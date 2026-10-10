@@ -262,7 +262,17 @@ pub trait Driver {
     /// written.
     ///
     /// Bytes that cannot be written yet (e.g. `EAGAIN`) are left queued and the driver
-    /// arms write readiness by re-registering with [`Interest::WRITABLE`].
+    /// arms write readiness by re-registering with [`Interest::WRITABLE`]. A write that leaves
+    /// the queue non-empty without arming write readiness does not strand the remainder: the
+    /// port schedules an [`crate::PortTaskKind::Output`] task for it (see
+    /// [`Port::output`](crate::Port::output)).
+    ///
+    /// The returned count is a **contract**: the driver must have called
+    /// [`ctx.output().consume(n)`](crate::queue::ByteQueue::consume) for exactly the bytes it
+    /// counts, because the queue is the only record of what still has to be written. The port
+    /// verifies it on every write path and reports a typed error when it does not hold
+    /// ([`Port::check_write_accounting`](crate::Port::output)), rather than trusting a count
+    /// that would make the next drive write the same bytes again.
     ///
     /// # Errors
     ///
@@ -277,6 +287,9 @@ pub trait Driver {
     fn ready_input(&mut self, ctx: &mut DriverContext<'_>) -> Result<()>;
 
     /// Handles write readiness; the default drains the output queue via [`Driver::output`].
+    ///
+    /// The returned count carries the same consume-what-you-report contract as
+    /// [`Driver::output`], and is verified the same way.
     ///
     /// # Errors
     ///

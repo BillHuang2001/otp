@@ -186,6 +186,64 @@ fn poller() -> Poller {
     Poller::new().expect("a poll set")
 }
 
+/// A driver that **reports** a write count it never consumed from its output queue — the contract
+/// violation the port guards against, because the unconsumed bytes would otherwise be written
+/// again by the next drive (duplicated output).
+struct LyingWriteDriver;
+
+impl Driver for LyingWriteDriver {
+    fn name(&self) -> &str {
+        "lying-write"
+    }
+
+    fn start(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
+        Ok(())
+    }
+
+    fn output(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
+        // Counts every queued byte as written without a single `consume`.
+        Ok(ctx.output().len())
+    }
+
+    fn ready_input(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
+        Ok(())
+    }
+
+    fn stop(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// A driver that writes exactly one byte per call and **never** arms write readiness: a short
+/// write, which leaves the rest of the queue for the port to re-drive.
+struct OneByteWriterDriver;
+
+impl Driver for OneByteWriterDriver {
+    fn name(&self) -> &str {
+        "one-byte"
+    }
+
+    fn start(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
+        Ok(())
+    }
+
+    fn output(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
+        if ctx.output().is_empty() {
+            return Ok(0);
+        }
+        ctx.output().consume(1);
+        Ok(1)
+    }
+
+    fn ready_input(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
+        Ok(())
+    }
+
+    fn stop(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
+        Ok(())
+    }
+}
+
 // --- GAP 1: the driver timer-arming seam ------------------------------------
 
 #[test]
@@ -438,4 +496,95 @@ fn a_driver_without_the_port_exit_hook_still_accepts_the_notification() {
         registry.notify_port_exit(&mut poller, PortId::new(4242), PortExitReason::Closed),
         Err(BeamError::BadArg)
     ));
+}
+
+// --- the write-count contract and the short-write re-drive -------------------
+
+/// A driver that reports a byte count it did not consume is caught, on **both** write paths, by
+/// the typed accounting guard instead of silently leaving the bytes to be written again.
+#[test]
+fn a_driver_reporting_a_count_it_did_not_consume_is_caught() {
+    let mut poller = poller();
+    let mut registry = PortRegistry::new();
+    let id = registry
+        .open(&mut poller, Box::new(LyingWriteDriver))
+        .expect("the port opens");
+
+    // The inline write path (`PortRegistry::output` -> `Port::output`): the driver claims both
+    // bytes are written while the queue still holds them.
+    let inline = registry.output(&mut poller, id, b"hi");
+    assert!(
+        inline.is_err(),
+        "a count the driver did not consume is a typed error, not a silent success"
+    );
+    assert!(
+        matches!(&inline, Err(BeamError::Raise(_))),
+        "the mismatch is the crate's typed raise diagnostic: {inline:?}"
+    );
+    assert_eq!(
+        registry.get(id).expect("live").output_len(),
+        2,
+        "the unconsumed bytes are still queued (they were not silently dropped)"
+    );
+
+    // The scheduled-task write path (`PortTaskKind::Output` -> `Port::ready_output`): the same
+    // guard fires when the round runs the task.
+    registry
+        .port_command(&mut poller, id, b"xy", PortCommandOptions::new())
+        .expect("the command is queued");
+    let round = registry.execute_port_tasks(&mut poller, DEFAULT_READINESS_RED_BUDGET);
+    assert!(
+        matches!(&round, Err(BeamError::Raise(_))),
+        "the task round surfaces the same accounting error: {round:?}"
+    );
+    assert_eq!(
+        registry.get(id).expect("live").output_len(),
+        4,
+        "nothing was written by the lying driver"
+    );
+
+    registry.close(&mut poller, id).expect("closes");
+}
+
+/// A short inline write schedules an [`PortTaskKind::Output`] task, so the remainder is re-driven
+/// by the next port-task round even though the driver never armed write readiness.
+#[test]
+fn a_short_inline_write_schedules_an_output_task_for_the_remainder() {
+    let mut poller = poller();
+    let mut registry = PortRegistry::new();
+    let id = registry
+        .open(&mut poller, Box::new(OneByteWriterDriver))
+        .expect("the port opens");
+
+    // The driver takes one byte of the four and arms nothing.
+    assert_eq!(
+        registry.output(&mut poller, id, b"abcd").expect("writes"),
+        1,
+        "the driver wrote one byte"
+    );
+    assert_eq!(
+        registry.get(id).expect("live").output_len(),
+        3,
+        "the remainder stays queued"
+    );
+    assert!(
+        registry
+            .get(id)
+            .expect("live")
+            .has_pending_task(PortTaskKind::Output),
+        "the unfinished write schedules an OUTPUT task without any readiness arming"
+    );
+
+    // The scheduled task runs the driver again, making progress on the remainder.
+    let round = registry
+        .execute_port_tasks(&mut poller, DEFAULT_READINESS_RED_BUDGET)
+        .expect("the OUTPUT task runs");
+    assert_eq!(round.ran, 1, "the scheduled OUTPUT task ran");
+    assert_eq!(
+        registry.get(id).expect("live").output_len(),
+        2,
+        "the round drained one more byte"
+    );
+
+    registry.close(&mut poller, id).expect("closes");
 }

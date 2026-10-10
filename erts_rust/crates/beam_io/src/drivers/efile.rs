@@ -122,7 +122,10 @@
 //! A failed `open` is reported as [`beam_common::BeamError::Io`] carrying the failing
 //! `errno`; the `{error, <errno-atom>}` rendering (`enoent`, `eexist`, `eisdir`, …) is the
 //! runtime's `prim_file` floor's job, not this driver's. `errno_atom`/`erl_errno_id`'s rules
-//! are what the runtime applies (`posix_error_to_tuple`, `prim_file_nif.c:306-309`).
+//! are what the runtime applies (`posix_error_to_tuple`, `prim_file_nif.c:306-309`). An
+//! `open(2)` interrupted by a signal (`EINTR`) is **retried** rather than reported, exactly
+//! as the C's `do { fd = open(...); } while (fd == -1 && errno == EINTR)` does
+//! (`unix_prim_file.c:188-191`).
 //!
 //! # `read_ahead` and `delayed_write` (`prim_file` handoffs)
 //!
@@ -362,15 +365,25 @@ impl EfileDriver {
         }
         let mut c_path = parsed.path.clone();
         c_path.push(0);
-        // SAFETY: `c_path` is a NUL-terminated byte string owned by this call, so
-        // `open(2)` only reads it; the flags/`mode` combination is valid and `open`
-        // returns a fresh descriptor owned by this driver on success. `O_NONBLOCK`
-        // (always set, see `OpenFlags::to_oflags`) matters for FIFOs, whose `open` would
-        // otherwise block until a writer appears.
-        let fd = unsafe { libc::open(c_path.as_ptr().cast(), parsed.flags.to_oflags(), FILE_MODE) };
-        if fd < 0 {
-            return Err(error::io(std::io::Error::last_os_error()));
-        }
+        let flags = parsed.flags.to_oflags();
+        // A signal delivered while `open(2)` is in progress fails it with `EINTR`; the
+        // emulator retries instead of surfacing the error
+        // (`do { fd = open(...); } while(fd == -1 && errno == EINTR)`,
+        // `erts/emulator/nifs/unix/unix_prim_file.c:188-191`).
+        let fd = retry_on_eintr(|| {
+            // SAFETY: `c_path` is a NUL-terminated byte string owned by this call, so
+            // `open(2)` only reads it; `flags` is a valid flag word and `open` returns a
+            // fresh descriptor owned by this driver on success. `O_NONBLOCK` (always set,
+            // see `OpenFlags::to_oflags`) matters for FIFOs, whose `open` would otherwise
+            // block until a writer appears.
+            let opened = unsafe { libc::open(c_path.as_ptr().cast(), flags, FILE_MODE) };
+            if opened >= 0 {
+                Ok(opened)
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        })
+        .map_err(error::io)?;
         // The oracle refuses a directory (`EISDIR`) unless directory mode was asked for
         // (`open_file_is_dir`, `unix_prim_file.c:206-213`); `open(2)` on its own opens a
         // read-only directory happily, so without this check a directory port would
@@ -686,6 +699,22 @@ fn decimal_position(position: i64) -> Vec<u8> {
     position.to_string().into_bytes()
 }
 
+/// Runs `attempt` until it yields a descriptor or fails with an errno other than `EINTR`.
+///
+/// A signal delivered while a syscall is in progress fails it with `EINTR`; the emulator
+/// retries `open(2)` in that case rather than surfacing the error
+/// (`erts/emulator/nifs/unix/unix_prim_file.c:188-191`). `attempt` performs one syscall and
+/// reports its raw outcome, so the retry rule is exercised directly by the unit tests.
+fn retry_on_eintr(mut attempt: impl FnMut() -> std::io::Result<RawFd>) -> std::io::Result<RawFd> {
+    loop {
+        match attempt() {
+            Ok(fd) => return Ok(fd),
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 /// Whether `fd` names a directory (the C's `open_file_is_dir`, `unix_prim_file.c:126-140`).
 ///
 /// A failed `fstat` is treated as "not a directory", exactly as the C assumes.
@@ -702,15 +731,15 @@ fn is_directory(fd: RawFd) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        make_efile, parse_offset, parse_open_arg, parse_seek, Access, EfileDriver, FileDataMode,
-        OpenFlags,
+        make_efile, parse_offset, parse_open_arg, parse_seek, retry_on_eintr, Access, EfileDriver,
+        FileDataMode, OpenFlags,
     };
     use crate::poller::Poller;
     use crate::port::PortRegistry;
     use beam_common::BeamError;
     use beam_process::PortId;
     use std::io::Write;
-    use std::os::unix::io::AsRawFd;
+    use std::os::unix::io::{AsRawFd, RawFd};
     use std::os::unix::net::UnixStream;
     use std::time::{Duration, Instant};
 
@@ -1339,5 +1368,37 @@ mod tests {
             "the bytes reached the regular file"
         );
         std::fs::remove_file(&path).expect("the fixture file is removed");
+    }
+
+    #[test]
+    fn a_signal_interrupted_open_is_retried() {
+        let mut attempts = 0;
+        let fd = retry_on_eintr(|| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(std::io::Error::from_raw_os_error(libc::EINTR))
+            } else {
+                Ok(42)
+            }
+        })
+        .expect("a retried open succeeds");
+        assert_eq!(fd, 42);
+        assert_eq!(attempts, 3, "the interrupted attempts are retried");
+    }
+
+    #[test]
+    fn a_real_open_failure_is_not_retried() {
+        let mut attempts = 0;
+        let err = retry_on_eintr(|| {
+            attempts += 1;
+            Err::<RawFd, _>(std::io::Error::from_raw_os_error(libc::ENOENT))
+        })
+        .expect_err("a real failure is propagated");
+        assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
+        assert_eq!(attempts, 1, "only `EINTR` is retried");
+        // An error with no OS code at all is likewise reported unchanged.
+        let err = retry_on_eintr(|| Err::<RawFd, _>(std::io::Error::other("no errno")))
+            .expect_err("propagated");
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
     }
 }

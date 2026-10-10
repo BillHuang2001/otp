@@ -81,7 +81,8 @@ impl Phase {
 pub struct PhaseChange {
     /// The current phase.
     phase: Phase,
-    /// The line accumulator, used only in [`Phase::Text`].
+    /// The line accumulator: filled in [`Phase::Text`], drained by [`PhaseChange::flush`]
+    /// whatever the phase then is.
     line: LineBuffer,
 }
 
@@ -166,14 +167,16 @@ impl PhaseChange {
         }
     }
 
-    /// Releases the trailing partial line at EOF/`stop` (text phase only).
+    /// Releases any input held back by text-phase framing at EOF/`stop`.
     ///
-    /// In [`Phase::Binary`] there is nothing buffered, so this returns no frames.
+    /// This drains the line buffer **regardless of the current phase**: switching to
+    /// [`Phase::Binary`] deliberately does not discard buffered input (see the module
+    /// docs above), so bytes a driver already read in the text phase must still reach the
+    /// port input queue. In [`Phase::Binary`] the line buffer is empty unless it was filled
+    /// while the phase was [`Phase::Text`], so a driver that never used text framing gets
+    /// no frames.
     pub fn flush(&mut self) -> Vec<Vec<u8>> {
-        match self.phase {
-            Phase::Binary => Vec::new(),
-            Phase::Text => self.line.flush_all(),
-        }
+        self.line.flush_all()
     }
 }
 
@@ -253,6 +256,24 @@ mod tests {
         pc.to_text();
         assert_eq!(pc.flush(), vec![b"abc".to_vec()]);
         assert_eq!(pc.pending(), 0);
+    }
+
+    #[test]
+    fn flush_after_switching_to_binary_still_delivers_the_held_partial_line() {
+        let mut pc = PhaseChange::new();
+        pc.to_text();
+        assert!(pc.handle(b"partial").is_empty(), "held in the line buffer");
+        assert_eq!(pc.pending(), 7);
+        pc.to_binary();
+        assert_eq!(pc.current(), Phase::Binary);
+        // The switch must not lose the bytes already read in the text phase: `flush`
+        // drains the line buffer whatever the current phase is (the `FdDriver` EOF/`stop`
+        // path, where a `binary`/`noline` control command may have flipped the phase in
+        // between).
+        assert_eq!(pc.flush(), vec![b"partial".to_vec()]);
+        assert_eq!(pc.pending(), 0);
+        // A second flush finds nothing.
+        assert!(pc.flush().is_empty());
     }
 
     #[test]

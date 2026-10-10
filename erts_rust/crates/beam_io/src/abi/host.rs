@@ -79,6 +79,7 @@ use std::time::{Duration, Instant};
 
 use libc::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
 
+use beam_abi::common::SysIOVec;
 use beam_abi::driver::host::DriverHost;
 use beam_abi::driver::types::{
     ErlDrvData, ErlDrvEntry, ErlDrvEvent, ErlDrvPort, ErlDrvTermData, ERTS_INVALID_ERL_DRV_PORT,
@@ -93,6 +94,7 @@ use crate::abi::job::AsyncJobs;
 use crate::abi::DriverTable;
 use crate::driver::DriverContext;
 use crate::poller::{Interest, Token};
+use crate::queue::ByteQueue;
 
 /// The word capacity of the term heap handed to a driver through
 /// [`DriverHost::heap`](beam_abi::driver::host::DriverHost::heap).
@@ -256,22 +258,42 @@ pub struct DriverState {
     /// fd lock is released (`erl_check_io.c:1210-1216`), never re-entrantly inside the driver's
     /// own `driver_select`.
     pub(crate) queued_stop_select: Vec<ErlDrvEvent>,
+    /// The port's **driver queue** — the C's `prt->ioq`, the byte queue the `driver_enq*` family
+    /// fills and `driver_peekq`/`driver_deq` drain.
+    ///
+    /// It is deliberately **not** the port's `DriverContext::output()` queue. The C keeps the two
+    /// apart: `erts_port_output` (the Erlang→driver direction) builds its vector from the Erlang
+    /// iodata term on the fly and never reads `prt->ioq` (`io.c:1609-1646`, `io.c:1795-1846`),
+    /// whereas every `driver_enq`/`driver_pushq`/`driver_deq`/`driver_sizeq`/`driver_peekq` is
+    /// defined straight in terms of `drvport2ioq(ix)` (`io.c:6790-6919`) — a buffer only the driver
+    /// touches, drained by the driver's own `ready_output` (the reference user is `inet_drv`'s
+    /// `tcp_sendv`/`tcp_inet_output`, `inet_drv.c:13771-13842`, `:14093-14104`). Merging them would
+    /// re-deliver a driver's own queued bytes to its `outputv` as if they were new Erlang commands;
+    /// [`AbiHost::enq`] records the concrete consequence.
+    pub(crate) ioq: ByteQueue,
 }
 
 impl DriverState {
-    /// An empty state: nothing selected, no timer, no jobs.
+    /// An empty state: nothing selected, no timer, no jobs, an empty driver queue.
     pub(crate) fn new() -> DriverState {
         DriverState {
             selected: BTreeMap::new(),
             deadline: None,
             jobs: AsyncJobs::new(),
             queued_stop_select: Vec::new(),
+            ioq: ByteQueue::new(),
         }
     }
 
     /// The port timer deadline, or `None` when none is armed.
     pub fn deadline(&self) -> Option<Instant> {
         self.deadline
+    }
+
+    /// How many bytes the driver has queued on its own queue (`driver_sizeq`) — the observable
+    /// behind the `driver_enq`/`driver_deq` hooks.
+    pub fn queue_len(&self) -> usize {
+        self.ioq.len()
     }
 
     /// How many fds the driver currently has selected (`driver_select` on, not yet off).
@@ -509,6 +531,119 @@ impl DriverHost for AbiHost {
         }
     }
 
+    // -------------------------------------------------------------------------------------------
+    // Port queue — `driver_enq`/`driver_pushq`/`driver_deq`/`driver_sizeq`/`driver_peekq[v]`
+    //
+    // These read and write the port's **driver queue** ([`DriverState::ioq`], the C's `prt->ioq`),
+    // which is a different object from the port's `DriverContext::output()` queue that
+    // [`AbiHost::output`]'s counterpart feeds: the C never puts Erlang command bytes in
+    // `prt->ioq` and never delivers `prt->ioq` to `outputv` (see [`DriverState::ioq`] and
+    // [`AbiHost::enq`]).
+    //
+    // Unlike `driver_select`/`driver_output`, none of these needs an installed `DriverContext`:
+    // the queue is this host's own state, so a driver reaches it wherever it holds a live
+    // `ErlDrvPort`, exactly as the C's `drvport2ioq(ix)` does. The crate's single-thread invariant
+    // still applies — drive them from the port's thread (the C lock-protects the ioq for driver
+    // worker threads; this floor does not).
+    // -------------------------------------------------------------------------------------------
+
+    /// `driver_enq`/`driver_enq_bin`: append `data` to the port's driver queue.
+    ///
+    /// **Why not the port's `DriverContext::output()` queue** (the obvious-looking mapping): that
+    /// queue is the Erlang→driver channel, and [`DriverPort::write_driver`] hands whatever it holds
+    /// to the entry's `outputv`/`output` slot on the next `OUTPUT` task. A driver that enqueued
+    /// there — which is exactly what the reference user does, `driver_enqv(ix, ev, n)` in
+    /// `inet_drv`'s `tcp_sendv` (`inet_drv.c:13842`) and `driver_enq(ix, buf, h_len)` in its plain
+    /// path (`:13881-13886`) — would get its own bytes back as a **new port command**, so
+    /// `tcp_sendv` (which prepends the `{packet,N}` length header to every command it is handed,
+    /// `:13756-13770`) would frame those bytes a second time: silently corrupt output. The C has
+    /// no such path (an `OUTPUT` task runs only `ready_output`, `erl_port_task.c:1790-1797`), so
+    /// the driver queue is kept separate here.
+    ///
+    /// **Deviation from the C:** the queue is one contiguous [`ByteQueue`], so the C's
+    /// one-iovec-entry-per-enqueue chunking is not reproduced — [`DriverHost::peekq`] therefore
+    /// always reports a single entry (`vlen == 1`) where the oracle counts the enqueues (two
+    /// `driver_enq` calls → `*vlen == 2`, `beam_abi`'s `driver_peekq` docs). Byte **order** and
+    /// byte **count** are identical either way, which is all the family's consumers rely on.
+    ///
+    /// `is_binary` is not consulted: the seam hands the bytes over as a slice, so the C's
+    /// binary/plain distinction (its `ErlDrvBinary` refcount dance, `io.c:6860-6866`) has no
+    /// analogue. `0` = queued (the C's `-1` is an allocation failure, which a `Vec` cannot report).
+    fn enq(&mut self, data: &[u8], _is_binary: bool) -> c_int {
+        self.state.ioq.push(data);
+        0
+    }
+
+    /// `driver_pushq`/`driver_pushq_bin`: prepend `data` to the head of the port's driver queue.
+    ///
+    /// The C's `erts_ioq_pushqv` splices the new elements in front of the queue (`io.c:6800`).
+    /// [`ByteQueue`] appends only, so the queued bytes are moved behind `data` (order preserved).
+    /// `is_binary` as for [`DriverHost::enq`].
+    fn pushq(&mut self, data: &[u8], _is_binary: bool) -> c_int {
+        if data.is_empty() {
+            return 0; // The C's `len == 0` early return (`io.c:6881`).
+        }
+        let tail = self.state.ioq.front().to_vec();
+        self.state.ioq.clear();
+        self.state.ioq.push(data);
+        self.state.ioq.push(&tail);
+        0
+    }
+
+    /// `driver_deq`: drop up to `len` bytes from the head of the port's driver queue.
+    ///
+    /// Returns how many bytes were **dropped**, which is the value `beam_abi`'s `driver_deq` needs:
+    /// it re-reads [`DriverHost::sizeq`] afterwards and returns the C's *remaining* count
+    /// (`queues.rs::driver_deq`, `io.c:6807-6813`). A negative `len` — impossible through the C API,
+    /// whose operand is an `ErlDrvSizeT` — is refused with `-1`.
+    ///
+    /// **Deviation from the C:** `erts_ioq_deq` fails (`-1`) when `size > q->size` and leaves the
+    /// queue untouched (`erl_io_queue.c:351`), whereas this clamps (`ByteQueue::consume`). The
+    /// difference is unreachable through `driver_deq`, which takes that branch itself by comparing
+    /// against [`DriverHost::sizeq`] first; clamping is the safe direction for a direct host call,
+    /// because the queue is then left empty rather than silently holding bytes the caller believes
+    /// it dropped.
+    fn deq(&mut self, len: c_int) -> c_int {
+        if len < 0 {
+            return -1;
+        }
+        let dropped = self.state.ioq.consume(len as usize);
+        dropped.min(c_int::MAX as usize) as c_int
+    }
+
+    /// `driver_sizeq`: how many bytes are on the port's driver queue.
+    ///
+    /// Never negative while the host is alive — the C's `(ErlDrvSizeT)-1` is its null-queue case
+    /// (`io.c:6827-6834`), and `beam_abi` relies on a non-negative answer to let `driver_deq` and
+    /// `driver_peekqv` take their normal path.
+    fn sizeq(&mut self) -> c_int {
+        self.state.ioq.len().min(c_int::MAX as usize) as c_int
+    }
+
+    /// `driver_peekq`/`driver_peekqv`: a view of the head of the port's driver queue.
+    ///
+    /// One entry over [`ByteQueue::front`] — the whole contiguous queue; see
+    /// [`DriverHost::enq`] for the `vlen == 1` deviation from the C's per-enqueue chunking.
+    ///
+    /// `None` for an empty queue, which `beam_abi` renders as the C's `NULL` with `*vlen = 0`
+    /// (it tells "empty" and "unsupported" apart through [`DriverHost::sizeq`], and this host
+    /// always supports the queue).
+    ///
+    /// The `iov_base` addresses the queue's own buffer, so it stays valid until the next
+    /// `driver_enq`/`driver_pushq`/`driver_deq` — the C's lifetime for the pointer it returns —
+    /// while `beam_abi` copies the vector of iovecs itself into the driver's call for the callback's
+    /// duration.
+    fn peekq(&mut self) -> Option<Vec<SysIOVec>> {
+        let front = self.state.ioq.front();
+        if front.is_empty() {
+            return None;
+        }
+        Some(vec![SysIOVec {
+            iov_base: front.as_ptr() as *mut c_void,
+            iov_len: front.len(),
+        }])
+    }
+
     /// `driver_select`: register, re-register or de-register interest in an OS handle.
     ///
     /// The handle is the C convention of a **fd cast to a pointer**
@@ -525,23 +660,35 @@ impl DriverHost for AbiHost {
     /// select without the bit keeps a request an earlier select made); a release queues the event
     /// the *deselecting* call was given, which is the operand the C's `stop_select` receives
     /// (`erl_check_io.c:1215`).
+    ///
+    /// **The fd record is dropped only after the poller registration is really gone.** The record
+    /// (and with it the `ERL_DRV_USE` release obligation) is what a later de-select or the port
+    /// teardown walks, so withdrawing it on a **failed** `deregister` would lose the driver's
+    /// `stop_select` for an fd the poller still holds — the release must stay queued, not vanish.
+    /// A failed de-select answers `-1` and leaves the registration exactly as it was.
     fn select(&mut self, _port: ErlDrvPort, event: ErlDrvEvent, mode: c_int, on: c_int) -> c_int {
         let fd = event as usize as RawFd;
         let interest = interest_from_mode(mode);
 
         if on == 0 {
-            let Some(selected) = self.state.selected.remove(&fd) else {
+            let Some(selected) = self.state.selected.get(&fd) else {
                 return 0; // De-selecting an unknown fd is a no-op, not a failure.
             };
+            let token = selected.token;
             let owes_stop_select = selected.wants_stop_select();
-            let result = self.with_ctx(|ctx| ctx.deregister(fd, selected.token));
-            if owes_stop_select {
-                // Queued *after* the context borrow ends; the port fires it once this callback has
-                // returned (see `DriverState::queued_stop_select`).
-                self.state.queued_stop_select.push(event);
-            }
-            return match result {
-                Some(Ok(())) => 0,
+            return match self.with_ctx(|ctx| ctx.deregister(fd, token)) {
+                Some(Ok(())) => {
+                    self.state.selected.remove(&fd);
+                    if owes_stop_select {
+                        // Queued *after* the context borrow ends; the port fires it once this
+                        // callback has returned (see `DriverState::queued_stop_select`).
+                        self.state.queued_stop_select.push(event);
+                    }
+                    0
+                }
+                // The poller still holds the registration (or no context is installed): keep the
+                // record and its release obligation, so a later de-select or the teardown can
+                // still withdraw it and fire the callback exactly once.
                 _ => -1,
             };
         }

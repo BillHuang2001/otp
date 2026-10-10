@@ -20,7 +20,9 @@ Legacy C ground truth (read-only): `erts/emulator/beam/io.c` (the `LineBuf` `LIN
   read/write-slot seams `adopt_read_fd`/`release_read_fd`/`adopt_write_fd`/`release_write_fd`/
   `has_*_fd`/`attached_fd`), `set_nonblocking`.
 - `efile.rs` → `EfileDriver`, `make_efile`, `FileDataMode`; the `open` flag grammar and `Access`
-  translation reproduce the C's `efile_translate_modelist` + `get_flags`.
+  translation reproduce the C's `efile_translate_modelist` + `get_flags`, and `open(2)` is retried on
+  `EINTR` exactly as the C's `do { … } while (fd == -1 && errno == EINTR)` does
+  (`retry_on_eintr`, `unix_prim_file.c:188-191`).
 - `spawn.rs` → `SpawnDriver`, `SpawnSpec`/`SpawnOptions`/`StreamOptions`/`SpawnStream`,
   `build_command`, the deferred `fork_exec_child`, `ChildProc`/`ForkedChild`.
 - `line_buffer.rs` → `LineBuffer`, `DEFAULT_MAX_LINE_LEN`; `binary_io.rs` → `Phase`, `PhaseChange`.
@@ -34,17 +36,14 @@ Legacy C ground truth (read-only): `erts/emulator/beam/io.c` (the `LineBuf` `LIN
   A short write must leave the exact unwritten remainder queued and arm write readiness; a short read
   must never drop or duplicate bytes. `ByteQueue::front()` is always the whole contiguous remainder.
 - The `line_buffer.rs` state machine and the `\r\n`-terminator / over-long-line-split rules are
-  arm-for-arm ports of the C `read_linebuf` (`io.c:3252`) — change them only against that.
+  arm-for-arm ports of the C `read_linebuf` (`io.c:3252`); `LineBuffer::flush_all` likewise mirrors
+  `flush_linebuf` (`io.c:3211-3237`), including delivering a full line at the limit and its held `\r`
+  as **two** frames (the C's two calls). Change them only against those.
+- `PhaseChange::flush` drains the line buffer **whatever the current phase is** (`binary_io.rs`): a
+  `binary`/`noline` control command only flips the phase, it never discards input the driver already
+  read in the text phase, so the held bytes must still reach the port queue at EOF/`stop`.
 
 ## Known Issues
-- **`PhaseChange::flush()` loses text-phase bytes once the phase is `Binary`.** `flush`
-  (`binary_io.rs:172-177`) returns no frames in `Phase::Binary`, but `binary_io.rs:36-40` states a
-  partial line "survives a switch to binary and is delivered by the next `flush`". Reachable path:
-  the driver buffers a partial line in `Text`, a `binary`/`noline` control command flips the phase
-  (`fd.rs:568-571`/`182-184`), then EOF or `stop` calls `flush_input` → `phase.flush()` → nothing, so
-  the held bytes are silently dropped. Fix: `flush` should drain the line buffer regardless of the
-  current phase (the buffer is empty in `Binary` unless it was populated in `Text`); the existing
-  `binary_io` tests still pass because they switch back to `Text` before flushing.
 - **`{fd,N}` spawn port holds an `Interest::BOTH` registration for its life.** `arm_output`/
   `disarm_output` are no-ops for `duplex` (`spawn.rs:913-941`), so the single adopted descriptor stays
   registered both ways after read EOF (`release_stdout` is a no-op for duplex). Harmless under the

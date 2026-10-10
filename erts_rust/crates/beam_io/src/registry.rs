@@ -93,6 +93,10 @@ pub struct PortRegistry {
     ports: HashMap<u64, Port>,
     /// Ports closed since the last execution round, reported as
     /// [`PortNotification::Closed`].
+    ///
+    /// A port's number stays **allocated** in `ids` while it sits here: the release happens when
+    /// the close is actually reported (see [`PortRegistry::take_closed_notifications`]), so a
+    /// deferred report can never name a number a later [`PortRegistry::open`] reused.
     closed: Vec<PortId>,
     /// Keeps this type single-threaded (`Cell` is neither `Send` nor `Sync`).
     single_threaded: PhantomData<Cell<()>>,
@@ -160,12 +164,18 @@ impl PortRegistry {
         self.ports.get_mut(&id.number())
     }
 
-    /// Writes `data` to the given port's output queue.
+    /// Writes `data` to the given port's output queue and asks the port's driver to write it
+    /// **inline**.
+    ///
+    /// A write the driver cannot finish leaves the remainder queued **and schedules an
+    /// [`PortTaskKind::Output`] task**, so the next port-task round re-drives it even when the
+    /// driver did not re-arm write readiness (see [`Port::output`]).
     ///
     /// # Errors
     ///
     /// Returns `BeamError::BadArg` when `id` is not a live port, or whatever the port's
-    /// driver returns.
+    /// driver returns — including the typed accounting diagnostic a driver produces by
+    /// reporting a byte count it did not consume (see [`Port::output`]).
     pub fn output(&mut self, poller: &mut Poller, id: PortId, data: &[u8]) -> Result<usize> {
         match self.ports.get_mut(&id.number()) {
             Some(port) => port.output(poller, data),
@@ -173,11 +183,11 @@ impl PortRegistry {
         }
     }
 
-    /// Schedules the port tasks a batch of poller events implies and then runs what it
-    /// scheduled, returning how many events named a live port.
+    /// Schedules the port tasks a batch of poller events implies, runs what it scheduled, and
+    /// reports the round's outcome.
     ///
-    /// Each event's key is a port number; an event for an unknown key (including the
-    /// waker's [`WAKER_KEY`](crate::poller::WAKER_KEY)) is a no-op. Readiness is turned into
+    /// Each event's key is a port number; an event for an unknown key (including the waker's
+    /// [`WAKER_KEY`](crate::poller::WAKER_KEY)) is a no-op. Readiness is turned into
     /// scheduled port tasks rather than into direct driver calls (see
     /// [`PortRegistry::schedule_events`]), and the scheduled tasks are then executed under
     /// [`DEFAULT_READINESS_RED_BUDGET`] so a caller that does not drive the queue itself
@@ -185,13 +195,35 @@ impl PortRegistry {
     /// budget schedules with [`PortRegistry::schedule_events`] and runs the queue through
     /// [`PortRegistry::execute_port_tasks`].
     ///
+    /// The two entries differ in what they report. `handle_events` **harvests no input**: the
+    /// bytes an `INPUT` task read stay in the port's input queue for the caller to take with
+    /// [`Port::drain_input`]/[`Port::read_input`], so
+    /// [`PortTaskOutcome::notifications`] carries the [`PortNotification::Closed`] reports of
+    /// the ports closed since the previous round — drained, and their numbers retired, through
+    /// the same helper [`PortRegistry::execute_port_tasks`] uses — and **no**
+    /// [`PortNotification::Data`]. A caller looping on `handle_events` alone therefore sees every
+    /// close exactly once instead of accumulating them. A caller that wants the
+    /// `{Port, {data, Data}}` payloads must use [`PortRegistry::execute_port_tasks`]; the count of
+    /// events that named a live port is not carried by the outcome (a caller that needs it
+    /// compares [`PortRegistry::schedule_events`]'s return value with its own batch).
+    ///
     /// # Errors
     ///
-    /// Returns any error raised by a port's driver while the scheduled tasks run.
-    pub fn handle_events(&mut self, poller: &mut Poller, events: &[Event]) -> Result<usize> {
-        let handled = self.schedule_events(events);
-        let _outcome = self.run_scheduled_tasks(poller, DEFAULT_READINESS_RED_BUDGET)?;
-        Ok(handled)
+    /// Returns any error raised by a port's driver while the scheduled tasks run; the closes
+    /// still pending at that point stay queued (they are reported, and their numbers retired, by
+    /// the next round) rather than being dropped.
+    pub fn handle_events(
+        &mut self,
+        poller: &mut Poller,
+        events: &[Event],
+    ) -> Result<PortTaskOutcome> {
+        self.schedule_events(events);
+        let (ran, reds_used) = self.run_scheduled_tasks(poller, DEFAULT_READINESS_RED_BUDGET)?;
+        Ok(PortTaskOutcome {
+            ran,
+            reds_used,
+            notifications: self.take_closed_notifications(),
+        })
     }
 
     /// Schedules the port tasks a batch of poller events implies, returning how many events
@@ -252,18 +284,15 @@ impl PortRegistry {
     /// # Errors
     ///
     /// Returns any error raised by a port's driver while a task runs; the tasks after it
-    /// stay queued.
+    /// stay queued. A close pending at that point is **not** lost: the closes are drained only
+    /// after every fallible step of the round has succeeded, so an error leaves them queued for
+    /// the next round (and keeps their numbers allocated meanwhile — see
+    /// [`PortRegistry::take_closed_notifications`]).
     pub fn execute_port_tasks(
         &mut self,
         poller: &mut Poller,
         reds_budget: usize,
     ) -> Result<PortTaskOutcome> {
-        let mut notifications: Vec<PortNotification> = self
-            .closed
-            .drain(..)
-            .map(|port| PortNotification::Closed { port })
-            .collect();
-
         let (ran, reds_used) = self.run_scheduled_tasks(poller, reds_budget)?;
 
         // Drive async completions **after** the scheduled tasks and **before** harvesting input.
@@ -286,6 +315,12 @@ impl PortRegistry {
                 port.drive_async(poller)?;
             }
         }
+
+        // Collect the closes only now that the round's fallible steps are behind us: an early
+        // return above leaves them queued for the next round instead of dropping them, because
+        // nothing has drained `self.closed` yet. Minting a report also retires the closed port's
+        // number (see `take_closed_notifications`).
+        let mut notifications = self.take_closed_notifications();
 
         // Harvest the data the INPUT tasks read: a port task never hands bytes up itself,
         // so the round reports them for the runtime to turn into `{Port, {data, Data}}`.
@@ -536,25 +571,55 @@ impl PortRegistry {
         keys
     }
 
-    /// Stops and removes the port with id `id`, releasing its number.
+    /// Stops and removes the port with id `id`, queueing its number for retirement.
     ///
-    /// The close is reported as a [`PortNotification::Closed`] by the next
-    /// [`PortRegistry::execute_port_tasks`] round.
+    /// The close is reported as a [`PortNotification::Closed`] by the next round — either
+    /// [`PortRegistry::execute_port_tasks`] or [`PortRegistry::handle_events`] — and the port
+    /// **number is released at that point, not here**. Keeping it allocated until the report is
+    /// minted is what makes a `Closed` notification trustworthy: `beam_process::PortTable` hands
+    /// a released number straight back out to the next [`PortRegistry::open`], so releasing it
+    /// here would let a `close` + `open` pair make the deferred report name a *different, live*
+    /// port. A caller that closes a port and never runs another round therefore keeps the number
+    /// allocated — the round is what retires it.
     ///
     /// # Errors
     ///
     /// Returns `BeamError::BadArg` when `id` is not a live port, or whatever the driver's
-    /// `stop` returns.
+    /// `stop` returns. The port is removed and its close queued either way, so a teardown
+    /// failure neither leaves the port looking live nor leaks its number.
     pub fn close(&mut self, poller: &mut Poller, id: PortId) -> Result<()> {
         let Some(mut port) = self.ports.remove(&id.number()) else {
             return Err(error::badarg());
         };
-        // The port is gone from the registry either way, so its number is released
-        // even if the driver's teardown reports a failure.
         let result = port.close(poller);
-        self.ids.release(id);
+        // The port is gone from the registry either way, so its close is queued (and its number
+        // retired by the reporting round) even if the driver's teardown reports a failure.
         self.closed.push(id);
         result
+    }
+
+    /// Drains the closes pending since the last round into [`PortNotification::Closed`] values,
+    /// **retiring each closed port's number as its report is minted**.
+    ///
+    /// This is the single place a closed port's number is handed back to the id table (see
+    /// [`PortRegistry::close`]), which is why it is shared by both round drivers — a caller
+    /// looping on either one drains the queue, so closes are reported exactly once and
+    /// `self.closed` cannot grow without bound.
+    ///
+    /// Minting the report is what ends the number's reservation: a port opened between the
+    /// `close` and this call gets a **different** number, so a
+    /// [`PortNotification::Closed`] never names a reused, live port. Once the report is handed
+    /// over, the number is free again — a consumer must act on the notification in the round
+    /// that delivered it rather than storing the bare number for later.
+    fn take_closed_notifications(&mut self) -> Vec<PortNotification> {
+        let closed = std::mem::take(&mut self.closed);
+        closed
+            .into_iter()
+            .map(|port| {
+                self.ids.release(port);
+                PortNotification::Closed { port }
+            })
+            .collect()
     }
 
     /// Whether a port with id `id` is live.
@@ -679,8 +744,10 @@ mod tests {
         assert!(registry.is_empty());
     }
 
+    /// A closed port's number is **not** reused until its close has been reported, so a
+    /// deferred [`PortNotification::Closed`] can never name a freshly opened (live) port.
     #[test]
-    fn a_closed_port_id_is_reused_by_the_next_open() {
+    fn a_closed_port_number_is_retired_only_when_its_close_is_reported() {
         let mut poller = poller();
         let (mut registry, first) = registry_with_pipe(&mut poller);
         let second = registry
@@ -691,11 +758,42 @@ mod tests {
         registry.close(&mut poller, first).expect("closes");
         assert_eq!(registry.len(), 1);
 
-        let reused = registry
+        // The number is still reserved, so the next open cannot take it: the close has not been
+        // reported yet and the deferred report must not name a live port.
+        let third = registry
             .open(&mut poller, Box::new(FdDriver::pipe().expect("a pipe")))
             .expect("a third port");
-        assert_eq!(reused, first, "the released number is reused");
+        assert_ne!(third, first, "an unreported close keeps its number reserved");
         assert_eq!(registry.len(), 2);
+
+        // The reporting round hands the report over **and** retires the number with it.
+        let round = registry
+            .execute_port_tasks(&mut poller, DEFAULT_READINESS_RED_BUDGET)
+            .expect("runs");
+        assert_eq!(
+            round.notifications,
+            vec![PortNotification::Closed { port: first }],
+            "the close names the port that was closed"
+        );
+        assert!(
+            !registry.contains(first),
+            "the reported port is not a live port"
+        );
+        assert!(!registry.port_table().contains(first), "its number is retired");
+
+        // Retirement happens exactly once, with the report: the number is handed out again to the
+        // next open, and no second close report appears.
+        let reused = registry
+            .open(&mut poller, Box::new(FdDriver::pipe().expect("a pipe")))
+            .expect("a fourth port");
+        assert_eq!(reused, first, "the retired number is reusable");
+        let later = registry
+            .execute_port_tasks(&mut poller, DEFAULT_READINESS_RED_BUDGET)
+            .expect("runs");
+        assert!(
+            later.notifications.is_empty(),
+            "the close was reported exactly once"
+        );
     }
 
     #[test]
@@ -769,12 +867,19 @@ mod tests {
             .expect("the fd registers");
 
         // Unknown keys (including the waker's, whose token is never assigned to a port)
-        // are skipped without touching any driver.
+        // are skipped without touching any driver — and, with no port task queued, the round
+        // runs nothing and reports nothing.
         let events = vec![
             Event::new(token, 4242, Ready::default()),
             Event::new(token, WAKER_KEY, Ready::default()),
         ];
-        assert_eq!(registry.handle_events(&mut poller, &events).expect("ok"), 0);
+        let outcome = registry.handle_events(&mut poller, &events).expect("ok");
+        assert_eq!(outcome.ran, 0, "an unknown key schedules no task");
+        assert_eq!(outcome.reds_used, 0);
+        assert!(
+            outcome.notifications.is_empty(),
+            "an unknown key reports nothing"
+        );
         assert!(registry.contains(id));
     }
 
@@ -999,6 +1104,10 @@ mod tests {
             .execute_port_tasks(&mut poller, DEFAULT_READINESS_RED_BUDGET)
             .expect("runs");
         assert_eq!(first.notifications, vec![PortNotification::Closed { port: id }]);
+        assert!(
+            registry.closed.is_empty(),
+            "the reporting round drained the close queue"
+        );
 
         let second = registry
             .execute_port_tasks(&mut poller, DEFAULT_READINESS_RED_BUDGET)
@@ -1007,6 +1116,112 @@ mod tests {
             second.notifications.is_empty(),
             "a close is reported exactly once"
         );
+    }
+
+    /// `handle_events` routes the close draining through the same helper `execute_port_tasks`
+    /// uses, so a caller looping on it alone sees every close exactly once (and the pending-close
+    /// queue cannot grow without bound).
+    #[test]
+    fn handle_events_reports_and_retires_the_closes_it_drains() {
+        let mut poller = poller();
+        let (mut registry, id) = registry_with_pipe(&mut poller);
+        registry.close(&mut poller, id).expect("closes");
+        assert_eq!(registry.closed.len(), 1, "the close is pending");
+
+        let outcome = registry.handle_events(&mut poller, &[]).expect("runs");
+        assert_eq!(
+            outcome.notifications,
+            vec![PortNotification::Closed { port: id }],
+            "handle_events reports the close it drained"
+        );
+        assert_eq!(outcome.ran, 0, "no port task was scheduled");
+        assert!(
+            registry.closed.is_empty(),
+            "the close queue was drained by handle_events"
+        );
+        assert!(
+            !registry.port_table().contains(id),
+            "the reported close retired the port's number"
+        );
+        assert!(
+            !registry.contains(id),
+            "the reported port is not a live port"
+        );
+
+        // Exactly once: a second round has nothing left to report.
+        let again = registry.handle_events(&mut poller, &[]).expect("runs");
+        assert!(again.notifications.is_empty());
+    }
+
+    /// A driver error while a round runs its tasks must not drop a close that was already
+    /// pending: the closes are collected only after the round's fallible steps, so the report
+    /// survives — and keeps its number reserved — for the next round.
+    #[test]
+    fn a_task_error_does_not_drop_a_pending_close_report() {
+        /// A driver whose `output` always fails.
+        struct FailingWriteDriver;
+
+        impl Driver for FailingWriteDriver {
+            fn name(&self) -> &str {
+                "failing-write"
+            }
+
+            fn start(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
+                Ok(())
+            }
+
+            fn output(&mut self, _ctx: &mut DriverContext<'_>) -> Result<usize> {
+                Err(error::badarg())
+            }
+
+            fn ready_input(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
+                Ok(())
+            }
+
+            fn stop(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut poller = poller();
+        let mut registry = PortRegistry::new();
+
+        // A port that is closed (so a close is pending) ...
+        let closed = registry
+            .open(&mut poller, Box::new(FdDriver::pipe().expect("a pipe")))
+            .expect("opens");
+        registry.close(&mut poller, closed).expect("closes");
+
+        // ... and a port with a scheduled OUTPUT task whose driver fails when it runs.
+        let failing = registry
+            .open(&mut poller, Box::new(FailingWriteDriver))
+            .expect("opens");
+        registry
+            .port_command(&mut poller, failing, b"x", PortCommandOptions::new())
+            .expect("the command is queued");
+
+        let failed = registry.execute_port_tasks(&mut poller, DEFAULT_READINESS_RED_BUDGET);
+        assert!(failed.is_err(), "the driver's failure surfaces");
+        assert_eq!(
+            registry.closed,
+            vec![closed],
+            "the pending close stays queued instead of being dropped"
+        );
+        assert!(
+            registry.port_table().contains(closed),
+            "its number stays reserved while the close is unreported"
+        );
+
+        // The next round reports it (the failed task was consumed by the round that ran it).
+        let next = registry
+            .execute_port_tasks(&mut poller, DEFAULT_READINESS_RED_BUDGET)
+            .expect("runs");
+        assert_eq!(
+            next.notifications,
+            vec![PortNotification::Closed { port: closed }],
+            "the close survives the failed round"
+        );
+        assert!(!registry.port_table().contains(closed), "and retires its number");
     }
 
     #[test]
@@ -1276,10 +1491,28 @@ mod tests {
             .demonitor_port(watcher, reference, registry.port_table_mut())
             .expect("the watcher is live"));
 
-        // Closing through the registry still drives the SAME table, so the accessor agrees
-        // the number is released.
+        // Closing through the registry still drives the SAME table: the port is gone from the
+        // live map immediately, but its number stays reserved in the port table until the close
+        // is reported (so a deferred `Closed` can never name a reused id).
         registry.close(&mut poller, id).expect("closes");
         assert!(!registry.contains(id));
-        assert!(!registry.port_table().contains(id));
+        assert!(
+            registry.port_table().contains(id),
+            "the number is reserved until the close is reported"
+        );
+
+        // The reporting round is what releases the number. Nothing is scheduled, so the round
+        // only mints the close.
+        let outcome = registry
+            .execute_port_tasks(&mut poller, DEFAULT_READINESS_RED_BUDGET)
+            .expect("the round runs");
+        assert_eq!(
+            outcome.notifications,
+            vec![PortNotification::Closed { port: id }]
+        );
+        assert!(
+            !registry.port_table().contains(id),
+            "reporting the close retires the number"
+        );
     }
 }
