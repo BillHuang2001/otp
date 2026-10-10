@@ -153,11 +153,11 @@ Verified against the system `erlc` (OTP 29) disassembly:
   for an impossible post-reserve state.
 
 ## Handoff (parent-owned)
-- `../../../tests/gaps.rs` asserts the two read instructions' `no_fail` cases against the **old**
-  sentinel strings (`get_map_elements: key absent with no fail label` / `has_map_fields: key absent
-  with no fail label`). Those cases now surface the missing-atom gap, so the two expected strings
-  must become `maps: no 'function_clause' atom in the module` (the module in that fixture names
-  neither tag). This file is outside this node's scope.
+- `../../../tests/gaps.rs` still asserts the two read instructions' `no_fail` cases against the **old**
+  engine-defined sentinel errors, which the read path no longer raises — it now raises the bare atom
+  `function_clause` (class `error`). The unseeded fixture therefore surfaces the missing-atom gap, so
+  the two expected strings must become `maps: no 'function_clause' atom in the module` (the module in
+  that fixture names neither tag). This file is outside this node's scope.
 
 ## Notes for Agents
 - To make the tags nameable for **any** host (not just a seeding one), the engine would need

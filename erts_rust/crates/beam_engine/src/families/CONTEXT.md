@@ -51,7 +51,7 @@ semantically identical to the old first-claim-wins probe loop (see the module do
   `exceptions/raise.rs:60-63,75-78` a missing tag atom ⇒ `unsupported`.
 - `exceptions/stacktrace.rs:151-156` a missing `file`/`line` atom ⇒ `unsupported`.
 - `floats/*` — a non-float FR slot or a non-finite result ⇒ the documented `badarith` failure (`arith.rs:72,98`), never a fabricated value.
-- `bitstrings/create/mod.rs:348-352` a non-first `append`/`private_append`; `:369-371` unknown segment type; `:199-201` integer size `all`; `size.rs:173-185` `raise_seg_fail`.
+- `bitstrings/create/mod.rs:369-371` unknown segment type; `:199-201` integer size `all`; `size.rs:173-185` `raise_seg_fail`.
 - `bitstrings/mod.rs` — every invalid `Sz`/flag/offset ⇒ a typed result (`read_size` `:156`, `decode_flags` `:187`, `make_small_checked` `:292`).
 - `bitstrings/matching/match_ctx.rs:56-71` unknown `bs_start_match4` fail atom; `commands.rs:173-175` unknown `bs_match` command.
 - `bitstrings/raw.rs:264-265` result > 64 bytes in `make_bits`; `:222-226` zero-width bignum; `:317-320` short buffer.

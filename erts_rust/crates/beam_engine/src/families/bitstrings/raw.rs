@@ -64,8 +64,8 @@ use crate::machine::Machine;
 use crate::terms::{reserve, Slack};
 
 /// `ERL_ONHEAP_BINARY_LIMIT` (`erl_bits.h:167`): the largest byte count a hardware
-/// *heap* binary holds; a larger result needs the off-heap ref-counted binary this
-/// milestone does not build.
+/// *heap* binary holds; a larger result becomes the off-heap ref-counted binary
+/// [`make_binary`] builds ([`make_writable`] for the `bs_init_writable` accumulator).
 const ERL_ONHEAP_BINARY_LIMIT: usize = 64;
 
 /// The number of bytes in one heap word (`sizeof(Eterm)`).
