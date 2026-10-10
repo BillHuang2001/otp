@@ -23,8 +23,13 @@ module free of a module-context switch (`Step::Enter`), the interpreter everywhe
 * [`run`] — `RuntimeRunner`: the `ProcessRunner` implementation (one reduction slice) — the tier
   selection (once, at the first entry) and the tier-aware first-entry/resume execution, the
   parked-machine root publication (`publish_parked_roots`/`resume_from_process_roots`) and the
-  recorded outcome (the return value, or the exit reason stabilized through
-  `Runtime::try_stabilize_escaped`).
+  recorded outcome. Both recorded terms are transported with the **machine's off-heap handles**
+  (`engine.machine.refc_binaries()`, which is why they are stabilized *before* the engine goes back
+  into — or is dropped out of — `RunnerState`): the return value through
+  `Runtime::stabilize_term_with`, the exit reason through `Runtime::try_stabilize_escaped_with`. An
+  engine-built off-heap binary (`bs_init_writable`/`bs_create_bin` above the on-heap limit) is
+  therefore copied rather than refused with `badarg` (the return path) or kept un-copied against a
+  dangling payload (the exit path).
 * [`budget`] — the slice's reduction budget and the wrapper context that charges it.
 * [`tier`] — `JitMode` (`Auto` (**the `#[default]`**) / `Interpreter` / `Baseline`),
   `mode_from_value(Option<&str>)` (**the pure** `BEAM_RT_TIER` value semantics),
