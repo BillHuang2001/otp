@@ -156,6 +156,8 @@ battery() ->
     emit("ordered_set_update_counter_default", ordered_set_update_counter_default()),
     emit("hash_nav_absent", hash_nav_absent()),
     emit("hash_key_walk", hash_key_walk()),
+    emit("hash_last_prev_alias_first_next", hash_last_prev_alias_first_next()),
+    emit("hash_select_reverse_aliases_select", hash_select_reverse_aliases_select()),
     emit("update_counter_3_variants", update_counter_3_variants()),
     emit("update_counter_3_absent", update_counter_3_absent()),
     emit("update_counter_3_threshold", update_counter_3_threshold()),
@@ -581,6 +583,43 @@ hash_key_walk() ->
            ets:insert(T, {1, 10}), ets:insert(T, {1, 20}), ets:insert(T, {2, 20}),
            Keys = walk_next(T, ets:first(T), []),
            t([srt(Keys), r(length(Keys))])
+       end || Kind <- [set, bag, duplicate_bag]]).
+
+%% The hash-kind last/prev aliasing: a hash table implements ets:last/1 as
+%% ets:first/1 and ets:prev/2 as ets:next/2, so last =:= first, prev(K) =:= next(K)
+%% for every present K, and a prev walk from `last` reproduces the next walk from
+%% `first` exactly (the order itself is not contract → sorted at the end).
+hash_last_prev_alias_first_next() ->
+    l([begin
+           Empty = new(Kind),
+           EmptyAlias = ets:last(Empty) =:= ets:first(Empty),
+           One = new(Kind),
+           ets:insert(One, {1, 10}),
+           OneAlias = ets:last(One) =:= ets:first(One),
+           OnePrevNext = ets:prev(One, 1) =:= ets:next(One, 1),
+           T = new(Kind),
+           [ets:insert(T, {K, K * 10}) || K <- lists:seq(1, 5)],
+           First = ets:first(T), Last = ets:last(T),
+           NextWalk = walk_next(T, First, []),
+           PrevWalk = walk_prev(T, Last, []),
+           AliasAll = lists:all(fun(K) -> ets:prev(T, K) =:= ets:next(T, K) end,
+                                NextWalk),
+           t([r(EmptyAlias), r(OneAlias), r(OnePrevNext), r(Last =:= First),
+              r(AliasAll), r(PrevWalk =:= NextWalk), srt(PrevWalk)])
+       end || Kind <- [set, bag, duplicate_bag]]).
+
+%% The hash-kind select_reverse/2 aliases select/2: ERTS's db_select_reverse_hash
+%% delegates to the forward chunk function, so both traversals return the same list
+%% in the same order -- including each key's stored object order for a bag. The
+%% order itself is not contract, so only the sorted multiset is rendered.
+hash_select_reverse_aliases_select() ->
+    S = [{{'$1', '_'}, [], ['$_']}],
+    l([begin
+           T = new(Kind),
+           ets:insert(T, {1, 10}), ets:insert(T, {1, 20}), ets:insert(T, {2, 30}),
+           Fwd = ets:select(T, S),
+           Rev = ets:select_reverse(T, S),
+           t([r(Rev =:= Fwd), srt(Rev)])
        end || Kind <- [set, bag, duplicate_bag]]).
 
 %% `lookup_element/3` on a multi kind: a present key yields the element LIST,
