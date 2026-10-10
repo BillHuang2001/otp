@@ -29,8 +29,9 @@ Honors the crate-layer root-set contract: `x_reg_array[0..Live)` **plus the whol
   `garbage_collecting`, `active`, `sensitive`; per-flag get/set + `bits()/from_bits()`.
 - `Process` — the PCB, owning `pid`, `state`, `flags`, `priority`, `save_calls: u16`,
   `collector: beam_gc::Collector` (young + mature heap spaces), `relocation_exempt: bool`,
-  `off_heap: beam_message::OffHeapTable`
-  (MSO handles), `mailbox: beam_message::Queue`, `regs: Registers`, `dict: Dict`, `saved_args:
+  `off_heap: beam_message::OffHeapTable` (the process's **persistent** off-heap table — a queued
+  signal's reason objects and a host's moved-fragment objects; the send path stages through its own
+  fresh table, never this one), `mailbox: beam_message::Queue`, `regs: Registers`, `dict: Dict`, `saved_args:
   SavedArgs`, `signals: SignalQueue`, `reductions: u64`, `links: Links`, `monitors: Monitors`
   (outgoing process monitors), `monitored_by: Vec<MonitoredBy>` (incoming),
   `port_monitors: Vec<PortWatch>` (outgoing port watches), `exit_reason: Option<Eterm>`.
