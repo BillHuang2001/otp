@@ -932,7 +932,14 @@ pub fn run(args: Vec<String>) -> i32 {
     let env = config.env.clone();
     let mut source = None;
     match drive(config, &mut source) {
-        Ok(()) => EXIT_OK,
+        // A successful action still exits with the status a **non-terminating** node stop
+        // recorded: `init:stop/0,1` asks the node to halt (`init ! {stop,…}`) and returns
+        // `ok` to a caller that keeps running, so the status is applied here — after the
+        // whole expression has finished — instead of raising (the `halt/1` path below).
+        Ok(()) => source
+            .as_ref()
+            .and_then(|rt| rt.halt_status())
+            .unwrap_or(EXIT_OK),
         Err(error) => {
             if let Some(status) = error::halt_status(&error) {
                 // The program asked to terminate with this status: no diagnostic, no dump.
