@@ -370,7 +370,11 @@ fn format_fixed(value: f64, decimals: i64, compact: bool) -> Result<String> {
     if negative {
         out.push('-');
     }
-    if magnitude > FIXED_FAST_MAX || decimals >= FIXED_FAST_DECIMALS {
+    // The C's "Don't bother with optimizing too large numbers or too large
+    // precision" branch (`erl_sys_common_misc.c:196`): a magnitude above `2^53` or
+    // a precision at/above 19 falls back to a plain `%.*f`.
+    let slow = magnitude > FIXED_FAST_MAX || decimals >= FIXED_FAST_DECIMALS;
+    if slow {
         out.push_str(&format!("{magnitude:.precision$}"));
     } else if has_decimals {
         let scale = 10f64.powi(precision as i32);
@@ -390,11 +394,21 @@ fn format_fixed(value: f64, decimals: i64, compact: bool) -> Result<String> {
     } else {
         out.push_str(&(magnitude.round() as u64).to_string());
     }
-    if compact && has_decimals {
-        trim_trailing_zeros(&mut out);
-    }
+    // The buffer guard runs on the **untrimmed** rendering (`erl_sys_common_misc.c:199`),
+    // so a rendering the oracle's `fbuf[256]` cannot hold is `badarg` even when
+    // `compact` would shorten it (`float_to_list(1.7976931348623157e308,
+    // [{decimals,2},compact])`).
     if out.len() > FLOAT_BUF_CHARS {
         return Err(badarg());
+    }
+    // The slow branch drops trailing zeros whenever `compact` is set
+    // (`erl_sys_common_misc.c:202-204`); the fast branch only does so when the
+    // rendering has a fractional part (`:263`). So `{decimals,0},compact` of a
+    // magnitude above `2^53` collapses to its significant digits
+    // (`float_to_list(1.0e16,…)` ⇒ `"1"`, `9.1e15` ⇒ `"91"`) while the same option
+    // below `2^53` keeps them (`float_to_list(5.0e15,…)` ⇒ `"5000000000000000"`).
+    if compact && (has_decimals || slow) {
+        trim_trailing_zeros(&mut out);
     }
     Ok(out)
 }
@@ -811,6 +825,12 @@ mod tests {
         render_float(value, FloatFormat::Short, 20, false).expect("`short` always renders")
     }
 
+    /// The `{decimals, N}` fixed rendering of `value` — the `Fixed` arm of
+    /// [`render_float`], with `compact` selecting the trailing-zero trim.
+    fn fixed(value: f64, decimals: i64, compact: bool) -> String {
+        render_float(value, FloatFormat::Fixed, decimals, compact)
+            .expect("expected a rendering")
+    }
     /// `erlang:float_to_list(F, [short])` on the system oracle (OTP 29.1.1 /
     /// erts-17.1), each value as its IEEE-754 bit pattern. The table pins every
     /// observable property of the form: the shortest round-trip digits, the
@@ -948,5 +968,178 @@ mod tests {
         assert_eq!(short(9_007_199_254_740_991.0), "9007199254740991.0");
         assert_eq!(short(9_007_199_254_740_992.0), "9.007199254740992e15");
         assert_eq!(short(9_007_199_254_740_994.0), "9.007199254740994e15");
+    }
+
+    /// `erlang:float_to_list(F, [{decimals,0},compact])` on the system oracle
+    /// (OTP 29.1.1 / erts-17.1). The C's `compact` trim is *unconditional* in the
+    /// slow branch (`erl_sys_common_misc.c:202-204`), so a magnitude above `2^53`
+    /// collapses to its significant digits; the fast branch (`:262-263`) trims
+    /// only when the rendering has a fractional part, so a magnitude at or below
+    /// `2^53` keeps its integer trailing zeros.
+    #[test]
+    fn fixed_decimals_zero_compact_matches_the_oracle() {
+        // Slow branch (|v| > 2^53): trailing zeros are dropped.
+        for (value, expected) in [
+            (1.0e20, "1"),
+            (1.0e19, "1"),
+            (1.0e17, "1"),
+            (1.0e16, "1"),
+            (9.1e15, "91"),
+            (9.999e15, "9999"),
+            (2.0e20, "2"),
+            (1.5e20, "15"),
+            (1.234e20, "1234"),
+            (5.0e16, "5"),
+            (-1.0e20, "-1"),
+        ] {
+            assert_eq!(fixed(value, 0, true), expected, "float_to_list({value}, …)");
+        }
+        // Fast branch (|v| <= 2^53): the zeros are kept.
+        for (value, expected) in [
+            (1.0e15, "1000000000000000"),
+            (7.0e15, "7000000000000000"),
+            (5.0e15, "5000000000000000"),
+        ] {
+            assert_eq!(fixed(value, 0, true), expected, "float_to_list({value}, …)");
+        }
+        // Non-`compact` and `{decimals, N>0}` are unchanged.
+        assert_eq!(fixed(1.0e16, 0, false), "10000000000000000");
+        assert_eq!(fixed(1.0e20, 2, true), "100000000000000000000.0");
+        assert_eq!(fixed(9.1e15, 1, true), "9100000000000000.0");
+        assert_eq!(fixed(1.0, 2, true), "1.0");
+        assert_eq!(fixed(1.0, 19, true), "1.0");
+    }
+
+    /// The `fbuf[256]` guard runs on the **untrimmed** rendering
+    /// (`erl_sys_common_misc.c:199`), so a magnitude whose `%.*f` text overflows
+    /// the buffer is `badarg` even when `compact` would shorten the result —
+    /// `1.7976931348623157e308` trims to 17 characters but is still rejected.
+    #[test]
+    fn fixed_buffer_overflow_is_badarg_even_when_compact_would_shorten_it() {
+        for decimals in [0, 2] {
+            assert!(
+                render_float(f64::MAX, FloatFormat::Fixed, decimals, true).is_err(),
+                "decimals={decimals}"
+            );
+        }
+    }
+
+    /// `$ERTS_ORACLE` if it names an existing file, else `erl` on `$PATH` — the
+    /// same resolution `src/ets/specs.rs` and `tests/checksum.rs` use.
+    fn resolve_oracle() -> Option<std::path::PathBuf> {
+        if let Some(value) = std::env::var_os("ERTS_ORACLE") {
+            let program = std::path::PathBuf::from(&value);
+            if program.is_file() {
+                return Some(program);
+            }
+            eprintln!(
+                "[beam_bifs numeric] $ERTS_ORACLE='{}' is not an existing file — \
+                 treating it as no oracle.",
+                program.display()
+            );
+            return None;
+        }
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(|dir| dir.join("erl"))
+            .find(|candidate| candidate.is_file())
+    }
+
+    /// The `float_to_list/2` sweep the live-oracle cross-check runs:
+    /// `(Erlang float literal, Erlang option list, form, decimals, compact)`.
+    /// The `{decimals,0},compact` rows straddle the `2^53` fast/slow boundary (the
+    /// boundary this module's trim fix turns on); the rest are the
+    /// `{decimals,N>0},compact` and `{scientific,N}` controls that must not regress.
+    const SWEEP: &[(&str, &str, FloatFormat, i64, bool)] = &[
+        // `{decimals,0},compact` below `2^53`: fast branch, integer zeros kept.
+        ("1.0e15", "[{decimals,0},compact]", FloatFormat::Fixed, 0, true),
+        ("2.0e15", "[{decimals,0},compact]", FloatFormat::Fixed, 0, true),
+        ("7.0e15", "[{decimals,0},compact]", FloatFormat::Fixed, 0, true),
+        ("9.0e15", "[{decimals,0},compact]", FloatFormat::Fixed, 0, true),
+        // `{decimals,0},compact` above `2^53`: slow branch, zeros dropped.
+        ("9.1e15", "[{decimals,0},compact]", FloatFormat::Fixed, 0, true),
+        ("9.999e15", "[{decimals,0},compact]", FloatFormat::Fixed, 0, true),
+        ("1.0e16", "[{decimals,0},compact]", FloatFormat::Fixed, 0, true),
+        ("5.0e16", "[{decimals,0},compact]", FloatFormat::Fixed, 0, true),
+        ("1.0e17", "[{decimals,0},compact]", FloatFormat::Fixed, 0, true),
+        ("1.0e18", "[{decimals,0},compact]", FloatFormat::Fixed, 0, true),
+        ("1.0e19", "[{decimals,0},compact]", FloatFormat::Fixed, 0, true),
+        ("1.0e20", "[{decimals,0},compact]", FloatFormat::Fixed, 0, true),
+        ("2.0e20", "[{decimals,0},compact]", FloatFormat::Fixed, 0, true),
+        ("1.5e20", "[{decimals,0},compact]", FloatFormat::Fixed, 0, true),
+        ("1.234e20", "[{decimals,0},compact]", FloatFormat::Fixed, 0, true),
+        ("-1.0e20", "[{decimals,0},compact]", FloatFormat::Fixed, 0, true),
+        // Controls: the non-compact / fractional / scientific forms are unchanged.
+        ("1.0e16", "[{decimals,0}]", FloatFormat::Fixed, 0, false),
+        ("1.0e20", "[{decimals,0}]", FloatFormat::Fixed, 0, false),
+        ("1.0e20", "[{decimals,2},compact]", FloatFormat::Fixed, 2, true),
+        ("1.0e20", "[{decimals,4},compact]", FloatFormat::Fixed, 4, true),
+        ("9.1e15", "[{decimals,1},compact]", FloatFormat::Fixed, 1, true),
+        ("1.0", "[{decimals,2},compact]", FloatFormat::Fixed, 2, true),
+        ("1.0", "[{decimals,19},compact]", FloatFormat::Fixed, 19, true),
+        ("1.5", "[{decimals,1},compact]", FloatFormat::Fixed, 1, true),
+        ("0.0", "[{decimals,0},compact]", FloatFormat::Fixed, 0, true),
+        ("1.0", "[{decimals,0},compact]", FloatFormat::Fixed, 0, true),
+        ("1.0e16", "[{scientific,3}]", FloatFormat::Scientific, 3, false),
+        ("1.0e20", "[{scientific,3}]", FloatFormat::Scientific, 3, false),
+        ("9.1e15", "[{scientific,5}]", FloatFormat::Scientific, 5, false),
+    ];
+
+    /// The live-oracle cross-check for [`SWEEP`]: the oracle re-derives every
+    /// expectation, so the pinned goldens above cannot silently drift from the
+    /// real `float_to_list/2`.
+    #[test]
+    fn fixed_form_matches_the_live_oracle() {
+        let Some(oracle) = resolve_oracle() else {
+            eprintln!();
+            eprintln!("=========== beam_bifs numeric: live oracle SKIPPED ===========");
+            eprintln!("No usable system `erl` oracle found ($ERTS_ORACLE unset or not");
+            eprintln!("executable, and no `erl` on $PATH).");
+            eprintln!("This test is NOT a pass — set $ERTS_ORACLE (or install Erlang/OTP).");
+            eprintln!("=============================================================");
+            eprintln!();
+            return;
+        };
+
+        // Build the oracle's case list from `SWEEP` itself, so the two sides cannot
+        // drift out of step.
+        let cases = SWEEP
+            .iter()
+            .map(|(literal, opts, ..)| format!("{{{literal},{opts}}}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let eval = format!(
+            "Cases = [{cases}], \
+             [io:format(\"~s~n\",[erlang:float_to_list(F,O)]) || {{F,O}} <- Cases], \
+             halt()."
+        );
+        let output = std::process::Command::new(&oracle)
+            .arg("-noshell")
+            .arg("-eval")
+            .arg(&eval)
+            .arg("-s")
+            .arg("init")
+            .arg("stop")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn the oracle '{}': {e}", oracle.display()));
+        assert!(
+            output.status.success(),
+            "the oracle '{}' exited with {:?}\n--- stderr ---\n{}",
+            oracle.display(),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let stdout = String::from_utf8(output.stdout).expect("the oracle printed UTF-8");
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert_eq!(lines.len(), SWEEP.len(), "oracle output:\n{stdout}");
+
+        for ((literal, opts, format, decimals, compact), line) in SWEEP.iter().zip(&lines) {
+            let value: f64 = literal.parse().expect("an Erlang float literal");
+            let rendered = render_float(value, *format, *decimals, *compact)
+                .unwrap_or_else(|e| panic!("float_to_list({literal}, {opts}) => {e:?}"));
+            assert_eq!(&rendered, line, "float_to_list({literal}, {opts})");
+        }
     }
 }
