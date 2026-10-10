@@ -27,7 +27,8 @@
 //! the whole baseline backend (the split `mod.rs`/`runtime.rs`/`emit/` is exercised here
 //! in one place, so a change to any of them has its unit tests beside it) — a
 //! legitimately-large test module, not a file hiding a second concern. Suites that need a
-//! compiled real `.beam` live in the crate's `tests/` (`jit_real_module`, `jit_bench`).use super::emit::*;
+//! compiled real `.beam` live in the crate's `tests/` (`jit_real_module`, `jit_bench`).
+use super::emit::*;
 use super::runtime::{
     EXT_CALL, EXT_CALL_LAST, EXT_CALL_ONLY, RUNTIME_MACHINE_DISP, RUNTIME_XREGS_DISP,
 };
