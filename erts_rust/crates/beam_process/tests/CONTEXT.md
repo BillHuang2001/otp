@@ -207,9 +207,11 @@ SMP pool:
   the single-threaded scheduler (incl. the port-aware slice cleanup), mailbox, signals, GC roots, PCB state,
   pre-emption/fairness, the delivery collect-and-retry path and the host-controllable GC relocation exemption
 - `registry_monitors.rs`, `monitor_tag.rs`, `capability_inventory.rs`, `process_info_source.rs`,
-  `spawn_options.rs` → the process-control surface: name registry + monitors (incl. the `monitor/3` user
-  tag), the typed-error/capability inventory, the `process_info` item→accessor mapping, and the
-  spawn-option composition
+  `spawn_options.rs`, `lifecycle_oracle.rs` → the process-control surface: name registry + monitors (incl.
+  the `monitor/3` user tag), the typed-error/capability inventory, the `process_info` item→accessor
+  mapping, the spawn-option composition, and the lifecycle semantics (link exit propagation, `kill` under
+  `trap_exit`, exit-reason shapes, `erlang:exit/2` propagation, the registry round trip, `demonitor`
+  `[info]`/`[flush]`)
 - `split_borrow.rs` → the two `Process` split borrows (`heap_and_off_heap_mut` + `Fragments::move_into`;
   `heap_and_mailbox_mut` + `send_fragmented`)
 - `process_exit_observer.rs`, `port_monitor_cleanup.rs` → the process-death observer seam and the
