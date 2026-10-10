@@ -295,7 +295,7 @@ The **local record** of a process's relationships with processes on other nodes;
   (alloc/reuse + relationship round-trips), `progress` (generation bump), `ptab` (alloc/remove/reuse +
   serial bump, name registry, stale-pid rejection, `deliver` wake list, `take` clearing a pending wake,
   the trap/link-`EXIT`/`{'DOWN'}` paths waking a blocked recipient).
-- **`tests/` — the integration evidence pinning the M1 guarantees.** **29 files**, one topic each; the
+- **`tests/` — the integration evidence pinning the M1 guarantees.** **30 files**, one topic each; the
   authoritative per-file list lives in **`tests/CONTEXT.md`**. In short: `scheduler`/`messaging`/
   `signals`/`gc`/`priority`/`pending_signals`/`dict`/`dict_oracle`/`fragments` cover the single-threaded
   scheduler, the mailbox, signals, PCB state and the dictionary (including its `erl`-cross-checked
@@ -312,7 +312,10 @@ The **local record** of a process's relationships with processes on other nodes;
   relocation-exempt receiver surfaces the raw `Alloc` refusal and neither the base pointer nor the
   minor-GC counter moves), `gc_exemption` the host-controllable relocation exemption (the
   discriminating white-box evidence that an exempt delivery does not collect/relocate and a host-local
-  nursery term survives, with the unexempt counterpart proven to collect); and
+  nursery term survives, with the unexempt counterpart proven to collect);
+  `lifecycle_oracle` the `erl`-cross-checked lifecycle semantics (link-exit propagation, `kill` under
+  `trap_exit`, the `noproc`/`normal`/`killed` reason shapes, `erlang:exit/2` reasons, the
+  `register`/`whereis`/`registered`/`unregister` round trip, and `demonitor` `[info]`/`[flush]`); and
   `capability_inventory`/`process_info_source`/`spawn_options` the typed-error inventory, the
   `process_info` item→accessor map and the spawn-option composition. `tests/lock_scope.rs` is the
   bounded-quantum-lock evidence (a slice = `ceil(budget/quantum)` runner invocations under one slice; a
@@ -320,8 +323,8 @@ The **local record** of a process's relationships with processes on other nodes;
   whole-slice lock) plus the 1-vs-4-scheduler determinism check.
 - **`link` and monitor-death semantics are pinned by both the unit and the oracle suites.** `link` on a
   non-live local target signals `noproc` from it, and a target's death resolves the watcher's outgoing
-  `Monitor` — pinned by `tests/signals.rs`/`registry_monitors.rs`, each with an `erl`-cross-checked
-  `oracle_*` counterpart.
+  `Monitor` — pinned by `tests/signals.rs`/`registry_monitors.rs`/`lifecycle_oracle.rs`, each with an
+  `erl`-cross-checked `oracle_*` counterpart.
 - **Anti-flakiness (the SMP/lock-scope/timer/dirty/progress suites).** Every assertion is forced by
   **synchronization**, never `std::thread::sleep`: `mpsc` channels + `recv_timeout` carry the completion
   signals, `std::sync::Barrier`/gates coordinate concurrency, and `SchedulerPool::wait_idle(Some(timeout))`
@@ -332,8 +335,8 @@ The **local record** of a process's relationships with processes on other nodes;
   hanging.
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p
   beam_process` and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
-  Current total: **400 passed / 0 failed / 1 ignored** (161 in-module unit + integration across the
-  29 `tests/` files + 1 doctest; the ignored test is the documented non-yielding-runner hang failure mode
+  Current total: **411 passed / 0 failed / 1 ignored** (161 in-module unit + integration across the
+  30 `tests/` files + 1 doctest; the ignored test is the documented non-yielding-runner hang failure mode
   in `preemption.rs`), warning-free. The `oracle_*` suites share **one** `erl` driver
   (`tests/common/mod.rs`), run with `-kernel logger_level none` and normalized stdout so a crashed
   probe helper's `=ERROR REPORT====` block can never make a comparison flaky (see `tests/CONTEXT.md`). Always go through `../../scripts/cargo.sh` (`$HOME` is read-only),
@@ -406,9 +409,11 @@ The rationale (why) behind the frozen API and constraints lives in **`DESIGN_DEC
 - **Distribution-wide links/monitors**: external pids are decomposed into a `remote::RemotePid` and
   recorded (`remote_links`/`remote_monitors`), and every relationship change is routed through the
   `remote::DistSignalRouter` trait seam (implemented downstream over `beam_dist`; no crate dependency).
-  **Inbound** decoded control messages (`DOP_LINK`/`DOP_MONITOR_P`/`DOP_EXIT`) are **not** yet fed into
-  the table — that interpreter and the `DistSignal`→`Dop` adapter belong to `beam_rt` (a documented
-  handoff); with no router installed the table is record-only (`has_dist_router()`).
+  **Inbound** decoded control messages (`DOP_LINK`/`DOP_MONITOR_P`/`DOP_EXIT`/`DOP_EXIT2`) are **not** yet
+  fed into the table — that interpreter and the `DistSignal`→`Dop` adapter belong to `beam_rt` (a documented
+  handoff); with no router installed the table is record-only (`has_dist_router()`). The outbound
+  `DistSignal` keeps the link exit (`Exit` → `DOP_EXIT`) and `erlang:exit/2` (`Exit2` → `DOP_EXIT2`)
+  distinct.
 - **Port lifecycle driving** — port scheduling, port signals and the port's read path — remains
   `beam_io`'s; `PortTable` owns only the id plus the ownership/links/monitors, and
   `ProcessTable::port_closed` delivers the closing port's messages.
@@ -461,11 +466,11 @@ The rationale (why) behind the frozen API and constraints lives in **`DESIGN_DEC
 - **`port_info` item gap (owner: `beam_bifs`/`beam_rt`).** `port_info(P, queue_size)` and
   `port_info(P, locking)` are `badarg` where the oracle answers `{queue_size, 0}` / `{locking,
   port_level}`; the 7-item `port_info/1` roster and order already match.
-- **The differential allowlist carries 2 stale entries.** The gate `tools/differential/gate.sh` (a
-  sibling, read-only here) exits 3 because `tools/differential/known-gaps.txt` still lists
-  `proc_signals/monitor_3_tag_option_unsupported` and `proc_signals/monitor_port_unsupported`, two cases
-  that **agree**, so the gate exits 3 until they are dropped; the run itself is
-  `total=1213 agree=1210 mismatch=0 unsupported=3 skipped=0`.
+- **The compatibility gate is green.** `tools/differential/gate.sh --strict --allowlist
+  tools/differential/known-gaps.txt` (a sibling, read-only here) reports
+  `total=1328 agree=1327 mismatch=0 unsupported=1 skipped=0 allowed=1 unauthorized=0 stale=0`
+  (exit 0). The single allowlisted gap is `wire/new_fun_ext_encode` (A.5, unclosable by design —
+  an `erl_eval` template closure). Re-run `gate.sh` for the live figure.
 ## Routing Table
 - `DESIGN_DECISIONS.md` → the design rationale ("why") for the frozen API/constraints (signal-copy-at-enqueue, the resume-on-send wake list, the process-table mutation hub, the GC root set, dictionary equality/order, monitor/tag side tables, the SMP lock bounds, `SharedProcessTable`'s `Send/Sync`, non-flaky `wait_idle`)
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
@@ -489,7 +494,7 @@ The rationale (why) behind the frozen API and constraints lives in **`DESIGN_DEC
 - `src/port.rs` → `PortTable` (id alloc + ownership/link/monitor surface, the incoming half of a port monitor), `PortMonitor`, `PortClose`
 - `src/ptab.rs` → `ProcessTable` (pid alloc/lookup + name registry incl. `name_of` + the monitor hub (`monitor`/`noproc`, `demonitor`/`demonitor_flush`, `monitor_named`/`set_local_node`, `monitor_port(_term)`/`demonitor_port`, and the `*_with_tag` variants over their `tags` side table; a target's death resolves both halves — the watcher's outgoing `Monitor` is dropped) + the signal/link hub (incl. a non-live `link` signalling `noproc` from the dead target, and the shared `grow_receiver_for_signal` collect-grow-and-retry-once exhaustion policy its signal builders — `build_signal_term`/`copy_reason_onto`/`deliver_head_signal` — use) + decoupled signal servicing (`service_signals`, `service_signals_with_ports`) + termination (`terminate`, `terminate_with_ports`, the port-threaded `terminate_into` cascade) + the process-death observer seam + the wake list + `is_process_alive`/`exit_reason` + the remote records + the distribution seam), `ExitEffect`
 - `src/error.rs` → `pub(crate)` error constructors incl. the typed-`unsupported` and typed-`relocation_exempt` raise constructors (no new error type)
-- `tests/*.rs` (29 files) → the integration evidence; the authoritative per-file list is in `tests/CONTEXT.md` (`lock_scope.rs` = the bounded-quantum-lock + 1-vs-4-scheduler determinism evidence; `scheduler_ports.rs` = the port-aware scheduler slice cleanup; `exhaustion.rs` = deliver collect-grow-and-retry + on-demand `ensure_capacity` + fail-fast typed exhaustion; `signal_exhaustion.rs` = the same exhaustion policy on the `{'EXIT',…}`/`{'DOWN',…}` signal builders (oversized reason ⇒ nursery grown and delivered; exempt receiver ⇒ raw refusal, no relocation); `gc_exemption.rs` = the host-controllable relocation exemption (the discriminating no-collect/no-relocate white-box evidence + the unexempt counterpart); `dict_oracle.rs`/`registry_monitors.rs`/`monitor_tag.rs`/`port_monitor_cleanup.rs` = `erl`-cross-checked semantics; `preemption.rs` = the measured fairness evidence; `capability_inventory.rs` = the typed-error inventory; `split_borrow.rs` = the two split-borrow evidence sets (`heap_and_off_heap_mut` + `Fragments::move_into`; `heap_and_mailbox_mut` + `send_fragmented`); `process_exit_observer.rs`/`port_monitor_cleanup.rs` = the death-side observer + port-monitor cleanup evidence)
+- `tests/*.rs` (30 files) → the integration evidence; the authoritative per-file list is in `tests/CONTEXT.md` (`lock_scope.rs` = the bounded-quantum-lock + 1-vs-4-scheduler determinism evidence; `scheduler_ports.rs` = the port-aware scheduler slice cleanup; `exhaustion.rs` = deliver collect-grow-and-retry + on-demand `ensure_capacity` + fail-fast typed exhaustion; `signal_exhaustion.rs` = the same exhaustion policy on the `{'EXIT',…}`/`{'DOWN',…}` signal builders (oversized reason ⇒ nursery grown and delivered; exempt receiver ⇒ raw refusal, no relocation); `gc_exemption.rs` = the host-controllable relocation exemption (the discriminating no-collect/no-relocate white-box evidence + the unexempt counterpart); `lifecycle_oracle.rs` = the `erl`-cross-checked lifecycle semantics (link exit propagation, `kill` under `trap_exit`, exit-reason shapes, `erlang:exit/2` reasons, the registry round trip, `demonitor` `[info]`/`[flush]`); `dict_oracle.rs`/`registry_monitors.rs`/`monitor_tag.rs`/`port_monitor_cleanup.rs` = `erl`-cross-checked semantics; `preemption.rs` = the measured fairness evidence; `capability_inventory.rs` = the typed-error inventory; `split_borrow.rs` = the two split-borrow evidence sets (`heap_and_off_heap_mut` + `Fragments::move_into`; `heap_and_mailbox_mut` + `send_fragmented`); `process_exit_observer.rs`/`port_monitor_cleanup.rs` = the death-side observer + port-monitor cleanup evidence)
 - `tests/CONTEXT.md` → per-file topic list, the anti-flakiness constraint, the gate command
 - `../../erts/emulator/beam/erl_process.{c,h}` → PCB, scheduler, run queues (read-only ground truth)
 - `../../erts/emulator/beam/erl_thr_progress.c` → the thread-progress barrier ground truth (read-only)
