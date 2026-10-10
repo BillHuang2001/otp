@@ -782,7 +782,9 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   The following classes still use a **deterministic, panic-free fallback** rather than
   a structural comparison and must be extended if exact ordering is needed: on-heap bin refs
   (ordered by class rank, then object arity, then raw term word); internal references (compared by raw
-  payload words, not the decoded `num[]`); atoms whose name is absent from the passed `AtomTable`
+  payload words — for the M1 block those words *are* the identity, `node`/`serial`/`id`, so two refs with
+  the same id are `=:=` and ids order numerically; for a C-layout block it is the packed `u32`s, not the
+  decoded `num[]`); atoms whose name is absent from the passed `AtomTable`
   (fall back to the raw atom index).
   Hash-map comparison cannot be byte-matched to ERTS (ERTS's own HAMT order depends on its hash) — the
   flat-map-key-order rule is used for both shapes (see `src/map.rs` docs).
