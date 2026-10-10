@@ -155,10 +155,8 @@ its compiled-opcode program. The interior is a Rust AST, not a term program.
   directly against the live `erl` — `ceil`/`floor`, `max`/`min`, `binary_part/2,3`,
   `is_record/3`, `is_function/2`, `is_integer/3`, `node/0`, `xor/2`, `bnot/1` and the
   head-map literal-key rule — on top of the earlier `>`/`is_*`/`andalso`/`orelse`
-  guards and small-int arithmetic-in-a-body. One of those cases,
-  `select_guard_is_integer3`, is an honest **failure**: it exposed that
-  `guard::is_integer3` compares the upper bound the wrong way (see Known Issues), so
-  the case (and the differential gate) is red until that one comparison is fixed.
+  guards and small-int arithmetic-in-a-body; `select_guard_is_integer3` is green
+  (both bounds of the `is_integer/3` range are inclusive).
   The crate-local `tests/select.rs` / `tests/match_spec_run.rs` pin the full
   guard-BIF set (map/tuple/bitstring/float/`trunc`/`round`/`abs` + map construction,
   each with its live-`erl` probe quoted) and the guard-error classification (an
