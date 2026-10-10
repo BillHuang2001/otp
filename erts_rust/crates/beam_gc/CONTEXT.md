@@ -617,6 +617,23 @@ still reproduces today's collector exactly.
   major reclaims it only when dead; a mixed workload structurally equal under both strategies; and an
   **asserted** live-set-bounded memory accounting (retained `used_lines`·`LINE_WORDS` ≥ live words, slack ≤
   `live·(LINE_WORDS-1)`, and it drops when live objects are dropped).
+- **Per-shape copy coverage — what `beam_gc` proves directly, and the gaps.** The copier's per-object
+  sizing/child walk is `../beam_term`'s `layout::{object_words, for_each_child_slot}`. Direct
+  copy-correctness evidence exists for: cons cells + nested tuples (`tests/copy_correctness.rs`); flat
+  maps and >32-key HAMT maps incl. the collision node (`tests/map_copy.rs` — whose `MARKER`-scanned
+  footprint is the one per-shape word-count check independent of every size heuristic, `map_copy.rs:67,82`);
+  the 8-word `ErlSubBits`+`BinRef` refc pair (`tests/refc_binary_copy.rs`); Local/External/Imported funs
+  incl. the >255-arity External descriptor word and the descriptor-opacity property (`tests/fun_copy.rs`);
+  and a mixed cross-generation corpus — cycles, tuples, flat+HAMT maps, on-heap byte-aligned and
+  non-byte-aligned bitstrings, refc binaries, an off-heap MSO, all three fun kinds and an external pid
+  (`tests/stress_cross_generation.rs`). `tests/memory_overhead.rs` independently cross-checks
+  `object_words` against the bump allocator's real consumption for cons/2-tuple/float/flat-map.
+  **Not directly exercised by any `beam_gc` test:** bignums (`write_big`), native-record instances
+  (`RECORD_SUBTAG`/`write_record`), an `ErlSubBits` *match context* over an on-heap bitstring (the
+  non-`BinRef` `sub_bits_words` case), external ports/refs (`write_external_port`/`write_external_ref`),
+  and the `MAP_HEADER_TAG_HAMT_HEAD_ARRAY` head node (reachable only from `write_map` when the root
+  bitmap is full; exercised at best incidentally/unasserted). Each is a leaf or transparent-arityval
+  shape handled by `layout`'s default/`ARITYVAL` arms, but none has a direct copy test.
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_gc`
   and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
 - Cross-checks against the real system ERTS belong to `../tools/differential/`, not here.
