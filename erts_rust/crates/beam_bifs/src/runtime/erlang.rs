@@ -445,40 +445,37 @@ mod tests {
     use crate::bits;
     use crate::registry::default_registry;
 
-    /// The oracle probe behind every golden pinned in this module (OTP 29.1.1 /
-    /// erts-17.1), run as
-    ///
-    /// ```text
-    /// $D/probe.erl:
-    ///   -module(probe).  -export([main/0]).
-    ///   p(F) -> try F() catch C:R -> {C, R} end.
-    ///   main() ->
-    ///     io:format("small_bin ~p~n", [p(fun() -> erlang:term_to_iovec(<<1,2,3>>) end)]),
-    ///     io:format("tuple ~p~n", [p(fun() -> erlang:term_to_iovec({a,b}) end)]),
-    ///     io:format("atom1 ~p~n", [p(fun() -> erlang:term_to_iovec(abc) end)]),
-    ///     io:format("mv0 ~p~n", [p(fun() -> erlang:term_to_iovec(abc, [{minor_version,0}]) end)]),
-    ///     io:format("compressed_small ~p~n", [p(fun() -> erlang:term_to_iovec(abc, [compressed]) end)]),
-    ///     io:format("compressed0_small ~p~n", [p(fun() -> erlang:term_to_iovec(abc, [{compressed,0}]) end)]),
-    ///     io:format("bin65_1 ~p~n", [p(fun() -> [byte_size(B) || B <- erlang:term_to_iovec(binary:copy(<<1>>,65))] end)]),
-    ///     io:format("big_comp_is_list ~p~n", [p(fun() -> is_list(erlang:term_to_iovec(lists:duplicate(500,hello),[compressed])) end)]),
-    ///     io:format("bad_iovec ~p~n", [p(fun() -> erlang:term_to_iovec(abc, [iovec]) end)]),
-    ///     io:format("abs/1 ~p~n", [p(fun() -> erlang:is_builtin(erlang, abs, 1) end)]),
-    ///     io:format("2^32+1 abs ~p~n", [p(fun() -> erlang:is_builtin(erlang, abs, 4294967297) end)]),
-    ///     halt(0).
-    /// $ erlc -o $D $D/probe.erl && erl -noshell -pa $D -s probe main -s init stop
-    /// small_bin [<<131,109,0,0,0,3,1,2,3>>]
-    /// tuple [<<131,104,2,119,1,97,119,1,98>>]
-    /// atom1 [<<131,119,3,97,98,99>>]
-    /// mv0 [<<131,100,0,3,97,98,99>>]
-    /// compressed_small <<131,119,3,97,98,99>>
-    /// compressed0_small [<<131,119,3,97,98,99>>]
-    /// bin65_1 [6,65]
-    /// big_comp_is_list false
-    /// bad_iovec {error,badarg}
-    /// abs/1 true
-    /// 2^32+1 abs true
-    /// ```
-    const PROBE: () = ();
+    // The oracle probe behind every golden pinned in this module (OTP 29.1.1 /
+    // erts-17.1), run as
+    //
+    // $D/probe.erl:
+    //   -module(probe).  -export([main/0]).
+    //   p(F) -> try F() catch C:R -> {C, R} end.
+    //   main() ->
+    //     io:format("small_bin ~p~n", [p(fun() -> erlang:term_to_iovec(<<1,2,3>>) end)]),
+    //     io:format("tuple ~p~n", [p(fun() -> erlang:term_to_iovec({a,b}) end)]),
+    //     io:format("atom1 ~p~n", [p(fun() -> erlang:term_to_iovec(abc) end)]),
+    //     io:format("mv0 ~p~n", [p(fun() -> erlang:term_to_iovec(abc, [{minor_version,0}]) end)]),
+    //     io:format("compressed_small ~p~n", [p(fun() -> erlang:term_to_iovec(abc, [compressed]) end)]),
+    //     io:format("compressed0_small ~p~n", [p(fun() -> erlang:term_to_iovec(abc, [{compressed,0}]) end)]),
+    //     io:format("bin65_1 ~p~n", [p(fun() -> [byte_size(B) || B <- erlang:term_to_iovec(binary:copy(<<1>>,65))] end)]),
+    //     io:format("big_comp_is_list ~p~n", [p(fun() -> is_list(erlang:term_to_iovec(lists:duplicate(500,hello),[compressed])) end)]),
+    //     io:format("bad_iovec ~p~n", [p(fun() -> erlang:term_to_iovec(abc, [iovec]) end)]),
+    //     io:format("abs/1 ~p~n", [p(fun() -> erlang:is_builtin(erlang, abs, 1) end)]),
+    //     io:format("2^32+1 abs ~p~n", [p(fun() -> erlang:is_builtin(erlang, abs, 4294967297) end)]),
+    //     halt(0).
+    // $ erlc -o $D $D/probe.erl && erl -noshell -pa $D -s probe main -s init stop
+    // small_bin [<<131,109,0,0,0,3,1,2,3>>]
+    // tuple [<<131,104,2,119,1,97,119,1,98>>]
+    // atom1 [<<131,119,3,97,98,99>>]
+    // mv0 [<<131,100,0,3,97,98,99>>]
+    // compressed_small <<131,119,3,97,98,99>>
+    // compressed0_small [<<131,119,3,97,98,99>>]
+    // bin65_1 [6,65]
+    // big_comp_is_list false
+    // bad_iovec {error,badarg}
+    // abs/1 true
+    // 2^32+1 abs true
 
     /// The atoms every test table is seeded with, plus `extra`.
     fn seeded(extra: &[&str]) -> AtomTable {
@@ -516,6 +513,22 @@ mod tests {
         f(&reg, &mut ctx)
     }
 
+    /// Like [`with_reg`], but the registry also carries the `term_to_binary`
+    /// family ([`crate::binconv`]), so a test can cross-check `term_to_iovec`'s
+    /// image against the encoder it shares (the oracle's own equivalence:
+    /// `term_to_iovec/2 =:= term_to_binary/2`).
+    fn with_encoder_reg<R>(
+        extra: &[&str],
+        f: impl FnOnce(&BifRegistry, &mut BifContext<'_>) -> R,
+    ) -> R {
+        let mut reg = BifRegistry::new();
+        register(&mut reg);
+        crate::binconv::register(&mut reg);
+        let mut heap = Heap::new(1 << 20).expect("test heap");
+        let atoms = seeded(extra);
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        f(&reg, &mut ctx)
+    }
     fn call(
         reg: &BifRegistry,
         ctx: &mut BifContext<'_>,
@@ -668,22 +681,6 @@ mod tests {
 
     // -- erlang:term_to_iovec/1,2 -------------------------------------------
 
-    /// Runs `erlang:term_to_iovec(Term, Options)` in a registry that went through
-    /// the whole runtime registration (so nothing but the parameter list differs
-    /// from a real dispatch).
-    fn iovec(name: &str, term: Eterm, options: Option<Eterm>) -> Eterm {
-        let mut reg = BifRegistry::new();
-        crate::runtime::register(&mut reg);
-        let mut heap = Heap::new(1 << 20).expect("test heap");
-        let atoms = seeded(&[]);
-        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
-        let args: Vec<Eterm> = match options {
-            None => vec![term],
-            Some(opts) => vec![term, opts],
-        };
-        call(&reg, &mut ctx, name, &args).expect("term_to_iovec")
-    }
-
     #[test]
     fn term_to_iovec_returns_the_oracle_bytes() {
         // ORACLE: term_to_iovec(<<1,2,3>>) -> [<<131,109,0,0,0,3,1,2,3>>]
@@ -781,7 +778,7 @@ mod tests {
         // ORACLE: byte_size(term_to_iovec(lists:duplicate(500,hello),[compressed])) -> 50
         // ORACLE: is_list(...)                                                      -> false
         // ORACLE: term_to_iovec(T,[compressed]) =:= term_to_binary(T,[compressed])   -> true
-        with_reg(&[], |reg, ctx| {
+        with_encoder_reg(&[], |reg, ctx| {
             let hello = atom(ctx, "hello");
             let big = ctx.list(&vec![hello; 500]).expect("500xhello");
             let compressed = atom(ctx, "compressed");
@@ -793,8 +790,29 @@ mod tests {
 
             let t2b = call(reg, ctx, "term_to_binary", &[big, opts]).expect("t2b");
             let expected = bytes_of(ctx, t2b);
-            assert_eq!(image, expected);
-            assert_eq!(image.len(), 50, "the oracle's byte_size/1 is 50");
+            assert_eq!(image, expected, "term_to_iovec/2 =:= term_to_binary/2");
+
+            // The `[131][80][body_len:4 BE][zlib]` wrapper. The deflate bytes are
+            // implementation-defined (this crate's miniz_oxide emits one byte less
+            // than the oracle's zlib for this body), so — exactly as `crate::binconv`'s
+            // compressed tests do — only the framing and the round-trip are pinned,
+            // never the oracle's `byte_size/1` (50). See `../CONTEXT.md`.
+            let plain_term = call(reg, ctx, "term_to_binary", &[big]).expect("plain");
+            let plain = bytes_of(ctx, plain_term);
+            assert_eq!(image[0], 131, "VERSION_MAGIC");
+            assert_eq!(image[1], 80, "COMPRESSED_EXT");
+            assert_eq!(
+                u32::from_be_bytes([image[2], image[3], image[4], image[5]]) as usize,
+                plain.len() - 1,
+                "the size field is the body length (without the version byte)"
+            );
+            assert!(image.len() < plain.len(), "compression helped");
+
+            // The compressed image round-trips to the very same term.
+            let back = call(reg, ctx, "binary_to_term", &[result]).expect("round-trip");
+            let re_encoded_term = call(reg, ctx, "term_to_binary", &[back]).expect("re-encode");
+            let re_encoded = bytes_of(ctx, re_encoded_term);
+            assert_eq!(re_encoded, plain);
         });
     }
 
@@ -804,7 +822,7 @@ mod tests {
         //   (the oracle splits the refc payload out; this runtime materialises one
         //    contiguous image — same bytes, fewer segments: see `term_to_iovec_2`)
         // ORACLE: iolist_to_binary(term_to_iovec(T)) =:= term_to_binary(T)     -> true
-        with_reg(&[], |reg, ctx| {
+        with_encoder_reg(&[], |reg, ctx| {
             let payload = vec![1u8; 65];
             let big = bin(ctx, &payload);
             let result = call(reg, ctx, "term_to_iovec", &[big]).expect("iovec");
@@ -864,17 +882,20 @@ mod tests {
 
     /// Builds a `term_to_binary/2` option list from its Erlang source spelling.
     ///
-    /// The atoms the writer needs must be seeded; the two element forms the probe
-    /// uses are a bare atom and a 2-tuple of atoms/integers.
+    /// The atoms the writer needs must be seeded; the element forms the probe uses
+    /// are a bare atom, a `<<...>>` binary, and a 2-tuple of atoms/integers.
     fn build_options(ctx: &mut BifContext<'_>, options: &[&str]) -> Eterm {
         let mut elems = Vec::with_capacity(options.len());
         for option in options {
             let trimmed = option.trim();
             let elem = match trimmed.strip_prefix('{') {
-                None => match trimmed {
-                    "<<" => bin(ctx, &[1]),
-                    name => atom(ctx, name),
-                },
+                None => {
+                    if trimmed.starts_with("<<") {
+                        bin(ctx, &[1])
+                    } else {
+                        atom(ctx, trimmed)
+                    }
+                }
                 Some(inner) => {
                     let inner = inner.strip_suffix('}').expect("a closing brace");
                     let (head, tail) = inner.split_once(',').expect("a 2-tuple");
