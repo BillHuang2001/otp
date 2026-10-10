@@ -136,24 +136,35 @@ Verified against the system `erlc` (OTP 29) disassembly:
 ## Known Issues
 - **Nameability is a host load-time obligation** (see "The reason-atom contract" above). A host
   loading a module with the private, unseeded `beam_loader::load_file` table gets the typed
-  `unsupported` for the `badkey` case — the installed `erlc` interns `badmap` itself (its
-  `test,is_map` guard fail path builds `{badmap,X}`) but not `badkey`. The seeded hosts
-  (`beam_rt::boot::CORE_ATOMS`, the test `SEED_ATOMS`) name both, so the raise is the oracle's
-  `{badkey,Key}`/`{badmap,Source}` exactly. No engine seam resolves a tag outside the running
-  module's table; none should.
+  `unsupported` for the `badkey` case (the installed `erlc` interns `badmap` itself — its
+  `test,is_map` guard fail path builds `{badmap,X}` — but not `badkey`) and for the read
+  instructions' `function_clause` case when the module does not name it. The seeded hosts
+  (`beam_rt::boot::CORE_ATOMS`, the test `SEED_ATOMS`) name `badmap`/`badkey`/`function_clause`,
+  so the raise is the oracle's `{badkey,Key}`/`{badmap,Source}` (and the engine-defined bare
+  `function_clause`) exactly. No engine seam resolves a tag outside the running module's table;
+  none should.
 - `lookup`/`position` are O(n) scans (no hash) and `put_map_assoc` is O(n²) in the pair count
   (`write.rs:105`); correct but unoptimised.
 - `write.rs:165` (`put_map_exact: key vanished across the reserve`) is a defensive typed error
   for an impossible post-reserve state.
 
+## Handoff (parent-owned)
+- `../../../tests/gaps.rs` asserts the two read instructions' `no_fail` cases against the **old**
+  sentinel strings (`get_map_elements: key absent with no fail label` / `has_map_fields: key absent
+  with no fail label`). Those cases now surface the missing-atom gap, so the two expected strings
+  must become `maps: no 'function_clause' atom in the module` (the module in that fixture names
+  neither tag). This file is outside this node's scope.
+
 ## Notes for Agents
-- To make the two tags nameable for **any** host (not just a seeding one), the engine would need
+- To make the tags nameable for **any** host (not just a seeding one), the engine would need
   a new **defaulted** `ExecutionContext` method (e.g. `resolve_atom(&mut self, name: &str) ->
   Option<Atom>`, host contract: the returned index must be valid in the running module's table) —
-  today no such seam exists, and `raise_error_tuple` cannot reach the host's table. Do not
-  substitute a foreign index: an atom index is only meaningful against the table it is read with.
+  today no such seam exists, and `raise_error_tuple`/`raise_function_clause` cannot reach the
+  host's table. Do not substitute a foreign index: an atom index is only meaningful against the
+  table it is read with.
 - `raise_error_tuple` installs the `error` class atom only when the module can name it
-  (`mod.rs:266-268`), so an uncaught raise still propagates as `Err(BeamError::Raise(..))`.
+  (`mod.rs:317-319`), and `raise_function_clause` does the same (`mod.rs:287-289`), so an uncaught
+  raise still propagates as `Err(BeamError::Raise(..))`.
 - The same by-name/typed-gap pattern is used by the exceptions family
   (`../exceptions/raise.rs:52-86`), so a change to this contract is a two-site change.
 
