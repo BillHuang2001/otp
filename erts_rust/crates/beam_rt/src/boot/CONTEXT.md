@@ -143,8 +143,28 @@ configuration and it runs **all 22 directives to completion**, ending at the fin
   drive until their directive's MFA returns, so `whereis(application_controller)` answers a live,
   registered server — the directive ran `application_controller:start/1` to its `{ok, AC}` return
   (`application_controller.erl:203-211`), i.e. the AC completed `init/2` (`:531-558`) and reached
-  `gen_server:enter_loop`. `heart` and `logger` are not registered — both legitimately (heart returns
-  `ignore`; logger never reaches registration).
+  `gen_server:enter_loop`.
+  `heart` is not registered either, legitimately: `heart:start/0` returns `ignore`.
+- **`logger` is NOT registered — a cross-crate seam gap, not a boot gap.** Instruction 13's
+  `{kernelProcess,logger,{logger_server,start_link,[]}}` spawns the `logger_server` child through
+  `proc_lib:start_link/5` (`gen_server:start_link({local,logger}, …)`), whose body is entered through
+  `erlang:apply/3` (`proc_lib:init_p_do_apply/3`'s `try apply(M,F,A)`).
+  Because `erlang` is a member of `../native`'s `FLOOR_MODULES`, `RuntimeContext::resolve_external_call`
+  declines that call (`Ok(None)`), so the apply runs **synchronously** instead of through the
+  `Step::Enter` seam and the child's blocking `gen_server:init_it`/`init` folds into the typed
+  `error::blocked()`.
+  The child therefore dies before `proc_lib:init_ack/2`, `gen_server:init_it` never reaches its
+  `register(logger, self())`, and the directive's parked `proc_lib:sync_start/2` (timeout `infinity`)
+  never resumes.
+  The oracle **does** register the name: real OTP leaves a live `logger_server` registered as `logger`,
+  so a second `logger_server:start_link/0` reports `{error,{already_started,Pid}}`.
+  Closing the gap is a `beam_engine` change (give `call_ext`/`erlang:apply/2,3` the
+  `resolve_external_call`/`Step::Enter` treatment the literal-target `call_ext` already gets) or a
+  `../context` change (intercept `erlang:apply/2,3` in `call_bif` and run the target through the
+  blocking-aware entry) — **not** a boot change.
+  Pinned by `bootscript.rs::tests::the_real_boot_leaves_logger_unregistered_pending_the_apply_seam_gap`
+  (today's true behaviour) and the `#[ignore]`d positive
+  `bootscript.rs::tests::the_real_boot_registers_a_live_logger_process`.
 - **Instruction 20's `gen_server:call` suspends and resumes.** `apply_boot_call` runs `c:erlangrc/0`
   through the engine's blocking-aware entry; the scheduler pass services the `file_server_2` mailbox
   and delivers the reply (counted into the pass's `delivered` by `service_file_requests`), and the call
