@@ -642,5 +642,22 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        Case {
+            id: "bifs/base64_encode_empty_binary",
+            description: "base64:encode/1 of a zero-length binary is the zero-length binary <<>>",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // A zero-length *result* must be returned, not refused. The input is built at
+                // run time (`binary:copy/2` of one byte repeated 0 times) so it is not folded
+                // into a literal, and `base64:encode/1` still hands back an off-heap binary.
+                expr: "base64:encode(binary:copy(<<$A>>, 0))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok <<>>"),
+                exit_code: 0,
+            },
+        },
     ]
 }

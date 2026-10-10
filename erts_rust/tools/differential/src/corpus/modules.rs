@@ -38,6 +38,11 @@
 //! evidences: [`Contract::BeamAsm`] (a compiled `.beam` executes), plus
 //! [`Contract::LanguageSemantics`] (arithmetic/control-flow semantics) or
 //! [`Contract::OtpApps`] (a BIF/stdlib call) as applicable.
+//!
+//! The `modules/erl_error_format_exception_*` block additionally pins a **crash
+//! regression**: `erl_error:format_exception/3` on a **heap-allocated** reason (the `{1,2}` /
+//! `{a,b}` tuples) used to `SIGSEGV` the Rust runtime where the oracle answered a value, so
+//! each of those cases now agrees.
 
 use super::{Case, CaseKind, Contract, Golden, ModuleRun};
 
@@ -146,6 +151,19 @@ pub(crate) const DIFF_OPS_SOURCE: &str = "-module(diff_ops).\n\
      sum_range(A, B) when A > B -> 0;\n\
      sum_range(A, B) -> A + sum_range(A + 1, B).\n";
 
+/// The source compiled for the `erl_error:format_exception/3` regression cases.
+///
+/// Each exported function hands a reason to `erl_error:format_exception/3` and reduces the
+/// (deep) formatted charlist to its **flattened length**, an integer — the shape a module-run
+/// golden pins. The `{1,2}` / `{a,b}` reasons are **heap-allocated** tuples, which is exactly
+/// the shape that used to `SIGSEGV` the Rust runtime (the heap-allocated reason was walked
+/// through a stale pointer) while the oracle returned a value; `badarg` is an immediate atom.
+pub(crate) const DIFF_ERL_ERROR_SOURCE: &str = "-module(diff_erl_error).\n\
+     -export([fmt_throw_tuple/0, fmt_throw_atom_tuple/0, fmt_error_badarg/0]).\n\
+     fmt_throw_tuple() -> length(lists:flatten(erl_error:format_exception(throw, {1,2}, []))).\n\
+     fmt_throw_atom_tuple() -> length(lists:flatten(erl_error:format_exception(throw, {a,b}, []))).\n\
+     fmt_error_badarg() -> length(lists:flatten(erl_error:format_exception(error, badarg, []))).\n";
+
 /// Build one module-run case.
 fn case(
     id: &'static str,
@@ -175,6 +193,31 @@ fn case(
     }
 }
 
+/// Build one `erl_error:format_exception/3` module-run case (arity-0, integer result).
+fn err_case(
+    id: &'static str,
+    description: &'static str,
+    function: &'static str,
+    golden: &'static str,
+) -> Case {
+    Case {
+        id,
+        description,
+        contracts: &[Contract::BeamAsm, Contract::OtpApps],
+        kind: CaseKind::Module(ModuleRun {
+            source: DIFF_ERL_ERROR_SOURCE,
+            module: "diff_erl_error",
+            function,
+            arity: 0,
+            args: &[],
+            nif: None,
+        }),
+        golden: Golden {
+            stdout: Some(golden),
+            exit_code: 0,
+        },
+    }
+}
 /// The A.2 module-run cases. Every one of these is verified `AGREE`.
 pub(crate) fn group() -> Vec<Case> {
     use Contract::{BeamAsm, LanguageSemantics, OtpApps};
@@ -769,6 +812,31 @@ pub(crate) fn group() -> Vec<Case> {
             2,
             &[1, 10],
             "55",
+        ),
+        // --- A.7: the `erl_error:format_exception/3` heap-allocated-reason regression -------
+        //
+        // `format_exception/3` walks the reason it is handed; a **heap-allocated** reason (the
+        // `{1,2}`/`{a,b}` tuples) used to drive the Rust runtime into a `SIGSEGV` while the
+        // oracle answered a value. Each case reduces the (deep) formatted charlist to its
+        // flattened length — an integer, so the golden is stable — and must agree under both
+        // runtimes. `badarg` (an immediate atom) is the neighbouring shape that always worked.
+        err_case(
+            "modules/erl_error_format_exception_throw_tuple",
+            "erl_error:format_exception/3 on a heap-allocated tuple reason (throw, {1,2}) agrees",
+            "fmt_throw_tuple",
+            "22",
+        ),
+        err_case(
+            "modules/erl_error_format_exception_throw_atom_tuple",
+            "erl_error:format_exception/3 on a heap-allocated atom-tuple reason (throw, {a,b}) agrees",
+            "fmt_throw_atom_tuple",
+            "22",
+        ),
+        err_case(
+            "modules/erl_error_format_exception_error_badarg",
+            "erl_error:format_exception/3 on the immediate reason (error, badarg) agrees",
+            "fmt_error_badarg",
+            "29",
         ),
     ]
 }

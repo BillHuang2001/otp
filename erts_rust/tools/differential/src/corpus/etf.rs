@@ -33,9 +33,13 @@
 //! * an internal port ⇒ `V4_PORT_EXT` (120).
 //!
 //! The Rust runtime encodes a local pid (`NEW_PID_EXT`, 88) and an internal port
-//! (`V4_PORT_EXT`, 120), so both cases `agree` on their stable leading tag byte. Encoding an
-//! external **reference** is the runtime's `beam_rt: unsupported: external_term` capability
-//! gap, so no ref case is registered here.
+//! (`V4_PORT_EXT`, 120), so both cases `agree` on their stable leading tag byte. A **local**
+//! reference round-trips too: `make_ref/0` encodes to `NEWER_REFERENCE_EXT` (90) and decodes
+//! back, and both a pid and a reference come back **identical** to what went in, so those are
+//! pinned by identity/shape
+//! (`binary_to_term(term_to_binary(self())) =:= self()`,
+//! `is_reference(binary_to_term(term_to_binary(make_ref())))`) — the per-VM-start id/creation
+//! bytes of a pid/ref/port image are still never asserted.
 //!
 //! ## Known divergence (handoff — deliberately no case registered)
 //! A map with **more than 32 keys** (the large-map / hashmap image) cannot be pinned today:
@@ -766,6 +770,73 @@ pub(crate) fn group() -> Vec<Case> {
             },
             golden: Golden {
                 stdout: Some("ok <<131,119,4,116,114,117,101>>"),
+                exit_code: 0,
+            },
+        },
+        // -- the local pid/reference identity round trip (A.2/A.5) --------------------------
+        //
+        // A `NEW_PID_EXT`/`NEWER_REFERENCE_EXT` image carries the node's `(name, creation)`
+        // identity, so its bytes are per-VM-start and never asserted: what is pinned is that the
+        // decoded value **is** the value that went in (`=:=` for the pid, the `is_reference/1`
+        // shape for the reference — a ref's raw bytes are VM-unique). The compressed variant
+        // carries a pid and a reference past the 64-byte on-heap limit, and then observes them
+        // only through stable booleans/integers.
+        Case {
+            id: "etf/roundtrip_self_pid_identity",
+            description: "binary_to_term(term_to_binary(self())) is the very pid that called it",
+            contracts: &[Contract::BeamAsm, Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "binary_to_term(term_to_binary(self())) =:= self()",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/roundtrip_reference_shape",
+            description: "term_to_binary/1 of make_ref/0 encodes and decodes back to a reference",
+            contracts: &[Contract::BeamAsm, Contract::Distribution],
+            kind: CaseKind::Eval {
+                // The reference itself is per-VM-start, so only its *type* is observed.
+                expr: "is_reference(binary_to_term(term_to_binary(make_ref())))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/roundtrip_compressed_stable_term",
+            description: "a `[compressed]` image >64 bytes round-trips through binary_to_term/1",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "binary_to_term(term_to_binary({a,lists:seq(1,64)}, [compressed])) =:= {a,lists:seq(1,64)}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/roundtrip_compressed_pid_ref_payload",
+            description: "a `[compressed]` image past the on-heap limit brings back the same pid and reference",
+            contracts: &[Contract::BeamAsm, Contract::Distribution],
+            kind: CaseKind::Eval {
+                // The pid/reference are compared *to the values that went in*, so the golden is a
+                // stable `{true,true,64}` regardless of the per-VM-start ids.
+                expr: "begin P = self(), Ref = make_ref(), {P2,Ref2,Tail} = binary_to_term(term_to_binary({P,Ref,lists:seq(1,64)}, [compressed])), {P2 =:= P, Ref2 =:= Ref, length(Tail)} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {true,true,64}"),
                 exit_code: 0,
             },
         },
