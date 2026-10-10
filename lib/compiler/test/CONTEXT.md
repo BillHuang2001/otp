@@ -33,7 +33,16 @@ Generated clone `.erl` files and `Emakefile` are build artifacts — git-ignored
 - `test_lib.erl` / `test_lib.hrl` — shared helpers: `recompile/1`, `recompile_core/1` (from Core), `id/1`, `parallel/0`, `opt_opts/1`, `get_data_dir/1`, `smoke_disasm/1`, `p_run/2`, `highest_opcode/1`, `get_unique_files/1,2`, `assert_error_stack/3`. `test_lib.hrl` defines the `?AssertErrorStack(Error, Stack, Expr)` macro (asserts a raised error term and stacktrace shape); `test_lib:binary_part/2` and `test_lib:binary/1` exist to be overridden by BIF-override test cases.
 - `erl_md5.erl` — self-contained MD5 implementation used by `misc_SUITE`'s `md5` testcase.
 - `ext_records.erl` — module exporting native records (`-export_record([...])`) consumed by `native_record_SUITE`'s external-records testcase.
+- `stage2_bench.erl` — the driver behind `measure_stage2_compile.sh` (see "Compile-Throughput Measurement"). Not a suite; listed in `MODULES` so it is linted/installed like the other support modules.
 - `test_lib:get_unique_files/1,2` enumerates non-cloned, non-LFE `*_SUITE` files (used for the "loaded/smoke" style suites).
+
+## Compile-Throughput Measurement (Stage-2 passes)
+`measure_stage2_compile.sh` (+ `stage2_bench.erl`) is a manual, committed measurement harness — not a suite and not in CI. It answers "what do the opt-in Stage-2 passes cost, and did they fire at all?":
+- `lib/compiler/test/measure_stage2_compile.sh` (env: `REPS=N` default 5, `RIG_EBIN=DIR` to reuse a rig, `KEEP_SCRATCH=1`). Step 1 resolves `RIG_EBIN` via `../scripts/host_env.sh build` (read-only; writes only to `/tmp`), step 2 compiles `stage2_bench.erl` with the *host* `erlc` into a scratch `ebin`, step 3 runs `erl -noshell -pa <scratch> -pa $RIG_EBIN -s stage2_bench main -extra $REPS $ERL_TOP` (never an escript: escripts reject `-pa` and preload the host `compile`).
+- `stage2_bench` compiles `lib/stdlib/src/*.erl` (96 modules; `-I lib/stdlib/include lib/kernel/include lib/compiler/src`) in ONE session, once per option set — `off`, `loop_opt+loop_arith_licm`, `fusion_opt`, `fbip_opt`, `all` — after one discarded `off` warmup, rotating the option order every repetition (so drift does not favour one set). It prints min/median/max wall-clock, the ratio against `off`, and the number of modules whose `Code` chunk differs from the `off` reference; the raw per-repetition numbers are printed too. Modules that fail to compile are counted and listed. It exits non-zero only on harness errors (wrong compiler, empty corpus), never because a pass did or did not fire.
+- It refuses to run unless `code:which(compile)` is inside `RIG_EBIN` (exported by the wrapper): a forgotten `-pa` would otherwise silently benchmark the host OTP compiler, whose default pipeline knows nothing about these flags.
+- The `Code` chunk is extracted by hand from the FOR1 container (4-byte chunk id, 32-bit size, 4-byte-aligned payload, after the unsized `BEAM` form type) because the host's `beam_lib:chunks/2` cannot read it (`{error,beam_lib,{unknown_chunk,...}}`).
+- Interpretation: this host is shared/loaded, so only *ratios* mean anything (observed per-set spread is 10–40% within a run), always read the "changed" column first. Last measured (96-module stdlib corpus, host OTP 29.1.1, rig compiler 10.0.6, 5 and 7 repetitions): 24 modules change under `loop_opt+loop_arith_licm`, 2 under `fusion_opt`, 3 under `fbip_opt`, 27 under `all`; `all` is consistently the slowest option set (~+11–15% vs `off`), `fusion_opt` is indistinguishable from `off` at this noise level.
 
 ## Compile Flags for the Suites Themselves
 `ERL_COMPILE_FLAGS += +clint +clint0 +ssalint +nowarn_missing_spec_documented` — the suites are themselves compiled with the compiler's SSA/core linters enabled (so test code exercises the linters); `+deterministic` is filtered out.
@@ -100,6 +109,7 @@ This recipe drives the pass suites (`ssa_opt_budget_SUITE`, `beam_ssa_loop_opt_S
 | `z_SUITE`, `random_code_SUITE` | Smoke test (`code:all_loaded/0` sanity) and property-based random compilation |
 | `lfe_andor_SUITE.core`, `lfe_guard_SUITE.core` | LFE-derived Core Erlang suites (`+from_core`) |
 | `property_test/` | PropEr/EQC property tests (`compile_prop.erl`, `beam_types_prop.erl`) |
+| `measure_stage2_compile.sh` + `stage2_bench.erl` | Manual compile-throughput measurement of the opt-in Stage-2 passes on the whole `lib/stdlib/src` corpus (not a suite, not in CI) |
 | Fixture data dirs (`*_SUITE_data/`) | Static inputs consumed by their matching suite: `beam_doc_`, `beam_ssa_check_`, `beam_validator_` (`.S` listings), `bif_`, `compilation_`, `compile_`, `core_fold_`, `core_` (`.core`), `error_`, `inline_`, `receive_`, `record_` |
 
 ## Optimization-Correctness Guardrails (lists / maps / records / destructive update)
