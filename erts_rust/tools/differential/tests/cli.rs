@@ -795,6 +795,89 @@ fn the_ratchet_tolerates_only_the_recorded_gaps_end_to_end() {
     );
 }
 
+/// A `Mismatch` whose case id **is** recorded in an allowlist is still a hard failure: the
+/// allowlist tolerates only `unsupported`/`skipped` capability gaps, so it can never convert a
+/// genuine divergence into a pass.
+///
+/// A fake `$BEAM_RT` that prints a **differing** stdout (exit 0) makes every corpus case a
+/// `mismatch`; a synthetic allowlist records the target eval case's id. The binary must still
+/// report the mismatch and exit `1`, classify the recorded id `stale` (never `allowed`), and
+/// never let `ratchet.allowed` absorb it — so `gate.sh`'s `mismatch > 0 → exit 1` rule is what
+/// the binary enforces.
+#[cfg(unix)]
+#[test]
+fn a_mismatch_is_never_masked_by_an_allowlist_end_to_end() {
+    if !oracle_available() {
+        eprintln!("SKIP: oracle erl not available");
+        return;
+    }
+    let scratch = Scratch::new("ratchet-mismatch");
+    // Prints a different stdout than the oracle for EVERY invocation: a genuine divergence.
+    let fake = fake_runtime(&scratch, "beam_rt-fake", "echo 'ok bogus'\nexit 0");
+    let fake = fake.to_str().expect("utf-8 path");
+
+    // Record the (mismatching) eval case's id in the allowlist — this is the entry that must
+    // NOT be able to tolerate the mismatch.
+    let target = "etf/term_to_binary_tuple";
+    let list = scratch.0.join("mismatch-gaps.txt");
+    write_allowlist(&list, &[target]);
+
+    let invocation = invoke(
+        &[
+            "suite",
+            "--strict",
+            "--allowlist",
+            &list.display().to_string(),
+            "--json",
+            "--out",
+            &scratch.arg(),
+        ],
+        &[("BEAM_RT", fake)],
+    );
+    assert_eq!(invocation.code, Some(1), "{}", invocation.describe());
+    let json: serde_json::Value =
+        serde_json::from_str(&invocation.stdout).expect("the report parses");
+
+    // The recorded case really did diverge (its id is an eval case, always runnable).
+    assert!(
+        json["summary"]["mismatch"].as_u64().expect("a mismatch count") >= 1,
+        "the fake runtime must diverge: {}",
+        invocation.stdout
+    );
+    // The allowlist records the target id, yet NOTHING is allowed: a mismatch is never a gap.
+    assert_eq!(
+        json["ratchet"]["allowed"], 0,
+        "an allowlisted mismatch must never be `allowed`: {}",
+        invocation.stdout
+    );
+    // Its entry did not reproduce as a gap → `stale` (the allowlist must be tightened).
+    assert_eq!(
+        json["ratchet"]["stale"], 1,
+        "the recorded mismatch id is the one stale entry: {}",
+        invocation.stdout
+    );
+    // There are no gaps at all here (a differing runtime is never `unsupported`), but a host
+    // without `erlc` would `skip` the module-run cases, so `unauthorized` is not pinned.
+
+    // The recorded case is reported as a `mismatch`, not hidden.
+    let cases = json["cases"].as_array().expect("a cases array");
+    let recorded = cases
+        .iter()
+        .find(|case| case["case_id"] == target)
+        .unwrap_or_else(|| panic!("the recorded case is in the report: {}", invocation.stdout));
+    assert_eq!(
+        recorded["verdict"], "mismatch",
+        "the recorded case must be reported as a mismatch: {}",
+        invocation.stdout
+    );
+    // A mismatch is never available-but-agreeing: the two sides really differ.
+    assert_ne!(
+        recorded["rust"]["stdout"], recorded["oracle"]["stdout"],
+        "the reported mismatch must be backed by differing stdout: {}",
+        invocation.stdout
+    );
+}
+
 /// A missing/unreadable allowlist is a loud env error (exit 2) that fails **before** the
 /// corpus runs — no report is written.
 #[test]

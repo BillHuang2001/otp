@@ -192,9 +192,13 @@ failing=$(
   ' "$report"
 )
 
-# --- classify every non-agreeing case id against the allowlist --------------------------
+# --- classify every GAP id against the allowlist ----------------------------------------
+# A *gap* is a non-agreeing case whose verdict is `unsupported`/`skipped`. A `mismatch` is
+# NEVER a gap — it is a hard failure handled by the `mismatch` branch above — so it is
+# deliberately excluded here: the allowlist tolerates a capability gap, never a mismatch, and
+# this summary can therefore never imply that a mismatch was "allowed".
 # (for a readable summary: which gaps are unauthorized, which entries are stale)
-printf '%s\n' "$failing" | awk 'NF >= 2 { print $2 }' > "$out/gap-ids.txt"
+printf '%s\n' "$failing" | awk '$1 == "unsupported" || $1 == "skipped" { print $2 }' > "$out/gap-ids.txt"
 awk '!/^[[:space:]]*#/ && NF > 0 { print $1 }' "$allowlist" > "$out/allow-ids.txt"
 unauthorized_ids=$(awk -v ids="$(cat "$out/allow-ids.txt")" '
   BEGIN { n = split(ids, a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") ok[a[i]] = 1 }

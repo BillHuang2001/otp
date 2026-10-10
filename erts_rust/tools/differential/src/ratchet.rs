@@ -47,6 +47,18 @@ fn is_gap(verdict: Verdict) -> bool {
     matches!(verdict, Verdict::Unsupported | Verdict::Skipped)
 }
 
+/// Whether `report` contains a case whose observable result actually diverged.
+///
+/// This is the gate's hard-failure ground truth, and it is derived from the **case verdicts**
+/// first — the same source of truth [`RatchetReport::classify`] reads, so the "is it a gap?"
+/// and "is it a hard failure?" questions can never disagree. The summary's `mismatch` count is
+/// honoured *in addition*, so a report whose summary under-reports a mismatch still fails.
+/// The function can only ever *widen* the mismatch set, never narrow it: once a case is
+/// `Verdict::Mismatch`, no allowlist entry and no summary can make it disappear.
+fn has_mismatch(report: &RunReport) -> bool {
+    report.summary.mismatch > 0 || report.cases.iter().any(|case| case.verdict.is_mismatch())
+}
+
 /// The current run's gap classification against the allowlist.
 ///
 /// This is the top-level `ratchet` key of a [`RunReport`] produced with an allowlist; it is
@@ -111,13 +123,15 @@ pub fn report_from_suite(suite: &SuiteOutcome, allowlist: &Allowlist) -> RunRepo
 
 /// The process exit code of a suite run.
 ///
-/// * `1` on any `mismatch` (always a hard failure);
+/// * `1` on any `mismatch` (always a hard failure — see [`has_mismatch`], which reads the
+///   case verdicts so a mismatch can never be hidden by the summary *or* tolerated by an
+///   allowlist);
 /// * with a ratchet: `1` when an unauthorized gap appeared or an entry went stale, else `0`
 ///   (an allowlisted gap set is tolerated);
 /// * without a ratchet (today's behaviour): `1` under `strict` when any `unsupported`/
 ///   `skipped` case remains, else `0`.
 pub fn suite_exit_code(report: &RunReport, strict: bool) -> i32 {
-    if report.summary.mismatch > 0 {
+    if has_mismatch(report) {
         return 1;
     }
     if let Some(ratchet) = &report.ratchet {
@@ -277,7 +291,7 @@ mod tests {
     use crate::allowlist::Allowlist;
     use crate::compare::{FieldDiff, SideResult, Verdict};
     use crate::corpus::Contract;
-    use crate::report::{CaseReport, RunReport, SideReport};
+    use crate::report::{CaseReport, RunReport, SideReport, Summary};
     use crate::runtime::{RuntimeId, RuntimeSource, RuntimeSpec};
     use std::path::PathBuf;
 
@@ -329,6 +343,29 @@ mod tests {
         Allowlist::parse(source, None).expect("parses")
     }
 
+    /// A synthetic [`CaseOutcome`] carrying only the fields the ratchet path reads, so
+    /// `report_from_suite` can be exercised without an oracle-backed harness run.
+    fn suite_case(case_id: &str, verdict: Verdict) -> crate::harness::CaseOutcome {
+        crate::harness::CaseOutcome {
+            case_id: case_id.to_string(),
+            description: "d".to_string(),
+            contracts: vec![Contract::OtpApps],
+            eval: "try (ok) of V -> ok end.".to_string(),
+            oracle_argv: vec!["-noshell".to_string()],
+            rust_argv: vec!["-noshell".to_string()],
+            oracle: SideResult::unsupported("oracle"),
+            rust: SideResult::unsupported("beam_rt: unsupported: x"),
+            golden: crate::compare::GoldenCheck {
+                matched: true,
+                diffs: Vec::new(),
+            },
+            golden_asserted: true,
+            verdict,
+            diffs: Vec::new(),
+            oracle_spec: spec(),
+            rust_spec: None,
+        }
+    }
     #[test]
     fn classify_buckets_gaps_and_stale_entries() {
         let cases = vec![
@@ -356,6 +393,91 @@ mod tests {
         assert_eq!(ratchet.unauthorized, 0, "{ratchet:?}");
         // The entry did not reproduce as a gap → stale (the allowlist must be tightened).
         assert_eq!(ratchet.stale, 1, "{ratchet:?}");
+    }
+
+    /// The core invariant: a `Mismatch` whose id IS recorded in the allowlist must never be
+    /// tolerant — it is not `allowed` (nor `unauthorized`, the other gap counter), it is
+    /// `stale`, and the gate still exits `1`.
+    #[test]
+    fn an_allowlisted_mismatch_is_stale_and_still_fails_the_gate() {
+        let cases = vec![
+            case("a/agree", Verdict::Agree, None),
+            case("a/bad", Verdict::Mismatch, Some("oracle said x, rust said y")),
+        ];
+        let list = allowlist("a/bad  crate  this entry must never tolerate a mismatch\n");
+        let ratchet = RatchetReport::classify(&cases, &list);
+        assert_eq!(ratchet.allowed, 0, "a mismatch is never an allowed gap: {ratchet:?}");
+        assert_eq!(ratchet.unauthorized, 0, "a mismatch is no gap at all: {ratchet:?}");
+        assert_eq!(ratchet.stale, 1, "the recorded id did not reproduce as a gap: {ratchet:?}");
+
+        let run = report(cases, Some(ratchet));
+        // Exit 1 under the strict ratcheted gate `gate.sh` runs — the allowlist can never turn
+        // a mismatch into a pass (`0`) or a mere ratchet update (`3`). `--strict` is irrelevant
+        // to a mismatch: it is a hard failure either way.
+        assert_eq!(suite_exit_code(&run, true), 1);
+        assert_eq!(suite_exit_code(&run, false), 1);
+    }
+
+    /// A per-verdict matrix proving only `unsupported`/`skipped` reach the gap counters, so a
+    /// `mismatch` can never be recorded as an allowed (or unauthorized) gap.
+    #[test]
+    fn a_mismatch_never_contributes_to_the_gap_counters() {
+        for (verdict, is_gap) in [
+            (Verdict::Agree, false),
+            (Verdict::Mismatch, false),
+            (Verdict::Unsupported, true),
+            (Verdict::Skipped, true),
+        ] {
+            let cases = vec![case("a/x", verdict, Some("a reason"))];
+            let recorded = allowlist("a/x  crate  recorded\n");
+            let unrecorded = allowlist("# nothing recorded\n");
+            let allowed = RatchetReport::classify(&cases, &recorded);
+            let unauthorized = RatchetReport::classify(&cases, &unrecorded);
+            if is_gap {
+                assert_eq!(
+                    (allowed.allowed, allowed.unauthorized, allowed.stale),
+                    (1, 0, 0),
+                    "{verdict:?} is an allowlisted gap"
+                );
+                assert_eq!(
+                    (unauthorized.allowed, unauthorized.unauthorized, unauthorized.stale),
+                    (0, 1, 0),
+                    "{verdict:?} is an unauthorized gap"
+                );
+            } else {
+                // Neither gap counter ever sees a non-gap; a recorded non-gap is `stale`.
+                assert_eq!(
+                    (allowed.allowed, allowed.unauthorized),
+                    (0, 0),
+                    "{verdict:?} must never reach a gap counter"
+                );
+                assert_eq!(allowed.stale, 1, "{verdict:?} recorded but not a gap");
+                assert_eq!(
+                    (unauthorized.allowed, unauthorized.unauthorized, unauthorized.stale),
+                    (0, 0, 0),
+                    "{verdict:?} not recorded and not a gap"
+                );
+            }
+        }
+    }
+
+    /// Defense in depth: the hard-failure condition reads the **case verdicts** (the same
+    /// ground truth `RatchetReport::classify` uses), not only the summary, so a report whose
+    /// summary under-reports a mismatch still fails — as does one with a mismatching case but
+    /// an allowlist that records it.
+    #[test]
+    fn suite_exit_code_reads_the_case_verdicts_not_only_the_summary() {
+        let mut run = report(vec![case("a/bad", Verdict::Mismatch, None)], None);
+        // A summary that lies (it under-reports the mismatch) can never hide the case.
+        run.summary = Summary {
+            total: 1,
+            agree: 1,
+            mismatch: 0,
+            unsupported: 0,
+            skipped: 0,
+        };
+        assert_eq!(suite_exit_code(&run, true), 1);
+        assert_eq!(suite_exit_code(&run, false), 1);
     }
 
     #[test]
@@ -538,30 +660,11 @@ mod tests {
     fn report_from_suite_carries_the_ratchet_and_the_suite_exit_code_still_gates() {
         // A pure synthetic suite: build a real one through the harness is oracle-backed, so
         // exercise `report_from_suite` only through a constructed `SuiteOutcome`.
-        use crate::harness::{CaseOutcome, RuntimeContext, SuiteOutcome};
-        let make = |case_id: &str, verdict: Verdict| CaseOutcome {
-            case_id: case_id.to_string(),
-            description: "d".to_string(),
-            contracts: vec![Contract::OtpApps],
-            eval: "try (ok) of V -> ok end.".to_string(),
-            oracle_argv: vec!["-noshell".to_string()],
-            rust_argv: vec!["-noshell".to_string()],
-            oracle: SideResult::unsupported("oracle"),
-            rust: SideResult::unsupported("beam_rt: unsupported: x"),
-            golden: crate::compare::GoldenCheck {
-                matched: true,
-                diffs: Vec::new(),
-            },
-            golden_asserted: true,
-            verdict,
-            diffs: Vec::new(),
-            oracle_spec: spec(),
-            rust_spec: None,
-        };
+        use crate::harness::{RuntimeContext, SuiteOutcome};
         let suite = SuiteOutcome {
             cases: vec![
-                make("a/gap", Verdict::Unsupported),
-                make("a/agree_ish", Verdict::Skipped),
+                suite_case("a/gap", Verdict::Unsupported),
+                suite_case("a/agree_ish", Verdict::Skipped),
             ],
             context: RuntimeContext {
                 oracle: spec(),
@@ -582,5 +685,35 @@ mod tests {
         let list = allowlist("a/gap  c  r\na/agree_ish  c  r\n");
         let report = report_from_suite(&suite, &list);
         assert_eq!(suite_exit_code(&report, true), 0);
+    }
+
+    /// The same flow, but with a `Mismatch` in the suite whose id the allowlist records: the
+    /// report's ratchet must NOT count it `allowed`, and the suite must still exit `1`.
+    #[test]
+    fn report_from_suite_never_lets_an_allowlisted_mismatch_pass() {
+        use crate::harness::{RuntimeContext, SuiteOutcome};
+        let suite = SuiteOutcome {
+            cases: vec![
+                suite_case("a/gap", Verdict::Unsupported),
+                suite_case("a/bad", Verdict::Mismatch),
+            ],
+            context: RuntimeContext {
+                oracle: spec(),
+                rust: None,
+            },
+            strict: true,
+            exit_code: 1,
+        };
+        // The allowlist records BOTH the real gap and the mismatching case.
+        let list = allowlist("a/gap  c  r\na/bad  c  this must never tolerate a mismatch\n");
+        let report = report_from_suite(&suite, &list);
+        let ratchet = report.ratchet.clone().expect("the report carries a ratchet");
+        assert_eq!(ratchet.allowed, 1, "only the real gap is allowed: {ratchet:?}");
+        assert_eq!(ratchet.unauthorized, 0, "{ratchet:?}");
+        assert_eq!(ratchet.stale, 1, "the mismatch id is stale, not allowed: {ratchet:?}");
+        assert_eq!(report.summary.mismatch, 1, "the mismatch is counted");
+        // No allowlist can turn the mismatch into a pass.
+        assert_eq!(suite_exit_code(&report, true), 1);
+        assert_eq!(suite_exit_code(&report, false), 1);
     }
 }

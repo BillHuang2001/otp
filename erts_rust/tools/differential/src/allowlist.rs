@@ -241,10 +241,36 @@ proc_signals/monitor_port_unsupported\tbeam_bifs\tmonitor on a port\n\
         let source = "a/b  c1  first\na/b  c2  second\n";
         let err = Allowlist::parse(source, None).unwrap_err();
         assert!(matches!(err, Error::Usage(_)), "{err:?}");
+        assert_eq!(err.exit_code(), 2, "{err}");
         assert!(err.to_string().contains("duplicate"), "{err}");
         assert!(err.to_string().contains("a/b"), "{err}");
     }
 
+    /// Matching is exact: a neighbouring id must never be tolerated by a near-miss entry, so
+    /// an allowlist can never accidentally cover a case it does not name (e.g. a mismatch).
+    #[test]
+    fn case_ids_match_exactly_never_by_prefix_substring_or_case() {
+        let list = Allowlist::parse("foo/bar  crate  reason\n", None).expect("parses");
+        assert!(list.contains("foo/bar"));
+        assert!(list.get("foo/bar").is_some());
+        for near_miss in [
+            "foo/ba",
+            "foo/barbaz",
+            "foo/bar/extra",
+            "fo/bar",
+            "foo/bar ",
+            " foo/bar",
+            "FOO/BAR",
+            "foo/bar\n",
+            "",
+        ] {
+            assert!(
+                !list.contains(near_miss),
+                "a near-miss id {near_miss:?} must not match"
+            );
+            assert!(list.get(near_miss).is_none());
+        }
+    }
     #[test]
     fn loading_a_missing_file_is_an_io_error() {
         let missing = std::env::temp_dir().join("differential-allowlist-does-not-exist-xyz.txt");
