@@ -70,11 +70,18 @@
 //! supplies the missing half — the [`Continuation`](beam_io::io_device::Continuation) — by
 //! running the real export on the engine (see [`get_until`]).
 //!
+//! # The `{get_line, …}` line reader
+//!
+//! `{get_line, Enc, _Prompt}` — what `file:read_line/1` and `io:get_line/2` send — runs **no**
+//! Erlang code: `file_io_server` collects the line with its own `get_line/4` loop over
+//! `io_lib:collect_line/4` and casts it. The device loop is the same one `{get_until, …}`
+//! uses; this crate supplies the collect-and-cast half (see [`get_line`]).
+//!
 //! # Honest capability gaps (never a fabricated term)
 //!
 //! * Every *other* request this module does not serve is reported as the typed
 //!   [`crate::error::unsupported`] gap rather than a plausible-looking wrong answer
-//!   (`get_line`, `setopts`, `getopts`, `pread`/`pwrite`, `advise`, `allocate`,
+//!   (`setopts`, `getopts`, `pread`/`pwrite`, `advise`, `allocate`,
 //!   `read_handle_info`, the legacy `put_chars` arities, a tuple encoding,
 //!   `read_file_info`, `write_file`).
 //! * An unknown `file_server` `handle_call` request is the oracle's `{noreply, State}`:
@@ -96,6 +103,7 @@ use crate::context::RuntimeContext;
 use crate::error;
 use crate::runtime::Runtime;
 
+mod get_line;
 mod get_until;
 
 /// The native file service: the `file_server_2` process plus one **io-device** process per
@@ -525,6 +533,10 @@ impl Runtime {
             // encoding to `latin1` (`:395-396`).
             ("get_until", 5) => get_until::serve(self, service, Some(args[0]), &args[1..]),
             ("get_until", 4) => get_until::serve(self, service, None, args),
+            // The line reader: `{get_line,Enc,_Prompt}` (`file_io_server.erl:382-393`) and its
+            // legacy 2-tuple form, which defaults the encoding to `latin1` (`:412-413`).
+            ("get_line", 2) => get_line::serve(self, service, Some(args[0]), args[1]),
+            ("get_line", 1) => get_line::serve(self, service, None, args[0]),
             _ => Err(error::unsupported(&format!(
                 "file_server: the `{command}/{}` io request is not implemented",
                 args.len()
