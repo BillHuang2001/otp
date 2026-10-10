@@ -354,9 +354,7 @@ impl Machine {
     ///
     /// The consumer is the exception handler's `build_stacktrace` (the handler
     /// opcodes in `crate::families::exceptions`), which runs *after* the raise
-    /// unwound — hence the snapshot; until that reads it the accessor has no
-    /// production caller (`#[allow(dead_code)]`, matching `Contexts::len`).
-    #[allow(dead_code)]
+    /// unwound — hence the snapshot.
     #[inline]
     pub(crate) fn raise_snapshot(&self) -> &[(u32, u32, u32)] {
         &self.raise_snapshot
