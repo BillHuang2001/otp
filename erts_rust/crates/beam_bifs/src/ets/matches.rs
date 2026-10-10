@@ -368,12 +368,31 @@ mod tests {
         ctx.list(&[clause]).expect("fits")
     }
 
-    /// `[{{z}, [], [true]}]` — a spec whose head matches no 2-tuple object.
+    /// `[{{z}, [], [true]}]` — a spec whose head matches no 2-tuple object **and**
+    /// whose body (`true`) cannot keep the object's key, so `ets:select_replace/2`
+    /// rejects the whole call up front.
     fn no_match_spec(ctx: &mut BifContext<'_>) -> Eterm {
         let z = ctx.atom("z").expect("seeded");
         let head = ctx.tuple(&[z]).expect("fits");
         let guards = ctx.list(&[]).expect("fits");
         let body = ctx.list(&[ctx.atom("true").expect("seeded")]).expect("fits");
+        let clause = ctx.tuple(&[head, guards, body]).expect("fits");
+        ctx.list(&[clause]).expect("fits")
+    }
+
+    /// `[{{z,'$1'}, [], [{{z,'$1'}}]}]` — a spec whose head matches no 2-tuple
+    /// object (`z` is no object's key) while its body provably keeps the key at
+    /// position 1. `ets:select_replace/2` therefore accepts it and replaces
+    /// nothing.
+    fn key_keeping_no_match_spec(ctx: &mut BifContext<'_>) -> Eterm {
+        let z = ctx.atom("z").expect("seeded");
+        let v1 = ctx.atom("$1").expect("seeded");
+        let head = ctx.tuple(&[z, v1]).expect("fits");
+        let guards = ctx.list(&[]).expect("fits");
+        // The `{{ … }}` construction form: a 1-tuple holding the tuple to build.
+        let constructed = ctx.tuple(&[z, v1]).expect("fits");
+        let body_item = ctx.tuple(&[constructed]).expect("fits");
+        let body = ctx.list(&[body_item]).expect("fits");
         let clause = ctx.tuple(&[head, guards, body]).expect("fits");
         ctx.list(&[clause]).expect("fits")
     }
@@ -532,26 +551,54 @@ mod tests {
         assert_eq!(stored.len(), 1);
         assert!(beam_term::compare::eq(stored[0], b_b, &atoms));
 
-        // A spec that matches nothing replaces nothing (the oracle's count is 0).
+        // A body that cannot be proven to keep the object's key is `badarg` for
+        // the WHOLE call — even though this spec's head matches nothing. The
+        // oracle validates each clause's body *statically*, before it traverses
+        // anything (C `analyze_pattern` → `db_match_keeps_key`, mirrored by
+        // `beam_ets`' `select::exec::static_keeps_key`). Oracle:
+        //   T = ets:new(mytab,[set]), ets:insert(T,[{a,1},{b,2}]),
+        //   ets:select_replace(T, [{{z},[],[true]}])  ⇒  {error,badarg}
         let spec = no_match_spec(&mut ctx);
+        assert!(matches!(
+            select_replace_2(&mut ctx, &[handle, spec]),
+            Err(BeamError::BadArg)
+        ));
+
+        // A spec that matches nothing replaces nothing — provided its body keeps
+        // the key, so the static check above passes. Oracle:
+        //   ets:select_replace(T, [{{z,'$1'},[],[{{z,'$1'}}]}])  ⇒  0,
+        //   ets:tab2list(T)  ⇒  [{a,1},{b,2}]  (unchanged)
+        // Here the table already holds the `{a,b}`/`{b,b}` of the replacement
+        // above, so "unchanged" means exactly those two objects.
+        let spec = key_keeping_no_match_spec(&mut ctx);
         let count = select_replace_2(&mut ctx, &[handle, spec]).expect("no match");
         assert_eq!(signed_value(count), 0);
+        let stored = proper_list(lookup_2(&mut ctx, &[handle, a]).expect("lookup a")).expect("list");
+        assert_eq!(stored.len(), 1);
+        assert!(beam_term::compare::eq(stored[0], a_b, &atoms));
+        let stored = proper_list(lookup_2(&mut ctx, &[handle, b]).expect("lookup b")).expect("list");
+        assert_eq!(stored.len(), 1);
+        assert!(beam_term::compare::eq(stored[0], b_b, &atoms));
 
-        // On a `bag` the whole call is `badarg` — before the spec or the contents
-        // are looked at, so a never-matching spec is `badarg` too (verified).
+        // On a `bag` the kind is rejected before the spec or the contents are
+        // looked at, so even a *key-keeping*, never-matching spec is `badarg`
+        // (oracle: `ets:select_replace(ets:new(b2,[bag]),
+        // [{{z,'$1'},[],[{{z,'$1'}}]}])` ⇒ `{error,badarg}`; a matching
+        // key-keeping spec ⇒ `{error,badarg}` too).
         let bag = new_table_kind(&mut ctx, "bagtab", "bag");
+        let spec = key_keeping_no_match_spec(&mut ctx);
+        assert!(matches!(
+            select_replace_2(&mut ctx, &[bag, spec]),
+            Err(BeamError::BadArg)
+        ));
         let spec = replace_spec(&mut ctx);
         assert!(matches!(
             select_replace_2(&mut ctx, &[bag, spec]),
             Err(BeamError::BadArg)
         ));
-        let spec = no_match_spec(&mut ctx);
-        assert!(matches!(
-            select_replace_2(&mut ctx, &[bag, spec]),
-            Err(BeamError::BadArg)
-        ));
 
-        // A `duplicate_bag` is supported (`{a,1}` ⇒ `{a,b}`).
+        // A `duplicate_bag` is supported (`{a,1}` ⇒ `{a,b}`; oracle:
+        // `ets:select_replace(D, [{{'$1','$2'},[],[{{'$1',b}}]}])` ⇒ `1`).
         let dup = new_table_kind(&mut ctx, "duptab", "duplicate_bag");
         let obj = pair(&mut ctx, "a", 1);
         insert_2(&mut ctx, &[dup, obj]).expect("insert");
