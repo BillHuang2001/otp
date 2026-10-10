@@ -291,6 +291,7 @@ fn test_meta(command: &str) -> PortMeta {
         owner: OWNER,
         driver_terms: None,
         driver_atoms: None,
+        driver_control_flags: None,
     }
 }
 
