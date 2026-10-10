@@ -45,8 +45,9 @@
 //! * An `ErlSubBits` whose `orig` is a boxed `BinRef` is a **refc binary** — the
 //!   off-heap form of a binary bigger than `ERL_ONHEAP_BINARY_LIMIT` bytes
 //!   ([`beam_term::refc`]). `heap_bits` accepts it as a readable subject (its
-//!   base/size come from the frozen `ErlSubBits`), which is what lets a
-//!   `bs_create_bin` `append` seed itself from a previously built refc binary.
+//!   base, window offset and size come from the frozen `ErlSubBits`), which is what
+//!   lets a `bs_create_bin` `append` seed itself from a previously built refc binary
+//!   and lets a match run over a window that does not start on a byte boundary.
 //!
 //! `orig` is the subject term, kept so the context stays self-contained and its
 //! byte slice can be re-derived at every opcode.
@@ -73,7 +74,15 @@ const WORD_BYTES: usize = core::mem::size_of::<Eterm>();
 /// The two fixed head words of an `ErlHeapBits` (`thing_word`, `size`).
 const HEAP_BITS_HEAD_WORDS: usize = 2;
 
-/// The data pointer and **bit** size of an on-heap or refc bitstring term.
+/// The data pointer, **bit** size and **bit** offset of a readable bitstring
+/// subject: `(base, size, off)`.
+///
+/// The subject's bit `i` (`0 <= i < size`) is bit `off + i` of the byte payload
+/// starting at `base` (MSB-first within each byte). `off` is `0` for an on-heap
+/// bitstring (`ErlHeapBits`) and the frozen window start modulo 8 for a refc
+/// binary (`beam_term::refc`), whose window need **not** be byte-aligned — the
+/// family's bit readers thread `off` into their own bit index (see
+/// [`subject_bytes`]).
 ///
 /// Returns `None` for anything that is not a readable bitstring subject: a
 /// non-boxed term, an engine match context ([`HEADER_SUB_BITS`] whose `orig` is not
@@ -82,11 +91,11 @@ const HEAP_BITS_HEAD_WORDS: usize = 2;
 /// (a `bs_start_match3` match failure, or a typed `unsupported`).
 ///
 /// A **refc binary** — the off-heap form `beam_term::refc` builds for a result
-/// larger than [`ERL_ONHEAP_BINARY_LIMIT`] bytes — *is* accepted: its base and size
-/// come from the frozen `ErlSubBits` ([`beam_term::bitstring_parts`]), so the rest
-/// of the family (which only ever sees a `(ptr, bits)` pair plus
-/// [`subject_bytes`]) reads it exactly like a heap binary.
-pub(super) fn heap_bits(t: Eterm) -> Option<(*const u8, usize)> {
+/// larger than [`ERL_ONHEAP_BINARY_LIMIT`] bytes — *is* accepted: its base, window
+/// offset and size come from the frozen `ErlSubBits`
+/// ([`beam_term::bitstring_parts`]), so the rest of the family reads it exactly like
+/// a heap binary, at whatever bit offset its window starts.
+pub(super) fn heap_bits(t: Eterm) -> Option<(*const u8, usize, usize)> {
     // SAFETY: `is_bitstring` checks `is_boxed` before it dereferences the header.
     if !unsafe { beam_term::is_bitstring(t) } {
         return None;
@@ -106,16 +115,13 @@ pub(super) fn heap_bits(t: Eterm) -> Option<(*const u8, usize)> {
         // SAFETY: `t` is a live refc-binary bitstring (an `ErlSubBits` over a
         // `BinRef`), so `bitstring_parts` recovers its frozen base/offset/size.
         let (base, start, size) = unsafe { beam_term::bitstring_parts(t) };
-        if start % 8 != 0 {
-            // The engine only ever builds byte-aligned refc binaries; a bit-offset
-            // window would need the bit-level reader this `(ptr, bits)` pair cannot
-            // express, so refuse rather than read the wrong bytes.
-            return None;
-        }
-        // SAFETY: `base` points at the byte holding bit 0 of the payload, so the
-        // byte holding the window's first bit is `base + start / 8`; the window
-        // covers `size` bits from there (the caller keeps the payload alive).
-        return Some((unsafe { base.add(start / 8) }, size));
+        // SAFETY: `base` points at the byte holding bit 0 of the off-heap payload,
+        // so the byte holding the window's first bit is `base + start / 8` and the
+        // window's bit `i` is bit `start % 8 + i` of the payload from there. The
+        // payload covers `ceil((start + size) / 8)` bytes, which from
+        // `base + start / 8` is exactly `ceil((start % 8 + size) / 8)` bytes — the
+        // slice [`subject_bytes`] hands out. (The caller keeps the payload alive.)
+        return Some((unsafe { base.add(start / 8) }, size, start % 8));
     }
     if hdr == HEADER_BIN_REF {
         return None;
@@ -125,29 +131,37 @@ pub(super) fn heap_bits(t: Eterm) -> Option<(*const u8, usize)> {
     let bits = unsafe { *p.add(1) }.raw();
     // SAFETY: as above — a live heap-bits block stores its payload at word 2.
     let data = unsafe { p.add(HEAP_BITS_HEAD_WORDS).cast::<u8>() };
-    Some((data as *const u8, bits))
+    Some((data as *const u8, bits, 0))
 }
-/// The byte payload of a bitstring **subject** term: `ceil(bits / 8)` bytes.
+/// The byte payload of a bitstring **subject** term and its bit offset within it:
+/// `(base, off)`.
 ///
-/// A subject that is not a readable bitstring (a match context, a non-bitstring) is
-/// the documented M1 gap and yields [`crate::error::unsupported`]. The returned
-/// slice borrows the subject's storage, so the caller must keep the owning heap (or
-/// off-heap payload) alive and unmoved for as long as it is used (the
-/// [`ExecutionContext`] ownership contract; an off-heap payload is held by the
-/// [`Machine`] that built it).
-pub(super) fn subject_bytes<'a>(t: Eterm) -> Result<&'a [u8]> {
-    let (ptr, bits) = heap_bits(t)
+/// The subject's bit `i` is bit `off + i` of `base` (MSB-first), so a bit reader
+/// takes the subject's window-relative bit index `s` and reads `base` at `off + s`.
+/// The slice spans `ceil((off + size) / 8)` bytes, i.e. every bit of the window is
+/// covered (a byte-aligned subject starts at `off == 0`, exactly as before).
+///
+/// A subject that is not a readable bitstring (a match context, a bare off-heap
+/// binary reference, a non-bitstring) is the documented M1 gap and yields
+/// [`crate::error::unsupported`]. The returned slice borrows the subject's storage,
+/// so the caller must keep the owning heap (or off-heap payload) alive and unmoved
+/// for as long as it is used (the [`ExecutionContext`] ownership contract; an
+/// off-heap payload is held by the [`Machine`] that built it).
+pub(super) fn subject_bytes<'a>(t: Eterm) -> Result<(&'a [u8], usize)> {
+    let (ptr, bits, off) = heap_bits(t)
         .ok_or_else(|| error::unsupported("bitstring: subject is not a readable binary"))?;
-    let num_bytes = bits.div_ceil(8);
+    let num_bytes = (off + bits).div_ceil(8);
     if num_bytes == 0 {
-        return Ok(&[]);
+        // A 0-bit, byte-aligned window has no payload bytes (`off` is 0 here).
+        return Ok((&[], 0));
     }
     // SAFETY: a live subject covers `ceil(num_bytes / word_bytes)` words' worth of
     // storage from `ptr` (a heap-bits block's data region at word 2, or the
-    // byte-aligned window of an off-heap payload), so the `num_bytes` data bytes
-    // starting there are in bounds and readable; the caller keeps that storage alive
-    // and unmoved for `'a`.
-    Ok(unsafe { core::slice::from_raw_parts(ptr, num_bytes) })
+    // byte-aligned floor of an off-heap window whose payload extends through
+    // `ceil((off + bits) / 8)` bytes), so the `num_bytes` data bytes starting there
+    // are in bounds and readable; the caller keeps that storage alive and unmoved for
+    // `'a`.
+    Ok((unsafe { core::slice::from_raw_parts(ptr, num_bytes) }, off))
 }
 /// The `(orig, start, end)` triple of an `ErlSubBits` match context.
 ///
@@ -284,12 +298,35 @@ pub(super) fn big_parts_safe(t: Eterm) -> Option<(bool, Vec<u64>)> {
     Some((negative, digits.to_vec()))
 }
 
-/// Build an on-heap bitstring of exactly `nbits` bits from the leading bits of
-/// `bytes` (MSB-first), zeroing the unused trailing bits of the final byte.
+/// Whether `t` is an **off-heap refc binary** ([`beam_term::refc`]) — the frozen
+/// representation this family's result builders choose above
+/// [`ERL_ONHEAP_BINARY_LIMIT`] bytes.
+///
+/// The safe read side of [`beam_term::refc::is_refc_binary`], mirroring
+/// [`big_parts_safe`]: the family's `#[cfg(test)]` modules live under the crate-wide
+/// `#![deny(unsafe_code)]` and so cannot call the `unsafe` predicate themselves, so the
+/// single dereference stays here in the node's marked module.
+#[cfg(test)]
+pub(super) fn is_refc_binary(t: Eterm) -> bool {
+    // SAFETY: `is_refc_binary` checks `is_boxed` before it dereferences the header and
+    // only reads the `ErlSubBits.orig` slot when the header says `ErlSubBits`, so a
+    // non-refc term (including a non-bitstring) is answered `false` without any
+    // dereference of a non-live word.
+    unsafe { beam_term::refc::is_refc_binary(t) }
+}
+
+/// Build an **on-heap-only** bitstring of exactly `nbits` bits from the leading bits
+/// of `bytes` (MSB-first), zeroing the unused trailing bits of the final byte.
+///
+/// This is the on-heap `ErlHeapBits` builder and nothing more: it is the branch
+/// [`make_binary`] takes at/below the frozen limit, and it refuses a larger result
+/// with [`crate::error::unsupported`]. Callers that need the size-dispatching entry
+/// (anything that can build a result of arbitrary size — the `bs_get_binary2`/
+/// `bs_get_tail`/`bs_match binary` result builders) must call [`make_binary`] instead.
 ///
 /// `bytes` must hold at least `ceil(nbits / 8)` bytes; a longer slice is fine (the
-/// surplus is ignored). More than [`ERL_ONHEAP_BINARY_LIMIT`] bytes needs the
-/// off-heap representation and yields [`crate::error::unsupported`].
+/// surplus is ignored). More than [`ERL_ONHEAP_BINARY_LIMIT`] bytes yields
+/// [`crate::error::unsupported`].
 pub(super) fn make_bits(
     machine: &mut Machine,
     ctx: &mut dyn ExecutionContext,
@@ -447,14 +484,14 @@ mod tests {
         let heap = make_binary(&mut machine, &mut ctx, &heap_bytes, 64 * 8).unwrap();
         // SAFETY: `heap` is a live bitstring term built on the line above.
         assert!(!unsafe { beam_term::refc::is_refc_binary(heap) });
-        assert_eq!(subject_bytes(heap).unwrap(), heap_bytes.as_slice());
+        assert_eq!(subject_bytes(heap).unwrap(), (heap_bytes.as_slice(), 0));
         assert_eq!(heap_bits(heap).unwrap().1, 64 * 8);
 
         let refc_bytes: Vec<u8> = (1..=65u8).collect();
         let refc = make_binary(&mut machine, &mut ctx, &refc_bytes, 65 * 8).unwrap();
         // SAFETY: `refc` is a live bitstring term built on the line above.
         assert!(unsafe { beam_term::refc::is_refc_binary(refc) });
-        assert_eq!(subject_bytes(refc).unwrap(), refc_bytes.as_slice());
+        assert_eq!(subject_bytes(refc).unwrap(), (refc_bytes.as_slice(), 0));
         assert_eq!(heap_bits(refc).unwrap().1, 65 * 8);
         // The generic reader (`terms::binary_bytes`) is refc-aware too.
         assert_eq!(
@@ -475,7 +512,8 @@ mod tests {
         // SAFETY: `term` is a live bitstring term built on the line above.
         assert!(unsafe { beam_term::refc::is_refc_binary(term) });
         assert_eq!(heap_bits(term).unwrap().1, nbits);
-        let read = subject_bytes(term).unwrap();
+        let (read, off) = subject_bytes(term).unwrap();
+        assert_eq!(off, 0, "a full refc binary's window is byte-aligned");
         assert_eq!(read.len(), 65);
         assert_eq!(read[64], 0b1110_0000);
     }
@@ -490,9 +528,91 @@ mod tests {
         let term = make_writable(&mut machine, &mut ctx, 256).unwrap();
         // SAFETY: `term` is a live bitstring term built on the line above.
         assert!(unsafe { beam_term::refc::is_refc_binary(term) });
-        let (_, bits) = heap_bits(term).unwrap();
+        let (_, bits, _) = heap_bits(term).unwrap();
         assert_eq!(bits, 0);
-        assert_eq!(subject_bytes(term).unwrap(), &[] as &[u8]);
+        assert_eq!(subject_bytes(term).unwrap(), (&[] as &[u8], 0));
+    }
+
+    /// A refc binary whose window starts on a **non-byte-aligned** bit is a readable
+    /// subject: `heap_bits` reports its window offset (`start % 8`) and
+    /// `subject_bytes` hands out a slice that starts at the byte holding the window's
+    /// first bit and covers every window bit.
+    ///
+    /// The payload bytes `[0b1010_1100, 0b0011_0101, 0b1000_0000]` (MSB-first) with a
+    /// window of bits `1..17` (offset 1, size 16) hold `0b0101_1000_0110_1011`.
+    #[test]
+    fn a_non_byte_aligned_refc_window_is_readable() {
+        let mut ctx = MinimalContext::new();
+        // A word-aligned payload buffer (the frozen `write_refc_binary` base-alignment
+        // contract); the bytes are little-endian in the buffer, so write them byte by
+        // byte rather than relying on the word's memory order.
+        let mut payload: Vec<Eterm> = vec![Eterm::default(); 2];
+        let want_bytes = [0b1010_1100u8, 0b0011_0101u8, 0b1000_0000u8];
+        // SAFETY: `payload` holds 2 words (16 bytes) and `want_bytes` is 3 bytes, so
+        // the copy is in bounds within `payload`'s own allocation.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                want_bytes.as_ptr(),
+                payload.as_mut_ptr().cast::<u8>(),
+                want_bytes.len(),
+            );
+        }
+        let base = payload.as_ptr().cast::<u8>();
+        let val = payload.as_mut_ptr();
+        let hp = ctx
+            .alloc_words(beam_term::refc::ERL_REFC_BITS_SIZE)
+            .expect("the arena hands out 8 words");
+        // SAFETY: `hp` points at `ERL_REFC_BITS_SIZE` exclusively-owned words in the
+        // context's pointer-stable arena, `val`/`base` point at the live, word-aligned
+        // `payload`, and `next` is null. The window is bits `1..17` — deliberately not
+        // byte-aligned. The term is used only while `ctx`/`payload` live.
+        let refc = unsafe {
+            beam_term::refc::write_refc_binary(hp, val, core::ptr::null_mut(), base, 1, 16)
+        };
+        let (bits, off) = {
+            let (_, bits, off) = heap_bits(refc).unwrap();
+            (bits, off)
+        };
+        assert_eq!(bits, 16);
+        assert_eq!(off, 1, "the window starts one bit into the first byte");
+        let (bytes, read_off) = subject_bytes(refc).unwrap();
+        assert_eq!(read_off, 1);
+        // `ceil((1 + 16) / 8) == 3` bytes from `base`.
+        assert_eq!(bytes, want_bytes.as_slice());
+        // Reading the window's 16 bits at `off` reproduces the window bits.
+        let mut got = 0u16;
+        for i in 0..16usize {
+            let bit_index = read_off + i;
+            let bit = (bytes[bit_index / 8] >> (7 - (bit_index % 8))) & 1;
+            got = (got << 1) | u16::from(bit);
+        }
+        assert_eq!(got, 0b0101_1000_0110_1011);
+    }
+
+    /// A bare off-heap binary reference (`HEADER_BIN_REF`) is not a readable subject:
+    /// the family must never read it as raw payload bytes.
+    #[test]
+    fn a_bare_bin_ref_is_not_a_readable_subject() {
+        let mut ctx = MinimalContext::new();
+        let hp = ctx
+            .alloc_words(beam_term::refc::ERL_REFC_BITS_SIZE)
+            .expect("the arena hands out 8 words");
+        // SAFETY: `hp` points at `ERL_REFC_BITS_SIZE` words; `write_refc_binary` fully
+        // writes the `[BinRef][ErlSubBits]` pair, and `make_boxed(hp)` is the bare
+        // `BinRef` term under test (a live block whose header is `HEADER_BIN_REF`).
+        let bin_ref = unsafe {
+            beam_term::refc::write_refc_binary(
+                hp,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                hp.cast::<u8>(),
+                0,
+                0,
+            );
+            beam_term::make_boxed(hp)
+        };
+        assert!(heap_bits(bin_ref).is_none());
+        assert!(subject_bytes(bin_ref).is_err());
     }
 
     /// A machine that has built no refc term enumerates no payload handle: the

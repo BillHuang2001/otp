@@ -51,8 +51,8 @@ pub(crate) fn skip_utf(
     decode: fn(&[u8], usize, usize) -> Option<(u32, usize)>,
 ) -> Result<Option<Step>> {
     let (term, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_skip_utf")?;
-    let bytes = raw::subject_bytes(orig)?;
-    match decode(bytes, start, end) {
+    let (bytes, off) = raw::subject_bytes(orig)?;
+    match decode(bytes, start + off, end + off) {
         Some((_, len)) => {
             raw::set_ctx_start(term, start + len);
             Ok(Some(Step::Next))

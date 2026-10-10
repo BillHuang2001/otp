@@ -57,7 +57,7 @@ pub(crate) fn enter_match(
 ) -> Result<Option<Eterm>> {
     let value = read_operand(machine, ctx, subject)?;
     let extra = operand_slack_words(subject);
-    if let Some((_, bits)) = raw::heap_bits(value) {
+    if let Some((_, bits, _)) = raw::heap_bits(value) {
         // A heap binary: the context starts at bit 0 and spans its whole size.
         let context = raw::make_ctx(machine, ctx, 0, bits, extra, |m, slack| {
             read_operand_slack(m, subject, slack)
@@ -110,7 +110,7 @@ pub(crate) fn read_ctx(
 /// Re-read a match-context operand **after** an allocating read; the fresh
 /// (post-collection) context term is returned.
 ///
-/// A rooted allocation ([`raw::make_bits`]/[`raw::make_big`]/
+/// A rooted allocation ([`raw::make_binary`]/[`raw::make_big`]/
 /// [`crate::terms::make_float`]) may run a **moving** collector that relocates the
 /// context block, so an `Eterm` read *before* the allocation is a stale pointer
 /// afterwards. Any match opcode that (1) reads its context, (2) performs an
