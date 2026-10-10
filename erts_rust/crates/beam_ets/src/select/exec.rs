@@ -233,6 +233,236 @@ pub(super) fn is_true(value: expr::Value, atoms: &AtomTable) -> bool {
     expr::value_bool(value, atoms).unwrap_or(false)
 }
 
+// ---------------------------------------------------------------------------
+// The `ets:select_replace/2` static body check — the C `db_match_keeps_key`
+// (`../../erts/emulator/beam/erl_db_util.c:1422`), run on the *shape* of an
+// already-decoded spec.
+//
+// The C validates each clause of the **uncompiled** spec before it traverses
+// anything (`analyze_pattern` calls `on_match_validation` per clause), so a body
+// that it cannot prove keeps the key makes the whole call `badarg` even when
+// nothing matches. `beam_bifs` compiles the spec before this crate sees it, so
+// the check runs here over the compiled AST: `expr::decode` rejects every body
+// shape the C rejects for *structural* reasons (a call, a non-proper body list,
+// an unbound `'$N'`), and the AST still distinguishes the two forms the C walks
+// — `{X}` (`Expr::Tuple`, whose parts are the constructed tuple's elements) and
+// `{const, X}` (`Expr::Literal(X)`, holding the raw `X`).
+// ---------------------------------------------------------------------------
+
+/// Which side of the `db_match_eq_body` walk a node is.
+enum BodySide<'a> {
+    /// A body node of the decoded AST.
+    Expr(&'a expr::Expr),
+    /// A **raw** body subterm (the `{const, X}` form keeps `X` undecoded).
+    Raw(Eterm),
+}
+
+/// Whether **every** clause's body provably keeps the object's key — the C
+/// `db_match_keeps_key` applied to each clause (a single failure rejects the
+/// whole call, exactly as `analyze_pattern` does before traversing).
+fn static_keeps_key(spec: &MatchSpec, keypos: usize, atoms: &AtomTable) -> bool {
+    spec.clauses
+        .iter()
+        .all(|clause| clause_keeps_key(&clause.head, &clause.body, keypos, atoms))
+}
+
+/// One clause of [`static_keeps_key`].
+fn clause_keeps_key(
+    head: &pattern::Pattern,
+    body: &[Expr],
+    keypos: usize,
+    atoms: &AtomTable,
+) -> bool {
+    // 1. `body` must be a proper list of exactly one element.
+    let [element] = body else {
+        return false;
+    };
+    // 2. The whole-object body returns the same tuple.
+    if matches!(element, expr::Expr::WholeObject) {
+        return true;
+    }
+    // 4. The match head's key element must be extractable: the head must be a
+    //    tuple of arity `>= keypos` (the C `db_getkey`).
+    let pattern::Pattern::Tuple(head_elems) = head else {
+        return false;
+    };
+    if head_elems.len() < keypos {
+        return false;
+    }
+    let head_key = &head_elems[keypos - 1];
+
+    match element {
+        // 3. `{const, X}` — const mode, with the raw `X` as the subterm.
+        expr::Expr::Literal(subterm) if super::tuple_elements(*subterm).is_some() => {
+            let elems = super::tuple_elements(*subterm).expect("checked just above");
+            // 5. The subterm's key must be extractable.
+            if elems.len() < keypos {
+                return false;
+            }
+            let sub_key = elems[keypos - 1];
+            // 6. Structural equality with the head's key; 7. const mode rejects
+            //    any mismatch (no `{element, KeyPos, '$_'}` rescue).
+            eq_body_raw(head_key, sub_key, true, atoms)
+        }
+        // 3. `{X}` — the construction form; `parts` are `X`'s elements.
+        expr::Expr::Tuple(parts) => {
+            // 5.
+            if parts.len() < keypos {
+                return false;
+            }
+            let sub_key = &parts[keypos - 1];
+            if eq_body(head_key, BodySide::Expr(sub_key), false, atoms) {
+                return true;
+            }
+            // 8. `{element, KeyPos, '$_'}` is accepted unconditionally.
+            is_element_form(sub_key, keypos)
+        }
+        // 3. Anything else (a bare variable, `'$_'`, a call, `'$$'`, …) is not a
+        //    tuple construction.
+        _ => false,
+    }
+}
+
+/// `db_match_eq_body(a, b, const_mode)`: whether the head's key element `a`
+/// provably names the same term as the body's key element `b`.
+fn eq_body(
+    head: &pattern::Pattern,
+    body: BodySide<'_>,
+    const_mode: bool,
+    atoms: &AtomTable,
+) -> bool {
+    match body {
+        BodySide::Expr(e) => eq_body_expr(head, e, const_mode, atoms),
+        BodySide::Raw(t) => eq_body_raw(head, t, const_mode, atoms),
+    }
+}
+
+/// `db_match_eq_body` for a **raw** body term (the `{const, X}` subterm tree).
+fn eq_body_raw(a: &pattern::Pattern, b: Eterm, const_mode: bool, atoms: &AtomTable) -> bool {
+    if is_list(b) {
+        let pattern::Pattern::Cons(hcar, hcdr) = a else {
+            return false;
+        };
+        // SAFETY: `is_list(b)` established a live cons cell in the caller-owned
+        // spec term, so both `[CAR, CDR]` words are readable and `b` stays live
+        // for the whole call.
+        let (bcar, bcdr) = unsafe { (car(b), cdr(b)) };
+        return eq_body_raw(hcar, bcar, const_mode, atoms)
+            && eq_body_raw(hcdr, bcdr, const_mode, atoms);
+    }
+    if let Some(elems) = super::tuple_elements(b) {
+        if !const_mode {
+            // The `{{ … }}` double-tuple syntax unwraps to its inner tuple…
+            if elems.len() == 1 && super::tuple_elements(elems[0]).is_some() {
+                return eq_body_raw(a, elems[0], const_mode, atoms);
+            }
+            // …and `{const, X}` descends into `X` in const mode.
+            if elems.len() == 2 && super::atom_name(elems[0], atoms) == Some("const") {
+                return eq_body_raw(a, elems[1], true, atoms);
+            }
+            // A function call or any other invalid tuple syntax.
+            return false;
+        }
+        let pattern::Pattern::Tuple(helems) = a else {
+            return false;
+        };
+        if helems.len() != elems.len() {
+            return false;
+        }
+        return helems
+            .iter()
+            .zip(elems)
+            .all(|(h, t)| eq_body_raw(h, t, const_mode, atoms));
+    }
+    if expr::classify(b) == TermClass::Map {
+        return false;
+    }
+    leaf_eq(a, b, const_mode, atoms)
+}
+
+/// `db_match_eq_body` for a decoded body node.
+fn eq_body_expr(
+    a: &pattern::Pattern,
+    e: &expr::Expr,
+    const_mode: bool,
+    atoms: &AtomTable,
+) -> bool {
+    match e {
+        // The raw body term of `{const, X}` (with `X` a tuple) is `{const, X}`,
+        // which the C unwraps in const mode.
+        expr::Expr::Literal(t) if super::tuple_elements(*t).is_some() => {
+            eq_body_raw(a, *t, true, atoms)
+        }
+        expr::Expr::Literal(t) => leaf_eq(a, *t, const_mode, atoms),
+        expr::Expr::Bind(n) => {
+            !const_mode && matches!(a, pattern::Pattern::Bind(m) if m == n)
+        }
+        // `{X}` — already unwrapped by `decode_tuple`.
+        expr::Expr::Tuple(parts) => {
+            let pattern::Pattern::Tuple(helems) = a else {
+                return false;
+            };
+            if helems.len() != parts.len() {
+                return false;
+            }
+            helems
+                .iter()
+                .zip(parts)
+                .all(|(h, p)| eq_body_expr(h, p, const_mode, atoms))
+        }
+        expr::Expr::Cons(h, t) => {
+            let pattern::Pattern::Cons(ha, hb) = a else {
+                return false;
+            };
+            eq_body_expr(ha, h, const_mode, atoms) && eq_body_expr(hb, t, const_mode, atoms)
+        }
+        // `'$_'`, `'$$'`, a map or a call never keeps a syntactically-known key.
+        _ => false,
+    }
+}
+
+/// The leaf case of `db_match_eq_body`: an immediate must be the *same* term and
+/// not one of the special atoms (nor, in const mode, a match-spec variable);
+/// any other boxed term compares by term equality.
+fn leaf_eq(a: &pattern::Pattern, b: Eterm, const_mode: bool, atoms: &AtomTable) -> bool {
+    match a {
+        pattern::Pattern::Literal(lit) => {
+            if !eq(*lit, b, atoms) {
+                return false;
+            }
+            if let Some(name) = super::atom_name(*lit, atoms) {
+                if name == "_" || name == "$$" || name == "$_" {
+                    return false;
+                }
+                if const_mode && super::var_index(name).is_some() {
+                    return false;
+                }
+            }
+            true
+        }
+        pattern::Pattern::Bind(n) => {
+            !const_mode && super::atom_name(b, atoms).and_then(super::var_index) == Some(*n)
+        }
+        // A wildcard, a tuple, a list or a map never equals a leaf.
+        _ => false,
+    }
+}
+
+/// Whether a body key is the `{element, KeyPos, '$_'}` form (the C's last
+/// acceptance rule). It decodes to `element(KeyPos, '$_')`.
+fn is_element_form(sub_key: &expr::Expr, keypos: usize) -> bool {
+    let expr::Expr::Element(position, target) = sub_key else {
+        return false;
+    };
+    if !matches!(&**target, expr::Expr::WholeObject) {
+        return false;
+    }
+    let expr::Expr::Literal(inner) = &**position else {
+        return false;
+    };
+    is_small(*inner) && inner.raw() == make_small(keypos as i64).raw()
+}
+
 impl Table {
     /// The body value of every object the spec selects (`ets:select/2`) — one
     /// result per matching object, in the table's iteration order.
@@ -425,6 +655,12 @@ impl Table {
         let keypos = self.keypos();
         let multi = self.kind() == TableKind::DuplicateBag;
 
+        // The oracle validates the spec's body *shape* before it traverses
+        // anything (`analyze_pattern` → `db_match_keeps_key`), so an invalid body
+        // is `badarg` even when nothing matches and the table is untouched.
+        if !static_keeps_key(spec, keypos, atoms) {
+            return Err(crate::error::badarg());
+        }
         // Phase 1 — compute and validate *every* replacement before mutating, so a
         // rejected one leaves the table exactly as it was.
         let mut replacements: Vec<Eterm> = Vec::new();
