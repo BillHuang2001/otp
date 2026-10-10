@@ -442,6 +442,10 @@ The reply tag is **paired** with the request tag, never echoed: `{io_request, �
   `get_key/1,2`, `get_application/0,1`; `init:get_argument/1`'s automatic flags; `init:script_id/0`;
   `code:lib_dir/2`; the `filelib` existence probes — is pinned end to end, against the live oracle,
   by `../tests/a9_native_floor.rs`.
+- The `init:*` termination/reboot family (`init:get_arguments/0`'s automatic prefix, `init:stop/0,1`
+  exit codes, `init:restart/0`, `init:boot/1`) and `code:load_file/1`'s real load are pinned by
+  `../tests/native_init.rs` and `../tests/code_load_file.rs`, driving the built binary and
+  cross-checking the live oracle (skipping **loudly** without the toolchain).
 
 ## Routing Table
 - `../native.rs` → the dispatch table + the `erlang`-core items and shared helpers (read for the
