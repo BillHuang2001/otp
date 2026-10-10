@@ -163,8 +163,9 @@ configuration and it runs **all 22 directives to completion**, ending at the fin
   `../context` change (intercept `erlang:apply/2,3` in `call_bif` and run the target through the
   blocking-aware entry) — **not** a boot change.
   Pinned by `bootscript.rs::tests::the_real_boot_leaves_logger_unregistered_pending_the_apply_seam_gap`
-  (today's true behaviour) and the `#[ignore]`d positive
-  `bootscript.rs::tests::the_real_boot_registers_a_live_logger_process`.
+  (asserting the current behaviour) and the `#[ignore]`d positive
+  `bootscript.rs::tests::the_real_boot_registers_a_live_logger_process` (the oracle's behaviour,
+  which fails while the seam is open).
 - **Instruction 20's `gen_server:call` suspends and resumes.** `apply_boot_call` runs `c:erlangrc/0`
   through the engine's blocking-aware entry; the scheduler pass services the `file_server_2` mailbox
   and delivers the reply (counted into the pass's `delivered` by `service_file_requests`), and the call
