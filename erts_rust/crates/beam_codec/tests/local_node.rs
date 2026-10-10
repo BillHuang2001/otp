@@ -370,7 +370,10 @@ fn the_boundary_below_each_limit_still_decodes() {
     let term = fixture
         .decode(&newer_reference_image(LOCAL_NODE, 0, MAX_REFERENCE - 1))
         .expect("MAX_REFERENCE - 1 is a valid local first number");
-    assert_eq!(external_ref_parts(term).unwrap().1, [MAX_REFERENCE - 1]);
+    assert_eq!(
+        beam_codec::term::internal_ref_id(term).unwrap(),
+        (MAX_REFERENCE - 1) as u64
+    );
 
     // D6: `2^28 - 1` is the largest local process number, serial `2^32 - 1` the
     // largest serial (the latter is unreachable through a `u32` wire field, `5` is
@@ -378,14 +381,21 @@ fn the_boundary_below_each_limit_still_decodes() {
     let term = fixture
         .decode(&new_pid_image(LOCAL_NODE, MAX_PID_NUMBER, u32::MAX, 0))
         .expect("the largest local pid number/serial are valid");
-    let (_node, number, serial, _creation) = external_pid_parts(term).unwrap();
-    assert_eq!((number, serial), (MAX_PID_NUMBER, u32::MAX));
+    assert!(beam_term::prelude::is_internal_pid(term));
+    assert_eq!(
+        (
+            beam_term::prelude::pid_number(term) as u32,
+            beam_term::prelude::pid_serial(term) as u32
+        ),
+        (MAX_PID_NUMBER, u32::MAX)
+    );
 
     // D6 (ports): `2^60 - 1` is the largest local port id.
     let term = fixture
         .decode(&v4_port_image(LOCAL_NODE, MAX_PORT_NUMBER, 0))
         .expect("the largest local port id is valid");
-    assert_eq!(external_port_parts(term).unwrap().1, MAX_PORT_NUMBER);
+    assert!(beam_term::prelude::is_internal_port(term));
+    assert_eq!(beam_term::prelude::port_number(term), MAX_PORT_NUMBER);
 
     // D2: the remote (non-local) counterpart still accepts `MAX_REFERENCE` itself.
     let term = fixture
