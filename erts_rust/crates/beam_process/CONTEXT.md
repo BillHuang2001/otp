@@ -59,7 +59,9 @@ Honors the crate-layer root-set contract: `x_reg_array[0..Live)` **plus the whol
     fragment path. These are the only two `*_mut` pairs with a real caller need (the rest were audited);
     do not add a combined raw-pointer accessor for any pair.
   - **message delivery:** `deliver(from: Eterm, term: Eterm, src_off_heap: &OffHeapTable) ->
-    Result<DeliverOutcome>` — copies `term` into the young heap (on `AllocKind::Heap`/`Message`
+    Result<DeliverOutcome>` — copies `term` into the young heap **through a fresh per-send staging
+    `OffHeapTable`** (drained into the resulting `Message`; the process's persistent `off_heap` is never
+    touched, so a send cannot steal a queued signal's off-heap handles) (on `AllocKind::Heap`/`Message`
     exhaustion it collects and grows the nursery **on demand** to fit the refused request, then retries
     once; the retry's own failure is what the delivery returns), enqueues the `Message`, then `wake()`s;
     `deliver_simple(from, term)` — the no-off-heap form; `receive(pred) -> Option<Message>` (delegates
