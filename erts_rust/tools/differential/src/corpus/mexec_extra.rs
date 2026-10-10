@@ -37,10 +37,13 @@
 //! OTP application module is loaded and run).
 //!
 //! Deliberately avoided (documented divergences, not agreement): `lists:usort/2` with an
-//! ascending comparator (the Rust runtime produces a wrong *result*), the `math:erf/1`/
-//! `erfc/1` pair (1–5 ULP) and the whole `filelib` module (the Rust runtime reports it as a
-//! capability gap, not a value). Any golden that renders a map or a multiset here is reduced
-//! to an integer (size / sorted-key or sorted-value head), never an order-unstable `~w`.
+//! ascending comparator (the Rust runtime produces a wrong *result*) and the `math:erf/1`/
+//! `erfc/1` pair (1–5 ULP). `filelib` is only partly avoided: its **absent-path**
+//! `is_dir/1`/`is_file/1`/`is_regular/1` answers and the literal `wildcard/1` glob now AGREE
+//! (pinned by `boot_extra/filelib_*`), while its **existing-path** probes still hit the typed
+//! `#file_info{}` `access(2)` capability gap (a gap, not a differing value). Any golden that
+//! renders a map or a multiset here is reduced to an integer (size / sorted-key or sorted-value
+//! head), never an order-unstable `~w`.
 
 use super::{Case, CaseKind, Contract, Golden, ModuleRun};
 

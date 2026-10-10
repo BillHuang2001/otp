@@ -89,10 +89,11 @@ const CONTRACTS: &[Contract] = &[Contract::BeamAsm, Contract::OtpApps];
 /// `re:version/0` / `re:split/2`, which need `re:compile/2`).
 ///
 /// A candidate whose observable would be volatile (a `~w` of a multi-key map, a pid/ref/port,
-/// or an unseeded clock/`rand` value) is deliberately absent, as is one that would be a
-/// *genuine* divergence — e.g. a zero-length binary returned by `base64:encode/1` and handed
-/// straight to `io:format`, or `erl_error:format_exception/3` with a heap-allocated reason.
-/// Those produce a *differing* observable result, i.e. a `mismatch`: reported, not claimed.
+/// or an unseeded clock/`rand` value) is deliberately absent. Two shapes that *used* to produce
+/// a differing observable — a zero-length binary returned by `base64:encode/1` and handed
+/// straight to `io:format`, and `erl_error:format_exception/3` with a heap-allocated reason —
+/// are now fixed, and are pinned as corpus cases (`modules/bif_base64_encode_empty_size` and the
+/// `modules/erl_error_format_exception_*` group), so no sweep entry needs to avoid them.
 const SWEEP: &[Entry] = &[
     // --- array -------------------------------------------------------------------
     Entry { module: "array", spec: "array:size/1", args: &[0], body: "array:size(array:new())" },

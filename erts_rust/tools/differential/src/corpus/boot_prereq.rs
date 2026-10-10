@@ -47,23 +47,27 @@
 //! group is the boot-path *prerequisite* half of the A.9 surface, while `boot` (in `boot.rs`)
 //! holds the boot/version-observability half and `boot_extra` the preloaded-module invariants.
 //!
-//! The surfaces deliberately **not** pinned here are plain differing observables — genuine
-//! divergences that would be a `mismatch`, not a capability gap — and are handoffs to `beam_rt`
-//! (the oracle value state, verified with `differential compare` against the live system ERTS,
-//! is what the runtime should converge on):
+//! The surfaces deliberately **not** pinned here are either plain differing observables (a
+//! `mismatch`, not a capability gap) or typed capability gaps (never a mismatch); all are handoffs
+//! to `beam_rt` (the oracle value state, verified with `differential compare` against the live
+//! system ERTS, is what the runtime should converge on):
 //!
 //! | surface | oracle (OTP 29 / erts-17.1) | rust runtime |
 //! |---|---|---|
-//! | `init:get_argument(progname)` | `{ok,[["erl"]]}` | `{ok,[["beam_rt"]]}` (the runtime's own invocation name — correct in kind, differing in value) |
-//! | `init:script_id/0` | `{"Erlang/OTP","29"}` | raises `badarg` |
+//! | `init:script_id/0` | `{"Erlang/OTP","29"}` | a typed `unsupported` capability gap: `beam_rt: unsupported: init:script_id/0 (no boot script has been loaded)` (exit 3), **not** `badarg` |
 //! | `init:get_arguments/0` | every flag **plus** the emulator's `root`/`bindir`/`progname`/`home` | the runtime's own modelled flags only |
 //! | `erlang:module_loaded(lists)` (a non-preloaded module) | `true` | `false` |
-//! | `code:lib_dir/2` (e.g. `code:lib_dir(kernel, ebin)`) | a path string | raises `badarg` |
 //! | `code:get_path/0` | the installation's path list | a differing path list |
-//! | `application:get_all_key/1`, `application:get_key/1` | `{ok,KeyValueList}` / `{ok,KeyValueList}` | raises `badarg` |
-//! | `application:get_key(App, mod)` on a library app (e.g. `stdlib`) | `{ok,[]}` | `undefined` |
-//! | `application:get_key(kernel, env\|maxT\|runtime_dependencies\|…)` | the key's value | `undefined` |
+//! | `application:get_key(kernel, env)`, and so `application:get_all_key(kernel)`'s `env` member | the application's environment | a shorter, per-VM-start-ordered list |
 //! | `erlang:system_info(loaded)` | the loaded-code table | a typed `unsupported` capability gap (not a mismatch) |
+//!
+//! The rows this table used to carry that now **agree** (re-measured against the live runtimes)
+//! are no longer divergences: `init:get_argument(progname)` (the runtime reports the same
+//! invocation name; pinned **shape-only**, since the value is the invocation name),
+//! `code:lib_dir/2` (`code:lib_dir(kernel, ebin)`), `application:get_key(stdlib, mod)` (`{ok,[]}`),
+//! `application:get_all_key/1` and `application:get_key/1` (the `badarg` is gone — only the `env`
+//! member above still differs), `application:get_key(kernel, maxT)` (`{ok,infinity}`) and
+//! `application:get_key(kernel, runtime_dependencies)` (`undefined`).
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
 /// One A.9 boot-observability case: evaluate `expr` under both runtimes with the same
