@@ -44,6 +44,7 @@
 //! | [`limits`] | counts read from this runtime's live tables plus the emulator limits (`atom_count`, `process_count`, `port_limit`, …) |
 //! | [`schedulers`] | processor/scheduler/multi-scheduling keys |
 //! | [`memory`] | GC/heap policy keys, `allocated_areas`, `alloc_util_allocators`, `garbage_collection` |
+//! | [`dist`] | the distribution-state keys `dist` / `dist_ctrl` (answered only in the oracle's non-distributed state) |
 //! | [`unsupported`] | the oracle's keys for facilities this runtime does not have — an honest capability gap |
 //!
 //! # Implemented vs unsupported vs badarg
@@ -55,11 +56,11 @@
 //!   runtime's own live tables (`process_count`, `atom_count`, `allocated_areas`, …) and
 //!   are therefore correct-but-smaller than the oracle's run-time figure.
 //! * [`UNSUPPORTED_KEYS`] — the oracle accepts the key but it describes a facility this
-//!   runtime genuinely does not have (a live dist wire state, the time-correction
-//!   service, CPU-topology detection, the C-compiler/3PP identification, the code-loading
-//!   dumps, the logger pid, …). Each returns a raise whose reason atom starts with
-//!   `unsupported` ([`crate::error::unsupported`]) so a `-eval` caller sees the exit-3
-//!   capability gap — **never** a fabricated value or a hardcoded oracle number.
+//!   runtime genuinely does not have (the time-correction service, CPU-topology detection,
+//!   the C-compiler/3PP identification, the code-loading dumps, the logger pid, …). Each
+//!   returns a raise whose reason atom starts with `unsupported`
+//!   ([`crate::error::unsupported`]) so a `-eval` caller sees the exit-3 capability gap —
+//!   **never** a fabricated value or a hardcoded oracle number.
 //! * every other key — `badarg`, exactly what the oracle raises for a key it does not
 //!   accept (`erlang:system_info(nonsense)` ⇒ `error:badarg`).
 //!
@@ -79,6 +80,7 @@ use beam_term::{make_atom, try_make_small, AtomTable, Eterm, NIL};
 use crate::error;
 use crate::runtime::Runtime;
 
+mod dist;
 mod host;
 mod limits;
 mod memory;
@@ -167,6 +169,9 @@ pub const SUPPORTED_KEYS: &[&str] = &[
     "garbage_collection",
     "alloc_util_allocators",
     "allocated_areas",
+    // -- `dist`: the distribution-state keys (see [`dist`]) --
+    "dist",
+    "dist_ctrl",
 ];
 
 /// The keys the oracle accepts but this runtime answers with an honest **capability
@@ -179,9 +184,6 @@ pub const SUPPORTED_KEYS: &[&str] = &[
 pub const UNSUPPORTED_KEYS: &[&str] = &[
     // The host C allocator identification (`{glibc, …}`) — no C allocator to identify.
     "allocator",
-    // A live distribution node's wire state.
-    "dist",
-    "dist_ctrl",
     // The time-correction service and its clocks.
     "time_offset",
     "time_correction",
@@ -313,7 +315,7 @@ pub const INFO_ATOMS: &[&str] = &[
 
 /// A `system_info/1` value, independent of any heap.
 ///
-/// The first five variants are the scalar shapes; [`InfoValue::List`],
+/// The first six variants are the scalar shapes; [`InfoValue::List`],
 /// [`InfoValue::Tupled`] and [`InfoValue::Map`] are the generic containers the richer
 /// keys (`alloc_util_allocators`, `allocated_areas`, `{allocator, A}`,
 /// `garbage_collection`, `max_heap_size`) are built from — a `{Key, Value}` row is
@@ -332,6 +334,13 @@ pub enum InfoValue {
     Bool(bool),
     /// A two-element tuple of atoms, by name.
     Tuple(&'static str, &'static str),
+    /// A byte string (materialized as an on-heap binary).
+    ///
+    /// Distinct from [`InfoValue::Str`], which is an Erlang **string** — a list of
+    /// byte-sized small integers. `Binary` is the shape of `system_info(dist)` (the
+    /// oracle's `=node:…`/`=no_distribution` dump), built through the safe heap writer
+    /// [`beam_codec::term::make_binary`] so this crate stays `unsafe`-free.
+    Binary(Vec<u8>),
     /// A proper list, in order (materialized element by element, head first).
     List(Vec<InfoValue>),
     /// A tuple of arbitrary arity, in order.
@@ -354,7 +363,7 @@ impl InfoValue {
     /// * [`BeamError::TermNotFound`] when an atom this value names is not interned in
     ///   `atoms` — never an invented atom. A runtime materializing this crate's keys
     ///   seeds [`INFO_ATOMS`], which covers every atom the surface can emit;
-    /// * the heap's allocation failure for a string, a list, a tuple or a map.
+    /// * the heap's allocation failure for a string, a list, a tuple, a map or a binary.
     pub fn to_eterm(&self, heap: &mut Heap, atoms: &AtomTable) -> Result<Eterm> {
         match self {
             InfoValue::Int(value) => try_make_small(*value).map_err(|_| BeamError::SystemLimit),
@@ -372,6 +381,7 @@ impl InfoValue {
                 let second = atom_term(atoms, second)?;
                 heap.tuple(&[first, second])
             }
+            InfoValue::Binary(bytes) => beam_codec::term::make_binary(heap, bytes),
             InfoValue::List(elements) => {
                 // Materialize the elements first (they may need heap space of their own),
                 // then build the spine, so a nested container cannot be half-written.
@@ -436,6 +446,9 @@ pub fn system_info_value(key: &str, rt: &Runtime) -> Result<InfoValue> {
         return result;
     }
     if let Some(result) = memory::try_value(key, rt) {
+        return result;
+    }
+    if let Some(result) = dist::try_value(key, rt) {
         return result;
     }
     if let Some(result) = unsupported::try_value(key, rt) {
@@ -675,7 +688,7 @@ mod tests {
         }
         // The surface is the union of the family modules; keep the count pinned so a key
         // dropped from a family is caught.
-        assert_eq!(SUPPORTED_KEYS.len(), 63);
+        assert_eq!(SUPPORTED_KEYS.len(), 65);
         let mut sorted: Vec<&str> = SUPPORTED_KEYS.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
@@ -700,7 +713,7 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), UNSUPPORTED_KEYS.len(), "no duplicate keys");
-        assert_eq!(sorted.len(), 19);
+        assert_eq!(sorted.len(), 17);
     }
 
     #[test]
@@ -816,6 +829,22 @@ mod tests {
             ])
             .expect("the expected tuple fits");
         assert!(eq(tuple, expected, &atoms));
+
+        // A byte string materializes as a **binary** carrying exactly those bytes (this is
+        // the shape of `system_info(dist)`), not as an Erlang string.
+        let payload: &[u8] = b"=node:'nonode@nohost'\n=no_distribution\n";
+        let binary = InfoValue::Binary(payload.to_vec())
+            .to_eterm(&mut heap, &atoms)
+            .expect("binary");
+        let (bytes, offset_bits, size_bits) =
+            beam_codec::term::bitstring_bytes(binary).expect("a bitstring");
+        assert_eq!(offset_bits, 0);
+        assert_eq!(size_bits, payload.len() * 8, "byte-aligned: a binary");
+        assert_eq!(&bytes[..size_bits / 8], payload);
+        // No atom table is needed — a binary carries no atom.
+        assert!(InfoValue::Binary(payload.to_vec())
+            .to_eterm(&mut heap, &AtomTable::new())
+            .is_ok());
     }
 
     #[test]
