@@ -33,9 +33,10 @@
 use beam_term::{is_small, make_atom, signed_value, Eterm};
 
 use super::inlined::{AGGR_RESULT, FIB_RESULT, KERNEL_RESULT, WIDE_RESULT};
-use super::workloads::{Workload, BUILD_ROUNDS, MAP_ROUNDS, SELECT_ROUNDS, WALK_LENGTH};
+use super::workloads::{
+    Workload, BUILD_ROUNDS, CROSS_STEPS, MAP_ROUNDS, SELECT_ROUNDS, WALK_LENGTH,
+};
 use crate::terms;
-
 /// Assert `result` is the small integer `expected`.
 fn expect_small(result: Eterm, expected: i64) -> std::result::Result<(), String> {
     if !is_small(result) || signed_value(result) != expected {
@@ -113,4 +114,9 @@ pub(crate) fn verify_select(_workload: &Workload, result: Eterm) -> std::result:
 /// `walk/2` must return [`WALK_LENGTH`] (one per cell).
 pub(crate) fn verify_walk(_workload: &Workload, result: Eterm) -> std::result::Result<(), String> {
     expect_small(result, WALK_LENGTH as i64)
+}
+
+/// `cross/2` must return [`CROSS_STEPS`] (one per cross-module transfer).
+pub(crate) fn verify_cross(_workload: &Workload, result: Eterm) -> std::result::Result<(), String> {
+    expect_small(result, CROSS_STEPS as i64)
 }
