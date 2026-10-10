@@ -96,29 +96,40 @@
 //!
 //! # Not served
 //!
-//! The rest of `prim_file` still falls through to the preloaded `.beam` (whose `-nifs()`
-//! stubs raise `undef`) — never a fabricated success. Deliberately unclaimed here, with the
-//! reason for each:
+//! Two kinds of entry stay outside the floor's working surface.
 //!
-//! * `advise/4` and `allocate/3` — the C calls `posix_fadvise(2)`/`posix_fallocate(2)`
-//!   (`efile_advise`/`efile_allocate`, `unix_prim_file.c:571-650`), and safe `std` exposes
-//!   neither.
-//! * the whole `read_file_info/1,2`, `read_link_info/1,2`, `read_handle_info/1,2` and
-//!   `write_file_info/2,3` family — every `#file_info{}` field is fillable from
-//!   `std::fs::Metadata`/`MetadataExt` **except** `access` (the C calls `access(2)`, which
-//!   safe `std` does not expose), and the *default* time type is `local`, a time-zone
-//!   conversion this runtime has no facility for.
-//! * `copy/3` (a loop of `open`/`pread`/`pwrite`/`close` with its own errno remaps),
-//!   `read_line/1`, `get_handle/1`, `sendfile/8`, `ipread_s32bu_p32bu/3`,
-//!   `file_desc_to_ref/2` and `internal_get_nif_resource/1` — each needs a facility this
-//!   floor does not have (`read_line/1` the `{get_line,…}` io-device request, `sendfile/8`
-//!   the `sendfile(2)` syscall, the rest the NIF resource model).
-//! * `list_dir/1` and `list_dir_all/1` — their entries come back in `readdir(3)` order,
-//!   which the oracle does not sort and this runtime cannot pin.
-//! * `write_file/3` — not exported by the oracle at all, so a caller gets `error:undef`.
-//! * any refinement of the served `pread`/`pwrite` beyond the offset+count / offset+bytes
-//!   pairs pinned here — the C's `r_buffer` read-ahead and its `prim_buffer` resource are
-//!   not reproduced (see [`super::prim_file`]'s "Documented divergences").
+//! **Explicit typed gaps** — claimed by `prim_file_call` and answered with
+//! `error::unsupported/1` naming the facility this runtime lacks, so a caller gets the honest
+//! capability gap instead of the silently wrong `{error,badarg}` the preloaded wrapper's
+//! `catch error:_` would otherwise produce:
+//!
+//! * `read_file_info/1,2`, `read_link_info/1,2`, `read_handle_info/1,2` — every `#file_info{}`
+//!   field is safe-`std`-derivable **except** `access`: the path forms call `access(2)`
+//!   (`efile_read_info`, `unix_prim_file.c:757-762`) and the handle form
+//!   `check_access/1`'s `geteuid`/`getegid` + mode bits (`:771-801`), neither of which safe
+//!   `std` exposes. The **default `local`** (and `[{time,universal}]`) forms need **no**
+//!   time-zone facility here — the Erlang wrapper `adjust_times/2` produces them through the
+//!   served `erlang:posixtime_to_universaltime/1`/`universaltime_to_localtime/1`, so the NIF
+//!   only ever returns the clamped POSIX seconds.
+//! * `write_file_info/2,3` — `chmod(2)`/`chown(2)`/`utimes(2)`.
+//! * `advise/4` — `posix_fadvise(2)`; `allocate/3` — `posix_fallocate(2)`.
+//! * `list_dir/1`/`list_dir_all/1` — the answer is raw `readdir(3)` order, a property of the
+//!   on-disk directory state that the oracle does not sort and this runtime cannot pin.
+//! * `read_line/1` — its Erlang body drives the `prim_buffer:*` resource NIFs, which this
+//!   runtime does not model.
+//! * `file_desc_to_ref/2` — adopting a raw `int` fd.
+//!
+//! **Deliberately unclaimed**, because the call falls through to the preloaded `.beam` and the
+//! oracle answers the same thing there: `copy/2`, `write_file/3` and `delayed_close/1` are not
+//! exported (`error:undef`), and `sendfile/8`'s representable clause answers the *value*
+//! `{error,enotsup}`/`badarg` (`prim_file.erl:438-439`), never a result this floor could
+//! fabricate. (`copy/3` is pure Erlang over `file:copy_opened/3` and already works: `{ok,N}`.)
+//! `internal_get_nif_resource/1` is unclaimed too — it returns the NIF resource behind a
+//! descriptor, and this floor's `#file_descriptor{}` carries a private registry id instead.
+//!
+//! Not reproduced either: any refinement of the served `pread`/`pwrite` beyond the
+//! offset+count / offset+bytes pairs pinned here — the C's `r_buffer` read-ahead and its
+//! `prim_buffer` resource (see [`super::prim_file`]'s "Documented divergences").
 //!
 //! `prim_zip:splitter/3` and the other `prim_*` modules (`prim_buffer`, `prim_eval`,
 //! `prim_inet`/`prim_socket`/`prim_net`, `erl_prim_loader`) are untouched —
