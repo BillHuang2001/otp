@@ -99,9 +99,6 @@ its compiled-opcode program. The interior is a Rust AST, not a term program.
   without an installed hook this is an honest SEMANTIC under-match. Pinned by
   `tests/select.rs::documented_capability_gaps_are_typed_and_diverge_from_the_oracle`
   and `tests/match_spec_run.rs::documented_gaps_diverge_from_the_oracle_in_a_run`.
-- **`select_replace/2`'s key check is value-based**, not the oracle's static
-  `db_match_keeps_key` shape check (`exec.rs` `keeps_key` + the doc block); more
-  permissive in three corners, recorded by `tests/ets_replace.rs::recorded_divergence_*`.
 - **Continuations are index positions into `tab2list()`, not live cursors**
   (`continuation.rs`); a table mutated between `/3` and `/1` may shift the position
   (bounds-checked, never OOB). Hash-kind order is unspecified.
@@ -124,7 +121,15 @@ its compiled-opcode program. The interior is a Rust AST, not a term program.
   `/`, non-small operands, overflow → `unsupported_ets`; `div`/`rem` by 0 → `badarg`).
 - **Continuations carry a cloned compiled `MatchSpec` + limit + direction + index**, so a
   `/1` resume never recompiles and keeps its direction (`select` vs `select_reverse`).
-- **`select_replace` is two-phase** (compute+validate every replacement, then mutate) so a
+- **`select_replace/2` validates the body statically, up front** — the oracle's
+  `db_match_keeps_key` (`erts/emulator/beam/erl_db_util.c:1422`): every clause's body must
+  be a one-expression list of `'$_'`, the `{{ … }}` construction form or `{const, {…}}`,
+  and the constructed key must be *syntactically* the head's key (or the
+  `{element, KeyPos, '$_'}` form) — otherwise the whole call is `badarg` even when nothing
+  matches. `exec.rs::static_keeps_key`/`clause_keeps_key` carry the check, with the
+  `BodySide` walk mirroring the C `db_match_eq_body`. The rejected shapes are pinned by
+  `tests/ets_replace.rs::static_check_*` (each asserting the unchanged table).
+- **`select_replace` is then two-phase** (compute every replacement, then mutate) so a
   `badarg` leaves the table unchanged; `duplicate_bag` rebuilds affected keys from
   `take`'s checked-out copies.
 - **Body failures ≠ guard failures:** a body expression's `BadArg` becomes the atom `EXIT`
@@ -155,7 +160,7 @@ its compiled-opcode program. The interior is a Rust AST, not a term program.
 - `pattern.rs` → `Pattern` + head decode/match (+ dead `bound_vars`)
 - `expr/mod.rs` → `Expr`/`CmpOp`/`TypeTest`/`ArithOp`/`Value` + `ArithHook` + `decode`/`decode_tuple`/`decode_call`/`eval`/`eval_term`/`value_bool`/`classify`
 - `expr/guard.rs` → the guard-BIF helpers (incl. `ceil_floor`/`max_min`/`binary_part2,3`/`is_record3`/`is_function2`/`is_integer3`/`node0,1`/`xor`/`bnot` + `map_get`/`map_size`/`is_map_key`/`tuple_size`/`byte_size`/`bit_size`/`float`/`trunc`/`round`/`abs` + map construction) + the `SelfHook`/`set_self_hook` seam
-- `exec.rs` → `impl Table` select/match/delete/replace/count + `run_clauses`/`guards_hold`/`spec_for_pattern`/`BodyKind`
+- `exec.rs` → `impl Table` select/match/delete/replace/count + `run_clauses`/`guards_hold`/`spec_for_pattern`/`BodyKind` + the static `select_replace` body check (`static_keeps_key`/`clause_keeps_key`, the `db_match_keeps_key` mirror)
 - `run.rs` → `match_spec_run` (raw-spec list runner)
 - `continuation.rs` → `MatchContinuation` + the limit/continue forms (`traverse`/`resume`)
 - `../../../beam_bifs/src/{match_spec.rs,ets/{matches,reverse,specs,extra}.rs}` → the BIF bridges over this layer (they delegate to `compile`/`match_spec_run`/`Table::*`; no duplicated matcher)

@@ -51,7 +51,7 @@
 //!    `do_catch` — `erts/emulator/beam/erl_db_util.c`. A **guard** failure still
 //!    skips the clause (guards do *not* compile under `matchCatch`).
 //!
-//! # Recorded divergence: the oracle's *static* body check
+//! # The oracle's *static* body check
 //!
 //! `erl` validates the body's **shape** statically (`db_match_keeps_key`,
 //! `erts/emulator/beam/erl_db_util.c:1422`, installed as the match spec's
@@ -59,15 +59,14 @@
 //! expression is `'$_'`, the `{{ … }}` construction form, or `{const, {…}}`, and
 //! the constructed key must be *syntactically* the head's key (or
 //! `{element, KeyPos, '$_'}`). It therefore raises `badarg` **even when nothing
-//! matches**. `beam_ets` validates the **value** each body produces instead — the
-//! rule this crate is specified against — which is strictly more permissive in the
-//! corners pinned by the `recorded_divergence_*` tests at the end of this file.
-//! Wherever the oracle *accepts*, the two agree on every case here.
+//! matches**, and `beam_ets` adopts exactly that rule (the crate's
+//! `static_keeps_key`, mirroring `db_match_keeps_key`); the `static_check_*` tests
+//! at the end of this file pin the rejected shapes and the unchanged table.
 //!
 //! This is deliberately one comprehensive suite: it is a long file (over the
 //! workspace's ~1000-line guidance) because `select_replace/2`, the body
-//! runtime-failure rule and the recorded static-check divergence are covered as a
-//! single battery against one shared oracle renderer; splitting it by rule would
+//! runtime-failure rule and the static-check rejections are covered as a single
+//! battery against one shared oracle renderer; splitting it by rule would
 //! duplicate that harness.
 
 mod common;
@@ -986,22 +985,22 @@ fn only_badarg_is_masked_by_exit_never_a_typed_capability_gap() {
 }
 
 // ---------------------------------------------------------------------------
-// Recorded divergence: the oracle's *static* body check (see the module docs)
+// The oracle's *static* body check (see the module docs)
 //
 // `erl` raises `badarg` for a body that is not a one-expression list of `'$_'`,
 // `{{ … }}` or `{const, {…}}`, and requires the constructed key to be
 // *syntactically* the head's key — even when the spec matches nothing. `beam_ets`
-// implements the crate's specified **value**-based rule instead, which accepts
-// these. Each test asserts our (more permissive) result and quotes the oracle's
-// `badarg` so the difference cannot drift silently.
+// adopts exactly that rule, and it runs *before* any traversal, so every rejection
+// below is asserted together with the unchanged table (via `replace_line`, which
+// renders the table after the call).
 // ---------------------------------------------------------------------------
 
 #[test]
-fn recorded_divergence_a_multi_expression_body_whose_last_value_keeps_the_key() {
+fn static_check_multi_expression_body_is_badarg() {
     // erl: body `[{hd,5}, {{'$1','$2'}}]` on {1,10}/{2,20} is `badarg` (the C
-    //      requires a ONE-expression body).
-    // beam_ets: the first expression fails -> `EXIT`, the second builds the
-    //      matched tuple, which keeps the key -> `{ok:2,[{1,10},{2,20}]}`.
+    //      requires a ONE-expression body — `db_match_keeps_key`).
+    // The second expression would rebuild the matched tuple and keep the key, but
+    // the body's *shape* is rejected before anything is traversed.
     let atoms = atoms();
     let mut heap = Heap::new(256);
     let mut t = new_table(TableKind::Set);
@@ -1017,19 +1016,14 @@ fn recorded_divergence_a_multi_expression_body_whose_last_value_keeps_the_key() 
     )
     .unwrap();
 
-    assert_eq!(
-        replace_line(&atoms, &mut t, &spec),
-        "{ok:2,[{1,10},{2,20}]}",
-        "recorded divergence: the oracle is stricter here (badarg)"
-    );
+    assert_eq!(replace_line(&atoms, &mut t, &spec), "{badarg,[{1,10},{2,20}]}");
 }
 
 #[test]
-fn recorded_divergence_b_multi_expression_body_that_matches_nothing() {
+fn static_check_multi_expression_body_on_a_never_matching_spec_is_badarg() {
     // erl: `[{{99,'_'},[],[{hd,5},{{99,1}}]}]` on {1,10} is `badarg` — the oracle
     //      validates the body's shape *before* traversing, so an empty match set
     //      does not help.
-    // beam_ets: nothing matches -> `{ok:0,[{1,10}]}`.
     let atoms = atoms();
     let mut heap = Heap::new(256);
     let mut t = new_table(TableKind::Set);
@@ -1040,19 +1034,13 @@ fn recorded_divergence_b_multi_expression_body_that_matches_nothing() {
     let constructed = construct(&mut heap, &[make_small(99), make_small(1)]);
     let spec = compile(spec1(&mut heap, head, &[], &[failing, constructed]), &atoms).unwrap();
 
-    assert_eq!(
-        replace_line(&atoms, &mut t, &spec),
-        "{ok:0,[{1,10}]}",
-        "recorded divergence: the oracle is stricter here (badarg)"
-    );
+    assert_eq!(replace_line(&atoms, &mut t, &spec), "{badarg,[{1,10}]}");
 }
 
 #[test]
-fn recorded_divergence_c_constant_body_with_a_wildcard_head_key() {
+fn static_check_constant_body_with_a_wildcard_head_key_is_badarg() {
     // erl: `[{{'_','_'},[],[{const,{1,10}}]}]` on {1,10} is `badarg` — a `'_'` head
     //      key cannot be *syntactically* tied to the constant body key.
-    // beam_ets: the value check accepts it (the constant keeps the matched key) ->
-    //      `{ok:1,[{1,10}]}`.
     let atoms = atoms();
     let mut heap = Heap::new(256);
     let mut t = new_table(TableKind::Set);
@@ -1063,11 +1051,7 @@ fn recorded_divergence_c_constant_body_with_a_wildcard_head_key() {
     let body = tuple_of(&mut heap, &[at(&atoms, "const"), constant]);
     let spec = compile(spec1(&mut heap, head, &[], &[body]), &atoms).unwrap();
 
-    assert_eq!(
-        replace_line(&atoms, &mut t, &spec),
-        "{ok:1,[{1,10}]}",
-        "recorded divergence: the oracle is stricter here (badarg)"
-    );
+    assert_eq!(replace_line(&atoms, &mut t, &spec), "{badarg,[{1,10}]}");
 }
 
 #[test]
@@ -1093,11 +1077,10 @@ fn an_unbound_body_variable_is_badarg_like_the_oracle() {
 }
 
 #[test]
-fn recorded_divergence_e_rejected_body_on_a_never_matching_spec() {
+fn static_check_rejected_body_on_a_never_matching_spec_is_badarg() {
     // erl: `[{{99,'_'},[],[{hd,5}]}]` on {1,10} is `badarg` (the body `{hd,5}` is
-    //      not a construction, whatever it would evaluate to).
-    // beam_ets: the failing body becomes `EXIT`, but nothing matches, so the
-    //      outcome is `{ok:0,[{1,10}]}`.
+    //      not a construction, whatever it would evaluate to) — the check runs
+    //      before the traversal, so the empty match set does not help.
     let atoms = atoms();
     let mut heap = Heap::new(256);
     let mut t = new_table(TableKind::Set);
@@ -1107,18 +1090,14 @@ fn recorded_divergence_e_rejected_body_on_a_never_matching_spec() {
     let body = tuple_of(&mut heap, &[at(&atoms, "hd"), make_small(5)]);
     let spec = compile(spec1(&mut heap, head, &[], &[body]), &atoms).unwrap();
 
-    assert_eq!(
-        replace_line(&atoms, &mut t, &spec),
-        "{ok:0,[{1,10}]}",
-        "recorded divergence: the oracle is stricter here (badarg)"
-    );
+    assert_eq!(replace_line(&atoms, &mut t, &spec), "{badarg,[{1,10}]}");
 }
 
 #[test]
-fn recorded_divergence_f_rejected_body_on_an_empty_table() {
+fn static_check_rejected_body_on_an_empty_table_is_badarg() {
     // erl: `[{{'$1','$2'},[],[ '$2']}]` on an EMPTY set is `badarg` (the body is a
-    //      bare variable, not a construction).
-    // beam_ets: no object is ever evaluated -> `{ok:0,[]}`.
+    //      bare variable, not a construction) — the shape is validated before the
+    //      (empty) traversal, so an empty table does not help either.
     let atoms = atoms();
     let mut heap = Heap::new(256);
     let mut t = new_table(TableKind::Set);
@@ -1126,18 +1105,14 @@ fn recorded_divergence_f_rejected_body_on_an_empty_table() {
     let head = tuple_of(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
     let spec = compile(spec1(&mut heap, head, &[], &[at(&atoms, "$2")]), &atoms).unwrap();
 
-    assert_eq!(
-        replace_line(&atoms, &mut t, &spec),
-        "{ok:0,[]}",
-        "recorded divergence: the oracle is stricter here (badarg)"
-    );
+    assert_eq!(replace_line(&atoms, &mut t, &spec), "{badarg,[]}");
 }
 
 #[test]
 fn the_element_keypos_whole_object_construct_form_agrees_with_the_oracle() {
     // erl: `[{{'_','_'},[],[{{{element,1,'$_'},99}}]}]` on {1,10} ->
     //      `{ok:1,[{1,99}]}` — `{element, KeyPos, '$_'}` is one of the forms the
-    //      oracle's static check allows, and the value check agrees.
+    //      oracle's static check allows, and `beam_ets`'s static check allows it too.
     let atoms = atoms();
     let mut heap = Heap::new(256);
     let mut t = new_table(TableKind::Set);
