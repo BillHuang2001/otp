@@ -18,7 +18,6 @@ Configure-time pins: `make/autoconf/win*.config.cache.static` (`ac_cv_prog_CC=cc
 - `mc.sh` — `mc.exe` driver: locates `mc.exe` the same way, converts `-I`, `cd`s into the `-o` output directory before running (message compiler writes beside the source otherwise).
 - `emu_cc.sh` — the `EMU_CC` compiler (see `make/autoconf/otp.m4`, `LM_FIND_EMU_CC`): compiles with mingw `gcc` (`x86_64-w64-mingw32-gcc.exe` when `CONFIG_SUBTYPE=win64`, else `gcc`) plus `-D__WIN32__ -DWIN32 -DWINDOWS -fomit-frame-pointer`, then runs `coffix.exe -e` on the object. Needed because `cl.exe` cannot compile the computed gotos in `beam_emu.c`. `-MM` mode skips coffix. It self-bootstraps: rebuilds `coffix.exe` with `cl.exe` when `coffix.c` is newer.
 - `coffix.c` → built on demand as `coffix.exe`; patches PE/COFF section headers where gcc/mingw put the virtual size in `Misc.PhysicalAddress` with `SizeOfRawData == 0` (typical `.bss`), moving it to `SizeOfRawData` so the MS linker sizes the section correctly. Byte-identical to `../../mingw/coffix.c` and `../../../msys_tools/vc/coffix.c`/wsl copy.
-- `cc_wrap.c`, `ld_wrap.c` — C re-implementations of `cc.sh`/`ld.sh` (`cc_wrap.exe` shells out to `ld_wrap.exe`; an `#if 0` branch calls `bash ld.sh`). Not referenced by any Makefile or by `otp_build`, not built: legacy R13B03-era prototypes. Do not wire them in.
 
 ## Constraints
 - Same environment rules as `../` (Cygwin bash, `cygpath` conversion before calling MS tools; `/tmp` temp files).
@@ -32,7 +31,6 @@ Configure-time pins: `make/autoconf/win*.config.cache.static` (`ac_cv_prog_CC=cc
 - `cc.sh` rejects multiple sources with a single `-o *.o`.
 - Debug flags: `-g` turns on `/MDd` (debug CRT) unless the stdlib was forced with `-m*`; mixing object files built with different `-M*` settings produces link errors in `link.sh`'s stdlib choice.
 - The `-Owx` (wxErlang) optimization case is hardcoded; it silently overrides `-g`.
-- `cc_wrap.c`/`ld_wrap.c` are dead code — do not assume they match `cc.sh`/`ld.sh` behaviour.
 
 ## Dependencies
 - MSVC: `cl.exe`, `link.exe`, `lib.exe`, `rc.exe`, `mc.exe`, `mt.exe`; Cygwin `cygpath`.
