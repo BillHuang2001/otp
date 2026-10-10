@@ -178,6 +178,113 @@
         make_boxed(p as *const Eterm)
     }
 
+    /// `bytes` copied into a fresh **word-aligned** payload of whole `Eterm` words
+    /// (zero-padded) — the aligned backing storage an off-heap bitstring's base pointer
+    /// needs (`write_refc_binary`'s `debug_assert`). A `Box<[u8]>` would not be
+    /// `Eterm`-aligned.
+    fn word_aligned_payload(bytes: &[u8]) -> Box<[Eterm]> {
+        let word_bytes = core::mem::size_of::<Eterm>();
+        let mut payload: Box<[Eterm]> =
+            vec![Eterm::from_raw(0); bytes.len().div_ceil(word_bytes).max(1)].into_boxed_slice();
+        // SAFETY: `payload` owns at least `bytes.len()` writable bytes (rounded up to
+        // whole words, at least one), so the copy stays inside the box.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                payload.as_mut_ptr().cast::<u8>(),
+                bytes.len(),
+            );
+        }
+        payload
+    }
+
+    /// Builds a well-formed off-heap **refc binary**: the 8-word `[BinRef][ErlSubBits]`
+    /// pair ([`write_refc_binary`], root at `hp + ERL_BIN_REF_SIZE`), whose payload is a
+    /// [`word_aligned_payload`] of `bytes`. The payload box is returned alongside the
+    /// term so the test keeps it alive: the writer stores a raw pointer into it and
+    /// `copy_sub_bits` gathers those bytes.
+    ///
+    /// # Safety
+    ///
+    /// `heap` must have room for [`ERL_REFC_BITS_SIZE`] (8) words and must outlive the
+    /// returned term.
+    unsafe fn build_refc_binary(heap: &mut Heap, bytes: &[u8]) -> (Eterm, Box<[Eterm]>) {
+        let payload = word_aligned_payload(bytes);
+        let base = payload.as_ptr().cast::<u8>();
+        // SAFETY: the heap has room for the 8-word pair; `base` names the `Eterm`-aligned
+        // payload's first byte, covers `bytes.len() * 8` bits, and outlives the term (the
+        // box is handed back to the caller).
+        let root = unsafe {
+            let hp = heap
+                .alloc_words(ERL_REFC_BITS_SIZE)
+                .expect("heap room for a refc binary");
+            write_refc_binary(
+                hp,
+                payload.as_ptr() as *mut Eterm,
+                core::ptr::null_mut(),
+                base,
+                0,
+                bytes.len() * 8,
+            )
+        };
+        (root, payload)
+    }
+    /// The bit window `[start, start + size)` of `base` unpacked into bytes,
+    /// most-significant bit of the first byte first — an **independent** expectation for
+    /// [`TermStore::copy_sub_bits`], whose own gatherer is a different code path.
+    /// [`the_window_expectation_matches_a_hand_computation`] pins this helper against a
+    /// literal, so the two cannot be wrong together.
+    fn window_bytes(base: &[u8], start: usize, size: usize) -> Vec<u8> {
+        let mut out = vec![0u8; size.div_ceil(8)];
+        for i in 0..size {
+            let bit = (base[(start + i) / 8] >> (7 - ((start + i) % 8))) & 1;
+            out[i / 8] |= bit << (7 - (i % 8));
+        }
+        out
+    }
+
+    /// Builds a well-formed `ErlSubBits` over a **word-aligned** payload whose bit window
+    /// is **not byte-aligned** (`start = 3`, `size = 13`), so [`TermStore::copy_sub_bits`]
+    /// must take its bit-by-bit gather path (not the aligned slice copy) and
+    /// re-materialise a bitstring whose size is not a whole number of bytes.
+    ///
+    /// `payload_bytes` must cover at least the 16 bits the window reads. The payload box
+    /// is returned so the test keeps it alive.
+    ///
+    /// # Safety
+    ///
+    /// `heap` must have room for [`sub_bits_size_words`] (5) words and must outlive the
+    /// returned term.
+    unsafe fn build_non_aligned_sub_bits(
+        heap: &mut Heap,
+        payload_bytes: &[u8],
+    ) -> (Eterm, Box<[Eterm]>) {
+        /// The window's first bit and its (non-multiple-of-8) size in bits.
+        const START_BIT: usize = 3;
+        const SIZE_BITS: usize = 13;
+        assert!(
+            payload_bytes.len() * 8 >= START_BIT + SIZE_BITS,
+            "the payload must cover the whole window"
+        );
+        let payload = word_aligned_payload(payload_bytes);
+        let base = payload.as_ptr() as usize;
+        // SAFETY: the heap has room for the 5-word `ErlSubBits`; `base` is word-aligned
+        // (so its low flag bits are clear) and covers the window; `orig` is ignored by
+        // `copy_sub_bits` (it is only ever read through a `BinRef` pair).
+        let root = unsafe {
+            let hp = heap
+                .alloc_words(sub_bits_size_words())
+                .expect("heap room for a sub-bits thing");
+            write_sub_bits(
+                hp,
+                Eterm::from_raw(base),
+                Eterm::from_raw(START_BIT),
+                Eterm::from_raw(START_BIT + SIZE_BITS),
+                make_small(0),
+            )
+        };
+        (root, payload)
+    }
     /// Asserts that `copy` reproduced the whole thing of `source` word for word
     /// (used for the pointer-free leaves).
     fn assert_copied_verbatim(name: &str, source: Eterm, copy: Eterm) {
@@ -982,4 +1089,463 @@
             "the held block memory must stabilize, not grow with the cycle count"
         );
         assert_eq!(store.words(), 0);
+    }
+
+    // --- the boxed kinds the oracle's `ets:insert/2` accepts -------------------
+
+    /// A **hash map** (a >32-key HAMT, not a flat map) copies node by node: every HAMT
+    /// node, collision node and `[Key, Value]` leaf cell is reproduced into table
+    /// storage, so the copy is structurally equal to the source *and* survives the
+    /// source heap being clobbered.
+    #[test]
+    fn hash_map_copy_is_self_contained_and_equal() {
+        let atoms = AtomTable::new();
+        const N: i64 = 40;
+        let capacity = map_words_capacity(N as usize);
+        let mut heap = Heap::new(1024);
+        let pairs: Vec<(Eterm, Eterm)> = (0..N)
+            .map(|i| (make_small(i), make_small(i * 7 + 1)))
+            .collect();
+        // SAFETY: the heap has room for `capacity` words and outlives the map.
+        let map = unsafe {
+            let hp = heap.alloc_words(capacity).expect("heap room for a hash map");
+            write_map(hp, &pairs, &atoms).expect("a hash map is writable")
+        };
+        assert!(
+            !unsafe { is_flatmap(map) },
+            "{N} pairs must produce a HAMT, not a flat map"
+        );
+
+        let mut store = test_store();
+        let copied = store.copy(map).expect("a hash map is copyable");
+        assert_ne!(boxed_val(copied), boxed_val(map), "must be copied");
+        assert!(eq(map, copied, &atoms), "structural equality");
+        assert_eq!(map_size(copied, &atoms).expect("a live map"), N as usize);
+        assert!(store.words() > 0, "the HAMT owns store storage");
+
+        // Clobber the whole source-map region, then read the copy back: a copy that
+        // still aliased a node or a leaf cell would now read different values.
+        heap.reset();
+        let _clobber = heap
+            .tuple(&vec![make_small(-1); capacity - 1])
+            .expect("heap room for the clobber tuple");
+        let mut want = pairs.clone();
+        want.sort_by(|a, b| cmp(a.0, b.0, &atoms));
+        assert_eq!(
+            map_pairs(copied, &atoms).expect("a live map"),
+            want,
+            "the copy must be self-contained"
+        );
+
+        assert!(store.free(copied) > 0, "the free reclaims every run");
+        assert_eq!(store.words(), 0);
+    }
+
+    /// Builds the head node of a map whose single slot is a **collision node** — the
+    /// `[make_arityval(n)][n leaf cells]` shape `beam_term::map` writes for >= 2 keys
+    /// sharing a full 64-bit hash. `write_map` cannot produce it deterministically
+    /// (finding such a key pair needs a hash search), so it is built by hand here:
+    /// `[make_map_header(HEAD_BITMAP, 1, 1)][size = n][slot0 = coll]`, three words with
+    /// one occupancy bit.
+    ///
+    /// # Safety
+    ///
+    /// `heap` must have room for `3 + n + 2n` words and must outlive the term.
+    unsafe fn build_map_collision_node(heap: &mut Heap, pairs: &[(Eterm, Eterm)]) -> Eterm {
+        let n = pairs.len();
+        // SAFETY: `alloc_tuple(n)` hands over the collision tuple's `n + 1` words, then
+        // `2n` cons-cell words and the head node's 3 words are reserved. Every word is
+        // written before the term escapes.
+        unsafe {
+            let coll = heap.alloc_tuple(n).expect("heap room for the collision node");
+            for (i, (key, value)) in pairs.iter().enumerate() {
+                let cell = heap
+                    .alloc_words(2)
+                    .expect("heap room for a collision leaf cell");
+                *cell.add(CAR_OFFSET) = *key;
+                *cell.add(CDR_OFFSET) = *value;
+                *coll.add(1 + i) = make_list(cell as *const Eterm);
+            }
+            let head = heap.alloc_words(3).expect("heap room for the head node");
+            *head = make_map_header(MAP_HEADER_TAG_HAMT_HEAD_BITMAP, 1, 1);
+            *head.add(1) = Eterm::from_raw(n);
+            *head.add(2) = make_boxed(coll as *const Eterm);
+            make_boxed(head as *const Eterm)
+        }
+    }
+
+    /// A HAMT whose slot is a **collision node** is copied recursively: the head node,
+    /// the collision tuple and every leaf cell are deep-copied into table storage, so
+    /// the copy is structurally equal and independent of the source.
+    #[test]
+    fn hash_map_collision_node_copy_is_recursive() {
+        let mut atoms = AtomTable::new();
+        let a = atoms.intern("alpha");
+        let b = atoms.intern("beta");
+        let mut heap = Heap::new(32);
+        let pairs = [(make_atom(a), make_small(1)), (make_atom(b), make_small(2))];
+        // SAFETY: the heap has room (3 + 2 + 4 words) and outlives the map.
+        let map = unsafe { build_map_collision_node(&mut heap, &pairs) };
+
+        let mut store = test_store();
+        let copied = store.copy(map).expect("a collision-node map is copyable");
+        assert_ne!(boxed_val(copied), boxed_val(map));
+        assert!(eq(map, copied, &atoms), "structural equality");
+        assert_eq!(map_size(copied, &atoms).expect("a live map"), 2);
+
+        // The collision tuple is a distinct, deep-copied object, and so are its cells.
+        // SAFETY: `copied` and `map` are live 3-word head nodes; the slots and cells are
+        // live terms (the map's `size` word at word 1 is not a term).
+        unsafe {
+            let src_slot = *boxed_val(map).add(2);
+            let dst_slot = *boxed_val(copied).add(2);
+            assert!(is_boxed_term(dst_slot));
+            assert_ne!(
+                boxed_val(src_slot),
+                boxed_val(dst_slot),
+                "the collision node must be deep-copied"
+            );
+            assert_eq!(tuple_size(dst_slot), 2);
+            let src_cell = tuple_element(src_slot, 0);
+            let dst_cell = tuple_element(dst_slot, 0);
+            assert_ne!(
+                list_val(src_cell),
+                list_val(dst_cell),
+                "the leaf cells must be deep-copied"
+            );
+            assert_eq!(car(dst_cell), make_atom(a));
+            assert_eq!(cdr(dst_cell), make_small(1));
+        }
+
+        let mut want: Vec<(Eterm, Eterm)> = pairs.to_vec();
+        want.sort_by(|x, y| cmp(x.0, y.0, &atoms));
+        assert_eq!(map_pairs(copied, &atoms).expect("a live map"), want);
+
+        assert!(store.free(copied) > 0);
+        assert_eq!(store.words(), 0);
+    }
+
+    /// Every fun kind (`Local`/`External`/`Imported`) copies with its header and
+    /// descriptor words verbatim — only the `num_free` environment is deep-copied.
+    #[test]
+    fn every_fun_kind_copies_with_its_environment_deep_copied() {
+        let mut atoms = AtomTable::new();
+        let foo = atoms.intern("foo");
+        let bar = atoms.intern("bar");
+        let mut heap = Heap::new(64);
+        // A boxed environment element for the local fun, so the deep-copy of the
+        // environment is genuinely exercised.
+        // SAFETY: the heap has room for the float and outlives every fun.
+        let env_elem = unsafe { build_float(&mut heap, 2.5) };
+
+        // SAFETY: each `alloc_words(fun_words(kind, num_free))` reserves exactly the
+        // block the corresponding writer fills, and the heap outlives every fun.
+        let (local, external, imported) = unsafe {
+            let env = [make_small(7), env_elem];
+            let hp = heap
+                .alloc_words(fun_words(FunKind::Local, env.len()))
+                .expect("heap room for a local fun");
+            let local = write_fun_local(hp, 2, 0xDEAD_BEEF_0000_0001, 3, &env)
+                .expect("a local fun is writable");
+            let hp = heap
+                .alloc_words(fun_words(FunKind::External, 0))
+                .expect("heap room for an external fun");
+            let external =
+                write_fun_external(hp, 3, foo, bar).expect("an external fun is writable");
+            let env = [make_small(9)];
+            let hp = heap
+                .alloc_words(fun_words(FunKind::Imported, env.len()))
+                .expect("heap room for an imported fun");
+            let imported = write_fun_imported(
+                hp,
+                4,
+                foo,
+                &[0xAB; 16],
+                5,
+                6,
+                7,
+                FunPid {
+                    node: bar,
+                    number: 8,
+                    serial: 9,
+                    creation: 10,
+                },
+                &env,
+            )
+            .expect("an imported fun is writable");
+            (local, external, imported)
+        };
+
+        let mut store = test_store();
+        for (name, source) in [
+            ("local", local),
+            ("external", external),
+            ("imported", imported),
+        ] {
+            let copied = store.copy(source).expect("a fun is copyable");
+            assert_ne!(
+                boxed_val(copied),
+                boxed_val(source),
+                "{name}: must be deep-copied"
+            );
+            assert!(eq(source, copied, &atoms), "{name}: structural equality");
+            // SAFETY: both are live fun terms.
+            assert_eq!(
+                unsafe { fun_kind_of_header(*boxed_val(copied)) },
+                unsafe { fun_kind_of_header(*boxed_val(source)) },
+                "{name}: the kind survives"
+            );
+            assert!(store.free(copied) > 0, "{name}: holds store storage");
+        }
+
+        // The local fun's boxed environment element is a distinct, deep-copied thing.
+        let copied_local = store.copy(local).expect("a local fun is copyable");
+        // SAFETY: both are live local funs with the same `num_free`; the boxed elements
+        // are live floats.
+        unsafe {
+            let env_off = 1 + fun_desc_words(FunKind::Local);
+            let src_elem = *boxed_val(local).add(env_off + 1);
+            let dst_elem = *boxed_val(copied_local).add(env_off + 1);
+            assert!(is_float(src_elem) && is_float(dst_elem));
+            assert_ne!(
+                boxed_val(src_elem),
+                boxed_val(dst_elem),
+                "the environment must be deep-copied"
+            );
+            assert!(eq(src_elem, dst_elem, &atoms));
+        }
+        assert!(store.free(copied_local) > 0);
+        assert_eq!(store.words(), 0);
+    }
+
+    /// External pid/port/reference blocks are copied with their raw `u32`/`u64` payload
+    /// verbatim, while the `node` term slot is deep-copied when it is not an immediate.
+    #[test]
+    fn external_pid_port_and_ref_copy_their_node_slot_deeply() {
+        let mut atoms = AtomTable::new();
+        let node_atom = atoms.intern("n1@host");
+        let mut heap = Heap::new(64);
+        // A **boxed** node term for the pid, so the deep-copy of the node slot is
+        // exercised: a boxed node must never be left pointing at the source.
+        // SAFETY: the heap has room for the float and outlives the pid.
+        let boxed_node = unsafe { build_float(&mut heap, 6.25) };
+        let ids = [0x1111_1111u32, 0x2222_2222, 0x3333_3333];
+
+        // SAFETY: each `alloc_words(w)` reserves exactly the block the writer fills, and
+        // the heap outlives every term.
+        let (pid, port, ext_ref) = unsafe {
+            let hp = heap
+                .alloc_words(external_pid_size_words())
+                .expect("heap room for an external pid");
+            let pid = write_external_pid(hp, boxed_node, 1000, 7, 5);
+            let hp = heap
+                .alloc_words(external_port_size_words())
+                .expect("heap room for an external port");
+            let port = write_external_port(hp, make_atom(node_atom), 0x1_0000_0007, 5);
+            let hp = heap
+                .alloc_words(external_ref_size_words(ids.len()))
+                .expect("heap room for an external ref");
+            let ext_ref = write_external_ref(hp, make_atom(node_atom), &ids, 5);
+            (pid, port, ext_ref)
+        };
+
+        let mut store = test_store();
+        for (name, source) in [("pid", pid), ("port", port), ("ref", ext_ref)] {
+            let copied = store.copy(source).expect("an external thing is copyable");
+            assert_ne!(
+                boxed_val(copied),
+                boxed_val(source),
+                "{name}: must be deep-copied"
+            );
+            assert!(eq(source, copied, &atoms), "{name}: structural equality");
+            assert!(store.free(copied) > 0, "{name}: owns store storage");
+        }
+        assert_eq!(store.words(), 0);
+
+        // The pid's boxed node landed in table storage; its scalars are verbatim.
+        let copied_pid = store.copy(pid).expect("an external pid is copyable");
+        // SAFETY: both pids are live; the copied node is a live store-owned float.
+        unsafe {
+            let src_node = *boxed_val(pid).add(1);
+            let dst_node = *boxed_val(copied_pid).add(1);
+            assert!(is_float(src_node) && is_float(dst_node));
+            assert_ne!(
+                boxed_val(src_node),
+                boxed_val(dst_node),
+                "the node slot must be deep-copied"
+            );
+            assert!(eq(src_node, dst_node, &atoms));
+            let (_, number, serial, creation) = external_pid_parts(copied_pid);
+            assert_eq!((number, serial, creation), (1000, 7, 5));
+        }
+        assert!(store.free(copied_pid) > 0);
+        assert_eq!(store.words(), 0);
+    }
+
+    /// An off-heap **refc binary** is re-materialised as a **self-contained on-heap
+    /// binary**: [`TermStore::copy_sub_bits`] gathers the payload bytes and writes a
+    /// fresh `ErlHeapBits`, so the copy neither aliases the off-heap payload nor depends
+    /// on it. Dropping the payload after the copy must not disturb the copy.
+    #[test]
+    fn refc_binary_copy_is_a_self_contained_on_heap_binary() {
+        let atoms = AtomTable::new();
+        let bytes = [0xA3u8, 0x5C, 0xF0, 0x0F, 0x12, 0x34, 0x56, 0x78];
+        let mut heap = Heap::new(32);
+        // SAFETY: the heap has room for the 8-word refc pair and outlives the term.
+        let (refc, payload) = unsafe { build_refc_binary(&mut heap, &bytes) };
+        assert!(unsafe { is_bitstring(refc) });
+
+        let mut store = test_store();
+        let copied = store.copy(refc).expect("a refc binary is copyable");
+        assert_ne!(boxed_val(copied), boxed_val(refc), "must be copied");
+        assert!(eq(refc, copied, &atoms), "the copy holds the same bytes");
+        // The copy is an on-heap bitstring, not another off-heap reference.
+        // SAFETY: `copied` is a live boxed bitstring.
+        unsafe {
+            assert_eq!(
+                header_subtag(*boxed_val(copied)),
+                HEAP_BITS_SUBTAG as u32,
+                "the copy must be an on-heap bitstring"
+            );
+            assert!(is_binary(copied));
+            assert_eq!(bitstring_size(copied), bytes.len() * 8);
+        }
+
+        // Drop the off-heap payload: `refc` now dangles, but the copy must not.
+        drop(payload);
+        // SAFETY: `copied` is store-owned, on-heap and self-contained.
+        unsafe {
+            let (base, offset, size) = bitstring_parts(copied);
+            assert_eq!((offset, size), (0, bytes.len() * 8));
+            assert_eq!(core::slice::from_raw_parts(base, bytes.len()), &bytes[..]);
+        }
+
+        assert!(store.free(copied) > 0);
+        assert_eq!(store.words(), 0);
+    }
+
+    /// Pins the independent window expectation used by
+    /// [`sub_bitstring_copy_is_self_contained`] against a hand computation, so that test
+    /// cannot pass by the expectation and the production gatherer being wrong together.
+    #[test]
+    fn the_window_expectation_matches_a_hand_computation() {
+        // Bits 1..9 of `1010_1010 1100_1100` are `0101_0101`.
+        assert_eq!(window_bytes(&[0xAA, 0xCC], 1, 8), vec![0x55]);
+        // Bits 3..13 of `1010_0011 0101_1100` are `0001_1010 11` -> `1A C0`.
+        assert_eq!(window_bytes(&[0xA3, 0x5C], 3, 10), vec![0x1A, 0xC0]);
+    }
+
+    /// A **non-byte-aligned** sub-bitstring (`start = 3`, `size = 13`) copies as a
+    /// self-contained on-heap bitstring whose bits equal the source window — the
+    /// bit-by-bit gather path, not the aligned slice copy. Dropping the payload after
+    /// the copy must not disturb it.
+    #[test]
+    fn sub_bitstring_copy_is_self_contained() {
+        let atoms = AtomTable::new();
+        let payload_bytes = [0xA3u8, 0x5C];
+        let expected = window_bytes(&payload_bytes, 3, 13);
+        assert_eq!(expected.len(), 2, "13 bits is two (partial) bytes");
+
+        let mut heap = Heap::new(32);
+        // SAFETY: the heap has room for the 5-word `ErlSubBits` and outlives the term.
+        let (sub_bits, payload) = unsafe { build_non_aligned_sub_bits(&mut heap, &payload_bytes) };
+        assert!(unsafe { is_bitstring(sub_bits) });
+        assert!(
+            !unsafe { is_binary(sub_bits) },
+            "13 bits is not a whole number of bytes"
+        );
+
+        let mut store = test_store();
+        let copied = store.copy(sub_bits).expect("a sub-bitstring is copyable");
+        assert_ne!(boxed_val(copied), boxed_val(sub_bits), "must be copied");
+        assert!(eq(sub_bits, copied, &atoms), "the copy holds the same bits");
+        // SAFETY: `copied` is a live boxed bitstring.
+        unsafe {
+            assert_eq!(
+                header_subtag(*boxed_val(copied)),
+                HEAP_BITS_SUBTAG as u32,
+                "the copy must be an on-heap bitstring"
+            );
+            assert_eq!(bitstring_size(copied), 13);
+        }
+
+        // Drop the payload: `sub_bits` now dangles; the copy must not.
+        drop(payload);
+        // SAFETY: `copied` is store-owned, on-heap and self-contained.
+        unsafe {
+            let (base, offset, size) = bitstring_parts(copied);
+            assert_eq!((offset, size), (0, 13));
+            assert_eq!(
+                core::slice::from_raw_parts(base, 2),
+                &expected[..],
+                "the copy's bits are the source window"
+            );
+        }
+
+        // A byte-equivalent on-heap bitstring built independently compares equal.
+        let mut heap2 = Heap::new(8);
+        // SAFETY: `heap_bits_size_words(13)` words are reserved for the reference term.
+        let reference = unsafe {
+            let hp = heap2
+                .alloc_words(heap_bits_size_words(13))
+                .expect("heap room for the reference bitstring");
+            write_heap_bits(hp, &expected, 13).expect("a bitstring is writable")
+        };
+        assert!(eq(copied, reference, &atoms));
+
+        assert!(store.free(copied) > 0);
+        assert_eq!(store.words(), 0);
+    }
+
+    /// Per-object accounting over the two newly-supported multi-run kinds: a hash map
+    /// and a fun both reclaim exactly the words they consumed, and a **later** copy
+    /// reuses those runs without disturbing a still-live term.
+    #[test]
+    fn hash_map_and_fun_reclamation_keeps_the_accounting_stable() {
+        let atoms = AtomTable::new();
+        const N: i64 = 40;
+        let mut heap = Heap::new(1024);
+        let pairs: Vec<(Eterm, Eterm)> = (0..N)
+            .map(|i| (make_small(i), make_small(i + 100)))
+            .collect();
+        // SAFETY: the heap has room for the map (<= `map_words_capacity(N)`) and the fun.
+        let (map, fun) = unsafe {
+            let hp = heap
+                .alloc_words(map_words_capacity(pairs.len()))
+                .expect("heap room for a hash map");
+            let map = write_map(hp, &pairs, &atoms).expect("a hash map is writable");
+            let env = [make_small(5)];
+            let hp = heap
+                .alloc_words(fun_words(FunKind::Local, env.len()))
+                .expect("heap room for a fun");
+            let fun =
+                write_fun_local(hp, 1, 0x1234, 2, &env).expect("a local fun is writable");
+            (map, fun)
+        };
+
+        let mut store = test_store();
+        let map_copy = store.copy(map).expect("a hash map is copyable");
+        let fun_copy = store.copy(fun).expect("a fun is copyable");
+        let live = store.words();
+        let blocks = store.blocks();
+        assert!(live > 0, "both roots own store storage");
+        assert!(blocks > 0);
+
+        // Free only the map, then re-copy it: the still-live fun must be undisturbed and
+        // the recopy must reuse the freed runs (no new block, no new memory).
+        let map_words = store.free(map_copy);
+        assert!(map_words > 0);
+        assert_eq!(store.words(), live - map_words);
+        let map_copy2 = store.copy(map).expect("a hash map is copyable");
+        assert!(eq(map, map_copy2, &atoms), "the recopy is structurally equal");
+        assert!(eq(fun, fun_copy, &atoms), "the live fun survived the map churn");
+        assert_eq!(store.blocks(), blocks, "reuse mapped no new block");
+        assert_eq!(store.words(), live, "the recopy cost exactly the freed words");
+
+        // Free both roots: the live count returns to zero; the blocks stay mapped.
+        assert_eq!(store.free(map_copy2), map_words, "the map's runs");
+        assert_eq!(store.free(fun_copy), live - map_words, "the fun's runs");
+        assert_eq!(store.words(), 0);
+        assert_eq!(store.blocks(), blocks, "reclamation never unmaps a block");
+        assert!(store.memory() > 0, "the freed words' storage is still held");
     }
