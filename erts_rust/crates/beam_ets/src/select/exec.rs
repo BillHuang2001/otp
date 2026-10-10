@@ -269,7 +269,7 @@ fn static_keeps_key(spec: &MatchSpec, keypos: usize, atoms: &AtomTable) -> bool 
 /// One clause of [`static_keeps_key`].
 fn clause_keeps_key(
     head: &pattern::Pattern,
-    body: &[Expr],
+    body: &[expr::Expr],
     keypos: usize,
     atoms: &AtomTable,
 ) -> bool {
