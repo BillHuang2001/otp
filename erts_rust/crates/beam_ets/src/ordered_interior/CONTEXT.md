@@ -54,14 +54,20 @@ Term order is never re-implemented here (workspace Prevent-Duplication rule).
 
 ## Test Strategy
 `check_invariants` walks the whole tree against all five invariants (incl.
-`separator[i] == max(child[i])`) after every step of scattered 200-key and 10 000-key
-insert/delete/re-split churn, and drain-to-empty; an oracle `Vec` cross-checks `size` and the
-ascending key run. `mod.rs` tests cover the empty case, replace/`insert_new`/`delete_object`,
-mixed key classes, present/absent/boundary navigation, the replace-key-term rule, and memory
-monotonicity; both interiors are driven through the `Interior` seam by shared helpers.
-`../interior_parity.rs` proves the B+-tree and the sorted `Vec` produce identical observable
-traces. End-to-end `ordered_set` behaviour is oracle-differential-tested in `../tests/differential/`
-(navigation, 10 001-key, matchspec, ...). No `#[ignore]`; no self-comparison tautologies.
+`separator[i] == max(child[i])` **and** the `<= ORDER` fan-out bound) after every step of scattered
+200-key and 10 000-key insert/delete/re-split churn, and drain-to-empty; an oracle `Vec` cross-checks
+`size` and the ascending key run. A **100 000-key** churn case
+(`one_hundred_thousand_keys_survive_churn_with_the_invariants_held`) scatters inserts (LCG shuffle),
+periodically re-asserts `check_invariants`, checks membership/`lookup` and
+`first`/`last`/`next`/`prev` (incl. bounds), walks the full ascending key run, removes every third key,
+re-checks membership + the walk, re-inserts everything, walks again, then drains back to empty — all
+with immediates (no `Heap`), so it measures the index alone (~0.4 s). `mod.rs` tests cover the empty
+case, replace/`insert_new`/`delete_object`, mixed key classes, present/absent/boundary navigation, the
+replace-key-term rule, and memory monotonicity; both interiors are driven through the `Interior` seam
+by shared helpers. `../interior_parity.rs` proves the B+-tree and the sorted `Vec` produce identical
+observable traces. End-to-end `ordered_set` behaviour is oracle-differential-tested in
+`../tests/differential/` (navigation, 10 001-key, matchspec, ...). No `#[ignore]`; no self-comparison
+tautologies.
 
 ## Known Issues / Notes
 - **`insert`/`delete` are `O(log^2 n)`, not `O(log n)`** as the module docs claim: the separator
