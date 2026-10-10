@@ -369,7 +369,7 @@ pub(super) fn is_integer3(
     upper: Eterm,
     atoms: &AtomTable,
 ) -> Result<bool> {
-    use std::cmp::Ordering::{Greater, Less};
+    use std::cmp::Ordering::Greater;
     let is_integer =
         |term: Eterm| matches!(super::classify(term), TermClass::Small | TermClass::Big);
     if !is_integer(lower) || !is_integer(upper) {
@@ -378,7 +378,9 @@ pub(super) fn is_integer3(
     if !is_integer(value) {
         return Ok(false);
     }
-    Ok(cmp_arith(lower, value, atoms) != Greater && cmp_arith(value, upper, atoms) != Less)
+    // The C `is_integer_3` is `CMP_LE(Lower, Value) && CMP_LE(Value, Upper)` — BOTH
+    // bounds are inclusive, so the upper test is `Value =< Upper` (not `Value < Upper`).
+    Ok(cmp_arith(lower, value, atoms) != Greater && cmp_arith(value, upper, atoms) != Greater)
 }
 
 /// `node/0` — the local node name. The runtime-shape constant
