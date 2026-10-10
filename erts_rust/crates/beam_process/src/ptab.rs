@@ -53,6 +53,13 @@
 //! (external-pid) or **port** signal does not: it would carry no `trap_exit` policy decision
 //! to defer, so `node_down`/`port_closed` materialise it straight into the mailbox.
 //!
+//! Every signal-builder path handles a full receiver heap exactly as
+//! [`Process::deliver`](crate::process::Process::deliver) does (through
+//! [`grow_receiver_for_signal`]): the nursery is collected and grown **on demand** to cover the
+//! refused request and the build is retried once, so an oversized `{'EXIT', …}`/`{'DOWN', …}`
+//! reason is still delivered; a **relocation-exempt** receiver instead surfaces the raw
+//! `BeamError::Alloc` refusal unchanged (no collection, no growth, no retry).
+//!
 //! Legacy C ground truth (read-only): `erts/emulator/beam/erl_ptab.{c,h}` (the process/port
 //! table and the local name registry), `erl_process.c` (`erts_ptab_new_process`) and
 //! `erl_proc_sig_queue.c` (the signal queue this module reproduces).
@@ -60,7 +67,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use beam_alloc::Heap;
-use beam_common::{BeamError, Result};
+use beam_common::{AllocFailure, AllocKind, BeamError, Result};
 use beam_gc::HeapPolicy;
 use beam_message::{Message, MsoHandle, OffHeapTable};
 use beam_term::prelude::{atom_val, is_atom, is_immediate, make_atom, Atom, Eterm};
@@ -136,21 +143,57 @@ fn lookup_mut(slots: &mut [Slot], pid: ProcessId) -> Option<&mut Process> {
     slot.process.as_mut()
 }
 
+/// The receive-side heap-exhaustion policy every signal builder shares with
+/// [`Process::deliver`](crate::process::Process::deliver).
+///
+/// Copying a signal onto a receiver's heap can be refused because the nursery is full — a
+/// *normal* condition, not fatal OOM. A **relocation-exempt** receiver
+/// ([`Process::is_relocation_exempt`](crate::process::Process::is_relocation_exempt)) must not
+/// collect or grow (the host holds live words outside the crate root set, so relocating would
+/// recycle them), so the raw [`BeamError::Alloc`] refusal is returned **unchanged** and the
+/// caller surfaces it — the same raw-refusal contract `deliver` honours. Otherwise the nursery
+/// is collected and grown **on demand** to cover the refused request
+/// ([`Process::ensure_capacity`](crate::process::Process::ensure_capacity), seeded with the word
+/// count the copier reported), and the caller retries once; `Ok(())` means "retry now".
+fn grow_receiver_for_signal(process: &mut Process, failure: AllocFailure) -> Result<()> {
+    if process.is_relocation_exempt() {
+        // The heap cannot be moved under the host's unpublished roots: hand the refusal back
+        // verbatim (`kind` still Heap/Message) — no collection, no growth, no retry.
+        return Err(BeamError::Alloc(failure));
+    }
+    // The copier reports the whole graph's flat word count in the failure (as bytes), so the
+    // words the growth must cover are recoverable from it.
+    let need_words = failure.requested / core::mem::size_of::<Eterm>();
+    // The growth's own error is deliberately ignored, exactly as `Process::deliver` documents:
+    // when the policy's ceiling makes the request unreachable, `ensure_capacity` fails
+    // fail-fast without touching the collector, and the caller's retry reproduces the refusal.
+    // The retry's own result is authoritative — this is not a silent swallow.
+    let _growth = process.ensure_capacity(need_words);
+    Ok(())
+}
+
 /// Builds a signal term — together with the handles of the off-heap objects it owns — on
-/// `process`'s heap, collecting once and retrying when the heap is exhausted (a full heap is a
-/// normal condition, not fatal OOM).
+/// `process`'s heap, retrying once after a collect-and-grow when the heap is exhausted (a full
+/// heap is a normal condition, not fatal OOM).
 ///
 /// `build` returns whatever the caller needs (the term plus the handles of the fresh off-heap
 /// table it copied into, or the term plus extra terms materialised on the same heap). It creates
 /// that table itself, so a retry always starts from a clean table and never reuses a stale handle.
+///
+/// Exhaustion is handled exactly as [`Process::deliver`](crate::process::Process::deliver)
+/// handles it, through [`grow_receiver_for_signal`]: a **relocation-exempt** `process` surfaces
+/// the raw [`BeamError::Alloc`] refusal unchanged, otherwise the nursery is collected and grown
+/// on demand and `build` is retried once.
 fn build_signal_term<T, F>(process: &mut Process, build: F) -> Result<T>
 where
     F: Fn(&mut Heap) -> Result<T>,
 {
     match build(process.heap_mut()) {
         Ok(built) => Ok(built),
-        Err(BeamError::Alloc(_)) => {
-            process.collect()?;
+        Err(BeamError::Alloc(failure))
+            if matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
+        {
+            grow_receiver_for_signal(process, failure)?;
             build(process.heap_mut())
         }
         Err(error) => Err(error),
@@ -159,7 +202,9 @@ where
 
 /// Copies `reason` — whose heap is described by `src_off_heap` — into `process`'s own heap,
 /// registering every referenced off-heap object in the process's own off-heap table, and
-/// returns the copied term. Collects once and retries on heap exhaustion.
+/// returns the copied term. Retries once after a collect-and-grow on heap exhaustion
+/// ([`grow_receiver_for_signal`]): a **relocation-exempt** `process` surfaces the raw
+/// [`BeamError::Alloc`] refusal unchanged rather than collecting or growing.
 ///
 /// `None` means the reason is already owned by `process` (a process signalling itself) and is
 /// returned unchanged.
@@ -173,8 +218,10 @@ fn copy_reason_onto(
     };
     match process.copy_into_heap(reason, src) {
         Ok(copied) => Ok(copied),
-        Err(BeamError::Alloc(_)) => {
-            process.collect()?;
+        Err(BeamError::Alloc(failure))
+            if matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
+        {
+            grow_receiver_for_signal(process, failure)?;
             process.copy_into_heap(reason, src)
         }
         Err(error) => Err(error),
@@ -234,7 +281,7 @@ fn snapshot_off_heap(src: &OffHeapTable) -> OffHeapTable {
 /// enqueued (`enqueue_exit_signal`), so the delivered reason always resides in the recipient's
 /// own heap. This deliberately does **not** collect on heap exhaustion — a collection would
 /// relocate `reason`, turning the raw word stale — so a full heap surfaces as
-/// `BeamError::Alloc` and the caller retries after a collection with a freshly read reason
+/// `BeamError::Alloc` and the caller retries after a collect-and-grow with a freshly read reason
 /// (see [`ProcessTable::deliver_head_signal`]).
 ///
 /// # Errors
@@ -1450,7 +1497,9 @@ impl ProcessTable {
 
         // 4. Remote links and monitors: a dying process leaves the node's records, and every
         //    remote link partner must be told the process is gone. This runs before
-        //    `drop(process)` because `reason` may live in the dying heap the router reads.
+        //    `drop(process)` because `reason` may live in the dying heap the router reads. A
+        //    link partner's death is the **link** exit, so it routes `DistSignal::Exit`
+        //    (`DOP_EXIT`) — never `DistSignal::Exit2` (`erlang:exit/2`'s `DOP_EXIT2`).
         for remote in self.remote_links.remove(&pid).unwrap_or_default() {
             self.route(DistSignal::Exit {
                 from: pid,
@@ -1660,11 +1709,14 @@ impl ProcessTable {
         }
     }
 
-    /// Builds the head signal's message, retrying once after a collection.
+    /// Builds the head signal's message, retrying once after a collect-and-grow on heap
+    /// exhaustion (the [`grow_receiver_for_signal`] policy `Process::deliver` follows).
     ///
     /// The queued signal is an in-heap sub-rootset, so a heap-exhaustion collection relocates
-    /// its `reason` in place: `build` is handed a freshly read reason each attempt. On success
-    /// the head signal is removed and a blocked `pid` is woken (and recorded on the wake list).
+    /// its `reason` in place: `build` is handed a freshly read reason each attempt. A
+    /// **relocation-exempt** recipient surfaces the raw `BeamError::Alloc` refusal unchanged —
+    /// no collection, no growth, no retry. On success the head signal is removed and a blocked
+    /// `pid` is woken (and recorded on the wake list).
     fn deliver_head_signal<F>(&mut self, pid: ProcessId, mut build: F) -> Result<()>
     where
         F: FnMut(&mut Self, Eterm) -> Result<()>,
@@ -1677,12 +1729,14 @@ impl ProcessTable {
             };
             match build(self, reason) {
                 Ok(()) => break,
-                Err(BeamError::Alloc(_)) if attempt == 0 => {
+                Err(BeamError::Alloc(failure))
+                    if attempt == 0 && matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
+                {
                     attempt += 1;
                     let Some(recipient) = lookup_mut(&mut self.slots, pid) else {
                         return Ok(());
                     };
-                    recipient.collect()?;
+                    grow_receiver_for_signal(recipient, failure)?;
                 }
                 Err(error) => return Err(error),
             }
@@ -2115,7 +2169,8 @@ impl ProcessTable {
     }
 
     /// `erlang:exit/2` against an arbitrary pid term: a local pid exits through
-    /// [`ProcessTable::send_exit`], an external pid is routed as a `DOP_EXIT` control signal.
+    /// [`ProcessTable::send_exit`], an external pid is routed as a `DOP_EXIT2` control signal
+    /// ([`DistSignal::Exit2`] — a plain exit signal, *not* the link exit `DOP_EXIT`).
     ///
     /// # Errors
     ///
@@ -2124,7 +2179,7 @@ impl ProcessTable {
     pub fn send_exit_term(&mut self, from: ProcessId, to: Eterm, reason: Eterm) -> Result<()> {
         match PidTarget::from_eterm(to)? {
             PidTarget::Local(pid) => self.send_exit(from, pid, reason),
-            PidTarget::Remote(remote) => self.route(DistSignal::Exit {
+            PidTarget::Remote(remote) => self.route(DistSignal::Exit2 {
                 from,
                 to: remote,
                 reason,

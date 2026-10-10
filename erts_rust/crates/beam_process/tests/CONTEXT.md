@@ -157,7 +157,26 @@ SMP pool:
     guard makes both the no-relocation assertions and the defensive-entry assertions fail — verified
     during development, then restored). Deterministic — every size from the public heap-policy arithmetic,
     no sleeps / wall-clock bounds.
-29. `common/mod.rs` — the **shared oracle driver** used by `registry_monitors.rs`, `dict_oracle.rs`,
+29. `signal_exhaustion.rs` (4 tests) — the **signal builders' exhaustion policy**: the
+    `copy_reason_onto`/`build_signal_term`/`deliver_head_signal` paths (through the shared
+    `grow_receiver_for_signal`) treat a full receiver heap exactly as `Process::deliver` does. A
+    `{'EXIT', From, Reason}` whose copied reason is one word **larger** than the receiver's whole
+    bounded nursery is delivered: the refused copy collected once (`minor_gcs` up), grew the nursery on
+    demand to `next_heap_size(payload, 0)`, moved the base, and lands whole and exactly once in FIFO
+    order ahead of a following delivery (`an_oversized_exit_reason_grows_the_receivers_nursery_and_is_delivered`);
+    the same for a monitor `{'DOWN', …}` carrying a large reason
+    (`an_oversized_down_reason_grows_the_watchers_nursery_and_is_delivered`). A **relocation-exempt**
+    receiver instead surfaces the **raw** `Err(BeamError::Alloc(AllocKind::Heap | Message))` and neither
+    `minor_gcs()` nor the nursery `base()` moves, nothing is written and nothing is enqueued
+    (`a_relocation_exempt_receiver_surfaces_the_raw_refusal_without_relocating`); and the typed failure
+    leaves **no partial enqueue** (the signal is not queued, the mailbox is empty) with the receiver
+    still delivering a fitting signal afterwards
+    (`a_refused_signal_leaves_no_partial_state_and_the_receiver_still_delivers`). **Discriminating by
+    construction: the two delivery tests FAIL (a typed `Alloc` out of `terminate`) the moment the
+    builders only collect without growing, and the exemption test FAILS (a `relocation_exempt` raise
+    instead of the raw `Alloc`) the moment the short-circuit is removed.** Deterministic — every size
+    from the public heap-policy arithmetic, no sleeps / wall-clock bounds / oracle.
+30. `common/mod.rs` — the **shared oracle driver** used by `registry_monitors.rs`, `dict_oracle.rs`,
     `monitor_tag.rs`, `lifecycle_oracle.rs`, `capability_inventory.rs` and `port_monitor_cleanup.rs`:
     `ERL_TIMEOUT`, `erl_stdout`, `expect_oracle` and `strip_logger_reports` (+ 4 unit tests for the
     normalizer). It runs
@@ -167,7 +186,7 @@ SMP pool:
     removed), so a comparison is exact and never flaky. A support module (subdirectory files are not
     compiled as test targets); it carries `#![allow(dead_code)]` because not every including binary uses
     every helper.
-30. `lifecycle_oracle.rs` (7 tests) — the **lifecycle / process-control semantics** cross-checked against
+31. `lifecycle_oracle.rs` (7 tests) — the **lifecycle / process-control semantics** cross-checked against
     the real `erl` (skips loudly when absent), filling the cases the other `oracle_*` suites leave
     unpinned: link exit propagation from a **live** linked origin (a non-trapping peer dies, a trapping
     peer survives with `{'EXIT', A, {bad,1}}`, and the watcher's DOWN carries the same structured
@@ -199,13 +218,15 @@ SMP pool:
 - Run the whole crate gate with
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_process` (never `cd`,
   sandbox `$HOME` is read-only). Cross-checks against the real system ERTS belong to the sibling
-  `../../../tools/differential/` harness, not here. Current: **407 passed, 0 failed, 1 ignored**.
+  `../../../tools/differential/` harness, not here. Current: **411 passed, 0 failed, 1 ignored**.
 
 ## Routing Table
 - `scheduler.rs`, `messaging.rs`, `signals.rs`, `gc.rs`, `priority.rs`, `pending_signals.rs`,
-  `preemption.rs`, `dict.rs`, `fragments.rs`, `scheduler_ports.rs`, `exhaustion.rs`, `gc_exemption.rs` →
+  `preemption.rs`, `dict.rs`, `fragments.rs`, `scheduler_ports.rs`, `exhaustion.rs`,
+  `signal_exhaustion.rs`, `gc_exemption.rs` →
   the single-threaded scheduler (incl. the port-aware slice cleanup), mailbox, signals, GC roots, PCB state,
-  pre-emption/fairness, the delivery collect-and-retry path and the host-controllable GC relocation exemption
+  pre-emption/fairness, the collect-grow-and-retry exhaustion path of `Process::deliver` and the
+  `{'EXIT',…}`/`{'DOWN',…}` signal builders, and the host-controllable GC relocation exemption
 - `registry_monitors.rs`, `monitor_tag.rs`, `capability_inventory.rs`, `process_info_source.rs`,
   `spawn_options.rs`, `lifecycle_oracle.rs` → the process-control surface: name registry + monitors (incl.
   the `monitor/3` user tag), the typed-error/capability inventory, the `process_info` item→accessor

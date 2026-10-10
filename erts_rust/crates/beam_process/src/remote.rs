@@ -51,12 +51,18 @@
 //! DistSignal::Monitor   -> {DOP_MONITOR_P, Remote, Local, Ref}  -> Dop::MonitorP,   &[to_term, watcher.to_eterm(), ref_term]
 //! DistSignal::Demonitor -> {DOP_DEMONITOR_P, Remote, Local, Ref}-> Dop::DemonitorP, &[to_term, watcher.to_eterm(), ref_term]
 //! DistSignal::Exit      -> {DOP_EXIT, From, To, Reason}         -> Dop::Exit,       &[from.to_eterm(), to_term, reason]
+//! DistSignal::Exit2     -> {DOP_EXIT2, From, To, Reason}        -> Dop::Exit2,      &[from.to_eterm(), to_term, reason]
 //! ```
 //!
 //! where `to_term` is the [`RemotePid`] materialised on the router's own scratch heap with
 //! [`RemotePid::to_eterm`] and `ref_term` is the [`MonitorRef`] materialised with
 //! [`MonitorRef::to_eterm`]. (`DOP_UNLINK` = 4 is documented as *never sent*; modern ERTS
-//! unlinks by id, hence `Dop::UnlinkId`.)
+//! unlinks by id, hence `Dop::UnlinkId`.) `DOP_EXIT` and `DOP_EXIT2` are distinct opcodes with
+//! distinct receipt semantics (read-only `dist.c:2760` vs `dist.c:2824`): `DOP_EXIT` is a
+//! **link** exit ("`from`, which `to` is linked to, died" → `erts_dsig_send_exit`,
+//! `dist.c:1747`) and `DOP_EXIT2` is a plain exit signal from `erlang:exit/2` ("`from` sent an
+//! exit signal to `to`" → `erts_dsig_send_exit2`, `dist.c:1800`), so the seam keeps them
+//! separate.
 //!
 //! [`DistSignalRouter::route`] must serialise the signal **synchronously**: `reason` may live
 //! in the signaller's heap, which the caller is free to drop or recycle as soon as `route`
@@ -230,9 +236,27 @@ pub enum DistSignal {
         /// The reference identifying the monitor.
         reference: MonitorRef,
     },
-    /// `erlang:exit/2` (or a link exit) towards a remote pid (`DOP_EXIT`).
+    /// A **link** exit: a local process linked to `to` has died, so `from` is no longer linked
+    /// to it (`DOP_EXIT` → `{DOP_EXIT, From, To, Reason}` → `Dop::Exit`).
+    ///
+    /// The receiver interprets this as "the process I am linked to went away". Legacy C ground
+    /// truth: `erts_dsig_send_exit` (`dist.c:1747`) / the `DOP_EXIT` receipt arm (`dist.c:2760`).
     Exit {
-        /// The local signaller.
+        /// The local process that died (the link partner of `to`).
+        from: ProcessId,
+        /// The remote link partner.
+        to: RemotePid,
+        /// The exit reason term (may live in the signaller's heap — serialise it synchronously).
+        reason: Eterm,
+    },
+    /// `erlang:exit/2` towards a remote pid: `to` is sent a plain exit signal from `from`
+    /// (`DOP_EXIT2` → `{DOP_EXIT2, From, To, Reason}` → `Dop::Exit2`).
+    ///
+    /// Distinct from [`DistSignal::Exit`] because the receiver must not treat it as a link exit.
+    /// Legacy C ground truth: `erts_dsig_send_exit2` (`dist.c:1800`) / the `DOP_EXIT2` receipt
+    /// arm (`dist.c:2824`).
+    Exit2 {
+        /// The local signaller (`erlang:exit(To, Reason)`'s caller).
         from: ProcessId,
         /// The remote recipient.
         to: RemotePid,
