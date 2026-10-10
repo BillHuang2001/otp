@@ -316,11 +316,11 @@ const UNSUPPORTED_ITEM_REASONS: &[(&str, &str)] = &[
     ),
     (
         "async_dist",
-        "no `async_dist` flag in `beam_process::ProcessFlags`",
+        "no async_dist flag in `beam_process::ProcessFlags`",
     ),
     (
         "priority_messages",
-        "no `priority_messages` flag in `beam_process::ProcessFlags`",
+        "no priority_messages flag in `beam_process::ProcessFlags`",
     ),
     (
         "garbage_collection_info",
