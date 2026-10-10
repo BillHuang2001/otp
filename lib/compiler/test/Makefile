@@ -81,10 +81,10 @@ MODULES= \
 	warnings_SUITE \
 	z_SUITE \
 	zlc_SUITE \
+	stage2_bench \
+	stage2_suite_driver \
 	test_lib \
-        erl_md5 \
-	stage2_bench
-
+        erl_md5
 NO_BOOL_OPT= \
 	guard \
 	andor
