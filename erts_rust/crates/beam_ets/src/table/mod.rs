@@ -594,6 +594,57 @@ impl Table {
         Ok(())
     }
 
+    /// Replace **every** object stored under `key` with `objects`, reclaiming the
+    /// replaced objects' storage.
+    ///
+    /// This is the storage-faithful rebuild behind `ets:select_replace/2` on a
+    /// `duplicate_bag` (see [`crate::select`]): several objects may share a key and
+    /// a replacement must land on the *specific* matched object, so the key's entry
+    /// is rebuilt rather than overwritten.
+    ///
+    /// Unlike [`Table::take`] — which *checks out* its copies and leaves their
+    /// storage held for the table's lifetime — this path copies the new objects
+    /// into table storage **first**, then frees the replaced objects through the
+    /// ordinary removal path, so repeated replacement keeps the table's storage
+    /// bounded.
+    ///
+    /// `objects` are the caller's terms (usually built on its scratch heap): every
+    /// one is validated against `keypos` and deep-copied into table storage before
+    /// any mutation, so a rejected object leaves the table unchanged (the existing
+    /// entry intact). The copies are installed through the already-stored path, so
+    /// the index key aliases the new table-owned object exactly like an `insert`.
+    pub(crate) fn replace_key(
+        &mut self,
+        key: Eterm,
+        objects: &[Eterm],
+        atoms: &AtomTable,
+    ) -> Result<()> {
+        // Phase 1 — validate and deep-copy the whole new object list into table
+        // storage *before* anything is removed, so the copy never reads storage the
+        // subsequent removal reclaims.
+        let mut stored = Vec::with_capacity(objects.len());
+        for &object in objects {
+            match self.store_object(object) {
+                Ok(one) => stored.push(one),
+                Err(err) => {
+                    // Nothing has been removed yet: release the copies made so far
+                    // and report, leaving the key's entry exactly as it was.
+                    for one in stored {
+                        self.store.free(one);
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        // Phase 2 — remove the key's old objects and reclaim their storage.
+        self.delete(key, atoms)?;
+        // Phase 3 — install the already-copied roots (no second deep copy).
+        for one in stored {
+            self.insert_stored(one, atoms)?;
+        }
+        Ok(())
+    }
+
     /// Delete every object in the table (`ets:delete_all_objects/1`).
     pub fn delete_all_objects(&mut self) {
         if self.fixed {

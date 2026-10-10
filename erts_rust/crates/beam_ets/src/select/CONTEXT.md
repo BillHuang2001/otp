@@ -147,8 +147,11 @@ its compiled-opcode program. The interior is a Rust AST, not a term program.
   `BodySide` walk mirroring the C `db_match_eq_body`. The rejected shapes are pinned by
   `tests/ets_replace.rs::static_check_*` (each asserting the unchanged table).
 - **`select_replace` is then two-phase** (compute every replacement, then mutate) so a
-  `badarg` leaves the table unchanged; `duplicate_bag` rebuilds affected keys from
-  `take`'s checked-out copies.
+  `badarg` leaves the table unchanged; `duplicate_bag` rebuilds each affected key through
+  `Table::replace_key`, which deep-copies the rebuilt list into table storage **before**
+  removing the key's old objects — so every replaced object's storage is reclaimed (bounded
+  across repeated replacement) while a replacement that equals the object it replaces stays
+  harmless.
 - **Body failures ≠ guard failures:** a body expression's `BadArg` becomes the atom `EXIT`
   (C `FAIL_TERM`) and evaluation continues; a guard failure skips the clause (C
   `matchCatch`) — both match the oracle.
