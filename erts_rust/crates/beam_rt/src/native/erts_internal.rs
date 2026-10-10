@@ -698,10 +698,9 @@ impl RuntimeContext<'_> {
     /// [`BeamError::BadArg`] for anything that is not an internal pid — the C's
     /// `BIF_ERROR(BIF_P, BADARG)`.
     ///
-    /// The `/2` form is **not** served: `is_process_alive_2` (`erl_bif_info.c:4058`)
-    /// requires a *reference* and traces the answer back through the signal/trap
-    /// machinery (`{Ref, Result}` sent to self), which this runtime does not run;
-    /// Erlang's `/1` wrapper is built on it.
+    /// The `/2` form is served separately by [`Self::erts_is_process_alive_2`]
+    /// (`erl_bif_info.c:4058`), which is the reference-carrying variant Erlang's `/1`
+    /// wrapper is built on.
     fn erts_is_process_alive(&mut self, args: &[Eterm]) -> Result<Eterm> {
         let term = *args.first().ok_or(BeamError::BadArg)?;
         let pid = ProcessId::from_eterm(term).map_err(|_| BeamError::BadArg)?;
