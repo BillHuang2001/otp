@@ -1502,7 +1502,8 @@ mod tests {
 
     /// Every name the test tables are seeded with, in this order.
     const NAMES: &[&str] = &[
-        "ok", "error", "incomplete", "latin1", "utf8", "unicode", "foo", "true", "false",
+        "ok", "error", "incomplete", "latin1", "utf8", "unicode", "foo", "true", "false", "big",
+        "little", "utf16", "utf32",
     ];
 
     fn table() -> AtomTable {
@@ -1889,6 +1890,313 @@ mod tests {
             assert_eq!(show(ctx, "bin_is_7bit", &[enc(ctx, "ok")]), "false");
             let one_f = ctx.make_float(1.0).unwrap();
             assert_eq!(show(ctx, "bin_is_7bit", &[one_f]), "false");
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // utf16 / utf32 (the wide encodings)
+    // -----------------------------------------------------------------------
+    //
+    // Every expectation below is a verbatim transcription of the system oracle
+    // (OTP 29 / erts-17.1) — see `../unicode.rs`'s module docs and the pinned
+    // `escript` probe in `tests/unicode_wide.rs`. `#{…}` is a binary, `[…]` a
+    // list and `{…}` a tuple in `describe`'s rendering.
+
+    /// The `{utf16|utf32, big|little}` encoding tuple.
+    fn enc_pair(ctx: &mut BifContext<'_>, name: &str, endian: &str) -> Eterm {
+        let tag = enc(ctx, name);
+        let end = enc(ctx, endian);
+        ctx.tuple(&[tag, end]).expect("the tuple fits")
+    }
+
+    #[test]
+    fn utf16_input_matches_the_oracle() {
+        with_ctx(|ctx| {
+            let b = enc(ctx, "utf16");
+            let big = enc_pair(ctx, "utf16", "big");
+            let lit = enc_pair(ctx, "utf16", "little");
+            // The bare atom is an alias of the big-endian form.
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 65, 0, 66]), b]), "#{65,66}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 65, 0, 66]), big]), "#{65,66}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[65, 0, 66, 0]), lit]), "#{65,66}");
+            // A BOM is just U+FEFF.
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[254, 255, 0, 65]), b]), "#{239,187,191,65}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[255, 254, 65, 0]), lit]), "#{239,187,191,65}");
+            // A surrogate pair becomes one code point; a lone surrogate does not.
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[216, 60, 222, 0]), b]), "#{240,159,136,128}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[60, 216, 0, 222]), lit]), "#{240,159,136,128}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[216, 0, 0, 65]), b]), "{error,#{},#{216,0,0,65}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[220, 0]), b]), "{error,#{},#{220,0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[216, 60, 65, 66]), b]), "{error,#{},#{216,60,65,66}}");
+            // A code unit whose lead byte is not a surrogate lead byte is plain.
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 216]), b]), "#{195,152}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[255, 254]), b]), "#{239,191,190}");
+            // Truncated input is `incomplete`, never `error`; a lone lead byte
+            // is over-reported as needing 3 (big) / 1 (little).
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 65, 0]), b]), "{incomplete,#{65},#{0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0]), b]), "{incomplete,#{},#{0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[216, 0]), b]), "{incomplete,#{},#{216,0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 65, 216, 0]), b]), "{incomplete,#{65},#{216,0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[216, 60, 222]), b]), "{incomplete,#{},#{216,60,222}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[216]), b]), "{incomplete,#{},#{216}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[255]), b]), "{incomplete,#{},#{255}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[220]), b]), "{error,#{},#{220}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[60, 216, 0, 222, 65]), lit]), "{incomplete,#{240,159,136,128},#{65}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[255]), lit]), "{incomplete,#{},#{255}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 220]), lit]), "{error,#{},#{0,220}}");
+            // Empty input, and a list is code points regardless of the encoding.
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[]), b]), "#{}");
+            let empty = ctx.list(&[]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[empty, b]), "#{}");
+            let ab = ctx.list(&[ctx.int(65).unwrap(), ctx.int(66).unwrap()]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[ab, b]), "#{65,66}");
+            let emoji = ctx.list(&[ctx.int(0x1F600).unwrap()]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[emoji, b]), "#{240,159,152,128}");
+            // An out-of-range / surrogate / negative integer nests the Rest twice
+            // (`ml_map`'s `{error, Accum, [Rest | T]}` around `Fun`'s `[Part]`).
+            let over = ctx.list(&[ctx.int(0x110000).unwrap()]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[over, b]), "{error,#{},[[1114112]]}");
+            let sur = ctx.list(&[ctx.int(0xD800).unwrap()]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[sur, b]), "{error,#{},[[55296]]}");
+            let neg = ctx.list(&[ctx.int(-1).unwrap()]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[neg, b]), "{error,#{},[[-1]]}");
+            // Mixed/nested shapes, including a binary part.
+            let a_inner = ctx.list(&[ctx.int(65).unwrap()]).unwrap();
+            let b_inner = ctx.list(&[ctx.int(66).unwrap()]).unwrap();
+            let nested = ctx.list(&[a_inner, b_inner]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[nested, b]), "#{65,66}");
+            let mixed = ctx.list(&[ctx.int(65).unwrap(), bin(&[0, 66])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[mixed, b]), "#{65,66}");
+            let one_bin = ctx.list(&[bin(&[0, 65])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[one_bin, b]), "#{65}");
+            let improper_bin = ctx.cons(ctx.int(65).unwrap(), bin(&[0, 66])).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[improper_bin, b]), "#{65,66}");
+            let bits = ctx.list(&[ctx.int(65).unwrap(), bin(&[0, 66])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[bits, b]), "#{65,66}");
+            // Errors that are `badarg`, not tuples.
+            let one_float = ctx.make_float(1.0).unwrap();
+            let floats = ctx.list(&[one_float]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[floats, b]), "badarg");
+            let atoms = ctx.list(&[enc(ctx, "ok")]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[atoms, b]), "badarg");
+            let improper = ctx.cons(ctx.int(65).unwrap(), ctx.int(66).unwrap()).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[improper, b]), "badarg");
+            // A non-byte-aligned bitstring is not a binary, so no `ml_map` clause
+            // matches (the oracle's `function_clause` ⇒ `badarg`).
+            assert_eq!(show(ctx, "characters_to_binary", &[bitstring(&[0, 65, 0], 20), b]), "badarg");
+            assert_eq!(show(ctx, "characters_to_list", &[bitstring(&[0, 65, 0], 20), b]), "badarg");
+        });
+    }
+
+    #[test]
+    fn utf16_parts_carry_a_pending_partial_code_point() {
+        with_ctx(|ctx| {
+            let b = enc(ctx, "utf16");
+            let pair = ctx.list(&[bin(&[216, 60]), bin(&[222, 0])]).unwrap();
+            // `ml_map`'s pending accumulator splices the halves together.
+            assert_eq!(show(ctx, "characters_to_binary", &[pair, b]), "#{240,159,136,128}");
+            let half = ctx.list(&[bin(&[216]), bin(&[60, 222, 0])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[half, b]), "#{240,159,136,128}");
+            let two = ctx.list(&[bin(&[0, 65]), bin(&[0, 66])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[two, b]), "#{65,66}");
+            let split = ctx.list(&[bin(&[0]), bin(&[65, 0, 66])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[split, b]), "#{65,66}");
+            let short = ctx.list(&[bin(&[0, 65]), bin(&[216, 60, 222, 0])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[short, b]), "#{65,240,159,136,128}");
+            // A pending partial sequence followed by an integer is the
+            // `{error, Accum, [Incomplete | Whole]}` clause.
+            let bad = ctx.list(&[bin(&[0, 65]), bin(&[216, 60]), ctx.int(66).unwrap()]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[bad, b]), "{error,#{65},[#{216,60},66]}");
+            let list = ctx.list(&[bin(&[0, 65]), bin(&[220, 0]), bin(&[0, 66])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_list", &[list, b]), "{error,[65],[#{220,0},#{0,66}]}");
+            let elem = ctx.list(&[bin(&[0, 220, 0])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[elem, b]), "{incomplete,#{195,156},#{0}}");
+        });
+    }
+
+    #[test]
+    fn utf32_input_matches_the_oracle() {
+        with_ctx(|ctx| {
+            let b = enc(ctx, "utf32");
+            let big = enc_pair(ctx, "utf32", "big");
+            let lit = enc_pair(ctx, "utf32", "little");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 0, 0, 65]), b]), "#{65}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 0, 0, 65]), big]), "#{65}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[65, 0, 0, 0]), lit]), "#{65}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 0, 0, 65, 0, 0, 0, 66]), b]), "#{65,66}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[65, 0, 0, 0, 66, 0, 0, 0]), lit]), "#{65,66}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 0, 254, 255]), b]), "#{239,187,191}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 0, 255, 255]), b]), "#{239,191,191}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 0, 0, 0]), b]), "#{0}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 0, 0, 0]), lit]), "#{0}");
+            // A surrogate or a value above U+10FFFF is an error; the `cbv/2`
+            // clauses decide the truncated forms.
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 0, 216, 0]), b]), "{error,#{},#{0,0,216,0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 216, 0, 0]), lit]), "{error,#{},#{0,216,0,0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 17, 0, 0]), b]), "{error,#{},#{0,17,0,0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 17, 0, 0, 65]), b]), "{error,#{},#{0,17,0,0,65}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0]), b]), "{incomplete,#{},#{0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 0]), b]), "{incomplete,#{},#{0,0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 0, 0]), b]), "{incomplete,#{},#{0,0,0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 17, 0]), b]), "{error,#{},#{0,17,0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0]), lit]), "{incomplete,#{},#{0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[65, 0, 0]), lit]), "{incomplete,#{},#{65,0,0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[65, 216, 1]), lit]), "{incomplete,#{},#{65,216,1}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[254, 255, 0]), lit]), "{error,#{},#{254,255,0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[255, 255, 0]), lit]), "{error,#{},#{255,255,0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[1, 255, 0]), lit]), "{incomplete,#{},#{1,255,0}}");
+            // Splitting a code point across two parts uses the pending path too.
+            let split = ctx.list(&[bin(&[0, 0]), bin(&[0, 65])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[split, b]), "#{65}");
+            let short = ctx.list(&[bin(&[0]), bin(&[0, 65])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[short, b]), "{incomplete,#{},#{0,0,65}}");
+            let part = ctx.list(&[bin(&[0, 0, 0]), bin(&[65])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[part, b]), "#{65}");
+            let one_bin = ctx.list(&[bin(&[0, 0, 0, 65])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[one_bin, b]), "#{65}");
+        });
+    }
+
+    #[test]
+    fn wide_output_encodings_match_the_oracle() {
+        with_ctx(|ctx| {
+            let u = enc(ctx, "unicode");
+            let l = enc(ctx, "latin1");
+            let f = enc(ctx, "utf8");
+            let b16 = enc(ctx, "utf16");
+            let b16l = enc_pair(ctx, "utf16", "little");
+            let b16b = enc_pair(ctx, "utf16", "big");
+            let b32 = enc(ctx, "utf32");
+            let b32l = enc_pair(ctx, "utf32", "little");
+            let ab = ctx.list(&[ctx.int(65).unwrap(), ctx.int(66).unwrap()]).unwrap();
+            let emoji = ctx.list(&[ctx.int(0x1F600).unwrap()]).unwrap();
+            // Out = utf16/utf32 (the general `characters_to_binary_int/3` clause).
+            assert_eq!(show(ctx, "characters_to_binary", &[ab, l, b16]), "#{0,65,0,66}");
+            assert_eq!(show(ctx, "characters_to_binary", &[ab, l, b16l]), "#{65,0,66,0}");
+            assert_eq!(show(ctx, "characters_to_binary", &[emoji, u, b16]), "#{216,61,222,0}");
+            assert_eq!(show(ctx, "characters_to_binary", &[ab, l, b32]), "#{0,0,0,65,0,0,0,66}");
+            assert_eq!(show(ctx, "characters_to_binary", &[ab, l, b32l]), "#{65,0,0,0,66,0,0,0}");
+            assert_eq!(show(ctx, "characters_to_binary", &[emoji, u, b32l]), "#{0,246,1,0}");
+            // An unencodable integer: the Rest nests twice (limited first, then
+            // guarded by the out-transcoder).
+            let over = ctx.list(&[ctx.int(0x110000).unwrap()]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[over, u, b16]), "{error,#{},[[1114112]]}");
+            assert_eq!(show(ctx, "characters_to_binary", &[over, u, b32]), "{error,#{},[[1114112]]}");
+            let sur = ctx.list(&[ctx.int(0xD800).unwrap()]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[sur, u, b16]), "{error,#{},[[55296]]}");
+            assert_eq!(show(ctx, "characters_to_binary", &[sur, u, b32]), "{error,#{},[[55296]]}");
+            let neg = ctx.list(&[ctx.int(-2).unwrap()]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[neg, u, b16]), "{error,#{},[[-2]]}");
+            let too_big = ctx.list(&[ctx.int(256).unwrap()]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[too_big, l, b16]), "{error,#{},[[256]]}");
+            // A wide input encoding on either side of `/3`.
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 65, 0, 66]), b16, f]), "#{65,66}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 65]), b16, u]), "#{65}");
+            assert_eq!(show(ctx, "characters_to_binary", &[ab, f, b16]), "#{0,65,0,66}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(b"AB"), f, b16]), "#{0,65,0,66}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 65]), b16, b16]), "#{0,65}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 65]), b16, b16l]), "#{65,0}");
+            assert_eq!(show(ctx, "characters_to_binary", &[ab, b16l, b16b]), "#{0,65,0,66}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 0, 0, 65]), b32, b16]), "#{0,65}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 65]), b16, b32]), "#{0,0,0,65}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 0, 0, 65]), b32, b32l]), "#{65,0,0,0}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 65]), b16, b32]), "#{0,0,0,65}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[216, 60, 222, 0]), b16, b16l]), "#{60,216,0,222}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[216, 60, 222, 0]), b16, b32]), "#{0,1,242,0}");
+            // A `latin1` output caps the code points at 255.
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 65, 0, 66]), b16, l]), "#{65,66}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[216, 60, 222, 0]), b16, l]), "{error,#{},#{216,60,222,0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 65, 1, 0]), b16, l]), "{error,#{65},#{1,0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 0, 0, 65]), b32, l]), "#{65}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 0, 0]), b32, l]), "{incomplete,#{},#{0,0,0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 0, 0]), b32l, l]), "{incomplete,#{},#{0,0,0}}");
+            // Incomplete/error shapes for the wide input.
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 65, 216]), b16, l]), "{incomplete,#{65},#{216}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 65, 216]), b16, f]), "{incomplete,#{65},#{216}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 65, 220, 0]), b16, f]), "{error,#{65},#{220,0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 17, 0, 0]), b32, f]), "{error,#{},#{0,17,0,0}}");
+            // utf8 input with a wide output, split across parts.
+            let split = ctx.list(&[bin(&[195]), bin(&[169])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[split, f, b16]), "#{0,233}");
+            assert_eq!(show(ctx, "characters_to_binary", &[split, f, l]), "#{233}");
+            let inline = ctx.list(&[bin(&[0, 65]), ctx.int(66).unwrap()]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[inline, b16, b16]), "#{0,65,0,66}");
+        });
+    }
+
+    #[test]
+    fn wide_characters_to_list_matches_the_oracle() {
+        with_ctx(|ctx| {
+            let b = enc(ctx, "utf16");
+            let b32 = enc(ctx, "utf32");
+            let lit = enc_pair(ctx, "utf16", "little");
+            let lit32 = enc_pair(ctx, "utf32", "little");
+            assert_eq!(show(ctx, "characters_to_list", &[bin(&[0, 65, 0, 66]), b]), "[65,66]");
+            assert_eq!(show(ctx, "characters_to_list", &[bin(&[65, 0]), lit]), "[65]");
+            assert_eq!(show(ctx, "characters_to_list", &[bin(&[0, 0, 0, 65]), b32]), "[65]");
+            assert_eq!(show(ctx, "characters_to_list", &[bin(&[65, 0, 0, 0]), lit32]), "[65]");
+            assert_eq!(show(ctx, "characters_to_list", &[bin(&[216, 60, 222, 0]), b]), "[127488]");
+            assert_eq!(show(ctx, "characters_to_list", &[bin(&[]), b]), "[]");
+            assert_eq!(show(ctx, "characters_to_list", &[bin(&[]), lit32]), "[]");
+            let empty = ctx.list(&[]).unwrap();
+            assert_eq!(show(ctx, "characters_to_list", &[empty, b]), "[]");
+            let ab = ctx.list(&[ctx.int(65).unwrap(), ctx.int(66).unwrap()]).unwrap();
+            assert_eq!(show(ctx, "characters_to_list", &[ab, b]), "[65,66]");
+            let mixed = ctx.list(&[ctx.int(65).unwrap(), bin(&[0, 66])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_list", &[mixed, b]), "[65,66]");
+            // The wide `Rest` is carried untranslated, and a top-level binary
+            // reports it bare while a list input keeps the `[Rest|T]` nesting.
+            assert_eq!(show(ctx, "characters_to_list", &[bin(&[0, 65, 216]), b]), "{incomplete,[65],#{216}}");
+            assert_eq!(show(ctx, "characters_to_list", &[bin(&[0, 65, 220, 0]), b]), "{error,[65],#{220,0}}");
+            assert_eq!(show(ctx, "characters_to_list", &[bin(&[0, 17, 0, 0]), b32]), "{error,[],#{0,17,0,0}}");
+            assert_eq!(show(ctx, "characters_to_list", &[bin(&[0]), b]), "{incomplete,[],#{0}}");
+            assert_eq!(show(ctx, "characters_to_list", &[bin(&[0, 0, 0, 65, 0, 0]), b32]), "{incomplete,[65],#{0,0}}");
+            let one = ctx.list(&[bin(&[0])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_list", &[one, b]), "{incomplete,[],#{0}}");
+            let pair = ctx.list(&[bin(&[216, 60]), bin(&[222, 0])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_list", &[pair, b]), "[127488]");
+            let half = ctx.list(&[bin(&[216]), bin(&[60, 222, 0])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_list", &[half, b]), "[127488]");
+        });
+    }
+
+    #[test]
+    fn wide_encoding_arguments_are_validated_like_the_oracle() {
+        with_ctx(|ctx| {
+            let one = bin(&[1]);
+            let ab = ctx.list(&[ctx.int(65).unwrap()]).unwrap();
+            let foo = enc(ctx, "foo");
+            let b16 = enc(ctx, "utf16");
+            let b32 = enc(ctx, "utf32");
+            // An unknown atom, and any malformed `{wide, endian}` tuple.
+            assert_eq!(show(ctx, "characters_to_binary", &[one, foo]), "badarg");
+            assert_eq!(show(ctx, "characters_to_list", &[one, foo]), "badarg");
+            let foo_pair = enc_pair(ctx, "utf16", "foo");
+            let foo32 = enc_pair(ctx, "utf32", "foo");
+            assert_eq!(show(ctx, "characters_to_binary", &[one, foo_pair]), "badarg");
+            assert_eq!(show(ctx, "characters_to_binary", &[one, foo32]), "badarg");
+            assert_eq!(show(ctx, "characters_to_list", &[one, foo_pair]), "badarg");
+            assert_eq!(show(ctx, "characters_to_binary", &[ab, enc(ctx, "latin1"), foo]), "badarg");
+            assert_eq!(show(ctx, "characters_to_binary", &[ab, enc(ctx, "latin1"), foo_pair]), "badarg");
+            let one_tuple = ctx.tuple(&[b16]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[one, one_tuple]), "badarg");
+            let three = ctx.tuple(&[b16, enc(ctx, "big"), enc(ctx, "big")]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[one, three]), "badarg");
+            let non_atom = ctx.list(&[ctx.int(5).unwrap()]).unwrap();
+            let bad_tag = ctx.tuple(&[non_atom, enc(ctx, "big")]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[one, bad_tag]), "badarg");
+            // A bare non-atom encoding.
+            let five = ctx.int(5).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[one, five]), "badarg");
+            assert_eq!(show(ctx, "characters_to_list", &[one, five]), "badarg");
+            // The wide atoms themselves are accepted (so the failures above are
+            // about the *shape* of the argument, not the encoding name); a
+            // one-byte input shows the `cbv/2` asymmetry (`utf16` reports it as
+            // a prefix, `utf32` does not).
+            assert_eq!(show(ctx, "characters_to_binary", &[one, b16]), "{incomplete,#{},#{1}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[one, b32]), "{error,#{},#{1}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 65]), b16]), "#{65}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 0, 0, 65]), b32]), "#{65}");
         });
     }
 }
