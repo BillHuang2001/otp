@@ -59,9 +59,9 @@ The pass runs the **port-less** `Scheduler::run_ready` (its port half, `Runtime:
 * Integration (`../../tests/`): `port_wake.rs` (a port wake resumed through the scheduler), `proc_lib_start.rs` (the cross-module `receive` suspend seam), `file_server.rs` (the native `file_server_2` service driven over real temporary files/directories, oracle-cross-checked), `position.rs`, `boot.rs` (the real `start.boot` to completion), and the `run`-action suites (`cli.rs`, `slice.rs`).
 
 ## Routing Table
-* `../runtime.rs` → the `Runtime` façade (boot wiring, code server + module cache, the slice, the spawn API, the timer/distribution accessors, `stabilize_term`/`materialize_args`, `system_info`, `eval`, `format_term`, `refs_mut`, and the `file_services` field).
+* `../runtime.rs` → the `Runtime` façade (boot wiring, code server + module cache, the slice, the spawn API, the timer/distribution accessors, `stabilize_term`/`stabilize_term_with` + their destination off-heap table `eval_off_heap`, `materialize_args`, `system_info`, `eval`, `format_term`, `refs_mut`, and the `file_services` field).
 * `scheduler.rs` (+ `scheduler/tests.rs`) → the scheduler-pass family (one pass = processes → ports → timers → distribution, in bounded steps; the native-service step `service_file_requests` runs right after the run queue drains) + the `Runtime::with_port_table` short-borrow seam for port-aware `beam_process` operations.
-* `gc.rs` → `GcState` + `gc_stats`/`GcStatsSnapshot` + the pin/halt/valve sets + `try_stabilize_escaped`.
+* `gc.rs` → `GcState` + `gc_stats`/`GcStatsSnapshot` + the pin/halt/valve sets + `try_stabilize_escaped`/`try_stabilize_escaped_with`.
 * `ets_owner.rs` → the `ProcessExitObserver` host (`OwnerIndex`/`EtsExitObserver`) + `Runtime::drain_ets_owner_exits`/`drain_port_monitor_exits`.
 * `../runner/` → the `ProcessRunner` (`mod.rs`/`entry.rs`/`run.rs`/`budget.rs`/`reason.rs`/`perf.rs`/`tests.rs`), re-exporting `crate::runner::{ProcessEntry, RunnerState, RuntimeRunner}`.
 * `../context/gc.rs` → the engine's heap-admission point (`ExecutionContext::ensure_heap`) that drives this state.
