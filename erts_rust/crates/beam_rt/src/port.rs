@@ -78,7 +78,15 @@
 //! [`PortId`] out of `beam_io`'s registry; `port_close/1` kills and reaps the child and
 //! returns the id to the table; `port_info/1,2` answers real items; and the child's stdout
 //! is polled — a `receive {Port, {data, Data}}` reads the driver's stream back, delivering
-//! a `binary` for a `binary`-stream port (a char list otherwise).
+//! a `binary` for a `binary`-stream port (a char list otherwise), **at whatever width the
+//! child wrote** (see [`RuntimeContext::port_data_message`]).
+//!
+//! The child's **stderr** follows the oracle exactly: it is *inherited* from the emulator
+//! by default (so it appears on `beam_rt`'s own stderr and is never port data), and the
+//! `stderr_to_stdout` option makes the child's descriptor 2 an exact duplicate of its
+//! descriptor 1, so the diagnostics arrive as port data interleaved with stdout in true
+//! write order (`spawn_start`'s `stderrfd = opts->redir_stderr ? ifd[1] : dup(2)`,
+//! `erts/emulator/sys/unix/sys_drivers.c:500`).
 //!
 //! `port_command/2,3` writes to the child's **stdin** (an iolist, a binary or a char list),
 //! which is what makes `open_port({spawn,"cat"},[])` echo its input back: the bytes are
@@ -88,12 +96,10 @@
 //! it once with `Interest::BOTH`), so the same call writes out through that descriptor —
 //! exactly the oracle's behaviour.
 //!
-//! **Not yet:** only **stdout** is polled (the child's stderr is discarded by the driver);
-//! `connected` only flips to `false` at `port_close/1` rather than when the child exits by
-//! itself; a stream read of more than `ERL_ONHEAP_BINARY_LIMIT` (64) bytes on a `binary`
-//! port is a typed *unsupported* gap (there is no off-heap ref-counted binary build path
-//! here yet); and the `eof` option is accepted but inert (its `{Port, eof}` message is not
-//! synthesized).
+//! **Not yet:** `connected` only flips to `false` at `port_close/1` rather than when the
+//! child exits by itself; the `eof` option is accepted but inert (its `{Port, eof}` message
+//! is not synthesized); and `nouse_stdio` is accepted without effect (the child always gets
+//! the stdio pipes, never the `fd 3`/`fd 4` pair).
 //!
 //! # `port_info` items
 //!
@@ -149,7 +155,7 @@ use beam_engine::terms;
 use beam_io::{
     Driver, Event, Poller, PortCommandOptions, PortExitReason, PortNotification,
     PortRegistry as IoPortRegistry, SpawnDriver, SpawnOptions, SpawnSpec, SpawnStream,
-    PORT_REDS_EXECUTE,
+    StreamOptions, PORT_REDS_EXECUTE,
 };
 use beam_process::{PortId, PortTable, ProcessId, ProcessTable};
 use beam_term::{
@@ -1160,6 +1166,10 @@ struct PortOptions {
     /// The `exit_status` flag: the driver queues a `{Port, {exit_status, Status}}` message
     /// once the child has been reaped.
     exit_status: bool,
+    /// The `stderr_to_stdout` flag: the child's descriptor 2 becomes an exact duplicate of
+    /// its descriptor 1, so its stderr bytes arrive as port data (interleaved with stdout in
+    /// true write order) instead of being inherited by the emulator.
+    stderr_to_stdout: bool,
 }
 
 impl PortOptions {
@@ -1167,6 +1177,18 @@ impl PortOptions {
     /// default).
     fn stream(&self) -> StreamType {
         self.stream.unwrap_or(StreamType::List)
+    }
+
+    /// The child-stream options the `spawn` driver applies at `fork`/`exec` time
+    /// ([`beam_io::StreamOptions`]).
+    ///
+    /// `eof` is left off: the `eof` option is accepted by the whitelist but inert here (its
+    /// `{Port, eof}` message is not synthesized — see the module docs).
+    fn stream_options(&self) -> StreamOptions {
+        StreamOptions {
+            stderr_to_stdout: self.stderr_to_stdout,
+            eof: false,
+        }
     }
 
     /// Applies `other` on top of `self`: whatever `other` explicitly set wins, and the
@@ -1185,6 +1207,7 @@ impl PortOptions {
         self.env.extend(other.env);
         // A flag: asking anywhere in either option list asks for it.
         self.exit_status |= other.exit_status;
+        self.stderr_to_stdout |= other.stderr_to_stdout;
     }
 }
 
@@ -1429,6 +1452,9 @@ impl RuntimePorts {
                     // The driver queues a `{Port, {exit_status, Status}}` message once the
                     // child has been reaped — the pump reports it.
                     "exit_status" => parsed.exit_status = true,
+                    // The child's stderr is merged into its stdout, so its bytes arrive as
+                    // port data (the `spawn` driver's `dup2(1, 2)`).
+                    "stderr_to_stdout" => parsed.stderr_to_stdout = true,
                     // Whitelisted, accepted, without effect here (see the module docs).
                     _ => {}
                 }
@@ -1541,6 +1567,10 @@ impl PortHook for RuntimePorts {
             let mut registry = self.registry_mut()?;
             return registry.register(Box::new(adapter), meta);
         }
+        // The child-stream options (`stderr_to_stdout`) are applied in the child, so they are
+        // handed to the driver's constructor rather than carried in `SpawnOptions`. Read before
+        // the honored fields below are moved out of `resolved`.
+        let stream_options = resolved.stream_options();
         let spawn_options = SpawnOptions {
             stream: stream.into(),
             cd: resolved.cd,
@@ -1548,7 +1578,8 @@ impl PortHook for RuntimePorts {
             args: resolved.args,
             exit_status: resolved.exit_status,
         };
-        let driver = SpawnDriver::new(&spec.spawn_spec()?, &spawn_options)?;
+        let driver =
+            SpawnDriver::with_stream_options(&spec.spawn_spec()?, &spawn_options, stream_options)?;
         let os_pid = driver.os_pid();
         let meta = PortMeta {
             command: spec.command,
@@ -1785,9 +1816,8 @@ impl RuntimeContext<'_> {
     /// # Errors
     ///
     /// The poller's/driver's failures; a nested borrow of the port table is a typed
-    /// capability gap rather than a panic; the arena's allocation failure when a term does
-    /// not fit (including the documented >`ERL_ONHEAP_BINARY_LIMIT` *unsupported* gap for a
-    /// wide `binary`-stream read).
+    /// capability gap rather than a panic; the message builders' allocation failure when a
+    /// term does not fit.
     pub(crate) fn poll_port_messages(&mut self, timeout: Duration) -> Result<Vec<Eterm>> {
         // The shared port state is cloned out so the *messages* — which need `&mut self` —
         // are never built while the registry is borrowed (the same snapshot rule
@@ -1856,6 +1886,24 @@ impl RuntimeContext<'_> {
     /// `list` default, `erl`'s own). The `data` atom is interned into the runtime's one
     /// shared table, so the message is nameable by the printer and matchable by a `receive`
     /// clause.
+    ///
+    /// # The binary stream has no width limit
+    ///
+    /// A read is as wide as the child wrote: the driver hands over up to 64 KiB of one
+    /// `read(2)` ([`beam_io`]'s `READ_CHUNK`), and the oracle delivers a port `binary` of
+    /// exactly that width (`open_port({spawn,"…"},[binary])` on a 200-byte writer yields a
+    /// 200-byte `binary()`). [`terms::make_heap_binary`] refuses anything past
+    /// `ERL_ONHEAP_BINARY_LIMIT` (64) bytes because it only materializes the *on-heap*
+    /// `ErlHeapBits` form, so the payload is built by
+    /// [`beam_codec::term::make_binary`] instead — the same on-heap layout for every width,
+    /// which is the interior-policy substitution `beam_codec` documents
+    /// (`ERTS` would store a wider binary off-heap; `is_binary/1`, `byte_size/1`, the
+    /// contents and the ETF image are identical either way).
+    ///
+    /// The block lives on the runtime's never-reset `-eval` arena
+    /// ([`RuntimeContext::eval_heap`]) — the same pointer-stable home the evaluator gives a
+    /// term the engine arena cannot express — so a delivered message stays valid for the
+    /// runtime's lifetime.
     pub(crate) fn port_data_message(
         &mut self,
         port: PortId,
@@ -1864,7 +1912,7 @@ impl RuntimeContext<'_> {
     ) -> Result<Eterm> {
         let data = make_atom(self.runtime.code_server.atoms_mut().intern("data"));
         let payload = match stream {
-            StreamType::Binary => terms::make_heap_binary(self, bytes)?,
+            StreamType::Binary => beam_codec::term::make_binary(self.eval_heap(), bytes)?,
             StreamType::List => {
                 let mut list = NIL;
                 for byte in bytes.iter().rev() {
@@ -2135,7 +2183,14 @@ mod tests {
             let command = self.string(command);
             self.name("spawn", command)
         }
-        /// The value `port_info/1` answered for `name`.
+
+        /// The `{args, [Arg…]}` option tuple of a `{spawn_executable, Path}` port.
+        fn args_option(&mut self, args: &[&str]) -> Eterm {
+            let terms: Vec<Eterm> = args.iter().map(|arg| self.string(arg)).collect();
+            let list = self.list(&terms);
+            let tag = self.atom("args");
+            self.heap.tuple(&[tag, list]).expect("an args option")
+        }        /// The value `port_info/1` answered for `name`.
         fn item(&mut self, port: PortId, name: &str) -> Eterm {
             let pairs = self
                 .hook
@@ -2200,6 +2255,66 @@ mod tests {
         panic!("no stream data for {port:?}");
     }
 
+    /// Drains the fixture's port poller until `port` reports its **exit**, returning every
+    /// data event it produced, in order (one entry per [`PortEvent::Data`]).
+    ///
+    /// The child `port` names must be opened with the `exit_status` option: that notification
+    /// is what tells the test the stream is complete, rather than a fixed sleep. Each round is
+    /// one real [`PortRegistry::pump`] — the same read path the runtime's scheduler pass drives
+    /// — and a round that reports the exit is still drained for the bytes it read in the very
+    /// same round (a reaped child's last bytes and its status arrive together).
+    fn pump_events_until_exit(
+        registry: &mut PortRegistry,
+        port: PortId,
+        bound: Duration,
+    ) -> Vec<Vec<u8>> {
+        let deadline = Instant::now() + bound;
+        let mut data = Vec::new();
+        while Instant::now() < deadline {
+            let mut exited = false;
+            for event in registry.pump(Duration::from_millis(50)).expect("pump") {
+                match event {
+                    PortEvent::Data {
+                        port: source,
+                        bytes,
+                        ..
+                    } if source == port => data.push(bytes),
+                    PortEvent::Exited {
+                        port: source, ..
+                    } if source == port => exited = true,
+                    _ => {}
+                }
+            }
+            if exited {
+                return data;
+            }
+        }
+        panic!("{port:?} reported no exit within {bound:?}; got {data:?}");
+    }
+
+    /// [`pump_events_until_exit`] concatenated into the child's whole byte stream.
+    fn pump_until_exit(registry: &mut PortRegistry, port: PortId, bound: Duration) -> Vec<u8> {
+        pump_events_until_exit(registry, port, bound).concat()
+    }
+    /// Runs `expr` under the host `erl` and returns its stdout, or `None` when the toolchain is
+    /// not usable (the caller then prints a loud skip banner — never a silent pass).
+    fn erl_eval(expr: &str) -> Option<String> {
+        let output = std::process::Command::new("erl")
+            .args(["-noshell", "-eval", expr, "-s", "init", "stop"])
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// Prints the loud "this oracle cross-check was skipped" banner (see [`erl_eval`]).
+    fn skip_oracle_check(what: &str) {
+        println!("================================================================");
+        println!("SKIP: no usable `erl` on PATH — the oracle cross-check for {what} is skipped");
+        println!("================================================================");
+    }
     /// The `port_info/1,2` metadata of a port a test registers **directly** (bypassing
     /// `open_port/2`), so a recorder driver can be driven without a real child.
     fn test_meta(command: &str) -> PortMeta {
@@ -2675,6 +2790,197 @@ mod tests {
         assert_eq!(counters.bytes(), (5, 5));
     }
 
+    // --- the port READ path (contract A.4) ------------------------------------------------
+    //
+    // Two properties of the read path are pinned here, because both are observable and both
+    // are answerable by the oracle:
+    //
+    // * a `binary` stream has **no width limit** — the driver hands over up to 64 KiB of one
+    //   `read(2)`, and the oracle delivers a `binary()` of exactly that width, so the message
+    //   builder may not go through the engine's 64-byte-only on-heap binary writer;
+    // * the child's stderr is **inherited** from the emulator by default and merged into the
+    //   port's stream by `stderr_to_stdout` (`spawn_start`'s `stderrfd = opts->redir_stderr ?
+    //   ifd[1] : dup(2)`, `erts/emulator/sys/unix/sys_drivers.c:500`).
+
+    /// A `binary`-stream message is a `binary()` of **every** width.
+    ///
+    /// `ERL_ONHEAP_BINARY_LIMIT` (64) is exactly where the engine's `make_heap_binary` stops,
+    /// so the widths below straddle it; a `list` stream is unchanged (a char list).
+    #[test]
+    fn a_binary_stream_message_is_a_binary_of_every_width() {
+        let mut rt = Runtime::new(RuntimeConfig::default()).expect("the default runtime");
+        let port = PortId::new(1);
+        for width in [0usize, 1, 63, 64, 65, 200, 4096] {
+            let bytes: Vec<u8> = (0..width).map(|i| (i % 251) as u8).collect();
+            let message = {
+                let mut ctx = RuntimeContext::new(&mut rt);
+                ctx.port_data_message(port, &bytes, StreamType::Binary)
+                    .unwrap_or_else(|error| panic!("a {width}-byte binary-stream message: {error}"))
+            };
+            // `{Port, {data, Bin}}`.
+            assert_eq!(terms::tuple_arity(message).expect("a port message tuple"), 2);
+            let inner = terms::tuple_element(message, 1).expect("the `{data, …}` tuple");
+            let payload = terms::tuple_element(inner, 1).expect("the data payload");
+            assert_eq!(
+                terms::binary_bytes(payload).expect("the payload is a binary"),
+                &bytes[..],
+                "a {width}-byte read is delivered as a {width}-byte binary"
+            );
+        }
+        // The `data` atom really is the shared table's `data` (the printer and a `receive`
+        // clause both resolve it).
+        let data_atom = rt.code_server.atoms().lookup("data").expect("the data atom");
+        let message = {
+            let mut ctx = RuntimeContext::new(&mut rt);
+            ctx.port_data_message(port, b"ab", StreamType::Binary)
+                .expect("a message")
+        };
+        let inner = terms::tuple_element(message, 1).expect("the `{data, …}` tuple");
+        assert_eq!(
+            terms::tuple_element(inner, 0).expect("the tag"),
+            make_atom(data_atom)
+        );
+
+        // The `list` stream is untouched: a char list, never a binary.
+        let message = {
+            let mut ctx = RuntimeContext::new(&mut rt);
+            ctx.port_data_message(port, b"abc", StreamType::List)
+                .expect("a list-stream message")
+        };
+        let inner = terms::tuple_element(message, 1).expect("the `{data, …}` tuple");
+        assert_eq!(text_of(terms::tuple_element(inner, 1).expect("the payload")), "abc");
+    }
+
+    /// A real child's 200-byte `binary`-stream read reaches the owner at full width, through
+    /// the same pump the runtime's scheduler pass drives — and the oracle agrees on the width.
+    #[test]
+    fn a_wide_binary_stream_read_is_delivered_at_full_width() {
+        let mut fx = fixture();
+        // `head -c 200 /dev/zero` writes exactly 200 NUL bytes — three times the 64-byte
+        // on-heap binary limit — and exits.
+        let name = fx.spawn("head -c 200 /dev/zero");
+        let binary = fx.atom("binary");
+        let exit_status = fx.atom("exit_status");
+        let options = fx.list(&[binary, exit_status]);
+        let port = fx.hook.open_port(name, options).expect("open_port binary");
+
+        let mut rt = Runtime::new(RuntimeConfig::default()).expect("the default runtime");
+        let chunks = pump_events_until_exit(
+            &mut fx.registry.borrow_mut(),
+            port,
+            Duration::from_secs(10),
+        );
+        let mut got: Vec<u8> = Vec::new();
+        for bytes in &chunks {
+            // Every chunk is built into the oracle's `{Port, {data, Bin}}` shape, and each one
+            // is a binary of exactly its own width.
+            let message = {
+                let mut ctx = RuntimeContext::new(&mut rt);
+                ctx.port_data_message(port, bytes, StreamType::Binary)
+                    .expect("a binary-stream message")
+            };
+            let inner = terms::tuple_element(message, 1).expect("the `{data, …}` tuple");
+            let payload = terms::tuple_element(inner, 1).expect("the payload");
+            assert_eq!(
+                terms::binary_bytes(payload).expect("a binary payload"),
+                &bytes[..]
+            );
+            got.extend_from_slice(bytes);
+        }
+        assert_eq!(got.len(), 200, "the child's 200 bytes are delivered in full");
+        assert!(
+            got.iter().all(|byte| *byte == 0),
+            "`/dev/zero` wrote NUL bytes"
+        );
+        // Oracle cross-check: the *same* child under the real runtime must report the same
+        // width (the oracle stores a binary this wide off-heap; this runtime builds it on-heap
+        // — the observable term is identical).
+        let expr = r#"begin P = open_port({spawn,"head -c 200 /dev/zero"},[binary]), F = fun F(N) -> receive {P,{data,D}} -> F(N + byte_size(D)) after 2000 -> N end end, io:format("~w",[F(0)]) end"#;
+        match erl_eval(expr) {
+            Some(oracle) => assert_eq!(
+                oracle, "200",
+                "the oracle reads the same 200 bytes from the same child"
+            ),
+            None => skip_oracle_check("the width of a binary-stream read"),
+        }
+    }
+
+    /// `stderr_to_stdout` merges the child's stderr into the port's stream; without it the
+    /// child's stderr is inherited by the emulator and never reaches the port.
+    ///
+    /// The two ports below run the *same* child, so the option is the only difference — which
+    /// is what makes the assertion discriminating rather than incidental. Without the option
+    /// the child's `err` line lands on this test process's own stderr (the C's `dup(2)`
+    /// default), which is why it is absent from the port's stream.
+    #[test]
+    fn the_stderr_to_stdout_option_merges_the_child_stderr_into_the_port_stream() {
+        let mut fx = fixture();
+        let script = "echo out; echo err >&2";
+        let (name, args) = {
+            let path = fx.string("/bin/sh");
+            let name = fx.name("spawn_executable", path);
+            let args = fx.args_option(&["-c", script]);
+            (name, args)
+        };
+        let binary = fx.atom("binary");
+        let exit_status = fx.atom("exit_status");
+        let merge = fx.atom("stderr_to_stdout");
+        let merged_port = {
+            let merged = fx.list(&[binary, merge, exit_status, args]);
+            fx.hook
+                .open_port(name, merged)
+                .expect("open_port [binary, stderr_to_stdout, exit_status]")
+        };
+        let plain_port = {
+            let plain = fx.list(&[binary, exit_status, args]);
+            fx.hook
+                .open_port(name, plain)
+                .expect("open_port [binary, exit_status]")
+        };
+
+        let merged = pump_until_exit(
+            &mut fx.registry.borrow_mut(),
+            merged_port,
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&merged),
+            "out\nerr\n",
+            "the child's stderr is port data, interleaved with stdout in write order"
+        );
+
+        let plain = pump_until_exit(
+            &mut fx.registry.borrow_mut(),
+            plain_port,
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&plain),
+            "out\n",
+            "without the option the child's stderr is inherited, never port data"
+        );
+
+        // Oracle cross-check: the merged byte sequence, as the oracle delivers it.
+        let expr = r#"begin P = open_port({spawn_executable,"/bin/sh"},[binary,stderr_to_stdout,exit_status,{args,["-c","echo out; echo err >&2"]}]), F = fun F(A) -> receive {P,{data,D}} -> F(<<A/binary,D/binary>>); {P,{exit_status,_}} -> A after 3000 -> A end end, io:format("~w",[binary_to_list(F(<<>>))]) end"#;
+        match erl_eval(expr) {
+            Some(oracle) => assert_eq!(
+                oracle,
+                format!("[{}]", byte_list(&merged)),
+                "the oracle merges the same bytes in the same order"
+            ),
+            None => skip_oracle_check("the `stderr_to_stdout` merge"),
+        }
+    }
+
+    /// `bytes` rendered as the `~w` form of an Erlang byte list (`[1,2,3]`), so a whole
+    /// sequence can be compared against an oracle's `io:format("~w", …)` output.
+    fn byte_list(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .map(|byte| byte.to_string())
+            .collect::<Vec<String>>()
+            .join(",")
+    }
     #[test]
     fn a_fd_port_write_reaches_the_adopted_descriptor() {
         use std::io::Read;
