@@ -642,7 +642,7 @@ A non-self target lowers to `erlang:F(Node,...)`, whose `erlang.erl` clause call
 All other constants are truthful defaults or derive from real state (`application.rs:98`/`:194-196`, `code.rs:49`/`:183-185`, `init.rs:127-175`, `port.rs:148-154`/`:282-301`).
 
 ## Handoffs (owned by OTHER nodes)
-The per-call dispatch arm for every native BIF is a registration in `../native.rs` (one level up, outside *this* node's scope); its `("code","get_mode",0)` arm is reachable and agrees with the oracle (`interactive`), though its module-doc table still omits it.
+The per-call dispatch arm for every native BIF is a registration in `../native.rs` (one level up, outside *this* node's scope); its `("code","get_mode",0)` arm is reachable and agrees with the oracle (`interactive`), though its module-doc table still omits it (the table now also lists `code:load_file/1` and the `init:stop/0,1`/`restart/0`/`boot/1` arms).
 `init:get_argument(root)` and `init:get_argument(home)` agree with the oracle through the same `init:get_argument/1` arm.
 `init:get_argument(progname)` is the C rule (`$PROGNAME` else the compile-time `"erl"`), so it agrees with the oracle for a normal invocation; `init:get_argument(bindir)` is `<root>/erts-<vsn>/bin` of the installation the runtime resolved (`$ERTS_STDLIB_DIR`, else the filesystem probe), which is the oracle's own emulator directory whenever both run against the same installation.
 The `file_server_2` service's remaining cross-node gap — a scheduled `gen_server:call` to the service (**`beam_engine`**) — is itemised in the `file_server.rs` subsection above.
