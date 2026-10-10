@@ -633,15 +633,51 @@ impl PortRegistry {
     /// through `beam_io`, which is why a caller that must keep this registry's own metadata in step
     /// uses [`PortRegistry::close`] instead.
     ///
+    /// # An internal port is `badarg` for every verb
+    ///
+    /// A port whose driver is a **built-in** one (a `{spawn, Cmd}` / `{spawn_executable, Path}` /
+    /// `{fd, N}` port — i.e. every port but a `{spawn_driver, Name}` one, see
+    /// [`PortRegistry::is_driver_port`]) has no `control` callback, and the C's
+    /// `call_driver_control` answers `ERTS_PORT_OP_BADARG` **before** any callback for a driver
+    /// whose `control` slot is `NULL` (`io.c:4035`); `erts_internal_port_control_3` turns that into
+    /// the atom `badarg` (`erl_bif_port.c:340-343`). So `erlang:port_control/3` on a `{spawn,"cat"}`
+    /// or `{fd,0,1}` port is the oracle's `badarg` for **every** verb (measured), never the built-in
+    /// driver's `Ok(vec![])`. That check deliberately precedes the reserved-`"close"` forward: the
+    /// oracle's command is a `c_uint`, so a `"close"` string cannot arise from real `port_control`
+    /// call, and rejecting the internal port first is what matches the C.
+    ///
     /// # Errors
     ///
-    /// [`BeamError::BadArg`] for a port this registry does not hold (closed, or never opened) —
-    /// `beam_io`'s own answer for an unknown port, and the oracle's for `port_control` on a dead
-    /// one — the driver's own rejection (a C driver with no `control` slot, or a negative result,
-    /// is also `badarg`), and the typed capability gap for a reply the driver answers from memory of
-    /// its own (see [`driver::DriverPortAdapter::control_reply`]).
+    /// [`BeamError::BadArg`] for a port this registry does not hold (closed, or never opened), for
+    /// an **internal** port (above), and for the driver's own rejection (a C driver with no `control`
+    /// slot, or a negative result); the typed capability gap for a reply the driver answers from
+    /// memory of its own (see [`driver::DriverPortAdapter::control_reply`]).
     pub fn port_control(&mut self, id: PortId, op: &str, arg: &[u8]) -> Result<Vec<u8>> {
+        if !self.is_driver_port(id) {
+            // Either an internal port — no C driver host, so the oracle's `badarg` for every verb
+            // (`call_driver_control`, `io.c:4035`) — or a port this registry does not hold, which is
+            // `badarg` too. Both are the atom `badarg`, never a fabricated reply.
+            return Err(BeamError::BadArg);
+        }
         self.registry.port_control(&mut self.poller, id, op, arg)
+    }
+
+    /// Whether `id` is backed by a **user C driver** (`{spawn_driver, Name}`) rather than one of the
+    /// built-in `spawn`/`spawn_executable`/`fd` drivers — the C's "does this port's driver have a
+    /// `control` callback?" predicate.
+    ///
+    /// This runtime gives a C driver host to a `{spawn_driver, Name}` port alone (every other `Name`
+    /// form is backed by [`beam_io::SpawnDriver`]), so [`PortMeta::kind`] being
+    /// [`PortName::SpawnDriver`] is exactly the C's `prt->drv_ptr->control != NULL` test
+    /// (`io.c:4035`). It is what [`PortRegistry::port_control`] keys its internal-port `badarg` on,
+    /// and — via the same C-driver-host fact — what [`PortRegistry::control_binary`] reads a flag
+    /// from.
+    ///
+    /// `false` for a port this registry does not hold.
+    pub fn is_driver_port(&self, id: PortId) -> bool {
+        self.meta
+            .get(&id.number())
+            .is_some_and(|meta| meta.kind == PortName::SpawnDriver)
     }
 
     /// Whether `id`'s C driver asked for a **binary** `erlang:port_control/3` reply

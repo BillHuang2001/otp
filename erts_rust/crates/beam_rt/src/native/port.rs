@@ -18,18 +18,19 @@
 //
 // %CopyrightEnd%
 
-//! The port half of the runtime-native BIF floor: `erlang:port_command/2,3` and the
-//! closed-port half of `erlang:port_info/1,2`.
+//! The port half of the runtime-native BIF floor: `erlang:port_command/2,3`,
+//! `erlang:port_control/3` and the closed-port half of `erlang:port_info/1,2`.
 //!
 //! `beam_bifs` owns the *roster* of port BIFs (`open_port/2`, `port_close/1`,
 //! `port_info/1,2`, `list_to_port/1`, `port_to_list/1` — see
 //! `../../beam_bifs/src/port.rs`) and reaches the port *machinery* through the
 //! [`PortHook`](beam_bifs::PortHook) seam, which [`crate::port::RuntimePorts`] implements.
-//! Two things do **not** fit that seam and are served here instead, ahead of the registry:
+//! Three things do **not** fit that seam and are served here instead, ahead of the registry:
 //!
 //! | Call | Why it is runtime-native |
 //! |---|---|
 //! | `erlang:port_command/2,3` | writing to the port's write stream is the port's *input* direction, which the `PortHook` seam has no method for — the runtime owns the write handle |
+//! | `erlang:port_control/3` | the driver's `control` callback, which the `PortHook` seam has no method for either (an `erlang.erl` wrapper over `erts_internal:port_control/3`) |
 //! | `erlang:port_info/1,2` | two answers a `PortHook` returning `{Item, Value}` pairs cannot express: `undefined` for a port the runtime does not hold, and the bare `[]` for a live, **unregistered** port's `registered_name` item |
 //!
 //! # `port_command/2,3`
@@ -214,6 +215,12 @@ impl RuntimeContext<'_> {
     /// `control` slot, or one that returns a negative result, is `badarg` (the C's
     /// `call_driver_control`, `io.c:4035/4074`).
     ///
+    /// An **internal** port — a `{spawn, Cmd}` / `{spawn_executable, Path}` / `{fd, N}` port, whose
+    /// built-in driver has no `control` callback — is `badarg` for **every** verb: the C rejects it
+    /// before any callback (`call_driver_control`, `io.c:4035`) and the oracle answers `badarg`
+    /// (measured). Only a `{spawn_driver, Name}` port carries a user driver whose `control` slot may
+    /// answer ([`PortRegistry::is_driver_port`]).
+    ///
     /// The reply is an Erlang **list of byte integers** — `write_port_control_result`
     /// (`io.c:4098-4175`) renders the bytes with `buf_to_intlist` whenever the driver did **not**
     /// set `PORT_CONTROL_FLAG_BINARY`. A driver that *did* set the flag — `set_port_control_flags`
@@ -223,10 +230,10 @@ impl RuntimeContext<'_> {
     ///
     /// # Errors
     ///
-    /// [`BeamError::BadArg`] for a non-port / unknown port, an out-of-range `Operation`, non-iodata
-    /// `Data`, a driver with no `control` slot or a negative driver result; the typed capability gap
-    /// of [`crate::port::RuntimePorts::port_control`] for a reply the driver answers from memory of
-    /// its own, and of the port table already being borrowed.
+    /// [`BeamError::BadArg`] for a non-port / unknown port, an **internal** port, an out-of-range
+    /// `Operation`, non-iodata `Data`, a driver with no `control` slot or a negative driver result;
+    /// the typed capability gap of [`crate::port::RuntimePorts::port_control`] for a reply the
+    /// driver answers from memory of its own, and of the port table already being borrowed.
     fn port_control(&mut self, args: &[Eterm]) -> Result<Eterm> {
         let port = PortId::from_eterm(*args.first().ok_or(BeamError::BadArg)?)?;
         let operation = Self::term_to_uint(*args.get(1).ok_or(BeamError::BadArg)?)?;
