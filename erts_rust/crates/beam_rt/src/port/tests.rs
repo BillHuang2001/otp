@@ -55,6 +55,7 @@ struct Fixture {
 const TEST_ATOMS: &[&str] = &[
     "spawn",
     "spawn_executable",
+    "spawn_driver",
     "fd",
     "not_a_driver",
     // The honored option tags.
@@ -559,6 +560,68 @@ fn invalid_names_and_options_are_badarg() {
 
     // Validation precedes allocation, so no rejected call consumed a port number: the
     // next successful `open_port` gets the very first id.
+    let port = fx.hook.open_port(spawn, NIL).expect("a valid port");
+    assert_eq!(port, PortId::new(0));
+}
+
+/// A **built-in** emulator driver name opens a real port, exactly as the C resolves
+/// `{spawn_driver, Name}` against its loaded-driver list (`io.c:599-628`) rather than only a `.so`.
+///
+/// `tcp_inet` is one of the oracle's statically linked drivers
+/// (`erts/emulator/drivers/common/inet_drv.c:1348`), so `open_port({spawn_driver,"tcp_inet"},[])`
+/// answers a live `#Port<…>` (oracle-verified) — the built-in fallback must produce the same, not
+/// the `badarg` of a failed `.so` load.
+#[test]
+fn a_builtin_driver_name_opens_a_live_driver_port() {
+    let mut fx = fixture();
+    let command = fx.string("tcp_inet");
+    let name = fx.name("spawn_driver", command);
+    let port = fx
+        .hook
+        .open_port(name, NIL)
+        .expect("a built-in driver name opens a real port");
+
+    // A real id out of `beam_io`'s table, with `port_info/1` metadata recorded — the port is
+    // genuinely live, not a fabricated handle.
+    assert!(fx.registry.borrow().is_live(port));
+    assert_eq!(text_of(fx.item(port, "name")), "tcp_inet");
+    // A built-in driver port owns no OS child: `port_info(Port, os_pid)` is the atom `undefined`.
+    assert!(is_atom(fx.item(port, "os_pid")), "no OS child");
+
+    // It is a **driver** port (its driver has a `control` callback): `port_control` must reach the
+    // built-in driver rather than answer the internal-port `badarg` (`../port.rs:671-679`).
+    assert!(fx.registry.borrow().is_driver_port(port), "a driver port");
+    // ...but its bytes must **not** be drained from a C driver's inline `output` callback — a
+    // built-in driver delivers through its poller-registered descriptor on the port-task round.
+    let kind = fx.registry.borrow().meta.get(&port.number()).map(|meta| meta.kind);
+    assert_eq!(kind, Some(PortName::SpawnDriverBuiltin));
+    assert!(PortName::SpawnDriverBuiltin.has_driver_control());
+    assert!(!PortName::SpawnDriverBuiltin.bytes_from_driver_output());
+
+    // `port_close/1` succeeds for it (the oracle's `true`) and releases the id.
+    fx.hook.close_port(port).expect("closing the built-in driver port");
+    assert!(!fx.registry.borrow().contains(port));
+
+    // Oracle cross-check: the same call answers a live port under the system runtime.
+    let expr = "io:format(\"~s\",[case catch open_port({spawn_driver,\"tcp_inet\"},[]) of \
+                P when is_port(P) -> \"port\"; R -> io_lib:format(\"~p\",[R]) end]).";
+    match erl_eval(expr) {
+        Some(oracle) => assert_eq!(oracle, "port", "the oracle opens a built-in driver port too"),
+        None => skip_oracle_check("opening a built-in `{spawn_driver,\"tcp_inet\"}` port"),
+    }
+}
+
+/// An unknown `{spawn_driver, Name}` still fails as before: the built-in fallback only catches a
+/// name this runtime links in, so a name no built-in and no `.so` answers stays the oracle's own
+/// `error:badarg` (`io.c`'s `ERTS_OPEN_DRIVER_RET(NULL, -3, BADARG)`).
+#[test]
+fn an_unknown_spawn_driver_name_is_still_badarg() {
+    let mut fx = fixture();
+    let command = fx.string("no_such_driver_anywhere");
+    let name = fx.name("spawn_driver", command);
+    assert_badarg(fx.hook.open_port(name, NIL));
+    // The failed open consumed no port number.
+    let spawn = fx.spawn("true");
     let port = fx.hook.open_port(spawn, NIL).expect("a valid port");
     assert_eq!(port, PortId::new(0));
 }

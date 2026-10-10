@@ -458,6 +458,10 @@ pub struct Runtime {
     /// request decoding, reply shaping and scheduler-pass step); the field itself is the
     /// state that ties the registered `file_server_2` pid to the runtime.
     pub(crate) file_services: crate::native::file_server::FileServices,
+    /// The `{Name, Vsn}` header of the OTP boot script this runtime has **loaded**, or
+    /// `None` before any script was read/executed — the source of `init:script_id/0`. Set
+    /// by [`Runtime::boot_from_script`] / [`Runtime::boot_from_script_reporting`].
+    boot_script_id: Option<(String, String)>,
 }
 
 impl Runtime {
@@ -597,6 +601,7 @@ impl Runtime {
             perf_map,
             open_files: HashMap::new(),
             file_services,
+            boot_script_id: None,
         })
     }
 
@@ -641,6 +646,17 @@ impl Runtime {
     /// Whether the boot sequence has run.
     pub fn is_booted(&self) -> bool {
         self.booted
+    }
+
+    /// The `{Name, Vsn}` header of the boot script this runtime loaded, if any — the source
+    /// of `init:script_id/0` (see [`crate::native::init`]).
+    ///
+    /// `None` until a script has been read through [`Runtime::boot_from_script`] /
+    /// [`Runtime::boot_from_script_reporting`].
+    pub fn boot_script_id(&self) -> Option<(&str, &str)> {
+        self.boot_script_id
+            .as_ref()
+            .map(|(name, vsn)| (name.as_str(), vsn.as_str()))
     }
 
     /// The configuration this runtime was created with.
@@ -882,6 +898,29 @@ impl Runtime {
     /// The arena's allocation failure when the value does not fit, translated to the
     /// emulator's documented `error:system_limit` — an honest error, never a dangling term
     /// (see [`crate::error::enforce_term_heap_limit`]).
+    ///
+    /// **A value carrying an off-heap payload is refused with `BeamError::BadArg`** — the
+    /// runtime's `error:badarg`, which is not what the value raised. The copy runs through
+    /// `beam_message::copy_struct_simple`, which builds **empty** source *and* destination
+    /// off-heap tables (`beam_message/src/copy.rs:761-763`), so the refc-binary arm cannot
+    /// resolve the payload's owning handle out of the *source* table and refuses
+    /// (`beam_message/src/copy.rs:487-490`, the `bad_term()` class
+    /// [`Runtime::try_stabilize_escaped`] documents as the off-heap-payload capability gap).
+    /// An escape store may keep the original term and freeze collection; a *return value*
+    /// may not — the process heap dies with the process, taking the 8-word
+    /// `[BinRef][ErlSubBits]` descriptor with it and, with the producing `Machine`, the
+    /// payload itself. So a program whose result is an off-heap binary — `base64:encode/1`,
+    /// whose `bs_init_writable` accumulator is always a refc binary even when empty — answers
+    /// `beam_rt: badarg` (exit 1) where the oracle prints the binary (see
+    /// `tests/empty_binary_result.rs`).
+    ///
+    /// Closing it needs the copy engine to materialize such a payload itself: a
+    /// self-contained ("flatten") copy mode in `beam_message` — the window flattening
+    /// `copy_match_context` already performs for a match context works verbatim on a refc
+    /// `ErlSubBits`, and its sizing must count the flattened heap-bits block instead of
+    /// `ERL_REFC_BITS_SIZE` (`beam_message/src/copy.rs:309-312`) — adopted here as this one
+    /// call. `beam_message` is outside this crate's node, so the refusal stands until that
+    /// entry point exists.
     pub(crate) fn stabilize_term(&mut self, term: Eterm) -> Result<Eterm> {
         beam_message::copy_struct_simple(term, &mut self.eval_heap)
             .map_err(error::enforce_term_heap_limit)
@@ -1094,6 +1133,9 @@ impl Runtime {
     pub fn boot_from_script(&mut self, path: impl AsRef<Path>) -> Result<BootScript> {
         self.boot_if_needed()?;
         let script = bootscript::read(path.as_ref())?;
+        // Record the script's real `{Name, Vsn}` header before executing it, so
+        // `init:script_id/0` can answer it even if execution later stops early.
+        self.boot_script_id = Some((script.name.clone(), script.vsn.clone()));
         bootscript::execute(self, &script)?;
         Ok(script)
     }
@@ -1133,6 +1175,7 @@ impl Runtime {
                 })
             }
         };
+        self.boot_script_id = Some((script.name.clone(), script.vsn.clone()));
         bootscript::execute_reporting(self, &script)
     }
     /// **The slice.** Loads `path`, caches the module, runs `function/arity` with

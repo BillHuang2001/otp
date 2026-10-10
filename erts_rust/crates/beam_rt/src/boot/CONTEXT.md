@@ -42,9 +42,11 @@ submodules and their docs; do not look for `boot.rs` here.
   `APPLY_BLOCK_SLICES`.
 - Consumed by `Runtime::boot` (`../runtime.rs`), driven by `Runtime::boot_if_needed` on every public
   entry point; `Runtime::boot_from_script` drives `execute`; `Runtime::preloaded_loaded()` /
-  `is_preloaded_loaded(name)` report the loaded set. **The CLI really runs a boot script**: a `-boot
-  FILE` invocation selects the `Action::Boot` arm (`../cli.rs::drive`), which calls `Runtime::boot()`
-  (the 22 preloaded `.beam`s) and then `Runtime::boot_from_script(&path)`.
+  `is_preloaded_loaded(name)` report the loaded set. `Runtime::boot_script_id` **retains the loaded
+  script's `{Name,Vsn}`** (set by `boot_from_script`/`boot_from_script_reporting`, read by the
+  `init:script_id/0` floor entry) so the script's identity survives the call. **The CLI really runs a
+  boot script**: a `-boot FILE` invocation selects the `Action::Boot` arm (`../cli.rs::drive`), which
+  calls `Runtime::boot()` (the 22 preloaded `.beam`s) and then `Runtime::boot_from_script(&path)`.
 - `code:which/1` / `code:all_loaded/0` / `code:is_loaded/1` render `preloaded` from the **name registry**
   (`../native/code.rs`), not from this cache; `code:all_loaded/0` explicitly filters preloaded names out
   of the cache so it does not list them twice.
@@ -132,10 +134,11 @@ configuration and it runs **all 22 directives to completion**, ending at the fin
   line, and the executor tests build their runtime with their own `system_runtime()` helper — the
   CLI's own parser (`crate::cli::parse`, not `parse_with_env`: a test must not depend on `ERL_*FLAGS`)
   over the CLI argv `beam_rt -noshell -boot bootstrap/bin/start` — and `tests/boot.rs` mirrors it
-  (`boot_cli_runtime`). A `RuntimeConfig::default()` runtime (an empty `init_args`, so
-  `init:get_arguments/0` is `[]` where the oracle also reports `root`/`bindir`/`progname`/`home`; see
-  `../native/CONTEXT.md`) stops earlier, at instruction 16 (`application:load/1`, an `error
-  function_clause`).
+  (`boot_cli_runtime`). The **four automatic flags** (`root`/`home`/`progname`/`bindir`) are served
+  by `init:get_argument/1` but are not command-line flags, so they never appear in
+  `init:get_arguments/0` — and they are no longer a boot determinant: the real script runs to
+  `{progress,started}` under a `RuntimeConfig::default()` runtime too
+  (`tests/a9_native_floor.rs::script_id_is_the_loaded_boot_scripts_real_header`).
 - **The kernel processes are ready when instruction 20 runs.** The three `{kernelProcess, …}` bursts
   drive until their directive's MFA returns, so `whereis(application_controller)` answers a live,
   registered server — the directive ran `application_controller:start/1` to its `{ok, AC}` return
@@ -179,9 +182,8 @@ because it cannot be duplicated.
    `{get_line,…}` request is still the typed `unsupported` gap (the served device surface is
    itemised in `../native/CONTEXT.md`).
 3. **`beam_rt` `../native/init.rs` — `init:get_arguments/0` lists only the command-line flags**, so it
-   omits the oracle's automatic `root`/`bindir`/`progname`/`home`. A `RuntimeConfig::default()` runtime
-   therefore stops at instruction 16 (`application:load/1`, an `error function_clause`); the
-   CLI-equivalent configuration runs the whole script.
+   omits the oracle's automatic `root`/`bindir`/`progname`/`home` (all four ARE served by
+   `init:get_argument/1`, which is what the boot chain needs).
 4. **`beam_bifs`.** Whatever the started applications still need past the above.
 
 ## Constraints

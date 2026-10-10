@@ -156,6 +156,7 @@ impl RuntimeContext<'_> {
             ("init", "get_plain_arguments", 0) => Some(self.get_plain_arguments()),
             ("init", "get_arguments", 0) => Some(self.get_arguments()),
             ("init", "get_status", 0) => Some(self.get_status()),
+            ("init", "script_id", 0) => Some(self.script_id_0()),
             ("os", "cmd", 1) => Some(self.os_cmd(args)),
             // The port surface the `PortHook` seam cannot express: `port_command/2,3` (the
             // port's *input* direction) and `port_control/3` (the driver's `control` callback) —
@@ -175,12 +176,18 @@ impl RuntimeContext<'_> {
             ("code", "lib_dir", 1) => Some(self.code_lib_dir_1(args)),
             ("code", "root_dir", 0) => Some(self.code_root_dir()),
             ("code", "get_mode", 0) => Some(self.code_get_mode()),
+            ("code", "lib_dir", 2) => Some(self.code_lib_dir_2(args)),
             ("application", "get_env", 1) => Some(self.application_get_env_1()),
             ("application", "get_env", 2) => Some(self.application_get_env_2(args)),
             ("application", "get_env", 3) => Some(self.application_get_env_3(args)),
             ("application", "get_all_env", 1) => Some(self.application_get_all_env_1(args)),
             ("application", "get_key", 2) => Some(self.application_get_key_2(args)),
             ("application", "get_application", 0) => Some(self.application_get_application_0()),
+            ("application", "get_application", 1) => {
+                Some(self.application_get_application_1(args))
+            }
+            ("application", "get_all_key", 1) => Some(self.application_get_all_key_1(args)),
+            ("application", "get_key", 1) => Some(self.application_get_key_1(args)),
             ("application", "loaded_applications", 0) => {
                 Some(self.application_loaded_applications())
             }
