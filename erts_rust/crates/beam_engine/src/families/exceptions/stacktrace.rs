@@ -22,7 +22,8 @@
 //! `[{Module,Function,Arity,Location}]` form.
 //!
 //! Split out of [`super`] (the family's `exec` dispatch) by responsibility; the
-//! Milestone-1 approximation and its precise residuals are documented on
+//! **raise-time snapshot** the cooked trace is derived from — each frame resolved
+//! in its **own** module context — and the precise residuals are documented on
 //! [`symbolic_stacktrace`].
 //!
 //! # One reservation for the whole graph
@@ -39,6 +40,8 @@
 //! and the unrooted path cannot diverge in layout; the carve order is exactly the
 //! order the shape's word count is computed in, so a correctly sized region is
 //! consumed exactly.
+
+use std::sync::Arc;
 
 use beam_common::Result;
 use beam_loader::{Atom, Instr, LineEntry, Module};
@@ -57,40 +60,68 @@ use crate::terms::{ContextSink, Sink};
 /// The symbolic (cooked) stacktrace `[{Module,Function,Arity,Location}]` for a
 /// non-`NIL` raw stacktrace, innermost frame first.
 ///
-/// **Milestone-1 approximation — the precise residuals.** C's `build_stacktrace`
+/// **Where the frames come from.** C's `build_stacktrace`
 /// (`../../erts/emulator/beam/beam_common.c:1204-1292`) walks the *saved* raw
 /// `StackTrace` object carried by the exception (`s->trace[]`, a sequence of saved
 /// continuation pointers) and resolves each through `erts_lookup_function_info`,
 /// building `{M,F,A,Location}` items with `erts_build_mfa_item`
-/// (`../../erts/emulator/beam/utils.c:3430-3457`). The M1 machine keeps no such
-/// object — it captures no stacktrace at all — so the engine substitutes the
-/// equivalent information it *does* have: the **live call frames**. Every frame's
-/// continuation-pointer slot is a `(func, pc)` ([`Machine::resumption_addresses`]);
-/// `func` indexes the running [`Module`]'s functions, giving
-/// `{Module,Function,Arity}`, and the location is the `line` marker in effect at
-/// `pc` (C's line lookup, `../../erts/emulator/beam/beam_file.c`).
+/// (`../../erts/emulator/beam/utils.c:3430-3457`). The engine keeps no such object,
+/// but it does capture the equivalent information at **raise time**: every
+/// [`Machine::throw_with_trace`] rebuilds [`Machine::raise_snapshot`] — the
+/// pre-unwind `(context, func, pc)` frame chain, the **raising** frame first, then
+/// every live caller innermost-first — *before* it unwinds the call frames to the
+/// handler. This function therefore cooks from that snapshot, **not** from the
+/// machine's live call frames: by the time the handler's `build_stacktrace` runs,
+/// the frames the raise unwound out of are gone from the call-frame stack, yet the
+/// snapshot still names them. `func` indexes the frame's own [`Module`]'s functions,
+/// giving `{Module,Function,Arity}`, and the location is the `line` marker in effect
+/// at `pc` (C's line lookup, `../../erts/emulator/beam/beam_file.c`).
+///
+/// **Which module a frame belongs to.** A snapshot entry's context names the module
+/// its `(func, pc)` pair belongs to (a frame's continuation carries the module
+/// context it returns into — see [`crate::machine::ModuleContext`]):
+/// * context `0` — the run's entry module, which the machine **borrows** rather than
+///   owns — resolves against the `module` argument, but **only** when the machine's
+///   [`Machine::current_context`] is also `0` (then that argument *is* that entry
+///   module). When the handler — where `build_stacktrace` runs — is in a registered
+///   (non-zero) context, the caller's `module` argument is the *callee's* module, so
+///   a context-`0` snapshot frame cannot be resolved and is **skipped** rather than
+///   named against the wrong module.
+/// * a non-zero context `id` resolves through [`Machine::module_context`]; an id that
+///   was never registered is **skipped**.
+///
+/// A skipped frame contributes **no** item — this is best-effort metadata, exactly
+/// like [`Machine::raise_stacktrace`] on the uncaught path, and a frame is never
+/// named with a module its address does not belong to. An **empty** snapshot, or one
+/// whose every frame is skipped, cooks to the **empty list** ([`NIL`]) — the honest
+/// answer for a trace the engine cannot name. (A frame whose module *is* resolvable
+/// but whose function index is outside that module's function table is a typed
+/// [`crate::error::unsupported`], never a panic: the module is the only thing that
+/// can name the address, so silently dropping it would hide a real mismatch.)
 ///
 /// The residuals, all deliberate and all reported:
 /// 1. **Only interpreted frames appear.** The frame stack starts at the
 ///    `run_export`/`run_label` entry, so a caller *outside* the run — the host's
 ///    own chain, the oracle's trailing `erl_eval`/`init` entries — has no frame
-///    here and is absent from the result. A call that leaves the loop into the
-///    host context (a `call_ext` into another module, an `apply_fun`) likewise
-///    materialises no interpreted frame.
-/// 2. **The frames are the live ones, not the saved ones.** C reports the chain
-///    captured when the exception was raised; the engine reports the chain at
-///    `build_stacktrace` time. The compiler emits `build_stacktrace` immediately
-///    after `try_case`, which has already unwound to the frame owning the handler,
-///    so C's saved chain additionally holds the frames the raise unwound out of.
-/// 3. **The innermost item carries the arity, never an argument list.** C uses the
+///    here and is absent from the result.
+/// 2. **The innermost item carries the arity, never an argument list.** C uses the
 ///    exception's saved arguments where the raw trace holds them (`args` in
-///    `erts_build_mfa_item`); M1 keeps no such list, so the arity — C's own
-///    fallback for a frame without saved args — is always emitted.
-/// 4. **No `error_info` entries.** C's innermost item extends its `Location` with
-///    the raw trace's extra info (`get_error_info_from_exc`); M1 has none.
+///    `erts_build_mfa_item`); the snapshot keeps no such list, so the arity — C's
+///    own fallback for a frame without saved args — is always emitted.
+/// 3. **No `error_info` entries.** C's innermost item extends its `Location` with
+///    the raw trace's extra info (`get_error_info_from_exc`); the engine has none.
 ///
 /// The *order* is C's: `build_stacktrace` prepends the current function last
 /// (`beam_common.c:1278-1288`), so the list runs innermost frame first.
+///
+/// **Why a cooked trace is never landed as the raw `x(2)` trace.** C's raw trace is
+/// an opaque object of **saved code pointers** (`c_p->ftrace`), with no engine
+/// equivalent; and the oracle's own cooked `S` for `try ... catch C:R:S -> S end`
+/// additionally holds host `init:*` frames that live *outside* this engine's run. A
+/// snapshot-cooked trace is therefore a strictly-**partial** list that would still
+/// differ from the oracle's — landing it would trade this documented omission for a
+/// different, silently-partial value. So `x(2)` stays `NIL` on the compiled path (see
+/// the family docs) and this function only serves the non-`NIL` raw-trace arm.
 ///
 /// The whole `[Item]` graph is sized from metadata, reserved in **one** rooted
 /// allocation ([`crate::terms::reserve_slack`]) and carved from it, so a moving
@@ -99,15 +130,45 @@ pub(crate) fn symbolic_stacktrace(
     machine: &mut Machine,
     module: &Module,
     ctx: &mut dyn ExecutionContext,
-    func: u32,
-    pc: u32,
 ) -> Result<Eterm> {
-    // The function executing right now (the dispatch loop's current position),
-    // then every frame that is suspended in a call, innermost first. Only the
-    // *shapes* are computed here: no BEAM-heap word is touched yet.
-    let mut shapes = Vec::new();
-    for (func, pc) in std::iter::once((func, pc)).chain(machine.resumption_addresses()) {
-        shapes.push(item_shape(module, func, pc)?);
+    // The **raise-time** frame chain: the raising frame first, then every caller
+    // innermost-first, exactly as it was captured *before* the raise unwound the
+    // call frames. Copy it out of the machine so the `shapes` below borrow only
+    // local module handles (never `machine`), leaving the later
+    // `reserve_slack(machine, ..)` free to take `&mut machine`.
+    let frames: Vec<(u32, u32, u32)> = machine.raise_snapshot().to_vec();
+    // Where the handler (`build_stacktrace`) is executing: only when it is the entry
+    // module's context (`0`) is the caller's `module` argument the module a
+    // context-`0` frame belongs to.
+    let handler_context = machine.current_context();
+    // Resolve each frame's owning module *before* sizing: a non-zero context's
+    // `Arc<Module>` must stay alive across the one reservation below, because an
+    // [`ItemShape`] borrows its `Line` chunk (the file name).
+    let mut owned: Vec<Arc<Module>> = Vec::new();
+    let mut plan: Vec<FrameOwner> = Vec::with_capacity(frames.len());
+    for (context, _func, _pc) in &frames {
+        match *context {
+            0 if handler_context == 0 => plan.push(FrameOwner::EntryModule),
+            0 => plan.push(FrameOwner::Skip),
+            id => match machine.module_context(id) {
+                Some(handle) => {
+                    plan.push(FrameOwner::Owned(owned.len()));
+                    owned.push(handle.module.clone());
+                }
+                None => plan.push(FrameOwner::Skip),
+            },
+        }
+    }
+    // Only the *shapes* are computed here: no BEAM-heap word is touched yet. A
+    // skipped frame contributes no shape.
+    let mut shapes: Vec<ItemShape<'_>> = Vec::with_capacity(frames.len());
+    for ((_context, func, pc), owner) in frames.iter().zip(plan.iter()) {
+        let owner_module: &Module = match owner {
+            FrameOwner::EntryModule => module,
+            FrameOwner::Owned(index) => &owned[*index],
+            FrameOwner::Skip => continue,
+        };
+        shapes.push(item_shape(owner_module, *func, *pc)?);
     }
     // `2` words per list cell plus every item's own nodes — sized **before** the
     // reservation, because a collection under it relocates the machine's roots and
@@ -119,7 +180,25 @@ pub(crate) fn symbolic_stacktrace(
         // Child nodes before the parent, in the order `ItemShape::words` counts.
         items.push(write_item(&mut sink, shape)?);
     }
+    // An empty (or wholly skipped) snapshot is the honest empty list.
     sink.list(&items)
+}
+
+/// Which [`Module`] a snapshot frame's `(func, pc)` pair belongs to, resolved
+/// **before** the shapes are computed and before the one reservation.
+///
+/// The distinction exists so that a resolved frame's `Arc<Module>` handle lives in
+/// one local vector for the whole build: an [`ItemShape`] borrows the module's
+/// `Line` chunk (the file name), so the handle must outlive every `reserve`/`write`
+/// step — never be dropped after the shape was computed.
+enum FrameOwner {
+    /// The run's **entry** module — the `module` argument. Valid only for a
+    /// context-`0` frame observed from a context-`0` handler.
+    EntryModule,
+    /// Index into the local handle vector: a registered context's module.
+    Owned(usize),
+    /// The frame's context cannot be resolved — the frame contributes no item.
+    Skip,
 }
 
 /// One `{Module,Function,Arity,Location}` stacktrace item for the function at

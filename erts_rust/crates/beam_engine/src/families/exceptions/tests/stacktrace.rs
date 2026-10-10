@@ -22,6 +22,10 @@
 //! source-location items.
 use super::*;
 
+use std::sync::Arc;
+
+use beam_loader::Atom;
+
 // The production builders take the `Machine` plus a reader closure so a moving
 // collector can relocate operands between the reserve and the read; these tests
 // build from already-materialized terms against a non-collecting arena, so alias
@@ -49,14 +53,16 @@ fn build_stacktrace_of_a_nil_raw_trace_is_nil() {
 }
 
 #[test]
-fn build_stacktrace_derives_the_live_callers_innermost_first() {
-    // A non-NIL raw trace (only a synthetic module produces one at M1) is
-    // approximated from the live frames: the current function first, then every
-    // frame suspended in a call, innermost first. No line marker is in effect,
-    // so each Location is NIL (C's LINE_INVALID_LOCATION).
+fn build_stacktrace_cooks_the_raise_snapshot_innermost_first() {
+    // The frames are cooked from the machine's **raise-time snapshot**
+    // (`Machine::raise_snapshot`), not from the live call frames: the raise unwinds
+    // `outer`'s frame away *before* `build_stacktrace` runs, yet the snapshot still
+    // names it. The raising frame comes first, then every caller innermost-first.
+    // No line marker is in effect, so each Location is NIL (C's
+    // LINE_INVALID_LOCATION).
     let mut fixture = Fixture::new(&[]);
-    let entry = fixture.add_function(
-        "f",
+    let run_entry = fixture.add_function(
+        "run",
         0,
         vec![
             Instr::Label(Label(1)),
@@ -64,18 +70,18 @@ fn build_stacktrace_derives_the_live_callers_innermost_first() {
             Instr::Return,
         ],
     );
-    let g_entry = fixture.add_function(
-        "g",
-        2,
-        vec![Instr::Label(Label(2)), Instr::Return],
-    );
+    let caller_entry =
+        fixture.add_function("caller", 0, vec![Instr::Label(Label(2)), Instr::Return]);
+    let outer_entry =
+        fixture.add_function("outer", 0, vec![Instr::Label(Label(3)), Instr::Return]);
     let module = fixture.finish();
-    assert_eq!(entry, Label(1));
-    assert_eq!(g_entry, Label(2));
+    assert_eq!(run_entry, Label(1));
+    assert_eq!(caller_entry, Label(2));
+    assert_eq!(outer_entry, Label(3));
 
     let mut machine = Machine::new();
-    // The bottom frame, then a frame that called into `f` — its continuation is
-    // `f` at code offset 2 (`g/2`'s own frame-less `return`).
+    // The bottom frame, then `caller` (resumes at `(1, 1)`) and `outer` (resumes at
+    // `(2, 1)`) each suspended in a call.
     machine.push_frame(0).unwrap();
     machine.push_frame(0).unwrap();
     machine
@@ -85,34 +91,58 @@ fn build_stacktrace_derives_the_live_callers_innermost_first() {
             context: 0,
         })
         .unwrap();
+    machine.push_frame(0).unwrap();
+    machine
+        .set_continuation(crate::machine::Continuation::Address {
+            func: 2,
+            pc: 1,
+            context: 0,
+        })
+        .unwrap();
+    // The raising instruction: `run/0` at code offset 1.
+    machine.current_code = Some((0, 1));
+    // A catch frame owned by frame 1: landing there unwinds frame 2 (`outer`) away.
+    machine.push_catch_frame(CatchFrame::new(1, 0, 1));
+    machine.set_class_atom(ExceptionClass::Error, make_atom(Atom::from_raw(11)));
+    let step = machine
+        .throw_with_trace(ExceptionClass::Error, Eterm::from_raw(1), NIL)
+        .expect("a live frame catches");
+    assert_eq!(step, Step::Goto { func: 1, pc: 0 });
+    assert_eq!(machine.frame_depth(), 2, "the raise unwound `outer` away");
+
     // x(0) must hold a non-NIL raw stacktrace for the instruction to cook one.
     machine.set_x(0, make_small(1)).unwrap();
-
     let mut ctx = MinimalContext::new();
-    // Run the `build_stacktrace` at code offset 1 of function 0.
     let step = exec(
         &mut machine,
         &module,
         &no_labels(),
         &Instr::BuildStacktrace,
         0,
-        1,
+        0,
         &mut ctx,
     )
     .unwrap();
     assert_eq!(step, Some(Step::Next));
 
     let m = module.atom_table.lookup("m").unwrap();
-    let f = module.atom_table.lookup("f").unwrap();
-    let g = module.atom_table.lookup("g").unwrap();
-    let item_f = terms::make_tuple(&mut ctx, &[make_atom(m), make_atom(f), make_small(0), NIL])
-        .unwrap();
-    let item_g = terms::make_tuple(&mut ctx, &[make_atom(m), make_atom(g), make_small(2), NIL])
-        .unwrap();
-    let expected = terms::make_list(&mut ctx, &[item_f, item_g]).unwrap();
+    let run = module.atom_table.lookup("run").unwrap();
+    let caller = module.atom_table.lookup("caller").unwrap();
+    let outer = module.atom_table.lookup("outer").unwrap();
+    let item_run =
+        terms::make_tuple(&mut ctx, &[make_atom(m), make_atom(run), make_small(0), NIL])
+            .unwrap();
+    let item_outer =
+        terms::make_tuple(&mut ctx, &[make_atom(m), make_atom(outer), make_small(0), NIL])
+            .unwrap();
+    let item_caller =
+        terms::make_tuple(&mut ctx, &[make_atom(m), make_atom(caller), make_small(0), NIL])
+            .unwrap();
+    let expected = terms::make_list(&mut ctx, &[item_run, item_outer, item_caller]).unwrap();
     assert!(
         cmp(machine.x(0).unwrap(), expected, &module.atom_table).is_eq(),
-        "the cooked trace must be [{{m,f,0,[]}}, {{m,g,2,[]}}]"
+        "the cooked trace must be [{{m,run,0,[]}}, {{m,outer,0,[]}}, {{m,caller,0,[]}}] — the \
+         unwound `outer` frame being present proves the snapshot is used, not the live stack"
     );
 }
 
@@ -143,9 +173,16 @@ fn build_stacktrace_item_carries_the_source_location() {
     let module = fixture.finish();
     let mut machine = Machine::new();
     machine.push_frame(0).unwrap();
+    // The snapshot's raising frame is the `line`-marked code offset 2: capture it
+    // through an (uncaught) raise, which snapshots before unwinding.
+    machine.current_code = Some((0, 2));
+    let err = machine
+        .throw(ExceptionClass::Error, Eterm::from_raw(1))
+        .expect_err("no catch frame");
+    assert!(matches!(err, BeamError::Raise(_)));
     machine.set_x(0, make_small(1)).unwrap(); // a non-NIL raw trace
     let mut ctx = MinimalContext::new();
-    let step = exec(&mut machine, &module, &no_labels(), &Instr::BuildStacktrace, 0, 2, &mut ctx)
+    let step = exec(&mut machine, &module, &no_labels(), &Instr::BuildStacktrace, 0, 0, &mut ctx)
         .unwrap();
     assert_eq!(step, Some(Step::Next));
 
@@ -188,10 +225,17 @@ fn build_stacktrace_without_the_file_or_line_atom_is_a_typed_error() {
         let module = fixture.finish();
         let mut machine = Machine::new();
         machine.push_frame(0).unwrap();
+        // A snapshot frame with a real location, so `location_shape` is reached:
+        // capture it through an (uncaught) raise.
+        machine.current_code = Some((0, 2));
+        let err = machine
+            .throw(ExceptionClass::Error, Eterm::from_raw(1))
+            .expect_err("no catch frame");
+        assert!(matches!(err, BeamError::Raise(_)));
         machine.set_x(0, make_small(1)).unwrap();
         let mut ctx = MinimalContext::new();
         let err =
-            exec(&mut machine, &module, &no_labels(), &Instr::BuildStacktrace, 0, 2, &mut ctx)
+            exec(&mut machine, &module, &no_labels(), &Instr::BuildStacktrace, 0, 0, &mut ctx)
                 .unwrap_err();
         assert!(
             matches!(err, BeamError::Raise(_)),
@@ -205,18 +249,124 @@ fn build_stacktrace_of_an_unknown_function_index_is_a_typed_error() {
     let module = Fixture::new(&[]).finish();
     let mut machine = Machine::new();
     machine.push_frame(0).unwrap();
+    // The snapshot's raising frame names function index 3, absent from the empty
+    // module. Capture it through an (uncaught) raise.
+    machine.current_code = Some((3, 0));
+    let err = machine
+        .throw(ExceptionClass::Error, Eterm::from_raw(1))
+        .expect_err("no catch frame");
+    assert!(matches!(err, BeamError::Raise(_)));
     machine.set_x(0, make_small(1)).unwrap();
     let mut ctx = MinimalContext::new();
-    // Function index 3 does not exist in the empty module.
     let err = exec(
         &mut machine,
         &module,
         &no_labels(),
         &Instr::BuildStacktrace,
-        3,
+        0,
         0,
         &mut ctx,
     )
     .unwrap_err();
     assert!(matches!(err, BeamError::Raise(_)));
+}
+
+#[test]
+fn build_stacktrace_resolves_a_snapshot_frame_in_its_own_module_context() {
+    // A snapshot frame whose context is a registered (non-zero) module context
+    // resolves in **that** module; a context-`0` frame observed from a non-zero
+    // handler context cannot be named (the `module` argument is the *callee's*) and
+    // is skipped.
+    let mut fixture = Fixture::new(&[]);
+    let callee_name = fixture.module.atom_table.intern("callee");
+    fixture.module.name = callee_name;
+    let boom_entry = fixture.add_function("boom", 1, vec![Instr::Label(Label(1)), Instr::Return]);
+    assert_eq!(boom_entry, Label(1));
+    // `boom` is the callee's first (and only) function, so its function index is 0.
+    let boom: u32 = 0;
+    let callee = Arc::new(fixture.finish());
+
+    // The run's entry module (context 0): a `run/0` a *skipped* context-0 frame
+    // would otherwise have been named against.
+    let mut entry_fixture = Fixture::new(&[]);
+    entry_fixture.add_function("run", 0, vec![Instr::Label(Label(1)), Instr::Return]);
+    let entry_module = entry_fixture.finish();
+
+    let mut machine = Machine::new();
+    // A frame chain holding BOTH a context-`0` frame and a context-`id` frame: the
+    // bottom frame, then a frame returning into context 0, then the raising `boom`
+    // frame in the callee context.
+    machine.push_frame(0).unwrap();
+    machine.push_frame(0).unwrap();
+    machine
+        .set_continuation(crate::machine::Continuation::Address {
+            func: 0,
+            pc: 0,
+            context: 0,
+        })
+        .unwrap();
+    let id = machine.register_context(&callee);
+    assert!(id >= 1, "a registered context id is non-zero");
+    machine.push_frame(0).unwrap();
+    machine
+        .set_continuation(crate::machine::Continuation::Address {
+            func: boom,
+            pc: 0,
+            context: id,
+        })
+        .unwrap();
+    machine.switch_context(id).unwrap();
+    machine.current_code = Some((boom, 0));
+
+    // An uncaught raise (no catch frame) still captures the snapshot.
+    let err = machine
+        .throw_with_trace(ExceptionClass::Exit, Eterm::from_raw(2), NIL)
+        .expect_err("no catch frame");
+    assert!(matches!(err, BeamError::Raise(_)));
+    assert_eq!(
+        machine.current_context(),
+        id,
+        "the handler runs in the callee's context"
+    );
+
+    machine.set_x(0, make_small(1)).unwrap();
+    let mut ctx = MinimalContext::new();
+    let step = exec(
+        &mut machine,
+        &entry_module,
+        &no_labels(),
+        &Instr::BuildStacktrace,
+        0,
+        0,
+        &mut ctx,
+    )
+    .unwrap();
+    assert_eq!(step, Some(Step::Next));
+
+    // The cooked trace holds exactly the two callee frames: the context-0 frame was
+    // skipped, so no entry-module (`m`) item appears.
+    let callee_atom = callee.atom_table.lookup("callee").unwrap();
+    let boom_atom = callee.atom_table.lookup("boom").unwrap();
+    let frames = crate::terms::list_elements(machine.x(0).unwrap()).unwrap();
+    assert_eq!(
+        frames.len(),
+        2,
+        "the skipped context-0 snapshot frame contributes no item"
+    );
+    for frame in &frames {
+        assert_eq!(
+            crate::terms::tuple_element(*frame, 0).unwrap(),
+            make_atom(callee_atom),
+            "the frame's module must be the callee"
+        );
+        assert_eq!(
+            crate::terms::tuple_element(*frame, 1).unwrap(),
+            make_atom(boom_atom)
+        );
+        assert_eq!(
+            crate::terms::tuple_element(*frame, 2).unwrap(),
+            make_small(1)
+        );
+        assert_eq!(crate::terms::tuple_element(*frame, 3).unwrap(), NIL);
+    }
 }
