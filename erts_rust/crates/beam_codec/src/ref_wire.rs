@@ -148,11 +148,13 @@ mod tests {
     fn a_long_number_list_uses_the_first_three() {
         // A 4/5-number image contributes only its first three numbers
         // (`external.c:4821-4830`).
-        assert_eq!(ref_numbers_to_id(&[1, 2, 3, 0xDEAD_BEEF]), (3u64 << 32) | 2 | 1);
         assert_eq!(
             ref_numbers_to_id(&[1, 2, 3, 4, 5]),
             ref_numbers_to_id(&[1, 2, 3])
         );
+        assert_eq!(ref_numbers_to_id(&[1, 2, 3, 0xDEAD_BEEF]), 1 | (3u64 << 32));
+        // …and nothing from the ignored tail leaks into the id.
+        assert_eq!(ref_numbers_to_id(&[0, 0, 0, u32::MAX, u32::MAX]), 0);
     }
 
     #[test]

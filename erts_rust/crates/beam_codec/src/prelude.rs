@@ -27,7 +27,7 @@
 
 pub use crate::atom_cache::{AtomCache, AtomCacheWriter};
 pub use crate::compress::{compress, decompress};
-pub use crate::decode::{decode_term, Decoder};
+pub use crate::decode::{decode_term, decode_term_with_local_node, Decoder};
 pub use crate::encode::{
     encode_term, encode_term_body, encode_term_body_compressed, encode_term_compressed,
     encode_term_local, encode_term_with_minor_version, AtomEncoding, Encoder, FunIdentity,

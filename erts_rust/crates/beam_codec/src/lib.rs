@@ -63,7 +63,7 @@ pub mod writer;
 pub mod prelude;
 
 pub use crate::atom_cache::{AtomCache, AtomCacheWriter};
-pub use crate::decode::{decode_term, Decoder};
+pub use crate::decode::{decode_term, decode_term_with_local_node, Decoder};
 pub use crate::off_heap::OffHeapBinaries;
 pub use crate::encode::{
     encode_term, encode_term_body, encode_term_body_compressed, encode_term_compressed,
@@ -81,5 +81,6 @@ pub use crate::term::{
     fun_num_free_term, fun_old_index, fun_old_uniq, fun_true_arity_term, fun_uniq_bytes, FunKind,
     FunPid, FUN_DESC_WORDS_EXTERNAL, FUN_MAX_FIELD, MAX_ARG,
 };
+pub use crate::term::{internal_ref_id, make_internal_ref};
 pub use crate::writer::Writer;
 pub use beam_term::fun::{fun_desc_words, fun_kind_of_header, fun_true_arity, fun_words};
