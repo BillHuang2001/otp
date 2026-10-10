@@ -305,6 +305,17 @@ pub unsafe extern "C" fn enif_get_atom_length(
 
 /// `int enif_get_string(ErlNifEnv*, ERL_NIF_TERM list, char* buf, unsigned len, ErlNifCharEncoding);`
 ///
+/// Returns the number of bytes written **including the NUL** on success, a **negative** count (whose
+/// magnitude is the bytes written plus the NUL) when the value did not fit, and `0` when the list is
+/// not a valid character list.
+///
+/// The `Utf8` arm is a byte-faithful port of the oracle's two-stage path — `erts_unicode_list_to_buf`
+/// (`erts/emulator/beam/utils.c:2862-2942`) called from `enif_get_string`
+/// (`erts/emulator/beam/erl_nif.c:1639-1653`): the **byte** budget is `len - 1` (the NUL needs a slot)
+/// and the **character** budget is `len`, and a multibyte character that does not fully fit the byte
+/// budget is dropped *whole*. A truncated UTF-8 sequence is therefore never emitted, and the byte
+/// count never exceeds `len - 1`.
+///
 /// # Safety
 ///
 /// `env` must be a live env; `buf` must be null or point at `len` writable bytes.
@@ -355,41 +366,107 @@ pub unsafe extern "C" fn enif_get_string(
             (n + 1) as c_int
         }
         ErlNifCharEncoding::Utf8 => {
-            let mut codepoints: Vec<char> = Vec::new();
+            // Byte-faithful port of `erts_unicode_list_to_buf(list, buf, len - 1, len, &written)`
+            // (`utils.c:2862`) plus its caller's result mapping (`erl_nif.c:1639-1653`). The byte
+            // budget is `len - 1` (the terminating NUL needs its slot) and the character budget is
+            // `len`; a multibyte character that does not fit the byte budget is dropped **whole**,
+            // so a truncated UTF-8 sequence is never emitted.
+            let mut written = 0usize; // the C's `sz`: bytes of *complete* characters written
+            let mut chars_left = len; // the C's `len`: the character budget
+            let mut capacity = len - 1; // the C's `capacity`: the byte budget
             let mut cur = t(list);
-            while prelude::is_list(cur) {
+            // The C's `res`: `0` = the list ended cleanly, `-1` = type error, `-2` = out of budget.
+            let res = loop {
+                if prelude::is_nil(cur) {
+                    break 0;
+                }
+                if !prelude::is_list(cur) {
+                    break -1;
+                }
+                if chars_left == 0 {
+                    break -2;
+                }
+                chars_left -= 1;
                 // SAFETY: `cur` is a live cons cell.
-                let (head, tail) = unsafe { (prelude::car(cur), prelude::cdr(cur)) };
-                match decode_codepoint(head) {
-                    Some(ch) => codepoints.push(ch),
-                    None => {
-                        // SAFETY: `len >= 1`.
-                        unsafe { buf.write(0) };
-                        return 0;
+                let head = unsafe { prelude::car(cur) };
+                // The C's `is_not_small` — a float, atom, binary, or >60-bit integer is a type error.
+                if !prelude::is_small(head) {
+                    break -1;
+                }
+                // The C casts the signed small to an unsigned `Uint`, so a negative codepoint
+                // becomes a huge value that falls into the `>= 0x110000` type error below.
+                let val = prelude::signed_value(head) as u64;
+                let charlen = if val < 0x80 {
+                    1
+                } else if val < 0x800 {
+                    2
+                } else if val < 0x10000 {
+                    if (0xD800..=0xDFFF).contains(&val) {
+                        break -1; // an unpaired surrogate is a type error, not a budget error
+                    }
+                    3
+                } else if val < 0x110000 {
+                    4
+                } else {
+                    break -1;
+                };
+                if capacity < charlen {
+                    break -2; // the whole character is dropped — `written` stays put
+                }
+                capacity -= charlen;
+                // The C's UTF-8 encoder (`utils.c:2890-2931`), byte for byte.
+                let mut encoded = [0u8; 4];
+                match charlen {
+                    1 => encoded[0] = val as u8,
+                    2 => {
+                        encoded[0] = (0xC0 | (val >> 6)) as u8;
+                        encoded[1] = (0x80 | (val & 0x3F)) as u8;
+                    }
+                    3 => {
+                        encoded[0] = (0xE0 | (val >> 12)) as u8;
+                        encoded[1] = (0x80 | ((val >> 6) & 0x3F)) as u8;
+                        encoded[2] = (0x80 | (val & 0x3F)) as u8;
+                    }
+                    _ => {
+                        encoded[0] = (0xF0 | (val >> 18)) as u8;
+                        encoded[1] = (0x80 | ((val >> 12) & 0x3F)) as u8;
+                        encoded[2] = (0x80 | ((val >> 6) & 0x3F)) as u8;
+                        encoded[3] = (0x80 | (val & 0x3F)) as u8;
                     }
                 }
-                cur = tail;
-            }
-            if prelude::is_not_nil(cur) {
-                // SAFETY: `len >= 1`.
-                unsafe { buf.write(0) };
-                return 0;
-            }
-            let encoded: Vec<u8> = codepoints.iter().collect::<String>().into_bytes();
-            let mut n = 0usize;
-            for &byte in &encoded {
-                // SAFETY: `n < len` (the overflow branch returns first), so `buf[n]` is writable.
-                unsafe { buf.add(n).write(byte as c_char) };
-                n += 1;
-                if n >= len {
-                    // SAFETY: `n >= 1` and `n - 1 < len`.
-                    unsafe { buf.add(n - 1).write(0) };
-                    return -(n as c_int);
+                // SAFETY: the byte budget just reserved `charlen` bytes, so `written..written +
+                // charlen` lies inside the caller's `buf[..len]`.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        encoded.as_ptr().cast::<c_char>(),
+                        buf.add(written),
+                        charlen,
+                    );
+                }
+                written += charlen;
+                // SAFETY: `cur` is a live cons cell.
+                cur = unsafe { prelude::cdr(cur) };
+            };
+            match res {
+                // `retval == 0`: `buf[written] = '\0'; return (int)(written + 1);`
+                0 => {
+                    // SAFETY: `written <= len - 1` (the byte budget was `len - 1`).
+                    unsafe { buf.add(written).write(0) };
+                    (written + 1) as c_int
+                }
+                // `retval == -2`: `buf[written] = '\0'; return -(int)(written + 1);`
+                -2 => {
+                    // SAFETY: `written <= len - 1` (the byte budget was `len - 1`).
+                    unsafe { buf.add(written).write(0) };
+                    -((written + 1) as c_int)
+                }
+                // `retval == -1`: `buf[0] = '\0'; return 0;` (any prior bytes are discarded).
+                _ => {
+                    // SAFETY: `len >= 1` (checked on entry), so `buf[0]` is inside the buffer.
+                    unsafe { buf.write(0) };
+                    0
                 }
             }
-            // SAFETY: `n < len` here (the loop returns as soon as `n >= len`).
-            unsafe { buf.add(n).write(0) };
-            (n + 1) as c_int
         }
     }
 }

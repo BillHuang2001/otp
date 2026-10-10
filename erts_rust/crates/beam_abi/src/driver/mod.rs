@@ -34,12 +34,17 @@
 //!   `driver_api_table()` they are published through.
 //! - [`loader`] — the dynamic driver loader: `dlopen`/`dlsym`, the `ErlDrvEntry` load contract,
 //!   and `DriverLibrary`.
+//! - [`async_job`] — the safe async-job runner ([`AsyncJob`]): the one `unsafe` constructor for a
+//!   `driver_async` job plus safe invoke/release, so a host need not write `unsafe` to drive a
+//!   driver's `async_invoke`/`async_free` callbacks.
 
 pub mod api;
+pub mod async_job;
 pub mod current_host;
 pub mod drv;
 pub mod host;
 pub mod loader;
 pub mod types;
 
+pub use async_job::{AsyncCallback, AsyncJob};
 pub use current_host::with_current_host;

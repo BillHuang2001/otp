@@ -473,9 +473,29 @@ writers over the host's `beam_alloc::Heap`, atoms through `NifHost::intern_atom`
   (`enif_alloc_binary`/`enif_realloc_binary`/`enif_release_binary`/`enif_make_new_binary`/
   `enif_make_binary`/`enif_make_sub_binary`/`enif_inspect_binary`/`enif_inspect_iolist_as_binary`);
   the ETF pair `enif_term_to_binary`/`enif_binary_to_term` through `NifHost` (each answers the C's
-  failure `0` when the host hook is absent).
+  failure `0` when the host hook is absent). The binary I/O shapes are **oracle-exact** (C
+  `erl_nif.c` → `erts_inspect_iolist_as_binary` / `erts_copy_bits_fwd` / `erts_build_sub_bitstring`):
+  - `enif_inspect_iolist_as_binary` accepts a byte **integer only in head (CAR) position**, a proper
+    list, a byte-sized binary/bitstring, and the empty list — `[]`/`nil` **succeeds** with `size = 0`
+    and a **non-NULL dummy** `data` pointer (`(unsigned char*)&bin->data`, C `erl_nif.c:1400`).
+    A bare integer argument, a **non-nil non-list tail** (`[1|2]`), a non-byte integer (`256`, `-1`)
+    and a non-byte-sized bitstring (`<<1:7>>`) are all type **failures → `0`** (fields left at
+    `size = 0`, `data = -1`).
+  - `enif_inspect_binary` accepts a **bit-offset, byte-sized** bitstring (`TAIL_BITS(size) == 0` ⇒
+    always `1`): a non-byte-aligned start is copied out via a private `copy_bits_fwd`, and that copy
+    buffer is handed back **owned** (null `__spare__[0]`, released once by `enif_release_binary`);
+    the zero-byte dummy of an unaligned view is zeroed.
+  - `enif_make_sub_binary` windows **any bitstring by bits** — the result's bit offset is
+    `source_bit_offset + pos*8` and it spans `size` bits: `size == 0` ⇒ `<<>>` for any `pos`; at most
+    `ERL_ONHEAP_BITS_LIMIT` (512) bits copies into an `ErlHeapBits`, above it becomes an `ErlSubBits`
+    window. `badarg` only for a non-bitstring source or a `pos*8 + size*8 > source_bit_size` request
+    with `size > 0` (checked with `checked_mul`).
 - **`get`** — `enif_get_int/uint/long/ulong/double/list_cell/tuple/list_length/string/
-  string_length/atom/atom_length`.
+  string_length/atom/atom_length`. The `ERL_NIF_UTF8` arm of `enif_get_string` is **byte-faithful**
+  to `erts_unicode_list_to_buf` (`utils.c:2862-2942`): byte budget `len-1`, char budget `len`, and a
+  multibyte char that does not fully fit is dropped **whole** — `buf[written] = '\0'` and a **negative
+  `-(written+1)`**, or `buf[0] = '\0'` and `0` when nothing fit. `enif_get_string_length` already
+  agrees (its UTF8 length counts the encoded bytes).
 - **`make`** — `enif_make_int/uint/long/ulong/double/atom(_len)/new_atom(_len)/existing_atom(_len)/
   string(_len)/list_cell/reverse_list/ref/tuple_from_array/list_from_array`. The four make-atom
   entry points **record** each interned atom on the env; `enif_make_existing_atom(_len)` consults
@@ -589,14 +609,22 @@ Every one is `#[no_mangle] pub unsafe extern "C"` with the exact signature of it
   `driver_deq`/`driver_sizeq`, `driver_enq_bin`/`driver_pushq_bin`, `driver_peekq`/`driver_peekqv`,
   `driver_enqv`/`driver_pushqv`), delegating to the `DriverHost` queue hooks. The return codes were
   measured on the oracle (e.g. `driver_deq` returns the **remaining** count, `(ErlDrvSizeT)-1` when
-  over-dequeued).
+  over-dequeued). `driver_sizeq`'s `NOT_A_SIZE` sentinel **is** `(ErlDrvSizeT)-1`
+  (`ErlDrvSizeT::MAX`, `queues.rs`), and the C only ever returns it for a `NULL` queue — so an empty
+  allocated queue must make the **host** answer `0` (the C's value; a fresh port's hook must not
+  leave `sizeq` at the default `-1`). Owner of that half: `beam_rt`/`beam_io`.
 - **`threads`** — the 33 `erl_drv_*` thread/synchronisation slots, a self-contained cast-and-forward
   facade over `crate::sync` (no `ErlDrvPort`, hence no `DriverHost` hook: a mutex/cond/rwlock/tid/tsd
   key is an object the runtime owns outright).
 - **`pdl`** — the port data lock (`driver_pdl_create`/`lock`/`unlock`/`get_refc`/`inc_refc`/
   `dec_refc` over a real mutex+atomic refcount in a process-wide registry), the driver monitors
   (`driver_monitor_process`/`demonitor_process`/`get_monitored_process`/`compare_monitors`), and the
-  deprecated `driver_get_now`.
+  deprecated `driver_get_now`. `driver_compare_monitors` is **host-free and complete** (a 24-byte
+  `memcmp` = `ERTS_REF_THING_SIZE(3)*8`, C `io.c:7142-7146`); the five refc slots never touch the
+  host (crate-owned `PdlState`); only `driver_pdl_create` delegates — and the host must return a
+  **per-port-stable** handle (C `pp->port_data_lock`; a second create on the same port ⇒ `NULL`).
+  The monitor trio's missing half is the `DriverHost` hooks (registration, liveness, the per-port
+  monitor tree, firing `process_exit`) — owner `beam_rt`/`beam_io`, no `beam_abi` change.
 - **`lifecycle`** — the failure/exit family (`driver_failure_eof`/`_atom`/`_posix`/`driver_failure`/
   `driver_exit` collapsing onto `DriverHost::failure`/`port_exit`), the attributes (`set_busy_port`/
   `set_port_control_flags`/`get_port_flags`, round-tripping through the seam), `erl_drv_busy_msgq_limits`,
@@ -605,6 +633,29 @@ Every one is `#[no_mangle] pub unsafe extern "C"` with the exact signature of it
   forward to whatever host `with_current_host` published, else `-1`/`0`), `driver_lock_driver` and
   `driver_create_port` (recover the host through the shared `env_for` port helper). Ground truth
   `io.c:7640`/`7698`/`7324`/`786`.
+
+### The safe async-job runner (`src/driver/async_job.rs`)
+`driver_async`'s last three operands (`async_invoke`, `async_data`, `async_free`,
+`erl_driver.h:605-607`) **are** a C async job. The driver-facing half already existed
+(`driver_async` → `DriverHost::r#async`); the **host** half was the gap: `invoke`/`free`/`data` arrive
+as raw C pointers, so a runtime that forbids `unsafe` (the sibling `beam_rt` is `#![deny(unsafe_code)]`)
+could receive a job but never *run* it. `AsyncJob` closes that gap **without changing any frozen ABI**:
+- `pub type AsyncCallback = unsafe extern "C" fn(*mut c_void)`.
+- `pub struct AsyncJob` — the single `unsafe` entry point
+  `AsyncJob::new(invoke: Option<AsyncCallback>, free: Option<AsyncCallback>, data: *mut c_void) ->
+  Option<AsyncJob>` (its `# Safety` section is the caller's promise that the three operands are a
+  live C async job; `None` when `async_invoke` is `NULL`, i.e. nothing to run and the caller still
+  owns the data). Everything after it is **safe**: `invoke(&self) -> *mut c_void` runs
+  `(*async_invoke)(async_data)` and returns the data for `ready_async`; `finish(self)` runs
+  `(*async_free)(async_data)` **exactly once** (the handle is consumed); `data()`/`has_invoke()`/
+  `has_free()` inspect the operands without dereferencing them; `Drop` frees a still-held job
+  **without** invoking it; `Debug` never touches the pointers.
+- **Inert by default.** `DriverHost::r#async`, its signature and its `-1` default are **unchanged** —
+  a host with no async pool keeps answering `-1`, so no existing implementor changes behaviour. A host
+  opts in by constructing a job and running it (the C's `+A 0` inline path is the worked example in
+  the module docs). Re-exported at the crate root as `beam_abi::{AsyncJob, AsyncCallback}`.
+- Owner of the *adoption* half (`beam_rt`): implement `DriverHost::r#async`, poll/drain `ready_async`,
+  keep the driver object mapped while a job is outstanding, and implement `driver_async_port_key`.
 
 ### Dynamic loader (`src/driver/loader.rs`)
 `load(path, name) -> Result<DriverLibrary, DriverLoadError>` does `dlopen(path+".so", RTLD_NOW |
@@ -698,9 +749,21 @@ Failure variants and their reason atoms (`erl_bif_ddll.c:1709-1720`): `NoDriverI
   table: identical terms take a raw-word fast path and distinct **atoms** fall back to `beam_term`'s
   index order (exact for non-atom keys, the common NIF case).
 - Integers: small ints + one-limb bignums; a wider value makes the accessor return `0` rather than
-  truncate. `enif_make_binary` builds an **on-heap** binary (off-heap refc binaries are not exposed by
-  the seam). `enif_inspect_binary` refuses a *bit*-offset base instead of fabricating an unaligned
-  pointer.
+  truncate. `enif_alloc_binary`/`enif_make_new_binary`/`enif_make_binary` build an **on-heap** binary
+  even above the C's `ERL_ONHEAP_BITS_LIMIT` (512 bits / 64 bytes), where the oracle switches to an
+  off-heap refc binary — observable via `erts_debug:flat_size` (8 for the oracle's 65-byte binary vs
+  11 here). Both are valid binaries of the same size/bytes; only the *representation* (and hence the
+  flat-size figure) differs, because the frozen `enif_*` seam exposes no off-heap refc binary.
+- **`beam_rt`/`beam_io`-owned halves of the A.4 driver surface** (no `beam_abi` change — the operand
+  handling and return-code mapping here are oracle-exact): `driver_monitor_process`/
+  `driver_demonitor_process`/`driver_get_monitored_process` need the `DriverHost` hooks
+  (registration, liveness, the per-port monitor tree, firing `process_exit`);
+  `driver_pdl_create` needs a **per-port-stable** host handle (a second create on the same port ⇒
+  `NULL`); `driver_sizeq` must make the host answer `0` on an empty-but-allocated queue (see the
+  `queues` bullet); `driver_async` needs the host to run the `AsyncJob` (see the async-job section);
+  and the A.4 differential corpus exercises `beam_rt`'s `DriverPort` host
+  (`beam_rt/src/port/driver.rs`), not `beam_io`'s `AbiHost`, so those fixes must land in `beam_rt`
+  (or `beam_rt` must adopt `beam_io`'s host).
 - Malformed-term guard: a bare `THE_NON_VALUE` / `HEADER`-tagged word is rejected at the
   term-inspecting entry points (the C would deref it); a *forged* pointer-tagged word is still
   undetectable from the word alone, exactly as in the C.
@@ -721,11 +784,12 @@ Failure variants and their reason atoms (`erl_bif_ddll.c:1709-1720`): `NoDriverI
 - `src/driver/api.rs` → `ErlDrvApi` (111-entry `driver_*`/`erl_drv_*` function table) + `ErlDrvApi::empty()`
 - `src/driver/host.rs` → the driver host seam: `DriverHost` (heap/atoms/output/send_term + the defaulted service hooks, incl. the driver-registry hooks `add_driver_entry`/`remove_driver_entry`/`lock_driver`/`create_port`) + `DriverEnv` (per-port env behind `*mut ErlDrvPort_`, `as_port`/`from_port`) + `decode_term_spec` (the reverse-Polish term-data decoder) + the `with_current_host` re-export
 - `src/driver/current_host.rs` → the thread-local **current-driver-host** publication: `with_current_host(host, f)` (scoped, restores the previous host on exit, nesting-safe) plus the `pub(crate)` reader the two port-free entry-list slots use
+- `src/driver/async_job.rs` → the **safe async-job runner** (`AsyncJob`/`AsyncCallback`, re-exported at the crate root): the single `unsafe` `new` constructor plus the safe `invoke`/`finish`/`data`/`has_invoke`/`has_free`; `Drop` frees a held job without invoking it, `Debug` never dereferences
 - `src/driver/drv/` → **one file per driver family** (`mem`, `port`, `queues`, `threads`, `pdl`, `lifecycle`, `registry`), each owning its `pub(super) const fn populate`; `mod.rs` holds the module docs, the shared `env_for` helper, the `#[used] static DRIVER_API` table + `driver_api_table()`, the `driver_term_nil` data symbol and `binary_payload`; `port_tests.rs` is the path-included child of `port`
 - `src/driver/loader.rs` → the dynamic driver loader: `DriverLibrary`, `DriverLoadError`/`DriverCallError`, `load()` (dlopen/dlsym `driver_init` + oracle-order `ErlDrvEntry` validation), the per-callback wrappers, `Drop` (finish + dlclose)
 - `src/layout.rs` → the compile-time layout freeze (all `const _: () = assert!(...)` for the table above)
 - `tests/common/mod.rs` → shared test helpers (NOT a test target: a subdirectory module pulled in with `mod common;`): `erl_include_dir`, `cc_available`, `compile_so`, `skip`, `TestHost`, `TestDriverHost`
-- `tests/` → crate-level integration tests (`layout.rs`, `term_abi.rs`, `api_surface.rs`, `abi_conformance.rs`, `entry.rs`, `host_seam.rs`, `enif.rs`, `loader.rs`, `nif_end_to_end.rs`, `nif_process.rs`, `nif_resource.rs`, `nif_env.rs`, `nif_ioq.rs`, `nif_mapiter.rs`, `nif_threads.rs`, `nif_variadic.rs`, `nif_atom_env.rs`, `driver_end_to_end.rs`, `driver_loader.rs`, `driver_binary_refc.rs`, `driver_lifecycle.rs`, `driver_queues.rs`, `driver_pdl.rs`, `driver_threads.rs`) + `tests/fixtures/*.c` (real C NIFs/drivers), all compiled at test time with the system `cc` against the system OTP headers
+- `tests/` → crate-level integration tests (`layout.rs`, `term_abi.rs`, `api_surface.rs`, `abi_conformance.rs`, `entry.rs`, `host_seam.rs`, `enif.rs`, `loader.rs`, `nif_end_to_end.rs`, `nif_process.rs`, `nif_resource.rs`, `nif_env.rs`, `nif_ioq.rs`, `nif_mapiter.rs`, `nif_threads.rs`, `nif_variadic.rs`, `nif_atom_env.rs`, `nif_get_string.rs`, `nif_bitslice.rs`, `nif_subbin.rs`, `driver_end_to_end.rs`, `driver_loader.rs`, `driver_binary_refc.rs`, `driver_lifecycle.rs`, `driver_queues.rs`, `driver_pdl.rs`, `driver_threads.rs`, `driver_async_job.rs`) + `tests/fixtures/*.c` (real C NIFs/drivers, incl. `nif_iolist.c` for the iolist/binary-shape oracle cross-check and `nif_get_string_utf8.c` for the `ERL_NIF_UTF8` truncation), all compiled at test time with the system `cc` against the system OTP headers
 
 ## Notes for Agents
 - **Read the legacy headers before touching a layout**: `../../erts/emulator/beam/erl_nif.h`,
