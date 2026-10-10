@@ -389,8 +389,9 @@ The reply tag is **paired** with the request tag, never echoed: `{io_request, �
   `io:request/2` loads the `io` module body, `net_kernel:dflag_unicode_io/1` is served (the
   `RuntimeHooks` bridge) and the service answers with the tag **paired** to the request, so
   `file:read/2`, `io:scan_erl_exprs/4`, `io:parse_erl_exprs/4` and `file:read_line/1` all complete
-  and agree with the oracle (`../tests/io_scan.rs`; `file:read_line/1` additionally through the
-  `{get_line,…}` arm above).
+  and agree with the oracle — the first three in `../tests/io_scan.rs`, `file:read_line/1` through
+  the `{get_line,…}` arm above, cross-checked by
+  [`file_server/get_line/tests.rs`](file_server/get_line/tests.rs)'s `the_replies_match_the_live_oracle`.
 
 ## Constraints
 - **`#![deny(unsafe_code)]`** — the crate-wide rule covers this whole floor. Terms are built and
