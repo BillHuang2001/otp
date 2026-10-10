@@ -132,7 +132,6 @@ pub const SUPPORTED_KEYS: &[&str] = &[
     "halt_flush_timeout",
     "creation",
     // The emulator's own build/implementation flags (see [`system`]).
-    "build_type",
     "compat_rel",
     "endian",
     "eager_check_io",
@@ -210,6 +209,12 @@ pub const SUPPORTED_KEYS: &[&str] = &[
 /// reporting an oracle number for a facility that does not exist would be a lie about a
 /// different emulator.
 pub const UNSUPPORTED_KEYS: &[&str] = &[
+    // The emulator's own build tag. It shares the C arm with `emu_type`
+    // (`erl_bif_info.c:2800`, `am_build_type || am_emu_type`), but this runtime's own build
+    // tier (`debug` in a dev build, `opt` in a release build) is **not** the oracle's
+    // release tag (`opt`), so answering it would be an own-state divergence — the honest
+    // typed gap instead.
+    "build_type",
     // The host C allocator identification (`{glibc, …}`) — no C allocator to identify.
     "allocator",
     // The time-correction service and its clocks.
@@ -775,7 +780,7 @@ mod tests {
         }
         // The surface is the union of the family modules; keep the count pinned so a key
         // dropped from a family is caught.
-        assert_eq!(SUPPORTED_KEYS.len(), 88);
+        assert_eq!(SUPPORTED_KEYS.len(), 87);
         let mut sorted: Vec<&str> = SUPPORTED_KEYS.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
@@ -800,7 +805,7 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), UNSUPPORTED_KEYS.len(), "no duplicate keys");
-        assert_eq!(sorted.len(), 27);
+        assert_eq!(sorted.len(), 28);
     }
 
     #[test]

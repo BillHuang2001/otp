@@ -204,6 +204,39 @@ wait_forever()-> receive X -> X after infinity -> timeout end.
 Any byte change in a fixture invalidates the expected values in the tests that load it;
 re-derive them from the system `erl`, do **not** guess.
 
+## GC fixtures (`gc_loop` · `gc_ints` · `gc_floats` · `heap_growth`, committed)
+
+These four are committed oracle fixtures for the process-heap collector
+(`tests/gc_collect.rs` and `tests/heap_growth.rs`):
+
+* `gc_loop.beam` — `loop/1` tail-recursively conses every iteration (`build/1`), so a
+  scheduled process really allocates; the acceptance evidence that the collector runs at the
+  engine's heap-admission point.
+* `gc_ints.beam` — `l1/1` accumulates `+`/`rem` on small integers only: it allocates nothing,
+  pinning that a non-allocating loop's young heap never moves.
+* `gc_floats.beam` — `l1/1` accumulates `sqrt/1` in one IEEE-754 double: a module with a
+  float-family instruction is never collected over (a live float register is outside the root
+  set), and its result must stay exact.
+* `heap_growth.beam` — `sprawl/1` builds a 400-element tuple of a *runtime* value in one block
+  (the compiler emits a single `test_heap 1 401`, far above the 233-word fresh nursery) and
+  `run/1` repeats it, discarding each tuple, so a runtime that cannot grow the nursery must
+  fall back to the pointer-stable arena on every iteration. Pins the growable-heap seam
+  (`Process::ensure_capacity` behind `ensure_heap`).
+
+All four are path-free (`+deterministic`) and regenerate with the same scratch-dir recipe:
+
+```sh
+for f in gc_loop gc_ints gc_floats heap_growth; do
+    SCRATCH="$TMPDIR/beam_rt_${f}_fix"
+    rm -rf "$SCRATCH"; mkdir -p "$SCRATCH/gen"
+    cp "$f.erl" "$SCRATCH/gen/"
+    ( cd "$SCRATCH/gen" && erlc +deterministic "$f.erl" )
+    cp "$SCRATCH/gen/$f.beam" "$f.beam"
+done
+```
+
+Each rebuilt `.beam` must be **force-added** (`git add -f gc_loop.beam`), like the images above.
+
 ## Oracle values (verified against `erl -noshell`)
 
 | export | oracle expression | value |

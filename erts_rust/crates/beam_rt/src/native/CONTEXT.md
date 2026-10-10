@@ -27,14 +27,14 @@ per-function bodies. Files:
 | Module | Serves |
 |---|---|
 | `../native.rs` (parent) | module docs, `try_native`, the shared helpers (`atom`/`atom_name`/`charlist`/`render`/`string_list`/`write_output`/`chars_to_string`), the `erlang` core (`halt/0,1`, `display/1`, `io:put_chars/1,2`, `apply/2,3`, `system_info/1`, `send_after/3`, `cancel_timer/1`, `os:cmd/1`), the binary-surface and scheduler-model test modules |
-| `init.rs` | `init:get_argument/1` — a command-line flag from `RuntimeConfig::init_args`, plus the three **automatic** flags the emulator defines itself (`root` = the code root dir, `home` = `$HOME`, `progname` = the basename this runtime was invoked as — a deliberate, invocation-dependent divergence from the oracle's `erl`) — `get_arguments/0`, `get_plain_arguments/0`, `get_status/0` |
-| `code.rs` | `code:get_path/0`, `all_loaded/0`, `which/1`, `is_loaded/1`, `is_sticky/1,2`, `ensure_loaded/1`, `lib_dir/0,1`, `root_dir/0`, `get_mode/0` (the code server's `interactive`/`embedded` mode, from the `-mode` init argument per `code.erl:1741-1765`) |
+| `init.rs` | `init:get_argument/1` — a command-line flag from `RuntimeConfig::init_args`, plus the four **automatic** flags the emulator defines itself (`root` = the code root dir, `home` = `$HOME`, `progname` = `$PROGNAME` else the compile-time `"erl"`, `bindir` = `<root>/erts-<vsn>/bin` from `CodeServer::bindir()`), `init:script_id/0` (the loaded boot script's `{Name,Vsn}`, or the typed gap when none is loaded) — `get_arguments/0`, `get_plain_arguments/0`, `get_status/0` |
+| `code.rs` | `code:get_path/0`, `all_loaded/0`, `which/1`, `is_loaded/1`, `is_sticky/1,2`, `ensure_loaded/1`, `lib_dir/0,1,2`, `root_dir/0`, `get_mode/0` (the code server's `interactive`/`embedded` mode, from the `-mode` init argument per `code.erl:1741-1765`) |
 | `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) | `erlang:make_ref/0`, `spawn/1,2,3`, `spawn_link/1,2,3`, `spawn_opt/2,3,4` (incl. the heap-size options → `beam_gc::HeapPolicy`), `spawn_monitor/1,2,3,4`, `ports/0`, `processes/0`, `pre_loaded/0`, `group_leader/0`, `whereis/1`, `register/2`, `unregister/1`, `module_loaded/1`; the monitor family (`monitor/2,3`, `demonitor/1,2`) in `process/monitor.rs`, `exit/2,3` in `process/exit.rs` |
 | `node.rs` | `erlang:is_alive/0`, `get_cookie/0`, `set_cookie/2`, `nodes/0,1` |
 | `memory/` | `erlang:process_info/1,2` — the full per-process introspection surface (see below) |
 | `group_leader.rs` | `erlang:group_leader/2` + `erts_internal:group_leader/2,3` over `Runtime::group_leaders` (per-process, default the root pid; see below) |
 | `port.rs` | `erlang:port_command/2,3`, **`erlang:port_control/3`** (the driver's `control` callback, with the oracle's list-vs-binary reply rule) and the closed-port half of `erlang:port_info/1,2` (the `PortHook` seam cannot express those) |
-| `application.rs` | `application:get_env/1,2,3`, `get_all_env/1`, `get_key/2`, `get_application/0` (always `undefined` — there is no application controller and no owning application), `loaded_applications/0`, `which_applications/0` over a minimal native `.app` view |
+| `application.rs` | `application:get_env/1,2,3`, `get_all_env/1`, `get_all_key/1`, `get_key/1,2`, `get_application/0,1`, `loaded_applications/0`, `which_applications/0` over a minimal native `.app` view; `/0` is always `undefined` and `/1` maps a module to its loaded application (see below) |
 | `erts_internal.rs` | the `erts_internal` floor (`erts_internal_call`; the dispatch table is the source of truth) **plus the two `erlang:garbage_collect/0,1` bodies it hosts** — see below |
 | `erts_internal/trace.rs` | the `erts_internal:trace/3` + `:trace_pattern/3` handler bodies (`erlang:trace/2,3` and `erlang:trace_pattern/2,3` call them) + their private pattern/target helpers, over `crate::trace` — see below |
 | `prim.rs` | the `prim_file` floor (27 entries) — see below |
@@ -44,7 +44,7 @@ per-function bodies. Files:
 | `file_server/get_line.rs` | the `{get_line, Enc, _Prompt}` io-device request (`get_line::serve` + the `LineContinuation`) + tests in `file_server/get_line/tests.rs` (see below) |
 | `test_support.rs` | the shared test fixtures (`runtime`/`system_runtime`/`call`/`atom`/`chars`/`string_of`) |
 
-**`init:get_arguments/0` lists ONLY the command-line flags**, so it differs from the oracle by exactly its four automatic `root`/`bindir`/`progname`/`home` entries — which is why a `RuntimeConfig::default()` runtime (an empty `init_args`, so the listing is `[]`) stops the real boot script earlier, at instruction 16 (`application:load/1`, an `error function_clause`); the CLI-equivalent configuration runs the whole script to `{progress,started}` — the boot-chain consequence is in [`../boot/CONTEXT.md`](../boot/CONTEXT.md).
+**`init:get_argument/1` serves the four automatic flags** (`root`, `home`, `progname`, `bindir`), so it is *not* the boot determinant it once was — the real boot script runs to `{progress,started}` under both the CLI-equivalent configuration and a `RuntimeConfig`-default runtime. **`init:get_arguments/0` still lists ONLY the command-line flags**, so it differs from the oracle by exactly those four automatic entries (which are not command-line flags) — the boot-chain consequence is in [`../boot/CONTEXT.md`](../boot/CONTEXT.md).
 
 **The process-control families route through the sibling `beam_process` machinery.** `monitor/2,3` and `demonitor/1,2` use `ProcessTable::{monitor, monitor_named, demonitor, demonitor_flush}`: `[flush]` removes a queued `'DOWN'` from the caller's mailbox and `[info]` answers the **real** "was a monitor on record and got removed" boolean (a second `demonitor(Ref, [info])` is `false`; the reference stays on record so it is never `badarg`). `exit/2,3` signals another process through `ProcessTable::send_exit`, but a **self**-directed exit is raised directly (non-trapping caller, or the untrappable `kill`) or delivered as `{'EXIT', self(), R}` via `RuntimeContext::deliver_message` (trapping caller and `Reason != kill`) — because the sibling scheduler defers a self-directed signal that arrives while the pid is `Running`, which it is inside a slice. `exit/3` accepts ONLY the bare atom `priority` as an option (`[{priority, high}]` is `badarg`). `is_alive/0`/`get_cookie/0`/`set_cookie/2`/`nodes/0,1` read the runtime's `DistNode`/cookie/local-node state (`../runtime.rs`; `get_cookie/0` is the atom `nocookie` while the node is not alive, and `set_cookie/2` RAISES `badarg`/`distribution_not_started`, matching the oracle). `spawn_opt` parses and validates EVERY option **before** the child is allocated, then builds the child's `HeapPolicy` with `beam_gc::HeapPolicy::from_spawn_opts` and applies it via the policy-aware `Runtime::spawn_*_with_policy`.
 
@@ -436,7 +436,10 @@ The reply tag is **paired** with the request tag, never echoed: `{io_request, �
 - Test fixtures that need a real `.beam` or the system Erlang skip **loudly**
   (`system_runtime()` / the file-local `lists_beam()`); the arithmetic/`term_type` suites need none.
 - Cross-crate integration (CLI/exit codes, the preloaded `boot/*` corpus, `-eval`) is pinned by the
-  `../tests/` suites, not here.
+  `../tests/` suites, not here. This node's A.9 native-floor surface — `application:get_all_key/1`,
+  `get_key/1,2`, `get_application/0,1`; `init:get_argument/1`'s automatic flags; `init:script_id/0`;
+  `code:lib_dir/2`; the `filelib` existence probes — is pinned end to end, against the live oracle,
+  by `../tests/a9_native_floor.rs`.
 
 ## Routing Table
 - `../native.rs` → the dispatch table + the `erlang`-core items and shared helpers (read for the
@@ -466,7 +469,7 @@ The reply tag is **paired** with the request tag, never echoed: `{io_request, �
 - `file_server/get_until.rs` → the `{get_until, …}` io-device request (`get_until::serve` + the
   engine-backed `EngineContinuation` implementing `beam_io::io_device::Continuation`) + its unit
   tests in `file_server/get_until/tests.rs`
-- `init.rs` / `code.rs` / `application.rs` → the preloaded-module surfaces (contract A.7) — the `init` automatic flags (`root`/`home`/`progname`), the code server's `get_mode/0` and `application:get_application/0` included
+- `init.rs` / `code.rs` / `application.rs` → the preloaded-module surfaces (contract A.7) — the `init` automatic flags (`root`/`home`/`progname`/`bindir`) + `init:script_id/0`, the code server's `get_mode/0` and `lib_dir/2`, and the `application` config view (`get_key/1,2`, `get_all_key/1`, `get_application/0,1`)
 - `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) / `port.rs` → the process/spawn (incl. `spawn_monitor`) and registry/reference surfaces, the monitor/demonitor and exit-signalling surfaces, and the port surface (`port_command/2,3`, `port_control/3` and the closed-port/`registered_name` halves of `port_info/1,2`) (contracts A.4/A.7/A.8/A.9)
 - `node.rs` → the node/cookie surface (`is_alive/0`, `get_cookie/0`, `set_cookie/2`, `nodes/0,1`) + its unit tests
 - `test_support.rs` → the shared fixtures
@@ -620,15 +623,20 @@ A non-self target lowers to `erlang:F(Node,...)`, whose `erlang.erl` clause call
 ### Recorded gaps and fabricated values
 - **`last_calls` ⇒ `false` is a real divergence** — `Process::save_calls()` holds a real flag (`memory/mod.rs:803`).
 - `application.rs:388-409` `app_env_props` reads the `.app` resource's `env` list verbatim, so kernel's start-time `logger`/`connect_all` injections are absent ⇒ `application:get_env(kernel,connect_all)` is `undefined` here vs `{ok,true}` on the oracle.
-- `init:get_argument(bindir)` (`init.rs:89`) real value unused (falls through to `error`; the doc at `:140` records it).
+- `init:get_argument(progname)` follows the C rule — `$PROGNAME` when set, else the compile-time `"erl"` (`erlexec.c:1702-1705`); the oracle's `"erl"` comes from the same compile-time default (its launcher sets `PROGNAME` only for a renamed binary), so the two agree.
+- `init:script_id/0` is the **loaded** boot script's `{Name,Vsn}`; on the default `-eval`/`run` path no script is loaded, so it is the precise typed gap `unsupported: init:script_id/0 (no boot script has been loaded)` — never a fabricated version.
+- `erlang:module_loaded/1` answers this runtime's **own** loaded set: the boot set is smaller than the oracle's (an app outside the preloaded `primLoad` batches is not yet loaded here), a documented divergence pinned by `../tests/module_loaded.rs`.
+- `code:is_loaded/1` and `code:which/1` report **path resolvability**, not the code server's load state — the deliberate divergence that keeps the `boot/code_is_loaded_*` corpus cases agreeing; never "fix" it.
+- `file_server.rs` serves `read_file_info/1`/`read_link_info/1`'s **stat failure** path only (an absent path is the oracle's `{error,enoent}`, so `filelib:is_dir/1` &c. answer `false`); a *successful* stat is the typed gap `file_server: the #file_info{} `access` slot needs access(2), which no safe std API exposes`.
+- `application:get_application/1` on a non-atom that is not a pid leaves the function with no clause (`function_clause`, the oracle's own shape); the oracle's extra `is_pid/1` clause answers `undefined` for a pid — a documented divergence, since this runtime runs no application-owned process.
 - `file_server.rs` does not serve `{write_file,Name,Data}` (`:338-352`, its served server request surface) though `prim_file:write_file/2` IS implemented (`prim.rs:188`).
 - `context/process_bridge.rs:323-331` `process_flag(error_handler, A)` accepts an atom where the oracle raises `badarg` (owner `context/`).
 All other constants are truthful defaults or derive from real state (`application.rs:98`/`:194-196`, `code.rs:49`/`:183-185`, `init.rs:127-175`, `port.rs:148-154`/`:282-301`).
 
 ## Handoffs (owned by OTHER nodes)
-The per-call dispatch arm for every native BIF is a registration in `../native.rs` (one level up, outside *this* node's scope); its `("code","get_mode",0)` and `("application","get_application",0)` arms are reachable and agree with the oracle (`interactive` / `undefined`), though its module-doc table still omits both names.
+The per-call dispatch arm for every native BIF is a registration in `../native.rs` (one level up, outside *this* node's scope); its `("code","get_mode",0)` arm is reachable and agrees with the oracle (`interactive`), though its module-doc table still omits it.
 `init:get_argument(root)` and `init:get_argument(home)` agree with the oracle through the same `init:get_argument/1` arm.
-`init:get_argument(progname)` is a deliberate, invocation-dependent gap: both runtimes report the basename **they** were invoked as (the oracle's `"erl"` comes from the `erl` shell script's `$0`), so the value is a property of the harness's invocation, not one this runtime may fabricate — never a wrong result.
+`init:get_argument(progname)` is the C rule (`$PROGNAME` else the compile-time `"erl"`), so it agrees with the oracle for a normal invocation; `init:get_argument(bindir)` is `<root>/erts-<vsn>/bin` of the installation the runtime resolved (`$ERTS_STDLIB_DIR`, else the filesystem probe), which is the oracle's own emulator directory whenever both run against the same installation.
 The `file_server_2` service's remaining cross-node gap — a scheduled `gen_server:call` to the service (**`beam_engine`**) — is itemised in the `file_server.rs` subsection above.
 
 ## See Also

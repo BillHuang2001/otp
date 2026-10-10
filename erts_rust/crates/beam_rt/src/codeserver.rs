@@ -234,6 +234,35 @@ impl CodeServer {
         candidates.into_iter().next()
     }
 
+    /// The emulator's `bin` directory — the `bindir` of `erlexec.c` (`:1541-1543`).
+    ///
+    /// `erlexec.c` composes it as `<rootdir>/erts-<vsn>/bin`, the directory holding the
+    /// emulator executables (`beam.smp`, `erlexec`, …). It is derived here from the same
+    /// installation resolution the code path uses: the resolved root's sibling `<erts-*>`
+    /// directories are searched for the one that really holds the emulator (`beam.smp`),
+    /// and the honest `None` is returned when there is no such directory — a directory is
+    /// never fabricated.
+    ///
+    /// `None` until the system directories have been added (so [`CodeServer::lib_root`] can
+    /// resolve the root), and for a runtime whose installation keeps no emulator under the
+    /// root.
+    pub fn bindir(&self) -> Option<PathBuf> {
+        let root = self.lib_root()?.parent()?.to_path_buf();
+        let mut candidates: Vec<PathBuf> = std::fs::read_dir(&root)
+            .ok()?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("erts-"))
+                    && path.join("bin").join("beam.smp").is_file()
+            })
+            .collect();
+        candidates.sort();
+        candidates.into_iter().next().map(|erts| erts.join("bin"))
+    }
+
     /// Whether `name` has been loaded (and cached) already.
     pub fn is_loaded(&self, name: &str) -> bool {
         self.modules.contains_key(name)

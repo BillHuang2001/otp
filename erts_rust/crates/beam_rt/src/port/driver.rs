@@ -145,7 +145,15 @@ use beam_abi::driver::types::{
     ErlDrvBinary, ErlDrvEntry, ErlDrvEvent, ErlDrvPort, ErlDrvSizeT, ErlIOVec,
     ERTS_INVALID_ERL_DRV_PORT, ERL_DRV_READ, ERL_DRV_USE, ERL_DRV_USE_NO_CALLBACK, ERL_DRV_WRITE,
 };
+use beam_abi::driver::types::ErlDrvPDL;
 use beam_abi::{DriverEnv, DriverHost, SysIOVec};
+
+/// The per-port driver-private state the host owns: the C's driver-private byte queue
+/// (`prt->ioq`), the port **state** stream flags `driver_get_port_flags` reports, and the port's
+/// one-PDL rule (`driver_pdl_create`).
+mod state;
+
+use state::DriverQueue;
 use beam_common::BeamError;
 use beam_alloc::Heap;
 use beam_io::{DriverContext, Interest, Token};
@@ -516,6 +524,23 @@ pub struct DriverPort {
     /// integers normally, a **binary** when `PORT_CONTROL_FLAG_BINARY` is set. Seized with
     /// [`DriverPort::control_flags`] before the host is boxed into the port lifecycle.
     control_flags: Rc<Cell<c_int>>,
+    /// The driver's **private** byte queue — the C's `prt->ioq` (`io.c:6790-6919`), which
+    /// `driver_enq`/`driver_pushq`/`driver_deq`/… reach and nothing else does. Distinct from the
+    /// port's *input* queue (the bytes `driver_output` answers with) and from the Erlang→driver
+    /// output queue `beam_io` owns (see [`state::DriverQueue`]).
+    queue: DriverQueue,
+    /// The port's **state** stream flags as `driver_get_port_flags` reports them — the C's
+    /// `ERTS_PORT_SFLG_BINARY_IO`/`ERTS_PORT_SFLG_LINEBUF_IO` (`io.c:5325-5344`), derived from the
+    /// `open_port/2` stream option (`binary` ⇒ `PORT_FLAG_BINARY`, otherwise `0`).
+    ///
+    /// **Not** the same thing as [`DriverPort::control_flags`]: the C reads `prt->control_flags`
+    /// only for the `port_control` reply form (`io.c:5318`), and `driver_get_port_flags` reads the
+    /// port *state* flags instead (`io.c:5338-5341`).
+    port_flags: c_int,
+    /// Whether this port already handed out its one PDL (`driver_pdl_create`) — the C's
+    /// "a port admits exactly one PDL" rule (`io.c:6716-6787`), which `beam_abi`'s PDL registry
+    /// enforces by handle address.
+    pdl_created: bool,
 }
 
 impl DriverPort {
@@ -532,7 +557,28 @@ impl DriverPort {
             terms: TermQueue::new(),
             control: Rc::new(RefCell::new(DriverControl::default())),
             control_flags: Rc::new(Cell::new(0)),
+            queue: DriverQueue::new(),
+            // A port opened without a stream option is the C's default `list` stream (`io.c:5338`).
+            port_flags: 0,
+            pdl_created: false,
         }
+    }
+
+    /// Sets the port's **state** stream flags (see [`DriverPort::get_port_flags`]).
+    ///
+    /// The `open_port/2` provider computes them from the resolved stream option
+    /// ([`crate::port::StreamType`]) right before the host is moved into the port lifecycle, which
+    /// is why this is a builder step rather than a constructor argument: a host nobody claims keeps
+    /// the C's `list` default (`0`).
+    pub fn with_port_flags(mut self, port_flags: c_int) -> DriverPort {
+        self.port_flags = port_flags;
+        self
+    }
+
+    /// Drops the per-port driver-private state: the port (and the driver) is going away, so its
+    /// queue must not outlive it.
+    pub fn clear_driver_state(&mut self) {
+        self.queue.clear();
     }
 
     /// The port's [`TermQueue`] — the handle a driver callback's `erl_drv_output_term` /
@@ -852,10 +898,15 @@ impl DriverHost for DriverPort {
         0
     }
 
-    /// The flags the driver last set — the value the seam's `set_port_control_flags` →
-    /// `get_port_flags` round trip reports.
+    /// The port's **state** stream flags, as `driver_get_port_flags` reports them.
+    ///
+    /// The C reads the *port state* bits (`ERTS_PORT_SFLG_BINARY_IO` ⇒ `PORT_FLAG_BINARY` (1), else
+    /// `ERTS_PORT_SFLG_LINEBUF_IO` ⇒ `PORT_FLAG_LINE` (2), else `0`, `io.c:5338-5341`), **not**
+    /// `prt->control_flags` — which only decides the `port_control` reply form (`io.c:5318`,
+    /// `write_port_control_result`, `io.c:4133-4175`) and is what
+    /// [`DriverPort::set_control_flags`]/[`DriverPort::control_flags`] carry.
     fn get_port_flags(&mut self) -> Option<c_int> {
-        Some(self.control_flags.get())
+        Some(self.port_flags)
     }
 
     /// Drops the port's pending timer (`driver_cancel_timer`) — `0`, or the C's `-1` for a host no
@@ -914,6 +965,66 @@ impl DriverHost for DriverPort {
     /// one process, so this is the same pid [`DriverPort::connected_pid`] answers with.
     fn caller_pid(&mut self, _port: ErlDrvPort) -> Option<Eterm> {
         Some(self.owner.to_eterm())
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The driver-private queue (`prt->ioq`) and the one-PDL rule
+    // -----------------------------------------------------------------------------------------
+
+    /// `driver_enq` / `driver_enq_bin`: append `data` at the driver-private queue's **tail**.
+    ///
+    /// The queue is the C's `prt->ioq` (`io.c:6790-6919`) — the driver's **own** queue, reached only
+    /// by `driver_enq`/`driver_pushq`/`driver_deq`/…, and distinct from both the Erlang→driver
+    /// output queue `beam_io` owns (`prt->queue`) and the port's input queue (what `driver_output`
+    /// answers with). `0` is the C's success code; nothing here can fail to accept the bytes (the
+    /// C's `-1` stands for an allocation failure).
+    fn enq(&mut self, data: &[u8], _is_binary: bool) -> c_int {
+        self.queue.enq(data)
+    }
+
+    /// `driver_pushq` / `driver_pushq_bin`: put `data` at the queue's **head** (the C's
+    /// `driver_pushq*`, the `enq_front` counterpart).
+    fn pushq(&mut self, data: &[u8], _is_binary: bool) -> c_int {
+        self.queue.pushq(data)
+    }
+
+    /// `driver_deq`: drop `len` bytes from the queue's head, answering the number dropped, or `-1`
+    /// for a request larger than the queue (the C's failure code, which `beam_abi`'s wrapper turns
+    /// into the `NOT_A_SIZE` result and which leaves the queue untouched).
+    fn deq(&mut self, len: c_int) -> c_int {
+        self.queue.deq(len)
+    }
+
+    /// `driver_sizeq`: the driver-private queue's byte count — `0` for a **fresh** port
+    /// (`io.c:6827-6834`), and never negative for a live one.
+    fn sizeq(&mut self) -> c_int {
+        self.queue.sizeq()
+    }
+
+    /// `driver_peekq`: one iovec entry per queued chunk, `None` for an empty queue (the C's `NULL`
+    /// with `*vlenp = 0`, `io.c:6861-6880`).
+    fn peekq(&mut self) -> Option<Vec<SysIOVec>> {
+        self.queue.peekq()
+    }
+
+    /// `driver_pdl_create`: this port's **one** port-data lock (`io.c:6716-6787`).
+    ///
+    /// The C's handle is an opaque pointer the driver keeps for the port's life; the properties that
+    /// matter are that it is non-null, stable and **distinct per port**, which the host's own
+    /// address is: a [`DriverPort`] lives inside a `Box` that never moves (the invariant
+    /// [`DriverPortAdapter::start`] states), so this is a stable, per-port unique handle and a plain
+    /// pointer cast — no `unsafe` needed.
+    ///
+    /// A second call on the same port answers `None` (the C's "a port admits exactly one PDL"), and
+    /// `beam_abi`'s PDL registry rejects a duplicate handle address independently — so both the
+    /// no-op repeated call and a port whose host was rebuilt answer the C's `NULL`.
+    fn pdl_create(&mut self) -> Option<ErlDrvPDL> {
+        if self.pdl_created {
+            return None;
+        }
+        self.pdl_created = true;
+        let handle: *const DriverPort = &*self;
+        Some(handle as ErlDrvPDL)
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1780,6 +1891,10 @@ impl beam_io::Driver for DriverPortAdapter {
             control.selects.clear();
             control.deadline = None;
         }
+        // The port's driver-private state goes with the driver: the private queue (`prt->ioq`) dies
+        // with the port struct. (The C also detaches the port's monitors here — `io.c:3846-3959` —
+        // but the monitor family is not modelled; see the `beam_abi` monitor-identity handoff.)
+        driver.host_mut().clear_driver_state();
         let released = self.release_selections(ctx);
         // The environment goes now: the port handle the driver held is dead the moment `stop`
         // returned, exactly as the C's `ErlDrvPort` is.
@@ -1800,9 +1915,14 @@ impl Drop for DriverPortAdapter {
     ///
     /// The queue's entries point into this adapter's own host arena, so leaving them for a reader
     /// to drain after the arena is freed would be a dangling read; an emptied queue is the honest
-    /// answer (see [`TermQueue`]).
+    /// answer (see [`TermQueue`]). The host's own per-port private state (its driver-private byte
+    /// queue — see the `state` child module) is dropped with the host, and is cleared here too so a
+    /// port that never reached [`beam_io::Driver::stop`] leaves exactly the same state behind.
     fn drop(&mut self) {
         self.terms.clear();
+        if let Some(driver) = self.driver.as_mut() {
+            driver.host_mut().clear_driver_state();
+        }
     }
 }
 
@@ -1823,6 +1943,14 @@ mod stop_select_tests;
 /// absent-slot build) and the reply-source rule of [`DriverPortAdapter::control_reply`].
 #[cfg(test)]
 mod control_tests;
+
+/// The A.4 **driver-private queue / one-PDL / port-flags hook regression suite** for
+/// [`DriverPort`]'s [`beam_abi::DriverHost`] implementation — the `prt->ioq` behind
+/// `driver_enq`/`driver_pushq`/`driver_deq`/`driver_sizeq`/`driver_peekq`, the one-PDL rule behind
+/// `driver_pdl_create`, and the port state flags `driver_get_port_flags` reports. A separate file
+/// because the C entry points themselves are not nameable from this crate (see its module docs).
+#[cfg(test)]
+mod hooks_tests;
 #[cfg(test)]
 mod tests {
     use super::*;

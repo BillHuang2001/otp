@@ -79,11 +79,15 @@
 //!
 //! # Honest capability gaps (never a fabricated term)
 //!
+//! * `{read_file_info, Name}` and `{read_link_info, Name}` are **partly** served by the
+//!   [`file_info`] child: the `stat(2)`/`lstat(2)` failure is the oracle's `{error, Reason}`
+//!   verbatim, while a *successful* stat — whose reply would need the `#file_info{}` `access`
+//!   slot — stays the typed capability gap (the child's docs carry the full argument).
 //! * Every *other* request this module does not serve is reported as the typed
 //!   [`crate::error::unsupported`] gap rather than a plausible-looking wrong answer
 //!   (`setopts`, `getopts`, `pread`/`pwrite`, `advise`, `allocate`,
 //!   `read_handle_info`, the legacy `put_chars` arities, a tuple encoding,
-//!   `read_file_info`, `write_file`).
+//!   `write_file`).
 //! * An unknown `file_server` `handle_call` request is the oracle's `{noreply, State}`:
 //!   the service replies **nothing** and carries on.
 
@@ -103,6 +107,7 @@ use crate::context::RuntimeContext;
 use crate::error;
 use crate::runtime::Runtime;
 
+mod file_info;
 mod get_line;
 mod get_until;
 
@@ -348,7 +353,11 @@ impl Runtime {
             ("get_cwd", 0) => self.prim_file_1("get_cwd", &[]).map(Some),
             ("get_cwd", 1) => self.prim_file_1("get_cwd", args).map(Some),
             ("list_dir", 1) => self.reply_list_dir(args).map(Some),
-            // Everything else — `write_file`, `read_file_info`, `copy`, … — has no faithful
+            // `file_server.erl:141-145`/`:156-160`: `read_file_info` follows symlinks
+            // (`stat(2)`), `read_link_info` does not (`lstat(2)`).
+            ("read_file_info", 1) => file_info::serve(self, true, args).map(Some),
+            ("read_link_info", 1) => file_info::serve(self, false, args).map(Some),
+            // Everything else — `write_file`, `copy`, `write_file_info`, … — has no faithful
             // native implementation here and is a typed gap, never a wrong value.
             _ => Err(error::unsupported(&format!(
                 "file_server: the `{command}/{}` request is not implemented",

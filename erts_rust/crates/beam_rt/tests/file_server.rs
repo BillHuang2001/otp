@@ -191,3 +191,71 @@ fn listing_a_directory_returns_every_entry() {
         "every entry in the directory is listed"
     );
 }
+
+/// The exact reason the service reports when a `stat(2)` **succeeded** and the reply would need
+/// the `#file_info{}` `access` slot.
+const FILE_INFO_GAP: &str = "file_server: the #file_info{} `access` slot needs access(2), which \
+                             no safe std API exposes";
+
+/// `filelib:is_dir/1` / `is_file/1` / `is_regular/1` read **only** `#file_info.type`
+/// (`lib/stdlib/src/filelib.erl:273-297`) through `file:read_file_info/1`, so an **absent** path
+/// is decided by the `stat(2)` failure alone — the half of the `read_file_info/1` seam the
+/// native service serves (`{error, enoent}` ⇒ `false`).
+#[test]
+fn filelib_existence_probes_on_an_absent_path_are_false() {
+    let dir = TempDir::new("filelib_absent");
+    let missing = literal(&dir.child("absent"));
+    for call in [
+        format!("filelib:is_dir({missing})"),
+        format!("filelib:is_file({missing})"),
+        format!("filelib:is_regular({missing})"),
+    ] {
+        assert_eq!(renders_like_the_oracle(&call), "false", "`{call}`");
+    }
+}
+
+/// `filelib:wildcard/1` is built on `file:list_dir/1` (already served) plus `exists/2` →
+/// `file:read_link_info/1` (`filelib.erl:742-753`) for its fully-literal case: a directory
+/// pattern lists, a pattern naming a directory that does not exist is `[]`, and a literal name
+/// that does not exist is `[]` too — all cross-checked against the oracle.
+#[test]
+fn filelib_wildcard_agrees_on_extant_and_absent_patterns() {
+    let dir = TempDir::new("filelib_wildcard");
+    for name in ["a.txt", "b.txt", "c.erl"] {
+        fs::write(dir.child(name), b"x").expect("write an entry");
+    }
+    for call in [
+        format!("lists:sort(filelib:wildcard({}))", literal(&dir.path().join("*.txt"))),
+        format!("lists:sort(filelib:wildcard({}))", literal(&dir.path().join("*"))),
+        format!("filelib:wildcard({})", literal(&dir.path().join("*.err"))),
+        format!("filelib:wildcard({})", literal(&dir.child("no-such-file.txt"))),
+        format!("filelib:wildcard({})", literal(&dir.path().join("no-such-dir/*"))),
+    ] {
+        // `renders_like_the_oracle` asserts equality with the live oracle's own rendering.
+        let _ = renders_like_the_oracle(&call);
+    }
+}
+
+/// The **success** path stays an honest capability gap, and this is the test that keeps it
+/// honest: the `#file_info{}` `access` slot is `access(2)`-derived in the oracle
+/// (`erts/emulator/nifs/unix/unix_prim_file.c:755-762`) and no safe `std` API exposes
+/// `access(2)` or `geteuid(2)`, so the runtime must not invent the field. `filelib:is_dir/1` on
+/// an **existing** directory is exactly the call a fabricated `access` would silently turn into
+/// a wrong `true`/`false`.
+#[test]
+fn the_file_info_success_path_is_the_access_capability_gap() {
+    let dir = TempDir::new("filelib_gap");
+    let mut runtime = Runtime::with_defaults().expect("the default runtime");
+    for call in [
+        format!("file:read_file_info({})", literal(dir.path())),
+        format!("file:read_link_info({})", literal(dir.path())),
+        format!("filelib:is_dir({})", literal(dir.path())),
+    ] {
+        let error = runtime.eval(&call).expect_err(&call);
+        assert_eq!(
+            beam_rt::error::unsupported_reason(&error).as_deref(),
+            Some(FILE_INFO_GAP),
+            "`{call}` must stay the precise typed `access` gap"
+        );
+    }
+}

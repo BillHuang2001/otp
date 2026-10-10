@@ -97,6 +97,30 @@ use crate::error;
 /// against OTP 29/erts-17.1).
 const LOADED_APPLICATIONS: &[&str] = &["kernel", "stdlib"];
 
+/// The proplist keys `application:get_all_key/1` reports for a **loaded** application, in
+/// the oracle's own order (`application_controller:get_pid_all_key/1`,
+/// `application_controller.erl:427-446`).
+///
+/// The same key set is also exactly the set the controller resolves for
+/// `application:get_key/2` on a loaded application: a key outside it — a file-only property
+/// such as `runtime_dependencies` — answers `undefined` even when the resource file
+/// declares it (oracle-verified, OTP 29/erts-17.1).
+const LOADED_APP_KEYS: &[&str] = &[
+    "description",
+    "id",
+    "vsn",
+    "modules",
+    "maxP",
+    "maxT",
+    "registered",
+    "included_applications",
+    "optional_applications",
+    "applications",
+    "env",
+    "mod",
+    "start_phases",
+];
+
 impl RuntimeContext<'_> {
     // -- application:get_env/1,2,3 --------------------------------------------
 
@@ -194,6 +218,142 @@ impl RuntimeContext<'_> {
     pub(super) fn application_get_application_0(&mut self) -> Result<Eterm> {
         self.atom("undefined")
     }
+
+    /// `application:get_all_key(App)`: `{ok, [{Key, Value}…]}` for a **loaded**
+    /// application, else the atom `undefined`.
+    ///
+    /// The gate is exactly the oracle's `ets:lookup(ac_tab, {loaded, AppName})`
+    /// (`application_controller:get_all_key/1`, `application_controller.erl:412-419`): only
+    /// an application this runtime *is* reports its keys — the two of
+    /// [`LOADED_APPLICATIONS`] — while every other application (an unloaded one, a
+    /// non-atom, an unknown name) is `undefined`. The keys are [`LOADED_APP_KEYS`] in that
+    /// order, each value resolved as [`application_get_key_2`](Self::application_get_key_2)
+    /// resolves it (the file's declaration, or the controller's documented default).
+    /// Oracle-verified (OTP 29/erts-17.1): `application:get_all_key(kernel)` ⇒ `{ok, [...]}`
+    /// (13 keys), while `compiler`/`sasl`/`erts`/`nosuchapp`/`42`/`[kernel]` all ⇒
+    /// `undefined`.
+    pub(super) fn application_get_all_key_1(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let app = args.first().copied().and_then(|arg| self.atom_name(arg));
+        let app = match app {
+            Some(app) if LOADED_APPLICATIONS.contains(&app.as_str()) => app,
+            _ => return self.atom("undefined"),
+        };
+        let Some(props) = self.app_props(&app)? else {
+            return self.atom("undefined");
+        };
+        let mut entries = Vec::with_capacity(LOADED_APP_KEYS.len());
+        for key in LOADED_APP_KEYS {
+            let value = self.loaded_app_value(&app, key, &props)?.unwrap_or_else(|| {
+                // Every key of `LOADED_APP_KEYS` has a controller value or a file value;
+                // a missing one would be a broken resource and is `undefined`.
+                beam_term::NIL
+            });
+            let key_atom = self.atom(key)?;
+            entries.push(terms::make_tuple(self, &[key_atom, value])?);
+        }
+        let entries = terms::make_list(self, &entries)?;
+        let ok = self.atom("ok")?;
+        terms::make_tuple(self, &[ok, entries])
+    }
+
+    /// `application:get_key(App)`: resolves to the key list of *the calling process's*
+    /// application — `application.erl:986-987` is `get_key(Key) ->
+    /// application_controller:get_pid_key(group_leader(), Key)` — and is therefore the atom
+    /// `undefined` for a process whose group leader belongs to no application.
+    ///
+    /// This runtime runs no application master, so no process (the runtime's own root
+    /// process included) belongs to an application; the oracle answers the very same thing
+    /// for such a process. Oracle-verified (OTP 29/erts-17.1): inside `erl -noshell`,
+    /// `application:get_key(kernel)`, `(stdlib)`, `(nosuchapp)` and `(42)` **all** answer
+    /// `undefined` — the argument is never even consulted.
+    ///
+    /// `// documented divergence:` an earlier note claimed the oracle answers
+    /// `{ok, KeyValueList}` here; the LIVE oracle does not (verified: `undefined`), and
+    /// inventing a list would be exactly the fabrication the golden rule forbids.
+    pub(super) fn application_get_key_1(&mut self, _args: &[Eterm]) -> Result<Eterm> {
+        self.atom("undefined")
+    }
+
+    /// `application:get_application(Module)`: `{ok, App}` for the **loaded** application
+    /// whose `modules` property lists `Module`, else `undefined`.
+    ///
+    /// `application.erl:1047-1055` resolves a module through
+    /// `application_controller:get_application/1` (`application_controller.erl:471-485`),
+    /// which finds the `{loaded, App}` entry whose `modules` list holds the module. This
+    /// runtime therefore searches the two [`LOADED_APPLICATIONS`]' own `modules` lists. Only
+    /// an **atom** is a module: any other argument leaves the oracle's `is_atom(Module)`
+    /// guard (`application.erl:1051`) and is a `function_clause`. Oracle-verified (OTP
+    /// 29/erts-17.1): `kernel` ⇒ `{ok,kernel}`, `lists` ⇒ `{ok,stdlib}`, an unknown atom ⇒
+    /// `undefined`, `[lists]` ⇒ a `function_clause` raise.
+    ///
+    /// `// documented divergence:` the oracle also has a `is_pid(Pid)` clause that answers
+    /// `undefined` for a pid; this runtime runs no application-owned process, so a pid names
+    /// no application here either — but it is reported with the `function_clause` shape of
+    /// the non-atom guard rather than walked as a pid.
+    pub(super) fn application_get_application_1(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let module = *args.first().ok_or(BeamError::BadArg)?;
+        let Some(module) = self.atom_name(module) else {
+            return Err(BeamError::Raise(beam_common::Raise::error(
+                beam_common::ExitReason::atom("function_clause"),
+            )));
+        };
+        for app in LOADED_APPLICATIONS {
+            let Some(props) = self.app_props(app)? else {
+                continue;
+            };
+            if app_modules(&props).iter().any(|name| name == &module) {
+                let name = self.atom(app)?;
+                let ok = self.atom("ok")?;
+                return terms::make_tuple(self, &[ok, name]);
+            }
+        }
+        self.atom("undefined")
+    }
+
+    /// The value of `key` for the **loaded** application `app`, whose parsed resource
+    /// proplist is `props`: the file's own declaration when it carries one, else the
+    /// `application_controller`'s documented default (`make_appl_i`,
+    /// `application_controller.erl:1572-1598`).
+    ///
+    /// `None` when the controller would not resolve the key at all: a key outside
+    /// [`LOADED_APP_KEYS`] (a file-only property such as `runtime_dependencies` answers
+    /// `undefined` in the oracle), or one of the controller keys whose value only comes from
+    /// the app's own `#appl_data{}` and which the file does not declare.
+    fn loaded_app_value(
+        &mut self,
+        app: &str,
+        key: &str,
+        props: &[(AppTerm, AppTerm)],
+    ) -> Result<Option<Eterm>> {
+        if !LOADED_APP_KEYS.contains(&key) {
+            return Ok(None);
+        }
+        if key == "env" {
+            let pairs = self.app_env_props(app)?.unwrap_or_default();
+            let mut entries = Vec::with_capacity(pairs.len());
+            for (key, value) in &pairs {
+                let key = self.materialize(key)?;
+                let value = self.materialize(value)?;
+                entries.push(terms::make_tuple(self, &[key, value])?);
+            }
+            return Ok(Some(terms::make_list(self, &entries)?));
+        }
+        if let Some(value) = prop_value(props, key) {
+            return Ok(Some(self.materialize(value)?));
+        }
+        // The controller's own defaults for a key the resource file does not declare.
+        let value = match key {
+            "id" | "included_applications" | "optional_applications" | "mod" => beam_term::NIL,
+            "maxP" | "maxT" => self.atom("infinity")?,
+            "start_phases" => self.atom("undefined")?,
+            // `description`/`vsn`/`modules`/`registered`/`applications` come from the app's
+            // own `#appl_data{}`; a resource that declares none of them is a broken
+            // installation and the honest answer is `undefined`.
+            _ => return Ok(None),
+        };
+        Ok(Some(value))
+    }
+
     // -- application:loaded_applications/0, which_applications/0 --------------
 
     /// `application:loaded_applications/0`: `{Application, Description, Vsn}` for every
@@ -222,18 +382,25 @@ impl RuntimeContext<'_> {
 
     // -- application:get_key/2 ------------------------------------------------
 
-    /// `application:get_key(App, Key)`: `{ok, Value}` for any property of the
-    /// application's resource file, or `undefined`.
+    /// `application:get_key(App, Key)`: `{ok, Value}` for a key the application controller
+    /// exposes, or `undefined`.
     ///
-    /// The lookup is **generic** — the whole proplist is parsed and `Key` looked up in it
-    /// — so `vsn`, `description`, `modules`, `applications`, `registered`, `mod`,
-    /// `runtime_dependencies` and any other key the file declares are all answered the
-    /// same way (oracle-verified: `get_key(kernel, vsn)` ⇒ `{ok,"11.0.4"}`,
-    /// `get_key(kernel, description)` ⇒ `{ok,"ERTS  CXC 138 10"}`,
+    /// For a **loaded** application (`kernel`/`stdlib`) the lookup is over the controller's
+    /// own key set ([`LOADED_APP_KEYS`]): the value is the resource file's declaration when
+    /// it carries one, else the controller's documented default (`make_appl_i`,
+    /// `application_controller.erl:1572-1598`) — so `get_key(kernel, maxP)` ⇒
+    /// `{ok,infinity}`, `get_key(stdlib, mod)` ⇒ `{ok,[]}` (stdlib.app declares no `mod`),
+    /// `get_key(kernel, start_phases)` ⇒ `{ok,undefined}`, while a key outside the set — a
+    /// file-only property such as `runtime_dependencies` — is `undefined`. That is exactly
+    /// the oracle's answer (oracle-verified: `get_key(kernel, vsn)` ⇒ `{ok,"11.0.4"}`,
     /// `get_key(stdlib, applications)` ⇒ `{ok,[kernel]}`,
     /// `get_key(kernel, modules)` ⇒ `{ok,[<module atoms>]}`,
+    /// `get_key(kernel, runtime_dependencies)` ⇒ `undefined`,
     /// `get_key(kernel, nope_key)` ⇒ `undefined`, `get_key(bogusapp, vsn)` ⇒ `undefined`,
     /// `get_key(42, vsn)` ⇒ `undefined`).
+    ///
+    /// For an application that resolves but is **not** loaded this runtime answers the raw
+    /// resource-file declaration — see the `// documented divergence:` note below.
     pub(super) fn application_get_key_2(&mut self, args: &[Eterm]) -> Result<Eterm> {
         let app = args.first().copied().and_then(|arg| self.atom_name(arg));
         let key = args.get(1).copied().and_then(|arg| self.atom_name(arg));
@@ -243,6 +410,30 @@ impl RuntimeContext<'_> {
         let Some(props) = self.app_props(&app)? else {
             return self.atom("undefined");
         };
+        if LOADED_APPLICATIONS.contains(&app.as_str()) {
+            // A loaded application: the controller's key set, each value the file's own
+            // declaration or the controller default.
+            return match self.loaded_app_value(&app, &key, &props)? {
+                Some(value) => {
+                    let ok = self.atom("ok")?;
+                    terms::make_tuple(self, &[ok, value])
+                }
+                None => self.atom("undefined"),
+            };
+        }
+        // An application that is installed but not loaded: the oracle still answers the
+        // controller-*stored* keys (`description`/`id`/`vsn`/`included_applications`/
+        // `optional_applications`/`applications`, `application_controller.erl:380-404`) and
+        // `undefined` for everything else. This runtime has no application controller to
+        // hold those defaults, so it answers the raw resource-file declaration instead —
+        // the honest source available.
+        //
+        // `// documented divergence:` for an unloaded application the oracle would report
+        // `undefined` for a key the controller does not store (`modules`, `registered`,
+        // `maxP`/`maxT`, `mod`, `start_phases`) where this returns the file's declaration,
+        // and vice versa for a controller default the file does not carry. The keys the
+        // *loaded* applications of [`LOADED_APPLICATIONS`] expose are exact; this path only
+        // ever answers for an application outside that set.
         match prop_value(&props, &key) {
             Some(value) => {
                 let value = self.materialize(value)?;
@@ -451,6 +642,21 @@ fn prop_value<'p>(props: &'p [(AppTerm, AppTerm)], key: &str) -> Option<&'p AppT
         .iter()
         .find(|(name, _)| matches!(name, AppTerm::Atom(atom) if atom == key))
         .map(|(_, value)| value)
+}
+
+/// The module names a parsed resource's `modules` property lists, or an empty list when it
+/// declares none.
+fn app_modules(props: &[(AppTerm, AppTerm)]) -> Vec<String> {
+    match prop_value(props, "modules") {
+        Some(AppTerm::List(items)) => items
+            .iter()
+            .filter_map(|item| match item {
+                AppTerm::Atom(name) => Some(name.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------
