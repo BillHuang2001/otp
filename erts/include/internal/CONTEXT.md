@@ -168,6 +168,33 @@ Consumers: `erts/lib_src/`, `erts/emulator/` (incl. `beam/sys.h`, `erl_utils.h`,
   TILE64/TILEPro (only reachable via `../../../xcomp/erl-xcomp-TileraMDE2.0-tilepro.conf`);
   `libatomic_ops/` is only selected with `--with-libatomic_ops`. Reading one of these dirs in
   isolation is misleading — the real definitions are in the dir it forwards to.
+- **Defined-but-unreferenced symbols (verified zero uses tree-wide via `git grep -w`):** `ETHR_B2KW`
+  (`ethr_internal.h:47`), `ETHR_WIN_MUTEX__` (`ethr_mutex.h:235`), the typedef `ethr_uint128_t`
+  (`ethread.h:270`; its symmetric partner `ethr_sint128_t` is used), the debug macros
+  `ETHR_MTX_CHK_EXCL_IS_NON_EXCL` and `ETHR_MTX_CHK_EXCL_SET_NON_EXCL_NO` (`ethr_mutex.h`, defined in
+  all 3 conditional branches, never expanded), `ETHR_NDWA_AOVAL2VAL__`
+  (`libatomic_ops/ethr_dw_atomic.h`, 3 branches; its inverse `ETHR_NDWA_VAL2AOVAL__` is used),
+  `ETHR_WIN_HAVE_XCHG_ADD_ACQ` (`win/ethr_atomic.h`, defined + `#undef`ed but never tested), and 10 of
+  the `ETHR_X86_RUNTIME_CONF_HAVE_*` feature macros (`ethread.h:308-331`): the `..._RDTSCP__`,
+  `..._NONSTOP_TSC__`, `..._NONSTOP_TSC_S3__` positive forms and the `..._NO_{DW_CMPXCHG,CPUID,RDTSCP,
+  CONSTANT_TSC,TSC_RELIABLE_TSC,NONSTOP_TSC,NONSTOP_TSC_S3}__` forms. The other family members
+  (`..._SSE2__`, `..._NO_SSE2__`, `..._DW_CMPXCHG__`, `..._CPUID__`, `..._CONSTANT_TSC__`,
+  `..._TSC_RELIABLE__`, `..._META`/`..._NO_META`) *are* referenced.
+- **`ETHR_X86_RUNTIME_CONF_HAVE_NO_CONSTANT_TSC__` is miswired**: it expands
+  `ETHR_X86_RUNTIME_CONF_HAVE_NO_META(nonstop_tsc)` (`ethread.h:315`), not `constant_tsc`. Harmless today
+  only because nothing references the macro.
+- **`AO_USE_PENTIUM4_INSTRS` (`libatomic_ops/ethread.h:36`) is not dead** despite appearing once
+  in-tree: it is a libatomic_ops knob consumed by the *external* `atomic_ops.h`, which is not vendored.
+- **All ten impl dirs remain reachable.** Every selecting condition in `ethread.h:373-410`/`632-636` is
+  satisfiable by a config this tree supports (`otp.m4` `ERL_FIND_ETHR_LIB` + `LM_HARDWARE_ARCH`,
+  `xcomp/*.conf`, `HOWTO/INSTALL.md`): `i386`/`x86_64`, `ppc32` (`erl-xcomp-powerpc-dso-linux-gnu.conf`),
+  `tile` (`erl-xcomp-TileraMDE2.0-tilepro.conf`), `libatomic_ops` (`--with-libatomic_ops`),
+  `pthread`/`win` (configure `AC_DEFINE(ETHR_PTHREADS)`/`(ETHR_WIN32_THREADS)`), `gcc` (fall-through on
+  any GNU-C target with no dedicated dir, e.g. aarch64/arm; or `--enable-prefer-gcc-native-ethr-impls`).
+  `sparc32`/`sparc64` have **no xcomp config** — they are reachable only via a native SPARC build
+  (`otp.m4:2237` `sparc|sun4u|sparc64|sun4v`, `otp.m4:3058-3060`, `--with-sparc-memory-order`,
+  `HOWTO/INSTALL.md` lists "32/64-bit SPARC V9" as an OTP-native impl). SPARC and tile have no CI
+  coverage in `.github/`.
 - Installed ≠ public, and the install set is *not* the directory contents: several headers here
   (`ethr_internal.h`, `ethr_optimized_fallbacks.h`'s consumers aside, the whole `gcc/`…`win/` set) are
   shipped in the release as internal includes, while `ethr_internal.h` — the most internal file of all —
