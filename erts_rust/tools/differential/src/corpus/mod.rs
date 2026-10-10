@@ -88,6 +88,7 @@ mod boot_prereq;
 mod driver;
 mod driver_c;
 mod driver_abi;
+mod driver_abi_extra;
 mod driver_ports;
 mod errors;
 mod etf;
@@ -97,9 +98,11 @@ mod ets_spec;
 mod flags;
 mod math_bifs;
 mod mexec;
+mod mexec_extra;
 mod modules;
 mod nif;
 mod nif_abi;
+mod nif_abi_extra;
 mod nif_res;
 mod nif_so;
 mod phash;
@@ -402,10 +405,12 @@ fn build_corpus() -> Vec<Case> {
     cases.extend(nif_so::group());
     cases.extend(nif_res::group());
     cases.extend(nif_abi::group());
+    cases.extend(nif_abi_extra::group());
     cases.extend(records::group());
     cases.extend(driver::group());
     cases.extend(driver_c::group());
     cases.extend(driver_abi::group());
+    cases.extend(driver_abi_extra::group());
     cases.extend(driver_ports::group());
     cases.extend(wire::group());
     cases.extend(wire_ids::group());
@@ -426,6 +431,7 @@ fn build_corpus() -> Vec<Case> {
     cases.extend(boot_extra::group());
     cases.extend(flags::group());
     cases.extend(mexec::group());
+    cases.extend(mexec_extra::group());
     cases.extend(modules::group());
     cases
 }
