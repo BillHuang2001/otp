@@ -334,6 +334,18 @@ struct PortMeta {
     /// when the driver is unloaded, so a term is only ever drained while the arena it was built on
     /// is alive (see the queue's lifetime contract).
     driver_terms: Option<driver::TermQueue>,
+    /// The names a `{spawn_driver, Name}` port's C driver first interned inside a callback,
+    /// awaiting a commit into the runtime's **live** atom table.
+    ///
+    /// A driver callback cannot mint an atom — the live table is borrowed for the whole callback
+    /// and this crate is `#![deny(unsafe_code)]` — so a *new* name is handed a **predicted** index
+    /// and recorded here, exactly like the BIF/NIF hosts' `PendingInterner`. Seized with
+    /// [`driver::DriverPort::pending_atoms`] **before** the host is moved into the port lifecycle,
+    /// for the same reason as [`PortMeta::driver_terms`] (the boxed driver exposes no host), and
+    /// landed by [`PortRegistry::commit_driver_atoms`].
+    ///
+    /// `None` for every port without a C driver (a `spawn`/`fd` port).
+    driver_atoms: Option<driver::DriverAtoms>,
 }
 
 /// A message a live port has produced: the child's stream bytes, or its reaped exit status.
@@ -849,6 +861,40 @@ impl PortRegistry {
             }
         }
         events
+    }
+
+    /// Commits every live driver port's pending interned names into `atoms` — the runtime's
+    /// **one live** table — and returns the `(port, name)` pairs whose prediction had drifted.
+    ///
+    /// A [`driver::DriverPort`] host cannot mint an atom inline (the runtime's table is borrowed
+    /// while a driver callback runs and this crate is `#![deny(unsafe_code)]`), so a *new* name a
+    /// driver interned inside a callback is handed a **predicted** index and recorded on its
+    /// [`driver::DriverAtoms`] handle. Landing it here — at a step boundary where no callback is
+    /// running and no such table is borrowed — is what makes the name resolvable at all; without
+    /// this call a driver-interned name would keep a predicted index that names nothing.
+    ///
+    /// The returned list is never a silent drop: a name whose predicted index the table has moved
+    /// past sits behind a term the driver has already built, so the caller reports it (see
+    /// [`Runtime::deliver_port_messages`]).
+    ///
+    /// # Errors
+    ///
+    /// None: the driver callback that interned the name has already returned, so there is nobody
+    /// left to fail — a name that cannot land at its predicted index is reported, not raised.
+    fn commit_driver_atoms(
+        &mut self,
+        atoms: &mut beam_term::AtomTable,
+    ) -> Vec<(PortId, String)> {
+        let mut dropped = Vec::new();
+        for (number, meta) in self.meta.iter_mut() {
+            let Some(pending) = meta.driver_atoms.as_ref() else {
+                continue;
+            };
+            for name in pending.commit(atoms) {
+                dropped.push((PortId::new(*number), name));
+            }
+        }
+        dropped
     }
 
     /// The terms the **C driver** ports have emitted (`erl_drv_output_term`/`erl_drv_send_term`).
@@ -1425,6 +1471,9 @@ impl PortHook for RuntimePorts {
             // `erl_drv_output_term`/`erl_drv_send_term` pushes onto and
             // [`PortRegistry::take_driver_terms`] drains.
             let driver_terms = host.term_queue();
+            // The same seize for the names the driver may intern in a later callback: without this
+            // handle a name it predicts would never reach the live atom table.
+            let driver_atoms = host.pending_atoms();
             let adapter =
                 driver::DriverPortAdapter::load(&candidates, &driver_name, host, spec.command.clone())
                     .map_err(|_| BeamError::BadArg)?;
@@ -1439,6 +1488,7 @@ impl PortHook for RuntimePorts {
                 owner: self.owner,
                 kind: PortName::SpawnDriver,
                 driver_terms: Some(driver_terms),
+                driver_atoms: Some(driver_atoms),
             };
             let mut registry = self.registry_mut()?;
             return registry.register(Box::new(adapter), meta);
@@ -1460,8 +1510,10 @@ impl PortHook for RuntimePorts {
             monitors: Vec::new(),
             owner: self.owner,
             kind: spec.kind,
-            // A `spawn`/`fd` port has no C driver, so no driver term queue exists.
+            // A `spawn`/`fd` port has no C driver, so it has neither driver term queue nor names
+            // a driver interned.
             driver_terms: None,
+            driver_atoms: None,
         };
         // The registry stays borrowed across `register`: starting a port cannot re-enter a
         // port operation, and a nested borrow is a typed error rather than a panic.
@@ -1575,6 +1627,25 @@ impl Runtime {
                 .map_err(|_| error::unsupported("the port table is already in use"))?;
             registry.pump(timeout)?
         };
+        // A driver callback cannot mint an atom (the live table is borrowed for the whole
+        // callback), so a *new* name one interned was handed a predicted index for **this**
+        // boundary to land. Committing before any message is built means the terms a driver
+        // emitted through `erl_drv_output_term` resolve against a table that holds their names.
+        {
+            let mut registry = self
+                .ports
+                .try_borrow_mut()
+                .map_err(|_| error::unsupported("the port table is already in use"))?;
+            for (port, name) in registry.commit_driver_atoms(self.code_server.atoms_mut()) {
+                // Never silent: the term the driver built already carries an index that now names
+                // a different atom, which no later commit can repair.
+                eprintln!(
+                    "beam_rt: driver port {} interned the atom `{name}` at an index the atom \
+                     table had already moved past; the name is not resolvable",
+                    port.number()
+                );
+            }
+        }
         // The name `os:set_signal/2`'s notifications are addressed to, resolved **once** and by
         // `lookup` rather than `intern`: the shared table holds the atom only if some code
         // interned it, which is exactly when a process can be registered under it. `None` ⇒
@@ -2093,6 +2164,7 @@ mod tests {
             monitors: Vec::new(),
             owner: OWNER,
             driver_terms: None,
+            driver_atoms: None,
         }
     }
 
@@ -2958,6 +3030,7 @@ mod tests {
         meta.kind = PortName::SpawnDriver;
         meta.owner = owner;
         meta.driver_terms = Some(queue);
+        meta.driver_atoms = Some(host.pending_atoms());
         (host, meta)
     }
 

@@ -146,13 +146,138 @@ use beam_abi::driver::types::{
 use beam_abi::{DriverEnv, DriverHost, SysIOVec};
 use beam_common::BeamError;
 use beam_alloc::Heap;
-use beam_bifs::AtomInterner;
 use beam_io::{DriverContext, Interest, Token};
 use beam_process::ProcessId;
-use beam_term::{make_atom, AtomTable, Eterm};
+use beam_term::{make_atom, Atom, AtomTable, Eterm};
 
-use crate::context::PendingInterner;
+/// The atoms a driver first interned inside a callback, awaiting the port layer's commit.
+///
+/// An [`AtomTable`] is **append-only** and its indices never renumber, so a name the live table
+/// already holds keeps its index — but a *new* name can only be **predicted** while a driver
+/// callback runs: the runtime's one live table is mutably borrowed at the commit site, and this
+/// crate is `#![deny(unsafe_code)]`, so a host cannot mint an atom inline. This is the same
+/// deferred-commit rule the BIF/NIF hosts use (`crate::context::PendingInterner`), with the two
+/// things a **long-lived** host needs and a per-call one does not:
+///
+/// * **re-rooting** ([`DriverAtoms::rebase`]) — a driver host outlives the BIF call that opened
+///   its port, so other code may have interned names since; the port layer re-bases the
+///   prediction on the live table's length (`DriverAtoms::len`) at a step boundary it controls
+///   (see [`crate::port::PortRegistry::rebase_driver_atoms`]);
+/// * a **verified** commit ([`DriverAtoms::commit`]) — a name is interned only when it lands at
+///   exactly the index the driver was handed. A prediction the table has moved past (something
+///   else interned in between, or the name already exists elsewhere) is *dropped and returned to
+///   the caller*, never interned at a different index — which would make the driver's already
+///   built term name the **wrong** atom.
+///
+/// The handle is shared by `Rc<RefCell<..>>` between the host (which predicts, from inside a
+/// callback) and the port layer (which re-roots and commits), exactly like [`TermQueue`].
+#[derive(Clone, Debug)]
+pub struct DriverAtoms {
+    /// The shared prediction state: the live table's length when the window was opened, and the
+    /// names recorded since, in order.
+    inner: Rc<RefCell<DriverAtomsState>>,
+}
 
+/// The mutable half of a [`DriverAtoms`].
+#[derive(Debug)]
+struct DriverAtomsState {
+    /// The index the *first* recorded name was predicted at (the live table's length when the
+    /// window was opened).
+    base: usize,
+    /// The names recorded in this window, in order (deduplicated).
+    names: Vec<String>,
+}
+
+impl DriverAtoms {
+    /// A pending set rooted at `base` (the live table's current length).
+    pub fn new(base: usize) -> DriverAtoms {
+        DriverAtoms {
+            inner: Rc::new(RefCell::new(DriverAtomsState {
+                base,
+                names: Vec::new(),
+            })),
+        }
+    }
+
+    /// Whether no name is awaiting a commit.
+    ///
+    /// Load-bearing as a **guard**: committing nothing must not even *reach* the shared table
+    /// through `Rc::make_mut`, because that would deep-clone the whole table (thousands of
+    /// entries after boot) for nothing.
+    pub fn is_empty(&self) -> bool {
+        self.names().is_empty()
+    }
+
+    /// The names recorded since the last commit, in order — the caller's report of what a commit
+    /// dropped.
+    fn names(&self) -> Vec<String> {
+        self.inner.borrow().names.clone()
+    }
+
+    /// The index `name` will be interned at: the live table's index when it already holds the
+    /// name, the index it was already predicted at, or the next free predicted index.
+    fn intern(&self, name: &str) -> Atom {
+        let mut state = self.inner.borrow_mut();
+        if let Some(offset) = state.names.iter().position(|pending| pending == name) {
+            // A duplicate within this window reuses the predicted index.
+            return Atom::from_raw((state.base + offset) as u32);
+        }
+        let index = state.base + state.names.len();
+        state.names.push(name.to_string());
+        Atom::from_raw(index as u32)
+    }
+
+    /// Re-roots the prediction on the live table's length `len` — the port layer's window opening.
+    ///
+    /// A no-op while names are still pending: the already handed-out indices are anchored at the
+    /// current base, so moving it would invalidate them (the caller commits first — see
+    /// [`crate::port::PortRegistry::rebase_driver_atoms`]).
+    pub fn rebase(&self, len: usize) {
+        let mut state = self.inner.borrow_mut();
+        if state.names.is_empty() {
+            state.base = len;
+        }
+    }
+
+    /// Interns the recorded names into `atoms`, in prediction order, and returns the names it had
+    /// to **drop** — the ones whose predicted index the live table has already moved past, so a
+    /// different name sits where the index the driver was handed points.
+    ///
+    /// A drop is never silent: the caller reports it (see
+    /// [`crate::port::PortRegistry::dropped_driver_atoms`]). Interning such a name anyway would
+    /// append it at a *different* index than the driver's term carries, which is a wrong atom
+    /// behind a valid-looking index — strictly worse than a prediction that names nothing
+    /// (`beam_abi`'s term-data machine reports the failure to the driver).
+    ///
+    /// The base is re-rooted on `atoms.len()` afterwards, so the next window predicts from the
+    /// table's real end.
+    pub fn commit(&self, atoms: &mut AtomTable) -> Vec<String> {
+        let names = {
+            let mut state = self.inner.borrow_mut();
+            std::mem::take(&mut state.names)
+        };
+        let base = self.inner.borrow().base;
+        let mut dropped = Vec::new();
+        for (offset, name) in names.into_iter().enumerate() {
+            let predicted = base + offset;
+            if atoms.len() != predicted {
+                dropped.push(name);
+                continue;
+            }
+            atoms.intern(&name);
+        }
+        self.inner.borrow_mut().base = atoms.len();
+        dropped
+    }
+}
+
+impl beam_bifs::AtomInterner for DriverAtoms {
+    /// Records `name` (or resolves the index it was already predicted at), for
+    /// [`DriverAtoms::commit`] to land.
+    fn intern(&mut self, name: &str) -> Atom {
+        DriverAtoms::intern(self, name)
+    }
+}
 /// One `driver_select` request a driver callback made through [`DriverHost::select`].
 ///
 /// The C acts on it immediately; here it is *recorded* and applied by the port lifecycle as soon
@@ -345,8 +470,8 @@ impl TermQueue {
 /// A driver host for one port: the runtime services the `driver_*` / `erl_drv_*` functions need.
 ///
 /// It owns a private term arena (the heap the term-data decoder builds its terms on), holds a
-/// handle to the runtime's **one shared** [`AtomTable`] plus the deferred-commit [`PendingInterner`]
-/// a *new* atom is recorded on, and answers the port queries with the owning [`ProcessId`].
+/// handle to the runtime's **one shared** [`AtomTable`] plus the deferred-commit [`DriverAtoms`]
+/// record a *new* atom is predicted on, and answers the port queries with the owning [`ProcessId`].
 ///
 /// See the module docs for the current scope: the output / term-data / pid services and the
 /// recorded `driver_select` / timer requests are implemented; `driver_async` and the custom
@@ -361,9 +486,9 @@ pub struct DriverPort {
     /// A handle to the runtime's shared atom table, used to resolve (never to mint *through*) an
     /// existing atom.
     atoms: Rc<AtomTable>,
-    /// The deferred-commit interner a **new** atom is recorded on (see
+    /// The deferred-commit record a **new** atom is predicted on (see
     /// [`DriverPort::commit_atoms`]).
-    interner: PendingInterner,
+    interner: DriverAtoms,
     /// The process the port belongs to — what `driver_connected` / `driver_caller` report.
     owner: ProcessId,
     /// Every `driver_output` / `erl_drv_output` payload, in call order.
@@ -386,7 +511,7 @@ pub struct DriverPort {
 impl DriverPort {
     /// A host over `heap`, resolving/interning atoms against `atoms`, running as `owner`.
     pub fn new(heap: Heap, atoms: Rc<AtomTable>, owner: ProcessId) -> DriverPort {
-        let interner = PendingInterner::new(atoms.len());
+        let interner = DriverAtoms::new(atoms.len());
         DriverPort {
             heap,
             atoms,
@@ -407,6 +532,17 @@ impl DriverPort {
     /// rather than a field the reader can borrow.
     pub fn term_queue(&self) -> TermQueue {
         self.terms.clone()
+    }
+
+    /// The predicted-name handle of this host — the one the port layer commits into the runtime's
+    /// **live** atom table (see [`DriverPort::commit_atoms`]).
+    ///
+    /// Taken **before** the host is boxed into a port, for the same reason as
+    /// [`DriverPort::term_queue`]: the boxed driver exposes no host, so without this handle a name
+    /// a driver interned inside a callback would stay *predicted* forever — its index would never
+    /// reach the live table (see [`DriverAtoms`]).
+    pub fn pending_atoms(&self) -> DriverAtoms {
+        self.interner.clone()
     }
     /// The event/timer state this host shares with its port lifecycle.
     ///
@@ -452,14 +588,15 @@ impl DriverPort {
         self.atoms.name(beam_term::atom_val(term))
     }
 
-    /// Interns the names recorded by [`DriverHost::intern_atom`] into `atoms`, in order.
+    /// Interns the names recorded by [`DriverHost::intern_atom`] into `atoms`, in order, and
+    /// returns the names it had to **drop** (see [`DriverAtoms::commit`]).
     ///
     /// The same deferred-commit rule as the NIF host (`crate::nif`'s `NifHostImpl`): the runtime's
     /// atom table is held immutably while a driver callback runs, so a *new* name is given its
     /// predicted index straight away and only materialised **after** the borrow is released. The
     /// caller must pass the **same** table the host's `atoms` handle refers to.
-    pub fn commit_atoms(&self, atoms: &mut AtomTable) {
-        self.interner.commit(atoms);
+    pub fn commit_atoms(&self, atoms: &mut AtomTable) -> Vec<String> {
+        self.interner.commit(atoms)
     }
 
     /// Builds the one per-port environment for this driver.
