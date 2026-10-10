@@ -1601,6 +1601,29 @@ impl RuntimePorts {
     }
 }
 
+impl StreamType {
+    /// The C's **port state** stream flags, as `driver_get_port_flags` reports them
+    /// (`io.c:5325-5344`): `ERTS_PORT_SFLG_BINARY_IO` ⇒ `PORT_FLAG_BINARY` (1), else
+    /// `ERTS_PORT_SFLG_LINEBUF_IO` ⇒ `PORT_FLAG_LINE` (2), else `0`.
+    ///
+    /// Those state bits are set by the `open_port/2` stream option alone (`binary` ⇒ binary I/O,
+    /// `line`/`{line,N}` ⇒ line-buffered, otherwise neither — `erl_bif_port.c:985-990`,
+    /// `1139-1141`), so they are derived here from the same resolved stream that decides the read
+    /// path's message shape. This runtime's `open_port/2` accepts `line` as a whitelisted-but-inert
+    /// option, so the `PORT_FLAG_LINE` case is **not reachable** here: a driver port opened `[line]`
+    /// answers `0` where the oracle answers `2` (documented residual, never guessed).
+    pub(crate) fn port_flags(self) -> i32 {
+        match self {
+            StreamType::Binary => PORT_FLAG_BINARY,
+            StreamType::List => 0,
+        }
+    }
+}
+
+/// The C's `PORT_FLAG_BINARY`: the port state bit `driver_get_port_flags` maps
+/// `ERTS_PORT_SFLG_BINARY_IO` onto (`erl_driver.h`'s `PORT_FLAG_BINARY`, `1 << 0`).
+const PORT_FLAG_BINARY: i32 = 1;
+
 impl PortHook for RuntimePorts {
     fn open_port(&mut self, name: Eterm, options: Eterm) -> Result<PortId> {
         // Validation first: a Name/Options the drivers cannot accept is `badarg` and must
@@ -1629,7 +1652,11 @@ impl PortHook for RuntimePorts {
                 Heap::new(PORT_HEAP_WORDS)?,
                 Rc::clone(&self.atoms),
                 self.owner,
-            );
+            )
+            // The port's **state** stream flags, which `driver_get_port_flags` reports: the C reads
+            // `ERTS_PORT_SFLG_BINARY_IO`/`ERTS_PORT_SFLG_LINEBUF_IO` (`io.c:5338-5341`) set by the
+            // very stream option the port was opened with (`erl_bif_port.c:985-990`).
+            .with_port_flags(stream.port_flags());
             // Seize the driver's term queue **before** the host is moved into the port lifecycle
             // (the boxed driver exposes no host): it is the handle a driver callback's
             // `erl_drv_output_term`/`erl_drv_send_term` pushes onto and
