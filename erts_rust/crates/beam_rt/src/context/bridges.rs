@@ -501,27 +501,47 @@ impl RecordSource for RecordBridge<'_> {
     }
 }
 
-/// The `beam_bifs` local-node-identity seam: this runtime's fixed, non-distributed identity.
+/// The `beam_bifs` local-node-identity seam: this runtime's **own** node.
 ///
-/// `term_to_binary/1` of an **internal** pid/port id needs the local node's name atom and
-/// creation to emit `NEW_PID_EXT` (`88`)/`V4_PORT_EXT` (`120`). Milestone 1 has no
-/// distribution, so the identity is the fixed `nonode@nohost` with creation `0` — the same
-/// identity `beam_bifs`' own [`BifContext::local_node`] fallback answers for the runtime's
-/// node (see `crate::native`). Making it explicit here means the identity does not depend on
-/// the fallback's atom being present.
+/// The identity is runtime state, not a constant. `term_to_binary/1` of an **internal**
+/// pid/port id needs the local node's name atom and creation to emit `NEW_PID_EXT`
+/// (`88`)/`V4_PORT_EXT` (`120`), and `node/0` is the identity's atom. The runtime is the only
+/// thing that knows it — `-name`/`-sname` makes it a distributed node named `node@host`,
+/// otherwise it is the fixed `nonode@nohost` — and it is interned in the one shared atom table
+/// at construction ([`Runtime::local_node`] is that single source of truth), so the hook is
+/// filled from there rather than from a hard-coded name.
 ///
-/// Both fields are `Copy` (the atom is resolved once, from the shared table, before the
-/// context borrows it), so the hook needs **no** runtime borrow and can be installed in
-/// every [`RuntimeContext::call_registered`] arm.
+/// The decoding direction is supposed to read the *same* identity: `binary_to_term/1` would
+/// use it to recognise an incoming identifier that names this node (`beam_codec`'s
+/// `is_local_node`, the C's `dec_is_this_node`) and normalise it to an internal id. That half
+/// is not implemented — `beam_bifs` never installs a local node on its decoder — so the hook
+/// is consumed by the encoder only today.
+///
+/// Keeping the identity live is what makes the two directions agree on a **named** node once
+/// the decoder half lands: the atom `term_to_binary` writes for an internal pid is the very
+/// atom a decoded `NEW_PID_EXT` is compared against, so a `-sname`/`-name` runtime no longer
+/// stamps its pids with `nonode@nohost`.
+///
+/// The atom is `Copy` (resolved once, before the context borrows the shared table), so the
+/// hook needs **no** runtime borrow and can be installed in every
+/// [`RuntimeContext::call_registered`] arm.
 pub(super) struct NodeIdentity {
-    /// The node-name atom, resolved from the shared table at the start of the call.
+    /// The runtime's node-name atom, taken from [`Runtime::local_node`] at the start of the
+    /// call; always `Some` for a live runtime (the atom is interned at construction).
     pub(super) node: Option<Atom>,
 }
 
 impl LocalNode for NodeIdentity {
     fn local_node(&mut self) -> Option<(Atom, u32)> {
         // Creation `0`: the value of an undistributed node (the C's `erts_creation` of a
-        // node that never connected anywhere).
+        // node that never connected anywhere). A `-sname`/`-name` node's `epmd`-assigned
+        // creation is not carried here — this seam's struct holds only the node atom, and
+        // its shape is pinned by the colocated unit test — so the name is live while the
+        // creation stays the undistributed default. The encoder reads this hook, so
+        // `term_to_binary/1` of an internal pid stamps exactly this identity. The decoder
+        // does **not** read it yet (`beam_bifs`'s `binary_to_term/1` never installs a local
+        // node on its `beam_codec` decoder), so a decoded local identifier stays external —
+        // a `beam_bifs` gap this crate only supplies the identity for.
         self.node.map(|node| (node, 0))
     }
 }

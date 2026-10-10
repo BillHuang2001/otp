@@ -961,12 +961,16 @@ impl<'a> RuntimeContext<'a> {
         // `&mut ProcessTable`, like the dict arm — and therefore its own mutually exclusive
         // arm; see [`RuntimeHooksBridge`]).
         let uses_runtime_hooks = Self::uses_runtime_hooks(module, function, arity);
-        // The local-node identity: `nonode@nohost` with creation 0 (the M1 runtime has no
-        // distribution), read from the shared table *before* it is borrowed by the context.
-        // Both fields are `Copy`, so this hook needs no runtime borrow at all and every arm
-        // below can install it (see [`NodeIdentity`]).
+        // The local-node identity: **this runtime's own node** — the configured
+        // `node@host` atom when `-name`/`-sname` made it a distributed node, else the fixed
+        // `nonode@nohost` ([`Runtime::local_node`] is the single source of truth for both).
+        // It is read from the runtime *before* the shared atom table is borrowed by the
+        // context, and it is always `Some` for a live runtime: the atom was interned into
+        // that very table at construction, so the hook can never answer "unknown" for a node
+        // this runtime *is*. Both fields are `Copy`, so this hook needs no runtime borrow at
+        // all and every arm below can install it (see [`NodeIdentity`]).
         let mut local_node = NodeIdentity {
-            node: atoms.lookup("nonode@nohost"),
+            node: Some(self.runtime.local_node()),
         };
         // The caller's module name, cloned out *before* `self` is destructured: it outlives
         // the `BifContext` borrow below (the context stores `&str`, but a local `String` is
