@@ -104,6 +104,10 @@ is part of the documented NIF/driver ABI.
   `ETHR_HAVE_ETHREAD_DEFINES`, `ETHR_SMP_REQUIRE_NATIVE_IMPLS`) and
   `internal/$(TARGET)/ethread_header_config.h`. Grepping only this tree can miss an `ETHR_*`
   definition.
+- `erl_fixed_size_int_types.h` defines `SI_16_FSTR` instead of `SGND_INT_16_FSTR` in its
+  `SIZEOF_INT == 2` branch (`:130`); that branch therefore lacks the signed-16 printf-length macro
+  (the `#else` branch at `:135` has the correctly-named one). No OTP target has `SIZEOF_INT == 2`,
+  and neither name is referenced in-tree, so this is latent only.
 
 ## Notes for Agents
 - To find where a header goes: semi-public → here; ERTS-internal/unstable → `internal/`; NIF or
