@@ -338,23 +338,19 @@ The reply tag is **paired** with the request tag, never echoed: `{io_request, �
 
 #### Honest capability gaps (never a fabricated term)
 * **`{get_until,Enc,_Prompt,Mod,Func,XtraArgs}` is served** by
-  [`file_server/get_until.rs`](file_server/get_until.rs): the device's read loop drives an
-  engine-backed `Continuation` that loads `Mod` and runs `Mod:Func(Cont, Data, XtraArgs…)` on the
-  interpreter, decodes `{more, Cont}` / `{done, Reply, Buf}` and stashes `Buf` as the device's
-  `State#state.buf` (so the next request scans it first). Remaining typed gaps of that request:
-  a continuation that suspends in a `receive`; a leftover that is a deep iolist, a non-charlist,
-  a negative code point or a non-byte-aligned bitstring; a **request** encoding other than
-  `latin1`/`unicode`; and a request for a pid with no registered device (the "closed io device"
-  gap). The `{get_chars, …}` arm does not consult the stashed buffer, and a `{utf16,_}`/`{utf32,_}`
-  **stream** encoding is read as `latin1` (both shared divergences).
+  [`file_server/get_until.rs`](file_server/get_until.rs): the read loop drives an engine-backed
+  `Continuation` running `Mod:Func(Cont, Data, XtraArgs…)`, decodes `{more,Cont}`/`{done,Reply,Buf}`
+  and stashes `Buf` as the device's `State#state.buf`. Typed gaps: a continuation suspending in a
+  `receive`; a leftover that is a deep iolist / non-charlist / negative code point / non-byte-aligned
+  bitstring; an encoding other than `latin1`/`unicode`; a pid with no registered device ("closed io
+  device"). The `{get_chars,…}` arm ignores the stashed buffer and a `{utf16,_}`/`{utf32,_}`
+  **stream** is read as `latin1` (both shared divergences).
 * **`{get_line,Enc,_Prompt}` is served** by [`file_server/get_line.rs`](file_server/get_line.rs):
-  the same device loop drives the `LineContinuation` (the oracle's `io_lib:collect_line/4` plus
-  `cast/4`), so `file:read_line/1` and `io:get_line/2` on a file device complete. Remaining typed
-  gaps of that request: a **request** `Enc` that is neither `latin1` nor `unicode` (incl. a
-  non-atom); invalid UTF-8 on a `unicode` device surfaces `beam_io`'s `invalid_unicode` stop where
-  the oracle answers `{error,{no_translation,unicode,latin1}}`; and after that `no_translation`
-  retire a further request hits the "closed io device" gap rather than the oracle's
-  `{error,terminated}`.
+  the same loop drives the `LineContinuation` (the oracle's `io_lib:collect_line/4` + `cast/4`), so
+  `file:read_line/1`/`io:get_line/2` complete. Typed gaps: a request `Enc` that is neither `latin1`
+  nor `unicode` (incl. a non-atom); invalid UTF-8 on a `unicode` device surfaces `beam_io`'s
+  `invalid_unicode` stop where the oracle answers `{error,{no_translation,unicode,latin1}}`, after
+  which a further request hits the "closed io device" gap rather than `{error,terminated}`.
 * **Other io-device requests stay the typed `unsupported` gap** — `setopts`/`getopts`/
   `pread`/`pwrite`/`advise`/`allocate`/`read_handle_info`, the legacy `put_chars` arities, a
   non-`latin1` encoding and `read_file_info`/`write_file`.
