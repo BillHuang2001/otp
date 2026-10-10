@@ -18,29 +18,45 @@
 //
 // %CopyrightEnd%
 
-//! `maps` module BIFs over flat maps: `new/0`, `from_list/1`, `to_list/1`,
-//! `get/2,3`, `find/2`, `put/3`, `update/3`, `remove/2`, `keys/1`, `values/1`,
-//! `size/1`, `is_key/2`, `merge/2`, `with/2`, `without/2`, `iterator/1`, `next/1`,
-//! the `fun`-taking `map/2`, `fold/3`, `filter/2` and `foreach/2`, plus the
-//! `erlang:map_*` entries `map_get/2`, `map_size/1` and `is_map_key/2`.
+//! `maps` module BIFs over **both** map representations: `new/0`, `from_list/1`,
+//! `to_list/1`, `get/2,3`, `find/2`, `put/3`, `update/3`, `remove/2`, `take/2`,
+//! `from_keys/2`, `keys/1`, `values/1`, `size/1`, `is_key/2`, `merge/2`, `with/2`,
+//! `without/2`, `iterator/1`, `next/1`, the `fun`-taking `map/2`, `fold/3`,
+//! `filter/2` and `foreach/2`, plus the `erlang:map_*` entries `map_get/2`,
+//! `map_size/1` and `is_map_key/2`.
 //!
-//! Ground truth (read-only): `../../erts/emulator/beam/erl_map.c` (the
-//! `maps_*` BIFs), `../../lib/stdlib/src/maps.erl` (the `new/0`/`to_list/1`/
-//! `get/3`/`size/1`/`with/2`/`without/2`/`iterator/1`/`next/1` wrappers) and
+//! Ground truth (read-only): `../../erts/emulator/beam/erl_map.c` (the `maps_*`
+//! BIFs and `erts_internal_map_next_3`), `../../lib/stdlib/src/maps.erl` (the
+//! `new/0`/`to_list/1`/`iterator/1`/`next/1` wrappers) and
 //! `../../erts/emulator/beam/bif.tab` (the roster: `bif maps:find/2`,
 //! `maps:get/2`, `maps:from_list/1`, `maps:is_key/2`, `maps:keys/1`,
 //! `maps:merge/2`, `maps:put/3`, `maps:remove/2`, `maps:update/3`,
 //! `maps:values/1`; `ubif erlang:map_size/1`, `erlang:map_get/2`,
-//! `erlang:is_map_key/2`). Flat-map layout is owned by `beam_term::thing`
-//! (`write_flatmap`/`flatmap_parts`) and reached through [`crate::access`].
+//! `erlang:is_map_key/2`).
+//!
+//! # The two map representations
+//!
+//! A map is a *flat* map when it holds at most `MAP_SMALL_MAP_LIMIT` (32) distinct
+//! keys and a *HAMT* hash map above that (`erl_map.h`). Both layouts are owned by
+//! `beam_term::map` (`write_map`/`map_pairs_storage_order`/`map_size`/`map_get`),
+//! which this module reaches through [`crate::access`] — so every reader and every
+//! producer below handles either representation, with no pair-count ceiling. The
+//! writer ([`build`] → [`crate::access::make_map`] → `beam_term::map::write_map`)
+//! picks the representation exactly as ERTS does (≤32 distinct keys ⇒ flat map with
+//! the keys in `erts_cmp_flatmap_keys` order, more ⇒ a HAMT keyed by `erts_map_hash`)
+//! and collapses duplicate keys **last value wins**.
+//!
+//! Reading a HAMT is the interesting half: an *existing* hash map reaches these BIFs
+//! whenever `beam_codec` decodes a `MAP_EXT` blob with more than 32 distinct keys
+//! (i.e. `binary_to_term/1`), or whenever one of the producers here returned one.
 //!
 //! # The `fun`-taking BIFs
 //!
 //! `map/2`, `fold/3`, `filter/2` and `foreach/2` are real `erl_map.c` BIFs, so
 //! they are registered here rather than left to `maps.erl`. They call their fun
 //! through [`BifContext::call_fun`] (the [`crate::FunCaller`] seam); with no caller
-//! installed (Milestone-1 has no in-crate evaluator) they raise `unsupported_bif`,
-//! and a fun's own failures propagate verbatim.
+//! installed they raise `unsupported_bif`, and a fun's own failures propagate
+//! verbatim.
 //!
 //! * `map(Fun, Map)` calls `Fun(Key, Value)` and stores the result — the keys are
 //!   unchanged, the values are the fun's results, in the map's stored order.
@@ -49,21 +65,19 @@
 //!   for its side effects and returns `ok`.
 //! * A predicate result that is not a `true`/`false` atom is the oracle's
 //!   `error:{case_clause, Value}` (see the structured-reason section below).
-//! * The traversal order is the map's **stored** order — the oracle's canonical
-//!   flat-map key order (see the section below) — so a `fold` that accumulates into
-//!   a list sees the oracle's pair sequence for any map this crate built.
+//! * The traversal order is the map's **stored** order (`map_pairs_storage_order`),
+//!   so a `fold` that accumulates into a list sees the oracle's pair sequence.
 //!
 //! The fun argument is **not** arity-checked here — that is the runtime's job when
 //! it invokes it — so `maps:map(5, #{})` returns `#{}` where the oracle raises
-//! `badarg` (documented Milestone-1 gap: a non-fun is only detected once a fun call
-//! actually happens).
+//! `badarg` (documented gap: a non-fun is only detected once a fun call happens).
 //!
 //! # Key identity is exact (`=:=`)
 //!
-//! Map keys are compared with [`beam_term::compare::eq`] — the *exact* `=:=` order.
-//! `#{1.0 => a}` and `#{1 => a}` are therefore distinct maps, and
-//! `maps:get(1, #{1.0 => a})` misses (see [`find_key`]). This is verified against
-//! the OTP 29 oracle: `maps:is_key(1, #{1.0 => a})` ⇒ `false`, while
+//! Map keys are compared with the *exact* `=:=` order (`beam_term::compare::eq`,
+//! via `beam_term::map`'s own lookup): `#{1.0 => a}` and `#{1 => a}` are therefore
+//! distinct maps, and `maps:get(1, #{1.0 => a})` misses. Verified against the OTP 29
+//! oracle: `maps:is_key(1, #{1.0 => a})` ⇒ `false`, while
 //! `maps:get(1.0, #{1.0 => a})` ⇒ `a`.
 //!
 //! # Structured reasons carry their term
@@ -84,171 +98,132 @@
 //! ⇒ `error:{badmap,1}`, and
 //! `... try maps:get(a,#{}) ...` ⇒ `error:{badkey,a}`.
 //!
-//! # Milestone-1 deviations (documented, never a silently wrong result)
+//! # Iterators (`iterator/1`, `next/1`, `to_list/1`)
 //!
-//! * **A map with more than 32 pairs is `system_limit`**
-//!   ([`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit)).
-//!   Every Milestone-1 map is a *flat* map, and `beam_term::thing::write_flatmap`
-//!   only writes up to `MAP_SMALL_MAP_LIMIT` (32) pairs — a 33-pair map must be a
-//!   HAMT hashmap, which no Milestone-1 code can build. Producing such a map
-//!   (`from_list`, `put`, `merge`, …) therefore reports `system_limit` rather than
-//!   a wrong map. Reading an *existing* hashmap term (an `is_hashmap` operand) is
-//!   likewise `system_limit` ([`map_parts`]); no Milestone-1 producer creates one,
-//!   so that branch is defensive.
-//! * **`iterator/1` yields the map's key/value list.** Real ERTS returns an opaque
-//!   iterator; Milestone-1 uses the documented stand-in of the map's `{Key, Value}`
-//!   pair list in stored order ([`iterator_1`]). [`next_1`] then peels one pair and
-//!   returns `{Key, Value, NextIter}` exactly as the oracle does, where `NextIter`
-//!   is the *remaining* pair list or the atom `none` when the list is exhausted;
-//!   an exhausted iterator (`none`, or the empty list) yields `none`. (The oracle
-//!   raises `badarg` for a bare `[]`, which in this representation *is* the
-//!   exhausted iterator for `#{}`.)
+//! `maps:iterator(Map)` is `[0 | Map]` — an improper cons whose head is the
+//! **path** into the map and whose tail is the map itself (`maps.erl:1062`) —
+//! *not* a `{Key, Value}` pair list. `maps:next(Iter)` returns the look-ahead form
+//! `{Key, Value, NextIter}`. `maps:to_list/1` accepts **either** a map (its stored
+//! order) **or** an iterator (the walk), and reports a bad iterator as the
+//! structured `error:{badmap, Iter}` (`maps.erl:531-543`). Oracle-pinned (OTP 29 /
+//! erts-17.1):
+//!
+//! * `maps:iterator(#{a=>1,b=>2,c=>3})` ⇒ `[0 | #{a=>1,b=>2,c=>3}]`.
+//! * `maps:next([0 | #{c=>3,b=>2,a=>1}])` ⇒ `{c,3,{b,2,{a,1,none}}}` — a flat map's
+//!   chain is emitted whole and terminates in `none`; the path is only bound-checked
+//!   (`maps:next([3 | …])` gives the same chain, `[4 | …]` is `badarg`).
+//! * `maps:next([Path | Map])` with a **list** path is the ordered form
+//!   (`maps:iterator(M, ordered)`): `{K, maps:get(K, Map), …}` for each key of the
+//!   path, `badarg` for a key the map lacks or an improper path tail, `none` at the
+//!   end of the list.
+//! * `maps:next({K,V,I})` ⇒ itself; `maps:next(none)` ⇒ `none`; anything else
+//!   (`5`, `[]`, `[0 | 5]`, `[a | Map]`) is `badarg`.
+//!
+//! **Documented deviation (chain chunking).** For a HAMT with an *integer* path the
+//! C emits at most `MAP_SMALL_MAP_LIMIT` pairs on the first (`path == 0`) call and
+//! then `min(remaining reductions / 4, size)` pairs per later call, appending a
+//! `[Path | Map]` continuation whose path is an internal trie-nibble encoding
+//! (`erl_map.c:3783-3810`). The chunk size is therefore a function of the process's
+//! remaining reduction budget — it changes between two identical calls in the same
+//! process — and is not reproducible outside the emulator's reduction accounting.
+//! This module emits the first call capped at [`MAP_SMALL_MAP_LIMIT`] pairs (matching
+//! the oracle's deterministic `path == 0` case) and every later call to completion,
+//! with the continuation path being this implementation's own opaque HAMT offset.
+//! The **pair sequence**, the **order**, and the terminal `none` are identical to the
+//! oracle's, which is all any walk (including `maps:to_list/1`) observes.
 //!
 //! # Order
 //!
 //! OTP documents map iteration order as unspecified, but the oracle is *not*
-//! arbitrary: every flat map it holds — one from a literal, one from
-//! `maps:from_list/1`, one rebuilt by `maps:put/3` — stores its keys in
-//! `erts_cmp_flatmap_keys` order (`erts/emulator/beam/erl_utils.h:267-272`;
-//! `erts_validate_and_sort_flatmap`): **atom keys by atom index, every other pair by
-//! the exact term order**. That is the order `maps:keys/1`/`maps:to_list/1` report and
-//! the order the `term_to_binary/1` image carries, so it is observable.
+//! arbitrary: a flat map stores its keys in `erts_cmp_flatmap_keys` order (atom keys
+//! by atom index, every other pair by the exact term order) and a HAMT in its
+//! trie's slot-traversal order. [`crate::access::map_pairs_storage_order`] returns
+//! exactly that order for either representation, and every order-defining reader
+//! (`keys/1`, `values/1`, `to_list/1`, the iterator walk) reports it **unchanged** —
+//! nothing here sorts a map's pairs. Oracle-pinned: `maps:keys/1` of the 33-key map
+//! `maps:from_list([{N,N} || N <- lists:seq(1,33)])` is
+//! `[18,4,12,19,29,13,2,7,31,8,10,23,9,15,32,1,25,28,20,6,11,17,24,14,33,3,16,30,21,5,27,26,22]`.
 //!
-//! [`build_map`] — the writer behind every producer here (`from_list`, `put`,
-//! `update`, `remove`, `take`, `from_keys`, `merge`, `with`, `without`, `map`,
-//! `filter`) — therefore sorts the pairs with [`compare::cmp_flatmap_keys`] before
-//! handing them to [`crate::access::make_flatmap`], and every reader returns the
-//! map's **stored** order unchanged. Oracle-pinned:
-//! `maps:from_list([{3,a},{1,b},{2,c}])` ⇒ `#{1 => b, 2 => c, 3 => a}` (keys
-//! `[1,2,3]`), and atom-keyed order follows the *index* rather than insertion or name
-//! (`X = list_to_atom("zzzq"), Y = list_to_atom("aaaq")` ⇒
-//! `maps:keys(maps:from_list([{X,1},{Y,2}]))` = `[zzzq,aaaq]`, while adding `a` gives
-//! `[a,zzzq,aaaq]`). The runtime's own atom indices are a documented Milestone-1 gap
-//! (`beam_rt`'s `CORE_ATOMS` is not the legacy `atom.names` order), so an
-//! *atom-keyed* order can still differ from the oracle's while the ordering *rule*
-//! above is identical.
-//!
-//! The `fun`-taking `map/2`/`fold/3`/`filter/2`/`foreach/2` traverse (and, where they
-//! rebuild, store) that same order, so a `fold` that accumulates into a list sees the
-//! oracle's pair sequence.
+//! The runtime's own atom indices are a documented gap (`beam_rt`'s `CORE_ATOMS` is
+//! not the legacy `atom.names` order), so an *atom-keyed* flat map's order can still
+//! differ from the oracle's while the ordering *rule* above is identical.
 
 use beam_common::Result;
-use beam_term::{atom_val, compare, AtomTable, Eterm};
+use beam_term::prelude::signed_value;
+use beam_term::{atom_val, compare, Eterm};
 
 use crate::access;
 use crate::context::BifContext;
-use crate::error::{badarg, structured_error, system_limit};
+use crate::error::{badarg, structured_error};
 use crate::print::proper_list;
 use crate::registry::BifRegistry;
 
-/// `MAP_SMALL_MAP_LIMIT` — the largest flat-map pair count, mirroring
-/// `beam_term::thing`'s (private) constant of the same name. ERTS switches to a
-/// hashmap above it (`erl_map.h:MAP_SMALL_MAP_LIMIT`); Milestone-1 has no HAMT
-/// builder, so a larger map is
-/// [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit) (see the module docs).
+/// `MAP_SMALL_MAP_LIMIT` (`erl_map.h:96`): the largest flat-map pair count. ERTS
+/// switches to a HAMT hash map above it. Mirroring
+/// `beam_term::map::MAP_SMALL_MAP_LIMIT`, and used here only as the HAMT iterator's
+/// per-call chunk cap (see the module docs).
 const MAP_SMALL_MAP_LIMIT: usize = 32;
 
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// Splits a *map* argument into its `(keys, values)`, in stored order.
+/// The `(key, value)` pairs of a *map* argument, in the map's **stored** order.
+///
+/// Both representations are handled: a flat map yields its keys-tuple order, a HAMT
+/// its trie slot-traversal order ([`crate::access::map_pairs_storage_order`]) — the
+/// order the oracle's `maps:keys/1`/`values/1`/`to_list/1` report.
 ///
 /// # Errors
 ///
 /// The oracle's structured `error:{badmap, Term}` — an
 /// [`ExitReason::Structured`](beam_common::ExitReason::Structured) raise carrying the
 /// `{badmap, Term}` tuple as its live reason term — when `term` is not a map
-/// (oracle: `maps:get(a, 1)` ⇒ `error:{badmap,1}`);
-/// [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit) when `term` is a hashmap (a >32-pair map, which the
-/// Milestone-1 flat-map layer cannot represent).
-fn map_parts(ctx: &mut BifContext<'_>, term: Eterm) -> Result<(Vec<Eterm>, Vec<Eterm>)> {
+/// (oracle: `maps:get(a, 1)` ⇒ `error:{badmap,1}`).
+fn map_pairs(ctx: &mut BifContext<'_>, term: Eterm) -> Result<Vec<(Eterm, Eterm)>> {
     if !access::is_map(term) {
         return Err(structured_error(ctx, "badmap", &[term])?);
     }
-    if !access::is_flatmap(term) {
-        // Only flat maps and hashmaps are `is_map`; this is the hashmap case.
-        return Err(system_limit());
-    }
-    access::flatmap_pairs(term)
+    // `term` is a live map, so the accessor cannot fail (its only error is `BadMap`).
+    access::map_pairs_storage_order(term)
 }
 
-/// The index of `key` within `keys` under exact (`=:=`) equality, if present.
-///
-/// The comparison is [`compare::eq`] — the same exact order `=:=` uses — so `1`
-/// and `1.0` are different keys.
-fn find_key(atoms: &AtomTable, keys: &[Eterm], key: Eterm) -> Option<usize> {
-    keys.iter().position(|&k| compare::eq(k, key, atoms))
-}
-
-/// Builds a flat map from parallel key/value vectors, storing the keys in the
-/// oracle's canonical **flat-map key order**.
-///
-/// ERTS keeps a flat map's key tuple sorted by `erts_cmp_flatmap_keys`
-/// (`erts/emulator/beam/erl_utils.h:267-272`, `erts_validate_and_sort_flatmap`):
-/// **two atom keys order by atom index, any other pair by the exact term order** —
-/// reproduced by [`compare::cmp_flatmap_keys`]. That stored order is observable
-/// through `maps:keys/1`, `maps:to_list/1`, `maps:iterator/1` and the
-/// `term_to_binary/1` image (the encoder emits the pairs in stored order), so an
-/// insertion-order writer diverges from the oracle. Oracle-pinned:
-/// `maps:from_list([{3,a},{1,b},{2,c}])` ⇒ `#{1 => b, 2 => c, 3 => a}` (keys
-/// `[1,2,3]`, image `<<131,116,0,0,0,3,97,1,119,1,98,97,2,119,1,99,97,3,119,1,97>>`).
-///
-/// Every caller passes already-deduplicated keys (each insert collapses a duplicate
-/// last-wins), so this sort is the only normalization the writer needs.
+/// Exact (`=:=`) lookup of `key` in the **map** `map` (`map` must already be a map).
 ///
 /// # Errors
 ///
-/// [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit) when there are more than [`MAP_SMALL_MAP_LIMIT`]
-/// pairs (a HAMT map, which Milestone-1 cannot build); otherwise propagates the
-/// heap's allocation failure.
-fn build_map(ctx: &mut BifContext<'_>, keys: &[Eterm], values: &[Eterm]) -> Result<Eterm> {
-    if keys.len() > MAP_SMALL_MAP_LIMIT {
-        return Err(system_limit());
-    }
-    let mut pairs: Vec<(Eterm, Eterm)> =
-        keys.iter().copied().zip(values.iter().copied()).collect();
-    pairs.sort_by(|a, b| compare::cmp_flatmap_keys(a.0, b.0, ctx.atoms()));
-    access::make_flatmap(ctx.heap(), &pairs)
+/// Propagates [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a non-map —
+/// unreachable for a caller that classified first, but never swallowed.
+fn map_lookup(ctx: &BifContext<'_>, map: Eterm, key: Eterm) -> Result<Option<Eterm>> {
+    access::map_get(map, key, ctx.atoms())
 }
 
-/// Builds the proper list of `{Key, Value}` pair tuples for a map argument.
+/// Builds a map term from `pairs` on the context heap.
 ///
-/// This is both `maps:to_list/1`'s result and the Milestone-1 iterator value (see
-/// the module docs).
-fn pair_list_of(ctx: &mut BifContext<'_>, map: Eterm) -> Result<Eterm> {
-    let (keys, values) = map_parts(ctx, map)?;
-    let mut pairs = Vec::with_capacity(keys.len());
-    for (k, v) in keys.iter().zip(values.iter()) {
-        pairs.push(ctx.tuple(&[*k, *v])?);
+/// The representation (flat map ≤32 distinct keys, HAMT above) and the stored key
+/// order are chosen by `beam_term::map::write_map`, which also collapses duplicate
+/// keys **last value wins** — so callers may pass duplicates freely (the oracle's
+/// `maps:from_list/1`, `merge/2`, `from_keys/2` and `put/3` all behave that way).
+///
+/// # Errors
+///
+/// Propagates the heap's allocation failure.
+fn build(ctx: &mut BifContext<'_>, pairs: &[(Eterm, Eterm)]) -> Result<Eterm> {
+    access::make_map(ctx.heap(), pairs)
+}
+
+/// Builds the proper list of `{Key, Value}` pair tuples for `pairs`.
+fn pair_list(ctx: &mut BifContext<'_>, pairs: &[(Eterm, Eterm)]) -> Result<Eterm> {
+    let mut out = Vec::with_capacity(pairs.len());
+    for &(k, v) in pairs {
+        out.push(ctx.tuple(&[k, v])?);
     }
-    ctx.list(&pairs)
+    ctx.list(&out)
 }
 
 /// Whether `term` is exactly the atom `name`.
 fn is_atom_named(ctx: &BifContext<'_>, term: Eterm, name: &str) -> bool {
     access::is_atom(term) && ctx.atoms().name(atom_val(term)) == Some(name)
-}
-
-/// The keys of `map` that occur in `wanted` (a list of candidate keys).
-///
-/// Collects the `(key, value)` pairs of `map` whose key is `=:=` to one of
-/// `wanted` — the shared core of `maps:with/2`.
-fn selected_pairs(
-    atoms: &AtomTable,
-    keys: &[Eterm],
-    values: &[Eterm],
-    wanted: &[Eterm],
-) -> (Vec<Eterm>, Vec<Eterm>) {
-    let mut out_keys = Vec::new();
-    let mut out_values = Vec::new();
-    for (&k, &v) in keys.iter().zip(values.iter()) {
-        if wanted.iter().any(|&w| compare::eq(w, k, atoms)) {
-            out_keys.push(k);
-            out_values.push(v);
-        }
-    }
-    (out_keys, out_values)
 }
 
 // ---------------------------------------------------------------------------
@@ -257,44 +232,71 @@ fn selected_pairs(
 
 /// `maps:new/0` — the empty map `#{}` (a three-word empty flat map).
 fn new_0(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
-    access::make_flatmap(ctx.heap(), &[])
+    build(ctx, &[])
 }
 
 /// `maps:from_list/1` — a map from a list of `{Key, Value}` tuples.
 ///
 /// A later duplicate key wins (`maps:from_list([{1,a},{1,b}])` ⇒ `#{1 => b}`,
-/// verified against the oracle).
+/// verified against the oracle), which `write_map`'s last-wins dedup gives directly.
 ///
 /// # Errors
 ///
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when the argument is not a proper list, or an element is
-/// not a 2-tuple (both exactly the oracle's `badarg`);
-/// [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit)
-/// when the result needs a hashmap (>32 distinct keys).
+/// not a 2-tuple (both exactly the oracle's `badarg`).
 fn from_list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let elems = proper_list(args[0]).ok_or_else(badarg)?;
-    let mut keys: Vec<Eterm> = Vec::new();
-    let mut values: Vec<Eterm> = Vec::new();
+    let mut pairs: Vec<(Eterm, Eterm)> = Vec::with_capacity(elems.len());
     for elem in elems {
         if !access::is_tuple(elem) || access::tuple_size(elem) != 2 {
             return Err(badarg());
         }
-        let key = access::tuple_element(elem, 0);
-        let value = access::tuple_element(elem, 1);
-        match find_key(ctx.atoms(), &keys, key) {
-            Some(i) => values[i] = value,
-            None => {
-                keys.push(key);
-                values.push(value);
-            }
-        }
+        pairs.push((access::tuple_element(elem, 0), access::tuple_element(elem, 1)));
     }
-    build_map(ctx, &keys, &values)
+    build(ctx, &pairs)
 }
 
-/// `maps:to_list/1` — the map's `{Key, Value}` pairs in stored order.
+/// `maps:to_list/1` — the `{Key, Value}` pairs of a **map** (stored order) or of an
+/// **iterator** (the walk).
+///
+/// # Errors
+///
+/// The oracle's structured `error:{badmap, Iter}` when the argument is neither a map
+/// nor a walkable iterator (`maps.erl:533-538`; any failure of the underlying
+/// `maps:next/1` is reported against the *original* argument, not the sub-iterator).
+/// Oracle-pinned: `maps:to_list(5)` ⇒ `error:{badmap,5}`,
+/// `maps:to_list({a,b,c})` ⇒ `error:{badmap,{a,b,c}}` (its third element `c` is not an
+/// iterator), `maps:to_list([])` ⇒ `error:{badmap,[]}`.
 fn to_list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    pair_list_of(ctx, args[0])
+    let arg = args[0];
+    if access::is_map(arg) {
+        let pairs = access::map_pairs_storage_order(arg)?;
+        return pair_list(ctx, &pairs);
+    }
+    // Iterator path: `to_list_from_iterator(next(Iter))`.
+    let badmap = |ctx: &mut BifContext<'_>| structured_error(ctx, "badmap", &[arg]).map(Err);
+    let mut acc: Vec<Eterm> = Vec::new();
+    let mut cur = match next_1(ctx, &[arg]) {
+        Ok(v) => v,
+        Err(_) => return badmap(ctx)?,
+    };
+    loop {
+        if is_atom_named(ctx, cur, "none") {
+            break;
+        }
+        if !(access::is_tuple(cur) && access::tuple_size(cur) == 3) {
+            return badmap(ctx)?;
+        }
+        let key = access::tuple_element(cur, 0);
+        let value = access::tuple_element(cur, 1);
+        let next_iter = access::tuple_element(cur, 2);
+        acc.push(ctx.tuple(&[key, value])?);
+        cur = match next_1(ctx, &[next_iter]) {
+            Ok(v) => v,
+            Err(_) => return badmap(ctx)?,
+        };
+    }
+    ctx.list(&acc)
 }
 
 /// `maps:get/2` and `erlang:map_get/2` — the value for `Key`.
@@ -308,9 +310,12 @@ fn to_list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `erl -noshell -eval 'try maps:get(a,1) catch C:R -> io:format("~p:~p~n",[C,R]) end, halt().'`
 /// ⇒ `error:{badmap,1}`; the same with `maps:get(a,#{})` ⇒ `error:{badkey,a}`.
 fn get_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let (keys, values) = map_parts(ctx, args[1])?;
-    match find_key(ctx.atoms(), &keys, args[0]) {
-        Some(i) => Ok(values[i]),
+    let map = args[1];
+    if !access::is_map(map) {
+        return Err(structured_error(ctx, "badmap", &[map])?);
+    }
+    match map_lookup(ctx, map, args[0])? {
+        Some(value) => Ok(value),
         None => Err(structured_error(ctx, "badkey", &[args[0]])?),
     }
 }
@@ -322,11 +327,11 @@ fn get_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// The oracle's structured `error:{badmap, Map}` when `Map` is not a map (the live
 /// reason term of the raise).
 fn get_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let (keys, values) = map_parts(ctx, args[1])?;
-    match find_key(ctx.atoms(), &keys, args[0]) {
-        Some(i) => Ok(values[i]),
-        None => Ok(args[2]),
+    let map = args[1];
+    if !access::is_map(map) {
+        return Err(structured_error(ctx, "badmap", &[map])?);
     }
+    Ok(map_lookup(ctx, map, args[0])?.unwrap_or(args[2]))
 }
 
 /// `maps:find/2` — `{ok, Value}` when `Key` is present, else the atom `error`.
@@ -336,11 +341,11 @@ fn get_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// The oracle's structured `error:{badmap, Map}` when `Map` is not a map (the live
 /// reason term of the raise); an absent `Key` is not an error.
 fn find_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let found = {
-        let (keys, values) = map_parts(ctx, args[1])?;
-        find_key(ctx.atoms(), &keys, args[0]).map(|i| values[i])
-    };
-    match found {
+    let map = args[1];
+    if !access::is_map(map) {
+        return Err(structured_error(ctx, "badmap", &[map])?);
+    }
+    match map_lookup(ctx, map, args[0])? {
         Some(value) => {
             let ok = ctx.ok()?;
             ctx.tuple(&[ok, value])
@@ -354,19 +359,12 @@ fn find_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// # Errors
 ///
 /// The oracle's structured `error:{badmap, Map}` when `Map` is not a map (the live
-/// reason term of the raise);
-/// [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit) when
-/// inserting a 33rd key needs a hashmap.
+/// reason term of the raise).
 fn put_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let (mut keys, mut values) = map_parts(ctx, args[2])?;
-    match find_key(ctx.atoms(), &keys, args[0]) {
-        Some(i) => values[i] = args[1],
-        None => {
-            keys.push(args[0]);
-            values.push(args[1]);
-        }
-    }
-    build_map(ctx, &keys, &values)
+    let mut pairs = map_pairs(ctx, args[2])?;
+    // Appending makes `write_map`'s last-wins dedup pick the new value.
+    pairs.push((args[0], args[1]));
+    build(ctx, &pairs)
 }
 
 /// `maps:update/3` — a new map with `Key`'s value replaced by `Value`.
@@ -381,14 +379,21 @@ fn put_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// A structured raise when `Map` is not a map (`error:{badmap, Map}`) or `Key` is absent
 /// (`error:{badkey, Key}`).
 fn update_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let (keys, mut values) = map_parts(ctx, args[2])?;
-    match find_key(ctx.atoms(), &keys, args[0]) {
-        Some(i) => {
-            values[i] = args[1];
-            build_map(ctx, &keys, &values)
+    let pairs = map_pairs(ctx, args[2])?;
+    let mut out: Vec<(Eterm, Eterm)> = Vec::with_capacity(pairs.len());
+    let mut found = false;
+    for (k, v) in pairs {
+        if compare::eq(k, args[0], ctx.atoms()) {
+            out.push((k, args[1]));
+            found = true;
+        } else {
+            out.push((k, v));
         }
-        None => Err(structured_error(ctx, "badkey", &[args[0]])?),
     }
+    if !found {
+        return Err(structured_error(ctx, "badkey", &[args[0]])?);
+    }
+    build(ctx, &out)
 }
 
 /// `maps:remove/2` — a new map without `Key` (a no-op when it is absent).
@@ -398,17 +403,12 @@ fn update_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// The oracle's structured `error:{badmap, Map}` when `Map` is not a map (the live
 /// reason term of the raise).
 fn remove_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let (keys, values) = map_parts(ctx, args[1])?;
-    let removed = find_key(ctx.atoms(), &keys, args[0]);
-    let mut out_keys = Vec::with_capacity(keys.len());
-    let mut out_values = Vec::with_capacity(values.len());
-    for (i, (&k, &v)) in keys.iter().zip(values.iter()).enumerate() {
-        if Some(i) != removed {
-            out_keys.push(k);
-            out_values.push(v);
-        }
-    }
-    build_map(ctx, &out_keys, &out_values)
+    let pairs = map_pairs(ctx, args[1])?;
+    let out: Vec<(Eterm, Eterm)> = pairs
+        .into_iter()
+        .filter(|&(k, _)| !compare::eq(k, args[0], ctx.atoms()))
+        .collect();
+    build(ctx, &out)
 }
 
 /// `maps:take/2` — `{Value, MapWithoutKey}` when `Key` is present, else `error`.
@@ -420,23 +420,23 @@ fn remove_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// # Errors
 ///
 /// The oracle's structured `error:{badmap, Map}` when `Map` is not a map (the live
-/// reason term of the raise); [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit) can only
-/// arise from a hashmap operand (defensive).
+/// reason term of the raise).
 fn take_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let (keys, values) = map_parts(ctx, args[1])?;
-    let Some(i) = find_key(ctx.atoms(), &keys, args[0]) else {
+    let pairs = map_pairs(ctx, args[1])?;
+    let Some(index) = pairs
+        .iter()
+        .position(|&(k, _)| compare::eq(k, args[0], ctx.atoms()))
+    else {
         return ctx.atom("error");
     };
-    let value = values[i];
-    let mut out_keys = Vec::with_capacity(keys.len());
-    let mut out_values = Vec::with_capacity(values.len());
-    for (j, (&k, &v)) in keys.iter().zip(values.iter()).enumerate() {
-        if j != i {
-            out_keys.push(k);
-            out_values.push(v);
-        }
-    }
-    let rest = build_map(ctx, &out_keys, &out_values)?;
+    let value = pairs[index].1;
+    let rest: Vec<(Eterm, Eterm)> = pairs
+        .into_iter()
+        .enumerate()
+        .filter(|&(j, _)| j != index)
+        .map(|(_, pair)| pair)
+        .collect();
+    let rest = build(ctx, &rest)?;
     ctx.tuple(&[value, rest])
 }
 
@@ -445,41 +445,51 @@ fn take_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// A duplicate key collapses to one pair (`maps:from_keys([a,a], 2)` ⇒ `#{a => 2}`),
 /// and the empty list gives `#{}`. The keys may be any terms, and two keys that are
 /// *distinct* under `=:=` but equal under `==` stay separate
-/// (`maps:from_keys([1,1.0], v)` ⇒ `#{1 => v, 1.0 => v}`).
+/// (`maps:from_keys([1,1.0], v)` ⇒ `#{1 => v, 1.0 => v}`) — both follow from
+/// `write_map`'s exact-key, last-wins dedup.
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `Keys` is not a proper list (the oracle's `badarg`);
-/// [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit) when more than 32 *distinct* keys would need a
-/// hashmap (a Milestone-1 gap — see the module docs).
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `Keys` is not a proper list (the oracle's `badarg`).
 fn from_keys_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let keys = proper_list(args[0]).ok_or_else(badarg)?;
-    let mut out_keys: Vec<Eterm> = Vec::new();
-    for key in keys {
-        if find_key(ctx.atoms(), &out_keys, key).is_none() {
-            out_keys.push(key);
-        }
-    }
-    let values = vec![args[1]; out_keys.len()];
-    build_map(ctx, &out_keys, &values)
+    let pairs: Vec<(Eterm, Eterm)> = keys.into_iter().map(|k| (k, args[1])).collect();
+    build(ctx, &pairs)
 }
 
 /// `maps:keys/1` — the map's keys, in stored order.
+///
+/// # Errors
+///
+/// The oracle's structured `error:{badmap, Term}` when the argument is not a map.
 fn keys_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let (keys, _) = map_parts(ctx, args[0])?;
+    let pairs = map_pairs(ctx, args[0])?;
+    let keys: Vec<Eterm> = pairs.into_iter().map(|(k, _)| k).collect();
     ctx.list(&keys)
 }
 
 /// `maps:values/1` — the map's values, in stored order.
+///
+/// # Errors
+///
+/// The oracle's structured `error:{badmap, Term}` when the argument is not a map.
 fn values_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let (_, values) = map_parts(ctx, args[0])?;
+    let pairs = map_pairs(ctx, args[0])?;
+    let values: Vec<Eterm> = pairs.into_iter().map(|(_, v)| v).collect();
     ctx.list(&values)
 }
 
 /// `maps:size/1` and `erlang:map_size/1` — the number of pairs.
+///
+/// # Errors
+///
+/// The oracle's structured `error:{badmap, Term}` when the argument is not a map.
 fn size_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let (keys, _) = map_parts(ctx, args[0])?;
-    ctx.int(keys.len() as i64)
+    if !access::is_map(args[0]) {
+        return Err(structured_error(ctx, "badmap", &[args[0]])?);
+    }
+    let n = access::map_size(args[0])?;
+    ctx.int(n as i64)
 }
 
 /// `maps:is_key/2` and `erlang:is_map_key/2` — whether `Key` is present.
@@ -489,8 +499,11 @@ fn size_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// The oracle's structured `error:{badmap, Map}` when `Map` is not a map (the live
 /// reason term of the raise).
 fn is_key_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let (keys, _) = map_parts(ctx, args[1])?;
-    let present = find_key(ctx.atoms(), &keys, args[0]).is_some();
+    let map = args[1];
+    if !access::is_map(map) {
+        return Err(structured_error(ctx, "badmap", &[map])?);
+    }
+    let present = map_lookup(ctx, map, args[0])?.is_some();
     ctx.boolean(present)
 }
 
@@ -499,21 +512,12 @@ fn is_key_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// # Errors
 ///
 /// The oracle's structured `error:{badmap, Map}` naming whichever argument is not a map
-/// (the live reason term of the raise);
-/// [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit) when the union needs a hashmap (>32 pairs).
+/// (the live reason term of the raise).
 fn merge_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let (mut keys, mut values) = map_parts(ctx, args[0])?;
-    let (keys2, values2) = map_parts(ctx, args[1])?;
-    for (&k, &v) in keys2.iter().zip(values2.iter()) {
-        match find_key(ctx.atoms(), &keys, k) {
-            Some(i) => values[i] = v,
-            None => {
-                keys.push(k);
-                values.push(v);
-            }
-        }
-    }
-    build_map(ctx, &keys, &values)
+    let mut pairs = map_pairs(ctx, args[0])?;
+    // Appending `Map2`'s pairs makes its value win on a shared key (last wins).
+    pairs.extend(map_pairs(ctx, args[1])?);
+    build(ctx, &pairs)
 }
 
 /// `maps:with/2` — the entries of `Map` whose key is in `Keys`.
@@ -524,9 +528,14 @@ fn merge_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `badarg`); the oracle's structured `error:{badmap, Map}` when `Map` is not a map.
 fn with_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let wanted = proper_list(args[0]).ok_or_else(badarg)?;
-    let (keys, values) = map_parts(ctx, args[1])?;
-    let (out_keys, out_values) = selected_pairs(ctx.atoms(), &keys, &values, &wanted);
-    build_map(ctx, &out_keys, &out_values)
+    let pairs = map_pairs(ctx, args[1])?;
+    let mut out: Vec<(Eterm, Eterm)> = Vec::new();
+    for (k, v) in pairs {
+        if wanted.iter().any(|&w| compare::eq(w, k, ctx.atoms())) {
+            out.push((k, v));
+        }
+    }
+    build(ctx, &out)
 }
 
 /// `maps:without/2` — the entries of `Map` whose key is **not** in `Keys`.
@@ -537,56 +546,150 @@ fn with_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `badarg`); the oracle's structured `error:{badmap, Map}` when `Map` is not a map.
 fn without_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let unwanted = proper_list(args[0]).ok_or_else(badarg)?;
-    let (keys, values) = map_parts(ctx, args[1])?;
-    let mut out_keys = Vec::new();
-    let mut out_values = Vec::new();
-    for (&k, &v) in keys.iter().zip(values.iter()) {
+    let pairs = map_pairs(ctx, args[1])?;
+    let mut out: Vec<(Eterm, Eterm)> = Vec::new();
+    for (k, v) in pairs {
         if !unwanted.iter().any(|&w| compare::eq(w, k, ctx.atoms())) {
-            out_keys.push(k);
-            out_values.push(v);
+            out.push((k, v));
         }
     }
-    build_map(ctx, &out_keys, &out_values)
+    build(ctx, &out)
 }
 
-/// `maps:iterator/1` — the Milestone-1 iterator: the map's key/value list.
+/// `maps:iterator/1` — the oracle's `[0 | Map]` improper-cons iterator.
 ///
-/// See the module docs; real ERTS returns an opaque iterator term.
+/// # Errors
+///
+/// The oracle's structured `error:{badmap, Map}` when the argument is not a map
+/// (`maps.erl:983-984`); pinned by the oracle: `maps:iterator(1)` ⇒
+/// `error:{badmap,1}`.
 fn iterator_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    pair_list_of(ctx, args[0])
+    let map = args[0];
+    if !access::is_map(map) {
+        return Err(structured_error(ctx, "badmap", &[map])?);
+    }
+    let path = ctx.int(0)?;
+    ctx.cons(path, map)
 }
 
 /// `maps:next/1` — `{Key, Value, NextIter}`, or the atom `none` when exhausted.
 ///
-/// `NextIter` is the remaining key/value list, or `none` once the last pair has been
-/// returned; an already-exhausted iterator (the atom `none`, or the empty list the
-/// [`iterator_1`] of `#{}` produces) yields `none`.
+/// Mirrors `maps.erl:1104-1117` / `erts_internal_map_next_3`:
+///
+/// * `{K, V, I}` ⇒ itself (the look-ahead chain is already built).
+/// * `none` ⇒ `none`.
+/// * `[Path | Map]`, `Map` a map and `Path` an integer or a list ⇒ the chain; see the
+///   module docs for the path semantics and the documented chunking deviation.
+/// * Anything else ⇒ `badarg`.
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when the argument is neither `none`, the empty list, nor a
-/// list of 2-tuples (a malformed iterator).
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a malformed iterator — a non-map tail, a
+/// non-integer/non-list path, an out-of-range integer path, an ordered path that names a
+/// key the map lacks, or an improper ordered path tail (each exactly the oracle's
+/// `badarg`).
 fn next_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let iter = args[0];
-    if access::is_nil(iter) || is_atom_named(ctx, iter, "none") {
+    if is_atom_named(ctx, iter, "none") {
         return ctx.atom("none");
     }
+    if access::is_tuple(iter) && access::tuple_size(iter) == 3 {
+        return Ok(iter);
+    }
+    // `[]` is not a cons, so it falls through to `badarg` — the oracle's answer for a
+    // bare empty list (only `none` terminates).
     if !access::is_list(iter) {
         return Err(badarg());
     }
-    let pair = access::car(iter);
-    if !access::is_tuple(pair) || access::tuple_size(pair) != 2 {
+    let path = access::car(iter);
+    let map = access::cdr(iter);
+    if !access::is_map(map) {
         return Err(badarg());
     }
-    let key = access::tuple_element(pair, 0);
-    let value = access::tuple_element(pair, 1);
-    let rest = access::cdr(iter);
-    let next_iter = if access::is_nil(rest) {
-        ctx.atom("none")?
+    if access::is_list(path) || access::is_nil(path) {
+        // Ordered iterator (`maps:iterator(M, ordered)`): the path is the key list.
+        return ordered_next(ctx, path, map);
+    }
+    if !access::is_small(path) {
+        // A bignum path is a documented gap (the C decodes its digits as the trie
+        // path); a negative small int is out of range below.
+        return Err(badarg());
+    }
+    let start = signed_value(path);
+    if start < 0 {
+        return Err(badarg());
+    }
+    let start = start as usize;
+    let pairs = access::map_pairs_storage_order(map)?;
+    let n = pairs.len();
+    if start > n {
+        return Err(badarg());
+    }
+    if !access::is_hashmap(map) {
+        // A flat map ignores the path beyond the bound check and emits the whole chain.
+        let none = ctx.atom("none")?;
+        return chain(ctx, &pairs, 0, n, none);
+    }
+    // A HAMT: chunk at `MAP_SMALL_MAP_LIMIT`, continuing at `[start + chunk | Map]`.
+    let end = core::cmp::min(start + MAP_SMALL_MAP_LIMIT, n);
+    let terminal = if end < n {
+        let next_path = ctx.int(end as i64)?;
+        ctx.cons(next_path, map)?
     } else {
-        rest
+        ctx.atom("none")?
     };
-    ctx.tuple(&[key, value, next_iter])
+    chain(ctx, &pairs, start, end, terminal)
+}
+
+/// Builds `{k[i], v[i], …}` for `i` in `from..end` (ascending), ending in `terminal`.
+fn chain(
+    ctx: &mut BifContext<'_>,
+    pairs: &[(Eterm, Eterm)],
+    from: usize,
+    end: usize,
+    terminal: Eterm,
+) -> Result<Eterm> {
+    let mut result = terminal;
+    for i in (from..end).rev() {
+        result = ctx.tuple(&[pairs[i].0, pairs[i].1, result])?;
+    }
+    Ok(result)
+}
+
+/// The ordered-iterator walk (`erts_internal_map_next_3`'s list-path arm): the chain
+/// is `{K, maps:get(K, Map), …}` for every key of `keys`, terminating in `none`.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when a key of `keys` is absent from `map`, or when
+/// `keys` has an improper tail (the C's `ordered_badarg`).
+fn ordered_next(ctx: &mut BifContext<'_>, keys_list: Eterm, map: Eterm) -> Result<Eterm> {
+    let mut keys: Vec<Eterm> = Vec::new();
+    let mut cur = keys_list;
+    loop {
+        if access::is_nil(cur) {
+            break;
+        }
+        if !access::is_list(cur) {
+            // An improper path tail: the C jumps to `ordered_badarg`.
+            return Err(badarg());
+        }
+        keys.push(access::car(cur));
+        cur = access::cdr(cur);
+    }
+    let mut values: Vec<Eterm> = Vec::with_capacity(keys.len());
+    for &key in &keys {
+        match map_lookup(ctx, map, key)? {
+            Some(value) => values.push(value),
+            None => return Err(badarg()),
+        }
+    }
+    let none = ctx.atom("none")?;
+    let mut result = none;
+    for i in (0..keys.len()).rev() {
+        result = ctx.tuple(&[keys[i], values[i], result])?;
+    }
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -615,24 +718,23 @@ fn predicate_holds(ctx: &mut BifContext<'_>, result: Eterm) -> Result<bool> {
 /// `maps:map(Fun, Map)` — `Fun(Key, Value)` supplies each value.
 ///
 /// The keys and their order are unchanged; only the values are the fun's results.
-/// A `>32`-pair result is [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit)
-/// like every other map producer here.
 fn map_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
-    let (keys, values) = map_parts(ctx, args[1])?;
-    let mut mapped = Vec::with_capacity(values.len());
-    for (&key, &value) in keys.iter().zip(values.iter()) {
-        mapped.push(ctx.call_fun(fun, &[key, value])?);
+    let pairs = map_pairs(ctx, args[1])?;
+    let mut out: Vec<(Eterm, Eterm)> = Vec::with_capacity(pairs.len());
+    for (key, value) in pairs {
+        let mapped = ctx.call_fun(fun, &[key, value])?;
+        out.push((key, mapped));
     }
-    build_map(ctx, &keys, &mapped)
+    build(ctx, &out)
 }
 
 /// `maps:fold(Fun, Init, Map)` — `Acc = Fun(Key, Value, Acc)` over every pair.
 fn fold_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
     let mut acc = args[1];
-    let (keys, values) = map_parts(ctx, args[2])?;
-    for (&key, &value) in keys.iter().zip(values.iter()) {
+    let pairs = map_pairs(ctx, args[2])?;
+    for (key, value) in pairs {
         acc = ctx.call_fun(fun, &[key, value, acc])?;
     }
     Ok(acc)
@@ -641,24 +743,22 @@ fn fold_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `maps:filter(Pred, Map)` — the `{Key, Value}` pairs whose predicate is `true`.
 fn filter_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
-    let (keys, values) = map_parts(ctx, args[1])?;
-    let mut kept_keys = Vec::new();
-    let mut kept_values = Vec::new();
-    for (&key, &value) in keys.iter().zip(values.iter()) {
+    let pairs = map_pairs(ctx, args[1])?;
+    let mut out: Vec<(Eterm, Eterm)> = Vec::new();
+    for (key, value) in pairs {
         let result = ctx.call_fun(fun, &[key, value])?;
         if predicate_holds(ctx, result)? {
-            kept_keys.push(key);
-            kept_values.push(value);
+            out.push((key, value));
         }
     }
-    build_map(ctx, &kept_keys, &kept_values)
+    build(ctx, &out)
 }
 
 /// `maps:foreach(Fun, Map)` — `Fun(Key, Value)` for its side effects; `ok`.
 fn foreach_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
-    let (keys, values) = map_parts(ctx, args[1])?;
-    for (&key, &value) in keys.iter().zip(values.iter()) {
+    let pairs = map_pairs(ctx, args[1])?;
+    for (key, value) in pairs {
         ctx.call_fun(fun, &[key, value])?;
     }
     ctx.ok()
@@ -720,16 +820,13 @@ mod tests {
     }
 
     fn with_ctx<R>(f: impl FnOnce(&mut BifContext<'_>) -> R) -> R {
-        let mut heap = Heap::new(8192).expect("test heap");
+        let mut heap = Heap::new(1 << 16).expect("test heap");
         let atoms = atoms();
         let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
         f(&mut ctx)
     }
 
-    /// Asserts that `result` is the oracle's `error:{Tag, Value}` **structured** raise:
-    /// the class is `error`, the reason is `ExitReason::Structured` (so
-    /// `BeamError::as_atom` is `None`) and the live reason term is the 2-tuple
-    /// `{Tag, Value}`.
+    /// Asserts that `result` is the oracle's `error:{Tag, Value}` **structured** raise.
     #[track_caller]
     fn assert_structured(
         result: Result<Eterm>,
@@ -762,19 +859,32 @@ mod tests {
         }
     }
 
-    /// A flat map with `pairs` on the context heap.
+    /// A map with `pairs` on the context heap.
     fn map(ctx: &mut BifContext<'_>, pairs: &[(Eterm, Eterm)]) -> Eterm {
-        access::make_flatmap(ctx.heap(), pairs).expect("the map fits")
+        build(ctx, pairs).expect("the map fits")
     }
 
-    /// The stored keys of a flat map.
+    /// The stored `(key, value)` pairs of **any** map.
+    fn pairs_of(term: Eterm) -> Vec<(Eterm, Eterm)> {
+        access::map_pairs_storage_order(term).expect("a map")
+    }
+
     fn keys_of(term: Eterm) -> Vec<Eterm> {
-        access::flatmap_pairs(term).expect("a flat map").0
+        pairs_of(term).into_iter().map(|(k, _)| k).collect()
     }
 
-    /// The stored values of a flat map.
     fn values_of(term: Eterm) -> Vec<Eterm> {
-        access::flatmap_pairs(term).expect("a flat map").1
+        pairs_of(term).into_iter().map(|(_, v)| v).collect()
+    }
+
+    /// `(k, v)` pairs of `1..=n` mapped to themselves.
+    fn ident_pairs(ctx: &mut BifContext<'_>, n: i64) -> Vec<(Eterm, Eterm)> {
+        (1..=n)
+            .map(|i| {
+                let k = ctx.int(i).unwrap();
+                (k, k)
+            })
+            .collect()
     }
 
     #[test]
@@ -806,7 +916,6 @@ mod tests {
             assert_eq!(keys_of(m), vec![one, two]);
             assert_eq!(values_of(m), vec![a, b]);
 
-            // `to_list/1` rebuilds the `{K, V}` list in stored order.
             let back = to_list_1(ctx, &[m]).expect("maps:to_list/1");
             let elems = proper_list(back).expect("a proper list");
             assert_eq!(elems.len(), 2);
@@ -838,13 +947,7 @@ mod tests {
     #[test]
     fn from_list_stores_keys_in_the_canonical_flatmap_key_order() {
         with_ctx(|ctx| {
-            // Oracle pin:
-            //   erl -noshell -eval 'io:format("~w~n",[maps:keys(maps:from_list([{3,a},{1,b},{2,c}]))]), halt().'
-            //     => [1,2,3]
-            //   erl -noshell -eval 'io:format("~w~n",[term_to_binary(maps:from_list([{3,a},{1,b},{2,c}]))]), halt().'
-            //     => <<131,116,0,0,0,3,97,1,119,1,98,97,2,119,1,99,97,3,119,1,97>>
-            // i.e. `#{1 => b, 2 => c, 3 => a}`: the keys are stored sorted, so the
-            // *values* follow the keys, not the input list.
+            // Oracle: `maps:keys(maps:from_list([{3,a},{1,b},{2,c}]))` => [1,2,3]
             let one = ctx.int(1).unwrap();
             let two = ctx.int(2).unwrap();
             let three = ctx.int(3).unwrap();
@@ -857,72 +960,8 @@ mod tests {
             let list = ctx.list(&[p3, p1, p2]).unwrap();
 
             let m = from_list_1(ctx, &[list]).expect("maps:from_list/1");
-            // The insertion order would be [3, 1, 2]; the oracle stores [1, 2, 3].
             assert_eq!(keys_of(m), vec![one, two, three]);
             assert_eq!(values_of(m), vec![b, c, a]);
-
-            // `to_list/1` reports the same stored order.
-            let back = to_list_1(ctx, &[m]).expect("maps:to_list/1");
-            let elems = proper_list(back).expect("a proper list");
-            assert_eq!(access::tuple_element(elems[0], 0), one);
-            assert_eq!(access::tuple_element(elems[0], 1), b);
-            assert_eq!(access::tuple_element(elems[2], 0), three);
-            assert_eq!(access::tuple_element(elems[2], 1), a);
-        });
-    }
-
-    #[test]
-    fn atom_keys_order_by_the_flatmap_key_rule_not_by_insertion() {
-        with_ctx(|ctx| {
-            // Oracle: atom keys are stored by *atom index* (`erts_cmp_flatmap_keys`),
-            // never by insertion order or by name:
-            //   erl -noshell -eval 'X=list_to_atom("zzzq"), Y=list_to_atom("aaaq"),
-            //     io:format("~w~n",[maps:keys(maps:from_list([{X,1},{Y,2}]))]), halt().'
-            //     => [zzzq,aaaq]   (X was interned first)
-            //   erl -noshell -eval 'io:format("~w~n",[maps:keys(maps:from_list([{a,1},{b,2},{c,3}]))]), halt().'
-            //     => [c,b,a]       (in ERTS, index(c) < index(b) < index(a))
-            // This test table seeds `a`, `b`, `c` in that order, so here the index
-            // order *is* [a, b, c] and an insertion-order writer would give [c, b, a].
-            let a = ctx.atom("a").unwrap();
-            let b = ctx.atom("b").unwrap();
-            let c = ctx.atom("c").unwrap();
-            let pairs: Vec<Eterm> = [c, b, a]
-                .iter()
-                .map(|&k| ctx.tuple(&[k, make_small(1)]).unwrap())
-                .collect();
-            let list = ctx.list(&pairs).unwrap();
-
-            let m = from_list_1(ctx, &[list]).expect("maps:from_list/1");
-            assert_eq!(keys_of(m), vec![a, b, c]);
-            // Exactly the order the shared flat-map key comparator defines.
-            let mut expected = vec![a, b, c];
-            expected.sort_by(|x, y| compare::cmp_flatmap_keys(*x, *y, ctx.atoms()));
-            assert_eq!(keys_of(m), expected);
-        });
-    }
-
-    #[test]
-    fn every_producer_stores_keys_in_the_canonical_order() {
-        with_ctx(|ctx| {
-            let zero = ctx.int(0).unwrap();
-            let one = ctx.int(1).unwrap();
-            let two = ctx.int(2).unwrap();
-            let a = ctx.atom("a").unwrap();
-
-            let m = map(ctx, &[(one, a), (two, a)]);
-            // Inserting a key that sorts *first* stores it first (the oracle's
-            // `erts_maps_put` inserts into the sorted key tuple).
-            let inserted = put_3(ctx, &[zero, a, m]).unwrap();
-            assert_eq!(keys_of(inserted), vec![zero, one, two]);
-
-            // `merge/2` re-stores the union in the same order.
-            let first = map(ctx, &[(zero, a)]);
-            let merged = merge_2(ctx, &[m, first]).unwrap();
-            assert_eq!(keys_of(merged), vec![zero, one, two]);
-
-            // `remove/2` of an absent key still yields the canonical order.
-            let absent = remove_2(ctx, &[zero, m]).unwrap();
-            assert_eq!(keys_of(absent), vec![one, two]);
         });
     }
 
@@ -931,22 +970,18 @@ mod tests {
         with_ctx(|ctx| {
             let a = ctx.atom("a").unwrap();
 
-            // Not a list at all: oracle `badarg`.
             assert!(matches!(from_list_1(ctx, &[make_small(1)]), Err(BeamError::BadArg)));
 
-            // A non-tuple element: oracle `badarg`.
             let not_a_pair = ctx.list(&[make_small(1)]).unwrap();
             assert!(matches!(
                 from_list_1(ctx, &[not_a_pair]),
                 Err(BeamError::BadArg)
             ));
 
-            // A 3-tuple element: oracle `badarg` (only 2-tuples are pairs).
             let three = ctx.tuple(&[make_small(1), make_small(2), make_small(3)]).unwrap();
             let has_three = ctx.list(&[three]).unwrap();
             assert!(matches!(from_list_1(ctx, &[has_three]), Err(BeamError::BadArg)));
 
-            // An improper list: the oracle's `function_clause` is reported as `badarg`.
             let improper = ctx.cons(make_small(1), a).unwrap();
             assert!(matches!(from_list_1(ctx, &[improper]), Err(BeamError::BadArg)));
         });
@@ -960,16 +995,13 @@ mod tests {
             let m = map(ctx, &[(one, two)]);
 
             assert_eq!(get_2(ctx, &[one, m]).unwrap(), two);
-            // A missing key is the oracle's `error:{badkey, 9}`.
             //   erl -noshell -eval 'try maps:get(9,#{1=>2}) catch C:R ->
             //     io:format("~p:~p~n",[C,R]) end, halt().'  =>  error:{badkey,9}
             let miss = get_2(ctx, &[make_small(9), m]);
             assert_structured(miss, ctx, "badkey", make_small(9));
-            // `get/3` returns the default on a miss.
             assert_eq!(get_3(ctx, &[make_small(9), m, make_small(7)]).unwrap(), make_small(7));
             assert_eq!(get_3(ctx, &[one, m, make_small(7)]).unwrap(), two);
 
-            // A non-map second argument is the oracle's `error:{badmap, 9}`.
             //   erl -noshell -eval 'try maps:get(1,9) catch C:R ->
             //     io:format("~p:~p~n",[C,R]) end, halt().'  =>  error:{badmap,9}
             let bad_map = get_2(ctx, &[one, make_small(9)]);
@@ -988,16 +1020,12 @@ mod tests {
             let m = map(ctx, &[(float_one, a)]);
 
             assert_eq!(get_2(ctx, &[float_one, m]).unwrap(), a);
-            // `1` is not the key `1.0`: both miss with the oracle's `error:{badkey, 1}`.
-            //   erl -noshell -eval 'try maps:update(1,a,#{1.0=>a}) catch C:R ->
-            //     io:format("~p:~p~n",[C,R]) end, halt().'  =>  error:{badkey,1}
             let miss = get_2(ctx, &[one, m]);
             assert_structured(miss, ctx, "badkey", one);
             let miss_update = update_3(ctx, &[one, a, m]);
             assert_structured(miss_update, ctx, "badkey", one);
             assert_eq!(is_key_2(ctx, &[one, m]).unwrap(), ctx.boolean(false).unwrap());
             assert_eq!(is_key_2(ctx, &[float_one, m]).unwrap(), ctx.boolean(true).unwrap());
-            // `put(1, ...)` adds a second, distinct key.
             let two_keys = put_3(ctx, &[one, a, m]).unwrap();
             assert_eq!(size_1(ctx, &[two_keys]).unwrap(), make_small(2));
         });
@@ -1018,16 +1046,13 @@ mod tests {
             let miss = find_2(ctx, &[make_small(9), m]).unwrap();
             assert!(is_atom_named(ctx, miss, "error"));
 
-            // A non-map operand is the oracle's `error:{badmap, 9}`.
-            //   erl -noshell -eval 'try maps:find(1,9) catch C:R ->
-            //     io:format("~p:~p~n",[C,R]) end, halt().'  =>  error:{badmap,9}
             let bad_map = find_2(ctx, &[one, make_small(9)]);
             assert_structured(bad_map, ctx, "badmap", make_small(9));
         });
     }
 
     #[test]
-    fn put_inserts_and_replaces_without_mutating_the_input() {
+    fn put_update_remove_and_take() {
         with_ctx(|ctx| {
             let one = ctx.int(1).unwrap();
             let two = ctx.int(2).unwrap();
@@ -1035,66 +1060,31 @@ mod tests {
             let m = map(ctx, &[(one, two)]);
 
             let replaced = put_3(ctx, &[one, nine, m]).unwrap();
-            assert_eq!(keys_of(replaced), vec![one]);
             assert_eq!(values_of(replaced), vec![nine]);
-            // The original map is unchanged.
             assert_eq!(values_of(m), vec![two]);
 
             let inserted = put_3(ctx, &[nine, one, m]).unwrap();
             assert_eq!(keys_of(inserted), vec![one, nine]);
-            assert_eq!(values_of(inserted), vec![two, one]);
-
-            // A non-map third argument is the oracle's `error:{badmap, 9}`.
-            //   erl -noshell -eval 'try maps:put(1,2,9) catch C:R ->
-            //     io:format("~p:~p~n",[C,R]) end, halt().'  =>  error:{badmap,9}
-            let bad_map = put_3(ctx, &[one, two, nine]);
-            assert_structured(bad_map, ctx, "badmap", nine);
-        });
-    }
-
-    #[test]
-    fn update_replaces_but_rejects_an_absent_key() {
-        with_ctx(|ctx| {
-            let one = ctx.int(1).unwrap();
-            let two = ctx.int(2).unwrap();
-            let nine = ctx.int(9).unwrap();
-            let m = map(ctx, &[(one, two)]);
 
             let updated = update_3(ctx, &[one, nine, m]).unwrap();
-            assert_eq!(keys_of(updated), vec![one]);
             assert_eq!(values_of(updated), vec![nine]);
-
-            // It does not insert: a missing key is the oracle's `error:{badkey, 9}`.
-            //   erl -noshell -eval 'try maps:update(9,1,#{1=>2}) catch C:R ->
-            //     io:format("~p:~p~n",[C,R]) end, halt().'  =>  error:{badkey,9}
             let miss = update_3(ctx, &[nine, one, m]);
             assert_structured(miss, ctx, "badkey", nine);
-            let bad_map = update_3(ctx, &[one, one, nine]);
-            assert_structured(bad_map, ctx, "badmap", nine);
-        });
-    }
-
-    #[test]
-    fn remove_drops_a_key_and_is_a_no_op_when_absent() {
-        with_ctx(|ctx| {
-            let one = ctx.int(1).unwrap();
-            let two = ctx.int(2).unwrap();
-            let nine = ctx.int(9).unwrap();
-            let m = map(ctx, &[(one, two), (nine, one)]);
 
             let removed = remove_2(ctx, &[one, m]).unwrap();
-            assert_eq!(keys_of(removed), vec![nine]);
-            assert_eq!(values_of(removed), vec![one]);
-
-            // Removing an absent key returns the map unchanged.
+            assert!(keys_of(removed).is_empty());
             let absent = remove_2(ctx, &[make_small(7), m]).unwrap();
-            assert_eq!(keys_of(absent), vec![one, nine]);
+            assert_eq!(keys_of(absent), vec![one]);
 
-            // A non-map second argument is the oracle's `error:{badmap, 9}`.
-            //   erl -noshell -eval 'try maps:remove(1,9) catch C:R ->
-            //     io:format("~p:~p~n",[C,R]) end, halt().'  =>  error:{badmap,9}
-            let bad_map = remove_2(ctx, &[one, nine]);
-            assert_structured(bad_map, ctx, "badmap", nine);
+            let taken = take_2(ctx, &[one, m]).unwrap();
+            assert_eq!(access::tuple_element(taken, 0), two);
+            assert!(keys_of(access::tuple_element(taken, 1)).is_empty());
+            let taken_miss = take_2(ctx, &[nine, m]).unwrap();
+            assert!(is_atom_named(ctx, taken_miss, "error"));
+
+            for bad in [put_3(ctx, &[one, two, nine]), remove_2(ctx, &[one, nine])] {
+                assert_structured(bad, ctx, "badmap", nine);
+            }
         });
     }
 
@@ -1107,107 +1097,60 @@ mod tests {
             let b = ctx.atom("b").unwrap();
             let m = map(ctx, &[(one, a), (two, b)]);
 
-            let ks = keys_1(ctx, &[m]).unwrap();
-            assert_eq!(proper_list(ks).unwrap(), vec![one, two]);
-            let vs = values_1(ctx, &[m]).unwrap();
-            assert_eq!(proper_list(vs).unwrap(), vec![a, b]);
+            assert_eq!(proper_list(keys_1(ctx, &[m]).unwrap()).unwrap(), vec![one, two]);
+            assert_eq!(proper_list(values_1(ctx, &[m]).unwrap()).unwrap(), vec![a, b]);
             assert_eq!(size_1(ctx, &[m]).unwrap(), make_small(2));
-
             assert_eq!(is_key_2(ctx, &[one, m]).unwrap(), ctx.boolean(true).unwrap());
             assert_eq!(is_key_2(ctx, &[a, m]).unwrap(), ctx.boolean(false).unwrap());
 
-            // Every non-map operand is the oracle's `{badmap, Operand}`:
-            //   erl -noshell -eval 'lists:foreach(fun(F) -> try F() catch C:R ->
-            //     io:format("~p:~p~n",[C,R]) end end, [fun() -> maps:keys(1) end,
-            //     fun() -> maps:values(a) end, fun() -> maps:size(1) end,
-            //     fun() -> maps:is_key(1,1) end]), halt().'
-            //   =>  error:{badmap,1} / error:{badmap,a} / error:{badmap,1} / error:{badmap,1}
             for bad in [one, a] {
-                let keys = keys_1(ctx, &[bad]);
-                assert_structured(keys, ctx, "badmap", bad);
-                let values = values_1(ctx, &[bad]);
-                assert_structured(values, ctx, "badmap", bad);
-                let size = size_1(ctx, &[bad]);
-                assert_structured(size, ctx, "badmap", bad);
+                assert_structured(keys_1(ctx, &[bad]), ctx, "badmap", bad);
+                assert_structured(values_1(ctx, &[bad]), ctx, "badmap", bad);
+                assert_structured(size_1(ctx, &[bad]), ctx, "badmap", bad);
             }
-            let not_a_map = is_key_2(ctx, &[one, one]);
-            assert_structured(not_a_map, ctx, "badmap", one);
+            assert_structured(is_key_2(ctx, &[one, one]), ctx, "badmap", one);
         });
     }
 
     #[test]
-    fn merge_is_the_union_with_the_second_map_winning() {
+    fn merge_with_and_without() {
         with_ctx(|ctx| {
             let one = ctx.int(1).unwrap();
             let two = ctx.int(2).unwrap();
             let nine = ctx.int(9).unwrap();
             let a = ctx.atom("a").unwrap();
             let b = ctx.atom("b").unwrap();
+            let c = ctx.atom("c").unwrap();
 
             let m1 = map(ctx, &[(one, a), (two, b)]);
             let m2 = map(ctx, &[(two, a), (nine, b)]);
 
             let merged = merge_2(ctx, &[m1, m2]).unwrap();
             assert_eq!(keys_of(merged), vec![one, two, nine]);
-            // `two`'s value comes from the second map.
             assert_eq!(values_of(merged), vec![a, a, b]);
+            assert_structured(merge_2(ctx, &[m1, one]), ctx, "badmap", one);
+            assert_structured(merge_2(ctx, &[one, m1]), ctx, "badmap", one);
 
-            // A non-map operand is the oracle's `{badmap, Operand}` — naming whichever
-            // argument is not a map.
-            //   erl -noshell -eval 'try maps:merge(#{},1) catch C:R ->
-            //     io:format("~p:~p~n",[C,R]) end, halt().'  =>  error:{badmap,1}
-            let bad_second = merge_2(ctx, &[m1, one]);
-            assert_structured(bad_second, ctx, "badmap", one);
-            let bad_first = merge_2(ctx, &[one, m1]);
-            assert_structured(bad_first, ctx, "badmap", one);
-        });
-    }
-
-    #[test]
-    fn with_and_without_filter_by_key_list() {
-        with_ctx(|ctx| {
-            let one = ctx.int(1).unwrap();
-            let two = ctx.int(2).unwrap();
-            let a = ctx.atom("a").unwrap();
-            let b = ctx.atom("b").unwrap();
-            let c = ctx.atom("c").unwrap();
-            let m = map(ctx, &[(one, a), (two, b)]);
-
-            // `maps:with([1, 9], #{1=>a,2=>b})` ⇒ `#{1=>a}`.
             let wanted = ctx.list(&[one, make_small(9)]).unwrap();
-            let kept = with_2(ctx, &[wanted, m]).unwrap();
+            let kept = with_2(ctx, &[wanted, m1]).unwrap();
             assert_eq!(keys_of(kept), vec![one]);
-            assert_eq!(values_of(kept), vec![a]);
-
-            // `maps:with([], _)` and a duplicate key list are harmless.
             let empty = ctx.list(&[]).unwrap();
-            assert!(keys_of(with_2(ctx, &[empty, m]).unwrap()).is_empty());
-            let dup = ctx.list(&[one, one]).unwrap();
-            assert_eq!(keys_of(with_2(ctx, &[dup, m]).unwrap()), vec![one]);
+            assert!(keys_of(with_2(ctx, &[empty, m1]).unwrap()).is_empty());
 
-            // `maps:without([1], #{1=>a,2=>b})` ⇒ `#{2=>b}`.
             let drop = ctx.list(&[one]).unwrap();
-            let rest = without_2(ctx, &[drop, m]).unwrap();
+            let rest = without_2(ctx, &[drop, m1]).unwrap();
             assert_eq!(keys_of(rest), vec![two]);
-            assert_eq!(values_of(rest), vec![b]);
 
-            // A non-list key argument is the oracle's atom `badarg`; a non-map argument
-            // is its structured `{badmap, C}`.
-            //   erl -noshell -eval 'try maps:with(a,#{}) catch C:R ->
-            //     io:format("~p:~p~n",[C,R]) end, halt().'    =>  error:badarg
-            //   erl -noshell -eval 'try maps:with([],c) catch C:R ->
-            //     io:format("~p:~p~n",[C,R]) end, halt().'    =>  error:{badmap,c}
-            assert!(matches!(with_2(ctx, &[c, m]), Err(BeamError::BadArg)));
-            assert!(matches!(without_2(ctx, &[c, m]), Err(BeamError::BadArg)));
-            let bad_map = with_2(ctx, &[empty, c]);
-            assert_structured(bad_map, ctx, "badmap", c);
-            let bad_map = without_2(ctx, &[empty, c]);
-            assert_structured(bad_map, ctx, "badmap", c);
+            assert!(matches!(with_2(ctx, &[c, m1]), Err(BeamError::BadArg)));
+            assert!(matches!(without_2(ctx, &[c, m1]), Err(BeamError::BadArg)));
+            assert_structured(with_2(ctx, &[empty, c]), ctx, "badmap", c);
+            assert_structured(without_2(ctx, &[empty, c]), ctx, "badmap", c);
         });
     }
 
+    /// `maps:iterator/1` is `[0 | Map]`; `maps:next/1` walks it and `none` terminates.
     #[test]
-    fn iterator_and_next_walk_the_pairs() {
+    fn iterator_is_path_and_map_and_next_walks_it() {
         with_ctx(|ctx| {
             let one = ctx.int(1).unwrap();
             let two = ctx.int(2).unwrap();
@@ -1215,91 +1158,111 @@ mod tests {
             let b = ctx.atom("b").unwrap();
             let m = map(ctx, &[(one, a), (two, b)]);
 
-            // The M1 iterator is the `{K, V}` list in stored order.
+            // Oracle: `maps:iterator(#{1=>a,2=>b})` ⇒ `[0 | Map]`.
             let iter = iterator_1(ctx, &[m]).unwrap();
-            let elems = proper_list(iter).expect("a proper list");
-            assert_eq!(elems.len(), 2);
-            assert_eq!(access::tuple_element(elems[0], 0), one);
-            assert_eq!(access::tuple_element(elems[1], 0), two);
+            assert!(access::is_list(iter));
+            assert_eq!(signed_value(access::car(iter)), 0);
+            assert_eq!(access::cdr(iter), m);
 
-            // Pull the first pair: `{1, a, <remaining list>}`.
+            // Oracle: `maps:next([0|Map])` ⇒ `{1,a,{2,b,none}}`.
             let first = next_1(ctx, &[iter]).unwrap();
-            assert!(access::is_tuple(first) && access::tuple_size(first) == 3);
             assert_eq!(access::tuple_element(first, 0), one);
             assert_eq!(access::tuple_element(first, 1), a);
-            let rest = access::tuple_element(first, 2);
-            assert_eq!(proper_list(rest).unwrap().len(), 1);
-
-            // The last pair carries the terminal iterator `none`.
-            let second = next_1(ctx, &[rest]).unwrap();
+            let second = access::tuple_element(first, 2);
             assert_eq!(access::tuple_element(second, 0), two);
-            assert_eq!(access::tuple_element(second, 1), b);
             assert!(is_atom_named(ctx, access::tuple_element(second, 2), "none"));
 
-            // An exhausted iterator (the empty list, or the atom `none`) ⇒ `none`.
-            let exhausted = next_1(ctx, &[NIL]).unwrap();
-            assert!(is_atom_named(ctx, exhausted, "none"));
-            let none_atom = ctx.atom("none").unwrap();
-            let from_none = next_1(ctx, &[none_atom]).unwrap();
-            assert!(is_atom_named(ctx, from_none, "none"));
-            // `#{}`'s iterator is the empty list, which is already exhausted.
-            let empty_map = new_0(ctx, &[]).unwrap();
-            let empty_iter = iterator_1(ctx, &[empty_map]).unwrap();
-            let exhausted_from_empty = next_1(ctx, &[empty_iter]).unwrap();
-            assert!(is_atom_named(ctx, exhausted_from_empty, "none"));
+            // A path beyond the map size is `badarg` (path == n is still accepted).
+            let at_bound = ctx.cons(make_small(2), m).unwrap();
+            let past_bound = ctx.cons(make_small(3), m).unwrap();
+            assert!(next_1(ctx, &[at_bound]).is_ok());
+            assert!(matches!(next_1(ctx, &[past_bound]), Err(BeamError::BadArg)));
+            // `next` of a `{K,V,I}` look-ahead is the identity; `none` is `none`.
+            assert_eq!(next_1(ctx, &[first]).unwrap(), first);
+            let none = ctx.atom("none").unwrap();
+            assert_eq!(next_1(ctx, &[none]).unwrap(), none);
+            // Malformed iterators are `badarg` (a bare list, a non-map tail, a non-list
+            // path, a non-tuple/non-`none`).
+            for bad in [
+                make_small(5),
+                NIL,
+                ctx.cons(make_small(0), make_small(5)).unwrap(),
+                ctx.cons(a, m).unwrap(),
+                ctx.list(&[make_small(1)]).unwrap(),
+            ] {
+                assert!(matches!(next_1(ctx, &[bad]), Err(BeamError::BadArg)), "{bad:?}");
+            }
 
-            // A malformed iterator is `badarg`.
-            assert!(matches!(next_1(ctx, &[make_small(1)]), Err(BeamError::BadArg)));
-            let bad = ctx.list(&[make_small(1)]).unwrap();
-            assert!(matches!(next_1(ctx, &[bad]), Err(BeamError::BadArg)));
-            // `iterator/1` of a non-map is the oracle's `{badmap, 1}`:
-            //   erl -noshell -eval 'try maps:iterator(1) catch C:R ->
-            //     io:format("~p:~p~n",[C,R]) end, halt().'  =>  error:{badmap,1}
-            let bad_map = iterator_1(ctx, &[make_small(1)]);
-            assert_structured(bad_map, ctx, "badmap", make_small(1));
+            // The ordered (list-path) form walks the path's keys.
+            let path = ctx.list(&[two, one]).unwrap();
+            let ordered_iter = ctx.cons(path, m).unwrap();
+            let ordered = next_1(ctx, &[ordered_iter]).unwrap();
+            assert_eq!(access::tuple_element(ordered, 0), two);
+            assert_eq!(access::tuple_element(ordered, 1), b);
+            let tail = access::tuple_element(ordered, 2);
+            assert_eq!(access::tuple_element(tail, 0), one);
+            assert!(is_atom_named(ctx, access::tuple_element(tail, 2), "none"));
+            // An absent key or an improper path tail is `badarg`.
+            let bad_path = ctx.list(&[two, ctx.atom("c").unwrap()]).unwrap();
+            assert!(matches!(
+                {
+                    let it = ctx.cons(bad_path, m).unwrap();
+                    next_1(ctx, &[it])
+                },
+                Err(BeamError::BadArg)
+            ));
+            let improper = ctx.cons(two, one).unwrap();
+            assert!(matches!(
+                {
+                    let it = ctx.cons(improper, m).unwrap();
+                    next_1(ctx, &[it])
+                },
+                Err(BeamError::BadArg)
+            ));
+
+            assert_structured(iterator_1(ctx, &[make_small(1)]), ctx, "badmap", make_small(1));
         });
     }
 
+    /// `maps:to_list/1` accepts a map **or** an iterator, and reports a bad iterator
+    /// as `{badmap, Iter}`.
     #[test]
-    fn erlang_map_entries_are_the_same_bifs() {
+    fn to_list_accepts_a_map_or_an_iterator() {
         with_ctx(|ctx| {
             let one = ctx.int(1).unwrap();
             let two = ctx.int(2).unwrap();
-            let m = map(ctx, &[(one, two)]);
+            let five = ctx.int(5).unwrap();
+            let a = ctx.atom("a").unwrap();
+            let b = ctx.atom("b").unwrap();
+            let m = map(ctx, &[(one, a), (two, b)]);
 
-            assert_eq!(get_2(ctx, &[one, m]).unwrap(), two);
-            assert_eq!(size_1(ctx, &[m]).unwrap(), make_small(1));
-            assert_eq!(is_key_2(ctx, &[one, m]).unwrap(), ctx.boolean(true).unwrap());
-        });
-    }
+            let via_map = proper_list(to_list_1(ctx, &[m]).unwrap()).unwrap();
+            assert_eq!(access::tuple_element(via_map[0], 0), one);
+            assert_eq!(access::tuple_element(via_map[1], 0), two);
 
-    #[test]
-    fn more_than_32_pairs_is_a_typed_error() {
-        with_ctx(|ctx| {
-            // 33 distinct keys need a hashmap the Milestone-1 layer cannot build.
-            let pairs: Vec<Eterm> = (0..33)
-                .map(|i| {
-                    let k = ctx.int(i).unwrap();
-                    ctx.tuple(&[k, k]).unwrap()
-                })
-                .collect();
-            let list = ctx.list(&pairs).unwrap();
-            assert!(matches!(from_list_1(ctx, &[list]), Err(BeamError::SystemLimit)));
+            let iter = iterator_1(ctx, &[m]).unwrap();
+            let via_iter = proper_list(to_list_1(ctx, &[iter]).unwrap()).unwrap();
+            assert_eq!(via_iter.len(), 2);
+            assert_eq!(access::tuple_element(via_iter[0], 0), one);
+            assert_eq!(access::tuple_element(via_iter[1], 0), two);
 
-            // A full 32-pair map is fine; adding a 33rd key overflows to hashmap.
-            let full: Vec<(Eterm, Eterm)> = (0..32)
-                .map(|i| {
-                    let k = ctx.int(i).unwrap();
-                    (k, k)
-                })
-                .collect();
-            let m = map(ctx, &full);
-            assert_eq!(size_1(ctx, &[m]).unwrap(), make_small(32));
-            let extra = ctx.int(100).unwrap();
-            assert!(matches!(put_3(ctx, &[extra, extra, m]), Err(BeamError::SystemLimit)));
-            // Removing a key first keeps the result a flat map.
-            let shrunk = remove_2(ctx, &[ctx.int(0).unwrap(), m]).unwrap();
-            assert!(put_3(ctx, &[extra, extra, shrunk]).is_ok());
+            // `[]`, `5` and `[0|5]` are not iterators: `{badmap, Arg}`.
+            for bad in [
+                NIL,
+                make_small(5),
+                ctx.cons(make_small(0), five).unwrap(),
+            ] {
+                match to_list_1(ctx, &[bad]) {
+                    Err(BeamError::Raise(raise)) => {
+                        assert_eq!(raise.reason, beam_common::ExitReason::Structured);
+                    }
+                    other => panic!("expected {{badmap,_}}, got {other:?}"),
+                }
+            }
+            // `{a,1,x}`: the third element `x` is not an iterator. Oracle ⇒
+            // `error:{badmap,{a,1,x}}`.
+            let bad_tuple = ctx.tuple(&[a, one, ctx.atom("c").unwrap()]).unwrap();
+            assert_structured(to_list_1(ctx, &[bad_tuple]), ctx, "badmap", bad_tuple);
         });
     }
 
@@ -1328,7 +1291,6 @@ mod tests {
             ("maps", "without", 2),
             ("maps", "iterator", 1),
             ("maps", "next", 1),
-            // The `fun`-taking BIFs (backed by the `FunCaller` seam).
             ("maps", "map", 2),
             ("maps", "fold", 3),
             ("maps", "filter", 2),
@@ -1359,6 +1321,27 @@ mod tests {
                 reg.call("erlang", "map_size", 1, ctx, &[empty]).expect("map_size/1"),
                 make_small(0)
             );
+        });
+    }
+
+    /// A 33-key map is a real HAMT: `size`/`get`/`find`/`is_key` and the whole
+    /// producer set must handle it, and it must round-trip through `binary_to_term`.
+    #[test]
+    fn thirty_three_keys_is_a_hash_map() {
+        with_ctx(|ctx| {
+            let pairs = ident_pairs(ctx, 33);
+            let tuples: Vec<Eterm> = pairs
+                .iter()
+                .map(|&(k, v)| ctx.tuple(&[k, v]).unwrap())
+                .collect();
+            let list = ctx.list(&tuples).unwrap();
+            let m = from_list_1(ctx, &[list]).expect("a 33-pair list");
+
+            assert!(access::is_hashmap(m), "33 keys must build a HAMT");
+            assert_eq!(size_1(ctx, &[m]).unwrap(), make_small(33));
+            assert_eq!(get_2(ctx, &[ctx.int(17).unwrap(), m]).unwrap(), ctx.int(17).unwrap());
+            assert_eq!(is_key_2(ctx, &[ctx.int(34).unwrap(), m]).unwrap(), ctx.boolean(false).unwrap());
+            assert_eq!(pairs_of(m).len(), 33);
         });
     }
 }

@@ -1583,13 +1583,17 @@ mod tests {
         });
         assert_eq!(output, "<<>>");
 
-        // A flat map renders `#{k => v,…}` in flatmap key order (a < b < c).
+        // A flat map renders `#{k => v,…}` in the map's stored order — for a flat map
+        // the flatmap key order (a < b). `make_flatmap` preserves the pair order it is
+        // handed, so canonicalise exactly as the writers do (`maps.rs::build_map`).
         let (output, _) = run_io("~w", |ctx| {
             let a = ctx.atom("a").expect("seeded");
             let b = ctx.atom("b").expect("seeded");
             let one_ = ctx.int(1).expect("fits");
             let two = ctx.int(2).expect("fits");
-            let map = crate::access::make_flatmap(ctx.heap(), &[(b, one_), (a, two)]).expect("fits");
+            let mut pairs = [(b, one_), (a, two)];
+            pairs.sort_by(|x, y| beam_term::compare::cmp_flatmap_keys(x.0, y.0, ctx.atoms()));
+            let map = crate::access::make_flatmap(ctx.heap(), &pairs).expect("fits");
             one(ctx, map)
         });
         assert_eq!(output, "#{a => 2,b => 1}");

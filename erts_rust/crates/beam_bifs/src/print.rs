@@ -66,11 +66,14 @@
 //!
 //! # Maps
 //!
-//! A flat map renders `#{k => v,…}` (note ` => ` between a key and its value and a
+//! A map renders `#{k => v,…}` (note ` => ` between a key and its value and a
 //! bare `,` between pairs — the oracle's rendering). Pairs are printed in the
-//! oracle's *flatmap key order* (`erts_cmp_flatmap_keys`, `erl_utils.h:267`): two
-//! atom keys compare by their raw term word (i.e. by atom index / intern order),
-//! anything else by the exact term order (`beam_term::compare::cmp`).
+//! map's **storage order** ([`beam_term::map::map_pairs_storage_order`]) — the
+//! order `maps:keys/1` yields: a flat map (≤32 pairs) stores its keys in the
+//! oracle's *flatmap key order* (`erts_cmp_flatmap_keys`, `erl_utils.h:267`: two
+//! atom keys by their raw term word, i.e. atom index / intern order; anything else
+//! by the exact term order), and a hash map (>32 pairs) stores them in its HAMT slot
+//! traversal order. Both match the oracle's `~w`/`~p` byte for byte.
 //!
 //! # `~p`/`~P` re-flow (`io_lib_pretty`)
 //!
@@ -110,12 +113,12 @@
 
 use beam_codec::term::big_parts;
 use beam_common::Result;
-use beam_term::{atom_val, compare, pid_number, pid_serial, signed_value, AtomTable, Eterm};
+use beam_term::{atom_val, pid_number, pid_serial, signed_value, AtomTable, Eterm};
 
 use crate::access::{
-    bitstring_bit_size, bitstring_bits, car, cdr, flatmap_pairs, float_value, is_atom, is_big,
-    is_float, is_internal_pid, is_internal_ref, is_list, is_map, is_nil, is_small, is_tuple,
-    ref_thing_id, tuple_element, tuple_size,
+    bitstring_bit_size, bitstring_bits, car, cdr, float_value, is_atom, is_big, is_float,
+    is_internal_pid, is_internal_ref, is_list, is_map, is_nil, is_small, is_tuple, ref_thing_id,
+    tuple_element, tuple_size,
 };
 use crate::bits;
 use crate::context::BifContext;
@@ -422,8 +425,12 @@ fn render_tuple_rest_chunk(
     out.push(render_chunk(atoms, tuple_element(term, index), printable, depth - 1)?);
     render_tuple_rest_chunk(atoms, term, index + 1, depth - 1, printable, out)
 }
-/// Renders a flat map (`#{k => v,…}`), `io_lib:write_map/4` /
+/// Renders a map (`#{k => v,…}`), `io_lib:write_map/4` /
 /// `io_lib_pretty:write/1` (both build `[#, {, [pair, …, pair], }]`).
+///
+/// The pairs come from the map's storage order (flat-map key order for a flat map,
+/// HAMT slot order for a hash map) — the order `maps:keys/1` yields and the oracle
+/// prints — so no re-sort is needed and a >32-pair hash map renders like the oracle.
 fn render_map_chunk(
     atoms: &AtomTable,
     term: Eterm,
@@ -433,12 +440,10 @@ fn render_map_chunk(
     if depth == 1 {
         return Ok(Chunk::text("#{}"));
     }
-    let (keys, values) = flatmap_pairs(term)?;
-    let mut pairs: Vec<(Eterm, Eterm)> = keys.into_iter().zip(values).collect();
+    let pairs: Vec<(Eterm, Eterm)> = beam_term::map::map_pairs_storage_order(term)?;
     if pairs.is_empty() {
         return Ok(Chunk::text("#{}"));
     }
-    pairs.sort_by(|a, b| flatmap_key_cmp(a.0, b.0, atoms));
     let inner = depth - 1;
     let mut body: Vec<Chunk> = Vec::new();
     body.push(map_pair_chunk(atoms, pairs[0], printable, inner)?);
@@ -491,16 +496,6 @@ fn map_pair_chunk(
         render_chunk(atoms, pair.1, printable, depth)?,
     ]))
 }
-/// The oracle's flatmap internal key order (`erts_cmp_flatmap_keys`): two atoms by
-/// their raw term word (atom index order), anything else by the exact term order.
-fn flatmap_key_cmp(a: Eterm, b: Eterm, atoms: &AtomTable) -> core::cmp::Ordering {
-    if is_atom(a) && is_atom(b) {
-        a.raw().cmp(&b.raw())
-    } else {
-        compare::cmp(a, b, atoms)
-    }
-}
-
 /// `io_lib_format:chars/2` — a deeply nested `lists:duplicate/2`.
 ///
 /// `chars(C, N)` is `[]`/`[C]`/`[C,C]`/`[C,C,C]` for `N` in `0..=3`, else `[S|S]`
@@ -900,6 +895,20 @@ mod tests {
         format_term_depth(ctx, term, printable, depth).expect("term is printable")
     }
 
+    /// A flat map whose keys are stored in the canonical flat-map key order
+    /// ([`beam_term::compare::cmp_flatmap_keys`]).
+    ///
+    /// [`crate::access::make_flatmap`] preserves the pair order it is handed, so the
+    /// writer canonicalises first — exactly the step `maps.rs::build_map` performs (and
+    /// what `beam_term::map::write_map` sorts for). A real flat map always stores its
+    /// keys in that order, which is why the printer renders the map's *storage* order
+    /// without re-sorting.
+    fn canonical_flatmap(ctx: &mut BifContext<'_>, pairs: &[(Eterm, Eterm)]) -> Eterm {
+        let mut pairs = pairs.to_vec();
+        pairs.sort_by(|a, b| beam_term::compare::cmp_flatmap_keys(a.0, b.0, ctx.atoms()));
+        crate::access::make_flatmap(ctx.heap(), &pairs).expect("the flat map fits")
+    }
+
     #[test]
     fn small_ints_and_atoms() {
         with_ctx(|ctx| {
@@ -1089,8 +1098,7 @@ mod tests {
             let two = ctx.int(2).expect("fits");
             let three = ctx.int(3).expect("fits");
             let four = ctx.int(4).expect("fits");
-            let map = crate::access::make_flatmap(ctx.heap(), &[(three, four), (one, two)])
-                .expect("fits");
+            let map = canonical_flatmap(ctx, &[(three, four), (one, two)]);
             assert_eq!(show(ctx, map, false), "#{1 => 2,3 => 4}");
             assert_eq!(show(ctx, map, true), "#{1 => 2,3 => 4}");
 
@@ -1119,14 +1127,12 @@ mod tests {
             let b = ctx.atom("b").expect("seeded");
             let one = ctx.int(1).expect("fits");
             let two = ctx.int(2).expect("fits");
-            let map =
-                crate::access::make_flatmap(ctx.heap(), &[(b, one), (a, two)]).expect("fits");
+            let map = canonical_flatmap(ctx, &[(b, one), (a, two)]);
             assert_eq!(show(ctx, map, false), "#{a => 2,b => 1}");
 
             // Mixed classes use the term order (`1` < `a` < `{a}`).
             let tuple = ctx.tuple(&[a]).expect("fits");
-            let map = crate::access::make_flatmap(ctx.heap(), &[(tuple, one), (a, two), (one, one)])
-                .expect("fits");
+            let map = canonical_flatmap(ctx, &[(tuple, one), (a, two), (one, one)]);
             assert_eq!(show(ctx, map, false), "#{1 => 1,a => 2,{a} => 1}");
         });
     }
