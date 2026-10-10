@@ -224,7 +224,7 @@ This crate's link in the A.9 boot-blocker chain (the runtime's boot stop point a
 - `src/nif.rs` -> `erlang:load_nif/2`
 - `src/io.rs` / `src/print.rs` -> the `io`/`io_lib` format engine; the `~w`/`~p`/`~W`/`~P` leaf renderer
 - `src/print/pretty.rs` / `src/print/pretty/cind.rs` -> the `io_lib_pretty` port; the `cind/7` family
-- `tests/` -> 64 integration files / 66 suites / 1238 tests (lib suite 589)
+- `tests/` -> 64 integration files / 66 suites / 1240 tests (lib suite 591)
 - siblings `../beam_engine`/`../beam_process`/`../beam_ets`/`../beam_codec`/`../beam_term`/`../beam_loader`/`../beam_io` -> the `call_bif` seam, `ProcessId`/`PortId`/`PortTable`, the `Table`/match-spec engine, the ETF codec, the frozen term API, the `Recs` chunk, the poller (read-only)
 - `../../erts/emulator/beam/` (`bif.tab`, `bif.c`, `erl_bif_*.c` incl. `erl_bif_atomics.c`/`erl_bif_counters.c`/`erl_bif_ddll.c`/`erl_bif_port.c`, `erl_arith.c`/`big.c`, `erl_map.c`, `erl_record.c`, `erl_db_*`, `binary.c`, `packet_parser.c`, `erl_md5.c`, `external.c`, `erl_term_hashing.c`, `erl_unicode.c`, `erl_time_sup.c`, `erl_unix_sys_ddll.c`), `../../erts/emulator/zlib/`, `../../erts/emulator/sys/common/erl_float_short.cpp` -> authoritative names/arities/semantics (read-only)
 
