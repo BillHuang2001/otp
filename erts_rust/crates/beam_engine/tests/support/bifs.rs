@@ -327,6 +327,9 @@ impl ModuleHost {
             // `lists:keyfind/3` is a `lists` NIF too (`erl_bif_lists.c:keyfind`);
             // `io_lib_format:get_option/3` looks a format option up with it.
             ("lists", "keyfind", 3) => Some(self.keyfind(args)),
+            // `lists:keysearch/3` is the same NIF wrapped: `{value, Tuple}` for a
+            // hit, `false` otherwise (`erl_bif_lists.c:1279-1292`).
+            ("lists", "keysearch", 3) => Some(self.keysearch(args)),
             // The **NIF** modules. `persistent_term:get/1,2` is a NIF: the real
             // `.beam`'s body is the `erlang:nif_error/1` stub, and the store behind
             // it (`erts_internal`'s persistent-term table) exists in no host here —
@@ -644,6 +647,21 @@ impl ModuleHost {
                 }
             }
             cursor = terms::cons_tail(cursor)?;
+        }
+    }
+
+    /// `lists:keysearch(Key, N, TupleList)` — `{value, Tuple}` for the first
+    /// tuple `keyfind` matches, else the atom `false`
+    /// (`../../erts/emulator/beam/erl_bif_lists.c:1279-1292`: `keysearch_3` runs
+    /// `keyfind/3` and wraps a tuple result in `{value, Tuple}`). Every error path
+    /// (`N` below `1`, a non-integer `N`, an improper list) is `keyfind`'s.
+    fn keysearch(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let found = self.keyfind(args)?;
+        if terms::tuple_arity(found).is_ok() {
+            let tag = self.intern("value");
+            terms::make_tuple(self, &[tag, found])
+        } else {
+            Ok(found)
         }
     }
 
