@@ -28,9 +28,13 @@
 %%%
 %%% It hoists loop-invariant arithmetic out of a loop into its preheader.
 %%% `+'/'-'/'*' raise `badarith' for a non-number operand, `div'/`rem' for a
-%%% zero divisor too, `band'/`bor'/`bxor' for a non-integer, and `bsl'/`bsr'
-%%% for a non-integer, a negative count or a `system_limit' overflow, so
-%%% hoisting one needs a proof that it cannot raise AT THE PREHEADER.
+%%% zero divisor too and `band'/`bor'/`bxor' for a non-integer, so hoisting one
+%%% needs a proof that it cannot raise AT THE PREHEADER; with both operands
+%%% proven integers (and, for `div'/`rem', a non-zero literal divisor) a
+%%% `badarith' is impossible. `bsl'/`bsr' are NOT hoisted at all: a left shift
+%%% additionally raises `system_limit' past the bignum arity bound, which no
+%%% proof available here excludes, and hoisting it out of a conditionally
+%%% executed block would raise on paths the original program never took.
 %%%
 %%% A structural fact (see `beam_ssa_loop_reduce') is valid there: it rests on
 %%% definitions that dominate the preheader. A type annotation is NOT: the
@@ -46,7 +50,16 @@
 %% The subset of the integer BIFs that this pass may hoist out of a loop.
 %% Unlike the tag tests they can raise `badarith', so the pass has to prove
 %% them non-raising first; see `arith_hoistable/6'.
--define(ARITH_BIFS, ['+','-','*','div','rem','band','bor','bxor','bsl','bsr']).
+%%
+%% `bsl'/`bsr' are deliberately ABSENT: a left shift raises `system_limit',
+%% not `badarith', when the result outgrows the bignum arity bound
+%% (`erl_arith.c': `if (ires-8 > BIG_ARITY_MAX)'), and no proof available here
+%% bounds the magnitude of an integer-typed operand. Hoisting a loop-invariant
+%% `A bsl N' out of a conditionally executed block into the preheader would
+%% then raise on paths where the original program never evaluated it. (A right
+%% shift cannot grow, but it is excluded with the left shift for symmetry --
+%% there is nothing to gain from hoisting it separately.)
+-define(ARITH_BIFS, ['+','-','*','div','rem','band','bor','bxor']).
 
 %% `{bif,Name}' operations through which the SSA type analysis can narrow one
 %% of their arguments (`infer_type'/4 and `infer_relop'/3' in
@@ -56,12 +69,6 @@
                       is_function, is_integer, is_list, is_map, is_number,
                       is_pid, is_port, is_reference, is_tuple, is_record,
                       '==', '/=', '=<', '<', '>=', '>', '=:=', '=/=']).
-
-%% The largest literal shift count the arithmetic LICM accepts. `bsl' raises
-%% `system_limit', not `badarith', when the result would exceed the bignum
-%% arity bound (`erl_arith.c': `if (ires-8 > BIG_ARITY_MAX)'), so a count that
-%% is merely proven non-negative does not make the instruction non-raising.
--define(MAX_LITERAL_SHIFT, 64).
 
 %% Maximum number of instructions hoisted per loop. Bounds the growth of the
 %% preheader on pathological input. The base LICM in `beam_ssa_loop_opt' uses
@@ -245,21 +252,11 @@ is_integer_kind(unknown) -> false.
 %% that accept every integer contribute nothing further; `div'/`rem' need a
 %% non-zero literal, because a divisor that is a loop-invariant *variable* (or
 %% the literal 0) could be zero on the new paths and would have to keep
-%% raising there; `bsl'/`bsr' need a literal count in 0..?MAX_LITERAL_SHIFT.
+%% raising there. `bsl'/`bsr' never reach here -- they are not in ?ARITH_BIFS.
 second_operand_ok(Op, B) when Op =:= 'div'; Op =:= 'rem' ->
     is_nonzero_literal(B);
-second_operand_ok(Op, B) when Op =:= 'bsl'; Op =:= 'bsr' ->
-    is_shift_literal(B);
 second_operand_ok(_Op, _B) ->
     true.
-
-%% `bsl'/`bsr' accept any integer first operand but raise for a negative or a
-%% non-integer count and can hit `system_limit' for a huge one, so the count
-%% must be a literal in `0..?MAX_LITERAL_SHIFT'.
-is_shift_literal(#b_literal{val=N}) when is_integer(N) ->
-    N >= 0 andalso N =< ?MAX_LITERAL_SHIFT;
-is_shift_literal(_B) ->
-    false.
 
 is_nonzero_literal(#b_literal{val=N}) when is_integer(N), N =/= 0 -> true;
 is_nonzero_literal(_B) -> false.

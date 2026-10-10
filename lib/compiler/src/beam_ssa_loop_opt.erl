@@ -81,12 +81,16 @@
 %%%    duplicated) into an exactly equivalent cheaper one, and only when the
 %%%    rewrite is exact for every value its operands can have:
 %%%
+%%%    * `X * 2' becomes `X + X', which is exact for every number (and cannot
+%%%      raise where `*' did not).
 %%%    * `X * 2^n' (n >= 1, `2^n' a literal) becomes `X bsl n' when X is
-%%%      provably an integer; for integers, including bignums, `bsl' is
-%%%      exactly multiplication by a power of two.
-%%%    * `X * 2' becomes `X + X' otherwise, which is exact for every number.
+%%%      provably an integer of bounded magnitude and n <= 64. `bsl' is exactly
+%%%      multiplication by a power of two for integers, but it rounds a float
+%%%      operand instead of raising and raises `system_limit' for a result past
+%%%      the bignum arity bound, so integrality AND boundedness are required.
 %%%    * `X div 2^n' (n >= 1) becomes `X bsr n' when X is provably a
-%%%      NON-NEGATIVE integer (`div' truncates toward zero, `bsr' floors).
+%%%      NON-NEGATIVE integer (`div' truncates toward zero, `bsr' floors). A
+%%%      right shift cannot grow, so no magnitude bound is needed.
 %%%    * `X rem 2^n' (n >= 1) becomes `X band (2^n - 1)' when X is provably a
 %%%      non-negative integer (`rem' of a negative dividend would not agree).
 %%%

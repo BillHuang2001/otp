@@ -31,10 +31,18 @@
 %%% an exactly equivalent cheaper one, and only when the rewrite is exact for
 %%% every value its operands can have:
 %%%
-%%% * `X * 2^n' (n >= 1, `2^n' a literal) becomes `X bsl n' when X is provably
-%%%   an integer; for integers, including bignums, `bsl' is exactly
-%%%   multiplication by a power of two.
-%%% * `X * 2' becomes `X + X' otherwise, which is exact for every number.
+%%% * `X * 2' becomes `X + X' for every number. Doubling by addition is exact
+%%%   (multiplication by 2 and adding a float to itself both double the
+%%%   exponent without rounding, subnormals included) and raises on exactly the
+%%%   same values as `*', so it needs no integrality proof at all.
+%%% * `X * 2^n' (n >= 1, `2^n' a literal) becomes `X bsl n' only when X is
+%%%   provably an integer of BOUNDED magnitude and n <= ?MAX_SHIFT. For
+%%%   integers `bsl' is exactly multiplication by a power of two, but it is
+%%%   *not* exception-equivalent to `*': `bsl' raises `system_limit' for a
+%%%   result past the bignum arity bound where `*' would still have returned a
+%%%   bignum. A bounded operand (|X| < 2^128, the widest `#t_integer{}' range
+%%%   the analysis represents) and a count <= ?MAX_SHIFT keep the result far
+%%%   below that bound, so no exception is introduced.
 %%% * `X div 2^n' (n >= 1) becomes `X bsr n' when X is provably a
 %%%   NON-NEGATIVE integer (`div' truncates toward zero, `bsr' floors).
 %%% * `X rem 2^n' (n >= 1) becomes `X band (2^n - 1)' when X is provably a
@@ -93,6 +101,13 @@
 
 %% The integrality/non-negativity fact proven for a value, if any.
 -type kind() :: 'nat' | 'int' | 'unknown'.
+
+%% The largest literal shift count the `*' -> `bsl' rewrite may produce. The
+%% emulator raises `system_limit' from `erts_bsl' when the result outgrows the
+%% bignum arity bound (`BIG_ARITY_MAX', ~2 million bits), which `*' would not
+%% have done; a small count together with a bounded operand (see `bounded/3')
+%% keeps the result far below that bound.
+-define(MAX_SHIFT, 64).
 
 -spec strength_reduce([{beam_ssa:label(), [beam_ssa:label()]}],
                       beam_ssa:block_map()) -> beam_ssa:block_map().
@@ -158,11 +173,14 @@ def_kind(V, Defs, Ivs, Kinds) ->
 def_kind_1(#b_set{op=phi, args=Args}, Kinds) ->
     join_kinds([value_kind(V, Kinds) || {V, _L} <- Args]);
 def_kind_1(#b_set{op={bif,Op}, args=Args}=Def, Kinds) ->
-    %% The operands are classified at their use, so the type annotations on
-    %% this defining instruction count as well. That is what makes a value
-    %% computed from a function argument or from a value extracted out of a
-    %% term -- neither of which has a defining instruction of its own -- a
-    %% proven integer.
+    %% `operand_kinds/4' classifies each operand with the annotation on THIS
+    %% instruction, which is the type `beam_ssa_type' proved for that operand
+    %% at this instruction (`opt_anno_types/2' annotates an operand with its
+    %% block-entry type, so the fact is valid on every path that reaches it).
+    %% That is what makes a value computed from a function argument or from a
+    %% value extracted out of a term -- neither of which has a defining
+    %% instruction of its own -- a proven integer, and the fact is about the
+    %% RESULT of the instruction, hence valid at every use of it.
     Ks = operand_kinds(Def, Args, 0, Kinds),
     case lists:member(Op, ?NAT_BIFS) andalso all_nat(Ks) of
         true -> nat;
@@ -405,35 +423,62 @@ swap_arg_types(Anno) ->
     Anno.
 
 strength_mul(#b_literal{val=K}, X, I, Kinds) when is_integer(K) ->
-    strength_mul_1(K, X, operand_kind(I, 1, X, Kinds));
+    strength_mul_1(K, X, operand_kind(I, 1, X, Kinds), bounded(I, 1, X));
 strength_mul(X, #b_literal{val=K}, I, Kinds) when is_integer(K) ->
-    strength_mul_1(K, X, operand_kind(I, 0, X, Kinds));
+    strength_mul_1(K, X, operand_kind(I, 0, X, Kinds), bounded(I, 0, X));
 strength_mul(_A, _B, _I, _Kinds) ->
     no.
 
-strength_mul_1(K, X, Kind) when K > 1 ->
+%% `X * 2' is `X + X' for EVERY number, with no proof needed: both raise
+%% `badarith' on exactly the same non-numbers and both double a float exactly.
+%% It is therefore preferred over the shift even when X is a proven integer,
+%% because it cannot introduce a `system_limit' that `*' would not have raised.
+strength_mul_1(2, X, _Kind, _Bounded) ->
+    {'+', [X, X]};
+%% A shift is only equivalent to `*' when X is provably INTEGRAL and of bounded
+%% magnitude and the count is small. Integrality is required because `erts_bsl'
+%% rounds a float first operand to an integer instead of raising, so
+%% `1.5 bsl 5' succeeds (`48') where `1.5 * 32' raises `badarith'; the magnitude
+%% and count bounds are required because `bsl' raises `system_limit' past the
+%% bignum arity bound where `*' would have returned a bignum. See `bounded/3'
+%% and ?MAX_SHIFT.
+strength_mul_1(K, X, Kind, true) when K > 2 ->
     case power_of_two(K) of
-        {ok, N} ->
+        {ok, N} when N =< ?MAX_SHIFT ->
             case Kind of
-                nat ->
-                    {'bsl', [X, #b_literal{val=N}]};
-                int ->
-                    {'bsl', [X, #b_literal{val=N}]};
-                unknown when K =:= 2 ->
-                    %% X * 2 == X + X for every number: adding a float to
-                    %% itself doubles it without rounding, exactly like
-                    %% multiplying by 2, and both fail on the same values.
-                    {'+', [X, X]};
-                unknown ->
-                    no
+                nat -> {'bsl', [X, #b_literal{val=N}]};
+                int -> {'bsl', [X, #b_literal{val=N}]};
+                unknown -> no
             end;
-        no ->
+        _ ->
             no
     end;
-strength_mul_1(_K, _X, _Kind) ->
+strength_mul_1(_K, _X, _Kind, _Bounded) ->
     %% A literal factor of 0 or 1 is not a shift and `X * 0'/'X * 1' still
-    %% raise for a non-number, so those are left alone.
+    %% raise for a non-number, so those are left alone. A factor that is not a
+    %% power of two has no exact shift form, and a power of two whose operand
+    %% magnitude is not provably bounded is left alone as well.
     no.
+
+%% Whether the operand's magnitude is provably bounded -- i.e. below the widest
+%% range the type analysis represents (2^?NUM_BITS). Only such an operand may
+%% be turned into a left shift: `bsl' raises `system_limit' past the bignum
+%% arity bound where `*' would have returned a bignum, so an unbounded operand
+%% would turn a succeeding program into a failing one.
+%%
+%% Only a finite `#t_integer{}' element range proves a bound. `integer()'
+%% (`elements=any') and a union do not, and NEITHER DOES A LITERAL: a literal
+%% bignum operand can itself be arbitrarily large, so it is not accepted (a
+%% literal-by-literal product has already been constant-folded anyway).
+bounded(#b_set{anno=Anno}, Index, #b_var{}) ->
+    case Anno of
+        #{arg_types := #{Index := #t_integer{elements={Lo, Hi}}}} ->
+            is_integer(Lo) andalso is_integer(Hi);
+        _ ->
+            false
+    end;
+bounded(_I, _Index, _Arg) ->
+    false.
 
 strength_div(X, #b_literal{val=K}, I, Kinds) when is_integer(K), K > 1 ->
     case power_of_two(K) of
