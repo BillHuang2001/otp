@@ -5,8 +5,8 @@ This file is documentation, not a change log: it describes the tests that exist 
 Every count below is a local run of the gate command; **`#[ignore]`d tests are not run by `cargo test` and therefore not by CI.**
 
 ## Gate figures
-- `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --no-fail-fast` → **1090** passed / 0 failed / **1 ignored** across **53 result lines** -- **52 test binaries** (1 lib unit-test binary + 51 integration files under `tests/*.rs`) plus **1 doc-test**; the lib binary holds **454** unit tests.
-- `... -p beam_engine --features jit-cranelift` → **1142** passed / 0 failed / **2 ignored** (`tests/jit_cranelift.rs` + `tests/jit_cranelift_real.rs` engage on top of the figures above).
+- `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --no-fail-fast` → **1108** passed / 0 failed / **1 ignored** across **53 result lines** -- **52 test binaries** (1 lib unit-test binary + 51 integration files under `tests/*.rs`) plus **1 doc-test**; the lib binary holds **467** unit tests.
+- `... -p beam_engine --features jit-cranelift` → **1160** passed / 0 failed / **2 ignored** (`tests/jit_cranelift.rs` + `tests/jit_cranelift_real.rs` engage on top of the figures above).
 - The ignored tests are the JIT measurement tables — `tests/jit_bench.rs::interpreter_versus_native_tiers_measurement_table` (default run) and the feature-gated Cranelift ABBA harness in `src/jit/cranelift/bench.rs` — run explicitly with `--ignored --nocapture`. Their numbers live in `MEASURED.md`.
 
 ## Per-module `#[cfg(test)]` unit tests
