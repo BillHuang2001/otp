@@ -53,7 +53,7 @@
 //! | `dynamic_trace_probes` | bool |
 //! | `modified_timing_level` | atom, `undefined` |
 //! | `update_cpu_info` | atom, `unchanged` |
-//! | `trace_control_word` | int |
+//! | `trace_control_word` | int, `0` |
 //! | `port_parallelism` | bool |
 //! | `kernel_poll` | bool |
 //! | `halt_flush_timeout` | atom, `infinity` |
@@ -109,6 +109,15 @@ pub(crate) fn try_value(key: &str, rt: &Runtime) -> Option<Result<InfoValue>> {
         "dynamic_trace_probes" => Some(Ok(InfoValue::Bool(false))),
         "modified_timing_level" => Some(Ok(InfoValue::Atom("undefined"))),
         "update_cpu_info" => Some(Ok(InfoValue::Atom("unchanged"))),
+        // This runtime's trace-control word. It is **always `0`**: the word is an
+        // independent node-global knob whose only writers are
+        // `erlang:system_flag(trace_control_word, N)` / `erts_internal:set_tcw`
+        // (`erl_db_util.c:1080-1110`), which this runtime does not implement
+        // (`src/seq_trace.rs::system_flag_2` serves only `reset_seq_trace` and is a typed
+        // gap for every other flag). Process tracing does **not** change it — the oracle
+        // returns `0` before and after `erlang:trace(self(),true,[call])` +
+        // `trace_pattern/3` — so `0` is this runtime's truthful live value, not a
+        // placeholder. Deriving it from the process-trace state would be a *wrong* value.
         "trace_control_word" => Some(Ok(InfoValue::Int(0))),
         "port_parallelism" => Some(Ok(InfoValue::Bool(false))),
         "kernel_poll" => Some(Ok(InfoValue::Bool(cfg!(unix)))),
