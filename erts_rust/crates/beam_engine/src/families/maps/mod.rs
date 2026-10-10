@@ -67,17 +67,24 @@
 //!   present, the value is discarded". Same failure set as `get_map_elements`.
 //! * `emu/ops.tab:1364-1424` — the transforms (`put_map_assoc` "can never fail and
 //!   does not need any failure label").
+//! * `emu/beam_emu.c:578-583` (`i_func_info_IaaI`) + `beam_common.c:448-544`
+//!   (`handle_error`) — the `function_clause` reason for a head/guard/pattern
+//!   failure with no branch, the reason this engine gives the absent-key `NO_FAIL`
+//!   branch (see "The absent-key `NO_FAIL` reason" below).
 //!
 //! # Semantics
 //!
 //! * `GetMapElements { fail, source, pairs }` — read `source`; if it is not a map
 //!   jump to `fail` (or raise `{badmap, Source}` when `fail` is
 //!   [`NO_FAIL`] — the reason the compiler's own `is_map` guard branch raises). For
-//!   each `(key, dst)` pair, look `key` up; **a missing key jumps to `fail`**,
-//!   otherwise the value is written to `dst`. Partial writes before a failure are
-//!   harmless (the clause matcher restarts at `fail`).
+//!   each `(key, dst)` pair, look `key` up; **a missing key jumps to `fail`**, or —
+//!   when `fail` is [`NO_FAIL`] — raises the bare atom `function_clause` (the
+//!   engine-defined reason for this branchless failure, see below), otherwise the
+//!   value is written to `dst`. Partial writes before a failure are harmless (the
+//!   clause matcher restarts at `fail`).
 //! * `HasMapFields { fail, source, keys }` — every key must be present, else jump
-//!   to `fail`. No writes.
+//!   to `fail`, or raise the same bare `function_clause` when `fail` is
+//!   [`NO_FAIL`]. No writes.
 //! * `PutMapAssoc { fail, source, dst, live, pairs }` — build a **new** map =
 //!   `source` with each `(key, value)` inserted or overwritten, then write it to
 //!   `dst`. Maps are immutable, so the source is never mutated in place. The result
@@ -91,6 +98,22 @@
 //! the update) is **unused at M1**: `MinimalContext` has no moving collector, so the
 //! update cannot relocate terms. It stays in the IR for the Stage-4 collector.
 //!
+//! # The absent-key `NO_FAIL` reason (engine-defined)
+//!
+//! The read path's C failure is the plain `$FAIL($Fail)` (`emu/map_instrs.tab:49-122`
+//! → `emu/macros.tab:56-60`), which sets **no** exception reason: only
+//! `erts_gc_update_map_exact` sets `BADKEY` (`beam_common.c:2265`). The installed
+//! `erlc` never emits [`NO_FAIL`] for the matching forms (both `get_map_elements` and
+//! `has_map_fields` always carry a fail label), so a **missing key with
+//! `fail == NO_FAIL`** has no ground truth. It is therefore engine-defined and raises
+//! class `error` with the **bare atom** `function_clause` — the reason C gives a
+//! head/guard/pattern failure that finds no branch (`emu/beam_emu.c:578-583`
+//! `i_func_info_IaaI`, `beam_common.c:448-544`). The tag is resolved **only** from the
+//! running module's atom table: a module that cannot name it yields the documented
+//! typed `error::unsupported`, never a substituted atom. The non-map `source` case
+//! is unrelated and stays `{badmap, Source}` (the compiler's own `is_map` guard
+//! reason).
+//!
 //! # Milestone-1 limits (all documented, never a wrong result)
 //!
 //! * **Atom key order follows the module-local atom table.** The frozen flat-map
@@ -102,9 +125,9 @@
 //! * A non-map `source` that the ground truth does not route to `fail` (e.g. a
 //!   `put_map_assoc` whose dropped fail label is always `NO_FAIL`) raises
 //!   `{badmap, Source}` rather than mis-reading the term.
-//! * A **missing key with `fail == NO_FAIL`** has no ground truth (the compiler
-//!   always emits a fail label for the matching forms), so it is a documented typed
-//!   `error::unsupported` rather than an invented exception reason.
+//! * A **missing key with `fail == NO_FAIL`** is engine-defined (see the section
+//!   above): it raises the bare atom `function_clause`, or the typed
+//!   `error::unsupported` when the module cannot name it.
 
 mod read;
 #[cfg(test)]
@@ -224,19 +247,47 @@ fn fail_or_raise(
     }
 }
 
-/// The fail-label-only failure path (a failure the ground truth never raises for):
-/// jump to `fail`, or report `what` as a documented typed error when `fail` is
-/// [`NO_FAIL`].
-fn jump_or_unsupported(
+/// The fail-label-only failure path (the read instructions' absent key): jump to
+/// `fail`, or — when `fail` is [`NO_FAIL`] — raise the bare atom `function_clause`.
+///
+/// The ground truth never sets a reason here (the read path's C failure is the plain
+/// `$FAIL($Fail)`), so this branchless failure is engine-defined; see the
+/// "absent-key `NO_FAIL` reason" section in the module docs.
+fn fail_or_function_clause(
+    machine: &mut Machine,
+    module: &Module,
     labels: &LabelMap,
     fail: Label,
-    what: &str,
 ) -> Result<Step> {
     if fail == NO_FAIL {
-        Err(error::unsupported(what))
+        raise_function_clause(machine, module)
     } else {
         goto(labels, fail)
     }
+}
+
+/// Raise class `error` with the **bare atom** `function_clause`.
+///
+/// This is the reason C gives a head/guard/pattern failure that finds no branch
+/// (`emu/beam_emu.c:578-583` `i_func_info_IaaI`, `beam_common.c:448-544`), and the
+/// reason this engine gives the read instructions' `NO_FAIL` absent-key branch (the
+/// ground truth sets no reason: it is a plain `$FAIL`, and the compiler never emits
+/// [`NO_FAIL`] for the matching forms).
+///
+/// The atom is resolved **only** from the running module's atom table: a module that
+/// never mentions `function_clause` cannot name the reason, so a missing atom is a
+/// documented typed `error::unsupported` (never a substituted, wrong atom). The
+/// `error` class atom is installed when the module has it, so a landing can place it
+/// in `x(3)`.
+fn raise_function_clause(machine: &mut Machine, module: &Module) -> Result<Step> {
+    let atom = module
+        .atom_table
+        .lookup("function_clause")
+        .ok_or_else(|| error::unsupported("maps: no 'function_clause' atom in the module"))?;
+    if let Some(class_atom) = module.atom_table.lookup(ExceptionClass::Error.as_str()) {
+        machine.set_class_atom(ExceptionClass::Error, make_atom(class_atom));
+    }
+    machine.throw_error(make_atom(atom))
 }
 
 /// Raise `{Tag,Value}` as a class-`error` exception (the `{badmap,Source}` /
