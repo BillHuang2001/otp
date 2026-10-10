@@ -37,9 +37,14 @@ map for the source subtree and the notes the child nodes inherit.
 - Build/test with the wrapper: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_codec --no-fail-fast` (`$HOME` is read-only). Never `cd`.
 - Sibling `../tests/` (integration binaries) is **read-only** for this node — escalate
   test changes to `..`.
-- The `unsupported_external_term` on an internal reference came from the encoder having
-  no internal-ref branch; the internal pid/port branches already exist
-  (`encode/mod.rs`, `if let Some((local_node, creation)) = self.local_node`).
+- Local-node identifier round-trip: a local-node pid/port/ref now demotes to this
+  runtime's internal form on decode (when an identity is installed) and an internal
+  ref now encodes as a 3-number `NEWER_REFERENCE_EXT` (when an identity is installed);
+  both are inert with no identity (the distribution path is untouched). `decode_term`
+  stays identity-free — use `decode_term_with_local_node` for `binary_to_term`.
+- The runtime seam is not wired yet: `beam_bifs::binconv` builds its `Decoder` without
+  `with_local_node`, and its `decode_term_bif` still calls `decode_term`, so the demotion
+  is inert end-to-end until a host installs the identity.
 
 ## Routing Table
 - `lib.rs` → crate wiring, root re-exports, the single `#[allow(unsafe_code)] mod term;`
