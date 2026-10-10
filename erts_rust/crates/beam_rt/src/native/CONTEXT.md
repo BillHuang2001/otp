@@ -37,7 +37,7 @@ per-function bodies. Files:
 | `application.rs` | `application:get_env/1,2,3`, `get_all_env/1`, `get_key/2`, `get_application/0` (always `undefined` — there is no application controller and no owning application), `loaded_applications/0`, `which_applications/0` over a minimal native `.app` view |
 | `erts_internal.rs` | the `erts_internal` floor (14 BIFs) — see below |
 | `prim.rs` | the `prim_file` floor (27 entries) — see below |
-| `prim_file.rs` | the whole-file-descriptor half of the `prim_file` floor (`open/2` `read/2` `write/2` `close/1` `position/2`) + its unit tests |
+| `prim_file.rs` | the whole-file-descriptor half of the `prim_file` floor (`open/2` `read/2` `write/2` `close/1` `position/2` `pread/2,3` `pwrite/2,3` `truncate/1` `sync/1` `datasync/1` `write_file/2` `set_cwd/1` `ipread_s32bu_p32bu/3` `get_handle/1`) + its unit tests |
 | `file_server.rs` | the native **`file_server_2` service** (contract A.9) — the registered service process + its native io-devices, the `gen_server`/`file`/`io` wire, and the scheduler-pass step that services their mailboxes (see below) |
 | `file_server/get_until.rs` | the `{get_until, …}` io-device request (`get_until::serve` + the engine-backed `EngineContinuation`) — the one io-device step that runs Erlang code, driving `Mod:Func(Cont, Data, XtraArgs…)` on the engine (see below); its unit tests live in `file_server/get_until/tests.rs` |
 | `file_server/get_line.rs` | the `{get_line, Enc, _Prompt}` io-device request (`get_line::serve` + the `LineContinuation` implementing `io_lib:collect_line/4`'s semantics and the `cast/4` reply table) — what makes `file:read_line/1` work (see below); its unit tests live in `file_server/get_line/tests.rs` |
