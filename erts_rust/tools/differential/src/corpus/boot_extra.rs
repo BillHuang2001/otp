@@ -53,12 +53,13 @@
 //!
 //! | surface | oracle (OTP 29 / erts-17.1) | rust runtime |
 //! |---|---|---|
-//! | `code:get_mode/0` | `interactive` | raises `badarg` |
 //! | `code:lib_dir/2` (e.g. `code:lib_dir(kernel, ebin)`) | a path string | raises `badarg` |
 //! | `code:get_path/0` | the installation's path list | a differing path list |
-//! | `init:get_argument(root\|home\|progname)` | `{ok,[[Path]]}` / `{ok,[["erl"]]}` | `error` |
+//! | `init:get_argument(progname)` | `{ok,[["erl"]]}` | `{ok,[["beam_rt"]]}` (the runtime's own invocation name) |
+//! | `init:get_arguments/0` | every flag **plus** the emulator's `root`/`bindir`/`progname`/`home` | the runtime's own modelled flags only |
 //! | `init:script_id/0` | `{"Erlang/OTP","29"}` | raises `badarg` |
-//! | `application:get_application/0,1` | `undefined` / `{ok,App}` | raises `badarg` |
+//! | `application:get_application/1` | `{ok,App}` | raises `badarg` |
+//! | `application:get_all_key/1`, `application:get_key/1` | `{ok,KeyValueList}` | raises `badarg` |
 //! | `application:get_key(App, mod)` on a library app | `{ok,[]}` | `undefined` |
 //! | `erlang:module_info/1`, `erlang:get_module_info/2` | the export table (from `erlang`) | `undef` / `badarg` |
 //! | `lists:module_info(exports)` | the export set | the same set in a differing order |
@@ -72,9 +73,10 @@
 //! | `erlang:system_info(endian)` / `erlang:system_info(build_type)` | `little` / `opt` | raises `badarg` |
 //! | `persistent_term:info/0` | the live `count`/`memory` counters | zero-valued counters |
 //!
-//! (`erlang:check_old_code/1`, `erlang:system_info(loaded)` and `erlang:system_info(check_io)` are
-//! capability gaps — the runtime raises its documented `unsupported` — so they are neither cases
-//! nor mismatches.)
+//! (`code:get_mode/0`, `application:get_application/0` and `init:get_argument(root\|home)` — the
+//! emulator's automatic flags — **do** agree and are pinned in the sibling `boot_prereq` group.
+//! `erlang:system_info(loaded)` and `erlang:system_info(check_io)` are capability gaps — the
+//! runtime raises its documented `unsupported` — so they are neither cases nor mismatches.)
 
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
