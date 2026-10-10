@@ -54,6 +54,9 @@ mod trace;
 #[cfg(test)]
 mod tests;
 
+// The one definition of the failed-clause `function_clause` raise, shared with the
+// instruction families (the maps read path's absent-key `NO_FAIL` branch).
+pub(crate) use dispatch::raise_function_clause_no_fail;
 // The `tests` submodule is moved verbatim from the former single-file
 // `interpreter.rs`; it relies on `use super::*` for the names that file had in
 // scope, so the ones not otherwise needed here are imported test-only.

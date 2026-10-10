@@ -18,7 +18,7 @@
 //
 // %CopyrightEnd%
 
-//! Bitstring **construction**: `bs_create_bin` (and the `bs_init_writable` gap).
+//! Bitstring **construction**: `bs_create_bin` and `bs_init_writable`.
 //!
 //! Ground truth (read-only): `emu/bs_instrs.tab` (`i_bs_create_bin` `:415`,
 //! `i_bs_private_append`), the segment table `emu/generators.tab` and the flag bits
@@ -39,12 +39,13 @@
 //!
 //! Implemented: `integer` (any width, big- or little-endian, the value masked into
 //! the field — up to 64 bits through the machine-word path, wider fields through the
-//! bignum path [`super::push_wide_int`]), `binary` (byte-aligned, `all` or an
+//! bignum path [`super::push_wide_int`]), `binary` (byte-aligned or not, `all` or an
 //! explicit bit count), `string` constants from the `StrT` table, `float` (16/32/64
-//! bits, big- or little-endian), `utf8`/`utf16`/`utf32`, an `append`/`private_append`
-//! **first** segment, and `bs_init_writable` — combined into one result bitstring of
-//! any size (an on-heap `ErlHeapBits` up to the 64-byte limit, an off-heap refc
-//! binary above it; see [`raw::make_binary`]).
+//! bits, big- or little-endian), `utf8`/`utf16`/`utf32`, an
+//! `append`/`private_append` segment in **any** position (its source's bits are
+//! concatenated at the point it appears), and `bs_init_writable` — combined into one
+//! result bitstring of any size (an on-heap `ErlHeapBits` up to the 64-byte limit, an
+//! off-heap refc binary above it; see [`raw::make_binary`]).
 //!
 //! # `append` / `private_append`: copy-rebuild, not in-place growth
 //!
@@ -53,17 +54,15 @@
 //! so a loop that appends `n` times is amortised O(n). The engine's payloads are
 //! immutable ([`beam_alloc::RefcBinary`] has no grow operation and `BinRef.val` has no
 //! setter), so an append instead **seeds a bit vector with the source's bits, appends
-//! the remaining segments, and materialises a fresh term**. The result bytes are
-//! identical for every successful build (so this is observationally correct), but a
-//! long append loop is O(n²) rather than amortised O(n). Three further C observables
-//! are deliberately unmodelled in M1: the `BIN_FLAG_WRITABLE`/`BIN_FLAG_ACTIVE_WRITER`
+//! the remaining segments, and materialises a fresh term** — the same bits C's
+//! `not_writable` arm copies (`erl_bits.c:1855-1924`). The result bytes are identical
+//! for every successful build (so this is observationally correct), but a long append
+//! loop is O(n²) rather than amortised O(n). Three further C observables are
+//! deliberately unmodelled in M1: the `BIN_FLAG_WRITABLE`/`BIN_FLAG_ACTIVE_WRITER`
 //! flags on the underlying binary, `binary:referenced_byte_size/1`'s "capacity vs
 //! size" answer, and the fact that a `private_append` result lets a *later*
 //! `private_append` reuse the same buffer (the engine's result is an ordinary,
 //! non-writable refc binary — which the next append simply seeds from).
-//!
-//! Not implemented (a precise typed [`crate::error::unsupported`]): an
-//! `append`/`private_append` segment that is not the first.
 //!
 //! # `BS_FAIL_INFO`: why a segment failure raises a bare reason atom
 //!
@@ -237,7 +236,9 @@ fn assemble(
             "binary" => {
                 // The size loop's `is_not_bitstring(Src)` check
                 // (`emu/bs_instrs.tab:390`) fails **before** the size is even read.
-                let Some((bytes, src_bits)) = segment_source(machine, module, value_op, ctx)? else {
+                let Some((bytes, src_off, src_bits)) =
+                    segment_source(machine, module, value_op, ctx)?
+                else {
                     return fail_seg(machine, module, labels, fail, SegReason::BadArg);
                 };
                 let nbits = if is_all(module, size_op) {
@@ -263,7 +264,7 @@ fn assemble(
                 if nbits > src_bits {
                     return fail_seg(machine, module, labels, fail, SegReason::BadArg);
                 }
-                writer.push_bits_from(bytes, 0, nbits);
+                writer.push_bits_from(bytes, src_off, nbits);
             }
             // `string Unit Fs Offset Size` — append a constant byte string from the
             // module's `StrT` table (`BS_LOAD_STRING_SRC`/`erts_bs_put_string`,
@@ -332,37 +333,36 @@ fn assemble(
             }
             // `append`/`private_append` (`BSC_APPEND`/`BSC_PRIVATE_APPEND`,
             // `bs_instrs.tab:541-569`). The compiler emits it as the **first**
-            // segment only, with the accumulator in the value operand and the size
-            // operand `all`; C seeds the build with the whole of the source
-            // bitstring (`erts_bs_append_checked` / `erts_bs_private_append_checked`
-            // take `sb->end` as the starting position) and then appends the
-            // remaining segments. The source may be the `bs_init_writable` result
-            // (a 0-bit refc binary) or a previously built refc binary, both of which
-            // [`raw::heap_bits`] reads.
+            // segment, with the accumulator in the value operand and the size operand
+            // `all`; an appending segment in any other position concatenates the
+            // source's bits onto the segments already accumulated. C seeds the build
+            // with the whole of the source bitstring (`erts_bs_append_checked` /
+            // `erts_bs_private_append_checked` take `sb->end` as the starting position)
+            // and then appends the remaining segments. The source may be the
+            // `bs_init_writable` result (a 0-bit refc binary) or a previously built
+            // refc binary, both of which [`raw::heap_bits`] reads — at whatever bit
+            // offset their window starts.
             //
             // The engine seeds its bit vector from the source and rebuilds a fresh
             // term rather than growing the source's payload in place (the engine's
-            // payloads are immutable). That is observationally identical for a
-            // successful build; see the module docs for the honest divergences.
+            // payloads are immutable; C's `not_writable` arm does the same copy). That
+            // is observationally identical for a successful build; see the module docs
+            // for the honest divergences.
             "append" | "private_append" => {
-                if i != 0 {
-                    return Err(error::unsupported(
-                        "bs_create_bin: append/private_append is not the first segment",
-                    ));
-                }
                 let value = read_value(machine, module, ctx, value_op)?;
-                let Some((_, src_bits)) = raw::heap_bits(value) else {
-                    // `erts_bs_append_checked` (`erl_bits.c:1744`) rejects a
-                    // non-bitstring accumulator with `BADARG`.
+                let Some((_, src_bits, _)) = raw::heap_bits(value) else {
+                    // `erts_bs_append_checked` (`erl_bits.c:1744`) /
+                    // `erts_bs_private_append_checked` reject a non-bitstring
+                    // accumulator with `BADARG`.
                     return fail_seg(machine, module, labels, fail, SegReason::BadArg);
                 };
-                // `erts_bs_append_checked` (`erl_bits.c:1778`): the accumulator's
-                // bit size must be a multiple of the segment's unit.
+                // `erts_bs_append_checked` (`erl_bits.c:1877`): the source's bit size
+                // must be a multiple of the segment's unit.
                 if unit != 1 && src_bits % unit != 0 {
                     return fail_seg(machine, module, labels, fail, SegReason::BadArg);
                 }
-                let bytes = raw::subject_bytes(value)?;
-                writer.push_bits_from(bytes, 0, src_bits);
+                let (bytes, src_off) = raw::subject_bytes(value)?;
+                writer.push_bits_from(bytes, src_off, src_bits);
             }
 
             other => {

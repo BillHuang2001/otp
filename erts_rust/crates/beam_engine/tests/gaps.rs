@@ -174,13 +174,25 @@ fn pin_badarg(name: &str, result: std::result::Result<Eterm, BeamError>) {
 #[test]
 fn interpreter_capability_gaps_report_their_exact_typed_error() {
     // --- core loop: the `NO_FAIL` guard branches (src/interpreter.rs) ---------
+    // A `NO_FAIL` (`fail == 0`) failure is now a DEFINED raise, not an undefined
+    // fall-through: the shared helper `raise_function_clause_no_fail` raises class
+    // `error` with the bare atom `function_clause`, resolved ONLY from the running
+    // module's own atom table. A module that cannot name `function_clause` degrades
+    // to the honest typed gap pinned here. The installed `erlc` ALWAYS supplies a
+    // real fail label for these instructions, so a `{f,0}` failure has NO `erl`
+    // oracle — it is pinned from C ground truth
+    // (`../../erts/emulator/beam/emu/macros.tab` `FAIL`/`FAIL_HEAD_OR_BODY`,
+    // `beam_common.c` `handle_error`, `emu/beam_emu.c` `find_func_info`) plus the
+    // engine's own `func_info` precedent.
     // CORPUS-REACHABLE: `test`/`select_val` are emitted for every match.
     {
         let mut f = GapFixture::new();
         let code = vec![
             Instr::Label(Label(1)),
-            // `is_tuple` on a small int fails, and `fail` is `NO_FAIL` (the
-            // compiler's "cannot fail" marker) ⇒ typed error, never a fall-through.
+            // `is_tuple` on a small int fails with `fail == NO_FAIL` (the compiler's
+            // "cannot fail" marker): the defined raise is class `error` / bare atom
+            // `function_clause` from the module's own atom table, but this synthetic
+            // module cannot name that atom, so it surfaces as the typed gap below.
             Instr::Test {
                 kind: TestKind::IsTuple,
                 fail: NO_FAIL,
@@ -193,7 +205,7 @@ fn interpreter_capability_gaps_report_their_exact_typed_error() {
         pin(
             "test/no_fail",
             run_gap(&module, entry, &[make_small(0)]),
-            "test/no_fail",
+            "test: no 'function_clause' atom in the module",
         );
     }
     {
@@ -213,14 +225,26 @@ fn interpreter_capability_gaps_report_their_exact_typed_error() {
         pin(
             "select_val/no_fail",
             run_gap(&module, entry, &[make_small(0)]),
-            "select_val/no_fail",
+            "select_val: no 'function_clause' atom in the module",
         );
     }
 
     // --- maps family (src/families/maps.rs) ----------------------------------
+    // A `get_map_elements`/`has_map_fields` `NO_FAIL` (`fail == 0`) failure is the same
+    // DEFINED raise as the core loop: class `error` with the bare atom `function_clause`,
+    // resolved ONLY from the running module's own atom table (the modules below cannot
+    // name it, hence the typed gaps). The installed `erlc` ALWAYS supplies a real fail
+    // label for these instructions, so a `{f,0}` failure has NO `erl` oracle — it is
+    // pinned from C ground truth (`../../erts/emulator/beam/emu/macros.tab`
+    // `FAIL`/`FAIL_HEAD_OR_BODY`, `beam_common.c` `handle_error`, `emu/beam_emu.c`
+    // `find_func_info`) plus the engine's own `func_info` precedent. The
+    // `put_map_assoc`/`put_map_exact` `{badmap,Source}`/`{badkey,Key}` raises are
+    // UNCHANGED (see below).
     // CORPUS-REACHABLE: map reads/updates are emitted by every map-using module.
     {
-        // `get_map_elements` with an absent key and `fail == NO_FAIL`. The map is
+        // `get_map_elements` with an absent key and `fail == NO_FAIL`: the defined
+        // raise is class `error` / bare atom `function_clause` from the module's own
+        // atom table, which this module cannot name, hence the typed gap. The map is
         // built in a separate context that stays alive for the run.
         let mut f = GapFixture::new();
         let a = f.atom("a");
@@ -243,10 +267,13 @@ fn interpreter_capability_gaps_report_their_exact_typed_error() {
         pin(
             "get_map_elements/no_fail",
             run_gap(&module, entry, &[map]),
-            "get_map_elements: key absent with no fail label",
+            "maps: no 'function_clause' atom in the module",
         );
     }
     {
+        // `has_map_fields` with an absent required key and `fail == NO_FAIL`: the
+        // defined raise is class `error` / bare atom `function_clause` from the
+        // module's own atom table, which this module cannot name, hence the typed gap.
         let mut f = GapFixture::new();
         let a = f.atom("a");
         let b = f.atom("b");
@@ -268,7 +295,7 @@ fn interpreter_capability_gaps_report_their_exact_typed_error() {
         pin(
             "has_map_fields/no_fail",
             run_gap(&module, entry, &[map]),
-            "has_map_fields: key absent with no fail label",
+            "maps: no 'function_clause' atom in the module",
         );
     }
     {
@@ -415,108 +442,6 @@ fn interpreter_capability_gaps_report_their_exact_typed_error() {
             run_gap(&module, entry, &[make_small(0)]),
             "put_record/no_fail",
         );
-    }
-
-    // --- bitstrings family (src/families/bitstrings/{create,raw}.rs) ---------
-    // CORPUS-REACHABLE: `bs_create_bin` is emitted for every binary builder.
-    {
-        // An `append`/`private_append` segment that is **not** the first: the
-        // compiler only ever emits it first; C seeds the build from the source, so
-        // a non-first one is refused rather than mis-handled. The segment list is
-        // `[Type, Index, Unit, Flags, Value, Size]` per segment.
-        let mut f = GapFixture::new();
-        let integer = f.atom("integer");
-        let append = f.atom("append");
-        let segments = vec![
-            // segment 0 — a valid `integer:8` segment.
-            Operand::Atom(integer),
-            Operand::Integer(1),
-            Operand::Integer(1),
-            Operand::Nil,
-            Operand::Integer(7),
-            Operand::Integer(8),
-            // segment 6 — the misplaced `append`.
-            Operand::Atom(append),
-            Operand::Integer(0),
-            Operand::Integer(1),
-            Operand::Nil,
-            Operand::Integer(0),
-            Operand::Integer(0),
-        ];
-        let code = vec![
-            Instr::Label(Label(1)),
-            Instr::BsCreateBin {
-                fail: NO_FAIL,
-                alloc: 0,
-                live: 1,
-                unit: 8,
-                dst: Operand::X(1),
-                segments,
-            },
-            Instr::Return,
-        ];
-        let entry = f.add_function("f", 0, code);
-        let module = f.finish();
-        pin(
-            "bs_create_bin/append-not-first",
-            run_gap(&module, entry, &[]),
-            "bs_create_bin: append/private_append is not the first segment",
-        );
-    }
-    {
-        // A refc-binary `ErlSubBits` window that does **not** start on a byte
-        // boundary: `raw::heap_bits` refuses it (the engine only ever builds
-        // byte-aligned refc binaries), so a match-context op over it reports the
-        // unreadable subject instead of reading the wrong bytes.
-        //
-        // `bs_get_tail` takes its context operand and reads `orig` out of it; the
-        // misaligned refc term *is* an `ErlSubBits`, whose `orig` is the bare
-        // `BinRef` — which `heap_bits` refuses.
-        let mut f = GapFixture::new();
-        let code = vec![
-            Instr::Label(Label(1)),
-            Instr::BsGetTail {
-                ctx: Operand::X(0),
-                dst: Operand::X(1),
-                live: 1,
-            },
-            Instr::Return,
-        ];
-        let entry = f.add_function("f", 1, code);
-        let module = f.finish();
-
-        // Keep the misaligned refc term (and its payload) alive for the run. Both
-        // are word-aligned (a `Vec<Eterm>`), satisfying `beam_term::refc`'s
-        // frozen-layout contract; `offset_bits = 1` is the misalignment under test.
-        let mut builder = MinimalContext::new();
-        let mut payload: Vec<Eterm> = vec![Eterm::default(); 2];
-        let base = payload.as_ptr().cast::<u8>();
-        let value = payload.as_mut_ptr();
-        let hp = builder
-            .alloc_words(beam_term::refc::ERL_REFC_BITS_SIZE)
-            .expect("the arena hands out 8 words");
-        // SAFETY: `hp` points at `ERL_REFC_BITS_SIZE` (8) exclusively-owned words in
-        // the context's pointer-stable arena, `value`/`base` point at the live,
-        // word-aligned `payload`, and `next` is null (a chain terminator). The
-        // returned term is used only while `builder`/`payload` live.
-        let refc = unsafe {
-            beam_term::refc::write_refc_binary(
-                hp,
-                value,
-                core::ptr::null_mut(),
-                base,
-                1,
-                16,
-            )
-        };
-        // The term must survive the run: pass it as the argument (the payload stays
-        // alive in `payload`/`builder` for the whole call).
-        pin(
-            "bitstring/refc-window-not-byte-aligned",
-            run_gap(&module, entry, &[refc]),
-            "bitstring: subject is not a readable binary",
-        );
-        core::hint::black_box(&payload);
     }
 
     // --- exceptions family (src/families/exceptions.rs) ----------------------

@@ -30,8 +30,10 @@
 //! frozen map layouts (flat map and hashmap/HAMT, walked node by node), and match
 //! keys with `beam_term::cmp` — no hash function, no reimplemented term ordering. A
 //! non-map source takes the `fail` branch, or raises `{badmap, Source}` when the
-//! label is `NO_FAIL`; an absent key takes the `fail` branch (the parent module docs
-//! carry the full semantics and the ground truth).
+//! label is `NO_FAIL`; an absent key takes the `fail` branch, or — when the label is
+//! `NO_FAIL` (engine-defined: the ground truth's read failure sets no reason) — raises
+//! the bare atom `function_clause` (the parent module docs carry the full semantics
+//! and the ground truth).
 
 use crate::interpreter::LabelMap;
 
@@ -45,7 +47,7 @@ use crate::predicates;
 use crate::terms;
 use crate::Step;
 
-use super::{fail_or_raise, jump_or_unsupported, lookup};
+use super::{fail_or_function_clause, fail_or_raise, lookup};
 
 /// `get_map_elements Fail Src {Key,Dst}*` — write each key's value to its
 /// destination; a non-map source or an absent key fails.
@@ -68,11 +70,7 @@ pub(super) fn get_map_elements(
         match lookup(&entries, key, &module.atom_table) {
             Some(value) => write_operand(machine, dst_operand, value)?,
             None => {
-                return jump_or_unsupported(
-                    labels,
-                    fail,
-                    "get_map_elements: key absent with no fail label",
-                );
+                return fail_or_function_clause(machine, module, labels, fail);
             }
         }
     }
@@ -98,11 +96,7 @@ pub(super) fn has_map_fields(
     for key_operand in keys {
         let key = read_operand(machine, ctx, key_operand)?;
         if lookup(&entries, key, &module.atom_table).is_none() {
-            return jump_or_unsupported(
-                labels,
-                fail,
-                "has_map_fields: key absent with no fail label",
-            );
+            return fail_or_function_clause(machine, module, labels, fail);
         }
     }
     Ok(Step::Next)

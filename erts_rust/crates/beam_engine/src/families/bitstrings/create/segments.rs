@@ -37,21 +37,26 @@ use crate::machine::Machine;
 use super::read_value;
 use super::super::{is_all, raw, read_size, small_value};
 
-/// The byte slice and bit count a `binary` segment draws from, or `None` when the
-/// operand is not a bitstring — the C `is_not_bitstring(Src)` -> `$BS_FAIL_INFO(...,
-/// BADARG, am_type, Src)` arm (`emu/bs_instrs.tab:390`, `:650`).
+/// The byte slice, window bit offset and bit count a `binary` segment draws from,
+/// or `None` when the operand is not a bitstring — the C `is_not_bitstring(Src)` ->
+/// `$BS_FAIL_INFO(..., BADARG, am_type, Src)` arm (`emu/bs_instrs.tab:390`, `:650`).
+///
+/// The offset is the source's own window offset (`0` for a byte-aligned subject,
+/// non-zero for a refc binary whose window does not start on a byte boundary); the
+/// caller threads it into the bit index it copies from, so a non-byte-aligned source
+/// is copied bit-exactly.
 pub(super) fn segment_source<'a>(
     machine: &Machine,
     module: &Module,
     operand: &Operand,
     ctx: &mut dyn ExecutionContext,
-) -> Result<Option<(&'a [u8], usize)>> {
+) -> Result<Option<(&'a [u8], usize, usize)>> {
     let value = read_value(machine, module, ctx, operand)?;
-    let Some((_, bits)) = raw::heap_bits(value) else {
+    let Some((_, bits, _)) = raw::heap_bits(value) else {
         return Ok(None);
     };
-    let bytes = raw::subject_bytes(value)?;
-    Ok(Some((bytes, bits)))
+    let (bytes, off) = raw::subject_bytes(value)?;
+    Ok(Some((bytes, off, bits)))
 }
 
 /// The `StrT` bytes a `string` constant segment appends.

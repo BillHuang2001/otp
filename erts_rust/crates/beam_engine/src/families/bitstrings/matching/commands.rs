@@ -71,11 +71,11 @@ pub(crate) fn run_commands(
         // Re-derive the context and its byte view at the top of **every** iteration:
         // the previous iteration's `integer`/`binary`/`get_tail` command allocated
         // through the rooted seam (`read_integer_field` -> `raw::make_big`,
-        // `raw::make_bits`), whose moving collector may have relocated the context
+        // `raw::make_binary`), whose moving collector may have relocated the context
         // block, so a `term`/`bytes` captured before that allocation is stale
         // (the frozen reserve, then read, then write ordering).
         let (_, orig, _, end) = read_ctx(machine, ctx, ctx_op, "bs_match")?;
-        let bytes = raw::subject_bytes(orig)?;
+        let (bytes, off) = raw::subject_bytes(orig)?;
         let Operand::Atom(command) = &commands[i] else {
             return Err(error::unsupported(
                 "bs_match: command list does not start with an atom",
@@ -128,7 +128,7 @@ pub(crate) fn run_commands(
                 if nbits > end.saturating_sub(pos) {
                     return fail_step(machine, module, labels, fail, ctx_op, ctx);
                 }
-                let value = read_integer_field(machine, ctx, bytes, pos, nbits, flags)?;
+                let value = read_integer_field(machine, ctx, bytes, pos + off, nbits, flags)?;
                 pos += nbits;
                 // The C advances `sb->start` (inside `erts_bs_get_integer_2`) *before*
                 // it binds `$Dst`, so the advance is mirrored first: `Dst` may be the
@@ -154,8 +154,12 @@ pub(crate) fn run_commands(
                 if nbits > end.saturating_sub(pos) {
                     return fail_step(machine, module, labels, fail, ctx_op, ctx);
                 }
-                let out = extract_bits(bytes, pos, nbits)?;
-                let value = raw::make_bits(machine, ctx, &out, nbits)?;
+                let out = extract_bits(bytes, pos + off, nbits)?;
+                // `i_bs_get_fixed_binary` builds the window through
+                // `erts_build_sub_bitstring` for an arbitrary bit count (no 64-byte
+                // limit), so the result goes through `raw::make_binary`, which picks
+                // the frozen on-heap/off-heap representation by size.
+                let value = raw::make_binary(machine, ctx, &out, nbits)?;
                 pos += nbits;
                 // `i_bs_get_fixed_binary` does `sb->start += size;` *before*
                 // `$Dst = result;` — mirror the advance first (`Dst` may be the
@@ -170,8 +174,11 @@ pub(crate) fn run_commands(
             "get_tail" => {
                 let dst = cmd_at(commands, i + 3)?;
                 let nbits = end.saturating_sub(pos);
-                let out = extract_bits(bytes, pos, nbits)?;
-                let value = raw::make_bits(machine, ctx, &out, nbits)?;
+                let out = extract_bits(bytes, pos + off, nbits)?;
+                // `i_bs_get_tail` builds an arbitrary bit count (no 64-byte limit),
+                // so the result goes through `raw::make_binary` (on-heap at/below
+                // `ERL_ONHEAP_BINARY_LIMIT`, off-heap refc above).
+                let value = raw::make_binary(machine, ctx, &out, nbits)?;
                 write_operand(machine, dst, value)?;
                 i += 4;
             }
@@ -191,7 +198,7 @@ pub(crate) fn run_commands(
                 if bits > 64 || bits > end.saturating_sub(pos) {
                     return fail_step(machine, module, labels, fail, ctx_op, ctx);
                 }
-                if read_uint_be(bytes, pos, bits)? != want as u64 {
+                if read_uint_be(bytes, pos + off, bits)? != want as u64 {
                     return fail_step(machine, module, labels, fail, ctx_op, ctx);
                 }
                 pos += bits;
@@ -212,7 +219,7 @@ pub(crate) fn run_commands(
 ///
 /// The context operand is re-read **here**, right before the write: the command that
 /// advanced the cursor may have allocated through the rooted seam
-/// ([`read_integer_field`] -> [`raw::make_big`], [`raw::make_bits`]), whose moving
+/// ([`read_integer_field`] -> [`raw::make_big`], [`raw::make_binary`]), whose moving
 /// collector may have relocated the context block, so the term captured at the top of
 /// the iteration is stale (the frozen reserve, then read, then write ordering). The
 /// operand itself is part of the machine's root set and is rewritten in place by the
@@ -258,5 +265,106 @@ pub(crate) fn ensure_at_least(remaining: usize, size: usize, unit: usize) -> boo
         remaining >= size
     } else {
         remaining >= size && (remaining - size) % unit == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Instruction-level tests for the `bs_match` command interpreter's result
+    //! builders — in particular the `binary`/`get_tail` commands whose C bodies
+    //! (`i_bs_get_fixed_binary`, `i_bs_get_tail`) build through
+    //! `erts_build_sub_bitstring` for an **arbitrary** bit count.
+    use super::*;
+
+    use crate::context::MinimalContext;
+    use crate::families::bitstrings::exec as family_exec;
+    use crate::families::bitstrings::raw;
+    use crate::terms::binary_bytes;
+    use beam_loader::{Instr, NO_FAIL};
+
+    /// Open a match context over the subject in `x(0)`, into `x(1)`.
+    fn start_match(machine: &mut Machine, module: &Module, ctx: &mut MinimalContext) -> Step {
+        family_exec(
+            machine,
+            module,
+            &LabelMap::new(),
+            &Instr::BsStartMatch3 {
+                fail: NO_FAIL,
+                bin: Operand::X(0),
+                live: 1,
+                dst: Operand::X(1),
+            },
+            0,
+            0,
+            ctx,
+        )
+        .expect("bs_start_match3 reports no raise")
+        .expect("the family claims bs_start_match3")
+    }
+
+    /// `binary … Size=all …` over a subject whose whole window is above
+    /// `ERL_ONHEAP_BINARY_LIMIT` binds the off-heap refc form.
+    ///
+    /// The C `i_bs_get_fixed_binary` (`bs_instrs.tab:1447`) builds its window
+    /// through `erts_build_sub_bitstring` for an arbitrary size (no 64-byte limit),
+    /// so the command routes the result through `raw::make_binary`, which picks the
+    /// frozen on-heap/off-heap representation by size; before that it was the typed
+    /// `unsupported("bitstring: result binary > 64 bytes")`.
+    #[test]
+    fn bs_match_binary_above_the_heap_limit_builds_an_off_heap_refc_result() {
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+
+        let mut module = Module::default();
+        let binary = Operand::Atom(module.atom_table.intern("binary"));
+        let all = Operand::Atom(module.atom_table.intern("all"));
+
+        let payload: Vec<u8> = (1..=70u8).collect();
+        let subject = raw::make_binary(&mut machine, &mut ctx, &payload, payload.len() * 8)
+            .expect("a 70-byte refc subject");
+        assert!(raw::is_refc_binary(subject));
+        machine.set_x(0, subject).expect("root the subject");
+        assert_eq!(start_match(&mut machine, &module, &mut ctx), Step::Next);
+
+        // `bs_match {f,0} {x,1} [binary, Live, Flags, all, Unit, {x,0}]`.
+        let step = family_exec(
+            &mut machine,
+            &module,
+            &LabelMap::new(),
+            &Instr::BsMatch {
+                fail: NO_FAIL,
+                ctx: Operand::X(1),
+                commands: vec![
+                    binary,
+                    Operand::Integer(2), // Live
+                    Operand::Nil,        // Flags
+                    all,                 // Size = all
+                    Operand::Integer(1), // Unit
+                    Operand::X(0),       // Dst
+                ],
+            },
+            0,
+            0,
+            &mut ctx,
+        )
+        .expect("bs_match reports no raise")
+        .expect("the family claims bs_match");
+        assert_eq!(step, Step::Next);
+
+        let result = machine.x(0).expect("the matched window");
+        assert!(
+            raw::is_refc_binary(result),
+            "a 560-bit (70-byte) `all` window is above the 64-byte on-heap limit"
+        );
+        assert_eq!(
+            raw::heap_bits(result).map(|(_, bits, _)| bits),
+            Some(560),
+            "`all` reads the whole 70-byte payload"
+        );
+        assert_eq!(
+            binary_bytes(result).expect("a byte-aligned result"),
+            payload.as_slice(),
+            "the off-heap result reads back bit-exactly"
+        );
     }
 }

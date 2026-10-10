@@ -61,6 +61,8 @@ mod create;
 mod matching;
 #[allow(unsafe_code)]
 mod raw;
+#[cfg(test)]
+mod run_tests;
 
 use crate::interpreter::LabelMap;
 
@@ -498,7 +500,7 @@ pub(super) fn extract_bits(bytes: &[u8], start: usize, nbits: usize) -> Result<V
 /// A bit sink: append bits (MSB-first) to a growable byte buffer.
 ///
 /// Used by the `bs_create_bin` builder, which assembles the result as a bit vector
-/// and materialises it once at the end ([`raw::make_bits`]).
+/// and materialises it once at the end ([`raw::make_binary`]).
 #[derive(Default)]
 pub(super) struct BitWriter {
     bytes: Vec<u8>,
