@@ -557,9 +557,7 @@ needs:
     floor `fadvise`/`fallocate`/`chmod`/`chown`/`utimes`.
 
 ## Handoffs (owned by OTHER nodes)
-The per-call dispatch arm for every native BIF is a registration in `../native.rs` (one level up, the parent node — outside *this* node's scope).
-`../native.rs`'s `try_native` carries the `("code", "get_mode", 0)` and `("application", "get_application", 0)` arms, so both entries are reachable and agree with the oracle (`code:get_mode()` ⇒ `interactive`; `application:get_application()` ⇒ `undefined`).
-`../native.rs`'s module-doc table still omits those two names, so the parent node should add them there.
+The per-call dispatch arm for every native BIF is a registration in `../native.rs` (one level up, outside *this* node's scope); its `("code","get_mode",0)` and `("application","get_application",0)` arms are reachable and agree with the oracle (`interactive` / `undefined`), though its module-doc table still omits both names.
 `init:get_argument(root)` and `init:get_argument(home)` agree with the oracle through the same `init:get_argument/1` arm.
 `init:get_argument(progname)` is a deliberate, invocation-dependent gap: both runtimes report the basename **they** were invoked as (the oracle's `"erl"` comes from the `erl` shell script's `$0`), so the value is a property of the harness's invocation, not one this runtime may fabricate — never a wrong result.
 The `file_server_2` service's remaining cross-node gap — a scheduled `gen_server:call` to the service (**`beam_engine`**) — is itemised in the `file_server.rs` subsection above.
