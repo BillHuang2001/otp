@@ -272,6 +272,19 @@ impl Machine {
         trace: Eterm,
     ) -> Result<Step> {
         self.pending_exception = Some((class, reason));
+        // Rebuild the **pre-unwind** raise snapshot before anything is unwound: the
+        // handler's `build_stacktrace` (and the uncaught funnel) must be able to name
+        // the frames the raise unwinds out of. `step_instruction` records
+        // `current_code` at its head, so it is exactly the raising instruction; the
+        // live callers come from the call-frame stack, innermost first. This is the
+        // engine's replacement for C's saved raw `StackTrace` (`c_p->ftrace`).
+        self.raise_snapshot.clear();
+        if let Some((func, pc)) = self.current_code() {
+            self.raise_snapshot.push((self.current_context(), func, pc));
+        }
+        for (func, pc, context) in self.resumption_contexts() {
+            self.raise_snapshot.push((context, func, pc));
+        }
         let frame = match self.catch_frames.last() {
             Some(frame) => *frame,
             // An uncaught structured raise carries its live reason term out of the

@@ -8,16 +8,23 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
 
 ## API Surface (crate-internal; methods on `impl Machine`)
 - `mod.rs` — `Machine` (x-register file, float-register (FR) file of `Eterm` term slots, Erlang stack,
-  call frames, exception catch frames, literal area, module-context registry, latched A.8 trace gate,
+  call frames, exception catch frames, literal area, module-context registry, the **raise-time snapshot**
+  `raise_snapshot: Vec<(u32, u32, u32)>` — the pre-unwind `(context, func, pc)` chain, the engine's
+  replacement for C's saved raw `StackTrace` (`c_p->ftrace`) — latched A.8 trace gate,
   reduction counter); `MAX_REGISTER`/`MAX_FLOAT_REGISTER`; `reset`; the **root-set hand-off**
   (`stack_mut`, `with_roots` handing over the whole `RootSet`, and `alloc_rooted` — the convenience
   wrapper that calls `ExecutionContext::alloc_words_rooted`).
 - `registers.rs` — x/FR access (`get_fr`/`set_fr`, bounds-checked → `bad_register`; `x_mut`/`fr_mut` as
-  the single-view root-set accessors).
-- `frames.rs` — `allocate*`/`deallocate*`/`trim`, the typed `Continuation` CP slot, and `Machine::ensure_heap`
-  (the `ensure_heap_full` root-set admission point that hands over the whole `RootSet`).
-- `catch.rs` — the `CatchFrame` stack + the raise/unwind entry (`throw`/`throw_error`/`throw_with_trace`) and the
-  **uniform raise funnel**: `raise_stacktrace(entry_module: Option<&Module>, func, pc)` derives the symbolic `StackTrace` (raising function,
+  the single-view root-set accessors); `Machine::reset` clears the raise snapshot alongside the module
+  contexts (both belong to the run that is starting).
+- `frames.rs` — `allocate*`/`deallocate*`/`trim`, the typed `Continuation` CP slot, `Machine::ensure_heap`
+  (the `ensure_heap_full` root-set admission point that hands over the whole `RootSet`), and the
+  caller-chain introspection (`resumption_contexts`/`resumption_addresses`/`raise_snapshot`).
+- `catch.rs` — the `CatchFrame` stack + the raise/unwind entry (`throw`/`throw_error`/`throw_with_trace`)
+  and the **uniform raise funnel**: `throw_with_trace` first REBUILDS `raise_snapshot` (the raising frame
+  from `current_code`/`current_context`, then every live caller from `resumption_contexts`) — **before** any
+  unwind and before the early no-live-frame `Err(BeamError::Raise)` return, so the pre-unwind chain
+  survives for the handler. `raise_stacktrace(entry_module: Option<&Module>, func, pc)` derives the symbolic `StackTrace` (raising function,
   then every live caller innermost first) and `with_uncaught_frames` attaches it to an uncaught `BeamError::Raise`
   (leaving a non-raise error, an already-framed raise and an **engine diagnostic** — a reason atom prefixed
   `unsupported_opcode: `, the `error::unsupported` sentinel — untouched). The funnel's first half runs at the
@@ -57,8 +64,9 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   a raise landing in another context's live catch frame (pinned by `drive.rs`'s tests
   `a_cross_module_return_switches_the_machine_back_into_the_caller_context` and
   `a_raise_landing_in_a_callers_catch_frame_switches_into_the_callers_context`).
-- `reset` clears the register files, stacks, catch frames, contexts, pending exception and the trace gate, but **not**
-  the `refc_binaries` arena.
+- `reset` clears the register files, stacks, catch frames, contexts, the raise snapshot, the pending exception and
+  the trace gate, but **not** the `refc_binaries` arena; a resume (`resume_outcome`) resets nothing, so the
+  contexts and the raise snapshot both survive it.
 
 ## See Also
 - `../interpreter/CONTEXT.md` → the per-instruction dispatcher (`step_instruction`, also the JIT deopt target).

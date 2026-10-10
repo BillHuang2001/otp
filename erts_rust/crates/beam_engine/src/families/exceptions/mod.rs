@@ -63,18 +63,26 @@
 //! typed error, and a caught raise fails with a typed `unsupported`.
 //!
 //! **Milestone-1 limits (all documented, never a wrong result):**
-//! - No stacktrace is captured, so `catch_end` builds `{'EXIT',Reason}` without
-//!   the stacktrace element the real runtime appends to the reason (C's
-//!   `add_stacktrace`); a `catch` whose handler would need a stacktrace only ever
-//!   observes a shorter (but otherwise identical) reason term.
+//! - No raw `StackTrace` object is ever **landed** as the trace, so `catch_end`
+//!   builds `{'EXIT',Reason}` without the stacktrace element the real runtime
+//!   appends to the reason (C's `add_stacktrace`); a `catch` whose handler would
+//!   need a stacktrace only ever observes a shorter (but otherwise identical)
+//!   reason term. This is deliberate: C's raw trace is an **opaque object of saved
+//!   code pointers** with no engine equivalent, and the oracle's cooked `S` for
+//!   `try ... catch C:R:S -> S end` additionally holds host `init:*` frames that
+//!   live *outside* this engine's run — so a snapshot-cooked trace would be a
+//!   strictly-**partial** list that still differs, i.e. the same divergence traded
+//!   for a different, silently-wrong value. `x(2)` therefore stays `NIL` on the
+//!   compiled path (a caught exception lands with `x(2) = NIL`).
 //! - `catch_end` cannot build `{'EXIT',V}` in a module whose atom table lacks
 //!   `'EXIT'` (the loader exposes only the module's atoms); it returns a typed
 //!   `unsupported` rather than substituting a wrong atom.
 //! - [`Instr::BuildStacktrace`] cooks a **NIL** raw stacktrace to `NIL` exactly as
-//!   C does (a caught exception lands with `x(2) = NIL` because the machine
-//!   captures no stacktrace), and approximates a non-NIL one from the machine's
-//!   **live call frames** — the engine keeps no raw `StackTrace` object. See the
-//!   `symbolic_stacktrace` body for the precise residuals.
+//!   C does, and cooks a non-NIL one from the machine's **raise-time snapshot**
+//!   ([`Machine::raise_snapshot`]) — the pre-unwind frame chain, each frame
+//!   resolved in its **own** module context, with a frame whose context cannot be
+//!   resolved skipped (and an empty/wholly-skipped snapshot cooking to the empty
+//!   list). See the `symbolic_stacktrace` body for the precise residuals.
 //! - [`Instr::RawRaise`] reproduces C exactly for the three real classes and for
 //!   the "unknown class" fall-through; the fall-through needs the atom `badarg` in
 //!   the module's atom table (a module whose atom table lacks it is a typed
@@ -120,6 +128,12 @@ pub(crate) fn exec(
     pc: u32,
     ctx: &mut dyn ExecutionContext,
 ) -> Result<Option<Step>> {
+    // The family's opcodes are position-independent: each handler opcode is
+    // addressed by its own operand/register state, and `build_stacktrace` cooks the
+    // machine's **raise-time snapshot** (not the dispatch loop's current `(func,
+    // pc)`). The `(func, pc)` parameters stay in the signature because it is the
+    // frozen family-router contract.
+    let _ = (func, pc);
     match instr {
         // `try Frame Fail` / `catch Frame Fail` (`catch` is a macro for `try`):
         // push the handler's catch frame, blank the frame slot (`catches++`, `Y =
@@ -238,16 +252,17 @@ pub(crate) fn exec(
             let raw = read_operand(machine, ctx, &Operand::X(0))?;
             // C's `get_trace_from_exc/1` returns NULL for a NIL exception, and
             // `build_stacktrace` then yields NIL (`beam_common.c:1219-1223`). The
-            // M1 machine captures no stacktrace, so every caught exception lands
-            // with `x(2) = NIL` (`Machine::land_exception`) and the compiler's
-            // handler moves that into `x(0)` — the engine therefore reproduces the
-            // oracle's `[]` exactly on the compiled path. A non-NIL raw stacktrace
-            // (which no compiler-emitted path produces at M1) is approximated from
-            // the machine's live call frames.
+            // compiled path lands every caught exception with `x(2) = NIL` (the
+            // engine keeps no raw `StackTrace` object — see the module doc), and the
+            // compiler's handler moves that into `x(0)`, so the engine reproduces
+            // the oracle's `[]` exactly there. A non-NIL raw stacktrace is cooked
+            // from the machine's **raise-time snapshot** (`Machine::raise_snapshot`),
+            // each frame resolved in its OWN module context — never from the live
+            // call frames, which the raise has already unwound.
             let cooked = if is_nil(raw) {
                 NIL
             } else {
-                symbolic_stacktrace(machine, module, ctx, func, pc)?
+                symbolic_stacktrace(machine, module, ctx)?
             };
             machine.set_x(0, cooked)?;
             Ok(Some(Step::Next))
