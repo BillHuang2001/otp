@@ -92,12 +92,17 @@
 //! `crate::io` module docs for the precise rule, the term classes and the narrowest
 //! repro.
 //!
+//! # Floats
+//!
+//! A float renders as `float_to_list(F, [short])` — the oracle's plain float
+//! leaf (`io_lib:write1/4` calls `io_lib_format:fwrite_g/1`, which is
+//! `float_to_list(F, [short])`), reproduced by the same
+//! [`crate::numeric::format_short`] port the `float_to_list/2` BIF uses, so
+//! `1.0e5` ⇒ `"1.0e5"`, `0.1` ⇒ `"0.1"`, `1.0` ⇒ `"1.0"`. The domain is finite
+//! floats — OTP represents no `inf`/`NaN` (see [`format_float`]).
+//!
 //! # Deviations from the oracle (documented)
 //!
-//! * **Floats** use Rust's shortest round-trip with a `.0` appended when integral
-//!   (`1.0`, `1.5`, `0.1`, `3.14159`), not OTP's `float_to_list(F, [short])`:
-//!   large/small magnitudes differ (`1.0e10` renders `10000000000`, the oracle
-//!   `1.0e10`).
 //! * **Quoted atoms are not re-escaped** (a `'` inside a name is printed verbatim)
 //!   — such atoms are not produced by Milestone-1.
 //! * **Non-byte-aligned bitstrings** render as the oracle's `<<X:L>>` (whole leading
@@ -337,7 +342,7 @@ fn render_chunk(atoms: &AtomTable, term: Eterm, printable: bool, depth: i64) -> 
         return Ok(Chunk::text(&format_atom(name)));
     }
     if is_float(term) {
-        return Ok(Chunk::text(&format_float(float_value(term))));
+        return Ok(Chunk::text(&format_float(float_value(term))?));
     }
     if bits::is_binary(term) {
         return render_binary_chunk(term, printable, depth);
@@ -880,15 +885,27 @@ fn is_bare_atom(name: &str) -> bool {
         .all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'@')
 }
 
-/// Renders a float: Rust's shortest round-trip, with a `.0` appended when the
-/// rendering is integral (deviation from `float_to_list(F, [short])`; see the
-/// module docs).
-fn format_float(value: f64) -> String {
-    let mut s = format!("{value}");
-    if value.is_finite() && !s.contains('.') && !s.contains('e') && !s.contains('E') {
-        s.push_str(".0");
+/// Renders a float exactly as the oracle's plain (non-`~e`/`~f`/`~g`) float leaf
+/// does: `io_lib:write1/4`'s float clause is `io_lib_format:fwrite_g(Fl)`, and
+/// `fwrite_g/1` is `float_to_list(Fl, [short])` (`io_lib_format.erl:758-760`).
+/// So the rendering is [`crate::numeric::format_short`] — the same
+/// compatibility-pinned port `float_to_list/2` uses, never a second renderer.
+///
+/// # Errors
+///
+/// As [`crate::numeric::format_short`]. The guard is unreachable for a real
+/// `f64` (the shortest round-trip form is well under 255 characters).
+fn format_float(value: f64) -> Result<String> {
+    if !value.is_finite() {
+        // Outside the oracle's domain: OTP cannot hold an `inf`/`NaN` float at
+        // all (`binary_to_term/1` refuses such a `NEW_FLOAT_EXT`), so no float
+        // the oracle can *print* reaches here. `format_short`'s shortest-digit
+        // search only accepts a finite non-zero value, so keep the debug-style
+        // spelling rather than panic; the BIF arithmetic that can fabricate one
+        // is a separate, recorded gap.
+        return Ok(format!("{value}"));
     }
-    s
+    crate::numeric::format_short(value)
 }
 
 /// Renders an internal ref as `#Ref<0.0.0.Id>` (Milestone-1 refs carry no channel,
@@ -984,18 +1001,85 @@ mod tests {
     }
 
     #[test]
-    fn floats_use_shortest_round_trip_with_dot_zero() {
+    fn floats_render_as_float_to_list_short() {
         with_ctx(|ctx| {
+            // The oracle (`erl -noshell -eval 'io:format("~w~n",[V])'`) renders
+            // every one of these as `float_to_list(V, [short])`.
             for (value, expected) in [
-                (1.0f64, "1.0"),
+                (0.0f64, "0.0"),
+                (-0.0, "-0.0"),
+                (1.0, "1.0"),
                 (1.5, "1.5"),
                 (0.1, "0.1"),
                 (3.14159, "3.14159"),
                 (-2.5, "-2.5"),
+                (100.0, "100.0"),
+                (100.5, "100.5"),
+                // The magnitude rule: the decimal notation only survives while it
+                // is no longer than the scientific one.
+                (1.0e-4, "0.0001"),
+                (1.0e-5, "1.0e-5"),
+                (1.0e-6, "1.0e-6"),
+                (1.0e5, "1.0e5"),
+                (1.0e10, "1.0e10"),
+                (1.0e16, "1.0e16"),
+                (1.0e20, "1.0e20"),
+                (1.0e100, "1.0e100"),
+                (1.0e-300, "1.0e-300"),
+                (1.0e9, "1.0e9"),
+                (123456789.5, "123456789.5"),
+                (1234567895.0, "1234567895.0"),
+                (12345678900.0, "12345678900.0"),
+                (1.2345e-5, "1.2345e-5"),
+                (9.1e15, "9.1e15"),
+                (1.5e-4, "1.5e-4"),
+                (2.5e-7, "2.5e-7"),
+                (3.141592653589793, "3.141592653589793"),
+                (f64::MAX, "1.7976931348623157e308"),
+                (5.0e-324, "5.0e-324"),
+                (f64::MIN_POSITIVE, "2.2250738585072014e-308"),
             ] {
                 let term = ctx.make_float(value).expect("fits");
-                assert_eq!(show(ctx, term, false), expected, "float {value}");
+                assert_eq!(show(ctx, term, false), expected, "~w of {value:?}");
+                assert_eq!(show(ctx, term, true), expected, "~p of {value:?}");
+                assert_eq!(show_at(ctx, term, false, 3), expected, "~W of {value:?}");
+                assert_eq!(show_at(ctx, term, true, 3), expected, "~P of {value:?}");
             }
+        });
+    }
+
+    #[test]
+    fn a_non_finite_float_is_outside_the_oracle_domain() {
+        with_ctx(|ctx| {
+            // OTP cannot hold `inf`/`NaN` (its `binary_to_term/1` rejects a
+            // `NEW_FLOAT_EXT` with exponent `16#7FF`), so there is nothing to
+            // compare against; the printer must not panic on one.
+            for (value, expected) in [(f64::INFINITY, "inf"), (f64::NEG_INFINITY, "-inf")] {
+                let term = ctx.make_float(value).expect("fits");
+                assert_eq!(show(ctx, term, false), expected);
+            }
+            let nan = ctx.make_float(f64::NAN).expect("fits");
+            assert_eq!(show(ctx, nan, false), "NaN");
+        });
+    }
+
+    #[test]
+    fn floats_render_the_same_nested() {
+        with_ctx(|ctx| {
+            let a = ctx.atom("a").expect("seeded");
+            let ten = ctx.make_float(1.0e10).expect("fits");
+            let five = ctx.make_float(1.0e5).expect("fits");
+            let small = ctx.make_float(1.0e-6).expect("fits");
+
+            let tuple = ctx.tuple(&[five, small]).expect("fits");
+            let tail = ctx.cons(tuple, NIL).expect("fits");
+            let list = ctx.cons(ten, tail).expect("fits");
+            // `erl -noshell -eval 'io:format("~p~n",[[1.0e10,{1.0e5,1.0e-6}]])'`.
+            assert_eq!(show(ctx, list, false), "[1.0e10,{1.0e5,1.0e-6}]");
+            assert_eq!(show(ctx, list, true), "[1.0e10,{1.0e5,1.0e-6}]");
+
+            let map = canonical_flatmap(ctx, &[(a, ten)]);
+            assert_eq!(show(ctx, map, false), "#{a => 1.0e10}");
         });
     }
 
