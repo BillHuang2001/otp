@@ -190,7 +190,8 @@ SMP pool:
 - `lock_scope.rs` is the **only** file with wall-clock bounds; they are deliberately loose and
   two-sided (a cross-thread send must be serviced far below the slice's duration, and the slice must
   last far above that bound — the anti-vacuity guard).
-- The `oracle_*` suites (`dict_oracle.rs`, `registry_monitors.rs`, `monitor_tag.rs`, and the `erl`
+- The `oracle_*` suites (`dict_oracle.rs`, `registry_monitors.rs`, `monitor_tag.rs`,
+  `lifecycle_oracle.rs`, and the `erl`
   cross-checks in `capability_inventory.rs`/`port_monitor_cleanup.rs`) go through the **shared driver**
   `common/mod.rs`, **skip loudly** when `erl` is absent, and must never spawn a child process that
   inherits `erl`'s stderr (a captured-stderr pipe blocks until the child dies — the probes are written
@@ -198,7 +199,7 @@ SMP pool:
 - Run the whole crate gate with
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_process` (never `cd`,
   sandbox `$HOME` is read-only). Cross-checks against the real system ERTS belong to the sibling
-  `../../../tools/differential/` harness, not here. Current: **396 passed, 0 failed, 1 ignored**.
+  `../../../tools/differential/` harness, not here. Current: **407 passed, 0 failed, 1 ignored**.
 
 ## Routing Table
 - `scheduler.rs`, `messaging.rs`, `signals.rs`, `gc.rs`, `priority.rs`, `pending_signals.rs`,
