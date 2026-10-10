@@ -33,7 +33,7 @@ per-function bodies. Files:
 | `node.rs` | `erlang:is_alive/0`, `get_cookie/0`, `set_cookie/2`, `nodes/0,1` |
 | `memory/` | `erlang:process_info/1,2` — the full per-process introspection surface (see below) |
 | `group_leader.rs` | `erlang:group_leader/2` + `erts_internal:group_leader/2,3` over `Runtime::group_leaders` (per-process, default the root pid; see below) |
-| `port.rs` | `erlang:port_command/2,3` and the closed-port half of `erlang:port_info/1,2` (the `PortHook` seam cannot express those) |
+| `port.rs` | `erlang:port_command/2,3`, **`erlang:port_control/3`** (the driver's `control` callback, with the oracle's list-vs-binary reply rule) and the closed-port half of `erlang:port_info/1,2` (the `PortHook` seam cannot express those) |
 | `application.rs` | `application:get_env/1,2,3`, `get_all_env/1`, `get_key/2`, `get_application/0` (always `undefined` — there is no application controller and no owning application), `loaded_applications/0`, `which_applications/0` over a minimal native `.app` view |
 | `erts_internal.rs` | the `erts_internal` floor (`erts_internal_call`; the dispatch table is the source of truth) **plus the two `erlang:garbage_collect/0,1` bodies it hosts** — see below |
 | `erts_internal/trace.rs` | the `erts_internal:trace/3` + `:trace_pattern/3` handler bodies (`erlang:trace/2,3` and `erlang:trace_pattern/2,3` call them) + their private pattern/target helpers, over `crate::trace` — see below |
@@ -467,7 +467,7 @@ The reply tag is **paired** with the request tag, never echoed: `{io_request, �
   engine-backed `EngineContinuation` implementing `beam_io::io_device::Continuation`) + its unit
   tests in `file_server/get_until/tests.rs`
 - `init.rs` / `code.rs` / `application.rs` → the preloaded-module surfaces (contract A.7) — the `init` automatic flags (`root`/`home`/`progname`), the code server's `get_mode/0` and `application:get_application/0` included
-- `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) / `port.rs` → the process/spawn (incl. `spawn_monitor`) and registry/reference surfaces, the monitor/demonitor and exit-signalling surfaces, and the port-write surface (contracts A.4/A.7/A.8/A.9)
+- `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) / `port.rs` → the process/spawn (incl. `spawn_monitor`) and registry/reference surfaces, the monitor/demonitor and exit-signalling surfaces, and the port surface (`port_command/2,3`, `port_control/3` and the closed-port/`registered_name` halves of `port_info/1,2`) (contracts A.4/A.7/A.8/A.9)
 - `node.rs` → the node/cookie surface (`is_alive/0`, `get_cookie/0`, `set_cookie/2`, `nodes/0,1`) + its unit tests
 - `test_support.rs` → the shared fixtures
 - `../context/mod.rs` → `RuntimeContext::call_bif` / `try_native`'s caller and the host seams
@@ -549,8 +549,11 @@ needs:
   ordinary compiler-generated surface.)
 - **The port-BIF family** (`open_port/2`, `port_call/3`, `port_close/1`, `port_command/3`,
   `port_connect/2`, `port_control/3`, `port_info/1,2`) is **not** claimed *here*: the `erlang:*`
-  counterparts are served by `../port.rs` + `beam_bifs`' `PortHook` seam. `erts_internal`'s own
-  entries stay unclaimed (the preloaded wrapper is irrelevant to M1 callers).
+  counterparts are served by `../port.rs` (the `PortHook` seam: `open_port/2`, `port_close/1`, the
+  live-port `port_info/1,2`), by the sibling [`port.rs`](port.rs) (`port_command/2,3`,
+  **`port_control/3`** and the closed-port / `registered_name` halves of `port_info/1,2` — the
+  forms the seam cannot express) and, for the `erts_internal:port_*` spellings this floor does not
+  claim, by the `beam_bifs` registry over its `RuntimeHooks` seam.
 - **`prim_*` preloaded driver modules:** the `prim_file` subset `prim.rs` + `prim_file.rs` serve (the
   **27** entries in their tables) is on the floor; **every other** `prim_file` entry and all of
   `erl_prim_loader`, `prim_inet`, `prim_socket`, `prim_net`, `prim_zip`, `prim_buffer`, `prim_eval`
@@ -568,7 +571,9 @@ needs:
     from safe `std`; the crate is `deny(unsafe_code)`); the default `local` time type is **not** a
     blocker (`posixtime_to_universaltime/1` + `universaltime_to_localtime/1` are served). Also
     `write_file_info/2,3` (`chmod`/`chown`/`utimes`), `advise/4`, `allocate/3`, `file_desc_to_ref/2`
-    (raw fd adoption), `read_line/1` (drives the `prim_buffer:*` resource NIFs, all `undef`).
+    (raw fd adoption), `prim_file:read_line/1` (its Erlang body drives the `prim_buffer:*` resource
+    NIFs, all `undef` — the library-level `file:read_line/1` is served by the `file_server_2`
+    `{get_line,…}` arm, [`file_server/get_line.rs`](file_server/get_line.rs)).
   * `list_dir/1`/`list_dir_all/1` **not** claimed: `readdir(3)` order, unpinnable (`file_server.rs`
     *does* serve the `{list_dir,Name}` request over `std::fs::read_dir`). `prim_zip:splitter/3`
     unclaimed (pure Erlang, error paths not reproduced).
@@ -582,10 +587,35 @@ needs:
 
 ## Known Issues
 
-### Curated-gap closability (`../error.rs:415-453`; oracle-checked, OTP 29.1.1 / erts-17.1)
-**Closable via an `erlang.erl` wrapper arm** — the public `erlang:` name wraps an `erts_internal:*` primitive this floor already serves: `erlang:garbage_collect/0` (`erlang.erl:3046`) + `/1` (`:3055`) → **served** `erts_internal:garbage_collect/1` (`erts_internal.rs:266`); `erlang:process_flag/3` (`:5522-5531`) → **served** `erts_internal:process_flag/3` (`erts_internal.rs:252`); `erlang:localtime_to_universaltime/1` (`:11875-11881`) → the **registered** `/2` (`beam_bifs/src/calendar.rs:418-421`). A non-self target lowers to `erlang:F(Node,...)`, whose `erlang.erl` clause calls `erts_internal:F(...)` (`call_bif`'s `module == "erlang"` fallback, `context/mod.rs:1810-1819`).
-**Mislabeled — the oracle does not export the name either** (`{error,undef}`), so the runtime answers `unsupported`/exit 3 where the oracle exits 1: `register/3`, `system_profile/1`, `apply/1`, `function_exported/2`, `load_module/3`, `statistics/0`, `map_get/3`, `concatenate/2`, `system_info/2`. `set_cookie/2` is **already served** (`native.rs:232`, `node.rs:125-140`).
-**Needs a new facility (shape-closable only):** `port_connect/2`/`port_call/3`, `spawn_request/2..5` (omits `/1`), `suspend_process/1` (omits `/2`), `system_monitor/*` (`/0` ⇒ `undefined`; `erts_internal:system_monitor/1,3` exported but unserved), `process_display/2`, `load_module/2`, `disconnect_node/1` (needs `"net_kernel"` in `FLOOR_MODULES`, `native.rs:116-125`). Edit gates: `error.rs:844-950`, `native.rs:837-869`.
+### Curated-gap closability (`../error.rs:436-469`; oracle-checked, OTP 29.1.1 / erts-17.1)
+The list's membership rule is single and strict: a `(function, arity)` belongs in
+`KNOWN_UNIMPLEMENTED_ERLANG_BIFS` **iff** it is an OTP `erlang` BIF the oracle **exports and serves**
+but this runtime does **not** serve.
+A name the oracle itself rejects as `undef` must never be listed — curating one would answer the
+oracle's exit-1 "no such function" with an exit-3 capability gap, a divergence dressed up as a gap.
+The rule is drift-guarded: `error.rs`'s `a_name_the_otp_release_does_not_export_is_not_a_curated_gap`
+asserts that the nine names the release does not export (`apply/1`, `function_exported/2`,
+`load_module/3`, `system_info/2`, `statistics/0`, `map_get/3`, `concatenate/2`, `register/3`,
+`system_profile/1`) are **not** listed and classify as the bare `undef`.
+The listed set is 19 `(function, arity)` pairs over 12 names: `set_cookie/2` (already served by the
+floor, so an inert entry), `disconnect_node/1`, `port_connect/2`, `port_call/3`,
+`spawn_request/1,2,3,4,5`, `process_flag/3`, `process_display/2`, `suspend_process/1,2`,
+`system_monitor/0,1,2`, `garbage_collect/2`, `load_module/2`, `localtime_to_universaltime/1`.
+**Closable via an `erlang.erl` wrapper arm** — the public `erlang:` name wraps an `erts_internal:*`
+primitive this floor already serves: `erlang:process_flag/3` (`erlang.erl:5522-5531`) → the
+**served** `erts_internal:process_flag/3` (`erts_internal.rs:254`); `erlang:localtime_to_universaltime/1`
+(`erlang.erl:11875-11881`) → the **registered** `/2` (`beam_bifs/src/calendar.rs:416-421`).
+A non-self target lowers to `erlang:F(Node,...)`, whose `erlang.erl` clause calls `erts_internal:F(...)`
+(`call_bif`'s `module == "erlang"` fallback, `context/mod.rs:1811-1819`).
+`erlang:garbage_collect/0,1` are closable the same way and the floor already serves both (see the
+`erts_internal.rs` section), so only `/2` stays listed.
+**Needs a new facility (shape-closable only):** `port_connect/2`/`port_call/3`,
+`spawn_request/1..5`, `suspend_process/1,2`, `system_monitor/0,1,2` (`/0` ⇒ `undefined`;
+`erts_internal:system_monitor/1,3` exported but unserved), `process_display/2`, `load_module/2`,
+`disconnect_node/1` (needs `"net_kernel"` in `FLOOR_MODULES`, `native.rs:116-125`). Edit gates:
+`error.rs`'s `known_unimplemented_bifs_are_capability_gaps_and_never_shadow_the_registry` +
+`the_effective_gap_set_never_shadows_the_registry`, and `native.rs`'s
+`every_floor_module_is_a_real_try_native_arm` (`native.rs:837-869`).
 
 ### Recorded gaps and fabricated values
 - **`last_calls` ⇒ `false` is a real divergence** — `Process::save_calls()` holds a real flag (`memory/mod.rs:803`).
