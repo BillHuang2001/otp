@@ -392,8 +392,14 @@ The rationale (why) behind the frozen API and constraints lives in **`DESIGN_DEC
 - **Process-dictionary interior and heap fragments.** The dictionary is modelled as a flat key/value
   list (no hash-array interior), and `erlang:process_info/1`'s view of it is still absent. A real
   in-heap `ErlHeapFragment` (a `beam_gc`/`beam_message`-owned type, still absent) is not modelled: saved
-  args are a plain `Eterm` root list and M1 fits a message into the receiver's own young heap,
-  growing that heap on demand (collect + grow + retry once) rather than falling back to a fragment.
+  args are a plain `Eterm` root list and `Process::deliver` fits a message into the receiver's own
+  young heap, growing that heap on demand (collect + grow + retry once) rather than falling back to a
+  fragment. The `ptab.rs` signal builders (`build_signal_term`, `copy_reason_onto`, `deliver_head_signal`)
+  collect-and-retry-once but never grow (`collect`, not `ensure_capacity`): a message too large for the
+  collected nursery surfaces a typed `BeamError::Alloc` (a *queued* head signal stays queued; a terminal
+  DOWN/EXIT from `monitor*`/`node_down`/`port_closed` is not enqueued) — and they honour the relocation
+  exemption only *indirectly* (via `Process::collect` refusing, so nothing relocates), so the caller sees
+  the typed `relocation_exempt` raise, **not** `Process::deliver`'s raw `AllocKind::Heap` refusal.
 - **Distribution-wide links/monitors**: external pids are decomposed into a `remote::RemotePid` and
   recorded (`remote_links`/`remote_monitors`), and every relationship change is routed through the
   `remote::DistSignalRouter` trait seam (implemented downstream over `beam_dist`; no crate dependency).
