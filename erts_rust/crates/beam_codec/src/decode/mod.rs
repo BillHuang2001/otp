@@ -958,7 +958,7 @@ impl<'a> Decoder<'a> {
 /// *stricter* than the identical uncompressed image — an observable divergence from
 /// the oracle — so the wrapper stays transparent here.
 pub fn decode_term(bytes: &[u8], heap: &mut Heap, atoms: &mut AtomTable) -> Result<Eterm> {
-    if let Some(body) = decompress_wrapper(bytes)? {
+    if let Some((body, _consumed)) = decompress_wrapper(bytes)? {
         let mut decoder = Decoder::new_body(&body);
         return decoder.decode(heap, atoms);
     }
@@ -966,6 +966,46 @@ pub fn decode_term(bytes: &[u8], heap: &mut Heap, atoms: &mut AtomTable) -> Resu
     let term = decoder.decode(heap, atoms)?;
     decoder.finish()?;
     Ok(term)
+}
+
+/// Like [`decode_term`], but also reports how many **source** bytes the image occupied
+/// — the `binary_to_term/2` `used` count (`external.c:1797-1801`).
+///
+/// The returned `usize` is the number of bytes of `bytes` that belong to the term:
+/// for an ordinary image, `Decoder::position()` after the term was decoded; for a
+/// `COMPRESSED` image, the whole wrapper — the 6-byte `[VERSION_MAGIC][COMPRESSED_EXT]
+/// [size:4 BE]` header plus the zlib stream — i.e. exactly `byte_size(term_to_binary(T,
+/// [compressed]))`. Anything in `bytes` **after** that point is trailing data the
+/// runtime is free to ignore.
+///
+/// Unlike [`decode_term`] this entry point does **not** call [`Decoder::finish`] on
+/// either branch: the whole point of a `used` count is to tolerate trailing bytes, and
+/// the oracle's `binary_to_term/2` `used` option does exactly that. The plain path is
+/// therefore *less* strict here than [`decode_term`]'s deliberate strictness — the
+/// behaviour the distribution reader needs.
+///
+/// For a `COMPRESSED` image the count stops at the end of the zlib stream (see
+/// [`crate::compress::decompress_bounded_used`]), so bytes after a compressed image are
+/// neither read nor counted, matching the C.
+///
+/// # Errors
+///
+/// Every error [`decode_term`] reports on the term itself. A `COMPRESSED` image whose
+/// declared size disagrees with the inflated length, or a corrupt zlib stream, is
+/// `BeamError::BadArg`.
+pub fn decode_term_used(
+    bytes: &[u8],
+    heap: &mut Heap,
+    atoms: &mut AtomTable,
+) -> Result<(Eterm, usize)> {
+    if let Some((body, consumed)) = decompress_wrapper(bytes)? {
+        let mut decoder = Decoder::new_body(&body);
+        let term = decoder.decode(heap, atoms)?;
+        return Ok((term, consumed));
+    }
+    let mut decoder = Decoder::new(bytes)?;
+    let term = decoder.decode(heap, atoms)?;
+    Ok((term, decoder.position()))
 }
 
 /// Like [`decode_term`], but installs the local node identity so an incoming
@@ -1000,7 +1040,7 @@ pub fn decode_term_with_local_node(
     creation: u32,
     local_hash: Option<u32>,
 ) -> Result<Eterm> {
-    if let Some(body) = decompress_wrapper(bytes)? {
+    if let Some((body, _consumed)) = decompress_wrapper(bytes)? {
         let mut decoder = Decoder::new_body(&body).with_local_node(node, creation);
         if let Some(hash) = local_hash {
             decoder = decoder.with_local_node_hash(hash);
@@ -1016,6 +1056,44 @@ pub fn decode_term_with_local_node(
     Ok(term)
 }
 
+/// Like [`decode_term_with_local_node`], but also reports the `used` source-byte count
+/// — the local-node-identity-aware twin of [`decode_term_used`].
+///
+/// The consumed count is computed exactly as in [`decode_term_used`] (the zlib stream
+/// end for a `COMPRESSED` image, [`Decoder::position`] otherwise), and, like it, this
+/// entry point does **not** call [`Decoder::finish`] on either branch, so trailing
+/// bytes are tolerated. The identity is installed on both the compressed-body and the
+/// plain path, so a `term_to_binary/2 [compressed]` image demotes exactly like its
+/// uncompressed twin.
+///
+/// # Errors
+///
+/// Every error [`decode_term_with_local_node`] reports, plus the consumed-count rules
+/// of [`decode_term_used`].
+pub fn decode_term_with_local_node_used(
+    bytes: &[u8],
+    heap: &mut Heap,
+    atoms: &mut AtomTable,
+    node: Atom,
+    creation: u32,
+    local_hash: Option<u32>,
+) -> Result<(Eterm, usize)> {
+    if let Some((body, consumed)) = decompress_wrapper(bytes)? {
+        let mut decoder = Decoder::new_body(&body).with_local_node(node, creation);
+        if let Some(hash) = local_hash {
+            decoder = decoder.with_local_node_hash(hash);
+        }
+        let term = decoder.decode(heap, atoms)?;
+        return Ok((term, consumed));
+    }
+    let mut decoder = Decoder::new(bytes)?.with_local_node(node, creation);
+    if let Some(hash) = local_hash {
+        decoder = decoder.with_local_node_hash(hash);
+    }
+    let term = decoder.decode(heap, atoms)?;
+    Ok((term, decoder.position()))
+}
+
 /// Whether `bytes` is a top-level `COMPRESSED` image:
 /// `[VERSION_MAGIC][COMPRESSED_EXT][size:4 BE][zlib stream]`.
 ///
@@ -1023,21 +1101,33 @@ pub fn decode_term_with_local_node(
 /// byte is consumed, the C requires at least the tag plus the 4-byte size before it
 /// takes the `COMPRESSED` branch, so a shorter image is treated as an ordinary (and
 /// therefore invalid) term starting at the `80` byte.
-fn is_compressed_image(bytes: &[u8]) -> bool {
+///
+/// This predicate is the `used`-aware entry points' and the distribution reader's
+/// shared test for whether the `[used]` count must be taken from the zlib stream end
+/// rather than a term decoder's cursor; it is public so a caller can make the same
+/// distinction without re-deriving it.
+pub fn is_compressed_image(bytes: &[u8]) -> bool {
     bytes.len() >= 6 && bytes[0] == VERSION_MAGIC && bytes[1] == COMPRESSED_EXT
 }
 
-/// Unwraps a top-level `COMPRESSED` image, returning the inner term body.
+/// Unwraps a top-level `COMPRESSED` image, returning the inner term body and the total
+/// consumed source bytes.
 ///
 /// `Ok(None)` means the image is not compressed and the caller decodes it normally;
-/// `Ok(Some(body))` is the decompressed inner term — the bytes that follow the
-/// version byte of the *inner* `term_to_binary` image, so they start at the term tag
-/// and carry no version byte.
+/// `Ok(Some((body, consumed)))` gives the decompressed inner term — the bytes that
+/// follow the version byte of the *inner* `term_to_binary` image, so they start at the
+/// term tag and carry no version byte — plus the number of bytes of the *input* that
+/// the whole image occupied: the 6-byte `[VERSION_MAGIC][COMPRESSED_EXT][size:4 BE]`
+/// header followed by the zlib stream.
 ///
 /// The 4-byte size field is the inner term's byte length **excluding** the version
 /// byte; a decompressed length that disagrees with it, or any zlib failure, yields
 /// `BeamError::BadArg` (`external.c:1807-1810`), never a partially decoded term.
-fn decompress_wrapper(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
+///
+/// `consumed` stops where the zlib stream ends (Adler-32 trailer included), so any
+/// bytes in `bytes` after the stream are neither read nor counted — exactly the
+/// `binary_to_term/2` `used` semantics (`external.c:1797-1801`).
+fn decompress_wrapper(bytes: &[u8]) -> Result<Option<(Vec<u8>, usize)>> {
     if !is_compressed_image(bytes) {
         return Ok(None);
     }
@@ -1050,11 +1140,12 @@ fn decompress_wrapper(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
     // large payload — e.g. the 33 MiB binary `tests/compressed_oracle.rs` compresses —
     // decodable, exactly as the oracle does (`external.c:1768-1781` measures the real
     // uncompressed size instead of failing).
-    let body = crate::compress::decompress_bounded(&bytes[6..], size)?;
+    let (body, stream_consumed) = crate::compress::decompress_bounded_used(&bytes[6..], size)?;
     if body.len() != size {
         return Err(bad_arg());
     }
-    Ok(Some(body))
+    // The image is the 6-byte wrapper header plus the zlib stream it wraps.
+    Ok(Some((body, 6 + stream_consumed)))
 }
 
 /// Groups base-256 magnitude bytes (least significant first) into `ErtsDigit`s —

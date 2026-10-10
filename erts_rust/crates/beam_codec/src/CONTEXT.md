@@ -74,7 +74,7 @@ map for the source subtree and the notes the child nodes inherit.
 - `reader.rs`/`writer.rs` → bounds-checked BE cursor / growable sink (safe Rust)
 - `atom_cache.rs` → `AtomCache` + the `AtomCacheWriter` hook trait
 - `off_heap.rs` → `OffHeapBinaries` host trait
-- `compress.rs` → zlib for `COMPRESSED` (`compress`/`decompress`/`decompress_bounded`)
+- `compress.rs` → zlib for `COMPRESSED` (`compress`/`decompress`/`decompress_bounded`/`decompress_bounded_used`)
 - `error.rs` → `bad_arg`/`system_limit`, the `unsupported*` reason atoms
 - `prelude.rs` → the downstream glob-import surface
 - `decode/` → the `Decoder` state machine, the tag arms, the local-node identity seam (D2/D4/D6/D7) and the local-node pid/port/ref **demotion** to the internal form, `decode_term[_with_local_node]`, the `MAX_DECODE_DEPTH` bound
