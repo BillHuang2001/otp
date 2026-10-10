@@ -157,6 +157,50 @@ impl AnyCollector {
         }
     }
 
+    /// The mature generation's **base** address — the strategy-agnostic form of
+    /// `mature().base()`.
+    ///
+    /// Both mature generations are one contiguous region, so this and
+    /// [`mature_capacity_words`](AnyCollector::mature_capacity_words) name the whole of it:
+    /// `base .. base + capacity_words` in term words.
+    pub fn mature_base(&self) -> *mut Eterm {
+        match self {
+            AnyCollector::Copying(c) => c.mature().base(),
+            AnyCollector::Immix(c) => c.mature().base(),
+        }
+    }
+
+    /// Whether `ptr` addresses a word the mature generation owns — the strategy-agnostic
+    /// form of `mature().contains(ptr)`, and the predicate a host answers its
+    /// "does this term live in a region the collector scans?" question with (a term is only
+    /// safe to collect over when it is an immediate, a literal, or a pointer into the
+    /// process's own young or mature heap — the runtime's `root_is_unscanned` valve).
+    ///
+    /// Reuses each concrete space's own range test (their `contains`); **the two differ,
+    /// deliberately**:
+    ///
+    /// * the copying [`Collector`]'s [`HeapSpace::contains`] covers the **live region**
+    ///   `[base, top)` — the words the mutator or a promotion has handed out. The
+    ///   not-yet-allocated tail of the space is *not* included.
+    /// * the [`GenImmixCollector`]'s [`ImmixSpace`](crate::immix::ImmixSpace) test covers the
+    ///   **whole region** `[base, base + capacity)`, **free lines included** — the mark-region
+    ///   space is one contiguous block-aligned area whose holes are still addressable. It is
+    ///   therefore **over-inclusive** relative to the copying one.
+    ///
+    /// The over-inclusion is harmless for the membership question this answers: a word the
+    /// space will never hand out cannot be the target of a live reference (a live term only
+    /// ever points at an *allocated* address), and a genuinely foreign container — a pooled
+    /// BIF heap, the runtime's pointer-stable arena, a message fragment — lies outside every
+    /// mature space's range entirely, so an address on a free line is never mistaken for one.
+    /// A caller that needs the exact live fill of a copying space that precisely should read
+    /// [`mature_used_words`](AnyCollector::mature_used_words) instead.
+    pub fn mature_contains(&self, ptr: *const Eterm) -> bool {
+        match self {
+            AnyCollector::Copying(c) => c.mature().contains(ptr),
+            AnyCollector::Immix(c) => c.mature().contains(ptr),
+        }
+    }
+
     /// The collector's accumulated statistics.
     pub fn stats(&self) -> GcStats {
         match self {

@@ -29,7 +29,7 @@
 //! mature generation (measured in `tests/immix_break_even.rs`, ruled in `src/selection.rs`)
 //! becomes reachable from the production path.
 //!
-//! Two things are proven:
+//! Three things are proven:
 //!
 //! 1. **Observational equivalence.** One process-shaped workload — allocate on `young_mut()`,
 //!    consult `should_collect`, `collect`, `ensure_capacity` — is driven through **both**
@@ -43,6 +43,11 @@
 //!    to the mark-region variant through the **automatic** rule (no pin) — and
 //!    `AnyCollector::new(policy)`, the counterpart of `Collector::new`, resolves both the
 //!    same way.
+//! 3. **The mature-space geometry the host reads is strategy-agnostic.** The added
+//!    forwarders (`mature_capacity_words` / `mature_used_words` / `mature_available_words`,
+//!    plus `mature_base` / `mature_contains`) reproduce exactly what the **concrete** mature
+//!    space answers, for both pinned strategies — including the one deliberate difference
+//!    between them (the mark-region range test also covers free lines).
 //!
 //! Every corpus is deterministic (no randomness), every assertion is on a deterministic
 //! count or a structural comparison, and **no timing is ever asserted**.
@@ -52,8 +57,7 @@ use beam_gc::prelude::{
     IMMIX_BREAK_EVEN_WORDS,
 };
 use beam_term::compare::eq as term_eq;
-use beam_term::prelude::{make_small, AtomTable, Eterm};
-
+use beam_term::prelude::{is_boxed, make_small, ptr_val, AtomTable, Eterm};
 // ---------------------------------------------------------------------------
 // The process-shaped workload
 // ---------------------------------------------------------------------------
@@ -530,5 +534,151 @@ fn should_collect_answers_exactly_what_the_nursery_answers() {
         assert!(c.should_collect(3));
         assert!(!c.should_collect(left));
         assert!(c.should_collect(left + 1));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 4. The mature-space geometry is queryable strategy-agnostically
+// ---------------------------------------------------------------------------
+
+/// The selected strategy's **concrete** mature space's `base` — the reference
+/// [`AnyCollector::mature_base`] must reproduce.
+fn concrete_mature_base(c: &AnyCollector) -> *mut Eterm {
+    match c {
+        AnyCollector::Copying(x) => x.mature().base(),
+        AnyCollector::Immix(x) => x.mature().base(),
+    }
+}
+
+/// The selected strategy's **concrete** mature space's own `contains` — the reference
+/// [`AnyCollector::mature_contains`] must reproduce address for address.
+fn concrete_mature_contains(c: &AnyCollector, ptr: *const Eterm) -> bool {
+    match c {
+        AnyCollector::Copying(x) => x.mature().contains(ptr),
+        AnyCollector::Immix(x) => x.mature().contains(ptr),
+    }
+}
+
+/// One past the last byte of the mature region (`base + capacity_words`), computed from the
+/// strategy-agnostic accessors alone.
+fn mature_region_end(c: &AnyCollector) -> usize {
+    c.mature_base() as usize + c.mature_capacity_words() * core::mem::size_of::<Eterm>()
+}
+
+/// The host's `root_is_unscanned` valve asks "is this term's address inside a region the
+/// collector scans?" — the young nursery being one, the mature generation the other. This
+/// pins the mature half of that question: for **both** pinned strategies the new
+/// [`AnyCollector::mature_contains`] answers exactly what the concrete mature space answers,
+/// for probe addresses inside a freshly allocated object, on a word the region owns but has
+/// not allocated, and outside the region entirely, and [`AnyCollector::mature_base`] /
+/// [`AnyCollector::mature_capacity_words`] name the same region the concrete space does.
+#[test]
+fn the_mature_membership_predicate_agrees_with_the_concrete_space() {
+    let word = core::mem::size_of::<Eterm>();
+    for kind in [MatureKind::Copying, MatureKind::Immix] {
+        let config = GcConfig::copying(workload_policy()).with_mature(kind);
+        let mut c = AnyCollector::from_config(&config).expect("collector");
+        assert_eq!(c.kind(), kind, "the variant under test is the one that runs");
+
+        // The workload's geometry is fixed, so the mature capacity is exactly the configured
+        // one on both paths (a whole number of mark-region blocks).
+        assert_eq!(c.mature_capacity_words(), MATURE_WORDS, "{kind:?}: capacity");
+
+        // Promote one live 3-word tuple into the mature generation.
+        let term = c
+            .young_mut()
+            .heap_mut()
+            .tuple(&[make_small(1), make_small(2), make_small(3)])
+            .expect("the nursery holds the tuple");
+        let mut roots = [term];
+        c.collect_minor(&mut roots).expect("the promotion fits");
+        let live = roots[0];
+        assert!(is_boxed(live), "{kind:?}: the promoted tuple is boxed");
+
+        // `mature_base` + `mature_capacity_words` name exactly the concrete space's region:
+        // its base, and `base + capacity_words` for its end (both spaces are contiguous).
+        assert_eq!(c.mature_base(), concrete_mature_base(&c), "{kind:?}: base");
+        assert_eq!(
+            mature_region_end(&c),
+            c.mature_base() as usize + MATURE_WORDS * word,
+            "{kind:?}: the region runs `capacity_words` past the base"
+        );
+
+        // Probe addresses: the header of a freshly allocated object (inside the region, on an
+        // allocated word) ...
+        let in_object = ptr_val(live) as *const Eterm;
+        // ... the region's last word (inside the region, past the copying space's live fill
+        // but inside the mark-region space's block-aligned area) ...
+        let last_word = (mature_region_end(&c) - word) as *const Eterm;
+        // ... the base itself ...
+        let at_base = c.mature_base() as *const Eterm;
+        // ... one word before the base, one past the end, a stack word, and the nursery's own
+        // base — every one of them outside the mature region.
+        let before_base = (c.mature_base() as usize - word) as *const Eterm;
+        let at_end = mature_region_end(&c) as *const Eterm;
+        let on_stack: Eterm = make_small(7);
+        let stack_word = core::ptr::addr_of!(on_stack);
+        let nursery_base = c.young().base() as *const Eterm;
+        let probes = [
+            in_object,
+            last_word,
+            at_base,
+            before_base,
+            at_end,
+            stack_word,
+            nursery_base,
+        ];
+
+        // The predicate is the concrete mature space's own answer, address for address — the
+        // strategy-agnostic accessor introduces no range logic of its own.
+        for probe in probes {
+            assert_eq!(
+                c.mature_contains(probe),
+                concrete_mature_contains(&c, probe),
+                "{kind:?}: `mature_contains({probe:?})` must be the concrete space's answer"
+            );
+        }
+
+        // ... and each anchor behaves as the two strategies' documented geometry says.
+        assert!(
+            c.mature_contains(in_object),
+            "{kind:?}: a freshly allocated object is inside the mature region"
+        );
+        assert!(
+            c.mature_contains(at_base),
+            "{kind:?}: a region with allocated words owns its base"
+        );
+        assert!(
+            !c.mature_contains(before_base),
+            "{kind:?}: one word before the base is outside"
+        );
+        assert!(
+            !c.mature_contains(at_end),
+            "{kind:?}: the region is half-open — `base + capacity_words` is outside"
+        );
+        assert!(
+            !c.mature_contains(stack_word),
+            "{kind:?}: a stack word is outside"
+        );
+        assert!(
+            !c.mature_contains(nursery_base),
+            "{kind:?}: the nursery is a different region"
+        );
+
+        // The one semantic difference between the strategies: the copying space's range test
+        // covers only its **live fill** `[base, top)`, so the region's last word — a
+        // not-yet-allocated word — is not owned; the mark-region space owns its whole
+        // block-aligned region, free lines included, so that same address IS owned. A caller
+        // must read the over-inclusion as "the address belongs to the mature region", never as
+        // "a live object lives there".
+        assert_eq!(
+            c.mature_contains(last_word),
+            kind == MatureKind::Immix,
+            "{kind:?}: only the mark-region range test is over-inclusive (it covers free lines)"
+        );
+        assert!(
+            c.mature_used_words() < MATURE_WORDS,
+            "{kind:?}: the promoted tuple did not fill the region, so `last_word` is unallocated"
+        );
     }
 }
