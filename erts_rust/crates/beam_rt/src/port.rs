@@ -366,6 +366,19 @@ struct PortMeta {
     /// `None` for every port without a C driver (a `spawn`/`fd` port) — one whose `control` reply
     /// is the oracle's own `badarg`.
     driver_control_flags: Option<Rc<Cell<c_int>>>,
+    /// Cumulative bytes this port has delivered **into** Erlang — `port_info(Port, input)`.
+    ///
+    /// Bumped exactly where the node-global [`IoCounters::input`] is (the bytes of a
+    /// `{Port, {data, …}}` message), so the per-port figure is the port's own share of the same
+    /// events rather than a second, independently-maintained count. A `Cell` because `info` reads
+    /// it through the immutable `&PortMeta` the registry hands out.
+    input: Cell<u64>,
+    /// Cumulative bytes this runtime has written **to** this port — `port_info(Port, output)`.
+    ///
+    /// Bumped at the single write path ([`PortRegistry::write_command`]), alongside the
+    /// node-global [`IoCounters::output`], so it counts what `port_command/2,3` handed the port
+    /// exactly as the oracle's own `output` item does.
+    output: Cell<u64>,
 }
 
 /// A message a live port has produced: the child's stream bytes, or its reaped exit status.
@@ -586,13 +599,16 @@ impl PortRegistry {
     /// [`BeamError::Io`] when the write itself fails (a child that closed its stdin yields
     /// `EPIPE`).
     pub fn write_command(&mut self, id: PortId, bytes: &[u8]) -> Result<()> {
-        if !self.meta.contains_key(&id.number()) {
+        let Some(meta) = self.meta.get_mut(&id.number()) else {
             return Err(BeamError::BadArg);
-        }
+        };
         // Every byte handed to a port counts as **output** for `erlang:statistics(io)`,
         // whichever stream it goes to (the counters are bumped before the branch so a
-        // driver port and a child/`{fd,N}` port are counted alike).
+        // driver port and a child/`{fd,N}` port are counted alike). The port's **own**
+        // `port_info(Port, output)` total is bumped at the same instant, so the two agree by
+        // construction.
         self.io_counters.note_output(bytes.len());
+        meta.output.set(meta.output.get().saturating_add(bytes.len() as u64));
         // A **C driver** port has no child pipe: `port_command` *is* the driver's own `output`
         // callback. `beam_io::PortRegistry::output` runs it inline, and the bytes the driver
         // answers with through `driver_output` are queued as this port's input for the next
@@ -633,15 +649,51 @@ impl PortRegistry {
     /// through `beam_io`, which is why a caller that must keep this registry's own metadata in step
     /// uses [`PortRegistry::close`] instead.
     ///
+    /// # An internal port is `badarg` for every verb
+    ///
+    /// A port whose driver is a **built-in** one (a `{spawn, Cmd}` / `{spawn_executable, Path}` /
+    /// `{fd, N}` port — i.e. every port but a `{spawn_driver, Name}` one, see
+    /// [`PortRegistry::is_driver_port`]) has no `control` callback, and the C's
+    /// `call_driver_control` answers `ERTS_PORT_OP_BADARG` **before** any callback for a driver
+    /// whose `control` slot is `NULL` (`io.c:4035`); `erts_internal_port_control_3` turns that into
+    /// the atom `badarg` (`erl_bif_port.c:340-343`). So `erlang:port_control/3` on a `{spawn,"cat"}`
+    /// or `{fd,0,1}` port is the oracle's `badarg` for **every** verb (measured), never the built-in
+    /// driver's `Ok(vec![])`. That check deliberately precedes the reserved-`"close"` forward: the
+    /// oracle's command is a `c_uint`, so a `"close"` string cannot arise from real `port_control`
+    /// call, and rejecting the internal port first is what matches the C.
+    ///
     /// # Errors
     ///
-    /// [`BeamError::BadArg`] for a port this registry does not hold (closed, or never opened) —
-    /// `beam_io`'s own answer for an unknown port, and the oracle's for `port_control` on a dead
-    /// one — the driver's own rejection (a C driver with no `control` slot, or a negative result,
-    /// is also `badarg`), and the typed capability gap for a reply the driver answers from memory of
-    /// its own (see [`driver::DriverPortAdapter::control_reply`]).
+    /// [`BeamError::BadArg`] for a port this registry does not hold (closed, or never opened), for
+    /// an **internal** port (above), and for the driver's own rejection (a C driver with no `control`
+    /// slot, or a negative result); the typed capability gap for a reply the driver answers from
+    /// memory of its own (see [`driver::DriverPortAdapter::control_reply`]).
     pub fn port_control(&mut self, id: PortId, op: &str, arg: &[u8]) -> Result<Vec<u8>> {
+        if !self.is_driver_port(id) {
+            // Either an internal port — no C driver host, so the oracle's `badarg` for every verb
+            // (`call_driver_control`, `io.c:4035`) — or a port this registry does not hold, which is
+            // `badarg` too. Both are the atom `badarg`, never a fabricated reply.
+            return Err(BeamError::BadArg);
+        }
         self.registry.port_control(&mut self.poller, id, op, arg)
+    }
+
+    /// Whether `id` is backed by a **user C driver** (`{spawn_driver, Name}`) rather than one of the
+    /// built-in `spawn`/`spawn_executable`/`fd` drivers — the C's "does this port's driver have a
+    /// `control` callback?" predicate.
+    ///
+    /// This runtime gives a C driver host to a `{spawn_driver, Name}` port alone (every other `Name`
+    /// form is backed by [`beam_io::SpawnDriver`]), so [`PortMeta::kind`] being
+    /// [`PortName::SpawnDriver`] is exactly the C's `prt->drv_ptr->control != NULL` test
+    /// (`io.c:4035`). It is what [`PortRegistry::port_control`] keys its internal-port `badarg` on,
+    /// and — via the same C-driver-host fact — what [`PortRegistry::control_binary`] reads a flag
+    /// from.
+    ///
+    /// `false` for a port this registry does not hold.
+    pub fn is_driver_port(&self, id: PortId) -> bool {
+        self.meta
+            .get(&id.number())
+            .is_some_and(|meta| meta.kind == PortName::SpawnDriver)
     }
 
     /// Whether `id`'s C driver asked for a **binary** `erlang:port_control/3` reply
@@ -861,6 +913,8 @@ impl PortRegistry {
                             // Bytes a port produced are **input** for
                             // `erlang:statistics(io)`, counted where they really arrive.
                             self.io_counters.note_input(bytes.len());
+                            // ...and for this port's own `port_info(Port, input)`.
+                            meta.input.set(meta.input.get().saturating_add(bytes.len() as u64));
                             events.push(PortEvent::Data {
                                 port,
                                 bytes,
@@ -917,6 +971,8 @@ impl PortRegistry {
                 // Bytes a driver answered with are **input** for
                 // `erlang:statistics(io)`, counted where they are harvested.
                 self.io_counters.note_input(bytes.len());
+                // ...and for this port's own `port_info(Port, input)`.
+                meta.input.set(meta.input.get().saturating_add(bytes.len() as u64));
                 events.push(PortEvent::Data {
                     port,
                     bytes,
@@ -1109,10 +1165,12 @@ impl PortRegistry {
         // `id` is a **bare small integer** (the oracle's shape), not the port term.
         let id = try_make_small(i64::try_from(port.number()).map_err(|_| BeamError::SystemLimit)?)
             .map_err(|_| BeamError::SystemLimit)?;
-        // `input`/`output` are byte counters; the runtime keeps no per-port totals, so both
-        // are `0` — which is what the oracle reports right after `open_port`.
-        let input = make_small(0);
-        let output = make_small(0);
+        // `input`/`output` are this port's cumulative byte totals: the bytes it delivered into
+        // Erlang and the bytes the runtime wrote to it (bumped at the same sites as the
+        // node-global `IoCounters` the `statistics(io)` arm reads). Both are `0` for a port that
+        // has moved no bytes yet — the oracle's answer right after `open_port`.
+        let input = byte_count(meta.input.get())?;
+        let output = byte_count(meta.output.get())?;
         let os_pid = match meta.os_pid {
             Some(pid) => try_make_small(i64::from(pid)).map_err(|_| BeamError::SystemLimit)?,
             // `port_info(Port, os_pid)` is `undefined` for a port without an OS process —
@@ -1599,6 +1657,8 @@ impl PortHook for RuntimePorts {
                 driver_terms: Some(driver_terms),
                 driver_atoms: Some(driver_atoms),
                 driver_control_flags: Some(driver_control_flags),
+                input: Cell::new(0),
+                output: Cell::new(0),
             };
             let mut registry = self.registry_mut()?;
             return registry.register(Box::new(adapter), meta);
@@ -1630,6 +1690,8 @@ impl PortHook for RuntimePorts {
             driver_terms: None,
             driver_atoms: None,
             driver_control_flags: None,
+            input: Cell::new(0),
+            output: Cell::new(0),
         };
         // The registry stays borrowed across `register`: starting a port cannot re-enter a
         // port operation, and a nested borrow is a typed error rather than a panic.
@@ -2110,7 +2172,26 @@ fn monitor_list(heap: &mut Heap, atoms: &AtomTable, pids: &[ProcessId]) -> Resul
     Ok(list)
 }
 
+/// `count` bytes as an Erlang integer for a `port_info(Port, input | output)` answer.
+///
+/// A byte total is always non-negative and, on any real host, far below `2^59`, so the small-int
+/// encoding is the oracle's own shape. The `SystemLimit` arm is the honest answer for a count that
+/// somehow did not fit a small integer rather than a truncated figure.
+///
+/// # Errors
+///
+/// [`BeamError::SystemLimit`] when `count` does not fit a small integer.
+fn byte_count(count: u64) -> Result<Eterm> {
+    let value = i64::try_from(count).map_err(|_| BeamError::SystemLimit)?;
+    try_make_small(value).map_err(|_| BeamError::SystemLimit)
+}
+
 /// The provider's unit suite: `open_port/2` decoding, the `port_info/1,2` vocabulary,
 /// the message pump and its driver interop (see `src/port/tests.rs`).
 #[cfg(test)]
 mod tests;
+
+/// Test-only helpers for the provider's own suite and the native floor's port tests: a
+/// minimal always-ready driver and the port-registration helper (see `src/port/test_support.rs`).
+#[cfg(test)]
+pub(crate) mod test_support;

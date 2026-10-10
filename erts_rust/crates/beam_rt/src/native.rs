@@ -87,7 +87,7 @@ mod group_leader;
 mod init;
 pub(crate) mod memory;
 mod node;
-mod port;
+pub(crate) mod port;
 mod prim;
 mod prim_file;
 mod process;

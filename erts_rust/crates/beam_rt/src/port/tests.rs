@@ -24,6 +24,7 @@
 //! sibling `driver/*_tests.rs` modules are split the same way. It is a child module, so
 //! `use super::*;` reaches every private item of the provider.
 use super::*;
+use std::cell::Cell;
 use beam_io::signal::{Disposition, Signal};
 use beam_io::DriverContext;
 use beam_process::{ProcessState, SignalAtoms};
@@ -291,6 +292,9 @@ fn test_meta(command: &str) -> PortMeta {
         owner: OWNER,
         driver_terms: None,
         driver_atoms: None,
+        driver_control_flags: None,
+        input: Cell::new(0),
+        output: Cell::new(0),
     }
 }
 
