@@ -258,7 +258,8 @@ impl ProcessRunner for RuntimeRunner<'_> {
             }
             // The slice's reduction budget, charged at the machine's heap-admission points
             // (see the `run` docs).
-            let mut probe = BudgetProbe::new(budget);            let mut budget_ctx = BudgetContext {
+            let mut probe = BudgetProbe::new(budget);
+            let mut budget_ctx = BudgetContext {
                 inner: &mut ctx,
                 probe: &mut probe,
             };

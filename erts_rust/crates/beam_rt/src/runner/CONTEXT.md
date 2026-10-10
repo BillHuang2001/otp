@@ -30,7 +30,10 @@ module free of a module-context switch (`Step::Enter`), the interpreter everywhe
   engine-built off-heap binary (`bs_init_writable`/`bs_create_bin` above the on-heap limit) is
   therefore copied rather than refused with `badarg` (the return path) or kept un-copied against a
   dangling payload (the exit path).
-* [`budget`] — the slice's reduction budget and the wrapper context that charges it.
+* [`budget`] — the slice's reduction budget and the wrapper context that charges it. As the
+  scheduled path's outermost `ExecutionContext` it forwards every engine seam it does not itself
+  implement — `send_message_with_off_heap` in particular, whose trait default would otherwise drop
+  the sender machine's off-heap handles and make an engine-built off-heap send a `badarg`.
 * [`tier`] — `JitMode` (`Auto` (**the `#[default]`**) / `Interpreter` / `Baseline`),
   `mode_from_value(Option<&str>)` (**the pure** `BEAM_RT_TIER` value semantics),
   `env_default()` (the memoized unset-variable default), `select_entry_tier(...)` and
