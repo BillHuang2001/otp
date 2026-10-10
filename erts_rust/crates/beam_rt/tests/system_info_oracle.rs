@@ -101,6 +101,12 @@ const ORACLE_EQUAL_KEYS: &[&str] = &[
     "alloc_util_allocators",
     "multi_scheduling_blockers",
     "normal_multi_scheduling_blockers",
+    // The distribution-state keys are oracle-equal in the state `RuntimeConfig::default()`
+    // describes: a `nonode@nohost` runtime with no established link (`dist` is the 39-byte
+    // binary, `dist_ctrl` is `[]`). A runtime that *is* a node answers the typed capability
+    // gap instead (see `src/info/dist.rs`).
+    "dist",
+    "dist_ctrl",
 ];
 
 /// Keys for which only the **shape** is comparable: this runtime's own version strings
@@ -136,8 +142,6 @@ const SHAPE_ONLY_KEYS: &[&str] = &[
 /// Pinned here so a future `unsupported` key is checked against the oracle too.
 const ORACLE_ACCEPTED_UNSUPPORTED_KEYS: &[&str] = &[
     "allocator",
-    "dist",
-    "dist_ctrl",
     "time_offset",
     "time_correction",
     "time_warp_mode",
@@ -188,6 +192,7 @@ enum Kind {
     Tuple,
     List,
     Map,
+    Binary,
 }
 
 /// A value's observable shape: its kind plus (for containers) its top-level arity.
@@ -216,6 +221,12 @@ fn rust_shape(value: &InfoValue) -> Shape {
         InfoValue::Tuple(_, _) => Shape {
             kind: Kind::Tuple,
             arity: 2,
+        },
+        // A byte string is a scalar for shape purposes: `~p` renders it as `<<"…">>`, which
+        // has no comparable top-level element count.
+        InfoValue::Binary(_) => Shape {
+            kind: Kind::Binary,
+            arity: 0,
         },
         InfoValue::Tupled(elements) => Shape {
             kind: Kind::Tuple,
@@ -273,6 +284,11 @@ fn oracle_shape(text: &str) -> Shape {
     if text.starts_with('"') {
         return scalar(Kind::Str);
     }
+    // A bit string / binary (`~p` renders it as `<<"…">>`, or as `<<1,2,3>>` when a byte is
+    // not printable). Classified before the atom fallback, which would otherwise swallow it.
+    if delimited(text, "<<", ">>").is_some() {
+        return scalar(Kind::Binary);
+    }
     if let Some(inner) = delimited(text, "#{", "}") {
         return Shape {
             kind: Kind::Map,
@@ -313,6 +329,30 @@ fn render(value: &InfoValue) -> String {
         InfoValue::Atom(name) => (*name).to_string(),
         InfoValue::Bool(value) => if *value { "true" } else { "false" }.to_string(),
         InfoValue::Tuple(first, second) => format!("{{{first},{second}}}"),
+        // `~p` renders a byte string as a quoted string when every byte is printable
+        // (escaping `\` / `"` and the `\n` / `\r` / `\t` control characters) and switches to
+        // the all-decimal form otherwise (`<<0,65,255>>`). `system_info(dist)` is the former;
+        // the fallback keeps the rendering faithful rather than silently wrong.
+        InfoValue::Binary(bytes) => {
+            let escapable = |byte: &u8| matches!(byte, b'\n' | b'\r' | b'\t' | 0x20..=0x7e);
+            if !bytes.iter().all(escapable) {
+                let parts: Vec<String> = bytes.iter().map(u8::to_string).collect();
+                return format!("<<{}>>", parts.join(","));
+            }
+            let mut text = String::from("<<\"");
+            for byte in bytes {
+                match byte {
+                    b'\\' => text.push_str("\\\\"),
+                    b'"' => text.push_str("\\\""),
+                    b'\n' => text.push_str("\\n"),
+                    b'\r' => text.push_str("\\r"),
+                    b'\t' => text.push_str("\\t"),
+                    other => text.push(char::from(*other)),
+                }
+            }
+            text.push_str("\">>");
+            text
+        }
         InfoValue::Tupled(elements) => {
             let parts: Vec<String> = elements.iter().map(render).collect();
             format!("{{{}}}", parts.join(","))

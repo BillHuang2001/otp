@@ -109,25 +109,33 @@ mod tests {
     }
 
     #[test]
-    fn a_configured_node_is_a_capability_gap() {
-        // A runtime carrying a `-name`/`-sname` node cannot reproduce the oracle's live
-        // wire dump, so both keys are the typed gap rather than a fabricated answer.
+    fn a_configured_node_without_a_link_gaps_dist_and_reports_no_controllers() {
+        // A runtime carrying a `-name`/`-sname` node cannot reproduce the oracle's live wire
+        // dump, so `dist` is the typed gap rather than a fabricated answer. `dist_ctrl`, on
+        // the other hand, is still `[]`: the oracle itself answers `[]` for a node with no
+        // accepted link (measured: `erl -name infodist@localhost` reports a 66-byte `dist`
+        // and `dist_ctrl` = `[]`).
         // A node is created only when the listener binds; skip loudly if it cannot (the
         // oracle that produced the values above is likewise an external facility).
         let config = RuntimeConfig::default().with_node_name("info_dist@localhost");
         let Ok(rt) = Runtime::new(config) else {
-            eprintln!("SKIP a_configured_node_is_a_capability_gap: could not bind a listener");
+            eprintln!(
+                "SKIP a_configured_node_without_a_link_gaps_dist_and_reports_no_controllers: \
+                 could not bind a listener"
+            );
             return;
         };
-        for key in ["dist", "dist_ctrl"] {
-            let error = try_value(key, &rt)
-                .unwrap_or_else(|| panic!("{key} belongs to this family"))
-                .expect_err(&format!("{key} must be a capability gap for a live node"));
-            assert!(
-                crate::error::unsupported_reason(&error).is_some(),
-                "{key} must classify as unsupported, got {error:?}"
-            );
-        }
+        let error = try_value("dist", &rt)
+            .unwrap_or_else(|| panic!("dist belongs to this family"))
+            .expect_err("dist must be a capability gap for a live node");
+        assert!(
+            crate::error::unsupported_reason(&error).is_some(),
+            "dist must classify as unsupported, got {error:?}"
+        );
+        assert_eq!(
+            try_value("dist_ctrl", &rt).unwrap().unwrap(),
+            InfoValue::List(Vec::new())
+        );
     }
 
     #[test]

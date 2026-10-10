@@ -1272,6 +1272,15 @@ fn the_runtime_hooks_bridge_serves_the_dynamic_tag_and_statistics_arms() {
     let true_atom = rt.intern("true");
     let false_atom = rt.intern("false");
     let run_queue = rt.intern("run_queue");
+    let run_queues = rt.intern("run_queues");
+    let run_queue_lengths = rt.intern("run_queue_lengths");
+    let run_queue_lengths_all = rt.intern("run_queue_lengths_all");
+    let total_run_queue_lengths = rt.intern("total_run_queue_lengths");
+    let total_run_queue_lengths_all = rt.intern("total_run_queue_lengths_all");
+    let scheduler_wall_time_all = rt.intern("scheduler_wall_time_all");
+    let undefined = rt.intern("undefined");
+    let active_tasks = rt.intern("active_tasks");
+    let microstate_accounting = rt.intern("microstate_accounting");
     let wall_clock = rt.intern("wall_clock");
     let runtime_key = rt.intern("runtime");
     let garbage_collection = rt.intern("garbage_collection");
@@ -1315,6 +1324,88 @@ fn the_runtime_hooks_bridge_serves_the_dynamic_tag_and_statistics_arms() {
             .expect("statistics(run_queue)"),
         make_small(queued as i64)
     );
+
+    // The whole run-queue family reads the same real queue: `run_queues` is the per-queue
+    // **tuple** (one element — this runtime has one run queue and no dirty schedulers),
+    // `run_queue_lengths`/`_all` the per-queue **list**, and `total_*` the sum.
+    let value = ctx
+        .call_bif("erlang", "statistics", 1, &[run_queues])
+        .expect("statistics(run_queues)");
+    assert_eq!(terms::tuple_arity(value).expect("a 1-tuple"), 1, "one real run queue");
+    assert_eq!(
+        terms::tuple_element(value, 0).expect("the queue length"),
+        make_small(queued as i64)
+    );
+    for key in [run_queue_lengths, run_queue_lengths_all] {
+        let value = ctx
+            .call_bif("erlang", "statistics", 1, &[key])
+            .expect("statistics(run_queue_lengths[_all])");
+        assert_eq!(
+            terms::list_elements(value).expect("a proper list"),
+            vec![make_small(queued as i64)],
+            "one element per real run queue"
+        );
+    }
+    for key in [total_run_queue_lengths, total_run_queue_lengths_all] {
+        assert_eq!(
+            ctx.call_bif("erlang", "statistics", 1, &[key])
+                .expect("statistics(total_run_queue_lengths[_all])"),
+            make_small(queued as i64),
+            "the sum over the one real run queue"
+        );
+    }
+
+    // `scheduler_wall_time_all` is the `_all` sibling of `scheduler_wall_time`: the oracle's
+    // own "not enabled" answer, exactly as this runtime never enables it.
+    assert_eq!(
+        ctx.call_bif("erlang", "statistics", 1, &[scheduler_wall_time_all])
+            .expect("statistics(scheduler_wall_time_all)"),
+        undefined,
+        "never enabled, so `undefined` is exact"
+    );
+
+    // `garbage_collection` is the C's `{GCs, WordsReclaimed, 0}` shape, summed from this
+    // runtime's own collector counters. A fresh runtime has run no collection yet — the
+    // real-counter direction (a collection that really ran) is pinned by
+    // `statistics_garbage_collection_reads_the_runtimes_own_collector_counters`.
+    let value = ctx
+        .call_bif("erlang", "statistics", 1, &[garbage_collection])
+        .expect("statistics(garbage_collection)");
+    assert_eq!(terms::tuple_arity(value).expect("a 3-tuple"), 3);
+    assert_eq!(terms::tuple_element(value, 0).expect("GCs"), make_small(0));
+    assert_eq!(terms::tuple_element(value, 1).expect("WordsReclaimed"), make_small(0));
+    assert_eq!(
+        terms::tuple_element(value, 2).expect("the reserved third element"),
+        make_small(0),
+        "the C's `gather_gc_info_result/1` always answers 0 here"
+    );
+
+    // A valid statistics key this runtime cannot measure is the typed capability gap (never
+    // a fabricated number); a name that is not a statistics key at all is the oracle's
+    // `badarg`. `active_tasks*` needs the per-run-queue "a scheduler is executing from this
+    // queue" state `beam_process::Scheduler` does not keep, and `microstate_accounting` the
+    // MSACC per-thread machinery; the counters it *can* measure are served (see
+    // `the_served_statistics_counters_read_the_runtimes_own_state`).
+    for (key, name) in [
+        (active_tasks, "active_tasks"),
+        (microstate_accounting, "microstate_accounting"),
+    ] {
+        let error = ctx
+            .call_bif("erlang", "statistics", 1, &[key])
+            .expect_err("an unmeasurable statistics key is an honest gap");
+        let expected = format!("erlang:statistics/1: the `{name}` counter is not implemented");
+        assert_eq!(
+            crate::error::unsupported_reason(&error).as_deref(),
+            Some(expected.as_str()),
+            "the gap names the counter"
+        );
+    }
+    for key in [atom_count, make_small(1)] {
+        let error = ctx
+            .call_bif("erlang", "statistics", 1, &[key])
+            .expect_err("an unknown statistics key is badarg");
+        assert_eq!(error.as_atom(), Some("badarg"), "{error}");
+    }
 
     // `statistics(wall_clock)` is a real monotonic clock: `{Total, SinceLastRead}`, both
     // whole milliseconds. Sleeping between two reads must advance the total and make the
@@ -1366,22 +1457,70 @@ fn the_runtime_hooks_bridge_serves_the_dynamic_tag_and_statistics_arms() {
 
     // A valid statistics key this runtime cannot measure is the typed capability gap (never
     // a fabricated number); a name that is not a statistics key at all is the oracle's
-    // `badarg`. `garbage_collection` needs a real accumulative collector, so it stays the
-    // honest gap; the counters it *can* measure are served (see
-    // `the_served_statistics_counters_read_the_runtimes_own_state`).
-    let error = ctx
-        .call_bif("erlang", "statistics", 1, &[garbage_collection])
-        .expect_err("garbage_collection is an honest gap");
-    assert_eq!(
-        crate::error::unsupported_reason(&error).as_deref(),
-        Some("erlang:statistics/1: the `garbage_collection` counter is not implemented")
-    );
-    for key in [atom_count, make_small(1)] {
-        let error = ctx
-            .call_bif("erlang", "statistics", 1, &[key])
-            .expect_err("an unknown statistics key is badarg");
-        assert_eq!(error.as_atom(), Some("badarg"), "{error}");
+    // `badarg`. These two are asserted above, next to the served statistics arms.
+}
+
+/// `statistics(garbage_collection)` reads the runtime's **own real** collector counters: a
+/// process that has really collected over its own young heap is reported, and the two figures
+/// are the collector's own cumulative ones (not a placeholder).
+#[test]
+fn statistics_garbage_collection_reads_the_runtimes_own_collector_counters() {
+    let mut rt = runtime();
+    // A live process whose own collector really runs: put a scratch tuple on its young heap
+    // (unrooted, so it is garbage) and collect.
+    let pid = rt.processes.spawn_default().expect("a spawned process");
+    {
+        let process = rt.processes.get_mut(pid).expect("the process is live");
+        process
+            .heap_mut()
+            .tuple(&[make_small(1), make_small(2), make_small(3)])
+            .expect("a scratch tuple on the young heap");
     }
+    let collection = rt
+        .processes
+        .get_mut(pid)
+        .expect("the process is live")
+        .collect()
+        .expect("a process-heap collection");
+    assert!(
+        collection.stats.words_reclaimed > 0,
+        "the unrooted tuple was garbage the collector reclaimed"
+    );
+
+    // The expected answer is exactly what the live processes' collectors say now.
+    let expected: (i64, i64) = rt
+        .processes()
+        .pids()
+        .filter_map(|live| rt.processes().get(live))
+        .fold((0, 0), |(collections, reclaimed), process| {
+            let stats = process.collector().stats();
+            (
+                collections + (stats.minor_collections + stats.major_collections) as i64,
+                reclaimed + stats.words_reclaimed as i64,
+            )
+        });
+    assert!(expected.0 > 0, "a collection really ran");
+
+    let garbage_collection = rt.intern("garbage_collection");
+    let mut ctx = RuntimeContext::new(&mut rt);
+    let value = ctx
+        .call_bif("erlang", "statistics", 1, &[garbage_collection])
+        .expect("statistics(garbage_collection)");
+    assert_eq!(terms::tuple_arity(value).expect("a 3-tuple"), 3);
+    assert_eq!(
+        signed_value(terms::tuple_element(value, 0).expect("GCs")),
+        expected.0,
+        "the collections the live collectors really ran"
+    );
+    assert_eq!(
+        signed_value(terms::tuple_element(value, 1).expect("WordsReclaimed")),
+        expected.1,
+        "the words those collections really reclaimed"
+    );
+    assert_eq!(
+        terms::tuple_element(value, 2).expect("the reserved third element"),
+        make_small(0)
+    );
 }
 
 /// The counters this runtime keeps for `erlang:statistics/1` are read from its **own real

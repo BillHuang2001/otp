@@ -76,7 +76,7 @@
 use beam_common::{BeamError, Result};
 use beam_engine::terms;
 use beam_process::PortId;
-use beam_term::{is_small, signed_value, Eterm, NIL};
+use beam_term::{is_small, make_small, signed_value, Eterm, NIL};
 
 use crate::context::RuntimeContext;
 use crate::error;
@@ -98,6 +98,7 @@ impl RuntimeContext<'_> {
         match (function, arity) {
             ("port_command", 2) => Some(self.port_command(args, false)),
             ("port_command", 3) => Some(self.port_command(args, true)),
+            ("port_control", 3) => Some(self.port_control(args)),
             ("port_info", 1) | ("port_info", 2) => self.port_info_native(args),
             _ => None,
         }
@@ -187,6 +188,90 @@ impl RuntimeContext<'_> {
         }
         Ok(force)
     }
+
+    /// `erlang:port_control(Port, Operation, Data)`: hand the drive's own `control` callback an
+    /// operation and answer the **bytes it replied with**.
+    ///
+    /// `erlang:port_control/3` is an `erlang.erl` wrapper over `erts_internal:port_control/3`
+    /// (`../../erts/preloaded/src/erlang.erl:12212`), which is the same shape as `port_command/3`
+    /// — the `PortHook` seam has no `control` method — so it is served here, on the floor, ahead
+    /// of the registry.
+    ///
+    /// The decode follows `erts_internal_port_control_3`
+    /// (`../../erts/emulator/beam/erl_bif_port.c:322-360`):
+    ///
+    /// 1. `Port` must be a port term the runtime holds — anything else is [`BeamError::BadArg`]
+    ///    (`sig_lookup_port`), the oracle's own reason for a closed/unknown/live-less port;
+    /// 2. `Operation` is read with `term_to_Uint`: a non-negative integer up to `UINT_MAX`
+    ///    ([`RuntimeContext::term_to_uint`]); out of range is `badarg`;
+    /// 3. `Data` is iodata ([`RuntimeContext::iodata_bytes`], `erts_iolist_to_buf`), so
+    ///    `port_control(P, 1, <<"x">>)` and `port_control(P, 1, [$x])` are both accepted; a bare
+    ///    integer is not iodata and is `badarg`, exactly as for `port_command/2`.
+    ///
+    /// The verb is forwarded to the driver as its **decimal `c_uint` string** — the convention
+    /// [`RuntimePorts::port_control`](crate::port::RuntimePorts::port_control) documents and
+    /// `beam_io`'s C-driver host parses. The reply is the **driver's own bytes**: a driver with no
+    /// `control` slot, or one that returns a negative result, is `badarg` (the C's
+    /// `call_driver_control`, `io.c:4035/4074`).
+    ///
+    /// The reply is an Erlang **list of byte integers** — `write_port_control_result`
+    /// (`io.c:4098-4175`) renders the bytes with `buf_to_intlist` whenever the driver did **not**
+    /// set `PORT_CONTROL_FLAG_BINARY` (a binary is the flag's own form, and the driver adapter
+    /// tracks no control flags yet), which is what the oracle answers for every reply length
+    /// below the flag.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] for a non-port / unknown port, an out-of-range `Operation`, non-iodata
+    /// `Data`, a driver with no `control` slot or a negative driver result; the typed capability gap
+    /// of [`crate::port::RuntimePorts::port_control`] for a reply the driver answers from memory of
+    /// its own, and of the port table already being borrowed.
+    fn port_control(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let port = PortId::from_eterm(*args.first().ok_or(BeamError::BadArg)?)?;
+        let operation = Self::term_to_uint(*args.get(1).ok_or(BeamError::BadArg)?)?;
+        let data = *args.get(2).ok_or(BeamError::BadArg)?;
+        // The registry is reached through a cheap clone of its `Rc` handle, exactly as
+        // `port_command` does, so the reply term is built after the borrow is released.
+        let ports = std::rc::Rc::clone(&self.runtime.ports);
+        let reply = {
+            let mut registry = ports
+                .try_borrow_mut()
+                .map_err(|_| error::unsupported("the port table is already in use"))?;
+            let mut bytes = Vec::new();
+            self.iodata_bytes(data, &mut bytes)?;
+            registry.port_control(port, &operation.to_string(), &bytes)?
+        };
+        Self::int_list(self, &reply)
+    }
+
+    /// `term` as a `Uint` — the C's `term_to_Uint`: a non-negative integer that fits `UINT_MAX`,
+    /// else [`BeamError::BadArg`].
+    ///
+    /// This runtime's small integers already reach `2^59` on 64-bit, so a **bignum** is always
+    /// past `UINT_MAX` and `term_to_Uint`'s own overflow arm covers it; a float, an atom or a
+    /// negative integer fails the same way (the C's `badarg`).
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] for anything that is not a small integer in `0..=u32::MAX`.
+    fn term_to_uint(term: Eterm) -> Result<u32> {
+        if !is_small(term) {
+            return Err(BeamError::BadArg);
+        }
+        u32::try_from(signed_value(term)).map_err(|_| BeamError::BadArg)
+    }
+
+    /// `bytes` as an Erlang **list of byte integers** — the `buf_to_intlist` rendering of a port
+    /// control reply (`io.c:4160`).
+    ///
+    /// # Errors
+    ///
+    /// Whatever the heap reports when the list cannot be built.
+    fn int_list(&mut self, bytes: &[u8]) -> Result<Eterm> {
+        let elements: Vec<Eterm> = bytes.iter().map(|byte| make_small(*byte as i64)).collect();
+        terms::make_list(self, &elements)
+    }
+
     /// The native half of `erlang:port_info/1,2`: `undefined` for a port the runtime does
     /// not hold, and the bare `[]` for a **live** port's `registered_name` item.
     ///
@@ -233,42 +318,62 @@ impl RuntimeContext<'_> {
     ///
     /// [`BeamError::BadArg`] for a term that is not iodata.
     fn iodata_bytes(&self, term: Eterm, out: &mut Vec<u8>) -> Result<()> {
-        self.iolist_bytes(term, out, true)
-    }
-
-    /// Collects one iodata *element* into `out`: a byte-sized small integer, a binary, or a
-    /// (possibly nested) list of those.
-    ///
-    /// `top_level` distinguishes the outermost call from a list element: a bare integer is
-    /// only iodata as an element (`iodata()` is `binary() | iolist()`, never an integer), so
-    /// the outermost integer is [`BeamError::BadArg`] while an element integer is a byte.
-    ///
-    /// # Errors
-    ///
-    /// [`BeamError::BadArg`] for a term that is not iodata.
-    fn iolist_bytes(&self, term: Eterm, out: &mut Vec<u8>, top_level: bool) -> Result<()> {
-        if is_small(term) {
-            if top_level {
-                // `iodata() = binary() | iolist()`: a bare integer is not iodata.
-                return Err(BeamError::BadArg);
-            }
-            out.push(u8::try_from(signed_value(term)).map_err(|_| BeamError::BadArg)?);
-            return Ok(());
-        }
-        if let Ok(bytes) = terms::binary_bytes(term) {
-            out.extend_from_slice(bytes);
-            return Ok(());
-        }
-        if let Ok(elements) = terms::list_elements(term) {
-            for element in elements {
-                self.iolist_bytes(element, out, false)?;
-            }
-            return Ok(());
-        }
-        Err(BeamError::BadArg)
+        iodata_bytes(term, out)
     }
 }
 
+/// Collects `term` as Erlang **iodata** into `out` — a binary, or a (possibly nested) list of
+/// byte-sized integers/binaries.
+///
+/// This is `iolist_to_binary/1`'s acceptance rule, restricted to what a port stream can carry: a
+/// non-integer *element*, an out-of-range element integer, an improper tail and a non-iodata term
+/// are all [`BeamError::BadArg`]. The **top level** must be a binary or a list — a bare integer is
+/// deliberately rejected, because Erlang's `iodata()` is `binary() | iolist()`
+/// (`iolist_to_binary(42)` is `badarg`), even though `42` is a valid *element*.
+///
+/// It is a **free** function rather than a method so a caller that holds no [`RuntimeContext`] can
+/// still flatten iodata — the NIF host's `enif_port_command` hook
+/// ([`crate::nif::RuntimeNifServices`]) is exactly such a caller. The method form
+/// [`RuntimeContext::iodata_bytes`] forwards here.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] for a term that is not iodata.
+pub(crate) fn iodata_bytes(term: Eterm, out: &mut Vec<u8>) -> Result<()> {
+    iolist_bytes(term, out, true)
+}
+
+/// Collects one iodata *element* into `out`: a byte-sized small integer, a binary, or a
+/// (possibly nested) list of those.
+///
+/// `top_level` distinguishes the outermost call from a list element: a bare integer is only iodata
+/// as an element (`iodata() = binary() | iolist()`, never an integer), so the outermost integer is
+/// [`BeamError::BadArg`] while an element integer is a byte.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] for a term that is not iodata.
+fn iolist_bytes(term: Eterm, out: &mut Vec<u8>, top_level: bool) -> Result<()> {
+    if is_small(term) {
+        if top_level {
+            // `iodata() = binary() | iolist()`: a bare integer is not iodata.
+            return Err(BeamError::BadArg);
+        }
+        out.push(u8::try_from(signed_value(term)).map_err(|_| BeamError::BadArg)?);
+        return Ok(());
+    }
+    if let Ok(bytes) = terms::binary_bytes(term) {
+        out.extend_from_slice(bytes);
+        return Ok(());
+    }
+    if let Ok(elements) = terms::list_elements(term) {
+        for element in elements {
+            iolist_bytes(element, out, false)?;
+        }
+        return Ok(());
+    }
+    Err(BeamError::BadArg)
+}
 #[cfg(test)]
 mod tests {
     use super::*;

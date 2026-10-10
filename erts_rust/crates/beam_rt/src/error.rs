@@ -419,7 +419,6 @@ pub(crate) const KNOWN_UNIMPLEMENTED_ERLANG_BIFS: &[(&str, u32)] = &[
     ("disconnect_node", 1),
     // Ports: declared as `erts_internal:port_*`.
     ("port_connect", 2),
-    ("port_control", 3),
     ("port_call", 3),
     ("spawn_request", 2),
     ("spawn_request", 3),
