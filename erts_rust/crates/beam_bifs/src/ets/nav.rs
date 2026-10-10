@@ -50,7 +50,8 @@
 //!
 //! The alias is applied here, in the BIF layer, and never by changing
 //! `beam_ets::Table::last`/`prev` — those keep the interior's own semantics, which
-//! the `ets:last/1`/`ets:prev/2` BIFs build on.
+//! the `ets:last/1`/`ets:prev/2` BIFs build on. The rule itself is the shared
+//! [`has_backward_walk`] predicate (the `adopt` fun-folds key off it too).
 //!
 //! # The multi-object answer
 //!
@@ -65,7 +66,10 @@ use beam_term::Eterm;
 use crate::context::BifContext;
 use crate::registry::BifRegistry;
 
-use super::{copy_out, copy_out_list, restore_table, resolve, take_table_gated, END_OF_TABLE};
+use super::{
+    copy_out, copy_out_list, has_backward_walk, restore_table, resolve, take_table_gated,
+    END_OF_TABLE,
+};
 
 /// Registers the `*_lookup` BIFs.
 pub(super) fn register(reg: &mut BifRegistry) {
@@ -116,7 +120,7 @@ fn first_lookup_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 fn last_lookup_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
-    let key = if table.kind().is_ordered() {
+    let key = if has_backward_walk(&table) {
         table.last(ctx.atoms())
     } else {
         table.first(ctx.atoms())
@@ -155,7 +159,7 @@ fn prev_lookup_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let key = args[1];
     let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
-    let outcome = if table.kind().is_ordered() {
+    let outcome = if has_backward_walk(&table) {
         table.prev(key, ctx.atoms())
     } else {
         table.next(key, ctx.atoms())
