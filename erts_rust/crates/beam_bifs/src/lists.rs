@@ -275,13 +275,16 @@ fn sort_by_arith(atoms: &AtomTable, elems: &[Eterm]) -> Vec<Eterm> {
 // Helpers for the `fun`-taking functions (the `FunCaller` seam)
 // ---------------------------------------------------------------------------
 
-/// The boolean value of a `true`/`false` **atom**, else `badarg`.
+/// The boolean value of a `true`/`false` **atom**, else the oracle's
+/// `error:{case_clause, Value}`.
 ///
 /// Every predicate read in this module goes through `case Pred(E) of true -> …;
-/// false -> … end`, so a non-boolean result is an error rather than a truthy value
-/// (the oracle reports `case_clause` or `{bad_filter, E}`; Milestone-1 reports
-/// `badarg` — see the module docs).
-fn boolean_result(ctx: &BifContext<'_>, result: Eterm) -> Result<bool> {
+/// false -> … end`, so a non-boolean result is an error rather than a truthy value,
+/// and the oracle's reason carries the offending value: `lists:all(fun(X) -> X end,
+/// [1,2,3])` ⇒ `error:{case_clause,1}` (also `any/2`, `partition/2`, `takewhile/2`,
+/// `dropwhile/2`, `splitwith/2`, `sort/2`, `usort/2`). [`structured_error`] degrades
+/// to a plain `badarg` when the `case_clause` atom cannot be interned.
+fn boolean_result(ctx: &mut BifContext<'_>, result: Eterm) -> Result<bool> {
     if is_atom(result) {
         match ctx.atoms().name(atom_val(result)) {
             Some("true") => return Ok(true),
@@ -289,13 +292,47 @@ fn boolean_result(ctx: &BifContext<'_>, result: Eterm) -> Result<bool> {
             _ => {}
         }
     }
-    Err(badarg())
+    Err(case_clause(ctx, result)?)
 }
 
 /// Calls the predicate `fun` on `args` and reads its boolean result.
 fn call_predicate(ctx: &mut BifContext<'_>, fun: Eterm, args: &[Eterm]) -> Result<bool> {
     let result = ctx.call_fun(fun, args)?;
     boolean_result(ctx, result)
+}
+
+/// `lists:filter/2`'s predicate read: the oracle's comprehension reports a
+/// non-boolean filter as the *structured* `error:{bad_filter, Value}` (probed:
+/// `lists:filter(fun(X) -> X end, [1,2,3])` ⇒ `error:{bad_filter,1}`), not the
+/// `{case_clause, …}` the `case`-based callers raise.
+fn call_filter_predicate(ctx: &mut BifContext<'_>, fun: Eterm, elem: Eterm) -> Result<bool> {
+    let result = ctx.call_fun(fun, &[elem])?;
+    if is_atom(result) {
+        match ctx.atoms().name(atom_val(result)) {
+            Some("true") => return Ok(true),
+            Some("false") => return Ok(false),
+            _ => {}
+        }
+    }
+    Err(structured_error(ctx, "bad_filter", &[result])?)
+}
+
+/// The `is_function(Fun, Arity)` guard every `fun`-taking `lists.erl` function
+/// carries.
+///
+/// A wrong fun is a **guard** failure, so the oracle raises
+/// `error:function_clause` *before* the list is walked — even for an empty list the
+/// fun would never be called on. Probed `error:function_clause`:
+/// `lists:map(5, [])`, `lists:map(5, [1])`, `lists:filter(5, [])`,
+/// `lists:foldl(5, 0, [])`, `lists:foreach(5, [])`, `lists:sort(5, [])`,
+/// `lists:usort(5, [])`, `lists:all(5, [])`, `lists:any(5, [])`,
+/// `lists:takewhile(5, [])`, `lists:dropwhile(5, [])`, `lists:splitwith(5, [])`,
+/// `lists:partition(5, [])`, `lists:sort(fun(A) -> A end, [1,2])`.
+fn require_fun(fun: Eterm, arity: u32) -> Result<()> {
+    match fun_arity(fun) {
+        Some(n) if n == arity => Ok(()),
+        _ => Err(function_clause()),
+    }
 }
 
 /// The `Fun(A, B)` ordering of two elements for `sort/2`/`usort/2`.
@@ -1202,6 +1239,8 @@ fn unzip(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 fn map2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
     let list = args[1];
+    // `map(F, List) when is_function(F, 1)`.
+    require_fun(fun, 1)?;
     if !is_nil(list) && !is_list(list) {
         // `case List of [Hd | Tail] -> …; [] -> … end` matches neither clause.
         return Err(case_clause(ctx, list)?);
@@ -1223,6 +1262,8 @@ fn map2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `foreach(Fun, List)` — `Fun` called for its side effects, left to right; `ok`.
 fn foreach2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
+    // `foreach(F, List) when is_function(F, 1)`.
+    require_fun(fun, 1)?;
     let elems = proper_list(args[1]).ok_or_else(function_clause)?;
     for elem in elems {
         ctx.call_fun(fun, &[elem])?;
@@ -1245,6 +1286,8 @@ fn foreach2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `badarg`, and any other `Pred` failure propagates untouched.
 fn filter2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
+    // `filter(Pred, List) when is_function(Pred, 1)`.
+    require_fun(fun, 1)?;
     let mut kept = Vec::new();
     let mut cur = args[1];
     loop {
@@ -1256,7 +1299,7 @@ fn filter2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
             return Err(bad_generator(ctx, cur)?);
         }
         let elem = car(cur);
-        if call_predicate(ctx, fun, &[elem])? {
+        if call_filter_predicate(ctx, fun, elem)? {
             kept.push(elem);
         }
         cur = cdr(cur);
@@ -1274,6 +1317,8 @@ fn filter2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// whatever `Fun` raises.
 fn foldl3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
+    // `foldl(F, Accu, List) when is_function(F, 2)`.
+    require_fun(fun, 2)?;
     let mut acc = args[1];
     let list = args[2];
     if !is_nil(list) && !is_list(list) {
@@ -1296,6 +1341,8 @@ fn foldl3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `foldr(Fun, Acc0, List)` — `Acc = Fun(Elem, Acc)`, **right to left**.
 fn foldr3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
+    // `foldr(F, Accu, List) when is_function(F, 2)`.
+    require_fun(fun, 2)?;
     let mut acc = args[1];
     for &elem in proper_list(args[2]).ok_or_else(function_clause)?.iter().rev() {
         acc = ctx.call_fun(fun, &[elem, acc])?;

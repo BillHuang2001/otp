@@ -394,8 +394,9 @@ fn floats_nested_in_containers_agree_with_the_oracle() {
 #[test]
 fn the_e_f_g_directives_are_unchanged() {
     let reg = default_registry();
-    // Kept clear of `~f` of the largest doubles: that renders >255 characters and
-    // the oracle's buffer is a separate (pre-existing) gap.
+    // `~f` of the largest doubles renders far past 255 characters (316 for
+    // `f64::MAX`): the `float_to_list/2` buffer bound is *not* on this path. The
+    // extremes are pinned in `tests/float_directives.rs`.
     let values = [
         0.0f64,
         1.0,
