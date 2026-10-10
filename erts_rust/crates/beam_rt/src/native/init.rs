@@ -28,25 +28,26 @@
 //! terminal boot state for `get_status/0` — instead of loading a module it cannot execute
 //! (see the parent module's docs).
 
-use std::path::Path;
-
 use beam_common::{BeamError, Result};
 use beam_engine::terms;
 use beam_term::Eterm;
 
 use crate::context::RuntimeContext;
+use crate::error;
 
 impl RuntimeContext<'_> {
     /// `init:get_argument(Flag)`: `{ok, [[Value…]…]}` for a flag that was given (one
     /// inner list per occurrence, empty for a valueless flag), or the atom `error`.
     ///
-    /// Three flags are **automatic** — the emulator defines them itself, so they are not
+    /// Four flags are **automatic** — the emulator defines them itself, so they are not
     /// command-line flags and have no [`InitArgs`](crate::config::InitArgs) entry
     /// (`init.erl:363-388`): `root` (the installation directory, served from the same
     /// resolution as [`code:root_dir/0`](Self::code_root_dir)), `progname` (the name of
-    /// the program that started the runtime — see [`progname`]) and `home` (the `$HOME`
-    /// environment variable). These are answered from the runtime's own state; a flag the
-    /// runtime has no value for is the atom `error`, exactly like an absent flag.
+    /// the program that started the runtime — see [`progname`]), `home` (the `$HOME`
+    /// environment variable) and `bindir` (the emulator's `bin` directory —
+    /// [`CodeServer::bindir`](crate::CodeServer::bindir)). These are answered from the
+    /// runtime's own state; a flag the runtime has no value for is the atom `error`,
+    /// exactly like an absent flag.
     ///
     /// The occurrences are **snapshotted** out of the configuration before any term is
     /// built: every occurrence is owned data by then, so no borrow of the runtime is
@@ -81,6 +82,22 @@ impl RuntimeContext<'_> {
                 return match progname() {
                     Some(name) => {
                         let value = self.charlist(&name)?;
+                        self.ok_single_value(value)
+                    }
+                    None => self.atom("error"),
+                };
+            }
+            // `bindir` — the directory holding the emulator executables — is a
+            // *filesystem* fact (`erlexec.c:1541-1543`): `<rootdir>/erts-<vsn>/bin`. It is
+            // derived from the very same installation resolution the code path uses; when
+            // no installation (and so no emulator directory) is resolvable there is no
+            // bindir to report, so the honest answer is `error` (never a fabricated
+            // directory).
+            "bindir" => {
+                let _ = self.runtime.code_server.add_system_paths();
+                return match self.runtime.code_server.bindir() {
+                    Some(dir) => {
+                        let value = self.charlist(&dir.display().to_string())?;
                         self.ok_single_value(value)
                     }
                     None => self.atom("error"),
@@ -173,27 +190,66 @@ impl RuntimeContext<'_> {
         let started = self.atom("started")?;
         terms::make_tuple(self, &[starting, started])
     }
+
+    /// `init:script_id/0`: the `{Name, Vsn}` header of the **loaded** boot script, as a
+    /// 2-tuple of strings (contracts A.7/A.9).
+    ///
+    /// The oracle's `init` answers the id of the script it booted (`init.erl`'s
+    /// `script_id/0` returns the `Id` it read out of the `.boot` file). This runtime
+    /// records that header when it loads a script ([`Runtime::boot_from_script`]); before
+    /// any script has been loaded there is no id to report, which is a typed capability
+    /// gap — never a fabricated `{"Erlang/OTP", …}` literal.
+    ///
+    /// `// documented divergence:` this runtime's release is OTP `30.0-rc0`, so the header
+    /// of the committed `bootstrap/bin/start.boot` it loads is `{"Erlang/OTP","30"}` where
+    /// the OTP-29 oracle reports `{"Erlang/OTP","29"}`. The value is the *real* header of
+    /// the script this runtime loaded, so it tracks the release exactly as the oracle's
+    /// does — the difference is the release, not the mechanism.
+    ///
+    /// [`Runtime::boot_from_script`]: crate::Runtime::boot_from_script
+    pub(super) fn script_id_0(&mut self) -> Result<Eterm> {
+        let Some((name, vsn)) = self
+            .runtime
+            .boot_script_id()
+            .map(|(name, vsn)| (name.to_string(), vsn.to_string()))
+        else {
+            return Err(error::unsupported(
+                "init:script_id/0 (no boot script has been loaded)",
+            ));
+        };
+        let name = self.charlist(&name)?;
+        let vsn = self.charlist(&vsn)?;
+        terms::make_tuple(self, &[name, vsn])
+    }
 }
 
 /// The name of the program that started this runtime — the value of
 /// `init:get_argument(progname)`.
 ///
-/// The oracle's `progname` is **not a fixed string**: the `erl` shell script exports the
-/// basename of `$0` as `PROGNAME` and hands it to the emulator as `-progname`, so the
-/// answer is the *invocation* name of the program (`init.erl:373-378`: "The name of the
-/// program which started Erlang"). Invoking the oracle through a symlink named `foo`
-/// makes it report `"foo"`, not `"erl"`. This runtime applies the same rule to its own
-/// `argv[0]` — the basename of the path it was started as.
+/// The C emulator composes it in exactly one place (`erts/etc/common/erlexec.c:1702-1705`):
+/// `progname = get_env("PROGNAME")`, falling back to the compile-time
+/// `DEFAULT_PROGNAME = "erl"` (`erlexec.c:36`). It is **not** the basename of `$0` — the
+/// `erl` shell script is what exports `PROGNAME` before starting the emulator, so an
+/// unset `PROGNAME` always yields `"erl"` however the program was invoked. This runtime
+/// reproduces the C rule verbatim.
 ///
-/// `None` when the process has no `argv[0]`, when it is empty, or when its basename is
-/// not valid UTF-8 (a name this runtime's char lists cannot carry); the caller then
-/// answers `error`.
+/// `None` only when `PROGNAME` is set to a value this runtime's char lists cannot carry
+/// (not valid UTF-8); the caller then answers `error`, exactly as for an unset variable.
 fn progname() -> Option<String> {
-    let arg0 = std::env::args_os().next()?;
-    if arg0.is_empty() {
-        return None;
+    progname_from(std::env::var_os("PROGNAME").as_deref())
+}
+
+/// The C emulator's compile-time `progname` default (`erlexec.c:36`, `:1702-1705`).
+const DEFAULT_PROGNAME: &str = "erl";
+
+/// The `progname` value for a given `PROGNAME` environment value — the pure rule behind
+/// [`progname`]: a set, non-empty value wins, anything else is [`DEFAULT_PROGNAME`], and a
+/// set-but-non-UTF-8 value has no char-list image (`None`).
+fn progname_from(env: Option<&std::ffi::OsStr>) -> Option<String> {
+    match env {
+        Some(value) if !value.is_empty() => value.to_str().map(str::to_string),
+        _ => Some(DEFAULT_PROGNAME.to_string()),
     }
-    Path::new(&arg0).file_name()?.to_str().map(str::to_string)
 }
 
 #[cfg(test)]
@@ -385,39 +441,109 @@ mod tests {
     }
 
     #[test]
-    fn get_argument_progname_is_the_invocation_basename() {
-        // The oracle's `progname` is the basename of the path the program was started as
-        // (the `erl` script's `$0`), never a fixed string — so this runtime answers the
-        // basename of its own `argv[0]`.
-        let Some(arg0) = std::env::args_os().next() else {
-            return;
-        };
-        let Some(expected) = std::path::Path::new(&arg0)
-            .file_name()
-            .and_then(|name| name.to_str())
-        else {
-            return; // no argv[0] basename to compare against
-        };
-        assert!(!expected.is_empty());
-        assert_eq!(progname().as_deref(), Some(expected));
+    fn progname_follows_the_c_env_rule() {
+        // `progname = get_env("PROGNAME")`, else the compile-time default `"erl"`
+        // (`erlexec.c:36`, `:1702-1705`) — never the invocation basename.
+        use std::ffi::OsStr;
+        assert_eq!(progname_from(None).as_deref(), Some(DEFAULT_PROGNAME));
+        assert_eq!(
+            progname_from(Some(OsStr::new(""))).as_deref(),
+            Some(DEFAULT_PROGNAME)
+        );
+        assert_eq!(
+            progname_from(Some(OsStr::new("myerl"))).as_deref(),
+            Some("myerl")
+        );
+        // A non-UTF-8 value has no char-list image.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert_eq!(progname_from(Some(OsStr::from_bytes(b"\xff"))), None);
+        }
+    }
 
+    #[test]
+    fn get_argument_progname_is_erl_by_default() {
+        // Oracle: `init:get_argument(progname)` ⇒ `{ok,[["erl"]]}` when `PROGNAME` is
+        // unset (the `erl` wrapper script is what sets it to anything else). The process
+        // environment is global, so the `PROGNAME`-set case is covered by the pure rule
+        // above; here the unset case is pinned.
+        if std::env::var_os("PROGNAME").is_some() {
+            return; // cannot exercise the default with the variable set
+        }
         let mut runtime = runtime();
         let flag = atom(&mut runtime, "progname");
         let answer = call(&mut runtime, "init", "get_argument", &[flag]).expect("progname");
         assert_eq!(
             single_automatic_value(&mut runtime, answer).as_deref(),
-            Some(expected),
-            "progname is the basename the runtime was started as"
+            Some(DEFAULT_PROGNAME),
+            "an unset PROGNAME answers the compile-time default"
         );
     }
 
     #[test]
-    fn get_argument_still_reports_an_absent_automatic_flag_as_error() {
+    fn get_argument_bindir_is_the_emulator_directory() {
+        // Oracle: `init:get_argument(bindir)` ⇒ `{ok,[["<root>/erts-<vsn>/bin"]]}` — the
+        // directory holding the emulator executables. It is derived from the installation
+        // this runtime's code path resolved, and is a real directory (or `error` when no
+        // installation is discoverable, which this test skips over honestly).
+        let Some(mut runtime) = system_runtime() else {
+            return;
+        };
+        let flag = atom(&mut runtime, "bindir");
+        let answer = call(&mut runtime, "init", "get_argument", &[flag]).expect("bindir");
+        let Some(dir) = single_automatic_value(&mut runtime, answer) else {
+            return; // no emulator directory under the resolved root
+        };
+        assert!(
+            std::path::Path::new(&dir).join("beam.smp").is_file(),
+            "bindir holds the emulator executables: {dir}"
+        );
+    }
+
+    #[test]
+    fn script_id_is_the_loaded_boot_script_header() {
+        // Before any script has been loaded there is no id: a typed capability gap, never
+        // a fabricated `{"Erlang/OTP", …}`.
+        let mut runtime = runtime();
+        let error = call(&mut runtime, "init", "script_id", &[]).expect_err("no script loaded");
+        assert_eq!(
+            crate::error::unsupported_reason(&error).as_deref(),
+            Some("init:script_id/0 (no boot script has been loaded)")
+        );
+
+        // After loading the committed `start.boot`, the answer is its real `{Name, Vsn}`
+        // header — `{"Erlang/OTP","30"}` for this release.
+        let script_path =
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../../bootstrap/bin/start.boot");
+        let expected = crate::boot::bootscript::read(std::path::Path::new(script_path))
+            .expect("the committed start.boot");
+        let Some(mut runtime) = system_runtime() else {
+            return;
+        };
+        runtime.boot().expect("boot");
+        let _ = runtime.boot_from_script_reporting(script_path);
+        let answer = call(&mut runtime, "init", "script_id", &[]).expect("script_id/0");
+        assert_eq!(terms::tuple_arity(answer).expect("a 2-tuple"), 2);
+        assert_eq!(
+            string_of(terms::tuple_element(answer, 0).unwrap()),
+            expected.name
+        );
+        assert_eq!(
+            string_of(terms::tuple_element(answer, 1).unwrap()),
+            expected.vsn
+        );
+        assert_eq!(expected.name, "Erlang/OTP");
+        assert_eq!(expected.vsn, "30");
+    }
+
+    #[test]
+    fn get_argument_still_reports_an_absent_flag_as_error() {
         // A flag the runtime has no value for is the atom `error` — the automatic flags
         // do not change that rule for any other name.
         let mut runtime = runtime();
-        let flag = atom(&mut runtime, "bindir");
-        let answer = call(&mut runtime, "init", "get_argument", &[flag]).expect("bindir");
+        let flag = atom(&mut runtime, "no_such_flag");
+        let answer = call(&mut runtime, "init", "get_argument", &[flag]).expect("absent");
         assert_eq!(runtime.atom_name_of(answer), Some("error"));
     }
 }

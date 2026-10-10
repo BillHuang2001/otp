@@ -44,19 +44,27 @@
 //!
 //! # The one by-construction divergence: the **boot set size**
 //!
-//! The oracle's boot script loads ~109 modules, so `erlang:module_loaded(lists)` is `true`
-//! there the moment the node starts. This runtime loads only its 22 preloaded `.beam`s at
-//! boot, so the same probe answers `false` until `lists` is actually loaded. That is the same
-//! class of divergence as `erlang:processes/0` / `system_info(port_count)`: an answer that
-//! reads **this** runtime's own state and is *truthful* about it, not a bug to paper over.
-//! [`the_boot_set_divergence_is_this_runtimes_own_truthful_loaded_set`] asserts this runtime's
-//! own value, proves that value is truthful (a forced load flips it), and **records** the
-//! oracle's differing value without failing on it.
+//! The oracle's node start-up runs `bootstrap/bin/start.boot`, whose three `primLoad` batches
+//! (29 + 86 + 87 names) put `lists`, `kernel` and ~200 other modules in its code table, so
+//! `erlang:module_loaded(lists)` is `true` there the moment the node starts. This runtime
+//! loads only its 22 preloaded `.beam`s at boot (its `-eval`/`run` boot does not run the boot
+//! script), so the same probes answer `false` until those modules are actually loaded. That is
+//! the same class of divergence as `erlang:processes/0` / `system_info(port_count)`: an answer
+//! that reads **this** runtime's own state and is *truthful* about it, not a bug to paper
+//! over. [`the_boot_set_divergence_is_exactly_the_boot_scripts_module_loads`] measures it in
+//! one oracle-cross-checked probe (the two boot-script names differ; an *available* module and
+//! an unknown one do not), [`the_loaded_set_is_self_consistent_in_both`] pins that this
+//! runtime agrees with its own `code:all_loaded/0`, and
+//! [`the_two_boot_script_names_flip_when_this_runtime_loads_them`] (plus
+//! [`the_boot_set_divergence_is_this_runtimes_own_truthful_loaded_set`]) proves the `false` is
+//! a truthful "not loaded", not a missing lookup — a real load flips it, exactly as in the
+//! oracle.
 //!
 //! The hard constraint this suite guards: the answer must **never** come from a
 //! `find_file(...).is_some()` ("is on the code path") shortcut, which would wrongly answer
-//! `true` for `xmerl_scan`/`dialyzer` -
-//! [`an_absent_or_unloaded_name_is_false_in_both`] is the guard.
+//! `true` for `xmerl_scan`/`dialyzer`/`digraph` —
+//! [`an_absent_or_unloaded_name_is_false_in_both`] and
+//! [`the_boot_set_divergence_is_exactly_the_boot_scripts_module_loads`] are the guards.
 //!
 //! # A `lists:reverse` gotcha worth naming
 //!
@@ -224,6 +232,43 @@ const EXPR_BADARG: &str = "erlang:module_loaded(42).";
 const EXPR_BADARG_CAUGHT: &str = "\
 try erlang:module_loaded(42) catch error:badarg -> io:format(\"badarg~n\") end, halt(0).";
 
+/// The boot-set divergence in **one** probe: two names the oracle's node start-up loads
+/// (`bootstrap/bin/start.boot`'s three `primLoad` batches — 29 + 86 + 87 module names) and
+/// two it does not. `digraph` is only *available* there (`code:which/1` resolves it) and
+/// `nonexistent_xyz` does not exist at all, so both runtimes answer `false` for them.
+const EXPR_BOOT_SET: &str = "\
+io:format(\"~p~n\", [{erlang:module_loaded(lists), erlang:module_loaded(kernel), \
+erlang:module_loaded(digraph), erlang:module_loaded(nonexistent_xyz)}]), halt(0).";
+
+/// This runtime's own answer for [`EXPR_BOOT_SET`]: its `-eval` boot loads only the 22
+/// preloaded `.beam`s, so neither `lists` nor `kernel` is loaded here.
+const BOOT_SET_OURS: &str = "{false,false,false,false}";
+
+/// The live oracle's answer for [`EXPR_BOOT_SET`] (OTP 29.1.1 / erts-17.1): `lists` and
+/// `kernel` are in its code table before `-eval` runs; `digraph`/`nonexistent_xyz` are not.
+const BOOT_SET_ORACLE: &str = "{true,true,false,false}";
+
+/// This runtime's loaded set checked against **its own** `code:all_loaded/0`: `D` (the
+/// modules that listing disagrees with `erlang:module_loaded/1` about) must be none, and the
+/// two boot-script names are not loaded here.
+const EXPR_SELF_CONSISTENT: &str = "\
+L = [M || {M, _} <- code:all_loaded()], \
+D = [M || M <- L, not erlang:module_loaded(M)], \
+io:format(\"~p~n\", [{D, erlang:module_loaded(lists), erlang:module_loaded(kernel)}]), \
+halt(0).";
+
+/// The oracle's answer for [`EXPR_SELF_CONSISTENT`]: its loaded set is self-consistent too,
+/// and its boot script has already loaded both names.
+const SELF_CONSISTENT_ORACLE: &str = "{[],true,true}";
+
+/// The same two names, **after** this runtime has genuinely loaded them through
+/// `code:ensure_loaded/1`: both flip to `true`, and the whole 4-tuple then matches the
+/// oracle's answer for the same program — so the `false` above is "not loaded here", never
+/// "unknown".
+const EXPR_ENSURE_BOTH: &str = "\
+io:format(\"~p~n\", [{code:ensure_loaded(kernel), erlang:module_loaded(kernel), \
+code:ensure_loaded(lists), erlang:module_loaded(lists)}]), halt(0).";
+const ENSURE_BOTH_EXPECTED: &str = "{{module,kernel},true,{module,lists},true}";
 // ---------------------------------------------------------------------------------------
 // The tests
 // ---------------------------------------------------------------------------------------
@@ -377,5 +422,86 @@ fn a_non_atom_argument_is_badarg_in_both() {
     assert_eq!(
         theirs_caught.out, "badarg",
         "the recorded reason must be the live oracle's answer"
+    );
+}
+
+/// The boot-set divergence, in a single oracle-cross-checked probe: of `lists` (loaded by
+/// the oracle's boot script), `kernel` (likewise), `digraph` (only *available* — `code:which/1`
+/// resolves it) and an unknown name, exactly the two boot-script names differ. Both runtimes
+/// agree that "resolvable on the code path" and "unknown" are **not** "loaded", which is the
+/// guard against closing this gap with a code-path shortcut.
+#[test]
+fn the_boot_set_divergence_is_exactly_the_boot_scripts_module_loads() {
+    let ours = beam_rt_eval(EXPR_BOOT_SET);
+    assert_eq!(ours.code, 0, "beam_rt: exit {} stderr {}", ours.code, ours.err);
+    assert_eq!(
+        ours.out, BOOT_SET_OURS,
+        "this runtime's boot loads only the 22 preloaded modules, so neither `lists` nor \
+         `kernel` is loaded here"
+    );
+
+    let Some(oracle) = support::require_oracle("module_loaded") else {
+        return;
+    };
+    let theirs = oracle_eval(&oracle, EXPR_BOOT_SET);
+    assert_eq!(theirs.code, 0, "the oracle failed: stderr {}", theirs.err);
+    assert_eq!(
+        theirs.out, BOOT_SET_ORACLE,
+        "the recorded value must be the live oracle's answer"
+    );
+    eprintln!(
+        "module_loaded(lists|kernel|digraph|nonexistent_xyz): beam_rt={} oracle={} \
+         (the first two are in the oracle's `start.boot` primLoad batches and absent from \
+         this runtime's preloaded-only boot; the last two are loaded in neither)",
+        ours.out, theirs.out
+    );
+}
+
+/// This runtime's own loaded set is **self-consistent**: every module its `code:all_loaded/0`
+/// lists answers `true`, and the two boot-script names it has not loaded answer `false`. The
+/// oracle is self-consistent too and has both names loaded, so the two answers differ in
+/// exactly those two positions — the same divergence, measured without trusting either
+/// runtime's boot set.
+#[test]
+fn the_loaded_set_is_self_consistent_in_both() {
+    let ours = beam_rt_eval(EXPR_SELF_CONSISTENT);
+    assert_eq!(ours.code, 0, "beam_rt: exit {} stderr {}", ours.code, ours.err);
+    assert_eq!(
+        ours.out, "{[],false,false}",
+        "every module this runtime lists as loaded must answer `true`, and `lists`/`kernel` \
+         are not loaded here"
+    );
+
+    let Some(oracle) = support::require_oracle("module_loaded") else {
+        return;
+    };
+    let theirs = oracle_eval(&oracle, EXPR_SELF_CONSISTENT);
+    assert_eq!(theirs.code, 0, "the oracle failed: stderr {}", theirs.err);
+    assert_eq!(
+        theirs.out, SELF_CONSISTENT_ORACLE,
+        "the recorded value must be the live oracle's answer"
+    );
+}
+
+/// `lists`/`kernel` flip to `true` once this runtime genuinely loads them, and the whole
+/// 4-tuple then matches the oracle's answer for the same program: the `false` this runtime
+/// answers above is "not loaded here", never "unknown".
+#[test]
+fn the_two_boot_script_names_flip_when_this_runtime_loads_them() {
+    let ours = beam_rt_eval(EXPR_ENSURE_BOTH);
+    assert_eq!(ours.code, 0, "beam_rt: exit {} stderr {}", ours.code, ours.err);
+    assert_eq!(
+        ours.out, ENSURE_BOTH_EXPECTED,
+        "both names must be loaded and report `true` once `code:ensure_loaded/1` loaded them"
+    );
+
+    let Some(oracle) = support::require_oracle("module_loaded") else {
+        return;
+    };
+    let theirs = oracle_eval(&oracle, EXPR_ENSURE_BOTH);
+    assert_eq!(theirs.code, 0, "the oracle failed: stderr {}", theirs.err);
+    assert_eq!(
+        theirs.out, ENSURE_BOTH_EXPECTED,
+        "the oracle's answer for the same program must agree with this runtime's"
     );
 }

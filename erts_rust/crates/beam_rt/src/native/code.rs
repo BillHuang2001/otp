@@ -316,6 +316,41 @@ impl RuntimeContext<'_> {
         }
     }
 
+    /// `code:lib_dir(App, SubDir)`: the application directory of `App` joined with
+    /// `SubDir`, with **no** validation of `SubDir`.
+    ///
+    /// The oracle's guard (`code.erl:957-962`) is `is_atom(App), is_atom(SubDir)`: a
+    /// non-atom of either raises `function_clause`. The code server then joins the two
+    /// unconditionally (`code_server.erl:1041-1057`), so an unknown subdirectory is still
+    /// `<appdir>/<SubDir>` — it is never stat'ed — while an unknown **application** is
+    /// `{error, bad_name}`. Oracle-verified (OTP 29/erts-17.1): `code:lib_dir(kernel, ebin)`
+    /// ⇒ `…/kernel-11.0.4/ebin`, `code:lib_dir(kernel, bogus)` ⇒ `…/kernel-11.0.4/bogus`,
+    /// `code:lib_dir(nosuchapp, ebin)` ⇒ `{error,bad_name}`, `code:lib_dir(kernel, 42)` and
+    /// `code:lib_dir(42, ebin)` ⇒ a `function_clause` raise.
+    pub(super) fn code_lib_dir_2(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let app = *args.first().ok_or(BeamError::BadArg)?;
+        let sub = *args.get(1).ok_or(BeamError::BadArg)?;
+        let (Some(app), Some(sub)) = (self.atom_name(app), self.atom_name(sub)) else {
+            // The oracle's `is_atom/1` guards fail, so no clause matches: the bare-atom
+            // `function_clause` raise the engine reports for a genuine wrapper miss.
+            return Err(BeamError::Raise(beam_common::Raise::error(
+                beam_common::ExitReason::atom("function_clause"),
+            )));
+        };
+        self.runtime.code_server.add_system_paths()?;
+        match self.runtime.code_server.app_dir(&app) {
+            Some(dir) => {
+                let joined = dir.join(&sub);
+                self.charlist(&joined.display().to_string())
+            }
+            None => {
+                let tag = self.atom("error")?;
+                let reason = self.atom("bad_name")?;
+                terms::make_tuple(self, &[tag, reason])
+            }
+        }
+    }
+
     /// `code:root_dir/0`: the Erlang installation root the system booted from, as a
     /// string.
     ///
