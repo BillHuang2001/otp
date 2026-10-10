@@ -353,24 +353,38 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 ## Contract A.9 (build/bootstrapping) — status
 A.9 is the shallowest contract: its only differential coverage is boot/version **observability** — there
 is **no self-hosted build** (the Rust runtime does not compile and run itself).
-- **Boot path stopping point.** `beam_rt`'s boot (`src/boot/`, the boot node: `beam_rt/src/boot/CONTEXT.md`)
-  reads and executes the real `bootstrap/bin/start.boot` (OTP 30 / erts-17.1, 22 instructions). It runs
-  instructions 0–15 (every `primLoad` batch and the three `kernelProcess` directives, each driven to its
-  process's own registration) and **stops at instruction 16**, `{apply,{application,load,[{application,
-  stdlib,…}]}}`, with the typed `exit noproc` — no live registered `application_controller`.
-- **Outstanding blocker chain** (owner per link):
-  1. `application_controller:init/1` dies at `ets:new(ac_tab, [set,public,named_table,{read_concurrency,true}])`
-     — `beam_bifs`'s `src/ets.rs::parse_options` rejects every 2-tuple option except `{keypos,N}` ⇒ `badarg`
-     (**owner: `beam_bifs`**).
-  2. `add_env/2`'s `ets:insert(ac_tab, …)` fails because `beam_bifs`'s table-taking BIFs decode the table
-     argument with `ref_thing_id` only, so an **atom** `named_table` name is unreachable, and `ets:new`
-     returns a ref where the oracle returns the name atom (**owner: `beam_bifs`**).
-  3. instruction 13's `logger` cannot start: `logger_server:start_link/0` → `gen_server:start_link` →
-     `proc_lib:sync_start/2`'s `receive` sits in a **cross-module callee**, and the engine's synchronous
-     `Instr::CallExt` arm folds the callee's suspend into `beam_engine::blocked()` instead of suspending the
-     process (**owner: `beam_engine`**; seam pinned by `beam_rt/tests/proc_lib_start.rs`).
-  The boot-script reader/executor itself is complete; instructions 17–21 are unreached (instruction 12's
-  `heart` is benign — `heart:start/0` returns `ignore`).
+- **Boot path — completes.** `beam_rt`'s boot (`src/boot/`, the boot node: `beam_rt/src/boot/CONTEXT.md`)
+  reads and executes the real `bootstrap/bin/start.boot` (OTP 30 / erts-17.1, 22 instructions) **to
+  completion**, ending at the final `{progress,started}` (index 21). The former stop at instruction 16
+  (`{apply,{application,load,[{application,stdlib,…}]}}`, `exit noproc`) is closed: the `{kernelProcess,…}`
+  servers survive their short-lived directive process via the unlink in `beam_rt/src/boot/drive.rs`, and
+  the final `{apply,{c,erlangrc,[]}}` (index 20) is unblocked by the runtime-native `file_server_2` service
+  (`beam_rt/src/native/file_server.rs`). Pinned by
+  `beam_rt/tests/boot.rs::the_real_start_boot_runs_to_completion`,
+  `beam_rt/src/boot/bootscript.rs::the_real_start_boot_completes_through_execute_reporting`, and the CLI
+  test `beam_rt/tests/boot.rs::the_cli_runs_the_real_boot_script_to_completion` (exit 0, empty
+  stdout/stderr). The differential case `boot/proc_lib_start_link_blocks_the_boot_path` now **agrees** (it
+  is no longer in `tools/differential/known-gaps.txt`).
+- **Remaining A.9 gaps (fidelity, not boot-completion):**
+  1. **No self-hosted build.** The Rust runtime does not compile/run itself; the compiler bootstrap
+     (Stage 2, `../lib/compiler`) is not wired into `beam_rt`.
+  2. **No live `code_server`/`erl_prim_loader`/`logger`/`application_controller` process** on a plain
+     runtime. `code:*` (except `code:load_file/1`), `init:*` (except `init:boot/1`,`init:stop/0,1`,
+     `init:restart/0`), and the `application:*` queries are served by a native floor
+     (`beam_rt/src/native/{code,init,application}.rs`). On the `-boot` path the real
+     `application_controller:start/1` IS spawned and stays registered (instruction 14).
+  3. **`logger` never registers**: instruction 13's `{kernelProcess,logger,{logger_server,start_link,[]}}`
+     spawns but does not reach its registration (`beam_rt/src/boot/bootscript.rs` comment; the boot
+     completes without it). `error_logger` has no process (only `error_logger:warning_map/0` via the
+     `RuntimeHooks` bridge).
+  4. **`init:get_arguments/0` omits the automatic `root`/`bindir`/`progname`/`home`** (they ARE served by
+     `init:get_argument/1`, which the boot chain uses).
+  5. **The native `file_server_2` is not the real Erlang `file_server`** — a mailbox-drained
+     `beam_process::Process` (`beam_rt/src/native/file_server.rs`); `{get_until,…}` and
+     `file:read_line/1` (`{get_line,…}`) are the typed `unsupported` gaps.
+  6. **Latent:** the nested `RuntimeContext` blocking pump (`beam_rt/src/context/mod.rs`) loops until the
+     machine returns or a pump reports 0, with no wall-clock cap (the `DRIVE_DEADLINE` bounds only the
+     outer boot drive); a perpetually runnable boot-spawned process would not be bounded.
 
 ## Known Structural Debt (candidates for the next pass)
 - The map/bitstring/refc handoffs above are only partly adopted: `beam_codec` forwards to `beam_term`
