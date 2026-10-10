@@ -450,6 +450,30 @@ pub trait ExecutionContext {
         Err(crate::error::unsupported("send_message"))
     }
 
+    /// `send`: deliver `message` to the pid/port term `to`, handing over the
+    /// **source off-heap table** the receiver-side copy needs to resolve any
+    /// engine-built off-heap (refc) binary in `message`.
+    ///
+    /// `src_binaries` are the payload handles of the machine that built `message`
+    /// (the in-flight `Machine::refc_binaries()` slice): a `bs_init_writable` /
+    /// `bs_create_bin` result over `beam_term::refc::ERL_ONHEAP_BINARY_LIMIT` bytes
+    /// is stored off the process heap, and the copy engine resolves such a term by
+    /// its data pointer through the copy's **source** off-heap table. The default
+    /// body forwards to [`send_message`](ExecutionContext::send_message) and
+    /// discards `src_binaries`, so every existing implementor (including all test
+    /// contexts and `MinimalContext`) compiles and behaves exactly as today --
+    /// a host with no off-heap payloads sees the documented degradation (an
+    /// engine-built off-heap binary in a message is refused by the receiver copy).
+    fn send_message_with_off_heap(
+        &mut self,
+        to: Eterm,
+        message: Eterm,
+        src_binaries: &[beam_alloc::RefcBinary],
+    ) -> Result<()> {
+        let _ = src_binaries;
+        self.send_message(to, message)
+    }
+
     /// `loop_rec`: the candidate at the current mailbox scan position, `Ok(None)`
     /// when the scan/mailbox is exhausted.
     ///

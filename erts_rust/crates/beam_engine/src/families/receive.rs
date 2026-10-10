@@ -46,9 +46,9 @@
 //!   matching and no term inspection of messages.
 //! - Every mailbox operation that involves a *time* or a *position* is delegated
 //!   to the host through the [`ExecutionContext`] receive seam
-//!   ([`ExecutionContext::send_message`], `receive_next`, `receive_skip`,
-//!   `receive_remove`, `receive_reset`, `receive_marker_*`). The host owns the
-//!   mailbox and the scan position; the engine keeps no mailbox state.
+//!   ([`ExecutionContext::send_message_with_off_heap`], `receive_next`,
+//!   `receive_skip`, `receive_remove`, `receive_reset`, `receive_marker_*`). The
+//!   host owns the mailbox and the scan position; the engine keeps no mailbox state.
 //! - `recv_marker_*` terms are **opaque**: a marker produced by
 //!   `recv_marker_reserve` is stored in a register and handed back verbatim, and
 //!   only a separate *reference* term reaches `recv_marker_use`/`recv_marker_clear`.
@@ -110,7 +110,7 @@ pub(crate) fn exec(
         Instr::Send => {
             let to = read_operand(machine, ctx, &Operand::X(0))?;
             let message = read_operand(machine, ctx, &Operand::X(1))?;
-            match ctx.send_message(to, message) {
+            match ctx.send_message_with_off_heap(to, message, machine.refc_binaries()) {
                 Ok(()) => {
                     machine.set_x(0, message)?;
                     Ok(Some(Step::Next))
@@ -302,6 +302,8 @@ mod tests {
         next: Option<Eterm>,
         /// What `send_message` receives.
         sent: Option<(Eterm, Eterm)>,
+        /// The `data_ptr()` of every off-heap binary handle the send seam forwards.
+        sent_off_heap: Vec<usize>,
         /// The error `send_message` fails with, if any.
         send_error: Option<BeamError>,
         /// The opaque marker `receive_marker_reserve` hands back.
@@ -355,6 +357,18 @@ mod tests {
             }
         }
 
+        fn send_message_with_off_heap(
+            &mut self,
+            to: Eterm,
+            message: Eterm,
+            src_binaries: &[beam_alloc::RefcBinary],
+        ) -> Result<()> {
+            // Record the handles the `send` arm forwarded, then behave exactly as
+            // the default body: forward to `send_message` (so the observable
+            // mailbox call and its error path are unchanged).
+            self.sent_off_heap = src_binaries.iter().map(|b| b.data_ptr() as usize).collect();
+            self.send_message(to, message)
+        }
         fn receive_next(&mut self) -> Result<Option<Eterm>> {
             self.calls.push("receive_next");
             Ok(self.next)
@@ -422,6 +436,52 @@ mod tests {
         assert_eq!(machine.x(0), Some(make_small(42)));
     }
 
+    #[test]
+    fn send_forwards_the_machines_off_heap_binary_handles() {
+        // The `send` arm hands the receiving copy the machine's off-heap payload
+        // handles (`Machine::refc_binaries`) so an engine-built refc binary in the
+        // message can be resolved by the copy's *source* off-heap table.
+        let module = Module::default();
+        let labels = LabelMap::new();
+        let mut machine = Machine::with_max_register(4);
+        machine.set_x(0, make_small(7)).unwrap();
+        machine.set_x(1, make_small(42)).unwrap();
+        let first = machine.alloc_refc_binary(&[1, 2, 3, 4, 5]).unwrap();
+        let second = machine.alloc_refc_binary(&[6, 7, 8]).unwrap();
+        let mut ctx = StubCtx::new();
+
+        let step = exec(&mut machine, &module, &labels, &Instr::Send, 0, 0, &mut ctx).unwrap();
+
+        assert_eq!(step, Some(Step::Next));
+        // Exactly the machine's handles, in build order (same data pointers).
+        assert_eq!(ctx.sent_off_heap, vec![first as usize, second as usize]);
+        assert_eq!(
+            ctx.sent_off_heap,
+            machine
+                .refc_binaries()
+                .iter()
+                .map(|b| b.data_ptr() as usize)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn send_forwards_an_empty_handle_slice_without_off_heap_binaries() {
+        // The negative baseline: a machine that built no off-heap binary forwards an
+        // empty slice (the documented degradation is a receiver-copy concern, not a
+        // send-arm one).
+        let module = Module::default();
+        let labels = LabelMap::new();
+        let mut machine = Machine::with_max_register(4);
+        machine.set_x(0, make_small(7)).unwrap();
+        machine.set_x(1, make_small(42)).unwrap();
+        let mut ctx = StubCtx::new();
+
+        let step = exec(&mut machine, &module, &labels, &Instr::Send, 0, 0, &mut ctx).unwrap();
+
+        assert_eq!(step, Some(Step::Next));
+        assert!(ctx.sent_off_heap.is_empty());
+    }
     #[test]
     fn send_failure_propagates_without_a_catch_frame() {
         let module = Module::default();
