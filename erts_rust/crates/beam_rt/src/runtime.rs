@@ -475,6 +475,10 @@ pub struct Runtime {
     /// `None` before any script was read/executed — the source of `init:script_id/0`. Set
     /// by [`Runtime::boot_from_script`] / [`Runtime::boot_from_script_reporting`].
     boot_script_id: Option<(String, String)>,
+    /// The path of the OTP boot script this runtime has **loaded**, or `None` before any
+    /// script was read/executed. Recorded alongside [`Runtime::boot_script_id`] so
+    /// [`Runtime::restart`] can re-run the very script the system booted from.
+    boot_script_path: Option<PathBuf>,
 }
 
 impl Runtime {
@@ -493,8 +497,11 @@ impl Runtime {
     pub fn new(config: RuntimeConfig) -> Result<Runtime> {
         let mut code_server = CodeServer::new();
         boot::seed_core_atoms(code_server.atoms_mut());
+        // The configured `-pa`/`-pz` directories are *boot-time default* code-path entries: a
+        // later `init:restart/0` resets the code path to exactly them plus the system `ebin`
+        // directories (see [`Runtime::restart`] and [`CodeServer::reset_paths_to_defaults`]).
         for dir in &config.code_paths {
-            code_server.add_path(dir.clone());
+            code_server.add_default_path(dir.clone());
         }
         let signals = SignalAtoms::from_table(code_server.atoms_mut());
         let mut processes = ProcessTable::new(signals);
@@ -616,6 +623,7 @@ impl Runtime {
             open_files: HashMap::new(),
             file_services,
             boot_script_id: None,
+            boot_script_path: None,
         })
     }
 
@@ -1196,8 +1204,10 @@ impl Runtime {
         self.boot_if_needed()?;
         let script = bootscript::read(path.as_ref())?;
         // Record the script's real `{Name, Vsn}` header before executing it, so
-        // `init:script_id/0` can answer it even if execution later stops early.
+        // `init:script_id/0` can answer it even if execution later stops early — and record
+        // the path, so `init:restart/0` can re-run the very script the system booted from.
         self.boot_script_id = Some((script.name.clone(), script.vsn.clone()));
+        self.boot_script_path = Some(path.as_ref().to_path_buf());
         bootscript::execute(self, &script)?;
         Ok(script)
     }
@@ -1238,8 +1248,71 @@ impl Runtime {
             }
         };
         self.boot_script_id = Some((script.name.clone(), script.vsn.clone()));
+        self.boot_script_path = Some(path.as_ref().to_path_buf());
         bootscript::execute_reporting(self, &script)
     }
+
+    /// The path of the boot script this runtime has **loaded**, if any — the source of
+    /// [`Runtime::restart`]'s re-run (and the file whose header `init:script_id/0` reports).
+    ///
+    /// `None` until a script has been read through [`Runtime::boot_from_script`] /
+    /// [`Runtime::boot_from_script_reporting`] — in particular on the plain `-eval`/`run`
+    /// path, which boots the preloaded set only.
+    pub fn boot_script_path(&self) -> Option<&Path> {
+        self.boot_script_path.as_deref()
+    }
+
+    /// The **in-process reboot** behind `init:restart/0`
+    /// (`erts/preloaded/src/init.erl:492-518,937-954`).
+    ///
+    /// The oracle's `restart/0` only sends `init ! {stop,restart}` and answers `ok` at once;
+    /// it is the `init` process that takes the applications down, unloads code, closes the
+    /// ports and boots again. This runtime has no live `init` process, so the reboot is
+    /// performed here, reaching the same **observable** end state — the node is booted again
+    /// and keeps answering:
+    ///
+    /// 1. the code path is reset to its **boot-time default**
+    ///    ([`CodeServer::reset_paths_to_defaults`]): the `-pa`/`-pz` directories the runtime
+    ///    was configured with plus the system `ebin` directories, dropping whatever a boot
+    ///    script's `{path, …}` directive or a later [`Runtime::add_code_path`] appended;
+    /// 2. the boot sequence is re-run **forcibly** — the `booted` flag is what makes
+    ///    [`Runtime::boot`] idempotent, so it is cleared first — re-establishing the whole
+    ///    preloaded set;
+    /// 3. the boot script this runtime loaded, if any, is executed again
+    ///    ([`Runtime::boot_from_script`]), exactly as the oracle's `do_restart/3` re-runs
+    ///    `boot(Start, Flags, Args)` (`init.erl:951-954`).
+    ///
+    /// # Fidelity limit (honest, not hidden)
+    ///
+    /// The oracle's restart first **clears the system** — it takes every application down,
+    /// unloads all code and closes every port (`init.erl:929-962`). This runtime models no
+    /// application-owned process or port to take down, and never unloads a module, so that
+    /// teardown is *approximated* by re-running the boot sequence: the module cache and any
+    /// live boot-spawned process are left in place. What a caller can observe — the node is
+    /// booted again, the code path is back to its default and `init:*`/`code:*` still answer
+    /// — is therefore reproduced, with the documented difference that re-running the real
+    /// `start.boot` re-runs its `{kernelProcess, …}` directives against servers that are
+    /// **already** registered (a re-registration is the process table's `badarg`, which the
+    /// boot drive tolerates; the existing server keeps the name).
+    ///
+    /// A failure at any step is reported as its typed error — never a silently half-restarted
+    /// runtime.
+    ///
+    /// # Errors
+    ///
+    /// [`Runtime::boot`]'s errors (an unresolvable system installation, an unparsable
+    /// preloaded `.beam`) and [`Runtime::boot_from_script`]'s (a script that cannot be read,
+    /// parsed or executed).
+    pub fn restart(&mut self) -> Result<()> {
+        self.code_server.reset_paths_to_defaults();
+        self.booted = false;
+        self.boot()?;
+        if let Some(path) = self.boot_script_path.clone() {
+            self.boot_from_script(path)?;
+        }
+        Ok(())
+    }
+
     /// **The slice.** Loads `path`, caches the module, runs `function/arity` with
     /// `args` and returns `x(0)`.
     ///

@@ -394,3 +394,110 @@ fn init_get_arguments_omits_an_unavailable_automatic_flag() {
     );
     assert!(our_flags.contains(&"noshell".to_string()), "{our_flags:?}");
 }
+
+// ---------------------------------------------------------------------------------------
+// init:restart/0 and init:boot/1
+// ---------------------------------------------------------------------------------------
+
+/// The canonical ETF image of `{script, {"T","1"}, [{progress,started}]}` — a well-formed boot
+/// script (byte-for-byte what the oracle's `term_to_binary/1` produces for that term) whose only
+/// directive is informational, so it always executes to the end.
+const MINIMAL_SCRIPT: &[u8] = &[
+    131, 104, 3, 119, 6, b's', b'c', b'r', b'i', b'p', b't', 104, 2, 107, 0, 1, b'T', 107, 0, 1,
+    b'1', 108, 0, 0, 0, 1, 104, 2, 119, 8, b'p', b'r', b'o', b'g', b'r', b'e', b's', b's', 119, 7,
+    b's', b't', b'a', b'r', b't', b'e', b'd', 106,
+];
+
+/// Writes [`MINIMAL_SCRIPT`] to a fresh `$TMPDIR/<unique>/mini.boot`; returns the file path and
+/// its **suffix-less** stem (the value a `-boot` flag takes — `init` appends `.boot` itself,
+/// `init.erl:1265-1269`).
+fn minimal_script() -> (PathBuf, PathBuf) {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "beam_rt_native_init_script.{}.{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a scratch directory");
+    let stem = dir.join("mini");
+    let path = stem.with_extension("boot");
+    std::fs::write(&path, MINIMAL_SCRIPT).expect("the fixture script");
+    (path, stem)
+}
+
+/// `init:restart/0` reboots the node **in place** and answers the atom `ok`
+/// (`erts/preloaded/src/init.erl:494,514,937-954`); the node is booted again and still answers
+/// `init:*`/`code:*` afterwards.
+///
+/// # No oracle comparison (deliberate)
+///
+/// The oracle's `restart/0` really takes the system down and re-boots, and a bare
+/// `erl -noshell -eval 'init:restart()'` **hangs** under a bounded probe (the pre-restart
+/// `-s init stop` has been consumed, and the restarted node runs no request to stop), so the
+/// program cannot be compared against the live `erl`. This test therefore pins **this**
+/// runtime's observable behaviour — the return value, the boot status and a live
+/// `code:get_path/0` after the reboot — which is the contract a caller depends on.
+///
+/// This runtime's floor performs the reboot synchronously (no live `init` process exists);
+/// the mechanism's honest fidelity limit is documented on `Runtime::restart`.
+#[test]
+fn init_restart_reboots_the_node_and_keeps_it_answering() {
+    let expr = "io:format(\"~p~n\", [catch init:restart()]), \
+                io:format(\"~p~n\", [element(1, init:get_status())]), \
+                io:format(\"~p~n\", [is_list(code:get_path())]), halt(0).";
+    let ours = beam_rt(expr);
+    assert_eq!(ours.code, 0, "beam_rt: {}", ours.err);
+    assert_eq!(ours.out.trim(), "ok\nstarting\ntrue", "beam_rt: {}", ours.err);
+}
+
+/// `init:boot(BootArgs)` runs the boot script named by the `-boot <Script>` flag
+/// (`init.erl:585-597,1257-1269`) — resolved with the very rule the CLI's `-boot FILE` action
+/// uses, so the two can never disagree.
+///
+/// The real `boot/1` **never returns** (it registers as `init` and enters its receive loop); this
+/// runtime's floor runs the boot and answers `ok`, so the caller's expression continues — which is
+/// what this program observes: the boot answered `ok` and the node still serves `code:get_path/0`.
+#[test]
+fn init_boot_runs_the_script_named_by_the_boot_flag() {
+    let (path, stem) = minimal_script();
+    let stem = stem.display();
+    let expr = format!(
+        "io:format(\"~p~n\", [catch init:boot([<<\"-boot\">>, <<\"{stem}\">>])]), \
+         io:format(\"~p~n\", [is_list(code:get_path())]), halt(0)."
+    );
+    let ours = beam_rt(&expr);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(ours.code, 0, "beam_rt: {}", ours.err);
+    assert_eq!(ours.out.trim(), "ok\ntrue", "beam_rt: {}", ours.err);
+}
+
+/// A `-boot` value whose script cannot be resolved is that resolution's typed
+/// `cannot get bootfile …` error — never a silent boot of some other script. The `catch` proves
+/// it is raised in the caller (catchable), and the answer is *not* `ok`.
+#[test]
+fn init_boot_of_an_unresolvable_script_never_silently_boots() {
+    let expr = "io:format(\"~p~n\", [catch init:boot([<<\"-boot\">>, \
+                <<\"no-such-script-beefcafe\">>])]), halt(0).";
+    let ours = beam_rt(expr);
+    assert_eq!(ours.code, 0, "beam_rt: {}", ours.err);
+    assert!(
+        !ours.out.trim_start().starts_with("ok"),
+        "an unresolvable script is reported, not silently booted: {:?}",
+        ours.out
+    );
+}
+
+/// A `BootArgs` that is not a list of binaries is `badarg` (`init.erl:585-587`), raised in the
+/// caller — so a `try` catches it and the program goes on to exit 0.
+#[test]
+fn init_boot_rejects_a_non_byte_list_argument_with_badarg() {
+    for expr in [
+        "io:format(\"~p~n\", [try init:boot(7) catch error:badarg -> caught end]), halt(0).",
+        "io:format(\"~p~n\", [try init:boot(\"-boot\") catch error:badarg -> caught end]), halt(0).",
+    ] {
+        let ours = beam_rt(expr);
+        assert_eq!(ours.code, 0, "beam_rt `{expr}`: {}", ours.err);
+        assert_eq!(ours.out.trim(), "caught", "beam_rt `{expr}`: {}", ours.err);
+    }
+}

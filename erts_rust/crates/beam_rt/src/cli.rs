@@ -1203,6 +1203,25 @@ fn resolve_boot_file(value: &str, root: Option<&Path>) -> Result<PathBuf> {
     )))
 }
 
+/// Resolves a boot-script **value** the way `init`'s `get_boot/2` does, against the runtime's
+/// own Erlang root ([`boot_file_root`]).
+///
+/// This is the one seam shared by the CLI's `-boot FILE` action ([`run_boot_script`]) and the
+/// runtime-native floor's `init:boot/1` (`../beam_rt/src/native/init.rs`) — one resolution
+/// rule, so the two can never drift.
+///
+/// The runtime must be **booted** for `$ROOT` (and the `<Root>/bin` fallback) to resolve, since
+/// `<Root>` is derived from the system `ebin` directories on the code path; a caller on a
+/// floor path boots first.
+///
+/// # Errors
+///
+/// [`resolve_boot_file`]'s typed `cannot get bootfile …` error when a `$ROOT/…` value has no
+/// resolvable root or both candidates are missing.
+pub(crate) fn resolve_boot_file_for(runtime: &Runtime, value: &str) -> Result<PathBuf> {
+    resolve_boot_file(value, boot_file_root(runtime).as_deref())
+}
+
 /// The `-s Mod Func [Args…]` / `-run Mod Func [Args…]` action: the result is
 /// **discarded** (real `erl` semantics), so a failure is still reported but a value is
 /// not printed.

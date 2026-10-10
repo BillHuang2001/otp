@@ -37,6 +37,8 @@
 //! | `init:get_plain_arguments/0` | the (always empty) plain-argument list — the CLI models no plain arguments |
 //! | `init:get_arguments/0` | the whole command line, in order, from `RuntimeConfig::init_args`, preceded by the emulator's own automatic flags (`root`/`bindir`/`progname`/`home`) |
 //! | `init:stop/0,1` | terminates the **node**: records the exit status (or raises the crash-dump slogan / `badarg`) and answers `ok` without interrupting the caller |
+//! | `init:restart/0` | reboots the node **in place** (resets the code path to its boot default, re-runs the boot sequence and the loaded boot script) and answers `ok` (`init.erl:492-518,937-954`) |
+//! | `init:boot/1` | the boot **entry point**: parses the `-boot <Script>` flag out of the byte-list argument, resolves it exactly as the CLI's `-boot FILE` does and executes the script (`init.erl:585-597`) |
 //! | `os:cmd/1` | runs a command through `/bin/sh` and returns its stdout — the host's own process spawn |
 //! | `code:get_path/0`, `code:all_loaded/0`, `code:which/1`, `code:is_loaded/1`, `code:is_sticky/1,2`, `code:ensure_loaded/1`, `code:load_file/1`, `code:lib_dir/0,1`, `code:root_dir/0` | read the runtime's own [`CodeServer`](crate::CodeServer) state (the code path, the loaded/preloaded module set, the installation) |
 //! | `application:get_env/1,2,3`, `application:get_all_env/1`, `application:get_key/2`, `application:loaded_applications/0`, `application:which_applications/0` | read the runtime's own **application-config view** — the `.app` resource files of the OTP applications its code path resolves |
@@ -158,6 +160,8 @@ impl RuntimeContext<'_> {
             ("init", "get_arguments", 0) => Some(self.get_arguments()),
             ("init", "stop", 0) => Some(self.stop_0()),
             ("init", "stop", 1) => Some(self.stop_1(args)),
+            ("init", "restart", 0) => Some(self.restart_0()),
+            ("init", "boot", 1) => Some(self.boot_1(args)),
             ("init", "get_status", 0) => Some(self.get_status()),
             ("init", "script_id", 0) => Some(self.script_id_0()),
             ("os", "cmd", 1) => Some(self.os_cmd(args)),
