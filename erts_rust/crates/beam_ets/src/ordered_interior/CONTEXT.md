@@ -22,8 +22,11 @@ Term order is never re-implemented here (workspace Prevent-Duplication rule).
 ## Invariants (asserted by `Tree::check_invariants`, test-only)
 1. A branch holds `keys.len() == children.len()`, separators strictly ascending in `cmp_arith`.
 2. `separator[i] == max(children[i])` — the *exact* subtree maximum, not a lower bound.
-3. Every node below the root holds within `[MIN_OCCUPANCY=16, ORDER=32]` entries/children; the root
-   leaf may be empty, a root branch keeps `>= 2` children.
+3. Every node holds **at most `ORDER=32`** entries/children (the fan-out that bounds node size and
+   makes a split amortized `O(1)` — one split per `ORDER/2` inserts), and every node below the root
+   holds within `[MIN_OCCUPANCY=16, ORDER=32]`; the root leaf may be empty, a root branch keeps `>= 2`
+   children. Both arms assert the upper bound explicitly, so an unbounded-node-size regression fails
+   `check_invariants` loudly.
 4. All leaves are at the same depth. 5. The leaf chain visits every leaf exactly once, left to right.
 
 ## Design Decisions
