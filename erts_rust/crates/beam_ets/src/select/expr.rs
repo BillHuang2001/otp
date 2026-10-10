@@ -298,6 +298,32 @@ pub enum Expr {
     /// atom); the pattern-only builders whose body is `[true]` (`match_delete`)
     /// use it so the deletion test does not depend on the `AtomTable`.
     Bool(bool),
+    /// `ceil/1`.
+    Ceil(Box<Expr>),
+    /// `floor/1`.
+    Floor(Box<Expr>),
+    /// `max/2` — the larger operand by **term order** (`cmp_arith`).
+    Max(Box<Expr>, Box<Expr>),
+    /// `min/2` — the smaller operand by **term order** (`cmp_arith`).
+    Min(Box<Expr>, Box<Expr>),
+    /// `binary_part/2` — the second operand is a **runtime** `{Pos, Len}` 2-tuple.
+    BinaryPart2(Box<Expr>, Box<Expr>),
+    /// `binary_part/3`.
+    BinaryPart3(Box<Expr>, Box<Expr>, Box<Expr>),
+    /// `is_record/3`.
+    IsRecord3(Box<Expr>, Box<Expr>, Box<Expr>),
+    /// `is_function/2`.
+    IsFunction2(Box<Expr>, Box<Expr>),
+    /// `is_integer/3`.
+    IsInteger3(Box<Expr>, Box<Expr>, Box<Expr>),
+    /// `node/0`.
+    Node0,
+    /// `node/1`.
+    Node1(Box<Expr>),
+    /// `xor/2`.
+    Xor(Box<Expr>, Box<Expr>),
+    /// `bnot/1`.
+    Bnot(Box<Expr>),
 }
 
 /// The result of evaluating a guard or body expression.
