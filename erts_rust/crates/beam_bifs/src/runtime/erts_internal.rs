@@ -141,8 +141,22 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     runtime_bif!(reg, "erts_internal", ets_lookup_binary_info, 2);
     reg.register("erts_internal", "ets_raw_first", 1, ets_raw_first_1);
     reg.register("erts_internal", "ets_raw_next", 2, ets_raw_next_2);
+    // `ets_super_user/1` is a typed gap because the state it mutates lives outside
+    // this family: the C (`../../erts/emulator/beam/erl_db.c:4717-4727`) takes a
+    // boolean, sets or clears `F_ETS_SUPER_USER` on the *calling process* and returns
+    // `ok`; the flag is then consumed by the ETS access gate in `src/ets/*`. This
+    // runtime has no per-process super-user concept for that gate to consult, so a
+    // faithful `ok` would be a fabricated value.
     runtime_bif!(reg, "erts_internal", ets_super_user, 1);
     runtime_bif!(reg, "erts_internal", garbage_collect, 1);
+    // `gather_alloc_histograms/1` and `gather_carrier_info/1` are typed gaps because
+    // the data they render is unreachable from a BIF: the C
+    // (`../../erts/emulator/beam/erl_bif_info.c:5686-5738`) validates a 6-tuple
+    // argument and then walks the allocator/carrier internals (`erts_alcu_gather_*`,
+    // the `ERTS_ALC_A_MIN..MAX` allocator-name atoms). `beam_alloc` exposes carriers
+    // but no public allocator-name list and no carrier-statistics walk, so a valid
+    // argument has no answer to give here — only `beam_rt` (which owns the allocator
+    // configuration) can serve them through the seam.
     runtime_bif!(reg, "erts_internal", gather_alloc_histograms, 1);
     runtime_bif!(reg, "erts_internal", gather_carrier_info, 1);
     runtime_bif!(reg, "erts_internal", get_creation, 0);

@@ -77,6 +77,10 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     crate::runtime::runtime_bif!(reg, "erts_debug", lcnt_collect, 0);
     crate::runtime::runtime_bif!(reg, "erts_debug", lcnt_control, 1);
     crate::runtime::runtime_bif!(reg, "erts_debug", lcnt_control, 2);
+    // `map_info/1` summarises a HAMT map's node interior (depth, arrays, collisions,
+    // bitmaps, leafs); walking that interior is confined to `crate::access`, this
+    // crate's `#[allow(unsafe_code)]` term-access module, and no such accessor exists
+    // yet — so the key is a typed gap rather than a fabricated summary.
     crate::runtime::runtime_bif!(reg, "erts_debug", map_info, 1);
     crate::runtime::runtime_bif!(reg, "erts_debug", set_internal_state, 2);
     // A gap on purpose — the sharing it measures is unrepresentable here (see the
