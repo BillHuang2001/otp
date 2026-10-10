@@ -71,7 +71,7 @@
 use beam_alloc::Heap;
 use beam_common::Result;
 use beam_engine::context::RootSet;
-use beam_gc::CollectionKind;
+use beam_gc::{Collection, CollectionKind};
 use beam_loader::{Instr, Module};
 use beam_process::{Process, ProcessTable, MAX_REG};
 use beam_term::Eterm;
@@ -347,6 +347,41 @@ pub(crate) fn scatter_roots_full(process: &Process, roots: &mut RootSet<'_>) -> 
     true
 }
 
+/// The action the heap-admission point takes once it is committed to collecting: the
+/// collector's on-demand **growth** seam ([`Process::ensure_capacity`]) whenever the
+/// process's own heap-size policy can actually reach `heap_need` — a plain
+/// [`Process::collect`] otherwise.
+///
+/// The difference is that a collection sizes the nursery from what it left alive in it, not
+/// from what the caller is about to allocate, so a request larger than the nursery could
+/// never be met by collecting alone: the allocation would fall back to the pointer-stable
+/// arena ([`alloc_words`]) on every round. Growing the now-empty nursery to cover the
+/// request is what keeps such a workload on the process's own — reclaimable — heap.
+///
+/// `Process::ensure_capacity` fails **fast** — before it collects — when
+/// `HeapPolicy::next_words(need, 0) < need`, i.e. when a bounded policy (`+hmax N`) cannot
+/// reach the request at all. That case keeps the pre-growth behaviour exactly: the
+/// collection still runs, and the allocation falls back to the arena — never a fabricated
+/// collection, never a new failure mode.
+///
+/// Both heap-admission doors ([`ensure_heap`] and [`ensure_heap_full`]) take this action, so
+/// the narrow and the full-root door can never drift apart on it.
+///
+/// # Errors
+///
+/// The collection's own error. The caller halts collection for that process
+/// ([`Runtime::halt_process_gc`](crate::runtime::gc)) and reports success, leaving the
+/// allocation to fall back to the arena exactly as it did before.
+fn collect_or_grow(process: &mut Process, heap_need: u32) -> Result<Collection> {
+    let need = heap_need as usize;
+    let growable = process.collector().policy().next_words(need, 0) >= need;
+    if growable {
+        process.ensure_capacity(need)
+    } else {
+        process.collect()
+    }
+}
+
 /// The engine's heap-admission point for a scheduled slice: collect the running process's
 /// own heap when it cannot satisfy `heap_need` more words — **growing** it when the
 /// request is larger than the nursery — or when a `garbage_collect` BIF asked for one.
@@ -473,26 +508,10 @@ pub(crate) fn ensure_heap(
     }
 
     // The action: a plain collection, or — when the process's own heap-size policy can
-    // actually reach `heap_need` — the collector's on-demand **growth** seam
-    // ([`Process::ensure_capacity`]), which runs exactly the same collection and then sizes
-    // the now-empty nursery to fit the request. Without this step a request larger than the
-    // nursery could never be met by collecting alone: the allocation would fall back to the
-    // pointer-stable arena ([`alloc_words`]) on every round instead of being reclaimed with
-    // the heap it belongs to.
-    //
-    // `Process::ensure_capacity` fails **fast** — before it collects — when
-    // `HeapPolicy::next_words(need, 0) < need`, i.e. when a bounded policy (`+hmax N`) cannot
-    // reach the request at all. That case keeps today's behaviour exactly: the collection
-    // still runs, and the allocation falls back to the arena — never a fabricated
-    // collection, never a new failure mode. A genuine collection (or growth) failure still
-    // halts only this process's collection, exactly as before.
-    let need = heap_need as usize;
-    let growable = process.collector().policy().next_words(need, 0) >= need;
-    let action = if growable {
-        process.ensure_capacity(need)
-    } else {
-        process.collect()
-    };
+    // actually reach `heap_need` — the collector's on-demand **growth** seam. See
+    // [`collect_or_grow`] for why the growth is what keeps a request larger than the nursery
+    // on the process's own reclaimable heap, and for the bounded-policy fallback.
+    let action = collect_or_grow(process, heap_need);
     match action {
         Ok(collection) => {
             runtime.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
@@ -525,6 +544,16 @@ pub(crate) fn ensure_heap(
 /// occupancy test and the "committed" request consume — and only the root hand-off differs:
 /// it publishes and scatters `roots` (every x slot, the whole stack, the whole FR file)
 /// through [`publish_roots_full`]/[`scatter_roots_full`] instead of a `live`-bounded x prefix.
+///
+/// # Growth
+///
+/// This door takes the **same action** as the narrow one ([`collect_or_grow`]): the
+/// collector's on-demand growth seam whenever the process's own heap-size policy can reach
+/// `heap_need`, a plain collection otherwise. A request larger than the nursery therefore
+/// grows the (now-empty) nursery to fit it instead of leaving every round to the
+/// pointer-stable arena, and a bounded policy (`+hmax N`) that cannot reach the request
+/// keeps the pre-growth behaviour — the collection still runs and the allocation falls back
+/// to the arena. See [`collect_or_grow`] for the full rationale.
 ///
 /// # Why the whole root set, not the engine's `live` hint
 ///
@@ -600,7 +629,10 @@ pub(crate) fn ensure_heap_full(
         return Ok(());
     }
 
-    match process.collect() {
+    // The action is the same as the narrow door's: collect, or grow the nursery to fit a
+    // request the post-collection nursery cannot hold. See [`collect_or_grow`].
+    let action = collect_or_grow(process, heap_need);
+    match action {
         Ok(collection) => {
             runtime.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
         }
