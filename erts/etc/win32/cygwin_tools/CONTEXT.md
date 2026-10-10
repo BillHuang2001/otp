@@ -32,11 +32,10 @@ Top level (all `#!/bin/sh` bash scripts, all shadow the real tools via `PATH`):
 - **`emu_cc.sh` exists because `cl.exe` cannot compile computed gotos**: for `TARGET=win32` non-debug builds `erts/emulator/Makefile.in` uses `EMU_CC=@EMU_CC@` (the `emu_cc.sh` found in `PATH`) for `beam_emu.c`; it compiles with mingw `gcc` and then runs `coffix.exe` to make the object linkable by MSVC's linker. See `make/autoconf/otp.m4` (`LM_FIND_EMU_CC`).
 - **`coffix.c`**: gcc/mingw objects put the virtual size in the COFF section's `PhysicalAddress` field with raw size 0, which confuses the MS linker when sizing `.bss`; `coffix -e` moves the value into `SizeOfRawData` so mixed gcc/MSVC objects link.
 - **Three near-identical copies** (`cygwin_tools`, `../msys_tools`, `../wsl_tools`) instead of one script with runtime detection: each tree hardcodes its environment's path-conversion tool (`cygpath` vs `msys2win_path.sh`/`win2msys_path.sh` vs `wslpath`). The duplication is real — there is no shared include.
-- `cc_wrap.c` / `ld_wrap.c` (`vc/`) are C re-implementations of `cc.sh`/`ld.sh` from the R13B03 era; they are not referenced by any Makefile or by `otp_build` and are not built. Treat them as dead prototypes.
 
 ## Known Issues / Gotchas
 - **Near-duplicate trees**: `../msys_tools/` (MSYS2) and `../wsl_tools/` (WSL) contain the same script set with different path translation (see `./CONTEXT.md` siblings). A functional change here almost always has to be mirrored into both, and consumed from `../../common/Makefile.in` / `otp_build` — check those callers before changing an interface.
-- Observed divergences: `cygwin_tools` has both `vc/` and `mingw/` plus `vc/cc_wrap.c`/`vc/ld_wrap.c`; `msys_tools` has only `vc/` plus `msys2win_path.sh`/`win2msys_path.sh`; `wsl_tools` has only `vc/` plus `SetupWSLcross.bat` (and its `w32_path.sh` is heavily rewritten around `wslpath`/`//wsl$` UNC paths). `msys_tools/vc/cc.sh` is the only variant that does *not* convert paths itself (it relies on MSYS2, plus `MSYS2_ARG_CONV_EXCL=-FoC`), and it also parses `Note: including file:` output for fast `-MM -MS` dependencies.
+- Observed divergences: `cygwin_tools` has both `vc/` and `mingw/`; `msys_tools` has only `vc/` plus `msys2win_path.sh`/`win2msys_path.sh`; `wsl_tools` has only `vc/` plus `SetupWSLcross.bat` (and its `w32_path.sh` is heavily rewritten around `wslpath`/`//wsl$` UNC paths). `msys_tools/vc/cc.sh` is the only variant that does *not* convert paths itself (it relies on MSYS2, plus `MSYS2_ARG_CONV_EXCL=-FoC`), and it also parses `Note: including file:` output for fast `-MM -MS` dependencies.
 - Temp files are hardcoded to `/tmp` in several scripts (`reg_query.sh` batch file, `cc.sh`/`ld.sh`/`mc.sh`/`rc.sh` message files). Fine under Cygwin/MSYS2; the WSL variants instead use `$ERL_TOP/tmp`/`$ERL_TOP/tmpobj` because `/tmp` is not visible to `cl.exe`.
 - `cc.sh` prints compiler output with `tail -n +2` / `tail +2` to drop Microsoft's banner line; a tool whose greeting spans more lines will leak text into `configure` tests.
 - `cc.sh` refuses multiple source files combined with a single `-o *.o`.
@@ -62,7 +61,7 @@ Top level (all `#!/bin/sh` bash scripts, all shadow the real tools via `PATH`):
 - A Cygwin/MSYS2/WSL Windows CI job (`.github/`) is the only coverage for the translatation logic.
 
 ## Routing Table
-- `vc/` → MSVC shims (`cc.sh`, `ld.sh`, `ar.sh`, `rc.sh`, `mc.sh`, `emu_cc.sh`, `coffix.c`; unused `cc_wrap.c`/`ld_wrap.c`)
+- `vc/` → MSVC shims (`cc.sh`, `ld.sh`, `ar.sh`, `rc.sh`, `mc.sh`, `emu_cc.sh`, `coffix.c`)
 - `mingw/` → mingw/gcc variants of the same shims (used by `otp_build env_mingw32`)
 - `../msys_tools/` → MSYS2 copy of this tree (sibling — read-only, mirror changes via this node's parent)
 - `../wsl_tools/` → WSL copy of this tree (sibling — read-only, mirror changes via this node's parent)

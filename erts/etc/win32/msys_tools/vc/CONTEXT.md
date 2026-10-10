@@ -70,8 +70,7 @@ This is the `vc/` variant used by the MSYS2 host; sibling near-duplicates live i
 
 ## Notes for Agents
 - **Mirror changes into `../../cygwin_tools/vc/` and `../../wsl_tools/vc/`** (near-duplicates). The Cygwin
-  tree additionally has C helpers `cc_wrap.c`/`ld_wrap.c` (native `cygpath` interfaces) that this tree lacks;
-  the Cygwin tree also has a separate `mingw/` variant. Do not blindly copy — verify the host-specific
+  tree additionally has a separate `mingw/` variant. Do not blindly copy — verify the host-specific
   path-conversion calls stay right.
 - Interface consumers to re-check when changing flags: `erts/etc/common/Makefile.in` (win32,
   `USING_VC`→`-MT`/`-MD`), `make/autoconf/win32.config.cache.static`, `make/autoconf/otp.m4`.
