@@ -163,10 +163,9 @@ for an unregistered `registered_name`), so the list is a genuine, shorter-by-con
 - **`status`**: the calling process is `running` (this runtime is single-threaded, so exactly one
   process executes at a time — the oracle's answer for the caller); every other process carries its
   own `ProcessState` (a process parked in `receive` is `waiting`, matching the oracle).
-- **`group_leader`** is the process's own group leader (`Runtime::group_leader_of(pid)`), defaulting to
-  this runtime's root pid and settable by `erlang:group_leader/2` (and inherited on spawn) — one source
-  of truth shared by `erlang:group_leader/0`, the `/2` BIFs and this item. It is this runtime's real
-  pid, not the oracle's `<0.70.0>` io process.
+- **`group_leader`** is the process's own (`Runtime::group_leader_of(pid)`, default the root pid;
+  settable by `erlang:group_leader/2`, inherited on spawn) — one source of truth shared with
+  `erlang:group_leader/0`; this runtime's real pid, not the oracle's `<0.70.0>` io process.
 - **`reductions`** is this process's real counter (the absolute value differs — the code differs).
 - **`error_handler`** (the atom `error_handler`) and **`suspending`** (`[]`) are unchanging runtime
   defaults — the facts they report are true of this runtime. **`last_calls`** is the exception: it is
