@@ -494,4 +494,66 @@ mod tests {
         assert_eq!(bits, 0);
         assert_eq!(subject_bytes(term).unwrap(), &[] as &[u8]);
     }
+
+    /// A machine that has built no refc term enumerates no payload handle: the
+    /// accessor a host uses to seed a copy's source off-heap table starts empty.
+    #[test]
+    fn refc_binaries_is_empty_on_a_fresh_machine() {
+        let machine = Machine::new();
+        assert!(
+            machine.refc_binaries().is_empty(),
+            "a fresh machine has built no off-heap payload"
+        );
+    }
+
+    /// Every off-heap payload the machine builds is **enumerable**: the refc term
+    /// `make_binary` returns appears in the accessor, and the exposed handle's
+    /// `data_ptr` is exactly the pointer the term's `BinRef.val` word holds — the
+    /// lookup key a host's copy resolves the payload by.
+    #[test]
+    fn a_built_refc_binary_is_enumerable_and_the_handle_is_the_bin_ref_payload() {
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        let bytes: Vec<u8> = (1..=65u8).collect();
+        let term = make_binary(&mut machine, &mut ctx, &bytes, 65 * 8).unwrap();
+        // SAFETY: `term` is a live bitstring term built on the line above.
+        assert!(unsafe { beam_term::refc::is_refc_binary(term) });
+
+        let handles = machine.refc_binaries();
+        assert_eq!(handles.len(), 1, "the one refc term the machine built");
+        assert_eq!(handles[0].len(), 65);
+        assert_eq!(handles[0].as_bytes(), bytes.as_slice());
+
+        // The frozen representation: the boxed root is the `ErlSubBits`, whose `orig`
+        // slot (word 4) is the boxed `BinRef` holding the payload pointer in its `val`
+        // word (word 1) — `write_refc_binary`'s layout.
+        // SAFETY: `term` is a live boxed `ErlSubBits`, so word 4 is the live term
+        // `write_refc_binary` wrote there.
+        let orig = unsafe { *boxed_val(term).add(4) };
+        // SAFETY: `orig` is the live `BinRef` term read out of `orig` above.
+        let (val, _next) = unsafe { beam_term::refc::bin_ref_parts(orig) };
+        assert_eq!(
+            val as *mut u8,
+            handles[0].data_ptr(),
+            "the term's BinRef.val is the enumerated handle's payload"
+        );
+    }
+
+    /// Cloning an exposed handle takes a second reference to the payload, so the
+    /// payload outlives the machine that built it: dropping the whole machine leaves
+    /// the clone's bytes readable.
+    #[test]
+    fn a_cloned_refc_binary_handle_outlives_the_machine() {
+        let handle = {
+            let mut machine = Machine::new();
+            let mut ctx = MinimalContext::new();
+            let _term = make_writable(&mut machine, &mut ctx, 65).unwrap();
+            let handles = machine.refc_binaries();
+            assert_eq!(handles.len(), 1);
+            handles[0].clone()
+        }; // the machine is dropped here, releasing its own handle.
+
+        assert_eq!(handle.len(), 65);
+        assert_eq!(handle.as_bytes(), vec![0u8; 65].as_slice());
+    }
 }

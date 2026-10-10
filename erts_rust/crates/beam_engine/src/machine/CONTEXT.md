@@ -13,7 +13,10 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   replacement for C's saved raw `StackTrace` (`c_p->ftrace`) — latched A.8 trace gate,
   reduction counter); `MAX_REGISTER`/`MAX_FLOAT_REGISTER`; `reset`; the **root-set hand-off**
   (`stack_mut`, `with_roots` handing over the whole `RootSet`, and `alloc_rooted` — the convenience
-  wrapper that calls `ExecutionContext::alloc_words_rooted`).
+  wrapper that calls `ExecutionContext::alloc_words_rooted`); and the **off-heap refc-binary handle view**
+  `refc_binaries()` — the read-only slice of the `RefcBinary` payload handles `alloc_refc_binary` built,
+  which a host clones into a copy's **source** off-heap table so the copy engine can resolve a refc
+  binary's payload by data pointer (a cloned handle's refcount keeps the payload alive past the machine).
 - `registers.rs` — x/FR access (`get_fr`/`set_fr`, bounds-checked → `bad_register`; `x_mut`/`fr_mut` as
   the single-view root-set accessors); `Machine::reset` clears the raise snapshot alongside the module
   contexts (both belong to the run that is starting).
