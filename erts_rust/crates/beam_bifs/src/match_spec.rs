@@ -79,6 +79,18 @@
 //!   its `{ok, TraceReturn, Flags, Errors}` shape by guessing would be a
 //!   fabricated result, so the dialect is refused instead.
 //!
+//!   The dialect's **argument check is reproduced exactly**, because the C makes
+//!   it before it lints or compiles: `if (trace && !(is_list(against) ||
+//!   against == NIL)) return THE_NON_VALUE;` (`erl_db_util.c:6078-6080`), which
+//!   the BIF turns into `error:badarg` (`:6062`). So a **non-list, non-`[]`**
+//!   `Against` — a scalar, an atom, a map of either shape — is `badarg` here too,
+//!   whether or not the spec would compile; only a list (or `[]`) `Against`
+//!   reaches the typed gap. `is_list` in the C is a cons-cell test
+//!   (`[]` ⇒ `NIL`), and [`is_list`](crate::access::is_list) is the same test.
+//!   Verified: `erlang:match_spec_test(1, [{'_',[],[ok]}], trace)` and the same
+//!   with `#{a=>1}`, `hello`, `[]`-spec variants all raise `error:badarg`, while
+//!   `erlang:match_spec_test([1,2], [{'_',[],[ok]}], trace)` is `{ok,true,[],[]}`.
+//!
 //! # Lint reproduction (the `Errors` element)
 //!
 //! The C lints the spec (`db_match_set_lint`) *before* compiling it, and its
@@ -133,9 +145,18 @@
 //!
 //! So any head pattern that mentions a map (at any depth, through tuples and
 //! conses) is a typed [`unsupported_bif`]. A map in a **guard or body** needs no
-//! special case: `beam_ets`'s expression decoder rejects map expressions outright
-//! (`../beam_ets/src/select/expr.rs:316-320`), so it already lands in the typed
-//! gap above.
+//! special case: `beam_ets` decodes a map expression (`#{K => V}`, the C's
+//! `dmc_map`) and **constructs** it at evaluation time — its keys/values may be
+//! variables — exactly as the C does
+//! (`../beam_ets/src/select/expr.rs:358-363`), so the wholesale delegation below
+//! already answers it. Verified: `erlang:match_spec_test(7, [{'$1',[],[#{a=>'$1'}]}], table)`
+//! and the crate both yield `{ok, #{a => 7}, [], []}`, and
+//! `erlang:match_spec_test(#{a=>1}, [{'$1',[{'is_map','$1'}],[ok]}], table)` is
+//! `{ok, ok, [], []}` in both.
+//!
+//! An `Against` term that *is* a map (flat or HAMT) is likewise not a head
+//! pattern and needs no special case — it is the object the head is matched
+//! against.
 
 use beam_common::{BeamError, Result};
 use beam_term::{AtomTable, Eterm, NIL};
@@ -166,8 +187,16 @@ fn match_spec_test_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> 
     let (against, spec, dialect) = (args[0], args[1], args[2]);
     match atom_name(ctx.atoms(), dialect).as_deref() {
         Some("table") => test_table(ctx, against, spec),
-        // The trace dialect needs a trace programme and a trace runner this
-        // runtime does not have; refused rather than faked (module docs).
+        // The C rejects a non-list, non-`[]` `Against` in the trace dialect
+        // **before** it lints or compiles anything
+        // (`if (trace && !(is_list(against) || against == NIL))`,
+        // `erl_db_util.c:6078-6080` — `is_list` is a cons-cell test there too), so
+        // a scalar/map/atom `Against` is `error:badarg` even for a spec that would
+        // not compile. Reproduced here.
+        Some("trace") if !is_list(against) && !is_nil(against) => Err(badarg()),
+        // For a list `Against` the dialect needs a trace programme and a trace
+        // runner this runtime does not have; refused rather than faked (module
+        // docs).
         Some("trace") => Err(unsupported_bif()),
         // Every other `Type`, atom or not (`erl_db_util.c:6062`).
         _ => Err(badarg()),

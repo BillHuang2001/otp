@@ -404,8 +404,12 @@ fn the_trace_dialect_is_a_typed_gap() {
     let c = ctx.tuple(&[v1, guards, body]).expect("fits");
     let spec = ctx.list(&[c]).expect("fits");
 
+    // A **scalar** `Against` is refused by the C's argument check *before* the
+    // dialect is compiled (`if (trace && !(is_list(against) || against == NIL))`,
+    // `erl_db_util.c:6078-6080`), so it is `error:badarg`, not the typed gap; only
+    // the list form below reaches the (still missing) trace runner.
     let err = call(&reg, &mut ctx, seven, spec, trace).expect_err("trace");
-    assert!(is_raise_atom(&err, "unsupported_bif"), "trace: {err:?}");
+    assert!(is_badarg(&err), "trace scalar: {err:?}");
 
     let list = ctx.list(&[seven]).expect("fits");
     let err = call(&reg, &mut ctx, list, spec, trace).expect_err("trace list");

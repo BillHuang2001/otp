@@ -50,8 +50,8 @@
 //! [`crate::registry::BifRegistry::with_core_bifs`] calls.
 
 use beam_common::{BeamError, Result};
-use beam_term::compare::eq;
-use beam_term::{atom_val, AtomTable, Eterm};
+use beam_term::compare::{cmp_flatmap_keys, eq};
+use beam_term::{atom_val, Eterm};
 
 use crate::access;
 use crate::context::BifContext;
@@ -227,8 +227,9 @@ fn create(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     if !access::is_map(opts) {
         return Err(error::structured_error(ctx, "badmap", &[opts])?);
     }
-    // A flat map is the only map shape this crate builds/reads (see the crate
-    // `CONTEXT.md`); a >32-entry (hash) map also fails the exactly-1 check.
+    // `Opts` must hold exactly one entry (`is_exported`), so it is always a flat
+    // map; `flatmap_pairs` reads it directly and rejects any other shape (a map
+    // of another size is a typed `badarg`, matching the C's exactly-1 check).
     let (opt_keys, opt_values) = access::flatmap_pairs(opts)?;
     if opt_keys.len() != 1 || !atom_name_is(ctx, opt_keys[0], "is_exported") {
         return Err(error::badarg());
@@ -255,20 +256,6 @@ fn create(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     )
 }
 
-/// The update-map value for `key`, matched by exact (`=:=`) equality — the C
-/// `records_update_4` key comparison.
-fn update_value<'a>(
-    update_keys: &[Eterm],
-    update_values: &'a [Eterm],
-    key: Eterm,
-    atoms: &AtomTable,
-) -> Option<&'a Eterm> {
-    update_keys
-        .iter()
-        .position(|&k| eq(k, key, atoms))
-        .map(|i| &update_values[i])
-}
-
 /// `records:update/4` (`records_update_4`, `erl_record.c:1087-1245`).
 ///
 /// `Record` must be a native record. `Name == '_'` skips the module/name check;
@@ -277,6 +264,23 @@ fn update_value<'a>(
 /// original record unchanged, and every update key must name an existing field.
 /// The result shares the record's definition (observationally identical to the C,
 /// which copies the def pointer).
+///
+/// # Both map shapes are accepted
+///
+/// `Updates` may be a flat map **or** a hash map (a `>MAP_SMALL_MAP_LIMIT`-key
+/// HAMT): the C has a separate arm for each (`erl_record.c:1148-1180` and
+/// `:1181-1229`), and the field rules are identical. The update keys are ordered
+/// by the C's `erts_cmp_flatmap_keys` (`record_compare`, `erl_record.c:892-902`)
+/// — the order a flat map already stores its keys in, and the order the C sorts a
+/// hash map's keys into before merging (`erl_record.c:1203-1204`) — so a map
+/// carrying several non-field keys reports the same one the oracle does.
+///
+/// Verified against the oracle (erts-17.1) with a 40-field record:
+/// `records:update(R, m, r, U)` with a 40-entry `U` updates every field, and the
+/// same `U` with the module/name wildcards returns the record unchanged for
+/// fields it does not mention. A >32-entry update map whose keys name no field
+/// reports the **lowest-atom-index** offender as
+/// `error:{badfield,{{Module,Name},Key}}`.
 ///
 /// # Errors
 ///
@@ -293,9 +297,6 @@ fn update_value<'a>(
 ///   (`records:update(R, '_', '_', #{zz=>9})` ⇒ `error:{badfield,{{m,r},zz}}`). Which
 ///   key is reported for several bad keys follows the update map's stored order (OTP
 ///   documents map order as unspecified).
-///
-/// A >32-entry (hash) update map is [`error::system_limit`] — a typed gap (this crate
-/// builds/reads only flat maps), never a wrong result.
 fn update(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let (rec, module, name, updates) = (args[0], args[1], args[2], args[3]);
     if !access::is_record(rec) {
@@ -319,16 +320,20 @@ fn update(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     if !access::is_map(updates) {
         return Err(error::structured_error(ctx, "badmap", &[updates])?);
     }
-    if access::is_hashmap(updates) {
-        // >32 update keys: a hash map, which this crate neither builds nor reads
-        // (the crate `CONTEXT.md` documents the flat-map-only scope).
-        return Err(error::system_limit());
-    }
-    let (update_keys, update_values) = access::flatmap_pairs(updates)?;
-    if update_keys.is_empty() {
-        // The oracle returns the record unchanged for an empty update map.
+    if access::map_size(updates)? == 0 {
+        // The oracle returns the record unchanged for an empty update map
+        // (`records_update_4`, `erl_record.c:1131-1133`).
         return Ok(rec);
     }
+
+    // The update keys, ordered as the C's merge sees them (`record_compare`,
+    // `erl_record.c:892-902`) — see the function docs. A flat map's stored order
+    // already is that order; a hash map's is not, so sort either way.
+    let mut update_keys: Vec<Eterm> = access::map_pairs_storage_order(updates)?
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    update_keys.sort_by(|a, b| cmp_flatmap_keys(*a, *b, ctx.atoms()));
 
     let keys = access::native_record_declaration_keys(def)?;
     for &update_key in &update_keys {
@@ -340,8 +345,8 @@ fn update(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     // Rebuild in declaration order, overlaying the update map's values.
     let mut pairs = Vec::with_capacity(keys.len());
     for &key in &keys {
-        let value = match update_value(&update_keys, &update_values, key, ctx.atoms()) {
-            Some(&value) => value,
+        let value = match access::map_get(updates, key, ctx.atoms())? {
+            Some(value) => value,
             None => access::native_record_get(rec, key, ctx.atoms())?.ok_or_else(error::badarg)?,
         };
         pairs.push((key, value));
