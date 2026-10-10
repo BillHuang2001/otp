@@ -19,9 +19,15 @@
 // %CopyrightEnd%
 
 //! In-module unit tests for the baseline tier: the block-target codec and
-//! runtime-block layout (`runtime`), and the register allocator plus the
-//! small-int arithmetic fast path (`emit`).
-use super::emit::*;
+//! runtime-block layout (`runtime`), the register allocator plus the
+//! small-int arithmetic fast path (`emit`), and the native cross-module
+//! `call_ext*` transfer (a driver-mediated module-context switch).
+//!
+//! This file is **deliberately long**: it is one comprehensive `#[cfg(test)]` suite over
+//! the whole baseline backend (the split `mod.rs`/`runtime.rs`/`emit/` is exercised here
+//! in one place, so a change to any of them has its unit tests beside it) — a
+//! legitimately-large test module, not a file hiding a second concern. Suites that need a
+//! compiled real `.beam` live in the crate's `tests/` (`jit_real_module`, `jit_bench`).use super::emit::*;
 use super::runtime::{
     EXT_CALL, EXT_CALL_LAST, EXT_CALL_ONLY, RUNTIME_MACHINE_DISP, RUNTIME_XREGS_DISP,
 };
