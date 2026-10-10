@@ -81,6 +81,7 @@
 //! | `current_function` / `initial_call` | `{M, F, A}` of the function the process is in / was entered at — from the engine, see below |
 //! | `current_location` | `{M, F, A, [{file, File}, {line, L}]}` |
 //! | `current_stacktrace` | `[{M, F, A, Location}, …]`, innermost frame first |
+//! | `catchlevel` | the live exception catch-frame depth, as an integer — from the engine, see below |
 //! | `total_heap_size` / `heap_size` | this process's real heap capacities, in words |
 //! | `stack_size` | the Erlang stack's word count |
 //! | `reductions` | this process's real reduction counter |
@@ -98,22 +99,25 @@
 //!
 //! These are *valid* oracle item names, so answering `badarg` would be a lie. Each is a
 //! typed capability gap ([`crate::error::unsupported`], reason atom starting with
-//! `unsupported`) naming the accessor/hook that is missing:
+//! `unsupported`) naming the precise missing accessor/hook ([`UNSUPPORTED_ITEM_REASONS`]):
 //!
 //! | item | why / what is needed |
 //! |---|---|
-//! | `catchlevel` | the runtime has no catch-frame store reachable from here |
-//! | `backtrace` | no binary backtrace (see `current_stacktrace`) |
-//! | `magic_ref`, `parent`, `label` | no such PCB fields in M1 |
-//! | `async_dist`, `priority_messages` | no such process flags in M1 |
-//! | `garbage_collection_info` | needs the collector's per-generation block detail beyond [`beam_gc::HeapInfo`] |
-//! | `binary` | no process registers off-heap refc binaries in its off-heap table yet (see the crate CONTEXT.md), and `beam_alloc::RefcBinary` exposes no refcount accessor for the `{Ptr,Size,Refc}` third field |
+//! | `backtrace` | no raw/binary stack-dump accessor — the engine builds only the cooked `current_stacktrace` list, not the C's `erts_stack_dump` binary |
+//! | `magic_ref` | no magic ref is bound into a process off-heap table — `beam_abi`'s NIF resource API is unbound and nothing registers a resource with a process |
+//! | `parent` | no parent field on the PCB ([`beam_process::Process`]) — the spawn path never records the spawning process |
+//! | `label` | no label field on the PCB ([`beam_process::Process`]) |
+//! | `async_dist` | no `async_dist` flag in [`beam_process::ProcessFlags`] |
+//! | `priority_messages` | no `priority_messages` flag in [`beam_process::ProcessFlags`] |
+//! | `garbage_collection_info` | [`beam_gc::HeapInfo`] tracks no per-generation block detail (the oracle's `old_heap_block_size`/`mbuf_size`/`recent_size`/`bin_vheap_block_size`/`bin_old_vheap_block_size` are unmeasured) |
+//! | `binary` | no process registers off-heap refc binaries in `Process::off_heap`; the engine holds them on `Machine::refc_binaries`, which this floor cannot enumerate |
 //!
-//! The four **execution-position** items (`current_function`, `initial_call`,
-//! `current_location`, `current_stacktrace`) are therefore *conditionally* answerable rather
+//! The **execution-position** items (`current_function`, `initial_call`, `current_location`,
+//! `current_stacktrace`) and `catchlevel` are therefore *conditionally* answerable rather
 //! than gaps: they are built by the engine's read-only [`Machine`](beam_engine::Machine) accessors out of the
-//! process's own entry module, which is what [`RuntimeContext::position_value`] reads
-//! through the [`engines`](RuntimeContext::engines) view of the runner state. They are served
+//! process's own entry module and engine, which is what [`RuntimeContext::position_value`] /
+//! [`RuntimeContext::catchlevel_value`] read through the [`engines`](RuntimeContext::engines)
+//! view of the runner state. They are served
 //! for a process this runtime scheduled and left parked — the case the oracle's values below
 //! are pinned against — and are omitted (`/1`) or the typed capability gap (`/2`) for a
 //! process with no readable position: the caller itself (a scheduler pass holds its machine
@@ -250,6 +254,7 @@ const IMPLEMENTED_ITEMS: &[&str] = &[
     "initial_call",
     "current_location",
     "current_stacktrace",
+    "catchlevel",
     "total_heap_size",
     "heap_size",
     "stack_size",
@@ -269,8 +274,10 @@ const IMPLEMENTED_ITEMS: &[&str] = &[
 
 /// The valid oracle item names this runtime cannot yet answer — a typed `unsupported`
 /// capability gap rather than a fabricated value or a false `badarg` (see the module docs).
+///
+/// `catchlevel` is **not** here: it is answerable through the engine (see
+/// [`RuntimeContext::catchlevel_value`]).
 const UNSUPPORTED_ITEMS: &[&str] = &[
-    "catchlevel",
     "backtrace",
     "magic_ref",
     "parent",
@@ -279,6 +286,53 @@ const UNSUPPORTED_ITEMS: &[&str] = &[
     "priority_messages",
     "garbage_collection_info",
     "binary",
+];
+
+/// Why each item in [`UNSUPPORTED_ITEMS`] cannot be answered — the precise missing
+/// accessor/hook, verified against the real backing code. [`RuntimeContext::unsupported_item`]
+/// reports this text, so a capability gap names what is actually missing instead of a vague
+/// placeholder. An item whose data becomes available must move to [`IMPLEMENTED_ITEMS`] and
+/// lose its row here.
+const UNSUPPORTED_ITEM_REASONS: &[(&str, &str)] = &[
+    (
+        "backtrace",
+        "no raw/binary stack-dump accessor: the engine exposes only the cooked \
+         `Machine::current_stacktrace` list, never the C's `erts_stack_dump` binary",
+    ),
+    (
+        "magic_ref",
+        "no magic ref is bound into a process off-heap table: `beam_abi`'s NIF resource API \
+         (`enif_alloc_resource`/`enif_make_resource`) is unbound and nothing registers a \
+         resource with a process",
+    ),
+    (
+        "parent",
+        "no parent field on the PCB (`beam_process::Process`): the spawn path \
+         (`Runtime::spawn_process`/`spawn_fun_process`) never records the spawning process",
+    ),
+    (
+        "label",
+        "no label field on the PCB (`beam_process::Process`)",
+    ),
+    (
+        "async_dist",
+        "no `async_dist` flag in `beam_process::ProcessFlags`",
+    ),
+    (
+        "priority_messages",
+        "no `priority_messages` flag in `beam_process::ProcessFlags`",
+    ),
+    (
+        "garbage_collection_info",
+        "`beam_gc::HeapInfo` tracks no per-generation block detail: the oracle's \
+         `old_heap_block_size`/`mbuf_size`/`recent_size`/`bin_vheap_block_size`/\
+         `bin_old_vheap_block_size` are not measured by the collector",
+    ),
+    (
+        "binary",
+        "no process registers off-heap refc binaries in `Process::off_heap`: the engine holds \
+         them on `Machine::refc_binaries`, which this floor cannot enumerate",
+    ),
 ];
 
 /// One parsed `process_info` item: an atom name, or the `{dictionary, Key}` 2-tuple.
@@ -565,17 +619,30 @@ impl RuntimeContext<'_> {
     }
 
     /// The typed capability gap for a valid item this runtime cannot answer.
+    ///
+    /// The reason names the item *and* the exact missing accessor/hook behind it (from
+    /// [`UNSUPPORTED_ITEM_REASONS`]) so a gap is never a vague placeholder. `catchlevel` and
+    /// the four execution-position items share the one *conditional* reason: they are served
+    /// from the process's engine, which this runtime does not hold for the caller, a
+    /// fun-bodied process or an unscheduled pid.
     fn unsupported_item(&self, item: &Item) -> BeamError {
         match item {
-            Item::Atom(name) if POSITION_ITEMS.contains(&name.as_str()) => {
+            Item::Atom(name)
+                if POSITION_ITEMS.contains(&name.as_str()) || name.as_str() == "catchlevel" =>
+            {
                 crate::error::unsupported(&format!(
-                    "process_info: {name} (this runtime holds no execution position for that \
-                     process: it is the caller, a fun-bodied process or an unscheduled pid)"
+                    "process_info: {name} (this runtime holds no engine for that process: it is \
+                     the caller, a fun-bodied process or an unscheduled pid)"
                 ))
             }
-            Item::Atom(name) => crate::error::unsupported(&format!(
-                "process_info: {name} (see beam_rt/src/native/memory/mod.rs for the missing accessor)"
-            )),
+            Item::Atom(name) => {
+                let why = UNSUPPORTED_ITEM_REASONS
+                    .iter()
+                    .find(|(item, _)| item == name)
+                    .map(|(_, why)| *why)
+                    .unwrap_or("no backing accessor is reachable from this floor");
+                crate::error::unsupported(&format!("process_info: {name} ({why})"))
+            }
             Item::DictionaryKey(_) => crate::error::unsupported("process_info: {dictionary,_}"),
         }
     }
@@ -614,6 +681,36 @@ impl RuntimeContext<'_> {
         }
     }
 
+    /// The `catchlevel` item: the process's live exception **catch-frame depth**, as an
+    /// integer.
+    ///
+    /// The C answers `make_small(catchlevel(rp))` (`erl_bif_info.c:2169-2171`) where
+    /// `catchlevel(p) = p->catches` (`beam_common.c:2347-2350`) — the number of active
+    /// `catch`/`try` frames, incremented by the `catch` instruction and decremented by
+    /// `catch_end`/`try_end`. `beam_engine` maintains exactly that stack
+    /// ([`Machine::catch_frame_depth`](beam_engine::Machine::catch_frame_depth)), pushed by
+    /// `Instr::Try`/`Instr::Catch` and popped by `try_case`/`try_end`/`catch_end`, so this is
+    /// the same quantity.
+    ///
+    /// Conditionality matches the execution-position items: `Ok(None)` — the honest "cannot
+    /// answer", an omission in `process_info/1` and the typed capability gap in
+    /// `process_info/2` — when this runtime holds no engine for `pid` (the caller itself, the
+    /// `-eval` root process, a fun-bodied process, an unscheduled pid). A missing engine is
+    /// never a fabricated `0`.
+    ///
+    /// Oracle (OTP 29.1.1 / erts-17.1): `0` for a process parked outside any `try`; `1` for
+    /// one parked inside a single `try`; the caller itself reports its own live depth (a
+    /// `process_info(self(), catchlevel)` evaluated inside one `try` answers `1`).
+    fn catchlevel_value(&mut self, pid: ProcessId) -> Result<Option<Eterm>> {
+        let Some(engines) = self.engines() else {
+            return Ok(None);
+        };
+        let Some((_module, machine)) = engines.engine_at(pid) else {
+            return Ok(None);
+        };
+        Ok(Some(make_small(machine.catch_frame_depth() as i64)))
+    }
+
     /// An item's value from this runtime's real state, or `None` when the item is a valid
     /// oracle name this runtime cannot answer.
     fn raw_value(&mut self, item: &Item, snapshot: &Snapshot) -> Result<Option<Eterm>> {
@@ -639,6 +736,11 @@ impl RuntimeContext<'_> {
             "current_function" | "initial_call" | "current_location" | "current_stacktrace" => {
                 return self.position_value(name, snapshot.pid)
             }
+            // The catch level (the C's `catchlevel(rp)` = `rp->catches`,
+            // `beam_common.c:2347-2350`, `erl_bif_info.c:2169-2171`): the depth of the
+            // process's live exception catch-frame stack. Read from the engine like the
+            // position items — see [`Self::catchlevel_value`].
+            "catchlevel" => return self.catchlevel_value(snapshot.pid),
             "status" => self.atom(snapshot.status)?,
             "message_queue_len" => make_small(snapshot.message_queue_len as i64),
             "messages" => terms::make_list(self, &snapshot.messages)?,
