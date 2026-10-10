@@ -31,11 +31,29 @@
 //!
 //! Every value is produced in the runtime's **native** time unit, fixed here to
 //! **nanoseconds** (`1e9` per second; this Linux host reports the same unit via
-//! `erts_internal:time_unit/0`). A `/1` unit argument — `second`, `millisecond`,
-//! `microsecond`, `nanosecond` or `native` — divides the native value by that
-//! unit's ratio, **flooring toward negative infinity**, exactly as
-//! `erlang:convert_time_unit/3` does (`erl_time_sup.c:2460`, verified against the
-//! oracle); any other unit is `badarg` (`monotonic_time(fortnight)` => `badarg`).
+//! `erts_internal:time_unit/0`, and the same `1e9` via
+//! `erts_internal:perf_counter_unit/0`).
+//!
+//! A `/1` unit argument names the target unit either as an atom or as a
+//! **positive integer** — that many target units per second, the
+//! `erlang:convert_time_unit/3` convention (`system_time(1)` => seconds,
+//! `system_time(1000)` => milliseconds). The accepted atoms are the ones
+//! `time_unit_conversion`'s switch lists (`erl_time_sup.c:2277-2309`):
+//! `native` and `perf_counter` (both the native `1e9`/s here), `second`/`seconds`,
+//! `millisecond`/`milli_seconds`, `microsecond`/`micro_seconds` and
+//! `nanosecond`/`nano_seconds`. The value is
+//! `native * per_second div 1_000_000_000`, **flooring toward negative infinity**,
+//! exactly as `erlang:convert_time_unit/3` does (`erl_time_sup.c:2268`, verified
+//! against the oracle; the rounding is `erts_napi_convert_time_unit`,
+//! `erl_time_sup.c:2462-2495`).
+//!
+//! Everything else is `badarg`: an unrecognized atom (`monotonic_time(fortnight)`),
+//! a non-integer (`1.0`, a list), a zero or negative integer, and a **negative**
+//! bignum (the C's `big_sign`). A *positive* bignum unit is a legal unit the C
+//! evaluates in arbitrary precision, which this runtime's `i128`-bounded
+//! arithmetic cannot reproduce, so it answers the typed capability gap
+//! [`BeamError::Raise`] `unsupported_bif` — never a wrong value (the same
+//! convention as `src/os_bif.rs::os_unit`).
 //!
 //! # Where M1's clocks come from
 //!
@@ -61,10 +79,12 @@
 //! range (`2^59 - 1` ≈ 5.76·10^17 ns, i.e. 1988) for decades, so `system_time/0`,
 //! `system_time(nanosecond)`, `system_time(native)` and both `time_offset` forms
 //! return a **bignum**, exactly as real ERTS does — the value is materialized by
-//! [`crate::arith::int_from_i64`], which folds a value that fits back into a small
-//! integer and promotes otherwise. The coarser units
-//! (`second`/`millisecond`/`microsecond`) stay small in practice, and
-//! `monotonic_time/1` is a process-relative, hence small, value.
+//! the module-local `int_from_i128`, which folds a value that fits back into a
+//! small integer through [`crate::arith::int_from_i64`] and promotes otherwise.
+//! The coarser units (`second`/`millisecond`/`microsecond`) stay small in
+//! practice, while a coarse **integer** unit conversely promotes
+//! (`system_time(1 bsl 58)`), and `monotonic_time/1` is a process-relative, hence
+//! small, value.
 //!
 //! [`BeamError::SystemLimit`] remains only for a clock before 1970 or a
 //! nanosecond count past `i64` (year ~2262) — never a truncated value.
@@ -90,65 +110,122 @@ use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use beam_common::{BeamError, Result};
-use beam_term::{atom_val, Eterm};
+use beam_term::{atom_val, signed_value, Eterm};
 
-use crate::access::is_atom;
+use crate::access::{is_atom, is_big, is_small};
 use crate::arith;
 use crate::context::BifContext;
-use crate::error::badarg;
+use crate::error::{badarg, unsupported_bif};
 use crate::print::proper_list;
 use crate::registry::BifRegistry;
 
-/// A time unit accepted by the `/1` BIFs (matching `erl_time_sup.c`'s
-/// `am_second`/`am_millisecond`/`am_microsecond`/`am_nanosecond`/`am_native`).
+/// A time unit accepted by the `/1` BIFs — the atom forms of `time_unit_conversion`'s
+/// switch (`erl_time_sup.c:2277-2309`) plus the integer "units per second" form
+/// `erlang:convert_time_unit/3` also accepts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimeUnit {
-    /// `second`.
-    Second,
-    /// `millisecond`.
-    Millisecond,
-    /// `microsecond`.
-    Microsecond,
-    /// `nanosecond`.
-    Nanosecond,
-    /// `native` — the runtime's native unit (nanoseconds in M1).
+    /// `native` — the runtime's native unit (nanoseconds in M1, `1e9`/s).
     Native,
+    /// `perf_counter` — the perf-counter unit (also `1e9`/s on this host,
+    /// `erts_internal:perf_counter_unit/0`).
+    PerfCounter,
+    /// `nanosecond` / the deprecated `nano_seconds`.
+    Nanosecond,
+    /// `microsecond` / the deprecated `micro_seconds`.
+    Microsecond,
+    /// `millisecond` / the deprecated `milli_seconds`.
+    Millisecond,
+    /// `second` / the deprecated `seconds`.
+    Second,
+    /// A caller-supplied **positive** integer: that many target units per second
+    /// (`system_time(1)` => seconds, `system_time(1000)` => milliseconds).
+    PerSecond(i64),
 }
 
 impl TimeUnit {
-    /// The number of native units (nanoseconds) in one `self`.
-    fn native_per_unit(self) -> i64 {
+    /// The number of target units in one second.
+    fn per_second(self) -> i128 {
         match self {
-            TimeUnit::Second => 1_000_000_000,
-            TimeUnit::Millisecond => 1_000_000,
-            TimeUnit::Microsecond => 1_000,
-            TimeUnit::Nanosecond | TimeUnit::Native => 1,
+            TimeUnit::Native | TimeUnit::PerfCounter | TimeUnit::Nanosecond => 1_000_000_000,
+            TimeUnit::Microsecond => 1_000_000,
+            TimeUnit::Millisecond => 1_000,
+            TimeUnit::Second => 1,
+            TimeUnit::PerSecond(per_second) => i128::from(per_second),
         }
     }
 }
 
-/// The unit named by the atom `term`, or `badarg` for anything else (including a
-/// non-atom and an unknown atom).
+/// The unit named by `term` — exactly the set `time_unit_conversion` accepts
+/// (`erl_time_sup.c:2277-2341`): the atoms
+/// `native`/`perf_counter`/`second`/`seconds`/`millisecond`/`milli_seconds`/
+/// `microsecond`/`micro_seconds`/`nanosecond`/`nano_seconds`, or any **positive**
+/// integer (units per second).
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] for anything else — an unknown atom, a non-integer, a
+/// zero or negative integer, and a negative bignum. A **positive bignum** unit is
+/// a legal unit whose C conversion runs in arbitrary precision; this runtime's
+/// `i128`-bounded arithmetic cannot reproduce it, so it answers the typed
+/// capability gap `unsupported_bif` rather than a wrong value.
 fn time_unit(ctx: &BifContext<'_>, term: Eterm) -> Result<TimeUnit> {
-    let name = if is_atom(term) {
-        ctx.atoms().name(atom_val(term))
-    } else {
-        None
-    };
-    match name {
-        Some("second") => Ok(TimeUnit::Second),
-        Some("millisecond") => Ok(TimeUnit::Millisecond),
-        Some("microsecond") => Ok(TimeUnit::Microsecond),
-        Some("nanosecond") => Ok(TimeUnit::Nanosecond),
-        Some("native") => Ok(TimeUnit::Native),
-        _ => Err(badarg()),
+    if is_small(term) {
+        let value = signed_value(term);
+        // `time_unit_conversion`'s `signed_val(term) <= 0` arm.
+        if value <= 0 {
+            return Err(badarg());
+        }
+        return Ok(TimeUnit::PerSecond(value));
     }
+    if is_big(term) {
+        // The C accepts a non-negative bignum (it traps to Erlang code, which
+        // computes `ToUnit * Time div FromUnit`); a negative one is `badarg`
+        // (`big_sign`).
+        let (negative, _) = beam_codec::term::big_parts(term).map_err(|_| badarg())?;
+        return if negative {
+            Err(badarg())
+        } else {
+            Err(unsupported_bif())
+        };
+    }
+    if is_atom(term) {
+        return match ctx.atoms().name(atom_val(term)) {
+            Some("native") => Ok(TimeUnit::Native),
+            Some("perf_counter") => Ok(TimeUnit::PerfCounter),
+            Some("second" | "seconds") => Ok(TimeUnit::Second),
+            Some("millisecond" | "milli_seconds") => Ok(TimeUnit::Millisecond),
+            Some("microsecond" | "micro_seconds") => Ok(TimeUnit::Microsecond),
+            Some("nanosecond" | "nano_seconds") => Ok(TimeUnit::Nanosecond),
+            _ => Err(badarg()),
+        };
+    }
+    Err(badarg())
 }
 
-/// Converts a native (nanosecond) value into `unit`, flooring toward negative
-/// infinity — the `erlang:convert_time_unit/3` rounding (`erl_time_sup.c:2492`).
-fn convert_native(native: i64, unit: TimeUnit) -> i64 {
-    native.div_euclid(unit.native_per_unit())
+/// Converts a native (nanosecond) value into `unit` — `native * per_second div
+/// 1_000_000_000`, flooring toward negative infinity, the
+/// `erlang:convert_time_unit/3` rounding (`erts_napi_convert_time_unit`,
+/// `erl_time_sup.c:2462-2495`).
+///
+/// The multiplication runs in `i128`: the widest accepted unit is the largest
+/// small integer (`2^59 - 1`/s), so the product of a `i64` nanosecond count and
+/// `per_second` stays far inside `i128`.
+fn convert_native(native: i64, unit: TimeUnit) -> i128 {
+    (i128::from(native) * unit.per_second()).div_euclid(1_000_000_000)
+}
+
+/// The exact integer term for a conversion result: a small integer when it fits,
+/// else the heap bignum the oracle returns (a coarse integer unit such as
+/// `system_time(1 bsl 58)` promotes).
+fn int_from_i128(ctx: &mut BifContext<'_>, value: i128) -> Result<Eterm> {
+    if let Ok(small) = i64::try_from(value) {
+        return arith::int_from_i64(ctx, small);
+    }
+    // An `i128` magnitude is at most two 64-bit limbs, least significant first —
+    // the order `arith::int_from_mag` expects.
+    let magnitude = value.unsigned_abs();
+    let limbs = [magnitude as u64, (magnitude >> 64) as u64];
+    arith::int_from_mag(ctx, value < 0, &limbs)
 }
 
 /// The process-global monotonic clock; its origin is the first call.
@@ -188,7 +265,7 @@ fn monotonic_time_0(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> 
 /// `erlang:monotonic_time/1`.
 fn monotonic_time_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let unit = time_unit(ctx, args[0])?;
-    arith::int_from_i64(ctx, convert_native(monotonic_native(), unit))
+    int_from_i128(ctx, convert_native(monotonic_native(), unit))
 }
 
 /// `erlang:system_time/0`.
@@ -199,7 +276,7 @@ fn system_time_0(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
 /// `erlang:system_time/1`.
 fn system_time_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let unit = time_unit(ctx, args[0])?;
-    arith::int_from_i64(ctx, convert_native(system_native()?, unit))
+    int_from_i128(ctx, convert_native(system_native()?, unit))
 }
 
 /// `erlang:time_offset/0` — `system_time - monotonic_time` in native units.
@@ -212,7 +289,7 @@ fn time_offset_0(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
 fn time_offset_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let unit = time_unit(ctx, args[0])?;
     let offset = system_native()? - monotonic_native();
-    arith::int_from_i64(ctx, convert_native(offset, unit))
+    int_from_i128(ctx, convert_native(offset, unit))
 }
 
 /// `erlang:timestamp/0` — `{MegaSecs, Secs, MicroSecs}`, from `system_time/0`
@@ -301,8 +378,23 @@ mod tests {
     fn seeded_atoms() -> AtomTable {
         let mut atoms = AtomTable::new();
         atoms.seed([
-            "true", "false", "ok", "second", "millisecond", "microsecond", "nanosecond", "native",
-            "positive", "monotonic", "fortnight", "bogus",
+            "true",
+            "false",
+            "ok",
+            "second",
+            "seconds",
+            "millisecond",
+            "milli_seconds",
+            "microsecond",
+            "micro_seconds",
+            "nanosecond",
+            "nano_seconds",
+            "native",
+            "perf_counter",
+            "positive",
+            "monotonic",
+            "fortnight",
+            "bogus",
         ]);
         atoms
     }
@@ -318,6 +410,12 @@ mod tests {
             "expected a small integer result, got a non-small term"
         );
         signed_value(term)
+    }
+
+    /// The `f64` value of an integer result term, small integer or bignum (the
+    /// native-nanosecond readings are past the 60-bit small range).
+    fn as_number(term: Eterm) -> f64 {
+        arith::integer_to_f64(term).expect("an integer result")
     }
 
     /// A heap big enough for the tuples/lists these tests build.
@@ -359,6 +457,138 @@ mod tests {
         );
     }
 
+    /// Every accepted unit spelling names its exact ratio, and the conversion is
+    /// `native * per_second div 1_000_000_000` flooring toward negative infinity
+    /// (the `erlang:convert_time_unit/3` rounding, pinned against the oracle:
+    /// `convert_time_unit(-1500000000, nanosecond, second)` => `-2`).
+    #[test]
+    fn every_accepted_unit_names_its_per_second_ratio() {
+        let mut heap = heap();
+        let atoms = seeded_atoms();
+        let ctx = context(&mut heap, &atoms);
+
+        let native = ctx.atom("native").expect("seeded");
+        let perf_counter = ctx.atom("perf_counter").expect("seeded");
+        let nanosecond = ctx.atom("nanosecond").expect("seeded");
+        let nano_seconds = ctx.atom("nano_seconds").expect("seeded");
+        let microsecond = ctx.atom("microsecond").expect("seeded");
+        let micro_seconds = ctx.atom("micro_seconds").expect("seeded");
+        let millisecond = ctx.atom("millisecond").expect("seeded");
+        let milli_seconds = ctx.atom("milli_seconds").expect("seeded");
+        let second = ctx.atom("second").expect("seeded");
+        let seconds = ctx.atom("seconds").expect("seeded");
+        let one = ctx.int(1).expect("fits");
+        let thousand = ctx.int(1000).expect("fits");
+        let million = ctx.int(1_000_000).expect("fits");
+        let nano = ctx.int(1_000_000_000).expect("fits");
+        let two = ctx.int(2).expect("fits");
+        let nine_nine_nine = ctx.int(999).expect("fits");
+
+        let cases = [
+            (native, 1_000_000_000i128),
+            (perf_counter, 1_000_000_000),
+            (nanosecond, 1_000_000_000),
+            (nano_seconds, 1_000_000_000),
+            (microsecond, 1_000_000),
+            (micro_seconds, 1_000_000),
+            (millisecond, 1_000),
+            (milli_seconds, 1_000),
+            (second, 1),
+            (seconds, 1),
+            // The integer forms of `erlang:convert_time_unit/3`: units per second.
+            (one, 1),
+            (thousand, 1_000),
+            (million, 1_000_000),
+            (nano, 1_000_000_000),
+            (two, 2),
+            (nine_nine_nine, 999),
+        ];
+        for (term, per_second) in cases {
+            let unit = time_unit(&ctx, term).expect("an accepted unit");
+            assert_eq!(unit.per_second(), per_second, "wrong ratio for {unit:?}");
+
+            // The exact conversion of a positive, a zero and a negative native
+            // count — the last one floors toward negative infinity.
+            assert_eq!(
+                convert_native(1_500_000_000, unit),
+                1_500_000_000 * per_second / 1_000_000_000
+            );
+            assert_eq!(convert_native(0, unit), 0);
+            assert_eq!(
+                convert_native(-1_500_000_000, unit),
+                (-1_500_000_000 * per_second).div_euclid(1_000_000_000)
+            );
+        }
+
+        // The oracle-pinned floor cases.
+        assert_eq!(convert_native(-1_500_000_000, TimeUnit::Second), -2);
+        assert_eq!(
+            convert_native(-1_500_000_000, TimeUnit::Millisecond),
+            -1_500
+        );
+        assert_eq!(
+            convert_native(-1_500_000_000, TimeUnit::Microsecond),
+            -1_500_000
+        );
+        assert_eq!(
+            convert_native(-1_500_000_000, TimeUnit::Nanosecond),
+            -1_500_000_000
+        );
+        assert_eq!(convert_native(-1, TimeUnit::Nanosecond), -1);
+        assert_eq!(convert_native(1, TimeUnit::Nanosecond), 1);
+        assert_eq!(convert_native(1, TimeUnit::Second), 0);
+    }
+
+    /// Every alias is accepted by all three `/1` BIFs and reads the clock with its
+    /// canonical ratio (`seconds`/`second`, `milli_seconds`/`millisecond`,
+    /// `micro_seconds`/`microsecond`, `nano_seconds`/`nanosecond`,
+    /// `perf_counter`/`native`).
+    #[test]
+    fn every_alias_is_accepted_by_all_three_unit_bifs() {
+        let mut heap = heap();
+        let atoms = seeded_atoms();
+        let mut ctx = context(&mut heap, &atoms);
+
+        // (alias, the number of nanoseconds in one of it)
+        let aliases = [
+            (ctx.atom("second").expect("seeded"), 1.0e9f64),
+            (ctx.atom("seconds").expect("seeded"), 1.0e9),
+            (ctx.atom("millisecond").expect("seeded"), 1.0e6),
+            (ctx.atom("milli_seconds").expect("seeded"), 1.0e6),
+            (ctx.atom("microsecond").expect("seeded"), 1.0e3),
+            (ctx.atom("micro_seconds").expect("seeded"), 1.0e3),
+            (ctx.atom("nanosecond").expect("seeded"), 1.0),
+            (ctx.atom("nano_seconds").expect("seeded"), 1.0),
+            (ctx.atom("native").expect("seeded"), 1.0),
+            (ctx.atom("perf_counter").expect("seeded"), 1.0),
+        ];
+
+        for (arg, ns_per_unit) in aliases {
+            let mono = as_number(monotonic_time_1(&mut ctx, &[arg]).expect("monotonic_time/1"));
+            assert!(mono >= 0.0, "monotonic_time/1 must not be negative: {mono}");
+
+            let sys = as_number(system_time_1(&mut ctx, &[arg]).expect("system_time/1"));
+            assert!(sys > 0.0, "system_time/1 must be positive: {sys}");
+
+            let off = as_number(time_offset_1(&mut ctx, &[arg]).expect("time_offset/1"));
+            assert!(off > 0.0, "time_offset/1 must be positive: {off}");
+
+            // `time_offset = system_time - monotonic_time` (the invariant the
+            // oracle exhibits). The three reads happen within microseconds of each
+            // other and each is floored to a whole unit, so a generous
+            // ten-milliseconds-worth of the unit covers the flooring.
+            let gap = (off - (sys - mono)).abs();
+            assert!(
+                gap <= 2.0 + 1.0e7 / ns_per_unit,
+                "time_offset/1 ({off}) vs system_time/1 ({sys}) - monotonic_time/1 ({mono})"
+            );
+        }
+    }
+
+    /// The aliases share a ratio with their canonical spelling: each alias reads
+    /// the same coarse bracket as the canonical unit (and `perf_counter` the same
+    /// as `native`). A wrongly-scaled alias (say `seconds` mapped to `1e9`/s)
+    /// falls outside the bracket.
     #[test]
     fn every_time_unit_is_converted_consistently() {
         let mut heap = heap();
@@ -366,27 +596,41 @@ mod tests {
         let mut ctx = context(&mut heap, &atoms);
 
         let second = ctx.atom("second").expect("seeded");
+        let seconds = ctx.atom("seconds").expect("seeded");
         let millisecond = ctx.atom("millisecond").expect("seeded");
+        let milli_seconds = ctx.atom("milli_seconds").expect("seeded");
         let microsecond = ctx.atom("microsecond").expect("seeded");
+        let micro_seconds = ctx.atom("micro_seconds").expect("seeded");
         let nanosecond = ctx.atom("nanosecond").expect("seeded");
+        let nano_seconds = ctx.atom("nano_seconds").expect("seeded");
         let native = ctx.atom("native").expect("seeded");
+        let perf_counter = ctx.atom("perf_counter").expect("seeded");
 
-        // Bracket every conversion between two nanosecond readings.
-        let lo = as_int(monotonic_time_1(&mut ctx, &[nanosecond]).expect("ns"));
-        let sec = as_int(monotonic_time_1(&mut ctx, &[second]).expect("s"));
-        let ms = as_int(monotonic_time_1(&mut ctx, &[millisecond]).expect("ms"));
-        let us = as_int(monotonic_time_1(&mut ctx, &[microsecond]).expect("us"));
-        let ns = as_int(monotonic_time_1(&mut ctx, &[nanosecond]).expect("ns"));
-        let nat = as_int(monotonic_time_1(&mut ctx, &[native]).expect("native"));
-        let hi = as_int(monotonic_time_1(&mut ctx, &[nanosecond]).expect("ns"));
-
-        assert!(lo / 1_000_000_000 <= sec && sec <= hi / 1_000_000_000);
-        assert!(lo / 1_000_000 <= ms && ms <= hi / 1_000_000);
-        assert!(lo / 1_000 <= us && us <= hi / 1_000);
-        // `nanosecond` and `native` share the identity ratio, so both equal the
-        // nanosecond reading.
-        assert!(lo <= ns && ns <= hi);
-        assert!(lo <= nat && nat <= hi);
+        // (unit, the number of nanoseconds in one of it)
+        let cases = [
+            (second, 1_000_000_000i64),
+            (seconds, 1_000_000_000),
+            (millisecond, 1_000_000),
+            (milli_seconds, 1_000_000),
+            (microsecond, 1_000),
+            (micro_seconds, 1_000),
+            (nanosecond, 1),
+            (nano_seconds, 1),
+            (native, 1),
+            (perf_counter, 1),
+        ];
+        for (unit, ns_per_unit) in cases {
+            // Bracket the reading between two nanosecond readings.
+            let lo = as_int(monotonic_time_1(&mut ctx, &[nanosecond]).expect("ns"));
+            let value = as_int(monotonic_time_1(&mut ctx, &[unit]).expect("unit"));
+            let hi = as_int(monotonic_time_1(&mut ctx, &[nanosecond]).expect("ns"));
+            assert!(
+                lo / ns_per_unit <= value && value <= hi / ns_per_unit,
+                "a reading of {value} is outside [{}, {}]",
+                lo / ns_per_unit,
+                hi / ns_per_unit
+            );
+        }
     }
 
     #[test]
@@ -396,22 +640,123 @@ mod tests {
         let mut ctx = context(&mut heap, &atoms);
 
         let fortnight = ctx.atom("fortnight").expect("seeded");
-        let not_an_atom = ctx.int(1).expect("fits");
+        // A float, a list and a tuple are not units; neither is `0` or a negative
+        // integer (`time_unit_conversion`'s `signed_val(term) <= 0`).
+        let a_float = ctx.make_float(1.0).expect("fits");
+        let a_list = ctx.list(&[]).expect("fits");
+        let zero = ctx.int(0).expect("fits");
+        let a_tuple = ctx.tuple(&[zero]).expect("fits");
+        let minus_one = ctx.int(-1).expect("fits");
+        let minus_thousand = ctx.int(-1000).expect("fits");
 
-        for arg in [fortnight, not_an_atom] {
-            assert!(matches!(
-                monotonic_time_1(&mut ctx, &[arg]),
-                Err(BeamError::BadArg)
-            ));
-            assert!(matches!(
-                system_time_1(&mut ctx, &[arg]),
-                Err(BeamError::BadArg)
-            ));
-            assert!(matches!(
-                time_offset_1(&mut ctx, &[arg]),
-                Err(BeamError::BadArg)
-            ));
+        for arg in [
+            fortnight,
+            a_float,
+            a_list,
+            a_tuple,
+            zero,
+            minus_one,
+            minus_thousand,
+        ] {
+            assert!(
+                matches!(monotonic_time_1(&mut ctx, &[arg]), Err(BeamError::BadArg)),
+                "monotonic_time/1 accepted a bad unit"
+            );
+            assert!(
+                matches!(system_time_1(&mut ctx, &[arg]), Err(BeamError::BadArg)),
+                "system_time/1 accepted a bad unit"
+            );
+            assert!(
+                matches!(time_offset_1(&mut ctx, &[arg]), Err(BeamError::BadArg)),
+                "time_offset/1 accepted a bad unit"
+            );
         }
+    }
+
+    /// A **bignum** unit: a negative one is `badarg` (the C's `big_sign`), and a
+    /// positive one — a legal unit the C converts in arbitrary precision — is the
+    /// typed capability gap `unsupported_bif`, never a wrong value.
+    #[test]
+    fn bignum_units_are_badarg_or_a_typed_gap() {
+        let mut heap = heap();
+        let atoms = seeded_atoms();
+        let mut ctx = context(&mut heap, &atoms);
+
+        // 2^64 + 1: far past the 60-bit small-integer range.
+        let limbs = [1u64, 1u64];
+        let positive = arith::int_from_mag(&mut ctx, false, &limbs).expect("a bignum");
+        let negative = arith::int_from_mag(&mut ctx, true, &limbs).expect("a bignum");
+
+        assert!(matches!(
+            time_unit(&ctx, positive),
+            Err(BeamError::Raise(_))
+        ));
+        assert!(matches!(time_unit(&ctx, negative), Err(BeamError::BadArg)));
+        assert!(matches!(
+            system_time_1(&mut ctx, &[positive]),
+            Err(BeamError::Raise(_))
+        ));
+        assert!(matches!(
+            monotonic_time_1(&mut ctx, &[negative]),
+            Err(BeamError::BadArg)
+        ));
+        assert!(matches!(
+            time_offset_1(&mut ctx, &[negative]),
+            Err(BeamError::BadArg)
+        ));
+    }
+
+    /// A coarse **integer** unit converts exactly like the oracle (units per
+    /// second), and a result past the 60-bit small range promotes to a bignum.
+    #[test]
+    fn integer_units_convert_and_promote() {
+        let mut heap = heap();
+        let atoms = seeded_atoms();
+        let mut ctx = context(&mut heap, &atoms);
+
+        let second = ctx.atom("second").expect("seeded");
+        let millisecond = ctx.atom("millisecond").expect("seeded");
+        let one = ctx.int(1).expect("fits");
+        let thousand = ctx.int(1000).expect("fits");
+        let two = ctx.int(2).expect("fits");
+        let very_coarse = ctx.int(1 << 58).expect("a small integer");
+
+        let secs = as_int(system_time_1(&mut ctx, &[second]).expect("second"));
+        let by_one = as_int(system_time_1(&mut ctx, &[one]).expect("1"));
+        assert_eq!(by_one, secs, "`1` is the second unit");
+
+        // The integer forms read the same coarse bracket as their atom spelling.
+        for (atom_unit, integer_unit) in [(second, one), (millisecond, thousand)] {
+            let lo = as_int(system_time_1(&mut ctx, &[atom_unit]).expect("atom"));
+            let value = as_int(system_time_1(&mut ctx, &[integer_unit]).expect("integer"));
+            let hi = as_int(system_time_1(&mut ctx, &[atom_unit]).expect("atom"));
+            assert!(
+                lo <= value && value <= hi,
+                "the integer and atom spellings of a unit disagree: {value} vs [{lo}, {hi}]"
+            );
+        }
+
+        // `2` units per second is twice the second reading.
+        let by_two = as_int(system_time_1(&mut ctx, &[two]).expect("2"));
+        assert!(
+            (by_two - 2 * secs).abs() <= 1,
+            "system_time(2) = {by_two} is not 2 x {secs}"
+        );
+
+        // A unit of `2^58`/s (the value is `seconds * 2^58`, so it is far past the
+        // small range) is materialized as a heap bignum — never a saturated or
+        // truncated value.
+        let promoted = system_time_1(&mut ctx, &[very_coarse]).expect("2^58");
+        let value = as_number(promoted);
+        let expected = (secs as f64) * ((1u64 << 58) as f64);
+        assert!(
+            beam_codec::term::big_parts(promoted).is_ok(),
+            "a value past 2^59 must be a heap bignum"
+        );
+        assert!(
+            (value - expected).abs() < expected * 0.01,
+            "system_time(2^58) = {value} is not the expected magnitude {expected}"
+        );
     }
 
     #[test]
