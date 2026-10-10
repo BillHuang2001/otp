@@ -30,10 +30,14 @@
 //! `None` from `try_local_bif` means "not a local BIF" (an external module
 //! call). The floor covers the small-arithmetic/comparison operators, the
 //! term-building/reading BIFs (`element`, `setelement`, `list_to_tuple`, …), the
-//! `erlang:is_*/1` type-test guards, the `lists` NIFs (`reverse/2`, `member/2`,
-//! `keyfind/3`), and a typed refusal for the `persistent_term:get/1,2` NIF.
+//! `erlang:is_*/1` type-test guards plus the `erlang:is_integer/3` **range guard**
+//! (the compiled form of `is_integer(V, Lo, Hi)`, e.g. `calendar`'s
+//! `time_to_seconds/1`), the `erlang:raise/3` raise (what the compiler lowers the
+//! `throw(X)` sugar to; `gb_sets`'s `is_equal/2` differing-sets branch), the
+//! `lists` NIFs (`reverse/2`, `member/2`, `keyfind/3`), and a typed refusal for
+//! the `persistent_term:get/1,2` NIF.
 
-use beam_common::{BeamError, Result};
+use beam_common::{BeamError, ExceptionClass, ExitReason, LiveReason, Raise, Result};
 use beam_engine::terms;
 use beam_term::{
     atom_val, cmp, cmp_arith, is_atom, is_small, make_atom, make_small, signed_value, Eterm,
@@ -299,6 +303,10 @@ impl ModuleHost {
             ("erlang", "is_float", 1) => Some(Ok(self.boolean(guard::is_float(args[0])))),
             ("erlang", "is_function", 1) => Some(Ok(self.boolean(terms::is_fun(args[0])))),
             ("erlang", "is_integer", 1) => Some(Ok(self.boolean(guard::is_integer(args[0])))),
+            // `is_integer(Value, Min, Max)` — the **range**-guard BIF the compiler
+            // emits for `is_integer(V, Lo, Hi)` (`calendar:time_to_seconds/1`'s
+            // `is_integer(H, 0, 23)`); mirrors the C `is_integer_3`.
+            ("erlang", "is_integer", 3) => Some(self.is_integer_3(args)),
             ("erlang", "is_list", 1) => Some(Ok(self.boolean(guard::is_list(args[0])))),
             ("erlang", "is_map", 1) => Some(Ok(self.boolean(guard::is_map(args[0])))),
             ("erlang", "is_number", 1) => Some(Ok(self.boolean(guard::is_number(args[0])))),
@@ -336,6 +344,11 @@ impl ModuleHost {
                 Some(Err(BeamError::BadArg))
             }
             ("erlang", "nif_error", 1) => Some(Err(BeamError::BadArg)),
+            // `erlang:raise/3` — the raise BIF the compiler lowers `throw(X)` to
+            // (`gb_sets:is_equal/2`'s differing-sets branch is a
+            // `call_ext_last erlang:raise/3` with class `throw`, NOT an
+            // `erlang:throw/1`).
+            ("erlang", "raise", 3) => Some(self.raise_3(args)),
             _ => None,
         }
     }
@@ -403,6 +416,93 @@ impl ModuleHost {
             Compare::Ge => ordering.is_ge(),
         };
         Ok(self.boolean(result))
+    }
+
+    /// `is_integer(Value, Min, Max)` — the **range-guard** BIF the compiler emits
+    /// for `is_integer(V, Lo, Hi)` (e.g. `calendar:time_to_seconds/1`'s
+    /// `is_integer(H, 0, 23)`).
+    ///
+    /// Mirrors the ERTS C `is_integer_3`
+    /// (`../../erts/emulator/beam/erl_bif_guard.c:337`) exactly:
+    ///
+    /// * a non-integer **bound** (`Min`/`Max`) is a `badarg`;
+    /// * a non-integer **value** fails the guard and yields `false` — **not**
+    ///   `badarg` (the bounds are the interface, the value is what is tested);
+    /// * otherwise `true` iff `Min =< Value && Value =< Max`.
+    fn is_integer_3(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        if args.len() != 3 {
+            return Err(BeamError::BadArg);
+        }
+        if !guard::is_integer(args[1]) || !guard::is_integer(args[2]) {
+            return Err(BeamError::BadArg);
+        }
+        if !guard::is_integer(args[0]) {
+            return Ok(self.boolean(false));
+        }
+        let in_range = cmp_arith(args[1], args[0], &self.atoms).is_le()
+            && cmp_arith(args[0], args[2], &self.atoms).is_le();
+        Ok(self.boolean(in_range))
+    }
+
+    /// `erlang:raise(Class, Reason, Stacktrace)` — the raise BIF the compiler
+    /// lowers the Erlang `throw(X)` sugar to.
+    ///
+    /// `gb_sets:is_equal/2`'s differing-sets branch compiles `throw(not_equal)` to
+    /// `call_ext_last erlang:raise/3` with class `throw` (`gb_sets.erl:240`), **not**
+    /// to an `erlang:throw/1` call. Mirrors `beam_bifs::convert::raise_3`: the
+    /// **class** comes from the first argument and must name one of
+    /// `error`/`exit`/`throw` (anything else is a `badarg`), and the reason carries
+    /// the shape the host's other raise BIFs use — an **atom** reason becomes the
+    /// raise's [`ExitReason`], while a **non-atom** reason rides the opaque
+    /// [`Raise::live_reason`] slot as its real term ([`ExitReason::Structured`]).
+    ///
+    /// The stacktrace argument is not reproduced: the engine derives an uncaught
+    /// raise's stacktrace from its own live frames.
+    fn raise_3(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        if args.len() != 3 {
+            return Err(BeamError::BadArg);
+        }
+        let class = self.exception_class(args[0])?;
+        let reason = args[1];
+        // An **atom** reason becomes the raise's [`ExitReason`] (named against the
+        // shared table; an unnameable atom is the typed `badarg` rather than a
+        // substituted name). A **non-atom** reason is [`ExitReason::Structured`]
+        // and its real term travels in the live-reason slot (the workspace
+        // convention: payload = `Eterm`).
+        let (exit_reason, live) = if is_atom(reason) {
+            let name = self
+                .atoms
+                .name(atom_val(reason))
+                .map(str::to_string)
+                .ok_or(BeamError::BadArg)?;
+            (ExitReason::Atom(name.into()), None)
+        } else {
+            (ExitReason::Structured, Some(LiveReason::new(reason)))
+        };
+        let raise = match class {
+            ExceptionClass::Error => Raise::error(exit_reason),
+            ExceptionClass::Exit => Raise::exit(exit_reason),
+            _ => Raise::throw(exit_reason),
+        };
+        let raise = match live {
+            Some(live) => raise.with_live_reason(live),
+            None => raise,
+        };
+        Err(BeamError::Raise(raise))
+    }
+
+    /// The [`ExceptionClass`] named by `term` (`error`/`exit`/`throw`), mirroring
+    /// `beam_bifs::convert::exception_class` — anything else is a `badarg`.
+    fn exception_class(&self, term: Eterm) -> Result<ExceptionClass> {
+        if !is_atom(term) {
+            return Err(BeamError::BadArg);
+        }
+        match self.atoms.name(atom_val(term)) {
+            Some("error") => Ok(ExceptionClass::Error),
+            Some("exit") => Ok(ExceptionClass::Exit),
+            Some("throw") => Ok(ExceptionClass::Throw),
+            _ => Err(BeamError::BadArg),
+        }
     }
 
     /// `A ++ B` — `A`'s elements prepended onto `B`.

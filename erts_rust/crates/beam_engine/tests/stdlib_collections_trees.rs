@@ -35,8 +35,8 @@
 //!   `take_smallest/1`, `take_largest/1`, `smallest/1`, `largest/1`,
 //!   `iterator/1` + `next/1` (an in-order walk), `balance/1`;
 //! * **`gb_sets`** — `union/2`, `intersection/2`, `subtract/2`, `singleton/1`,
-//!   `is_equal/2` (equal branch only — the differing branch is a host gap, see
-//!   `gb_sets_is_equal_on_differing_sets_reports_its_host_gap`), `take_smallest/1`,
+//!   `is_equal/2` (both branches — the differing branch throws `not_equal`, which
+//!   the host floor's `erlang:raise/3` turns into `false`), `take_smallest/1`,
 //!   `take_largest/1`.
 //!
 //! ## Why these two modules run
@@ -58,7 +58,6 @@
 
 mod support;
 
-use beam_common::BeamError;
 use beam_engine::terms;
 use beam_term::{make_small, Eterm};
 use support::{
@@ -329,10 +328,6 @@ fn stdlib_gb_sets_union_intersection_subtract_is_equal() {
     assert_set(&mut host, diff, &[1]);
 
     // oracle: gb_sets:is_equal(from_list([1,2,3]), from_list([1,2,3])) = true
-    //
-    // (The **differing**-sets branch is `false` on the oracle but is a *host* gap
-    // here — see `gb_sets_is_equal_on_differing_sets_reports_its_host_gap`: the
-    // equal branch returns `[]` and never throws, so it executes end to end.)
     let c = int_list(&mut host, &[1, 2, 3]);
     let same = host
         .call("gb_sets", "from_list", &[c])
@@ -343,26 +338,19 @@ fn stdlib_gb_sets_union_intersection_subtract_is_equal() {
     assert_shared_atom(&mut host, equal, "true");
 }
 
-/// The one blocked `gb_sets` export in this slice: `is_equal/2` on two
-/// **differing** sets.
+/// `gb_sets:is_equal/2` on two **differing** sets — the branch that throws.
 ///
 /// `gb_sets:is_equal/2`'s first clause (`gb_sets.erl:222`) walks the second set's
 /// sorted keys while recursing the first and, the moment a key differs, runs
 /// `throw(not_equal)`, relying on its own
 /// `try is_equal_1(…) of [] -> true catch throw:not_equal -> false end` to turn
-/// that throw into `false`. The engine's **test-host BIF floor**
-/// (`support/bifs.rs`) serves no `erlang:throw/1`, so that call becomes the
-/// floor's typed `badarg` — an `error`-class raise, which the `catch
-/// throw:not_equal` clause correctly does **not** match, so it propagates out.
-///
-/// This is a *host facility* gap (the floor is deliberately minimal; the real
-/// runtime serves `throw/1` through `beam_bifs`), **not** an engine opcode gap —
-/// the equal-sets branch (which returns `[]` and never throws) executes above,
-/// and `is_equal`'s walk is the same `gb_trees` traversal the other cases prove.
-///
-/// This test pins the **exact** typed error rather than inventing a result.
+/// that throw into `false`. The compiler lowers `throw(not_equal)` to
+/// `erlang:raise(throw, not_equal, nil)` (`gb_sets.erl:240`), and the host floor's
+/// `erlang:raise/3` raises class `throw` with the atom `not_equal`, which the
+/// `catch throw:not_equal` clause matches — so the walk returns `false` exactly as
+/// the oracle does.
 #[test]
-fn gb_sets_is_equal_on_differing_sets_reports_its_host_gap() {
+fn stdlib_gb_sets_is_equal_on_differing_sets_is_false() {
     if skip_if_unavailable() {
         return;
     }
@@ -377,30 +365,12 @@ fn gb_sets_is_equal_on_differing_sets_reports_its_host_gap() {
         .call("gb_sets", "from_list", &[b])
         .expect("gb_sets:from_list/1 must run");
 
-    // oracle: gb_sets:is_equal(from_list([1,2,3]), from_list([2,3,4])) = false
-    //
-    // expected typed gap: `error:badarg` raised out of the unserved
-    // `erlang:throw(not_equal)` (the host floor, mirroring `beam_bifs`'s missing
-    // host seam for `throw/1`).
-    let err = host
+    // oracle: erl -noshell -eval 'io:format("~w~n",[gb_sets:is_equal(gb_sets:from_list([1,2,3]), gb_sets:from_list([2,3,4]))]),halt().'
+    //         => false
+    let equal = host
         .call("gb_sets", "is_equal", &[s, s12])
-        .expect_err("`gb_sets:is_equal/2` needs the unserved `erlang:throw/1`");
-    println!(
-        "HOST GAP: gb_sets:is_equal/2 — the test-host BIF floor serves no \
-         `erlang:throw/1` (owner: tests/support/bifs.rs, mirroring beam_bifs' host \
-         seam): {err:?}"
-    );
-
-    let term = match &err {
-        BeamError::Raise(raise) => raise
-            .live_reason()
-            .and_then(|live| live.downcast_ref::<Eterm>())
-            .copied(),
-        other => panic!("`gb_sets:is_equal/2` must be the typed raise, got {other:?}"),
-    };
-    let term = term.expect("the `badarg` raise must carry its live reason term");
-    term_atom(&mut host, "badarg");
-    assert_atom(&host, term, "badarg");
+        .expect("gb_sets:is_equal/2 must run");
+    assert_shared_atom(&mut host, equal, "false");
 }
 
 #[test]
