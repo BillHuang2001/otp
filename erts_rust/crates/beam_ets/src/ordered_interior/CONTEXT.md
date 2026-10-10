@@ -82,7 +82,7 @@ tautologies.
   happens inside the delete of 15, not a subsequent one. The scenario itself is correct; cosmetic.
 
 ## Routing Table
-- `mod.rs` → `OrderedSetInterior` (B+-tree facade + `Interior` impl) and its test module
+- `mod.rs` → `OrderedSetInterior` (B+-tree facade + `Interior` impl); declares `mod tests;` → `tests.rs` (the crate's biggest test module)
 - `tree.rs` → `Tree`: insert/split, delete/borrow-or-merge, navigation, `check_invariants`
 - `node.rs` → `Node`/`LeafNode`/`BranchNode`/`Entry`, the `NodeStore` arena, `search_entries`, `child_index`, `ORDER`/`MIN_OCCUPANCY`
 - `iter.rs` → `LeafIter` (the leaf-chain ordered iterator)
