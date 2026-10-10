@@ -43,6 +43,13 @@
 //!   (`lists:zipwith(5, [], [1])`, `lists:zipwith(5, [1,2], [])`) fails the clause set
 //!   itself and is `function_clause` whatever the fun is.
 //!
+//!   `zipwith/3` needs one more layer of care in a test: with the stub `FunCaller`
+//!   standing in for the call layer (it *answers* instead of raising `{badfun,5}`),
+//!   the walk applies the non-fun to the single pair and then continues into the
+//!   guarded `([], [])` terminal clause — so the observable is "the fun **reached**
+//!   the call layer", proven by the stub's recorded argument tuple, not "the call
+//!   returned `Ok`". An entry guard would reject before the fun is ever applied.
+//!
 //! The guard is a **clause head**, so it also precedes the `case`-based walks:
 //! `lists:all(5, a)` is `function_clause`, *not* the `{case_clause, a}`
 //! `lists:all(fun(_) -> true end, a)` raises. Both orderings are pinned below.
@@ -121,7 +128,7 @@ use beam_bifs::{default_registry, BifContext, BifRegistry, FunCaller};
 use beam_codec::term::{tuple_arity, tuple_element};
 use beam_common::{BeamError, ExceptionClass, ExitReason, Result};
 use beam_process::ProcessId;
-use beam_term::{atom_val, make_atom, AtomTable, Eterm, NIL};
+use beam_term::{atom_val, make_atom, make_small, AtomTable, Eterm, NIL};
 
 // ---------------------------------------------------------------------------
 // Test scaffolding
@@ -146,15 +153,19 @@ fn atom(name: &str) -> (AtomTable, Eterm) {
 }
 
 /// A `FunCaller` that never inspects the fun: every call answers the configured
-/// *verdict* term. The functions under test read the verdict as a boolean (the
-/// predicates, `sort/2`'s ordering fun) or hand it straight back (`zipwith/3`), so one
-/// stub serves them all.
+/// *verdict* term, and the arguments of every call are recorded (in call order) so a
+/// test can prove that the BIF **reached** the call layer rather than rejecting the fun
+/// itself. The functions under test read the verdict as a boolean (the predicates,
+/// `sort/2`'s ordering fun) or hand it straight back (`zipwith/3`), so one stub serves
+/// them all.
 struct StubFuns {
     verdict: Eterm,
+    calls: Vec<Vec<Eterm>>,
 }
 
 impl FunCaller for StubFuns {
-    fn call_fun(&mut self, _fun: Eterm, _args: &[Eterm]) -> Result<Eterm> {
+    fn call_fun(&mut self, _fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
+        self.calls.push(args.to_vec());
         Ok(self.verdict)
     }
 }
@@ -162,6 +173,16 @@ impl FunCaller for StubFuns {
 /// Runs `f` over the default registry and a fresh context whose stub fun answers `true`
 /// when `verdict` is set, else `false`.
 fn run<R>(verdict: bool, f: impl FnOnce(&BifRegistry, &mut BifContext<'_>) -> R) -> R {
+    run_recording(verdict, f).0
+}
+
+/// Like [`run`], but also returns the argument tuple of every fun application the stub
+/// `FunCaller` saw — the evidence that a BIF handed a fun (or a non-fun) to the call
+/// layer instead of rejecting it.
+fn run_recording<R>(
+    verdict: bool,
+    f: impl FnOnce(&BifRegistry, &mut BifContext<'_>) -> R,
+) -> (R, Vec<Vec<Eterm>>) {
     let registry = default_registry();
     let atoms = seeded_atoms();
     // Leaked on purpose: the closure's results are `Eterm`s that point into this heap,
@@ -173,9 +194,12 @@ fn run<R>(verdict: bool, f: impl FnOnce(&BifRegistry, &mut BifContext<'_>) -> R)
     } else {
         make_atom(atoms.lookup("false").expect("seeded"))
     };
-    let mut stub = StubFuns { verdict };
-    let mut ctx = BifContext::new(heap, &atoms, ProcessId::new(1, 0)).with_fun_caller(&mut stub);
-    f(&registry, &mut ctx)
+    let mut stub = StubFuns { verdict, calls: Vec::new() };
+    let result = {
+        let mut ctx = BifContext::new(heap, &atoms, ProcessId::new(1, 0)).with_fun_caller(&mut stub);
+        f(&registry, &mut ctx)
+    };
+    (result, stub.calls)
 }
 
 /// A **real** `EXPORT_EXT` fun term of arity `arity`, so the `is_function(Fun, Arity)`
@@ -535,16 +559,38 @@ fn zipwith_guards_only_its_empty_empty_clause() {
     assert_function_clause(result);
 
     // Equal-length non-empty lists match the **unguarded** first clause, so the BIF
-    // must not reject the non-fun: the oracle reaches the call layer —
+    // must not reject the non-fun up front: the oracle reaches the call layer —
     // `lists:zipwith(5, [1], [2])` => {error,{badfun,5}}.
-    let result = run(true, |reg, ctx| {
+    //
+    // The stub `FunCaller` stands in for that layer and *answers* (`Ok(true)`) instead
+    // of raising `{badfun,5}`, so the walk applies the non-fun to the pair and then
+    // continues into the guarded `([], [])` terminal clause, whose `is_function(5, 2)`
+    // is the only remaining rejection. What the BIF is responsible for is therefore not
+    // the *outcome* but that the fun **reached the call layer** — the stub's recorded
+    // argument tuple is exactly that evidence (an entry guard would reject before the
+    // fun is ever applied, leaving the recording empty).
+    let (result, calls) = run_recording(true, |reg, ctx| {
         let one = ctx.list(&[ctx.int(1).expect("fits")]).expect("fits");
         let two = ctx.list(&[ctx.int(2).expect("fits")]).expect("fits");
         let non_fun = ctx.int(5).expect("fits");
         reg.call("lists", "zipwith", 3, ctx, &[non_fun, one, two])
     });
-    assert_not_function_clause(&result);
-    assert!(result.is_ok(), "the unguarded clause reaches the (stub) call layer");
+    assert_eq!(
+        calls,
+        vec![vec![make_small(1), make_small(2)]],
+        "the unguarded clause applies the fun to the single pair"
+    );
+    // And the only rejection the BIF may still produce is that terminal clause's own
+    // bare `function_clause` — never a different reason.
+    match &result {
+        Ok(_) => {}
+        Err(BeamError::Raise(raise)) => assert_eq!(
+            raise.reason,
+            ExitReason::atom("function_clause"),
+            "the only remaining rejection is the `([], [])` guard, got {result:?}"
+        ),
+        other => panic!("unexpected non-raise failure: {other:?}"),
+    }
 
     // A real arity-2 fun passes the guard:
     // `lists:zipwith(fun(A, _B) -> A end, [], [])` => [].
