@@ -117,6 +117,13 @@ is part of the documented NIF/driver ABI.
 - Sizes/int-width questions trace back to `../configure.ac:122` (AC_CONFIG_HEADERS) and the
   `SIZEOF_*` AC_CHECK_SIZEOF probes, not to hand-written constants.
 - Do not `git add -f` anything under a `$(TARGET)` directory.
+- Every tracked header under this node is reachable from at least one supported build configuration:
+  the per-arch/impl dirs are pulled in by conditional `#include`s in `internal/ethread.h` (so a
+  header unused on the current host machine is still live). `erl_fixed_size_int_types.h` is the sole
+  header with no in-tree `#include` (installed-only). See `internal/CONTEXT.md` for the
+  impl-selection table.
+- The two `.h.in`/`.mk.in` pairs are configure inputs referenced from `../configure.ac`
+  (`:122`, `:3946-3947`), not dead templates.
 - `internal/*.mk.in` are **makefile** fragments, not C headers — they become `internal/$(TARGET)/*.mk`
   consumed by `../lib_src/Makefile.in` and `../../lib/common_test/test_server/ts_erl_config.erl`.
 
