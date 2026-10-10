@@ -659,16 +659,31 @@ impl Driver for DriverPort {
         Ok(())
     }
 
-    /// `ready_output`: drain the port's output queue to the driver **and** report write-readiness.
+    /// `ready_output`: deliver any queued command bytes, then report write-readiness.
     ///
-    /// The drained bytes always go down this crate's single write path,
-    /// [`DriverPort::write_driver`] — the C's `port_command` → `output`/`outputv` delivery
-    /// (`io.c:1782`/`io.c:1517`) — so a queued command reaches the driver whichever callback slots
-    /// its entry declares. When the entry also declares a `ready_output` slot, that slot then runs
-    /// with the write-armed fd as the event: it is the C's write-**readiness** notification (the
-    /// `ERTS_PORT_TASK_OUTPUT` arm, `erl_port_task.c:1793-1797`), not a second write path, so an
-    /// entry declaring both callbacks sees the C's combined effect (bytes via `output`/`outputv`,
-    /// then the notification).
+    /// Two distinct C events share this one port-task arm, which is why the order below is the order
+    /// it is:
+    ///
+    /// 1. bytes Erlang queued (`port_command`) go down this crate's single write path,
+    ///    [`DriverPort::write_driver`] — the C's `port_command` → `outputv`/`output` delivery
+    ///    (`io.c:1782`/`io.c:1517`), which this crate performs on the port's `OUTPUT` task because
+    ///    [`PortRegistry::port_command`](crate::PortRegistry::port_command) only queues the bytes and
+    ///    schedules that task; and
+    /// 2. the entry's own `ready_output` slot then runs as the C's write-**readiness** notification
+    ///    (the `ERTS_PORT_TASK_OUTPUT` arm, `erl_port_task.c:1793-1797`, whose only driver callback
+    ///    *is* `ready_output`).
+    ///
+    /// **The write half is guarded on the queue being non-empty.** The C never calls
+    /// `output`/`outputv` with nothing to write: an `OUTPUT` task scheduled purely by write
+    /// readiness carries no command at all (`erl_check_io.c::oready`, and the emulator keeps the two
+    /// apart — `io.c` hands the command's vector to `outputv` from `erts_port_output`, never from
+    /// the port task). A zero-length `outputv` call is therefore a callback the C does not make and
+    /// a driver need not expect (`inet_drv`'s `tcp_sendv` would prepend its `{packet,N}` length
+    /// header to it, `inet_drv.c:13756-13770`).
+    ///
+    /// **The readiness half is *not* guarded.** An `OUTPUT` task exists in the C to notify write
+    /// readiness and runs `ready_output` unconditionally, so whether this crate's task also happened
+    /// to carry command bytes is not something the notification may depend on.
     ///
     /// A slot-absent entry is unaffected: [`DriverPort::write_driver`] routes to the entry's
     /// `outputv`/`output`, and an entry declaring neither gets the C's logging `no_output_callback`
@@ -682,7 +697,9 @@ impl Driver for DriverPort {
         // task was scheduled for, not whatever the write callback may re-arm (`output`/`outputv`
         // are free to call `driver_select`).
         let event = fd_to_event(self.abi.state().fd_armed(false));
-        self.write_driver(ctx, &mut buf);
+        if !buf.is_empty() {
+            self.write_driver(ctx, &mut buf);
+        }
         if self.lib.entry().ready_output.is_some() {
             self.call(ctx, |port, _handle| {
                 let _ = port.lib.ready_output(port.data, event);
