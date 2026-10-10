@@ -22,18 +22,22 @@
 %% Tests for the opt-in "FBIP" (functional-but-in-place) pass
 %% beam_ssa_fbip/1.
 %%
-%% The pass is only run when the compile option `fbip_opt' is given; the
-%% gating is done by beam_ssa_destructive_update:opt/2, which invokes the
-%% pass after the regular alias/destructive-update transforms. Without the
-%% option the update_record hint is whatever the ordinary destructive-update
-%% pass produced.
+%% The pass is only run when the compile option `fbip_opt' is given. It is
+%% then registered as the named module pass `ssa_opt_fbip' in
+%% beam_ssa_opt:epilogue_module_passes/1, i.e. after the regular alias and
+%% destructive-update transforms, and its kill switch `no_ssa_opt_fbip' is
+%% auto-derived from that registration like for every other pass (the option
+%% replaces the pass with an identity fun). `no_ssa_opt' also skips it, by
+%% skipping the whole `beam_ssa_opt' phase. Without `fbip_opt' the pass is not
+%% registered at all and the update_record hint is whatever the ordinary
+%% destructive-update pass produced.
 %%
 %% The pass rewrites a *copying* `update_record' to the `inplace' hint when
 %% the update source is a value that is provably
 %%
-%%   * freshly allocated (a tuple, a writable binary, a call to a local
-%%     "fresh returning" function, or a value that is already an inplace
-%%     update result),
+%%   * freshly allocated (a tuple construction, a call to a local "fresh
+%%     returning" function, an update that is already `inplace', or an
+%%     all-fresh `phi'),
 %%   * uniquely owned (not a function argument, used exactly once), and
 %%   * correctly positioned: either the definition is in the same block as
 %%     the update, or the definition block D dominates the update block U
@@ -101,30 +105,11 @@
 %% instruction at all; that case is exercised (and documented) by the
 %% `literal_sources' probe functions.
 %%
-%% == Divergences from the documented contract ==
-%%
-%% Two clauses of the contract above cannot be pinned by a test:
-%%
-%%   1. The freshness rule lists an allocating `bs_create_bin' /
-%%      `bs_init_writable' as a fresh source. `update_record' writes a tuple,
-%%      and the type analysis proves that an update of a binary source can
-%%      never succeed, so such an update is folded into an unconditional
-%%      `{badrecord,_}' raise before this pass runs - no Erlang source can
-%%      get a `bs_create_bin'/`bs_init_writable' source into an
-%%      `update_record' and the clause is unreachable for this pass.
-%%      `bin_upd/1' asserts the observable consequence instead: neither
-%%      build contains an `update_record' for a binary source.
-%%   2. The pass is documented as having the kill switch `no_ssa_opt_fbip',
-%%      but that switch does NOT disable it. It is accepted without a
-%%      warning, and it is inert: `ssa_opt_fbip' is not a pass of the
-%%      `beam_ssa_opt' phase list - the pass is invoked by
-%%      `beam_ssa_destructive_update:opt/2' through the `$fbip_opt'
-%%      process-dictionary flag, and the name is only declared in
-%%      `compile:options/0' for the `--help' text - so `passes_1/2' has no
-%%      pass name to derive the negation from. Only `no_ssa_opt' disables the
-%%      pass (by skipping the whole `beam_ssa_opt' phase). This suite
-%%      therefore asserts the switch that works and does not assert the
-%%      documented effect of `no_ssa_opt_fbip'.
+%% Only a tuple can be the source of an `update_record' reaching the pass:
+%% `update_record' always writes a tuple, and the SSA type analysis folds an
+%% update of a binary source into an unconditional `{badrecord,_}' raise
+%% before the pass runs. `bin_upd/1' asserts that observable consequence:
+%% neither build contains an `update_record' for a binary source.
 %%
 -module(beam_ssa_fbip_SUITE).
 
@@ -350,7 +335,7 @@ fresh_source_declines(Config) ->
 %% `update_record': the type analysis proves it can never succeed and
 %% replaces it with a `{badrecord,_}' raise. All three functions must have no
 %% `update_record' at all in either build - in particular the option must not
-%% introduce an `inplace' one (see divergence 1 in the header).
+%% introduce an `inplace' one (see the tuple-source note in the header).
 no_reuse_for_lists_maps_binaries(Config) ->
     {_Mod, Builds} = build_probe(Config, "beam_ssa_fbip_noreuse"),
 
@@ -380,10 +365,9 @@ literal_sources_not_rewritten(Config) ->
 %% The pass is opt-in, so it must not perturb a module in which it cannot
 %% fire: for a module with no `update_record' at all the eligibility gate is
 %% already false and the module must be compiled identically with `fbip_opt'
-%% and without it. The whole module is compared, not just one function, so
-%% this pins "default off changes nothing" for the default pipeline. The
-%% inert `no_ssa_opt_fbip' (see divergence 2 in the header) is included
-%% because it must at least not change anything on its own.
+%% and without it, and `no_ssa_opt_fbip' on its own must change nothing
+%% either. The whole module is compared, not just one function, so this pins
+%% "default off changes nothing" for the default pipeline.
 default_off_unchanged(Config) ->
     {_Mod, Builds} =
         build_probe(Config, "beam_ssa_fbip_passive",
@@ -400,28 +384,54 @@ default_off_unchanged(Config) ->
     ?assertEqual(3, length(Builds)),
     ok.
 
-%% The kill switch that works: `no_ssa_opt' skips the whole SSA optimization
-%% phase - the pass is invoked from inside
-%% beam_ssa_destructive_update:opt/2, which is one of its sub-passes - so the
-%% record updates are compiled as copying constructions and no
-%% `update_record' instruction is generated at all. The pass therefore
-%% cannot fire, and the build must still behave exactly like the default
-%% one.
+%% Both kill switches work. `no_ssa_opt' skips the whole SSA optimization
+%% phase - the FBIP pass is one of its passes - so the record updates are
+%% compiled as copying constructions and no `update_record' instruction is
+%% generated at all. `no_ssa_opt_fbip' replaces just the pass with an
+%% identity fun, so it must revert the rewrite exactly back to the result of
+%% the build without `fbip_opt'. The pass therefore cannot fire under either
+%% switch, and both builds must still behave exactly like the default one.
 %%
-%% `no_ssa_opt_fbip' is NOT covered here because it does not disable the
-%% pass; see divergence 2 in the suite header.
+%% This is checked for every probe whose update `fbip_opt' rewrites: the
+%% `nofbip' and the `nofbip_only' build must have the same hint as the
+%% `plain' build, and the whole disassembled module code of both must be
+%% identical to the `plain' build's code.
 kill_switches(Config) ->
     {_Mod, Builds} =
         build_probe(Config, "beam_ssa_fbip_kill",
-                    [{no_ssa_opt,[binary,fbip_opt,no_ssa_opt]}]),
+                    [{plain,[binary]},
+                     {fbip,[binary,fbip_opt]},
+                     {no_ssa_opt,[binary,fbip_opt,no_ssa_opt]},
+                     {nofbip,[binary,fbip_opt,no_ssa_opt_fbip]},
+                     {nofbip_only,[binary,no_ssa_opt_fbip]}]),
 
-    lists:foreach(fun(Fun) ->
-                          ?assertEqual(none, hint(no_ssa_opt, Builds, Fun, 1))
-                  end, [safe,join,nested,phi_call]),
-    ?assertEqual(none, hint(no_ssa_opt, Builds, loop_alloc, 2)),
+    Rewritten = [{safe,1},{join,1},{nested,1},{phi_call,1},{loop_alloc,2}],
+    lists:foreach(fun({Fun,Arity}) ->
+                          %% The pass cannot fire here at all.
+                          ?assertEqual(none,
+                                       hint(no_ssa_opt, Builds, Fun, Arity)),
 
-    %% Skipping the SSA optimization phase must not change what the probes
-    %% do.
+                          %% It really does fire with the option ...
+                          ?assertEqual({atom,inplace},
+                                       hint(fbip, Builds, Fun, Arity)),
+
+                          %% ... and turning it off again (either way)
+                          %% gives back exactly the flag-OFF hint.
+                          ?assertEqual(hint(plain, Builds, Fun, Arity),
+                                       hint(nofbip, Builds, Fun, Arity)),
+                          ?assertEqual(hint(plain, Builds, Fun, Arity),
+                                       hint(nofbip_only, Builds, Fun, Arity))
+                  end, Rewritten),
+
+    %% Neither switch may disturb anything else either: compared as a whole
+    %% module, both builds are the flag-OFF build.
+    Plain = normalize(code_of(plain, Builds)),
+    lists:foreach(fun(Set) ->
+                          ?assertEqual({Set,Plain},
+                                       {Set,normalize(code_of(Set, Builds))})
+                  end, [nofbip,nofbip_only]),
+
+    %% Disabling the pass must not change what the probes do.
     lists:foreach(fun({Fun, Args}) ->
                           check_calls(Builds, Fun, Args)
                   end, cases()),
@@ -771,6 +781,14 @@ unchanged(Builds, Fun, Arity, Expected) ->
 
 is_update_record(I) ->
     is_tuple(I) andalso tuple_size(I) =:= 6 andalso element(1, I) =:= update_record.
+
+%% The disassembled code (element(4)) of one build, as it is used by the
+%% whole-module comparisons above; apply normalize/1 before comparing.
+code_of(Set, Builds) ->
+    case lists:keyfind(Set, 1, Builds) of
+        {Set, _Mod, _Bin, Code} -> Code;
+        false -> ct:fail({missing_option_set, Set})
+    end.
 
 function_code(Code, Name, Arity) ->
     case [Is || {function,N,A,_,Is} <- Code, N =:= Name, A =:= Arity] of
