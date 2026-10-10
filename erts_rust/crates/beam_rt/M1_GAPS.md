@@ -3,8 +3,7 @@
 Companion to [`CONTEXT.md`](CONTEXT.md). It holds the current-state per-item detail behind `CONTEXT.md`'s
 condensed `Known Issues / Intentional M1 gaps` bullets and its longest cross-node handoffs, split out so
 `CONTEXT.md` stays under the Context Tree per-file read limit. Every gap below is a typed capability gap
-or a measured own-state difference — never a wrong result, except the single term-lifetime defect recorded
-under `Cross-node handoff detail`. Present-state documentation, not a change log.
+or a measured own-state difference — never a wrong result. Present-state documentation, not a change log.
 
 ## Dispatch, atoms and module introspection
 * **Shared-`AtomTable` cloning.** `call_registered`/`try_call_nif` commit pending names via
@@ -197,27 +196,3 @@ re-basing, and `beam_bifs` per-object `hp` re-fetch.
   `BifRegistry::call`) — ~4 small `String` allocations per registered call, the largest attributable
   dispatch residual (measured ~60-80 ns/call alongside the caller-module clone). A borrowed-key
   `lookup(&str, &str, u32)` would remove it.
-* **Term lifetime across a mailbox delivery (owner: `beam_process`) — a WRONG-RESULT defect, not a capability gap.**
-  `Process::deliver` copies an incoming payload onto the recipient's young heap and, on `AllocKind::Heap`/
-  `AllocKind::Message` exhaustion, runs `Process::collect()` (`beam_process/src/process.rs:688-693`). That
-  collect publishes only the registers/stack, the mailbox payloads, the process dictionary, the saved BIF
-  args and the pending-signal queue (`Process::collect`, `beam_process/src/process.rs:780-`) — it does **not**
-  know about a term held by this crate's `-eval` evaluator environment or by a nested `Machine` running a
-  module export (`RuntimeContext::run_export`; the nested heap-admission latch is deliberately never armed,
-  `src/context/gc.rs`). Such a term is therefore not relocated and its words are recycled.
-  Repro (deterministic): `beam_rt -noshell -eval '{ok,D}=file:open("<f.erl>",[read]),
-  A=io:scan_erl_exprs(D,"",{1,1},[]), B=io:scan_erl_exprs(D,"",{1,1},[]),
-  C=io:scan_erl_exprs(D,"",{1,1},[]), io:format("~p~n",[A]).'` → `beam_rt: badarg` (exit 1) where the oracle
-  prints the first form's token list; printing each result immediately after its own request works. Larger
-  first forms fail sooner (a typed `allocation failure: message` instead of `badarg`), and
-  `erts_debug:size(A)` after three requests panics in `beam_term/src/ops.rs:194` (`invalid boxed header
-  subtag 0x9`). The payload-size dependence is non-monotonic — the collect fires only when the young heap is
-  exhausted. The `{get_until,…}` continuation (`src/native/file_server/get_until.rs`) is what makes it
-  reachable: its reply payload is the first large enough to exhaust the recipient's young heap, which arms
-  the delivery-time collect (`file:read/2`'s pure-Rust `{get_chars,…}` arm happens not to). This crate's own
-  valves (`Runtime::halt_process_gc`/`gc_process_enabled`, `src/runtime/gc.rs`) are consulted only by its own
-  `ensure_heap` admission point, never by `beam_process`'s delivery-driven collect. Fix shape: an exemption
-  honoured by `Process::deliver`'s collect for a process whose full root set cannot be published, driven from
-  this crate's valve — the same conservative rule `ensure_heap` already applies to an unresolvable call site.
-  A discriminating regression test belongs in `tests/io_scan.rs`: issue two or more `{get_until,…}` requests on
-  one device and then read the FIRST result.
