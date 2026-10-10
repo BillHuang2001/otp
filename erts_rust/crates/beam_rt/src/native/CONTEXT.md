@@ -553,6 +553,21 @@ needs:
     `path_access` + `process_credentials()` (closes the whole `#file_info{}` family) and a raw-syscall
     floor `fadvise`/`fallocate`/`chmod`/`chown`/`utimes`.
 
+## Known Issues
+
+### Curated-gap closability (`../error.rs:415-453`; oracle-checked, OTP 29.1.1 / erts-17.1)
+**Closable via an `erlang.erl` wrapper arm** — the public `erlang:` name wraps an `erts_internal:*` primitive this floor already serves: `erlang:garbage_collect/0` (`erlang.erl:3046`) + `/1` (`:3055`) → **served** `erts_internal:garbage_collect/1` (`erts_internal.rs:266`); `erlang:process_flag/3` (`:5522-5531`) → **served** `erts_internal:process_flag/3` (`erts_internal.rs:252`); `erlang:localtime_to_universaltime/1` (`:11875-11881`) → the **registered** `/2` (`beam_bifs/src/calendar.rs:418-421`). A non-self target lowers to `erlang:F(Node,...)`, whose `erlang.erl` clause calls `erts_internal:F(...)` (`call_bif`'s `module == "erlang"` fallback, `context/mod.rs:1810-1819`).
+**Mislabeled — the oracle does not export the name either** (`{error,undef}`), so the runtime answers `unsupported`/exit 3 where the oracle exits 1: `register/3`, `system_profile/1`, `apply/1`, `function_exported/2`, `load_module/3`, `statistics/0`, `map_get/3`, `concatenate/2`, `system_info/2`. `set_cookie/2` is **already served** (`native.rs:232`, `node.rs:125-140`).
+**Needs a new facility (shape-closable only):** `port_connect/2`/`port_call/3`, `spawn_request/2..5` (omits `/1`), `suspend_process/1` (omits `/2`), `system_monitor/*` (`/0` ⇒ `undefined`; `erts_internal:system_monitor/1,3` exported but unserved), `process_display/2`, `load_module/2`, `disconnect_node/1` (needs `"net_kernel"` in `FLOOR_MODULES`, `native.rs:116-125`). Edit gates: `error.rs:844-950`, `native.rs:837-869`.
+
+### Recorded gaps and fabricated values
+- **`last_calls` ⇒ `false` is a real divergence** — `Process::save_calls()` holds a real flag (`memory/mod.rs:803`).
+- `application.rs:303-409` `app_env_props` omits kernel's `logger`/`connect_all` injections ⇒ `application:get_env(kernel,connect_all)` is `undefined` here vs `{ok,true}` on the oracle.
+- `init:get_argument(bindir)` (`init.rs:89`) real value unused (falls through to `error`).
+- `file_server.rs` does not serve `{write_file,Name,Data}` (`:337-357`) though `prim_file:write_file/2` IS implemented (`prim.rs:188`).
+- `context/process_bridge.rs:323-331` `process_flag(error_handler, A)` accepts an atom where the oracle raises `badarg` (owner `context/`).
+All other constants are truthful defaults or derive from real state (`application.rs:98`/`:194-196`, `code.rs:49`/`:183-185`, `init.rs:127-175`, `port.rs:148-154`/`:282-301`).
+
 ## Handoffs (owned by OTHER nodes)
 The per-call dispatch arm for every native BIF is a registration in `../native.rs` (one level up, outside *this* node's scope); its `("code","get_mode",0)` and `("application","get_application",0)` arms are reachable and agree with the oracle (`interactive` / `undefined`), though its module-doc table still omits both names.
 `init:get_argument(root)` and `init:get_argument(home)` agree with the oracle through the same `init:get_argument/1` arm.
