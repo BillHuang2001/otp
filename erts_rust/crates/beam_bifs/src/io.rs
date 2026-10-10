@@ -45,13 +45,26 @@
 //! `~w` (write), `~p` (print — the printable-string rule, see [`crate::print`]),
 //! `~W`/`~P` (`~w`/`~p` with an explicit *depth* argument), `~s` (string: an atom's
 //! name, a proper list of byte-sized small integers, or a **binary**), `~c` (a
-//! character; `~tc` uses the full code point), `~n` (newline), `~~` (a literal
-//! `~`), `~i` (consume and ignore one argument), `~b`/`~B` (an integer in base 10,
-//! or `~.<base>b`/`~.<base>B` for base 2–36), `~x`/`~X` (an integer in `.<base>`
-//! with a **two-argument** `(Integer, Prefix)` shape), `~+`/`~#` (an integer in
-//! `.<base>`, default 10, carrying the `Base#` **prefix** its own base implies —
-//! lowercase digits for `~+`, uppercase for `~#`), and the float directives
-//! `~e`/`~f`/`~g`.
+//! character: `~c` takes the integer's low byte, `~tc` the full code point,
+//! negative, surrogates and bignums included — see below), `~n` (newline), `~~` (a
+//! literal `~`), `~i` (consume and ignore one argument), `~b`/`~B` (an integer in
+//! base 10, or `~.<base>b`/`~.<base>B` for base 2–36), `~x`/`~X` (an integer in
+//! `.<base>` with a **two-argument** `(Integer, Prefix)` shape), `~+`/`~#` (an
+//! integer in `.<base>`, default 10, carrying the `Base#` **prefix** its own base
+//! implies — lowercase digits for `~+`, uppercase for `~#`), and the float
+//! directives `~e`/`~f`/`~g`.
+//!
+//! # `~c`/`~tc`: the code point, verbatim
+//!
+//! `io_lib_format:control_small($c,…)` has two clauses: `~tc` renders the integer
+//! **verbatim** (`char(A, …)` is `[A]`) and `~c` renders only its low byte
+//! (`char(A band 255, …)`). So `io_lib:format("~tc",[1114112])` ⇒ `[1114112]`,
+//! `~tc` of the surrogate `55296` ⇒ `[55296]`, `~tc` of `-1` ⇒ `[-1]`, `~tc` of a
+//! bignum ⇒ that bignum, and `~c` of `257`/`-1`/`1 bsl 100` ⇒ `[1]`/`[255]`/`[0]`
+//! — all reproduced here. Such a code point is carried as a [`crate::print::Chunk::Int`]
+//! and `io:format` raises `badarg` for one the oracle's unicode device refuses
+//! (`io:format("~tc",[1114112])` ⇒ `error:badarg`), while a valid scalar is written
+//! as its UTF-8 encoding (`io:format("~tc",[16#10FFFF])` ⇒ `F4 8F BF BF`).
 //!
 //! Every integer directive — `~b`/`~B`, `~x`/`~X`, `~+`/`~#` — renders an
 //! **arbitrary-precision** integer: the digits come from the shared
@@ -60,6 +73,7 @@
 //! (`~.<base>…`); it must be `2..=36` exactly as `io_lib_format`'s
 //! `unprefixed_integer`/`prefixed_integer` guard demands, else `badarg`. The sign
 //! precedes the prefix (`io_lib:format("~.16#",[-255])` ⇒ `"-16#FF"`).
+//!
 //!
 //! Every directive accepts the full control-sequence prefix of
 //! `io_lib_format:collect_cseq/2`: an optional `-` (**left** adjust), a decimal
@@ -125,9 +139,6 @@
 //! * **Precision is the base for `~b`/`~B`/`~x`/`~X`/`~+`/`~#`** (as in the
 //!   oracle); it is a maximum length for `~w`/`~W` and an initial column for
 //!   `~p`/`~P`.
-//! * **`~c` takes a small integer only** (`~c`/`~tc` of a bignum is `badarg`); the
-//!   oracle would print its low byte / code point. A documented gap. The radix
-//!   directives (`~b`/`~B`/`~x`/`~X`/`~+`/`~#`) accept a bignum.
 //! * **`io_lib:format/3` ignores unknown options but not `chars_limit`.** The only
 //!   option erts-17.1 recognises is `{chars_limit, N}`; other elements are ignored
 //!   (verified against the oracle). A *limiting* `chars_limit` (`N >= 0`) selects
@@ -137,19 +148,21 @@
 //!   non-list `Options` is `badarg`, exactly as in the oracle; a negative
 //!   `chars_limit` (the oracle's default, i.e. no limit) behaves like `format/2`.
 
+use beam_codec::term::big_parts;
 use beam_common::Result;
 use beam_term::{atom_val, signed_value, Eterm};
 
 use crate::access::{
-    float_value, is_atom, is_float, is_small, is_tuple, tuple_element, tuple_size,
+    float_value, is_atom, is_big, is_float, is_small, is_tuple, tuple_element, tuple_size,
 };
+use crate::arith::int_from_mag;
 use crate::bits;
 use crate::context::BifContext;
 use crate::error::{badarg, unsupported_bif};
 use crate::numeric::integer_digits;
 use crate::print::{
-    adjust_chunk, dup_chars, field_chunk, flatten, pretty_chunk, proper_list, string_field_chunk,
-    term_chunk, Chunk, UNLIMITED_DEPTH,
+    adjust_chunk, dup_chars, dup_element, field_chunk, flatten_output, pretty_chunk, proper_list,
+    string_field_chunk, term_chunk, Chunk, UNLIMITED_DEPTH,
 };
 use crate::registry::BifRegistry;
 
@@ -283,7 +296,7 @@ fn chars_limit_option(ctx: &BifContext<'_>, option: Eterm) -> Result<Option<i64>
 /// `io:format`: render, write the result, return `ok`.
 fn io_format(ctx: &mut BifContext<'_>, format: Eterm, args: Option<Eterm>) -> Result<Eterm> {
     let chunks = render_format_of(ctx, format, args)?;
-    ctx.write_output(&flatten(&chunks))?;
+    ctx.write_output(&flatten_output(&chunks)?)?;
     ctx.ok()
 }
 
@@ -447,6 +460,8 @@ fn indent_char(c: char, column: i64) -> i64 {
 fn indentation_of(chunk: &Chunk, column: i64) -> i64 {
     match chunk {
         Chunk::Char(c) => indent_char(*c, column),
+        // `indentation([C|Cs], I) when is_integer(C) -> indentation(Cs, I+1)`.
+        Chunk::Int(_) => column + 1,
         Chunk::List(items) => items.iter().fold(column, |col, item| indentation_of(item, col)),
     }
 }
@@ -455,6 +470,7 @@ fn indentation_of(chunk: &Chunk, column: i64) -> i64 {
 fn splice_flat(out: &mut Vec<Chunk>, chunk: Chunk) {
     match chunk {
         Chunk::Char(c) => out.push(Chunk::Char(c)),
+        Chunk::Int(term) => out.push(Chunk::Int(term)),
         Chunk::List(items) => {
             for item in items {
                 splice_flat(out, item);
@@ -472,10 +488,12 @@ fn chunks_to_term(ctx: &mut BifContext<'_>, chunks: &[Chunk]) -> Result<Eterm> {
     ctx.list(&elems)
 }
 
-/// Materializes one chunk: a character is a small integer, a list a sub-list.
+/// Materializes one chunk: a character is a small integer, a raw integer is that
+/// integer itself, a list a sub-list.
 fn chunk_to_term(ctx: &mut BifContext<'_>, chunk: &Chunk) -> Result<Eterm> {
     match chunk {
         Chunk::Char(c) => ctx.int(i64::from(*c as u32)),
+        Chunk::Int(term) => int_element_term(ctx, *term),
         Chunk::List(items) => {
             let mut elems = Vec::with_capacity(items.len());
             for item in items {
@@ -484,6 +502,21 @@ fn chunk_to_term(ctx: &mut BifContext<'_>, chunk: &Chunk) -> Result<Eterm> {
             ctx.list(&elems)
         }
     }
+}
+
+/// Materializes a raw integer element on the context heap: the small integer
+/// itself, or the same **bignum** (`~tc` of `1 bsl 100` returns the bignum
+/// verbatim — the oracle's `char(A, …)` is `[A]`).
+///
+/// The limbs are borrowed from the term's own storage, so they are copied out
+/// before anything is allocated on the context heap.
+fn int_element_term(ctx: &mut BifContext<'_>, term: Eterm) -> Result<Eterm> {
+    if is_small(term) {
+        return ctx.int(signed_value(term));
+    }
+    let (negative, limbs) = big_parts(term)?;
+    let limbs = limbs.to_vec();
+    int_from_mag(ctx, negative, &limbs)
 }
 
 /// Parses one `~…` control sequence prefix, returning the [`Spec`] and the control
@@ -678,17 +711,8 @@ fn dispatch(
         }
         b'c' => {
             let arg = take(args, next_arg)?;
-            if !is_small(arg) {
-                return Err(badarg());
-            }
-            let value = signed_value(arg);
-            let ch = if spec.unicode {
-                let cp = u32::try_from(value).map_err(|_| badarg())?;
-                char::from_u32(cp).ok_or_else(badarg)?
-            } else {
-                (value & 0xff) as u8 as char
-            };
-            Ok(Piece::small(char_chunk(ch, spec)?))
+            let elem = char_element(arg, spec.unicode)?;
+            Ok(Piece::small(char_elem_chunk(elem, spec)?))
         }
         b'b' | b'B' => {
             let arg = take(args, next_arg)?;
@@ -857,14 +881,76 @@ fn float_field(chunk: Chunk, spec: &Spec) -> Chunk {
     }
 }
 
-/// `io_lib_format:char/5` for `~c`/`~~`.
+/// The single element a `~c`/`~tc` directive contributes
+/// (`io_lib_format:control_small($c,…)`).
+///
+/// The oracle has two clauses (`io_lib_format.erl:528-531`):
+///
+/// * with the `t` (unicode) modifier the argument is the code point **verbatim**
+///   (`char(A, …)` is `[A]`), so an integer that is not a Unicode scalar value —
+///   `1114112`, a surrogate `55296`, a negative value, a bignum — is carried as a
+///   [`Chunk::Int`] (the oracle's `io_lib:format` returns the raw integer;
+///   `io:format` then raises `badarg`, see [`flatten_output`]);
+/// * without it only the low byte survives (`char(A band 255, …)`), which is
+///   always a character.
+///
+/// # Errors
+///
+/// `badarg` for a non-integer argument (a float, an atom, a list, …), exactly as
+/// the oracle's `is_integer(A)` guards do: `io_lib:format("~tc",[1.0])` ⇒
+/// `error:badarg`.
+fn char_element(arg: Eterm, unicode: bool) -> Result<Chunk> {
+    if !unicode {
+        return Ok(Chunk::Char(low_byte(arg)? as char));
+    }
+    if is_small(arg) {
+        let value = signed_value(arg);
+        return Ok(match u32::try_from(value).ok().and_then(char::from_u32) {
+            Some(c) => Chunk::Char(c),
+            None => Chunk::Int(arg),
+        });
+    }
+    if is_big(arg) {
+        return Ok(Chunk::Int(arg));
+    }
+    Err(badarg())
+}
+
+/// `A band 255` for an integer term — the low byte of its two's-complement
+/// representation (`-1` ⇒ `255`, `256` ⇒ `0`, `1 bsl 100` ⇒ `0`).
+///
+/// # Errors
+///
+/// `badarg` for a non-integer term.
+fn low_byte(term: Eterm) -> Result<u8> {
+    if is_small(term) {
+        return Ok((signed_value(term) & 0xff) as u8);
+    }
+    if is_big(term) {
+        let (negative, limbs) = big_parts(term)?;
+        // A bignum's limb vector is never empty (an all-zero magnitude is the
+        // small integer `0`), but a malformed one is an error, not a zero byte.
+        let low = limbs.first().copied().ok_or_else(badarg)? as u8;
+        return Ok(if negative { 0u8.wrapping_sub(low) } else { low });
+    }
+    Err(badarg())
+}
+
+/// `io_lib_format:char/5` for `~~`.
 fn char_chunk(ch: char, spec: &Spec) -> Result<Chunk> {
+    char_elem_chunk(Chunk::Char(ch), spec)
+}
+
+/// `io_lib_format:char/5` for `~c`/`~tc`/`~~`: the single `elem` (a [`Chunk::Char`]
+/// or a raw [`Chunk::Int`]) duplicated `Field`/`Precision` times — `chars/2` is
+/// `lists:duplicate/2`, so a raw integer is duplicated just like a character.
+fn char_elem_chunk(elem: Chunk, spec: &Spec) -> Result<Chunk> {
     match (spec.width, spec.precision) {
-        (None, None) => Ok(Chunk::List(vec![Chunk::Char(ch)])),
-        (Some(field), None) => Ok(dup_chars(ch, field)),
-        (None, Some(p)) => Ok(dup_chars(ch, p)),
+        (None, None) => Ok(Chunk::List(vec![elem])),
+        (Some(field), None) => Ok(dup_element(elem, field)),
+        (None, Some(p)) => Ok(dup_element(elem, p)),
         (Some(field), Some(p)) if field >= p => Ok(adjust_chunk(
-            dup_chars(ch, p),
+            dup_element(elem, p),
             dup_chars(spec.pad as char, field - p),
             spec.left,
         )),
@@ -1074,6 +1160,7 @@ fn round_digit(digit: u8, tail: String, carry: bool) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::print::flatten;
     use beam_alloc::Heap;
     use beam_common::{BeamError, ExitReason};
     use beam_process::ProcessId;
@@ -1624,7 +1711,190 @@ mod tests {
         assert!(matches!(result, Err(BeamError::BadArg)));
     }
 
-    // ---- width from the argument, depth ---------------------------------------
+    // ---- `~c`/`~tc`: the code point verbatim ----------------------------------
+
+    /// `1 bsl 100` as little-endian limbs (`2^100 = 2^64 * 2^36`).
+    const SHIFTED_100: &[u64] = &[0, 1 << 36];
+
+    /// `(1 bsl 64) + 255`: a bignum whose low byte is `255`.
+    const BIGNUM_LOW_255: &[u64] = &[255, 1];
+
+    /// The flattened element list of an `io_lib:format` result — each element's
+    /// decimal (`~w`-style), comma-joined. [`deep_text`] cannot be used here: it
+    /// assumes every element is a byte-sized character, while `~tc` of an
+    /// out-of-range code point carries the integer verbatim.
+    fn run_io_lib_codes(
+        format: &str,
+        build_args: impl FnOnce(&mut BifContext<'_>) -> Option<Eterm>,
+    ) -> (String, Result<Eterm>) {
+        let mut heap = Heap::new(4096).expect("test heap");
+        let mut atoms = AtomTable::new();
+        atoms.seed(SEED);
+        let mut sink = BytesSink::new();
+        let (result, codes) = {
+            let mut ctx =
+                BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_output(&mut sink);
+            let format_term = list_from_bytes(&mut ctx, format.as_bytes());
+            let args = build_args(&mut ctx).expect("an argument list");
+            let result = format_lib_2(&mut ctx, &[format_term, args]);
+            let codes = match &result {
+                Ok(term) => element_codes(*term),
+                Err(BeamError::BadArg) => String::new(),
+                Err(other) => panic!("unexpected error {other:?}"),
+            };
+            (result, codes)
+        };
+        (codes, result.map(|_| make_small(0)).map_err(|e| e))
+    }
+
+    /// Flattens an `io_lib:format` result to its element codes (see
+    /// [`run_io_lib_codes`]).
+    fn element_codes(term: Eterm) -> String {
+        let mut out: Vec<String> = Vec::new();
+        collect_codes(term, &mut out);
+        out.join(",")
+    }
+
+    fn collect_codes(term: Eterm, out: &mut Vec<String>) {
+        if !is_small(term) && !is_big(term) {
+            for elem in proper_list(term).expect("io_lib:format returns a proper list") {
+                collect_codes(elem, out);
+            }
+            return;
+        }
+        out.push(if is_small(term) {
+            signed_value(term).to_string()
+        } else {
+            integer_digits(term, 10).expect("a bignum renders")
+        });
+    }
+
+    /// `io:format/2` captures the **raw bytes** (see [`run_io_bytes`]).
+    fn run_io_bytes(
+        format: &str,
+        build_args: impl FnOnce(&mut BifContext<'_>) -> Option<Eterm>,
+    ) -> (Vec<u8>, Result<Eterm>) {
+        let mut heap = Heap::new(4096).expect("test heap");
+        let mut atoms = AtomTable::new();
+        atoms.seed(SEED);
+        let mut sink = BytesSink::new();
+        let result = {
+            let mut ctx =
+                BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_output(&mut sink);
+            let format_term = list_from_bytes(&mut ctx, format.as_bytes());
+            let args = build_args(&mut ctx).expect("an argument list");
+            format_2(&mut ctx, &[format_term, args])
+        };
+        (sink.contents().to_vec(), result)
+    }
+
+    /// `~tc` renders the integer **verbatim**, even when it is not a Unicode
+    /// scalar (the oracle's `char(A, …)` is `[A]`). Every expectation is the
+    /// oracle's (`erl -noshell -eval 'io:format("~w~n",[io_lib:format(F,A)]).'`).
+    #[test]
+    fn tilde_tc_carries_the_code_point_verbatim() {
+        // `io_lib:format("~tc",[1114112])` ⇒ `[1114112]` (past `16#10FFFF`).
+        let (codes, result) = run_io_lib_codes("~tc", |ctx| ints(ctx, &[1114112]));
+        assert!(result.is_ok());
+        assert_eq!(codes, "1114112");
+
+        // A surrogate (`16#D800`) is carried too: ⇒ `[55296]`.
+        let (codes, _) = run_io_lib_codes("~tc", |ctx| ints(ctx, &[55296]));
+        assert_eq!(codes, "55296");
+
+        // A negative code point and zero: ⇒ `[-1]`, `[0]`.
+        let (codes, _) = run_io_lib_codes("~tc", |ctx| ints(ctx, &[-1]));
+        assert_eq!(codes, "-1");
+        let (codes, _) = run_io_lib_codes("~tc", |ctx| ints(ctx, &[0]));
+        assert_eq!(codes, "0");
+
+        // A valid scalar is still the character itself: `[16#10FFFF]`.
+        let (codes, _) = run_io_lib_codes("~tc", |ctx| ints(ctx, &[0x10FFFF]));
+        assert_eq!(codes, "1114111");
+
+        // A bignum is carried in full: `~tc` of `1 bsl 100` ⇒ the bignum.
+        let (codes, _) = run_io_lib_codes("~tc", |ctx| {
+            let big = beam_codec::term::make_big(ctx.heap(), false, SHIFTED_100).expect("test big");
+            one(ctx, big)
+        });
+        assert_eq!(codes, "1267650600228229401496703205376");
+        let (codes, _) = run_io_lib_codes("~tc", |ctx| {
+            let big = beam_codec::term::make_big(ctx.heap(), true, SHIFTED_100).expect("test big");
+            one(ctx, big)
+        });
+        assert_eq!(codes, "-1267650600228229401496703205376");
+
+        // Width/precision duplicate the raw element (`chars/2`): `~3tc` ⇒ three
+        // copies, `~3.2tc` ⇒ one pad space and two copies.
+        let (codes, _) = run_io_lib_codes("~3tc", |ctx| ints(ctx, &[1114112]));
+        assert_eq!(codes, "1114112,1114112,1114112");
+        let (codes, _) = run_io_lib_codes("~3.2tc", |ctx| ints(ctx, &[1114112]));
+        assert_eq!(codes, "32,1114112,1114112");
+    }
+
+    /// `~c` (latin1) keeps only the low byte of its integer argument —
+    /// `char(A band 255, …)` — bignums included.
+    #[test]
+    fn tilde_c_masks_to_the_low_byte() {
+        let (codes, _) = run_io_lib_codes("~c", |ctx| ints(ctx, &[256]));
+        assert_eq!(codes, "0");
+        let (codes, _) = run_io_lib_codes("~c", |ctx| ints(ctx, &[257]));
+        assert_eq!(codes, "1");
+        let (codes, _) = run_io_lib_codes("~c", |ctx| ints(ctx, &[-1]));
+        assert_eq!(codes, "255");
+        let (codes, _) = run_io_lib_codes("~c", |ctx| ints(ctx, &[1114112]));
+        assert_eq!(codes, "0");
+
+        // A bignum's low byte (`(1 bsl 64) + 255` ⇒ `255`; negated ⇒ `1`; and
+        // `1 bsl 100` has an all-zero low limb ⇒ `0`).
+        let (codes, _) = run_io_lib_codes("~c", |ctx| {
+            let big = beam_codec::term::make_big(ctx.heap(), false, BIGNUM_LOW_255).expect("test big");
+            one(ctx, big)
+        });
+        assert_eq!(codes, "255");
+        let (codes, _) = run_io_lib_codes("~c", |ctx| {
+            let big = beam_codec::term::make_big(ctx.heap(), true, BIGNUM_LOW_255).expect("test big");
+            one(ctx, big)
+        });
+        assert_eq!(codes, "1");
+        let (codes, _) = run_io_lib_codes("~c", |ctx| {
+            let big = beam_codec::term::make_big(ctx.heap(), false, SHIFTED_100).expect("test big");
+            one(ctx, big)
+        });
+        assert_eq!(codes, "0");
+    }
+
+    /// `io:format` writes a valid code point as its **UTF-8** encoding and raises
+    /// `badarg` for one the oracle's unicode device refuses (never a fabricated
+    /// byte).
+    #[test]
+    fn tilde_tc_write_path_is_utf8_or_badarg() {
+        // `io:format("~tc",[16#10FFFF])` ⇒ the UTF-8 bytes `F4 8F BF BF`.
+        let (bytes, result) = run_io_bytes("~tc", |ctx| ints(ctx, &[0x10FFFF]));
+        assert!(result.is_ok());
+        assert_eq!(bytes, vec![0xF4, 0x8F, 0xBF, 0xBF]);
+
+        // `io:format("~c",[255])` ⇒ the UTF-8 bytes `C3 BF`.
+        let (bytes, result) = run_io_bytes("~c", |ctx| ints(ctx, &[255]));
+        assert!(result.is_ok());
+        assert_eq!(bytes, vec![0xC3, 0xBF]);
+
+        // Out of range / surrogate / negative / bignum ⇒ `error:badarg`.
+        for value in [1114112i64, 55296, -1] {
+            let (bytes, result) = run_io_bytes("~tc", move |ctx| ints(ctx, &[value]));
+            assert!(
+                matches!(result, Err(BeamError::BadArg)),
+                "~tc of {value} should be badarg, wrote {bytes:?}"
+            );
+            assert!(bytes.is_empty(), "nothing is written on badarg");
+        }
+        let (bytes, result) = run_io_bytes("~tc", |ctx| {
+            let big = beam_codec::term::make_big(ctx.heap(), false, SHIFTED_100).expect("test big");
+            one(ctx, big)
+        });
+        assert!(matches!(result, Err(BeamError::BadArg)));
+        assert!(bytes.is_empty());
+    }    // ---- width from the argument, depth ---------------------------------------
 
     #[test]
     fn width_and_precision_from_arguments() {

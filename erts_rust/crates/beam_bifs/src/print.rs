@@ -151,14 +151,19 @@ pub(crate) const UNLIMITED_DEPTH: i64 = -1;
 /// oracle's `io_lib`/`io_lib_pretty` build.
 ///
 /// An `io_lib` "chars" value is a list whose elements are either single
-/// characters (small integers) or further lists: `Char` is one such element and
-/// `List` a sub-list element. `io:format` flattens the tree to text, while
-/// `io_lib:format` materializes it as the corresponding nested term (see
-/// `crate::io`).
+/// characters (small integers), *raw* integers, or further lists: `Char` is one
+/// such element, `Int` a raw-integer element and `List` a sub-list element.
+/// `io:format` flattens the tree to text, while `io_lib:format` materializes it
+/// as the corresponding nested term (see `crate::io`).
 #[derive(Clone)]
 pub(crate) enum Chunk {
     /// One character element — a single small integer in the output list.
     Char(char),
+    /// An integer element that is not a Rust `char`: the oracle's `io_lib` keeps
+    /// the integer **verbatim** while its unicode device refuses it. Only the
+    /// `~tc` directive and the radix **prefix** build one — see [`crate::io`] and
+    /// [`flatten_output`].
+    Int(Eterm),
     /// A sub-list element.
     List(Vec<Chunk>),
 }
@@ -173,6 +178,12 @@ impl Chunk {
     pub(crate) fn flatten_into(&self, out: &mut String) {
         match self {
             Chunk::Char(c) => out.push(*c),
+            // A raw integer element. Every production path that can build one goes
+            // through [`flatten_output`] (which rejects a non-scalar code point
+            // first, as the oracle's unicode device does); `flatten` is reached
+            // from a *term* rendering, which never builds an `Int`. The
+            // "unrepresentable" marker keeps this total without a panic.
+            Chunk::Int(term) => out.push(raw_scalar(*term).unwrap_or(char::REPLACEMENT_CHARACTER)),
             Chunk::List(items) => {
                 for item in items {
                     item.flatten_into(out);
@@ -184,7 +195,8 @@ impl Chunk {
     /// The flat character count (`io_lib:chars_length/1`).
     pub(crate) fn flat_len(&self) -> usize {
         match self {
-            Chunk::Char(_) => 1,
+            // `io_lib:chars_length/1` counts a raw integer element as one character.
+            Chunk::Char(_) | Chunk::Int(_) => 1,
             Chunk::List(items) => items.iter().map(Chunk::flat_len).sum(),
         }
     }
@@ -212,6 +224,66 @@ pub(crate) fn flatten(chunks: &[Chunk]) -> String {
         chunk.flatten_into(&mut out);
     }
     out
+}
+
+/// The `char` a raw integer element denotes, `None` when it is not a Unicode
+/// scalar value (negative, past `16#10FFFF`, or a surrogate).
+///
+/// A bignum is never a scalar — its magnitude is at least `2^59`.
+fn raw_scalar(term: Eterm) -> Option<char> {
+    if !is_small(term) {
+        return None;
+    }
+    u32::try_from(signed_value(term))
+        .ok()
+        .and_then(char::from_u32)
+}
+
+/// Flattens a chunk sequence to the text an `io:format` device receives,
+/// rejecting a raw integer element that is not a Unicode scalar value with
+/// `badarg`.
+///
+/// `io:format` writes the iolist to a device, and the oracle's device is a
+/// **unicode** one: it encodes every character as UTF-8 and refuses a code point
+/// outside the scalar range. So `io_lib:format("~tc",[1114112])` ⇒ `[1114112]`
+/// (the integer is carried verbatim) while `io:format("~tc",[1114112])` ⇒
+/// `error:badarg` — and likewise for a surrogate (`55296`), a negative value and
+/// a bignum. The `&str`-typed [`crate::context::OutputSink`] cannot carry such a
+/// code point either, so the error is raised here rather than fabricating text.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a non-scalar
+/// [`Chunk::Int`].
+pub(crate) fn flatten_output(chunks: &[Chunk]) -> Result<String> {
+    let mut out = String::new();
+    for chunk in chunks {
+        flatten_output_into(chunk, &mut out)?;
+    }
+    Ok(out)
+}
+
+/// [`flatten_output`] for one chunk.
+fn flatten_output_into(chunk: &Chunk, out: &mut String) -> Result<()> {
+    match chunk {
+        Chunk::Char(c) => {
+            out.push(*c);
+            Ok(())
+        }
+        Chunk::Int(term) => match raw_scalar(*term) {
+            Some(c) => {
+                out.push(c);
+                Ok(())
+            }
+            None => Err(badarg()),
+        },
+        Chunk::List(items) => {
+            for item in items {
+                flatten_output_into(item, out)?;
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Renders `term` the way the `~w` (`printable = false`) or `~p`
@@ -519,22 +591,27 @@ fn map_pair_chunk(
 /// (`S` = `chars(C, N/2)`) for even `N` and `[C,S|S]` for odd `N`, so a long run
 /// is a *tree* of sub-lists, not a flat list.
 pub(crate) fn dup_chars(c: char, n: usize) -> Chunk {
+    dup_element(Chunk::Char(c), n)
+}
+
+/// [`dup_chars`] for an arbitrary single element — a [`Chunk::Char`] or a raw
+/// [`Chunk::Int`] (`io_lib_format:chars/2` duplicates whatever `char/5` holds,
+/// and `~tc` may hold an integer that is not a Unicode scalar).
+pub(crate) fn dup_element(elem: Chunk, n: usize) -> Chunk {
     match n {
         0 => Chunk::List(Vec::new()),
-        1 => Chunk::List(vec![Chunk::Char(c)]),
-        2 => Chunk::List(vec![Chunk::Char(c), Chunk::Char(c)]),
-        3 => {
-            Chunk::List(vec![Chunk::Char(c), Chunk::Char(c), Chunk::Char(c)])
-        }
+        1 => Chunk::List(vec![elem]),
+        2 => Chunk::List(vec![elem.clone(), elem]),
+        3 => Chunk::List(vec![elem.clone(), elem.clone(), elem]),
         n if n % 2 == 0 => {
-            let half = dup_chars(c, n / 2);
+            let half = dup_element(elem, n / 2);
             let mut items = vec![half.clone()];
             items.extend(half.into_items());
             Chunk::List(items)
         }
         n => {
-            let half = dup_chars(c, n / 2);
-            let mut items = vec![Chunk::Char(c), half.clone()];
+            let half = dup_element(elem.clone(), n / 2);
+            let mut items = vec![elem, half.clone()];
             items.extend(half.into_items());
             Chunk::List(items)
         }
