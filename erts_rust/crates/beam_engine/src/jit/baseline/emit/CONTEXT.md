@@ -7,8 +7,8 @@ Lower the typed IR basic blocks of a `beam_loader::Module` into native x86-64 fu
 `compile_module`); `regalloc.rs` picks the cached x-registers; `operands.rs` reads operand shapes;
 `r#move.rs`/`test.rs`/`select.rs`/`arith.rs`/`compare.rs`/`aggregate.rs` each lower one instruction
 group; `link.rs` owns the direct block-to-block jump and the linked local tail call.
-The driver, block ABI and the two helpers (`jit_step_one`, `jit_tail_call`) live one level up in
-`../mod.rs` / `../runtime.rs`; this node only *emits calls* to them.
+The driver, block ABI and the three helpers (`jit_step_one`, `jit_ext_call`, `jit_tail_call`) live one
+level up in `../mod.rs` / `../runtime.rs`; this node only *emits calls* to them.
 
 ## Core model (do not break)
 - **Only `CACHE_REGISTERS.len()` = 5 x-registers are held in machine registers** (`r12`-`r15` + `rbp`,
@@ -45,6 +45,7 @@ group's `try_inline_*`; **`Ok(false)` means "lowered nothing"** and the arm then
 | Jump | `Jump` | `link.rs::Linker::emit_exit` | resolved label -> linked or return-to-driver |
 | Local tail call | `CallLast` | `link.rs::Linker::emit_tail_exit` | `Linker::is_compiled` |
 | Local tail call (no pop) | `CallOnly` | `link.rs::Linker::emit_exit` (lowers like `Jump`) | resolved label |
+| Cross-module call | `CallExt`,`CallExtOnly`,`CallExtLast` | `mod.rs::emit_ext_call` (an `emit_helper_call` to `jit_ext_call`) | n/a — the helper resolves the import and reports `ENTER` |
 | Everything else | -- | `_` arm -> `emit_step_and_continue` | -- (`FuncInfo` is deliberately here, never a no-op) |
 
 Note `GcBif` tries arith **then** comparison; `Bif` tries only comparison
@@ -90,10 +91,15 @@ Note `GcBif` tries arith **then** comparison; `Bif` tries only comparison
    to the rest of the block (`fast_done`). Present in `arith.rs`, `compare.rs`, `test.rs`,
    `aggregate.rs` (`emit_list_read`/`emit_tuple_read`/`try_inline_select_tuple_arity`). `select_val` has
    no fallback (all-immediate alternatives are total).
-`emit_step_and_continue` (`mod.rs`) = one `jit_step_one` call + continuation check: `rax` is compared
+`emit_step_and_continue` (`mod.rs`) = one `jit_step_one` call + `emit_continue_check`: `rax` is compared
 against `encode_target(func, pc+1)`; equal -> `fill` and fall through natively at `pc+1`; any other word
-(`Goto`/`HALT`/`ERROR`/`Wait`) -> `jmp done`, the shared epilogue, which `ret`s to the driver with the
-word in `rax`. So a non-`Next` helper outcome and the return-to-driver deopt share one epilogue.
+(`Goto`/`HALT`/`ERROR`/`ENTER`/`Wait`) -> `jmp done`, the shared epilogue, which `ret`s to the driver with
+the word in `rax`. So a non-`Next` helper outcome and the return-to-driver deopt share one epilogue.
+`emit_ext_call` (`mod.rs`, the `CallExt*` arm) is the **second** caller of that same check: it emits an
+`emit_helper_call` to `jit_ext_call` for the instruction itself — import resolution plus the variant's
+frame discipline, no interpreter step — and then `emit_continue_check`. Its `Next` case is the helper's
+`jit_step_one` fallback (the synchronous `call_bif` path); its other word is the `ENTER` of a resolved
+cross-module transfer, which the driver decodes into the context switch.
 `link.rs::emit_exit`'s unlinkable path is a **different** mechanism: it is *not* a helper call — it spills,
 materialises the return word in `rax`, and jumps to `done`; the **driver** then looks up the block or
 takes one interpreter step.
@@ -104,10 +110,12 @@ takes one interpreter step.
   store — emitted before the cached loads, because `rbx` is callee-saved and no cached register may sit in
   caller-saved scratch across the call), then load each cached register from `machine.x`.
 - `mod.rs::spill` / `mod.rs::fill`: store/load every `(x, reg)` in `Allocation::slots`.
-- **Every helper call spills first.** `mod.rs::emit_helper_call` (used by `emit_step_and_continue`) calls
-  `spill` before setting up `rdi`/`rsi`/`rdx` and `call r11` (`jit_step_one`); it does **not** spill after
-  the call (the helper legitimately wrote `machine.x`) — `fill` reloads instead. `link.rs::emit_tail_exit`
-  spills before `call jit_tail_call`. No emitted path in this node calls a helper without spilling first.
+- **Every helper call spills first.** `mod.rs::emit_helper_call` (used by `emit_step_and_continue` and
+  `emit_ext_call`) calls `spill` before loading `rdi` from the `rt` slot, filling the ABI argument
+  registers `rsi`/`rdx`/`rcx`/`r8`/`r9` with the caller's argument words, and `call r11`; it does **not**
+  spill after the call (the helper legitimately wrote `machine.x`) — `fill` reloads instead.
+  `link.rs::emit_tail_exit` spills before `call jit_tail_call`. No emitted path in this node calls a helper
+  without spilling first.
 - `link.rs::emit_exit` and `link.rs::emit_tail_exit` spill on **both** the linked and the deopt paths.
 - The epilogue (`mod.rs`: `done` -> `emit_frame_teardown` -> `ret`) does **not** spill: every path reaching
   it has already spilled. The inline fast paths (`move`/`arith`/`compare`/`test`/`select`/`aggregate`) do
@@ -131,14 +139,14 @@ out-of-bound register is never counted. Every non-selected register is read/writ
 - `CodeBuffer` reservations are budgeted by `code_capacity_estimate` (loose on purpose: under-estimating
   turns a large module into a `SystemLimit` compile error). Block entry labels are reserved **before**
   emitting, so forward branches are ordinary `rel32` fixups, never post-`seal` patching (W^X unchanged).
-- A `Step::Enter` (module-context switch) surfaces from a block's per-instruction deopt as the `ENTER` word with the resolved `(context, func, pc)` in the runtime's `enter` slot; the **driver** performs the switch (`Machine::switch_context` + module/label/literal re-bind + the callee's blocks via `NativeCode::module_blocks`) and re-enters native code. `call_ext*` is not an inline set member.
+- A resolved `CallExt`/`CallExtOnly`/`CallExtLast` surfaces from the `emit_ext_call` helper as the `ENTER` word with the resolved `(context, func, pc)` in the runtime's `enter` slot; the **driver** performs the switch (`Machine::switch_context` + module/label/literal re-bind + the callee's blocks via `NativeCode::module_blocks`) and re-enters native code. The transfer is still a driver round-trip (a cross-module link is unsound — separate mappings, buffer-local `rel32` fixups, a module baked into `JitRuntime`), but the *call instruction* no longer costs an interpreter step; a seam miss (the synchronous `call_bif` path) or a failed frame discipline falls back to `jit_step_one` inside the helper.
 - Never hand-edit generated data. Files ~1000 lines; split by responsibility. Apache-2.0 header on every
   `.rs` (byte-exact, license scanner enforced).
 
 ## Routing Table
 - `mod.rs` -> compiled-block shape: `SAVED_REGISTERS`/`CACHE_REGISTERS`/scratch constants, `touch`/`Allocation`,
   `compile_module`, `code_capacity_estimate` + size budgets, `emit_block` (the dispatch), `emit_helper_call`,
-  `emit_step_and_continue`, `spill`/`fill`.
+  `emit_step_and_continue`, `emit_ext_call`, `emit_continue_check`, `spill`/`fill`.
 - `regalloc.rs` -> `allocate_registers` + `cacheable_touches`.
 - `operands.rs` -> `x_offset`, `x_register`, `constant_word`, `small_word`.
 - `r#move.rs` -> `try_inline_move`, `try_inline_swap`.
