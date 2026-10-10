@@ -38,6 +38,7 @@
 use std::sync::Arc;
 
 use beam_common::Result;
+use beam_engine::context::RootSet;
 use beam_engine::ExecutionContext;
 use beam_loader::{Label, Module};
 use beam_term::Eterm;
@@ -187,12 +188,44 @@ impl ExecutionContext for BudgetContext<'_, '_> {
         ExecutionContext::ensure_heap(self.inner, heap_need, live, x_regs, stack)
     }
 
+    /// The **primary** admission point (`test_heap`/`allocate_heap`): charge one reduction,
+    /// arm the GC latch, then serve the request over the machine's **whole** root set.
+    ///
+    /// This is the door [`Machine::ensure_heap`](beam_engine::Machine::ensure_heap) actually
+    /// reaches, so the collection it may drive sees every x register, the whole Erlang stack
+    /// **and the whole FR file**. The latch is armed for the slice's own machine only (see the
+    /// type docs), which is exactly the root set
+    /// [`crate::context::gc::ensure_heap_full`] may collect against; it is cleared as the first
+    /// statement there (see [`RuntimeContext::arm_gc`]).
+    fn ensure_heap_full(&mut self, heap_need: u32, roots: RootSet<'_>) -> Result<()> {
+        self.probe.charge()?;
+        self.inner.arm_gc();
+        ExecutionContext::ensure_heap_full(self.inner, heap_need, roots)
+    }
+
     fn heap_available(&self) -> usize {
         ExecutionContext::heap_available(&*self.inner)
     }
 
     fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm> {
         ExecutionContext::alloc_words(self.inner, n)
+    }
+
+    /// The engine's raw-word allocation ([`Machine::alloc_rooted`](beam_engine::Machine::alloc_rooted),
+    /// reached by `terms::reserve`/`reserve_slack`): arm the GC latch and forward.
+    ///
+    /// The reduction budget is **not** charged here — this is not a heap-admission point the
+    /// compiler emits once per loop, and charging it would change how many instructions a slice
+    /// runs. Arming the latch is still required: this is a legitimate collection site for the
+    /// slice's own machine (it is handed the whole root set), and without the latch the nested
+    /// machinery would refuse to collect.
+    fn alloc_words_rooted(
+        &mut self,
+        n: usize,
+        roots: RootSet<'_>,
+    ) -> Result<*mut Eterm> {
+        self.inner.arm_gc();
+        ExecutionContext::alloc_words_rooted(self.inner, n, roots)
     }
 
     fn apply(&mut self, module: &str, function: &str, arity: u32, args: &[Eterm]) -> Result<Eterm> {

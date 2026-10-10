@@ -73,17 +73,19 @@ impl<'a> RuntimeRunner<'a> {
 /// collector runs against a partial root set and leaves a stale word in the machine's `x`
 /// ([`crate::context::gc`] documents the hand-off).
 ///
-/// [`RootSet::ALL_LIVE`] is the conservative choice: the parked machine's live count is not
-/// exposed, and over-approximating a copying collector's root set is always *safe* (it can only
-/// keep a term alive, never free a live one). A `pid` with no process in `table` has nothing to
-/// publish into; the machine is left as it is.
+/// The machine's **whole** root set is published — every x register, the whole Erlang stack
+/// **and the whole FR file** ([`gc::publish_roots_full`](crate::context::gc::publish_roots_full)).
+/// [`RootSet::ALL_LIVE`] is the conservative choice for the x file: the parked machine's live
+/// count is not exposed, over-approximating a copying collector's root set is always *safe* (it
+/// can only keep a term alive, never free a live one), and the FR file holds `Eterm` term slots
+/// at Milestone 1 so it is a root like any other. A `pid` with no process in `table` has nothing
+/// to publish into; the machine is left as it is.
 fn publish_parked_roots(table: &mut ProcessTable, pid: ProcessId, machine: &mut Machine) {
     let Some(process) = table.get_mut(pid) else {
         return;
     };
     machine.with_roots(RootSet::ALL_LIVE, |roots| {
-        let live = roots.live_len();
-        gc::publish_roots(process, live, roots.x, roots.stack)
+        gc::publish_roots_full(process, &roots)
     });
 }
 
