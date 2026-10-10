@@ -660,6 +660,37 @@ mod tests {
     }
 
     #[test]
+    fn lowers_set_tuple_element_in_file_operand_order() {
+        // `set_tuple_element s S P` — the OTP≤28 in-place tuple write: operand 0 is
+        // the element value (`s`), operand 1 the tuple (`S`), operand 2 the raw
+        // element index (`P`, a `{u,Off}`). `beam_disasm` resolves it as
+        // `{set_tuple_element,Src,Dst,{u,Off}}` (`lib/compiler/src/beam_disasm.erl:1017`).
+        assert_eq!(
+            lower(
+                Opcode::set_tuple_element,
+                vec![Operand::X(3), Operand::Y(1), Operand::Integer(2)],
+            ),
+            Instr::SetTupleElement {
+                element: Operand::X(3),
+                tuple: Operand::Y(1),
+                offset: 2,
+            }
+        );
+        // The offset is stored **raw** — a tag-relative data index, never scaled by 8.
+        assert_eq!(
+            lower(
+                Opcode::set_tuple_element,
+                vec![Operand::Integer(1), Operand::X(0), Operand::Integer(0)],
+            ),
+            Instr::SetTupleElement {
+                element: Operand::Integer(1),
+                tuple: Operand::X(0),
+                offset: 0,
+            }
+        );
+    }
+
+    #[test]
     fn lowers_the_list_instructions() {
         assert_eq!(
             lower(
@@ -1588,6 +1619,15 @@ mod tests {
         assert!(matches!(
             lower_instr(&raw(
                 Opcode::get_tuple_element,
+                vec![Operand::X(0), Operand::X(1), Operand::X(2)],
+            ))
+            .unwrap_err(),
+            BeamError::BadArg
+        ));
+        // `set_tuple_element` expects its offset to be an unsigned integer too.
+        assert!(matches!(
+            lower_instr(&raw(
+                Opcode::set_tuple_element,
                 vec![Operand::X(0), Operand::X(1), Operand::X(2)],
             ))
             .unwrap_err(),

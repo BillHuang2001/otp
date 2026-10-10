@@ -148,7 +148,9 @@ Both are the *only* entry points; all intermediate types are public for inspecti
     `Deallocate(u32)`, `Trim { n: u32, remaining: u32 }`, `Return`,
     `DeallocateReturn(u32)` (the loader's only superinstruction — see `src/lower/fuse.rs`).
   - **tuples** — `PutTuple2 { dst, elements: Vec<Operand> }`,
-    `GetTupleElement { source, element: u32, dst }`.
+    `GetTupleElement { source, element: u32, dst }`,
+    `SetTupleElement { element, tuple, offset: u32 }` (the OTP≤28 in-place write; `offset` is the raw
+    compiler "Position" index).
   - **lists** — `PutList { head, tail, dst }`, `GetList { source, head, tail }`,
     `GetHd { source, head }`, `GetTl { source, tail }`.
   - **maps** — `GetMapElements { fail, source, pairs: Vec<(Operand, Operand)> }`,
@@ -371,7 +373,7 @@ silently-accepted wrong value:
   by `(module, function, arity)` following the real `bif.tab` naming — the loader does **not** know and
   must **not** encode `bif.tab` numbering. `Module.imports` is the single source of BIF identity.
 - **`Instr` and `TestKind` live in `src/instr.rs`, re-exported from `ir.rs`.** The instruction
-  vocabulary is one large flat enum (107 variants); an enum cannot be spread across submodules and
+  vocabulary is one large flat enum (108 variants); an enum cannot be spread across submodules and
   splitting the *variants* would destroy the single-name surface the engine matches on, so it is kept in
   one dedicated module while `ir.rs` (the data types) does `pub use crate::instr::*;` so `crate::ir::Instr`,
   `crate::Instr` and `prelude::*` are unchanged. This keeps `ir.rs` focused on the module/function/table
@@ -597,15 +599,13 @@ silently-accepted wrong value:
   (`tests/literals.rs` + `tests/common/mod.rs` for the raw byte scan); a byte-exact assertion is only
   valid for a **map-free** literal. (This is faithful behavior, not a defect: the two images denote the
   same term.)
-- **`Instr::Generic` fallback opcodes — 133 of 193 typed, 60 Generic.** 108 opcodes lower to a named
-  `Instr` mapping (`src/lower/instr.rs`) and the 25 `is_*`/`test_arity` opcodes to `Instr::Test`, so 133
-  of the 193 `genop.tab` opcodes are typed; the other 60 keep `Instr::Generic`. 59 of those are the
+- **`Instr::Generic` fallback opcodes — 134 of 193 typed, 59 Generic.** 109 opcodes lower to a named
+  `Instr` mapping (`src/lower/instr.rs`) and the 25 `is_*`/`test_arity` opcodes to `Instr::Test`, so 134
+  of the 193 `genop.tab` opcodes are typed; the other 59 keep `Instr::Generic`. Those 59 are exactly the
   `-`-prefixed obsolete/transform-only entries the compiler never emits (`is_constant/2`, `make_fun2/1`,
-  `allocate_zero/2`, the legacy `bs_*` forms, …); the 60th is **`set_tuple_element/3` (opcode 67)** — a
-  non-obsolete `genop.tab` entry that is also never emitted (the compiler emits `put_tuple2`). The
-  compiler emits none of the 60, so the observed residual census over the whole installed OTP `lib` root
-  (all 34 apps / ≈1366 modules) is **empty** (`tests/generic_census.rs` pins it); it is a deliberate,
-  lossless gap — never a wrong result.
+  `allocate_zero/2`, the legacy `bs_*` forms, …), so the observed residual census over the whole
+  installed OTP `lib` root (all 34 apps / ≈1366 modules) is **empty** (`tests/generic_census.rs` pins
+  it); it is a deliberate, lossless gap — never a wrong result.
 - **Previously-unexercised variants are now fixture-proven reachable (not merely claimed).** The on-PATH
   OTP-29 `erlc` DOES emit the native-record family: the committed `nr_def`/`nr_use` pair lowers 186-191
   typed. `executable_line` (183) / `debug_line` (184) are reachable via `+line_coverage` /`+beam_debug_info`
@@ -650,7 +650,7 @@ silently-accepted wrong value:
 - `src/opcode.rs` → `Opcode` enum + name/number/arity roster (derived from `../../lib/compiler/src/genop.tab`) + the derived `OnceLock` arity lookup table `src/decode.rs` dispatches on
 - `src/operand.rs` → `Operand`/`Reg`/`TypeIndex`/`AllocKind`/`HeapNeed` types
 - `src/decode.rs` → instruction-stream → `Vec<RawInstr>` (opcode + operands + byte offset) + the tagged-varint operand decoder
-- `src/instr.rs` → the typed instruction vocabulary: `Instr` (107 variants) + `TestKind`
+- `src/instr.rs` → the typed instruction vocabulary: `Instr` (108 variants) + `TestKind`
 - `src/ir.rs` → the IR data types: `Module`, `Function`, `Export`, `Import`, `FunDescriptor`, `RecordDefinition`/`RecordField`, `Block`, `LineTable`, `TypeTable`, … (+ `pub use crate::instr::*`)
 - `src/literal.rs` → `LiteralArea` / `SharedLiteralArea`: decoded `LitT` literals materialized into a heap (+ the shared `decode_terms`/`decode_terms_at_capacity` retry path)
 - `src/decoded.rs` → `DecodedTerm` / `SharedDecodedTerm`: the shared eagerly-decoded small-term holder (`terms`/`by_name`/`raw`) the `Attr`/`CInf`/`Meta` chunk tables build on
