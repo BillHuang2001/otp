@@ -372,3 +372,17 @@ printing `~w`. The suite enforces the floors `BREADTH_MODULE_FLOOR = 171` (disti
 corpus modules that actually execute) and `BREADTH_CALL_FLOOR = 480` (oracle-checked
 calls that execute); `#`-prefixed and blank lines are ignored. It is *data*: regenerate
 it, never hand-edit a value.
+
+## `stdlib_exports_harness.beam` (`stdlib_exports_harness.erl`) — `tests/stdlib_exports_more.rs`
+
+The harness for the exports slice: each export is a thin wrapper around a **real
+system stdlib** function that a direct call cannot enter (a NIF stub, or a
+fun-taking export whose `fun` only the caller can build).
+
+| export | Erlang | why a wrapper |
+|---|---|---|
+| `lists_keysearch/3` | `lists:keysearch(Key, N, TupleList).` | the `lists` `keysearch/3` NIF: the installed `.beam`'s own body is the `erlang:nif_error(undef)` stub, so it is only reachable through a caller's `call_ext` |
+| `ordsets_map_double/1` | `ordsets:map(fun(E) -> E * 2 end, S).` | `ordsets:map/2` takes a `fun` (`make_fun3` + `call_fun*`) |
+| `ordsets_filtermap_double/1` | `ordsets:filtermap(fun(E) -> {true, E * 2} end, S).` | same, with the `{true, Value}` result shape |
+
+Rebuild it with the neutral-directory `erlc +deterministic` recipe above.
