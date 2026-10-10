@@ -155,7 +155,7 @@ use beam_common::{BeamError, Result};
 use beam_engine::terms;
 use libc::c_int;
 use beam_io::{
-    Driver, Event, Poller, PortCommandOptions, PortExitReason, PortNotification,
+    Driver, DriverRegistry, Event, Poller, PortCommandOptions, PortExitReason, PortNotification,
     PortRegistry as IoPortRegistry, SpawnDriver, SpawnOptions, SpawnSpec, SpawnStream,
     StreamOptions, PORT_REDS_EXECUTE,
 };
@@ -266,10 +266,53 @@ pub enum PortName {
     Spawn,
     /// `{spawn_executable, Path}`: run `Path` directly with the `args` option.
     SpawnExecutable,
-    /// `{spawn_driver, Name}`: a **C driver** (contract A.4) loaded from `Name` — no OS child.
+    /// `{spawn_driver, Name}`: a **C driver** (contract A.4) `dlopen`ed from `Name` — no OS child.
     SpawnDriver,
+    /// `{spawn_driver, Name}` where `Name` is a **built-in** driver this runtime links in
+    /// (`fd`/`efile`/`tcp_inet` — the Rust analogue of the emulator's statically linked drivers,
+    /// e.g. `tcp_inet` in `erts/emulator/drivers/common/inet_drv.c:1348`), resolved against
+    /// [`beam_io::DriverRegistry`] rather than `dlopen`ed.
+    ///
+    /// Like [`PortName::SpawnDriver`] it gives the port a driver `control` callback
+    /// ([`PortRegistry::is_driver_port`]), but **unlike** it its bytes do not come from a C
+    /// driver's inline `output` callback: they arrive through the driver's poller-registered
+    /// descriptor on the port-task round, so [`PortRegistry::take_driver_outputs`] must not drain
+    /// it and [`PortRegistry::write_command`] takes the ordinary `port_command` path.
+    SpawnDriverBuiltin,
     /// `{fd, N}`: a descriptor the Erlang side already owns.
     Fd,
+}
+
+impl PortName {
+    /// Whether this name form gives the port a driver **`control` callback** — the C's
+    /// `prt->drv_ptr->control != NULL` test (`io.c:4035`), which [`PortRegistry::port_control`]
+    /// keys its internal-port `badarg` on.
+    ///
+    /// A `{spawn_driver, Name}` port gets one whether its driver was `dlopen`ed
+    /// ([`PortName::SpawnDriver`]) or built in ([`PortName::SpawnDriverBuiltin`]); a
+    /// `spawn`/`spawn_executable`/`fd` port (backed by [`beam_io::SpawnDriver`]) never does.
+    fn has_driver_control(self) -> bool {
+        match self {
+            PortName::SpawnDriver | PortName::SpawnDriverBuiltin => true,
+            PortName::Spawn | PortName::SpawnExecutable | PortName::Fd => false,
+        }
+    }
+
+    /// Whether the port's bytes come from a C driver's **inline `output` callback** — only a
+    /// `dlopen`ed `{spawn_driver, Name}` port ([`PortName::SpawnDriver`]).
+    ///
+    /// A built-in driver port ([`PortName::SpawnDriverBuiltin`]) — and every `spawn`/`fd` port —
+    /// delivers through a poller-registered descriptor on the port-task round instead, so its
+    /// bytes are not harvested from the driver's input queue.
+    fn bytes_from_driver_output(self) -> bool {
+        match self {
+            PortName::SpawnDriver => true,
+            PortName::SpawnDriverBuiltin
+            | PortName::Spawn
+            | PortName::SpawnExecutable
+            | PortName::Fd => false,
+        }
+    }
 }
 
 /// The Erlang-side representation of a port's stream: the `binary`/`list` option.
@@ -327,10 +370,12 @@ struct PortMeta {
     owner: ProcessId,
     /// Which `Name` form opened the port.
     ///
-    /// The two message producers route on it: a `{spawn_driver, Name}` port's bytes come from the
-    /// C driver's `output` callback (queued on the port's input queue by
+    /// The two message producers route on it (see [`PortName::has_driver_control`] /
+    /// [`PortName::bytes_from_driver_output`]): a `dlopen`ed `{spawn_driver, Name}` port's bytes
+    /// come from the C driver's `output` callback (queued on the port's input queue by
     /// [`driver::DriverPortAdapter`]) and are drained by [`PortRegistry::take_driver_outputs`],
-    /// while every other port's come from its registered descriptor through the port-task round.
+    /// while every other port's — including a **built-in** driver port's — come from a
+    /// poller-registered descriptor through the port-task round.
     kind: PortName,
     /// The term queue of a `{spawn_driver, Name}` port: the terms its C driver emitted through
     /// `erl_drv_output_term`/`erl_drv_send_term`, drained by
@@ -498,6 +543,13 @@ pub struct PortRegistry {
     registry: IoPortRegistry,
     /// The `port_info/1` metadata, keyed by port number.
     meta: HashMap<u64, PortMeta>,
+    /// The **built-in** driver factories a `{spawn_driver, Name}` port is resolved against
+    /// **before** any `dlopen` — the Rust analogue of the C `driver_tab.c`'s statically linked
+    /// drivers (`fd`, `efile`, `tcp_inet`; see [`beam_io::DriverRegistry::with_builtins`]).
+    ///
+    /// Built **once**, when this registry is constructed, so an `open_port/2` only does a hash
+    /// lookup here; a name that misses falls through to the `.so` loader exactly as before.
+    builtin_drivers: DriverRegistry,
     /// The arena a `port_info/1` result is built on.
     ///
     /// `port_info/1` hands its `{Item, Value}` pairs to `beam_bifs`, which copies them into
@@ -536,10 +588,23 @@ impl PortRegistry {
             poller: Poller::new()?,
             registry: IoPortRegistry::new(),
             meta: HashMap::new(),
+            builtin_drivers: DriverRegistry::with_builtins(),
             heap: Heap::new(PORT_HEAP_WORDS)?,
             io_counters: Rc::new(IoCounters::default()),
             watch: watch::SignalWatch::new(),
         })
+    }
+
+    /// Constructs the **built-in** driver registered under `name`, or `None` when `name` names no
+    /// built-in (so the caller falls through to the `.so` loader).
+    ///
+    /// The `Some` wraps the factory's own `Result`: a **registered** built-in whose construction
+    /// fails (say a descriptor the OS refuses) is reported as that typed failure — never a
+    /// fabricated port — and is distinct from `None`, meaning "no such built-in at all".
+    fn create_builtin_driver(&self, name: &str) -> Option<Result<Box<dyn Driver>>> {
+        self.builtin_drivers
+            .contains(name)
+            .then(|| self.builtin_drivers.create(name))
     }
 
     /// The shared I/O byte counters behind `erlang:statistics(io)` (see [`IoCounters`]).
@@ -616,7 +681,7 @@ impl PortRegistry {
         if self
             .meta
             .get(&id.number())
-            .map(|meta| meta.kind == PortName::SpawnDriver)
+            .map(|meta| meta.kind.bytes_from_driver_output())
             .unwrap_or(false)
         {
             self.registry.output(&mut self.poller, id, bytes)?;
@@ -638,10 +703,11 @@ impl PortRegistry {
     /// The operation is forwarded **verbatim** to [`beam_io::PortRegistry::port_control`], which
     /// hands it to the port's driver: for a [`PortName::SpawnDriver`] port that is
     /// [`DriverPortAdapter::control`](driver::DriverPortAdapter::control), i.e. the C driver's own
-    /// `control` callback, and for the built-in drivers the string verbs they own. `op` for a C
-    /// driver is the verb as a decimal `c_uint` string — `erts_internal:port_control/3` reads its
-    /// `Command` with `term_to_Uint` (`../../erts/emulator/beam/erl_bif_port.c:322-340`), which is
-    /// the same convention `beam_io` uses (`beam_io/src/abi/port.rs:716`).
+    /// `control` callback (`op` is then the verb as a decimal `c_uint` string —
+    /// `erts_internal:port_control/3` reads its `Command` with `term_to_Uint`,
+    /// `../../erts/emulator/beam/erl_bif_port.c:322-340`, the same convention `beam_io` uses,
+    /// `beam_io/src/abi/port.rs:716`), and for a [`PortName::SpawnDriverBuiltin`] port the built-in
+    /// driver's own string verbs.
     ///
     /// [`beam_io::PortControl::CLOSE`] (`"close"`) is **reserved** by that forwardee: it closes the
     /// port instead of reaching a driver. A C driver's verbs are integers, so the reserved verb can
@@ -651,16 +717,17 @@ impl PortRegistry {
     ///
     /// # An internal port is `badarg` for every verb
     ///
-    /// A port whose driver is a **built-in** one (a `{spawn, Cmd}` / `{spawn_executable, Path}` /
-    /// `{fd, N}` port — i.e. every port but a `{spawn_driver, Name}` one, see
-    /// [`PortRegistry::is_driver_port`]) has no `control` callback, and the C's
-    /// `call_driver_control` answers `ERTS_PORT_OP_BADARG` **before** any callback for a driver
-    /// whose `control` slot is `NULL` (`io.c:4035`); `erts_internal_port_control_3` turns that into
-    /// the atom `badarg` (`erl_bif_port.c:340-343`). So `erlang:port_control/3` on a `{spawn,"cat"}`
-    /// or `{fd,0,1}` port is the oracle's `badarg` for **every** verb (measured), never the built-in
-    /// driver's `Ok(vec![])`. That check deliberately precedes the reserved-`"close"` forward: the
-    /// oracle's command is a `c_uint`, so a `"close"` string cannot arise from real `port_control`
-    /// call, and rejecting the internal port first is what matches the C.
+    /// An **internal** port (a `{spawn, Cmd}` / `{spawn_executable, Path}` / `{fd, N}` port — i.e.
+    /// every port but a `{spawn_driver, Name}` one, see [`PortRegistry::is_driver_port`]) has no
+    /// `control` callback, and the C's `call_driver_control` answers `ERTS_PORT_OP_BADARG` **before**
+    /// any callback for a driver whose `control` slot is `NULL` (`io.c:4035`);
+    /// `erts_internal_port_control_3` turns that into the atom `badarg` (`erl_bif_port.c:340-343`).
+    /// So `erlang:port_control/3` on a `{spawn,"cat"}` or `{fd,0,1}` port is the oracle's `badarg`
+    /// for **every** verb (measured), never an empty `Ok(vec![])`. That check deliberately precedes
+    /// the reserved-`"close"` forward: the oracle's command is a `c_uint`, so a `"close"` string
+    /// cannot arise from real `port_control` call, and rejecting the internal port first is what
+    /// matches the C. A `{spawn_driver, Name}` port — loaded `.so` **or** built-in driver — is *not*
+    /// internal: its driver has a `control` callback, so the verb reaches it.
     ///
     /// # Errors
     ///
@@ -678,22 +745,24 @@ impl PortRegistry {
         self.registry.port_control(&mut self.poller, id, op, arg)
     }
 
-    /// Whether `id` is backed by a **user C driver** (`{spawn_driver, Name}`) rather than one of the
-    /// built-in `spawn`/`spawn_executable`/`fd` drivers — the C's "does this port's driver have a
+    /// Whether `id` is backed by a **user driver** — a `{spawn_driver, Name}` port, whether the
+    /// driver was `dlopen`ed or is a built-in ([`PortName::SpawnDriver`] /
+    /// [`PortName::SpawnDriverBuiltin`]) — rather than one of the built-in
+    /// `spawn`/`spawn_executable`/`fd` drivers. This is the C's "does this port's driver have a
     /// `control` callback?" predicate.
     ///
-    /// This runtime gives a C driver host to a `{spawn_driver, Name}` port alone (every other `Name`
-    /// form is backed by [`beam_io::SpawnDriver`]), so [`PortMeta::kind`] being
-    /// [`PortName::SpawnDriver`] is exactly the C's `prt->drv_ptr->control != NULL` test
-    /// (`io.c:4035`). It is what [`PortRegistry::port_control`] keys its internal-port `badarg` on,
-    /// and — via the same C-driver-host fact — what [`PortRegistry::control_binary`] reads a flag
-    /// from.
+    /// This runtime gives a driver `control` callback to a `{spawn_driver, Name}` port alone
+    /// (every other `Name` form is backed by [`beam_io::SpawnDriver`]), so
+    /// [`PortName::has_driver_control`] is exactly the C's `prt->drv_ptr->control != NULL` test
+    /// (`io.c:4035`). It is what [`PortRegistry::port_control`] keys its internal-port `badarg`
+    /// on, and — via the same driver-callback fact — what [`PortRegistry::control_binary`] reads a
+    /// flag from.
     ///
     /// `false` for a port this registry does not hold.
     pub fn is_driver_port(&self, id: PortId) -> bool {
         self.meta
             .get(&id.number())
-            .is_some_and(|meta| meta.kind == PortName::SpawnDriver)
+            .is_some_and(|meta| meta.kind.has_driver_control())
     }
 
     /// Whether `id`'s C driver asked for a **binary** `erlang:port_control/3` reply
@@ -938,13 +1007,15 @@ impl PortRegistry {
         }
     }
 
-    /// The `{Port, {data, Data}}` events the **C driver** ports have produced.
+    /// The `{Port, {data, Data}}` events the **`dlopen`ed C driver** ports have produced.
     ///
-    /// A driver port's bytes are what the driver's `output` callback answered with through
-    /// `driver_output`; [`driver::DriverPortAdapter`] queues them on the port's input queue, and
-    /// this drains it. A `spawn`/`fd` port's input queue is drained by the port-task round instead
-    /// ([`beam_io::Port::take_input_notification`], whose `INPUT` task its registered descriptor
-    /// makes run), so the two never report the same bytes.
+    /// A `{spawn_driver, Name}` port backed by a loaded `.so` gets its bytes from the driver's
+    /// `output` callback answering through `driver_output`; [`driver::DriverPortAdapter`] queues
+    /// them on the port's input queue, and this drains it. A `spawn`/`fd` port's input queue, and a
+    /// **built-in** driver port's ([`PortName::SpawnDriverBuiltin`], whose bytes come from its
+    /// poller-registered descriptor), are drained by the port-task round instead
+    /// ([`beam_io::Port::take_input_notification`], whose `INPUT` task their registration makes
+    /// run), so the two never report the same bytes.
     ///
     /// # Errors
     ///
@@ -954,7 +1025,7 @@ impl PortRegistry {
         let numbers: Vec<u64> = self
             .meta
             .iter()
-            .filter(|(_, meta)| meta.kind == PortName::SpawnDriver)
+            .filter(|(_, meta)| meta.kind.bytes_from_driver_output())
             .map(|(number, _)| *number)
             .collect();
         let mut events = Vec::new();
@@ -1229,10 +1300,11 @@ impl NameSpec {
             PortName::Fd => Ok(SpawnSpec::Fd {
                 fd: self.fd.ok_or(BeamError::BadArg)?,
             }),
-            // A `{spawn_driver, Name}` port is backed by a **C driver**, not by the spawn
-            // driver: `open_port` registers a `driver::DriverPortAdapter` for it and never asks
-            // for a spawn spec, so reaching this is a programming error.
-            PortName::SpawnDriver => Err(BeamError::BadArg),
+            // A `{spawn_driver, Name}` port is backed by a driver (a loaded `.so` or a built-in),
+            // not by the spawn driver: `open_port` registers a [`driver::DriverPortAdapter`] or a
+            // built-in [`Driver`] for it and never asks for a spawn spec, so reaching this is a
+            // programming error.
+            PortName::SpawnDriver | PortName::SpawnDriverBuiltin => Err(BeamError::BadArg),
         }
     }
 }
@@ -1642,12 +1714,52 @@ impl PortHook for RuntimePorts {
         // OS pid the driver reports is what `port_info(Port, os_pid)` answers.
         let stream = resolved.stream();
         if spec.kind == PortName::SpawnDriver {
+            // The driver name is the prefix up to the first blank — the C's own rule (`io.c` walks
+            // the name to the first blank before matching `driver_name`), the same rule
+            // [`driver_lookup`] applies to build the `.so` candidates.
+            let (candidates, driver_name) = driver_lookup(&spec.command);
+            // The registry borrow is taken for the **whole** arm: neither branch re-enters a port
+            // operation (`register` starting a driver cannot re-enter the port table, and the
+            // `dlopen` path builds its host from `self.atoms`/`self.owner`, which are not the
+            // registry), so one borrow serves both.
+            let mut registry = self.registry_mut()?;
+            // A **built-in** driver — a statically linked emulator driver such as `tcp_inet`
+            // (`erts/emulator/drivers/common/inet_drv.c:1348`) — is resolved against this runtime's
+            // own driver registry **before** any `dlopen`, exactly as the C resolves a name against
+            // its loaded-driver list (`io.c:599-628`), so `open_port({spawn_driver,"tcp_inet"},_)`
+            // opens a real port rather than failing to load a `.so` that does not exist. Its bytes
+            // arrive through the poller-registered descriptor on the port-task round (not a C
+            // driver's inline `output` callback), so it is recorded as
+            // [`PortName::SpawnDriverBuiltin`] — a driver port for `port_control`, but not for
+            // [`PortRegistry::take_driver_outputs`].
+            if let Some(created) = registry.create_builtin_driver(&driver_name) {
+                let driver = created?;
+                let meta = PortMeta {
+                    command: spec.command,
+                    // A built-in driver port owns no OS child; `port_info(Port, os_pid)` is
+                    // `undefined`.
+                    os_pid: None,
+                    stream,
+                    // Nothing to reap, so no `{Port, {exit_status, …}}` is ever synthesized.
+                    notify_exit: false,
+                    monitors: Vec::new(),
+                    owner: self.owner,
+                    kind: PortName::SpawnDriverBuiltin,
+                    // A built-in driver has no C host, so it has no term queue, interns no name and
+                    // sets no control flags.
+                    driver_terms: None,
+                    driver_atoms: None,
+                    driver_control_flags: None,
+                    input: Cell::new(0),
+                    output: Cell::new(0),
+                };
+                return registry.register(driver, meta);
+            }
             // A **C driver** (contract A.4) port: the driver is `dlopen`ed and registered as the
             // port's driver, so `port_command` reaches its `output` callback and its
             // `driver_output` bytes reach the owner. An unknown driver name is the oracle's own
             // `error:badarg` (`io.c`'s `ERTS_OPEN_DRIVER_RET(NULL, -3, BADARG)`), never a
             // fabricated port and never a silent no-op.
-            let (candidates, driver_name) = driver_lookup(&spec.command);
             let host = driver::DriverPort::new(
                 Heap::new(PORT_HEAP_WORDS)?,
                 Rc::clone(&self.atoms),
@@ -1688,7 +1800,6 @@ impl PortHook for RuntimePorts {
                 input: Cell::new(0),
                 output: Cell::new(0),
             };
-            let mut registry = self.registry_mut()?;
             return registry.register(Box::new(adapter), meta);
         }
         // The child-stream options (`stderr_to_stdout`) are applied in the child, so they are

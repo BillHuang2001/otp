@@ -149,7 +149,8 @@ use beam_abi::driver::types::ErlDrvPDL;
 use beam_abi::{DriverEnv, DriverHost, SysIOVec};
 
 /// The per-port driver-private state the host owns: the C's driver-private byte queue
-/// (`prt->ioq`) and the port's process-monitor table.
+/// (`prt->ioq`), the port **state** stream flags `driver_get_port_flags` reports, and the port's
+/// one-PDL rule (`driver_pdl_create`).
 mod state;
 
 use state::DriverQueue;
@@ -1890,9 +1891,9 @@ impl beam_io::Driver for DriverPortAdapter {
             control.selects.clear();
             control.deadline = None;
         }
-        // The port's driver-private state goes with the driver: the C detaches the port's monitors on
-        // close (`io.c:3846-3959`) and asserts the tree empty at teardown (`io.c:3716`), and the
-        // private queue (`prt->ioq`) dies with the port struct.
+        // The port's driver-private state goes with the driver: the private queue (`prt->ioq`) dies
+        // with the port struct. (The C also detaches the port's monitors here — `io.c:3846-3959` —
+        // but the monitor family is not modelled; see the `beam_abi` monitor-identity handoff.)
         driver.host_mut().clear_driver_state();
         let released = self.release_selections(ctx);
         // The environment goes now: the port handle the driver held is dead the moment `stop`
@@ -1914,9 +1915,9 @@ impl Drop for DriverPortAdapter {
     ///
     /// The queue's entries point into this adapter's own host arena, so leaving them for a reader
     /// to drain after the arena is freed would be a dangling read; an emptied queue is the honest
-    /// answer (see [`TermQueue`]). The host's own per-port state (its private queue and monitors)
-    /// is dropped with the host, and is cleared here too so a port that never reached
-    /// [`beam_io::Driver::stop`] leaves exactly the same state behind.
+    /// answer (see [`TermQueue`]). The host's own per-port private state (its driver-private byte
+    /// queue — see the `state` child module) is dropped with the host, and is cleared here too so a
+    /// port that never reached [`beam_io::Driver::stop`] leaves exactly the same state behind.
     fn drop(&mut self) {
         self.terms.clear();
         if let Some(driver) = self.driver.as_mut() {
