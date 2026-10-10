@@ -353,7 +353,13 @@ still reproduces today's collector exactly.
   so the rule trades latency for copy work; a pause- or memory-sensitive process should pin
   `MatureSelection::Explicit(MatureKind::Copying)` regardless of size. The break-even is a **copy-work**
   break-even, not a wall-clock one; the measurement is a single-threaded in-process micro-benchmark and every
-  harness assertion is on the deterministic counts (timings are printed, never asserted).
+  harness assertion is on the deterministic counts (timings are printed, never asserted). The
+  *timing-derived* figures above are **not reproducible run-to-run and are not asserted** — a re-run of
+  `immix_break_even` observed the small-object "words saved per extra µs" climb 73→92→127→130→149 over
+  1→64 blocks (still rising at 64) rather than the 69→85 plateau, and `immix_selection_curve`'s pauses
+  spanned 1.60×–3.56× rather than the quoted 1.83×–2.38×; only the deterministic counts (pinned/moved
+  objects+words and the `Law`) reproduce exactly, so read the *value* of `IMMIX_BREAK_EVEN_WORDS` as
+  timing-motivated, not measurement-pinned.
 - **Standing decision (re-confirmed by the two-axis sweep).** `Auto` **never** selects Immix for the default
   policy — the rule reads the construction-time `initial_mature_words` (default 233 < one 256-word block), so
   the first size it accepts is 2048 configured words, which a default-policy process can never reach however
