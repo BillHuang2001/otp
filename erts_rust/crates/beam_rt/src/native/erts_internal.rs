@@ -324,8 +324,8 @@ impl RuntimeContext<'_> {
         // Only a scheduled process — the one whose heap the collector owns — can be
         // collected. Every other context runs on the runtime-wide arena, which the
         // collector never moves, so a request for it would be a no-op pretending to be work.
-        if self.mailbox_table.is_some() {
-            let pid = self.mailbox_pid;
+        if !self.owns_process_table() {
+            let pid = self.pid();
             self.runtime.request_gc(pid);
         }
         self.atom("true")

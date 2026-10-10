@@ -461,7 +461,9 @@ mod tests {
     #[test]
     fn a_forced_gc_request_is_served_exactly_once() {
         let mut rt = small_runtime();
-        let mut table = ProcessTable::new();
+        let mut table = ProcessTable::new(beam_process::SignalAtoms::from_table(
+            &mut beam_term::AtomTable::new(),
+        ));
         let pid = table.spawn_default().expect("a process");
 
         assert!(!rt.gc_request_pending(pid), "nothing requested yet");
@@ -486,7 +488,9 @@ mod tests {
     #[test]
     fn a_forbidden_collection_is_refused_without_pretending() {
         let mut rt = small_runtime();
-        let mut table = ProcessTable::new();
+        let mut table = ProcessTable::new(beam_process::SignalAtoms::from_table(
+            &mut beam_term::AtomTable::new(),
+        ));
 
         let pinned = table.spawn_default().expect("a process");
         rt.pin_process(pinned);
@@ -511,16 +515,23 @@ mod tests {
     #[test]
     fn requests_of_dead_processes_are_pruned_and_live_ones_kept() {
         let mut rt = small_runtime();
-        let mut table = ProcessTable::new();
+        let mut table = ProcessTable::new(beam_process::SignalAtoms::from_table(
+            &mut beam_term::AtomTable::new(),
+        ));
         let live = table.spawn_default().expect("a process");
-        let absent = rt.self_pid();
+        // A process that terminated with a request still pending: its slot is freed and its
+        // serial bumped, so the table no longer holds the pid. (A fresh table's *first* spawn
+        // would be number 0/serial 0 — the very pid `rt.self_pid()` names — so it cannot model
+        // an absent process; a second, then-taken spawn does.)
+        let gone = table.spawn_default().expect("a second, terminated process");
+        table.take(gone).expect("the terminated process");
 
         rt.request_gc(live);
-        rt.request_gc(absent);
+        rt.request_gc(gone);
         rt.prune_gc_requests(&table);
         assert!(rt.gc_request_pending(live), "a live process keeps its request");
         assert!(
-            !rt.gc_request_pending(absent),
+            !rt.gc_request_pending(gone),
             "a pid the table does not hold is pruned"
         );
     }
