@@ -24,10 +24,12 @@ is part of the documented NIF/driver ABI.
 
 ## API Surface
 - `erl_fixed_size_int_types.h` — `usgnd_int_8/16/32/64`, `sgnd_int_8/16/32/64`, `usgnd_int_max`,
-  `sgnd_int_max` and the matching `*_FSTR` printf-length macros. Consumed by `erl_printf_format.h`,
-  the emulator and third-party driver code that needs fixed-width types independent of `int N_t`
-  availability. Guards against `SIZEOF_*` mismatch by saving/undef'ing/rechecking around the
-  `#include "erl_int_sizes_config.h"`.
+  `sgnd_int_max` and the matching `*_FSTR` printf-length macros: fixed-width types independent of
+  `int N_t` availability. Guards against `SIZEOF_*` mismatch by saving/undef'ing/rechecking around
+  `#include "erl_int_sizes_config.h"`. **No in-tree consumer** — the file is `#include`d nowhere
+  in-tree and no in-tree code references `usgnd_int_*`/`sgnd_int_*`; its only live reference is the
+  install rule (`../lib_src/Makefile.in:434`, `RELEASE_INCLUDES`). It ships for out-of-tree
+  embedder/driver code.
 - `erl_int_sizes_config.h.in` — autoconf template (`SIZEOF_CHAR/SHORT/INT/LONG/LONG_LONG/VOID_P`).
   Configure writes `erts/include/$(TARGET)/erl_int_sizes_config.h` (AC_CONFIG_HEADERS,
   `../configure.ac:122`). Consumers: `erl_fixed_size_int_types.h`, `../../emulator/beam/erl_drv_nif.h`,
