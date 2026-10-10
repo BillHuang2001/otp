@@ -722,6 +722,19 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
 - `tests/` → crate-level integration tests (bit-pattern pins `layout.rs`, ABI pins `abi.rs`, term-ordering `compare_terms.rs`, external/record comparison `compare_external.rs`, bounded sizing `size_bounded.rs`, record/internal-ref hashing `record_ref_hash.rs`, the M1 internal-reference layout `internal_ref.rs`, system-`erl` oracle cross-checks `oracle.rs`, `map_hash.rs`, `number_oracle.rs` and `compare_oracle.rs`). `record_ref_hash.rs` carries offline pins for two native records (`(make_hash2, make_hash, definition_hash)`) and, when `erlc`/`erl` are present, compiles a real `-record #r{...}` fixture and cross-checks `phash2(T,1 bsl 32)`/`phash(T,1 bsl 32)-1` (skips loudly otherwise). Its corpus uses only keys defined in `atom.names` so the oracle's atom indices agree with `AtomTable::from_atom_names` (the C record hash is not portable for keys outside `atom.names`, and a record's value walk follows the definition's sorted-key order, not the declaration order). `internal_ref.rs` pins the four written words literally (never by cross-checking the sibling producers — this crate is a dependency sink) plus the round-trip, the typed errors and the `=:=`/order behaviour of two equal-id vs different-id references.
 
 ## Handoffs (owned by other nodes — escalate writes to the parent)
+- **The M1 internal-reference seam — this writer/accessor is the API the next consumer codes against.**
+  A **local-node** reference decoded from the wire (`NEWER_REFERENCE_EXT` / `NEW_REFERENCE_EXT`) is
+  materialized by reserving `INTERNAL_REF_WORDS` words and calling `boxed::write_internal_ref(hp, id)` —
+  never by hand-writing the four words — and an internal reference's id is read back for the encoder
+  with `boxed::internal_ref_id(t)` (never `internal_ref_numbers`, which describes the C layout only and
+  would return small-int tags for an M1 block). The wire form carries the local node's identity, which
+  the M1 block does not store (`node`/`serial` are the zeroed terms); a reference for **another** node
+  is an external reference and stays on `thing::write_external_ref`.
+  **Parity requirement:** the four words this writer emits are byte-identical to the ones
+  `beam_process`'s `MonitorRef::to_eterm`, `beam_bifs`'s `make_ref_thing` and `beam_rt`'s native process
+  floor already write; `tests/internal_ref.rs` pins that shape literally, so any of those producers
+  drifting from it — or a decode path building a different block — breaks the frozen term layout.
+  Owner of the consumer: `beam_codec` (outside this node); the three producers keep their own parity.
 - **`beam_codec` can now carry an external fun arity > 255 and a zero-length external reference.**
   `fun::write_fun_external` accepts **any** arity (it masks the header field with `FUN_MAX_FIELD`, so a
   block for an `External` fun with `num_free == 0` is `fun_words(External, 0) == 4` words and the true
