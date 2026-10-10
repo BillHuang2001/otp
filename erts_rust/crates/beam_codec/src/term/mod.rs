@@ -55,6 +55,7 @@
 
 mod binary;
 mod fun;
+mod r#ref;
 mod record;
 pub use binary::{
     bit_count_to_bytes, bitstring_bytes, bitstring_parts, bitstring_size_bits, make_binary,
@@ -73,6 +74,11 @@ pub use fun::{
 };
 #[cfg(test)]
 pub use fun::make_fun_local;
+/// The **M1 internal-reference** forwarding layer ([`r#ref`]): the safe wrappers
+/// (`internal_ref_id`/`make_internal_ref`) over [`beam_term::boxed`]'s frozen
+/// internal-reference layout, used by the encoder's internal-reference branch and
+/// the decoder's local-node demotion.
+pub use r#ref::{internal_ref_id, make_internal_ref};
 /// The whole native-record forwarding layer ([`record`]): the record constructor,
 /// the instance/definition readers and the frozen sizing surface
 /// (`record_block_words`/`record_def_size_words`/`record_inst_size_words` plus the

@@ -54,6 +54,7 @@ pub mod encode;
 pub mod error;
 pub mod off_heap;
 pub mod reader;
+pub(crate) mod ref_wire;
 pub mod tag;
 #[allow(unsafe_code)]
 pub mod term;
