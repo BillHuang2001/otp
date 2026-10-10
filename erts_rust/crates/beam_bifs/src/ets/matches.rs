@@ -293,6 +293,7 @@ mod tests {
             "z",
             "$1",
             "$2",
+            "$_",
             "$end_of_table",
         ]);
         atoms
@@ -409,7 +410,7 @@ mod tests {
         let z = ctx.atom("z").expect("seeded");
         let head = ctx.tuple(&[z]).expect("fits");
         let guards = ctx.list(&[]).expect("fits");
-        let body = ctx.list(&[ctx.atom("true").expect("seeded")]).expect("fits");
+        let body = ctx.list(&[ctx.atom("$_").expect("seeded")]).expect("fits");
         let clause = ctx.tuple(&[head, guards, body]).expect("fits");
         ctx.list(&[clause]).expect("fits")
     }

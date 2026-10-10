@@ -735,6 +735,7 @@ mod tests {
             "protection",
             "public",
             "protected",
+            "private",
         ]);
         atoms
     }
@@ -921,66 +922,131 @@ mod tests {
 
     /// A valid `{protection, P}` option changes the table's access through
     /// `Table::setopts(Some(owner), SetOpt::Access(_))` (the owner-gated setter) and
-    /// returns `true`. A malformed value and a duplicate `{protection, _}` are still
-    /// the oracle's `badarg` (the C validates the whole list first).
+    /// returns `true`; `ets:info(T, protection)` reflects each change immediately. An
+    /// empty option list by the owner is `true` (nothing is changed); a malformed
+    /// value, a duplicate `{protection, _}` and a **non-owner** caller (even on a
+    /// `public` table) are the oracle's `badarg`.
+    ///
+    /// Oracle probes (`erl -noshell`, erts-17.1):
+    ///
+    /// ```text
+    /// 1> T = ets:new(t, [set, public]),
+    ///    {ets:setopts(T, [{protection, protected}]), ets:info(T, protection)}.
+    /// {true, protected}
+    /// 2> {ets:setopts(T, [{protection, private}]), ets:info(T, protection)}.
+    /// {true, private}
+    /// 3> {ets:setopts(T, [{protection, public}]), ets:info(T, protection)}.
+    /// {true, public}
+    /// 4> ets:setopts(T, []).                        % the owner, nothing to change
+    /// true
+    /// 5> ets:setopts(T, [{protection, bogus}]).
+    /// ** exception error: bad argument
+    /// 6> ets:setopts(T, [{protection, public}, {protection, public}]).
+    /// ** exception error: bad argument
+    /// 7> % a non-owner of the public table (from a spawned process):
+    ///    catch ets:setopts(T, [{protection, private}]).
+    /// {'EXIT', {badarg, …}}                         % info(T, protection) stays public
+    /// ```
     #[test]
     fn setopts_applies_the_protection_option() {
         let bifs = crate::default_registry();
         let atoms = setopts_atoms();
         let mut heap = Heap::new(1 << 14).expect("heap");
         let mut tables = TableRegistry::new();
-        let pid = ProcessId::new(1, 0);
+        let owner = ProcessId::new(1, 0);
+        let other = ProcessId::new(2, 0);
 
-        let mut ctx = BifContext::new(&mut heap, &atoms, pid).with_tables(&mut tables);
-        let name = ctx.atom("t").expect("seeded");
-        let set = ctx.atom("set").expect("seeded");
-        let set_opts = ctx.list(&[set]).expect("option list");
-        let table = bifs
-            .call("ets", "new", 2, &mut ctx, &[name, set_opts])
-            .expect("ets:new");
+        // Build the table as its owner and walk the three modes, checking
+        // `ets:info(T, protection)` after every change (probes 1–3).
+        let (table, protection) = {
+            let mut ctx = BifContext::new(&mut heap, &atoms, owner).with_tables(&mut tables);
+            let name = ctx.atom("t").expect("seeded");
+            let set = ctx.atom("set").expect("seeded");
+            let public = ctx.atom("public").expect("seeded");
+            let set_opts = ctx.list(&[set, public]).expect("option list");
+            let table = bifs
+                .call("ets", "new", 2, &mut ctx, &[name, set_opts])
+                .expect("ets:new");
 
-        let protection = ctx.atom("protection").expect("seeded");
-        let public = ctx.atom("public").expect("seeded");
-
-        // A **valid** `{protection, public}` is applied and returns `true`.
-        let valid = {
-            let opt = ctx.tuple(&[protection, public]).expect("option");
-            ctx.list(&[opt]).expect("option list")
+            let protection = ctx.atom("protection").expect("seeded");
+            for mode in ["protected", "private", "public"] {
+                let value = ctx.atom(mode).expect("seeded");
+                let opt = ctx.tuple(&[protection, value]).expect("option");
+                let opts = ctx.list(&[opt]).expect("option list");
+                let truth = bifs
+                    .call("ets", "setopts", 2, &mut ctx, &[table, opts])
+                    .expect("ets:setopts");
+                assert_eq!(ctx.atoms().name(atom_val(truth)), Some("true"));
+                let info = bifs
+                    .call("ets", "info", 2, &mut ctx, &[table, protection])
+                    .expect("ets:info/2");
+                assert_eq!(
+                    ctx.atoms().name(atom_val(info)),
+                    Some(mode),
+                    "the protection is applied"
+                );
+            }
+            (table, protection)
         };
-        let truth = bifs
-            .call("ets", "setopts", 2, &mut ctx, &[table, valid])
-            .expect("setopts/2");
-        assert_eq!(ctx.atoms().name(atom_val(truth)), Some("true"));
-        let info = bifs
-            .call("ets", "info", 2, &mut ctx, &[table, protection])
-            .expect("ets:info/2");
-        assert_eq!(
-            ctx.atoms().name(atom_val(info)),
-            Some("public"),
-            "the protection is applied"
-        );
 
-        // A malformed `{protection, <non-access atom>}` is `badarg`.
-        let bad_value = {
-            let opt = ctx
-                .tuple(&[protection, ctx.atom("heir").expect("seeded")])
-                .expect("option");
-            ctx.list(&[opt]).expect("option list")
-        };
-        assert!(matches!(
-            bifs.call("ets", "setopts", 2, &mut ctx, &[table, bad_value]),
-            Err(BeamError::BadArg)
-        ));
+        // Probe 4: an empty option list is accepted for the owner and returns `true`.
+        {
+            let mut ctx = BifContext::new(&mut heap, &atoms, owner).with_tables(&mut tables);
+            let empty = ctx.list(&[]).expect("[]");
+            let truth = bifs
+                .call("ets", "setopts", 2, &mut ctx, &[table, empty])
+                .expect("ets:setopts");
+            assert_eq!(ctx.atoms().name(atom_val(truth)), Some("true"));
+        }
 
-        // A duplicate `{protection, _}` is `badarg` (the C rejects it, even when both
-        // entries are equal).
-        let duplicate = {
-            let one = ctx.tuple(&[protection, public]).expect("option");
-            ctx.list(&[one, one]).expect("option list")
-        };
-        assert!(matches!(
-            bifs.call("ets", "setopts", 2, &mut ctx, &[table, duplicate]),
-            Err(BeamError::BadArg)
-        ));
+        // Probe 5: a malformed `{protection, <non-access atom>}` is `badarg`.
+        // Probe 6: a duplicate `{protection, _}` is `badarg`, even when both entries
+        // are equal (the C validates the whole list first).
+        {
+            let mut ctx = BifContext::new(&mut heap, &atoms, owner).with_tables(&mut tables);
+            let public = ctx.atom("public").expect("seeded");
+            let bad_value = {
+                let opt = ctx
+                    .tuple(&[protection, ctx.atom("heir").expect("seeded")])
+                    .expect("option");
+                ctx.list(&[opt]).expect("option list")
+            };
+            assert!(matches!(
+                bifs.call("ets", "setopts", 2, &mut ctx, &[table, bad_value]),
+                Err(BeamError::BadArg)
+            ));
+            let duplicate = {
+                let one = ctx.tuple(&[protection, public]).expect("option");
+                ctx.list(&[one, one]).expect("option list")
+            };
+            assert!(matches!(
+                bifs.call("ets", "setopts", 2, &mut ctx, &[table, duplicate]),
+                Err(BeamError::BadArg)
+            ));
+        }
+
+        // Probe 7: a non-owner caller is `badarg`. The table is `public`, so the write
+        // gate admits the caller and the *owner* check is what denies it.
+        {
+            let mut ctx = BifContext::new(&mut heap, &atoms, other).with_tables(&mut tables);
+            let private = ctx.atom("private").expect("seeded");
+            let opt = ctx.tuple(&[protection, private]).expect("option");
+            let opts = ctx.list(&[opt]).expect("option list");
+            assert!(matches!(
+                bifs.call("ets", "setopts", 2, &mut ctx, &[table, opts]),
+                Err(BeamError::BadArg)
+            ));
+        }
+        {
+            let mut ctx = BifContext::new(&mut heap, &atoms, owner).with_tables(&mut tables);
+            let info = bifs
+                .call("ets", "info", 2, &mut ctx, &[table, protection])
+                .expect("ets:info/2");
+            assert_eq!(
+                ctx.atoms().name(atom_val(info)),
+                Some("public"),
+                "a denied call leaves the protection unchanged"
+            );
+        }
     }
 }

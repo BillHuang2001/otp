@@ -1461,6 +1461,60 @@ mod tests {
         )
     }
 
+    // -- live oracle ------------------------------------------------------
+
+    /// `$ERTS_ORACLE` if it names an existing file, else `erl` on `$PATH` — the same
+    /// resolution `src/numeric.rs`, `src/ets/specs.rs` and `tests/checksum.rs` use.
+    fn resolve_oracle() -> Option<std::path::PathBuf> {
+        if let Some(value) = std::env::var_os("ERTS_ORACLE") {
+            let program = std::path::PathBuf::from(&value);
+            if program.is_file() {
+                return Some(program);
+            }
+            eprintln!(
+                "[beam_bifs binconv] $ERTS_ORACLE='{}' is not an existing file — \
+                 treating it as no oracle.",
+                program.display()
+            );
+            return None;
+        }
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(|dir| dir.join("erl"))
+            .find(|candidate| candidate.is_file())
+    }
+
+    /// Runs `eval` under the oracle (`erl -noshell -eval <eval> -s init stop`) and
+    /// returns its stdout as lines.
+    ///
+    /// `None` means there is **no usable oracle** (the same convention
+    /// [`resolve_oracle`] uses): a loud notice is printed and the caller skips — never a
+    /// silent pass. A **spawned** oracle that fails (non-zero exit) is a test failure,
+    /// not a skip.
+    fn oracle_stdout(eval: &str) -> Option<Vec<String>> {
+        let oracle = resolve_oracle()?;
+        let output = std::process::Command::new(&oracle)
+            .arg("-noshell")
+            .arg("-eval")
+            .arg(eval)
+            .arg("-s")
+            .arg("init")
+            .arg("stop")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn the oracle '{}': {e}", oracle.display()));
+        assert!(
+            output.status.success(),
+            "the oracle '{}' exited with {:?}\n--- stderr ---\n{}",
+            oracle.display(),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let stdout = String::from_utf8(output.stdout).expect("the oracle printed UTF-8");
+        Some(stdout.lines().map(str::to_string).collect())
+    }
+
     // -- list_to_binary / binary_to_list ----------------------------------
 
     #[test]
@@ -2693,6 +2747,69 @@ mod tests {
             assert_eq!(
                 int_of(access::tuple_element(wrapped, 1)),
                 plain.len() as i64
+            );
+        });
+    }
+
+    /// The live-oracle cross-check for the `[used]` rule on a top-level `COMPRESSED`
+    /// image: the count is the compressed image's **own** length, never the padded
+    /// input's.
+    ///
+    /// The oracle produces the image (`term_to_binary(lists:seq(1,1000), [compressed])`),
+    /// reports its own `[used]` for `<Image/binary, 1,2,…,10>`, and prints the image's
+    /// exact bytes. The **same** bytes are then decoded here, so the two runtimes are
+    /// compared on one image (the oracle's zlib payload is its own — miniz_oxide's
+    /// deflate bytes differ — which is why comparing on *its* bytes, not two
+    /// independently produced ones, is what makes this a cross-check). Oracle-pinned:
+    /// `1827 1837 1827` for `lists:seq(1,1000)` (erts-17.1, probed live) — the
+    /// 1827-byte image inside a 1837-byte input reports 1827.
+    #[test]
+    fn binary_to_term_used_on_a_compressed_image_matches_the_live_oracle() {
+        // A raw string keeps the Erlang source readable — every `"` and `\` below is
+        // the Erlang character, not a Rust escape.
+        let eval = r#"C = term_to_binary(lists:seq(1,1000),[compressed]),
+P = <<C/binary,1,2,3,4,5,6,7,8,9,10>>,
+{_,U} = binary_to_term(P,[used]),
+io:format("~p ~p ~p~n",[byte_size(C), byte_size(P), U]),
+Bs = [integer_to_list(B) || B <- binary_to_list(C)],
+io:format("~s~n", [lists:join(",", Bs)]),
+halt()."#;
+        let Some(lines) = oracle_stdout(eval) else {
+            eprintln!();
+            eprintln!("=========== beam_bifs binconv: live oracle SKIPPED ===========");
+            eprintln!("No usable system `erl` oracle found ($ERTS_ORACLE unset or");
+            eprintln!("not executable, and no `erl` on $PATH).");
+            eprintln!("This test is NOT a pass — set $ERTS_ORACLE (or install Erlang/OTP).");
+            eprintln!("=============================================================");
+            eprintln!();
+            return;
+        };
+        assert!(lines.len() >= 2, "expected two oracle lines, got {lines:?}");
+        assert_eq!(
+            lines[0], "1827 1837 1827",
+            "the oracle's own (image, input, used) sizes changed"
+        );
+        // The byte list is the oracle's exact compressed image.
+        let image: Vec<u8> = lines[1]
+            .split(',')
+            .map(|byte| byte.trim().parse::<u8>().expect("an oracle byte"))
+            .collect();
+        assert_eq!(image.len(), 1827, "the oracle printed {len} bytes", len = image.len());
+        assert_eq!(&image[..2], &[VERSION_MAGIC, COMPRESSED_EXT]);
+
+        // Decode the oracle's very image, with the oracle's own trailing bytes.
+        let mut padded = image.clone();
+        padded.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        with_ctx(|ctx| {
+            let blob = bin(&padded);
+            let used_option = used_option(ctx);
+            let wrapped = binary_to_term_2(ctx, &[blob, used_option]).unwrap();
+            // The rule: the image's length, not the ten bytes longer input's.
+            assert_eq!(int_of(access::tuple_element(wrapped, 1)), image.len() as i64);
+            // And the decoded term really is `lists:seq(1,1000)`.
+            assert_eq!(
+                values(access::tuple_element(wrapped, 0)),
+                (1..=1000).collect::<Vec<i64>>()
             );
         });
     }
