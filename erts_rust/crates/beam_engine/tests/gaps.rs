@@ -64,8 +64,10 @@ use beam_term::{make_small, Atom, Eterm};
 //     `GetRecordElements`, `PutRecord`, `IsRecordAccessible`, `GetRecordField`,
 //     `GetRecordElementsId`, `UpdateRecordId`) plus `Deallocate` (the loader fuses
 //     every corpus `deallocate;return` into `DeallocateReturn`, so the standalone
-//     variant is unreached), `BsTestTail2`, `ExecutableLine`, `DebugLine`,
-//     `Generic` — 12 of the 107 `Instr` variants.
+//     variant is unreached), `BsTestTail2`, `SetTupleElement` (the corpus lowers no
+//     in-place tuple write: a general `setelement/3` builds a fresh tuple, and a
+//     record update lowers to `update_record`), `ExecutableLine`, `DebugLine`,
+//     `Generic` — 13 of the 108 `Instr` variants.
 //     Toolchain evidence for the native-record family: `erl_features:configurable()`
 //     ⇒ `[compr_assign,maybe_expr]` (`native_record` is not in it), `erlc
 //     -enable-feature native_record` ⇒ "the feature 'native_record' does not

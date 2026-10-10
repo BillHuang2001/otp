@@ -20,7 +20,7 @@
 
 //! The interpreter's **execution census** over the frozen typed IR.
 //!
-//! `beam_loader::Instr` is a closed vocabulary of **107** variants (plus the
+//! `beam_loader::Instr` is a closed vocabulary of **108** variants (plus the
 //! separate 25-kind `TestKind`). This file turns "is every variant reachable on a
 //! real execution path?" into an executable claim instead of an untested assertion:
 //!
@@ -39,8 +39,8 @@
 //!      [`UNCLAIMED_PREFIX`] that `families::dispatch` returns for an instruction
 //!      **no** core arm and **no** family claims.
 //!
-//!    The census asserts (c) is **empty**: every one of the 107 variants is owned.
-//!    At this revision the measured dynamic split is **49 EXECUTED + 58
+//!    The census asserts (c) is **empty**: every one of the 108 variants is owned.
+//!    At this revision the measured dynamic split is **49 EXECUTED + 59
 //!    CLAIMED-BLOCKED + 0 UNCLAIMED** (pinned below as `EXECUTED_VARIANTS` /
 //!    `CLAIMED_BLOCKED_VARIANTS`). Many CLAIMED-BLOCKED rows are **probe artifacts**,
 //!    not real gaps: the roster drives every atom-ish operand as the degenerate
@@ -88,7 +88,7 @@
 //! DebugLine, NifStart, OnLoad, FuncInfo, Move, Swap, Test, SelectVal, Jump, GcBif,
 //! Bif0, Bif, Call, CallLast, CallOnly, CallExt, CallExtOnly, CallExtLast, Allocate,
 //! AllocateHeap, TestHeap, Deallocate, DeallocateReturn, Trim, Return, InitYregs,
-//! Generic`); the other **76** are claimed by exactly one of the nine families under
+//! Generic`); the other **77** are claimed by exactly one of the nine families under
 //! `src/families/**`.
 //! `Instr::Generic` is the residual-opcode sentinel: it is handled by
 //! `src/generic.rs` (`error::unsupported(op.name())`), which is core, so it is
@@ -97,11 +97,11 @@
 //! # Why one long file
 //!
 //! The rosters ([`all_instr_variants`], [`the_test_kinds`]) are a hand-maintained
-//! one-to-one mirror of a closed enum — 107 `Instr` constructions and 25 `TestKind`s
+//! one-to-one mirror of a closed enum — 108 `Instr` constructions and 25 `TestKind`s
 //! whose value *is* that they are exhaustive. They must live beside the census that
 //! consumes them, and they cannot be factored into `tests/support/` (a shared module
 //! owned by another test file); keeping every census artifact in this one file is
-//! what makes the "107 rows / 107 distinct names" assertion a real completeness
+//! what makes the "108 rows / 108 distinct names" assertion a real completeness
 //! check rather than a claim split across modules.
 
 mod support;
@@ -128,28 +128,31 @@ const UNCLAIMED_PREFIX: &str = "widened opcode not yet executed";
 
 /// The number of `beam_loader::Instr` variants this census must drive (the enum's
 /// own roster; a mismatch means the hand-written roster below drifted).
-const INSTR_VARIANTS: usize = 107;
+const INSTR_VARIANTS: usize = 108;
 
 /// The number of [`TestKind`]s (the enum's own roster).
 const TEST_KINDS: usize = 25;
 
 /// The measured **dynamic** classification of the [`INSTR_VARIANTS`] variants at
 /// this census's revision: the probe reached a `Step`/return for **49** of them
-/// (class (a) EXECUTED) and observed a typed, owned capability error for **58**
+/// (class (a) EXECUTED) and observed a typed, owned capability error for **59**
 /// (class (b) CLAIMED-BLOCKED); **0** are unclaimed.
 ///
 /// These are the *dynamic* counts, not the *static* family assignment (31 core arms
-/// + 76 family-owned): a family-owned variant whose degenerate probe happens to
+/// + 77 family-owned): a family-owned variant whose degenerate probe happens to
 /// execute classifies as EXECUTED — `SelectTupleArity` on a non-tuple takes the
 /// `fail` branch, exactly like an unmatched arity, and `GetRecordElements`/
 /// `GetRecordElementsId`/`GetRecordField`/`UpdateRecordId` branch to `fail` on a
 /// non-record source. `Deallocate` and `DeallocateReturn` both pop the probe's only
 /// (zero-Y) bottom frame, so the following `return` finds no frame — a probe
-/// artifact that classes both CLAIMED-BLOCKED. The counts are pinned so a change of
-/// classification (a real regression, or a newly executed variant) fails the build.
+/// artifact that classes both CLAIMED-BLOCKED. `SetTupleElement` is CLAIMED-BLOCKED
+/// because the probe passes the degenerate `Operand::Nil` as the tuple, so the
+/// family's write-target check raises `{badmatch, Nil}`. The counts are pinned so a
+/// change of classification (a real regression, or a newly executed variant) fails
+/// the build.
 const EXECUTED_VARIANTS: usize = 49;
 /// See [`EXECUTED_VARIANTS`]; class (b) CLAIMED-BLOCKED.
-const CLAIMED_BLOCKED_VARIANTS: usize = 58;
+const CLAIMED_BLOCKED_VARIANTS: usize = 59;
 
 // ---------------------------------------------------------------------------
 // Classification
@@ -399,7 +402,7 @@ fn interpreter_execution_census_over_every_instr_variant() {
     );
 
     // The roster must be complete *and* duplicate-free: every construction is a real
-    // variant, so 107 distinct names out of 107 variants is exhaustive coverage.
+    // variant, so 108 distinct names out of 108 variants is exhaustive coverage.
     let distinct: BTreeSet<&str> = rows.iter().map(|row| row.name.as_str()).collect();
     assert_eq!(
         rows.len(),
@@ -754,7 +757,7 @@ fn the_test_kinds() -> Vec<TestKind> {
     ]
 }
 
-/// Every one of the 107 [`Instr`] variants — one construction each, in the enum's
+/// Every one of the 108 [`Instr`] variants — one construction each, in the enum's
 /// own order.
 ///
 /// Operand choices are the *minimal well-formed* ones that let the variant be
@@ -893,6 +896,11 @@ fn all_instr_variants() -> Vec<Instr> {
             source: x0(),
             element: 0,
             dst: x1(),
+        },
+        Instr::SetTupleElement {
+            element: x1(),
+            tuple: x0(),
+            offset: 0,
         },
         Instr::PutList {
             head: x0(),
