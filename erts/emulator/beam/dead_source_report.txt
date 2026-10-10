@@ -1,6 +1,220 @@
-Dead-source checker report for erts/emulator/**/*.{c,h,cpp,hpp,cc}
-candidates checked: 746   referenced: 721   exempt (retained by rule): 25   deletable: 0
+Dead-source checker report for erts/**/*.{c,h,cpp,hpp,cc} — whole erts/ tree
+STRICT:  candidates checked: 925   live: 823   strict-dead: 102   strict-dead-not-exempt (ACTIONABLE): 1
+loose (advisory): referenced: 900   exempt (retained by rule): 25   deletable: 0
 
+STRICT DEAD (not built and not reachable from any live file), grouped per subdirectory:
+  emulator/asmjit/
+    exempt:
+      erts/emulator/asmjit/asmjit.h  <- vendored 3PP (asmjit), see Makefile.in ASMJIT_CPP
+    ACTIONABLE:
+      (none)
+  emulator/asmjit/arm/
+    exempt:
+      erts/emulator/asmjit/arm/a64operand.cpp  <- vendored 3PP (asmjit), see Makefile.in ASMJIT_CPP
+      erts/emulator/asmjit/arm/a64rapass.cpp  <- vendored 3PP (asmjit), see Makefile.in ASMJIT_CPP
+    ACTIONABLE:
+      (none)
+  emulator/asmjit/x86/
+    exempt:
+      erts/emulator/asmjit/x86/x86instdb.cpp  <- vendored 3PP (asmjit), see Makefile.in ASMJIT_CPP
+      erts/emulator/asmjit/x86/x86operand.cpp  <- vendored 3PP (asmjit), see Makefile.in ASMJIT_CPP
+      erts/emulator/asmjit/x86/x86rapass.cpp  <- vendored 3PP (asmjit), see Makefile.in ASMJIT_CPP
+    ACTIONABLE:
+      (none)
+  emulator/test/alloc_SUITE_data/
+    exempt:
+      erts/emulator/test/alloc_SUITE_data/basic.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/alloc_SUITE_data/bucket_mask.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/alloc_SUITE_data/coalesce.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/alloc_SUITE_data/migration.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/alloc_SUITE_data/mseg_clear_cache.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/alloc_SUITE_data/rbtree.c  <- test fixture under test/ (owned by the CT suites)
+    ACTIONABLE:
+      (none)
+  emulator/test/binary_SUITE_data/
+    exempt:
+      erts/emulator/test/binary_SUITE_data/call_local_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/binary_SUITE_data/send_term_local_drv.c  <- test fixture under test/ (owned by the CT suites)
+    ACTIONABLE:
+      (none)
+  emulator/test/busy_port_SUITE_data/
+    exempt:
+      erts/emulator/test/busy_port_SUITE_data/busy_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/busy_port_SUITE_data/hard_busy_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/busy_port_SUITE_data/nosuspend_test_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/busy_port_SUITE_data/soft_busy_drv.c  <- test fixture under test/ (owned by the CT suites)
+    ACTIONABLE:
+      (none)
+  emulator/test/ddll_SUITE_data/
+    exempt:
+      erts/emulator/test/ddll_SUITE_data/echo_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/ddll_SUITE_data/echo_drv_fail_init.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/ddll_SUITE_data/initfail_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/ddll_SUITE_data/lock_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/ddll_SUITE_data/wrongname_drv.c  <- test fixture under test/ (owned by the CT suites)
+    ACTIONABLE:
+      (none)
+  emulator/test/dirty_nif_SUITE_data/
+    exempt:
+      erts/emulator/test/dirty_nif_SUITE_data/dirty_nif_SUITE.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/dirty_nif_SUITE_data/echo_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/dirty_nif_SUITE_data/on_halt_a.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/dirty_nif_SUITE_data/on_halt_b.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/dirty_nif_SUITE_data/on_halt_c.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/dirty_nif_SUITE_data/on_halt_d.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/dirty_nif_SUITE_data/on_halt_e.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/dirty_nif_SUITE_data/on_halt_f.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/dirty_nif_SUITE_data/on_halt_nif.c  <- test fixture under test/ (owned by the CT suites)
+    ACTIONABLE:
+      (none)
+  emulator/test/driver_SUITE_data/
+    exempt:
+      erts/emulator/test/driver_SUITE_data/async_blast_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/driver_SUITE_data/caller_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/driver_SUITE_data/chkio_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/driver_SUITE_data/consume_timeslice_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/driver_SUITE_data/env_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/driver_SUITE_data/erl_errno_id_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/driver_SUITE_data/invalid_extended_marker_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/driver_SUITE_data/io_ready_exit_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/driver_SUITE_data/ioq_exit_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/driver_SUITE_data/larger_major_vsn_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/driver_SUITE_data/larger_minor_vsn_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/driver_SUITE_data/many_events_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/driver_SUITE_data/missing_callback_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/driver_SUITE_data/monitor_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/driver_SUITE_data/otp_6879_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/driver_SUITE_data/otp_9302_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/driver_SUITE_data/outputv_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/driver_SUITE_data/peek_non_existing_queue_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/driver_SUITE_data/queue_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/driver_SUITE_data/smaller_major_vsn_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/driver_SUITE_data/smaller_minor_vsn_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/driver_SUITE_data/sys_info_base_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/driver_SUITE_data/sys_info_curr_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/driver_SUITE_data/sys_info_drv_impl.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/driver_SUITE_data/sys_info_drv_impl.h  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/driver_SUITE_data/sys_info_prev_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/driver_SUITE_data/thr_msg_blast_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/driver_SUITE_data/timer_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/driver_SUITE_data/vsn_mismatch_drv_impl.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/driver_SUITE_data/zero_extended_marker_garb_drv.c  <- test fixture under test/ (owned by the CT suites)
+    ACTIONABLE:
+      (none)
+  emulator/test/erl_drv_thread_SUITE_data/
+    exempt:
+      erts/emulator/test/erl_drv_thread_SUITE_data/basic.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/erl_drv_thread_SUITE_data/rwlock.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/erl_drv_thread_SUITE_data/tsd.c  <- test fixture under test/ (owned by the CT suites)
+    ACTIONABLE:
+      (none)
+  emulator/test/lttng_SUITE_data/
+    exempt:
+      erts/emulator/test/lttng_SUITE_data/caller_drv.c  <- test fixture under test/ (owned by the CT suites)
+    ACTIONABLE:
+      (none)
+  emulator/test/mtx_SUITE_data/
+    exempt:
+      erts/emulator/test/mtx_SUITE_data/mtx_SUITE.c  <- test fixture under test/ (owned by the CT suites)
+    ACTIONABLE:
+      (none)
+  emulator/test/nif_SUITE_data/
+    exempt:
+      erts/emulator/test/nif_SUITE_data/echo_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/nif_SUITE_data/nif_SUITE.1.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/nif_SUITE_data/nif_mod.1.2_0.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/nif_SUITE_data/nif_mod.1.2_4.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/nif_SUITE_data/nif_mod.1.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/nif_SUITE_data/nif_mod.2.2_0.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/nif_SUITE_data/nif_mod.2.2_4.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/nif_SUITE_data/nif_mod.2.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/nif_SUITE_data/nif_mod.3.2_0.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/nif_SUITE_data/nif_mod.3.2_4.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/nif_SUITE_data/nif_mod.3.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/nif_SUITE_data/nif_mod.4.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/nif_SUITE_data/nif_mod.5.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/nif_SUITE_data/nif_mod.c  <- test fixture under test/ (owned by the CT suites)
+    ACTIONABLE:
+      (none)
+  emulator/test/os_signal_SUITE_data/
+    exempt:
+      erts/emulator/test/os_signal_SUITE_data/os_signal_nif.c  <- test fixture under test/ (owned by the CT suites)
+    ACTIONABLE:
+      (none)
+  emulator/test/port_SUITE_data/
+    exempt:
+      erts/emulator/test/port_SUITE_data/dead_port.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/port_SUITE_data/echo_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/port_SUITE_data/exit_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/port_SUITE_data/failure_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/port_SUITE_data/sleep_failure_drv.c  <- test fixture under test/ (owned by the CT suites)
+    ACTIONABLE:
+      (none)
+  emulator/test/port_bif_SUITE_data/
+    exempt:
+      erts/emulator/test/port_bif_SUITE_data/control_drv.c  <- test fixture under test/ (owned by the CT suites)
+    ACTIONABLE:
+      (none)
+  emulator/test/port_trace_SUITE_data/
+    exempt:
+      erts/emulator/test/port_trace_SUITE_data/echo_drv.c  <- test fixture under test/ (owned by the CT suites)
+    ACTIONABLE:
+      (none)
+  emulator/test/send_term_SUITE_data/
+    exempt:
+      erts/emulator/test/send_term_SUITE_data/ext_terms.h  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/send_term_SUITE_data/send_term_drv.c  <- test fixture under test/ (owned by the CT suites)
+    ACTIONABLE:
+      (none)
+  emulator/test/signal_SUITE_data/
+    exempt:
+      erts/emulator/test/signal_SUITE_data/unlink_signal_drv.c  <- test fixture under test/ (owned by the CT suites)
+    ACTIONABLE:
+      (none)
+  emulator/test/system_profile_SUITE_data/
+    exempt:
+      erts/emulator/test/system_profile_SUITE_data/echo_drv.c  <- test fixture under test/ (owned by the CT suites)
+    ACTIONABLE:
+      (none)
+  emulator/test/trace_SUITE_data/
+    exempt:
+      erts/emulator/test/trace_SUITE_data/slow_drv.c  <- test fixture under test/ (owned by the CT suites)
+      erts/emulator/test/trace_SUITE_data/trace_SUITE.c  <- test fixture under test/ (owned by the CT suites)
+    ACTIONABLE:
+      (none)
+  emulator/test/trace_call_time_SUITE_data/
+    exempt:
+      erts/emulator/test/trace_call_time_SUITE_data/trace_nif.c  <- test fixture under test/ (owned by the CT suites)
+    ACTIONABLE:
+      (none)
+  emulator/test/trace_nif_SUITE_data/
+    exempt:
+      erts/emulator/test/trace_nif_SUITE_data/trace_nif.c  <- test fixture under test/ (owned by the CT suites)
+    ACTIONABLE:
+      (none)
+  emulator/test/trace_port_SUITE_data/
+    exempt:
+      erts/emulator/test/trace_port_SUITE_data/echo_drv.c  <- test fixture under test/ (owned by the CT suites)
+    ACTIONABLE:
+      (none)
+  example/
+    exempt:
+      erts/example/matrix_nif.c  <- doc sample; not built/installed/tested by the OTP build
+      erts/example/next_perm.cc  <- doc sample; not built/installed/tested by the OTP build
+    ACTIONABLE:
+      (none)
+  lib_src/yielding_c_fun/test/examples/
+    exempt:
+      (none)
+    ACTIONABLE:
+      erts/lib_src/yielding_c_fun/test/examples/test_generated_header_file_code.c
+  test/ethread_SUITE_data/
+    exempt:
+      erts/test/ethread_SUITE_data/ethread_tests.c  <- erts-level test tooling/fixture (owned by the CT suites)
+    ACTIONABLE:
+      (none)
+
+=== ADVISORY: loose single-pass tier (NOT the deletion gate) ===
 DELETABLE (no build ref, no #include, no symbol use):
   (none)
 
@@ -33,7 +247,50 @@ EXEMPT (mechanically unreferenced but retained):
 
 WEAK (retained, but the only reference is a non-makefile mention -
       a CT suite, an escript or a CI list; audit before deleting):
+  erts/lib_src/yielding_c_fun/test/examples/test_generated_header_file_code.c  <- erts/lib_src/yielding_c_fun/test/test.sh: mentions 'test_generated_header_file_code'
 
 REFERENCED BUT NOT IN AN OBJECT LIST (compilation units reachable only by
 #include / symbol use - i.e. dead-but-referenced; audit before deleting):
-  (none)
+  erts/etc/unix/setuid_socket_wrap.c
+  erts/etc/win32/cygwin_tools/mingw/coffix.c
+  erts/etc/win32/cygwin_tools/vc/cc_wrap.c
+  erts/etc/win32/cygwin_tools/vc/coffix.c
+  erts/etc/win32/cygwin_tools/vc/ld_wrap.c
+  erts/etc/win32/msys_tools/vc/coffix.c
+  erts/etc/win32/wsl_tools/vc/coffix.c
+  erts/lib_src/yielding_c_fun/test/examples/auto_yield.c
+  erts/lib_src/yielding_c_fun/test/examples/const_defenition.c
+  erts/lib_src/yielding_c_fun/test/examples/consume_reds.c
+  erts/lib_src/yielding_c_fun/test/examples/consume_reds_variable.c
+  erts/lib_src/yielding_c_fun/test/examples/control_statements.c
+  erts/lib_src/yielding_c_fun/test/examples/custom_code_save_restore_yield_state.c
+  erts/lib_src/yielding_c_fun/test/examples/custom_code_save_restore_yield_state_alt_syntax.c
+  erts/lib_src/yielding_c_fun/test/examples/debug_ptr_to_stack.c
+  erts/lib_src/yielding_c_fun/test/examples/declarations.c
+  erts/lib_src/yielding_c_fun/test/examples/declarations_in_for_loops.c
+  erts/lib_src/yielding_c_fun/test/examples/destroy_while_yielded.c
+  erts/lib_src/yielding_c_fun/test/examples/in_code_var_declaration.c
+  erts/lib_src/yielding_c_fun/test/examples/multi_scope_yield.c
+  erts/lib_src/yielding_c_fun/test/examples/nested_call_consume_reds.c
+  erts/lib_src/yielding_c_fun/test/examples/nested_loop_yield.c
+  erts/lib_src/yielding_c_fun/test/examples/sha256_erlang_nif/c_src/sha-2/sha-256_orginal.c
+  erts/lib_src/yielding_c_fun/test/examples/sha256_erlang_nif/c_src/sha256_nif.c
+  erts/lib_src/yielding_c_fun/test/examples/simple_fun_call.c
+  erts/lib_src/yielding_c_fun/test/examples/simple_yield.c
+  erts/lib_src/yielding_c_fun/test/examples/simple_yield_no_reds.c
+  erts/lib_src/yielding_c_fun/test/examples/simple_yielding_fun_call.c
+  erts/lib_src/yielding_c_fun/test/examples/stack_array.c
+  erts/lib_src/yielding_c_fun/test/examples/static_inline_function.c
+  erts/lib_src/yielding_c_fun/test/examples/test_generated_header_file_code.c
+  erts/lib_src/yielding_c_fun/test/examples/test_generated_header_file_main.c
+  erts/lib_src/yielding_c_fun/test/examples/test_only_output_yielding_funs.c
+  erts/lib_src/yielding_c_fun/test/examples/test_only_output_yielding_funs_ptr_to_stack.c
+  erts/lib_src/yielding_c_fun/test/examples/test_trap.c
+  erts/lib_src/yielding_c_fun/test/examples/thread_example.c
+  erts/lib_src/yielding_c_fun/test/examples/void_param.c
+  erts/lib_src/yielding_c_fun/test/examples/void_ret_fun.c
+  erts/lib_src/yielding_c_fun/test/examples/ycf_cannot_transform_fun_call.c
+  erts/lib_src/yielding_c_fun/test/examples/ycf_stack_alloc.c
+  erts/lib_src/yielding_c_fun/test/examples/yield_with_struct.c
+  erts/lib_src/yielding_c_fun/test/examples/yielding_fun_in_control.c
+  erts/lib_src/yielding_c_fun/test/examples/yielding_mutual_recursion.c
