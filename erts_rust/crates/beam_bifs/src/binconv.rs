@@ -165,7 +165,7 @@ use crate::access;
 use crate::arith;
 use crate::bits;
 use crate::context::BifContext;
-use crate::error::{badarg, system_limit};
+use crate::error::{badarg, system_limit, unsupported_bif};
 use crate::numeric::{
     base_arg, format_scientific, integer_digits, parse_float, parse_float_options, parse_integer,
     render_float, small_arg, DEFAULT_FLOAT_DECIMALS,
@@ -659,6 +659,11 @@ pub(crate) struct T2bOptions {
     /// The zlib level of `compressed`/`{compressed, Level}`, `None` when neither was
     /// given (the oracle's `level` default).
     compression: Option<u8>,
+    /// The bare `deterministic` atom (`DFLAG_DETERMINISTIC`, `external.c:1552`).
+    deterministic: bool,
+    /// The bare `local` atom (`DFLAG_LOCAL_EXT` — the `LOCAL_EXT` wrapper,
+    /// `external.c:1539-1542`, `:3305-3317`).
+    local: bool,
 }
 
 impl Default for T2bOptions {
@@ -668,6 +673,8 @@ impl Default for T2bOptions {
         T2bOptions {
             minor_version: 2,
             compression: None,
+            deterministic: false,
+            local: false,
         }
     }
 }
@@ -699,11 +706,18 @@ pub(crate) fn parse_term_to_binary_options(atoms: &AtomTable, opts: Eterm) -> Re
     let mut parsed = T2bOptions::default();
     for item in proper_list(opts).ok_or_else(badarg)? {
         if access::is_atom(item) {
-            if atoms.name(atom_val(item)) == Some("compressed") {
-                parsed.compression = Some(DEFAULT_COMPRESSED_LEVEL);
-                continue;
+            match atoms.name(atom_val(item)) {
+                Some("compressed") => parsed.compression = Some(DEFAULT_COMPRESSED_LEVEL),
+                Some("deterministic") => parsed.deterministic = true,
+                Some("local") => parsed.local = true,
+                // `iovec` is accepted by `parse_t2b_opts` only when the caller can
+                // receive an iovec (`iovecp != NULL`) — `term_to_binary/2` passes
+                // `NULL` (`external.c:1565-1590`), so the oracle answers `badarg`, as
+                // it does for `fragment` (a `fsizep == NULL` caller, `:1592-1617`) and
+                // for every other atom.
+                _ => return Err(badarg()),
             }
-            return Err(badarg());
+            continue;
         }
         if !access::is_tuple(item) || access::tuple_size(item) != 2 {
             return Err(badarg());
@@ -731,6 +745,12 @@ pub(crate) fn parse_term_to_binary_options(atoms: &AtomTable, opts: Eterm) -> Re
             _ => return Err(badarg()),
         }
     }
+    // `parse_t2b_opts` rejects the pair *after* the whole list is scanned
+    // (`external.c:1543-1545`), so `[local, deterministic]` is `badarg` in either
+    // order — the two flag sets are mutually exclusive.
+    if parsed.local && parsed.deterministic {
+        return Err(badarg());
+    }
     Ok(parsed)
 }
 
@@ -743,10 +763,95 @@ pub(crate) fn parse_term_to_binary_options(atoms: &AtomTable, opts: Eterm) -> Re
 ///
 /// The encoder's and zlib's errors (see [`encode_body`]).
 fn encode_image(ctx: &mut BifContext<'_>, term: Eterm, options: &T2bOptions) -> Result<Vec<u8>> {
+    // `local` selects the `LOCAL_EXT` wrapper, whose 4-byte payload is the *node's*
+    // local hash: `local_node_hash` seeds a Bob-Jenkins block hash from the node's
+    // hostname/pid/time-offset and the runtime's monotonic clock
+    // (`external.c:136-200`), patches the `[VERSION_MAGIC][LOCAL_EXT][hash:4 BE]`
+    // prologue (`:3305-3317`, `:4046-4109`) and — for an internal pid/port/ref —
+    // replaces the node atom with `NIL_EXT` (`:5589`). `beam_codec` can write that
+    // wrapper (`Encoder::finish_local(hash)`), but the hash itself is runtime/node
+    // state: it changes on every VM start, so it belongs to `beam_rt`/`beam_dist`, not
+    // to this crate, and there is no seam to obtain it. A typed gap is therefore the
+    // honest answer — fabricating four bytes would produce an image the oracle (and
+    // every other node) rejects.
+    if options.local {
+        return Err(unsupported_bif());
+    }
+    // `deterministic` (`DFLAG_DETERMINISTIC`) re-sorts every map's keys into full
+    // Erlang term order (`CMP_TERM` = `erts_cmp(_, _, 1, 0)`, `map_key_compare`,
+    // `external.c:3217-3227`, applied at `:3433-3470`/`:3757-3804`). The codec's
+    // encoder has no deterministic mode: its map arms emit the flat map in stored
+    // order and the HAMT in reversed slot order (`encode_map`/`encode_hashmap_pairs`).
+    // When the stored order already *is* the deterministic order the plain encoder is
+    // byte-exact and the option is a no-op — verified here by
+    // [`deterministic_order_is_unchanged`], which walks the term conservatively and
+    // answers `false` (⇒ typed gap) for any map that would need re-sorting and for any
+    // subtree whose maps it cannot inspect.
+    if options.deterministic && !deterministic_order_is_unchanged(term, ctx.atoms()) {
+        return Err(unsupported_bif());
+    }
     match options.compression {
         None => plain_image_of(ctx, term, options),
         Some(level) => compressed_image(&encode_body(ctx, term, options)?, level),
     }
+}
+
+/// Whether `term`'s map keys are already in the order `[deterministic]` requires, so
+/// the plain encoder reproduces the option's image byte-for-byte.
+///
+/// `[deterministic]` sorts each map's pairs by full Erlang term order (`CMP_TERM`,
+/// `erts_cmp(a, b, 1, 0)`) — atoms by **name**, not by index — whereas ERTS stores a
+/// flat map in `erts_cmp_flatmap_keys` order (atoms by index) and a HAMT in hash order.
+/// A map therefore needs re-sorting whenever its stored pair order differs from the
+/// `cmp` order ([`beam_term::map::map_pairs`] returns exactly that order).
+///
+/// The walk is deliberately **conservative**: it descends tuples, lists (proper and
+/// improper), and both map kinds, but a native record or a fun — whose fields/*
+/// closure environment can hold a map this module cannot read without `unsafe` — makes
+/// it answer `false` (a typed gap) rather than risk `true` for a subtree that does
+/// contain a map. A leaf term is trivially unchanged.
+fn deterministic_order_is_unchanged(term: Eterm, atoms: &AtomTable) -> bool {
+    if access::is_map(term) {
+        // The stored order (flat map: `erts_cmp_flatmap_keys`; HAMT: slot walk) vs the
+        // deterministic (`cmp`) order. `map_pairs` returns the latter.
+        let Ok(stored) = access::map_pairs_storage_order(term) else {
+            return false;
+        };
+        let Ok(ordered) = beam_term::map::map_pairs(term, atoms) else {
+            return false;
+        };
+        if stored.len() != ordered.len() {
+            return false;
+        }
+        let same_order = stored.iter().zip(ordered.iter()).all(|(s, o)| {
+            beam_term::compare::cmp(s.0, o.0, atoms).is_eq()
+                && beam_term::compare::cmp(s.1, o.1, atoms).is_eq()
+        });
+        if !same_order {
+            return false;
+        }
+        return stored
+            .iter()
+            .all(|(k, v)| deterministic_order_is_unchanged(*k, atoms) && deterministic_order_is_unchanged(*v, atoms));
+    }
+    if access::is_tuple(term) {
+        return (0..access::tuple_size(term))
+            .all(|index| deterministic_order_is_unchanged(access::tuple_element(term, index), atoms));
+    }
+    if access::is_list(term) {
+        // A cons (`is_list` covers only the non-NIL cons); follow the chain and inspect
+        // the tail too, so an improper list's final element is walked as well.
+        let mut cursor = term;
+        while access::is_list(cursor) {
+            if !deterministic_order_is_unchanged(access::car(cursor), atoms) {
+                return false;
+            }
+            cursor = access::cdr(cursor);
+        }
+        return deterministic_order_is_unchanged(cursor, atoms);
+    }
+    // A fun's environment and a native record's fields are opaque here — see above.
+    !(access::is_function(term) || access::is_record(term))
 }
 
 /// The **uncompressed** external image of `term` under `options`: the version byte
@@ -2132,6 +2237,7 @@ mod tests {
     }
 
     // -- binary_to_term ---------------------------------------------------
+
     #[test]
     fn binary_to_term_matches_the_oracle() {
         with_ctx(|ctx| {
