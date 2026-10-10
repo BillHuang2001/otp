@@ -108,7 +108,7 @@ The surface answers **67** atom keys plus two tuple keys (`{allocator, A}`, `{wo
 * **`unsafe`-free.** The whole crate is `#![deny(unsafe_code)]`; the glue uses only the safe peripheries of the lower crates (`Heap::cons/tuple`, `AtomTable::intern`, `BifRegistry::call`).
 * **Call down, never duplicate.** The `~p` printer is **not** re-implemented — `format.rs` drives the registered `io:format/2` BIF.
 * **Frozen term layout** (`../CONTEXT.md` §2): terms are built/inspected only through `beam_term`.
-* **Files ~1000 lines**, split by responsibility; `#![warn(missing_docs)]`, every public item documented. Pre-existing oversize (not restructured): `src/port.rs` (~2079 lines of production; its ~2190-line unit suite lives in `src/port/tests.rs`).
+* **Files ~1000 lines**, split by responsibility; `#![warn(missing_docs)]`, every public item documented. Pre-existing oversize (not restructured): `src/port.rs` (~2079 lines of production; its ~2190-line unit suite lives in `src/port/tests.rs`) and `src/runtime.rs` (~2280 lines — the façade is also the colocated home of its own unit tests).
 
 ## Design Decisions
 * **One shared atom table (the code server's).** `CodeServer` owns **one** `Rc<AtomTable>` (copy-on-write on intern); every loaded module is interned into it and `call_bif` hands `BifContext` that same table, so an atom a BIF builds is an index the engine compares and the printer names for **every** loaded module. Indices are insertion-ordered and never renumber.
