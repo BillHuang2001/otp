@@ -936,25 +936,42 @@ mod tests {
     /// The per-port byte counters `port_info(Port, input | output)` report are real: a write
     /// bumps the port's `output`, and a driver reply bumps nothing on the *input* side (a driver
     /// port's input is harvested by the pump, not by `port_control`).
+    ///
+    /// `erlang:port_info/2` answers the **`{Item, Value}` pair**, never the bare value — the
+    /// oracle's own shape (`erl -eval 'erlang:port_info(open_port({spawn,"cat"},[]), input)'` ⇒
+    /// `{input,0}`). The helper below therefore unwraps the pair *and* pins its item, so a
+    /// regression that answered the pair for the wrong item, or stopped answering a pair, fails
+    /// here rather than comparing a 2-tuple against a small int.
     #[test]
     fn port_info_io_items_read_the_ports_own_byte_totals() {
         let mut runtime = runtime();
         let port = driver_port(&mut runtime, b"ok");
-        let item = |runtime: &mut Runtime, name: &str| {
+        let item = |runtime: &mut Runtime, name: &str| -> Eterm {
             let key = atom(runtime, name);
-            call(runtime, "erlang", "port_info", &[port.to_eterm(), key])
+            let pair = call(runtime, "erlang", "port_info", &[port.to_eterm(), key])
+                .unwrap_or_else(|error| panic!("port_info({name}) must answer: {error}"));
+            assert_eq!(
+                terms::tuple_arity(pair).expect("a tuple"),
+                2,
+                "`{name}` is a {{Item,Value}} pair"
+            );
+            assert_eq!(
+                terms::tuple_element(pair, 0).expect("the pair's item"),
+                key,
+                "the pair's item is `{name}`"
+            );
+            terms::tuple_element(pair, 1).expect("the pair's value")
         };
         // A fresh port has moved no bytes — the oracle's own answer right after `open_port`.
-        assert_eq!(item(&mut runtime, "input").expect("input"), make_small(0));
-        assert_eq!(item(&mut runtime, "output").expect("output"), make_small(0));
+        assert_eq!(item(&mut runtime, "input"), make_small(0));
+        assert_eq!(item(&mut runtime, "output"), make_small(0));
         // Writing to the port credits its `output` total.
         let data = chars(&mut runtime, "hello");
         call(&mut runtime, "erlang", "port_command", &[port.to_eterm(), data])
             .expect("the driver accepts the write");
-        assert_eq!(
-            item(&mut runtime, "output").expect("output"),
-            make_small(5),
-            "5 bytes written"
-        );
+        assert_eq!(item(&mut runtime, "output"), make_small(5), "5 bytes written");
+        // A driver port's *input* is what the pump harvests from `driver_output`, not what
+        // `port_command` wrote, so it is still zero here (the write was an output).
+        assert_eq!(item(&mut runtime, "input"), make_small(0));
     }
 }
