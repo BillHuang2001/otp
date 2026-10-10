@@ -621,6 +621,11 @@ silently-accepted wrong value:
   `crates/beam_dist/src/auth.rs` already ships a self-contained RFC 1321 `md5`, so the algorithm belongs
   at a lowest-common-ancestor crate (`beam_codec`/`beam_common`) or behind a new dependency edge — do not
   duplicate it here.
+- **Implicit mandatory chunks are more lenient than the legacy reader.** The C errors when `ImpT`
+  (`beam_file.c:1667`) or `ExpT` (`beam_file.c:1675`) is absent; this loader requires only `AtU8` and
+  `Code` and treats every other chunk as optional (`src/chunk/mod.rs:131-138`), returning an empty
+  table instead of an error. Harmless for real images (which always carry both) — a divergence for
+  stripped/hostile inputs only.
 - **Atoms are interned into a fresh per-module `AtomTable`**, not a shared `atom.names`-seeded table;
   positional/global atom identity for preloaded modules is a `beam_rt` concern.
 
