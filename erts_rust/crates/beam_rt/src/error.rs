@@ -434,9 +434,9 @@ pub(crate) const KNOWN_UNIMPLEMENTED_ERLANG_BIFS: &[(&str, u32)] = &[
     ("system_monitor", 1),
     ("system_monitor", 2),
     ("system_profile", 1),
-    // Garbage collection: `erts_internal:garbage_collect/1` hosts the collector entry.
-    ("garbage_collect", 0),
-    ("garbage_collect", 1),
+    // Garbage collection: `erts_internal:garbage_collect/1` hosts the collector entry, and
+    // `/0`+`/1` are served by the runtime-native floor (`src/native/erts_internal.rs`); `/2`
+    // is the asynchronous system-task form, which this runtime has no protocol for.
     ("garbage_collect", 2),
     // Code loading and application.
     ("apply", 1),
