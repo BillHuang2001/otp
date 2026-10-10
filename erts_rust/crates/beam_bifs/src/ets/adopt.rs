@@ -68,11 +68,16 @@
 //! * **`ets:foldl/3`** / **`ets:foldr/3`** — stdlib `ets.erl` functions (not
 //!   `bif.tab` entries). The argument order is `(Fun, Acc0, Tab)` and the
 //!   accumulator is the fun's **last** argument. The oracle walks *keys*
-//!   (`first_lookup`/`next_lookup`, `last_lookup`/`prev_lookup`) and applies
-//!   `lists:foldl`/`lists:foldr` to each key's object list, so `foldl` visits
-//!   every object in forward traversal order and `foldr` in the exact reverse
-//!   (including the objects *within* one key: a `bag` holding `{1,a},{1,b}`
-//!   yields `a,b` for `foldl` and `b,a` for `foldr`). An **empty table returns
+//!   (`first_lookup`/`next_lookup`, resp. `last_lookup`/`prev_lookup`) and applies
+//!   `lists:foldl`/`lists:foldr` to each key's object list. `foldr` therefore
+//!   reverses each key's object list for every kind, but walks the keys backwards
+//!   only where the interior can — for a **hash** kind (`set`/`bag`/
+//!   `duplicate_bag`) `ets:last_lookup`/`ets:prev_lookup` alias the forward
+//!   primitives ([`has_backward_walk`]), so `foldr` visits the keys in the *same*
+//!   order as `foldl` and only the objects within each key are reversed (a `bag`
+//!   holding `{1,a},{1,b}` yields `a,b` for `foldl` and `b,a` for `foldr`); an
+//!   `ordered_set` additionally walks its keys last-to-first, so there `foldr` is
+//!   the exact reverse of `foldl`. An **empty table returns
 //!   `Acc0` without ever calling the fun** (so a non-fun is only observable on a
 //!   non-empty table). A table argument that names no table — including a name
 //!   atom that is not a `named_table` — is `badarg`. The fun is applied through
@@ -145,7 +150,7 @@ use crate::print::proper_list;
 use crate::registry::BifRegistry;
 
 use super::resolve::{caller_owner, owner_of, resolve_handle, Gate};
-use super::{copy_out, restore_table, take_table_gated};
+use super::{copy_out, has_backward_walk, restore_table, take_table_gated};
 
 /// Registers the adopted `ets:*` verbs (see the module docs for the scope and for
 /// the honest gaps).
@@ -397,9 +402,8 @@ fn foldl_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     fold(ctx, args, false)
 }
 
-/// `ets:foldr(Fun, Acc0, Tab)` — as [`foldl_3`], but the objects are visited in
-/// the exact reverse order (the oracle walks the keys last-to-first and each
-/// key's object list right-to-left).
+/// `ets:foldr(Fun, Acc0, Tab)` — as [`foldl_3`], but the objects are visited right
+/// to left (see [`collect_objects`] for what that means per kind).
 fn foldr_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     fold(ctx, args, true)
 }
@@ -425,21 +429,29 @@ fn fold(ctx: &mut BifContext<'_>, args: &[Eterm], reverse: bool) -> Result<Eterm
         // without calling the fun, so the fun is never validated on an empty table.
         return Ok(acc0);
     }
+    // `objects` is already in *visit* order — the fold direction was applied while
+    // collecting, exactly as the oracle's `do_foldl`/`do_foldr` walk.
     let mut acc = acc0;
-    if reverse {
-        for &object in objects.iter().rev() {
-            acc = ctx.call_fun(fun, &[object, acc])?;
-        }
-    } else {
-        for &object in objects.iter() {
-            acc = ctx.call_fun(fun, &[object, acc])?;
-        }
+    for &object in objects.iter() {
+        acc = ctx.call_fun(fun, &[object, acc])?;
     }
     Ok(acc)
 }
 
-/// Collects every object of `table` in forward traversal order (keys through
-/// `first`/`next`, each key's objects in lookup order) onto the caller's heap.
+/// Collects every object of `table` in **visit** order — the order the fold's fun
+/// is applied in — onto the caller's heap.
+///
+/// The oracle's `ets:foldl/3`/`ets:foldr/3` (`stdlib/src/ets.erl:2510,2552`) are
+/// `first_lookup`/`next_lookup` (resp. `last_lookup`/`prev_lookup`) walks over the
+/// *keys*, each key's object list folded with `lists:foldl`/`lists:foldr`. That
+/// gives two independent directions:
+///
+/// * the **key walk** — reversed only when the interior can actually walk
+///   backwards, i.e. only for an `ordered_set` ([`has_backward_walk`]); a hash
+///   kind's `last_lookup`/`prev_lookup` alias the *forward* primitives, so `foldr`
+///   visits the keys in the very same order as `foldl` there;
+/// * the **object list of each key** — reversed for `foldr` (the `lists:foldr`
+///   over `Objects`), for every kind.
 ///
 /// The copies go through [`super::copy_out`] so the fun never sees a term aliasing
 /// table storage (the fun may allocate on the caller heap).
@@ -450,16 +462,24 @@ fn collect_objects(
     out: &mut Vec<Eterm>,
     ctx: &mut BifContext<'_>,
 ) -> Result<()> {
-    let mut key = if reverse {
+    let backward_keys = reverse && has_backward_walk(table);
+    let mut key = if backward_keys {
         table.last(atoms)
     } else {
         table.first(atoms)
     };
     while let Some(current) = key {
-        for object in table.lookup(current, atoms) {
-            out.push(copy_out(object, ctx)?);
+        let objects = table.lookup(current, atoms);
+        if reverse {
+            for object in objects.iter().rev() {
+                out.push(copy_out(*object, ctx)?);
+            }
+        } else {
+            for object in objects {
+                out.push(copy_out(object, ctx)?);
+            }
         }
-        key = match if reverse {
+        key = match if backward_keys {
             table.prev(current, atoms)
         } else {
             table.next(current, atoms)

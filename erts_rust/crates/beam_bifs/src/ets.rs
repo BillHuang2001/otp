@@ -1513,6 +1513,21 @@ pub(super) fn key_or_end(ctx: &mut BifContext<'_>, key: Option<Eterm>) -> Result
     }
 }
 
+/// Whether `table`'s interior implements a genuine **backward** key walk.
+///
+/// Only an `ordered_set` does. The hash interiors (`set`/`bag`/`duplicate_bag`)
+/// define no `last_key`/`prev_key`, so the oracle **aliases** the reverse
+/// navigators to the forward ones for them — `ets:last/1` ≡ `ets:first/1`,
+/// `ets:prev/2` ≡ `ets:next/2`, `ets:last_lookup/1` ≡ `ets:first_lookup/1` and
+/// `ets:prev_lookup/2` ≡ `ets:next_lookup/2` (pinned in [`nav`]).
+///
+/// This is the single home of that rule: the `nav` bridge and the `adopt` fun-folds
+/// both key off it, and `beam_ets::Table::last`/`prev` are left alone so the
+/// interior keeps its own semantics.
+pub(super) fn has_backward_walk(table: &Table) -> bool {
+    table.kind().is_ordered()
+}
+
 /// The 1-based element position argument of `lookup_element`/`update_element`,
 /// reused as the `ets:select/3`-family **limit** (a non-integer or a negative
 /// value is `badarg`; `0` is rejected downstream by [`Table`]).
