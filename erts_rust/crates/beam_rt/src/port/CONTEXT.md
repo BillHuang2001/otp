@@ -157,8 +157,6 @@ The message itself is `RuntimeContext::signal_notify_message(name)` → `(from, 
   / `driver_c/*` / `driver_abi/*` cases.
 
 ## Routing Table
-- `../port.rs` → the A.4 `PortHook` provider, the poller/`PortRegistry`, the port-task round and the message builders.
-- `tests.rs` → that provider's unit suite (`open_port/2`'s decode, the `port_info` vocabulary, the port-message pump, the `next_deadline` clamp and the read path).
 - `driver.rs` → the A.4 host + `beam_io::Driver` lifecycle above.
 - `driver/ready_output_tests.rs` → the A.4 write-path regression suite (a real C driver `.so` compiled at test time).
 - `driver/control_tests.rs` → the A.4 port-control regression suite (the reply-verb matrix + the absent slot).
