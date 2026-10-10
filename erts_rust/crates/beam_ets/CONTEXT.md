@@ -108,27 +108,39 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 - **Element updates:** `update_counter(key, op)`, `update_counter_with(key, op, default)`,
   `update_element(key, &[(pos, term)]) -> bool`.
 - **Navigation:** `first()`, `last()`, `next(key)`, `prev(key)`, `take(key) -> Vec<Eterm>` (copies out +
-  reclaims the stored originals).
+  reclaims the stored originals), plus the `pub(crate)` `tab2list_rev()` — the reverse-navigation walk
+  (the `ordered_set` reverse of `tab2list()`; the hash kinds' `tab2list()` itself). For the **hash kinds**
+  (`set`/`bag`/`duplicate_bag`) `last() == first()` and `prev(k) == next(k)` (`erl_db_hash.c:853-856`),
+  with an unknown anchor `badarg` (`check_navigable`); only `ordered_set` has the real arithmetic order.
 - **Access control:** `check_read(requester)` / `check_write(requester)` / `as_requester(requester) ->
   TableAccess<'_>`.
 - **Select family** (`select/exec.rs`; also the `select_all(pred)` predicate primitive): `select(spec)`,
   `select_reverse(spec)`, `select_delete(spec) -> usize`, `select_count(spec) -> usize`, `match_object(pattern)`, `match_(pattern)`,
-  `match_delete(pattern) -> usize`, `select_replace(spec) -> usize`.
+  `match_delete(pattern) -> usize`, `select_replace(spec) -> usize`. `select_reverse` (`exec.rs`) drives
+  the interior's own reverse navigation (`Table::tab2list_rev`): for an `ordered_set` it is the exact
+  reverse of `Table::tab2list()`, while for the **hash kinds** it returns the **same** list in the
+  **same** order as `select` (their `last`/`prev` **are** `first`/`next`, `erl_db_hash.c:2310-2313`).
 - **Limit + continuation forms** (`continuation.rs`; `Option::None` ⇒ `'$end_of_table'`): each
   `-> (Vec<Eterm>, Option<MatchContinuation>)`: `select_limit`/`select_continue`/`select_reverse_limit`/
   `select_reverse_continue`/`match_limit`/`match_continue`/`match_object_limit`/`match_object_continue`.
-  `select_reverse` (`exec.rs`) enumerates the exact reverse of `Table::tab2list()` order; a
-  continuation carries a private direction so its resume keeps the direction.
+  `MatchContinuation` carries a private `Cursor` (`Begin`/`Anchor(key)`/`Position(ordinal)`) plus a
+  private direction, so a `/1` resume keeps both: an `ordered_set` resumes from the last-yielded key as
+  an **exclusive** `next`/`prev` range bound (`Anchor`), a hash kind from an ordinal (`Position`).
 - `Table::set_fixation(bool)` / `is_fixed()` / `deferred_objects()` — `ets:safe_fixtable/2`.
 - `pub fn match_spec_run(list, spec, atoms, heap) -> Result<Vec<Eterm>>` (`run.rs`) — the
   table-independent `ets:match_spec_run/2` runner.
 - `pub(crate) trait Interior` — the internal dispatch seam (`insert`/`insert_new`/`delete`/
-  `delete_object`/`lookup`/`member`/`lookup_element`/`lookup_elements`/`size`/`iter_objects`/`keys`/
-  `take`/`first_key`/`last_key`/`next_key`/`prev_key`/`memory`/`update_counter`/`update_element`).
-  `insert` returns `Result<bool>` — **whether the object was retained** — so `Table::insert` reclaims
-  the deep copy it made when the interior rejects it (`bag`'s duplicate is the only `false`). Generic
-  defaults rebuild the object on the caller's heap; the hash interior overrides the element updates
-  with destructive in-place writes. Private — not part of the cross-crate API.
+  `delete_object`/`lookup`/`member`/`lookup_element`/`lookup_elements`/`size`/`iter_objects`/
+  `iter_objects_rev`/`keys`/`take`/`first_key`/`last_key`/`next_key`/`prev_key`/`memory`/
+  `update_counter`/`update_element`). `insert` returns `Result<bool>` — **whether the object was
+  retained** — so `Table::insert` reclaims the deep copy it made when the interior rejects it (`bag`'s
+  duplicate is the only `false`). Generic defaults rebuild the object on the caller's heap; the hash
+  interior overrides the element updates with destructive in-place writes. `iter_objects_rev()` is the
+  **defaulted** reverse-navigation walk (the order an `ets:last/1` + `ets:prev/2` walk visits the
+  objects): the default is the exact reverse of `iter_objects()` (the `ordered_set` semantics), and
+  both hash interiors (`ChampInterior`/`HashInterior`) override it to return `iter_objects()`
+  **unchanged**, because their `last`/`prev` **are** `first`/`next`. It is the single source of truth
+  behind `Table::tab2list_rev` (and so `select_reverse`). Private — not part of the cross-crate API.
 
 ### `table/rename.rs` — `ets:rename/2` (oracle-pinned)
 - `pub fn Table::rename(&mut self, name: Atom, is_taken: impl FnOnce(Atom) -> bool) ->
@@ -171,9 +183,11 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
     iter_objects_rev}` (each yields `TableTerm<'a>` bound to the view borrow via `ets:first|next` /
     `last|prev`; the `*_objects` forms expand the multi kinds per object), `TableRead::{foldl, foldr}`
     over objects, and the bulk copy-out `TableRead::tab2list_into(&mut TermStore) -> Result<Vec<Eterm>>`.
-    Every item is a `TableTerm<'_>` tied to the borrow and the iterators are returned as
-    `impl Iterator`, so no private view type leaks into a public signature. A full hash-kind walk is
-    O(n²), so `tab2list_into` stays the bulk path.
+    The `*_rev` forms and `foldr` drive `ets:last/1` + `ets:prev/2`, so for an `ordered_set` they are the
+    exact mirror of the forward forms and for the hash kinds they are the **same** traversal (their
+    `last`/`prev` **are** `first`/`next`, `erl_db_hash.c:853-856`). Every item is a `TableTerm<'_>` tied
+    to the borrow and the iterators are returned as `impl Iterator`, so no private view type leaks into a
+    public signature. A full hash-kind walk is O(n²), so `tab2list_into` stays the bulk path.
   - The views are `!Send` by design (they carry a scratch `Heap`): neither a view nor its aliasing
     terms can move to another thread.
 
@@ -247,7 +261,9 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `term_hash`, compressing children into a `datamap` (inline slots) + `nodemap` (sub-nodes); a full-hash
   collision lives in a `CollisionNode` (key-compared with `eq`), so a pathological hash cannot recurse
   past 64 bits. Every `Interior` method is overridden; `set` navigation order is unspecified, so
-  `first_key`/`last_key`/`next_key`/`prev_key` use the trait defaults.
+  `first_key`/`next_key` fall back to the trait defaults while `last_key(atoms) = first_key(atoms)`,
+  `prev_key(k, atoms) = next_key(k, atoms)` and `iter_objects_rev() = iter_objects()` are the hash-kind
+  aliasing (`erl_db_hash.c:853-856`) — the reverse walk **is** the forward one.
 - **Delete canonicalization.** A removal canonicalizes bottom-up: a sub-node holding exactly one entry
   is **inlined** into its parent as an inline slot (promoting a multi-entry sub-node wholesale would
   break routing — a sub-node is indexed by the *next* 5 hash bits).
@@ -260,7 +276,9 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   reclaims the rejected copy); `duplicate_bag` keeps a multiset. `delete_object` removes **every** equal
   object (the oracle). Public API for testing/reuse: `new(kind)`, `take(key, atoms)`,
   `update_counter(key, pos, incr, atoms)`, `update_element(key, updates, atoms)`, `memory(atoms)`. It
-  implements `keys()` but not `first_key`/`last_key`/`next_key`/`prev_key` (trait defaults).
+  implements `keys()` (with `first_key`/`next_key` from the trait defaults) and overrides the hash-kind
+  navigation aliasing: `last_key(atoms) = first_key(atoms)`, `prev_key(k, atoms) = next_key(k, atoms)`
+  and `iter_objects_rev() = iter_objects()` (`erl_db_hash.c:853-856`).
 
 ### `ordered_interior/` — the ordered `ordered_set` interiors (B+-tree + sorted `Vec`)
 - **A same-arith-key replace replaces the stored KEY term too** (the key follows the object): an insert
@@ -323,8 +341,12 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   propagates as a typed error — an unevaluable guard is never silently a non-match.
 - `run.rs` — `match_spec_run(list, spec, atoms, heap)`.
 - `continuation.rs` — `pub struct MatchContinuation` (opaque: table id + the table's **registered-name
-  atom** for a `named_table` (else `None`) + the compiled spec (body included) + limit + direction +
-  position) and the limited forms, each `-> (Vec<Eterm>, Option<MatchContinuation>)`. `resume` rejects a
+  atom** for a `named_table` (else `None`) + the compiled spec (body included) + limit + direction + a
+  private `Cursor`) and the limited forms, each `-> (Vec<Eterm>, Option<MatchContinuation>)`. `Cursor` is
+  `Begin` (a `/3` start) / `Anchor(key)` (an `ordered_set` resume: the last key the chunk yielded, used as
+  an **exclusive** `next`/`prev` range bound, so it survives the anchor's own deletion) /
+  `Position(ordinal)` (a hash kind's resume ordinal into the iteration order — ERTS's cursor there is a
+  bucket/index, not a key, `erl_db_hash.c:2310-2313`). `resume` rejects a
   continuation whose table id **or** recorded name does not match (a `named_table`'s continuations die
   on `rename`, exactly like the oracle), and it re-applies the stored direction and spec so a `/1` resume
   needs no direction/spec argument.
@@ -474,6 +496,32 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   the `table/ownership.rs` entry).
 - **The guard-scoped view gains a view-borrowed traversal API** (`view/iter.rs`) returning `TableTerm`
   bound to the borrow — so a full table walk is expressible without a bare `Eterm` escaping.
+- **The hash kinds' `last`/`prev` ARE their `first`/`next` (C-faithful navigation).** ERTS's hash
+  interior installs the same function twice — `db_first_hash, db_next_hash, db_first_hash /* last ==
+  first */, db_next_hash /* prev == next */` (`../../erts/emulator/beam/erl_db_hash.c:853-856`, repeated
+  at `:891-894` for the `*_lookup` table) — and `db_select_reverse_hash` delegates to the same chunk
+  function as `db_select_hash` (`:2310-2313`). So for `set`/`bag`/`duplicate_bag` there is **no**
+  backward walk: `ets:last/1` == `ets:first/1`, `ets:prev/2` == `ets:next/2` (an unknown anchor stays
+  `badarg` through `Table::check_navigable`), `'$end_of_table'` ends the walk, and `ets:select_reverse`
+  returns exactly what `ets:select` returns. `ChampInterior`/`HashInterior` reproduce it by overriding
+  `last_key`/`prev_key`/`iter_objects_rev`; the `Interior` trait's defaults stay the `ordered_set`
+  semantics and `ordered_set` keeps the true arithmetic order (`first`/`last`, `next_from`/`prev_from`).
+  Probe values (system `erl` 29.1.1 / erts-17.1): keys `1..5` ⇒ `first` == `last` == `1`,
+  `next(T,3)` == `prev(T,3)` == `4`, `prev(T,1)` == `next(T,1)` == `5`; a 6-key set ⇒ `first` ==
+  `last` == `6`; a single-key set ⇒ `{only,only,'$end_of_table','$end_of_table'}`; an empty hash-kind
+  table ⇒ `first` == `last` == `'$end_of_table'` while `prev(T,7)` is `badarg`. Pinned by
+  `multikind/hash_last_prev_alias_first_next` and `multikind/hash_select_reverse_aliases_select`.
+  (Structural change → `../../CHANGE.md`.)
+- **Select-family continuations are key-anchored on an `ordered_set`, ordinal on the hash kinds.**
+  `MatchContinuation`'s private `Cursor::{Begin, Anchor(Eterm), Position(usize)}` is chosen by the table
+  kind, which never changes after creation, so the two shapes are never mixed. The ordered kind resumes
+  with `Table::next`/`prev` from the **last key its chunk yielded** (`Anchor`), an **exclusive** range
+  bound, so the resume survives the anchor's own deletion (probed: `{1}..{10}` chunked at 4 ⇒
+  `[1,2,3,4]`, delete `2` + insert `0` ⇒ `[5,6,7,8]` then `[9,10]`; deleting the anchor `4` instead ⇒ the
+  identical `[5,6,7,8]`). The hash kinds keep the ordinal `Position` because their ERTS cursor is a
+  bucket/index, not a key (`erl_db_hash.c:2310-2313`), and this crate documents the hash iteration order
+  as an interior freedom. Continuation identity is unchanged (the table id + the `named_table` name atom;
+  the read gate precedes consumption). (Structural change → `../../CHANGE.md`.)
 
 ## Concurrency, fixation & sharing (current state)
 - **`Table` is `Send + Sync` and shareable across processes**: plain `Eterm` data + a
@@ -531,15 +579,23 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   from `tests/common/`, and the live-`erl` plumbing in `tests/common/oracle.rs`. `ets_store_terms.rs`
   cross-checks every newly-copyable boxed kind (hash map, each fun kind, external pid/port/ref, bitstring,
   refc binary) through `Table::insert`/`lookup` against the oracle's `phash2`.
-- **Differential evidence suite** (the compatibility gate): `tests/differential.rs` runs **157 cases**
+- **Differential evidence suite** (the compatibility gate): `tests/differential.rs` runs **159 cases**
   (13 case-group files under `tests/differential/battery/` plus the shared harness `battery/mod.rs`, the
   embedded oracle program in `erl_program.rs`) identically under the system `erl` (OTP 29.1.1 / erts-17.1)
   and under `beam_ets`, comparing canonical renderings line-by-line — **every case agrees**;
-  `KNOWN_DIVERGENCES` is empty. The oracle is **required by default** — a genuinely absent
+  `KNOWN_DIVERGENCES` is empty. The hash-kind navigation/reverse aliasing is pinned by the `multikind`
+  group's `hash_last_prev_alias_first_next` and `hash_select_reverse_aliases_select`. The oracle is
+  **required by default** — a genuinely absent
   `erl` FAILS the cross-check rather than skipping it (`BEAM_ETS_ALLOW_NO_ORACLE=1` opts out with a loud
   skip; `BEAM_ETS_REQUIRE_ORACLE=1` forces the requirement).
+- **`tests/ets_continuation.rs` / `tests/ets_continuation_direction.rs` cross-check the continuation
+  cursor against the live oracle, including a mutation between chunks**: an `ordered_set` resume
+  survives a delete of the last-yielded (anchor) key, and a delete/insert behind the cursor does not
+  shift the next chunk.
 - **Gate (this crate):** `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_ets`
-  is green (0 failures across every test binary, including the 8 doctests — 5 of them `compile_fail`).
+  is green — **25 test binaries, 557 passed / 0 failed** (including the 8 doctests — 5 of them
+  `compile_fail`); with the oracle required, the battery emits and compares all **159** cases
+  (`[differential] oracle: … — 159 cases emitted` / `— comparing 159 cases against beam_ets`).
   Forced-oracle: `BEAM_ETS_REQUIRE_ORACLE=1 erts_rust/scripts/cargo.sh test
   --manifest-path erts_rust/Cargo.toml -p beam_ets --test differential`.
 
@@ -561,6 +617,8 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   remains host-side is the *rendering* — `TableInfo::write_concurrency` is still a `bool`, so the `auto`
   atom / the normalized `{debug_hash_fixed_number_of_locks, Nlocks}` tuple is supplied by the
   `beam_bifs` `TableProfile` sidecar. The stored `FixedLocks` count is the requested, un-normalized one.
+  **Owner: this crate** — fine-grained locking is a **throughput** workstream, never a correctness gap
+  (one `write()` guard spans a whole check-then-act sequence, so no update is lost).
 - **The owner-death transition's runtime caller reclaims named and unnamed tables alike.** `Table::owner_died`
   is driven by `beam_rt::runtime::ets_owner::drain_ets_owner_exits` (over the `EtsExitObserver` installed
   on the `ProcessTable`), and `beam_bifs`'s `ets:new/2` records the owner. The set of tables a dead owner
@@ -579,10 +637,12 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `Heir(Heir)`/`ClearHeir`/`Access(Access)`; other options (`safe_fixtable`, `{write_concurrency, _}`,
   …) are out of scope; `ets:info(T, holder)` is `badarg` in the oracle and none is emitted. The BIF
   bridge's `{protection, _}` wiring belongs to `beam_bifs`.
-- **Scalar `lookup_element` is unsupported for the multi kinds.** `Table::lookup_element`/
-  `lookup_element_or` raise `unsupported_ets` for `bag`/`duplicate_bag` (the oracle returns a *list*);
-  the faithful forms are `lookup_element_all`/`lookup_element_all_or`. **Handoff:** the `beam_bifs`
-  bridge must route the multi kinds through those.
+- **Scalar `lookup_element` is a deliberate typed refusal for the multi kinds.** `Table::lookup_element`/
+  `lookup_element_or` raise the typed `unsupported_ets` for `bag`/`duplicate_bag` — a scalar `Eterm`
+  cannot express the oracle's *list* — and the faithful forms are
+  `lookup_element_all`/`lookup_element_all_or`. The `beam_bifs` BIFs already branch on
+  `kind().is_multi()` to those forms (`beam_bifs/src/ets.rs::lookup_element_3/4`), so the refusal is
+  unreachable through the BIF surface and is not an open gap.
 - **`tab2file`/`file2tab`/`tabfile_info` are BLOCKED, not merely out of scope.** The table-file format
   is `{Header, Objects, Footer}` with every field an ETF term, so it needs `beam_codec` plus file I/O
   (`beam_io` is wave 5 — an upward edge, forbidden for a wave-1 crate). `tab2list` + `first`/`next`
@@ -602,12 +662,18 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `MatchSpec`.
 - **Named-table lookup-by-name is the runtime's job.** `Table` exposes `name()`/`is_named()` only; the
   name→table registry is the sibling `beam_bifs::ets::TableRegistry` (this crate holds no global state).
-- **The continuation position is an INDEX into iteration order, not a key-based cursor.** The oracle's
-  `ets:select/1` continuation carries the last key and resumes relative to it, so inserts/deletes
-  *behind* the cursor do not shift what the next chunk returns; this crate stores the position as an
-  ordinal, so a mutation between chunks can skip or repeat an object relative to the oracle. Every
-  single-chunk and no-mutation-between-chunks case agrees (the 157-case battery covers the latter); the
-  divergence only appears across a resume straddling a mutation.
+- **A hash-kind continuation is an ordinal into iteration order; an `ordered_set`'s is a key anchor.**
+  The oracle's `ets:select/1` continuation carries the last key and resumes relative to it, so
+  inserts/deletes do not shift what the next chunk returns. This crate reproduces that for `ordered_set`
+  — `MatchContinuation`'s `Cursor::Anchor` is the last-yielded key, used as an **exclusive**
+  `Table::next`/`prev` bound — oracle-verified across a mutation *including the anchor's own deletion*
+  (`tests/ets_continuation.rs`/`tests/ets_continuation_direction.rs`). The three hash kinds keep the
+  ordinal `Position`, because ERTS's cursor there is a bucket/index (`erl_db_hash.c:2310-2313`) and this
+  crate's hash iteration order is an interior freedom; a mutation landing at or behind the ordinal can
+  therefore skip or repeat an object relative to the oracle. That divergence only appears across a
+  resume straddling a mutation — never a typed error and never a wrong result for a mutation-free walk
+  (every single-chunk and no-mutation-between-chunks case agrees; the 159-case battery covers the
+  latter).
 - **Deep-copy covers every kind the oracle accepts in `ets:insert/2`.** Immediates, cons cells, tuples,
   flat **and hash** maps (HAMT/collision nodes copied node-by-node, no `AtomTable` needed), funs (all
   three kinds — header/descriptor verbatim + deep-copied env), boxed leaves (float, bignum, internal ref,
@@ -626,8 +692,11 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `is_function/2`, `is_integer/3`, `node/0,1`, `xor/2`, `bnot/1`, plus map **construction** in a guard
   or a body. Anything outside that set is `badarg`, like the oracle (`list_to_tuple/1` is not a
   `guard_tab` member and is `badarg` on both sides; there is no `is_record/2`, no comprehension and no
-  `process_info`-style guard). Match-spec arithmetic via the default `ArithHook` is small-int only; a
-  real runtime installs a full hook via `set_arith_hook`. Typed divergences (always a typed error,
+  `process_info`-style guard). Match-spec arithmetic via the default `ArithHook` is small-int/float only
+  (checked `i64` plus faithful float `+ - * /`); full arithmetic needs a host-installed hook via
+  `set_arith_hook`, whose owners are `beam_term` (the number/arithmetic layer, which exposes no big
+  add/sub/compare LCA today) and `beam_bifs`/`beam_rt` (the installers) — no host installs one today, so
+  it stays a typed gap that this crate never fills itself. Typed divergences (always a typed error,
   never a wrong result): a **head** map's **keys** are literal — a variable/underscore key is `badarg`
   at every nesting depth — while its **values** are matched structurally like tuple elements, so
   `#{a => '_'}` matches `#{a => 1}` and an object carrying extra keys still matches (a wildcard/variable
@@ -668,6 +737,17 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 - **`beam_bifs` — the `auto` / `{debug_hash_fixed_number_of_locks, Nlocks}` rendering stays host-side.**
   `TableInfo::write_concurrency` is a `bool`, so the `TableProfile` sidecar must supply the `auto` atom /
   the normalized lock count (`TableOptions` stores the *requested*, un-normalized count).
+- **`beam_bifs` — the hash-kind `last`/`prev` workaround can now go.** `beam_bifs/src/ets.rs` still
+  special-cases the hash kinds: `last_1` at `:1141-1151` (the branch at `:1144-1148` —
+  `if table.kind().is_ordered() { table.last(..) } else { table.first(..) }`) and `prev_2` at
+  `:1182-1197` (the branch at `:1190-1194` — the same shape over `prev`/`next`), i.e. the `:1144-1195`
+  span. `Table::last`/`Table::prev` are C-faithful now (the interior aliases them to `first`/`next` for
+  the hash kinds, `erl_db_hash.c:853-856`), so both BIFs could call `table.last(..)`/`table.prev(..)`
+  unconditionally and drop the branch (the ordered-kind `'$end_of_table'` anchor rejection stays).
+- **`beam_bifs`/`beam_rt` — install an `ArithHook` for full match-spec arithmetic.** `set_arith_hook`
+  has no production caller, so the default (`DefaultArithHook`) stays small-int/float only and a bignum
+  operand or an out-of-range integer result is the typed `unsupported_ets`. A runtime installs
+  `beam_ets::select::expr::ArithHook` per thread over `beam_term`'s number layer to lift that gap.
 
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
@@ -677,12 +757,12 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 - `src/store/tests.rs` → the `TermStore` unit-test module
 - `src/table/mod.rs` → `Table`/`TableId`/`OwnerId`, constructors, metadata/ownership accessors (incl. the live `access` field + `set_access`), write ops, access checks, `select_all`, module wiring
 - `src/table/tests.rs` → the table-level unit tests (write ops, metadata, access/protection, ownership/heir, counters, the store-accounting cases)
-- `src/table/read.rs` → the read/navigation `impl Table` (incl. `is_named_table`)
+- `src/table/read.rs` → the read/navigation `impl Table` (incl. `is_named_table`, `tab2list_rev`, and the hash-kind `last`/`prev` aliasing)
 - `src/table/rename.rs` → `Table::rename` + `RenameOutcome` (`ets:rename/2` semantics)
 - `src/table/shared.rs` → `SharedTable` (the locked handle) + its unit tests
 - `src/table/view/mod.rs`, `view/read.rs`, `view/write.rs`, `view/term.rs`, `view/iter.rs` → the guard-scoped `TableRead`/`TableWrite`/`TableTerm` views (the aliasing defence, incl. `TableWrite::set_access`) + the view-borrowed traversal API (iterators / `foldl` / `foldr` / `tab2list_into`)
 - `src/table/view/tests.rs` → the view-layer unit tests (incl. the aliasing evidence)
-- `src/table/interior.rs` → the private `pub(crate) trait Interior` + `build_interior`
+- `src/table/interior.rs` → the private `pub(crate) trait Interior` (incl. the defaulted `iter_objects_rev`) + `build_interior`
 - `src/table/access.rs` → `TableAccess` (access-enforcing view, incl. `set_access`)
 - `src/table/ownership.rs` → `Heir`/`SetOpt` (incl. `Access(Access)`), the owner-gated `Table::setopts`, `install_heir`/`heir_data`/`copy_heir`/`replace_heir`, the `give_away` semantics + the pid-gap docs
 - `src/table/lifecycle.rs` → `OwnerDeath` + `Table::owner_died`
@@ -694,12 +774,12 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 - `src/interior_bench.rs` → the interior microbenchmarks (`#[cfg(test)]`)
 - `src/ordered_interior/{mod,sorted,node,tree,iter}.rs` → the B+-tree `ordered_set` interior (conditional separator refresh via `InsertStep`, single-descent `insert_new`), the sorted-`Vec` alternative, the node arena, the tree ops, the iterator
 - `src/ordered_interior/tests.rs` → the ordered-interior unit tests (B+-tree invariants, the sorted-`Vec` interior, the `cmp_arith` key-order cases)
-- `src/select/{mod,pattern,expr,exec,run,continuation}.rs` → the match-spec compiler, executor, runner and continuations (`MatchContinuation` carries the table id + registered name + spec + direction + position)
+- `src/select/{mod,pattern,expr,exec,run,continuation}.rs` → the match-spec compiler, executor, runner and continuations (`MatchContinuation` carries the table id + registered name + spec + direction + a private `Cursor`: `Begin` / `Anchor(key)` for an `ordered_set` / `Position(ordinal)` for the hash kinds)
 - `src/info.rs` → `TableInfo` + `entries` (the 15-field `ets:info` pairs)
 - `src/error.rs` → `badarg`/`unsupported` failure constructors
 - `tests/common/mod.rs` → shared integration-test helpers; `tests/common/oracle.rs` → the live-`erl` plumbing
 - `tests/ets_*.rs` → public-API integration tests by concern (basic/order/select/bag/info/nav/access/set_access/update/replace/continuation/continuation_direction/ownership/fixtable/shared/options/rename/reclamation/concurrency/store_terms), plus `tests/select.rs` and `tests/match_spec_run.rs`
-- `tests/differential.rs` + `tests/differential/{battery/*,erl_program.rs}` → the differential evidence suite vs the system `erl` (157 cases, 13 battery groups)
+- `tests/differential.rs` + `tests/differential/{battery/*,erl_program.rs}` → the differential evidence suite vs the system `erl` (159 cases, 13 battery groups)
 - `ETS_SURFACE.md` → the `ets:*` coverage census + the oracle-probed semantic facts + the runtime-level gaps and the exact API each needs
 - `../../erts/emulator/beam/erl_db.c` / `erl_db_hash.c` / `erl_db_tree.c` / `erl_db_util.c` / `erl_db*.h` → the API, interiors, key/match handling and flags being mirrored (read-only)
 

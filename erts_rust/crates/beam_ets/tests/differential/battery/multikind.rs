@@ -473,6 +473,89 @@ impl Battery {
         list_of(&rendered)
     }
 
+    /// The hash-kind **`last`/`prev` aliasing** of `first`/`next`: ERTS's hash
+    /// tables implement `ets:last/1` as `ets:first/1` and `ets:prev/2` as
+    /// `ets:next/2` (`erl_db_hash.c:853-856`), so `last == first`, `prev(K) ==
+    /// next(K)` for every present `K`, and a `prev` walk from `last` reproduces the
+    /// `next` walk from `first` exactly. The internal order is not contract, so the
+    /// case renders the **relationships** (booleans) for the empty, single-key and
+    /// 5-key shapes, plus a sorted multiset of the walked keys.
+    fn hash_last_prev_alias_first_next(&mut self) -> String {
+        let mut rendered = Vec::new();
+        for kind in [TableKind::Set, TableKind::Bag, TableKind::DuplicateBag] {
+            let empty = self.table(kind, 1);
+            let empty_alias = empty.last(&self.atoms) == empty.first(&self.atoms);
+
+            let mut one = self.table(kind, 1);
+            one.insert(self.object(1, 10), &self.atoms).expect("insert");
+            let one_alias = one.last(&self.atoms) == one.first(&self.atoms);
+            let one_prev_next = one.prev(make_small(1), &self.atoms).expect("prev")
+                == one.next(make_small(1), &self.atoms).expect("next");
+
+            let mut table = self.table(kind, 1);
+            for key in 1..=5i64 {
+                table
+                    .insert(self.object(key, key * 10), &self.atoms)
+                    .expect("insert");
+            }
+            let first = table.first(&self.atoms);
+            let last = table.last(&self.atoms);
+            let next_walk = self.walk_next(&table, first);
+            let prev_walk = self.walk_prev(&table, last);
+            let alias_all = next_walk.iter().all(|&key| {
+                table.prev(key, &self.atoms).expect("prev")
+                    == table.next(key, &self.atoms).expect("next")
+            });
+            rendered.push(tuple_of(&[
+                bool_str(empty_alias),
+                bool_str(one_alias),
+                bool_str(one_prev_next),
+                bool_str(last == first),
+                bool_str(alias_all),
+                bool_str(prev_walk == next_walk),
+                self.srt(&prev_walk),
+            ]));
+        }
+        list_of(&rendered)
+    }
+
+    /// The hash-kind **`select_reverse/2` aliasing** of `select/2`: ERTS's
+    /// `db_select_reverse_hash` delegates to the forward chunk function
+    /// (`erl_db_hash.c:2310-2313`), so the reverse traversal returns the same list in
+    /// the same order — including each key's stored object order for a `bag` holding
+    /// two objects under one key. Rendered as the boolean relationship plus a sorted
+    /// multiset, since the internal order is not contract.
+    fn hash_select_reverse_aliases_select(&mut self) -> String {
+        let dollar1 = self.atom("$1");
+        let underscore = self.atom("_");
+        let whole = self.atom("$_");
+        let head = self.tuple(&[dollar1, underscore]);
+        let body = self.list(&[whole]);
+        let spec_term = self.spec(head, NIL, body);
+        let spec = compile(spec_term, &self.atoms).expect("the whole-object spec compiles");
+
+        let mut rendered = Vec::new();
+        for kind in [TableKind::Set, TableKind::Bag, TableKind::DuplicateBag] {
+            let mut table = self.table(kind, 1);
+            // Key 1 holds two objects for the multi kinds; both traversals must keep
+            // that per-key stored order.
+            table.insert(self.object(1, 10), &self.atoms).expect("insert");
+            table.insert(self.object(1, 20), &self.atoms).expect("insert");
+            table.insert(self.object(2, 30), &self.atoms).expect("insert");
+            let forward = table
+                .select(&spec, &self.atoms, &mut self.out)
+                .expect("select");
+            let reverse = table
+                .select_reverse(&spec, &self.atoms, &mut self.out)
+                .expect("select_reverse");
+            rendered.push(tuple_of(&[
+                bool_str(reverse == forward),
+                self.srt(&reverse),
+            ]));
+        }
+        list_of(&rendered)
+    }
+
     /// `lookup_element/3` on a multi kind: a present key yields the element
     /// **list** (order not contract → sorted), while an absent key (no `default`)
     /// and a stored object too short for the position are both `badarg` — the
@@ -698,6 +781,14 @@ pub(super) fn multikind_cases(battery: &mut Battery) -> Vec<(String, String)> {
     ));
     cases.push(("hash_nav_absent".into(), battery.hash_nav_absent()));
     cases.push(("hash_key_walk".into(), battery.hash_key_walk()));
+    cases.push((
+        "hash_last_prev_alias_first_next".into(),
+        battery.hash_last_prev_alias_first_next(),
+    ));
+    cases.push((
+        "hash_select_reverse_aliases_select".into(),
+        battery.hash_select_reverse_aliases_select(),
+    ));
 
     cases
 }

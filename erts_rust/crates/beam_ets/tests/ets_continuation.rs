@@ -67,21 +67,47 @@ fn object(heap: &mut Heap, key: i64, value: Eterm) -> Eterm {
     heap.tuple(&[make_small(key), value]).expect("test heap has room")
 }
 
-/// An `ordered_set` of `{1,a}`..`{n,letter}` (deterministic iteration order).
+/// An `ordered_set` of `{1,a}`..`{n,letter}` (deterministic iteration order) over the
+/// crate's **default** ordered interior (the K-ary B+-tree).
 fn ordered_table(heap: &mut Heap, atoms: &AtomTable, entries: &[(i64, &str)]) -> Table {
+    ordered_table_with(heap, atoms, entries, OrderedInterior::default())
+}
+
+/// [`ordered_table`] over an explicitly chosen ordered interior. The two ordered
+/// interiors are observationally identical, so the same expectations must hold over
+/// both (see [`a_key_anchored_resume_survives_a_mutation_between_chunks`]).
+fn ordered_table_with(
+    heap: &mut Heap,
+    atoms: &AtomTable,
+    entries: &[(i64, &str)],
+    interior: OrderedInterior,
+) -> Table {
     let mut opts = TableOptions::new();
     opts.set_kind(TableKind::OrderedSet);
-    let mut table = Table::new(TableId::next(), opts).expect("a fresh table");
+    let mut table = Table::with_ordered_interior(TableId::next(), opts, interior)
+        .expect("a fresh table");
     for (key, value) in entries {
         let obj = object(heap, *key, at(atoms, value));
         table.insert(obj, atoms).expect("insert into a fresh table");
     }
     table
 }
-
 /// The six `{1,a}`..`{6,f}` entries two full `limit = 3` chunks need.
 const SIX: &[(i64, &str)] = &[(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e"), (6, "f")];
 
+/// A `set` of `{K, K}` objects — a **hash kind**, whose iteration order is an
+/// interior freedom (it is never compared to the oracle by value; see
+/// [`a_hash_kinds_reverse_limit_and_continue_are_its_forward_ones`]).
+fn set_table(heap: &mut Heap, atoms: &AtomTable, keys: &[i64]) -> Table {
+    let mut opts = TableOptions::new();
+    opts.set_kind(TableKind::Set);
+    let mut table = Table::new(TableId::next(), opts).expect("a fresh table");
+    for &key in keys {
+        let obj = object(heap, key, make_small(key));
+        table.insert(obj, atoms).expect("insert into a fresh table");
+    }
+    table
+}
 /// `[{ '$1', [], ['$1'] }]` — a bare-variable head that binds the whole object and
 /// returns it. This is the spec the oracle chunking probes below use.
 fn whole_object_spec(heap: &mut Heap, atoms: &AtomTable) -> MatchSpec {
@@ -529,13 +555,15 @@ fn a_continuation_is_an_immutable_value() {
 /// `'$end_of_table'`), and objects **appended** past the issued position do not
 /// disturb the resume (both probed on the system `erl`).
 ///
-/// The oracle keeps a key-based cursor, so its resume also survives a deletion
-/// *at or behind* the cursor; this crate's position is an index into the iteration
-/// order, which does not. `src/select/continuation.rs` documents that as a known
-/// approximation, so it is deliberately not pinned here.
+/// The oracle keeps a **key-based** cursor for an `ordered_set`, which this crate
+/// reproduces (the mutation cases are pinned by
+/// [`a_key_anchored_resume_survives_a_mutation_between_chunks`] below and
+/// cross-checked against the live oracle in the sibling
+/// `tests/ets_continuation_direction.rs`). The residual approximation is the **hash
+/// kinds**, whose ERTS cursor is a bucket index and whose iteration order is an
+/// interior freedom — see the module docs of `src/select/continuation.rs`.
 #[test]
-fn a_continuation_resumes_over_a_table_emptied_or_extended_since_it_was_issued() {
-    let atoms = atoms();
+fn a_continuation_resumes_over_a_table_emptied_or_extended_since_it_was_issued() {    let atoms = atoms();
     let mut heap = Heap::new(8192).expect("test heap");
     let mut out = Heap::new(4096).expect("out heap");
     let spec = whole_object_spec(&mut heap, &atoms);
@@ -802,4 +830,214 @@ fn select_reverse_limit_edges_and_carried_direction() {
     assert_results(&r, &reverse_step, &atoms);
     let (r, _) = table.select_continue(&rev, &atoms, &mut out).unwrap();
     assert_results(&r, &reverse_step, &atoms);
+}
+
+// ---------------------------------------------------------------------------
+// The cursor: a key anchor for `ordered_set`, an ordinal for the hash kinds
+// ---------------------------------------------------------------------------
+
+/// **The `ordered_set` cursor is the last key its chunk yielded and the resume is
+/// the RANGE strictly after (forward) / before (reverse) that anchor**, so a
+/// mutation landing between the two chunks can neither skip nor repeat an object —
+/// not even when the anchor itself is deleted (the oracle's key cursor, not a
+/// lookup).
+///
+/// Every expectation is a probe against the system `erl` (OTP 29.1.1 / erts-17.1)
+/// on an `ordered_set {1}..{10}` with `S = [{'$1',[],['$1']}]`:
+///
+/// ```text
+/// {C, K} = ets:select(T, S, 4)                C = [{1},{2},{3},{4}], K = cont
+/// ets:delete(T, 2), ets:insert(T, {0})
+/// ets:select(K)                               -> {[{5},{6},{7},{8}], cont}
+///   (the inserted {0} is behind the anchor and is NOT returned)
+/// ...delete the anchor {4} instead            -> {[{5},{6},{7},{8}], cont}
+/// ...insert {-1} before the anchor            -> {[{5},{6},{7},{8}], cont}
+/// {R, RK} = ets:select_reverse(T, S, 3)       R = [{10},{9},{8}]
+/// ets:delete(T, 10), ets:select_reverse(RK)   -> {[{7},{6},{5}], cont}
+/// ```
+///
+/// The same probes are cross-checked against the live oracle in
+/// `tests/ets_continuation_direction.rs` (`mut_*` cases).
+#[test]
+fn a_key_anchored_resume_survives_a_mutation_between_chunks() {
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut out = Heap::new(4096).expect("out heap");
+    let spec = whole_object_spec(&mut heap, &atoms);
+    let ten: Vec<(i64, &str)> = (1..=10).map(|key| (key, "a")).collect();
+
+    // The anchor is the *ordered interior's* range API, so both ordered interiors
+    // must reproduce every probe.
+    for interior in [OrderedInterior::BPlusTree, OrderedInterior::Sorted] {
+        let context = interior.as_str();
+
+        // The oracle's chunk 2 for every mutation below.
+        let chunk2 = [
+            object(&mut heap, 5, at(&atoms, "a")),
+            object(&mut heap, 6, at(&atoms, "a")),
+            object(&mut heap, 7, at(&atoms, "a")),
+            object(&mut heap, 8, at(&atoms, "a")),
+        ];
+
+        // A deletion *behind* the anchor plus an insertion still further behind it:
+        // the inserted {0} sorts before the anchor, so it is not returned.
+        let mut behind = ordered_table_with(&mut heap, &atoms, &ten, interior);
+        let (first, c) = behind.select_limit(&spec, 4, &atoms, &mut out).unwrap();
+        assert_results(
+            &first,
+            &[
+                object(&mut heap, 1, at(&atoms, "a")),
+                object(&mut heap, 2, at(&atoms, "a")),
+                object(&mut heap, 3, at(&atoms, "a")),
+                object(&mut heap, 4, at(&atoms, "a")),
+            ],
+            &atoms,
+        );
+        let c = c.expect("a full chunk yields a continuation");
+        behind.delete(make_small(2), &atoms).expect("delete 2");
+        behind
+            .insert(object(&mut heap, 0, at(&atoms, "a")), &atoms)
+            .expect("insert 0");
+        let (r, more) = behind.select_continue(&c, &atoms, &mut out).unwrap();
+        assert_results(&r, &chunk2, &atoms);
+        assert!(more.is_some(), "{context}: the walk has not reached the end");
+
+        // The anchor ITSELF deleted: the resume is a range, not a lookup of it.
+        let mut gone = ordered_table_with(&mut heap, &atoms, &ten, interior);
+        let (_, c) = gone.select_limit(&spec, 4, &atoms, &mut out).unwrap();
+        let c = c.expect("a full chunk yields a continuation");
+        gone.delete(make_small(4), &atoms)
+            .expect("delete the anchor itself");
+        let (r, _) = gone.select_continue(&c, &atoms, &mut out).unwrap();
+        assert_results(&r, &chunk2, &atoms);
+
+        // An insertion *before* the anchor does not shift the resume either.
+        let mut before = ordered_table_with(&mut heap, &atoms, &ten, interior);
+        let (_, c) = before.select_limit(&spec, 4, &atoms, &mut out).unwrap();
+        let c = c.expect("a full chunk yields a continuation");
+        before
+            .insert(object(&mut heap, -1, at(&atoms, "a")), &atoms)
+            .expect("insert before the anchor");
+        let (r, _) = before.select_continue(&c, &atoms, &mut out).unwrap();
+        assert_results(&r, &chunk2, &atoms);
+
+        // The reverse mirror: the anchor is the first key the reverse chunk yielded,
+        // and deleting it still resumes strictly before it.
+        let mut reverse = ordered_table_with(&mut heap, &atoms, &ten, interior);
+        let (r, c) = reverse
+            .select_reverse_limit(&spec, 3, &atoms, &mut out)
+            .unwrap();
+        assert_results(
+            &r,
+            &[
+                object(&mut heap, 10, at(&atoms, "a")),
+                object(&mut heap, 9, at(&atoms, "a")),
+                object(&mut heap, 8, at(&atoms, "a")),
+            ],
+            &atoms,
+        );
+        let c = c.expect("a full reverse chunk yields a continuation");
+        reverse
+            .delete(make_small(10), &atoms)
+            .expect("delete the reverse anchor");
+        let (r, _) = reverse
+            .select_reverse_continue(&c, &atoms, &mut out)
+            .unwrap();
+        assert_results(
+            &r,
+            &[
+                object(&mut heap, 7, at(&atoms, "a")),
+                object(&mut heap, 6, at(&atoms, "a")),
+                object(&mut heap, 5, at(&atoms, "a")),
+            ],
+            &atoms,
+        );
+
+        // A fully consumed walk: the limit lands exactly on the last object (a
+        // continuation is still returned), whose own resume finds nothing.
+        let four = ordered_table_with(&mut heap, &atoms, &ten[..4], interior);
+        let (r, c) = four.select_limit(&spec, 4, &atoms, &mut out).unwrap();
+        assert_eq!(r.len(), 4);
+        let c = c.expect("limit == size still continues");
+        let (left, end) = four.select_continue(&c, &atoms, &mut out).unwrap();
+        assert!(
+            left.is_empty() && end.is_none(),
+            "{context}: renders as '$end_of_table'"
+        );
+    }
+}
+
+/// **A hash kind's reverse traversal IS its forward traversal.** ERTS's hash
+/// interior has `last`/`prev` *equal* to `first`/`next` (`erl_db_hash.c:853-856`)
+/// and `db_select_reverse_hash` delegates to the same chunk function as
+/// `db_select_hash` (`:2310-2313`), so for `set`/`bag`/`duplicate_bag`
+/// `ets:select_reverse` returns exactly the same list in the same order as
+/// `ets:select` — chunked and unchunked, per-key object order included. Verified on
+/// the system `erl` (OTP 29 / erts-17.1) with a `set` of `{K,K}` objects:
+/// `ets:select(H, S, 3) =:= ets:select_reverse(H, S, 3)` and the two resumptions
+/// agree as well.
+///
+/// Only the **rule** is pinned here, never a concrete hash order: the hash kinds'
+/// iteration order is a documented interior freedom (it is not the oracle's), so the
+/// walk's contents are compared to *itself*, forward against reverse. The live oracle
+/// is cross-checked on the same rule in `tests/ets_continuation_direction.rs`
+/// (`hash_rev_chunk`/`hash_rev_resume`).
+#[test]
+fn a_hash_kinds_reverse_limit_and_continue_are_its_forward_ones() {
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut out = Heap::new(4096).expect("out heap");
+    let spec = whole_object_spec(&mut heap, &atoms);
+    let table = set_table(&mut heap, &atoms, &[1, 2, 3, 4, 5, 6]);
+
+    // Chunk 1: `limit = 3` on six objects; the reverse chunk is the forward chunk.
+    let (fwd, fwd_cont) = table.select_limit(&spec, 3, &atoms, &mut out).unwrap();
+    assert_eq!(fwd.len(), 3, "a full forward chunk");
+    let (rev, rev_cont) = table
+        .select_reverse_limit(&spec, 3, &atoms, &mut out)
+        .unwrap();
+    assert_results(&rev, &fwd, &atoms);
+    let fwd_cont = fwd_cont.expect("a full chunk yields a continuation");
+    let rev_cont = rev_cont.expect("a full reverse chunk yields a continuation");
+
+    // Chunk 2, resumed through each side's own name; the direction degenerates.
+    let (fwd2, fwd_more) = table.select_continue(&fwd_cont, &atoms, &mut out).unwrap();
+    assert_eq!(fwd2.len(), 3, "a full forward chunk");
+    let (rev2, _) = table
+        .select_reverse_continue(&rev_cont, &atoms, &mut out)
+        .unwrap();
+    assert_results(&rev2, &fwd2, &atoms);
+    assert!(fwd_more.is_some(), "limit == size still continues");
+
+    // ...and the `/1` name is irrelevant: the carried spec + cursor decide.
+    let (via_match, _) = table.match_continue(&rev_cont, &atoms, &mut out).unwrap();
+    assert_results(&via_match, &fwd2, &atoms);
+    let (via_object, _) = table
+        .match_object_continue(&rev_cont, &atoms, &mut out)
+        .unwrap();
+    assert_results(&via_object, &fwd2, &atoms);
+
+    // A fully consumed walk ends on both sides (`limit == size` ⇒ cont, then empty).
+    let (all, end) = table.select_limit(&spec, 6, &atoms, &mut out).unwrap();
+    assert_eq!(all.len(), 6);
+    let end = end.expect("limit == size still continues");
+    let (left, done) = table.select_continue(&end, &atoms, &mut out).unwrap();
+    assert!(left.is_empty() && done.is_none());
+    let (rev_all, rev_end) = table
+        .select_reverse_limit(&spec, 6, &atoms, &mut out)
+        .unwrap();
+    assert_results(&rev_all, &all, &atoms);
+    let rev_end = rev_end.expect("limit == size still continues");
+    let (left, done) = table
+        .select_reverse_continue(&rev_end, &atoms, &mut out)
+        .unwrap();
+    assert!(left.is_empty() && done.is_none());
+
+    // `limit > size` completes in one chunk with no continuation, on both sides.
+    let (fwd_all, fwd_end) = table.select_limit(&spec, 10, &atoms, &mut out).unwrap();
+    let (rev_all, rev_end) = table
+        .select_reverse_limit(&spec, 10, &atoms, &mut out)
+        .unwrap();
+    assert_results(&rev_all, &fwd_all, &atoms);
+    assert!(fwd_end.is_none() && rev_end.is_none());
 }

@@ -125,9 +125,23 @@ fn singleton_table(
     table
 }
 
+/// A `set` of `{K, K}` objects — a **hash kind**, whose iteration order is an
+/// interior freedom and is therefore never compared to the oracle *by value*; the
+/// battery cross-checks only the *rule* that its reverse traversal is its forward
+/// traversal (see the module docs of `src/select/continuation.rs`).
+fn hash_table(heap: &mut Heap, atoms: &AtomTable, count: i64) -> Table {
+    let mut opts = TableOptions::new();
+    opts.set_kind(TableKind::Set);
+    let mut table = Table::new(TableId::next(), opts).expect("a fresh table");
+    for key in 1..=count {
+        let obj = object(heap, key, make_small(key));
+        table.insert(obj, atoms).expect("insert into a fresh table");
+    }
+    table
+}
+
 /// The six `{1,a}`..`{6,f}` entries two full `limit = 3` chunks need.
 const SIX: &[(i64, &str)] = &[(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e"), (6, "f")];
-
 /// The signature every `/1` entry point shares with its siblings.
 type ResumeStep = fn(
     &Table,
@@ -446,8 +460,50 @@ main(_) ->
     {RP, RPC} = ets:select_reverse(T, S, 3),
     line("rev_partial", chunk(RP, RPC)),
     line("rev_partial_resume", tail(ets:select_reverse(RPC))),
-    UN = ets:new(un, [ordered_set]),
-    [ets:insert(UN,{I}) || I <- lists:seq(1,6)],
+
+    %% The ordered_set cursor is the last yielded KEY and the resume is a RANGE
+    %% strictly after (forward) / before (reverse) it, so a mutation landing between
+    %% the chunks cannot shift the resume — not even deleting the anchor itself.
+    CUR = ets:new(m, [ordered_set]),
+    [ets:insert(CUR,{I}) || I <- lists:seq(1,10)],
+    {OUT1, CONT1} = ets:select(CUR, S, 4),
+    line("mut_base", chunk(OUT1, CONT1)),
+    ets:delete(CUR, 2),
+    ets:insert(CUR, {0}),
+    line("mut_delete_behind_resume", tail(ets:select(CONT1))),
+    CUR2 = ets:new(m2, [ordered_set]),
+    [ets:insert(CUR2,{I}) || I <- lists:seq(1,10)],
+    {_, CONT2} = ets:select(CUR2, S, 4),
+    ets:delete(CUR2, 4),
+    line("mut_delete_anchor_resume", tail(ets:select(CONT2))),
+    CUR3 = ets:new(m3, [ordered_set]),
+    [ets:insert(CUR3,{I}) || I <- lists:seq(1,10)],
+    {_, CONT3} = ets:select(CUR3, S, 4),
+    ets:insert(CUR3, {-1}),
+    line("mut_insert_before_resume", tail(ets:select(CONT3))),
+    CUR4 = ets:new(m4, [ordered_set]),
+    [ets:insert(CUR4,{I}) || I <- lists:seq(1,10)],
+    {ROUT1, RCONT1} = ets:select_reverse(CUR4, S, 3),
+    line("mut_rev_base", chunk(ROUT1, RCONT1)),
+    ets:delete(CUR4, 10),
+    line("mut_rev_delete_anchor_resume", tail(ets:select_reverse(RCONT1))),
+    CUR5 = ets:new(m5, [ordered_set]),
+    [ets:insert(CUR5,{I}) || I <- lists:seq(1,4)],
+    {_, DCONT} = ets:select(CUR5, S, 4),
+    line("mut_consumed_resume", tail(ets:select(DCONT))),
+    %% A hash kind's `last`/`prev` ARE its `first`/`next`, so its reverse traversal
+    %% IS its forward traversal: the two chunks are the same list. Only the *rule* is
+    %% cross-checked (their iteration order is not the oracle's).
+    H = ets:new(h, [set]),
+    [ets:insert(H, {I, I}) || I <- lists:seq(1,6)],
+    {HA, HC} = ets:select(H, S, 3),
+    {HB, HBC} = ets:select_reverse(H, S, 3),
+    line("hash_rev_chunk", same(HA, HB)),
+    {HA2, _} = ets:select(HC),
+    {HB2, _} = ets:select_reverse(HBC),
+    line("hash_rev_resume", same(HA2, HB2)),
+
+    UN = ets:new(un, [ordered_set]),    [ets:insert(UN,{I}) || I <- lists:seq(1,6)],
     {_, UC} = ets:select(UN, S, 2),
     ets:rename(UN, un_renamed),
     line("unnamed_rename_resume", tail(ets:select(UC))),
@@ -463,8 +519,10 @@ tail('$end_of_table') -> "end";
 tail({Results, '$end_of_table'}) -> "{" ++ rlist(Results) ++ ",end}";
 tail({Results, _Cont}) -> "{" ++ rlist(Results) ++ ",cont}".
 
-line(Label, Rendered) -> io:format("~s -> ~s~n", [Label, Rendered]).
+%% Whether two result lists are identical (the hash kinds' reverse-vs-forward rule).
+same(A, B) -> case A =:= B of true -> "same"; false -> "differ" end.
 
+line(Label, Rendered) -> io:format("~s -> ~s~n", [Label, Rendered]).
 rlist(L) -> "[" ++ lists:join(",", [rterm(X) || X <- L]) ++ "]".
 rtuple(T) -> "{" ++ lists:join(",", [rterm(E) || E <- tuple_to_list(T)]) ++ "}".
 rterm(X) when is_integer(X) -> integer_to_list(X);
@@ -740,9 +798,91 @@ fn rust_battery() -> BTreeMap<String, String> {
         render_chunk(&chunk, cont.as_ref(), &atoms),
     );
 
+    // ---- the ordered_set cursor is a key anchor, not an ordinal -------------
+    let mut m = singleton_table(&mut heap, &atoms, 10, |_| {});
+    let (r, c) = m.select_limit(&spec, 4, &atoms, &mut out).unwrap();
+    cases.insert("mut_base".into(), render_chunk(&r, c.as_ref(), &atoms));
+    let c = c.expect("a full chunk");
+    m.delete(make_small(2), &atoms).expect("delete behind the anchor");
+    m.insert(singleton(&mut heap, 0), &atoms)
+        .expect("insert before the anchor");
+    let (r, c) = m.select_continue(&c, &atoms, &mut out).unwrap();
+    cases.insert(
+        "mut_delete_behind_resume".into(),
+        render_chunk(&r, c.as_ref(), &atoms),
+    );
+
+    let mut m2 = singleton_table(&mut heap, &atoms, 10, |_| {});
+    let (_, c) = m2.select_limit(&spec, 4, &atoms, &mut out).unwrap();
+    let c = c.expect("a full chunk");
+    m2.delete(make_small(4), &atoms)
+        .expect("delete the anchor itself");
+    let (r, c) = m2.select_continue(&c, &atoms, &mut out).unwrap();
+    cases.insert(
+        "mut_delete_anchor_resume".into(),
+        render_chunk(&r, c.as_ref(), &atoms),
+    );
+
+    let mut m3 = singleton_table(&mut heap, &atoms, 10, |_| {});
+    let (_, c) = m3.select_limit(&spec, 4, &atoms, &mut out).unwrap();
+    let c = c.expect("a full chunk");
+    m3.insert(singleton(&mut heap, -1), &atoms)
+        .expect("insert before the anchor");
+    let (r, c) = m3.select_continue(&c, &atoms, &mut out).unwrap();
+    cases.insert(
+        "mut_insert_before_resume".into(),
+        render_chunk(&r, c.as_ref(), &atoms),
+    );
+
+    let mut m4 = singleton_table(&mut heap, &atoms, 10, |_| {});
+    let (r, c) = m4
+        .select_reverse_limit(&spec, 3, &atoms, &mut out)
+        .unwrap();
+    cases.insert("mut_rev_base".into(), render_chunk(&r, c.as_ref(), &atoms));
+    let c = c.expect("a full reverse chunk");
+    m4.delete(make_small(10), &atoms)
+        .expect("delete the reverse anchor itself");
+    let (r, c) = m4.select_reverse_continue(&c, &atoms, &mut out).unwrap();
+    cases.insert(
+        "mut_rev_delete_anchor_resume".into(),
+        render_chunk(&r, c.as_ref(), &atoms),
+    );
+
+    let four_keys = singleton_table(&mut heap, &atoms, 4, |_| {});
+    let (_, c) = four_keys.select_limit(&spec, 4, &atoms, &mut out).unwrap();
+    let c = c.expect("limit == size still continues");
+    let (r, c) = four_keys.select_continue(&c, &atoms, &mut out).unwrap();
+    cases.insert(
+        "mut_consumed_resume".into(),
+        render_chunk(&r, c.as_ref(), &atoms),
+    );
+
+    // ---- a hash kind's reverse traversal IS its forward traversal -----------
+    // Only the *rule* is compared (a hash kind's iteration order is not the
+    // oracle's), so both sides render the same/differ verdict.
+    let hash = hash_table(&mut heap, &atoms, 6);
+    let same = |a: &[Eterm], b: &[Eterm]| -> String {
+        if render_term_list(a, &atoms) == render_term_list(b, &atoms) {
+            "same".to_string()
+        } else {
+            "differ".to_string()
+        }
+    };
+    let (fwd, fwd_cont) = hash.select_limit(&spec, 3, &atoms, &mut out).unwrap();
+    let (rev, rev_cont) = hash
+        .select_reverse_limit(&spec, 3, &atoms, &mut out)
+        .unwrap();
+    cases.insert("hash_rev_chunk".into(), same(&fwd, &rev));
+    let (fwd2, _) = hash
+        .select_continue(&fwd_cont.expect("a full chunk"), &atoms, &mut out)
+        .unwrap();
+    let (rev2, _) = hash
+        .select_reverse_continue(&rev_cont.expect("a full chunk"), &atoms, &mut out)
+        .unwrap();
+    cases.insert("hash_rev_resume".into(), same(&fwd2, &rev2));
+
     // ---- identity: renaming a named_table kills its continuation ------------
-    let un_renamed = atoms.intern("un_renamed");
-    let nm = atoms.intern("nm");
+    let un_renamed = atoms.intern("un_renamed");    let nm = atoms.intern("nm");
     let nm_renamed = atoms.intern("nm_renamed");
     let mut un = singleton_table(&mut heap, &atoms, 6, |_| {});
     let (_, cont) = un.select_limit(&spec, 2, &atoms, &mut out).unwrap();

@@ -46,7 +46,10 @@
 //! [`TableRead::iter_objects`] yields every stored **object**, not every key: it
 //! walks the keys and expands each key's object list, so a `bag`/`duplicate_bag`
 //! key holding several objects yields each of them. [`TableRead::iter_keys`] yields
-//! each key once. The reverse forms are the exact mirror of the forward ones.
+//! each key once. The reverse forms walk `ets:last/1` + `ets:prev/2`: for an
+//! `ordered_set` they are the exact mirror of the forward ones; for the hash kinds
+//! (`set`/`bag`/`duplicate_bag`) they yield the **same** order, because their
+//! `last`/`prev` are `first`/`next` (`erl_db_hash.c:853-856`).
 //!
 //! # Cost
 //!
@@ -193,13 +196,20 @@ impl<'a> Iterator for ObjectIter<'a> {
     }
 }
 
-/// A reverse **object** iterator over a read view: the exact mirror of
-/// [`ObjectIter`] (keys last-to-first, each key's objects last-to-first).
+/// A reverse **object** iterator over a read view: `ets:last/1` + `ets:prev/2`,
+/// expanding each key's objects in stored order.
+///
+/// For an `ordered_set` it is the exact mirror of [`ObjectIter`] (keys
+/// last-to-first; each key holds one object). For the hash kinds
+/// (`set`/`bag`/`duplicate_bag`) it yields the **same** order as [`ObjectIter`],
+/// because their `last`/`prev` are `first`/`next` (`erl_db_hash.c:853-856`) — so
+/// the reverse walk *is* the forward walk, keys and per-key object order alike.
 ///
 /// Obtained from [`TableRead::iter_objects_rev`].
 pub struct ObjectIterRev<'a> {
     walk: KeyWalk<'a>,
-    /// The current key's remaining objects, in reverse stored order.
+    /// The current key's remaining objects, in stored order (the hash kinds keep
+    /// the forward per-key order; an `ordered_set` key holds a single object).
     pending: std::vec::IntoIter<Eterm>,
 }
 
@@ -212,9 +222,7 @@ impl<'a> Iterator for ObjectIterRev<'a> {
                 return Some(TableTerm::new(object));
             }
             let key = self.walk.next_raw()?;
-            let mut objects = self.walk.objects(key);
-            objects.reverse();
-            self.pending = objects.into_iter();
+            self.pending = self.walk.objects(key).into_iter();
         }
     }
 }
@@ -275,8 +283,9 @@ impl<'g> TableRead<'g> {
     /// `ets:prev/2`), each tagged to this view's borrow.
     ///
     /// For an `ordered_set` this is exactly [`iter_keys`](Self::iter_keys) reversed;
-    /// for the hash kinds it is the reverse of the interior's own (unspecified)
-    /// order.
+    /// for the hash kinds (`set`/`bag`/`duplicate_bag`) it is the **same** order as
+    /// [`iter_keys`](Self::iter_keys) — their `last`/`prev` are `first`/`next`
+    /// (`erl_db_hash.c:853-856`).
     ///
     /// A term the iterator yields may not outlive the view:
     ///
@@ -346,9 +355,13 @@ impl<'g> TableRead<'g> {
         }
     }
 
-    /// Every stored **object** in reverse iteration order — the exact mirror of
-    /// [`iter_objects`](Self::iter_objects): keys last-to-first, and each key's
-    /// objects last-to-first.
+    /// Every stored **object** in reverse iteration order (`ets:last/1` +
+    /// `ets:prev/2`), each key's objects expanded in stored order.
+    ///
+    /// The exact mirror of [`iter_objects`](Self::iter_objects) for an
+    /// `ordered_set`; the **same** order for the hash kinds (`set`/`bag`/
+    /// `duplicate_bag`), whose `last`/`prev` are `first`/`next`
+    /// (`erl_db_hash.c:853-856`).
     pub fn iter_objects_rev<'a>(
         &'a self,
         atoms: &'a AtomTable,
@@ -400,7 +413,10 @@ impl<'g> TableRead<'g> {
 
     /// `lists:foldr/3` over the table's **objects**, in reverse iteration order:
     /// `f(object1, f(object2, … f(objectN, init)))` — the mirror of
-    /// [`foldl`](Self::foldl), so folding a list into itself reverses it.
+    /// [`foldl`](Self::foldl) for an `ordered_set`, so folding an `ordered_set` into
+    /// a list reverses it. For the hash kinds (`set`/`bag`/`duplicate_bag`) it
+    /// visits the objects in the **same** order as [`foldl`](Self::foldl), because
+    /// their `last`/`prev` are `first`/`next` (`erl_db_hash.c:853-856`).
     ///
     /// As with `foldl`, only the accumulator escapes the guard.
     pub fn foldr<T>(
@@ -443,14 +459,14 @@ mod tests {
     //! ordinal/probabilistic claim:
     //!
     //! * an `ordered_set` walk (forward and reverse) has a *deterministic* order, so
-    //!   it is asserted literally;
+    //!   it is asserted literally, the reverse being the exact mirror of the forward;
     //! * a hash kind's forward walk order is unspecified, so it is asserted as a
-    //!   *permutation* of the stored keys, while the **reverse** walk is asserted to
-    //!   be the exact reverse of the forward one (both are deterministic runs of the
-    //!   same interior);
+    //!   *permutation* of the stored keys — and its **reverse** walk is asserted to
+    //!   be the *same* order as the forward one, because a hash kind's `last`/`prev`
+    //!   are `first`/`next` (`erl_db_hash.c:853-856`);
     //! * the object walks are asserted to yield every stored object exactly once
-    //!   (a multiset), and the reverse object walk to be the exact mirror of the
-    //!   forward one.
+    //!   (a multiset), and the reverse object walk to equal the forward one for a
+    //!   hash kind (mirror for an `ordered_set`).
 
     use super::*;
     use crate::kind::{Access, TableKind, TableOptions};
@@ -562,10 +578,10 @@ mod tests {
     }
 
     /// A hash kind's forward walk is a permutation of the stored keys (each exactly
-    /// once); its reverse walk is the exact mirror of the forward one, and the same
-    /// holds for the object walks.
+    /// once); its reverse walk is the **same** order (a hash kind's `last`/`prev`
+    /// are `first`/`next`), and the same holds for the object walks.
     #[test]
-    fn hash_kind_walks_visit_every_key_once_and_mirror() {
+    fn hash_kind_walks_visit_every_key_once_and_reverse_equals_forward() {
         const N: i64 = 64;
         let atoms = AtomTable::new();
         let shared = shared_table(TableKind::Set);
@@ -582,9 +598,8 @@ mod tests {
         );
         let reverse = keys_reverse(&shared, &atoms);
         assert_eq!(
-            reverse,
-            forward.iter().rev().copied().collect::<Vec<_>>(),
-            "the reverse walk is the exact mirror of the forward one"
+            reverse, forward,
+            "a hash kind walks the same order in both directions"
         );
 
         let forward_objects = objects_forward(&shared, &atoms);
@@ -594,8 +609,8 @@ mod tests {
         );
         let reverse_objects = objects_reverse(&shared, &atoms);
         assert_eq!(
-            reverse_objects,
-            forward_objects.iter().rev().copied().collect::<Vec<_>>()
+            reverse_objects, forward_objects,
+            "a hash kind's object walk is direction-independent"
         );
     }
 
@@ -620,11 +635,8 @@ mod tests {
             sorted(forward.clone()),
             vec![(1, 10), (1, 20), (1, 30), (2, 200)]
         );
-        // The reverse object walk is the exact mirror of the forward one.
-        assert_eq!(
-            objects_reverse(&shared, &atoms),
-            forward.iter().rev().copied().collect::<Vec<_>>()
-        );
+        // A `bag` is a hash kind, so its reverse object walk is the same order.
+        assert_eq!(objects_reverse(&shared, &atoms), forward);
     }
 
     /// An empty table walks to nothing, and a fold over nothing returns its seed.
@@ -663,7 +675,7 @@ mod tests {
         assert_eq!(objects_reverse(&shared, &atoms), vec![(42, 420)]);
     }
 
-    /// `foldl` and `foldr` traverse opposite orders over the same objects.
+    /// `foldl` and `foldr` traverse opposite orders over an `ordered_set`.
     #[test]
     fn foldl_and_foldr_traverse_opposite_orders() {
         let atoms = AtomTable::new();
@@ -705,6 +717,45 @@ mod tests {
             forward.iter().rev().copied().collect::<Vec<_>>(),
             "foldr is the mirror of foldl"
         );
+    }
+
+    /// For a hash kind (`set`/`bag`/`duplicate_bag`) `foldr` visits the objects in
+    /// the **same** order as `foldl`, because the kind's `last`/`prev` are
+    /// `first`/`next` (`erl_db_hash.c:853-856`).
+    #[test]
+    fn foldr_matches_foldl_for_a_hash_kind() {
+        let atoms = AtomTable::new();
+        let shared = shared_table(TableKind::Bag);
+        let mut heap = Heap::new(64);
+        for (key, value) in [(1, 10), (1, 20), (2, 200), (3, 300)] {
+            put(&shared, pair(&mut heap, key, value), &atoms);
+        }
+
+        let forward: Vec<i64> = shared
+            .with_read(|view| {
+                view.foldl(
+                    Vec::new(),
+                    |mut acc, object| {
+                        acc.push(pair_of(&object).1);
+                        acc
+                    },
+                    &atoms,
+                )
+            })
+            .expect("no poisoned lock");
+        let reverse: Vec<i64> = shared
+            .with_read(|view| {
+                view.foldr(
+                    Vec::new(),
+                    |object, mut acc| {
+                        acc.push(pair_of(&object).1);
+                        acc
+                    },
+                    &atoms,
+                )
+            })
+            .expect("no poisoned lock");
+        assert_eq!(reverse, forward, "a hash kind folds the same order both ways");
     }
 
     /// `tab2list_into` copies the whole table out under one guard, and the copies

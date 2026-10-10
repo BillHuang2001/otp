@@ -186,12 +186,21 @@ impl Table {
 
     /// The first key in the table's iteration order (`ets:first/1`); `None` is the
     /// `'$end_of_table'` result and an empty table always yields it.
+    ///
+    /// The hash kinds (`set`/`bag`/`duplicate_bag`) walk an internal, unspecified
+    /// order; an `ordered_set` walks ascending arithmetic key order.
     pub fn first(&self, atoms: &AtomTable) -> Option<Eterm> {
         self.interior.first_key(atoms)
     }
 
     /// The last key in the table's iteration order (`ets:last/1`); `None` is the
     /// `'$end_of_table'` result and an empty table always yields it.
+    ///
+    /// Mirrors the verified `erl` (OTP 29 / erts-17.1): for the hash kinds
+    /// (`set`/`bag`/`duplicate_bag`) `ets:last/1` is `ets:first/1` — ERTS's hash
+    /// tables implement `last` as `first` (`erl_db_hash.c:853-856`), so `last`
+    /// returns the same key `first` does, not the greatest key. Only an
+    /// `ordered_set` has a real backward step: `last` is its arithmetic-maximum key.
     pub fn last(&self, atoms: &AtomTable) -> Option<Eterm> {
         self.interior.last_key(atoms)
     }
@@ -211,9 +220,15 @@ impl Table {
     }
 
     /// The key preceding `key` (`ets:prev/2`); `Ok(None)` is the
-    /// `'$end_of_table'` result. Mirrors [`next`](Table::next) (verified against the
-    /// system `erl`): a range bound for `ordered_set`, a present-key requirement
-    /// (`badarg` otherwise) for the hash kinds.
+    /// `'$end_of_table'` result.
+    ///
+    /// Mirrors the verified `erl` (OTP 29 / erts-17.1) behaviour: an `ordered_set`
+    /// reads `key` as a **range bound** (an absent key is fine, an empty table
+    /// yields `'$end_of_table'`), whereas the hash kinds (`set`/`bag`/
+    /// `duplicate_bag`) require the anchor key to be *present* (`badarg` otherwise)
+    /// and, being hash tables whose `prev` **is** `next` (`erl_db_hash.c:853-856`),
+    /// answer exactly what [`next`](Table::next) answers — there is no backward
+    /// step and the walk ends at `'$end_of_table'` with the same last key.
     pub fn prev(&self, key: Eterm, atoms: &AtomTable) -> Result<Option<Eterm>> {
         self.check_navigable(key, atoms)?;
         Ok(self.interior.prev_key(key, atoms))
@@ -299,5 +314,22 @@ impl Table {
     /// Every object in the table (ordered for `ordered_set`).
     pub fn tab2list(&self) -> Vec<Eterm> {
         self.interior.iter_objects().collect()
+    }
+
+    /// Every object in the table's **reverse-navigation** order (`ets:last/1` +
+    /// `ets:prev/2`), expanding each key's objects in stored order.
+    ///
+    /// This is the crate's single source of truth for a reverse traversal: the
+    /// interior decides the order, so an `ordered_set` yields the exact reverse of
+    /// [`tab2list`](Table::tab2list) (descending key order), while the hash kinds
+    /// (`set`/`bag`/`duplicate_bag`) yield the **same** order as
+    /// [`tab2list`](Table::tab2list) — their `last`/`prev` are `first`/`next`
+    /// (`erl_db_hash.c:853-856`), so a hash reverse walk *is* a forward walk.
+    ///
+    /// [`select_reverse`](Table::select_reverse) drives this instead of reversing
+    /// [`tab2list`](Table::tab2list) itself, which would wrongly mirror the hash
+    /// kinds.
+    pub(crate) fn tab2list_rev(&self) -> Vec<Eterm> {
+        self.interior.iter_objects_rev().collect()
     }
 }

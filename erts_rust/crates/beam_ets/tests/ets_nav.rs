@@ -29,14 +29,18 @@
 //!     for the hash kinds (their walk is anchored at a present entry);
 //!   * an absent anchor key: `ordered_set` treats it as a range bound (the nearest
 //!     stored key above/below it) while the hash kinds raise `badarg`;
-//!   * `next` past the largest stored key is `'$end_of_table'` for every kind.
+//!   * `next` past the largest stored key is `'$end_of_table'` for every kind;
+//!   * the hash kinds (`set`/`bag`/`duplicate_bag`) implement `ets:last/1` as
+//!     `ets:first/1` and `ets:prev/2` as `ets:next/2` (`erl_db_hash.c:853-856`), so
+//!     `last == first` and `prev(K) == next(K)` for every present `K`; only
+//!     `ordered_set` has a genuine backward step.
 //!
 //! The guard-scoped view (`TableRead::{iter_keys, iter_keys_rev, iter_objects,
 //! iter_objects_rev, foldl, foldr, tab2list_into}`) is a re-expression of
 //! `ets:first/1` + `ets:next/2`, so its traversal order is pinned here too: every
-//! forward form visits exactly the objects `tab2list` yields, in that order, and its
-//! `*_rev`/`foldr` mirror is the exact reverse (`ordered_set`: ascending arithmetic
-//! key order; hash kinds: unspecified, compared as a normalised multiset).
+//! forward form visits exactly the objects `tab2list` yields, in that order; the
+//! `*_rev`/`foldr` forms are that order reversed for an `ordered_set` and the same
+//! order for the hash kinds (whose `prev` is `next`).
 
 mod common;
 
@@ -148,12 +152,29 @@ fn hash_navigation_walks_every_key_once_and_rejects_an_absent_anchor() {
             );
         }
 
-        // `last` closes the same order, and `prev(first)` is the start of it.
+        // A hash kind implements `ets:last/1` as `ets:first/1` and `ets:prev/2` as
+        // `ets:next/2` (`erl_db_hash.c:853-856`): `last` is `first`, `prev` mirrors
+        // `next` at every step, and both walks end at `'$end_of_table'`.
         let first = t.first(&atoms).unwrap();
-        assert_eq!(t.last(&atoms), walk.last().copied(), "{kind:?} last");
-        assert_eq!(t.prev(first, &atoms).unwrap(), None, "{kind:?} prev(first)");
-        let last = t.last(&atoms).unwrap();
-        assert_eq!(t.next(last, &atoms).unwrap(), None, "{kind:?} next(last)");
+        assert_eq!(t.last(&atoms), Some(first), "{kind:?} last == first");
+        for &key in &walk {
+            assert_eq!(
+                t.prev(key, &atoms).unwrap(),
+                t.next(key, &atoms).unwrap(),
+                "{kind:?} prev == next at {key:?}"
+            );
+        }
+        let last_walked = *walk.last().unwrap();
+        assert_eq!(
+            t.prev(last_walked, &atoms).unwrap(),
+            None,
+            "{kind:?} prev at the walk end"
+        );
+        assert_eq!(
+            t.next(last_walked, &atoms).unwrap(),
+            None,
+            "{kind:?} next at the walk end"
+        );
 
         // An anchor key that is not stored is `badarg` (verified `erl` behaviour).
         assert!(matches!(
@@ -193,15 +214,18 @@ fn hash_navigation_walks_every_key_once_and_rejects_an_absent_anchor() {
 /// order. What is contract — and is pinned here — is:
 ///
 ///   * `first`/`last` return a **present** key (never a bogus one) or
+///     `'$end_of_table'`, and `last` **is** `first` (a hash table implements
+///     `ets:last/1` as `ets:first/1`);
+///   * the `first` + `next` walk visits every stored key exactly once, and `prev`
+///     walks that same order (`ets:prev/2` is `ets:next/2`), both ending in
 ///     `'$end_of_table'`;
-///   * the `first` + `next` walk visits every stored key exactly once, and `last`
-///     closes that same walk (`prev(first)` and `next(last)` are `'$end_of_table'`);
 ///   * `next`/`prev` on an **absent** anchor key are `badarg` — the walk is anchored
 ///     at a present entry.
 ///
 /// Rationalised against the real `erl` (OTP 29 / erts-17.1): a 3-key `set` answers
-/// `first = last = 1` there, but that is the *internal* order, not a rule — so this
-/// test deliberately asserts nothing of the form `last == first`.
+/// `first = last = 1` there, and `prev(K) = next(K)` for every present `K` — the
+/// hash-table function table `db_first_hash, db_next_hash, db_first_hash /* last ==
+/// first */, db_next_hash /* prev == next */` (`erl_db_hash.c:853-856`).
 #[test]
 fn hash_navigation_order_is_unspecified_but_every_returned_key_is_present() {
     for kind in [TableKind::Set, TableKind::Bag, TableKind::DuplicateBag] {
@@ -235,15 +259,19 @@ fn hash_navigation_order_is_unspecified_but_every_returned_key_is_present() {
         }
         assert_eq!(walk.len(), KEYS as usize, "{kind:?}: the walk covers every key");
 
-        // `last` closes the same order; the two ends are `'$end_of_table'`.
+        // `last` **is** `first` for a hash kind, and `prev` walks the same order as
+        // `next`: both reach `'$end_of_table'` past the single walked end.
         let last = t.last(&atoms).expect("a non-empty table has a last key");
         assert!(is_present(last), "{kind:?}: last is a stored key");
-        assert!(
-            eq(last, *walk.last().unwrap(), &atoms),
-            "{kind:?}: last closes the walk"
-        );
-        assert_eq!(t.next(last, &atoms).unwrap(), None, "{kind:?}: next(last)");
-        assert_eq!(t.prev(first, &atoms).unwrap(), None, "{kind:?}: prev(first)");
+        assert!(eq(last, first, &atoms), "{kind:?}: last == first");
+        // `prev` walks the same order as `next`, at every present key.
+        for &key in &walk {
+            assert_eq!(
+                t.prev(key, &atoms).unwrap(),
+                t.next(key, &atoms).unwrap(),
+                "{kind:?}: prev == next at {key:?}"
+            );
+        }
 
         // An absent anchor key is always `badarg`, whatever its value.
         for absent in [make_small(-1), make_small(KEYS), make_small(999)] {
@@ -705,9 +733,11 @@ fn view_tab2list_into(shared: &SharedTable) -> Vec<(i64, i64)> {
     owned.iter().map(|object| pair_of(*object)).collect()
 }
 
-/// Every view-layer traversal visits the objects in exactly `tab2list` order, and
-/// the `*_rev` / `foldr` forms are the exact mirror — for **all four kinds**. An
-/// `ordered_set` is the ascending key order.
+/// Every view-layer traversal visits the objects in exactly `tab2list` order. The
+/// `*_rev` / `foldr` forms are the exact mirror for an `ordered_set` and the
+/// **same** order for the hash kinds (`set`/`bag`/`duplicate_bag`), whose
+/// `last`/`prev` are `first`/`next` (`erl_db_hash.c:853-856`). An `ordered_set` is
+/// the ascending key order.
 #[test]
 fn view_layer_traverses_in_tab2list_order_for_every_kind() {
     for kind in [
@@ -736,10 +766,17 @@ fn view_layer_traverses_in_tab2list_order_for_every_kind() {
             "{kind:?}: tab2list_into order"
         );
 
-        let mut rev_keys = keys.clone();
-        rev_keys.reverse();
-        let mut rev_objects = reference.clone();
-        rev_objects.reverse();
+        // An `ordered_set`'s reverse forms mirror the forward ones; a hash kind's
+        // reverse forms are the same order.
+        let (rev_keys, rev_objects) = if kind.is_ordered() {
+            let mut rev_keys = keys.clone();
+            rev_keys.reverse();
+            let mut rev_objects = reference.clone();
+            rev_objects.reverse();
+            (rev_keys, rev_objects)
+        } else {
+            (keys.clone(), reference.clone())
+        };
         assert_eq!(
             view_keys_rev(&shared, &atoms),
             rev_keys,
