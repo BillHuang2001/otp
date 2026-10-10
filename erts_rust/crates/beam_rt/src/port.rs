@@ -2263,6 +2263,12 @@ mod tests {
     /// one real [`PortRegistry::pump`] — the same read path the runtime's scheduler pass drives
     /// — and a round that reports the exit is still drained for the bytes it read in the very
     /// same round (a reaped child's last bytes and its status arrive together).
+    ///
+    /// `port` must be the fixture's **only** live port: a round drains every live port, so an
+    /// event bearing another port would otherwise be discarded here — and for an `Exited` that
+    /// is unrecoverable, because [`PortRegistry::take_exit_status`] hands a status out exactly
+    /// once. Rather than silently starving the caller, a foreign event fails the helper loudly
+    /// (open one port per fixture at a time, or drive the two strictly one after the other).
     fn pump_events_until_exit(
         registry: &mut PortRegistry,
         port: PortId,
@@ -2273,15 +2279,24 @@ mod tests {
         while Instant::now() < deadline {
             let mut exited = false;
             for event in registry.pump(Duration::from_millis(50)).expect("pump") {
+                // A signal carries no port and no owner (it is node-global), so it is the one
+                // event that says nothing about which port a round drained.
+                let source = match &event {
+                    PortEvent::Data { port, .. }
+                    | PortEvent::Exited { port, .. }
+                    | PortEvent::Term { port, .. } => Some(*port),
+                    PortEvent::Signal { .. } => None,
+                };
+                if let Some(source) = source {
+                    assert_eq!(
+                        source, port,
+                        "another live port produced an event in the round for {port:?}; \
+                         pump one port per fixture at a time"
+                    );
+                }
                 match event {
-                    PortEvent::Data {
-                        port: source,
-                        bytes,
-                        ..
-                    } if source == port => data.push(bytes),
-                    PortEvent::Exited {
-                        port: source, ..
-                    } if source == port => exited = true,
+                    PortEvent::Data { bytes, .. } => data.push(bytes),
+                    PortEvent::Exited { .. } => exited = true,
                     _ => {}
                 }
             }
@@ -2908,36 +2923,38 @@ mod tests {
     /// `stderr_to_stdout` merges the child's stderr into the port's stream; without it the
     /// child's stderr is inherited by the emulator and never reaches the port.
     ///
-    /// The two ports below run the *same* child, so the option is the only difference — which
-    /// is what makes the assertion discriminating rather than incidental. Without the option
-    /// the child's `err` line lands on this test process's own stderr (the C's `dup(2)`
-    /// default), which is why it is absent from the port's stream.
+    /// Both ports run the *same* child (the same executable, `{args, …}` and command line), so
+    /// the option list is the only difference — which is what makes the assertion
+    /// discriminating rather than incidental. Without the option the child's `err` line lands
+    /// on this test process's own stderr (the C's `dup(2)` default), which is why it is absent
+    /// from the port's stream.
+    ///
+    /// The two ports are driven **strictly one after the other**, never concurrently: the
+    /// fixture owns one poller and [`PortRegistry::pump`] drains *every* live port in a round,
+    /// so pumping one port while a second is open would fold the second port's chunks — and its
+    /// one-shot `{Port, {exit_status, …}}` — into a round whose events the first port's helper
+    /// does not keep (`beam_io::PortRegistry::take_exit_status` hands a status out exactly
+    /// once).
     #[test]
     fn the_stderr_to_stdout_option_merges_the_child_stderr_into_the_port_stream() {
         let mut fx = fixture();
         let script = "echo out; echo err >&2";
-        let (name, args) = {
+        let name = {
             let path = fx.string("/bin/sh");
-            let name = fx.name("spawn_executable", path);
-            let args = fx.args_option(&["-c", script]);
-            (name, args)
+            fx.name("spawn_executable", path)
         };
+        let args = fx.args_option(&["-c", script]);
         let binary = fx.atom("binary");
         let exit_status = fx.atom("exit_status");
         let merge = fx.atom("stderr_to_stdout");
+
+        // The merged port first, driven to its exit before the plain port is opened.
         let merged_port = {
             let merged = fx.list(&[binary, merge, exit_status, args]);
             fx.hook
                 .open_port(name, merged)
                 .expect("open_port [binary, stderr_to_stdout, exit_status]")
         };
-        let plain_port = {
-            let plain = fx.list(&[binary, exit_status, args]);
-            fx.hook
-                .open_port(name, plain)
-                .expect("open_port [binary, exit_status]")
-        };
-
         let merged = pump_until_exit(
             &mut fx.registry.borrow_mut(),
             merged_port,
@@ -2949,6 +2966,13 @@ mod tests {
             "the child's stderr is port data, interleaved with stdout in write order"
         );
 
+        // …then the *same* child **without** the option (the option list is the only difference).
+        let plain_port = {
+            let plain = fx.list(&[binary, exit_status, args]);
+            fx.hook
+                .open_port(name, plain)
+                .expect("open_port [binary, exit_status]")
+        };
         let plain = pump_until_exit(
             &mut fx.registry.borrow_mut(),
             plain_port,

@@ -17,6 +17,8 @@ Two "is it empty" predicates: `is_empty()` counts **ports only** (`system_info(p
 `pump` first `watch.sync`s the signal self-pipe into the poller, harvests the already-queued driver output/terms and any handled signal, then polls in `PORT_POLL_SLICE` (25 ms) slices clamped by the earliest driver deadline, runs the port tasks, harvests each driver's `driver_output`, and reports `PortEvent::{Data,Exited,Term,Signal}`; the sentinel `watch::SIGNAL_KEY` readiness event is filtered out before the port consumers see it (no port ever sees the signal pipe).
 `SpawnDriver` is the **single** OS-child implementation (this crate owns only `open_port/2`'s decoding into a term-free `SpawnSpec`/`SpawnOptions`, plus `PortMeta`). `deliver_port_messages` delivers each event into the **owning** process's mailbox: `{Port,{data,..}}`/`{Port,{exit_status,..}}` to `owner`, a driver-emitted term (stabilized onto the pointer-stable arena) to `to.unwrap_or(owner)`, and `{notify, Name}` (sender `system`) to the pid `whereis` resolves for the interned `erl_signal_server` atom — each through `deliver_simple`, so a blocked receiver is woken; `close` calls `beam_io`'s `notify_port_exit(…, Closed)` **before** `registry.close(...)`.
 
+The **read path and the child streams**: one `{Port,{data,Data}}` is built per driver read (`RuntimeContext::port_data_message` in `../port.rs`): a `binary` stream delivers a `binary` **at whatever width the child wrote** — up to `beam_io`'s `READ_CHUNK` (64 KiB) per `read(2)` — built by `beam_codec::term::make_binary` on the pointer-stable `eval_heap` (the on-heap `ErlHeapBits` layout at every width, so `terms::make_heap_binary`'s 64-byte limit never applies), and a `list` stream a char list. The child's **stderr is inherited** from the emulator by default — it is never port data — and the `stderr_to_stdout` option (`PortOptions::stderr_to_stdout`, `PortOptions::overlay`, `PortOptions::stream_options()` → `beam_io::StreamOptions` → `SpawnDriver::with_stream_options`) makes the child's descriptor 2 an exact duplicate of descriptor 1, so its diagnostics arrive as port data interleaved with stdout in true write order (the C's `stderrfd = opts->redir_stderr ? ifd[1] : dup(2)`, `erts/emulator/sys/unix/sys_drivers.c:500`).
+
 ### `port/driver.rs` — the driver C ABI host (A.4)
 `Driver{library, host: Box<DriverPort>}` pairs a loaded driver with the host its callbacks run against (**field order is load-bearing**: the library's `Drop` runs the entry's `finish` before the host drops). `DriverPort` is the concrete `beam_abi::DriverHost` behind the opaque `ErlDrvPort_`: the handle **is** the per-port `DriverEnv`'s address (a driver-private term arena, the shared `AtomTable` + a `PendingInterner`, the owning `ProcessId`, and the output/pid services). `load_driver(candidates, name)` delegates to the **dedicated driver loader `beam_abi::driver::loader::load`** (a real `ErlDrvEntry` loader, distinct from the NIF loader and needing no host), tries each candidate (the loader appends `.so`) and reports the **last** typed error.
 `DriverPort::binary_to_term` (the `DriverHost` hook `erl_drv_binary_to_term` reaches) decodes the driver's bytes with `beam_codec::decode_term`: the decoder needs `&mut AtomTable`, so the shared table is **cloned** (the `beam_bifs::binconv` precedent) and a name the clone appended is recorded on the pending interner at its predicted index (via `intern`, never `intern_atom` — the interner's `base` was fixed when the host was built) for the port's atom-commit step; an invalid image is the C's `ERTS_DDT_FAIL` (`None`), never a raise.
@@ -28,29 +30,29 @@ The `DriverHost` registry hooks carry the C's exact codes: `add_driver_entry`/`r
 **The drain is wired end to end**: `PortRegistry` seizes the handle as `meta.driver_terms` at `open_port/2`, `take_driver_terms` surfaces each queued term as `PortEvent::Term{port, to, term, owner}`, and the pump copies it onto the pointer-stable arena (`RuntimeContext::stabilize_driver_term`) and delivers it to the destination — the connected process for `None`, the explicit pid for `Some`. `tests/driver.rs` pins both paths against the oracle with `EVENT_DRIVER_MODE` 2/3 (`erl_drv_output_term` / `erl_drv_send_term`).
 
 The precise symbols of `driver.rs`:
-- `DriverPort` (`driver.rs:235`) — `impl beam_abi::DriverHost` (`driver.rs:445`); the concrete host behind
+- `DriverPort` (`driver.rs:481`) — `impl beam_abi::DriverHost` (`driver.rs:720`); the concrete host behind
   the opaque `*mut ErlDrvPort_` a driver callback receives. The port handle **is** the per-port
-  `DriverEnv`'s address. Its `binary_to_term` (`driver.rs:621`) is the `beam_codec`-backed decode above.
-- `Driver { library, host: Box<DriverPort> }` (`193`) — field order is load-bearing (`library` drops first).
-- `DriverPortAdapter` (`669`) — `impl beam_io::Driver` over a loaded C driver: `load`/`name`/`state`/`selected`,
+  `DriverEnv`'s address. Its `binary_to_term` (`driver.rs:760`) is the `beam_codec`-backed decode above.
+- `Driver { library, host: Box<DriverPort> }` (`364`) — field order is load-bearing (`library` drops first).
+- `DriverPortAdapter` (`999`) — `impl beam_io::Driver` over a loaded C driver: `load`/`name`/`state`/`selected`,
   plus the callback mapping `start`/`output`/`ready_input`/`ready_output`/`control`/`timeout`/`stop`.
-  `control(command: &str, arg: &[u8])` (`1655`) parses the verb as a `c_uint` and runs the entry's `control`,
+  `control(command: &str, arg: &[u8])` (`1633`) parses the verb as a `c_uint` and runs the entry's `control`,
   with the C's codes (see Known Issues); its reply source is resolved by the associated
-  `control_reply(reply, request, rbuf, len)` (`1446`).
-- `notify_ready(&mut self, ctx, fd: c_int, read: bool)` (`1116`) — runs the entry's `ready_input`/`ready_output`
+  `control_reply(reply, request, rbuf, len)` (`1420`).
+- `notify_ready(&mut self, ctx, fd: c_int, read: bool)` (`1326`) — runs the entry's `ready_input`/`ready_output`
   for one **already-resolved** descriptor (the C's `(ErlDrvEvent) state->fd`); `dispatch_ready(ctx, read)`
-  (`1088`) keeps the resolution half, and an entry with no callback for the direction gets the C's
+  (`1297`) keeps the resolution half, and an entry with no callback for the direction gets the C's
   `no_ready_*_callback` (log *and* deselect, `io.c:7523-7538`) before `settle`. `ready_output` resolves the
   fd itself so it can capture it before the write.
-- `load_driver(candidates, name)` (`810`) — `beam_abi::driver::loader::load` per candidate, reporting the last typed error.
+- `load_driver(candidates, name)` (`949`) — `beam_abi::driver::loader::load` per candidate, reporting the last typed error.
 - The timer family matches the C for **every** live port: the C substitutes a silent `no_timeout_callback`
 when the entry declares no `timeout` slot (`io.c:7601`), so `io.c:6918`'s `-1` stands only for an invalid
 port (`DriverControl::attached == false`); `driver_set_timer` arms the deadline and answers `0`, and a
 fired deadline runs the entry's `timeout` or, when absent, is the C's silent no-op.
 The four driver-registry slots are **all overridden** (not left at no-host defaults):
-  `add_driver_entry` (`565`, → `registry_add_entry`, `0`/`1`), `remove_driver_entry` (`571`, →
-  `registry_remove_entry`, C's `1`/`0`/`-1`), `lock_driver` (`584`, `0` iff `control.driver_loaded`
-  else `-1`), `create_port` (`601`, always `ERTS_INVALID_ERL_DRV_PORT`).
+  `add_driver_entry` (`891`, → `registry_add_entry`, `0`/`1`), `remove_driver_entry` (`897`, →
+  `registry_remove_entry`, C's `1`/`0`/`-1`), `lock_driver` (`910`, `0` iff `control.driver_loaded`
+  else `-1`), `create_port` (`927`, always `ERTS_INVALID_ERL_DRV_PORT`).
 
 ### `port/watch.rs` — the `os:set_signal/2` delivery half (`pub(crate)`)
 One `thread_local!` `FACILITY: RefCell<FacilitySlot>`, holding the facility created lazily by the first `os:set_signal/2` and **never dropped in production** (a per-call facility would be dropped at the end of the call and `SignalFacility::drop` restores the prior dispositions), so a later call observes the disposition an earlier one installed. `HANDLED: RefCell<BTreeSet<Signal>>` mirrors which signals currently hold `Disposition::Handle` (a later `ignore`/`default` removes the entry), so `SignalWatch::is_pollable` answers without a syscall. Accessors `with_facility` (creates on first use) / `with_existing_facility` (never creates). `install(signal, disposition)` sets the disposition and updates the mirror; a failed install leaves the mirror untouched.
@@ -59,9 +61,9 @@ The message itself is `RuntimeContext::signal_notify_message(name)` → `(from, 
 
 ## Constraints
 - Crate is `#![deny(unsafe_code)]`: the registry slots operate over a **thread-local** entry list
-  `DRIVER_ENTRIES` (`358`), not a process-global `DriverTable`. The runtime drives every port on one thread.
-- Every driver callback runs under `publishing` → `beam_abi::with_current_host` (`440`), used at
-  `start` (`994`), `ready_*` (`902`), `output` (`1036`), `timeout` (`1088`) and `stop` (`1129`) — this is
+  `DRIVER_ENTRIES` (`642`), not a process-global `DriverTable`. The runtime drives every port on one thread.
+- Every driver callback runs under `publishing` → `beam_abi::with_current_host` (`715`), used at
+  `start` (`1485`), `ready_*` (`1337`), `output` (`1554`), `timeout` (`1696`) and `stop` (`1737`) — this is
   what lets the two port-less registry slots reach a host during a callback.
 - The `SignalFacility` is a `thread_local` (not a `Runtime` field) for the same reason `context::trace`'s slot is: the runtime is single-threaded (`!Send`), so the slot *is* the process's one facility. A **second** live facility would re-point `beam_io`'s trampoline write end at its own pipe; the one `FacilitySlot` the slot holds — created lazily by the first `os:set_signal/2` and **never dropped** (production never drops the runtime's facility, and a test build `mem::forget`s it in `Drop` so a libtest thread teardown cannot restore the process-global dispositions under a live signal test) — is what prevents that.
 - Never a fabricated success: failures are typed `BeamError`s, and a state/lifecycle it cannot serve
@@ -87,12 +89,12 @@ The message itself is `RuntimeContext::signal_notify_message(name)` → `(from, 
 - The exact success code of the four term-emitting calls differs: the C returns `1` for a well-formed spec, this runtime's `send_term` returns `0` (the **accept/refuse split** agrees and is pinned by the `driver_abi` corpus).
 - `take_exit_status` is always `Ok(None)` — a driver port owns no child, so no `{Port,{exit_status,…}}`.
 - A driver that armed **more than one** registration per direction is a typed `unsupported`
-  (`armed_event`, `875`), never a wrong descriptor.
+  (`armed_event`, `1264`), never a wrong descriptor.
 - `os:set_signal/2`'s notification is **dropped when no `erl_signal_server` is registered** — the C's own behaviour (`signal_notify_requested`, `sys.c:589-604` sends nothing when the process is absent), never an error. The `-eval` receive path (`poll_port_messages`) can only observe its own mailbox, so it drops a `PortEvent::Signal`; the scheduler path (`deliver_port_messages`) is the one that delivers it.
 
 ## Notes for Agents
 - The colocated signal tests share **one** `watch::test_guard()` lock so they serialize on the process-global signal dispositions.
-- Signal tests send with `Command::new("kill") -USR1 <pid>` on `std::process::id()` — **never** `libc::raise`, which would need `unsafe`. A test that calls `run_scheduled` must account for the port loop parking (the scheduler's quiescence predicate; see Handoffs).
+- Signal tests send with `Command::new("kill") -USR1 <pid>` on `std::process::id()` — **never** `libc::raise`, which would need `unsafe`. A test that calls `run_scheduled` must account for the port loop parking (the scheduler's quiescence predicate — `Runtime::is_nt` reads `PortRegistry::has_nothing_to_poll`; see `../runtime/CONTEXT.md`).
 
 ## Test Strategy
 - Colocated units in `../port.rs`: every `Name` form + option (`{fd,N}` over a socket pair), an empty
@@ -101,6 +103,18 @@ The message itself is `RuntimeContext::signal_notify_message(name)` → `(from, 
   `TermQueue` drain, `stabilize_driver_term`, and the signal delivery end to end
   (`a_handled_signal_is_delivered_to_the_registered_signal_server`, the no-server drop, a second signal,
   `ignore`/`default` leaving nothing pollable, and a zero-port runtime still polling a registered watch).
+- The **read path** is pinned colocated too, over a real child and the real pump the scheduler pass
+  drives: `a_binary_stream_message_is_a_binary_of_every_width` (`port_data_message`'s two stream shapes
+  plus the interned `data` atom), `a_wide_binary_stream_read_is_delivered_at_full_width` (a 200-byte child
+  write arrives in full, oracle-cross-checked on the width) and
+  `the_stderr_to_stdout_option_merges_the_child_stderr_into_the_port_stream` (`out\nerr\n` with the option,
+  `out\n` without it — the same child, only the option list differs). They share `pump_events_until_exit`
+  (one real `PortRegistry::pump` per round, returning the target port's chunks up to its `Exited`), its
+  `pump_until_exit` and `Fixture::args_option` helpers; the helper requires the target port to be the
+  fixture's **only live port** (a round drains every live port and `beam_io::PortRegistry::take_exit_status`
+  hands a status out once, so a foreign event would be lost) and fails loudly rather than starving the
+  caller. The oracle cross-checks run through `erl_eval`, which prints a **loud** skip banner when no
+  usable `erl` is on `PATH`.
 - Colocated units in `driver.rs`: the registry-slot codes, the thread-local entry list, the
   `armed_event` rejection, and `binary_to_term` (a decoded image, an invalid one → `None`).
 - The A.4 **write-path regression suite** `driver/ready_output_tests.rs` (`a_queued_port_command_reaches_output_with_a_writable_descriptor_armed`
@@ -115,6 +129,19 @@ The message itself is `RuntimeContext::signal_notify_message(name)` → `(from, 
   imports no `driver_*` symbol and is handed `driver_select`/`driver_output` as two `%lx` addresses in the
   loader's `command` string, which its `start` calls through; the test skips **loudly** without `cc` or
   `erl_driver.h`.
+- The two sibling end-to-end driver suites share that fixture pattern (a real C driver `.so` compiled at
+  test time from an `RT_*` env-var-selected source, a **loud** `SKIP:` banner without `cc`/`erl_driver.h`,
+  and the same `--lib`-link constraint: the fixture imports no `driver_*` symbol and receives the host
+  functions it needs — plus a **marker file** path — in the loader's `command` string).
+  `driver/control_tests.rs` pins the port-control matrix of `DriverPortAdapter::control`
+  (`call_driver_control`, `io.c:4024-4078`) over the real `PortRegistry::port_control` entry point: the
+  reply verbs `RT_CTL_REVERSE`/`FIXED`/`NIL`/`FOREIGN`/`NEGATIVE`, the absent-slot `badarg`
+  (`RT_CTL_HAS_CONTROL=0`), and the `C:<cmd>:<len>` marker proving the verb arrived as the **parsed
+  integer** with the request's real length. `driver/stop_select_tests.rs` pins the
+  `driver_select(port, event, ERL_DRV_USE, 0)` → `stop_select` handback (`erl_check_io.c:1177-1193`,
+  `:1212-1216`), discriminating the `ERL_DRV_USE_NO_CALLBACK` cancel bit from a plain direction deselect;
+  a `stop_select` callback is handed an `ErlDrvEvent` and **no** `ErlDrvData`, so its marker file records
+  both the armed descriptor (`A:<fd>`) and the handed-back event (`S:<event>`).
 - Colocated units in `watch.rs`: nothing-to-poll with no disposition, the self-pipe registered once, and
   `ready`/`drain` over a really-sent signal; plus `#[cfg(test)]` `test_guard`/`pending`/`send_to_self`/
   `wait_until_pending` helpers shared by the three signal test modules. Every watch assertion about a
@@ -130,6 +157,8 @@ The message itself is `RuntimeContext::signal_notify_message(name)` → `(from, 
 ## Routing Table
 - `driver.rs` → the A.4 host + `beam_io::Driver` lifecycle above.
 - `driver/ready_output_tests.rs` → the A.4 write-path regression suite (a real C driver `.so` compiled at test time).
+- `driver/control_tests.rs` → the A.4 port-control regression suite (the reply-verb matrix + the absent slot).
+- `driver/stop_select_tests.rs` → the A.4 `ERL_DRV_USE`/`stop_select` handback regression suite.
 - `watch.rs` → the `os:set_signal/2` delivery half (facility + `SignalWatch` + the `{notify,Signal}` name builder).
 - `../port.rs` → the A.4 `PortHook` provider, the poller/`PortRegistry`, the port-task round and the message builders.
 - `../native/port.rs` → the native `port_command/2,3` + `port_info` closed-port/`registered_name` floor.
@@ -141,3 +170,5 @@ The message itself is `RuntimeContext::signal_notify_message(name)` → `(from, 
 
 ## Handoffs (owned by OTHER nodes)
 - **`beam_abi`** — `DriverHost::r#async` needs a **safe** runner for the async `invoke`/`free` pair (e.g. `DriverLibrary::invoke_async(invoke, data)` + a `free` counterpart); `ready_async` is already safely callable, so only those two are missing.
+- **`beam_abi` / `beam_io`** — a **safe reply-copy** helper for a `control` reply the driver answered from memory of its own, so the one remaining driver-`control` gap can close. The copy already exists as an `unsafe` slice read inside `impl Driver for DriverPort` (`beam_io/src/abi/port.rs:710-747`; after `control` returns `cres ≥ 0` and `rbuf` non-null, `core::slice::from_raw_parts(rbuf, n)` at `:745`), but `beam_rt` never names `beam_io::abi` and is `#![deny(unsafe_code)]`, and the frozen `beam_abi::DriverLibrary::control` (`driver/loader.rs:288`) reports only the `cres` and the re-pointed `*mut c_char` — dereferencing it is the caller's `unsafe`. The helper belongs on `beam_abi`'s `DriverLibrary` (e.g. a `control_reply` that returns the copied bytes) or on `beam_io`'s public wrapper, never as a re-derived `unsafe` block in `port/driver.rs`; until it exists `DriverPortAdapter::control_reply` answers the typed *unsupported*.
+- **`beam_bifs` / `beam_rt::native`** — the port-control BIF arm. The `beam_bifs::PortHook` trait declares only `open_port`/`close_port`/`port_info` (`beam_bifs/src/context.rs:198-220`), so the runtime's own entry point `RuntimePorts::port_control` (`../port.rs:1280`) has no caller: the arm needs a `PortHook::port_control(&mut self, port: PortId, op: &str, arg: &[u8]) -> Result<Vec<u8>>` method plus the `erts_internal:port_control/3` entry in `../native/`. Until then `erlang:port_control/3` stays in `../error.rs`'s `KNOWN_UNIMPLEMENTED_ERLANG_BIFS` and raises `unsupported: erlang:port_control/3`.
