@@ -67,7 +67,6 @@
 %%     producing A), and
 %%   * A is defined by a single instruction which is one of:
 %%       - `put_tuple`/`put_tuple2` (a freshly allocated heap tuple),
-%%       - `bs_init_writable` or an allocating `bs_create_bin`,
 %%       - a local `call` to a fresh returning function,
 %%       - an `update_record` already carrying the `inplace` hint (an
 %%         in-place update returns the same now-private object), or
@@ -134,6 +133,41 @@
 %% freshness or the position rule cannot be proven the hint is left
 %% untouched and the code falls back to copying, so the transform never
 %% weakens a `copy`/`reuse` that was required for safety.
+%%
+%% == Why only tuples are accepted as an update source ==
+%%
+%% A fresh value is only accepted as the source of an `inplace'
+%% `update_record' when it is provably a *heap tuple*. Beside
+%% `put_tuple`/`put_tuple2` that is the case for an already-`inplace'
+%% `update_record' (whose own source is a tuple by the same argument), for a
+%% local call to a function all of whose returns are so proven, and for a phi
+%% all of whose incoming values are so proven. The two allocating binary
+%% instructions, `bs_init_writable` and an allocating `bs_create_bin`, are
+%% deliberately *not* freshness sources, even though they do allocate a fresh
+%% binary: an `update_record' whose source is a binary is not a valid
+%% instruction. Neither the interpreter nor the JIT checks the source of an
+%% `update_record' for being a tuple before it untags it and writes to it
+%% (`i_update_record_copy'/`i_update_record_in_place' in
+%% erts/emulator/beam/emu/instrs.tab do `tuple_val($Src)' unconditionally), so
+%% every `update_record' the compiler emits relies on the source *being* a
+%% tuple at run time. When the type analysis cannot prove that, the code
+%% generator emits an `is_tagged_tuple' (or `is_tuple') test that raises
+%% badarg in front of the update; that test is added long after this pass has
+%% run, so this pass must not license an `inplace' write to a source it only
+%% knows to be a fresh *binary*: the harmless `copy' of a non-tuple turns into
+%% an untagged pointer write into whatever `tuple_val/1' happens to compute,
+%% i.e. silent heap corruption rather than a clean badarg. Excluding the two
+%% binary constructors costs nothing: a binary can never be the source of a
+%% valid `update_record', so no sound rewrite is lost. It also removes the
+%% related subtleties of a binary that is still being built (an allocating
+%% `bs_create_bin' can read values with a `get_tail' segment) and of the
+%% `private_append' chain `beam_ssa_destructive_update' builds on top of
+%% `bs_init_writable'.
+%%
+%% For the same reason the `{succeeded,_}' guard of an instruction is not
+%% counted as a use (see scan_is/5): it names the checked instruction's result
+%% only to keep the pair together for the code generator, it materializes a
+%% boolean, and it therefore does not create a second reference to the value.
 %%
 %% == Known limitation: lists and maps ==
 %%
@@ -347,14 +381,6 @@ is_fresh_def(Ctx, #b_set{op=Op,args=Args}, Visiting) ->
             true;
         put_tuple2 ->
             true;
-        bs_init_writable ->
-            true;
-        bs_create_bin ->
-            %% A binary constructed in one go allocates a fresh binary.
-            case Args of
-                [#b_literal{val=alloc}|_] -> true;
-                _ -> false
-            end;
         call ->
             case Args of
                 [#b_local{}=Callee|_] ->
