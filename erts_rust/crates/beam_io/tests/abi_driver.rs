@@ -46,13 +46,16 @@
 //! `driver_select(READ|USE_NO_CALLBACK)`, `11` `driver_select(READ)`, `12`
 //! `driver_select(READ, 0)`, `13` a fixed reply re-pointed at the driver's own buffer, `14`–`16`
 //! the `driver_async` completions owned by a `ready_async`/`async_free` (the latter the subject of
-//! `tests/abi_async.rs`) and `17`/`18` the sticky `ERL_DRV_USE` re-selections; any
+//! `tests/abi_async.rs`) and `17`/`18` the sticky `ERL_DRV_USE` re-selections, `19`–`22`
+//! `driver_enq`/`driver_sizeq`/`driver_peekq`/`driver_deq` (the driver's own queue) and `23`/`24`
+//! `driver_peekqv` / a `driver_select(WRITE)` arm on `fd=<n>`; any
 //! other verb answers the negative `cres` that `port_control/3` reports as `badarg`. Its `output`
 //! echoes via `driver_output`, its `ready_input` reads the selected fd and `driver_output`s the
 //! bytes, its `ready_output` emits `"W"`, its `timeout` emits `"T"`, its `ready_async`/`async_free`
 //! log their arm and its `stop_select` appends
 //! `stop_select` to the log — so every callback's firing is observable as port data or as a log
-//! line.
+//! line. `tests/fixtures/host_driver_both.c` is the same fixture with the entry's `outputv` slot
+//! set, so it declares all three write-side callbacks at once.
 //!
 //! # Skip-vs-fail policy
 //!
@@ -819,6 +822,319 @@ fn port_control_returns_the_drivers_reply_bytes() {
         .port_control(&mut poller, id, "not-a-number", &[])
         .expect_err("a non-numeric verb must fail");
     assert_eq!(err.as_atom(), Some("badarg"));
+
+    registry.close(&mut poller, id).expect("the port closes");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The driver queue: `driver_enq`/`driver_sizeq`/`driver_peekq[v]`/`driver_deq`
+// ---------------------------------------------------------------------------------------------
+//
+// A driver's own queue (the C's `prt->ioq`) is filled and drained by the `driver_enq*`/`driver_deq`
+// family and is deliberately **not** the port's Erlang→driver output queue — see `AbiHost::enq` for
+// why merging them would re-deliver a driver's own bytes to its `outputv` (`inet_drv`'s `tcp_sendv`
+// would then frame them a second time). The fixture's control verbs 19–23 drive the family and
+// report each observation as `key=value` text whose trailing `bytes=` field carries the raw byte
+// payload, so these tests read the queue back directly.
+
+/// The C's `(ErlDrvSizeT)-1` — `driver_deq`'s failure answer (the queue was left untouched).
+const ERL_DRV_NO_SIZE: u64 = u64::MAX;
+
+/// The bytes after the reply's `bytes=` marker (its trailing raw payload), or empty when the reply
+/// carries no such field.
+fn reply_bytes(reply: &[u8]) -> Vec<u8> {
+    const MARKER: &[u8] = b"bytes=";
+    match reply
+        .windows(MARKER.len())
+        .position(|window| window == MARKER)
+    {
+        Some(at) => reply[at + MARKER.len()..].to_vec(),
+        None => Vec::new(),
+    }
+}
+
+/// The value of the `key=<decimal>` field named `key` in a fixture queue-verb reply. Only the
+/// header (everything before the trailing `bytes=` payload) is scanned, so the payload's arbitrary
+/// bytes can never be mistaken for a field.
+fn reply_field(reply: &[u8], key: &str) -> u64 {
+    const MARKER: &[u8] = b"bytes=";
+    let header = match reply
+        .windows(MARKER.len())
+        .position(|window| window == MARKER)
+    {
+        Some(at) => &reply[..at],
+        None => reply,
+    };
+    let text = std::str::from_utf8(header).expect("the fixture's queue report header is ASCII");
+    let want = format!("{key}=");
+    let raw = text
+        .split_ascii_whitespace()
+        .find_map(|field| field.strip_prefix(want.as_str()))
+        .unwrap_or_else(|| panic!("the fixture reply {text:?} has no `{key}=` field"));
+    raw.parse::<u64>()
+        .unwrap_or_else(|err| panic!("the `{key}` field {raw:?} is not a decimal number: {err}"))
+}
+
+/// Control verb `19`: `driver_enq` `bytes` on the port's driver queue; returns the host's code.
+fn queue_enq(poller: &mut Poller, registry: &mut PortRegistry, id: PortId, bytes: &[u8]) -> u64 {
+    let reply = registry
+        .port_control(poller, id, "19", bytes)
+        .expect("control verb 19 runs `driver_enq`");
+    reply_field(&reply, "enq")
+}
+
+/// Control verb `20`: `driver_sizeq`.
+fn queue_size(poller: &mut Poller, registry: &mut PortRegistry, id: PortId) -> u64 {
+    let reply = registry
+        .port_control(poller, id, "20", &[])
+        .expect("control verb 20 runs `driver_sizeq`");
+    reply_field(&reply, "size")
+}
+
+/// Control verb `21`: `driver_peekq` — `(vlen, head bytes)`.
+fn queue_peek(poller: &mut Poller, registry: &mut PortRegistry, id: PortId) -> (i64, Vec<u8>) {
+    let reply = registry
+        .port_control(poller, id, "21", &[])
+        .expect("control verb 21 runs `driver_peekq`");
+    (reply_field(&reply, "vlen") as i64, reply_bytes(&reply))
+}
+
+/// Control verb `23`: `driver_peekqv` — `(vsize, head bytes)`.
+fn queue_peekv(poller: &mut Poller, registry: &mut PortRegistry, id: PortId) -> (i64, Vec<u8>) {
+    let reply = registry
+        .port_control(poller, id, "23", &[])
+        .expect("control verb 23 runs `driver_peekqv`");
+    (reply_field(&reply, "qvsize") as i64, reply_bytes(&reply))
+}
+
+/// Control verb `22`: `driver_deq(n)`; returns the C's answer — the new queue size, or
+/// [`ERL_DRV_NO_SIZE`] when `n` exceeds the queue.
+fn queue_deq(poller: &mut Poller, registry: &mut PortRegistry, id: PortId, n: i32) -> u64 {
+    let reply = registry
+        .port_control(poller, id, "22", &n.to_le_bytes())
+        .expect("control verb 22 runs `driver_deq`");
+    reply_field(&reply, "deq")
+}
+
+/// The driver-queue family round trips through a real `dlopen`ed port without losing or duplicating
+/// a byte: `driver_enq` → `driver_sizeq` → `driver_peekq[v]` → `driver_deq`.
+///
+/// The queue is the host's driver-private byte queue (see the section comment above), so the four
+/// steps are driven in order through the fixture's control verbs and each observation is read back
+/// from the reply.
+#[test]
+fn the_driver_queue_round_trips_enq_size_peek_and_deq() {
+    let Some(so) = fixture_so() else {
+        return;
+    };
+    let (host, _state) = TestPortHost::new();
+    let (mut poller, mut registry, id) = open_port(&so, "", host);
+
+    // A fresh port's driver queue is empty: size 0, an empty peek view in both forms.
+    assert_eq!(
+        queue_size(&mut poller, &mut registry, id),
+        0,
+        "a fresh port's driver queue is empty"
+    );
+    assert_eq!(queue_peek(&mut poller, &mut registry, id), (0, Vec::new()));
+    assert_eq!(queue_peekv(&mut poller, &mut registry, id), (0, Vec::new()));
+
+    // An empty enqueue is the C's early return: it succeeds and queues nothing.
+    assert_eq!(queue_enq(&mut poller, &mut registry, id, b""), 0);
+    assert_eq!(queue_size(&mut poller, &mut registry, id), 0);
+
+    // Three `driver_enq` calls accumulate in order.
+    for part in [&b"AAA"[..], b"BB", b"C"] {
+        assert_eq!(
+            queue_enq(&mut poller, &mut registry, id, part),
+            0,
+            "driver_enq reports the C's 0 on success"
+        );
+    }
+    assert_eq!(
+        queue_size(&mut poller, &mut registry, id),
+        6,
+        "3 + 2 + 1 bytes are queued"
+    );
+
+    // `driver_peekq` reports the whole head in enqueue order. The host publishes it as one
+    // contiguous iovec entry (its documented `vlen == 1` deviation from the C's per-enqueue
+    // chunking), so the assertion pins the order, not the chunking.
+    assert_eq!(
+        queue_peek(&mut poller, &mut registry, id),
+        (1, b"AAABBC".to_vec()),
+        "the queued bytes come back in enqueue order"
+    );
+    // The vector form (`driver_peekqv`) reports the same head.
+    assert_eq!(
+        queue_peekv(&mut poller, &mut registry, id),
+        (1, b"AAABBC".to_vec()),
+        "the vector peek reports the same bytes"
+    );
+
+    // `driver_deq(0)` is the C's no-op: it reports the unchanged size.
+    assert_eq!(queue_deq(&mut poller, &mut registry, id, 0), 6);
+
+    // `driver_deq(4)` drops exactly the four head bytes and returns the new size.
+    assert_eq!(
+        queue_deq(&mut poller, &mut registry, id, 4),
+        2,
+        "four bytes dropped leaves two"
+    );
+    assert_eq!(
+        queue_peek(&mut poller, &mut registry, id),
+        (1, b"BC".to_vec()),
+        "exactly the four head bytes went away: nothing lost, nothing duplicated"
+    );
+
+    // A `driver_deq` past the queue is the C's failure: it answers `(ErlDrvSizeT)-1` and leaves the
+    // queue untouched (`erts_ioq_deq`'s `q->size < size` branch).
+    assert_eq!(
+        queue_deq(&mut poller, &mut registry, id, 5),
+        ERL_DRV_NO_SIZE,
+        "dequeuing more than the queue holds is the C's failure, not a clamp"
+    );
+    assert_eq!(
+        queue_size(&mut poller, &mut registry, id),
+        2,
+        "a failed deq leaves the queue exactly as it was"
+    );
+    assert_eq!(
+        queue_peek(&mut poller, &mut registry, id),
+        (1, b"BC".to_vec())
+    );
+
+    // Draining the rest empties the queue again.
+    assert_eq!(queue_deq(&mut poller, &mut registry, id, 2), 0);
+    assert_eq!(queue_peek(&mut poller, &mut registry, id), (0, Vec::new()));
+    assert_eq!(queue_peekv(&mut poller, &mut registry, id), (0, Vec::new()));
+
+    registry.close(&mut poller, id).expect("the port closes");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The `outputv`-over-`output` preference, with all three write-side slots declared at once
+// ---------------------------------------------------------------------------------------------
+
+/// An entry that declares **both** `outputv` and `output` (and `ready_output`) gets the C's
+/// preference: `outputv` runs for a `port_command` and `output` never does — and the entry's
+/// `ready_output` still runs **after** the write.
+///
+/// The C's write path is `if (drv->outputv) { … } else { … drv->output … }` (`io.c:1782`), so a
+/// driver that declares both callbacks must never see the plain one. `host_driver_both.c` is the
+/// fixture `host_driver.c` with the entry's `outputv` slot set, so it is the one build whose entry
+/// declares all three at once; its `outputv` logs `outputv` and echoes the data, its `output` logs
+/// `output`, and its `ready_output` emits `"W"` — so the callback that ran and the order they ran
+/// in are both observable.
+#[test]
+fn an_entry_with_outputv_and_output_prefers_outputv_then_runs_ready_output() {
+    let Some(so) = both_fixture_so() else {
+        return;
+    };
+    let (host, _state) = TestPortHost::new();
+    let probe = logged_port_command("both-write-callbacks");
+    let (mut poller, mut registry, id) = open_port(&so, &probe.command, host);
+
+    // A `port_command` queues the bytes and schedules an `OUTPUT` task; running that task takes the
+    // bytes down the write path and then runs the entry's write-readiness notification.
+    registry
+        .port_command(&mut poller, id, b"hello", PortCommandOptions::EMPTY)
+        .expect("the command is queued");
+    let outcome = registry
+        .execute_port_tasks(&mut poller, DEFAULT_READINESS_RED_BUDGET)
+        .expect("the OUTPUT task runs");
+    assert_eq!(outcome.ran, 1, "the queued command schedules one task");
+
+    // `outputv` echoes `hello` and `ready_output` emits `W`, coalesced by the port's input queue in
+    // that order — the write happened first, the readiness notification after it.
+    assert_eq!(
+        data_of(&outcome, id),
+        vec![b"helloW".to_vec()],
+        "the vector write ran, then the entry's write-readiness notification"
+    );
+
+    let lines = log_lines(&probe.log);
+    assert_eq!(
+        count_line(&lines, "outputv"),
+        1,
+        "the entry's `outputv` slot ran (the C prefers the vector callback, io.c:1782); log = {lines:?}"
+    );
+    assert_eq!(
+        count_line(&lines, "output"),
+        0,
+        "the entry's plain `output` slot must NOT run when `outputv` exists; log = {lines:?}"
+    );
+
+    registry.close(&mut poller, id).expect("the port closes");
+}
+
+// ---------------------------------------------------------------------------------------------
+// A write-readiness-only `OUTPUT` task: `ready_output` without the write path
+// ---------------------------------------------------------------------------------------------
+
+/// An `OUTPUT` task scheduled purely by **write readiness** — with an empty command queue — runs the
+/// entry's `ready_output` slot but must **not** invoke the driver's `output`/`outputv` write path.
+///
+/// The C's `ERTS_PORT_TASK_OUTPUT` arm runs only the entry's `ready_output`
+/// (`erl_port_task.c:1790-1797`); the port-command delivery is a separate event (`io.c:1782`). A
+/// driver that armed `ERL_DRV_WRITE` and is notified of writability with nothing to write must
+/// therefore get no `output`/`outputv` call — a zero-length vector `inet_drv`'s `tcp_sendv` would
+/// otherwise prepend its `{packet,N}` length header to (`inet_drv.c:13756-13770`). The fixture's
+/// `output` logs `output`, so its absence is the evidence the write path did not run;
+/// `host_ready_output` emits `"W"`, which is the evidence the notification did.
+#[test]
+fn a_write_readiness_only_task_runs_ready_output_but_not_the_write_path() {
+    let Some(so) = fixture_so() else {
+        return;
+    };
+    let (host, _state) = TestPortHost::new();
+    let probe = logged_port_command("write-readiness-empty-queue");
+    let (mut poller, mut registry, id) = open_port(&so, &probe.command, host);
+
+    // Control verb 24 arms `ERL_DRV_WRITE` on the configured fd. The `PortArms` gate drops a
+    // readiness event for a direction the driver never armed, so the arm must come first.
+    registry
+        .port_control(&mut poller, id, "24", &[])
+        .expect("control verb 24 arms ERL_DRV_WRITE");
+    assert_eq!(
+        poller.len(),
+        1,
+        "the write selection registered the fd with the reactor"
+    );
+
+    // A write-only readiness event with an empty output queue still schedules the `OUTPUT` task.
+    assert!(
+        registry.schedule_readiness(
+            id.number(),
+            Readiness {
+                writable: true,
+                ..Readiness::default()
+            }
+        ),
+        "the key names a live port"
+    );
+    let outcome = registry
+        .execute_port_tasks(&mut poller, DEFAULT_READINESS_RED_BUDGET)
+        .expect("the OUTPUT task runs");
+    assert_eq!(
+        outcome.ran, 1,
+        "the write-readiness event scheduled exactly one task"
+    );
+
+    // The entry's `ready_output` ran (it emits `W`)...
+    assert_eq!(
+        data_of(&outcome, id),
+        vec![b"W".to_vec()],
+        "the entry's ready_output slot fired for the write-readiness notification"
+    );
+    // ...and the write path did not: the fixture's `output` is the only thing that logs `output`, and
+    // it must not be handed an empty buffer.
+    let lines = log_lines(&probe.log);
+    assert_eq!(
+        count_line(&lines, "output"),
+        0,
+        "an empty output queue must not reach the driver's output callback; log = {lines:?}"
+    );
 
     registry.close(&mut poller, id).expect("the port closes");
 }
