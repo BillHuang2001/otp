@@ -251,8 +251,20 @@ SMP pool:
     `Message::new(payload, from).with_token(..).with_off_heap(..)` form, which drops `fragments`/
     `binaries`/`nodes`) — verified by temporarily restoring step 6, then reverting. Deterministic — the
     fragment/ownership assertions, no sleeps / wall-clock bounds / oracle.
-
-## Constraints
+34. `off_heap_send_isolation.rs` (2 tests) — the **send-path staging-table isolation**: `Process::deliver`
+    stages its copy through a fresh per-send `OffHeapTable`, so a send must NOT drain the receiver's
+    **persistent** off-heap table (a queued signal's reason objects / a host's moved-fragment objects). A
+    200-byte refc binary pushed onto `process.off_heap_mut()` stays present with the same
+    `data_ptr`/refcount after a delivery to that same process, and the queued message owns only what it
+    copied (a payload that really references an off-heap binary is still captured). **Both tests FAIL on
+    the pre-fix code** (which passed `self.off_heap` as the drained destination) — verified by reverting.
+35. `message_from_is_immediate.rs` (6 tests) — every signal path's `Message::from` is an **immediate**
+    (the C's `is_immed(ERL_MESSAGE_FROM)` invariant) and survives a collection: a named-monitor DOWN
+    (`from == target.to_eterm()`, body still `{Name,Node}`), an ordinary-monitor DOWN, a failed-by-name
+    named-monitor DOWN (`from == system`), a remote DOWN and a remote EXIT (`from == node`, body still the
+    external pid), and the collection case (a nursery GC then `is_immediate(from)` + `from` unchanged,
+    the relocated payload still carrying `{Name,Node}`). **5 of the 6 FAIL on the pre-fix code** (which
+    stored an on-heap `from`) — verified by reverting.## Constraints
 - **Anti-flakiness (BINDING).** Every assertion is forced by **synchronization**, never a bare
   `std::thread::sleep`: `mpsc` channels + `recv_timeout` carry the completion signals,
   `std::sync::Barrier`/gates coordinate concurrency, and `SchedulerPool::wait_idle(Some(timeout))` is
