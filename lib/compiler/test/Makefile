@@ -82,8 +82,8 @@ MODULES= \
 	z_SUITE \
 	zlc_SUITE \
 	test_lib \
+	stage2_suite_driver \
         erl_md5
-
 NO_BOOL_OPT= \
 	guard \
 	andor
