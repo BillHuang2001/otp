@@ -1942,6 +1942,14 @@ mod stop_select_tests;
 /// absent-slot build) and the reply-source rule of [`DriverPortAdapter::control_reply`].
 #[cfg(test)]
 mod control_tests;
+
+/// The A.4 **driver-private queue / one-PDL / port-flags hook regression suite** for
+/// [`DriverPort`]'s [`beam_abi::DriverHost`] implementation — the `prt->ioq` behind
+/// `driver_enq`/`driver_pushq`/`driver_deq`/`driver_sizeq`/`driver_peekq`, the one-PDL rule behind
+/// `driver_pdl_create`, and the port state flags `driver_get_port_flags` reports. A separate file
+/// because the C entry points themselves are not nameable from this crate (see its module docs).
+#[cfg(test)]
+mod hooks_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
