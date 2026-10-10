@@ -18,9 +18,10 @@
 //
 // %CopyrightEnd%
 
-//! Integration tests for the [`tcp_inet` driver](super)'s **read-path packet framing** — the
-//! `{packet, N}` decode implemented in [`super::frame`] and wired into the `recv` verb and
-//! [`super::TcpInetDriver::read_available`].
+//! Integration tests for the [`tcp_inet` driver](super)'s **packet framing** — the `{packet, N}`
+//! decode implemented in [`super::frame`] and wired into the `recv` verb and
+//! [`super::TcpInetDriver::read_available`], plus its **write-side counterpart**: the length
+//! header the `send` verb prepends under `{packet, 1|2|4}` (the C's `tcp_sendv`/`tcp_send`).
 //!
 //! Split from the driver's own `tests.rs` suite (which is a sibling, concurrently edited file)
 //! and kept separate because it drives the framing path over **real loopback sockets** and
@@ -30,14 +31,13 @@
 //! accepted descriptor (ownership is moved with [`IntoRawFd`]), and a raw `std::net::TcpStream`
 //! plays the peer so the bytes on the wire are exactly the test's own.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::io::IntoRawFd;
 use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
-
 use beam_common::Result;
 use beam_process::PortId;
 
@@ -423,12 +423,117 @@ fn an_unsupported_packet_type_is_a_typed_error_never_a_wrong_frame() {
 }
 
 // -----------------------------------------------------------------------
-// The oracle cross-check: the payloads real `gen_tcp` produces
+// The write path frames under {packet, 1|2|4} too
 // -----------------------------------------------------------------------
 
+/// Sends `payload` through the port's `send` verb and returns the exact `wire` bytes that reach
+/// the peer.
+///
+/// The peer reads precisely `wire` bytes: a missing header byte (the defect this covers) leaves
+/// `read_exact` short and fails the test, and an extra one is visible in the returned bytes —
+/// neither can be absorbed by the stream.
+fn send_and_capture(
+    registry: &mut PortRegistry,
+    poller: &mut Poller,
+    id: PortId,
+    client: &mut TcpStream,
+    wire: usize,
+    payload: &[u8],
+) -> Vec<u8> {
+    client
+        .set_read_timeout(Some(WAIT))
+        .expect("a read timeout");
+    assert_eq!(
+        control(registry, poller, id, "send", payload),
+        ctl_ok(),
+        "the `send` verb"
+    );
+    let mut got = vec![0u8; wire];
+    client
+        .read_exact(&mut got)
+        .expect("the peer reads exactly the announced bytes");
+    got
+}
+
+/// `{packet, 4}`, `{packet, 2}` and `{packet, 1}`: the `send` verb prepends the same big-endian
+/// length header the C's `tcp_sendv` does (`inet_drv.c:13745`-`:13769`), so the peer's
+/// `packet_get_length` reads the message back as one frame.
+#[test]
+fn a_framed_send_prepends_the_length_header() {
+    let payload: &[u8] = b"abc";
+    for (packet, header) in [
+        (PacketType::Len1, vec![3u8]),
+        (PacketType::Len2, vec![0, 3]),
+        (PacketType::Len4, vec![0, 0, 0, 3]),
+    ] {
+        let mut poller = poller();
+        let (mut registry, id, mut client) = connected_port(&mut poller);
+        set_packet(&mut registry, &mut poller, id, packet);
+
+        let mut expected = header;
+        expected.extend_from_slice(payload);
+        assert_eq!(
+            send_and_capture(
+                &mut registry,
+                &mut poller,
+                id,
+                &mut client,
+                expected.len(),
+                payload
+            ),
+            expected,
+            "{packet:?}: the wire bytes must be the header followed by the payload"
+        );
+        registry.close(&mut poller, id).expect("closes the port");
+    }
+}
+
+/// An **empty** send under a framing code still writes the bare header: the C's shortcut
+/// (`if ((h_len == 0) && (len == 0)) return 0`, `inet_drv.c:13907`) fires only when there is no
+/// header either — the oracle writes `<<0,0,0,0>>` for `{packet,4}` and `<<0>>` for `{packet,1}`.
+#[test]
+fn an_empty_send_under_a_framing_code_writes_the_bare_header() {
+    for (packet, header) in [
+        (PacketType::Len1, vec![0u8]),
+        (PacketType::Len4, vec![0, 0, 0, 0]),
+    ] {
+        let mut poller = poller();
+        let (mut registry, id, mut client) = connected_port(&mut poller);
+        set_packet(&mut registry, &mut poller, id, packet);
+
+        assert_eq!(
+            send_and_capture(&mut registry, &mut poller, id, &mut client, header.len(), b""),
+            header,
+            "{packet:?}: an empty payload still announces a zero-length body"
+        );
+        registry.close(&mut poller, id).expect("closes the port");
+    }
+}
+
+/// `{packet, raw}` — the default, and every code outside `1`/`2`/`4` — is **never** framed: the
+/// payload goes out verbatim (the C's `default: h_len = 0`).
+#[test]
+fn a_raw_send_writes_the_payload_verbatim() {
+    let mut poller = poller();
+    let (mut registry, id, mut client) = connected_port(&mut poller);
+    set_packet(&mut registry, &mut poller, id, PacketType::Raw);
+
+    // The same bytes a `{packet, 4}` send would frame: nothing is prepended here.
+    assert_eq!(
+        send_and_capture(&mut registry, &mut poller, id, &mut client, 3, b"abc"),
+        b"abc",
+        "raw mode puts the payload on the wire untouched"
+    );
+    registry.close(&mut poller, id).expect("closes the port");
+}
+
+// -----------------------------------------------------------------------
+// The oracle cross-check: the payloads real `gen_tcp` produces
+// -----------------------------------------------------------------------
 /// The Erlang `{packet, …}` option whose framing matches `packet`.
 fn erl_packet_option(packet: PacketType) -> &'static str {
     match packet {
+        PacketType::Raw => "{packet,raw}",
         PacketType::Len1 => "{packet,1}",
         PacketType::Len2 => "{packet,2}",
         PacketType::Len4 => "{packet,4}",
@@ -456,6 +561,42 @@ fn oracle_expression(cases: &[(Vec<u8>, PacketType)]) -> String {
            ok = gen_tcp:send(C, Wire), timer:sleep(150), gen_tcp:close(C) end), \
          {{ok,S}} = gen_tcp:accept(L, 2000), \
          {{ok,B}} = gen_tcp:recv(S,0,2000), gen_tcp:close(S), gen_tcp:close(L), B end, \
+         R = [{}], \
+         Sh = fun(Xs) -> lists:flatten(lists:join(\",\", [integer_to_list(V) || V <- Xs])) end, \
+         io:format(\"~s~n\", [lists:flatten(lists:join(\"|\", [Sh(binary_to_list(B)) || B <- R]))])",
+        calls.join(", ")
+    )
+}
+
+/// The Erlang side of the **write**-path cross-check: `gen_tcp` ports with the same framing
+/// options, each sending the same payload through the real `inet` stack while a raw peer reads
+/// the bytes that actually reach the wire, printed as comma-separated byte lists, `|`-separated
+/// between cases. `Total` is one whole frame, so the peer reads exactly one message.
+fn oracle_write_expression(cases: &[(Vec<u8>, PacketType, usize)]) -> String {
+    let calls: Vec<String> = cases
+        .iter()
+        .map(|(payload, packet, total)| {
+            let bytes: Vec<String> = payload.iter().map(u8::to_string).collect();
+            format!(
+                "F({}, <<{}>>, {})",
+                erl_packet_option(*packet),
+                bytes.join(","),
+                total
+            )
+        })
+        .collect();
+    format!(
+        "F = fun(Pkt, Payload, Total) -> \
+         {{ok,L}} = gen_tcp:listen(0, [binary,{{active,false}},{{reuseaddr,true}},Pkt]), \
+         {{ok,P}} = inet:port(L), \
+         Parent = self(), \
+         spawn(fun() -> {{ok,C}} = gen_tcp:connect({{127,0,0,1}},P,[binary,{{active,false}}]), \
+           B = case gen_tcp:recv(C, Total, 2000) of {{ok,X}} -> X; _ -> <<>> end, \
+           Parent ! {{captured,B}}, gen_tcp:close(C) end), \
+         {{ok,S}} = gen_tcp:accept(L, 2000), \
+         ok = gen_tcp:send(S, Payload), \
+         timer:sleep(150), gen_tcp:close(S), gen_tcp:close(L), \
+         receive {{captured,B}} -> B after 3000 -> <<>> end end, \
          R = [{}], \
          Sh = fun(Xs) -> lists:flatten(lists:join(\",\", [integer_to_list(V) || V <- Xs])) end, \
          io:format(\"~s~n\", [lists:flatten(lists:join(\"|\", [Sh(binary_to_list(B)) || B <- R]))])",
@@ -558,6 +699,72 @@ fn the_frame_payloads_agree_with_the_gen_tcp_oracle() {
         assert_eq!(
             rust_payload, oracle_payload,
             "case {index} ({packet:?}, wire {wire:?}) disagrees with gen_tcp"
+        );
+    }
+}
+
+/// The **compatibility gate for the write path**: the bytes this driver puts on the wire for a
+/// `send` must be byte-for-byte what real `gen_tcp:send` puts there for the same payload under
+/// the same `{packet, N}` option.
+///
+/// The oracle runs the real `inet` stack (the C's `tcp_sendv`) with a raw peer reading exactly
+/// one frame, so both sides are compared on the wire — the header included, which is what a
+/// peer's `packet_get_length` relies on. The `{packet, 4}` empty-payload case pins the C's
+/// "a framing code still writes the bare header" detail (`inet_drv.c:13907`).
+///
+/// The oracle is the system `erl` on `PATH`; if it is absent the check **skips loudly**, never
+/// fails.
+#[test]
+fn the_wire_bytes_of_a_framed_send_agree_with_the_gen_tcp_oracle() {
+    // (payload, packet code, the whole frame's length on the wire)
+    let cases: Vec<(Vec<u8>, PacketType, usize)> = vec![
+        (b"abc".to_vec(), PacketType::Len1, 4),
+        (b"abc".to_vec(), PacketType::Len2, 5),
+        (b"abc".to_vec(), PacketType::Len4, 7),
+        (Vec::new(), PacketType::Len4, 4),
+        (b"abc".to_vec(), PacketType::Raw, 3),
+    ];
+
+    // What this driver puts on the wire.
+    let mut rust = Vec::new();
+    for (payload, packet, total) in &cases {
+        let mut poller = poller();
+        let (mut registry, id, mut client) = connected_port(&mut poller);
+        set_packet(&mut registry, &mut poller, id, *packet);
+        rust.push(send_and_capture(
+            &mut registry,
+            &mut poller,
+            id,
+            &mut client,
+            *total,
+            payload,
+        ));
+        registry.close(&mut poller, id).expect("closes the port");
+    }
+
+    // What real `gen_tcp:send` puts there for the same payload.
+    let Some(stdout) = erl_stdout(&oracle_write_expression(&cases)) else {
+        return; // the oracle is unavailable; the check skipped loudly above
+    };
+    let Some(oracle) = parse_payload_dump(&stdout) else {
+        panic!("could not parse the oracle wire dump: {stdout:?}");
+    };
+
+    eprintln!("oracle wire bytes: {oracle:?}");
+    eprintln!("driver wire bytes: {rust:?}");
+    assert_eq!(oracle.len(), cases.len(), "one frame per case: {oracle:?}");
+
+    for (index, ((payload, packet, total), (rust_wire, oracle_wire))) in
+        cases.iter().zip(rust.iter().zip(oracle.iter())).enumerate()
+    {
+        assert_eq!(
+            rust_wire.len(),
+            *total,
+            "case {index} ({packet:?}) is not one whole frame: {rust_wire:?}"
+        );
+        assert_eq!(
+            rust_wire, oracle_wire,
+            "case {index} ({packet:?}, payload {payload:?}) disagrees with gen_tcp"
         );
     }
 }

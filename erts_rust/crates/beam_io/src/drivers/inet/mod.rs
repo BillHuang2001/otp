@@ -113,7 +113,10 @@
 //!   the `recv` verb takes **one** decoded frame's payload out of it — the header stripped and
 //!   the payload delivered as one message ([`self::frame`], over the pure decoder in
 //!   [`self::packet`]). `{packet_size, …}` (`32`) bounds a frame's body (`max_plen`) and
-//!   `{line_delim, …}` (`40`) sets the line delimiter. Decoded: `raw` (`0`), `1`/`2`/`4`
+//!   `{line_delim, …}` (`40`) sets the line delimiter. The `1`/`2`/`4` codes frame **both**
+//!   directions: the read path strips the length header and the `send` verb prepends it (the
+//!   C's `tcp_sendv`/`tcp_send`, `:13745`-`:13769`, `:13861`-`:13877`), while every other code
+//!   takes the C's `default:` arm and writes no header. Decoded: `raw` (`0`), `1`/`2`/`4`
 //!   (`1`/`2`/`3`), `asn1` (`4`), `sunrm`/`rm` (`5`), `cdr` (`6`), `fcgi` (`7`), `line` (`8`)
 //!   and `tpkt` (`9`) — `line` delivers the delimiter (`gen_tcp:recv`'s behaviour, the C's
 //!   `packet_get_body` "as is"). **Absent by design** (a typed error, never a wrong frame): the
@@ -996,10 +999,25 @@ impl TcpInetDriver {
     /// callback in the C; the remainder stays queued (with write readiness armed) exactly as
     /// a short `write(2)` leaves it.
     ///
+    /// Under a `{packet, 1|2|4}` code the payload is **framed on the wire**: the C's
+    /// `tcp_sendv`/`tcp_send` prepend a 1-/2-/4-byte big-endian length header
+    /// (`inet_drv.c:13745`-`:13769`, `:13861`-`:13877`), so the peer's own
+    /// `packet_get_length` reads the message back as a frame — the write-side counterpart of the
+    /// read path's header strip (both live in [`self::frame`]). An **empty** payload still writes
+    /// the bare header: the C's shortcut (`if ((h_len == 0) && (len == 0)) return 0`,
+    /// `inet_drv.c:13907`) fires only when there is no header either, and the oracle agrees.
+    ///
     /// Once the peer's close is known the verb answers `[0] ++ "closed"` **once** and
     /// `[0] ++ "enotconn"` after that (the C's `tcp_inet_commandv` plus its
     /// `TCP_ADDF_DELAYED_CLOSE_SEND` flag, `inet_drv.c:12682`); a `send` whose write is what
     /// discovers the close answers `closed` too.
+    ///
+    /// A `shutdown(SHUT_WR|SHUT_RDWR)` **deferred** because output was still queued
+    /// ([`TcpInetDriver::pending_shutdown`]) rejects a further `send`, exactly as the C does:
+    /// `tcp_inet_commandv` routes it to `tcp_shutdown_error(desc, EPIPE)` (`inet_drv.c:12695`),
+    /// which runs the close path and answers `{error, closed}` (`tcp_send_or_shutdown_error`,
+    /// `:13654`-`:13670`). So this send answers `[0] ++ "closed"`, the queued output is dropped
+    /// and every later one answers `enotconn`.
     ///
     /// # Errors
     ///
@@ -1011,6 +1029,23 @@ impl TcpInetDriver {
         }
         if let Some(name) = self.peer_close.send_reply() {
             return Ok(ctl_xerror(name));
+        }
+        if self.pending_shutdown.is_some() {
+            // A write shutdown could not be applied yet (the queue was not empty), and the C
+            // refuses a further send with `EPIPE` rather than queueing behind it
+            // (`inet_drv.c:12695`): the close path runs, so this send answers `closed` —
+            // consuming the send direction's one-shot reply — the output that can never be
+            // delivered is dropped, the socket is de-registered and every later send answers
+            // `enotconn` (`tcp_send_or_shutdown_error`, `:13654`-`:13670`).
+            self.latch_peer_close(ctx)?;
+            self.peer_close.send_reported = true;
+            return Ok(ctl_xerror("closed"));
+        }
+        // `{packet, 1|2|4}` frames the payload with a length header before the bytes reach the
+        // queue; every other code (raw, line, ASN.1/…, the HTTP family) takes the C's `default:`
+        // arm and writes no header at all.
+        if let Some(header) = frame::write_header(&self.options, arg.len()) {
+            ctx.output().push(&header);
         }
         ctx.output().push(arg);
         let _written = self.write_pending(ctx)?;

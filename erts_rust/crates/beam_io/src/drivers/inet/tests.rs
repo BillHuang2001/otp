@@ -1206,6 +1206,66 @@ fn a_read_side_shutdown_is_never_deferred() {
     );
 }
 
+/// **A `send` after a *deferred* `shutdown` is refused, not queued behind it** — the C's
+/// `tcp_inet_commandv` routes it to `tcp_shutdown_error(desc, EPIPE)` (`inet_drv.c:12695`)
+/// instead of to `tcp_sendv`, and that answers `{error, closed}`, drops the output that can
+/// never be delivered and runs the close path (`tcp_send_or_shutdown_error`, `:13654`-`:13670`).
+///
+/// So the send answers `[0] ++ "closed"` — consuming the send direction's one-shot reply, which
+/// is why the next one is `enotconn` — the socket is de-registered and the queued bytes are gone.
+/// The replies are the ones the *same* C function produces for the reachable half-close sequence,
+/// pinned against the oracle by [`the_send_after_a_shutdown_semantics_agree_with_the_erl_oracle`].
+#[test]
+fn a_send_after_a_deferred_shutdown_is_rejected_and_tears_the_connection_down() {
+    let (mut rig, _client) = Rig::connected();
+    let queued = fill_output_queue(&mut rig);
+    assert!(queued > 0, "the output queue is stalled");
+
+    // The write shutdown cannot be applied yet, so it is deferred (the C's
+    // `TCP_ADDF_PENDING_SHUT_WR`).
+    assert_eq!(
+        rig.control("shutdown", &[TCP_SHUT_WR]).expect("the verb"),
+        ctl_ok()
+    );
+    assert_eq!(rig.driver.pending_shutdown, Some(TCP_SHUT_WR));
+
+    // The further send is the C's `EPIPE` -> `tcp_shutdown_error(desc, EPIPE)`.
+    assert_eq!(
+        rig.control("send", b"late").expect("the send verb"),
+        ctl_xerror("closed"),
+        "the C answers `{{error, closed}}` rather than queueing behind the shutdown"
+    );
+    assert!(rig.driver.peer_closed(), "the close path ran");
+    assert_eq!(
+        rig.driver.pending_shutdown, None,
+        "the deferred shutdown went away with the connection"
+    );
+    assert_eq!(
+        rig.output_len(),
+        0,
+        "the {queued} queued bytes can never reach the peer, so they are dropped"
+    );
+    assert!(
+        rig.driver.token.is_none(),
+        "the socket is de-registered, like every other latched close"
+    );
+
+    // The one-shot bookkeeping is the C's: `enotconn` from the next send on, and the receive
+    // direction still owes its own `closed`.
+    assert_eq!(
+        rig.control("send", b"late").expect("the send verb"),
+        ctl_xerror("enotconn")
+    );
+    assert_eq!(
+        rig.control("recv", b"").expect("the recv verb"),
+        ctl_xerror("closed")
+    );
+    assert_eq!(
+        rig.control("recv", b"").expect("the recv verb"),
+        ctl_xerror("enotconn")
+    );
+}
+
 /// **The latched peer close answers `closed` once per direction, then `enotconn` forever** — and
 /// the close **drops** the output that can never reach the peer (the C's `tcp_clear_output`,
 /// `inet_drv.c:12786`).
@@ -1356,6 +1416,101 @@ fn oracle_half_close_expression() -> String {
      R3 = gen_tcp:recv(S, 0, 5000), \
      io:format(\"~p|~p|~p|~p|~p~n\", [Shut, R1, E, R2, R3])"
         .to_string()
+}
+
+/// The Erlang side of the **send-after-shutdown** cross-check: a real `gen_tcp` write-side
+/// `shutdown`, then two `gen_tcp:send`s and two `gen_tcp:recv`s, printed as
+/// `Shut|S1|S2|R1|R2`.
+///
+/// The C routes a send on a socket whose write side is gone — whether the `shutdown` was applied
+/// at once or deferred behind a queued output (`TCP_ADDF_PENDING_SHUTDOWN`) — through the one
+/// `tcp_send_or_shutdown_error` (`inet_drv.c:13613`), which is why this reachable sequence pins
+/// the replies the deferred case owes too.
+fn oracle_send_after_shutdown_expression() -> String {
+    "{ok, L} = gen_tcp:listen(0, [{ip, {127,0,0,1}}, binary, {active, false}]), \
+     {ok, P} = inet:port(L), \
+     {ok, C} = gen_tcp:connect({127,0,0,1}, P, [binary, {active, false}]), \
+     {ok, S} = gen_tcp:accept(L), \
+     Shut = gen_tcp:shutdown(S, write), \
+     S1 = gen_tcp:send(S, <<\"late\">>), \
+     S2 = gen_tcp:send(S, <<\"late\">>), \
+     R1 = gen_tcp:recv(S, 0, 5000), \
+     R2 = gen_tcp:recv(S, 0, 5000), \
+     io:format(\"~p|~p|~p|~p|~p~n\", [Shut, S1, S2, R1, R2])"
+        .to_string()
+}
+
+/// The **compatibility gate for the send path**: a `send` on a socket whose write side has been
+/// shut down is `{error, closed}` — never a silently accepted write — and the connection is then
+/// gone, so the next `send` is `{error, enotconn}` and the receive direction reports `closed`
+/// once and `enotconn` after that.
+///
+/// The oracle runs the reachable form (an empty output queue, so the `shutdown` is applied at
+/// once); the driver runs the **deferred** form (its queue stalled, which no oracle expression
+/// reproduces deterministically) and must produce the very same replies, because the C sends both
+/// through `tcp_send_or_shutdown_error`.
+#[test]
+fn the_send_after_a_shutdown_semantics_agree_with_the_erl_oracle() {
+    let Some(stdout) = erl_stdout(&oracle_send_after_shutdown_expression()) else {
+        return; // the oracle is unavailable; the check skipped loudly above
+    };
+    let Some(line) = stdout.lines().find(|line| line.contains('|')) else {
+        panic!("could not parse the oracle reply dump: {stdout:?}");
+    };
+    let oracle: Vec<&str> = line.trim().split('|').collect();
+    eprintln!("oracle send-after-shutdown sequence: {oracle:?}");
+    assert_eq!(
+        oracle,
+        vec![
+            "ok",
+            "{error,closed}",
+            "{error,enotconn}",
+            "{error,closed}",
+            "{error,enotconn}",
+        ],
+        "the real inet stack's own sequence"
+    );
+
+    // The driver runs the deferred form of the identical sequence.
+    let (mut rig, _client) = Rig::connected();
+    let queued = fill_output_queue(&mut rig);
+    assert!(queued > 0, "the output queue is stalled");
+
+    // `Shut` — the write shutdown is deferred, and the reply is still the oracle's `ok`.
+    assert_eq!(
+        rig.control("shutdown", &[TCP_SHUT_WR]).expect("the verb"),
+        ctl_ok(),
+        "the oracle's `ok`"
+    );
+    assert_eq!(
+        rig.driver.pending_shutdown,
+        Some(TCP_SHUT_WR),
+        "the deferred form is the one being pinned here"
+    );
+
+    // `S1`/`S2` — the send is refused by the close path: `closed` once, then `enotconn`.
+    assert_eq!(
+        rig.control("send", b"late").expect("the send verb"),
+        ctl_xerror("closed"),
+        "the oracle's `{{error,closed}}`"
+    );
+    assert_eq!(
+        rig.control("send", b"late").expect("the send verb"),
+        ctl_xerror("enotconn"),
+        "the oracle's `{{error,enotconn}}`"
+    );
+
+    // `R1`/`R2` — the receive direction owes its own `closed`, then `enotconn`.
+    assert_eq!(
+        rig.control("recv", b"").expect("the recv verb"),
+        ctl_xerror("closed"),
+        "the oracle's `{{error,closed}}`"
+    );
+    assert_eq!(
+        rig.control("recv", b"").expect("the recv verb"),
+        ctl_xerror("enotconn"),
+        "the oracle's `{{error,enotconn}}`"
+    );
 }
 
 /// The **compatibility gate** for the half-close, the deferred shutdown and the latched peer
