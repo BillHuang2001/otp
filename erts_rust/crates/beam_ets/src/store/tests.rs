@@ -151,9 +151,15 @@
         make_boxed(p as *const Eterm)
     }
 
-    /// Builds a sub-bitstring thing (`[header, bit_offset, bit_size, off_heap_bin,
-    /// pad]`) — a kind that aliases storage outside the term graph and is therefore
-    /// *not* in the copied subset.
+    /// Builds a **malformed** sub-bitstring thing: `[HEADER_SUB_BITS, base_flags,
+    /// start, end, orig]` whose `base_flags` is a **null** pointer and whose bit
+    /// window is non-empty (`start = 0`, `end = 4`), so it names no readable payload.
+    ///
+    /// A well-formed sub-bitstring (and an off-heap refc binary) **is** in the copied
+    /// subset — [`TermStore::copy_sub_bits`] re-materialises it as a self-contained
+    /// on-heap bitstring (see [`build_refc_binary`]/[`build_non_aligned_sub_bits`] for
+    /// the positive fixtures). This shape is the *malformed* one that the null-base
+    /// guard rejects with `badarg` instead of dereferencing a null base.
     ///
     /// # Safety
     ///
@@ -543,9 +549,16 @@
         );
     }
 
-    /// The `badarg` path for term kinds outside the copied subset.
+    /// The `badarg` path for a **malformed** `ErlSubBits`.
+    ///
+    /// A well-formed sub-bitstring is copyable (it is re-materialised on-heap — see
+    /// [`sub_bitstring_copy_is_self_contained`]); this fixture's base pointer is null
+    /// while its bit window is non-empty, so there is no readable payload. `copy`
+    /// rejects it through the null-base guard in [`TermStore::copy_sub_bits`] rather
+    /// than dereferencing null — the typed `badarg` the oracle cannot produce, since
+    /// it cannot represent such a term at all.
     #[test]
-    fn sub_bitstring_is_rejected_with_badarg() {
+    fn malformed_sub_bitstring_is_rejected_with_badarg() {
         let mut heap = Heap::new(16);
         // SAFETY: the heap has room for the 5-word sub-bits thing and outlives it.
         let sub_bits = unsafe { build_sub_bits(&mut heap) };
@@ -784,6 +797,12 @@
 
     /// A copy rejected part-way through hands its partial runs back, so a later copy
     /// of the same shape reuses them instead of mapping another block.
+    ///
+    /// The rejected inner term is the **malformed** `ErlSubBits` fixture (a null base
+    /// with a non-empty window — [`build_sub_bits`]), which hits the null-base guard
+    /// in [`TermStore::copy_sub_bits`]. The outer tuple has already been allocated
+    /// when the rejection happens (the elements are copied before the block is
+    /// reserved), so the rollback path is exactly what is under test.
     #[test]
     fn a_rejected_nested_term_leaks_no_words_and_leaves_them_reusable() {
         let mut heap = Heap::new(32);
