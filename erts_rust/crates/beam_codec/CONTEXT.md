@@ -28,7 +28,7 @@ Signatures only; the wire rules and C ground truth live below. All fallible call
   `binary.rs` — `make_binary`/`make_bitstring`/off-heap `make_refc_binary` (the frozen `[BinRef(3)][ErlSubBits(5)]` pair), the `bitstring_*` readers and the `heap_bits_size_words`/`bit_count_to_bytes`/`BITSTRING_POINTER_FLAG_MASK` sizing re-exports.
   `fun.rs` — `make_fun_external` (**any** arity accepted: the true value in descriptor word 3, `arity & FUN_MAX_FIELD` in the 8-bit header field, `FUN_DESC_WORDS_EXTERNAL = 3`) and `make_fun_imported` (the `NEW_FUN_EXT` block, `1 + 10 + env.len()` words, **`env[k]` = the *k*-th wire slot**), the `fun_*_term` accessors (a miss ⇒ `BadArg`; the `_term` suffix is mandatory), the `beam_term::fun` re-exports and `#[cfg(test)] make_fun_local` (production local-fun creation is `beam_engine::terms::make_fun`).
   `record.rs` — `is_record`, the hash-computing `make_record` (§Records), the `record_*` readers, `AM_TRUE`/`AM_FALSE`.
-
+  `ref.rs` — the safe wrappers over `beam_term::boxed`'s internal-ref layout: `make_internal_ref(heap, id)` (allocates `INTERNAL_REF_WORDS` and calls the `unsafe` `write_internal_ref`) and `internal_ref_id(term)` (the id read-back); the crate's only internal-ref accessors, `// SAFETY:`-documented and re-exported at the crate root.
 **Public but not part of the cross-crate contract**: dependents (`beam_bifs`, `beam_ets`, `beam_message`, `beam_rt`) take float/bignum/map/identifier constructors from `beam_term::thing` directly, and this module keeps the codec-internal convenience seam plus the guard constants only.
 
 #### Minor-version flavours (`{minor_version, N}`)
