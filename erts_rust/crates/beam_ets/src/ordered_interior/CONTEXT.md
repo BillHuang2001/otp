@@ -77,7 +77,7 @@ tautologies.
 - `next_from`/`prev_from` with `inclusive = true` has no production consumer yet: only `Tree::next`/
   `prev` call them (`inclusive = false`). It is the range API a later `ets:select`/`ets:next`-style
   scan wires up (documented in `mod.rs`).
-- The `borrowing_from_the_left_sibling_keeps_the_separator_exact` test comment (`mod.rs:851-853`)
+- The `borrowing_from_the_left_sibling_keeps_the_separator_exact` test comment (`tests.rs`)
   says the merged first leaf holds "30 entries"; the arithmetic gives 31 (15 + 16), and the merge
   happens inside the delete of 15, not a subsequent one. The scenario itself is correct; cosmetic.
 
