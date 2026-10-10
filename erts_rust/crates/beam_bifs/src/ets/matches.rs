@@ -400,17 +400,22 @@ mod tests {
     }
 
     /// `[{{z}, [], [true]}]` — a spec whose head matches no 2-tuple object but whose
-    /// body (`[true]`) is **not** a key-keeping construction.
+    /// body (`[true]`, the atom `true` as the sole body expression) is **not** a
+    /// key-keeping construction.
     ///
     /// The oracle validates the body's *shape* up front (`db_match_keeps_key`, the
     /// spec's `on_match_validation`), so `ets:select_replace/2` rejects the whole call
     /// with `badarg` **even though the head matches nothing** (verified: on a `set`
     /// the oracle raises `badarg` here rather than returning 0).
+    ///
+    /// Do **not** substitute a `['$_']` body here: `'$_'` returns the matched object
+    /// *unchanged*, which trivially keeps its key at position 1, so that spec is
+    /// valid and merely matches nothing (the oracle answers `0`, not `badarg`).
     fn rejected_body_spec(ctx: &mut BifContext<'_>) -> Eterm {
         let z = ctx.atom("z").expect("seeded");
         let head = ctx.tuple(&[z]).expect("fits");
         let guards = ctx.list(&[]).expect("fits");
-        let body = ctx.list(&[ctx.atom("$_").expect("seeded")]).expect("fits");
+        let body = ctx.list(&[ctx.atom("true").expect("seeded")]).expect("fits");
         let clause = ctx.tuple(&[head, guards, body]).expect("fits");
         ctx.list(&[clause]).expect("fits")
     }
@@ -571,7 +576,10 @@ mod tests {
         two_objects(&mut ctx, handle);
 
         // On a `set`: both objects match, both replacements keep the key, so the
-        // count is 2 and `{a,1}`/`{b,2}` become `{a,b}`/`{b,b}` (verified).
+        // count is 2 and `{a,1}`/`{b,2}` become `{a,b}`/`{b,b}`. Oracle (set holding
+        // `{a,1}`/`{b,2}`):
+        //   ets:select_replace(T, [{{'$1','$2'},[],[{{'$1',b}}]}])  ⇒  2,
+        //   ets:tab2list(T)  ⇒  [{a,b},{b,b}]
         let spec = replace_spec(&mut ctx);
         let count = select_replace_2(&mut ctx, &[handle, spec]).expect("ets:select_replace/2");
         assert_eq!(signed_value(count), 2);
@@ -589,6 +597,8 @@ mod tests {
         // A **valid** key-keeping spec that matches nothing replaces nothing: the
         // oracle's count is 0 (the head `{z}` cannot match a 2-tuple object and the
         // `{{z}}` body provably keeps the key, so the static body check passes).
+        // Oracle (set holding `{a,1}`/`{b,2}`):
+        //   ets:select_replace(T, [{{z},[],[{{z}}]}])  ⇒  0
         let spec = no_match_spec(&mut ctx);
         let count = select_replace_2(&mut ctx, &[handle, spec]).expect("no match");
         assert_eq!(signed_value(count), 0);
