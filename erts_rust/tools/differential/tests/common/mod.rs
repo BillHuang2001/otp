@@ -42,6 +42,7 @@
 #![allow(dead_code)] // Each test binary includes this module; not every one uses every helper.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// A **worktree-local** scratch root for the integration tests, created if needed.
 ///
@@ -91,4 +92,43 @@ pub fn fresh_rust_spec() -> Option<differential::runtime::RuntimeSpec> {
         Path::new(env!("CARGO_MANIFEST_DIR")),
     )
     .expect("the fresh beam_rt exists, so $BEAM_RT resolution cannot fail")
+}
+
+/// Serializes the integration tests that run the **real conformance corpus** under the
+/// oracle.
+///
+/// The harness sweeps the corpus *sequentially* ([`differential::harness::run_suite`]), but
+/// `cargo test` runs the tests of one binary on **parallel threads**. Several tests in
+/// `tests/cli.rs` each drive a full `suite` child process, so without serialization they
+/// overlap and spawn many oracle `erl` processes at once. Two corpus cases —
+/// `flags/sname_switch_value` (`-sname mynode`) and `flags/name_switch_value`
+/// (`-name node@host`) — start distribution and therefore register their node name with
+/// `epmd`; when two such `erl` processes run concurrently on the same host, the second loses
+/// the name race and exits non-zero with
+/// `Protocol 'inet_tcp': the name mynode@… seems to be in use by another Erlang node`.
+///
+/// The oracle then no longer reproduces the case golden, and
+/// [`differential::compare::verdict_with`] turns an oracle golden miss into a
+/// [`differential::compare::Verdict::Mismatch`] — a **spurious** divergence that has nothing
+/// to do with the Rust runtime (the same case agrees when run alone, and the real gate
+/// reports `mismatch=0`). The flake is `epmd`/hostname contention, not a runtime bug: two
+/// concurrent `erl -sname mynode` reliably collide on this host, while 20 *sequential* runs
+/// are clean.
+///
+/// The case id, node name and goldens are **frozen corpus data** (`src/corpus/flags.rs`), so
+/// a test cannot hand the case a unique node name; the only faithful fix is to ensure that at
+/// most one corpus sweep runs at a time. Every test that drives a full `suite` holds this
+/// lock for the whole invocation. Cargo runs one binary's tests on parallel threads, so a
+/// **process-wide** lock is exactly the right scope; it also runs the test *binaries*
+/// sequentially, so nothing outside this process can contend.
+///
+/// **Do not remove this lock, and do not narrow it around a single invocation:** it must
+/// span every oracle spawn of a name-bearing case within a test, or the epmd collision
+/// returns. A poisoned lock is recovered (the panicking test already reported its failure);
+/// the guard is intentionally *not* released early on a panic.
+pub fn corpus_run_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }

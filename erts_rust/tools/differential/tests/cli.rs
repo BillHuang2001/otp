@@ -24,6 +24,15 @@
 //! (0 agreed / 1 mismatch / 2 usage-env-IO) and the `--help` surface are locked in, and
 //! environment overrides (`$ERTS_ORACLE`, `$BEAM_RT`) can be injected without touching
 //! this test process. Tests that need the oracle **skip loudly** when `erl` is missing.
+//!
+//! **Every test that drives a full `suite` holds [`common::corpus_run_lock`] for its whole
+//! body.** Cargo runs this binary's tests on parallel threads, and two corpus cases
+//! (`flags/sname_switch_value` `-sname mynode`, `flags/name_switch_value` `-name node@host`)
+//! start distribution and register their node name with `epmd`; overlapping full-corpus runs
+//! make the second `erl` lose that name race, so the *oracle* stops reproducing its golden
+//! and the case is reported as a spurious `mismatch`. The lock serializes the corpus sweeps
+//! so at most one `-sname`/`-name` `erl` runs at a time — see the lock's own doc comment in
+//! `tests/common/mod.rs` for the full root cause. Do not remove it.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -324,6 +333,11 @@ fn the_suite_reports_module_agreement_and_expression_capability_gaps() {
         eprintln!("SKIP: oracle erl not available");
         return;
     }
+    // Serialize the full corpus sweep against the binary's other corpus-running tests: two
+    // corpus cases register an `epmd` node name (`-sname`/`-name`), so overlapping sweeps
+    // would make the oracle lose the name race and report a spurious mismatch. Held for the
+    // whole body — see `common::corpus_run_lock`.
+    let _corpus_run = common::corpus_run_lock();
     // The child's effective runtime: the freshly built debug `beam_rt` (injected as
     // `$BEAM_RT`) if one exists, else whatever its workspace-default resolution finds. This
     // mirrors `runtime::resolve_rust_from` so the gate can never disagree with the child.
@@ -638,6 +652,11 @@ fn a_rust_runtime_signalling_unsupported_is_honest_not_a_mismatch() {
         eprintln!("SKIP: oracle erl not available");
         return;
     }
+    // Serialize the full corpus sweep against the binary's other corpus-running tests: two
+    // corpus cases register an `epmd` node name (`-sname`/`-name`), so overlapping sweeps
+    // would make the oracle lose the name race and report a spurious mismatch. Held for the
+    // whole body — see `common::corpus_run_lock`.
+    let _corpus_run = common::corpus_run_lock();
     let scratch = Scratch::new("fake-unsupported");
     let fake = fake_runtime(
         &scratch,
@@ -697,6 +716,11 @@ fn the_ratchet_tolerates_only_the_recorded_gaps_end_to_end() {
         eprintln!("SKIP: oracle erl not available");
         return;
     }
+    // Serialize the full corpus sweep against the binary's other corpus-running tests: two
+    // corpus cases register an `epmd` node name (`-sname`/`-name`), so overlapping sweeps
+    // would make the oracle lose the name race and report a spurious mismatch. Held for the
+    // whole body — see `common::corpus_run_lock`.
+    let _corpus_run = common::corpus_run_lock();
     let scratch = Scratch::new("ratchet");
     let fake = fake_runtime(
         &scratch,
@@ -811,6 +835,11 @@ fn a_mismatch_is_never_masked_by_an_allowlist_end_to_end() {
         eprintln!("SKIP: oracle erl not available");
         return;
     }
+    // Serialize the full corpus sweep against the binary's other corpus-running tests: two
+    // corpus cases register an `epmd` node name (`-sname`/`-name`), so overlapping sweeps
+    // would make the oracle lose the name race and report a spurious mismatch. Held for the
+    // whole body — see `common::corpus_run_lock`.
+    let _corpus_run = common::corpus_run_lock();
     let scratch = Scratch::new("ratchet-mismatch");
     // Prints a different stdout than the oracle for EVERY invocation: a genuine divergence.
     let fake = fake_runtime(&scratch, "beam_rt-fake", "echo 'ok bogus'\nexit 0");
