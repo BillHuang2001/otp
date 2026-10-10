@@ -48,10 +48,12 @@
 //! range-bound rule: an absent key is answered by the nearest stored key, not
 //! rejected).
 //!
-//! The alias is applied here, in the BIF layer, and never by changing
-//! `beam_ets::Table::last`/`prev` — those keep the interior's own semantics, which
-//! the `ets:last/1`/`ets:prev/2` BIFs build on. The rule itself is the shared
-//! [`has_backward_walk`] predicate (the `adopt` fun-folds key off it too).
+//! The alias is [`Table::last`]/[`Table::prev`]'s own: `beam_ets`'s hash interiors
+//! define `last_key`/`prev_key` as `first_key`/`next_key` (the C
+//! `db_first_hash, db_next_hash, db_first_hash, db_next_hash` function table,
+//! `../../erts/emulator/beam/erl_db_hash.c:853-856`), so this module delegates to
+//! `last`/`prev` for every kind and the two verb pairs (`ets:last/1`/`ets:prev/2`
+//! in `ets.rs`) can never disagree.
 //!
 //! # The multi-object answer
 //!
@@ -67,8 +69,8 @@ use crate::context::BifContext;
 use crate::registry::BifRegistry;
 
 use super::{
-    copy_out, copy_out_list, has_backward_walk, is_end_of_table_key, restore_table, resolve,
-    take_table_gated, END_OF_TABLE,
+    copy_out, copy_out_list, is_end_of_table_key, restore_table, resolve, take_table_gated,
+    END_OF_TABLE,
 };
 use crate::error::badarg;
 
@@ -115,17 +117,13 @@ fn first_lookup_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `ets:last_lookup(Tab)` — the last key and its objects, or `'$end_of_table'`.
 ///
-/// A **hash** kind has no backward walk, and the oracle aliases this to
-/// `first_lookup` there (see the module docs); only an `ordered_set` takes
-/// [`Table::last`].
+/// For a **hash** kind [`Table::last`] is its own alias of `first` (see the module
+/// docs), so this answers `first_lookup`'s key there and only an `ordered_set`
+/// reads the real end of the order.
 fn last_lookup_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
-    let key = if has_backward_walk(&table) {
-        table.last(ctx.atoms())
-    } else {
-        table.first(ctx.atoms())
-    };
+    let key = table.last(ctx.atoms());
     key_objects(ctx, handle, table, key)
 }
 
@@ -141,7 +139,7 @@ fn next_lookup_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let key = args[1];
     let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
-    if has_backward_walk(&table) && is_end_of_table_key(ctx, key) {
+    if table.kind().is_ordered() && is_end_of_table_key(ctx, key) {
         restore_table(ctx, handle, table)?;
         return Err(badarg());
     }
@@ -159,25 +157,21 @@ fn next_lookup_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `ets:prev_lookup(Tab, Key)` — the key preceding `Key` and its objects, or
 /// `'$end_of_table'`.
 ///
-/// Mirroring [`next_lookup_2`]'s alias: a **hash** kind answers with the *forward*
-/// step ([`Table::next`] — the oracle's behaviour), only an `ordered_set` with
-/// [`Table::prev`]. The chosen primitive's `badarg` propagates as the oracle's,
-/// and an `ordered_set` rejects the `'$end_of_table'` anchor outright (the C
-/// `db_prev_tree_common`'s unconditional `DB_ERROR_BADKEY`), like [`next_lookup_2`].
+/// As with [`last_lookup_1`], the hash-kind alias is [`Table::prev`]'s own, so a
+/// `set`/`bag`/`duplicate_bag` answers what `next_lookup` answers and only an
+/// `ordered_set` steps to the real predecessor. [`Table::prev`]'s `badarg`
+/// propagates as the oracle's, and an `ordered_set` rejects the `'$end_of_table'`
+/// anchor outright (the C `db_prev_tree_common`'s unconditional `DB_ERROR_BADKEY`),
+/// like [`next_lookup_2`].
 fn prev_lookup_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let key = args[1];
     let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
-    let backward = has_backward_walk(&table);
-    if backward && is_end_of_table_key(ctx, key) {
+    if table.kind().is_ordered() && is_end_of_table_key(ctx, key) {
         restore_table(ctx, handle, table)?;
         return Err(badarg());
     }
-    let outcome = if backward {
-        table.prev(key, ctx.atoms())
-    } else {
-        table.next(key, ctx.atoms())
-    };
+    let outcome = table.prev(key, ctx.atoms());
     match outcome {
         Ok(prev) => key_objects(ctx, handle, table, prev),
         Err(err) => {

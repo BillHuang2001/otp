@@ -23,11 +23,15 @@
 //!
 //! # What "reverse" means (oracle-verified, erts-17.1)
 //!
-//! Only an **`ordered_set`** has a documented backward iteration order, and there
-//! the results come in **descending key order**. For the hash kinds
-//! (`set`/`bag`/`duplicate_bag`) the oracle leaves the order unspecified, so
-//! [`Table::select_reverse`], which visits `beam_ets`' iteration order backwards
-//! (the reverse of `ets:select/2`), is within the oracle's freedom.
+//! Only an **`ordered_set`** has a backward iteration order: there
+//! [`Table::select_reverse`] descends and the results come in **descending key
+//! order**. A hash kind (`set`/`bag`/`duplicate_bag`) has **no backward walk** —
+//! its C function table defines `last` as `first` and `prev` as `next`
+//! (`db_first_hash, db_next_hash, db_first_hash, db_next_hash`,
+//! `../../erts/emulator/beam/erl_db_hash.c:853-856`) — so `ets:select_reverse/2`
+//! **is** `ets:select/2` there, yielding the very same sequence element for
+//! element. The alias lives in `beam_ets`'s hash interiors ([`Table::last`]/
+//! [`Table::prev`] and `iter_objects_rev`), so this module just delegates.
 //!
 //! # The BIFs are thin wrappers over `beam_ets`
 //!
@@ -68,8 +72,9 @@ pub(super) fn register(reg: &mut BifRegistry) {
 }
 
 /// `ets:select_reverse(Tab, MatchSpec)` — the body values of every selected
-/// object, in descending key order for an `ordered_set` and in the reverse of
-/// `ets:select/2`'s order for a hash kind; the empty list when nothing matches.
+/// object, in descending key order for an `ordered_set`; a hash kind has no
+/// backward walk, so there the walk **is** `ets:select/2`'s and the very same
+/// sequence comes back (see the module docs). The empty list when nothing matches.
 ///
 /// `MatchSpec` is a raw match-spec list compiled by [`beam_ets::compile`]; a spec
 /// outside the supported subset is `badarg`, as is an unknown or non-table first
@@ -92,8 +97,9 @@ fn select_reverse_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `Limit` must be a positive integer (`0`, a negative and a non-integer value are
 /// `badarg`, matching `ets:select/3`); an exhausted traversal renders the same way
 /// the forward path does. The minted continuation is recorded with the reverse
-/// direction (see [`super::Continuation`]), so `ets:select/1` resuming it walks
-/// backward just as the oracle does.
+/// direction (see [`super::Continuation`]), so `ets:select/1` resuming it keeps
+/// that direction: a backward walk for an `ordered_set`, and for a hash kind the
+/// same sequence the forward walk would give (see the module docs).
 fn select_reverse_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let spec = compile(args[1], ctx.atoms())?;
@@ -220,11 +226,13 @@ mod tests {
         is_atom(term) && atoms.name(atom_val(term)) == Some(super::super::END_OF_TABLE)
     }
 
-    /// An `ordered_set` **descends**; a hash kind is left unspecified by the oracle,
-    /// so the native form (the reverse of `ets:select/2`) is only required to be the
-    /// same result multiset.
+    /// An `ordered_set` **descends** (its forward walk ascends); a hash kind's
+    /// `select_reverse/2` **is** `select/2` — its interior defines `last`/`prev` as
+    /// `first`/`next` (`erl_db_hash.c:853-856`, see the module docs), so there is no
+    /// backward order to walk and the reverse yields the forward sequence element
+    /// for element.
     #[test]
-    fn ordered_set_descends_and_hash_kinds_hold_the_same_results() {
+    fn ordered_set_descends_and_hash_kinds_match_select_exactly() {
         for kind in ["ordered_set", "set", "bag", "duplicate_bag"] {
             let (mut heap, atoms, mut reg) = parts();
             let mut ctx =
@@ -233,19 +241,14 @@ mod tests {
             insert_all(&mut ctx, handle, &[1, 2, 3, 4]);
             let spec = key_spec(&mut ctx);
 
-            let forward = super::super::select_2(&mut ctx, &[handle, spec]).expect("select/2");
-            let reverse = select_reverse_2(&mut ctx, &[handle, spec]).expect("select_reverse/2");
+            let forward = ints(super::super::select_2(&mut ctx, &[handle, spec]).expect("select/2"));
+            let reverse = ints(select_reverse_2(&mut ctx, &[handle, spec]).expect("select_reverse/2"));
 
             if kind == "ordered_set" {
-                assert_eq!(ints(reverse), vec![4, 3, 2, 1], "{kind} descends");
+                assert_eq!(forward, vec![1, 2, 3, 4], "{kind} ascends");
+                assert_eq!(reverse, vec![4, 3, 2, 1], "{kind} descends");
             } else {
-                // The hash-kind order is unspecified by the oracle, so only the
-                // multiset is pinned (the native reverse is `select`'s reverse).
-                let mut forward = ints(forward);
-                let mut reverse = ints(reverse);
-                forward.sort_unstable();
-                reverse.sort_unstable();
-                assert_eq!(forward, reverse, "{kind}: the same result multiset");
+                assert_eq!(reverse, forward, "{kind}: a hash-kind reverse is select itself");
             }
         }
     }
@@ -341,9 +344,12 @@ mod tests {
         assert_eq!(next, vec![2, 1], "a reverse continuation walks backward");
     }
 
-    /// A reverse continuation of a hash kind keeps walking backward too.
+    /// A hash kind's `select_reverse/2` **is** `select/2` — the oracle's hash
+    /// interiors define `last`/`prev` as `first`/`next` (`erl_db_hash.c:853-856`),
+    /// so there is no backward order and the reverse re-emits the forward sequence
+    /// element for element, including across `/3` chunk resumptions.
     #[test]
-    fn a_hash_kind_reverse_continuation_walks_backward() {
+    fn a_hash_kind_reverse_equals_the_forward_walk() {
         let (mut heap, atoms, mut reg) = parts();
         let mut ctx =
             BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut reg);
@@ -351,21 +357,21 @@ mod tests {
         insert_all(&mut ctx, handle, &[1, 2, 3, 4]);
         let spec = key_spec(&mut ctx);
 
-        // The forward and reverse full scans are reverses of one another.
+        // The forward and reverse full scans are the same sequence, element for
+        // element (not merely the same multiset).
         let forward = ints(super::super::select_2(&mut ctx, &[handle, spec]).expect("select/2"));
         let reverse = ints(select_reverse_2(&mut ctx, &[handle, spec]).expect("select_reverse/2"));
-        let mut expected = forward.clone();
-        expected.reverse();
-        assert_eq!(reverse, expected, "a hash-kind reverse is select's reverse");
+        assert_eq!(reverse, forward, "a hash-kind reverse is select itself");
 
-        // Chunking walks the same reverse order across resumptions.
+        // Chunking walks the same sequence across resumptions, and joins to it.
         let two = ctx.int(2).expect("fits");
         let (first, cont) = chunk(select_reverse_3(&mut ctx, &[handle, spec, two]).expect("c1"));
+        assert_eq!(first.len(), 2, "the chunk size is honoured");
         let cont = cont.expect("a continuation");
         let (second, _) = chunk(select_reverse_1(&mut ctx, &[cont]).expect("c2"));
         let mut joined = first.clone();
         joined.extend(second);
-        assert_eq!(joined, reverse, "the resumption continues the reverse walk");
+        assert_eq!(joined, forward, "the resumption continues the same sequence");
     }
 
     /// The oracle's `badarg`s.
