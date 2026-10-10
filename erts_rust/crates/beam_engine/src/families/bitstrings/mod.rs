@@ -61,6 +61,8 @@ mod create;
 mod matching;
 #[allow(unsafe_code)]
 mod raw;
+#[cfg(test)]
+mod run_tests;
 
 use crate::interpreter::LabelMap;
 

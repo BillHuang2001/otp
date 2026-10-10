@@ -50,10 +50,16 @@ is the term `raw::make_ctx` builds; its `orig` word is the subject it reads.
   - `size.rs` → the segment size validation (`SegSize`/`segment_size`, `seg_nbits`,
     `float_nbits`) and the `SegReason` raise (`fail_seg`).
   - `tests.rs` → `#[cfg(test)]` unit tests for the segment encoders.
+- `run_tests.rs` → `#[cfg(test)]` **integration** tests driven through the real public
+  execution entries (`Machine::run_label` / `Machine::run_export`) over synthetic
+  `beam_loader::Module`s + a `MinimalContext`, plus a live `erlc`/`erl` oracle
+  cross-check compiled from an inline source string at test time.
 
 ## Constraints
-- `#![deny(unsafe_code)]` crate-wide; `raw.rs` is the node's only `#[allow(unsafe_code)]`
-  module, and every `unsafe` block carries a `// SAFETY:` rationale.
+- `#![deny(unsafe_code)]` crate-wide; `raw.rs` is the node's only non-test
+  `#[allow(unsafe_code)]` module (`run_tests.rs` carries a local allow for the frozen
+  `bitstring_parts`/`write_refc_binary` readers its harness builds terms with), and every
+  `unsafe` block carries a `// SAFETY:` rationale.
 - Errors are `beam_common::{Result, BeamError}` only — no crate-local error enum, no
   `unwrap()` on runtime data, no panic, never a wrong result. A match failure branches to
   the instruction's fail label (or raises `{badmatch, Value}` when the label is `NO_FAIL`);
@@ -74,7 +80,19 @@ Per-module `#[cfg(test)]` unit tests over hand-built operands/direct decoder cal
 `make_binary`/`make_writable`, the machine's enumerable refc handles), `matching/mod.rs`
 (the pure decoders' oracle-derived values + the instruction-level empty-binary match),
 `matching/rooted.rs` (the rooted match path), `create/tests.rs` (the segment encoders).
-End-to-end evidence lives in the crate's integration suites (`../../TEST_NOTES.md`),
+`run_tests.rs` is the node's **end-to-end** suite: it builds synthetic `Module`s by hand
+and drives them through `Machine::run_label`/`Machine::run_export`, pinning
+- a `bs_start_match3` + `bs_get_tail`/`bs_get_integer2` sequence over a **refc subject
+  whose window starts one bit in** (`f/1`, entry `Label(1)`; `(1..17)` of the payload reads
+  `0x58 0x6B`), and
+- a `bs_create_bin` whose `append`/`private_append` segment is **not the first**
+  (segment list `[integer,1,1,nil,7,8] [<ty>,2,1,nil,{x,0},all]`, `f/1` exported at
+  `Label(1)`), over a heap-binary source and over a 65-byte refc source;
+plus a live oracle cross-check (`bitsrun:first3/1` = `7` over `<<16#E5>>`,
+`bitsrun:tail16/1` = `516` over the `1..=70` payload) that compiles an inline Erlang
+source with the system `erlc` at test time and compares against the real system `erl`,
+**skipping loudly** when `erlc`/`erl` are absent.
+End-to-end evidence also lives in the crate's integration suites (`../../TEST_NOTES.md`),
 notably `tests/gaps.rs` (the remaining typed errors), `tests/census.rs` (opcode
 coverage) and `tests/stdlib_sweep.rs` (the real installed `base64:encode/1`).
 
