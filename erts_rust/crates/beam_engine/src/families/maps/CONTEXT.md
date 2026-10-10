@@ -105,13 +105,21 @@ Verified against the system `erlc` (OTP 29) disassembly:
   atom-keyed map, never in map semantics (`lookup`/`position` compare by name via `cmp`).
 
 ## Test Strategy
-- `tests.rs` unit suite: hand-built `Instr`s + a recording context; the raise cases intern the
-  tag explicitly (`Fixture::new(&["a","badmap","error"])` at `:322`, `:512`;
-  `Fixture::new(&["a","b","badkey","error"])` at `:760`) and compare the landed reason via
-  `cmp`. No test asserts the **missing-atom** `unsupported` path here.
-- `../../../tests/gaps.rs:274-322` pins the missing-atom gap (`put_map_assoc/no_fail`,
-  `put_map_exact/no_fail`) with a hand-built `Module` + `MinimalContext` (which cannot name the
-  tag).
+- `tests.rs` unit suite: hand-built `Instr`s + a recording context. The raise cases intern the tag
+  explicitly and compare the landed reason: the `{badmap,Source}` cases
+  (`Fixture::new(&["a","badmap","error"])` at `:357`, `:685`), the `{badkey,Key}` cases
+  (`Fixture::new(&["a","b","badkey","error"])` at `:933`, `:959`), and the absent-key `NO_FAIL`
+  bare-`function_clause` cases (`Fixture::new(&["a","b","function_clause","error"])`) for **both**
+  read instructions — the **caught** path asserts the handler's `x(1)` equals `make_atom(function_clause)`
+  (`:382`, `:539`); the **uncaught** path recovers the reason term from `Raise::live_reason`
+  (`uncaught_raise`/`live_reason_term`, `:170`/`:178`) and asserts class `error` (`:409`, `:565`).
+- The **missing-atom** typed gap is asserted here too: a module that does not name `function_clause`
+  yields the exact `unsupported_opcode: maps: no 'function_clause' atom in the module`
+  (`assert_unsupported_reason`, `:188`; tests `:438`, `:594`).
+- `../../../tests/gaps.rs` pins the remaining missing-atom gaps (`put_map_assoc/no_fail`,
+  `put_map_exact/no_fail`, and the read instructions' `function_clause` nameability gap) with a
+  hand-built `Module` + `MinimalContext` (which cannot name the tag). *(Parent-owned; see the
+  handoff note below.)*
 - `../../../tests/maps.rs` runs the real oracle fixture `../tests/fixtures/mapfx.beam` **both
   ways**, so the reason term — never just `BeamError::Raise(_)` — is asserted:
   `exact_with_a_missing_key_raises_badkey` loads it through the **seeded** host
