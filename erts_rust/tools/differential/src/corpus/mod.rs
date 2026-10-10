@@ -66,7 +66,7 @@
 //! | [`proc_control`] | A.7 — `monitor`/`demonitor`, the `exit/1,2` taxonomy, `register`/`unregister`/`whereis`, the run-queue priorities |
 //! | [`system_info`] | A.8 — introspection (incl. `erlang:memory/0,1` — a Rust capability gap — and the trace / `seq_trace` / `halt` surface) |
 //! | [`boot`] | A.9 — boot/version observability (asserted by shape) |
-//! | [`boot_prereq`] | A.9 — the boot-path prerequisite primitives (preloaded set, boot-script applications, `register`/`whereis`, group-leader inheritance, the `-boot` flag, the `proc_lib` blocked-seam gap) |
+//! | [`boot_prereq`] | A.9 — the boot-path prerequisite primitives (preloaded set, boot-script applications, `register`/`whereis`, group-leader inheritance, the `-boot` flag, the `proc_lib` start wait) |
 //! | [`modules`] | A.2/A.1/A.7 — a freshly `erlc`-compiled module run under both runtimes |
 //! | [`mexec`] | A.2/A.7 — a *real* system stdlib/kernel module executed end to end |
 //! | [`records`] | A.1/A.2/A.7 — native records: the `records:*` BIFs + the native-record opcodes |

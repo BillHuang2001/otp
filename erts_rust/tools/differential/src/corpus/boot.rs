@@ -48,7 +48,7 @@
 //! `which_applications/0`/`loaded_applications/0`, the preloaded `init`, kernel's
 //! `error_logger`/`vsn` entries, the `register/2` + `whereis/1` and group-leader-inheritance
 //! kernel-process primitives, the `-boot` init argument and the boot chain's
-//! `proc_lib:start_link/4` **blocked-seam** capability case) live in the sibling `boot_prereq`
+//! `proc_lib:start_link/4` start wait) live in the sibling `boot_prereq`
 //! group; this group keeps the boot/version observability surface.
 use super::{Case, CaseKind, Contract, Golden, Probe};
 

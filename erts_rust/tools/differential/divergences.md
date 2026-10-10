@@ -110,6 +110,12 @@ not here.)
   oracle injects its runtime-added entries (`logger`, `connect_all`, …) with a per-VM-start
   order, the rust runtime returns the raw, shorter `.app` env. The `{ok,…}` shape and the other
   keys agree and are pinned. Owner: `beam_rt`.
+- `application:get_application/1` on a **pid** differs: the oracle answers `{ok,App}` for a
+  process an application owns and `undefined` for every other process (`application:get_application(self())`
+  and `application:get_application(spawn(fun() -> ok end))` are both `undefined` under `-noshell`),
+  while the rust runtime raises `error:function_clause` (it runs no application-owned process).
+  The **module** form agrees and is pinned (`boot_extra/application_get_application_1_*`).
+  Owner: `beam_rt`.
 - `erlang:module_info(exports)` → oracle the export table, rust `undef`
   (`lists:module_info(exports)` works but with a different entry order).
 - `whereis(code_server|erl_prim_loader|kernel_sup)` → oracle a pid, rust `undefined`.
