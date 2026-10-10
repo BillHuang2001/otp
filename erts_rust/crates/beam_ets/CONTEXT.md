@@ -593,7 +593,9 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   survives a delete of the last-yielded (anchor) key, and a delete/insert behind the cursor does not
   shift the next chunk.
 - **Gate (this crate):** `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_ets`
-  is green (0 failures across every test binary, including the 8 doctests — 5 of them `compile_fail`).
+  is green — **25 test binaries, 557 passed / 0 failed** (including the 8 doctests — 5 of them
+  `compile_fail`); with the oracle required, the battery emits and compares all **159** cases
+  (`[differential] oracle: … — 159 cases emitted` / `— comparing 159 cases against beam_ets`).
   Forced-oracle: `BEAM_ETS_REQUIRE_ORACLE=1 erts_rust/scripts/cargo.sh test
   --manifest-path erts_rust/Cargo.toml -p beam_ets --test differential`.
 
