@@ -82,7 +82,7 @@ The binary's own `run`/`suite` exit codes are unchanged (`0` agree / `1` mismatc
 - **No coupling to `crates/*` internals** (crate deps are `serde` + `serde_json` only). No `clap`; arg parsing is hand-rolled `std`. `unsafe` is **forbidden**.
 - **Loud failures:** stderr messages + nonzero exit; never silently swallow an error. Machine-readable JSON, stable schema, written under the gitignored `out/` (or `--out <dir>`).
 - Files target ~1000 lines; split by responsibility. Apache-2.0. The corpus group files are **data registries** (one embedded module/expression per case) and legitimately run past the soft target (`wire.rs`, `wire_extra.rs`, `errors.rs`, `nif_abi.rs`, `nif_abi_extra.rs`, `driver_abi.rs`, `driver_abi_extra.rs`, `mexec_extra.rs`, `boot_prereq.rs`, `boot_extra.rs`); do not split them for line count alone. The `report` module is a directory module split by responsibility.
-- The built-in corpus is the **conformance corpus** (1567 cases) and runs end to end in CI; keep it fast enough for that and reserve the heavy external suites (root §6) for milestones.
+- The built-in corpus is the **conformance corpus** (1628 cases) and runs end to end in CI; keep it fast enough for that and reserve the heavy external suites (root §6) for milestones.
 - **Never assert a golden whose output is order-unstable.** A `~w` rendering of a multi-key map (or any structure containing one) has a per-VM-start iteration order, so compare it structurally (`maps:size`, `lists:sort(maps:keys(M))`, single-key maps) instead. Same rule for pids/refs/ports/creation values that vary per VM start, and for a `load_nif` failure message that embeds a temp-dir path — assert a shape or classify into an integer, or use a deterministic decode→re-encode round-trip.
 
 ## Design Decisions
@@ -127,23 +127,24 @@ The binary's own `run`/`suite` exit codes are unchanged (`0` agree / `1` mismatc
 - The driver echo round trip runs only once `beam_rt run` drives the full scheduler (`Runtime::run_scheduled`); a single engine pass never runs the scheduler's port half, so the receiver blocks and the CLI exits `3` with `beam_rt: unsupported: ... blocked` (a capability gap, never a mismatch, never a hang).
 
 ## Known Issues / Notes for Agents
-- **The Rust side is a partial runtime; today's gate is 0 mismatches** (1567-case corpus). The **module-run** cases (embedded sources, the native-record group, the NIF `.so` groups, the C-driver groups, the real-system-module `mexec`/`mexec_extra` groups) `agree`, and the **eval** cases `agree` where the `-eval` evaluator supports them — `beam_rt` has a real Erlang-expression evaluator and does **not** auto-print the result. A capability gap is `unsupported`, never a mismatch: either the raise escapes and the CLI exits `3` (`beam_rt: unsupported: …`), or (for a probe-wrapped case) the probe *catches* it and prints one `exception <class> <reason>` line whose reason follows the `unsupported` convention.
-  - Current rollup (**stable across repeated runs**): **1567 total · 1566 agree · 0 mismatch · 1 unsupported · 0 skipped**; the one gap is recorded in `known-gaps.txt` (`allowed=1 unauthorized=0 stale=0`), so `gate.sh` → exit `0`.
+- **The Rust side is a partial runtime; today's gate is 0 mismatches** (1628-case corpus). The **module-run** cases (embedded sources, the native-record group, the NIF `.so` groups, the C-driver groups, the real-system-module `mexec`/`mexec_extra` groups) `agree`, and the **eval** cases `agree` where the `-eval` evaluator supports them — `beam_rt` has a real Erlang-expression evaluator and does **not** auto-print the result. A capability gap is `unsupported`, never a mismatch: either the raise escapes and the CLI exits `3` (`beam_rt: unsupported: …`), or (for a probe-wrapped case) the probe *catches* it and prints one `exception <class> <reason>` line whose reason follows the `unsupported` convention.
+  - Current rollup (**stable across repeated runs**): **1628 total · 1626 agree · 0 mismatch · 2 unsupported · 0 skipped**; both gaps are recorded in `known-gaps.txt` (`allowed=2 unauthorized=0 stale=0`), so `gate.sh` → exit `0`.
   - Per-contract rollup (A.1–A.9; a case may declare several contracts, so the column totals exceed `summary.total`):
 
 | Contract | total | agree | mismatch | unsupported | skipped |
 |---|---|---|---|---|---|
 | A.1 | 163 | 163 | 0 | 0 | 0 |
-| A.2 | 541 | 541 | 0 | 0 | 0 |
-| A.3 | 205 | 205 | 0 | 0 | 0 |
-| A.4 | 182 | 182 | 0 | 0 | 0 |
-| A.5 | 325 | 324 | 0 | 1 | 0 |
+| A.2 | 575 | 575 | 0 | 0 | 0 |
+| A.3 | 223 | 223 | 0 | 0 | 0 |
+| A.4 | 190 | 190 | 0 | 0 | 0 |
+| A.5 | 328 | 327 | 0 | 1 | 0 |
 | A.6 | 44 | 44 | 0 | 0 | 0 |
-| A.7 | 394 | 394 | 0 | 0 | 0 |
+| A.7 | 399 | 399 | 0 | 0 | 0 |
 | A.8 | 64 | 64 | 0 | 0 | 0 |
-| A.9 | 209 | 209 | 0 | 0 | 0 |
-- **The 1 `unsupported` case (an honest capability gap, not a mismatch).** Its golden is the oracle's own output, so it flips to `agree` automatically once its gap closes:
+| A.9 | 235 | 234 | 0 | 1 | 0 |
+- **The 2 `unsupported` cases (honest capability gaps, not mismatches).** Each golden is the oracle's own output, so it flips to `agree` automatically once its gap closes:
   - **`local_fun`:** `wire/new_fun_ext_encode` (A.5, `beam_rt: unsupported: local_fun`) — a lambda is an evaluator closure the `beam_rt` `-eval` path cannot give a faithful `NEW_FUN_EXT` image. `beam_codec` has `Encoder::with_fun_identity`; the remaining blocker is runtime wiring (`beam_rt`). Unclosable by design (an `erl_eval` lambda's closure identity needs `erl_eval`/`erl_scan`/`erl_parse`).
+  - **`init:script_id/0`:** `boot_extra/init_script_id_names_the_running_otp_release` (A.9, `beam_rt: unsupported: init:script_id/0 (no boot script has been loaded)`) — the `-eval`/`run` path loads no boot script, so the runtime raises its typed `unsupported`; the oracle answers `{"Erlang/OTP","29"}`. The case asserts `init:script_id() =:= {"Erlang/OTP", erlang:system_info(otp_release)}` (release-independent), so it flips to `agree` once a boot script is loaded.
 - **Several agreeing cases keep a historical `_unsupported` id suffix** (the `-eval` literal/parser shapes, the `erlang:statistics/1` counters, the `monitor/3` `{tag,_}` option, the A.9 boot seam). The suffix is byte-stable so the ids are never renamed; each is an ordinary `agree` case.
 - NIF cases degrade to `skipped` (not a failure) when `cc`/`erl_nif.h` is absent, like the `erlc`-less module cases. The A.4 driver-registry hooks answer (`driver_c` selectors `8`/`9`: `lock_driver` -> `0`, `add`/`remove_driver_entry` -> `0`/`1`), carried over the `driver_output` byte channel.
 - **`--strict`** exits `1` while any `unsupported`/`skipped`/`mismatch` remains; `--strict --allowlist <file>` exits `0` while every gap is recorded and the allowlist is fresh (`known-gaps.txt` → exit `0`), and `1` on an unauthorized gap or a stale entry. `tests/cli.rs` pins that a lenient (`run`) invocation on an unsupported case stays exit `0`.
@@ -160,7 +161,6 @@ The binary's own `run`/`suite` exit codes are unchanged (`0` agree / `1` mismatc
   - ETS query surface (`beam_bifs`): `ets:select/1` rejects the `'$end_of_table'` sentinel; the continuation is a bare single-use ref; a `named_table` lookup by name and `ets:info/1,2` on a deleted table are `badarg`; `ets:info(T, owner)` is `undefined`.
   - NIF (`beam_abi`/`beam_rt`): a `.so`-suffixed `load_nif/2` path loads vs `…load_failed`; a **local** NIF call runs the `erlang:nif_error` stub; a module that does not stub every `ErlNifFunc` entry loads where the oracle refuses.
   - Port/driver (`beam_rt`/`beam_io`): the `{fd,…}` grammar is disjoint; `{line,N}` returns raw bytes; `eof` is never delivered; a non-iodata `port_command/2` is accepted; `port_info(P,registered_name)` is `badarg`; only the oracle writes a missing-`{spawn,Cmd}` shell stderr line.
-  - Maps (`beam_bifs`/`beam_term`): a map with **more than 32 keys** cannot be constructed (`maps:from_list/1`, `maps:put/3` -> `error:system_limit`) or decoded (`binary_to_term/1` of a `MAP_EXT` (116) blob); the 32-key edge agrees.
   - Records (`beam_bifs`/`beam_engine`): `records:update/4`'s unknown-field reason is nested vs flat; `put_record`'s create form is a typed `unsupported`; generic opcodes **192/193** cannot be emitted by the installed OTP-29 `erlc`.
   - Exceptions (`beam_engine`/`beam_rt`): calling a non-fun (`5(1)`) is `{badfun,5}` vs `badarg`.
   - `erlang:exit(self(), normal)` (`beam_bifs`/`beam_rt`): the oracle ignores it (`true`), the Rust runtime raises `exit:normal`.
@@ -215,13 +215,13 @@ Corpus groups (`src/corpus/*`; each file's own module doc is the per-case refere
 - `src/corpus/terms.rs` -> A.1: term ordering/equality, arithmetic
 - `src/corpus/semantics.rs` -> A.1: arithmetic/precedence, bignum, `==`/`=:=`/`=/=`, ordering, `case`/`if`/`try`, funs (incl. the `semantics/closure_*` calling-convention cases), comprehensions, maps/tuples/binaries
 - `src/corpus/errors.rs` -> A.1: the `throw`/`exit`/`error` classes and reasons, the common `badarg`/`badarith` failures, the structured `try … catch` reasons, `function_clause`/`undef`
-- `src/corpus/etf.rs` -> A.2: `term_to_binary` bytes + `binary_to_term` round-trips and the supported tag surface; the >32-key map divergence is documented, not registered
+- `src/corpus/etf.rs` -> A.2: `term_to_binary` bytes + `binary_to_term` round-trips (incl. the local-pid/reference identity round trips and the `[compressed]` variant) and the supported tag surface
 - `src/corpus/wire_ids.rs` -> A.2/A.5: local pid/port id images (`NEW_PID_EXT`/`V4_PORT_EXT`) + the node-identity surface (`node/0,1`, `nodes/0,1`, `set_cookie/2`); the per-VM-start id fields are never asserted
 - `src/corpus/nif.rs` -> A.3: the observable `erlang:nif_error/1,2` reason shapes
 - `src/corpus/nif_so.rs` -> A.3 end to end: `load_nif/2` of a real `cc`-built `.so` (round trips + a NIF `badarg`) and the `load_failed`/`bad_lib`/reload shapes, integer-classified
 - `src/corpus/nif_res.rs` -> A.3 end to end: the resource type + the `enif_make_resource`→`enif_get_resource` round trip, `enif_ioq_*`, the `erl_drv_thread`/sync and extra-environment families (a destructor is not pinned)
 - `src/corpus/nif_abi.rs` -> A.3 end to end (104 cases, integer-classified): one shared C `.so` whose single `ErlNifFunc` entry `probe/1` switches on an integer selector over the `enif_*` surface
-- `src/corpus/nif_abi_extra.rs` -> A.3 end to end (62 cases, `nif_extra/…`): a second selector-driven C `.so` over the `enif_*` boundary/edge/refusal shapes and the map/IOQ/thread families
+- `src/corpus/nif_abi_extra.rs` -> A.3 end to end (80 cases, `nif_extra/…`): a second C `.so` over the `enif_*` boundary/edge/refusal shapes and the map/IOQ/thread families — its extra `probe_term/2` entry takes an Erlang-built term (from the module's `built_term/1`) so the iolist positional-shape rules and bit-offset string/binary shapes (which the C API cannot construct) are pinnable
 - `src/corpus/records.rs` -> A.1/A.2/A.7: `erlc`-compiled native-record runs + `records:create/4`/`update/4`/`get_definition/2`
 - `src/corpus/ets.rs` -> A.7/A.1: the plain `ets:*` BIF surface + table-type and option handling
 - `src/corpus/ets_spec.rs` -> A.7: the `ets` query surface (27 cases: the `select`/`match`/`match_object` + continuation and delete/replace/count families, `match_spec_*`, the `ordered_set` arithmetic-key rule)
@@ -233,10 +233,10 @@ Corpus groups (`src/corpus/*`; each file's own module doc is the per-case refere
 - `src/corpus/driver.rs` -> A.4: the observable driver/port surface (`os:cmd/1`, the spawn-driver read path, `port_command/2,3`, `port_info/1,2` + after `port_close`, `ports/0`)
 - `src/corpus/driver_c.rs` -> A.4 end to end: a real C driver `.so` opened as a port (the lifecycle, `port_info`, the `port_command`→`output` echo round trip and the driver-registry fixtures), integer-classified
 - `src/corpus/driver_abi.rs` -> A.4 end to end (79 cases, integer-classified): one shared C driver `.so` dispatched by a one-byte `port_command/2` selector (the ABI checks, the `driver_output*` round trips, the select/timer arms, the term and `erl_drv_*` sync families)
-- `src/corpus/driver_abi_extra.rs` -> A.4 end to end (39 cases, `driver_extra/…`): a second driver `.so` over `driver_get_now/1`, the timeslice/`erl_drv_time_offset` accounting, the zero-length allocator edges and the remaining `ErlDrvTerm` operand tags
+- `src/corpus/driver_abi_extra.rs` -> A.4 end to end (47 cases, `driver_extra/…`): a second driver `.so` over `driver_get_now/1`, the timeslice/`erl_drv_time_offset` accounting, the port-queue (sizeq/enq/pushq/peekq/deq) and `driver_pdl_*`/`get_port_flags` families, the zero-length allocator edges and the remaining `ErlDrvTerm` operand tags, plus a fixture-free `driver_builtin` module pinning the `tcp_inet` built-in driver resolution
 - `src/corpus/wire.rs` -> A.5: the distribution/ETF wire tag codec (the canonical flatmap key order byte-exactly, the legacy→modern id upgrades, `EXPORT_EXT`/`NEW_FUN_EXT`, `compressed` both ways, the version framing); a live handshake / `DOP_*` loopback needs two nodes and is a documented gap
 - `src/corpus/wire_extra.rs` -> A.5 (238 cases): the tag-level byte goldens + round trips, the `VERSION_MAGIC`/`compressed`/`{minor_version,_}` framing + the `[safe]`/`[used]` surface, the decode-side hand-built blobs, the `EXPORT_EXT`/`NEW_FUN_EXT` images, the `DOP_*` control-message tuples + `ERL_DIST_HEADER` framing, the external-id shape predicates
-- `src/corpus/bifs.rs` -> A.7: the BIF/OTP-app surface (`length`, `integer_to_binary`, `lists:*`, `maps:get`, binary ops, `io_lib:format`) + the timer, process-control and code-loading families, `erts_debug:size/1`, `erts_internal:cmp_term/2`
+- `src/corpus/bifs.rs` -> A.7: the BIF/OTP-app surface (`length`, `integer_to_binary`, `lists:*`, `maps:get`, binary ops, `io_lib:format`, the zero-length `base64:encode/1` result) + the timer, process-control and code-loading families, `erts_debug:size/1`, `erts_internal:cmp_term/2`
 - `src/corpus/ets_access.rs` -> A.7: the ETS access-control matrix (owner/non-owner × `public`/`protected`/`private`) + the deliberately ungated `ets:info/1,2`; the *denied* cells are a divergence and are not in the corpus
 - `src/corpus/proc_signals.rs` -> A.7: group-leader get/set + inheritance, the `dt_spread_tag/1`/`dt_restore_tag/1` switches, `erlang:statistics/1` (every counter agrees) and the `spawn_monitor`/`monitor` reference + `DOWN` shapes
 - `src/corpus/proc_control.rs` -> A.7: `monitor`/`demonitor`, the deterministic `DOWN` reasons, the `exit/1,2` target taxonomy and its caught-`EXIT` shape, `register`/`whereis` and the run-queue priorities; `exit(self(), normal)` is deliberately absent
@@ -244,17 +244,17 @@ Corpus groups (`src/corpus/*`; each file's own module doc is the per-case refere
 - `src/corpus/flags.rs` -> A.6: `init:get_argument/1`, `init:get_plain_arguments/0`, `-pa`/`-pz` multiplicity, repeated/bare flags, `-setcookie`/`-sname`/`-name`, app-env flags, the emulator `+`-flags via `system_info/1` (incl. the `+Q N` matrix), the `ERL_*FLAGS` merge and the `+hmax*`/`+hms`/`+hmbs` family
 - `src/corpus/boot.rs` -> A.9: the version banner, the code-server + `application:*` observability (`code:*`, `init:get_status/0`, `application:get_env/*`) and the boot-time process surface
 - `src/corpus/boot_prereq.rs` -> A.9 (52 cases, `boot/…` ids; the file carries the OTP Apache-2.0 header): the boot-path prerequisite primitives (`erlang:pre_loaded/0`, `which_applications/0`, `code:is_loaded(init)`, `register/2`+`whereis/1`), the `-boot` init argument (A.6) and the `proc_lib:start_link/4` case
-- `src/corpus/boot_extra.rs` -> A.9 (105 cases): the frozen `erlang:pre_loaded/0` set + its whole-set checks, the code server's view of every preloaded module, the `function_exported/3` floor, the kernel registered-name manifest, `init`/boot status, the preloaded `persistent_term`/`atomics` floors and the release-stable constants
-- `src/corpus/modules.rs` -> A.2/A.1/A.7 module-run cases: embedded `erlc`-compiled modules run under both runtimes (the genuine-agreement core)
+- `src/corpus/boot_extra.rs` -> A.9 (131 cases): the frozen `erlang:pre_loaded/0` set + its whole-set checks, the code server's view of every preloaded module, the `function_exported/3` floor, the kernel registered-name manifest, `init`/boot status, the preloaded `persistent_term`/`atomics` floors, the release-stable constants, and the "installation view" (`application:get_all_key/1`/`get_key/1,2`/`get_application/0,1`, `init:get_argument(progname|bindir)` shape-only, `code:lib_dir/2`, the `filelib:*` absent-path probes; `init:script_id/0` is the allowlisted gap)
+- `src/corpus/modules.rs` -> A.2/A.1/A.7 module-run cases: embedded `erlc`-compiled modules run under both runtimes (the genuine-agreement core), incl. the `erl_error:format_exception/3` heap-reason-crash regression cases and a `run`-action zero-length-binary case
 - `src/corpus/mexec.rs` -> A.2/A.7: the "modules execute" sweep — tiny wrappers whose int-arg functions call a real system module end-to-end
 - `src/corpus/mexec_extra.rs` -> A.2/A.7 (60 cases, `mexec_extra/…`): a second block of real-system-module wrappers over a broad slice of the installed standard library; every wrapper returns an integer, so no golden renders a map or a multiset
 
 Harness / data:
-- `tests/common/mod.rs` -> shared integration-test support: `fresh_rust_runtime()`/`fresh_rust_spec()` + `scratch_root()`
+- `tests/common/mod.rs` -> shared integration-test support: `fresh_rust_runtime()`/`fresh_rust_spec()` + `scratch_root()` + `corpus_run_lock()` (the process-wide mutex serializing the corpus-running `tests/cli.rs` bodies against epmd node-name contention)
 - `tests/abi.rs` -> A.3/A.4 structural C-ABI check: `-fsyntax-only`-compiles a C TU referencing the `enif_*`/`driver_*`/`erl_drv_*` surface and `_Static_assert`s the frozen sizes/offsets, against the in-tree legacy C headers `erts/emulator/beam/{erl_nif.h,erl_driver.h}` (a manual mirror of `crates/beam_abi/src/layout.rs`); a missing header or compiler ⇒ a loud skip, never a failure.
 - `tests/module_sweep.rs` -> the broad real-module **execute** sweep (277 entries / 35 real system modules; 273 `agree` + 4 `unsupported`) - asserts `Agree`/`Unsupported`, never `Mismatch`; skips loudly without the oracle
 - `tests/oracle.rs` -> oracle-backed integration tests (golden reproduction for eval + module cases incl. the NIF fixtures, oracle-vs-oracle, missing Rust runtime)
-- `tests/cli.rs` -> end-to-end binary tests (exit codes, `--help`, `--out` report, `list`, injected fresh `$BEAM_RT`, fake `$BEAM_RT` mismatch/unsupported/exit-3, the allowlist ratchet against the real corpus, `--allowlist` without `--strict` and a missing allowlist file, boot-banner-vs-real-stderr classification, the verdict-bucket invariant)
+- `tests/cli.rs` -> end-to-end binary tests (exit codes, `--help`, `--out` report, `list`, injected fresh `$BEAM_RT`, fake `$BEAM_RT` mismatch/unsupported/exit-3, the allowlist ratchet against the real corpus, `--allowlist` without `--strict` and a missing allowlist file, boot-banner-vs-real-stderr classification, the verdict-bucket invariant). The four tests that run the **real corpus** hold the process-wide `common::corpus_run_lock()` for their whole body, so at most one full sweep (hence one `-sname`/`-name` `erl`) runs at a time — two concurrent sweeps race for the same `epmd` node name, and the losing oracle then fails to reproduce `flags/sname_switch_value`'s golden, surfacing as a **spurious oracle-side mismatch**. Do not remove the lock.
 - `gate.sh` -> the CI gate wrapper over `suite --strict --allowlist known-gaps.txt` implementing the `0/1/2/3` ratchet contract
 - `known-gaps.txt` -> the committed known-gaps allowlist (one `<case-id> <owning-crate> <reason…>` per line; `#` comments and blank lines ignored) — the ratchet's source of truth
 - `GAPS.md` -> the generated gaps document (`--gaps`), never hand-edited; it appends the hand-maintained `divergences.md` ledger of observed-but-unpinned divergences
