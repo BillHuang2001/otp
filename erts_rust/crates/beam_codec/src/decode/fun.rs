@@ -169,14 +169,20 @@ impl<'a> Decoder<'a> {
     /// external-pid block on `heap`.
     ///
     /// The C decodes a term and requires `is_pid(temp)` before discarding it
-    /// (`external.c:5153-5160`); the length-delimited pid forms that can appear here
-    /// are `PID_EXT` (`103`) and `NEW_PID_EXT` (`88`). Reading their fields directly
-    /// keeps the node atom's interning in wire order and leaves the caller's heap
-    /// free of the dead block; any other tag (including a `LOCAL_EXT` pid, which this
-    /// codec does not support) is `BadArg`.
+    /// (`external.c:5153-5160`), so *every* pid form the generic walker accepts is
+    /// valid here: `PID_EXT` (`103`), `NEW_PID_EXT` (`88`) and — because `[local]`
+    /// makes the C substitute the internal `NIL` sysname for an internal pid
+    /// (`ERTS_DIST_EXT_INTERNAL_NC`, `external.c:2978`) — a `LOCAL_EXT` (`121`)
+    /// wrapper around either. Reading their fields directly keeps the node atom's
+    /// interning in wire order and leaves the caller's heap free of the dead block.
     ///
-    /// The C encoder always emits the `88` form (`enc_pid` on `erts_init_process_id`,
-    /// `external.c:3989`), and `103` is accepted because it, too, decodes to a pid.
+    /// Because the C routes the creator through the same `dec_pid` the plain
+    /// `Tag::Pid` arm uses, a *local* creator is subject to the same
+    /// number/serial bound (D6) and a `LOCAL_EXT` hash is verified (D4) whenever
+    /// the caller installed the identity ([`Decoder::with_local_node`] /
+    /// [`Decoder::with_local_node_hash`]); both are inert otherwise.
+    ///
+    /// Any other tag is `BadArg`, exactly as the C's `is_pid` test rejects it.
     fn decode_creator_pid(&mut self, heap: &mut Heap, atoms: &mut AtomTable) -> Result<FunPid> {
         let tag = Tag::from_byte(self.reader.u8()?).ok_or_else(bad_arg)?;
         match tag {
@@ -192,6 +198,7 @@ impl<'a> Decoder<'a> {
                 if creation > 3 {
                     return Err(bad_arg());
                 }
+                self.check_local_pid(node, creation, number, serial)?;
                 Ok(FunPid {
                     node: atom_val(node),
                     number,
@@ -204,12 +211,21 @@ impl<'a> Decoder<'a> {
                 let number = self.reader.u32be()?;
                 let serial = self.reader.u32be()?;
                 let creation = self.reader.u32be()?;
+                self.check_local_pid(node, creation, number, serial)?;
                 Ok(FunPid {
                     node: atom_val(node),
                     number,
                     serial,
                     creation,
                 })
+            }
+            // A `LOCAL_EXT`-wrapped pid: `dec_term`'s `case LOCAL_EXT` consumes the
+            // 4-byte node hash and re-enters with the internal-node flag
+            // (`external.c:5250-5254`), so the wrapped pid is the creator.
+            Tag::Local => {
+                let node_hash = self.reader.u32be()?;
+                self.check_local_node_hash(node_hash)?;
+                self.decode_creator_pid(heap, atoms)
             }
             _ => Err(bad_arg()),
         }
