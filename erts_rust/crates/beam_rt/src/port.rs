@@ -1358,9 +1358,10 @@ impl RuntimePorts {
     /// The reply is the **driver's own bytes**: this method never invents one, so an unsupported
     /// driver state is a typed error rather than an empty answer.
     ///
-    /// No `PortHook` method takes it yet — the port-control BIF arm
-    /// (`erts_internal:port_control/3`) does not exist — so this is the entry point that arm will
-    /// call (see `src/port/CONTEXT.md`'s Handoffs for the exact seam).
+    /// No `PortHook` method takes it yet — the reachable port-control entry is
+    /// [`PortRegistry::port_control`], called directly by the native floor's
+    /// `erlang:port_control/3` (`src/native/port.rs`) — so this method is retained for a
+    /// `runtime.rs`-internal caller (see `src/port/CONTEXT.md`'s API Surface note).
     ///
     /// # Errors
     ///

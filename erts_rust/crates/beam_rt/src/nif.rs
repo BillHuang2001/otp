@@ -62,18 +62,19 @@
 //! four counter sequences), the emulator information block (`system_info`) and the
 //! extra-environment family (`alloc_env`/`free_env`/`make_copy`).
 //!
-//! Four hooks need state the host does not own — a fresh reference (`enif_make_ref`), a name lookup
-//! (`enif_whereis_pid`) and the two liveness answers (`enif_is_process_alive`,
-//! `enif_is_current_process_alive`) — and reach it through the optional [`NifHostServices`] provider
-//! threaded in at construction. The **per-call** host (built by
+//! Six hooks need state the host does not own — a fresh reference (`enif_make_ref`), a name lookup
+//! (`enif_whereis_pid`), the two liveness answers (`enif_is_process_alive`,
+//! `enif_is_current_process_alive`) and the two port relations (`enif_is_port_alive`,
+//! `enif_port_command`) — and reach it through the optional [`NifHostServices`] provider threaded in
+//! at construction. The **per-call** host (built by
 //! [`RuntimeContext::try_call_nif`](crate::context::RuntimeContext)) carries a
-//! [`RuntimeNifServices`] over the runtime's reference-id allocator, its reference registry and its
-//! process table, so all four are live there. The **load/unload** host (built by
+//! [`RuntimeNifServices`] over the runtime's reference-id allocator, its reference registry, its
+//! process table and its port registry, so all six are live there. The **load/unload** host (built by
 //! [`NifBridge::load_nif`](crate::context::bridges::NifBridge)) is *moved into* the runtime's NIF
 //! registry, so it cannot borrow the runtime and is built with `services = None`: those hooks then
 //! stay the trait default (the typed `None`), so a `load`/`unload` callback can never fabricate a
-//! reference, a pid or a liveness answer. `erlang:load_nif/2` on an already-loaded module is a
-//! `reload` (the oracle's rule since OTP 20).
+//! reference, a pid, a liveness answer or a delivery. `erlang:load_nif/2` on an already-loaded module
+//! is a `reload` (the oracle's rule since OTP 20).
 //!
 //! # Hooks still at the trait default — and exactly why
 //!
@@ -93,13 +94,6 @@
 //!   to the calling process and reports whether its timeslice is exhausted. The provider holds the
 //!   process table **immutably** (`Process::bump_reductions` takes `&mut`), and the hook's `bool`
 //!   cannot express "unsupported": the honest answer is the default `false` ("do not yield").
-//! * **`is_port_alive`** / **`port_command`** (`:2340-2357`, `:1097-1133`) — the port table is this
-//!   crate's [`PortRegistry`](crate::port::PortRegistry) and `Runtime::ports` is an `Rc<RefCell<..>>`,
-//!   so a *cheap clone* reaches its `contains`/`write_command` (the
-//!   [`crate::context::ProcessBridge`] pattern). To close: **one field** on [`RuntimeNifServices`]
-//!   plus one line at its construction site in `crate::context`. The C sends a **term**
-//!   (`erts_port_output_async`), so faithfulness needs the term-carrying driver path too. Defaults:
-//!   `None` ⇒ `0` and `0`.
 //! * **`whereis_port`** (`:1182`) — resolves a name to a **port**. This runtime's name registry holds
 //!   pids only and `erlang:register/2` refuses a port (`ProcessId::from_eterm`), so no atom can ever
 //!   name a port here: `None` (⇒ `0`) is the *provable* answer, not a missing feature.
@@ -1163,13 +1157,21 @@ mod tests {
     }
 
     /// The [`NifHostServices`] provider a host delegates `make_ref`/`whereis_pid`/`is_process_alive`
-    /// to, recording that `make_ref` was handed the host's own heap.
+    /// (and the two port hooks) to, recording that `make_ref` was handed the host's own heap and
+    /// that `port_command` was reached at all.
     struct MockServices {
         reference: Eterm,
         name: Eterm,
         /// The pid `whereis_pid` resolves `name` to, and the one pid that is "live".
         pid: Eterm,
+        /// The one **port** term `is_port_alive` reports live and `port_command` accepts.
+        port: Eterm,
+        /// The `data` term `port_command` accepts for [`Self::port`]; anything else is refused —
+        /// the provider's own `Some(false)`, which is *not* the "cannot answer" `None`.
+        accepted: Eterm,
         saw_heap: bool,
+        /// Whether `port_command` reached the provider (vs. being answered by a trait default).
+        saw_port_command: bool,
     }
 
     impl NifHostServices for MockServices {
@@ -1185,6 +1187,15 @@ mod tests {
         fn is_process_alive(&mut self, pid: Eterm) -> Option<bool> {
             Some(pid == self.pid)
         }
+
+        fn is_port_alive(&mut self, port: Eterm) -> Option<bool> {
+            Some(port == self.port)
+        }
+
+        fn port_command(&mut self, port: Eterm, data: Eterm) -> Option<bool> {
+            self.saw_port_command = true;
+            Some(port == self.port && data == self.accepted)
+        }
     }
 
     /// `make_ref`/`whereis_pid`/`is_process_alive` delegate to the borrowed provider (the reference
@@ -1199,7 +1210,10 @@ mod tests {
             reference: make_small(11),
             name: registered,
             pid: make_small(22),
+            port: make_small(0),
+            accepted: make_small(0),
             saw_heap: false,
+            saw_port_command: false,
         };
         let mut host = host_as(make_small(7), &mut services);
         assert_eq!(
@@ -1236,7 +1250,10 @@ mod tests {
             reference: make_small(11),
             name: make_small(0),
             pid: live,
+            port: make_small(0),
+            accepted: make_small(0),
             saw_heap: false,
+            saw_port_command: false,
         };
 
         // The host whose own pid is the live one: both hooks answer `true`.
@@ -1268,6 +1285,159 @@ mod tests {
         assert_eq!(bare.is_current_process_alive(), None);
     }
 
+    /// The two **port** hooks delegate to the provider with the very terms the NIF passed
+    /// (`enif_is_port_alive` forwards `to_port.port_id`, `enif_port_command` the message), and stay
+    /// the typed `None` when the host carries no provider (the load/unload host) — never a
+    /// fabricated liveness and never a fabricated delivery.
+    #[test]
+    fn the_port_hooks_delegate_to_the_provider() {
+        let live = make_small(31);
+        let other = make_small(32);
+        let accepted = make_small(33);
+        let mut services = MockServices {
+            reference: make_small(11),
+            name: make_small(0),
+            pid: make_small(0),
+            port: live,
+            accepted,
+            saw_heap: false,
+            saw_port_command: false,
+        };
+
+        let mut host = host_as(make_small(7), &mut services);
+        assert_eq!(host.is_port_alive(live), Some(true), "the live port");
+        assert_eq!(
+            host.is_port_alive(other),
+            Some(false),
+            "another port is the provider's `false`, not the `None` a missing hook answers"
+        );
+        assert_eq!(
+            host.port_command(live, accepted),
+            Some(true),
+            "the live port accepts the message"
+        );
+        assert_eq!(
+            host.port_command(live, other),
+            Some(false),
+            "the provider refuses data it does not accept"
+        );
+        assert_eq!(
+            host.port_command(other, accepted),
+            Some(false),
+            "a port the provider does not hold refuses the write"
+        );
+        drop(host);
+        assert!(
+            services.saw_port_command,
+            "port_command reached the provider rather than a trait default"
+        );
+
+        // No provider (the load/unload host): the typed default, never a fabricated answer.
+        let (mut bare, _atoms, _interner) = host_with(&[]);
+        assert_eq!(bare.is_port_alive(live), None);
+        assert_eq!(bare.port_command(live, accepted), None);
+    }
+
+    /// The provider answers the runtime's **real** port registry: a live port is `true`, a port the
+    /// registry does not hold and a non-port are `false` (`!!erts_port_lookup`, `erl_nif.c:2344`),
+    /// and `enif_port_command` really writes the message's bytes to the port's write stream — the
+    /// port's own `output` total proves the bytes arrived.
+    #[test]
+    fn runtime_services_answer_port_liveness_and_really_write_to_the_port() {
+        let mut runtime = crate::Runtime::with_defaults().expect("the default runtime");
+        // A real, live `{spawn_driver, _}` port whose `output` callback accepts every write.
+        let (port, _flags) =
+            crate::port::test_support::register_control_port(&mut runtime, "nif_port_hooks", vec![]);
+        // The message bytes, built on the runtime's own arena (`"hello"` as an Erlang char list) —
+        // exactly the iodata shape a NIF's `enif_port_command` receives.
+        let data = runtime
+            .materialize_args(&[crate::ArgTerm::Str("hello".to_string())])
+            .expect("a char list")[0];
+
+        let mut services = services_of(&mut runtime);
+        assert_eq!(
+            services.is_port_alive(port.to_eterm()),
+            Some(true),
+            "the registered port is live"
+        );
+        assert_eq!(
+            services.is_port_alive(beam_process::PortId::new(9999).to_eterm()),
+            Some(false),
+            "a port the registry never allocated is not live"
+        );
+        for not_a_port in [make_small(1), NIL, make_atom(Atom::from_raw(0))] {
+            assert_eq!(
+                services.is_port_alive(not_a_port),
+                Some(false),
+                "a non-port names no live port ({not_a_port:?})"
+            );
+        }
+        // A refused write: a port the registry does not hold, and data that is not iodata.
+        assert_eq!(
+            services.port_command(beam_process::PortId::new(9999).to_eterm(), data),
+            Some(false),
+            "writing to an unknown port fails"
+        );
+        assert_eq!(
+            services.port_command(port.to_eterm(), make_small(42)),
+            Some(false),
+            "a bare integer is not iodata"
+        );
+        // The accepted write.
+        assert_eq!(
+            services.port_command(port.to_eterm(), data),
+            Some(true),
+            "the live port accepts the char list"
+        );
+        drop(services);
+
+        // The bytes really reached the port: its own `output` total is the five bytes written.
+        let output = runtime.code_server_atoms_mut().intern("output");
+        let mut sink = beam_bifs::NullSink;
+        let mut context = crate::context::RuntimeContext::with_output(&mut runtime, &mut sink);
+        let pair = beam_engine::ExecutionContext::call_bif(
+            &mut context,
+            "erlang",
+            "port_info",
+            2,
+            &[port.to_eterm(), make_atom(output)],
+        )
+        .expect("port_info/2");
+        assert_eq!(
+            beam_engine::terms::tuple_element(pair, 1).expect("the pair's value"),
+            make_small(5),
+            "the five written bytes are the port's own output total"
+        );
+    }
+
+    /// A registry that is **already borrowed** cannot be reached: both port hooks answer the typed
+    /// "cannot answer" `None` (`try_borrow`/`try_borrow_mut`, never a panicking `borrow_mut`), and
+    /// answer again once the borrow is released.
+    #[test]
+    fn a_borrowed_port_registry_degrades_to_none() {
+        let mut runtime = crate::Runtime::with_defaults().expect("the default runtime");
+        // Hold the registry exactly as a port BIF holds it for the length of its call. The handle
+        // is a clone of the `Rc`, so the runtime itself stays borrowable for the provider.
+        let ports = Rc::clone(&runtime.ports);
+        let held = ports.try_borrow_mut().expect("the port table is not borrowed");
+        let mut services = services_of(&mut runtime);
+        let port = beam_process::PortId::new(1).to_eterm();
+        assert_eq!(
+            services.is_port_alive(port),
+            None,
+            "a borrowed registry cannot answer liveness"
+        );
+        assert_eq!(
+            services.port_command(port, NIL),
+            None,
+            "a borrowed registry cannot accept a write"
+        );
+        drop(held);
+        // With the borrow released the very same provider answers again — the `None` was the
+        // borrow, never a fabricated refusal.
+        assert_eq!(services.is_port_alive(port), Some(false));
+        assert_eq!(services.port_command(port, NIL), Some(false));
+    }
     /// The provider answers the runtime's **real** process table: the root process is live, an
     /// unallocated pid is not, and a term that is not a pid names no live process.
     #[test]
