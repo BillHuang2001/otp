@@ -462,6 +462,32 @@ const EXPECTED: &[(&str, &str)] = &[
     ("select_guard_map_get", "ok:[1]"),
     ("select_guard_tuple_size", "ok:[1]"),
     ("select_guard_size_family", "ok:[1]"),
+    (
+        "select_guard_ceil_floor",
+        "{ok:[1,2],ok:[2],ok:[1]}",
+    ),
+    ("select_guard_max_min", "{ok:[1],ok:[2]}"),
+    ("select_guard_binary_part2", "ok:[1]"),
+    ("select_guard_binary_part3", "ok:[1]"),
+    ("select_guard_is_record3", "ok:[true,false,false]"),
+    (
+        "select_guard_is_function2",
+        "{ok:[],ok:[false,false]}",
+    ),
+    ("select_guard_is_integer3", "ok:[2]"),
+    (
+        "select_body_node0",
+        "ok:[nonode@nohost,nonode@nohost]",
+    ),
+    (
+        "select_guard_xor_body",
+        "{ok:[1,2],ok:[false,false]}",
+    ),
+    ("select_body_bnot", "ok:[-11,-21]"),
+    (
+        "select_head_map_nonliteral_key",
+        "{badarg,badarg}",
+    ),
     ("select_guard_float_arith", "ok:[2]"),
     ("select_body_whole", "[{1,a,10},{2,b,20}]"),
     ("select_body_var", "[1,2]"),

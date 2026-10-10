@@ -192,6 +192,17 @@ battery() ->
     emit("select_guard_map_get", select_guard_map_get()),
     emit("select_guard_tuple_size", select_guard_tuple_size()),
     emit("select_guard_size_family", select_guard_size_family()),
+    emit("select_guard_ceil_floor", select_guard_ceil_floor()),
+    emit("select_guard_max_min", select_guard_max_min()),
+    emit("select_guard_binary_part2", select_guard_binary_part2()),
+    emit("select_guard_binary_part3", select_guard_binary_part3()),
+    emit("select_guard_is_record3", select_guard_is_record3()),
+    emit("select_guard_is_function2", select_guard_is_function2()),
+    emit("select_guard_is_integer3", select_guard_is_integer3()),
+    emit("select_body_node0", select_body_node0()),
+    emit("select_guard_xor_body", select_guard_xor_body()),
+    emit("select_body_bnot", select_body_bnot()),
+    emit("select_head_map_nonliteral_key", select_head_map_nonliteral_key()),
     emit("select_guard_float_arith", select_guard_float_arith()),
     emit("select_body_whole", select_body_whole()),
     emit("select_body_var", select_body_var()),
@@ -825,6 +836,86 @@ select_guard_size_family() ->
     S = [{{'$1', '$2'}, [{'andalso', {'==', {byte_size, '$2'}, 3},
                                   {'==', {bit_size, '$2'}, 24}}], ['$1']}],
     cap_str(fun() -> inorder(ets:select(T, S)) end).
+
+select_guard_ceil_floor() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, 3}), ets:insert(T, {2, 2.5}),
+    S1 = [{{'$1', '$2'}, [{'==', {ceil, '$2'}, 3}], ['$1']}],
+    S2 = [{{'$1', '$2'}, [{'==', {floor, '$2'}, 2}], ['$1']}],
+    S3 = [{{'$1', '$2'}, [{'==', {ceil, '$2'}, '$2'}], ['$1']}],
+    t([cap_str(fun() -> inorder(ets:select(T, S1)) end),
+       cap_str(fun() -> inorder(ets:select(T, S2)) end),
+       cap_str(fun() -> inorder(ets:select(T, S3)) end)]).
+
+select_guard_max_min() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, 5}), ets:insert(T, {2, 9}),
+    S1 = [{{'$1', '$2'}, [{'==', {max, '$2', 7}, 7}], ['$1']}],
+    S2 = [{{'$1', '$2'}, [{'==', {min, '$2', 7}, 7}], ['$1']}],
+    t([cap_str(fun() -> inorder(ets:select(T, S1)) end),
+       cap_str(fun() -> inorder(ets:select(T, S2)) end)]).
+
+select_guard_binary_part2() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, <<1,2,3,4>>}), ets:insert(T, {2, <<5,6,7,8>>}),
+    S = [{{'$1', '$2'}, [{'==', {binary_part, '$2', {const, {1, 2}}}, <<2,3>>}], ['$1']}],
+    cap_str(fun() -> inorder(ets:select(T, S)) end).
+
+select_guard_binary_part3() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, <<1,2,3,4>>}), ets:insert(T, {2, <<5,6,7,8>>}),
+    S = [{{'$1', '$2'}, [{'==', {binary_part, '$2', 1, 2}, <<2,3>>}], ['$1']}],
+    cap_str(fun() -> inorder(ets:select(T, S)) end).
+
+select_guard_is_record3() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, {person, alice, 42}}),
+    ets:insert(T, {2, {person, alice}}),
+    ets:insert(T, {3, {animal, bob, 7}}),
+    S = [{{'$1', '$2'}, [], [{is_record, '$2', person, 3}]}],
+    cap_str(fun() -> inorder(ets:select(T, S)) end).
+
+select_guard_is_function2() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, 10}), ets:insert(T, {2, 20}),
+    S = [{{'$1', '$2'}, [{is_function, '$2', 0}], ['$1']}],
+    SB = [{{'$1', '$2'}, [], [{is_function, '$2', 0}]}],
+    t([cap_str(fun() -> inorder(ets:select(T, S)) end),
+       cap_str(fun() -> inorder(ets:select(T, SB)) end)]).
+
+select_guard_is_integer3() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, 3}), ets:insert(T, {2, 10}), ets:insert(T, {3, 30}),
+    S = [{{'$1', '$2'}, [{is_integer, '$2', 5, 25}], ['$1']}],
+    cap_str(fun() -> inorder(ets:select(T, S)) end).
+
+select_body_node0() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, 10}), ets:insert(T, {2, 20}),
+    S = [{{'$1', '$2'}, [], [{node}]}],
+    cap_str(fun() -> inorder(ets:select(T, S)) end).
+
+select_guard_xor_body() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, 10}), ets:insert(T, {2, 20}),
+    S = [{{'$1', '$2'}, [{'xor', true, false}], ['$1']}],
+    SB = [{{'$1', '$2'}, [], [{'xor', true, true}]}],
+    t([cap_str(fun() -> inorder(ets:select(T, S)) end),
+       cap_str(fun() -> inorder(ets:select(T, SB)) end)]).
+
+select_body_bnot() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, 10}), ets:insert(T, {2, 20}),
+    S = [{{'$1', '$2'}, [], [{'bnot', '$2'}]}],
+    cap_str(fun() -> inorder(ets:select(T, S)) end).
+
+select_head_map_nonliteral_key() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, #{a => 1}}),
+    S1 = [{{'$1', #{'$2' => '$3'}}, [], ['$1']}],
+    S2 = [{{'$1', {'$2', #{'$3' => '$4'}}}, [], ['$1']}],
+    t([cap_str(fun() -> inorder(ets:select(T, S1)) end),
+       cap_str(fun() -> inorder(ets:select(T, S2)) end)]).
 
 select_guard_float_arith() ->
     T = new(ordered_set),
