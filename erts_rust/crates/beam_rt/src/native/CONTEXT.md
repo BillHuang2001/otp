@@ -341,7 +341,15 @@ The reply tag is **paired** with the request tag, never echoed: `{io_request, �
   `latin1`/`unicode`; and a request for a pid with no registered device (the "closed io device"
   gap). The `{get_chars, …}` arm does not consult the stashed buffer, and a `{utf16,_}`/`{utf32,_}`
   **stream** encoding is read as `latin1` (both shared divergences).
-* **Other io-device requests stay the typed `unsupported` gap** — `get_line`/`setopts`/`getopts`/
+* **`{get_line,Enc,_Prompt}` is served** by [`file_server/get_line.rs`](file_server/get_line.rs):
+  the same device loop drives the `LineContinuation` (the oracle's `io_lib:collect_line/4` plus
+  `cast/4`), so `file:read_line/1` and `io:get_line/2` on a file device complete. Remaining typed
+  gaps of that request: a **request** `Enc` that is neither `latin1` nor `unicode` (incl. a
+  non-atom); invalid UTF-8 on a `unicode` device surfaces `beam_io`'s `invalid_unicode` stop where
+  the oracle answers `{error,{no_translation,unicode,latin1}}`; and after that `no_translation`
+  retire a further request hits the "closed io device" gap rather than the oracle's
+  `{error,terminated}`.
+* **Other io-device requests stay the typed `unsupported` gap** — `setopts`/`getopts`/
   `pread`/`pwrite`/`advise`/`allocate`/`read_handle_info`, the legacy `put_chars` arities, a
   non-`latin1` encoding and `read_file_info`/`write_file`.
 * **A scheduled process's `gen_server:call` to the service cannot complete** — the engine's
