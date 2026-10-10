@@ -458,6 +458,10 @@ pub struct Runtime {
     /// request decoding, reply shaping and scheduler-pass step); the field itself is the
     /// state that ties the registered `file_server_2` pid to the runtime.
     pub(crate) file_services: crate::native::file_server::FileServices,
+    /// The `{Name, Vsn}` header of the OTP boot script this runtime has **loaded**, or
+    /// `None` before any script was read/executed — the source of `init:script_id/0`. Set
+    /// by [`Runtime::boot_from_script`] / [`Runtime::boot_from_script_reporting`].
+    boot_script_id: Option<(String, String)>,
 }
 
 impl Runtime {
@@ -597,6 +601,7 @@ impl Runtime {
             perf_map,
             open_files: HashMap::new(),
             file_services,
+            boot_script_id: None,
         })
     }
 
@@ -641,6 +646,17 @@ impl Runtime {
     /// Whether the boot sequence has run.
     pub fn is_booted(&self) -> bool {
         self.booted
+    }
+
+    /// The `{Name, Vsn}` header of the boot script this runtime loaded, if any — the source
+    /// of `init:script_id/0` (see [`crate::native::init`]).
+    ///
+    /// `None` until a script has been read through [`Runtime::boot_from_script`] /
+    /// [`Runtime::boot_from_script_reporting`].
+    pub fn boot_script_id(&self) -> Option<(&str, &str)> {
+        self.boot_script_id
+            .as_ref()
+            .map(|(name, vsn)| (name.as_str(), vsn.as_str()))
     }
 
     /// The configuration this runtime was created with.
@@ -1094,6 +1110,9 @@ impl Runtime {
     pub fn boot_from_script(&mut self, path: impl AsRef<Path>) -> Result<BootScript> {
         self.boot_if_needed()?;
         let script = bootscript::read(path.as_ref())?;
+        // Record the script's real `{Name, Vsn}` header before executing it, so
+        // `init:script_id/0` can answer it even if execution later stops early.
+        self.boot_script_id = Some((script.name.clone(), script.vsn.clone()));
         bootscript::execute(self, &script)?;
         Ok(script)
     }
@@ -1133,6 +1152,7 @@ impl Runtime {
                 })
             }
         };
+        self.boot_script_id = Some((script.name.clone(), script.vsn.clone()));
         bootscript::execute_reporting(self, &script)
     }
     /// **The slice.** Loads `path`, caches the module, runs `function/arity` with
