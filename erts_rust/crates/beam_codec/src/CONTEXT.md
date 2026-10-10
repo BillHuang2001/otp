@@ -23,7 +23,6 @@ map for the source subtree and the notes the child nodes inherit.
 - `decode_term_with_local_node(bytes, heap, atoms, node, creation)` — the
   identity-carrying `decode_term` (compressed + plain), so a `binary_to_term` image
   can demote local-node pids/ports/refs. Re-exported from `lib.rs`/`prelude.rs`.
-
 ## Constraints
 - Inherited from [`../CONTEXT.md`](../CONTEXT.md) §Constraints (errors only through
   `beam_common::{Result, BeamError}`; additive + inert seams; `.rs` files carry the
