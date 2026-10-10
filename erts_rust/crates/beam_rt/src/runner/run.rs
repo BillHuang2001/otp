@@ -435,7 +435,16 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 // `x(0)`, not an exit reason: copy it onto the runtime's pointer-stable
                 // arena (so it outlives the process, whose own heap dies with it) and
                 // record it, then terminate the process normally.
-                let value = self.runtime.stabilize_term(value)?;
+                //
+                // The machine is still in scope and holds the off-heap payload handles for
+                // the refc binaries it built (a `bs_init_writable` accumulator, or any
+                // `bs_create_bin` result above the on-heap limit), so the copy resolves them
+                // through this machine's handles instead of refusing the term with the empty
+                // source table the simple form uses (see
+                // [`Runtime::stabilize_term_with`](crate::runtime::Runtime::stabilize_term_with)).
+                let value = self
+                    .runtime
+                    .stabilize_term_with(value, engine.machine.refc_binaries())?;
                 self.state.results.insert(pid, value);
                 Ok(RunOutcome::Exit(normal(self.runtime)))
             }
@@ -487,8 +496,15 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 // reason that *genuinely* cannot be copied is the honest `error:system_limit`
                 // (it is propagated, never stored dangling), while the documented off-heap
                 // capability gap keeps the original term and freezes the heaps — see
-                // `Runtime::try_stabilize_escaped`.
-                let reason = self.runtime.try_stabilize_escaped(reason)?;
+                // `Runtime::try_stabilize_escaped_with`.
+                //
+                // The machine is still in scope and owns the off-heap payload handles for the
+                // refc binaries it built, so the copy resolves them (a reason like
+                // `exit(<<big/binary>>)` would otherwise trip the valve over a payload the
+                // empty source table could not resolve).
+                let reason = self
+                    .runtime
+                    .try_stabilize_escaped_with(reason, engine.machine.refc_binaries())?;
                 self.state.exits.insert(pid, reason);
                 // Keep the original error as well: the reason *term* above is what the exit
                 // propagates, but only the error carries the raise class and the
