@@ -37,12 +37,17 @@
 //!   into two honest groups:
 //!     1. this runtime's own version strings, which are deliberately its **own**
 //!        (`version` = our erts version, `otp_release` = our OTP major, `emu_type` =
-//!        our build tier, `debug_compiled` = our debug tier);
+//!        our build tier, `build_type` = the same tier, `compat_rel` = our release
+//!        number, `debug_compiled` = our debug tier);
 //!     2. keys that read **this runtime's own live tables** (`atom_count`,
-//!        `process_count`, `port_count`, `ets_count`, `allocated_areas`, …) and are
+//!        `process_count`, `port_count`, `ets_count`, the scheduler-state keys,
+//!        `scheduling_statistics`' honest zeros, `allocated_areas`, …) and are
 //!        therefore correct-but-smaller than the oracle's run-time figure. Comparing
 //!        them for equality would be comparing two different emulators' tables — the
 //!        same rule `erlang:processes/0` / `erlang:ports/0` already follow.
+//!   `literal_test` also sits here: the oracle's 64-bit build answers `range` because its
+//!   literal test is a *range* check, while this runtime's frozen layout detects literals
+//!   with a tag bit — the C's own `tag` answer for a tag-based test.
 //! * [`UNSUPPORTED_KEYS`] — the oracle **accepts** each of these; this runtime answers
 //!   an honest capability gap instead, so the test pins the oracle-accepts fact and
 //!   (in `src/info.rs`) the exit-3 classification. The divergence is deliberate.
@@ -108,6 +113,21 @@ const ORACLE_EQUAL_KEYS: &[&str] = &[
     // gap instead (see `src/info/dist.rs`).
     "dist",
     "dist_ctrl",
+    // The emulator's own build/implementation flags whose value is a constant of every
+    // default erts-17.1 build **and** a truthful statement about this runtime (see
+    // `src/info/system.rs`): the I/O checking model, the port-task scheduling, the absent
+    // lock/ETS diagnostics, the absent HiPE, the disabled system sequential tracer, and the
+    // host's byte order.
+    "eager_check_io",
+    "io_thread",
+    "port_tasks",
+    "lock_checking",
+    "lock_counting",
+    "ets_always_compress",
+    "ets_realloc_moves",
+    "hipe_architecture",
+    "sequential_tracer",
+    "endian",
     // The ERTS monotonic-time interface constants. They are compile-time constants of the
     // erts-17.1 interface — byte-identical on every run of every build of that release — so
     // they are compared for **value**, not merely shape (see
@@ -144,6 +164,23 @@ const SHAPE_ONLY_KEYS: &[&str] = &[
     "max_heap_size",
     "heap_sizes",
     "allocated_areas",
+    // The scheduler **state** keys and the emulator's own build/implementation flags whose
+    // value legitimately differs from the oracle's (see `src/info/schedulers.rs` and
+    // `src/info/system.rs`): the scheduler counts are this runtime's own, `build_type` is
+    // *our* build tier, `compat_rel` *our* release number, `literal_test` is `tag` because
+    // this runtime's literal test is a tag bit (the oracle's 64-bit build answers `range`),
+    // and the scheduling-statistics counters are this runtime's honest zeros.
+    "build_type",
+    "compat_rel",
+    "literal_test",
+    "cpu_quota",
+    "schedulers_total",
+    "schedulers_active",
+    "schedulers_state",
+    "all_schedulers_state",
+    "run_queues",
+    "scheduling_statistics",
+    "total_scheduling_statistics",
 ];
 
 /// Keys the oracle accepts that this runtime answers with an honest capability gap.
@@ -164,6 +201,22 @@ const ORACLE_ACCEPTED_UNSUPPORTED_KEYS: &[&str] = &[
     "info",
     "procs",
     "loaded",
+    // ERTS *C-emulator internals* with no counterpart here (see `src/info/unsupported.rs`):
+    // the C toolchain's build flags, the ethread library, the constant-pool/jump-table
+    // loader switches, the static NIF table and its taints, the emulator argument vector,
+    // the scheduler distribution maps, the `BIG_ARITY_MAX` cap and the thread-progress dump.
+    "compile_info",
+    "ethread_info",
+    "ethread_used_tse",
+    "constant_pool_support",
+    "beam_jump_table",
+    "snifs",
+    "taints",
+    "emu_args",
+    "reader_groups_map",
+    "decentralized_counter_groups_map",
+    "max_integer",
+    "thread_progress",
 ];
 
 /// Keys the oracle raises `error:badarg` for — this runtime must not invent an answer.
@@ -175,6 +228,7 @@ const ORACLE_REJECTED_KEYS: &[&str] = &[
     "catchlevel",
     "export_count",
     "export_limit",
+    "instruction_counts",
     "memory",
     "module_count",
     "module_limit",
@@ -754,9 +808,16 @@ fn the_oracle_shapes_and_values_match() {
             ours.kind, theirs.kind,
             "system_info({key}): kind mismatch (ours {value:?}), oracle said {oracle}"
         );
-        // Scalars have no arity to compare; containers do, except the two whose arity
-        // legitimately follows *this* runtime's scheduler count / growth table.
-        if theirs.arity != 0 && !matches!(*key, "scheduler_bindings" | "heap_sizes") {
+        // Scalars have no arity to compare; containers do, except the three whose arity
+        // legitimately follows *this* runtime's scheduler count / growth table /
+        // configured dirty-scheduler pools (the C omits a `dirty_cpu`/`dirty_io` row whose
+        // total is 0, so a default runtime reports the single `normal` row).
+        if theirs.arity != 0
+            && !matches!(
+                *key,
+                "scheduler_bindings" | "heap_sizes" | "all_schedulers_state"
+            )
+        {
             assert_eq!(
                 ours.arity, theirs.arity,
                 "system_info({key}): arity mismatch (ours {value:?}), oracle said {oracle}"

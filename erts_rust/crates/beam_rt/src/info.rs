@@ -131,6 +131,20 @@ pub const SUPPORTED_KEYS: &[&str] = &[
     "kernel_poll",
     "halt_flush_timeout",
     "creation",
+    // The emulator's own build/implementation flags (see [`system`]).
+    "build_type",
+    "compat_rel",
+    "endian",
+    "eager_check_io",
+    "io_thread",
+    "port_tasks",
+    "lock_checking",
+    "lock_counting",
+    "ets_always_compress",
+    "ets_realloc_moves",
+    "hipe_architecture",
+    "literal_test",
+    "sequential_tracer",
     // -- `limits`: counts and emulator limits (see [`limits`]) --
     "atom_count",
     "atom_limit",
@@ -160,6 +174,15 @@ pub const SUPPORTED_KEYS: &[&str] = &[
     "normal_multi_scheduling_blockers",
     "thread_pool_size",
     "context_reductions",
+    // The scheduler *state*/statistics keys (see [`schedulers`]).
+    "schedulers_total",
+    "schedulers_active",
+    "schedulers_state",
+    "all_schedulers_state",
+    "run_queues",
+    "cpu_quota",
+    "scheduling_statistics",
+    "total_scheduling_statistics",
     // -- `memory`: GC/heap + allocator keys (see [`memory`]) --
     "min_heap_size",
     "min_bin_vheap_size",
@@ -206,6 +229,22 @@ pub const UNSUPPORTED_KEYS: &[&str] = &[
     "info",
     "procs",
     "loaded",
+    // ERTS *C-emulator internals* with no counterpart in this runtime: the C toolchain's
+    // build flags, the ethread library, the constant-pool/jump-table loader switches, the
+    // static NIF table and its taints, the emulator argument vector, the scheduler
+    // distribution maps, the `BIG_ARITY_MAX` bignum cap and the thread-progress debug dump.
+    "compile_info",
+    "ethread_info",
+    "ethread_used_tse",
+    "constant_pool_support",
+    "beam_jump_table",
+    "snifs",
+    "taints",
+    "emu_args",
+    "reader_groups_map",
+    "decentralized_counter_groups_map",
+    "max_integer",
+    "thread_progress",
 ];
 
 /// The **complete** atom vocabulary of this surface — every name [`system_info_value`]
@@ -314,6 +353,28 @@ pub const INFO_ATOMS: &[&str] = &[
     "disabled",
     "private",
     "on_heap",
+    // `endian` (`little`/`big`, the C's `WORDS_BIGENDIAN`) and `literal_test` (`tag` —
+    // this runtime's literal-area test is a tagged-pointer bit, the C's own word for a
+    // tag-based test; `range`/`range_bitmask` are the range-check variants).
+    "little",
+    "big",
+    "tag",
+    // `sequential_tracer`: the two atoms of `{sequential_tracer,false}` — the system
+    // sequential tracer is the disabled atom `false` when none is installed.
+    "sequential_tracer",
+    // `all_schedulers_state`: the pool names of the `{Pool,Total,Online,Active}` rows
+    // (`am_normal`/`am_dirty_cpu`/`am_dirty_io`, `erl_bif_info.c:3302-3328`).
+    "normal",
+    "dirty_cpu",
+    "dirty_io",
+    // `scheduling_statistics`/`total_scheduling_statistics`: the five priority-level names
+    // of the `{Prio,Executed,Migrated}` rows, in the oracle's order
+    // (`erts_sched_stat_term` over `ERTS_NO_PRIO_LEVELS`).
+    "process_max",
+    "process_high",
+    "process_normal",
+    "process_low",
+    "port",
 ];
 
 /// A `system_info/1` value, independent of any heap.
@@ -714,7 +775,7 @@ mod tests {
         }
         // The surface is the union of the family modules; keep the count pinned so a key
         // dropped from a family is caught.
-        assert_eq!(SUPPORTED_KEYS.len(), 67);
+        assert_eq!(SUPPORTED_KEYS.len(), 88);
         let mut sorted: Vec<&str> = SUPPORTED_KEYS.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
@@ -739,7 +800,7 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), UNSUPPORTED_KEYS.len(), "no duplicate keys");
-        assert_eq!(sorted.len(), 15);
+        assert_eq!(sorted.len(), 27);
     }
 
     #[test]

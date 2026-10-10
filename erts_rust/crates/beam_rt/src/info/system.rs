@@ -58,6 +58,36 @@
 //! | `kernel_poll` | bool |
 //! | `halt_flush_timeout` | atom, `infinity` |
 //! | `creation` | int |
+//!
+//! # The emulator's own build/implementation flags
+//!
+//! `erl_bif_info.c` also answers a family of keys that report a **build or
+//! implementation property of the emulator itself**, each of which this runtime can state
+//! truthfully about itself (and each of which the oracle answers as the same constant on
+//! every default erts-17.1 build). They live here with the other identity keys:
+//!
+//! | key | shape | this runtime |
+//! |---|---|---|
+//! | `build_type` | atom, `opt`/`debug` | the same build tag as `emu_type` (`am_build_type` and `am_emu_type` share one arm in the C) |
+//! | `compat_rel` | int | this runtime's own OTP release (`erts_compat_rel` defaults to the emulator's release number) |
+//! | `endian` | atom, `little`/`big` | the target's endianness (`WORDS_BIGENDIAN` in the C) — a fact about the host |
+//! | `eager_check_io` | bool, `true` | the C arm answers `am_true` unconditionally; this runtime's scheduler pass checks I/O every step |
+//! | `io_thread` | bool, `false` | no dedicated ERTS I/O thread (`beam_io`'s poller is driven from the scheduler pass) |
+//! | `port_tasks` | bool, `true` | ports are driven as tasks (`beam_io`'s port-task round) |
+//! | `lock_checking` / `lock_counting` | bool, `false` | no `ERTS_ENABLE_LOCK_CHECK`/`_COUNT` debug facility |
+//! | `ets_always_compress` | bool, `false` | this runtime never compresses ETS payloads (`erts_ets_always_compress`, `+ec`) |
+//! | `ets_realloc_moves` | bool, `false` | no "always moves on realloc" ETS diagnostic (`erts_ets_realloc_always_moves`) |
+//! | `hipe_architecture` | atom, `undefined` | HiPE is gone; the C arm is `BIF_RET(am_undefined)` |
+//! | `literal_test` | atom, `tag` | this runtime's literal-area test **is** a tag bit (`beam_term`'s `TAG_LITERAL_PTR`), not ERTS's `is_in_literal_range` — see below |
+//! | `sequential_tracer` | `{sequential_tracer,false}` | the system sequential tracer is the disabled atom `false` (`erts_get_system_seq_tracer()` with no tracer installed) |
+//!
+//! `literal_test` is the one key of this group whose value deliberately differs from the
+//! oracle's: `erl_bif_info.c:3547-3556` answers `range` when the build has
+//! `ERTS_HAVE_IS_IN_LITERAL_RANGE` (the 64-bit default) and `tag` when the literal test is
+//! a tagged-pointer test. The frozen term layout (workspace `CONTEXT.md` §2) carries a
+//! **3-bit pointer tag with a literal-area bit**, so `tag` is this runtime's truthful
+//! answer — the same word the C uses for a tag-based literal test — and it is compared
+//! **shape-only**.
 
 use beam_abi::{
     ERL_DRV_EXTENDED_MAJOR_VERSION, ERL_DRV_EXTENDED_MINOR_VERSION, ERL_NIF_MAJOR_VERSION,
@@ -123,7 +153,33 @@ pub(crate) fn try_value(key: &str, rt: &Runtime) -> Option<Result<InfoValue>> {
         "kernel_poll" => Some(Ok(InfoValue::Bool(cfg!(unix)))),
         "halt_flush_timeout" => Some(Ok(InfoValue::Atom("infinity"))),
         "creation" => Some(Ok(InfoValue::Int(creation(rt)))),
+        // The emulator's own build/implementation flags (see the module docs).
+        "build_type" => Some(Ok(emu_type())),
+        "compat_rel" => Some(Ok(InfoValue::Int(i64::from(beam_common::otp_version().major)))),
+        "endian" => Some(Ok(InfoValue::Atom(endian()))),
+        "eager_check_io" => Some(Ok(InfoValue::Bool(true))),
+        "io_thread" => Some(Ok(InfoValue::Bool(false))),
+        "port_tasks" => Some(Ok(InfoValue::Bool(true))),
+        "lock_checking" | "lock_counting" => Some(Ok(InfoValue::Bool(false))),
+        "ets_always_compress" => Some(Ok(InfoValue::Bool(false))),
+        "ets_realloc_moves" => Some(Ok(InfoValue::Bool(false))),
+        "hipe_architecture" => Some(Ok(InfoValue::Atom("undefined"))),
+        "literal_test" => Some(Ok(InfoValue::Atom("tag"))),
+        "sequential_tracer" => Some(Ok(InfoValue::Tuple("sequential_tracer", "false"))),
         _ => None,
+    }
+}
+
+/// `system_info(endian)` — the target's byte order.
+///
+/// The C answers `am_big`/`am_little` from its `WORDS_BIGENDIAN` build macro
+/// (`erl_bif_info.c:3102-3108`), so this is a genuine fact about the host both runtimes
+/// share — `cfg!(target_endian)` is the Rust analogue of that macro.
+fn endian() -> &'static str {
+    if cfg!(target_endian = "big") {
+        "big"
+    } else {
+        "little"
     }
 }
 
@@ -343,5 +399,80 @@ mod tests {
             try_value("kernel_poll", &rt).unwrap().unwrap(),
             InfoValue::Bool(true)
         ));
+    }
+
+    #[test]
+    fn the_build_and_implementation_flags_are_this_runtime_s_own() {
+        let rt = runtime();
+        // `build_type` and `emu_type` share one arm in the C, so they must agree here too.
+        assert_eq!(
+            try_value("build_type", &rt).unwrap().unwrap(),
+            emu_type(),
+            "build_type is the same build tag as emu_type"
+        );
+        // `compat_rel` is the emulator's own release number by default.
+        assert_eq!(
+            try_value("compat_rel", &rt).unwrap().unwrap(),
+            InfoValue::Int(i64::from(beam_common::otp_version().major))
+        );
+        // The endianness is a fact about the host this build targets.
+        assert_eq!(
+            try_value("endian", &rt).unwrap().unwrap(),
+            InfoValue::Atom(if cfg!(target_endian = "big") {
+                "big"
+            } else {
+                "little"
+            })
+        );
+        assert_eq!(
+            try_value("literal_test", &rt).unwrap().unwrap(),
+            InfoValue::Atom("tag"),
+            "the frozen layout's literal test is a tag bit"
+        );
+        assert_eq!(
+            try_value("sequential_tracer", &rt).unwrap().unwrap(),
+            InfoValue::Tuple("sequential_tracer", "false")
+        );
+        for key in [
+            "eager_check_io",
+            "ets_always_compress",
+            "ets_realloc_moves",
+            "hipe_architecture",
+            "io_thread",
+            "lock_checking",
+            "lock_counting",
+            "port_tasks",
+        ] {
+            assert!(
+                try_value(key, &rt).is_some(),
+                "{key} must be answered by the system family"
+            );
+        }
+        assert!(try_value("nonsense", &rt).is_none());
+    }
+
+    #[test]
+    fn the_boolean_implementation_flags_hold_the_oracle_s_build_constants() {
+        // Verified against the oracle (OTP 29.1.1 / erts-17.1):
+        //   eager_check_io -> true      io_thread -> false
+        //   port_tasks     -> true      lock_checking -> false
+        //   lock_counting  -> false     ets_always_compress -> false
+        //   ets_realloc_moves -> false  hipe_architecture -> undefined
+        let rt = runtime();
+        let boolean = |key: &str| match try_value(key, &rt).unwrap().unwrap() {
+            InfoValue::Bool(value) => value,
+            other => panic!("{key} must be a bool, got {other:?}"),
+        };
+        assert!(boolean("eager_check_io"));
+        assert!(boolean("port_tasks"));
+        assert!(!boolean("io_thread"));
+        assert!(!boolean("lock_checking"));
+        assert!(!boolean("lock_counting"));
+        assert!(!boolean("ets_always_compress"));
+        assert!(!boolean("ets_realloc_moves"));
+        assert_eq!(
+            try_value("hipe_architecture", &rt).unwrap().unwrap(),
+            InfoValue::Atom("undefined")
+        );
     }
 }
