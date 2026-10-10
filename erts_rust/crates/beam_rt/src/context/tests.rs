@@ -1963,3 +1963,183 @@ fn shared_gap(error: &BeamError, expected: &str) {
         "{error}"
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// The GC root-set hand-off: every x register and the whole FR file
+// ---------------------------------------------------------------------------------------
+
+/// The integer-only fixture (`tests/fixtures/gc_ints.beam`), used here for one property
+/// only: its code contains **no** float-family instruction, so the module guard
+/// ([`super::gc::module_uses_floats`]) lets a collection run over it. The bytes are never
+/// executed by these cases.
+const GC_INTS_BEAM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/gc_ints.beam");
+
+/// The call site's module name — a module the rig has loaded (so [`module_may_be_collected`]
+/// answers `true` from the real code server, not from a stubbed cache).
+///
+/// [`module_may_be_collected`]: super::gc::module_may_be_collected
+const GC_CALL_SITE: &str = "gc_ints";
+
+/// The rig the two root-hand-off cases share: a runtime with the float-free fixture loaded
+/// as the call site, plus a process living in a **caller-supplied** [`ProcessTable`] — the
+/// shape a scheduler slice has ([`RuntimeContext::for_process`]), and the one where a
+/// collection is a legitimate admission point.
+fn gc_root_set_rig() -> (Runtime, ProcessTable, ProcessId) {
+    let mut rt = runtime();
+    rt.load_module(GC_INTS_BEAM)
+        .expect("the float-free fixture loads into the code server");
+    let mut table = ProcessTable::new(beam_process::SignalAtoms::from_table(
+        &mut AtomTable::new(),
+    ));
+    let pid = table.spawn_default().expect("spawn a process");
+    (rt, table, pid)
+}
+
+/// Builds the two terms the root-set hand-off cases need on `pid`'s **own young heap**:
+///
+/// * `beyond` — the term that will sit in `x[1]` while the engine declares only `x[0]`
+///   live (`live = 1`); and
+/// * `fr_only` — the term that will be reachable **only** through the machine's FR file.
+///
+/// Both are two-element tuples of small integers, so their relocation is checked by value
+/// (`{7, 8}` / `{9, 10}`), never by address arithmetic.
+fn gc_root_terms(table: &mut ProcessTable, pid: ProcessId) -> (Eterm, Eterm) {
+    let process = table.get_mut(pid).expect("the spawned process");
+    let heap = process.heap_mut();
+    let beyond = heap
+        .tuple(&[make_small(7), make_small(8)])
+        .expect("the young heap builds {7,8}");
+    let fr_only = heap
+        .tuple(&[make_small(9), make_small(10)])
+        .expect("the young heap builds {9,10}");
+    (beyond, fr_only)
+}
+
+/// Assert `relocated` is `expected`'s tuple **at its new address** — the term really moved
+/// (a copied term never keeps its from-space address) and the copy is intact.
+fn assert_relocated_tuple(relocated: Eterm, stale: Eterm, expected: [i64; 2], what: &str) {
+    assert_ne!(
+        relocated, stale,
+        "{what}: the term was left pointing into the from-space — a collection moved the \
+         heap without relocating it"
+    );
+    assert_eq!(
+        terms::tuple_arity(relocated).unwrap_or_else(|e| panic!("{what}: {e}")),
+        2,
+        "{what}: the relocated word is not the two-element tuple it was"
+    );
+    for (index, value) in expected.iter().enumerate() {
+        assert_eq!(
+            terms::tuple_element(relocated, index).expect("in range"),
+            make_small(*value),
+            "{what}: element {index} of the relocated tuple"
+        );
+    }
+}
+
+/// **The hole-1 regression guard: a collection must root the WHOLE root set.**
+///
+/// The engine's `live` count is only a *hint* — a slot it declares dead at one admission
+/// point can still be read later in the same run — and the FR file holds `Eterm` term slots
+/// at Milestone 1, so a float register is a root like any other. Both are invisible to the
+/// narrow `ensure_heap` door (it receives only an x prefix and the stack), so a collection it
+/// drove would move the heap out from under them.
+///
+/// The case therefore drives the **full-root** admission point
+/// ([`ExecutionContext::ensure_heap_full`]) with `live = 1` while a live term sits in `x[1]`
+/// and a second lives only in `fr[0]`. A forced collection runs; both must come back
+/// relocated (a different word, still the same tuple). A runtime that publishes only
+/// `x[0..live)` and discards the FR file leaves both words stale, which is exactly the
+/// failure this asserts against.
+#[test]
+fn a_admission_point_roots_every_x_register_and_the_whole_fr_file() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    let (beyond, fr_only) = gc_root_terms(&mut table, pid);
+
+    // `x[1]` is a live term the engine declares DEAD (`live = 1`); `fr[0]` is reachable
+    // through the FR file alone. Neither is in the narrow door's published root set.
+    let mut x = [make_small(0), beyond, NIL, NIL];
+    let mut stack = [NIL];
+    let mut fr = [fr_only];
+
+    let before = rt.gc_stats();
+    rt.request_gc(pid);
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.current_module = Some(GC_CALL_SITE.to_string());
+        ctx.arm_gc();
+        ctx.ensure_heap_full(0, RootSet::new(&mut x, &mut stack, &mut fr, 1))
+            .expect("the heap-admission point never fails the program");
+    }
+
+    let after = rt.gc_stats();
+    assert_eq!(
+        after.collections,
+        before.collections + 1,
+        "the forced collection really ran; {after:?}"
+    );
+    assert_eq!(
+        after.halted, before.halted,
+        "the collection and its scatter completed; {after:?}"
+    );
+
+    assert_relocated_tuple(x[1], beyond, [7, 8], "x[1] (beyond the `live` hint)");
+    assert_relocated_tuple(fr[0], fr_only, [9, 10], "fr[0] (reachable only through the FR file)");
+}
+
+/// **The same guard for the collecting allocation seam.**
+///
+/// [`ExecutionContext::alloc_words_rooted`] is the engine's term-building admission point:
+/// when the running process's young heap cannot serve `n` raw words it collects over the
+/// handed-in root set and retries. The root set it receives is the machine's whole
+/// [`RootSet`], so the same two roots must survive: an x register beyond the engine's `live`
+/// hint, and a term reachable only through the FR file.
+///
+/// The nursery is filled with garbage first, so the first bump genuinely fails and the
+/// collection is the only way the retry can be served.
+#[test]
+fn a_collecting_allocation_roots_every_x_register_and_the_whole_fr_file() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    let (beyond, fr_only) = gc_root_terms(&mut table, pid);
+
+    // Fill the nursery with unreachable tuples so a 16-word bump cannot be served.
+    {
+        let process = table.get_mut(pid).expect("the spawned process");
+        let filler = [make_small(1)];
+        while process.heap().available() >= 16 {
+            process
+                .heap_mut()
+                .tuple(&filler)
+                .expect("the nursery has room for a two-word tuple");
+        }
+    }
+
+    let mut x = [make_small(0), beyond, NIL, NIL];
+    let mut stack = [NIL];
+    let mut fr = [fr_only];
+
+    let before = rt.gc_stats();
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.current_module = Some(GC_CALL_SITE.to_string());
+        ctx.arm_gc();
+        ctx.alloc_words_rooted(16, RootSet::new(&mut x, &mut stack, &mut fr, 1))
+            .expect("a rooted allocation");
+    }
+
+    let after = rt.gc_stats();
+    assert_eq!(
+        after.collections,
+        before.collections + 1,
+        "the refused bump collected over the handed-in roots; {after:?}"
+    );
+    assert_eq!(after.halted, before.halted, "{after:?}");
+    assert_eq!(
+        after.fallbacks, before.fallbacks,
+        "the collection emptied the nursery, so the retry was served from the young heap \
+         (no arena fallback); {after:?}"
+    );
+
+    assert_relocated_tuple(x[1], beyond, [7, 8], "x[1] (beyond the `live` hint)");
+    assert_relocated_tuple(fr[0], fr_only, [9, 10], "fr[0] (reachable only through the FR file)");
+}
