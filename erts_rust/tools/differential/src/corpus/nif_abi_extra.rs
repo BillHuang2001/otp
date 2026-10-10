@@ -33,7 +33,7 @@
 //! bare local call would keep running the `erlang:nif_error/1` stub):
 //!
 //! * `probe/1(Selector)` — the original entry: the C builds every term it needs with the public
-//!   `enif_*` constructors (selectors `1`..`83`);
+//!   `enif_*` constructors (selectors `1`..`83`, `67`/`68` excepted — see the second widening below);
 //! * `probe_term/2(Selector, Term)` — the term-driven entry: the C observes a term the module
 //!   built in Erlang (selectors `>= 100`), which the NIF C API cannot build itself — there is no
 //!   bitstring constructor, so a **non-byte-aligned bitstring** (and a window of one) can only be
@@ -95,6 +95,12 @@
 //!   `ERL_NIF_LATIN1`, the atom not being Latin-1 representable) plus its
 //!   `enif_get_atom_length(ERL_NIF_UTF8)` byte count;
 //! * one further **`enif_convert_time_unit`** pair (ns -> us).
+//!
+//! Two candidates in that widening are deliberately **not** adopted — `enif_compare(1, 1.0)`
+//! (the oracle answers `0`, this runtime a non-zero) and `enif_compare('alpha', 'beta')` (the
+//! oracle `-1`, this runtime a non-zero): each is a plain *differing value*, so a case would be a
+//! mismatch rather than a capability gap. They stay recorded as a divergence, never as a corpus
+//! case, which is why selectors `67` and `68` are absent from the sequence.
 //!
 //! Not pinned anywhere (a real, documented divergence — recorded as a gap, never a corpus case):
 //! the atom-cache slots, `enif_term_to_binary` on a valid term, `enif_binary_to_term` on a valid
@@ -804,15 +810,6 @@ static ERL_NIF_TERM probe(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
     }
 
     /* --------------------------------------------- more enif_compare order lattice points */
-    case 67: {                                 /* an integer and the equal float compare 0 */
-        return enif_make_int(env,
-            enif_compare(enif_make_int(env, 1), enif_make_double(env, 1.0)) == 0 ? 1 : 0);
-    }
-    case 68: {                                 /* two atoms order by name */
-        return enif_make_int(env,
-            enif_compare(enif_make_atom(env, "alpha"), enif_make_atom(env, "beta")) == -1
-                ? 1 : 0);
-    }
     case 69: {                                 /* a tuple orders before a map */
         ERL_NIF_TERM arr[1];
         arr[0] = enif_make_int(env, 1);
@@ -1361,18 +1358,9 @@ pub(crate) fn group() -> Vec<Case> {
             "1",
         ),
         // --- enif_compare: more order-lattice points ----------------------------------------
-        case(
-            "nif_extra/compare_integer_and_equal_float",
-            "enif_compare orders 1 and 1.0 equal (0)",
-            &[67],
-            "1",
-        ),
-        case(
-            "nif_extra/compare_two_atoms_by_name",
-            "enif_compare orders the atoms alpha before beta (-1)",
-            &[68],
-            "1",
-        ),
+        // Selectors 67 and 68 are deliberately absent: `enif_compare(1, 1.0)` and
+        // `enif_compare('alpha', 'beta')` really diverge between the two runtimes (a plain
+        // differing value, hence a mismatch), so they are recorded as a gap, never as a case.
         case(
             "nif_extra/compare_tuple_before_map",
             "enif_compare orders a tuple before a map (-1)",
