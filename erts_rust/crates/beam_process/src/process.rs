@@ -857,10 +857,15 @@ impl Process {
     /// ([`SignalQueue::gather_roots`]) — all in-heap sub-rootsets: the queue is drained, every
     /// payload and the dict/saved-arg/signal words are appended to the root buffer, the
     /// collector runs, and each region is written back (registers via
-    /// [`Registers::scatter_roots`], each drained message re-enqueued around its **relocated**
-    /// payload via [`Message::with_payload`] — preserving the envelope's full ownership
-    /// (`from`/`token`/`off_heap`/`binaries`/`nodes`/`fragments`), then the dict, the saved args
-    /// and the pending signals scattered back) in the SAME order it was gathered.
+    /// [`Registers::scatter_roots`], each message re-installed around its relocated payload
+    /// through [`Message::with_payload`] — so its `from`/`token`/off-heap handles/refc
+    /// binaries/node entries/fragment chain travel with it — then the dict, the saved args and
+    /// the pending signals scattered back) in the SAME order it was gathered.
+    ///
+    /// A **fragment-resident** payload (a message too large for the receiver's heap) points
+    /// into the message's own [`Fragments`], not into the nursery being collected, so the
+    /// collector classifies it as foreign to every evacuated range and leaves it exactly where
+    /// it is; the message keeps owning the fragment chain that holds it.
     ///
     /// The outgoing port-monitor set ([`Process::port_monitors`]) is deliberately **not**
     /// gathered: a [`PortWatch`] holds a reference and a port number, both plain values
@@ -874,8 +879,8 @@ impl Process {
     ///
     /// # Errors
     ///
-    /// Propagates the collector's and the rebuilding allocations' `BeamError`s; the typed
-    /// `relocation_exempt` raise for an exempt process.
+    /// Propagates the collector's `BeamError`s; the typed `relocation_exempt` raise for an
+    /// exempt process.
     pub fn collect(&mut self) -> Result<Collection> {
         if self.relocation_exempt {
             return Err(error::relocation_exempt("collect"));
@@ -901,7 +906,7 @@ impl Process {
     /// When [`max_heap_words`](beam_gc::HeapPolicy::max_heap_words) (or the growth table's
     /// ceiling) makes the request unreachable, the typed [`BeamError::Alloc`] is returned
     /// **fail-fast**, before anything is collected, leaving the collector untouched; otherwise
-    /// the collector's and the rebuilding allocations' `BeamError`s are propagated.
+    /// the collector's `BeamError`s are propagated.
     ///
     /// A **relocation-exempt** process ([`Process::set_relocation_exempt`]) must **not** be grown
     /// (growing runs a collection first), so this returns the typed `relocation_exempt` raise
@@ -922,12 +927,15 @@ impl Process {
     /// *after* its collection succeeded (the nursery growth was refused), at which point the
     /// roots have already been relocated in place, so leaving them unwritten would corrupt the
     /// heap. On a fail-fast / pre-copy failure the roots are un-relocated and the write-back is
-    /// a harmless no-op (it rewrites the same values and rebuilds equivalent messages).
+    /// a harmless no-op (it rewrites the same values and re-installs the same payloads).
     ///
-    /// The mailbox is rebuilt in FIFO order through [`Message::with_payload`], which replaces only
-    /// the payload term: each envelope keeps everything else it owns — its `off_heap` MSO handles,
-    /// its counted refc `binaries`, its `nodes` references and its fragment chain — alongside the
-    /// relocated payload.
+    /// A queued message is re-installed with [`Message::with_payload`] — the relocation-safe
+    /// rebuild — so **everything but the payload word** travels across untouched: its `from`,
+    /// `token`, off-heap handle list, refc-binary list, node list and its [`Fragments`] chain
+    /// (for a payload too large for the receiver's heap, which lives *in* those fragments rather
+    /// than in the nursery being collected). Rebuilding from scratch would drop the fragment
+    /// chain — a use-after-free, since the payload would then point into freed fragments — and
+    /// would leak the refcounts the message held on its off-heap objects.
     fn run_rooted_collection<F>(&mut self, collect: F) -> Result<Collection>
     where
         F: FnOnce(&mut Collector, &mut [Eterm]) -> Result<Collection>,
@@ -938,8 +946,8 @@ impl Process {
         let x_live = self.regs.gather_roots(&mut roots);
         let reg_words = roots.len();
 
-        // 2. Drain the mailbox, appending each payload as a root. The drained envelopes are
-        //    re-enqueued below around their relocated payloads.
+        // 2. Drain the mailbox, appending each payload as a root. The drained messages are
+        //    re-installed around their relocated payloads below.
         let mut drained: Vec<Message> = Vec::new();
         while let Some(message) = self.mailbox.dequeue() {
             roots.push(message.payload());
@@ -963,12 +971,12 @@ impl Process {
         // 5. Write the (relocated) registers and stack words back.
         self.regs.scatter_roots(&roots, x_live);
 
-        // 6. Re-enqueue every drained envelope around its relocated payload, preserving FIFO
-        //    order. `with_payload` replaces only the payload term, so the envelope's full
-        //    ownership travels with it: `from`/`token`/`off_heap`/`binaries`/`nodes`/`fragments`.
-        //    Rebuilding with `Message::new` instead would drop the `binaries` (freeing a shared
-        //    refc payload the relocated `BinRef.val` still points at) and the `fragments` (a
-        //    use-after-free for a fragment-resident payload).
+        // 6. Re-install every message around its relocated payload, preserving FIFO order.
+        //    `with_payload` swaps only the payload word, so the message keeps its `from`,
+        //    `token`, off-heap handles, refc binaries, node entries and — for an oversized
+        //    payload — its fragment chain (a fragment-resident payload is outside the
+        //    collected nursery, so the collector classified it `Foreign` and left it
+        //    untouched).
         let payloads = &roots[reg_words..mail_words];
         for (index, message) in drained.into_iter().enumerate() {
             self.mailbox.enqueue(message.with_payload(payloads[index]));
