@@ -148,6 +148,58 @@ fn module_may_be_collected(runtime: &mut Runtime, name: &str) -> bool {
     }
 }
 
+/// Whether `ptr` lies inside `heap`'s live storage — `[base, hend)`, i.e. the caller's term
+/// words and the not-yet-handout tail of the same block.
+///
+/// [`Heap::hp`] is the bump pointer and [`Heap::hend`] is one past the block, so the block's
+/// base is `hp - used` term words back from `hp`.
+fn in_heap_block(heap: &Heap, ptr: usize) -> bool {
+    let words = heap.used().saturating_mul(std::mem::size_of::<Eterm>());
+    let base = (heap.hp() as usize).wrapping_sub(words);
+    let end = heap.hend() as usize;
+    ptr >= base && ptr < end
+}
+
+/// Whether `term` is a **container living in a region the collector does not scan** — the
+/// precondition that makes a collection of the owning process unsound.
+///
+/// A copying collector relocates exactly the words it finds in its *from* set (the young space,
+/// plus the mature space for a major) and classifies every other address as
+/// [`Target::Foreign`](beam_gc): it leaves such a pointer where it is **and does not follow it**
+/// — so a young word a foreign container points *at* is neither kept alive by it nor updated
+/// when it moves. A term with heap children is therefore only safe in a *scanned* region. The
+/// unscanned regions this runtime really creates are the pooled BIF heaps
+/// ([`Runtime::take_bif_heap`]), the `-eval` heap ([`Runtime::stabilize_term`]), the
+/// pointer-stable arena ([`crate::context::gc::alloc_words`]'s fallback) and a
+/// [`beam_message`] heap fragment.
+///
+/// The test is the conservative *complement* of the scanned set, so it needs no enumeration of
+/// the open-ended unscanned side: a term is safe exactly when it is an **immediate** (neither
+/// boxed nor a cons), a **literal** (a frozen code constant in the literal area, which never
+/// points into a movable heap), or a pointer into the process's own **young** or **mature**
+/// heap. Anything else — including a container handed back by a registered BIF or built on the
+/// arena — declines the collection.
+pub(crate) fn root_is_unscanned(process: &Process, term: Eterm) -> bool {
+    if !beam_term::prelude::is_boxed(term) && !beam_term::prelude::is_list(term) {
+        return false;
+    }
+    if beam_term::literal::is_literal(term) {
+        return false;
+    }
+    let ptr = beam_term::list::ptr_val(term) as usize;
+    !in_heap_block(process.heap(), ptr)
+        && !in_heap_block(process.collector().mature().heap(), ptr)
+}
+
+/// Whether **any** of the given machine roots is a container in an unscanned region (see
+/// [`root_is_unscanned`]).
+pub(crate) fn any_root_is_unscanned<'a, I>(process: &Process, roots: I) -> bool
+where
+    I: IntoIterator<Item = &'a Eterm>,
+{
+    roots.into_iter().any(|word| root_is_unscanned(process, *word))
+}
+
 /// Hand the executing machine's live roots to `process` — the **publish** half of the GC
 /// hand-off.
 ///
@@ -368,6 +420,15 @@ pub(crate) fn ensure_heap(
     if !forced && !process.should_collect(heap_need as usize) {
         return Ok(());
     }
+    // The **unscanned-root valve** (see [`root_is_unscanned`]): a live root in a region the
+    // collector does not scan would be left pointing at young words this move relocates, so the
+    // move is **declined** — the heap keeps its terms, the unscanned root stays valid and the
+    // program stays correct. The test runs *after* the occupancy short-circuit (an ordinary
+    // admission point that is not about to collect pays nothing) and *before* the request is
+    // consumed, so a forced collection it refuses stays armed for the runner's park arm.
+    if any_root_is_unscanned(process, x_regs.iter().chain(stack.iter())) {
+        return Ok(());
+    }
     // Committed: the request is answered exactly once, by this collection.
     if forced {
         runtime.take_gc_request(pid);
@@ -474,6 +535,21 @@ pub(crate) fn ensure_heap_full(
     if !forced && !process.should_collect(heap_need as usize) {
         return Ok(());
     }
+    // The **unscanned-root valve** — the full-root twin of the one in [`ensure_heap`]: a root in
+    // a region the collector does not scan declines the move (see [`root_is_unscanned`]), so the
+    // heap keeps its terms and the unscanned root stays valid. Tested after the occupancy
+    // short-circuit and before the request is consumed, so a refused forced collection stays
+    // armed for the runner's park arm.
+    if any_root_is_unscanned(
+        process,
+        roots
+            .x
+            .iter()
+            .chain(roots.stack.iter())
+            .chain(roots.fr.iter()),
+    ) {
+        return Ok(());
+    }
     if forced {
         runtime.take_gc_request(pid);
     }
@@ -523,14 +599,22 @@ pub(crate) fn heap_available(ctx: &RuntimeContext<'_>) -> usize {
 ///
 /// In a scheduled slice with collection enabled the block comes from the running process's
 /// young heap, so it is reclaimed by the collector once it is unreachable and the peak memory
-/// tracks the live set. Anything else — an `-eval`/single-pass context, a pinned or halted
-/// process, a request the young heap cannot serve, a not-yet-loaded process — falls back to
-/// the pointer-stable arena, exactly as before this seam existed. A fallback is never an
-/// error: the arena cannot fail where the young heap could.
+/// tracks the live set.
+///
+/// Everything **else** — an `-eval`/single-pass context (no process table), a pinned or halted
+/// process, a process the table no longer holds — keeps the pointer-stable arena, byte for byte
+/// as before this seam existed. The one refusal is a **collectable** slice process whose own
+/// young heap cannot serve the request: the block is *not* taken from the arena (the arena is a
+/// region the collector does not scan, so a term built there and handed straight back to the
+/// machine as a live root can neither keep nor relocate the young words it reaches — see
+/// [`root_is_unscanned`]), and the young heap's own typed allocation error is returned instead.
+/// This seam has no root set, so it cannot collect to make room; the engine reaches an admission
+/// point (`ensure_heap`) before it constructs terms, so the young heap normally has room here.
 ///
 /// # Errors
 ///
-/// Propagates the arena's allocation failure only.
+/// The young heap's `Alloc(AllocKind::Heap)` for a collectable slice process whose own heap
+/// cannot serve the request; the arena's allocation failure for every other context.
 pub(crate) fn alloc_words(ctx: &mut RuntimeContext<'_>, n: usize) -> Result<*mut Eterm> {
     let RuntimeContext {
         runtime,
@@ -542,8 +626,17 @@ pub(crate) fn alloc_words(ctx: &mut RuntimeContext<'_>, n: usize) -> Result<*mut
         if runtime.gc_process_enabled(*mailbox_pid) {
             if let Some(process) = table.get_mut(*mailbox_pid) {
                 let fill = runtime.gc_scratch(n.saturating_sub(1));
-                if let Ok(block) = bump(process.heap_mut(), n, fill) {
-                    return Ok(block);
+                match bump(process.heap_mut(), n, fill) {
+                    Ok(block) => return Ok(block),
+                    // A **collectable** slice process must not place this term in the
+                    // pointer-stable arena: the block is handed straight back to the machine as
+                    // a live root, and the arena is a region the collector does not scan, so the
+                    // term can neither keep nor relocate the young words it reaches (see
+                    // [`root_is_unscanned`]). This seam has no root set, so it cannot collect to
+                    // make room; the young heap's honest refusal is returned instead. The engine
+                    // reaches an admission point (`ensure_heap`) before it constructs terms, so
+                    // the young heap normally has room here.
+                    Err(error) => return Err(error),
                 }
             }
             runtime.note_gc_fallback();
@@ -622,6 +715,21 @@ pub(crate) fn alloc_words_rooted(
         runtime.note_gc_fallback();
         return runtime.alloc_words(n);
     };
+    // The unscanned-root valve (see [`root_is_unscanned`]): collecting over a root set that
+    // contains a container in a region the collector does not scan would relocate the young
+    // words it reaches without updating it, so this collection is declined and the block comes
+    // from the pointer-stable arena — the same honest fallback every other refusal path takes.
+    if any_root_is_unscanned(
+        process,
+        roots
+            .x
+            .iter()
+            .chain(roots.stack.iter())
+            .chain(roots.fr.iter()),
+    ) {
+        runtime.note_gc_fallback();
+        return runtime.alloc_words(n);
+    }
     if !publish_roots_full(process, &roots) {
         runtime.halt_process_gc(pid);
         runtime.note_gc_fallback();
