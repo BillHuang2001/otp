@@ -30,12 +30,17 @@
 mod common;
 
 use std::ffi::c_void;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use beam_abi::nif::enif::*;
 use beam_abi::nif::host::NifEnv;
+use beam_abi::nif::loader::load;
 use beam_abi::nif::term::{eterm_from_nif, nif_from_eterm, ERL_NIF_TERM};
 use beam_abi::nif::types::ErlNifBinary;
-use beam_term::prelude::*;
+use beam_term::prelude::{self, *};
+
+use common::{compile_so, skip};
 
 /// Intern `name` in the host and return the atom term.
 fn atom(host: &mut common::TestHost, name: &str) -> Eterm {
@@ -409,11 +414,54 @@ fn iolist_inspection_flattens_to_an_owned_buffer() {
         assert_eq!(core::slice::from_raw_parts(bin.data, 3), b"abc");
         // Owned: release frees the flattening buffer.
         enif_release_binary(&mut bin);
+
+        // A bare byte integer is **not** an iolist: `erts_iolist_size` accepts only a list, a
+        // bitstring or `nil` at the top level (`erl_iolist.c:150-233`), so `65` is refused even
+        // though a byte is a perfectly good iolist *element*.
+        assert_eq!(
+            enif_inspect_iolist_as_binary(env.as_ptr(), nif_from_eterm(make_small(65)), &mut bin),
+            0
+        );
+        // An integer is accepted only in the **head** position of a cons cell, so the improper tail
+        // `[1|2]` is a type error (`erl_iolist.c:206-233`)...
+        let improper = enif_make_list_cell(
+            env.as_ptr(),
+            nif_from_eterm(make_small(1)),
+            nif_from_eterm(make_small(2)),
+        );
+        assert_eq!(enif_inspect_iolist_as_binary(env.as_ptr(), improper, &mut bin), 0);
+        // ... and a small integer outside `0..=255` is not a byte even in head position.
+        let wide = enif_make_list_cell(
+            env.as_ptr(),
+            nif_from_eterm(make_small(256)),
+            nif_from_eterm(NIL),
+        );
+        assert_eq!(enif_inspect_iolist_as_binary(env.as_ptr(), wide, &mut bin), 0);
+        // The same bytes in the head position of a proper list are accepted.
+        let proper = enif_make_list_cell(
+            env.as_ptr(),
+            nif_from_eterm(make_small(1)),
+            enif_make_list_cell(env.as_ptr(), nif_from_eterm(make_small(2)), nif_from_eterm(NIL)),
+        );
+        assert_eq!(enif_inspect_iolist_as_binary(env.as_ptr(), proper, &mut bin), 1);
+        assert_eq!(core::slice::from_raw_parts(bin.data, bin.size), &[1u8, 2u8]);
+        enif_release_binary(&mut bin);
+
         // A term that is neither a binary nor an iolist is refused.
         assert_eq!(
             enif_inspect_iolist_as_binary(env.as_ptr(), nif_from_eterm(make_small(999)), &mut bin),
             0
         );
+
+        // `[]` is accepted with the C's shape: `size == 0` and a **non-NULL** dummy `data`
+        // (`bin->data = (unsigned char *)&bin->data;`, `erl_nif.c:1392`).
+        let mut empty = ErlNifBinary::default();
+        assert_eq!(enif_inspect_iolist_as_binary(env.as_ptr(), nif_from_eterm(NIL), &mut empty), 1);
+        assert_eq!(empty.size, 0);
+        assert!(!empty.data.is_null(), "the C gives `[]` a dummy non-NULL `data`");
+        // The dummy is an owned block here, so releasing the view stays well defined.
+        enif_release_binary(&mut empty);
+        assert!(empty.data.is_null() && empty.size == 0);
     }
 }
 
@@ -786,5 +834,299 @@ fn populated_table_has_the_expected_shape() {
     assert_eq!(
         core::mem::size_of::<beam_abi::nif::api::ErlNifApi>(),
         176 * 8
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The `enif_inspect_iolist_as_binary` shape rules, end to end through a real C NIF
+// ---------------------------------------------------------------------------------------------
+//
+// `tests/fixtures/nif_iolist.c` is a real NIF — compiled with the system `cc` against the system
+// `erl_nif.h`, `dlopen`ed through this crate's loader — whose `made/1` / `probe/1` report
+// `{Accepted, Size, DataNonNull, Checksum}` for `enif_inspect_iolist_as_binary`. The *same* `.so` is
+// then loaded by the **system** Erlang, so the shape rules are pinned by an oracle cross-check and
+// not only by this crate's own reading of `erl_iolist.c` (see the fixture header for the ground
+// truth). The refusal of a *bare byte integer* and of an improper-list tail is the regression these
+// cases lock down.
+
+/// The committed C fixture (a real NIF module — see its header for the A.3 rationale).
+const IOLIST_FIXTURE_C: &str = include_str!("fixtures/nif_iolist.c");
+
+/// The fixture's `ERL_NIF_INIT` name: the loader (and the oracle) require it to match the calling
+/// module, so it doubles as the name of the Erlang module the oracle test generates.
+const IOLIST_MODULE: &str = "test_nif_iolist";
+
+/// `{Accepted, Size, DataNonNull, Checksum}` — the fixture's observation.
+type Observation = [i64; 4];
+
+/// A case whose term the **fixture itself** builds in C, selected by `made/1`.
+///
+/// Selector 1 is `enif_make_int(env, 65)` and selector 2 `enif_make_list_cell(env, 1, 2)` — the
+/// recorded reproducers of the divergence. Every observation below is the **measured oracle value**
+/// (system OTP 29.1.1 / erts-17.1); `the_iolist_shape_rules_agree_with_the_erl_oracle` re-measures
+/// them on every run.
+const MADE_CASES: &[(i64, &str, Observation)] = &[
+    (1, "the bare byte integer 65", [0, -1, 0, -1]),
+    (2, "the improper list [1|2]", [0, -1, 0, -1]),
+    (3, "the non-byte head [256]", [0, -1, 0, -1]),
+    (4, "the byte-less nested list [[]]", [1, 0, 1, 0]),
+    (5, "the empty list []", [1, 0, 1, 0]),
+    (6, "the deeply nested [[<<\"ab\">>,[99]]]", [1, 3, 1, 590]),
+    (7, "the binary tail [1|<<\"xy\">>]", [1, 3, 1, 604]),
+    (8, "the empty binary <<>>", [1, 0, 1, 0]),
+    (9, "the plain binary <<\"xyz\">>", [1, 3, 1, 728]),
+    (10, "the large nested iolist", [1, 1500, 1, 139_276_846]),
+];
+
+/// A case whose term the **caller** builds — the shapes the public `enif_*` API cannot construct (a
+/// non-byte-aligned bitstring, an atom) plus a few worth pinning through the argument path too.
+struct ProbeCase {
+    /// The Erlang source text of the term (the oracle driver's `probe/1` argument).
+    erl: &'static str,
+    /// The same term, built through `beam_term`'s writers.
+    build: fn(&mut NifEnv) -> Eterm,
+    /// The measured oracle observation of that term.
+    want: Observation,
+}
+
+/// Every probe case with its measured oracle observation:
+///
+/// * `[<<1:7>>]` — a bitstring whose bit size is not a multiple of 8 is a type error *inside* a list
+///   (`erl_iolist.c:176-195`), unlike `[<<1:8>>]`, which is a one-byte element;
+/// * `[65,66,67]` — the byte-in-head-position case that has always agreed;
+/// * `[1|<<2>>]` — a byte-aligned bitstring in **tail** position is accepted (the post-loop check);
+/// * `nope` — a non-iolist term.
+const PROBE_CASES: &[ProbeCase] = &[
+    ProbeCase { erl: "[<<1:7>>]", build: seven_bit_in_list, want: [0, -1, 0, -1] },
+    ProbeCase { erl: "[<<1:8>>]", build: eight_bit_in_list, want: [1, 1, 1, 1] },
+    ProbeCase { erl: "[65,66,67]", build: byte_list, want: [1, 3, 1, 398] },
+    ProbeCase { erl: "[1|<<2>>]", build: byte_with_binary_tail, want: [1, 2, 1, 5] },
+    ProbeCase { erl: "nope", build: atom_term, want: [0, -1, 0, -1] },
+];
+
+/// A byte-aligned heap binary of `bytes`.
+fn heap_binary(heap: &mut beam_alloc::Heap, bytes: &[u8]) -> Eterm {
+    // SAFETY: `heap_bits_size_words` sizes the `[hdr][size][data…]` block for these bits, and
+    // `write_binary` writes every word of it before the term escapes.
+    let hp = unsafe { heap.alloc_words(heap_bits_size_words(bytes.len() * 8)) }
+        .expect("the test heap has room for the binary");
+    // SAFETY: `hp` heads the reserved block; `bytes` provides the payload.
+    unsafe { write_binary(hp, bytes) }.expect("a byte-aligned binary")
+}
+
+/// A heap bitstring of `n_bits` bits packed from `bytes` (MSB first, `<<…>>` semantics).
+fn heap_bitstring(heap: &mut beam_alloc::Heap, bytes: &[u8], n_bits: usize) -> Eterm {
+    // SAFETY: as `heap_binary`, for a bit count.
+    let hp = unsafe { heap.alloc_words(heap_bits_size_words(n_bits)) }
+        .expect("the test heap has room for the bitstring");
+    // SAFETY: `hp` heads the reserved block and `bytes` holds the `n_bits` bits.
+    unsafe { write_heap_bits(hp, bytes, n_bits) }.expect("a bitstring")
+}
+
+/// The cons cell `car :: cdr`.
+fn cons(heap: &mut beam_alloc::Heap, car: Eterm, cdr: Eterm) -> Eterm {
+    heap.cons(car, cdr).expect("the test heap has room for a cons cell")
+}
+
+/// `[<<1:7>>]` — seven bits (`0000001`, packed MSB-first into `0b0000_0010`).
+fn seven_bit_in_list(env: &mut NifEnv) -> Eterm {
+    let head = heap_bitstring(env.heap(), &[0b0000_0010], 7);
+    cons(env.heap(), head, NIL)
+}
+
+/// `[<<1:8>>]` — the same value as a whole byte.
+fn eight_bit_in_list(env: &mut NifEnv) -> Eterm {
+    let head = heap_bitstring(env.heap(), &[1], 8);
+    cons(env.heap(), head, NIL)
+}
+
+/// `[65,66,67]`.
+fn byte_list(env: &mut NifEnv) -> Eterm {
+    let tail = cons(env.heap(), make_small(67), NIL);
+    let tail = cons(env.heap(), make_small(66), tail);
+    cons(env.heap(), make_small(65), tail)
+}
+
+/// `[1|<<2>>]` — a byte followed by a byte-aligned binary tail.
+fn byte_with_binary_tail(env: &mut NifEnv) -> Eterm {
+    let tail = heap_binary(env.heap(), &[2]);
+    cons(env.heap(), make_small(1), tail)
+}
+
+/// The atom `nope` — not an iolist at all.
+fn atom_term(env: &mut NifEnv) -> Eterm {
+    env.host().intern_atom("nope").expect("the test host interns atoms")
+}
+
+/// The small integers of a fixture result tuple, in order (the fixture returns integers only).
+fn result_ints(t: Eterm) -> Vec<i64> {
+    // SAFETY: `t` is checked to be a tuple before its header is dereferenced.
+    assert!(unsafe { prelude::is_tuple(t) }, "the fixture returns a tuple; got {t:?}");
+    // SAFETY: `t` is a well-formed tuple produced by the fixture.
+    let n = unsafe { prelude::tuple_size(t) };
+    (0..n)
+        .map(|i| {
+            // SAFETY: `i < n == tuple_size(t)`, so the element is in bounds.
+            let elem = unsafe { prelude::tuple_element(t, i) };
+            assert!(prelude::is_small(elem), "every result element is a small integer");
+            prelude::signed_value(elem)
+        })
+        .collect()
+}
+
+/// Compile the committed fixture; `None` (after a loud skip) when the toolchain is absent.
+fn compile_iolist_fixture() -> Option<PathBuf> {
+    compile_so(IOLIST_MODULE, IOLIST_FIXTURE_C)
+}
+
+/// The `.so` path as a `&str`, or `None` (after a loud skip) when it is not valid UTF-8.
+fn iolist_so_path(so: &Path) -> Option<String> {
+    match so.to_str() {
+        Some(path) => Some(path.to_string()),
+        None => {
+            skip("the compiled .so path is not valid UTF-8");
+            None
+        }
+    }
+}
+
+#[test]
+fn the_iolist_shape_rules_hold_through_a_real_c_nif() {
+    // Touching the table keeps the `enif_*`-carrying codegen unit in the link, so the `.so`'s
+    // imports resolve and `dlopen(RTLD_NOW)` can succeed.
+    std::hint::black_box(enif_api_table());
+
+    let Some(so) = compile_iolist_fixture() else { return };
+    let Some(path) = iolist_so_path(&so) else { return };
+
+    let mut host = common::TestHost::new();
+    // The host outlives the library (drop order), which the loaded fixture requires.
+    let lib = load(&path, IOLIST_MODULE, &mut host, NIL)
+        .expect("a real NIF library must load: its enif_* imports resolve from the test binary");
+    let mut env = NifEnv::new(&mut host);
+
+    for (selector, what, want) in MADE_CASES {
+        // Each case builds its own terms, so rewinding the arena in between keeps the small test
+        // heap enough for the 1500-byte large case (each result is read out before the rewind).
+        env.heap().reset();
+        let got = lib
+            .call(&mut env, "made", 1, &[make_small(*selector)])
+            .unwrap_or_else(|err| panic!("made/{selector} ({what}) must be callable: {err:?}"));
+        assert_eq!(result_ints(got), want.to_vec(), "made/{selector} ({what})");
+    }
+
+    for case in PROBE_CASES {
+        env.heap().reset();
+        let arg = (case.build)(&mut env);
+        let got = lib
+            .call(&mut env, "probe", 1, &[arg])
+            .unwrap_or_else(|err| panic!("probe/1 of {} must be callable: {err:?}", case.erl));
+        assert_eq!(result_ints(got), case.want.to_vec(), "probe/1 of {}", case.erl);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The system-Erlang oracle (skipped loudly when the toolchain is absent)
+// ---------------------------------------------------------------------------------------------
+
+/// Whether `cmd` can be spawned with `args` at all (the oracle-toolchain probe; a non-zero exit is
+/// fine — e.g. `erlc -h` — only a missing binary counts as absent).
+fn runnable(cmd: &str, args: &[&str]) -> bool {
+    Command::new(cmd).args(args).output().is_ok()
+}
+
+/// Render one expected observation as the Erlang text `~w` prints for it.
+fn erl_tuple(values: &[i64]) -> String {
+    let inner: Vec<String> = values.iter().map(i64::to_string).collect();
+    format!("{{{}}}", inner.join(","))
+}
+
+/// Load the *same* fixture into the **system** Erlang and print every observation, one per line.
+///
+/// Returns `None` (after a loud skip) when `erl`/`erlc` are unavailable or the generated module
+/// cannot be built; a *runtime* failure of the Erlang side is a hard error, because that would mean
+/// the fixture is not a valid NIF rather than that the toolchain is missing.
+fn oracle_print(so: &Path) -> Option<Vec<String>> {
+    if !runnable("erl", &["-noshell", "-eval", "halt(0)."]) || !runnable("erlc", &["-h"]) {
+        skip("the erl/erlc oracle toolchain is not available");
+        return None;
+    }
+    let dir = so.parent()?.to_path_buf();
+    // `erlang:load_nif/2` appends the shared-object suffix itself, so hand it the path WITHOUT `.so`.
+    let stem = so.file_stem()?.to_str()?;
+    let nif_path = dir.join(stem);
+    let nif_path = nif_path.to_str()?;
+
+    // The oracle module: the stub bodies are replaced by the NIFs on `load_nif`. The compiler marks
+    // both functions `nif_start` because `init/0` calls `load_nif/2`, which is what makes the
+    // replacement possible.
+    let mut erl = format!("-module({IOLIST_MODULE}).\n-export([made/1, probe/1]).\n-on_load(init/0).\n\n");
+    erl.push_str(&format!("init() ->\n    erlang:load_nif(\"{nif_path}\", 0).\n\n"));
+    erl.push_str("made(_) -> erlang:nif_error(nif_not_loaded).\n");
+    erl.push_str("probe(_) -> erlang:nif_error(nif_not_loaded).\n");
+
+    let erl_file = dir.join(format!("{IOLIST_MODULE}.erl"));
+    std::fs::write(&erl_file, erl).expect("the oracle module is writable");
+
+    let compiled = Command::new("erlc")
+        .arg("-o")
+        .arg(&dir)
+        .arg(&erl_file)
+        .output()
+        .expect("erlc is runnable (probed above)");
+    assert!(
+        compiled.status.success(),
+        "erlc failed:\n{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+
+    let mut expr = String::new();
+    for (selector, _, _) in MADE_CASES {
+        expr.push_str(&format!("io:format(\"~w~n\", [{IOLIST_MODULE}:made({selector})]),\n"));
+    }
+    for case in PROBE_CASES {
+        expr.push_str(&format!("io:format(\"~w~n\", [{IOLIST_MODULE}:probe({})]),\n", case.erl));
+    }
+    expr.push_str("halt(0).\n");
+
+    let out = Command::new("erl")
+        .arg("-noshell")
+        .arg("-pa")
+        .arg(&dir)
+        .arg("-eval")
+        .arg(&expr)
+        .output()
+        .expect("erl is runnable (probed above)");
+    assert!(
+        out.status.success(),
+        "the oracle run failed (exit {:?}):\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+#[test]
+fn the_iolist_shape_rules_agree_with_the_erl_oracle() {
+    let Some(so) = compile_iolist_fixture() else { return };
+    let Some(lines) = oracle_print(&so) else { return };
+
+    let expected: Vec<String> = MADE_CASES
+        .iter()
+        .map(|(_, _, want)| erl_tuple(want))
+        .chain(PROBE_CASES.iter().map(|case| erl_tuple(&case.want)))
+        .collect();
+    assert_eq!(
+        lines, expected,
+        "the system Erlang and this crate must agree on every pinned iolist observation"
     );
 }
