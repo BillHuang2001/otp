@@ -42,18 +42,25 @@
 //!   none.
 //! * **`ets:setopts/2`** — `{heir, none}` / `{heir, Pid}` / `{heir, Pid, Data}`
 //!   (any option list shape the C `ets_setopts_2` accepts, including a **bare
-//!   tuple** in place of the one-element list) and returns `true`. The caller must
+//!   tuple** in place of the one-element list) plus
+//!   `{protection, public|protected|private}`, and returns `true`. The caller must
 //!   be the **owner** (`badarg` otherwise, even on a `public` table — verified);
-//!   a duplicate `{heir, _}`, a `{heir, none, Data}` 3-tuple, a non-pid heir, a
-//!   malformed option, an improper list or a non-list/non-tuple argument is
-//!   `badarg`. Two C behaviours are modelled structurally: a **dead** heir pid is
-//!   accepted and then **clears** the heir (`set_heir`, `erl_db.c:5324`) — that
-//!   needs a `ProcessHook`, see below — and the arity-2 `{heir, Pid}` form carries
-//!   **no** gift data (`None`, the C's `THE_NON_VALUE`, which is not a term at
-//!   all). An install goes through `Table::install_heir`, so the arity-3 gift data
-//!   is **deep-copied into table-owned storage** and survives the caller's heap
-//!   (unchanged for an immediate, `badarg` for a term outside the store's copyable
-//!   subset).
+//!   a duplicate `{heir, _}`, a duplicate `{protection, _}`, a `{heir, none, Data}`
+//!   3-tuple, a non-pid heir, an unknown `protection` mode, a malformed option, an
+//!   improper list or a non-list/non-tuple argument is `badarg`. Two C behaviours
+//!   are modelled structurally: a **dead** heir pid is accepted and then **clears**
+//!   the heir (`set_heir`, `erl_db.c:5324`) — that needs a `ProcessHook`, see
+//!   below — and the arity-2 `{heir, Pid}` form carries **no** gift data (`None`,
+//!   the C's `THE_NON_VALUE`, which is not a term at all). An install goes through
+//!   `Table::install_heir`, so the arity-3 gift data is **deep-copied into
+//!   table-owned storage** and survives the caller's heap (unchanged for an
+//!   immediate, `badarg` for a term outside the store's copyable subset). The
+//!   `protection` mode is applied through `Table::setopts(Some(owner),
+//!   SetOpt::Access(Access))` — the owner-gated access setter — so
+//!   `ets:info(T, protection)` reflects it immediately and the change does **not**
+//!   re-normalize the creation-time concurrency flags (the oracle's rule: a
+//!   `public` table created with `{write_concurrency, true}` switched to `private`
+//!   still reports `write_concurrency => true`).
 //! * **`ets:give_away/3`** — transfers ownership to a live, *different* pid and
 //!   returns `true`; `badarg` for a non-pid, a dead pid, the caller's own pid, a
 //!   non-owner caller, or a table argument that names no table (`ets_give_away_3`,
@@ -82,18 +89,6 @@
 //! `ets:match_spec_run_r/3` ([`super::specs`]) and the `*_lookup` family
 //! ([`super::nav`]).
 //!
-//! * **`ets:setopts(T, {protection, P})`** — the C also accepts the
-//!   `{protection, private|protected|public}` option (`am_protection` arm of
-//!   `ets_setopts_2`) and changes `ets:info(T, protection)`. `beam_ets::Table`
-//!   exposes `access()` but **no post-creation setter** (`TableOptions::set_access`
-//!   only affects *creation*), so this one sub-option is the typed
-//!   `unsupported_bif` gap (the whole option list is validated first, so a
-//!   `{protection, _}` call leaves the table untouched). The missing API is
-//!   `beam_ets::Table::set_access(&mut self, Access)` — or a `SetOpt::Access(Access)`
-//!   variant handled by `Table::setopts` — carrying the same **owner write gate**
-//!   `Table::setopts` already applies (the caller must be the table's owner; the C
-//!   is `ets_setopts_2`'s `DB_WRITE` acquisition plus its owner test). Until such a
-//!   setter exists there is no way to change the protection without fabricating it.
 //! * **`ets:fun2ms/1`** (a stdlib function) — it needs the *literal* fun written
 //!   at the call site (`ms_transform:transform_from_shell/3` → `erl_eval:fun_data/1`
 //!   → `erl_parse`'s abstract format). A [`BifFn`](crate::registry::BifFn) is a
@@ -137,7 +132,7 @@
 //!   `beam_rt` installs the hook, so the real runtime is exact.
 
 use beam_common::Result;
-use beam_ets::{OwnerId, Table};
+use beam_ets::{Access, OwnerId, SetOpt, Table};
 use beam_process::ProcessId;
 use beam_term::{atom_val, is_internal_pid, make_atom, AtomTable, Eterm};
 
@@ -222,8 +217,8 @@ enum HeirChange {
     },
 }
 
-/// `ets:setopts(Tab, Options)` — installs or clears the table's heir and returns
-/// `true`.
+/// `ets:setopts(Tab, Options)` — installs or clears the table's heir, changes its
+/// `protection` and returns `true`.
 ///
 /// Reproduces the accept/reject matrix of the C `ets_setopts_2`
 /// (`erl_db.c:3151`): the second argument is a proper list of options, **or a
@@ -234,9 +229,10 @@ enum HeirChange {
 /// option is `badarg`. An install runs through [`Table::install_heir`], so the
 /// gift data is **deep-copied into table-owned storage** (the A.1 copy boundary,
 /// the C `set_heir`'s `DbTerm`) and cannot dangle when the caller's heap is reused;
-/// a dead heir pid is accepted and clears the heir.
-/// `protection` is recognised (so a malformed one is still `badarg`) but **cannot
-/// be applied** — see the module docs — and answers the typed `unsupported_bif`.
+/// a dead heir pid is accepted and clears the heir. `protection` accepts exactly
+/// `public`/`protected`/`private` (a second `protection` option and any other
+/// value are `badarg`) and is applied through `Table::setopts(Some(owner),
+/// SetOpt::Access(Access))`, the owner-gated access setter.
 ///
 /// The C applies the options only after the whole list has been validated and the
 /// **owner** check has passed, so a caller who is not the table's owner gets
@@ -244,12 +240,7 @@ enum HeirChange {
 /// and the owner check the rest).
 fn setopts_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve_handle(ctx, args[0])?;
-    let (heir, protection) = parse_setopts(ctx.atoms(), args[1])?;
-    if protection {
-        // The C changes `protection`; `beam_ets::Table` has no access setter, so
-        // the whole call is the typed gap and the table is left untouched.
-        return Err(unsupported_bif());
-    }
+    let (heir, access) = parse_setopts(ctx.atoms(), args[1])?;
     // Resolve the `{heir, …}` option before taking the table: the dead-heir clear
     // asks the `ProcessHook` through the whole context.
     let change = match heir {
@@ -275,7 +266,11 @@ fn setopts_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         // `tb->common.owner != BIF_P->common.id` unconditionally).
         Err(badarg())
     } else {
-        match change {
+        // The heir change first (`Table::install_heir` deep-copies the gift into
+        // table-owned storage — the A.1 copy boundary, the C `set_heir`'s `DbTerm`
+        // — so a non-immediate `data` does not alias the caller's heap), then the
+        // access change through the owner-gated `Table::setopts`.
+        let heir_result = match change {
             HeirChange::Nothing => Ok(()),
             // The owner-level clear reclaims the outgoing heir's table-owned gift
             // copy (the C `free_heir_data`).
@@ -283,11 +278,12 @@ fn setopts_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
                 table.set_heir(None);
                 Ok(())
             }
-            // `Table::install_heir` deep-copies the gift into table-owned storage
-            // (the A.1 copy boundary, the C `set_heir`'s `DbTerm`), so a
-            // non-immediate `data` does not alias the caller's heap.
             HeirChange::Install { owner, data } => table.install_heir(owner, data),
-        }
+        };
+        heir_result.and_then(|()| match access {
+            Some(access) => table.setopts(Some(caller), SetOpt::Access(access)),
+            None => Ok(()),
+        })
     };
     restore_table(ctx, handle, table)?;
     outcome?;
@@ -295,8 +291,8 @@ fn setopts_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 }
 
 /// Parses an `ets:setopts/2` option list (see [`setopts_2`]), returning the
-/// `{heir, …}` option and whether a `{protection, _}` option appeared.
-fn parse_setopts(atoms: &AtomTable, options: Eterm) -> Result<(Option<HeirOpt>, bool)> {
+/// `{heir, …}` option and the `{protection, …}` access mode (when one was given).
+fn parse_setopts(atoms: &AtomTable, options: Eterm) -> Result<(Option<HeirOpt>, Option<Access>)> {
     let elems = if is_tuple(options) {
         vec![options]
     } else if is_list(options) || is_nil(options) {
@@ -305,7 +301,7 @@ fn parse_setopts(atoms: &AtomTable, options: Eterm) -> Result<(Option<HeirOpt>, 
         return Err(badarg());
     };
     let mut heir: Option<HeirOpt> = None;
-    let mut protection = false;
+    let mut access: Option<Access> = None;
     for elem in elems {
         if !is_tuple(elem) || tuple_size(elem) < 2 {
             return Err(badarg());
@@ -338,24 +334,27 @@ fn parse_setopts(atoms: &AtomTable, options: Eterm) -> Result<(Option<HeirOpt>, 
                 }
             }
             Some("protection") => {
-                if protection || tuple_size(elem) != 2 {
+                if access.is_some() || tuple_size(elem) != 2 {
                     return Err(badarg());
                 }
                 let value = tuple_element(elem, 1);
-                if !is_atom(value)
-                    || !matches!(
-                        atoms.name(atom_val(value)),
-                        Some("private") | Some("protected") | Some("public")
-                    )
-                {
+                let name = if is_atom(value) {
+                    atoms.name(atom_val(value))
+                } else {
+                    None
+                };
+                // The three mode atoms are the only accepted values (`Access`'s own
+                // parser is the single source of the spellings, so a
+                // `{protection, bogus}` cannot be half-accepted).
+                access = name.and_then(Access::from_atom_name);
+                if access.is_none() {
                     return Err(badarg());
                 }
-                protection = true;
             }
             _ => return Err(badarg()),
         }
     }
-    Ok((heir, protection))
+    Ok((heir, access))
 }
 
 // -------------------------------------------------------------- give_away/3
@@ -540,9 +539,9 @@ mod tests {
 
         // `{heir, none}` clears; `{heir, Pid}` installs with no gift data.
         let list = heir_list(&mut ctx, &[heir, none]);
-        let (opt, prot) = parse_setopts(ctx.atoms(), list).expect("{heir, none}");
+        let (opt, access) = parse_setopts(ctx.atoms(), list).expect("{heir, none}");
         assert!(matches!(opt, Some(HeirOpt::Clear)));
-        assert!(!prot);
+        assert!(access.is_none());
 
         let list = heir_list(&mut ctx, &[heir, pid]);
         let (opt, _) = parse_setopts(ctx.atoms(), list).expect("{heir, Pid}");
@@ -562,11 +561,11 @@ mod tests {
             _ => panic!("expected an installed heir"),
         }
 
-        // A `{protection, public}` option parses but is reported unservable.
+        // A `{protection, public}` option parses to the access mode.
         let list = heir_list(&mut ctx, &[protection, public]);
-        let (opt, prot) = parse_setopts(ctx.atoms(), list).expect("{protection, public}");
+        let (opt, access) = parse_setopts(ctx.atoms(), list).expect("{protection, public}");
         assert!(opt.is_none());
-        assert!(prot);
+        assert_eq!(access, Some(Access::Public));
 
         // Malformed shapes: a non-pid heir, `{heir, none, Data}`, a duplicate
         // `{heir, _}`, a duplicate `{protection, _}`, an unknown tag, a non-atom
@@ -608,8 +607,8 @@ mod tests {
         assert!(matches!(parse_setopts(ctx.atoms(), improper), Err(BeamError::BadArg)));
 
         // An empty list is accepted (the owner check happens elsewhere).
-        let (opt, prot) = parse_setopts(ctx.atoms(), NIL).expect("[]");
-        assert!(opt.is_none() && !prot);
+        let (opt, access) = parse_setopts(ctx.atoms(), NIL).expect("[]");
+        assert!(opt.is_none() && access.is_none());
     }
 
     /// A single option **tuple** is accepted in place of the one-element list
@@ -912,14 +911,12 @@ mod tests {
         );
     }
 
-    /// A valid `{protection, P}` option is **recognised** but is the typed
-    /// capability gap — `beam_ets` exposes no post-creation access setter — so the
-    /// whole call raises `unsupported_bif` and leaves the protection untouched
-    /// (never a wrong protection). A malformed value and a duplicate
-    /// `{protection, _}` are still the oracle's `badarg` (the C validates the whole
-    /// list first).
+    /// A valid `{protection, P}` option changes the table's access through
+    /// `Table::setopts(Some(owner), SetOpt::Access(_))` (the owner-gated setter) and
+    /// returns `true`. A malformed value and a duplicate `{protection, _}` are still
+    /// the oracle's `badarg` (the C validates the whole list first).
     #[test]
-    fn setopts_protection_is_a_typed_gap() {
+    fn setopts_applies_the_protection_option() {
         let bifs = crate::default_registry();
         let atoms = setopts_atoms();
         let mut heap = Heap::new(1 << 14).expect("heap");
@@ -937,22 +934,22 @@ mod tests {
         let protection = ctx.atom("protection").expect("seeded");
         let public = ctx.atom("public").expect("seeded");
 
-        // A **valid** `{protection, public}` is the typed gap.
+        // A **valid** `{protection, public}` is applied and returns `true`.
         let valid = {
             let opt = ctx.tuple(&[protection, public]).expect("option");
             ctx.list(&[opt]).expect("option list")
         };
-        assert_unsupported(
-            bifs.call("ets", "setopts", 2, &mut ctx, &[table, valid])
-                .expect_err("the protection typed gap"),
-        );
+        let truth = bifs
+            .call("ets", "setopts", 2, &mut ctx, &[table, valid])
+            .expect("setopts/2");
+        assert_eq!(ctx.atoms().name(atom_val(truth)), Some("true"));
         let info = bifs
             .call("ets", "info", 2, &mut ctx, &[table, protection])
             .expect("ets:info/2");
         assert_eq!(
             ctx.atoms().name(atom_val(info)),
-            Some("protected"),
-            "the protection is unchanged (the gap never applies a wrong one)"
+            Some("public"),
+            "the protection is applied"
         );
 
         // A malformed `{protection, <non-access atom>}` is `badarg`.

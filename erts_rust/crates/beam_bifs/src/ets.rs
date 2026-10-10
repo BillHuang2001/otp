@@ -376,10 +376,13 @@ impl TableRegistry {
     /// Inserts `table` under `handle`, returning the previous table if the handle
     /// was already present.
     ///
-    /// Any continuations of the replaced table are dropped (they name a table that
-    /// no longer exists).
+    /// **Continuations are not touched.** A continuation is an immutable value —
+    /// the `beam_ets` traversal state plus the table identity it was issued against
+    /// — exactly as in the oracle, where resuming one is repeatable and an
+    /// intervening table operation does not destroy it. A continuation of a table
+    /// that *has* gone away stays registered but can no longer resolve its table,
+    /// so resuming it is `badarg` (see [`resume_continuation`]).
     pub fn insert(&mut self, handle: u64, table: Table) -> Option<Table> {
-        self.continuations.retain(|_, cont| cont.table != handle);
         self.tables.insert(handle, table)
     }
 
@@ -411,8 +414,7 @@ impl TableRegistry {
         self.tables.remove(&handle)
     }
 
-    /// Removes and returns the table stored under `handle`, if any, dropping every
-    /// continuation that belonged to it but keeping its
+    /// Removes and returns the table stored under `handle`, if any, keeping its
     /// [`resolve::TableProfile`].
     ///
     /// This is the take half of every table-taking BIF's borrow-and-restore round
@@ -420,8 +422,12 @@ impl TableRegistry {
     /// the table's `ets:info/1,2` rendering is unchanged after e.g. an `insert/2`.
     /// The profile is dropped only by [`TableRegistry::remove`] or an explicit
     /// [`TableRegistry::forget_profile`] (the whole-table `ets:delete/1`).
+    ///
+    /// **Continuations are not touched** (they are immutable values — see
+    /// [`TableRegistry::insert`]): a take/restore round trip is invisible to them,
+    /// so an unrelated table operation never invalidates a live `ets:select/3`
+    /// continuation.
     pub fn take(&mut self, handle: u64) -> Option<Table> {
-        self.continuations.retain(|_, cont| cont.table != handle);
         self.tables.remove(&handle)
     }
 
@@ -491,15 +497,29 @@ impl TableRegistry {
         self.names.remove(&name)
     }
     /// Registers `state` as a live continuation of the table stored under
-    /// `table`, returning the fresh continuation id (the id of the ref thing the
+    /// `table`, returning the continuation id (the id of the ref thing the
     /// `ets:select` BIFs hand to Erlang). `reverse` records the traversal's
     /// direction (see [`Continuation`]).
+    ///
+    /// A continuation is an **immutable value derived from the traversal state**
+    /// (the `beam_ets` [`MatchContinuation`] is `PartialEq`), so an *equal* state
+    /// already registered for the same table and direction reuses its id instead of
+    /// minting a fresh one. That is what makes a resume **repeatable with an
+    /// identical result term**: the oracle resumes one continuation any number of
+    /// times and hands back `=:=`-equal chunks (continuations included — probed on
+    /// erts-17.1: `{_,C} = ets:match_object(T,'_',2), ets:match_object(C) =:=
+    /// ets:match_object(C)` ⇒ `true`).
     pub fn insert_continuation(
         &mut self,
         table: u64,
         state: MatchContinuation,
         reverse: bool,
     ) -> u64 {
+        if let Some(existing) = self.continuations.iter().find_map(|(handle, cont)| {
+            (cont.table == table && cont.reverse == reverse && cont.state == state).then_some(*handle)
+        }) {
+            return existing;
+        }
         let handle = self.next_continuation;
         self.next_continuation += 1;
         self.continuations.insert(
@@ -516,6 +536,11 @@ impl TableRegistry {
     /// Removes and returns the continuation stored under `handle`: the handle of
     /// its table, its opaque state and its direction (`None` when `handle` is
     /// unknown — the caller raises `badarg`).
+    ///
+    /// The continuation family no longer *consumes* on resume (see
+    /// [`TableRegistry::continuation`]); this consuming accessor is kept for a host
+    /// that permanently drops a traversal — [`TableRegistry::remove`], the
+    /// whole-table delete, does the same for every continuation of a table.
     pub fn take_continuation(
         &mut self,
         handle: u64,
@@ -525,9 +550,23 @@ impl TableRegistry {
             .map(|cont| (cont.table, cont.state, cont.reverse))
     }
 
+    /// The continuation stored under `handle` — the handle of its table, a copy of
+    /// its opaque state and its direction — or `None` when `handle` names no live
+    /// continuation.
+    ///
+    /// The state is **cloned, never removed**: resuming a continuation is a pure
+    /// function of it, so `ets:select(Cont)` is repeatable and an unrelated table
+    /// operation cannot invalidate it (the oracle's continuation is an immutable
+    /// value, contrary to a live cursor).
+    pub fn continuation(&self, handle: u64) -> Option<(u64, MatchContinuation, bool)> {
+        self.continuations
+            .get(&handle)
+            .map(|cont| (cont.table, cont.state.clone(), cont.reverse))
+    }
+
     /// The handle of the table a live continuation belongs to, if any.
     ///
-    /// [`resume_continuation`] needs it *before* consuming the continuation: the
+    /// [`resume_continuation`] needs it *before* resuming the continuation: the
     /// resuming call is access-gated as the calling process, and a denial must
     /// leave the continuation resumable (verified: after a non-owner's denied
     /// `ets:select(Cont)` on a `private` table, the owner can still resume it).
@@ -1091,10 +1130,22 @@ fn first_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 }
 
 /// `ets:last(Tab)` — the last key in the table's iteration order.
+///
+/// A **hash** kind (`set`/`bag`/`duplicate_bag`) has no backward walk, and the
+/// oracle aliases `ets:last/1` to `ets:first/1` there — the C runs the *forward*
+/// primitive for every non-`ordered_set` kind. Only an `ordered_set` reads the
+/// real end of its order. This mirrors `nav::last_lookup_1` exactly (the two
+/// verbs must never disagree). Verified against the system `erl` (OTP 29.1.1 /
+/// erts-17.1): keys `[6,3,4,8,1]` in a `set` give `first` `6`/`last` `6`, while an
+/// `ordered_set` gives `first` `1`/`last` `8`.
 fn last_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
-    let key = table.last(ctx.atoms());
+    let key = if table.kind().is_ordered() {
+        table.last(ctx.atoms())
+    } else {
+        table.first(ctx.atoms())
+    };
     restore_table(ctx, handle, table)?;
     key_or_end(ctx, key)
 }
@@ -1111,11 +1162,23 @@ fn next_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 }
 
 /// `ets:prev(Tab, Key)` — the key preceding `Key` (mirrors [`next_2`]).
+///
+/// Mirroring [`last_1`]'s alias: a **hash** kind answers with the *forward* step
+/// ([`Table::next`] — the oracle's behaviour: `prev` is aliased to `next` there),
+/// only an `ordered_set` with the real predecessor. The chosen primitive's
+/// `badarg` (a hash kind requires the anchor key to be present) propagates
+/// unchanged. Verified against the system `erl` (OTP 29.1.1 / erts-17.1): keys
+/// `[6,3,4,8,1]` give `next(T,3)` `4`/`prev(T,3)` `4` for a `set` and
+/// `next(T,3)` `4`/`prev(T,3)` `1` for an `ordered_set`.
 fn prev_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let key = args[1];
     let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
-    let outcome = table.prev(key, ctx.atoms());
+    let outcome = if table.kind().is_ordered() {
+        table.prev(key, ctx.atoms())
+    } else {
+        table.next(key, ctx.atoms())
+    };
     restore_table(ctx, handle, table)?;
     key_or_end(ctx, outcome?)
 }
@@ -1301,8 +1364,16 @@ pub(super) fn dispatch_continuation(
 ///
 /// The resume is **read**-gated as the calling process against the continuation's
 /// table (`erl_db.c`'s `ets_select_1` calls `db_get_table` with `DB_READ`), and the
-/// check runs *before* the continuation is consumed, so a denied resume gives the
-/// oracle's `badarg` and leaves the traversal resumable.
+/// check runs *before* the state is read, so a denied resume gives the oracle's
+/// `badarg` and leaves the traversal resumable.
+///
+/// **The resume never consumes the continuation.** The registry entry is read
+/// (cloned) and left in place, so the same continuation may be resumed any number
+/// of times with an identical result — the oracle's continuation is an immutable
+/// value, not a live cursor, and an unrelated table operation does not invalidate
+/// it. A continuation whose table has since been deleted (or whose `named_table`
+/// name was renamed away) is still `badarg`: the table lookup / the `beam_ets`
+/// identity check inside `resume` reject it.
 pub(super) fn resume_continuation(
     ctx: &mut BifContext<'_>,
     cont_term: Eterm,
@@ -1318,7 +1389,7 @@ pub(super) fn resume_continuation(
     }
     let (table_handle, cont, reverse) = {
         let tables = ctx.tables().ok_or_else(unsupported_bif)?;
-        tables.take_continuation(handle).ok_or_else(badarg)?
+        tables.continuation(handle).ok_or_else(badarg)?
     };
 
     let table = take_table(ctx, table_handle)?;
