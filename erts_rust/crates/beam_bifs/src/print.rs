@@ -627,8 +627,11 @@ fn string_field(s: Chunk, f: usize, left: bool, pad: u8) -> Chunk {
 ///
 /// The `~w` form is `[<, <, [digits, 44, digits, …], >, >]` (each byte its own
 /// sub-list, the separators individual integers; `[<, <, [], >, >]` for an empty
-/// binary, `[<, <, ["..."], >, >]` at depth 1). The `~p` form keeps the string
-/// leaf flat: `<<>>` / `<<...>>` / `<<"…">>`.
+/// binary). The body is depth-limited the way `io_lib:write_binary/3`'s
+/// `write_binary_body/4` limits it — one level per byte, then `"..."` while bytes
+/// remain — so `~W` of `<<1,2,3>>` is `<<>>`, `<<...>>`, `<<1,...>>`, `<<1,2,...>>`,
+/// `<<1,2,3>>` for depths `0..=4`. The `~p` form keeps the string leaf flat:
+/// `<<>>` / `<<...>>` / `<<"…">>`.
 fn render_binary_chunk(term: Eterm, printable: bool, depth: i64) -> Result<Chunk> {
     let bytes = bits::bytes(term)?;
     if printable {
@@ -656,16 +659,28 @@ fn render_binary_chunk(term: Eterm, printable: bool, depth: i64) -> Result<Chunk
             Chunk::Char('>'),
         ]));
     }
-    let mut body: Vec<Chunk> = Vec::new();
-    if depth == 1 {
-        body.push(Chunk::text("..."));
+    // `io_lib:write_binary/3` (`io_lib.erl` `write_binary_body/4`): each byte is one
+    // depth level, so at depth `D` (>= 1) the first `D - 1` bytes are shown and `...`
+    // follows when bytes remain (`<<1,2,3>>` at depth 3 ⇒ `<<1,2,...>>`). A negative
+    // depth is unlimited; depth `0` was handled by the caller.
+    let budget = if depth < 0 {
+        bytes.len()
     } else {
-        for (i, byte) in bytes.iter().enumerate() {
-            if i != 0 {
-                body.push(Chunk::Char(','));
-            }
-            body.push(Chunk::text(&byte.to_string()));
+        (depth - 1).max(0) as usize
+    };
+    let shown = budget.min(bytes.len());
+    let mut body: Vec<Chunk> = Vec::new();
+    for (i, byte) in bytes[..shown].iter().enumerate() {
+        if i != 0 {
+            body.push(Chunk::Char(','));
         }
+        body.push(Chunk::text(&byte.to_string()));
+    }
+    if shown < bytes.len() {
+        if shown != 0 {
+            body.push(Chunk::Char(','));
+        }
+        body.push(Chunk::text("..."));
     }
     Ok(Chunk::List(vec![
         Chunk::Char('<'),
@@ -706,16 +721,26 @@ fn render_bitstring_chunk(term: Eterm, printable: bool, depth: i64) -> Result<Ch
     let data = bitstring_bits(term)?;
     let full_bytes = bit_len / 8;
     let trailing_bits = bit_len % 8;
-    let mut body: Vec<Chunk> = Vec::new();
-    if depth == 1 {
-        body.push(Chunk::text("..."));
+    // `write_binary_body/4` consumes one depth level per body element: the
+    // `full_bytes` whole bytes and then the trailing `Value:Bits` field. So at depth
+    // `D` (>= 1) the first `D - 1` elements are shown and `...` follows while elements
+    // remain (`<<255:12>>` at depth 2 ⇒ `<<15,...>>`); a negative depth is unlimited.
+    let elements = full_bytes + 1;
+    let budget = if depth < 0 {
+        elements
     } else {
-        for (i, byte) in data[..full_bytes].iter().enumerate() {
-            if i != 0 {
-                body.push(Chunk::Char(','));
-            }
-            body.push(Chunk::text(&byte.to_string()));
+        (depth - 1).max(0) as usize
+    };
+    let shown = budget.min(full_bytes);
+    let mut body: Vec<Chunk> = Vec::new();
+    for (i, byte) in data[..shown].iter().enumerate() {
+        if i != 0 {
+            body.push(Chunk::Char(','));
         }
+        body.push(Chunk::text(&byte.to_string()));
+    }
+    if budget > full_bytes {
+        // The trailing field fits within the remaining depth.
         if full_bytes != 0 {
             body.push(Chunk::Char(','));
         }
@@ -725,6 +750,11 @@ fn render_bitstring_chunk(term: Eterm, printable: bool, depth: i64) -> Result<Ch
         body.push(Chunk::text(&trailing_value.to_string()));
         body.push(Chunk::Char(':'));
         body.push(Chunk::text(&trailing_bits.to_string()));
+    } else {
+        if shown != 0 {
+            body.push(Chunk::Char(','));
+        }
+        body.push(Chunk::text("..."));
     }
     Ok(Chunk::List(vec![
         Chunk::Char('<'),
@@ -1082,11 +1112,21 @@ mod tests {
             let list = ctx.list(&[one, two]).expect("fits");
             assert_eq!(show(ctx, list, false), "[<<1:1>>,2]");
 
-            // Depth: `~W`/`~P` elide a bitstring's contents at depth 1.
+            // Depth: `~W`/`~P` spend one level per body element (each whole byte, plus
+            // the trailing `Value:Bits` field), then emit `...`.
             assert_eq!(show_at(ctx, one, false, 1), "<<...>>");
             assert_eq!(show_at(ctx, one, true, 1), "<<...>>");
             assert_eq!(show_at(ctx, one, false, 0), "...");
             assert_eq!(show_at(ctx, one, false, 2), "<<1:1>>");
+            // `<<255:12>>`: `d=2` ⇒ `<<15,...>>`, `d=3` ⇒ full.
+            assert_eq!(show_at(ctx, twelve, false, 1), "<<...>>");
+            assert_eq!(show_at(ctx, twelve, false, 2), "<<15,...>>");
+            assert_eq!(show_at(ctx, twelve, false, 3), "<<15,15:4>>");
+            // `<<1:9>>`: one whole byte then the trailing bit.
+            assert_eq!(show_at(ctx, nine, false, 2), "<<0,...>>");
+            assert_eq!(show_at(ctx, nine, false, 3), "<<0,1:1>>");
+            // `<<5:3,3:2>>` is a single element, so it survives depth 2 intact.
+            assert_eq!(show_at(ctx, five, false, 2), "<<23:5>>");
         });
     }
 
@@ -1178,7 +1218,7 @@ mod tests {
         with_ctx(|ctx| {
             let bin = bits::make_binary(ctx.heap(), &[1, 2, 3]).expect("fits");
             assert_eq!(show_at(ctx, bin, false, 1), "<<...>>");
-            assert_eq!(show_at(ctx, bin, false, 2), "<<1,2,3>>");
+            assert_eq!(show_at(ctx, bin, false, 2), "<<1,...>>");
             // A printable binary at depth 1 is still elided (oracle).
             let abc = bits::make_binary(ctx.heap(), b"abc").expect("fits");
             assert_eq!(show_at(ctx, abc, true, 1), "<<...>>");
@@ -1196,6 +1236,60 @@ mod tests {
             assert_eq!(show_at(ctx, map, false, 1), "#{}");
             assert_eq!(show_at(ctx, map, false, 2), "#{a => 1,...}");
             assert_eq!(show_at(ctx, map, false, 3), "#{a => 1,b => 2,...}");
+        });
+    }
+
+    /// The `~W` binary depth rule, pinned to the erts-17.1 oracle
+    /// (`io_lib:write_binary/3`'s `write_binary_body/4`: one depth level per byte,
+    /// then `...` while bytes remain).
+    #[test]
+    fn binary_depth_limit_matches_io_lib_write() {
+        with_ctx(|ctx| {
+            // `erl -noshell -eval 'io:format("~W~n",[<<1,2,3>>,2]).'` ⇒ `<<1,...>>`.
+            let bin = bits::make_binary(ctx.heap(), &[1, 2, 3]).expect("fits");
+            assert_eq!(show_at(ctx, bin, false, 0), "...");
+            assert_eq!(show_at(ctx, bin, false, 1), "<<...>>");
+            assert_eq!(show_at(ctx, bin, false, 2), "<<1,...>>");
+            assert_eq!(show_at(ctx, bin, false, 3), "<<1,2,...>>");
+            assert_eq!(show_at(ctx, bin, false, 4), "<<1,2,3>>");
+            assert_eq!(show_at(ctx, bin, false, 5), "<<1,2,3>>");
+            assert_eq!(show_at(ctx, bin, false, UNLIMITED_DEPTH), "<<1,2,3>>");
+
+            // `~W` (`printable = false`) renders a printable binary in decimal, with
+            // the same one-level-per-byte budget.
+            let abc = bits::make_binary(ctx.heap(), b"abc").expect("fits");
+            assert_eq!(show_at(ctx, abc, false, 1), "<<...>>");
+            assert_eq!(show_at(ctx, abc, false, 2), "<<97,...>>");
+            assert_eq!(show_at(ctx, abc, false, 3), "<<97,98,...>>");
+            assert_eq!(show_at(ctx, abc, false, 4), "<<97,98,99>>");
+            assert_eq!(show_at(ctx, abc, false, 5), "<<97,98,99>>");
+
+            // An empty binary is `<<>>` at every depth.
+            let empty = bits::make_binary(ctx.heap(), &[]).expect("fits");
+            assert_eq!(show_at(ctx, empty, false, 1), "<<>>");
+            assert_eq!(show_at(ctx, empty, false, 3), "<<>>");
+            assert_eq!(show_at(ctx, empty, false, UNLIMITED_DEPTH), "<<>>");
+
+            // The depth is consumed across sibling elements, exactly as for any other
+            // container (`{<<1,...>>,<<...>>}` at depth 3).
+            let tuple = ctx.tuple(&[bin, bin]).expect("fits");
+            assert_eq!(show_at(ctx, tuple, false, 2), "{<<...>>,...}");
+            assert_eq!(show_at(ctx, tuple, false, 3), "{<<1,...>>,<<...>>}");
+            assert_eq!(show_at(ctx, tuple, false, 4), "{<<1,2,...>>,<<1,...>>}");
+            assert_eq!(show_at(ctx, tuple, false, 6), "{<<1,2,3>>,<<1,2,3>>}");
+
+            let list = ctx.list(&[bin, bin]).expect("fits");
+            assert_eq!(show_at(ctx, list, false, 2), "[<<...>>|...]");
+            assert_eq!(show_at(ctx, list, false, 3), "[<<1,...>>,<<...>>]");
+            assert_eq!(show_at(ctx, list, false, 4), "[<<1,2,...>>,<<1,...>>]");
+            assert_eq!(show_at(ctx, list, false, 6), "[<<1,2,3>>,<<1,2,3>>]");
+
+            let a = ctx.atom("a").expect("seeded");
+            let map = crate::access::make_flatmap(ctx.heap(), &[(a, bin)]).expect("fits");
+            assert_eq!(show_at(ctx, map, false, 1), "#{}");
+            assert_eq!(show_at(ctx, map, false, 2), "#{a => <<...>>,...}");
+            assert_eq!(show_at(ctx, map, false, 3), "#{a => <<1,...>>}");
+            assert_eq!(show_at(ctx, map, false, 5), "#{a => <<1,2,3>>}");
         });
     }
 
