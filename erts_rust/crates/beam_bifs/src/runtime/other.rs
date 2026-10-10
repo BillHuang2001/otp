@@ -167,7 +167,7 @@ mod tests {
     fn os_set_signal_is_a_roster_seam_key_forwarder() {
         assert!(
             crate::hook_sets::needs_runtime_hooks("os", "set_signal", 2),
-            "os:set_signal/2 must be in the 195-key RuntimeHooks roster"
+            "os:set_signal/2 must be in the 188-key RuntimeHooks roster"
         );
 
         let mut reg = BifRegistry::new();

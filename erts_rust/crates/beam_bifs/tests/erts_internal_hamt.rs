@@ -26,7 +26,9 @@
 //! `erl -noshell -eval …`); with `M = maps:from_list([{N,N*10} || N <- lists:seq(1,33)])`:
 //!
 //! * `erts_internal:map_to_tuple_keys(M)` ⇒ `error:badarg` (a HAMT has no key tuple);
-//! * `erts_internal:map_hashmap_children(M)` ⇒ the raw node slots (unreachable here);
+//! * `erts_internal:map_hashmap_children(M)` ⇒ the head node's 13 slot words in
+//!   **reverse storage order** (the C conses each slot onto `NIL` while walking the
+//!   node forward);
 //! * `erts_debug:flat_size(M)` ⇒ `123`;
 //! * `erts_internal:map_next(0, M, [])` ⇒ `[1, M | <the map's trailing 32 pairs>]`,
 //!   the integer `1` being the continuation `maps.erl:526-542`'s `to_list_internal/1`
@@ -59,7 +61,7 @@ use beam_common::{BeamError, ExceptionClass, ExitReason, Result};
 use beam_process::ProcessId;
 use beam_term::map::{map_words_capacity, write_map};
 use beam_term::prelude::signed_value;
-use beam_term::{is_small, AtomTable, Eterm, NIL};
+use beam_term::{is_list, is_nil, is_small, AtomTable, Eterm, NIL};
 
 // ---------------------------------------------------------------------------
 // Scaffolding
@@ -137,17 +139,6 @@ fn assert_badarg(result: Result<Eterm>, what: &str) {
     match result {
         Err(BeamError::BadArg) => {}
         other => panic!("{what}: expected BadArg, got {other:?}"),
-    }
-}
-
-/// Asserts the call raised a typed `unsupported_bif`.
-fn assert_unsupported(result: Result<Eterm>, what: &str) {
-    match result {
-        Err(BeamError::Raise(raise)) => {
-            assert_eq!(raise.class, ExceptionClass::Error, "{what}");
-            assert_eq!(raise.reason, ExitReason::atom("unsupported_bif"), "{what}");
-        }
-        other => panic!("{what}: expected unsupported_bif, got {other:?}"),
     }
 }
 
@@ -285,17 +276,114 @@ fn map_to_tuple_keys_is_badarg_for_a_hash_map_and_the_key_tuple_for_a_flat_map()
 // erts_internal:map_hashmap_children/1
 // ---------------------------------------------------------------------------
 
+/// One slot of a hash-map node, as the oracle probe's `shape/1` renders it: a leaf
+/// `[K | V]` cons cell (named by its key) or a sub-node (named by its own slot count).
+#[derive(Debug, PartialEq, Eq)]
+enum Slot {
+    Leaf(i64),
+    Node(usize),
+}
+
+/// Calls `map_hashmap_children/1` on `node` and records each slot as a [`Slot`],
+/// re-entering the BIF for a sub-node term (the oracle's own `shape/1` probe does the
+/// same). Also appends every leaf's key to `keys` in the order the slots are walked,
+/// which for the head node is the **flattened returned order**.
+///
+/// A leaf is the map's own `[K | V]` cons cell (so `CAR` is the key and `CDR` the
+/// value, which the map under test stores as `N => N*10`); a sub-node term is not a
+/// cons cell, so it is walked in turn. Panics if the result is not a proper list.
+fn slot_shapes(
+    reg: &BifRegistry,
+    ctx: &mut BifContext<'_>,
+    node: Eterm,
+    shapes: &mut Vec<Slot>,
+    keys: &mut Vec<i64>,
+) {
+    let list = call(
+        reg,
+        ctx,
+        "erts_internal",
+        "map_hashmap_children",
+        1,
+        &[node],
+    );
+    let mut cell = list;
+    while is_list(cell) {
+        let slot = beam_codec::term::cons_head(cell).expect("a cons cell");
+        match beam_codec::term::cons_head(slot) {
+            Ok(key) if is_small(key) => {
+                let value = beam_codec::term::cons_tail(slot).expect("a cons cell");
+                assert_eq!(
+                    signed_value(value),
+                    signed_value(key) * 10,
+                    "a leaf slot is the map's own [K | K*10] pair"
+                );
+                shapes.push(Slot::Leaf(signed_value(key)));
+                keys.push(signed_value(key));
+            }
+            _ => {
+                let mut inner = Vec::new();
+                slot_shapes(reg, ctx, slot, &mut inner, keys);
+                shapes.push(Slot::Node(inner.len()));
+            }
+        }
+        cell = beam_codec::term::cons_tail(cell).expect("a cons cell");
+    }
+    assert!(is_nil(cell), "the result is a proper list");
+}
+
 #[test]
-fn map_hashmap_children_keeps_a_typed_gap_only_for_a_hash_map_node() {
+fn map_hashmap_children_returns_the_node_slots() {
     with_ctx(|reg, ctx| {
         // The C returns the node's own in-heap slot words (`erl_map.c:3425-3461`) —
-        // leaf cons cells and sub-node terms in reverse slot order. Reaching them
-        // needs a node-interior accessor the LCA does not expose, so a hash-map node
-        // stays the typed gap rather than an invented list.
+        // every leaf cons cell and every sub-node term of the argument's node — in
+        // **reverse storage order**: it conses each slot onto `NIL` while walking the
+        // node forward (`while(sz--) res = CONS(hp, *ptr++, res);`), so the result is
+        // the reverse of the slot sequence `access::hamt_node` reads.
         let hash = integer_map10(ctx);
-        assert_unsupported(
-            reg.call("erts_internal", "map_hashmap_children", 1, ctx, &[hash]),
-            "map_hashmap_children/1 on a hash map",
+        let mut shapes = Vec::new();
+        let mut keys = Vec::new();
+        slot_shapes(reg, ctx, hash, &mut shapes, &mut keys);
+
+        // The oracle probe (OTP 29.1.1 / erts-17.1, recorded in `src/erts_internal.rs`;
+        // re-run here for `#{N => N*10 …}`): `length(...)` ⇒ `13` and `shape/1` over the
+        // slots ⇒ the sequence below — the head's 13 slots, leaves first-at-the-tail.
+        assert_eq!(
+            shapes,
+            vec![
+                Slot::Leaf(22),
+                Slot::Node(4),
+                Slot::Node(2),
+                Slot::Node(5),
+                Slot::Node(2),
+                Slot::Node(4),
+                Slot::Leaf(15),
+                Slot::Node(3),
+                Slot::Leaf(8),
+                Slot::Leaf(31),
+                Slot::Node(4),
+                Slot::Node(2),
+                Slot::Node(2),
+            ],
+            "the oracle's 13-slot head node for the 33-key map"
+        );
+
+        // The reverse-storage-order claim, checked against the map's own **storage**
+        // traversal: `maps:to_list/1` visits the head's slots in storage order (each
+        // slot's keys in that slot's storage order), so flattening the returned slots in
+        // the returned order — reversing at every level — must yield that traversal
+        // reversed. `beam_codec::term::map_pairs_storage_order` is the public reader of
+        // that order (`map_next_walks_a_hash_map_in_list_mode_and_agrees_with_maps_to_list`
+        // pins it against the oracle's `maps:to_list/1`).
+        let mut stored_keys: Vec<i64> = stored(ctx, hash)
+            .into_iter()
+            .map(|(k, _)| signed_value(k))
+            .collect();
+        assert_eq!(stored_keys.len(), 33, "every map key is reached");
+        stored_keys.reverse();
+        assert_eq!(
+            keys, stored_keys,
+            "the head slots are the map's slots in reverse storage order"
         );
 
         // A flat head is `badarg` (`HAMT_SUBTAG_HEAD_FLATMAP`).
