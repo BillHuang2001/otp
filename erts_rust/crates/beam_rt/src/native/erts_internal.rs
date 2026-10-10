@@ -263,8 +263,72 @@ impl RuntimeContext<'_> {
             ("term_to_string", 2) => Some(self.erts_term_to_string(args, true)),
             ("trace", 3) => Some(self.erts_trace(args)),
             ("trace_pattern", 3) => Some(self.erts_trace_pattern(args)),
+            ("garbage_collect", 1) => Some(self.erts_garbage_collect(args)),
             _ => None,
         }
+    }
+
+    // -- erts_internal:garbage_collect/1 --------------------------------------
+
+    /// `erts_internal:garbage_collect/1` — the runtime's **on-demand collection**, and the
+    /// BIF `erlang:garbage_collect/0,1` reduce to.
+    ///
+    /// # Ground truth
+    ///
+    /// `erts/emulator/beam/bif.c:4080-4094` (`erts_internal_garbage_collect_1`): the atom
+    /// `minor` requests a relaxed collection, `major` a fullsweep and anything else is
+    /// `badarg` (`am_badarg`); the C then runs `erts_garbage_collect` and returns `am_true`.
+    /// `erlang:garbage_collect/0` (`erts/preloaded/src/erlang.erl:3038-3040`) is the wrapper
+    /// `erts_internal:garbage_collect(major)`, and `erlang:garbage_collect/1` is
+    /// `erlang:garbage_collect(Pid, [])` — which for `self()` reaches this BIF too.
+    ///
+    /// # This runtime
+    ///
+    /// A collection's root set is the **executing machine's** `x[0..live)` plus its Erlang
+    /// stack, and a BIF running inside [`ExecutionContext`](beam_engine::ExecutionContext)
+    /// owns neither — so this BIF records a *request* on the runtime
+    /// ([`Runtime::request_gc`](crate::runtime::Runtime)) and returns the oracle's `true`.
+    /// The request is served at the engine's heap-admission point
+    /// ([`crate::context::gc::ensure_heap`]) or, if the process parks first, at the runner's
+    /// park arm (`Runtime::serve_gc_request`) — both of which own the machine's root set.
+    ///
+    /// The value is therefore the oracle's `true` for `minor` **and** `major` alike: the
+    /// runtime records *that* a collection was asked for, and the two modes differ only in
+    /// the collector's own escalation policy (`beam_gc::Collector::collect` picks a minor or
+    /// a fullsweep from the live set and the growth table), which this BIF does not
+    /// second-guess.
+    ///
+    /// **No collection is ever pretended.** `Runtime::gc_stats()`'s `collections` moves only
+    /// when a collection really ran. A request from a process whose collection is pinned,
+    /// halted or globally frozen, from a process the host cannot relocate (a
+    /// **relocation-exempt** one), or from one whose *module* code may hold a live
+    /// float-register term, is refused — honestly, with the oracle's `true` return value and
+    /// the counters untouched. A request that no collection point is ever reached for (a
+    /// process that asks and then returns without allocating or parking) is pruned when its
+    /// heap dies; there is nothing left to collect.
+    ///
+    /// A context that is not a scheduled slice (the `-eval` evaluator, a single-pass
+    /// `run_*`) allocates on the pointer-stable arena, which no collection touches, so no
+    /// request is recorded for it: the call is the oracle's `true` and nothing more.
+    ///
+    /// # Errors
+    ///
+    /// `badarg` for anything but the atoms `minor`/`major` — the C's `am_badarg` — and, from
+    /// the caller, the BIF heap's own exhaustion.
+    fn erts_garbage_collect(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let mode = *args.first().ok_or(BeamError::BadArg)?;
+        match self.atom_name(mode).as_deref() {
+            Some("minor") | Some("major") => {}
+            _ => return Err(BeamError::BadArg),
+        }
+        // Only a scheduled process — the one whose heap the collector owns — can be
+        // collected. Every other context runs on the runtime-wide arena, which the
+        // collector never moves, so a request for it would be a no-op pretending to be work.
+        if self.mailbox_table.is_some() {
+            let pid = self.mailbox_pid;
+            self.runtime.request_gc(pid);
+        }
+        self.atom("true")
     }
 
     // -- erts_internal:term_type/1 -------------------------------------------
@@ -2165,7 +2229,6 @@ mod tests {
             ("counters_add", 3),
             ("counters_put", 3),
             ("counters_info", 1),
-            ("garbage_collect", 1),
         ] {
             let mut sink = NullSink;
             let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
@@ -2227,29 +2290,41 @@ mod tests {
         assert!(has_memory, "the memory key is present");
     }
 
-    /// `erts_internal:garbage_collect/1` is a `RuntimeHooks` key the runtime installs no
-    /// provider for, so the floor leaves it alone and the registry's key answers the
-    /// honest typed gap: [`RuntimeHooksBridge::call`]'s fallback arm formats
-    /// `"{module}:{function}/{arity}"`.
+    /// `erts_internal:garbage_collect/1` answers the oracle's `true` for both modes and
+    /// raises `badarg` for anything else — and, precisely because it is **not** a scheduled
+    /// slice, it records no collection request (there is no movable heap for this context).
     ///
-    /// documented divergence: `erts_internal:garbage_collect(minor)` ⇒ `true` in the
-    /// oracle (a real minor collection); this runtime has no on-demand collection entry
-    /// point, so it reports the gap rather than a fabricated `true`.
-    ///
-    /// [`RuntimeHooksBridge::call`]: crate::context::RuntimeHooksBridge
+    /// Oracle (`erl -noshell -eval '…'`): `erts_internal:garbage_collect(minor)` ⇒ `true`,
+    /// `(major)` ⇒ `true`, `(foo)` ⇒ `error:badarg`, `(1)` ⇒ `error:badarg`.
     #[test]
-    fn garbage_collect_is_a_recorded_capability_gap() {
+    fn garbage_collect_answers_the_oracle_and_only_records_a_request_for_a_scheduled_process() {
         let mut runtime = runtime();
         let minor = atom(&mut runtime, "minor");
+        let major = atom(&mut runtime, "major");
+        let foo = atom(&mut runtime, "foo");
 
-        let error = erts(&mut runtime, "garbage_collect", &[minor])
-            .expect_err("no on-demand collection provider is installed");
+        let answer = erts(&mut runtime, "garbage_collect", &[minor]).expect("minor is served");
+        assert_eq!(runtime.atom_name_of(answer), Some("true"), "the oracle's `true`");
+        let answer = erts(&mut runtime, "garbage_collect", &[major]).expect("major is served");
+        assert_eq!(runtime.atom_name_of(answer), Some("true"), "the oracle's `true`");
+
+        for bad in [foo, make_small(1)] {
+            let error = erts(&mut runtime, "garbage_collect", &[bad])
+                .expect_err("only the two mode atoms are accepted");
+            assert!(
+                matches!(error, BeamError::BadArg),
+                "the C's `am_badarg`; got {error:?}"
+            );
+        }
+
+        // Not a scheduled slice (no process table, no movable heap): nothing was recorded
+        // and nothing was — or could honestly be — collected.
         assert_eq!(
-            error::unsupported_reason(&error).as_deref(),
-            Some("erts_internal:garbage_collect/1")
+            runtime.gc_stats().collections,
+            0,
+            "a non-scheduled context owns no movable heap to collect"
         );
     }
-
     /// A BIF this module does not serve is `None` from `erts_internal_call`, so the call
     /// falls through — never a fabricated value. On a code-path-less runtime the module
     /// load then fails honestly.

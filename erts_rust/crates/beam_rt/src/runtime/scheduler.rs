@@ -542,6 +542,11 @@ impl Runtime {
                 }
                 Err(err) => break Err(err),
             }
+            // A `garbage_collect` request (see `Runtime::request_gc`) whose process
+            // terminated in the slices just run can never be served — its heap is gone — so
+            // the request set is pruned to the pass's live processes here, where the table
+            // holds exactly them.
+            self.prune_gc_requests(&table);
             // The **native-service half**: drain the `file_server_2` service's and its
             // io-devices' mailboxes and deliver each reply into the requesting process's
             // mailbox (contract A.9, `src/native/file_server.rs`). A reply is what lets a

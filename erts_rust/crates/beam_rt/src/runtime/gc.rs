@@ -55,8 +55,9 @@
 use std::collections::{HashMap, HashSet};
 
 use beam_common::{BeamError, Result};
+use beam_gc::CollectionKind;
 use beam_loader::Module;
-use beam_process::ProcessId;
+use beam_process::{ProcessId, ProcessTable};
 use beam_term::Eterm;
 
 use super::Runtime;
@@ -98,6 +99,11 @@ pub(crate) struct GcState {
     pinned: HashSet<ProcessId>,
     /// Pids whose collection is halted (a collection failed, or the root-set sizes changed).
     halted: HashSet<ProcessId>,
+    /// Pids with an **unserved** forced-GC request — the on-demand collection behind
+    /// `erlang:garbage_collect/0,1` and `erts_internal:garbage_collect/1`, recorded by the
+    /// BIF and served at a point that owns the executing machine's root set (see
+    /// [`Runtime::request_gc`]).
+    requested: HashSet<ProcessId>,
     /// Whether **every** process heap must stay put (the global escape-store valve).
     disabled: bool,
     /// Why the global valve tripped (the first reason wins), for diagnostics.
@@ -128,6 +134,7 @@ impl GcState {
             float_free: HashMap::new(),
             pinned: HashSet::new(),
             halted: HashSet::new(),
+            requested: HashSet::new(),
             disabled: false,
             disabled_reason: None,
             valve_trips: 0,
@@ -168,6 +175,107 @@ impl Runtime {
     /// global valve is closed).
     pub(crate) fn gc_process_enabled(&self, pid: ProcessId) -> bool {
         self.gc_enabled() && !self.gc.pinned.contains(&pid) && !self.gc.halted.contains(&pid)
+    }
+
+    /// Records a **forced-GC request** for `pid` — the on-demand collection behind
+    /// `erlang:garbage_collect/0,1` and `erts_internal:garbage_collect/1`.
+    ///
+    /// A BIF may not collect: the root set a collection relocates is the **executing
+    /// machine's** `x[0..live)` plus its Erlang stack, and a BIF runs *inside*
+    /// [`ExecutionContext`](beam_engine::ExecutionContext), which owns neither. So the BIF
+    /// records the request here, answers the oracle's `true`, and the runtime serves the
+    /// request at the two points that *do* own that root set:
+    ///
+    /// * the engine's heap-admission point ([`crate::context::gc::ensure_heap`]) — the
+    ///   slice's **own** machine, whose registers it is handed — so a loop that keeps
+    ///   allocating collects on every request; and
+    /// * the runner's park arms ([`Runtime::serve_gc_request`]), where the machine's whole
+    ///   live root set has just been published into the process — so a process that asks for
+    ///   a collection and then blocks (or is pre-empted) is still served.
+    ///
+    /// A process that reaches **neither** after asking (it returns without allocating and
+    /// without parking) leaves the request unserved; its heap dies with it, so nothing is
+    /// collected and nothing is pretended (the requests of terminated processes are pruned
+    /// at the pass boundary, [`Runtime::prune_gc_requests`]).
+    ///
+    /// The request is one bit per process: asking twice before it is served collects once,
+    /// the honest reading of "that process was already due a collection".
+    pub(crate) fn request_gc(&mut self, pid: ProcessId) {
+        self.gc.requested.insert(pid);
+    }
+
+    /// Whether `pid` has an **unserved** forced-GC request (see [`Runtime::request_gc`]).
+    pub(crate) fn gc_request_pending(&self, pid: ProcessId) -> bool {
+        self.gc.requested.contains(&pid)
+    }
+
+    /// Consumes `pid`'s forced-GC request, answering whether there was one.
+    ///
+    /// A **served** request is consumed when the collection is committed to (the admission
+    /// point) or attempted (the park arm), and a **refused** one is dropped by
+    /// [`Runtime::gc_process_enabled`]'s valves rather than left armed: the BIF already
+    /// answered the oracle's `true` (the request was accepted), and re-arming would
+    /// silently collect the process the moment a valve happened to open — the opposite of
+    /// what an intentionally-collecting runtime should do.
+    pub(crate) fn take_gc_request(&mut self, pid: ProcessId) -> bool {
+        self.gc.requested.remove(&pid)
+    }
+
+    /// Serves `pid`'s pending forced-GC request **now** — the runner's park arm (see
+    /// [`Runtime::request_gc`] for why the BIF itself cannot collect).
+    ///
+    /// This is a legitimate collection site: the caller has just published the parked
+    /// machine's whole live root set into `pid`
+    /// ([`publish_parked_roots`](crate::runner)), and the machine's float-register file is
+    /// *provably* dead — the post-slice scan pins any pid whose `Machine::fr` holds a term,
+    /// so a pid that is still [`gc_process_enabled`](Runtime::gc_process_enabled) cannot be
+    /// carrying one. The collector therefore relocates exactly what is live, against the
+    /// process's own root set.
+    ///
+    /// Returns whether a collection ran. The answer is `false` — with the counters
+    /// untouched, never a fabricated collection — for a request the valves refuse (a pinned
+    /// or halted pid, the global escape-store valve), for a pid the table no longer holds,
+    /// and for a **relocation-exempt** process (the host holds live words outside this
+    /// crate's root set: nothing is moved and, because nothing failed, the process's
+    /// collection is *not* halted). A genuine collection failure halts that process's
+    /// collection ([`Runtime::halt_process_gc`]), exactly as the admission point does.
+    pub(crate) fn serve_gc_request(&mut self, table: &mut ProcessTable, pid: ProcessId) -> bool {
+        if !self.take_gc_request(pid) {
+            return false;
+        }
+        if !self.gc_process_enabled(pid) {
+            return false;
+        }
+        let Some(process) = table.get_mut(pid) else {
+            return false;
+        };
+        if process.is_relocation_exempt() {
+            return false;
+        }
+        match process.collect() {
+            Ok(collection) => {
+                self.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
+                true
+            }
+            Err(_) => {
+                self.halt_process_gc(pid);
+                false
+            }
+        }
+    }
+
+    /// Drops the forced-GC requests of processes `table` no longer holds.
+    ///
+    /// A process that terminated with a request still pending (it reached no heap-admission
+    /// point and no park after asking) can never be served — its heap is gone — so the entry
+    /// is noise that would otherwise accumulate for the runtime's whole lifetime, one per
+    /// such process. The scheduler pass prunes at its boundary, where the pass's own table
+    /// holds exactly the live processes.
+    pub(crate) fn prune_gc_requests(&mut self, table: &ProcessTable) {
+        if self.gc.requested.is_empty() {
+            return;
+        }
+        self.gc.requested.retain(|pid| table.contains(*pid));
     }
 
     /// Pins `pid` on the runtime: its heap is never moved again.
@@ -345,6 +453,76 @@ mod tests {
             "the term must exceed the destination heap to exercise the split"
         );
         big
+    }
+
+    /// **The forced-GC latch is served, once.** A request recorded for a live process is
+    /// consumed by [`Runtime::serve_gc_request`], which really collects it: the collection
+    /// counter moves and no error/halt is recorded.
+    #[test]
+    fn a_forced_gc_request_is_served_exactly_once() {
+        let mut rt = small_runtime();
+        let mut table = ProcessTable::new();
+        let pid = table.spawn_default().expect("a process");
+
+        assert!(!rt.gc_request_pending(pid), "nothing requested yet");
+        rt.request_gc(pid);
+        rt.request_gc(pid); // one bit per process: asking twice still collects once
+        assert!(rt.gc_request_pending(pid));
+
+        assert!(rt.serve_gc_request(&mut table, pid), "the request is served");
+        assert_eq!(rt.gc_stats().collections, 1, "a real collection ran");
+        assert_eq!(rt.gc_stats().errors, 0, "and it did not fail");
+        assert!(!rt.gc_request_pending(pid), "the request was consumed");
+        assert!(
+            !rt.serve_gc_request(&mut table, pid),
+            "there is nothing left to serve"
+        );
+        assert_eq!(rt.gc_stats().collections, 1, "and no second collection");
+    }
+
+    /// **A valve that forbids the move is never overridden by a request.** A pinned pid's and
+    /// a globally-frozen pid's requests are consumed and answered `false`: the counters stay
+    /// put, nothing is halted (a refusal is not a failure) and no collection is faked.
+    #[test]
+    fn a_forbidden_collection_is_refused_without_pretending() {
+        let mut rt = small_runtime();
+        let mut table = ProcessTable::new();
+
+        let pinned = table.spawn_default().expect("a process");
+        rt.pin_process(pinned);
+        rt.request_gc(pinned);
+        assert!(!rt.serve_gc_request(&mut table, pinned), "a pinned pid stays put");
+        assert!(!rt.gc_request_pending(pinned), "the request is consumed either way");
+
+        let frozen = table.spawn_default().expect("a second process");
+        rt.disable_gc("test: the global valve");
+        rt.request_gc(frozen);
+        assert!(!rt.serve_gc_request(&mut table, frozen), "the valve is absolute");
+
+        let stats = rt.gc_stats();
+        assert_eq!(stats.collections, 0, "no collection was pretended");
+        assert_eq!(stats.errors, 0, "a refusal is not a failure");
+        assert_eq!(stats.halted, 0, "and it halts nothing");
+    }
+
+    /// **A request whose process is gone is pruned, a live one is kept.** Without the prune
+    /// the request set would grow by one entry for every process that asked and then
+    /// terminated before a collection point was reached.
+    #[test]
+    fn requests_of_dead_processes_are_pruned_and_live_ones_kept() {
+        let mut rt = small_runtime();
+        let mut table = ProcessTable::new();
+        let live = table.spawn_default().expect("a process");
+        let absent = rt.self_pid();
+
+        rt.request_gc(live);
+        rt.request_gc(absent);
+        rt.prune_gc_requests(&table);
+        assert!(rt.gc_request_pending(live), "a live process keeps its request");
+        assert!(
+            !rt.gc_request_pending(absent),
+            "a pid the table does not hold is pruned"
+        );
     }
 
     /// **The honest split for a genuine failure.** A term the copier cannot fit is reported as

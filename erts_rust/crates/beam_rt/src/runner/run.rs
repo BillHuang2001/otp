@@ -421,6 +421,11 @@ impl ProcessRunner for RuntimeRunner<'_> {
             // while this process sits in `RunnerState.engines` must be able to relocate the
             // heap against the machine's live terms (see `publish_parked_roots`).
             publish_parked_roots(table, pid, &mut engine.machine);
+            // A `garbage_collect` request (see `Runtime::request_gc`) that no heap-admission
+            // point served is honoured **here**: the roots are just published and the
+            // machine's float-register file is provably dead (the scan above pinned the pid
+            // otherwise), so this is a legitimate collection site.
+            self.runtime.serve_gc_request(table, pid);
             self.state.engines.insert(pid, engine);
             return Ok(RunOutcome::Yield);
         }
@@ -467,6 +472,10 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 // `gc_process_enabled`) may relocate this process's heap while it waits (see
                 // `publish_parked_roots`).
                 publish_parked_roots(table, pid, &mut engine.machine);
+                // ...and serve a pending `garbage_collect` request (see
+                // `Runtime::request_gc`), which is why a process that asks for a collection
+                // and then blocks is still collected.
+                self.runtime.serve_gc_request(table, pid);
                 self.state.engines.insert(pid, engine);
                 Ok(RunOutcome::Wait)
             }
