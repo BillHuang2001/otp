@@ -98,6 +98,25 @@ impl Message {
         self
     }
 
+    /// Replaces the message's payload term, keeping **everything else** — `from`, `token`,
+    /// `off_heap`, `binaries`, `nodes` and `fragments`.
+    ///
+    /// This is the **relocation-safe rebuild**: a collector (or any other host step) that must move
+    /// a *queued* message's payload to a new address uses this instead of `Message::new(...)` +
+    /// re-applying the builders, so the fragment chain and the off-heap / refc-binary / node lists
+    /// the message owns are carried across. Rebuilding from scratch silently **drops** those lists,
+    /// which for a fragment-resident payload is a use-after-free (the new payload would point into
+    /// fragments nobody owns any more) and for a heap-resident one leaks the refcounts the message
+    /// held (see the sibling `beam_process` handoff in the crate `CONTEXT.md`).
+    ///
+    /// No validation is performed: the caller asserts `payload` is a term that belongs with this
+    /// envelope (in particular, for a fragmented message, a term pointing into the **same**
+    /// [`Fragments`], since the fragments are not re-derived from the new payload).
+    pub fn with_payload(mut self, payload: Eterm) -> Message {
+        self.payload = payload;
+        self
+    }
+
     /// The copied payload term.
     pub fn payload(&self) -> Eterm {
         self.payload
@@ -138,6 +157,47 @@ impl Message {
     /// own heap.
     pub fn fragments_mut(&mut self) -> Option<&mut Fragments> {
         self.fragments.as_mut()
+    }
+
+    /// The **logical word size** the payload occupies — the copy-charge input, the Rust analogue of
+    /// the legacy C `size_object_litopt(message)` (`bif.c`), which the sender charge divides by
+    /// `ERTS_MSG_COPY_WORDS_PER_REDUCTION` (64):
+    ///
+    /// * **Heap-resident message** (no fragments): the payload lives in the receiver's heap, so the
+    ///   size is the payload graph's flat word count, [`beam_term::size_object`] of the payload.
+    /// * **Fragmented message**: the payload points *into* the message's [`Fragments`] (it never
+    ///   touches the receiver's heap), so the size is the chain's used words,
+    ///   [`Fragments::total_used_words`] — the summed `used_size` of every fragment, i.e. exactly
+    ///   the words the payload occupies there.
+    ///
+    /// Either way this counts **heap words**, so an off-heap refc binary contributes only its 8-word
+    /// on-heap `[BinRef][ErlSubBits]` handle and a huge binary yields (almost) no charge — the
+    /// payload's *logical* byte size is accounted separately, to the holder, via
+    /// [`logical_binary_bytes`](Message::logical_binary_bytes).
+    ///
+    /// Note this is the *flat* count: [`beam_term::size_object`] is the C `size_object_x` port and,
+    /// like the C, is unbounded on a cyclic/forged graph (see the crate `CONTEXT.md`, Known Issues).
+    pub fn heap_words(&self) -> usize {
+        match &self.fragments {
+            Some(fragments) => fragments.total_used_words(),
+            None => beam_term::size_object(self.payload),
+        }
+    }
+
+    /// The **logical byte size** of the refc binaries this message shares — the input to the
+    /// *holder's* virtual binary heap (`bin_vheap += refc_binary->orig_size / sizeof(Eterm)`, the C
+    /// `erl_gc.c` rule surfaced to the user as `virtual_reds`).
+    ///
+    /// It is the sum of [`RefcBinary::len`] over [`binaries`](Message::binaries), the binaries whose
+    /// off-heap payloads the message holds. **0** when the message shares no refc binaries.
+    ///
+    /// Independent of [`heap_words`](Message::heap_words): the payload's on-heap cost counts only
+    /// the 8-word handles, so a 200-byte binary contributes `8` heap words here and `200` logical
+    /// bytes there. A **fragmented** message reports `0` from this accessor: on that path the
+    /// payload's binaries live in the fragment's own off-heap table and are owned by the
+    /// [`Fragments`], not by the envelope's `binaries` list.
+    pub fn logical_binary_bytes(&self) -> usize {
+        self.binaries.iter().map(RefcBinary::len).sum()
     }
 }
 
