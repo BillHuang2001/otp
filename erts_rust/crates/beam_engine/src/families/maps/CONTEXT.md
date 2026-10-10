@@ -11,12 +11,14 @@ borrows `module: &Module` for the atom table it compares keys with.
 
 Ground truth (read-only): `../../../../erts/emulator/beam/emu/map_instrs.tab:49-173`,
 `beam_common.c:2237-2268` (`erts_gc_update_map_exact` sets `BADKEY`), `emu/ops.tab:1364-1424`,
-`beam/generators.tab:230-253`.
+`beam/generators.tab:230-253`, and — for the read path's branchless failure — `emu/beam_emu.c:578-583`
+(`i_func_info_IaaI`) + `beam_common.c:448-544` (`handle_error`, the `function_clause` reason).
 
 ## Layout
 - `mod.rs` — `exec` (dispatch), `lookup`/`position` (linear `beam_term::cmp` scans),
-  `goto`, `fail_or_raise`, `jump_or_unsupported`, `raise_error_tuple`.
-- `read.rs` — `get_map_elements` (`:52`), `has_map_fields` (`:84`).
+  `goto`, `fail_or_raise` (`:234`), `fail_or_function_clause` (`:256`),
+  `raise_function_clause` (`:282`), `raise_error_tuple` (`:300`).
+- `read.rs` — `get_map_elements` (`:54`), `has_map_fields` (`:82`).
 - `write.rs` — `put_map_assoc` (`:68`), `put_map_exact` (`:119`); both reserve the whole map
   block with one rooted allocation (`make_map_rooted` + `merge_slack_words`) and re-read every
   operand from the post-reserve machine state, so a moving collector may run in the reserve.
