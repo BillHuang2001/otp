@@ -210,15 +210,12 @@ claim so it falls through to the registry. `get_dflags/0`'s five flag words are
 | `trace/3` | `erl_bif_trace.c` (`trace_3`) | body of `erlang:trace/2,3` (handler in `erts_internal/trace.rs`, over `crate::trace`): `PidSpec` selects the tracees (a pid the table holds, or the group atoms `all`/`existing`/`existing_processes`/`processes`), `How` sets (`true`)/clears (`false`) their flags, `FlagList` the flag set; the **caller** becomes the tracer. Returns the tracee count. The port/`new`-style PidSpecs and a non-`true`/`false` `How` are the typed/`badarg` paths |
 | `trace_pattern/3` | `erl_bif_trace.c` (`trace_pattern_3`) | body of `erlang:trace_pattern/2,3`: installs/removes a per-function trace pattern over `MFA` (each of module/function/arity a name or the `'_'` wildcard); consults `crate::trace`'s `PatternTable` |
 
-Documented divergences (deterministic, never a wrong value):
-- `term_type/1` reports every byte-aligned binary as `sub_binary`: the real
-  `heap_binary`/`sub_binary`/`refc_binary` split is the boxed **header subtag**
-  (`erl_map.c:3368-3376`), and the only predicates that read it are `unsafe`
-  (`beam_term::boxed`), which this crate's `#![deny(unsafe_code)]` forbids. A **typed
-  `unsupported`** stays for the boxed families the *safe* API cannot name at all — an internal
-  `reference` and a non-byte-aligned bitstring.
-- `no_aux_work_threads/0` derives from this runtime's own scheduler count (see the table), and
-  `processes_next/1` is index-addressed over *this* table.
+Documented divergences (deterministic, never a wrong value): `term_type/1` reports every
+byte-aligned binary as `sub_binary` — the real `heap_binary`/`sub_binary`/`refc_binary` split is the
+boxed header subtag (`erl_map.c:3368-3376`), readable only through the `unsafe` `beam_term::boxed`;
+a **typed `unsupported`** stays for the boxed families the safe API cannot name (an internal
+`reference`, a non-byte-aligned bitstring). `no_aux_work_threads/0` and `processes_next/1` derive
+from *this* runtime's own state (see the table).
 ### `prim.rs` — the served `prim_file` BIFs (contract A.7, the `prim_*` preloaded modules)
 `RuntimeContext::prim_file_call(function, arity, args) -> Option<Result<Eterm>>`. `prim_file` is a
 **preloaded** module whose BIFs are the C `prim_file_nif.c` NIFs; the floor claims the subset whose
