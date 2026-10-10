@@ -88,7 +88,7 @@ Only **frozen contracts and non-obvious behaviour** are listed; rustdoc carries 
   A failed spawn is either an `access(X_OK)`-rejected path (a constructor `BeamError::Raise` with the errno atom) or a path the check accepts but `exec` rejects (a searchable **directory**, a no-executable-format file) — the latter **opens the port**, the child's `_exit(errno)` becoming the exit status.
   `stop`/`Drop` kill + reap + deregister/close every descriptor, but an adopted `{fd,N}` is **never** closed.
   **The only module here that may spawn OS children** (project invariant).
-- `inet/` — the built-in **`tcp_inet`** TCP socket driver and its read-path `{packet, N}` framing.
+- `inet/` — the built-in **`tcp_inet`** TCP socket driver and its `{packet, N}` framing, applied on **both** the read path (`packet.rs`/`frame.rs`) and the send path (`verb_send` prepends the 1-/2-/4-byte big-endian length header).
   Full detail (the control-verb table, the option wire, the `PacketType` decoder, the four `gen_tcp` capability handoffs, the test strategy) is in the child node **`src/drivers/inet/CONTEXT.md`** — read it there; this doc only records that `tcp_inet` is one socket behind one port and is **unreachable from the running runtime today** (see *Handoffs*).
 
 ### `src/abi/` — the driver C-ABI host layer (A.4)
