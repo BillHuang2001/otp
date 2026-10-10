@@ -77,8 +77,9 @@
 //! contract: one `#[allow(unsafe_code)]` home for every term layout), split by
 //! responsibility into submodules under that one home — `construct` (the
 //! heap-seam builders), `read` (the tuple/list/binary readers), `map` (the
-//! flat-map/HAMT builder and reader), `fun` (the fun builder and readers) and
-//! `number` (the integer/float helpers) — plus a comprehensive in-module test
+//! flat-map/HAMT builder and reader), `fun` (the fun builder and readers),
+//! `number` (the integer/float helpers) and `update` (the in-place writers behind
+//! the destructive opcodes) — plus a comprehensive in-module test
 //! suite (raw-word layout assertions and the HAMT fixtures). Every submodule is
 //! re-exported here, so the public paths (`crate::terms::make_tuple`,
 //! `crate::terms::map_entries`, …) are unchanged.
@@ -106,6 +107,7 @@ mod slack;
 pub(crate) mod test_support;
 #[cfg(test)]
 pub(crate) mod alloc_tests;
+mod update;
 
 pub use construct::{
     badmatch_reason, badmatch_reason_rooted, make_cons, make_cons_rooted, make_heap_binary,
@@ -124,6 +126,7 @@ pub(crate) use sink::{write_list_at, write_tuple_at};
 pub use slack::Slack;
 pub(crate) use slack::reserve;
 pub use slack::reserve_slack;
+pub(crate) use update::set_tuple_element;
 
 /// `MAP_SMALL_MAP_LIMIT` (`erl_map.h:93-97`): the largest flat-map pair count.
 /// Above it ERTS uses a **hashmap** (HAMT), which [`make_map`] builds; this

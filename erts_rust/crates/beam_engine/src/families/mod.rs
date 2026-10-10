@@ -120,7 +120,10 @@ pub(crate) fn dispatch(
 ) -> Result<Step> {
     let claimed = match instr {
         // tuples
-        Instr::PutTuple2 { .. } | Instr::GetTupleElement { .. } | Instr::SelectTupleArity { .. } => {
+        Instr::PutTuple2 { .. }
+        | Instr::GetTupleElement { .. }
+        | Instr::SetTupleElement { .. }
+        | Instr::SelectTupleArity { .. } => {
             tuples::exec(machine, module, labels, instr, func, pc, ctx)
         }
         // records (tagged-tuple update + the native-record set)
