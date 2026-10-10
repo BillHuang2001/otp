@@ -100,7 +100,9 @@ takes one interpreter step.
 
 ## Spill/fill discipline
 - Prologue (`mod.rs::emit_block`): push `SAVED_REGISTERS` (6 callee-saved regs), reserve the 24-byte `rt`
-  slot, `rbx = rt->x_regs`, then load each cached register from `machine.x`.
+  slot, `rbx = rt->x_regs`, call `jit_set_position(rt, func, block_start_pc)` (the block-entry position
+  store — emitted before the cached loads, because `rbx` is callee-saved and no cached register may sit in
+  caller-saved scratch across the call), then load each cached register from `machine.x`.
 - `mod.rs::spill` / `mod.rs::fill`: store/load every `(x, reg)` in `Allocation::slots`.
 - **Every helper call spills first.** `mod.rs::emit_helper_call` (used by `emit_step_and_continue`) calls
   `spill` before setting up `rdi`/`rsi`/`rdx` and `call r11` (`jit_step_one`); it does **not** spill after
@@ -129,8 +131,7 @@ out-of-bound register is never counted. Every non-selected register is read/writ
 - `CodeBuffer` reservations are budgeted by `code_capacity_estimate` (loose on purpose: under-estimating
   turns a large module into a `SystemLimit` compile error). Block entry labels are reserved **before**
   emitting, so forward branches are ordinary `rel32` fixups, never post-`seal` patching (W^X unchanged).
-- A `Step::Enter` (module-context switch) is an interpreter-driver capability: `jit_step_one` returns the
-  typed `unsupported("jit: module context switch outside the interpreter driver")`.
+- A `Step::Enter` (module-context switch) surfaces from a block's per-instruction deopt as the `ENTER` word with the resolved `(context, func, pc)` in the runtime's `enter` slot; the **driver** performs the switch (`Machine::switch_context` + module/label/literal re-bind + the callee's blocks via `NativeCode::module_blocks`) and re-enters native code. `call_ext*` is not an inline set member.
 - Never hand-edit generated data. Files ~1000 lines; split by responsibility. Apache-2.0 header on every
   `.rs` (byte-exact, license scanner enforced).
 
