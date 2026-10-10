@@ -17,12 +17,9 @@ map for the source subtree and the notes the child nodes inherit.
   `NEW_REFERENCE_EXT` / `NEWER_REFERENCE_EXT` image (`ref_id_to_numbers` /
   `ref_numbers_to_id`, `REF_MASK`/`REF1_NUM_MASK`/`REF_NUMBERS`); `term::ref`
   (`internal_ref_id`/`make_internal_ref`) is the safe wrapper over
-  `beam_term::boxed`'s frozen M1 block. Both the decoder's local-node demotion and
-  the encoder's internal-reference branch consume these (single source, no
-  duplication).
-- `decode_term_with_local_node(bytes, heap, atoms, node, creation)` — the
-  identity-carrying `decode_term` (compressed + plain), so a `binary_to_term` image
-  can demote local-node pids/ports/refs. Re-exported from `lib.rs`/`prelude.rs`.
+  `beam_term::boxed`'s frozen M1 block. The single place either mapping is written —
+  both children must route through it, never re-derive it.
+
 ## Constraints
 - Inherited from [`../CONTEXT.md`](../CONTEXT.md) §Constraints (errors only through
   `beam_common::{Result, BeamError}`; additive + inert seams; `.rs` files carry the
@@ -32,12 +29,17 @@ map for the source subtree and the notes the child nodes inherit.
   through the `term/` safe wrappers (each with a `// SAFETY:` rationale).
 - The boxed interior layout of every term kind (`term/`, `ref_wire`'s identity) is
   `beam_term`'s — never redefine a layout here.
+- Every identity-gated change must stay **additive and inert** with no local node
+  installed (the distribution path is untouched).
 
 ## Notes for Agents
 - Oracle: the system `erl`/`erlc` on `$PATH` (skip loudly if absent).
 - Build/test with the wrapper: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_codec --no-fail-fast` (`$HOME` is read-only). Never `cd`.
 - Sibling `../tests/` (integration binaries) is **read-only** for this node — escalate
   test changes to `..`.
+- The `unsupported_external_term` on an internal reference came from the encoder having
+  no internal-ref branch; the internal pid/port branches already exist
+  (`encode/mod.rs`, `if let Some((local_node, creation)) = self.local_node`).
 
 ## Routing Table
 - `lib.rs` → crate wiring, root re-exports, the single `#[allow(unsafe_code)] mod term;`
@@ -49,6 +51,6 @@ map for the source subtree and the notes the child nodes inherit.
 - `compress.rs` → zlib for `COMPRESSED` (`compress`/`decompress`/`decompress_bounded`)
 - `error.rs` → `bad_arg`/`system_limit`, the `unsupported*` reason atoms
 - `prelude.rs` → the downstream glob-import surface
-- `decode/` → the `Decoder` state machine, the tag arms, the local-node identity seam (D2/D4/D6/D7) + the internal-form demotion, `decode_term[_with_local_node]`, `decode_depth` bound
-- `encode/` → the `Encoder` state machine, the tag emitters (incl. the internal pid/port/ref branches), `encode_term*`
+- `decode/` → the `Decoder` state machine, the tag arms, the local-node identity seam (D2/D4/D6/D7) and the local-node pid/port/ref **demotion** to the internal form, `decode_term[_with_local_node]`, the `MAX_DECODE_DEPTH` bound
+- `encode/` → the `Encoder` state machine, the tag emitters (incl. the internal pid/port/**ref** branches), `encode_term*`
 - `term/` → the **only** `unsafe` subtree: safe forwarding/allocation wrappers over `beam_term` (`binary`/`fun`/`record`/`ref`)
