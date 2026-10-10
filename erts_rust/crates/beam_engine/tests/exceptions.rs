@@ -576,27 +576,49 @@ fn the_stacktrace_fixture_class_clause_still_matches() {
 // The engine-derived symbolic stacktrace, end to end through the interpreter
 // ---------------------------------------------------------------------------
 
-/// A synthetic module whose `g/0` calls `f/0`, and whose `f/0` runs
-/// `build_stacktrace` over a non-NIL raw stacktrace:
+/// A synthetic module whose `g/0` calls `f/0`, and whose `f/0` raises inside a
+/// `try`, catches it and then runs `build_stacktrace` over a non-NIL raw
+/// stacktrace:
 ///
 /// ```text
 /// g() -> f().
-/// f() -> X = 1, build_stacktrace(X).
+/// f() -> try error({badmatch, 1}) catch _:_ -> build_stacktrace(X) end.  % X: raw trace
 /// ```
 ///
-/// The compiler never emits this (it always moves the caught `x(2)` — NIL at M1 —
-/// into `x(0)`), so a synthetic module is the only way to drive the engine's
-/// live-frame derivation through the *dispatch loop*; it also pins that the loop
-/// hands the family the right current `(func, pc)`.
+/// The raise is what populates the machine's **raise-time snapshot** (the
+/// pre-unwind frame chain): the `badmatch` records the raising `(func, pc)` before
+/// the catch lands, and the handler's `build_stacktrace` then cooks that snapshot.
+/// An **empty** snapshot (no raise since the last `reset`) cooks to the empty list,
+/// so this fixture is what drives the snapshot through the *dispatch loop* end to
+/// end. The compiler never emits this shape (it always moves the caught `x(2)` —
+/// NIL at M1 — into `x(0)`), so a synthetic module is required.
 fn synthetic_stacktrace_module() -> Module {
     let mut module = Module::default();
     module.name = module.atom_table.intern("m");
     let f = module.atom_table.intern("f");
     let g = module.atom_table.intern("g");
+    // The raise needs both the reason tag (`badmatch`, raised as `{badmatch,1}`)
+    // and the class (`error`) nameable from the module's own atom table.
+    module.atom_table.intern("badmatch");
+    module.atom_table.intern("error");
 
-    // f/0: load a (stand-in) raw stacktrace into x(0), then cook it.
+    // f/0: a `try` around a `badmatch`-raising instruction (so the machine captures
+    // its pre-unwind snapshot), then the handler loads a non-NIL raw stacktrace into
+    // x(0) and cooks it.
     let f_code = vec![
         Instr::Label(Label(10)),
+        Instr::Try {
+            frame: Operand::X(9),
+            fail: Label(20),
+        },
+        Instr::Badmatch {
+            value: Operand::Integer(1),
+        },
+        Instr::Return,
+        Instr::Label(Label(20)),
+        Instr::TryCase {
+            frame: Operand::X(9),
+        },
         Instr::Move {
             src: Operand::Integer(1),
             dst: Operand::X(0),
@@ -647,11 +669,13 @@ fn synthetic_stacktrace_module() -> Module {
 }
 
 #[test]
-fn build_stacktrace_derives_the_live_call_chain_innermost_first() {
-    // C walks the *saved* raw stacktrace; M1 keeps none, so the engine substitutes
-    // the live call frames: the function executing right now, then every frame
-    // suspended in a call, innermost first (`Machine::resumption_addresses`).
-    // No `line` marker is in effect for `f/0`'s code, so the location is `[]`.
+fn build_stacktrace_cooks_the_raise_snapshot_innermost_first() {
+    // The frames come from the machine's **raise-time snapshot**
+    // (`Machine::raise_snapshot`), the chain `f/0`'s `badmatch` captured before the
+    // catch landed: the raising `f/0` first, then its caller `g/0`, innermost-first.
+    // An empty snapshot cooks to the empty list, so the two non-empty items below
+    // can only come from the snapshot the raise populated. No `line` marker is in
+    // effect for either function, so each location is `[]`.
     let module = synthetic_stacktrace_module();
     let mut ctx = MinimalContext::new();
     let actual = run(&module, "g", &[], &mut ctx)
@@ -666,7 +690,8 @@ fn build_stacktrace_derives_the_live_call_chain_innermost_first() {
     let expected = terms::make_list(&mut ctx, &[item_f, item_g]).unwrap();
     assert!(
         cmp(actual, expected, &module.atom_table).is_eq(),
-        "the cooked trace must be [{{m,f,0,[]}},{{m,g,0,[]}}]"
+        "the cooked trace must be [{{m,f,0,[]}},{{m,g,0,[]}}] — the pre-unwind raise \
+         snapshot innermost-first"
     );
 }
 
