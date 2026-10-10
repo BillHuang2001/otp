@@ -19,11 +19,9 @@ Live drivers:
   An in-memory file implemented inside a port; consumed by `lib/kernel/src/ram_file.erl` (`open_port({spawn, "ram_file_drv"}, ...)`) and special-cased by `lib/runtime_tools/src/instrument.erl` (driver-level binary instrumentation).
 - `win32/registry_drv.c` → symbol `registry_driver_entry`, driver name `"registry__drv__"` (win32 only).
   Consumed by `lib/stdlib/src/win32reg.erl`, which appends a `"r"`/`"w"` mode suffix to the port name.
-- `unix/` holds no driver sources.
-- `vxworks/` holds no driver sources.
 
 ## Constraints
-- OS-specific code belongs in `unix/` (and `win32/`); `common/` must compile on all platforms and is compiled with `-Idrivers/common -Idrivers/$(ERLANG_OSTYPE)` so it may include headers from the matching OS directory.
+- OS-specific code belongs in the OS subdirectory (`win32/`); `common/` must compile on all platforms and is compiled with `-Idrivers/common -Idrivers/$(ERLANG_OSTYPE)` so it may include headers from the matching OS directory.
 - The public driver API is `../beam/erl_driver.h` (plus `../sys/$(ERLANG_OSTYPE)/driver_int.h`); these files include it as `"erl_driver.h"` and are the in-tree reference users of it.
 - `ERLANG_OSTYPE` is only `unix` or `win32` (set in `../configure.ac`).
 - Adding/removing a driver means editing `DRV_OBJS` in `../Makefile.in` and, if a new file name is used, exporting the matching `<base>driver_entry` symbol; the symbol name is derived mechanically, so renaming a file silently breaks the generated table link.
@@ -74,9 +72,7 @@ Live drivers:
 
 ## Routing Table
 - `common/` → platform-independent drivers: `inet_drv.c` (15879 lines; `inet`/`tcp_inet`/`udp_inet`/`sctp_inet`), `ram_file_drv.c` (~515 lines; `ram_file_drv`)
-- `unix/` → unix-specific driver sources (holds no driver sources)
 - `win32/` → win32-specific driver: `registry_drv.c` (~556 lines; `registry__drv__`), used by `lib/stdlib` `win32reg`
-- `vxworks/` → holds no driver sources
 - `../nifs/` → NIF counterparts and the newer `socket`/`prim_file`/`zlib` implementations (sibling — read-only, escalate writes to `../`)
 - `../beam/` → driver/port core, `erl_driver.h` public API (sibling — read-only, escalate writes to `../`)
 - `../sys/` → OS abstractions and pollset used by these drivers (sibling — read-only, escalate writes to `../`)
