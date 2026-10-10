@@ -119,6 +119,22 @@ pub(crate) trait Interior: Send + Sync {
     /// Every stored object, ordered for `ordered_set`.
     fn iter_objects(&self) -> Box<dyn Iterator<Item = Eterm> + '_>;
 
+    /// Every stored object in this interior's **reverse-navigation order** — the
+    /// order an `ets:last/1` + `ets:prev/2` walk visits them, expanding each key's
+    /// objects in stored order.
+    ///
+    /// The drop-in default is the `ordered_set` semantics: the exact reverse of
+    /// [`iter_objects`](Interior::iter_objects) (an `ordered_set` key holds one
+    /// object, so reversing the key order reverses the object order). The hash
+    /// kinds (`set`/`bag`/`duplicate_bag`) override it to return
+    /// [`iter_objects`](Interior::iter_objects) **unchanged**, because their
+    /// `last`/`prev` are `first`/`next` (see
+    /// [`last_key`](Interior::last_key)) — so their reverse traversal *is* the
+    /// forward one.
+    fn iter_objects_rev(&self) -> Box<dyn Iterator<Item = Eterm> + '_> {
+        Box::new(self.iter_objects().collect::<Vec<_>>().into_iter().rev())
+    }
+
     // ------------------------------------- removal, navigation and storage
 
     /// Remove `key`'s entry and return **every** object stored under it (an empty
@@ -150,6 +166,15 @@ pub(crate) trait Interior: Send + Sync {
 
     /// The last key in this interior's iteration order (`ets:last/1`); `None`
     /// when the table is empty.
+    ///
+    /// The drop-in default is the `ordered_set` semantics: a genuine backward step
+    /// to the **largest** key of the (ascending) iteration order. The hash kinds
+    /// (`set`/`bag`/`duplicate_bag`) override it, because ERTS implements
+    /// `ets:last/1` as `ets:first/1` for **every** hash-table kind — the
+    /// `db_first_hash, db_next_hash, db_first_hash /* last == first */,
+    /// db_next_hash /* prev == next */` function table
+    /// (`../../erts/emulator/beam/erl_db_hash.c:853-856`, repeated at `:891-894`) —
+    /// so there is no backward walk and no greatest-key search for them.
     fn last_key(&self, _atoms: &AtomTable) -> Option<Eterm> {
         self.keys().last().copied()
     }
@@ -157,10 +182,11 @@ pub(crate) trait Interior: Send + Sync {
     /// The key following `key` in this interior's iteration order, or `None` at
     /// the end of that order.
     ///
-    /// An **absent** `key` has no position in the iteration order, so the answer
+    /// An **absent** `key` has no position in the iteration order, so the default
     /// falls back to the nearest key in `beam_term` term order (the first key
     /// strictly greater than `key`); that is exactly the `ordered_set` range
-    /// semantics, and it gives the hash default a well-defined answer too.
+    /// semantics. The hash kinds keep the default and rely on `Table` rejecting an
+    /// absent anchor with `badarg` before this is reached.
     fn next_key(&self, key: Eterm, atoms: &AtomTable) -> Option<Eterm> {
         let keys = self.keys();
         match keys.iter().position(|&candidate| eq(candidate, key, atoms)) {
@@ -172,7 +198,13 @@ pub(crate) trait Interior: Send + Sync {
     }
 
     /// The key preceding `key` in this interior's iteration order, or `None` at
-    /// the start of that order (the mirror of [`Interior::next_key`]).
+    /// the start of that order.
+    ///
+    /// The drop-in default is the `ordered_set` mirror of
+    /// [`next_key`](Interior::next_key) (an absent `key` reads as a range bound:
+    /// the nearest key below it). The hash kinds override it as
+    /// `prev_key(key) = next_key(key)`, because ERTS's hash-table `ets:prev/2` is
+    /// `ets:next/2` (see [`last_key`](Interior::last_key)).
     fn prev_key(&self, key: Eterm, atoms: &AtomTable) -> Option<Eterm> {
         let keys = self.keys();
         match keys.iter().position(|&candidate| eq(candidate, key, atoms)) {

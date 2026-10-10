@@ -480,19 +480,22 @@ impl Table {
         Ok(selected)
     }
 
-    /// The body value of every object the spec selects, visiting the table in the
-    /// **reverse** of [`Self::select`]'s iteration order (`ets:select_reverse/2`).
+    /// The body value of every object the spec selects, visiting the table in its
+    /// **reverse-navigation** order (`ets:last/1` + `ets:prev/2`,
+    /// `ets:select_reverse/2`).
     ///
-    /// The traversal order is exactly the reverse of [`Table::tab2list`]: for an
+    /// The traversal order comes from the interior's own reverse navigation
+    /// (`Table::tab2list_rev`), which is the single source of truth: for an
     /// `ordered_set` that is **descending numeric key order** — verified against the
     /// system `erl` (OTP 29 / erts-17.1), whose `ets:select_reverse(T, [{'$1',[],
     /// ['$1']}])` on the `ordered_set` `{1,1}..{5,5}` returns
     /// `[{5,5},{4,4},{3,3},{2,2},{1,1}]`. For the hash kinds (`set`/`bag`/
-    /// `duplicate_bag`) the forward order is deliberately unspecified, so the
-    /// reverse is a complete permutation of the same result multiset (the oracle
-    /// walks its internal index backwards; this crate walks the reverse of its own
-    /// forward order — the same "hash-kind order is unspecified" freedom documented
-    /// elsewhere).
+    /// `duplicate_bag`) ERTS implements `ets:last/1` as `ets:first/1` and
+    /// `ets:prev/2` as `ets:next/2` (`erl_db_hash.c:853-856`), so
+    /// `ets:select_reverse/2` returns **exactly the same list in the same order** as
+    /// [`Self::select`] — including each key's stored object order for a `bag`.
+    /// (Only the interior's *internal* key order is unspecified; the two traversals
+    /// are equal, which is what this reproduces.)
     ///
     /// Otherwise identical to [`Self::select`]: fresh tuples/lists are built on
     /// `heap`; a result that is `'$_'`, a variable or a constant aliases table or
@@ -505,7 +508,7 @@ impl Table {
         heap: &mut Heap,
     ) -> Result<Vec<Eterm>> {
         let mut selected = Vec::new();
-        for object in self.tab2list().into_iter().rev() {
+        for object in self.tab2list_rev() {
             if let Some(value) = run_clauses(spec, object, atoms, heap)? {
                 selected.push(value.into_term(atoms)?);
             }

@@ -409,7 +409,10 @@ fn ordered_set_iterates_in_ascending_key_order() {
 //   * `select`, `match`, `match_object` and `tab2list` all walk the interior's own
 //     iteration order (`select` iterates `tab2list`, and the `match` family is
 //     `select` over a body that returns the whole object / the bound variables);
-//   * `select_reverse` walks exactly the **reverse** of it.
+//   * `select_reverse` walks the interior's **reverse-navigation** order: the exact
+//     reverse of it for an `ordered_set`, and the *same* order for a hash kind
+//     (`set`/`bag`/`duplicate_bag`), whose `ets:last/1` is `ets:first/1` and
+//     `ets:prev/2` is `ets:next/2` (`erl_db_hash.c:853-856`).
 //
 // For an `ordered_set` that order is the ascending arithmetic key order — exact and
 // oracle-comparable. For the hash kinds (`set`/`bag`/`duplicate_bag`) ERTS leaves
@@ -574,7 +577,9 @@ fn traverse_order_matches_the_recorded_oracle_figures() {
 /// The invariant behind the recorded figures, asserted directly on the sequences
 /// (not their renderings): for **every** kind the four forward traversals visit the
 /// objects in exactly `tab2list` order, and `select_reverse` visits them in the
-/// exact reverse — with `ordered_set` the ascending numeric key order.
+/// interior's reverse-navigation order — the exact reverse of `tab2list` for an
+/// `ordered_set` (the ascending numeric key order), and the **same** order for a
+/// hash kind (`set`/`bag`/`duplicate_bag`, whose `prev` is `next`).
 #[test]
 fn select_family_visits_objects_in_tab2list_order_for_every_kind() {
     for kind in KINDS {
@@ -636,15 +641,23 @@ fn select_family_visits_objects_in_tab2list_order_for_every_kind() {
             "{kind:?}: match order differs from tab2list"
         );
 
-        // `select_reverse` is the exact reverse of the forward order.
+        // `select_reverse` visits the objects in the interior's reverse-navigation
+        // order: the exact reverse of `tab2list` for an `ordered_set`, and the same
+        // order for a hash kind (whose `last`/`prev` are `first`/`next` — the
+        // hash-table function table in `erl_db_hash.c:853-856`).
         let reversed = table
             .select_reverse(&whole, &atoms, &mut out_heap())
             .unwrap();
         assert_eq!(reversed.len(), forward.len(), "{kind:?}: reverse count");
-        for (got, want) in reversed.iter().zip(forward.iter().rev()) {
+        let expected_reverse: Vec<Eterm> = if kind.is_ordered() {
+            forward.iter().rev().copied().collect()
+        } else {
+            forward.clone()
+        };
+        for (got, want) in reversed.iter().zip(&expected_reverse) {
             assert!(
                 eq(*got, *want, &atoms),
-                "{kind:?}: select_reverse is not the reverse of tab2list"
+                "{kind:?}: select_reverse is not the interior's reverse order"
             );
         }
 

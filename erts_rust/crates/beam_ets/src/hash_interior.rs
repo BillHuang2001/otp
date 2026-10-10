@@ -493,6 +493,25 @@ impl Interior for HashInterior {
             .collect()
     }
 
+    /// `ets:last/1` for a hash kind is `ets:first/1`
+    /// (`erl_db_hash.c:853-856`: `db_first_hash, db_next_hash, db_first_hash /* last
+    /// == first */, db_next_hash /* prev == next */`), so `last` is the first key of
+    /// the bucket-scan order — no backward walk, no greatest-key search.
+    fn last_key(&self, atoms: &AtomTable) -> Option<Eterm> {
+        self.first_key(atoms)
+    }
+
+    /// `ets:prev/2` for a hash kind is `ets:next/2` (the same C function table).
+    fn prev_key(&self, key: Eterm, atoms: &AtomTable) -> Option<Eterm> {
+        self.next_key(key, atoms)
+    }
+
+    /// The hash kinds' reverse walk is their forward one (`last`/`prev` are
+    /// `first`/`next`), so this is [`iter_objects`](Interior::iter_objects) as-is.
+    fn iter_objects_rev(&self) -> Box<dyn Iterator<Item = Eterm> + '_> {
+        self.iter_objects()
+    }
+
     fn memory(&self) -> usize {
         self.memory_words()
     }

@@ -36,8 +36,9 @@
 //! `insert_new` reports whether the key was absent, `update_counter`/
 //! `update_element` mutate the stored object, and lookup/iteration return the
 //! stored objects. Navigation order is unspecified for `set` (like the chained
-//! interior), so the `Interior` trait defaults answer `first`/`last`/`next`/`prev`
-//! over this interior's depth-first [`keys`](Interior::keys) order.
+//! interior), so `first`/`next` use the `Interior` trait defaults over this
+//! interior's depth-first [`keys`](Interior::keys) order, while `last`/`prev` are
+//! overridden to `first`/`next` — the C hash-kind rule (`erl_db_hash.c:853-856`).
 //!
 //! Public for testing and reuse, but **not** the cross-crate seam: dependents go
 //! through [`crate::Table`]. Nothing here re-implements term order or hashing.
@@ -504,6 +505,26 @@ impl Interior for ChampInterior {
 
     fn keys(&self) -> Vec<Eterm> {
         self.collect().into_iter().map(|slot| slot.key).collect()
+    }
+
+    /// `ets:last/1` for a hash kind is `ets:first/1`
+    /// (`erl_db_hash.c:853-856`: `db_first_hash, db_next_hash, db_first_hash /* last
+    /// == first */, db_next_hash /* prev == next */`). The CHAMP order is this
+    /// interior's own unspecified iteration order, so `last` is simply its first
+    /// key — there is no backward walk and no greatest-key search.
+    fn last_key(&self, atoms: &AtomTable) -> Option<Eterm> {
+        self.first_key(atoms)
+    }
+
+    /// `ets:prev/2` for a hash kind is `ets:next/2` (the same C function table).
+    fn prev_key(&self, key: Eterm, atoms: &AtomTable) -> Option<Eterm> {
+        self.next_key(key, atoms)
+    }
+
+    /// The hash kinds' reverse walk is their forward one (`last`/`prev` are
+    /// `first`/`next`), so this is [`iter_objects`](Interior::iter_objects) as-is.
+    fn iter_objects_rev(&self) -> Box<dyn Iterator<Item = Eterm> + '_> {
+        self.iter_objects()
     }
 
     fn memory(&self) -> usize {
