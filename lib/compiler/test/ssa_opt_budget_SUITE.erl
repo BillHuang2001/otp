@@ -21,7 +21,10 @@
 %%
 %% Tests for the opt-in per-SSA-pass time budget, watchdog, eligibility gates
 %% and per-function effort/budget model implemented by beam_ssa_opt_budget and
-%% wired into beam_ssa_opt:passes_1/3 / beam_ssa_destructive_update:opt/2.
+%% wired into beam_ssa_opt:passes_1/3 (the function-level passes, via
+%% wrap_fun/3) and, for the opt-in FBIP pass, into
+%% beam_ssa_opt:epilogue_module_passes/1 (which calls
+%% beam_ssa_opt_budget:run/5 for the named module pass ssa_opt_fbip).
 %%
 %% The machinery is default OFF: when none of the options
 %% ssa_opt_budget / {ssa_opt_budget,Millis}, {ssa_opt_fn_budget,Millis},
@@ -37,8 +40,9 @@
 %% `classify_model/1' and the `fn_budget_*' cases).
 %%
 %% The eligibility gates are cheap NECESSARY preconditions, wired in
-%% `beam_ssa_opt:gate/1' (and, for the FBIP pass, in
-%% `beam_ssa_destructive_update:opt/2'). The loop gate accepts a CFG back edge
+%% `beam_ssa_opt:gate/1' and - for the opt-in FBIP pass - declared by
+%% `beam_ssa_fbip:eligible/1' and handed to `beam_ssa_opt_budget:run/5' from
+%% `beam_ssa_opt:epilogue_module_passes/1'. The loop gate accepts a CFG back edge
 %% OR a strength-reduction candidate, because the `loop_opt' driver also
 %% reduces the whole function, which needs no loop (see `gates_skip_flat/1',
 %% `gates_run_rich/1', `gates_do_not_change_output/1' and
@@ -58,6 +62,7 @@
 -export([default_off/1,
          gates_skip_flat/1,
          gates_run_rich/1,
+         module_level_pass_no_function/1,
          gates_do_not_change_output/1,
          gates_accept_reduce_candidate/1,
          budget_ample_does_not_change_output/1,
@@ -86,6 +91,7 @@ groups() ->
       [default_off,
        gates_skip_flat,
        gates_run_rich,
+       module_level_pass_no_function,
        gates_do_not_change_output,
        gates_accept_reduce_candidate,
        budget_ample_does_not_change_output,
@@ -162,6 +168,44 @@ gates_run_rich(Config) ->
     check(St, ssa_opt_loop_opt, 1, 0),
     check(St, ssa_opt_fus, 1, 0),
     check(St, ssa_opt_fbip, 1, 0),
+    ok.
+
+%% A module-level pass runs through the same driver as the function-level
+%% passes (`beam_ssa_opt_budget:run/5', see
+%% `beam_ssa_opt:epilogue_module_passes/1'), but it is handed the whole module
+%% instead of a single function, so it has no function to classify and must
+%% not be recorded as a phantom one. The opt-in FBIP pass is such a pass: the
+%% rich probe's `rec_fresh/1' updates the result of a locally freshly
+%% allocating function, which is exactly the copying `update_record' that
+%% opens the pass's eligibility gate, so the pass runs rather than being
+%% gated. That run must leave the `effort' histogram exactly as it is without
+%% the pass, instead of adding a `{0,0}'-sized `full' entry (see `observe/1'
+%% and `fn_info/1' in beam_ssa_opt_budget).
+module_level_pass_no_function(Config) ->
+    Dir = tmp_dir(Config),
+    File = write_probe(Dir, "ssa_opt_budget_rich", rich_probe()),
+    %% `get_stats/0' reports the counters of the MOST RECENT compilation, so
+    %% the unflagged counters must be read before the flagged build starts.
+    _ = build(File, [binary,no_spawn_compiler_process,ssa_opt_gates]),
+    StUnflagged = stats(),
+    ?assert(is_map(StUnflagged)),
+    %% Without `fbip_opt' the pass is not even in the phase list.
+    PassesUnflagged = maps:get(passes, StUnflagged),
+    ?assertEqual({ssa_opt_fbip, false},
+                 {ssa_opt_fbip, maps:is_key(ssa_opt_fbip, PassesUnflagged)}),
+    _ = build(File, [binary,no_spawn_compiler_process,ssa_opt_gates,fbip_opt]),
+    StFlagged = stats(),
+    ?assert(is_map(StFlagged)),
+    %% With `fbip_opt' the pass is registered and really ran, so its absence
+    %% from the per-function bookkeeping below is not because it never ran.
+    PassesFlagged = maps:get(passes, StFlagged),
+    ?assertEqual({ssa_opt_fbip, true},
+                 {ssa_opt_fbip, maps:is_key(ssa_opt_fbip, PassesFlagged)}),
+    check(StFlagged, ssa_opt_fbip, 1, 0),
+    ?assert(ran_at_least(ssa_opt_fbip, PassesFlagged, 1)),
+    %% No phantom function: the module-level run adds no `{0,0}'-sized `full'
+    %% entry to the effort histogram, so it is the same in both builds.
+    ?assertEqual(maps:get(effort, StUnflagged), maps:get(effort, StFlagged)),
     ok.
 
 %% The gates only skip passes that provably cannot fire, so enabling them
