@@ -97,7 +97,9 @@ The message itself is `RuntimeContext::signal_notify_message(name)` → `(from, 
 - Signal tests send with `Command::new("kill") -USR1 <pid>` on `std::process::id()` — **never** `libc::raise`, which would need `unsafe`. A test that calls `run_scheduled` must account for the port loop parking (the scheduler's quiescence predicate — `Runtime::is_nt` reads `PortRegistry::has_nothing_to_poll`; see `../runtime/CONTEXT.md`).
 
 ## Test Strategy
-- Colocated units in `../port.rs`: every `Name` form + option (`{fd,N}` over a socket pair), an empty
+- Colocated units in `tests.rs` (the `#[cfg(test)] mod tests;` child of `../port.rs` — a separate file
+  so the suite does not grow the provider past its production size, as with `driver/*_tests.rs`): every
+  `Name` form + option (`{fd,N}` over a socket pair), an empty
   name → `BadArg` with no port number consumed, the `port_info` vocabulary, `pump`'s once-only
   `{exit_status,…}`, the `next_deadline` clamp, `take_driver_outputs`/`take_driver_terms`, the
   `TermQueue` drain, `stabilize_driver_term`, and the signal delivery end to end
