@@ -396,8 +396,11 @@ The rationale (why) behind the frozen API and constraints lives in **`DESIGN_DEC
   `ProcessTable::deliver(to, from, term, src_off_heap)` whose source table holds a refc binary the payload references, and it becomes a
   live runtime UAF once source off-heap registration lands. The `nodes` half is reachable via an external-pid payload (that copy needs
   no source table: `.../copy.rs:497-505`) but is benign in M1 — `NodeEntry` has no `Drop` and its count is non-observable bookkeeping, so
-  the count merely leaks. Fix: carry `.with_binaries(message.binaries().to_vec()).with_nodes(message.nodes().to_vec())` through the
-  rebuild. No test covers a message carrying off-heap ownership across a collection (`tests/gc.rs` roots only immediate/cons/tuple payloads).
+  the count merely leaks. A third field is dropped too: `fragments: Option<Fragments>` (`message.rs:51`), so a collection with a **fragmented**
+  queued payload rebuilds `payload` pointing into freed fragments — a use-after-free, not a leak. The relocation-safe seam is
+  `beam_message::Message::with_payload` (`../../beam_message/src/message.rs:115`), which replaces the payload while carrying
+  `from`/`token`/`off_heap`/`binaries`/`nodes`/`fragments`; the lossy path is `Message::new(...)` + re-applying the builders.
+  No test covers a message carrying off-heap ownership across a collection (`tests/gc.rs` roots only immediate/cons/tuple payloads).
 - **The `noproc` DOWN is delivered eagerly (documented deviation).** `monitor/2` on a non-live target
   materialises `{'DOWN', Ref, process, Target, noproc}` straight into the watcher's mailbox, so
   `process_info(self(), message_queue_len)` reports 1 immediately after the call where the oracle reports
