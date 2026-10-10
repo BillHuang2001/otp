@@ -62,7 +62,11 @@ Honors the crate-layer root-set contract: `x_reg_array[0..Live)` **plus the whol
     exhaustion it collects and grows the nursery **on demand** to fit the refused request, then retries
     once; the retry's own failure is what the delivery returns), enqueues the `Message`, then `wake()`s;
     `deliver_simple(from, term)` — the no-off-heap form; `receive(pred) -> Option<Message>` (delegates
-    to `beam_message::receive`). Because the nursery is grown on demand, a refused delivery — the raw
+    to `beam_message::receive`). **No receive scan position is stored on `Process`**: the mailbox is a
+    pure FIFO `beam_message::Queue`; a selective scan walks it fresh on every call
+    (`beam_message::receive` finds the first matching index and removes it), and a `QueueCursor` is a
+    transient caller-local value — only `ProcessTable::demonitor_flush` drives one (re-derived per
+    removal), never a `Process` field. Because the nursery is grown on demand, a refused delivery — the raw
     `AllocKind::Message` a caller's heap-fragment fallback keys on (`../beam_rt`'s
     `deliver_message`) — now means the receiver's heap policy could NOT grow the nursery to fit the
     payload (e.g. a `max_heap_words` cap, or a collection that cannot make room); with an unbounded
