@@ -38,7 +38,7 @@ use core::mem::size_of;
 use core::str;
 
 use beam_alloc::Heap;
-use beam_common::{BeamError, Result};
+use beam_common::Result;
 use beam_term::prelude::{
     is_atom, make_atom, make_small, try_make_small, MAX_ARITYVAL, MAX_SMALL, MIN_SMALL, NIL,
 };
@@ -69,29 +69,6 @@ const BIG_DIGIT_BYTES: usize = size_of::<u64>();
 /// modern `NEWER_REFERENCE_EXT` (and a local node in the shared block,
 /// `external.c:4810`) enforces it only for its own first number.
 const MAX_REFERENCE: u32 = 1 << 18;
-
-/// The error for a **well-formed** external reference whose wire id count is zero.
-///
-/// A zero-length reference is *not* malformed: the C builds a 0-number external
-/// ref block for it (`ref_num[0] = r0` followed by the odd-size padding write,
-/// `external.c:4846-4856`; `external_ref_no_numbers()` then reports 0) and the
-/// oracle accepts it — verified against erts-17.1:
-/// `binary_to_term(<<131,90,0,0,119,1,$n,0,0,0,0,0,0,0,0,0>>)` ⇒ `#Ref<…>`, and
-/// `binary_to_term(<<131,114,0,0,119,1,$n,0,0,0,0>>)` ⇒ `#Ref<…>` with
-/// `[used]` = 12 (the extra `r0` word is consumed either way).
-///
-/// This tree's external-ref block **cannot represent** such a term:
-/// [`beam_term::thing::write_external_ref`] — the layout owner, out of this
-/// crate's scope — requires `1 <= ids.len() <= MAX_REF_IDS`, and
-/// `beam_term`'s `make_hash`/`make_hash2` index `ids[0]` directly. Reported as a
-/// typed `SystemLimit` (a wire-supplied length outside the *representable* range —
-/// the same error [`crate::term::make_external_ref`] returns for a zero-id slice)
-/// rather than materializing a term that would mis-encode on the way out. See the
-/// crate `CONTEXT.md` §Known Issues for the exact `beam_term` change that would
-/// close this gap.
-fn zero_length_ref() -> BeamError {
-    system_limit()
-}
 
 /// Incremental external term format decoder.
 ///
@@ -353,12 +330,17 @@ impl<'a> Decoder<'a> {
                 if len > crate::term::MAX_REF_IDS {
                     return Err(bad_arg());
                 }
-                if len == 0 {
-                    return Err(zero_length_ref());
-                }
-                let mut ids = Vec::with_capacity(len);
-                ids.push(r0);
-                ids.extend(self.read_ids(len - 1)?);
+                // `len == 0` builds a **zero-id** external ref (the unconditional
+                // `r0` word is consumed but not stored, matching the C's zeroed
+                // padding write).
+                let ids = if len == 0 {
+                    Vec::new()
+                } else {
+                    let mut ids = Vec::with_capacity(len);
+                    ids.push(r0);
+                    ids.extend(self.read_ids(len - 1)?);
+                    ids
+                };
                 crate::term::make_external_ref(heap, node, &ids, creation)
             }
             Tag::NewerReference => {
@@ -378,12 +360,16 @@ impl<'a> Decoder<'a> {
                 if len > crate::term::MAX_REF_IDS {
                     return Err(bad_arg());
                 }
-                if len == 0 {
-                    return Err(zero_length_ref());
-                }
-                let mut ids = Vec::with_capacity(len);
-                ids.push(r0);
-                ids.extend(self.read_ids(len - 1)?);
+                // `len == 0` builds a **zero-id** external ref; the image re-encodes
+                // as the 11-byte `[90][0][node][creation]` the C emits.
+                let ids = if len == 0 {
+                    Vec::new()
+                } else {
+                    let mut ids = Vec::with_capacity(len);
+                    ids.push(r0);
+                    ids.extend(self.read_ids(len - 1)?);
+                    ids
+                };
                 crate::term::make_external_ref(heap, node, &ids, creation)
             }
             Tag::Port => {

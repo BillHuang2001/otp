@@ -111,7 +111,9 @@ pub use construct::{
     badmatch_reason, badmatch_reason_rooted, make_cons, make_cons_rooted, make_heap_binary,
     make_heap_binary_rooted, make_list, make_list_rooted, make_tuple, make_tuple_rooted,
 };
-pub use fun::{fun_arity, fun_free, fun_index, fun_num_free, fun_uniq, is_fun, make_fun};
+pub use fun::{
+    fun_arity, fun_free, fun_index, fun_num_free, fun_true_arity, fun_uniq, is_fun, make_fun,
+};
 pub use fun::make_fun_rooted;
 pub use map::{is_hashmap, make_flatmap, make_flatmap_rooted, make_map, make_map_rooted, map_entries};
 pub use number::{float_value, make_float, make_float_rooted, make_integer, make_integer_rooted};

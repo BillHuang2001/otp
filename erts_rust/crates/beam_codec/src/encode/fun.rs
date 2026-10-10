@@ -38,7 +38,8 @@ use crate::error;
 use crate::tag::{EXPORT_EXT, NEW_FUN_EXT};
 use crate::term::{
     fun_arity_term, fun_creator_pid, fun_env, fun_function, fun_index, fun_module,
-    fun_num_free_term, fun_old_index, fun_old_uniq, fun_uniq_bytes, FunKind, FunPid,
+    fun_num_free_term, fun_old_index, fun_old_uniq, fun_true_arity_term, fun_uniq_bytes, FunKind,
+    FunPid,
 };
 
 use super::{Encoder, FunIdentity};
@@ -70,10 +71,16 @@ impl<'a> Encoder<'a> {
 
     /// Encodes an `EXPORT_EXT` fun: `[113][module atom][function atom][arity small]`
     /// (`external.c:3997-4001`).
+    ///
+    /// The arity is the **true** arity (descriptor word 3), never the header's 8-bit
+    /// mask: the C reads the full arity back out of its out-of-line `Export` table
+    /// (`external.c:5038`) and re-emits it, so an arity above 255 must survive here
+    /// too (the header field saturates while the term keeps the true value —
+    /// [`crate::term::fun_true_arity_term`]).
     fn encode_fun_external(&mut self, term: Eterm) -> Result<()> {
         let module = fun_module(term)?;
         let function = fun_function(term)?;
-        let arity = fun_arity_term(term)?;
+        let arity = fun_true_arity_term(term)?;
         self.buf.u8(EXPORT_EXT);
         self.encode_atom(make_atom(module))?;
         self.encode_atom(make_atom(function))?;
@@ -197,7 +204,7 @@ mod tests {
     use beam_term::prelude::make_small;
     use beam_term::AtomTable;
 
-    use crate::encode::tests::{assert_system_limit, new_heap};
+    use crate::encode::tests::new_heap;
     use crate::encode::{encode_term, encode_term_body, Encoder, FunIdentity};
     use crate::error::{is_unsupported, is_unsupported_local_fun};
     use crate::term::{make_fun_external, make_fun_imported, make_fun_local, FunPid, MAX_ARG};
@@ -230,8 +237,17 @@ mod tests {
         let bytes = encode_term_body(max, &atoms).unwrap();
         assert_eq!(&bytes[bytes.len() - 2..], &[97, 255]);
 
-        // Arity 256 cannot fit the layout header ⇒ `SystemLimit` at construction.
-        assert_system_limit(make_fun_external(&mut heap, MAX_ARG + 1, module, function));
+        // An arity above the 8-bit header field encodes the **true** arity: the C
+        // reads it out of its `Export` table (`external.c:5038`), so 256 is a 4-byte
+        // `INTEGER_EXT` `0,0,1,0` — not the header's masked `[97, 0]`.
+        let over = make_fun_external(&mut heap, MAX_ARG + 1, module, function).unwrap();
+        let bytes = encode_term_body(over, &atoms).unwrap();
+        assert_eq!(&bytes[bytes.len() - 5..], &[98, 0, 0, 1, 0]);
+
+        // 511 masks to 255 in the header, but the true 511 is what goes on the wire.
+        let big = make_fun_external(&mut heap, 511, module, function).unwrap();
+        let bytes = encode_term_body(big, &atoms).unwrap();
+        assert_eq!(&bytes[bytes.len() - 5..], &[98, 0, 0, 1, 255]);
     }
 
     #[test]

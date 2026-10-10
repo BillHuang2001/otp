@@ -94,7 +94,11 @@ use crate::poller::Ready;
 
 /// The number of reductions a scheduler runs before it swaps the entity it is executing
 /// out (`CONTEXT_REDS`, `erts/emulator/beam/erl_vm.h`).
-pub const CONTEXT_REDS: usize = 4000;
+///
+/// This is the canonical [`beam_common::CONTEXT_REDS`], re-exported here so the existing
+/// `beam_io::port_task::CONTEXT_REDS` / `beam_io::CONTEXT_REDS` paths keep resolving; the
+/// definition lives in `beam_common`, there is no local copy.
+pub use beam_common::CONTEXT_REDS;
 
 /// The reductions one `INPUT` port task costs (`ERTS_PORT_REDS_INPUT` = `CONTEXT_REDS/100`).
 pub const PORT_REDS_INPUT: usize = CONTEXT_REDS / 100;

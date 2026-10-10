@@ -613,10 +613,66 @@ fn fun_to_list_1_gaps_a_local_fun_and_badargs_a_non_fun() {
     }
 }
 
+#[test]
+fn fun_to_list_1_renders_the_true_arity_past_255() {
+    let reg = default_registry();
+    let atoms = seeded_atoms();
+    let mut heap = Heap::new(4096).expect("test heap");
+    let mut ctx = make_ctx(&mut heap, &atoms);
+
+    // Oracle (OTP 29.1.1 / erts-17.1) on a crafted `EXPORT_EXT` whose arity field
+    // is 256/300 — `<<131,113,119,5,"lists",119,7,"reverse",<<97,256>>/...>>`:
+    //   erlang:fun_to_list(F)     => "fun lists:reverse/256" / ".../300"
+    //     (the C `FUN_DEF` printer uses `ep->info.mfa.arity`,
+    //      `erl_printf_term.c:721-723`)
+    //   erlang:fun_info(F, arity) => 0 / 44    (the header's 8-bit field)
+    //   erlang:fun_info_mfa(F)    => {lists,reverse,0} / {lists,reverse,44}
+    //   erlang:is_function(F, N)  => the same header field (256 ⇒ is_function(F,0))
+    for (arity, header, render) in [
+        (256usize, 0i64, "fun lists:reverse/256"),
+        (300, 44, "fun lists:reverse/300"),
+    ] {
+        let fun = external_fun(&mut ctx, arity, "lists", "reverse");
+
+        // The renderer uses the TRUE arity.
+        let text = call(&reg, &mut ctx, "fun_to_list", &[fun]).expect("fun_to_list");
+        assert_eq!(list_to_string(&reg, &mut ctx, text), render);
+
+        // `fun_info/2`'s `arity` and `fun_info_mfa/1` keep the header's 8-bit field.
+        let info = fun_info(&reg, &mut ctx, fun, "arity").expect("arity");
+        let value = pair_value(&reg, &mut ctx, &atoms, info, "arity");
+        assert_eq!(signed_value(value), header, "{arity}: fun_info/2 arity");
+
+        let mfa = call(&reg, &mut ctx, "fun_info_mfa", &[fun]).expect("fun_info_mfa");
+        assert_eq!(atom_name(&atoms, elem(&reg, &mut ctx, mfa, 1)), "lists");
+        assert_eq!(atom_name(&atoms, elem(&reg, &mut ctx, mfa, 2)), "reverse");
+        assert_eq!(
+            signed_value(elem(&reg, &mut ctx, mfa, 3)),
+            header,
+            "{arity}: fun_info_mfa/1 arity"
+        );
+
+        // `is_function/2` reads the same header field.
+        let is_fun = |ctx: &mut BifContext<'_>, n: i64| {
+            call(&reg, ctx, "is_function", &[fun, make_small(n)]).expect("is_function/2")
+        };
+        assert_eq!(
+            atom_name(&atoms, is_fun(&mut ctx, header)),
+            "true",
+            "{arity}: is_function/2 of the header arity"
+        );
+        assert_eq!(
+            atom_name(&atoms, is_fun(&mut ctx, arity as i64)),
+            "false",
+            "{arity}: is_function/2 of the true arity"
+        );
+        assert_eq!(atom_name(&atoms, is_fun(&mut ctx, 100)), "false");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // make_fun/3
 // ---------------------------------------------------------------------------
-
 #[test]
 fn make_fun_3_matches_the_oracle() {
     let reg = default_registry();
@@ -630,9 +686,9 @@ fn make_fun_3_matches_the_oracle() {
         call(&reg, &mut ctx, "make_fun", &[lists, reverse, make_small(1)]).expect("make_fun");
 
     // Oracle: `erlang:make_fun(lists,reverse,1)` =:= `fun lists:reverse/1` — in
-    // this layout both are the same 3-word `EXPORT_EXT` block. (`assert_eq!` on a
-    // boxed `Eterm` compares *addresses*, so the comparison is structural, i.e.
-    // the oracle's `=:=`.)
+    // this layout both are the same `EXPORT_EXT` block (`fun_words(External, 0)`).
+    // (`assert_eq!` on a boxed `Eterm` compares *addresses*, so the comparison is
+    // structural, i.e. the oracle's `=:=`.)
     let literal = external_fun(&mut ctx, 1, "lists", "reverse");
     assert_eq_term(&atoms, made, literal, "make_fun/3 vs the export lambda");
 

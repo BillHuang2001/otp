@@ -68,7 +68,8 @@ use beam_codec::error::{is_unsupported, is_unsupported_local_fun};
 use beam_codec::term::{
     big_parts, bitstring_bytes, cons_head, cons_tail, external_pid_parts, external_port_parts, external_ref_parts,
     flatmap_parts, float_value, fun_arity_term, fun_creator_pid, fun_env, fun_function, fun_index,
-    fun_kind_term, fun_module, fun_num_free_term, fun_old_index, fun_old_uniq, fun_uniq_bytes,
+    fun_kind_term, fun_module, fun_num_free_term, fun_old_index, fun_old_uniq, fun_true_arity_term,
+    fun_uniq_bytes,
     make_big, make_binary, make_external_pid, make_external_port, make_external_ref, make_flatmap,
     make_float, make_fun_external, make_fun_imported, tuple_arity, tuple_element,
 };
@@ -1380,8 +1381,29 @@ fn external_funs_round_trip() {
         // The decoded term is the same external fun, with no environment.
         assert_eq!(fun_kind_term(t2).unwrap(), FunKind::External);
         assert_eq!(fun_arity_term(t2).unwrap(), arity);
+        assert_eq!(fun_true_arity_term(t2).unwrap(), arity);
         assert_eq!(fun_num_free_term(t2).unwrap(), 0);
         assert_eq!(fun_env(t2).unwrap(), &[] as &[Eterm]);
+    }
+
+    // An arity **past** the 8-bit header field also round-trips: the header field is
+    // masked (`fun_arity_term` ⇒ `arity & 0xFF`) while the true arity is what the
+    // encoder emits (`fun_true_arity_term`), so the image keeps the real value.
+    for &arity in &[256usize, 511] {
+        let mut atoms = AtomTable::new();
+        let mut h = heap(64);
+        let fun = external_fun(&mut h, &mut atoms, arity);
+        let (img, t2, _h2, _a2) = roundtrip(fun, &atoms, 64);
+
+        let mut expected = vec![VERSION_MAGIC, EXPORT_EXT];
+        expected.extend_from_slice(&small_atom("lists"));
+        expected.extend_from_slice(&small_atom("reverse"));
+        expected.push(INTEGER_EXT);
+        expected.extend_from_slice(&(arity as u32).to_be_bytes());
+        assert_eq!(img, expected, "arity {arity} encodes its true value");
+
+        assert_eq!(fun_arity_term(t2).unwrap(), arity & 0xFF, "the header masks it");
+        assert_eq!(fun_true_arity_term(t2).unwrap(), arity);
     }
 
     // A fun whose module atom is longer than 255 *characters* cannot be encoded
@@ -1660,14 +1682,6 @@ fn assert_bad_arg(bytes: &[u8]) {
     );
 }
 
-fn assert_system_limit(bytes: &[u8]) {
-    let err = decode_err(bytes);
-    assert!(
-        matches!(err, BeamError::SystemLimit),
-        "expected SystemLimit, got {err:?}"
-    );
-}
-
 #[test]
 fn truncation_at_every_offset_is_bad_arg() {
     // A `NEW_PID_EXT` image built here rather than pasted, to keep the byte offsets
@@ -1806,13 +1820,6 @@ fn export_fun_decode_negative_cases_are_typed_errors() {
     img.extend_from_slice(&f);
     img.extend_from_slice(&[INTEGER_EXT, 0xFF, 0xFF, 0xFF, 0xFF]); // -1
     assert_bad_arg(&img);
-
-    // An arity past the header's 8-bit field ⇒ `SystemLimit`.
-    let mut img = vec![VERSION_MAGIC, EXPORT_EXT];
-    img.extend_from_slice(&m);
-    img.extend_from_slice(&f);
-    img.extend_from_slice(&[INTEGER_EXT, 0, 0, 1, 0]); // 256
-    assert_system_limit(&img);
 
     // Trailing garbage after a complete `EXPORT_EXT` fun ⇒ `BadArg`.
     let mut img = vec![VERSION_MAGIC, EXPORT_EXT];

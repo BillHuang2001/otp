@@ -22,14 +22,15 @@
 //!
 //! A fun is a boxed thing whose block is `[header][desc_words(kind)][env[0..num_free]]`
 //! (`beam_term::fun`): the C `entry` pointer is expanded into **inlined descriptor
-//! words** — 2 for a `Local` fun (`uniq`·`index`), 2 for an `External` fun
-//! (`module`·`function`), 10 for an `Imported` fun (the whole `NEW_FUN_EXT` signature).
-//! `beam_term::header_arity`/`thing_arityval` deliberately keep the C
+//! words** — 2 for a `Local` fun (`uniq`·`index`), 3 for an `External` fun
+//! (`module`·`function`·`arity`), 10 for an `Imported` fun (the whole `NEW_FUN_EXT`
+//! signature). `beam_term::header_arity`/`thing_arityval` deliberately keep the C
 //! `ERL_FUN_SIZE - 1 == 1` value (the old single-`entry` assumption), so a copier that
 //! sized or scanned a fun through `thing_arityval + 1` would (a) **under-size** the copy
-//! by `desc_words(kind) - 1` words — truncating the environment — and (b) advance the
-//! Cheney scan onto a raw descriptor word (`index` for `Local`, `uniq` bytes for
-//! `Imported`) and follow it as a bogus term reference, corrupting the heap.
+//! by `desc_words(kind) - 1` words — truncating the environment, and for an `External`
+//! fun dropping the descriptor `arity` word — and (b) advance the Cheney scan onto a raw
+//! descriptor word (`index` for `Local`, the `arity` word for `External`, `uniq` bytes
+//! for `Imported`) and follow it as a bogus term reference, corrupting the heap.
 //!
 //! These tests build all three kinds in a real [`HeapSpace`] (with compound free
 //! variables that must themselves be relocated), collect them as roots, and then assert
@@ -45,9 +46,9 @@ use beam_alloc::default_allocator;
 use beam_gc::prelude::{collect, HeapSpace};
 use beam_term::prelude::{
     boxed_val, fun_arity, fun_block_words, fun_creator_pid, fun_desc_words, fun_env, fun_function,
-    fun_index, fun_kind_of_header, fun_module, fun_num_free, fun_uniq, fun_uniq_bytes, fun_words,
-    list_val, make_arityval, make_boxed, make_small, write_fun_external, write_fun_imported,
-    write_fun_local, AtomTable, Eterm, FunKind, FunPid, NIL,
+    fun_index, fun_kind_of_header, fun_module, fun_num_free, fun_true_arity, fun_uniq,
+    fun_uniq_bytes, fun_words, list_val, make_arityval, make_boxed, make_small, write_fun_external,
+    write_fun_imported, write_fun_local, AtomTable, Eterm, FunKind, FunPid, NIL,
 };
 
 /// Allocates an empty `words`-word semi-space over the default allocator.
@@ -87,7 +88,7 @@ fn write_external(
     function: beam_term::prelude::Atom,
 ) -> Eterm {
     let words = fun_words(FunKind::External, 0);
-    // SAFETY: `words` (3) exclusively-owned, writable words are reserved at `hp`; every
+    // SAFETY: `words` (4) exclusively-owned, writable words are reserved at `hp`; every
     // one is written by `write_fun_external`.
     unsafe {
         let hp = from
@@ -130,7 +131,7 @@ fn write_imported(
 fn fun_block_size_formula_is_pinned_per_kind() {
     // The inlined descriptor widths (`beam_term::fun`).
     assert_eq!(fun_desc_words(FunKind::Local), 2);
-    assert_eq!(fun_desc_words(FunKind::External), 2);
+    assert_eq!(fun_desc_words(FunKind::External), 3);
     assert_eq!(fun_desc_words(FunKind::Imported), 10);
 
     // `fun_words` == `1 + desc + num_free` across the kind/size grid.
@@ -155,9 +156,9 @@ fn fun_block_size_formula_is_pinned_per_kind() {
     let module = atoms.intern("mod");
     let function = atoms.intern("call");
 
-    assert_eq!(fun_words(FunKind::External, 0), 3);
+    assert_eq!(fun_words(FunKind::External, 0), 4);
     let external = write_external(&mut from, 2, module, function);
-    assert_eq!(fun_block_words(external).unwrap(), 3);
+    assert_eq!(fun_block_words(external).unwrap(), 4);
 
     assert_eq!(fun_words(FunKind::Imported, 1), 12); // 1 + 10 + 1
     let imported = write_imported(
@@ -228,7 +229,7 @@ fn funs_of_all_three_kinds_survive_a_collection() {
     // The exact live footprint, by the layout formula: the three fun blocks plus the
     // four compound free-variable objects the environment reaches.
     let local_w = fun_words(FunKind::Local, 3); // 6
-    let external_w = fun_words(FunKind::External, 0); // 3
+    let external_w = fun_words(FunKind::External, 0); // 4
     let imported_w = fun_words(FunKind::Imported, 2); // 13
     let expected_live = local_w + external_w + imported_w + 3 + 2 + 4 + 2;
     assert_eq!(
@@ -272,6 +273,7 @@ fn funs_of_all_three_kinds_survive_a_collection() {
     unsafe {
         assert_eq!(fun_module(external).unwrap(), module);
         assert_eq!(fun_function(external).unwrap(), function);
+        assert_eq!(fun_true_arity(external).unwrap(), 2);
     }
 
     assert_eq!(fun_kind_of_header(header(imported)), FunKind::Imported);
@@ -471,4 +473,66 @@ fn fun_copy_total_is_exactly_the_sum_of_the_three_fun_blocks() {
     {
         assert_eq!(fun_kind_of_header(header(*r)), kind);
     }
+}
+
+/// The **descriptor `arity` word** of an `External` fun survives a copy: all 4 words of
+/// the block (`[header][module][function][arity]`) are moved, so a true arity the
+/// header's 8-bit field cannot hold is preserved by the descriptor word.
+///
+/// `write_fun_external` masks the header's 8-bit arity field and stores the *full* arity
+/// in descriptor word 3 (reachable only through `fun_true_arity`). A copier that sized
+/// the block as the old 3 words would truncate that word, and the copy would report only
+/// the header's masked arity. Writing `arity = 300` (needing 9 bits) makes the two
+/// observably different: `fun_arity(header(copied)) == 300 & 0xFF == 44` while
+/// `fun_true_arity(copied) == 300`.
+#[test]
+fn external_fun_descriptor_arity_word_survives_a_copy() {
+    let mut atoms = AtomTable::new();
+    atoms.seed(["mod", "call"]);
+    let module = atoms.intern("mod");
+    let function = atoms.intern("call");
+
+    let mut from = space(16);
+    // A true arity past the header's 8-bit field (`300 & 0xFF == 44`).
+    let external = write_external(&mut from, 300, module, function);
+    assert_eq!(fun_words(FunKind::External, 0), 4);
+    assert_eq!(
+        from.used_words(),
+        4,
+        "the from-space is exactly the 4-word fun block"
+    );
+
+    // A to-space sized *exactly* to the 4-word block: the copy must fit precisely.
+    let mut to = space(4);
+    let mut roots = [external];
+    let stats = collect(&from, &mut to, &mut roots).expect("collect");
+
+    // The root moved into the to-space, out of the from-space.
+    let copied = roots[0];
+    assert!(to.contains_term(copied), "root must point into the to-space");
+    assert!(
+        !from.contains_term(copied),
+        "root must no longer point into the from-space"
+    );
+
+    // All 4 words (header, `module`, `function`, descriptor `arity`) were copied.
+    assert_eq!(
+        to.used_words(),
+        fun_words(FunKind::External, 0),
+        "exactly the fun block is copied"
+    );
+    assert_eq!(stats.words_copied, 4);
+    assert_eq!(stats.objects_copied, 1);
+    assert_eq!(stats.words_reclaimed, 0, "the whole from-space was live");
+
+    // The header's 8-bit field is honestly truncated (`300 & 0xFF == 44`)...
+    assert_eq!(fun_arity(header(copied)), 300 & 0xFF);
+    assert_ne!(
+        fun_arity(header(copied)),
+        300,
+        "the header cannot hold the true arity"
+    );
+    // ...but the descriptor `arity` word survived the copy verbatim.
+    // SAFETY: `copied` is the live, copied external fun.
+    assert_eq!(unsafe { fun_true_arity(copied) }.unwrap(), 300);
 }

@@ -77,8 +77,8 @@ pub use crate::reader::Reader;
 pub use crate::tag::*;
 pub use crate::term::{
     fun_arity_term, fun_creator_pid, fun_env, fun_function, fun_index, fun_kind_term, fun_module,
-    fun_num_free_term, fun_old_index, fun_old_uniq, fun_uniq_bytes, FunKind, FunPid, FUN_MAX_FIELD,
-    MAX_ARG,
+    fun_num_free_term, fun_old_index, fun_old_uniq, fun_true_arity_term, fun_uniq_bytes, FunKind,
+    FunPid, FUN_DESC_WORDS_EXTERNAL, FUN_MAX_FIELD, MAX_ARG,
 };
 pub use crate::writer::Writer;
-pub use beam_term::fun::{fun_kind_of_header, fun_words};
+pub use beam_term::fun::{fun_desc_words, fun_kind_of_header, fun_true_arity, fun_words};

@@ -316,6 +316,49 @@ fn oracle_hashmap_image_decodes_and_reencodes_byte_identically() {
     );
 }
 
+/// The `MAP_SMALL_MAP_LIMIT` boundary: a 33-pair map (one past the flat-map ceiling)
+/// is a HAMT in both implementations, and the oracle's image decodes and re-encodes
+/// byte-identically.
+#[test]
+fn hashmap_boundary_33_pairs_decodes_and_reencodes_byte_identically() {
+    let Some(oracle) =
+        oracle_or_skip("hashmap_boundary_33_pairs_decodes_and_reencodes_byte_identically")
+    else {
+        return;
+    };
+
+    // 33 distinct integer keys = `MAP_SMALL_MAP_LIMIT` (32) + 1 ⇒ the oracle builds a HAMT.
+    let oracle_image = parse_binary(&run_erl(
+        &oracle,
+        "io:format(\"~w~n\", [term_to_binary(maps:from_list([{N, N*2} || N <- lists:seq(1,33)]))])",
+    ));
+    assert_eq!(oracle_image[0], VERSION_MAGIC);
+    assert_eq!(oracle_image[1], MAP_EXT);
+    assert_eq!(
+        u32::from_be_bytes([
+            oracle_image[2],
+            oracle_image[3],
+            oracle_image[4],
+            oracle_image[5]
+        ]),
+        33
+    );
+
+    let mut h = heap();
+    let mut atoms = AtomTable::new();
+    let term = decode_term(&oracle_image, &mut h, &mut atoms).expect("the oracle image decodes");
+    assert!(
+        flatmap_parts(term).is_err(),
+        "33 > MAP_SMALL_MAP_LIMIT ⇒ a HAMT, not a flat map"
+    );
+    assert_eq!(beam_term::map::map_size(term, &atoms).unwrap(), 33);
+    assert_eq!(
+        encode_term(term, &atoms).expect("a decoded map re-encodes"),
+        oracle_image,
+        "our re-encode of the oracle's 33-pair HAMT image must be byte-identical"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // (d) `1` and `1.0` are distinct keys — accepted by both.
 // ---------------------------------------------------------------------------

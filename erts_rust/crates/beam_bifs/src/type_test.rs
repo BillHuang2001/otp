@@ -406,12 +406,14 @@ mod tests {
         assert_eq!(reg.len(), 18);
     }
 
-    /// The words of a fun term: `[MAKE_FUN_HEADER(arity, 0, 0), uniq, index]`.
+    /// The words of a **local** fun term: `[MAKE_FUN_HEADER(arity, 0, 0), uniq, index]`.
     ///
     /// The fun layout is `[thing_word, entry, env…]` (`erl_fun.h`, see
     /// `beam_engine::terms::make_fun`) and its header (`erl_term.h:413-424`) packs
     /// the arity at bit 8 and the environment size at bit 16; `is_function/2` reads
-    /// only the header.
+    /// only the header. This is a `Local` block (`fun_words(FunKind::Local, 0) == 3`
+    /// — no kind bit set), so the widened *external* descriptor (4 words) does not
+    /// affect it.
     fn fun_words(arity: usize) -> [Eterm; 3] {
         [
             Eterm::from_raw(beam_term::FUN_SUBTAG | (arity << 8)),

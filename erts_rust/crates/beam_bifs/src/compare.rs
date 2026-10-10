@@ -51,19 +51,14 @@
 //!
 //! # The honest typed gap
 //!
-//! [`beam_term::hashing`] answers `TermError` for a term it cannot hash faithfully
-//! (a native record whose cached definition hash is not a `Uint`, a `make_fun3` local
-//! fun without a module/`old_uniq`, a malformed block) and for a class whose
-//! *transcription* this runtime does not carry (an internal reference). The BIF
+//! [`beam_term::hashing`] is **authoritative**: it answers `TermError` for a term whose
+//! hash this runtime cannot reproduce **faithfully** — a native record whose definition
+//! cannot be resolved, an internal reference (whose C hash mixes an id of the node
+//! container this tree's M1 `Ref` thing does not carry), a `make_fun3` local fun (whose
+//! inlined descriptor carries no module/`old_uniq`) and a malformed block. The BIF
 //! contract here is the crate-wide one — a **typed** `unsupported_bif` capability gap,
 //! never a wrong number and never a plain `badarg` — so every `TermError` is mapped to
 //! `unsupported_bif` ([`hashing_gap`]).
-//!
-//! Two classes *succeed* in the LCA hashes yet must still be a gap here, because the
-//! value they would produce is not the oracle's: a **native record** and an **internal
-//! reference**. Both are found *before* delegating by [`hash_gap`], which walks the
-//! nested positions the hashes visit (the transcription this module replaced refused
-//! them at the same positions).
 //!
 //! # Pinned against the OTP 29 oracle
 //!
@@ -75,13 +70,11 @@
 
 use core::cmp::Ordering;
 
-use beam_codec::term::{fun_env, fun_kind_term, FunKind};
 use beam_common::{BeamError, Result};
 use beam_term::compare::{cmp, cmp_arith};
 use beam_term::hashing::{make_hash, make_hash2};
 use beam_term::{AtomTable, Eterm, TermError};
 
-use crate::access;
 use crate::arith;
 use crate::context::BifContext;
 use crate::error::{badarg, unsupported_bif};
@@ -169,68 +162,6 @@ pub(crate) fn register(reg: &mut BifRegistry) {
 /// rather than being collapsed into a plain `badarg` by `From<TermError>`.
 fn hashing_gap(_: TermError) -> BeamError {
     unsupported_bif()
-}
-
-/// `true` when `t`, or any term reachable from it, is a class whose `make_hash` /
-/// `make_hash2` value this runtime cannot reproduce faithfully — so the BIF must
-/// answer the typed `unsupported_bif` gap rather than a number.
-///
-/// Two classes qualify, and neither is reachable through [`hashing_gap`] (both
-/// *succeed* in the LCA hashes), so they are checked up front:
-///
-/// * a **native record**. Both hashes mix in the record definition's **cached** hash
-///   word (`erl_term_hashing.c:369` and `:1093`, which the C *requires* to be the
-///   definition's `make_hash2`) — and `records:create/4` stores the placeholder
-///   `make_small(0)` there, because [`beam_term::record::write_record`] takes that
-///   word as an explicit parameter (the value is a word of the very block being
-///   written, so it cannot be known before the block exists; see the
-///   [`beam_term::record`] module docs). The placeholder is a *small integer*, so
-///   `make_hash2` accepts it and would silently return a non-oracle value. A record
-///   is therefore a gap whatever its cache holds — the same contract the transcription
-///   this module replaced had.
-/// * an **internal reference**: both hashes mix in `internal_ref_numbers(ref)[0]`
-///   (`erl_term_hashing.c:289` and `:1456`) — the first id of the reference's *node
-///   container*, which this runtime's M1 on-heap `Ref` thing does not carry (it holds
-///   a single process-local id, see [`crate::access::make_ref_thing`]).
-///
-/// The walk visits exactly the nested positions the two hashes visit — a list's head
-/// and tail, a tuple's elements, a map's keys and values, an imported fun's
-/// environment — so a gap class is detected *wherever* it would have been mixed in,
-/// never only at the top level. It never dereferences blind: every step asks
-/// [`crate::access`] first, so a non-term word, a `NIL` or a `BinRef` is a leaf.
-fn hash_gap(t: Eterm, atoms: &AtomTable) -> bool {
-    let mut work = vec![t];
-    while let Some(t) = work.pop() {
-        if access::is_record(t) || access::is_internal_ref(t) {
-            return true;
-        }
-        if access::is_list(t) {
-            work.push(access::car(t));
-            work.push(access::cdr(t));
-        } else if access::is_tuple(t) {
-            for i in 0..access::tuple_size(t) {
-                work.push(access::tuple_element(t, i));
-            }
-        } else if access::is_map(t) {
-            match beam_term::map::map_pairs(t, atoms) {
-                Ok(pairs) => work.extend(pairs.into_iter().flat_map(|(k, v)| [k, v])),
-                // A map the LCA reader rejects is one the hashes reject too.
-                Err(_) => return true,
-            }
-        } else if access::is_function(t) {
-            match fun_kind_term(t) {
-                // A `make_fun3` fun carries no module/`old_uniq` to mix in; the hashes
-                // refuse it themselves (it is a `TermError` gap as well).
-                Ok(FunKind::Local) | Err(_) => return true,
-                Ok(FunKind::Imported) => match fun_env(t) {
-                    Ok(env) => work.extend(env.iter().copied()),
-                    Err(_) => return true,
-                },
-                Ok(FunKind::External) => {}
-            }
-        }
-    }
-    false
 }
 
 /// `phash_2`'s `Range` argument (`bif.c:5376-5385`) — the `Uint32` modulus, or `0`
@@ -325,26 +256,27 @@ fn phash2_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     ctx.int(i64::from(final_hash))
 }
 
-/// [`make_hash`] behind this crate's typed-gap contract: an unfaithful class
-/// ([`hash_gap`]) or an LCA refusal ([`hashing_gap`]) is `unsupported_bif`.
+/// [`make_hash`] behind this crate's typed-gap contract: a term the lowest-common-ancestor
+/// port cannot reproduce faithfully ([`hashing_gap`]) is the typed `unsupported_bif`
+/// capability gap, never a wrong number.
+///
+/// `beam_term::hashing` is **authoritative** here — it resolves a native record's
+/// definition hash itself and refuses the identity it cannot derive (an internal
+/// reference, a `make_fun3` local fun, a malformed block), so no consumer-side
+/// pre-check is needed.
 fn phash_of(t: Eterm, atoms: &AtomTable) -> Result<u32> {
-    if hash_gap(t, atoms) {
-        return Err(unsupported_bif());
-    }
     make_hash(t, atoms).map_err(hashing_gap)
 }
 
 /// [`make_hash2`] behind this crate's typed-gap contract — see [`phash_of`].
 fn phash2_of(t: Eterm, atoms: &AtomTable) -> Result<u32> {
-    if hash_gap(t, atoms) {
-        return Err(unsupported_bif());
-    }
     make_hash2(t, atoms).map_err(hashing_gap)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::access;
     use beam_alloc::Heap;
     use beam_common::{ExceptionClass, ExitReason};
     use beam_process::ProcessId;
@@ -352,7 +284,11 @@ mod tests {
 
     fn atoms() -> AtomTable {
         let mut atoms = AtomTable::new();
-        atoms.seed(["true", "false", "ok", "a", "b"]);
+        // The ERTS index convention: `false` = 0, `true` = 1 (see `atom.names` and
+        // `beam_term::AtomTable::from_atom_names`), then the rest in any order. `x`
+        // precedes `y` exactly as in `atom.names`, so a record's value walk order
+        // matches the oracle's.
+        atoms.seed(["false", "true", "ok", "a", "b", "rec", "r", "x", "y"]);
         atoms
     }
 
@@ -530,62 +466,175 @@ mod tests {
         );
     }
 
-    /// [`hash_gap`] finds an unfaithful class at **every** nesting depth the hashes
-    /// reach, not only at the top level — the contract the deleted transcription had
-    /// (its own walk refused these classes wherever it met them).
-    ///
-    /// Both classes here are ones the LCA hashes *accept*, so this is the guard that
-    /// keeps them a typed gap: a native record (whose cached definition hash this
-    /// runtime stores as the placeholder `make_small(0)`) and an internal reference
-    /// (whose id words this runtime's M1 `Ref` thing does not carry).
-    #[test]
-    fn the_hash_gap_is_found_at_every_nesting_depth() {
-        let mut heap = Heap::new(256).unwrap();
-        let table = atoms();
-        let a = table.lookup("a").unwrap();
+    // -----------------------------------------------------------------------
+    // The native-record and internal-reference classes
+    // -----------------------------------------------------------------------
 
-        // The way `records:create/4` builds one: `native_record_write` stores the
-        // placeholder `make_small(0)` as the definition's cached hash.
-        let rec = access::native_record_write(
-            &mut heap,
-            a,
-            a,
-            false,
-            &[(make_atom(a), make_small(2))],
-        )
-        .unwrap();
-        let r = access::make_ref_thing(&mut heap, 7).unwrap();
-        let a_term = make_atom(a);
+    /// `records:create(rec, r, [{a,1}], #{is_exported => true})` — built the way
+    /// `crate::records::create/4` does, i.e. through
+    /// [`access::native_record_write`], whose cached definition hash is the
+    /// placeholder `make_small(0)`.
+    ///
+    /// A **one-field** record is the shape whose oracle value is stable run to run
+    /// (see the test doc comment below); a record with several keys is not.
+    fn sample_record(heap: &mut Heap, table: &AtomTable) -> Eterm {
+        let module = table.lookup("rec").expect("seeded");
+        let name = table.lookup("r").expect("seeded");
+        let a = make_atom(table.lookup("a").expect("seeded"));
+        access::native_record_write(heap, module, name, true, &[(a, make_small(1))])
+            .expect("the record block fits")
+    }
+
+    /// A native record now hashes to the **oracle's** values instead of being a typed
+    /// gap, at the top level and nested inside a tuple / a list / a map.
+    ///
+    /// The expectations are re-derived from the system oracle (OTP 29.1.1 / erts-17.1):
+    ///
+    /// ```text
+    /// $ erl -noshell -eval '
+    ///     R2 = records:create(rec, r, [{a,1}], #{is_exported => true}),
+    ///     io:format("~p ~p ~p | ~p ~p ~p | ~p ~p ~p | ~p ~p ~p~n",
+    ///      [erlang:phash2({1,R2}), erlang:phash2({1,R2},1000000), erlang:phash({1,R2},1000000),
+    ///       erlang:phash2([R2,1]), erlang:phash2([R2,1],1000000), erlang:phash([R2,1],1000000),
+    ///       erlang:phash2(#{a => R2}), erlang:phash2(#{a => R2},1000000), erlang:phash(#{a => R2},1000000),
+    ///       erlang:phash2(R2), erlang:phash2(R2,1000000), erlang:phash(R2,1000000)]), halt().'
+    /// 105608320 874240 964745 | 46225311 967135 812886 | 7457474 553858 994470 | 33491412 709140 567678
+    /// ```
+    ///
+    /// (Identical over repeated runs.)
+    ///
+    /// **Why the one-field record.** The oracle's record-definition hash mixes the
+    /// *atom indices* of the field keys, and `a`/`b` are not in `erts/emulator/beam/atom.names`,
+    /// so the 2-field `[{a,1},{b,2}]` form is **not reproducible run to run** — the
+    /// oracle itself answers `15179545` or `118035477` for `phash2/1` depending on the
+    /// run (the Rust side reproduces the `118035477` family exactly). A one-field
+    /// record with `is_exported => true` is stable, which is what is pinned here.
+    ///
+    /// The record is built with the **placeholder** definition hash, so these values
+    /// prove the hash is taken from the definition block that
+    /// `beam_term::hashing` resolves itself (the same value the C caches at
+    /// creation time) — not from the stored word.
+    #[test]
+    fn native_records_hash_to_the_oracle_values() {
+        let mut heap = Heap::new(512).unwrap();
+        let table = atoms();
+        let a_term = make_atom(table.lookup("a").expect("seeded"));
+        let rec = sample_record(&mut heap, &table);
 
         let mut ctx = BifContext::new(&mut heap, &table, ProcessId::new(1, 0));
+        let one = make_small(1);
+        let million = make_small(1_000_000);
+
+        // Top level.
+        assert_eq!(phash2_1(&mut ctx, &[rec]).unwrap(), make_small(33_491_412));
+        assert_eq!(
+            phash2_2(&mut ctx, &[rec, million]).unwrap(),
+            make_small(709_140)
+        );
+        assert_eq!(
+            phash_2(&mut ctx, &[rec, million]).unwrap(),
+            make_small(567_678)
+        );
+
+        // ... and nested: both hashes visit the record wherever it sits.
+        let in_tuple = ctx.tuple(&[one, rec]).unwrap();
+        let in_list = ctx.list(&[rec, one]).unwrap();
+        let in_map = access::make_flatmap(ctx.heap(), &[(a_term, rec)]).unwrap();
+
+        assert_eq!(
+            phash2_1(&mut ctx, &[in_tuple]).unwrap(),
+            make_small(105_608_320)
+        );
+        assert_eq!(
+            phash2_2(&mut ctx, &[in_tuple, million]).unwrap(),
+            make_small(874_240)
+        );
+        assert_eq!(
+            phash_2(&mut ctx, &[in_tuple, million]).unwrap(),
+            make_small(964_745)
+        );
+
+        assert_eq!(
+            phash2_1(&mut ctx, &[in_list]).unwrap(),
+            make_small(46_225_311)
+        );
+        assert_eq!(
+            phash2_2(&mut ctx, &[in_list, million]).unwrap(),
+            make_small(967_135)
+        );
+        assert_eq!(
+            phash_2(&mut ctx, &[in_list, million]).unwrap(),
+            make_small(812_886)
+        );
+
+        assert_eq!(
+            phash2_1(&mut ctx, &[in_map]).unwrap(),
+            make_small(7_457_474)
+        );
+        assert_eq!(
+            phash2_2(&mut ctx, &[in_map, million]).unwrap(),
+            make_small(553_858)
+        );
+        assert_eq!(
+            phash_2(&mut ctx, &[in_map, million]).unwrap(),
+            make_small(994_470)
+        );
+    }
+
+    /// An **internal reference** is a class `beam_term::hashing` refuses with
+    /// `TermError::RefIdentityUnavailable` (its C hash mixes an id of the node
+    /// container that this tree's M1 `Ref` thing does not carry), so `erlang:phash/2`
+    /// and `erlang:phash2/1,2` must answer the typed `unsupported_bif` capability gap
+    /// at **every** nesting depth the two hashes reach — never a number.
+    ///
+    /// The oracle's `erlang:phash2(make_ref())` is environment-dependent (the C mixes
+    /// the running node's container id), so no value is pinned; the contract asserted
+    /// here is the typed refusal.
+    #[test]
+    fn internal_references_stay_the_typed_unsupported_bif_gap() {
+        let mut heap = Heap::new(512).unwrap();
+        let table = atoms();
+        let a_term = make_atom(table.lookup("a").expect("seeded"));
+        let r = access::make_ref_thing(&mut heap, 7).unwrap();
+
+        let mut ctx = BifContext::new(&mut heap, &table, ProcessId::new(1, 0));
+        let one = make_small(1);
         let range = make_small(1_000_000);
-        let rec_in_tuple = ctx.tuple(&[make_small(1), rec]).unwrap();
-        let rec_in_list = ctx.list(&[rec, make_small(1)]).unwrap();
-        let rec_in_map = access::make_flatmap(ctx.heap(), &[(a_term, rec)]).unwrap();
-        let ref_in_tuple = ctx.tuple(&[r]).unwrap();
 
-        // A record is a gap at the top level and nested, for both hashes.
-        assert_gap(phash2_1(&mut ctx, &[rec]), "phash2(record)");
-        assert_gap(phash_2(&mut ctx, &[rec, range]), "phash(record, range)");
-        assert_gap(
-            phash2_1(&mut ctx, &[rec_in_tuple]),
-            "phash2({1, record})",
-        );
-        assert_gap(phash2_1(&mut ctx, &[rec_in_list]), "phash2([record, 1])");
-        assert_gap(
-            phash2_1(&mut ctx, &[rec_in_map]),
-            "phash2(#{a => record})",
-        );
-        // ... and so is an internal reference.
-        assert_gap(phash2_1(&mut ctx, &[r]), "phash2(reference)");
-        assert_gap(
-            phash2_1(&mut ctx, &[ref_in_tuple]),
-            "phash2({reference})",
-        );
-        assert_gap(phash_2(&mut ctx, &[r, range]), "phash(reference, range)");
+        let in_tuple = ctx.tuple(&[one, r]).unwrap();
+        let in_list = ctx.list(&[r, one]).unwrap();
+        let in_map = access::make_flatmap(ctx.heap(), &[(a_term, r)]).unwrap();
+        // A record whose *field* holds the reference: the record's value walk reaches
+        // it, so the record too is a gap.
+        let rec_with_ref = access::native_record_write(
+            ctx.heap(),
+            table.lookup("rec").expect("seeded"),
+            table.lookup("r").expect("seeded"),
+            false,
+            &[(a_term, r)],
+        )
+        .unwrap();
 
-        // A control: the same containers *without* a gap class still hash.
-        let clean = ctx.tuple(&[make_small(1), a_term]).unwrap();
+        for (t, what) in [
+            (r, "reference"),
+            (in_tuple, "{1, reference}"),
+            (in_list, "[reference, 1]"),
+            (in_map, "#{a => reference}"),
+            (rec_with_ref, "a record with a reference field"),
+        ] {
+            assert_gap(phash2_1(&mut ctx, &[t]), &format!("phash2({what})"));
+            assert_gap(
+                phash2_2(&mut ctx, &[t, range]),
+                &format!("phash2({what}, range)"),
+            );
+            assert_gap(
+                phash_2(&mut ctx, &[t, range]),
+                &format!("phash({what}, range)"),
+            );
+        }
+
+        // A control: the same containers *without* a reference still hash.
+        let clean = ctx.tuple(&[one, a_term]).unwrap();
         assert!(phash2_1(&mut ctx, &[clean]).is_ok());
     }
 }

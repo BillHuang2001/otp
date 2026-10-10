@@ -168,6 +168,34 @@ pub(crate) fn fun_arity(x: Eterm) -> Option<u32> {
     Some(((header >> FUN_HEADER_ARITY_OFFS) & FUN_FIELD_MAX) as u32)
 }
 
+/// The **true** arity of a fun term — the arity the C `FUN_DEF` printer emits
+/// (`erl_printf_term.c:721-723`), i.e. what `erlang:fun_to_list/1` renders.
+///
+/// For a [`beam_term::fun::FunKind::External`] fun this is descriptor word 3,
+/// the inlined `Export`'s `info.mfa.arity`, which may exceed the header's 8-bit
+/// field (an `EXPORT_EXT` fun with true arity 256 renders `fun lists:reverse/256`
+/// — oracle-verified). For a local/imported fun it is the header's 8-bit field,
+/// i.e. the same value [`fun_arity`] returns.
+///
+/// This is **not** what `erlang:fun_info/2`'s `arity` item or
+/// `erlang:fun_info_mfa/1` report: those read the header's 8-bit field
+/// (`beam_codec::term::fun_arity_term`, the C `fun_arity(funp)`), so true arity
+/// 256 reports `0` and true arity 300 reports `44`.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] when `x` is not a fun.
+#[inline]
+pub(crate) fn fun_true_arity(x: Eterm) -> Result<usize> {
+    if !is_function(x) {
+        return Err(BeamError::BadArg);
+    }
+    // SAFETY: [`is_function`] (`is_any_fun`) established that `x` is a live boxed
+    // fun, so its whole block is live — the precondition of `fun_true_arity`; the
+    // only error it can return (`TermError::BadFun`) is excluded by that guard.
+    Ok(unsafe { beam_term::fun::fun_true_arity(x)? })
+}
+
 /// `is_record(x)` — a native record (`RECORD_SUBTAG`).
 ///
 /// This is the C `is_record` macro (`erl_term.h:437`), **not** a tuple test: a

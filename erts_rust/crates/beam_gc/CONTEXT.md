@@ -376,16 +376,16 @@ still reproduces today's collector exactly.
   deliberately returns the C `ERL_FUN_SIZE - 1 == 1` for a fun — the old assumption that a fun block is
   `[header][entry-pointer][env...]` with a single descriptor word. This runtime instead **inlines** the
   C `entry` as descriptor words, so a fun block is `[header][desc_words(kind)][env[0..num_free]]`, where
-  `desc_words` = 2 (`Local`), 2 (`External`), 10 (`Imported`), and `env[i]` is at
-  `hp[1 + desc_words(kind) + i]`. The copier therefore never uses `header_arity` for a fun:
+  `desc_words` = 2 (`Local`), 3 (`External`: `module`·`function`·`arity`), 10 (`Imported`), and `env[i]`
+  is at `hp[1 + desc_words(kind) + i]`. The copier therefore never uses `header_arity` for a fun:
   `beam_term::layout::object_words` sizes it as `fun_words(kind, num_free)` ==
   `1 + fun_desc_words(kind) + fun_num_free` (`fun_block_words_header`), and the canonical walk's fun
   case reports exactly the `num_free` env slots at `1 + desc_words(kind) + i`, so the whole descriptor
   is skipped opaquely. Using `header_arity`/`thing_arityval` for a fun would **under-size** the copy by
-  `desc_words(kind) - 1` words (1 for `Local`/`External`, 9 for `Imported`) and land the scan on a raw
-  descriptor word (`index` for `Local`, `uniq` bytes for `Imported`), following it as a bogus term
-  reference and corrupting the heap. Every fun offset/width comes from `beam_term::fun`; `copy.rs`
-  defines none of its own.
+  `desc_words(kind) - 1` words (1 for `Local`, 2 for `External`, 9 for `Imported`) and land the scan on
+  a raw descriptor word (`index` for `Local`, the `arity` word for `External`, `uniq` bytes for
+  `Imported`), following it as a bogus term reference and corrupting the heap. Every fun offset/width
+  comes from `beam_term::fun`; `copy.rs` defines none of its own.
 - **Object sizing/walking is shared, not duplicated.** The per-object walk lives in exactly one place —
   `beam_term::layout::{object_words, for_each_child_slot}` (the LCA that owns the frozen term layout).
   `copy.rs` exposes only the copy-specific `pub(crate)` pieces (`EvacDest`, `forward_slot`, `move_size`,
@@ -492,7 +492,10 @@ still reproduces today's collector exactly.
   per-kind block size (`fun_words == fun_block_words == 1 + desc + num_free`) and **a dedicated test
   proves the descriptor words are opaque**: it plants an `Imported` fun whose `uniq[0..8]` is a
   BOXED-tagged pointer into the from-space, so a scan that stepped `thing_arityval + 1` would follow that
-  raw word and corrupt the term, while the correct `fun_env_offset_header` step leaves it verbatim.
+  raw word and corrupt the term, while the correct `fun_env_offset_header` step leaves it verbatim. A
+  further dedicated test copies an `External` fun (whose 3-word descriptor is `module`·`function`·`arity`)
+  whose true arity (300) exceeds the header's 8-bit field and asserts the descriptor `arity` word
+  survives: the header reports the masked `300 & 0xFF == 44` while `fun_true_arity` reports the true `300`.
 - **`immix/*` in-module tests + `tests/immix_{parity,partial_block,measure}.rs` + `tests/gen_immix_collector.rs`
   — the integrated evidence.** The `immix/*` in-module tests cover block/line geometry, line-granular
   allocation + hole reuse after a collection, mark/classify, `AllMarked` pinning, partial-block
@@ -697,7 +700,7 @@ still reproduces today's collector exactly.
 - `tests/mature_selection.rs` → the automatic rule (Copying below / Immix at-or-above `IMMIX_BREAK_EVEN_WORDS`), the explicit override in both directions, and both collectors' structural agreement on a threshold-crossing corpus
 - `tests/map_copy.rs` → flat-map + HAMT-map (a 500-key deep trie, incl. a hand-built collision node) survive a collection; the copied map is sized exactly to its independently-measured footprint
 - `tests/refc_binary_copy.rs` → the 8-word `[BinRef][ErlSubBits]` refc-binary pair survives a collection (the `orig` back-pointer is forwarded to the copied `BinRef`, off-heap pointer left verbatim)
-- `tests/fun_copy.rs` → `Local`/`External`/`Imported` funs (with compound free variables) survive a collection: metadata + env round-trip, the block is sized exactly to `1 + desc_words + num_free`, and the descriptor words are proven opaque (a descriptor aliasing a from-space pointer must NOT be followed)
+- `tests/fun_copy.rs` → `Local`/`External`/`Imported` funs (with compound free variables) survive a collection: metadata + env round-trip, the block is sized exactly to `1 + desc_words + num_free`, the External descriptor (`module`·`function`·`arity`, 3 words) has its `arity` word proven to survive a copy (`fun_true_arity`), and the descriptor words are proven opaque (a descriptor aliasing a from-space pointer must NOT be followed)
 - `tests/heap_sizing.rs` → the growth/shrink policy + `fullsweep_after` counter + `HeapInfo` derivation + the system-`erl` oracle cross-check
 - `tests/gc_pressure.rs` / `tests/gc_pressure_structures.rs` / `tests/gc_pressure_offheap.rs` → threshold pressure, HAMT promotion, shared/cyclic graphs, dead refc binaries, fun-env refc binaries (through both strategies)
 - `tests/immix_workloads.rs` → the multi-workload copying-vs-Immix measurement (Design Decisions §Measured)

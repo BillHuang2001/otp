@@ -1043,14 +1043,25 @@ fn create_builds_a_zero_field_record() {
 
 #[test]
 #[allow(unsafe_code)]
-fn create_stores_the_computed_definition_hash_observable_via_phash2() {
-    // The definition's cached hash is `make_hash2({module,name,is_exported,keys})`
-    // (`beam_file.c:1240-1256`), and it is *observable*: `erlang:phash2/1` of a
-    // record mixes definition word 2 (`beam_term::hashing::make_hash2`). So the
-    // stored word must be the bit-exact computed hash — never the `write_record`
-    // placeholder the block is first laid out with.
+fn phash2_of_a_record_depends_on_its_definition_not_the_stored_word() {
+    // The record contract for `make_hash2`/`make_hash`
+    // (`beam_term/src/hashing/make_hash2.rs`, the `RECORD_SUBTAG` arm, and its
+    // `compute_record_definition_hash`): a record is hashed from a hash of its
+    // definition's *content* —
+    // `compute_record_definition_hash(def) == make_hash2({module, name, is_exported,
+    // keys-in-declaration-order})` — and NOT from definition word 2 (the C reads the
+    // cache there, `erl_term_hashing.c:1093-1096`; this tree's `record::write_record`
+    // can only store a caller-supplied placeholder, so the value is computed instead
+    // of read). Two consequences are asserted here:
+    //
+    // 1. the create form stores the bit-exact computed hash (never the `0` placeholder
+    //    the block is first laid out with), and
+    // 2. hashing does not depend on that stored word — it depends on the definition
+    //    (same definition ⇒ same hash whatever the stored word; different definition
+    //    ⇒ different hash).
     let mut module = load(RECORDS_FIXTURE_BEAM);
     let mixed = module.atom_table.intern("mixed");
+    let other = module.atom_table.intern("mixed_other");
     let b = module.atom_table.intern("b");
     let exported = module
         .record_by_name("mixed")
@@ -1068,6 +1079,7 @@ fn create_stores_the_computed_definition_hash_observable_via_phash2() {
     let (result, _) = run_create(&module, entry, &[], &mut ctx);
     let record = result.expect("creating #mixed{b = 42}");
 
+    // (1) The stored definition word is the bit-exact computed hash.
     // SAFETY: `record` is a live native-record term built by the engine.
     let definition = unsafe { beam_term::record_definition(record) }.expect("a definition");
     // SAFETY: `definition` is the record's own (live) definition block.
@@ -1083,8 +1095,8 @@ fn create_stores_the_computed_definition_hash_observable_via_phash2() {
             .expect("the definition hash");
     assert_eq!(stored, i64::from(computed));
 
-    // Build the *same* record with a `0` placeholder hash and show `phash2` of the
-    // two records differs: the stored value is not internal bookkeeping.
+    // The created record's field values in declaration order, so an independently
+    // written block can reproduce the *same* definition content.
     let fields = module
         .record_by_name("mixed")
         .expect("`mixed` is defined")
@@ -1099,6 +1111,9 @@ fn create_stores_the_computed_definition_hash_observable_via_phash2() {
             )
         })
         .collect();
+
+    // (2a) The SAME definition written with a `0` placeholder hash: the two records
+    // hash identically because the stored word is not an input.
     let hp = ctx
         .alloc_words(beam_term::record_block_words(pairs.len()))
         .expect("arena words");
@@ -1107,11 +1122,54 @@ fn create_stores_the_computed_definition_hash_observable_via_phash2() {
     let placeholder =
         unsafe { beam_term::write_record(hp, module.name, mixed, exported, &pairs, make_small(0)) }
             .expect("the placeholder block");
-    assert_ne!(
+    // SAFETY: `placeholder` is a live native-record term (its own definition block).
+    let placeholder_def =
+        unsafe { beam_term::record_definition(placeholder) }.expect("a definition");
+    // SAFETY: `placeholder_def` is the placeholder record's own definition block.
+    let placeholder_word =
+        unsafe { beam_term::record_definition_hash(placeholder_def) }.expect("the hash word");
+    assert_eq!(
+        beam_term::signed_value(placeholder_word),
+        0,
+        "the two records must really carry different stored hash words"
+    );
+    assert_eq!(
         beam_term::hashing::make_hash2(record, &module.atom_table).expect("phash2 of the record"),
         beam_term::hashing::make_hash2(placeholder, &module.atom_table)
             .expect("phash2 of the placeholder"),
-        "the definition hash word must change `phash2/1` of the record"
+        "the stored definition-hash word must not change `phash2/1` of the record"
+    );
+    assert_eq!(
+        beam_term::hashing::make_hash(record, &module.atom_table).expect("phash of the record"),
+        beam_term::hashing::make_hash(placeholder, &module.atom_table)
+            .expect("phash of the placeholder"),
+        "the stored definition-hash word must not change `phash/1` of the record"
+    );
+
+    // (2b) A DIFFERENT definition (a different record `name`, the same field values)
+    // must hash differently — the hash genuinely follows the definition, so (2a) is
+    // not vacuous. Its stored word is a *stale non-zero* value from the other
+    // definition, which hashing must ignore as well.
+    let hp_other = ctx
+        .alloc_words(beam_term::record_block_words(pairs.len()))
+        .expect("arena words");
+    // SAFETY: `hp_other` owns `record_block_words(n)` exclusively-owned words and
+    // `pairs` stays live in `ctx`.
+    let other_record = unsafe {
+        beam_term::write_record(hp_other, module.name, other, exported, &pairs, make_small(stored))
+    }
+    .expect("the other-definition block");
+    assert_ne!(
+        beam_term::hashing::make_hash2(record, &module.atom_table).expect("phash2 of the record"),
+        beam_term::hashing::make_hash2(other_record, &module.atom_table)
+            .expect("phash2 of the other definition"),
+        "a record with a different definition must hash differently"
+    );
+    assert_ne!(
+        beam_term::hashing::make_hash(record, &module.atom_table).expect("phash of the record"),
+        beam_term::hashing::make_hash(other_record, &module.atom_table)
+            .expect("phash of the other definition"),
+        "a record with a different definition must hash differently"
     );
 }
 

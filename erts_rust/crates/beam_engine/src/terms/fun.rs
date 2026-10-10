@@ -222,6 +222,22 @@ pub fn fun_index(t: Eterm) -> Result<u32> {
     unsafe { beam_term::fun::fun_index(t) }.map_err(BeamError::from)
 }
 
+/// The **true** arity of a fun term; a non-fun yields [`BeamError::BadArg`].
+///
+/// Forwarded to [`beam_term::fun::fun_true_arity`] (the layout owner). For a
+/// [`FunKind::External`](beam_term::fun::FunKind::External) fun the header field
+/// read by [`fun_arity`] saturates at 255 (`arity & FUN_MAX_FIELD`), while this
+/// returns the **real** arity from descriptor word 3 — what an ETF encoder or a
+/// `fun_info`-style renderer must use. A
+/// [`FunKind::Local`](beam_term::fun::FunKind::Local)/
+/// [`FunKind::Imported`](beam_term::fun::FunKind::Imported) fun carries no
+/// out-of-band copy, so those two kinds fall back to the header field.
+pub fn fun_true_arity(t: Eterm) -> Result<usize> {
+    // SAFETY: `t` must be a live fun term (the caller's contract); `fun_true_arity`
+    // re-checks that `t` is a boxed fun before reading descriptor word 3.
+    unsafe { beam_term::fun::fun_true_arity(t) }.map_err(BeamError::from)
+}
+
 /// The free variables of a fun term, in `env` order; a non-fun yields
 /// [`BeamError::BadArg`].
 ///

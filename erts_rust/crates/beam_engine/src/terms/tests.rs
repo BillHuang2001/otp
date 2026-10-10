@@ -31,7 +31,7 @@ use super::test_support::{
     badmatch_reason, make_cons, make_flatmap, make_float, make_fun, make_heap_binary,
     make_integer, make_list, make_tuple,
 };
-use crate::context::MinimalContext;
+use crate::context::{ExecutionContext, MinimalContext};
 use crate::machine::Machine;
 use beam_common::{BeamError, Result};
 use beam_loader::Module;
@@ -534,6 +534,34 @@ fn fun_fields_over_255_are_a_system_limit() {
     assert!(make_fun(&mut c, 256, 1, 1, &[]).is_err());
     let free = vec![make_small(0); 256];
     assert!(make_fun(&mut c, 1, 1, 1, &free).is_err());
+}
+
+#[test]
+fn fun_true_arity_reads_the_external_descriptor_over_255() {
+    // An external (`EXPORT_EXT`) fun whose true arity exceeds the header's 8-bit
+    // field: the header field `fun_arity` (C's `fun_info(F, arity)`) saturates at
+    // 255 — oracle-exact, not a bug — while the true arity an encoder must emit
+    // lives in descriptor word 3.
+    let mut c = ctx();
+    let mut atoms = beam_term::AtomTable::new();
+    let module = atoms.intern("module");
+    let function = atoms.intern("function");
+    let hp = c
+        .alloc_words(beam_term::fun::fun_words(
+            beam_term::fun::FunKind::External,
+            0,
+        ))
+        .unwrap();
+    // SAFETY: `hp` addresses exactly `fun_words(External, 0) == 4`
+    // exclusively-owned words, which `write_fun_external` writes in full.
+    let fun = unsafe { beam_term::fun::write_fun_external(hp, 300, module, function) }.unwrap();
+    assert!(is_fun(fun));
+    assert_eq!(fun_true_arity(fun).unwrap(), 300);
+    assert_eq!(fun_arity(fun).unwrap(), 300 & 0xFF);
+    assert_eq!(fun_num_free(fun).unwrap(), 0);
+    // Non-funs are rejected, never misread as a fun.
+    assert_bad_arg(fun_true_arity(NIL));
+    assert_bad_arg(fun_true_arity(make_small(1)));
 }
 
 // -- integers ----------------------------------------------------------

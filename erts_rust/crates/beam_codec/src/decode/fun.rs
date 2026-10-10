@@ -35,7 +35,7 @@ use beam_common::Result;
 use beam_term::prelude::{atom_val, is_small, signed_value, FunPid, MAX_ARG};
 use beam_term::{AtomTable, Eterm};
 
-use crate::error::{bad_arg, system_limit};
+use crate::error::bad_arg;
 use crate::tag::Tag;
 
 use super::Decoder;
@@ -52,32 +52,19 @@ impl<'a> Decoder<'a> {
     /// environment — the inlined-descriptor replacement for the C `Export`
     /// (`num_free == 0`).
     ///
-    /// # Documented capability gap — `arity > MAX_ARG` (255)
-    ///
-    /// The oracle **accepts** an `EXPORT_EXT` whose arity exceeds the 8-bit fun
-    /// header field, because in C the true arity never lives in the term: the fun
-    /// it produces is the shared `Export` lambda, built by `create_shared_lambda`
-    /// (`export.c:46-58`) with `MAKE_FUN_HEADER(export->info.mfa.arity, 0, 1)` —
-    /// where the *header* field is 8 bits, so `fun_arity/1` masks it
-    /// (`erl_fun.h:92-93`) and `fun_info(F, arity)` reports `arity & 0xFF`
-    /// (verified against erts-17.1: 256 ⇒ `{arity,0}`, 257 ⇒ 1, 511 ⇒ 255,
-    /// 512 ⇒ 0, 65535 ⇒ 255, 65536 ⇒ 0), while the *encoder* reads the full arity
-    /// back out of the `Export` table (`external.c:5038`) and therefore re-encodes
-    /// `256` unharmed.
-    ///
-    /// This tree inlines the descriptor into the term instead
-    /// (`beam_term::fun::write_fun_external`: `External` = `[header, module,
-    /// function]`, 3 words) and has no `Export` table, so the header's 8-bit field
-    /// is the only place the arity can live. Masking it would silently drop the
-    /// true arity and mis-encode every later `term_to_binary/1` of the term — the
-    /// crate's rule is *never silently truncate or mis-encode* — so the image is
-    /// reported as an unsupported length with a typed `BeamError::SystemLimit`
-    /// (the same "arity bound" error the layout's `make_fun_header` yields, and
-    /// the class `src/error.rs` documents for a hard arity bound) rather than
-    /// materialized as a lossy fun. Closing this gap needs a `beam_term` layout
-    /// change; see the crate `CONTEXT.md` §Known Issues and
-    /// `tests/ref_ext_zero_and_arity.rs`, which pins both the oracle's behaviour
-    /// and this rejection.
+    /// **The arity is not bounded by the 8-bit fun-header field.** In C the true
+    /// arity never lives in the term: the fun is the shared `Export` lambda built by
+    /// `create_shared_lambda` (`export.c:46-58`), whose header field is 8 bits — so
+    /// `fun_arity/1` masks it (`erl_fun.h:92-93`) and `fun_info(F, arity)` reports
+    /// `arity & 0xFF` (verified against erts-17.1: 256 ⇒ `{arity,0}`, 257 ⇒ 1,
+    /// 511 ⇒ 255, 512 ⇒ 0) — while the *encoder* reads the full arity back out of
+    /// the `Export` table (`external.c:5038`) and re-encodes it unharmed. This tree
+    /// inlines the `Export`'s `info.mfa.arity` into descriptor word 3
+    /// ([`beam_term::fun::write_fun_external`]: `External` = `[header, module,
+    /// function, arity]`, 4 words), so [`crate::term::fun_true_arity_term`] reports
+    /// the true value the encoder emits while [`crate::term::fun_arity_term`] keeps
+    /// the header mask — the same split as the oracle. Every non-negative arity is
+    /// therefore materialized faithfully: there is no `SystemLimit` on this path.
     pub(super) fn decode_export(&mut self, heap: &mut Heap, atoms: &mut AtomTable) -> Result<Eterm> {
         let module = self.decode_node_atom(heap, atoms)?;
         let function = self.decode_node_atom(heap, atoms)?;
@@ -90,11 +77,6 @@ impl<'a> Decoder<'a> {
         let Ok(arity) = usize::try_from(signed_value(arity)) else {
             return Err(bad_arg());
         };
-        if arity > MAX_ARG {
-            // See the capability-gap note above: the arity has no 9th bit to live
-            // in, and a masked arity would be silently mis-encoded on the way out.
-            return Err(system_limit());
-        }
         crate::term::make_fun_external(heap, arity, atom_val(module), atom_val(function))
     }
 
@@ -227,11 +209,13 @@ mod tests {
     use super::*;
     use beam_term::prelude::make_small;
 
-    use crate::decode::tests::{assert_bad_arg, assert_system_limit, decode};
+    use crate::decode::tests::{assert_bad_arg, decode};
+    use crate::encode::encode_term;
     use crate::tag::{EXPORT_EXT, NEW_FUN_EXT};
     use crate::term::{
         fun_arity_term, fun_creator_pid, fun_env, fun_function, fun_index, fun_kind_term,
-        fun_module, fun_num_free_term, fun_old_index, fun_old_uniq, fun_uniq_bytes, FunKind,
+        fun_module, fun_num_free_term, fun_old_index, fun_old_uniq, fun_true_arity_term,
+        fun_uniq_bytes, FunKind,
     };
 
     /// `EXPORT_EXT`: `[module atom][function atom][arity term]`.
@@ -271,30 +255,31 @@ mod tests {
 
         // A module/function field that is not an atom is malformed.
         assert_bad_arg(&[131, EXPORT_EXT, 97, 1, 119, 1, b'f', 97, 0]);
-        // An arity past the 8-bit header field is a **documented capability gap**,
-        // not a malformed image: the oracle *accepts* it and keeps the true arity
-        // out-of-band in its `Export` table, while our inlined `External` descriptor
-        // (3 words) has only the header's 8-bit field to hold it — see the
-        // capability-gap note on `decode_export`. We reject with a typed
-        // `SystemLimit` rather than silently masking the arity. Both sides of that
-        // divergence are cross-checked against the live oracle in
-        // `tests/ref_ext_zero_and_arity.rs`.
-        for arity in [256u32, 257, 511, 512, 65_535, 65_536, 0x00ff_ffff] {
-            let mut over = vec![131, EXPORT_EXT];
-            over.extend_from_slice(&[119, 1, b'm']);
-            over.extend_from_slice(&[119, 1, b'f']);
-            over.push(98); // INTEGER_EXT
-            over.extend_from_slice(&arity.to_be_bytes());
-            assert_system_limit(&over);
+        // An arity past the 8-bit header field decodes faithfully: `fun_arity_term`
+        // reports the header mask (`arity & 0xFF`) while `fun_true_arity_term` keeps
+        // the true value, exactly as the oracle splits `fun_info(F, arity)` from
+        // `term_to_binary(F)`. The re-encode uses the true arity, so the image is a
+        // fixed point (the width tag follows the same rule the C encoder uses:
+        // `SMALL_INTEGER_EXT` below 256, else `INTEGER_EXT`).
+        for arity in [255u32, 256, 257, 511, 512, 65_535, 65_536, 0x00ff_ffff] {
+            let mut image = vec![131, EXPORT_EXT];
+            image.extend_from_slice(&[119, 1, b'm']);
+            image.extend_from_slice(&[119, 1, b'f']);
+            if arity < 256 {
+                image.extend_from_slice(&[97, arity as u8]); // SMALL_INTEGER_EXT
+            } else {
+                image.push(98); // INTEGER_EXT
+                image.extend_from_slice(&arity.to_be_bytes());
+            }
+            let (_h, atoms, term) = decode(&image);
+            assert_eq!(fun_arity_term(term).unwrap(), (arity & 0xFF) as usize);
+            assert_eq!(fun_true_arity_term(term).unwrap(), arity as usize);
+            assert_eq!(
+                encode_term(term, &atoms).unwrap(),
+                image,
+                "EXPORT_EXT arity {arity} re-encodes byte-exactly"
+            );
         }
-        // ... while the arity at the field's ceiling still decodes.
-        let mut ceiling = vec![131, EXPORT_EXT];
-        ceiling.extend_from_slice(&[119, 1, b'm']);
-        ceiling.extend_from_slice(&[119, 1, b'f']);
-        ceiling.push(98); // INTEGER_EXT
-        ceiling.extend_from_slice(&255u32.to_be_bytes());
-        let (_h, _atoms, max_fun) = decode(&ceiling);
-        assert_eq!(fun_arity_term(max_fun).unwrap(), 255);
     }
 
     /// `NEW_FUN_EXT`: the full six-field header, the creator pid and the env.
