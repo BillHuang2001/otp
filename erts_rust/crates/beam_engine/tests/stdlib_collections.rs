@@ -210,21 +210,15 @@ fn calendar_seconds_convert_to_datetime_and_time() {
     assert_term(&host, back, expected_time);
 }
 
-/// The `calendar` exports that stop at the **test host's BIF floor** rather than
-/// the engine: `time_to_seconds/1`'s compiled guard is `bif is_integer/3` (the
-/// `is_integer(H, 0, 23)` **range** guard), and the host floor serves only the
-/// `is_integer/1` form — so the whole call is the typed `badarg` the floor
-/// answers a missing `erlang:` BIF with, never a wrong value.
+/// The `calendar` second-based *forward* conversions, whose compiled guard is the
+/// range-guard BIF `erlang:is_integer/3` (`is_integer(H, 0, 23)`):
+/// `time_to_seconds/1` and `datetime_to_gregorian_seconds/1` (which folds in
+/// `86400 * date_to_gregorian_days(Date) + time_to_seconds(Time)`).
 ///
-/// `datetime_to_gregorian_seconds/1` is `86400 * date_to_gregorian_days(Date) +
-/// time_to_seconds(Time)`, so it inherits the same gap.
-///
-/// Owner: the `beam_bifs`/host-floor `erlang:is_integer/3` BIF (the assertions
-/// here pin the *typed* error so a later regression that turns it into a wrong
-/// result is caught, mirroring
-/// `tests/apps_lists.rs::blocked_targets_report_their_typed_error`).
+/// The host floor (`support/bifs.rs`) serves that range guard, so both run end to
+/// end; the values are the live oracle's.
 #[test]
-fn calendar_range_guard_targets_report_their_typed_error() {
+fn calendar_range_guard_targets_compute_seconds() {
     if skip_if_unavailable() {
         return;
     }
@@ -233,34 +227,20 @@ fn calendar_range_guard_targets_report_their_typed_error() {
     // oracle: erl -noshell -eval 'io:format("~w~n",[calendar:time_to_seconds({1,2,3})]),halt().'
     //         => 3723
     let t = time(&mut host, 1, 2, 3);
-    let err = host
+    let seconds = host
         .call("calendar", "time_to_seconds", &[t])
-        .expect_err("`calendar:time_to_seconds/1` needs the `erlang:is_integer/3` range guard");
-    println!(
-        "HOST GAP: calendar:time_to_seconds/1 — needs the host floor BIF \
-         `erlang:is_integer/3`: {err:?}"
-    );
-    assert!(
-        matches!(err, beam_common::BeamError::BadArg),
-        "unexpected `calendar:time_to_seconds/1` typed error: {err:?}"
-    );
+        .expect("calendar:time_to_seconds/1 must run");
+    assert_small(&host, seconds, 3723);
 
     // oracle: erl -noshell -eval 'io:format("~w~n",[calendar:datetime_to_gregorian_seconds({{2000,1,1},{0,0,0}})]),halt().'
     //         => 63113904000
     let day = date(&mut host, 2000, 1, 1);
     let midnight = time(&mut host, 0, 0, 0);
     let datetime = term_tuple(&mut host, &[day, midnight]);
-    let err = host
+    let secs = host
         .call("calendar", "datetime_to_gregorian_seconds", &[datetime])
-        .expect_err("`calendar:datetime_to_gregorian_seconds/1` calls `time_to_seconds/1`");
-    println!(
-        "HOST GAP: calendar:datetime_to_gregorian_seconds/1 — needs the host floor BIF \
-         `erlang:is_integer/3`: {err:?}"
-    );
-    assert!(
-        matches!(err, beam_common::BeamError::BadArg),
-        "unexpected `calendar:datetime_to_gregorian_seconds/1` typed error: {err:?}"
-    );
+        .expect("calendar:datetime_to_gregorian_seconds/1 must run");
+    assert_small(&host, secs, 63113904000);
 }
 
 // ---------------------------------------------------------------------------
