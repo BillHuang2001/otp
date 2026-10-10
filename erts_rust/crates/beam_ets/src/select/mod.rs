@@ -31,7 +31,7 @@
 //!
 //! * **Head patterns** ([`Pattern`]): arbitrary terms — `'_'` (wildcard),
 //!   literals (compared with exact `=:=` — `beam_term::compare::eq`), nested
-//!   tuples and (proper or improper) lists, and `'$N'` variables. A repeated
+//!   tuples, (proper or improper) lists and maps, and `'$N'` variables. A repeated
 //!   `'$N'` requires the two elements to be equal (the C emits `matchCmp` for an
 //!   already-bound variable). `'$_'`/`'$$'` in a head are **ordinary literal
 //!   atoms** compared with exact `=:=` — they are special only in a *body* (the C
@@ -52,7 +52,11 @@
 //!   (`== /= < =< > >= =:= =/=`), the type tests (`is_atom is_integer is_float
 //!   is_number is_tuple is_list is_binary is_bitstring is_map is_pid is_port
 //!   is_reference is_function is_boolean`) and the guard BIFs `element/2`,
-//!   `abs/1`, `size/1`, `hd/1`, `tl/1`, `length/1`, `self/0`. Any other call is
+//!   `abs/1`, `ceil/1`, `floor/1`, `max/2`, `min/2`, `node/0`, `node/1`,
+//!   `round/1`, `trunc/1`, `float/1`, `size/1`, `hd/1`, `tl/1`, `length/1`,
+//!   `map_size/1`, `map_get/2`, `is_map_key/2`, `tuple_size/1`, `byte_size/1`,
+//!   `bit_size/1`, `binary_part/2,3`, `is_record/3`, `is_function/2`,
+//!   `is_integer/3`, `xor/2`, `bnot/1`, `self/0`. Any other call is
 //!   rejected by [`compile`] with `badarg` (an honest subset — never silently
 //!   ignored). Comparison uses `beam_term::compare` (`cmp` for the exact
 //!   operators, `cmp_arith` for `==`/`/=`/`<`/`=<`/`>`/`>=`), never a local
@@ -81,9 +85,13 @@
 //!
 //! # Known gaps
 //!
-//! * **Map patterns in a head** are compared as literals (a map containing a
-//!   wildcard/variable therefore under-matches). Maps as expressions are
-//!   rejected with `badarg`.
+//! * **Map patterns in a head** keep their **keys literal** and match their
+//!   **values** structurally, exactly like tuple elements: `#{x => '_'}` matches
+//!   any value for key `x` and `#{x => '$2'}` binds it. A **non-literal** key (a
+//!   `'$N'` variable or `'_'`) makes the whole spec `badarg` at compile time, at
+//!   every nesting depth (the C "Variable found in map key."/"Underscore found in
+//!   map key."). A map literal in a *guard*/*body* is **constructed** (see the
+//!   guards/bodies bullets above).
 //! * `self/0` has no process identity at the ETS layer and raises, so a guard
 //!   using it never matches (the clause is skipped).
 //! * `abs/1` accepts small integers only (bignums/floats raise).

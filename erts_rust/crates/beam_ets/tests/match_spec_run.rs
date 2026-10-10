@@ -1226,6 +1226,59 @@ fn documented_gaps_diverge_from_the_oracle_in_a_run() {
     );
 }
 
+/// A head map's **keys** stay literal (a variable/`'_'` key is `badarg`), while its
+/// **values** are element patterns matched structurally.
+#[test]
+fn a_head_map_binds_literal_keys_and_pattern_values() {
+    // oracle (OTP 29 / erts-17.1), input [{1,#{x=>1}},{2,#{x=>2}},{3,#{y=>3}}]:
+    //   match_spec_run([[{1,#{x=>1}},…]], compile([{{'$1',#{x => '$2'}},[],['$2']}])) -> [1,2]
+    //   match_spec_run(…, compile([{{'$1',#{x => '_'}},[],['$1']}]))                      -> [1,2]
+    //   match_spec_run(…, compile([{{'$1',#{'$2' => '_'}},[],['$1']}]))          -> error:badarg
+    //   match_spec_run(…, compile([{{'$1',#{'_'  => '_'}},[],['$1']}]))          -> error:badarg
+    let atoms = atoms();
+    let mut heap = Heap::new(16384).expect("test heap");
+    let m1 = flat_map(&mut heap, &[(at(&atoms, "x"), make_small(1))], &atoms);
+    let m2 = flat_map(&mut heap, &[(at(&atoms, "x"), make_small(2))], &atoms);
+    let m3 = flat_map(&mut heap, &[(at(&atoms, "y"), make_small(3))], &atoms);
+    let o1 = tup(&mut heap, &[make_small(1), m1]);
+    let o2 = tup(&mut heap, &[make_small(2), m2]);
+    let o3 = tup(&mut heap, &[make_small(3), m3]);
+    let input = list(&mut heap, &[o1, o2, o3]);
+
+    // A literal key with a variable value: the value is bound and returned.
+    let map = flat_map(&mut heap, &[(at(&atoms, "x"), at(&atoms, "$2"))], &atoms);
+    let head = tup(&mut heap, &[at(&atoms, "$1"), map]);
+    let got = run_one(input, head, &[], &[at(&atoms, "$2")], &atoms, &mut heap).unwrap();
+    assert_terms_eq(&got, &[make_small(1), make_small(2)], &atoms);
+
+    // A literal key with a wildcard value: matches any value for that key.
+    let map = flat_map(&mut heap, &[(at(&atoms, "x"), at(&atoms, "_"))], &atoms);
+    let head = tup(&mut heap, &[at(&atoms, "$1"), map]);
+    let got = run_one(input, head, &[], &[at(&atoms, "$1")], &atoms, &mut heap).unwrap();
+    assert_terms_eq(&got, &[make_small(1), make_small(2)], &atoms);
+
+    // A variable map key is badarg.
+    let map = flat_map(&mut heap, &[(at(&atoms, "$2"), at(&atoms, "_"))], &atoms);
+    let head = tup(&mut heap, &[at(&atoms, "$1"), map]);
+    assert!(
+        matches!(
+            run_one(input, head, &[], &[at(&atoms, "$1")], &atoms, &mut heap),
+            Err(BeamError::BadArg)
+        ),
+        "a variable map key is badarg"
+    );
+
+    // An underscore map key is badarg.
+    let map = flat_map(&mut heap, &[(at(&atoms, "_"), at(&atoms, "_"))], &atoms);
+    let head = tup(&mut heap, &[at(&atoms, "$1"), map]);
+    assert!(
+        matches!(
+            run_one(input, head, &[], &[at(&atoms, "$1")], &atoms, &mut heap),
+            Err(BeamError::BadArg)
+        ),
+        "an underscore map key is badarg"
+    );
+}
 // ===========================================================================
 // The guard-error classification over `ets:match_spec_run/2`
 //

@@ -43,7 +43,8 @@ use beam_ets::select::expr::set_arith_hook;
 fn atoms() -> AtomTable {
     let mut atoms = AtomTable::new();
     for name in [
-        "_", "$_", "$$", "$0", "$x", "$1", "$2", "$3", "true", "false", "ok", "x", "a", "b", "c",
+        "_", "$_", "$$", "$0", "$x", "$1", "$2", "$3", "true", "false", "ok", "x", "y", "a", "b",
+        "c",
         "element", "abs", "size", "hd", "tl", "length", "self", "andalso", "orelse", "not", "and",
         "or", "const", "is_integer", "is_atom", "is_boolean", "is_list", "is_number",
         "is_tuple", "is_float", "is_map", "is_pid", "is_port", "is_reference", "is_function",
@@ -2115,25 +2116,96 @@ fn nested_repeated_variable_enforces_equality_both_ways() {
 }
 
 #[test]
-fn a_map_head_pattern_compares_as_an_exact_literal() {
-    // oracle: T = [{1,#{a=>1}},{2,#{a=>2}}]; head `{'_',#{a=>1}}` -> `[{1,#{a=>1}}]`
-    // (a map with *no* wildcard/variable in the head is a plain exact literal here).
+fn a_map_head_pattern_matches_keys_literally_and_values_structurally() {
+    // oracle (OTP 29 / erts-17.1), T = [{1,#{x=>1}},{2,#{x=>2}},{3,#{y=>3}},{4,#{}},{5,#{x=>5,y=>7}}]:
+    //   select [{{'$1',#{x => '$2'}},[],['$2']}]        -> [1,2,5]       (variable value is bound)
+    //   select [{{'$1',#{x => '_'}},[],['$1']}]         -> [1,2,5]       (wildcard value matches any)
+    //   select [{{'$1',#{x => 5}},[],['$1']}]           -> [5]           (exact value; extra key `y` is OK)
+    //   select [{{'$1',#{}},[],['$1']}]                 -> [1,2,3,4,5]   (the empty map matches everything)
+    //   select [{{'$1',#{x => '$2',y => '$3'}},[],['$1']}] -> [5]        (EVERY literal key must be present)
+    //   select [{{'$1',#{x => {'$2','$2'}}},[],['$2']}] -> []            (values match structurally)
+    // A head map's KEYS are literal; its VALUES are element patterns, exactly like a
+    // tuple's. This was probed against the system `erl`.
     let atoms = atoms();
-    let mut heap = Heap::new(8192).expect("test heap");
+    let mut heap = Heap::new(16384).expect("test heap");
     let mut table = new_table(TableKind::Set);
-    let one = flat_map(&mut heap, &[(at(&atoms, "a"), make_small(1))], &atoms);
-    let two = flat_map(&mut heap, &[(at(&atoms, "a"), make_small(2))], &atoms);
-    let object_one = tup(&mut heap, &[make_small(1), one]);
-    let object_two = tup(&mut heap, &[make_small(2), two]);
-    table.insert(object_one, &atoms).unwrap();
-    table.insert(object_two, &atoms).unwrap();
 
-    let pattern = flat_map(&mut heap, &[(at(&atoms, "a"), make_small(1))], &atoms);
-    let head = tup(&mut heap, &[at(&atoms, "_"), pattern]);
-    let got = select_one(&table, head, &[], &[at(&atoms, "$_")], &atoms, &mut heap).unwrap();
-    assert_terms(&got, &[object_one], &atoms, "an exact map head");
+    let mk = |heap: &mut Heap, key: i64, pairs: &[(Eterm, Eterm)]| {
+        let map = flat_map(heap, pairs, &atoms);
+        tup(heap, &[make_small(key), map])
+    };
+    let o1 = mk(&mut heap, 1, &[(at(&atoms, "x"), make_small(1))]);
+    let o2 = mk(&mut heap, 2, &[(at(&atoms, "x"), make_small(2))]);
+    let o3 = mk(&mut heap, 3, &[(at(&atoms, "y"), make_small(3))]);
+    let o4 = mk(&mut heap, 4, &[]);
+    let o5 = mk(
+        &mut heap,
+        5,
+        &[(at(&atoms, "x"), make_small(5)), (at(&atoms, "y"), make_small(7))],
+    );
+    for obj in [o1, o2, o3, o4, o5] {
+        table.insert(obj, &atoms).unwrap();
+    }
+
+    // `#{x => '$2'}` — the value is bound and returned.
+    let map = flat_map(
+        &mut heap,
+        &[(at(&atoms, "x"), at(&atoms, "$2"))],
+        &atoms,
+    );
+    let head = tup(&mut heap, &[at(&atoms, "$1"), map]);
+    let got = select_one(&table, head, &[], &[at(&atoms, "$2")], &atoms, &mut heap).unwrap();
+    assert_eq!(small_ints(&got), vec![1, 2, 5], "a variable map value is bound");
+
+    // `#{x => '_'}` — a wildcard value matches any value for that key.
+    let map = flat_map(
+        &mut heap,
+        &[(at(&atoms, "x"), at(&atoms, "_"))],
+        &atoms,
+    );
+    let head = tup(&mut heap, &[at(&atoms, "$1"), map]);
+    let got = select_one(&table, head, &[], &[at(&atoms, "$1")], &atoms, &mut heap).unwrap();
+    assert_eq!(
+        small_ints(&got),
+        vec![1, 2, 5],
+        "a wildcard map value matches any value"
+    );
+
+    // `#{x => 5}` — an exact value; object 5 also carries the unrelated key `y`, which
+    // is allowed (the C `matchMap` only requires the head's keys to be present).
+    let map = flat_map(
+        &mut heap,
+        &[(at(&atoms, "x"), make_small(5))],
+        &atoms,
+    );
+    let head = tup(&mut heap, &[at(&atoms, "$1"), map]);
+    let got = select_one(&table, head, &[], &[at(&atoms, "$1")], &atoms, &mut heap).unwrap();
+    assert_eq!(small_ints(&got), vec![5], "an exact map value, extra key allowed");
+
+    // `#{}` — the empty map matches every map.
+    let map = flat_map(&mut heap, &[], &atoms);
+    let head = tup(&mut heap, &[at(&atoms, "$1"), map]);
+    let got = select_one(&table, head, &[], &[at(&atoms, "$1")], &atoms, &mut heap).unwrap();
+    assert_eq!(small_ints(&got), vec![1, 2, 3, 4, 5], "the empty map matches all");
+
+    // `#{x => '$2', y => '$3'}` — every literal key must be present (only object 5 has both).
+    let map = flat_map(
+        &mut heap,
+        &[(at(&atoms, "x"), at(&atoms, "$2")), (at(&atoms, "y"), at(&atoms, "$3"))],
+        &atoms,
+    );
+    let head = tup(&mut heap, &[at(&atoms, "$1"), map]);
+    let got = select_one(&table, head, &[], &[at(&atoms, "$1")], &atoms, &mut heap).unwrap();
+    assert_eq!(small_ints(&got), vec![5], "every literal key must be present");
+
+    // `#{x => {'$2','$2'}}` — the value is a structural 2-tuple with a repeated variable;
+    // no object's `x` is such a tuple, so nothing matches.
+    let value = tup(&mut heap, &[at(&atoms, "$2"), at(&atoms, "$2")]);
+    let map = flat_map(&mut heap, &[(at(&atoms, "x"), value)], &atoms);
+    let head = tup(&mut heap, &[at(&atoms, "$1"), map]);
+    let got = select_one(&table, head, &[], &[at(&atoms, "$2")], &atoms, &mut heap).unwrap();
+    assert!(got.is_empty(), "a structural map value pattern");
 }
-
 #[test]
 fn an_unbound_variable_in_a_guard_or_a_body_is_badarg() {
     // oracle: a `'$N'` the head does not bind makes the whole `ets:select/2` `badarg`,
@@ -2157,11 +2229,12 @@ fn an_unbound_variable_in_a_guard_or_a_body_is_badarg() {
     );
 }
 
-/// The three constructs below are **documented capability gaps** of this crate
+/// The constructs below are **documented capability gaps** of this crate
 /// (`src/select/mod.rs` "Known gaps"), each a typed outcome — never a wrong result.
-/// In every case the system `erl` (OTP 29 / erts-17.1) ACCEPTS the construct, so these
-/// are **recorded divergences**, not parity claims: this crate is strictly less
-/// capable here (reported to the source owner, not asserted as oracle behaviour).
+/// The map-*body* case is parity (both construct the map); the `self/0` case is a
+/// **recorded divergence** — the system `erl` (OTP 29 / erts-17.1) ACCEPTS the
+/// construct, so this crate is strictly less capable there (reported to the source
+/// owner, not asserted as oracle behaviour).
 #[test]
 fn documented_capability_gaps_are_typed_and_diverge_from_the_oracle() {
     let atoms = atoms();
@@ -2189,25 +2262,7 @@ fn documented_capability_gaps_are_typed_and_diverge_from_the_oracle() {
         );
     }
 
-    // 2. A wildcard inside a HEAD map under-matches here (the head map is a literal);
-    //    the oracle matches structurally (`#{a=>'_'}` matches `#{a=>1}` and `#{a=>2}`).
-    let mut map_table = new_table(TableKind::Set);
-    let one = flat_map(&mut heap, &[(at(&atoms, "a"), make_small(1))], &atoms);
-    let two = flat_map(&mut heap, &[(at(&atoms, "a"), make_small(2))], &atoms);
-    let object_one = tup(&mut heap, &[make_small(1), one]);
-    let object_two = tup(&mut heap, &[make_small(2), two]);
-    map_table.insert(object_one, &atoms).unwrap();
-    map_table.insert(object_two, &atoms).unwrap();
-    let wildcard_map = flat_map(&mut heap, &[(at(&atoms, "a"), at(&atoms, "_"))], &atoms);
-    let head = tup(&mut heap, &[at(&atoms, "_"), wildcard_map]);
-    let got = select_one(&map_table, head, &[], &[at(&atoms, "$_")], &atoms, &mut heap).unwrap();
-    assert!(
-        got.is_empty(),
-        "DIVERGENCE: the oracle matches a wildcard map head structurally; this crate \
-         compares the head map as an exact literal"
-    );
-
-    // 3. `self/0` has no process identity at the ETS layer, so it raises and its clause
+    // 2. `self/0` has no process identity at the ETS layer, so it raises and its clause
     //    is skipped; the oracle returns the pid (`{self} =:= {self}` matches).
     let self_call = call(&mut heap, at(&atoms, "self"), &[]);
     let guard = tup(
@@ -2221,6 +2276,56 @@ fn documented_capability_gaps_are_typed_and_diverge_from_the_oracle() {
     );
 }
 
+/// A head map's **key** must be literal: a variable or `'_'` key makes the whole spec
+/// `badarg` (the C `db_match_compile` "Variable found in map key."/"Underscore found in
+/// map key."), at every nesting depth.
+#[test]
+fn a_variable_or_underscore_in_a_map_head_key_is_badarg() {
+    // oracle (OTP 29 / erts-17.1):
+    //   select [{{'$1',#{'$2' => '$3'}},[],['$2']}]  -> error:badarg
+    //   select [{{'$1',#{'_'  => '$3'}},[],['$2']}]  -> error:badarg
+    //   select [{{{'$1',#{'$2' => '$3'}}},[],['$2']}] -> error:badarg (nested inside a tuple)
+    //   match_object(T, {'$1',#{'$2' => '_'}})        -> error:badarg
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let table = new_table(TableKind::Set);
+
+    // A variable key, top level.
+    let map = flat_map(&mut heap, &[(at(&atoms, "$2"), at(&atoms, "$3"))], &atoms);
+    let head = tup(&mut heap, &[at(&atoms, "$1"), map]);
+    let spec = spec1(&mut heap, head, &[], &[at(&atoms, "$2")]);
+    assert!(
+        matches!(compile(spec, &atoms), Err(BeamError::BadArg)),
+        "a variable map key is badarg"
+    );
+
+    // An underscore key, top level.
+    let map = flat_map(&mut heap, &[(at(&atoms, "_"), at(&atoms, "$3"))], &atoms);
+    let head = tup(&mut heap, &[at(&atoms, "$1"), map]);
+    let spec = spec1(&mut heap, head, &[], &[at(&atoms, "$2")]);
+    assert!(
+        matches!(compile(spec, &atoms), Err(BeamError::BadArg)),
+        "an underscore map key is badarg"
+    );
+
+    // A variable key nested inside a tuple (the recursion reaches it).
+    let inner = flat_map(&mut heap, &[(at(&atoms, "$2"), at(&atoms, "$3"))], &atoms);
+    let inner_tup = tup(&mut heap, &[at(&atoms, "$1"), inner]);
+    let head = tup(&mut heap, &[inner_tup]);
+    let spec = spec1(&mut heap, head, &[], &[make_small(1)]);
+    assert!(
+        matches!(compile(spec, &atoms), Err(BeamError::BadArg)),
+        "a nested variable map key is badarg"
+    );
+
+    // The `match_object/2` path compiles the same pattern, so it is badarg too.
+    let map = flat_map(&mut heap, &[(at(&atoms, "$2"), at(&atoms, "_"))], &atoms);
+    let pattern = tup(&mut heap, &[at(&atoms, "$1"), map]);
+    assert!(
+        matches!(table.match_object(pattern, &atoms, &mut heap), Err(BeamError::BadArg)),
+        "a variable map key is badarg through match_object"
+    );
+}
 // ===========================================================================
 // Traversal-order semantics for the FORWARD select family
 //

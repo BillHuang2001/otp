@@ -22,17 +22,27 @@
 //! table object against it.
 //!
 //! Mirrors the C `dmc_expr` head path (`erl_db_util.c`): `'_'` is a wildcard,
-//! `'$N'` binds (a repeated `'$N'` compares equal), tuples and cons cells recurse
-//! structurally, and **every other atom is an exact (`=:=`) literal** — including
-//! `'$_'`/`'$$'`, which are special only in a *body* (the C `dmc_one_term` emits
-//! `matchEq` for any atom that is not `'_'`/`'$N'`, `erl_db_util.c:4117-4121`).
+//! `'$N'` binds (a repeated `'$N'` compares equal), tuples, cons cells and **maps**
+//! recurse structurally, and **every other atom is an exact (`=:=`) literal** —
+//! including `'$_'`/`'$$'`, which are special only in a *body* (the C `dmc_one_term`
+//! emits `matchEq` for any atom that is not `'_'`/`'$N'`, `erl_db_util.c:4117-4121`).
+//!
+//! **Maps in a head pattern.** A head map's **keys stay literal** — a variable or
+//! `'_'` key makes the whole spec `badarg` at compile time (the C
+//! "Variable found in map key."/"Underscore found in map key."), at every nesting
+//! depth. The **values** are matched structurally, exactly like tuple elements: a
+//! wildcard/variable/literal value is compared as its element pattern, so
+//! `#{x => '_'}` matches any value for key `x` and `#{x => '$2'}` binds it.
+//! Probed against the system `erl` (see `tests/select.rs`).
 
 use std::collections::BTreeSet;
 
 use beam_common::Result;
 use beam_term::prelude::*;
 
+use super::expr::classify;
 use super::{atom_name, tuple_elements, var_index};
+use crate::error::badarg;
 
 /// One head pattern node.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +57,12 @@ pub enum Pattern {
     Literal(Eterm),
     /// A tuple pattern: matches a tuple of the same arity whose elements match.
     Tuple(Vec<Pattern>),
+    /// A map pattern: each entry is a **literal** key term plus the recursively
+    /// decoded **value** pattern. Matches a map that holds every key with a
+    /// matching value (extra keys in the object are allowed — the C `matchMap`
+    /// only requires `map_size(object) >= n`). A non-literal (variable/`'_'`) key
+    /// is rejected at compile time, so `decode` never produces one.
+    Map(Vec<(Eterm, Pattern)>),
     /// A cons pattern: matches a non-empty list whose head/tail match.
     Cons(Box<Pattern>, Box<Pattern>),
 }
@@ -83,9 +99,30 @@ pub(super) fn decode(term: Eterm, atoms: &AtomTable, vars: &mut BTreeSet<u32>) -
         let tail = Box::new(decode(tail_term, atoms, vars)?);
         return Ok(Pattern::Cons(head, tail));
     }
-    // Any other value (immediates, floats, bignums, maps, binrefs, …) is compared
-    // as an exact literal. (A head map containing wildcards/variables therefore
-    // under-matches — a documented gap.)
+    if classify(term) == TermClass::Map {
+        // A head map: keys stay literal, values recurse. Read the pairs through the
+        // shared `beam_term::map` primitive (never a local map reader).
+        let pairs = map_pairs(term, atoms).map_err(|_| badarg())?;
+        // The C `db_match_compile` rejects a variable/`'_'` key outright, so the
+        // check runs before any value is decoded — and, because `decode` recurses
+        // through tuples/lists/maps, it fires at every nesting depth.
+        for (key, _) in &pairs {
+            let is_key_variable = atom_name(*key, atoms)
+                .map(|name| var_index(name).is_some())
+                .unwrap_or(false);
+            let is_key_wildcard = matches!(atom_name(*key, atoms), Some("_"));
+            if is_key_variable || is_key_wildcard {
+                return Err(badarg());
+            }
+        }
+        let mut entries = Vec::with_capacity(pairs.len());
+        for (key, value) in pairs {
+            entries.push((key, decode(value, atoms, vars)?));
+        }
+        return Ok(Pattern::Map(entries));
+    }
+    // Any other value (immediates, floats, bignums, binrefs, …) is compared as an
+    // exact literal.
     Ok(Pattern::Literal(term))
 }
 
@@ -139,6 +176,26 @@ pub(super) fn matches(
             let (car_term, cdr_term) = unsafe { (car(object), cdr(object)) };
             matches(head, car_term, atoms, binds) && matches(tail, cdr_term, atoms, binds)
         }
+        Pattern::Map(entries) => {
+            if classify(object) != TermClass::Map {
+                return false;
+            }
+            // Every key must be present with a matching value; an absent key (`None`)
+            // or a non-map read (`Err`) is a non-match. Because all keys must be
+            // present, `map_size(object) >= entries.len()` is implied (the C
+            // `matchMap`'s explicit size check).
+            for (key, value_pattern) in entries {
+                match map_get(object, *key, atoms) {
+                    Ok(Some(value)) => {
+                        if !matches(value_pattern, value, atoms, binds) {
+                            return false;
+                        }
+                    }
+                    Ok(None) | Err(_) => return false,
+                }
+            }
+            true
+        }
     }
 }
 
@@ -158,6 +215,11 @@ pub(super) fn bound_vars(pattern: &Pattern, out: &mut BTreeSet<u32>) {
         Pattern::Cons(head, tail) => {
             bound_vars(head, out);
             bound_vars(tail, out);
+        }
+        Pattern::Map(entries) => {
+            for (_, value) in entries {
+                bound_vars(value, out);
+            }
         }
         Pattern::Wildcard | Pattern::Literal(_) => {}
     }
