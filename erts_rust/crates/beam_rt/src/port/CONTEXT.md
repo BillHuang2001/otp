@@ -96,6 +96,7 @@ The message itself is `RuntimeContext::signal_notify_message(name)` → `(from, 
 - `os:set_signal/2`'s notification is **dropped when no `erl_signal_server` is registered** — the C's own behaviour (`signal_notify_requested`, `sys.c:589-604` sends nothing when the process is absent), never an error. The `-eval` receive path (`poll_port_messages`) can only observe its own mailbox, so it drops a `PortEvent::Signal`; the scheduler path (`deliver_port_messages`) is the one that delivers it.
 
 ## Notes for Agents
+- The `RuntimePorts::port_control` doc comment (`../port.rs:1272-1274`) still claims the port-control BIF arm "does not exist" and calls the method uncalled-for; the arm **does** exist (`../native/port.rs`) and calls `PortRegistry::port_control` directly, so only the doc comment is stale (the `RuntimePorts::port_control` method itself is retained-but-uncalled — see the API Surface note).
 - The colocated signal tests share **one** `watch::test_guard()` lock so they serialize on the process-global signal dispositions.
 - Signal tests send with `Command::new("kill") -USR1 <pid>` on `std::process::id()` — **never** `libc::raise`, which would need `unsafe`. A test that calls `run_scheduled` must account for the port loop parking (the scheduler's quiescence predicate — `Runtime::is_nt` reads `PortRegistry::has_nothing_to_poll`; see `../runtime/CONTEXT.md`).
 
