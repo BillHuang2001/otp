@@ -152,10 +152,10 @@ An item this runtime cannot answer is **omitted** by `process_info/1` (the same 
 for an unregistered `registered_name`), so the list is a genuine, shorter-by-construction answer.
 
 #### Documented divergences (correct-but-different-by-construction — do NOT "fix" to a hardcoded figure)
-- **Count:** `/1` emits 15 (registered) / 14 (unregistered) items vs the oracle's 17 / 16 **for a
-  process with no readable execution position** — the `-eval` root process making its own call has
-  no engine, so `current_function`/`initial_call` are omitted (see the execution-position note). For
-  a process with a readable position the two are emitted and the count matches the oracle's.
+- **Count:** `/1` emits 15 (registered) / 14 (unregistered) items vs the oracle's 17 / 16 for a
+  process with no readable execution position (the `-eval` root making its own call has no engine,
+  so `current_function`/`initial_call` are omitted — see the execution-position note); with a
+  readable position the count matches the oracle's.
 - **`heap_size`** agrees with the oracle's 233 (the 233-word nursery), but **`total_heap_size`** is
   **466** (this collector pre-allocates a 233-word mature generation). The real figure is reported
   deliberately — inventing 233 would be a lie.
