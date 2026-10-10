@@ -53,7 +53,6 @@ Generated code also `#define`s `YCF_YIELD_CODE_GENERATED` and `YCF_IS_YIELDED`, 
 - **`lib/simple_c_gc/` no longer exists.** GC support was removed (deleted along with the `-use_gc` flag); `scripts/license-header.es` still lists the stale path `erts/lib_src/yielding_c_fun/lib/simple_c_gc/**` in its no-warning list, and `test/examples/sha256_erlang_nif/c_src/Makefile` still passes `-use_gc` (see that node's CONTEXT.md).
 - `-log_max_mem_usage` is only meaningful for the tool's own accounting; combined with the intentional leaking it reports peak, not freed, bytes.
 - `TODO` (in-tree) lists known gaps: automatic array-size/struct initialization, and warning on calls from positions YCF cannot handle.
-- `ycf_helpers.h` is dead code: no file `#include`s it and no Makefile/script/CI references it (the only in-tree mention is the prose line below). Its `ycf_alloc`/`ycf_free` bodies are duplicated inline in `test/examples/thread_example.c` (lines 23/28) and `doc/thread_tutorial.md` (lines 53/58), which define their own copies instead of including it. Its non-`static` `ycf_free(void*, void*)` would also collide (conflicting types / duplicate symbol) with the differently-signed `ycf_free(void*)` declared in `ycf_utils.h` and defined in `ycf_utils.c` if ever included into a live translation unit.
 - The `PRINT_LIST` macro in `ycf_lists.h` is never expanded anywhere (its only occurrence in the repo is its own `#define`); every other `ycf_lists.h` macro is used, either directly or inside `GENERATE_LIST_FUNCTIONS`.
 
 ## Notes for Agents
@@ -78,11 +77,11 @@ Generated code also `#define`s `YCF_YIELD_CODE_GENERATED` and `YCF_IS_YIELDED`, 
 
 ## Routing Table
 - `test/` → the entire regression suite: `test.sh` (bash driver, golden stdout `cmp`s) plus `examples/` corpus and the sha256 NIF demo → children have their own CONTEXT.md
-- `test/examples/` → 34 example `.c` programs + 30 golden `.c.out` stdout files, one feature each
+- `test/examples/` → 33 example `.c` programs + 30 golden `.c.out` stdout files, one feature each
 - `test/examples/sha256_erlang_nif/` → standalone rebar3 yielding-NIF demo (not run by `test.sh`)
 - `doc/thread_tutorial.md` → introductory tutorial (single file; the sample code is `test/examples/thread_example.c`)
 - `bin/` → tracked bash wrapper `bin/yielding_c_fun` (standalone-only) and, when built, the git-ignored compiler binary `bin/yielding_c_fun.bin` / `bin/$(TARGET)/yielding_c_fun`
-- Compiler sources: `ycf_main.c` (CLI/driver), `ycf_lexer.c`, `ycf_parser.c`/`.h`, `ycf_node.c`/`.h` (AST), `ycf_printers.c`/`.h` (code emission), `ycf_yield_fun.c`/`.h` (the transformation itself, the largest file), `ycf_symbol.c`/`.h`, `ycf_string.c`/`.h`, `ycf_utils.c`/`.h` (alloc/leak tracking), `ycf_lists.h` (list macros), `ycf_helpers.h` (standalone alloc/free helpers)
+- Compiler sources: `ycf_main.c` (CLI/driver), `ycf_lexer.c`, `ycf_parser.c`/`.h`, `ycf_node.c`/`.h` (AST), `ycf_printers.c`/`.h` (code emission), `ycf_yield_fun.c`/`.h` (the transformation itself, the largest file), `ycf_symbol.c`/`.h`, `ycf_string.c`/`.h`, `ycf_utils.c`/`.h` (alloc/leak tracking), `ycf_lists.h` (list macros)
 - Build: `main_target.mk` (shared rules, included by `../Makefile.in`), `GNUmakefile` (standalone + dev/test targets), `Makefile` (generated, non-GNU-make fallback), `.gitignore`
 - `TODO` → known feature gaps; `README.md` → authoritative CLI/language documentation
 

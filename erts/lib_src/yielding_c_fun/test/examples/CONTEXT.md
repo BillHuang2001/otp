@@ -54,7 +54,6 @@ Every entry is transformed with the CLI flags in the right-hand column (`yieldin
 | `test_only_output_yielding_funs.c` (+`.c.out`) | Transformed with `-static_aux_funs -only_yielding_funs -output_file_name tmp_dir/tmp.ycf.h`; compiles the **original** `.c` with `-I<test dir>/tmp_dir` and **hardcodes `#include "tmp.ycf.h"`** |
 | `test_only_output_yielding_funs_ptr_to_stack.c` (no `.out`) | Same `-only_yielding_funs` + `-debug`; the program must exit non-zero |
 | `ycf_cannot_transform_fun_call.c` (no `.out`) | Negative test: `yielding_c_fun -yield -f fun -f sub_fun2 -f sub_fun` must exit non-zero (untransformable call to a yieldable fun, e.g. inside a larger expression) |
-| `test_trap.c` (no `.out`) | Dead: referenced by nothing in `../test.sh`/`../GNUmakefile`. Old hand-written sample, and its `main()` calls `fun(1,&wb,1)` — the pre-generated-API signature; it would not build as-is today |
 
 ## Constraints
 - **`.c.out` files are byte-exact expected program stdout** compared with `cmp`; a trailing newline or a change in a `printf` breaks the test. Regenerate from a real run, never hand-edit.
@@ -75,7 +74,7 @@ Every entry is transformed with the CLI flags in the right-hand column (`yieldin
 
 ## Known Issues / Gotchas
 - Easy misreading: a `*.c.out` is **program stdout**, not generated/expected C source. `simple_yield.c.out` is literally `TRAPPED\nRETURNED 3\n`.
-- Files without a `.c.out`: `test_generated_header_file_code.c` (its test uses `test_generated_header_file_main.c.out`), `test_only_output_yielding_funs_ptr_to_stack.c`, `ycf_cannot_transform_fun_call.c` (negative test), `test_trap.c` (dead). Absence of a `.out` does not mean "untested" for the first three.
+- Files without a `.c.out`: `test_generated_header_file_code.c` (its test uses `test_generated_header_file_main.c.out`), `test_only_output_yielding_funs_ptr_to_stack.c`, `ycf_cannot_transform_fun_call.c` (negative test). Absence of a `.out` does not mean "untested" for the first three.
 - `debug_ptr_to_stack.c` is used twice with different expectations: the golden loop runs it **without** `-debug` (expects `TRAPPED\nRETURNED 1\n`), and a separate step runs it **with** `-debug -fnoauto fun` and requires a non-zero exit (the generated code detects the pointer-to-stack via `ycf_debug_get_stack_start()`). The same file must therefore define those `ycf_debug_*` symbols.
 - YCF's `-debug` mode only works on programs that provide `ycf_debug_get_stack_start()`/`ycf_debug_global_stack_top_ptr`; `multi_scope_yield.c` is also run with `-debug` (only to check that `-log_max_mem_usage` produces a file).
 - Some files here also define `YCF_CONSUME_REDS(X)`/`YCF_YIELD()` although only one of them is relevant to the flags used — harmless, the transform only reacts to the macros it is asked about.
