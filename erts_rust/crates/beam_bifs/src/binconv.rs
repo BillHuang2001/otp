@@ -151,16 +151,26 @@
 //!   above); `[deterministic]` is byte-exact when the term's maps are already in
 //!   atom-name order and reports `unsupported_bif` for any term whose maps would need
 //!   re-sorting. Neither ever returns a wrong image.
-//! * **Internal pid/port ids need a resolvable local node.** `self()` and an
-//!   internal port are 60-bit `Eterm` immediates carrying no node identity, so
-//!   `term_to_binary` writes them as the oracle's `NEW_PID_EXT` (`88`) /
-//!   `V4_PORT_EXT` (`120`) only when the context can name its local node — the
-//!   [`LocalNode`](crate::context::LocalNode) hook, else the M1 runtime's fixed
+//! * **Internal pid/port/ref ids need a resolvable local node, in both
+//!   directions.** `self()` and an internal port are 60-bit `Eterm` immediates
+//!   carrying no node identity, so `term_to_binary` writes them as the oracle's
+//!   `NEW_PID_EXT` (`88`) / `V4_PORT_EXT` (`120`) — and an internal reference as
+//!   `NEWER_REFERENCE_EXT` (`90`) — only when the context can name its local node:
+//!   the [`LocalNode`](crate::context::LocalNode) hook, else the M1 runtime's fixed
 //!   `nonode@nohost`/creation-0 identity when that atom is interned (see
 //!   [`BifContext::local_node`]). With no resolvable local node an internal id
 //!   stays the codec's `unsupported_external_term` error, never a wrong image.
-//!   A decoded `NEW_PID_EXT` stays an *external* id, so `binary_to_term` ∘
-//!   `term_to_binary` round-trips the wire term, not an internal pid.
+//!   The same identity is installed on the **decode** side, so a `NEW_PID_EXT` /
+//!   `V4_PORT_EXT` / reference whose node and creation name this node decodes to
+//!   the **internal** form (the oracle's `dec_is_this_node` branches) —
+//!   `binary_to_term(term_to_binary(self())) =:= self()`. With no identity the wire
+//!   form (an external id) is produced, byte-for-byte as before. One limit follows
+//!   from the M1 internal-reference substitution: its id is a single 60-bit small
+//!   (`beam_term`'s frozen 4-word block), so a wire reference whose numbers pack past
+//!   60 bits — every real `make_ref()` image — is the typed `SystemLimit` rather than a
+//!   truncated id (`beam_codec::ref_wire`'s module doc; the C's `ErtsORefThing` holds
+//!   3+ 32-bit numbers, which this representation does not model). The unit test
+//!   `the_oracle_reference_image_is_a_typed_id_width_gap` pins it.
 //! * **`integer_to_binary/1,2` and `binary_to_integer/1,2` promote to bignums.**
 //!   A value outside the 60-bit small range becomes an arbitrary-precision bignum
 //!   exactly as the oracle's does; only a magnitude past the bignum limb bound is
@@ -196,7 +206,10 @@
 //! [`crate::context`] documents for the hook.
 
 use beam_codec::compress::compress as zlib_compress;
-use beam_codec::{decode_term, Decoder, Encoder, MinorVersion, COMPRESSED_EXT, VERSION_MAGIC};
+use beam_codec::{
+    decode_term, decode_term_with_local_node, Decoder, Encoder, MinorVersion, COMPRESSED_EXT,
+    VERSION_MAGIC,
+};
 use beam_common::Result;
 use beam_term::{atom_val, signed_value, Atom, AtomTable, Eterm};
 
@@ -1049,12 +1062,22 @@ fn binary_to_term_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// after the zlib stream are ignored *and* uncounted, like the plain case's trailing
 /// bytes (see [`consumed_compressed_len`]).
 ///
+/// The context's local node identity ([`BifContext::local_node`]) is installed on the
+/// decoder, so a wire pid/port/reference whose node atom and creation name this node
+/// materializes as this runtime's **internal** form — the C's `dec_is_this_node`
+/// branches (`external.c:3175-3182` pid, `:4721` port, `:4821-4862` ref) — and
+/// `binary_to_term(term_to_binary(self())) =:= self()` holds. With no resolvable
+/// identity the decode is byte-for-byte the previous behaviour (the wire form, an
+/// external id). The 4-byte `LOCAL_EXT` node hash is runtime state with no seam here,
+/// so it is not installed (`None` consumes it unchecked).
+///
 /// # Errors
 ///
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a non-binary, a
 /// malformed/truncated image, an unknown option, or `safe` with an image that
 /// would create an atom; the codec's `unsupported_external_term` raise for a tag
-/// it cannot build (funs, exports, records, `LOCAL`).
+/// it cannot build (funs, exports, records, `LOCAL`) and `SystemLimit` for a local
+/// reference id that does not fit the M1 block's 60-bit slot.
 fn decode_term_bif(
     ctx: &mut BifContext<'_>,
     input: Eterm,
@@ -1062,16 +1085,28 @@ fn decode_term_bif(
     used: bool,
 ) -> Result<Eterm> {
     let data = bytes_arg(input)?;
+    // Read the local node identity *before* `ctx.heap()` — the accessor takes
+    // `&mut self`, so it cannot be called while the heap is borrowed. It is installed
+    // on the decoder below so an incoming identifier that names this node demotes to
+    // the internal form (see the docs above); `None` leaves the decode unchanged.
+    let identity = ctx.local_node();
     // Decode into a *clone* of the context's table: the decoder needs `&mut`, and
     // the clone has the context's indices (the names are interned in order).
     let mut local = ctx.atoms().clone();
     let known = local.len();
     let (term, position) = if is_compressed_image(&data) {
-        // `beam_codec::decode_term` owns the wrapper handling (the 4-byte size check
-        // and the inner body decode) — its `decompress_wrapper` is private, so the
-        // wrapper is recognised here with the same two-byte test it uses.
+        // `beam_codec::decode_term[_with_local_node]` owns the wrapper handling (the
+        // 4-byte size check and the inner body decode) — its `decompress_wrapper` is
+        // private, so the wrapper is recognised here with the same two-byte test it
+        // uses. The identity-aware entry point installs the identity on the inflated
+        // body, so a compressed image demotes exactly like its uncompressed twin.
         let heap = ctx.heap();
-        let decoded = decode_term(&data, heap, &mut local)?;
+        let decoded = match identity {
+            Some((node, creation)) => {
+                decode_term_with_local_node(&data, heap, &mut local, node, creation, None)?
+            }
+            None => decode_term(&data, heap, &mut local)?,
+        };
         // The wrapper's `used` count stops at the zlib stream's end (the C subtracts
         // what the inflater left unread, `external.c:1797-1801`/`:2011-2014`), so it
         // is the compressed image's length — *not* the whole input when trailing bytes
@@ -1080,7 +1115,13 @@ fn decode_term_bif(
         (decoded, position)
     } else {
         let heap = ctx.heap();
+        // The explicit `Decoder` (rather than the free function) keeps `position()` for
+        // the `[used]` count *and* — unlike the free function — does not require the
+        // whole stream to be consumed, matching the oracle's trailing-byte tolerance.
         let mut decoder = Decoder::new(&data)?;
+        if let Some((node, creation)) = identity {
+            decoder = decoder.with_local_node(node, creation);
+        }
         let decoded = decoder.decode(heap, &mut local)?;
         (decoded, decoder.position())
     };
@@ -1304,8 +1345,18 @@ mod tests {
     /// Runs `f` over a fresh context with the atom interner installed, handing back
     /// the table the interner owns (used to read back a freshly interned name).
     fn with_interner<R>(f: impl FnOnce(&mut BifContext<'_>, &Rc<RefCell<AtomTable>>) -> R) -> R {
+        with_interner_over(table(), f)
+    }
+
+    /// Runs `f` over a fresh context whose atom table is *exactly* `atoms` — so the
+    /// local-node fallback ([`BifContext::local_node`]) stays unresolved when `atoms`
+    /// lacks `nonode@nohost` — with an atom interner installed over a clone of it (the
+    /// shape [`decode_term_bif`]'s fresh-name handling relies on).
+    fn with_interner_over<R>(
+        atoms: AtomTable,
+        f: impl FnOnce(&mut BifContext<'_>, &Rc<RefCell<AtomTable>>) -> R,
+    ) -> R {
         let mut heap = heap();
-        let atoms = table();
         let shared = Rc::new(RefCell::new(atoms.clone()));
         let mut interner = Interner {
             table: Rc::clone(&shared),
@@ -2757,12 +2808,22 @@ mod tests {
     #[test]
     fn binary_to_term_round_trips_pids_and_maps() {
         with_ctx(|ctx| {
-            // An external pid (what the wire carries) round-trips byte-exactly.
+            // `PID_SELF` *is* the oracle's own `term_to_binary(self())` image
+            // (`erl -noshell -eval 'io:format("~w~n",[binary_to_list(
+            // term_to_binary(self()))]),halt(0).'` ⇒ exactly these 29 bytes) for the
+            // pid `(number = 10, serial = 0)` on `nonode@nohost`, so this pins
+            // `term_to_binary(binary_to_term(Bin)) == Bin` for it.
+            //
+            // It names this node (`nonode@nohost`, the harness identity), so the decode
+            // demotes it to the *internal* pid — the oracle's `dec_is_this_node` branch
+            // — and it re-encodes to the very same wire image.
             let term = binary_to_term_1(ctx, &[bin(PID_SELF)]).unwrap();
             assert!(access::is_pid(term));
-            let (node, number, serial, creation) = external_pid_parts(term).expect("an external pid");
-            assert_eq!(ctx.atoms().name(atom_val(node)), Some("nonode@nohost"));
-            assert_eq!((number, serial, creation), (10, 0, 0));
+            assert!(access::is_internal_pid(term), "expected the internal pid");
+            assert_eq!(
+                ProcessId::from_eterm(term).expect("an internal pid"),
+                ProcessId::new(10, 0)
+            );
             assert_eq!(text(term_to_binary_1(ctx, &[term]).unwrap()), PID_SELF.to_vec());
 
             // A map round-trips (structurally).
@@ -2865,16 +2926,133 @@ mod tests {
             let optioned = text(term_to_binary_2(ctx, &[self_pid, options]).unwrap());
             assert_eq!(optioned, pid_image(1, 0, 0));
 
-            // The round trip decodes to an *external* pid carrying the same
-            // node/number/serial/creation (the wire form, not an internal id).
+            // The round trip decodes back to the *internal* pid — word-identical to
+            // `self()` (the harness's `ProcessId::new(1, 0)`), i.e. the oracle's
+            // `P =:= self()` — because the image names this node.
             let back = binary_to_term_1(ctx, &[bin(&image)]).unwrap();
-            let (node, number, serial, creation) =
-                external_pid_parts(back).expect("an external pid");
-            assert_eq!(ctx.atoms().name(atom_val(node)), Some("nonode@nohost"));
-            assert_eq!((number, serial, creation), (1, 0, 0));
+            assert!(access::is_internal_pid(back), "expected the internal pid");
+            assert_eq!(back, self_pid, "binary_to_term ∘ term_to_binary must be id");
         });
     }
 
+    // -----------------------------------------------------------------------
+    // binary_to_term — the local-node decode demotion
+    // -----------------------------------------------------------------------
+
+    /// The local pid **decode** demotion (the oracle's `dec_is_this_node` branch,
+    /// `external.c:3175-3182`): an image that names this node materializes the internal
+    /// pid immediate, so `binary_to_term(term_to_binary(self())) =:= self()`.
+    #[test]
+    fn binary_to_term_demotes_a_local_pid_to_the_internal_form() {
+        with_ctx(|ctx| {
+            let self_pid = ctx.self_pid().to_eterm();
+            let image = text(term_to_binary_1(ctx, &[self_pid]).unwrap());
+            assert_eq!(
+                image,
+                pid_image(1, 0, 0),
+                "the encoder's internal-pid image"
+            );
+
+            let back = binary_to_term_1(ctx, &[bin(&image)]).unwrap();
+            assert!(access::is_internal_pid(back), "expected the internal pid");
+            assert_eq!(back, self_pid, "P =:= self() after the round trip");
+
+            // A nested identifier demotes too (the demotion is per-arm, not top-level).
+            let nested = ctx.tuple(&[self_pid]).expect("fits");
+            let nested_image = text(term_to_binary_1(ctx, &[nested]).unwrap());
+            let back = binary_to_term_1(ctx, &[bin(&nested_image)]).unwrap();
+            assert!(access::is_tuple(back), "expected the tuple back");
+            assert_eq!(access::tuple_element(back, 0), self_pid);
+
+            // …and so does the `[used]` arm of `binary_to_term/2` (the `[used]` count
+            // still includes the `131` version byte — see `etf_options.rs`).
+            let used = used_option(ctx);
+            let pair = binary_to_term_2(ctx, &[bin(&image), used]).unwrap();
+            assert_eq!(access::tuple_element(pair, 0), self_pid);
+            assert_eq!(int_of(access::tuple_element(pair, 1)), image.len() as i64);
+        });
+    }
+
+    /// The COMPRESSED-body path installs the identity as well, so a local pid inside a
+    /// deflated image demotes exactly like its uncompressed twin.
+    #[test]
+    fn binary_to_term_demotes_a_local_pid_inside_a_compressed_image() {
+        with_ctx(|ctx| {
+            let self_pid = ctx.self_pid().to_eterm();
+            // A body big enough that the deflate stream wins (the C reverts to the plain
+            // image when it does not, `external.c:2250-2301`).
+            let elements = vec![self_pid; 300];
+            let list = ctx.list(&elements).expect("the list fits");
+            let options = compressed_option(ctx);
+            let image = text(term_to_binary_2(ctx, &[list, options]).unwrap());
+            assert_eq!(image[1], COMPRESSED_EXT, "expected a COMPRESSED image");
+
+            let back = binary_to_term_1(ctx, &[bin(&image)]).unwrap();
+            let items = proper_list(back).expect("a proper list");
+            assert_eq!(items.len(), 300);
+            assert!(
+                items.iter().all(|&item| item == self_pid),
+                "every element must be the internal pid"
+            );
+        });
+    }
+
+    /// An internal reference round-trips under the local node identity: the encoder
+    /// writes `NEWER_REFERENCE_EXT` (`90` — the form this runtime emits for an internal
+    /// ref), the decoder demotes it back to the frozen 4-word M1 block
+    /// (`external.c:4821-4862`), so the two terms compare exactly equal (they are two
+    /// distinct allocations, so the raw `Eterm` words differ — `compare::eq` is the
+    /// structural test) and re-encode to the same bytes.
+    #[test]
+    fn binary_to_term_demotes_a_local_reference_to_the_internal_form() {
+        with_ctx(|ctx| {
+            for id in [0u64, 1, 42, 1 << 18, 1 << 40, (1u64 << 50) | 7] {
+                let reference = access::make_ref_thing(ctx.heap(), id).expect("the ref fits");
+                let image = text(term_to_binary_1(ctx, &[reference]).unwrap());
+                assert_eq!(image[0], VERSION_MAGIC, "id = {id}");
+                assert_eq!(image[1], 90, "NEWER_REFERENCE_EXT, id = {id}");
+
+                let back = binary_to_term_1(ctx, &[bin(&image)]).unwrap();
+                assert!(access::is_internal_ref(back), "id = {id}");
+                assert_eq!(access::ref_thing_id(back).unwrap(), id, "id = {id}");
+                assert!(
+                    beam_term::compare::eq(back, reference, ctx.atoms()),
+                    "binary_to_term ∘ term_to_binary, id = {id}"
+                );
+                // The round trip is idempotent: the re-encode is the very same image.
+                assert_eq!(text(term_to_binary_1(ctx, &[back]).unwrap()), image);
+            }
+        });
+    }
+    /// The oracle's own `term_to_binary(make_ref())` image is a **typed gap** here.
+    ///
+    /// ORACLE (OTP 29.1.1 / erts-17.1):
+    /// `erl -noshell -eval 'io:format("~w~n",[binary_to_list(term_to_binary(make_ref()))]),halt(0).'`
+    /// ⇒ `[131,90,0,3,119,13,"nonode@nohost",0,0,0,0, 0,0,2,97,219, 29,184,0,2, 67,170,76,26]`
+    /// — a `NEWER_REFERENCE_EXT` (`90`) with 3 numbers `0x000261DB`, `0x1DB80002`,
+    /// `0x43AA4C1A`. The third is `>= 2^28`, so the packed M1 id
+    /// (`(n0 & 0x3FFFF) | (n1 & 0xFFFC0000) | (n2 << 32)`) reaches past the 60-bit small
+    /// the internal-ref block stores. This crate reports the typed `SystemLimit` rather
+    /// than a truncated/substituted id (the width limit is `beam_codec::ref_wire`'s, see
+    /// its module doc): the *self-consistent* round trip above is what this runtime
+    /// guarantees for its own references.
+    #[test]
+    fn the_oracle_reference_image_is_a_typed_id_width_gap() {
+        let mut oracle = vec![VERSION_MAGIC, 90, 0, 3, 119, 13];
+        oracle.extend_from_slice(b"nonode@nohost");
+        oracle.extend_from_slice(&0u32.to_be_bytes()); // creation
+        oracle.extend_from_slice(&0x0002_61DBu32.to_be_bytes()); // n0
+        oracle.extend_from_slice(&0x1DB8_0002u32.to_be_bytes()); // n1
+        oracle.extend_from_slice(&0x43AA_4C1Au32.to_be_bytes()); // n2
+
+        with_ctx(|ctx| {
+            let err = binary_to_term_1(ctx, &[bin(&oracle)]).unwrap_err();
+            assert!(
+                matches!(err, beam_common::BeamError::SystemLimit),
+                "expected the typed id-width gap, got {err:?}"
+            );
+        });
+    }
     /// A minimal [`LocalNode`](crate::context::LocalNode) test double answering a fixed
     /// `(node, creation)`.
     struct StubNode {
@@ -2931,6 +3109,35 @@ mod tests {
         assert!(is_unsupported(&err), "expected unsupported, got {err:?}");
     }
 
+    /// The **additive** guarantee of the decode identity: with no resolvable local node
+    /// the very same pid image still decodes to the *external* wire pid, byte-for-byte
+    /// as before the seam.
+    #[test]
+    fn a_local_pid_image_stays_external_without_a_local_node() {
+        // A table that lacks `nonode@nohost` (and no `LocalNode` hook) leaves
+        // `BifContext::local_node` unresolved, so the decoder installs no identity. The
+        // interner is needed only because the image's own node atom is *new* to this
+        // table (the decoder still interns it, exactly as any other incoming atom).
+        let mut no_node = AtomTable::new();
+        no_node.seed(["a", "b", "true", "false"].iter().copied());
+        with_interner_over(no_node, |ctx, interned| {
+            assert!(ctx.local_node().is_none(), "no identity in this context");
+
+            let back = binary_to_term_1(ctx, &[bin(PID_SELF)]).unwrap();
+            assert!(access::is_pid(back));
+            assert!(
+                !access::is_internal_pid(back),
+                "expected the external wire pid, got the internal form"
+            );
+            let (node, number, serial, creation) =
+                external_pid_parts(back).expect("an external pid");
+            assert_eq!(
+                interned.borrow().name(atom_val(node)),
+                Some("nonode@nohost")
+            );
+            assert_eq!((number, serial, creation), (10, 0, 0));
+        });
+    }
     // -- registration -----------------------------------------------------
 
     #[test]
