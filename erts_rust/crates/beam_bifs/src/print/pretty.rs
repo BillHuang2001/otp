@@ -36,15 +36,14 @@ use beam_common::Result;
 use beam_term::{signed_value, Eterm};
 
 use crate::access::{
-    car, cdr, flatmap_pairs, is_atom, is_list, is_map, is_nil, is_small, is_tuple, tuple_element,
-    tuple_size,
+    car, cdr, is_atom, is_list, is_map, is_nil, is_small, is_tuple, tuple_element, tuple_size,
 };
 use crate::bits;
 use crate::context::BifContext;
 
 use super::{
-    char_printable, dup_chars, flatmap_key_cmp, latin1_printable_char, printable_string,
-    proper_list, quoted_string, term_chunk, Chunk, UNLIMITED_DEPTH,
+    char_printable, dup_chars, latin1_printable_char, printable_string, proper_list, quoted_string,
+    term_chunk, Chunk, UNLIMITED_DEPTH,
 };
 
 mod cind;
@@ -302,8 +301,7 @@ fn list_length(seq: &Seq, acc: i64, dots: i64) -> (i64, i64) {
 ///
 /// # Errors
 ///
-/// As [`term_chunk`]: a term outside the Milestone-1 printable set, or a hash map
-/// (only flat maps are modelled).
+/// As [`term_chunk`]: a term outside the Milestone-1 printable set.
 fn build(ctx: &mut BifContext<'_>, term: Eterm, printable: bool, d: i64, t: i64) -> Result<Node> {
     if is_nil(term) {
         return Ok(Node::leaf("[]"));
@@ -318,8 +316,7 @@ fn build(ctx: &mut BifContext<'_>, term: Eterm, printable: bool, d: i64, t: i64)
         return build_tuple(ctx, term, printable, d, t);
     }
     if is_map(term) {
-        let (keys, _values) = flatmap_pairs(term)?;
-        if keys.is_empty() {
+        if beam_term::map::map_size(term, ctx.atoms())? == 0 {
             return Ok(Node::leaf("#{}"));
         }
         if d == 1 {
@@ -440,7 +437,7 @@ fn tuple1(
     Ok(prepend(elem, inner))
 }
 /// `io_lib_pretty:print_length_map/7` (the `D =:= 1` elision is [`build`]'s):
-/// the pairs in this crate's flatmap key order (see the module docs).
+/// the pairs in the map's storage order (see the module docs).
 fn build_map(
     ctx: &mut BifContext<'_>,
     term: Eterm,
@@ -448,9 +445,7 @@ fn build_map(
     d: i64,
     t: i64,
 ) -> Result<Node> {
-    let (keys, values) = flatmap_pairs(term)?;
-    let mut pairs: Vec<(Eterm, Eterm)> = keys.into_iter().zip(values).collect();
-    pairs.sort_by(|a, b| flatmap_key_cmp(a.0, b.0, ctx.atoms()));
+    let pairs: Vec<(Eterm, Eterm)> = beam_term::map::map_pairs_storage_order(term)?;
     let seq = map1(ctx, &pairs, printable, 0, d, d - 1, tsub(t, 3))?;
     let (len, dots) = list_length(&seq, 3, 0);
     Ok(Node {
