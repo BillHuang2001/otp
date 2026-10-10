@@ -387,6 +387,389 @@ impl RuntimeContext<'_> {
         }
     }
 
+    // -- prim_file:pread/3, pread/2 -------------------------------------------
+
+    /// `prim_file:pread/3` — `Size` bytes read at `Offset` **without moving the
+    /// descriptor's cursor** (`prim_file.erl:336-342`, `pread_nif_impl`,
+    /// `prim_file_nif.c:712-750`).
+    ///
+    /// The C's argument order is exact: `Offset` and `Size` must both be *numbers*
+    /// (`enif_is_number`) else `{error,badarg}`; each must then fit an `int64` **and** be
+    /// non-negative (`enif_get_int64` + the `< 0` test) else `{error,einval}`. A read that
+    /// returns nothing is the bare atom `eof` — the C answers `am_eof` whenever the kernel
+    /// returned 0 bytes, so `Size = 0` and an offset at or past end of file are both `eof`
+    /// — while a **short** read at end of file is still `{ok, Binary}`.
+    ///
+    /// Oracle: `pread(Fd,0,3)`⇒`{ok,<<"012">>}`; `pread(Fd,9,5)` on an 11-byte file
+    /// ⇒`{ok,<<"9a">>}`; `pread(Fd,0,0)`/`(Fd,11,3)`⇒`eof`; `pread(Fd,-1,3)`/`(Fd,0,-1)`
+    /// /`(Fd,0,3.0)`/`(Fd,0.0,3)`/`(Fd,0,1 bsl 80)`⇒`{error,einval}`; `pread(Fd,0,foo)`
+    /// /`(Fd,foo,3)`⇒`{error,badarg}`; a `[write]` fd⇒`{error,ebadf}`; a `[directory]` fd
+    /// ⇒`{error,eisdir}`; after `close/1`⇒`{error,einval}`; the cursor is unchanged by a
+    /// successful pread.
+    ///
+    /// `// documented divergence:` the oracle raises `function_clause` for a term that is
+    /// not a `#file_descriptor{}` at all (`pread(foo,0,3)`); this runtime answers the value
+    /// `{error,badarg}` (see "Documented divergences").
+    pub(super) fn prim_pread(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let fd = *args.first().ok_or(BeamError::BadArg)?;
+        let offset = *args.get(1).ok_or(BeamError::BadArg)?;
+        let size = *args.get(2).ok_or(BeamError::BadArg)?;
+        match (number_arg(offset), number_arg(size)) {
+            (NumArg::Value(offset), NumArg::Value(size)) if offset >= 0 && size >= 0 => {
+                self.pread_at(fd, offset, size)
+            }
+            // Both args must be *numbers* before either is range-checked, exactly as the
+            // C's single `||` does (`prim_file_nif.c:717-721`).
+            (NumArg::BadArg, _) | (_, NumArg::BadArg) => self.error_tuple("badarg"),
+            _ => self.error_tuple("einval"),
+        }
+    }
+
+    /// The shared body of `pread/3` and the per-pair step of `pread/2`: decode the
+    /// descriptor, then one positioned host read.
+    fn pread_at(&mut self, fd: Eterm, offset: i64, size: i64) -> Result<Eterm> {
+        let Some(descriptor) = self.decode_descriptor(fd) else {
+            return self.error_tuple("badarg");
+        };
+        self.check_owner(&descriptor)?;
+        let outcome = match self.runtime.open_files_mut().get_mut(&descriptor.id) {
+            None => None,
+            Some(file) => Some(pread_extent(file, offset as u64, size as usize)),
+        };
+        let Some(read) = outcome else {
+            return self.error_tuple("einval");
+        };
+        match read {
+            // `bytes_read == 0` ⇒ `am_eof` (`prim_file_nif.c:729-731`) — which covers a
+            // zero-length request and an offset at or past end of file alike.
+            Ok(bytes) if bytes.is_empty() => self.atom("eof"),
+            Ok(bytes) => {
+                let contents = beam_codec::term::make_binary(self.eval_heap(), &bytes)?;
+                self.ok_tuple(contents)
+            }
+            Err(error) => self.error_tuple_for(&error),
+        }
+    }
+
+    /// `prim_file:pread/2` — the `pread_list/3` wrapper over repeated `pread/3`
+    /// (`prim_file.erl:344-368`).
+    ///
+    /// The list is walked **in source order** (the wrapper prepends and reverses once, so
+    /// the answers come back in the order asked for) and each element is a `binary()` or
+    /// the atom `eof`. The first error aborts with it. An **empty** list is `{ok,[]}`
+    /// *before* the descriptor's state is consulted — the wrapper's `get_fd_data/1` only
+    /// reads the map, so `pread(ClosedFd,[])` is `{ok,[]}` in the oracle too.
+    ///
+    /// Oracle: `pread(F,[{0,3},{6,5}])`⇒`{ok,[<<"012">>,<<"6789a">>]}`;
+    /// `pread(F,[{0,3},{100,5}])`⇒`{ok,[<<"012">>,eof]}`; `pread(F,[])`⇒`{ok,[]}` (also on
+    /// a **closed** fd); `pread(F,[{0,1}])` on a closed fd⇒`{error,einval}`;
+    /// `pread(F,[{-1,3}])`⇒`{error,einval}`; `pread(F,[{0,foo}])`⇒`{error,badarg}`; a
+    /// `[directory]` fd⇒`{error,eisdir}`.
+    ///
+    /// `// documented divergence:` a non-list, a list element that is not a `{Offset, Size}`
+    /// pair and an improper tail all raise `function_clause` in the oracle (`pread(F,foo)`,
+    /// `pread(F,[{0}])`, `pread(F,[{0,1}|foo])`); this runtime answers `{error,badarg}`.
+    pub(super) fn prim_pread_list(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let fd = *args.first().ok_or(BeamError::BadArg)?;
+        let locations = *args.get(1).ok_or(BeamError::BadArg)?;
+        let Some(descriptor) = self.decode_descriptor(fd) else {
+            return self.error_tuple("badarg");
+        };
+        self.check_owner(&descriptor)?;
+        let mut current = locations;
+        // The answers are collected as owned bytes first, so the borrow of the runtime's
+        // open-file table never overlaps a heap-borrowing `self` call.
+        let mut pieces: Vec<ReadPiece> = Vec::new();
+        loop {
+            if is_nil(current) {
+                break;
+            }
+            if !is_list(current) {
+                return self.error_tuple("badarg");
+            }
+            let Some(pair) = two_tuple(current) else {
+                return self.error_tuple("badarg");
+            };
+            current = terms::cons_tail(current)?;
+            match (number_arg(pair.0), number_arg(pair.1)) {
+                (NumArg::Value(offset), NumArg::Value(size)) if offset >= 0 && size >= 0 => {
+                    let outcome = match self.runtime.open_files_mut().get_mut(&descriptor.id) {
+                        None => None,
+                        Some(file) => Some(pread_extent(file, offset as u64, size as usize)),
+                    };
+                    let Some(read) = outcome else {
+                        return self.error_tuple("einval");
+                    };
+                    match read {
+                        Ok(bytes) if bytes.is_empty() => pieces.push(ReadPiece::Eof),
+                        Ok(bytes) => pieces.push(ReadPiece::Bytes(bytes)),
+                        Err(error) => return self.error_tuple_for(&error),
+                    }
+                }
+                (NumArg::BadArg, _) | (_, NumArg::BadArg) => {
+                    return self.error_tuple("badarg");
+                }
+                _ => return self.error_tuple("einval"),
+            }
+        }
+        let mut results = Vec::with_capacity(pieces.len());
+        for piece in pieces {
+            results.push(match piece {
+                ReadPiece::Eof => self.atom("eof")?,
+                ReadPiece::Bytes(bytes) => beam_codec::term::make_binary(self.eval_heap(), &bytes)?,
+            });
+        }
+        let list = terms::make_list(self, &results)?;
+        self.ok_tuple(list)
+    }
+
+    // -- prim_file:pwrite/3, pwrite/2 -----------------------------------------
+
+    /// `prim_file:pwrite/3` — `IOData` written at `Offset` **without moving the
+    /// descriptor's cursor** (`prim_file.erl:370-391`, `pwrite_nif_impl`,
+    /// `prim_file_nif.c:752-780`).
+    ///
+    /// The payload is flattened exactly as `erlang:iolist_to_iovec/1` does it (see
+    /// [`flatten_iodata`]) — and, as in the wrapper, the flattening happens *before* the
+    /// descriptor is consulted, so a bad payload is `{error,badarg}` whatever the
+    /// descriptor is. `Offset` follows the C: a non-number is `{error,badarg}`, a number
+    /// that is not a non-negative `int64` is `{error,einval}`.
+    ///
+    /// Oracle: `pwrite(Fd,0,<<"XY">>)`⇒`ok`; `pwrite(Fd,0,<<>>)`⇒`ok`;
+    /// `pwrite(Fd,-1,<<"Z">>)`/`(Fd,0.0,<<"Z">>)`/`(Fd,1 bsl 80,<<"Z">>)`⇒`{error,einval}`;
+    /// `pwrite(Fd,0,foo)`/`(Fd,[1|2],…)`/`(Fd,<<1:4>>)`/`(Fd,foo,<<"Z">>)`⇒`{error,badarg}`;
+    /// a `[read]` fd⇒`{error,ebadf}`; a `[directory]` fd⇒`{error,ebadf}`; after `close/1`
+    /// ⇒`{error,einval}`; the cursor is unchanged.
+    ///
+    /// `// documented divergence:` a non-descriptor term raises `function_clause` in the
+    /// oracle; this runtime answers `{error,badarg}`.
+    pub(super) fn prim_pwrite(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let fd = *args.first().ok_or(BeamError::BadArg)?;
+        let offset = *args.get(1).ok_or(BeamError::BadArg)?;
+        let io_data = *args.get(2).ok_or(BeamError::BadArg)?;
+        // The wrapper flattens the payload before it decodes the descriptor
+        // (`prim_file.erl:371-372`), so a bad payload wins over a bad descriptor.
+        let Some(bytes) = flatten_iodata(io_data) else {
+            return self.error_tuple("badarg");
+        };
+        let offset = match number_arg(offset) {
+            NumArg::Value(offset) if offset >= 0 => offset,
+            NumArg::Value(_) => return self.error_tuple("einval"),
+            NumArg::EInval => return self.error_tuple("einval"),
+            NumArg::BadArg => return self.error_tuple("badarg"),
+        };
+        let Some(descriptor) = self.decode_descriptor(fd) else {
+            return self.error_tuple("badarg");
+        };
+        self.check_owner(&descriptor)?;
+        let outcome = match self.runtime.open_files_mut().get_mut(&descriptor.id) {
+            None => None,
+            // An empty payload is `ok` without a host call — but only for a live
+            // descriptor (the NIF's state check precedes the body).
+            Some(_) if bytes.is_empty() => Some(Ok(())),
+            Some(file) => Some(write_at(file, offset as u64, &bytes)),
+        };
+        match outcome {
+            None => self.error_tuple("einval"),
+            Some(Ok(())) => self.ok_atom(),
+            Some(Err(error)) => self.error_tuple_for(&error),
+        }
+    }
+
+    /// `prim_file:pwrite/2` — the `pwrite_list/3` wrapper over repeated `pwrite/3`
+    /// (`prim_file.erl:393-418`).
+    ///
+    /// The wrapper counts the pairs it has written and answers `{error, {Successes,
+    /// Reason}}` on the first failure (the count starting at 0), `ok` when every pair
+    /// landed. An **empty** list is `ok` before the descriptor's state is consulted.
+    ///
+    /// Oracle: `pwrite(F,[{0,<<"A">>},{2,<<"B">>}])`⇒`ok`; `pwrite(F,[])`⇒`ok` (also on a
+    /// **closed** fd); `pwrite(F,[{0,<<"A">>},{1,foo}])`⇒`{error,badarg}` (the iodata
+    /// raise wins over the state check); `pwrite(F,[{-1,<<"A">>}])`⇒`{error,{0,einval}}`;
+    /// `pwrite(F,[{0,<<"A">>}])` on a closed fd⇒`{error,{0,einval}}`; a `[directory]` fd
+    /// ⇒`{error,{0,ebadf}}`.
+    ///
+    /// `// documented divergence:` a non-list, an element that is not a pair and an
+    /// improper tail raise `function_clause` in the oracle; this runtime answers
+    /// `{error,badarg}`.
+    pub(super) fn prim_pwrite_list(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let fd = *args.first().ok_or(BeamError::BadArg)?;
+        let locations = *args.get(1).ok_or(BeamError::BadArg)?;
+        let Some(descriptor) = self.decode_descriptor(fd) else {
+            return self.error_tuple("badarg");
+        };
+        self.check_owner(&descriptor)?;
+        let mut current = locations;
+        let mut successes: i64 = 0;
+        loop {
+            if is_nil(current) {
+                break;
+            }
+            if !is_list(current) {
+                return self.error_tuple("badarg");
+            }
+            let Some(pair) = two_tuple(current) else {
+                return self.error_tuple("badarg");
+            };
+            current = terms::cons_tail(current)?;
+            let Some(bytes) = flatten_iodata(pair.1) else {
+                return self.error_tuple("badarg");
+            };
+            let offset = match number_arg(pair.0) {
+                NumArg::Value(offset) if offset >= 0 => offset,
+                NumArg::Value(_) | NumArg::EInval => {
+                    return self.pwrite_list_error(successes, "einval");
+                }
+                NumArg::BadArg => return self.error_tuple("badarg"),
+            };
+            let outcome = match self.runtime.open_files_mut().get_mut(&descriptor.id) {
+                None => None,
+                Some(_) if bytes.is_empty() => Some(Ok(())),
+                Some(file) => Some(write_at(file, offset as u64, &bytes)),
+            };
+            match outcome {
+                None => return self.pwrite_list_error(successes, "einval"),
+                Some(Ok(())) => successes += 1,
+                Some(Err(error)) => {
+                    let reason = errno_reason(&error);
+                    return self.pwrite_list_error(successes, &reason);
+                }
+            }
+        }
+        self.ok_atom()
+    }
+
+    /// `{error, {Successes, Reason}}` — `pwrite_list/3`'s failure shape.
+    fn pwrite_list_error(&mut self, successes: i64, reason: &str) -> Result<Eterm> {
+        let error = self.atom("error")?;
+        let reason = self.atom(reason)?;
+        let inner = terms::make_tuple(self, &[make_small(successes), reason])?;
+        terms::make_tuple(self, &[error, inner])
+    }
+
+    // -- prim_file:truncate/1 -------------------------------------------------
+
+    /// `prim_file:truncate/1` — the file truncated to the descriptor's **current
+    /// position** (`prim_file.erl:265-272`, `truncate_nif_impl`,
+    /// `unix_prim_file.c:693-710`).
+    ///
+    /// The C seeks to the current position (`lseek(fd, 0, SEEK_CUR)`) and then truncates to
+    /// it (`ftruncate`), which is exactly `stream_position()` + `set_len()`.
+    ///
+    /// Oracle: `truncate(Fd)` at position 0 on an 11-byte file ⇒ size 0; after
+    /// `position(Fd,4)` ⇒ size 4; after `write(Fd,<<"AB">>)` ⇒ size 2; a `[write]` fd
+    /// ⇒`ok`; a `[read]` fd, a `[directory]` fd and a closed fd ⇒`{error,einval}`.
+    ///
+    /// `// documented divergence:` `truncate(foo)` raises `function_clause` in the oracle;
+    /// this runtime answers the value `{error,badarg}` (the shared malformed-descriptor
+    /// rule), and a **closed/unknown** descriptor is `{error,einval}` — the oracle's own
+    /// `EFILE_STATE_CLOSED` answer.
+    pub(super) fn prim_truncate(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let fd = *args.first().ok_or(BeamError::BadArg)?;
+        let Some(descriptor) = self.decode_descriptor(fd) else {
+            return self.error_tuple("badarg");
+        };
+        self.check_owner(&descriptor)?;
+        let outcome = match self.runtime.open_files_mut().get_mut(&descriptor.id) {
+            None => None,
+            Some(file) => Some(match file.stream_position() {
+                Ok(position) => file.set_len(position),
+                Err(error) => Err(error),
+            }),
+        };
+        match outcome {
+            None => self.error_tuple("einval"),
+            Some(Ok(())) => self.ok_atom(),
+            Some(Err(error)) => self.error_tuple_for(&error),
+        }
+    }
+
+    // -- prim_file:sync/1, datasync/1 -----------------------------------------
+
+    /// `prim_file:sync/1` — `fsync(2)` (`prim_file.erl:290-298`, `sync_nif` with `data =
+    /// 0`, `unix_prim_file.c:542-568`).
+    ///
+    /// Oracle: `ok` for a file descriptor of any mode (including a `[read]` one) and for a
+    /// `[directory]` fd; `{error,einval}` after `close/1`.
+    ///
+    /// `// documented divergence:` `sync(foo)` raises `function_clause` in the oracle; the
+    /// malformed-descriptor value `{error,badarg}` is answered here.
+    pub(super) fn prim_sync(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        self.sync_descriptor(args, File::sync_all)
+    }
+
+    /// `prim_file:datasync/1` — `fdatasync(2)` (`prim_file.erl:299-304`, `sync_nif` with
+    /// `data = 1`).
+    ///
+    /// Same surface as [`prim_sync`](Self::prim_sync) with the data-only host call.
+    pub(super) fn prim_datasync(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        self.sync_descriptor(args, File::sync_data)
+    }
+
+    /// The shared body of `sync/1` and `datasync/1`: decode the descriptor, then run the
+    /// host's flush.
+    fn sync_descriptor(&mut self, args: &[Eterm], flush: fn(&File) -> io::Result<()>) -> Result<Eterm> {
+        let fd = *args.first().ok_or(BeamError::BadArg)?;
+        let Some(descriptor) = self.decode_descriptor(fd) else {
+            return self.error_tuple("badarg");
+        };
+        self.check_owner(&descriptor)?;
+        let outcome = match self.runtime.open_files_mut().get_mut(&descriptor.id) {
+            None => None,
+            Some(file) => Some(flush(file)),
+        };
+        match outcome {
+            None => self.error_tuple("einval"),
+            Some(Ok(())) => self.ok_atom(),
+            Some(Err(error)) => self.error_tuple_for(&error),
+        }
+    }
+
+    // -- prim_file:write_file/2 -----------------------------------------------
+
+    /// `prim_file:write_file/2` — the payload written over the whole file
+    /// (`prim_file.erl:574-584`, which composes `open(Name,[write,binary])` → `write` →
+    /// `close`).
+    ///
+    /// The oracle opens the file **first** and only then flattens the payload, so a bad
+    /// payload still creates/truncates the file before answering `{error,badarg}`; this
+    /// reproduces that order.
+    ///
+    /// Oracle: `write_file(P,<<"hello">>)`⇒`ok` (contents `<<"hello">>`); overwriting a
+    /// 10-byte file with `<<"AB">>`⇒`ok` and size 2; `write_file(P,"abc")`⇒`ok` (iodata);
+    /// a directory⇒`{error,eisdir}`; a missing parent⇒`{error,enoent}`; the empty path
+    /// (and `<<>>`)⇒`{error,enoent}`; a NUL path / an atom path / a bad payload
+    /// ⇒`{error,badarg}`.
+    ///
+    /// `// documented divergence:` `write_file/3` is **not exported** by the oracle
+    /// (`error:undef`), so only the arity-2 form is served here. A non-binary,
+    /// non-charlist path is the value `{error,badarg}` (never a raise).
+    pub(super) fn prim_write_file(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let name = *args.first().ok_or(BeamError::BadArg)?;
+        let payload = *args.get(1).ok_or(BeamError::BadArg)?;
+        let Some(path) = self.encode_path(name) else {
+            return self.error_tuple("badarg");
+        };
+        // `[write]` ⇒ `O_WRONLY|O_CREAT|O_TRUNC` (`get_flags`, `unix_prim_file.c:152-166`);
+        // `open(2)` itself answers the directory case with `EISDIR`.
+        let opened = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(std::ffi::OsStr::from_bytes(&path));
+        let mut file = match opened {
+            Ok(file) => file,
+            Err(error) => return self.error_tuple_for(&error),
+        };
+        let Some(bytes) = flatten_iodata(payload) else {
+            return self.error_tuple("badarg");
+        };
+        match file.write_all(&bytes) {
+            Ok(()) => self.ok_atom(),
+            Err(error) => self.error_tuple_for(&error),
+        }
+    }
+
     // -- the descriptor decode ------------------------------------------------
 
     /// The runtime's private id and recorded owner of a `#file_descriptor{}` argument.
