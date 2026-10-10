@@ -378,7 +378,16 @@ const EXPECTED: &[(&str, &str)] = &[
         "hash_nav_absent",
         "[{$end_of_table,$end_of_table,badarg,badarg,badarg,badarg},{$end_of_table,$end_of_table,badarg,badarg,badarg,badarg},{$end_of_table,$end_of_table,badarg,badarg,badarg,badarg}]",
     ),
-    ("hash_key_walk", "[{[1,2],2},{[1,2],2},{[1,2],2}]"),    ("update_counter_3_variants", "{15,12,25,[13,26],[{1,13,26}]}"),
+    ("hash_key_walk", "[{[1,2],2},{[1,2],2},{[1,2],2}]"),
+    (
+        "hash_last_prev_alias_first_next",
+        "[{true,true,true,true,true,true,[1,2,3,4,5]},{true,true,true,true,true,true,[1,2,3,4,5]},{true,true,true,true,true,true,[1,2,3,4,5]}]",
+    ),
+    (
+        "hash_select_reverse_aliases_select",
+        "[{true,[{1,20},{2,30}]},{true,[{1,10},{1,20},{2,30}]},{true,[{1,10},{1,20},{2,30}]}]",
+    ),
+    ("update_counter_3_variants", "{15,12,25,[13,26],[{1,13,26}]}"),
     ("update_counter_3_absent", "{badarg,badarg,0}"),
     ("update_counter_3_threshold", "[ok:100,ok:100]"),
     (
