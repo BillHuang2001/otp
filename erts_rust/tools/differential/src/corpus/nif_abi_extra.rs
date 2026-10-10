@@ -26,14 +26,23 @@
 //!
 //! # Shape (identical to [`super::nif_abi`])
 //!
-//! A **single** C library whose only `ErlNifFunc` entry is `probe/1`; the embedded module
-//! `nif_extra` loads it next to the compiled `.beam` (the self-locating trick the other A.3
-//! groups use) and calls `nif_extra:classify(N)`, which forwards the integer selector `N` to
-//! `nif_extra:probe(N)` — an **external** call, so the Rust runtime intercepts it at external
-//! dispatch (a bare local call would keep running the `erlang:nif_error/1` stub). Each C branch
-//! returns a **plain integer** (`1` matched, `0` not, `-1` unknown selector), so every golden is
-//! a VM-stable integer line. Two selectors deliberately raise from C; the module maps the raise
-//! class to an integer.
+//! A **single** C library with two `ErlNifFunc` entries; the embedded module `nif_extra` loads it
+//! next to the compiled `.beam` (the self-locating trick the other A.3 groups use) and calls
+//! `nif_extra:classify(N)`, which forwards the integer selector `N` to one of the two entries —
+//! each through an **external** call, so the Rust runtime intercepts it at external dispatch (a
+//! bare local call would keep running the `erlang:nif_error/1` stub):
+//!
+//! * `probe/1(Selector)` — the original entry: the C builds every term it needs with the public
+//!   `enif_*` constructors (selectors `1`..`62`);
+//! * `probe_term/2(Selector, Term)` — the term-driven entry: the C observes a term the module
+//!   built in Erlang (selectors `>= 100`), which the NIF C API cannot build itself — there is no
+//!   bitstring constructor, so a **non-byte-aligned bitstring** (and a window of one) can only be
+//!   built on the Erlang side.
+//!
+//! Each C branch returns a **plain integer** (`1` matched, `0` not, `-1` unknown selector, and for
+//! the direct observations below either the accessor's own integer answer or a `-100` "the shape
+//! did not match" sentinel), so every golden is a VM-stable integer line. Two selectors
+//! deliberately raise from C; the module maps the raise class to an integer.
 //!
 //! # Why these selectors, and no others
 //!
@@ -73,11 +82,38 @@
 //! the atom-cache slots, `enif_term_to_binary` on a valid term, `enif_binary_to_term` on a valid
 //! encoding, `enif_make_ref` on a valid env, `enif_make_existing_atom` on a *committed* atom and
 //! `enif_whereis_pid` on a name a process **is** registered under (see [`super::nif_abi`] for the
-//! full list and owners). `enif_inspect_iolist_as_binary` on a **bare byte integer** is a further
-//! divergence and is likewise unpinned: the oracle refuses it (`erts_iolist_size` accepts only a
-//! list or a binary at the top level, so the NIF answers `0`) while the Rust runtime flattens it
-//! (`flatten_iolist` accepts a small integer in `0..=255`) and answers `1`. The same byte inside
-//! a **list** agrees and is pinned by [`super::nif_abi`].
+//! full list and owners).
+//!
+//! # The A.3 binary/string shape fixes, pinned
+//!
+//! A later selector block (the term-driven `probe_term/2` entry, selectors `101`..`132`) pins the
+//! binary/string shape rules the runtime got wrong before, so they can never regress:
+//!
+//! * **`enif_inspect_iolist_as_binary`** follows the C's positional rules
+//!   (`erts_iolist_size`, `Unit = 8`): an integer is a byte **only in the head of a cons cell**, so
+//!   a bare byte integer (`65`), an improper-list tail (`[1|2]`), a non-byte integer head (`[256]`)
+//!   and a non-byte-aligned bitstring (`[<<1:7>>]`) are all **refused** (`0`) — the bare byte
+//!   integer was the long-standing divergence, now closed. `[]` (the same term as `nil`) is
+//!   *accepted* with size `0`, and valid nested lists / byte-aligned bitstrings
+//!   (`[1,[2,<<3>>]]`, `[<<1:8>>]`) flatten to the correct size and bytes.
+//! * **`enif_get_string` under `ERL_NIF_UTF8`** drops a multibyte character that does not fit the
+//!   byte budget **whole** (never emitting a truncated sequence) and answers the negative required
+//!   length: `[16#61,16#20AC]` fits exactly in a 5-byte buffer (answer `5`, bytes
+//!   `61 e2 82 ac`), is `-2` one byte smaller (the ASCII prefix written, the `€` dropped whole),
+//!   and `[16#20AC]` alone is `-1` in a 3-byte buffer.
+//! * **`enif_inspect_binary`** accepts a **byte-sized** bitstring whose start is not byte-aligned
+//!   (answering `1` with the window's real bytes), while still refusing a **non-byte-sized** one
+//!   (`<<1:7>>`).
+//! * **`enif_make_sub_binary`** windows a bit-offset source by **bits** and answers the empty
+//!   binary for a **zero-size** request at *any* position — including one past the last byte.
+//!
+//! Honest caveat on the bit-offset shapes (`110`, `120`, `121`): the two runtimes do not build the
+//! window the same way internally — the oracle's `bs_get_binary2` yields a genuine unaligned
+//! sub-bits *into* the source, while this runtime's `bs_match` copies the bits into a byte-aligned
+//! on-heap bitstring (`beam_engine`'s `BsGetBinary2`, and `erts_debug:unaligned_bitstring/2`'s
+//! documented representational deviation). The **observable** is identical either way, so the cases
+//! pin the byte size and the shifted bytes through `enif_inspect_binary` / `enif_make_sub_binary`
+//! rather than the internal offset.
 //!
 //! # Skip policy (inherited from [`super::nif_so`])
 //!
@@ -88,19 +124,20 @@
 use super::{Case, CaseKind, Contract, Golden, ModuleRun};
 use crate::module_build::NifFixture;
 
-/// The embedded module: the library's single `ErlNifFunc` stub (`probe/1`, exported so the oracle
-/// accepts the library) plus the `classify/1` driver.
+/// The embedded module: the library's two `ErlNifFunc` stubs (`probe/1` and `probe_term/2`, both
+/// exported so the oracle accepts the library) plus the `classify/1` driver.
 ///
 /// `classify/1` loads the library next to this module's `.beam` and, on a successful load,
-/// forwards the selector to `probe/1` through an **external** call. Only an integer leaves
-/// `run/1`: a NIF raise is caught and mapped to a class code, and any non-integer return is
-/// mapped to `90`, so the module's observable is always one integer line.
+/// forwards the selector to one of the two entry points through an **external** call. Only an
+/// integer leaves `run/1`: a NIF raise is caught and mapped to a class code, and any non-integer
+/// return is mapped to `90`, so the module's observable is always one integer line.
 const NIF_EXTRA_MODULE_SOURCE: &str = r#"-module(nif_extra).
--export([classify/1, probe/1]).
+-export([classify/1, probe/1, probe_term/2]).
 
-%% The library's single ErlNifFunc entry: stubbed and exported so erlang:load_nif/2 accepts the
-%% library, and dead code once the load succeeds (the real implementation is in the .so).
+%% The library's two ErlNifFunc entries: stubbed and exported so erlang:load_nif/2 accepts the
+%% library, and dead code once the load succeeds (the real implementations are in the .so).
 probe(_) -> erlang:nif_error(not_loaded).
+probe_term(_, _) -> erlang:nif_error(not_loaded).
 
 classify(N) ->
     Dir = filename:dirname(code:which(?MODULE)),
@@ -109,11 +146,45 @@ classify(N) ->
         {error, {Reason, _Text}} -> reason_code(Reason)
     end.
 
+%% The selector >= 100 block is term-driven: the module builds the term here and hands it to the
+%% library's second entry point. The C API has no bitstring constructor, so a non-byte-aligned
+%% bitstring — and an improper list, which the constructors cannot express either — can only be
+%% built on this side. Every other selector stays on the integer-driven probe/1.
+dispatch(N) when N >= 100 -> nif_extra:probe_term(N, built_term(N));
+dispatch(N) -> nif_extra:probe(N).
+
+%% The term each term-driven selector observes.
+built_term(101) -> 65;                            %% a bare byte integer (not an iolist)
+built_term(102) -> [1 | 2];                       %% an improper list
+built_term(103) -> [256];                         %% a non-byte integer head
+built_term(104) -> [<<1:7>>];                     %% a bit-sized (non-byte-aligned) element
+built_term(105) -> [];                            %% the empty list
+built_term(106) -> [1, [2, <<3>>]];               %% nested list + byte-aligned bitstring
+built_term(107) -> [<<1:8>>];                     %% a one-byte bitstring element
+built_term(108) -> [[]];                          %% a byte-less nested list
+built_term(109) -> [1 | <<2>>];                   %% the binary tail rule
+built_term(110) -> bit_window();                  %% enif_inspect_binary over a bit-offset window
+built_term(111) -> <<1:7>>;                       %% a non-byte-sized bitstring
+built_term(120) -> bit_window();                  %% enif_make_sub_binary(pos 0) of a bit-offset source
+built_term(121) -> bit_window();                  %% enif_make_sub_binary(pos 4) of a bit-offset source
+built_term(122) -> <<"abcdef">>;                  %% a zero-size sub-binary request
+built_term(123) -> <<"abcdef">>;                  %% a zero-size request one past the last byte
+built_term(130) -> [16#61, 16#20AC];              %% the UTF-8 truncation boundary (fits)
+built_term(131) -> [16#61, 16#20AC];              %% the UTF-8 truncation boundary (one byte short)
+built_term(132) -> [16#20AC].                     %% a lone multibyte char
+
+%% A 40-byte window that starts five bits into `<<0,1,…,45>>` — a byte-sized bitstring with a
+%% non-zero bit offset, exactly the shape enif_inspect_binary used to refuse.
+bit_window() ->
+    Bin = list_to_binary(lists:seq(0, 45)),
+    <<_:5, W:40/binary, _/bits>> = Bin,
+    W.
+
 %% Every branch answers an integer, so the golden is a VM-stable integer line. The raising
 %% selectors land in the explicit class clauses; the wildcard keeps a surprising failure a
 %% diffable integer rather than an escaping raise.
 run(N) ->
-    try nif_extra:probe(N) of
+    try dispatch(N) of
         I when is_integer(I) -> I;
         _ -> 90
     catch
@@ -163,6 +234,61 @@ static ERL_NIF_TERM make_bytes(ErlNifEnv* env, const char* s, size_t n) {
 static ERL_NIF_TERM make_nil(ErlNifEnv* env) {
     ERL_NIF_TERM none[1] = {0};
     return enif_make_list_from_array(env, none, 0);
+}
+
+/* ------------------------------------------------------------------- term-driven helpers */
+
+/* The flattened byte view of `term` as `enif_inspect_iolist_as_binary` reports it:
+ * `-1` when the C refused the term (its return was `0`), else the flattened byte count
+ * (`0` for the accepted empty iolist). `checksum` (when non-NULL) receives the order-sensitive
+ * byte checksum `sum((i + 1) * byte[i])` of the accepted view — `0` for an empty view.
+ * The view is only read, never released (the `probe/1` arms keep the same contract). */
+static int iolist_shape(ErlNifEnv* env, ERL_NIF_TERM term, unsigned long long* checksum) {
+    ErlNifBinary v;
+    unsigned long long sum = 0;
+    size_t i;
+
+    if (!enif_inspect_iolist_as_binary(env, term, &v))
+        return -1;
+    for (i = 0; i < v.size; i++)
+        sum += (unsigned long long) (i + 1) * v.data[i];
+    if (checksum != NULL)
+        *checksum = sum;
+    return (int) v.size;
+}
+
+/* The byte view of `term` as `enif_inspect_binary` reports it, encoded as
+ * `size * 1000000 + sum((i + 1) * byte[i])` so a wrong size and wrong bytes are both visible;
+ * `-1` when the C refused the term. */
+static long long binary_view(ErlNifEnv* env, ERL_NIF_TERM term) {
+    ErlNifBinary v;
+    unsigned long long sum = 0;
+    size_t i;
+
+    if (!enif_inspect_binary(env, term, &v))
+        return -1;
+    for (i = 0; i < v.size; i++)
+        sum += (unsigned long long) (i + 1) * v.data[i];
+    return (long long) v.size * 1000000LL + (long long) sum;
+}
+
+/* `1` when `term` is the *accepted empty* iolist: `enif_inspect_iolist_as_binary` answered `1`,
+ * the size is `0`, and the view carries the C's **non-NULL** dummy `data` (`erl_nif.c:1392`:
+ * `bin->data = (unsigned char *)&bin->data;`), else `0`. */
+static int iolist_is_empty(ErlNifEnv* env, ERL_NIF_TERM term) {
+    ErlNifBinary v;
+    v.size = 0;
+    v.data = NULL;
+    v.ref_bin = NULL;
+    if (!enif_inspect_iolist_as_binary(env, term, &v))
+        return 0;
+    return (v.size == 0 && v.data != NULL) ? 1 : 0;
+}
+
+/* `enif_make_sub_binary(env, term, pos, size)` inspected through `enif_inspect_binary`, encoded
+ * like `binary_view`. */
+static long long sub_binary_view(ErlNifEnv* env, ERL_NIF_TERM term, size_t pos, size_t size) {
+    return binary_view(env, enif_make_sub_binary(env, term, pos, size));
 }
 
 static ERL_NIF_TERM probe(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
@@ -633,10 +759,109 @@ static ERL_NIF_TERM probe(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
     return enif_make_int(env, -1);
 }
 
-static ErlNifFunc nif_extra_funcs[] = {
-    {"probe", 1, probe, 0}
-};
+/* The term-driven entry: observe a term the module built in Erlang. The NIF C API has no
+ * bitstring constructor, so a non-byte-aligned bitstring (and a window of one) can only be built
+ * on the Erlang side; the same route carries the shapes the constructors cannot express either
+ * (an improper list). Each arm returns a plain integer, so every golden stays VM-stable. */
+static ERL_NIF_TERM probe_term(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    int sel = 0;
+    ERL_NIF_TERM term;
 
+    if (argc != 2 || !enif_get_int(env, argv[0], &sel))
+        return enif_make_badarg(env);
+    term = argv[1];
+
+    switch (sel) {
+    /* ------------------------------------------- enif_inspect_iolist_as_binary shape rules */
+    case 101:                                  /* a BARE byte integer is not an iolist */
+        return enif_make_int(env, iolist_shape(env, term, NULL) == -1 ? 1 : 0);
+    case 102:                                  /* an improper-list tail [1|2] */
+        return enif_make_int(env, iolist_shape(env, term, NULL) == -1 ? 1 : 0);
+    case 103:                                  /* a non-byte integer head [256] */
+        return enif_make_int(env, iolist_shape(env, term, NULL) == -1 ? 1 : 0);
+    case 104: {                                /* a bit-sized element [<<1:7>>] */
+        return enif_make_int(env, iolist_shape(env, term, NULL) == -1 ? 1 : 0);
+    }
+    case 105: case 108: {                      /* [] and [[]]: the accepted empty iolist, size 0 */
+        return enif_make_int(env, iolist_is_empty(env, term));
+    }
+    case 106: {                                /* [1,[2,<<3>>]] flattens to <<1,2,3>> */
+        unsigned long long sum = 0;
+        int n = iolist_shape(env, term, &sum);
+        /* 1*1 + 2*2 + 3*3 = 14 */
+        return enif_make_int(env, (n == 3 && sum == 14) ? 1 : 0);
+    }
+    case 107: {                                /* [<<1:8>>] flattens to the single byte 1 */
+        unsigned long long sum = 0;
+        int n = iolist_shape(env, term, &sum);
+        return enif_make_int(env, (n == 1 && sum == 1) ? 1 : 0);
+    }
+    case 109: {                                /* [1|<<2>>] flattens to <<1,2>> */
+        unsigned long long sum = 0;
+        int n = iolist_shape(env, term, &sum);
+        /* 1*1 + 2*2 = 5 */
+        return enif_make_int(env, (n == 2 && sum == 5) ? 1 : 0);
+    }
+    /* ---------------------------------------------------------------- enif_inspect_binary */
+    case 110:                                  /* a byte-sized bit-offset window reports 1 + bytes */
+        return enif_make_int64(env, (ErlNifSInt64) binary_view(env, term));
+    case 111:                                  /* a non-byte-sized bitstring is still refused */
+        return enif_make_int(env, binary_view(env, term) == -1 ? 1 : 0);
+
+    /* --------------------------------------------------------------- enif_make_sub_binary */
+    case 120:                                  /* a bit-offset window, byte pos 0, 8 bytes */
+        return enif_make_int64(env, (ErlNifSInt64) sub_binary_view(env, term, 0, 8));
+    case 121:                                  /* a bit-offset window, byte pos 4, 8 bytes */
+        return enif_make_int64(env, (ErlNifSInt64) sub_binary_view(env, term, 4, 8));
+    case 122: case 123: {                      /* a zero-size window is the empty binary */
+        size_t pos = (sel == 122) ? 3 : 7;      /* 7 is one past the last byte of <<"abcdef">> */
+        ERL_NIF_TERM s = enif_make_sub_binary(env, term, pos, 0);
+        ErlNifBinary v;
+        if (!enif_inspect_binary(env, s, &v))
+            return enif_make_int(env, 0);
+        return enif_make_int(env, (v.size == 0 && enif_is_binary(env, s)) ? 1 : 0);
+    }
+
+    /* ------------------------------------------------- enif_get_string under ERL_NIF_UTF8 */
+    case 130: {                                /* the ASCII prefix + one whole char fit exactly */
+        static const unsigned char want[5] = {0x61, 0xE2, 0x82, 0xAC, 0x00};
+        char buf[8];
+        int r;
+        memset(buf, 0x7F, sizeof(buf));
+        r = enif_get_string(env, term, buf, 5, ERL_NIF_UTF8);
+        if (r != 5 || memcmp(buf, want, sizeof(want)) != 0)
+            return enif_make_int(env, -100);
+        return enif_make_int(env, r);
+    }
+    case 131: {                                /* one byte too small: the char is dropped whole */
+        char buf[8];
+        int r;
+        memset(buf, 0x7F, sizeof(buf));
+        r = enif_get_string(env, term, buf, 4, ERL_NIF_UTF8);
+        if (r != -2 || (unsigned char) buf[0] != 0x61 || buf[1] != '\0')
+            return enif_make_int(env, -100);
+        return enif_make_int(env, r);
+    }
+    case 132: {                                /* a lone multibyte char that cannot fit at all */
+        char buf[8];
+        int r;
+        memset(buf, 0x7F, sizeof(buf));
+        r = enif_get_string(env, term, buf, 3, ERL_NIF_UTF8);
+        if (r != -1 || buf[0] != '\0')
+            return enif_make_int(env, -100);
+        return enif_make_int(env, r);
+    }
+
+    default:
+        break;
+    }
+    return enif_make_int(env, -1);
+}
+
+static ErlNifFunc nif_extra_funcs[] = {
+    {"probe", 1, probe, 0},
+    {"probe_term", 2, probe_term, 0}
+};
 /* `ERL_NIF_INIT` seeds ErlNifEntry.name with the stringified module name (`nif_extra`), so this
    library may only be loaded as `nif_extra`. */
 ERL_NIF_INIT(nif_extra, nif_extra_funcs, load, NULL, NULL, NULL)
@@ -917,9 +1142,119 @@ pub(crate) fn group() -> Vec<Case> {
         case("nif_extra/time_convert_sec_to_nsec", "enif_convert_time_unit maps 1 s to 1e9 ns", &[60], "1"),
         case("nif_extra/time_convert_sec_to_msec", "enif_convert_time_unit maps 1 s to 1000 ms", &[61], "1"),
         case("nif_extra/time_monotonic_non_decreasing", "enif_monotonic_time never runs backwards", &[62], "1"),
+        // --- enif_inspect_iolist_as_binary: the C's positional shape rules ------------------
+        case(
+            "nif_extra/iolist_refuses_bare_byte_integer",
+            "enif_inspect_iolist_as_binary refuses a bare byte integer (a byte is only ever a cons head)",
+            &[101],
+            "1",
+        ),
+        case(
+            "nif_extra/iolist_refuses_improper_tail",
+            "enif_inspect_iolist_as_binary refuses the improper list [1|2]",
+            &[102],
+            "1",
+        ),
+        case(
+            "nif_extra/iolist_refuses_non_byte_head",
+            "enif_inspect_iolist_as_binary refuses the non-byte integer head [256]",
+            &[103],
+            "1",
+        ),
+        case(
+            "nif_extra/iolist_refuses_bit_sized_element",
+            "enif_inspect_iolist_as_binary refuses the non-byte-aligned element [<<1:7>>]",
+            &[104],
+            "1",
+        ),
+        case(
+            "nif_extra/iolist_accepts_empty_list_size_zero",
+            "enif_inspect_iolist_as_binary accepts [] with size 0",
+            &[105],
+            "1",
+        ),
+        case(
+            "nif_extra/iolist_flattens_nested_list_and_binary",
+            "enif_inspect_iolist_as_binary flattens [1,[2,<<3>>]] to <<1,2,3>>",
+            &[106],
+            "1",
+        ),
+        case(
+            "nif_extra/iolist_accepts_byte_aligned_bitstring_element",
+            "enif_inspect_iolist_as_binary accepts [<<1:8>>] and flattens it to <<1>>",
+            &[107],
+            "1",
+        ),
+        case(
+            "nif_extra/iolist_accepts_byte_less_nested_list",
+            "enif_inspect_iolist_as_binary accepts [[]] with size 0 and the non-NULL dummy data",
+            &[108],
+            "1",
+        ),
+        case(
+            "nif_extra/iolist_accepts_binary_tail",
+            "enif_inspect_iolist_as_binary accepts the binary tail [1|<<2>>] and flattens it",
+            &[109],
+            "1",
+        ),        // --- enif_inspect_binary over a bit-offset window -----------------------------------
+        case(
+            "nif_extra/binary_inspect_bit_offset_window",
+            "enif_inspect_binary accepts a byte-sized bit-offset window: size 40 + byte checksum",
+            &[110],
+            "40100960",
+        ),
+        case(
+            "nif_extra/binary_inspect_refuses_non_byte_sized",
+            "enif_inspect_binary refuses the non-byte-sized bitstring <<1:7>>",
+            &[111],
+            "1",
+        ),
+        // --- enif_make_sub_binary: bit-offset windows and the zero-size request -------------
+        case(
+            "nif_extra/sub_binary_bit_offset_window_from_zero",
+            "enif_make_sub_binary windows a bit-offset source by bits (byte pos 0, 8 bytes)",
+            &[120],
+            "8005384",
+        ),
+        case(
+            "nif_extra/sub_binary_bit_offset_window_from_four",
+            "enif_make_sub_binary windows a bit-offset source by bits (byte pos 4, 8 bytes)",
+            &[121],
+            "8003358",
+        ),
+        case(
+            "nif_extra/sub_binary_zero_size_is_empty",
+            "enif_make_sub_binary with size 0 is the empty binary",
+            &[122],
+            "1",
+        ),
+        case(
+            "nif_extra/sub_binary_zero_size_past_the_end_is_empty",
+            "enif_make_sub_binary with size 0 accepts a pos one past the last byte and is empty",
+            &[123],
+            "1",
+        ),
+        // --- enif_get_string under ERL_NIF_UTF8: the truncation rule ------------------------
+        case(
+            "nif_extra/string_utf8_ascii_prefix_plus_whole_char_fits",
+            "enif_get_string UTF-8 writes the ASCII prefix and one whole multibyte char (return 5)",
+            &[130],
+            "5",
+        ),
+        case(
+            "nif_extra/string_utf8_drops_char_whole_one_byte_short",
+            "enif_get_string UTF-8 drops the multibyte char whole when it does not fit (return -2)",
+            &[131],
+            "-2",
+        ),
+        case(
+            "nif_extra/string_utf8_lone_multibyte_char_too_large",
+            "enif_get_string UTF-8 answers -1 when only the multibyte char is present and cannot fit",
+            &[132],
+            "-1",
+        ),
     ]
 }
-
 #[cfg(test)]
 mod tests {
     //! Invariants of the widened A.3 group: every case is a module-run case claiming
@@ -1087,13 +1422,47 @@ mod tests {
     #[test]
     fn the_module_exports_and_calls_the_probe() {
         for needle in [
-            "-export([classify/1, probe/1])",
+            "-export([classify/1, probe/1, probe_term/2])",
             "nif_extra:probe(N)",
+            "nif_extra:probe_term(N, built_term(N))",
             "erlang:load_nif(Dir ++ \"/nif_extra\", 0)",
         ] {
             assert!(
                 super::NIF_EXTRA_MODULE_SOURCE.contains(needle),
                 "the module must contain {needle:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_term_driven_selector_has_a_built_term() {
+        // A selector routed to `probe_term/2` must have a `built_term/1` clause, or the module
+        // raises `function_clause` and the case observes an error instead of the C's answer.
+        let mut term_driven = 0;
+        for case in group() {
+            let CaseKind::Module(run) = &case.kind else {
+                unreachable!("every case in this group is a module-run case")
+            };
+            if run.args[0] < 100 {
+                continue;
+            }
+            term_driven += 1;
+            assert!(
+                super::NIF_EXTRA_MODULE_SOURCE.contains(&format!("built_term({}) ->", run.args[0])),
+                "case {}: selector {} has no built_term/1 clause",
+                case.id,
+                run.args[0]
+            );
+        }
+        assert!(term_driven >= 10, "the term-driven block must carry a broad selector set");
+        // The two entry points really are both registered in the C table.
+        for needle in ["{\"probe\", 1, probe, 0}", "{\"probe_term\", 2, probe_term, 0}"] {
+            assert!(super::NIF_EXTRA_C.contains(needle), "the library must register {needle}");
+        }
+        for needle in ["probe(_) -> erlang:nif_error(not_loaded)", "probe_term(_, _) -> erlang:nif_error(not_loaded)"] {
+            assert!(
+                super::NIF_EXTRA_MODULE_SOURCE.contains(needle),
+                "the module must stub every ErlNifFunc entry: {needle}"
             );
         }
     }
