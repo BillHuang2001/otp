@@ -920,3 +920,175 @@
         let err = decoder.decode(&mut heap, &mut atoms).unwrap_err();
         assert!(matches!(err, BeamError::BadArg), "got {err:?}");
     }
+
+    // -----------------------------------------------------------------------
+    // Local-node identifier demotion (`Decode` side of the A.5 round-trip)
+    // -----------------------------------------------------------------------
+    //
+    // With the local node identity installed (`Decoder::with_local_node`) an
+    // incoming external identifier whose node/creation name *this* node is
+    // materialized as the **internal** form (internal pid/port immediate, M1
+    // internal reference) instead of an external thing — the C's
+    // `dec_is_this_node` branches (`external.c:3175-3182` pid, `:4721` port,
+    // `:4821-4862` ref). Without an identity every one of these images keeps
+    // decoding to the external form, so the seam is inert by default.
+
+    /// Interns the `\"n1\"` node atom and decodes `bytes` with that node as the local
+    /// node (creation `creation`), returning the term and the table it points into.
+    fn decode_with_local_node(bytes: &[u8], creation: u32) -> (Heap, AtomTable, Eterm) {
+        let mut heap = Heap::new(256).expect("tiny heap allocation");
+        let mut atoms = AtomTable::new();
+        let node = atoms.intern("n1");
+        let term = decode_term_with_local_node(bytes, &mut heap, &mut atoms, node, creation, None)
+            .expect("valid local image decodes");
+        (heap, atoms, term)
+    }
+
+    #[test]
+    fn a_local_pid_and_port_demote_to_the_internal_form() {
+        use beam_term::prelude::{
+            is_internal_pid, is_internal_port, pid_number, pid_serial, port_number,
+        };
+
+        // `NEW_PID_EXT` naming the local node: number 0x01020304, serial 0x05060708.
+        let mut pid = vec![131, 88];
+        pid.extend_from_slice(&NODE_N1);
+        pid.extend_from_slice(&0x0102_0304u32.to_be_bytes());
+        pid.extend_from_slice(&0x0506_0708u32.to_be_bytes());
+        pid.extend_from_slice(&9u32.to_be_bytes());
+        let (_h, _a, term) = decode_with_local_node(&pid, 9);
+        assert!(is_internal_pid(term), "expected an internal pid, got {term:?}");
+        // The wire reads number then serial; the internal form recovers both.
+        assert_eq!(pid_number(term), 0x0102_0304);
+        assert_eq!(pid_serial(term), 0x0506_0708);
+
+        // `V4_PORT_EXT` naming the local node: a full 64-bit id.
+        let mut port = vec![131, 120];
+        port.extend_from_slice(&NODE_N1);
+        port.extend_from_slice(&0x0000_0007_0000_0001u64.to_be_bytes());
+        port.extend_from_slice(&5u32.to_be_bytes());
+        let (_h, _a, term) = decode_with_local_node(&port, 5);
+        assert!(is_internal_port(term), "expected an internal port, got {term:?}");
+        assert_eq!(port_number(term), 0x0000_0007_0000_0001);
+
+        // The legacy `PID_EXT` (tiny 8-bit creation) demotes too, and its field
+        // order (number then serial) is preserved.
+        let mut legacy = vec![131, 103];
+        legacy.extend_from_slice(&NODE_N1);
+        legacy.extend_from_slice(&1u32.to_be_bytes());
+        legacy.extend_from_slice(&2u32.to_be_bytes());
+        legacy.push(3);
+        let (_h, _a, term) = decode_with_local_node(&legacy, 3);
+        assert!(is_internal_pid(term));
+        assert_eq!((pid_number(term), pid_serial(term)), (1, 2));
+    }
+
+    #[test]
+    fn a_local_reference_demotes_to_the_internal_form() {
+        use crate::term::internal_ref_id;
+
+        // `NEWER_REFERENCE_EXT` carrying three numbers is the id their pack yields.
+        let mut image = vec![131, 90, 0, 3];
+        image.extend_from_slice(&NODE_N1);
+        image.extend_from_slice(&7u32.to_be_bytes());
+        image.extend_from_slice(&1u32.to_be_bytes());
+        image.extend_from_slice(&2u32.to_be_bytes());
+        image.extend_from_slice(&3u32.to_be_bytes());
+        let (_h, _a, term) = decode_with_local_node(&image, 7);
+        assert_eq!(
+            internal_ref_id(term).expect("internal reference"),
+            crate::ref_wire::ref_numbers_to_id(&[1, 2, 3])
+        );
+
+        // A legacy `REFERENCE_EXT` (101) with `r0 = 42` is the id 42 (a single number
+        // is zero-padded to the three the internal form packs).
+        let mut legacy = vec![131, 101];
+        legacy.extend_from_slice(&NODE_N1);
+        legacy.extend_from_slice(&42u32.to_be_bytes());
+        legacy.push(1);
+        let (_h, _a, term) = decode_with_local_node(&legacy, 1);
+        assert_eq!(internal_ref_id(term).unwrap(), 42);
+    }
+
+    #[test]
+    fn a_local_reference_round_trips_every_id_magnitude() {
+        use crate::term::internal_ref_id;
+
+        for id in [
+            0u64,
+            1,
+            42,
+            1 << 18,
+            1 << 32,
+            1 << 40,
+            1 << 45,
+            (1u64 << 59) - 1,
+        ] {
+            // Build the image from the id's own wire numbers, so the round-trip is
+            // exercised across the whole 60-bit id space.
+            let numbers = crate::ref_wire::ref_id_to_numbers(id);
+            let mut image = vec![131, 90, 0, 3];
+            image.extend_from_slice(&NODE_N1);
+            image.extend_from_slice(&0u32.to_be_bytes()); // creation
+            for number in numbers {
+                image.extend_from_slice(&number.to_be_bytes());
+            }
+            let (_h, _a, term) = decode_with_local_node(&image, 0);
+            assert_eq!(internal_ref_id(term).unwrap(), id, "id = {id}");
+        }
+    }
+
+    #[test]
+    fn a_compressed_local_image_demotes_through_the_entry_point() {
+        use beam_term::prelude::is_internal_pid;
+
+        // A `COMPRESSED` image whose inner body is a local `NEW_PID_EXT`: the identity
+        // must be installed on the compressed-body path too (it is not a bare
+        // `decode` of the inflated bytes).
+        let mut body = vec![88];
+        body.extend_from_slice(&NODE_N1);
+        body.extend_from_slice(&7u32.to_be_bytes());
+        body.extend_from_slice(&8u32.to_be_bytes());
+        body.extend_from_slice(&4u32.to_be_bytes());
+        let zlib = crate::compress::compress(&body, 6).unwrap();
+        let mut image = vec![VERSION_MAGIC, COMPRESSED_EXT];
+        image.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        image.extend_from_slice(&zlib);
+
+        let (_h, _a, term) = decode_with_local_node(&image, 4);
+        assert!(is_internal_pid(term), "expected an internal pid, got {term:?}");
+    }
+
+    #[test]
+    fn without_an_identity_the_external_form_is_kept() {
+        // The very same local-node images decode to the *external* things when no
+        // identity is installed — the seam is inert by default and decoding is
+        // unchanged.
+        let mut pid = vec![131, 88];
+        pid.extend_from_slice(&NODE_N1);
+        pid.extend_from_slice(&0x0102_0304u32.to_be_bytes());
+        pid.extend_from_slice(&0x0506_0708u32.to_be_bytes());
+        pid.extend_from_slice(&9u32.to_be_bytes());
+        let (_h, atoms, term) = decode(&pid);
+        let (node, number, serial, creation) = external_pid_parts(term).unwrap();
+        assert_eq!(atoms.name(atom_val(node)), Some("n1"));
+        assert_eq!((number, serial, creation), (0x0102_0304, 0x0506_0708, 9));
+
+        let mut port = vec![131, 120];
+        port.extend_from_slice(&NODE_N1);
+        port.extend_from_slice(&7u64.to_be_bytes());
+        port.extend_from_slice(&5u32.to_be_bytes());
+        let (_h, _a, term) = decode(&port);
+        let (node, number, creation) = external_port_parts(term).unwrap();
+        assert_eq!(atoms.name(atom_val(node)), Some("n1"));
+        assert_eq!((number, creation), (7, 5));
+
+        let mut reference = vec![131, 90, 0, 1];
+        reference.extend_from_slice(&NODE_N1);
+        reference.extend_from_slice(&7u32.to_be_bytes());
+        reference.extend_from_slice(&1u32.to_be_bytes());
+        let (_h, _a, term) = decode(&reference);
+        let (node, ids, creation) = external_ref_parts(term).unwrap();
+        assert_eq!(atoms.name(atom_val(node)), Some("n1"));
+        assert_eq!((ids, creation), (&[1u32][..], 7));
+    }
