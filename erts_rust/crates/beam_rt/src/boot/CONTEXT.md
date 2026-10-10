@@ -145,23 +145,54 @@ configuration and it runs **all 22 directives to completion**, ending at the fin
   (`application_controller.erl:203-211`), i.e. the AC completed `init/2` (`:531-558`) and reached
   `gen_server:enter_loop`.
   `heart` is not registered either, legitimately: `heart:start/0` returns `ignore`.
-- **`logger` is NOT registered — a cross-crate seam gap, not a boot gap.** Instruction 13's
-  `{kernelProcess,logger,{logger_server,start_link,[]}}` spawns the `logger_server` child through
-  `proc_lib:start_link/5` (`gen_server:start_link({local,logger}, …)`), whose body is entered through
-  `erlang:apply/3` (`proc_lib:init_p_do_apply/3`'s `try apply(M,F,A)`).
-  Because `erlang` is a member of `../native`'s `FLOOR_MODULES`, `RuntimeContext::resolve_external_call`
-  declines that call (`Ok(None)`), so the apply runs **synchronously** instead of through the
-  `Step::Enter` seam and the child's blocking `gen_server:init_it`/`init` folds into the typed
-  `error::blocked()`.
-  The child therefore dies before `proc_lib:init_ack/2`, `gen_server:init_it` never reaches its
-  `register(logger, self())`, and the directive's parked `proc_lib:sync_start/2` (timeout `infinity`)
-  never resumes.
-  The oracle **does** register the name: real OTP leaves a live `logger_server` registered as `logger`,
-  so a second `logger_server:start_link/0` reports `{error,{already_started,Pid}}`.
-  Closing the gap is a `beam_engine` change (give `call_ext`/`erlang:apply/2,3` the
-  `resolve_external_call`/`Step::Enter` treatment the literal-target `call_ext` already gets) or a
-  `../context` change (intercept `erlang:apply/2,3` in `call_bif` and run the target through the
-  blocking-aware entry) — **not** a boot change.
+- **`logger` is NOT registered — the `erlang:apply/3` seam gap, still open.** Instruction 13's
+  `{kernelProcess,logger,{logger_server,start_link,[]}}` makes
+  [`start_kernel_process`](drive.rs) `spawn_process` the directive, whose `gen_server:start_link/3`
+  spawns the `logger_server` child through `proc_lib:start_link/5`; the child is entered at
+  `proc_lib:init_p_do_apply/3`, whose body is `try … apply(M,F,A) … catch … end`.
+  `erlc` compiles that `apply/3` to a **`call_ext`** to `{extfunc,erlang,apply,3}` (the `call_ext*`
+  target is a literal atom even when the applied module is a variable). The engine's `CallExt` arm
+  asks [`RuntimeContext::resolve_external_call`](../context/mod.rs) first, which answers `Ok(None)`
+  for `erlang` (it is a member of [`../native`](../native/CONTEXT.md)'s `FLOOR_MODULES`), so the call
+  falls through to the synchronous `call_import` → `call_bif` → `native::apply_dynamic` →
+  `run_export` → `run_export_blocking` route. That route builds a **nested `Machine`** and pumps the
+  scheduler while the callee is suspended — but a context that *is* a scheduler slice
+  (`RuntimeContext::for_process` ⇒ `may_pump_scheduler() == false`) must not re-enter the scheduler,
+  so `pump_once` reports `Ok(None)` and the call folds into the typed `error::blocked()` sentinel
+  (`../error.rs::unsupported_reason`).
+  The sentinel is **uncatchable in practice**: the child really is inside `proc_lib`'s `try`, but
+  `Machine::raise_bif_error` can only land an error in a live catch frame when the running module's
+  atom table holds the reason atom, and no compiler emits
+  `'unsupported_opcode: run: process blocked (no message available)'` — so the raise escapes and the
+  child dies. Its registered name dies with it, the directive's parked `proc_lib:sync_start/2`
+  (timeout `infinity`) never resumes, and `whereis(logger)` stays `undefined` while the boot still
+  reaches `{progress,started}`.
+  The oracle **does** register the name (a live `logger_server` registered as `logger`; a second
+  `logger_server:start_link/0` reports `{error,{already_started,Pid}}`).
+  **A single-level fix is not enough.** The blocking callee is reached through *two* nested `apply/3`
+  levels on this path (`proc_lib:init_p_do_apply/3` → `gen:init_it/7` → `gen_server:init_it/6`), and
+  each level is a separate nested `Machine`; `gen:register_name` runs inside the deepest one, so the
+  outer process must stay alive across the whole chain. The two sound routes are:
+  1. **`beam_engine`** (not this node's to change) — mirror C's `fixed_apply` (`fixed_apply`,
+     `../../erts/emulator/beam/beam_common.c:1528-1566`, dispatched through `$DISPATCH_EXPORT`): in
+     the `CallExt`/`CallExtOnly`/`CallExtLast` arms of `../beam_engine/src/interpreter/dispatch.rs`,
+     when the import target is `erlang:apply/2|3`, decode `x(0)=M`, `x(1)=F`, `x(2)=Args`, unpack
+     `Args` into `x(0..N)`, place M/F at `x(N)`/`x(N+1)` and dispatch through
+     `families::funs::apply_target` with the `Instr::Apply*` frame discipline — so the apply becomes
+     an in-machine `Step::Enter` and a `receive` inside the callee suspends the process normally.
+  2. **`../context`** (this crate) — a *park-and-resume* pending-apply protocol: `Runtime` keeps a
+     `HashMap<ProcessId, Vec<PendingApply>>` keyed by `(module, function, arity)`; a blocked nested
+     apply in a scheduled context stores its suspended `Machine` + resume address and returns the
+     sentinel; the runner's `Err` arm recognises the sentinel (via `error::unsupported_reason`) with a
+     pending entry for the pid and **parks** the process (Waiting + `publish_parked_roots` +
+     `serve_gc_request` + `set_relocation_exempt`, since the nested machines' `x`/stack are outside
+     the published root set), and the next slice re-dispatches the same instruction, which finds the
+     keyed entry and *resumes* the retained machine instead of restarting it (restarting is unsound:
+     `register/2` of an already-registered name raises `badarg`). The re-dispatch is outermost-first,
+     so a key-matched `Vec` per pid covers multi-level nesting. On the baseline-JIT tier the parked
+     address must be resumed interpretively — `Machine::current_code` is **block-granular** there
+     (`jit_set_position` records the block start), and re-entering a block mid-way would re-execute
+     its `allocate`/`try`.
   Pinned by `bootscript.rs::tests::the_real_boot_leaves_logger_unregistered_pending_the_apply_seam_gap`
   (asserting the current behaviour) and the `#[ignore]`d positive
   `bootscript.rs::tests::the_real_boot_registers_a_live_logger_process` (the oracle's behaviour,
@@ -224,12 +255,10 @@ because it cannot be duplicated.
   `{kernelProcess, …}` burst and an `{apply, …}`'s `Wait` arm both go through
   `drive_scheduler`, which checks the deadline between slices. An execution that suspends
   *inside* a `RuntimeContext` blocking pump instead — `RunOutcome::Wait` handled by
-  `run_export_blocking`/`run_label_blocking` (`../context/mod.rs`) — loops until the machine
-  returns or a pump reports `0`, with no wall-clock cap, so a perpetually runnable process on
-  the queue would keep that pump going. On the real `start.boot` every boot-spawned process is
-  parked in a `receive`, so the queue drains and the pump returns; the gap is a latent one for
-  a boot chain that would spawn a busy process. The cap belongs in `../context/mod.rs` (this
-  node's, but not `src/boot/**`).
+  `run_export_blocking`/`run_label_blocking` (`../context/mod.rs`) — is bounded by that pump's
+  own `BLOCKING_PUMP_DEADLINE` (checked between pump rounds, ending in a typed diagnostic
+  rather than a spin) and, earlier, by a pump that reports `0`; the nested cap is documented in
+  `../context/CONTEXT.md`.
 - `bootscript.rs` is ~1756 lines (production ~700, the rest its oracle test module) — the crate's
   documented long-file precedent; `drive.rs` is ~382 lines. `#![deny(unsafe_code)]`; no `unwrap()` on
   runtime data.
