@@ -54,11 +54,13 @@
 //! C's `beamasm_metadata_early_init`).
 //!
 //! Every line the map holds is a **real** native code range — an address is **never**
-//! fabricated. A **scheduled** process (`run <file.beam>`) enters a module export on the
-//! baseline tier, and the runner then snapshots that module's cached baseline artifacts
-//! (`beam_engine::jit::cache::baseline_code_map`) into the map through [`PerfMap::record`],
-//! once per first entry, so each line names code the baseline backend actually mapped. The
-//! map is **empty** in exactly the cases where no such entry happens: `+JPperf` is off (no
+//! fabricated. A **scheduled** process's first module-export entry is the one site that feeds
+//! the map: the runner snapshots that module's cached baseline artifacts
+//! (`beam_engine::jit::cache::baseline_code_map`, which compiles the module into the
+//! per-thread baseline cache on first sight) into the map through [`PerfMap::record`], once
+//! per first entry, so each line names code the baseline backend actually mapped. The
+//! snapshot is taken for every such entry, whatever execution tier the slice itself runs on.
+//! The map is **empty** in exactly the cases where no such entry happens: `+JPperf` is off (no
 //! file is opened at all), or the run is a single-pass action (`-eval`/`-s`/`-run`) that
 //! never enters a module export through the runner. The `jit-<pid>.dump` file carries the
 //! exact 40-byte JITDUMP header and no `JIT_CODE_LOAD`/`JIT_CODE_DEBUG_INFO` record (the dump
@@ -68,7 +70,7 @@
 //!
 //! | `+JPperf` value | file |
 //! |---|---|
-//! | `map` | `<directory>/perf-<pid>.map` (the baseline JIT's real code ranges, appended per first entry; empty when no scheduled process runs) |
+//! | `map` | `<directory>/perf-<pid>.map` (the baseline JIT's real code ranges, appended once per module-export first entry; empty when no such entry happens) |
 //! | `dump` | `<directory>/jit-<pid>.dump` (the 40-byte header, no records) |
 //! | `true` | both (`true` is `map` **and** `dump`) |
 //! | `fp` / `no_fp` | neither — frame pointers are a code-generation choice, and select no file |
