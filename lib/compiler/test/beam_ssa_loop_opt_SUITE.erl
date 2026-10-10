@@ -32,7 +32,8 @@
          off_by_default/1, non_trivial_loops_unchanged/1,
          type_driven_ssa/1, type_driven_probe/1,
          type_driven_equivalence/1, type_driven_kill_switches/1,
-         rem_to_band/1, arith_licm_ssa/1, arith_licm_declines/1,
+         rem_to_band/1, div_rem_pow2/1, huge_mul_declines/1,
+         arith_licm_ssa/1, arith_licm_declines/1, no_shift_hoist/1,
          arith_licm_probe/1, arith_licm_equivalence/1,
          arith_licm_kill_switches/1, default_output_identical/1]).
 suite() -> [{ct_hooks,[ts_install_cth]}, {timetrap,{minutes,5}}].
@@ -42,7 +43,8 @@ all() -> [strength_reduction, induction_variable_canonicalisation,
           off_by_default, non_trivial_loops_unchanged,
           type_driven_ssa, type_driven_probe,
           type_driven_equivalence, type_driven_kill_switches,
-          rem_to_band, arith_licm_ssa, arith_licm_declines,
+          rem_to_band, div_rem_pow2, huge_mul_declines,
+          arith_licm_ssa, arith_licm_declines, no_shift_hoist,
           arith_licm_probe, arith_licm_equivalence,
           arith_licm_kill_switches, default_output_identical].
 init_per_suite(Config) -> Config.
@@ -66,6 +68,16 @@ end_per_suite(_Config) -> ok.
 %% `arg_types' annotation -- is exercised here too, by annotating the
 %% synthetic instructions, and end-to-end on a real module in the
 %% `type_driven_*' tests below.
+%%
+%% Every reduction has to preserve EXCEPTIONS, not just values: `X * 2^n' is
+%% only turned into `X bsl n' for a provably INTEGRAL (a float shift rounds
+%% instead of raising `badarith') operand of provably BOUNDED magnitude (a
+%% shift raises `system_limit' where `*' returns a bignum) and n =< 64, and
+%% `div'/`rem' -> `bsr'/`band' need a non-negative dividend because `div'
+%% truncates towards zero while the bit operations do not. The firing proofs
+%% below therefore annotate a FINITE range, and the decline proofs cover the
+%% merely non-negative, unbounded-integer, possibly-negative, float and
+%% unannotated operands.
 %%=========================================================================
 
 strength_reduction(_Config) ->
@@ -74,20 +86,33 @@ strength_reduction(_Config) ->
     {In, Out} = run_pass(iv_loop(0, '+', 1)),
     {bif,'*'} = op(In, m),
     {bif,'div'} = op(In, d),
-    %% i * 8 -> i bsl 3 and i div 4 -> i bsr 2, rewritten in place: same
-    %% destination, same operands, only the operation and the literal change.
-    #b_set{op={bif,'bsl'}, dst=#b_var{name=m},
-           args=[#b_var{name=i}, #b_literal{val=3}]} = instr(Out, m),
+    %% `i div 4' -> `i bsr 2' (non-negativity is all that rule needs), but
+    %% `i * 8' stays `*': a structurally proven integer is UNBOUNDED, so the
+    %% shift is declined -- `bsl' raises `system_limit' past the bignum arity
+    %% bound where `*' would still have returned a bignum.
+    {bif,'*'} = op(Out, m),
     #b_set{op={bif,'bsr'}, dst=#b_var{name=d},
            args=[#b_var{name=i}, #b_literal{val=2}]} = instr(Out, d),
     %% Everything else in the loop is untouched.
     {bif,'+'} = op(Out, s),
 
+    %% A FINITE, bounded operand range is what licenses the shift: it proves
+    %% the result stays far below the arity bound. The rewrite is in place:
+    %% same destination, same operands, only the operation and the literal
+    %% change.
+    Bounded = #t_integer{elements={0,1000}},
+    {_, OutB} = run_pass(bounded_iv_loop(Bounded)),
+    #b_set{op={bif,'bsl'}, dst=#b_var{name=m},
+           args=[#b_var{name=i}, #b_literal{val=3}]} = instr(OutB, m),
+    #b_set{op={bif,'bsr'}, dst=#b_var{name=d},
+           args=[#b_var{name=i}, #b_literal{val=2}]} = instr(OutB, d),
+
     %% A decreasing induction variable starting at 9 is still a proven
-    %% integer, but it can go negative, so only the multiplication may be
-    %% reduced; `div' must stay behind because it truncates towards zero.
+    %% integer, but it can go negative and is unbounded: neither reduction
+    %% applies (`div' must stay behind on both counts -- it truncates towards
+    %% zero, and `bsr' floors).
     {_, Out2} = run_pass(iv_loop(9, '-', 1)),
-    {bif,'bsl'} = op(Out2, m),
+    {bif,'*'} = op(Out2, m),
     {bif,'div'} = op(Out2, d),
 
     %% `X * 2' is exact for every number -- a float doubles without rounding
@@ -107,21 +132,21 @@ induction_variable_canonicalisation(_Config) ->
     %% The step recurrence is canonicalised into `i + 1' ...
     [#b_literal{val=1}, #b_var{name=i}] = args(In, up),
     [#b_var{name=i}, #b_literal{val=1}] = args(Out, up),
-    %% ... and the induction variable is recognised, which is what licences
-    %% the reduction of the values derived from it.
-    #b_set{op={bif,'bsl'}, args=[#b_var{name=i}, #b_literal{val=3}]} =
-        instr(Out, m),
+    %% ... and the induction variable is recognised, which is what proves it
+    %% a non-negative integer and hence licences `div' -> `bsr' on the values
+    %% derived from it. (`*' -> `bsl' additionally needs a bounded operand
+    %% range, see `strength_reduction'.)
     #b_set{op={bif,'bsr'}, args=[#b_var{name=i}, #b_literal{val=2}]} =
         instr(Out, d),
+    {bif,'*'} = op(Out, m),
 
     %% A value computed from an induction variable inherits its facts: with
     %% i >= 0 and step +1 the value `j = i + 1' is a non-negative integer on
-    %% every iteration, so both reductions apply to it as well.
+    %% every iteration, so the quotient rule applies to it as well.
     {_, OutD} = run_pass(derived_loop()),
-    #b_set{op={bif,'bsl'}, args=[#b_var{name=j}, #b_literal{val=3}]} =
-        instr(OutD, jm),
     #b_set{op={bif,'bsr'}, args=[#b_var{name=j}, #b_literal{val=2}]} =
         instr(OutD, jd),
+    {bif,'*'} = op(OutD, jm),
     ok.
 
 strength_reduction_declines(_Config) ->
@@ -155,8 +180,14 @@ strength_reduction_equivalence(Config) ->
     Plain = load(Config, sr_plain, Src, []),
     Opt = load(Config, sr_opt, Src, [loop_opt]),
     Vals = [-1000001, -1000, -9, -3, -2, -1, 0, 1, 2, 3, 7, 8, 9, 255, 256,
-            1000000, 123456789012345678901234567890,
-            2.5, -2.5, 0.0, 1.0e300],
+            1000000, 123456789012345678901234567890, 1 bsl 200,
+            %% Floats: `X * 2' is `X + X' here, which must double exactly --
+            %% signed zero, subnormals and a value whose double overflows all
+            %% behave as the multiplication does.
+            2.5, -2.5, 0.0, -0.0, 5.0e-324, -5.0e-324, 1.0e-320, 1.0e308,
+            -1.0e308, 1.0e-300,
+            %% A non-number raises `badarith' in both builds.
+            foo, [a, b], <<1, 2:3>>, {}],
     lists:foreach(
       fun(F) ->
               lists:foreach(
@@ -168,8 +199,9 @@ strength_reduction_equivalence(Config) ->
                             false -> ct:fail({result_mismatch, F, V, A, B})
                         end
                 end, Vals)
-      end, [mul2, mul8, mul16, mul3, div2, div8, div16, div3,
-            div0, div1, idiv2_nonneg, loop_mul]),
+      end, [mul2, mul8, mul16, mul32, mul3, div2, div8, div16, div3,
+            div0, div1, idiv2_nonneg, idiv16_nonneg, irem16_nonneg,
+            loop_mul]),
     ok.
 
 %% Run `Mod:F(V)' and return the value or the {Class,Reason} of the
@@ -179,12 +211,14 @@ call(Mod, F, V) ->
 
 sr_src() ->
     "-module(sr_probe).\n"
-    "-export([mul2/1, mul8/1, mul16/1, mul3/1,\n"
+    "-export([mul2/1, mul8/1, mul16/1, mul32/1, mul3/1,\n"
     "         div2/1, div8/1, div16/1, div3/1, div0/1, div1/1,\n"
-    "         idiv2_nonneg/1, loop_mul/1]).\n"
+    "         idiv2_nonneg/1, idiv16_nonneg/1, irem16_nonneg/1,\n"
+    "         loop_mul/1]).\n"
     "mul2(X) -> X * 2.\n"
     "mul8(X) -> X * 8.\n"
     "mul16(X) -> X * 16.\n"
+    "mul32(X) -> X * 32.\n"
     "mul3(X) -> X * 3.\n"
     "div2(X) -> X div 2.\n"
     "div8(X) -> X div 8.\n"
@@ -193,6 +227,8 @@ sr_src() ->
     "div0(X) -> X div 0.\n"
     "div1(X) -> X div 1.\n"
     "idiv2_nonneg(X) when is_integer(X), X >= 0 -> X div 2.\n"
+    "idiv16_nonneg(X) when is_integer(X), X >= 0 -> X div 16.\n"
+    "irem16_nonneg(X) when is_integer(X), X >= 0 -> X rem 16.\n"
     "loop_mul(X) -> loop_mul(X, 20, 0).\n"
     "loop_mul(_X, 0, Acc) -> Acc;\n"
     "loop_mul(X, N, Acc) -> loop_mul(X, N - 1, Acc + X * 8 + X div 4).\n".
@@ -252,26 +288,44 @@ non_trivial_loops_unchanged(Config) ->
 
 type_driven_ssa(_Config) ->
     NonNeg = #t_integer{elements={0,'+inf'}},
+    Bounded = #t_integer{elements={0,1000}},
+    BoundedSigned = #t_integer{elements={-1000,1000}},
     AnyInt = #t_integer{},
     Negative = #t_integer{elements={'-inf',10}},
     Number = #t_number{elements={0,'+inf'}},
 
-    %% A non-negative integer annotation licences both rules.
-    {_, OutNN} = run_pass(ann_loop(NonNeg, NonNeg)),
+    %% A FINITE bounded range licences `*' -> `bsl' (the firing proof); the
+    %% non-negativity it implies licences `div' -> `bsr' as well.
+    {_, OutB} = run_pass(ann_loop(Bounded, Bounded)),
     #b_set{op={bif,'bsl'}, args=[#b_var{name=x}, #b_literal{val=3}]} =
-        instr(OutNN, m),
+        instr(OutB, m),
+    #b_set{op={bif,'bsr'}, args=[#b_var{name=x}, #b_literal{val=2}]} =
+        instr(OutB, d),
+
+    %% A finite range that reaches below zero licenses the shift (the
+    %% magnitude is bounded) but not `bsr' (the dividend may be negative).
+    {_, OutBS} = run_pass(ann_loop(BoundedSigned, BoundedSigned)),
+    #b_set{op={bif,'bsl'}, args=[#b_var{name=x}, #b_literal{val=3}]} =
+        instr(OutBS, m),
+    {bif,'div'} = op(OutBS, d),
+
+    %% A non-negative but UNBOUNDED annotation fires `div' -> `bsr' only: the
+    %% magnitude of the shift's operand is not proven, and `bsl' would raise
+    %% `system_limit' where `*' returns a bignum.
+    {_, OutNN} = run_pass(ann_loop(NonNeg, NonNeg)),
+    {bif,'*'} = op(OutNN, m),
     #b_set{op={bif,'bsr'}, args=[#b_var{name=x}, #b_literal{val=2}]} =
         instr(OutNN, d),
 
-    %% A plain integer annotation licences `*' -> `bsl' but not `div' ->
-    %% `bsr', which needs non-negativity.
+    %% A plain (unbounded) integer annotation proves integrality only, which
+    %% licenses neither rule now.
     {_, OutInt} = run_pass(ann_loop(AnyInt, AnyInt)),
-    {bif,'bsl'} = op(OutInt, m),
+    {bif,'*'} = op(OutInt, m),
     {bif,'div'} = op(OutInt, d),
 
-    %% A range that reaches below zero proves integrality only.
+    %% A range whose lower bound is not an integer proves integrality only.
     {_, OutNeg} = run_pass(ann_loop(Negative, Negative)),
-    {bif,'bsl'} = op(OutNeg, m),
+    {bif,'*'} = op(OutNeg, m),
     {bif,'div'} = op(OutNeg, d),
 
     %% `number' covers floats, so it proves nothing; neither does a union
@@ -287,7 +341,7 @@ type_driven_ssa(_Config) ->
     {bif,'div'} = op(OutFlt, d),
 
     %% Without an annotation the operand stays unknown, so nothing is
-    %% rewritten: the annotation, not the loop, is what licences the rewrite.
+    %% rewritten: the annotation, not the loop, is what licenses the rewrite.
     {_, OutNone} = run_pass(ann_loop(no_anno, no_anno)),
     {bif,'*'} = op(OutNone, m),
     {bif,'div'} = op(OutNone, d),
@@ -301,18 +355,20 @@ type_driven_ssa(_Config) ->
     {bif,'*'} = op(OutUnknown, m8),
 
     %% The annotation of a *defining* instruction is used as well: `y = x + 1'
-    %% is a non-negative integer because `x' is annotated as one, and that
-    %% makes `y * 8' reducible even though the product itself carries no
-    %% annotation.
+    %% is a non-negative integer because `x' is annotated as one, so `y div 4'
+    %% is reduced even though the quotient carries no annotation of its own;
+    %% `y * 8' is not, because that annotation proves the kind but no bound.
     {_, OutDer} = run_pass(ann_derived_loop(NonNeg)),
-    #b_set{op={bif,'bsl'}, args=[#b_var{name=y}, #b_literal{val=3}]} =
-        instr(OutDer, ym),
+    #b_set{op={bif,'bsr'}, args=[#b_var{name=y}, #b_literal{val=2}]} =
+        instr(OutDer, yd),
+    {bif,'*'} = op(OutDer, ym),
     {_, OutDerNo} = run_pass(ann_derived_loop(no_anno)),
     {bif,'*'} = op(OutDerNo, ym),
+    {bif,'div'} = op(OutDerNo, yd),
 
     %% Canonicalising `8 * x' into `x * 8' must move the annotation of the
     %% variable operand with it, otherwise the reduction loses its proof.
-    {_, OutLhs} = run_pass(ann_lhs_mul_loop(NonNeg)),
+    {_, OutLhs} = run_pass(ann_lhs_mul_loop(Bounded)),
     #b_set{op={bif,'bsl'}, args=[#b_var{name=x}, #b_literal{val=3}]} =
         instr(OutLhs, m),
     {_, OutLhsNo} = run_pass(ann_lhs_mul_loop(no_anno)),
@@ -328,25 +384,33 @@ type_driven_ssa(_Config) ->
 %%=========================================================================
 
 type_driven_probe(Config) ->
-    Plain = rcv_bifs(Config, lp_rcv_plain, []),
-    Opt = rcv_bifs(Config, lp_rcv_opt, [loop_opt]),
-    %% Without the option, `X * 8' and `X div 4' are `*' and `div'.
+    Src = receive_probe_src("lp_rcv"),
+    %% `rcv/1' guards the operand non-negative but leaves its magnitude
+    %% unbounded: `X div 4' -> `bsr 2' fires, `X * 8' stays `*'.
+    Plain = rcv_bifs(Config, lp_rcv, rcv, 1, Src, []),
     [{'*', [8]}, {'div', [4]}, {'+', []}] = Plain,
-    %% With it, they are reduced in place to `bsl 3' and `bsr 2'. Nothing is
-    %% added or removed: only the operation and the literal changes.
-    [{'bsl', [3]}, {'bsr', [2]}, {'+', []}] = Opt,
-    %% The kill switches turn the reduction off again.
-    NoLoop = rcv_bifs(Config, lp_rcv_noloop, [loop_opt, no_ssa_opt_loop_opt]),
-    NoSsa = rcv_bifs(Config, lp_rcv_nossa, [loop_opt, no_ssa_opt]),
-    [{'*', [8]}, {'div', [4]}, {'+', []}] = NoLoop,
-    [{'*', [8]}, {'div', [4]}, {'+', []}] = NoSsa,
+    [{'*', [8]}, {'bsr', [2]}, {'+', []}] =
+        rcv_bifs(Config, lp_rcv, rcv, 1, Src, [loop_opt]),
+    %% `rcvb/1' additionally bounds it (`X =< 1000'), so the operand's range
+    %% is finite and BOTH rules fire. Nothing is added or removed: only the
+    %% operation and the literal changes.
+    [{'*', [8]}, {'div', [4]}, {'+', []}] =
+        rcv_bifs(Config, lp_rcv, rcvb, 1, Src, []),
+    [{'bsl', [3]}, {'bsr', [2]}, {'+', []}] =
+        rcv_bifs(Config, lp_rcv, rcvb, 1, Src, [loop_opt]),
+    %% The kill switches turn the reductions off again.
+    [{'*', [8]}, {'div', [4]}, {'+', []}] =
+        rcv_bifs(Config, lp_rcv_noloop, rcv, 1, Src,
+                 [loop_opt, no_ssa_opt_loop_opt]),
+    [{'*', [8]}, {'div', [4]}, {'+', []}] =
+        rcv_bifs(Config, lp_rcv_nossa, rcv, 1, Src, [loop_opt, no_ssa_opt]),
     ok.
 
-%% Compile the objective's receive probe under `Opts' and return the
-%% arithmetic BIFs of its `rcv/1' function.
-rcv_bifs(Config, Name, Opts) ->
-    Code = disasm(Config, Name, receive_probe_src(atom_to_list(Name)), Opts),
-    fn_bifs(Code, rcv, 1).
+%% Compile the receive probe as `Name' under `Opts' and return the arithmetic
+%% BIFs of its `F'/`A' function.
+rcv_bifs(Config, Name, F, A, Src, Opts) ->
+    Code = disasm(Config, Name, Src, Opts),
+    fn_bifs(Code, F, A).
 %%=========================================================================
 %% Functional equivalence of the type-driven reduction: the module is
 %% compiled with and without `loop_opt' and both are run over a sweep of
@@ -357,7 +421,9 @@ type_driven_equivalence(Config) ->
     Plain = load(Config, eq_plain, drive_probe_src("eq_plain"), []),
     Opt = load(Config, eq_opt, drive_probe_src("eq_opt"), [loop_opt]),
     %% The rewrite really did happen in the `loop_opt' build, so this is not
-    %% a comparison of a module with itself.
+    %% a comparison of a module with itself: `{n, _}' keeps its `* 8' (the
+    %% operand is unbounded), `{i, _}' keeps its `* 16', `{d, _}' is `bsr 3',
+    %% `{b, _}' (bounded) is `bsl 3' and `{m, _}' is `+'.
     OBifs = fn_bifs(disasm(Config, eq_disasm, drive_probe_src("eq_disasm"),
                            [loop_opt]), loop, 0),
     lists:foreach(fun(B) ->
@@ -365,12 +431,13 @@ type_driven_equivalence(Config) ->
                               true -> ok;
                               false -> ct:fail({reduction_missing, B, OBifs})
                           end
-                  end, [{'bsl', [3]}, {'bsr', [2]}, {'bsl', [4]}, {'bsr', [3]},
-                        {'+', []}]),
+                  end, [{'*', [8]}, {'bsl', [3]}, {'bsr', [2]}, {'*', [16]},
+                        {'bsr', [3]}, {'+', []}]),
     Vals = [-1000001, -1000, -9, -3, -2, -1, 0, 1, 2, 3, 7, 8, 9, 255, 256,
-            1000000, 123456789012345678901234567890, 1 bsl 200,
-            2.5, -2.5, 0.0, 1.0e300, foo, [a, b], <<1, 2:3>>, {}],
-    Tags = [n, i, d, m],
+            1000, 1001, 1000000, 123456789012345678901234567890, 1 bsl 200,
+            2.5, -2.5, 0.0, -0.0, 5.0e-324, 1.0e308, 1.0e300,
+            foo, [a, b], <<1, 2:3>>, {}],
+    Tags = [n, b, i, d, m],
     lists:foreach(
       fun(Tag) ->
               lists:foreach(
@@ -405,7 +472,7 @@ type_driven_kill_switches(Config) ->
 
 run_sweep(Mod) ->
     [{Tag, V, call(Mod, {Tag, V})}
-     || Tag <- [n, i, d, m],
+     || Tag <- [n, b, i, d, m],
         V <- [-9, -1, 0, 1, 8, 2.5, foo]].
 
 call(Mod, Msg) ->
@@ -438,11 +505,113 @@ rem_to_band(_Config) ->
     ok.
 
 %%=========================================================================
+%% `X div 2^n' -> `X bsr n' and `X rem 2^n' -> `X band (2^n - 1)' for a
+%% proven non-negative integer dividend (no magnitude bound is needed: the
+%% result shrinks). The gate on the shift COUNT of `*' -> `bsl' is checked
+%% here too.
+%%=========================================================================
+
+div_rem_pow2(_Config) ->
+    NonNeg = #t_integer{elements={0,'+inf'}},
+    %% The firing proof: a non-negative integer is enough for both rules,
+    %% even though its magnitude is unbounded.
+    {_, Out} = run_pass(ann_divrem_loop(16, NonNeg)),
+    #b_set{op={bif,'bsr'}, args=[#b_var{name=x}, #b_literal{val=4}]} =
+        instr(Out, d),
+    #b_set{op={bif,'band'}, args=[#b_var{name=x}, #b_literal{val=15}]} =
+        instr(Out, r),
+    %% An integer that may be negative proves non-negativity for neither:
+    %% `-1 div 16 = -1' but `-1 bsr 4 = -1' agrees here, while `-1 rem 16 = -1'
+    %% and `-1 band 15 = 15' disagree, and `-16 div 16 = -1' vs
+    %% `-16 bsr 4 = -1' is fine but `-1 div 16 = 0' vs `-1 bsr 4 = -1' is not.
+    %% Both are therefore declined.
+    lists:foreach(
+      fun(Type) ->
+              {_, O} = run_pass(ann_divrem_loop(16, Type)),
+              {bif,'div'} = op(O, d),
+              {bif,'rem'} = op(O, r)
+      end, [#t_integer{}, #t_integer{elements={'-inf',10}},
+            #t_integer{elements={-1000,1000}}, #t_float{},
+            #t_number{elements={0,'+inf'}}, no_anno]),
+
+    %% The literal factor must be a power of two within the allowed shift
+    %% count: 2^64 fires `bsl 64', 2^65 does not (a bigger shift could
+    %% overflow where the multiplication would not).
+    Bounded = #t_integer{elements={0,1000}},
+    {_, Out64} = run_pass(ann_pow_loop(1 bsl 64, Bounded)),
+    #b_set{op={bif,'bsl'}, dst=#b_var{name=p},
+           args=[#b_var{name=x}, #b_literal{val=64}]} = instr(Out64, p),
+    {_, Out65} = run_pass(ann_pow_loop(1 bsl 65, Bounded)),
+    {bif,'*'} = op(Out65, p),
+    %% ... and an unbounded operand declines regardless of `n'.
+    {_, OutU64} = run_pass(ann_pow_loop(1 bsl 64, #t_integer{})),
+    {bif,'*'} = op(OutU64, p),
+    ok.
+
+%%=========================================================================
+%% A huge integer multiplied by 32 must stay a multiplication: the operand is
+%% unbounded, so the `bsl' rewrite (which raises `system_limit' where `*'
+%% returns a bignum) is declined, and the executed values agree with the
+%% unoptimized build right up to the emulator's bignum arity bound.
+%%=========================================================================
+
+huge_mul_declines(Config) ->
+    AnyInt = #t_integer{},
+    NonNeg = #t_integer{elements={0,'+inf'}},
+    %% SSA-level: no annotation, an unbounded integer and a merely
+    %% non-negative range all decline `* 32' -> `bsl 5'; only a finite range
+    %% fires it.
+    lists:foreach(
+      fun(Type) ->
+              {_, O} = run_pass(ann_pow_loop(32, Type)),
+              {bif,'*'} = op(O, p)
+      end, [no_anno, AnyInt, NonNeg]),
+    {_, OutB} = run_pass(ann_pow_loop(32, #t_integer{elements={0,1000}})),
+    #b_set{op={bif,'bsl'}, dst=#b_var{name=p},
+           args=[#b_var{name=x}, #b_literal{val=5}]} = instr(OutB, p),
+
+    %% Executed: the probe's `mul32/1' keeps its `* 32'.
+    Src = huge_mul_src(),
+    Plain = load(Config, hm_plain, Src, []),
+    Opt = load(Config, hm_opt, Src, [loop_opt]),
+    [{'*', [32]}] =
+        fn_bifs(disasm(Config, hm_disasm, Src, [loop_opt]), mul32, 1),
+    %% The largest magnitude a bignum of this emulator can hold.
+    Max = bsl_limit(),
+    Boundary = 1 bsl (Max - 5),          %% `Boundary * 32' is exactly at the bound
+    Over = 1 bsl (Max - 4),              %% `Over * 32' (and `Over bsl 5') overflow
+    case try Over bsl 5 catch error:E -> {shift_error, E} end of
+        {shift_error, system_limit} -> ok;
+        Other0 -> ct:fail({expected_shift_overflow, Other0})
+    end,
+    lists:foreach(
+      fun(V) ->
+              A = call(Plain, mul32, V),
+              B = call(Opt, mul32, V),
+              case A =:= B of
+                  true -> ok;
+                  false -> ct:fail({result_mismatch, mul32, V, A, B})
+              end
+      end, [1, -1, 0, 1 bsl 200, -(1 bsl 200), Boundary, Over]),
+    {ok, Prod} = call(Plain, mul32, Boundary),
+    case Prod =:= Boundary * 32 of
+        true -> ok;
+        false -> ct:fail({inexact_product, Boundary, Prod})
+    end,
+    %% At the boundary the unoptimized build's `*' also raises, and the
+    %% rewritten build must raise exactly the same thing.
+    {error, system_limit} = call(Plain, mul32, Over),
+    {error, system_limit} = call(Opt, mul32, Over),
+    ok.
+
+%%=========================================================================
 %% LICM of arithmetic (`loop_arith_licm'). A hoist is only accepted when the
 %% operation is provably non-raising AT THE PREHEADER, i.e. every operand is
-%% loop-invariant and its integrality (and, for `div'/`rem'/`bsl'/`bsr', the
-%% second operand) is proven there. The annotation of an operand that the
-%% loop itself narrows is loop-dependent and is not accepted.
+%% loop-invariant and its integrality (and, for `div'/`rem', a non-zero
+%% literal divisor) is proven there. The annotation of an operand that the
+%% loop itself narrows is loop-dependent and is not accepted. `bsl'/`bsr' are
+%% never hoisted at all: a shift can raise `system_limit' on a path the
+%% original program never took (see `no_shift_hoist').
 %%=========================================================================
 
 arith_licm_ssa(_Config) ->
@@ -466,8 +635,7 @@ arith_licm_ssa(_Config) ->
       [{'*', [var(x), lit(3)]}, {'-', [var(x), lit(1)]},
        {'band', [var(x), lit(7)]}, {'bor', [var(x), lit(8)]},
        {'bxor', [var(x), lit(1)]}, {'div', [var(x), lit(4)]},
-       {'rem', [var(x), lit(4)]}, {'bsl', [var(x), lit(3)]},
-       {'bsr', [var(x), lit(3)]}]),
+       {'rem', [var(x), lit(4)]}]),
     %% `x' defined outside the loop as `1 + 1' is a non-negative integer by
     %% the structural rules, so no annotation is needed ...
     {_, OutS} = run_arith(structural_arith_loop(false)),
@@ -497,12 +665,18 @@ arith_licm_declines(_Config) ->
       [{'div', [var(x), var(v)], Both},
        {'rem', [var(x), var(v)], Both},
        {'div', [var(x), lit(0)], anno0(AnyInt)},
-       %% `bsl' raises `system_limit' for a huge count and `badarith' for a
-       %% negative or non-integer one.
+       %% `bsl' raises `system_limit' past the bignum arity bound (a proof
+       %% that excludes that is not available here) and `badarith' for a
+       %% negative or non-integer count; `bsr' raises `badarith' for a
+       %% negative count. Even the ordinary, entirely non-raising shapes are
+       %% left in the loop, because the shift is excluded outright.
+       {'bsl', [var(x), lit(3)], anno0(AnyInt)},
+       {'bsr', [var(x), lit(3)], anno0(AnyInt)},
        {'bsl', [var(x), lit(1000)], anno0(AnyInt)},
        {'bsl', [var(x), lit(-1)], anno0(AnyInt)},
        {'bsr', [var(x), lit(-1)], anno0(AnyInt)},
        {'bsl', [var(x), var(v)], Both},
+       {'bsr', [var(x), var(v)], Both},
        %% An operand whose integrality is not proven at the preheader.
        {'+', [var(x), lit(1)], #{}},
        {'+', [var(x), lit(1)], anno0(#t_float{})},
@@ -516,6 +690,65 @@ arith_licm_declines(_Config) ->
     [] = hoisted(OutNr, y),
     ok.
 
+%%=========================================================================
+%% `bsl'/`bsr' are never hoisted (see `arith_licm_declines' for the SSA-level
+%% proof): a shift that is loop-invariant can still raise `system_limit' or
+%% `badarith' on a path the original program never took, so moving it into
+%% the preheader would raise where the loop body was never entered. The
+%% probes below put the shift in a `receive' clause body whose operand (and
+%% count) come from outside the loop, and check that the `loop_arith_licm'
+%% build is instruction-for-instruction equal to the `loop_opt'-only build
+%% and behaves identically, including on the raising values.
+%%=========================================================================
+
+no_shift_hoist(Config) ->
+    Src = shift_probe_src(),
+    D = fun(Opts) -> disasm(Config, nsh_probe, Src, Opts) end,
+    Base = D([loop_opt]),
+    Licm = D([loop_opt, loop_arith_licm]),
+    %% The shift functions are untouched by the LICM ...
+    lists:foreach(
+      fun({F, A}) ->
+              case insns(Base, F, A) =:= insns(Licm, F, A) of
+                  true -> ok;
+                  false -> ct:fail({shift_was_hoisted, F, A})
+              end
+      end, [{shl, 1}, {shl2, 2}, {shr2, 2}]),
+    %% ... while the control's multiplication IS hoisted, so the pass really
+    %% did run.
+    case insns(Base, mul8, 1) =:= insns(Licm, mul8, 1) of
+        true -> ct:fail(arith_licm_did_not_fire);
+        false -> ok
+    end,
+    %% Executed: results *and* exceptions agree. `Huge' is a magnitude at
+    %% which `Huge bsl 3' overflows; with no `stop' in the mailbox the clause
+    %% body is never evaluated, so it must not raise.
+    Plain = load(Config, nsh_plain, Src, []),
+    Opt = load(Config, nsh_opt, Src, [loop_opt, loop_arith_licm]),
+    Max = bsl_limit(),
+    Huge = 1 bsl (Max - 2),
+    {error, system_limit} = shift_call(Plain, shl, [Huge], true),
+    Cases = [ {shl, [Huge], false}, {shl, [Huge], true},
+              {shl, [1], false}, {shl, [1], true},
+              {shl2, [1, -1], false}, {shl2, [1, -1], true},
+              {shl2, [Huge, -1], false}, {shl2, [1, 1 bsl 40], true},
+              {shl2, [0, -1], false}, {shl2, [1, 3], false},
+              {shr2, [1, -1], false}, {shr2, [1, -1], true},
+              {shr2, [Huge, 3], false}, {shr2, [-1, 3], false},
+              {shr2, [1, 1], true} ],
+    lists:foreach(
+      fun({F, Args, Send}) ->
+              A = shift_call(Plain, F, Args, Send),
+              B = shift_call(Opt, F, Args, Send),
+              case A =:= B of
+                  true -> ok;
+                  false -> ct:fail({result_mismatch, F, Args, Send, A, B})
+              end
+      end, Cases),
+    %% The huge clause is declined, so the shifted value itself is unchanged.
+    {ok, Huge} = shift_call(Plain, shl, [Huge], false),
+    {ok, Huge} = shift_call(Opt, shl, [Huge], false),
+    ok.
 %%=========================================================================
 %% The same, end to end on a real module: a `receive' loop whose arithmetic
 %% is computed from a loop-invariant argument that a guard OUTSIDE the loop
@@ -922,6 +1155,21 @@ iv_loop_lhs(Init) ->
      {3, #b_blk{is=[set(up, {bif,'+'}, [lit(1), var(i)])], last=bri(2)}},
      {4, #b_blk{is=[], last=#b_ret{arg=var(m)}}}].
 
+%% `iv_loop' with `Type' (a FINITE `#t_integer{}' range) annotated on the
+%% operand of the product and of the quotient: that bounded range is what
+%% licenses `* 8' -> `bsl 3', in addition to the non-negativity the induction
+%% variable already proves.
+bounded_iv_loop(Type) ->
+    A = anno0(Type),
+    [{1, #b_blk{is=[], last=bri(2)}},
+     {2, #b_blk{is=[#b_set{op=phi, dst=var(i),
+                           args=[{lit(0), 1}, {var(up), 3}]},
+                        set_anno(m, {bif,'*'}, [var(i), lit(8)], A),
+                        set_anno(d, {bif,'div'}, [var(i), lit(4)], A)],
+                last=#b_br{bool=var(c), succ=3, fail=4}}},
+     {3, #b_blk{is=[set(up, {bif,'+'}, [var(i), lit(1)])], last=bri(2)}},
+     {4, #b_blk{is=[], last=#b_ret{arg=var(m)}}}].
+
 %% No definition for `x': it must be treated as unknown.
 unknown_loop() ->
     [{1, #b_blk{is=[], last=bri(2)}},
@@ -993,6 +1241,24 @@ ann_loop(MulType, DivType) ->
      {3, #b_blk{is=[], last=bri(2)}},
      {4, #b_blk{is=[], last=#b_ret{arg=var(m)}}}].
 
+%% d = x div K and r = x rem K, both with the operand annotated `Type'.
+ann_divrem_loop(K, Type) ->
+    A = anno0(Type),
+    [{1, #b_blk{is=[], last=bri(2)}},
+     {2, #b_blk{is=[set_anno(d, {bif,'div'}, [var(x), lit(K)], A),
+                        set_anno(r, {bif,'rem'}, [var(x), lit(K)], A)],
+                last=#b_br{bool=var(c), succ=3, fail=4}}},
+     {3, #b_blk{is=[], last=bri(2)}},
+     {4, #b_blk{is=[], last=#b_ret{arg=var(d)}}}].
+
+%% p = x * K, with the operand annotated `Type'.
+ann_pow_loop(K, Type) ->
+    [{1, #b_blk{is=[], last=bri(2)}},
+     {2, #b_blk{is=[set_anno(p, {bif,'*'}, [var(x), lit(K)], anno0(Type))],
+                last=#b_br{bool=var(c), succ=3, fail=4}}},
+     {3, #b_blk{is=[], last=bri(2)}},
+     {4, #b_blk{is=[], last=#b_ret{arg=var(p)}}}].
+
 %% m2 = x * 2 and m8 = x * 8, with `x' untyped.
 ann_mul2_loop() ->
     [{1, #b_blk{is=[], last=bri(2)}},
@@ -1002,12 +1268,14 @@ ann_mul2_loop() ->
      {3, #b_blk{is=[], last=bri(2)}},
      {4, #b_blk{is=[], last=#b_ret{arg=var(m8)}}}].
 
-%% y = x + 1, and then ym = y * 8 with no annotation of its own: only the
-%% annotation of the `+' that defines `y' can prove it.
+%% y = x + 1, then ym = y * 8 and yd = y div 4, with no annotation of their
+%% own: only the annotation of the `+' that defines `y' can classify it, and
+%% that proves the kind (so `yd' is reduced) but no bound (so `ym' is not).
 ann_derived_loop(XType) ->
     [{1, #b_blk{is=[], last=bri(2)}},
      {2, #b_blk{is=[set_anno(y, {bif,'+'}, [var(x), lit(1)], anno0(XType)),
-                        set(ym, {bif,'*'}, [var(y), lit(8)])],
+                        set(ym, {bif,'*'}, [var(y), lit(8)]),
+                        set(yd, {bif,'div'}, [var(y), lit(4)])],
                 last=#b_br{bool=var(c), succ=3, fail=4}}},
      {3, #b_blk{is=[], last=bri(2)}},
      {4, #b_blk{is=[], last=#b_ret{arg=var(ym)}}}].
@@ -1033,22 +1301,32 @@ anno1(Type) -> #{arg_types => #{1 => Type}}.
 %% Real-module probes.
 %%=========================================================================
 
-%% The `receive' loop of the objective: a guarded clause over a value that
-%% the type analysis can prove a non-negative integer.
+%% A `receive' loop with one guarded clause per reduction rule: a value the
+%% type analysis can prove a non-negative integer. `rcv/1' leaves the
+%% magnitude unbounded (so only `div' -> `bsr' fires), while `rcvb/1' bounds
+%% it with `X =< 1000' (so the operand's range is finite and `*' -> `bsl'
+%% fires too).
 receive_probe_src(Mod) ->
     io_lib:format(
-      "-module(~s).\n-export([rcv/1]).\n"
+      "-module(~s).\n-export([rcv/1, rcvb/1]).\n"
       "rcv(T) ->\n"
       "    receive\n"
       "        {n, X} when is_integer(X), X >= 0 -> X * 8 + X div 4;\n"
       "        stop -> 0\n"
       "    after T -> -1\n"
+      "    end.\n"
+      "rcvb(T) ->\n"
+      "    receive\n"
+      "        {n, X} when is_integer(X), X >= 0, X =< 1000 -> X * 8 + X div 4;\n"
+      "        stop -> 0\n"
+      "    after T -> -1\n"
       "    end.\n", [Mod]).
 
 %% The same loop, with one clause per reduction rule (including the
-%% unguarded `X * 2' -> `X + X' fallback), driven one message at a time so
-%% that the test can sweep values through it. `flush/0' keeps the mailbox
-%% clean whether or not the message matched.
+%% unguarded `X * 2' -> `X + X' fallback and a bounded `* 8' that IS turned
+%% into a shift), driven one message at a time so that the test can sweep
+%% values through it. `flush/0' keeps the mailbox clean whether or not the
+%% message matched.
 drive_probe_src(Mod) ->
     io_lib:format(
       "-module(~s).\n-export([one/1]).\n"
@@ -1061,6 +1339,7 @@ drive_probe_src(Mod) ->
       "loop() ->\n"
       "    receive\n"
       "        {n, X} when is_integer(X), X >= 0 -> X * 8 + X div 4;\n"
+      "        {b, X} when is_integer(X), X >= 0, X =< 1000 -> X * 8;\n"
       "        {i, X} when is_integer(X) -> X * 16;\n"
       "        {d, X} when is_integer(X), X >= 0 -> X div 8;\n"
       "        {m, X} -> X * 2;\n"
@@ -1071,6 +1350,60 @@ drive_probe_src(Mod) ->
       "    receive _ -> flush()\n"
       "    after 0 -> ok\n"
       "    end.\n", [Mod]).
+
+%% The probe of `huge_mul_declines': an unbounded `* 32' that must stay a
+%% multiplication.
+huge_mul_src() ->
+    "-module(hm_probe).\n-export([mul32/1]).\n"
+    "mul32(X) -> X * 32.\n".
+
+%% The probe of `no_shift_hoist': the shift operand (and, in the `/2'
+%% functions, the count) is a function argument proven an integer OUTSIDE the
+%% loop, so the shift is loop-invariant and was hoisted before the fix; the
+%% `mul8/1' control is the multiplication the LICM does still hoist.
+shift_probe_src() ->
+    "-module(nsh_probe).\n"
+    "-export([shl/1, shl2/2, shr2/2, mul8/1]).\n"
+    "shl(T) when is_integer(T), T >= 0 ->\n"
+    "    receive stop -> T bsl 3 after 0 -> T end;\n"
+    "shl(T) -> T.\n"
+    "shl2(T, N) when is_integer(T), is_integer(N) ->\n"
+    "    receive stop -> T bsl N after 0 -> T end;\n"
+    "shl2(T, _N) -> T.\n"
+    "shr2(T, N) when is_integer(T), is_integer(N) ->\n"
+    "    receive stop -> T bsr N after 0 -> T end;\n"
+    "shr2(T, _N) -> T.\n"
+    "mul8(T) when is_integer(T), T >= 0 ->\n"
+    "    receive stop -> T * 8 after 0 -> T end;\n"
+    "mul8(T) -> T.\n".
+
+%% Call `Mod:F(Args...)' with (`Send') or without a pending `stop' message
+%% and return the value or the {Class,Reason} of the exception.
+shift_call(Mod, F, Args, Send) ->
+    flush(),
+    case Send of
+        true -> self() ! stop;
+        false -> ok
+    end,
+    R = try {ok, apply(Mod, F, Args)} catch C:R0 -> {C, R0} end,
+    flush(),
+    R.
+
+%% The largest bit index a bignum of this emulator can have: the largest `N'
+%% for which `1 bsl N' succeeds. A shift whose result would have a higher
+%% index raises `system_limit'. The index is derived from the emulator's
+%% digit size, so it must not be hard-coded.
+bsl_limit() ->
+    bsl_limit(1, 1 bsl 40).
+
+bsl_limit(Lo, Hi) when Hi - Lo =< 1 ->
+    Lo;
+bsl_limit(Lo, Hi) ->
+    Mid = (Lo + Hi) div 2,
+    case try 1 bsl Mid catch error:_E -> overflow end of
+        N when is_integer(N) -> bsl_limit(Mid, Hi);
+        _ -> bsl_limit(Lo, Mid)
+    end.
 
 %%=========================================================================
 %% Compiling, disassembling and running a probe under a set of options.
