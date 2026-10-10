@@ -62,6 +62,17 @@ pub enum TermError {
     /// fun at all, or to a fun of the wrong kind for that accessor (see
     /// [`crate::fun`]).
     BadFun,
+    /// A reference layout helper or accessor was applied to a term that is not a
+    /// well-formed reference of the expected layout (see [`crate::boxed`]):
+    /// [`crate::boxed::internal_ref_id`] on a term that is not an **M1
+    /// internal-reference thing** — a word that is not a term, a boxed term of
+    /// another kind, or a *C-layout* `ErtsORefThing` block, whose id word does not
+    /// exist (reading it would run past the block).
+    ///
+    /// Deliberately distinct from [`TermError::RefIdentityUnavailable`]: that one is
+    /// a perfectly well-formed M1 reference whose C hash cannot be reproduced, not a
+    /// malformed term.
+    BadRef,
     /// The operation needs identity information the term does not carry: a
     /// `make_fun3` [local fun](crate::fun::FunKind::Local) hashes through its
     /// module and `old_uniq` fields in the C (`erl_term_hashing.c:1224-1246`), but
@@ -133,6 +144,7 @@ impl fmt::Display for TermError {
             TermError::BadMap => "not a map",
             TermError::BadBitstring => "invalid bitstring byte count",
             TermError::BadFun => "not a fun",
+            TermError::BadRef => "not a reference",
             TermError::FunIdentityUnavailable => "fun identity unavailable",
             TermError::RefIdentityUnavailable => "reference identity unavailable",
             TermError::BadRecord => "not a record",
@@ -162,6 +174,7 @@ impl core::error::Error for TermError {}
 /// | `BadMap` | `BadArg` | `badarg` |
 /// | `BadBitstring` | `BadArg` | `badarg` |
 /// | `BadFun` | `BadArg` | `badarg` |
+/// | `BadRef` | `BadArg` | `badarg` |
 /// | `FunIdentityUnavailable` | `BadArg` | `badarg` |
 /// | `RefIdentityUnavailable` | `BadArg` | `badarg` |
 /// | `BadRecord` | `BadArg` | `badarg` |
@@ -189,6 +202,9 @@ impl From<TermError> for BeamError {
             // A non-fun (or wrong-kind fun) reached a fun layout helper: an argument
             // failure.
             TermError::BadFun => BeamError::BadArg,
+            // A non-reference (or a reference of the wrong on-heap layout) reached a
+            // reference layout helper: an argument failure.
+            TermError::BadRef => BeamError::BadArg,
             // Missing fun identity is a capability gap, not a BEAM error; the engine
             // raises the same `badarg` the C's `erts_exit`-free paths would (there is
             // no oracle reason to reproduce — the oracle simply never takes this
@@ -240,6 +256,7 @@ mod tests {
             "invalid bitstring byte count"
         );
         assert_eq!(TermError::BadFun.to_string(), "not a fun");
+        assert_eq!(TermError::BadRef.to_string(), "not a reference");
         assert_eq!(
             TermError::FunIdentityUnavailable.to_string(),
             "fun identity unavailable"
@@ -294,6 +311,15 @@ mod tests {
         );
     }
     #[test]
+    fn bad_ref_is_not_ref_identity_unavailable() {
+        // "this is not an M1 internal reference" (a shape failure) must be tellable
+        // from "this is one, but its C hash is unreproducible" (an identity gap).
+        assert_ne!(TermError::BadRef, TermError::RefIdentityUnavailable);
+        assert_ne!(TermError::BadRef, TermError::NotATerm);
+        assert_ne!(TermError::BadRef, TermError::BadFun);
+    }
+
+    #[test]
     fn term_graph_errors_are_distinguishable() {
         // The whole point of the two variants: "cannot size, it is cyclic" (a
         // malformed graph) must be tellable from "cannot size, it is too big" (a
@@ -334,6 +360,7 @@ mod tests {
             BeamError::BadArg
         ));
         assert!(matches!(BeamError::from(TermError::BadFun), BeamError::BadArg));
+        assert!(matches!(BeamError::from(TermError::BadRef), BeamError::BadArg));
         assert!(matches!(
             BeamError::from(TermError::FunIdentityUnavailable),
             BeamError::BadArg

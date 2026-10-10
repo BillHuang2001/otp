@@ -24,10 +24,17 @@
 //! Ground truth: `erts/emulator/beam/erl_term.h` (boxed/list access methods, the
 //! header layout and `*_SUBTAG` group) plus `erl_map.h`, `erl_bits.h` and
 //! `erl_fun.h` for the thing layouts used by the sub-type tests.
+//!
+//! This module also owns the crate's canonical **M1 internal-reference thing**
+//! layout ([`write_internal_ref`] / [`internal_ref_id`]) — the frozen 4-word
+//! `[make_header(3, REF_SUBTAG), node, serial, id]` block this runtime actually
+//! builds. [`internal_ref_numbers`] next to it describes the **C** layout only and
+//! must not be fed an M1 reference.
 
 use crate::error::{TermError, TermResult};
 use crate::eterm::Eterm;
 use crate::fun::{FUN_HEADER_IMPORTED_OFFS, FUN_HEADER_KIND_OFFS};
+use crate::immediate::{is_small, make_small, signed_value, try_make_small};
 use crate::tag::{
     ARITYVAL_SUBTAG, BIG_TAG_MASK, BIN_REF_SUBTAG, BITSTRING_TAG_MASK, EXTERNAL_TAG_MASK,
     EXTERNAL_PID_SUBTAG, EXTERNAL_PORT_SUBTAG, EXTERNAL_REF_SUBTAG, FLOAT_SUBTAG, FUN_SUBTAG,
@@ -396,8 +403,8 @@ boxed_predicate!(
     "`is_internal_ref(x)`"
 );
 
-/// `internal_ref_numbers(x)` (`erl_node_container_utils.h:264`) — the reference's
-/// `num[]` ids as a `u32` slice.
+/// `internal_ref_numbers(x)` (`erl_node_container_utils.h:264`) — **the C-layout
+/// reader**: the reference's `num[]` ids as a `u32` slice.
 ///
 /// On 64-bit little-endian the C block is
 /// `ErtsORefThing { Eterm header; Uint32 num[ERTS_REF_NUMBERS]; Uint32 marker; }`
@@ -407,11 +414,27 @@ boxed_predicate!(
 /// two payload words is the 3 ids followed by the marker word, hence a 4-element
 /// slice.
 ///
+/// # This is the C layout, NOT the M1 shape this tree produces
+///
+/// The reference thing this runtime actually builds is the **M1
+/// internal-reference thing** ([`write_internal_ref`]): a 4-word
+/// `[make_header(3, REF_SUBTAG), node, serial, id]` block whose payload is three
+/// *terms*, not a packed `u32` `num[]`. Its header carries `REF_SUBTAG` too, so
+/// [`is_internal_ref`] is `true` for it — but feeding it to this reader would
+/// silently return the small-integer **tags** of words 1..2 as if they were ids,
+/// i.e. a wrong reference identity instead of an error. **Never pass an M1
+/// reference here**: [`internal_ref_id`] is the sanctioned accessor for the M1
+/// layout, and it refuses a C-layout block rather than over-reading it.
+///
+/// This function is retained as the documented C-layout view (`ErtsORefThing`,
+/// written by nothing in this tree) — no code in this crate or its dependents calls
+/// it.
+///
 /// # Safety
 ///
-/// `t` must be a live internal reference (see [`is_internal_ref`]) whose
-/// `[header, w1, w2]` block is valid and live for the returned `'a` (which cannot
-/// outlive the term's heap).
+/// `t` must be a live **C-layout** internal reference (see [`is_internal_ref`])
+/// whose `[header, w1, w2]` block is valid and live for the returned `'a` (which
+/// cannot outlive the term's heap). An M1 reference must not be passed — see above.
 pub unsafe fn internal_ref_numbers<'a>(t: Eterm) -> &'a [u32] {
     let p = boxed_val(t);
     // SAFETY: the caller guarantees a validated internal-reference block; its two
@@ -419,6 +442,123 @@ pub unsafe fn internal_ref_numbers<'a>(t: Eterm) -> &'a [u32] {
     // for `'a` by the caller's contract.
     unsafe { core::slice::from_raw_parts(p.add(1).cast::<u32>(), 4) }
 }
+
+// ---------------------------------------------------------------------------
+// The M1 internal-reference thing (the shape this runtime actually builds)
+// ---------------------------------------------------------------------------
+
+/// The number of **payload** words of an M1 internal-reference thing: `node`,
+/// `serial` and `id` (the header word is not counted).
+///
+/// The M1 producers (`beam_process::MonitorRef::to_eterm`,
+/// `beam_bifs`'s `make_ref_thing`, `beam_rt`'s native floor) all use this value.
+pub const INTERNAL_REF_PAYLOAD_WORDS: usize = 3;
+
+/// The total number of words of an M1 internal-reference thing, header included.
+///
+/// The frozen block is
+/// `[make_header(3, REF_SUBTAG), node, serial, id]`: word 0 is the header
+/// (`make_header(3, REF_SUBTAG)`, raw `0xD0`), words 1 and 2 are the zeroed *node*
+/// and *serial* terms (Milestone-1 has a single local node and a single monotonic
+/// id space, so the whole identity lives in word 3), and word 3 is `make_small(id)`.
+///
+/// This is the **M1 substitution** for the C `ErtsORefThing` (`[header(2,
+/// REF_SUBTAG), num[0..3] as 4 `u32`s]`): the node container of the C layout is not
+/// carried, and the id lives in a *term* rather than inside a packed `u32` array.
+pub const INTERNAL_REF_WORDS: usize = INTERNAL_REF_PAYLOAD_WORDS + 1;
+
+/// `write_internal_ref(hp, id)` — build the **M1 internal-reference thing**.
+///
+/// This is the crate's canonical, heap-agnostic writer for an internal reference
+/// (the frozen term-layout LCA, workspace `CONTEXT.md` §2), matching the convention
+/// of the sibling writers ([`crate::map::write_map`],
+/// [`crate::bitstring::write_heap_bits`], [`crate::refc::write_bin_ref`],
+/// [`crate::fun::write_fun_local`]): `beam_term` cannot allocate, so the caller
+/// reserves the words and passes `hp`.
+///
+/// It writes exactly [`INTERNAL_REF_WORDS`] words — `[make_header(3, REF_SUBTAG),
+/// make_small(0), make_small(0), make_small(id)]` — and returns the tagged root
+/// `make_boxed(hp)`.
+///
+/// # Frozen inter-crate contract
+///
+/// The four words are **byte-identical** to what `beam_process`'s
+/// `MonitorRef::to_eterm`, `beam_bifs`'s `make_ref_thing` and `beam_rt`'s native
+/// process floor write, so a reference already in memory hashes/compares/encodes
+/// exactly like one this writer built. Those producers and this writer must stay in
+/// lockstep; a drift here is a term-layout break.
+///
+/// # Safety
+///
+/// `hp` must point to at least [`INTERNAL_REF_WORDS`] writable, properly aligned
+/// `Eterm` words, owned exclusively by the caller for the lifetime of the returned
+/// term (the writer never reallocates and hands the pointer out inside the root).
+///
+/// # Errors
+///
+/// [`TermError::SmallIntOutOfRange`] when `id` does not fit a 60-bit small integer
+/// (the value never fits in the fixed single-word id slot) — never a truncated or
+/// substituted id.
+pub unsafe fn write_internal_ref(hp: *mut Eterm, id: u64) -> TermResult<Eterm> {
+    let id_term = try_make_small(i64::try_from(id).map_err(|_| TermError::SmallIntOutOfRange)?)?;
+    // SAFETY: the caller guarantees `hp` addresses `INTERNAL_REF_WORDS` writable
+    // words; every one of them is written before the pointer escapes.
+    unsafe {
+        *hp = make_header(INTERNAL_REF_PAYLOAD_WORDS, REF_SUBTAG);
+        *hp.add(1) = make_small(0); // node: the local node
+        *hp.add(2) = make_small(0); // serial: one id space in M1
+        *hp.add(3) = id_term; // id
+    }
+    Ok(make_boxed(hp))
+}
+
+/// `internal_ref_id(t)` — the numeric id of an **M1 internal-reference thing**.
+///
+/// The read-back half of [`write_internal_ref`] (and of the sibling producers it is
+/// byte-identical to): the id is word [`INTERNAL_REF_PAYLOAD_WORDS`] of the block,
+/// a non-negative small integer.
+///
+/// # Layout, and why this refuses a C-layout block
+///
+/// [`is_internal_ref`] tests the header **subtag** only, so it is `true` for both
+/// this tree's M1 reference (header arity 3, four words) and the C `ErtsORefThing`
+/// (header arity 2, three words — the shape [`internal_ref_numbers`] reads). The two
+/// layouts do not share an id slot, and reading the M1 id word of a three-word block
+/// would run past it, so this accessor requires the header arity to be
+/// [`INTERNAL_REF_PAYLOAD_WORDS`] and reports a typed error otherwise. It is the only
+/// sanctioned way to read an id out of a reference term.
+///
+/// # Safety
+///
+/// If `t` is a boxed term, its header word must be a live, aligned term word. A
+/// reference block is read only after its header has been validated.
+///
+/// # Errors
+///
+/// [`TermError::BadRef`] when `t` is not an M1 internal-reference thing: a word that
+/// is not a term, a boxed term of another kind, a C-layout ref block (arity 2), or a
+/// block whose id word is not a non-negative small integer. Never a wrong id.
+pub unsafe fn internal_ref_id(t: Eterm) -> TermResult<u64> {
+    if !unsafe { is_internal_ref(t) } {
+        return Err(TermError::BadRef);
+    }
+    let p = boxed_val(t);
+    // SAFETY: `is_internal_ref` confirmed a boxed term whose header carries
+    // `REF_SUBTAG`, so its header word is a live, aligned term word.
+    if header_arity(unsafe { *p }) != INTERNAL_REF_PAYLOAD_WORDS {
+        // A C-layout ref block (arity 2): its id word does not exist. Refuse rather
+        // than read past the block.
+        return Err(TermError::BadRef);
+    }
+    // SAFETY: the header arity says the block has `INTERNAL_REF_PAYLOAD_WORDS`
+    // payload words, so word `INTERNAL_REF_PAYLOAD_WORDS` (the id) is in bounds.
+    let id_word = unsafe { *p.add(INTERNAL_REF_PAYLOAD_WORDS) };
+    if !is_small(id_word) {
+        return Err(TermError::BadRef);
+    }
+    u64::try_from(signed_value(id_word)).map_err(|_| TermError::BadRef)
+}
+
 boxed_predicate!(
     is_external_pid,
     is_external_pid_header,
@@ -429,8 +569,7 @@ boxed_predicate!(
     is_external_port_header,
     "`is_external_port(x)`"
 );
-boxed_predicate!(
-    is_external_ref,
+boxed_predicate!(    is_external_ref,
     is_external_ref_header,
     "`is_external_ref(x)`"
 );
