@@ -50,7 +50,7 @@ Term order is never re-implemented here (workspace Prevent-Duplication rule).
   and are unreachable from the public API; panics are never control flow for runtime data.
 - The B+-tree assumes `cmp_arith` is a strict total order (its only caveat is the documented
   `beam_term` best-effort `f64` comparison for out-of-range bignum<->float keys).
-- Files target ~1000 lines; the big test module lives in `mod.rs`.
+- Files target ~1000 lines; the big test module is the `tests` submodule in `tests.rs`.
 
 ## Test Strategy
 `check_invariants` walks the whole tree against all five invariants (incl.
