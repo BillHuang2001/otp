@@ -661,6 +661,38 @@ fn sweep_base64_builds_an_off_heap_binary() {
     );
 }
 
+/// `base64:encode/1` on the **empty** binary — the empty-clause arm of the real
+/// `base64:encode_binary/4`, reached through the same `bs_init_writable` builder.
+///
+/// `base64:encode/2` opens the accumulator with `bs_init_writable` and tail-calls
+/// `encode_binary/4`, whose first clause **refuses** `<<>>` (`bs_match` with
+/// `{commands,[{ensure_at_least,48,1}]}` takes the fail label) and whose empty clause
+/// **accepts** it (`bs_match` with `{commands,[{ensure_exactly,0}]}` falls through) and
+/// returns that accumulator, a 0-bit off-heap (refc) binary.
+///
+/// The expected value is the system `erl` oracle verbatim:
+///
+/// ```text
+/// erl -noshell -eval 'io:format("~p~n",[base64:encode(<<>>)]),halt().'
+/// <<>>
+/// ```
+#[test]
+fn sweep_base64_encodes_the_empty_binary() {
+    if skip_if_unavailable() {
+        return;
+    }
+    let mut host = exec_host();
+
+    // The 0-byte input `<<>>`, built test-side.
+    let empty = terms::make_heap_binary(&mut host, &[]).expect("an empty heap binary");
+    let got = run(&mut host, "base64", "encode", &[empty]);
+    assert_eq!(
+        terms::binary_bytes(got).expect("base64:encode/1 must return a binary"),
+        &b""[..],
+        "base64:encode(<<>>) must be the empty binary, like the oracle"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 4. Blocked mechanisms (asserted loudly, never silently passed)
 // ---------------------------------------------------------------------------
