@@ -134,7 +134,7 @@
 //!   entry is `(destination, term)` only, so the runtime that drains it delivers the term itself
 //!   (`erl_drv_output_term` sends the decoded term, never a `{Port, Term}` wrapper) with no
 //!   sending-port identity.
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -508,6 +508,14 @@ pub struct DriverPort {
     /// The event/timer state shared with the port lifecycle that owns this host (see
     /// [`DriverControl`]).
     control: Rc<RefCell<DriverControl>>,
+    /// The port's `PORT_CONTROL_FLAG_*` bit set, as the driver last set it through
+    /// `set_port_control_flags` — the C's `prt->control_flags` (`io.c:5318`).
+    ///
+    /// Shared with the runtime's `PortMeta`, which reads it **after** a `control` callback to pick
+    /// the reply's Erlang form (`write_port_control_result`, `io.c:4133-4175`): a list of byte
+    /// integers normally, a **binary** when `PORT_CONTROL_FLAG_BINARY` is set. Seized with
+    /// [`DriverPort::control_flags`] before the host is boxed into the port lifecycle.
+    control_flags: Rc<Cell<c_int>>,
 }
 
 impl DriverPort {
@@ -523,6 +531,7 @@ impl DriverPort {
             sent: Vec::new(),
             terms: TermQueue::new(),
             control: Rc::new(RefCell::new(DriverControl::default())),
+            control_flags: Rc::new(Cell::new(0)),
         }
     }
 
@@ -553,6 +562,15 @@ impl DriverPort {
     /// docs). A host nobody claims keeps answering the C's failure code for both.
     fn control(&self) -> Rc<RefCell<DriverControl>> {
         Rc::clone(&self.control)
+    }
+
+    /// The port's control-flags cell, shared with the runtime — the handle `PortMeta` holds to
+    /// render a `port_control` reply (see [`DriverPort::set_control_flags`]).
+    ///
+    /// Taken **before** the host is boxed into a port (the boxed driver exposes no host), exactly
+    /// like [`DriverPort::term_queue`].
+    pub fn control_flags(&self) -> Rc<Cell<c_int>> {
+        Rc::clone(&self.control_flags)
     }
     /// The process the port belongs to.
     pub fn owner(&self) -> ProcessId {
@@ -819,6 +837,25 @@ impl DriverHost for DriverPort {
         }
         control.deadline = Some(deadline);
         0
+    }
+
+    /// Records the control flags the driver asked for (`set_port_control_flags` — the C's
+    /// `prt->control_flags`, `io.c:5318`).
+    ///
+    /// The C returns `void`, so the seam's `0` is always the answer. The recorded bit set is what
+    /// the runtime reads back (`set_port_control_flags` → `get_port_flags` round-trips through
+    /// this seam, `beam_abi`'s `driver/drv/lifecycle.rs`) to render a `port_control` reply as a
+    /// **binary** when `PORT_CONTROL_FLAG_BINARY` is set and as a list of byte integers otherwise —
+    /// the C's own rule (`write_port_control_result`, `io.c:4133-4175`).
+    fn set_control_flags(&mut self, _mode: c_int, flags: c_int) -> c_int {
+        self.control_flags.set(flags);
+        0
+    }
+
+    /// The flags the driver last set — the value the seam's `set_port_control_flags` →
+    /// `get_port_flags` round trip reports.
+    fn get_port_flags(&mut self) -> Option<c_int> {
+        Some(self.control_flags.get())
     }
 
     /// Drops the port's pending timer (`driver_cancel_timer`) — `0`, or the C's `-1` for a host no
