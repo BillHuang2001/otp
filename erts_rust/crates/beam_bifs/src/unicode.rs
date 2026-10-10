@@ -1898,8 +1898,8 @@ mod tests {
     // -----------------------------------------------------------------------
     //
     // Every expectation below is a verbatim transcription of the system oracle
-    // (OTP 29 / erts-17.1) — see `../unicode.rs`'s module docs and the pinned
-    // `escript` probe in `tests/unicode_wide.rs`. `#{…}` is a binary, `[…]` a
+    // (OTP 29 / erts-17.1) — see `../unicode.rs`'s module docs and the live `erl`
+    // cross-check in `tests/unicode_wide.rs`. `#{…}` is a binary, `[…]` a
     // list and `{…}` a tuple in `describe`'s rendering.
 
     /// The `{utf16|utf32, big|little}` encoding tuple.
