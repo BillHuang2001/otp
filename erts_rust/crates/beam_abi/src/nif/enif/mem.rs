@@ -557,7 +557,30 @@ pub unsafe extern "C" fn enif_make_binary(
     n(term)
 }
 
+/// The C's `ERL_ONHEAP_BITS_LIMIT` (`erl_bits.h:166-168`: 64 bytes / 512 bits) — the bit size at or
+/// below which `erts_build_sub_bitstring` materialises the window as a **heap bitstring** (the bits
+/// copied into a fresh block), and above which it builds an `ErlSubBits` **window** over the
+/// source's own storage (`erl_bits.c:2643-2669`, with `erts_extracted_bitstring_size` sizing the
+/// reservation for the same split).
+const ERL_ONHEAP_BITS_LIMIT: usize = 512;
+
 /// `ERL_NIF_TERM enif_make_sub_binary(ErlNifEnv*, ERL_NIF_TERM bin_term, size_t pos, size_t size);`
+///
+/// The window is bits `NBITS(pos) .. NBITS(pos) + NBITS(size)` of the source's **bit** string:
+/// `pos`/`size` are byte counts, but the C adds `NBITS(pos)` to the source's *bit* offset
+/// (`erl_nif.c:1776-1783`, `source_offset + NBITS(pos)`, `NBITS(size)`). Any bitstring source is
+/// therefore valid: byte-aligned or not, byte-sized or not. The result is always `NBITS(size)` bits
+/// — hence always byte-sized — and is built with `erts_build_sub_bitstring`'s split: a **heap
+/// bitstring** (bits copied) at or below [`ERL_ONHEAP_BITS_LIMIT`] bits, an `ErlSubBits` window
+/// over the source's storage above it (so a sub-window of an off-heap binary stays a window into
+/// that binary rather than becoming a fresh heap blob).
+///
+/// `size == 0` yields the empty bitstring for **any** `pos`, including `pos == total_bytes + 1`:
+/// the C's three bounds `ASSERT`s are compiled out of the release oracle, nothing is read, and
+/// `<<>>` comes back (measured). A `size > 0` window running past the source's last bit, or a
+/// **non-bitstring** source, raises `badarg` here: the C reads out of bounds (or faults) there, and
+/// this crate refuses rather than faults (the documented policy — the oracle's
+/// `enif_make_sub_binary(env, ok, 0, 1)` SIGSEGVs).
 ///
 /// # Safety
 ///
@@ -576,32 +599,68 @@ pub unsafe extern "C" fn enif_make_sub_binary(
     if !is_term_word(term) {
         return n(badarg_atom(e));
     }
-    // SAFETY: `is_binary` only dereferences the header of a boxed term.
-    if !unsafe { prelude::is_binary(term) } {
+    // SAFETY: `is_bitstring` only dereferences the header of a boxed term.
+    if !unsafe { prelude::is_bitstring(term) } {
+        // The C's `ASSERT(is_bitstring(bin_term))` is compiled out; a non-bitstring would be read
+        // through the bitstring macros (out of bounds / a fault).
         return n(badarg_atom(e));
     }
-    // SAFETY: `term` is a live byte-aligned bitstring.
-    let bits = unsafe { prelude::bitstring_size(term) };
-    let total_bytes = bits / 8;
-    if pos > total_bytes || size > total_bytes - pos {
-        return n(badarg_atom(e));
+    // SAFETY: `term` is a live bitstring.
+    let source_bits = unsafe { prelude::bitstring_size(term) };
+    let (n_bits, pos_bits) = if size == 0 {
+        // Nothing is read, so any `pos` is accepted (the C returns `<<>>` even for
+        // `pos == total_bytes + 1`); 0 bits also keeps `pos_bits == 0` (never used).
+        (0, 0)
+    } else {
+        let (Some(n_bits), Some(pos_bits)) = (size.checked_mul(8), pos.checked_mul(8)) else {
+            return n(badarg_atom(e));
+        };
+        // `pos_bits + n_bits > source_bits`, written so the subtraction cannot wrap.
+        if n_bits > source_bits || pos_bits > source_bits - n_bits {
+            return n(badarg_atom(e));
+        }
+        (n_bits, pos_bits)
+    };
+    if n_bits <= ERL_ONHEAP_BITS_LIMIT {
+        // `erts_build_sub_bitstring`'s heap arm: copy the window's bits into a fresh `ErlHeapBits`
+        // (`HEAP_BITSTRING` / `copy_binary_to_buffer`, `erl_bits.h:171-176`).
+        let n_bytes = prelude::bit_count_to_bytes(n_bits);
+        // SAFETY: `heap_bits_size_words` sizes the `[hdr][size][data…]` block for `n_bits` bits.
+        let Some(hp) = (unsafe { alloc(e, prelude::heap_bits_size_words(n_bits)) }) else {
+            return bare_badarg();
+        };
+        let mut bytes = vec![0u8; n_bytes];
+        for i in 0..n_bits {
+            // SAFETY: `pos_bits + n_bits <= source_bits`, so bit `pos_bits + i` is inside the
+            // source (`bit_at` reads bit `i` of the term's own bit string, source offset included).
+            if unsafe { prelude::bit_at(term, pos_bits + i) } {
+                bytes[i / 8] |= 1 << (7 - (i % 8));
+            }
+        }
+        // SAFETY: `hp` heads the reserved block and `bytes` holds exactly the `ceil(n_bits / 8)`
+        // payload bytes it needs (a bit count of 0 writes the header only).
+        let Ok(out) = (unsafe { prelude::write_heap_bits(hp, &bytes, n_bits) }) else {
+            return bare_badarg();
+        };
+        return n(out);
     }
-    if pos == 0 && size == total_bytes {
-        return bin_term;
-    }
-    // SAFETY: as above — `(base, bit_offset, _)`.
+    // The `ErlSubBits` arm: a window over the source's storage, at the **absolute** bit offset
+    // `source_offset + NBITS(pos)` into it — which is what makes a non-byte-aligned source work.
+    // SAFETY: `term` is a live bitstring; `(base, offset, _)` is its `(data base, bit offset, bit
+    // size)` triple.
     let (base, offset, _) = unsafe { prelude::bitstring_parts(term) };
-    if offset & 7 != 0 || base.is_null() {
+    if base.is_null() {
         return n(badarg_atom(e));
     }
     // SAFETY: `sub_bits_size_words()` sizes the 5-word `ErlSubBits` block.
     let Some(hp) = (unsafe { alloc(e, prelude::sub_bits_size_words()) }) else {
         return bare_badarg();
     };
-    let start = (pos * 8) as usize;
-    let end = ((pos + size) * 8) as usize;
-    // SAFETY: `hp` heads the reserved 5-word block; the base pointer identifies the original
-    // payload (kept alive by `term`'s heap), and the window is inside it by the checks above.
+    let start = offset + pos_bits;
+    let end = start + n_bits;
+    // SAFETY: `hp` heads the reserved 5-word block; `base` identifies the underlying storage (kept
+    // alive by `term`, which is also the `orig` slot), and the window is inside that storage by the
+    // bound check above (`base` is word-aligned, so no flag bit is set in the base word).
     let sub = unsafe {
         prelude::write_sub_bits(
             hp,
