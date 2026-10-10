@@ -127,13 +127,11 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   the system `erlc`) and execute it — `beam_rt run <slice.beam> slice:add/2 2 3` → `5`,
   `slice:fib/1 10` → `55`. The supported opcode subset is documented honestly per crate; anything
   outside it returns a typed `BeamError` (never a wrong result).
-- **Compatibility gate (`tools/differential`):** `summary: total=1213 agree=1210 mismatch=0 unsupported=3
-  skipped=0` (`gate.sh` → exit `3` until the allowlist is refreshed to those 3). **No case disagrees.**
-  `gate.sh` is authoritative — re-run it for the live per-contract split; the remaining `unsupported`
-  are honest, recorded capability gaps (never `mismatch`): `wire/new_fun_ext_encode` (unclosable — an
-  `erl_eval` lambda's closure identity needs `erl_eval`/`erl_scan`/`erl_parse`),
-  `proc_signals/statistics_runtime_unsupported` (CPU time needs a `sysconf`/`clock_gettime` facility), and
-  the A.9 boot seam (`boot/proc_lib_start_link_blocks_the_boot_path`).
+- **Compatibility gate (`tools/differential`):** `gate.sh` is authoritative — re-run it for the live
+  per-contract split. **No case disagrees**; the recorded capability gaps (the `known-gaps.txt` ratchet
+  allowlist) are `wire/new_fun_ext_encode` (unclosable — an `erl_eval` lambda's closure identity needs
+  `erl_eval`/`erl_scan`/`erl_parse`) and `boot_extra/init_script_id_names_the_running_otp_release` (A.9 —
+  `init:script_id/0` on a `-eval`/`run` path that loads no boot script).
 - **BIF surface complete:** `beam_bifs` registers **556/556 declared `bif.tab` BIFs** (registry 640
   keys = 556 declared + 84 non-table keys: 79 stdlib fast paths + `erlang:memory/0,1` + the OTP-30
   `pid_to_binary`/`ref_to_binary`/`port_to_binary`) through defaulted
