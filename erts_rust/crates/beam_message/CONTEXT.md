@@ -41,15 +41,27 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   (`HEADER_BIN_REF`, `val` = the MSO slot), a **refc binary** (the 8-word `[BinRef][ErlSubBits]` pair,
   the payload shared via its `RefcBinary` handle) and an **external pid/port/ref** (whose node is
   registered in the destination node list).
-  The capacity preflight is `preflight_words` (a `pub(crate)` cycle-safe, bounded walk) — see Design
-  Decisions; a graph that does not fit is refused **before** any word is written (the destination is
-  left untouched). A non-term (a bare header word, incl. `THE_NON_VALUE`) or a forged **cyclic**
-  graph is a typed `BeamError::BadArg`, never a wrong result and never a hang.
+  The copy is **single-pass for a clean destination** (an empty heap *and* an off-heap table empty in
+  all three lists — the fresh-fragment / fresh-receiver-heap case): `try_copy_fast` materialises the
+  whole graph through a `TrialTarget` bump pointer over the heap's unwritten words and commits it with
+  one `alloc_words`, so the sizing walk is skipped entirely. Every other destination (and every
+  clean-destination failure) takes the **preflight-then-write** path: the cycle-safe bounded
+  `preflight_words` runs before any word is written, so a graph that does not fit is refused **before**
+  any write (the destination is left untouched) and a fast-path failure is re-derived as the crate's
+  typed outcome. Either way a non-term (a bare header word, incl. `THE_NON_VALUE`) or a forged
+  **cyclic** graph is a typed `BeamError::BadArg`, never a wrong result and never a hang, and a refusal
+  is always `BeamError::Alloc(AllocKind::Message)` with **no partial write**.
 - `pub fn copy_struct_simple(term: Eterm, to: &mut beam_alloc::Heap) -> Result<Eterm>` — the common
   case of `copy_struct` with empty off-heap tables (graphs that contain no off-heap references).
 - `pub fn size_of_copy(term: Eterm) -> usize` — thin forwarder to `beam_term::size_object` (the total
   flat word count). Exposed so callers/tests can size a destination heap without re-deriving it; the
   copier's own preflight is the cycle-safe `preflight_words`, not this.
+- `pub(crate) trait CopyTarget` + `struct TrialTarget` + `fn is_clean_destination` / `fn try_copy_fast`
+  (crate-internal): the `copy_struct` destination abstraction. `Heap` reserves per object; `TrialTarget`
+  is the single-pass attempt's bump pointer over `[to.hp(), hend)` with `free = to.available()`, counting
+  `written` without touching `used`/`peak`. `is_clean_destination` = `to.used() == 0 && ctx.dst_off_heap().is_fully_empty()`.
+  A failed attempt is rolled back with `to.reset()` + `OffHeapTable::rollback` (`is_fully_empty`/`rollback`
+  are `pub(crate)` on `off_heap.rs`), then the preflight path re-derives the typed outcome.
 ### `share.rs` — the sharing-preserving copier
 - `pub fn copy_struct_shared(term: Eterm, to: &mut beam_alloc::Heap, ctx: &mut CopyContext<'_>) -> Result<Eterm>`
   — copies exactly like `copy_struct` (same immediate/literal/off-heap-node policy, same iterative
@@ -104,6 +116,16 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   - a payload that fits the receiver heap lives **in that heap** with no fragments and its off-heap
     objects in `off_heap`/`binaries`/`nodes`; a payload too large lives in the message's `Fragments`
     (the `data.heap_frag`/`hfrag` of `ErtsMessage`) and `payload()` points into them.
+  - **logical-size accounting surface** (the C `size_object_litopt` / `bin_vheap` inputs a host needs):
+    `heap_words() -> usize` (the sender copy-charge input — the payload graph's flat word count when
+    heap-resident, the fragment chain's `total_used_words()` when fragmented; **heap words only**, so an
+    off-heap refc binary contributes just its 8-word `[BinRef][ErlSubBits]` handle) and
+    `logical_binary_bytes() -> usize` (the *holder's* virtual-binary-heap input — the summed `RefcBinary`
+    payload lengths of `binaries()`, `0` when none).
+  - **rebuild-preserving** `with_payload(Eterm) -> Message` — a new payload term keeping `from`,
+    `token`, `off_heap`, `binaries`, `nodes` AND `fragments`: the relocation-safe rebuild a collector
+    must use (a from-scratch `Message::new` rebuild drops the fragment chain and the binary/node lists —
+    a use-after-free a sibling currently has; see Known Issues).
 - `pub struct Queue` — the per-process FIFO message queue (a pure data structure; **no** scheduler
   coupling). `new()`/`Default`, `enqueue(Message)`, `dequeue() -> Option<Message>`,
   `peek() -> Option<&Message>`, `len()`, `is_empty()`, `clear()`, `iter() -> impl Iterator<Item=&Message>`.
@@ -351,7 +373,10 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   the widened 4-word `[header, module, function, arity]` block, incl. the true-arity word); on-heap
   bitstrings (byte-aligned + non-byte-aligned). The off-heap classes are covered by their own files:
   refc binary → `binary.rs`, MSO container → `copy.rs`/`sizing.rs`, external pid/port/ref →
-  `external.rs`. **Not covered by any copy test:** boxed float, bignum, and HAMT collision tuples.
+  `external.rs`. A boxed `HEADER_FLONUM` float, a positive/negative bignum and a **HAMT collision tuple** are also
+  covered here (each copy asserted `compare::eq` with a distinct address and an exact
+  `dst.used() == size_object(term)`; the collision node is hand-laid with `make_map_header` + a
+  collision tuple, since `write_map` cannot force a 64-bit hash collision).
 - `tests/guards.rs` — **non-term and cycle guards + the relocation invariant**: `is_shared`/`shallow`
   reject every bare header word (incl. `THE_NON_VALUE`/`HEADER_SUB_BITS`) with a typed `BadArg` and
   write nothing; a forged cyclic graph (self-cons, self-tuple, 2-cell, 100-cell) returns a typed
@@ -360,14 +385,28 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   proves **every** non-shared compound subterm lies inside the destination heap region (nothing still
   points into the source) — the corpus includes a `SUB_BITS` match context, which the copier flattens
   to a fresh on-heap-bitstring leaf the walk asserts lives in the destination.
-- `tests/sizing.rs` — **sized-then-copied exactness**: for a 14-shape corpus (small tuple, deep list,
-  improper list, flat map, 64-key HAMT map, nested graph, Local/External fun, record, bitstring,
-  `SUB_BITS` match context, MSO container, refc binary, a graph with a shared refc binary), a
-  destination of exactly
-  `size_of_copy(term)` words accepts the copy with `to.used() == size_object(term) <= capacity`, and a
-  one-word-short (and zero-word) destination is refused with `Alloc(Message)` and
-  `used() == peak_used() == 0` (no partial write); immediates/`tuple0()` copy into a zero-capacity heap
-  by identity.
+- `tests/sizing.rs` — **sized-then-copied exactness**: for a 20-shape corpus (small tuple, deep list,
+  improper list, flat map, 64-key HAMT map, nested graph, Local/External fun, native record, byte-aligned
+  and 13-bit non-byte-aligned bitstrings, boxed float, 2-digit bignum, `SUB_BITS` match context, MSO
+  container, refc binary, a graph with a shared refc binary, external pid, external port, external
+  reference), a destination of exactly `size_of_copy(term)` words accepts the copy with
+  `to.used() == size_object(term) <= capacity`, and a one-word-short (and zero-word) destination is
+  refused with `Alloc(Message)` and `used() == peak_used() == 0` (no partial write, and no off-heap
+  artifact — the MSO handle, refc-binary AND node lists all empty); immediates/`tuple0()` copy into a
+  zero-capacity heap by identity. `a_one_word_short_destination_is_refused_before_any_write` is the
+  **wrong-size-copy detector**.
+- `tests/single_pass.rs` — the clean-destination **single-pass** contract: a faithful copy (vs the
+  preflighted path) with `dst.used() == size_of_copy(term)` for several shapes; a clean one-word-short
+  destination still refuses as a total no-op (`AllocKind::Message`, `used() == peak_used() == 0`, no
+  off-heap artifact — send atomicity preserved); a refused clean copy gives back the off-heap references
+  it took (source refcount back to 1); a forged cyclic graph / non-term on a clean destination is still a
+  typed `BadArg` (never a hang or a wrong result); and a DIRTY destination (pre-charged heap or non-empty
+  off-heap table) still takes the sized path untouched.
+- `tests/message_size.rs` — the logical-size surface: `heap_words()` == `size_object(payload)` for a
+  heap-resident message and == `fragments().total_used_words()` for fragment-resident ones (built by both
+  `send_fragmented` and `HeapFragment::copy_root`); `logical_binary_bytes()` == the shared refc payload's
+  length (and `0` with none) while `heap_words()` counts only the 8-word handle; `with_payload` preserves
+  `from`/`token`/`off_heap`/`binaries`/`nodes`/`fragments`.
 - `tests/share.rs` — the sharing-preserving evidence: (a) a `1000`-element subterm repeated `N = 8`
   times ⇒ the shared destination uses `2N + 2K` words vs the flat `2N + N·2K` (a >7× saving) and every
   occurrence shares one destination address while the flat copy's are all distinct; (b) the shared copy
@@ -387,7 +426,8 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
 - `tests/external.rs` — external thing copy: words verbatim and the node atom/creation preserved (via
   `external_*_parts`), one node entry per distinct node, two references to the same node ⇒ one entry
   with refcount 2, port and reference nodes registered separately, and dropping the destination
-  releasing the node. `compare::eq` is deliberately **not** used (see Known Issues).
+  releasing the node, plus an exact `dst.used() == size_object(term)` (`== external_*_size_words()`)
+  assertion on the pid and on the port/reference tests. `compare::eq` is deliberately **not** used (see Known Issues).
 - `tests/fun.rs` — a **closure crossing a copy boundary** is sized/walked from the frozen
   `beam_term::fun` layout (`env[0]` at `1 + desc_words(kind)`, block `1 + desc_words(kind) + num_free`),
   never the legacy C `ERL_FUN_SIZE`: a 0-free-variable (`make_fun`) closure and a 5-free-variable
@@ -416,8 +456,9 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   too-small `beam_alloc::Heap` yields `Alloc(Message)` with `requested == words * size_of::<Eterm>()`
   and leaves the heap untouched (`used() == 0`); `is_message_heap_exhaustion` accepts it and rejects
   `BadArg`, the other `AllocKind`s and non-`Alloc` variants; the flat-word-count boundary is pinned.
-- `tests/perf.rs` — the committed, dependency-free **copy-cost measurement** (see Performance below);
-  asserts correctness only, never a timing threshold.
+- `tests/perf.rs` — the committed, dependency-free **copy-cost measurement** (see Performance below),
+  including the **preflight-share probe** (clean vs pre-charged destination); asserts correctness only,
+  never a timing threshold.
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_message`
   and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace --all-targets`.
   Always go through `../../scripts/cargo.sh` (`$HOME` is read-only), never `cd`, never touch `../../tools/`.
@@ -442,14 +483,31 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
 | refc binary reuse (512 B) | 8 | 1 | 61.3 | 7.7 | 61.3 (payload shared) |
 
 Per-word cost is flat across shapes (~7.7–9.3 ns/word; the homogeneous cons chain is **not** the
-worst), so the objective's "avoid a per-word tag re-test for a homogeneous list" would recover at most
-~1 ns/word on one shape while adding a second, less-tested path to the most safety-critical loop — not
-worth the risk, so **no optimiser change was made**. The `alloc_words` bump allocator already performs
-exactly one reservation per object and the preflight reserves nothing, so there is no per-object
-overhead left for a "single up-front reservation" to remove. (Sub-100 ns fixed cost for one object
-dominates the small shapes.)
+worst). (Sub-100 ns fixed cost for one object dominates the small shapes.)
+
+**The clean-destination copy is now single-pass.** A `copy_struct` into a clean destination (an empty
+heap *and* a fully empty off-heap table) runs materialise-then-commit (`try_copy_fast`) and skips the
+sizing walk entirely; a dirty destination still preflights before writing. The `preflight-share` probe
+in `tests/perf.rs` measures the saving as `best_ns(clean)` vs `best_ns(pre-charged)` (best-of-100 000,
+dev/`opt-level=1`, host at `/proc/loadavg` 199–286): small tuple (4 words) `best_ns` **78 → 62**
+(pre-charged 74.5), a Pass-1 share of ≈ 13 ns (~17 %); flat map, 8 keys (20 words) `best_ns`
+**155 → 101.5** (pre-charged 151.5), a Pass-1 share of ≈ 48.5 ns (~32 %). `tests/perf.rs` asserts
+correctness only, never a timing threshold; absolute numbers are inflated under the
+shared/oversubscribed host — prefer ratios.
 ## Known Issues / Intentional M1 gaps
-- **`copy_struct` is a deliberate two-pass copy; the design docs' Stage-3 "opportunistic messaging wins" are NOT implemented.** Every call runs a full bounded sizing walk (`preflight_words`) before writing any word, so a rejected/oversized send is a total no-op (the `send` atomicity / `send_fragmented` reuse guarantee). `../ERTS_RUST_REWRITE_DEEPDIVE.md` §D ("Cheaper messaging and ETS", the "(a) Opportunistic messaging wins (in the current VM)" paragraph) and §H Stage 3 specify the follow-ups — a *bounded single-pass small copy* (a `size_object_bounded(msg, N)` probe that reserves once and falls back to the sized/fragment path on overflow, removing the first pass for the dominant 4–8-word gen envelope) and *message-queue auto-tuning* (replace the static `SPO_ON_HEAP_MSGQ`/`+hmqd` on-/off-heap choice with a queue-length-threshold flip through `erts_change_message_queue_management`). Neither doc names a concrete N/threshold — both are left to the implementer. In `../tools/bench` the only `Category::Messaging` ("messaging/copy-bound") workload is `emqx`, which reports `skipped(emqx-requires-otp-28)`; the runnable copy-cost signal is `tests/perf.rs` (ns/word, ns/object).
+- **`copy_struct` is two-pass only for a DIRTY destination; a clean one is now single-pass.** The
+  Stage-3 "bounded single-pass small copy" from `../ERTS_RUST_REWRITE_DEEPDIVE.md` §D/§H and
+  `../ERTS_RUST_REWRITE_EVALUATION.md` §D/E is landed for the clean case (`try_copy_fast`). Generalising
+  it to a dirty destination needs an **off-heap checkpoint API** — `OffHeapTable::rollback` drains all
+  three lists (so it would discard pre-existing entries) and there is no
+  `OffHeapTable::checkpoint()`/`rollback_to(...)`; a `beam_alloc::Heap::truncate(mark)` would only help an
+  alternative design that writes straight into the heap. Both live outside this crate. The other Stage-3
+  item, **message-queue auto-tuning** (replacing the static `SPO_ON_HEAP_MSGQ`/`+hmqd` on-/off-heap choice
+  through `erts_change_message_queue_management`), is a per-process placement flag — a `beam_process`/
+  `beam_rt` concern this crate does not model (its `send` vs `send_fragmented` choice is the placement
+  decision itself). In `../tools/bench` the only `Category::Messaging` ("messaging/copy-bound") workload
+  is `emqx`, which reports `skipped(emqx-requires-otp-28)`; the runnable copy-cost signal is
+  `tests/perf.rs`.
 - **`beam_term::compare` has no structural arm for external pid/port/reference (nor for
   `RECORD_SUBTAG`).** It falls through to the deterministic `fallback_cmp` (same class ⇒ order by
   object arity, then raw term word), so a copy is never `=:=` its original for those two shapes and
@@ -495,16 +553,14 @@ dominates the small shapes.)
 - **Scheduler coupling is absent by design.** `Queue` is a pure FIFO; selective-receive waiting,
   `after`, the save queue, signal/priority ordering and the message-queue length semantics of
   `ErtsSignalPrivQueues` are `beam_process`'s.
-- **No logical-size / reduction-accounting surface.** `Message` exposes no size accessor (no
-  `logical_size()`/word count); a host that must charge the sender's message-copy reductions or
-  report a message's size derives it itself — `beam_term::size_object(payload)` for a heap-resident
-  payload, `Fragments::total_used_words()` for a fragment-resident one. The C sender charge is
-  `size_object_litopt(message) / ERTS_MSG_COPY_WORDS_PER_REDUCTION` (64 release; `erl_message.c:881-886`;
-  same at `erl_proc_sig_queue.c:2284-2289`) plus a fixed 4 (`bif.c:2742`/`:2862`), in **heap words**:
-  an off-heap refc binary contributes only its 8-word `[BinRef][ErlSubBits]` handle (`copy.c:219-242`),
-  **not** its payload length. A payload's logical byte size is charged to the *holder's* virtual
-  binary heap (`bin_vheap`, `erl_gc.c:3046,3051`) / `virtual_reds` (`erl_process.c:9678`), a separate
-  mechanism this crate does not model.
+- **The logical-size surface is exposed but nothing charges it yet.** `Message::heap_words()` supplies
+  the sender's copy-charge input (the C `msize = size_object_litopt(message)`; charge
+  `4 + msize / ERTS_MSG_COPY_WORDS_PER_REDUCTION` (64 release) capped at `CONTEXT_REDS` — `bif.c:2742`/
+  `:2862`, `erl_message.c:881-886`) and `Message::logical_binary_bytes()` the *holder's* virtual
+  binary-heap input (`bin_vheap += orig_size / sizeof(Eterm)`, surfaced as `virtual_reds` —
+  `erl_gc.c:3046,3051`, `erl_process.c:9678`); a host must apply both. Charging the holding process's
+  virtual binary heap remains a separate mechanism this crate does not model. `message_queue_len` (the
+  message COUNT) and `message_queue_data` (on_heap/off_heap) are unaffected.
 - **`Message.token` is a plain field (`NIL` when absent).** The seq-trace / distribution-token
   machinery that fills it is `beam_dist`/`beam_rt`.
 - **The binary/node lists are carried but not yet consumed.** `beam_process`/`beam_rt` must own a
@@ -512,28 +568,30 @@ dominates the small shapes.)
   today nothing sweeps them, the `Message`'s own `Drop` releases them. A **fragmented** message instead
   leaves those lists empty: its payload's off-heap objects live in the fragment's `off_heap` table until
   `Fragments::move_into` hands them to the destination table.
-- **Copy-coverage gap: boxed floats and bignums are never exercised.** No test under `tests/` builds or
-  copies a `HEADER_FLONUM` float or a `HEADER_POS_BIG`/`HEADER_NEG_BIG` bignum (the only appearance of a
-  float header is the *bare non-term* `HEADER_FLONUM` in `guards.rs`), so the copier's generic
-  `object_words`+`copy_nonoverlapping` arm is untested for those two classes. The LCA sizes them
-  correctly (`beam_term::layout::object_words`'s default arm = `thing_arityval + 1`, i.e. `2` for a
-  flonum and `big_size_words(n)` for a bignum), but a regression there would not be caught. HAMT
-  *collision* tuples are likewise unexercised (`copy.rs` deliberately does not force one).
+- **Cross-crate: a received message's fragments/binaries/nodes must survive a mailbox rebuild (sibling
+  `beam_process`).** `beam_process::Process::run_rooted_collection` rebuilds each queued message with
+  `Message::new(payload, from).with_token(...).with_off_heap(...)`, dropping `fragments`/`binaries`/
+  `nodes` — a use-after-free for a fragment-resident payload once source off-heap registration is live.
+  This crate supplies the correct primitive (`Message::with_payload`, which keeps every list); the fix
+  belongs to `beam_process` (reported up). `beam_rt`'s `MailboxState` only retains fragments for messages
+  it removes.
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude` (incl. `is_message_heap_exhaustion`)
-- `src/copy.rs` → the iterative `copy_struct` engine (the `unsafe` core) + `CopyContext` + the cycle-safe `preflight_words`/`bounded_words`/`is_acyclic` + `size_of_copy`
+- `src/copy.rs` → the iterative `copy_struct` engine (the `unsafe` core) + `CopyContext` + the cycle-safe `preflight_words`/`bounded_words`/`is_acyclic` + `size_of_copy` + the clean-destination single-pass path (`CopyTarget`/`TrialTarget`, `is_clean_destination`, `try_copy_fast`)
 - `src/share.rs` → the sharing-preserving `copy_struct_shared` (source-identity memo over `copy.rs`'s `shallow`; preflights via `copy::preflight_words`)
 - `src/fragment.rs` → `HeapFragment` (bump region + off-heap table + roots) and `Fragments` (the chain + `move_into`, ownership released only after the whole chain moves); the `ErlHeapFragment` message-buffer model
 - `src/layout.rs` → the beam_message-specific M1 **identification + encoding** helpers for the copier: off-heap container (`is_off_heap_container`/`is_off_heap_term`/`off_heap_slot`/`make_off_heap_container`), refc binary (`is_refc_binary_term`), match context (`is_match_context_term`) and external thing (`is_external_header`/`external_node_creation`). Per-object word counts and child-slot enumeration are **not** defined here — the canonical walk (`object_words`, `for_each_child_slot`, `for_each_sizing_child_slot`) is re-exported (`pub(crate) use`) from the LCA `beam_term::layout`
-- `src/off_heap.rs` → `OffHeapTable` (MSO-typed façade over slot-indexed `beam_gc::OffHeap`, plus the refc-binary and node lists); MSO handle re-export
+- `src/off_heap.rs` → `OffHeapTable` (MSO-typed façade over slot-indexed `beam_gc::OffHeap`, plus the refc-binary and node lists); MSO handle re-export + the `pub(crate)` `is_fully_empty`/`rollback` used by the single-pass rollback
 - `src/node.rs` → `NodeEntry`, the refcounted `(node, creation)` external-thing node identity
-- `src/message.rs` → `Message` envelope (payload/from/token + off-heap, binary and node lists + optional `Fragments`) + `Queue` FIFO
+- `src/message.rs` → `Message` envelope (payload/from/token + off-heap, binary and node lists + optional `Fragments`) + `Queue` FIFO + the logical-size surface (`heap_words`/`logical_binary_bytes`) and `with_payload`
 - `src/mailbox.rs` → `send` / `send_fragmented` / `receive` / `receive_ref` data-level primitives
 - `src/error.rs` → `pub(crate)` copy-failure constructors + the public `is_message_heap_exhaustion` predicate (no new error type)
 - `tests/copy.rs` → flat-copy correctness: nested-graph equality, deep list, literal sharing, MSO refcount, exhaustion, HAMT trie
 - `tests/classes.rs` → term-class completeness across every copyable class
 - `tests/guards.rs` → non-term/cycle guards + the destination-relocation invariant (incl. a `SUB_BITS` match context)
 - `tests/sizing.rs` → sized-then-copied exactness (incl. the `SUB_BITS` match-context shape) + too-small-reservation refusal
+- `tests/single_pass.rs` → the clean-destination single-pass contract (faithfulness, no-op refusal, refcount rollback, cycle→BadArg, dirty path untouched)
+- `tests/message_size.rs` → the logical-size surface (`heap_words`/`logical_binary_bytes`) + `with_payload` envelope preservation
 - `tests/share.rs` → sharing-preserving evidence: N-fold subterm, structural equality, no-sharing size, shared MSO identity
 - `tests/binary.rs` → refc-binary payload sharing (refcount, `data_ptr`, `orig` fix-up, size) + on-heap small-binary copy-by-value + `SUB_BITS` match-context flattening (no source aliasing)
 - `tests/external.rs` → external pid/port/ref verbatim copy + node linkage/refcounting
