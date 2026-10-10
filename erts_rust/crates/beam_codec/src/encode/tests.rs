@@ -22,6 +22,9 @@
     //! wire bytes, including the width-policy boundaries. Terms are built with
     //! `beam_alloc::Heap` + the [`crate::term`] constructors.
 
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+
     use beam_alloc::Heap;
     use beam_common::{BeamError, Result};
     use beam_term::prelude::{
@@ -29,10 +32,11 @@
     };
 
     use super::*;
+    use crate::decode::Decoder;
     use crate::error::is_unsupported;
     use crate::term::{
         make_big, make_external_pid, make_external_port, make_external_ref, make_flatmap,
-        make_float,
+        make_float, make_internal_ref,
     };
 
     /// A heap large enough for every term a test builds (tests pass a bigger one
@@ -513,6 +517,100 @@
     }
 
     #[test]
+    fn internal_ref_uses_local_node_for_newer_reference_ext() {
+        let mut atoms = AtomTable::new();
+        let sysname = atoms.intern("nonode@nohost");
+        let mut heap = new_heap(1 << 12);
+
+        // The exact `NEWER_REFERENCE_EXT` body: `[90][len = 3:u16 BE][node atom]`
+        // `[creation:u32 BE]` followed by the three big-endian numbers the id packs
+        // into. The numbers come from `ref_wire` (the single place the mapping is
+        // written) — never re-derived here.
+        let expected = |creation: u32, id: u64| {
+            let mut e = vec![90u8];
+            e.extend_from_slice(&3u16.to_be_bytes());
+            e.extend_from_slice(&[119, 13]);
+            e.extend_from_slice(b"nonode@nohost");
+            e.extend_from_slice(&creation.to_be_bytes());
+            for number in crate::ref_wire::ref_id_to_numbers(id) {
+                e.extend_from_slice(&number.to_be_bytes());
+            }
+            e
+        };
+
+        // A high-bit id: the whole identity sits in the third number, and the first
+        // stays below `MAX_REFERENCE` so the local reference is oracle-valid.
+        let high: u64 = 1 << 45;
+        assert_eq!(crate::ref_wire::ref_id_to_numbers(high), [0, 0, 1 << 13]);
+        assert!(crate::ref_wire::ref_id_to_numbers(high)[0] < (1 << 18));
+        let r = make_internal_ref(&mut heap, high).unwrap();
+        let mut encoder = Encoder::new(&atoms).with_local_node(sysname, 0);
+        encoder.encode(r).unwrap();
+        let image = encoder.finish();
+        assert_eq!(image[0], 131);
+        assert_eq!(&image[1..], &expected(0, high)[..]);
+        assert_eq!(
+            image,
+            vec![
+                131, 90, 0, 3, 119, 13, 110, 111, 110, 111, 100, 101, 64, 110, 111, 104, 111,
+                115, 116, // "nonode@nohost"
+                0, 0, 0, 0, // creation = 0
+                0, 0, 0, 0, // n0
+                0, 0, 0, 0, // n1
+                0, 0, 0x20, 0, // n2 = 8192
+            ]
+        );
+
+        // An id spanning all three number slots (with a non-zero creation), encoded
+        // without the version byte.
+        let spread: u64 = (1 << 40) | (1 << 20) | 5;
+        assert_eq!(
+            crate::ref_wire::ref_id_to_numbers(spread),
+            [5, 1 << 20, 1 << 8]
+        );
+        let r = make_internal_ref(&mut heap, spread).unwrap();
+        let mut body_encoder = Encoder::new_body(&atoms).with_local_node(sysname, 7);
+        body_encoder.encode(r).unwrap();
+        let body = body_encoder.finish();
+        assert_eq!(body, expected(7, spread));
+        let mut literal = vec![90u8];
+        literal.extend_from_slice(&3u16.to_be_bytes());
+        literal.extend_from_slice(&[119, 13]);
+        literal.extend_from_slice(b"nonode@nohost");
+        literal.extend_from_slice(&7u32.to_be_bytes());
+        literal.extend_from_slice(&5u32.to_be_bytes());
+        literal.extend_from_slice(&(1u32 << 20).to_be_bytes());
+        literal.extend_from_slice(&(1u32 << 8).to_be_bytes());
+        assert_eq!(body, literal);
+
+        // The image is wire-valid: a **plain** decode with no local node identity
+        // installed does not demote (the demotion seam is inert without an identity),
+        // so it yields an *external* reference, and re-encoding it reproduces the same
+        // three numbers.
+        let mut decoder = Decoder::new_body(&body);
+        let decoded = decoder.decode(&mut heap, &mut atoms).unwrap();
+        decoder.finish().unwrap();
+        assert!(crate::term::external_ref_parts(decoded).is_ok());
+        assert_eq!(encode_term_body(decoded, &atoms).unwrap(), body);
+    }
+
+    #[test]
+    fn internal_ref_without_a_local_node_is_unsupported() {
+        let atoms = AtomTable::new();
+        let mut heap = new_heap(64);
+        let r = make_internal_ref(&mut heap, 1 << 45).unwrap();
+
+        // Without a local node identity an internal reference has no wire image: its
+        // node atom/creation are the runtime's, and the three numbers alone do not
+        // identify a node.
+        let mut bare = Encoder::new(&atoms);
+        let err = bare
+            .encode(r)
+            .expect_err("an internal ref without a local node is unsupported");
+        assert!(is_unsupported(&err));
+    }
+
+    #[test]
     fn version_magic_is_emitted_only_by_new() {
         let atoms = AtomTable::new();
 
@@ -732,4 +830,204 @@
         let mut encoder = Encoder::new_body(&atoms).with_atom_cache(&mut cache);
         encoder.encode(make_atom(ok)).unwrap();
         assert_eq!(encoder.finish_local(1), vec![131, 121, 0, 0, 0, 1, 82, 2]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Internal-reference canonical image + live oracle cross-check
+    // (loud skip when no `erl`)
+    // -----------------------------------------------------------------------
+
+    /// The encoder's internal-reference image is the oracle's canonical bytes.
+    ///
+    /// The exact body is `[131][90 NEWER_REFERENCE_EXT][len = 3:u16 BE]`
+    /// `[SMALL_ATOM_UTF8 119,13 "nonode@nohost"][creation:u32 BE]`
+    /// `[n0,n1,n2: 3 × u32 BE]` — verified byte-for-byte against real ERTS.
+    #[test]
+    fn internal_ref_encodes_the_oracle_canonical_image() {
+        let mut atoms = AtomTable::new();
+        let sysname = atoms.intern("nonode@nohost");
+        let mut heap = new_heap(1 << 12);
+
+        // A high-bit id: the whole identity sits in the third number (`1 << 45`
+        // packs to `[0, 0, 8192]` — see
+        // `internal_ref_uses_local_node_for_newer_reference_ext`).
+        let id: u64 = 1 << 45;
+        let r = make_internal_ref(&mut heap, id).unwrap();
+
+        let mut encoder = Encoder::new(&atoms).with_local_node(sysname, 0);
+        encoder.encode(r).unwrap();
+        let image = encoder.finish();
+
+        // The exact 35-byte canonical image (version · `90` NEWER_REFERENCE_EXT ·
+        // len = 3 · the node atom · creation = 0 · the three numbers `[0, 0, 8192]`).
+        assert_eq!(
+            image,
+            vec![
+                131, 90, 0, 3, 119, 13, 110, 111, 110, 111, 100, 101, 64, 110, 111, 104, 111,
+                115, 116, // "nonode@nohost"
+                0, 0, 0, 0, // creation = 0
+                0, 0, 0, 0, // n0 = 0
+                0, 0, 0, 0, // n1 = 0
+                0, 0, 32, 0, // n2 = 8192
+            ]
+        );
+
+        // Live oracle check that skips loudly when no oracle is installed. Whether or
+        // not real ERTS treats creation 0 as its own local node, the re-encode is
+        // byte-identical: it either stays a 3-number external reference preserving
+        // creation 0, or it materializes internally and re-encodes with the node's
+        // creation 0 — both produce exactly our image.
+        let Some(oracle) = oracle_or_skip("internal_ref_encodes_the_oracle_canonical_image")
+        else {
+            return;
+        };
+        let bytes = erlang_binary_literal(&image);
+        let eval = format!(
+            "B = {bytes}, io:format(\"~p\", \
+             [binary_to_list(term_to_binary(binary_to_term(B))) =:= binary_to_list(B)])"
+        );
+        assert_eq!(
+            run_erl(&oracle, &eval),
+            "true",
+            "real ERTS did not re-encode our internal-reference image byte-identically \
+             (image {bytes})"
+        );
+    }
+
+    /// A local-node legacy `REFERENCE_EXT` (`101`) demotes to this runtime's internal
+    /// reference on decode and re-encodes as the canonical 3-number
+    /// `NEWER_REFERENCE_EXT`.
+    ///
+    /// The legacy image carries a single number (`r0 = 42`); the C zero-pads a short
+    /// image to `ERTS_REF_NUMBERS = 3`, so the re-encode is `90,0,3` with ids
+    /// `[42, 0, 0]`. Before the local-node demotion landed this re-encoded as `90,0,1`
+    /// (the wire count was preserved).
+    #[test]
+    fn a_local_legacy_reference_recodes_as_the_canonical_three_number_form() {
+        let mut atoms = AtomTable::new();
+        let sysname = atoms.intern("nonode@nohost");
+
+        // `[131][101 REFERENCE_EXT][SMALL_ATOM_UTF8 119,13 "nonode@nohost"]`
+        // `[r0 = 42:u32 BE][creation = 0:8-bit tiny]`.
+        let mut legacy = vec![131u8, 101, 119, 13];
+        legacy.extend_from_slice(b"nonode@nohost");
+        legacy.extend_from_slice(&42u32.to_be_bytes());
+        legacy.push(0);
+
+        let mut heap = new_heap(1 << 12);
+        let mut decoder = Decoder::new(&legacy).unwrap().with_local_node(sysname, 0);
+        let term = decoder.decode(&mut heap, &mut atoms).unwrap();
+        decoder.finish().unwrap();
+
+        // Re-encoding the demoted (internal) reference with the identity installed
+        // yields the canonical 3-number form: the single legacy number is zero-padded
+        // to `ERTS_REF_NUMBERS` (the exact bytes pin the demotion — an *external*
+        // reference would re-encode with `90,0,1`).
+        let mut encoder = Encoder::new(&atoms).with_local_node(sysname, 0);
+        encoder.encode(term).unwrap();
+        assert_eq!(
+            encoder.finish(),
+            vec![
+                131, 90, 0, 3, 119, 13, 110, 111, 110, 111, 100, 101, 64, 110, 111, 104, 111,
+                115, 116, // "nonode@nohost"
+                0, 0, 0, 0, // creation = 0
+                0, 0, 0, 42, // n0 = 42
+                0, 0, 0, 0, // n1 = 0
+                0, 0, 0, 0, // n2 = 0
+            ]
+        );
+    }
+
+    /// Whether `p` is an existing executable file.
+    fn is_executable(p: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            match std::fs::metadata(p) {
+                Ok(m) => m.is_file() && m.permissions().mode() & 0o111 != 0,
+                Err(_) => false,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            p.is_file()
+        }
+    }
+
+    /// Resolve the oracle the same way `tools/differential` / `tests/local_node.rs`
+    /// do: `$ERTS_ORACLE` if it is an existing executable, else `erl` on `$PATH`.
+    fn resolve_oracle() -> Option<PathBuf> {
+        if let Some(value) = std::env::var_os("ERTS_ORACLE") {
+            let program = PathBuf::from(&value);
+            if is_executable(&program) {
+                return Some(program);
+            }
+            eprintln!(
+                "[beam_codec encode] $ERTS_ORACLE='{}' is not an existing executable — treating it as no oracle.",
+                program.display()
+            );
+        }
+        let path = std::env::var_os("PATH")?;
+        for dir in std::env::split_paths(&path) {
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
+            let candidate = dir.join("erl");
+            if is_executable(&candidate) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    /// Returns the oracle, or prints a loud skip note and returns `None`.
+    fn oracle_or_skip(test: &str) -> Option<PathBuf> {
+        match resolve_oracle() {
+            Some(program) => Some(program),
+            None => {
+                eprintln!();
+                eprintln!("============ beam_codec encode: {test} SKIPPED ============");
+                eprintln!("No usable system `erl` oracle found ($ERTS_ORACLE unset or not");
+                eprintln!("executable, and no `erl` on $PATH). This test is NOT a pass —");
+                eprintln!("set $ERTS_ORACLE (or install Erlang/OTP) and re-run.");
+                eprintln!("==========================================================");
+                eprintln!();
+                None
+            }
+        }
+    }
+
+    /// Run one `erl -noshell -eval <eval> -s init stop` and return its trimmed stdout.
+    fn run_erl(oracle: &Path, eval: &str) -> String {
+        let output = Command::new(oracle)
+            .arg("-noshell")
+            .arg("-eval")
+            .arg(eval)
+            .arg("-s")
+            .arg("init")
+            .arg("stop")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn the oracle '{}': {e}", oracle.display()));
+        assert!(
+            output.status.success(),
+            "the oracle '{}' exited with {:?}\n--- stderr ---\n{}\n--- eval ---\n{eval}",
+            oracle.display(),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        String::from_utf8(output.stdout)
+            .unwrap_or_else(|e| panic!("the oracle printed non-UTF-8 to stdout: {e}"))
+            .trim()
+            .to_string()
+    }
+
+    /// The `<<b0,b1,...>>` Erlang binary literal for `bytes` (`io_lib`-free).
+    fn erlang_binary_literal(bytes: &[u8]) -> String {
+        let joined = bytes
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("<<{joined}>>")
     }

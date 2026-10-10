@@ -52,7 +52,8 @@ use core::str;
 use beam_alloc::Heap;
 use beam_common::Result;
 use beam_term::prelude::{
-    is_atom, make_atom, make_small, try_make_small, MAX_ARITYVAL, MAX_SMALL, MIN_SMALL, NIL,
+    is_atom, make_atom, make_internal_pid, make_internal_port, make_pid_data, make_port_data,
+    make_small, try_make_small, MAX_ARITYVAL, MAX_SMALL, MIN_SMALL, NIL,
 };
 use beam_term::refc::ERL_ONHEAP_BITS_LIMIT;
 use beam_term::{Atom, AtomTable, Eterm};
@@ -392,6 +393,17 @@ impl<'a> Decoder<'a> {
                 if creation > 3 {
                     return Err(bad_arg());
                 }
+                // A **local node's** reference materializes as *this* runtime's internal
+                // reference (`ref_ext_common`'s `dec_is_this_node` branch,
+                // `external.c:4821-4862`): the single wire number is the id, zero-padded
+                // to `ERTS_REF_NUMBERS`. Inert unless `Decoder::with_local_node` installed
+                // the identity (see [`local_node`]).
+                if self.is_local_node(node, creation) {
+                    return crate::term::make_internal_ref(
+                        heap,
+                        crate::ref_wire::ref_numbers_to_id(&[r0]),
+                    );
+                }
                 crate::term::make_external_ref(heap, node, &[r0], creation)
             }
             Tag::NewReference => {
@@ -439,6 +451,15 @@ impl<'a> Decoder<'a> {
                     ids.extend(self.read_ids(len - 1)?);
                     ids
                 };
+                // Local-node demotion: an internal reference (see the `Tag::Reference`
+                // arm and `ref_ext_common`, `external.c:4821-4862`). The empty `len == 0`
+                // slice maps to id 0 — exactly the C's zeroed padding.
+                if self.is_local_node(node, creation) {
+                    return crate::term::make_internal_ref(
+                        heap,
+                        crate::ref_wire::ref_numbers_to_id(&ids),
+                    );
+                }
                 crate::term::make_external_ref(heap, node, &ids, creation)
             }
             Tag::NewerReference => {
@@ -474,6 +495,15 @@ impl<'a> Decoder<'a> {
                     ids.extend(self.read_ids(len - 1)?);
                     ids
                 };
+                // Local-node demotion (see the `Tag::Reference` arm): the C's
+                // `ref_ext_common` builds the internal reference from only the first
+                // `ERTS_REF_NUMBERS` numbers, zero-padding a shorter image.
+                if self.is_local_node(node, creation) {
+                    return crate::term::make_internal_ref(
+                        heap,
+                        crate::ref_wire::ref_numbers_to_id(&ids),
+                    );
+                }
                 crate::term::make_external_ref(heap, node, &ids, creation)
             }
             Tag::Port => {
@@ -492,6 +522,12 @@ impl<'a> Decoder<'a> {
                 // the C rejects an id past `ERTS_MAX_INTERNAL_PORT_NUMBER`
                 // (`external.c:4718-4721`). Inert without a local node identity.
                 self.check_local_port(node, creation, number)?;
+                // A local node's port materializes as the internal port immediate
+                // (`dec_port`, `external.c:4721`), so `P =:= self()`-style identity
+                // holds. Inert without a local node identity.
+                if self.is_local_node(node, creation) {
+                    return Ok(make_internal_port(make_port_data(number)));
+                }
                 crate::term::make_external_port(heap, node, number, creation)
             }
             Tag::NewPort => {
@@ -499,6 +535,9 @@ impl<'a> Decoder<'a> {
                 let number = u64::from(self.reader.u32be()?);
                 let creation = self.reader.u32be()?;
                 self.check_local_port(node, creation, number)?;
+                if self.is_local_node(node, creation) {
+                    return Ok(make_internal_port(make_port_data(number)));
+                }
                 crate::term::make_external_port(heap, node, number, creation)
             }
             Tag::V4Port => {
@@ -510,6 +549,9 @@ impl<'a> Decoder<'a> {
                 let creation = self.reader.u32be()?;
                 // The only port tag whose id can exceed the 60-bit local bound.
                 self.check_local_port(node, creation, number)?;
+                if self.is_local_node(node, creation) {
+                    return Ok(make_internal_port(make_port_data(number)));
+                }
                 crate::term::make_external_port(heap, node, number, creation)
             }
             Tag::Pid => {
@@ -526,6 +568,16 @@ impl<'a> Decoder<'a> {
                 // D6: `dec_pid` bounds a *local* pid's number/serial
                 // (`external.c:3175-3179`).
                 self.check_local_pid(node, creation, number, serial)?;
+                // A local node's pid materializes as the internal pid immediate
+                // (`dec_pid`, `external.c:3175-3182`), so `P =:= self()` holds. The wire
+                // reads `number` first, then `serial`; `make_pid_data` takes (serial,
+                // number). Inert without a local node identity.
+                if self.is_local_node(node, creation) {
+                    return Ok(make_internal_pid(make_pid_data(
+                        u64::from(serial),
+                        u64::from(number),
+                    )));
+                }
                 crate::term::make_external_pid(heap, node, number, serial, creation)
             }
             Tag::NewPid => {
@@ -534,6 +586,12 @@ impl<'a> Decoder<'a> {
                 let serial = self.reader.u32be()?;
                 let creation = self.reader.u32be()?;
                 self.check_local_pid(node, creation, number, serial)?;
+                if self.is_local_node(node, creation) {
+                    return Ok(make_internal_pid(make_pid_data(
+                        u64::from(serial),
+                        u64::from(number),
+                    )));
+                }
                 crate::term::make_external_pid(heap, node, number, serial, creation)
             }
 
@@ -903,6 +961,53 @@ pub fn decode_term(bytes: &[u8], heap: &mut Heap, atoms: &mut AtomTable) -> Resu
         return decoder.decode(heap, atoms);
     }
     let mut decoder = Decoder::new(bytes)?;
+    let term = decoder.decode(heap, atoms)?;
+    decoder.finish()?;
+    Ok(term)
+}
+
+/// Like [`decode_term`], but installs the local node identity so an incoming
+/// identifier whose node/creation name the running node is materialized as this
+/// runtime's **internal** form (internal pid/port immediate, M1 internal
+/// reference) instead of an external thing — the C's `dec_is_this_node` branches
+/// (`external.c:3175-3182` pid, `:4721` port, `:4821-4862` ref).
+///
+/// `node` is the `sysname` atom **as interned in `atoms`** (the same atom the wire
+/// image carries for the local node) and `creation` is the running node's creation
+/// — the caller (`beam_rt`, which owns node identity) resolves both. The identity
+/// is installed on **both** the compressed-body path and the plain path, so a
+/// `term_to_binary/2 [compressed]` image demotes exactly like its uncompressed
+/// twin. When `local_hash` is `Some(h)`, a `LOCAL_EXT` (`121`) wrapper's 4-byte
+/// node hash must equal `h` else `BeamError::BadArg` (the `decoded_size` check,
+/// `external.c:6505-6511`); `None` consumes the hash unchecked.
+///
+/// [`decode_term`] itself stays identity-free: with no identity installed decoding
+/// is byte-for-byte unchanged, so the distribution payload path is untouched.
+///
+/// # Errors
+///
+/// Every error [`decode_term`] reports, plus `BeamError::BadArg` for a mismatched
+/// `LOCAL_EXT` hash and `BeamError::SystemLimit` for a local reference id that does
+/// not fit the M1 block's 60-bit slot.
+pub fn decode_term_with_local_node(
+    bytes: &[u8],
+    heap: &mut Heap,
+    atoms: &mut AtomTable,
+    node: Atom,
+    creation: u32,
+    local_hash: Option<u32>,
+) -> Result<Eterm> {
+    if let Some(body) = decompress_wrapper(bytes)? {
+        let mut decoder = Decoder::new_body(&body).with_local_node(node, creation);
+        if let Some(hash) = local_hash {
+            decoder = decoder.with_local_node_hash(hash);
+        }
+        return decoder.decode(heap, atoms);
+    }
+    let mut decoder = Decoder::new(bytes)?.with_local_node(node, creation);
+    if let Some(hash) = local_hash {
+        decoder = decoder.with_local_node_hash(hash);
+    }
     let term = decoder.decode(heap, atoms)?;
     decoder.finish()?;
     Ok(term)

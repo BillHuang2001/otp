@@ -398,8 +398,9 @@ impl<'a> Encoder<'a> {
             return self.encode_bitstring(bytes, offset_bits, size_bits);
         }
         // Internal pids/ports are 60-bit `Eterm` immediates (not boxed external id
-        // things). They carry no node identity of their own, so the local node's
-        // sysname/creation — owned by the runtime — must be supplied via
+        // things) and an internal reference is the M1 `[header, node, serial, id]`
+        // block — none of them carry a node identity of their own, so the local
+        // node's sysname/creation — owned by the runtime — must be supplied via
         // [`Encoder::with_local_node`].
         if let Some((local_node, creation)) = self.local_node {
             // Reading the id-tag bits of any `Eterm` is a safe, frozen-layout
@@ -414,6 +415,15 @@ impl<'a> Encoder<'a> {
             }
             if is_internal_port(term) {
                 return self.encode_internal_port(local_node, port_number(term), creation);
+            }
+            // An internal reference: `crate::term::internal_ref_id` is the safe
+            // frozen-layout probe (`beam_term`'s `is_internal_ref` is `unsafe`, and the
+            // crate confines `unsafe` to `crate::term`). It accepts exactly the M1
+            // 4-word block and returns a typed `BadArg` for every other term — a
+            // C-layout `ErtsORefThing` block included, whose id word does not exist —
+            // so it doubles as the predicate rather than risking a wrong id.
+            if let Ok(id) = crate::term::internal_ref_id(term) {
+                return self.encode_internal_ref(local_node, id, creation);
             }
         }
         // Anything else is not a term the encoder can represent: report it explicitly
@@ -757,6 +767,25 @@ impl<'a> Encoder<'a> {
         self.buf.u64be(number);
         self.buf.u32be(creation);
         Ok(())
+    }
+
+    /// Encodes an internal reference as `NEWER_REFERENCE_EXT` (tag 90):
+    /// `[90][len = 3: u16 BE][node atom][creation: u32 BE][n0,n1,n2: 3 × u32 BE]`.
+    ///
+    /// The M1 internal-reference thing carries its whole identity as one 60-bit `id`
+    /// in a single word, while the wire carries the C's three 32-bit numbers;
+    /// [`crate::ref_wire::ref_id_to_numbers`] is the *single* place that mapping is
+    /// written (the decoder's local-node demotion goes through the same module), and
+    /// it keeps `numbers[0]` below `MAX_REFERENCE` so the emitted local reference is
+    /// oracle-valid.
+    ///
+    /// Delegating to [`Encoder::encode_ref`] keeps the `NEWER_REFERENCE_EXT` byte
+    /// layout in one place — the tag, the count, the node atom and the creation word
+    /// are written exactly as for an external reference, with the count fixed at the
+    /// three numbers [`crate::ref_wire::ref_id_to_numbers`] returns.
+    fn encode_internal_ref(&mut self, node: Atom, id: u64, creation: u32) -> Result<()> {
+        let numbers = crate::ref_wire::ref_id_to_numbers(id);
+        self.encode_ref(make_atom(node), &numbers, creation)
     }
 
     /// Encodes an external reference as `NEWER_REFERENCE_EXT` (the modern form).
