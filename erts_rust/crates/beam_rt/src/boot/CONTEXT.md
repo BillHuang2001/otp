@@ -172,31 +172,18 @@ configuration and it runs **all 22 directives to completion**, ending at the fin
   **A single-level fix is not enough.** The blocking callee is reached through *two* nested `apply/3`
   levels on this path (`proc_lib:init_p_do_apply/3` → `gen:init_it/7` → `gen_server:init_it/6`), and
   each level is a separate nested `Machine`; `gen:register_name` runs inside the deepest one, so the
-  outer process must stay alive across the whole chain. The two sound routes are:
-  1. **`beam_engine`** (not this node's to change) — mirror C's `fixed_apply` (`fixed_apply`,
-     `../../erts/emulator/beam/beam_common.c:1528-1566`, dispatched through `$DISPATCH_EXPORT`): in
-     the `CallExt`/`CallExtOnly`/`CallExtLast` arms of `../beam_engine/src/interpreter/dispatch.rs`,
-     when the import target is `erlang:apply/2|3`, decode `x(0)=M`, `x(1)=F`, `x(2)=Args`, unpack
-     `Args` into `x(0..N)`, place M/F at `x(N)`/`x(N+1)` and dispatch through
-     `families::funs::apply_target` with the `Instr::Apply*` frame discipline — so the apply becomes
-     an in-machine `Step::Enter` and a `receive` inside the callee suspends the process normally.
-  2. **`../context`** (this crate) — a *park-and-resume* pending-apply protocol: `Runtime` keeps a
-     `HashMap<ProcessId, Vec<PendingApply>>` keyed by `(module, function, arity)`; a blocked nested
-     apply in a scheduled context stores its suspended `Machine` + resume address and returns the
-     sentinel; the runner's `Err` arm recognises the sentinel (via `error::unsupported_reason`) with a
-     pending entry for the pid and **parks** the process (Waiting + `publish_parked_roots` +
-     `serve_gc_request` + `set_relocation_exempt`, since the nested machines' `x`/stack are outside
-     the published root set), and the next slice re-dispatches the same instruction, which finds the
-     keyed entry and *resumes* the retained machine instead of restarting it (restarting is unsound:
-     `register/2` of an already-registered name raises `badarg`). The re-dispatch is outermost-first,
-     so a key-matched `Vec` per pid covers multi-level nesting. On the baseline-JIT tier the parked
-     address must be resumed interpretively — `Machine::current_code` is **block-granular** there
-     (`jit_set_position` records the block start), and re-entering a block mid-way would re-execute
-     its `allocate`/`try`.
+  outer process must stay alive across the whole chain.
+  The fix belongs to **`beam_engine`**: its `call_ext*` arms must give `erlang:apply/2,3` the
+  `resolve_external_call`/`Step::Enter` treatment a literal-target `call_ext` already gets. The exact
+  change, its C ground truth and why the in-crate retries (restart, or park-and-resume) are unsound
+  are recorded **once** in the crate `CONTEXT.md` (`## Notes for Agents`, the `beam_engine` bullet);
+  this node does not repeat them.
   Pinned by `bootscript.rs::tests::the_real_boot_leaves_logger_unregistered_pending_the_apply_seam_gap`
   (asserting the current behaviour) and the `#[ignore]`d positive
   `bootscript.rs::tests::the_real_boot_registers_a_live_logger_process` (the oracle's behaviour,
-  which fails while the seam is open).
+  which fails while the seam is open); the same gap is pinned at the CLI by
+  `../tests/boot.rs::the_cli_boot_leaves_logger_unregistered_pending_the_apply_seam_gap` and its
+  `#[ignore]`d positive counterpart.
 - **Instruction 20's `gen_server:call` suspends and resumes.** `apply_boot_call` runs `c:erlangrc/0`
   through the engine's blocking-aware entry; the scheduler pass services the `file_server_2` mailbox
   and delivers the reply (counted into the pass's `delivered` by `service_file_requests`), and the call
