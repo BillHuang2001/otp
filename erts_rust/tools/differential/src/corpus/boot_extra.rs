@@ -46,21 +46,26 @@
 //! A.6) through the environment half ([`CaseKind::EvalEnv`](super::CaseKind::EvalEnv)), pinning
 //! that an `ERL_AFLAGS`-supplied `-boot` reaches `init:get_argument(boot)` identically.
 //!
+//! Beyond that state, the group pins the booted system's **installation view** — the surfaces the
+//! boot chain reads out of the running installation rather than out of the emulator: the
+//! `application` resource of a started application (`get_all_key/1`, `get_key/1,2`,
+//! `get_application/0,1`), `init`'s automatic `progname`/`bindir` arguments, `init:script_id/0`,
+//! `code:lib_dir/2`, and `filelib`'s existence probes on a guaranteed-absent path. Every one of
+//! them is pinned **structurally** where the value is host- or release-dependent (a path, a version
+//! string, an invocation name) and by value only where the answer is a frozen constant, a boolean
+//! or a documented `undefined`.
+//!
 //! The surfaces deliberately **not** pinned here are plain differing observables — genuine
 //! divergences that would be a `mismatch`, not a capability gap — and are handoffs to `beam_rt`
-//! (the oracle value state, verified with `differential compare` against the live system ERTS, is
-//! what the runtime should converge on):
+//! (the oracle value state, verified against the live system ERTS, is what the runtime should
+//! converge on):
 //!
 //! | surface | oracle (OTP 29 / erts-17.1) | rust runtime |
 //! |---|---|---|
-//! | `code:lib_dir/2` (e.g. `code:lib_dir(kernel, ebin)`) | a path string | raises `badarg` |
-//! | `code:get_path/0` | the installation's path list | a differing path list |
-//! | `init:get_argument(progname)` | `{ok,[["erl"]]}` | `{ok,[["beam_rt"]]}` (the runtime's own invocation name) |
+//! | `code:get_path/0` | the installation's path list | a shorter, differing path list |
 //! | `init:get_arguments/0` | every flag **plus** the emulator's `root`/`bindir`/`progname`/`home` | the runtime's own modelled flags only |
-//! | `init:script_id/0` | `{"Erlang/OTP","29"}` | raises `badarg` |
-//! | `application:get_application/1` | `{ok,App}` | raises `badarg` |
-//! | `application:get_all_key/1`, `application:get_key/1` | `{ok,KeyValueList}` | raises `badarg` |
-//! | `application:get_key(App, mod)` on a library app | `{ok,[]}` | `undefined` |
+//! | `application:get_application/1` on a **pid** | `{ok,App}`, or `undefined` for a process outside any application | raises `function_clause` (the runtime runs no application-owned process; the *module* form **does** agree and is pinned below) |
+//! | `application:get_all_key/1`'s / `get_key(App, env)`'s `env` member | the application's environment | a differing (shorter, per-VM-start-ordered) list — the *key names* are pinned, the member is not |
 //! | `erlang:module_info/1`, `erlang:get_module_info/2` | the export table (from `erlang`) | `undef` / `badarg` |
 //! | `lists:module_info(exports)` | the export set | the same set in a differing order |
 //! | `erlang:module_loaded(kernel)` | `true` | `false` |
@@ -76,7 +81,10 @@
 //! (`code:get_mode/0`, `application:get_application/0` and `init:get_argument(root\|home)` — the
 //! emulator's automatic flags — **do** agree and are pinned in the sibling `boot_prereq` group.
 //! `erlang:system_info(loaded)` and `erlang:system_info(check_io)` are capability gaps — the
-//! runtime raises its documented `unsupported` — so they are neither cases nor mismatches.)
+//! runtime raises its documented `unsupported` — so they are neither cases nor mismatches.) The
+//! one capability gap this group *does* carry is `init:script_id/0`: the runtime reports it as
+//! `unsupported` on the `-eval`/`run` path (no boot script is loaded there), so its case is
+//! recorded in `known-gaps.txt` and the ratchet can only tighten when the gap closes.
 
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
@@ -815,6 +823,188 @@ pub(crate) fn group() -> Vec<Case> {
             "atomics:get(atomics:new(1, []), 1) =:= 0",
             "ok true",
         ),
+        // --- The `application` resource of a started application --------------------------
+        // `get_all_key/1`/`get_key/2` read the *parsed `.app` resource* of an application the boot
+        // script started; `get_application/0,1` resolves the application of a process (or of a
+        // module). The returned key/value list carries volatile members (the `env` list's entries
+        // and per-VM-start order) and release-varying strings (the `vsn`), so only the **shape**,
+        // the **presence of specific keys**, the `undefined` answers and the module → application
+        // map are pinned — never a raw rendering of the whole list.
+        eval(
+            "boot_extra/application_get_all_key_kernel_is_key_value_list",
+            "application:get_all_key(kernel) is {ok,KeyValueList} of {atom(),_} pairs",
+            "begin {ok,L} = application:get_all_key(kernel), is_list(L) andalso length(L) > 0 andalso lists:all(fun({K,_}) -> is_atom(K) end, L) end",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/application_get_all_key_stdlib_is_key_value_list",
+            "application:get_all_key(stdlib) is a non-empty {ok,KeyValueList}",
+            "begin {ok,L} = application:get_all_key(stdlib), is_list(L) andalso length(L) > 0 end",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/application_get_all_key_kernel_has_mod_key",
+            "application:get_all_key(kernel) carries the application's `mod` start module",
+            "lists:keymember(mod, 1, element(2, application:get_all_key(kernel)))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/application_get_all_key_kernel_has_vsn_key",
+            "application:get_all_key(kernel)'s key names contain `vsn`",
+            "begin {ok,L} = application:get_all_key(kernel), lists:member(vsn, [K || {K,_} <- L]) end",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/application_get_all_key_and_get_key_agree_on_registered",
+            "application:get_all_key/1 and application:get_key/2 report the same `registered` manifest",
+            "lists:keyfind(registered, 1, element(2, application:get_all_key(kernel))) =:= {registered, element(2, application:get_key(kernel, registered))}",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/application_get_all_key_unknown_application_is_undefined",
+            "application:get_all_key/1 reports `undefined` for an application that does not exist",
+            "application:get_all_key(no_such_application_xyz)",
+            "ok undefined",
+        ),
+        // `application:get_key/1` is the *arity-1* form: it looks `Key` up in the **calling
+        // process's** application. The `-eval` process belongs to no application, so the oracle
+        // answers `undefined` — the same value a nonexistent key gives.
+        eval(
+            "boot_extra/application_get_key_1_without_an_application_is_undefined",
+            "application:get_key/1 is `undefined` for a process that belongs to no application",
+            "application:get_key(vsn)",
+            "ok undefined",
+        ),
+        eval(
+            "boot_extra/application_get_key_kernel_applications_is_ok_empty",
+            "application:get_key(kernel, applications) is the empty dependency list (kernel depends on no application)",
+            "application:get_key(kernel, applications) =:= {ok,[]}",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/application_get_key_kernel_maxP_is_infinity",
+            "application:get_key(kernel, maxP) is the unbounded `infinity` process limit",
+            "application:get_key(kernel, maxP) =:= {ok,infinity}",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/application_get_key_stdlib_mod_is_ok_empty",
+            "application:get_key(stdlib, mod) is {ok,[]} (a library application carries no start module)",
+            "application:get_key(stdlib, mod) =:= {ok,[]}",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/application_get_key_kernel_missing_key_is_undefined",
+            "application:get_key/2 reports `undefined` for a key the application does not set",
+            "application:get_key(kernel, no_such_key_xyz)",
+            "ok undefined",
+        ),
+        eval(
+            "boot_extra/application_get_key_unknown_application_is_undefined",
+            "application:get_key/2 reports `undefined` for an application that does not exist",
+            "application:get_key(no_such_application_xyz, vsn)",
+            "ok undefined",
+        ),
+        eval(
+            "boot_extra/application_get_application_0_is_undefined",
+            "application:get_application/0 is `undefined` for a process outside any application",
+            "application:get_application()",
+            "ok undefined",
+        ),
+        eval(
+            "boot_extra/application_get_application_1_kernel_module_is_kernel",
+            "application:get_application/1 maps the `kernel` module to the kernel application",
+            "application:get_application(kernel)",
+            "ok {ok,kernel}",
+        ),
+        eval(
+            "boot_extra/application_get_application_1_lists_module_is_stdlib",
+            "application:get_application/1 maps the `lists` module to the stdlib application",
+            "application:get_application(lists)",
+            "ok {ok,stdlib}",
+        ),
+        eval(
+            "boot_extra/application_get_application_1_unknown_module_is_undefined",
+            "application:get_application/1 is `undefined` for a module that belongs to no loaded application",
+            "application:get_application(no_such_module_xyz)",
+            "ok undefined",
+        ),
+        // --- `init`'s automatic arguments and the boot-script identity ---------------------
+        // `progname`/`bindir` are the two automatic flags whose *values* are inherently
+        // host/runtime-specific (the invocation name, the installation's binary directory), so
+        // only their shape — and, for `bindir`, the frozen `bin` basename — is pinned.
+        eval(
+            "boot_extra/init_get_argument_progname_is_a_non_empty_string",
+            "init:get_argument(progname) is {ok,[[String]]} with a non-empty program name",
+            "begin {ok,[[P]]} = init:get_argument(progname), is_list(P) andalso length(P) > 0 end",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/init_get_argument_bindir_is_a_non_empty_string",
+            "init:get_argument(bindir) is {ok,[[String]]} with a non-empty binary directory",
+            "begin {ok,[[D]]} = init:get_argument(bindir), is_list(D) andalso length(D) > 0 end",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/init_get_argument_bindir_is_a_bin_directory",
+            "init:get_argument(bindir)'s path ends in the frozen `bin` component",
+            "begin {ok,[[D]]} = init:get_argument(bindir), filename:basename(D) =:= \"bin\" end",
+            "ok true",
+        ),
+        // `init:script_id/0` names the loaded boot script. The `-eval` path loads none, so the
+        // runtime raises its documented `unsupported`; the assertion is release-independent (the
+        // oracle is OTP 29, the rewrite targets OTP 30) and the case is recorded in
+        // `known-gaps.txt` so the ratchet can only tighten when the gap closes.
+        eval(
+            "boot_extra/init_script_id_names_the_running_otp_release",
+            "init:script_id/0 is the {Name,Release} pair of the running OTP release (a capability gap today)",
+            "init:script_id() =:= {\"Erlang/OTP\", erlang:system_info(otp_release)}",
+            "ok true",
+        ),
+        // --- `code:lib_dir/2` --------------------------------------------------------------
+        // `code:lib_dir/2` joins the booted application's directory with a subdirectory; the
+        // joined path is host-specific, so only its shape and its relation to `lib_dir/1` are
+        // pinned.
+        eval(
+            "boot_extra/code_lib_dir_kernel_ebin_is_the_ebin_subdirectory",
+            "code:lib_dir(kernel, ebin) is a path ending in the frozen `ebin` component",
+            "begin P = code:lib_dir(kernel, ebin), is_list(P) andalso filename:basename(P) =:= \"ebin\" end",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/code_lib_dir_stdlib_ebin_is_the_ebin_subdirectory",
+            "code:lib_dir(stdlib, ebin) is a path ending in the frozen `ebin` component",
+            "begin P = code:lib_dir(stdlib, ebin), is_list(P) andalso filename:basename(P) =:= \"ebin\" end",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/code_lib_dir_kernel_ebin_is_under_the_application_dir",
+            "code:lib_dir(kernel, ebin) is `code:lib_dir(kernel)` plus a subdirectory",
+            "lists:prefix(code:lib_dir(kernel), code:lib_dir(kernel, ebin))",
+            "ok true",
+        ),
+        // --- `filelib`'s existence probes ---------------------------------------------------
+        // The boot chain's file lookups are `filelib:is_dir/1`/`is_file/1`/`wildcard/1`; on a
+        // **guaranteed-absent** path both runtimes agree on the negative answer. (An *existing*
+        // path is the runtime's typed `access(2)` capability gap — a handoff, not a case.)
+        eval(
+            "boot_extra/filelib_is_dir_of_an_absent_path_is_false",
+            "filelib:is_dir/1 is `false` for a path that does not exist",
+            "filelib:is_dir(\"/nonexistent/boot_extra_absent_dir\")",
+            "ok false",
+        ),
+        eval(
+            "boot_extra/filelib_is_file_of_an_absent_path_is_false",
+            "filelib:is_file/1 is `false` for a path that does not exist",
+            "filelib:is_file(\"/nonexistent/boot_extra_absent_file\")",
+            "ok false",
+        ),
+        eval(
+            "boot_extra/filelib_wildcard_of_an_absent_path_is_empty",
+            "filelib:wildcard/1 is the empty list for a path that does not exist",
+            "filelib:wildcard(\"/nonexistent/boot_extra_absent_dir/*\")",
+            "ok []",
+        ),
     ]
 }
 
@@ -944,6 +1134,7 @@ mod tests {
     const ALLOWED_GOLDENS: &[&str] = &[
         "ok true",
         "ok false",
+        "ok []",
         "ok error",
         "ok undefined",
         "ok preloaded",
@@ -951,6 +1142,8 @@ mod tests {
         "ok default",
         "ok lists",
         "ok init",
+        "ok {ok,kernel}",
+        "ok {ok,stdlib}",
         "ok {file,preloaded}",
         "ok {module,lists}",
         "ok {error,bad_name}",
