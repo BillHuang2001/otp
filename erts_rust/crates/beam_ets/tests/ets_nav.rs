@@ -890,3 +890,243 @@ fn view_order_agrees_with_the_live_oracle() {
         VIEW_EXPECTED.len()
     );
 }
+
+// ---------------------------------------------------------------------------
+// `take/2` on every kind + the navigation state it leaves behind
+// ---------------------------------------------------------------------------
+//
+// `ets:take/2` removes a key's entry and returns the objects. For the
+// multi-object kinds (`bag`/`duplicate_bag`) the entry holds **every** object
+// under the key, so the result is a list; for `set`/`ordered_set` it is a
+// one-element list. The battery below `take`s key `1` from a `{1,10},{2,20},
+// {3,30}` table (plus a second `{1,15}` object for a multi kind), then pins the
+// state and the re-anchored navigation against the live oracle.
+//
+// The hash kinds' iteration order is unspecified, so every hash-kind fact is
+// order-independent (a sorted rendering, or a fact true whatever the order); the
+// `ordered_set` facts additionally pin its exact order. The oracle prints with
+// `~w` (not `~p`, whose string heuristic would render `[10]` as `"\n"`).
+
+/// The `take` + re-anchoring facts of one kind; see the section comment for the
+/// order-independence convention.
+fn take_facts(kind: TableKind) -> BTreeMap<String, String> {
+    let atoms = AtomTable::new();
+    let mut heap = Heap::new(256);
+    let name = kind.as_atom_name();
+    let mut facts = BTreeMap::new();
+
+    let mut table = new_table(kind);
+    for key in 1..=3i64 {
+        table.insert(object(&mut heap, key, key * 10), &atoms).unwrap();
+    }
+    if kind.is_multi() {
+        table.insert(object(&mut heap, 1, 15), &atoms).unwrap();
+    }
+
+    // `take(1)` hands back the objects and removes the entry.
+    let taken = table.take(make_small(1), &atoms).unwrap();
+    let mut taken_vals: Vec<i64> = taken.iter().map(|object| pair_of(*object).1).collect();
+    taken_vals.sort();
+    facts.insert(format!("{name}.take_vals"), render_ints(&taken_vals));
+
+    // A second `take` of the same key, and a `take` of an absent key, are both
+    // empty (never an error).
+    let again = table.take(make_small(1), &atoms).unwrap();
+    let mut again_vals: Vec<i64> = again.iter().map(|object| pair_of(*object).1).collect();
+    again_vals.sort();
+    facts.insert(format!("{name}.take_again"), render_ints(&again_vals));
+    let absent = table.take(make_small(99), &atoms).unwrap();
+    let absent_vals: Vec<i64> = absent.iter().map(|object| pair_of(*object).1).collect();
+    facts.insert(format!("{name}.absent_take"), render_ints(&absent_vals));
+
+    // The entry is gone; the rest of the table is untouched.
+    facts.insert(format!("{name}.size_after"), table.size().to_string());
+    facts.insert(
+        format!("{name}.member1_after"),
+        table.member(make_small(1), &atoms).to_string(),
+    );
+
+    // The surviving objects, normalised (a hash kind's own order is unspecified).
+    let mut pairs: Vec<(i64, i64)> = table.tab2list().iter().map(|object| pair_of(*object)).collect();
+    pairs.sort();
+    let keys: Vec<i64> = pairs.iter().map(|(key, _)| *key).collect();
+    facts.insert(format!("{name}.walk_keys"), render_ints(&keys));
+    facts.insert(format!("{name}.list_pairs"), render_pairs(&pairs));
+
+    // The taken key is now an *absent* anchor: a range bound for `ordered_set`,
+    // `badarg` for the hash kinds.
+    facts.insert(
+        format!("{name}.next_absent1"),
+        render_nav(table.next(make_small(1), &atoms)),
+    );
+    facts.insert(
+        format!("{name}.prev_absent1"),
+        render_nav(table.prev(make_small(1), &atoms)),
+    );
+
+    // Exact order is only contract for `ordered_set`.
+    if kind.is_ordered() {
+        let mut ends = [
+            signed_value(table.first(&atoms).expect("the table is non-empty")),
+            signed_value(table.last(&atoms).expect("the table is non-empty")),
+        ];
+        ends.sort();
+        facts.insert(format!("{name}.first_last"), render_ints(&ends));
+        facts.insert(
+            format!("{name}.next2"),
+            render_nav(table.next(make_small(2), &atoms)),
+        );
+        facts.insert(
+            format!("{name}.prev3"),
+            render_nav(table.prev(make_small(3), &atoms)),
+        );
+        facts.insert(
+            format!("{name}.next3"),
+            render_nav(table.next(make_small(3), &atoms)),
+        );
+    }
+
+    facts
+}
+
+/// Every `take` + re-anchoring fact — the figures the system `erl`
+/// (OTP 29.1.1 / erts-17.1) prints for the identical script.
+#[rustfmt::skip]
+const NAV_TAKE_EXPECTED: &[(&str, &str)] = &[
+    ("set.take_vals", "[10]"), ("set.take_again", "[]"), ("set.absent_take", "[]"),
+    ("set.size_after", "2"), ("set.member1_after", "false"),
+    ("set.walk_keys", "[2,3]"), ("set.list_pairs", "[{2,20},{3,30}]"),
+    ("set.next_absent1", "badarg"), ("set.prev_absent1", "badarg"),
+
+    ("ordered_set.take_vals", "[10]"), ("ordered_set.take_again", "[]"),
+    ("ordered_set.absent_take", "[]"), ("ordered_set.size_after", "2"),
+    ("ordered_set.member1_after", "false"),
+    ("ordered_set.walk_keys", "[2,3]"), ("ordered_set.list_pairs", "[{2,20},{3,30}]"),
+    ("ordered_set.next_absent1", "2"), ("ordered_set.prev_absent1", "'$end_of_table'"),
+    ("ordered_set.first_last", "[2,3]"), ("ordered_set.next2", "3"),
+    ("ordered_set.prev3", "2"), ("ordered_set.next3", "'$end_of_table'"),
+
+    ("bag.take_vals", "[10,15]"), ("bag.take_again", "[]"), ("bag.absent_take", "[]"),
+    ("bag.size_after", "2"), ("bag.member1_after", "false"),
+    ("bag.walk_keys", "[2,3]"), ("bag.list_pairs", "[{2,20},{3,30}]"),
+    ("bag.next_absent1", "badarg"), ("bag.prev_absent1", "badarg"),
+
+    ("duplicate_bag.take_vals", "[10,15]"), ("duplicate_bag.take_again", "[]"),
+    ("duplicate_bag.absent_take", "[]"), ("duplicate_bag.size_after", "2"),
+    ("duplicate_bag.member1_after", "false"),
+    ("duplicate_bag.walk_keys", "[2,3]"), ("duplicate_bag.list_pairs", "[{2,20},{3,30}]"),
+    ("duplicate_bag.next_absent1", "badarg"), ("duplicate_bag.prev_absent1", "badarg"),
+];
+
+/// Every fact of the `take` battery.
+fn all_take_facts() -> BTreeMap<String, String> {
+    let mut facts = BTreeMap::new();
+    for kind in NAV_KINDS {
+        facts.extend(take_facts(kind));
+    }
+    facts
+}
+
+/// The crate's `take`/re-anchoring rules, pinned to the recorded oracle figures
+/// (no oracle needed).
+#[test]
+fn take_reanchoring_matches_the_recorded_oracle_figures() {
+    let facts = all_take_facts();
+    for (key, want) in NAV_TAKE_EXPECTED {
+        assert_eq!(facts.get(*key).map(String::as_str), Some(*want), "fact `{key}`");
+    }
+    assert_eq!(
+        facts.len(),
+        NAV_TAKE_EXPECTED.len(),
+        "the battery produced a different number of facts than recorded"
+    );
+}
+
+/// The oracle program of the `take` battery (see [`NAV_TAKE_EXPECTED`]); it catches
+/// `badarg` so a raised error is a printed fact rather than a crash, and prints with
+/// `~w` so a one-element integer list is not rendered as an Erlang string.
+const NAV_TAKE_ORACLE_PROGRAM: &str = r#"#!/usr/bin/env escript
+main(_) ->
+    P = fun(K, V) -> io:format("~s -> ~w~n", [K, V]) end,
+    G = fun(F) -> try {ok, F()} catch error:badarg -> badarg end end,
+    R = fun({ok, V}) -> V; (badarg) -> badarg end,
+    S = fun(L) -> lists:sort(L) end,
+    F = fun(Kind) ->
+        KS = atom_to_list(Kind),
+        T = ets:new(take, [Kind]),
+        [ets:insert(T, {N, N * 10}) || N <- [1, 2, 3]],
+        case Kind of
+            set -> ok;
+            ordered_set -> ok;
+            _ -> ets:insert(T, {1, 15})
+        end,
+        Taken = ets:take(T, 1),
+        P(KS ++ ".take_vals", S([V || {_, V} <- Taken])),
+        P(KS ++ ".take_again", ets:take(T, 1)),
+        P(KS ++ ".absent_take", ets:take(T, 99)),
+        P(KS ++ ".size_after", ets:info(T, size)),
+        P(KS ++ ".member1_after", ets:member(T, 1)),
+        Objs = ets:tab2list(T),
+        P(KS ++ ".walk_keys", S([K || {K, _} <- Objs])),
+        P(KS ++ ".list_pairs", S(Objs)),
+        P(KS ++ ".next_absent1", R(G(fun() -> ets:next(T, 1) end))),
+        P(KS ++ ".prev_absent1", R(G(fun() -> ets:prev(T, 1) end))),
+        case Kind of
+            ordered_set ->
+                P(KS ++ ".first_last", S([ets:first(T), ets:last(T)])),
+                P(KS ++ ".next2", R(G(fun() -> ets:next(T, 2) end))),
+                P(KS ++ ".prev3", R(G(fun() -> ets:prev(T, 3) end))),
+                P(KS ++ ".next3", R(G(fun() -> ets:next(T, 3) end)));
+            _ -> ok
+        end,
+        ets:delete(T)
+      end,
+    [F(K) || K <- [set, ordered_set, bag, duplicate_bag]],
+    ok.
+"#;
+
+/// The live cross-check: the system `erl` runs the identical `take` battery and
+/// both sides must reproduce every recorded figure. The oracle is **required by
+/// default** (see `tests/common/oracle.rs`).
+#[test]
+fn take_reanchoring_agrees_with_the_live_oracle() {
+    let Some(escript) = oracle::resolve_escript() else {
+        oracle::skip(
+            "take_reanchoring_agrees_with_the_live_oracle",
+            "no Erlang oracle found ($ERTS_ORACLE unset and no executable escript on $PATH)",
+        );
+        return;
+    };
+    let output = oracle::run_escript(
+        &escript,
+        NAV_TAKE_ORACLE_PROGRAM,
+        &[],
+        "nav_take",
+        Duration::from_secs(60),
+    );
+    let live = parse_lines(&String::from_utf8_lossy(&output.stdout));
+    let facts = all_take_facts();
+
+    for (key, want) in NAV_TAKE_EXPECTED {
+        assert_eq!(
+            live.get(*key).map(String::as_str),
+            Some(*want),
+            "the oracle disagrees with the recorded figure for `{key}`"
+        );
+        assert_eq!(
+            facts.get(*key).map(String::as_str),
+            Some(*want),
+            "the crate disagrees with the recorded figure for `{key}`"
+        );
+    }
+    assert_eq!(
+        live.len(),
+        NAV_TAKE_EXPECTED.len(),
+        "the oracle printed a different number of facts than recorded:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    println!(
+        "[ets] take re-anchoring: {} facts agree with the live oracle",
+        NAV_TAKE_EXPECTED.len()
+    );
+}

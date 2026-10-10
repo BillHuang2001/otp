@@ -444,9 +444,40 @@ fn update_badarg_cases() {
         //     try records:update(R, '"'"'_'"'"', '"'"'_'"'"', #{zz=>9}) catch C:T ->
         //     io:format("~p:~p~n",[C,T]) end, halt().'  =>  error:{badfield,{{m,r},zz}}
         let m_r = ctx.tuple(&[m, r]).expect("fits");
-        let expected = ctx.tuple(&[badfield, m_r, other]).expect("fits");
+        let pair = ctx.tuple(&[m_r, other]).expect("fits");
+        let expected = ctx.tuple(&[badfield, pair]).expect("fits");
         assert_structured(
             reg.call("records", "update", 4, ctx, &[rec, m, r, bad_key]),
+            ctx,
+            expected,
+        );
+        // Oracle: the '_' wildcard reports the RECORD's own module/name
+        //   => error:{badfield, {{m,r}, other}}.
+        //   erl -noshell -eval 'R=records:create(m,r,[{a,1}],#{is_exported=>true}),
+        //     try records:update(R, '_', '_', #{other=>9}) catch C:T ->
+        //     io:format("~p:~p~n",[C,T]) end, halt().'  =>  error:{badfield,{{m,r},other}}
+        let underscore = ctx.atom("_").expect("seeded");
+        let expected = ctx.tuple(&[badfield, pair]).expect("fits");
+        assert_structured(
+            reg.call(
+                "records",
+                "update",
+                4,
+                ctx,
+                &[rec, underscore, underscore, bad_key],
+            ),
+            ctx,
+            expected,
+        );
+        // Oracle: a non-atom update key => error:{badfield, {{m,r}, 1}}.
+        //   erl -noshell -eval 'R=records:create(m,r,[{a,1}],#{is_exported=>true}),
+        //     try records:update(R, m, r, #{1=>1}) catch C:T ->
+        //     io:format("~p:~p~n",[C,T]) end, halt().'  =>  error:{badfield,{{m,r},1}}
+        let non_atom_update = map_of(ctx, &[(make_small(1), make_small(1))]);
+        let pair = ctx.tuple(&[m_r, make_small(1)]).expect("fits");
+        let expected = ctx.tuple(&[badfield, pair]).expect("fits");
+        assert_structured(
+            reg.call("records", "update", 4, ctx, &[rec, m, r, non_atom_update]),
             ctx,
             expected,
         );
@@ -539,7 +570,8 @@ fn create_badarg_cases() {
         let non_atom_pair = ctx.tuple(&[one, one]).expect("fits");
         let non_atom_key = ctx.list(&[non_atom_pair]).expect("fits");
         let m_r = ctx.tuple(&[m, r]).expect("fits");
-        let expected = ctx.tuple(&[badfield, m_r, one]).expect("fits");
+        let pair = ctx.tuple(&[m_r, one]).expect("fits");
+        let expected = ctx.tuple(&[badfield, pair]).expect("fits");
         assert_structured(call(reg, ctx, m, r, non_atom_key, o), ctx, expected);
         // Oracle: badarg for a duplicate key.
         let dup_a = ctx.tuple(&[a, one]).expect("fits");

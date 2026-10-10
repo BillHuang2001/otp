@@ -273,6 +273,41 @@ impl OffHeapTable {
     pub fn drain_nodes(&mut self) -> Vec<NodeEntry> {
         core::mem::take(&mut self.nodes)
     }
+
+    // -- roll-back for an optimistic copy --------------------------------
+
+    /// Whether the table is empty in **every** category: no MSO handle, no refc binary and no
+    /// node reference.
+    ///
+    /// [`is_empty`](OffHeapTable::is_empty) covers only the MSO list (that type's slot space), so a
+    /// caller that needs "this table holds nothing at all" must ask this instead. The copy engine's
+    /// clean-destination gate does: a destination this returns `true` for is one the optimistic
+    /// single-pass attempt can roll back wholesale.
+    pub(crate) fn is_fully_empty(&self) -> bool {
+        self.inner.is_empty() && self.binaries.is_empty() && self.nodes.is_empty()
+    }
+
+    /// Releases every reference this table registered and empties all three lists.
+    ///
+    /// The roll-back half of the copy engine's optimistic single-pass attempt (`copy::copy_struct`)
+    /// on a destination that was **clean** when the attempt began: the attempt refcounts the
+    /// off-heap objects it copies (`clone_slot`, `push_binary`, `push_node`), so abandoning it must
+    /// give those references back or the source objects would leak a count per failed copy.
+    ///
+    /// The MSO handles and refc binaries release through their own `Drop` when the drained lists
+    /// drop (`drain_handles` clones-then-drops the shared list, so the net effect of draining plus
+    /// dropping the result is exactly the one reference each push added). A [`NodeEntry`] must be
+    /// released explicitly: its count is `release_all`'s, not `Drop`'s, because the count belongs
+    /// to the registering table rather than to the handle.
+    ///
+    /// Not `pub`: the roll-back is only sound on a table the caller knows started empty.
+    pub(crate) fn rollback(&mut self) {
+        drop(self.drain_handles());
+        drop(self.drain_binaries());
+        for entry in self.drain_nodes() {
+            entry.release_all();
+        }
+    }
 }
 
 #[cfg(test)]

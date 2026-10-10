@@ -81,6 +81,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
+use std::rc::Rc;
 
 use beam_common::Result;
 use beam_loader::{Atom, Label, Module};
@@ -200,7 +201,13 @@ impl ModuleKey {
 /// is a `CodeCache`: it is confined to the thread that created it.
 pub struct CodeCache {
     /// Compiled artifacts by module identity; each entry owns its executable mapping.
-    entries: HashMap<ModuleKey, CompiledModule>,
+    ///
+    /// Held behind an [`Rc`] so a caller can take a cheap **handle** to an artifact
+    /// ([`CodeCache::compiled_handle`]) and keep it alive — with its executable mapping —
+    /// after the cache borrow is released (even across [`CodeCache::clear`]). The native
+    /// driver needs exactly that: a cross-module callee's blocks stay mapped and unmoved
+    /// while the driver runs in another module and may touch the cache again.
+    entries: HashMap<ModuleKey, Rc<CompiledModule>>,
     /// How many times a module has actually been compiled (cache misses).
     compiles: u64,
 }
@@ -251,18 +258,42 @@ impl CodeCache {
     /// [`baseline::compile_module`] and stores the result. Compilation is bounded (exactly
     /// the cost the one-shot entry paid) and happens at most once per distinct module.
     ///
+    /// The returned reference borrows the cache; a caller that must keep the artifact
+    /// alive after releasing that borrow (the native driver holding a cross-module
+    /// callee's blocks) uses [`CodeCache::compiled_handle`] instead.
+    ///
     /// A compile failure (the typed [`BeamError`](beam_common::BeamError) the baseline
     /// backend returns for an unlowerable construct) is propagated without inserting a
     /// partial entry, so a later call retries rather than caching a failure.
     pub fn get_or_compile(&mut self, module: &Module) -> Result<&CompiledModule> {
         match self.entries.entry(ModuleKey::of(module)) {
-            std::collections::hash_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
+            std::collections::hash_map::Entry::Occupied(entry) => Ok(&**entry.into_mut()),
             std::collections::hash_map::Entry::Vacant(entry) => {
                 let compiled = baseline::compile_module(module)?;
                 self.compiles += 1;
-                Ok(entry.insert(compiled))
+                Ok(&*entry.insert(Rc::new(compiled)))
             }
         }
+    }
+
+    /// An owned handle to `module`'s compiled artifact, compiling it on first sight.
+    ///
+    /// Exactly [`CodeCache::get_or_compile`] except that the artifact is handed back as
+    /// an [`Rc`] **clone** instead of a borrow: the cache borrow ends with this call, so
+    /// the caller can hold the handle (and the executable mapping behind it) across
+    /// arbitrary other cache access — it stays alive even if the entry is later cleared.
+    /// This is what a cross-module caller (the native driver entering a callee's blocks)
+    /// needs; a compile failure behaves as in [`CodeCache::get_or_compile`].
+    pub(crate) fn compiled_handle(&mut self, module: &Module) -> Result<Rc<CompiledModule>> {
+        let key = ModuleKey::of(module);
+        if let Some(existing) = self.entries.get(&key) {
+            return Ok(Rc::clone(existing));
+        }
+        let compiled = baseline::compile_module(module)?;
+        self.compiles += 1;
+        let handle = Rc::new(compiled);
+        self.entries.insert(key, Rc::clone(&handle));
+        Ok(handle)
     }
 
     /// Run exported `function/arity` against `module`'s cached artifact; yields `x(0)`.
@@ -369,19 +400,45 @@ pub(crate) fn run_baseline_cached(
     ctx: &mut dyn ExecutionContext,
 ) -> Result<Eterm> {
     CODE_CACHE.with(|cell| {
-        let mut cache = match cell.try_borrow_mut() {
-            Ok(cache) => cache,
-            Err(_) => {
-                // Re-entrant call: the cache is already borrowed. Compile uncached rather
-                // than panic (a `RefCell` double-borrow is not a diagnosable runtime error).
-                let compiled = baseline::compile_module(module)?;
-                return baseline::run_compiled(
-                    &compiled, machine, module, function, arity, args, ctx,
-                );
-            }
+        // Take an owned handle and release the cache borrow **before** the run: the
+        // driver consults this same cache for a cross-module callee's blocks
+        // ([`cached_module_blocks`]), which needs the `RefCell` free. The handle keeps
+        // the artifact (and its executable mapping) alive for the whole run.
+        let compiled = {
+            let mut cache = match cell.try_borrow_mut() {
+                Ok(cache) => cache,
+                Err(_) => {
+                    // Re-entrant call: the cache is already borrowed. Compile uncached rather
+                    // than panic (a `RefCell` double-borrow is not a diagnosable runtime error).
+                    let compiled = baseline::compile_module(module)?;
+                    return baseline::run_compiled(
+                        &compiled, machine, module, function, arity, args, ctx,
+                    );
+                }
+            };
+            cache.compiled_handle(module)?
         };
-        let compiled = cache.get_or_compile(module)?;
-        baseline::run_compiled(compiled, machine, module, function, arity, args, ctx)
+        baseline::run_compiled(&compiled, machine, module, function, arity, args, ctx)
+    })
+}
+
+/// A cross-module callee's compiled blocks, from the **per-thread** baseline cache.
+///
+/// The native driver's [`NativeCode::module_blocks`](crate::jit::baseline::NativeCode::module_blocks)
+/// hook: a `call_ext*` the host resolved runs in another module, and the driver needs
+/// that module's block table to run it natively. The module is compiled into the
+/// per-thread cache on first sight (pure, bounded) and an owned handle is returned so
+/// the driver holds the code across its own `&mut Machine` calls.
+///
+/// `None` means "no native blocks available here" — the cache is genuinely re-entrant
+/// (its `RefCell` is already borrowed, e.g. a driver reached through another cached
+/// entry), or compilation failed. The driver then runs that module on its
+/// per-instruction interpreter step, exactly as it does an address its entry artifact
+/// did not compile, so the run stays interpreter-identical.
+pub(crate) fn cached_module_blocks(module: &Module) -> Option<Rc<CompiledModule>> {
+    CODE_CACHE.with(|cell| {
+        let mut cache = cell.try_borrow_mut().ok()?;
+        cache.compiled_handle(module).ok()
     })
 }
 
@@ -407,17 +464,21 @@ pub(crate) fn run_baseline_cached_outcome(
     ctx: &mut dyn ExecutionContext,
 ) -> Result<RunOutcome> {
     CODE_CACHE.with(|cell| {
-        let mut cache = match cell.try_borrow_mut() {
-            Ok(cache) => cache,
-            Err(_) => {
-                let compiled = baseline::compile_module(module)?;
-                return baseline::run_compiled_outcome(
-                    &compiled, machine, module, function, arity, args, ctx,
-                );
-            }
+        // An owned handle, then the borrow is released before the run so the driver can
+        // resolve a cross-module callee through this same cache (see `run_baseline_cached`).
+        let compiled = {
+            let mut cache = match cell.try_borrow_mut() {
+                Ok(cache) => cache,
+                Err(_) => {
+                    let compiled = baseline::compile_module(module)?;
+                    return baseline::run_compiled_outcome(
+                        &compiled, machine, module, function, arity, args, ctx,
+                    );
+                }
+            };
+            cache.compiled_handle(module)?
         };
-        let compiled = cache.get_or_compile(module)?;
-        baseline::run_compiled_outcome(compiled, machine, module, function, arity, args, ctx)
+        baseline::run_compiled_outcome(&compiled, machine, module, function, arity, args, ctx)
     })
 }
 
@@ -437,17 +498,20 @@ pub(crate) fn run_baseline_cached_label_outcome(
     ctx: &mut dyn ExecutionContext,
 ) -> Result<RunOutcome> {
     CODE_CACHE.with(|cell| {
-        let mut cache = match cell.try_borrow_mut() {
-            Ok(cache) => cache,
-            Err(_) => {
-                let compiled = baseline::compile_module(module)?;
-                return baseline::run_compiled_label_outcome(
-                    &compiled, machine, module, label, arity, args, ctx,
-                );
-            }
+        // See `run_baseline_cached`: owned handle, borrow released before the run.
+        let compiled = {
+            let mut cache = match cell.try_borrow_mut() {
+                Ok(cache) => cache,
+                Err(_) => {
+                    let compiled = baseline::compile_module(module)?;
+                    return baseline::run_compiled_label_outcome(
+                        &compiled, machine, module, label, arity, args, ctx,
+                    );
+                }
+            };
+            cache.compiled_handle(module)?
         };
-        let compiled = cache.get_or_compile(module)?;
-        baseline::run_compiled_label_outcome(compiled, machine, module, label, arity, args, ctx)
+        baseline::run_compiled_label_outcome(&compiled, machine, module, label, arity, args, ctx)
     })
 }
 
@@ -476,17 +540,22 @@ pub(crate) fn run_baseline_cached_resume_outcome(
     ctx: &mut dyn ExecutionContext,
 ) -> Result<RunOutcome> {
     CODE_CACHE.with(|cell| {
-        let mut cache = match cell.try_borrow_mut() {
-            Ok(cache) => cache,
-            Err(_) => {
-                let compiled = baseline::compile_module(module)?;
-                return baseline::run_compiled_resume_outcome(
-                    &compiled, machine, module, func, pc, ctx,
-                );
-            }
+        // See `run_baseline_cached`: owned handle, borrow released before the run (a
+        // resume parked inside a cross-module callee re-enters native code there, which
+        // consults this cache).
+        let compiled = {
+            let mut cache = match cell.try_borrow_mut() {
+                Ok(cache) => cache,
+                Err(_) => {
+                    let compiled = baseline::compile_module(module)?;
+                    return baseline::run_compiled_resume_outcome(
+                        &compiled, machine, module, func, pc, ctx,
+                    );
+                }
+            };
+            cache.compiled_handle(module)?
         };
-        let compiled = cache.get_or_compile(module)?;
-        baseline::run_compiled_resume_outcome(compiled, machine, module, func, pc, ctx)
+        baseline::run_compiled_resume_outcome(&compiled, machine, module, func, pc, ctx)
     })
 }
 

@@ -35,13 +35,20 @@
 //!
 //! # M1 scope and deviations
 //!
-//! * **Every binary stays on the heap.** C keeps a binary of more than
-//!   `ERL_ONHEAP_BINARY_LIMIT` (64) bytes off-heap behind a `BinRef` (and a match
-//!   context behind a `SUB_BITS` thing). Milestone-1 builds no off-heap thing at
-//!   all — the heap is an arena that never moves, so the 64-byte limit buys nothing
-//!   here — and [`bytes`] therefore rejects a `SUB_BITS` term rather than following
-//!   its indirection. This is a documented deviation from C's placement policy, not
-//!   from its *layout*: the on-heap block is byte-for-byte the C one.
+//! * **Every binary this module *builds* stays on the heap.** C keeps a binary of
+//!   more than `ERL_ONHEAP_BINARY_LIMIT` (64) bytes off-heap behind a `BinRef`, and
+//!   [`make_bitstring`] follows C's *layout* byte-for-byte (the on-heap block) while
+//!   deliberately ignoring the 64-byte *placement* rule — the heap is an arena that
+//!   never moves, so the limit buys nothing here. This is a deviation from C's
+//!   placement policy, not from its layout.
+//! * **Readers accept *both* representations.** The engine's own
+//!   `bs_create_bin`/`bs_init_writable` path (`beam_engine`'s
+//!   `families/bitstrings/raw.rs::make_binary`) DOES build the off-heap
+//!   `[BinRef][ErlSubBits]` refc binary for any payload above
+//!   `ERL_ONHEAP_BINARY_LIMIT` (64) bytes, so [`bytes`] follows the frozen
+//!   `beam_term::bitstring::bitstring_parts` indirection and reads such a term
+//!   correctly (a byte-aligned window is the contiguous slice at
+//!   `base + offset_bits / 8`; a mid-byte window is re-packed bit by bit).
 //! * The consumers are the `binary`/`unicode` BIFs plus `erlang:size/1`
 //!   (`crate::term_ops`), which call [`make_binary`]/[`make_bitstring`]/
 //!   [`byte_size`]/[`bytes`]. A few helpers still carry `#[allow(dead_code)]` for
@@ -124,10 +131,13 @@ pub(crate) fn byte_size(term: Eterm) -> Result<usize> {
 
 /// Copies the bytes of a binary out of the term.
 ///
+/// Handles **both** frozen bitstring representations: an on-heap `ErlHeapBits` and
+/// an off-heap `ErlSubBits` window (the `[BinRef][ErlSubBits]` refc binary the
+/// engine builds through `bs_create_bin` above `ERL_ONHEAP_BINARY_LIMIT` bytes).
+///
 /// # Errors
 ///
-/// [`BeamError::BadArg`] when `term` is not a byte-aligned bitstring, or is an
-/// off-heap `SUB_BITS` thing (which M1 never builds — see the module docs).
+/// [`BeamError::BadArg`] when `term` is not a byte-aligned bitstring.
 #[allow(dead_code)]
 pub(crate) fn bytes(term: Eterm) -> Result<Vec<u8>> {
     access::binary_bytes(term)

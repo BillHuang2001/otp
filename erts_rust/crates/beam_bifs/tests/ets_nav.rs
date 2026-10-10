@@ -359,6 +359,113 @@ fn next_and_prev_lookup_are_reachable_with_the_range_bound_rule() {
     );
 }
 
+/// The `'$end_of_table'` **anchor** raises `badarg` for the ordered
+/// `ets:next_lookup/2` and `ets:prev_lookup/2` — through the public registry —
+/// even when the atom is itself a **stored** key, and on an empty table; a hash
+/// kind is unaffected.
+///
+/// The C `db_next_tree_common`/`db_prev_tree_common`
+/// (`../../erts/emulator/beam/erl_db_tree.c:654,729`) return `DB_ERROR_BADKEY`
+/// unconditionally on `am_EOT` (`db_next_hash_common` has no such special-case).
+/// Oracle probe (erts-17.1): an `ordered_set` holding `{1,10},{2,20},{3,30}`
+/// answers `badarg` for `ets:next_lookup(T,'$end_of_table')` and
+/// `ets:prev_lookup(T,'$end_of_table')`, stored or not; a `set` with the atom
+/// stored walks it as an ordinary key.
+#[test]
+fn ordered_lookups_reject_the_end_of_table_anchor() {
+    let bifs = default_registry();
+    let mut heap = Heap::new(1 << 16).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut tables = TableRegistry::new();
+    let mut ctx = BifContext::new(&mut heap, &atoms, self_pid()).with_tables(&mut tables);
+
+    let handle = new_table(&bifs, &mut ctx, "nav_t", &["ordered_set"]);
+    let eot = ctx.atom("$end_of_table").expect("seeded");
+
+    // An empty `ordered_set` rejects the anchor for both lookup walkers.
+    for name in ["next_lookup", "prev_lookup"] {
+        assert!(
+            matches!(
+                call(&bifs, &mut ctx, "ets", name, 2, &[handle, eot]),
+                Err(BeamError::BadArg)
+            ),
+            "ets:{name}/2 on an empty ordered_set must be badarg"
+        );
+    }
+
+    insert_pairs(&bifs, &mut ctx, handle, &[(1, 10), (2, 20), (3, 30)]);
+
+    // The ordinary lookup walk still answers; an *absent* anchor that is not the
+    // walk's terminator is `badarg` nonetheless.
+    let one = int(&mut ctx, 1);
+    let next = call(&bifs, &mut ctx, "ets", "next_lookup", 2, &[handle, one])
+        .expect("ets:next_lookup(T,1)");
+    let expected = expected_key_objects(&mut ctx, 2, &[(2, 20)]);
+    assert_same(&atoms, next, expected);
+    for name in ["next_lookup", "prev_lookup"] {
+        assert!(
+            matches!(
+                call(&bifs, &mut ctx, "ets", name, 2, &[handle, eot]),
+                Err(BeamError::BadArg)
+            ),
+            "ets:{name}/2 on the '$end_of_table' anchor must be badarg"
+        );
+    }
+
+    // Storing the atom as a key leaves it rejected.
+    let eot_obj = ctx.tuple(&[eot, eot]).expect("the object fits");
+    call(&bifs, &mut ctx, "ets", "insert", 2, &[handle, eot_obj]).expect("ets:insert");
+    for name in ["next_lookup", "prev_lookup"] {
+        assert!(
+            matches!(
+                call(&bifs, &mut ctx, "ets", name, 2, &[handle, eot]),
+                Err(BeamError::BadArg)
+            ),
+            "ets:{name}/2 on the stored '$end_of_table' anchor must be badarg"
+        );
+    }
+
+    // A hash kind (`set`) is unaffected: with the atom stored it is an ordinary
+    // key, so the forward step walks from it and the backward one aliases it.
+    let hashed = new_table(&bifs, &mut ctx, "d", &["set"]);
+    for obj in [
+        ctx.tuple(&[one, one]).expect("fits"),
+        ctx.tuple(&[eot, eot]).expect("fits"),
+    ] {
+        call(&bifs, &mut ctx, "ets", "insert", 2, &[hashed, obj]).expect("ets:insert");
+    }
+    let next = call(&bifs, &mut ctx, "ets", "next_lookup", 2, &[hashed, eot])
+        .expect("next_lookup(eot) on a set is not badarg");
+    let prev = call(&bifs, &mut ctx, "ets", "prev_lookup", 2, &[hashed, eot])
+        .expect("prev_lookup(eot) on a set is not badarg");
+    assert_same(&atoms, next, prev);
+}
+
+/// One live cross-check that the system ERTS really rejects the
+/// `'$end_of_table'` anchor in all four ordered walkers (the goldens this suite
+/// pins for the crate's own BIFs). `~w` is used so the oracle does not line-wrap;
+/// the test **skips loudly** when no `erl` is on `PATH`.
+#[test]
+fn the_live_oracle_rejects_the_end_of_table_anchor() {
+    let statement = concat!(
+        "T = ets:new(nav_t, [ordered_set]), ",
+        "[ets:insert(T, O) || O <- [{1,10},{2,20},{3,30}]], ",
+        "E = '$end_of_table', ",
+        "F = fun(G) -> try G() of V -> {ok, V} catch C:R -> {C, R} end end, ",
+        "io:format(\"~w~n\", [[F(fun() -> ets:next(T, E) end), ",
+        "F(fun() -> ets:prev(T, E) end), ",
+        "F(fun() -> ets:next_lookup(T, E) end), ",
+        "F(fun() -> ets:prev_lookup(T, E) end)]])"
+    );
+    let Some(actual) = oracle_eval(statement) else {
+        return;
+    };
+    assert_eq!(
+        actual, "[{error,badarg},{error,badarg},{error,badarg},{error,badarg}]",
+        "the live oracle no longer rejects the '$end_of_table' anchor"
+    );
+}
+
 // ---------------------------------------------------------------- rename/2
 
 /// `ets:rename/2` reaches its real implementation and rekeys the name registry.

@@ -118,18 +118,23 @@ pub(super) fn parked_receive_timeout(
 ///
 /// The operand is a **decoded IR operand**, not a runtime term: a literal timeout (`after
 /// 20`) is [`Operand::Integer`] or (for a value the loader materialized) [`Operand::Literal`],
-/// and an X-register timeout is read from the machine — the registers are untouched by the
-/// suspension, so the value the `wait_timeout` tested is still there.
+/// and an X- **or Y-register** timeout is read from the machine — no register and no Y slot of
+/// the parked frame is touched by the suspension, so the value the `wait_timeout` tested is
+/// still there. The Y case is read through the public [`Machine::y`] accessor, which is exactly
+/// the slot the parked frame owns (the `wait_timeout` and the frame that carries its `Time` are
+/// the same function), so a `receive … after T` with `T` a runtime variable recovers the same
+/// deadline a literal one does.
 ///
-/// `None` for everything else — an `after infinity` atom, a **Y-register** timeout (a runtime
-/// variable, which `Machine` exposes no stack read for), and any non-positive or non-integer
-/// value. `None` means "no deadline": the process parks until a message arrives, which is the
-/// honest answer when the delay cannot be known rather than a guessed one.
+/// `None` for everything else — an `after infinity` atom, a Y slot with no frame behind it (the
+/// machine is not parked, or `k` is outside the frame's Y slots), and any non-positive or
+/// non-integer value. `None` means "no deadline": the process parks until a message arrives,
+/// which is the honest answer when the delay cannot be known rather than a guessed one.
 pub(super) fn timeout_delay(machine: &Machine, module: &Module, time: &Operand) -> Option<Duration> {
     match time {
         Operand::Integer(millis) => positive_millis(*millis),
         Operand::Literal(index) => module.literal(*index).and_then(millis_of),
         Operand::X(register) => machine.x(*register).and_then(millis_of),
+        Operand::Y(register) => machine.y(*register).and_then(millis_of),
         _ => None,
     }
 }

@@ -37,8 +37,9 @@
 //!   [`DriverHost`](beam_abi::driver::host::DriverHost) implementation that owns the port's
 //!   persistent C-ABI state (the `driver_select` registration map — including the two
 //!   `ERL_DRV_USE` release bits `driver_select`'s `mode` may carry, and the queue of
-//!   `stop_select` callbacks a released selection still owes — the `driver_set_timer` deadline and
-//!   the `driver_async` job set) and reaches the live port through the
+//!   `stop_select` callbacks a released selection still owes — the `driver_set_timer` deadline, the
+//!   `driver_async` job set and the driver's own port queue, the `driver_enq*` family's `prt->ioq`)
+//!   and reaches the live port through the
 //!   [`DriverContext`](crate::driver::DriverContext) installed for the duration of one callback.
 //! * [`job`] — [`AsyncJobs`], the `driver_async` bookkeeping (a bounded, process-global worker
 //!   pool shared by every port, a queue position per job, and the per-port completion channel

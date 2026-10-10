@@ -206,11 +206,23 @@ pub(crate) fn scatter_roots(
 }
 
 /// The engine's heap-admission point for a scheduled slice: collect the running process's
-/// own heap when it cannot satisfy `heap_need` more words.
+/// own heap when it cannot satisfy `heap_need` more words — or when a `garbage_collect` BIF
+/// asked for one.
 ///
 /// `armed` is the slice latch (see the module docs). When it is not set, when the running
 /// process is not collectable, or when the call site's module is not known to be float-free,
 /// this is a no-op — exactly the pre-collector runtime.
+///
+/// # Forced collections
+///
+/// `armed` is `true` for the slice's **own** machine and nothing else, so this is one of the
+/// two points that hold the root set a *requested* collection needs
+/// ([`Runtime::request_gc`](crate::runtime::Runtime)): a pending request is consumed here and
+/// the collection runs **whatever the heap's occupancy** — the "the nursery is full" test is
+/// what a request overrides, not the safety valves. A request the valves refuse (a pinned or
+/// halted pid, the global valve), or one whose call site is not float-free, is dropped
+/// without a collection: the BIF already answered the oracle's `true`, and the honest
+/// outcome is no collection at all, never a fabricated one.
 ///
 /// # Errors
 ///
@@ -230,7 +242,15 @@ pub(crate) fn ensure_heap(
         return Ok(());
     }
     let pid = ctx.mailbox_pid;
+    // A `garbage_collect` request (`erlang:garbage_collect/0,1`,
+    // `erts_internal:garbage_collect/1`) forces the collection. It is **peeked** here and
+    // consumed only once this point is committed to collecting, so a request refused by the
+    // float guard below stays armed for the runner's park arm — where the machine's
+    // float-register file is *provably* dead and the collection is therefore legitimate
+    // (`Runtime::serve_gc_request`).
+    let forced = ctx.runtime.gc_request_pending(pid);
     if !ctx.runtime.gc_process_enabled(pid) {
+        ctx.runtime.take_gc_request(pid);
         return Ok(());
     }
     // The float guard: only a call site whose module is known to be float-free may be
@@ -258,8 +278,12 @@ pub(crate) fn ensure_heap(
     let Some(process) = table.get_mut(pid) else {
         return Ok(());
     };
-    if !process.should_collect(heap_need as usize) {
+    if !forced && !process.should_collect(heap_need as usize) {
         return Ok(());
+    }
+    // Committed: the request is answered exactly once, by this collection.
+    if forced {
+        runtime.take_gc_request(pid);
     }
 
     // Transfer the machine's roots into the process root set. `Process::collect` gathers

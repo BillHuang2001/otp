@@ -34,6 +34,7 @@ use beam_ets::{
 };
 use beam_term::prelude::*;
 use common::*;
+use std::time::Duration;
 
 /// A table of `kind` with the default interiors.
 fn table(kind: TableKind) -> Table {
@@ -872,4 +873,84 @@ fn term_store_word_accounting_returns_to_zero_under_copy_free_churn() {
         blocks[4], blocks[0],
         "the store acquired a fresh arena block per cycle: {blocks:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// `ets:info(T, memory)` against the live oracle (the ballpark check)
+// ---------------------------------------------------------------------------
+//
+// The absolute figure is implementation-specific (a word count of the table's own
+// term storage plus its index), so it can never equal the oracle's. But it *is*
+// a word count in the same unit as `ets:info(_, memory)`, so a large table's
+// figure must land in the same order of magnitude: a wildly different number
+// would mean the accounting covered a different unit, or that storage was
+// leaked or grossly undercounted. Boundedness and monotonicity at the crate
+// level are pinned by the stress tests above; this test pins the *unit* and the
+// scale against the oracle.
+
+/// The object count of the memory ballpark table.
+const MEMORY_N: i64 = 100_000;
+
+/// The oracle program: the identical `{I, I*2}` table per kind, printing the
+/// table's `memory` field.
+const MEMORY_ORACLE_PROGRAM: &str = r#"#!/usr/bin/env escript
+main(_) ->
+    P = fun(K, V) -> io:format("~s -> ~w~n", [K, V]) end,
+    [begin
+        T = ets:new(mem, [Kind]),
+        [ets:insert(T, {I, I * 2}) || I <- lists:seq(0, 99999)],
+        P(atom_to_list(Kind), ets:info(T, memory)),
+        ets:delete(T)
+     end || Kind <- [set, ordered_set, bag, duplicate_bag]],
+    ok.
+"#;
+
+/// A large table's `ets:info(T, memory)` agrees with the oracle to within one
+/// order of magnitude, for every kind.
+#[test]
+fn ets_info_memory_is_in_the_oracles_ballpark() {
+    let Some(escript) = oracle::resolve_escript() else {
+        oracle::skip(
+            "ets_info_memory_is_in_the_oracles_ballpark",
+            "no Erlang oracle found ($ERTS_ORACLE unset and no executable escript on $PATH)",
+        );
+        return;
+    };
+    let output = oracle::run_escript(
+        &escript,
+        MEMORY_ORACLE_PROGRAM,
+        &[],
+        "memory",
+        Duration::from_secs(120),
+    );
+    let live = parse_lines(&String::from_utf8_lossy(&output.stdout));
+
+    for kind in [
+        TableKind::Set,
+        TableKind::OrderedSet,
+        TableKind::Bag,
+        TableKind::DuplicateBag,
+    ] {
+        let atoms = AtomTable::new();
+        let mut heap = Heap::new(1 << 21);
+        let mut t = table(kind);
+        for key in 0..MEMORY_N {
+            t.insert(object(&mut heap, key, key * 2), &atoms).unwrap();
+        }
+        let ours = t.memory();
+        let oracle_mem: usize = live
+            .get(kind.as_atom_name())
+            .unwrap_or_else(|| panic!("the oracle printed no memory for {kind:?}"))
+            .parse()
+            .expect("the oracle's memory field is an integer");
+        // Same order of magnitude: a ratio bound wide enough to be robust across
+        // allocator/64-bit-word differences, tight enough to catch a wrong unit
+        // or a large leak.
+        assert!(
+            ours <= oracle_mem * 10 && ours * 10 >= oracle_mem,
+            "{kind:?}: the crate reports {ours} words but the oracle {oracle_mem} \
+             (not the same order of magnitude)"
+        );
+        println!("[ets] memory {kind:?}: crate={ours} words, oracle={oracle_mem} words");
+    }
 }

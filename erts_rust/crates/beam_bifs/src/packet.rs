@@ -173,11 +173,11 @@ fn decode_packet_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
     match packet_length(packet_type, &bytes, &opts) {
         PacketLength::Invalid => {
-            let reason = ctx.atom("invalid")?;
+            let reason = ctx.intern_atom("invalid")?;
             error_tuple(ctx, reason)
         }
         PacketLength::More(None) => {
-            let reason = ctx.atom("undefined")?;
+            let reason = ctx.intern_atom("undefined")?;
             more_tuple(ctx, reason)
         }
         PacketLength::More(Some(len)) => {
@@ -189,7 +189,7 @@ fn decode_packet_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
                 // `erl_bif_port.c:1564-1569`: `{more, PacketSz}` (or `undefined`
                 // for the degenerate zero length) — never a partial packet.
                 if packet_sz == 0 {
-                    let reason = ctx.atom("undefined")?;
+                    let reason = ctx.intern_atom("undefined")?;
                     more_tuple(ctx, reason)
                 } else {
                     let len = ctx.int(packet_sz as i64)?;
@@ -197,7 +197,7 @@ fn decode_packet_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
                 }
             } else {
                 // A whole packet: the body (`packet_get_body`) and the remainder.
-                let ok = ctx.atom("ok")?;
+                let ok = ctx.intern_atom("ok")?;
                 let body = bits::make_binary(ctx.heap(), &bytes[header_len..packet_sz])?;
                 let rest = bits::make_binary(ctx.heap(), &bytes[packet_sz..])?;
                 let elems = [ok, body, rest];
@@ -209,14 +209,14 @@ fn decode_packet_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `{error, Reason}` (`erl_bif_port.c:1562-1563`).
 fn error_tuple(ctx: &mut BifContext<'_>, reason: Eterm) -> Result<Eterm> {
-    let tag = ctx.atom("error")?;
+    let tag = ctx.intern_atom("error")?;
     let elems = [tag, reason];
     ctx.tuple(&elems)
 }
 
 /// `{more, Required}` (`erl_bif_port.c:1565-1569`).
 fn more_tuple(ctx: &mut BifContext<'_>, required: Eterm) -> Result<Eterm> {
-    let tag = ctx.atom("more")?;
+    let tag = ctx.intern_atom("more")?;
     let elems = [tag, required];
     ctx.tuple(&elems)
 }

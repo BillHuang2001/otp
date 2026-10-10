@@ -32,18 +32,32 @@
 //! helpers live in [`crate::bits`]; raw term access in [`crate::access`]. This
 //! module is safe Rust (the crate's only `unsafe` module is `access.rs`).
 //!
-//! # Implemented encodings (Milestone-1 scope)
+//! # Implemented encodings
 //!
-//! `latin1` and `unicode`/`utf8` (the two atoms are exact aliases, as in
-//! `erl_unicode.c`) as **input and output** encodings, for all five registered
-//! arities. `utf16`/`utf32` (and the `{utf16,little|big}` / `{utf32,…}` forms) are
-//! **not implemented**: an encoding argument naming one is reported as a typed
+//! `latin1`, `unicode`/`utf8` (the two atoms are exact aliases, as in
+//! `erl_unicode.c`) and `utf16`/`utf32` (with the `{utf16,big|little}` /
+//! `{utf32,big|little}` forms, where the bare atom means `big`) as **input and
+//! output** encodings, for all five registered arities. An encoding argument
+//! naming something else is a typed
 //! [`BeamError::BadArg`](beam_common::BeamError::BadArg) — the same class the
-//! oracle raises for an unknown encoding atom, and never a wrong result. (In the
-//! oracle those two encodings route through `unicode:characters_to_binary_int/3`
-//! → `i_trans`/`o_trans`; the general engine-2 machinery below is the port of that
-//! path, so adding them later is a matter of extending [`Encoding`] and the two
-//! transcoders.)
+//! oracle raises for an unknown encoding atom, and never a wrong result.
+//!
+//! The two wide families take different routes in the oracle and are ported
+//! accordingly:
+//!
+//! * as an **input** encoding of `characters_to_binary/2` the C BIF **traps** to
+//!   `unicode:characters_to_binary_int/2` (`erl_unicode.c:948-954`), i.e. engine 2
+//!   below with an output encoding of `unicode`;
+//! * as an **input** encoding of `characters_to_list/2` the C BIF traps to
+//!   `unicode:characters_to_list_int/2` = "`characters_to_binary_int/2`, then
+//!   read the result back as `utf8`" (`unicode.erl:849-857`), so a wide decode
+//!   produces a *list* through the UTF-8 round trip;
+//! * as an **output** encoding of `characters_to_binary/3` they take
+//!   `characters_to_binary_int/3`'s general clause (the guard only covers
+//!   `latin1`/`unicode`/`utf8` on both sides).
+//!
+//! The codec itself (the `<<U/utf16>>` / `<<U/utf32>>` step decoder, the `cbv/2`
+//! prefix probe and the `<<One/utf16>>` builders) lives in [`wide`].
 //!
 //! # Two engines (both ported)
 //!
@@ -63,7 +77,8 @@
 //!
 //! `no_conversion_needed/3` (the `unicode.erl` short-circuit) is applied first for
 //! every `/2` and `/3` call, including its `{latin1,latin1}` → `is_binary/1` and
-//! `{latin1,utf8}`/`{utf8,latin1}` → `bin_is_7bit/1` cases.
+//! `{latin1,utf8}`/`{utf8,latin1}` → `bin_is_7bit/1` cases. (It is never true for a
+//! wide encoding: only the four `latin1`/`utf8` combinations are short-circuited.)
 //!
 //! # Pinned oracle behaviours worth naming
 //!
@@ -98,35 +113,81 @@ use crate::context::BifContext;
 use crate::error::badarg;
 use crate::registry::BifRegistry;
 
+mod wide;
+
 // ---------------------------------------------------------------------------
 // Encoding selection
 // ---------------------------------------------------------------------------
 
 /// The encodings this module implements. `unicode` is an alias of `utf8`
-/// (`erl_unicode.c` compares `am_unicode`/`am_utf8` to the same branch), so the two
-/// atoms share one variant.
+/// (`erl_unicode.c` compares `am_unicode`/`am_utf8` to the same branch) and the
+/// bare `utf16`/`utf32` atoms are aliases of their **big**-endian forms
+/// (`unicode.erl:1069-1080`, `1112-1134`), so those share one variant each.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Encoding {
     /// One byte per code point, `U+0000..=U+00FF`.
     Latin1,
     /// UTF-8.
     Utf8,
+    /// UTF-16, big-endian (`utf16` and `{utf16,big}`).
+    Utf16Big,
+    /// UTF-16, little-endian (`{utf16,little}`).
+    Utf16Little,
+    /// UTF-32, big-endian (`utf32` and `{utf32,big}`).
+    Utf32Big,
+    /// UTF-32, little-endian (`{utf32,little}`).
+    Utf32Little,
 }
 
 /// Parses an encoding argument.
 ///
-/// `Ok(Some(_))` for `latin1`/`utf8`/`unicode`; `Ok(None)` for any **other atom**
-/// (an unimplemented encoding such as `utf16`, which the caller reports as
-/// `badarg`); `Err(badarg)` for a non-atom, which the oracle also rejects.
+/// `Ok(Some(_))` for every encoding this module implements; `Ok(None)` for any
+/// **other atom** or any other two-element tuple whose tag is `utf16`/`utf32`
+/// (such as `{utf16,foo}`), which the caller reports as `badarg` — the class the
+/// oracle's `i_trans`/`o_trans` `function_clause` degrades to; `Err(badarg)` for
+/// a non-atom, which the oracle rejects outright.
 fn encoding_arg(atoms: &AtomTable, term: Eterm) -> Result<Option<Encoding>> {
+    let name = |t: Eterm| -> Option<&str> {
+        if access::is_atom(t) {
+            atoms.name(atom_val(t))
+        } else {
+            None
+        }
+    };
+    if access::is_tuple(term) {
+        // `{utf16|utf32, big|little}`; anything else is an unknown encoding.
+        if access::tuple_size(term) != 2 {
+            return Ok(None);
+        }
+        let little = match name(access::tuple_element(term, 1)) {
+            Some("big") => false,
+            Some("little") => true,
+            _ => return Ok(None),
+        };
+        return Ok(match name(access::tuple_element(term, 0)) {
+            Some("utf16") => Some(if little {
+                Encoding::Utf16Little
+            } else {
+                Encoding::Utf16Big
+            }),
+            Some("utf32") => Some(if little {
+                Encoding::Utf32Little
+            } else {
+                Encoding::Utf32Big
+            }),
+            _ => None,
+        });
+    }
     if !access::is_atom(term) {
         return Err(badarg());
     }
-    match atoms.name(atom_val(term)) {
-        Some("latin1") => Ok(Some(Encoding::Latin1)),
-        Some("utf8") | Some("unicode") => Ok(Some(Encoding::Utf8)),
-        _ => Ok(None),
-    }
+    Ok(match atoms.name(atom_val(term)) {
+        Some("latin1") => Some(Encoding::Latin1),
+        Some("utf8") | Some("unicode") => Some(Encoding::Utf8),
+        Some("utf16") => Some(Encoding::Utf16Big),
+        Some("utf32") => Some(Encoding::Utf32Big),
+        _ => None,
+    })
 }
 
 /// `unicode:bin_is_7bit/1` — `true` iff `term` is a byte-aligned binary whose
@@ -498,9 +559,10 @@ fn sub_binary(ctx: &mut BifContext<'_>, orig: &[u8], offset: usize) -> Result<Et
     bits::make_binary(ctx.heap(), &orig[offset..])
 }
 
-/// `{Tag, A, B}` with `Tag` an existing atom.
+/// `{Tag, A, B}` with `Tag` **produced** by the caller (`error`/`incomplete`/`ok`),
+/// so it is interned on demand rather than looked up.
 fn tuple3(ctx: &mut BifContext<'_>, tag: &str, a: Eterm, b: Eterm) -> Result<Eterm> {
-    let tag = ctx.atom(tag)?;
+    let tag = ctx.intern_atom(tag)?;
     ctx.tuple(&[tag, a, b])
 }
 
@@ -859,11 +921,29 @@ struct MapEnv {
     chk: bool,
     /// The `Limit` the integer parts are checked against.
     limit: i64,
-    /// `true` when the output encoding is `latin1` (`o_trans(latin1)`).
-    out_latin1: bool,
+    /// The output encoding — `o_trans(OutEncoding)`.
+    out_enc: Encoding,
 }
 
-/// `i_trans` / `i_trans_chk` for `latin1`.
+/// One decode step of `enc`'s decoder at the head of `bytes` (the Erlang
+/// `<<U/utf16>>`/`<<U/utf32>>`/`<<U/utf8>>` binary-pattern match, with `cbv/2`
+/// standing in when it fails). `latin1` never reaches here — [`in_trans`]
+/// short-circuits it with `binary_to_list/1`.
+fn in_step(enc: Encoding, bytes: &[u8]) -> wide::Step {
+    match enc {
+        Encoding::Utf16Big => wide::decode_utf16(bytes, false),
+        Encoding::Utf16Little => wide::decode_utf16(bytes, true),
+        Encoding::Utf32Big => wide::decode_utf32(bytes, false),
+        Encoding::Utf32Little => wide::decode_utf32(bytes, true),
+        Encoding::Latin1 | Encoding::Utf8 => match decode_one(bytes) {
+            Decode::Ok(cp, len) => wide::Step::Ok(cp, len),
+            Decode::Invalid => wide::Step::Invalid,
+            Decode::Incomplete(missing) => wide::Step::Incomplete(missing),
+        },
+    }
+}
+
+/// `i_trans` / `i_trans_chk` for every implemented input encoding.
 fn in_trans(ctx: &mut BifContext<'_>, env: &MapEnv, bytes: &[u8]) -> Result<InTrans> {
     if env.in_enc == Encoding::Latin1 {
         // `binary_to_list/1` — every byte is a code point, never an error.
@@ -872,8 +952,8 @@ fn in_trans(ctx: &mut BifContext<'_>, env: &MapEnv, bytes: &[u8]) -> Result<InTr
     let mut out = Vec::new();
     let mut i = 0usize;
     while i < bytes.len() {
-        match decode_one(&bytes[i..]) {
-            Decode::Ok(cp, len) => {
+        match in_step(env.in_enc, &bytes[i..]) {
+            wide::Step::Ok(cp, len) => {
                 if env.chk && cp > 255 {
                     return Ok(InTrans::Error {
                         translated: out,
@@ -883,13 +963,13 @@ fn in_trans(ctx: &mut BifContext<'_>, env: &MapEnv, bytes: &[u8]) -> Result<InTr
                 out.push(i64::from(cp));
                 i += len;
             }
-            Decode::Invalid => {
+            wide::Step::Invalid => {
                 return Ok(InTrans::Error {
                     translated: out,
                     rest: bits::make_binary(ctx.heap(), &bytes[i..])?,
                 });
             }
-            Decode::Incomplete(missing) => {
+            wide::Step::Incomplete(missing) => {
                 return Ok(InTrans::Incomplete {
                     translated: out,
                     rest: bits::make_binary(ctx.heap(), &bytes[i..])?,
@@ -903,20 +983,29 @@ fn in_trans(ctx: &mut BifContext<'_>, env: &MapEnv, bytes: &[u8]) -> Result<InTr
 
 /// `o_trans` applied to one code point.
 fn out_trans_one(env: &MapEnv, value: i64) -> OutTransInt {
-    if env.out_latin1 {
-        if (0..=255).contains(&value) {
-            OutTransInt::Bin(vec![value as u8])
-        } else {
-            // `list_to_binary/1` raises; `characters_to_binary/3` turns it into `badarg`.
-            OutTransInt::Raise
+    match env.out_enc {
+        Encoding::Latin1 => {
+            if (0..=255).contains(&value) {
+                OutTransInt::Bin(vec![value as u8])
+            } else {
+                // `list_to_binary/1` raises; `characters_to_binary/3` turns it into `badarg`.
+                OutTransInt::Raise
+            }
         }
-    } else {
-        let mut out = Vec::new();
-        if encode_utf8(value, &mut out) {
-            OutTransInt::Bin(out)
-        } else {
-            OutTransInt::ErrorPart
+        Encoding::Utf8 => {
+            let mut out = Vec::new();
+            if encode_utf8(value, &mut out) {
+                OutTransInt::Bin(out)
+            } else {
+                OutTransInt::ErrorPart
+            }
         }
+        // `<<One/utf16>>` &c.: an unencodable code point raises inside
+        // `do_o_binary2`, which catches it into `{error, <<>>, [One|T]}`.
+        Encoding::Utf16Big => wide::encode_utf16(value, false).map_or(OutTransInt::ErrorPart, OutTransInt::Bin),
+        Encoding::Utf16Little => wide::encode_utf16(value, true).map_or(OutTransInt::ErrorPart, OutTransInt::Bin),
+        Encoding::Utf32Big => wide::encode_utf32(value, false).map_or(OutTransInt::ErrorPart, OutTransInt::Bin),
+        Encoding::Utf32Little => wide::encode_utf32(value, true).map_or(OutTransInt::ErrorPart, OutTransInt::Bin),
     }
 }
 
@@ -1184,21 +1273,68 @@ fn ml_map(
     }
 }
 
-/// `characters_to_binary_int/3` for an output encoding of `latin1`.
-fn engine2_binary(ctx: &mut BifContext<'_>, data: Eterm, in_enc: Encoding) -> Result<Eterm> {
-    let env = MapEnv {
-        in_enc,
-        chk: true,
-        limit: 255,
-        out_latin1: true,
+/// The `{InTrans, Limit}`/`o_trans` environment of `characters_to_binary_int/3`
+/// (`unicode.erl:891-896`): the checker and the 255 limit come from a `latin1`
+/// **output**, otherwise the *input* being `latin1` still caps the integer parts
+/// at 255.
+fn engine2_env(in_enc: Encoding, out_enc: Encoding) -> MapEnv {
+    let chk = out_enc == Encoding::Latin1;
+    let limit = if chk || in_enc == Encoding::Latin1 {
+        255
+    } else {
+        0x10FFFF
     };
-    match ml_map(ctx, &env, data, Vec::new(), None)? {
-        MlResult::Bin(bytes) => bits::make_binary(ctx.heap(), &bytes),
-        MlResult::Incomplete { accum, rest, .. } => {
+    MapEnv {
+        in_enc,
+        chk,
+        limit,
+        out_enc,
+    }
+}
+
+/// The raw outcome of `characters_to_binary_int/3` — the unbuilt form of what
+/// [`engine2_binary`] shapes into a term, so `characters_to_list_int/2` can read
+/// the converted binary back as a list ([`ctl_wide`]).
+enum Engine2 {
+    /// The converted bytes.
+    Bin(Vec<u8>),
+    /// `{incomplete, Accum, Inc}` (the `Missing` count is dropped, as in the
+    /// Erlang `case Res of … {incomplete,A,B,_} -> {incomplete,A,B}`).
+    Incomplete { accum: Vec<u8>, rest: Eterm },
+    /// `{error, Accum, Rest}`.
+    Error { accum: Vec<u8>, rest: Eterm },
+}
+
+/// `ml_map/3` over the `characters_to_binary_int/3` closure, unbuilt.
+fn engine2_run(
+    ctx: &mut BifContext<'_>,
+    data: Eterm,
+    in_enc: Encoding,
+    out_enc: Encoding,
+) -> Result<Engine2> {
+    let env = engine2_env(in_enc, out_enc);
+    Ok(match ml_map(ctx, &env, data, Vec::new(), None)? {
+        MlResult::Bin(bytes) => Engine2::Bin(bytes),
+        MlResult::Incomplete { accum, rest, .. } => Engine2::Incomplete { accum, rest },
+        MlResult::Error { accum, rest } => Engine2::Error { accum, rest },
+    })
+}
+
+/// `characters_to_binary_int/3` for any output encoding (`latin1`'s
+/// `i_trans_chk`/255-limit special case is decided by [`engine2_env`]).
+fn engine2_binary(
+    ctx: &mut BifContext<'_>,
+    data: Eterm,
+    in_enc: Encoding,
+    out_enc: Encoding,
+) -> Result<Eterm> {
+    match engine2_run(ctx, data, in_enc, out_enc)? {
+        Engine2::Bin(bytes) => bits::make_binary(ctx.heap(), &bytes),
+        Engine2::Incomplete { accum, rest } => {
             let converted = bits::make_binary(ctx.heap(), &accum)?;
             tuple3(ctx, "incomplete", converted, rest)
         }
-        MlResult::Error { accum, rest } => {
+        Engine2::Error { accum, rest } => {
             let converted = bits::make_binary(ctx.heap(), &accum)?;
             tuple3(ctx, "error", converted, rest)
         }
@@ -1240,14 +1376,22 @@ fn subject_of(data: Eterm) -> Eterm {
 }
 
 /// `characters_to_binary(Data, InEncoding, OutEncoding)`.
+///
+/// The oracle's guard clause (`unicode.erl:882-889`) sends the six
+/// `latin1`/`unicode`/`utf8` × `unicode`/`utf8` combinations to the C BIF engine
+/// ([`engine1_binary`]); every other pair — including every wide encoding on
+/// either side — takes `characters_to_binary_int/3`'s general clause
+/// ([`engine2_binary`]).
 fn ctb(ctx: &mut BifContext<'_>, data: Eterm, in_enc: Encoding, out_enc: Encoding) -> Result<Eterm> {
     if let Some(unchanged) = no_conversion_needed(data, in_enc, out_enc) {
         return Ok(unchanged);
     }
-    match out_enc {
-        Encoding::Utf8 => engine1_binary(ctx, subject_of(data), in_enc == Encoding::Latin1),
-        Encoding::Latin1 => engine2_binary(ctx, data, in_enc),
+    let narrow_utf8 = out_enc == Encoding::Utf8
+        && (in_enc == Encoding::Latin1 || in_enc == Encoding::Utf8);
+    if narrow_utf8 {
+        return engine1_binary(ctx, subject_of(data), in_enc == Encoding::Latin1);
     }
+    engine2_binary(ctx, data, in_enc, out_enc)
 }
 
 /// `unicode:characters_to_binary/1` — `characters_to_binary(Data, unicode, unicode)`.
@@ -1269,17 +1413,49 @@ fn characters_to_binary_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Et
 }
 
 /// `characters_to_list(Data, InEncoding)`.
+///
+/// `latin1` and `utf8`/`unicode` are the C BIF's own paths; a wide encoding makes
+/// the BIF **trap** to `unicode:characters_to_list_int/2`
+/// (`erl_unicode.c:1139-1142`), i.e. `do_characters_to_list/2`
+/// (`unicode.erl:849-857`): convert to a UTF-8 binary, then read *that* back as a
+/// `utf8` list, keeping the error/incomplete tag and the untranslated `Rest`.
 fn ctl(ctx: &mut BifContext<'_>, data: Eterm, in_enc: Encoding) -> Result<Eterm> {
-    let latin1 = in_enc == Encoding::Latin1;
-    if !latin1 && bits::is_bitstring(data) {
-        // The plain-utf8-binary fast path (`utf8_to_list`); a non-byte-aligned
-        // bitstring is `badarg`.
-        if aligned_binary_size(data).is_none() {
-            return Err(badarg());
+    match in_enc {
+        Encoding::Latin1 => engine1_list(ctx, data, true),
+        Encoding::Utf8 => {
+            if bits::is_bitstring(data) {
+                // The plain-utf8-binary fast path (`utf8_to_list`); a non-byte-aligned
+                // bitstring is `badarg`.
+                if aligned_binary_size(data).is_none() {
+                    return Err(badarg());
+                }
+                return utf8_to_list(ctx, data);
+            }
+            engine1_list(ctx, data, false)
         }
-        return utf8_to_list(ctx, data);
+        _ => ctl_wide(ctx, data, in_enc),
     }
-    engine1_list(ctx, data, latin1)
+}
+
+/// `unicode:characters_to_list_int/2` for a wide input encoding.
+fn ctl_wide(ctx: &mut BifContext<'_>, data: Eterm, in_enc: Encoding) -> Result<Eterm> {
+    /// `unicode:characters_to_list(Bin, utf8)` — the converted binary is valid
+    /// UTF-8 by construction, so this is the plain-list fast path.
+    fn read_back(ctx: &mut BifContext<'_>, accum: &[u8]) -> Result<Eterm> {
+        let converted = bits::make_binary(ctx.heap(), accum)?;
+        ctl(ctx, converted, Encoding::Utf8)
+    }
+    match engine2_run(ctx, data, in_enc, Encoding::Utf8)? {
+        Engine2::Bin(accum) => read_back(ctx, &accum),
+        Engine2::Incomplete { accum, rest } => {
+            let list = read_back(ctx, &accum)?;
+            tuple3(ctx, "incomplete", list, rest)
+        }
+        Engine2::Error { accum, rest } => {
+            let list = read_back(ctx, &accum)?;
+            tuple3(ctx, "error", list, rest)
+        }
+    }
 }
 
 /// `unicode:characters_to_list/1` — `characters_to_list(Data, unicode)`.
@@ -1327,7 +1503,8 @@ mod tests {
 
     /// Every name the test tables are seeded with, in this order.
     const NAMES: &[&str] = &[
-        "ok", "error", "incomplete", "latin1", "utf8", "unicode", "foo", "true", "false",
+        "ok", "error", "incomplete", "latin1", "utf8", "unicode", "foo", "true", "false", "big",
+        "little", "utf16", "utf32",
     ];
 
     fn table() -> AtomTable {
@@ -1714,6 +1891,313 @@ mod tests {
             assert_eq!(show(ctx, "bin_is_7bit", &[enc(ctx, "ok")]), "false");
             let one_f = ctx.make_float(1.0).unwrap();
             assert_eq!(show(ctx, "bin_is_7bit", &[one_f]), "false");
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // utf16 / utf32 (the wide encodings)
+    // -----------------------------------------------------------------------
+    //
+    // Every expectation below is a verbatim transcription of the system oracle
+    // (OTP 29 / erts-17.1) — see `../unicode.rs`'s module docs and the live `erl`
+    // cross-check in `tests/unicode_wide.rs`. `#{…}` is a binary, `[…]` a
+    // list and `{…}` a tuple in `describe`'s rendering.
+
+    /// The `{utf16|utf32, big|little}` encoding tuple.
+    fn enc_pair(ctx: &mut BifContext<'_>, name: &str, endian: &str) -> Eterm {
+        let tag = enc(ctx, name);
+        let end = enc(ctx, endian);
+        ctx.tuple(&[tag, end]).expect("the tuple fits")
+    }
+
+    #[test]
+    fn utf16_input_matches_the_oracle() {
+        with_ctx(|ctx| {
+            let b = enc(ctx, "utf16");
+            let big = enc_pair(ctx, "utf16", "big");
+            let lit = enc_pair(ctx, "utf16", "little");
+            // The bare atom is an alias of the big-endian form.
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 65, 0, 66]), b]), "#{65,66}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 65, 0, 66]), big]), "#{65,66}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[65, 0, 66, 0]), lit]), "#{65,66}");
+            // A BOM is just U+FEFF.
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[254, 255, 0, 65]), b]), "#{239,187,191,65}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[255, 254, 65, 0]), lit]), "#{239,187,191,65}");
+            // A surrogate pair becomes one code point; a lone surrogate does not.
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[216, 60, 222, 0]), b]), "#{240,159,136,128}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[60, 216, 0, 222]), lit]), "#{240,159,136,128}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[216, 0, 0, 65]), b]), "{error,#{},#{216,0,0,65}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[220, 0]), b]), "{error,#{},#{220,0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[216, 60, 65, 66]), b]), "{error,#{},#{216,60,65,66}}");
+            // A code unit whose lead byte is not a surrogate lead byte is plain.
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 216]), b]), "#{195,152}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[255, 254]), b]), "#{239,191,190}");
+            // Truncated input is `incomplete`, never `error`; a lone lead byte
+            // is over-reported as needing 3 (big) / 1 (little).
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 65, 0]), b]), "{incomplete,#{65},#{0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0]), b]), "{incomplete,#{},#{0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[216, 0]), b]), "{incomplete,#{},#{216,0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 65, 216, 0]), b]), "{incomplete,#{65},#{216,0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[216, 60, 222]), b]), "{incomplete,#{},#{216,60,222}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[216]), b]), "{incomplete,#{},#{216}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[255]), b]), "{incomplete,#{},#{255}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[220]), b]), "{error,#{},#{220}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[60, 216, 0, 222, 65]), lit]), "{incomplete,#{240,159,136,128},#{65}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[255]), lit]), "{incomplete,#{},#{255}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 220]), lit]), "{error,#{},#{0,220}}");
+            // Empty input, and a list is code points regardless of the encoding.
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[]), b]), "#{}");
+            let empty = ctx.list(&[]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[empty, b]), "#{}");
+            let ab = ctx.list(&[ctx.int(65).unwrap(), ctx.int(66).unwrap()]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[ab, b]), "#{65,66}");
+            let emoji = ctx.list(&[ctx.int(0x1F600).unwrap()]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[emoji, b]), "#{240,159,152,128}");
+            // An out-of-range / surrogate / negative integer nests the Rest twice
+            // (`ml_map`'s `{error, Accum, [Rest | T]}` around `Fun`'s `[Part]`).
+            let over = ctx.list(&[ctx.int(0x110000).unwrap()]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[over, b]), "{error,#{},[[1114112]]}");
+            let sur = ctx.list(&[ctx.int(0xD800).unwrap()]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[sur, b]), "{error,#{},[[55296]]}");
+            let neg = ctx.list(&[ctx.int(-1).unwrap()]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[neg, b]), "{error,#{},[[-1]]}");
+            // Mixed/nested shapes, including a binary part.
+            let a_inner = ctx.list(&[ctx.int(65).unwrap()]).unwrap();
+            let b_inner = ctx.list(&[ctx.int(66).unwrap()]).unwrap();
+            let nested = ctx.list(&[a_inner, b_inner]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[nested, b]), "#{65,66}");
+            let mixed = ctx.list(&[ctx.int(65).unwrap(), bin(&[0, 66])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[mixed, b]), "#{65,66}");
+            let one_bin = ctx.list(&[bin(&[0, 65])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[one_bin, b]), "#{65}");
+            let improper_bin = ctx.cons(ctx.int(65).unwrap(), bin(&[0, 66])).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[improper_bin, b]), "#{65,66}");
+            let bits = ctx.list(&[ctx.int(65).unwrap(), bin(&[0, 66])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[bits, b]), "#{65,66}");
+            // Errors that are `badarg`, not tuples.
+            let one_float = ctx.make_float(1.0).unwrap();
+            let floats = ctx.list(&[one_float]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[floats, b]), "badarg");
+            let atoms = ctx.list(&[enc(ctx, "ok")]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[atoms, b]), "badarg");
+            let improper = ctx.cons(ctx.int(65).unwrap(), ctx.int(66).unwrap()).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[improper, b]), "badarg");
+            // A non-byte-aligned bitstring is not a binary, so no `ml_map` clause
+            // matches (the oracle's `function_clause` ⇒ `badarg`).
+            assert_eq!(show(ctx, "characters_to_binary", &[bitstring(&[0, 65, 0], 20), b]), "badarg");
+            assert_eq!(show(ctx, "characters_to_list", &[bitstring(&[0, 65, 0], 20), b]), "badarg");
+        });
+    }
+
+    #[test]
+    fn utf16_parts_carry_a_pending_partial_code_point() {
+        with_ctx(|ctx| {
+            let b = enc(ctx, "utf16");
+            let pair = ctx.list(&[bin(&[216, 60]), bin(&[222, 0])]).unwrap();
+            // `ml_map`'s pending accumulator splices the halves together.
+            assert_eq!(show(ctx, "characters_to_binary", &[pair, b]), "#{240,159,136,128}");
+            let half = ctx.list(&[bin(&[216]), bin(&[60, 222, 0])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[half, b]), "#{240,159,136,128}");
+            let two = ctx.list(&[bin(&[0, 65]), bin(&[0, 66])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[two, b]), "#{65,66}");
+            let split = ctx.list(&[bin(&[0]), bin(&[65, 0, 66])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[split, b]), "#{65,66}");
+            let short = ctx.list(&[bin(&[0, 65]), bin(&[216, 60, 222, 0])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[short, b]), "#{65,240,159,136,128}");
+            // A pending partial sequence followed by an integer is the
+            // `{error, Accum, [Incomplete | Whole]}` clause.
+            let bad = ctx.list(&[bin(&[0, 65]), bin(&[216, 60]), ctx.int(66).unwrap()]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[bad, b]), "{error,#{65},[#{216,60},66]}");
+            let list = ctx.list(&[bin(&[0, 65]), bin(&[220, 0]), bin(&[0, 66])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_list", &[list, b]), "{error,[65],[#{220,0},#{0,66}]}");
+            let elem = ctx.list(&[bin(&[0, 220, 0])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[elem, b]), "{incomplete,#{195,156},#{0}}");
+        });
+    }
+
+    #[test]
+    fn utf32_input_matches_the_oracle() {
+        with_ctx(|ctx| {
+            let b = enc(ctx, "utf32");
+            let big = enc_pair(ctx, "utf32", "big");
+            let lit = enc_pair(ctx, "utf32", "little");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 0, 0, 65]), b]), "#{65}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 0, 0, 65]), big]), "#{65}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[65, 0, 0, 0]), lit]), "#{65}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 0, 0, 65, 0, 0, 0, 66]), b]), "#{65,66}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[65, 0, 0, 0, 66, 0, 0, 0]), lit]), "#{65,66}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 0, 254, 255]), b]), "#{239,187,191}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 0, 255, 255]), b]), "#{239,191,191}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 0, 0, 0]), b]), "#{0}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 0, 0, 0]), lit]), "#{0}");
+            // A surrogate or a value above U+10FFFF is an error; the `cbv/2`
+            // clauses decide the truncated forms.
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 0, 216, 0]), b]), "{error,#{},#{0,0,216,0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 216, 0, 0]), lit]), "{error,#{},#{0,216,0,0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 17, 0, 0]), b]), "{error,#{},#{0,17,0,0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 17, 0, 0, 65]), b]), "{error,#{},#{0,17,0,0,65}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0]), b]), "{incomplete,#{},#{0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 0]), b]), "{incomplete,#{},#{0,0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 0, 0]), b]), "{incomplete,#{},#{0,0,0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 17, 0]), b]), "{error,#{},#{0,17,0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0]), lit]), "{incomplete,#{},#{0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[65, 0, 0]), lit]), "{incomplete,#{},#{65,0,0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[65, 216, 1]), lit]), "{incomplete,#{},#{65,216,1}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[254, 255, 0]), lit]), "{error,#{},#{254,255,0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[255, 255, 0]), lit]), "{error,#{},#{255,255,0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[1, 255, 0]), lit]), "{incomplete,#{},#{1,255,0}}");
+            // Splitting a code point across two parts uses the pending path too.
+            let split = ctx.list(&[bin(&[0, 0]), bin(&[0, 65])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[split, b]), "#{65}");
+            let short = ctx.list(&[bin(&[0]), bin(&[0, 65])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[short, b]), "{incomplete,#{},#{0,0,65}}");
+            let part = ctx.list(&[bin(&[0, 0, 0]), bin(&[65])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[part, b]), "#{65}");
+            let one_bin = ctx.list(&[bin(&[0, 0, 0, 65])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[one_bin, b]), "#{65}");
+        });
+    }
+
+    #[test]
+    fn wide_output_encodings_match_the_oracle() {
+        with_ctx(|ctx| {
+            let u = enc(ctx, "unicode");
+            let l = enc(ctx, "latin1");
+            let f = enc(ctx, "utf8");
+            let b16 = enc(ctx, "utf16");
+            let b16l = enc_pair(ctx, "utf16", "little");
+            let b16b = enc_pair(ctx, "utf16", "big");
+            let b32 = enc(ctx, "utf32");
+            let b32l = enc_pair(ctx, "utf32", "little");
+            let ab = ctx.list(&[ctx.int(65).unwrap(), ctx.int(66).unwrap()]).unwrap();
+            let emoji = ctx.list(&[ctx.int(0x1F600).unwrap()]).unwrap();
+            // Out = utf16/utf32 (the general `characters_to_binary_int/3` clause).
+            assert_eq!(show(ctx, "characters_to_binary", &[ab, l, b16]), "#{0,65,0,66}");
+            assert_eq!(show(ctx, "characters_to_binary", &[ab, l, b16l]), "#{65,0,66,0}");
+            assert_eq!(show(ctx, "characters_to_binary", &[emoji, u, b16]), "#{216,61,222,0}");
+            assert_eq!(show(ctx, "characters_to_binary", &[ab, l, b32]), "#{0,0,0,65,0,0,0,66}");
+            assert_eq!(show(ctx, "characters_to_binary", &[ab, l, b32l]), "#{65,0,0,0,66,0,0,0}");
+            assert_eq!(show(ctx, "characters_to_binary", &[emoji, u, b32l]), "#{0,246,1,0}");
+            // An unencodable integer: the Rest nests twice (limited first, then
+            // guarded by the out-transcoder).
+            let over = ctx.list(&[ctx.int(0x110000).unwrap()]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[over, u, b16]), "{error,#{},[[1114112]]}");
+            assert_eq!(show(ctx, "characters_to_binary", &[over, u, b32]), "{error,#{},[[1114112]]}");
+            let sur = ctx.list(&[ctx.int(0xD800).unwrap()]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[sur, u, b16]), "{error,#{},[[55296]]}");
+            assert_eq!(show(ctx, "characters_to_binary", &[sur, u, b32]), "{error,#{},[[55296]]}");
+            let neg = ctx.list(&[ctx.int(-2).unwrap()]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[neg, u, b16]), "{error,#{},[[-2]]}");
+            let too_big = ctx.list(&[ctx.int(256).unwrap()]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[too_big, l, b16]), "{error,#{},[[256]]}");
+            // A wide input encoding on either side of `/3`.
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 65, 0, 66]), b16, f]), "#{65,66}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 65]), b16, u]), "#{65}");
+            assert_eq!(show(ctx, "characters_to_binary", &[ab, f, b16]), "#{0,65,0,66}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(b"AB"), f, b16]), "#{0,65,0,66}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 65]), b16, b16]), "#{0,65}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 65]), b16, b16l]), "#{65,0}");
+            assert_eq!(show(ctx, "characters_to_binary", &[ab, b16l, b16b]), "#{0,65,0,66}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 0, 0, 65]), b32, b16]), "#{0,65}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 65]), b16, b32]), "#{0,0,0,65}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 0, 0, 65]), b32, b32l]), "#{65,0,0,0}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 65]), b16, b32]), "#{0,0,0,65}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[216, 60, 222, 0]), b16, b16l]), "#{60,216,0,222}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[216, 60, 222, 0]), b16, b32]), "#{0,1,242,0}");
+            // A `latin1` output caps the code points at 255.
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 65, 0, 66]), b16, l]), "#{65,66}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[216, 60, 222, 0]), b16, l]), "{error,#{},#{216,60,222,0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 65, 1, 0]), b16, l]), "{error,#{65},#{1,0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 0, 0, 65]), b32, l]), "#{65}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 0, 0]), b32, l]), "{incomplete,#{},#{0,0,0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 0, 0]), b32l, l]), "{incomplete,#{},#{0,0,0}}");
+            // Incomplete/error shapes for the wide input.
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 65, 216]), b16, l]), "{incomplete,#{65},#{216}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 65, 216]), b16, f]), "{incomplete,#{65},#{216}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 65, 220, 0]), b16, f]), "{error,#{65},#{220,0}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 17, 0, 0]), b32, f]), "{error,#{},#{0,17,0,0}}");
+            // utf8 input with a wide output, split across parts.
+            let split = ctx.list(&[bin(&[195]), bin(&[169])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[split, f, b16]), "#{0,233}");
+            assert_eq!(show(ctx, "characters_to_binary", &[split, f, l]), "#{233}");
+            let inline = ctx.list(&[bin(&[0, 65]), ctx.int(66).unwrap()]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[inline, b16, b16]), "#{0,65,0,66}");
+        });
+    }
+
+    #[test]
+    fn wide_characters_to_list_matches_the_oracle() {
+        with_ctx(|ctx| {
+            let b = enc(ctx, "utf16");
+            let b32 = enc(ctx, "utf32");
+            let lit = enc_pair(ctx, "utf16", "little");
+            let lit32 = enc_pair(ctx, "utf32", "little");
+            assert_eq!(show(ctx, "characters_to_list", &[bin(&[0, 65, 0, 66]), b]), "[65,66]");
+            assert_eq!(show(ctx, "characters_to_list", &[bin(&[65, 0]), lit]), "[65]");
+            assert_eq!(show(ctx, "characters_to_list", &[bin(&[0, 0, 0, 65]), b32]), "[65]");
+            assert_eq!(show(ctx, "characters_to_list", &[bin(&[65, 0, 0, 0]), lit32]), "[65]");
+            assert_eq!(show(ctx, "characters_to_list", &[bin(&[216, 60, 222, 0]), b]), "[127488]");
+            assert_eq!(show(ctx, "characters_to_list", &[bin(&[]), b]), "[]");
+            assert_eq!(show(ctx, "characters_to_list", &[bin(&[]), lit32]), "[]");
+            let empty = ctx.list(&[]).unwrap();
+            assert_eq!(show(ctx, "characters_to_list", &[empty, b]), "[]");
+            let ab = ctx.list(&[ctx.int(65).unwrap(), ctx.int(66).unwrap()]).unwrap();
+            assert_eq!(show(ctx, "characters_to_list", &[ab, b]), "[65,66]");
+            let mixed = ctx.list(&[ctx.int(65).unwrap(), bin(&[0, 66])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_list", &[mixed, b]), "[65,66]");
+            // The wide `Rest` is carried untranslated, and a top-level binary
+            // reports it bare while a list input keeps the `[Rest|T]` nesting.
+            assert_eq!(show(ctx, "characters_to_list", &[bin(&[0, 65, 216]), b]), "{incomplete,[65],#{216}}");
+            assert_eq!(show(ctx, "characters_to_list", &[bin(&[0, 65, 220, 0]), b]), "{error,[65],#{220,0}}");
+            assert_eq!(show(ctx, "characters_to_list", &[bin(&[0, 17, 0, 0]), b32]), "{error,[],#{0,17,0,0}}");
+            assert_eq!(show(ctx, "characters_to_list", &[bin(&[0]), b]), "{incomplete,[],#{0}}");
+            assert_eq!(show(ctx, "characters_to_list", &[bin(&[0, 0, 0, 65, 0, 0]), b32]), "{incomplete,[65],#{0,0}}");
+            let one = ctx.list(&[bin(&[0])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_list", &[one, b]), "{incomplete,[],#{0}}");
+            let pair = ctx.list(&[bin(&[216, 60]), bin(&[222, 0])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_list", &[pair, b]), "[127488]");
+            let half = ctx.list(&[bin(&[216]), bin(&[60, 222, 0])]).unwrap();
+            assert_eq!(show(ctx, "characters_to_list", &[half, b]), "[127488]");
+        });
+    }
+
+    #[test]
+    fn wide_encoding_arguments_are_validated_like_the_oracle() {
+        with_ctx(|ctx| {
+            let one = bin(&[1]);
+            let ab = ctx.list(&[ctx.int(65).unwrap()]).unwrap();
+            let foo = enc(ctx, "foo");
+            let b16 = enc(ctx, "utf16");
+            let b32 = enc(ctx, "utf32");
+            // An unknown atom, and any malformed `{wide, endian}` tuple.
+            assert_eq!(show(ctx, "characters_to_binary", &[one, foo]), "badarg");
+            assert_eq!(show(ctx, "characters_to_list", &[one, foo]), "badarg");
+            let foo_pair = enc_pair(ctx, "utf16", "foo");
+            let foo32 = enc_pair(ctx, "utf32", "foo");
+            assert_eq!(show(ctx, "characters_to_binary", &[one, foo_pair]), "badarg");
+            assert_eq!(show(ctx, "characters_to_binary", &[one, foo32]), "badarg");
+            assert_eq!(show(ctx, "characters_to_list", &[one, foo_pair]), "badarg");
+            assert_eq!(show(ctx, "characters_to_binary", &[ab, enc(ctx, "latin1"), foo]), "badarg");
+            assert_eq!(show(ctx, "characters_to_binary", &[ab, enc(ctx, "latin1"), foo_pair]), "badarg");
+            let one_tuple = ctx.tuple(&[b16]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[one, one_tuple]), "badarg");
+            let three = ctx.tuple(&[b16, enc(ctx, "big"), enc(ctx, "big")]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[one, three]), "badarg");
+            let non_atom = ctx.list(&[ctx.int(5).unwrap()]).unwrap();
+            let bad_tag = ctx.tuple(&[non_atom, enc(ctx, "big")]).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[one, bad_tag]), "badarg");
+            // A bare non-atom encoding.
+            let five = ctx.int(5).unwrap();
+            assert_eq!(show(ctx, "characters_to_binary", &[one, five]), "badarg");
+            assert_eq!(show(ctx, "characters_to_list", &[one, five]), "badarg");
+            // The wide atoms themselves are accepted (so the failures above are
+            // about the *shape* of the argument, not the encoding name); a
+            // one-byte input shows the `cbv/2` asymmetry (`utf16` reports it as
+            // a prefix, `utf32` does not).
+            assert_eq!(show(ctx, "characters_to_binary", &[one, b16]), "{incomplete,#{},#{1}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[one, b32]), "{error,#{},#{1}}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 65]), b16]), "#{65}");
+            assert_eq!(show(ctx, "characters_to_binary", &[bin(&[0, 0, 0, 65]), b32]), "#{65}");
         });
     }
 }

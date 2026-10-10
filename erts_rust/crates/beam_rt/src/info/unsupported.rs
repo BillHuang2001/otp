@@ -30,16 +30,29 @@
 //! | key | why it is a gap |
 //! |---|---|
 //! | `allocator` | this runtime does not identify the host C allocator (`{glibc, …}`) |
-//! | `dist` / `dist_ctrl` | no live distribution wire state (the listener never reaches `Established`) |
 //! | `time_offset`/`time_correction`/`time_warp_mode`/`tolerant_timeofday` | no time-correction service |
-//! | `start_time` / `end_time` | no time server |
 //! | `os_monotonic_time_source` / `os_system_time_source` | no time-source introspection |
 //! | `cpu_topology` | no CPU-topology detection |
 //! | `check_io` | no poll-set introspection |
 //! | `c_compiler_used` | not built by a C compiler |
-//! | `embedded_3pps` | bundles no third-party libraries |
-//! | `system_logger` | no logger process |
+//! | `embedded_3pps` | embeds none of ERTS's third-party C libraries |
+//! | `system_logger` | no logger process to name |
 //! | `info` / `procs` / `loaded` | no memory/process/loaded-code self-description dumps |
+//! | `compile_info` | not built by a C toolchain, so it has no `ldflags`/`cflags`/`config.h` triple |
+//! | `ethread_info` / `ethread_used_tse` | no C ethread library (and no thread-specific-data slots) |
+//! | `constant_pool_support` / `beam_jump_table` | no ERTS constant-pool code loading, and no `NO_JUMP_TABLE` build switch to report |
+//! | `snifs` / `taints` | no static NIF table, and no NIF-taint tracking |
+//! | `emu_args` | the emulator argument vector is not exposed |
+//! | `reader_groups_map` / `decentralized_counter_groups_map` | no reader groups and no decentralized counters to distribute |
+//! | `max_integer` | no `BIG_ARITY_MAX` bignum-arity cap |
+//! | `thread_progress` | no thread-progress debug state to dump |
+//!
+//! Every key above is a **C-emulator internal**: it describes ERTS's C build, its C
+//! thread/allocator library, its loader's code-loading switches or a debug dump of its own
+//! C state. None of them has a counterpart this runtime could report a value for, and the
+//! C's answer is not a constant of the *interface* (unlike `hipe_architecture`'s
+//! `undefined` or `endian`'s host byte order, which are served) — so each is the honest
+//! typed capability gap rather than a copied oracle figure.
 
 use beam_common::Result;
 
@@ -58,21 +71,45 @@ pub(crate) fn try_value(key: &str, _rt: &Runtime) -> Option<Result<InfoValue>> {
     }
     let reason = match key {
         "allocator" => "this runtime does not identify the host C allocator",
-        "dist" => "this runtime does not report distribution state",
-        "dist_ctrl" => "this runtime models no distribution controllers",
         "time_offset" | "time_correction" | "time_warp_mode" | "tolerant_timeofday" => {
             "this runtime has no time-correction service"
         }
-        "start_time" | "end_time" => "this runtime has no time server",
         "os_monotonic_time_source" | "os_system_time_source" => {
             "this runtime has no time-source introspection"
         }
         "cpu_topology" => "this runtime does not detect CPU topology",
         "check_io" => "this runtime has no poll-set introspection",
         "c_compiler_used" => "this runtime was not built by a C compiler",
-        "embedded_3pps" => "this runtime bundles no third-party libraries",
-        "system_logger" => "this runtime has no logger process",
+        "embedded_3pps" => {
+            "this runtime embeds none of ERTS's third-party C libraries; \
+             its dependencies are Rust crates, a different set this key does not describe"
+        }
+        "system_logger" => {
+            "this runtime runs no logger process, so it has no logger pid to report"
+        }
         "info" | "procs" | "loaded" => "this runtime has no self-description dump",
+        "compile_info" => {
+            "this runtime is not built by a C toolchain, so it has no ldflags/cflags/config.h triple"
+        }
+        "ethread_info" => "this runtime has no C ethread library to describe",
+        "ethread_used_tse" => "this runtime uses no ethread thread-specific-data slots",
+        "constant_pool_support" => {
+            "this runtime does not implement ERTS's constant-pool code loading"
+        }
+        "beam_jump_table" => {
+            "this runtime has no ERTS jump-table dispatch build switch (NO_JUMP_TABLE) to report"
+        }
+        "snifs" => "this runtime publishes no static NIF table",
+        "taints" => "this runtime does not track the taints loading a NIF would record",
+        "emu_args" => "this runtime does not expose an emulator argument vector",
+        "reader_groups_map" => "this runtime has no reader groups to distribute over schedulers",
+        "decentralized_counter_groups_map" => {
+            "this runtime has no decentralized counters to distribute over schedulers"
+        }
+        "max_integer" => {
+            "this runtime has no BIG_ARITY_MAX bignum-arity cap to report as the largest integer"
+        }
+        "thread_progress" => "this runtime has no thread-progress debug state to dump",
         // Unreachable while `UNSUPPORTED_KEYS` and this match stay in sync; the guard
         // below keeps them honest rather than silently answering `None`.
         _ => "this facility is not implemented",

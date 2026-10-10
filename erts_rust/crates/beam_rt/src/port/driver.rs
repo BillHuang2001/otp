@@ -121,38 +121,165 @@
 //!   is present — `erl_async.c:604-613`) needs the driver's private state and entry, which the
 //!   frozen [`DriverHost`] seam does not give the host. It is reported as the C's own failure code
 //!   (`-1`) rather than faked.
-//! * **`driver_control`** (the driver's `control` callback behind `port_control/3`). It is
-//!   reachable only from the port lifecycle, and its reply protocol (`rbuf`/`rlen`, plus the
-//!   `driver_free_buf` rule for a driver-allocated reply) is not modelled here.
+//! * **`driver_control`'s reply *source*.** The entry's `control` callback behind `port_control/3`
+//!   **is** routed ([`DriverPortAdapter::control`]), but the C lets a driver answer from a buffer it
+//!   allocated itself (`*resp_bufp = driver_alloc(…)`, `io.c:4141-4168`), and reading that raw
+//!   pointer is precisely the raw-memory access this crate's `#![deny(unsafe_code)]` forbids. A
+//!   reply the driver writes into the buffer it was handed (and the C's `NIL`, a `NULL` reply
+//!   pointer) is served; a reply from the driver's own memory is the typed *unsupported* gap — never
+//!   a fabricated or truncated reply. Closing it needs a **safe** copy helper on `beam_abi`'s
+//!   [`DriverLibrary`] (recorded in `port/CONTEXT.md`'s Handoffs).
 //! * **A queued term carries no sending port.** The C stamps the port into the message header
 //!   (`from = prt->common.id`, `io.c:6172`), which is what send-tracing shows; a [`TermQueue`]
 //!   entry is `(destination, term)` only, so the runtime that drains it delivers the term itself
 //!   (`erl_drv_output_term` sends the decoded term, never a `{Port, Term}` wrapper) with no
 //!   sending-port identity.
-//! * **`ERL_DRV_USE` / `stop_select`** is accepted but never fires: a deselected event is
-//!   deregistered from the poll set, yet the driver's `stop_select` callback is not run.
-
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use libc::{c_int, c_ulong};
+use libc::{c_int, c_uint, c_ulong};
 
 use beam_abi::driver::loader::{self, DriverLibrary, DriverLoadError};
 use beam_abi::driver::types::{
-    ErlDrvBinary, ErlDrvEntry, ErlDrvEvent, ErlDrvPort, ErlIOVec, ERTS_INVALID_ERL_DRV_PORT,
-    ERL_DRV_READ, ERL_DRV_WRITE,
+    ErlDrvBinary, ErlDrvEntry, ErlDrvEvent, ErlDrvPort, ErlDrvSizeT, ErlIOVec,
+    ERTS_INVALID_ERL_DRV_PORT, ERL_DRV_READ, ERL_DRV_USE, ERL_DRV_USE_NO_CALLBACK, ERL_DRV_WRITE,
 };
 use beam_abi::{DriverEnv, DriverHost, SysIOVec};
 use beam_common::BeamError;
 use beam_alloc::Heap;
-use beam_bifs::AtomInterner;
 use beam_io::{DriverContext, Interest, Token};
 use beam_process::ProcessId;
-use beam_term::{make_atom, AtomTable, Eterm};
+use beam_term::{make_atom, refc::ERL_ONHEAP_BINARY_LIMIT, Atom, AtomTable, Eterm};
 
-use crate::context::PendingInterner;
+/// The atoms a driver first interned inside a callback, awaiting the port layer's commit.
+///
+/// An [`AtomTable`] is **append-only** and its indices never renumber, so a name the live table
+/// already holds keeps its index — but a *new* name can only be **predicted** while a driver
+/// callback runs: the runtime's one live table is mutably borrowed at the commit site, and this
+/// crate is `#![deny(unsafe_code)]`, so a host cannot mint an atom inline. This is the same
+/// deferred-commit rule the BIF/NIF hosts use (`crate::context::PendingInterner`), with the two
+/// things a **long-lived** host needs and a per-call one does not:
+///
+/// * **re-rooting** ([`DriverAtoms::rebase`]) — a driver host outlives the BIF call that opened
+///   its port, so other code may have interned names since; the port layer re-bases the
+///   prediction on the live table's length (`DriverAtoms::len`) at a step boundary it controls
+///   (see [`crate::port::PortRegistry::rebase_driver_atoms`]);
+/// * a **verified** commit ([`DriverAtoms::commit`]) — a name is interned only when it lands at
+///   exactly the index the driver was handed. A prediction the table has moved past (something
+///   else interned in between, or the name already exists elsewhere) is *dropped and returned to
+///   the caller*, never interned at a different index — which would make the driver's already
+///   built term name the **wrong** atom.
+///
+/// The handle is shared by `Rc<RefCell<..>>` between the host (which predicts, from inside a
+/// callback) and the port layer (which re-roots and commits), exactly like [`TermQueue`].
+#[derive(Clone, Debug)]
+pub struct DriverAtoms {
+    /// The shared prediction state: the live table's length when the window was opened, and the
+    /// names recorded since, in order.
+    inner: Rc<RefCell<DriverAtomsState>>,
+}
 
+/// The mutable half of a [`DriverAtoms`].
+#[derive(Debug)]
+struct DriverAtomsState {
+    /// The index the *first* recorded name was predicted at (the live table's length when the
+    /// window was opened).
+    base: usize,
+    /// The names recorded in this window, in order (deduplicated).
+    names: Vec<String>,
+}
+
+impl DriverAtoms {
+    /// A pending set rooted at `base` (the live table's current length).
+    pub fn new(base: usize) -> DriverAtoms {
+        DriverAtoms {
+            inner: Rc::new(RefCell::new(DriverAtomsState {
+                base,
+                names: Vec::new(),
+            })),
+        }
+    }
+
+    /// Whether no name is awaiting a commit.
+    ///
+    /// Load-bearing as a **guard**: committing nothing must not even *reach* the shared table
+    /// through `Rc::make_mut`, because that would deep-clone the whole table (thousands of
+    /// entries after boot) for nothing.
+    pub fn is_empty(&self) -> bool {
+        self.names().is_empty()
+    }
+
+    /// The names recorded since the last commit, in order — the caller's report of what a commit
+    /// dropped.
+    fn names(&self) -> Vec<String> {
+        self.inner.borrow().names.clone()
+    }
+
+    /// The index `name` will be interned at: the live table's index when it already holds the
+    /// name, the index it was already predicted at, or the next free predicted index.
+    fn intern(&self, name: &str) -> Atom {
+        let mut state = self.inner.borrow_mut();
+        if let Some(offset) = state.names.iter().position(|pending| pending == name) {
+            // A duplicate within this window reuses the predicted index.
+            return Atom::from_raw((state.base + offset) as u32);
+        }
+        let index = state.base + state.names.len();
+        state.names.push(name.to_string());
+        Atom::from_raw(index as u32)
+    }
+
+    /// Re-roots the prediction on the live table's length `len` — the port layer's window opening.
+    ///
+    /// A no-op while names are still pending: the already handed-out indices are anchored at the
+    /// current base, so moving it would invalidate them (the caller commits first — see
+    /// [`crate::port::PortRegistry::rebase_driver_atoms`]).
+    pub fn rebase(&self, len: usize) {
+        let mut state = self.inner.borrow_mut();
+        if state.names.is_empty() {
+            state.base = len;
+        }
+    }
+
+    /// Interns the recorded names into `atoms`, in prediction order, and returns the names it had
+    /// to **drop** — the ones whose predicted index the live table has already moved past, so a
+    /// different name sits where the index the driver was handed points.
+    ///
+    /// A drop is never silent: the caller reports it (see
+    /// [`crate::port::PortRegistry::dropped_driver_atoms`]). Interning such a name anyway would
+    /// append it at a *different* index than the driver's term carries, which is a wrong atom
+    /// behind a valid-looking index — strictly worse than a prediction that names nothing
+    /// (`beam_abi`'s term-data machine reports the failure to the driver).
+    ///
+    /// The base is re-rooted on `atoms.len()` afterwards, so the next window predicts from the
+    /// table's real end.
+    pub fn commit(&self, atoms: &mut AtomTable) -> Vec<String> {
+        let names = {
+            let mut state = self.inner.borrow_mut();
+            std::mem::take(&mut state.names)
+        };
+        let base = self.inner.borrow().base;
+        let mut dropped = Vec::new();
+        for (offset, name) in names.into_iter().enumerate() {
+            let predicted = base + offset;
+            if atoms.len() != predicted {
+                dropped.push(name);
+                continue;
+            }
+            atoms.intern(&name);
+        }
+        self.inner.borrow_mut().base = atoms.len();
+        dropped
+    }
+}
+
+impl beam_bifs::AtomInterner for DriverAtoms {
+    /// Records `name` (or resolves the index it was already predicted at), for
+    /// [`DriverAtoms::commit`] to land.
+    fn intern(&mut self, name: &str) -> Atom {
+        DriverAtoms::intern(self, name)
+    }
+}
 /// One `driver_select` request a driver callback made through [`DriverHost::select`].
 ///
 /// The C acts on it immediately; here it is *recorded* and applied by the port lifecycle as soon
@@ -162,7 +289,7 @@ use crate::context::PendingInterner;
 struct SelectRequest {
     /// The descriptor the driver selected (or deselected).
     fd: c_int,
-    /// The `ERL_DRV_READ`/`ERL_DRV_WRITE` (and, unhandled, `ERL_DRV_USE`) mode bits.
+    /// The `ERL_DRV_READ`/`ERL_DRV_WRITE`/`ERL_DRV_USE` mode bits, verbatim.
     mode: c_int,
     /// Non-zero to select, zero to deselect (`driver_select`'s `on` argument).
     on: c_int,
@@ -345,8 +472,8 @@ impl TermQueue {
 /// A driver host for one port: the runtime services the `driver_*` / `erl_drv_*` functions need.
 ///
 /// It owns a private term arena (the heap the term-data decoder builds its terms on), holds a
-/// handle to the runtime's **one shared** [`AtomTable`] plus the deferred-commit [`PendingInterner`]
-/// a *new* atom is recorded on, and answers the port queries with the owning [`ProcessId`].
+/// handle to the runtime's **one shared** [`AtomTable`] plus the deferred-commit [`DriverAtoms`]
+/// record a *new* atom is predicted on, and answers the port queries with the owning [`ProcessId`].
 ///
 /// See the module docs for the current scope: the output / term-data / pid services and the
 /// recorded `driver_select` / timer requests are implemented; `driver_async` and the custom
@@ -361,9 +488,9 @@ pub struct DriverPort {
     /// A handle to the runtime's shared atom table, used to resolve (never to mint *through*) an
     /// existing atom.
     atoms: Rc<AtomTable>,
-    /// The deferred-commit interner a **new** atom is recorded on (see
+    /// The deferred-commit record a **new** atom is predicted on (see
     /// [`DriverPort::commit_atoms`]).
-    interner: PendingInterner,
+    interner: DriverAtoms,
     /// The process the port belongs to — what `driver_connected` / `driver_caller` report.
     owner: ProcessId,
     /// Every `driver_output` / `erl_drv_output` payload, in call order.
@@ -381,12 +508,20 @@ pub struct DriverPort {
     /// The event/timer state shared with the port lifecycle that owns this host (see
     /// [`DriverControl`]).
     control: Rc<RefCell<DriverControl>>,
+    /// The port's `PORT_CONTROL_FLAG_*` bit set, as the driver last set it through
+    /// `set_port_control_flags` — the C's `prt->control_flags` (`io.c:5318`).
+    ///
+    /// Shared with the runtime's `PortMeta`, which reads it **after** a `control` callback to pick
+    /// the reply's Erlang form (`write_port_control_result`, `io.c:4133-4175`): a list of byte
+    /// integers normally, a **binary** when `PORT_CONTROL_FLAG_BINARY` is set. Seized with
+    /// [`DriverPort::control_flags`] before the host is boxed into the port lifecycle.
+    control_flags: Rc<Cell<c_int>>,
 }
 
 impl DriverPort {
     /// A host over `heap`, resolving/interning atoms against `atoms`, running as `owner`.
     pub fn new(heap: Heap, atoms: Rc<AtomTable>, owner: ProcessId) -> DriverPort {
-        let interner = PendingInterner::new(atoms.len());
+        let interner = DriverAtoms::new(atoms.len());
         DriverPort {
             heap,
             atoms,
@@ -396,6 +531,7 @@ impl DriverPort {
             sent: Vec::new(),
             terms: TermQueue::new(),
             control: Rc::new(RefCell::new(DriverControl::default())),
+            control_flags: Rc::new(Cell::new(0)),
         }
     }
 
@@ -408,6 +544,17 @@ impl DriverPort {
     pub fn term_queue(&self) -> TermQueue {
         self.terms.clone()
     }
+
+    /// The predicted-name handle of this host — the one the port layer commits into the runtime's
+    /// **live** atom table (see [`DriverPort::commit_atoms`]).
+    ///
+    /// Taken **before** the host is boxed into a port, for the same reason as
+    /// [`DriverPort::term_queue`]: the boxed driver exposes no host, so without this handle a name
+    /// a driver interned inside a callback would stay *predicted* forever — its index would never
+    /// reach the live table (see [`DriverAtoms`]).
+    pub fn pending_atoms(&self) -> DriverAtoms {
+        self.interner.clone()
+    }
     /// The event/timer state this host shares with its port lifecycle.
     ///
     /// [`DriverPortAdapter::load`] takes this handle so the driver's `driver_select` and
@@ -415,6 +562,15 @@ impl DriverPort {
     /// docs). A host nobody claims keeps answering the C's failure code for both.
     fn control(&self) -> Rc<RefCell<DriverControl>> {
         Rc::clone(&self.control)
+    }
+
+    /// The port's control-flags cell, shared with the runtime — the handle `PortMeta` holds to
+    /// render a `port_control` reply (see [`DriverPort::set_control_flags`]).
+    ///
+    /// Taken **before** the host is boxed into a port (the boxed driver exposes no host), exactly
+    /// like [`DriverPort::term_queue`].
+    pub fn control_flags(&self) -> Rc<Cell<c_int>> {
+        Rc::clone(&self.control_flags)
     }
     /// The process the port belongs to.
     pub fn owner(&self) -> ProcessId {
@@ -452,14 +608,15 @@ impl DriverPort {
         self.atoms.name(beam_term::atom_val(term))
     }
 
-    /// Interns the names recorded by [`DriverHost::intern_atom`] into `atoms`, in order.
+    /// Interns the names recorded by [`DriverHost::intern_atom`] into `atoms`, in order, and
+    /// returns the names it had to **drop** (see [`DriverAtoms::commit`]).
     ///
     /// The same deferred-commit rule as the NIF host (`crate::nif`'s `NifHostImpl`): the runtime's
     /// atom table is held immutably while a driver callback runs, so a *new* name is given its
     /// predicted index straight away and only materialised **after** the borrow is released. The
     /// caller must pass the **same** table the host's `atoms` handle refers to.
-    pub fn commit_atoms(&self, atoms: &mut AtomTable) {
-        self.interner.commit(atoms);
+    pub fn commit_atoms(&self, atoms: &mut AtomTable) -> Vec<String> {
+        self.interner.commit(atoms)
     }
 
     /// Builds the one per-port environment for this driver.
@@ -682,6 +839,25 @@ impl DriverHost for DriverPort {
         0
     }
 
+    /// Records the control flags the driver asked for (`set_port_control_flags` — the C's
+    /// `prt->control_flags`, `io.c:5318`).
+    ///
+    /// The C returns `void`, so the seam's `0` is always the answer. The recorded bit set is what
+    /// the runtime reads back (`set_port_control_flags` → `get_port_flags` round-trips through
+    /// this seam, `beam_abi`'s `driver/drv/lifecycle.rs`) to render a `port_control` reply as a
+    /// **binary** when `PORT_CONTROL_FLAG_BINARY` is set and as a list of byte integers otherwise —
+    /// the C's own rule (`write_port_control_result`, `io.c:4133-4175`).
+    fn set_control_flags(&mut self, _mode: c_int, flags: c_int) -> c_int {
+        self.control_flags.set(flags);
+        0
+    }
+
+    /// The flags the driver last set — the value the seam's `set_port_control_flags` →
+    /// `get_port_flags` round trip reports.
+    fn get_port_flags(&mut self) -> Option<c_int> {
+        Some(self.control_flags.get())
+    }
+
     /// Drops the port's pending timer (`driver_cancel_timer`) — `0`, or the C's `-1` for a host no
     /// lifecycle has claimed.
     fn cancel_timer(&mut self, _port: ErlDrvPort) -> c_int {
@@ -851,10 +1027,10 @@ pub fn load_driver(
 /// * `driver_async` keeps the [`beam_abi::DriverHost`] default (`-1`): see the module docs — there
 ///   is no async pool, and the C's in-band path needs the entry and the driver's private state,
 ///   which the frozen host seam does not hand the host function.
-/// * `driver_control` (the entry's `control` callback behind `port_control/3`) is not routed here
-///   yet, so [`beam_io::Driver::control`]'s default (no reply bytes) is used.
+/// * `driver_control` (the entry's `control` callback behind `port_control/3`) is routed by
+///   [`DriverPortAdapter::control`]; its only gap is a reply the driver answers from memory of its
+///   own rather than from the buffer it was handed (a typed *unsupported*, see the module docs).
 /// * A queued term is delivered without a sending-port identity (the C stamps `from = prt`).
-/// * `ERL_DRV_USE` is accepted but its `stop_select` callback never fires.
 /// * `take_exit_status` is always `Ok(None)`: a driver port owns no child to reap, so no
 ///   `{Port, {exit_status, …}}` message is ever synthesized for it.
 pub struct DriverPortAdapter {
@@ -1006,30 +1182,68 @@ impl DriverPortAdapter {
     /// The C's rule is per `(event, direction)`: `on` arms the `ERL_DRV_READ`/`ERL_DRV_WRITE`
     /// directions named by `mode`, `!on` clears them, and the event is deregistered once no
     /// direction is left (`erl_check_io.c:987`).
+    ///
+    /// A **deselect** whose `mode` carries `ERL_DRV_USE` *without* the cancel bit — the C's
+    /// `(mode & ERL_DRV_USE_NO_CALLBACK) == ERL_DRV_USE` test (`erl_check_io.c:1177`) — is the
+    /// "I am done with this event" form: it also clears **both** directions
+    /// (`mode |= ERL_DRV_READ | ERL_DRV_WRITE`, `erl_check_io.c:1044`) and, once the event has no
+    /// armed direction left, runs the driver's `stop_select` callback. The same form fires it on an
+    /// event this port never armed, which is the C's "unknown fd" fast track
+    /// (`erl_check_io.c:1030-1040`). The cancel bit (`ERL_DRV_USE_NO_CALLBACK`) suppresses the
+    /// callback, which is why the C tests the pair rather than `ERL_DRV_USE` alone — and why the
+    /// substituted `no_ready_*_callback` (which deselects with `ERL_DRV_USE_NO_CALLBACK`,
+    /// `io.c:7522`/`7534`) never re-enters `stop_select`.
+    ///
+    /// The C stores the same obligation on its per-fd event state (`ERTS_EV_FLAG_USED`,
+    /// `erl_check_io.c:86`) and keeps a plain deselect from removing the fd from the poll set while
+    /// that flag is set (`erl_check_io.c:1111`/`1123`/`1170`). The flag is read off the request that
+    /// carries it here instead, because that is the very input the C's callback branch tests and
+    /// `beam_io`'s `DriverContext` has no "registered with no armed direction" state
+    /// ([`Interest`] has no empty value): the difference is poll-set bookkeeping only — never an
+    /// observable change through the driver ABI, and never a wrong `stop_select` decision.
     fn apply_select(
         &mut self,
         ctx: &mut DriverContext<'_>,
         request: SelectRequest,
     ) -> beam_common::Result<()> {
+        // `driver_select(p, e, ERL_DRV_USE, 0)` — the "done with this event" form.
+        let stop_use = request.on == 0
+            && (request.mode & ERL_DRV_USE_NO_CALLBACK) == ERL_DRV_USE;
+        let mode = if stop_use {
+            request.mode | ERL_DRV_READ | ERL_DRV_WRITE
+        } else {
+            request.mode
+        };
         let index = self.selected.iter().position(|s| s.fd == request.fd);
         let current = index.map_or_else(Armed::default, |i| self.selected[i].armed);
-        let next = current.with(request.mode, request.on != 0);
+        let next = current.with(mode, request.on != 0);
         match (index, next.interest()) {
             // Nothing was armed and nothing becomes armed: a no-op (`ERL_DRV_USE` on its own, or a
-            // deselect of a direction this port never held).
-            (None, None) => Ok(()),
-            // Still armed: re-register with the new direction mask.
+            // deselect of a direction this port never held). The C's fast path still runs
+            // `stop_select` for the "done with this event" form.
+            (None, None) => {
+                if stop_use {
+                    self.fire_stop_select(request.fd)?;
+                }
+                Ok(())
+            }
+            // Still armed: re-register with the new direction mask. A direction is left, so the C
+            // never reaches its `ASSERT(state->events == 0)` branch and no `stop_select` runs.
             (Some(i), Some(interest)) => {
                 let token = self.selected[i].token;
                 ctx.reregister(request.fd, token, interest)?;
                 self.selected[i].armed = next;
                 Ok(())
             }
-            // The last direction went away: drop the registration.
+            // The last direction went away: drop the registration, and run the driver's
+            // `stop_select` when this call was the "done with this event" form.
             (Some(i), None) => {
                 let token = self.selected[i].token;
                 ctx.deregister(request.fd, token)?;
                 self.selected.remove(i);
+                if stop_use {
+                    self.fire_stop_select(request.fd)?;
+                }
                 Ok(())
             }
             // A new descriptor.
@@ -1042,6 +1256,38 @@ impl DriverPortAdapter {
                 });
                 Ok(())
             }
+        }
+    }
+
+    /// Runs the driver's `stop_select` for `fd` — the C's `(*drv_ptr->stop_select)(e, NULL)`
+    /// (`erl_check_io.c:1212-1216`), the driver's licence to release the event.
+    ///
+    /// The event handed back is `fd as ErlDrvEvent`, which **is** the value the C passes on: it
+    /// forwards the very `ErlDrvEvent` the driver gave `driver_select`, and this runtime only ever
+    /// accepted one that reduces to an fd ([`DriverPort`]'s `select` refuses anything else with the
+    /// C's `-1`), so rebuilding the pointer from the descriptor is the identical handle — a driver
+    /// that compares the two sees the same event.
+    ///
+    /// An entry with no `stop_select` slot is the C's `no_stop_select_callback`
+    /// (`io.c:7546-7553`, a log line) — a no-op here, the same rule every other absent callback
+    /// follows.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] when the driver has already been torn down, and [`BeamError::Io`] when
+    /// the callback reports a failure.
+    fn fire_stop_select(&mut self, fd: c_int) -> beam_common::Result<()> {
+        let Some(driver) = self.driver.as_mut() else {
+            return Err(BeamError::BadArg);
+        };
+        let event = fd as isize as ErlDrvEvent;
+        let called = publishing(driver, |library| {
+            library.stop_select(event, std::ptr::null_mut())
+        });
+        match called {
+            Ok(()) => Ok(()),
+            Err(error) if error.is_absent() => Ok(()),
+            Err(error) => Err(driver_call_error(error)),
         }
     }
 
@@ -1105,8 +1351,9 @@ impl DriverPortAdapter {
     /// readiness the task was actually scheduled for.
     ///
     /// An entry that declares no callback for the direction is the C's `no_ready_*_callback`, which
-    /// the C substitutes for a `NULL` slot (`io.c:7523-7538`): it logs and **deselects** the event,
-    /// so the registration is dropped rather than spinning on a readiness nothing consumes.
+    /// the C substitutes for a `NULL` slot (`io.c:7518-7534`): it logs and **deselects** that
+    /// direction — with `ERL_DRV_USE_NO_CALLBACK`, so the substituted callback never re-enters
+    /// `stop_select` — rather than spinning on a readiness nothing consumes.
     ///
     /// # Errors
     ///
@@ -1133,13 +1380,19 @@ impl DriverPortAdapter {
         });
         match called {
             Ok(()) => {}
-            // The entry has no callback for this direction: the C's `no_ready_*_callback`.
+            // The entry has no callback for this direction: the C's `no_ready_input_callback`
+            // (`io.c:7518-7523`) / `no_ready_output_callback` (`io.c:7529-7534`), which deselect
+            // **exactly the direction the readiness was for** with the cancel bit
+            // (`ERL_DRV_READ|ERL_DRV_USE_NO_CALLBACK`, resp. the `ERL_DRV_WRITE` form). The cancel
+            // bit is load-bearing: it is what keeps the substituted callback from re-entering
+            // `stop_select` through `apply_select`'s "done with this event" form.
             Err(error) if error.is_absent() => {
+                let direction = if read { ERL_DRV_READ } else { ERL_DRV_WRITE };
                 self.apply_select(
                     ctx,
                     SelectRequest {
                         fd,
-                        mode: ERL_DRV_READ | ERL_DRV_WRITE,
+                        mode: direction | ERL_DRV_USE_NO_CALLBACK,
                         on: 0,
                     },
                 )?;
@@ -1175,6 +1428,56 @@ impl DriverPortAdapter {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    /// The bytes a `control` call answered with, read from whichever buffer the driver left its
+    /// reply pointer in.
+    ///
+    /// The C reads `cres` bytes from `*rbuf` unconditionally, because it is C: the pointer the
+    /// driver leaves is either the pre-allocated buffer it was handed or memory the driver owns.
+    /// Both are the *same bytes*; the difference is only whether this crate may read them. It is
+    /// `#![deny(unsafe_code)]` (workspace `../CONTEXT.md` §3), so a raw pointer may not be
+    /// dereferenced here — and the driver's own allocation (`driver_alloc` is a plain `malloc`,
+    /// `beam_abi`'s `driver/drv/mem.rs:62`) is exactly such a pointer.
+    ///
+    /// The reply is therefore sliced out of the buffers this call **owns** whenever the driver's
+    /// pointer addresses them — the reply buffer it was handed (the buffer-filling driver, and the
+    /// `ctl_reply` shape of `inet_drv.c`, which re-points `*rbuf` only when its answer does not fit
+    /// the 64 bytes it was given) or the request buffer it was passed. A pointer that addresses
+    /// neither is reported as the typed *unsupported* capability gap: the runtime cannot read the
+    /// driver's memory without the raw access its crate attributes forbid, and a truncated or empty
+    /// reply would be a fabricated one.
+    ///
+    /// A `NULL` reply pointer is the C's `NIL` (`io.c:4126`) — an empty reply, which is what this
+    /// returns.
+    ///
+    /// # Errors
+    ///
+    /// The typed capability gap for a reply from the driver's own memory.
+    fn control_reply(
+        reply: &[u8],
+        request: &[u8],
+        rbuf: *const std::os::raw::c_char,
+        len: usize,
+    ) -> beam_common::Result<Vec<u8>> {
+        if rbuf.is_null() {
+            return Ok(Vec::new());
+        }
+        let start = rbuf as usize;
+        for source in [reply, request] {
+            let base = source.as_ptr() as usize;
+            if start < base {
+                continue;
+            }
+            let offset = start - base;
+            // `offset + len <= source.len()`, written without an addition that could overflow.
+            if offset <= source.len() && len <= source.len() - offset {
+                return Ok(source[offset..offset + len].to_vec());
+            }
+        }
+        Err(crate::error::unsupported(
+            "a driver control reply from the driver's own memory",
+        ))
     }
 }
 /// Maps a driver-callback failure onto the runtime's error type.
@@ -1342,6 +1645,76 @@ impl beam_io::Driver for DriverPortAdapter {
         Ok(written)
     }
 
+    /// Runs the driver's `control` callback — the driver half of `erlang:port_control/3`
+    /// (`call_driver_control`, `io.c:4024-4078`).
+    ///
+    /// `command` is a C driver's verb, an **integer** on the wire: `erts_internal:port_control/3`
+    /// converts its `Command` with `term_to_Uint` (`erl_bif_port.c:322-340`, `> UINT_MAX` ⇒
+    /// `badarg`), which is why [`beam_io`]'s built-in C-driver host parses the same `&str` as a
+    /// decimal `c_uint` (`beam_io/src/abi/port.rs:716`). A verb that is not one is the caller's
+    /// `badarg`, never a driver call with a substituted command.
+    ///
+    /// The reply protocol is the C's exactly. The caller hands the driver a pre-allocated
+    /// [`ERL_ONHEAP_BINARY_LIMIT`]-byte buffer (`char resp_buf[…]`, `io.c:4352-4354`), `*rbuf`
+    /// initially pointing at it; the driver either writes into that buffer, re-points `*rbuf` at
+    /// memory of its own, or leaves it `NULL` — which the C renders as `NIL`
+    /// (`write_port_control_result`, `io.c:4126`). The bytes it reports (`cres`) are the reply.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] when the entry declares no `control` slot — the C's
+    /// `if (!prt->drv_ptr->control) return ERTS_PORT_OP_BADARG;` (`io.c:4035`) — when `command` is
+    /// not a decimal `c_uint`, or when the driver returned a negative result (`io.c:4074`), and the
+    /// typed capability gap of [`DriverPortAdapter::control_reply`] for a reply the driver answers
+    /// from memory of its own.
+    fn control(
+        &mut self,
+        ctx: &mut beam_io::DriverContext<'_>,
+        command: &str,
+        arg: &[u8],
+    ) -> beam_common::Result<Vec<u8>> {
+        let Some(driver) = self.driver.as_mut() else {
+            return Err(BeamError::BadArg);
+        };
+        let cmd: c_uint = command.parse().map_err(|_| BeamError::BadArg)?;
+        let state = self.state;
+        // The C passes the caller's `Data` as a writable buffer (`basep`, `io.c:4343-4348`) and the
+        // driver may read it for the duration of the call only — an owned copy gives it exactly
+        // that lifetime.
+        let mut buf = arg.to_vec();
+        // The C's reply buffer (`io.c:4352-4354`): `char resp_buf[ERL_ONHEAP_BINARY_LIMIT];
+        // char *resp_bufp = &resp_buf[0]; ErlDrvSizeT resp_size = sizeof(resp_buf);`.
+        let mut reply = vec![0u8; ERL_ONHEAP_BINARY_LIMIT];
+        let mut rbuf = reply.as_mut_ptr() as *mut std::os::raw::c_char;
+        let rlen = reply.len() as ErlDrvSizeT;
+        let called = publishing(driver, |library| {
+            library.control(
+                state,
+                cmd,
+                buf.as_mut_ptr() as *mut std::os::raw::c_char,
+                buf.len() as ErlDrvSizeT,
+                &mut rbuf,
+                rlen,
+            )
+        });
+        let cres = match called {
+            Ok(cres) => cres,
+            // The C's absent-`control` badarg (`io.c:4035`).
+            Err(error) if error.is_absent() => return Err(BeamError::BadArg),
+            Err(error) => return Err(driver_call_error(error)),
+        };
+        if cres < 0 {
+            // The C's `if (cres < 0) return ERTS_PORT_OP_BADARG;` (`io.c:4074`).
+            return Err(BeamError::BadArg);
+        }
+        let bytes = Self::control_reply(&reply, &buf, rbuf, cres as usize)?;
+        // A `control` callback is an ordinary driver callback: whatever it asked of its port (a
+        // `driver_select`, a `driver_set_timer`, a `driver_output`) is applied now, exactly as for
+        // every other callback (see [`DriverPortAdapter::settle`]).
+        self.settle(ctx)?;
+        Ok(bytes)
+    }
+
     /// Runs the driver's `timeout` callback for a fired port timer.
     ///
     /// The pending deadline is cleared **first** (the C's own order), so a callback that re-arms
@@ -1439,6 +1812,17 @@ impl Drop for DriverPortAdapter {
 #[cfg(test)]
 mod ready_output_tests;
 
+/// The A.4 **`ERL_DRV_USE` / `stop_select` regression test** for
+/// [`DriverPortAdapter::apply_select`], with the real C driver fixture it compiles: the C's
+/// "done with this event" form, the plain deselect that must not fire it, and the cancel form.
+#[cfg(test)]
+mod stop_select_tests;
+
+/// The A.4 **port-control regression suite** for [`DriverPortAdapter::control`] — the driver half of
+/// `port_control/3` — with the real C driver fixture it compiles (five reply verbs, plus the
+/// absent-slot build) and the reply-source rule of [`DriverPortAdapter::control_reply`].
+#[cfg(test)]
+mod control_tests;
 #[cfg(test)]
 mod tests {
     use super::*;

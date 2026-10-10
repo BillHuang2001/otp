@@ -590,10 +590,15 @@ const PID_TEXT_MAX: usize = 64;
 /// (oracle-verified at the 71/72 boundary).
 const REF_TEXT_MAX: usize = 71;
 
-/// The largest id the Milestone-1 ref thing can hold: its `id` word is a 60-bit
-/// small integer (`access::make_ref_thing`), so a larger number names a reference
-/// this runtime cannot materialize.
-const MAX_INTERNAL_REF_NUMBER: u64 = (1 << 59) - 1;
+/// The oracle's `MAX_REFERENCE = 1 << _REF_NUM_SIZE = 1 << 18 = 262144`
+/// (`erl_term.h:768,771`): `list_to_ref_1` rejects an id `>= MAX_REFERENCE` with
+/// `badarg` (`bif.c:4777`). This is the *C's* bound and is tighter than the
+/// Milestone-1 ref thing's own reach (its `id` word is a 60-bit small integer,
+/// `access::make_ref_thing`), so the oracle's bound is what a byte-faithful
+/// `list_to_ref/1` must enforce. Oracle-verified at the boundary:
+/// `#Ref<0.0.0.262143>` parses, `#Ref<0.0.0.262144>` and `#Ref<0.0.0.4294967295>`
+/// are `badarg`.
+const MAX_REFERENCE: u64 = 1 << 18;
 
 /// The `%T` text of an internal pid as raw bytes — `<channel.number.serial>`
 /// (`erl_printf_term.c:508-519`): the channel is the local node's, then the
@@ -751,8 +756,10 @@ fn parse_pid_text(bytes: &[u8]) -> Result<ProcessId> {
 /// `#Ref<0.0.0.N>` shape is representable: a non-local channel, a non-zero upper ref
 /// number, or a shape with the wrong field count (`#Ref<0.0.0>`,
 /// `#Ref<0.0.0.1.2>`) names a reference this runtime cannot materialize and is
-/// `badarg` — never a fabricated term. Leading zeros are accepted
-/// (`#Ref<00.00.00.01>` ⇒ `#Ref<0.0.0.1>`), as in the C.
+/// `badarg` — never a fabricated term. The id must also satisfy the oracle's
+/// `id < `[`MAX_REFERENCE`] (`bif.c:4777`): `#Ref<0.0.0.262144>` and above are
+/// `badarg`, exactly as the C rejects them before the id can leave its range. Leading
+/// zeros are accepted (`#Ref<00.00.00.01>` ⇒ `#Ref<0.0.0.1>`), as in the C.
 ///
 /// # Errors
 ///
@@ -774,7 +781,7 @@ fn parse_ref_text(bytes: &[u8]) -> Result<u64> {
     if channel != LOCAL_NODE_NUMBER || upper1 != 0 || upper0 != 0 {
         return Err(badarg());
     }
-    if id > MAX_INTERNAL_REF_NUMBER {
+    if id >= MAX_REFERENCE {
         return Err(badarg());
     }
     Ok(id)
@@ -871,7 +878,9 @@ fn port_to_binary_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `list_to_ref("#Ref<1.0.0.1>")` and `list_to_ref("#Ref<0.1.0.1>")` are all
 /// `badarg`: the last two name a reference whose node/upper ref numbers this
 /// runtime's single-id-word ref thing cannot carry, so they are an honest gap
-/// rather than a fabricated reference (see [`parse_ref_text`]).
+/// rather than a fabricated reference (see [`parse_ref_text`]). The id is bounded by
+/// the oracle's `id < `[`MAX_REFERENCE`]: `list_to_ref("#Ref<0.0.0.262144>")` is
+/// `badarg` (`bif.c:4777`), so no id the oracle can never hold is materialized.
 ///
 /// # Errors
 ///
@@ -1056,10 +1065,33 @@ mod tests {
             let reference = list_to_ref_1(ctx, &[zeros]).expect("the text parses");
             let back = ref_to_list_1(ctx, &[reference]).expect("a reference");
             assert_eq!(string_of(back), "#Ref<0.0.0.7>");
-            // A shape the single-id-word ref thing cannot carry is `badarg`.
-            for bad in ["bogus", "#Ref<0.0.0>", "#Ref<0.0.0.1.2>", "#Ref<1.0.0.1>", "#Ref<0.1.0.1>"] {
+            // A shape the single-id-word ref thing cannot carry is `badarg`
+            // (`#Ref<1.0.0.1>`/`#Ref<0.1.0.1>` are fine in the oracle but name a node
+            // or upper ref number this runtime cannot hold), and so is every
+            // malformed prefix/suffix/field the oracle rejects with `badarg`.
+            for bad in [
+                "bogus",
+                "#Ref<0.0.0>",
+                "#Ref<0.0.0.1.2>",
+                "#Ref<1.0.0.1>",
+                "#Ref<0.1.0.1>",
+                "#Ref<0.0.1.1>",
+                "#Refx<0.0.0.1>",
+                "#ref<0.0.0.1>",
+                "#Ref<0.0.0.1>x",
+                "#Ref<0.0.0.1",
+                "#Ref<0.0.0.-1>",
+                "#Ref<0.0.0.+1>",
+                "#Ref<0.0.0. 1>",
+                "#Ref<0.0.0.1.>",
+                "#Ref<0.0.0.1.a>",
+                "#Ref<0.0.0.1e2>",
+            ] {
                 let text = byte_chars(ctx, bad.as_bytes());
-                assert!(matches!(list_to_ref_1(ctx, &[text]), Err(BeamError::BadArg)));
+                assert!(
+                    matches!(list_to_ref_1(ctx, &[text]), Err(BeamError::BadArg)),
+                    "{bad} must be badarg"
+                );
             }
 
             // A non-pid/non-ref and the `_to_binary` byte equality.
@@ -1081,6 +1113,44 @@ mod tests {
                 bits::bytes(port_to_binary_1(ctx, &[port]).expect("a port")).expect("a binary"),
                 b"#Port<0.3>"
             );
+        });
+    }
+
+    #[test]
+    fn the_ref_id_is_bounded_by_the_oracles_max_reference() {
+        // The C's `refn[0] >= MAX_REFERENCE` check (`bif.c:4777`), with
+        // `MAX_REFERENCE = 1 << _REF_NUM_SIZE = 1 << 18 = 262144`
+        // (`erl_term.h:768,771`). The oracle's bound — not the Milestone-1 ref thing's
+        // 60-bit reach — is what `list_to_ref/1` must enforce, else an id the oracle
+        // can never materialize is fabricated. ORACLE:
+        //   erlang:list_to_ref("#Ref<0.0.0.262143>") => #Ref<0.0.0.262143>
+        //   erlang:list_to_ref("#Ref<0.0.0.262144>") => error:badarg
+        //   erlang:list_to_ref("#Ref<0.0.0.4294967295>") => error:badarg
+        with_ctx(|ctx| {
+            // The last representable ids round-trip with their exact value.
+            for (text, id) in [("#Ref<0.0.0.0>", 0u64), ("#Ref<0.0.0.262143>", 262_143)] {
+                let chars = byte_chars(ctx, text.as_bytes());
+                let reference = list_to_ref_1(ctx, &[chars]).expect("an in-range id");
+                assert_eq!(access::ref_thing_id(reference).expect("a ref thing"), id);
+            }
+            // `id >= MAX_REFERENCE` is `badarg`, never a fabricated reference.
+            for bad in [
+                "#Ref<0.0.0.262144>",
+                "#Ref<0.0.0.262145>",
+                "#Ref<0.0.0.4294967295>",
+                "#Ref<0.0.0.4294967296>",
+                "#Ref<0.0.0.1152921504606846975>",
+            ] {
+                let chars = byte_chars(ctx, bad.as_bytes());
+                assert!(
+                    matches!(list_to_ref_1(ctx, &[chars]), Err(BeamError::BadArg)),
+                    "{bad} must be badarg (id >= MAX_REFERENCE)"
+                );
+            }
+            // Leading-zero padding still normalizes to the small value, as in the C.
+            let padded = byte_chars(ctx, b"#Ref<0.0.0.0000000000000001>");
+            let reference = list_to_ref_1(ctx, &[padded]).expect("an in-range id");
+            assert_eq!(access::ref_thing_id(reference).expect("a ref thing"), 1);
         });
     }
 

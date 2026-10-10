@@ -68,6 +68,16 @@
 //! `case_clause`. Milestone-1 collapses all of these to
 //! [`BeamError::BadArg`](beam_common::BeamError::BadArg) (see the errors section).
 //!
+//! # The `is_function(Fun, Arity)` clause guard
+//!
+//! Every fun-taking `lists.erl` function guards its clause head with
+//! `is_function(Fun, Arity)`, so a **non-fun** or a wrong-arity fun is the bare
+//! `error:function_clause` — raised *before* the list argument is looked at, hence
+//! for every list shape including `[]` (see [`require_fun`]). Two functions guard only
+//! part of their clause set, so a wrong fun there is *not* rejected up front: `sort/2`'s
+//! `[X, Y | T]` clause (a non-fun reaches the call layer as `error:{badfun,5}`) and
+//! `zipwith/3` (only its `([], [])` terminal clause is guarded).
+//!
 //! # `sort/2` and `usort/2` — the ordering fun
 //!
 //! `Fun(A, B)` is the `=<` relation, so it is probed in **both** directions: only
@@ -113,16 +123,48 @@
 //! `[1,1.0]`). `usort/1` removes the *later* of each arithmetically-equal run
 //! (`usort([1.0, 1])` ⇒ `[1.0]`, `usort([1, 1.0])` ⇒ `[1]`).
 //!
-//! # Errors — `function_clause`, `badarg` or `badarith`
+//! # Errors — `function_clause`, `case_clause`, `bad_generator`, `badarg` or `badarith`
 //!
-//! The oracle distinguishes *argument* failures (`badarg` — e.g.
-//! `lists:member(x, [a|b])`, `keysort(1, [b,c])`) from *no-clause* failures
-//! (`error:function_clause` — e.g. `lists:nth(3, [a,b])`, `lists:last([])`,
-//! `lists:zip([1], [2,3])`, `lists:nthtail(5, [1,2])`, `lists:sublist([1],0,1)`),
-//! and this module reproduces both: a no-clause failure is the `function_clause`
-//! constructor in `crate::error` (class `error`, the bare atom `function_clause` as
-//! the reason — the arguments travel in the stacktrace), everything else is
-//! [`BeamError::BadArg`](beam_common::BeamError::BadArg) — never a wrong result.
+//! The oracle distinguishes three *shape* failures of the list argument, and this
+//! module reproduces each one exactly (every case below was probed against the
+//! OTP 29 / erts-17.1 oracle):
+//!
+//! * `error:function_clause` — the clause-set itself rejects the argument (the
+//!   function matches `[Hd | Tail]`/`[]` directly, or its recursive worker has no
+//!   clause for a non-list tail): `reverse/1` (`reverse(a)`, `reverse([1|2])`),
+//!   `map/2`, `foldl/3`, `all/2` and `any/2` (an *improper* tail), `foldr/3`,
+//!   `foreach/2`, `flatmap/2`, `sort/1,2`, `usort/1,2`, `keysort/2` (an improper tail
+//!   past the first two elements), `keymap/3` (a non-list, an improper tail, or a
+//!   non-positive `Index` on an **empty** list), `zip/2`, `zipwith/3`, `partition/2`,
+//!   `takewhile/2`, `dropwhile/2`, `splitwith/2`, `mapfoldl/3`, `mapfoldr/3`, and the
+//!   clause-checked scanners `sublist/2,3`, `last/1`, `nth/2`, `nthtail/2`, `sum/1`,
+//!   `max/1`, `min/1`, `delete/2`, `flatten/1,2`, `append/1`, `duplicate/2`;
+//! * `error:{case_clause, V}` — the walk `case`s the **whole** argument up front
+//!   (`map/2` as a *non-list*, `foldl/3`, `all/2`, `any/2`) or clause-matches it
+//!   against `[]`/`[_]`/`[X, Y | T]` (`keysort/2`), so a non-list — or, for
+//!   `keysort/2`, a cons whose tail is not a list — raises `{case_clause, V}` with
+//!   `V` the argument itself;
+//! * `error:{bad_generator, V}` — `filter/2` is a list comprehension, whose
+//!   generator reports the value it cannot iterate: the whole argument for a
+//!   non-list, the non-list **remainder** for an improper list
+//!   (`lists:filter(P, [1|2])` ⇒ `{bad_generator, 2}`).
+//!
+//! All three walks are **lazy** — they stop at the failure point, so a short-circuiting
+//! predicate (`all(fun(_) -> false end, [1|2])` ⇒ `false`,
+//! `any(fun(_) -> true end, [1|2])` ⇒ `true`) or a raising fun answers *before* an
+//! improper tail is ever reached.
+//!
+//! `case_clause`/`bad_generator` are not predefined emulator atoms, so the tag is
+//! interned through [`BifContext::intern_atom`]: with no `AtomInterner` hook the
+//! structured raise degrades to the bare `badarg` this crate reported before (see
+//! [`crate::error::structured_error`]).
+//!
+//! The `badarg` cases are the *element*-level failures (`keymap/3`'s `element/2`,
+//! `keysort/2`'s key, `append/1`'s non-list element, `flatmap/2`'s non-list fun
+//! result) and every argument-type failure of the five real `bif.tab` BIFs
+//! (`member/2`, `reverse/2`, `keyfind/3`, `keymember/3`, `keysearch/3`) plus the
+//! `++`/`--` operators: a non-list or improper operand there is `badarg` in the C
+//! (`erl_bif_lists.c`), never a no-clause failure.
 //! Arithmetic on a non-number (`sum([a])`) is
 //! [`BeamError::BadArith`](beam_common::BeamError::BadArith). `sum/1` folds with the
 //! `arith` module's exact `+`, so it promotes to a bignum exactly like the oracle; a
@@ -140,15 +182,15 @@
 
 use core::cmp::Ordering;
 
-use beam_common::Result;
+use beam_common::{BeamError, Result};
 use beam_term::compare::{cmp_arith, eq};
 use beam_term::{atom_val, signed_value, AtomTable, Eterm, NIL};
 
 use crate::access::{
-    car, cdr, is_atom, is_list, is_nil, is_small, is_tuple, tuple_element, tuple_size,
+    car, cdr, fun_arity, is_atom, is_list, is_nil, is_small, is_tuple, tuple_element, tuple_size,
 };
 use crate::context::BifContext;
-use crate::error::{function_clause, badarg, system_limit};
+use crate::error::{badarg, function_clause, structured_error, system_limit};
 use crate::print::proper_list;
 use crate::registry::BifRegistry;
 
@@ -175,6 +217,27 @@ fn small_int(t: Eterm) -> Result<i64> {
     }
 }
 
+/// The `error:{case_clause, Value}` raise.
+///
+/// `lists.erl` reads its list argument through a `case … of [Hd | Tail] -> …;
+/// [] -> … end` in `map/2`, `foldl/3`, `all/2` and `any/2` (and matches it against
+/// `[]`/`[_]`/`[X, Y | T]` in `keysort/2`), so a non-list that matches **no** clause
+/// raises the reason tuple carrying the argument itself — never a bare `badarg`.
+/// The tag atom is interned through [`BifContext::intern_atom`]; when it cannot be
+/// named (no `AtomInterner` hook) [`structured_error`] degrades to `badarg`.
+fn case_clause(ctx: &mut BifContext<'_>, value: Eterm) -> Result<BeamError> {
+    structured_error(ctx, "case_clause", &[value])
+}
+
+/// The `error:{bad_generator, Value}` raise of a list comprehension.
+///
+/// `lists:filter/2` is `[E || E <- List, Pred(E)]`, whose generator reports the
+/// value it could not iterate: the **whole** argument when that is not a list, and
+/// the non-list **remainder** when the walk runs off an improper tail
+/// (`filter(P, [1|2])` ⇒ `{bad_generator, 2}`).
+fn bad_generator(ctx: &mut BifContext<'_>, value: Eterm) -> Result<BeamError> {
+    structured_error(ctx, "bad_generator", &[value])
+}
 /// Like [`small_int`], but a non-integer argument is the oracle's
 /// `function_clause` (`nth`/`nthtail`/`sublist`/`seq`/`duplicate`/`keysort`
 /// have no clause for a non-integer index or length).
@@ -222,13 +285,16 @@ fn sort_by_arith(atoms: &AtomTable, elems: &[Eterm]) -> Vec<Eterm> {
 // Helpers for the `fun`-taking functions (the `FunCaller` seam)
 // ---------------------------------------------------------------------------
 
-/// The boolean value of a `true`/`false` **atom**, else `badarg`.
+/// The boolean value of a `true`/`false` **atom**, else the oracle's
+/// `error:{case_clause, Value}`.
 ///
 /// Every predicate read in this module goes through `case Pred(E) of true -> …;
-/// false -> … end`, so a non-boolean result is an error rather than a truthy value
-/// (the oracle reports `case_clause` or `{bad_filter, E}`; Milestone-1 reports
-/// `badarg` — see the module docs).
-fn boolean_result(ctx: &BifContext<'_>, result: Eterm) -> Result<bool> {
+/// false -> … end`, so a non-boolean result is an error rather than a truthy value,
+/// and the oracle's reason carries the offending value: `lists:all(fun(X) -> X end,
+/// [1,2,3])` ⇒ `error:{case_clause,1}` (also `any/2`, `partition/2`, `takewhile/2`,
+/// `dropwhile/2`, `splitwith/2`, `sort/2`, `usort/2`). [`structured_error`] degrades
+/// to a plain `badarg` when the `case_clause` atom cannot be interned.
+fn boolean_result(ctx: &mut BifContext<'_>, result: Eterm) -> Result<bool> {
     if is_atom(result) {
         match ctx.atoms().name(atom_val(result)) {
             Some("true") => return Ok(true),
@@ -236,13 +302,62 @@ fn boolean_result(ctx: &BifContext<'_>, result: Eterm) -> Result<bool> {
             _ => {}
         }
     }
-    Err(badarg())
+    Err(case_clause(ctx, result)?)
 }
 
 /// Calls the predicate `fun` on `args` and reads its boolean result.
 fn call_predicate(ctx: &mut BifContext<'_>, fun: Eterm, args: &[Eterm]) -> Result<bool> {
     let result = ctx.call_fun(fun, args)?;
     boolean_result(ctx, result)
+}
+
+/// `lists:filter/2`'s predicate read: the oracle's comprehension reports a
+/// non-boolean filter as the *structured* `error:{bad_filter, Value}` (probed:
+/// `lists:filter(fun(X) -> X end, [1,2,3])` ⇒ `error:{bad_filter,1}`), not the
+/// `{case_clause, …}` the `case`-based callers raise.
+fn call_filter_predicate(ctx: &mut BifContext<'_>, fun: Eterm, elem: Eterm) -> Result<bool> {
+    let result = ctx.call_fun(fun, &[elem])?;
+    if is_atom(result) {
+        match ctx.atoms().name(atom_val(result)) {
+            Some("true") => return Ok(true),
+            Some("false") => return Ok(false),
+            _ => {}
+        }
+    }
+    Err(structured_error(ctx, "bad_filter", &[result])?)
+}
+
+/// The `is_function(Fun, Arity)` guard every `fun`-taking `lists.erl` function
+/// carries.
+///
+/// A wrong fun is a **guard** failure, so the oracle raises
+/// `error:function_clause` *before* the list is walked — even for an empty list the
+/// fun would never be called on. Probed `error:function_clause` (non-fun `5`, or a
+/// fun of the wrong arity, for every list shape `[]` / `[1]` / a non-list):
+/// `lists:map(5, [])`, `lists:map(5, [1])`, `lists:filter(5, [])`,
+/// `lists:foldl(5, 0, [])`, `lists:foldr(5, 0, [])`, `lists:foreach(5, [])`,
+/// `lists:all(5, [])`, `lists:any(5, [])`, `lists:flatmap(5, [])`,
+/// `lists:takewhile(5, [])`, `lists:dropwhile(5, [])`, `lists:splitwith(5, [])`,
+/// `lists:partition(5, [])`, `lists:mapfoldl(5, 0, [])`, `lists:mapfoldr(5, 0, [])`,
+/// `lists:usort(5, [])`, `lists:sort(5, [])`, `lists:sort(5, [1])`,
+/// `lists:sort(fun(A) -> A end, [])`, `lists:zipwith(5, [], [])`.
+///
+/// Two functions guard only part of their clause set, so a wrong fun is **not**
+/// rejected up front and the guard must not be applied at their entry (see the
+/// per-function notes):
+/// * `lists:sort/2`'s `[X, Y | T]` clause is unguarded — `lists:sort(5, [1,2])`
+///   reaches the *call* layer and is `error:{badfun,5}` (a wrong-arity fun is
+///   `error:{badarity, …}`), not `function_clause`; only the `[]`/`[_]` clauses
+///   carry the guard.
+/// * `lists:zipwith/3` guards only its `([], [])` terminal clause —
+///   `lists:zipwith(5, [1], [2])` is `error:{badfun,5}`, while a length mismatch
+///   (`lists:zipwith(5, [], [1])`, `lists:zipwith(5, [1,2], [])`) fails its own
+///   clause set and is `function_clause` regardless of the fun.
+fn require_fun(fun: Eterm, arity: u32) -> Result<()> {
+    match fun_arity(fun) {
+        Some(n) if n == arity => Ok(()),
+        _ => Err(function_clause()),
+    }
 }
 
 /// The `Fun(A, B)` ordering of two elements for `sort/2`/`usort/2`.
@@ -397,9 +512,39 @@ fn member(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 // ---------------------------------------------------------------------------
 
 /// `reverse(List)` — a new list with the elements of `List` in reverse order.
+///
+/// # Errors
+///
+/// `lists.erl` implements `reverse/1` as four clauses — `[]`, `[_]`, `[A, B]` and
+/// `[A, B | L]` — so a **non-list** and a single-element *improper* list both match
+/// no clause and raise `error:function_clause` (`lists:reverse(a)`,
+/// `lists:reverse([1|2])`), whereas from two elements on the `[A, B | L]` clause
+/// hands its `L` to the `reverse/2` BIF, which requires a proper list and is
+/// therefore `badarg` (`lists:reverse([1,2|3])`). Both were probed against the
+/// oracle.
 fn reverse1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let elems = proper_list(args[0]).ok_or_else(badarg)?;
-    reverse_with_tail(ctx, &elems, NIL)
+    let list = args[0];
+    if is_nil(list) {
+        return Ok(NIL);
+    }
+    if !is_list(list) {
+        return Err(function_clause());
+    }
+    let tail = cdr(list);
+    if !is_nil(tail) && !is_list(tail) {
+        // `[X | non-list]` with a *non-empty* non-list tail matches neither `[_]`
+        // nor `[A, B | L]`; a `NIL` tail is exactly `[_]`, handled just below.
+        return Err(function_clause());
+    }
+    if is_nil(tail) {
+        // `reverse([_] = L) -> L` — the single element is never even inspected.
+        return Ok(list);
+    }
+    // `[A, B | L]` -> `lists:reverse(L, [B, A])`; the `reverse/2` BIF rejects an
+    // improper `L` with `badarg`.
+    let elems = proper_list(cdr(tail)).ok_or_else(badarg)?;
+    let pair = build_list(ctx, &[car(tail), car(list)], NIL)?;
+    reverse_with_tail(ctx, &elems, pair)
 }
 
 /// `reverse(List1, Tail)` — `List1` reversed with the arbitrary `Tail` appended.
@@ -496,7 +641,7 @@ fn keysearch(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         list = cdr(list);
         if is_tuple(elem) && pos <= tuple_size(elem) {
             if cmp_arith(key, tuple_element(elem, pos - 1), ctx.atoms()) == Ordering::Equal {
-                let tag = ctx.atom("value")?;
+                let tag = ctx.intern_atom("value")?;
                 return ctx.tuple(&[tag, elem]);
             }
         }
@@ -971,9 +1116,19 @@ fn key_element(term: Eterm, n: usize) -> Result<Eterm> {
 
 /// `keysort(N, TupleList)` — a stable sort on the `N`th element of each tuple.
 ///
-/// Lists of fewer than two elements are returned unchanged *without* touching a
-/// key (so `keysort(2, [{b}])` ⇒ `[{b}]`), matching `lists.erl`'s single-element
-/// shortcut.
+/// `lists.erl` clause-matches the list as `[]`/`[_]`/`[X, Y | T]`: lists of fewer
+/// than two elements are returned unchanged *without* touching a key (so
+/// `keysort(2, [{b}])` ⇒ `[{b}]`, and even an out-of-range `N` is accepted), while
+/// anything else — a non-list, or a cons whose tail is not a list
+/// (`keysort(1, [1|2])`) — matches no clause and raises `{case_clause, List}`.
+///
+/// # Errors
+///
+/// `function_clause` for a non-integer or non-positive `N` (the guard) and for an
+/// improper tail **past** the first two elements (probed: `keysort(1, [{2,b},{1,a}|3])`
+/// ⇒ `function_clause`, the `keysplit_1`/`keysort_1` workers running out of clause);
+/// `{case_clause, List}` for a non-list or a one-element-with-bad-tail list;
+/// `badarg` for an element that is not a tuple or is shorter than `N` (`element/2`).
 fn keysort(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let index = small_int_clause(args[0])?;
     if index < 1 {
@@ -981,13 +1136,34 @@ fn keysort(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     }
     let index = index as usize;
     let list = args[1];
-    let elems = proper_list(list).ok_or_else(badarg)?;
-    if elems.len() < 2 {
-        return Ok(list);
+    if is_nil(list) {
+        return Ok(list); // `[] -> L`
     }
-    let mut keys = Vec::with_capacity(elems.len());
-    for &elem in &elems {
+    if !is_list(list) {
+        return Err(case_clause(ctx, list)?);
+    }
+    let tail = cdr(list);
+    if !is_nil(tail) && !is_list(tail) {
+        // `[X | non-list]` with a *non-empty* non-list tail matches neither `[_]`
+        // nor `[X, Y | T]`; a `NIL` tail is exactly `[_]`, handled just below.
+        return Err(case_clause(ctx, list)?);
+    }
+    if is_nil(tail) {
+        return Ok(list); // `[_] -> L` — no key access at all
+    }
+    // `[X, Y | T]`: `element/2` applies to each element in order, and a non-list
+    // tail has no worker clause.
+    let mut elems = Vec::new();
+    let mut keys = Vec::new();
+    let mut cur = list;
+    while is_list(cur) {
+        let elem = car(cur);
         keys.push(key_element(elem, index)?);
+        elems.push(elem);
+        cur = cdr(cur);
+    }
+    if !is_nil(cur) {
+        return Err(function_clause());
     }
     let sorted = {
         let atoms = ctx.atoms();
@@ -1073,17 +1249,37 @@ fn unzip(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `map(Fun, List)` — `Fun` applied to every element, left to right.
 ///
+/// `lists.erl` reads the argument through `case List of [Hd | Tail] -> …; [] -> … end`
+/// and hands the tail to the `map_1/2` worker, so the walk is **lazy** — `Fun` runs on
+/// the elements *before* the failure and the reason depends on *where* the argument
+/// stopped being a list.
+///
 /// # Errors
 ///
-/// `badarg` when `List` is not a proper list (the oracle raises `case_clause` for a
-/// non-list and `function_clause` for an improper tail); otherwise propagates
-/// whatever `Fun` raises through [`BifContext::call_fun`].
+/// `error:{case_clause, List}` when `List` matches neither clause of the outer `case`
+/// (probed: `lists:map(F, a)` ⇒ `{case_clause, a}`); `error:function_clause` when an
+/// **improper** tail is actually reached (`map_1/2` has no clause for a non-list tail;
+/// probed `lists:map(F, [1|2])` ⇒ `function_clause`); otherwise propagates whatever
+/// `Fun` raises through [`BifContext::call_fun`].
 fn map2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
-    let elems = proper_list(args[1]).ok_or_else(badarg)?;
-    let mut mapped = Vec::with_capacity(elems.len());
-    for elem in elems {
+    let list = args[1];
+    // `map(F, List) when is_function(F, 1)`.
+    require_fun(fun, 1)?;
+    if !is_nil(list) && !is_list(list) {
+        // `case List of [Hd | Tail] -> …; [] -> … end` matches neither clause.
+        return Err(case_clause(ctx, list)?);
+    }
+    let mut mapped = Vec::new();
+    let mut cur = list;
+    while is_list(cur) {
+        let elem = car(cur);
         mapped.push(ctx.call_fun(fun, &[elem])?);
+        cur = cdr(cur);
+    }
+    if !is_nil(cur) {
+        // The `map_1/2` worker has no clause for a non-list tail.
+        return Err(function_clause());
     }
     build_list(ctx, &mapped, NIL)
 }
@@ -1091,6 +1287,8 @@ fn map2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `foreach(Fun, List)` — `Fun` called for its side effects, left to right; `ok`.
 fn foreach2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
+    // `foreach(F, List) when is_function(F, 1)`.
+    require_fun(fun, 1)?;
     let elems = proper_list(args[1]).ok_or_else(function_clause)?;
     for elem in elems {
         ctx.call_fun(fun, &[elem])?;
@@ -1099,24 +1297,68 @@ fn foreach2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 }
 
 /// `filter(Pred, List)` — the elements for which `Pred` returns `true`, in order.
+///
+/// `lists.erl` is a list comprehension (`[E || E <- List, Pred(E)]`), so the failure is
+/// the **generator's** and it reports the value it could not iterate — the whole
+/// argument for a non-list, the non-list **remainder** for an improper list.
+///
+/// # Errors
+///
+/// `error:{bad_generator, V}` with `V` the whole argument when it is not a list
+/// (probed: `filter(P, a)` ⇒ `{bad_generator, a}`) and the non-list remainder when the
+/// walk runs off an improper tail (probed: `filter(P, [1|2])` ⇒ `{bad_generator, 2}`,
+/// `filter(P, [1,2|3])` ⇒ `{bad_generator, 3}`). A **non-boolean** `Pred` result stays
+/// `badarg`, and any other `Pred` failure propagates untouched.
 fn filter2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
-    let elems = proper_list(args[1]).ok_or_else(badarg)?;
+    // `filter(Pred, List) when is_function(Pred, 1)`.
+    require_fun(fun, 1)?;
     let mut kept = Vec::new();
-    for elem in elems {
-        if call_predicate(ctx, fun, &[elem])? {
+    let mut cur = args[1];
+    loop {
+        if is_nil(cur) {
+            break;
+        }
+        if !is_list(cur) {
+            // The comprehension generator reports the value it cannot iterate.
+            return Err(bad_generator(ctx, cur)?);
+        }
+        let elem = car(cur);
+        if call_filter_predicate(ctx, fun, elem)? {
             kept.push(elem);
         }
+        cur = cdr(cur);
     }
     build_list(ctx, &kept, NIL)
 }
 
 /// `foldl(Fun, Acc0, List)` — `Acc = Fun(Elem, Acc)`, left to right.
+///
+/// # Errors
+///
+/// `error:{case_clause, List}` for a non-list (`foldl/3`'s own `case`) and
+/// `error:function_clause` for an improper tail the `foldl_1/3` worker reaches; the
+/// accumulator built from the elements before the failure is discarded. Propagates
+/// whatever `Fun` raises.
 fn foldl3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
+    // `foldl(F, Accu, List) when is_function(F, 2)`.
+    require_fun(fun, 2)?;
     let mut acc = args[1];
-    for elem in proper_list(args[2]).ok_or_else(badarg)? {
+    let list = args[2];
+    if !is_nil(list) && !is_list(list) {
+        // `case List of [Hd | Tail] -> …; [] -> … end` matches neither clause.
+        return Err(case_clause(ctx, list)?);
+    }
+    let mut cur = list;
+    while is_list(cur) {
+        let elem = car(cur);
         acc = ctx.call_fun(fun, &[elem, acc])?;
+        cur = cdr(cur);
+    }
+    if !is_nil(cur) {
+        // The `foldl_1/3` worker has no clause for a non-list tail.
+        return Err(function_clause());
     }
     Ok(acc)
 }
@@ -1124,6 +1366,8 @@ fn foldl3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `foldr(Fun, Acc0, List)` — `Acc = Fun(Elem, Acc)`, **right to left**.
 fn foldr3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
+    // `foldr(F, Accu, List) when is_function(F, 2)`.
+    require_fun(fun, 2)?;
     let mut acc = args[1];
     for &elem in proper_list(args[2]).ok_or_else(function_clause)?.iter().rev() {
         acc = ctx.call_fun(fun, &[elem, acc])?;
@@ -1133,12 +1377,28 @@ fn foldr3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `all(Pred, List)` — whether `Pred` holds for every element.
 ///
-/// **Short-circuits**: the first `false` decides and no further element is visited.
-/// The walk is lazy for the same reason, so — like `all/2` in `lists.erl` — it can
-/// answer before an improper tail is ever reached.
+/// **Short-circuits**: the first `false` decides and no further element is visited, so
+/// — like `all/2` in `lists.erl` — it can answer *before* an improper tail is ever
+/// reached (probed: `lists:all(fun(_) -> false end, [1|2])` ⇒ `false`).
+///
+/// # Errors
+///
+/// `error:{case_clause, List}` when `List` matches neither clause of `all/2`'s own
+/// `case` (probed: `lists:all(P, a)` ⇒ `{case_clause, a}`); `error:function_clause`
+/// for an improper tail the `all_1/2` worker actually reaches (probed:
+/// `lists:all(fun(_) -> true end, [1|2])` ⇒ `function_clause`). A non-boolean `Pred`
+/// result stays `badarg`.
 fn all2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
-    let mut cur = args[1];
+    let list = args[1];
+    // `all(Pred, List) when is_function(Pred, 1)` — the guard runs *before* the
+    // `case List of … end`, so a wrong fun is `function_clause` even for a non-list.
+    require_fun(fun, 1)?;
+    if !is_nil(list) && !is_list(list) {
+        // `case List of [Hd | Tail] -> …; [] -> true end` matches neither clause.
+        return Err(case_clause(ctx, list)?);
+    }
+    let mut cur = list;
     while is_list(cur) {
         let elem = car(cur);
         if !call_predicate(ctx, fun, &[elem])? {
@@ -1147,17 +1407,35 @@ fn all2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         cur = cdr(cur);
     }
     if !is_nil(cur) {
-        return Err(badarg());
+        // The `all_1/2` worker has no clause for a non-list tail.
+        return Err(function_clause());
     }
     ctx.boolean(true)
 }
 
 /// `any(Pred, List)` — whether `Pred` holds for some element.
 ///
-/// **Short-circuits**: the first `true` decides and no further element is visited.
+/// **Short-circuits**: the first `true` decides and no further element is visited, so
+/// — like `any/2` in `lists.erl` — it can answer *before* an improper tail is ever
+/// reached (probed: `lists:any(fun(_) -> true end, [1|2])` ⇒ `true`).
+///
+/// # Errors
+///
+/// `error:{case_clause, List}` when `List` matches neither clause of `any/2`'s own
+/// `case` (probed: `lists:any(P, a)` ⇒ `{case_clause, a}`); `error:function_clause`
+/// for an improper tail the `any_1/2` worker actually reaches (probed:
+/// `lists:any(fun(_) -> false end, [1|2])` ⇒ `function_clause`). A non-boolean `Pred`
+/// result stays `badarg`.
 fn any2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
-    let mut cur = args[1];
+    let list = args[1];
+    // `any(Pred, List) when is_function(Pred, 1)` — same ordering as `all/2`.
+    require_fun(fun, 1)?;
+    if !is_nil(list) && !is_list(list) {
+        // `case List of [Hd | Tail] -> …; [] -> false end` matches neither clause.
+        return Err(case_clause(ctx, list)?);
+    }
+    let mut cur = list;
     while is_list(cur) {
         let elem = car(cur);
         if call_predicate(ctx, fun, &[elem])? {
@@ -1166,7 +1444,8 @@ fn any2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         cur = cdr(cur);
     }
     if !is_nil(cur) {
-        return Err(badarg());
+        // The `any_1/2` worker has no clause for a non-list tail.
+        return Err(function_clause());
     }
     ctx.boolean(false)
 }
@@ -1180,6 +1459,8 @@ fn any2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// not a proper list (`List ++ Rest` is `badarg` in the oracle).
 fn flatmap2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
+    // `flatmap(Fun, List) when is_function(Fun, 1)`.
+    require_fun(fun, 1)?;
     let elems = proper_list(args[1]).ok_or_else(function_clause)?;
     let mut flat: Vec<Eterm> = Vec::new();
     for elem in elems {
@@ -1192,6 +1473,8 @@ fn flatmap2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `takewhile(Pred, List)` — the longest prefix whose elements satisfy `Pred`.
 fn takewhile2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    // `takewhile(Pred, List) when is_function(Pred, 1)`.
+    require_fun(args[0], 1)?;
     let (taken, _rest) = take_while_prefix(ctx, args[0], args[1])?;
     build_list(ctx, &taken, NIL)
 }
@@ -1199,6 +1482,8 @@ fn takewhile2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `dropwhile(Pred, List)` — `List` with its longest `Pred`-satisfying prefix
 /// removed (the remainder is returned as-is, sharing its tail).
 fn dropwhile2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    // `dropwhile(Pred, List) when is_function(Pred, 1)`.
+    require_fun(args[0], 1)?;
     let (_taken, rest) = take_while_prefix(ctx, args[0], args[1])?;
     Ok(rest)
 }
@@ -1206,6 +1491,8 @@ fn dropwhile2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `partition(Pred, List)` — `{Satisfied, NotSatisfied}`, both order-preserving.
 fn partition2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
+    // `partition(Pred, L) when is_function(Pred, 1)`.
+    require_fun(fun, 1)?;
     let elems = proper_list(args[1]).ok_or_else(function_clause)?;
     let mut satisfied = Vec::new();
     let mut not_satisfied = Vec::new();
@@ -1224,6 +1511,8 @@ fn partition2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `splitwith(Pred, List)` — `{takewhile(Pred, List), dropwhile(Pred, List)}` in a
 /// single pass (`splitwith_1`).
 fn splitwith2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    // `splitwith(Pred, List) when is_function(Pred, 1)`.
+    require_fun(args[0], 1)?;
     let (taken, rest) = take_while_prefix(ctx, args[0], args[1])?;
     let taken = build_list(ctx, &taken, NIL)?;
     ctx.tuple(&[taken, rest])
@@ -1233,6 +1522,8 @@ fn splitwith2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// applied left to right; the mapped values are in element order.
 fn mapfoldl3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
+    // `mapfoldl(Fun, Acc0, List) when is_function(Fun, 2)`.
+    require_fun(fun, 2)?;
     let mut acc = args[1];
     let elems = proper_list(args[2]).ok_or_else(function_clause)?;
     let mut mapped = Vec::with_capacity(elems.len());
@@ -1250,6 +1541,8 @@ fn mapfoldl3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// (`mapfoldr_1` conses without reversing its accumulator).
 fn mapfoldr3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
+    // `mapfoldr(Fun, Acc0, List) when is_function(Fun, 2)`.
+    require_fun(fun, 2)?;
     let mut acc = args[1];
     let elems = proper_list(args[2]).ok_or_else(function_clause)?;
     let mut mapped = vec![NIL; elems.len()];
@@ -1269,6 +1562,11 @@ fn mapfoldr3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// a length mismatch, so `zipwith(F, [1,2,3], [10,20])` raises `function_clause`
 /// exactly like `zip/2`. The `trim`/`{pad, …}` behaviours live in `zipwith/4`, which
 /// this module does not register.
+///
+/// The `is_function(F, 2)` guard sits on the **`([], [])` terminal clause only**
+/// (probed: `lists:zipwith(5, [], [])` ⇒ `function_clause`, while
+/// `lists:zipwith(5, [1], [2])` reaches the call layer and is `error:{badfun,5}`),
+/// so the non-empty walk must **not** pre-check the fun.
 fn zipwith3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
     let mut left = args[1];
@@ -1281,7 +1579,11 @@ fn zipwith3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
                 left = cdr(left);
                 right = cdr(right);
             }
-            (false, false) if is_nil(left) && is_nil(right) => break,
+            (false, false) if is_nil(left) && is_nil(right) => {
+                // `zipwith(F, [], [], fail) when is_function(F, 2)`.
+                require_fun(fun, 2)?;
+                break;
+            }
             _ => return Err(function_clause()),
         }
     }
@@ -1289,9 +1591,17 @@ fn zipwith3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 }
 
 /// `sort(Fun, List)` — a **stable** sort in the `Fun` (`=<`) order.
+///
+/// Only the `[]`/`[_]` clauses carry `when is_function(Fun, 2)`; the `[X, Y | T]`
+/// clause does **not**, so a wrong fun is a guard failure just for a list of fewer
+/// than two elements (probed: `lists:sort(5, [])`/`lists:sort(5, [1])` ⇒
+/// `error:function_clause`, `lists:sort(5, [1,2])` ⇒ `error:{badfun,5}`).
 fn sort2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
     let elems = proper_list(args[1]).ok_or_else(function_clause)?;
+    if elems.len() < 2 {
+        require_fun(fun, 2)?;
+    }
     let sorted = merge_sort_elems(elems, |a, b| fun_order(ctx, fun, a, b))?;
     ctx.list(&sorted)
 }
@@ -1314,6 +1624,9 @@ fn sort2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// prepending are held *reversed* so the prepend is a `push`.
 fn usort2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
+    // Every `usort/2` clause carries `when is_function(Fun, 2)` (probed for `[]`,
+    // `[1]` and `[1,2]` ⇒ `error:function_clause`).
+    require_fun(fun, 2)?;
     let elems = proper_list(args[1]).ok_or_else(function_clause)?;
     let sorted = usort_1_entry(ctx, fun, &elems)?;
     ctx.list(&sorted)
@@ -1698,26 +2011,60 @@ fn rufmerge2_1(
 /// `keymap(Fun, Index, TupleList)` — `Fun` applied to the `Index`th element of
 /// every tuple, the result replacing it.
 ///
+/// `lists.erl` has exactly two clauses — `keymap(Fun, Index, [Tup | Tail])` (no guard)
+/// and `keymap(Fun, Index, []) when is_integer(Index), Index >= 1, is_function(Fun,1)`
+/// — so the argument shape decides between a no-clause failure and `element/2`'s
+/// explicit `badarg`.
+///
 /// # Errors
 ///
-/// `badarg` when `TupleList` is not a proper list, or an element is not a tuple
-/// with at least `Index` elements (`element/2` runs *before* `Fun`, so the fun is
-/// never called for such an element), or `Index` is not a small integer `>= 1`.
+/// `error:function_clause` when the argument is not a list at all, when the walk runs
+/// off an improper tail, or when the **empty-list** clause's guard fails — `Index` is
+/// not an integer `>= 1`, or `Fun` is not a fun of arity 1 (probed: `keymap(F,1,a)`
+/// ⇒ `function_clause`, `keymap(F,1,{a,b})` ⇒ `function_clause`,
+/// `keymap(F,1,[{a,b}|2])` ⇒ `function_clause`, `keymap(F,0,[])` ⇒
+/// `function_clause`, `keymap(non_fun,1,[])` ⇒ `function_clause`,
+/// `keymap(fun(_,_) -> 0 end,1,[])` ⇒ `function_clause`). `badarg` when `element/2`
+/// rejects the element it is handed — a non-tuple, a tuple shorter than `Index`, or a
+/// non-integer/out-of-range `Index` on a **non-empty** list (probed:
+/// `keymap(F,1,[a,b])` ⇒ `badarg`, `keymap(F,2,[{a}])` ⇒ `badarg`,
+/// `keymap(F,0,[{a,b}])` ⇒ `badarg`). `element/2` runs *before* `Fun`, so the fun is
+/// never called for such an element.
 fn keymap3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
-    let index = small_int(args[1])?;
-    if index < 1 {
-        return Err(badarg());
+    let index_term = args[1];
+    let mut mapped = Vec::new();
+    let mut cur = args[2];
+    while is_list(cur) {
+        let elem = car(cur);
+        // `element(Index, Tup)` — its own `badarg`, and it comes first.
+        let index = match small_int(index_term) {
+            Ok(index) if index >= 1 && is_tuple(elem) && index as usize <= tuple_size(elem) => {
+                index as usize
+            }
+            _ => return Err(badarg()),
+        };
+        let replaced = ctx.call_fun(fun, &[tuple_element(elem, index - 1)])?;
+        mapped.push(replace_element(ctx, elem, index, replaced)?);
+        cur = cdr(cur);
     }
-    let index = index as usize;
-    let elems = proper_list(args[2]).ok_or_else(function_clause)?;
-    let mut mapped = Vec::with_capacity(elems.len());
-    for elem in elems {
-        if !is_tuple(elem) || index > tuple_size(elem) {
-            return Err(badarg());
-        }
-        let updated = ctx.call_fun(fun, &[tuple_element(elem, index - 1)])?;
-        mapped.push(replace_element(ctx, elem, index, updated)?);
+    if !is_nil(cur) {
+        // Neither clause matches a non-list tail.
+        return Err(function_clause());
+    }
+    // The `[]` clause's guard: `is_integer(Index), Index >= 1, is_function(Fun, 1)`.
+    match small_int(index_term) {
+        Ok(index) if index >= 1 => {}
+        _ => return Err(function_clause()),
+    }
+    // The guard's `is_function(Fun, 1)` conjunct is only reachable via the `[]`
+    // clause: a non-empty list matches the *unguarded* first clause, so its fun is
+    // applied regardless of its fun-ness/arity (a `{badfun, F}`/`{badarity, …}` is
+    // that call's own error, raised through `FunCaller`). `mapped.is_empty()` is
+    // exactly "the argument was `[]`", so the check is inert for every list the
+    // first clause already handled.
+    if mapped.is_empty() && fun_arity(fun) != Some(1) {
+        return Err(function_clause());
     }
     build_list(ctx, &mapped, NIL)
 }
@@ -1861,10 +2208,12 @@ mod tests {
         with_heap(65_536, f)
     }
 
-    /// A mock [`crate::FunCaller`] for the ordering funs of `sort/2`/`usort/2`: the
-    /// "fun" term is a small-integer sentinel naming the *exact* Erlang comparator
-    /// the oracle was probed with. `true`/`false` come from the seeded atom table
-    /// (the runtime's boolean atoms are not at fixed indices).
+    /// A mock [`crate::FunCaller`] for the ordering funs of `sort/2`/`usort/2`: a
+    /// **real** `EXPORT_EXT` fun of arity 2 whose *function-name* atom carries the
+    /// small-integer sentinel naming the *exact* Erlang comparator the oracle was
+    /// probed with (the fun must be a genuine arity-2 fun term so `usort/2`'s
+    /// `is_function(Fun, 2)` clause guard passes). `true`/`false` come from the
+    /// seeded atom table (the runtime's boolean atoms are not at fixed indices).
     struct OrderFuns {
         truth: Eterm,
         falsity: Eterm,
@@ -1881,11 +2230,27 @@ mod tests {
     const ORDER_LT: i64 = 104;
     /// `fun(A, B) -> A > B end` — a non-total strict descending order.
     const ORDER_GT: i64 = 105;
+
+    /// The comparator sentinel `id` as a real arity-2 `EXPORT_EXT` fun term — its
+    /// function-name atom is `Atom::from_raw(id)`, which the mock decodes.
+    fn order_fun(ctx: &mut BifContext<'_>, id: i64) -> Eterm {
+        beam_codec::term::make_fun_external(
+            ctx.heap(),
+            2,
+            beam_term::Atom::from_raw(0),
+            beam_term::Atom::from_raw(id as u32),
+        )
+        .expect("the external fun fits")
+    }
+
     impl crate::FunCaller for OrderFuns {
         fn call_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
             let a = beam_term::signed_value(args[0]);
             let b = beam_term::signed_value(args[1]);
-            let result = match beam_term::signed_value(fun) {
+            let id = beam_codec::term::fun_function(fun)
+                .expect("the mock only ever sees an EXPORT_EXT fun")
+                .raw() as i64;
+            let result = match id {
                 ALWAYS_FALSE => false,
                 ALWAYS_TRUE => true,
                 ORDER_ASC => a <= b,
@@ -1913,8 +2278,8 @@ mod tests {
     /// Calls `usort/2` with the sentinel comparator `id` on `list` and renders the
     /// result with `~w`.
     fn show_usort(ctx: &mut BifContext<'_>, id: i64, list: Eterm) -> String {
-        let args = vec![make_small(id), list];
-        let out = usort2(ctx, &args).expect("usort/2 should succeed");
+        let fun = order_fun(ctx, id);
+        let out = usort2(ctx, &[fun, list]).expect("usort/2 should succeed");
         pretty(ctx, out)
     }
 
@@ -2007,6 +2372,8 @@ mod tests {
         with_ctx(|ctx| {
             show!(ctx, reverse1, [ints(ctx, &[1, 2, 3])], "[3,2,1]");
             show!(ctx, reverse1, [NIL], "[]");
+            // `reverse([_] = L) -> L` — a one-element list comes back untouched.
+            show!(ctx, reverse1, [ints(ctx, &[1])], "[1]");
             show!(ctx, reverse2, [ints(ctx, &[1, 2]), NIL], "[2,1]");
 
             // `reverse([], Tail)` is `Tail` itself — it is never checked to be a list.
@@ -2017,8 +2384,11 @@ mod tests {
             show!(ctx, reverse2, [ints(ctx, &[1, 2]), tuple_tail], "[2,1|{tail}]");
 
             let improper = ctx.cons(make_small(1), ctx.atom("b").unwrap()).unwrap();
-            rejects!(ctx, reverse1, [improper]);
-            rejects!(ctx, reverse1, [ctx.atom("a").unwrap()]);
+            // A non-list and a one-element improper list match none of `reverse/1`'s
+            // four clauses — `error:function_clause` (probed against the oracle).
+            rejects_clause!(ctx, reverse1, [improper]);
+            rejects_clause!(ctx, reverse1, [ctx.atom("a").unwrap()]);
+            // `reverse/2` is the `badarg`-checking BIF.
             rejects!(ctx, reverse2, [improper, NIL]);
             rejects!(ctx, reverse2, [ctx.atom("a").unwrap(), NIL]);
         });
@@ -2784,7 +3154,7 @@ mod tests {
             let improper = ctx
                 .cons(make_small(1), ctx.atom("a").expect("seeded"))
                 .expect("the cons fits");
-            let args = vec![make_small(ORDER_ASC), improper];
+            let args = vec![order_fun(ctx, ORDER_ASC), improper];
             rejects_clause!(ctx, usort2, [args[0], args[1]]);
         });
     }

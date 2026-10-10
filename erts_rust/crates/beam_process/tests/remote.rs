@@ -290,11 +290,12 @@ fn send_exit_term_routes_remote_and_delegates_local() {
         .expect("from is live");
     assert_eq!(
         log.borrow().as_slice(),
-        &[DistSignal::Exit {
+        &[DistSignal::Exit2 {
             from,
             to: rpid,
             reason,
-        }]
+        }],
+        "erlang:exit/2 towards a remote pid routes DOP_EXIT2, not the link exit DOP_EXIT"
     );
 
     // A local target still goes through the local signal path.

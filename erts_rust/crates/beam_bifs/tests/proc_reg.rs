@@ -38,11 +38,12 @@
 //! Every (b) golden carries the system-OTP probe that pinned it (OTP 29.1.1 /
 //! erts-17.1).
 
+use std::cell::RefCell;
 use std::process::Command;
 
 use beam_alloc::Heap;
 use beam_bifs::prelude::*;
-use beam_common::Result;
+use beam_common::{BeamError, Result};
 use beam_process::{PortId, ProcessId};
 use beam_term::{atom_val, is_list, make_atom, make_small, Atom, AtomTable, Eterm, NIL};
 
@@ -1051,4 +1052,93 @@ fn live_oracle_agrees_on_the_inventory_shapes() {
         "true|true|true|true",
         "the live oracle disagrees with the pinned inventory shapes"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The produced `undefined` atom is interned on demand
+// ---------------------------------------------------------------------------
+
+/// An [`AtomInterner`] over its own table, seeded as a **clone** of the context's
+/// so an already-interned name keeps the exact index the context's table spells
+/// (the index coupling [`BifContext::intern_atom`] relies on).
+struct Interner {
+    table: RefCell<AtomTable>,
+}
+
+impl Interner {
+    fn seeded_like(atoms: &AtomTable) -> Interner {
+        Interner {
+            table: RefCell::new(atoms.clone()),
+        }
+    }
+
+    /// The name the interner's table spells for the atom term `term`, if any.
+    fn name_of(&self, term: Eterm) -> Option<String> {
+        self.table.borrow().name(atom_val(term)).map(str::to_string)
+    }
+}
+
+impl AtomInterner for Interner {
+    fn intern(&mut self, name: &str) -> Atom {
+        self.table.borrow_mut().intern(name)
+    }
+}
+
+#[test]
+fn the_produced_undefined_atom_is_interned_on_demand() {
+    // The atom `undefined` is *produced* by this module (the value an unregistered
+    // `whereis/1` name and a dead `process_info/2` process answer), so it is
+    // interned on demand rather than looked up: a runtime whose boot seed lacks it
+    // must not abort with an uncatchable `TermNotFound`.
+    //
+    // ORACLE (erts-17.1): `erlang:whereis(zz_no_such_name_zz)` => `undefined`;
+    //                     `erlang:process_info(<dead pid>, status)` => `undefined`.
+    let reg = default_registry();
+    let mut heap = heap();
+
+    // The inputs only — `undefined` is **deliberately absent**.
+    let mut atoms = AtomTable::new();
+    atoms.seed(["a", "status"]);
+
+    let status = atoms.lookup("status").expect("seeded");
+    let mut hook = StubProcesses::default();
+    // The stub must know the item, or it answers `Unknown` (`badarg`) *before* the
+    // dead-process check; the value itself is irrelevant, the pid is dead.
+    hook.info_items.push((status, StubItemValue::Small(0)));
+    // `hook.alive` stays empty, so every pid is reported dead.
+
+    let mut interner = Interner::seeded_like(&atoms);
+
+    let (missing_name, dead_info) = {
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+            .with_process_hook(&mut hook)
+            .with_atom_interner(&mut interner);
+
+        let name = atom_term(&atoms, "a");
+        let missing =
+            call(&reg, &mut ctx, "erlang", "whereis", 1, &[name]).expect("the hook answers");
+
+        let status = atom_term(&atoms, "status");
+        let dead = ProcessId::new(9, 9).to_eterm();
+        let info = call(&reg, &mut ctx, "erlang", "process_info", 2, &[dead, status])
+            .expect("the hook answers");
+
+        (missing, info)
+    };
+
+    // Both `undefined` values were created on demand: read them back from the
+    // interner's table (where the created atom lives), not the context's.
+    assert_eq!(interner.name_of(missing_name).as_deref(), Some("undefined"));
+    assert_eq!(interner.name_of(dead_info).as_deref(), Some("undefined"));
+
+    // The negative control: with **no** `AtomInterner` installed the produced atom
+    // is the typed `BeamError::TermNotFound`, never a fabricated index.
+    let mut bare_hook = StubProcesses::default();
+    let mut bare = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+        .with_process_hook(&mut bare_hook);
+    let name = atom_term(&atoms, "a");
+    assert!(matches!(
+        call(&reg, &mut bare, "erlang", "whereis", 1, &[name]),
+        Err(BeamError::TermNotFound)
+    ));
 }

@@ -53,7 +53,10 @@
 //! the text phase ([`FdDriver::set_line_mode`], or the `line`/`text` control commands)
 //! frames the stream into lines first (`{line, N}`, see [`crate::drivers::line_buffer`]):
 //! only complete lines reach the port input queue, a line longer than the maximum is
-//! split, and a trailing partial line is released on EOF/`stop`.
+//! split, and a trailing partial line is released on EOF/`stop`. Switching back to the
+//! binary phase ([`FdDriver::set_binary_mode`], or the `binary`/`noline` control commands)
+//! only changes how *subsequent* input is framed — it never discards the bytes the text
+//! phase already buffered, which [`PhaseChange::flush`] still releases on EOF/`stop`.
 //!
 //! Output is **not** line-framed: in the emulator the line flag
 //! (`ERTS_PORT_SFLG_LINEBUF_IO`) affects how a port *delivers* input to its owner, not how
@@ -1089,6 +1092,55 @@ mod tests {
             pump_until_input(&mut poller, &mut registry, id, 7),
             b"partial",
             "EOF flushes the trailing partial line"
+        );
+
+        registry.close(&mut poller, id).expect("closes");
+    }
+
+    #[test]
+    fn a_partial_line_survives_switching_to_binary_and_is_flushed_at_eof() {
+        let (peer, read_end) = UnixStream::pair().expect("socketpair");
+        // SAFETY: `read_end.as_raw_fd()` names an open descriptor of a live stream.
+        let fd = unsafe { libc::dup(read_end.as_raw_fd()) };
+        assert!(fd >= 0, "dup(2) succeeded");
+
+        let mut poller = poller();
+        let mut registry = PortRegistry::new();
+        let id = registry
+            .open(
+                &mut poller,
+                Box::new(FdDriver::read_only(fd).with_line_mode(1024)),
+            )
+            .expect("the port starts");
+
+        let mut writer = &peer;
+        writer.write_all(b"partial").expect("writes");
+        // The partial line is buffered by the text phase and not delivered yet.
+        let events = poller
+            .poll(Some(Duration::from_millis(200)))
+            .expect("poll succeeds");
+        registry
+            .handle_events(&mut poller, &events)
+            .expect("events dispatch");
+        assert!(
+            registry.get_mut(id).expect("live").drain_input().is_empty(),
+            "the partial line stays buffered while the phase is text"
+        );
+
+        // A `binary` control command switches the phase; the bytes already read in the
+        // text phase must not be discarded by that switch…
+        registry
+            .get_mut(id)
+            .expect("live")
+            .control(&mut poller, "binary", b"")
+            .expect("binary");
+
+        // …and EOF must still deliver them (the phase is binary at this point).
+        drop(peer);
+        assert_eq!(
+            pump_until_input(&mut poller, &mut registry, id, 7),
+            b"partial",
+            "the text-phase partial survives the phase switch and is flushed at EOF"
         );
 
         registry.close(&mut poller, id).expect("closes");

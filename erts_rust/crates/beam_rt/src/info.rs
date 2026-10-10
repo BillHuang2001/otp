@@ -44,6 +44,8 @@
 //! | [`limits`] | counts read from this runtime's live tables plus the emulator limits (`atom_count`, `process_count`, `port_limit`, …) |
 //! | [`schedulers`] | processor/scheduler/multi-scheduling keys |
 //! | [`memory`] | GC/heap policy keys, `allocated_areas`, `alloc_util_allocators`, `garbage_collection` |
+//! | [`dist`] | the distribution-state keys `dist` / `dist_ctrl` (answered only in the oracle's non-distributed state) |
+//! | [`time`] | the ERTS monotonic-time interface constants `start_time` / `end_time` |
 //! | [`unsupported`] | the oracle's keys for facilities this runtime does not have — an honest capability gap |
 //!
 //! # Implemented vs unsupported vs badarg
@@ -55,11 +57,11 @@
 //!   runtime's own live tables (`process_count`, `atom_count`, `allocated_areas`, …) and
 //!   are therefore correct-but-smaller than the oracle's run-time figure.
 //! * [`UNSUPPORTED_KEYS`] — the oracle accepts the key but it describes a facility this
-//!   runtime genuinely does not have (a live dist wire state, the time-correction
-//!   service, CPU-topology detection, the C-compiler/3PP identification, the code-loading
-//!   dumps, the logger pid, …). Each returns a raise whose reason atom starts with
-//!   `unsupported` ([`crate::error::unsupported`]) so a `-eval` caller sees the exit-3
-//!   capability gap — **never** a fabricated value or a hardcoded oracle number.
+//!   runtime genuinely does not have (the time-correction service, CPU-topology detection,
+//!   the C-compiler/3PP identification, the code-loading dumps, the logger pid, …). Each
+//!   returns a raise whose reason atom starts with `unsupported`
+//!   ([`crate::error::unsupported`]) so a `-eval` caller sees the exit-3 capability gap —
+//!   **never** a fabricated value or a hardcoded oracle number.
 //! * every other key — `badarg`, exactly what the oracle raises for a key it does not
 //!   accept (`erlang:system_info(nonsense)` ⇒ `error:badarg`).
 //!
@@ -79,11 +81,13 @@ use beam_term::{make_atom, try_make_small, AtomTable, Eterm, NIL};
 use crate::error;
 use crate::runtime::Runtime;
 
+mod dist;
 mod host;
 mod limits;
 mod memory;
 mod schedulers;
 mod system;
+mod time;
 mod unsupported;
 
 // The host-identity helpers (`os_type`, `system_architecture`) live in their own child
@@ -127,6 +131,20 @@ pub const SUPPORTED_KEYS: &[&str] = &[
     "kernel_poll",
     "halt_flush_timeout",
     "creation",
+    // The emulator's own build/implementation flags (see [`system`]).
+    "build_type",
+    "compat_rel",
+    "endian",
+    "eager_check_io",
+    "io_thread",
+    "port_tasks",
+    "lock_checking",
+    "lock_counting",
+    "ets_always_compress",
+    "ets_realloc_moves",
+    "hipe_architecture",
+    "literal_test",
+    "sequential_tracer",
     // -- `limits`: counts and emulator limits (see [`limits`]) --
     "atom_count",
     "atom_limit",
@@ -156,6 +174,15 @@ pub const SUPPORTED_KEYS: &[&str] = &[
     "normal_multi_scheduling_blockers",
     "thread_pool_size",
     "context_reductions",
+    // The scheduler *state*/statistics keys (see [`schedulers`]).
+    "schedulers_total",
+    "schedulers_active",
+    "schedulers_state",
+    "all_schedulers_state",
+    "run_queues",
+    "cpu_quota",
+    "scheduling_statistics",
+    "total_scheduling_statistics",
     // -- `memory`: GC/heap + allocator keys (see [`memory`]) --
     "min_heap_size",
     "min_bin_vheap_size",
@@ -167,6 +194,12 @@ pub const SUPPORTED_KEYS: &[&str] = &[
     "garbage_collection",
     "alloc_util_allocators",
     "allocated_areas",
+    // -- `dist`: the distribution-state keys (see [`dist`]) --
+    "dist",
+    "dist_ctrl",
+    // -- `time`: the ERTS monotonic-time interface constants (see [`time`]) --
+    "start_time",
+    "end_time",
 ];
 
 /// The keys the oracle accepts but this runtime answers with an honest **capability
@@ -179,16 +212,11 @@ pub const SUPPORTED_KEYS: &[&str] = &[
 pub const UNSUPPORTED_KEYS: &[&str] = &[
     // The host C allocator identification (`{glibc, …}`) — no C allocator to identify.
     "allocator",
-    // A live distribution node's wire state.
-    "dist",
-    "dist_ctrl",
     // The time-correction service and its clocks.
     "time_offset",
     "time_correction",
     "time_warp_mode",
     "tolerant_timeofday",
-    "start_time",
-    "end_time",
     "os_monotonic_time_source",
     "os_system_time_source",
     // CPU-topology *detection*, poll-set introspection, C-compiler/3PP identification.
@@ -201,6 +229,22 @@ pub const UNSUPPORTED_KEYS: &[&str] = &[
     "info",
     "procs",
     "loaded",
+    // ERTS *C-emulator internals* with no counterpart in this runtime: the C toolchain's
+    // build flags, the ethread library, the constant-pool/jump-table loader switches, the
+    // static NIF table and its taints, the emulator argument vector, the scheduler
+    // distribution maps, the `BIG_ARITY_MAX` bignum cap and the thread-progress debug dump.
+    "compile_info",
+    "ethread_info",
+    "ethread_used_tse",
+    "constant_pool_support",
+    "beam_jump_table",
+    "snifs",
+    "taints",
+    "emu_args",
+    "reader_groups_map",
+    "decentralized_counter_groups_map",
+    "max_integer",
+    "thread_progress",
 ];
 
 /// The **complete** atom vocabulary of this surface — every name [`system_info_value`]
@@ -309,11 +353,33 @@ pub const INFO_ATOMS: &[&str] = &[
     "disabled",
     "private",
     "on_heap",
+    // `endian` (`little`/`big`, the C's `WORDS_BIGENDIAN`) and `literal_test` (`tag` —
+    // this runtime's literal-area test is a tagged-pointer bit, the C's own word for a
+    // tag-based test; `range`/`range_bitmask` are the range-check variants).
+    "little",
+    "big",
+    "tag",
+    // `sequential_tracer`: the two atoms of `{sequential_tracer,false}` — the system
+    // sequential tracer is the disabled atom `false` when none is installed.
+    "sequential_tracer",
+    // `all_schedulers_state`: the pool names of the `{Pool,Total,Online,Active}` rows
+    // (`am_normal`/`am_dirty_cpu`/`am_dirty_io`, `erl_bif_info.c:3302-3328`).
+    "normal",
+    "dirty_cpu",
+    "dirty_io",
+    // `scheduling_statistics`/`total_scheduling_statistics`: the five priority-level names
+    // of the `{Prio,Executed,Migrated}` rows, in the oracle's order
+    // (`erts_sched_stat_term` over `ERTS_NO_PRIO_LEVELS`).
+    "process_max",
+    "process_high",
+    "process_normal",
+    "process_low",
+    "port",
 ];
 
 /// A `system_info/1` value, independent of any heap.
 ///
-/// The first five variants are the scalar shapes; [`InfoValue::List`],
+/// The first six variants are the scalar shapes; [`InfoValue::List`],
 /// [`InfoValue::Tupled`] and [`InfoValue::Map`] are the generic containers the richer
 /// keys (`alloc_util_allocators`, `allocated_areas`, `{allocator, A}`,
 /// `garbage_collection`, `max_heap_size`) are built from — a `{Key, Value}` row is
@@ -322,7 +388,13 @@ pub const INFO_ATOMS: &[&str] = &[
 /// map-shaped key (`max_heap_size`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InfoValue {
-    /// A small integer (materialized as a small-int immediate).
+    /// A 64-bit signed integer.
+    ///
+    /// Materialized as a small-int immediate when it fits the 60-bit small range and as a
+    /// one-digit bignum otherwise — exactly the C's `make_time_val`
+    /// (`erl_time_sup.c:2133-2146`: `IS_SSMALL(val)` → `make_small`, else
+    /// `erts_sint64_to_big`), which is how the oracle answers `system_info(end_time)`
+    /// (a value outside the small range).
     Int(i64),
     /// A string (materialized as a list of byte-sized small integers, as the oracle does).
     Str(String),
@@ -332,6 +404,13 @@ pub enum InfoValue {
     Bool(bool),
     /// A two-element tuple of atoms, by name.
     Tuple(&'static str, &'static str),
+    /// A byte string (materialized as an on-heap binary).
+    ///
+    /// Distinct from [`InfoValue::Str`], which is an Erlang **string** — a list of
+    /// byte-sized small integers. `Binary` is the shape of `system_info(dist)` (the
+    /// oracle's `=node:…`/`=no_distribution` dump), built through the safe heap writer
+    /// [`beam_codec::term::make_binary`] so this crate stays `unsafe`-free.
+    Binary(Vec<u8>),
     /// A proper list, in order (materialized element by element, head first).
     List(Vec<InfoValue>),
     /// A tuple of arbitrary arity, in order.
@@ -349,15 +428,14 @@ impl InfoValue {
     ///
     /// # Errors
     ///
-    /// * [`BeamError::SystemLimit`] when an [`InfoValue::Int`] does not fit a 60-bit
-    ///   small integer (impossible for the keys of this crate);
     /// * [`BeamError::TermNotFound`] when an atom this value names is not interned in
     ///   `atoms` — never an invented atom. A runtime materializing this crate's keys
     ///   seeds [`INFO_ATOMS`], which covers every atom the surface can emit;
-    /// * the heap's allocation failure for a string, a list, a tuple or a map.
+    /// * the heap's allocation failure for a string, a list, a tuple, a map, a binary or
+    ///   the block of an [`InfoValue::Int`] outside the small range.
     pub fn to_eterm(&self, heap: &mut Heap, atoms: &AtomTable) -> Result<Eterm> {
         match self {
-            InfoValue::Int(value) => try_make_small(*value).map_err(|_| BeamError::SystemLimit),
+            InfoValue::Int(value) => integer_term(heap, *value),
             InfoValue::Str(text) => {
                 let mut list = NIL;
                 for byte in text.bytes().rev() {
@@ -372,6 +450,7 @@ impl InfoValue {
                 let second = atom_term(atoms, second)?;
                 heap.tuple(&[first, second])
             }
+            InfoValue::Binary(bytes) => beam_codec::term::make_binary(heap, bytes),
             InfoValue::List(elements) => {
                 // Materialize the elements first (they may need heap space of their own),
                 // then build the spine, so a nested container cannot be half-written.
@@ -416,6 +495,21 @@ fn atom_term(atoms: &AtomTable, name: &str) -> Result<Eterm> {
         .ok_or(BeamError::TermNotFound)
 }
 
+/// A 64-bit signed integer as a term: a small-int immediate when it fits the 60-bit small
+/// range, else a one-digit bignum.
+///
+/// The C's `make_time_val` (`erl_time_sup.c:2133-2146`) picks between exactly these two
+/// representations (`IS_SSMALL(val)` → `make_small`, else `erts_sint64_to_big`), and
+/// `erts_sint64_to_big` writes one `ErtsDigit` on `ARCH_64` (`big.c:2357-2364`,
+/// `big.h:120-121`), which is what [`beam_codec::term::make_big`] writes for a single
+/// digit. The magnitude comes from `unsigned_abs`, so `i64::MIN` cannot overflow.
+fn integer_term(heap: &mut Heap, value: i64) -> Result<Eterm> {
+    match try_make_small(value) {
+        Ok(small) => Ok(small),
+        Err(_) => beam_codec::term::make_big(heap, value < 0, &[value.unsigned_abs()]),
+    }
+}
+
 /// Computes the `system_info/1` value of `key` against a runtime.
 ///
 /// # Errors
@@ -436,6 +530,12 @@ pub fn system_info_value(key: &str, rt: &Runtime) -> Result<InfoValue> {
         return result;
     }
     if let Some(result) = memory::try_value(key, rt) {
+        return result;
+    }
+    if let Some(result) = dist::try_value(key, rt) {
+        return result;
+    }
+    if let Some(result) = time::try_value(key, rt) {
         return result;
     }
     if let Some(result) = unsupported::try_value(key, rt) {
@@ -675,7 +775,7 @@ mod tests {
         }
         // The surface is the union of the family modules; keep the count pinned so a key
         // dropped from a family is caught.
-        assert_eq!(SUPPORTED_KEYS.len(), 63);
+        assert_eq!(SUPPORTED_KEYS.len(), 88);
         let mut sorted: Vec<&str> = SUPPORTED_KEYS.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
@@ -700,7 +800,7 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), UNSUPPORTED_KEYS.len(), "no duplicate keys");
-        assert_eq!(sorted.len(), 19);
+        assert_eq!(sorted.len(), 27);
     }
 
     #[test]
@@ -816,6 +916,22 @@ mod tests {
             ])
             .expect("the expected tuple fits");
         assert!(eq(tuple, expected, &atoms));
+
+        // A byte string materializes as a **binary** carrying exactly those bytes (this is
+        // the shape of `system_info(dist)`), not as an Erlang string.
+        let payload: &[u8] = b"=node:'nonode@nohost'\n=no_distribution\n";
+        let binary = InfoValue::Binary(payload.to_vec())
+            .to_eterm(&mut heap, &atoms)
+            .expect("binary");
+        let (bytes, offset_bits, size_bits) =
+            beam_codec::term::bitstring_bytes(binary).expect("a bitstring");
+        assert_eq!(offset_bits, 0);
+        assert_eq!(size_bits, payload.len() * 8, "byte-aligned: a binary");
+        assert_eq!(&bytes[..size_bits / 8], payload);
+        // No atom table is needed — a binary carries no atom.
+        assert!(InfoValue::Binary(payload.to_vec())
+            .to_eterm(&mut heap, &AtomTable::new())
+            .is_ok());
     }
 
     #[test]

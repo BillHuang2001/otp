@@ -29,6 +29,10 @@
 //! (`cmp` for the exact operators, `cmp_arith` for the arithmetic/ordinal ones) —
 //! term order is never re-implemented here.
 //!
+//! The evaluation helpers that do not depend on the compiler (the guard BIFs, the
+//! term-class probes and the boolean/atom conversions) live in the sibling
+//! [`guard`] module; this module owns the AST, its decoding and the evaluator.
+//!
 //! # Arithmetic (the [`ArithHook`] seam)
 //!
 //! `+ - * / div rem band bor bxor bsl bsr` are accepted in **both** guards and
@@ -38,13 +42,17 @@
 //! sees exactly what the corresponding Erlang expression worker sees.
 //!
 //! Evaluation goes through the [`ArithHook`] seam rather than a hard-coded
-//! implementation: a runtime with real bignum/float arithmetic installs its own
-//! hook with [`set_arith_hook`], and without one [`DefaultArithHook`] answers.
-//! The default implements **small-integer** arithmetic only, and it never
-//! fabricates a result — a non-small operand (bignum/float), an `i64` overflow, a
-//! result outside the 60-bit small range, or `/` (whose Erlang result is *always* a
-//! float: `4/2` is `2.0`) is the typed `unsupported_ets` raise, and `div`/`rem` by
-//! zero is `badarg` (what the oracle raises).
+//! implementation: a runtime that owns richer arithmetic installs its own hook
+//! with [`set_arith_hook`], and without one [`DefaultArithHook`] answers.
+//! The default implements the **integer** operators exactly and the **float**
+//! operators faithfully (`arith`): a small-integer `+`/`-`/`*` keeps the checked
+//! `i64` path, a **float** operand moves the operation into `f64` (a bignum
+//! converting through `big_to_f64`), and `/` is **always** a float (`1/2` is
+//! `0.5`, `4/2` is `2.0`). It never fabricates a result — a bignum operand on an
+//! integer operator, an `i64` overflow, and a result outside the 60-bit small
+//! range are the typed `unsupported_ets` raise, a float overflow to `±inf`/`NaN`
+//! is refused, and `div`/`rem` by zero, a zero `/` divisor and a non-number
+//! operand are `badarg` (what the oracle raises).
 //!
 //! Shift operators follow the C `erts_shift`
 //! (`../../erts/emulator/beam/erl_arith.c:196-247`) exactly over the small-integer
@@ -58,17 +66,38 @@
 //! Like every other guard construct, arithmetic that raises inside a **guard**
 //! makes its clause fail and is skipped by the caller; the body path is the
 //! executor's (`select/exec.rs`).
+//!
+//! # `self/0` (the [`SelfHook`] seam)
+//!
+//! `self/0` has no process identity at the ETS layer. The seam mirrors
+//! [`ArithHook`]: a runtime that knows the calling process installs its own
+//! [`SelfHook`] with [`set_self_hook`], and without one the default answers the
+//! typed `badarg`, so a `self/0` guard clause is skipped exactly as before.
+//!
+//! # The extended guard BIFs
+//!
+//! `ceil/1`, `floor/1`, `max/2`, `min/2`, `binary_part/2,3`, `is_record/3`,
+//! `is_function/2`, `is_integer/3`, `node/0,1`, `xor/2` and `bnot/1` decode to
+//! their own [`Expr`] variants here and are evaluated by [`guard`] — mirroring the
+//! same `guard_tab` dispatch, with a typed error (never a fabricated answer) for
+//! every operand outside the implemented subset.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use beam_alloc::Heap;
-use beam_common::{BeamError, Result};
+use beam_common::Result;
 use beam_term::prelude::*;
 
 use super::{atom_name, var_index};
 use crate::error::{badarg, unsupported};
+
+mod arith;
+mod guard;
+
+use arith::default_arith;
+pub use guard::{set_self_hook, SelfHook};
 
 /// A comparison operator usable in a guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,28 +189,30 @@ pub enum ArithOp {
 ///
 /// [`eval`] takes no hook parameter — the executor in `select/exec.rs` calls it
 /// directly — so the hook is installed **per thread** with [`set_arith_hook`]
-/// instead of being threaded through every expression. A runtime that owns real
-/// bignum/float arithmetic installs its own implementation there; without one
-/// [`DefaultArithHook`] answers, and it implements **small integers only**.
+/// instead of being threaded through every expression. A runtime that owns richer
+/// arithmetic installs its own implementation there; without one
+/// [`DefaultArithHook`] answers, and it implements the integer and float
+/// operators in [`arith`](self::arith).
 pub trait ArithHook {
     /// Evaluate one arithmetic operation over its already-evaluated operands.
     ///
     /// `args` holds the operand terms (one for a unary `+`/`-`, two otherwise;
     /// [`decode`] rejects every other arity with `badarg`). `heap` is the caller's
-    /// heap, for an implementation that has to materialize a term (a bignum, say).
+    /// heap, for an implementation that has to materialize a term (a float, say).
     fn eval(
         &self,
         op: ArithOp,
         args: &[Eterm],
         _atoms: &AtomTable,
-        _heap: &mut Heap,
+        heap: &mut Heap,
     ) -> Result<Eterm> {
-        default_arith(op, args)
+        default_arith(op, args, heap)
     }
 }
 
-/// The built-in arithmetic hook: **small-integer** `+ - * div rem band bor bxor
-/// bsl bsr` (and unary `+`/`-`) via checked `i64` arithmetic.
+/// The built-in arithmetic hook: integer `+ - * div rem band bor bxor bsl bsr`
+/// (and unary `+`/`-`) via checked `i64` arithmetic, plus faithful **float**
+/// `+ - * /` (a boxed float result).
 ///
 /// Every case outside that subset is a typed error rather than a fabricated
 /// answer — see [`default_arith`], which lists exactly which failure each case
@@ -298,6 +329,32 @@ pub enum Expr {
     /// atom); the pattern-only builders whose body is `[true]` (`match_delete`)
     /// use it so the deletion test does not depend on the `AtomTable`.
     Bool(bool),
+    /// `ceil/1`.
+    Ceil(Box<Expr>),
+    /// `floor/1`.
+    Floor(Box<Expr>),
+    /// `max/2` — the larger operand by **term order** (`cmp_arith`).
+    Max(Box<Expr>, Box<Expr>),
+    /// `min/2` — the smaller operand by **term order** (`cmp_arith`).
+    Min(Box<Expr>, Box<Expr>),
+    /// `binary_part/2` — the second operand is a **runtime** `{Pos, Len}` 2-tuple.
+    BinaryPart2(Box<Expr>, Box<Expr>),
+    /// `binary_part/3`.
+    BinaryPart3(Box<Expr>, Box<Expr>, Box<Expr>),
+    /// `is_record/3`.
+    IsRecord3(Box<Expr>, Box<Expr>, Box<Expr>),
+    /// `is_function/2`.
+    IsFunction2(Box<Expr>, Box<Expr>),
+    /// `is_integer/3`.
+    IsInteger3(Box<Expr>, Box<Expr>, Box<Expr>),
+    /// `node/0`.
+    Node0,
+    /// `node/1`.
+    Node1(Box<Expr>),
+    /// `xor/2`.
+    Xor(Box<Expr>, Box<Expr>),
+    /// `bnot/1`.
+    Bnot(Box<Expr>),
 }
 
 /// The result of evaluating a guard or body expression.
@@ -319,7 +376,7 @@ impl Value {
     /// `true`/`false`, which must be interned in `atoms` (`badarg` otherwise).
     pub(super) fn into_term(self, atoms: &AtomTable) -> Result<Eterm> {
         match self {
-            Value::Bool(flag) => bool_term(flag, atoms),
+            Value::Bool(flag) => guard::bool_term(flag, atoms),
             Value::Term(term) => Ok(term),
         }
     }
@@ -421,6 +478,18 @@ fn decode_call(name: &str, args: &[Eterm], atoms: &AtomTable, vars: &BTreeSet<u3
         }
         Ok(Expr::Arith(op, vec![arg(0)?, arg(1)?]))
     };
+    let unary = |build: fn(Box<Expr>) -> Expr| -> Result<Expr> {
+        if args.len() != 1 {
+            return Err(badarg());
+        }
+        Ok(build(Box::new(arg(0)?)))
+    };
+    let binary = |build: fn(Box<Expr>, Box<Expr>) -> Expr| -> Result<Expr> {
+        if args.len() != 2 {
+            return Err(badarg());
+        }
+        Ok(build(Box::new(arg(0)?), Box::new(arg(1)?)))
+    };
     match name {
         // Special forms.
         "andalso" | "and" | "orelse" | "or" => {
@@ -462,9 +531,19 @@ fn decode_call(name: &str, args: &[Eterm], atoms: &AtomTable, vars: &BTreeSet<u3
         "=<" => pairwise(CmpOp::Le),
         ">" => pairwise(CmpOp::Gt),
         ">=" => pairwise(CmpOp::Ge),
-        // Type tests.
+        // Type tests. `is_function/1` and `is_integer/1` also have a wider form
+        // (`is_function/2`, `is_integer/3`) that the C `guard_tab` carries; the
+        // other arities are `badarg` (verified against `erl`).
         "is_atom" => one(TypeTest::Atom),
-        "is_integer" => one(TypeTest::Integer),
+        "is_integer" => match args.len() {
+            1 => one(TypeTest::Integer),
+            3 => Ok(Expr::IsInteger3(
+                Box::new(arg(0)?),
+                Box::new(arg(1)?),
+                Box::new(arg(2)?),
+            )),
+            _ => Err(badarg()),
+        },
         "is_float" => one(TypeTest::Float),
         "is_number" => one(TypeTest::Number),
         "is_tuple" => one(TypeTest::Tuple),
@@ -475,8 +554,22 @@ fn decode_call(name: &str, args: &[Eterm], atoms: &AtomTable, vars: &BTreeSet<u3
         "is_pid" => one(TypeTest::Pid),
         "is_port" => one(TypeTest::Port),
         "is_reference" => one(TypeTest::Reference),
-        "is_function" => one(TypeTest::Function),
+        "is_function" => match args.len() {
+            1 => one(TypeTest::Function),
+            2 => Ok(Expr::IsFunction2(Box::new(arg(0)?), Box::new(arg(1)?))),
+            _ => Err(badarg()),
+        },
         "is_boolean" => one(TypeTest::Boolean),
+        // `is_record/3` only — the oracle's `is_record/2` is `badarg` (the C
+        // `guard_tab` binds the three-argument form alone).
+        "is_record" => match args.len() {
+            3 => Ok(Expr::IsRecord3(
+                Box::new(arg(0)?),
+                Box::new(arg(1)?),
+                Box::new(arg(2)?),
+            )),
+            _ => Err(badarg()),
+        },
         // Guard BIFs.
         "element" => {
             if args.len() != 2 {
@@ -595,6 +688,28 @@ fn decode_call(name: &str, args: &[Eterm], atoms: &AtomTable, vars: &BTreeSet<u3
             }
             Ok(Expr::Round(Box::new(arg(0)?)))
         }
+        "ceil" => unary(Expr::Ceil),
+        "floor" => unary(Expr::Floor),
+        "max" => binary(Expr::Max),
+        "min" => binary(Expr::Min),
+        // `binary_part/2` takes a **runtime** `{Pos, Len}` 2-tuple; `/3` takes the
+        // two positions separately. Any other arity is `badarg`.
+        "binary_part" => match args.len() {
+            2 => Ok(Expr::BinaryPart2(Box::new(arg(0)?), Box::new(arg(1)?))),
+            3 => Ok(Expr::BinaryPart3(
+                Box::new(arg(0)?),
+                Box::new(arg(1)?),
+                Box::new(arg(2)?),
+            )),
+            _ => Err(badarg()),
+        },
+        "node" => match args.len() {
+            0 => Ok(Expr::Node0),
+            1 => Ok(Expr::Node1(Box::new(arg(0)?))),
+            _ => Err(badarg()),
+        },
+        "xor" => binary(Expr::Xor),
+        "bnot" => unary(Expr::Bnot),
         "self" => {
             if !args.is_empty() {
                 return Err(badarg());
@@ -702,16 +817,16 @@ pub(super) fn eval(
         Expr::Cmp(op, left, right) => {
             let left = eval_term(left, binds, object, atoms, heap)?;
             let right = eval_term(right, binds, object, atoms, heap)?;
-            Ok(Value::Bool(compare(*op, left, right, atoms)))
+            Ok(Value::Bool(guard::compare(*op, left, right, atoms)))
         }
         Expr::Test(test, operand) => {
             let operand = eval_term(operand, binds, object, atoms, heap)?;
-            Ok(Value::Bool(type_test(*test, operand, atoms)))
+            Ok(Value::Bool(guard::type_test(*test, operand, atoms)))
         }
         Expr::Element(position, tuple) => {
             let position = eval_term(position, binds, object, atoms, heap)?;
             let tuple = eval_term(tuple, binds, object, atoms, heap)?;
-            element(position, tuple).map(Value::Term)
+            guard::element(position, tuple).map(Value::Term)
         }
         Expr::Abs(operand) => {
             let operand = eval_term(operand, binds, object, atoms, heap)?;
@@ -724,7 +839,7 @@ pub(super) fn eval(
                 // SAFETY: the class established a live float block.
                 TermClass::Float => {
                     let value = unsafe { float_value(operand) };
-                    write_float_term(heap, value.abs()).map(Value::Term)
+                    guard::write_float_term(heap, value.abs()).map(Value::Term)
                 }
                 // The absolute value of a bignum needs bignum arithmetic: a typed gap,
                 // never a `badarg` that would silently under-match a guard.
@@ -745,7 +860,7 @@ pub(super) fn eval(
         }
         Expr::Size(operand) => {
             let operand = eval_term(operand, binds, object, atoms, heap)?;
-            size(operand).map(Value::Term)
+            guard::size(operand).map(Value::Term)
         }
         Expr::Hd(operand) => {
             let operand = eval_term(operand, binds, object, atoms, heap)?;
@@ -799,27 +914,27 @@ pub(super) fn eval(
         }
         Expr::TupleSize(operand) => {
             let operand = eval_term(operand, binds, object, atoms, heap)?;
-            tuple_size_of(operand).map(Value::Term)
+            guard::tuple_size_of(operand).map(Value::Term)
         }
         Expr::ByteSize(operand) => {
             let operand = eval_term(operand, binds, object, atoms, heap)?;
-            bitstring_length(operand, true).map(Value::Term)
+            guard::bitstring_length(operand, true).map(Value::Term)
         }
         Expr::BitSize(operand) => {
             let operand = eval_term(operand, binds, object, atoms, heap)?;
-            bitstring_length(operand, false).map(Value::Term)
+            guard::bitstring_length(operand, false).map(Value::Term)
         }
         Expr::Float(operand) => {
             let operand = eval_term(operand, binds, object, atoms, heap)?;
-            float_of(operand, heap).map(Value::Term)
+            guard::float_of(operand, heap).map(Value::Term)
         }
         Expr::Trunc(operand) => {
             let operand = eval_term(operand, binds, object, atoms, heap)?;
-            integral_of(operand, false).map(Value::Term)
+            guard::integral_of(operand, false).map(Value::Term)
         }
         Expr::Round(operand) => {
             let operand = eval_term(operand, binds, object, atoms, heap)?;
-            integral_of(operand, true).map(Value::Term)
+            guard::integral_of(operand, true).map(Value::Term)
         }
         Expr::Map(pairs) => {
             let mut built = Vec::with_capacity(pairs.len());
@@ -829,124 +944,73 @@ pub(super) fn eval(
                     eval_term(value, binds, object, atoms, heap)?,
                 ));
             }
-            build_map(built, atoms, heap).map(Value::Term)
+            guard::build_map(built, atoms, heap).map(Value::Term)
         }
-        // No process identity at the ETS layer: the guard raises (the clause is
-        // skipped) rather than producing a wrong pid. This is a **semantic**
-        // under-match (the oracle evaluates `self/0` against the calling process),
-        // NOT a swallowed capability gap — see `guards_hold`'s classification.
-        Expr::SelfPid => Err(badarg()),
-    }
-}
-
-/// `tuple_size/1`.
-fn tuple_size_of(operand: Eterm) -> Result<Eterm> {
-    if classify(operand) != TermClass::Tuple {
-        return Err(badarg());
-    }
-    // SAFETY: `class` established a live tuple header, whose arity word is readable.
-    Ok(make_small(unsafe { tuple_size(operand) } as i64))
-}
-
-/// `byte_size/1` (`bytes`) / `bit_size/1`: the bitstring's bit count, or its byte
-/// count `NBYTES(bits) = (bits + 7) / 8` (`erts/emulator/beam/erl_bits.h:27`).
-///
-/// A non-bitstring is the oracle's `badarg`. An **off-heap** (refc) binary is a
-/// typed capability gap rather than a `badarg`: it *is* a bitstring, so reporting
-/// `badarg` would let a guard silently under-match (workspace `CONTEXT.md` §3).
-fn bitstring_length(operand: Eterm, bytes: bool) -> Result<Eterm> {
-    match classify(operand) {
-        // SAFETY: the class established a live `ErlHeapBits`/`ErlSubBits` block, which
-        // is all `bitstring_size` reads.
-        TermClass::Bitstring => {
-            let bits = unsafe { bitstring_size(operand) };
-            Ok(make_small(if bytes { (bits + 7) / 8 } else { bits } as i64))
+        // `self/0` resolves through the [`SelfHook`] seam: without an installed
+        // host hook the guard raises (the clause is then skipped). The default is
+        // therefore a **semantic** under-match of a construct the ETS layer cannot
+        // evaluate — see `guards_hold`'s classification.
+        Expr::SelfPid => Ok(Value::Term(guard::self_term()?)),
+        Expr::Ceil(operand) => {
+            let operand = eval_term(operand, binds, object, atoms, heap)?;
+            guard::ceil_floor(operand, true).map(Value::Term)
         }
-        TermClass::BinRef => Err(unsupported(
-            "match-spec 'byte_size'/'bit_size' on an off-heap (refc) binary",
-        )),
-        _ => Err(badarg()),
-    }
-}
-
-/// `float/1`: a small integer casts to the nearest `f64` (the same rounding the
-/// oracle's integer→float conversion uses), a bignum goes through
-/// `beam_term::number::big_to_f64` (faithful nearest-double rounding, `badarg` when
-/// beyond the `f64` range — what the oracle raises), a float is the identity, and
-/// anything else is `badarg`.
-fn float_of(operand: Eterm, heap: &mut Heap) -> Result<Eterm> {
-    let value = match classify(operand) {
-        TermClass::Small => signed_value(operand) as f64,
-        TermClass::Big => match big_to_f64(operand) {
-            None => return Err(badarg()),
-            Some(value) => value,
-        },
-        // `float/1` on a float is the identity (the term is returned unchanged).
-        TermClass::Float => return Ok(operand),
-        _ => return Err(badarg()),
-    };
-    write_float_term(heap, value)
-}
-
-/// Materialise a fresh float term on `heap`.
-fn write_float_term(heap: &mut Heap, value: f64) -> Result<Eterm> {
-    // SAFETY: `alloc_words(FLOAT_SIZE_WORDS)` hands back the two exclusively-owned,
-    // writable words a float occupies; `write_float` writes both before the term
-    // escapes, and the heap outlives it.
-    unsafe {
-        let words = heap.alloc_words(FLOAT_SIZE_WORDS)?;
-        Ok(write_float(words, value))
-    }
-}
-
-/// `trunc/1` (`round == false`) / `round/1`.
-///
-/// An integer operand is the **identity** (what `erl` returns). A float truncates
-/// toward zero (`f64::trunc`) or rounds **half away from zero** (`f64::round` is
-/// exactly Erlang's — verified against `erl`: `round(2.5)` is `3`, `round(-2.5)` is
-/// `-3`, `round(2.4)` is `2`, `trunc(1.9)` is `1`, `trunc(-1.9)` is `-1`). A result
-/// outside the 60-bit small range is a bignum in the oracle (`round(1.0e30)`), so it
-/// is the typed `unsupported_ets` — never a truncated wrong integer. A non-number is
-/// the oracle's `badarg`.
-fn integral_of(operand: Eterm, round: bool) -> Result<Eterm> {
-    match classify(operand) {
-        // An integer operand is returned unchanged (`trunc/1`/`round/1` are the
-        // identity on integers, including a bignum).
-        TermClass::Small | TermClass::Big => Ok(operand),
-        TermClass::Float => {
-            // SAFETY: the class established a live float block.
-            let value = unsafe { float_value(operand) };
-            let integral = if round { value.round() } else { value.trunc() };
-            // `2^59` is the exclusive bound of the 60-bit small range.
-            const BOUND: f64 = 576_460_752_303_423_488.0;
-            if !integral.is_finite() || integral.abs() >= BOUND {
-                return Err(unsupported(
-                    "match-spec 'trunc'/'round': the result is not a small integer",
-                ));
-            }
-            // `|integral| < 2^59` and `integral` is integer-valued, so the cast is
-            // exact and in range.
-            try_make_small(integral as i64).map_err(|_| {
-                unsupported("match-spec 'trunc'/'round': the result is not a small integer")
-            })
+        Expr::Floor(operand) => {
+            let operand = eval_term(operand, binds, object, atoms, heap)?;
+            guard::ceil_floor(operand, false).map(Value::Term)
         }
-        _ => Err(badarg()),
-    }
-}
-
-/// Materialise a map from already-evaluated key/value pairs on `heap`, through
-/// `beam_term::map::write_map` (last-wins dedup, a flat map at most
-/// `MAP_SMALL_MAP_LIMIT` keys, else the ERTS HAMT layout) — the frozen map builder,
-/// never a local one.
-fn build_map(pairs: Vec<(Eterm, Eterm)>, atoms: &AtomTable, heap: &mut Heap) -> Result<Eterm> {
-    let capacity = map_words_capacity(pairs.len());
-    // SAFETY: `alloc_words(capacity)` hands back `capacity` exclusively-owned,
-    // writable words — exactly `write_map`'s precondition — and `write_map`
-    // initialises every word of the map it returns, which borrows that storage; the
-    // heap outlives the term.
-    unsafe {
-        let hp = heap.alloc_words(capacity)?;
-        write_map(hp, &pairs, atoms).map_err(BeamError::from)
+        Expr::Max(left, right) => {
+            let left = eval_term(left, binds, object, atoms, heap)?;
+            let right = eval_term(right, binds, object, atoms, heap)?;
+            Ok(Value::Term(guard::max_min(left, right, atoms, true)))
+        }
+        Expr::Min(left, right) => {
+            let left = eval_term(left, binds, object, atoms, heap)?;
+            let right = eval_term(right, binds, object, atoms, heap)?;
+            Ok(Value::Term(guard::max_min(left, right, atoms, false)))
+        }
+        Expr::BinaryPart2(binary, spec) => {
+            let binary = eval_term(binary, binds, object, atoms, heap)?;
+            let spec = eval_term(spec, binds, object, atoms, heap)?;
+            guard::binary_part2(binary, spec, heap).map(Value::Term)
+        }
+        Expr::BinaryPart3(binary, position, length) => {
+            let binary = eval_term(binary, binds, object, atoms, heap)?;
+            let position = eval_term(position, binds, object, atoms, heap)?;
+            let length = eval_term(length, binds, object, atoms, heap)?;
+            guard::binary_part3(binary, position, length, heap).map(Value::Term)
+        }
+        Expr::IsRecord3(term, name, size) => {
+            let term = eval_term(term, binds, object, atoms, heap)?;
+            let name = eval_term(name, binds, object, atoms, heap)?;
+            let size = eval_term(size, binds, object, atoms, heap)?;
+            guard::is_record3(term, name, size, atoms).map(Value::Bool)
+        }
+        Expr::IsFunction2(term, arity) => {
+            let term = eval_term(term, binds, object, atoms, heap)?;
+            let arity = eval_term(arity, binds, object, atoms, heap)?;
+            guard::is_function2(term, arity).map(Value::Bool)
+        }
+        Expr::IsInteger3(value, lower, upper) => {
+            let value = eval_term(value, binds, object, atoms, heap)?;
+            let lower = eval_term(lower, binds, object, atoms, heap)?;
+            let upper = eval_term(upper, binds, object, atoms, heap)?;
+            guard::is_integer3(value, lower, upper, atoms).map(Value::Bool)
+        }
+        Expr::Node0 => guard::node0(atoms).map(Value::Term),
+        Expr::Node1(term) => {
+            let term = eval_term(term, binds, object, atoms, heap)?;
+            guard::node1(term, atoms).map(Value::Term)
+        }
+        Expr::Xor(left, right) => {
+            let left = eval_term(left, binds, object, atoms, heap)?;
+            let right = eval_term(right, binds, object, atoms, heap)?;
+            guard::xor(left, right, atoms).map(Value::Bool)
+        }
+        Expr::Bnot(operand) => {
+            let operand = eval_term(operand, binds, object, atoms, heap)?;
+            guard::bnot(operand).map(Value::Term)
+        }
     }
 }
 
@@ -968,257 +1032,16 @@ fn eval_term(
 pub(super) fn value_bool(value: Value, atoms: &AtomTable) -> Result<bool> {
     match value {
         Value::Bool(flag) => Ok(flag),
-        Value::Term(term) => bool_of_atom(term, atoms).ok_or_else(badarg),
+        Value::Term(term) => guard::bool_of_atom(term, atoms).ok_or_else(badarg),
     }
 }
 
 /// The term class of a live term (a thin wrapper documenting the `unsafe`).
-fn classify(term: Eterm) -> TermClass {
+///
+/// Shared with [`guard`] so every helper classifies a term through the same
+/// documented probe.
+pub(super) fn classify(term: Eterm) -> TermClass {
     // SAFETY: `class` reads a boxed header only for a boxed word; `term` is a live
     // term (a spec subterm or a matched value), so its header is valid.
     unsafe { class(term) }
-}
-
-/// The Erlang spelling of an [`ArithOp`] (used in the typed error messages, so a
-/// refusal reads as the operator the spec actually wrote).
-fn arith_name(op: ArithOp) -> &'static str {
-    match op {
-        ArithOp::Add => "+",
-        ArithOp::Sub => "-",
-        ArithOp::Mul => "*",
-        ArithOp::Div => "/",
-        ArithOp::IntDiv => "div",
-        ArithOp::Rem => "rem",
-        ArithOp::Band => "band",
-        ArithOp::Bor => "bor",
-        ArithOp::Bxor => "bxor",
-        ArithOp::Bsl => "bsl",
-        ArithOp::Bsr => "bsr",
-    }
-}
-
-/// The typed "outside the small-integer subset" failure for `op`.
-fn not_small(op: &str) -> BeamError {
-    unsupported(&format!(
-        "match-spec arithmetic '{op}': the result is not a small integer"
-    ))
-}
-
-/// The [`DefaultArithHook`] implementation: small-integer `+ - * div rem band bor
-/// bxor bsl bsr`, plus unary `+`/`-`, all through checked `i64`.
-///
-/// It is deliberately **total-or-refusing** — never wrong:
-///
-/// * A **non-small operand** (bignum, float, atom, tuple, …) ⇒ `unsupported_ets`.
-///   The oracle would answer several of those (`1 + 1.0` is `2.5`), but only with
-///   float/bignum arithmetic this hook does not have; guessing a small integer
-///   would be a wrong result.
-/// * An `i64` overflow, or a result outside the 60-bit small range (`MAX_SMALL +
-///   1`, `-1 bsl 62`, … — bignums in the oracle) ⇒ `unsupported_ets`.
-/// * `/` ⇒ `unsupported_ets`: its Erlang result is **always** a float (`1/2` is
-///   `0.5`, `4/2` is `2.0`).
-/// * `div`/`rem` by zero ⇒ `badarg`, which is what the oracle raises.
-/// * Shift operators mirror the C `erts_shift`
-///   (`../../erts/emulator/beam/erl_arith.c:196-247`). A **negative** count
-///   *reverses* the direction: the `bsr` count is negated and the sign of the
-///   resulting count chooses the direction, so `bsl`/`bsr` merely swap (`8 bsr -1`
-///   is `16`, `1 bsl -1` is `0`, `8 bsl -1` is `4`). A **right** shift of a 60-bit
-///   small by 59 or more (including 64+) saturates to the sign's `0`/`-1`
-///   (`1 bsr 100` is `0`, `-1 bsr 100` is `-1`) — never `badarg`. A **left** shift
-///   (directly, or a `bsr` with a negative count) that leaves the 60-bit small
-///   range — a count of 64 or more, or lost bits such as `2 bsl 62` — is a bignum
-///   in the oracle, so it is the typed `unsupported_ets`. A zero operand short-
-///   circuits to `0` for every count (`0 bsl 100` is `0`), as the C does.
-/// * A wrong operand count ⇒ `badarg`; only reachable by calling the seam
-///   directly, since [`decode_call`] rejects it at compile time.
-fn default_arith(op: ArithOp, args: &[Eterm]) -> Result<Eterm> {
-    let name = arith_name(op);
-    // An operand is in the subset only when it *is* a small integer.
-    let operand = |index: usize| -> Result<i64> {
-        let term = args.get(index).copied().ok_or_else(badarg)?;
-        if is_small(term) {
-            Ok(signed_value(term))
-        } else {
-            Err(unsupported(&format!(
-                "match-spec arithmetic '{name}': operand {} is not a small integer",
-                index + 1
-            )))
-        }
-    };
-    // A computed value is in the subset only when it still fits a 60-bit small.
-    let result = |value: i64| -> Result<Eterm> {
-        try_make_small(value).map_err(|_| not_small(name))
-    };
-    // The checked `i64` form: `None` is the overflow the checked op detected.
-    let checked = |value: Option<i64>| -> Result<Eterm> {
-        match value {
-            Some(value) => result(value),
-            None => Err(not_small(name)),
-        }
-    };
-    match (op, args.len()) {
-        // Unary `+` — the identity on a small integer.
-        (ArithOp::Add, 1) => result(operand(0)?),
-        // Unary `-`.
-        (ArithOp::Sub, 1) => checked(operand(0)?.checked_neg()),
-        (ArithOp::Add, 2) => checked(operand(0)?.checked_add(operand(1)?)),
-        (ArithOp::Sub, 2) => checked(operand(0)?.checked_sub(operand(1)?)),
-        (ArithOp::Mul, 2) => checked(operand(0)?.checked_mul(operand(1)?)),
-        // `/` always yields a float, so it can never be a small-integer answer.
-        (ArithOp::Div, 2) => Err(unsupported(
-            "match-spec arithmetic '/': the result is a float",
-        )),
-        (ArithOp::IntDiv, 2) | (ArithOp::Rem, 2) => {
-            let (left, right) = (operand(0)?, operand(1)?);
-            if right == 0 {
-                return Err(badarg());
-            }
-            checked(if op == ArithOp::IntDiv {
-                left.checked_div(right)
-            } else {
-                left.checked_rem(right)
-            })
-        }
-        // `band`/`bor`/`bxor` on two 60-bit values always stay 60-bit, but the
-        // result is range-checked like every other op rather than assumed.
-        (ArithOp::Band, 2) => result(operand(0)? & operand(1)?),
-        (ArithOp::Bor, 2) => result(operand(0)? | operand(1)?),
-        (ArithOp::Bxor, 2) => result(operand(0)? ^ operand(1)?),
-        (ArithOp::Bsl, 2) | (ArithOp::Bsr, 2) => {
-            let (value, count) = (operand(0)?, operand(1)?);
-            // The C `erts_shift` returns the value unchanged for a zero count or a
-            // zero operand (`i == 0 || ires == 0`); the zero-operand case matters
-            // because it short-circuits even an out-of-range count (`0 bsl 100`).
-            if value == 0 || count == 0 {
-                return result(value);
-            }
-            // …and it *reverses the direction* for a negative count: `bsr` negates
-            // the count (`i = -signed_val(arg2)`), and the sign of the resulting
-            // count chooses the direction, so `bsl`/`bsr` merely swap. `|count|`
-            // fits `i64` because a small integer is at most 60 bits.
-            let (left, amount) = if count > 0 {
-                (op == ArithOp::Bsl, count)
-            } else {
-                (op == ArithOp::Bsr, -count)
-            };
-            // A count past `u32` is far beyond the 64-bit width; saturate so the
-            // boundary handling below applies (left ⇒ bignum, right ⇒ sign).
-            let amount = u32::try_from(amount).unwrap_or(u32::MAX);
-            if left {
-                // A left shift must not silently drop shifted-out bits: `2 bsl 62`
-                // is a bignum in the oracle and a bare `<<` would answer `0`. Any
-                // count of 64 or more leaves the 60-bit range for sure, so it is
-                // refused the same way (never guessed).
-                if amount >= 64 {
-                    return Err(not_small(name));
-                }
-                let shifted = value << amount;
-                if (shifted >> amount) != value {
-                    return Err(not_small(name));
-                }
-                result(shifted)
-            } else {
-                // An arithmetic right shift of a 60-bit value saturates to the
-                // sign's `0`/`-1`; clamping the amount at 63 yields exactly that
-                // (and keeps the shift in range for the `i64` operation).
-                result(value >> amount.min(63))
-            }
-        }
-        _ => Err(badarg()),
-    }
-}
-
-/// A comparison, using `beam_term::compare` (never a local term order).
-fn compare(op: CmpOp, left: Eterm, right: Eterm, atoms: &AtomTable) -> bool {
-    use std::cmp::Ordering::{Equal, Greater, Less};
-    match op {
-        CmpOp::ExactEq => cmp(left, right, atoms) == Equal,
-        CmpOp::ExactNe => cmp(left, right, atoms) != Equal,
-        CmpOp::ArithEq => cmp_arith(left, right, atoms) == Equal,
-        CmpOp::ArithNe => cmp_arith(left, right, atoms) != Equal,
-        CmpOp::Lt => cmp_arith(left, right, atoms) == Less,
-        CmpOp::Le => cmp_arith(left, right, atoms) != Greater,
-        CmpOp::Gt => cmp_arith(left, right, atoms) == Greater,
-        CmpOp::Ge => cmp_arith(left, right, atoms) != Less,
-    }
-}
-
-/// A type test (`is_*`).
-fn type_test(test: TypeTest, operand: Eterm, atoms: &AtomTable) -> bool {
-    use TermClass::*;
-    let kind = classify(operand);
-    match test {
-        TypeTest::Atom => kind == Atom,
-        TypeTest::Integer => matches!(kind, Small | Big),
-        TypeTest::Float => kind == Float,
-        TypeTest::Number => matches!(kind, Small | Big | Float),
-        TypeTest::Tuple => kind == Tuple,
-        // `is_list([])` is true in Erlang.
-        TypeTest::List => matches!(kind, List | Nil),
-        // SAFETY: `is_binary` reads the header of a bitstring term only; the class
-        // check guarantees that.
-        TypeTest::Binary => (kind == Bitstring && unsafe { is_binary(operand) }) || kind == BinRef,
-        TypeTest::Bitstring => matches!(kind, Bitstring | BinRef),
-        TypeTest::Map => kind == Map,
-        TypeTest::Pid => matches!(kind, Pid | ExternalPid),
-        TypeTest::Port => matches!(kind, Port | ExternalPort),
-        TypeTest::Reference => matches!(kind, Ref | ExternalRef),
-        TypeTest::Function => kind == Fun,
-        TypeTest::Boolean => matches!(atom_name(operand, atoms), Some("true") | Some("false")),
-    }
-}
-
-/// `element(N, Tuple)`.
-fn element(position: Eterm, tuple: Eterm) -> Result<Eterm> {
-    if !is_small(position) {
-        return Err(badarg());
-    }
-    let index = signed_value(position);
-    if index < 1 {
-        return Err(badarg());
-    }
-    if !unsafe { is_tuple(tuple) } {
-        return Err(badarg());
-    }
-    // SAFETY: `is_tuple(tuple)` established a live tuple header.
-    let arity = unsafe { tuple_size(tuple) };
-    let offset = usize::try_from(index - 1).map_err(|_| badarg())?;
-    if offset >= arity {
-        return Err(badarg());
-    }
-    // SAFETY: `offset < arity == tuple_size(tuple)`.
-    Ok(unsafe { tuple_element(tuple, offset) })
-}
-
-/// `size/1`: the arity of a tuple, or the byte size of a binary.
-fn size(operand: Eterm) -> Result<Eterm> {
-    let kind = classify(operand);
-    if kind == TermClass::Tuple {
-        // SAFETY: `class` established a live tuple header.
-        let arity = unsafe { tuple_size(operand) };
-        return Ok(make_small(arity as i64));
-    }
-    // SAFETY: `is_binary` reads the header of a bitstring term only; the class
-    // check guarantees that.
-    if kind == TermClass::Bitstring && unsafe { is_binary(operand) } {
-        // SAFETY: `is_binary` established a byte-aligned bitstring.
-        let bits = unsafe { bitstring_size(operand) };
-        return Ok(make_small((bits / 8) as i64));
-    }
-    Err(badarg())
-}
-
-/// The atom `true`/`false`.
-fn bool_term(value: bool, atoms: &AtomTable) -> Result<Eterm> {
-    let name = if value { "true" } else { "false" };
-    atoms.lookup(name).map(make_atom).ok_or_else(badarg)
-}
-
-/// Interpret a term as a boolean: the literal atom `true`/`false`, else `None`.
-fn bool_of_atom(term: Eterm, atoms: &AtomTable) -> Option<bool> {
-    match atom_name(term, atoms) {
-        Some("true") => Some(true),
-        Some("false") => Some(false),
-        _ => None,
-    }
 }

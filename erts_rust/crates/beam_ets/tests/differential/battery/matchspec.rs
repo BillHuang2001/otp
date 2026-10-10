@@ -19,12 +19,14 @@
 // %CopyrightEnd%
 
 //! The **`select` / `match`** case group: `select/2` with variables, wildcards,
-//! literals and guards (comparison, type test, `andalso`/`orelse`) and bodies
-//! (`'$_'`, `'$N'`, constants, `{{…}}` construction); `select_delete/2` +
-//! `select_count/2`; the `match` family; malformed specs (`badarg`);
-//! `ets:match_spec_run/2` (bindings/whole-element/all-bindings bodies, a repeated
-//! head variable, multi-clause first-match-wins, an empty list and a non-list
-//! `badarg`); and the body-error `EXIT` semantics.
+//! literals and guards (comparison, type test, `andalso`/`orelse`, the guard BIFs
+//! and their wider forms — `ceil`/`floor`, `max`/`min`, `binary_part/2,3`,
+//! `is_record/3`, `is_function/2`, `is_integer/3`, `node/0`, `xor/2`, `bnot/1`) and
+//! bodies (`'$_'`, `'$N'`, constants, `{{…}}` construction); the head-map
+//! literal-key rule; `select_delete/2` + `select_count/2`; the `match` family;
+//! malformed specs (`badarg`); `ets:match_spec_run/2` (bindings/whole-element/
+//! all-bindings bodies, a repeated head variable, multi-clause first-match-wins, an
+//! empty list and a non-list `badarg`); and the body-error `EXIT` semantics.
 
 use super::*;
 use beam_ets::match_spec_run;
@@ -137,11 +139,9 @@ impl Battery {
 
     /// `{'==', {'/', '$2', 2}, 10.0}` — the `/` operator in a guard.
     ///
-    /// `/` always yields a **float** in Erlang, and `DefaultArithHook` refuses it
-    /// (`unsupported_ets`) rather than guessing a small integer, so `beam_ets`
-    /// propagates the typed error instead of silently under-matching — rendered by
-    /// [`Battery::cap_select`] as `error:unsupported_ets: …`. A **recorded
-    /// divergence** (`tests/differential.rs::KNOWN_DIVERGENCES`).
+    /// `/` always yields a **float** in Erlang; `DefaultArithHook` computes it, so
+    /// the guard holds for the row whose `$2 / 2` is the float `10.0` — matching the
+    /// oracle.
     fn select_guard_div(&mut self) -> String {
         let mut table = self.table(TableKind::OrderedSet, 1);
         for key in [1i64, 2, 3] {
@@ -380,10 +380,297 @@ impl Battery {
         self.cap_select(&table, spec_term)
     }
 
+    /// `{'==', {'ceil', '$2'}, 3}` / `{'==', {'floor', '$2'}, 2}` over an integer
+    /// and a float value, plus the integer **identity**
+    /// `{'==', {'ceil', '$2'}, '$2'}` (whose result is the operand's own term).
+    fn select_guard_ceil_floor(&mut self) -> String {
+        let mut table = self.table(TableKind::OrderedSet, 1);
+        let integer = self.object(1, 3);
+        let half = self.float(2.5);
+        let float_object = self.tuple(&[make_small(2), half]);
+        table.insert(integer, &self.atoms).expect("insert");
+        table.insert(float_object, &self.atoms).expect("insert");
+
+        let v1 = self.atom("$1");
+        let v2 = self.atom("$2");
+        let head = self.tuple(&[v1, v2]);
+        let arith_eq = self.atom("==");
+        let ceil = self.atom("ceil");
+        let ceil_call = self.tuple(&[ceil, v2]);
+        let floor = self.atom("floor");
+        let floor_call = self.tuple(&[floor, v2]);
+        let body = self.list(&[v1]);
+
+        let ceil_guard = self.tuple(&[arith_eq, ceil_call, make_small(3)]);
+        let ceil_guards = self.list(&[ceil_guard]);
+        let ceil_spec = self.spec(head, ceil_guards, body);
+        let floor_guard = self.tuple(&[arith_eq, floor_call, make_small(2)]);
+        let floor_guards = self.list(&[floor_guard]);
+        let floor_spec = self.spec(head, floor_guards, body);
+        let identity_guard = self.tuple(&[arith_eq, ceil_call, v2]);
+        let identity_guards = self.list(&[identity_guard]);
+        let identity_spec = self.spec(head, identity_guards, body);
+
+        let ceil_rendered = self.cap_select(&table, ceil_spec);
+        let floor_rendered = self.cap_select(&table, floor_spec);
+        let identity_rendered = self.cap_select(&table, identity_spec);
+        tuple_of(&[ceil_rendered, floor_rendered, identity_rendered])
+    }
+
+    /// `{'==', {'max', '$2', 7}, 7}` / `{'==', {'min', '$2', 7}, 7}` over ints.
+    fn select_guard_max_min(&mut self) -> String {
+        let mut table = self.table(TableKind::OrderedSet, 1);
+        let first = self.object(1, 5);
+        let second = self.object(2, 9);
+        table.insert(first, &self.atoms).expect("insert");
+        table.insert(second, &self.atoms).expect("insert");
+
+        let v1 = self.atom("$1");
+        let v2 = self.atom("$2");
+        let head = self.tuple(&[v1, v2]);
+        let arith_eq = self.atom("==");
+        let max = self.atom("max");
+        let max_call = self.tuple(&[max, v2, make_small(7)]);
+        let min = self.atom("min");
+        let min_call = self.tuple(&[min, v2, make_small(7)]);
+        let body = self.list(&[v1]);
+
+        let max_guard = self.tuple(&[arith_eq, max_call, make_small(7)]);
+        let max_guards = self.list(&[max_guard]);
+        let max_spec = self.spec(head, max_guards, body);
+        let min_guard = self.tuple(&[arith_eq, min_call, make_small(7)]);
+        let min_guards = self.list(&[min_guard]);
+        let min_spec = self.spec(head, min_guards, body);
+
+        let max_rendered = self.cap_select(&table, max_spec);
+        let min_rendered = self.cap_select(&table, min_spec);
+        tuple_of(&[max_rendered, min_rendered])
+    }
+
+    /// `{'==', {'binary_part', '$2', {const, {1, 2}}}, <<2,3>>}` — the `/2` form's
+    /// spec operand must be an explicit `{const, …}` (a bare `{1, 2}` term is
+    /// `badarg`), and the result stays inside a comparison because the renderer
+    /// cannot print a binary.
+    fn select_guard_binary_part2(&mut self) -> String {
+        let mut table = self.table(TableKind::OrderedSet, 1);
+        let four = self.binary(&[1, 2, 3, 4]);
+        let first = self.tuple(&[make_small(1), four]);
+        let other = self.binary(&[5, 6, 7, 8]);
+        let second = self.tuple(&[make_small(2), other]);
+        table.insert(first, &self.atoms).expect("insert");
+        table.insert(second, &self.atoms).expect("insert");
+
+        let v1 = self.atom("$1");
+        let v2 = self.atom("$2");
+        let head = self.tuple(&[v1, v2]);
+        let arith_eq = self.atom("==");
+        let binary_part = self.atom("binary_part");
+        let constant = self.atom("const");
+        let spec_pair = self.ints(&[1, 2]);
+        let const_spec = self.tuple(&[constant, spec_pair]);
+        let call = self.tuple(&[binary_part, v2, const_spec]);
+        let expected = self.binary(&[2, 3]);
+        let guard = self.tuple(&[arith_eq, call, expected]);
+        let guards = self.list(&[guard]);
+        let body = self.list(&[v1]);
+        let spec_term = self.spec(head, guards, body);
+        self.cap_select(&table, spec_term)
+    }
+
+    /// `{'==', {'binary_part', '$2', 1, 2}, <<2,3>>}` — the `/3` form.
+    fn select_guard_binary_part3(&mut self) -> String {
+        let mut table = self.table(TableKind::OrderedSet, 1);
+        let four = self.binary(&[1, 2, 3, 4]);
+        let first = self.tuple(&[make_small(1), four]);
+        let other = self.binary(&[5, 6, 7, 8]);
+        let second = self.tuple(&[make_small(2), other]);
+        table.insert(first, &self.atoms).expect("insert");
+        table.insert(second, &self.atoms).expect("insert");
+
+        let v1 = self.atom("$1");
+        let v2 = self.atom("$2");
+        let head = self.tuple(&[v1, v2]);
+        let arith_eq = self.atom("==");
+        let binary_part = self.atom("binary_part");
+        let call = self.tuple(&[binary_part, v2, make_small(1), make_small(2)]);
+        let expected = self.binary(&[2, 3]);
+        let guard = self.tuple(&[arith_eq, call, expected]);
+        let guards = self.list(&[guard]);
+        let body = self.list(&[v1]);
+        let spec_term = self.spec(head, guards, body);
+        self.cap_select(&table, spec_term)
+    }
+
+    /// `{'is_record', '$2', person, 3}` as a **body** over a matching 3-tuple, a
+    /// same-named 2-tuple and a differently-named 3-tuple: the rendering carries
+    /// both `true` and `false`.
+    fn select_guard_is_record3(&mut self) -> String {
+        let mut table = self.table(TableKind::OrderedSet, 1);
+        let person = self.atom("person");
+        let alice = self.atom("alice");
+        let bob = self.atom("bob");
+        let animal = self.atom("animal");
+        let record = self.tuple(&[person, alice, make_small(42)]);
+        let first = self.tuple(&[make_small(1), record]);
+        let short = self.tuple(&[person, alice]);
+        let second = self.tuple(&[make_small(2), short]);
+        let other = self.tuple(&[animal, bob, make_small(7)]);
+        let third = self.tuple(&[make_small(3), other]);
+        table.insert(first, &self.atoms).expect("insert");
+        table.insert(second, &self.atoms).expect("insert");
+        table.insert(third, &self.atoms).expect("insert");
+
+        let v1 = self.atom("$1");
+        let v2 = self.atom("$2");
+        let head = self.tuple(&[v1, v2]);
+        let is_record = self.atom("is_record");
+        let call = self.tuple(&[is_record, v2, person, make_small(3)]);
+        let body = self.list(&[call]);
+        let spec_term = self.spec(head, NIL, body);
+        self.cap_select(&table, spec_term)
+    }
+
+    /// `{'is_function', '$2', 0}` over integers — empty as a guard, all `false`
+    /// as a body (building a fun term is out of scope).
+    fn select_guard_is_function2(&mut self) -> String {
+        let mut table = self.table(TableKind::OrderedSet, 1);
+        let first = self.object(1, 10);
+        let second = self.object(2, 20);
+        table.insert(first, &self.atoms).expect("insert");
+        table.insert(second, &self.atoms).expect("insert");
+
+        let v1 = self.atom("$1");
+        let v2 = self.atom("$2");
+        let head = self.tuple(&[v1, v2]);
+        let is_function = self.atom("is_function");
+        let call = self.tuple(&[is_function, v2, make_small(0)]);
+        let guards = self.list(&[call]);
+        let key_body = self.list(&[v1]);
+        let guard_spec = self.spec(head, guards, key_body);
+        let bool_body = self.list(&[call]);
+        let body_spec = self.spec(head, NIL, bool_body);
+
+        let guard_rendered = self.cap_select(&table, guard_spec);
+        let body_rendered = self.cap_select(&table, body_spec);
+        tuple_of(&[guard_rendered, body_rendered])
+    }
+
+    /// `{'is_integer', '$2', 5, 25}` — the inclusive-range arithmetic guard.
+    fn select_guard_is_integer3(&mut self) -> String {
+        let mut table = self.table(TableKind::OrderedSet, 1);
+        for (key, value) in [(1i64, 3i64), (2, 10), (3, 30)] {
+            let object = self.object(key, value);
+            table.insert(object, &self.atoms).expect("insert");
+        }
+        let v1 = self.atom("$1");
+        let v2 = self.atom("$2");
+        let head = self.tuple(&[v1, v2]);
+        let is_integer = self.atom("is_integer");
+        let call = self.tuple(&[is_integer, v2, make_small(5), make_small(25)]);
+        let guards = self.list(&[call]);
+        let body = self.list(&[v1]);
+        let spec_term = self.spec(head, guards, body);
+        self.cap_select(&table, spec_term)
+    }
+
+    /// `{'node'}` as a body — the local node name `nonode@nohost`.
+    fn select_body_node0(&mut self) -> String {
+        let mut table = self.table(TableKind::OrderedSet, 1);
+        let first = self.object(1, 10);
+        let second = self.object(2, 20);
+        table.insert(first, &self.atoms).expect("insert");
+        table.insert(second, &self.atoms).expect("insert");
+
+        // The body resolves the local node name by lookup, so intern it first.
+        self.atom("nonode@nohost");
+        let v1 = self.atom("$1");
+        let v2 = self.atom("$2");
+        let head = self.tuple(&[v1, v2]);
+        let node = self.atom("node");
+        let call = self.tuple(&[node]);
+        let body = self.list(&[call]);
+        let spec_term = self.spec(head, NIL, body);
+        self.cap_select(&table, spec_term)
+    }
+
+    /// `{'xor', true, false}` as a guard (every object) and `{'xor', true, true}`
+    /// as a body (the atom `false`).
+    fn select_guard_xor_body(&mut self) -> String {
+        let mut table = self.table(TableKind::OrderedSet, 1);
+        let first = self.object(1, 10);
+        let second = self.object(2, 20);
+        table.insert(first, &self.atoms).expect("insert");
+        table.insert(second, &self.atoms).expect("insert");
+
+        let v1 = self.atom("$1");
+        let v2 = self.atom("$2");
+        let truth = self.atom("true");
+        let falsity = self.atom("false");
+        let head = self.tuple(&[v1, v2]);
+        let xor = self.atom("xor");
+        let guard_call = self.tuple(&[xor, truth, falsity]);
+        let guards = self.list(&[guard_call]);
+        let key_body = self.list(&[v1]);
+        let guard_spec = self.spec(head, guards, key_body);
+        let body_call = self.tuple(&[xor, truth, truth]);
+        let bool_body = self.list(&[body_call]);
+        let body_spec = self.spec(head, NIL, bool_body);
+
+        let guard_rendered = self.cap_select(&table, guard_spec);
+        let body_rendered = self.cap_select(&table, body_spec);
+        tuple_of(&[guard_rendered, body_rendered])
+    }
+
+    /// `{'bnot', '$2'}` as a body over integers — negative results.
+    fn select_body_bnot(&mut self) -> String {
+        let mut table = self.table(TableKind::OrderedSet, 1);
+        let first = self.object(1, 10);
+        let second = self.object(2, 20);
+        table.insert(first, &self.atoms).expect("insert");
+        table.insert(second, &self.atoms).expect("insert");
+
+        let v1 = self.atom("$1");
+        let v2 = self.atom("$2");
+        let head = self.tuple(&[v1, v2]);
+        let bnot = self.atom("bnot");
+        let call = self.tuple(&[bnot, v2]);
+        let body = self.list(&[call]);
+        let spec_term = self.spec(head, NIL, body);
+        self.cap_select(&table, spec_term)
+    }
+
+    /// A head map's **key** must be literal: a variable (or `'_'`) key is `badarg`
+    /// at **every** nesting depth, so the spec is rejected before the object's map
+    /// is ever compared.
+    fn select_head_map_nonliteral_key(&mut self) -> String {
+        let mut table = self.table(TableKind::OrderedSet, 1);
+        let a = self.atom("a");
+        let stored = self.map(&[(a, make_small(1))]);
+        let object = self.tuple(&[make_small(1), stored]);
+        table.insert(object, &self.atoms).expect("insert");
+
+        let v1 = self.atom("$1");
+        let v2 = self.atom("$2");
+        let v3 = self.atom("$3");
+        let v4 = self.atom("$4");
+        let body = self.list(&[v1]);
+
+        let map1 = self.map(&[(v2, v3)]);
+        let head1 = self.tuple(&[v1, map1]);
+        let direct_spec = self.spec(head1, NIL, body);
+        let direct = self.cap_select(&table, direct_spec);
+
+        let map2 = self.map(&[(v3, v4)]);
+        let inner = self.tuple(&[v2, map2]);
+        let head2 = self.tuple(&[v1, inner]);
+        let nested_spec = self.spec(head2, NIL, body);
+        let nested = self.cap_select(&table, nested_spec);
+
+        tuple_of(&[direct, nested])
+    }
+
     /// `{'==', {'*', '$2', 1.5}, 30.0}` — match-spec arithmetic with a **float**
-    /// operand, which `DefaultArithHook` refuses (`unsupported_ets`) rather than
-    /// guessing. A **recorded divergence**
-    /// (`tests/differential.rs::KNOWN_DIVERGENCES`).
+    /// operand: `DefaultArithHook` computes it in `f64`, matching the oracle.
     fn select_guard_float_arith(&mut self) -> String {
         let mut table = self.table(TableKind::OrderedSet, 1);
         for key in [1i64, 2] {
@@ -967,6 +1254,44 @@ pub(super) fn matchspec_cases(battery: &mut Battery) -> Vec<(String, String)> {
     cases.push((
         "select_guard_size_family".into(),
         battery.select_guard_size_family(),
+    ));
+    cases.push((
+        "select_guard_ceil_floor".into(),
+        battery.select_guard_ceil_floor(),
+    ));
+    cases.push((
+        "select_guard_max_min".into(),
+        battery.select_guard_max_min(),
+    ));
+    cases.push((
+        "select_guard_binary_part2".into(),
+        battery.select_guard_binary_part2(),
+    ));
+    cases.push((
+        "select_guard_binary_part3".into(),
+        battery.select_guard_binary_part3(),
+    ));
+    cases.push((
+        "select_guard_is_record3".into(),
+        battery.select_guard_is_record3(),
+    ));
+    cases.push((
+        "select_guard_is_function2".into(),
+        battery.select_guard_is_function2(),
+    ));
+    cases.push((
+        "select_guard_is_integer3".into(),
+        battery.select_guard_is_integer3(),
+    ));
+    cases.push(("select_body_node0".into(), battery.select_body_node0()));
+    cases.push((
+        "select_guard_xor_body".into(),
+        battery.select_guard_xor_body(),
+    ));
+    cases.push(("select_body_bnot".into(), battery.select_body_bnot()));
+    cases.push((
+        "select_head_map_nonliteral_key".into(),
+        battery.select_head_map_nonliteral_key(),
     ));
     cases.push((
         "select_guard_float_arith".into(),

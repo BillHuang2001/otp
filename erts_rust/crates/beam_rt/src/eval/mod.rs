@@ -2430,18 +2430,19 @@ mod tests {
 
     #[test]
     fn a_capability_gap_is_uncatchable() {
-        // `erlang:statistics(garbage_collection)` is a valid statistics key this runtime
-        // cannot measure (it needs a real accumulative collector), so the `RuntimeHooks`
+        // `erlang:statistics(active_tasks)` is a valid statistics key this runtime
+        // cannot measure (it needs per-scheduler task accounting), so the `RuntimeHooks`
         // bridge reports it as the `unsupported` capability gap. A `try`/`catch` in the
         // expression must NOT turn that into an apparent exception: it propagates out
         // (classified by `unsupported_reason`) so the CLI exits 3 with
-        // `beam_rt: unsupported: …`. (`statistics(runtime)` is now **served** from the
-        // runtime's CPU-time clock, alongside `statistics(wall_clock)`/`statistics(run_queue)`/
-        // `statistics(reductions)`/`statistics(scheduler_wall_time)` and the other measurable
-        // keys — they are cross-checked against the oracle by `tests/runtime_hooks.rs`.)
+        // `beam_rt: unsupported: …`. (The other measurable keys — `statistics(runtime)`
+        // from the runtime's CPU-time clock, alongside `statistics(garbage_collection)`/
+        // `statistics(wall_clock)`/`statistics(run_queue)`/`statistics(reductions)`/
+        // `statistics(scheduler_wall_time)` — are **served** and cross-checked against the
+        // oracle by `tests/runtime_hooks.rs`.)
         for expr in [
-            "try erlang:statistics(garbage_collection) catch _:_ -> 0 end",
-            "try (erlang:statistics(garbage_collection)) of V -> V catch C:R -> ok end",
+            "try erlang:statistics(active_tasks) catch _:_ -> 0 end",
+            "try (erlang:statistics(active_tasks)) of V -> V catch C:R -> ok end",
         ] {
             let error = run(expr).expect_err("a capability gap propagates");
             assert!(

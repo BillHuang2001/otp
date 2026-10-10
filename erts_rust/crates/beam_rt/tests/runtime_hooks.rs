@@ -223,12 +223,53 @@ const EXPR_RUNTIME_SHAPE: &str = "\
 
 /// A valid statistics key this runtime cannot measure: the honest typed capability gap.
 ///
-/// `garbage_collection` needs a real accumulative collector, which this runtime does not keep,
-/// so it stays a gap rather than a fabricated number.
-const EXPR_STATISTICS_GAP: &str = "erlang:statistics(garbage_collection).";
+/// `active_tasks` needs the per-run-queue "a scheduler is executing a process from this
+/// queue" state (`ERTS_RUNQ_FLG_EXEC`), which `beam_process::Scheduler` does not keep — the
+/// run slice dequeues into a local — so it stays a gap rather than a fabricated number.
+const EXPR_STATISTICS_GAP: &str = "erlang:statistics(active_tasks).";
+
+/// The second remaining gap: `microstate_accounting` needs per-scheduler MSACC state
+/// (microstate scopes, blocked-time accounting and the thread list), none of which this
+/// single-threaded runtime keeps.
+const EXPR_STATISTICS_GAP_MSACC: &str = "erlang:statistics(microstate_accounting).";
 
 /// A name that is not a statistics key at all: the oracle's `badarg` (exit 1).
 const EXPR_STATISTICS_BADARG: &str = "erlang:statistics(atom_count).";
+
+/// `statistics(total_run_queue_lengths)` / `_all`: a non-negative integer in both runtimes.
+const EXPR_TOTAL_RUN_QUEUE_LENGTHS_SHAPE: &str = "\
+S = erlang:statistics(total_run_queue_lengths), \
+io:format(\"~p~n\", [is_integer(S) andalso S >= 0]), halt(0).";
+const EXPR_TOTAL_RUN_QUEUE_LENGTHS_ALL_SHAPE: &str = "\
+S = erlang:statistics(total_run_queue_lengths_all), \
+io:format(\"~p~n\", [is_integer(S) andalso S >= 0]), halt(0).";
+
+/// `statistics(scheduler_wall_time_all)`: the atom `undefined` in both runtimes (neither
+/// enables the scheduler wall-time measurement).
+const EXPR_SCHEDULER_WALL_TIME_ALL: &str = "\
+io:format(\"~p~n\", [erlang:statistics(scheduler_wall_time_all)]), halt(0).";
+
+/// `statistics(garbage_collection)`: `{GCs, WordsReclaimed, 0}` in both runtimes — the
+/// shape `erlang.erl`'s `gather_gc_info_result/1` builds (the third element is the reserved
+/// constant `0`). The two figures are volatile, so only the shape is pinned.
+const EXPR_GARBAGE_COLLECTION_SHAPE: &str = "\
+{GCs, Recl, Z} = erlang:statistics(garbage_collection), \
+io:format(\"~p~n\", [{is_integer(GCs) andalso GCs >= 0, \
+is_integer(Recl) andalso Recl >= 0, Z}]), halt(0).";
+
+/// `statistics(run_queues)`'s shape **on this runtime**: a 1-element tuple holding an
+/// integer. The oracle emits one element per run queue plus the two always-allocated dirty
+/// queues; this runtime has one run queue and no dirty schedulers, so its arity is 1 (a
+/// recorded, deliberate divergence — see the module docs).
+const EXPR_RUN_QUEUES_OURS: &str = "\
+Q = erlang:statistics(run_queues), \
+io:format(\"~p~n\", [{is_tuple(Q), tuple_size(Q), is_integer(element(1, Q))}]), halt(0).";
+
+/// `statistics(run_queue_lengths)`'s shape **on this runtime**: a 1-element list of an
+/// integer, for the same reason as [`EXPR_RUN_QUEUES_OURS`].
+const EXPR_RUN_QUEUE_LENGTHS_OURS: &str = "\
+L = erlang:statistics(run_queue_lengths), \
+io:format(\"~p~n\", [{is_list(L), length(L), is_integer(hd(L))}]), halt(0).";
 
 /// This runtime's own `statistics(run_queue)`: a freshly loaded `-eval` process queues
 /// nothing, because the boot loads modules rather than spawning runnable processes.
@@ -318,6 +359,26 @@ fn the_served_statistics_shapes_match_the_live_oracle() {
         ("statistics(runtime)", EXPR_RUNTIME_SHAPE, "{true,true}"),
         ("statistics(io)", EXPR_IO_SHAPE, "{input,output,true,true}"),
         ("statistics(scheduler_wall_time)", EXPR_SCHEDULER_WALL_TIME, "undefined"),
+        (
+            "statistics(scheduler_wall_time_all)",
+            EXPR_SCHEDULER_WALL_TIME_ALL,
+            "undefined",
+        ),
+        (
+            "statistics(total_run_queue_lengths)",
+            EXPR_TOTAL_RUN_QUEUE_LENGTHS_SHAPE,
+            "true",
+        ),
+        (
+            "statistics(total_run_queue_lengths_all)",
+            EXPR_TOTAL_RUN_QUEUE_LENGTHS_ALL_SHAPE,
+            "true",
+        ),
+        (
+            "statistics(garbage_collection)",
+            EXPR_GARBAGE_COLLECTION_SHAPE,
+            "{true,true,0}",
+        ),
     ];
     let Some(oracle) = support::require_oracle("runtime_hooks") else {
         for (what, expr, expected) in flows {
@@ -371,23 +432,68 @@ fn statistics_run_queue_is_this_runtimes_own_real_queue() {
     );
 }
 
+/// The per-run-queue shapes are asserted on **this** side only: the oracle emits one element
+/// per run queue plus its two always-allocated dirty queues (18 for `run_queues`, 17 for
+/// `run_queue_lengths`), while this runtime has one run queue and no dirty schedulers. Both
+/// answers are a faithful reading of their own scheduler set; the divergence is recorded.
+#[test]
+fn the_per_run_queue_shapes_read_this_runtimes_own_scheduler_set() {
+    for (what, expr, expected) in [
+        ("statistics(run_queues)", EXPR_RUN_QUEUES_OURS, "{true,1,true}"),
+        (
+            "statistics(run_queue_lengths)",
+            EXPR_RUN_QUEUE_LENGTHS_OURS,
+            "{true,1,true}",
+        ),
+    ] {
+        let ours = beam_rt_eval(expr);
+        assert_eq!(ours.code, 0, "{what}: exit {} — {}", ours.code, ours.err);
+        assert_eq!(ours.out, expected, "{what}");
+
+        let Some(oracle) = support::require_oracle("runtime_hooks") else {
+            continue;
+        };
+        let theirs = oracle_eval(&oracle, expr);
+        assert_eq!(
+            theirs.code, 0,
+            "{what} oracle: exit {} — {}",
+            theirs.code, theirs.err
+        );
+        eprintln!(
+            "note: {what} — this runtime {ours_out}, oracle {theirs_out} \
+             (this runtime's own scheduler set: one run queue, no dirty schedulers)",
+            ours_out = ours.out,
+            theirs_out = theirs.out
+        );
+    }
+}
+
 /// A valid statistics key this runtime cannot measure is the typed capability gap (exit 3),
 /// never a fabricated number; a name that is not a statistics key at all is the oracle's
 /// `badarg` (exit 1) in both runtimes.
 #[test]
 fn the_unmeasurable_and_invalid_statistics_keys_are_classified_honestly() {
-    let ours = beam_rt_eval(EXPR_STATISTICS_GAP);
-    assert_eq!(ours.code, 3, "a capability gap exits 3: {} — {}", ours.code, ours.err);
-    assert!(
-        ours.err.contains("unsupported"),
-        "the gap must say `unsupported`: {}",
-        ours.err
-    );
-    assert!(
-        ours.err.contains("garbage_collection"),
-        "the gap must name the counter: {}",
-        ours.err
-    );
+    for (what, expr) in [
+        ("active_tasks", EXPR_STATISTICS_GAP),
+        ("microstate_accounting", EXPR_STATISTICS_GAP_MSACC),
+    ] {
+        let ours = beam_rt_eval(expr);
+        assert_eq!(
+            ours.code, 3,
+            "{what}: a capability gap exits 3: {} — {}",
+            ours.code, ours.err
+        );
+        assert!(
+            ours.err.contains("unsupported"),
+            "{what}: the gap must say `unsupported`: {}",
+            ours.err
+        );
+        assert!(
+            ours.err.contains(what),
+            "{what}: the gap must name the counter: {}",
+            ours.err
+        );
+    }
 
     let Some(oracle) = support::require_oracle("runtime_hooks") else {
         let ours = beam_rt_eval(EXPR_STATISTICS_BADARG);
@@ -395,15 +501,24 @@ fn the_unmeasurable_and_invalid_statistics_keys_are_classified_honestly() {
         assert!(ours.err.contains("badarg"), "{}", ours.err);
         return;
     };
-    // The oracle **accepts** `garbage_collection` (it keeps the accumulative collector this
-    // runtime lacks), so the two runtimes differ by capability here — recorded, never
-    // asserted as agreement.
-    let theirs = oracle_eval(&oracle, EXPR_STATISTICS_GAP);
-    assert_eq!(theirs.code, 0, "oracle: exit {} — {}", theirs.code, theirs.err);
-    eprintln!(
-        "note: statistics(garbage_collection) — this runtime exit 3 (unsupported), oracle {} {:?}",
-        theirs.code, theirs.out
-    );
+    // The oracle **accepts** both keys (it keeps the per-run-queue EXEC flag and the MSACC
+    // accounting this runtime lacks), so the two runtimes differ by capability here —
+    // recorded, never asserted as agreement.
+    for (what, expr) in [
+        ("active_tasks", EXPR_STATISTICS_GAP),
+        ("microstate_accounting", EXPR_STATISTICS_GAP_MSACC),
+    ] {
+        let theirs = oracle_eval(&oracle, expr);
+        assert_eq!(
+            theirs.code, 0,
+            "{what} oracle: exit {} — {}",
+            theirs.code, theirs.err
+        );
+        eprintln!(
+            "note: statistics({what}) — this runtime exit 3 (unsupported), oracle {} {:?}",
+            theirs.code, theirs.out
+        );
+    }
 
     // An unknown key is `badarg` in **both** — the classification this suite guards.
     let ours = beam_rt_eval(EXPR_STATISTICS_BADARG);

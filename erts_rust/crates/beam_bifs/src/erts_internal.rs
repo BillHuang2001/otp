@@ -70,15 +70,23 @@
 //!    (which counts `2 + ceil(bits/64)`) where C switches to the 8-word
 //!    `[BinRef][ErlSubBits]` pair.
 //!
-//! A **hashmap** (>32-pair map), an external pid/port/ref (whose `node` slot is
-//! likewise inlined by this runtime) and any boxed subtag this module does not
-//! positively recognize as representation-identical are treated the same way:
-//! conservatively divergent, never guessed. Everything else — immediates, cons
-//! cells, tuples and native records, floats, bignums, flat maps, on-heap
-//! bitstrings up to 512 bits and the 8-word refc pair itself — is counted exactly
-//! as the C does, because it is the same algorithm over the same frozen layouts
-//! (note `heap_bits_size(bits) == 2 + ceil(bits/64)`, identical to
-//! [`beam_term::bitstring::heap_bits_size_words`]).
+//! An external pid/port/ref (whose `node` slot is likewise inlined by this runtime)
+//! and any boxed subtag this module does not positively recognize as
+//! representation-identical are treated the same way: conservatively divergent,
+//! never guessed. Everything else — immediates, cons cells, tuples and native
+//! records, floats, bignums, flat maps, **hash maps** (their HAMT node interiors are
+//! the ERTS layout, `copy.c:192-214`, which
+//! [`beam_term::layout`](beam_term) sizes exactly), on-heap bitstrings up to 512
+//! bits and the 8-word refc pair itself — is counted exactly as the C does, because
+//! it is the same algorithm over the same frozen layouts (note
+//! `heap_bits_size(bits) == 2 + ceil(bits/64)`, identical to
+//! [`beam_term::bitstring::heap_bits_size_words`]). Oracle-pinned:
+//! `erts_debug:flat_size(maps:from_list([{N,N*10} || N <- lists:seq(1,33)]))` ⇒ `123`,
+//! the count this runtime's own 33-pair HAMT produces. A hash map's *trie shape* —
+//! and therefore its count — is driven by `erts_map_hash`, which for an atom key
+//! reads the atom's runtime index, so an atom-keyed HAMT can legitimately count
+//! differently here than in the oracle; that is a differing *input map*, not a
+//! differing representation, and the number is this runtime's true flat size.
 //!
 //! # The internal integer parsers *return* their failure atoms
 //!
@@ -104,18 +112,17 @@
 //!   shared-term walk, the emulator's internal state and the BEAM code loader).
 //! * Typed gaps *inside* a registered BIF (each returns
 //!   [`crate::error::unsupported_bif`], never a wrong value):
-//!   `map_next/3` on a hashmap (`erl_map.c:3739+` walks HAMT nodes with path
-//!   bignums and reduction-budget chunking) and `map_hashmap_children/1` on a
-//!   non-flat node (the raw node walk, `erl_map.c:3425-3461`); `flat_size/1` for
-//!   the divergent representations above. `term_type/1` distinguishes the on-heap
-//!   (`heap_binary`) from the off-heap (`sub_binary`) bitstring by the layout rule
-//!   itself; the C `refc_binary` name is unreachable because a bare `BinRef` header
-//!   is not `is_bitstring`, so such a term falls into the unrecognized-tag gap
-//!   (this runtime builds no standalone `BinRef` term anyway).
-
+//!   `flat_size/1` for the divergent representations above.
+//!   `term_type/1` distinguishes the on-heap (`heap_binary`) from the off-heap
+//!   (`sub_binary`) bitstring by the layout rule itself; the C `refc_binary` name is
+//!   unreachable because a bare `BinRef` header is not `is_bitstring`, so such a term
+//!   falls into the unrecognized-tag gap (this runtime builds no standalone `BinRef`
+//!   term anyway). `map_next/3` walks both map representations; only its continuation
+//!   *path encoding* and per-call chunk size are this implementation's own (see
+//!   [`map_next_3`]).
 use beam_common::{BeamError, Result};
 use beam_term::prelude::{boxed_val, make_small, signed_value};
-use beam_term::{atom_val, compare, Eterm};
+use beam_term::{atom_val, Eterm, NIL};
 
 use crate::access;
 use crate::arith;
@@ -285,18 +292,23 @@ fn has_representation_divergence(term: Eterm) -> bool {
                 Err(_) => return true,
             }
         }
-        if access::is_flatmap(current) {
-            match access::flatmap_pairs(current) {
-                Ok((keys, values)) => {
-                    work.extend(keys);
-                    work.extend(values);
+        if access::is_map(current) {
+            // Both representations: a flat map (`map_pairs_storage_order` reads its
+            // keys tuple) and a HAMT (`size_object` sizes the frozen ERTS node
+            // interiors, so only the keys/values can carry a divergence).
+            match access::map_pairs_storage_order(current) {
+                Ok(pairs) => {
+                    for (key, value) in pairs {
+                        work.push(key);
+                        work.push(value);
+                    }
                     continue;
                 }
                 Err(_) => return true,
             }
         }
-        // A hashmap (`is_map` beyond the flat map) or any subtag not positively
-        // recognized above: its word count is not verifiable through the safe API.
+        // Any subtag not positively recognized above: its word count is not
+        // verifiable through the safe API.
         return true;
     }
     false
@@ -393,6 +405,12 @@ fn unsafe_base_of(term: Eterm) -> *const u8 {
 /// `erts_internal:map_to_tuple_keys/1` — a flat map's key tuple
 /// (`erl_map.c:3318-3328`). The C returns the map's own key-tuple object; this
 /// builds a fresh tuple that is `=:=`-equal to it.
+///
+/// A **hash map is `badarg`** — not `{badmap, _}`: the C reaches a map's keys only
+/// through the flat-map head's `keys` word, so `erts_internal_map_to_tuple_keys_1`
+/// errors explicitly for a HAMT (`erl_map.c:3322-3323`). Oracle-pinned:
+/// `erts_internal:map_to_tuple_keys(maps:from_list([{N,N} || N <- lists:seq(1,33)]))`
+/// ⇒ `error:badarg` (and `#{}`⇒`{}`, `[1,2]`⇒`error:{badmap,[1,2]}`).
 fn map_to_tuple_keys_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let term = args[0];
     if access::is_flatmap(term) {
@@ -400,14 +418,29 @@ fn map_to_tuple_keys_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm
         return ctx.tuple(&keys);
     }
     if access::is_map(term) {
-        // A hashmap: the C raises `badarg`.
         return Err(badarg());
     }
     Err(structured_error(ctx, "badmap", &[term])?)
 }
 
 /// `erts_internal:map_hashmap_children/1` — the slot values of one hashmap node
-/// (`erl_map.c:3425-3461`). Only the two non-node cases are reproducible here.
+/// (`erl_map.c:3425-3461`).
+///
+/// The C returns the node's own **in-heap slot words** — every leaf cons cell, every
+/// sub-node term and every collision tuple of the node reached by the argument — in
+/// **reverse slot order** (`res = CONS(hp, *ptr++, res)` walks the slots forward, so
+/// the last slot ends up first). The argument must be a *map* term; an inner node or
+/// a collision node is only reachable by handing back one of the node terms a
+/// previous call returned (`is_map` accepts the inner-node header too, and
+/// `erl_map.c:3435-3453` carries a branch for each class).
+///
+/// Oracle-pinned (OTP 29.1.1 / erts-17.1; see the module tests):
+/// `map_hashmap_children(#{a => 1, b => 2})` ⇒ `error:badarg` (a flat map),
+/// `map_hashmap_children(1)` ⇒ `error:{badmap, 1}`, and for
+/// `maps:from_list([{N, N} || N <- lists:seq(1, 33)])` the 13-slot head node yields
+/// `[[22|22], #{21 => 21,5 => 5,27 => 27,26 => 26}, …]` — the leaf cons cells are the
+/// very words the map stores, so a consumer (the oracle's `erts_debug:size/1`) sees
+/// the shared leaves.
 fn map_hashmap_children_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let term = args[0];
     if !access::is_map(term) {
@@ -417,24 +450,61 @@ fn map_hashmap_children_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Et
         // `HAMT_SUBTAG_HEAD_FLATMAP` ⇒ the C raises `badarg`.
         return Err(badarg());
     }
-    // Any other node needs the raw HAMT slot walk (head-array/head-bitmap/node-bitmap
-    // and the collision-node arityval form), which the public term API does not
-    // expose.
-    Err(unsupported_bif())
+    let node = access::hamt_node(term)?;
+    // The C's `while(sz--) res = CONS(hp, *ptr++, res)` conses the slots in
+    // storage order onto the accumulator, so the result lists them reversed.
+    let mut result = NIL;
+    for slot in node.slots {
+        result = ctx.cons(slot, result)?;
+    }
+    Ok(result)
 }
 
+/// The HAMT positional walk's per-call chunk cap, `MAP_SMALL_MAP_LIMIT`
+/// (`erl_map.h:96`) — the oracle's deterministic *first*-call ceiling
+/// (`erl_map.c:3799-3801`). [`crate::maps`]'s `next/1` uses the same cap and the
+/// same storage-order offset encoding, so the two implementations of this BIF agree.
+const HAMT_CHUNK: usize = 32;
+
 /// `erts_internal:map_next/3` — one step of `maps:next/1`'s iteration
-/// (`erl_map.c:3636-3920`).
+/// (`erl_map.c:3636-4122`).
 ///
-/// The ordered-iterator path (`Path` a list with mode `iterator`) folds the looked-up
-/// pairs into `{K0,V0,{K1,V1,…none}}`; the flat-map path folds either that tuple
-/// chain (iterator mode) or `[{K,V} | Acc]` (list mode) over the map's **stored**
-/// pairs, ignoring the position value beyond its `n >= Path` bound check.
+/// Three shapes, decided by the arguments exactly as the C does:
 ///
-/// The C caps the ordered path at `MAX(1, reds_left/32)` elements and, when it stops
-/// early, returns the raw `{…, [RestPath|Map]}` continuation. That truncation is
-/// unreachable for the ≤32-element paths a flat map can hold, so this implementation
-/// never truncates; end-to-end `maps:next/1` results are unaffected.
+/// * **ordered iterator** (`Mode == iterator` and a list/NIL `Path`): `Path` is the
+///   key list `maps:iterator(M, ordered)` built, and the result is
+///   `{K, maps:get(K, Map), …}` over it, one triple per key, terminating in `none`.
+/// * **iterator** (any other `Path` with `Mode == iterator`): the look-ahead chain
+///   `{K0,V0,{K1,V1,…}}`, ending in `none` — or in the `[NextPath | Map]`
+///   continuation a caller (`maps:next/1`) resumes from.
+/// * **list mode** (`Mode` a list or NIL, `Path` an integer): the `{K,V}` pairs are
+///   prepended onto `Mode` and the result is `[NextPath, Map | Accumulated]` while a
+///   chunk remains (`maps.erl:526-542` accumulates it) or the plain list once the map
+///   is exhausted.
+///
+/// Both positional walks read the map's pairs in the order
+/// [`crate::access::map_pairs_storage_order`] reports — a flat map's key-tuple order,
+/// a HAMT's slot-traversal order, i.e. the oracle's `maps:to_list/1` order. A flat
+/// map (≤ [`HAMT_CHUNK`] pairs) always emits its whole chain, ignoring the offset
+/// beyond the bound check; a HAMT is chunked.
+///
+/// # Deviation: the `Path` is an opaque storage-order offset and the chunking is fixed
+///
+/// The C's `Path` is an internal trie-nibble encoding (`erl_map.c:4058-4111`, a
+/// bignum past 15 levels, with "offset from end" semantics in list mode) and, after
+/// the first call, its element count is `min(remaining reductions / 4, size)`
+/// (`erl_map.c:3783-3792`) — a function of the *process's* reduction budget, so two
+/// identical calls in one process can return different amounts. Neither is
+/// reproducible here: no node-interior accessor exists (see
+/// [`map_hashmap_children_1`]) and a [`BifContext`] carries no reduction counter.
+/// This implementation therefore emits the oracle's *deterministic* first-call cap
+/// ([`HAMT_CHUNK`]) and then one further [`HAMT_CHUNK`] per call, using its own
+/// offset (an integer, so `maps.erl`'s `is_integer(Path)` guard accepts it) as the
+/// continuation. The **pair sequence**, the **order** and the terminal `none` are
+/// the oracle's; only the intermediate chunk boundaries and the continuation values
+/// differ, and only for a map with more than 2×[`HAMT_CHUNK`] pairs (below that the
+/// chunking coincides). `crate::maps`'s `next/1` uses the same encoding, so
+/// `maps:next/1` and `maps:to_list/1` agree end-to-end.
 fn map_next_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let (path, map, mode) = (args[0], args[1], args[2]);
     // (1) A non-map is a plain `badarg` here — *not* `{badmap, _}` (`erl_map.c:3644`).
@@ -449,63 +519,111 @@ fn map_next_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
     // (3) Ordered iterator: the path is the key list to visit.
     if iterator && (access::is_nil(path) || access::is_list(path)) {
-        if !access::is_flatmap(map) {
-            return Err(unsupported_bif());
-        }
-        let (keys, values) = access::flatmap_pairs(map)?;
-        let mut visited_keys: Vec<Eterm> = Vec::new();
-        let mut visited_values: Vec<Eterm> = Vec::new();
-        let mut current = path;
-        while access::is_list(current) {
-            let key = access::car(current);
-            match keys
-                .iter()
-                .position(|&k| compare::eq(k, key, ctx.atoms()))
-            {
-                Some(i) => {
-                    visited_keys.push(key);
-                    visited_values.push(values[i]);
-                }
-                None => return Err(badarg()),
-            }
-            current = access::cdr(current);
-        }
-        let none = atom(ctx, "none")?;
-        let mut result = none;
-        for i in (0..visited_keys.len()).rev() {
-            result = ctx.tuple(&[visited_keys[i], visited_values[i], result])?;
-        }
-        return Ok(result);
+        return ordered_next(ctx, path, map);
     }
 
-    if !access::is_flatmap(map) {
-        // The HAMT path walk (path bignums, node stack, reduction chunking).
-        return Err(unsupported_bif());
-    }
-    let (keys, values) = access::flatmap_pairs(map)?;
-    let n = keys.len();
-    // (4) The position must be a small integer with `n >= unsigned_val(Path)`; a
-    // negative small integer has a huge unsigned value and is therefore a `badarg`.
+    // (4) The positional walks. The offset must be a small integer no greater than
+    // the pair count — a negative small integer has a huge unsigned value and is
+    // therefore a `badarg`, exactly as the C's `n < unsigned_val(Path)` test.
+    let pairs = access::map_pairs_storage_order(map)?;
+    let n = pairs.len();
     if !access::is_small(path) || (n as u64) < unsigned_val(path) {
         return Err(badarg());
     }
-    if iterator {
-        let mut result = atom(ctx, "none")?;
-        for i in (0..n).rev() {
-            result = ctx.tuple(&[keys[i], values[i], result])?;
+    let offset = unsigned_val(path) as usize;
+
+    if access::is_flatmap(map) {
+        // A flat map's chain is emitted whole, whatever the offset.
+        if iterator {
+            let none = atom(ctx, "none")?;
+            return chain(ctx, &pairs, 0, n, none);
         }
-        Ok(result)
-    } else {
-        // List mode: the accumulator is the caller's third argument, verbatim.
         let mut result = mode;
         for i in (0..n).rev() {
-            let pair = ctx.tuple(&[keys[i], values[i]])?;
+            let pair = ctx.tuple(&[pairs[i].0, pairs[i].1])?;
             result = ctx.cons(pair, result)?;
         }
-        Ok(result)
+        return Ok(result);
     }
+    if iterator {
+        let end = core::cmp::min(offset + HAMT_CHUNK, n);
+        let terminal = if end < n {
+            ctx.cons(ctx.int(end as i64)?, map)?
+        } else {
+            atom(ctx, "none")?
+        };
+        return chain(ctx, &pairs, offset, end, terminal);
+    }
+
+    // List mode: the chunk *ending* at `to`. The C traverses the trie backwards
+    // (`erl_map.c:3975-4054`) and `CONS`es each pair onto the accumulator, so the
+    // first call yields the map's *trailing* chunk and later calls prepend earlier
+    // ones — the accumulated list ends up in storage order. Path `0` is that first
+    // call; any other path resumes one chunk further down.
+    let (from, to) = if offset == 0 {
+        (n.saturating_sub(HAMT_CHUNK), n)
+    } else {
+        (offset.saturating_sub(HAMT_CHUNK), offset)
+    };
+    let mut result = mode;
+    for i in (from..to).rev() {
+        let pair = ctx.tuple(&[pairs[i].0, pairs[i].1])?;
+        result = ctx.cons(pair, result)?;
+    }
+    if from > 0 {
+        let next = ctx.int(from as i64)?;
+        result = ctx.cons(map, result)?;
+        result = ctx.cons(next, result)?;
+    }
+    Ok(result)
 }
 
+/// Folds the pairs `from..end` (ascending) into the iterator-mode look-ahead chain
+/// `{K0,V0,{K1,V1,…}}`, ending in `terminal`.
+fn chain(
+    ctx: &mut BifContext<'_>,
+    pairs: &[(Eterm, Eterm)],
+    from: usize,
+    end: usize,
+    terminal: Eterm,
+) -> Result<Eterm> {
+    let mut result = terminal;
+    for i in (from..end).rev() {
+        result = ctx.tuple(&[pairs[i].0, pairs[i].1, result])?;
+    }
+    Ok(result)
+}
+
+/// The ordered-iterator walk (`erl_map.c:3656-3707`): for every key of `keys_path`,
+/// a `{Key, Value, …}` triple whose value is `maps:get(Key, Map)` — any map kind,
+/// flat or hash — terminating in `none`. A `NIL` path yields `none` itself.
+///
+/// # Errors
+///
+/// `badarg` for a key the map does not hold (the C's `ordered_badarg`).
+fn ordered_next(ctx: &mut BifContext<'_>, keys_path: Eterm, map: Eterm) -> Result<Eterm> {
+    let mut keys: Vec<Eterm> = Vec::new();
+    let mut current = keys_path;
+    while access::is_list(current) {
+        keys.push(access::car(current));
+        current = access::cdr(current);
+    }
+    // `current` is `NIL` here: the caller admitted only a proper list or `NIL`.
+    // Look every value up before building, so no `ctx.atoms()` borrow is held across
+    // a `ctx.tuple` allocation.
+    let mut values: Vec<Eterm> = Vec::with_capacity(keys.len());
+    for &key in &keys {
+        match access::map_get(map, key, ctx.atoms())? {
+            Some(value) => values.push(value),
+            None => return Err(badarg()),
+        }
+    }
+    let mut result = atom(ctx, "none")?;
+    for i in (0..keys.len()).rev() {
+        result = ctx.tuple(&[keys[i], values[i], result])?;
+    }
+    Ok(result)
+}
 /// `erts_internal:time_unit/0` — the runtime's native time unit in units per second
 /// (`erl_time_sup.c:2537-2540`, `ERTS_MONOTONIC_TIME_UNIT`). This runtime fixes the
 /// native unit to **nanoseconds** (see `src/time.rs`), as on this Linux host;
@@ -704,6 +822,7 @@ pub(crate) fn register(reg: &mut BifRegistry) {
 mod tests {
     use super::*;
     use beam_alloc::Heap;
+    use beam_common::ExitReason;
     use beam_process::ProcessId;
     use beam_term::AtomTable;
 
@@ -846,11 +965,198 @@ mod tests {
             let expected_rest = ctx.list(&[x]).unwrap();
             let result = list_to_integer_2(ctx, &[list, ten]).unwrap();
             assert_eq!(access::tuple_element(result, 0), make_small(12));
-            assert!(compare::eq(
+            assert!(beam_term::compare::eq(
                 access::tuple_element(result, 1),
                 expected_rest,
                 ctx.atoms()
             ));
+        });
+    }
+
+    /// One slot of a hash-map node, as the oracle probe's `shape/1` renders it: a
+    /// leaf kv cons cell (identified by its key, the head of both of its words) or a
+    /// sub-node (identified by its own child count).
+    #[derive(Debug, PartialEq, Eq)]
+    enum Child {
+        Leaf(i64),
+        Node(usize),
+    }
+
+    /// Calls `map_hashmap_children/1` and reads the result **inside** the call's heap
+    /// scope (the returned list and its cons cells are heap terms), reporting each
+    /// slot as a [`Child`].
+    fn child_shapes(ctx: &mut BifContext<'_>, node: Eterm) -> Result<Vec<Child>> {
+        let list = map_hashmap_children_1(ctx, &[node])?;
+        let mut shapes = Vec::new();
+        let mut cell = list;
+        while access::is_list(cell) {
+            let child = access::car(cell);
+            if access::is_list(child) {
+                // A leaf is the map's own `[Key|Value]` cons cell; the probe's maps
+                // store `K => K`, so both words are the key.
+                let head = access::car(child);
+                assert_eq!(access::cdr(child), head, "a leaf is a [K|K] pair");
+                shapes.push(Child::Leaf(signed_value(head)));
+            } else {
+                let inner = map_hashmap_children_1(ctx, &[child])?;
+                shapes.push(Child::Node(list_len(inner)));
+            }
+            cell = access::cdr(cell);
+        }
+        assert!(access::is_nil(cell), "the result is a proper list");
+        Ok(shapes)
+    }
+
+    /// The length of a proper list built by this module.
+    fn list_len(mut cell: Eterm) -> usize {
+        let mut len = 0;
+        while access::is_list(cell) {
+            len += 1;
+            cell = access::cdr(cell);
+        }
+        assert!(access::is_nil(cell), "a proper list");
+        len
+    }
+
+    /// `N => N` integer pairs for `N` in `1..=keys`, inserted in ascending order.
+    fn int_pairs(keys: std::ops::RangeInclusive<i64>) -> Vec<(Eterm, Eterm)> {
+        keys.map(|key| (make_small(key), make_small(key))).collect()
+    }
+
+    /// Oracle probe (OTP 29.1.1 / erts-17.1, `erl` on `PATH`) — the whole pin this
+    /// module's `map_hashmap_children/1` expectations were taken from:
+    ///
+    /// ```text
+    /// erts_internal:map_hashmap_children(#{a => 1, b => 2})       => error:badarg
+    /// erts_internal:map_hashmap_children(#{})                     => error:badarg
+    /// erts_internal:map_hashmap_children(1)                       => error:{badmap,1}
+    /// erts_internal:map_hashmap_children("abc")                   => error:{badmap,"abc"}
+    /// erts_internal:map_hashmap_children({a,b})                   => error:{badmap,{a,b}}
+    /// erts_internal:map_hashmap_children(#{}, x)                  => error:undef
+    /// erts_internal:map_hashmap_children()                        => error:undef
+    ///
+    /// M33 = maps:from_list([{N,N} || N <- lists:seq(1,33)]).
+    ///   length(erts_internal:map_hashmap_children(M33))           => 13
+    ///   [[22|22], #{21=>21,5=>5,27=>27,26=>26}, #{3=>3,16=>16,30=>30},
+    ///    #{11=>11,17=>17,24=>24,14=>14,33=>33}, #{20=>20,6=>6},
+    ///    #{32=>32,1=>1,25=>25,28=>28}, [15|15], #{10=>10,23=>23,9=>9},
+    ///    [8|8], [31|31], #{29=>29,13=>13,2=>2,7=>7}, #{12=>12,19=>19},
+    ///    #{18=>18,4=>4}]
+    ///   children of the level-1 nodes, in the same order:
+    ///     [4, 2, 5, 2, 4, 3, 4, 2, 2]
+    ///
+    /// so the head's slot **storage** order is the reverse of the printed list: the
+    /// C accumulates `res = CONS(hp, *ptr++, res)` while walking forward.
+    /// ```
+    #[test]
+    fn map_hashmap_children_lists_the_head_slots_in_reverse_like_the_oracle() {
+        with_ctx(|ctx| {
+            let map = access::make_map(ctx.heap(), &int_pairs(1..=33)).expect("the map fits");
+            assert!(access::is_hashmap(map));
+            let shapes = child_shapes(ctx, map).expect("a HAMT head node");
+            assert_eq!(
+                shapes,
+                vec![
+                    Child::Leaf(22),
+                    Child::Node(4),
+                    Child::Node(2),
+                    Child::Node(5),
+                    Child::Node(2),
+                    Child::Node(4),
+                    Child::Leaf(15),
+                    Child::Node(3),
+                    Child::Leaf(8),
+                    Child::Leaf(31),
+                    Child::Node(4),
+                    Child::Node(2),
+                    Child::Node(2),
+                ],
+                "the oracle's 13-slot head node for the 33-key map"
+            );
+        });
+    }
+
+    /// The result is the node's own slot words, in reverse storage order — the C's
+    /// `while(sz--) res = CONS(hp, *ptr++, res)` (`erl_map.c:3455-3460`).
+    #[test]
+    fn map_hashmap_children_reverses_the_node_storage_order() {
+        with_ctx(|ctx| {
+            let map = access::make_map(ctx.heap(), &int_pairs(1..=40)).expect("the map fits");
+            let slots = access::hamt_node(map).expect("a head node").slots;
+            let list = map_hashmap_children_1(ctx, &[map]).expect("a HAMT head node");
+            let mut got = Vec::new();
+            let mut cell = list;
+            while access::is_list(cell) {
+                got.push(access::car(cell));
+                cell = access::cdr(cell);
+            }
+            assert!(access::is_nil(cell), "a proper list");
+            let mut expected = slots;
+            expected.reverse();
+            assert_eq!(got, expected, "reverse storage order, same words");
+        });
+    }
+
+    /// A HAMT **inner** node handed straight back (the oracle lets a caller do exactly
+    /// this) is walked like a head node. Oracle pin: for the 40-key map the head's
+    /// slot in **storage** order is `#{18 => 18,4 => 4,34 => 34}`, whose children are
+    /// `[{leaf,34},{leaf,4},{leaf,18}]` in that order.
+    #[test]
+    fn map_hashmap_children_accepts_a_hamt_inner_node() {
+        with_ctx(|ctx| {
+            let map = access::make_map(ctx.heap(), &int_pairs(1..=40)).expect("the map fits");
+            let node = {
+                let slots = access::hamt_node(map).expect("a head node").slots;
+                slots
+                    .into_iter()
+                    .find(|slot| !access::is_list(*slot))
+                    .expect("the 40-key head has sub-nodes")
+            };
+            assert!(access::is_map(node), "an inner node is still is_map");
+            assert!(!access::is_hashmap(node), "but not is_hashmap");
+            let shapes = child_shapes(ctx, node).expect("an inner node is walkable");
+            assert_eq!(
+                shapes,
+                vec![Child::Leaf(34), Child::Leaf(4), Child::Leaf(18)],
+                "the 40-key head's storage-order-first sub-node",
+            );
+        });
+    }
+
+    /// A flat map is `badarg` (the C's `HAMT_SUBTAG_HEAD_FLATMAP` arm) and any other
+    /// term is the structured `{badmap, Term}` — never a fabricated list.
+    #[test]
+    fn map_hashmap_children_rejects_flat_maps_and_non_maps() {
+        with_ctx(|ctx| {
+            let flat = access::make_flatmap(ctx.heap(), &[]).expect("the empty map");
+            assert!(access::is_flatmap(flat));
+            assert!(
+                matches!(
+                    map_hashmap_children_1(ctx, &[flat]),
+                    Err(BeamError::BadArg)
+                ),
+                "a flat map is badarg"
+            );
+
+            let expected_tag = ctx.atom("badmap").unwrap();
+            for term in [make_small(1), ctx.atom("b").unwrap(), ctx.tuple(&[make_small(1)]).unwrap()] {
+                let expected = ctx.tuple(&[expected_tag, term]).unwrap();
+                match map_hashmap_children_1(ctx, &[term]) {
+                    Err(BeamError::Raise(raise)) => {
+                        assert_eq!(raise.reason, ExitReason::Structured);
+                        let reason = raise
+                            .live_reason()
+                            .and_then(|live| live.downcast_ref::<Eterm>())
+                            .copied()
+                            .expect("a live reason term");
+                        assert!(
+                            beam_term::compare::eq(reason, expected, ctx.atoms()),
+                            "expected {{badmap, {term:?}}}"
+                        );
+                    }
+                    other => panic!("expected a raised {{badmap, _}}, got {other:?}"),
+                }
+            }
         });
     }
 

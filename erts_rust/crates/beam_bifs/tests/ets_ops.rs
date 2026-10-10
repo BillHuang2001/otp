@@ -499,6 +499,100 @@ fn navigation_walks_a_set_and_an_ordered_set() {
     assert_eq!(next, one);
 }
 
+/// The `'$end_of_table'` **anchor** raises `badarg` for the `ordered_set` walkers
+/// `ets:next/2` and `ets:prev/2` — through the public registry — even when the
+/// atom is itself a **stored** key; a hash kind is unaffected.
+///
+/// The C `db_next_tree_common`/`db_prev_tree_common`
+/// (`../../erts/emulator/beam/erl_db_tree.c:654,729`) return `DB_ERROR_BADKEY`
+/// unconditionally on `am_EOT`, so an `ordered_set` never reads the atom as a
+/// range bound (`db_next_hash_common` has no such special-case). Oracle probe
+/// (`erl -noshell`, OTP 29.1.1 / erts-17.1), an `ordered_set` of
+/// `{1,1},{2,2},{3,3}`: both walkers raise `badarg` on the anchor, stored or not,
+/// and on an empty table; a `set` with `'$end_of_table'` stored answers normally.
+#[test]
+fn ordered_set_walkers_reject_the_end_of_table_anchor() {
+    let reg = default_registry();
+    let mut heap = Heap::new(65536).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut tables = TableRegistry::new();
+    let mut ctx =
+        BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut tables);
+
+    let ordered = new_table(&reg, &mut ctx, "my_tab", "ordered_set");
+    let eot = ctx.atom("$end_of_table").expect("seeded");
+
+    // An empty `ordered_set` rejects the anchor for both directions.
+    for name in ["next", "prev"] {
+        assert!(
+            matches!(
+                reg.call("ets", name, 2, &mut ctx, &[ordered, eot]),
+                Err(BeamError::BadArg)
+            ),
+            "ets:{name}/2 on an empty ordered_set must be badarg"
+        );
+    }
+
+    // Three integer-keyed objects, plus `'$end_of_table'` stored as a key.
+    for key in 1..=3i64 {
+        let k = ctx.int(key).expect("fits");
+        let obj = ctx.tuple(&[k, k]).expect("fits");
+        reg.call("ets", "insert", 2, &mut ctx, &[ordered, obj])
+            .expect("insert");
+    }
+    let eot_obj = ctx.tuple(&[eot, eot]).expect("fits");
+    reg.call("ets", "insert", 2, &mut ctx, &[ordered, eot_obj])
+        .expect("insert");
+
+    let one = ctx.int(1).expect("fits");
+    let two = ctx.int(2).expect("fits");
+    let three = ctx.int(3).expect("fits");
+
+    // The ordinary walks are unaffected.
+    assert_eq!(
+        reg.call("ets", "next", 2, &mut ctx, &[ordered, one])
+            .expect("next(1)"),
+        two
+    );
+    assert_eq!(
+        reg.call("ets", "prev", 2, &mut ctx, &[ordered, three])
+            .expect("prev(3)"),
+        two
+    );
+
+    // The anchor is rejected even though it is stored.
+    for name in ["next", "prev"] {
+        assert!(
+            matches!(
+                reg.call("ets", name, 2, &mut ctx, &[ordered, eot]),
+                Err(BeamError::BadArg)
+            ),
+            "ets:{name}/2 on the stored '$end_of_table' anchor must be badarg"
+        );
+    }
+
+    // A hash kind (`set`) is unaffected: with the atom stored it is an ordinary
+    // key, so `ets:next/2` walks from it and `ets:prev/2` aliases that step.
+    let hashed = new_table(&reg, &mut ctx, "tab2", "set");
+    for obj in [
+        ctx.tuple(&[one, one]).expect("fits"),
+        ctx.tuple(&[eot, eot]).expect("fits"),
+    ] {
+        reg.call("ets", "insert", 2, &mut ctx, &[hashed, obj])
+            .expect("insert");
+    }
+    let next = reg
+        .call("ets", "next", 2, &mut ctx, &[hashed, eot])
+        .expect("next(eot) on a set is not badarg");
+    let prev = reg
+        .call("ets", "prev", 2, &mut ctx, &[hashed, eot])
+        .expect("prev(eot) on a set is not badarg");
+    assert!(
+        beam_term::compare::eq(next, prev, &atoms),
+        "a hash kind aliases prev to next"
+    );
+}
+
 #[test]
 fn info_reports_the_table_fields() {
     let reg = default_registry();

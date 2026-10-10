@@ -37,6 +37,7 @@
 //! observable (`ok <repr>` / exit 0, or `exception <class> <reason>` / exit 1).
 use std::process::Command;
 
+mod support;
 /// The `Probe::Value` wrapper: print the value of the expression with `~w`.
 const VALUE_PROBE: &str = concat!(
     "try ({}) of V -> io:format(\"ok ~w~n\", [V]), halt(0) catch C:R -> ",
@@ -747,31 +748,54 @@ fn port_info_after_close_and_exit_status_follow_the_oracle() {
     }
 }
 
-/// A `binary`-stream read wider than the on-heap binary limit (64 bytes) is a typed
-/// *capability gap*: the CLI exits 3 with the honest `unsupported:` line, never a wrong
-/// result and never a disagreement with the oracle (which would print the binary).
+/// A `binary`-stream read wider than the on-heap binary limit (64 bytes) is **delivered at
+/// full width** — the oracle's own behaviour — never a typed capability gap.
+///
+/// `open_port({spawn,"head -c 100 /dev/zero"}, [binary])` writes its 100 bytes in one
+/// `write(2)`, and the read path hands over up to `READ_CHUNK` (64 KiB) of one `read(2)`, so
+/// the first `{Port, {data, D}}` clause binds the whole 100-byte `binary()`. The value is
+/// printed with `~w`, so stdout is exactly `ok <<0,0,…,0>>` — one hundred `0` elements — and
+/// the process exits 0 with an empty stderr. The oracle comparison at the end cross-checks
+/// that whole line against the system `erl` (a loud skip when no `erl` is available).
 #[test]
-fn an_oversized_port_stream_binary_is_unsupported_not_wrong() {
-    let output = Command::new(env!("CARGO_BIN_EXE_beam_rt"))
-        .args([
-            "-noshell",
-            "-eval",
-            "try (begin P = open_port({spawn,\"head -c 100 /dev/zero\"}, [binary]), \
-             receive {P,{data,D}} -> D after 500 -> no_data end end) of V -> \
-             io:format(\"ok ~w~n\", [V]), halt(0) catch C:R -> \
-             io:format(\"exception ~w ~w~n\", [C, R]), halt(1) end.",
-        ])
-        .output()
-        .expect("spawning beam_rt failed");
-    assert_eq!(output.status.code(), Some(3), "stderr: {:?}", output.stderr);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.starts_with("beam_rt: unsupported: "),
-        "stderr: {stderr:?}"
+fn an_oversized_port_stream_binary_is_delivered_at_full_width() {
+    let expr = concat!(
+        r#"begin P = open_port({spawn,"head -c 100 /dev/zero"}, [binary]), "#,
+        "receive {P,{data,D}} -> D after 500 -> no_data end end"
     );
-    assert!(!stderr.contains("Usage:"), "stderr: {stderr:?}");
-}
+    let (stdout, exit, stderr) = probe(expr, &[], Kind::Value);
+    assert_eq!(exit, 0, "stdout {stdout:?} / stderr {stderr:?}");
+    assert!(stderr.is_empty(), "stderr {stderr:?}");
+    // `~w` renders a binary as `<<b1,b2,…>>`, so the line is `ok <<0,0,…,0>>`: the byte list
+    // between the delimiters must be the *whole* 100-byte read, every element a zero.
+    let rendered = stdout
+        .strip_prefix("ok <<")
+        .and_then(|rest| rest.strip_suffix(">>\n"))
+        .unwrap_or_else(|| panic!("expected a `~w`-printed binary, got {stdout:?}"));
+    let elements: Vec<&str> = rendered.split(',').collect();
+    assert_eq!(
+        elements.len(),
+        100,
+        "the 100-byte read is delivered as one binary: {stdout:?}"
+    );
+    assert!(
+        elements.iter().all(|element| *element == "0"),
+        "every byte of /dev/zero is a NUL: {stdout:?}"
+    );
 
+    // Oracle cross-check: the system `erl` prints the very same line. A missing oracle is a
+    // loud skip, never a silent pass.
+    if let Some(oracle) = support::require_oracle("eval") {
+        match support::oracle_eval(&oracle, None, &wrap(expr, Kind::Value)) {
+            Some(oracle_stdout) => assert_eq!(
+                stdout.trim_end(),
+                oracle_stdout,
+                "the runtime delivers the same binary the oracle does"
+            ),
+            None => eprintln!("SKIP the live-oracle comparison: the erl probe could not answer"),
+        }
+    }
+}
 /// A `-eval` expression outside the grammar is a *capability gap* — exit 3 with exactly/// one `beam_rt: unsupported: …` line. `tests/cli.rs` asserts the shape; here it is
 /// re-asserted through the probe helper so the corpus cannot regress into a silent 0.
 #[test]

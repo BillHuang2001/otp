@@ -19,14 +19,23 @@
 // %CopyrightEnd%
 
 //! In-module unit tests for the baseline tier: the block-target codec and
-//! runtime-block layout (`runtime`), and the register allocator plus the
-//! small-int arithmetic fast path (`emit`).
+//! runtime-block layout (`runtime`), the register allocator plus the
+//! small-int arithmetic fast path (`emit`), and the native cross-module
+//! `call_ext*` transfer (a driver-mediated module-context switch).
+//!
+//! This file is **deliberately long**: it is one comprehensive `#[cfg(test)]` suite over
+//! the whole baseline backend (the split `mod.rs`/`runtime.rs`/`emit/` is exercised here
+//! in one place, so a change to any of them has its unit tests beside it) — a
+//! legitimately-large test module, not a file hiding a second concern. Suites that need a
+//! compiled real `.beam` live in the crate's `tests/` (`jit_real_module`, `jit_bench`).
 use super::emit::*;
-use super::runtime::{RUNTIME_MACHINE_DISP, RUNTIME_XREGS_DISP};
+use super::runtime::{
+    EXT_CALL, EXT_CALL_LAST, EXT_CALL_ONLY, RUNTIME_MACHINE_DISP, RUNTIME_XREGS_DISP,
+};
 use super::*;
 use crate::jit::emitter::Reg;
 use crate::jit::Tier;
-use crate::machine::MAX_REGISTER;
+use crate::machine::{Continuation, MAX_REGISTER};
 use crate::MinimalContext;
 use beam_loader::{
     Block, Export, Function, Import, ImportRef, Instr, Label, Operand, Reg as RegRef, NO_FAIL,
@@ -75,6 +84,7 @@ fn the_runtime_layout_matches_the_offsets_generated_code_uses() {
         labels: &labels,
         ctx: &mut ctx,
         error: None,
+        enter: None,
     };
     let base = &rt as *const JitRuntime as usize;
     let machine_field = &rt.machine as *const *mut Machine as usize;
@@ -1047,12 +1057,15 @@ fn seam_context(callee: &std::sync::Arc<Module>) -> MinimalContext {
 }
 
 /// A `call_ext` the host resolves through [`ExecutionContext::resolve_external_call`]
-/// runs the callee **in this machine** on the interpreter (a module-context
-/// switch). A compiled block has one module's code, label map and literal area
-/// bound, so the native tier reports the documented typed error for that
-/// `Step::Enter` — never a wrong result and never a silent continue.
+/// runs the callee **in this machine** on a module-context switch, and the native tier
+/// drives that switch exactly as the interpreter does: the compiled block's per-instruction
+/// deopt reports the resolved target with the [`ENTER`] word (never a wrong result, never a
+/// silent continue), the driver performs the context switch and enters the callee's own
+/// compiled blocks — or, for a callee the tier has no blocks for, its documented
+/// per-instruction interpreter step — and the callee's `return` unwinds back into the
+/// caller's frame.
 #[test]
-fn a_resolved_cross_module_call_is_a_typed_error_on_the_baseline_tier() {
+fn a_resolved_cross_module_call_runs_on_the_baseline_tier() {
     let callee_module = build_module(
         "callee_x",
         &[],
@@ -1113,21 +1126,22 @@ fn a_resolved_cross_module_call_is_a_typed_error_on_the_baseline_tier() {
         RunOutcome::Returned(make_small(99))
     );
 
+    // The baseline tier drives the same module-context switch (through the block's
+    // `ENTER` word), so it produces the identical result.
     let mut baseline = Machine::new();
     let mut baseline_ctx = seam_context(&callee);
-    let err = baseline
-        .run_export_outcome_with_tier(
-            &caller,
-            name,
-            0,
-            &[],
-            &mut baseline_ctx,
-            Tier::BaselineJit,
-        )
-        .expect_err("a compiled block cannot switch module context");
     assert_eq!(
-        error_reason(&err),
-        "unsupported_opcode: jit: module context switch outside the interpreter driver"
+        baseline
+            .run_export_outcome_with_tier(
+                &caller,
+                name,
+                0,
+                &[],
+                &mut baseline_ctx,
+                Tier::BaselineJit,
+            )
+            .expect("baseline run through the seam"),
+        RunOutcome::Returned(make_small(99))
     );
 }
 
@@ -1137,11 +1151,17 @@ fn a_resolved_cross_module_call_is_a_typed_error_on_the_baseline_tier() {
 // ---------------------------------------------------------------------------
 
 /// The native export entry must record the same run-entry position as the
-/// interpreter's **for an export that is not the module's first function**: the
-/// recorded `(func, arity)` and the last interpreted `(func, pc)` both name
-/// function index `1`, which only the interpreter's own `train` (the phase-8
-/// green thread) and the compiled blocks' deopts can reach — so the two agree
-/// only if `run_native_outcome` ran the interpreter's own `enter_run`.
+/// interpreter's **for an export that is not the module's first function**:
+/// `entry_call` names function index `1`, which only the interpreter's own
+/// `enter_run` (the phase-8 green thread) can record — so the two agree only if
+/// `run_native_outcome` ran the interpreter's own `enter_run`.
+///
+/// `current_code` at the end of the run is the position of the last position *recorded*,
+/// and both tiers record the trailing `return`: the interpreter steps it, and the native
+/// tier's compiled block reaches it through its documented per-instruction deopt. The
+/// block prologue's own block-entry record (`(1, 0)`) is therefore superseded — the
+/// separate linked-chain test pins the case where a natively executed block is the last
+/// thing to record.
 #[test]
 fn the_baseline_entry_records_the_same_run_position_as_the_interpreter() {
     let module = build_module(
@@ -1387,4 +1407,689 @@ fn the_block_spills_its_cached_registers_before_a_helper_call() {
              block must have spilled its resident"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// the block-entry position store
+// ---------------------------------------------------------------------------
+
+/// A position recorded from a **natively executed block's own prologue**.
+///
+/// Every compiled block opens by calling `jit_set_position(rt, func, pc)` with its
+/// own `(func, pc)`, so `Machine::current_code` advances at **block granularity**
+/// even when a linked branch carries control from one block to the next without ever
+/// returning to the driver. The observation uses a block whose execution ends through
+/// the linked tail call's **checked frame pop**: a `deallocate` that no longer matches
+/// the live frame is raised by `jit_tail_call`, which is not an *interpreted*
+/// instruction (the interpreter's own `call_last` does the pop in its instruction
+/// body). So the recorded position is not overwritten afterwards, and the tier's
+/// position is exactly the entry of the last block the linked chain reached.
+///
+/// The interpreter steps the `call_last` instruction, so it records that instruction's
+/// address; the native tier, which linked the `jump` into the successor block and then
+/// popped the frame in the helper, records that successor block's entry. Both report the
+/// same error — the position is the only difference, and it is the block-granularity
+/// contract this store exists for.
+#[test]
+fn a_linked_chain_records_the_last_block_entry_as_the_position() {
+    // `f/0`: block A (`Label(1)`, an inlined `move`, a linked `jump`) transfers straight
+    // into block B (`Label(2)`, the linked `call_last` whose frame pop fails), so the
+    // last block the chain reached is B, at pc 3.
+    let module = build_module(
+        "linked_position",
+        &[],
+        vec![(
+            "f",
+            0,
+            vec![
+                Instr::Label(Label(1)),
+                Instr::Move {
+                    src: Operand::Integer(5),
+                    dst: Operand::X(0),
+                },
+                Instr::Jump { target: Label(2) },
+                Instr::Label(Label(2)),
+                Instr::CallLast {
+                    arity: 0,
+                    target: Label(3),
+                    deallocate: 5,
+                },
+                Instr::Label(Label(3)),
+                Instr::Return,
+            ],
+        )],
+        &[("f", 0, Label(1))],
+    );
+    let name = export_atom(&module, "f");
+
+    let mut baseline = Machine::new();
+    let mut baseline_ctx = MinimalContext::new();
+    let baseline_err = baseline
+        .run_export_outcome_with_tier(
+            &module,
+            name,
+            0,
+            &[],
+            &mut baseline_ctx,
+            Tier::BaselineJit,
+        )
+        .expect_err("the linked tail call's checked frame pop raises");
+    assert_eq!(
+        baseline.current_code(),
+        Some((0, 3)),
+        "the native tier records the entry of the last linked block, not an \
+         interpreted instruction"
+    );
+
+    let mut interpreter = Machine::new();
+    let mut interpreter_ctx = MinimalContext::new();
+    let interpreter_err = interpreter
+        .run_export_outcome_with_tier(
+            &module,
+            name,
+            0,
+            &[],
+            &mut interpreter_ctx,
+            Tier::Interpreter,
+        )
+        .expect_err("the interpreter's own `call_last` pop raises too");
+    assert_eq!(
+        interpreter.current_code(),
+        Some((0, 4)),
+        "the interpreter steps the `call_last` instruction and records its address"
+    );
+
+    // The tier and the interpreter raise the identical error — only the recorded
+    // position differs, exactly as the block-granularity contract intends.
+    assert_eq!(error_reason(&baseline_err), error_reason(&interpreter_err));
+}
+
+// ---------------------------------------------------------------------------
+// resuming a suspension parked inside a cross-module callee
+// ---------------------------------------------------------------------------
+
+/// A tiny in-memory mailbox for the cross-module resume test: a `Vec` of messages
+/// plus a scan position, so the test can fill the queue **between** the suspension
+/// and the resume.
+///
+/// Only the scan methods this receive shape reaches are overridden; the marker
+/// family keeps the [`Mailbox`] trait's typed `unsupported` default (the receive
+/// below has no `recv_marker_*` instruction).
+#[derive(Clone, Default)]
+struct ResumeMailbox {
+    /// The queued messages, in arrival order.
+    messages: std::rc::Rc<std::cell::RefCell<Vec<Eterm>>>,
+    /// The scan position `loop_rec` peeks at; `loop_rec_end` advances it.
+    scan: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+impl ResumeMailbox {
+    /// An empty mailbox.
+    fn new() -> ResumeMailbox {
+        ResumeMailbox::default()
+    }
+
+    /// Queue `message` as the next arrival.
+    fn push(&self, message: Eterm) {
+        self.messages.borrow_mut().push(message);
+    }
+
+    /// The queued messages, in arrival order.
+    fn messages(&self) -> Vec<Eterm> {
+        self.messages.borrow().clone()
+    }
+}
+
+impl crate::Mailbox for ResumeMailbox {
+    fn send_message(&mut self, _to: Eterm, message: Eterm) -> Result<()> {
+        self.push(message);
+        Ok(())
+    }
+
+    fn receive_next(&mut self) -> Result<Option<Eterm>> {
+        let scan = self.scan.get();
+        Ok(self.messages.borrow().get(scan).copied())
+    }
+
+    fn receive_skip(&mut self) -> Result<()> {
+        self.scan.set(self.scan.get() + 1);
+        Ok(())
+    }
+
+    fn receive_remove(&mut self) -> Result<()> {
+        let scan = self.scan.get();
+        let mut messages = self.messages.borrow_mut();
+        if scan < messages.len() {
+            messages.remove(scan);
+        }
+        self.scan.set(0);
+        Ok(())
+    }
+
+    fn receive_reset(&mut self) -> Result<()> {
+        self.scan.set(0);
+        Ok(())
+    }
+
+    // The receive below has no `recv_marker_*` instruction, so the marker family is
+    // the seam's honest "this mailbox cannot serve it" answer, never a silent no-op.
+    fn receive_marker_reserve(&mut self) -> Result<Eterm> {
+        Err(crate::error::unsupported("receive_marker_reserve"))
+    }
+
+    fn receive_marker_bind(&mut self, _marker: Eterm, _reference: Eterm) -> Result<()> {
+        Err(crate::error::unsupported("receive_marker_bind"))
+    }
+
+    fn receive_marker_use(&mut self, _reference: Eterm) -> Result<()> {
+        Err(crate::error::unsupported("receive_marker_use"))
+    }
+
+    fn receive_marker_clear(&mut self, _reference: Eterm) -> Result<()> {
+        Err(crate::error::unsupported("receive_marker_clear"))
+    }
+}
+
+/// A context whose cross-module-call seam resolves `callee_x:g/0` to `entry`
+/// (against the shared `Arc` handle the engine keeps alive while a frame can return
+/// into the callee) and whose mailbox is `mailbox`.
+fn cross_resume_context(
+    callee: &std::sync::Arc<Module>,
+    entry: Label,
+    mailbox: ResumeMailbox,
+) -> MinimalContext {
+    let handle = std::sync::Arc::clone(callee);
+    let mut ctx = MinimalContext::with_external_resolver(Box::new(move |module, function, arity| {
+        if module == "callee_x" && function == "g" && arity == 0 {
+            Ok(Some((std::sync::Arc::clone(&handle), entry)))
+        } else {
+            Ok(None)
+        }
+    }));
+    ctx.set_mailbox(Box::new(mailbox));
+    ctx
+}
+
+/// The caller/callee pair the cross-module resume test drives: `caller_x:f/0`
+/// allocates a frame and `call_ext`s `callee_x:g/0`, whose body scans its mailbox
+/// (`loop_rec`/`remove_message`/`return`) and suspends on an empty one
+/// (`wait`), resuming at the `loop_rec`.
+///
+/// The callee's `wait` re-enters **after** the `allocate`, exactly like the compiler's
+/// own receive loop, so a resume pushes no second frame.
+fn cross_resume_modules() -> (Module, Atom, std::sync::Arc<Module>) {
+    let callee_module = build_module(
+        "callee_x",
+        &[],
+        vec![(
+            "g",
+            0,
+            vec![
+                Instr::Label(Label(1)), // the function label
+                Instr::Label(Label(2)), // the export entry (`allocate`)
+                Instr::Allocate {
+                    stack_need: beam_loader::HeapNeed::Words(0),
+                    live: 0,
+                },
+                Instr::Label(Label(3)), // the `loop_rec` the `wait` resumes at
+                Instr::LoopRec {
+                    fail: Label(4),
+                    dst: Operand::X(0),
+                },
+                Instr::RemoveMessage,
+                Instr::Deallocate(0),
+                Instr::Return,
+                Instr::Label(Label(4)), // the empty-mailbox arm
+                Instr::Wait { target: Label(3) },
+            ],
+        )],
+        &[("g", 0, Label(2))],
+    );
+    let callee = std::sync::Arc::new(callee_module);
+
+    let caller = build_module(
+        "caller_x",
+        &[("callee_x", "g", 0)],
+        vec![(
+            "f",
+            0,
+            vec![
+                Instr::Label(Label(1)),
+                Instr::Label(Label(2)),
+                Instr::Allocate {
+                    stack_need: beam_loader::HeapNeed::Words(0),
+                    live: 0,
+                },
+                Instr::CallExt {
+                    arity: 0,
+                    target: ImportRef(0),
+                },
+                Instr::DeallocateReturn(0),
+            ],
+        )],
+        &[("f", 0, Label(2))],
+    );
+    let name = export_atom(&caller, "f");
+    (caller, name, callee)
+}
+
+/// Park `caller_x:f/0` on an empty mailbox, deliver one message and resume — all on
+/// `tier` — returning `(parked, resumed, remaining messages)`.
+fn park_and_resume(
+    caller: &Module,
+    name: Atom,
+    callee: &std::sync::Arc<Module>,
+    tier: Tier,
+) -> (RunOutcome, RunOutcome, Vec<Eterm>) {
+    let mailbox = ResumeMailbox::new();
+    let mut ctx = cross_resume_context(callee, Label(2), mailbox.clone());
+    let mut machine = Machine::new();
+
+    let parked = machine
+        .run_export_outcome_with_tier(caller, name, 0, &[], &mut ctx, tier)
+        .expect("the empty mailbox parks the process");
+    let (func, pc) = match parked {
+        RunOutcome::Wait { func, pc } => (func, pc),
+        ref other => panic!("expected a wait, got {other:?}"),
+    };
+    // The process is parked **inside the callee**, i.e. in a non-zero module
+    // context: the caller's `call_ext` entered the callee's context, whose registered
+    // handle and module must survive the suspension for the resume to land in it.
+    assert_ne!(
+        machine.current_context(),
+        0,
+        "the suspension must be parked in the callee's module context, not the caller's"
+    );
+
+    mailbox.push(make_small(42));
+    let resumed = machine
+        .resume_outcome_with_tier(caller, func, pc, &mut ctx, tier)
+        .expect("the resume completes");
+    (parked, resumed, mailbox.messages())
+}
+
+/// A suspension parked inside a **cross-module callee** resumes on the native tier and
+/// completes with the interpreter's exact result.
+///
+/// The caller `call_ext`s `callee_x:g/0` through the host's
+/// [`ExecutionContext::resolve_external_call`](crate::ExecutionContext::resolve_external_call)
+/// seam, so the callee runs in the caller's **own** machine and its `receive` parks
+/// the process in the callee's module context. [`Machine::resume_outcome_with_tier`]
+/// with [`Tier::BaselineJit`] therefore starts the driver in that context (read from
+/// `Machine::current_context`), re-binds the callee's module, label map and literal
+/// area, resolves its compiled blocks through `NativeCode::module_blocks`, re-enters
+/// the callee's `(func, pc)`, and the resumed slice unwinds back through the caller's
+/// frame to the identical [`RunOutcome::Returned`].
+///
+/// Without the cross-module resume handling this is the exact case that failed: a
+/// resume that assumed the entry module/context would either run the callee's address
+/// as a caller-module address (a wrong result) or report a typed `unsupported`.
+#[test]
+fn a_suspension_inside_a_cross_module_callee_resumes_on_the_baseline_tier() {
+    let (caller, name, callee) = cross_resume_modules();
+
+    let (interpreter_parked, interpreter_resumed, interpreter_rest) =
+        park_and_resume(&caller, name, &callee, Tier::Interpreter);
+    let (baseline_parked, baseline_resumed, baseline_rest) =
+        park_and_resume(&caller, name, &callee, Tier::BaselineJit);
+
+    assert!(
+        matches!(&interpreter_parked, RunOutcome::Wait { .. }),
+        "the interpreter must park too, got {interpreter_parked:?}"
+    );
+    assert_eq!(
+        baseline_parked, interpreter_parked,
+        "both tiers must report the same resume address for the parked receive"
+    );
+    assert_eq!(
+        interpreter_resumed,
+        RunOutcome::Returned(make_small(42)),
+        "the resumed receive yields the delivered message through the caller's return"
+    );
+    assert_eq!(
+        baseline_resumed, interpreter_resumed,
+        "a resume inside a cross-module callee must be interpreter-identical on the baseline tier"
+    );
+    assert!(
+        baseline_rest.is_empty() && interpreter_rest.is_empty(),
+        "`remove_message` unlinked the matched message on both tiers"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// the native `call_ext*` arm: `jit_ext_call` (resolution + frame discipline)
+//
+// `baseline/runtime.rs::jit_ext_call` — over the pure-Rust `resolve_ext_entry` —
+// is the helper the `baseline/emit/mod.rs::emit_ext_call` arm wires into every
+// compiled block's `call_ext*` lowering, so those instructions no longer deopt
+// unconditionally. For an import the host resolves through
+// `ExecutionContext::resolve_external_call`, the helper returns the [`ENTER`]
+// word and hands the resolved `(context, func, pc)` to the driver through
+// `JitRuntime::enter`, applying the variant's frame discipline (`CallExt` stores
+// `Continuation::Address { func, pc + 1, context }` first, `CallExtOnly` stores
+// nothing, `CallExtLast` resolves *then* pops). Anything the host cannot run here
+// — `Ok(None)`, an unresolved import/entry label, a failed frame discipline —
+// mutates nothing and falls back to `jit_step_one` (the interpreter's own step),
+// so the synchronous `call_bif` path and every one of its errors are
+// byte-identical to the tier before the arm existed.
+// ---------------------------------------------------------------------------
+
+/// A caller module `caller_x` importing `callee_x:g/0`, whose `f/0` allocates a
+/// zero-Y frame and then executes `call` at the function's last code index.
+///
+/// Returns the module and the `(func, pc)` of `call` (`func` is always `0`).
+fn ext_call_caller(call: Instr) -> (Module, (u32, u32)) {
+    let code = vec![
+        Instr::Label(Label(1)), // the function label
+        Instr::Label(Label(2)), // the export entry
+        Instr::Allocate {
+            stack_need: beam_loader::HeapNeed::Words(0),
+            live: 0,
+        },
+        call,
+    ];
+    let pc = (code.len() - 1) as u32;
+    let module = build_module(
+        "caller_x",
+        &[("callee_x", "g", 0)],
+        vec![("f", 0, code)],
+        &[("f", 0, Label(2))],
+    );
+    (module, (0, pc))
+}
+
+/// The callee `callee_x:g/0` the seam resolves to: its export entry is
+/// `Label(1)` at code index `0`.
+fn ext_call_callee() -> std::sync::Arc<Module> {
+    std::sync::Arc::new(build_module(
+        "callee_x",
+        &[],
+        vec![(
+            "g",
+            0,
+            vec![
+                Instr::Label(Label(1)),
+                Instr::Move {
+                    src: Operand::Integer(99),
+                    dst: Operand::X(0),
+                },
+                Instr::Return,
+            ],
+        )],
+        &[("g", 0, Label(1))],
+    ))
+}
+
+/// The observable result of one [`jit_ext_call`] invocation on a fresh machine
+/// holding a single live zero-Y frame.
+struct ExtCallProbe {
+    /// The block-ABI word the helper returned.
+    word: i64,
+    /// The `(context, func, pc)` the helper handed the driver, when it resolved.
+    enter: Option<(u32, u32, u32)>,
+    /// The typed error the helper stored, if any.
+    error: Option<beam_common::BeamError>,
+    /// The machine's frame depth after the call.
+    frame_depth: usize,
+    /// The caller frame's continuation after the call (`None` once popped).
+    continuation: Option<Continuation>,
+    /// `x(0)` after the call.
+    x0: Option<Eterm>,
+}
+
+/// Invoke [`jit_ext_call`] for `kind`/`deallocate` at `(func, pc)` on a fresh
+/// machine holding a single live zero-Y frame, with `ctx` as the context.
+fn run_ext_call(
+    caller: &Module,
+    (func, pc): (u32, u32),
+    mut ctx: MinimalContext,
+    kind: u32,
+    deallocate: u32,
+) -> ExtCallProbe {
+    let mut machine = Machine::new();
+    machine
+        .push_frame(0)
+        .expect("the caller's zero-Y frame");
+    let labels = crate::interpreter::build_label_map(caller);
+    let x_regs = machine.x.as_mut_ptr();
+    let mut rt = JitRuntime {
+        machine: &mut machine,
+        x_regs,
+        module: caller,
+        labels: &labels,
+        ctx: &mut ctx,
+        error: None,
+        enter: None,
+    };
+    // `caller_x`'s only import is `callee_x:g/0`, i.e. `ImportRef(0)`.
+    let word = jit_ext_call(&mut rt as *mut JitRuntime<'_>, func, pc, 0, kind, deallocate);
+    ExtCallProbe {
+        word,
+        enter: rt.enter,
+        error: rt.error.take(),
+        frame_depth: machine.frame_depth(),
+        continuation: machine.continuation().ok(),
+        x0: machine.x(0),
+    }
+}
+
+/// `call_ext` resolves through the host's seam: the helper returns the [`ENTER`]
+/// word, hands the driver the callee's `(context, func, pc)`, and — **first** —
+/// stores the caller's return address (`Continuation::Address { func, pc + 1,
+/// context }`) in the live frame, exactly like the interpreter's `Instr::CallExt`.
+#[test]
+fn jit_ext_call_resolves_call_ext_into_an_enter_and_stores_the_continuation() {
+    let (caller, (func, pc)) = ext_call_caller(Instr::CallExt {
+        arity: 0,
+        target: ImportRef(0),
+    });
+    let callee = ext_call_callee();
+    let probe = run_ext_call(&caller, (func, pc), seam_context(&callee), EXT_CALL, 0);
+
+    assert_eq!(probe.word, ENTER, "a resolved call_ext reports the ENTER word");
+    let (context, callee_func, callee_pc) = probe
+        .enter
+        .expect("the resolved target is handed to the driver through rt.enter");
+    assert_eq!(
+        context, 1,
+        "the callee is the machine's first registered module context"
+    );
+    assert_eq!(
+        (callee_func, callee_pc),
+        (0, 0),
+        "the callee's export entry `g/0` is `Label(1)` -> `(func 0, pc 0)`"
+    );
+    assert_eq!(probe.frame_depth, 1, "call_ext keeps the caller's frame");
+    assert_eq!(
+        probe.continuation,
+        Some(Continuation::Address {
+            func,
+            pc: pc + 1,
+            context: 0,
+        }),
+        "call_ext stores its return address (its own func, pc + 1, caller context)"
+    );
+}
+
+/// `call_ext_only` is a tail call: it stores **no** continuation — the callee
+/// returns along the frame's *existing* continuation (the bottom `Halt` here) —
+/// but still hands the driver the resolved target.
+#[test]
+fn jit_ext_call_only_enters_without_storing_a_continuation() {
+    let (caller, (func, pc)) = ext_call_caller(Instr::CallExtOnly {
+        arity: 0,
+        target: ImportRef(0),
+    });
+    let callee = ext_call_callee();
+    let probe = run_ext_call(&caller, (func, pc), seam_context(&callee), EXT_CALL_ONLY, 0);
+
+    assert_eq!(
+        probe.word, ENTER,
+        "a resolved call_ext_only reports the ENTER word"
+    );
+    assert_eq!(
+        probe.enter.map(|(c, f, p)| (c, f, p)),
+        Some((1, 0, 0)),
+        "the callee's export entry is handed to the driver"
+    );
+    assert_eq!(probe.frame_depth, 1, "a tail call reuses the caller's frame");
+    assert_eq!(
+        probe.continuation,
+        Some(Continuation::Halt),
+        "call_ext_only stores nothing: the frame keeps its existing continuation"
+    );
+}
+
+/// `call_ext_last` resolves the target **then** pops the caller's frame (the
+/// interpreter's own `pop_frame_checked`), so a resolved tail call leaves no
+/// frame behind.
+#[test]
+fn jit_ext_call_last_resolves_then_pops_the_frame() {
+    let (caller, (func, pc)) = ext_call_caller(Instr::CallExtLast {
+        arity: 0,
+        target: ImportRef(0),
+        deallocate: 0,
+    });
+    let callee = ext_call_callee();
+    let probe = run_ext_call(&caller, (func, pc), seam_context(&callee), EXT_CALL_LAST, 0);
+
+    assert_eq!(
+        probe.word, ENTER,
+        "a resolved call_ext_last reports the ENTER word"
+    );
+    assert_eq!(
+        probe.enter,
+        Some((1, 0, 0)),
+        "the callee's entry is resolved before the pop"
+    );
+    assert_eq!(
+        probe.frame_depth, 0,
+        "call_ext_last pops the caller's frame"
+    );
+    assert_eq!(
+        probe.continuation, None,
+        "there is no caller frame left to hold a continuation"
+    );
+}
+
+/// A host that cannot run the callee (`resolve_external_call` -> `Ok(None)`)
+/// falls back to [`jit_step_one`] — the interpreter's own step — which runs the
+/// *whole* instruction through the synchronous `call_bif` path: the helper
+/// reports the advance (`func, pc + 1`), `x(0)` gets the BIF's result, `rt.enter`
+/// stays `None` and the cross-module frame discipline never runs.
+#[test]
+fn jit_ext_call_falls_back_to_the_synchronous_path_when_no_callee_resolves() {
+    let (caller, (func, pc)) = ext_call_caller(Instr::CallExt {
+        arity: 0,
+        target: ImportRef(0),
+    });
+    // No resolver is installed, so the seam answers `Ok(None)`; the BIF hook is
+    // then the synchronous dispatch path and answers `callee_x:g/0` with `7`.
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(None::<(String, String, u32)>));
+    let record = std::rc::Rc::clone(&seen);
+    let ctx = MinimalContext::with_bif_hook(Box::new(move |module, function, arity, _args| {
+        *record.borrow_mut() = Some((module.to_string(), function.to_string(), arity));
+        Ok(make_small(7))
+    }));
+    let probe = run_ext_call(&caller, (func, pc), ctx, EXT_CALL, 0);
+
+    assert_eq!(
+        *seen.borrow(),
+        Some(("callee_x".to_string(), "g".to_string(), 0)),
+        "the fallback dispatches the caller's import through call_bif"
+    );
+    assert_eq!(
+        probe.word,
+        encode_target(func, pc + 1),
+        "the fallback runs the interpreter's CallExt, which advances by one"
+    );
+    assert_eq!(
+        probe.enter, None,
+        "no cross-module transfer is reported on the synchronous path"
+    );
+    assert_eq!(
+        probe.x0,
+        Some(make_small(7)),
+        "the synchronous call_bif wrote its result to x(0)"
+    );
+    assert_eq!(
+        probe.frame_depth, 1,
+        "the synchronous path keeps the caller's frame"
+    );
+    assert_eq!(
+        probe.continuation,
+        Some(Continuation::Halt),
+        "call_ext stores no continuation on the BIF path"
+    );
+}
+
+/// A `call_ext_last` whose `Deallocate` operand is **stale** (its frame size no
+/// longer matches the live frame — the shape `trim` produces) must not fabricate
+/// a wrong `ENTER`: the frame discipline's checked pop rejects the mismatch, the
+/// helper mutates nothing and falls back to [`jit_step_one`], which re-runs the
+/// instruction and reports the interpreter's exact `deallocate: frame size
+/// mismatch` error. The caller's frame is left intact.
+#[test]
+fn jit_ext_call_last_rejects_a_stale_deallocate_with_the_checked_pop_error() {
+    // The live frame has zero Y slots; the operand claims two -> a mismatch.
+    let (caller, (func, pc)) = ext_call_caller(Instr::CallExtLast {
+        arity: 0,
+        target: ImportRef(0),
+        deallocate: 2,
+    });
+    let callee = ext_call_callee();
+    let probe = run_ext_call(&caller, (func, pc), seam_context(&callee), EXT_CALL_LAST, 2);
+
+    assert_eq!(
+        probe.word, ERROR,
+        "a failed frame discipline is the typed ERROR word, never a wrong ENTER"
+    );
+    assert_eq!(
+        probe.enter, None,
+        "nothing is handed to the driver when the discipline fails"
+    );
+    assert_eq!(
+        probe.frame_depth, 1,
+        "the rejected pop leaves the caller's frame intact"
+    );
+    let err = probe
+        .error
+        .expect("the fallback's typed error is stored in rt.error");
+    assert_eq!(
+        error_reason(&err),
+        "unsupported_opcode: deallocate: frame size mismatch"
+    );
+}
+
+/// The emit arm actually wires the helper into a compiled block: the artifact's
+/// machine code contains the `movabs r11, <jit_ext_call>` immediate that
+/// `emit_ext_call` emits (the same `movabs r11, helper` shape every helper call
+/// uses), so a `call_ext*` no longer lowers to an unconditional deopt.
+#[test]
+fn the_compiled_block_wires_the_ext_call_helper_into_native_code() {
+    let (caller, _) = ext_call_caller(Instr::CallExt {
+        arity: 0,
+        target: ImportRef(0),
+    });
+    let compiled = compile_module(&caller).expect("the caller module compiles");
+    assert!(compiled.block_count() > 0, "the caller module produced a block");
+
+    // `mov r11, imm64` (the `movabs` form) is `49 BB <imm64 little-endian>`; the
+    // immediate is the helper's address.
+    let helper = jit_ext_call as *const () as usize;
+    let mut needle = vec![0x49u8, 0xBB];
+    needle.extend_from_slice(&(helper as u64).to_le_bytes());
+
+    let (start, end) = compiled.code_address_range();
+    // SAFETY: `[start, end)` is the artifact's live, sealed executable mapping,
+    // which `compiled` owns and keeps mapped for this borrow; reading it as bytes
+    // is valid and does not execute it.
+    let code = unsafe { std::slice::from_raw_parts(start as *const u8, end - start) };
+
+    assert!(
+        code.windows(needle.len())
+            .any(|window| window == needle.as_slice()),
+        "the compiled block must `movabs r11, <jit_ext_call>`; its absence means the \
+         emit arm did not wire the native `call_ext*` helper"
+    );
 }

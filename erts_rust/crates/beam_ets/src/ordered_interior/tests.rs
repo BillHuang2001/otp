@@ -986,3 +986,118 @@
         // The seam and the inherent accessor agree.
         assert_eq!(Interior::memory(&t), populated);
     }
+
+    /// A ≥100k-key stress: scattered insertion, per-key reads, a scattered
+    /// removal/re-insert round and a full drain — with the structural invariants
+    /// re-checked throughout, so the fan-out bound (`<= ORDER`), the occupancy
+    /// floor, the separator **term identity**, the leaf-chain coherence and the
+    /// strict key ascent are all asserted at scale.
+    ///
+    /// The expected iteration order is the ascending arithmetic key run `0..N` —
+    /// exactly what the oracle's `ets:tab2list/1` yields for an `ordered_set` (the
+    /// live-oracle `ordered_large` differential case pins the agreement of that
+    /// order at 10 001 keys; this test scales the *structure* two orders of
+    /// magnitude further and drives insert/delete churn through every rebalance
+    /// path).
+    ///
+    /// Objects are immediates, so no heap is needed and the test measures the
+    /// index, not an arena.
+    #[test]
+    fn one_hundred_thousand_keys_survive_churn_with_the_invariants_held() {
+        const N: i64 = 100_000;
+        let atoms = AtomTable::new();
+        let mut t = OrderedSetInterior::new();
+
+        // Scattered insertion (the coprime stride `65_537` visits every index
+        // exactly once): the tree splits its way down to several levels.
+        for (step, k) in shuffled(N, 65_537).enumerate() {
+            assert!(
+                t.insert_new(make_small(k), make_small(k * 3), &atoms).unwrap(),
+                "key {k} is new"
+            );
+            if step % 5_000 == 0 {
+                t.tree.check_invariants(&atoms);
+            }
+        }
+        assert_eq!(t.size(), N as usize);
+        t.tree.check_invariants(&atoms);
+        assert!(
+            t.tree.height() >= 3,
+            "100k keys need more than two levels (height {})",
+            t.tree.height()
+        );
+
+        // Every key reads back its own object; navigation is exact at both ends.
+        for k in 0..N {
+            assert!(t.member(make_small(k), &atoms), "key {k} is a member");
+            assert_eq!(t.lookup(make_small(k), &atoms), vec![make_small(k * 3)]);
+        }
+        assert_eq!(t.first(&atoms), Some(make_small(0)));
+        assert_eq!(t.last(&atoms), Some(make_small(N - 1)));
+        assert_eq!(t.next(make_small(N / 2), &atoms), Some(make_small(N / 2 + 1)));
+        assert_eq!(t.prev(make_small(N / 2), &atoms), Some(make_small(N / 2 - 1)));
+        assert_eq!(t.next(make_small(N - 1), &atoms), None);
+        assert_eq!(t.prev(make_small(0), &atoms), None);
+        // A present anchor's successor, and an absent bound beyond every key.
+        assert_eq!(t.next(make_small(12_345), &atoms), Some(make_small(12_346)));
+        assert_eq!(t.next(make_small(N + 5), &atoms), None);
+        assert_eq!(t.prev(make_small(-1), &atoms), None);
+
+        // The full leaf-chain walk is exactly the ascending key run (the oracle's
+        // `ordered_set` iteration order).
+        assert_eq!(
+            ordered_keys(&t, &atoms),
+            (0..N).map(make_small).collect::<Vec<_>>()
+        );
+
+        // Remove every third key — forcing borrow/merge across the whole tree …
+        let removed: Vec<i64> = (0..N).step_by(3).collect();
+        let mut present = vec![true; N as usize];
+        for &k in &removed {
+            present[k as usize] = false;
+            t.delete(make_small(k), &atoms).unwrap();
+        }
+        assert_eq!(t.size(), N as usize - removed.len());
+        t.tree.check_invariants(&atoms);
+        for k in 0..N {
+            assert_eq!(
+                t.member(make_small(k), &atoms),
+                present[k as usize],
+                "membership of {k} after the deletes"
+            );
+        }
+        assert_eq!(
+            ordered_keys(&t, &atoms),
+            (0..N)
+                .filter(|k| present[*k as usize])
+                .map(make_small)
+                .collect::<Vec<_>>()
+        );
+
+        // … re-insert them (re-splitting around the holes) …
+        for &k in &removed {
+            assert!(t
+                .insert_new(make_small(k), make_small(k * 3), &atoms)
+                .unwrap());
+        }
+        assert_eq!(t.size(), N as usize);
+        t.tree.check_invariants(&atoms);
+        assert_eq!(
+            ordered_keys(&t, &atoms),
+            (0..N).map(make_small).collect::<Vec<_>>()
+        );
+
+        // … then drain the whole tree; the last delete collapses the root back to
+        // a single empty leaf.
+        for (step, k) in shuffled(N, 65_537).enumerate() {
+            t.delete(make_small(k), &atoms).unwrap();
+            if step % 5_000 == 0 {
+                t.tree.check_invariants(&atoms);
+            }
+        }
+        assert_eq!(t.size(), 0);
+        assert!(t.iter_objects().next().is_none());
+        assert_eq!(t.first(&atoms), None);
+        assert_eq!(t.last(&atoms), None);
+        t.tree.check_invariants(&atoms);
+    }

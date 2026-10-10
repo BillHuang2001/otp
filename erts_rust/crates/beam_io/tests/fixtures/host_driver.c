@@ -15,9 +15,9 @@
  * `host_driver`.
  *
  * Portability note: this fixture references ONLY `driver_*` symbols whose host slots are
- * implemented today (alloc/free, output, output-term, select, timers, async). Referencing an
- * unimplemented slot would make `dlopen(RTLD_NOW)` fail, so the fixture deliberately keeps to
- * that subset.
+ * implemented today (alloc/free, output, output-term, select, timers, async, the port queues).
+ * Referencing an unimplemented slot would make `dlopen(RTLD_NOW)` fail, so the fixture deliberately
+ * keeps to that subset.
  *
  * ## The start command
  *
@@ -104,6 +104,25 @@
  *  18  `driver_select(port, fd, ERL_DRV_READ | ERL_DRV_USE, 1)` followed by
  *      `driver_select(port, fd, ERL_DRV_READ | ERL_DRV_USE_NO_CALLBACK, 1)` — a re-selection that
  *      **declines** the callback, which must clear the obligation; return the second host's code.
+ *  19  `driver_enq(port, buf, len)` — append the control argument to the port's **driver queue**
+ *      (the C's `prt->ioq`); answer `enq=<rc>` (the host's return code, `0` = queued).
+ *  20  `driver_sizeq(port)`; answer `size=<n>`.
+ *  21  `driver_peekq(port, &vlen)`; answer `vlen=<v> bytes=<the queued head bytes>` (the whole
+ *      queue when non-empty, `vlen == 1` — the host's one-contiguous-entry shape).
+ *  22  `driver_deq(port, n)` with `n` an `int` from the argument (default `0`); answer
+ *      `deq=<left> size=<n>`, where `left` is `driver_deq`'s return — the **new** queue size, or
+ *      `(ErlDrvSizeT)-1` when `n` exceeds the queue (which then stays untouched, `io.c:6807`).
+ *  23  `driver_peekqv(port, &ev)`; answer `qvsize=<v> qsize=<n> bytes=<the queued head bytes>`.
+ *  24  `driver_select(port, (ErlDrvEvent) fd, ERL_DRV_WRITE, 1)` — arm the **write** direction on
+ *      the configured fd, so a write-readiness event schedules an `OUTPUT` task; return the host's
+ *      code (or -1 when no fd was configured).
+ *
+ * Verbs 19–24 answer their observation as `key=value` text; the `bytes=` field is the trailing raw
+ * payload and every other field is a decimal number. Verbs 19–23 are the driver-queue family
+ * (`driver_enq`/`driver_sizeq`/`driver_peekq[v]`/`driver_deq`, `io.c:6790-6919`): the queue is the
+ * host's driver-private byte queue (the C's `prt->ioq`, **not** the port's Erlang→driver output
+ * queue), so it persists across these `control` calls for the port's whole life and a host can
+ * drive the four steps in order.
  *
  * Any other command returns `-1`, the C's negative `cres` (`port_control/3` answers `badarg`,
  * `io.c:4074`).
@@ -124,16 +143,22 @@
  * have run — the release tests drop the port instead of closing it (a closed port has freed the
  * state, and the release still has to be delivered).
  *
- * ## The two builds
+ * ## The variant builds
  *
  * `host_driver.c` builds an entry whose `ready_async` is `host_ready_async`, whose `process_exit` is
  * `host_process_exit` and whose `emergency_close` is `host_emergency_close`. Each slot has its own
  * `_SLOT` override macro, so a variant that `#include`s this file can force any of them to `NULL`
- * (see `host_driver_no_ready_async.c`, the `NULL`-slot build the host's `async_free` arm is
- * exercised with, and `host_driver_no_process_exit.c`, the build the port-exit adapter's
- * `emergency_close` fallback is exercised with).
+ * (`host_driver_no_ready_async.c`, the `NULL`-slot build the host's `async_free` arm is exercised
+ * with, and `host_driver_no_process_exit.c`, the build the port-exit adapter's `emergency_close`
+ * fallback is exercised with).
+ *
+ * The three write-side slots are `output`, `outputv` and `ready_output`. The base entry declares
+ * `output` and `ready_output` but leaves `outputv` `NULL` (an `output`-only driver); the `outputv`
+ * *callback* is compiled only when a variant asks for it by defining `HOST_DRIVER_OUTPUTV_SLOT`
+ * (which also sets `HOST_DRIVER_HAS_OUTPUTV`). `host_driver_both.c` sets the slot to
+ * `host_outputv`, so its entry is the one build that declares all three at once — the shape the
+ * C's `outputv`-over-`output` preference (`io.c:1782`) is about.
  */
-
 /* The fixture uses the POSIX `nanosleep` (the slow async job) and `read`/`close`, which a strict
  * `-std=c99` compilation does not expose without a feature-test macro; ask for POSIX.1-2008
  * before any header is read so the fixture builds under `-std=c99` as well as the default mode. */
@@ -178,6 +203,17 @@
 #define HOST_DRIVER_HAS_EMERGENCY_CLOSE 1
 #endif
 
+/* The entry's `outputv` slot: `NULL` in the base fixture (the `output`-only shape) and the vector
+ * callback in a variant that asks for it. This is the mirror of the `_SLOT` blocks above with the
+ * default flipped to `NULL`: the base entry deliberately declares only `output`, and the variant
+ * that wants both write callbacks (`host_driver_both.c`) defines `HOST_DRIVER_OUTPUTV_SLOT` to
+ * `host_outputv`, which also tells this file to compile that callback (never an unused-function
+ * warning in the base build). */
+#ifdef HOST_DRIVER_OUTPUTV_SLOT
+#define HOST_DRIVER_HAS_OUTPUTV 1
+#else
+#define HOST_DRIVER_OUTPUTV_SLOT NULL
+#endif
 /* Private per-port state, allocated in `start` and freed in `stop`. */
 typedef struct {
     ErlDrvPort port;   /* the port handle `output`/`timeout` need (they get no port argument) */
@@ -278,6 +314,39 @@ static int buf_int(char *buf, ErlDrvSizeT len, int def) {
     return v;
 }
 
+/* Copy `prefix`, then `data[0 .. len]` (when non-null), into the caller's reply buffer and return
+ * the total length. A reply that does not fit answers the C's negative `cres`, which never happens
+ * for these reports: the host always hands in a 4096-byte buffer. */
+static ErlDrvSSizeT reply_prefixed(char **rbuf, ErlDrvSizeT rlen,
+                                   const char *prefix, const char *data, ErlDrvSizeT len) {
+    size_t plen = strlen(prefix);
+    if (rbuf == NULL || *rbuf == NULL || plen + (size_t) len > (size_t) rlen)
+        return (ErlDrvSSizeT) -1;
+    memcpy(*rbuf, prefix, plen);
+    if (data != NULL && len > 0)
+        memcpy(*rbuf + plen, data, (size_t) len);
+    return (ErlDrvSSizeT) (plen + (size_t) len);
+}
+
+/* Gather `iov[0 .. vlen]` into `out` (bounded by `cap`) and return the byte count; an entry with a
+ * null base or a zero length contributes nothing. Used by the peek verbs to linearize the iovec
+ * view the host publishes into a byte payload the reply can carry. */
+static ErlDrvSizeT gather_iov(char *out, ErlDrvSizeT cap, const SysIOVec *iov, int vlen) {
+    ErlDrvSizeT n = 0;
+    int i;
+    if (iov == NULL || vlen <= 0)
+        return 0;
+    for (i = 0; i < vlen && n < cap; i++) {
+        ErlDrvSizeT len = iov[i].iov_len;
+        if (iov[i].iov_base == NULL || len == 0)
+            continue;
+        if (len > cap - n)
+            len = cap - n;
+        memcpy(out + n, iov[i].iov_base, (size_t) len);
+        n += len;
+    }
+    return n;
+}
 /* The `fail-start=<kind>` token: the `start` sentinel the command string asks for, so a host can
  * observe the C's three `ERL_DRV_ERROR_*` `start` failures through a real shared object. Scans
  * `command` (the same whitespace/comma separated tokenization `parse_command` uses) and answers the
@@ -411,6 +480,33 @@ static void host_output(ErlDrvData drv_data, char *buf, ErlDrvSizeT len) {
     }
     (void) driver_output(st->port, buf, len);
 }
+
+#ifdef HOST_DRIVER_HAS_OUTPUTV
+/* The C's **vector** port-command callback (`io.c:1842-1864`): `iov[0]` is the empty header block a
+ * driver may fill in, `iov[1]` the data. An entry that declares it is preferred over `output`
+ * (`if (drv->outputv) { … } else { … drv->output … }`, `io.c:1782`) — the preference
+ * `host_driver_both.c` exists to exercise. It logs `outputv` (so a host can prove the vector form
+ * ran **and** the plain form did not: `output` logs `output`) and echoes the data block back
+ * through `driver_output`. */
+static void host_outputv(ErlDrvData drv_data, ErlIOVec *ev) {
+    host_state *st = (host_state *) drv_data;
+    if (st == NULL)
+        return;
+    log_event(st, "outputv");
+    log_handle(st);
+    if (ev != NULL && ev->vsize >= 2 && ev->iov != NULL && ev->iov[1].iov_base != NULL) {
+        char *data = (char *) ev->iov[1].iov_base;
+        ErlDrvSizeT len = ev->iov[1].iov_len;
+        if (strcmp(st->mode, "upper") == 0) {
+            ErlDrvSizeT i;
+            for (i = 0; i < len; i++)
+                if (data[i] >= 'a' && data[i] <= 'z')
+                    data[i] = (char) (data[i] - 'a' + 'A');
+        }
+        (void) driver_output(st->port, data, len);
+    }
+}
+#endif
 
 /* A readable descriptor: read(2) to EAGAIN (or EOF) and forward every byte read. */
 static void host_ready_input(ErlDrvData drv_data, ErlDrvEvent event) {
@@ -609,6 +705,58 @@ static ErlDrvSSizeT host_control(ErlDrvData drv_data, unsigned int command,
                              ERL_DRV_READ | ERL_DRV_USE, 1);
         return (ErlDrvSSizeT) driver_select(st->port, (ErlDrvEvent) (intptr_t) st->fd,
                                             ERL_DRV_READ | ERL_DRV_USE_NO_CALLBACK, 1);
+    case 19: {
+        /* `driver_enq`: append the control argument bytes to the driver queue. */
+        char out[64];
+        snprintf(out, sizeof(out), "enq=%d", driver_enq(st->port, buf, len));
+        return reply_prefixed(rbuf, rlen, out, NULL, 0);
+    }
+    case 20: {
+        /* `driver_sizeq`: how many bytes are on the driver queue. */
+        char out[64];
+        snprintf(out, sizeof(out), "size=%lu", (unsigned long) driver_sizeq(st->port));
+        return reply_prefixed(rbuf, rlen, out, NULL, 0);
+    }
+    case 21: {
+        /* `driver_peekq`: the head iovec view. Report the entry count the host publishes
+         * (`vlen`) and then the bytes themselves. */
+        char out[64];
+        char head[512];
+        int vlen = -2;
+        ErlDrvSizeT n;
+        SysIOVec *iov = driver_peekq(st->port, &vlen);
+        n = gather_iov(head, sizeof(head), iov, vlen);
+        snprintf(out, sizeof(out), "vlen=%d bytes=", vlen);
+        return reply_prefixed(rbuf, rlen, out, head, n);
+    }
+    case 22: {
+        /* `driver_deq`: drop `n` bytes (an `int` argument, default 0) from the head. Report the
+         * C's return — the new queue size, or `(ErlDrvSizeT)-1` when `n` exceeds the queue. */
+        char out[80];
+        ErlDrvSizeT left = driver_deq(st->port, (ErlDrvSizeT) buf_int(buf, len, 0));
+        snprintf(out, sizeof(out), "deq=%lu size=%lu",
+                 (unsigned long) left, (unsigned long) driver_sizeq(st->port));
+        return reply_prefixed(rbuf, rlen, out, NULL, 0);
+    }
+    case 23: {
+        /* `driver_peekqv`: the vector form of the head view. Report `vsize`, the returned total
+         * size and the bytes. */
+        char out[64];
+        char head[512];
+        ErlIOVec ev = {0, 0, NULL, NULL};
+        ErlDrvSizeT n = driver_peekqv(st->port, &ev);
+        ErlDrvSizeT got = gather_iov(head, sizeof(head), ev.iov, (int) ev.vsize);
+        snprintf(out, sizeof(out), "qvsize=%d qsize=%lu bytes=",
+                 (int) ev.vsize, (unsigned long) n);
+        return reply_prefixed(rbuf, rlen, out, head, got);
+    }
+    case 24:
+        /* Arm the **write** direction on the configured fd, so a write-readiness event schedules
+         * an `OUTPUT` task (the `PortArms` gate). Returns the host's code. */
+        if (st->fd < 0)
+            return (ErlDrvSSizeT) -1;
+        return (ErlDrvSSizeT) driver_select(st->port, (ErlDrvEvent) (intptr_t) st->fd,
+                                            ERL_DRV_WRITE, 1);
     default:
         /* An unrecognised request: a negative `cres`, which `port_control/3` reports as `badarg`. */
         return (ErlDrvSSizeT) -1;
@@ -627,7 +775,7 @@ static ErlDrvEntry host_driver_entry = {
     .handle = NULL,
     .control = host_control,
     .timeout = host_timeout,
-    .outputv = NULL,
+    .outputv = HOST_DRIVER_OUTPUTV_SLOT,
     .ready_async = HOST_DRIVER_READY_ASYNC_SLOT,
     .flush = NULL,
     .call = NULL,

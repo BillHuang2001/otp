@@ -96,11 +96,13 @@ use crate::error;
 use crate::registry::BifRegistry;
 
 /// The atom `undefined` — the value `whereis/1` returns for an unregistered name
-/// (`erts_whereis_name_to_id`, `register.c:279`). Resolved from the context's
-/// atom table; a table without it is the crate's usual `TermNotFound`, never a
-/// fabricated atom.
-fn undefined(ctx: &BifContext<'_>) -> Result<Eterm> {
-    ctx.atom("undefined")
+/// (`erts_whereis_name_to_id`, `register.c:279`) and the value the two
+/// `process_info` forms return for a dead process. *Produced* here, so it is
+/// interned on demand ([`BifContext::intern_atom`]) rather than looked up: a
+/// runtime whose boot seed lacks `undefined` would otherwise abort the whole
+/// process with an uncatchable `TermNotFound` instead of answering `undefined`.
+fn undefined(ctx: &mut BifContext<'_>) -> Result<Eterm> {
+    ctx.intern_atom("undefined")
 }
 
 /// `erlang:whereis(Name)` — the pid (or port) registered under `Name`, or the

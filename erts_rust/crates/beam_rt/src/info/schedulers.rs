@@ -43,6 +43,27 @@
 //! | `multi_scheduling_blockers` / `normal_multi_scheduling_blockers` | `[]` |
 //! | `thread_pool_size` | int (`+A N` clamped to `>= 1`, else `1`) |
 //! | `context_reductions` | int (`4000`, the `CONTEXT_REDS` interface constant) |
+//!
+//! # The scheduler *state* and *statistics* keys
+//!
+//! `erl_bif_info.c:3258-3352` answers a further group of keys from the same
+//! `erts_schedulers_state()` snapshot this runtime already derives its scalar scheduler
+//! keys from, so they are served here with this runtime's own figures (the differential
+//! suite compares them **shape-only**, exactly like `schedulers`):
+//!
+//! | key | shape | this runtime |
+//! |---|---|---|
+//! | `schedulers_total` | int | the same count as `schedulers` |
+//! | `schedulers_active` | int | every scheduler this runtime has is active |
+//! | `schedulers_state` | `{Total,Online,Active}` | all three the one scheduler count |
+//! | `all_schedulers_state` | a list of `{Pool,Total,Online,Active}` rows | the `normal` row always, plus a `dirty_cpu`/`dirty_io` row when the `+SDcpu`/`+SDio` pool is configured (the C omits a pool whose total is `0`) |
+//! | `run_queues` | int | one run queue per normal scheduler (`erts_no_run_queues`) |
+//! | `cpu_quota` | int | this runtime's processor count (`erts_get_logical_processors`; `unknown` in the oracle when the host reports none) |
+//! | `scheduling_statistics` / `total_scheduling_statistics` | `[{process_max,0,0},…,{port,0,0}]` | this runtime collects no scheduling statistics, so every executed/migrated counter is the honest `0` |
+//!
+//! The `scheduling_statistics` list is the oracle's five `{Prio, Executed, Migrated}`
+//! rows in its own priority order (`process_max`, `process_high`, `process_normal`,
+//! `process_low`, `port` — `erts_sched_stat_term` over `ERTS_NO_PRIO_LEVELS`).
 
 use beam_common::Result;
 
@@ -85,8 +106,106 @@ pub(crate) fn try_value(key: &str, rt: &Runtime) -> Option<Result<InfoValue>> {
         // `erlang:system_info(context_reductions)` is `make_small(CONTEXT_REDS)`, a frozen
         // ERTS interface constant (`beam_common::CONTEXT_REDS`) reported as `4000` always.
         "context_reductions" => Some(Ok(InfoValue::Int(beam_common::CONTEXT_REDS as i64))),
+        // The scheduler *state* keys, all from this runtime's own scheduler model.
+        "schedulers_total" | "schedulers_active" | "run_queues" => {
+            Some(Ok(InfoValue::Int(schedulers_count(rt))))
+        }
+        "schedulers_state" => Some(Ok(schedulers_state(rt))),
+        "all_schedulers_state" => Some(Ok(all_schedulers_state(rt))),
+        // `erts_get_logical_processors(…, &no)`: the processor quota available to the
+        // emulator. With no quota below the online count, this is the processor count.
+        "cpu_quota" => Some(Ok(InfoValue::Int(logical_processors()))),
+        "scheduling_statistics" | "total_scheduling_statistics" => {
+            Some(Ok(scheduling_statistics()))
+        }
         _ => None,
     }
+}
+
+/// `system_info(schedulers_state)` — `{Total, Online, Active}` (`erl_bif_info.c:3262-3272`).
+///
+/// All three are this runtime's one scheduler count: it has no online/offline model and
+/// no paused scheduler, so every scheduler it reports is both online and active — the
+/// same rule [`schedulers_online`](try_value) already follows.
+fn schedulers_state(rt: &Runtime) -> InfoValue {
+    let count = schedulers_count(rt);
+    InfoValue::Tupled(vec![
+        InfoValue::Int(count),
+        InfoValue::Int(count),
+        InfoValue::Int(count),
+    ])
+}
+
+/// `system_info(all_schedulers_state)` — one `{Pool, Total, Online, Active}` row per pool
+/// (`erl_bif_info.c:3284-3329`).
+///
+/// The C builds the list as `normal`, then `dirty_cpu`, then `dirty_io`, **omitting** a
+/// dirty pool whose total is `0`; this runtime has no dirty pool unless `+SDcpu`/`+SDio`
+/// configured one, so a default runtime answers the single `normal` row. The `dirty_io`
+/// row reports the io pool's total twice (the C's `TUPLE4(am_dirty_io, total, total,
+/// active)`), unlike the `normal`/`dirty_cpu` rows' total/online/active.
+fn all_schedulers_state(rt: &Runtime) -> InfoValue {
+    let count = schedulers_count(rt);
+    let mut rows = vec![InfoValue::Tupled(vec![
+        InfoValue::Atom("normal"),
+        InfoValue::Int(count),
+        InfoValue::Int(count),
+        InfoValue::Int(count),
+    ])];
+    if let Some(dirty_cpu) = configured_pool(rt.config().emulator.dirty_cpu_schedulers) {
+        rows.push(InfoValue::Tupled(vec![
+            InfoValue::Atom("dirty_cpu"),
+            InfoValue::Int(dirty_cpu),
+            InfoValue::Int(dirty_cpu),
+            InfoValue::Int(dirty_cpu),
+        ]));
+    }
+    if let Some(dirty_io) = configured_pool(rt.config().emulator.dirty_io_schedulers) {
+        rows.push(InfoValue::Tupled(vec![
+            InfoValue::Atom("dirty_io"),
+            InfoValue::Int(dirty_io),
+            InfoValue::Int(dirty_io),
+            InfoValue::Int(dirty_io),
+        ]));
+    }
+    InfoValue::List(rows)
+}
+
+/// A configured dirty-scheduler pool size, or `None` when there is no pool (the C omits a
+/// pool whose total is `0`).
+fn configured_pool(configured: Option<u32>) -> Option<i64> {
+    configured.map(i64::from).filter(|count| *count > 0)
+}
+
+/// `system_info(scheduling_statistics)` / `(total_scheduling_statistics)` — the per-priority
+/// scheduler counters (`erts_sched_stat_term`, `erl_process.c:11977-12012`).
+///
+/// The oracle's five `{Prio, Executed, Migrated}` rows, in its priority order; this runtime
+/// collects no scheduling statistics (it does not track per-priority executed/migrated
+/// process counts), so every counter is the honest `0` — a truthful own-state figure, never
+/// a copied oracle number. The two keys differ in the C only in that the
+/// non-`total` form **resets** the counters it reads; with nothing collected they answer
+/// the same list here.
+fn scheduling_statistics() -> InfoValue {
+    const PRIORITIES: [&str; 5] = [
+        "process_max",
+        "process_high",
+        "process_normal",
+        "process_low",
+        "port",
+    ];
+    InfoValue::List(
+        PRIORITIES
+            .iter()
+            .map(|priority| {
+                InfoValue::Tupled(vec![
+                    InfoValue::Atom(priority),
+                    InfoValue::Int(0),
+                    InfoValue::Int(0),
+                ])
+            })
+            .collect(),
+    )
 }
 
 /// The async-thread-pool size this runtime was configured with, clamped to at least one
@@ -123,20 +242,12 @@ fn thread_pool_size(rt: &Runtime) -> i64 {
 
 /// `+SDcpu N`, else `0` — this runtime has no dirty CPU scheduler pool.
 fn dirty_cpu_schedulers(rt: &Runtime) -> i64 {
-    rt.config()
-        .emulator
-        .dirty_cpu_schedulers
-        .map(i64::from)
-        .unwrap_or(0)
+    configured_pool(rt.config().emulator.dirty_cpu_schedulers).unwrap_or(0)
 }
 
 /// `+SDio N`, else `0` — this runtime has no dirty IO scheduler pool.
 fn dirty_io_schedulers(rt: &Runtime) -> i64 {
-    rt.config()
-        .emulator
-        .dirty_io_schedulers
-        .map(i64::from)
-        .unwrap_or(0)
+    configured_pool(rt.config().emulator.dirty_io_schedulers).unwrap_or(0)
 }
 
 /// `{unbound, unbound, …}`, one `unbound` atom per configured (normal) scheduler —
@@ -193,6 +304,138 @@ mod tests {
             InfoValue::List(Vec::new())
         );
         assert!(try_value("nonsense", &rt).is_none());
+    }
+
+    #[test]
+    fn the_scheduler_state_keys_describe_this_runtime_s_own_model() {
+        let rt = runtime();
+        let count = schedulers_count(&rt);
+
+        // The three scalar aliases of the scheduler count.
+        for key in ["schedulers_total", "schedulers_active", "run_queues"] {
+            assert_eq!(
+                try_value(key, &rt).unwrap().unwrap(),
+                InfoValue::Int(count),
+                "{key} follows this runtime's scheduler count"
+            );
+        }
+        // `cpu_quota` is the processor quota, never below one.
+        assert_eq!(
+            try_value("cpu_quota", &rt).unwrap().unwrap(),
+            InfoValue::Int(logical_processors())
+        );
+        // `schedulers_state` is `{Total,Online,Active}`, all online/active here.
+        assert_eq!(
+            try_value("schedulers_state", &rt).unwrap().unwrap(),
+            InfoValue::Tupled(vec![
+                InfoValue::Int(count),
+                InfoValue::Int(count),
+                InfoValue::Int(count)
+            ])
+        );
+        // No dirty pool is configured by default, so `all_schedulers_state` carries only
+        // the `normal` row (the C omits a pool whose total is 0) — and it is *first*.
+        assert_eq!(
+            try_value("all_schedulers_state", &rt).unwrap().unwrap(),
+            InfoValue::List(vec![InfoValue::Tupled(vec![
+                InfoValue::Atom("normal"),
+                InfoValue::Int(count),
+                InfoValue::Int(count),
+                InfoValue::Int(count),
+            ])])
+        );
+        assert!(try_value("nonsense", &rt).is_none());
+    }
+
+    #[test]
+    fn all_schedulers_state_includes_a_configured_dirty_pool() {
+        let mut config = crate::config::RuntimeConfig::default().with_schedulers(2);
+        config.emulator.dirty_cpu_schedulers = Some(4);
+        config.emulator.dirty_io_schedulers = Some(2);
+        let rt = Runtime::new(config).expect("a runtime with dirty pools");
+        let InfoValue::List(rows) = try_value("all_schedulers_state", &rt).unwrap().unwrap() else {
+            panic!("all_schedulers_state must be a list");
+        };
+        // `normal`, then `dirty_cpu`, then `dirty_io` — the C's list order.
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0],
+            InfoValue::Tupled(vec![
+                InfoValue::Atom("normal"),
+                InfoValue::Int(2),
+                InfoValue::Int(2),
+                InfoValue::Int(2)
+            ])
+        );
+        assert_eq!(
+            rows[1],
+            InfoValue::Tupled(vec![
+                InfoValue::Atom("dirty_cpu"),
+                InfoValue::Int(4),
+                InfoValue::Int(4),
+                InfoValue::Int(4)
+            ])
+        );
+        assert_eq!(
+            rows[2],
+            InfoValue::Tupled(vec![
+                InfoValue::Atom("dirty_io"),
+                InfoValue::Int(2),
+                InfoValue::Int(2),
+                InfoValue::Int(2)
+            ])
+        );
+
+        // A configured pool of zero is still "no pool" — the C omits it.
+        let mut config = crate::config::RuntimeConfig::default().with_schedulers(1);
+        config.emulator.dirty_io_schedulers = Some(0);
+        let rt = Runtime::new(config).expect("a runtime with an empty +SDio");
+        let InfoValue::List(rows) = try_value("all_schedulers_state", &rt).unwrap().unwrap() else {
+            panic!("all_schedulers_state must be a list");
+        };
+        assert_eq!(rows.len(), 1, "a zero-total pool is omitted");
+    }
+
+    #[test]
+    fn scheduling_statistics_are_the_oracle_s_rows_with_no_counters_collected() {
+        // Verified against the oracle (OTP 29.1.1 / erts-17.1):
+        //   [{process_max,0,0},{process_high,0,0},{process_normal,0,0},
+        //    {process_low,0,0},{port,0,0}]
+        let expected = InfoValue::List(vec![
+            InfoValue::Tupled(vec![
+                InfoValue::Atom("process_max"),
+                InfoValue::Int(0),
+                InfoValue::Int(0),
+            ]),
+            InfoValue::Tupled(vec![
+                InfoValue::Atom("process_high"),
+                InfoValue::Int(0),
+                InfoValue::Int(0),
+            ]),
+            InfoValue::Tupled(vec![
+                InfoValue::Atom("process_normal"),
+                InfoValue::Int(0),
+                InfoValue::Int(0),
+            ]),
+            InfoValue::Tupled(vec![
+                InfoValue::Atom("process_low"),
+                InfoValue::Int(0),
+                InfoValue::Int(0),
+            ]),
+            InfoValue::Tupled(vec![
+                InfoValue::Atom("port"),
+                InfoValue::Int(0),
+                InfoValue::Int(0),
+            ]),
+        ]);
+        let rt = runtime();
+        for key in ["scheduling_statistics", "total_scheduling_statistics"] {
+            assert_eq!(
+                try_value(key, &rt).unwrap().unwrap(),
+                expected,
+                "{key} is the oracle's five priority rows with this runtime's honest zeros"
+            );
+        }
     }
 
     #[test]

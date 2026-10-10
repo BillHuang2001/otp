@@ -15,7 +15,9 @@ The per-opcode semantics and the full M1 gap list are in `../../INSTRUCTION_SURF
 - `exec(machine, module, labels, instr, func, pc, ctx) -> Result<Option<Step>>` —
   the family's entry point, called by the `families::dispatch` router (which routes
   by the instruction's own `Instr` variant, so ownership is disjoint). `Ok(Some(step))`
-  = executed, `Ok(None)` = not this family's variant, `Err` = raised.
+  = executed, `Ok(None)` = not this family's variant, `Err` = raised. Every owned
+  opcode is position-independent, so `func`/`pc` are unused (kept because the
+  signature is the frozen family-router contract).
 - Opcodes owned: `try`/`catch` (push a catch frame), `try_case`/`try_end`/`catch_end`
   (the handler opcodes; each consumes exactly one frame), `badmatch` ⇒ `{badmatch,V}`,
   `case_end` ⇒ `{case_clause,V}`, `try_case_end` ⇒ `{try_clause,V}`, `badrecord` ⇒
@@ -27,10 +29,35 @@ The per-opcode semantics and the full M1 gap list are in `../../INSTRUCTION_SURF
   construction through the **rooted** builders, so a moving collector can run under the
   reserve), `install_class_atom` (never substitutes an atom the module cannot name) and
   `classify_class` (`raw_raise`'s class protocol).
-- `stacktrace.rs`: `symbolic_stacktrace` — cooks a non-`NIL` raw stacktrace from the
-  machine's **live call frames** (M1 keeps no raw `StackTrace` object). One rooted
-  reservation for the whole node graph (`terms::slack`/`terms::sink`); `NIL` cooks to
-  `NIL`, exactly as C does.
+- `stacktrace.rs`: `symbolic_stacktrace(machine, module, ctx)` — cooks a non-`NIL` raw
+  stacktrace from `Machine::raise_snapshot()` (the **pre-unwind** `(context, func, pc)`
+  chain every `Machine::throw_with_trace` rebuilds at raise time: the raising frame
+  first, then every live caller innermost-first). **Each frame resolves in its OWN
+  module context**: context `0` against the `module` argument, but only when
+  `Machine::current_context()` is also `0` (otherwise the handler runs in a callee
+  context and the argument is the *callee's* module, so the frame is skipped); a
+  non-zero context `id` through `Machine::module_context(id)`. A frame whose context
+  cannot be resolved is **skipped** (best-effort metadata, like the uncaught path's
+  `Machine::raise_stacktrace`); a frame whose module IS resolved but whose function
+  index is out of range is a typed `unsupported`. An **empty** snapshot — or one whose
+  every frame is skipped — cooks to the **empty list**, the honest answer. One rooted
+  reservation for the whole node graph (`terms::slack`/`terms::sink`); the resolved
+  `Arc<Module>` handles stay alive in a local vector across it, because each item shape
+  borrows its module's `Line` chunk. `NIL` cooks to `NIL`, exactly as C does. The
+  non-`NIL` arm is still **unreachable from compiler output today**: every engine raise
+  lands with `x(2) = NIL` (`Machine::throw`/`throw_error`/`throw_with_trace` always pass
+  `NIL`; the two forwarding sites `raise Trace Value` and `raw_raise` forward a value
+  that is itself `NIL` inductively), so only the synthetic `tests/stacktrace.rs`
+  fixtures reach it.
+
+## Why no captured trace is landed as the raw `x(2)` trace
+C's raw trace is an **opaque object of saved code pointers** (`c_p->ftrace`) with no
+engine equivalent, and the oracle's own cooked `S` for `try ... catch C:R:S -> S end`
+additionally holds host `init:*` frames that live *outside* this engine's run. A
+snapshot-cooked trace is therefore a strictly-**partial** list that would still differ
+from the oracle's, so landing it would trade this documented omission for a different,
+silently-partial value. `x(2)` stays `NIL` on the compiled path, C's `add_stacktrace`
+stays omitted, and `catch_end` semantics are unchanged.
 
 ## Constraints
 - Errors are `beam_common::{Result, BeamError}` only. An unsupported case is a typed
@@ -56,7 +83,11 @@ builder, `no_labels`, `exec_one` and `assert_reason_tuple`; several submodules a
   fold (throw class, error/exit `{'EXIT',Reason}`, the missing-`EXIT`-atom typed error).
 - `raising.rs` — the raising opcodes' reason expansion (caught and uncaught), the
   `raise` re-raise opcode, `raw_raise`'s class protocol and `badarg` fall-through.
-- `stacktrace.rs` — `build_stacktrace`, incl. the NIL raw trace and the typed errors.
+- `stacktrace.rs` — `build_stacktrace`: the `NIL` raw trace (`NIL` out), the
+  raise-snapshot ordering (a frame the raise *unwound* is still present, proving the
+  snapshot is cooked rather than the live stack), a snapshot frame resolved in its own
+  module context (with a context-`0` frame skipped from a non-zero handler context),
+  the source-location item, and the typed errors.
 - `end_to_end.rs` — whole synthetic sequences.
 - `cross_module.rs` — **cross-module containment**: one shared `beam_term::AtomTable`
   (`Universe`) so exception *class* atoms compare equal across modules, modules entered

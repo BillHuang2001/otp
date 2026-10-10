@@ -46,11 +46,13 @@ Only **frozen contracts and non-obvious behaviour** are listed; rustdoc carries 
   · `PortCommandOptions { nosuspend, force }` — carried/validated but no-ops (ports never busy; the BIF layer owns their effect once a busy-port command queue exists).
 - `Port` — owns a `Box<dyn Driver>` + the two byte queues; the scheduling surface (`queue_output`/`schedule_task`/`schedule_timeout`/`arm_timeout`/`cancel_timeout`/`next_timeout`/`pending_tasks`/`next_task`/`has_pending_task`/`timeout`) and the exit/async/stream surfaces (`take_exit_status`/`take_eof`/`has_pending_async`/`drive_async`/`notify_exit`).
   **Every driver interaction** (`start`/`output`/`ready_input`/`ready_output`/`control`/`timeout`) refreshes the port timer from `Driver::next_timeout` via `refresh_timeout`: `Some(d)` arms/**re-points** the single `TIMEOUT` task at `d`, `None` clears it.
+  A driver write (`output`/`ready_output`) is **verified**: the port checks the output queue shrank by exactly the count the driver reported (a mismatch is the typed `error::unsupported(...)`, guarding the write-accounting invariant against duplicated bytes) and schedules an `OUTPUT` task whenever the queue is left non-empty, so a short write cannot stall without re-driving.
   Re-exports `PortRegistry`.
 
 ### `registry.rs`
 - `PortRegistry` — id allocation (inner `beam_process::PortTable`) + `HashMap<u64, Port>` by port number; basic ops (`new`/`open`/`open_named`/`get`/`get_mut`/`output`/`contains`/`len`/`is_empty`/`close`); `port_table`/`port_table_mut` expose that **same** id table (see the port-monitor handoff; `port_table_mut`'s rustdoc carries the borrowing rule).
-  Frozen seams (all `BadArg` for an unknown id): `handle_events` (**schedules *and* runs** one round under `DEFAULT_READINESS_RED_BUDGET`); `execute_port_tasks` (port-number order under a reduction budget ⇒ a `PortTaskOutcome`; drives async completions for every live port whose driver answers `has_pending_async` *before* harvesting input, so a `driver_async` job reaches `ready_async`/`async_free` with no runtime call); `schedule_events`/`schedule_readiness` (enqueue only — an `INPUT`/`OUTPUT` task for directions the driver armed (`PortArms`)); `port_command` (queue output + schedule an `OUTPUT` task; the write happens in the task); `port_control` (reserved `"close"` closes with an empty reply; **any other `op`** goes verbatim to `control(op, arg)`, its reply returned); `take_exit_status`/`take_eof` (once-only reaped child status / EOF report); `schedule_timeout`/`cancel_timeout`/`next_deadline` (`next_deadline` = min over live drivers' `next_timeout`); `notify_port_exit` (`Driver::port_exit` **at most once**, port left live, independent of `close`/`stop`); `drive_async` (a manual async drive point for one port).
+  `close` runs the driver's `stop`, drops the port from the map and **retires the port number only when its `Closed` notification is reported** — so a deferred `Closed` can never name a reused id (both round drivers mint closes through one `take_closed_notifications` helper).
+  Frozen seams (all `BadArg` for an unknown id): `handle_events` (**schedules *and* runs** one round under `DEFAULT_READINESS_RED_BUDGET`, returning the round's `PortTaskOutcome` and reporting/retiring the closes it drains); `execute_port_tasks` (port-number order under a reduction budget ⇒ a `PortTaskOutcome`; drives async completions for every live port whose driver answers `has_pending_async` *before* harvesting input, so a `driver_async` job reaches `ready_async`/`async_free` with no runtime call); `schedule_events`/`schedule_readiness` (enqueue only — an `INPUT`/`OUTPUT` task for directions the driver armed (`PortArms`)); `port_command` (queue output + schedule an `OUTPUT` task; the write happens in the task); `port_control` (reserved `"close"` closes with an empty reply; **any other `op`** goes verbatim to `control(op, arg)`, its reply returned); `take_exit_status`/`take_eof` (once-only reaped child status / EOF report); `schedule_timeout`/`cancel_timeout`/`next_deadline` (`next_deadline` = min over live drivers' `next_timeout`); `notify_port_exit` (`Driver::port_exit` **at most once**, port left live, independent of `close`/`stop`); `drive_async` (a manual async drive point for one port).
 
 ### `driver.rs`
 - `DriverFlags(u32)` — `Copy + Eq`; `SOFT_BUSY`.
@@ -86,7 +88,7 @@ Only **frozen contracts and non-obvious behaviour** are listed; rustdoc carries 
   A failed spawn is either an `access(X_OK)`-rejected path (a constructor `BeamError::Raise` with the errno atom) or a path the check accepts but `exec` rejects (a searchable **directory**, a no-executable-format file) — the latter **opens the port**, the child's `_exit(errno)` becoming the exit status.
   `stop`/`Drop` kill + reap + deregister/close every descriptor, but an adopted `{fd,N}` is **never** closed.
   **The only module here that may spawn OS children** (project invariant).
-- `inet/` — the built-in **`tcp_inet`** TCP socket driver and its read-path `{packet, N}` framing.
+- `inet/` — the built-in **`tcp_inet`** TCP socket driver and its `{packet, N}` framing, applied on **both** the read path (`packet.rs`/`frame.rs`) and the send path (`verb_send` prepends the 1-/2-/4-byte big-endian length header).
   Full detail (the control-verb table, the option wire, the `PacketType` decoder, the four `gen_tcp` capability handoffs, the test strategy) is in the child node **`src/drivers/inet/CONTEXT.md`** — read it there; this doc only records that `tcp_inet` is one socket behind one port and is **unreachable from the running runtime today** (see *Handoffs*).
 
 ### `src/abi/` — the driver C-ABI host layer (A.4)
@@ -154,8 +156,8 @@ Full detail is in the child node **`src/abi/CONTEXT.md`** — read it there.
 
 ## Test Strategy
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io` **GREEN**, and `... build --workspace --all-targets` **GREEN, warning-free**.
-Current: **545 passing / 0 failing / 2 ignored** — **376** lib in-module (`#[cfg(test)]`) + **166** across the 18 `tests/*.rs` suites + **5** doctests (3 passed: the `!Send`/`!Sync` compile-fail pins on `PortRegistry` + the `IoDevice` example; 2 `ignore`d: `cpu_time::RuntimeClock`, `port`).
-- **In-module (376):** `drivers` 183 (`inet` 115, `spawn` 23, `line_buffer` 13, `fd` 13, `efile` 11, `binary_io` 8), `io_device` 40 (`tests` 25, `encoding` 7, `source` 5, `continuation` 3), `abi` 33 (`host` 15, `port` 8, `table` 7, `job` 3), `registry` 25, `signal` 20, `port_task` 16, `poller` 12, `timer` 12, `ddll` 11, `queue` 8, `driver` 6, `cpu_time` 6, `error` 4.
+Current: **574 passing / 0 failing / 2 ignored** — **398** lib in-module (`#[cfg(test)]`) + **173** across the 18 `tests/*.rs` suites + **5** doctests (3 passed: the `!Send`/`!Sync` compile-fail pins on `PortRegistry` + the `IoDevice` example; 2 `ignore`d: `cpu_time::RuntimeClock`, `port`).
+- **In-module (398):** `drivers` 200 (`inet` 125, `spawn` 23, `line_buffer` 16, `fd` 14, `efile` 13, `binary_io` 9), `io_device` 41 (`tests` 26, `encoding` 7, `source` 5, `continuation` 3), `abi` 35 (`host_tests` 17, `port` 8, `table` 7, `job` 3), `registry` 27, `signal` 20, `port_task` 16, `poller` 12, `timer` 12, `ddll` 11, `queue` 8, `driver` 6, `cpu_time` 6, `error` 4.
 - The C-driver suites and the `erl`-oracle cases **skip loudly** without `cc`/`erl_nif.h`/`erl`.
   The C-driver fixtures assert a real `beam_abi::driver::loader::load`; **linking needs BOTH `build.rs`'s `-Wl,--export-dynamic` and a `driver_api_table()` reference from the test binary** (either alone ⇒ `dlopen(RTLD_NOW)` fails with `undefined symbol: driver_mk_port`).
 - The signal suite is serialized on a global `Mutex` (the facility is process-global) and the `cpu_time` suite asserts only monotone/structural properties (real syscalls never exact values).
@@ -181,8 +183,13 @@ Current: **545 passing / 0 failing / 2 ignored** — **376** lib in-module (`#[c
   Input is not line-framed (no `line` verb): the `binary`/`list` choice rides `SpawnStream`.
 - **`port_control`/control atoms are not decoded here.** `port_control(op, &[u8])` takes a `&str` op + raw bytes; the C decodes Erlang tuples in `io.c`, so decoding `{command,…}`/`{connect,…}` is the runtime's job.
 - **This crate has no poll thread of its own.** `execute_port_tasks` runs a round on demand; the per-iteration drive (poll → `schedule_events`/`handle_events` → `execute_port_tasks`), the reduction budget and the single long-lived `Poller` live in `beam_rt`'s single-threaded main loop.
-- **File sizes (`wc -l`).** Over 1000: `src/drivers/spawn.rs` 1966, `src/drivers/inet/tests.rs` 1447, `src/drivers/efile.rs` 1343, `src/drivers/inet/mod.rs` 1296, `src/registry.rs` 1285, `src/abi/host.rs` 1267, `src/drivers/inet/packet.rs` 1245, `src/drivers/fd.rs` 1141, `src/signal.rs` 1105 — each is a source half plus its suite (or, for `inet`, a subtree with its own child doc).
-  All other modules are under 1000; if a source half grows, split its test module into a sibling `tests/` file (as `src/drivers/inet/` already does).
+- **No `Driver::flush` / asynchronous CLOSING on port close.** `PortRegistry::close`/`Port::close` run the driver's `stop` and drop both byte queues; the `Driver` trait has no flush hook, so output queued at close time is not flushed (the C calls `drv->flush` and parks a port with a non-empty `ioq` in `ERTS_PORT_SFLG_CLOSING`, `../../erts/emulator/beam/io.c:3659-3700`, `:3946-3956`).
+  `beam_rt` mitigates by notifying the port owner before closing.
+- **A multi-fd driver's readiness is not per-fd.** `DriverState::fd_armed` always hands `ready_input`/`ready_output` the first `BTreeMap`-ordered fd matching the direction, so a port with ≥2 fds selected the same way would starve the others; correcting it needs the fired fd reported through the poller/`DriverContext` (a frozen-seam change).
+  Harmless for every current driver (one fd each).
+- **File sizes (`wc -l`).** Over 1000: `src/drivers/spawn.rs` 1966, `src/drivers/inet/tests.rs` 1602, `src/registry.rs` 1518, `src/drivers/efile.rs` 1404, `src/drivers/inet/mod.rs` 1331, `src/drivers/inet/packet.rs` 1245, `src/drivers/fd.rs` 1193, `src/signal.rs` 1105, `src/abi/port.rs` 1017 — each is a source half plus its suite (or, for `inet`, a subtree with its own child doc).
+  `src/abi/host.rs` is now **879** with its in-module suite split out into `src/abi/host_tests.rs` (710); all other modules are under 1000.
+  If a source half grows, split its test module into a sibling `tests/` file (as `src/drivers/inet/` and `src/abi/` already do).
 
 ## Handoff to beam_rt — the CPU-time facility
 `beam_rt` owns the `erlang:statistics(runtime)` BIF and must adopt `src/cpu_time.rs`:
@@ -223,6 +230,7 @@ Current: **545 passing / 0 failing / 2 ignored** — **376** lib in-module (`#[c
 
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
+- `src/CONTEXT.md` → the crate source-root node doc (the crate-level I/O core: module wiring + one-liner routing to every module) (child node)
 - `src/poller.rs` → `Poller` (`EINTR`-tolerant `poll`, `libc::poll(2)` fallback), `Token`, `Interest`, `Ready`, `Event`, `Waker`
 - `src/timer.rs` → `Timeout`, `Timer`; `src/queue.rs` → `ByteQueue`
 - `src/port_task.rs` → `PortTaskKind`/`PortTask`/`PortTaskQueue`, the reduction constants, `Readiness`, `PortNotification`, `PortTaskOutcome`
@@ -237,26 +245,29 @@ Current: **545 passing / 0 failing / 2 ignored** — **376** lib in-module (`#[c
 - `src/drivers/line_buffer.rs` → `LineBuffer`, `DEFAULT_MAX_LINE_LEN`; `src/drivers/binary_io.rs` → `Phase`, `PhaseChange`
 - `src/drivers/efile.rs` → `EfileDriver`, `make_efile`, `FileDataMode`
 - `src/drivers/spawn.rs` → `SpawnDriver`, `SpawnSpec`/`SpawnOptions`/`StreamOptions`/`SpawnStream`, `build_command`
-- `src/drivers/inet/` → the `tcp_inet` driver + read-path framing (child node `src/drivers/inet/CONTEXT.md`)
+- `src/drivers/inet/` → the `tcp_inet` driver + `{packet, N}` framing (read + send paths) (child node `src/drivers/inet/CONTEXT.md`)
 - `src/drivers/mod.rs` → driver-module wiring + re-exports
+- `src/drivers/CONTEXT.md` → the built-in-drivers node doc (`fd`/`efile`/`spawn`/`tcp_inet` + the `{line,N}`/phase framing) (child node)
 - `src/abi/` → the driver C-ABI host layer (child node `src/abi/CONTEXT.md`)
 - `src/io_device/` → the io-device request layer (`{get_until, Enc, Prompt, Mod, Func, XtraArgs}`): `IoDevice`/`Encoding`/`ByteSource`/`SliceSource`/`EmptySource` + the `Continuation` seam (`ContData`/`Applied`/`Leftover`/`NoEngineContinuation`)/`read_size`; sub-files `mod.rs`/`device.rs`/`encoding.rs`/`source.rs`/`continuation.rs`/`tests.rs`
+- `src/io_device/CONTEXT.md` → the io-device request-layer node doc (child node)
 - `src/error.rs` → `pub(crate)` error constructors (`badarg`/`io`/`system_limit`/`notsup`/`unsupported`/`spawn_failure`/`driver_init_failed`), `errno_atom`
+- `tests/CONTEXT.md` → the integration-test node doc (the fixture/test vocabulary: the C fixtures, their control-verb vocabulary, the variant-macro pattern, the loud-skip policy) (child node)
 - `tests/poller.rs` (11) → reactor gate: registration/readiness on real pipes/socketpairs (`key`, no-events, `reregister` flip, `deregister`, double-register), timeout/waker, `EINTR` tolerance
 - `tests/port.rs` (4) → the `open`→`output`→`poll`→`handle_events`→`read_input` round-trip, `close` id release, `open_named`, unknown keys incl.
   `WAKER_KEY`
-- `tests/port_task.rs` (4) → scheduling + the receive-wake path (`PortNotification::Data` → `deliver_simple` → `Scheduler::resume_woken`)
+- `tests/port_task.rs` (5) → scheduling + the receive-wake path (`PortNotification::Data` → `deliver_simple` → `Scheduler::resume_woken`)
 - `tests/signal.rs` (21) → the real-signal gate (the 12-signal set, coalescing, the async-signal-safe trampoline, `Drop` restore/global-end CAS)
 - `tests/cpu_time.rs` (8) → the `erlang:statistics(runtime)` floor: real `getrusage`/`clock_gettime` monotone/structural properties + the `RuntimeClock` anchor semantics
 - `tests/ddll.rs` (11) → `dlopen`/`dlsym`/`dlclose` round-trips, the `cc` fixture `.so`, the hermetic undefined-symbol case, the error→atom mapping + the single-sourcing pins
 - `tests/efile.rs` (16) → real files through the reactor + the `poll(2)` fallback: flag modes, `position`/`seek`/`sync`/`truncate`, `binary`/`list`+`data_mode`, `EISDIR`/`ENOTDIR`/`EEXIST`/`ENOENT`, `BadArg`, the all-mode oracle sweep
 - `tests/spawn.rs` (27) → real children: both queues, notifications, every `Name`/option form, EOF deregistration, write-readiness, unknown-id `BadArg`, once-only exit status, kill+reap, duplex `{fd,N}`, a 200 KiB stderr flood, a failed spawn's errno atom + the oracle reason
 - `tests/inet.rs` (8) → `tcp_inet` on loopback TCP: round-trip, write-readiness, unknown-verb `BadArg`, the peer-close shapes + the `erl`-oracle cross-checks of the control replies, the socket-option replies and the driver-state option replies (10 byte-for-byte)
-- `tests/driver_seams.rs` (5) → the driver-declared timer (`next_timeout` → `timeout`) + the once-only `notify_port_exit` seam
-- `tests/fixture_builds.rs` (7) + `tests/fixtures/{host_driver.c,host_driver_no_ready_async.c,host_driver_no_process_exit.c,vector_driver.c}` → the `cc`-built C-driver fixtures (incl. the `outputv`-only one and the `ready_async`-less / `process_exit`-less variant builds), with a load assertion
+- `tests/driver_seams.rs` (7) → the driver-declared timer (`next_timeout` → `timeout`) + the once-only `notify_port_exit` seam
+- `tests/fixture_builds.rs` (8) + `tests/fixtures/{host_driver.c,host_driver_both.c,host_driver_no_ready_async.c,host_driver_no_process_exit.c,vector_driver.c}` → the `cc`-built C-driver fixtures (incl. the `outputv`-only one, the both `outputv`+`output`+`ready_output` entry, and the `ready_async`-less / `process_exit`-less variant builds), with a load assertion
 - `tests/support/mod.rs` → shared `cc`-compile/scratch-dir helpers (per-run fresh dirs, so a fixture's append-mode log never leaks between runs)
 - `tests/cdriver/mod.rs` → the shared C-driver helpers (`compile_so`/`load_driver`/`open_port`/`round_data`/`await_log_line`/`logged_port_command`/`LoggedPort` + the `variant_fixture_*`/`no_process_exit_variant_fixture_*` builders) reused by `abi_{driver,async,vector,lifecycle,start_failure}.rs`
-- `tests/abi_driver.rs` (16) → the end-to-end C-driver path: command parsing, `output` echo, write-readiness → `ready_output`, `driver_output` → one `send_term`, timer arm/fire/cancel, `driver_select`/deselect → a `Data` notification, `stop_select` on deselect/teardown/`Drop` (each exactly once), `driver_async` via a plain round, `close` → `stop` + `Closed`, the sticky `ERL_DRV_USE` re-selects
+- `tests/abi_driver.rs` (19) → the end-to-end C-driver path: command parsing, `output` echo, write-readiness → `ready_output`, `driver_output` → one `send_term`, the driver port-queue family round trip (`driver_enq`/`driver_sizeq`/`driver_peekq[v]`/`driver_deq`), the both `outputv`+`output`-slots ordering, a write-readiness-only task (runs `ready_output` but not the write path), timer arm/fire/cancel, `driver_select`/deselect → a `Data` notification, `stop_select` on deselect/teardown/`Drop` (each exactly once), `driver_async` via a plain round, `close` → `stop` + `Closed`, the sticky `ERL_DRV_USE` re-selects
 - `tests/abi_async.rs` (8) → the `driver_async` completion arms (`ready_async`; `async_free` via the variant build; the NULL-invoke release; drop-while-in-flight; drop-before-drain — each `async_free` exactly once) + the `ErlDrvPort` pointer-identity test + a plain-thread `driver_output` refused
 - `tests/abi_vector.rs` (7) → the `outputv`-only entry on both write paths + the async-free shapes, over `tests/fixtures/vector_driver.c`
 - `tests/abi_lifecycle.rs` (3) → the port-exit adapter (`DriverPort::port_exit` via `notify_port_exit`: the `process_exit` branch and the `emergency_close` fallback over the `process_exit`-less variant, each once-only and non-teardown) + `take_exit_status` ("no status") over real `dlopen`ed `.so`s
@@ -289,7 +300,7 @@ Current: **545 passing / 0 failing / 2 ignored** — **376** lib in-module (`#[c
 - `../CONTEXT.md` → crate-layer contracts, the seam types, the Stage-0…6 mapping (§7), wave-5 position.
 - `../../CONTEXT.md` → workspace contracts §1 A.4 (driver C ABI) / A.6 (CLI/config), §3 (error strategy).
 - `../../ERTS_RUST_REWRITE_DEEPDIVE.md` §A (the two clean seams), §H (Stage 5).
-- `src/drivers/inet/CONTEXT.md` → the `tcp_inet` driver + read-path framing (child node).
+- `src/drivers/inet/CONTEXT.md` → the `tcp_inet` driver + `{packet, N}` framing (read + send paths) (child node).
 - `src/abi/CONTEXT.md` → the driver C-ABI host layer (child node).
 - `../beam_process/CONTEXT.md` → `PortTable`/`PortId`, `Scheduler`/`ProcessTable`, the scheduler that drives ports.
 - Owed upstream (`../../CHANGE.md`, repo-root owned): the port-task model/`PortNotification`/`port_command`+`port_control`, the `line`/phase/`efile` drivers, the poller regular-file fallback + `FdDriver` EOF de-registration + `EINTR`-tolerant `poll`, the spawn driver (`StreamOptions`, the failed-spawn split + deferred `fork`/`execve` child, the duplex `{fd,N}` form), the bounded `driver_async` pool + round-driven completion + exactly-once release + `KeepAlive`, the sticky `ERL_DRV_USE`/`stop_select` callback, the defaulted driver seams (`take_exit_status`/`take_eof`/`has_pending_async`/`next_timeout`/`port_exit` + `PortExitReason`), the `outputv` write-path preference, `signal`, `cpu_time`, `ddll`.

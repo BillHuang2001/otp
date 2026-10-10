@@ -30,18 +30,24 @@
 //! * [`ORACLE_EQUAL_KEYS`] — the oracle's printed value must equal this runtime's
 //!   rendered value (whitespace-normalized, because `~p` wraps long lists across
 //!   lines). These are either interface constants any erts-17.1 build reports the same
-//!   way (`nif_version`, `driver_version`, the limits, the GC policy rows, …) or facts
-//!   about the shared host (`wordsize`, `os_type`, `os_version`, `machine`).
+//!   way (`nif_version`, `driver_version`, the monotonic-time interface constants
+//!   `start_time`/`end_time`, the limits, the GC policy rows, …) or facts about the
+//!   shared host (`wordsize`, `os_type`, `os_version`, `machine`).
 //! * [`SHAPE_ONLY_KEYS`] — only the *shape* is compared, never the value. These split
 //!   into two honest groups:
 //!     1. this runtime's own version strings, which are deliberately its **own**
 //!        (`version` = our erts version, `otp_release` = our OTP major, `emu_type` =
-//!        our build tier, `debug_compiled` = our debug tier);
+//!        our build tier, `build_type` = the same tier, `compat_rel` = our release
+//!        number, `debug_compiled` = our debug tier);
 //!     2. keys that read **this runtime's own live tables** (`atom_count`,
-//!        `process_count`, `port_count`, `ets_count`, `allocated_areas`, …) and are
+//!        `process_count`, `port_count`, `ets_count`, the scheduler-state keys,
+//!        `scheduling_statistics`' honest zeros, `allocated_areas`, …) and are
 //!        therefore correct-but-smaller than the oracle's run-time figure. Comparing
 //!        them for equality would be comparing two different emulators' tables — the
 //!        same rule `erlang:processes/0` / `erlang:ports/0` already follow.
+//!   `literal_test` also sits here: the oracle's 64-bit build answers `range` because its
+//!   literal test is a *range* check, while this runtime's frozen layout detects literals
+//!   with a tag bit — the C's own `tag` answer for a tag-based test.
 //! * [`UNSUPPORTED_KEYS`] — the oracle **accepts** each of these; this runtime answers
 //!   an honest capability gap instead, so the test pins the oracle-accepts fact and
 //!   (in `src/info.rs`) the exit-3 classification. The divergence is deliberate.
@@ -101,6 +107,34 @@ const ORACLE_EQUAL_KEYS: &[&str] = &[
     "alloc_util_allocators",
     "multi_scheduling_blockers",
     "normal_multi_scheduling_blockers",
+    // The distribution-state keys are oracle-equal in the state `RuntimeConfig::default()`
+    // describes: a `nonode@nohost` runtime with no established link (`dist` is the 39-byte
+    // binary, `dist_ctrl` is `[]`). A runtime that *is* a node answers the typed capability
+    // gap instead (see `src/info/dist.rs`).
+    "dist",
+    "dist_ctrl",
+    // The emulator's own build/implementation flags whose value is a constant of every
+    // default erts-17.1 build **and** a truthful statement about this runtime (see
+    // `src/info/system.rs`): the I/O checking model, the port-task scheduling, the absent
+    // lock/ETS diagnostics, the absent HiPE, the disabled system sequential tracer, and the
+    // host's byte order.
+    "eager_check_io",
+    "io_thread",
+    "port_tasks",
+    "lock_checking",
+    "lock_counting",
+    "ets_always_compress",
+    "ets_realloc_moves",
+    "hipe_architecture",
+    "sequential_tracer",
+    "endian",
+    // The ERTS monotonic-time interface constants. They are compile-time constants of the
+    // erts-17.1 interface — byte-identical on every run of every build of that release — so
+    // they are compared for **value**, not merely shape (see
+    // `the_monotonic_time_interface_constants_match_the_oracle`, which re-probes the oracle
+    // and pins the recorded figures).
+    "start_time",
+    "end_time",
 ];
 
 /// Keys for which only the **shape** is comparable: this runtime's own version strings
@@ -130,20 +164,33 @@ const SHAPE_ONLY_KEYS: &[&str] = &[
     "max_heap_size",
     "heap_sizes",
     "allocated_areas",
+    // The scheduler **state** keys and the emulator's own build/implementation flags whose
+    // value legitimately differs from the oracle's (see `src/info/schedulers.rs` and
+    // `src/info/system.rs`): the scheduler counts are this runtime's own, `build_type` is
+    // *our* build tier, `compat_rel` *our* release number, `literal_test` is `tag` because
+    // this runtime's literal test is a tag bit (the oracle's 64-bit build answers `range`),
+    // and the scheduling-statistics counters are this runtime's honest zeros.
+    "build_type",
+    "compat_rel",
+    "literal_test",
+    "cpu_quota",
+    "schedulers_total",
+    "schedulers_active",
+    "schedulers_state",
+    "all_schedulers_state",
+    "run_queues",
+    "scheduling_statistics",
+    "total_scheduling_statistics",
 ];
 
 /// Keys the oracle accepts that this runtime answers with an honest capability gap.
 /// Pinned here so a future `unsupported` key is checked against the oracle too.
 const ORACLE_ACCEPTED_UNSUPPORTED_KEYS: &[&str] = &[
     "allocator",
-    "dist",
-    "dist_ctrl",
     "time_offset",
     "time_correction",
     "time_warp_mode",
     "tolerant_timeofday",
-    "start_time",
-    "end_time",
     "os_monotonic_time_source",
     "os_system_time_source",
     "cpu_topology",
@@ -154,6 +201,22 @@ const ORACLE_ACCEPTED_UNSUPPORTED_KEYS: &[&str] = &[
     "info",
     "procs",
     "loaded",
+    // ERTS *C-emulator internals* with no counterpart here (see `src/info/unsupported.rs`):
+    // the C toolchain's build flags, the ethread library, the constant-pool/jump-table
+    // loader switches, the static NIF table and its taints, the emulator argument vector,
+    // the scheduler distribution maps, the `BIG_ARITY_MAX` cap and the thread-progress dump.
+    "compile_info",
+    "ethread_info",
+    "ethread_used_tse",
+    "constant_pool_support",
+    "beam_jump_table",
+    "snifs",
+    "taints",
+    "emu_args",
+    "reader_groups_map",
+    "decentralized_counter_groups_map",
+    "max_integer",
+    "thread_progress",
 ];
 
 /// Keys the oracle raises `error:badarg` for — this runtime must not invent an answer.
@@ -165,6 +228,7 @@ const ORACLE_REJECTED_KEYS: &[&str] = &[
     "catchlevel",
     "export_count",
     "export_limit",
+    "instruction_counts",
     "memory",
     "module_count",
     "module_limit",
@@ -188,6 +252,7 @@ enum Kind {
     Tuple,
     List,
     Map,
+    Binary,
 }
 
 /// A value's observable shape: its kind plus (for containers) its top-level arity.
@@ -216,6 +281,12 @@ fn rust_shape(value: &InfoValue) -> Shape {
         InfoValue::Tuple(_, _) => Shape {
             kind: Kind::Tuple,
             arity: 2,
+        },
+        // A byte string is a scalar for shape purposes: `~p` renders it as `<<"…">>`, which
+        // has no comparable top-level element count.
+        InfoValue::Binary(_) => Shape {
+            kind: Kind::Binary,
+            arity: 0,
         },
         InfoValue::Tupled(elements) => Shape {
             kind: Kind::Tuple,
@@ -273,6 +344,11 @@ fn oracle_shape(text: &str) -> Shape {
     if text.starts_with('"') {
         return scalar(Kind::Str);
     }
+    // A bit string / binary (`~p` renders it as `<<"…">>`, or as `<<1,2,3>>` when a byte is
+    // not printable). Classified before the atom fallback, which would otherwise swallow it.
+    if delimited(text, "<<", ">>").is_some() {
+        return scalar(Kind::Binary);
+    }
     if let Some(inner) = delimited(text, "#{", "}") {
         return Shape {
             kind: Kind::Map,
@@ -313,6 +389,30 @@ fn render(value: &InfoValue) -> String {
         InfoValue::Atom(name) => (*name).to_string(),
         InfoValue::Bool(value) => if *value { "true" } else { "false" }.to_string(),
         InfoValue::Tuple(first, second) => format!("{{{first},{second}}}"),
+        // `~p` renders a byte string as a quoted string when every byte is printable
+        // (escaping `\` / `"` and the `\n` / `\r` / `\t` control characters) and switches to
+        // the all-decimal form otherwise (`<<0,65,255>>`). `system_info(dist)` is the former;
+        // the fallback keeps the rendering faithful rather than silently wrong.
+        InfoValue::Binary(bytes) => {
+            let escapable = |byte: &u8| matches!(byte, b'\n' | b'\r' | b'\t' | 0x20..=0x7e);
+            if !bytes.iter().all(escapable) {
+                let parts: Vec<String> = bytes.iter().map(u8::to_string).collect();
+                return format!("<<{}>>", parts.join(","));
+            }
+            let mut text = String::from("<<\"");
+            for byte in bytes {
+                match byte {
+                    b'\\' => text.push_str("\\\\"),
+                    b'"' => text.push_str("\\\""),
+                    b'\n' => text.push_str("\\n"),
+                    b'\r' => text.push_str("\\r"),
+                    b'\t' => text.push_str("\\t"),
+                    other => text.push(char::from(*other)),
+                }
+            }
+            text.push_str("\">>");
+            text
+        }
         InfoValue::Tupled(elements) => {
             let parts: Vec<String> = elements.iter().map(render).collect();
             format!("{{{}}}", parts.join(","))
@@ -525,6 +625,69 @@ fn the_port_limit_matrix_matches_the_oracle() {
     }
 }
 
+/// The ERTS monotonic-time **interface constants** `system_info(start_time)` /
+/// `system_info(end_time)` — against the live oracle.
+///
+/// These two keys are *not* measured instants and do not come from a time server: they are
+/// compile-time constants of the erts-17.1 monotonic-time interface
+/// (`erts_get_monotonic_{start,end}_time` returning
+/// `make_time_val(ERTS_MONOTONIC_TIME_{START,END}_EXTERNAL)`, `erl_time_sup.c:2148-2158`;
+/// `erl_time.h:312-323`/`403-407`), so every run of every erts-17.1 build answers the same
+/// pair — which is why they are compared for **equality** rather than shape.
+///
+/// The recorded figures are the oracle's own answers, re-probed below so a stale table
+/// cannot pass silently (the same guard `tests/garbage_collect.rs` uses). Oracle:
+/// `erl -noshell -eval 'io:format("~p ~p~n",[erlang:system_info(start_time),erlang:system_info(end_time)]),halt().'`
+/// prints `-576460752000000000 8646911283000000000` — run twice, identical both times.
+const ORACLE_START_TIME: i64 = -576_460_752_000_000_000;
+const ORACLE_END_TIME: i64 = 8_646_911_283_000_000_000;
+
+#[test]
+fn the_monotonic_time_interface_constants_match_the_oracle() {
+    // The values are constants, so they cannot drift between runs — probe twice and require
+    // both runs (and the recorded table) to agree.
+    let expr = "io:format(\"~p ~p~n\", \
+                [erlang:system_info(start_time), erlang:system_info(end_time)]), halt(0).";
+    let expected = format!("{ORACLE_START_TIME} {ORACLE_END_TIME}");
+    for run in 1..=2 {
+        let Some(oracle) = oracle_run(&[], &[], expr) else {
+            eprintln!(
+                "SKIP the_monotonic_time_interface_constants_match_the_oracle: no system `erl`"
+            );
+            return;
+        };
+        assert_eq!(
+            oracle, expected,
+            "the live oracle's answer on run {run} (the recorded ground truth must be re-probed)"
+        );
+    }
+
+    // `end_time` lies outside the 60-bit small range, so the oracle's `make_time_val`
+    // materializes a bignum; pinned so the recorded value cannot be replaced by a truncated
+    // small, and so this runtime's identical choice is checked against the oracle's.
+    let kinds = "io:format(\"~p ~p~n\", \
+                 [abs(erlang:system_info(start_time)) < 1152921504606846976, \
+                  abs(erlang:system_info(end_time)) < 1152921504606846976]), halt(0).";
+    let Some(oracle) = oracle_run(&[], &[], kinds) else {
+        eprintln!("SKIP the_monotonic_time_interface_constants_match_the_oracle: no system `erl`");
+        return;
+    };
+    assert_eq!(
+        oracle, "true false",
+        "the oracle's start_time is a small integer and its end_time a bignum"
+    );
+
+    let rt = Runtime::new(RuntimeConfig::default()).expect("the default runtime");
+    assert_eq!(
+        render(&system_info_value("start_time", &rt).expect("start_time")),
+        ORACLE_START_TIME.to_string()
+    );
+    assert_eq!(
+        render(&system_info_value("end_time", &rt).expect("end_time")),
+        ORACLE_END_TIME.to_string()
+    );
+}
+
 /// `{wordsize, W}` — the second tuple key the oracle answers, and a genuine fact about
 /// the host both runtimes share (`erl_bif_info.c:2521-2527`).
 #[test]
@@ -645,9 +808,16 @@ fn the_oracle_shapes_and_values_match() {
             ours.kind, theirs.kind,
             "system_info({key}): kind mismatch (ours {value:?}), oracle said {oracle}"
         );
-        // Scalars have no arity to compare; containers do, except the two whose arity
-        // legitimately follows *this* runtime's scheduler count / growth table.
-        if theirs.arity != 0 && !matches!(*key, "scheduler_bindings" | "heap_sizes") {
+        // Scalars have no arity to compare; containers do, except the three whose arity
+        // legitimately follows *this* runtime's scheduler count / growth table /
+        // configured dirty-scheduler pools (the C omits a `dirty_cpu`/`dirty_io` row whose
+        // total is 0, so a default runtime reports the single `normal` row).
+        if theirs.arity != 0
+            && !matches!(
+                *key,
+                "scheduler_bindings" | "heap_sizes" | "all_schedulers_state"
+            )
+        {
             assert_eq!(
                 ours.arity, theirs.arity,
                 "system_info({key}): arity mismatch (ours {value:?}), oracle said {oracle}"

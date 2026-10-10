@@ -24,6 +24,15 @@ Inlined: metadata no-ops, `Move`, `Swap`, `Jump`, `CallOnly`, `Test`, small-int 
 `unsafe` only in `mod.rs`; the tier never touches `Machine` state a block cannot address — anything
 requiring a frame pop or context switch deopts to the shared helper.
 
+## Cross-module transfer
+The tier runs on the **shared** driver (`../baseline`), which handles a `Step::Enter` (a
+`call_ext*` the host resolved through `ExecutionContext::resolve_external_call`) by switching module
+context and re-entering. The Cranelift tier inherits `NativeCode::module_blocks`'s default (`None`),
+so the callee is not accelerated — the driver runs it on its per-instruction interpreter step — but
+it *executes*, so a compiled caller reaches the callee and returns correctly. Its own
+`run_resume_outcome` remains the typed `unsupported("cranelift jit: cannot resume at an arbitrary
+pc …")` because each compiled function bakes in its entry `pc`.
+
 ## Measured verdict — the tier stays DEFAULT-OFF
 The feature is measurement-gated, and the measurement says **no**: Cranelift is *not* a win. Two
 independent harnesses agree (the fixed-order tier table in crate `tests/jit_bench.rs`, and the

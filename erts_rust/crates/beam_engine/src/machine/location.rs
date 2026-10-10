@@ -145,6 +145,21 @@ impl Machine {
         self.current_code
     }
 
+    /// Record the machine's current execution position as `(function index, code
+    /// offset)` — the **write** half of [`Machine::current_code`].
+    ///
+    /// The interpreted loop writes this store directly
+    /// ([`Machine::step_instruction`](crate::Machine) records it at entry); a
+    /// **native JIT tier** reaches this accessor from each compiled block's
+    /// prologue, so `Machine::current_code` reflects block-granularity position
+    /// even across linked blocks, which never return to the driver. It is
+    /// deliberately infallible: any `(func, pc)` the code can reach is a real
+    /// position within some module the machine is executing, and the derived
+    /// accessors reject an out-of-range index with their typed error rather than
+    /// this setter inventing a failure.
+    pub(crate) fn set_current_code(&mut self, func: u32, pc: u32) {
+        self.current_code = Some((func, pc));
+    }
     /// The `(function index, arity)` the run was entered at — the engine's
     /// analogue of ERTS's `$initial_call`.
     ///

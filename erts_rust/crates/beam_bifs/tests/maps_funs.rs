@@ -24,9 +24,14 @@
 //! A `BifFn` cannot execute BEAM code, so — exactly like the `lists` fun-taking
 //! BIFs in `tests/lists_funs.rs` — these call their fun through the public
 //! [`FunCaller`] seam ([`BifContext::call_fun`]). Each test installs a **mock**
-//! caller: the "fun" argument is a small-integer sentinel naming the operation, and
-//! the mock supplies the behaviour (a real `beam_rt` would resolve a closure
-//! reference there).
+//! caller: the "fun" argument is a **real** `EXPORT_EXT` fun term whose *function*
+//! atom names the operation, and the mock supplies the behaviour (a real `beam_rt`
+//! would resolve a closure reference there).
+//!
+//! A `fun`-taking `maps` BIF first applies the oracle's `is_function(Fun, Arity)`
+//! clause-head guard ([`mock_fun`]), so the mock's fun must be a real fun of the
+//! right arity — an opaque sentinel never reaches the mock, and the guard's own
+//! `error:badarg` cases are pinned in `tests/maps_fun_guards.rs`.
 //!
 //! OTP documents map iteration order as **unspecified** and the oracle's own order
 //! is neither insertion nor sorted order (`maps:keys(#{b=>2,a=>1,c=>3})` ⇒
@@ -38,9 +43,11 @@
 use beam_alloc::Heap;
 use beam_bifs::{default_registry, BifContext, BifRegistry, FunCaller};
 use beam_common::{BeamError, Result};
-use beam_codec::term::{cons_head, cons_tail, tuple_element};
+use beam_codec::term::{cons_head, cons_tail, fun_function, make_fun_external, tuple_element};
 use beam_process::ProcessId;
-use beam_term::{is_list, is_nil, is_small, make_atom, make_small, signed_value, AtomTable, Eterm};
+use beam_term::{
+    atom_val, is_list, is_nil, is_small, make_atom, make_small, signed_value, AtomTable, Eterm,
+};
 
 /// `fun(K, V) -> K + V end`.
 const KEY_PLUS_VALUE: i64 = 1;
@@ -53,9 +60,44 @@ const KEY: i64 = 4;
 /// A fun whose body raises `badarg`; the BIF must propagate it untouched.
 const RAISES: i64 = 5;
 
+/// The `(operation, true arity, function-atom)` triple of every mock fun.
+///
+/// The mock's fun argument is a **real** `EXPORT_EXT` fun term (see [`mock_fun`]):
+/// a `fun`-taking `maps` BIF validates its fun with the oracle's
+/// `is_function(Fun, Arity)` clause-head guard, so an opaque small-integer sentinel
+/// would be rejected with the plain `error:badarg` before the mock is ever
+/// consulted. The operation is therefore carried in the fun's *function* atom, which
+/// [`MockFuns::operation`] decodes back through the seeded [`AtomTable`].
+///
+/// The arity is the one the equivalent Erlang fun has — `map/2`, `filter/2` and
+/// `foreach/2` call the fun with two arguments and `fold/3` with three, so the fun
+/// the mock is handed must match.
+const MOCK_FUNS: [(i64, usize, &str); 5] = [
+    (KEY_PLUS_VALUE, 2, "f_key_plus_value"),
+    (VALUE_GT_15, 2, "f_value_gt_15"),
+    (ACC_KEY_TIMES_VALUE, 3, "f_acc_key_times_value"),
+    (KEY, 2, "f_key"),
+    (RAISES, 2, "f_raises"),
+];
+
+/// The fun term the mock recognizes as `operation`: an `EXPORT_EXT` fun of the
+/// operation's true arity whose function atom names it.
+///
+/// Built on the *context* heap (the BIF only hands the term straight back to the
+/// [`FunCaller`], never copying it), so a test can build it mid-walk with nothing
+/// but its `BifContext`.
+fn mock_fun(ctx: &mut BifContext<'_>, operation: i64) -> Eterm {
+    let (_, arity, name) =
+        MOCK_FUNS.iter().find(|(id, _, _)| *id == operation).expect("a known mock operation");
+    let module = atom_val(ctx.atom("mock").expect("seeded"));
+    let function = atom_val(ctx.atom(name).expect("seeded"));
+    make_fun_external(ctx.heap(), *arity, module, function).expect("the mock fun fits")
+}
+
 fn seeded_atoms() -> AtomTable {
     let mut atoms = AtomTable::new();
-    atoms.seed(["true", "false", "ok", "case_clause"]);
+    atoms.seed(["true", "false", "ok", "case_clause", "mock"]);
+    atoms.seed(MOCK_FUNS.iter().map(|(_, _, name)| *name));
     atoms
 }
 
@@ -86,22 +128,41 @@ fn assert_structured(result: Result<Eterm>, ctx: &BifContext<'_>, expected: Eter
     }
 }
 
-/// The mock `FunCaller`: it recognises the sentinel fun term and computes the
-/// operation's result. Every result here is an immediate, so the mock needs no heap.
+/// The mock `FunCaller`: it decodes the operation a mock fun term names and computes
+/// the operation's result. Every result here is an immediate, so the mock needs no heap.
 struct MockFuns {
+    /// The seeded atom table, kept to resolve a mock fun's *function* atom back to its
+    /// operation after `with_mock` has returned.
+    atoms: &'static AtomTable,
     truth: Eterm,
     falsity: Eterm,
     calls: Vec<(i64, Vec<Eterm>)>,
 }
 
 impl MockFuns {
-    fn new(atoms: &AtomTable) -> MockFuns {
+    fn new(atoms: &'static AtomTable) -> MockFuns {
         let atom = |name: &str| make_atom(atoms.lookup(name).expect("seeded atom"));
         MockFuns {
+            atoms,
             truth: atom("true"),
             falsity: atom("false"),
             calls: Vec::new(),
         }
+    }
+
+    /// The operation the mock fun term `fun` names.
+    ///
+    /// Every fun argument reaching the mock is one [`mock_fun`] built, so its function
+    /// atom is a seeded [`MOCK_FUNS`] name; anything else is a test bug, not an input
+    /// the BIF could produce.
+    fn operation(&self, fun: Eterm) -> i64 {
+        let function = fun_function(fun).expect("a mock fun argument is an external fun");
+        let name = self.atoms.name(function).expect("the mock fun's function atom is seeded");
+        MOCK_FUNS
+            .iter()
+            .find(|(_, _, atom)| *atom == name)
+            .map(|(id, _, _)| *id)
+            .unwrap_or_else(|| panic!("unknown mock fun {name}"))
     }
 
     fn boolean(&self, value: bool) -> Eterm {
@@ -122,7 +183,7 @@ fn number(term: Eterm) -> i64 {
 
 impl FunCaller for MockFuns {
     fn call_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
-        let operation = number(fun);
+        let operation = self.operation(fun);
         self.calls.push((operation, args.to_vec()));
         match operation {
             KEY_PLUS_VALUE => Ok(make_small(number(args[0]) + number(args[1]))),
@@ -139,15 +200,18 @@ impl FunCaller for MockFuns {
 /// mock fun caller installed, returning the closure's value and the recorded calls.
 fn with_mock<R>(f: impl FnOnce(&BifRegistry, &mut BifContext<'_>) -> R) -> (R, Vec<(i64, Vec<Eterm>)>) {
     let registry = default_registry();
-    let atoms = seeded_atoms();
+    // Leaked for the same reason as the heap: the mock resolves a mock fun's function
+    // atom through this table *after* `with_mock` has returned, and the expected atom
+    // values must be identical for every seed sequence.
+    let atoms: &'static AtomTable = Box::leak(Box::new(seeded_atoms()));
     // Leaked on purpose: the closure's results are `Eterm`s that point into this
     // heap, and the tests inspect them *after* `with_mock` returns. Freeing the
     // heap here would make those reads a use-after-free.
     let heap: &'static mut Heap = Box::leak(Box::new(Heap::new(65_536).expect("test heap")));
-    let mut mock = MockFuns::new(&atoms);
+    let mut mock = MockFuns::new(atoms);
     let result = {
         let mut ctx =
-            BifContext::new(heap, &atoms, ProcessId::new(1, 0)).with_fun_caller(&mut mock);
+            BifContext::new(heap, atoms, ProcessId::new(1, 0)).with_fun_caller(&mut mock);
         f(&registry, &mut ctx)
     };
     (result, mock.calls)
@@ -214,9 +278,8 @@ fn size(reg: &BifRegistry, ctx: &mut BifContext<'_>, map: Eterm) -> i64 {
 fn map_rebuilds_every_value_and_keeps_every_key() {
     let ((mapped, mapped_size), calls) = with_mock(|reg, ctx| {
         let map = int_map(reg, ctx, &[(1, 10), (2, 20)]);
-        let mapped = reg
-            .call("maps", "map", 2, ctx, &[make_small(KEY_PLUS_VALUE), map])
-            .expect("maps:map/2");
+        let fun = mock_fun(ctx, KEY_PLUS_VALUE);
+        let mapped = reg.call("maps", "map", 2, ctx, &[fun, map]).expect("maps:map/2");
         (pairs(reg, ctx, mapped), size(reg, ctx, mapped))
     });
     // Oracle: maps:map(fun(K,V) -> K+V end, #{1=>10,2=>20}) => #{1=>11,2=>22}
@@ -232,9 +295,8 @@ fn map_rebuilds_every_value_and_keeps_every_key() {
 fn map_of_the_empty_map_calls_nothing() {
     let ((mapped, mapped_size), calls) = with_mock(|reg, ctx| {
         let empty = reg.call("maps", "new", 0, ctx, &[]).expect("maps:new/0");
-        let mapped = reg
-            .call("maps", "map", 2, ctx, &[make_small(KEY_PLUS_VALUE), empty])
-            .expect("maps:map/2");
+        let fun = mock_fun(ctx, KEY_PLUS_VALUE);
+        let mapped = reg.call("maps", "map", 2, ctx, &[fun, empty]).expect("maps:map/2");
         (pairs(reg, ctx, mapped), size(reg, ctx, mapped))
     });
     // Oracle: maps:map(_Fun, #{}) => #{}.
@@ -247,14 +309,9 @@ fn map_of_the_empty_map_calls_nothing() {
 fn fold_visits_every_pair_and_threads_the_accumulator() {
     let (total, calls) = with_mock(|reg, ctx| {
         let map = int_map(reg, ctx, &[(1, 10), (2, 20)]);
-        reg.call(
-            "maps",
-            "fold",
-            3,
-            ctx,
-            &[make_small(ACC_KEY_TIMES_VALUE), make_small(0), map],
-        )
-        .expect("maps:fold/3")
+        let fun = mock_fun(ctx, ACC_KEY_TIMES_VALUE);
+        reg.call("maps", "fold", 3, ctx, &[fun, make_small(0), map])
+            .expect("maps:fold/3")
     });
     // Oracle: maps:fold(fun(K,V,Acc) -> Acc + K*V end, 0, #{1=>10,2=>20}) => 50.
     // The accumulator is threaded into each call, so the total is order-insensitive
@@ -265,14 +322,9 @@ fn fold_visits_every_pair_and_threads_the_accumulator() {
 
     let (total, _) = with_mock(|reg, ctx| {
         let map = int_map(reg, ctx, &[(1, 10), (2, 20)]);
-        reg.call(
-            "maps",
-            "fold",
-            3,
-            ctx,
-            &[make_small(ACC_KEY_TIMES_VALUE), make_small(100), map],
-        )
-        .expect("maps:fold/3")
+        let fun = mock_fun(ctx, ACC_KEY_TIMES_VALUE);
+        reg.call("maps", "fold", 3, ctx, &[fun, make_small(100), map])
+            .expect("maps:fold/3")
     });
     // Oracle: the same fold seeded with 100 => 150.
     assert_eq!(number(total), 150);
@@ -282,14 +334,9 @@ fn fold_visits_every_pair_and_threads_the_accumulator() {
 fn fold_of_the_empty_map_returns_the_initial_accumulator() {
     let (acc, calls) = with_mock(|reg, ctx| {
         let empty = reg.call("maps", "new", 0, ctx, &[]).expect("maps:new/0");
-        reg.call(
-            "maps",
-            "fold",
-            3,
-            ctx,
-            &[make_small(ACC_KEY_TIMES_VALUE), make_small(7), empty],
-        )
-        .expect("maps:fold/3")
+        let fun = mock_fun(ctx, ACC_KEY_TIMES_VALUE);
+        reg.call("maps", "fold", 3, ctx, &[fun, make_small(7), empty])
+            .expect("maps:fold/3")
     });
     // Oracle: maps:fold(_Fun, 7, #{}) => 7.
     assert_eq!(number(acc), 7);
@@ -300,9 +347,8 @@ fn fold_of_the_empty_map_returns_the_initial_accumulator() {
 fn filter_keeps_only_the_pairs_the_predicate_accepts() {
     let ((kept, kept_size), calls) = with_mock(|reg, ctx| {
         let map = int_map(reg, ctx, &[(1, 10), (2, 20)]);
-        let kept = reg
-            .call("maps", "filter", 2, ctx, &[make_small(VALUE_GT_15), map])
-            .expect("maps:filter/2");
+        let fun = mock_fun(ctx, VALUE_GT_15);
+        let kept = reg.call("maps", "filter", 2, ctx, &[fun, map]).expect("maps:filter/2");
         (pairs(reg, ctx, kept), size(reg, ctx, kept))
     });
     // Oracle: maps:filter(fun(_K,V) -> V > 15 end, #{1=>10,2=>20}) => #{2=>20}.
@@ -314,9 +360,8 @@ fn filter_keeps_only_the_pairs_the_predicate_accepts() {
     // (oracle: maps:filter(fun(_K,V) -> V > 15 end, #{1=>10,2=>11}) => #{}).
     let ((none, none_size), _) = with_mock(|reg, ctx| {
         let map = int_map(reg, ctx, &[(1, 10), (2, 11)]);
-        let none = reg
-            .call("maps", "filter", 2, ctx, &[make_small(VALUE_GT_15), map])
-            .expect("maps:filter/2");
+        let fun = mock_fun(ctx, VALUE_GT_15);
+        let none = reg.call("maps", "filter", 2, ctx, &[fun, map]).expect("maps:filter/2");
         (pairs(reg, ctx, none), size(reg, ctx, none))
     });
     assert!(none.is_empty());
@@ -331,7 +376,8 @@ fn filter_rejects_a_non_boolean_predicate_result() {
         // (the fun's own non-boolean result is the `case_clause` value).
         //   erl -noshell -eval 'try maps:filter(fun(K,_V) -> K end, #{1=>10}) catch C:R ->
         //     io:format("~p:~p~n",[C,R]) end, halt().'  =>  error:{case_clause,1}
-        let result = reg.call("maps", "filter", 2, ctx, &[make_small(KEY), map]);
+        let fun = mock_fun(ctx, KEY);
+        let result = reg.call("maps", "filter", 2, ctx, &[fun, map]);
         let case_clause = ctx.atom("case_clause").expect("seeded");
         let expected = ctx.tuple(&[case_clause, make_small(1)]).expect("fits");
         assert_structured(result, ctx, expected);
@@ -343,8 +389,8 @@ fn filter_rejects_a_non_boolean_predicate_result() {
 fn foreach_visits_every_pair_and_returns_ok() {
     let (result, calls) = with_mock(|reg, ctx| {
         let map = int_map(reg, ctx, &[(1, 10), (2, 20)]);
-        reg.call("maps", "foreach", 2, ctx, &[make_small(KEY_PLUS_VALUE), map])
-            .expect("maps:foreach/2")
+        let fun = mock_fun(ctx, KEY_PLUS_VALUE);
+        reg.call("maps", "foreach", 2, ctx, &[fun, map]).expect("maps:foreach/2")
     });
     // Oracle: maps:foreach/2 => ok.
     assert_eq!(result, make_atom(seeded_atoms().lookup("ok").expect("seeded")));
@@ -356,7 +402,8 @@ fn foreach_visits_every_pair_and_returns_ok() {
 fn a_failing_fun_is_propagated_verbatim() {
     let ((), _) = with_mock(|reg, ctx| {
         let map = int_map(reg, ctx, &[(1, 10)]);
-        match reg.call("maps", "map", 2, ctx, &[make_small(RAISES), map]) {
+        let fun = mock_fun(ctx, RAISES);
+        match reg.call("maps", "map", 2, ctx, &[fun, map]) {
             Err(error) => assert!(matches!(error, BeamError::BadArg)),
             other => panic!("expected the fun's own error, got {other:?}"),
         }
@@ -367,17 +414,22 @@ fn a_failing_fun_is_propagated_verbatim() {
 fn without_a_fun_caller_the_maps_fun_bifs_are_a_typed_unsupported() {
     let registry = default_registry();
     let atoms = seeded_atoms();
-    let mut heap = Heap::new(1024).expect("test heap");
+    let mut heap = Heap::new(4096).expect("test heap");
     let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
     let map = int_map(&registry, &mut ctx, &[(1, 10)]);
 
-    let cases: [(&str, u32, Vec<Eterm>); 4] = [
-        ("map", 2, vec![make_small(KEY_PLUS_VALUE), map]),
-        ("fold", 3, vec![make_small(ACC_KEY_TIMES_VALUE), make_small(0), map]),
-        ("filter", 2, vec![make_small(VALUE_GT_15), map]),
-        ("foreach", 2, vec![make_small(KEY_PLUS_VALUE), map]),
+    let cases: [(&str, u32, i64, Vec<Eterm>); 4] = [
+        ("map", 2, KEY_PLUS_VALUE, vec![map]),
+        ("fold", 3, ACC_KEY_TIMES_VALUE, vec![make_small(0), map]),
+        ("filter", 2, VALUE_GT_15, vec![map]),
+        ("foreach", 2, KEY_PLUS_VALUE, vec![map]),
     ];
-    for (name, arity, args) in cases {
+    for (name, arity, operation, tail) in cases {
+        // A **valid** fun (the right arity) with no caller installed is the typed
+        // `unsupported_bif` gap — the guard passes, the seam is missing.
+        let fun = mock_fun(&mut ctx, operation);
+        let mut args = vec![fun];
+        args.extend(tail);
         match registry.call("maps", name, arity, &mut ctx, &args) {
             Err(BeamError::Raise(raise)) => {
                 assert_eq!(raise.class, beam_common::ExceptionClass::Error);
@@ -391,14 +443,9 @@ fn without_a_fun_caller_the_maps_fun_bifs_are_a_typed_unsupported() {
     // caller (oracle: maps:map(_Fun, #{}) => #{}, maps:fold(_Fun, Init, #{}) => Init).
     let empty = registry.call("maps", "new", 0, &mut ctx, &[]).expect("maps:new/0");
     assert_eq!(size(&registry, &mut ctx, empty), 0);
+    let fun = mock_fun(&mut ctx, ACC_KEY_TIMES_VALUE);
     let acc = registry
-        .call(
-            "maps",
-            "fold",
-            3,
-            &mut ctx,
-            &[make_small(ACC_KEY_TIMES_VALUE), make_small(41), empty],
-        )
+        .call("maps", "fold", 3, &mut ctx, &[fun, make_small(41), empty])
         .expect("maps:fold/3");
     assert_eq!(number(acc), 41);
 }

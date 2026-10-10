@@ -58,12 +58,18 @@
 //!   (`1 + 1.5` ⇒ `2.5`); `123456789012345678 * 98` ⇒ `12098765323209876444`
 //!   (a bignum — the `semantics/bignum_multiplication` differential case).
 //! * `abs/1`: `abs(-1.0)` ⇒ `1.0`; `abs(-(1 bsl 70))` ⇒ `1180591620717411303424`.
-//! * unary `-`: `-1.5` ⇒ `-1.5`; unary `+`: the number, unchanged.
+//!   It is also the **only** operator here whose non-number error is `badarg`:
+//!   `abs(a)`/`abs([])`/`abs({1})` ⇒ `badarg` (the C `abs_1` fall-through),
+//!   while every other operator raises `badarith` for a non-number.//! * unary `-`: `-1.5` ⇒ `-1.5`; unary `+`: the number, unchanged.
 //! * `div`/`rem`: integers only (`1.0 div 2` ⇒ `badarith`), truncated toward zero
 //!   (`-7 div 2` ⇒ `-3`, `-7 rem 2` ⇒ `-1`, `7 div -2` ⇒ `-3`, `7 rem -2` ⇒ `1`);
 //!   `rem` carries the dividend's sign; a zero divisor is `badarith`.
 //! * `/`: *always* a float (`2/1` ⇒ `2.0`); both operands convert to `f64` and a
 //!   zero divisor is `badarith`.
+//! * `+ - * /` on floats produce a finite result or raise: a result leaving the
+//!   `f64` range is `badarith` (`1.0e308 + 1.0e308`, `1.0e308 * 2.0`,
+//!   `lists:sum([1.0e308,1.0e308])`), the C `ERTS_FP_ERROR` `isfinite` guard. An
+//!   underflow to `0.0` is not an error.
 //!
 //! # The integer bit operators
 //!
@@ -105,7 +111,7 @@
 
 use core::cmp::Ordering;
 
-use beam_common::Result;
+use beam_common::{BeamError, Result};
 use beam_term::{signed_value, Eterm, MAX_SMALL, MIN_SMALL};
 
 use crate::access;
@@ -138,6 +144,18 @@ enum Num {
 /// [`BeamError::BadArith`](beam_common::BeamError::BadArith) for anything that is
 /// not a small integer, a bignum or a float (`1 + a` in the oracle).
 fn number(t: Eterm) -> Result<Num> {
+    number_or(t, badarith())
+}
+
+/// [`number`] with a caller-chosen error class for a non-number operand.
+///
+/// The C guard operators do **not** agree on that class: every operator but one
+/// raises `badarith` (`ERTS_FP_ERROR`/`BIF_ERROR(BIF_P, BADARITH)`), while
+/// `abs_1` falls through to `BIF_ERROR(BIF_P, BADARG)`
+/// (`../../../erts/emulator/beam/erl_bif_guard.c:104`) — i.e. `abs(a)`,
+/// `abs([])` and `abs({1})` are `badarg` in the oracle, not `badarith`
+/// (oracle-verified on OTP 29.1.1). Only [`abs`] passes `badarg` here.
+fn number_or(t: Eterm, non_number: BeamError) -> Result<Num> {
     if access::is_small(t) {
         Ok(Num::Int(Big::from_i64(signed_value(t))))
     } else if access::is_big(t) {
@@ -148,7 +166,7 @@ fn number(t: Eterm) -> Result<Num> {
     } else if access::is_float(t) {
         Ok(Num::Float(access::float_value(t)))
     } else {
-        Err(badarith())
+        Err(non_number)
     }
 }
 
@@ -175,6 +193,26 @@ fn as_float(n: &Num) -> Result<f64> {
     match n {
         Num::Int(value) => value.to_f64(),
         Num::Float(f) => Ok(*f),
+    }
+}
+
+/// The float result of `+ - * /`, rejecting an overflow the way the oracle's
+/// `ERTS_FP_ERROR` does (`erl_arith.c`: `if (!isfinite(f)) goto badarith`).
+///
+/// Any *finite* result passes through unchanged, so an underflow to `0.0`
+/// (`1.0e-308 * 1.0e-308` ⇒ `0.0`) is normal while an overflow that would leave
+/// the `f64` range (`1.0e308 + 1.0e308`, `1.0e308 * 2.0`, `1.0e308 / 1.0e-308`)
+/// is `badarith` — never a fabricated `inf`.
+///
+/// # Errors
+///
+/// [`BeamError::BadArith`](beam_common::BeamError::BadArith) for a non-finite
+/// result.
+fn finite(value: f64) -> Result<f64> {
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(badarith())
     }
 }
 
@@ -318,7 +356,7 @@ fn shift_mag_right(mag: &mut Vec<u64>, bits: usize) {
 fn add(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     match (number(args[0])?, number(args[1])?) {
         (Num::Int(x), Num::Int(y)) => int_term(ctx, &x.add(&y)),
-        (x, y) => ctx.make_float(as_float(&x)? + as_float(&y)?),
+        (x, y) => ctx.make_float(finite(as_float(&x)? + as_float(&y)?)?),
     }
 }
 
@@ -336,7 +374,7 @@ pub(crate) fn add_terms(ctx: &mut BifContext<'_>, a: Eterm, b: Eterm) -> Result<
 fn sub(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     match (number(args[0])?, number(args[1])?) {
         (Num::Int(x), Num::Int(y)) => int_term(ctx, &x.sub(&y)),
-        (x, y) => ctx.make_float(as_float(&x)? - as_float(&y)?),
+        (x, y) => ctx.make_float(finite(as_float(&x)? - as_float(&y)?)?),
     }
 }
 
@@ -344,7 +382,7 @@ fn sub(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 fn mul(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     match (number(args[0])?, number(args[1])?) {
         (Num::Int(x), Num::Int(y)) => int_term(ctx, &x.mul(&y)),
-        (x, y) => ctx.make_float(as_float(&x)? * as_float(&y)?),
+        (x, y) => ctx.make_float(finite(as_float(&x)? * as_float(&y)?)?),
     }
 }
 
@@ -355,7 +393,7 @@ fn divide(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     if y == 0.0 {
         return Err(badarith());
     }
-    ctx.make_float(x / y)
+    ctx.make_float(finite(x / y)?)
 }
 
 /// `A div B` — integer division, truncating toward zero.
@@ -371,8 +409,15 @@ fn int_rem(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 }
 
 /// `abs(A)`.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a non-number — the
+/// **only** guard operator that is `badarg` rather than `badarith` for a
+/// non-number (`abs_1`'s fall-through,
+/// `../../../erts/emulator/beam/erl_bif_guard.c:104`; see [`number_or`]).
 fn abs(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    match number(args[0])? {
+    match number_or(args[0], badarg())? {
         Num::Int(value) => int_term(ctx, &value.abs()),
         Num::Float(f) => ctx.make_float(f.abs()),
     }
@@ -1146,7 +1191,7 @@ mod tests {
     use beam_alloc::Heap;
     use beam_common::BeamError;
     use beam_process::ProcessId;
-    use beam_term::{make_small, AtomTable};
+    use beam_term::{make_small, AtomTable, NIL};
 
     /// Words in the test heap: enough for the widest bignum the tests build.
     const TEST_HEAP_WORDS: usize = 8192;
@@ -1272,13 +1317,65 @@ mod tests {
         with_ctx(|ctx| {
             let a = ctx.atom("a").unwrap();
             assert!(matches!(add(ctx, &[make_small(1), a]), Err(BeamError::BadArith)));
-            assert!(matches!(abs(ctx, &[a]), Err(BeamError::BadArith)));
+            // `abs/1` is deliberately **not** here: its non-number error is `badarg`
+            // (see `abs_of_a_non_number_is_badarg`).
             assert!(matches!(negate(ctx, &[a]), Err(BeamError::BadArith)));
             assert!(matches!(identity(ctx, &[a]), Err(BeamError::BadArith)));
             assert!(matches!(divide(ctx, &[make_small(1), a]), Err(BeamError::BadArith)));
         });
     }
 
+    /// `abs/1` is the sole guard operator whose non-number error is `badarg`, not
+    /// `badarith`: the C `abs_1` falls through to `BIF_ERROR(BIF_P, BADARG)`
+    /// (`../../../erts/emulator/beam/erl_bif_guard.c:104`), oracle-verified on OTP
+    /// 29.1.1 for `abs(a)`, `abs([])` and `abs({1})`.
+    #[test]
+    fn abs_of_a_non_number_is_badarg() {
+        with_ctx(|ctx| {
+            let a = ctx.atom("a").unwrap();
+            let tuple = ctx.tuple(&[make_small(1)]).unwrap();
+            for operand in [a, NIL, tuple] {
+                assert!(
+                    matches!(abs(ctx, &[operand]), Err(BeamError::BadArg)),
+                    "abs of a non-number must be badarg"
+                );
+            }
+            // The other operators keep the shared `badarith` coercion — `number/1`
+            // itself is unchanged.
+            assert!(matches!(negate(ctx, &[a]), Err(BeamError::BadArith)));
+            assert!(matches!(identity(ctx, &[NIL]), Err(BeamError::BadArith)));
+            assert!(matches!(bnot(ctx, &[a]), Err(BeamError::BadArith)));
+        });
+    }
+
+    /// `abs/1` is exact for every numeric class, including a negative bignum whose
+    /// magnitude is a bignum again (`abs(-(1 bsl 200))` ⇒ `1 bsl 200`).
+    #[test]
+    fn abs_of_a_number_is_exact() {
+        with_ctx(|ctx| {
+            assert_eq!(int(abs(ctx, &[make_small(-5)]).unwrap()), 5);
+            assert_eq!(int(abs(ctx, &[make_small(5)]).unwrap()), 5);
+            let neg = ctx.make_float(-1.5).unwrap();
+            assert_eq!(float(abs(ctx, &[neg]).unwrap()), 1.5);
+
+            // `-(1 bsl 200)`: limb 3 carries `1 << (200 - 3*64)` = 256.
+            let negative_big = bignum(ctx, true, &[0, 0, 0, 256]);
+            assert_eq!(parts(negative_big), (true, vec![0, 0, 0, 256]));
+            assert_eq!(
+                parts(abs(ctx, &[negative_big]).unwrap()),
+                (false, vec![0, 0, 0, 256])
+            );
+            // An already-positive bignum is unchanged.
+            let positive_big = bignum(ctx, false, &[0, 0, 0, 256]);
+            assert_eq!(
+                parts(abs(ctx, &[positive_big]).unwrap()),
+                (false, vec![0, 0, 0, 256])
+            );
+            // `abs(-(1 bsl 70))` — the module-doc value.
+            let two_to_70 = bignum(ctx, true, &[0, 64]);
+            assert_eq!(value(abs(ctx, &[two_to_70]).unwrap()), 1i128 << 70);
+        });
+    }
     #[test]
     fn zero_divisors_are_badarith() {
         with_ctx(|ctx| {
@@ -1522,6 +1619,41 @@ mod tests {
             carry_digits.push(((1u64 << 54) - 1) << 10);
             let carry = bignum(ctx, false, &carry_digits);
             assert!(matches!(add(ctx, &[carry, one_point_oh]), Err(BeamError::BadArith)));
+        });
+    }
+
+    /// A float operation whose result leaves the `f64` range raises `badarith`
+    /// (the C `ERTS_FP_ERROR` `isfinite` guard, `erl_arith.c:485-491`) instead of
+    /// fabricating `inf`; an underflow to `0.0` and any other finite result pass
+    /// through unchanged. Oracle: OTP 29.1.1 / erts-17.1.
+    #[test]
+    fn float_overflow_is_badarith_but_underflow_is_not() {
+        with_ctx(|ctx| {
+            let big = ctx.make_float(1.0e308).unwrap();
+            let neg_big = ctx.make_float(-1.0e308).unwrap();
+            let tiny = ctx.make_float(1.0e-308).unwrap();
+            let two = ctx.make_float(2.0).unwrap();
+
+            // `1.0e308 + 1.0e308`, `1.0e308 - -1.0e308`, `1.0e308 * 2.0`,
+            // `1.0e308 / 1.0e-308` are all `badarith` in the oracle.
+            assert!(matches!(add(ctx, &[big, big]), Err(BeamError::BadArith)));
+            assert!(matches!(sub(ctx, &[big, neg_big]), Err(BeamError::BadArith)));
+            assert!(matches!(mul(ctx, &[big, two]), Err(BeamError::BadArith)));
+            assert!(matches!(divide(ctx, &[big, tiny]), Err(BeamError::BadArith)));
+
+            // `lists:sum/1` folds through `add_terms`, which shares the guard.
+            assert!(matches!(add_terms(ctx, big, big), Err(BeamError::BadArith)));
+
+            // Underflow is *not* an error, and a finite product/quota of any
+            // magnitude is returned unchanged (`1.0e308 * 1.0e-308`).
+            assert_eq!(float(mul(ctx, &[tiny, tiny]).unwrap()), 0.0);
+            assert_eq!(float(mul(ctx, &[big, tiny]).unwrap()), 0.9999999999999999);
+            assert_eq!(float(divide(ctx, &[big, big]).unwrap()), 1.0);
+
+            // The guard is on the *result*: `f64::MAX + 0.0` stays finite.
+            let max = ctx.make_float(f64::MAX).unwrap();
+            let zero = ctx.make_float(0.0).unwrap();
+            assert_eq!(float(add(ctx, &[max, zero]).unwrap()), f64::MAX);
         });
     }
 

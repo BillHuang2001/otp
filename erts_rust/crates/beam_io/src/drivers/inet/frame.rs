@@ -18,13 +18,12 @@
 //
 // %CopyrightEnd%
 
-//! The `tcp_inet` **read-path framing glue** — the bridge between the socket options the
-//! driver stores ([`SocketOptions`]) and the pure, term-free packet decoder in
-//! [`super::packet`].
+//! The `tcp_inet` **framing glue** — the bridge between the socket options the driver stores
+//! ([`SocketOptions`]) and the pure, term-free packet decoder in [`super::packet`].
 //!
 //! [`super::packet`] turns a byte buffer plus four framing parameters into "this is one frame
 //! of `n` bytes" — a faithful port of the C's `packet_get_length` (`packet_parser.c:248`). This
-//! module is the small layer on top that the driver's read path actually calls:
+//! module is the small layer on top that the driver's two byte paths actually call:
 //!
 //! * [`options`] builds the decoder's [`PacketOptions`] from the driver's stored
 //!   `{packet, N}`/`{packet_size, N}`/`{line_delimiter, C}` socket options, exactly as the C
@@ -35,7 +34,11 @@
 //! * [`extract`] takes at most one whole frame's **payload** off the front of the buffer the
 //!   driver accumulates, the driver-side half of the C's `tcp_remain`/`tcp_reply_data` pair: it
 //!   reports a whole frame ([`Some`]), "not yet complete" ([`None`]) or a typed decode failure,
-//!   and **never** a partial, merged or wrong frame.
+//!   and **never** a partial, merged or wrong frame;
+//! * [`write_header`] is the **write**-side counterpart: the length header the C's
+//!   `tcp_sendv`/`tcp_send` prepend under `{packet, 1|2|4}` (`inet_drv.c:13745`-`:13769`,
+//!   `:13861`-`:13877`), so the bytes this driver queues are what a peer's `packet_get_length`
+//!   reads back as a frame.
 //!
 //! The decode itself is [`PacketType::payload_range`] (the C's `packet_get_body`,
 //! `packet_parser.h:152`): the header is stripped for [`Len1`](PacketType::Len1)/
@@ -45,8 +48,7 @@
 //!
 //! Legacy C ground truth (read-only): `erts/emulator/beam/packet_parser.{c,h}` and
 //! `erts/emulator/drivers/common/inet_drv.c` (`inet_set_opts`'s option store, `tcp_remain`,
-//! `tcp_reply_data`).
-
+//! `tcp_reply_data`, `tcp_sendv`, `tcp_send`).
 use beam_common::Result;
 
 use crate::error;
@@ -104,6 +106,36 @@ pub(super) fn framed(options: &SocketOptions) -> Option<PacketType> {
     }
 }
 
+/// The big-endian length **header** the C's `tcp_sendv`/`tcp_send` put in front of the payload
+/// under a `{packet, 1|2|4}` code (`inet_drv.c:13745`-`:13769`, `:13861`-`:13877`), or `None`
+/// when the current code writes no header at all.
+///
+/// The C switches on `desc->inet.htype` and stores the **payload** length (`ev->size` in
+/// `tcp_sendv`, `len` in `tcp_send`) with `put_int8`/`put_int16`/`put_int32`, so the header is a
+/// 1-, 2- or 4-byte big-endian number the peer's [`PacketOptions::decode`] reads back as the
+/// frame length. That is the exact counterpart of the read path's header strip
+/// ([`PacketType::payload_range`]).
+///
+/// Every other code — `raw`, the line mode, the ASN.1/CDR/FCGI/TPKT types and the HTTP family —
+/// takes the C's `default:` arm, sets `h_len = 0` and writes the payload verbatim.
+///
+/// Two faithfully-reproduced details:
+///
+/// * the C's `put_int*` macros truncate the length to the header's width (`sys.h:1286`-`:1321`),
+///   which the `as` casts here reproduce: `{packet, 1}` with a 300-byte payload announces 44;
+/// * an **empty** payload still writes the bare header. The C's shortcut
+///   (`if ((h_len == 0) && (len == 0)) return 0`, `inet_drv.c:13907`) requires *no header* as
+///   well, so `{packet, 4}` + `gen_tcp:send(S, <<>>)` really puts `<<0,0,0,0>>` on the wire
+///   (verified against the oracle).
+pub(super) fn write_header(options: &SocketOptions, len: usize) -> Option<Vec<u8>> {
+    match PacketType::from_code(options.packet as u8) {
+        Some(PacketType::Len1) => Some((len as u8).to_be_bytes().to_vec()),
+        Some(PacketType::Len2) => Some((len as u16).to_be_bytes().to_vec()),
+        Some(PacketType::Len4) => Some((len as u32).to_be_bytes().to_vec()),
+        _ => None,
+    }
+}
+
 /// Takes at most one complete frame's **payload** off the front of `pending`.
 ///
 /// Reads the frame header off the buffered bytes ([`PacketOptions::decode`], the C's
@@ -142,10 +174,9 @@ pub(super) fn extract(pending: &mut Vec<u8>, framing: &PacketOptions) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{extract, framed, options, SocketOptions};
+    use super::{extract, framed, options, write_header, SocketOptions};
     use super::{PacketOptions, PacketType};
     use beam_common::BeamError;
-
     /// The stored socket options for `packet_code`/`packet_size`/`line_delim` (everything else
     /// default).
     fn socket(packet_code: u8, packet_size: i32, line_delim: u8) -> SocketOptions {
@@ -201,8 +232,81 @@ mod tests {
         }
     }
 
-    // --- extract -------------------------------------------------------------
+    // --- write_header --------------------------------------------------------
 
+    #[test]
+    fn write_header_is_the_big_endian_payload_length_of_the_1_2_and_4_codes() {
+        let len = 3;
+        assert_eq!(
+            write_header(&socket(PacketType::Len1.code(), 0, b'\n'), len),
+            Some(vec![3]),
+            "the C's `put_int8`, one header byte"
+        );
+        assert_eq!(
+            write_header(&socket(PacketType::Len2.code(), 0, b'\n'), len),
+            Some(vec![0, 3]),
+            "the C's `put_int16`"
+        );
+        assert_eq!(
+            write_header(&socket(PacketType::Len4.code(), 0, b'\n'), len),
+            Some(vec![0, 0, 0, 3]),
+            "the C's `put_int32`"
+        );
+    }
+
+    #[test]
+    fn write_header_truncates_to_the_header_width_like_the_c_macros() {
+        // `put_int8(300, buf)` stores `300 & 0xff`.
+        assert_eq!(
+            write_header(&socket(PacketType::Len1.code(), 0, b'\n'), 300),
+            Some(vec![44])
+        );
+        // `put_int16(0x1_0002, buf)` stores the low 16 bits.
+        assert_eq!(
+            write_header(&socket(PacketType::Len2.code(), 0, b'\n'), 0x1_0002),
+            Some(vec![0, 2])
+        );
+    }
+
+    #[test]
+    fn write_header_of_an_empty_payload_is_still_the_bare_header() {
+        // The C's `(h_len == 0) && (len == 0)` shortcut needs no header too, so a framing code
+        // still announces a zero-length body (the oracle writes `<<0,0,0,0>>` for `{packet,4}`).
+        assert_eq!(
+            write_header(&socket(PacketType::Len4.code(), 0, b'\n'), 0),
+            Some(vec![0, 0, 0, 0])
+        );
+        assert_eq!(
+            write_header(&socket(PacketType::Len1.code(), 0, b'\n'), 0),
+            Some(vec![0])
+        );
+    }
+
+    #[test]
+    fn every_other_code_writes_the_payload_verbatim() {
+        // `raw`, the line mode, the other decoded types and the HTTP family all take the C's
+        // `default:` arm (`h_len = 0`), and so does an out-of-range code.
+        for code in [
+            PacketType::Raw.code(),
+            PacketType::Asn1.code(),
+            PacketType::Rm.code(),
+            PacketType::Cdr.code(),
+            PacketType::Fcgi.code(),
+            PacketType::LineLf.code(),
+            PacketType::Tpkt.code(),
+            PacketType::Http.code(),
+            PacketType::SslTls.code(),
+            200,
+        ] {
+            assert_eq!(
+                write_header(&socket(code, 0, b'\n'), 3),
+                None,
+                "code {code} writes no length header"
+            );
+        }
+    }
+
+    // --- extract -------------------------------------------------------------
     #[test]
     fn extract_returns_one_full_frame_and_consumes_just_it() {
         let framing = PacketOptions::new(PacketType::Len2);

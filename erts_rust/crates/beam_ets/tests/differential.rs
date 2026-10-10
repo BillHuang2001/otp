@@ -180,8 +180,8 @@
 //!   compares keys arithmetically (`erl_db_tree.c` `cmp_key_eq`, `CMP =
 //!   erts_cmp(a, b, 0, 0)`), so it interleaves integers and floats
 //!   (`-3 < -2.5 < 0 < 1.5 < 5`) and `1` and `1.0` are the *same* key.
-//!   `beam_ets` reproduces this (`compare::cmp_arith`), so
-//!   [`KNOWN_DIVERGENCES`] is empty and every case is compared strictly.
+//!   `beam_ets` reproduces this (`compare::cmp_arith`), so no key-ordering case
+//!   is a recorded divergence and every one is compared strictly.
 //! * **A replacing insert also replaces the stored key term**: inserting
 //!   `{1.0,b}` over `{1,a}` collapses to one object and makes `ets:first`/
 //!   `ets:last`/`ets:next` report the *last-inserted* key term (`1.0`, and `1` in
@@ -191,15 +191,13 @@
 //!   `delete_all_objects/1` leave only an observable trace (`size`, `member`,
 //!   `lookup`, `tab2list`); `memory` and the table `id` are never rendered
 //!   (`reclamation_observable`).
-//! * **A guard that is the runtime's own capability gap is *not* swallowed.**
-//!   `erl` runs match-spec arithmetic through the ordinary BIFs, so `/` (whose
-//!   Erlang result is always a float) and any float/bignum operand answer a
-//!   float/bignum. This crate's `DefaultArithHook` has no float/bignum arithmetic
-//!   and answers the typed `unsupported_ets` raise, which the guard path
-//!   propagates (only the oracle's own `badarg` skips a clause) — so
-//!   `select_guard_div` and `select_guard_float_arith` are the two recorded
-//!   [`KNOWN_DIVERGENCES`], rendered honestly through `cap_select` rather than
-//!   silently under-matching. Every other new guard/body construct agrees.
+//! * **Match-spec arithmetic follows the oracle.** `erl` runs match-spec
+//!   arithmetic through the ordinary BIFs, so `/` is always a float and a
+//!   float/bignum operand yields a float/bignum. `DefaultArithHook` mirrors that:
+//!   `+ - * /` (and unary `+`/`-`) compute in `f64` when a float is involved and
+//!   `/` is always a float, while integer-only operators and a result that leaves
+//!   the 60-bit small range stay the typed `unsupported_ets`. A guard's capability
+//!   gap is never swallowed — only the oracle's own `badarg` skips a clause.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -462,6 +460,32 @@ const EXPECTED: &[(&str, &str)] = &[
     ("select_guard_map_get", "ok:[1]"),
     ("select_guard_tuple_size", "ok:[1]"),
     ("select_guard_size_family", "ok:[1]"),
+    (
+        "select_guard_ceil_floor",
+        "{ok:[1,2],ok:[2],ok:[1]}",
+    ),
+    ("select_guard_max_min", "{ok:[1],ok:[2]}"),
+    ("select_guard_binary_part2", "ok:[1]"),
+    ("select_guard_binary_part3", "ok:[1]"),
+    ("select_guard_is_record3", "ok:[true,false,false]"),
+    (
+        "select_guard_is_function2",
+        "{ok:[],ok:[false,false]}",
+    ),
+    ("select_guard_is_integer3", "ok:[2]"),
+    (
+        "select_body_node0",
+        "ok:[nonode@nohost,nonode@nohost]",
+    ),
+    (
+        "select_guard_xor_body",
+        "{ok:[1,2],ok:[false,false]}",
+    ),
+    ("select_body_bnot", "ok:[-11,-21]"),
+    (
+        "select_head_map_nonliteral_key",
+        "{badarg,badarg}",
+    ),
     ("select_guard_float_arith", "ok:[2]"),
     ("select_body_whole", "[{1,a,10},{2,b,20}]"),
     ("select_body_var", "[1,2]"),
@@ -703,43 +727,16 @@ fn expected_map() -> BTreeMap<String, String> {
 
 /// Cases where `beam_ets` is **known to differ from the system `erl` today**.
 ///
-/// These are *recorded*, not tolerated: they are excluded from the equality
-/// assertion and pinned by [`known_divergences_are_still_present`], which fails —
-/// telling you to delete the entry — the moment `beam_ets` is fixed. Keeping them
-/// in the battery (rather than dropping them) keeps the oracle's real behaviour in
-/// `EXPECTED` and the gap actionable.
+/// Currently **empty**: the match-spec arithmetic gap is closed — `DefaultArithHook`
+/// computes float `+ - * /` (and the always-float `/`) faithfully — so every battery
+/// case agrees with the oracle.
 ///
-/// Both entries are the **same typed capability gap**: match-spec arithmetic
-/// outside the small-integer subset. The C runs every arithmetic operator through
-/// the ordinary BIFs, so a `/` (whose Erlang result is *always* a float) or any
-/// float/bignum operand answers a float/bignum; this crate's `DefaultArithHook`
-/// has no float/bignum arithmetic and deliberately answers the typed
-/// `unsupported_ets` raise instead of guessing (workspace `CONTEXT.md` §3 — never
-/// a wrong result). In a **guard** the error is not swallowed: `guards_hold`
-/// propagates everything but the oracle's own `badarg`, so `select` fails and
-/// [`Battery::cap_select`] renders `error:unsupported_ets: …` where the oracle
-/// renders the selected keys. A real runtime installs a full `ArithHook`
-/// (`set_arith_hook`), which is what closes both cases.
-const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
-    (
-        "select_guard_div",
-        "the `/` match-spec operator: Erlang's result is always a float, so \
-         DefaultArithHook answers the typed `unsupported_ets` instead of a \
-         fabricated small integer, and a guard propagates it (no silent \
-         under-match). The oracle selects `ok:[2]`; beam_ets renders \
-         `error:unsupported_ets: match-spec arithmetic '/': the result is a float`. \
-         Closed by installing a full ArithHook.",
-    ),
-    (
-        "select_guard_float_arith",
-        "match-spec arithmetic with a float operand (`{'*', '$2', 1.5}`): \
-         DefaultArithHook is small-integer only, so the operand is the typed \
-         `unsupported_ets` rather than a guessed value, and the guard propagates \
-         it. The oracle selects `ok:[2]`; beam_ets renders \
-         `error:unsupported_ets: match-spec arithmetic '*': operand 2 is not a \
-         small integer`. Closed by installing a full ArithHook.",
-    ),
-];
+/// A recorded divergence is excluded from the equality assertion and pinned by
+/// [`known_divergences_are_still_present`], which fails — telling you to delete the
+/// entry — the moment `beam_ets` matches the oracle. Keeping an entry in the battery
+/// (rather than dropping it) keeps the oracle's real behaviour in `EXPECTED` and the
+/// gap actionable.
+const KNOWN_DIVERGENCES: &[(&str, &str)] = &[];
 /// `true` when `name` is a recorded divergence.
 fn is_known_divergence(name: &str) -> bool {
     KNOWN_DIVERGENCES.iter().any(|(case, _)| *case == name)

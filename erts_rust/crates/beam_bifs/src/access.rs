@@ -40,10 +40,14 @@
 
 use beam_alloc::Heap;
 use beam_common::{BeamError, Result};
-use beam_term::prelude::{boxed_val, make_boxed, make_header, make_small, signed_value, try_make_small};
+use beam_term::prelude::{
+    boxed_val, is_arity_value, is_boxed_term, make_boxed, make_header, make_small, signed_value,
+    try_make_small,
+};
 use beam_term::{
-    Atom, AtomTable, Eterm, BITSTRING_TAG_MASK, ERL_HEAP_BITS_SIZE, HEADER_ARITY_OFFS,
-    HEADER_FLONUM, HEAP_BITS_SUBTAG, REF_SUBTAG,
+    Atom, AtomTable, Eterm, ERL_HEAP_BITS_SIZE, HAMT_SUBTAG_HEAD_ARRAY,
+    HAMT_SUBTAG_HEAD_BITMAP, HAMT_SUBTAG_NODE_BITMAP, HEADER_ARITY_OFFS, HEADER_FLONUM,
+    HEADER_MAP_SUBTAG_MASK, HEAP_BITS_SUBTAG, REF_SUBTAG,
 };
 
 // ---------------------------------------------------------------------------
@@ -486,30 +490,52 @@ pub(crate) fn bitstring_bit_size(term: Eterm) -> Result<usize> {
 
 /// Copies the bytes of a byte-aligned bitstring (a *binary*) out of the term.
 ///
+/// **Both** frozen bitstring representations are handled, through the LCA reader
+/// [`beam_term::bitstring::bitstring_parts`]:
+///
+/// * an **on-heap** `ErlHeapBits` (`[thing_word, n_bits, data…]`), whose base is
+///   `boxed_val(term) + 2` with a zero bit offset — the bytes are stored in address
+///   order (`erl_bits.h`: the data area is byte-addressed);
+/// * an **off-heap** `ErlSubBits` window (a `[BinRef][ErlSubBits]` refc binary, e.g.
+///   built by `beam_engine`'s `bs_create_bin` for any payload above 64 bytes, or a
+///   match context), whose base is `base_flags & !ERL_SUB_BITS_FLAG_MASK` and whose
+///   start is a **bit** offset into that storage.
+///
+/// When that window starts on a byte boundary the answer is the contiguous slice
+/// `base + offset_bits / 8`; when it starts mid-byte there is no contiguous byte
+/// image, so the bits are re-packed MSB-first by [`bitstring_bits`] — never a
+/// guessed image.
+///
 /// # Errors
 ///
-/// [`BeamError::BadArg`] when `term` is not a byte-aligned bitstring. An off-heap
-/// `SUB_BITS` thing is also rejected: Milestone-1 builds none (every binary this
-/// crate creates is on-heap), and its bytes live behind a `BinRef`/match-context
-/// indirection that no M1 producer creates.
+/// [`BeamError::BadArg`] when `term` is not a byte-aligned bitstring.
 #[allow(dead_code)]
 pub(crate) fn binary_bytes(term: Eterm) -> Result<Vec<u8>> {
     if !is_binary(term) {
         return Err(BeamError::BadArg);
     }
-    // SAFETY: [`is_binary`] confirmed `term` is a boxed, byte-aligned bitstring, so
-    // its header word is a live term word.
-    let header = unsafe { *boxed_val(term) };
-    if header.raw() & BITSTRING_TAG_MASK != HEAP_BITS_SUBTAG {
-        return Err(BeamError::BadArg);
+    // SAFETY: [`is_binary`] confirmed `term` is a live, byte-aligned bitstring (heap
+    // or sub), so `bitstring_parts` reads only that term's own words and returns a
+    // base pointer into storage backing bits `offset_bits..offset_bits + size_bits`
+    // — kept alive by `term` for the whole of the copy below.
+    let (base, offset_bits, size_bits) = unsafe { beam_term::bitstring::bitstring_parts(term) };
+    let nbytes = size_bits / 8;
+    if offset_bits & 7 != 0 {
+        // A mid-byte window has no contiguous byte image: re-pack bit by bit.
+        return bitstring_bits(term);
     }
-    // SAFETY: a heap bitstring is `[header, size, data…]`, so word 2 begins the live
-    // data area, which holds `ceil(byte_len / 8)` words — i.e. at least `byte_len`
-    // initialised bytes (`erl_bits.h`: the data area is byte-addressed).
-    let data = unsafe { boxed_val(term).add(HEAP_BITS_PREFIX_WORDS).cast::<u8>() };
-    let nbytes = unsafe { beam_term::bitstring_size(term) } / 8;
-    // SAFETY: the `nbytes` bytes just described are initialised and in bounds; the
-    // copy goes out byte by byte, so it is endianness-agnostic.
+    if nbytes == 0 {
+        // No bytes to read — return before touching `base`, which may be null or
+        // dangling for a zero-length window (`from_raw_parts` is UB for a zero-length
+        // slice built from such a pointer).
+        return Ok(Vec::new());
+    }
+    // SAFETY: `offset_bits` and `size_bits` are both multiples of 8 (`is_binary`), so
+    // bits `offset_bits..offset_bits + size_bits` are exactly the `nbytes > 0`
+    // initialised bytes at `base + offset_bits / 8`, all inside the live storage the
+    // base pointer covers; the copy goes out byte by byte, so it is
+    // endianness-agnostic.
+    let data = unsafe { base.add(offset_bits / 8) };
     Ok(unsafe { core::slice::from_raw_parts(data, nbytes) }.to_vec())
 }
 
@@ -547,10 +573,13 @@ pub(crate) fn bitstring_bits(term: Eterm) -> Result<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
-// Flat maps (`beam_term::thing` owns the layout)
+// Maps (`beam_term::map` owns both layouts: flat map and HAMT hash map)
 //
-// Reserved for the `maps` module BIFs, which land later; every item is exercised by
-// the tests below until then (hence the `#[allow(dead_code)]`).
+// `is_flatmap`/`is_hashmap`/`make_flatmap`/`flatmap_pairs` are the flat-map half of
+// this surface and keep their original shapes for existing callers; the `map_*`/
+// `make_map` items below handle **both** representations (the crate's `maps` BIFs
+// need a map with more than `MAP_SMALL_MAP_LIMIT` distinct keys to be a real HAMT,
+// not a `system_limit`).
 // ---------------------------------------------------------------------------
 
 /// `is_flatmap(x)` — a flat map (a small map), as opposed to a hashmap.
@@ -562,10 +591,7 @@ pub(crate) fn is_flatmap(x: Eterm) -> bool {
     unsafe { beam_term::is_flatmap(x) }
 }
 
-/// `is_hashmap(x)`.
-// A documented part of the `access.rs` surface reserved for dependents: M1 builds no
-// hashmaps (every M1 map is a flat map), so no BIF dispatches on it yet.
-#[allow(dead_code)]
+/// `is_hashmap(x)` — a hash map (a HAMT), i.e. a map above `MAP_SMALL_MAP_LIMIT`.
 #[inline]
 pub(crate) fn is_hashmap(x: Eterm) -> bool {
     // SAFETY: as [`is_flatmap`].
@@ -611,6 +637,190 @@ pub(crate) fn flatmap_pairs(term: Eterm) -> Result<(Vec<Eterm>, Vec<Eterm>)> {
     Ok((keys.to_vec(), values.to_vec()))
 }
 
+/// Builds a map from `(key, value)` pairs on `heap`, choosing the representation
+/// ERTS does: at most `MAP_SMALL_MAP_LIMIT` (32) **distinct** keys give a flat map
+/// (keys stored in `erts_cmp_flatmap_keys` order), more give a HAMT hash map whose
+/// stored pair order is the oracle's `maps:to_list/1` order.
+///
+/// This is the layout-owning [`beam_term::map::write_map`] behind the crate's map
+/// producers. The pair order of `pairs` is irrelevant: `write_map` sorts a flat map
+/// and places a hash map's keys by `erts_map_hash`, collapsing duplicate keys
+/// **last value wins** in both cases.
+///
+/// The atom table passed to `write_map` is a **fresh empty one**. The builder
+/// consults it only to name atoms in a *tie-break* (`compare::cmp_atoms`, reached
+/// from `cmp`/`eq` for keys whose hashes collide); an unknown name falls back to the
+/// raw atom index, so the result stays deterministic and — because distinct atoms
+/// have distinct indices — never merges two distinct keys. The same substitution
+/// (`beam_abi`'s driver host `map_term`) is used there for the same reason: taking
+/// `ctx.atoms()` alongside `ctx.heap()` would need two simultaneous borrows of
+/// [`BifContext`](crate::context::BifContext).
+///
+/// # Errors
+///
+/// Propagates [`BeamError::Alloc`](beam_common::BeamError::Alloc) when `heap` cannot
+/// fit the block, and the builder's own `TermError` (reconciled to
+/// [`BeamError::BadArg`]) for a malformed key.
+pub(crate) fn make_map(heap: &mut Heap, pairs: &[(Eterm, Eterm)]) -> Result<Eterm> {
+    let atoms = AtomTable::new();
+    let words = beam_term::map::map_words_capacity(pairs.len());
+    // SAFETY: `alloc_words` hands out `words` exclusively-owned, writable words.
+    let p = unsafe { heap.alloc_words(words)? };
+    // SAFETY: `p` is the base of those `words` words; `write_map` writes every word
+    // it needs (the reservation is a documented upper bound, so trailing words may
+    // stay unwritten) and returns a boxed root into the same block, which stays live
+    // and unmoved for as long as `heap` does, which the caller keeps alive.
+    Ok(unsafe { beam_term::map::write_map(p, pairs, &atoms)? })
+}
+
+/// The `(key, value)` pairs of **any** map — flat map or HAMT — in the order the map
+/// **stores** them: a flat map's keys-tuple order, a hash map's HAMT slot traversal
+/// order. That is the order the oracle's `maps:keys/1`, `maps:values/1` and
+/// `maps:to_list/1` report.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] when `term` is not a map.
+pub(crate) fn map_pairs_storage_order(term: Eterm) -> Result<Vec<(Eterm, Eterm)>> {
+    Ok(beam_term::map::map_pairs_storage_order(term)?)
+}
+
+/// The number of keys in **any** map — flat map or HAMT (`erts_map_size`).
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] when `term` is not a map.
+pub(crate) fn map_size(term: Eterm) -> Result<usize> {
+    Ok(beam_term::map::map_size(term, &AtomTable::new())?)
+}
+
+/// The value bound to `key` in **any** map — flat map or HAMT — or `None`.
+///
+/// The key match is the frozen exact (`=:=`) one (`beam_term::map::map_get`), so the
+/// caller must have classified `term` as a map first. `atoms` is the caller's real
+/// table (it decides only the atom-name tie-break inside `=:=`); no heap is involved,
+/// so a BIF can pass `ctx.atoms()` here.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] when `term` is not a map.
+pub(crate) fn map_get(term: Eterm, key: Eterm, atoms: &AtomTable) -> Result<Option<Eterm>> {
+    Ok(beam_term::map::map_get(term, key, atoms)?)
+}
+
+// ---------------------------------------------------------------------------
+// Hash-map (HAMT) node interiors
+//
+// The frozen node layout is owned by `beam_term::map` (a sibling crate); the
+// accessors below are the crate's read-only view of it, mirroring the C's
+// `hashmap_node_size` / the `hashmap_info` walk's node switch
+// (`erl_map.c:2296-2320`, `erl_map.c:3490-3536`):
+//
+// | node | header | words | layout |
+// |---|---|---|---|
+// | head, 16 slots | `HAMT_SUBTAG_HEAD_ARRAY` | `18` | `[hdr][size][16 slots]` |
+// | head, bitmap | `HAMT_SUBTAG_HEAD_BITMAP(bmp)` | `2 + n` | `[hdr][size][n slots]` |
+// | inner, bitmap | `HAMT_SUBTAG_NODE_BITMAP(bmp)` | `1 + n` | `[hdr][n slots]` |
+// | collision | `make_arityval(n)` | `1 + n` | a tuple of `n` kv cons cells |
+//
+// with `n = popcount(bmp)`. A slot is one **term word**: a leaf cons cell, a
+// sub-node or — at the last level — a collision tuple.
+// ---------------------------------------------------------------------------
+
+/// The class of a hash-map node, read from its header word
+/// (`_HEADER_MAP_SUBTAG_MASK`, `erl_map.h:169`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum HamtNode {
+    /// `HAMT_SUBTAG_HEAD_ARRAY` — the head node with all 16 slots present,
+    /// `[hdr][size][16 slots]`.
+    HeadArray,
+    /// `HAMT_SUBTAG_HEAD_BITMAP(bmp)` — the head node holding only the slots the
+    /// bitmap marks, `[hdr][size][n slots]`.
+    HeadBitmap,
+    /// `HAMT_SUBTAG_NODE_BITMAP(bmp)` — an inner node, `[hdr][n slots]`.
+    InnerBitmap,
+    /// A collision node — a plain `make_arityval(n)` tuple of `n` kv cons cells.
+    Collision,
+}
+
+/// The class of the hash-map node `term` — `None` for anything that is not a
+/// hash-map node (a leaf cons cell, a flat map, an immediate, a tuple, …).
+///
+/// An inner node and a collision node are *not* reachable as an ordinary Erlang
+/// term, but both are returned by [`crate::erts_internal::map_hashmap_children/1`],
+/// which the oracle lets a caller hand straight back to it (`erl_map.c:3425`),
+/// so the classification covers all four classes.
+///
+/// A collision node's header is an arityval, i.e. *not* a map header, so it is
+/// told apart by [`is_arity_value`] after the map-header test fails.
+pub(crate) fn hamt_node_kind(term: Eterm) -> Option<HamtNode> {
+    if !is_boxed_term(term) {
+        return None;
+    }
+    // SAFETY: `term` is a live boxed term (and not a bare header word), so
+    // `boxed_val` points at its header word.
+    let header = unsafe { *boxed_val(term) };
+    if beam_term::is_map_header(header) {
+        match header.raw() & HEADER_MAP_SUBTAG_MASK {
+            HAMT_SUBTAG_HEAD_ARRAY => Some(HamtNode::HeadArray),
+            HAMT_SUBTAG_HEAD_BITMAP => Some(HamtNode::HeadBitmap),
+            HAMT_SUBTAG_NODE_BITMAP => Some(HamtNode::InnerBitmap),
+            // The remaining map tag is the flat map, which has no HAMT interior.
+            _ => None,
+        }
+    } else if is_arity_value(header) {
+        Some(HamtNode::Collision)
+    } else {
+        None
+    }
+}
+
+/// A hash-map node's interior: its class and its slot words in **storage order**,
+/// exactly as the C reads them (`*ptr++`, `erl_map.c:3490-3536`).
+pub(crate) struct HamtNodeView {
+    /// The node's class.
+    pub kind: HamtNode,
+    /// The slot words in storage order (slot `0` first).
+    pub slots: Vec<Eterm>,
+}
+/// Reads the interior of the hash-map node `term` (see [`HamtNode`] for the
+/// layout; `hashmap_node_size`, `erl_map.c:2296-2320`).
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] when `term` is not a well-formed hash-map node — not a
+/// node at all, or a bitmap node with no slot set.
+pub(crate) fn hamt_node(term: Eterm) -> Result<HamtNodeView> {
+    let kind = hamt_node_kind(term).ok_or(BeamError::BadArg)?;
+    let base = boxed_val(term);
+    // SAFETY: `term` is a live boxed hash-map node, so `base` points at its
+    // header word (word 0 of its block).
+    let header = unsafe { *base };
+    // `slots_off` is the word offset of slot 0 (`hashmap_node_size`'s `*nodep`
+    // advancement: the head's `size` word sits between the header and the slots).
+    let (slots_off, count) = match kind {
+        HamtNode::HeadArray => (2usize, 16usize),
+        HamtNode::HeadBitmap | HamtNode::InnerBitmap => {
+            let bitmap = beam_term::map_header_val(header) as u16;
+            let slots_off = if kind == HamtNode::HeadBitmap { 2 } else { 1 };
+            (slots_off, bitmap.count_ones() as usize)
+        }
+        HamtNode::Collision => (1usize, beam_term::header_arity(header)),
+    };
+    if count == 0 {
+        // A bitmap node always has at least one slot and a collision node at
+        // least two (`ASSERT(sz >= 1)` / `ASSERT(sz >= 2)`); a zero-slot header
+        // is malformed, and `count - 1` indexing downstream would underflow.
+        return Err(BeamError::BadArg);
+    }
+    let mut slots = Vec::with_capacity(count);
+    for i in 0..count {
+        // SAFETY: the node owns `slots_off + count` words (the frozen layout
+        // above), so slot `i` lies inside its own live block.
+        slots.push(unsafe { *base.add(slots_off + i) });
+    }
+    Ok(HamtNodeView { kind, slots })
+}
 // ---------------------------------------------------------------------------
 // Native records (`beam_term::record` owns the frozen layout; `erl_record.h`)
 //
@@ -638,6 +848,12 @@ pub(crate) fn flatmap_pairs(term: Eterm) -> Result<(Vec<Eterm>, Vec<Eterm>)> {
 /// (`TermError::BadRecord` reconciled to `badarg`); otherwise propagates
 /// [`BeamError::Alloc`](beam_common::BeamError::Alloc) when `heap` cannot fit the
 /// block.
+/// Leaves the cached definition hash (definition word 2) as the `0` placeholder —
+/// a fabricated value. The `records` module must therefore build records through
+/// [`beam_codec::term::make_record`](beam_codec::term::make_record), which writes
+/// the real `compute_record_definition_hash` value (this writer is retained only
+/// because the `compare` test suite pins the record layout through it).
+#[allow(dead_code)]
 pub(crate) fn native_record_write(
     heap: &mut Heap,
     module: Atom,
@@ -757,6 +973,7 @@ pub(crate) fn native_record_is_native(rec: Eterm, module: Atom, name: Atom) -> b
 mod tests {
     use super::*;
     use beam_alloc::Heap;
+    use beam_alloc::RefcBinary;
     use beam_common::BeamError;
     use beam_process::ProcessId;
     use beam_term::{is_boxed, make_small, NIL};
@@ -895,6 +1112,89 @@ mod tests {
             let header = unsafe { *boxed_val(bin) };
             assert_eq!(header, make_header(arity, HEAP_BITS_SUBTAG));
         }
+    }
+
+    /// The bytes `<<(I rem 256) || I <- lists:seq(1, N)>>` holds — the oracle's
+    /// >64-byte subject for the off-heap refc-binary path.
+    fn ramp(n: usize) -> Vec<u8> {
+        (1..=n).map(|i| (i % 256) as u8).collect()
+    }
+
+    /// Builds the off-heap `[BinRef][ErlSubBits]` pair the engine's `bs_create_bin`
+    /// writes for a payload above `ERL_ONHEAP_BINARY_LIMIT` (64) bytes, and returns
+    /// the boxed root.
+    ///
+    /// `payload` owns the storage the pair points into and must outlive every use of
+    /// the returned term.
+    fn refc_binary(
+        heap: &mut Heap,
+        payload: &RefcBinary,
+        offset_bits: usize,
+        size_bits: usize,
+    ) -> Eterm {
+        let base = payload.data_ptr();
+        // SAFETY: `alloc_words` hands out `ERL_REFC_BITS_SIZE` (8) exclusively-owned,
+        // writable words — exactly the pair `write_refc_binary` fully writes.
+        let hp = unsafe { heap.alloc_words(beam_term::refc::ERL_REFC_BITS_SIZE) }
+            .expect("the 8-word pair fits");
+        // SAFETY: `hp` is that reserved pair; `base` is the first byte of `payload`'s
+        // live, `UNIT_SIZE`-aligned data area (kept alive by the caller), which covers
+        // bits `offset_bits..offset_bits + size_bits`.
+        unsafe {
+            beam_term::refc::write_refc_binary(
+                hp,
+                base.cast::<Eterm>(),
+                core::ptr::null_mut(),
+                base,
+                offset_bits,
+                size_bits,
+            )
+        }
+    }
+
+    #[test]
+    fn binary_bytes_reads_an_off_heap_refc_binary() {
+        let mut heap = Heap::new(64).expect("test heap");
+        let data = ramp(96);
+        assert!(data.len() > 64, "the subject must exceed ERL_ONHEAP_BINARY_LIMIT");
+        let payload = RefcBinary::new(&data).expect("the off-heap payload allocates");
+
+        // The whole-binary view: `start = 0`, the full bit size.
+        let root = refc_binary(&mut heap, &payload, 0, data.len() * 8);
+        assert!(is_bitstring(root));
+        assert!(is_binary(root));
+        assert_eq!(bitstring_bit_size(root).unwrap(), data.len() * 8);
+        assert_eq!(
+            binary_bytes(root).unwrap(),
+            data,
+            "the off-heap payload must be read verbatim, not from boxed_val + 2"
+        );
+        // The bit-by-bit reader agrees (it re-packs the same bits MSB-first).
+        assert_eq!(bitstring_bits(root).unwrap(), data);
+
+        // A byte-aligned SUB_WINDOW: `start = 8` bits, one byte shorter.
+        let window = refc_binary(&mut heap, &payload, 8, (data.len() - 1) * 8);
+        assert!(is_binary(window));
+        assert_eq!(bitstring_bit_size(window).unwrap(), (data.len() - 1) * 8);
+        assert_eq!(binary_bytes(window).unwrap(), data[1..].to_vec());
+
+        // A multi-byte-aligned interior window (`start = 64` bits).
+        let inner = refc_binary(&mut heap, &payload, 64, 8 * 8);
+        assert!(is_binary(inner));
+        assert_eq!(binary_bytes(inner).unwrap(), data[8..16].to_vec());
+
+        // A mid-byte window has no contiguous byte image, so it is re-packed bit by
+        // bit: `start = 4`, size 8 bits ⇒ the low nibble of `data[0]` (0x01) then the
+        // high nibble of `data[1]` (0x02) ⇒ `0b0001_0000`.
+        let mid = refc_binary(&mut heap, &payload, 4, 8);
+        assert!(is_binary(mid), "an 8-bit window is byte aligned");
+        assert_eq!(binary_bytes(mid).unwrap(), vec![0x10]);
+        assert_eq!(binary_bytes(mid).unwrap(), bitstring_bits(mid).unwrap());
+
+        // A zero-length window must not touch the base pointer.
+        let empty = refc_binary(&mut heap, &payload, 0, 0);
+        assert!(is_binary(empty));
+        assert_eq!(binary_bytes(empty).unwrap(), Vec::<u8>::new());
     }
 
     #[test]

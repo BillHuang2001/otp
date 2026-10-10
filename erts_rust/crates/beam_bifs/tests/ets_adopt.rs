@@ -56,15 +56,24 @@
 //! ** exception error: bad argument
 //! 12> ets:foldl(notfun, [], ets:new(e, [set])).         % empty: no fun call
 //! []
-//! 13> ets:foldl(fun({_,V}, A) -> [V|A] end, [], T2).    % forward traversal
-//! 14> ets:foldr(fun({_,V}, A) -> [V|A] end, [], T2).    % the exact reverse
+//! 13> ets:foldl(fun(X, A) -> [X|A] end, [], T2).        % forward traversal
+//! 14> ets:foldr(fun(X, A) -> [X|A] end, [], T2).        % last-to-first *only*
+//!                                                       % for an ordered_set;
+//!                                                       % a hash kind keeps 13's
+//!                                                       % key order and reverses
+//!                                                       % each key's objects
 //! ```
 
+use std::process::Command;
+
 use beam_alloc::Heap;
-use beam_bifs::{default_registry, BifContext, BifRegistry, TableRegistry};
-use beam_common::{BeamError, ExitReason};
+use beam_bifs::{default_registry, BifContext, BifRegistry, FunCaller, TableRegistry};
+use beam_codec::term::{cons_head, cons_tail, tuple_element};
+use beam_common::{BeamError, ExitReason, Result as BmResult};
 use beam_process::ProcessId;
-use beam_term::{atom_val, AtomTable, Eterm};
+use beam_term::{
+    atom_val, is_list, is_nil, is_small, signed_value, AtomTable, Eterm, NIL,
+};
 
 /// The atom names these tests need.
 fn seeded_atoms() -> AtomTable {
@@ -76,6 +85,8 @@ fn seeded_atoms() -> AtomTable {
         "set",
         "named_table",
         "public",
+        "protected",
+        "private",
         "heir",
         "none",
         "protection",
@@ -122,6 +133,12 @@ fn opt_list(ctx: &mut BifContext<'_>, elems: &[Eterm]) -> Eterm {
 /// The atom `name` as a term (the name is seeded).
 fn atom(ctx: &mut BifContext<'_>, name: &str) -> Eterm {
     ctx.atom(name).expect("seeded")
+}
+
+/// `ets:info(Tab, Item)` through the registry.
+fn info(bifs: &BifRegistry, ctx: &mut BifContext<'_>, table: Eterm, item: Eterm) -> Eterm {
+    bifs.call("ets", "info", 2, ctx, &[table, item])
+        .expect("ets:info/2")
 }
 
 /// Asserts `term` is the atom `expected`.
@@ -325,33 +342,150 @@ fn setopts_rejects_the_malformed_options() {
     assert_badarg(err);
 }
 
-/// `{protection, _}` is recognised by the parser but is the typed capability gap
-/// here (`beam_ets::Table` has no access setter) — never a fabricated `true`
-/// (probe 7 is the oracle's `true`).
+/// `{protection, P}` is a **supported** option: `ets:setopts/2` applies the access
+/// mode through the owner-gated `Table::setopts` and returns `true`, and
+/// `ets:info(T, protection)` reflects it immediately. All three modes, the
+/// bare-tuple form and the `{heir, …}` combination are applied; a duplicate
+/// `{protection, _}`, an unknown mode and a 3-tuple `{protection, P, X}` are the
+/// oracle's `badarg`, and a non-owner is `badarg` leaving the protection
+/// unchanged.
+///
+/// Probes (`erl -noshell`, erts-17.1):
+///
+/// ```text
+/// 1> T = ets:new(t, [set]),
+///    {ets:setopts(T, [{protection, public}]), ets:info(T, protection)}.
+/// {true, public}
+/// 2> {ets:setopts(T, [{protection, private}]), ets:info(T, protection)}.
+/// {true, private}
+/// 3> {ets:setopts(T, [{heir, none}, {protection, protected}]), ets:info(T, protection)}.
+/// {true, protected}
+/// 4> ets:setopts(T, {protection, public}).               % a bare tuple is accepted
+/// true
+/// 5> ets:setopts(T, [{protection, public}, {protection, private}]).
+/// ** exception error: bad argument
+/// 6> ets:setopts(T, {protection, bogus}).
+/// ** exception error: bad argument
+/// 7> ets:setopts(T, {protection, public, 7}).
+/// ** exception error: bad argument
+/// 8> T2 = ets:new(p, [set, public]),                     % a non-owner of a public table
+///    catch ets:setopts(T2, [{protection, private}]).     % (a spawned child process)
+/// {'EXIT', {badarg, …}}                                  % info(T2, protection) stays public
+/// ```
 #[test]
-fn setopts_protection_is_a_typed_gap() {
+fn setopts_protection_is_supported() {
     let bifs = default_registry();
     let mut heap = Heap::new(1 << 16).expect("test heap");
     let atoms = seeded_atoms();
     let mut tables = TableRegistry::new();
-    let mut ctx = BifContext::new(&mut heap, &atoms, self_pid()).with_tables(&mut tables);
+    let owner = self_pid();
+    let other = ProcessId::new(2, 0);
 
-    let table = new_table(&bifs, &mut ctx, "justname", &["set"]).expect("ets:new");
-    let protection = atom(&mut ctx, "protection");
-    let public = atom(&mut ctx, "public");
-    let bogus = atom(&mut ctx, "k");
+    // The owner drives the whole `{protection, _}` matrix on a `public` table
+    // (so a non-owner would reach the owner check rather than the write gate).
+    let (table, protection, private) = {
+        let mut ctx = BifContext::new(&mut heap, &atoms, owner).with_tables(&mut tables);
+        let table = new_table(&bifs, &mut ctx, "justname", &["set", "public"]).expect("ets:new");
+        let protection = atom(&mut ctx, "protection");
+        let public = atom(&mut ctx, "public");
+        let private = atom(&mut ctx, "private");
+        let protected = atom(&mut ctx, "protected");
+        let bogus = atom(&mut ctx, "k");
+        let heir = atom(&mut ctx, "heir");
+        let none = atom(&mut ctx, "none");
 
-    let opts = opt_list(&mut ctx, &[protection, public]);
-    let err = bifs
-        .call("ets", "setopts", 2, &mut ctx, &[table, opts])
-        .expect_err("the typed gap");
-    assert_unsupported(err);
-    // A malformed `{protection, _}` is still `badarg` (the C validates first).
-    let bad = opt_list(&mut ctx, &[protection, bogus]);
-    let err = bifs
-        .call("ets", "setopts", 2, &mut ctx, &[table, bad])
-        .expect_err("badarg");
-    assert_badarg(err);
+        // `[{protection, public}]` ⇒ `true`, `info(T, protection)` ⇒ `public` (probe 1).
+        let opts = opt_list(&mut ctx, &[protection, public]);
+        let ret = bifs
+            .call("ets", "setopts", 2, &mut ctx, &[table, opts])
+            .expect("ets:setopts");
+        assert_true(&ctx, ret);
+        let got = info(&bifs, &mut ctx, table, protection);
+        assert_atom(&ctx, got, "public");
+
+        // `[{protection, private}]` ⇒ `true`, `info` ⇒ `private` (probe 2).
+        let opts = opt_list(&mut ctx, &[protection, private]);
+        let ret = bifs
+            .call("ets", "setopts", 2, &mut ctx, &[table, opts])
+            .expect("ets:setopts");
+        assert_true(&ctx, ret);
+        let got = info(&bifs, &mut ctx, table, protection);
+        assert_atom(&ctx, got, "private");
+
+        // `[{heir, none}, {protection, protected}]` ⇒ `true`, `info` ⇒ `protected`
+        // (probe 3) — the `{heir, …}` and `{protection, …}` options compose.
+        let heir_opt = ctx.tuple(&[heir, none]).expect("option");
+        let prot_opt = ctx.tuple(&[protection, protected]).expect("option");
+        let opts = ctx.list(&[heir_opt, prot_opt]).expect("option list");
+        let ret = bifs
+            .call("ets", "setopts", 2, &mut ctx, &[table, opts])
+            .expect("ets:setopts");
+        assert_true(&ctx, ret);
+        let got = info(&bifs, &mut ctx, table, protection);
+        assert_atom(&ctx, got, "protected");
+
+        // A bare `{protection, public}` tuple is accepted ⇒ `true`, `info` ⇒ `public`
+        // (probe 4).
+        let bare = ctx.tuple(&[protection, public]).expect("bare option");
+        let ret = bifs
+            .call("ets", "setopts", 2, &mut ctx, &[table, bare])
+            .expect("ets:setopts");
+        assert_true(&ctx, ret);
+        let got = info(&bifs, &mut ctx, table, protection);
+        assert_atom(&ctx, got, "public");
+
+        // A duplicate `{protection, _}` is `badarg` and leaves the mode untouched
+        // (probe 5).
+        let dup = {
+            let one = ctx.tuple(&[protection, public]).expect("option");
+            let two = ctx.tuple(&[protection, private]).expect("option");
+            ctx.list(&[one, two]).expect("option list")
+        };
+        let err = bifs
+            .call("ets", "setopts", 2, &mut ctx, &[table, dup])
+            .expect_err("badarg");
+        assert_badarg(err);
+        let got = info(&bifs, &mut ctx, table, protection);
+        assert_atom(&ctx, got, "public");
+
+        // An unknown mode `{protection, bogus}` is `badarg` (unchanged, probe 6).
+        let bad = opt_list(&mut ctx, &[protection, bogus]);
+        let err = bifs
+            .call("ets", "setopts", 2, &mut ctx, &[table, bad])
+            .expect_err("badarg");
+        assert_badarg(err);
+        let got = info(&bifs, &mut ctx, table, protection);
+        assert_atom(&ctx, got, "public");
+
+        // A 3-tuple `{protection, public, 7}` is `badarg` (unchanged, probe 7).
+        let seven = ctx.int(7).expect("small int");
+        let three = ctx.tuple(&[protection, public, seven]).expect("option");
+        let err = bifs
+            .call("ets", "setopts", 2, &mut ctx, &[table, three])
+            .expect_err("badarg");
+        assert_badarg(err);
+        let got = info(&bifs, &mut ctx, table, protection);
+        assert_atom(&ctx, got, "public");
+
+        (table, protection, private)
+    };
+
+    // A non-owner is `badarg` and leaves the protection unchanged (probe 8). The
+    // table is `public`, so the write gate admits the caller and the *owner* check
+    // is what denies it.
+    {
+        let mut ctx = BifContext::new(&mut heap, &atoms, other).with_tables(&mut tables);
+        let opts = opt_list(&mut ctx, &[protection, private]);
+        let err = bifs
+            .call("ets", "setopts", 2, &mut ctx, &[table, opts])
+            .expect_err("badarg");
+        assert_badarg(err);
+    }
+    {
+        let mut ctx = BifContext::new(&mut heap, &atoms, owner).with_tables(&mut tables);
+        let got = info(&bifs, &mut ctx, table, protection);
+        assert_atom(&ctx, got, "public");
+    }
 }
 
 /// `ets:setopts/2` requires the owner — after a `give_away` the former owner is
@@ -538,8 +672,345 @@ fn folds_without_a_fun_caller_are_a_typed_gap() {
     }
 }
 
-// -------------------------------------------------------- owner→handle roster
+// ------------------------------------------------ foldl/3 foldr/3 traversal
+//
+// `ets:foldl/3`/`ets:foldr/3` are stdlib `ets.erl` functions (`do_foldl`/`do_foldr`,
+// `stdlib/src/ets.erl:2510,2552`): a *key* walk (`first_lookup`/`next_lookup`,
+// resp. `last_lookup`/`prev_lookup`) whose landed objects are folded with
+// `lists:foldl`/`lists:foldr`. That makes two independent directions:
+//
+//   * `foldr` reverses each key's object list for **every** kind;
+//   * `foldr` walks the keys last-to-first **only** where the interior can, i.e.
+//     only for an `ordered_set` — a hash kind's `ets:last_lookup`/`ets:prev_lookup`
+//     alias the forward primitives, so there `foldr` visits the keys in the very
+//     same order as `foldl`.
+//
+// The `ordered_set` and single-key-`bag` probes below are order-*defined*, so they
+// are pinned against the oracle's literal output; the multi-key hash-kind probes
+// only pin the oracle's *relation* (whose absolute order the docs call
+// "unspecified").
 
+/// Sentinel "fun": `fun(Object, Acc) -> [Object | Acc] end` — the oracle probes'
+/// own fun, so the accumulator can be compared with the oracle's printed list.
+const COLLECT: i64 = 1;
+
+/// Sentinel "fun": `fun({Key, _}, Acc) -> [Key | Acc] end` — collects the **key
+/// walk** only, which is what distinguishes a hash kind from an `ordered_set`.
+const COLLECT_KEY: i64 = 2;
+
+/// The mock [`FunCaller`] the fold tests install: it runs exactly the bodies the
+/// oracle probes ran, on its own heap.
+struct MockFolds {
+    heap: &'static mut Heap,
+}
+
+impl FunCaller for MockFolds {
+    fn call_fun(&mut self, fun: Eterm, args: &[Eterm]) -> BmResult<Eterm> {
+        assert!(is_small(fun), "the mock is only called with a sentinel fun");
+        match signed_value(fun) {
+            COLLECT => self.heap.cons(args[0], args[1]),
+            COLLECT_KEY => {
+                let key = tuple_element(args[0], 0).expect("a {Key, Value} object");
+                self.heap.cons(key, args[1])
+            }
+            other => panic!("unknown mock fun {other}"),
+        }
+    }
+}
+
+/// The atom names the fold-traversal tests need.
+fn fold_atoms() -> AtomTable {
+    let mut atoms = AtomTable::new();
+    atoms.seed(["true", "set", "ordered_set", "bag", "duplicate_bag", "t"]);
+    atoms
+}
+
+/// Runs `ets:{verb}/3` over a freshly created `kind` table holding `objects`, with
+/// the mock sentinel `fun`, and answers the resulting term (the fun's accumulator).
+fn fold_objects(kind: &str, objects: &[(i64, i64)], verb: &str, fun: i64) -> Eterm {
+    let bifs = default_registry();
+    let atoms = fold_atoms();
+    // Both heaps are leaked on purpose: the mock builds the accumulator on its own
+    // heap and the caller decodes that term after this function returns (the
+    // `tests/lists_funs.rs` pattern).
+    let mock_heap: &'static mut Heap = Box::leak(Box::new(Heap::new(1 << 16).expect("mock heap")));
+    let mut mock = MockFolds { heap: mock_heap };
+    let heap: &'static mut Heap = Box::leak(Box::new(Heap::new(1 << 16).expect("heap")));
+    let mut tables = TableRegistry::new();
+    let mut ctx = BifContext::new(heap, &atoms, self_pid())
+        .with_tables(&mut tables)
+        .with_fun_caller(&mut mock);
+
+    let name = atom(&mut ctx, "t");
+    let kind_atom = atom(&mut ctx, kind);
+    let options = ctx.list(&[kind_atom]).expect("option list");
+    let table = bifs
+        .call("ets", "new", 2, &mut ctx, &[name, options])
+        .expect("ets:new");
+    for &(k, v) in objects {
+        let key = ctx.int(k).expect("small int");
+        let value = ctx.int(v).expect("small int");
+        let object = ctx.tuple(&[key, value]).expect("object");
+        bifs.call("ets", "insert", 2, &mut ctx, &[table, object])
+            .expect("ets:insert");
+    }
+    let fun = ctx.int(fun).expect("small int");
+    bifs.call("ets", verb, 3, &mut ctx, &[fun, NIL, table])
+        .expect("the fold")
+}
+
+/// The `{Key, Value}` pairs of a `COLLECT` accumulator, in the order the fun consed
+/// them — i.e. **reverse** visit order, exactly the list the oracle probe printed.
+fn accumulator(term: Eterm) -> Vec<(i64, i64)> {
+    let pieces = proper_terms(term);
+    pieces
+        .iter()
+        .map(|&object| {
+            let key = tuple_element(object, 0).expect("a {Key, Value} object");
+            let value = tuple_element(object, 1).expect("a {Key, Value} object");
+            assert!(is_small(key) && is_small(value), "the mock collects small ints");
+            (signed_value(key), signed_value(value))
+        })
+        .collect()
+}
+
+/// The application order of a fold: the accumulator reversed.
+fn visit_order(term: Eterm) -> Vec<(i64, i64)> {
+    let mut order = accumulator(term);
+    order.reverse();
+    order
+}
+
+/// Groups a visit order into consecutive same-key runs (`(key, values)`).
+fn runs(visit: &[(i64, i64)]) -> Vec<(i64, Vec<i64>)> {
+    let mut out: Vec<(i64, Vec<i64>)> = Vec::new();
+    for &(key, value) in visit {
+        match out.last_mut() {
+            Some((last, values)) if *last == key => values.push(value),
+            _ => out.push((key, vec![value])),
+        }
+    }
+    out
+}
+
+/// The elements of a proper list built on a mock heap.
+fn proper_terms(term: Eterm) -> Vec<Eterm> {
+    let mut out = Vec::new();
+    let mut cur = term;
+    while is_list(cur) {
+        out.push(cons_head(cur).expect("a cons head"));
+        cur = cons_tail(cur).expect("a cons tail");
+    }
+    assert!(is_nil(cur), "expected a proper list, got a term ending in {cur:?}");
+    out
+}
+
+/// `ets:foldl/3`/`ets:foldr/3` on an `ordered_set` — the one kind whose traversal
+/// order the docs define — must reproduce the oracle verbatim: `foldl` walks
+/// first-to-last, `foldr` last-to-first, and each key's object list is folded with
+/// `lists:foldr`. (The pre-fix bridge walked `last`/`prev` *and* reversed the whole
+/// collected vector, so `foldr` answered exactly what `foldl` did.)
+///
+/// Oracle probe (OTP 29.1.1 / erts-17.1):
+/// ```text
+/// T = ets:new(t, [ordered_set]), [ets:insert(T, {K, K*10}) || K <- lists:seq(1,5)],
+/// ets:foldl(fun(X, A) -> [X|A] end, [], T) => [{5,50},{4,40},{3,30},{2,20},{1,10}]
+/// ets:foldr(fun(X, A) -> [X|A] end, [], T) => [{1,10},{2,20},{3,30},{4,40},{5,50}]
+/// ```
+#[test]
+fn folds_walk_an_ordered_set_last_to_first_like_the_oracle() {
+    let objects: Vec<(i64, i64)> = (1..=5).map(|k| (k, k * 10)).collect();
+
+    let forward = fold_objects("ordered_set", &objects, "foldl", COLLECT);
+    assert_eq!(
+        accumulator(forward),
+        vec![(5, 50), (4, 40), (3, 30), (2, 20), (1, 10)],
+        "ets:foldl/3 walks an ordered_set first-to-last"
+    );
+
+    let backward = fold_objects("ordered_set", &objects, "foldr", COLLECT);
+    assert_eq!(
+        accumulator(backward),
+        vec![(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)],
+        "ets:foldr/3 walks an ordered_set last-to-first"
+    );
+
+    // The two are the exact reverse of one another (visit order).
+    let mut expected = visit_order(forward);
+    expected.reverse();
+    assert_eq!(visit_order(backward), expected);
+}
+
+/// A `bag` holding several objects under **one** key: the oracle's key walk is
+/// trivial there, so this pins the per-key object reversal verbatim — `foldl`
+/// folds the key's objects with `lists:foldl`, `foldr` with `lists:foldr`.
+///
+/// Oracle probe (OTP 29.1.1 / erts-17.1):
+/// ```text
+/// B = ets:new(b, [bag]), ets:insert(B, [{1,10},{1,11},{1,12}]),
+/// ets:foldl(fun(X, A) -> [X|A] end, [], B) => [{1,12},{1,11},{1,10}]
+/// ets:foldr(fun(X, A) -> [X|A] end, [], B) => [{1,10},{1,11},{1,12}]
+/// ```
+#[test]
+fn folds_reverse_a_key_objects_like_the_oracle() {
+    let objects = vec![(1, 10), (1, 11), (1, 12)];
+    for kind in ["bag", "duplicate_bag"] {
+        assert_eq!(
+            accumulator(fold_objects(kind, &objects, "foldl", COLLECT)),
+            vec![(1, 12), (1, 11), (1, 10)],
+            "{kind}: ets:foldl/3 folds the key's objects left to right"
+        );
+        assert_eq!(
+            accumulator(fold_objects(kind, &objects, "foldr", COLLECT)),
+            vec![(1, 10), (1, 11), (1, 12)],
+            "{kind}: ets:foldr/3 folds the key's objects right to left"
+        );
+    }
+}
+
+/// The **hash-kind** rule: `ets:foldr/3` visits the keys in exactly the same order
+/// as `ets:foldl/3` (its `last_lookup`/`prev_lookup` alias the forward primitives)
+/// and only reverses each key's object list. A `set` has one object per key, so
+/// there the two folds are literally identical.
+#[test]
+fn hash_kind_folds_keep_the_key_order_and_reverse_each_keys_objects() {
+    let one_each: Vec<(i64, i64)> = (1..=5).map(|k| (k, k * 10)).collect();
+    for kind in ["set", "bag", "duplicate_bag"] {
+        let forward = fold_objects(kind, &one_each, "foldl", COLLECT);
+        let backward = fold_objects(kind, &one_each, "foldr", COLLECT);
+        let forward_order = visit_order(forward);
+        let backward_order = visit_order(backward);
+        assert_eq!(
+            backward_order
+                .iter()
+                .map(|&(key, _)| key)
+                .collect::<Vec<_>>(),
+            forward_order.iter().map(|&(key, _)| key).collect::<Vec<_>>(),
+            "{kind}: a hash kind keeps the foldl key order in foldr"
+        );
+        assert_eq!(
+            backward_order, forward_order,
+            "{kind}: with one object per key the two folds agree"
+        );
+    }
+
+    // Multi-object keys: the key runs stay in order and only the values within a
+    // run are reversed.
+    let multi = vec![(1, 10), (1, 11), (1, 12), (2, 20), (2, 21), (3, 30)];
+    for kind in ["bag", "duplicate_bag"] {
+        let forward = runs(&visit_order(fold_objects(kind, &multi, "foldl", COLLECT)));
+        let backward = runs(&visit_order(fold_objects(kind, &multi, "foldr", COLLECT)));
+        assert_eq!(
+            backward.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+            forward.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+            "{kind}: foldr keeps foldl's key order"
+        );
+        assert_eq!(forward.len(), 3, "{kind}: three key runs");
+        for ((fkey, fvalues), (bkey, bvalues)) in forward.iter().zip(backward.iter()) {
+            assert_eq!(fkey, bkey);
+            let mut reversed = fvalues.clone();
+            reversed.reverse();
+            assert_eq!(
+                &reversed, bvalues,
+                "{kind}: only key {fkey}'s object list is reversed"
+            );
+        }
+    }
+
+    // And the key walk itself, collected on its own, agrees between the two folds.
+    // One object per key, so the call count is the key count for every hash kind.
+    for kind in ["set", "bag", "duplicate_bag"] {
+        let forward_keys = proper_terms(fold_objects(kind, &one_each, "foldl", COLLECT_KEY));
+        let backward_keys = proper_terms(fold_objects(kind, &one_each, "foldr", COLLECT_KEY));
+        assert_eq!(
+            backward_keys, forward_keys,
+            "{kind}: foldr visits the keys in foldl's order"
+        );
+        assert_eq!(forward_keys.len(), one_each.len(), "{kind}: one call per object");
+    }
+}
+
+/// A one-object table (any kind) folds to the same single-object list either way,
+/// and the `ordered_set` fold of a single key is likewise direction-independent
+/// (the oracle's `'$end_of_table'` short circuits).
+#[test]
+fn folds_on_a_single_object_agree_in_both_directions() {
+    let one = vec![(7, 70)];
+    for kind in ["set", "ordered_set", "bag", "duplicate_bag"] {
+        assert_eq!(
+            accumulator(fold_objects(kind, &one, "foldl", COLLECT)),
+            vec![(7, 70)],
+            "{kind}"
+        );
+        assert_eq!(
+            accumulator(fold_objects(kind, &one, "foldr", COLLECT)),
+            vec![(7, 70)],
+            "{kind}"
+        );
+    }
+}
+
+// ------------------------------------------------------- live oracle check
+
+/// Runs one `-eval` statement under the system `erl`; `None` when the oracle is
+/// unavailable (the test then skips loudly).
+fn oracle_eval(statement: &str) -> Option<String> {
+    let output = Command::new("erl")
+        .args(["-noshell", "-eval", statement, "-s", "init", "stop"])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => Some(
+            String::from_utf8_lossy(&out.stdout)
+                .trim_end_matches(['\n', '\r'])
+                .to_string(),
+        ),
+        Ok(out) => {
+            eprintln!(
+                "SKIP: the oracle `erl` failed ({}); stderr: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            None
+        }
+        Err(err) => {
+            eprintln!("SKIP: no `erl` oracle on PATH ({err})");
+            None
+        }
+    }
+}
+
+/// The live cross-check for the fold traversal: re-runs the probe the goldens above
+/// were measured from (an `ordered_set`, a single-key `bag`, and a multi-key `bag`
+/// whose **key walk alone** is collected), so a future OTP change cannot silently
+/// invalidate them. `~w` (not `~p`) keeps the oracle from line-wrapping.
+#[test]
+fn the_fold_traversals_agree_with_the_live_oracle() {
+    let statement = concat!(
+        "T = ets:new(ft_o, [ordered_set]), ",
+        "[ets:insert(T, {K, K*10}) || K <- lists:seq(1,5)], ",
+        "B = ets:new(ft_b, [bag]), ets:insert(B, [{1,10},{1,11},{1,12}]), ",
+        "M = ets:new(ft_m, [bag]), ",
+        "ets:insert(M, [{1,10},{1,11},{1,12},{2,20},{2,21},{3,30}]), ",
+        "F = fun(X, A) -> [X|A] end, ",
+        "K = fun({Key, _}, A) -> [Key|A] end, ",
+        "io:format(\"~w~n\", [{",
+        "ets:foldl(F, [], T), ets:foldr(F, [], T), ",
+        "ets:foldl(F, [], B), ets:foldr(F, [], B), ",
+        "ets:foldl(K, [], M), ets:foldr(K, [], M)}])"
+    );
+    let Some(actual) = oracle_eval(statement) else {
+        return;
+    };
+    assert_eq!(
+        actual,
+        "{[{5,50},{4,40},{3,30},{2,20},{1,10}],[{1,10},{2,20},{3,30},{4,40},{5,50}],\
+         [{1,12},{1,11},{1,10}],[{1,10},{1,11},{1,12}],\
+         [3,2,2,1,1,1],[3,2,2,1,1,1]}",
+        "the live oracle disagrees with the pinned fold goldens"
+    );
+}
+
+// -------------------------------------------------------- owner→handle roster
 /// The runtime's reclamation seam, reached through the **public** registry API: a
 /// dead owner's tables are enumerated with `handles_owned_by` (keyed by
 /// `owner_of`, the lossless pid→owner bridge) and dropped through the existing

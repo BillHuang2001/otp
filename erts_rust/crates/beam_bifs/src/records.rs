@@ -50,8 +50,8 @@
 //! [`crate::registry::BifRegistry::with_core_bifs`] calls.
 
 use beam_common::{BeamError, Result};
-use beam_term::compare::eq;
-use beam_term::{atom_val, AtomTable, Eterm};
+use beam_term::compare::{cmp_flatmap_keys, eq};
+use beam_term::{atom_val, Eterm};
 
 use crate::access;
 use crate::context::BifContext;
@@ -102,9 +102,14 @@ fn definition_or_badrecord(ctx: &mut BifContext<'_>, term: Eterm) -> Result<Eter
 /// try records:update(R,m,r,#{zz=>9}) catch C:E -> io:format("~p:~p~n",[C,E]) end,
 /// halt().'` ⇒ `error:{badfield,{{m,r},zz}}` (with the record's own module/name, even
 /// when the caller passed the `'_'` wildcard).
+///
+/// The reason is a **2-tuple** whose single element is the `{{Module, Name}, Key}`
+/// pair, not a flat 3-tuple: the `{Module, Name}` identifier is nested one level
+/// deeper, exactly as the C builds it (`erl_record.c`).
 fn badfield(ctx: &mut BifContext<'_>, module: Eterm, name: Eterm, key: Eterm) -> Result<BeamError> {
     let identifier = ctx.tuple(&[module, name])?;
-    error::structured_error(ctx, "badfield", &[identifier, key])
+    let pair = ctx.tuple(&[identifier, key])?;
+    error::structured_error(ctx, "badfield", &[pair])
 }
 
 /// `records:get/2` (`records_get_2`, `erl_record.c:1247-1274`): a native record
@@ -199,9 +204,14 @@ fn field_pairs(fields: Eterm) -> Result<Vec<(Eterm, Eterm)>> {
 /// `Module`/`Name` must be atoms, `Opts` a 1-entry map containing `is_exported`
 /// with a `true`/`false` value, and `Fields` a proper list of `{Key, Value}`
 /// 2-tuples with atom keys (no duplicates). The result is the frozen
-/// `[field_order][definition][instance]` block; its cached definition hash is
-/// `make_small(0)` (this crate cannot compute the C `make_hash2` — see
-/// `beam_term::record`).
+/// `[field_order][definition][instance]` block whose cached definition hash
+/// (definition word 2) is the real
+/// `beam_term::hashing::compute_record_definition_hash` value C's
+/// `records_create_4` stores (`erl_record.c:1041-1046`), written through
+/// [`beam_codec::term::make_record`] — the sibling safe constructor that owns the
+/// write-placeholder-then-recompute dance. [`access::native_record_write`] cannot
+/// be used here: it leaves the `0` placeholder, and the word is observable (a
+/// record's `erlang:phash2/1` mixes it) — see the comment at its call site.
 ///
 /// # Errors
 ///
@@ -227,8 +237,9 @@ fn create(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     if !access::is_map(opts) {
         return Err(error::structured_error(ctx, "badmap", &[opts])?);
     }
-    // A flat map is the only map shape this crate builds/reads (see the crate
-    // `CONTEXT.md`); a >32-entry (hash) map also fails the exactly-1 check.
+    // `Opts` must hold exactly one entry (`is_exported`), so it is always a flat
+    // map; `flatmap_pairs` reads it directly and rejects any other shape (a map
+    // of another size is a typed `badarg`, matching the C's exactly-1 check).
     let (opt_keys, opt_values) = access::flatmap_pairs(opts)?;
     if opt_keys.len() != 1 || !atom_name_is(ctx, opt_keys[0], "is_exported") {
         return Err(error::badarg());
@@ -246,27 +257,21 @@ fn create(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
             return Err(badfield(ctx, module, name, key)?);
         }
     }
-    access::native_record_write(
+    // Definition word 2 is the *observable* cached definition hash
+    // `make_hash2({module, name, is_exported, keys})`: a record's `erlang:phash2/1`
+    // mixes it, so the `0` placeholder `access::native_record_write` leaves is a
+    // fabricated value. `beam_codec::term::make_record` writes the real one (it
+    // needs the atom table to name the module/name/keys, so the caller's table is
+    // cloned first — `ctx.heap()` and `ctx.atoms()` cannot be borrowed at once).
+    let atoms = ctx.atoms().clone();
+    beam_codec::term::make_record(
         ctx.heap(),
+        &atoms,
         atom_val(module),
         atom_val(name),
         is_exported,
         &pairs,
     )
-}
-
-/// The update-map value for `key`, matched by exact (`=:=`) equality — the C
-/// `records_update_4` key comparison.
-fn update_value<'a>(
-    update_keys: &[Eterm],
-    update_values: &'a [Eterm],
-    key: Eterm,
-    atoms: &AtomTable,
-) -> Option<&'a Eterm> {
-    update_keys
-        .iter()
-        .position(|&k| eq(k, key, atoms))
-        .map(|i| &update_values[i])
 }
 
 /// `records:update/4` (`records_update_4`, `erl_record.c:1087-1245`).
@@ -277,6 +282,23 @@ fn update_value<'a>(
 /// original record unchanged, and every update key must name an existing field.
 /// The result shares the record's definition (observationally identical to the C,
 /// which copies the def pointer).
+///
+/// # Both map shapes are accepted
+///
+/// `Updates` may be a flat map **or** a hash map (a `>MAP_SMALL_MAP_LIMIT`-key
+/// HAMT): the C has a separate arm for each (`erl_record.c:1148-1180` and
+/// `:1181-1229`), and the field rules are identical. The update keys are ordered
+/// by the C's `erts_cmp_flatmap_keys` (`record_compare`, `erl_record.c:892-902`)
+/// — the order a flat map already stores its keys in, and the order the C sorts a
+/// hash map's keys into before merging (`erl_record.c:1203-1204`) — so a map
+/// carrying several non-field keys reports the same one the oracle does.
+///
+/// Verified against the oracle (erts-17.1) with a 40-field record:
+/// `records:update(R, m, r, U)` with a 40-entry `U` updates every field, and the
+/// same `U` with the module/name wildcards returns the record unchanged for
+/// fields it does not mention. A >32-entry update map whose keys name no field
+/// reports the **lowest-atom-index** offender as
+/// `error:{badfield,{{Module,Name},Key}}`.
 ///
 /// # Errors
 ///
@@ -293,9 +315,6 @@ fn update_value<'a>(
 ///   (`records:update(R, '_', '_', #{zz=>9})` ⇒ `error:{badfield,{{m,r},zz}}`). Which
 ///   key is reported for several bad keys follows the update map's stored order (OTP
 ///   documents map order as unspecified).
-///
-/// A >32-entry (hash) update map is [`error::system_limit`] — a typed gap (this crate
-/// builds/reads only flat maps), never a wrong result.
 fn update(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let (rec, module, name, updates) = (args[0], args[1], args[2], args[3]);
     if !access::is_record(rec) {
@@ -319,16 +338,20 @@ fn update(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     if !access::is_map(updates) {
         return Err(error::structured_error(ctx, "badmap", &[updates])?);
     }
-    if access::is_hashmap(updates) {
-        // >32 update keys: a hash map, which this crate neither builds nor reads
-        // (the crate `CONTEXT.md` documents the flat-map-only scope).
-        return Err(error::system_limit());
-    }
-    let (update_keys, update_values) = access::flatmap_pairs(updates)?;
-    if update_keys.is_empty() {
-        // The oracle returns the record unchanged for an empty update map.
+    if access::map_size(updates)? == 0 {
+        // The oracle returns the record unchanged for an empty update map
+        // (`records_update_4`, `erl_record.c:1131-1133`).
         return Ok(rec);
     }
+
+    // The update keys, ordered as the C's merge sees them (`record_compare`,
+    // `erl_record.c:892-902`) — see the function docs. A flat map's stored order
+    // already is that order; a hash map's is not, so sort either way.
+    let mut update_keys: Vec<Eterm> = access::map_pairs_storage_order(updates)?
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    update_keys.sort_by(|a, b| cmp_flatmap_keys(*a, *b, ctx.atoms()));
 
     let keys = access::native_record_declaration_keys(def)?;
     for &update_key in &update_keys {
@@ -340,16 +363,21 @@ fn update(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     // Rebuild in declaration order, overlaying the update map's values.
     let mut pairs = Vec::with_capacity(keys.len());
     for &key in &keys {
-        let value = match update_value(&update_keys, &update_values, key, ctx.atoms()) {
-            Some(&value) => value,
+        let value = match access::map_get(updates, key, ctx.atoms())? {
+            Some(value) => value,
             None => access::native_record_get(rec, key, ctx.atoms())?.ok_or_else(error::badarg)?,
         };
         pairs.push((key, value));
     }
-    // Preserve the record's own definition (module/name/is_exported).
+    // Preserve the record's own definition (module/name/is_exported), and carry its
+    // real cached definition hash: `beam_codec::term::make_record` recomputes it
+    // from those same four inputs (see the `create` call site), whereas
+    // `access::native_record_write` would write back the fabricated `0`.
     let is_exported = atom_val(rec_exported) == beam_term::AM_TRUE;
-    access::native_record_write(
+    let atoms = ctx.atoms().clone();
+    beam_codec::term::make_record(
         ctx.heap(),
+        &atoms,
         atom_val(rec_module),
         atom_val(rec_name),
         is_exported,
@@ -840,11 +868,12 @@ mod tests {
             let non_atom_key = ctx.list(&[non_atom_pair]).unwrap();
             let good_opts = opts(ctx, false);
             let identifier = ctx.tuple(&[module, name]).unwrap();
+            let pair = ctx.tuple(&[identifier, one]).unwrap();
             assert_structured(
                 create(ctx, &[module, name, non_atom_key, good_opts]),
                 ctx,
                 "badfield",
-                &[identifier, one],
+                &[pair],
             );
             // A duplicate key: badarg.
             let dup_a = ctx.tuple(&[key_a, one]).unwrap();
@@ -946,11 +975,36 @@ mod tests {
             //     io:format("~p:~p~n",[C,T]) end, halt().'  =>  error:{badfield,{{m,r},zz}}
             let bad_key = updates(ctx, "other", 9);
             let identifier = ctx.tuple(&[module, name]).unwrap();
+            let pair_other = ctx.tuple(&[identifier, other]).unwrap();
             assert_structured(
                 update(ctx, &[rec, module, name, bad_key]),
                 ctx,
                 "badfield",
-                &[identifier, other],
+                &[pair_other],
+            );
+            // A non-atom update key names no field either.
+            //   erl -noshell -eval 'R = records:create(m,r,[{a,1}],#{is_exported=>true}),
+            //     try records:update(R, m, r, #{1=>1}) catch C:T ->
+            //     io:format("~p:~p~n",[C,T]) end, halt().'  =>  error:{badfield,{{m,r},1}}
+            let non_atom_update =
+                access::make_flatmap(ctx.heap(), &[(make_small(1), make_small(1))]).expect("fits");
+            let pair_one = ctx.tuple(&[identifier, make_small(1)]).unwrap();
+            assert_structured(
+                update(ctx, &[rec, module, name, non_atom_update]),
+                ctx,
+                "badfield",
+                &[pair_one],
+            );
+            // The `'_'` wildcard still reports the RECORD's own module/name.
+            //   erl -noshell -eval 'R = records:create(m,r,[{a,1}],#{is_exported=>true}),
+            //     try records:update(R, '"'"'_'"'"', '"'"'_'"'"', #{other=>9}) catch C:T ->
+            //     io:format("~p:~p~n",[C,T]) end, halt().'  =>  error:{badfield,{{m,r},other}}
+            let underscore = atom_of(ctx, "_");
+            assert_structured(
+                update(ctx, &[rec, underscore, underscore, bad_key]),
+                ctx,
+                "badfield",
+                &[pair_other],
             );
         });
     }

@@ -35,9 +35,12 @@
 //! * `immediates` - small ints, atoms, `NIL`, internal pid/port/catch: shared by identity, no word.
 //! * `cons lists` - proper **and** improper (dotted) pairs.
 //! * `tuples` - nested, zero-arity (the shared literal), and a native `RECORD_SUBTAG` record.
-//! * `maps` - a flat map (`<= 32` keys) and a HAMT/hash map (`> 32` keys, head-bitmap/inner-node).
+//! * `maps` - a flat map (`<= 32` keys), a HAMT/hash map (`> 32` keys, head-bitmap/inner-node) and
+//!   a HAMT **collision node** (the tuple of `[Key, Value]` cells two keys share when their full
+//!   64-bit hashes agree).
 //! * `funs` - `Local` (`make_fun3`), `External` (`EXPORT_EXT`), `Imported` (`NEW_FUN_EXT`).
-//! * `bitstrings` - an on-heap small binary (`ErlHeapBits`).
+//! * `bitstrings` - an on-heap small binary (`ErlHeapBits`), byte-aligned and not.
+//! * `numbers` - a boxed float (`HEADER_FLONUM`) and a positive/negative bignum (`write_big`).
 //!
 //! Two documented `beam_term::compare` limitations shape the assertions here (see the crate
 //! `CONTEXT.md` `Known Issues`): it has **no structural arm** for external pid/port/reference (so
@@ -543,4 +546,150 @@ fn a_non_byte_aligned_bitstring_copies_by_value() {
     // SAFETY: `binary` is a live `ErlHeapBits`; only its base pointer is read.
     let src_base = unsafe { bitstring_parts(binary) }.0;
     assert_ne!(base as usize, src_base as usize, "copied by value, not shared");
+}
+
+// ---------------------------------------------------------------------------
+// Numeric leaves: boxed floats and bignums
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_boxed_float_copies_by_value() {
+    let value = core::f64::consts::PI;
+    let mut src = src_heap();
+    // SAFETY: `write_float` fills exactly the `FLOAT_SIZE_WORDS` (2) words reserved here.
+    let float = unsafe {
+        let hp = src.alloc_words(FLOAT_SIZE_WORDS).expect("the float fits");
+        write_float(hp, value)
+    };
+
+    let mut dst = dest_for(float);
+    let copy = copy_into(float, &mut dst);
+    assert_faithful_copy(float, copy, &AtomTable::new());
+    assert_eq!(size_object(float), FLOAT_SIZE_WORDS, "header + the f64 bits word");
+    assert_eq!(dst.used(), size_object(float), "exactly the 2-word flonum block");
+    // A float is copied by value: the copy carries the same `f64` bit pattern at a new address.
+    // SAFETY: both terms are live boxed floats.
+    let (src_bits, copied_bits) = unsafe { (float_bits(float), float_bits(copy)) };
+    assert_eq!(copied_bits, src_bits, "the f64 bit pattern is preserved");
+    // SAFETY: `copy` is a live boxed float.
+    assert_eq!(unsafe { float_value(copy) }, value, "the value reads back");
+}
+
+#[test]
+fn a_bignum_copies_by_value_for_both_signs() {
+    // A 2-digit magnitude (2^64 + 5): one header word plus two `ErtsDigit`s.
+    let digits = [5u64, 1u64];
+    for negative in [false, true] {
+        let mut src = src_heap();
+        // SAFETY: `big_size_words(2)` (3) words are reserved and `digits` is non-empty.
+        let big = unsafe {
+            let hp = src
+                .alloc_words(big_size_words(digits.len()))
+                .expect("the bignum fits");
+            write_big(hp, negative, &digits)
+        };
+
+        let mut dst = dest_for(big);
+        let copy = copy_into(big, &mut dst);
+        assert_faithful_copy(big, copy, &AtomTable::new());
+        assert_eq!(
+            size_object(big),
+            big_size_words(digits.len()),
+            "header + one word per ErtsDigit"
+        );
+        assert_eq!(dst.used(), size_object(big), "exactly the bignum block");
+        // SAFETY: `copy` is a live bignum of the same shape as `big`.
+        let (copied_neg, copied_digits) = unsafe { big_parts(copy) };
+        assert_eq!(copied_neg, negative, "the header's sign bit is preserved");
+        assert_eq!(copied_digits, &digits[..], "every digit is copied verbatim");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HAMT collision tuples
+// ---------------------------------------------------------------------------
+
+/// Builds a two-key hash map whose single head slot is a **collision node** — the ordinary tuple
+/// of `[Key, Value]` cons cells two keys share when their full 64-bit hashes agree (`erl_map.h`;
+/// `map.rs`'s `TrieChild::Collision`). Forcing a genuine 64-bit hash collision through
+/// [`write_map`] is impractical, so the node is laid out with the public builders
+/// ([`make_map_header`] + [`make_arityval`] + [`make_list`]), exactly as `beam_term`'s own
+/// `size`/`layout` unit tests lay out a HAMT by hand.
+fn build_collision_map(src: &mut Heap) -> Eterm {
+    // SAFETY: every `alloc_words` call below reserves exactly the words written into it, and every
+    // word of the produced map is initialised before the root term escapes.
+    unsafe {
+        let cell_a = src.alloc_words(2).expect("cell a fits");
+        *cell_a = make_small(1);
+        *cell_a.add(1) = make_small(11);
+        let cell_b = src.alloc_words(2).expect("cell b fits");
+        *cell_b = make_small(2);
+        *cell_b.add(1) = make_small(22);
+
+        // The collision node: a plain 3-word tuple `[arityval(2), cell_a, cell_b]`.
+        let coll = src.alloc_words(3).expect("the collision tuple fits");
+        *coll = make_arityval(2);
+        *coll.add(1) = make_list(cell_a as *const Eterm);
+        *coll.add(2) = make_list(cell_b as *const Eterm);
+        let coll_term = make_boxed(coll as *const Eterm);
+
+        // The head node: `[header, size, slot0]`, a one-slot bitmap head pointing at the collision
+        // node (`make_map_header(type, arity, val)` = `[tag|type, arity, val]`).
+        let head = src.alloc_words(3).expect("the head node fits");
+        *head = make_map_header(MAP_HEADER_TAG_HAMT_HEAD_BITMAP, 1, 0b1);
+        *head.add(1) = Eterm::from_raw(2); // the head's `size` word: the total key count
+        *head.add(2) = coll_term;
+        make_boxed(head as *const Eterm)
+    }
+}
+
+#[test]
+fn a_hamt_collision_tuple_copies_with_its_cells() {
+    let atoms = AtomTable::new();
+    let mut src = src_heap();
+    let map = build_collision_map(&mut src);
+    // SAFETY: `map` is a live boxed hash-map head node.
+    let head = unsafe { *boxed_val(map) };
+    assert!(is_map_header(head), "the head is a HAMT node");
+    assert!(
+        !is_flatmap_header(head),
+        "a collision node lives only in a hash map, never a flat map"
+    );
+    // SAFETY: `map` is a live boxed head node with one bitmap slot.
+    let src_collision = unsafe { *boxed_val(map).add(2) };
+
+    let mut dst = dest_for(map);
+    let copy = copy_into(map, &mut dst);
+    // `compare` navigates the trie (the collision tuple is walked as a tuple of cells), so a
+    // faithful copy is `=:=` the original.
+    assert_faithful_copy(map, copy, &atoms);
+    // Head node (3) + the collision tuple (3) + its two 2-word cons cells.
+    assert_eq!(size_object(map), 3 + 3 + 2 + 2);
+    assert_eq!(
+        dst.used(),
+        size_object(map),
+        "the collision node and every cell is written once"
+    );
+    assert_eq!(map_size(copy, &atoms).expect("well-formed"), 2);
+    // The pairs survive (read through `map_pairs`, which walks every slot rather than following a
+    // hash path — a hand-laid collision node has no meaningful nibble path).
+    assert_eq!(
+        map_pairs(copy, &atoms).expect("well-formed"),
+        vec![
+            (make_small(1), make_small(11)),
+            (make_small(2), make_small(22)),
+        ]
+    );
+    // The copied collision tuple is a distinct object reached from the copied head.
+    // SAFETY: `copy` is a live boxed head node with one bitmap slot.
+    let copied_collision = unsafe { *boxed_val(copy).add(2) };
+    assert_ne!(
+        object_addr(copied_collision),
+        object_addr(src_collision),
+        "the collision tuple is a real copy"
+    );
+    assert!(
+        is_arity_value(unsafe { *boxed_val(copied_collision) }),
+        "the copied slot is still a collision tuple"
+    );
 }

@@ -79,6 +79,7 @@ use std::time::{Duration, Instant};
 
 use libc::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
 
+use beam_abi::common::SysIOVec;
 use beam_abi::driver::host::DriverHost;
 use beam_abi::driver::types::{
     ErlDrvData, ErlDrvEntry, ErlDrvEvent, ErlDrvPort, ErlDrvTermData, ERTS_INVALID_ERL_DRV_PORT,
@@ -93,6 +94,7 @@ use crate::abi::job::AsyncJobs;
 use crate::abi::DriverTable;
 use crate::driver::DriverContext;
 use crate::poller::{Interest, Token};
+use crate::queue::ByteQueue;
 
 /// The word capacity of the term heap handed to a driver through
 /// [`DriverHost::heap`](beam_abi::driver::host::DriverHost::heap).
@@ -256,22 +258,42 @@ pub struct DriverState {
     /// fd lock is released (`erl_check_io.c:1210-1216`), never re-entrantly inside the driver's
     /// own `driver_select`.
     pub(crate) queued_stop_select: Vec<ErlDrvEvent>,
+    /// The port's **driver queue** — the C's `prt->ioq`, the byte queue the `driver_enq*` family
+    /// fills and `driver_peekq`/`driver_deq` drain.
+    ///
+    /// It is deliberately **not** the port's `DriverContext::output()` queue. The C keeps the two
+    /// apart: `erts_port_output` (the Erlang→driver direction) builds its vector from the Erlang
+    /// iodata term on the fly and never reads `prt->ioq` (`io.c:1609-1646`, `io.c:1795-1846`),
+    /// whereas every `driver_enq`/`driver_pushq`/`driver_deq`/`driver_sizeq`/`driver_peekq` is
+    /// defined straight in terms of `drvport2ioq(ix)` (`io.c:6790-6919`) — a buffer only the driver
+    /// touches, drained by the driver's own `ready_output` (the reference user is `inet_drv`'s
+    /// `tcp_sendv`/`tcp_inet_output`, `inet_drv.c:13771-13842`, `:14093-14104`). Merging them would
+    /// re-deliver a driver's own queued bytes to its `outputv` as if they were new Erlang commands;
+    /// [`AbiHost::enq`] records the concrete consequence.
+    pub(crate) ioq: ByteQueue,
 }
 
 impl DriverState {
-    /// An empty state: nothing selected, no timer, no jobs.
+    /// An empty state: nothing selected, no timer, no jobs, an empty driver queue.
     pub(crate) fn new() -> DriverState {
         DriverState {
             selected: BTreeMap::new(),
             deadline: None,
             jobs: AsyncJobs::new(),
             queued_stop_select: Vec::new(),
+            ioq: ByteQueue::new(),
         }
     }
 
     /// The port timer deadline, or `None` when none is armed.
     pub fn deadline(&self) -> Option<Instant> {
         self.deadline
+    }
+
+    /// How many bytes the driver has queued on its own queue (`driver_sizeq`) — the observable
+    /// behind the `driver_enq`/`driver_deq` hooks.
+    pub fn queue_len(&self) -> usize {
+        self.ioq.len()
     }
 
     /// How many fds the driver currently has selected (`driver_select` on, not yet off).
@@ -509,6 +531,119 @@ impl DriverHost for AbiHost {
         }
     }
 
+    // -------------------------------------------------------------------------------------------
+    // Port queue — `driver_enq`/`driver_pushq`/`driver_deq`/`driver_sizeq`/`driver_peekq[v]`
+    //
+    // These read and write the port's **driver queue** ([`DriverState::ioq`], the C's `prt->ioq`),
+    // which is a different object from the port's `DriverContext::output()` queue that
+    // [`AbiHost::output`]'s counterpart feeds: the C never puts Erlang command bytes in
+    // `prt->ioq` and never delivers `prt->ioq` to `outputv` (see [`DriverState::ioq`] and
+    // [`AbiHost::enq`]).
+    //
+    // Unlike `driver_select`/`driver_output`, none of these needs an installed `DriverContext`:
+    // the queue is this host's own state, so a driver reaches it wherever it holds a live
+    // `ErlDrvPort`, exactly as the C's `drvport2ioq(ix)` does. The crate's single-thread invariant
+    // still applies — drive them from the port's thread (the C lock-protects the ioq for driver
+    // worker threads; this floor does not).
+    // -------------------------------------------------------------------------------------------
+
+    /// `driver_enq`/`driver_enq_bin`: append `data` to the port's driver queue.
+    ///
+    /// **Why not the port's `DriverContext::output()` queue** (the obvious-looking mapping): that
+    /// queue is the Erlang→driver channel, and [`DriverPort::write_driver`] hands whatever it holds
+    /// to the entry's `outputv`/`output` slot on the next `OUTPUT` task. A driver that enqueued
+    /// there — which is exactly what the reference user does, `driver_enqv(ix, ev, n)` in
+    /// `inet_drv`'s `tcp_sendv` (`inet_drv.c:13842`) and `driver_enq(ix, buf, h_len)` in its plain
+    /// path (`:13881-13886`) — would get its own bytes back as a **new port command**, so
+    /// `tcp_sendv` (which prepends the `{packet,N}` length header to every command it is handed,
+    /// `:13756-13770`) would frame those bytes a second time: silently corrupt output. The C has
+    /// no such path (an `OUTPUT` task runs only `ready_output`, `erl_port_task.c:1790-1797`), so
+    /// the driver queue is kept separate here.
+    ///
+    /// **Deviation from the C:** the queue is one contiguous [`ByteQueue`], so the C's
+    /// one-iovec-entry-per-enqueue chunking is not reproduced — [`DriverHost::peekq`] therefore
+    /// always reports a single entry (`vlen == 1`) where the oracle counts the enqueues (two
+    /// `driver_enq` calls → `*vlen == 2`, `beam_abi`'s `driver_peekq` docs). Byte **order** and
+    /// byte **count** are identical either way, which is all the family's consumers rely on.
+    ///
+    /// `is_binary` is not consulted: the seam hands the bytes over as a slice, so the C's
+    /// binary/plain distinction (its `ErlDrvBinary` refcount dance, `io.c:6860-6866`) has no
+    /// analogue. `0` = queued (the C's `-1` is an allocation failure, which a `Vec` cannot report).
+    fn enq(&mut self, data: &[u8], _is_binary: bool) -> c_int {
+        self.state.ioq.push(data);
+        0
+    }
+
+    /// `driver_pushq`/`driver_pushq_bin`: prepend `data` to the head of the port's driver queue.
+    ///
+    /// The C's `erts_ioq_pushqv` splices the new elements in front of the queue (`io.c:6800`).
+    /// [`ByteQueue`] appends only, so the queued bytes are moved behind `data` (order preserved).
+    /// `is_binary` as for [`DriverHost::enq`].
+    fn pushq(&mut self, data: &[u8], _is_binary: bool) -> c_int {
+        if data.is_empty() {
+            return 0; // The C's `len == 0` early return (`io.c:6881`).
+        }
+        let tail = self.state.ioq.front().to_vec();
+        self.state.ioq.clear();
+        self.state.ioq.push(data);
+        self.state.ioq.push(&tail);
+        0
+    }
+
+    /// `driver_deq`: drop up to `len` bytes from the head of the port's driver queue.
+    ///
+    /// Returns how many bytes were **dropped**, which is the value `beam_abi`'s `driver_deq` needs:
+    /// it re-reads [`DriverHost::sizeq`] afterwards and returns the C's *remaining* count
+    /// (`queues.rs::driver_deq`, `io.c:6807-6813`). A negative `len` — impossible through the C API,
+    /// whose operand is an `ErlDrvSizeT` — is refused with `-1`.
+    ///
+    /// **Deviation from the C:** `erts_ioq_deq` fails (`-1`) when `size > q->size` and leaves the
+    /// queue untouched (`erl_io_queue.c:351`), whereas this clamps (`ByteQueue::consume`). The
+    /// difference is unreachable through `driver_deq`, which takes that branch itself by comparing
+    /// against [`DriverHost::sizeq`] first; clamping is the safe direction for a direct host call,
+    /// because the queue is then left empty rather than silently holding bytes the caller believes
+    /// it dropped.
+    fn deq(&mut self, len: c_int) -> c_int {
+        if len < 0 {
+            return -1;
+        }
+        let dropped = self.state.ioq.consume(len as usize);
+        dropped.min(c_int::MAX as usize) as c_int
+    }
+
+    /// `driver_sizeq`: how many bytes are on the port's driver queue.
+    ///
+    /// Never negative while the host is alive — the C's `(ErlDrvSizeT)-1` is its null-queue case
+    /// (`io.c:6827-6834`), and `beam_abi` relies on a non-negative answer to let `driver_deq` and
+    /// `driver_peekqv` take their normal path.
+    fn sizeq(&mut self) -> c_int {
+        self.state.ioq.len().min(c_int::MAX as usize) as c_int
+    }
+
+    /// `driver_peekq`/`driver_peekqv`: a view of the head of the port's driver queue.
+    ///
+    /// One entry over [`ByteQueue::front`] — the whole contiguous queue; see
+    /// [`DriverHost::enq`] for the `vlen == 1` deviation from the C's per-enqueue chunking.
+    ///
+    /// `None` for an empty queue, which `beam_abi` renders as the C's `NULL` with `*vlen = 0`
+    /// (it tells "empty" and "unsupported" apart through [`DriverHost::sizeq`], and this host
+    /// always supports the queue).
+    ///
+    /// The `iov_base` addresses the queue's own buffer, so it stays valid until the next
+    /// `driver_enq`/`driver_pushq`/`driver_deq` — the C's lifetime for the pointer it returns —
+    /// while `beam_abi` copies the vector of iovecs itself into the driver's call for the callback's
+    /// duration.
+    fn peekq(&mut self) -> Option<Vec<SysIOVec>> {
+        let front = self.state.ioq.front();
+        if front.is_empty() {
+            return None;
+        }
+        Some(vec![SysIOVec {
+            iov_base: front.as_ptr() as *mut c_void,
+            iov_len: front.len(),
+        }])
+    }
+
     /// `driver_select`: register, re-register or de-register interest in an OS handle.
     ///
     /// The handle is the C convention of a **fd cast to a pointer**
@@ -525,23 +660,35 @@ impl DriverHost for AbiHost {
     /// select without the bit keeps a request an earlier select made); a release queues the event
     /// the *deselecting* call was given, which is the operand the C's `stop_select` receives
     /// (`erl_check_io.c:1215`).
+    ///
+    /// **The fd record is dropped only after the poller registration is really gone.** The record
+    /// (and with it the `ERL_DRV_USE` release obligation) is what a later de-select or the port
+    /// teardown walks, so withdrawing it on a **failed** `deregister` would lose the driver's
+    /// `stop_select` for an fd the poller still holds — the release must stay queued, not vanish.
+    /// A failed de-select answers `-1` and leaves the registration exactly as it was.
     fn select(&mut self, _port: ErlDrvPort, event: ErlDrvEvent, mode: c_int, on: c_int) -> c_int {
         let fd = event as usize as RawFd;
         let interest = interest_from_mode(mode);
 
         if on == 0 {
-            let Some(selected) = self.state.selected.remove(&fd) else {
+            let Some(selected) = self.state.selected.get(&fd) else {
                 return 0; // De-selecting an unknown fd is a no-op, not a failure.
             };
+            let token = selected.token;
             let owes_stop_select = selected.wants_stop_select();
-            let result = self.with_ctx(|ctx| ctx.deregister(fd, selected.token));
-            if owes_stop_select {
-                // Queued *after* the context borrow ends; the port fires it once this callback has
-                // returned (see `DriverState::queued_stop_select`).
-                self.state.queued_stop_select.push(event);
-            }
-            return match result {
-                Some(Ok(())) => 0,
+            return match self.with_ctx(|ctx| ctx.deregister(fd, token)) {
+                Some(Ok(())) => {
+                    self.state.selected.remove(&fd);
+                    if owes_stop_select {
+                        // Queued *after* the context borrow ends; the port fires it once this
+                        // callback has returned (see `DriverState::queued_stop_select`).
+                        self.state.queued_stop_select.push(event);
+                    }
+                    0
+                }
+                // The poller still holds the registration (or no context is installed): keep the
+                // record and its release obligation, so a later de-select or the teardown can
+                // still withdraw it and fire the callback exactly once.
                 _ => -1,
             };
         }
@@ -728,540 +875,5 @@ impl DriverHost for AbiHost {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{interest_from_mode, AbiHost, LocalAtomPortHost, PortHost};
-    use beam_abi::driver::host::DriverHost;
-    use beam_abi::driver::types::{
-        ErlDrvEntry, ErlDrvEvent, ErlDrvEvent_, ERTS_INVALID_ERL_DRV_PORT, ERL_DRV_READ,
-        ERL_DRV_USE, ERL_DRV_USE_NO_CALLBACK, ERL_DRV_WRITE,
-    };
-    use beam_process::PortId;
-    use beam_term::prelude::{is_atom, make_atom, AtomTable};
-    use libc::c_int;
-    use std::os::unix::io::{AsRawFd, RawFd};
-    use std::os::unix::net::UnixStream;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::thread::sleep;
-    use std::time::Duration;
-
-    use crate::abi::DriverTable;
-    use crate::driver::PortArms;
-    use crate::poller::{Interest, Poller};
-    use crate::queue::ByteQueue;
-    use crate::DriverContext;
-
-    /// A fresh host over a private atom table.
-    fn new_host() -> AbiHost {
-        AbiHost::new(Box::new(LocalAtomPortHost::new())).expect("a driver heap")
-    }
-
-    /// A `driver_select`-style event handle: the fd cast to a pointer (the C convention).
-    fn event_for(fd: RawFd) -> ErlDrvEvent {
-        fd as usize as *mut ErlDrvEvent_
-    }
-
-    /// A fresh poll set plus the two port queues and the arming record one context needs.
-    fn new_context_parts() -> (Poller, ByteQueue, ByteQueue, PortArms) {
-        (
-            Poller::new().expect("a poll set"),
-            ByteQueue::new(),
-            ByteQueue::new(),
-            PortArms::default(),
-        )
-    }
-
-    #[test]
-    fn the_local_atom_host_interns_into_its_own_table() {
-        let mut table = AtomTable::new();
-        let expected = make_atom(table.intern("ok"));
-        let mut host = LocalAtomPortHost::with_names(&["ok", "error"]);
-        assert_eq!(host.intern_atom("ok"), Some(expected));
-        // A repeat is the same atom, and seeding order is insertion order.
-        assert_eq!(host.intern_atom("ok"), Some(expected));
-        assert_ne!(host.intern_atom("error"), Some(expected));
-        assert_eq!(host.connected_pid(), None);
-        assert_eq!(host.caller_pid(), None);
-        assert!(!host.send_term(None, expected));
-        assert_eq!(
-            LocalAtomPortHost::default().intern_atom("x").map(is_atom),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn the_new_host_starts_empty_and_has_a_term_heap() {
-        let mut host = new_host();
-        assert!(host.state().deadline().is_none());
-        assert_eq!(host.state().selected_len(), 0);
-        assert_eq!(host.state().in_flight(), 0);
-        assert_eq!(host.heap().capacity(), super::DRIVER_HEAP_WORDS);
-        assert_eq!(host.heap().used(), 0);
-    }
-
-    #[test]
-    fn driver_output_lands_in_the_port_input_queue() {
-        let mut host = new_host();
-        let (mut poller, mut input, mut output, mut arms) = new_context_parts();
-        let mut ctx = DriverContext::new(
-            PortId::new(0),
-            &mut poller,
-            &mut input,
-            &mut output,
-            &mut arms,
-        );
-        host.install(&mut ctx);
-
-        assert_eq!(
-            DriverHost::output(&mut host, core::ptr::null_mut(), b"hi"),
-            0
-        );
-        assert_eq!(ctx.input().front(), b"hi");
-        assert_eq!(
-            DriverHost::output(&mut host, core::ptr::null_mut(), b"!"),
-            0
-        );
-        assert_eq!(ctx.input().front(), b"hi!");
-        // Nothing was queued for the device: `driver_output` is owner-bound.
-        assert_eq!(ctx.output().len(), 0);
-        host.clear();
-
-        // With the context cleared the same call is refused, never a null dereference.
-        assert_eq!(
-            DriverHost::output(&mut host, core::ptr::null_mut(), b"x"),
-            -1
-        );
-    }
-
-    #[test]
-    fn the_host_methods_fail_gracefully_without_an_installed_context() {
-        let mut host = new_host();
-        assert_eq!(
-            DriverHost::select(
-                &mut host,
-                core::ptr::null_mut(),
-                event_for(0),
-                ERL_DRV_READ,
-                1
-            ),
-            -1
-        );
-        assert_eq!(host.state().selected_len(), 0);
-    }
-
-    #[test]
-    fn select_registers_reregisters_and_deselects_one_fd() {
-        let mut host = new_host();
-        let (mut poller, mut input, mut output, mut arms) = new_context_parts();
-        let (_peer, local) = UnixStream::pair().expect("socketpair(2) succeeds");
-        let fd = local.as_raw_fd();
-        let event = event_for(fd);
-
-        {
-            let mut ctx = DriverContext::new(
-                PortId::new(0),
-                &mut poller,
-                &mut input,
-                &mut output,
-                &mut arms,
-            );
-            host.install(&mut ctx);
-
-            assert_eq!(
-                DriverHost::select(&mut host, core::ptr::null_mut(), event, ERL_DRV_READ, 1),
-                0
-            );
-            assert_eq!(host.state().selected_len(), 1);
-            assert_eq!(host.state().fd_armed(true), Some(fd));
-            assert_eq!(host.state().fd_armed(false), None);
-
-            // A re-select with a new mode updates the interest instead of adding an entry.
-            assert_eq!(
-                DriverHost::select(&mut host, core::ptr::null_mut(), event, ERL_DRV_WRITE, 1),
-                0
-            );
-            assert_eq!(host.state().selected_len(), 1);
-            assert_eq!(host.state().fd_armed(true), None);
-            assert_eq!(host.state().fd_armed(false), Some(fd));
-
-            // De-selecting releases the poller registration.
-            assert_eq!(
-                DriverHost::select(&mut host, core::ptr::null_mut(), event, ERL_DRV_READ, 0),
-                0
-            );
-            assert_eq!(host.state().selected_len(), 0);
-
-            // De-selecting an fd that was never selected still succeeds.
-            assert_eq!(
-                DriverHost::select(
-                    &mut host,
-                    core::ptr::null_mut(),
-                    event_for(4242),
-                    ERL_DRV_READ,
-                    0
-                ),
-                0
-            );
-            host.clear();
-        }
-
-        assert!(poller.is_empty(), "the poll set holds no registration");
-    }
-
-    /// The two `ERL_DRV_USE` bits are recorded with the registration (never folded into the
-    /// interest), and a released `ERL_DRV_USE` registration queues its event for the port's
-    /// `stop_select` (see `DriverState::queued_stop_select`).
-    #[test]
-    fn select_records_the_use_release_bits_and_queues_the_release() {
-        let mut host = new_host();
-        let (mut poller, mut input, mut output, mut arms) = new_context_parts();
-        let (_peer, local) = UnixStream::pair().expect("socketpair(2) succeeds");
-        let fd = local.as_raw_fd();
-        let event = event_for(fd);
-        let mut ctx = DriverContext::new(
-            PortId::new(0),
-            &mut poller,
-            &mut input,
-            &mut output,
-            &mut arms,
-        );
-        host.install(&mut ctx);
-
-        // `ERL_DRV_READ | ERL_DRV_USE`: the release bit is not an interest, so the registration is
-        // still read-only, and nothing is queued while the selection is live.
-        assert_eq!(
-            DriverHost::select(
-                &mut host,
-                core::ptr::null_mut(),
-                event,
-                ERL_DRV_READ | ERL_DRV_USE,
-                1
-            ),
-            0
-        );
-        assert_eq!(host.state().fd_armed(true), Some(fd));
-        assert_eq!(host.state().fd_armed(false), None);
-        assert!(host.state_mut().take_queued_stop_select().is_empty());
-
-        // De-selecting queues the event the deselecting call was handed (the C's operand).
-        assert_eq!(
-            DriverHost::select(&mut host, core::ptr::null_mut(), event, ERL_DRV_READ, 0),
-            0
-        );
-        assert_eq!(host.state_mut().take_queued_stop_select(), vec![event]);
-        assert!(
-            host.state_mut().take_queued_stop_select().is_empty(),
-            "taking the queue empties it"
-        );
-
-        // The release obligation each `mode` records: only `ERL_DRV_USE` without `_NO_CALLBACK`.
-        for (mode, owes) in [
-            (ERL_DRV_READ, false),
-            (ERL_DRV_USE, true),
-            (ERL_DRV_READ | ERL_DRV_USE, true),
-            (ERL_DRV_WRITE | ERL_DRV_USE, true),
-            (ERL_DRV_USE_NO_CALLBACK, false),
-            (ERL_DRV_READ | ERL_DRV_USE_NO_CALLBACK, false),
-        ] {
-            assert_eq!(
-                DriverHost::select(&mut host, core::ptr::null_mut(), event, mode, 1),
-                0,
-                "the selection registers"
-            );
-            let mut selected = host.state_mut().take_all_selected();
-            assert_eq!(selected.len(), 1, "exactly one registration was live ({mode})");
-            let (taken_fd, token, taken_owes) = selected.pop().expect("one entry was taken");
-            assert_eq!(taken_fd, fd);
-            assert_eq!(taken_owes, owes, "the release obligation recorded for mode {mode}");
-            ctx.deregister(fd, token)
-                .expect("the poller registration is withdrawn");
-        }
-
-        host.clear();
-        assert!(poller.is_empty(), "every registration was released");
-    }
-
-    #[test]
-    fn the_mode_bitfield_maps_onto_the_interest_mask() {
-        assert_eq!(interest_from_mode(ERL_DRV_READ), Interest::READABLE);
-        assert_eq!(interest_from_mode(ERL_DRV_WRITE), Interest::WRITABLE);
-        assert_eq!(
-            interest_from_mode(ERL_DRV_READ | ERL_DRV_WRITE),
-            Interest::BOTH
-        );
-        // Neither direction set still watches the fd (see the function's docs).
-        assert_eq!(interest_from_mode(4), Interest::READABLE);
-        assert_eq!(interest_from_mode(0 as c_int), Interest::READABLE);
-    }
-
-    #[test]
-    fn the_port_timer_arms_reports_and_cancels() {
-        let mut host = new_host();
-
-        assert_eq!(
-            DriverHost::read_timer(&mut host, core::ptr::null_mut()),
-            None,
-            "no timer is armed yet"
-        );
-        assert_eq!(DriverHost::set_timer(&mut host, core::ptr::null_mut(), 50), 0);
-        let deadline = host.state().deadline().expect("a deadline was armed");
-        assert!(deadline > std::time::Instant::now());
-        let remaining = DriverHost::read_timer(&mut host, core::ptr::null_mut())
-            .expect("a remaining time is reported");
-        assert!(remaining <= 50, "the remaining time never exceeds the request");
-        assert!(remaining > 0, "a 50 ms timer has not expired yet: {remaining}");
-
-        assert_eq!(DriverHost::cancel_timer(&mut host, core::ptr::null_mut()), 0);
-        assert_eq!(host.state().deadline(), None);
-        assert_eq!(DriverHost::read_timer(&mut host, core::ptr::null_mut()), None);
-
-        // An immediate timer reports `Some(0)`, as the C writes `0`.
-        assert_eq!(DriverHost::set_timer(&mut host, core::ptr::null_mut(), 0), 0);
-        assert_eq!(
-            DriverHost::read_timer(&mut host, core::ptr::null_mut()),
-            Some(0)
-        );
-    }
-
-    static INVOCATIONS: AtomicUsize = AtomicUsize::new(0);
-
-    unsafe extern "C" fn count_invocation(_data: *mut libc::c_void) {
-        INVOCATIONS.fetch_add(1, Ordering::SeqCst);
-    }
-
-    /// Blocks briefly until `done()` holds, so the async tests are not timing-flaky.
-    fn wait_for(mut done: impl FnMut() -> bool) -> bool {
-        for _ in 0..400 {
-            if done() {
-                return true;
-            }
-            sleep(Duration::from_millis(5));
-        }
-        done()
-    }
-
-    #[test]
-    fn driver_async_runs_the_invoke_and_records_a_completion() {
-        INVOCATIONS.store(0, Ordering::SeqCst);
-        let mut host = new_host();
-
-        let id = DriverHost::r#async(
-            &mut host,
-            core::ptr::null_mut(),
-            core::ptr::null_mut(),
-            Some(count_invocation),
-            core::ptr::null_mut(),
-            None,
-        );
-        assert!(id >= 0, "driver_async returns a queue position, got {id}");
-        assert!(wait_for(|| INVOCATIONS.load(Ordering::SeqCst) == 1));
-        assert_eq!(INVOCATIONS.load(Ordering::SeqCst), 1);
-        assert_eq!(host.state().in_flight(), 1);
-
-        // The worker reports its completion; the port thread drains it (what `poll_async` does).
-        let mut jobs = 0;
-        wait_for(|| {
-            jobs = host.state_mut().jobs.drain().len();
-            jobs > 0
-        });
-        assert_eq!(jobs, 1, "exactly one completion is recorded");
-        assert_eq!(host.state().in_flight(), 0);
-    }
-
-    #[test]
-    fn a_null_async_invoke_returns_a_position_and_records_nothing() {
-        let mut host = new_host();
-        let id = DriverHost::r#async(
-            &mut host,
-            core::ptr::null_mut(),
-            core::ptr::null_mut(),
-            None,
-            core::ptr::null_mut(),
-            None,
-        );
-        assert!(id >= 0, "the fire-and-forget form still returns a position");
-        // Give a (non-existent) worker ample time; nothing must ever be reported.
-        sleep(Duration::from_millis(30));
-        assert_eq!(host.state_mut().jobs.drain().len(), 0);
-        assert_eq!(host.state().in_flight(), 0);
-    }
-
-    #[test]
-    fn the_port_host_defaults_decline_the_optional_hooks() {
-        struct Bare;
-        impl PortHost for Bare {
-            fn intern_atom(&mut self, _name: &str) -> Option<beam_term::prelude::Eterm> {
-                None
-            }
-        }
-
-        let mut host = AbiHost::new(Box::new(Bare)).expect("a driver heap");
-        assert_eq!(host.intern_atom("ok"), None);
-        assert_eq!(host.connected_pid(core::ptr::null_mut()), None);
-        assert_eq!(host.caller_pid(core::ptr::null_mut()), None);
-        assert_eq!(
-            host.send_term(core::ptr::null_mut(), None, beam_term::prelude::NIL),
-            -1
-        );
-    }
-
-    // -------------------------------------------------------------------------------------------
-    // The process-global driver-registry hooks
-    // -------------------------------------------------------------------------------------------
-
-    /// A statically named `ErlDrvEntry` with no `init` — the shape `add_driver_entry` records.
-    ///
-    /// A distinct `'static` name per test keeps the shared process-global [`DriverTable`] from
-    /// letting two parallel tests see each other's registrations (cargo runs them concurrently).
-    fn named_entry(name: *const u8) -> ErlDrvEntry {
-        ErlDrvEntry {
-            driver_name: name as *mut libc::c_char,
-            ..ErlDrvEntry::default()
-        }
-    }
-
-    #[test]
-    fn add_and_remove_driver_entry_reach_the_process_global_table() {
-        const NAME: &[u8] = b"host_test_registry\0";
-        let mut host = new_host();
-        let mut entry = named_entry(NAME.as_ptr());
-
-        // `remove_driver_entry` of an address the table has never seen is the C's `0`.
-        assert_eq!(
-            DriverHost::remove_driver_entry(&mut host, &mut entry),
-            0,
-            "an unregistered entry is the C's 0 (not found)"
-        );
-
-        // `add_driver_entry` records it in the process-global table and answers `0`.
-        assert_eq!(
-            DriverHost::add_driver_entry(&mut host, &mut entry),
-            0,
-            "recording the entry is the C's void-wrapper success"
-        );
-        assert_eq!(
-            DriverTable::global()
-                .lookup("host_test_registry")
-                .map(|driver| driver.entry),
-            Some(&mut entry as *mut ErlDrvEntry),
-            "the entry reached the process-global table"
-        );
-
-        // Removing the same pointer answers the C's `1`, and a second removal reports `0`.
-        assert_eq!(
-            DriverHost::remove_driver_entry(&mut host, &mut entry),
-            1,
-            "removed"
-        );
-        assert!(DriverTable::global().lookup("host_test_registry").is_none());
-        assert_eq!(
-            DriverHost::remove_driver_entry(&mut host, &mut entry),
-            0,
-            "not found any more"
-        );
-    }
-
-    #[test]
-    fn lock_driver_reports_the_ports_own_driver_handle() {
-        // A bare host carries no driver identity: the C's statically-linked case (`handle == NULL`).
-        let mut bare = new_host();
-        assert_eq!(
-            DriverHost::lock_driver(&mut bare, core::ptr::null_mut()),
-            -1,
-            "a host with no driver identity answers the C's -1"
-        );
-
-        // A host carrying a dynamically loaded identity answers `0` even though the name is not
-        // registered in the process-global table — the C consults the port's own driver, never
-        // `driver_list`.
-        let mut loaded =
-            AbiHost::for_driver(Box::new(LocalAtomPortHost::new()), "lock_driver_probe", true)
-                .expect("a driver heap");
-        assert_eq!(
-            DriverHost::lock_driver(&mut loaded, core::ptr::null_mut()),
-            0,
-            "a loaded driver locks regardless of any global registration"
-        );
-
-        // An identity that is statically linked is still the C's `-1`.
-        let mut statically =
-            AbiHost::for_driver(Box::new(LocalAtomPortHost::new()), "lock_driver_probe", false)
-                .expect("a driver heap");
-        assert_eq!(
-            DriverHost::lock_driver(&mut statically, core::ptr::null_mut()),
-            -1,
-            "a statically linked driver has no handle to lock"
-        );
-    }
-
-    #[test]
-    fn create_port_is_the_invalid_port_sentinel() {
-        let mut host = new_host();
-        let name = c"host_driver";
-        assert_eq!(
-            DriverHost::create_port(
-                &mut host,
-                core::ptr::null_mut(),
-                1,
-                name.as_ptr() as *mut libc::c_char,
-                core::ptr::null_mut(),
-            ),
-            ERTS_INVALID_ERL_DRV_PORT,
-            "a request the host cannot honour answers the C's single failure value"
-        );
-    }
-
-    /// The two **no-port** slots reach a host **only** inside a `beam_abi::with_current_host`
-    /// scope — the thread-local publication the adapter installs around every driver callback.
-    #[test]
-    fn the_no_port_slots_reach_the_host_only_inside_a_publication() {
-        const NAME: &[u8] = b"host_test_publication\0";
-        let table = DriverTable::global();
-        let api = beam_abi::driver::drv::driver_api_table();
-        let add = api.add_driver_entry.expect("the slot is populated");
-        let remove = api.remove_driver_entry.expect("the slot is populated");
-
-        let mut host = new_host();
-        let mut entry = named_entry(NAME.as_ptr());
-
-        // Outside any publication there is no current host: the slots answer the C's failure
-        // values without touching anything.
-        // SAFETY: `entry` is a live `ErlDrvEntry` for this test's whole body; the pointer is only
-        // forwarded to a host, and there is none.
-        unsafe { add(&mut entry) };
-        assert!(
-            table.lookup("host_test_publication").is_none(),
-            "with no published host nothing is recorded"
-        );
-        // SAFETY: as above.
-        assert_eq!(
-            unsafe { remove(&mut entry) },
-            0,
-            "with no published host the removal is the C's 0"
-        );
-
-        // Inside the publication the port's own host handles the request.
-        beam_abi::with_current_host(&mut host, || {
-            // SAFETY: `entry` is live; the published host records its address.
-            unsafe { add(&mut entry) };
-            assert!(
-                table.lookup("host_test_publication").is_some(),
-                "the published host recorded the entry"
-            );
-        });
-        assert!(
-            table.lookup("host_test_publication").is_some(),
-            "the registration outlives the publication"
-        );
-
-        // The publication is gone again, so the entry can only be removed inside one.
-        beam_abi::with_current_host(&mut host, || {
-            // SAFETY: `entry` is live; the published host removes its address.
-            assert_eq!(
-                unsafe { remove(&mut entry) },
-                1,
-                "the published host removes the entry"
-            );
-        });
-        assert!(table.lookup("host_test_publication").is_none());
-    }
-}
+#[path = "host_tests.rs"]
+mod tests;

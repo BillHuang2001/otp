@@ -100,6 +100,10 @@ All four need a change **outside** `src/drivers/inet/`; each is a real `gen_tcp`
 - **(d) The async-op queue.** `INET_MAX_ASYNC = 1` (`:1069`), `enq_async`, the `[1] ++ async_id_be16` reply and the later `{inet_async, Port, Ref, Result}` message, plus a per-port 16-bit op ref and a **second-port** `accept`.
   This floor's `recv`/`accept`/`connect` are **synchronous** (which is also why `recv` rejects the C's 8-byte `Timeout(4), Length(4)` payload with `BadArg`, and `accept` transfers the port rather than returning an async id).
 
+## Known Issues
+- **`verb_send` does not frame output.** Under `{packet,1|2|4}` the C's `tcp_send`/`tcp_sendv` (`inet_drv.c:13745-13769`, `:13861-13877`) **prepend** a 1/2/4-byte big-endian length header before the payload; this floor pushes the argument verbatim (`mod.rs:1015`), so a send under those codes is unframed where the oracle is framed (`{packet,4}` + `gen_tcp:send(C, <<"abc">>)` ⇒ the raw peer reads `<<0,0,0,3,"abc">>`). Only the read path frames (`frame.rs`/`packet.rs`).
+- **`verb_send` ignores a deferred `shutdown`.** After `shutdown(SHUT_WR|SHUT_RDWR)` deferred because output was queued (`mod.rs:1143-1147`), the C rejects a further send with `EPIPE` ⇒ `{error,closed}` and tears the socket down (`inet_drv.c:12695-12696` → `:13654-13670`); this floor instead accepts and queues the bytes (`pending_shutdown` is only re-applied when the queue drains, `mod.rs:778-781`).
+
 ## Test Strategy
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io` **GREEN** (sandbox `$HOME` read-only — always the wrapper; never `cd`).
 - **In-module (115):** `packet.rs` **62**, `tests.rs` **27**, `frame_tests.rs` **11**, `frame.rs` **9**, `opt.rs` **6**.

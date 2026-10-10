@@ -28,22 +28,28 @@
 //! This file owns the four shapes whose lowering story is "every instruction is a
 //! `jit_step_one` helper round-trip on a native tier": `build/0`
 //! (`put_tuple2`/`put_list`), `map/2` (the map family), `select/1` (`select_val`) and
-//! `walk/2` (a tail-recursive cons-list walk). The shapes the tier *inlines* are in
-//! [`super::inlined`], and [`workloads`] is the concatenation of both.
+//! `walk/2` (a tail-recursive cons-list walk), plus the two-module `cross/2` shape,
+//! whose transfer is neither: its `call_ext_last` deopts, but the *driver* then lands
+//! the call cross-module. The shapes the tier *inlines* are in [`super::inlined`],
+//! and [`workloads`] is the concatenation of all three.
 //!
 //! The harness half (the parent module) owns the tiers, the timing and the reporting;
 //! this file owns the workload type and the deopted programs. See the parent for the
 //! method and the caveats (mean `ns/op`, shared/high-load sandbox, and the fact that
 //! correctness — never "the JIT is faster" — is the only thing asserted).
 
+use std::sync::Arc;
+
 use beam_common::Result;
-use beam_loader::{Instr, Label, MapWriteArgs, Module, Operand, TestKind, NO_FAIL};
+use beam_loader::{
+    HeapNeed, ImportRef, Instr, Label, MapWriteArgs, Module, Operand, TestKind, NO_FAIL,
+};
 use beam_term::{make_atom, make_small, Atom, Eterm, NIL};
 
 use crate::context::{BifHook, MinimalContext};
 use crate::terms;
 
-use super::checks::{verify_build, verify_map, verify_select, verify_walk};
+use super::checks::{verify_build, verify_cross, verify_map, verify_select, verify_walk};
 use super::support::{arith_hook, Fixture};
 
 // ---------------------------------------------------------------------------
@@ -63,6 +69,23 @@ pub(super) const SELECT_ROUNDS: usize = 32;
 /// The number of cons cells in the list the walk workload traverses.
 pub(super) const WALK_LENGTH: usize = 64;
 
+/// The number of cross-module `call_ext_last` transfers one `cross/2` run performs.
+///
+/// Every transfer increments the accumulator exactly once, so the exported result is
+/// this count — a loop that ran a different number of transfers cannot produce it.
+pub(super) const CROSS_STEPS: usize = 64;
+
+/// The module the cross-module workload is **entered** through (the caller side).
+const PING_MODULE: &str = "jit_bench_cross_a";
+
+/// Its exported tail-call loop.
+const PING_FUNCTION: &str = "ping";
+
+/// The module the cross-module workload tail-calls (the callee side).
+const PONG_MODULE: &str = "jit_bench_cross_b";
+
+/// The callee's exported tail-call loop — the one that bounces back into [`PING_MODULE`].
+const PONG_FUNCTION: &str = "pong";
 /// The number of timed runs per `(workload, tier)`, and the warm-up count.
 ///
 /// One warm-up run precedes the timed runs for every tier; the count below is the
@@ -103,6 +126,33 @@ pub(super) struct Workload {
     /// body is *supposed* to compute, so a tier that "agrees" on a wrong answer still
     /// fails).
     verify: fn(&Workload, Eterm) -> std::result::Result<(), String>,
+    /// The cross-module call pair this workload drives, if any (see [`CrossCall`]).
+    cross: Option<CrossCall>,
+}
+
+/// The two-module cross-module tail-call pair a [`Workload`] may carry.
+///
+/// A `call_ext_last` is not in a native tier's inline set, so it always **deopts** to
+/// one interpreter step — but that step resolves the import through the host's
+/// cross-module seam ([`ExecutionContext::resolve_external_call`]) and hands the
+/// driver a [`Step::Enter`](crate::Step), so the transfer itself is a driver-mediated
+/// **module-context switch**. This type is what lets the harness answer that seam for
+/// the pair of modules the `cross/2` workload ping-pongs between.
+///
+/// [`ExecutionContext::resolve_external_call`]: crate::ExecutionContext::resolve_external_call
+pub(super) struct CrossCall {
+    /// The callee module handle — the same `Arc<Module>` the driver must be able to
+    /// `Arc::ptr_eq`-dedup as one module context, so it is kept alive here.
+    pub(super) module: Arc<Module>,
+    /// The `module` name the workload module's `call_ext_last` import names.
+    pub(super) import_module: &'static str,
+    /// The `function` name that import names.
+    pub(super) import_function: &'static str,
+    /// The arity of that import (both directions of the pair use the same arity).
+    pub(super) import_arity: u32,
+    /// The callee's export **entry** label (the label *after* `func_info`) — the exact
+    /// label a `run_export` would enter.
+    pub(super) entry: Label,
 }
 
 impl Workload {
@@ -124,9 +174,18 @@ impl Workload {
             arity,
             args,
             verify,
+            cross: None,
         }
     }
 
+    /// Attach the cross-module call pair this workload drives.
+    ///
+    /// A separate builder so the five workloads that need no resolver keep building
+    /// through [`Workload::new`] unchanged.
+    pub(super) fn with_cross(mut self, cross: CrossCall) -> Workload {
+        self.cross = Some(cross);
+        self
+    }
     /// The call arguments for a run, obtained **in the run's own context**.
     ///
     /// A heap term (the map, the list) must be built in the context that will own it:
@@ -165,11 +224,61 @@ impl Workload {
             _ => arith_hook(None, None),
         }
     }
-}
 
+    /// Install this workload's cross-module-call resolver, if it has one.
+    ///
+    /// The resolver is the host half of the `call_ext*` seam
+    /// ([`ExecutionContext::resolve_external_call`](crate::ExecutionContext::resolve_external_call)):
+    /// it answers `(module, function, arity)` with the callee's shared `Arc<Module>`
+    /// plus its export entry label, or `Ok(None)` to leave the call on the
+    /// synchronous `call_bif` path (which is what every other import — `erlang`'s `-`
+    /// — must keep getting, since the arithmetic hook is the reference for that).
+    ///
+    /// A ping-pong needs **both** directions answered, and the workload module itself
+    /// is not an `Arc`, so the resolver also holds a handle to it (and to its own
+    /// export entry), derived from `self`. A workload without a [`CrossCall`] installs
+    /// nothing, so its context keeps the trait's `Ok(None)` default.
+    ///
+    /// [`ExecutionContext::resolve_external_call`]: crate::ExecutionContext::resolve_external_call
+    pub(super) fn install_cross(&self, ctx: &mut MinimalContext) {
+        let Some(cross) = &self.cross else {
+            return;
+        };
+        let callee = Arc::clone(&cross.module);
+        let entry = cross.entry;
+        let import_module = cross.import_module;
+        let import_function = cross.import_function;
+        let import_arity = cross.import_arity;
+        // The callee's own `call_ext_last` names the entry module, so the resolver
+        // needs a handle to it too — a genuine A -> B -> A ping-pong, every hop a
+        // cross-module `Step::Enter` transfer. The names are copied out because the
+        // resolver must be `'static` (it outlives this borrow).
+        let home = Arc::new(self.module.clone());
+        let home_entry = self.module.export(self.function, self.arity);
+        let home_module = self.module.atom_name(self.module.name).map(str::to_string);
+        let home_function = self.module.atom_name(self.function).map(str::to_string);
+
+        ctx.set_external_resolver(Box::new(move |module, function, arity| {
+            if arity != import_arity {
+                return Ok(None);
+            }
+            if module == import_module && function == import_function {
+                return Ok(Some((Arc::clone(&callee), entry)));
+            }
+            if home_module.as_deref() == Some(module) && home_function.as_deref() == Some(function)
+            {
+                if let Some(label) = home_entry {
+                    return Ok(Some((Arc::clone(&home), label)));
+                }
+            }
+            Ok(None)
+        }));
+    }
+}
 /// Every workload the tier table measures: the shapes the baseline tier **deopts**
 /// ([`build_workload`]/[`map_workload`]/[`select_workload`]/[`walk_workload`]) followed
-/// by the shapes it **inlines** (`super::inlined`).
+/// by the shapes it **inlines** (`super::inlined`) and the cross-module transfer
+/// ([`cross_workload`]).
 pub(super) fn workloads() -> Vec<Workload> {
     let mut all = vec![
         build_workload(),
@@ -178,9 +287,9 @@ pub(super) fn workloads() -> Vec<Workload> {
         walk_workload(),
     ];
     all.extend(super::inlined::inlined_workloads());
+    all.push(cross_workload());
     all
 }
-
 /// `build/0` — [`BUILD_ROUNDS`] `put_tuple2` + `put_list` pairs, then `return`.
 ///
 /// ```text
@@ -233,6 +342,7 @@ fn build_workload() -> Workload {
         arity: 0,
         args: Args::Fixed(Vec::new()),
         verify: verify_build,
+        cross: None,
     }
 }
 
@@ -310,6 +420,7 @@ fn map_workload() -> Workload {
         arity: 2,
         args: Args::InContext(map_args),
         verify: verify_map,
+        cross: None,
     }
 }
 
@@ -384,6 +495,7 @@ fn select_workload() -> Workload {
         arity: 1,
         args: Args::Fixed(vec![make_small(0)]),
         verify: verify_select,
+        cross: None,
     }
 }
 
@@ -457,13 +569,142 @@ fn walk_workload() -> Workload {
         arity: 2,
         args: Args::InContext(walk_args),
         verify: verify_walk,
+        cross: None,
     }
+}
+
+/// `cross/2` — [`CROSS_STEPS`] cross-module `call_ext_last` transfers between **two**
+/// modules, a `ping/2` ⇄ `pong/2` ping-pong.
+///
+/// ```text
+/// entry:
+///   allocate 0
+///   select_val x0 Fail=step {0 => base}    ; DEOPTED: a resolved-label switch
+/// step:
+///   x1 = x1 + 1                            ; inlined small-int '+'
+///   x0 = x0 - 1                            ; DEOPTED small-int '-'/2
+///   call_ext_last 2 <other>/2 0            ; DEOPTED: resolved through the host seam
+/// base:
+///   x0 = x1
+///   return
+/// ```
+///
+/// This is the one workload whose cost is not an instruction-lowering story: the
+/// `call_ext_last` cannot be inlined (a compiled block's module, label map and
+/// literal area are all bound for **one** module — see `super::super::CONTEXT.md`), so
+/// it deopts to one interpreter step, which resolves the import through the host's
+/// cross-module seam and hands the driver a `Step::Enter`. The driver then performs
+/// the module-context switch. On the baseline tier the callee's blocks are resolved
+/// through the driver's `NativeCode::module_blocks`
+/// ([`crate::jit::cache::cached_module_blocks`]), which compiles the callee into the
+/// per-thread [`CodeCache`](crate::jit::cache::CodeCache) on first sight — so the
+/// callee runs **natively** too, and the workload isolates the *transfer* itself.
+///
+/// The pair is a genuine A → B → A ping-pong: `jit_bench_cross_a:ping/2` tail-calls
+/// `jit_bench_cross_b:pong/2`, which tail-calls `jit_bench_cross_a:ping/2` again, each
+/// hop crossing the module boundary. Every transfer counts itself in `x(1)` exactly
+/// once, so the exported result is [`CROSS_STEPS`] — and the loop terminates because
+/// `x(0)` (the remaining transfers) is decremented on every hop and the switch at the
+/// top branches to `base` at zero.
+///
+/// [`Fixture::with_plus`] installs `erlang:'+'/2` (index 0, the inlined increment);
+/// `erlang:'-'/2` is index 1 and the cross-module target of the module at hand is
+/// index 2. Both modules share [`cross_body`], so the two bodies are the same shape
+/// with their own imports.
+fn cross_workload() -> Workload {
+    // The callee side: `jit_bench_cross_b:pong/2` bounces back into `jit_bench_cross_a`.
+    let mut pong = Fixture::with_plus(PONG_MODULE);
+    pong.import("erlang", "-", 2);
+    let back_to_ping = pong.import(PING_MODULE, PING_FUNCTION, 2);
+    let code = cross_body(&pong, back_to_ping);
+    let (pong_module, pong_function) = pong.finish(PONG_FUNCTION, 2, code);
+    let entry = pong_module
+        .export(pong_function, 2)
+        .expect("the cross workload exports the callee's entry");
+    let callee = Arc::new(pong_module);
+
+    // The caller side: the module the run is entered through.
+    let mut ping = Fixture::with_plus(PING_MODULE);
+    ping.import("erlang", "-", 2);
+    let to_pong = ping.import(PONG_MODULE, PONG_FUNCTION, 2);
+    let code = cross_body(&ping, to_pong);
+    let (module, function) = ping.finish(PING_FUNCTION, 2, code);
+
+    Workload::new(
+        format!(
+            "cross/2 ({CROSS_STEPS} cross-module call_ext_last transfers between \
+             {PING_MODULE} and {PONG_MODULE})"
+        ),
+        module,
+        function,
+        2,
+        Args::Fixed(vec![make_small(CROSS_STEPS as i64), make_small(0)]),
+        verify_cross,
+    )
+    .with_cross(CrossCall {
+        module: callee,
+        import_module: PONG_MODULE,
+        import_function: PONG_FUNCTION,
+        import_arity: 2,
+        entry,
+    })
+}
+
+/// The ping-pong body both modules of the `cross/2` pair share.
+///
+/// `cross` is the module's own cross-module import (index 2 of its import table: the
+/// other module's exported function). `x(0)` counts the transfers still to make and
+/// `x(1)` counts the ones already made, so the entry's switch sends an exhausted `x(0)`
+/// to `base` and every other value into `step` — where the cross-module tail call is
+/// taken with the decremented counters. The `allocate 0` gives every entered body a
+/// frame for its `call_ext_last ... 0` to pop.
+///
+/// The `select_val` has a **resolved-label** `fail` (so it is the deopted shape, not
+/// the inlined immediate one), and every `gc_bif` carries `NO_FAIL`, i.e. a BIF error
+/// raises rather than branching — the arithmetic hook answers both `+` and `-`.
+fn cross_body(fixture: &Fixture, cross: ImportRef) -> Vec<Instr> {
+    let step = Label(2);
+    let base = Label(3);
+    vec![
+        Instr::Label(Label(1)),
+        Instr::Allocate {
+            stack_need: HeapNeed::Words(0),
+            live: 2,
+        },
+        Instr::SelectVal {
+            value: Operand::X(0),
+            fail: step,
+            pairs: vec![(Operand::Integer(0), base)],
+        },
+        Instr::Label(step),
+        // `x1 = x1 + 1` — the `erlang:'+'/2` import `Fixture::with_plus` installs at 0.
+        fixture.add(Operand::X(1), Operand::Integer(1), Operand::X(1), 2),
+        // `x0 = x0 - 1` — the `erlang:'-'/2` import at index 1.
+        Instr::GcBif {
+            arity: 2,
+            bif: ImportRef(1),
+            fail: NO_FAIL,
+            live: 2,
+            args: vec![Operand::X(0), Operand::Integer(1)],
+            dst: Operand::X(0),
+        },
+        Instr::CallExtLast {
+            arity: 2,
+            target: cross,
+            deallocate: 0,
+        },
+        Instr::Label(base),
+        Instr::Move {
+            src: Operand::X(1),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ]
 }
 
 // ---------------------------------------------------------------------------
 // Argument preparation (heap terms must live in the run's own context)
 // ---------------------------------------------------------------------------
-
 /// The `map/2` arguments: the flat map `#{1 => 1, 2 => 2, 3 => 3}`, built in `ctx`.
 fn map_args(ctx: &mut MinimalContext) -> Result<Vec<Eterm>> {
     let map = terms::make_flatmap(

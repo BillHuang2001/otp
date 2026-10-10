@@ -391,16 +391,36 @@ pub(crate) fn no_mailbox(pid: beam_process::ProcessId) -> BeamError {
 
 /// The `erlang`-namespace calls classified as **known** capability gaps rather than the
 /// *plain* `erlang:X/Y is not a BIF` diagnostic a **genuinely unknown** `erlang` name
-/// gets (such a name now raises the bare [`undef`] the oracle does): that would present a
+/// gets (such a name raises the bare [`undef`] the oracle does): that would present a
 /// documented capability gap as a genuine runtime error. A listed call is classified as
 /// *unsupported* instead (exit code [`EXIT_UNSUPPORTED`](crate::cli::EXIT_UNSUPPORTED)) —
 /// see [`known_unimplemented_bif`].
 ///
+/// # Membership: exactly one rule
+///
+/// A `(function, arity)` belongs here **iff** the OTP release really **exports** the name
+/// from the `erlang` module **and** this runtime does not serve it. Nothing else qualifies:
+/// membership means *"an OTP `erlang` BIF the oracle exports but this runtime does not
+/// serve"* — a capability gap this runtime can honestly report as such.
+///
+/// A name the **oracle itself** rejects as `undef` because `erlang` does not export it
+/// (`erlang:apply/1`, `erlang:function_exported/2`, `erlang:load_module/3`,
+/// `erlang:system_info/2`, `erlang:statistics/0`, `erlang:map_get/3`,
+/// `erlang:concatenate/2`, `erlang:register/3`, `erlang:system_profile/1` — all verified
+/// with `erlang:function_exported(erlang, F, A)` and a direct call on OTP 29.1.1 /
+/// erts-17.1, both `false`/`error:undef`) therefore must **not** be listed: curating one
+/// would answer the oracle's exit-1 "no such function" with an exit-3 capability gap, a
+/// divergence dressed up as a gap. Such a name falls through to [`undef`], the honest
+/// reproduction of the oracle's *absence*.
+///
 /// This list is the **candidate** set, not the answer: [`is_known_unimplemented_bif`]
 /// intersects it with the live `beam_bifs` registry at use time, so a name the registry
 /// has since grown is never shadowed and the two can never drift apart (see the
-/// [`is_known_unimplemented_bif`] docs). A name in `beam_bifs`' `erlang` registry is
-/// therefore dead weight here — remove it when you notice it — but it is *harmless*.
+/// [`is_known_unimplemented_bif`] docs). An entry the *registry* owns therefore violates
+/// this rule and is inert — the intersection enforces the rule, so such an entry can never
+/// change an answer. An entry only the runtime-native floor (`crate::native`, which runs
+/// *before* the registry and this fallback — `set_cookie/2` today) serves never reaches the
+/// fallback either: inert too, and equally to be removed when noticed.
 ///
 /// `beam_bifs` now registers **every** declared `bif.tab` entry, routing each through its
 /// `RuntimeHooks` seam (the typed `unsupported_bif` capability gap until the runtime
@@ -408,10 +428,11 @@ pub(crate) fn no_mailbox(pid: beam_process::ProcessId) -> BeamError {
 /// this fallback and must never be listed here; what remains is the residue of
 /// `erlang`-namespace calls that carry **no** declared `bif.tab` entry under the `erlang`
 /// module — the OTP `erlang` functions whose implementation is an `erts_internal:*` BIF
-/// (`port_control/3`, `process_flag/3`, `suspend_process/1`, `system_monitor/1`,
-/// `garbage_collect/1`, ...) or an `erlang.erl` wrapper, which the registry cannot own.
-/// The list is curated rather than generated: a name is added as it is noticed reaching
-/// the fallback with a plain `not a BIF` diagnostic.
+/// (`port_control/3`, `process_flag/3`, `suspend_process/1,2`, `system_monitor/1`,
+/// `garbage_collect/2`, ...) or an `erlang.erl` wrapper, which the registry cannot own.
+/// The list is curated rather than generated: a name is added once the oracle is confirmed
+/// to export it *and* it is noticed reaching the fallback with the plain `not a BIF`
+/// diagnostic.
 pub(crate) const KNOWN_UNIMPLEMENTED_ERLANG_BIFS: &[(&str, u32)] = &[
     // The distribution/node surface the release carries without an `erlang`-module
     // `bif.tab` entry.
@@ -419,38 +440,32 @@ pub(crate) const KNOWN_UNIMPLEMENTED_ERLANG_BIFS: &[(&str, u32)] = &[
     ("disconnect_node", 1),
     // Ports: declared as `erts_internal:port_*`.
     ("port_connect", 2),
-    ("port_control", 3),
     ("port_call", 3),
+    // Spawning on a remote node: the whole `spawn_request` family is exported by the
+    // oracle, and no arity of it carries an `erlang`-module `bif.tab` entry (the
+    // `erts_internal:spawn_request/4` the registry does own is a different key).
+    ("spawn_request", 1),
     ("spawn_request", 2),
     ("spawn_request", 3),
     ("spawn_request", 4),
     ("spawn_request", 5),
-    // Process control: `process_flag/3`, `suspend_process/1` and `process_display/2` are
+    // Process control: `process_flag/3`, `suspend_process/1,2` and `process_display/2` are
     // declared as `erts_internal:` BIFs.
     ("process_flag", 3),
     ("process_display", 2),
     ("suspend_process", 1),
-    ("register", 3),
+    ("suspend_process", 2),
     ("system_monitor", 0),
     ("system_monitor", 1),
     ("system_monitor", 2),
-    ("system_profile", 1),
-    // Garbage collection: `erts_internal:garbage_collect/1` hosts the collector entry.
-    ("garbage_collect", 0),
-    ("garbage_collect", 1),
+    // Garbage collection: `erts_internal:garbage_collect/1` hosts the collector entry, and
+    // `/0`+`/1` are served by the runtime-native floor (`src/native/erts_internal.rs`); `/2`
+    // is the asynchronous system-task form, which this runtime has no protocol for.
     ("garbage_collect", 2),
-    // Code loading and application.
-    ("apply", 1),
-    ("function_exported", 2),
+    // Code loading.
     ("load_module", 2),
-    ("load_module", 3),
     // The system/time surface.
-    ("system_info", 2),
     ("localtime_to_universaltime", 1),
-    ("statistics", 0),
-    // The removed term-manipulation BIFs.
-    ("map_get", 3),
-    ("concatenate", 2),
 ];
 
 /// A **known** `erlang` BIF that Milestone-1 deliberately does not implement.
@@ -876,6 +891,86 @@ mod tests {
         // `undef` a typo gets.
         assert!(!listed_as_unimplemented("nope", 1));
         assert!(!is_known_unimplemented_bif(&registry, "nope", 1));
+    }
+
+    /// The two-way answer the `erlang`-namespace fallback gives once the native floor and the
+    /// `beam_bifs` registry have both declined a call (`context/mod.rs::call_bif`): a curated
+    /// name is the typed capability gap, anything else the bare `undef` the oracle raises.
+    fn erlang_fallback(registry: &BifRegistry, function: &str, arity: u32) -> BeamError {
+        if is_known_unimplemented_bif(registry, function, arity) {
+            known_unimplemented_bif(function, arity)
+        } else {
+            undef()
+        }
+    }
+
+    /// Membership means exactly *"an OTP `erlang` BIF the oracle **exports** but this runtime
+    /// does not serve"* — so a name the OTP release does not export at all must never be
+    /// curated.
+    ///
+    /// Each name below was curated by an earlier revision although `erlang` does **not** export
+    /// it: `erlang:function_exported(erlang, F, A)` is `false` and a call raises
+    /// `error:undef` (verified against the oracle — OTP 29.1.1 / erts-17.1 — with
+    /// `erl -noshell -eval 'try erlang:F(A…) catch C:R -> {C,R} end, halt().'`). Curating one
+    /// answered the oracle's exit-1 "no such function" with an exit-3 capability gap, a
+    /// divergence presented as a gap. They must classify as **not** a gap, i.e. reach the bare
+    /// [`undef`] — never come back.
+    #[test]
+    fn a_name_the_otp_release_does_not_export_is_not_a_curated_gap() {
+        let registry = beam_bifs::default_registry();
+        for (function, arity) in [
+            ("apply", 1u32),
+            ("function_exported", 2),
+            ("load_module", 3),
+            ("system_info", 2),
+            ("statistics", 0),
+            ("map_get", 3),
+            ("concatenate", 2),
+            ("register", 3),
+            ("system_profile", 1),
+        ] {
+            assert!(
+                !listed_as_unimplemented(function, arity),
+                "erlang:{function}/{arity} is not exported by the release and must not be curated"
+            );
+            let answer = erlang_fallback(&registry, function, arity);
+            assert_eq!(
+                unsupported_reason(&answer),
+                None,
+                "erlang:{function}/{arity} is the oracle's exit-1 `undef`, never a capability gap"
+            );
+            assert_eq!(
+                answer.as_atom(),
+                Some("undef"),
+                "erlang:{function}/{arity} answers the bare reason atom the oracle raises"
+            );
+        }
+    }
+
+    /// The **exit codes** the differential harness keys off, for both directions of the rule:
+    /// a reclassified name is the oracle's exit-1 `error:undef`, a newly curated one the exit-3
+    /// capability gap — the very signal [`unsupported_reason`] is the single interpreter of.
+    #[test]
+    fn a_reclassified_name_exits_1_and_a_newly_curated_one_exits_3() {
+        // `erlang` does not export `statistics/0`, so the oracle exits 1 with `error:undef`;
+        // an earlier revision answered exit 3 here.
+        assert_eq!(
+            crate::cli::run(vec!["-eval".to_string(), "erlang:statistics()".to_string()]),
+            crate::cli::EXIT_RUNTIME,
+            "a name the release does not export is the oracle's genuine `undef`, exit 1"
+        );
+        // The reverse direction: these two **are** exported by the oracle and are not served
+        // here, so the honest answer is the capability gap, not a bare `undef`.
+        for expr in [
+            "erlang:spawn_request(self())",
+            "erlang:suspend_process(self(), true)",
+        ] {
+            assert_eq!(
+                crate::cli::run(vec!["-eval".to_string(), expr.to_string()]),
+                crate::cli::EXIT_UNSUPPORTED,
+                "{expr} is an exported-but-unserved erlang BIF: a capability gap, exit 3"
+            );
+        }
     }
 
     #[test]

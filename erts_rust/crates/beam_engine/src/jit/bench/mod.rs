@@ -30,7 +30,7 @@
 //! [`run_measurement_table`] (the `#[ignore]`d table). Keeping the harness here is what
 //! stops the unit-test and integration-test halves from growing a copy each.
 //!
-//! Nine workloads, split by lowering story:
+//! Ten workloads, split by lowering story:
 //!
 //! * The shapes the baseline tier **deopts** (every instruction is a `jit_step_one`
 //!   helper round-trip on a native tier) — **`build/0`** (`put_tuple2`/`put_list`),
@@ -40,12 +40,21 @@
 //!   walk: an `is_nonempty_list` guard + `get_list` + a small-int `'+'/2` + `call_only`).
 //! * The shapes the tier **inlines** ([`inlined`]) — **`slice:fib/1`** (a real `.beam`
 //!   fixture), **`kernel/2`**, **`wide/2`**, **`aggr/2`** and **`cmp/2`**.
+//! * **`cross/2`** ([`workloads::workloads`]) — a two-module `ping/2` ⇄ `pong/2`
+//!   ping-pong whose `call_ext_last` deopts to one interpreter step, which the
+//!   **driver** turns into a module-context switch (`Step::Enter`). It is the one
+//!   workload that measures a cross-module *transfer*: on the baseline tier the callee
+//!   is compiled into the per-thread code cache on first sight, so it runs natively
+//!   too and the figure isolates the switch.
 //!
 //! # Method
 //!
 //! Every workload is a hand-built synthetic [`Module`] assembled by the loader's own
 //! block decomposition ([`beam_loader::lower::build_blocks`]), run on the shared
-//! [`MinimalContext`] + a [`JitBackend`]. A native tier **compiles once** outside the
+//! [`MinimalContext`] + a [`JitBackend`]. `cross/2` additionally installs a
+//! cross-module-call resolver
+//! ([`Workload::install_cross`](workloads::Workload::install_cross)) and drives a
+//! second module through it. A native tier **compiles once** outside the
 //! timed loop ([`JitBackend::compile`]) and the loop only ever calls
 //! [`JitBackend::run_compiled`]; one warm-up run precedes the timed runs, and the same
 //! [`Machine`] is reused across them (`run_*` resets it). `ns/op` is the **mean** over
@@ -71,10 +80,9 @@
 //!
 //! [`support`] owns the scaffolding the harnesses share (the synthetic [`Module`]
 //! builder, the arithmetic BIF hook and the ns/op report primitives); [`workloads`]
-//! owns the workload type and the deopted programs, [`inlined`] the tier-inlined ones;
-//! [`checks`] owns the per-workload result checks; this file owns the tier seam, the
-//! timing loop and the reporting.
-
+//! owns the workload type, the deopted programs and the cross-module ping-pong,
+//! [`inlined`] the tier-inlined ones; [`checks`] owns the per-workload result checks;
+//! this file owns the tier seam, the timing loop and the reporting.
 use std::cmp::Ordering;
 use std::time::{Duration, Instant};
 
@@ -212,6 +220,7 @@ impl Measurement {
     fn run(tier: Tier, workload: &Workload, runs: u32) -> Measurement {
         let mut machine = Machine::new();
         let mut context = MinimalContext::with_bif_hook(workload.bif_hook());
+        workload.install_cross(&mut context);
         let args = workload
             .arguments(&mut context)
             .expect("the workload's arguments must build");

@@ -38,12 +38,13 @@
 use std::sync::Arc;
 
 use beam_common::{BeamError, ExceptionClass, ExitReason, Raise, StackTrace};
-use beam_loader::{HeapNeed, Instr, Label, Operand, NO_FAIL};
-use beam_term::{cmp, make_atom, make_small};
+use beam_loader::{Atom, HeapNeed, Instr, Label, Operand, NO_FAIL};
+use beam_term::{cmp, make_atom, make_small, Eterm, NIL};
 
 use super::test_support::{seam, Fixture};
-use super::{Machine, RunOutcome};
+use super::{CatchFrame, Continuation, Machine, RunOutcome};
 use crate::context::MinimalContext;
+use crate::Step;
 
 // The production builders take the `Machine` plus a reader closure so a moving
 // collector can relocate operands between the reserve and the read; these tests
@@ -485,4 +486,120 @@ fn a_caught_raise_lands_unchanged_and_exposes_no_frames() {
     assert!(cmp(value, expected, &module.atom_table).is_eq());
     // The handler consumed its catch frame; no exception is in flight.
     assert_eq!(machine.catch_frame_depth(), 0, "the handler popped its frame");
+}
+
+// ---------------------------------------------------------------------------
+// The raise-time snapshot: the pre-unwind frame chain
+// ---------------------------------------------------------------------------
+
+/// A raise captures the frame chain **before** it unwinds, so the frames the raise
+/// unwound out of are still nameable when the handler's `build_stacktrace` runs.
+///
+/// The snapshot is the engine's replacement for C's saved raw `StackTrace`
+/// (`c_p->ftrace`): the raising frame first, then every live caller innermost-first
+/// as `(context, func, pc)`.
+#[test]
+fn a_raise_snapshots_the_pre_unwind_frame_chain() {
+    let mut machine = Machine::new();
+    // A caller chain: the bottom frame, then F suspended in a call (resumes at
+    // `(7, 3)`) and G suspended in a call (resumes at `(9, 1)`).
+    machine.push_frame(0).unwrap();
+    machine.push_frame(0).unwrap();
+    machine
+        .set_continuation(Continuation::Address {
+            func: 7,
+            pc: 3,
+            context: 0,
+        })
+        .unwrap();
+    machine.push_frame(0).unwrap();
+    machine
+        .set_continuation(Continuation::Address {
+            func: 9,
+            pc: 1,
+            context: 0,
+        })
+        .unwrap();
+    // `step_instruction` records `current_code` at the raising instruction; here it
+    // is the function at index 5, code offset 11, in the entry context (0).
+    machine.current_code = Some((5, 11));
+
+    // A catch frame owned by frame 1: landing there unwinds frame 2 (G) away.
+    machine.push_catch_frame(CatchFrame::new(20, 2, 1));
+    machine.set_class_atom(ExceptionClass::Error, make_atom(Atom::from_raw(11)));
+
+    let step = machine
+        .throw_with_trace(ExceptionClass::Error, Eterm::from_raw(1), NIL)
+        .expect("a live frame catches");
+    assert_eq!(step, Step::Goto { func: 20, pc: 2 });
+
+    // The raise unwound frame 2 away…
+    assert_eq!(machine.frame_depth(), 2, "the raise unwound frame 2 away");
+    // …but the snapshot still holds the chain as it was *before* the unwind: the
+    // raising function `(5, 11)` first, then every caller innermost-first — G's
+    // frame `(9, 1)`, which the unwind dropped, is still named.
+    assert_eq!(machine.raise_snapshot(), &[(0, 5, 11), (0, 9, 1), (0, 7, 3)]);
+}
+
+/// The snapshot is refreshed on the **uncaught** path too: the refresh happens
+/// before the early `Err(BeamError::Raise)` return, so the uncaught funnel
+/// (`Machine::with_uncaught_frames`) can name the same chain.
+#[test]
+fn an_uncaught_raise_snapshots_the_frame_chain() {
+    let mut machine = Machine::new();
+    machine.push_frame(0).unwrap();
+    machine.push_frame(0).unwrap();
+    machine
+        .set_continuation(Continuation::Address {
+            func: 7,
+            pc: 3,
+            context: 0,
+        })
+        .unwrap();
+    machine.current_code = Some((5, 11));
+
+    let err = machine
+        .throw(ExceptionClass::Exit, Eterm::from_raw(2))
+        .expect_err("no catch frame");
+    assert!(matches!(err, BeamError::Raise(_)));
+    assert_eq!(machine.raise_snapshot(), &[(0, 5, 11), (0, 7, 3)]);
+}
+
+/// The reset-vs-resume split the module contexts follow applies to the snapshot
+/// too: `Machine::reset` (the start of every fresh run) clears it, while a resume
+/// ([`Machine::resume_outcome`]) preserves it.
+#[test]
+fn reset_clears_the_raise_snapshot_but_a_resume_preserves_it() {
+    // A module whose only function returns immediately, to resume into.
+    let mut fixture = Fixture::new("m");
+    fixture.add_function("f", 0, vec![Instr::Label(Label(1)), Instr::Return]);
+    let module = fixture.finish();
+    let mut ctx = MinimalContext::new();
+
+    let mut machine = Machine::new();
+    machine.push_frame(0).unwrap();
+    machine.current_code = Some((5, 3));
+    // An uncaught raise refreshes the snapshot (nothing is unwound here).
+    let _ = machine
+        .throw(ExceptionClass::Throw, Eterm::from_raw(0x99))
+        .expect_err("no catch frame");
+    assert_eq!(machine.raise_snapshot(), &[(0, 5, 3)]);
+
+    // A resume is not a reset: the snapshot survives re-entering the machine.
+    let outcome = machine
+        .resume_outcome(&module, 0, 0, &mut ctx)
+        .expect("the resumed function returns");
+    assert!(matches!(outcome, RunOutcome::Returned(_)));
+    assert_eq!(
+        machine.raise_snapshot(),
+        &[(0, 5, 3)],
+        "a resume must not clear the snapshot"
+    );
+
+    // A reset — the start of every fresh run — clears it.
+    machine.reset();
+    assert!(
+        machine.raise_snapshot().is_empty(),
+        "reset clears the snapshot"
+    );
 }

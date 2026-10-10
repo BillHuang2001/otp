@@ -153,6 +153,19 @@ impl FromSet {
             .push((space.base() as usize, space.top() as usize));
     }
 
+    /// Adds an explicit half-open byte-address range `[lo, hi)` this set evacuates.
+    ///
+    /// Used for a space whose "live region" is not its `[base, top)` fill — the mark-region
+    /// mature space is one contiguous region whose free lines are inside it too, so a
+    /// [`FromSet`] over it is `base .. base + capacity`.
+    pub(crate) fn add_range(&mut self, lo: usize, hi: usize) {
+        self.ranges.push((lo, hi));
+    }
+
+    /// The evacuated ranges, as half-open byte-address pairs.
+    pub(crate) fn ranges(&self) -> &[(usize, usize)] {
+        &self.ranges
+    }
     /// Whether `ptr` falls inside any evacuated range.
     pub fn contains(&self, ptr: *const Eterm) -> bool {
         let addr = ptr as usize;

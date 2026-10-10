@@ -70,10 +70,14 @@
 //!      updated term). From here the nursery holds only final mature addresses.
 //!   3. **Promote the nursery.** Now that the nursery's mature references are final, the
 //!      promotion leaves them verbatim (`Foreign`) and cannot create a stale pointer.
-//!
-//! If, after a major has reclaimed the mature generation, the live nursery still does not
-//! fit (`free_lines() < needed`), the collector returns the typed heap-exhaustion
-//! [`BeamError`](beam_common::BeamError) — never a panic and never a half-forwarded heap.
+//!   4. **Grow instead of failing.** Should the reclaimed region still not hold the
+//!      promotion (`free_lines() < needed`), the fullsweep grows the mature generation —
+//!      it is relocated wholesale into a larger fresh mark-region space
+//!      ([`GenImmixCollector::grow_major`]), so a growable heap never turns a working
+//!      program into a failing one. Only a [`HeapPolicy::max_heap_words`] ceiling that
+//!      cannot reach the larger size reports the typed heap-exhaustion
+//!      [`BeamError`](beam_common::BeamError), and always *before* anything is promoted:
+//!      never a panic and never a half-forwarded heap.
 //!
 //! # Sharing with the copying engine
 //!
@@ -493,22 +497,25 @@ impl GenImmixCollector {
     ///
     /// When the heap-size policy asks for a different mature-region size
     /// ([`HeapPolicy::mature_after_fullsweep`]) the fullsweep **relocates** instead — see
-    /// [`relocate_major`](Self::relocate_major).
+    /// [`relocate_major`](Self::relocate_major). When the policy *keeps* the capacity but
+    /// the in-place reclaim still cannot hold the promotion, the fullsweep falls back to
+    /// growing the region — see [`grow_major`](Self::grow_major).
     fn run_major(
         &mut self,
         roots: &mut [Eterm],
         needed: usize,
         refs: Vec<(*mut Eterm, Eterm)>,
     ) -> Result<GcStats> {
-        // The size this fullsweep should leave behind: the policy's growth/shrink decision
-        // fed with the mature occupancy plus the nursery's promotion lines (both line-
-        // rounded, so it is an upper bound on what has to fit).
-        let need_words = needed.saturating_mul(LINE_WORDS);
-        let live_words = self.mature.used_words().saturating_add(need_words);
+        // The size this fullsweep should leave behind, from the **exact live graph** it
+        // evacuates (nursery *and* mature, reachable-from-roots only) — never the
+        // pre-collection occupancy, whose garbage would make the policy's `should_grow`
+        // fire on every fullsweep and creep the region up without bound (see
+        // [`crate::live`]).
+        let live = crate::live::live_full(&self.young, &self.mature, roots);
         let capacity = self.mature.capacity_words();
-        let target = self.policy.mature_after_fullsweep(capacity, live_words, 0);
+        let target = self.policy.mature_after_fullsweep(capacity, live.words, 0);
         if target != capacity {
-            return self.relocate_major(roots, target);
+            return self.relocate_major(roots, target, live.lines);
         }
 
         // The nursery's mature references, as additional roots: a mature object reachable
@@ -527,9 +534,9 @@ impl GenImmixCollector {
         }
 
         if self.mature.free_lines() < needed {
-            // Even after reclaiming the mature generation the live nursery does not fit:
-            // a typed, retryable heap exhaustion, never a panic or a partial promotion.
-            return Err(heap_exhausted(needed.saturating_mul(LINE_WORDS)));
+            // Even after reclaiming the mature generation the *in-place* region cannot hold
+            // the promotion: grow the region instead of failing — see [`Self::grow_major`].
+            return self.grow_major(roots, needed, live.lines);
         }
 
         let mut from = PromoteFrom {
@@ -551,6 +558,56 @@ impl GenImmixCollector {
         Ok(stats)
     }
 
+    /// The **growth fallback** for a fullsweep whose **in-place** reclaim left fewer free
+    /// lines than the nursery's promotion needs (`needed`).
+    ///
+    /// The in-place reclaim ([`ImmixSpace::collect`]) has already run when this is reached,
+    /// and the nursery's mature-reference slots have already been rewritten to their final
+    /// in-place addresses, so the ordering the major prescribes (reclaim mature in place →
+    /// resolve the nursery's references → promote the nursery) is preserved: this only
+    /// replaces the *promotion* target with a larger, freshly-built mark-region space. The
+    /// whole live set — the nursery's graph *and* the just-reclaimed mature generation — is
+    /// copied into it by the ordinary promotion protocol of
+    /// [`relocate_major`](Self::relocate_major), so the old region's garbage (including
+    /// whatever the in-place reclaim could not return) is abandoned wholesale.
+    ///
+    /// A growable heap therefore never turns a working program into a failing one. The
+    /// growth is still bounded by [`HeapPolicy::max_heap_words`]: when the policy's ceiling
+    /// cannot reach a region larger than the current one the typed, retryable heap
+    /// exhaustion is returned instead, and — exactly as before — **before any word is
+    /// promoted**. The nursery is left un-forwarded throughout (nothing here writes to it),
+    /// and on that error path the current mature region is left in place, so the
+    /// already-reclaimed mature generation is still fully addressable from every reference.
+    ///
+    /// (Under the current selection rule this fallback is defensive: a policy that *keeps*
+    /// the mature capacity only does so when it already has room for the promotion plus the
+    /// reserve, so the in-place shortfall this answers can only be reached when
+    /// `max_heap_words` clamps the region to its current capacity — i.e. precisely when
+    /// growing is forbidden. It exists so that a future selection rule, or a policy that
+    /// keeps a capacity it should have grown, can never fail a collection it could satisfy.)
+    fn grow_major(
+        &mut self,
+        roots: &mut [Eterm],
+        needed: usize,
+        live_lines: usize,
+    ) -> Result<GcStats> {
+        let capacity = self.mature.capacity_words();
+        // The target must cover both the promotion the reclaim could not fit (`needed`) and
+        // the line need of the whole live set being relocated (`live_lines`), since a
+        // line-granular space charges one line per object even for a two-word cell.
+        let want = capacity
+            .saturating_add(needed.saturating_mul(LINE_WORDS))
+            .max(live_lines.saturating_mul(LINE_WORDS));
+        // `next_words` applies the policy's floor and its `max_heap_words` ceiling, so a
+        // target that is not strictly larger than the current capacity means the ceiling
+        // (or the growth table's own ceiling) forbids growing at all.
+        let target = self.policy.next_words(want, 0);
+        if target <= capacity {
+            return Err(heap_exhausted(needed.saturating_mul(LINE_WORDS)));
+        }
+        self.relocate_major(roots, target, live_lines)
+    }
+
     /// A fullsweep that also **relocates** the mature generation into a differently-sized
     /// mark-region space — the growth/shrink half of
     /// [`HeapPolicy::mature_after_fullsweep`].
@@ -561,22 +618,38 @@ impl GenImmixCollector {
     /// [`last_immix_stats`](Self::last_immix_stats) is cleared). The old mature region is
     /// abandoned wholesale, so its garbage is reclaimed for free.
     ///
-    /// The target size comes from the policy's *occupancy* estimate, which is an upper
-    /// bound on the live set, so `fresh` always has room. Should an explicit
-    /// `max_heap_words` clamp break that, the typed heap exhaustion is returned *before*
-    /// any word is copied — the from-space is never left half-forwarded.
-    fn relocate_major(&mut self, roots: &mut [Eterm], target: usize) -> Result<GcStats> {
+    /// `live_lines` is the **exact** line need of the graph being relocated
+    /// ([`crate::live::Live::lines`]: the per-object `lines_for` sum, not
+    /// `lines_for(total_words)`, which would round the total once and under-count the many
+    /// one-line objects a mark-region space actually charges for). The destination is both
+    /// raised to it and checked against it *before* any word is copied, so the promotion can
+    /// never run out of lines halfway — an explicit
+    /// [`max_heap_words`](HeapPolicy::max_heap_words) ceiling that forbids the raise is the
+    /// typed heap exhaustion instead, and the from-space is never left half-forwarded.
+    fn relocate_major(
+        &mut self,
+        roots: &mut [Eterm],
+        target: usize,
+        live_lines: usize,
+    ) -> Result<GcStats> {
         let used = self.young.used_words();
         let before = self.mature.used_words().saturating_add(used);
 
         let alloc = self.mature.allocator().clone();
+        // Raise the policy's word target to the copy's real line need when the former alone
+        // does not cover it (a space of two-word cells needs one line each). A ceiling that
+        // forbids the raise leaves the target as it is and the check below reports it.
+        let want = target.max(live_lines.saturating_mul(LINE_WORDS));
+        let target = if want > target {
+            self.policy.next_words(want, 0)
+        } else {
+            target
+        };
         let fresh = ImmixSpace::with_allocator(alloc, target)?;
-        let needed_lines = before.div_ceil(LINE_WORDS);
         let mut fresh = fresh;
-        if fresh.free_lines() < needed_lines {
-            return Err(heap_exhausted(needed_lines.saturating_mul(LINE_WORDS)));
+        if fresh.free_lines() < live_lines {
+            return Err(heap_exhausted(live_lines.saturating_mul(LINE_WORDS)));
         }
-
         // Copy the whole live set out of the nursery and the old mature region. The two
         // borrows (`root` via `from`, `fresh` via `to`) are disjoint, and the immutable
         // borrow of `self.mature` ends with the block below, before the field is replaced.
@@ -979,3 +1052,6 @@ mod tests {
         assert!(roots.iter().all(|r| c.young().contains_term(*r)));
     }
 }
+
+#[cfg(test)]
+mod grow_tests;

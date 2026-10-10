@@ -157,15 +157,63 @@ SMP pool:
     guard makes both the no-relocation assertions and the defensive-entry assertions fail — verified
     during development, then restored). Deterministic — every size from the public heap-policy arithmetic,
     no sleeps / wall-clock bounds.
-29. `common/mod.rs` — the **shared oracle driver** used by `registry_monitors.rs`, `dict_oracle.rs`,
-    `monitor_tag.rs`, `capability_inventory.rs` and `port_monitor_cleanup.rs`: `ERL_TIMEOUT`,
-    `erl_stdout`, `expect_oracle` and `strip_logger_reports` (+ 4 unit tests for the normalizer). It runs
+29. `signal_exhaustion.rs` (4 tests) — the **signal builders' exhaustion policy**: the
+    `copy_reason_onto`/`build_signal_term`/`deliver_head_signal` paths (through the shared
+    `grow_receiver_for_signal`) treat a full receiver heap exactly as `Process::deliver` does. A
+    `{'EXIT', From, Reason}` whose copied reason is one word **larger** than the receiver's whole
+    bounded nursery is delivered: the refused copy collected once (`minor_gcs` up), grew the nursery on
+    demand to `next_heap_size(payload, 0)`, moved the base, and lands whole and exactly once in FIFO
+    order ahead of a following delivery (`an_oversized_exit_reason_grows_the_receivers_nursery_and_is_delivered`);
+    the same for a monitor `{'DOWN', …}` carrying a large reason
+    (`an_oversized_down_reason_grows_the_watchers_nursery_and_is_delivered`). A **relocation-exempt**
+    receiver instead surfaces the **raw** `Err(BeamError::Alloc(AllocKind::Heap | Message))` and neither
+    `minor_gcs()` nor the nursery `base()` moves, nothing is written and nothing is enqueued
+    (`a_relocation_exempt_receiver_surfaces_the_raw_refusal_without_relocating`); and the typed failure
+    leaves **no partial enqueue** (the signal is not queued, the mailbox is empty) with the receiver
+    still delivering a fitting signal afterwards
+    (`a_refused_signal_leaves_no_partial_state_and_the_receiver_still_delivers`). **Discriminating by
+    construction: the two delivery tests FAIL (a typed `Alloc` out of `terminate`) the moment the
+    builders only collect without growing, and the exemption test FAILS (a `relocation_exempt` raise
+    instead of the raw `Alloc`) the moment the short-circuit is removed.** Deterministic — every size
+    from the public heap-policy arithmetic, no sleeps / wall-clock bounds / oracle.
+30. `common/mod.rs` — the **shared oracle driver** used by `registry_monitors.rs`, `dict_oracle.rs`,
+    `monitor_tag.rs`, `lifecycle_oracle.rs`, `capability_inventory.rs` and `port_monitor_cleanup.rs`:
+    `ERL_TIMEOUT`, `erl_stdout`, `expect_oracle` and `strip_logger_reports` (+ 4 unit tests for the
+    normalizer). It runs
     `erl -noshell -kernel logger_level none -eval …` (the `none` level deterministically suppresses the
     `=ERROR REPORT====` block a crashed probe helper would otherwise race onto **stdout**) and normalizes
     the captured stdout (a report block — a line starting with `=`, through the next blank line — is
     removed), so a comparison is exact and never flaky. A support module (subdirectory files are not
     compiled as test targets); it carries `#![allow(dead_code)]` because not every including binary uses
     every helper.
+31. `lifecycle_oracle.rs` (7 tests) — the **lifecycle / process-control semantics** cross-checked against
+    the real `erl` (skips loudly when absent), filling the cases the other `oracle_*` suites leave
+    unpinned: link exit propagation from a **live** linked origin (a non-trapping peer dies, a trapping
+    peer survives with `{'EXIT', A, {bad,1}}`, and the watcher's DOWN carries the same structured
+    reason); **`kill` under `trap_exit`** (an untrappable `killed` death of a trapping process, with a
+    trapping link peer receiving `{'EXIT', P, killed}` and a `killed` DOWN); the `noproc`/`normal`/
+    `killed` exit-reason **shapes** at a trapping peer (incl. an explicit `killed` being *trappable*,
+    unlike the `kill` sentinel); `erlang:exit/2` propagating a structured reason verbatim with `From` the
+    signaller; the registry's `register`/`whereis`/`registered`/`unregister` round trip; `demonitor`
+    `[info]` bool semantics (with the born-down divergence **documented, not asserted for parity**); and
+    `demonitor(Ref, [flush])` removing a queued DOWN for a **pid** target. Every oracle expression is
+    synchronized on a message (no sleeps); variable names are kept distinct per receive in the `-eval`
+    text so no earlier binding is silently re-used as a pattern.
+32. `terminate_best_effort.rs` (2 tests) — the **best-effort termination cascade** of
+    `ProcessTable::terminate`/`terminate_with_ports`: a dying process is reclaimed *first*, so a
+    per-peer signalling failure is dropped-and-logged (ERTS's `erts_dsig_drop`) and the cascade
+    continues, letting the process-death observer and the port-monitor cleanup always run. Two
+    failures are forced, each hitting a different step: a `DistSignalRouter` whose transport always
+    fails (`Err(BeamError::Io(NotConnected))`) despite which the routing is **attempted once per
+    remote link partner** — asserting the second partner was still routed after the first failed —
+    and a relocation-exempt link peer whose bounded nursery refuses the exit-reason copy (raw
+    `Alloc`), after which the *next* link partner is still signalled. In both cases `terminate`
+    returns `Ok`, the observer fired **exactly once**, the local watcher still got its
+    `{'DOWN', …}`, and the dead watcher's incoming `PortMonitor` is gone. **Discriminating by
+    construction: both tests FAIL (a typed `Io` / `Alloc` out of `terminate`, observer unrun, port
+    monitor still listed) the moment the per-peer `?`-propagation is restored.** Deterministic —
+    the refusal size is the exempt peer's own bounded nursery capacity + 1 word, no sleeps /
+    wall-clock bounds / oracle.
 
 ## Constraints
 - **Anti-flakiness (BINDING).** Every assertion is forced by **synchronization**, never a bare
@@ -176,7 +224,8 @@ SMP pool:
 - `lock_scope.rs` is the **only** file with wall-clock bounds; they are deliberately loose and
   two-sided (a cross-thread send must be serviced far below the slice's duration, and the slice must
   last far above that bound — the anti-vacuity guard).
-- The `oracle_*` suites (`dict_oracle.rs`, `registry_monitors.rs`, `monitor_tag.rs`, and the `erl`
+- The `oracle_*` suites (`dict_oracle.rs`, `registry_monitors.rs`, `monitor_tag.rs`,
+  `lifecycle_oracle.rs`, and the `erl`
   cross-checks in `capability_inventory.rs`/`port_monitor_cleanup.rs`) go through the **shared driver**
   `common/mod.rs`, **skip loudly** when `erl` is absent, and must never spawn a child process that
   inherits `erl`'s stderr (a captured-stderr pipe blocks until the child dies — the probes are written
@@ -184,24 +233,32 @@ SMP pool:
 - Run the whole crate gate with
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_process` (never `cd`,
   sandbox `$HOME` is read-only). Cross-checks against the real system ERTS belong to the sibling
-  `../../../tools/differential/` harness, not here. Current: **396 passed, 0 failed, 1 ignored**.
+  `../../../tools/differential/` harness, not here. Current: **413 passed, 0 failed, 1 ignored**.
 
 ## Routing Table
 - `scheduler.rs`, `messaging.rs`, `signals.rs`, `gc.rs`, `priority.rs`, `pending_signals.rs`,
-  `preemption.rs`, `dict.rs`, `fragments.rs`, `scheduler_ports.rs`, `exhaustion.rs`, `gc_exemption.rs` →
+  `preemption.rs`, `dict.rs`, `fragments.rs`, `scheduler_ports.rs`, `exhaustion.rs`,
+  `signal_exhaustion.rs`, `gc_exemption.rs` →
   the single-threaded scheduler (incl. the port-aware slice cleanup), mailbox, signals, GC roots, PCB state,
-  pre-emption/fairness, the delivery collect-and-retry path and the host-controllable GC relocation exemption
+  pre-emption/fairness, the collect-grow-and-retry exhaustion path of `Process::deliver` and the
+  `{'EXIT',…}`/`{'DOWN',…}` signal builders, and the host-controllable GC relocation exemption
 - `registry_monitors.rs`, `monitor_tag.rs`, `capability_inventory.rs`, `process_info_source.rs`,
-  `spawn_options.rs` → the process-control surface: name registry + monitors (incl. the `monitor/3` user
-  tag), the typed-error/capability inventory, the `process_info` item→accessor mapping, and the
-  spawn-option composition
+  `spawn_options.rs`, `lifecycle_oracle.rs` → the process-control surface: name registry + monitors (incl.
+  the `monitor/3` user tag), the typed-error/capability inventory, the `process_info` item→accessor
+  mapping, the spawn-option composition, and the lifecycle semantics (link exit propagation, `kill` under
+  `trap_exit`, exit-reason shapes, `erlang:exit/2` propagation, the registry round trip, `demonitor`
+  `[info]`/`[flush]`)
 - `split_borrow.rs` → the two `Process` split borrows (`heap_and_off_heap_mut` + `Fragments::move_into`;
   `heap_and_mailbox_mut` + `send_fragmented`)
 - `process_exit_observer.rs`, `port_monitor_cleanup.rs` → the process-death observer seam and the
   death-side port-monitor cleanup
-- `dict_oracle.rs`, `registry_monitors.rs`, `monitor_tag.rs`, `port_monitor_cleanup.rs` (oracle tests) →
-  `erl`-cross-checked process-dictionary, process-control and port-monitor evidence (loud skip when `erl`
-  is absent); their driver is the shared `common/mod.rs`
+- `terminate_best_effort.rs` → the best-effort termination cascade (a failing `DistSignalRouter` /
+  an unreachable peer heap must not abort the death; the observer and the port-monitor cleanup still
+  run)
+- `dict_oracle.rs`, `registry_monitors.rs`, `monitor_tag.rs`, `lifecycle_oracle.rs`,
+  `port_monitor_cleanup.rs` (oracle tests) →
+  `erl`-cross-checked process-dictionary, process-control, lifecycle and port-monitor evidence (loud skip
+  when `erl` is absent); their driver is the shared `common/mod.rs`
 - `ports.rs`, `remote.rs` → the port table and distributed links/monitors
 - `smp.rs`, `lock_scope.rs`, `timers.rs`, `dirty.rs`, `progress.rs` → the SMP pool (see
   `../src/smp/CONTEXT.md`)

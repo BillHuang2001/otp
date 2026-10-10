@@ -376,10 +376,13 @@ impl TableRegistry {
     /// Inserts `table` under `handle`, returning the previous table if the handle
     /// was already present.
     ///
-    /// Any continuations of the replaced table are dropped (they name a table that
-    /// no longer exists).
+    /// **Continuations are not touched.** A continuation is an immutable value —
+    /// the `beam_ets` traversal state plus the table identity it was issued against
+    /// — exactly as in the oracle, where resuming one is repeatable and an
+    /// intervening table operation does not destroy it. A continuation of a table
+    /// that *has* gone away stays registered but can no longer resolve its table,
+    /// so resuming it is `badarg` (see [`resume_continuation`]).
     pub fn insert(&mut self, handle: u64, table: Table) -> Option<Table> {
-        self.continuations.retain(|_, cont| cont.table != handle);
         self.tables.insert(handle, table)
     }
 
@@ -411,8 +414,7 @@ impl TableRegistry {
         self.tables.remove(&handle)
     }
 
-    /// Removes and returns the table stored under `handle`, if any, dropping every
-    /// continuation that belonged to it but keeping its
+    /// Removes and returns the table stored under `handle`, if any, keeping its
     /// [`resolve::TableProfile`].
     ///
     /// This is the take half of every table-taking BIF's borrow-and-restore round
@@ -420,8 +422,12 @@ impl TableRegistry {
     /// the table's `ets:info/1,2` rendering is unchanged after e.g. an `insert/2`.
     /// The profile is dropped only by [`TableRegistry::remove`] or an explicit
     /// [`TableRegistry::forget_profile`] (the whole-table `ets:delete/1`).
+    ///
+    /// **Continuations are not touched** (they are immutable values — see
+    /// [`TableRegistry::insert`]): a take/restore round trip is invisible to them,
+    /// so an unrelated table operation never invalidates a live `ets:select/3`
+    /// continuation.
     pub fn take(&mut self, handle: u64) -> Option<Table> {
-        self.continuations.retain(|_, cont| cont.table != handle);
         self.tables.remove(&handle)
     }
 
@@ -491,15 +497,29 @@ impl TableRegistry {
         self.names.remove(&name)
     }
     /// Registers `state` as a live continuation of the table stored under
-    /// `table`, returning the fresh continuation id (the id of the ref thing the
+    /// `table`, returning the continuation id (the id of the ref thing the
     /// `ets:select` BIFs hand to Erlang). `reverse` records the traversal's
     /// direction (see [`Continuation`]).
+    ///
+    /// A continuation is an **immutable value derived from the traversal state**
+    /// (the `beam_ets` [`MatchContinuation`] is `PartialEq`), so an *equal* state
+    /// already registered for the same table and direction reuses its id instead of
+    /// minting a fresh one. That is what makes a resume **repeatable with an
+    /// identical result term**: the oracle resumes one continuation any number of
+    /// times and hands back `=:=`-equal chunks (continuations included — probed on
+    /// erts-17.1: `{_,C} = ets:match_object(T,'_',2), ets:match_object(C) =:=
+    /// ets:match_object(C)` ⇒ `true`).
     pub fn insert_continuation(
         &mut self,
         table: u64,
         state: MatchContinuation,
         reverse: bool,
     ) -> u64 {
+        if let Some(existing) = self.continuations.iter().find_map(|(handle, cont)| {
+            (cont.table == table && cont.reverse == reverse && cont.state == state).then_some(*handle)
+        }) {
+            return existing;
+        }
         let handle = self.next_continuation;
         self.next_continuation += 1;
         self.continuations.insert(
@@ -516,6 +536,11 @@ impl TableRegistry {
     /// Removes and returns the continuation stored under `handle`: the handle of
     /// its table, its opaque state and its direction (`None` when `handle` is
     /// unknown — the caller raises `badarg`).
+    ///
+    /// The continuation family no longer *consumes* on resume (see
+    /// [`TableRegistry::continuation`]); this consuming accessor is kept for a host
+    /// that permanently drops a traversal — [`TableRegistry::remove`], the
+    /// whole-table delete, does the same for every continuation of a table.
     pub fn take_continuation(
         &mut self,
         handle: u64,
@@ -525,9 +550,23 @@ impl TableRegistry {
             .map(|cont| (cont.table, cont.state, cont.reverse))
     }
 
+    /// The continuation stored under `handle` — the handle of its table, a copy of
+    /// its opaque state and its direction — or `None` when `handle` names no live
+    /// continuation.
+    ///
+    /// The state is **cloned, never removed**: resuming a continuation is a pure
+    /// function of it, so `ets:select(Cont)` is repeatable and an unrelated table
+    /// operation cannot invalidate it (the oracle's continuation is an immutable
+    /// value, contrary to a live cursor).
+    pub fn continuation(&self, handle: u64) -> Option<(u64, MatchContinuation, bool)> {
+        self.continuations
+            .get(&handle)
+            .map(|cont| (cont.table, cont.state.clone(), cont.reverse))
+    }
+
     /// The handle of the table a live continuation belongs to, if any.
     ///
-    /// [`resume_continuation`] needs it *before* consuming the continuation: the
+    /// [`resume_continuation`] needs it *before* resuming the continuation: the
     /// resuming call is access-gated as the calling process, and a denial must
     /// leave the continuation resumable (verified: after a non-owner's denied
     /// `ets:select(Cont)` on a `private` table, the owner can still resume it).
@@ -1091,31 +1130,68 @@ fn first_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 }
 
 /// `ets:last(Tab)` — the last key in the table's iteration order.
+///
+/// A **hash** kind (`set`/`bag`/`duplicate_bag`) has no backward walk, and the
+/// oracle aliases `ets:last/1` to `ets:first/1` there — the C runs the *forward*
+/// primitive for every non-`ordered_set` kind. Only an `ordered_set` reads the
+/// real end of its order. This mirrors `nav::last_lookup_1` exactly (the two
+/// verbs must never disagree). Verified against the system `erl` (OTP 29.1.1 /
+/// erts-17.1): keys `[6,3,4,8,1]` in a `set` give `first` `6`/`last` `6`, while an
+/// `ordered_set` gives `first` `1`/`last` `8`.
 fn last_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
-    let key = table.last(ctx.atoms());
+    let key = if table.kind().is_ordered() {
+        table.last(ctx.atoms())
+    } else {
+        table.first(ctx.atoms())
+    };
     restore_table(ctx, handle, table)?;
     key_or_end(ctx, key)
 }
 
 /// `ets:next(Tab, Key)` — the key following `Key` (an `ordered_set` reads `Key`
 /// as a range bound; the hash kinds require it present, else `badarg`).
+///
+/// An `ordered_set` additionally **rejects** the `'$end_of_table'` anchor with
+/// `badarg` (see [`is_end_of_table_key`]) — the C `db_next_tree_common`'s
+/// unconditional `DB_ERROR_BADKEY`; without it the anchor would be read as a
+/// greatest-bound and answer `'$end_of_table'` where the oracle raises.
 fn next_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let key = args[1];
     let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
+    if table.kind().is_ordered() && is_end_of_table_key(ctx, key) {
+        restore_table(ctx, handle, table)?;
+        return Err(badarg());
+    }
     let outcome = table.next(key, ctx.atoms());
     restore_table(ctx, handle, table)?;
     key_or_end(ctx, outcome?)
 }
 
 /// `ets:prev(Tab, Key)` — the key preceding `Key` (mirrors [`next_2`]).
+///
+/// Mirroring [`last_1`]'s alias: a **hash** kind answers with the *forward* step
+/// ([`Table::next`] — the oracle's behaviour: `prev` is aliased to `next` there),
+/// only an `ordered_set` with the real predecessor. The chosen primitive's
+/// `badarg` (a hash kind requires the anchor key to be present) propagates
+/// unchanged. Verified against the system `erl` (OTP 29.1.1 / erts-17.1): keys
+/// `[6,3,4,8,1]` give `next(T,3)` `4`/`prev(T,3)` `4` for a `set` and
+/// `next(T,3)` `4`/`prev(T,3)` `1` for an `ordered_set`.
 fn prev_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let key = args[1];
     let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
-    let outcome = table.prev(key, ctx.atoms());
+    if table.kind().is_ordered() && is_end_of_table_key(ctx, key) {
+        restore_table(ctx, handle, table)?;
+        return Err(badarg());
+    }
+    let outcome = if table.kind().is_ordered() {
+        table.prev(key, ctx.atoms())
+    } else {
+        table.next(key, ctx.atoms())
+    };
     restore_table(ctx, handle, table)?;
     key_or_end(ctx, outcome?)
 }
@@ -1301,8 +1377,16 @@ pub(super) fn dispatch_continuation(
 ///
 /// The resume is **read**-gated as the calling process against the continuation's
 /// table (`erl_db.c`'s `ets_select_1` calls `db_get_table` with `DB_READ`), and the
-/// check runs *before* the continuation is consumed, so a denied resume gives the
-/// oracle's `badarg` and leaves the traversal resumable.
+/// check runs *before* the state is read, so a denied resume gives the oracle's
+/// `badarg` and leaves the traversal resumable.
+///
+/// **The resume never consumes the continuation.** The registry entry is read
+/// (cloned) and left in place, so the same continuation may be resumed any number
+/// of times with an identical result — the oracle's continuation is an immutable
+/// value, not a live cursor, and an unrelated table operation does not invalidate
+/// it. A continuation whose table has since been deleted (or whose `named_table`
+/// name was renamed away) is still `badarg`: the table lookup / the `beam_ets`
+/// identity check inside `resume` reject it.
 pub(super) fn resume_continuation(
     ctx: &mut BifContext<'_>,
     cont_term: Eterm,
@@ -1318,7 +1402,7 @@ pub(super) fn resume_continuation(
     }
     let (table_handle, cont, reverse) = {
         let tables = ctx.tables().ok_or_else(unsupported_bif)?;
-        tables.take_continuation(handle).ok_or_else(badarg)?
+        tables.continuation(handle).ok_or_else(badarg)?
     };
 
     let table = take_table(ctx, table_handle)?;
@@ -1440,6 +1524,36 @@ pub(super) fn key_or_end(ctx: &mut BifContext<'_>, key: Option<Eterm>) -> Result
         Some(key) => copy_out(key, ctx),
         None => ctx.intern_atom(END_OF_TABLE),
     }
+}
+
+/// Whether `key` is the atom `'$end_of_table'` — the anchor an **`ordered_set`**
+/// `next`/`prev`/`next_lookup`/`prev_lookup` rejects with `badarg`.
+///
+/// The C `db_next_tree_common`/`db_prev_tree_common`
+/// (`../../erts/emulator/beam/erl_db_tree.c:654,729`) return `DB_ERROR_BADKEY`
+/// unconditionally on that atom — even when it is a *stored* key of the tree — so
+/// the four ordered walkers must raise `badarg` instead of reading it as a range
+/// bound. A hash kind does **not** special-case it (`db_next_hash_common` merely
+/// requires the anchor be present), so this predicate is consulted only for an
+/// `ordered_set`; a hash kind whose stored key really is `'$end_of_table'` keeps
+/// working.
+pub(super) fn is_end_of_table_key(ctx: &BifContext<'_>, key: Eterm) -> bool {
+    is_atom(key) && ctx.atoms().name(atom_val(key)) == Some(END_OF_TABLE)
+}
+
+/// Whether `table`'s interior implements a genuine **backward** key walk.
+///
+/// Only an `ordered_set` does. The hash interiors (`set`/`bag`/`duplicate_bag`)
+/// define no `last_key`/`prev_key`, so the oracle **aliases** the reverse
+/// navigators to the forward ones for them — `ets:last/1` ≡ `ets:first/1`,
+/// `ets:prev/2` ≡ `ets:next/2`, `ets:last_lookup/1` ≡ `ets:first_lookup/1` and
+/// `ets:prev_lookup/2` ≡ `ets:next_lookup/2` (pinned in [`nav`]).
+///
+/// This is the single home of that rule: the `nav` bridge and the `adopt` fun-folds
+/// both key off it, and `beam_ets::Table::last`/`prev` are left alone so the
+/// interior keeps its own semantics.
+pub(super) fn has_backward_walk(table: &Table) -> bool {
+    table.kind().is_ordered()
 }
 
 /// The 1-based element position argument of `lookup_element`/`update_element`,
@@ -1671,6 +1785,15 @@ mod tests {
     fn new_table(ctx: &mut BifContext<'_>, name: &str) -> Eterm {
         let name = ctx.atom(name).expect("seeded");
         let kind = ctx.atom("set").expect("seeded");
+        let opts = ctx.list(&[kind]).expect("fits");
+        new_2(ctx, &[name, opts]).expect("ets:new")
+    }
+
+    /// Creates a table of `kind` in `ctx` and returns its handle (like
+    /// [`new_table`], which fixes the `set` kind).
+    fn new_table_of(ctx: &mut BifContext<'_>, name: &str, kind: &str) -> Eterm {
+        let name = ctx.atom(name).expect("seeded");
+        let kind = ctx.atom(kind).expect("seeded");
         let opts = ctx.list(&[kind]).expect("fits");
         new_2(ctx, &[name, opts]).expect("ets:new")
     }
@@ -2181,6 +2304,95 @@ mod tests {
             next_2(&mut ctx, &[handle, b]),
             Err(BeamError::BadArg)
         ));
+    }
+
+    /// The `'$end_of_table'` **anchor** is `badarg` for the `ordered_set` walkers
+    /// `ets:next/2` and `ets:prev/2` (the `*_lookup` pair is pinned in
+    /// [`super::nav`]) — even when that atom is itself a **stored** key, and even
+    /// on an empty table.
+    ///
+    /// The C `db_next_tree_common`/`db_prev_tree_common`
+    /// (`../../erts/emulator/beam/erl_db_tree.c:654,729`) return `DB_ERROR_BADKEY`
+    /// unconditionally on `am_EOT`, so the atom is never read as a range bound. A
+    /// hash kind has no such special-case (`db_next_hash_common`), so there the
+    /// atom is an ordinary key.
+    ///
+    /// Oracle probe (`erl -noshell`, OTP 29.1.1 / erts-17.1), an `ordered_set`
+    /// holding `{1,1},{2,2},{3,3}`: `ets:next(T,'$end_of_table')` and
+    /// `ets:prev(T,'$end_of_table')` both raise `badarg`; storing
+    /// `'$end_of_table'` as a key leaves both `badarg`; an empty `ordered_set` is
+    /// `badarg` too.
+    #[test]
+    fn ordered_set_next_and_prev_reject_the_end_of_table_anchor() {
+        let (mut heap, atoms, mut reg) = parts();
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut reg);
+        let handle = new_table_of(&mut ctx, "mytab", "ordered_set");
+        let eot = ctx.atom(END_OF_TABLE).expect("seeded");
+
+        // An empty `ordered_set` rejects the anchor as well.
+        assert!(matches!(
+            next_2(&mut ctx, &[handle, eot]),
+            Err(BeamError::BadArg)
+        ));
+        assert!(matches!(
+            prev_2(&mut ctx, &[handle, eot]),
+            Err(BeamError::BadArg)
+        ));
+
+        // Three integer-keyed objects: an *absent* anchor that is not the walk's
+        // terminator is still rejected (the C checks the atom before any range
+        // logic), while the ordinary walks are unaffected.
+        let one = ctx.int(1).expect("fits");
+        let two = ctx.int(2).expect("fits");
+        let three = ctx.int(3).expect("fits");
+        let a = ctx.atom("a").expect("seeded");
+        for key in [one, two, three] {
+            let obj = ctx.tuple(&[key, a]).expect("fits");
+            insert_2(&mut ctx, &[handle, obj]).expect("insert");
+        }
+        assert_eq!(next_2(&mut ctx, &[handle, one]).expect("next(1)"), two);
+        assert_eq!(prev_2(&mut ctx, &[handle, three]).expect("prev(3)"), two);
+        assert!(matches!(
+            next_2(&mut ctx, &[handle, eot]),
+            Err(BeamError::BadArg)
+        ));
+        assert!(matches!(
+            prev_2(&mut ctx, &[handle, eot]),
+            Err(BeamError::BadArg)
+        ));
+
+        // The atom **stored** as a key: the anchor is rejected even though it is
+        // present in the tree (the C rejects `am_EOT` before it ever looks it up).
+        let eot_obj = ctx.tuple(&[eot, eot]).expect("fits");
+        insert_2(&mut ctx, &[handle, eot_obj]).expect("insert");
+        assert!(matches!(
+            next_2(&mut ctx, &[handle, eot]),
+            Err(BeamError::BadArg)
+        ));
+        assert!(matches!(
+            prev_2(&mut ctx, &[handle, eot]),
+            Err(BeamError::BadArg)
+        ));
+
+        // Every rejection restored the table: the real walk still answers.
+        assert_eq!(next_2(&mut ctx, &[handle, one]).expect("still live"), two);
+
+        // A hash kind is unaffected: with the atom stored it is an ordinary key,
+        // so `ets:next/2` walks from it and `ets:prev/2` aliases that step.
+        let hashed = new_table_of(&mut ctx, "mytab", "set");
+        for obj in [
+            ctx.tuple(&[one, a]).expect("fits"),
+            ctx.tuple(&[eot, a]).expect("fits"),
+        ] {
+            insert_2(&mut ctx, &[hashed, obj]).expect("insert");
+        }
+        let next = next_2(&mut ctx, &[hashed, eot]).expect("next(eot) on a set is not badarg");
+        let prev = prev_2(&mut ctx, &[hashed, eot]).expect("prev(eot) on a set is not badarg");
+        assert!(
+            beam_term::compare::eq(next, prev, &atoms),
+            "a hash kind aliases prev to next"
+        );
     }
 
     #[test]

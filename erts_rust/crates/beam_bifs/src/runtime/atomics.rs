@@ -124,10 +124,34 @@ const ERTS_CACHE_LINE_SIZE: u64 = 64;
 /// `ATOMICS_PER_CACHE_LINE` — the number of 64-bit counters that fit one cache line.
 const ATOMICS_PER_CACHE_LINE: u64 = ERTS_CACHE_LINE_SIZE / 8;
 
-/// `ATOMICS_PER_COUNTER` — the C replicates each counter once per scheduler (plus a
-/// slot 0) so the per-scheduler updates do not share a cache line. This runtime has
-/// no per-scheduler replication; it reports the *modelled* size of the C's layout
-/// (see [`counters_info_1`]).
+/// `ATOMICS_PER_COUNTER` (`erl_bif_counters.c:50`) — how many 64-bit atomic
+/// instances the C replicates per logical counter: `erts_no_schedulers + 1` (one
+/// instance per **normal scheduler** plus the "base value" slot 0).
+///
+/// # The real dependency, what this models, and where it diverges
+///
+/// The real dependency is the emulator's normal-scheduler count —
+/// `erlang:system_info(schedulers)`, i.e. `+S N` when the emulator is started with
+/// one, else the machine's processor count. A [`BifFn`](crate::registry::BifFn) has
+/// **no seam to that count**: `BifContext` carries none, and `beam_bifs` may not
+/// depend on `beam_rt`, which owns `RuntimeConfig::emulator.schedulers`
+/// (`beam_rt/src/info.rs::schedulers_count`). This therefore reports the default that
+/// the oracle *and this runtime* both use — the host's logical parallelism
+/// (`std::thread::available_parallelism` — `beam_rt`'s own
+/// `system_info(schedulers)` fallback; `1` when the platform cannot report it) — plus
+/// the C's slot 0.
+///
+/// Divergence: an oracle started with an explicit `+S N` reports `N + 1` instead.
+/// Verified on a 16-processor host (where the formula above is exact:
+/// `N = 1..8 → 1120`, `9..16 → 2208`, `17..24 → 3296`, `64 → 8736`): `erl +S 1` ⇒
+/// `N = 1 → 160`, `+S 2` ⇒ `224`, `+S 4` ⇒ `352`, `+S 8` ⇒ `608`. A host whose
+/// `available_parallelism()` differs from the oracle's processor count (an affinity
+/// restriction or a container cgroup limit) diverges the same way. This BIF has no
+/// way to read the runtime's configured count, so it cannot track `+S`; the figure
+/// stays an *approximation*, which is what the oracle's own contract is — its
+/// `counters:info/1` documentation calls `memory` "Approximate memory consumption for
+/// the array in bytes". A typed capability gap for the whole BIF would be worse: it
+/// would discard the exactly-correct `size` for no gain.
 fn atomics_per_counter() -> u64 {
     std::thread::available_parallelism()
         .map(|n| n.get() as u64)
@@ -185,18 +209,46 @@ fn bignum_magnitude(term: Eterm) -> Result<(bool, Vec<u64>)> {
     Ok((negative, magnitude))
 }
 
-/// `term_to_UWord` for a *non-negative* integer (`erl_bif_atomics.c:64`).
+/// `term_to_UWord` for a *non-negative* integer (`erl_bif_atomics.c:64`) — the
+/// arity / index / `Opts` conversion shared by every BIF here.
 ///
-/// A small integer is its value; a bignum is `badarg` (every BIF that uses this —
-/// an arity, an index, `Opts` — bounds the value to the small range anyway, so the
-/// C's `SYSTEM_LIMIT` for an out-of-`UWord` bignum is reported here as its documented
-/// `badarg`), and any other term (negative, float, atom, list, ...) is `badarg`.
+/// On this 64-bit target C's `term_to_UWord` is `term_to_Uint` (`big.c:3505-3538`),
+/// whose bignum arm is the one that matters: a small integer is its value when
+/// non-negative, a **non-negative bignum** is accepted iff it fits a single
+/// `ErtsDigit` (`big_size(term) * D_EXP <= 64`, `D_EXP = 64` on 64-bit —
+/// `big.h:55`) with that digit as the value, and a **wider** bignum answers
+/// `SYSTEM_LIMIT` (not `badarg`); a negative integer and every non-integer term (a
+/// float, an atom, a list, ...) answer `BADARG`.
+///
+/// Verified against the oracle (OTP 29.1.1 / erts-17.1): the one-limb bignum
+/// `1 bsl 59` (`2^59`) is accepted — `erts_internal:atomics_new(3, 1 bsl 59)` builds
+/// an **unsigned** array, because `Opts` reads only bit 0 — while the two-limb
+/// `2 bsl 63` (`2^64`) and `counters_new(1 bsl 59)` answer `error:system_limit`, and
+/// a **negative** bignum (`-(1 bsl 59)`) answers `error:badarg`.
+///
+/// Callers differ in how they forward a `SYSTEM_LIMIT`: [`atomics_new`] and
+/// [`counters_new`] propagate it (the C's `BIF_ERROR(BIF_P, cnt)`), while the index
+/// path collapses *every* failure to `badarg` ([`index_of`]) because the C reaches
+/// `term_to_UWord` through an `&&` chain.
 fn term_to_uword(term: Eterm) -> Result<u64> {
     if access::is_small(term) {
         let value = signed_value(term);
         if value >= 0 {
             return Ok(value as u64);
         }
+        return Err(badarg());
+    }
+    if access::is_big(term) {
+        let (negative, magnitude) = bignum_magnitude(term)?;
+        if negative {
+            return Err(badarg());
+        }
+        return match magnitude.as_slice() {
+            [] => Ok(0),
+            [limb] => Ok(*limb),
+            // `big_size(term) * D_EXP > sizeof(Uint) * 8` (`big.c:3524`).
+            _ => Err(system_limit()),
+        };
     }
     Err(badarg())
 }
@@ -277,8 +329,14 @@ fn get_incr(term: Eterm) -> Result<i64> {
 ///
 /// `1 <= ix <= len`; a non-integer, `0`, a negative value, a float or a value past
 /// the end is `badarg` (C's `--ix < vlen`, `erl_bif_atomics.c:113-119`).
+///
+/// C reaches the conversion through `get_ref_ix`'s `&&` chain
+/// (`get_ref(ref, pp) && term_to_UWord(ix, &ixp) && --(*ixp) < (*pp)->vlen`,
+/// `erl_bif_atomics.c:104-107`), so **every** `term_to_UWord` failure is reported as
+/// this BIF's `badarg` — including the `SYSTEM_LIMIT` of an over-wide bignum index.
+/// Verified: `atomics:get(R, 1 bsl 63)` ⇒ `error:badarg` (not `system_limit`).
 fn index_of(len: usize, term: Eterm) -> Result<usize> {
-    let ix = term_to_uword(term)?;
+    let ix = term_to_uword(term).map_err(|_| badarg())?;
     if ix == 0 || ix > len as u64 {
         return Err(badarg());
     }
@@ -338,6 +396,11 @@ fn with_counters<R>(handle: Eterm, f: impl FnOnce(&mut Vec<i64>) -> Result<R>) -
 /// (`OPT_SIGNED`) selects signedness; every other bit is ignored (`(3,0)` and
 /// `(3,2)` are unsigned, `(3,1)` and `(3,3)` signed). All cells start at `0`; the
 /// handle is returned.
+///
+/// Both arguments go through [`term_to_uword`], so a one-limb bignum is legal in
+/// either position (`Opts` `1 bsl 59` is a real — unsigned — option value) and a
+/// wider one is the C's `system_limit`. An `Arity` too large for the allocator stays
+/// a typed `system_limit`, never an abort.
 fn atomics_new(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let cnt = term_to_uword(args[0])?;
     if cnt == 0 {
@@ -451,9 +514,11 @@ fn atomics_compare_exchange(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<
 /// order `max, memory, min, size`.
 ///
 /// `Max`/`Min` are the signedness bounds (`i64::MAX`/`i64::MIN`, or `u64::MAX`/`0`),
-/// `size` is the cell count and `memory` is the C's `40 + 8 * size` magic-binary
-/// size (`ertas_magic_ref2bin(...)->orig_size`, verified: 1→48, 3→64, 8→104,
-/// 1000→8040).
+/// `size` is the cell count and `memory` is the C's `erts_magic_ref2bin(ref)->orig_size`
+/// — `32 + 8 + 8 * size`, i.e. the 32-byte magic-binary header plus the
+/// `AtomicsRef { is_signed, vlen, v[size] }` payload. Unlike `counters`, this layout has
+/// **no** scheduler-dependent term, so the figure is exact for every `N` (verified:
+/// `1→48`, `3→64`, `8→104`, `9→112`, `1000→8040`, `10000→80040`, `100000→800040`).
 fn atomics_info(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let id = access::ref_thing_id(args[0])?;
     let (signed, n) = {
@@ -555,14 +620,14 @@ fn counters_put(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `erts_internal:counters_info(Ref)` (`erl_bif_counters.c:238`) — the flat map
 /// `#{memory => M, size => N}` in the oracle's key order `memory, size`.
 ///
-/// `size` is the counter count and `memory` is the C layout's modelled size:
-/// `32 + ATOMICS_PER_COUNTER * ceil(N / ATOMICS_PER_CACHE_LINE) * 64`, where
-/// `ATOMICS_PER_COUNTER` is `available_parallelism() + 1` (the C replicating one
-/// counter slot per scheduler plus slot 0). This is an **ERTS-model approximation**:
-/// this runtime does not reproduce the per-scheduler cache-line replication, so on a
-/// host whose parallelism differs from the oracle's scheduler count the reported
-/// `memory` differs (verified on a 16-scheduler oracle: 1→1120, 2→1120, 16→2208,
-/// 64→8736).
+/// `size` is the counter count (the C's `p->arity`) and `memory` is
+/// `erts_magic_ref2bin(ref)->orig_size` of the C's magic binary, whose layout is
+/// `32 + ATOMICS_PER_COUNTER * ceil(N / ATOMICS_PER_CACHE_LINE) * 64` — the 32-byte
+/// magic-binary header, then one 64-byte cache line per group of 8 counters, once per
+/// scheduler instance ([`atomics_per_counter`], which documents what this models and
+/// the `+S N` divergence). Verified byte-exact on a 16-processor host: `1 → 1120`,
+/// `8 → 1120`, `9 → 2208`, `17 → 3296`, `64 → 8736`, `1000 → 136032`,
+/// `10000 → 1360032`. Only `ATOMICS_PER_COUNTER` is scheduler-dependent.
 fn counters_info(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let id = access::ref_thing_id(args[0])?;
     let n = {
@@ -1057,6 +1122,90 @@ mod tests {
             let got = reg.call("erts_internal", "counters_get", 2, ctx, &[c, one]).unwrap();
             let minus_one = ctx.int(-1).unwrap();
             assert_eq!(got, minus_one);
+        });
+    }
+
+    /// The C's `term_to_UWord` is `term_to_Uint` on this 64-bit target
+    /// (`big.c:3505-3538`), so a **one-limb** non-negative bignum is a legal
+    /// `Arity`/`Index`/`Opts`, a wider one is `system_limit` at the arity/`Opts`
+    /// positions, and a negative one is `badarg`.
+    ///
+    /// Oracle (OTP 29.1.1 / erts-17.1):
+    /// `erts_internal:atomics_new(3, 1 bsl 59)` builds an unsigned array (only `Opts`
+    /// bit 0 is read); `atomics_new(3, 2 bsl 63)` and `counters_new(1 bsl 59)` ⇒
+    /// `error:system_limit`; `atomics_new(3, -(1 bsl 59))` ⇒ `error:badarg`; and
+    /// `atomics:get(R, 1 bsl 63)` ⇒ `error:badarg` (**not** `system_limit` — C's
+    /// `get_ref_ix` reaches the conversion through an `&&` chain).
+    #[test]
+    fn bignum_arguments_follow_the_oracles_classes() {
+        with_runtime(|reg, ctx| {
+            let three = ctx.int(3).unwrap();
+            let zero = ctx.int(0).unwrap();
+            // `2^59` — the smallest non-negative bignum (one 64-bit limb).
+            let one_limb = crate::arith::int_from_mag(ctx, false, &[1u64 << 59]).unwrap();
+            // `2^64` — two limbs (`[0, 1]` little-endian).
+            let two_limbs = crate::arith::int_from_mag(ctx, false, &[0, 1]).unwrap();
+            // `-(2^59)` — a negative bignum.
+            let negative = crate::arith::int_from_mag(ctx, true, &[1u64 << 59]).unwrap();
+
+            // A one-limb `Opts` is accepted; only bit 0 is read, so `2^59` is unsigned.
+            let r = reg
+                .call("erts_internal", "atomics_new", 2, ctx, &[three, one_limb])
+                .expect("a one-limb bignum Opts is legal");
+            let info = reg.call("atomics", "info", 1, ctx, &[r]).unwrap();
+            let unsigned_max = crate::arith::int_from_mag(ctx, false, &[u64::MAX]).unwrap();
+            assert!(eq(ctx, map_value(ctx, info, "max"), unsigned_max));
+            assert_eq!(map_value(ctx, info, "size"), ctx.int(3).unwrap());
+            assert_eq!(map_value(ctx, info, "memory"), ctx.int(64).unwrap());
+
+            // ... and `2^59 + 1` has bit 0 set, so it selects the *signed* form.
+            let odd = crate::arith::int_from_mag(ctx, false, &[(1u64 << 59) | 1]).unwrap();
+            let s = reg
+                .call("erts_internal", "atomics_new", 2, ctx, &[three, odd])
+                .expect("a one-limb bignum Opts with bit 0 set");
+            let info = reg.call("atomics", "info", 1, ctx, &[s]).unwrap();
+            let signed_max = crate::arith::int_from_i64(ctx, i64::MAX).unwrap();
+            assert!(eq(ctx, map_value(ctx, info, "max"), signed_max));
+
+            // A wider bignum is `system_limit` where the C propagates
+            // `term_to_UWord`'s failure code.
+            assert!(matches!(
+                reg.call("erts_internal", "atomics_new", 2, ctx, &[three, two_limbs]),
+                Err(BeamError::SystemLimit)
+            ));
+            assert!(matches!(
+                reg.call("erts_internal", "counters_new", 1, ctx, &[one_limb]),
+                Err(BeamError::SystemLimit)
+            ));
+
+            // A negative bignum is `badarg`.
+            assert_badarg(reg.call(
+                "erts_internal",
+                "atomics_new",
+                2,
+                ctx,
+                &[negative, zero],
+            ));
+
+            // The index path collapses the over-wide bignum to `badarg`, exactly like
+            // C's `get_ref_ix` `&&` chain (the oracle answers `badarg` here).
+            assert_badarg(reg.call("atomics", "get", 2, ctx, &[r, two_limbs]));
+            let c = new_counters(reg, ctx, 2);
+            assert_badarg(reg.call(
+                "erts_internal",
+                "counters_get",
+                2,
+                ctx,
+                &[c, two_limbs],
+            ));
+
+            // A one-limb bignum `Arity` is a legal (absurd) size; the C would attempt a
+            // ~4 EiB allocation, this runtime answers the typed `system_limit` instead
+            // of aborting.
+            assert!(matches!(
+                reg.call("erts_internal", "atomics_new", 2, ctx, &[one_limb, zero]),
+                Err(BeamError::SystemLimit)
+            ));
         });
     }
 

@@ -22,7 +22,8 @@
 //!
 //! The perf map is the diagnostic that names the native code a scheduled process can run,
 //! so it may only ever hold ranges the baseline backend actually mapped. This is the one
-//! hook that fills it, called once per module-export first entry.
+//! hook that fills it, called from the slice
+//! ([`RuntimeRunner::run`](super::run::RuntimeRunner)) once per module-export first entry.
 
 use beam_loader::Module;
 
@@ -34,10 +35,13 @@ use crate::runtime::Runtime;
 /// The perf map is the diagnostic that names the native code a scheduled process can run, so
 /// it may only ever hold ranges the baseline backend actually mapped
 /// ([`baseline_code_map`](beam_engine::jit::cache::baseline_code_map) -- which compiles the
-/// module on first sight, so the ranges are its own artifact's) -- never a synthesised one.
-/// Diagnostic-only by contract: a disabled flag returns without compiling anything, and a
-/// compile or write failure is *recorded* in the map's own diagnostic slot rather than
-/// propagated, exactly as the oracle logs it and carries on (a perf file must never fail a run).
+/// module into the per-thread baseline cache on first sight, so the ranges are its own
+/// artifact's) -- never a synthesised one. The slice calls this once per module-export first
+/// entry, whatever execution tier that slice runs on; a fun entry, a resume and a run that
+/// never enters a module export through the runner feed nothing. Diagnostic-only by contract:
+/// a disabled flag returns without compiling anything, and a compile or write failure is
+/// *recorded* in the map's own diagnostic slot rather than propagated, exactly as the oracle
+/// logs it and carries on (a perf file must never fail a run).
 pub(super) fn record_baseline_code(runtime: &mut Runtime, module: &Module) {
     if !runtime.perf_map().config().map_enabled() {
         return;

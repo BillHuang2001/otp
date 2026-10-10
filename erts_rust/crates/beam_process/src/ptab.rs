@@ -53,6 +53,13 @@
 //! (external-pid) or **port** signal does not: it would carry no `trap_exit` policy decision
 //! to defer, so `node_down`/`port_closed` materialise it straight into the mailbox.
 //!
+//! Every signal-builder path handles a full receiver heap exactly as
+//! [`Process::deliver`](crate::process::Process::deliver) does (through
+//! [`grow_receiver_for_signal`]): the nursery is collected and grown **on demand** to cover the
+//! refused request and the build is retried once, so an oversized `{'EXIT', …}`/`{'DOWN', …}`
+//! reason is still delivered; a **relocation-exempt** receiver instead surfaces the raw
+//! `BeamError::Alloc` refusal unchanged (no collection, no growth, no retry).
+//!
 //! Legacy C ground truth (read-only): `erts/emulator/beam/erl_ptab.{c,h}` (the process/port
 //! table and the local name registry), `erl_process.c` (`erts_ptab_new_process`) and
 //! `erl_proc_sig_queue.c` (the signal queue this module reproduces).
@@ -60,7 +67,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use beam_alloc::Heap;
-use beam_common::{BeamError, Result};
+use beam_common::{AllocFailure, AllocKind, BeamError, Result};
 use beam_gc::HeapPolicy;
 use beam_message::{Message, MsoHandle, OffHeapTable};
 use beam_term::prelude::{atom_val, is_atom, is_immediate, make_atom, Atom, Eterm};
@@ -136,21 +143,57 @@ fn lookup_mut(slots: &mut [Slot], pid: ProcessId) -> Option<&mut Process> {
     slot.process.as_mut()
 }
 
+/// The receive-side heap-exhaustion policy every signal builder shares with
+/// [`Process::deliver`](crate::process::Process::deliver).
+///
+/// Copying a signal onto a receiver's heap can be refused because the nursery is full — a
+/// *normal* condition, not fatal OOM. A **relocation-exempt** receiver
+/// ([`Process::is_relocation_exempt`](crate::process::Process::is_relocation_exempt)) must not
+/// collect or grow (the host holds live words outside the crate root set, so relocating would
+/// recycle them), so the raw [`BeamError::Alloc`] refusal is returned **unchanged** and the
+/// caller surfaces it — the same raw-refusal contract `deliver` honours. Otherwise the nursery
+/// is collected and grown **on demand** to cover the refused request
+/// ([`Process::ensure_capacity`](crate::process::Process::ensure_capacity), seeded with the word
+/// count the copier reported), and the caller retries once; `Ok(())` means "retry now".
+fn grow_receiver_for_signal(process: &mut Process, failure: AllocFailure) -> Result<()> {
+    if process.is_relocation_exempt() {
+        // The heap cannot be moved under the host's unpublished roots: hand the refusal back
+        // verbatim (`kind` still Heap/Message) — no collection, no growth, no retry.
+        return Err(BeamError::Alloc(failure));
+    }
+    // The copier reports the whole graph's flat word count in the failure (as bytes), so the
+    // words the growth must cover are recoverable from it.
+    let need_words = failure.requested / core::mem::size_of::<Eterm>();
+    // The growth's own error is deliberately ignored, exactly as `Process::deliver` documents:
+    // when the policy's ceiling makes the request unreachable, `ensure_capacity` fails
+    // fail-fast without touching the collector, and the caller's retry reproduces the refusal.
+    // The retry's own result is authoritative — this is not a silent swallow.
+    let _growth = process.ensure_capacity(need_words);
+    Ok(())
+}
+
 /// Builds a signal term — together with the handles of the off-heap objects it owns — on
-/// `process`'s heap, collecting once and retrying when the heap is exhausted (a full heap is a
-/// normal condition, not fatal OOM).
+/// `process`'s heap, retrying once after a collect-and-grow when the heap is exhausted (a full
+/// heap is a normal condition, not fatal OOM).
 ///
 /// `build` returns whatever the caller needs (the term plus the handles of the fresh off-heap
 /// table it copied into, or the term plus extra terms materialised on the same heap). It creates
 /// that table itself, so a retry always starts from a clean table and never reuses a stale handle.
+///
+/// Exhaustion is handled exactly as [`Process::deliver`](crate::process::Process::deliver)
+/// handles it, through [`grow_receiver_for_signal`]: a **relocation-exempt** `process` surfaces
+/// the raw [`BeamError::Alloc`] refusal unchanged, otherwise the nursery is collected and grown
+/// on demand and `build` is retried once.
 fn build_signal_term<T, F>(process: &mut Process, build: F) -> Result<T>
 where
     F: Fn(&mut Heap) -> Result<T>,
 {
     match build(process.heap_mut()) {
         Ok(built) => Ok(built),
-        Err(BeamError::Alloc(_)) => {
-            process.collect()?;
+        Err(BeamError::Alloc(failure))
+            if matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
+        {
+            grow_receiver_for_signal(process, failure)?;
             build(process.heap_mut())
         }
         Err(error) => Err(error),
@@ -159,7 +202,9 @@ where
 
 /// Copies `reason` — whose heap is described by `src_off_heap` — into `process`'s own heap,
 /// registering every referenced off-heap object in the process's own off-heap table, and
-/// returns the copied term. Collects once and retries on heap exhaustion.
+/// returns the copied term. Retries once after a collect-and-grow on heap exhaustion
+/// ([`grow_receiver_for_signal`]): a **relocation-exempt** `process` surfaces the raw
+/// [`BeamError::Alloc`] refusal unchanged rather than collecting or growing.
 ///
 /// `None` means the reason is already owned by `process` (a process signalling itself) and is
 /// returned unchanged.
@@ -173,8 +218,10 @@ fn copy_reason_onto(
     };
     match process.copy_into_heap(reason, src) {
         Ok(copied) => Ok(copied),
-        Err(BeamError::Alloc(_)) => {
-            process.collect()?;
+        Err(BeamError::Alloc(failure))
+            if matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
+        {
+            grow_receiver_for_signal(process, failure)?;
             process.copy_into_heap(reason, src)
         }
         Err(error) => Err(error),
@@ -234,7 +281,7 @@ fn snapshot_off_heap(src: &OffHeapTable) -> OffHeapTable {
 /// enqueued (`enqueue_exit_signal`), so the delivered reason always resides in the recipient's
 /// own heap. This deliberately does **not** collect on heap exhaustion — a collection would
 /// relocate `reason`, turning the raw word stale — so a full heap surfaces as
-/// `BeamError::Alloc` and the caller retries after a collection with a freshly read reason
+/// `BeamError::Alloc` and the caller retries after a collect-and-grow with a freshly read reason
 /// (see [`ProcessTable::deliver_head_signal`]).
 ///
 /// # Errors
@@ -1279,8 +1326,9 @@ impl ProcessTable {
     ///
     /// # Errors
     ///
-    /// Returns `BeamError::TermNotFound` when the pid is unknown; propagates the
-    /// propagation's allocation and signalling errors.
+    /// Returns `BeamError::TermNotFound` when the pid is unknown. Once the pid **is** live the
+    /// termination completes: a per-peer signalling failure is dropped-and-logged and the cascade
+    /// continues (see [`ProcessTable::terminate_into`]), so this returns `Ok(())` for a live pid.
     pub fn terminate(&mut self, pid: ProcessId, reason: Eterm) -> Result<()> {
         let mut ports: Option<&mut PortTable> = None;
         self.terminate_and_cascade(&mut ports, pid, reason)
@@ -1340,6 +1388,30 @@ impl ProcessTable {
     /// outgoing [`PortWatch`]es then remove their incoming [`PortMonitor`](crate::port::PortMonitor)
     /// entries. The **process-death observer** (see [`ProcessExitObserver`]) is notified exactly
     /// once, here, after the death has been propagated and before `drop(process)`.
+    ///
+    /// # Best-effort propagation (a dying process's termination always completes)
+    ///
+    /// `pid` is reclaimed **first** (the `take` below bumps its slot serial), so by the time the
+    /// per-peer signals are generated the death has *already happened*. Every per-peer step is
+    /// therefore **best-effort**: a failure to queue a local `{'EXIT', …}`/`{'DOWN', …}` (an
+    /// unreachable receiver heap, or a relocation-exempt receiver refusing to grow) or to route a
+    /// remote [`DistSignal::Exit`] is **logged** — never silently swallowed — and the cascade
+    /// **continues** to the remaining peers, so the process-death observer (step 5) and the port
+    /// monitor cleanup (step 6) always run. Aborting mid-cascade instead would leave later peers
+    /// unsignalled, the observer unrun (leaking the host resources it releases, e.g. ETS tables
+    /// owned by the pid) and the port table holding dangling incoming `PortMonitor` entries.
+    ///
+    /// This mirrors what ERTS does with a control signal it cannot deliver: the signal is
+    /// **dropped and logged** (`erts_dsig_drop` / `dist.c` — a down remote node, an unreachable
+    /// peer), never turned into an abort of the death. A watcher's outgoing monitor record is
+    /// resolved regardless of whether its `{'DOWN', …}` reached the wire, because the target is
+    /// gone and a retained record could never be resolved.
+    ///
+    /// # Errors
+    ///
+    /// Always `Ok(())` today: the process is already reclaimed when the cascade starts, so there
+    /// is no remaining table-level failure to report. The `Result` is retained so a genuine
+    /// table-level failure can be surfaced without changing every caller.
     fn terminate_into(
         &mut self,
         ports: &mut Option<&mut PortTable>,
@@ -1387,6 +1459,10 @@ impl ProcessTable {
 
         // 1. Links: drop the back-link, then queue an exit signal on the peer. The peer decides
         //    (through `exit_policy`, at service time) whether it terminates or traps.
+        //
+        //    Best-effort (see the fn docs): a peer whose heap cannot take the reason copy is
+        //    dropped-and-logged and the cascade continues — `pid` is already reclaimed, so the
+        //    remaining peers must still be told.
         for target in links {
             if let Some(peer) = self.get_mut(target) {
                 peer.links_mut().remove(pid);
@@ -1395,7 +1471,17 @@ impl ProcessTable {
                 // The peer died earlier in this same propagation.
                 continue;
             }
-            self.enqueue_exit_signal(target, pid, reason, Some(process.off_heap()))?;
+            if let Err(failure) =
+                self.enqueue_exit_signal(target, pid, reason, Some(process.off_heap()))
+            {
+                beam_common::beam_error!(
+                    "beam_process: dropping exit signal {:?} -> {:?}: {:?}; termination continues",
+                    pid,
+                    target,
+                    failure
+                );
+                continue;
+            }
             receivers.push(target);
         }
 
@@ -1418,7 +1504,7 @@ impl ProcessTable {
                 continue;
             }
             let tag = self.tags.get(&watcher.reference).copied();
-            self.enqueue_down_signal(
+            let queued = match self.enqueue_down_signal(
                 watcher.watcher,
                 watcher.reference,
                 pid,
@@ -1426,12 +1512,32 @@ impl ProcessTable {
                 tag,
                 reason,
                 Some(process.off_heap()),
-            )?;
+            ) {
+                Ok(()) => true,
+                Err(failure) => {
+                    // Best-effort (see the fn docs): the watcher's heap could not take the DOWN.
+                    // Log and carry on — the target is dead either way, so the outgoing record is
+                    // still resolved below (it could never be resolved afterwards), and the named
+                    // monitor's `{Name, node}` descriptor goes with it: nothing will ever
+                    // materialise the DOWN that would have consumed it.
+                    beam_common::beam_error!(
+                        "beam_process: dropping DOWN signal {:?} -> {:?}: {:?}; termination \
+                         continues",
+                        pid,
+                        watcher.watcher,
+                        failure
+                    );
+                    self.named_monitors.remove(&watcher.reference);
+                    false
+                }
+            };
             forget_tag(&mut self.tags, watcher.reference);
             if let Some(watcher_process) = self.get_mut(watcher.watcher) {
                 watcher_process.monitors_mut().remove(watcher.reference);
             }
-            receivers.push(watcher.watcher);
+            if queued {
+                receivers.push(watcher.watcher);
+            }
         }
 
         // 3. The dying process's own outgoing monitors vanish with it — and so do the
@@ -1450,18 +1556,33 @@ impl ProcessTable {
 
         // 4. Remote links and monitors: a dying process leaves the node's records, and every
         //    remote link partner must be told the process is gone. This runs before
-        //    `drop(process)` because `reason` may live in the dying heap the router reads.
+        //    `drop(process)` because `reason` may live in the dying heap the router reads. A
+        //    link partner's death is the **link** exit, so it routes `DistSignal::Exit`
+        //    (`DOP_EXIT`) — never `DistSignal::Exit2` (`erlang:exit/2`'s `DOP_EXIT2`).
+        //
+        //    Best-effort (see the fn docs): a router transport failure (a down remote node, an
+        //    I/O error) drops-and-logs that signal — exactly ERTS's `erts_dsig_drop` — and the
+        //    remaining partners are still routed; the death must not abort on a peer that cannot
+        //    be reached. `remote_links` was already drained, so no record is left behind.
         for remote in self.remote_links.remove(&pid).unwrap_or_default() {
-            self.route(DistSignal::Exit {
+            if let Err(failure) = self.route(DistSignal::Exit {
                 from: pid,
                 to: remote,
                 reason,
-            })?;
+            }) {
+                beam_common::beam_error!(
+                    "beam_process: dropping remote exit signal {:?} -> {:?}: {:?}; termination \
+                     continues",
+                    pid,
+                    remote,
+                    failure
+                );
+            }
         }
+
         // Outgoing *remote* monitors die with the watcher: the remote node will simply
         // never see a `DOP_DEMONITOR_P`, which mirrors the local case above.
         self.remote_monitors.remove(&pid);
-
         // 5. Notify the process-death observer exactly once, now that the death has been
         //    propagated and *before* `drop(process)`: `reason` may live in the dying heap, so the
         //    payload is only valid up to the drop below. The observer is isolated (a panic is
@@ -1474,14 +1595,24 @@ impl ProcessTable {
         //    (`erlang:port_info(Port, monitors)` would still list the dead pid). With no port
         //    table in hand this is skipped (the observer still saw the watches). A port that has
         //    already closed has drained its side, so an unallocated id is not an error.
+        //
+        //    Best-effort per watch (see the fn docs): one watch that cannot be cleaned must not
+        //    leave the remaining watches dangling.
         if let Some(ports) = ports.as_deref_mut() {
             for watch in &port_monitors {
                 if ports.contains(watch.port) {
-                    ports.demonitor(watch.port, watch.reference)?;
+                    if let Err(failure) = ports.demonitor(watch.port, watch.reference) {
+                        beam_common::beam_error!(
+                            "beam_process: port-monitor cleanup for {:?} on port {:?} failed: \
+                             {:?}; termination continues",
+                            pid,
+                            watch.port,
+                            failure
+                        );
+                    }
                 }
             }
         }
-
         // Every copy that read `reason` from the dying heap is done — release it.
         drop(process);
 
@@ -1660,11 +1791,14 @@ impl ProcessTable {
         }
     }
 
-    /// Builds the head signal's message, retrying once after a collection.
+    /// Builds the head signal's message, retrying once after a collect-and-grow on heap
+    /// exhaustion (the [`grow_receiver_for_signal`] policy `Process::deliver` follows).
     ///
     /// The queued signal is an in-heap sub-rootset, so a heap-exhaustion collection relocates
-    /// its `reason` in place: `build` is handed a freshly read reason each attempt. On success
-    /// the head signal is removed and a blocked `pid` is woken (and recorded on the wake list).
+    /// its `reason` in place: `build` is handed a freshly read reason each attempt. A
+    /// **relocation-exempt** recipient surfaces the raw `BeamError::Alloc` refusal unchanged —
+    /// no collection, no growth, no retry. On success the head signal is removed and a blocked
+    /// `pid` is woken (and recorded on the wake list).
     fn deliver_head_signal<F>(&mut self, pid: ProcessId, mut build: F) -> Result<()>
     where
         F: FnMut(&mut Self, Eterm) -> Result<()>,
@@ -1677,12 +1811,14 @@ impl ProcessTable {
             };
             match build(self, reason) {
                 Ok(()) => break,
-                Err(BeamError::Alloc(_)) if attempt == 0 => {
+                Err(BeamError::Alloc(failure))
+                    if attempt == 0 && matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
+                {
                     attempt += 1;
                     let Some(recipient) = lookup_mut(&mut self.slots, pid) else {
                         return Ok(());
                     };
-                    recipient.collect()?;
+                    grow_receiver_for_signal(recipient, failure)?;
                 }
                 Err(error) => return Err(error),
             }
@@ -2115,7 +2251,8 @@ impl ProcessTable {
     }
 
     /// `erlang:exit/2` against an arbitrary pid term: a local pid exits through
-    /// [`ProcessTable::send_exit`], an external pid is routed as a `DOP_EXIT` control signal.
+    /// [`ProcessTable::send_exit`], an external pid is routed as a `DOP_EXIT2` control signal
+    /// ([`DistSignal::Exit2`] — a plain exit signal, *not* the link exit `DOP_EXIT`).
     ///
     /// # Errors
     ///
@@ -2124,7 +2261,7 @@ impl ProcessTable {
     pub fn send_exit_term(&mut self, from: ProcessId, to: Eterm, reason: Eterm) -> Result<()> {
         match PidTarget::from_eterm(to)? {
             PidTarget::Local(pid) => self.send_exit(from, pid, reason),
-            PidTarget::Remote(remote) => self.route(DistSignal::Exit {
+            PidTarget::Remote(remote) => self.route(DistSignal::Exit2 {
                 from,
                 to: remote,
                 reason,

@@ -78,7 +78,15 @@
 //! [`PortId`] out of `beam_io`'s registry; `port_close/1` kills and reaps the child and
 //! returns the id to the table; `port_info/1,2` answers real items; and the child's stdout
 //! is polled — a `receive {Port, {data, Data}}` reads the driver's stream back, delivering
-//! a `binary` for a `binary`-stream port (a char list otherwise).
+//! a `binary` for a `binary`-stream port (a char list otherwise), **at whatever width the
+//! child wrote** (see [`RuntimeContext::port_data_message`]).
+//!
+//! The child's **stderr** follows the oracle exactly: it is *inherited* from the emulator
+//! by default (so it appears on `beam_rt`'s own stderr and is never port data), and the
+//! `stderr_to_stdout` option makes the child's descriptor 2 an exact duplicate of its
+//! descriptor 1, so the diagnostics arrive as port data interleaved with stdout in true
+//! write order (`spawn_start`'s `stderrfd = opts->redir_stderr ? ifd[1] : dup(2)`,
+//! `erts/emulator/sys/unix/sys_drivers.c:500`).
 //!
 //! `port_command/2,3` writes to the child's **stdin** (an iolist, a binary or a char list),
 //! which is what makes `open_port({spawn,"cat"},[])` echo its input back: the bytes are
@@ -88,12 +96,10 @@
 //! it once with `Interest::BOTH`), so the same call writes out through that descriptor —
 //! exactly the oracle's behaviour.
 //!
-//! **Not yet:** only **stdout** is polled (the child's stderr is discarded by the driver);
-//! `connected` only flips to `false` at `port_close/1` rather than when the child exits by
-//! itself; a stream read of more than `ERL_ONHEAP_BINARY_LIMIT` (64) bytes on a `binary`
-//! port is a typed *unsupported* gap (there is no off-heap ref-counted binary build path
-//! here yet); and the `eof` option is accepted but inert (its `{Port, eof}` message is not
-//! synthesized).
+//! **Not yet:** `connected` only flips to `false` at `port_close/1` rather than when the
+//! child exits by itself; the `eof` option is accepted but inert (its `{Port, eof}` message
+//! is not synthesized); and `nouse_stdio` is accepted without effect (the child always gets
+//! the stdio pipes, never the `fd 3`/`fd 4` pair).
 //!
 //! # `port_info` items
 //!
@@ -143,13 +149,15 @@ use std::time::{Duration, Instant};
 pub mod driver;
 pub(crate) mod watch;
 use beam_alloc::Heap;
+use beam_abi::driver::types::PORT_CONTROL_FLAG_BINARY;
 use beam_bifs::PortHook;
 use beam_common::{BeamError, Result};
 use beam_engine::terms;
+use libc::c_int;
 use beam_io::{
     Driver, Event, Poller, PortCommandOptions, PortExitReason, PortNotification,
     PortRegistry as IoPortRegistry, SpawnDriver, SpawnOptions, SpawnSpec, SpawnStream,
-    PORT_REDS_EXECUTE,
+    StreamOptions, PORT_REDS_EXECUTE,
 };
 use beam_process::{PortId, PortTable, ProcessId, ProcessTable};
 use beam_term::{
@@ -334,6 +342,43 @@ struct PortMeta {
     /// when the driver is unloaded, so a term is only ever drained while the arena it was built on
     /// is alive (see the queue's lifetime contract).
     driver_terms: Option<driver::TermQueue>,
+    /// The names a `{spawn_driver, Name}` port's C driver first interned inside a callback,
+    /// awaiting a commit into the runtime's **live** atom table.
+    ///
+    /// A driver callback cannot mint an atom — the live table is borrowed for the whole callback
+    /// and this crate is `#![deny(unsafe_code)]` — so a *new* name is handed a **predicted** index
+    /// and recorded here, exactly like the BIF/NIF hosts' `PendingInterner`. Seized with
+    /// [`driver::DriverPort::pending_atoms`] **before** the host is moved into the port lifecycle,
+    /// for the same reason as [`PortMeta::driver_terms`] (the boxed driver exposes no host), and
+    /// landed by [`PortRegistry::commit_driver_atoms`].
+    ///
+    /// `None` for every port without a C driver (a `spawn`/`fd` port).
+    driver_atoms: Option<driver::DriverAtoms>,
+    /// The control flags a `{spawn_driver, Name}` port's C driver last set through
+    /// `set_port_control_flags` — the C's `prt->control_flags` (`io.c:5318`).
+    ///
+    /// Read **after** a `control` callback to pick the reply's Erlang form: a list of byte
+    /// integers, or a binary when `PORT_CONTROL_FLAG_BINARY` is set (`write_port_control_result`,
+    /// `io.c:4133-4175`). Seized from the host with [`driver::DriverPort::control_flags`] before
+    /// the host is moved into the port lifecycle (the boxed driver exposes no host), the same way
+    /// [`PortMeta::driver_terms`] and [`PortMeta::driver_atoms`] are.
+    ///
+    /// `None` for every port without a C driver (a `spawn`/`fd` port) — one whose `control` reply
+    /// is the oracle's own `badarg`.
+    driver_control_flags: Option<Rc<Cell<c_int>>>,
+    /// Cumulative bytes this port has delivered **into** Erlang — `port_info(Port, input)`.
+    ///
+    /// Bumped exactly where the node-global [`IoCounters::input`] is (the bytes of a
+    /// `{Port, {data, …}}` message), so the per-port figure is the port's own share of the same
+    /// events rather than a second, independently-maintained count. A `Cell` because `info` reads
+    /// it through the immutable `&PortMeta` the registry hands out.
+    input: Cell<u64>,
+    /// Cumulative bytes this runtime has written **to** this port — `port_info(Port, output)`.
+    ///
+    /// Bumped at the single write path ([`PortRegistry::write_command`]), alongside the
+    /// node-global [`IoCounters::output`], so it counts what `port_command/2,3` handed the port
+    /// exactly as the oracle's own `output` item does.
+    output: Cell<u64>,
 }
 
 /// A message a live port has produced: the child's stream bytes, or its reaped exit status.
@@ -554,13 +599,16 @@ impl PortRegistry {
     /// [`BeamError::Io`] when the write itself fails (a child that closed its stdin yields
     /// `EPIPE`).
     pub fn write_command(&mut self, id: PortId, bytes: &[u8]) -> Result<()> {
-        if !self.meta.contains_key(&id.number()) {
+        let Some(meta) = self.meta.get_mut(&id.number()) else {
             return Err(BeamError::BadArg);
-        }
+        };
         // Every byte handed to a port counts as **output** for `erlang:statistics(io)`,
         // whichever stream it goes to (the counters are bumped before the branch so a
-        // driver port and a child/`{fd,N}` port are counted alike).
+        // driver port and a child/`{fd,N}` port are counted alike). The port's **own**
+        // `port_info(Port, output)` total is bumped at the same instant, so the two agree by
+        // construction.
         self.io_counters.note_output(bytes.len());
+        meta.output.set(meta.output.get().saturating_add(bytes.len() as u64));
         // A **C driver** port has no child pipe: `port_command` *is* the driver's own `output`
         // callback. `beam_io::PortRegistry::output` runs it inline, and the bytes the driver
         // answers with through `driver_output` are queued as this port's input for the next
@@ -582,6 +630,87 @@ impl PortRegistry {
             .registry
             .execute_port_tasks(&mut self.poller, PORT_REDS_EXECUTE)?;
         Ok(())
+    }
+
+    /// Delivers a named port-control operation to the port's driver — the runtime side of
+    /// `erts_internal:port_control/3`.
+    ///
+    /// The operation is forwarded **verbatim** to [`beam_io::PortRegistry::port_control`], which
+    /// hands it to the port's driver: for a [`PortName::SpawnDriver`] port that is
+    /// [`DriverPortAdapter::control`](driver::DriverPortAdapter::control), i.e. the C driver's own
+    /// `control` callback, and for the built-in drivers the string verbs they own. `op` for a C
+    /// driver is the verb as a decimal `c_uint` string — `erts_internal:port_control/3` reads its
+    /// `Command` with `term_to_Uint` (`../../erts/emulator/beam/erl_bif_port.c:322-340`), which is
+    /// the same convention `beam_io` uses (`beam_io/src/abi/port.rs:716`).
+    ///
+    /// [`beam_io::PortControl::CLOSE`] (`"close"`) is **reserved** by that forwardee: it closes the
+    /// port instead of reaching a driver. A C driver's verbs are integers, so the reserved verb can
+    /// only arrive from a caller that meant the built-in drivers' close — and it closes the port
+    /// through `beam_io`, which is why a caller that must keep this registry's own metadata in step
+    /// uses [`PortRegistry::close`] instead.
+    ///
+    /// # An internal port is `badarg` for every verb
+    ///
+    /// A port whose driver is a **built-in** one (a `{spawn, Cmd}` / `{spawn_executable, Path}` /
+    /// `{fd, N}` port — i.e. every port but a `{spawn_driver, Name}` one, see
+    /// [`PortRegistry::is_driver_port`]) has no `control` callback, and the C's
+    /// `call_driver_control` answers `ERTS_PORT_OP_BADARG` **before** any callback for a driver
+    /// whose `control` slot is `NULL` (`io.c:4035`); `erts_internal_port_control_3` turns that into
+    /// the atom `badarg` (`erl_bif_port.c:340-343`). So `erlang:port_control/3` on a `{spawn,"cat"}`
+    /// or `{fd,0,1}` port is the oracle's `badarg` for **every** verb (measured), never the built-in
+    /// driver's `Ok(vec![])`. That check deliberately precedes the reserved-`"close"` forward: the
+    /// oracle's command is a `c_uint`, so a `"close"` string cannot arise from real `port_control`
+    /// call, and rejecting the internal port first is what matches the C.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] for a port this registry does not hold (closed, or never opened), for
+    /// an **internal** port (above), and for the driver's own rejection (a C driver with no `control`
+    /// slot, or a negative result); the typed capability gap for a reply the driver answers from
+    /// memory of its own (see [`driver::DriverPortAdapter::control_reply`]).
+    pub fn port_control(&mut self, id: PortId, op: &str, arg: &[u8]) -> Result<Vec<u8>> {
+        if !self.is_driver_port(id) {
+            // Either an internal port — no C driver host, so the oracle's `badarg` for every verb
+            // (`call_driver_control`, `io.c:4035`) — or a port this registry does not hold, which is
+            // `badarg` too. Both are the atom `badarg`, never a fabricated reply.
+            return Err(BeamError::BadArg);
+        }
+        self.registry.port_control(&mut self.poller, id, op, arg)
+    }
+
+    /// Whether `id` is backed by a **user C driver** (`{spawn_driver, Name}`) rather than one of the
+    /// built-in `spawn`/`spawn_executable`/`fd` drivers — the C's "does this port's driver have a
+    /// `control` callback?" predicate.
+    ///
+    /// This runtime gives a C driver host to a `{spawn_driver, Name}` port alone (every other `Name`
+    /// form is backed by [`beam_io::SpawnDriver`]), so [`PortMeta::kind`] being
+    /// [`PortName::SpawnDriver`] is exactly the C's `prt->drv_ptr->control != NULL` test
+    /// (`io.c:4035`). It is what [`PortRegistry::port_control`] keys its internal-port `badarg` on,
+    /// and — via the same C-driver-host fact — what [`PortRegistry::control_binary`] reads a flag
+    /// from.
+    ///
+    /// `false` for a port this registry does not hold.
+    pub fn is_driver_port(&self, id: PortId) -> bool {
+        self.meta
+            .get(&id.number())
+            .is_some_and(|meta| meta.kind == PortName::SpawnDriver)
+    }
+
+    /// Whether `id`'s C driver asked for a **binary** `erlang:port_control/3` reply
+    /// (`PORT_CONTROL_FLAG_BINARY`).
+    ///
+    /// The C reads the port's `control_flags` **after** the driver's `control` callback and renders
+    /// the reply as a binary when that bit is set, as a list of byte integers otherwise
+    /// (`write_port_control_result`, `io.c:4133-4175`). Call this after
+    /// [`PortRegistry::port_control`], which is when the driver has set its flags.
+    ///
+    /// `false` for an unknown port and for every port without a C driver (a `spawn`/`fd` port),
+    /// whose `control` reply is the oracle's `badarg` in the first place.
+    pub fn control_binary(&self, id: PortId) -> bool {
+        self.meta
+            .get(&id.number())
+            .and_then(|meta| meta.driver_control_flags.as_ref())
+            .is_some_and(|flags| flags.get() & PORT_CONTROL_FLAG_BINARY != 0)
     }
 
     /// The registry's port-number table, mutably — the seam the **port-monitor** BIFs drive.
@@ -784,6 +913,8 @@ impl PortRegistry {
                             // Bytes a port produced are **input** for
                             // `erlang:statistics(io)`, counted where they really arrive.
                             self.io_counters.note_input(bytes.len());
+                            // ...and for this port's own `port_info(Port, input)`.
+                            meta.input.set(meta.input.get().saturating_add(bytes.len() as u64));
                             events.push(PortEvent::Data {
                                 port,
                                 bytes,
@@ -840,6 +971,8 @@ impl PortRegistry {
                 // Bytes a driver answered with are **input** for
                 // `erlang:statistics(io)`, counted where they are harvested.
                 self.io_counters.note_input(bytes.len());
+                // ...and for this port's own `port_info(Port, input)`.
+                meta.input.set(meta.input.get().saturating_add(bytes.len() as u64));
                 events.push(PortEvent::Data {
                     port,
                     bytes,
@@ -849,6 +982,40 @@ impl PortRegistry {
             }
         }
         events
+    }
+
+    /// Commits every live driver port's pending interned names into `atoms` — the runtime's
+    /// **one live** table — and returns the `(port, name)` pairs whose prediction had drifted.
+    ///
+    /// A [`driver::DriverPort`] host cannot mint an atom inline (the runtime's table is borrowed
+    /// while a driver callback runs and this crate is `#![deny(unsafe_code)]`), so a *new* name a
+    /// driver interned inside a callback is handed a **predicted** index and recorded on its
+    /// [`driver::DriverAtoms`] handle. Landing it here — at a step boundary where no callback is
+    /// running and no such table is borrowed — is what makes the name resolvable at all; without
+    /// this call a driver-interned name would keep a predicted index that names nothing.
+    ///
+    /// The returned list is never a silent drop: a name whose predicted index the table has moved
+    /// past sits behind a term the driver has already built, so the caller reports it (see
+    /// [`Runtime::deliver_port_messages`]).
+    ///
+    /// # Errors
+    ///
+    /// None: the driver callback that interned the name has already returned, so there is nobody
+    /// left to fail — a name that cannot land at its predicted index is reported, not raised.
+    fn commit_driver_atoms(
+        &mut self,
+        atoms: &mut beam_term::AtomTable,
+    ) -> Vec<(PortId, String)> {
+        let mut dropped = Vec::new();
+        for (number, meta) in self.meta.iter_mut() {
+            let Some(pending) = meta.driver_atoms.as_ref() else {
+                continue;
+            };
+            for name in pending.commit(atoms) {
+                dropped.push((PortId::new(*number), name));
+            }
+        }
+        dropped
     }
 
     /// The terms the **C driver** ports have emitted (`erl_drv_output_term`/`erl_drv_send_term`).
@@ -998,10 +1165,12 @@ impl PortRegistry {
         // `id` is a **bare small integer** (the oracle's shape), not the port term.
         let id = try_make_small(i64::try_from(port.number()).map_err(|_| BeamError::SystemLimit)?)
             .map_err(|_| BeamError::SystemLimit)?;
-        // `input`/`output` are byte counters; the runtime keeps no per-port totals, so both
-        // are `0` — which is what the oracle reports right after `open_port`.
-        let input = make_small(0);
-        let output = make_small(0);
+        // `input`/`output` are this port's cumulative byte totals: the bytes it delivered into
+        // Erlang and the bytes the runtime wrote to it (bumped at the same sites as the
+        // node-global `IoCounters` the `statistics(io)` arm reads). Both are `0` for a port that
+        // has moved no bytes yet — the oracle's answer right after `open_port`.
+        let input = byte_count(meta.input.get())?;
+        let output = byte_count(meta.output.get())?;
         let os_pid = match meta.os_pid {
             Some(pid) => try_make_small(i64::from(pid)).map_err(|_| BeamError::SystemLimit)?,
             // `port_info(Port, os_pid)` is `undefined` for a port without an OS process —
@@ -1086,6 +1255,10 @@ struct PortOptions {
     /// The `exit_status` flag: the driver queues a `{Port, {exit_status, Status}}` message
     /// once the child has been reaped.
     exit_status: bool,
+    /// The `stderr_to_stdout` flag: the child's descriptor 2 becomes an exact duplicate of
+    /// its descriptor 1, so its stderr bytes arrive as port data (interleaved with stdout in
+    /// true write order) instead of being inherited by the emulator.
+    stderr_to_stdout: bool,
 }
 
 impl PortOptions {
@@ -1093,6 +1266,18 @@ impl PortOptions {
     /// default).
     fn stream(&self) -> StreamType {
         self.stream.unwrap_or(StreamType::List)
+    }
+
+    /// The child-stream options the `spawn` driver applies at `fork`/`exec` time
+    /// ([`beam_io::StreamOptions`]).
+    ///
+    /// `eof` is left off: the `eof` option is accepted by the whitelist but inert here (its
+    /// `{Port, eof}` message is not synthesized — see the module docs).
+    fn stream_options(&self) -> StreamOptions {
+        StreamOptions {
+            stderr_to_stdout: self.stderr_to_stdout,
+            eof: false,
+        }
     }
 
     /// Applies `other` on top of `self`: whatever `other` explicitly set wins, and the
@@ -1111,6 +1296,7 @@ impl PortOptions {
         self.env.extend(other.env);
         // A flag: asking anywhere in either option list asks for it.
         self.exit_status |= other.exit_status;
+        self.stderr_to_stdout |= other.stderr_to_stdout;
     }
 }
 
@@ -1163,6 +1349,27 @@ impl RuntimePorts {
             .map_err(|_| error::unsupported("the port table is already in use"))
     }
 
+    /// `erts_internal:port_control(Port, Op, Data)` — deliver a port-control operation to the
+    /// port's driver and return its reply bytes.
+    ///
+    /// This is the runtime side of the `control` callback: it forwards to
+    /// [`PortRegistry::port_control`] (see there for the verb convention, the reserved `"close"`
+    /// verb and the full error set), which reaches the driver through `beam_io`'s port registry.
+    /// The reply is the **driver's own bytes**: this method never invents one, so an unsupported
+    /// driver state is a typed error rather than an empty answer.
+    ///
+    /// No `PortHook` method takes it yet — the reachable port-control entry is
+    /// [`PortRegistry::port_control`], called directly by the native floor's
+    /// `erlang:port_control/3` (`src/native/port.rs`) — so this method is retained for a
+    /// `runtime.rs`-internal caller (see `src/port/CONTEXT.md`'s API Surface note).
+    ///
+    /// # Errors
+    ///
+    /// As for [`PortRegistry::port_control`]; a nested borrow of the registry is the typed
+    /// capability gap of [`RuntimePorts::registry_mut`], never a panic.
+    pub fn port_control(&mut self, port: PortId, op: &str, arg: &[u8]) -> Result<Vec<u8>> {
+        self.registry_mut()?.port_control(port, op, arg)
+    }
     /// The name of `term`, when `term` is an atom interned in the shared table.
     fn atom_name(&self, term: Eterm) -> Option<&str> {
         if !is_atom(term) {
@@ -1335,6 +1542,9 @@ impl RuntimePorts {
                     // The driver queues a `{Port, {exit_status, Status}}` message once the
                     // child has been reaped — the pump reports it.
                     "exit_status" => parsed.exit_status = true,
+                    // The child's stderr is merged into its stdout, so its bytes arrive as
+                    // port data (the `spawn` driver's `dup2(1, 2)`).
+                    "stderr_to_stdout" => parsed.stderr_to_stdout = true,
                     // Whitelisted, accepted, without effect here (see the module docs).
                     _ => {}
                 }
@@ -1425,6 +1635,13 @@ impl PortHook for RuntimePorts {
             // `erl_drv_output_term`/`erl_drv_send_term` pushes onto and
             // [`PortRegistry::take_driver_terms`] drains.
             let driver_terms = host.term_queue();
+            // The same seize for the names the driver may intern in a later callback: without this
+            // handle a name it predicts would never reach the live atom table.
+            let driver_atoms = host.pending_atoms();
+            // And for the port's control flags: the driver sets them from inside a `control`
+            // callback through `set_port_control_flags`, and the runtime reads them back to pick
+            // the reply's Erlang form (a list, or a binary in `PORT_CONTROL_FLAG_BINARY` mode).
+            let driver_control_flags = host.control_flags();
             let adapter =
                 driver::DriverPortAdapter::load(&candidates, &driver_name, host, spec.command.clone())
                     .map_err(|_| BeamError::BadArg)?;
@@ -1439,10 +1656,18 @@ impl PortHook for RuntimePorts {
                 owner: self.owner,
                 kind: PortName::SpawnDriver,
                 driver_terms: Some(driver_terms),
+                driver_atoms: Some(driver_atoms),
+                driver_control_flags: Some(driver_control_flags),
+                input: Cell::new(0),
+                output: Cell::new(0),
             };
             let mut registry = self.registry_mut()?;
             return registry.register(Box::new(adapter), meta);
         }
+        // The child-stream options (`stderr_to_stdout`) are applied in the child, so they are
+        // handed to the driver's constructor rather than carried in `SpawnOptions`. Read before
+        // the honored fields below are moved out of `resolved`.
+        let stream_options = resolved.stream_options();
         let spawn_options = SpawnOptions {
             stream: stream.into(),
             cd: resolved.cd,
@@ -1450,7 +1675,8 @@ impl PortHook for RuntimePorts {
             args: resolved.args,
             exit_status: resolved.exit_status,
         };
-        let driver = SpawnDriver::new(&spec.spawn_spec()?, &spawn_options)?;
+        let driver =
+            SpawnDriver::with_stream_options(&spec.spawn_spec()?, &spawn_options, stream_options)?;
         let os_pid = driver.os_pid();
         let meta = PortMeta {
             command: spec.command,
@@ -1460,8 +1686,13 @@ impl PortHook for RuntimePorts {
             monitors: Vec::new(),
             owner: self.owner,
             kind: spec.kind,
-            // A `spawn`/`fd` port has no C driver, so no driver term queue exists.
+            // A `spawn`/`fd` port has no C driver, so it has neither driver term queue nor names
+            // a driver interned, nor control flags.
             driver_terms: None,
+            driver_atoms: None,
+            driver_control_flags: None,
+            input: Cell::new(0),
+            output: Cell::new(0),
         };
         // The registry stays borrowed across `register`: starting a port cannot re-enter a
         // port operation, and a nested borrow is a typed error rather than a panic.
@@ -1575,6 +1806,25 @@ impl Runtime {
                 .map_err(|_| error::unsupported("the port table is already in use"))?;
             registry.pump(timeout)?
         };
+        // A driver callback cannot mint an atom (the live table is borrowed for the whole
+        // callback), so a *new* name one interned was handed a predicted index for **this**
+        // boundary to land. Committing before any message is built means the terms a driver
+        // emitted through `erl_drv_output_term` resolve against a table that holds their names.
+        {
+            let mut registry = self
+                .ports
+                .try_borrow_mut()
+                .map_err(|_| error::unsupported("the port table is already in use"))?;
+            for (port, name) in registry.commit_driver_atoms(self.code_server.atoms_mut()) {
+                // Never silent: the term the driver built already carries an index that now names
+                // a different atom, which no later commit can repair.
+                eprintln!(
+                    "beam_rt: driver port {} interned the atom `{name}` at an index the atom \
+                     table had already moved past; the name is not resolvable",
+                    port.number()
+                );
+            }
+        }
         // The name `os:set_signal/2`'s notifications are addressed to, resolved **once** and by
         // `lookup` rather than `intern`: the shared table holds the atom only if some code
         // interned it, which is exactly when a process can be registered under it. `None` ⇒
@@ -1666,9 +1916,8 @@ impl RuntimeContext<'_> {
     /// # Errors
     ///
     /// The poller's/driver's failures; a nested borrow of the port table is a typed
-    /// capability gap rather than a panic; the arena's allocation failure when a term does
-    /// not fit (including the documented >`ERL_ONHEAP_BINARY_LIMIT` *unsupported* gap for a
-    /// wide `binary`-stream read).
+    /// capability gap rather than a panic; the message builders' allocation failure when a
+    /// term does not fit.
     pub(crate) fn poll_port_messages(&mut self, timeout: Duration) -> Result<Vec<Eterm>> {
         // The shared port state is cloned out so the *messages* — which need `&mut self` —
         // are never built while the registry is borrowed (the same snapshot rule
@@ -1737,6 +1986,24 @@ impl RuntimeContext<'_> {
     /// `list` default, `erl`'s own). The `data` atom is interned into the runtime's one
     /// shared table, so the message is nameable by the printer and matchable by a `receive`
     /// clause.
+    ///
+    /// # The binary stream has no width limit
+    ///
+    /// A read is as wide as the child wrote: the driver hands over up to 64 KiB of one
+    /// `read(2)` ([`beam_io`]'s `READ_CHUNK`), and the oracle delivers a port `binary` of
+    /// exactly that width (`open_port({spawn,"…"},[binary])` on a 200-byte writer yields a
+    /// 200-byte `binary()`). [`terms::make_heap_binary`] refuses anything past
+    /// `ERL_ONHEAP_BINARY_LIMIT` (64) bytes because it only materializes the *on-heap*
+    /// `ErlHeapBits` form, so the payload is built by
+    /// [`beam_codec::term::make_binary`] instead — the same on-heap layout for every width,
+    /// which is the interior-policy substitution `beam_codec` documents
+    /// (`ERTS` would store a wider binary off-heap; `is_binary/1`, `byte_size/1`, the
+    /// contents and the ETF image are identical either way).
+    ///
+    /// The block lives on the runtime's never-reset `-eval` arena
+    /// ([`RuntimeContext::eval_heap`]) — the same pointer-stable home the evaluator gives a
+    /// term the engine arena cannot express — so a delivered message stays valid for the
+    /// runtime's lifetime.
     pub(crate) fn port_data_message(
         &mut self,
         port: PortId,
@@ -1745,7 +2012,7 @@ impl RuntimeContext<'_> {
     ) -> Result<Eterm> {
         let data = make_atom(self.runtime.code_server.atoms_mut().intern("data"));
         let payload = match stream {
-            StreamType::Binary => terms::make_heap_binary(self, bytes)?,
+            StreamType::Binary => beam_codec::term::make_binary(self.eval_heap(), bytes)?,
             StreamType::List => {
                 let mut list = NIL;
                 for byte in bytes.iter().rev() {
@@ -1906,1737 +2173,26 @@ fn monitor_list(heap: &mut Heap, atoms: &AtomTable, pids: &[ProcessId]) -> Resul
     Ok(list)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use beam_io::signal::{Disposition, Signal};
-    use beam_io::DriverContext;
-    use beam_process::{ProcessState, SignalAtoms};
-
-    use crate::boot;
-    use crate::config::RuntimeConfig;
-
-    /// The process every port the fixture's hook opens claims as its owner.
-    const OWNER: ProcessId = ProcessId::new(7, 0);
-
-    /// A test fixture: the shared registry, the atom table both the provider and the test
-    /// resolve names through, the provider itself, and a term heap.
-    ///
-    /// The atom table is interned **before** the provider takes its handle: the handle is
-    /// an `Rc` clone, so mutating the table afterwards would fork it (see the module docs).
-    struct Fixture {
-        registry: Rc<RefCell<PortRegistry>>,
-        atoms: Rc<AtomTable>,
-        hook: RuntimePorts,
-        heap: Heap,
-    }
-
-    /// The vocabulary the tests build `Name`/`Options` terms out of, and the item atoms.
-    ///
-    /// The item atoms (`name`, `id`, `connected`, `os_pid`, `links`, `input`, `output`,
-    /// `monitors`) come from the boot seed; the option atoms do not, so the whole
-    /// `open_port/2` option whitelist is interned here too.
-    const TEST_ATOMS: &[&str] = &[
-        "spawn",
-        "spawn_executable",
-        "fd",
-        "not_a_driver",
-        // The honored option tags.
-        "cd",
-        "env",
-        "args",
-        // The full option-atom whitelist and its rejected neighbours.
-        "stream",
-        "use_stdio",
-        "stderr_to_stdout",
-        "line",
-        "nouse_stdio",
-        "binary",
-        "list",
-        "in",
-        "out",
-        "eof",
-        "hide",
-        "exit_status",
-        "overlapped_io",
-        // The option-tuple whitelist and its rejected neighbours.
-        "packet",
-        "arg0",
-        "parallelism",
-        "busy_limits_port",
-        "busy_limits_msgq",
-        "nope",
-    ];
-
-    fn fixture() -> Fixture {
-        let mut atoms = AtomTable::new();
-        boot::seed_core_atoms(&mut atoms);
-        for name in TEST_ATOMS {
-            atoms.intern(name);
-        }
-        let atoms = Rc::new(atoms);
-        let registry = Rc::new(RefCell::new(PortRegistry::new().expect("a port registry")));
-        let hook = RuntimePorts::new(Rc::clone(&registry), Rc::clone(&atoms), OWNER);
-        Fixture {
-            registry,
-            atoms,
-            hook,
-            heap: Heap::new(512).expect("a test heap"),
-        }
-    }
-
-    impl Fixture {
-        /// The atom `name` as a term (it must be pre-interned: see [`Fixture`]).
-        fn atom(&self, name: &str) -> Eterm {
-            make_atom(self.atoms.lookup(name).expect("a pre-interned atom"))
-        }
-
-        /// `text` as an Erlang string on the fixture's heap.
-        fn string(&mut self, text: &str) -> Eterm {
-            charlist(&mut self.heap, text).expect("a string")
-        }
-
-        /// An Erlang list of `elements` on the fixture's heap.
-        fn list(&mut self, elements: &[Eterm]) -> Eterm {
-            let mut list = NIL;
-            for element in elements.iter().rev() {
-                list = heap_cons(&mut self.heap, *element, list);
-            }
-            list
-        }
-
-        /// The `{tag, value}` `Name` tuple `open_port/2` takes.
-        fn name(&mut self, tag: &str, value: Eterm) -> Eterm {
-            let tag = self.atom(tag);
-            self.heap.tuple(&[tag, value]).expect("a name tuple")
-        }
-
-        /// The `{spawn, Cmd}` `Name` with `command` as the shell command line.
-        fn spawn(&mut self, command: &str) -> Eterm {
-            let command = self.string(command);
-            self.name("spawn", command)
-        }
-        /// The value `port_info/1` answered for `name`.
-        fn item(&mut self, port: PortId, name: &str) -> Eterm {
-            let pairs = self
-                .hook
-                .port_info(port)
-                .unwrap_or_else(|error| panic!("port_info({port:?}) failed: {error}"));
-            let wanted = self.atom(name);
-            pairs
-                .iter()
-                .find(|(key, _)| *key == wanted)
-                .map(|(_, value)| *value)
-                .unwrap_or_else(|| panic!("no {name:?} item in {pairs:?}"))
-        }
-    }
-
-    /// A cons cell built directly on the fixture's heap (the `beam_alloc` interface, which
-    /// is what the production `charlist`/`pid_list` helpers use).
-    fn heap_cons(heap: &mut Heap, head: Eterm, tail: Eterm) -> Eterm {
-        heap.cons(head, tail).expect("a cons cell")
-    }
-
-    /// `term` read as a byte string.
-    fn text_of(term: Eterm) -> String {
-        terms::list_elements(term)
-            .expect("a proper list")
-            .into_iter()
-            .map(|element| char::from(u8::try_from(signed_value(element)).expect("a byte")))
-            .collect()
-    }
-
-    /// Asserts `result` is exactly `Err(BeamError::BadArg)`.
-    ///
-    /// [`BeamError`] is not `PartialEq` (it carries an owned message and a live BEAM reason
-    /// term), so the check is a `matches!` rather than an `assert_eq!`.
-    fn assert_badarg<T: std::fmt::Debug>(result: Result<T>) {
-        assert!(
-            matches!(result, Err(BeamError::BadArg)),
-            "expected badarg, got {result:?}"
-        );
-    }
-
-    /// Drains the fixture's port poller until `port` produces stream data, returning it.
-    ///
-    /// The child's output is *not* read by the test any more: the runtime's poller owns the
-    /// descriptors (the whole point of the `beam_io` adoption), so the bytes are recovered
-    /// through the same `pump` the runtime itself uses.
-    fn pump_data(registry: &mut PortRegistry, port: PortId) -> Vec<u8> {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            for event in registry.pump(Duration::from_millis(50)).expect("pump") {
-                if let PortEvent::Data {
-                    port: source,
-                    bytes,
-                    ..
-                } = event
-                {
-                    if source == port {
-                        return bytes;
-                    }
-                }
-            }
-        }
-        panic!("no stream data for {port:?}");
-    }
-
-    /// The `port_info/1,2` metadata of a port a test registers **directly** (bypassing
-    /// `open_port/2`), so a recorder driver can be driven without a real child.
-    fn test_meta(command: &str) -> PortMeta {
-        PortMeta {
-            command: command.to_string(),
-            kind: PortName::Spawn,
-            os_pid: None,
-            stream: StreamType::List,
-            notify_exit: false,
-            monitors: Vec::new(),
-            owner: OWNER,
-            driver_terms: None,
-        }
-    }
-
-    /// A driver that records its lifecycle callbacks and can declare a timer.
-    ///
-    /// The built-in drivers (`fd`/`efile`/`spawn`) give no observation point for the two
-    /// `beam_rt`-driven seams — the port-exit notification ([`Driver::port_exit`]) and the
-    /// poll deadline ([`Driver::next_timeout`] + [`Driver::timeout`]) — so they are pinned
-    /// against this recorder instead.
-    struct RecorderDriver {
-        /// The registered name (required by the trait; unused by the tests).
-        name: &'static str,
-        /// The lifecycle callbacks in call order: `"exit:<Reason>"` from `port_exit` and
-        /// `"stop"` from the teardown.
-        log: Rc<RefCell<Vec<String>>>,
-        /// The deadline `next_timeout` declares, when this recorder carries a timer.
-        deadline: Option<Instant>,
-        /// Where the timer records the instant it actually fired (absent without a timer).
-        fired_at: Option<Rc<RefCell<Option<Instant>>>>,
-    }
-
-    impl RecorderDriver {
-        /// A recorder with no timer, appending its callbacks to `log`.
-        fn new(name: &'static str, log: Rc<RefCell<Vec<String>>>) -> RecorderDriver {
-            RecorderDriver {
-                name,
-                log,
-                deadline: None,
-                fired_at: None,
-            }
-        }
-
-        /// A recorder declaring a timer at `deadline`, recording when it fires.
-        fn with_timer(deadline: Instant, fired_at: Rc<RefCell<Option<Instant>>>) -> RecorderDriver {
-            RecorderDriver {
-                name: "recorder",
-                log: Rc::new(RefCell::new(Vec::new())),
-                deadline: Some(deadline),
-                fired_at: Some(fired_at),
-            }
-        }
-    }
-
-    impl Driver for RecorderDriver {
-        fn name(&self) -> &str {
-            self.name
-        }
-
-        fn start(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
-            Ok(())
-        }
-
-        fn output(&mut self, _ctx: &mut DriverContext<'_>) -> Result<usize> {
-            Ok(0)
-        }
-
-        fn ready_input(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
-            Ok(())
-        }
-
-        fn stop(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
-            self.log.borrow_mut().push("stop".to_string());
-            Ok(())
-        }
-
-        fn port_exit(&mut self, _ctx: &mut DriverContext<'_>, reason: PortExitReason) -> Result<()> {
-            self.log.borrow_mut().push(format!("exit:{reason:?}"));
-            Ok(())
-        }
-
-        fn next_timeout(&self) -> Option<Instant> {
-            // Declared until it has fired: the port re-arms its `TIMEOUT` task from this
-            // after every interaction, so a still-declared deadline would fire every round.
-            match &self.fired_at {
-                Some(fired) if fired.borrow().is_some() => None,
-                _ => self.deadline,
-            }
-        }
-
-        fn timeout(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
-            if let Some(fired) = &self.fired_at {
-                *fired.borrow_mut() = Some(Instant::now());
-            }
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn spawn_true_opens_a_real_registered_port() {
-        let mut fx = fixture();
-        let command = fx.string("true");
-        let name = fx.name("spawn", command);
-
-        let port = fx
-            .hook
-            .open_port(name, NIL)
-            .expect("open_port({spawn, \"true\"}, [])");
-        assert!(PortId::is_port(port.to_eterm()), "a real internal port");
-        assert!(fx.registry.borrow().contains(port));
-
-        // The child really started: `os_pid` is its process id, captured from the driver
-        // before the port was registered.
-        let os_pid = signed_value(fx.item(port, "os_pid"));
-        assert!(os_pid > 0, "a spawned child has an os pid, got {os_pid}");
-
-        // Every item atom resolves through the shared table (never a fabricated index), and
-        // the pair list is exactly the oracle's `/1` roster followed by the `/2`-only
-        // `monitors` — in the oracle's order.
-        let pairs = fx.hook.port_info(port).expect("port_info");
-        let keys: Vec<String> = pairs
-            .iter()
-            .map(|(key, _)| {
-                fx.atoms
-                    .name(atom_val(*key))
-                    .expect("an item atom resolves")
-                    .to_string()
-            })
-            .collect();
-        assert_eq!(
-            keys,
-            [
-                "name", "links", "id", "connected", "input", "output", "os_pid", "monitors"
-            ]
-        );
-        assert_eq!(text_of(fx.item(port, "name")), "true");
-        // `id` is a bare small integer (the port number), **not** the port term.
-        assert_eq!(
-            fx.item(port, "id"),
-            make_small(i64::try_from(port.number()).expect("an id fits"))
-        );
-        // `links` is the owner as a one-element list and `connected` is that same owner pid.
-        let owner = OWNER.to_eterm();
-        assert_eq!(
-            terms::list_elements(fx.item(port, "links")).expect("links is a list"),
-            vec![owner]
-        );
-        assert_eq!(fx.item(port, "connected"), owner);
-        assert_eq!(fx.item(port, "input"), make_small(0), "a byte counter, 0 at open");
-        assert_eq!(fx.item(port, "output"), make_small(0), "a byte counter, 0 at open");
-        assert_eq!(fx.item(port, "monitors"), NIL, "nothing monitors a port yet");
-    }
-
-    #[test]
-    fn the_name_forms_and_their_options_are_accepted() {
-        let mut fx = fixture();
-
-        // `{spawn, Atom}` — an atom is a shell command line.
-        let name = fx.name("spawn", fx.atom("not_a_driver"));
-        let port = fx.hook.open_port(name, NIL).expect("{spawn, atom}");
-        assert_eq!(text_of(fx.item(port, "name")), "not_a_driver");
-        // `{spawn, [Prog, Arg…]}` is **flattened** (concatenation, no separator) into a shell
-        // command line — the oracle has no argv form for `{spawn, …}`.
-        let program = fx.string("/bin/sh");
-        let dash_c = fx.string("-c");
-        let command = fx.string("true");
-        let argv = fx.list(&[program, dash_c, command]);
-        let name = fx.name("spawn", argv);
-        let port = fx.hook.open_port(name, NIL).expect("{spawn, argv}");
-        assert_eq!(text_of(fx.item(port, "name")), "/bin/sh-ctrue");
-        // `{spawn_executable, Path}` honouring `{args, […]}` and a `binary` stream.
-        let path = fx.string("/bin/sh");
-        let name = fx.name("spawn_executable", path);
-        let dash_c = fx.string("-c");
-        let true_cmd = fx.string("true");
-        let args = fx.list(&[dash_c, true_cmd]);
-        let args_pair = {
-            let tag = fx.atom("args");
-            fx.heap.tuple(&[tag, args]).expect("an args option")
-        };
-        let binary = fx.atom("binary");
-        let options = fx.list(&[binary, args_pair]);
-        let port = fx
-            .hook
-            .open_port(name, options)
-            .expect("{spawn_executable, \"/bin/sh\"} with args");
-        assert_eq!(text_of(fx.item(port, "name")), "/bin/sh");
-        // `stream` is no longer a `port_info` item: the honored `binary` option is asserted
-        // on the port's own metadata.
-        let stream = fx
-            .registry
-            .borrow()
-            .meta
-            .get(&port.number())
-            .expect("a live port")
-            .stream;
-        assert_eq!(stream, StreamType::Binary);
-
-        // `{fd, N}` registers a descriptor port with no OS process. The descriptor is a
-        // socketpair end the **test** owns and keeps open: `beam_io`'s driver adopts a
-        // `{fd, N}` by putting it in non-blocking mode (`fcntl(F_SETFL, O_NONBLOCK)`), which
-        // the sandbox refuses for an inherited descriptor (`EPERM`); a socketpair end always
-        // accepts it, so the childless name form is exercised independently of the test
-        // harness's fds.
-        use std::os::fd::AsRawFd;
-        use std::os::unix::net::UnixStream;
-        let (local, _peer) = UnixStream::pair().expect("a socketpair");
-        let fd = local.as_raw_fd();
-        let name = fx.name("fd", make_small(i64::from(fd)));
-        let port = fx.hook.open_port(name, NIL).expect("{fd, N}");
-        // `os_pid` is `undefined` for a port without an OS process, while `connected` is
-        // still the owner pid — both the oracle's answers.
-        assert_eq!(fx.item(port, "os_pid"), fx.atom("undefined"));
-        assert_eq!(fx.item(port, "connected"), OWNER.to_eterm());
-    }
-
-    #[test]
-    fn the_working_directory_option_is_applied() {
-        let mut fx = fixture();
-        let name = fx.spawn("pwd");
-        let dir = fx.string("/");
-        let cd = {
-            let tag = fx.atom("cd");
-            fx.heap.tuple(&[tag, dir]).expect("a cd option")
-        };
-        let options = fx.list(&[cd]);
-        // The option is applied to the child (`pwd` runs in `/`); the port itself only
-        // exposes that it started.
-        let port = fx.hook.open_port(name, options).expect("{cd, \"/\"}");
-        assert!(signed_value(fx.item(port, "os_pid")) > 0);
-    }
-
-    #[test]
-    fn invalid_names_and_options_are_badarg() {
-        let mut fx = fixture();
-
-        // A Name that is not a recognized `{tag, …}` tuple.
-        assert_badarg(fx.hook.open_port(make_small(1), NIL));
-        let command = fx.string("true");
-        let unknown = fx.name("not_a_driver", command);
-        assert_badarg(fx.hook.open_port(unknown, NIL));
-        // A known tag whose `Cmd` the drivers cannot accept.
-        let bad_command = fx.name("spawn", make_small(5));
-        assert_badarg(fx.hook.open_port(bad_command, NIL));
-        // A negative descriptor.
-        let bad_fd = fx.name("fd", make_small(-1));
-        assert_badarg(fx.hook.open_port(bad_fd, NIL));
-
-        // An `Options` that is not a list at all.
-        let spawn = fx.spawn("true");
-        assert_badarg(fx.hook.open_port(spawn, make_small(5)));
-        // A recognized option with a malformed value.
-        let cd_pair = {
-            let tag = fx.atom("cd");
-            fx.heap.tuple(&[tag, make_small(5)]).expect("a cd option")
-        };
-        let options = fx.list(&[cd_pair]);
-        assert_badarg(fx.hook.open_port(spawn, options));
-        let bad_args = {
-            let tag = fx.atom("args");
-            let value = fx.atom("nope");
-            fx.heap.tuple(&[tag, value]).expect("an args option")
-        };
-        let options = fx.list(&[bad_args]);
-        assert_badarg(fx.hook.open_port(spawn, options));
-        // A recognized option with the wrong arity.
-        let cd_alone = {
-            let tag = fx.atom("cd");
-            fx.heap.tuple(&[tag]).expect("a cd option")
-        };
-        let options = fx.list(&[cd_alone]);
-        assert_badarg(fx.hook.open_port(spawn, options));
-
-        // Validation precedes allocation, so no rejected call consumed a port number: the
-        // next successful `open_port` gets the very first id.
-        let port = fx.hook.open_port(spawn, NIL).expect("a valid port");
-        assert_eq!(port, PortId::new(0));
-    }
-
-    #[test]
-    fn whitelisted_option_atoms_and_tuples_are_accepted() {
-        let mut fx = fixture();
-        // The whole accepted option-atom whitelist, every no-op here except `binary`.
-        let atoms = [
-            "stream",
-            "use_stdio",
-            "stderr_to_stdout",
-            "line",
-            "nouse_stdio",
-            "binary",
-            "in",
-            "out",
-            "eof",
-            "hide",
-            "exit_status",
-            "overlapped_io",
-        ];
-        let mut elements: Vec<Eterm> = Vec::new();
-        for name in atoms {
-            let atom = fx.atom(name);
-            elements.push(atom);
-        }
-        // A whitelisted tuple option is accepted too.
-        let packet = {
-            let tag = fx.atom("packet");
-            fx.heap.tuple(&[tag, make_small(4)]).expect("a packet option")
-        };
-        elements.push(packet);
-        let options = fx.list(&elements);
-        let name = fx.spawn("true");
-        let port = fx
-            .hook
-            .open_port(name, options)
-            .expect("whitelisted options are accepted");
-        // Accepting an option never changes what the port is (the `binary` atom is the one
-        // that *does* change the stream, exercised in the name-forms test).
-        assert_eq!(text_of(fx.item(port, "name")), "true");
-    }
-
-    #[test]
-    fn options_outside_the_whitelist_are_badarg() {
-        let mut fx = fixture();
-        // `list` is not an option (a list stream is the default).
-        let name = fx.spawn("true");
-        let list = fx.atom("list");
-        let options = fx.list(&[list]);
-        assert_badarg(fx.hook.open_port(name, options));
-        // An unknown option atom.
-        let name = fx.spawn("true");
-        let nope = fx.atom("nope");
-        let options = fx.list(&[nope]);
-        assert_badarg(fx.hook.open_port(name, options));
-        // An unknown option tuple.
-        let name = fx.spawn("true");
-        let bad_tuple = {
-            let tag = fx.atom("nope");
-            fx.heap.tuple(&[tag, make_small(1)]).expect("a nope option")
-        };
-        let options = fx.list(&[bad_tuple]);
-        assert_badarg(fx.hook.open_port(name, options));
-        // A whitelisted tuple whose tag is fine but whose arity is wrong.
-        let name = fx.spawn("true");
-        let bad_arity = {
-            let tag = fx.atom("packet");
-            fx.heap.tuple(&[tag]).expect("a packet option")
-        };
-        let options = fx.list(&[bad_arity]);
-        assert_badarg(fx.hook.open_port(name, options));
-        // A non-atom, non-tuple option element.
-        let name = fx.spawn("true");
-        let options = fx.list(&[make_small(1)]);
-        assert_badarg(fx.hook.open_port(name, options));
-        // Validation precedes allocation: none of the rejected calls consumed a port number.
-        let name = fx.spawn("true");
-        let port = fx.hook.open_port(name, NIL).expect("a valid port");
-        assert_eq!(port, PortId::new(0));
-    }
-
-    #[test]
-    fn close_port_releases_the_slot_and_reaps_a_running_child() {
-        let mut fx = fixture();
-        // `cat` blocks on the port's stdin pipe (which the runtime holds open), so the
-        // child is certainly still running when the port is closed.
-        let name = fx.spawn("cat");
-        let port = fx.hook.open_port(name, NIL).expect("open_port({spawn, \"cat\"}, [])");
-        assert!(fx.registry.borrow().contains(port));
-
-        fx.hook
-            .close_port(port)
-            .expect("port_close/1 kills and reaps the child");
-        assert!(!fx.registry.borrow().contains(port));
-        // A closed port is *not live*: `port_info/1` reports no items (the oracle's
-        // `undefined`), while a close of it stays `badarg` — never a silently accepted
-        // close.
-        assert_badarg(fx.hook.close_port(port));
-        assert!(fx
-            .hook
-            .port_info(port)
-            .expect("a closed port has no items")
-            .is_empty());
-    }
-
-    #[test]
-    fn closing_a_port_that_already_exited_succeeds() {
-        let mut fx = fixture();
-        // `true` exits immediately; whether it has been reaped by the time it is closed
-        // depends on scheduling, and both paths must succeed.
-        let name = fx.spawn("true");
-        let port = fx.hook.open_port(name, NIL).expect("open_port");
-        fx.hook.close_port(port).expect("closing an exited child is fine");
-        assert!(!fx.registry.borrow().contains(port));
-    }
-
-    #[test]
-    fn an_unallocated_port_is_badarg() {
-        let mut fx = fixture();
-        let never_allocated = PortId::new(999);
-        // `port_info/1` answers the oracle's "no items", i.e. the atom `undefined` once
-        // `beam_bifs`/the native floor render it — never `badarg`, and never a fabricated
-        // pair (see [`PortRegistry::info`]).
-        assert!(fx
-            .hook
-            .port_info(never_allocated)
-            .expect("an unallocated port has no items, not a badarg")
-            .is_empty());
-        // Closing a port the runtime does not hold *is* `badarg`: the close cannot be
-        // performed, and a silently accepted no-op would hide a leaked port.
-        assert_badarg(fx.hook.close_port(never_allocated));
-    }
-
-    #[test]
-    fn write_command_really_writes_to_the_child_and_an_unknown_port_is_badarg() {
-        let mut fx = fixture();
-        // `cat` echoes exactly what it is given, so the write is observable through the
-        // runtime's own poller (the same path that delivers `{Port, {data, …}}`).
-        let name = fx.spawn("cat");
-        let port = fx.hook.open_port(name, NIL).expect("open_port({spawn, \"cat\"}, [])");
-        fx.registry
-            .borrow_mut()
-            .write_command(port, b"hello")
-            .expect("port_command");
-        let echo = pump_data(&mut fx.registry.borrow_mut(), port);
-        assert_eq!(&echo, b"hello");
-
-        // A port the registry does not hold is `badarg` (the oracle's reason for a closed
-        // port), and so is a port id that was never allocated.
-        assert_badarg(fx.registry.borrow_mut().write_command(PortId::new(9), b"x"));
-        fx.hook.close_port(port).expect("port_close/1");
-        assert_badarg(fx.registry.borrow_mut().write_command(port, b"x"));
-    }
-
-    /// `erlang:statistics(io)` reads the port subsystem's own byte counters: `output` is what
-    /// `port_command/2,3` handed to a port's stream and `input` is what a port delivered back
-    /// as `{Port, {data, …}}`. Both are bumped at the real read/write sites, so a byte count
-    /// can never be a fabricated constant.
-    #[test]
-    fn the_io_counters_track_the_bytes_written_to_and_read_from_a_port() {
-        let mut fx = fixture();
-        // The runtime keeps a clone of the registry's counters; grab it before borrowing the
-        // registry mutably below.
-        let counters = fx.registry.borrow().io_counters();
-        assert_eq!(counters.bytes(), (0, 0), "a fresh runtime has moved no port bytes");
-
-        let name = fx.spawn("cat");
-        let port = fx
-            .hook
-            .open_port(name, NIL)
-            .expect("open_port({spawn, \"cat\"}, [])");
-        // `cat` echoes exactly what it is given, so the write and the echo are both
-        // observable through the runtime's own poller.
-        fx.registry
-            .borrow_mut()
-            .write_command(port, b"hello")
-            .expect("port_command");
-        assert_eq!(
-            counters.bytes(),
-            (0, 5),
-            "the write is `output`; nothing has been read back yet"
-        );
-        let echo = pump_data(&mut fx.registry.borrow_mut(), port);
-        assert_eq!(&echo, b"hello");
-        assert_eq!(
-            counters.bytes(),
-            (5, 5),
-            "the echo `cat` produced is `input`"
-        );
-
-        // A rejected write moves nothing: the counters are bumped only after the port is
-        // resolved.
-        assert_badarg(fx.registry.borrow_mut().write_command(PortId::new(9), b"x"));
-        assert_eq!(counters.bytes(), (5, 5));
-    }
-
-    #[test]
-    fn a_fd_port_write_reaches_the_adopted_descriptor() {
-        use std::io::Read;
-        use std::os::fd::AsRawFd;
-        use std::os::unix::net::UnixStream;
-
-        let mut fx = fixture();
-        // A descriptor the **test** owns and keeps open: `beam_io`'s driver adopts a
-        // `{fd, N}` by putting it in non-blocking mode (`fcntl(F_SETFL, O_NONBLOCK)`), which
-        // the sandbox refuses for an inherited descriptor (`EPERM`); a socketpair end always
-        // accepts it. The adoption is **duplex** — the one descriptor is registered with
-        // `Interest::BOTH` — so `port_command` writes out through it (the oracle's own
-        // behaviour for a `{fd, N}` port).
-        let (local, mut peer) = UnixStream::pair().expect("a socketpair");
-        let fd = local.as_raw_fd();
-        let name = fx.name("fd", make_small(i64::from(fd)));
-        let port = fx.hook.open_port(name, NIL).expect("{fd, N}");
-
-        // The write takes the normal driver write path and the bytes come out of the peer.
-        fx.registry
-            .borrow_mut()
-            .write_command(port, b"ping")
-            .expect("the write reaches the adopted descriptor");
-        let mut buf = [0u8; 4];
-        peer.set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("a read timeout");
-        peer.read_exact(&mut buf)
-            .expect("the peer reads what the port wrote");
-        assert_eq!(&buf, b"ping");
-
-        // A write never closes the port.
-        assert!(fx.registry.borrow().is_live(port));
-        fx.hook.close_port(port).expect("port_close/1");
-    }
-
-    #[test]
-    fn an_empty_port_name_is_badarg() {
-        let mut fx = fixture();
-        // The oracle rejects an empty command/path in its own validation of the `Name`
-        // (`open_port({spawn,""},[])` and `open_port({spawn_executable,""},[])` are both
-        // `error:badarg` against erts-17.1) — before any driver is reached, whose `exec` of
-        // an empty program would report `enoent` instead.
-        let empty = fx.string("");
-        let name = fx.name("spawn", empty);
-        assert_badarg(fx.hook.open_port(name, NIL));
-        let empty = fx.string("");
-        let name = fx.name("spawn_executable", empty);
-        assert_badarg(fx.hook.open_port(name, NIL));
-        // The 3-tuple form carries the same name.
-        let empty = fx.string("");
-        let options = fx.list(&[]);
-        let tag = fx.atom("spawn_executable");
-        let name = fx.heap.tuple(&[tag, empty, options]).expect("a name tuple");
-        assert_badarg(fx.hook.open_port(name, NIL));
-
-        // Validation precedes allocation: none of the rejected calls consumed a port number.
-        let name = fx.spawn("true");
-        let port = fx.hook.open_port(name, NIL).expect("a valid port");
-        assert_eq!(port, PortId::new(0));
-    }
-
-    #[test]
-    fn closing_a_port_notifies_the_driver_of_the_exit_before_the_teardown() {
-        let fx = fixture();
-        let log = Rc::new(RefCell::new(Vec::new()));
-        let driver = RecorderDriver::new("recorder", Rc::clone(&log));
-        let port = fx
-            .registry
-            .borrow_mut()
-            .register(Box::new(driver), test_meta("recorder"))
-            .expect("a registered port");
-
-        // The driver is told the port is exiting (`Closed`) **before** its teardown `stop`:
-        // the two are distinct callbacks, and the order is what makes `port_exit` an
-        // advisory notification rather than part of the teardown.
-        fx.registry.borrow_mut().close(port).expect("close");
-        assert_eq!(
-            *log.borrow(),
-            vec!["exit:Closed".to_string(), "stop".to_string()],
-            "the port-exit notification precedes the teardown"
-        );
-        assert!(!fx.registry.borrow().contains(port));
-        // A close the runtime has already performed is never silently accepted again.
-        assert_badarg(fx.registry.borrow_mut().close(port));
-    }
-
-    #[test]
-    fn a_port_exit_notification_is_delivered_once_and_leaves_the_port_live() {
-        let fx = fixture();
-        let log = Rc::new(RefCell::new(Vec::new()));
-        let driver = RecorderDriver::new("recorder", Rc::clone(&log));
-        let port = fx
-            .registry
-            .borrow_mut()
-            .register(Box::new(driver), test_meta("recorder"))
-            .expect("a registered port");
-
-        // An isolated notification reaches the driver **once** and does not tear the port
-        // down: a repeat never calls `port_exit` again, and the port is still live for the
-        // later `stop`.
-        let mut borrowed = fx.registry.borrow_mut();
-        let ports = &mut *borrowed;
-        ports
-            .registry
-            .notify_port_exit(&mut ports.poller, port, PortExitReason::Closed)
-            .expect("the first notification reaches the driver");
-        assert_eq!(*log.borrow(), vec!["exit:Closed".to_string()]);
-        ports
-            .registry
-            .notify_port_exit(&mut ports.poller, port, PortExitReason::OwnerExited)
-            .expect("a repeat is a no-op");
-        assert_eq!(
-            *log.borrow(),
-            vec!["exit:Closed".to_string()],
-            "the port-exit notification is delivered at most once"
-        );
-        assert!(
-            ports.contains(port),
-            "the notification leaves the port live"
-        );
-        ports.close(port).expect("the teardown still runs");
-        assert_eq!(
-            *log.borrow(),
-            vec!["exit:Closed".to_string(), "stop".to_string()]
-        );
-    }
-
-    #[test]
-    fn the_pump_clamps_its_wait_to_a_driver_declared_deadline() {
-        let fx = fixture();
-        let fired_at = Rc::new(RefCell::new(None::<Instant>));
-        // A deadline inside `PORT_POLL_SLICE`: without the clamp the first poll would spend
-        // the whole slice before the port's `TIMEOUT` task could run at all.
-        let declared = Instant::now() + Duration::from_millis(10);
-        let driver = RecorderDriver::with_timer(declared, Rc::clone(&fired_at));
-        fx.registry
-            .borrow_mut()
-            .register(Box::new(driver), test_meta("timer"))
-            .expect("a registered port");
-
-        // The declaration reaches the clamp: `beam_io`'s `next_deadline` is exactly the
-        // driver's `next_timeout`, which the port's `TIMEOUT` task mirrors.
-        assert_eq!(
-            fx.registry.borrow().registry.next_deadline(),
-            Some(declared),
-            "the driver's declaration is the clamp's upper bound"
-        );
-
-        // A pump whose own timeout (60 ms) is far past the deadline still services the timer
-        // **at** its deadline: the poll may not block past it, so the task round right after
-        // the poll runs it. Unclamped, the first poll would block a whole `PORT_POLL_SLICE`.
-        let started = Instant::now();
-        let events = fx
-            .registry
-            .borrow_mut()
-            .pump(Duration::from_millis(60))
-            .expect("pump");
-        assert!(events.is_empty(), "a timer is not a port message: {events:?}");
-
-        let fired = fired_at.borrow().expect("the declared timer fired");
-        let delay = fired.duration_since(started);
-        assert!(
-            delay >= Duration::from_millis(5),
-            "the deadline is a lower bound — the timer must not fire early, fired after {delay:?}"
-        );
-        assert!(
-            delay < PORT_POLL_SLICE,
-            "the wait was clamped below the {PORT_POLL_SLICE:?} slice, fired after {delay:?}"
-        );
-        // The timer fired once and cleared its own declaration, so nothing is left armed.
-        assert_eq!(*fired_at.borrow(), Some(fired), "the timer fired exactly once");
-        assert_eq!(fx.registry.borrow().registry.next_deadline(), None);
-    }
-    #[test]
-    fn a_fd_port_adopts_a_caller_owned_descriptor() {
-        use std::io::Write;
-        use std::os::fd::AsRawFd;
-        use std::os::unix::net::UnixStream;
-
-        let mut fx = fixture();
-        // A descriptor the **test** owns and keeps open for the whole test.
-        // `beam_io`'s driver adopts a `{fd, N}` by putting it in non-blocking mode
-        // (`fcntl(F_SETFL, O_NONBLOCK)`), which the sandbox refuses for an inherited
-        // descriptor (fd 0 yields `EPERM`); a socketpair end always accepts it, so the
-        // childless name form is exercised independently of the test harness's fds.
-        let (mut local, _peer) = UnixStream::pair().expect("a socketpair");
-        let fd = local.as_raw_fd();
-
-        let name = fx.name("fd", make_small(i64::from(fd)));
-        let port = fx
-            .hook
-            .open_port(name, NIL)
-            .expect("{fd, N} adopts the descriptor");
-
-        // A descriptor port has no OS process of its own, is connected to its owner, and
-        // reports the `fd:<N>` rendering the reference implementation uses.
-        assert_eq!(fx.item(port, "os_pid"), fx.atom("undefined"));
-        assert_eq!(fx.item(port, "connected"), OWNER.to_eterm());
-        assert_eq!(text_of(fx.item(port, "name")), format!("fd:{fd}"));
-        assert!(fx.registry.borrow().contains(port));
-
-        // Closing the port releases it but **never closes** the adopted descriptor: it
-        // belongs to the Erlang side. The write below would fail with `EBADF` if the
-        // driver had closed it.
-        fx.hook.close_port(port).expect("port_close/1");
-        assert!(!fx.registry.borrow().contains(port));
-        local
-            .write_all(b"x")
-            .expect("the adopted descriptor is still open after port_close/1");
-    }
-
-    #[test]
-    fn port_info_on_an_unknown_or_closed_port_is_an_empty_pair_list() {
-        let mut fx = fixture();
-        // Never opened: no pairs (the oracle's `undefined` through `beam_bifs`, and the
-        // native floor's own `undefined` for `erlang:port_info/1,2`).
-        assert!(fx.hook.port_info(PortId::new(9)).expect("no badarg").is_empty());
-        assert!(!fx.registry.borrow().is_live(PortId::new(9)));
-
-        // Closed: same answer, and `port_close/1` on it is still `badarg` — the two are
-        // deliberately different questions (reports may be empty, but a close the runtime
-        // cannot perform is never silently accepted).
-        let name = fx.spawn("true");
-        let port = fx.hook.open_port(name, NIL).expect("open_port");
-        assert!(fx.registry.borrow().is_live(port));
-        assert_eq!(
-            fx.hook.port_info(port).expect("a live port").len(),
-            8,
-            "seven `/1` items plus the `/2`-only `monitors`"
-        );
-        fx.hook.close_port(port).expect("port_close/1");
-        assert!(!fx.registry.borrow().is_live(port));
-        assert!(fx.hook.port_info(port).expect("no badarg").is_empty());
-        assert_badarg(fx.hook.close_port(port));
-    }
-
-    #[test]
-    fn the_exit_status_option_is_remembered_on_the_port() {
-        let mut fx = fixture();
-        // Without the option the poller has nothing to report.
-        let name = fx.spawn("true");
-        let plain = fx.hook.open_port(name, NIL).expect("open_port");
-        let exit_status = fx.atom("exit_status");
-        let options = fx.list(&[exit_status]);
-        let name = fx.spawn("true");
-        let with_option = fx.hook.open_port(name, options).expect("open_port");
-        let registry = fx.registry.borrow();
-        assert!(
-            !registry.meta.get(&plain.number()).expect("a port").notify_exit,
-            "a port opened without exit_status must not report an exit message"
-        );
-        assert!(
-            registry
-                .meta
-                .get(&with_option.number())
-                .expect("a port")
-                .notify_exit,
-            "the exit_status option must be recorded"
-        );
-    }
-
-    #[test]
-    fn the_pump_reports_a_reaped_childs_exit_status_once() {
-        let mut fx = fixture();
-        let exit_status = fx.atom("exit_status");
-        let options = fx.list(&[exit_status]);
-        let name = fx.spawn("sh -c \"exit 3\"");
-        let port = fx.hook.open_port(name, options).expect("open_port");
-
-        // The status is not tied to stream readiness: a child that wrote nothing still
-        // reports it, and it is reported exactly once.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut status = None;
-        let mut reports = 0;
-        while Instant::now() < deadline {
-            for event in fx
-                .registry
-                .borrow_mut()
-                .pump(Duration::from_millis(50))
-                .expect("pump")
-            {
-                if let PortEvent::Exited {
-                    port: source,
-                    status: reported,
-                    ..
-                } = event
-                {
-                    assert_eq!(source, port);
-                    status = Some(reported);
-                    reports += 1;
-                }
-            }
-            if status.is_some() {
-                break;
-            }
-        }
-        assert_eq!(status, Some(3), "the reaped child's exit code");
-        assert_eq!(reports, 1);
-
-        // A second round must not report it again.
-        let quiet = fx
-            .registry
-            .borrow_mut()
-            .pump(Duration::from_millis(50))
-            .expect("pump");
-        assert!(
-            quiet.is_empty(),
-            "an exit status is handed out exactly once: {quiet:?}"
-        );
-
-        // A port opened *without* the option never reports one.
-        let name = fx.spawn("true");
-        let plain = fx.hook.open_port(name, NIL).expect("open_port");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            let events = fx
-                .registry
-                .borrow_mut()
-                .pump(Duration::from_millis(50))
-                .expect("pump");
-            for event in events {
-                assert!(
-                    !matches!(event, PortEvent::Exited { port: p, .. } if p == plain),
-                    "a port without the exit_status option must not report one"
-                );
-            }
-            if fx.registry.borrow().is_live(plain) {
-                // The child has certainly exited by now; nothing was reported for it.
-                break;
-            }
-        }
-    }
-
-    #[test]
-    fn the_port_info_atom_vocabulary_is_seeded() {
-        let atoms = AtomTable::new();
-        let mut seeded = atoms;
-        boot::seed_core_atoms(&mut seeded);
-        for name in PORT_INFO_ATOMS {
-            assert!(seeded.lookup(name).is_some(), "{name} must be seeded");
-        }
-        // The provider resolves `true`/`false`/`undefined` too.
-        for name in ["true", "false", "undefined"] {
-            assert!(seeded.lookup(name).is_some(), "{name} must be seeded");
-        }
-    }
-
-    #[test]
-    fn an_empty_port_registry_has_no_ports() {
-        let registry = PortRegistry::new().expect("a port registry");
-        assert!(registry.is_empty());
-        assert!(!registry.contains(PortId::new(0)));
-        assert_eq!(registry.len(), 0);
-        assert!(registry.ids().is_empty());
-    }
-
-    #[test]
-    fn ids_reports_live_ports_across_a_released_lower_slot() {
-        let mut fx = fixture();
-        let first = {
-            let name = fx.spawn("true");
-            fx.hook.open_port(name, NIL).expect("first port")
-        };
-        let second = {
-            let name = fx.spawn("true");
-            fx.hook.open_port(name, NIL).expect("second port")
-        };
-        assert_eq!(
-            fx.registry.borrow().ids(),
-            vec![first, second],
-            "the live ports are reported in port-number order"
-        );
-
-        // Closing the *lower* port leaves a gap below the still-live higher one. The
-        // metadata map is the source of truth, so `ids` still reports the higher port (a
-        // scan-from-zero recovery would have stopped at the gap and missed it).
-        fx.hook.close_port(first).expect("closing the first port");
-        assert!(!fx.registry.borrow().contains(first));
-        assert_eq!(fx.registry.borrow().ids(), vec![second]);
-    }
-
-    // -----------------------------------------------------------------------------------------
-    // The driver-emitted-term delivery handoff (`erl_drv_output_term`/`erl_drv_send_term`)
-    // -----------------------------------------------------------------------------------------
-
-    /// A `DriverPort` host plus the `port_info` metadata a `{spawn_driver, Name}` `open_port/2`
-    /// builds for it: the two halves of the driver-term handoff (see
-    /// [`RuntimePorts::open_port`]).
-    ///
-    /// The host's [`driver::TermQueue`] is the **same** handle stored on `meta.driver_terms`, so
-    /// pushing through the host (what a driver callback does) is exactly what the port's drain
-    /// observes.
-    fn driver_term_host(atoms: &Rc<AtomTable>, owner: ProcessId) -> (driver::DriverPort, PortMeta) {
-        let host = driver::DriverPort::new(
-            Heap::new(64).expect("a driver heap"),
-            Rc::clone(atoms),
-            owner,
-        );
-        let queue = host.term_queue();
-        let mut meta = test_meta("driver");
-        meta.kind = PortName::SpawnDriver;
-        meta.owner = owner;
-        meta.driver_terms = Some(queue);
-        (host, meta)
-    }
-
-    /// The same, registered in the fixture's registry (a port with no OS child, driven by a
-    /// [`RecorderDriver`]).
-    fn driver_term_fixture(
-        fx: &Fixture,
-        owner: ProcessId,
-    ) -> (driver::DriverPort, PortId) {
-        let (host, meta) = driver_term_host(&fx.atoms, owner);
-        let port = fx
-            .registry
-            .borrow_mut()
-            .register(
-                Box::new(RecorderDriver::new("recorder", Rc::new(RefCell::new(Vec::new())))),
-                meta,
-            )
-            .expect("a registered driver port");
-        (host, port)
-    }
-
-    /// A term a C driver emitted is drained off the port's [`driver::TermQueue`] as a
-    /// [`PortEvent::Term`] — the decoded term itself, with the destination `erl_drv_output_term`
-    /// (`None` = the owner) or `erl_drv_send_term` (`Some(pid)`) named — and a destination this
-    /// node cannot resolve is dropped (the C's own "not delivered", `io.c:5664`).
-    #[test]
-    fn a_driver_emitted_term_is_drained_as_a_term_event() {
-        use beam_abi::DriverHost;
-
-        let fx = fixture();
-        let (mut host, port) = driver_term_fixture(&fx, OWNER);
-
-        // Nothing queued yet.
-        assert!(fx.registry.borrow_mut().take_driver_terms().is_empty());
-
-        let recipient = ProcessId::new(9, 0);
-        // `erl_drv_output_term`: the port's connected process.
-        assert_eq!(host.send_term(std::ptr::null_mut(), None, make_small(1)), 0);
-        // `erl_drv_send_term`: an explicit destination.
-        assert_eq!(
-            host.send_term(std::ptr::null_mut(), Some(recipient.to_eterm()), make_small(2)),
-            0
-        );
-        // A destination that is not a pid of this node: the C's refusal, never a misdelivery.
-        assert_eq!(
-            host.send_term(std::ptr::null_mut(), Some(make_small(3)), make_small(4)),
-            0
-        );
-
-        let events = fx.registry.borrow_mut().take_driver_terms();
-        assert_eq!(
-            events.len(),
-            2,
-            "the unresolvable destination is dropped: {events:?}"
-        );
-        match &events[0] {
-            PortEvent::Term {
-                port: source,
-                to,
-                term,
-                owner,
-            } => {
-                assert_eq!(*source, port);
-                assert_eq!(*to, None, "`None` = the port owner");
-                assert_eq!(*term, make_small(1));
-                assert_eq!(*owner, OWNER);
-            }
-            other => panic!("expected a term event, got {other:?}"),
-        }
-        match &events[1] {
-            PortEvent::Term { to, term, .. } => {
-                assert_eq!(*to, Some(recipient));
-                assert_eq!(*term, make_small(2));
-            }
-            other => panic!("expected a term event, got {other:?}"),
-        }
-        // Draining empties the queue: a second round reports nothing.
-        assert!(fx.registry.borrow_mut().take_driver_terms().is_empty());
-    }
-
-    /// The port pump surfaces a driver-emitted term as its own event (it is one of the two
-    /// producers [`PortRegistry::pump`] harvests, next to `driver_output`'s bytes).
-    #[test]
-    fn the_pump_reports_a_driver_emitted_term() {
-        use beam_abi::DriverHost;
-
-        let fx = fixture();
-        let (mut host, port) = driver_term_fixture(&fx, OWNER);
-        assert_eq!(host.send_term(std::ptr::null_mut(), None, make_small(7)), 0);
-
-        let events = fx
-            .registry
-            .borrow_mut()
-            .pump(Duration::from_millis(1))
-            .expect("pump");
-        assert!(
-            events.iter().any(|event| matches!(
-                event,
-                PortEvent::Term { port: p, term, .. } if *p == port && *term == make_small(7)
-            )),
-            "the pump must report the driver's term: {events:?}"
-        );
-        // Handed out exactly once.
-        assert!(fx.registry.borrow_mut().take_driver_terms().is_empty());
-    }
-
-    /// A driver-emitted term is delivered into its recipient's mailbox by
-    /// [`Runtime::deliver_port_messages`]: the term itself (never a `{Port, Term}` wrapper), to the
-    /// port's owner for `erl_drv_output_term` and to the named pid for `erl_drv_send_term`.
-    ///
-    /// The term was built on the **driver host's** arena, so it is copied onto the runtime's
-    /// pointer-stable heap before delivery — the mailbox payload is a fresh copy, not the driver's
-    /// own words (see [`RuntimeContext::stabilize_driver_term`]).
-    #[test]
-    fn a_driver_emitted_term_is_delivered_into_the_recipients_mailbox() {
-        use beam_abi::DriverHost;
-
-        let mut rt = Runtime::new(RuntimeConfig::default()).expect("the default runtime");
-        let mut table = ProcessTable::new(SignalAtoms::from_table(&mut AtomTable::new()));
-        let owner = table.spawn_default().expect("the port's owner");
-        let other = table.spawn_default().expect("an explicit destination");
-
-        // A two-element tuple built on the *host's* arena, so the delivered copy proves the term
-        // was stabilised off that heap rather than shared. A fresh `AtomTable` is fine: nothing in
-        // this term is an atom.
-        let atoms = Rc::new(AtomTable::new());
-        let (mut host, meta) = driver_term_host(&atoms, owner);
-        let mut scratch = Heap::new(16).expect("a scratch heap");
-        let queued = scratch
-            .tuple(&[make_small(1), make_small(2)])
-            .expect("a small tuple");
-        assert_eq!(host.send_term(std::ptr::null_mut(), None, queued), 0);
-        assert_eq!(
-            host.send_term(std::ptr::null_mut(), Some(other.to_eterm()), queued),
-            0
-        );
-
-        let port = rt
-            .ports
-            .borrow_mut()
-            .register(
-                Box::new(RecorderDriver::new("recorder", Rc::new(RefCell::new(Vec::new())))),
-                meta,
-            )
-            .expect("a registered driver port");
-
-        let delivered = rt
-            .deliver_port_messages(&mut table, Duration::from_millis(1))
-            .expect("deliver");
-        assert_eq!(delivered, 2, "both terms are delivered");
-
-        // The owner got the `erl_drv_output_term` term; the explicit destination got its own.
-        let in_owner = table
-            .get(owner)
-            .expect("the owner")
-            .mailbox()
-            .peek()
-            .expect("a message")
-            .payload();
-        assert_eq!(
-            terms::tuple_arity(in_owner).expect("the term itself is the message"),
-            2,
-            "in_owner={in_owner:?}"
-        );
-        assert_eq!(signed_value(terms::tuple_element(in_owner, 0).unwrap()), 1);
-        assert_eq!(signed_value(terms::tuple_element(in_owner, 1).unwrap()), 2);
-        assert_ne!(
-            in_owner.raw(),
-            queued.raw(),
-            "the delivered term is a copy off the driver's arena"
-        );
-
-        let in_other = table
-            .get(other)
-            .expect("the explicit destination")
-            .mailbox()
-            .peek()
-            .expect("a message")
-            .payload();
-        assert_eq!(terms::tuple_arity(in_other).unwrap(), 2, "{in_other:?}");
-
-        // The `from` of both messages is the port itself (what send-tracing reports).
-        assert_eq!(
-            table.get(owner).unwrap().mailbox().peek().unwrap().from(),
-            port.to_eterm()
-        );
-    }
-
-    /// An unresolvable `erl_drv_send_term` destination is dropped at the drain, so
-    /// [`Runtime::deliver_port_messages`] delivers nothing for it — the C's own "not delivered".
-    #[test]
-    fn a_driver_term_with_an_unresolvable_destination_is_not_delivered() {
-        use beam_abi::DriverHost;
-
-        let mut rt = Runtime::new(RuntimeConfig::default()).expect("the default runtime");
-        let mut table = ProcessTable::new(SignalAtoms::from_table(&mut AtomTable::new()));
-        let owner = table.spawn_default().expect("the port's owner");
-
-        let atoms = Rc::new(AtomTable::new());
-        let (mut host, meta) = driver_term_host(&atoms, owner);
-        assert_eq!(
-            host.send_term(std::ptr::null_mut(), Some(make_small(3)), make_small(4)),
-            0
-        );
-        let _ = rt
-            .ports
-            .borrow_mut()
-            .register(
-                Box::new(RecorderDriver::new("recorder", Rc::new(RefCell::new(Vec::new())))),
-                meta,
-            )
-            .expect("a registered driver port");
-
-        let delivered = rt
-            .deliver_port_messages(&mut table, Duration::from_millis(1))
-            .expect("deliver");
-        assert_eq!(delivered, 0, "the unresolvable destination is dropped");
-        assert!(
-            table.get(owner).expect("the owner").mailbox().is_empty(),
-            "nothing reaches the owner"
-        );
-    }
-
-    /// A term addressed to a process that is **not** the port's owner and not the evaluating
-    /// process is delivered to the named process, not to the owner.
-    #[test]
-    fn an_explicit_destination_overrides_the_owner() {
-        use beam_abi::DriverHost;
-
-        let mut rt = Runtime::new(RuntimeConfig::default()).expect("the default runtime");
-        let mut table = ProcessTable::new(SignalAtoms::from_table(&mut AtomTable::new()));
-        let owner = table.spawn_default().expect("the port's owner");
-        let other = table.spawn_default().expect("the destination");
-
-        let atoms = Rc::new(AtomTable::new());
-        let (mut host, meta) = driver_term_host(&atoms, owner);
-        assert_eq!(
-            host.send_term(std::ptr::null_mut(), Some(other.to_eterm()), make_small(42)),
-            0
-        );
-        let _ = rt
-            .ports
-            .borrow_mut()
-            .register(
-                Box::new(RecorderDriver::new("recorder", Rc::new(RefCell::new(Vec::new())))),
-                meta,
-            )
-            .expect("a registered driver port");
-
-        let delivered = rt
-            .deliver_port_messages(&mut table, Duration::from_millis(1))
-            .expect("deliver");
-        assert_eq!(delivered, 1);
-        assert_eq!(
-            table.get(other).unwrap().mailbox().peek().unwrap().payload(),
-            make_small(42)
-        );
-        assert!(
-            table.get(owner).unwrap().mailbox().is_empty(),
-            "the owner receives nothing for an explicit destination"
-        );
-    }
-
-    /// The `-eval` receive path returns a driver term addressed to the runtime's own process and
-    /// skips one addressed elsewhere (it can only observe its own mailbox).
-    #[test]
-    fn the_eval_receive_path_returns_only_its_own_driver_terms() {
-        use beam_abi::DriverHost;
-
-        let mut rt = Runtime::new(RuntimeConfig::default()).expect("the default runtime");
-        let me = rt.self_pid();
-        let elsewhere = ProcessId::new(1234, 0);
-
-        let atoms = Rc::new(AtomTable::new());
-        let (mut host, meta) = driver_term_host(&atoms, me);
-        // Addressed to the runtime's own process (the port owner).
-        assert_eq!(host.send_term(std::ptr::null_mut(), None, make_small(11)), 0);
-        // Addressed explicitly to the same process.
-        assert_eq!(
-            host.send_term(std::ptr::null_mut(), Some(me.to_eterm()), make_small(12)),
-            0
-        );
-        // Addressed to another process: not observable here.
-        assert_eq!(
-            host.send_term(std::ptr::null_mut(), Some(elsewhere.to_eterm()), make_small(13)),
-            0
-        );
-        let _ = rt
-            .ports
-            .borrow_mut()
-            .register(
-                Box::new(RecorderDriver::new("recorder", Rc::new(RefCell::new(Vec::new())))),
-                meta,
-            )
-            .expect("a registered driver port");
-
-        let messages = {
-            let mut ctx = RuntimeContext::new(&mut rt);
-            ctx.poll_port_messages(Duration::from_millis(1))
-                .expect("poll")
-        };
-        let values: Vec<i64> = messages.iter().map(|term| signed_value(*term)).collect();
-        assert_eq!(
-            values,
-            vec![11, 12],
-            "only the terms addressed to the evaluating process are returned"
-        );
-    }
-
-    /// [`RuntimeContext::stabilize_driver_term`] copies a heap term onto the runtime's
-    /// pointer-stable arena: the copy is at a different address and is structurally the same.
-    #[test]
-    fn stabilize_driver_term_copies_a_heap_term() {
-        let mut rt = Runtime::new(RuntimeConfig::default()).expect("the default runtime");
-        let mut src = Heap::new(16).expect("a source heap");
-        let term = src
-            .tuple(&[make_small(5), make_small(6)])
-            .expect("a small tuple");
-
-        let stable = {
-            let mut ctx = RuntimeContext::new(&mut rt);
-            ctx.stabilize_driver_term(term).expect("stabilize")
-        };
-        assert_ne!(stable.raw(), term.raw(), "the term is copied off its source heap");
-        assert_eq!(terms::tuple_arity(stable).unwrap(), 2);
-        assert_eq!(signed_value(terms::tuple_element(stable, 0).unwrap()), 5);
-        assert_eq!(signed_value(terms::tuple_element(stable, 1).unwrap()), 6);
-
-        // An immediate is shared, not copied.
-        let stable_immediate = {
-            let mut ctx = RuntimeContext::new(&mut rt);
-            ctx.stabilize_driver_term(make_small(9)).expect("stabilize")
-        };
-        assert_eq!(stable_immediate, make_small(9));
-    }
-
-    // --- `os:set_signal/2`'s delivery half (contract A.8) --------------------------------
-    //
-    // [`watch`] owns the mechanism (the one facility, the self-pipe, the dispositions) and
-    // [`PortRegistry::pump`] turns a caught signal into a [`PortEvent::Signal`]; the tests below
-    // prove the *delivery* [`Runtime::deliver_port_messages`] performs — the `{notify, Name}`
-    // 2-tuple, addressed by name to the `erl_signal_server` process with `system` as the sender
-    // (`signal_notify_requested`, `erts/emulator/sys/unix/sys.c:589-604`).
-    //
-    // Two properties of the subject shape every test here:
-    //
-    // * a disposition is **process-global**, so these tests serialize with the other
-    //   disposition-mutating tests of this crate's lib test binary on [`watch::test_guard`];
-    // * the signal is sent **from outside** with `kill(1)` (how an operator sends it), so it
-    //   arrives asynchronously — hence the bounded, poll-driven waits (each round is a real
-    //   [`PORT_POLL_SLICE`] poll of the runtime's own poller) rather than a single pump or a
-    //   fixed sleep.
-
-    /// How long a test waits for a signal it has sent to arrive and be delivered.
-    ///
-    /// Generous on purpose, and only ever spent on *failure*: a passing test returns as soon as
-    /// the delivery lands, and a signal is normally caught within the first slice.
-    const SIGNAL_DELIVERY_BOUND: Duration = Duration::from_secs(5);
-
-    /// A runtime and a [`ProcessTable`] sharing the **runtime's** atom table.
-    ///
-    /// The sharing is load-bearing: [`Runtime::deliver_port_messages`] resolves
-    /// `erl_signal_server` in the *runtime's* table and then asks `table.whereis` for the
-    /// process registered under that atom — a table built from an unrelated `AtomTable` would
-    /// hold the name under a different index and never find the server.
-    fn runtime_with_table() -> (Runtime, ProcessTable) {
-        let mut rt = Runtime::new(RuntimeConfig::default()).expect("the default runtime");
-        let table = ProcessTable::new(SignalAtoms::from_table(rt.code_server_atoms_mut()));
-        (rt, table)
-    }
-
-    /// Registers `pid` as `erl_signal_server`, interning the name into the runtime's shared
-    /// table (so the runtime's own `lookup` in [`Runtime::deliver_port_messages`] finds it).
-    fn register_signal_server(rt: &mut Runtime, table: &mut ProcessTable, pid: ProcessId) {
-        let name = rt.code_server_atoms_mut().intern("erl_signal_server");
-        table
-            .register(name, pid)
-            .expect("`erl_signal_server` is a free name");
-    }
-
-    /// Drives the port half until it has delivered `wanted` messages, returning the total
-    /// delivered — bounded by [`SIGNAL_DELIVERY_BOUND`].
-    ///
-    /// A signal's arrival is asynchronous, so the first round may legitimately observe nothing;
-    /// each round polls for up to [`PORT_POLL_SLICE`], making this a bounded wait on the
-    /// runtime's own poller rather than a race against a fixed sleep.
-    fn deliver_until(rt: &mut Runtime, table: &mut ProcessTable, wanted: usize) -> usize {
-        let deadline = Instant::now() + SIGNAL_DELIVERY_BOUND;
-        let mut delivered = 0;
-        while delivered < wanted && Instant::now() < deadline {
-            delivered += rt
-                .deliver_port_messages(table, PORT_POLL_SLICE)
-                .expect("the port poll must not fail");
-        }
-        delivered
-    }
-
-    /// Waits (bounded) until the signal self-pipe is readable — that is, until the trampoline
-    /// has really **caught** a signal — without consuming it (see `watch::watcher::pending`).
-    fn wait_until_caught() -> bool {
-        let deadline = Instant::now() + SIGNAL_DELIVERY_BOUND;
-        while Instant::now() < deadline {
-            if watch::watcher::pending() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        false
-    }
-
-    /// The `{notify, Name}` payload of the first message `pid` received.
-    fn notify_payload(table: &ProcessTable, pid: ProcessId) -> Eterm {
-        table
-            .get(pid)
-            .expect("the signal server is live")
-            .mailbox()
-            .peek()
-            .expect("the signal server received a message")
-            .payload()
-    }
-
-    /// A handled signal reaches the process registered as `erl_signal_server` as the 2-tuple
-    /// `{notify, Sigusr1}`, sent by the emulator itself (`system`) — and **wakes** that process,
-    /// which was blocked (`os:set_signal/2`'s delivery half, end to end).
-    #[test]
-    fn a_handled_signal_is_delivered_to_the_registered_signal_server() {
-        let _guard = watch::test_guard();
-        let (mut rt, mut table) = runtime_with_table();
-        let server = table.spawn_default().expect("the signal server process");
-        register_signal_server(&mut rt, &mut table, server);
-        // Blocked, like a process sitting in `receive {notify, _} -> … end`: the notification
-        // has to wake it through `beam_process`'s own resume-on-send path.
-        table
-            .get_mut(server)
-            .expect("the server")
-            .set_state(ProcessState::Waiting);
-
-        let before = watch::watcher::current(Signal::SigUsr1);
-        watch::install(Signal::SigUsr1, Disposition::Handle).expect("install handle on sigusr1");
-        watch::watcher::send_to_self(Signal::SigUsr1);
-        let delivered = deliver_until(&mut rt, &mut table, 1);
-        watch::install(Signal::SigUsr1, before).expect("restore the prior sigusr1 disposition");
-
-        assert_eq!(
-            delivered, 1,
-            "a handled signal must reach the registered `erl_signal_server` within \
-             {SIGNAL_DELIVERY_BOUND:?}"
-        );
-        assert!(
-            table.woken().contains(&server),
-            "the blocked server must be woken by the delivery: {:?}",
-            table.woken()
-        );
-        assert_eq!(
-            table.get(server).expect("the server").state(),
-            ProcessState::Runnable,
-            "the wake puts the server back on the run queue"
-        );
-
-        let message = notify_payload(&table, server);
-        assert_eq!(
-            terms::tuple_arity(message).expect("the notification is a tuple"),
-            2,
-            "message={message:?}"
-        );
-        let tag = terms::tuple_element(message, 0).expect("element 0");
-        assert_eq!(
-            rt.atom_name_of(tag),
-            Some("notify"),
-            "element 0 is the `notify` atom"
-        );
-        let name = terms::tuple_element(message, 1).expect("element 1");
-        assert_eq!(
-            rt.atom_name_of(name),
-            Some("sigusr1"),
-            "element 1 names the signal with its own atom"
-        );
-        // The sender is the emulator (`am_system`), exactly as `signal_notify_requested` sends it
-        // — not a pid, and not the port-less `undefined`.
-        let from = table
-            .get(server)
-            .expect("the server")
-            .mailbox()
-            .peek()
-            .expect("a message")
-            .from();
-        assert_eq!(rt.atom_name_of(from), Some("system"), "sender is `system`");
-    }
-
-    /// With **no** process registered as `erl_signal_server`, a caught signal is dropped
-    /// silently: no message, no error, and [`Runtime::deliver_port_messages`] reports `Ok(0)` —
-    /// the C's own behaviour (nothing is sent when the name has no live process).
-    ///
-    /// The test first proves the signal really *was* caught (the self-pipe is readable), so the
-    /// `Ok(0)` is a **drop**, not a signal that never arrived.
-    #[test]
-    fn a_handled_signal_with_no_signal_server_is_dropped_silently() {
-        let _guard = watch::test_guard();
-        let (mut rt, mut table) = runtime_with_table();
-        // A live process that is deliberately *not* the signal server.
-        let bystander = table.spawn_default().expect("a bystander process");
-
-        let before = watch::watcher::current(Signal::SigUsr1);
-        watch::install(Signal::SigUsr1, Disposition::Handle).expect("install handle on sigusr1");
-        watch::watcher::send_to_self(Signal::SigUsr1);
-        assert!(
-            wait_until_caught(),
-            "the signal was never caught, so the assertion below would be vacuous"
-        );
-
-        let delivered = rt
-            .deliver_port_messages(&mut table, PORT_POLL_SLICE)
-            .expect("a caught signal with no recipient is not an error");
-        watch::install(Signal::SigUsr1, before).expect("restore the prior sigusr1 disposition");
-
-        assert_eq!(delivered, 0, "no `erl_signal_server` ⇒ nothing is delivered");
-        assert!(
-            table
-                .get(bystander)
-                .expect("the bystander")
-                .mailbox()
-                .is_empty(),
-            "a notification must never reach an arbitrary process"
-        );
-        assert!(table.woken().is_empty(), "nothing was woken");
-    }
-
-    /// The watch survives its first drain: a **second** handled signal is delivered again, to
-    /// the same recipient, and wakes it again.
-    #[test]
-    fn a_second_handled_signal_is_delivered_again() {
-        let _guard = watch::test_guard();
-        let (mut rt, mut table) = runtime_with_table();
-        let server = table.spawn_default().expect("the signal server process");
-        register_signal_server(&mut rt, &mut table, server);
-
-        let before = watch::watcher::current(Signal::SigUsr1);
-        watch::install(Signal::SigUsr1, Disposition::Handle).expect("install handle on sigusr1");
-
-        table
-            .get_mut(server)
-            .expect("the server")
-            .set_state(ProcessState::Waiting);
-        watch::watcher::send_to_self(Signal::SigUsr1);
-        assert_eq!(
-            deliver_until(&mut rt, &mut table, 1),
-            1,
-            "the first signal is delivered"
-        );
-        assert!(
-            table.drain_woken().contains(&server),
-            "the first delivery wakes the server"
-        );
-
-        // The registration is *not* consumed by the first round: re-block the server, send a
-        // second signal, and the same watch reports it.
-        table
-            .get_mut(server)
-            .expect("the server")
-            .set_state(ProcessState::Waiting);
-        watch::watcher::send_to_self(Signal::SigUsr1);
-        let second = deliver_until(&mut rt, &mut table, 1);
-        watch::install(Signal::SigUsr1, before).expect("restore the prior sigusr1 disposition");
-
-        assert_eq!(second, 1, "the second signal is delivered too");
-        assert!(
-            table.drain_woken().contains(&server),
-            "and it wakes the server again"
-        );
-        let mailbox = table.get(server).expect("the server").mailbox();
-        assert_eq!(mailbox.len(), 2, "one message per signal");
-        for message in mailbox.iter() {
-            let payload = message.payload();
-            assert_eq!(terms::tuple_arity(payload).expect("a tuple"), 2);
-            assert_eq!(
-                rt.atom_name_of(terms::tuple_element(payload, 0).expect("element 0")),
-                Some("notify")
-            );
-            assert_eq!(
-                rt.atom_name_of(terms::tuple_element(payload, 1).expect("element 1")),
-                Some("sigusr1")
-            );
-            assert_eq!(rt.atom_name_of(message.from()), Some("system"));
-        }
-    }
-
-    /// `ignore` and `default` produce no notification and leave the registry with **nothing to
-    /// poll**: no trampoline is installed, so the self-pipe can never become readable and the
-    /// runtime must not keep sleeping on it.
-    ///
-    /// Only `ignore` is actually *delivered* — the kernel discards it. `default` is never
-    /// exercised with a real signal: `sigusr1`'s default action terminates the process, so a test
-    /// that sent one would kill the whole test binary.
-    #[test]
-    fn ignore_and_default_leave_nothing_to_poll_and_notify_nobody() {
-        let _guard = watch::test_guard();
-        let (mut rt, mut table) = runtime_with_table();
-        let server = table.spawn_default().expect("the signal server process");
-        register_signal_server(&mut rt, &mut table, server);
-
-        let before = watch::watcher::current(Signal::SigUsr1);
-        for disposition in [Disposition::Ignore, Disposition::Default] {
-            watch::install(Signal::SigUsr1, disposition).expect("the OS accepts the disposition");
-            assert!(
-                !watch::watcher::pending(),
-                "{disposition:?} installs no trampoline, so nothing can be caught"
-            );
-            assert!(
-                rt.ports.borrow().has_nothing_to_poll(),
-                "{disposition:?} must leave the runtime nothing to poll"
-            );
-        }
-
-        // `ignore` really is exercised against the kernel: the signal is sent and discarded.
-        watch::install(Signal::SigUsr1, Disposition::Ignore).expect("install ignore on sigusr1");
-        watch::watcher::send_to_self(Signal::SigUsr1);
-        // Give the OS time to act on it, then show the runtime saw nothing at all.
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(
-            !watch::watcher::pending(),
-            "an ignored signal never reaches the trampoline"
-        );
-        let delivered = rt
-            .deliver_port_messages(&mut table, PORT_POLL_SLICE)
-            .expect("deliver");
-        watch::install(Signal::SigUsr1, before).expect("restore the prior sigusr1 disposition");
-
-        assert_eq!(delivered, 0, "an ignored signal notifies nobody");
-        assert!(
-            table.get(server).expect("the server").mailbox().is_empty(),
-            "the signal server receives nothing"
-        );
-        assert!(rt.ports.borrow().has_nothing_to_poll());
-    }
-
-    /// The regression guard for the "don't sleep" shortcut: with **zero** live ports but a
-    /// registered signal watch, [`PortRegistry::has_nothing_to_poll`] is false, so the pump
-    /// still registers the self-pipe and **waits** on it for its slice instead of returning at
-    /// once (the old port-only predicate would have let a caught signal sit undelivered).
-    #[test]
-    fn a_zero_port_runtime_still_polls_a_registered_signal_watch() {
-        let _guard = watch::test_guard();
-        let (mut rt, mut table) = runtime_with_table();
-        // No port is opened at all: the *ports* predicate is empty …
-        assert!(rt.ports.borrow().is_empty(), "no port is open");
-        assert!(
-            !rt.ports.borrow().watch.is_registered(),
-            "nothing is registered before the first round"
-        );
-
-        let before = watch::watcher::current(Signal::SigUsr1);
-        watch::install(Signal::SigUsr1, Disposition::Handle).expect("install handle on sigusr1");
-
-        // … yet a `handle` disposition means there is still something to wait on, so the pump
-        // must not take its early return.
-        assert!(
-            !rt.ports.borrow().has_nothing_to_poll(),
-            "a `handle` disposition keeps the poller awake with zero ports"
-        );
-
-        let started = Instant::now();
-        let delivered = rt
-            .deliver_port_messages(&mut table, PORT_POLL_SLICE)
-            .expect("deliver");
-        let elapsed = started.elapsed();
-        watch::install(Signal::SigUsr1, before).expect("restore the prior sigusr1 disposition");
-
-        assert_eq!(delivered, 0, "no signal has been sent in this test");
-        assert!(
-            rt.ports.borrow().watch.is_registered(),
-            "the round registered the self-pipe with the runtime's poller"
-        );
-        // The wait is real and bounded by the slice: the poll blocks for it when nothing is
-        // ready, where a port-only shortcut returned immediately (every other path in this test
-        // is unchanged whether the round waits or not, which is why the timing *is* the guard).
-        assert!(
-            elapsed >= Duration::from_millis(5),
-            "the zero-port pump must really poll the self-pipe, not return at once \
-             (it returned after {elapsed:?})"
-        );
-    }
+/// `count` bytes as an Erlang integer for a `port_info(Port, input | output)` answer.
+///
+/// A byte total is always non-negative and, on any real host, far below `2^59`, so the small-int
+/// encoding is the oracle's own shape. The `SystemLimit` arm is the honest answer for a count that
+/// somehow did not fit a small integer rather than a truncated figure.
+///
+/// # Errors
+///
+/// [`BeamError::SystemLimit`] when `count` does not fit a small integer.
+fn byte_count(count: u64) -> Result<Eterm> {
+    let value = i64::try_from(count).map_err(|_| BeamError::SystemLimit)?;
+    try_make_small(value).map_err(|_| BeamError::SystemLimit)
 }
+
+/// The provider's unit suite: `open_port/2` decoding, the `port_info/1,2` vocabulary,
+/// the message pump and its driver interop (see `src/port/tests.rs`).
+#[cfg(test)]
+mod tests;
+
+/// Test-only helpers for the provider's own suite and the native floor's port tests: a
+/// minimal always-ready driver and the port-registration helper (see `src/port/test_support.rs`).
+#[cfg(test)]
+pub(crate) mod test_support;

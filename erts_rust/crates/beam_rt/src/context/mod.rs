@@ -1568,6 +1568,7 @@ impl<'a> RuntimeContext<'a> {
             refs: &mut self.runtime.refs,
             references: &mut self.runtime.references,
             processes,
+            ports: &self.runtime.ports,
         };
         let mut host = NifHostImpl::new(
             heap,

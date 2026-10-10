@@ -18,18 +18,19 @@
 //
 // %CopyrightEnd%
 
-//! The port half of the runtime-native BIF floor: `erlang:port_command/2,3` and the
-//! closed-port half of `erlang:port_info/1,2`.
+//! The port half of the runtime-native BIF floor: `erlang:port_command/2,3`,
+//! `erlang:port_control/3` and the closed-port half of `erlang:port_info/1,2`.
 //!
 //! `beam_bifs` owns the *roster* of port BIFs (`open_port/2`, `port_close/1`,
 //! `port_info/1,2`, `list_to_port/1`, `port_to_list/1` — see
 //! `../../beam_bifs/src/port.rs`) and reaches the port *machinery* through the
 //! [`PortHook`](beam_bifs::PortHook) seam, which [`crate::port::RuntimePorts`] implements.
-//! Two things do **not** fit that seam and are served here instead, ahead of the registry:
+//! Three things do **not** fit that seam and are served here instead, ahead of the registry:
 //!
 //! | Call | Why it is runtime-native |
 //! |---|---|
 //! | `erlang:port_command/2,3` | writing to the port's write stream is the port's *input* direction, which the `PortHook` seam has no method for — the runtime owns the write handle |
+//! | `erlang:port_control/3` | the driver's `control` callback, which the `PortHook` seam has no method for either (an `erlang.erl` wrapper over `erts_internal:port_control/3`) |
 //! | `erlang:port_info/1,2` | two answers a `PortHook` returning `{Item, Value}` pairs cannot express: `undefined` for a port the runtime does not hold, and the bare `[]` for a live, **unregistered** port's `registered_name` item |
 //!
 //! # `port_command/2,3`
@@ -76,7 +77,7 @@
 use beam_common::{BeamError, Result};
 use beam_engine::terms;
 use beam_process::PortId;
-use beam_term::{is_small, signed_value, Eterm, NIL};
+use beam_term::{is_small, make_small, signed_value, Eterm, NIL};
 
 use crate::context::RuntimeContext;
 use crate::error;
@@ -98,6 +99,7 @@ impl RuntimeContext<'_> {
         match (function, arity) {
             ("port_command", 2) => Some(self.port_command(args, false)),
             ("port_command", 3) => Some(self.port_command(args, true)),
+            ("port_control", 3) => Some(self.port_control(args)),
             ("port_info", 1) | ("port_info", 2) => self.port_info_native(args),
             _ => None,
         }
@@ -187,6 +189,105 @@ impl RuntimeContext<'_> {
         }
         Ok(force)
     }
+
+    /// `erlang:port_control(Port, Operation, Data)`: hand the drive's own `control` callback an
+    /// operation and answer the **bytes it replied with**.
+    ///
+    /// `erlang:port_control/3` is an `erlang.erl` wrapper over `erts_internal:port_control/3`
+    /// (`../../erts/preloaded/src/erlang.erl:12212`), which is the same shape as `port_command/3`
+    /// — the `PortHook` seam has no `control` method — so it is served here, on the floor, ahead
+    /// of the registry.
+    ///
+    /// The decode follows `erts_internal_port_control_3`
+    /// (`../../erts/emulator/beam/erl_bif_port.c:322-360`):
+    ///
+    /// 1. `Port` must be a port term the runtime holds — anything else is [`BeamError::BadArg`]
+    ///    (`sig_lookup_port`), the oracle's own reason for a closed/unknown/live-less port;
+    /// 2. `Operation` is read with `term_to_Uint`: a non-negative integer up to `UINT_MAX`
+    ///    ([`RuntimeContext::term_to_uint`]); out of range is `badarg`;
+    /// 3. `Data` is iodata ([`RuntimeContext::iodata_bytes`], `erts_iolist_to_buf`), so
+    ///    `port_control(P, 1, <<"x">>)` and `port_control(P, 1, [$x])` are both accepted; a bare
+    ///    integer is not iodata and is `badarg`, exactly as for `port_command/2`.
+    ///
+    /// The verb is forwarded to the driver as its **decimal `c_uint` string** — the convention
+    /// [`RuntimePorts::port_control`](crate::port::RuntimePorts::port_control) documents and
+    /// `beam_io`'s C-driver host parses. The reply is the **driver's own bytes**: a driver with no
+    /// `control` slot, or one that returns a negative result, is `badarg` (the C's
+    /// `call_driver_control`, `io.c:4035/4074`).
+    ///
+    /// An **internal** port — a `{spawn, Cmd}` / `{spawn_executable, Path}` / `{fd, N}` port, whose
+    /// built-in driver has no `control` callback — is `badarg` for **every** verb: the C rejects it
+    /// before any callback (`call_driver_control`, `io.c:4035`) and the oracle answers `badarg`
+    /// (measured). Only a `{spawn_driver, Name}` port carries a user driver whose `control` slot may
+    /// answer ([`PortRegistry::is_driver_port`]).
+    ///
+    /// The reply is an Erlang **list of byte integers** — `write_port_control_result`
+    /// (`io.c:4098-4175`) renders the bytes with `buf_to_intlist` whenever the driver did **not**
+    /// set `PORT_CONTROL_FLAG_BINARY`. A driver that *did* set the flag — `set_port_control_flags`
+    /// from its `control` callback, recorded in the port's control-flag cell — gets a **binary**
+    /// instead, which is the oracle's own shape for both modes (measured: a list reply is
+    /// `[97,98,99]`, a flagged reply `<<97,98,99>>`, and a `NULL` reply pointer `[]`).
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] for a non-port / unknown port, an **internal** port, an out-of-range
+    /// `Operation`, non-iodata `Data`, a driver with no `control` slot or a negative driver result;
+    /// the typed capability gap of [`crate::port::RuntimePorts::port_control`] for a reply the
+    /// driver answers from memory of its own, and of the port table already being borrowed.
+    fn port_control(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let port = PortId::from_eterm(*args.first().ok_or(BeamError::BadArg)?)?;
+        let operation = Self::term_to_uint(*args.get(1).ok_or(BeamError::BadArg)?)?;
+        let data = *args.get(2).ok_or(BeamError::BadArg)?;
+        // The registry is reached through a cheap clone of its `Rc` handle, exactly as
+        // `port_command` does, so the reply term is built after the borrow is released. The
+        // binary/list decision is read *after* the call: that is when the driver's `control`
+        // callback has had its chance to set `PORT_CONTROL_FLAG_BINARY` (`io.c:4403-4411`).
+        let ports = std::rc::Rc::clone(&self.runtime.ports);
+        let (reply, binary) = {
+            let mut registry = ports
+                .try_borrow_mut()
+                .map_err(|_| error::unsupported("the port table is already in use"))?;
+            let mut bytes = Vec::new();
+            self.iodata_bytes(data, &mut bytes)?;
+            let reply = registry.port_control(port, &operation.to_string(), &bytes)?;
+            let binary = registry.control_binary(port);
+            (reply, binary)
+        };
+        if binary {
+            terms::make_heap_binary(self, &reply)
+        } else {
+            Self::int_list(self, &reply)
+        }
+    }
+
+    /// `term` as a `Uint` — the C's `term_to_Uint`: a non-negative integer that fits `UINT_MAX`,
+    /// else [`BeamError::BadArg`].
+    ///
+    /// This runtime's small integers already reach `2^59` on 64-bit, so a **bignum** is always
+    /// past `UINT_MAX` and `term_to_Uint`'s own overflow arm covers it; a float, an atom or a
+    /// negative integer fails the same way (the C's `badarg`).
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] for anything that is not a small integer in `0..=u32::MAX`.
+    fn term_to_uint(term: Eterm) -> Result<u32> {
+        if !is_small(term) {
+            return Err(BeamError::BadArg);
+        }
+        u32::try_from(signed_value(term)).map_err(|_| BeamError::BadArg)
+    }
+
+    /// `bytes` as an Erlang **list of byte integers** — the `buf_to_intlist` rendering of a port
+    /// control reply (`io.c:4160`).
+    ///
+    /// # Errors
+    ///
+    /// Whatever the heap reports when the list cannot be built.
+    fn int_list(&mut self, bytes: &[u8]) -> Result<Eterm> {
+        let elements: Vec<Eterm> = bytes.iter().map(|byte| make_small(*byte as i64)).collect();
+        terms::make_list(self, &elements)
+    }
+
     /// The native half of `erlang:port_info/1,2`: `undefined` for a port the runtime does
     /// not hold, and the bare `[]` for a **live** port's `registered_name` item.
     ///
@@ -233,42 +334,62 @@ impl RuntimeContext<'_> {
     ///
     /// [`BeamError::BadArg`] for a term that is not iodata.
     fn iodata_bytes(&self, term: Eterm, out: &mut Vec<u8>) -> Result<()> {
-        self.iolist_bytes(term, out, true)
-    }
-
-    /// Collects one iodata *element* into `out`: a byte-sized small integer, a binary, or a
-    /// (possibly nested) list of those.
-    ///
-    /// `top_level` distinguishes the outermost call from a list element: a bare integer is
-    /// only iodata as an element (`iodata()` is `binary() | iolist()`, never an integer), so
-    /// the outermost integer is [`BeamError::BadArg`] while an element integer is a byte.
-    ///
-    /// # Errors
-    ///
-    /// [`BeamError::BadArg`] for a term that is not iodata.
-    fn iolist_bytes(&self, term: Eterm, out: &mut Vec<u8>, top_level: bool) -> Result<()> {
-        if is_small(term) {
-            if top_level {
-                // `iodata() = binary() | iolist()`: a bare integer is not iodata.
-                return Err(BeamError::BadArg);
-            }
-            out.push(u8::try_from(signed_value(term)).map_err(|_| BeamError::BadArg)?);
-            return Ok(());
-        }
-        if let Ok(bytes) = terms::binary_bytes(term) {
-            out.extend_from_slice(bytes);
-            return Ok(());
-        }
-        if let Ok(elements) = terms::list_elements(term) {
-            for element in elements {
-                self.iolist_bytes(element, out, false)?;
-            }
-            return Ok(());
-        }
-        Err(BeamError::BadArg)
+        iodata_bytes(term, out)
     }
 }
 
+/// Collects `term` as Erlang **iodata** into `out` — a binary, or a (possibly nested) list of
+/// byte-sized integers/binaries.
+///
+/// This is `iolist_to_binary/1`'s acceptance rule, restricted to what a port stream can carry: a
+/// non-integer *element*, an out-of-range element integer, an improper tail and a non-iodata term
+/// are all [`BeamError::BadArg`]. The **top level** must be a binary or a list — a bare integer is
+/// deliberately rejected, because Erlang's `iodata()` is `binary() | iolist()`
+/// (`iolist_to_binary(42)` is `badarg`), even though `42` is a valid *element*.
+///
+/// It is a **free** function rather than a method so a caller that holds no [`RuntimeContext`] can
+/// still flatten iodata — the NIF host's `enif_port_command` hook
+/// ([`crate::nif::RuntimeNifServices`]) is exactly such a caller. The method form
+/// [`RuntimeContext::iodata_bytes`] forwards here.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] for a term that is not iodata.
+pub(crate) fn iodata_bytes(term: Eterm, out: &mut Vec<u8>) -> Result<()> {
+    iolist_bytes(term, out, true)
+}
+
+/// Collects one iodata *element* into `out`: a byte-sized small integer, a binary, or a
+/// (possibly nested) list of those.
+///
+/// `top_level` distinguishes the outermost call from a list element: a bare integer is only iodata
+/// as an element (`iodata() = binary() | iolist()`, never an integer), so the outermost integer is
+/// [`BeamError::BadArg`] while an element integer is a byte.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] for a term that is not iodata.
+fn iolist_bytes(term: Eterm, out: &mut Vec<u8>, top_level: bool) -> Result<()> {
+    if is_small(term) {
+        if top_level {
+            // `iodata() = binary() | iolist()`: a bare integer is not iodata.
+            return Err(BeamError::BadArg);
+        }
+        out.push(u8::try_from(signed_value(term)).map_err(|_| BeamError::BadArg)?);
+        return Ok(());
+    }
+    if let Ok(bytes) = terms::binary_bytes(term) {
+        out.extend_from_slice(bytes);
+        return Ok(());
+    }
+    if let Ok(elements) = terms::list_elements(term) {
+        for element in elements {
+            iolist_bytes(element, out, false)?;
+        }
+        return Ok(());
+    }
+    Err(BeamError::BadArg)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,8 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn iodata_rejects_non_iodata_and_out_of_range_elements() {
-        let mut runtime = runtime();
+    fn iodata_rejects_non_iodata_and_out_of_range_elements() {        let mut runtime = runtime();
         let mut sink = NullSink;
         let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
         let mut out = Vec::new();
@@ -621,5 +741,237 @@ mod tests {
             context.iodata_bytes(improper, &mut out),
             Err(BeamError::BadArg)
         ));
+    }
+
+    /// Registers a live `{spawn_driver, _}`-kind port whose `control` answers `reply` for verb
+    /// `1`, and returns its id. Bypasses `open_port/2` so no C compiler is needed.
+    fn driver_port(runtime: &mut Runtime, reply: &[u8]) -> PortId {
+        let (port, _flags) = crate::port::test_support::register_control_port(
+            runtime,
+            "native_port_ctl",
+            vec![crate::port::test_support::ControlVerb::replying(1, reply)],
+        );
+        port
+    }
+
+    /// A driver's reply is an Erlang **list of byte integers** — `write_port_control_result`'s
+    /// `buf_to_intlist` arm (`io.c:4171`), which is the oracle's shape whenever the driver did not
+    /// ask for `PORT_CONTROL_FLAG_BINARY`. The 300-byte case pins that there is **no** size
+    /// threshold: a long reply is still an int list, never a binary.
+    #[test]
+    fn port_control_renders_a_driver_reply_as_a_list_of_byte_integers() {
+        let mut runtime = runtime();
+        for (label, reply) in [
+            ("a three-byte reply", b"abc".to_vec()),
+            ("a 300-byte reply", (0u8..=255).chain(0u8..44).collect()),
+        ] {
+            let expected: Vec<Eterm> = reply.iter().map(|byte| make_small(*byte as i64)).collect();
+            let port = driver_port(&mut runtime, &reply);
+            let answer = call(
+                &mut runtime,
+                "erlang",
+                "port_control",
+                &[port.to_eterm(), make_small(1), NIL],
+            )
+            .unwrap_or_else(|error| panic!("{label} must answer: {error}"));
+            let elements = terms::list_elements(answer).unwrap_or_else(|_| {
+                panic!("{label} must be a list, not a binary")
+            });
+            assert_eq!(elements, expected, "{label} is the driver's own bytes as ints");
+        }
+    }
+
+    /// A driver that answers no bytes is the oracle's `[]` — an empty **list**, never a binary and
+    /// never an error.
+    #[test]
+    fn port_control_with_no_reply_bytes_is_the_empty_list() {
+        let mut runtime = runtime();
+        let port = driver_port(&mut runtime, b"");
+        let answer = call(
+            &mut runtime,
+            "erlang",
+            "port_control",
+            &[port.to_eterm(), make_small(1), NIL],
+        )
+        .expect("an empty reply is not an error");
+        assert_eq!(answer, NIL, "the bare empty list");
+    }
+
+    /// `Data` is iodata, exactly as `erts_internal:port_control/3` reads it with
+    /// `erts_iolist_to_buf` (`erl_bif_port.c:322-360`): a nested iolist is accepted.
+    #[test]
+    fn port_control_accepts_iodata_data() {
+        let mut runtime = runtime();
+        let port = driver_port(&mut runtime, b"ok");
+        let data = iodata(&mut RuntimeContext::new(&mut runtime));
+        let answer = call(
+            &mut runtime,
+            "erlang",
+            "port_control",
+            &[port.to_eterm(), make_small(1), data],
+        )
+        .expect("an iolist is iodata");
+        assert_eq!(terms::list_elements(answer).expect("a list"), vec![
+            make_small(111),
+            make_small(107)
+        ]);
+    }
+
+    /// The oracle's `badarg` cases for `erlang:port_control/3` (`erts_internal_port_control_3`):
+    /// a bare-integer `Data` (not iodata), an `Operation` past `UINT_MAX` (`1 bsl 70`), a negative
+    /// `Operation`, an atom and a float `Operation`.
+    #[test]
+    fn port_control_rejects_bad_operations_and_non_iodata_data() {
+        let mut runtime = runtime();
+        let port = driver_port(&mut runtime, b"ok");
+        let big = call(&mut runtime, "erlang", "bsl", &[make_small(1), make_small(70)])
+            .expect("1 bsl 70");
+        let float = call(&mut runtime, "erlang", "float", &[make_small(1)]).expect("1.0");
+        let an_atom = atom(&mut runtime, "not_a_verb");
+        for (label, operation, data) in [
+            ("a bare-integer Data", make_small(1), make_small(42)),
+            ("an Operation past UINT_MAX", big, NIL),
+            ("a negative Operation", make_small(-1), NIL),
+            ("an atom Operation", an_atom, NIL),
+            ("a float Operation", float, NIL),
+        ] {
+            match call(
+                &mut runtime,
+                "erlang",
+                "port_control",
+                &[port.to_eterm(), operation, data],
+            ) {
+                Err(BeamError::BadArg) => {}
+                Err(other) => panic!("{label} must be badarg, got {other}"),
+                Ok(value) => panic!("{label} must not be accepted: {value:?}"),
+            }
+        }
+    }
+
+    /// An **internal** port — a built-in `spawn`/`spawn_executable`/`fd` one — is the oracle's
+    /// `badarg` for every verb, because the C rejects a driver with no `control` slot before any
+    /// callback (`call_driver_control`, `io.c:4035`).
+    #[test]
+    fn port_control_on_an_internal_port_is_badarg() {
+        let mut runtime = runtime();
+        let port = live_port(&mut runtime);
+        for verb in [0i64, 1, 4, 200] {
+            match call(
+                &mut runtime,
+                "erlang",
+                "port_control",
+                &[port.to_eterm(), make_small(verb), NIL],
+            ) {
+                Err(BeamError::BadArg) => {}
+                Err(other) => panic!("verb {verb} must be badarg, got {other}"),
+                Ok(value) => panic!("verb {verb} must not be accepted: {value:?}"),
+            }
+        }
+        // A port the runtime does not hold is `badarg` too.
+        assert!(matches!(
+            call(
+                &mut runtime,
+                "erlang",
+                "port_control",
+                &[PortId::new(9999).to_eterm(), make_small(1), NIL]
+            ),
+            Err(BeamError::BadArg)
+        ));
+    }
+
+    /// `PORT_CONTROL_FLAG_BINARY` set from inside a `control` callback makes the reply a
+    /// **binary**, and the flag **persists** for later calls on the same port — the C's
+    /// `prt->control_flags` is per-port state (`io.c:5318`), read after every callback
+    /// (`write_port_control_result`, `io.c:4133`).
+    #[test]
+    fn port_control_binary_flag_makes_the_reply_a_binary_and_persists() {
+        use beam_abi::driver::types::PORT_CONTROL_FLAG_BINARY;
+        let mut runtime = runtime();
+        let (port, flags) = crate::port::test_support::register_control_port(
+            &mut runtime,
+            "native_port_ctl_flag",
+            vec![
+                // Verb 1: a plain list reply, no flag.
+                crate::port::test_support::ControlVerb::replying(1, b"abc"),
+                // Verb 2: asks for binary-mode replies, then answers.
+                crate::port::test_support::ControlVerb::setting(
+                    2,
+                    b"bin",
+                    PORT_CONTROL_FLAG_BINARY,
+                ),
+                // Verb 3: answers without touching the flags — the reply must still be binary.
+                crate::port::test_support::ControlVerb::replying(3, b"xy"),
+            ],
+        );
+        let reply = |runtime: &mut Runtime, verb: i64| {
+            call(
+                runtime,
+                "erlang",
+                "port_control",
+                &[port.to_eterm(), make_small(verb), NIL],
+            )
+            .unwrap_or_else(|error| panic!("verb {verb} must answer: {error}"))
+        };
+        // Before the flag: a list.
+        assert_eq!(
+            terms::list_elements(reply(&mut runtime, 1)).expect("a list"),
+            vec![make_small(97), make_small(98), make_small(99)]
+        );
+        // The flag-setting call: a binary.
+        let binary = reply(&mut runtime, 2);
+        assert_eq!(
+            terms::binary_bytes(binary).expect("a binary"),
+            b"bin",
+            "the flag applies to the very call that set it"
+        );
+        assert_ne!(flags.get() & PORT_CONTROL_FLAG_BINARY, 0, "the flag is recorded");
+        // ...and it persists: verb 3 never sets it, yet the reply is a binary again.
+        assert_eq!(
+            terms::binary_bytes(reply(&mut runtime, 3)).expect("still a binary"),
+            b"xy",
+            "the flag persists across calls on the same port"
+        );
+    }
+
+    /// The per-port byte counters `port_info(Port, input | output)` report are real: a write
+    /// bumps the port's `output`, and a driver reply bumps nothing on the *input* side (a driver
+    /// port's input is harvested by the pump, not by `port_control`).
+    ///
+    /// `erlang:port_info/2` answers the **`{Item, Value}` pair**, never the bare value — the
+    /// oracle's own shape (`erl -eval 'erlang:port_info(open_port({spawn,"cat"},[]), input)'` ⇒
+    /// `{input,0}`). The helper below therefore unwraps the pair *and* pins its item, so a
+    /// regression that answered the pair for the wrong item, or stopped answering a pair, fails
+    /// here rather than comparing a 2-tuple against a small int.
+    #[test]
+    fn port_info_io_items_read_the_ports_own_byte_totals() {
+        let mut runtime = runtime();
+        let port = driver_port(&mut runtime, b"ok");
+        let item = |runtime: &mut Runtime, name: &str| -> Eterm {
+            let key = atom(runtime, name);
+            let pair = call(runtime, "erlang", "port_info", &[port.to_eterm(), key])
+                .unwrap_or_else(|error| panic!("port_info({name}) must answer: {error}"));
+            assert_eq!(
+                terms::tuple_arity(pair).expect("a tuple"),
+                2,
+                "`{name}` is a {{Item,Value}} pair"
+            );
+            assert_eq!(
+                terms::tuple_element(pair, 0).expect("the pair's item"),
+                key,
+                "the pair's item is `{name}`"
+            );
+            terms::tuple_element(pair, 1).expect("the pair's value")
+        };
+        // A fresh port has moved no bytes — the oracle's own answer right after `open_port`.
+        assert_eq!(item(&mut runtime, "input"), make_small(0));
+        assert_eq!(item(&mut runtime, "output"), make_small(0));
+        // Writing to the port credits its `output` total.
+        let data = chars(&mut runtime, "hello");
+        call(&mut runtime, "erlang", "port_command", &[port.to_eterm(), data])
+            .expect("the driver accepts the write");
+        assert_eq!(item(&mut runtime, "output"), make_small(5), "5 bytes written");
+        // A driver port's *input* is what the pump harvests from `driver_output`, not what
+        // `port_command` wrote, so it is still zero here (the write was an output).
+        assert_eq!(item(&mut runtime, "input"), make_small(0));
     }
 }

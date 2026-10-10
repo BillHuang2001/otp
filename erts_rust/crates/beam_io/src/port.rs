@@ -63,6 +63,7 @@ use beam_common::Result;
 use beam_process::PortId;
 
 use crate::driver::{Driver, DriverContext, PortArms, PortExitReason};
+use crate::error;
 use crate::poller::Poller;
 use crate::port_task::{PortNotification, PortTask, PortTaskKind, PortTaskQueue, PORT_REDS_EXECUTE};
 use crate::queue::ByteQueue;
@@ -205,17 +206,25 @@ impl Port {
         self.output.push(data);
     }
 
-    /// Queues `data` for output and asks the driver to drain it.
+    /// Queues `data` for output and asks the driver to drain it **inline**.
     ///
     /// Returns the number of bytes the driver actually wrote; the remainder stays queued. The
     /// port's `TIMEOUT` task is re-armed from [`Driver::next_timeout`] afterwards (see
-    /// [`Port::refresh_timeout`]).
+    /// [`Port::refresh_timeout`]), and a write that leaves the output queue **non-empty**
+    /// schedules an [`PortTaskKind::Output`] task — so a driver that does not re-arm write
+    /// readiness cannot strand the remainder: the next port-task round re-drives the write
+    /// (exactly what [`crate::PortRegistry::port_command`] gets from scheduling its own task).
+    ///
+    /// The driver's byte count is checked against the queue through
+    /// [`Port::check_write_accounting`] — see that method for the contract.
     ///
     /// # Errors
     ///
-    /// Returns whatever the driver's `output` returns.
+    /// Returns whatever the driver's `output` returns, or the typed accounting diagnostic when
+    /// the driver reports a byte count it did not consume.
     pub fn output(&mut self, poller: &mut Poller, data: &[u8]) -> Result<usize> {
         self.queue_output(data);
+        let before = self.output.len();
         let id = self.id;
         let result = {
             let Port {
@@ -229,7 +238,11 @@ impl Port {
             driver.output(&mut ctx)
         };
         self.refresh_timeout();
-        result
+        let written = self.check_write_accounting(before, result)?;
+        if !self.output.is_empty() {
+            self.schedule_task(PortTaskKind::Output);
+        }
+        Ok(written)
     }
 
     /// Schedules a task of `kind`, reporting whether it was newly scheduled.
@@ -417,12 +430,15 @@ impl Port {
     /// Dispatches write readiness to the driver's `ready_output`.
     ///
     /// The port's `TIMEOUT` task is re-armed from [`Driver::next_timeout`] afterwards (see
-    /// [`Port::refresh_timeout`]).
+    /// [`Port::refresh_timeout`]) and the driver's byte count is checked against the output
+    /// queue (see [`Port::check_write_accounting`]).
     ///
     /// # Errors
     ///
-    /// Returns whatever the driver's `ready_output` returns.
+    /// Returns whatever the driver's `ready_output` returns, or the typed accounting diagnostic
+    /// when the driver reports a byte count it did not consume.
     pub fn ready_output(&mut self, poller: &mut Poller) -> Result<usize> {
+        let before = self.output.len();
         let id = self.id;
         let result = {
             let Port {
@@ -436,7 +452,39 @@ impl Port {
             driver.ready_output(&mut ctx)
         };
         self.refresh_timeout();
-        result
+        self.check_write_accounting(before, result)
+    }
+
+    /// Checks a driver's write accounting: the output queue must have shrunk by exactly the
+    /// number of bytes the driver reported.
+    ///
+    /// A driver drains [`DriverContext::output`] and returns how many bytes it took — calling
+    /// `ctx.output().consume(n)` for every byte it counts. The queue is the single source of
+    /// truth for what still has to be written, so a driver that reports a count it never
+    /// consumed leaves those bytes queued and the **next** drive writes them again: duplicated
+    /// output, silently. That is why the count is verified here rather than trusted — this is
+    /// the guard every write path goes through ([`Port::output`] and [`Port::ready_output`],
+    /// the latter also being the one [`PortTaskKind::Output`] runs).
+    ///
+    /// `before` is the queue length taken immediately before the callback, so the check is
+    /// independent of what the driver did with the bytes: consuming fewer than reported, more
+    /// than reported, or pushing more onto the queue are all the same mismatch. The diagnostic
+    /// is typed (never a panic and never a silently truncated write), because only a driver
+    /// implementation can produce it.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the driver's own error, or returns the typed `unsupported` raise naming the
+    /// reported count and the bytes actually consumed.
+    fn check_write_accounting(&self, before: usize, result: Result<usize>) -> Result<usize> {
+        let reported = result?;
+        let consumed = before.saturating_sub(self.output.len());
+        if consumed != reported {
+            return Err(error::unsupported(&format!(
+                "a port driver reported {reported} bytes written but consumed {consumed} from its output queue"
+            )));
+        }
+        Ok(reported)
     }
 
     /// Dispatches a port-timer expiry to the driver's `timeout`.

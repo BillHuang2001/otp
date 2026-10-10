@@ -30,8 +30,20 @@
 //! [`crate::term`]. The fun/export tag arms' helpers live in the child [`fun`]
 //! module and the native-record arm in the child [`record`] module, each as a second
 //! `impl` block on [`Decoder`].
+//!
+//! ## Nesting depth is bounded (no abort on hostile input)
+//!
+//! [`Decoder::decode`] is recursive, so a deeply nested image could otherwise
+//! exhaust the native stack and **abort the process** (a Rust stack overflow, not a
+//! typed error). `decode` therefore refuses any term nested deeper than
+//! [`MAX_DECODE_DEPTH`] with `BeamError::SystemLimit`, and only *nesting* is bounded:
+//! a long (wide) list or tuple decodes iteratively and is unaffected. This is a
+//! deliberate, documented divergence from C `dec_term`
+//! (`../../erts/emulator/beam/external.c`), which has no explicit depth limit and
+//! relies on the emulator thread's stack.
 
 mod fun;
+mod local_node;
 mod record;
 
 use core::mem::size_of;
@@ -43,7 +55,7 @@ use beam_term::prelude::{
     is_atom, make_atom, make_small, try_make_small, MAX_ARITYVAL, MAX_SMALL, MIN_SMALL, NIL,
 };
 use beam_term::refc::ERL_ONHEAP_BITS_LIMIT;
-use beam_term::{AtomTable, Eterm};
+use beam_term::{Atom, AtomTable, Eterm};
 
 use crate::atom_cache::AtomCache;
 use crate::error::{bad_arg, system_limit};
@@ -70,6 +82,34 @@ const BIG_DIGIT_BYTES: usize = size_of::<u64>();
 /// `external.c:4810`) enforces it only for its own first number.
 const MAX_REFERENCE: u32 = 1 << 18;
 
+/// The maximum **nesting depth** [`Decoder::decode`] will recurse to.
+///
+/// `decode` is recursive: a tuple/list/map element, a map key/value, the node atom
+/// of an external identifier, a fun/record sub-term and the `LOCAL_EXT` wrapper all
+/// re-enter it. Without a bound, a deeply nested image (e.g. ~55 KB of nested
+/// 1-tuples) exhausts the native stack and Rust **aborts the process** with a stack
+/// overflow — hostile input turned into a crash, never a typed error. This bound
+/// converts that into a `BeamError::SystemLimit`.
+///
+/// This is a **documented divergence** from C `dec_term`
+/// (`../../erts/emulator/beam/external.c`), which has no explicit depth limit: it
+/// recurses on the emulator thread's stack. A bounded depth is the deliberate
+/// choice here — a typed resource error is strictly better than an abort.
+///
+/// The value is measurement-driven. Each nesting level costs roughly 340 bytes of
+/// native stack in the dev profile; on a **2 MiB** thread stack (the Rust default
+/// for spawned threads, and four times *smaller* than the 8 MiB main thread) the
+/// recursion first hits the guard page — and aborts — at a nesting depth of about
+/// **6250** (measured: a nested-1-tuple image decodes at depth 6200 and aborts at
+/// 6300). The limit is set to 1/4 of that measured cliff so the guard trips long
+/// before the stack is anywhere near exhaustion, leaving room for the deeper
+/// per-level frames of a debug build or a future code change.
+///
+/// Only **depth** is bounded, never length: the list spine and a tuple's elements
+/// are decoded iteratively (a loop feeding a `Vec`), so a 1,000,000-element list
+/// and a 100,000-element tuple still decode — this constant bounds nesting alone.
+const MAX_DECODE_DEPTH: usize = 1500;
+
 /// Incremental external term format decoder.
 ///
 /// `new` requires and consumes the leading version byte `131`; `new_body`
@@ -83,6 +123,20 @@ pub struct Decoder<'a> {
     /// The off-heap binary host, when a large binary's payload should live off the
     /// process heap (see [`Decoder::with_off_heap`]).
     off_heap: Option<&'a mut dyn OffHeapBinaries>,
+    /// The local node's identity — its `sysname` atom and `creation`
+    /// (`erts_this_node`) — when the caller installed it with
+    /// [`Decoder::with_local_node`]. `None` (the default) disables every
+    /// identity-gated rule, so decoding is unchanged (see [`local_node`]).
+    local_node: Option<(Atom, u32)>,
+    /// The expected `LOCAL_EXT` (`121`) node hash, when the caller installed it
+    /// with [`Decoder::with_local_node_hash`]. `None` (the default) leaves the
+    /// 4-byte hash consumed-but-unchecked, exactly as before.
+    local_hash: Option<u32>,
+    /// The current nesting depth of [`Decoder::decode`], bounded by
+    /// [`MAX_DECODE_DEPTH`]. Incremented on entry and decremented on **every** exit
+    /// path (see `decode`), so it tracks the live recursion depth, not the number of
+    /// terms decoded.
+    depth: usize,
 }
 
 impl<'a> Decoder<'a> {
@@ -95,17 +149,31 @@ impl<'a> Decoder<'a> {
         if reader.u8()? != VERSION_MAGIC {
             return Err(bad_arg());
         }
-        Ok(Decoder { reader, cache: None, off_heap: None })
+        Ok(Decoder {
+            reader,
+            cache: None,
+            off_heap: None,
+            local_node: None,
+            local_hash: None,
+            depth: 0,
+        })
     }
 
     /// Creates a decoder for a body: **no** leading version byte.
     pub fn new_body(bytes: &'a [u8]) -> Decoder<'a> {
-        Decoder { reader: Reader::new(bytes), cache: None, off_heap: None }
+        Decoder {
+            reader: Reader::new(bytes),
+            cache: None,
+            off_heap: None,
+            local_node: None,
+            local_hash: None,
+            depth: 0,
+        }
     }
 
     /// Attaches the distribution atom cache used to resolve `ATOM_CACHE_REF` (`82`).
     pub fn with_atom_cache(self, cache: &'a AtomCache) -> Decoder<'a> {
-        Decoder { reader: self.reader, cache: Some(cache), off_heap: self.off_heap }
+        Decoder { cache: Some(cache), ..self }
     }
 
     /// Attaches the [`OffHeapBinaries`] host that owns the payload of a **large**
@@ -123,7 +191,7 @@ impl<'a> Decoder<'a> {
     /// [`crate::term::bitstring_bytes`]/[`crate::term::bitstring_size_bits`] read both
     /// representations, so `byte_size/1`, the contents and the ETF image cannot differ.
     pub fn with_off_heap(self, host: &'a mut dyn OffHeapBinaries) -> Decoder<'a> {
-        Decoder { reader: self.reader, cache: self.cache, off_heap: Some(host) }
+        Decoder { off_heap: Some(host), ..self }
     }
 
     /// Decodes the next term into `heap`, interning its atoms into `atoms`.
@@ -146,7 +214,37 @@ impl<'a> Decoder<'a> {
     /// a [`FunKind::External`](crate::FunKind) fun and [`Tag::NewFun`] a
     /// [`FunKind::Imported`](crate::FunKind) one (see [`Decoder::decode_export`] and
     /// [`Decoder::decode_new_fun`]).
+    ///
+    /// **Nesting is bounded.** `decode` recurses on every nesting level (a
+    /// tuple/list/map element, a map key/value, an identifier's node atom, a
+    /// fun/record sub-term, the `LOCAL_EXT` wrapper), so a deeply nested image is
+    /// refused with `BeamError::SystemLimit` once the depth reaches
+    /// [`MAX_DECODE_DEPTH`] — a typed resource error instead of the native **stack
+    /// overflow / process abort** an unbounded recursion would cause. Only *depth* is
+    /// bounded: a wide (long) list or tuple is decoded iteratively and is never
+    /// affected (see [`MAX_DECODE_DEPTH`]).
     pub fn decode(&mut self, heap: &mut Heap, atoms: &mut AtomTable) -> Result<Eterm> {
+        // Bound the recursion *before* descending a level, so an over-deep image
+        // returns a typed error rather than exhausting the native stack. C
+        // `dec_term` has no such limit (it relies on the emulator thread's stack);
+        // the bounded divergence is deliberate and documented at the constant.
+        if self.depth >= MAX_DECODE_DEPTH {
+            return Err(system_limit());
+        }
+        self.depth += 1;
+        // The decrement runs on *every* exit path because the inner result is
+        // captured before returning (the recursive arms, the `LOCAL_EXT` wrapper's
+        // early `self.decode(...)`, and any `?` inside `decode_inner` all land here).
+        // `decode_inner` never panics, so the counter cannot leak.
+        let result = self.decode_inner(heap, atoms);
+        self.depth -= 1;
+        result
+    }
+
+    /// The recursive term walker behind [`Decoder::decode`], which owns the depth
+    /// accounting. Kept as a separate function so the guard has exactly one
+    /// increment and one decrement that no early `return` inside the walker can skip.
+    fn decode_inner(&mut self, heap: &mut Heap, atoms: &mut AtomTable) -> Result<Eterm> {
         let byte = self.reader.u8()?;
         let tag = Tag::from_byte(byte).ok_or_else(bad_arg)?;
         match tag {
@@ -347,14 +445,20 @@ impl<'a> Decoder<'a> {
                 // `[90][len:2 BE][node atom][creation:4][r0:4][ids…]`
                 // (`external.c:4786-4796`): a full 32-bit creation, the same
                 // unconditional `r0` as `NEW_REFERENCE_EXT`, and **no** tiny-creation
-                // or `r0` bound here — the C's `r0 >= MAX_REFERENCE` check sits in the
-                // *local*-node branch (`external.c:4810`), which a remote image never
-                // reaches (verified against erts-17.1: `r0 = 4294967295` ⇒ a ref whose
-                // `262144`-valued first number re-encodes unharmed).
+                // bound — the only `r0` check the C has for `90` sits in the
+                // *local*-node branch below.
                 let len = usize::from(self.reader.u16be()?);
                 let node = self.decode_node_atom(heap, atoms)?;
                 let creation = self.reader.u32be()?;
                 let r0 = self.reader.u32be()?;
+                // `r0 >= MAX_REFERENCE` is rejected **only for the local node**
+                // (`external.c:4804-4813`: the magic-ref table relies on 18 bits);
+                // a remote image keeps any `r0` (verified against erts-17.1:
+                // `r0 = 4294967295` on a remote node ⇒ a ref whose `262144`-valued
+                // first number re-encodes unharmed, while the same `r0` on the local
+                // node is `badarg`). Inert unless `Decoder::with_local_node` installed
+                // the identity.
+                self.check_local_ref_first_number(node, creation, r0)?;
                 // `ERTS_MAX_REF_NUMBERS` (`erl_term.h:780`) ⇒ `badarg` (verified
                 // against erts-17.1).
                 if len > crate::term::MAX_REF_IDS {
@@ -384,12 +488,17 @@ impl<'a> Decoder<'a> {
                 if creation > 3 {
                     return Err(bad_arg());
                 }
+                // D6: a *local* port id is a 60-bit immediate (`_PORT_NUM_SIZE`), so
+                // the C rejects an id past `ERTS_MAX_INTERNAL_PORT_NUMBER`
+                // (`external.c:4718-4721`). Inert without a local node identity.
+                self.check_local_port(node, creation, number)?;
                 crate::term::make_external_port(heap, node, number, creation)
             }
             Tag::NewPort => {
                 let node = self.decode_node_atom(heap, atoms)?;
                 let number = u64::from(self.reader.u32be()?);
                 let creation = self.reader.u32be()?;
+                self.check_local_port(node, creation, number)?;
                 crate::term::make_external_port(heap, node, number, creation)
             }
             Tag::V4Port => {
@@ -399,6 +508,8 @@ impl<'a> Decoder<'a> {
                 let node = self.decode_node_atom(heap, atoms)?;
                 let number = self.reader.u64be()?;
                 let creation = self.reader.u32be()?;
+                // The only port tag whose id can exceed the 60-bit local bound.
+                self.check_local_port(node, creation, number)?;
                 crate::term::make_external_port(heap, node, number, creation)
             }
             Tag::Pid => {
@@ -412,6 +523,9 @@ impl<'a> Decoder<'a> {
                 if creation > 3 {
                     return Err(bad_arg());
                 }
+                // D6: `dec_pid` bounds a *local* pid's number/serial
+                // (`external.c:3175-3179`).
+                self.check_local_pid(node, creation, number, serial)?;
                 crate::term::make_external_pid(heap, node, number, serial, creation)
             }
             Tag::NewPid => {
@@ -419,6 +533,7 @@ impl<'a> Decoder<'a> {
                 let number = self.reader.u32be()?;
                 let serial = self.reader.u32be()?;
                 let creation = self.reader.u32be()?;
+                self.check_local_pid(node, creation, number, serial)?;
                 crate::term::make_external_pid(heap, node, number, serial, creation)
             }
 
@@ -565,14 +680,16 @@ impl<'a> Decoder<'a> {
             // the tag — so we do the same, whether the wrapper is top-level (via
             // `Decoder::new`) or nested.
             //
-            // Hash verification is intentionally **not** performed here: the C only
-            // checks it in the `decoded_size` sizing pass, against a Bob-Jenkins block
-            // hash seeded with the node's `local_node_hash` (`external.c:6437-6442`,
-            // `:6471-6512`). That seed is node-identity-owned (`beam_rt`/`beam_dist`),
-            // which this codec has none of, so `dec_term`'s skip-the-hash behaviour is
-            // faithful.
+            // The 4-byte hash is verified only when the caller installed the expected
+            // value (`Decoder::with_local_node_hash`); the C hashes the inner term's
+            // bytes seeded with the running node's `local_node_hash`
+            // (`external.c:6471-6512`) inside the `decoded_size` sizing pass, which
+            // `binary_to_term/1,2` always runs — node identity is the caller's, so
+            // with nothing installed the bytes stay consumed-but-unchecked, exactly
+            // as `dec_term` does (`external.c:5250-5254`).
             Tag::Local => {
-                let _node_hash = self.reader.bytes(4)?;
+                let node_hash = self.reader.u32be()?;
+                self.check_local_node_hash(node_hash)?;
                 return self.decode(heap, atoms);
             }
 

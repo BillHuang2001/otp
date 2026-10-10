@@ -38,7 +38,7 @@
 //! | `erlang:function_exported/3` | the [`CodeServer`](crate::CodeServer) + the BIF registry |
 //! | `erlang:link/1`, `erlang:unlink/1` | [`beam_process::ProcessTable`]'s link set |
 //! | `erlang:dt_spread_tag/1`, `erlang:dt_restore_tag/1` | the oracle's boolean check (dynamic tracing is compiled out) |
-//! | `erlang:statistics/1` | `run_queue`; `wall_clock` (the process clock); `reductions`/`exact_reductions`/`context_switches` (the runtime's own cumulative counters); `runtime` (the long-lived `beam_io::cpu_time::RuntimeClock`); `io` (the port subsystem's byte counters); `scheduler_wall_time` (`undefined`, never enabled) |
+//! | `erlang:statistics/1` | `run_queue`; `run_queues`/`run_queue_lengths`/`run_queue_lengths_all`/`total_run_queue_lengths`/`total_run_queue_lengths_all` (the runtime's **one** real run queue, `beam_process`'s `Scheduler`); `wall_clock` (the process clock); `reductions`/`exact_reductions`/`context_switches` (the runtime's own cumulative counters); `runtime` (the long-lived `beam_io::cpu_time::RuntimeClock`); `io` (the port subsystem's byte counters); `garbage_collection` (the live processes' own `beam_gc` collector counters); `scheduler_wall_time`/`scheduler_wall_time_all` (`undefined`, never enabled) |
 //! | `os:set_signal/2` | [`signal`] — the one long-lived `beam_io::signal::SignalFacility` (the dispositions persist for the runtime's life) |
 //! | `net_kernel:dflag_unicode_io/1` | `true` for a local pid (a `badarg` for a non-pid; the typed gap for a remote pid) — the io-device read path's unicode fast-path probe |
 //!
@@ -55,8 +55,10 @@
 //!   exposes — so the absolute form is reported as the typed capability gap rather than
 //!   approximated by a millisecond-off estimate. `{abs, false}` (the default) IS served.
 //! * `statistics/1` serves **only** the keys this runtime can measure for real
-//!   (`run_queue`, `wall_clock`, `reductions`/`exact_reductions`, `context_switches`,
-//!   `runtime`, `io` and the never-enabled `scheduler_wall_time`, see
+//!   (`run_queue`, the `run_queues`/`run_queue_lengths*`/`total_run_queue_lengths*` family,
+//!   `wall_clock`, `reductions`/`exact_reductions`, `context_switches`, `runtime`, `io`,
+//!   `garbage_collection` and the never-enabled
+//!   `scheduler_wall_time`/`scheduler_wall_time_all`, see
 //!   [`RuntimeHooksBridge::statistics`]); every other key the oracle accepts is a valid
 //!   statistics key this runtime cannot answer honestly, so it reports the typed capability
 //!   gap. A name that is not a statistics key at all is the oracle's `badarg`.
@@ -82,7 +84,7 @@ use beam_common::{BeamError, ExitReason, Raise, Result};
 use beam_engine::terms;
 use beam_io::signal::{Disposition, Signal};
 use beam_process::{PidTarget, ProcessId, ProcessTable};
-use beam_term::prelude::{atom_val, is_atom, is_small, make_small, signed_value};
+use beam_term::prelude::{atom_val, is_atom, is_small, make_small, signed_value, NIL};
 use beam_term::{AtomTable, Eterm};
 
 use std::cell::Cell;
@@ -682,29 +684,47 @@ impl<'a> RuntimeHooksBridge<'a> {
     /// * `io` → `{{input, BytesIn}, {output, BytesOut}}` from the shared byte counters the
     ///   port subsystem bumps ([`crate::port::IoCounters`]): bytes delivered from a port as
     ///   `{Port, {data, …}}` and bytes written to a port by `port_command/2,3`.
-    /// * `scheduler_wall_time` → the atom `undefined`, the oracle's own "not enabled"
-    ///   answer. Only `erlang:system_flag(scheduler_wall_time, true)` turns it into a list of
+    /// * `run_queues`, `run_queue_lengths`, `run_queue_lengths_all`,
+    ///   `total_run_queue_lengths`, `total_run_queue_lengths_all` → the runtime's **one** real
+    ///   run queue ([`Runtime::run_queue_len`], the single `beam_process::Scheduler`), read
+    ///   exactly as the C's `erts_run_queues_len` reads its per-scheduler queues
+    ///   (`erl_process.c:9275-9302`): the tuple/list forms carry one element per run queue and
+    ///   the `total_*` forms the sum, so all five answer this runtime's single queue (see
+    ///   [`Self::run_queues`]).
+    /// * `garbage_collection` → `{GCs, WordsReclaimed, 0}`, the shape the C's
+    ///   `gather_gc_info_result/1` builds (`erlang.erl:13392-13404`: the third element is the
+    ///   reserved constant `0`). Both figures are summed from the real, **cumulative**
+    ///   [`beam_gc::GcStats`] of every live process's own collector — the collections each one
+    ///   ran ([`Runtime::gc_stats`] is the runtime's node-global collection counter; the
+    ///   reclaimed-word figure exists only inside a collector) and the words those
+    ///   collections really reclaimed (see [`Self::garbage_collection`]).
+    /// * `scheduler_wall_time`, `scheduler_wall_time_all` → the atom `undefined`, the
+    ///   oracle's own "not enabled" answer. Only
+    ///   `erlang:system_flag(scheduler_wall_time, true)` turns either into per-scheduler
     ///   `{SchedulerId, ActiveTime, TotalTime}` tuples, and this runtime never enables it, so
     ///   `undefined` is exact rather than an approximation.
     ///
-    /// **Documented divergence (the epoch, never the clock).** The oracle's `wall_clock`
-    /// total is measured from emulator start; this runtime anchors it at the **first**
-    /// `statistics(wall_clock)` read, because no earlier anchor is reachable from this seam
-    /// — the runtime's other monotonic origin lives inside `beam_bifs` (`src/time.rs`) and
-    /// exposes no reader. The numbers are therefore real elapsed time with a different
-    /// zero, exactly the class of divergence as `erlang:processes/0` ("an answer that reads
-    /// *this* runtime's own state"). The same "different zero" holds for `reductions` and
-    /// `context_switches`: they count *this* runtime's own work from its own start, and the
-    /// oracle counts far more of both because it runs a much larger emulator.
+    /// **Documented divergence (the epoch/scope, never the clock or counter).** The oracle's
+    /// `wall_clock` total is measured from emulator start; this runtime anchors it at the
+    /// **first** `statistics(wall_clock)` read, because no earlier anchor is reachable from
+    /// this seam — the runtime's other monotonic origin lives inside `beam_bifs`
+    /// (`src/time.rs`) and exposes no reader. The numbers are therefore real elapsed time with
+    /// a different zero, exactly the class of divergence as `erlang:processes/0` ("an answer
+    /// that reads *this* runtime's own state"). The same "different zero" holds for
+    /// `reductions` and `context_switches`: they count *this* runtime's own work from its own
+    /// start, and the oracle counts far more of both because it runs a much larger emulator.
+    /// `garbage_collection` has the same character: the C keeps a **per-scheduler** accumulator
+    /// that outlives every process, while this runtime's counters live inside each process's
+    /// collector, so the sum covers the processes that are **live** at the read.
     ///
     /// Every **other** key the oracle accepts is a genuine statistics key this runtime
-    /// cannot measure — `garbage_collection` needs a real accumulative collector,
-    /// `scheduler_wall_time_all`/`*_run_queue_lengths*`/`active_tasks*`/`run_queues`
-    /// per-scheduler queue lists and CPU time, and `microstate_accounting` the MSACC
-    /// machinery — so each answers the typed capability gap rather than a fabricated number
-    /// (workspace `CONTEXT.md` §3). A name that is **not** a statistics key at all is the
-    /// oracle's `badarg` (`erl_bif_info.c:4333`), which is reproduced rather than reported as
-    /// a gap.
+    /// cannot measure — `active_tasks*`/`total_active_tasks*` need the C's per-run-queue
+    /// "a scheduler is executing from this queue" (`ERTS_RUNQ_FLG_EXEC`) state, which
+    /// `beam_process::Scheduler` does not record, and `microstate_accounting` the MSACC
+    /// per-thread machinery — so each answers the typed capability gap rather than a
+    /// fabricated number (workspace `CONTEXT.md` §3). A name that is **not** a statistics key
+    /// at all is the oracle's `badarg` (`erl_bif_info.c:4333`), which is reproduced rather
+    /// than reported as a gap.
     ///
     /// # Errors
     ///
@@ -719,18 +739,26 @@ impl<'a> RuntimeHooksBridge<'a> {
         // oracle's `badarg` (never a substituted key).
         let name = atoms.name(atom_val(key)).ok_or(BeamError::BadArg)?;
         match name {
-            "run_queue" => Ok(make_small(self.runtime.run_queue_len() as i64)),
+            "run_queue" => Ok(self.total_run_queue_lengths()),
+            // The run-queue family: this runtime has one real run queue and runs no dirty
+            // schedulers, so the per-queue forms carry exactly one element (see
+            // [`Self::run_queues`]).
+            "run_queues" => self.run_queues(heap),
+            "run_queue_lengths" | "run_queue_lengths_all" => self.run_queue_lengths(heap),
+            "total_run_queue_lengths" | "total_run_queue_lengths_all" => {
+                Ok(self.total_run_queue_lengths())
+            }
             "wall_clock" => {
                 let (total, since) = wall_clock_millis();
                 heap.tuple(&[make_small(total), make_small(since)])
             }
-            // `scheduler_wall_time` answers `undefined` until
+            // `scheduler_wall_time`/`scheduler_wall_time_all` answer `undefined` until
             // `erlang:system_flag(scheduler_wall_time, true)` has been applied
-            // (`erl_bif_info.c:4258-4273`), and this runtime never enables it — it keeps no
+            // (`erl_bif_info.c:4174-4183`), and this runtime never enables it — it keeps no
             // per-scheduler CPU accounting to hand out. The oracle's own "not enabled"
             // answer is therefore the exact one to give, not a substitute for a missing
             // measurement (`tests/runtime_hooks.rs` pins it against the live oracle).
-            "scheduler_wall_time" => atom_term(atoms, "undefined"),
+            "scheduler_wall_time" | "scheduler_wall_time_all" => atom_term(atoms, "undefined"),
             // The three `{Total, SinceLast}` counter pairs, read from the runtime's own real
             // cumulative counters (`SinceLast` is the delta since the previous read of this
             // same key — see `Runtime::reductions_statistics`).
@@ -751,11 +779,102 @@ impl<'a> RuntimeHooksBridge<'a> {
                 let out_pair = heap.tuple(&[atom_term(atoms, "output")?, small_u64(output)])?;
                 heap.tuple(&[in_pair, out_pair])
             }
+            // `{GCs, WordsReclaimed, 0}` — the C's `gather_gc_info_result/1` shape, built from
+            // the real collector counters of the live processes (see [`Self::garbage_collection`]).
+            "garbage_collection" => self.garbage_collection(heap),
             other if STATISTICS_KEYS.contains(&other) => Err(error::unsupported(&format!(
                 "erlang:statistics/1: the `{other}` counter is not implemented"
             ))),
             _ => Err(BeamError::BadArg),
         }
+    }
+
+    /// The runtime's **one** real run queue's length, as a term-ready integer.
+    ///
+    /// [`Runtime::run_queue_len`] is the single `beam_process::Scheduler`'s run queue — this
+    /// runtime runs no dirty schedulers — so it is the whole of every run-queue figure the
+    /// oracle's `erts_run_queues_len` computes over its scheduler set
+    /// (`erl_process.c:9275-9302`).
+    fn run_queue_length(&self) -> i64 {
+        // A `usize` queue length is a small integer on any platform this runtime builds on;
+        // the saturation keeps the conversion total without trapping.
+        i64::try_from(self.runtime.run_queue_len()).unwrap_or(i64::MAX)
+    }
+
+    /// `statistics(run_queues)` — the per-run-queue length **tuple**
+    /// (`erl_bif_info.c:4310-4331`).
+    ///
+    /// The C emits one element per run queue (`erts_no_run_queues + ERTS_NUM_DIRTY_RUNQS`).
+    /// This runtime has exactly **one** run queue and no dirty schedulers, so the honest tuple
+    /// has one element: padding it with the oracle's always-allocated dirty-CPU/dirty-I/O
+    /// queues would name run queues that do not exist here, and an empty tuple would name
+    /// none at all.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the heap's failure when the tuple cannot be built.
+    fn run_queues(&self, heap: &mut Heap) -> Result<Eterm> {
+        heap.tuple(&[make_small(self.run_queue_length())])
+    }
+
+    /// `statistics(run_queue_lengths)` / `statistics(run_queue_lengths_all)` — the
+    /// per-run-queue length **list** (`erl_bif_info.c:4200-4230`).
+    ///
+    /// `run_queue_lengths` covers the normal and dirty-CPU run queues, `_all` adds the dirty
+    /// I/O ones. This runtime has a single run queue and no dirty ones, so both are the same
+    /// one-element list — a faithful reading of the same state, not a padded one.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the heap's failure when the list cell cannot be built.
+    fn run_queue_lengths(&self, heap: &mut Heap) -> Result<Eterm> {
+        heap.cons(make_small(self.run_queue_length()), NIL)
+    }
+
+    /// `statistics(total_run_queue_lengths)` / `statistics(total_run_queue_lengths_all)` —
+    /// the **sum** over the run queues (`erl_bif_info.c:4184-4199`).
+    ///
+    /// With one run queue it is [`Self::run_queue_length`] itself; the `_all` form only widens
+    /// the coverage to the dirty-I/O queues, of which this runtime has none.
+    fn total_run_queue_lengths(&self) -> Eterm {
+        make_small(self.run_queue_length())
+    }
+
+    /// `statistics(garbage_collection)` — `{GCs, WordsReclaimed, 0}`, the shape the C's
+    /// `gather_gc_info_result/1` builds (`erts/preloaded/src/erlang.erl:13392-13404`; the
+    /// third element is the reserved constant `0`).
+    ///
+    /// The C sums two **per-scheduler** accumulators: `gc_info.garbage_cols` (collections run)
+    /// and `gc_info.reclaimed` (words reclaimed), plus the dirty schedulers' own
+    /// (`erl_gc.c:3546-3603`). This runtime keeps neither node-globally — its GC counters live
+    /// inside each process's own [`beam_gc::Collector`]
+    /// ([`Runtime::gc_stats`] is the node-global *collection* count, and there is no
+    /// node-global reclaimed-words figure) — so both figures are summed from every **live**
+    /// process's [`Collector::stats`](beam_gc::Collector::stats): its cumulative
+    /// `minor_collections + major_collections` and its cumulative `words_reclaimed`. Both are
+    /// real measurements of work this runtime really did, and the pair comes from the same
+    /// counter set so the two elements can never describe different scopes.
+    ///
+    /// **Divergence (scope, documented):** a terminated process's collector goes away with it,
+    /// so its contribution leaves the sum, whereas the C's per-scheduler accumulators persist
+    /// for the emulator's life. The figures are otherwise the same quantity.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the heap's failure when the tuple cannot be built.
+    fn garbage_collection(&self, heap: &mut Heap) -> Result<Eterm> {
+        let mut collections: u64 = 0;
+        let mut reclaimed: u64 = 0;
+        for pid in self.runtime.processes().pids() {
+            if let Some(process) = self.runtime.processes().get(pid) {
+                let stats = process.collector().stats();
+                collections += stats.minor_collections + stats.major_collections;
+                // A `usize` word count is a small integer here; the saturation keeps the
+                // conversion total without trapping.
+                reclaimed += u64::try_from(stats.words_reclaimed).unwrap_or(u64::MAX);
+            }
+        }
+        heap.tuple(&[small_u64(collections), small_u64(reclaimed), make_small(0)])
     }
 
     /// Schedules `message` for `target` at `delay` from now under the reference `reference`,
@@ -937,19 +1056,24 @@ impl RuntimeHooks for RuntimeHooksBridge<'_> {
 /// key at all (the oracle's `badarg`) — the only two answers, since a fabricated figure is
 /// never acceptable (workspace `CONTEXT.md` §3). A key this runtime *does* serve has its own
 /// arm in [`RuntimeHooksBridge::statistics`] and must **not** appear here.
+///
+/// Each survivor names a piece of per-scheduler state this runtime genuinely lacks:
+///
+/// * `active_tasks`/`active_tasks_all`/`total_active_tasks`/`total_active_tasks_all` add, to
+///   each run queue's length, `1` when a scheduler is **currently executing a process from
+///   that queue** (the C's `ERTS_RUNQ_FLG_EXEC`, `erl_process.c:9266-9267`). This runtime's
+///   `beam_process::Scheduler` dequeues a pid into a local and records **no** current-process
+///   state, so that increment cannot be derived truthfully — reporting the bare queue length
+///   would silently answer a different question.
+/// * `microstate_accounting` gathers the MSACC per-thread microstate counters
+///   (`erts_msacc_request`, `erl_bif_info.c:4232-4238`); this runtime keeps no such
+///   accounting and has no scheduler threads to describe.
 const STATISTICS_KEYS: &[&str] = &[
-    "scheduler_wall_time_all",
     "total_active_tasks",
-    "total_run_queue_lengths",
     "total_active_tasks_all",
-    "total_run_queue_lengths_all",
     "active_tasks",
-    "run_queue_lengths",
     "active_tasks_all",
-    "run_queue_lengths_all",
     "microstate_accounting",
-    "garbage_collection",
-    "run_queues",
 ];
 
 /// The `{Total, SinceLast}` pair of small integers the three counter keys answer with.

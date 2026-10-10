@@ -1235,7 +1235,9 @@ fn do_match(
             let len = ctx.int(len as i64)?;
             ctx.tuple(&[pos, len])
         }
-        None => ctx.atom("nomatch"),
+        // `nomatch` is *produced* here, so it is interned on demand (the oracle
+        // pre-interns it from `atom.names`; a Rust runtime's boot seed need not).
+        None => ctx.intern_atom("nomatch"),
     }
 }
 

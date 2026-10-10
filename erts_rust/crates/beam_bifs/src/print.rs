@@ -66,11 +66,14 @@
 //!
 //! # Maps
 //!
-//! A flat map renders `#{k => v,…}` (note ` => ` between a key and its value and a
+//! A map renders `#{k => v,…}` (note ` => ` between a key and its value and a
 //! bare `,` between pairs — the oracle's rendering). Pairs are printed in the
-//! oracle's *flatmap key order* (`erts_cmp_flatmap_keys`, `erl_utils.h:267`): two
-//! atom keys compare by their raw term word (i.e. by atom index / intern order),
-//! anything else by the exact term order (`beam_term::compare::cmp`).
+//! map's **storage order** ([`beam_term::map::map_pairs_storage_order`]) — the
+//! order `maps:keys/1` yields: a flat map (≤32 pairs) stores its keys in the
+//! oracle's *flatmap key order* (`erts_cmp_flatmap_keys`, `erl_utils.h:267`: two
+//! atom keys by their raw term word, i.e. atom index / intern order; anything else
+//! by the exact term order), and a hash map (>32 pairs) stores them in its HAMT slot
+//! traversal order. Both match the oracle's `~w`/`~p` byte for byte.
 //!
 //! # `~p`/`~P` re-flow (`io_lib_pretty`)
 //!
@@ -89,14 +92,31 @@
 //! `crate::io` module docs for the precise rule, the term classes and the narrowest
 //! repro.
 //!
+//! # Floats
+//!
+//! A float renders as `float_to_list(F, [short])` — the oracle's plain float
+//! leaf (`io_lib:write1/4` calls `io_lib_format:fwrite_g/1`, which is
+//! `float_to_list(F, [short])`), reproduced by the same
+//! [`crate::numeric::format_short`] port the `float_to_list/2` BIF uses, so
+//! `1.0e5` ⇒ `"1.0e5"`, `0.1` ⇒ `"0.1"`, `1.0` ⇒ `"1.0"`. The domain is finite
+//! floats — OTP represents no `inf`/`NaN` (see [`format_float`]).
+//!
+//! # Atoms
+//!
+//! An atom is rendered by the oracle's `io_lib:write_atom_as_latin1/1` (the
+//! latin1 clause of `write1/4`, which `~w`, `~W`, `~p` and `~P` all take): bare
+//! when `io_lib:quote_atom/2` is false — the name is not an
+//! `erl_scan:reserved_word/1`, its first character is a lowercase letter
+//! (`a..z`, `ß..ÿ` except `÷`) and every character matches `name_char/1` (`a..z`,
+//! `ß..ÿ` except `÷`, `A..Z`, `À..Þ` except `×`, `0..9`, `_`, `@`) — and
+//! `'…'`-quoted with `io_lib:string_char(unicode_as_latin1, …)` escaping
+//! otherwise. So `héllo` is **bare** (`io_lib:format("~w",['héllo'])` ⇒
+//! `[104,233,108,108,111]`), `and`/`Hello`/`_foo`/`a b`/`a÷b` are quoted, a
+//! control character is an octal/`\n`/`\t`/… escape, `16#7F` is `\d`, and a
+//! character above `16#FF` is `\x{H}`. See [`format_atom`].
+//!
 //! # Deviations from the oracle (documented)
 //!
-//! * **Floats** use Rust's shortest round-trip with a `.0` appended when integral
-//!   (`1.0`, `1.5`, `0.1`, `3.14159`), not OTP's `float_to_list(F, [short])`:
-//!   large/small magnitudes differ (`1.0e10` renders `10000000000`, the oracle
-//!   `1.0e10`).
-//! * **Quoted atoms are not re-escaped** (a `'` inside a name is printed verbatim)
-//!   — such atoms are not produced by Milestone-1.
 //! * **Non-byte-aligned bitstrings** render as the oracle's `<<X:L>>` (whole leading
 //!   bytes, then the trailing `L` bits as `Value:L`), e.g. `<<1:1>>`, `<<23:5>>`,
 //!   `<<0,1:1>>`. The `~p` printable-string rule never applies to them.
@@ -110,12 +130,12 @@
 
 use beam_codec::term::big_parts;
 use beam_common::Result;
-use beam_term::{atom_val, compare, pid_number, pid_serial, signed_value, AtomTable, Eterm};
+use beam_term::{atom_val, pid_number, pid_serial, signed_value, AtomTable, Eterm};
 
 use crate::access::{
-    bitstring_bit_size, bitstring_bits, car, cdr, flatmap_pairs, float_value, is_atom, is_big,
-    is_float, is_internal_pid, is_internal_ref, is_list, is_map, is_nil, is_small, is_tuple,
-    ref_thing_id, tuple_element, tuple_size,
+    bitstring_bit_size, bitstring_bits, car, cdr, float_value, is_atom, is_big, is_float,
+    is_internal_pid, is_internal_ref, is_list, is_map, is_nil, is_small, is_tuple, ref_thing_id,
+    tuple_element, tuple_size,
 };
 use crate::bits;
 use crate::context::BifContext;
@@ -131,14 +151,19 @@ pub(crate) const UNLIMITED_DEPTH: i64 = -1;
 /// oracle's `io_lib`/`io_lib_pretty` build.
 ///
 /// An `io_lib` "chars" value is a list whose elements are either single
-/// characters (small integers) or further lists: `Char` is one such element and
-/// `List` a sub-list element. `io:format` flattens the tree to text, while
-/// `io_lib:format` materializes it as the corresponding nested term (see
-/// `crate::io`).
+/// characters (small integers), *raw* integers, or further lists: `Char` is one
+/// such element, `Int` a raw-integer element and `List` a sub-list element.
+/// `io:format` flattens the tree to text, while `io_lib:format` materializes it
+/// as the corresponding nested term (see `crate::io`).
 #[derive(Clone)]
 pub(crate) enum Chunk {
     /// One character element — a single small integer in the output list.
     Char(char),
+    /// An integer element that is not a Rust `char`: the oracle's `io_lib` keeps
+    /// the integer **verbatim** while its unicode device refuses it. Only the
+    /// `~tc` directive and the radix **prefix** build one — see [`crate::io`] and
+    /// [`flatten_output`].
+    Int(Eterm),
     /// A sub-list element.
     List(Vec<Chunk>),
 }
@@ -153,6 +178,12 @@ impl Chunk {
     pub(crate) fn flatten_into(&self, out: &mut String) {
         match self {
             Chunk::Char(c) => out.push(*c),
+            // A raw integer element. Every production path that can build one goes
+            // through [`flatten_output`] (which rejects a non-scalar code point
+            // first, as the oracle's unicode device does); `flatten` is reached
+            // from a *term* rendering, which never builds an `Int`. The
+            // "unrepresentable" marker keeps this total without a panic.
+            Chunk::Int(term) => out.push(raw_scalar(*term).unwrap_or(char::REPLACEMENT_CHARACTER)),
             Chunk::List(items) => {
                 for item in items {
                     item.flatten_into(out);
@@ -164,7 +195,8 @@ impl Chunk {
     /// The flat character count (`io_lib:chars_length/1`).
     pub(crate) fn flat_len(&self) -> usize {
         match self {
-            Chunk::Char(_) => 1,
+            // `io_lib:chars_length/1` counts a raw integer element as one character.
+            Chunk::Char(_) | Chunk::Int(_) => 1,
             Chunk::List(items) => items.iter().map(Chunk::flat_len).sum(),
         }
     }
@@ -192,6 +224,66 @@ pub(crate) fn flatten(chunks: &[Chunk]) -> String {
         chunk.flatten_into(&mut out);
     }
     out
+}
+
+/// The `char` a raw integer element denotes, `None` when it is not a Unicode
+/// scalar value (negative, past `16#10FFFF`, or a surrogate).
+///
+/// A bignum is never a scalar — its magnitude is at least `2^59`.
+fn raw_scalar(term: Eterm) -> Option<char> {
+    if !is_small(term) {
+        return None;
+    }
+    u32::try_from(signed_value(term))
+        .ok()
+        .and_then(char::from_u32)
+}
+
+/// Flattens a chunk sequence to the text an `io:format` device receives,
+/// rejecting a raw integer element that is not a Unicode scalar value with
+/// `badarg`.
+///
+/// `io:format` writes the iolist to a device, and the oracle's device is a
+/// **unicode** one: it encodes every character as UTF-8 and refuses a code point
+/// outside the scalar range. So `io_lib:format("~tc",[1114112])` ⇒ `[1114112]`
+/// (the integer is carried verbatim) while `io:format("~tc",[1114112])` ⇒
+/// `error:badarg` — and likewise for a surrogate (`55296`), a negative value and
+/// a bignum. The `&str`-typed [`crate::context::OutputSink`] cannot carry such a
+/// code point either, so the error is raised here rather than fabricating text.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a non-scalar
+/// [`Chunk::Int`].
+pub(crate) fn flatten_output(chunks: &[Chunk]) -> Result<String> {
+    let mut out = String::new();
+    for chunk in chunks {
+        flatten_output_into(chunk, &mut out)?;
+    }
+    Ok(out)
+}
+
+/// [`flatten_output`] for one chunk.
+fn flatten_output_into(chunk: &Chunk, out: &mut String) -> Result<()> {
+    match chunk {
+        Chunk::Char(c) => {
+            out.push(*c);
+            Ok(())
+        }
+        Chunk::Int(term) => match raw_scalar(*term) {
+            Some(c) => {
+                out.push(c);
+                Ok(())
+            }
+            None => Err(badarg()),
+        },
+        Chunk::List(items) => {
+            for item in items {
+                flatten_output_into(item, out)?;
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Renders `term` the way the `~w` (`printable = false`) or `~p`
@@ -334,7 +426,7 @@ fn render_chunk(atoms: &AtomTable, term: Eterm, printable: bool, depth: i64) -> 
         return Ok(Chunk::text(&format_atom(name)));
     }
     if is_float(term) {
-        return Ok(Chunk::text(&format_float(float_value(term))));
+        return Ok(Chunk::text(&format_float(float_value(term))?));
     }
     if bits::is_binary(term) {
         return render_binary_chunk(term, printable, depth);
@@ -422,8 +514,12 @@ fn render_tuple_rest_chunk(
     out.push(render_chunk(atoms, tuple_element(term, index), printable, depth - 1)?);
     render_tuple_rest_chunk(atoms, term, index + 1, depth - 1, printable, out)
 }
-/// Renders a flat map (`#{k => v,…}`), `io_lib:write_map/4` /
+/// Renders a map (`#{k => v,…}`), `io_lib:write_map/4` /
 /// `io_lib_pretty:write/1` (both build `[#, {, [pair, …, pair], }]`).
+///
+/// The pairs come from the map's storage order (flat-map key order for a flat map,
+/// HAMT slot order for a hash map) — the order `maps:keys/1` yields and the oracle
+/// prints — so no re-sort is needed and a >32-pair hash map renders like the oracle.
 fn render_map_chunk(
     atoms: &AtomTable,
     term: Eterm,
@@ -433,12 +529,10 @@ fn render_map_chunk(
     if depth == 1 {
         return Ok(Chunk::text("#{}"));
     }
-    let (keys, values) = flatmap_pairs(term)?;
-    let mut pairs: Vec<(Eterm, Eterm)> = keys.into_iter().zip(values).collect();
+    let pairs: Vec<(Eterm, Eterm)> = beam_term::map::map_pairs_storage_order(term)?;
     if pairs.is_empty() {
         return Ok(Chunk::text("#{}"));
     }
-    pairs.sort_by(|a, b| flatmap_key_cmp(a.0, b.0, atoms));
     let inner = depth - 1;
     let mut body: Vec<Chunk> = Vec::new();
     body.push(map_pair_chunk(atoms, pairs[0], printable, inner)?);
@@ -491,38 +585,33 @@ fn map_pair_chunk(
         render_chunk(atoms, pair.1, printable, depth)?,
     ]))
 }
-/// The oracle's flatmap internal key order (`erts_cmp_flatmap_keys`): two atoms by
-/// their raw term word (atom index order), anything else by the exact term order.
-fn flatmap_key_cmp(a: Eterm, b: Eterm, atoms: &AtomTable) -> core::cmp::Ordering {
-    if is_atom(a) && is_atom(b) {
-        a.raw().cmp(&b.raw())
-    } else {
-        compare::cmp(a, b, atoms)
-    }
-}
-
 /// `io_lib_format:chars/2` — a deeply nested `lists:duplicate/2`.
 ///
 /// `chars(C, N)` is `[]`/`[C]`/`[C,C]`/`[C,C,C]` for `N` in `0..=3`, else `[S|S]`
 /// (`S` = `chars(C, N/2)`) for even `N` and `[C,S|S]` for odd `N`, so a long run
 /// is a *tree* of sub-lists, not a flat list.
 pub(crate) fn dup_chars(c: char, n: usize) -> Chunk {
+    dup_element(Chunk::Char(c), n)
+}
+
+/// [`dup_chars`] for an arbitrary single element — a [`Chunk::Char`] or a raw
+/// [`Chunk::Int`] (`io_lib_format:chars/2` duplicates whatever `char/5` holds,
+/// and `~tc` may hold an integer that is not a Unicode scalar).
+pub(crate) fn dup_element(elem: Chunk, n: usize) -> Chunk {
     match n {
         0 => Chunk::List(Vec::new()),
-        1 => Chunk::List(vec![Chunk::Char(c)]),
-        2 => Chunk::List(vec![Chunk::Char(c), Chunk::Char(c)]),
-        3 => {
-            Chunk::List(vec![Chunk::Char(c), Chunk::Char(c), Chunk::Char(c)])
-        }
+        1 => Chunk::List(vec![elem]),
+        2 => Chunk::List(vec![elem.clone(), elem]),
+        3 => Chunk::List(vec![elem.clone(), elem.clone(), elem]),
         n if n % 2 == 0 => {
-            let half = dup_chars(c, n / 2);
+            let half = dup_element(elem, n / 2);
             let mut items = vec![half.clone()];
             items.extend(half.into_items());
             Chunk::List(items)
         }
         n => {
-            let half = dup_chars(c, n / 2);
-            let mut items = vec![Chunk::Char(c), half.clone()];
+            let half = dup_element(elem.clone(), n / 2);
+            let mut items = vec![elem, half.clone()];
             items.extend(half.into_items());
             Chunk::List(items)
         }
@@ -632,8 +721,11 @@ fn string_field(s: Chunk, f: usize, left: bool, pad: u8) -> Chunk {
 ///
 /// The `~w` form is `[<, <, [digits, 44, digits, …], >, >]` (each byte its own
 /// sub-list, the separators individual integers; `[<, <, [], >, >]` for an empty
-/// binary, `[<, <, ["..."], >, >]` at depth 1). The `~p` form keeps the string
-/// leaf flat: `<<>>` / `<<...>>` / `<<"…">>`.
+/// binary). The body is depth-limited the way `io_lib:write_binary/3`'s
+/// `write_binary_body/4` limits it — one level per byte, then `"..."` while bytes
+/// remain — so `~W` of `<<1,2,3>>` is `<<>>`, `<<...>>`, `<<1,...>>`, `<<1,2,...>>`,
+/// `<<1,2,3>>` for depths `0..=4`. The `~p` form keeps the string leaf flat:
+/// `<<>>` / `<<...>>` / `<<"…">>`.
 fn render_binary_chunk(term: Eterm, printable: bool, depth: i64) -> Result<Chunk> {
     let bytes = bits::bytes(term)?;
     if printable {
@@ -661,16 +753,28 @@ fn render_binary_chunk(term: Eterm, printable: bool, depth: i64) -> Result<Chunk
             Chunk::Char('>'),
         ]));
     }
-    let mut body: Vec<Chunk> = Vec::new();
-    if depth == 1 {
-        body.push(Chunk::text("..."));
+    // `io_lib:write_binary/3` (`io_lib.erl` `write_binary_body/4`): each byte is one
+    // depth level, so at depth `D` (>= 1) the first `D - 1` bytes are shown and `...`
+    // follows when bytes remain (`<<1,2,3>>` at depth 3 ⇒ `<<1,2,...>>`). A negative
+    // depth is unlimited; depth `0` was handled by the caller.
+    let budget = if depth < 0 {
+        bytes.len()
     } else {
-        for (i, byte) in bytes.iter().enumerate() {
-            if i != 0 {
-                body.push(Chunk::Char(','));
-            }
-            body.push(Chunk::text(&byte.to_string()));
+        (depth - 1).max(0) as usize
+    };
+    let shown = budget.min(bytes.len());
+    let mut body: Vec<Chunk> = Vec::new();
+    for (i, byte) in bytes[..shown].iter().enumerate() {
+        if i != 0 {
+            body.push(Chunk::Char(','));
         }
+        body.push(Chunk::text(&byte.to_string()));
+    }
+    if shown < bytes.len() {
+        if shown != 0 {
+            body.push(Chunk::Char(','));
+        }
+        body.push(Chunk::text("..."));
     }
     Ok(Chunk::List(vec![
         Chunk::Char('<'),
@@ -711,16 +815,26 @@ fn render_bitstring_chunk(term: Eterm, printable: bool, depth: i64) -> Result<Ch
     let data = bitstring_bits(term)?;
     let full_bytes = bit_len / 8;
     let trailing_bits = bit_len % 8;
-    let mut body: Vec<Chunk> = Vec::new();
-    if depth == 1 {
-        body.push(Chunk::text("..."));
+    // `write_binary_body/4` consumes one depth level per body element: the
+    // `full_bytes` whole bytes and then the trailing `Value:Bits` field. So at depth
+    // `D` (>= 1) the first `D - 1` elements are shown and `...` follows while elements
+    // remain (`<<255:12>>` at depth 2 ⇒ `<<15,...>>`); a negative depth is unlimited.
+    let elements = full_bytes + 1;
+    let budget = if depth < 0 {
+        elements
     } else {
-        for (i, byte) in data[..full_bytes].iter().enumerate() {
-            if i != 0 {
-                body.push(Chunk::Char(','));
-            }
-            body.push(Chunk::text(&byte.to_string()));
+        (depth - 1).max(0) as usize
+    };
+    let shown = budget.min(full_bytes);
+    let mut body: Vec<Chunk> = Vec::new();
+    for (i, byte) in data[..shown].iter().enumerate() {
+        if i != 0 {
+            body.push(Chunk::Char(','));
         }
+        body.push(Chunk::text(&byte.to_string()));
+    }
+    if budget > full_bytes {
+        // The trailing field fits within the remaining depth.
         if full_bytes != 0 {
             body.push(Chunk::Char(','));
         }
@@ -730,6 +844,11 @@ fn render_bitstring_chunk(term: Eterm, printable: bool, depth: i64) -> Result<Ch
         body.push(Chunk::text(&trailing_value.to_string()));
         body.push(Chunk::Char(':'));
         body.push(Chunk::text(&trailing_bits.to_string()));
+    } else {
+        if shown != 0 {
+            body.push(Chunk::Char(','));
+        }
+        body.push(Chunk::text("..."));
     }
     Ok(Chunk::List(vec![
         Chunk::Char('<'),
@@ -834,36 +953,167 @@ fn format_big_decimal(negative: bool, digits: &[u64]) -> String {
     out
 }
 
-/// Renders an atom name: bare when it matches `[a-z][A-Za-z0-9_@]*`, else quoted.
+/// Renders an atom name the way the oracle's atom leaf does — `~w`/`~p` take the
+/// latin1 clause of `io_lib:write1/4`, i.e. `io_lib:write_atom_as_latin1/1`:
+/// **bare** when [`is_bare_atom`] (the oracle's `io_lib:quote_atom/2` is `false`),
+/// otherwise wrapped in `'…'` with every character escaped by [`escape_atom_char`]
+/// (`io_lib:string_char(unicode_as_latin1, …)`).
+///
+/// So `héllo` renders bare (`io_lib:format("~w",['héllo'])` ⇒
+/// `[104,233,108,108,111]`), while `_foo`/`Hello`/`a b`/`and`/a control character/
+/// `16#7F`/`16#80..16#9F`/`a÷b` are quoted, and a character above `16#FF` becomes
+/// the `\x{H}` escape inside the quotes (`Ā` ⇒ `'\x{100}'`).
 fn format_atom(name: &str) -> String {
     if is_bare_atom(name) {
-        name.to_string()
-    } else {
-        format!("'{name}'")
+        return name.to_string();
     }
+    let mut out = String::with_capacity(name.len() + 2);
+    out.push('\'');
+    for c in name.chars() {
+        escape_atom_char(c, &mut out);
+    }
+    out.push('\'');
+    out
 }
 
-/// Whether `name` is a bare atom name (`[a-z][A-Za-z0-9_@]*`).
+/// `io_lib:quote_atom/2` — whether the atom name needs **no** quotes.
+///
+/// The name must not be an Erlang reserved word ([`is_reserved_word`]), its
+/// **first** character must be a lowercase letter (`a..z`, or `ß..ÿ` except `÷`)
+/// and every character must satisfy the oracle's `name_char/1`: `a..z`, `ß..ÿ`
+/// except `÷`, `A..Z`, `À..Þ` except `×`, `0..9`, `_` or `@` (`io_lib.erl`).
+///
+/// This is **not** the `~p` printable-latin1 rule ([`latin1_printable_char`] /
+/// `io_lib:printable_latin1_list/1`), which is a different predicate: a space,
+/// `16#A0`, a leading digit or a leading uppercase letter are *printable* yet
+/// still force quotes here, while `héllo` (bare) and `a÷b` (quoted, `÷` is
+/// excluded) are rendered exactly as the oracle renders them.
 fn is_bare_atom(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    match bytes.first() {
-        Some(&first) if first.is_ascii_lowercase() => {}
-        _ => return false,
+    if is_reserved_word(name) {
+        return false;
     }
-    bytes[1..]
-        .iter()
-        .all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'@')
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if is_atom_name_initial(first) => chars.all(is_atom_name_char),
+        _ => false,
+    }
 }
 
-/// Renders a float: Rust's shortest round-trip, with a `.0` appended when the
-/// rendering is integral (deviation from `float_to_list(F, [short])`; see the
-/// module docs).
-fn format_float(value: f64) -> String {
-    let mut s = format!("{value}");
-    if value.is_finite() && !s.contains('.') && !s.contains('e') && !s.contains('E') {
-        s.push_str(".0");
+/// `quote_atom/2`'s first-character clause: `a..z`, or `ß..ÿ` except `÷`.
+fn is_atom_name_initial(c: char) -> bool {
+    matches!(c, 'a'..='z') || (('\u{00DF}'..='\u{00FF}').contains(&c) && c != '\u{00F7}')
+}
+
+/// The oracle's `name_char/1`: `a..z`, `ß..ÿ` except `÷`, `A..Z`, `À..Þ` except
+/// `×`, `0..9`, `_` and `@`.
+fn is_atom_name_char(c: char) -> bool {
+    matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '@')
+        || (('\u{00DF}'..='\u{00FF}').contains(&c) && c != '\u{00F7}')
+        || (('\u{00C0}'..='\u{00DE}').contains(&c) && c != '\u{00D7}')
+}
+
+/// `erl_scan:reserved_word/1` — the fixed reserved words of `erl_scan.erl` plus
+/// the `erl_features:keywords/0` set of the default feature configuration
+/// (`maybe`/`else`; the `maybe_expr` feature is on by default in erts-17.1, so a
+/// default oracle quotes both). A reserved word is always quoted, e.g.
+/// `io_lib:format("~w",['and'])` ⇒ `"'and'"` while `'rec'`/`'query'` stay bare.
+fn is_reserved_word(name: &str) -> bool {
+    matches!(
+        name,
+        "after"
+            | "begin"
+            | "case"
+            | "try"
+            | "cond"
+            | "catch"
+            | "andalso"
+            | "orelse"
+            | "end"
+            | "fun"
+            | "if"
+            | "let"
+            | "of"
+            | "receive"
+            | "when"
+            | "bnot"
+            | "not"
+            | "div"
+            | "rem"
+            | "band"
+            | "and"
+            | "bor"
+            | "bxor"
+            | "bsl"
+            | "bsr"
+            | "or"
+            | "xor"
+            | "maybe"
+            | "else"
+    )
+}
+
+/// `io_lib:string_char(unicode_as_latin1, C, $\', Tail)` — one character of a
+/// **quoted** atom, appended to `out`.
+///
+/// The oracle's clause order is reproduced exactly: the quote character and `\`
+/// escape first, then `16#20..16#7E` verbatim, then `16#A0..16#FF` verbatim (the
+/// `unicode_as_latin1` clause), then anything above `16#FF` as `\x{Hex}` with
+/// **uppercase** hex digits (`integer_to_list(C, 16)`), then the `\n \r \t \v \b
+/// \f \e` mnemonics, `16#7F` as `\d`, and every remaining character below `16#A0`
+/// as three octal digits. So `'\x{0}'` ⇒ `'\000'`, `'\x{1B}'` ⇒ `'\e'`,
+/// `'\x{7F}'` ⇒ `'\d'`, `'\x{80}'` ⇒ `'\200'`, `Ā` (U+0100) ⇒ `'\x{100}'`,
+/// `a'b` ⇒ `a\'b`, and `a"b`/`'a\xA0b'` keep `"`/`16#A0` verbatim.
+fn escape_atom_char(c: char, out: &mut String) {
+    let code = c as u32;
+    match c {
+        '\'' => out.push_str("\\'"),
+        '\\' => out.push_str("\\\\"),
+        _ if (0x20..=0x7E).contains(&code) => out.push(c),
+        _ if (0xA0..=0xFF).contains(&code) => out.push(c),
+        '\n' => out.push_str("\\n"),
+        '\r' => out.push_str("\\r"),
+        '\t' => out.push_str("\\t"),
+        '\u{0B}' => out.push_str("\\v"),
+        '\u{08}' => out.push_str("\\b"),
+        '\u{0C}' => out.push_str("\\f"),
+        '\u{1B}' => out.push_str("\\e"),
+        '\u{7F}' => out.push_str("\\d"),
+        _ if code > 0xFF => {
+            out.push_str("\\x{");
+            out.push_str(&format!("{code:X}"));
+            out.push('}');
+        }
+        // Every other character below `16#A0`: three octal digits.
+        _ => {
+            out.push('\\');
+            for shift in [6, 3, 0] {
+                out.push(char::from(b'0' + ((code >> shift) & 7) as u8));
+            }
+        }
     }
-    s
+}
+
+/// Renders a float exactly as the oracle's plain (non-`~e`/`~f`/`~g`) float leaf
+/// does: `io_lib:write1/4`'s float clause is `io_lib_format:fwrite_g(Fl)`, and
+/// `fwrite_g/1` is `float_to_list(Fl, [short])` (`io_lib_format.erl:758-760`).
+/// So the rendering is [`crate::numeric::format_short`] — the same
+/// compatibility-pinned port `float_to_list/2` uses, never a second renderer.
+///
+/// # Errors
+///
+/// As [`crate::numeric::format_short`]. The guard is unreachable for a real
+/// `f64` (the shortest round-trip form is well under 255 characters).
+fn format_float(value: f64) -> Result<String> {
+    if !value.is_finite() {
+        // Outside the oracle's domain: OTP cannot hold an `inf`/`NaN` float at
+        // all (`binary_to_term/1` refuses such a `NEW_FLOAT_EXT`), so no float
+        // the oracle can *print* reaches here. `format_short`'s shortest-digit
+        // search only accepts a finite non-zero value, so keep the debug-style
+        // spelling rather than panic; the BIF arithmetic that can fabricate one
+        // is a separate, recorded gap.
+        return Ok(format!("{value}"));
+    }
+    crate::numeric::format_short(value)
 }
 
 /// Renders an internal ref as `#Ref<0.0.0.Id>` (Milestone-1 refs carry no channel,
@@ -898,6 +1148,20 @@ mod tests {
     /// Renders `term` at `depth`.
     fn show_at(ctx: &mut BifContext<'_>, term: Eterm, printable: bool, depth: i64) -> String {
         format_term_depth(ctx, term, printable, depth).expect("term is printable")
+    }
+
+    /// A flat map whose keys are stored in the canonical flat-map key order
+    /// ([`beam_term::compare::cmp_flatmap_keys`]).
+    ///
+    /// [`crate::access::make_flatmap`] preserves the pair order it is handed, so the
+    /// writer canonicalises first — exactly the step `maps.rs::build_map` performs (and
+    /// what `beam_term::map::write_map` sorts for). A real flat map always stores its
+    /// keys in that order, which is why the printer renders the map's *storage* order
+    /// without re-sorting.
+    fn canonical_flatmap(ctx: &mut BifContext<'_>, pairs: &[(Eterm, Eterm)]) -> Eterm {
+        let mut pairs = pairs.to_vec();
+        pairs.sort_by(|a, b| beam_term::compare::cmp_flatmap_keys(a.0, b.0, ctx.atoms()));
+        crate::access::make_flatmap(ctx.heap(), &pairs).expect("the flat map fits")
     }
 
     #[test]
@@ -945,18 +1209,85 @@ mod tests {
     }
 
     #[test]
-    fn floats_use_shortest_round_trip_with_dot_zero() {
+    fn floats_render_as_float_to_list_short() {
         with_ctx(|ctx| {
+            // The oracle (`erl -noshell -eval 'io:format("~w~n",[V])'`) renders
+            // every one of these as `float_to_list(V, [short])`.
             for (value, expected) in [
-                (1.0f64, "1.0"),
+                (0.0f64, "0.0"),
+                (-0.0, "-0.0"),
+                (1.0, "1.0"),
                 (1.5, "1.5"),
                 (0.1, "0.1"),
                 (3.14159, "3.14159"),
                 (-2.5, "-2.5"),
+                (100.0, "100.0"),
+                (100.5, "100.5"),
+                // The magnitude rule: the decimal notation only survives while it
+                // is no longer than the scientific one.
+                (1.0e-4, "0.0001"),
+                (1.0e-5, "1.0e-5"),
+                (1.0e-6, "1.0e-6"),
+                (1.0e5, "1.0e5"),
+                (1.0e10, "1.0e10"),
+                (1.0e16, "1.0e16"),
+                (1.0e20, "1.0e20"),
+                (1.0e100, "1.0e100"),
+                (1.0e-300, "1.0e-300"),
+                (1.0e9, "1.0e9"),
+                (123456789.5, "123456789.5"),
+                (1234567895.0, "1234567895.0"),
+                (12345678900.0, "12345678900.0"),
+                (1.2345e-5, "1.2345e-5"),
+                (9.1e15, "9.1e15"),
+                (1.5e-4, "1.5e-4"),
+                (2.5e-7, "2.5e-7"),
+                (3.141592653589793, "3.141592653589793"),
+                (f64::MAX, "1.7976931348623157e308"),
+                (5.0e-324, "5.0e-324"),
+                (f64::MIN_POSITIVE, "2.2250738585072014e-308"),
             ] {
                 let term = ctx.make_float(value).expect("fits");
-                assert_eq!(show(ctx, term, false), expected, "float {value}");
+                assert_eq!(show(ctx, term, false), expected, "~w of {value:?}");
+                assert_eq!(show(ctx, term, true), expected, "~p of {value:?}");
+                assert_eq!(show_at(ctx, term, false, 3), expected, "~W of {value:?}");
+                assert_eq!(show_at(ctx, term, true, 3), expected, "~P of {value:?}");
             }
+        });
+    }
+
+    #[test]
+    fn a_non_finite_float_is_outside_the_oracle_domain() {
+        with_ctx(|ctx| {
+            // OTP cannot hold `inf`/`NaN` (its `binary_to_term/1` rejects a
+            // `NEW_FLOAT_EXT` with exponent `16#7FF`), so there is nothing to
+            // compare against; the printer must not panic on one.
+            for (value, expected) in [(f64::INFINITY, "inf"), (f64::NEG_INFINITY, "-inf")] {
+                let term = ctx.make_float(value).expect("fits");
+                assert_eq!(show(ctx, term, false), expected);
+            }
+            let nan = ctx.make_float(f64::NAN).expect("fits");
+            assert_eq!(show(ctx, nan, false), "NaN");
+        });
+    }
+
+    #[test]
+    fn floats_render_the_same_nested() {
+        with_ctx(|ctx| {
+            let a = ctx.atom("a").expect("seeded");
+            let ten = ctx.make_float(1.0e10).expect("fits");
+            let five = ctx.make_float(1.0e5).expect("fits");
+            let small = ctx.make_float(1.0e-6).expect("fits");
+
+            let tuple = ctx.tuple(&[five, small]).expect("fits");
+            let tail = ctx.cons(tuple, NIL).expect("fits");
+            let list = ctx.cons(ten, tail).expect("fits");
+            // `erl -noshell -eval 'io:format("~p~n",[[1.0e10,{1.0e5,1.0e-6}]])'`.
+            assert_eq!(show(ctx, list, false), "[1.0e10,{1.0e5,1.0e-6}]");
+            assert_eq!(show(ctx, list, true), "[1.0e10,{1.0e5,1.0e-6}]");
+
+            let map = canonical_flatmap(ctx, &[(a, ten)]);
+            assert_eq!(show(ctx, map, false), "#{a => 1.0e10}");
         });
     }
 
@@ -1073,11 +1404,21 @@ mod tests {
             let list = ctx.list(&[one, two]).expect("fits");
             assert_eq!(show(ctx, list, false), "[<<1:1>>,2]");
 
-            // Depth: `~W`/`~P` elide a bitstring's contents at depth 1.
+            // Depth: `~W`/`~P` spend one level per body element (each whole byte, plus
+            // the trailing `Value:Bits` field), then emit `...`.
             assert_eq!(show_at(ctx, one, false, 1), "<<...>>");
             assert_eq!(show_at(ctx, one, true, 1), "<<...>>");
             assert_eq!(show_at(ctx, one, false, 0), "...");
             assert_eq!(show_at(ctx, one, false, 2), "<<1:1>>");
+            // `<<255:12>>`: `d=2` ⇒ `<<15,...>>`, `d=3` ⇒ full.
+            assert_eq!(show_at(ctx, twelve, false, 1), "<<...>>");
+            assert_eq!(show_at(ctx, twelve, false, 2), "<<15,...>>");
+            assert_eq!(show_at(ctx, twelve, false, 3), "<<15,15:4>>");
+            // `<<1:9>>`: one whole byte then the trailing bit.
+            assert_eq!(show_at(ctx, nine, false, 2), "<<0,...>>");
+            assert_eq!(show_at(ctx, nine, false, 3), "<<0,1:1>>");
+            // `<<5:3,3:2>>` is a single element, so it survives depth 2 intact.
+            assert_eq!(show_at(ctx, five, false, 2), "<<23:5>>");
         });
     }
 
@@ -1089,8 +1430,7 @@ mod tests {
             let two = ctx.int(2).expect("fits");
             let three = ctx.int(3).expect("fits");
             let four = ctx.int(4).expect("fits");
-            let map = crate::access::make_flatmap(ctx.heap(), &[(three, four), (one, two)])
-                .expect("fits");
+            let map = canonical_flatmap(ctx, &[(three, four), (one, two)]);
             assert_eq!(show(ctx, map, false), "#{1 => 2,3 => 4}");
             assert_eq!(show(ctx, map, true), "#{1 => 2,3 => 4}");
 
@@ -1119,14 +1459,12 @@ mod tests {
             let b = ctx.atom("b").expect("seeded");
             let one = ctx.int(1).expect("fits");
             let two = ctx.int(2).expect("fits");
-            let map =
-                crate::access::make_flatmap(ctx.heap(), &[(b, one), (a, two)]).expect("fits");
+            let map = canonical_flatmap(ctx, &[(b, one), (a, two)]);
             assert_eq!(show(ctx, map, false), "#{a => 2,b => 1}");
 
             // Mixed classes use the term order (`1` < `a` < `{a}`).
             let tuple = ctx.tuple(&[a]).expect("fits");
-            let map = crate::access::make_flatmap(ctx.heap(), &[(tuple, one), (a, two), (one, one)])
-                .expect("fits");
+            let map = canonical_flatmap(ctx, &[(tuple, one), (a, two), (one, one)]);
             assert_eq!(show(ctx, map, false), "#{1 => 1,a => 2,{a} => 1}");
         });
     }
@@ -1172,7 +1510,7 @@ mod tests {
         with_ctx(|ctx| {
             let bin = bits::make_binary(ctx.heap(), &[1, 2, 3]).expect("fits");
             assert_eq!(show_at(ctx, bin, false, 1), "<<...>>");
-            assert_eq!(show_at(ctx, bin, false, 2), "<<1,2,3>>");
+            assert_eq!(show_at(ctx, bin, false, 2), "<<1,...>>");
             // A printable binary at depth 1 is still elided (oracle).
             let abc = bits::make_binary(ctx.heap(), b"abc").expect("fits");
             assert_eq!(show_at(ctx, abc, true, 1), "<<...>>");
@@ -1190,6 +1528,60 @@ mod tests {
             assert_eq!(show_at(ctx, map, false, 1), "#{}");
             assert_eq!(show_at(ctx, map, false, 2), "#{a => 1,...}");
             assert_eq!(show_at(ctx, map, false, 3), "#{a => 1,b => 2,...}");
+        });
+    }
+
+    /// The `~W` binary depth rule, pinned to the erts-17.1 oracle
+    /// (`io_lib:write_binary/3`'s `write_binary_body/4`: one depth level per byte,
+    /// then `...` while bytes remain).
+    #[test]
+    fn binary_depth_limit_matches_io_lib_write() {
+        with_ctx(|ctx| {
+            // `erl -noshell -eval 'io:format("~W~n",[<<1,2,3>>,2]).'` ⇒ `<<1,...>>`.
+            let bin = bits::make_binary(ctx.heap(), &[1, 2, 3]).expect("fits");
+            assert_eq!(show_at(ctx, bin, false, 0), "...");
+            assert_eq!(show_at(ctx, bin, false, 1), "<<...>>");
+            assert_eq!(show_at(ctx, bin, false, 2), "<<1,...>>");
+            assert_eq!(show_at(ctx, bin, false, 3), "<<1,2,...>>");
+            assert_eq!(show_at(ctx, bin, false, 4), "<<1,2,3>>");
+            assert_eq!(show_at(ctx, bin, false, 5), "<<1,2,3>>");
+            assert_eq!(show_at(ctx, bin, false, UNLIMITED_DEPTH), "<<1,2,3>>");
+
+            // `~W` (`printable = false`) renders a printable binary in decimal, with
+            // the same one-level-per-byte budget.
+            let abc = bits::make_binary(ctx.heap(), b"abc").expect("fits");
+            assert_eq!(show_at(ctx, abc, false, 1), "<<...>>");
+            assert_eq!(show_at(ctx, abc, false, 2), "<<97,...>>");
+            assert_eq!(show_at(ctx, abc, false, 3), "<<97,98,...>>");
+            assert_eq!(show_at(ctx, abc, false, 4), "<<97,98,99>>");
+            assert_eq!(show_at(ctx, abc, false, 5), "<<97,98,99>>");
+
+            // An empty binary is `<<>>` at every depth.
+            let empty = bits::make_binary(ctx.heap(), &[]).expect("fits");
+            assert_eq!(show_at(ctx, empty, false, 1), "<<>>");
+            assert_eq!(show_at(ctx, empty, false, 3), "<<>>");
+            assert_eq!(show_at(ctx, empty, false, UNLIMITED_DEPTH), "<<>>");
+
+            // The depth is consumed across sibling elements, exactly as for any other
+            // container (`{<<1,...>>,<<...>>}` at depth 3).
+            let tuple = ctx.tuple(&[bin, bin]).expect("fits");
+            assert_eq!(show_at(ctx, tuple, false, 2), "{<<...>>,...}");
+            assert_eq!(show_at(ctx, tuple, false, 3), "{<<1,...>>,<<...>>}");
+            assert_eq!(show_at(ctx, tuple, false, 4), "{<<1,2,...>>,<<1,...>>}");
+            assert_eq!(show_at(ctx, tuple, false, 6), "{<<1,2,3>>,<<1,2,3>>}");
+
+            let list = ctx.list(&[bin, bin]).expect("fits");
+            assert_eq!(show_at(ctx, list, false, 2), "[<<...>>|...]");
+            assert_eq!(show_at(ctx, list, false, 3), "[<<1,...>>,<<...>>]");
+            assert_eq!(show_at(ctx, list, false, 4), "[<<1,2,...>>,<<1,...>>]");
+            assert_eq!(show_at(ctx, list, false, 6), "[<<1,2,3>>,<<1,2,3>>]");
+
+            let a = ctx.atom("a").expect("seeded");
+            let map = crate::access::make_flatmap(ctx.heap(), &[(a, bin)]).expect("fits");
+            assert_eq!(show_at(ctx, map, false, 1), "#{}");
+            assert_eq!(show_at(ctx, map, false, 2), "#{a => <<...>>,...}");
+            assert_eq!(show_at(ctx, map, false, 3), "#{a => <<1,...>>}");
+            assert_eq!(show_at(ctx, map, false, 5), "#{a => <<1,2,3>>}");
         });
     }
 
@@ -1239,17 +1631,172 @@ mod tests {
 
     #[test]
     fn bare_atom_name_rule() {
+        // `io_lib:quote_atom/2` — bare names.
         assert!(is_bare_atom("a"));
         assert!(is_bare_atom("hello"));
         assert!(is_bare_atom("x1_@z"));
         assert!(is_bare_atom("foo@bar"));
+        assert!(is_bare_atom("héllo"));
+        assert!(is_bare_atom("café"));
+        assert!(is_bare_atom("àbc"));
+        assert!(is_bare_atom("ß"));
+        assert!(is_bare_atom("ÿ"));
+        assert!(is_bare_atom("a1@_Z"));
+        // Quoted: an empty name, a bad first character, a bad later character.
         assert!(!is_bare_atom(""));
         assert!(!is_bare_atom("Foo"));
         assert!(!is_bare_atom("_foo"));
         assert!(!is_bare_atom("1x"));
         assert!(!is_bare_atom("a-b"));
+        assert!(!is_bare_atom(" a"));
+        assert!(!is_bare_atom("a b"));
+        assert!(!is_bare_atom("a.b"));
+        assert!(!is_bare_atom("a\nb"));
+        // `÷` is excluded from `ß..ÿ` in both positions, `×` from `À..Þ`.
+        assert!(!is_bare_atom("÷a"));
+        assert!(!is_bare_atom("a÷"));
+        assert!(!is_bare_atom("a×b"));
+        assert!(is_bare_atom("aØb"));
+        // A leading character above `16#FF` is never a name initial.
+        assert!(!is_bare_atom("Āa"));
+        assert!(!is_bare_atom("aĀ"));
+        // Reserved words are always quoted, other short names are not.
+        assert!(!is_bare_atom("and"));
+        assert!(is_bare_atom("rec"));
+        assert!(is_bare_atom("query"));
         assert_eq!(format_atom("_foo"), "'_foo'");
         assert_eq!(format_atom(""), "''");
+        assert_eq!(format_atom("héllo"), "héllo");
+        assert_eq!(format_atom("and"), "'and'");
+    }
+
+    #[test]
+    fn atom_quoting_and_escaping_match_the_oracle() {
+        // Every expectation below is the flattened `io_lib:format("~w",[A])` of the
+        // system `erl` (OTP 29.1.1 / erts-17.1), probed with
+        // `binary_to_atom(<<B>>, latin1)` for the whole byte range and with
+        // `binary_to_atom(unicode:characters_to_binary([C]), utf8)` above it.
+        let cases: &[(&str, &str)] = &[
+            ("a", "a"),
+            ("abc", "abc"),
+            ("x1_@z", "x1_@z"),
+            ("héllo", "héllo"),
+            ("café", "café"),
+            ("àbc", "àbc"),
+            ("ß", "ß"),
+            ("ÿ", "ÿ"),
+            ("", "''"),
+            ("Hello", "'Hello'"),
+            ("_foo", "'_foo'"),
+            ("1x", "'1x'"),
+            ("a-b", "'a-b'"),
+            ("a b", "'a b'"),
+            ("a'b", "'a\\'b'"),
+            ("a\\b", "'a\\\\b'"),
+            // `"` is *not* escaped inside a quoted atom (the quote is `'`).
+            ("a\"b", "'a\"b'"),
+            // Control characters: the mnemonics, then three octal digits.
+            ("a\x08b", "'a\\bb'"),
+            ("a\tb", "'a\\tb'"),
+            ("a\nb", "'a\\nb'"),
+            ("a\x0bb", "'a\\vb'"),
+            ("a\x0cb", "'a\\fb'"),
+            ("a\rb", "'a\\rb'"),
+            ("a\x1bb", "'a\\eb'"),
+            ("\0", "'\\000'"),
+            ("\x01", "'\\001'"),
+            ("\x0e", "'\\016'"),
+            ("\x1f", "'\\037'"),
+            // `16#7F` is `\d`, `16#80..16#9F` are octal, `16#A0..16#FF` verbatim.
+            ("a\x7fb", "'a\\db'"),
+            ("\u{80}", "'\\200'"),
+            ("a\u{9f}b", "'a\\237b'"),
+            ("\u{a0}", "'\u{a0}'"),
+            ("a\u{a0}b", "'a\u{a0}b'"),
+            ("ø", "ø"),
+            ("÷", "'÷'"),
+            // Above `16#FF`: `\x{H}` with uppercase hex digits.
+            ("Ā", "'\\x{100}'"),
+            ("aĀ", "'a\\x{100}'"),
+            ("\u{12c}", "'\\x{12C}'"),
+            ("\u{7ff}", "'\\x{7FF}'"),
+            ("\u{1f600}", "'\\x{1F600}'"),
+            ("\u{10ffff}", "'\\x{10FFFF}'"),
+            // Reserved words are quoted.
+            ("and", "'and'"),
+            ("end", "'end'"),
+            ("fun", "'fun'"),
+            ("maybe", "'maybe'"),
+            ("else", "'else'"),
+            ("rec", "rec"),
+            ("query", "query"),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(format_atom(name), *expected, "atom {name:?}");
+        }
+
+        // The byte-code sweep of the **bareness** decision, derived from the
+        // oracle's `quote_atom/2`: a single-character name is bare iff the
+        // character is an `a..z` / `ß..ÿ`-minus-`÷` initial (a one-character name
+        // has no later character to check).
+        for code in 0u32..=0x2FF {
+            let Some(c) = char::from_u32(code) else {
+                continue;
+            };
+            let name = c.to_string();
+            let expected = matches!(c, 'a'..='z')
+                || (('\u{00DF}'..='\u{00FF}').contains(&c) && c != '\u{00F7}');
+            assert_eq!(is_bare_atom(&name), expected, "single char {code:#X}");
+        }
+
+        // The **later-character** sweep: `"a" + C` is bare iff `name_char(C)`.
+        for code in 0u32..=0x2FF {
+            let Some(c) = char::from_u32(code) else {
+                continue;
+            };
+            let name = format!("a{c}");
+            let expected = matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '@')
+                || (('\u{00DF}'..='\u{00FF}').contains(&c) && c != '\u{00F7}')
+                || (('\u{00C0}'..='\u{00DE}').contains(&c) && c != '\u{00D7}');
+            assert_eq!(is_bare_atom(&name), expected, "trailing char {code:#X}");
+        }
+
+        // The escaping sweep for the whole latin1 range: every byte `0..=255` in
+        // a name that is always quoted (`"a" + C + " "`). The oracle's expected
+        // escape is spelled out by the same `string_char(unicode_as_latin1, …)`
+        // clause table (probed for all 256 values).
+        for code in 0u32..=0xFF {
+            let c = char::from_u32(code).expect("a byte is a char");
+            let name = format!("a{c} ");
+            let rendered = format_atom(&name);
+            assert!(
+                rendered.starts_with('\'') && rendered.ends_with('\''),
+                "{code:#X}"
+            );
+            let inner = &rendered[1..rendered.len() - 1];
+            let expected = match code {
+                0x27 => "a\\' ".to_string(),
+                0x5C => "a\\\\ ".to_string(),
+                0x08 => "a\\b ".to_string(),
+                0x09 => "a\\t ".to_string(),
+                0x0A => "a\\n ".to_string(),
+                0x0B => "a\\v ".to_string(),
+                0x0C => "a\\f ".to_string(),
+                0x0D => "a\\r ".to_string(),
+                0x1B => "a\\e ".to_string(),
+                0x7F => "a\\d ".to_string(),
+                c if (0x20..=0x7E).contains(&c) || (0xA0..=0xFF).contains(&c) => {
+                    format!("a{} ", char::from_u32(c).expect("a char"))
+                }
+                c => format!(
+                    "a\\{}{}{} ",
+                    char::from(b'0' + ((c >> 6) & 7) as u8),
+                    char::from(b'0' + ((c >> 3) & 7) as u8),
+                    char::from(b'0' + (c & 7) as u8)
+                ),
+            };
+            assert_eq!(inner, expected, "escaping byte {code:#X}");
+        }
     }
 
     #[test]

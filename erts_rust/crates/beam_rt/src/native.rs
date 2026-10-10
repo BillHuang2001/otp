@@ -87,7 +87,7 @@ mod group_leader;
 mod init;
 pub(crate) mod memory;
 mod node;
-mod port;
+pub(crate) mod port;
 mod prim;
 mod prim_file;
 mod process;
@@ -158,10 +158,10 @@ impl RuntimeContext<'_> {
             ("init", "get_status", 0) => Some(self.get_status()),
             ("os", "cmd", 1) => Some(self.os_cmd(args)),
             // The port surface the `PortHook` seam cannot express: `port_command/2,3` (the
-            // port's *input* direction — see [`port`]) and the closed-port half of
-            // `port_info/1,2`. Every other form of those two names falls through to the
-            // registry (`port_native` answers `None` for it).
-            ("erlang", "port_command" | "port_info", 1 | 2 | 3) => {
+            // port's *input* direction) and `port_control/3` (the driver's `control` callback) —
+            // see [`port`] — plus the closed-port half of `port_info/1,2`. Every other form of
+            // those three names falls through to the registry (`port_native` answers `None`).
+            ("erlang", "port_command" | "port_control" | "port_info", 1 | 2 | 3) => {
                 self.port_native(function, arity, args)
             }
             ("code", "get_path", 0) => Some(self.code_get_path()),
@@ -215,6 +215,17 @@ impl RuntimeContext<'_> {
             ("erlang", "exit", 3) => Some(self.exit_3(args)),
             ("erlang", "pre_loaded", 0) => Some(self.pre_loaded_0()),
             ("erlang", "module_loaded", 1) => Some(self.module_loaded_1(args)),
+            // The on-demand collection (contract A.7). `erlang:garbage_collect/0` is the
+            // `erlang.erl` wrapper over `erts_internal:garbage_collect(major)`
+            // (`erlang.erl:3051-3053`) and `/1` is the wrapper over
+            // `erlang:garbage_collect(Pid, [])` (`erlang.erl:3055-3066`), whose `self()` clause
+            // reaches that same `erts_internal` BIF — and `erlang` is a floor namespace
+            // ([`FLOOR_MODULES`]), so its `.beam` wrapper is un-enterable and the floor owns
+            // both names. The latch, its two serving points and the honest refusals live in
+            // [`erts_internal`]. `/2` remains a typed capability gap (the asynchronous
+            // system-task protocol).
+            ("erlang", "garbage_collect", 0) => Some(self.garbage_collect_0()),
+            ("erlang", "garbage_collect", 1) => Some(self.garbage_collect_1(args)),
             // The per-process **group leader** (contract A.9): `erlang:group_leader/2` is the
             // `erlang.erl` wrapper over `erts_internal:group_leader/2,3`, and the leader is
             // runtime state `beam_process` does not model — the store lives on
