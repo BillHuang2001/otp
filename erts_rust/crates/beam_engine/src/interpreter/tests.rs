@@ -562,7 +562,287 @@ fn test_with_a_live_fail_label_branches_instead_of_raising() {
         .unwrap();
     assert_eq!(step, Step::Goto { func: 0, pc: 2 });
     assert_eq!(machine.pending_exception(), None);
-}/// A module whose `n` imports are `erlang:f0/2` .. `erlang:f<n-1>/2`,
+}
+
+// ---- the same `NO_FAIL` raises through `run_label` + a live `try` frame ----
+
+/// The `(class, live reason term)` of an uncaught raise that surfaced as a run's
+/// `Err`. Panics unless the error is a raise carrying a live reason term, so a
+/// test can never pass by observing a different outcome than the one it pins.
+fn uncaught_class_and_reason(err: BeamError) -> (ExceptionClass, Eterm) {
+    match err {
+        BeamError::Raise(raise) => {
+            let live = raise
+                .live_reason
+                .as_ref()
+                .expect("an uncaught reason carries its term");
+            (
+                raise.class,
+                *live.downcast_ref::<Eterm>().expect("the reason term"),
+            )
+        }
+        other => panic!("expected an uncaught raise, got {other:?}"),
+    }
+}
+
+/// The `try … catch` skeleton of `../families/maps/tests.rs::with_catch`:
+/// `Label(1)`, `try Frame Fail=Label(3)`, `body`, `try_end Frame`,
+/// `move x(0),x(0)`, `return`, `Label(3)`, `try_case Frame`, `handler`, `return`.
+///
+/// After `try_case` the **class atom is in `x(0)`** (it is copied from `x(3)`)
+/// while the **reason stays in `x(1)`** (C's `handle_error` register
+/// convention), so `handler` selects which of the two the run returns.
+fn wrapped_in_catch(body: Vec<Instr>, handler: Instr) -> Vec<Instr> {
+    let mut code = vec![
+        Instr::Label(Label(1)),
+        Instr::Try {
+            frame: Operand::X(9),
+            fail: Label(3),
+        },
+    ];
+    code.extend(body);
+    code.extend([
+        Instr::TryEnd {
+            frame: Operand::X(9),
+        },
+        Instr::Move {
+            src: Operand::X(0),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+        Instr::Label(Label(3)),
+        Instr::TryCase {
+            frame: Operand::X(9),
+        },
+        handler,
+        Instr::Return,
+    ]);
+    code
+}
+
+/// The `test` `NO_FAIL` failure through the **real public run entry**:
+/// `run_label` drives the whole function, so the raise surfaces as the run's
+/// `Err` — class `error` with the **bare** atom `function_clause` — and the
+/// machine keeps the pending class + reason term a later introspection reads.
+#[test]
+fn test_with_no_fail_raises_function_clause_through_run_label() {
+    let (mut module, _) = module_with_function(
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Test {
+                kind: TestKind::IsTuple,
+                fail: NO_FAIL,
+                args: vec![Operand::X(0)],
+            },
+            Instr::Return,
+        ],
+        Vec::new(),
+    );
+    let function_clause = module.atom_table.intern("function_clause");
+    module.atom_table.intern("error");
+
+    let mut machine = Machine::new();
+    let err = machine
+        .run_label(
+            &module,
+            Label(1),
+            1,
+            &[make_small(1)],
+            &mut MinimalContext::new(),
+        )
+        .expect_err("a small integer is not a tuple, so the test fails");
+    let (class, reason) = uncaught_class_and_reason(err);
+    assert_eq!(class, ExceptionClass::Error);
+    assert_eq!(reason, make_atom(function_clause));
+    // The machine records exactly the same pending class + reason term.
+    assert_eq!(machine.pending_class(), Some(ExceptionClass::Error));
+    assert_eq!(
+        machine.pending_exception(),
+        Some((ExceptionClass::Error, make_atom(function_clause)))
+    );
+}
+
+/// The `select_val` spelling through `run_label`: a scrutinee matching no
+/// alternative with an `f,0` failure operand raises class `error` with the bare
+/// atom `function_clause`.
+#[test]
+fn select_val_with_no_fail_raises_function_clause_through_run_label() {
+    let (mut module, _) = module_with_function(
+        vec![
+            Instr::Label(Label(1)),
+            Instr::SelectVal {
+                value: Operand::X(0),
+                fail: NO_FAIL,
+                pairs: vec![(Operand::Integer(1), Label(3))],
+            },
+            Instr::Label(Label(2)),
+            Instr::Return,
+            Instr::Label(Label(3)),
+            Instr::Return,
+        ],
+        Vec::new(),
+    );
+    let function_clause = module.atom_table.intern("function_clause");
+    module.atom_table.intern("error");
+
+    let mut machine = Machine::new();
+    let err = machine
+        .run_label(
+            &module,
+            Label(1),
+            1,
+            &[make_small(2)],
+            &mut MinimalContext::new(),
+        )
+        .expect_err("`2` matches neither alternative");
+    let (class, reason) = uncaught_class_and_reason(err);
+    assert_eq!(class, ExceptionClass::Error);
+    assert_eq!(reason, make_atom(function_clause));
+    assert_eq!(
+        machine.pending_exception(),
+        Some((ExceptionClass::Error, make_atom(function_clause)))
+    );
+}
+
+/// A failed `test` `NO_FAIL` raise is an ordinary BEAM exception: a live `try`
+/// frame catches it, and the handler observes both the class (`x(0)` after
+/// `try_case`) and the reason (`x(1)`). Two runs of the same failing body,
+/// differing only in which register the handler returns.
+#[test]
+fn a_no_fail_test_raise_lands_in_a_live_catch_frame() {
+    let body = vec![Instr::Test {
+        kind: TestKind::IsTuple,
+        fail: NO_FAIL,
+        args: vec![Operand::X(0)],
+    }];
+
+    // Run 1: the handler returns the landed **reason** (`x(1)`).
+    let (mut module, _) = module_with_function(
+        wrapped_in_catch(
+            body.clone(),
+            Instr::Move {
+                src: Operand::X(1),
+                dst: Operand::X(0),
+            },
+        ),
+        Vec::new(),
+    );
+    let function_clause = module.atom_table.intern("function_clause");
+    module.atom_table.intern("error");
+
+    let mut machine = Machine::new();
+    let reason = machine
+        .run_label(
+            &module,
+            Label(1),
+            1,
+            &[make_small(1)],
+            &mut MinimalContext::new(),
+        )
+        .expect("the live catch frame handles the raise");
+    assert_eq!(reason, make_atom(function_clause));
+    assert_eq!(machine.catch_frame_depth(), 0, "try_case consumed the frame");
+
+    // Run 2: the handler returns the landed **class** (`x(0)`, the `try_case`
+    // copy of `x(3)`).
+    let (mut module, _) = module_with_function(
+        wrapped_in_catch(
+            body,
+            Instr::Move {
+                src: Operand::X(0),
+                dst: Operand::X(0),
+            },
+        ),
+        Vec::new(),
+    );
+    let error = module.atom_table.intern("error");
+    module.atom_table.intern("function_clause");
+
+    let mut machine = Machine::new();
+    let class = machine
+        .run_label(
+            &module,
+            Label(1),
+            1,
+            &[make_small(1)],
+            &mut MinimalContext::new(),
+        )
+        .expect("the live catch frame handles the raise");
+    assert_eq!(class, make_atom(error));
+    assert_eq!(machine.catch_frame_depth(), 0, "try_case consumed the frame");
+}
+
+/// The `select_val` spelling of the same catchability: a `NO_FAIL` failure with
+/// no alternative matching is caught by a live `try` frame, whose handler sees
+/// the class in `x(0)` and the bare `function_clause` reason in `x(1)`.
+#[test]
+fn a_no_fail_select_val_raise_lands_in_a_live_catch_frame() {
+    // The (never-taken) `1 -> Label(3)` alternative happens to name this
+    // wrapper's catch handler; the scrutinee is `2`, so only the `NO_FAIL` path
+    // runs.
+    let body = vec![Instr::SelectVal {
+        value: Operand::X(0),
+        fail: NO_FAIL,
+        pairs: vec![(Operand::Integer(1), Label(3))],
+    }];
+
+    // Run 1: the handler returns the landed **reason** (`x(1)`).
+    let (mut module, _) = module_with_function(
+        wrapped_in_catch(
+            body.clone(),
+            Instr::Move {
+                src: Operand::X(1),
+                dst: Operand::X(0),
+            },
+        ),
+        Vec::new(),
+    );
+    let function_clause = module.atom_table.intern("function_clause");
+    module.atom_table.intern("error");
+
+    let mut machine = Machine::new();
+    let reason = machine
+        .run_label(
+            &module,
+            Label(1),
+            1,
+            &[make_small(2)],
+            &mut MinimalContext::new(),
+        )
+        .expect("the live catch frame handles the raise");
+    assert_eq!(reason, make_atom(function_clause));
+    assert_eq!(machine.catch_frame_depth(), 0, "try_case consumed the frame");
+
+    // Run 2: the handler returns the landed **class** (`x(0)`, the `try_case`
+    // copy of `x(3)`).
+    let (mut module, _) = module_with_function(
+        wrapped_in_catch(
+            body,
+            Instr::Move {
+                src: Operand::X(0),
+                dst: Operand::X(0),
+            },
+        ),
+        Vec::new(),
+    );
+    let error = module.atom_table.intern("error");
+    module.atom_table.intern("function_clause");
+
+    let mut machine = Machine::new();
+    let class = machine
+        .run_label(
+            &module,
+            Label(1),
+            1,
+            &[make_small(2)],
+            &mut MinimalContext::new(),
+        )
+        .expect("the live catch frame handles the raise");
+    assert_eq!(class, make_atom(error));
+    assert_eq!(machine.catch_frame_depth(), 0, "try_case consumed the frame");
+}
+
+/// A module whose `n` imports are `erlang:f0/2` .. `erlang:f<n-1>/2`,
 /// interned into its own atom table.
 fn module_with_imports(n: u32) -> Module {
     let (mut module, _) =
