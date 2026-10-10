@@ -214,6 +214,26 @@ SMP pool:
     monitor still listed) the moment the per-peer `?`-propagation is restored.** Deterministic —
     the refusal size is the exempt peer's own bounded nursery capacity + 1 word, no sleeps /
     wall-clock bounds / oracle.
+33. `message_relocation.rs` (4 tests) — the collection's **queued-message re-install**: a collection
+    (`Process::collect`/`ensure_capacity` via `run_rooted_collection`) must carry a queued message's
+    **whole envelope** — it re-installs each message with `Message::with_payload`, so a fragment-resident
+    payload keeps its `Fragments` chain and a heap-resident one keeps its refc-binary/node lists. A
+    `Message::new(root, from).with_fragments(Fragments)` (root copied via `HeapFragment::copy_root`) is
+    queued, the nursery is filled with unrooted garbage, `Process::collect` runs, and the message still
+    has `fragments().is_some()`, `fragment.contains(payload)` still true, `from` intact and the payload
+    readable (`a_fragment_resident_message_survives_a_collection_with_its_fragment_chain`); a
+    `{RefcBinary, ExternalPid}` payload delivered through `Process::deliver` keeps `binaries().len()==1`
+    with the shared-owner refcount at 3 (one handle each for the test, the source table and the message —
+    **neither dropped early nor registered twice**) and `nodes().len()==1`
+    (`an_off_heap_payload_keeps_its_binary_and_node_lists_across_a_collection`); mixed
+    heap/fragment/heap messages keep FIFO order (`a_collection_preserves_mailbox_fifo_order_across_mixed_message_kinds`);
+    and a `relocation_exempt` receiver refuses the collection (the typed `relocation_exempt` raise,
+    `collect_if_needed` ⇒ `Ok(false)`, `minor_gcs()==0`) leaving the queued message untouched
+    (`an_exempt_process_refuses_the_collection_and_leaves_the_queued_message_untouched`).
+    **Discriminating by construction: 3 of the 4 tests FAIL on the pre-fix rebuild** (the
+    `Message::new(payload, from).with_token(..).with_off_heap(..)` form, which drops `fragments`/
+    `binaries`/`nodes`) — verified by temporarily restoring step 6, then reverting. Deterministic — the
+    fragment/ownership assertions, no sleeps / wall-clock bounds / oracle.
 
 ## Constraints
 - **Anti-flakiness (BINDING).** Every assertion is forced by **synchronization**, never a bare
