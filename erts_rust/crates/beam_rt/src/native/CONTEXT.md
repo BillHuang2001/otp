@@ -176,13 +176,11 @@ for an unregistered `registered_name`), so the list is a genuine, shorter-by-con
   `process_flag(message_queue_data, off_heap)`, which `process.rs` accepts and ignores — so such a
   process reports `on_heap` where the oracle reports `off_heap`. Honouring it needs per-process
   storage in `beam_process::Process` (a cross-crate handoff, not a value this floor may fabricate).
-- **`trace`** is the **live** per-process ERTS tracee-flag bitmask — an **integer**, never the
-  `trace_info(P, flags)` atom list (C `make_small(ERTS_IS_P_TRACED_FL(rp, TRACEE_FLAGS))`,
-  `erl_bif_info.c:2133`; oracle `{trace,0}` untraced, `{trace,1024}` after `[call]`,
-  `{trace,32763895}` after `[all]`). `trace_bitmask` maps `crate::trace::flags_to_atoms(flags)`
-  through the `ERTS_TRACE_FLAG_BITS` table (`F_TRACE_FLAG(n) = 1 << (3 + n)`), whose 21 rows sum to
-  the oracle's `[all]` bitmask exactly; an untraced process ⇒ `0`. The table's coverage is
-  drift-guarded by `memory/tests.rs`.
+- **`trace`** is the **live** per-process ERTS tracee-flag bitmask as an **integer**, never the
+  `trace_info(P, flags)` atom list (oracle `{trace,0}` untraced, `{trace,1024}` after `[call]`,
+  `{trace,32763895}` after `[all]`). `trace_bitmask` maps `flags_to_atoms(flags)` through the
+  `ERTS_TRACE_FLAG_BITS` table (`1 << (3 + n)`), whose 21 rows sum to the oracle's `[all]` exactly;
+  untraced ⇒ `0`. Drift-guarded by `memory/tests.rs`.
 
 ### `erts_internal.rs` — the served BIFs (contract A.7)
 `RuntimeContext::erts_internal_call(function, arity, args) -> Option<Result<Eterm>>`; `beam_bifs`
