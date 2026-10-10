@@ -402,17 +402,25 @@ fn a_non_first_private_append_segment_seeds_from_a_refc_binary() {
 // (3) the live `erlc`/`erl` oracle cross-check (skips loudly when absent)
 // ---------------------------------------------------------------------------
 
-/// The inline fixture compiled at test time. Both functions are **BIF-free** (the
+/// The inline fixture compiled at test time. Every function is **BIF-free** (the
 /// [`MinimalContext`] installs no BIF hook), so they exercise the bitstring family
 /// and nothing else:
 ///
 /// * `first3/1` reads a 3-bit field off a byte-aligned subject;
 /// * `tail16/1` skips one bit and reads the next 16, so a `>64`-byte subject (which
 ///   the harness builds as an off-heap refc binary) is read at a non-byte-aligned
-///   window.
+///   window;
+/// * `rest16/1` skips one bit and 16 more, then takes the whole remaining tail — over
+///   a 70-byte subject the 543-bit result is above the 64-byte on-heap limit, so it
+///   must come back as an off-heap refc binary;
+/// * `rest16bin/1` skips 16 byte-aligned bits and takes the rest as a `binary` — over
+///   a 70-byte subject the 544-bit (68-byte) result is likewise above the limit;
+/// * `built_tail/1` builds the 70-byte subject **itself** at runtime (`<<Seed:560>>`,
+///   an `integer` `bs_create_bin` segment wider than 64 bits) and reads a tail at a
+///   non-byte-aligned window out of it.
 const ORACLE_SRC: &str = "\
 -module(bitsrun).
--export([first3/1, tail16/1]).
+-export([first3/1, tail16/1, rest16/1, rest16bin/1, built_tail/1]).
 
 first3(Bin) ->
     <<A:3, _/bits>> = Bin,
@@ -421,6 +429,19 @@ first3(Bin) ->
 tail16(Bin) ->
     <<_:1, B:16, _/bits>> = Bin,
     B.
+
+rest16(Bin) ->
+    <<_:1, _:16, Rest/bits>> = Bin,
+    Rest.
+
+rest16bin(Bin) ->
+    <<_:16, Rest/binary>> = Bin,
+    Rest.
+
+built_tail(Seed) ->
+    Bin = <<Seed:560>>,
+    <<_:1, _:16, Rest/bits>> = Bin,
+    Rest.
 ";
 
 /// Compile [`ORACLE_SRC`] into a per-`tag` fresh temp dir and return that dir.
@@ -563,5 +584,200 @@ fn tail16_over_a_refc_subject_matches_the_oracle() {
     match erl_eval(&dir, &eval) {
         Some(out) => assert_eq!(out.trim(), "516", "the oracle disagrees for `{eval}`"),
         None => eprintln!("SKIP: no system `erl` on PATH -- tail16/1 oracle value skipped"),
+    }
+}
+
+/// The bits `[skip, 8 * payload.len())` of `payload`, as `(bytes, bit_count)` — the
+/// value `<<_:skip, Rest/bits>>` must return.
+///
+/// Pure Rust over the raw subject bytes, so the expectation is independent of the
+/// engine's own [`bitstring`] reader (the payload is `1..=70`, whose shifted window is
+/// not a plain byte slice).
+fn tail_of(payload: &[u8], skip: usize) -> (Vec<u8>, usize) {
+    let nbits = payload.len() * 8 - skip;
+    let mut out = vec![0u8; nbits.div_ceil(8)];
+    for i in 0..nbits {
+        let bit = (payload[(skip + i) / 8] >> (7 - ((skip + i) % 8))) & 1;
+        out[i / 8] |= bit << (7 - (i % 8));
+    }
+    (out, nbits)
+}
+
+/// Build the 70-byte (`1..=70`) off-heap refc subject `rest16/1` and `rest16bin/1`
+/// read, in the machine that owns its payload: returns the subject term and the
+/// payload bytes it was built from.
+fn refc_subject_70(machine: &mut Machine, ctx: &mut MinimalContext) -> (Eterm, Vec<u8>) {
+    let payload: Vec<u8> = (1..=70u8).collect();
+    let subject = raw::make_binary(machine, ctx, &payload, payload.len() * 8)
+        .expect("a 70-byte refc subject");
+    // SAFETY: `subject` is a live bitstring built on the line above.
+    assert!(
+        unsafe { beam_term::refc::is_refc_binary(subject) },
+        "70 bytes is above the 64-byte on-heap limit"
+    );
+    (subject, payload)
+}
+
+/// `bitsrun:rest16/1` = `<<_:1, _:16, Rest/bits>>` over a **70-byte** subject: the
+/// 543-bit result is above the 64-byte on-heap limit, so it must come back as an
+/// off-heap refc binary.
+///
+/// The C `get_tail` match command builds through `erts_build_sub_bitstring`, which has
+/// no size limit; the expected value is the subject's bits `17..560` (derived in Rust
+/// by [`tail_of`]) and the bit count is cross-checked against the live `erl` on the same
+/// bytes.
+///
+/// A literal `<<_:1, _:16, Rest/binary>>` cannot serve here: the 17-bit prefix leaves
+/// 543 bits, which is not a multiple of the unit 8 a `binary` tail requires, so the
+/// oracle `badmatch`es it (`ensure_at_least 17 8`). `rest16bin/1` is the byte-aligned
+/// `Rest/binary` counterpart below.
+#[test]
+fn rest16_over_a_refc_subject_returns_an_off_heap_result() {
+    let Some(dir) = compile_oracle("rest16") else {
+        eprintln!("SKIP: no usable `erlc` on PATH -- bitsrun:rest16/1 cross-check skipped");
+        return;
+    };
+    let module = load_file(dir.join("bitsrun.beam"))
+        .unwrap_or_else(|e| panic!("load bitsrun.beam: {e:?}"));
+
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::new();
+    let (subject, payload) = refc_subject_70(&mut machine, &mut ctx);
+
+    let result = machine
+        .run_export(&module, oracle_export(&module, "rest16"), 1, &[subject], &mut ctx)
+        .expect("bitsrun:rest16/1");
+    // SAFETY: `result` is a live bitstring the run just produced.
+    assert!(
+        unsafe { beam_term::refc::is_refc_binary(result) },
+        "a 543-bit result is above the 64-byte on-heap limit"
+    );
+    let (want, want_bits) = tail_of(&payload, 17);
+    assert_eq!(want_bits, 543, "70 bytes minus a 17-bit prefix");
+    assert_eq!(
+        bitstring(result),
+        (want, want_bits),
+        "bitsrun:rest16 is the subject's bits 17..560, bit-exactly"
+    );
+
+    let eval = format!(
+        "io:format(\"~p\", [bit_size(bitsrun:rest16(<<{}>>))]), halt(0).",
+        byte_literal(&payload)
+    );
+    match erl_eval(&dir, &eval) {
+        Some(out) => assert_eq!(out.trim(), "543", "the oracle disagrees for `{eval}`"),
+        None => eprintln!("SKIP: no system `erl` on PATH -- rest16/1 oracle value skipped"),
+    }
+}
+
+/// `bitsrun:rest16bin/1` = `<<_:16, Rest/binary>>` over the same 70-byte subject: the
+/// 544-bit (68-byte) `Rest/binary` result is above the 64-byte on-heap limit, so it too
+/// must be an off-heap refc binary, and its bytes are exactly the subject's bytes
+/// `2..70`.
+#[test]
+fn rest16bin_over_a_refc_subject_returns_an_off_heap_binary_result() {
+    let Some(dir) = compile_oracle("rest16bin") else {
+        eprintln!("SKIP: no usable `erlc` on PATH -- bitsrun:rest16bin/1 cross-check skipped");
+        return;
+    };
+    let module = load_file(dir.join("bitsrun.beam"))
+        .unwrap_or_else(|e| panic!("load bitsrun.beam: {e:?}"));
+
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::new();
+    let (subject, payload) = refc_subject_70(&mut machine, &mut ctx);
+
+    let result = machine
+        .run_export(&module, oracle_export(&module, "rest16bin"), 1, &[subject], &mut ctx)
+        .expect("bitsrun:rest16bin/1");
+    // SAFETY: `result` is a live binary the run just produced.
+    assert!(
+        unsafe { beam_term::refc::is_refc_binary(result) },
+        "a 544-bit (68-byte) result is above the 64-byte on-heap limit"
+    );
+    let (want, want_bits) = tail_of(&payload, 16);
+    assert_eq!(want_bits, 544, "70 bytes minus a byte-aligned 16-bit prefix");
+    assert_eq!(
+        bitstring(result),
+        (want, want_bits),
+        "bitsrun:rest16bin is the subject's bits 16..560, bit-exactly"
+    );
+    assert_eq!(
+        binary_bytes(result).expect("a byte-aligned binary"),
+        &payload[2..],
+        "the byte-aligned view is the subject's bytes 2..70"
+    );
+
+    let eval = format!(
+        "io:format(\"~p\", [bit_size(bitsrun:rest16bin(<<{}>>))]), halt(0).",
+        byte_literal(&payload)
+    );
+    match erl_eval(&dir, &eval) {
+        Some(out) => assert_eq!(out.trim(), "544", "the oracle disagrees for `{eval}`"),
+        None => eprintln!("SKIP: no system `erl` on PATH -- rest16bin/1 oracle value skipped"),
+    }
+}
+
+/// The 560-bit big-endian representation of `seed` — the 70-byte field the module's own
+/// `<<Seed:560>>` must build.
+fn seed_560(seed: u64) -> Vec<u8> {
+    let mut out = vec![0u8; 70];
+    out[62..].copy_from_slice(&seed.to_be_bytes());
+    out
+}
+
+/// `bitsrun:built_tail/1` builds the 70-byte subject **itself** at runtime with a
+/// `bs_create_bin` `integer` segment **wider than 64 bits** (`<<Seed:560>>`), then reads
+/// a non-byte-aligned window out of it: the strictly stronger end-to-end shape (no
+/// harness-built subject, and the wide-segment construction is exercised too).
+///
+/// The expected value is the subject's bits `17..560`, where the subject is the 560-bit
+/// big-endian image of `Seed` ([`seed_560`]); the bit count is cross-checked against the
+/// live `erl`, which also builds the subject the same way.
+#[test]
+fn built_tail_builds_the_wide_subject_itself_and_returns_an_off_heap_result() {
+    let Some(dir) = compile_oracle("built_tail") else {
+        eprintln!("SKIP: no usable `erlc` on PATH -- bitsrun:built_tail/1 cross-check skipped");
+        return;
+    };
+    let module = load_file(dir.join("bitsrun.beam"))
+        .unwrap_or_else(|e| panic!("load bitsrun.beam: {e:?}"));
+
+    /// 57 bits, so it fits in a 60-bit immediate — how the oracle passes it too.
+    const SEED: u64 = 0x0102_0304_0506_0708;
+
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::new();
+    let seed = beam_term::make_small(SEED as i64);
+
+    let result = machine
+        .run_export(
+            &module,
+            oracle_export(&module, "built_tail"),
+            1,
+            &[seed],
+            &mut ctx,
+        )
+        .expect("bitsrun:built_tail/1");
+    // SAFETY: `result` is a live bitstring the run just produced.
+    assert!(
+        unsafe { beam_term::refc::is_refc_binary(result) },
+        "a 543-bit result is above the 64-byte on-heap limit"
+    );
+    let (want, want_bits) = tail_of(&seed_560(SEED), 17);
+    assert_eq!(want_bits, 543, "560 bits minus a 17-bit prefix");
+    assert_eq!(
+        bitstring(result),
+        (want, want_bits),
+        "bitsrun:built_tail is the module-built subject's bits 17..560, bit-exactly"
+    );
+
+    let eval = format!(
+        "Bin = <<{SEED}:560>>, <<_:1, _:16, Rest/bits>> = Bin, \
+         io:format(\"~p\", [bit_size(Rest)]), halt(0)."
+    );
+    match erl_eval(&dir, &eval) {
+        Some(out) => assert_eq!(out.trim(), "543", "the oracle disagrees for `{eval}`"),
+        None => eprintln!("SKIP: no system `erl` on PATH -- built_tail/1 oracle value skipped"),
     }
 }

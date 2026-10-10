@@ -298,12 +298,35 @@ pub(super) fn big_parts_safe(t: Eterm) -> Option<(bool, Vec<u64>)> {
     Some((negative, digits.to_vec()))
 }
 
-/// Build an on-heap bitstring of exactly `nbits` bits from the leading bits of
-/// `bytes` (MSB-first), zeroing the unused trailing bits of the final byte.
+/// Whether `t` is an **off-heap refc binary** ([`beam_term::refc`]) — the frozen
+/// representation this family's result builders choose above
+/// [`ERL_ONHEAP_BINARY_LIMIT`] bytes.
+///
+/// The safe read side of [`beam_term::refc::is_refc_binary`], mirroring
+/// [`big_parts_safe`]: the family's `#[cfg(test)]` modules live under the crate-wide
+/// `#![deny(unsafe_code)]` and so cannot call the `unsafe` predicate themselves, so the
+/// single dereference stays here in the node's marked module.
+#[cfg(test)]
+pub(super) fn is_refc_binary(t: Eterm) -> bool {
+    // SAFETY: `is_refc_binary` checks `is_boxed` before it dereferences the header and
+    // only reads the `ErlSubBits.orig` slot when the header says `ErlSubBits`, so a
+    // non-refc term (including a non-bitstring) is answered `false` without any
+    // dereference of a non-live word.
+    unsafe { beam_term::refc::is_refc_binary(t) }
+}
+
+/// Build an **on-heap-only** bitstring of exactly `nbits` bits from the leading bits
+/// of `bytes` (MSB-first), zeroing the unused trailing bits of the final byte.
+///
+/// This is the on-heap `ErlHeapBits` builder and nothing more: it is the branch
+/// [`make_binary`] takes at/below the frozen limit, and it refuses a larger result
+/// with [`crate::error::unsupported`]. Callers that need the size-dispatching entry
+/// (anything that can build a result of arbitrary size — the `bs_get_binary2`/
+/// `bs_get_tail`/`bs_match binary` result builders) must call [`make_binary`] instead.
 ///
 /// `bytes` must hold at least `ceil(nbits / 8)` bytes; a longer slice is fine (the
-/// surplus is ignored). More than [`ERL_ONHEAP_BINARY_LIMIT`] bytes needs the
-/// off-heap representation and yields [`crate::error::unsupported`].
+/// surplus is ignored). More than [`ERL_ONHEAP_BINARY_LIMIT`] bytes yields
+/// [`crate::error::unsupported`].
 pub(super) fn make_bits(
     machine: &mut Machine,
     ctx: &mut dyn ExecutionContext,

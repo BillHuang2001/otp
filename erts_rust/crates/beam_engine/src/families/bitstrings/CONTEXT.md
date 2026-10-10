@@ -29,6 +29,14 @@ is the term `raw::make_ctx` builds; its `orig` word is the subject it reads.
   `make_bits`/`make_binary`/`make_writable` (result materialisation). All term layout is
   forwarded to `beam_term::{bitstring, refc}`; only the frozen-header dereferences live
   here. Every `unsafe` block carries a `// SAFETY:` rationale.
+  `make_binary` is the **size-dispatching** result entry: at/below
+  `ERL_ONHEAP_BINARY_LIMIT` (64) bytes it builds an on-heap `ErlHeapBits`
+  (`make_bits`, its on-heap-only branch), above it the 8-word `[BinRef][ErlSubBits]`
+  refc pair over a payload from `Machine::alloc_refc_binary` — the same threshold C
+  picks from `ERL_ONHEAP_BITS_LIMIT`.
+  `is_refc_binary` is a `#[cfg(test)]` safe wrapper over
+  `beam_term::refc::is_refc_binary` for the node's test modules (which live under the
+  crate-wide `#![deny(unsafe_code)]`), mirroring `big_parts_safe`.
 - `matching/` → the match side:
   - `mod.rs` → `exec` for all `bs_start_match*`/`bs_get_*`/`bs_skip_*`/`bs_match`/
     `bs_match_string`/`bs_test_tail2` opcodes + the decoder unit tests.
@@ -72,14 +80,22 @@ is the term `raw::make_ctx` builds; its `orig` word is the subject it reads.
   `crate::terms::reserve` → `Machine::alloc_rooted`) and re-read the context operand after
   an allocating read (`reread_ctx`), per the frozen **reserve, then read, then write**
   ordering.
+- Every **match result** binary (`bs_get_tail`, `bs_get_binary2`, the `bs_match`
+  `binary`/`get_tail` commands) is built through `raw::make_binary`, so a result of any
+  size gets the frozen representation the limits prescribe — the C
+  `i_bs_get_tail`/`i_bs_get_binary_2`/`i_bs_get_fixed_binary` all build through
+  `erts_build_sub_bitstring` with no size limit.
 - Files ~1000 lines; split by responsibility.
 
 ## Test Strategy
 Per-module `#[cfg(test)]` unit tests over hand-built operands/direct decoder calls:
 `raw.rs` (the subject triple, the refc window, the frozen representation of
 `make_binary`/`make_writable`, the machine's enumerable refc handles), `matching/mod.rs`
-(the pure decoders' oracle-derived values + the instruction-level empty-binary match),
-`matching/rooted.rs` (the rooted match path), `create/tests.rs` (the segment encoders).
+(the pure decoders' oracle-derived values, the instruction-level empty-binary match, and
+`bs_get_tail`/`bs_get_binary2` over a 70-byte refc subject asserting the off-heap refc
+result bit-exactly), `matching/commands.rs` (the `bs_match` `binary` command over the same
+subject asserting the off-heap refc result), `matching/rooted.rs` (the rooted match path),
+`create/tests.rs` (the segment encoders).
 `run_tests.rs` is the node's **end-to-end** suite: it builds synthetic `Module`s by hand
 and drives them through `Machine::run_label`/`Machine::run_export`, pinning
 - a `bs_start_match3` + `bs_get_tail`/`bs_get_integer2` sequence over a **refc subject
@@ -89,9 +105,11 @@ and drives them through `Machine::run_label`/`Machine::run_export`, pinning
   (segment list `[integer,1,1,nil,7,8] [<ty>,2,1,nil,{x,0},all]`, `f/1` exported at
   `Label(1)`), over a heap-binary source and over a 65-byte refc source;
 plus a live oracle cross-check (`bitsrun:first3/1` = `7` over `<<16#E5>>`,
-`bitsrun:tail16/1` = `516` over the `1..=70` payload) that compiles an inline Erlang
-source with the system `erlc` at test time and compares against the real system `erl`,
-**skipping loudly** when `erlc`/`erl` are absent.
+`bitsrun:tail16/1` = `516`, `bitsrun:rest16/1` = a 543-bit result and
+`bitsrun:rest16bin/1` = a 544-bit `Rest/binary` result, both over the `1..=70` payload and
+both asserted to be off-heap refc binaries) that compiles an inline Erlang source with the
+system `erlc` at test time and compares against the real system `erl`, **skipping loudly**
+when `erlc`/`erl` are absent.
 End-to-end evidence also lives in the crate's integration suites (`../../TEST_NOTES.md`),
 notably `tests/gaps.rs` (the remaining typed errors), `tests/census.rs` (opcode
 coverage) and `tests/stdlib_sweep.rs` (the real installed `base64:encode/1`).
@@ -99,11 +117,6 @@ coverage) and `tests/stdlib_sweep.rs` (the real installed `base64:encode/1`).
 ## Remaining typed capability gaps
 Every gap is a typed error, never a wrong value. The node's own, in addition to the
 crate-level ones in `../CONTEXT.md`:
-- `raw::make_bits` refuses a result of more than `ERL_ONHEAP_BINARY_LIMIT` (64) bytes
-  (`unsupported("bitstring: result binary > 64 bytes")`), so a `bs_get_tail` /
-  `bs_get_binary2` result above that size — which C materialises as an off-heap
-  sub-binary sharing the subject's payload — is not built (use `raw::make_binary` where a
-  full result is needed).
 - A segment list with no type atom, an unknown segment type, a `string` offset/size
   outside `module.strings`, an integer segment with size `all`, a non-integer value in an
   integer/utf segment, and a truncated segment list are typed `unsupported`/`badarg`.

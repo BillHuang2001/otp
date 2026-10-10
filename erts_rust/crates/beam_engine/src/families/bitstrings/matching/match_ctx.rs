@@ -110,7 +110,7 @@ pub(crate) fn read_ctx(
 /// Re-read a match-context operand **after** an allocating read; the fresh
 /// (post-collection) context term is returned.
 ///
-/// A rooted allocation ([`raw::make_bits`]/[`raw::make_big`]/
+/// A rooted allocation ([`raw::make_binary`]/[`raw::make_big`]/
 /// [`crate::terms::make_float`]) may run a **moving** collector that relocates the
 /// context block, so an `Eterm` read *before* the allocation is a stale pointer
 /// afterwards. Any match opcode that (1) reads its context, (2) performs an
