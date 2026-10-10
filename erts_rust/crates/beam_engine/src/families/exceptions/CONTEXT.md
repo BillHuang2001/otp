@@ -30,7 +30,13 @@ The per-opcode semantics and the full M1 gap list are in `../../INSTRUCTION_SURF
 - `stacktrace.rs`: `symbolic_stacktrace` — cooks a non-`NIL` raw stacktrace from the
   machine's **live call frames** (M1 keeps no raw `StackTrace` object). One rooted
   reservation for the whole node graph (`terms::slack`/`terms::sink`); `NIL` cooks to
-  `NIL`, exactly as C does.
+  `NIL`, exactly as C does. Its non-`NIL` arm is **unreachable from compiler output
+  today**: every engine raise lands with `x(2) = NIL` (`Machine::throw`/`throw_error`/
+  `throw_with_trace` always pass `NIL`; the two forwarding sites `raise Trace Value` and
+  `raw_raise` forward a value that is itself `NIL` inductively), so only the synthetic
+  `tests/stacktrace.rs` fixtures reach it. It also resolves **every** frame against the
+  single `module` argument (not each frame's own module context, unlike the uncaught
+  path's `Machine::raise_stacktrace`) — dormant while the arm is unreachable.
 
 ## Constraints
 - Errors are `beam_common::{Result, BeamError}` only. An unsupported case is a typed
