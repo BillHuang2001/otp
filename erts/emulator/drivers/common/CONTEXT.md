@@ -86,7 +86,7 @@ Caller liveness: `driver_monitor_process`/`driver_demonitor_process` on async co
 
 ## Routing Table
 - (no child nodes) — this directory has no subdirectories.
-- `../unix/`, `../win32/`, `../vxworks/` → platform-specific drivers (in `../`; `unix/` + `vxworks/` are legacy/non-linked)
+- `../win32/` → win32-specific driver (`registry_drv.c`)
 - `../nifs/` → NIF counterparts incl. the newer `socket` API (`prim_socket_nif.c`), `prim_file`, `zlib`, `zstd`
 - `../beam/` → `erl_driver.h` (driver API), `io.c` (driver_tab registration), `packet_parser.c`
 - `../sys/` → pollset (`erl_check_io`), `sys_*` helpers, `erts_sys_ddll_*`
