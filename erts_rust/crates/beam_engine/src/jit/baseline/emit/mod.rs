@@ -27,9 +27,9 @@
 //! instruction the block does not lower natively, the spill/fill discipline
 //! ([`CACHE_REGISTERS`]), the tier's one arithmetic optimisation — the guarded
 //! small-int `erlang:'+'/2`/`'-'/2`/`'*'/2` fast path ([`try_inline_gc_bif`]) — and the
-//! guarded aggregate readers ([`aggregate`]: the cons-cell readers
-//! `get_list`/`get_hd`/`get_tl` and the tuple readers `get_tuple_element` /
-//! `select_tuple_arity`).
+//! guarded aggregate readers plus the tuple writer ([`aggregate`]: the cons-cell
+//! readers `get_list`/`get_hd`/`get_tl`, the tuple readers `get_tuple_element` /
+//! `select_tuple_arity`, and the destructive `set_tuple_element`).
 //! [`compile_module`] lowers every basic block of a module into the
 //! [`CompiledModule`] artifact. See `super` for the block ABI (in `runtime`) and the
 //! driver that runs the emitted code.
@@ -109,7 +109,7 @@ mod test;
 
 use aggregate::{
     try_inline_get_hd, try_inline_get_list, try_inline_get_tl, try_inline_get_tuple_element,
-    try_inline_select_tuple_arity,
+    try_inline_select_tuple_arity, try_inline_set_tuple_element,
 };
 use arith::try_inline_gc_bif;
 use compare::try_inline_comparison;
@@ -312,9 +312,9 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
 /// when the small-int fast path lowers it, the whole guarded sequence plus its
 /// helper fallback ([`FAST_PATH_BYTES`]); a `get_list`/`get_hd`/`get_tl` likewise
 /// costs its guarded sequence plus the helper fallback it may still branch to
-/// ([`LIST_PATH_BYTES`]), and a `get_tuple_element`/`select_tuple_arity` its own
-/// guarded sequence plus one spill-and-return stub per arity alternative
-/// ([`TUPLE_PATH_BYTES`]).
+/// ([`LIST_PATH_BYTES`]), and a `get_tuple_element`/`set_tuple_element`/
+/// `select_tuple_arity` its own guarded sequence plus one spill-and-return stub per
+/// arity alternative ([`TUPLE_PATH_BYTES`]).
 /// Under-estimating would turn a large module into a `SystemLimit` compile error,
 /// so the estimate is deliberately loose — [`FAST_PATH_BYTES`] is budgeted for
 /// *every* `gc_bif` and [`LIST_PATH_BYTES`] for every cons-cell read, whether or
@@ -341,6 +341,7 @@ fn code_capacity_estimate(module: &Module) -> usize {
                     list_reads += 1
                 }
                 Instr::GetTupleElement { .. } => tuple_paths += 1,
+                Instr::SetTupleElement { .. } => tuple_paths += 1,
                 Instr::SelectTupleArity { destinations, .. } => {
                     tuple_paths += 1 + destinations.len()
                 }
@@ -556,6 +557,32 @@ fn emit_block(
                     source,
                     *element,
                     dst,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? {
+                    emit_step_and_continue(buffer, done, allocation, func, pc)?;
+                }
+            }
+            // The guarded tuple writer: `set_tuple_element` overwrites one element word
+            // of a real tuple natively and destructively (see [`aggregate`]). Any shape
+            // that is not an in-bound x-register tuple plus an immediate-or-register
+            // value is the `_` arm, and so is a **rejected target**: the guard branches to
+            // the helper, whose interpreter step raises the exact `{badmatch, Source}` — a
+            // non-tuple or an out-of-range `offset` — or reports the typed `unsupported`
+            // for a term in a shared literal area.
+            Instr::SetTupleElement {
+                element,
+                tuple,
+                offset,
+            } => {
+                if !try_inline_set_tuple_element(
+                    buffer,
+                    element,
+                    tuple,
+                    *offset,
                     allocation,
                     done,
                     func,

@@ -35,6 +35,7 @@ use crate::machine::MAX_REGISTER;
 
 use super::aggregate::{
     get_hd_shape, get_list_shape, get_tl_shape, get_tuple_element_shape, select_tuple_arity_plan,
+    set_tuple_element_shape,
 };
 use super::arith::fast_arith;
 use super::compare::comparison_shape;
@@ -50,7 +51,8 @@ use super::{Allocation, CACHE_REGISTERS};
 /// [`super::r#move::try_inline_move`] lowers, a `swap` over two addressable x-registers, a `test`
 /// whose shape [`super::test::test_plan`] lowers, a `gc_bif` [`fast_arith`] lowers,
 /// a `get_list`/`get_hd`/`get_tl` its `*_shape` lowers, a `get_tuple_element` its
-/// [`get_tuple_element_shape`], and a `select_tuple_arity` its
+/// [`get_tuple_element_shape`], a `set_tuple_element` its
+/// [`set_tuple_element_shape`], and a `select_tuple_arity` its
 /// [`select_tuple_arity_plan`])
 /// contributes one *native touch* per x-register operand, and the registers with the
 /// highest touch counts are held resident — a usage-weighted approximation of
@@ -211,6 +213,19 @@ fn cacheable_touches(
             dst,
         } => {
             if let Some(shape) = get_tuple_element_shape(source, *element, dst) {
+                touches.extend(shape.registers());
+            }
+        }
+        // A tuple write is charged its target tuple and, for a register element, the
+        // element register, and only when its shape is claimed (a `Y`/literal/out-of-bound
+        // operand, or an element needing heap materialisation, keeps the whole instruction
+        // on the helper, which contributes no native touch).
+        Instr::SetTupleElement {
+            element,
+            tuple,
+            offset,
+        } => {
+            if let Some(shape) = set_tuple_element_shape(element, tuple, *offset) {
                 touches.extend(shape.registers());
             }
         }
