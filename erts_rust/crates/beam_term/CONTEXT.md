@@ -81,8 +81,9 @@ assume a different layout.**
 - `is_list`/`is_not_list`; `is_not_nil_list` (= `is_list`: NIL is an immediate, not a LIST word).
 - `car(Eterm) -> Eterm`; `cdr(Eterm) -> Eterm` (raw 2-word cell access); `CAR_OFFSET=0`, `CDR_OFFSET=1`.
 
-### `boxed.rs` — boxed pointers, header words, boxed sub-types
-- `make_boxed(*mut Eterm) -> Eterm`; `boxed_val(Eterm) -> *mut Eterm`; `is_boxed`/`is_not_boxed`.
+### `boxed.rs` — boxed pointers, header words, boxed sub-types, the internal reference
+- `make_boxed(*mut Eterm) -> Eterm`; `boxed_val(Eterm) -> *mut Eterm`; `is_boxed`/`is_not_boxed`;
+  `is_boxed_term` (boxed *and* a term word).
 - Headers: `make_header(size, subtag)`, `header_subtag(Eterm) -> u32`, `header_arity(Eterm) -> usize`,
   `thing_arityval(Eterm) -> usize`.
 - Arityval (tuple header): `make_arityval(usize) -> Eterm`, `make_arityval_zero()`,
@@ -91,9 +92,23 @@ assume a different layout.**
 - Sub-type predicates: `is_map`/`is_map_header`/`is_flatmap`/`is_hashmap`, `is_float`, `is_big`,
   `is_internal_ref`, `is_any_fun`, `is_record`, `is_bitstring`/`is_binary`,
   `is_external_pid`/`is_external_port`/`is_external_ref`.
-- `unsafe fn internal_ref_numbers<'a>(t: Eterm) -> &'a [u32]` — the internal reference's `num[]`
-  (`erl_term.h` `internal_ref_numbers`); consumed by `make_hash`/`make_hash2`. Caller invariant: `t`
-  is a live internal ref.
+- **The M1 internal-reference thing — the canonical layout** (this crate's single documented truth for
+  an on-heap reference; the shape this runtime actually builds): the frozen 4-word
+  `[make_header(3, REF_SUBTAG), node, serial, id]` block, declared by
+  `INTERNAL_REF_PAYLOAD_WORDS = 3` / `INTERNAL_REF_WORDS = 4`, written by
+  `unsafe fn write_internal_ref(hp: *mut Eterm, id: u64) -> TermResult<Eterm>` (heap-agnostic like every
+  other writer: the caller reserves the words, the writer returns `make_boxed(hp)`;
+  `TermError::SmallIntOutOfRange` when `id` does not fit a 60-bit small) and read back by
+  `unsafe fn internal_ref_id(t: Eterm) -> TermResult<u64>` (`TermError::BadRef` for anything that is not
+  an M1 reference — a non-term, another boxed kind, a *C-layout* arity-2 block, which it refuses instead
+  of over-reading, or a non-small id word). These two are the only sanctioned producer/consumer pair for
+  an internal reference.
+- `unsafe fn internal_ref_numbers<'a>(t: Eterm) -> &'a [u32]` — **the C-layout reader**
+  (`erl_term.h` `internal_ref_numbers`): the `ErtsORefThing` `num[]` ids (3 `u32`s + the marker word)
+  of a **3-word** `[make_header(2, REF_SUBTAG), w1, w2]` block. Kept as the C-layout description only —
+  nothing in this crate or its dependents calls it, and it must **never** be fed an M1 reference (an M1
+  header passes `is_internal_ref` too, but its payload is three *terms*, so the read would silently
+  return small-int tags instead of ids); use `internal_ref_id` for an M1 reference.
 - Map header field accessors: `MAP_HEADER_TYPE/ARITY/VAL(Hdr)` (per `erl_term.h`).
 
 ### `tuple.rs` — tuples
