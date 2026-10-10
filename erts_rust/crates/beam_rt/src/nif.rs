@@ -55,31 +55,78 @@
 //!
 //! # The host's runtime services
 //!
-//! [`NifHostImpl`] serves a NIF call the runtime state it can reach: the atom services
-//! (`intern_atom`/`atom_name`/`existing_atom`), the **ETF codec**
-//! (`term_to_binary`/`binary_to_term`, over the same `beam_codec` encoder/decoder and the same
-//! deferred-interner discipline the `erlang:term_to_binary/1` BIF uses), a **unique-integer
-//! source** (`unique_integer`, mirroring the C emulator's four counter sequences), the
-//! emulator **system-information** block (`system_info`, whose `scheduler_threads` is the
-//! runtime's real normal-scheduler count) and the **reference/registry** hooks
-//! (`make_ref`/`whereis_pid`, over the borrowed [`NifHostServices`] below). It also implements the
-//! whole extra-environment family — `alloc_env`/`free_env` (a live message environment whose atoms
-//! are the runtime's own, see [`NifHost::alloc_env`]) and `make_copy` (the message-env idiom's
-//! term movement, see [`NifHost::make_copy`]).
+//! [`NifHostImpl`] serves a NIF call every runtime facility it can reach: the atom services
+//! (`intern_atom`/`atom_name`/`existing_atom`), the ETF codec (`term_to_binary`/`binary_to_term`,
+//! over the same `beam_codec` encoder/decoder and the same deferred-interner discipline the
+//! `erlang:term_to_binary/1` BIF uses), a unique-integer source (`unique_integer`, the C emulator's
+//! four counter sequences), the emulator information block (`system_info`) and the
+//! extra-environment family (`alloc_env`/`free_env`/`make_copy`).
 //!
-//! # Borrowed runtime services
-//!
-//! Two hooks need runtime state the host does not own: a fresh reference (`enif_make_ref`) and a
-//! name lookup (`enif_whereis_pid`). The host reaches both through an optional [`NifHostServices`]
-//! provider threaded in at construction. The **per-call** host (built by
+//! Four hooks need state the host does not own — a fresh reference (`enif_make_ref`), a name lookup
+//! (`enif_whereis_pid`) and the two liveness answers (`enif_is_process_alive`,
+//! `enif_is_current_process_alive`) — and reach it through the optional [`NifHostServices`] provider
+//! threaded in at construction. The **per-call** host (built by
 //! [`RuntimeContext::try_call_nif`](crate::context::RuntimeContext)) carries a
 //! [`RuntimeNifServices`] over the runtime's reference-id allocator, its reference registry and its
-//! process table, so both hooks are live there. The **load/unload** host (built by
+//! process table, so all four are live there. The **load/unload** host (built by
 //! [`NifBridge::load_nif`](crate::context::bridges::NifBridge)) is *moved into* the runtime's NIF
-//! registry, so it cannot borrow the runtime and is built with `services = None`: both hooks then
+//! registry, so it cannot borrow the runtime and is built with `services = None`: those hooks then
 //! stay the trait default (the typed `None`), so a `load`/`unload` callback can never fabricate a
-//! reference or a pid. `erlang:load_nif/2` on an already-loaded module is a `reload` (the oracle's
-//! rule since OTP 20).
+//! reference, a pid or a liveness answer. `erlang:load_nif/2` on an already-loaded module is a
+//! `reload` (the oracle's rule since OTP 20).
+//!
+//! # Hooks still at the trait default — and exactly why
+//!
+//! The rest of [`NifHost`] is **not** unimplemented by oversight: each hook needs runtime state this
+//! host cannot reach, so it keeps [`beam_abi`]'s typed default rather than inventing an answer. Every
+//! seam that would close one lives outside this file (crate `CONTEXT.md` handoffs); the `enif_*`
+//! C-variadic functions (`make_tuple`/`make_list`/`set_option`/the `*printf` family,
+//! rust-lang/rust#44930) cannot exist in stable Rust at all.
+//!
+//! * **`priv_data`** (`erl_nif.c:609-612`) — the pointer the library's `load` callback wrote through
+//!   its `void**`. `beam_abi`'s loader produces it *after* the per-call host is built and keeps it in
+//!   [`NifLibrary`](beam_abi::nif::loader::NifLibrary) (where
+//!   [`priv_data`](beam_abi::nif::loader::NifLibrary::priv_data) reads it); the host is never told.
+//!   Default: null — the C's own value for a library that set none. To close: a field plus the call
+//!   site handing the pointer in.
+//! * **`consume_timeslice`** (`:3362-3381`) — charges `((CONTEXT_REDS+99)/100) * percent` reductions
+//!   to the calling process and reports whether its timeslice is exhausted. The provider holds the
+//!   process table **immutably** (`Process::bump_reductions` takes `&mut`), and the hook's `bool`
+//!   cannot express "unsupported": the honest answer is the default `false` ("do not yield").
+//! * **`is_port_alive`** / **`port_command`** (`:2340-2357`, `:1097-1133`) — the port table is this
+//!   crate's [`PortRegistry`](crate::port::PortRegistry) and `Runtime::ports` is an `Rc<RefCell<..>>`,
+//!   so a *cheap clone* reaches its `contains`/`write_command` (the
+//!   [`crate::context::ProcessBridge`] pattern). To close: **one field** on [`RuntimeNifServices`]
+//!   plus one line at its construction site in `crate::context`. The C sends a **term**
+//!   (`erts_port_output_async`), so faithfulness needs the term-carrying driver path too. Defaults:
+//!   `None` ⇒ `0` and `0`.
+//! * **`whereis_port`** (`:1182`) — resolves a name to a **port**. This runtime's name registry holds
+//!   pids only and `erlang:register/2` refuses a port (`ProcessId::from_eterm`), so no atom can ever
+//!   name a port here: `None` (⇒ `0`) is the *provable* answer, not a missing feature.
+//! * **`send`** (`:860-1093`) — copies `msg` onto the receiver's heap and queues it
+//!   (`erts_alloc_message_heap` + `copy_struct`); here that is `ProcessTable::deliver` plus the
+//!   `beam_message` copier, which need a **mutable** table *and* a copy context the provider lacks.
+//!   Default `None` ⇒ `enif_send` answers `0`: a NIF that ignores the return value loses the message
+//!   — the most damaging remaining gap, and still better than fabricating `1`.
+//! * **`monitor_process`** / **`demonitor_process`** (`:3954-4011`, `:4019-4052`) — records the
+//!   monitor under the *resource* doing the watching and returns the internal reference it was
+//!   registered under. This runtime's monitors are keyed by a **process** watcher
+//!   (`ProcessTable::monitor(watcher, target, kind)`) and a NIF resource has no process identity;
+//!   registering would need `&mut ProcessTable` besides. Defaults: `1` (dead/undefined target), `1`
+//!   (not identified).
+//! * **`select`** (`erl_check_io.c`) — registers poll interest and delivers a notification carrying
+//!   the resource handle to a pid. The poller is `PortRegistry`'s **private** `Poller`, registered
+//!   per *port descriptor* with a port-task callback, and the notification needs the `send` path
+//!   above: a new subsystem, not a wiring gap. Default `-1` (negative, so the C's documented
+//!   `retval < 0` idiom still holds).
+//! * **`schedule_nif`** (`:3560-3604`) — re-enters the NIF through the emulator's scheduling
+//!   trampoline or moves it to a dirty scheduler. This runtime has neither
+//!   (`dirty_scheduler_support = 0`) and its call stack is the engine's. Default `badarg` — the C's
+//!   own answer for a bad flag.
+//! * **`dynamic_resource_call`** (`:3297-3323`) — resolves a resource term minted by **another** NIF
+//!   module and calls that type's `dyncall`; `beam_abi`'s registry (a thread-local) resolves only the
+//!   terms *it* minted, so this needs a per-library `{module, name}`-keyed resource-type registry.
+//!   Default ⇒ the C's failure code `1`.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -90,7 +137,7 @@ use beam_abi::nif::types::ErlNifEnv;
 use beam_abi::{ErlDrvSysInfo, NifEnv, NifHost};
 use beam_alloc::Heap;
 use beam_bifs::AtomInterner;
-use beam_process::{MonitorRef, ProcessTable, RefAllocator};
+use beam_process::{MonitorRef, ProcessId, ProcessTable, RefAllocator};
 use beam_term::prelude::{atom_val, is_atom, is_header, make_atom, make_small, Eterm};
 use beam_term::AtomTable;
 use libc::c_char;
@@ -192,12 +239,13 @@ impl NifRegistry {
 
 /// The runtime services a NIF host calls back into.
 ///
-/// The two `enif_*` hooks [`NifHost::make_ref`] and [`NifHost::whereis_pid`] need state the host
-/// does not own — a fresh reference and a name lookup — so the host borrows it through this trait
-/// instead of duplicating the runtime's minting/registry logic. The concrete provider is
-/// [`RuntimeNifServices`], built by
+/// The three `enif_*` hooks [`NifHost::make_ref`], [`NifHost::whereis_pid`],
+/// [`NifHost::is_process_alive`] and [`NifHost::is_current_process_alive`] need state the host does
+/// not own — a fresh reference, a name lookup and a process-table liveness test — so the host
+/// borrows it through this trait instead of duplicating the runtime's minting/registry logic. The
+/// concrete provider is [`RuntimeNifServices`], built by
 /// [`RuntimeContext::try_call_nif`](crate::context::RuntimeContext); the load/unload host carries
-/// no provider, so both hooks stay the typed `None` there.
+/// no provider, so every hook stays its typed default there.
 pub(crate) trait NifHostServices {
     /// Mint a fresh internal reference on `heap` and register it in the runtime's reference
     /// registry (a **plain** reference, so `demonitor/1` recognises it), returning its term.
@@ -208,6 +256,20 @@ pub(crate) trait NifHostServices {
     /// Resolve the registered name `name` (an atom) to an internal pid term; `None` for a
     /// non-atom argument or an unregistered name.
     fn whereis_pid(&mut self, name: Eterm) -> Option<Eterm>;
+
+    /// Whether `pid` names a **live** process — the one relation behind both
+    /// [`NifHost::is_process_alive`] and, applied to the host's own pid,
+    /// [`NifHost::is_current_process_alive`].
+    ///
+    /// The default `None` is "this provider cannot answer" (there is no process table), which the
+    /// ABI turns into its documented fallback rather than a guess. A provider that *holds* the
+    /// table always answers: a term that is not an internal pid names no live process, so it is
+    /// `Some(false)` — never a fabricated `true` and never a third "unknown" state the C has no
+    /// code for.
+    fn is_process_alive(&mut self, pid: Eterm) -> Option<bool> {
+        let _ = pid;
+        None
+    }
 }
 
 /// The concrete [`NifHostServices`] over a runtime's own reference id space, reference registry
@@ -244,6 +306,14 @@ impl NifHostServices for RuntimeNifServices<'_> {
             return None;
         }
         Some(self.processes.whereis(atom_val(name))?.to_eterm())
+    }
+
+    /// The process table's own liveness test — the same relation `erlang:is_process_alive/1`
+    /// answers (`beam_bifs`'s `is_process_alive_1`, `proc_reg.rs`, reaching the identical
+    /// [`ProcessTable::is_process_alive`]). The provider holds the table, so it can always answer:
+    /// a non-internal-pid term is `Some(false)`.
+    fn is_process_alive(&mut self, pid: Eterm) -> Option<bool> {
+        Some(ProcessId::from_eterm(pid).is_ok_and(|pid| self.processes.is_process_alive(pid)))
     }
 }
 
@@ -451,6 +521,34 @@ impl NifHost for NifHostImpl<'_> {
         self.services.as_mut()?.whereis_pid(name)
     }
 
+    /// `enif_is_process_alive(env, pid)` — whether `pid` names a live process.
+    ///
+    /// Delegates to the borrowed [`NifHostServices`], whose provider holds the runtime's process
+    /// table and answers the C's own relation: `!!erts_proc_lookup(proc->pid)` (`erl_nif.c:2330`),
+    /// the same test `erlang:is_process_alive/1` performs. `beam_abi` answers the *calling* process
+    /// before consulting this hook (it can always name it through [`NifHost::self_pid`]), so what
+    /// arrives here is any other pid. A non-pid term names no live process, so the provider's
+    /// `Some(false)` — not the "cannot answer" `None`; with no provider (the load/unload host) the
+    /// trait default `None` is returned, and `enif_is_process_alive` then answers `0` — never a
+    /// fabricated liveness.
+    fn is_process_alive(&mut self, pid: Eterm) -> Option<bool> {
+        self.services.as_mut()?.is_process_alive(pid)
+    }
+
+    /// `enif_is_current_process_alive(env)` — whether **this host's** process is still alive.
+    ///
+    /// The C asks the calling process's own PCB, `!ERTS_PROC_IS_EXITING(c_p)` (`erl_nif.c:2319`),
+    /// which it can reach only on a scheduler thread holding a process and otherwise *aborts the
+    /// emulator* (`:2311-2318`). This runtime runs every NIF on the scheduler thread that owns the
+    /// calling process, whose identity is exactly [`NifHost::self_pid`], so the answer is that
+    /// pid's liveness — the same process-table relation [`NifHost::is_process_alive`] uses. With no
+    /// provider this is the trait default `None`, and `beam_abi` then answers `1` for any host that
+    /// can name its process (which this one always can).
+    fn is_current_process_alive(&mut self) -> Option<bool> {
+        let self_pid = self.self_pid;
+        self.services.as_mut()?.is_process_alive(self_pid)
+    }
+
     /// `enif_make_unique_integer` — draw from the runtime's four NIF-facing unique sequences.
     ///
     /// One monotonic counter per property combination, so a value under `[positive, monotonic]` is
@@ -620,6 +718,29 @@ mod tests {
             None,
         );
         (host, atoms, interner)
+    }
+
+    /// A host over a fresh table whose own pid ([`NifHost::self_pid`]) is `self_pid`, reaching
+    /// `services` — the per-call host's shape without a runtime behind it.
+    fn host_as<'s>(self_pid: Eterm, services: &'s mut MockServices) -> NifHostImpl<'s> {
+        NifHostImpl::new(
+            Heap::new(256).expect("a test heap"),
+            Rc::new(AtomTable::new()),
+            PendingInterner::new(0),
+            self_pid,
+            1,
+            Some(services),
+        )
+    }
+
+    /// The [`RuntimeNifServices`] provider over a real runtime — the three disjoint field borrows
+    /// [`RuntimeContext::try_call_nif`](crate::context::RuntimeContext) builds.
+    fn services_of(runtime: &mut crate::Runtime) -> RuntimeNifServices<'_> {
+        RuntimeNifServices {
+            refs: &mut runtime.refs,
+            references: &mut runtime.references,
+            processes: &runtime.processes,
+        }
     }
 
     /// [`NifHost::make_copy`] is the **identity**: `alloc_env` builds the message env over this
@@ -954,11 +1075,12 @@ mod tests {
         assert_eq!(info.nif_minor_version, beam_abi::ERL_NIF_MINOR_VERSION);
     }
 
-    /// The [`NifHostServices`] provider a host delegates `make_ref`/`whereis_pid` to, recording
-    /// that `make_ref` was handed the host's own heap.
+    /// The [`NifHostServices`] provider a host delegates `make_ref`/`whereis_pid`/`is_process_alive`
+    /// to, recording that `make_ref` was handed the host's own heap.
     struct MockServices {
         reference: Eterm,
         name: Eterm,
+        /// The pid `whereis_pid` resolves `name` to, and the one pid that is "live".
         pid: Eterm,
         saw_heap: bool,
     }
@@ -972,16 +1094,19 @@ mod tests {
         fn whereis_pid(&mut self, name: Eterm) -> Option<Eterm> {
             (name == self.name).then_some(self.pid)
         }
+
+        fn is_process_alive(&mut self, pid: Eterm) -> Option<bool> {
+            Some(pid == self.pid)
+        }
     }
 
-    /// `make_ref`/`whereis_pid` delegate to the borrowed provider (the reference on the host's own
-    /// heap), and stay the typed `None` when the host carries no provider (the load/unload host) —
-    /// never a fabricated value.
+    /// `make_ref`/`whereis_pid`/`is_process_alive` delegate to the borrowed provider (the reference
+    /// on the host's own heap), and stay the typed `None` when the host carries no provider (the
+    /// load/unload host) — never a fabricated value.
     #[test]
     fn the_reference_and_registry_hooks_delegate_to_the_provider() {
         use beam_term::Atom;
 
-        let atoms = Rc::new(AtomTable::new());
         let registered = make_atom(Atom::from_raw(3));
         let mut services = MockServices {
             reference: make_small(11),
@@ -989,14 +1114,7 @@ mod tests {
             pid: make_small(22),
             saw_heap: false,
         };
-        let mut host = NifHostImpl::new(
-            Heap::new(256).expect("a test heap"),
-            atoms,
-            PendingInterner::new(0),
-            make_small(7),
-            1,
-            Some(&mut services),
-        );
+        let mut host = host_as(make_small(7), &mut services);
         assert_eq!(
             host.make_ref(),
             Some(make_small(11)),
@@ -1019,6 +1137,128 @@ mod tests {
         let (mut bare, _atoms, _interner) = host_with(&[]);
         assert_eq!(bare.make_ref(), None);
         assert_eq!(bare.whereis_pid(registered), None);
+    }
+
+    /// The two liveness hooks delegate to the provider, and `is_current_process_alive` asks about
+    /// the host's **own** pid (`NifHost::self_pid`) — the C's `erl_nif.c:2319` relation.
+    #[test]
+    fn the_liveness_hooks_delegate_with_the_hosts_own_pid() {
+        let live = make_small(7);
+        let other = make_small(99);
+        let mut services = MockServices {
+            reference: make_small(11),
+            name: make_small(0),
+            pid: live,
+            saw_heap: false,
+        };
+
+        // The host whose own pid is the live one: both hooks answer `true`.
+        let mut host = host_as(live, &mut services);
+        assert_eq!(host.is_process_alive(live), Some(true), "a live pid");
+        assert_eq!(
+            host.is_process_alive(other),
+            Some(false),
+            "another pid is the provider's `false`"
+        );
+        assert_eq!(
+            host.is_current_process_alive(),
+            Some(true),
+            "the host's own pid is live"
+        );
+        drop(host);
+
+        // The very same provider, but a host whose own pid is *not* the live one: the current-
+        // process answer flips, which is what pins that the host's `self_pid` is what is asked
+        // about — not a fixed answer.
+        let mut host = host_as(other, &mut services);
+        assert_eq!(host.is_current_process_alive(), Some(false));
+        drop(host);
+
+        // No provider (the load/unload host): the typed default — `beam_abi` then answers the
+        // `self_pid`-based fallback for the current process, and `0` for another pid.
+        let (mut bare, _atoms, _interner) = host_with(&[]);
+        assert_eq!(bare.is_process_alive(live), None);
+        assert_eq!(bare.is_current_process_alive(), None);
+    }
+
+    /// The provider answers the runtime's **real** process table: the root process is live, an
+    /// unallocated pid is not, and a term that is not a pid names no live process.
+    #[test]
+    fn runtime_services_answer_process_liveness_from_the_real_table() {
+        let mut runtime = crate::Runtime::with_defaults().expect("the default runtime");
+        let root = runtime.self_pid();
+        let mut services = services_of(&mut runtime);
+
+        assert_eq!(
+            services.is_process_alive(root.to_eterm()),
+            Some(true),
+            "the root process is in the table"
+        );
+        assert_eq!(
+            services.is_process_alive(ProcessId::new(999_999, 0).to_eterm()),
+            Some(false),
+            "a pid the table never allocated names no live process"
+        );
+        for not_a_pid in [make_small(1), NIL, make_atom(Atom::from_raw(0))] {
+            assert_eq!(
+                services.is_process_alive(not_a_pid),
+                Some(false),
+                "a non-pid names no live process ({not_a_pid:?})"
+            );
+        }
+    }
+
+    /// The oracle's `erlang:is_process_alive/1` answers the **same relation** the provider answers
+    /// (`!!erts_proc_lookup`, `erl_nif.c:2330`; `is_process_alive_1`, `erl_bif_info.c:4069`): a live
+    /// process is `true`, a terminated one `false`. Skips **loudly** without the toolchain.
+    #[test]
+    fn the_liveness_relation_agrees_with_the_oracle() {
+        use std::process::Command;
+
+        // `self()` is live, a spawned-and-terminated process is not. `halt().` so the probe
+        // terminates.
+        let output = match Command::new("erl")
+            .args([
+                "-noshell",
+                "-eval",
+                "Dead = spawn(fun() -> ok end), M = erlang:monitor(process, Dead), \
+                 receive {'DOWN', M, _, _, _} -> ok end, \
+                 Live = spawn(fun() -> receive stop -> ok end end), \
+                 io:format(\"~p ~p ~p~n\", \
+                           [is_process_alive(self()), is_process_alive(Dead), \
+                            is_process_alive(Live)]), \
+                 halt().",
+            ])
+            .output()
+        {
+            Ok(output) if output.status.success() => output,
+            Ok(output) => {
+                eprintln!("SKIP: `erl` exited with {}", output.status);
+                return;
+            }
+            Err(error) => {
+                eprintln!("SKIP: cannot run `erl`: {error}");
+                return;
+            }
+        };
+
+        let mut runtime = crate::Runtime::with_defaults().expect("the default runtime");
+        let root = runtime.self_pid();
+        let mut services = services_of(&mut runtime);
+        let ours = [
+            services.is_process_alive(root.to_eterm()),
+            services.is_process_alive(ProcessId::new(999_999, 0).to_eterm()),
+        ];
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "true false true",
+            "the oracle's (self, terminated, live) answers"
+        );
+        assert_eq!(
+            ours,
+            [Some(true), Some(false)],
+            "the provider answers the same relation the oracle does"
+        );
     }
 
     /// `system_info` reports the scheduler count the host was built with — the runtime's real
@@ -1059,11 +1299,7 @@ mod tests {
             .expect("registers an unregistered name");
 
         let mut heap = Heap::new(256).expect("a test heap");
-        let mut services = RuntimeNifServices {
-            refs: &mut runtime.refs,
-            references: &mut runtime.references,
-            processes: &runtime.processes,
-        };
+        let mut services = services_of(&mut runtime);
         let reference = services.make_ref(&mut heap).expect("mints a reference");
         assert_eq!(
             services.whereis_pid(name),
