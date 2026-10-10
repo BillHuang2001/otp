@@ -1017,19 +1017,36 @@ impl Process {
     /// The copy half of [`Process::deliver`]: copies `term` into the young heap through the
     /// shared copy engine and enqueues the resulting message.
     ///
-    /// Destructures `self` so the young heap, the mailbox and the off-heap table can be
-    /// borrowed disjointly (a `&mut self` method cannot hold three simultaneous borrows).
+    /// Destructures `self` so the young heap and the mailbox can be borrowed disjointly (a
+    /// `&mut self` method cannot hold both borrows).
+    ///
+    /// # The staging table is per-send, not the process's own
+    ///
+    /// `beam_message::send` **drains** the copy's destination off-heap table into the [`Message`]
+    /// it builds (`enqueue_copied`), because that destination *is* the message's off-heap
+    /// ownership. It must therefore be a **fresh, empty staging** table — never `self.off_heap`.
+    /// `Process.off_heap` is instead the process's **persistent** off-heap table: a queued
+    /// signal's reason is registered there by [`Process::copy_into_heap`] and stays for the
+    /// process's lifetime (its on-heap `PendingSignal.reason` references those slots), and
+    /// [`Process::heap_and_off_heap_mut`] lets a host register moved-fragment objects in it too.
+    /// Passing it here would *steal* those live handles into this message on every send, leaving
+    /// the queued signal referencing freed slots/payloads — a use-after-free. `beam_rt`'s
+    /// `send_fragmented_message` stages the same way (`let mut dst = OffHeapTable::new();`).
+    ///
+    /// A failed copy wrote nothing to the staging table (the copier preflights capacity before
+    /// writing a word), so the two-attempt retry in [`Process::deliver`] stays correct: each
+    /// attempt builds its own fresh table.
     fn copy_message(&mut self, from: Eterm, term: Eterm, src_off_heap: &OffHeapTable) -> Result<()> {
         let Process {
             collector,
             mailbox,
-            off_heap,
             ..
         } = self;
         let to_heap = collector.young_mut().heap_mut();
-        // `send` drains `ctx`'s destination table into the message's off-heap list, so the
-        // process's own table is the per-message off-heap table here.
-        let mut ctx = CopyContext::new(src_off_heap, off_heap);
+        // A fresh per-send staging table: `send` drains it into the message, so it must start
+        // empty and must NOT be the process's persistent `off_heap` (see above).
+        let mut dst = OffHeapTable::new();
+        let mut ctx = CopyContext::new(src_off_heap, &mut dst);
         beam_message::send(from, term, to_heap, mailbox, &mut ctx)
     }
 }
