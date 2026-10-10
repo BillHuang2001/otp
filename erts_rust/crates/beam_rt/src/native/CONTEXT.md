@@ -474,27 +474,40 @@ needs:
   `dirty_process_handle_signals/1`. Needs the code server's purge protocol (scanning every
   process's stack for references to a module's code) and the literal-area release handshake.
 - **Atomics / counters / persistent terms:** `atomics_new/2`, `counters_new/1`, `counters_add/3`,
-  `counters_get/2`, `counters_info/1`, `counters_put/3`, `erase_persistent_terms/0`. Needs the
-  off-heap refcounted resource model for `atomics`/`counters` and `persistent_term`'s global table.
-- **ETS internals:** `ets_info_binary/1`, `ets_lookup_binary_info/2`, `ets_raw_first/1`,
-  `ets_raw_next/2`, `ets_super_user/1`. Needs the raw ETS binary-block traversal (`misc` / `db`
-  internals) and ETS protection-level / super-user bookkeeping.
-- **Process & scheduler control/introspection:** `garbage_collect/1`,
-  `process_display/2`, `process_flag/3`, `suspend_process/2`, `is_process_alive/2`,
-  `await_result/1`, `flush_monitor_messages/3`, `'@flush_monitor_messages_refopt'/0`. Needs
-  GC-on-demand, suspend/resume signalling, and the `{Ref, Result}` await protocol. (`process_display/2`
-  additionally needs a process **stack dump**, which the engine exposes no accessor for;
+  `counters_get/2`, `counters_info/1`, `counters_put/3` and `erase_persistent_terms/0` are **already
+  served** — the `counters_*`/`atomics_*` entries by the `beam_bifs` registry
+  (`beam_bifs/src/runtime/atomics.rs`) and `erase_persistent_terms/0` by the `RuntimeHooks` bridge —
+  so the floor must NOT claim them (an arm would duplicate the registry). They are listed only so a
+  later reader does not re-add them.
+- **ETS internals:** `ets_lookup_binary_info/2`, `ets_raw_first/1`, `ets_raw_next/2` need the raw
+  `term_to_binary` **block** writer / `db_raw_first|next` key iterator, which `beam_ets`' public API
+  does not expose. `ets_super_user/1` needs an ETS-protection-bypass bit on
+  `beam_process::ProcessFlags` (answering `ok` without it would fabricate a grant).
+  `ets_info_binary/1` is **not a BIF** (absent from `erts/emulator/beam/bif.tab`) and is removed
+  from this list.
+- **Process & scheduler control/introspection:** `garbage_collect/1` needs GC-on-demand driven from
+  the heap-admission point (the root set is the *executing* machine's `x`+stack, so a BIF must not
+  collect directly) — the missing API is a `Runtime::request_gc(pid)` latch consumed by
+  `context/gc.rs::ensure_heap`; only the C's `minor`/`major` vs `badarg` argument check is servable
+  in the floor today. `process_display/2` needs a process **stack dump**, which the engine exposes
+  no accessor for. `suspend_process/2` needs suspend/resume signalling; `await_result/1`,
   `flush_monitor_messages/3` and `'@flush_monitor_messages_refopt'/0` are **pure Erlang** receive
-  loops, not BIFs at all — they are not floor candidates.)
-- **Map internals:** `map_hashmap_children/1`, `map_next/3`. Needs a HAMT **walker** and the
-  4-bits-per-level path encoder (`erts_debug:size/1`'s iterator) — `beam_term::map`'s public API is
-  `map_pairs`/`map_size`/`map_get` only, with no interior-children or path accessor, so these can be
-  served only after that LCA crate grows one.
+  loops, not BIFs at all. `process_flag/3` and `is_process_alive/2` are **now served by the floor**
+  (see the table above). `is_system_process/1` is **already served** by the `RuntimeHooks` bridge
+  (`src/context/runtime_hooks.rs::is_process_predicate`) — the floor must not shadow it; its one
+  divergence is that the oracle's `true` for `init` is unreachable because nothing calls
+  `beam_process::ProcessFlags::set_system`.
+- **Map internals:** `map_hashmap_children/1` and `map_next/3` are **already served** by the
+  `beam_bifs` registry (`beam_bifs/src/erts_internal.rs`) — the floor must not claim them.
+  (`beam_term::map`'s public API really is `map_pairs`/`map_pairs_storage_order`/`map_size`/
+  `map_get`/`map_put`/`map_remove`/`map_words_capacity`, with no interior/path accessor; the
+  registry's own implementation is the answer.)
 - **Allocation/IO introspection & misc:** `gather_alloc_histograms/1`, `gather_carrier_info/1`,
-  `gather_io_bytes/2`, `get_internal_state_blocked/1`, `crasher/6`. Needs the `erts_alloc`
-  carrier/histogram readers, the async-thread pool, and the crash-dump/internals-dump path.
-  (`erts_internal:beamfile_module_md5/1` is covered above; `module_info/0,1` is the ordinary
-  compiler-generated surface.)
+  `gather_io_bytes/2`, `crasher/6` need the `erts_alloc` carrier/histogram readers, the
+  async-thread pool, and the crash-dump/internals-dump path. `get_internal_state_blocked/1` is
+  **pure Erlang** (it calls the unshipped `erts_debug:get_internal_state/1`) — not a floor
+  candidate. (`erts_internal:beamfile_module_md5/1` is covered above; `module_info/0,1` is the
+  ordinary compiler-generated surface.)
 - **The port-BIF family** (`open_port/2`, `port_call/3`, `port_close/1`, `port_command/3`,
   `port_connect/2`, `port_control/3`, `port_info/1,2`) is **not** claimed *here*: the `erlang:*`
   counterparts are served by `../port.rs` + `beam_bifs`' `PortHook` seam. `erts_internal`'s own
