@@ -24,10 +24,12 @@ is part of the documented NIF/driver ABI.
 
 ## API Surface
 - `erl_fixed_size_int_types.h` — `usgnd_int_8/16/32/64`, `sgnd_int_8/16/32/64`, `usgnd_int_max`,
-  `sgnd_int_max` and the matching `*_FSTR` printf-length macros. Consumed by `erl_printf_format.h`,
-  the emulator and third-party driver code that needs fixed-width types independent of `int N_t`
-  availability. Guards against `SIZEOF_*` mismatch by saving/undef'ing/rechecking around the
-  `#include "erl_int_sizes_config.h"`.
+  `sgnd_int_max` and the matching `*_FSTR` printf-length macros: fixed-width types independent of
+  `int N_t` availability. Guards against `SIZEOF_*` mismatch by saving/undef'ing/rechecking around
+  `#include "erl_int_sizes_config.h"`. **No in-tree consumer** — the file is `#include`d nowhere
+  in-tree and no in-tree code references `usgnd_int_*`/`sgnd_int_*`; its only live reference is the
+  install rule (`../lib_src/Makefile.in:434`, `RELEASE_INCLUDES`). It ships for out-of-tree
+  embedder/driver code.
 - `erl_int_sizes_config.h.in` — autoconf template (`SIZEOF_CHAR/SHORT/INT/LONG/LONG_LONG/VOID_P`).
   Configure writes `erts/include/$(TARGET)/erl_int_sizes_config.h` (AC_CONFIG_HEADERS,
   `../configure.ac:122`). Consumers: `erl_fixed_size_int_types.h`, `../../emulator/beam/erl_drv_nif.h`,
@@ -102,6 +104,10 @@ is part of the documented NIF/driver ABI.
   `ETHR_HAVE_ETHREAD_DEFINES`, `ETHR_SMP_REQUIRE_NATIVE_IMPLS`) and
   `internal/$(TARGET)/ethread_header_config.h`. Grepping only this tree can miss an `ETHR_*`
   definition.
+- `erl_fixed_size_int_types.h` defines `SI_16_FSTR` instead of `SGND_INT_16_FSTR` in its
+  `SIZEOF_INT == 2` branch (`:130`); that branch therefore lacks the signed-16 printf-length macro
+  (the `#else` branch at `:135` has the correctly-named one). No OTP target has `SIZEOF_INT == 2`,
+  and neither name is referenced in-tree, so this is latent only.
 
 ## Notes for Agents
 - To find where a header goes: semi-public → here; ERTS-internal/unstable → `internal/`; NIF or
@@ -111,6 +117,13 @@ is part of the documented NIF/driver ABI.
 - Sizes/int-width questions trace back to `../configure.ac:122` (AC_CONFIG_HEADERS) and the
   `SIZEOF_*` AC_CHECK_SIZEOF probes, not to hand-written constants.
 - Do not `git add -f` anything under a `$(TARGET)` directory.
+- Every tracked header under this node is reachable from at least one supported build configuration:
+  the per-arch/impl dirs are pulled in by conditional `#include`s in `internal/ethread.h` (so a
+  header unused on the current host machine is still live). `erl_fixed_size_int_types.h` is the sole
+  header with no in-tree `#include` (installed-only). See `internal/CONTEXT.md` for the
+  impl-selection table.
+- The two `.h.in`/`.mk.in` pairs are configure inputs referenced from `../configure.ac`
+  (`:122`, `:3946-3947`), not dead templates.
 - `internal/*.mk.in` are **makefile** fragments, not C headers — they become `internal/$(TARGET)/*.mk`
   consumed by `../lib_src/Makefile.in` and `../../lib/common_test/test_server/ts_erl_config.erl`.
 

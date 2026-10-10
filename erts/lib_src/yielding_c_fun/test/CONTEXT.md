@@ -19,7 +19,7 @@ Nothing outside `yielding_c_fun/` consumes this directory; the standalone `../GN
   5. `-only_yielding_funs -static_aux_funs` produce an include file usable by the original `.c` unchanged.
   6. Two `-debug` negative tests: the compiled program must exit non-zero (pointer-to-stack detection), plus one negative test where YCF itself must exit non-zero (`ycf_cannot_transform_fun_call.c`).
   7. `-log_max_mem_usage <file>` creates the file.
-- `examples/` — 34 example `.c` inputs and 30 committed `.c.out` golden-stdout files; the corpus doubles as the documentation/learning material (`../README.md` points at it, `../doc/thread_tutorial.md` is built on `thread_example.c`). See its own CONTEXT.md for the file→feature map.
+- `examples/` — 33 example `.c` inputs and 30 committed `.c.out` golden-stdout files; the corpus doubles as the documentation/learning material (`../README.md` points at it, `../doc/thread_tutorial.md` is built on `thread_example.c`). See its own CONTEXT.md for the file→feature map.
 - `examples/sha256_erlang_nif/` — self-contained rebar3 demo of YCF used to build a *yielding* NIF; its invocation in `test.sh` is commented out, so it is never run automatically.
 
 ## Constraints
@@ -44,7 +44,6 @@ Nothing outside `yielding_c_fun/` consumes this directory; the standalone `../GN
 - The `test_add_san` / `test_mem_san` / `test_ub_san` / `test_sanitizers` targets in `../GNUmakefile` do **not** actually sanitize YCF: they add `-fsanitize=…` via `CFLAGS`, but `../main_target.mk`'s `YCF_CFLAGS` filters `-fsanitize%` out deliberately ("YCF is a short lived tool leaking memory deliberately"), and `test.sh`'s `CC_ARGS` adds no sanitizer flags either. Their visible effect is building with clang plus the targets' own `-O00`/`-O02`-style flags.
 - `examples/test_generated_header_file_main.c` hardcodes `#include "tmp_dir/tmp.h"` and is compiled with `-I<test dir>`; `examples/test_only_output_yielding_funs*.c` hardcode `#include "tmp.ycf.h"` with `-I tmp_dir`. Renaming `TMP_DIR`/`TMP_H_FILE`/`TMP_INC_FILE` in `test.sh` silently breaks those steps.
 - `debug_ptr_to_stack.c` is exercised twice with different expectations: in the golden loop *without* `-debug` (it is in `SIMPLE_TEST_FILES`) and again in the `-debug` negative test. It also defines the `ycf_debug_get_stack_start()`/`ycf_debug_global_stack_top_ptr` hooks that `-debug`-generated code needs.
-- `examples/test_trap.c` is referenced by nothing in `test.sh`/`GNUmakefile`, and the `.gitignore` entry `test/test_trap_out.c` is a leftover — nothing generates that file any more.
 - The commented-out sha256 NIF block (~lines 190–194) cannot be enabled as-is: its `examples/sha256_erlang_nif/c_src/Makefile` still passes the removed `-use_gc` flag, so YCF prints a usage error and exits **0** without producing output, leaving an empty generated file and failing the demo build (see that node's CONTEXT.md).
 - `../bin/yielding_c_fun` (wrapper) assumes the standalone layout and execs `$DIR/yielding_c_fun.bin`; it does not work in the `bin/$(TARGET)/` layout of an OTP build.
 - Two files named `yielding_c_fun`/`yielding_c_fun.bin` plus a `yielding_c_fun.exe` copy in the bootstrap tree (`Makefile.in`) are easy to confuse when debugging.
@@ -69,7 +68,7 @@ Nothing outside `yielding_c_fun/` consumes this directory; the standalone `../GN
 - Coverage gaps: no test of `-print_ast`/`-print_symbols`/`-h`; no direct assertion on the text of generated code; `-fexternal` and multi-file/`#include` inputs untested; `ycf_cannot_transform_fun_call.c` only checks the exit code; error-message paths untested; the sha256 NIF demo and every window where the tool is run from an OTP-built `bin/$(TARGET)` are uncovered.
 
 ## Routing Table
-- `examples/` → 34 example `.c` programs + 30 golden `.c.out` stdout files consumed by `test.sh` (own CONTEXT.md: file→feature map, how to add an example)
+- `examples/` → 33 example `.c` programs + 30 golden `.c.out` stdout files consumed by `test.sh` (own CONTEXT.md: file→feature map, how to add an example)
 - `examples/sha256_erlang_nif/` → standalone rebar3 yielding-NIF demo project (own CONTEXT.md; **not** executed by `test.sh`)
 
 ## See Also

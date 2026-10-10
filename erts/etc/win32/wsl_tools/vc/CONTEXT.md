@@ -43,7 +43,7 @@ Unix flag in → MSVC flag out. Each script is a translator whose contract is "a
 
 ## Notes for Agents
 - **Mirror changes**: `../../cygwin_tools/vc/` and `../../msys_tools/vc/` are near-duplicates of this directory (same scripts, path helper swapped). A fix applied only here silently leaves the other two Windows build environments broken; check `../../../common/Makefile.in`, `../../../../../otp_build` and `../../../../../HOWTO/INSTALL-WIN32.md` too.
-- Observed divergence to keep in mind: `../../cygwin_tools/vc/` additionally ships `cc_wrap.c`/`ld_wrap.c` (unreferenced by the build) and a whole extra `../../cygwin_tools/mingw/` build tree with its own `emu_cc.sh`; `wsl_tools/vc/` and `msys_tools/vc/` have neither. Only `wsl_tools/vc/cc.sh` has the fast-dependency path.
+- Observed divergence to keep in mind: `../../cygwin_tools/vc/` additionally ships a whole extra `../../cygwin_tools/mingw/` build tree with its own `emu_cc.sh`; `wsl_tools/vc/` and `msys_tools/vc/` have neither. Only `wsl_tools/vc/cc.sh` has the fast-dependency path.
 - Debug tracing: set `CC_SH_DEBUG_LOG`, `LD_SH_DEBUG_LOG`, `MC_SH_DEBUG_LOG`, `RC_SH_DEBUG_LOG`, `EMU_CC_SH_DEBUG_LOG` to a file path to append the expanded command lines (the first thing to do when a build fails inside a shim).
 - Which tree is selected is decided in `otp_build` (`env_win32`/`env_win64`/`echo_env_wsl`), not here.
 - Nothing in this directory is generated or auto-updated (unlike `../../../../autoconf/`); every file here is hand-maintained. `coffix.exe` is the only build product.

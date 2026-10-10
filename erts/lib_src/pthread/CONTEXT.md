@@ -67,6 +67,8 @@ Declared in `erts/include/internal/ethread.h`, `erts/include/internal/ethr_inter
 - Without configuring the tree you cannot compile or even fully preprocess these files; `config.h` and `ethread_header_config.h` are generated.
 - Feature detection for everything here lives in `make/autoconf/otp.m4` (the `ETHR_*` sections; `ETHR_X86_SSE2_ASM`, `ETHR_HAVE_LINUX_FUTEX`, `ETHR_HAVE_PTHREAD_COND_TIMEDWAIT_MONOTONIC`, `pthread_setname_np` variants, `ETHR_MODIFIED_DEFAULT_STACK_SIZE`) — edit the `.m4`/`configure.ac` and regenerate, never the generated `configure`.
 - Files in this dir are hand-written and small; there are no generated sources here.
+- A symbol-level audit of the three `.c` files (every `static` function/object, every `typedef`, every `#define`, every `#if 0` and every guard macro) finds **no dead code**: each static is referenced inside its own file, each locally defined macro is consumed by `../../include/internal/{ethread.h,pthread/ethr_event.h,i386/ethr_dw_atomic.h}`, there are no `#if 0` blocks and every guard macro is defined somewhere in the tree.
+- `ethr_compiler_barrier` (`../../include/internal/ethread.h:553`) is declared but defined nowhere in `lib_src`; this dir references it only indirectly, through the `ETHR_YIELD()` fallback branch at `ethr_event.c:131` and `:431`, which is compiled only when neither `ETHR_HAVE_SCHED_YIELD` nor `ETHR_HAVE_PTHREAD_YIELD` is configured.
 - `git log -p -- erts/lib_src/pthread/` is the change history (thread-name and huge-timeout work is recent).
 
 ## Dependencies

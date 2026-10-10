@@ -2,14 +2,14 @@
 # %CopyrightBegin%
 # SPDX-License-Identifier: Apache-2.0
 #
-# Mechanical dead-source checker for the legacy emulator C/C++ tree.
+# Mechanical dead-source checker for the legacy ERTS C/C++ tree.
 #
 # WHY THIS EXISTS
-#   erts/emulator/ is the legacy BEAM emulator, kept only as the FLAVOR=emu
-#   bootstrap fallback while erts_rust/ becomes the runtime.  Sources that no
-#   Makefile, no #include and no symbol reference reaches are dead weight and
-#   may be deleted.  A full emulator compile is far too expensive to use as the
-#   bar, so this script produces the mechanical reference proof instead.
+#   The legacy C/C++ ERTS tree is still the OTP build's default runtime and the
+#   differential oracle for the erts_rust/ rewrite, so it must only ever shrink
+#   by files that are PROVABLY unreferenced.  A full ERTS compile is far too
+#   expensive to use as the bar, so this script produces the mechanical
+#   reference proof instead.
 #
 # WHAT IT PROVES (decisive reference classes)
 #   A  BUILD REFERENCE  - the file's stem appears as a whole word (or the full
@@ -36,25 +36,53 @@
 #   does not make a file live - but it is reported so a human can see why a
 #   grep "found" the name.
 #
-# USAGE
-#   python3 check_dead_sources.py                 # report; exit 1 if deletable
-#   python3 check_dead_sources.py --write-report  # also write dead_source_report.txt
-#   python3 check_dead_sources.py --explain GLOB  # show evidence lines per file
+# TWO TIERS
+#   STRICT (decisive)   A fixpoint / transitive-closure liveness analysis over
+#                       the build wiring.  A file is LIVE if it is
+#                         (a) a compilation unit named by a real object-list
+#                             entry (both the "$(VAR:%=prefix/%.o)" and the
+#                             "$(VAR:.c=.o)" substitution forms - zlib's
+#                             ZLIB_FILES, ryu's RYU_FILES, lib_src's
+#                             ETHREAD_LIB_SRC - are resolved back to the
+#                             sources they name), or covered by a
+#                             $(wildcard ...) pattern, or
+#                         (b) reached from a live file through an #include of its
+#                             basename or through a symbol it defines.
+#                       Everything else is STRICT DEAD.  Only candidate files
+#                       (C-family sources) propagate liveness, so a reference
+#                       that comes solely from a CT *.erl suite, a CI yaml, a
+#                       doc or an already-dead file does NOT make a file live.
+#                       The deletion gate is "STRICT DEAD and not exempt" = 0.
+#   LOOSE (advisory)    The original single-pass A/B/C reference classes plus the
+#                       per-file exemptions.  Reported for context only; it is
+#                       NOT the deletion gate.
 #
-# Scope: every tracked erts/emulator/**/*.{c,h,cpp,hpp,cc}.
+# USAGE
+#   python3 check_dead_sources.py                       # default --root erts
+#   python3 check_dead_sources.py --root erts/emulator  # narrow the scope
+#   python3 check_dead_sources.py --root erts/lib_src
+#   python3 check_dead_sources.py --root .              # whole repository
+#   python3 check_dead_sources.py --write-report        # also write dead_source_report.txt
+#   python3 check_dead_sources.py --explain GLOB        # show evidence lines per file
+#
+#   Exit status is 1 when the ACTIONABLE STRICT-dead set (STRICT dead and not
+#   retained by an exemption rule) is non-empty, else 0.
+#
+# Scope: every tracked <root>/**/*.{c,h,cpp,hpp,cc}; the default root is `erts`.
 
 import argparse
 import fnmatch
 import re
 import subprocess
 import sys
-from collections import Counter
+from collections import Counter, deque
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]          # repo root
-EMU_REL = Path("erts/emulator")
+DEFAULT_SCAN = "erts"                               # default --root scope
 CANDIDATE_EXTS = {".c", ".h", ".cpp", ".hpp", ".cc"}
 CFAMILY_EXTS = {".c", ".h", ".cpp", ".hpp", ".cc", ".tab", ".def", ".inc"}
+COMPILE_EXTS = (".c", ".cpp", ".cc")                # units that get an object
 
 # Sources that can carry a *build* reference (class A).
 BUILD_NAMES = {"makefile", "otp_build", "configure", "configure.ac", "configure.src"}
@@ -69,7 +97,8 @@ SELF_EXCLUDE = {"erts/emulator/beam/check_dead_sources.py",
                 "erts/emulator/beam/dead_source_report.txt"}
 
 # Unreferenced but intentionally retained, with the reason (checked before a file
-# is ever reported as deletable).  Directory prefixes.
+# is ever reported as deletable, by BOTH the loose and the strict tier).
+# Directory prefixes.
 EXEMPT_PREFIXES = (
     # Vendored third-party copies: not OTP code, updated only by their updater.
     ("erts/emulator/asmjit/", "vendored 3PP (asmjit), see Makefile.in ASMJIT_CPP"),
@@ -82,6 +111,11 @@ EXEMPT_PREFIXES = (
     ("erts/emulator/test/", "test fixture under test/ (owned by the CT suites)"),
     ("erts/emulator/asan/", "sanitizer helper/suppression fixture"),
     ("erts/emulator/valgrind/", "valgrind suppression fixture"),
+    # ERTS-level test tooling (e.g. erts/test/utils/gccifier.c): a C helper used
+    # by the install/upgrade suites, not by the runtime build.
+    ("erts/test/", "erts-level test tooling/fixture (owned by the CT suites)"),
+    # Doc samples, deliberately not built/installed/tested by the OTP build.
+    ("erts/example/", "doc sample; not built/installed/tested by the OTP build"),
 )
 # Individual files that must stay even if mechanically unreferenced.
 EXEMPT_FILES = {
@@ -109,6 +143,17 @@ FUNC_LINE_RE = re.compile(r"^([A-Za-z_][\w \t\*]*?)\b([A-Za-z_]\w*)\s*\(", re.M)
 GVAR_LINE_RE = re.compile(r"^([A-Za-z_][\w \t\*]*?)\b([A-Za-z_]\w*)\s*(\[[^\]]*\])?\s*=", re.M)
 HEADER_EXTS = {".h", ".hpp", ".inc"}
 
+# "$(VAR:%=$(OBJDIR)/%.o)" / "$(VAR:.c=.o)" - the object list is synthesized
+# from VAR's contents, so VAR's assignment must be resolved to recover the
+# sources it names (zlib's ZLIB_FILES, ryu's RYU_FILES, lib_src's
+# ETHREAD_LIB_SRC / ERTS_INTERNAL_LIB_SRCS, ...).
+SUBST_O_RE = re.compile(r"\$\(([A-Za-z_]\w*)\s*:((?:[^()\n]|\$\([^)\n]*\))*?\.o)\)")
+MAKE_ASSIGN_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*[:+]?=\s*(.*)$")
+# One item of a make variable that names sources: a bare object stem ("adler32")
+# or a source file, possibly reached through a make variable
+# ("$(ETHR_THR_LIB_BASE_DIR)/ethr_event.c").
+SRC_TOKEN_RE = re.compile(r"^(?:[A-Za-z_][\w.\-]*|[^\s\\]*\.(?:c|cpp|cc))$")
+
 C_KEYWORDS = {
     "if", "else", "for", "while", "do", "switch", "case", "default", "return",
     "sizeof", "struct", "union", "enum", "typedef", "static", "const", "extern",
@@ -117,6 +162,39 @@ C_KEYWORDS = {
     "defined", "include", "define", "ifdef", "ifndef", "endif", "elif", "pragma",
     "error", "warning", "line", "TRUE", "FALSE", "NULL", "while0",
 }
+
+# The scan scope, set from --root in main().  None means "the whole repository".
+SCAN_REL = Path(DEFAULT_SCAN)
+
+
+def exempt_reason(rel):
+    """Why `rel` is retained although mechanically unreferenced (else None).
+
+    Used by BOTH the loose and the strict tier so they agree on what counts as
+    an intentional retention.
+    """
+    why = EXEMPT_FILES.get(rel)
+    if why is not None:
+        return why
+    for pref, reason in EXEMPT_PREFIXES:
+        if rel.startswith(pref):
+            return reason
+    # Generic CT-fixture rule: any *_SUITE_data/ fixture anywhere under test/.
+    if "/test/" in rel and "_SUITE_data/" in rel:
+        return "CT test fixture (owned by its *_SUITE)"
+    return None
+
+
+def scan_dir_relative(rel):
+    """Parent directory of `rel` relative to SCAN_REL (report grouping)."""
+    p = Path(rel)
+    if SCAN_REL is not None:
+        try:
+            p = p.relative_to(SCAN_REL)
+        except ValueError:
+            pass
+    parent = p.parent
+    return str(parent) if str(parent) != "." else "(top level)"
 
 
 def tracked_files():
@@ -160,6 +238,34 @@ def is_build_source(path):
                                   ".erl", ".hrl", ".yml", ".yaml"}
 
 
+def list_assignments(txt):
+    """Map VAR -> set(items) for plain "VAR = a b \\\n c" assignments whose
+    items all name a source (a bare object stem, or a .c/.cpp/.cc file).
+
+    Anything with a flag, a path-less expansion or a non-source token is
+    skipped, so "$(ZLIB_CFLAGS := -O2 ...)" and every flag list are ignored and
+    only the source registries (ZLIB_FILES, RYU_FILES, ETHREAD_LIB_SRC,
+    ERTS_INTERNAL_LIB_SRCS, ...) are captured.
+    """
+    assignments = {}
+    for line in txt.replace("\\\n", " ").splitlines():
+        m = MAKE_ASSIGN_RE.match(line)
+        if not m:
+            continue
+        var, rhs = m.group(1), m.group(2).strip()
+        if not rhs:
+            continue
+        tokens = rhs.split()
+        if tokens and all(SRC_TOKEN_RE.match(tok) for tok in tokens):
+            assignments.setdefault(var, set()).update(tokens)
+    return assignments
+
+
+def item_stem(item):
+    """Object stem named by a make-variable item ("common/x.c" / "d2s" -> stem)."""
+    return Path(item).name.rsplit(".", 1)[0]
+
+
 def glob_to_regex(pattern):
     """Translate a make $(wildcard) pattern to a regex matching any path suffix.
 
@@ -190,8 +296,12 @@ def glob_to_regex(pattern):
 
 
 def main():
+    global SCAN_REL
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--root", default=DEFAULT_SCAN,
+                    help="directory scope to scan, relative to the repo root "
+                         f"(default: {DEFAULT_SCAN}); '.' or '' means the whole repo")
     ap.add_argument("--write-report", action="store_true",
                     help="write dead_source_report.txt next to this script")
     ap.add_argument("--explain", metavar="GLOB",
@@ -199,16 +309,23 @@ def main():
     ap.add_argument("--out", default=None, help="report path (default: dead_source_report.txt)")
     args = ap.parse_args()
 
+    raw_root = (args.root or "").strip().rstrip("/")
+    SCAN_REL = None if raw_root in ("", ".") else Path(raw_root)
+
     files = tracked_files()
-    candidates = sorted(p for p in files
-                        if p.suffix.lower() in CANDIDATE_EXTS
-                        and str(p).startswith(str(EMU_REL) + "/"))
+    if SCAN_REL is None:
+        candidates = sorted(p for p in files if p.suffix.lower() in CANDIDATE_EXTS)
+    else:
+        prefix = str(SCAN_REL) + "/"
+        candidates = sorted(p for p in files
+                            if p.suffix.lower() in CANDIDATE_EXTS
+                            and str(p).startswith(prefix))
 
     # ---- index the reference sources -------------------------------------
     # Single pass: tokenize each source once and accumulate *inverted* indexes
     # (token -> sources) restricted to the tokens that matter, i.e. the stems of
     # the candidate files.  Without this the check is quadratic over the tree
-    # (13k sources x ~750 candidates) and takes minutes.
+    # (13k sources x ~900 candidates) and takes minutes.
     candidate_stems = {p.name.rsplit(".", 1)[0] for p in candidates}
     src_text = {}          # path -> text (kept for candidate files only)
     globs = []             # (pattern_source_path, pattern, regex)
@@ -222,6 +339,7 @@ def main():
     includes = {}          # basename -> list of "path" that #include it
     own_tokens = {}        # candidate rel -> Counter
     object_res = []        # regex matching object basenames listed in a Makefile
+    subst_decls = []       # (makefile rel, set(source items)) for $(VAR:...%.o)
 
     basename_re = re.compile(r"([A-Za-z_][\w.\-]*\.(?:c|h|cpp|hpp|cc|tab|inc|def))\b")
     obj_token_re = re.compile(r"([A-Za-z_][\w.\-]*\.(?:o|obj))\b")
@@ -270,6 +388,15 @@ def main():
                     pat = "".join("[^/]*" if ch == "\x00" else re.escape(ch)
                                   for ch in body)
                     object_res.append(re.compile(pat + "$"))
+                # Object lists synthesised from a source registry
+                # ($(ZLIB_FILES:%=$(ZLIB_OBJDIR)/%.o), $(ETHREAD_LIB_SRC:.c=.o))
+                # name no object token at all, so resolve the registry back to
+                # the sources it names here.
+                assigns = list_assignments(txt)
+                for m in SUBST_O_RE.finditer(txt):
+                    var = m.group(1)
+                    if var in assigns:
+                        subst_decls.append((rel, set(assigns[var])))
         for stem in candidate_stems.intersection(cnt):
             stem_refs_all.setdefault(stem, []).append(rel)
 
@@ -278,6 +405,28 @@ def main():
         txt = read_text(c)
         own_tokens[str(c)] = Counter(TOKEN_RE.findall(txt)) if txt else Counter()
         src_text[str(c)] = txt or ""
+
+    def match_scan_rel(rx, c):
+        """Glob-match a candidate's path relative to the scan scope."""
+        if SCAN_REL is None:
+            return False
+        try:
+            return bool(rx.match(str(c.relative_to(SCAN_REL))))
+        except ValueError:
+            return False
+
+    def glob_covered(c):
+        for _grel, _gpat, rx in globs:
+            if rx.match(str(c)) or match_scan_rel(rx, c) or rx.match(c.name):
+                return True
+        return False
+
+    def object_token_covered(c):
+        stem = c.name.rsplit(".", 1)[0]
+        for rx in object_res:
+            if rx.search(stem + ".o") or rx.search(stem + ".obj"):
+                return True
+        return False
 
     # ---- decide ----------------------------------------------------------
     def defined_symbols(c):
@@ -323,9 +472,9 @@ def main():
         # class A: build reference (whole-word stem, verbatim basename, glob)
         build_hits = [f"{s}: mentions '{stem}'" for s in stem_refs_build.get(stem, ())]
         build_hits += [f"{s}: mentions '{base}'" for s in basename_refs.get(base, ())]
-        for grel, gpat, rx in globs:
-            if rx.match(str(c)) or rx.match(str(c.relative_to(EMU_REL))) or rx.match(c.name):
-                build_hits.append(f"{grel}: $(wildcard {gpat}) covers this file")
+        for _grel, _gpat, rx in globs:
+            if rx.match(str(c)) or match_scan_rel(rx, c) or rx.match(c.name):
+                build_hits.append(f"{_grel}: $(wildcard {_gpat}) covers this file")
         if build_hits:
             ev["A build ref"] = build_hits
             if stem_refs_make.get(stem) or basename_refs.get(base) or \
@@ -350,17 +499,13 @@ def main():
             strong = True
         return ev, strong
 
+    # ===== loose (advisory) tier =========================================
     deletable, exempt, referenced, weak = [], [], [], []
     details = {}
     for c in candidates:
         rel = str(c)
         ev, strong = evidence(c)
-        reason = EXEMPT_FILES.get(rel)
-        if reason is None:
-            for pref, why in EXEMPT_PREFIXES:
-                if rel.startswith(pref):
-                    reason = why
-                    break
+        reason = exempt_reason(rel)
         details[rel] = (ev, reason)
         if ev:
             referenced.append(rel)
@@ -371,43 +516,137 @@ def main():
         else:
             deletable.append(rel)
 
+    # ===== STRICT liveness tier (fixpoint / transitive closure) ==========
+    def strict_seed(c):
+        """Seed a compilation unit that a real object list / wildcard covers."""
+        if c.suffix.lower() in COMPILE_EXTS and (object_token_covered(c) or
+                                                glob_covered(c)):
+            return True
+        return False
+
+    # A synthesised object list ("$(VAR:%=$(OBJDIR)/%.o)", "$(VAR:.c=.o)") is
+    # built from VAR's items; resolve each to the candidate source(s) it names.
+    stem_to_cand = {}
+    for c in candidates:
+        stem_to_cand.setdefault(c.name.rsplit(".", 1)[0], []).append(c)
+    subst_seeded = set()
+    for mk_rel, items in subst_decls:
+        mkdir = str(Path(mk_rel).parent)
+        for item in items:
+            named = [str(x) for x in stem_to_cand.get(item_stem(item), ())]
+            if not named:
+                continue
+            local = [x for x in named if x.startswith(mkdir + "/")]
+            subst_seeded.update(local or named)
+
+    # Reverse index: implies[G] = candidates that become live once G is live.
+    cand_set = {str(c) for c in candidates}
+    cand_by_base = {}
+    for c in candidates:
+        cand_by_base.setdefault(c.name, []).append(str(c))
+    sym_owners = {}
+    for c in candidates:
+        for s in defined_symbols(c):
+            sym_owners.setdefault(s, []).append(str(c))
+    all_syms = set(sym_owners)
+    implies = {}           # live file -> candidates it makes live
+    for base, owners in cand_by_base.items():
+        for g in includes.get(base, ()):
+            if g in cand_set:
+                for owner in owners:
+                    if owner != g:
+                        implies.setdefault(g, set()).add(owner)
+    for g in cand_set:
+        for s in set(own_tokens[g]) & all_syms:
+            for f in sym_owners[s]:
+                if f != g:
+                    implies.setdefault(g, set()).add(f)
+
+    live = {str(c) for c in candidates if strict_seed(c)} | subst_seeded
+    worklist = deque(sorted(live))
+    while worklist:
+        g = worklist.popleft()
+        for f in implies.get(g, ()):
+            if f not in live:
+                live.add(f)
+                worklist.append(f)
+
+    strict_dead = sorted(rel for rel in (str(c) for c in candidates)
+                         if rel not in live)
+    strict_dead_action = [rel for rel in strict_dead if exempt_reason(rel) is None]
+
+    def loose_verdict(rel):
+        ev, reason = details[rel]
+        if ev:
+            return "REFERENCED"
+        return "EXEMPT: " + reason if reason else "UNREFERENCED"
+
+    def strict_verdict(rel):
+        if rel in live:
+            return "STRICT LIVE"
+        why = exempt_reason(rel)
+        return "STRICT DEAD (exempt: " + why + ")" if why else "STRICT DEAD (ACTIONABLE)"
+
     if args.explain:
         pat = args.explain
         for rel in sorted(details):
             if not fnmatch.fnmatch(rel, pat) and pat not in rel:
                 continue
-            ev, reason = details[rel]
-            verdict = "REFERENCED" if ev else ("EXEMPT: " + reason if reason else "UNREFERENCED")
-            print(f"== {rel}  [{verdict}]")
+            ev, _reason = details[rel]
+            print(f"== {rel}  [{loose_verdict(rel)}] [{strict_verdict(rel)}]")
             for cls, hits in ev.items():
                 print(f"   {cls}:")
                 for h in hits[:8]:
                     print(f"     - {h}")
-            adv = [s for s in stem_refs_all.get(Path(rel).name.rsplit('.', 1)[0], ()) if s != rel]
+            adv = [s for s in stem_refs_all.get(Path(rel).name.rsplit('.', 1)[0], ())
+                   if s != rel]
             if adv and not ev:
                 print(f"   advisory-only mentions ({len(adv)}): {', '.join(adv[:8])}")
         return 0
 
     def is_built(c):
         """Is this compilation unit named by an object list (or a wildcard)?"""
-        stem = c.name.rsplit(".", 1)[0]
-        base = stem + ".o"
-        for rx in object_res:
-            if rx.search(base):
-                return True
-        # wildcard-covered sources host their objects through a pattern rule
-        for grel, gpat, rx in globs:
-            if rx.match(str(c)) or rx.match(str(c.relative_to(EMU_REL))) or rx.match(c.name):
-                return True
-        return False
+        return str(c) in subst_seeded or object_token_covered(c) or glob_covered(c)
 
-    lines = []
-    lines.append("Dead-source checker report for erts/emulator/**/*.{c,h,cpp,hpp,cc}")
-    lines.append(f"candidates checked: {len(candidates)}   "
-                 f"referenced: {len(referenced)}   "
+    # ===== report ========================================================
+    scope_glob = ("**/*.{c,h,cpp,hpp,cc}" if SCAN_REL is None
+                  else f"{SCAN_REL}/**/*.{{c,h,cpp,hpp,cc}}")
+    scope_desc = ("whole repository" if SCAN_REL is None
+                  else f"whole {SCAN_REL}/ tree")
+    lines = [f"Dead-source checker report for {scope_glob} — {scope_desc}"]
+    lines.append(f"STRICT:  candidates checked: {len(candidates)}   "
+                 f"live: {len(live)}   strict-dead: {len(strict_dead)}   "
+                 f"strict-dead-not-exempt (ACTIONABLE): {len(strict_dead_action)}")
+    lines.append(f"loose (advisory): referenced: {len(referenced)}   "
                  f"exempt (retained by rule): {len(exempt)}   "
                  f"deletable: {len(deletable)}")
     lines.append("")
+    lines.append("STRICT DEAD (not built and not reachable from any live file),"
+                 " grouped per subdirectory:")
+    if not strict_dead:
+        lines.append("  (none)")
+    else:
+        groups = {}
+        for rel in strict_dead:
+            groups.setdefault(scan_dir_relative(rel), []).append(rel)
+        for d in sorted(groups):
+            lines.append(f"  {d}/")
+            ex = [r for r in groups[d] if exempt_reason(r)]
+            ac = [r for r in groups[d] if not exempt_reason(r)]
+            lines.append("    exempt:")
+            if ex:
+                for rel in ex:
+                    lines.append(f"      {rel}  <- {exempt_reason(rel)}")
+            else:
+                lines.append("      (none)")
+            lines.append("    ACTIONABLE:")
+            if ac:
+                for rel in ac:
+                    lines.append(f"      {rel}")
+            else:
+                lines.append("      (none)")
+    lines.append("")
+    lines.append("=== ADVISORY: loose single-pass tier (NOT the deletion gate) ===")
     lines.append("DELETABLE (no build ref, no #include, no symbol use):")
     if deletable:
         for rel in deletable:
@@ -428,9 +667,9 @@ def main():
     lines.append("REFERENCED BUT NOT IN AN OBJECT LIST (compilation units reachable only by")
     lines.append("#include / symbol use - i.e. dead-but-referenced; audit before deleting):")
     unbuilt = [rel for rel in referenced
-               if Path(rel).suffix.lower() in (".c", ".cpp", ".cc")
+               if Path(rel).suffix.lower() in COMPILE_EXTS
                and not is_built(Path(rel))
-               and not any(rel.startswith(pref) for pref, _ in EXEMPT_PREFIXES)]
+               and exempt_reason(rel) is None]
     if unbuilt:
         for rel in unbuilt:
             lines.append(f"  {rel}")
@@ -445,7 +684,7 @@ def main():
         out.write_text(report)
         print(f"[written to {out.relative_to(ROOT) if out.is_absolute() else out}]")
 
-    return 1 if deletable else 0
+    return 1 if strict_dead_action else 0
 
 
 if __name__ == "__main__":

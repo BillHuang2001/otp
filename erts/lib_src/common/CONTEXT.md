@@ -67,6 +67,8 @@ The directory has no subdirectories, no `Makefile` and no build outputs of its o
 - `ERTS_PREMATURE_TIMEOUT` (`erl_misc_utils.h`) is a no-op everywhere except Darwin.
 - CPU topology reading only exists for linux/kstat/win32/FreeBSD (`ERTS_CPU_TOPOLOGY_ENABLED`); on other platforms the topology functions return errors.
 - `ethr_atomics.c` and `ethr_mutex.c` are huge because they contain a full implementation per platform/word-size combination; do not try to read them linearly.
+- Several facilities in `ethr_mutex.c` are **never compiled** because their gate macros are never defined anywhere in the tree: `ETHR_RLOCK_WITH_INC_DEC` (its only `#define` sits inside `#if 0`), `ETHR_MTX_HARD_DEBUG_Q`/`ETHR_MTX_HARD_DEBUG_WSQ` (the former commented out; the latter gated by `ETHR_MTX_HARD_DEBUG`, itself inside `#if 0` in `ethr_mutex.h`), and `ETHR_DBG_WIN_MTX_WITH_PTHREADS` (commented out at `ethr_mutex.h:63`). Their `#else` branches are always taken, so both definitions of `hard_debug_chk_q__`, `rwmutex_incdec_restore_failed_tryrlock` and the static `InitializeCriticalSectionAndSpinCount`/`DeleteCriticalSection` overrides exist only in dead branches. `ethr_mutex.c:327-348` (`#if 0 /* Not used */`) likewise still defines the uncalled `rwmutex_freqread_rdrs_dec`.
+- Defined-but-never-expanded macros (safe to remove): `ETHR_SPIN_WITH_WAITERS` (`ethr_mutex.c:40`), `FMTL_no` and `FMTF_MASK` (`erl_printf_format.c:116,133`), `ERTS_MU_RELATION_CACHE` (`erl_misc_utils.c:1494`).
 
 ## Notes for Agents
 - There is nothing to build or run inside this directory: no Makefile, no tests, no outputs. Use `../Makefile.in` for build questions and `../obj/$(TARGET)/$(TYPE)/` for artefacts.

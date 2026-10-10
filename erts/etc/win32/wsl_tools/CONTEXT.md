@@ -47,7 +47,7 @@ The user-facing description of this build mode is `../../../../HOWTO/INSTALL-WIN
 
 ## Routing Table
 - `vc/` → MSVC compiler/linker/assembler/resource/message shims (`cc.sh`, `ld.sh`, `ar.sh`, `rc.sh`, `mc.sh`, `emu_cc.sh`, `coffix.c`)
-- `../cygwin_tools/` → near-duplicate shim tree for Cygwin (adds `mingw/`, `cc_wrap.c`/`ld_wrap.c`) — read-only, escalate writes to `../`
+- `../cygwin_tools/` → near-duplicate shim tree for Cygwin (adds `mingw/`) — read-only, escalate writes to `../`
 - `../msys_tools/` → near-duplicate shim tree for MSYS2 (`msys2win_path.sh`, `win2msys_path.sh`) — read-only, escalate writes to `../`
 - `../../common/Makefile.in` → consumer of `cc.sh`/`ld.sh`/`ar.sh`/`rc.sh`/`mc.sh` (`USING_VC=@MIXED_VC@`) — read-only, escalate writes to `../../`
 - `../../../../Makefile.in` → `bootstrap_setup` target calling `make_bootstrap_ini.sh`; `erts/Makefile` → `local_setup` calling `make_local_ini.sh`
