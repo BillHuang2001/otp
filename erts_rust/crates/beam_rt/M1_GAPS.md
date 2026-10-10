@@ -31,26 +31,15 @@ Present-state documentation, not a change log.
   <non-integer>)` returns the previous value where the oracle raises `badarg` (`bif.c:1911`).
 
 ## Placeholders where a truthful source exists
-* **`port_info(Port, input|output)`** is hard-coded `0` (`src/port.rs`) where the oracle reports real
-  cumulative per-port byte counts; only the **node-global** `IoCounters` behind
-  `erlang:statistics(io)` exist, never per-port totals. The differential `port_info` case filters these
-  two items out (`tools/differential/src/corpus/driver.rs`).
 * **`NodeIdentity`'s creation is a fixed `0`** (`src/context/bridges.rs`) while a live
   `crate::dist::DistNode::creation()` exists, so an internal pid/port image still encodes creation `0`
-  on a wired node.
-* **`init:get_argument(bindir)`** answers `error` (no arm) where the oracle returns the real
-  `erts-*/bin` path from the resolved code root; `root`/`home`/`progname` **are** answered from the
-  runtime's own state (`src/native/init.rs`).
+  on a wired node. The **node atom** beside it *is* the runtime's live `Runtime::local_node()`, stamped
+  on every `call_registered` arm.
 * **Flag-driven `system_info` literals** (`src/info/system.rs`: `port_parallelism`, `break_ignored`,
   `modified_timing_level`, `halt_flush_timeout`; `src/info/limits.rs`: `dist_buf_busy_limit`,
   `delayed_node_table_gc`) report their default because no A.6 CLI arm preserves the driving flag
   (`+spp`/`+B`/`+T`/`-shutdown_time`/`+zdbbl`/`+zdntgc`): `cli.rs::record_unmodeled` drops an unmodeled
   `+flag`, so there is no state to derive from.
-* **The key-partition gap.** Some oracle-accepted `system_info` keys are in neither `SUPPORTED_KEYS` nor
-  `UNSUPPORTED_KEYS` — `lock_checking`, `lock_counting`, `hipe_architecture`, `ets_realloc_moves`,
-  `ets_always_compress`, `snifs`, `port_tasks`, `io_thread`, `scheduling_statistics`, `compat_rel`,
-  `max_integer` — so this runtime raises `badarg` where the oracle answers a value. Classifying them is a
-  `src/info.rs` change; the per-key analysis is in [`src/info/CONTEXT.md`](src/info/CONTEXT.md).
 * **`process_info(P, last_calls)`** answers `false` although the runtime holds the real `save_calls` flag
   (`beam_process::Process::save_calls`).
 
@@ -188,7 +177,9 @@ stream a char list. The child's **stderr is inherited** from the emulator by def
 data; `stderr_to_stdout` makes descriptor 2 an exact duplicate of descriptor 1, so its diagnostics
 arrive as port data interleaved in true write order. `connected` flips to `false` only at
 `port_close/1`; `os:cmd/1` stays the runtime-native host spawn.
-A `{spawn_driver, Name}` port's `driver_output` **is** delivered to its owner as `{Port, {data, Data}}`,
+`{spawn_driver, Name}` resolves the name against the **built-in driver table** (`tcp_inet`/`fd`/`efile`)
+before any `dlopen` exactly as the C does (`io.c:599-628`) — an unknown name is still `badarg`. A
+`{spawn_driver, Name}` port's `driver_output` **is** delivered to its owner as `{Port, {data, Data}}`,
 and a driver-emitted `erl_drv_output_term`/`erl_drv_send_term` term reaches the connected process or the
 explicit destination (the `TermQueue` drain is wired end to end). `driver_select` is real, and
 `driver_set_timer` arms for every attached port (the C substitutes a no-op `no_timeout_callback` when
@@ -197,14 +188,19 @@ deadline). An `OUTPUT` port task always drains the port's output queue through t
 (the entry's `outputv`/`output`) and *then* runs the entry's `ready_output` as the write-**readiness**
 notification, so a queued `port_command` buffer reaches the driver whether or not the driver armed a
 writable fd. The driver's `control` callback **is** routed behind `erlang:port_control/3`, and
-`ERL_DRV_USE`'s `stop_select` **fires** on the cancel/deselect handback.
+`ERL_DRV_USE`'s `stop_select` **fires** on the cancel/deselect handback. The **driver-private queue**
+(`driver_enq`/`driver_pushq`/`driver_deq`/`driver_sizeq`/`driver_peekq` — a fresh port's `sizeq` is `0`),
+`driver_pdl_create` and the port **state** flags (`get_port_flags`; `set_control_flags` stores into the
+port's own control-flags cell) are implemented, so the host covers **23 of the 40** `DriverHost` hooks.
 Typed gaps: `driver_async` (no async pool; `Runtime` is `!Send` and the `invoke`/`free` pair is
-`unsafe`); a `control` reply the driver answered from **its own** memory (needs a safe copy helper on
-`beam_abi`); an OS child (`os_pid` is `undefined` for a driver port, and `take_exit_status` is always
-`Ok(None)`); a built-in (`spawn`/`spawn_executable`/`fd`) port's `port_control/3` answering `[]` where
-the oracle raises `badarg` (a gap owned by `beam_io`'s default `Driver::control`); `port_info`'s
-`input`/`output` (the placeholders above); and a driver arming **more than one** registration per
-direction (the typed `unsupported`).
+`unsafe`); the process-monitor family (`driver_monitor_process`/`_demonitor_process`/
+`_get_monitored_process` — a returned monitor could never be correlated again without a safe
+`monitor_identity` reader on `beam_abi`); a `control` reply the driver answered from **its own** memory
+(needs a safe copy helper on `beam_abi`); an OS child (`os_pid` is `undefined` for a driver port, and
+`take_exit_status` is always `Ok(None)`); a built-in (`spawn`/`spawn_executable`/`fd`) port's
+`port_control/3` answering `[]` where the oracle raises `badarg` (a gap owned by `beam_io`'s default
+`Driver::control`); and a driver arming **more than one** registration per direction (the typed
+`unsupported`).
 The six `erl_ddll` registry BIFs (`loaded_drivers/0`, `try_load/3`, `try_unload/2`, `monitor/2`,
 `demonitor/1`, `info/2`) stay typed `unsupported`: `loaded_drivers/0` would report this runtime's own
 (empty) driver set where the oracle lists its statically-linked `tcp_inet`/`udp_inet`/`ram_file_drv` — a
@@ -220,8 +216,10 @@ needs the port write path and the distributed `{Name, Node}` send is contract A.
 `epmd` best-effort (a failure is recorded, never fatal) and completes the server-side `'N'` handshake
 against a real OTP peer (`tests/dist.rs`). Gaps: no `net_kernel` protocol; the inbound
 link/exit/monitor/alias `DOP_*` families stay typed `Unsupported` (no remote-peer seam in
-`beam_process`); `node/0` and the node-valued `system_info` items do **not** reflect the live node
-(`NodeIdentity` carries the creation-`0` placeholder above). `DOP_SEND`/`DOP_REG_SEND` already reach
+`beam_process`); `node/0` and the node atom a pid image carries **do** reflect the live
+`-name`/`-sname` node (`Runtime::local_node()` is stamped on every `call_registered` arm), but the
+`NodeIdentity` reports creation `0` (the placeholder above), so a decoded local id is still external
+(see the `beam_codec`/`beam_bifs` handoff). `DOP_SEND`/`DOP_REG_SEND` already reach
 local mailboxes through `LocalDeliverySink`, gated by `Runtime::allow_inbound_delivery` (default OFF, so
 the differential corpus is byte-identical); a live-peer loop past the handshake needs the
 `FragmentAssembler` receive-buffer coupling.
@@ -275,17 +273,22 @@ failed collection halts that process's collection rather than failing the progra
 become `error::system_limit` via `error::enforce_term_heap_limit` — `AllocKind::Heap` (the per-process
 bump allocator) **and** `AllocKind::Message` (the copy engine's destination-heap exhaustion, classified
 by `beam_message::is_message_heap_exhaustion`) → CLI `beam_rt: system_limit`, exit 1.
-**On-demand heap growth is adopted only on the `beam_process` message-delivery path.** `Process::deliver`
-retries a refused `AllocKind::Heap`/`Message` copy after `Process::ensure_capacity` grows the nursery to
-fit it; a bounded `HeapPolicy::max_heap_words` makes that growth refuse fail-fast, and the refusal is what
+**On-demand heap growth is adopted at the engine's heap-admission point and on the `beam_process`
+message-delivery path.** `src/context/gc.rs::ensure_heap` runs the collector's on-demand **growth**
+(`Process::ensure_capacity`) whenever the process's own heap-size policy can reach the request
+(`HeapPolicy::next_words(need, 0) >= need`) and a plain `Process::collect` otherwise, so a `test_heap`
+request larger than the nursery is admitted by growing it in place (`tests/heap_growth.rs`).
+A bounded `+hmax N` policy the request cannot reach is refused **before** collecting, keeping the
+fallback behaviour exactly (the collection still runs, the allocation falls back to the arena).
+`Process::deliver` grows the nursery the same way for a refused message copy; the refusal is what
 reproduces the raw `AllocKind::Message` that `deliver_message` keys its heap-fragment fallback on (an
 unbounded receiver would instead absorb the payload into its grown nursery). A **relocation-exempt**
-receiver skips the collect-and-grow retry entirely. `beam_rt`'s own allocation
-paths still do **not** grow, so heap exhaustion there still raises `error:system_limit`: the engine `ensure_heap` hook is a
-no-op and BIFs build terms on a `beam_alloc::Heap` (`BifContext::heap()`) caching raw `hp`, so the live
-set is invisible to `roots`; the bounded heaps (`Runtime::bif_heaps`/`eval_heap`) are bump arenas that
-never move. To adopt: a reservation-capable `Heap` + re-derivable top/`hp`, `beam_engine` `alloc_words`
-re-basing, and `beam_bifs` per-object `hp` re-fetch.
+receiver skips the collect-and-grow retry entirely. Allocation **outside** the admission point still does
+not grow, so exhaustion there still raises `error::system_limit`: BIFs build terms on a `beam_alloc::Heap`
+(`BifContext::heap()`) caching raw `hp`, so the live set is invisible to `roots`, and the bounded heaps
+(`Runtime::bif_heaps`/`eval_heap`) are bump arenas that never move. To adopt: a reservation-capable
+`Heap` + re-derivable top/`hp`, `beam_engine` `alloc_words` re-basing, and `beam_bifs` per-object `hp`
+re-fetch.
 
 ## Heap switches
 `+hms`/`+hmbs` set a `beam_gc::HeapPolicy` rounded through the growth table (`+hms 1000` → 1598),
@@ -333,17 +336,42 @@ re-basing, and `beam_bifs` per-object `hp` re-fetch.
   word/byte accessor** so `erlang:memory/0,1`'s `processes`/`processes_used` can be real on the
   `-eval`/single-pass path; (c) an **allocation-admission root-set hook** — `ExecutionContext::alloc_words`
   carries no root set, so an `alloc_words`-only workload is never collected.
-* **`beam_bifs` / `src/context`** — feed `NodeIdentity` from `Runtime::dist_node()` so `erlang:node/0` and
-  the node-valued `system_info` items reflect a live `-sname`/`-name` node.
+* **`beam_bifs` / `src/context` — the node identity.** The live node atom is fed from
+  `Runtime::local_node()` and stamped on every `call_registered` arm, so `erlang:node/0` and the node atom
+  a pid image carries reflect a live `-sname`/`-name` node; the residual is the **creation** — the hook
+  still reports the fixed `0` where a live `crate::dist::DistNode::creation()` exists, so an internal
+  pid/port image on a wired node encodes creation `0`.
+* **`beam_codec` / `beam_bifs` — the local-identifier decode.** `binary_to_term/1` must normalise a
+  local-node `NEW_PID_EXT` (`88`)/`V4_PORT_EXT` to an **internal** pid/port (the C's
+  `dec_pid`/`dec_is_this_node`, `external.c:3123-3195`), which needs the local identity installed on the
+  decoder (`beam_codec::Decoder::with_local_node` from `beam_bifs::binconv::decode_term_bif`; `beam_bifs`'s
+  `binconv.rs` never installs it). Until then `binary_to_term(term_to_binary(self())) =:= self()` is
+  `false` — `tests/pid_roundtrip.rs` pins that as a deliberate tripwire.
 * **Distribution, phase 2** — the inbound link/exit/monitor/alias `DOP_*` families need a
   `beam_process` **remote-peer** seam (plus an alias table); `DOP_SEND`/`DOP_REG_SEND` already reach
   local mailboxes, and a live-peer loop past the handshake needs the `FragmentAssembler` receive-buffer
   coupling.
-* **`beam_io` / `beam_abi` lifecycle.** Finish the driver-port lifecycle (`driver_async` needs a
-  `beam_abi::DriverHost` seam that can fire `ready_async`, since `beam_rt` is `#![deny(unsafe_code)]`; a
-  per-registration `ErlDrvEvent` identity). `erl_drv_monotonic_time`'s phase differs because
-  `beam_abi/src/driver/drv/mem.rs` reads `CLOCK_MONOTONIC` from the system epoch where the oracle returns
-  the Erlang monotonic time (a process-global origin shared with `beam_bifs`' `time.rs`).
+* **`beam_io` / `beam_abi` lifecycle.** The **process-monitor family** is blocked on a safe `beam_abi`
+  reader `monitor_identity(mon: *const ErlDrvMonitor) -> Option<[u8; 24]>`: the frozen hook
+  `monitor_process(&mut self, pid: Eterm) -> Option<ErlDrvMonitor>` never sees the caller's out-parameter,
+  and `demonitor_process`/`get_monitored_process` receive an `*const ErlDrvMonitor` whose 24-byte identity
+  may not be read under `#![deny(unsafe_code)]`, so the three stay the C's failure code. `driver_async`
+  needs a `beam_abi::DriverHost` seam that can fire `ready_async` (since `beam_rt` is
+  `#![deny(unsafe_code)]`); a `control` reply the driver answered from its own memory needs a safe copy
+  helper; a per-registration `ErlDrvEvent` identity is still owed. `erl_drv_monotonic_time`'s phase differs
+  because `beam_abi/src/driver/drv/mem.rs` reads `CLOCK_MONOTONIC` from the system epoch where the oracle
+  returns the Erlang monotonic time (a process-global origin shared with `beam_bifs`' `time.rs`).
+* **`beam_io` — a safe filesystem accessor.** A safe `path_access(Path)` (a `libc::access` wrapper) plus
+  `process_credentials()` (effective uid/gid) would close the `#file_info{}` **`access`** slot, and so the
+  `filelib`/`file:read_file_info` existing-path **success** cases; only the stat-failure path is served
+  today (`src/native/file_server/file_info.rs`), because `access(2)` is reachable only through `libc::access`,
+  which `#![deny(unsafe_code)]` forbids.
+* **`beam_message` — an off-heap refc-binary copy mode.** `copy_struct_simple` builds **empty** source and
+  destination off-heap tables, so `copy_refc_binary` cannot resolve a `RefcBinary` payload's backing store
+  (`binary_by_data_ptr` misses) and returns `bad_term` (`BeamError::BadArg`). A self-contained "flatten"
+  copy mode would let `src/runtime.rs::stabilize_term` carry an off-heap result across; the `beam_rt` half
+  is that single `copy_struct_simple` call, pinned red by `tests/empty_binary_result.rs`'s `#[ignore]`d
+  Test B.
 * **`beam_bifs` — the `ets:setopts/2` heir gift copy and the tid-ref mint.** The owner→handle roster
   exists, so a dead owner's *unnamed* table is reclaimed (see the ETS section). Remaining gaps:
   `ets:setopts/2` installs `{heir,…}` through the non-copying `beam_ets::Table::setopts` where
