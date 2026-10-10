@@ -500,7 +500,7 @@ mod tests {
     use std::rc::Rc;
 
     use beam_alloc::Heap;
-    use beam_common::{BeamError, ExitReason};
+    use beam_common::BeamError;
     use beam_process::PortId;
     use beam_term::{atom_val, Atom, AtomTable, NIL};
 
@@ -717,18 +717,6 @@ mod tests {
             "protected",
         ]);
         atoms
-    }
-
-    /// Asserts `err` is this crate's typed capability gap (`unsupported_bif`).
-    fn assert_unsupported(err: BeamError) {
-        match err {
-            BeamError::Raise(raise) => assert_eq!(
-                raise.reason,
-                ExitReason::atom("unsupported_bif"),
-                "expected the typed unsupported_bif gap"
-            ),
-            other => panic!("expected unsupported_bif, got {other:?}"),
-        }
     }
 
     /// `ets:setopts/2`'s arity-3 `{heir, Pid, Data}` form **deep-copies** the gift
