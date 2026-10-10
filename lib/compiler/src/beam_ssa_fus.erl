@@ -22,14 +22,15 @@
 
 %%%
 %%% This pass performs "operation fusion": it replaces a pair of operations by
-%%% a single, exactly equivalent, cheaper one. Three transformations are
+%%% a single, exactly equivalent, cheaper one. Four transformations are
 %%% implemented; all are opt-in (compile option `fusion_opt') and share the
 %%% rule that nothing is rewritten unless every condition checked by the pass
 %%% holds, so every uncertain case is left untouched.
 %%%
 %%% Fusion 1 and Fusion 2 are "map lookup fusion": they remove map key *tests*
 %%% whose result is already implied by a following map key *extraction*, so
-%%% that the map is probed once instead of twice.
+%%% that the map is probed once instead of twice. Fusion 5 is the same
+%%% redundancy for the `maps:get/2' spelling of an extraction.
 %%%
 %%% Fusion 4 is "arithmetic constant-chain fusion": it folds a multiplication
 %%% by an integer constant whose result is immediately multiplied by a second
@@ -201,6 +202,31 @@
 %%% anywhere else, or a chain link whose block is not exclusively reached from
 %%% the multiplication, is left alone.
 %%%
+%%% Fusion 5 (implemented) is Fusion 1's redundancy for the `maps:get/2'
+%%% spelling of a map extraction. `maps:get/2' is a guard BIF and is therefore
+%%% compiled to the `map_get/2' instruction (never to `get_map_element'), which
+%%% the front end pairs with a `{succeeded,body}' marker:
+%%%
+%%%     has_map_field(Map, Key) -> Bool ; br Bool, LSucc, LFail
+%%%     LSucc: D = bif:map_get(Key, Map)
+%%%            SBool = succeeded:body D
+%%%            br SBool, LSS, LFail2
+%%%
+%%% is replaced by
+%%%
+%%%     D = get_map_element(Map, Key)
+%%%     SBool = succeeded:guard D
+%%%     br SBool, LSS, LFail
+%%%
+%%% `D' and `SBool' keep their names, so every use (and any use beyond LSucc)
+%%% stays valid; only the instruction that computes D changes, and LSucc is
+%%% dropped. The map is again probed once instead of twice, and the reasoning
+%%% is identical to Fusion 1's (`has_map_field' true implies Map is a map and
+%%% Key is present, so `map_get' cannot raise). See the comment above
+%%% `fuse_5_blk/3'. `LFail2' is not required to be absent here (it normally
+%%% *is* the exception pseudo block, which `map_get' branches to on failure),
+%%% only to stay consistent when it keeps other predecessors.
+%%%
 %%% Other "chains" that are deliberately NOT fused here:
 %%%
 %%%   * Map updates: `beam_ssa_opt:ssa_opt_cse' already merges adjacent
@@ -218,6 +244,34 @@
 %%%     instruction (literal lists are built through the literal pool by the
 %%%     loader), and the elements of the list are not known to be constants.
 %%%     Out of scope.
+%%%   * `X * C1 div C2' -> `X * (C1 div C2)': NOT exact. Integer division
+%%%     truncates, so the rewrite only preserves the value when C2 divides C1
+%%%     exactly (`C1 rem C2 =:= 0', with C2 > 0); `5 * 3 div 2' is 7 while
+%%%     `5 * (3 div 2)' is 5. The narrowing rewrite `(X * C1) div C2' ->
+%%%     `X * (C1 div C2)' would therefore need a divisibility proof for both
+%%%     constants on top of the integrality proof for X, and it would have to
+%%%     keep the `div' when C2 does not divide C1. The precondition is
+%%%     provable (both constants are literals) but the pattern is rare enough
+%%%     that it has not been implemented; the safe special case `C1 div C2' is
+%%%     already folded by the compiler when both operands are literals.
+%%%   * Nested `bsl'/`bsr' shifts, e.g. `(X bsl A) bsr B' -> `X bsl (A - B)':
+%%%     the fused BEAM form *does* exist (`{bif,bsl,..}'/`{bif,bsr,..}' are
+%%%     single BIFs) and the fold is exact for a proven integer X and literal
+%%%     shifts, because `bsl' is "multiply by 2^Shift" and shifts compose
+%%%     additively for both signs of the shift. It is not implemented because
+%%%     the compiler already strength-reduces multiplication chains
+%%%     (`beam_ssa_loop_opt' under its own flag, `beam_ssa_type:reassociate/3'
+%%%     for literals) and a *shift* chain of two literal shifts is folded by
+%%%     the constant folding in `sys_core_fold' before this pass ever sees it;
+%%%     there is no measured case left for it in the tree.
+%%%   * `get_map_element' chains: `D1 = map_get(K1, M), D2 = map_get(K2, D1)'
+%%%     and friends. There is no fused BEAM instruction for a map lookup whose
+%%%     operand is the result of another map lookup, and `map_get/2' on a value
+%%%     that is not a map raises `{badmap,Term}' - so nothing can be folded
+%%%     into a single instruction. Out of scope.
+%%%
+%%% Fusion 3 (`get_tuple_element/3' chains) and the partial-overlap case of
+%%% Fusion 2 are discussed next to Fusion 1/Fusion 2 above.
 %%%
 -module(beam_ssa_fus).
 -moduledoc false.
@@ -245,7 +299,8 @@ ssa_opt_fus({#opt_st{ssa=Blocks0}=St, FuncDb}) ->
 %% transformations - either a block whose last instruction is a
 %% `has_map_field' test on the same variable as the block's conditional branch,
 %% and whose success edge either starts with a `get_map_element' of the same
-%% map and key (Fusion 1) or is again a `has_map_field' test of the same map
+%% map and key (Fusion 1) or with the `map_get/2' lookup of the same map and
+%% key (Fusion 5), or is again a `has_map_field' test of the same map
 %% with the same failure label (a possible Fusion 2 test chain), or a block
 %% whose branch is on the success guard of a multiplication by an integer
 %% constant and whose successor starts with a multiplication of its result by
@@ -280,6 +335,10 @@ candidate_succ(Blocks, LSucc, Map, Key, LFail) ->
         #{LSucc := #b_blk{is=[#b_set{op=get_map_element,args=[Map,Key]}|_]}} ->
             %% Fusion 1 candidate: the success edge starts with the extraction
             %% of the tested key.
+            true;
+        #{LSucc := #b_blk{is=[#b_set{op={bif,map_get},args=[Key,Map]}|_]}} ->
+            %% Fusion 5 candidate: the success edge starts with the `map_get/2'
+            %% lookup of the tested key (note the reversed argument order).
             true;
         #{LSucc := #b_blk{is=Is,last=#b_br{bool=B,fail=LFail}}} ->
             %% Fusion 2 candidate: the success edge starts another map-key test
@@ -344,7 +403,7 @@ scan([], _Blocks) ->
     false.
 
 %%============================================================================
-%% Fusion driver: Fusion 1 first, then Fusion 2, then Fusion 4.
+%% Fusion driver: Fusion 1, then Fusion 2, then Fusion 4, then Fusion 5.
 %%============================================================================
 
 -spec fuse_blk(beam_ssa:label(), beam_ssa:b_blk(), beam_ssa:block_map()) ->
@@ -353,7 +412,11 @@ fuse_blk(LA, Blk, Blocks) ->
     case fuse_1_blk(LA, Blk, Blocks) of
         no ->
             case fuse_2_blk(LA, Blk, Blocks) of
-                no -> fuse_4_blk(LA, Blk, Blocks);
+                no ->
+                    case fuse_4_blk(LA, Blk, Blocks) of
+                        no -> fuse_5_blk(LA, Blk, Blocks);
+                        {yes,_}=Yes -> Yes
+                    end;
                 {yes,_}=Yes -> Yes
             end;
         {yes,_}=Yes -> Yes
@@ -765,6 +828,161 @@ maybe_fuse_4(LA, LSucc, LFinal, LFail2, D1, B2, Type, Blocks) ->
     andalso not has_phi(LSucc, Blocks)
     andalso not has_phi(LFinal, Blocks)
     andalso not has_phi(LFail2, Blocks).
+
+%%============================================================================
+%% Fusion 5: has_map_field + map_get -> get_map_element
+%%============================================================================
+
+%% The same redundancy as Fusion 1, but for the other spelling of a map
+%% extraction. `maps:get/2' is compiled to the `map_get/2' BIF (it is a guard
+%% BIF, so it may not expand to a test instruction), which the front end pairs
+%% with a `{succeeded,body}' marker:
+%%
+%%     LA:  ... has_map_field(Map, Key) -> Bool ; br Bool, LSucc, LFail
+%%     LSucc: D = bif:map_get(Key, Map)
+%%            SBool = succeeded:body D
+%%            br SBool, LSS, LFail2
+%%
+%% The test makes the lookup redundant in exactly the same way: `has_map_field'
+%% returning true implies both that Map is a map and that Key is present, so
+%% `map_get' can never raise `{badkey,Key}' (nor `{badmap,Term}'). The pair is
+%% therefore replaced by a single `get_map_element' in the *first* block, with
+%% the failure edge redirected to LFail:
+%%
+%%     LA:  ... D = get_map_element(Map, Key)
+%%              SBool = succeeded:guard D
+%%              br SBool, LSS, LFail
+%%
+%% `D' keeps its name, so all of its uses stay valid: its uses were dominated
+%% by LSucc and are still dominated by LA, which is LSucc's only predecessor.
+%% `SBool' keeps its name too and is still consumed only by the branch. LSucc
+%% is then unreachable and is dropped.
+%%
+%% The gain is the same as Fusion 1's: the map is probed once (`get_map_elements'
+%% in the generated BEAM code) instead of once for the test plus once for the
+%% lookup. It only fires when the type analysis has proven Map to be a map at
+%% the test site, which is also what turns the `is_map_key/2' BIF into the
+%% `has_map_field' instruction in the first place; without that proof (e.g. for
+%% a map operand of unknown type) nothing is rewritten. The extraction is only
+%% rewritten when the lookup is the *only* thing on the success edge of the
+%% test, so the two blocks can be collapsed.
+%%
+%% Semantics preserved (identical to Fusion 1):
+%%
+%%   * The failure set is unchanged. A failing `get_map_elements' writes nothing
+%%     to its destination, so D is never bound on the LFail path, exactly as it
+%%     was never bound there before (the `map_get' lived in LSucc, on the
+%%     success edge of the test). A present key takes the same LSS edge with the
+%%     same value in D.
+%%   * The `{badkey,Key}'/`{badmap,Term}' exception that `map_get/2' raises for
+%%     a missing key or a non-map can no longer be raised - but it could not be
+%%     raised before either, because the test that guards the lookup has already
+%%     proven Map to be a map and Key to be present. LFail2 (the exception block
+%%     that `map_get' branched to on failure) simply loses an edge, exactly as
+%%     when the type analysis proves a guard cannot fail.
+%%   * Instruction order and the error position are unchanged: the fused lookup
+%%     takes the position of the test (keeping the lookup's source location, so
+%%     a stack trace would still point at the `maps:get/2' call), and no
+%%     instruction is added to any block.
+%%   * The `succeeded' marker is emitted as a `guard' check, which is the
+%%     canonical pairing for `get_map_element'
+%%     (`beam_core_to_ssa:select_extract_map/4') and is what
+%%     `beam_ssa_codegen:cg_block/3' matches.
+%%
+%% Nothing is rewritten unless all of the conditions checked by
+%% `maybe_fuse_5/9' hold; every uncertain case is left untouched.
+%%============================================================================
+
+%% Entry point for Fusion 5 at a block LA whose last instruction is a
+%% `has_map_field' test on the branch variable.
+-spec fuse_5_blk(beam_ssa:label(), beam_ssa:b_blk(), beam_ssa:block_map()) ->
+          no | {yes, beam_ssa:block_map()}.
+fuse_5_blk(LA, #b_blk{is=Is,last=#b_br{bool=Bool,succ=LSucc,fail=LFail}=BrA},
+           Blocks) ->
+    case lists:reverse(Is) of
+        [#b_set{op=has_map_field,dst=Bool,args=[Map,Key]}=Hmf | RevPrefix] ->
+            fuse_5(LA, lists:reverse(RevPrefix), BrA, Hmf, Map, Key,
+                   LSucc, LFail, Blocks);
+        _ ->
+            no
+    end;
+fuse_5_blk(_LA, _Blk, _Blocks) ->
+    no.
+
+fuse_5(LA, Prefix, BrA, Hmf, Map, Key, LSucc, LFail, Blocks) ->
+    case Blocks of
+        #{LSucc := #b_blk{is=[#b_set{op={bif,map_get},
+                                     dst=D,args=[Key,Map]}=GetMap,
+                                #b_set{op={succeeded,_},
+                                       dst=SBool,args=[D]}=Succeeded],
+                          last=#b_br{bool=SBool,succ=LSS,fail=LFail2}}} ->
+            HmfType = anno_arg_type(Hmf),
+            case maybe_fuse_5(LA, LSucc, LSS, LFail, LFail2, Hmf#b_set.dst,
+                              SBool, HmfType, Blocks) of
+                true ->
+                    %% The lookup's argument order is reversed (`map_get/2'
+                    %% takes the key first), so its type annotations describe
+                    %% the wrong arguments and must be dropped; the type passes
+                    %% recompute them on the next iteration.
+                    Anno = maps:without([arg_types,result_type],
+                                        GetMap#b_set.anno),
+                    Get = #b_set{op=get_map_element, dst=D, args=[Map,Key],
+                                 anno=Anno},
+                    Br = BrA#b_br{bool=SBool, succ=LSS, fail=LFail},
+                    A1 = #b_blk{is=Prefix ++ [Get,Succeeded], last=Br},
+                    {yes,maps:remove(LSucc, Blocks#{LA => A1})};
+                false ->
+                    no
+            end;
+        #{} ->
+            no
+    end.
+
+%% All the conditions that must hold for the Fusion 5 rewrite to be provably
+%% valid.
+-spec maybe_fuse_5(beam_ssa:label(), beam_ssa:label(), beam_ssa:label(),
+                   beam_ssa:label(), beam_ssa:label(), beam_ssa:b_var(),
+                   beam_ssa:b_var(), false | term(), beam_ssa:block_map()) ->
+          boolean().
+maybe_fuse_5(LA, LSucc, LSS, LFail, LFail2, Bool, SBool, HmfType, Blocks) ->
+    Special = ?EXCEPTION_BLOCK,
+    %% The exception pseudo block is special and must not be part of the
+    %% rewrite (a branch to it means "raise"). LFail2, on the other hand, *is*
+    %% normally the exception block here, because `map_get' raises on failure;
+    %% it is therefore only required to stay consistent, not to be absent - see
+    %% the phi/LFail2 condition below.
+    lists:all(fun(L) -> L =/= Special end, [LA,LSucc,LSS,LFail])
+    andalso LSucc =/= LSS                       %LSucc's br would become a self loop
+    andalso LSS =/= LA                          %LSS must not be the rewritten block
+    andalso LFail =/= LSucc                     %A would reference a removed block
+    %% LSucc is removed, so it must have exactly one predecessor (LA); that
+    %% makes all its former instructions unreachable and keeps the moved
+    %% definition of D dominated by LA.
+    andalso preds(LSucc, Blocks) =:= [LA]
+    %% Redirecting the success edge of the test to LSS must not create a new
+    %% entry into LSS, so that LSS stays dominated by LA (and D stays dominated
+    %% by its new definition site).
+    andalso preds(LSS, Blocks) =:= [LSucc]
+    %% The edge LSucc -> LFail2 disappears. If LFail2 then becomes unreachable
+    %% that is fine (it can only have been reached through the lookup, which
+    %% cannot fail); otherwise LFail2 must not have a phi node, whose entry for
+    %% LSucc would become stale. LFail2 is *not* required to be unreachable:
+    %% for `maps:get/2' it is the exception pseudo block, which is shared by
+    %% every raising instruction in the function.
+    andalso (preds(LFail2, Blocks) =:= [LSucc] orelse not has_phi(LFail2, Blocks))
+    %% Phi nodes would have to be rewritten when the predecessors change; it
+    %% is cheaper (and safer) to simply not fuse in that case.
+    andalso not has_phi(LSucc, Blocks)
+    andalso not has_phi(LSS, Blocks)
+    andalso not has_phi(LFail, Blocks)
+    %% The test result is consumed only by the branch we rewrite, and the
+    %% lookup's success bool only by the branch we drop.
+    andalso use_count(Bool, Blocks) =:= 1
+    andalso use_count(SBool, Blocks) =:= 1
+    %% `get_map_elements' requires a map operand, while `has_map_field' maps a
+    %% non-map to "false" (and `map_get' would raise `{badmap,Term}' instead).
+    %% Only fuse when Map is provably a map here.
+    andalso is_map_type(HmfType).
 
 %% The type of the first argument of the instruction, as recorded by
 %% beam_ssa_type. `false` when unknown.
