@@ -932,7 +932,14 @@ pub fn run(args: Vec<String>) -> i32 {
     let env = config.env.clone();
     let mut source = None;
     match drive(config, &mut source) {
-        Ok(()) => EXIT_OK,
+        // A successful action still exits with the status a **non-terminating** node stop
+        // recorded: `init:stop/0,1` asks the node to halt (`init ! {stop,…}`) and returns
+        // `ok` to a caller that keeps running, so the status is applied here — after the
+        // whole expression has finished — instead of raising (the `halt/1` path below).
+        Ok(()) => source
+            .as_ref()
+            .and_then(|rt| rt.halt_status())
+            .unwrap_or(EXIT_OK),
         Err(error) => {
             if let Some(status) = error::halt_status(&error) {
                 // The program asked to terminate with this status: no diagnostic, no dump.
@@ -1194,6 +1201,25 @@ fn resolve_boot_file(value: &str, root: Option<&Path>) -> Result<PathBuf> {
         "cannot get bootfile {}",
         candidate.display()
     )))
+}
+
+/// Resolves a boot-script **value** the way `init`'s `get_boot/2` does, against the runtime's
+/// own Erlang root ([`boot_file_root`]).
+///
+/// This is the one seam shared by the CLI's `-boot FILE` action ([`run_boot_script`]) and the
+/// runtime-native floor's `init:boot/1` (`../beam_rt/src/native/init.rs`) — one resolution
+/// rule, so the two can never drift.
+///
+/// The runtime must be **booted** for `$ROOT` (and the `<Root>/bin` fallback) to resolve, since
+/// `<Root>` is derived from the system `ebin` directories on the code path; a caller on a
+/// floor path boots first.
+///
+/// # Errors
+///
+/// [`resolve_boot_file`]'s typed `cannot get bootfile …` error when a `$ROOT/…` value has no
+/// resolvable root or both candidates are missing.
+pub(crate) fn resolve_boot_file_for(runtime: &Runtime, value: &str) -> Result<PathBuf> {
+    resolve_boot_file(value, boot_file_root(runtime).as_deref())
 }
 
 /// The `-s Mod Func [Args…]` / `-run Mod Func [Args…]` action: the result is
