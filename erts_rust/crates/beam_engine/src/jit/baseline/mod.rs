@@ -182,7 +182,7 @@ mod tests;
 // outside this module (`crate::jit::baseline::…`) stays exactly what it was.
 pub(crate) use emit::compile_module;
 pub use runtime::{decode_target, decode_wait, encode_target, encode_wait, ENTER, ERROR, HALT, WAIT_BIT};
-pub(crate) use runtime::{jit_set_position, jit_step_one, JitRuntime};
+pub(crate) use runtime::{jit_ext_call, jit_set_position, jit_step_one, JitRuntime};
 
 use runtime::NativeBlock;
 // ---------------------------------------------------------------------------

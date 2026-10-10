@@ -21,11 +21,13 @@
 //! The baseline JIT's block ABI and its per-instruction helper.
 //!
 //! The `HALT`/`ERROR`/`WAIT` return words and the `(func, pc)` control-word codec,
-//! the `#[repr(C)]` runtime block a compiled block receives, and the two helpers a
+//! the `#[repr(C)]` runtime block a compiled block receives, and the helpers a
 //! block calls: [`jit_step_one`] — the per-instruction deopt for the first
 //! instruction the block could not lower natively (a suspending `receive` is handed
 //! back to the driver through [`WAIT_BIT`], so a blocking-aware driver can report it
-//! as a suspension) — and [`jit_tail_call`], the checked frame pop a **linked local
+//! as a suspension) — [`jit_ext_call`], the native arm of a `call_ext*` (the import
+//! resolution plus the variant's frame discipline, handed to the driver as the
+//! [`ENTER`] word) — and [`jit_tail_call`], the checked frame pop a **linked local
 //! tail call** uses (see [`super::emit::link`]). See `super` for the block ABI as a
 //! whole, the emitter that produces blocks and the driver that decodes the words
 //! these items produce.
@@ -35,11 +37,12 @@ use crate::interpreter::LabelMap;
 use std::mem;
 
 use beam_common::BeamError;
-use beam_loader::Module;
+use beam_loader::{ImportRef, Module};
 use beam_term::Eterm;
 
 use crate::context::ExecutionContext;
-use crate::machine::Machine;
+use crate::error;
+use crate::machine::{Continuation, Machine};
 use crate::Step;
 
 // ---------------------------------------------------------------------------
@@ -177,6 +180,10 @@ pub(crate) type StepHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, u32, u32
 /// successor word and the frame size a local `call_last` pops).
 pub(crate) type TailHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, i64, u32) -> i64;
 
+/// The `jit_ext_call` helper's native signature (the block ABI plus the
+/// instruction's own `(func, pc)`, the `ImportRef` index, the [`EXT_CALL`]-family
+/// kind and — for `call_ext_last` — the frame size to pop).
+pub(crate) type ExtCallHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, u32, u32, u32, u32, u32) -> i64;
 /// The `jit_set_position` helper's native signature (the block ABI plus the block's
 /// own `(func, pc)`); it returns nothing — a position store cannot fail.
 pub(crate) type PositionHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, u32, u32);
@@ -261,6 +268,154 @@ pub(crate) extern "C" fn jit_step_one(rt: *mut JitRuntime<'_>, func: u32, pc: u3
             ERROR
         }
     }
+}
+
+/// The kind of `call_ext*` a [`jit_ext_call`] call describes: `call_ext Arity Bif` —
+/// the caller's frame is kept and the return address stored in it.
+pub(crate) const EXT_CALL: u32 = 0;
+
+/// The kind of `call_ext*` a [`jit_ext_call`] call describes: `call_ext_only Arity
+/// Bif` — a tail call, so the caller's frame is reused unchanged.
+pub(crate) const EXT_CALL_ONLY: u32 = 1;
+
+/// The kind of `call_ext*` a [`jit_ext_call`] call describes: `call_ext_last Arity
+/// Bif Deallocate` — the caller's frame is popped before the callee is entered.
+pub(crate) const EXT_CALL_LAST: u32 = 2;
+
+/// The **`call_ext*`** helper: resolve the import through the host's cross-module-call
+/// seam and, when it answers, apply the variant's frame discipline and hand the
+/// callee to the driver as the [`ENTER`] word — the same transfer [`jit_step_one`]
+/// produces for a `Step::Enter`, without paying an interpreter step for the call
+/// instruction itself.
+///
+/// `kind` is one of [`EXT_CALL`]/[`EXT_CALL_ONLY`]/[`EXT_CALL_LAST`] and `deallocate`
+/// the `call_ext_last` frame size (ignored otherwise). The per-variant discipline is
+/// exactly the interpreter's ([`crate::interpreter`]'s `Instr::CallExt*` arms):
+///
+/// * `CallExt` stores `Continuation::Address { func, pc + 1, context: current }` in
+///   the live frame (an `Instr::Call`);
+/// * `CallExtOnly` stores nothing (an `Instr::CallOnly`);
+/// * `CallExtLast` pops the frame with [`Machine::pop_frame_checked`] — the
+///   interpreter's own checked pop — **after** the target resolved, so a bad label
+///   can never leave a popped frame behind (an `Instr::CallLast`).
+///
+/// Anything the host cannot run in this machine — the seam's `Ok(None)` (the
+/// synchronous `call_bif` path, NIFs, the runtime's native floor), an import whose
+/// atoms the module's table lacks, a target label the callee does not define, a
+/// frame discipline that failed — falls back to [`jit_step_one`], which runs the
+/// *entire* instruction through the interpreter. That fallback is what keeps the
+/// synchronous path and every one of its errors byte-identical to the tier before
+/// this arm existed: nothing is mutated before the fallback, so the interpreter sees
+/// exactly the state it would have seen and reports exactly its own error.
+///
+/// The import's `(module name, function name, arity)` is read straight out of the
+/// active module's `ImpT` table and atom table — the same triple the per-run import
+/// cache ([`LabelMap`]'s `import_target`) answers with, including its three typed
+/// errors — and `arity` is the import's **declared** arity, which is what the
+/// interpreter hands the seam.
+pub(crate) extern "C" fn jit_ext_call(
+    rt: *mut JitRuntime<'_>,
+    func: u32,
+    pc: u32,
+    target: u32,
+    kind: u32,
+    deallocate: u32,
+) -> i64 {
+    let resolved = {
+        // SAFETY: the driver passes `rt` as the address of a live, exclusively
+        // borrowed `JitRuntime` and never aliases it for the duration of the call;
+        // every pointer it holds points at an object the driver owns and keeps alive
+        // for the whole loop (`machine`, `module`), or at a local (`labels`) that
+        // outlives the loop.
+        let runtime = unsafe { &mut *rt };
+        // SAFETY: `runtime.machine` is a non-null pointer to the driver's live
+        // `Machine`; no other `&mut Machine` exists while the helper runs.
+        let machine = unsafe { &mut *runtime.machine };
+        // SAFETY: `runtime.module` points at the module the driver is running, which
+        // outlives the loop.
+        let module = unsafe { &*runtime.module };
+        // SAFETY: `runtime.ctx` is the driver's `&mut dyn ExecutionContext` reborrowed
+        // as a raw pointer; the driver holds no `&mut` to it while the helper runs.
+        let ctx = unsafe { &mut *runtime.ctx };
+
+        resolve_ext_entry(
+            machine,
+            module,
+            ImportRef(target),
+            kind,
+            func,
+            pc,
+            deallocate,
+            ctx,
+        )
+    };
+    match resolved {
+        Some((context, callee, callee_pc)) => {
+            // SAFETY: `rt` is the same live, exclusively borrowed `JitRuntime` the
+            // driver owns; the `&mut` derived from it above is dead by now, so this
+            // store does not alias it. The driver takes the slot when it decodes the
+            // `ENTER` word.
+            unsafe { (*rt).enter = Some((context, callee, callee_pc)) };
+            ENTER
+        }
+        // The instruction is the interpreter's to execute (all of it, exactly once).
+        None => jit_step_one(rt, func, pc),
+    }
+}
+
+/// Resolve a `call_ext*` through the host's seam and apply its frame discipline.
+///
+/// `None` means "the interpreter step must run this instruction": the host cannot run
+/// the callee in this machine, the import does not resolve, the callee's entry label
+/// is not in its own label index, or the frame discipline failed. **Nothing has been
+/// mutated** on any of those paths (registering a module context is idempotent, the
+/// continuation store and the frame pop both validate before writing), so the caller's
+/// [`jit_step_one`] fallback re-runs the instruction and produces exactly what the
+/// interpreter would have produced.
+fn resolve_ext_entry(
+    machine: &mut Machine,
+    module: &Module,
+    target: ImportRef,
+    kind: u32,
+    func: u32,
+    pc: u32,
+    deallocate: u32,
+    ctx: &mut dyn ExecutionContext,
+) -> Option<(u32, u32, u32)> {
+    // The import's `(module, function, arity)`. This is the per-call resolution
+    // (`LabelMap::import_target`'s uncached fallback), which is the definition of the
+    // import semantics: an index past the end of `ImpT` and an atom the module's table
+    // does not hold are not resolvable, so the interpreter must report them.
+    let import = module.imports.get(target.0 as usize)?;
+    let module_name = module.atom_name(import.module)?;
+    let function_name = module.atom_name(import.function)?;
+    let (callee, label) = ctx
+        .resolve_external_call(module_name, function_name, import.arity)
+        .ok()??;
+    // Registering is idempotent by the handle's allocation identity, so a recursive or
+    // repeated cross-module call reuses one context (and its already-built label index).
+    let context = machine.register_context(&callee);
+    let handle = machine.module_context(context)?;
+    // The entry label is resolved against the **callee's own** label index, so an
+    // unknown label is never a jump into the wrong module.
+    let (callee_func, callee_pc) = handle.labels.resolve(label).ok()?;
+    let discipline = match kind {
+        EXT_CALL => {
+            // The caller's context, read *before* the store (the callee's context is
+            // the one being entered): a `return` in the callee comes back here.
+            let caller_context = machine.current_context();
+            machine.set_continuation(Continuation::Address {
+                func,
+                pc: pc + 1,
+                context: caller_context,
+            })
+        }
+        EXT_CALL_ONLY => Ok(()),
+        EXT_CALL_LAST => machine.pop_frame_checked(deallocate),
+        _ => Err(error::unsupported("jit: unknown call_ext kind")),
+    };
+    discipline.ok()?;
+    Some((context, callee_func, callee_pc))
 }
 
 /// The **position store** helper: record a compiled block's own `(func, pc)` as the

@@ -86,13 +86,16 @@
 use std::collections::BTreeMap;
 
 use beam_common::Result;
-use beam_loader::{Instr, Module};
+use beam_loader::{ImportRef, Instr, Module};
 
 use crate::interpreter::{self, LabelMap};
 use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg, DEFAULT_CAPACITY};
 
-use super::runtime::{encode_target, PositionHelper, StepHelper, RUNTIME_XREGS_DISP};
-use super::{jit_set_position, jit_step_one, CompiledModule};
+use super::runtime::{
+    encode_target, ExtCallHelper, PositionHelper, StepHelper, EXT_CALL, EXT_CALL_LAST,
+    EXT_CALL_ONLY, RUNTIME_XREGS_DISP,
+};
+use super::{jit_ext_call, jit_set_position, jit_step_one, CompiledModule};
 
 mod aggregate;
 mod arith;
@@ -686,6 +689,48 @@ fn emit_block(
                 }
                 Err(_) => emit_step_and_continue(buffer, done, allocation, func, pc)?,
             },
+            // The **cross-module** calls. Unlike a local `call_*` these enter code
+            // outside this module's compiled blocks, so the transfer is always a
+            // driver round-trip — but the *call itself* no longer needs an
+            // interpreter step: [`emit_ext_call`] performs the import resolution and
+            // the variant's frame discipline in the `jit_ext_call` helper, which
+            // hands the resolved callee back as the `ENTER` word. Everything the
+            // host cannot run in this machine (the synchronous `call_bif` path and
+            // every one of its errors) is exactly the interpreter's own step, taken
+            // by the helper's fallback.
+            Instr::CallExt { target, .. } => {
+                emit_ext_call(
+                    buffer, allocation, done, func, pc, *target, EXT_CALL, 0,
+                )?;
+            }
+            Instr::CallExtOnly { target, .. } => {
+                emit_ext_call(
+                    buffer,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    *target,
+                    EXT_CALL_ONLY,
+                    0,
+                )?;
+            }
+            Instr::CallExtLast {
+                target,
+                deallocate,
+                ..
+            } => {
+                emit_ext_call(
+                    buffer,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    *target,
+                    EXT_CALL_LAST,
+                    *deallocate,
+                )?;
+            }
             // The word-level `test` subset (see the section below): a native
             // predicate plus a branch to the resolved fail label. Any other shape —
             // a `NO_FAIL` test, an unresolved fail label, a boxed-term type test, an
@@ -772,30 +817,36 @@ fn emit_position_store(buffer: &mut CodeBuffer, func: u32, pc: u32) -> Result<()
     buffer.call_r(Reg::R11)
 }
 
-/// Emit the spill-then-helper sequence for instruction `(func, pc)` — **without**
-/// the block exit, so the caller decides what to do with the helper's word.
+/// Emit the spill-then-helper sequence for `helper` — **without** the block exit, so
+/// the caller decides what to do with the helper's word.
 ///
-/// The spill comes **first**: the helper is the interpreter and reads `machine.x`,
-/// which must already hold the values the inline prefix produced. The `rt` slot is
-/// reloaded into `rdi` (the helper's first argument); the helper preserves the
-/// callee-saved registers, so `rbx` (the `machine.x` base) survives it — but the
-/// block must **not** spill after the call: the helper legitimately wrote
-/// `machine.x`.
+/// The spill comes **first**: every helper reads `machine.x` (the interpreter itself
+/// for [`jit_step_one`], the frame discipline of `call_ext_last` for
+/// [`jit_ext_call`]), which must already hold the values the inline prefix produced.
+/// The `rt` slot is reloaded into `rdi` (every helper's first argument) and `args`
+/// fills the remaining integer argument registers in ABI order (`rsi`, `rdx`, `rcx`,
+/// `r8`, `r9`); a helper preserves the callee-saved registers, so `rbx` (the
+/// `machine.x` base) survives the call — but the block must **not** spill after it:
+/// the helper legitimately wrote `machine.x`.
 ///
 /// The helper's result word is left in `rax` (the block ABI's return register) for
-/// the caller's continuation check.
+/// the caller's continuation check. Passing the helper as a raw pointer keeps the
+/// call sites' own function-pointer types (`StepHelper`, `ExtCallHelper`) as the
+/// type check on its signature.
 fn emit_helper_call(
     buffer: &mut CodeBuffer,
     allocation: &Allocation,
-    func: u32,
-    pc: u32,
+    helper: *const (),
+    args: &[i64],
 ) -> Result<()> {
     spill(buffer, allocation)?;
     buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)?;
-    buffer.mov_ri(Reg::Rsi, i64::from(func))?;
-    buffer.mov_ri(Reg::Rdx, i64::from(pc))?;
-    let helper: StepHelper = jit_step_one;
-    buffer.mov_ri(Reg::R11, helper as *const () as i64)?;
+    // The `rsi`/`rdx`/`rcx`/`r8`/`r9` argument registers, in ABI order.
+    const ARG_REGISTERS: [Reg; 5] = [Reg::Rsi, Reg::Rdx, Reg::Rcx, Reg::R8, Reg::R9];
+    for (reg, value) in ARG_REGISTERS.iter().zip(args) {
+        buffer.mov_ri(*reg, *value)?;
+    }
+    buffer.mov_ri(Reg::R11, helper as i64)?;
     buffer.call_r(Reg::R11)
 }
 
@@ -809,8 +860,8 @@ fn emit_helper_call(
 ///   instruction at `pc` and the block can carry on at `pc + 1`, so the emitted code
 ///   refills the cached x-registers (mandatory: the helper *is* the interpreter and
 ///   wrote `machine.x`) and **falls through** to the next instruction's lowering;
-/// * any other word (`Goto`/`HALT`/`ERROR`, and the `Wait` → `blocked` error) → jump
-///   to the block epilogue with that word in `rax`, exactly as before.
+/// * any other word (`Goto`/`HALT`/`ERROR`/`ENTER`, and the `Wait` → `blocked`
+///   error) → jump to the block epilogue with that word in `rax`, exactly as before.
 ///
 /// Continuing in-block rather than leaving the block is what makes native coverage
 /// independent of where a block's first non-inlinable instruction sits: the
@@ -823,7 +874,72 @@ pub(super) fn emit_step_and_continue(
     func: u32,
     pc: u32,
 ) -> Result<()> {
-    emit_helper_call(buffer, allocation, func, pc)?;
+    let helper: StepHelper = jit_step_one;
+    emit_helper_call(
+        buffer,
+        allocation,
+        helper as *const (),
+        &[i64::from(func), i64::from(pc)],
+    )?;
+    emit_continue_check(buffer, done, allocation, func, pc)
+}
+
+/// Emit the native arm for one `call_ext*` instruction: the `jit_ext_call` helper
+/// (import resolution + frame discipline) followed by the same continuation check a
+/// deopt uses.
+///
+/// The two outcomes the emitted code distinguishes are exactly the tier's:
+///
+/// * `encode_target(func, pc + 1)` — the helper fell back to the interpreter, which
+///   ran the instruction and advanced by one (the synchronous `call_bif` path), so
+///   the cached x-registers are refilled and the block continues at `pc + 1`;
+/// * anything else — the `ENTER` word of a resolved cross-module transfer (this arm's
+///   whole point), and `HALT`/`ERROR`/`WAIT` — jumps to the block epilogue with the
+///   word in `rax`, which the driver decodes exactly as it decodes a deopt's.
+///
+/// `kind`/`deallocate` select the variant ([`EXT_CALL`], [`EXT_CALL_ONLY`],
+/// [`EXT_CALL_LAST`] + the frame size to pop).
+#[allow(clippy::too_many_arguments)]
+fn emit_ext_call(
+    buffer: &mut CodeBuffer,
+    allocation: &Allocation,
+    done: CodeLabel,
+    func: u32,
+    pc: u32,
+    target: ImportRef,
+    kind: u32,
+    deallocate: u32,
+) -> Result<()> {
+    let helper: ExtCallHelper = jit_ext_call;
+    emit_helper_call(
+        buffer,
+        allocation,
+        helper as *const (),
+        &[
+            i64::from(func),
+            i64::from(pc),
+            i64::from(target.0),
+            i64::from(kind),
+            i64::from(deallocate),
+        ],
+    )?;
+    emit_continue_check(buffer, done, allocation, func, pc)
+}
+
+/// Emit the shared tail of a helper sequence: continue in-block when the helper's word
+/// in `rax` is exactly "the next instruction" (`Step::Next`), otherwise leave the block
+/// with that word in `rax` for the driver to decode.
+///
+/// The refill is what makes the continuation legal: every helper that can produce
+/// `Next` is the interpreter and wrote `machine.x`, so the block's cached x-registers
+/// are stale.
+fn emit_continue_check(
+    buffer: &mut CodeBuffer,
+    done: CodeLabel,
+    allocation: &Allocation,
+    func: u32,
+    pc: u32,
+) -> Result<()> {
     // `rax` holds the helper's word; only "the next instruction" continues here.
     buffer.mov_ri(Reg::R11, encode_target(func, pc + 1))?;
     buffer.cmp_rr(Reg::Rax, Reg::R11)?;
