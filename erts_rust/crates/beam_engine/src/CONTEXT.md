@@ -26,16 +26,20 @@ execution semantics are documented one level up in `../CONTEXT.md` (read it firs
   `ExecutionContext::reduce(n) -> Result<()>`, charged **once per interpreted instruction** by
   `Machine::drive` and observed through `Machine::reductions()`/`reset_reductions()`; a host
   pre-empts by returning its own typed error from `reduce`.
-- **`Step::Enter` is interpreter-only.** A raise that lands in a catch frame belonging to another
-  module context, a resolved cross-module `call_ext`, and a cross-module `return` onto a
-  caller-context continuation all cross the module boundary as `Step::Enter`; the driver switches
-  the context and re-binds the literal area there. The native tiers report the typed
-  `unsupported("jit: module context switch outside the interpreter driver")` for it — never a
-  silently wrong block. Because cross-module landing works, a raise inside a cross-module callee
-  (`gen:call`'s `exit(noproc)` inside `gen_server:call/3`'s `catch`, say) is caught and unwound
-  exactly as the oracle does; the reason a caller then sees is whatever the callee's own wrapper
-  built (a compound term, carried out in the `Raise` live-reason slot, never reshaped).
-- `unsafe` only in the modules marked at the crate level (`terms`, `predicates`), each with its
+- **`Step::Enter` crosses the module boundary on every tier.** A raise that lands in a catch frame
+  belonging to another module context, a resolved cross-module `call_ext`, and a cross-module
+  `return` onto a caller-context continuation all cross the module boundary as `Step::Enter`; the
+  driver switches the context and re-binds the literal area there. The **interpreter** driver
+  (`Machine::drive`) handles it directly; the **native baseline tier** handles it too — a block
+  returns the `ENTER` block-ABI word, the driver switches context (reusing `Machine::switch_context` +
+  the context registry + the literal rebind, exactly as `Machine::drive` does) and re-enters the
+  callee's compiled blocks when the tier has them (else its per-instruction step). A seal-time
+  cross-module *link* is unsound (each `CompiledModule` owns a separate executable mapping, `rel32`
+  fixups are buffer-local, and the entry module is baked into `JitRuntime`), so the transfer stays a
+  **driver round-trip by design**. Because cross-module landing works, a raise inside a cross-module
+  callee (`gen:call`'s `exit(noproc)` inside `gen_server:call/3`'s `catch`, say) is caught and
+  unwound exactly as the oracle does; the reason a caller then sees is whatever the callee's own
+  wrapper built (a compound term, carried out in the `Raise` live-reason slot, never reshaped).- `unsafe` only in the modules marked at the crate level (`terms`, `predicates`), each with its
   `// SAFETY:` rationale, plus the modules carrying a module-local `#![allow(unsafe_code)]` under
   the crate-wide deny (`context.rs` — the `MinimalContext` region heap is the crate's raw
   `beam_alloc::ReservedHeap` bump seam — `families/bitstrings/raw.rs`, `families/records/raw.rs`,

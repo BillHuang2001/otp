@@ -616,9 +616,8 @@ fn a_wait_inside_a_cross_module_callee_resumes_to_a_returned_value() {
 }
 
 // ---------------------------------------------------------------------------
-// the interpreter tier entry and the documented native-tier limitation
+// the interpreter tier entry and the baseline tier's native context switch
 // ---------------------------------------------------------------------------
-
 #[test]
 fn the_interpreter_tier_entry_reports_the_same_cross_module_suspend() {
     // The tier-selecting outcome entry with `Tier::Interpreter` is the same
@@ -635,25 +634,27 @@ fn the_interpreter_tier_entry_reports_the_same_cross_module_suspend() {
 }
 
 #[test]
-fn a_native_tier_reports_a_typed_error_for_a_resolved_cross_module_call() {
-    // A module-context switch is an interpreter-driver capability: a compiled
-    // block's module, label map and literal area are all bound for ONE module. The
-    // baseline tier must therefore report a typed error — never a silently wrong
-    // block, and never a silent fallback to the synchronous path.
+fn the_baseline_tier_executes_a_resolved_cross_module_call() {
+    // A resolved cross-module call now executes on the native baseline tier via a
+    // driver-mediated module-context switch (`call_ext`/`call_ext_only`/
+    // `call_ext_last`): a seal-time cross-module link is unsound (each compiled
+    // module owns a separate executable mapping and its `rel32` fixups are
+    // buffer-local), so the transfer is a driver round-trip that switches module
+    // context and re-enters the callee. The baseline tier therefore reports the
+    // SAME outcome the interpreter tier does for the same module — here the
+    // callee's own `receive` suspends the driving process at the callee's address
+    // (the callee module is not in the tier's block store, so it runs on the
+    // per-instruction interpreter step, exactly as an uncompiled address does).
     let (caller, run) = caller_module("recv");
     let mut ctx = SeamCtx::new(callee(), rejecting());
     let mut machine = Machine::new();
 
-    let err = machine
+    let outcome = machine
         .run_export_outcome_with_tier(&caller, run, 0, &[], &mut ctx, Tier::BaselineJit)
-        .expect_err("the native tier cannot switch module contexts");
+        .expect("a suspend is not an error");
 
-    assert_eq!(
-        reason(err),
-        "unsupported_opcode: jit: module context switch outside the interpreter driver"
-    );
+    assert_eq!(outcome, RunOutcome::Wait { func: 1, pc: 0 });
 }
-
 // ---------------------------------------------------------------------------
 // the seam's `Ok(None)` default is a no-op for any other external
 // ---------------------------------------------------------------------------

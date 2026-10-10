@@ -28,7 +28,7 @@
 //! faster: that is environment-dependent and would be flaky; the printed numbers are
 //! the evidence.
 //!
-//! The harness and the nine workloads live in `beam_engine::jit::bench` (the crate's
+//! The harness and the ten workloads live in `beam_engine::jit::bench` (the crate's
 //! single JIT-measurement module — see its `CONTEXT.md` for the workload set, the
 //! method and the caveats). This file owns the two `#[test]` entry points:
 //!
