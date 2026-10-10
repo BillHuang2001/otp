@@ -501,6 +501,13 @@ dominates the small shapes.)
   today nothing sweeps them, the `Message`'s own `Drop` releases them. A **fragmented** message instead
   leaves those lists empty: its payload's off-heap objects live in the fragment's `off_heap` table until
   `Fragments::move_into` hands them to the destination table.
+- **Copy-coverage gap: boxed floats and bignums are never exercised.** No test under `tests/` builds or
+  copies a `HEADER_FLONUM` float or a `HEADER_POS_BIG`/`HEADER_NEG_BIG` bignum (the only appearance of a
+  float header is the *bare non-term* `HEADER_FLONUM` in `guards.rs`), so the copier's generic
+  `object_words`+`copy_nonoverlapping` arm is untested for those two classes. The LCA sizes them
+  correctly (`beam_term::layout::object_words`'s default arm = `thing_arityval + 1`, i.e. `2` for a
+  flonum and `big_size_words(n)` for a bignum), but a regression there would not be caught. HAMT
+  *collision* tuples are likewise unexercised (`copy.rs` deliberately does not force one).
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude` (incl. `is_message_heap_exhaustion`)
 - `src/copy.rs` → the iterative `copy_struct` engine (the `unsafe` core) + `CopyContext` + the cycle-safe `preflight_words`/`bounded_words`/`is_acyclic` + `size_of_copy`
