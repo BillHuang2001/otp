@@ -338,6 +338,29 @@ impl Machine {
             .map(|(func, pc, _context)| (func, pc))
             .collect()
     }
+
+    /// The **raise-time snapshot** of the pre-unwind frame chain: the engine's
+    /// replacement for C's saved raw `StackTrace` (`c_p->ftrace`).
+    ///
+    /// Each entry is `(context, func, pc)` — the **raising** frame first, then every
+    /// live caller innermost-first, the same order C's `build_stacktrace` emits. It
+    /// is rebuilt by [`Machine::throw_with_trace`] *before* it unwinds the call-frame
+    /// stack, so it still names the frames a raise unwound out of by the time the
+    /// handler's `build_stacktrace` runs (the live call frames no longer hold them).
+    /// Empty until a raise has happened since the last [`Machine::reset`].
+    ///
+    /// Read-only introspection; a resume ([`Machine::resume_outcome`]) preserves it
+    /// (only [`Machine::reset`] clears it).
+    ///
+    /// The consumer is the exception handler's `build_stacktrace` (the handler
+    /// opcodes in `crate::families::exceptions`), which runs *after* the raise
+    /// unwound — hence the snapshot; until that reads it the accessor has no
+    /// production caller (`#[allow(dead_code)]`, matching `Contexts::len`).
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn raise_snapshot(&self) -> &[(u32, u32, u32)] {
+        &self.raise_snapshot
+    }
 }
 
 #[cfg(test)]

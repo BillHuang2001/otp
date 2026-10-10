@@ -172,6 +172,20 @@ pub struct Machine {
     /// process blocked in, which is how a resume recovers the module identity of
     /// the reported `(func, pc)`.
     pub(crate) context: u32,
+    /// The **raise-time snapshot** of the pre-unwind frame chain: the engine's
+    /// replacement for C's saved raw `StackTrace` (`c_p->ftrace`).
+    ///
+    /// Each entry is `(context, func, pc)`: the **raising** frame first, then every
+    /// live caller innermost-first — the order C's `build_stacktrace` emits. It is
+    /// rebuilt by [`Machine::throw_with_trace`] **before** it unwinds the
+    /// call-frame stack, so the handler's `build_stacktrace` (and the uncaught
+    /// funnel [`Machine::with_uncaught_frames`]) can still name the frames the
+    /// raise unwound out of. Read back through [`Machine::raise_snapshot`].
+    ///
+    /// Cleared by [`Machine::reset`] (the snapshot belongs to the run that is
+    /// starting) but **not** by a resume ([`Machine::resume_outcome`]), which must
+    /// preserve it along with the machine's other suspended state.
+    pub(crate) raise_snapshot: Vec<(u32, u32, u32)>,
     /// The **off-heap ref-counted binary payloads** this machine has built.
     ///
     /// A binary larger than [`beam_term::refc::ERL_ONHEAP_BINARY_LIMIT`] is stored
@@ -292,6 +306,7 @@ impl Machine {
             entry_literals: None,
             contexts: Contexts::new(),
             context: 0,
+            raise_snapshot: Vec::new(),
             refc_binaries: Vec::new(),
             args_scratch: Vec::new(),
             trace_on: false,

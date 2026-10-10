@@ -224,6 +224,12 @@ impl Machine {
         // module handle it must be resumed in.
         self.contexts.clear();
         self.context = 0;
+        // The raise-time snapshot belongs to the run that is starting too: it is the
+        // pre-unwind frame chain of whichever raise last happened, and a fresh run
+        // begins with no raise in flight. As with `contexts`, `resume_outcome`
+        // deliberately does **not** reset, so a raise that suspended the process
+        // keeps its snapshot until the process resumes and raises again.
+        self.raise_snapshot.clear();
         // The execution-position introspection belongs to the run that is starting:
         // `step_instruction` re-records `current_code` and `run_loop` re-records
         // `entry_call` (the `$initial_call` analogue).
