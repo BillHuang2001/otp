@@ -46,6 +46,7 @@ Only **frozen contracts and non-obvious behaviour** are listed; rustdoc carries 
   · `PortCommandOptions { nosuspend, force }` — carried/validated but no-ops (ports never busy; the BIF layer owns their effect once a busy-port command queue exists).
 - `Port` — owns a `Box<dyn Driver>` + the two byte queues; the scheduling surface (`queue_output`/`schedule_task`/`schedule_timeout`/`arm_timeout`/`cancel_timeout`/`next_timeout`/`pending_tasks`/`next_task`/`has_pending_task`/`timeout`) and the exit/async/stream surfaces (`take_exit_status`/`take_eof`/`has_pending_async`/`drive_async`/`notify_exit`).
   **Every driver interaction** (`start`/`output`/`ready_input`/`ready_output`/`control`/`timeout`) refreshes the port timer from `Driver::next_timeout` via `refresh_timeout`: `Some(d)` arms/**re-points** the single `TIMEOUT` task at `d`, `None` clears it.
+  A driver write (`output`/`ready_output`) is **verified**: the port checks the output queue shrank by exactly the count the driver reported (a mismatch is the typed `error::unsupported(...)`, guarding the write-accounting invariant against duplicated bytes) and schedules an `OUTPUT` task whenever the queue is left non-empty, so a short write cannot stall without re-driving.
   Re-exports `PortRegistry`.
 
 ### `registry.rs`
