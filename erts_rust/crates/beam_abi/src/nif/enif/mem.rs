@@ -35,6 +35,12 @@
 //!   [`enif_realloc_binary`] may `free`/`realloc` it.
 //! * `__spare__[0] != null` (the sentinel `1 as *mut c_void`) — **inspected**: the payload points
 //!   into the BEAM heap; release is a no-op.
+//!
+//! A binary family view is therefore one of three shapes: a zero-copy *inspected* window (a
+//! byte-aligned bitstring base), an *owned* fresh buffer (an `enif_alloc_binary` block, a
+//! flattened iolist, or the copy [`enif_inspect_binary`] makes of a **byte-sized** bitstring
+//! whose start is not byte-aligned — the C's env-owned tmp object, which this crate has no
+//! env-local allocator for, so the buffer is released by [`enif_release_binary`] instead).
 
 use super::*;
 
@@ -224,22 +230,91 @@ pub unsafe extern "C" fn enif_inspect_binary(
     }
     // SAFETY: as above; `bitstring_parts` reports `(base, bit_offset, bit_size)`.
     let (base, offset, _) = unsafe { prelude::bitstring_parts(term) };
-    if offset & 7 != 0 || base.is_null() {
-        // An unaligned base cannot be exposed as a byte buffer without a copy; refuse honestly.
+    if base.is_null() {
+        // A null data base can be neither exposed nor copied from; refuse rather than dereference.
         return 0;
     }
-    // SAFETY: the payload starts at `base + offset/8` and is `bits/8` bytes long.
-    let payload = unsafe { base.add(offset / 8) }.cast_mut();
-    // SAFETY: `bin` is non-null and writable; `payload` borrows the live term's storage.
+    if offset & 7 == 0 {
+        // SAFETY: the payload starts at `base + offset/8` and is `bits/8` bytes long.
+        let payload = unsafe { base.add(offset / 8) }.cast_mut();
+        // SAFETY: `bin` is non-null and writable; `payload` borrows the live term's storage.
+        unsafe {
+            bin.write(ErlNifBinary {
+                size: bits / 8,
+                data: payload,
+                ref_bin: core::ptr::null_mut(),
+                __spare__: [INSPECTED as *mut c_void, core::ptr::null_mut()],
+            });
+        }
+        return 1;
+    }
+    // A *byte-sized* window whose start is not byte-aligned: the C always returns `1` here and
+    // materialises the real bits with `erts_copy_bits_fwd(base, offset, bin->data, 0, size)`
+    // into an env-owned tmp buffer (`erl_nif.c:1353-1362`). This crate's `NifEnv` has no
+    // tmp-object list, so the copy is handed back as an **owned** buffer instead: the pointer is
+    // non-NULL, `size` is the real byte count, and `__spare__[0]` stays null so
+    // [`enif_release_binary`] frees it exactly once. A NIF that never releases the view leaks
+    // (safe, and the same contract [`enif_inspect_iolist_as_binary`] already gives a flattened
+    // iolist); the bits exposed are always the term's own, never uninitialised bytes.
+    let len = bits / 8;
+    let alloc_bytes = if len == 0 { 1 } else { len };
+    // SAFETY: a fresh writable `alloc_bytes`-byte block.
+    let data = unsafe { libc::malloc(alloc_bytes) }.cast::<c_uchar>();
+    if data.is_null() {
+        return 0;
+    }
+    // SAFETY: `data` is writable for `len` bytes and is disjoint from the live term's storage.
+    unsafe { copy_bits_fwd(term, bits, data) };
+    // SAFETY: `bin` is non-null and writable; the null marker records the copy as owned.
     unsafe {
         bin.write(ErlNifBinary {
-            size: bits / 8,
-            data: payload,
+            size: len,
+            data,
             ref_bin: core::ptr::null_mut(),
-            __spare__: [INSPECTED as *mut c_void, core::ptr::null_mut()],
+            __spare__: [core::ptr::null_mut(), core::ptr::null_mut()],
         });
     }
     1
+}
+
+/// Assemble the `bits`-bit window of the bitstring `term` into the byte-aligned buffer `dst`,
+/// most-significant-bit first — the C's `erts_copy_bits_fwd(base, offset, dst, 0, bits)`
+/// (`erl_nif.c:1359`) behind both `enif_inspect_binary`'s unaligned case and the iolist
+/// flattening (`erl_iolist.c` `erts_iolist_to_buf`).
+///
+/// `bits` must be a multiple of 8, `dst` writable for `bits / 8` bytes and disjoint from the
+/// term's storage.
+///
+/// Output byte `k` is source bits `offset + 8k .. offset + 8k + 8`; when `offset` is not
+/// byte-aligned those 8 bits straddle the source bytes `base[(offset + 8k) / 8]` and its
+/// successor, combined as `(hi << 8 | lo) >> (8 - offset % 8)`. The successor is read **only**
+/// for a non-aligned offset, where the window's last needed bit (`offset + bits - 1`) lands in
+/// it — a bit `bitstring_parts` guarantees the base covers, so the read stays in range.
+///
+/// # Safety
+///
+/// `term` must be a live bitstring whose `bitstring_parts` base covers `offset + bits` bits
+/// (`bits` a multiple of 8); `dst` must be non-null and writable for `bits / 8` bytes.
+unsafe fn copy_bits_fwd(term: Eterm, bits: usize, dst: *mut u8) {
+    // SAFETY: `term` is a live bitstring (caller contract).
+    let (base, offset, _) = unsafe { prelude::bitstring_parts(term) };
+    for k in 0..(bits / 8) {
+        let bit = offset + k * 8;
+        let r = bit & 7;
+        // SAFETY: the base covers bits `offset .. offset + bits`, so byte `bit / 8` is readable.
+        let hi = unsafe { *base.add(bit >> 3) } as u16;
+        let byte = if r == 0 {
+            hi as u8
+        } else {
+            // SAFETY: `r != 0`, so this output byte's last source bit is `bit + 7`, which is a bit
+            // the window covers and so lies in `base[(bit / 8) + 1]` (in range; `r == 0` above
+            // avoids ever touching the byte past the window).
+            let lo = unsafe { *base.add((bit >> 3) + 1) } as u16;
+            ((hi << 8 | lo) >> (8 - r)) as u8
+        };
+        // SAFETY: `k < bits / 8`, so `dst + k` is inside the caller's `bits / 8`-byte buffer.
+        unsafe { dst.add(k).write(byte) };
+    }
 }
 
 /// Append the flattened bytes of the iolist **object** `obj` to `out`; `false` on a type error.
@@ -305,20 +380,38 @@ fn flatten_iolist_element(head: Eterm, out: &mut Vec<u8>) -> bool {
     false
 }
 
-/// Append the bytes of the byte-aligned bitstring `term` (`false` when its base is not byte-aligned).
+/// Append the bytes of the byte-sized bitstring `term` to `out` (`false` when it has no whole
+/// number of bytes, or a null data base).
+///
+/// A byte-aligned base is copied straight out of the term's storage; a **bit-offset** window is
+/// reassembled with [`copy_bits_fwd`], exactly as the C's `erts_iolist_to_buf` does
+/// (`erl_iolist.c:269-305`, which copies a `head_offset`-shifted bitstring bitwise), so a
+/// byte-sized bitstring at a non-byte-aligned offset contributes its real bytes rather than
+/// failing the whole iolist.
 fn push_bitstring_bytes(term: Eterm, out: &mut Vec<u8>) -> bool {
     // SAFETY: `term` is a live byte-aligned bitstring (the caller tested `is_binary`).
     let bits = unsafe { prelude::bitstring_size(term) };
-    // SAFETY: as above; `bitstring_parts` reports `(base, bit_offset, bit_size)`.
-    let (base, offset, _) = unsafe { prelude::bitstring_parts(term) };
-    if offset & 7 != 0 || base.is_null() {
-        // An unaligned base cannot be exposed as a byte run without a bit-shifting copy; refuse
-        // honestly rather than emit shifted bytes.
+    if bits & 7 != 0 {
+        // A non-byte-sized bitstring is a type error inside an iolist (`erl_iolist.c:170-174`).
         return false;
     }
-    // SAFETY: the payload starts at `base + offset/8` and is `bits/8` bytes long (`is_binary`).
-    let bytes = unsafe { core::slice::from_raw_parts(base.add(offset / 8), bits / 8) };
-    out.extend_from_slice(bytes);
+    // SAFETY: as above; `bitstring_parts` reports `(base, bit_offset, bit_size)`.
+    let (base, offset, _) = unsafe { prelude::bitstring_parts(term) };
+    if base.is_null() {
+        return false;
+    }
+    let len = bits / 8;
+    if offset & 7 == 0 {
+        // SAFETY: the payload starts at `base + offset/8` and is `len` bytes long (`is_binary`).
+        let bytes = unsafe { core::slice::from_raw_parts(base.add(offset / 8), len) };
+        out.extend_from_slice(bytes);
+        return true;
+    }
+    let start = out.len();
+    out.resize(start + len, 0);
+    // SAFETY: `out` now holds `len` writable bytes at `start`, disjoint from the term's storage,
+    // and `bits` is a multiple of 8.
+    unsafe { copy_bits_fwd(term, bits, out.as_mut_ptr().add(start)) };
     true
 }
 
@@ -328,7 +421,8 @@ fn push_bitstring_bytes(term: Eterm, out: &mut Vec<u8>) -> bool {
 /// otherwise the term is flattened into a freshly `malloc`'d (owned) buffer the caller must release.
 /// The shape rules are the C's (`erl_nif.c:1385-1407` over `erl_iolist.c:150-233`): an integer is
 /// only ever a **byte in head position** of a cons cell, so a bare integer, a non-byte integer
-/// (`256`, `-1`), an improper-list tail, and a non-byte-aligned bitstring are all refused with `0`.
+/// (`256`, `-1`), an improper-list tail, and a **non-byte-sized** bitstring (`<<1:7>>`) are all
+/// refused with `0`.
 /// An empty iolist (`[]`, or any byte-less one) is accepted with a **non-NULL** dummy `data` and
 /// `size == 0` — the shape `enif_inspect_iolist_as_binary` gives `nil` in the C (`erl_nif.c:1392`).
 ///
