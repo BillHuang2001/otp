@@ -2088,6 +2088,186 @@ mod tests {
         ));
     }
 
+    // -- erts_internal:is_process_alive/2 -------------------------------------
+
+    /// Oracle: `erts_internal:is_process_alive(self(), make_ref())` ⇒ `ok`. The C's
+    /// contract is an argument test plus a *queued* is-alive request
+    /// (`erl_bif_info.c:4058-4067`), so the BIF's own return value is the atom `ok`
+    /// whenever the arguments pass.
+    #[test]
+    fn is_process_alive_2_answers_ok_for_a_pid_and_a_runtime_reference() {
+        let mut runtime = runtime();
+        let me = call(&mut runtime, "erlang", "self", &[]).expect("self/0");
+        let reference = call(&mut runtime, "erlang", "make_ref", &[]).expect("make_ref/0");
+
+        let answer = erts(&mut runtime, "is_process_alive", &[me, reference])
+            .expect("a pid and a runtime reference");
+        assert_eq!(runtime.atom_name_of(answer), Some("ok"));
+    }
+
+    /// Oracle: `(foo, Ref)`, `(self(), foo)`, `(self(), <<1>>)`, `(self(), [])` and
+    /// `(self(), binary_to_term(<<131,90,…>>))` all ⇒ `error:badarg` — the C tests
+    /// `is_internal_pid(Arg1) && is_internal_ordinary_ref(Arg2)`, and a wire
+    /// `EXTERNAL_REFERENCE` is *not* an ordinary ref thing either, so this arm's
+    /// runtime-reference test agrees with the oracle there (agreement, not a divergence).
+    #[test]
+    fn is_process_alive_2_rejects_a_non_pid_and_a_non_runtime_reference() {
+        let mut runtime = runtime();
+        let me = call(&mut runtime, "erlang", "self", &[]).expect("self/0");
+        let reference = call(&mut runtime, "erlang", "make_ref", &[]).expect("make_ref/0");
+
+        let foo = atom(&mut runtime, "foo");
+        let not_a_reference = binary(&mut runtime, &[1, 2]);
+        assert!(matches!(
+            erts(&mut runtime, "is_process_alive", &[foo, reference]),
+            Err(BeamError::BadArg)
+        ));
+        assert!(matches!(
+            erts(&mut runtime, "is_process_alive", &[me, foo]),
+            Err(BeamError::BadArg)
+        ));
+        assert!(matches!(
+            erts(&mut runtime, "is_process_alive", &[me, not_a_reference]),
+            Err(BeamError::BadArg)
+        ));
+        assert!(matches!(
+            erts(&mut runtime, "is_process_alive", &[me, NIL]),
+            Err(BeamError::BadArg)
+        ));
+
+        // The wire `EXTERNAL_REFERENCE` image the `term_type/1` test also decodes.
+        let image = binary(
+            &mut runtime,
+            &[131, 90, 0, 1, 118, 0, 2, 110, 49, 0, 0, 0, 1, 0, 0, 0, 2],
+        );
+        let external =
+            call(&mut runtime, "erlang", "binary_to_term", &[image]).expect("binary_to_term/1");
+        assert!(matches!(
+            erts(&mut runtime, "is_process_alive", &[me, external]),
+            Err(BeamError::BadArg)
+        ));
+    }
+
+    /// The discriminating pair, over a pid the process table does **not** hold: `/1`
+    /// consults the table and answers `false`, while `/2` never consults it — it is an
+    /// argument test plus a queued request, so it answers `ok` for a live and an absent
+    /// pid alike (oracle-verified).
+    #[test]
+    fn is_process_alive_2_answers_ok_where_is_process_alive_1_answers_false() {
+        let mut runtime = runtime();
+        let reference = call(&mut runtime, "erlang", "make_ref", &[]).expect("make_ref/0");
+        // `MAX_PROCESS_NUMBER` with serial 1 — a well-formed internal pid no process
+        // table in this test can hold.
+        let absent = make_internal_pid(make_pid_data(1, 0x0FFF_FFFF));
+
+        assert_eq!(
+            ok_name(&mut runtime, "is_process_alive", &[absent]),
+            "false"
+        );
+        let answer = erts(&mut runtime, "is_process_alive", &[absent, reference])
+            .expect("the /2 form answers ok");
+        assert_eq!(runtime.atom_name_of(answer), Some("ok"));
+    }
+
+    // -- erts_internal:process_flag/3 -----------------------------------------
+
+    /// Oracle: `erts_internal:process_flag(self(), save_calls, 7)` ⇒ `0`;
+    /// `… save_calls, 4` ⇒ `7`; `… save_calls, 0` ⇒ `4` — `process_flag_aux`'s
+    /// `save_calls` arm (`bif.c:1896-2022`) installs the buffer length and returns the
+    /// **previous** one (`0` when there was none).
+    #[test]
+    fn process_flag_3_save_calls_answers_the_previous_length() {
+        let mut runtime = runtime();
+        let me = call(&mut runtime, "erlang", "self", &[]).expect("self/0");
+        let save_calls = atom(&mut runtime, "save_calls");
+
+        for (value, previous) in [(7i64, 0i64), (4, 7), (0, 4)] {
+            let answer = erts(
+                &mut runtime,
+                "process_flag",
+                &[me, save_calls, make_small(value)],
+            )
+            .expect("the calling process");
+            assert_eq!(signed_value(answer), previous, "save_calls {value}");
+        }
+    }
+
+    /// The direct form implements **only** `save_calls` — `process_flag/2`'s own flag
+    /// chain is a *different* function (`bif.c:2262-2297` vs `:1896-2022`), so the oracle
+    /// rejects `trap_exit` here even though `erlang:process_flag(trap_exit, true)`
+    /// succeeds. A `save_calls` value that is not a small integer (`true`) or is outside
+    /// `0..=10000` (`-1`, `10001`) is `error:badarg`; the top of the range is accepted.
+    #[test]
+    fn process_flag_3_is_the_bare_process_flag_aux_surface() {
+        let mut runtime = runtime();
+        let me = call(&mut runtime, "erlang", "self", &[]).expect("self/0");
+        let save_calls = atom(&mut runtime, "save_calls");
+        let trap_exit = atom(&mut runtime, "trap_exit");
+        let true_ = atom(&mut runtime, "true");
+
+        assert!(matches!(
+            erts(&mut runtime, "process_flag", &[me, trap_exit, true_]),
+            Err(BeamError::BadArg)
+        ));
+        for value in [true_, make_small(-1), make_small(10_001)] {
+            assert!(
+                matches!(
+                    erts(&mut runtime, "process_flag", &[me, save_calls, value]),
+                    Err(BeamError::BadArg)
+                ),
+                "save_calls {value:?}"
+            );
+        }
+
+        // Rejections above are side-effect free, so the buffer is still empty.
+        let answer = erts(
+            &mut runtime,
+            "process_flag",
+            &[me, save_calls, make_small(10_000)],
+        )
+        .expect("10000 is in range");
+        assert_eq!(signed_value(answer), 0);
+    }
+
+    /// Oracle: a **non-pid** first argument is the *value* atom `badtype`
+    /// (`BIF_RET(am_badtype)`, `bif.c:2290-2293`) — not a raise, and not `badarg` — for
+    /// an atom and for an integer alike.
+    #[test]
+    fn process_flag_3_answers_badtype_for_a_non_pid() {
+        let mut runtime = runtime();
+        let save_calls = atom(&mut runtime, "save_calls");
+        let one = make_small(1);
+
+        for not_a_pid in [atom(&mut runtime, "foo"), make_small(123)] {
+            let answer = erts(&mut runtime, "process_flag", &[not_a_pid, save_calls, one])
+                .expect("badtype is a value, not a raise");
+            assert_eq!(runtime.atom_name_of(answer), Some("badtype"));
+        }
+    }
+
+    /// documented divergence: another **internal** pid is the C's async flag RPC
+    /// (`erts_proc_sig_send_rpc_request`, `bif.c:2284-2289`), whose oracle answer is an
+    /// internal reference (`#Ref<…>`, `erts_internal:process_flag(Child, save_calls, 3)`
+    /// ⇒ e.g. `#Ref<0.2788243652.3908304899.166571>`) with `{Ref, Result}` delivered to
+    /// the caller afterwards. This runtime has no cross-process RPC with a
+    /// reference-keyed reply, so a reference minted here could never be answered; it
+    /// reports the typed capability gap instead of fabricating one.
+    #[test]
+    fn process_flag_3_reports_the_async_rpc_gap_for_another_process() {
+        let mut runtime = runtime();
+        let save_calls = atom(&mut runtime, "save_calls");
+        // A well-formed internal pid this process table does not hold (and never `self()`).
+        let other = make_internal_pid(make_pid_data(1, 0x0FFF_FFFF));
+
+        let error = erts(
+            &mut runtime,
+            "process_flag",
+            &[other, save_calls, make_small(1)],
+        )
+        .expect_err("another process is the async-RPC gap");
+        assert!(error::unsupported_reason(&error).is_some(), "{error}");
+    }
+
     // -- erts_internal:processes_next/1 ---------------------------------------
 
     /// Oracle: `processes_next(1000000000000)` ⇒ `error:badarg` (past the table limit)
@@ -2224,6 +2404,109 @@ mod tests {
         let equal =
             erts(&mut runtime, "cmp_term", &[make_small(1), make_small(1)]).expect("cmp_term/2");
         assert_eq!(signed_value(equal), 0);
+    }
+
+    /// The floor must not claim the names owned **elsewhere** — a claimed arm here would
+    /// shadow the `beam_bifs` registry (or, for `is_system_process/1` and
+    /// `garbage_collect/1`, the `RuntimeHooks` bridge behind it), which is exactly why the
+    /// dispatch order is floor → registry → module load. The assertion is on the floor's
+    /// own [`RuntimeContext::erts_internal_call`], so it stays exact even if the registry's
+    /// coverage grows or shrinks.
+    #[test]
+    fn the_floor_does_not_claim_names_served_elsewhere() {
+        let mut runtime = runtime();
+        for (function, arity) in [
+            ("is_system_process", 1),
+            ("map_hashmap_children", 1),
+            ("map_next", 3),
+            ("counters_new", 1),
+            ("counters_get", 2),
+            ("counters_add", 3),
+            ("counters_put", 3),
+            ("counters_info", 1),
+            ("garbage_collect", 1),
+        ] {
+            let mut sink = NullSink;
+            let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
+            assert!(
+                context.erts_internal_call(function, arity, &[]).is_none(),
+                "erts_internal:{function}/{arity} must fall through to the registry"
+            );
+        }
+    }
+
+    /// The fall-through above is not merely "not owned": the registry serves the
+    /// `counters` family for real, so the same call succeeds through it with the oracle's
+    /// shape.
+    ///
+    /// Oracle: `C = counters:new(2, [])`, `counters:get(C,1)` ⇒ `0`,
+    /// `counters:put(C,1,5)` ⇒ `ok`, `counters:add(C,1,3)` ⇒ `ok`,
+    /// `counters:info(C)` ⇒ `#{max => …, memory => …, min => …, size => 2}` (the
+    /// `max`/`min` pair belongs to `atomics:info/1`). The `memory` figure is this
+    /// runtime's own ERTS-model approximation, so only its presence is pinned.
+    #[test]
+    fn counters_calls_fall_through_to_the_registry() {
+        let mut runtime = runtime();
+        let counters =
+            erts(&mut runtime, "counters_new", &[make_small(2)]).expect("counters_new/1");
+        let one = make_small(1);
+
+        let answer = erts(&mut runtime, "counters_get", &[counters, one]).expect("counters_get/2");
+        assert_eq!(signed_value(answer), 0, "every counter starts at 0");
+
+        let answer = erts(
+            &mut runtime,
+            "counters_put",
+            &[counters, one, make_small(5)],
+        )
+        .expect("put/3");
+        assert_eq!(runtime.atom_name_of(answer), Some("ok"));
+        let answer = erts(
+            &mut runtime,
+            "counters_add",
+            &[counters, one, make_small(3)],
+        )
+        .expect("add/3");
+        assert_eq!(runtime.atom_name_of(answer), Some("ok"));
+        let answer = erts(&mut runtime, "counters_get", &[counters, one]).expect("counters_get/2");
+        assert_eq!(signed_value(answer), 8, "5 + 3");
+
+        let info = erts(&mut runtime, "counters_info", &[counters]).expect("counters_info/1");
+        let entries = terms::map_entries(info).expect("a flat map");
+        let mut size = None;
+        let mut has_memory = false;
+        for (key, value) in &entries {
+            match runtime.atom_name_of(*key) {
+                Some("size") => size = Some(signed_value(*value)),
+                Some("memory") => has_memory = true,
+                _ => {}
+            }
+        }
+        assert_eq!(size, Some(2));
+        assert!(has_memory, "the memory key is present");
+    }
+
+    /// `erts_internal:garbage_collect/1` is a `RuntimeHooks` key the runtime installs no
+    /// provider for, so the floor leaves it alone and the registry's key answers the
+    /// honest typed gap: [`RuntimeHooksBridge::call`]'s fallback arm formats
+    /// `"{module}:{function}/{arity}"`.
+    ///
+    /// documented divergence: `erts_internal:garbage_collect(minor)` ⇒ `true` in the
+    /// oracle (a real minor collection); this runtime has no on-demand collection entry
+    /// point, so it reports the gap rather than a fabricated `true`.
+    ///
+    /// [`RuntimeHooksBridge::call`]: crate::context::RuntimeHooksBridge
+    #[test]
+    fn garbage_collect_is_a_recorded_capability_gap() {
+        let mut runtime = runtime();
+        let minor = atom(&mut runtime, "minor");
+
+        let error = erts(&mut runtime, "garbage_collect", &[minor])
+            .expect_err("no on-demand collection provider is installed");
+        assert_eq!(
+            error::unsupported_reason(&error).as_deref(),
+            Some("erts_internal:garbage_collect/1")
+        );
     }
 
     /// A BIF this module does not serve is `None` from `erts_internal_call`, so the call
