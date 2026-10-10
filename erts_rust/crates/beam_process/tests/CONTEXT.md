@@ -258,10 +258,12 @@ SMP pool:
 ## Routing Table
 - `scheduler.rs`, `messaging.rs`, `signals.rs`, `gc.rs`, `priority.rs`, `pending_signals.rs`,
   `preemption.rs`, `dict.rs`, `fragments.rs`, `scheduler_ports.rs`, `exhaustion.rs`,
-  `signal_exhaustion.rs`, `gc_exemption.rs` →
+  `signal_exhaustion.rs`, `gc_exemption.rs`, `message_relocation.rs` →
   the single-threaded scheduler (incl. the port-aware slice cleanup), mailbox, signals, GC roots, PCB state,
   pre-emption/fairness, the collect-grow-and-retry exhaustion path of `Process::deliver` and the
-  `{'EXIT',…}`/`{'DOWN',…}` signal builders, and the host-controllable GC relocation exemption
+  `{'EXIT',…}`/`{'DOWN',…}` signal builders, the host-controllable GC relocation exemption, and the
+  collection's queued-message re-install (a fragment-resident/off-heap-owning message keeps its whole
+  envelope across a collect)
 - `registry_monitors.rs`, `monitor_tag.rs`, `capability_inventory.rs`, `process_info_source.rs`,
   `spawn_options.rs`, `lifecycle_oracle.rs` → the process-control surface: name registry + monitors (incl.
   the `monitor/3` user tag), the typed-error/capability inventory, the `process_info` item→accessor
