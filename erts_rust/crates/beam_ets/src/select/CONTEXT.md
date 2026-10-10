@@ -72,14 +72,23 @@ its compiled-opcode program. The interior is a Rust AST, not a term program.
   `TermClass::BinRef` → `unsupported_ets` arm is reachable only for a *bare* `BinRef`
   term, which is not a user-visible term. (`tests/select.rs::
   byte_size_and_bit_size_read_an_off_heap_refc_binary_correctly`.)
-- **`is_integer/3` compares the lower bound only.** `guard::is_integer3` accepts a
-  `Value` when `Lower =< Value` **and** `Value >= Upper` (`cmp_arith(value, upper,
-  atoms) != Less` where the oracle's inclusive range needs `!= Greater`), so it
-  misses the interior of the range and over-matches every value at or above
-  `Upper`: over `{1,3}`/`{2,10}`/`{3,30}` with `{'is_integer','$2',5,25}` the
-  oracle selects `[2]` and this crate selects `[3]`. Pinned by the differential
-  case `select_guard_is_integer3` (which therefore FAILS the gate today); the fix
-  is the one comparison in `src/select/expr/guard.rs`.
+- **A bare `{}` (0-arity tuple) as a guard/body expression PANICS.** `decode_tuple`
+  (`src/select/expr/mod.rs:451`) reads `atom_name(elements[0], atoms)` after only
+  the `elements.len() == 1` construct-form check, so an empty tuple indexes an
+  empty slice → index-out-of-bounds panic. `decode` recurses over tuples/lists/maps,
+  so any `{}` reachable as an expression subterm triggers it (a nested `{{{}}}` too;
+  `{{}}` and `{const,{}}` do not). Every entry point that reaches
+  `beam_ets::compile` is affected — `ets:select/2,3`, `select_delete`, `select_count`,
+  `select_reverse/2,3`, `select_replace`, `match/m`, `match_object/…`,
+  `ets:match_spec_compile/1`, `ets:match_spec_run/2`, `ets:match_spec_run_r/3` — and
+  `erlang:match_spec_test/3` (its outer `structural_lint` does not descend into
+  expressions, so the `{}` reaches `beam_ets::match_spec_run`). The oracle raises
+  `badarg` (`ets:select(T,[{'$1',[],[{}]}])`, `ets:select(T,[{'$1',[{}],[ok]}])`,
+  `ets:match_spec_compile([{'$1',[],[{}]}])`) and `erlang:match_spec_test(1,
+  [{'$1',[],[{}]}],table)` returns `{ok,{error,[{error,"{} is neither a function
+  call, nor a tuple (tuples are written {{ ... }})."}]}}`. No existing test covers a
+  bare `{}`. Minimal C-faithful fix: reject an empty tuple in `decode_tuple`
+  (`if elements.is_empty() { return Err(badarg()); }` before the `elements[0]` read).
 - **A map in a HEAD matches structurally; its keys must be LITERAL.** `pattern.rs`
   decodes a head map to `Pattern::Map(Vec<(Eterm, Pattern)>)`: the keys stay
   literal — a variable (`'$N'`) or `'_'` key is `badarg`, at **every** nesting
