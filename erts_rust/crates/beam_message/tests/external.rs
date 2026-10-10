@@ -58,6 +58,16 @@ fn an_external_pid_is_copied_verbatim_and_registers_its_node() {
     };
 
     assert_eq!(dst.used(), size_of_copy(original), "the thing's words are copied verbatim");
+    assert_eq!(
+        dst.used(),
+        size_object(original),
+        "the copy writes exactly the preflighted word count"
+    );
+    assert_eq!(
+        dst.used(),
+        external_pid_size_words(),
+        "the 4-word external pid block, nothing more"
+    );
     assert_ne!(boxed_val(copy), boxed_val(original), "a real copy");
 
     // SAFETY: both terms are live 4-word external pid blocks.
@@ -154,6 +164,18 @@ fn external_port_and_reference_nodes_are_registered_separately() {
         let mut ctx = CopyContext::new(&src_off, &mut dst_off);
         copy_struct(tuple, &mut dst, &mut ctx).expect("the copy succeeds")
     };
+
+    // The whole graph is copied verbatim: the 2-tuple (3 words) plus the port and reference blocks.
+    assert_eq!(
+        dst.used(),
+        size_object(tuple),
+        "the port, reference and tuple words are copied verbatim"
+    );
+    assert_eq!(
+        size_object(tuple),
+        3 + external_port_size_words() + external_ref_size_words(3),
+        "the tuple (3) plus the 4-word port and 5-word reference blocks"
+    );
 
     // Two distinct nodes -> two entries.
     assert_eq!(dst_off.nodes().len(), 2, "one entry per distinct node");

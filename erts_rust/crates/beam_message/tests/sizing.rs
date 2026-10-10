@@ -26,11 +26,12 @@
 //!
 //! 1. `size_object(term) == to.used()` and `to.used() <= to.capacity()` - the preflight is neither
 //!    an under- nor an over-reservation, for a corpus spanning immediates-free compounds, deep and
-//!    improper lists, flat maps, HAMT maps, funs, native records, on-heap bitstrings, `SUB_BITS`
-//!    match contexts, off-heap MSO containers and refc binaries;
+//!    improper lists, flat maps, HAMT maps, funs, native records, on-heap bitstrings (byte-aligned
+//!    and not), boxed floats, bignums, `SUB_BITS` match contexts, off-heap MSO containers, refc
+//!    binaries and external pid/port/reference blocks;
 //! 2. a destination one word short is **refused before a single word is written** - the error is the
 //!    typed message-heap allocation failure and `to.used() == 0` (no partial write), and no off-heap
-//!    artifact is registered either.
+//!    artifact (refc-binary handle, MSO slot or node entry) is registered either.
 //!
 //! `beam_term::size_object` is deliberately **not** modified here (it lives in `beam_term`); this
 //! file pins the agreement between it and `layout::object_words` - the per-object counter the
@@ -189,6 +190,78 @@ fn on_heap_bitstring(s: &mut Src) -> Eterm {
     }
 }
 
+/// A byte-aligned **boxed float** leaf.
+fn boxed_float(s: &mut Src) -> Eterm {
+    // SAFETY: `FLOAT_SIZE_WORDS` (2) words are reserved for the `[HEADER_FLONUM, bits]` block.
+    unsafe {
+        let hp = s.heap.alloc_words(FLOAT_SIZE_WORDS).expect("the float fits");
+        write_float(hp, core::f64::consts::PI)
+    }
+}
+
+/// A **bignum** leaf (a 2-digit negative magnitude: one header word plus two `ErtsDigit`s).
+fn bignum(s: &mut Src) -> Eterm {
+    let digits = [7u64, 1u64];
+    // SAFETY: `big_size_words(2)` (3) words are reserved and `digits` is non-empty.
+    unsafe {
+        let hp = s
+            .heap
+            .alloc_words(big_size_words(digits.len()))
+            .expect("the bignum fits");
+        write_big(hp, true, &digits)
+    }
+}
+
+/// A **non-byte-aligned** on-heap bitstring (13 bits, so the last byte holds 3 live bits).
+fn non_byte_aligned_bitstring(s: &mut Src) -> Eterm {
+    let bits = 13usize;
+    let bytes = [0b1011_0110u8, 0b0000_0101u8];
+    // SAFETY: `heap_bits_size_words(13)` words are reserved and the payload fits.
+    unsafe {
+        let hp = s.heap.alloc_words(heap_bits_size_words(bits)).expect("fits");
+        write_heap_bits(hp, &bytes, bits).expect("the payload fits")
+    }
+}
+
+/// A standalone **external pid** (a 4-word `ExternalThing` block).
+fn external_pid(s: &mut Src) -> Eterm {
+    let node = make_atom(s.atoms.intern("nonode@nohost"));
+    // SAFETY: `external_pid_size_words()` (4) words are reserved for the block.
+    unsafe {
+        let hp = s
+            .heap
+            .alloc_words(external_pid_size_words())
+            .expect("the pid fits");
+        write_external_pid(hp, node, 0x1234, 0x0007, 5)
+    }
+}
+
+/// A standalone **external port** (a 4-word `ExternalThing` block).
+fn external_port(s: &mut Src) -> Eterm {
+    let node = make_atom(s.atoms.intern("node_a@host"));
+    // SAFETY: `external_port_size_words()` (4) words are reserved for the block.
+    unsafe {
+        let hp = s
+            .heap
+            .alloc_words(external_port_size_words())
+            .expect("the port fits");
+        write_external_port(hp, node, 0x9999, 3)
+    }
+}
+
+/// A standalone **external reference** over three ids (a 5-word `ExternalThing` block).
+fn external_reference(s: &mut Src) -> Eterm {
+    let node = make_atom(s.atoms.intern("node_b@host"));
+    // SAFETY: `external_ref_size_words(3)` (5) words are reserved for the block.
+    unsafe {
+        let hp = s
+            .heap
+            .alloc_words(external_ref_size_words(3))
+            .expect("the ref fits");
+        write_external_ref(hp, node, &[10, 20, 30], 4)
+    }
+}
+
 fn off_heap_container(s: &mut Src) -> Eterm {
     let slot = s.off.push(Mso::new(0x0BAD_F00D_u32, 20));
     bin_ref(&mut s.heap, slot)
@@ -271,10 +344,16 @@ const CORPUS: &[(&str, fn(&mut Src) -> Eterm)] = &[
     ("external fun", external_fun),
     ("native record", native_record),
     ("on-heap bitstring", on_heap_bitstring),
+    ("non-byte-aligned bitstring (13 bits)", non_byte_aligned_bitstring),
+    ("boxed float", boxed_float),
+    ("bignum (2-digit, negative)", bignum),
     ("match context over an on-heap bitstring", match_context),
     ("off-heap MSO container", off_heap_container),
     ("refc binary", refc_binary),
     ("graph with a shared refc binary", graph_with_refc_binary),
+    ("external pid", external_pid),
+    ("external port", external_port),
+    ("external reference (3 ids)", external_reference),
 ];
 
 #[test]
@@ -310,15 +389,23 @@ fn the_documented_sizing_is_exact_for_every_shape() {
             dst.used() <= dst.capacity(),
             "{name}: the copy never overflows the destination"
         );
-        // Only a shape containing a refc binary registers a destination artifact (its shared
-        // handle); the MSO-container shape's object is registered too, so allow up to two.
-        assert!(
-            dst_off.binaries().len() + dst_off.len() <= 2,
-            "{name}: no unexpected off-heap artifact"
-        );
+        // A shape registers a destination off-heap artifact only when it holds an off-heap
+        // reference: a refc binary contributes its shared handle (one per copied occurrence, so
+        // two for the graph that holds one twice), an MSO container contributes its slot, and an
+        // external pid/port/reference contributes its node entry. Nothing else may appear.
+        let artifacts = dst_off.binaries().len() + dst_off.len() + dst_off.nodes().len();
+        assert!(artifacts <= 2, "{name}: no unexpected off-heap artifact");
     }
 }
 
+/// The **wrong-size-copy detector**: a destination one word short of the preflighted
+/// [`size_of_copy`] must refuse the whole copy *before writing a single word*.
+///
+/// This is what pins the sized-then-copied contract from the other side — the copier preflights
+/// the exact word count, so a reservoir short by one word is a typed message-heap allocation
+/// failure (`AllocKind::Message`) with `used() == peak_used() == 0` (no partial write), and it
+/// registers no off-heap artifact (no refc-binary handle, no MSO slot, and no node entry) either.
+/// Every [`CORPUS`] shape must therefore be larger than one word.
 #[test]
 fn a_one_word_short_destination_is_refused_before_any_write() {
     for (name, build) in CORPUS {
@@ -345,7 +432,7 @@ fn a_one_word_short_destination_is_refused_before_any_write() {
         assert_eq!(dst.used(), 0, "{name}: a refused copy writes no destination word");
         assert_eq!(dst.peak_used(), 0, "{name}: nothing was even temporarily written");
         assert!(
-            dst_off.binaries().is_empty() && dst_off.is_empty(),
+            dst_off.binaries().is_empty() && dst_off.is_empty() && dst_off.nodes().is_empty(),
             "{name}: a refused copy registers no off-heap artifact"
         );
     }
