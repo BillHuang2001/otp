@@ -22,11 +22,13 @@
 //! runtime-block layout (`runtime`), and the register allocator plus the
 //! small-int arithmetic fast path (`emit`).
 use super::emit::*;
-use super::runtime::{RUNTIME_MACHINE_DISP, RUNTIME_XREGS_DISP};
+use super::runtime::{
+    EXT_CALL, EXT_CALL_LAST, EXT_CALL_ONLY, RUNTIME_MACHINE_DISP, RUNTIME_XREGS_DISP,
+};
 use super::*;
 use crate::jit::emitter::Reg;
 use crate::jit::Tier;
-use crate::machine::MAX_REGISTER;
+use crate::machine::{Continuation, MAX_REGISTER};
 use crate::MinimalContext;
 use beam_loader::{
     Block, Export, Function, Import, ImportRef, Instr, Label, Operand, Reg as RegRef, NO_FAIL,
@@ -1744,5 +1746,343 @@ fn a_suspension_inside_a_cross_module_callee_resumes_on_the_baseline_tier() {
     assert!(
         baseline_rest.is_empty() && interpreter_rest.is_empty(),
         "`remove_message` unlinked the matched message on both tiers"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// the native `call_ext*` arm: `jit_ext_call` (resolution + frame discipline)
+//
+// `baseline/runtime.rs::jit_ext_call` — over the pure-Rust `resolve_ext_entry` —
+// is the helper the `baseline/emit/mod.rs::emit_ext_call` arm wires into every
+// compiled block's `call_ext*` lowering, so those instructions no longer deopt
+// unconditionally. For an import the host resolves through
+// `ExecutionContext::resolve_external_call`, the helper returns the [`ENTER`]
+// word and hands the resolved `(context, func, pc)` to the driver through
+// `JitRuntime::enter`, applying the variant's frame discipline (`CallExt` stores
+// `Continuation::Address { func, pc + 1, context }` first, `CallExtOnly` stores
+// nothing, `CallExtLast` resolves *then* pops). Anything the host cannot run here
+// — `Ok(None)`, an unresolved import/entry label, a failed frame discipline —
+// mutates nothing and falls back to `jit_step_one` (the interpreter's own step),
+// so the synchronous `call_bif` path and every one of its errors are
+// byte-identical to the tier before the arm existed.
+// ---------------------------------------------------------------------------
+
+/// A caller module `caller_x` importing `callee_x:g/0`, whose `f/0` allocates a
+/// zero-Y frame and then executes `call` at the function's last code index.
+///
+/// Returns the module and the `(func, pc)` of `call` (`func` is always `0`).
+fn ext_call_caller(call: Instr) -> (Module, (u32, u32)) {
+    let code = vec![
+        Instr::Label(Label(1)), // the function label
+        Instr::Label(Label(2)), // the export entry
+        Instr::Allocate {
+            stack_need: beam_loader::HeapNeed::Words(0),
+            live: 0,
+        },
+        call,
+    ];
+    let pc = (code.len() - 1) as u32;
+    let module = build_module(
+        "caller_x",
+        &[("callee_x", "g", 0)],
+        vec![("f", 0, code)],
+        &[("f", 0, Label(2))],
+    );
+    (module, (0, pc))
+}
+
+/// The callee `callee_x:g/0` the seam resolves to: its export entry is
+/// `Label(1)` at code index `0`.
+fn ext_call_callee() -> std::sync::Arc<Module> {
+    std::sync::Arc::new(build_module(
+        "callee_x",
+        &[],
+        vec![(
+            "g",
+            0,
+            vec![
+                Instr::Label(Label(1)),
+                Instr::Move {
+                    src: Operand::Integer(99),
+                    dst: Operand::X(0),
+                },
+                Instr::Return,
+            ],
+        )],
+        &[("g", 0, Label(1))],
+    ))
+}
+
+/// The observable result of one [`jit_ext_call`] invocation on a fresh machine
+/// holding a single live zero-Y frame.
+struct ExtCallProbe {
+    /// The block-ABI word the helper returned.
+    word: i64,
+    /// The `(context, func, pc)` the helper handed the driver, when it resolved.
+    enter: Option<(u32, u32, u32)>,
+    /// The typed error the helper stored, if any.
+    error: Option<beam_common::BeamError>,
+    /// The machine's frame depth after the call.
+    frame_depth: usize,
+    /// The caller frame's continuation after the call (`None` once popped).
+    continuation: Option<Continuation>,
+    /// `x(0)` after the call.
+    x0: Option<Eterm>,
+}
+
+/// Invoke [`jit_ext_call`] for `kind`/`deallocate` at `(func, pc)` on a fresh
+/// machine holding a single live zero-Y frame, with `ctx` as the context.
+fn run_ext_call(
+    caller: &Module,
+    (func, pc): (u32, u32),
+    mut ctx: MinimalContext,
+    kind: u32,
+    deallocate: u32,
+) -> ExtCallProbe {
+    let mut machine = Machine::new();
+    machine
+        .push_frame(0)
+        .expect("the caller's zero-Y frame");
+    let labels = crate::interpreter::build_label_map(caller);
+    let x_regs = machine.x.as_mut_ptr();
+    let mut rt = JitRuntime {
+        machine: &mut machine,
+        x_regs,
+        module: caller,
+        labels: &labels,
+        ctx: &mut ctx,
+        error: None,
+        enter: None,
+    };
+    // `caller_x`'s only import is `callee_x:g/0`, i.e. `ImportRef(0)`.
+    let word = jit_ext_call(&mut rt as *mut JitRuntime<'_>, func, pc, 0, kind, deallocate);
+    ExtCallProbe {
+        word,
+        enter: rt.enter,
+        error: rt.error.take(),
+        frame_depth: machine.frame_depth(),
+        continuation: machine.continuation().ok(),
+        x0: machine.x(0),
+    }
+}
+
+/// `call_ext` resolves through the host's seam: the helper returns the [`ENTER`]
+/// word, hands the driver the callee's `(context, func, pc)`, and — **first** —
+/// stores the caller's return address (`Continuation::Address { func, pc + 1,
+/// context }`) in the live frame, exactly like the interpreter's `Instr::CallExt`.
+#[test]
+fn jit_ext_call_resolves_call_ext_into_an_enter_and_stores_the_continuation() {
+    let (caller, (func, pc)) = ext_call_caller(Instr::CallExt {
+        arity: 0,
+        target: ImportRef(0),
+    });
+    let callee = ext_call_callee();
+    let probe = run_ext_call(&caller, (func, pc), seam_context(&callee), EXT_CALL, 0);
+
+    assert_eq!(probe.word, ENTER, "a resolved call_ext reports the ENTER word");
+    let (context, callee_func, callee_pc) = probe
+        .enter
+        .expect("the resolved target is handed to the driver through rt.enter");
+    assert_eq!(
+        context, 1,
+        "the callee is the machine's first registered module context"
+    );
+    assert_eq!(
+        (callee_func, callee_pc),
+        (0, 0),
+        "the callee's export entry `g/0` is `Label(1)` -> `(func 0, pc 0)`"
+    );
+    assert_eq!(probe.frame_depth, 1, "call_ext keeps the caller's frame");
+    assert_eq!(
+        probe.continuation,
+        Some(Continuation::Address {
+            func,
+            pc: pc + 1,
+            context: 0,
+        }),
+        "call_ext stores its return address (its own func, pc + 1, caller context)"
+    );
+}
+
+/// `call_ext_only` is a tail call: it stores **no** continuation — the callee
+/// returns along the frame's *existing* continuation (the bottom `Halt` here) —
+/// but still hands the driver the resolved target.
+#[test]
+fn jit_ext_call_only_enters_without_storing_a_continuation() {
+    let (caller, (func, pc)) = ext_call_caller(Instr::CallExtOnly {
+        arity: 0,
+        target: ImportRef(0),
+    });
+    let callee = ext_call_callee();
+    let probe = run_ext_call(&caller, (func, pc), seam_context(&callee), EXT_CALL_ONLY, 0);
+
+    assert_eq!(
+        probe.word, ENTER,
+        "a resolved call_ext_only reports the ENTER word"
+    );
+    assert_eq!(
+        probe.enter.map(|(c, f, p)| (c, f, p)),
+        Some((1, 0, 0)),
+        "the callee's export entry is handed to the driver"
+    );
+    assert_eq!(probe.frame_depth, 1, "a tail call reuses the caller's frame");
+    assert_eq!(
+        probe.continuation,
+        Some(Continuation::Halt),
+        "call_ext_only stores nothing: the frame keeps its existing continuation"
+    );
+}
+
+/// `call_ext_last` resolves the target **then** pops the caller's frame (the
+/// interpreter's own `pop_frame_checked`), so a resolved tail call leaves no
+/// frame behind.
+#[test]
+fn jit_ext_call_last_resolves_then_pops_the_frame() {
+    let (caller, (func, pc)) = ext_call_caller(Instr::CallExtLast {
+        arity: 0,
+        target: ImportRef(0),
+        deallocate: 0,
+    });
+    let callee = ext_call_callee();
+    let probe = run_ext_call(&caller, (func, pc), seam_context(&callee), EXT_CALL_LAST, 0);
+
+    assert_eq!(
+        probe.word, ENTER,
+        "a resolved call_ext_last reports the ENTER word"
+    );
+    assert_eq!(
+        probe.enter,
+        Some((1, 0, 0)),
+        "the callee's entry is resolved before the pop"
+    );
+    assert_eq!(
+        probe.frame_depth, 0,
+        "call_ext_last pops the caller's frame"
+    );
+    assert_eq!(
+        probe.continuation, None,
+        "there is no caller frame left to hold a continuation"
+    );
+}
+
+/// A host that cannot run the callee (`resolve_external_call` -> `Ok(None)`)
+/// falls back to [`jit_step_one`] — the interpreter's own step — which runs the
+/// *whole* instruction through the synchronous `call_bif` path: the helper
+/// reports the advance (`func, pc + 1`), `x(0)` gets the BIF's result, `rt.enter`
+/// stays `None` and the cross-module frame discipline never runs.
+#[test]
+fn jit_ext_call_falls_back_to_the_synchronous_path_when_no_callee_resolves() {
+    let (caller, (func, pc)) = ext_call_caller(Instr::CallExt {
+        arity: 0,
+        target: ImportRef(0),
+    });
+    // No resolver is installed, so the seam answers `Ok(None)`; the BIF hook is
+    // then the synchronous dispatch path and answers `callee_x:g/0` with `7`.
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(None::<(String, String, u32)>));
+    let record = std::rc::Rc::clone(&seen);
+    let ctx = MinimalContext::with_bif_hook(Box::new(move |module, function, arity, _args| {
+        *record.borrow_mut() = Some((module.to_string(), function.to_string(), arity));
+        Ok(make_small(7))
+    }));
+    let probe = run_ext_call(&caller, (func, pc), ctx, EXT_CALL, 0);
+
+    assert_eq!(
+        *seen.borrow(),
+        Some(("callee_x".to_string(), "g".to_string(), 0)),
+        "the fallback dispatches the caller's import through call_bif"
+    );
+    assert_eq!(
+        probe.word,
+        encode_target(func, pc + 1),
+        "the fallback runs the interpreter's CallExt, which advances by one"
+    );
+    assert_eq!(
+        probe.enter, None,
+        "no cross-module transfer is reported on the synchronous path"
+    );
+    assert_eq!(
+        probe.x0,
+        Some(make_small(7)),
+        "the synchronous call_bif wrote its result to x(0)"
+    );
+    assert_eq!(
+        probe.frame_depth, 1,
+        "the synchronous path keeps the caller's frame"
+    );
+    assert_eq!(
+        probe.continuation,
+        Some(Continuation::Halt),
+        "call_ext stores no continuation on the BIF path"
+    );
+}
+
+/// A `call_ext_last` whose `Deallocate` operand is **stale** (its frame size no
+/// longer matches the live frame — the shape `trim` produces) must not fabricate
+/// a wrong `ENTER`: the frame discipline's checked pop rejects the mismatch, the
+/// helper mutates nothing and falls back to [`jit_step_one`], which re-runs the
+/// instruction and reports the interpreter's exact `deallocate: frame size
+/// mismatch` error. The caller's frame is left intact.
+#[test]
+fn jit_ext_call_last_rejects_a_stale_deallocate_with_the_checked_pop_error() {
+    // The live frame has zero Y slots; the operand claims two -> a mismatch.
+    let (caller, (func, pc)) = ext_call_caller(Instr::CallExtLast {
+        arity: 0,
+        target: ImportRef(0),
+        deallocate: 2,
+    });
+    let callee = ext_call_callee();
+    let probe = run_ext_call(&caller, (func, pc), seam_context(&callee), EXT_CALL_LAST, 2);
+
+    assert_eq!(
+        probe.word, ERROR,
+        "a failed frame discipline is the typed ERROR word, never a wrong ENTER"
+    );
+    assert_eq!(
+        probe.enter, None,
+        "nothing is handed to the driver when the discipline fails"
+    );
+    assert_eq!(
+        probe.frame_depth, 1,
+        "the rejected pop leaves the caller's frame intact"
+    );
+    let err = probe
+        .error
+        .expect("the fallback's typed error is stored in rt.error");
+    assert_eq!(
+        error_reason(&err),
+        "unsupported_opcode: deallocate: frame size mismatch"
+    );
+}
+
+/// The emit arm actually wires the helper into a compiled block: the artifact's
+/// machine code contains the `movabs r11, <jit_ext_call>` immediate that
+/// `emit_ext_call` emits (the same `movabs r11, helper` shape every helper call
+/// uses), so a `call_ext*` no longer lowers to an unconditional deopt.
+#[test]
+fn the_compiled_block_wires_the_ext_call_helper_into_native_code() {
+    let (caller, _) = ext_call_caller(Instr::CallExt {
+        arity: 0,
+        target: ImportRef(0),
+    });
+    let compiled = compile_module(&caller).expect("the caller module compiles");
+    assert!(compiled.block_count() > 0, "the caller module produced a block");
+
+    // `mov r11, imm64` (the `movabs` form) is `49 BB <imm64 little-endian>`; the
+    // immediate is the helper's address.
+    let helper = jit_ext_call as *const () as usize;
+    let mut needle = vec![0x49u8, 0xBB];
+    needle.extend_from_slice(&(helper as u64).to_le_bytes());
+
+    let (start, end) = compiled.code_address_range();
+    // SAFETY: `[start, end)` is the artifact's live, sealed executable mapping,
+    // which `compiled` owns and keeps mapped for this borrow; reading it as bytes
+    // is valid and does not execute it.
+    let code = unsafe { std::slice::from_raw_parts(start as *const u8, end - start) };
+
+    assert!(
+        code.windows(needle.len())
+            .any(|window| window == needle.as_slice()),
+        "the compiled block must `movabs r11, <jit_ext_call>`; its absence means the \
+         emit arm did not wire the native `call_ext*` helper"
     );
 }
