@@ -43,9 +43,10 @@
 //! (`BeamError::BadArg`) — the `badarg` the CLI prints.
 //!
 //! The fix is a self-contained ("flatten") copy mode in `beam_message` plus a one-line
-//! adoption in `beam_rt/src/runtime.rs::stabilize_term`. Both live outside this node's
-//! permitted scope (`tests/**` of `beam_rt`), so the test is marked `#[ignore]` with that
-//! reason and must be un-ignored when the fix lands.
+//! adoption in `beam_rt/src/runtime.rs::stabilize_term`. The `beam_message` half is read-only
+//! to this node, and the adopting call cannot compile until that entry point exists, so the
+//! test is marked `#[ignore]` with that reason and must be un-ignored when the fix lands
+//! (the `beam_rt` half is the single `copy_struct_simple` call in `stabilize_term`).
 //!
 //! The fixture is compiled **at test time** with the system `erlc` into a scratch directory
 //! under the system temp dir (never committed), and every test **skips loudly** — never
