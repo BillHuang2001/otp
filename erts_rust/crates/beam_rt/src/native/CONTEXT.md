@@ -109,6 +109,7 @@ before the registry.
 | `last_calls` | `false` — the oracle's own answer for a process with no saved-calls buffer (`erl_bif_info.c:2184-2188`); this runtime never saves calls |
 | `sequential_trace_token` | the process's sequential-trace token 5-tuple, or the bare `[]` while sequential tracing is inactive for it (read from `crate::seq_trace::token`) |
 | `memory` | this process's real bytes (`(total_heap_size + stack_size) * 8` + off-heap overhead) |
+| `catchlevel` | the live exception catch-frame depth as an integer, from `Machine::catch_frame_depth()` (the C's `catchlevel(rp) = rp->catches`); answered for a process with a readable engine, the typed gap otherwise (same conditionality as the execution-position items — a process parked outside any `try`/`catch` reports `0`) |
 
 #### The execution-position items (the engine's view of *where* a process is)
 `current_function`/`initial_call`/`current_location`/`current_stacktrace` are read from the
