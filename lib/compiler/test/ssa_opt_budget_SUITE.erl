@@ -36,6 +36,14 @@
 %% `ssa_opt_gates' alone the output is unchanged (see `effort_levels/1',
 %% `classify_model/1' and the `fn_budget_*' cases).
 %%
+%% The eligibility gates are cheap NECESSARY preconditions, wired in
+%% `beam_ssa_opt:gate/1' (and, for the FBIP pass, in
+%% `beam_ssa_destructive_update:opt/2'). The loop gate accepts a CFG back edge
+%% OR a strength-reduction candidate, because the `loop_opt' driver also
+%% reduces the whole function, which needs no loop (see `gates_skip_flat/1',
+%% `gates_run_rich/1', `gates_do_not_change_output/1' and
+%% `gates_accept_reduce_candidate/1').
+%%
 %% Every test case here compiles probe modules with `no_spawn_compiler_process'
 %% so that the compilation - and thus the per-compilation statistics
 %% (beam_ssa_opt_budget:get_stats/0) and the per-function queries - happens in
@@ -51,9 +59,12 @@
          gates_skip_flat/1,
          gates_run_rich/1,
          gates_do_not_change_output/1,
+         gates_accept_reduce_candidate/1,
          budget_ample_does_not_change_output/1,
+         budget_alone_does_not_change_output/1,
          budget_takes_effect/1,
          watchdog_takes_effect/1,
+         watchdog_alone_does_not_change_output/1,
          tight_budget_equivalence/1,
          real_module_budget_equivalence/1,
          classify_model/1,
@@ -76,9 +87,12 @@ groups() ->
        gates_skip_flat,
        gates_run_rich,
        gates_do_not_change_output,
+       gates_accept_reduce_candidate,
        budget_ample_does_not_change_output,
+       budget_alone_does_not_change_output,
        budget_takes_effect,
        watchdog_takes_effect,
+       watchdog_alone_does_not_change_output,
        tight_budget_equivalence,
        real_module_budget_equivalence,
        classify_model,
@@ -124,16 +138,17 @@ default_off(Config) ->
 
 %% The eligibility gates skip the opt-in passes when their (cheap)
 %% precondition cannot hold: the flat probe has no loop, no map lookup and
-%% no record update, so none of the three passes may run.
+%% no record update, so none of the three passes may run - they are gated
+%% instead, i.e. their `ran' counter stays at zero.
 gates_skip_flat(Config) ->
     Opts = [binary,no_spawn_compiler_process,ssa_opt_gates,
             loop_opt,fusion_opt,fbip_opt],
     _ = build_sets(Config, "ssa_opt_budget_flat", flat_probe(), [{gates, Opts}]),
     St = stats(),
     ?assert(is_map(St)),
-    check(St, ssa_opt_loop_opt, 0, 1),
-    check(St, ssa_opt_fus, 0, 1),
-    check(St, ssa_opt_fbip, 0, 1),
+    check_skipped(St, ssa_opt_loop_opt),
+    check_skipped(St, ssa_opt_fus),
+    check_skipped(St, ssa_opt_fbip),
     ok.
 
 %% ... while the rich probe (a receive loop, a map lookup guard and record
@@ -162,6 +177,31 @@ gates_do_not_change_output(Config) ->
     ?assertEqual(code_of(key(plain, Builds)), code_of(key(gates, Builds))),
     ok.
 
+%% The loop gate accepts a CFG back edge OR a strength-reduction candidate,
+%% because the `loop_opt' driver also strength-reduces the WHOLE function
+%% (`X * 2' is `X + X' for every number), which needs no loop at all. The
+%% gates are a NECESSARY precondition, so enabling them must not drop such a
+%% rewrite: the gated build must produce exactly the code of the ungated
+%% `loop_opt' build, and the statistics must show the pass running on the
+%% candidate while the functions that have neither shape are gated. A gate
+%% that only accepted a back edge would gate the candidate too and produce
+%% the `no_loop_opt' code here.
+gates_accept_reduce_candidate(Config) ->
+    Sets = [{off, [binary,no_spawn_compiler_process]},
+            {opt, [binary,no_spawn_compiler_process,loop_opt]},
+            {gates, [binary,no_spawn_compiler_process,loop_opt,ssa_opt_gates]}],
+    Builds = build_sets(Config, "ssa_opt_budget_reduce", reduce_probe(), Sets),
+    %% The pass really does change a function without any loop, so the
+    %% comparison below is meaningful.
+    ?assert(code_of(key(off, Builds)) =/= code_of(key(opt, Builds))),
+    ?assertEqual(code_of(key(opt, Builds)), code_of(key(gates, Builds))),
+    St = stats(),
+    ?assert(is_map(St)),
+    %% Ran on the candidate `dbl/1', gated on `plain/1' and on the generated
+    %% `module_info/0,1', none of which has a back edge or a candidate.
+    check(St, ssa_opt_loop_opt, 1, 1),
+    ok.
+
 %% A budget that is never reached must not change the generated code
 %% either.
 budget_ample_does_not_change_output(Config) ->
@@ -169,6 +209,24 @@ budget_ample_does_not_change_output(Config) ->
             {ample, [binary,no_spawn_compiler_process,{ssa_opt_budget,600000}]}],
     Builds = build_sets(Config, "ssa_opt_budget_rich", rich_probe(), Sets),
     ?assertEqual(code_of(key(plain, Builds)), code_of(key(ample, Builds))),
+    ok.
+
+%% The bare `ssa_opt_budget' atom really arms the cumulative budget (with the
+%% documented default instead of being ignored), and a budget that is never
+%% reached leaves the generated code of a REAL module byte-for-byte
+%% unchanged. `remaining/0' and the statistics of the bare-option build are
+%% what make the comparison meaningful: identical code because the option was
+%% dropped would satisfy it just as well.
+budget_alone_does_not_change_output(_Config) ->
+    Src = suite_source(),
+    Plain = build(Src, [binary,no_spawn_compiler_process]),
+    Default = build(Src, [binary,no_spawn_compiler_process,ssa_opt_budget]),
+    ?assert(is_map(stats())),
+    ?assert(is_integer(remaining())),
+    Ample = build(Src, [binary,no_spawn_compiler_process,
+                        {ssa_opt_budget,600000}]),
+    ?assertEqual(code_of(Plain), code_of(Default)),
+    ?assertEqual(code_of(Plain), code_of(Ample)),
     ok.
 
 %% A zero budget is exceeded immediately: the skippable passes stop running
@@ -199,10 +257,25 @@ watchdog_takes_effect(Config) ->
     Result = compile:file(File, Opts),
     ?assertMatch({error,_,_}, Result),
     {error, Errors, _} = Result,
-    ?assertMatch({ssa_opt_watchdog_timeout,_}, crash_reason(Errors)),
+    Reason = crash_reason(Errors),
+    ?assertMatch({ssa_opt_watchdog_timeout,_}, Reason),
+    {ssa_opt_watchdog_timeout, Pass} = Reason,
+    ?assert(is_atom(Pass)),
     St = stats(),
     ?assert(is_map(St)),
-    ?assert(maps:get(timed_out, St) > 0),
+    %% The error names the pass whose counter was bumped, and no other pass
+    %% timed out: the timeout aborts the compilation at the first pass it
+    %% hits.
+    Passes = maps:get(passes, St),
+    ?assertEqual({Pass, true},
+                 {Pass, maps:get(timed_out, maps:get(Pass, Passes, pass_zero()))
+                  >= 1}),
+    ?assertEqual(1, maps:get(timed_out, St)),
+    %% Only a pass that may be skipped is run under the watchdog at all: a
+    %% pass that must always run is not bounded, so it can never be the one
+    %% named in the error.
+    ?assertEqual({Pass, false},
+                 {Pass, lists:member(Pass, never_skipped())}),
     ok.
 
 %% Extract the error reason reported for a compilation pass that crashed.
@@ -210,6 +283,24 @@ crash_reason([{_,D}|_]) when is_list(D) -> crash_reason(D);
 crash_reason([{none,compile,{crash,_,Reason,_}}|_]) -> Reason;
 crash_reason([{none,compile,{crash,_,Reason}}|_]) -> Reason;
 crash_reason(Other) -> Other.
+
+%% The bare `ssa_opt_watchdog' atom arms the per-pass watchdog with the
+%% documented default. A pass that finishes in time is then run in a monitored
+%% child process and its state is returned, so the result must be
+%% byte-for-byte the result without the watchdog - which is what makes the
+%% zero-budget abort of `watchdog_takes_effect/1' a statement about the
+%% timeout rather than about the child-process mechanism.
+watchdog_alone_does_not_change_output(Config) ->
+    Sets = [{plain, [binary,no_spawn_compiler_process]},
+            {watchdog, [binary,no_spawn_compiler_process,ssa_opt_watchdog]}],
+    Builds = build_sets(Config, "ssa_opt_budget_rich", rich_probe(), Sets),
+    St = stats(),
+    ?assert(is_map(St)),
+    %% The passes did run to completion under the watchdog (the child process
+    %% returns its state, which is what the code below depends on).
+    ?assert(maps:get(ran, St) > 0),
+    ?assertEqual(code_of(key(plain, Builds)), code_of(key(watchdog, Builds))),
+    ok.
 
 %% Compile the same probe with the default options and with an exhausted
 %% budget, execute both builds and check that they agree exactly (including
@@ -309,8 +400,9 @@ effort_levels(Config) ->
 %% `{ssa_opt_fn_budget,0}' exhausts every function's allowance immediately, so
 %% every skippable pass is skipped from the start: the per-function "optimizer
 %% off from here on" shape. It must be observable in the statistics, must
-%% change the generated code (it is less optimized) and must not change
-%% behaviour.
+%% change the generated code (it is less optimized), must not change behaviour
+%% and must leave exactly the passes that are never part of a skipped suffix
+%% running.
 fn_budget_takes_effect(Config) ->
     Sets = [{plain, [binary,no_spawn_compiler_process]},
             {fn_tight, [binary,no_spawn_compiler_process,
@@ -320,6 +412,25 @@ fn_budget_takes_effect(Config) ->
     ?assert(is_map(St)),
     ?assert(maps:get(function_over_budget, St) > 0),
     ?assert(code_of(key(plain, Builds)) =/= code_of(key(fn_tight, Builds))),
+    %% The allowance is exhausted for every function, so the only passes that
+    %% ran are the ones that are never skipped, and every other recorded pass
+    %% was skipped for each function instead, i.e. never ran at all.
+    Passes = maps:get(passes, St),
+    lists:foreach(fun(Name) ->
+                          ?assertEqual({Name, true},
+                                       {Name, ran_at_least(Name, Passes, 1)})
+                  end, never_skipped()),
+    Skippable = [Name || Name <- maps:keys(Passes),
+                         not lists:member(Name, never_skipped())],
+    ?assert(Skippable =/= []),
+    lists:foreach(fun(Name) ->
+                          Pass = maps:get(Name, Passes, pass_zero()),
+                          ?assertEqual({Name, false},
+                                       {Name, ran_at_least(Name, Passes, 1)}),
+                          ?assertEqual({Name, true},
+                                       {Name, maps:get(function_over_budget,
+                                                       Pass) > 0})
+                  end, Skippable),
     check_behaviour(Builds),
     ok.
 
@@ -335,13 +446,21 @@ fn_budget_equivalence(Config) ->
     ok.
 
 %% A per-function allowance that is never reached must not change the
-%% generated code either.
+%% generated code either. The bare `ssa_opt_fn_budget' atom is the documented
+%% "enabled with the default allowance" form; arming the machinery through it
+%% is observable in the statistics, and its default allowance (500 ms) is as
+%% far out of reach of these probes as the explicit one.
 fn_budget_ample_does_not_change_output(Config) ->
     Sets = [{plain, [binary,no_spawn_compiler_process]},
             {fn_ample, [binary,no_spawn_compiler_process,
-                        {ssa_opt_fn_budget,1000000}]}],
+                        {ssa_opt_fn_budget,1000000}]},
+            {fn_default, [binary,no_spawn_compiler_process,
+                          ssa_opt_fn_budget]}],
     Builds = build_sets(Config, "ssa_opt_budget_rich", rich_probe(), Sets),
+    %% The bare atom really armed the machinery instead of being dropped.
+    ?assert(is_map(stats())),
     ?assertEqual(code_of(key(plain, Builds)), code_of(key(fn_ample, Builds))),
+    ?assertEqual(code_of(key(plain, Builds)), code_of(key(fn_default, Builds))),
     ok.
 
 %% `{ssa_opt_fn_budget,Millis}' is a first-class compiler option: `compile.erl'
@@ -476,8 +595,34 @@ check(Stats, Name, MinRan, MinGated) ->
     ?assertEqual({Name, true}, {Name, maps:get(gated, Pass) >= MinGated}),
     ok.
 
+%% Assert that pass `Name' was never run, i.e. that its eligibility gate
+%% rejected it for every function it saw.
+check_skipped(Stats, Name) ->
+    Passes = maps:get(passes, Stats, #{}),
+    Pass = maps:get(Name, Passes, pass_zero()),
+    ?assertEqual({Name, 0}, {Name, maps:get(ran, Pass)}),
+    ?assertEqual({Name, true}, {Name, maps:get(gated, Pass) >= 1}),
+    ok.
+
+%% Whether pass `Name' ran at least `N' times in the collected statistics.
+ran_at_least(Name, Passes, N) ->
+    maps:get(ran, maps:get(Name, Passes, pass_zero())) >= N.
+
+%% The passes that must always run, mirroring `beam_ssa_opt:skippable/1': they
+%% change the SSA representation or produce annotations the code generator
+%% depends on, so they are never part of a skipped suffix (and are not run
+%% under the watchdog either).
+never_skipped() ->
+    [ssa_opt_split_blocks,
+     ssa_opt_linearize,
+     ssa_opt_blockify,
+     ssa_opt_type_finish,
+     ssa_opt_live,
+     ssa_opt_bs_ensure].
+
 pass_zero() ->
-    #{ran => 0, gated => 0, over_budget => 0, timed_out => 0}.
+    #{ran => 0, gated => 0, over_budget => 0, function_over_budget => 0,
+      timed_out => 0}.
 
 %% The pure model function under test, aliased to keep the assertions short.
 model(Blocks, Instructions) ->
@@ -649,6 +794,21 @@ flat_probe() ->
     "h({a, B}) -> B;\n"
     "h([H | _]) -> H;\n"
     "h(_) -> none.\n".
+
+%% No loop, but a strength-reduction candidate: `dbl/1' multiplies by two, for
+%% which `loop_opt' has an exact rewrite for every number (`X * 2' -> `X + X')
+%% that needs neither a back edge nor an integrality proof, so the widened
+%% loop gate must accept this module. `plain/1' has neither a back edge nor a
+%% candidate - `X + 1' is a variable-first sum, not a canonicalisable
+%% `C + V' - so the same gate must reject it.
+reduce_probe() ->
+    "-module(ssa_opt_budget_reduce).\n"
+    "-export([dbl/1,plain/1]).\n"
+    "\n"
+    "dbl(X) -> X * 2.\n"
+    "\n"
+    "plain(X) when is_integer(X) -> X + 1;\n"
+    "plain(X) -> X.\n".
 
 %% A receive loop, a map lookup guard, record updates and an update of the
 %% result of a local freshly-allocating function: all three gates are open,
