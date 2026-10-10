@@ -159,8 +159,14 @@
 //!   `nonode@nohost`/creation-0 identity when that atom is interned (see
 //!   [`BifContext::local_node`]). With no resolvable local node an internal id
 //!   stays the codec's `unsupported_external_term` error, never a wrong image.
-//!   A decoded `NEW_PID_EXT` stays an *external* id, so `binary_to_term` ∘
-//!   `term_to_binary` round-trips the wire term, not an internal pid.
+//!   A decoded `NEW_PID_EXT` for the **local** node stays an *external* id: the codec's
+//!   decoder never selects the internal-id arm (`beam_codec`'s
+//!   `Decoder::with_local_node` gates only its D2/D4/D6 *rejection* rules), so
+//!   `binary_to_term` ∘ `term_to_binary` round-trips the *wire* term and the decoded id
+//!   is not `=:= self()` where the oracle returns the internal pid — pinned by
+//!   `binary_to_term_of_a_local_pid_stays_external_pending_the_codec_fix` and detailed in
+//!   the crate `CONTEXT.md` handoff (§To `beam_codec` — the local-node decode
+//!   substitution).
 //! * **`integer_to_binary/1,2` and `binary_to_integer/1,2` promote to bignums.**
 //!   A value outside the 60-bit small range becomes an arbitrary-precision bignum
 //!   exactly as the oracle's does; only a magnitude past the bignum limb bound is
@@ -1409,6 +1415,60 @@ mod tests {
         )
     }
 
+    // -- live oracle ------------------------------------------------------
+
+    /// `$ERTS_ORACLE` if it names an existing file, else `erl` on `$PATH` — the same
+    /// resolution `src/numeric.rs`, `src/ets/specs.rs` and `tests/checksum.rs` use.
+    fn resolve_oracle() -> Option<std::path::PathBuf> {
+        if let Some(value) = std::env::var_os("ERTS_ORACLE") {
+            let program = std::path::PathBuf::from(&value);
+            if program.is_file() {
+                return Some(program);
+            }
+            eprintln!(
+                "[beam_bifs binconv] $ERTS_ORACLE='{}' is not an existing file — \
+                 treating it as no oracle.",
+                program.display()
+            );
+            return None;
+        }
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(|dir| dir.join("erl"))
+            .find(|candidate| candidate.is_file())
+    }
+
+    /// Runs `eval` under the oracle (`erl -noshell -eval <eval> -s init stop`) and
+    /// returns its stdout as lines.
+    ///
+    /// `None` means there is **no usable oracle** (the same convention
+    /// [`resolve_oracle`] uses): a loud notice is printed and the caller skips — never a
+    /// silent pass. A **spawned** oracle that fails (non-zero exit) is a test failure,
+    /// not a skip.
+    fn oracle_stdout(eval: &str) -> Option<Vec<String>> {
+        let oracle = resolve_oracle()?;
+        let output = std::process::Command::new(&oracle)
+            .arg("-noshell")
+            .arg("-eval")
+            .arg(eval)
+            .arg("-s")
+            .arg("init")
+            .arg("stop")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn the oracle '{}': {e}", oracle.display()));
+        assert!(
+            output.status.success(),
+            "the oracle '{}' exited with {:?}\n--- stderr ---\n{}",
+            oracle.display(),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let stdout = String::from_utf8(output.stdout).expect("the oracle printed UTF-8");
+        Some(stdout.lines().map(str::to_string).collect())
+    }
+
     // -- list_to_binary / binary_to_list ----------------------------------
 
     #[test]
@@ -2645,6 +2705,69 @@ mod tests {
         });
     }
 
+    /// The live-oracle cross-check for the `[used]` rule on a top-level `COMPRESSED`
+    /// image: the count is the compressed image's **own** length, never the padded
+    /// input's.
+    ///
+    /// The oracle produces the image (`term_to_binary(lists:seq(1,1000), [compressed])`),
+    /// reports its own `[used]` for `<Image/binary, 1,2,…,10>`, and prints the image's
+    /// exact bytes. The **same** bytes are then decoded here, so the two runtimes are
+    /// compared on one image (the oracle's zlib payload is its own — miniz_oxide's
+    /// deflate bytes differ — which is why comparing on *its* bytes, not two
+    /// independently produced ones, is what makes this a cross-check). Oracle-pinned:
+    /// `1827 1837 1827` for `lists:seq(1,1000)` (erts-17.1, probed live) — the
+    /// 1827-byte image inside a 1837-byte input reports 1827.
+    #[test]
+    fn binary_to_term_used_on_a_compressed_image_matches_the_live_oracle() {
+        // A raw string keeps the Erlang source readable — every `"` and `\` below is
+        // the Erlang character, not a Rust escape.
+        let eval = r#"C = term_to_binary(lists:seq(1,1000),[compressed]),
+P = <<C/binary,1,2,3,4,5,6,7,8,9,10>>,
+{_,U} = binary_to_term(P,[used]),
+io:format("~p ~p ~p~n",[byte_size(C), byte_size(P), U]),
+Bs = [integer_to_list(B) || B <- binary_to_list(C)],
+io:format("~s~n", [lists:join(",", Bs)]),
+halt()."#;
+        let Some(lines) = oracle_stdout(eval) else {
+            eprintln!();
+            eprintln!("=========== beam_bifs binconv: live oracle SKIPPED ===========");
+            eprintln!("No usable system `erl` oracle found ($ERTS_ORACLE unset or");
+            eprintln!("not executable, and no `erl` on $PATH).");
+            eprintln!("This test is NOT a pass — set $ERTS_ORACLE (or install Erlang/OTP).");
+            eprintln!("=============================================================");
+            eprintln!();
+            return;
+        };
+        assert!(lines.len() >= 2, "expected two oracle lines, got {lines:?}");
+        assert_eq!(
+            lines[0], "1827 1837 1827",
+            "the oracle's own (image, input, used) sizes changed"
+        );
+        // The byte list is the oracle's exact compressed image.
+        let image: Vec<u8> = lines[1]
+            .split(',')
+            .map(|byte| byte.trim().parse::<u8>().expect("an oracle byte"))
+            .collect();
+        assert_eq!(image.len(), 1827, "the oracle printed {len} bytes", len = image.len());
+        assert_eq!(&image[..2], &[VERSION_MAGIC, COMPRESSED_EXT]);
+
+        // Decode the oracle's very image, with the oracle's own trailing bytes.
+        let mut padded = image.clone();
+        padded.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        with_ctx(|ctx| {
+            let blob = bin(&padded);
+            let used_option = used_option(ctx);
+            let wrapped = binary_to_term_2(ctx, &[blob, used_option]).unwrap();
+            // The rule: the image's length, not the ten bytes longer input's.
+            assert_eq!(int_of(access::tuple_element(wrapped, 1)), image.len() as i64);
+            // And the decoded term really is `lists:seq(1,1000)`.
+            assert_eq!(
+                values(access::tuple_element(wrapped, 0)),
+                (1..=1000).collect::<Vec<i64>>()
+            );
+        });
+    }
+
     #[test]
     fn binary_to_term_matches_the_oracle() {
         with_ctx(|ctx| {
@@ -2866,12 +2989,86 @@ mod tests {
             assert_eq!(optioned, pid_image(1, 0, 0));
 
             // The round trip decodes to an *external* pid carrying the same
-            // node/number/serial/creation (the wire form, not an internal id).
+            // node/number/serial/creation (the wire form, not an internal id) — the
+            // recorded gap [`binary_to_term_of_a_local_pid_stays_external_pending_the_codec_fix`]
+            // pins in full.
             let back = binary_to_term_1(ctx, &[bin(&image)]).unwrap();
             let (node, number, serial, creation) =
                 external_pid_parts(back).expect("an external pid");
             assert_eq!(ctx.atoms().name(atom_val(node)), Some("nonode@nohost"));
             assert_eq!((number, serial, creation), (1, 0, 0));
+        });
+    }
+
+    /// The `binary_to_term(term_to_binary(self()))` round trip: the oracle hands back the
+    /// **internal** pid, this runtime keeps the **external** wire id — the A.5 divergence
+    /// `../../tools/differential/divergences.md` records.
+    ///
+    /// Probed live on erts-17.1, the oracle answers `true` for
+    /// `binary_to_term(term_to_binary(self())) =:= self()` and renders the decoded id as an
+    /// internal `<0.Id.0>` pid. Here the decode yields the boxed *external* id:
+    /// `beam_codec`'s `Decoder::with_local_node` seam gates only the D2/D4/D6 *rejection*
+    /// rules (`beam_codec/src/decode/local_node.rs`) and never selects the internal-id arm,
+    /// so the equality is `false` and the printer refuses the external block with `badarg`
+    /// (`src/print.rs`, "external pids … are outside the Milestone-1 term set"). Both
+    /// symptoms have this one cause.
+    ///
+    /// **This crate cannot close it.** The C substitutes the internal id *inside* the
+    /// recursive decode (`dec_pid`, `external.c:3172-3181`; the port and reference arms do
+    /// the same), so the fix belongs in `beam_codec`'s decoder — see the crate `CONTEXT.md`
+    /// handoff for the exact change. A top-level-only rewrite here would leave every
+    /// *nested* pid external (an inconsistent runtime), and a deep rewrite would duplicate
+    /// the decoder's own container knowledge. This test pins today's behaviour next to the
+    /// live oracle's, so it fails loudly — and is updated to assert the internal id — the
+    /// day that change lands.
+    #[test]
+    fn binary_to_term_of_a_local_pid_stays_external_pending_the_codec_fix() {
+        // The live oracle: the round trip *equals* `self()` and the decoded id prints as an
+        // internal `<Node.Id.Serial>` pid. (The id itself is a per-VM-start value, so only
+        // the shape is pinned.)
+        let eval = r#"io:format("~p ~p~n", [binary_to_term(term_to_binary(self())) =:= self(), binary_to_term(term_to_binary(self()))]), halt()."#;
+        if let Some(lines) = oracle_stdout(eval) {
+            let fields: Vec<&str> = lines[0].split_whitespace().collect();
+            assert_eq!(fields.len(), 2, "unexpected oracle line {:?}", lines[0]);
+            assert_eq!(fields[0], "true", "the oracle's `=:= self()` is true");
+            let id = fields[1];
+            assert!(
+                id.starts_with('<') && id.ends_with('>') && id.matches('.').count() == 2,
+                "the oracle prints an internal pid, got {id:?}"
+            );
+        } else {
+            eprintln!();
+            eprintln!("=== beam_bifs binconv: live oracle SKIPPED (pid round trip) ===");
+            eprintln!("No usable system `erl` oracle found — this test is NOT a pass.");
+            eprintln!("=============================================================");
+            eprintln!();
+        }
+
+        with_ctx(|ctx| {
+            let self_pid = ctx.self_pid().to_eterm();
+            assert!(beam_term::is_internal_pid(self_pid));
+            let image = text(term_to_binary_1(ctx, &[self_pid]).unwrap());
+            assert_eq!(image, pid_image(1, 0, 0));
+
+            // The decode keeps the *external* wire id (the codec's gap) ...
+            let back = binary_to_term_1(ctx, &[bin(&image)]).unwrap();
+            assert!(access::is_pid(back));
+            assert!(
+                !beam_term::is_internal_pid(back),
+                "the beam_codec local-node substitution landed — update this test to \
+                 assert the internal id"
+            );
+            // ... so it is a *different* term from `self()` (`=:= self()` is false) ...
+            assert_ne!(back, self_pid);
+            // ... while its wire fields are exactly the ones the image carried: the
+            // divergence is the term *identity*, not the node/number/serial/creation.
+            let (node, number, serial, creation) =
+                external_pid_parts(back).expect("an external pid");
+            assert_eq!(ctx.atoms().name(atom_val(node)), Some("nonode@nohost"));
+            assert_eq!((number, serial, creation), (1, 0, 0));
+            // Re-encoding stays byte-exact either way (the encoder resolves an internal id
+            // through the `LocalNode` seam), so only the decoded identity diverges.
+            assert_eq!(text(term_to_binary_1(ctx, &[back]).unwrap()), image);
         });
     }
 
