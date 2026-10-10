@@ -35,7 +35,7 @@ per-function bodies. Files:
 | `group_leader.rs` | `erlang:group_leader/2` + `erts_internal:group_leader/2,3` over `Runtime::group_leaders` (per-process, default the root pid; see below) |
 | `port.rs` | `erlang:port_command/2,3` and the closed-port half of `erlang:port_info/1,2` (the `PortHook` seam cannot express those) |
 | `application.rs` | `application:get_env/1,2,3`, `get_all_env/1`, `get_key/2`, `get_application/0` (always `undefined` — there is no application controller and no owning application), `loaded_applications/0`, `which_applications/0` over a minimal native `.app` view |
-| `erts_internal.rs` | the `erts_internal` floor (`erts_internal_call`; the dispatch table is the source of truth) — see below |
+| `erts_internal.rs` | the `erts_internal` floor (`erts_internal_call`; the dispatch table is the source of truth) **plus the two `erlang:garbage_collect/0,1` bodies it hosts** — see below |
 | `erts_internal/trace.rs` | the `erts_internal:trace/3` + `:trace_pattern/3` handler bodies (`erlang:trace/2,3` and `erlang:trace_pattern/2,3` call them) + their private pattern/target helpers, over `crate::trace` — see below |
 | `prim.rs` | the `prim_file` floor (27 entries) — see below |
 | `prim_file.rs` | the whole-file-descriptor half of the `prim_file` floor (`open/2` `read/2` `write/2` `close/1` `position/2` `pread/2,3` `pwrite/2,3` `truncate/1` `sync/1` `datasync/1` `write_file/2` `set_cwd/1` `ipread_s32bu_p32bu/3` `get_handle/1`) + its unit tests |
@@ -49,6 +49,40 @@ per-function bodies. Files:
 **The process-control families route through the sibling `beam_process` machinery.** `monitor/2,3` and `demonitor/1,2` use `ProcessTable::{monitor, monitor_named, demonitor, demonitor_flush}`: `[flush]` removes a queued `'DOWN'` from the caller's mailbox and `[info]` answers the **real** "was a monitor on record and got removed" boolean (a second `demonitor(Ref, [info])` is `false`; the reference stays on record so it is never `badarg`). `exit/2,3` signals another process through `ProcessTable::send_exit`, but a **self**-directed exit is raised directly (non-trapping caller, or the untrappable `kill`) or delivered as `{'EXIT', self(), R}` via `RuntimeContext::deliver_message` (trapping caller and `Reason != kill`) — because the sibling scheduler defers a self-directed signal that arrives while the pid is `Running`, which it is inside a slice. `exit/3` accepts ONLY the bare atom `priority` as an option (`[{priority, high}]` is `badarg`). `is_alive/0`/`get_cookie/0`/`set_cookie/2`/`nodes/0,1` read the runtime's `DistNode`/cookie/local-node state (`../runtime.rs`; `get_cookie/0` is the atom `nocookie` while the node is not alive, and `set_cookie/2` RAISES `badarg`/`distribution_not_started`, matching the oracle). `spawn_opt` parses and validates EVERY option **before** the child is allocated, then builds the child's `HeapPolicy` with `beam_gc::HeapPolicy::from_spawn_opts` and applies it via the policy-aware `Runtime::spawn_*_with_policy`.
 
 **The spawn family works from *inside* a scheduler slice too.** `RuntimeContext::owns_process_table` picks the target: a context that owns the table (the `-eval` evaluator) spawns through `Runtime::spawn_process_with_policy`/`spawn_fun_process_with_policy` as before, while one built by `for_process` — a slice of a pass that has **moved** the runtime's table out — goes through `RuntimeContext::spawn_in_pass`: the child's pid is allocated in the **pass** table with its heap policy and priority (the same `ProcessTable::spawn` + `set_priority` the direct path uses), the entry point is resolved by `Runtime::resolve_export_entry` (the wording shared with the direct path, so module resolution/`undef` are identical), and the record is handed to the pass (`Runtime::note_pending_spawn`). `Runtime::absorb_pending_spawns` then registers the engine entry in the pass's runner state and enqueues the pid **at its own priority**, so the child is scheduled and really runs — `spawn_link`/`spawn_opt`'s `link`/`monitor` go through the same table via `link_to_child`/`apply_spawn_options`. Proven end to end by `tests/spawn_from_slice.rs` (all five forms incl. a nested spawn, oracle-cross-checked) and by the two `runtime::scheduler::tests` cases over `absorb_pending_spawns`.
+
+### `erlang:garbage_collect/0,1` (contract A.7) — the on-demand collection
+Bodies in `erts_internal.rs`, arms in `../native.rs::try_native`. `erlang` is a floor namespace, so
+its `.beam` wrappers are un-enterable and the floor owns both names: `/0` (`erlang.erl:3051-3053`,
+whose body is `erts_internal:garbage_collect(major)`) and `/1` (`erlang.erl:3055-3066`, the wrapper
+`erlang:garbage_collect(Pid, [])`, whose `self()` clause reaches that same preloaded BIF).
+
+**No BIF may collect.** The root set a collection relocates is the **executing machine's**
+`x[0..live)` plus its Erlang stack, and a BIF runs *inside* the engine, owning neither — so a
+servable call records a **request** through the one latch (`Runtime::request_gc`) and answers the
+oracle's `true`. The request is served at the two sites that *do* own that root set: the engine's
+heap-admission point (`../../src/context/gc.rs::ensure_heap`, where a pending request bypasses only
+the occupancy test, never the safety valves) and the runner's park arms (`../../src/runner/run.rs` →
+`Runtime::serve_gc_request`, after each `publish_parked_roots`); a request still pending when its
+process terminates is pruned at the pass boundary
+(`../../src/runtime/scheduler.rs::scheduler_pass` → `prune_gc_requests`). A request is recorded
+**only** for a **scheduled slice** — a context that does not own the process table
+(`RuntimeContext::owns_process_table`); every other context (`-eval`, a single-pass `run_*`)
+allocates on the pointer-stable runtime arena, which no collection ever moves, so it answers the
+oracle's `true` and records nothing. `Runtime::gc_stats().collections` therefore moves only when a
+collection really ran; a request the valves refuse (a pinned or halted pid, a **relocation-exempt**
+process, the global escape-store valve) is dropped honestly with the counters untouched, never
+re-armed.
+
+`/1`'s argument contract is the oracle's (`erl` probes, and the C's own test in
+`erl_process.c:11309-11324`): a **live local pid** ⇒ `true` and a request recorded for *that* pid; a
+well-formed internal pid the process table does not hold ⇒ `false`, with nothing recorded; anything
+that is not an internal pid — including an **external**/wire pid, which this runtime has no
+distribution link to and so can never honour ⇒ `badarg` (`am_badarg`). `/2` (`{async, ReqId}` system
+tasks) remains a **typed capability gap** and stays in
+[`../../src/error.rs::KNOWN_UNIMPLEMENTED_ERLANG_BIFS`](../../src/error.rs). Observable evidence:
+[`../../tests/garbage_collect.rs`](../../tests/garbage_collect.rs) — the return values are
+oracle-cross-checked, and a scheduled `ask/1` really moves the `collections` counter where the
+identical `plain/1` workload moves it by zero.
 
 **`erlang:spawn_monitor/1,2,3,4` is an `erlang.erl` wrapper, not a `bif.tab` BIF.** The four arities (`erlang.erl:10667`/`:10686`/`:10706`/`:10874`) are `erlang:spawn_opt(…, [monitor])` behind `erlang.erl`'s own guards — `is_function(F, 0)` for `/1` and `/2`, plus `is_atom(Node)`, `is_atom(M)`, `is_atom(F)`, `is_list(A)` — so no registry entry (and nothing in the known-unimplemented list) claims them and the floor owns the whole family. A guard violation is the oracle's `badarg`; the `Node` forms on a node **other** than this runtime's own are the typed capability gap, because the oracle routes that clause through a distributed `erlang:spawn_request/5` (contract A.5) and this runtime has no send path for a spawn — never a locally fabricated child. The `Node` test is `process/monitor.rs`'s `pub(super)` `is_local_node`, one definition shared with `monitor/2,3`'s `{Name, Node}` target. The monitor itself is installed by the private `attach_monitor` (shared with `spawn_opt`'s `monitor` option, so the `{Pid, Ref}` shape and the reference → monitor bookkeeping cannot drift), and it is on record **before the child's first schedulable moment**: the child is only a run-queue entry (or a pass `PendingSpawn`) when the BIF returns and the runtime is single-threaded, so a child that exits immediately still delivers its `{'DOWN', …, normal}`. Proven end to end by `tests/spawn_monitor.rs` (all four arities on this runtime's own node, every guard rejection, and the node gap; oracle-cross-checked).
 
@@ -505,11 +539,9 @@ needs:
   `beam_process::ProcessFlags` (answering `ok` without it would fabricate a grant).
   `ets_info_binary/1` is **not a BIF** (absent from `erts/emulator/beam/bif.tab`) and is removed
   from this list.
-- **Process & scheduler control/introspection:** `garbage_collect/1` needs GC-on-demand driven from
-  the heap-admission point (the root set is the *executing* machine's `x`+stack, so a BIF must not
-  collect directly) — the missing API is a `Runtime::request_gc(pid)` latch consumed by
-  `context/gc.rs::ensure_heap`; only the C's `minor`/`major` vs `badarg` argument check is servable
-  in the floor today. `process_display/2` needs a process **stack dump**, which the engine exposes
+- **Process & scheduler control/introspection:** `erlang:garbage_collect/0,1` **are served by the
+  floor** (see above); `erlang:garbage_collect/2` stays a typed capability gap. `process_display/2`
+  needs a process **stack dump**, which the engine exposes
   no accessor for. `suspend_process/2` needs suspend/resume signalling; `await_result/1`,
   `flush_monitor_messages/3` and `'@flush_monitor_messages_refopt'/0` are **pure Erlang** receive
   loops, not BIFs at all. `process_flag/3` and `is_process_alive/2` are **now served by the floor**
