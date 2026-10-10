@@ -891,6 +891,10 @@ impl ProcessTable {
     /// When `tag` is `Some`, the head atom is the caller's user tag instead of `'DOWN'`.
     /// The `{Name, Node}` target is materialised on the watcher's own heap *inside* the
     /// [`build_signal_term`] closure, so a collect-and-retry never leaves a stale word behind.
+    ///
+    /// The message's **`from`** is the `system` atom — an immediate — exactly as the C stores
+    /// `am_system` for a monitor that failed by name (`erl_proc_sig_queue.c:4991`). `from` is
+    /// **not** a GC root and is never relocated, so it may never hold a heap term.
     fn deliver_named_noproc_down(
         &mut self,
         watcher: ProcessId,
@@ -905,7 +909,7 @@ impl ProcessTable {
             let Some(recipient) = lookup_mut(&mut self.slots, watcher) else {
                 return Ok(());
             };
-            let (term, target, off_heap) = build_signal_term(recipient, |heap| {
+            let (term, off_heap) = build_signal_term(recipient, |heap| {
                 let reference_term = reference.to_eterm(heap)?;
                 let target = heap.tuple(&[make_atom(name), make_atom(node)])?;
                 let term = build_down_message_term(
@@ -917,11 +921,11 @@ impl ProcessTable {
                     target,
                     reason,
                 )?;
-                Ok((term, target, Vec::<MsoHandle>::new()))
+                Ok((term, Vec::<MsoHandle>::new()))
             })?;
             recipient
                 .mailbox_mut()
-                .enqueue(Message::new(term, target).with_off_heap(off_heap));
+                .enqueue(Message::new(term, atoms.system_term()).with_off_heap(off_heap));
             recipient.wake()
         };
         if woke {
@@ -929,7 +933,6 @@ impl ProcessTable {
         }
         Ok(())
     }
-
     // --- named monitors ------------------------------------------------------
 
     /// Installs the atom that names the **local node** (e.g. `nonode@nohost`).
@@ -1880,6 +1883,11 @@ impl ProcessTable {
     /// A **named** monitor's DOWN carries the `{Name, node}` pair it was created with rather than
     /// the pid the name resolved to (the oracle's behaviour); an ordinary monitor carries the
     /// pid. The named descriptor is consumed here: the DOWN is its last use.
+    ///
+    /// The message's **`from`** is always the resolved internal pid **immediate**
+    /// ([`ProcessId::to_eterm`]): the C requires `is_immed(ERL_MESSAGE_FROM(mp))`
+    /// (`erl_proc_sig_queue.c:8441`), and a `{Name, node}`/external-pid target belongs in the
+    /// message **body**, never in `from` — which is not a GC root.
     fn build_and_enqueue_down(
         &mut self,
         pid: ProcessId,
@@ -1916,11 +1924,10 @@ impl ProcessTable {
         )?;
         recipient
             .mailbox_mut()
-            .enqueue(Message::new(term, target_term));
+            .enqueue(Message::new(term, target.to_eterm()));
         self.named_monitors.remove(&reference);
         Ok(())
     }
-
     /// Enqueues an exit signal on `to`'s signal queue, copying `reason` out of the heap
     /// described by `src` (the signaller's off-heap table, or `None` for a self-signal whose
     /// reason already lives in `to`'s heap) so the queued reason always outlives the signaller.
@@ -2375,6 +2382,11 @@ impl ProcessTable {
     /// Enqueues `{'DOWN', Ref, process, RemotePid, Reason}` into `watcher`'s mailbox — built on
     /// the watcher's own heap — and wakes a blocked watcher.
     ///
+    /// The message's **`from`** is the remote **node atom** — an immediate — exactly as the C
+    /// stores the node atom for a `DIST_PROC`/`DIST_PORT` monitor
+    /// (`erl_proc_sig_queue.c:4984`/`:5014`); the external-pid target stays in the message
+    /// **body**. `from` is not a GC root, so it may never hold the heap-materialised external pid.
+    ///
     /// An unknown watcher is skipped (it died earlier in the same sweep).
     fn enqueue_remote_down_message(
         &mut self,
@@ -2388,11 +2400,11 @@ impl ProcessTable {
             let Some(recipient) = lookup_mut(&mut self.slots, watcher) else {
                 return Ok(());
             };
-            let (term, from, off_heap) = build_signal_term(recipient, |heap| {
+            let (term, off_heap) = build_signal_term(recipient, |heap| {
                 let reference_term = reference.to_eterm(heap)?;
-                let from = remote.to_eterm(heap)?;
                 // A remote monitor carries no user tag (see `monitor_term_with_tag`), so the
-                // DOWN keeps the default `'DOWN'` head atom.
+                // DOWN keeps the default `'DOWN'` head atom; the closure materialises the remote
+                // pid into the message *body*.
                 let term = build_down_message_remote(
                     heap,
                     atoms,
@@ -2401,11 +2413,11 @@ impl ProcessTable {
                     remote,
                     reason,
                 )?;
-                Ok((term, from, Vec::<MsoHandle>::new()))
+                Ok((term, Vec::<MsoHandle>::new()))
             })?;
             recipient
                 .mailbox_mut()
-                .enqueue(Message::new(term, from).with_off_heap(off_heap));
+                .enqueue(Message::new(term, remote.node()).with_off_heap(off_heap));
             recipient.wake()
         };
         if woke {
@@ -2413,9 +2425,13 @@ impl ProcessTable {
         }
         Ok(())
     }
-
     /// Enqueues `{'EXIT', RemotePid, Reason}` into `peer`'s mailbox — built on the peer's own
     /// heap — and wakes a blocked peer.
+    ///
+    /// The message's **`from`** is the remote **node atom** — an immediate — as the C stores for
+    /// a node-down exit (`erl_proc_sig_queue.c:4984`/`:5014`); the external-pid link partner
+    /// stays in the message **body**. `from` is not a GC root, so it may never hold the
+    /// heap-materialised external pid.
     ///
     /// An unknown peer is skipped (it died earlier in the same sweep).
     fn enqueue_remote_exit_message(
@@ -2429,14 +2445,14 @@ impl ProcessTable {
             let Some(recipient) = lookup_mut(&mut self.slots, peer) else {
                 return Ok(());
             };
-            let (term, from, off_heap) = build_signal_term(recipient, |heap| {
+            let (term, off_heap) = build_signal_term(recipient, |heap| {
                 let from = remote.to_eterm(heap)?;
                 let term = build_exit_message_term(heap, atoms, from, reason)?;
-                Ok((term, from, Vec::<MsoHandle>::new()))
+                Ok((term, Vec::<MsoHandle>::new()))
             })?;
             recipient
                 .mailbox_mut()
-                .enqueue(Message::new(term, from).with_off_heap(off_heap));
+                .enqueue(Message::new(term, remote.node()).with_off_heap(off_heap));
             recipient.wake()
         };
         if woke {
@@ -2444,7 +2460,6 @@ impl ProcessTable {
         }
         Ok(())
     }
-
     // --- name registry -------------------------------------------------------
 
     /// Registers `pid` under `name` (`erlang:register/2`).
