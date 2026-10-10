@@ -3037,7 +3037,7 @@ mod tests {
     /// keeps the faithful **external** reference form (which re-encodes to these very
     /// bytes), never a truncated/substituted id (`beam_codec::ref_wire::representable_ref_id`).
     #[test]
-    fn the_oracle_reference_image_is_a_typed_id_width_gap() {
+    fn the_oracle_reference_image_decodes_to_the_faithful_external_form() {
         let mut oracle = vec![VERSION_MAGIC, 90, 0, 3, 119, 13];
         oracle.extend_from_slice(b"nonode@nohost");
         oracle.extend_from_slice(&0u32.to_be_bytes()); // creation
@@ -3046,10 +3046,19 @@ mod tests {
         oracle.extend_from_slice(&0x43AA_4C1Au32.to_be_bytes()); // n2
 
         with_ctx(|ctx| {
-            let err = binary_to_term_1(ctx, &[bin(&oracle)]).unwrap_err();
+            let back = binary_to_term_1(ctx, &[bin(&oracle)]).expect("the image decodes");
             assert!(
-                matches!(err, beam_common::BeamError::SystemLimit),
-                "expected the typed id-width gap, got {err:?}"
+                access::is_reference(back),
+                "expected a reference, got {back:?}"
+            );
+            assert!(
+                access::is_external_ref(back),
+                "a packed id past the 60-bit small keeps the external form"
+            );
+            assert_eq!(
+                text(term_to_binary_1(ctx, &[back]).unwrap()),
+                oracle,
+                "the external reference re-encodes byte-exactly"
             );
         });
     }
