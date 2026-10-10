@@ -271,7 +271,10 @@ parsed-as-raw, or tooling-only (with a reason). `Docs` (a compressed ExDoc term)
   tagged items until `item_count` of them have been `TAG_i`; a `TAG_a <name_index>` sets the current file
   index and is consumed *in addition* (not counted), a `TAG_i <line>` emits a
   `LineEntry { file, line }` (`beam_file.c:443-602`). `items[0]` is the undefined location `{0,0}`;
-  `files[0]` is synthesized as `<module>.erl`.
+  `files[0]` is synthesized as `<module>.erl`. There is **no separate range-table / func-info
+  line-range chunk** in the `.beam` format: the runtime range table (`beam_ranges.c`) is synthesized at
+  load from this table plus the function labels, so `Module.line` plus the per-function labels is the
+  loader's complete line-info obligation.
 - **`Type`** — `u32 version` (`4` current, `3` OTP 27/28; else fallback), `i32 count` (≥1,
   `entries[0]` = "any"), then per entry a `u16 type_word` (+ optional `i64 lower`, `i64 upper`, `u8 unit-1`
   gated by `type_word` bits 13-15). Absent/incompatible ⇒ a single "any" fallback entry.
