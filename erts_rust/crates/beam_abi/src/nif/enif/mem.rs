@@ -263,8 +263,15 @@ pub unsafe extern "C" fn enif_inspect_binary(
     if data.is_null() {
         return 0;
     }
-    // SAFETY: `data` is writable for `len` bytes and is disjoint from the live term's storage.
-    unsafe { copy_bits_fwd(term, bits, data) };
+    if len == 0 {
+        // A zero-byte window still gets the C's non-NULL `data`; zero it so no uninitialised byte
+        // is even reachable (nothing is exposed at `size == 0`, but the block is then defined).
+        // SAFETY: `data` is one writable byte (just allocated).
+        unsafe { data.write(0) };
+    } else {
+        // SAFETY: `data` is writable for `len` bytes and is disjoint from the live term's storage.
+        unsafe { copy_bits_fwd(term, bits, data) };
+    }
     // SAFETY: `bin` is non-null and writable; the null marker records the copy as owned.
     unsafe {
         bin.write(ErlNifBinary {
