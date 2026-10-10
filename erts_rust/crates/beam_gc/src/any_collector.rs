@@ -67,6 +67,18 @@ impl AnyCollector {
         }
     }
 
+    /// Creates a collector for `policy` with the **automatic rule** deciding the mature
+    /// strategy — the strategy-dispatching counterpart of [`Collector::new`] for a caller that
+    /// owns only a heap policy (the host `beam_process::Process` does exactly that).
+    ///
+    /// Equivalent to `AnyCollector::from_config(&GcConfig::new(policy))`, so it resolves to
+    /// the same strategy [`GcConfig::new`] does: the copying [`Collector`] for a policy below
+    /// the break-even (the default policy included) and the [`GenImmixCollector`] at/above it
+    /// ([`crate::selection`]).
+    pub fn new(policy: HeapPolicy) -> Result<AnyCollector> {
+        AnyCollector::from_config(&GcConfig::new(policy))
+    }
+
     /// The `MatureKind` this collector was built for.
     pub fn kind(&self) -> MatureKind {
         match self {
@@ -109,6 +121,42 @@ impl AnyCollector {
         }
     }
 
+    /// The mature generation's **capacity** in words — the strategy-agnostic form of
+    /// `mature().capacity_words()`.
+    ///
+    /// The two mature generations are differently-typed ([`HeapSpace`] for the copying
+    /// [`Collector`], [`ImmixSpace`](crate::immix::ImmixSpace) for the
+    /// [`GenImmixCollector`]), so there is no common `&` reference to hand back; this method
+    /// and its two siblings expose the word-count observables both types agree on, in the same
+    /// unit (words). The mark-region space accounts in whole lines, so its figures are
+    /// line-rounded (`used_lines * LINE_WORDS`): a caller reads them as "at least this many
+    /// words", never as an exact per-object count.
+    pub fn mature_capacity_words(&self) -> usize {
+        match self {
+            AnyCollector::Copying(c) => c.mature().capacity_words(),
+            AnyCollector::Immix(c) => c.mature().capacity_words(),
+        }
+    }
+
+    /// The words the mature generation currently holds (whole lines in the mark-region
+    /// strategy — see [`mature_capacity_words`](AnyCollector::mature_capacity_words)).
+    pub fn mature_used_words(&self) -> usize {
+        match self {
+            AnyCollector::Copying(c) => c.mature().used_words(),
+            AnyCollector::Immix(c) => c.mature().used_words(),
+        }
+    }
+
+    /// The words the mature generation can still hand out (whole lines in the mark-region
+    /// strategy — see [`mature_capacity_words`](AnyCollector::mature_capacity_words)). Always
+    /// `mature_capacity_words() - mature_used_words()`.
+    pub fn mature_available_words(&self) -> usize {
+        match self {
+            AnyCollector::Copying(c) => c.mature().available_words(),
+            AnyCollector::Immix(c) => c.mature().available_words(),
+        }
+    }
+
     /// The collector's accumulated statistics.
     pub fn stats(&self) -> GcStats {
         match self {
@@ -129,6 +177,21 @@ impl AnyCollector {
     /// The `garbage_collection` observables of the selected strategy.
     pub fn heap_info(&self) -> crate::heap_info::HeapInfo {
         crate::heap_info::HeapInfo::of(self)
+    }
+
+    /// Whether the nursery can no longer satisfy `need_words` more words — the query a runtime
+    /// makes at its heap-admission point before it decides to collect. Forwarded to whichever
+    /// strategy is selected ([`Collector::should_collect`] /
+    /// [`GenImmixCollector::should_collect`]).
+    ///
+    /// Both strategies answer this from the **shared** young nursery (an exact-fit allocation
+    /// still fits), so the answer is strategy-independent — a caller that switches the mature
+    /// generation gets the same admission decisions.
+    pub fn should_collect(&self, need_words: usize) -> bool {
+        match self {
+            AnyCollector::Copying(c) => c.should_collect(need_words),
+            AnyCollector::Immix(c) => c.should_collect(need_words),
+        }
     }
 
     /// Runs a collection on the selected strategy.
