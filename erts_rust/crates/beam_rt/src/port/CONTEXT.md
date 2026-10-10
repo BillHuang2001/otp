@@ -163,6 +163,7 @@ The message itself is `RuntimeContext::signal_notify_message(name)` → `(from, 
 - `driver/stop_select_tests.rs` → the A.4 `ERL_DRV_USE`/`stop_select` handback regression suite.
 - `watch.rs` → the `os:set_signal/2` delivery half (facility + `SignalWatch` + the `{notify,Signal}` name builder).
 - `../port.rs` → the A.4 `PortHook` provider, the poller/`PortRegistry`, the port-task round and the message builders.
+- `tests.rs` → that provider's unit suite (`open_port/2`'s decode, the `port_info` vocabulary, the port-message pump, the `next_deadline` clamp and the read path).
 - `../native/port.rs` → the native `port_command/2,3` + `port_info` closed-port/`registered_name` floor.
 - `../context/signal.rs` → the `os:set_signal/2` answer surface (delegates the facility to `watch.rs`).
 - `../context/` → installs `RuntimePorts` as the `PortHook` on every registered-BIF arm.
