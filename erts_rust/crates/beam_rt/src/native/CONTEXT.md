@@ -539,40 +539,28 @@ needs:
   are **Not implemented** and still fall through to a real preloaded-`.beam` load (they ship in the
   `erts` `ebin`, which is on the code path) whose `-nifs()`/`erlang:load_nif` entry then needs the
   matching host.
-  * **Served beyond the table above:** `pread/2,3` and `pwrite/2,3` (`{ok,Bin}`/`ok`/`{error,R}`,
-    the file cursor untouched; via the safe `FileExt::read_at`/`write_at`), `truncate/1`
-    (an `ftruncate` at the current position), `sync/1`/`datasync/1`, `write_file/2`
-    (open-then-flatten), `set_cwd/1`, `ipread_s32bu_p32bu/3` (the 8-byte BE `{size,offset}` pointer
-    block) and `get_handle/1` (a bare native-endian fd binary — a documented divergence: the
-    *number* is this runtime's own fd). `copy/3` already works (pure Erlang over
-    `file:copy_opened/3`); a `directory`-mode `open/2` is **not** a gap — `std::fs::File` opens with
-    `O_DIRECTORY` (`open(D,[directory,read])` ⇒ `{ok,Fd}`; `open(D,[read])` ⇒ `{error,eisdir}`).
-  * **Typed gaps (an explicit `unsupported`, never a silent wrong value):**
-    `read_file_info/1,2`, `read_link_info/1,2`, `read_handle_info/1,2` — the `#file_info{}` tuple is
-    fillable from `std::fs::Metadata`/`MetadataExt` for every field **except** `access`, which needs
-    `access(2)` (path forms) / `geteuid`+`getegid`+mode bits (handle form), absent from safe `std`
-    and the crate is `deny(unsafe_code)`. The *default* time type `local` is **not** a blocker
-    (`erlang:posixtime_to_universaltime/1` + `universaltime_to_localtime/1` are served), so `access`
-    is the sole blocker. `write_file_info/2,3` needs `chmod`/`chown`/`utimes`; `advise/4` needs
-    `posix_fadvise(2)`; `allocate/3` needs `posix_fallocate(2)`; `file_desc_to_ref/2` needs raw fd
-    adoption/`dup`; `read_line/1`'s body drives the `prim_buffer:*` resource NIFs (all `undef`).
-  * `list_dir/1`/`list_dir_all/1` are **not** claimed: their entries come back in `readdir(3)` order,
-    which the oracle does not sort and this runtime cannot pin. (`file_server.rs` *does* serve the
-    `{list_dir,Name}` request — see above — over `std::fs::read_dir`.) `prim_zip:splitter/3` is
-    likewise unclaimed — pure Erlang over iolists whose error paths this floor does not reproduce.
-  * Deliberately unclaimed (an arm would *create* a divergence, since the oracle answers the same):
-    `copy/2`, `write_file/3`, `delayed_close/1` (unexported ⇒ `error:undef`) and `sendfile/8`
-    (oracle `{error,enotsup}`/`badarg`). `internal_get_nif_resource/1` stays unclaimed (no
-    NIF-resource model).
-  * Remaining machinery: the socket/NIF resource machinery (`prim_socket`, `prim_net`, `prim_inet`),
-    zlib (`prim_zip`), a binary-buffer resource (`prim_buffer`), the boot loader protocol
-    (`erl_prim_loader`), and the `prim_eval` iteration protocol. M1's own file/socket/OS floor is
-    deliberately minimal (`os:cmd/1`, `beam_io`'s spawn driver, the port write stream) and is not a
-    `prim_*` implementation.
-  * **Missing `beam_io` facilities (the one place raw syscalls live):** a safe
-    `path_access(Path) -> (R_OK,W_OK)` + `process_credentials() -> (euid,egid)` (which would close
-    the whole `#file_info{}` family), and a raw-syscall floor
-    `fadvise`/`fallocate`/`chmod`/`chown`/`utimes`.
+  * **Served beyond the table above:** `pread/2,3`, `pwrite/2,3` (cursor untouched, via safe
+    `FileExt::read_at`/`write_at`), `truncate/1`, `sync/1`, `datasync/1`, `write_file/2`, `set_cwd/1`,
+    `ipread_s32bu_p32bu/3`, `get_handle/1` (a bare native-endian fd binary — divergence: the *number*
+    is this runtime's own fd). `copy/3` works (pure Erlang); `open(D,[directory,read])` ⇒ `{ok,Fd}`
+    (`std::fs::File` opens with `O_DIRECTORY`; `open(D,[read])` ⇒ `{error,eisdir}`).
+  * **Typed gaps (explicit `unsupported`, never a silent wrong value):** `read_file_info/1,2`,
+    `read_link_info/1,2`, `read_handle_info/1,2` — every `#file_info{}` field is fillable from
+    `std::fs::Metadata`/`MetadataExt` **except** `access` (`access(2)` / `geteuid`+`getegid`, absent
+    from safe `std`; the crate is `deny(unsafe_code)`); the default `local` time type is **not** a
+    blocker (`posixtime_to_universaltime/1` + `universaltime_to_localtime/1` are served). Also
+    `write_file_info/2,3` (`chmod`/`chown`/`utimes`), `advise/4`, `allocate/3`, `file_desc_to_ref/2`
+    (raw fd adoption), `read_line/1` (drives the `prim_buffer:*` resource NIFs, all `undef`).
+  * `list_dir/1`/`list_dir_all/1` **not** claimed: `readdir(3)` order, unpinnable (`file_server.rs`
+    *does* serve the `{list_dir,Name}` request over `std::fs::read_dir`). `prim_zip:splitter/3`
+    unclaimed (pure Erlang, error paths not reproduced).
+  * Deliberately unclaimed (an arm would *create* a divergence — the oracle answers the same):
+    `copy/2`, `write_file/3`, `delayed_close/1` (unexported ⇒ `error:undef`), `sendfile/8`
+    (`{error,enotsup}`/`badarg`), `internal_get_nif_resource/1` (no NIF-resource model).
+  * Remaining machinery: `prim_socket`/`prim_net`/`prim_inet`, `prim_zip` (zlib), `prim_buffer`,
+    `erl_prim_loader` (boot loader protocol), `prim_eval`. **Missing `beam_io` facilities:** a safe
+    `path_access` + `process_credentials()` (closes the whole `#file_info{}` family) and a raw-syscall
+    floor `fadvise`/`fallocate`/`chmod`/`chown`/`utimes`.
 
 ## Handoffs (owned by OTHER nodes)
 The per-call dispatch arm for every native BIF is a registration in `../native.rs` (one level up, the parent node — outside *this* node's scope).
