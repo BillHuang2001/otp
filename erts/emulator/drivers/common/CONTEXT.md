@@ -3,7 +3,7 @@
 ## Intent
 The two live, statically-linked `erl_driver` (port) drivers that are OS-independent: `inet_drv.c` (the Erlang socket driver backing `gen_tcp`/`gen_udp`/`gen_sctp`, `inet_tcp`/`inet_udp`/`inet_sctp`, `local_tcp`/`local_udp`, all via the preloaded `prim_inet`) and `ram_file_drv.c` (in-memory file backing `lib/kernel`'s `ram_file`).
 Both are compiled into `beam` via `DRV_OBJS` in `../Makefile.in` and registered at VM start through the generated `driver_tab[]`.
-`inet_drv.c` is ~15.9k lines (the VM's largest single source of socket semantics); `ram_file_drv.c` is ~534 lines.
+`inet_drv.c` is ~15.9k lines (the VM's largest single source of socket semantics); `ram_file_drv.c` is ~515 lines.
 
 ## API Surface
 Public (to Erlang) surface is the drivers' registered names and the port-control / port-command wire protocol, not C symbols.
