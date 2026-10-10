@@ -156,5 +156,7 @@ A runtime **halt** the program requests is neither: it exits with the requested 
 * `flags.rs` → the validators for the emulator switches with no runtime-visible effect (`+Q`/`+P`/`+K`/`+sbt`/`-emu_flavor`/`-M*`+`+M*`) and their ground-truth constants
 * `vars.rs` → the `ErlEnv` model + `from_env` for the `ERL_*` variables **outside** the `*FLAGS` merge (`ERL_MAX_PORTS`/`ERL_INETRC`/`ERL_CRASH_DUMP`/`ERL_CRASH_DUMP_SECONDS`/`ERL_ROOTDIR`/`ERL_MAX_ETS_TABLES`/`ERL_FULLSWEEP_AFTER`)
 * `../cli.rs` → the switch parser (`parse`/`parse_with_env`, incl. the `+Q` / `ERL_MAX_PORTS` → `RuntimeConfig::max_ports` request), the `USAGE` text, the `run` driver and the four `EXIT_*` codes (the parent of this directory)
+* `../../tests/cli.rs` → the A.6 vertical-slice / exit-code end-to-end suite on the built binary
 * `../../tests/cli_flags.rs` → the A.6 integration suite at the executable boundary
 * `../../tests/cli_env.rs` → the A.6 integration suite for the non-`*FLAGS` environment variables
+* `../../tests/boot.rs` → the A.7/A.9 `-boot FILE` action suite on the built binary (the real `bootstrap/bin/start.boot` to `{progress,started}`)
