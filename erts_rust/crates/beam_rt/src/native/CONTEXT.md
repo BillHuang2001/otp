@@ -355,12 +355,12 @@ The reply tag is **paired** with the request tag, never echoed: `{io_request, �
 * **A scheduled process's `gen_server:call` to the service cannot complete** — the engine's
   non-blocking `fold_outcome` folds the callee's suspend into `error::blocked()`. Owner:
   **`beam_engine`**.
-* **The io-device read path completes from library code; `file:read_line/1` is the residual gap.**
+* **The io-device read path completes from library code, `{get_line,…}` included.**
   `io:request/2` loads the `io` module body, `net_kernel:dflag_unicode_io/1` is served (the
   `RuntimeHooks` bridge) and the service answers with the tag **paired** to the request, so
-  `file:read/2`, `io:scan_erl_exprs/4` and `io:parse_erl_exprs/4` all complete and agree with the
-  oracle (`../tests/io_scan.rs`). `file:read_line/1`'s `{get_line,…}` request is not served (the
-  list above), so it stays the typed `unsupported` gap.
+  `file:read/2`, `io:scan_erl_exprs/4`, `io:parse_erl_exprs/4` and `file:read_line/1` all complete
+  and agree with the oracle (`../tests/io_scan.rs`; `file:read_line/1` additionally through the
+  `{get_line,…}` arm above).
 
 ## Constraints
 - **`#![deny(unsafe_code)]`** — the crate-wide rule covers this whole floor. Terms are built and
