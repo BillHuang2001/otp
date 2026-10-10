@@ -27,19 +27,32 @@ Ground truth (read-only): `../../../../erts/emulator/beam/emu/map_instrs.tab:49-
 ## Failure paths
 | Site | Condition | `fail != NO_FAIL` | `fail == NO_FAIL` |
 |---|---|---|---|
-| `read.rs:63,95` / `write.rs:84,135` | non-map `source` | jump | raise `{badmap,Source}` |
+| `read.rs:65,93` / `write.rs:84,135` | non-map `source` | jump | raise `{badmap,Source}` |
 | `write.rs:141` | `put_map_exact` key absent | jump | raise `{badkey,Key}` |
-| `read.rs:71,101` | key absent | jump | typed `unsupported` |
+| `read.rs:73,99` | key absent | jump | raise the **bare atom** `function_clause` |
 
-`fail_or_raise` (`mod.rs:211`) forwards the `{Tag,Value}` raise to `raise_error_tuple`
-(`mod.rs:249`); `jump_or_unsupported` (`mod.rs:230`) has no ground-truth reason and yields
-`error::unsupported(what)`.
+`fail_or_raise` (`mod.rs:234`) forwards the `{Tag,Value}` raise to `raise_error_tuple`
+(`mod.rs:300`); `fail_or_function_clause` (`mod.rs:256`) forwards the absent-key `NO_FAIL` branch to
+`raise_function_clause` (`mod.rs:282`), which throws class `error` with the bare atom
+`function_clause` (no tuple — the reason is not `{Tag,Value}`).
+
+### The absent-key `NO_FAIL` reason (engine-defined)
+The read path's C failure is the plain `$FAIL($Fail)` (`emu/map_instrs.tab:49-122` →
+`emu/macros.tab:56-60`), which sets **no** exception reason; only `erts_gc_update_map_exact` sets
+`BADKEY` (`beam_common.c:2265`). The installed `erlc` never emits `NO_FAIL` for the matching forms
+(both read instructions always carry a fail label), so this branchless failure has no ground truth.
+It is engine-defined: class `error`, reason the **bare atom** `function_clause` — the reason C gives
+a head/guard/pattern failure with no branch (`emu/beam_emu.c:578-583` `i_func_info_IaaI`). The tag is
+resolved by name from the running module's atom table (like `badmap`/`badkey`), so a module that
+cannot name it yields the typed `error::unsupported("maps: no 'function_clause' atom in the module")`
+instead of a substituted atom.
 
 ## The reason-atom contract (load-bearing)
 - `raise_error_tuple` resolves the tag **only** from the running module's
-  `beam_loader::Module::atom_table` (`mod.rs:256-259`); a missing name is the typed
-  `error::unsupported("maps: no '<tag>' atom in the module")`, which `error::unsupported`
-  renders as the reason atom `unsupported_opcode: maps: no '<tag>' atom in the module`.
+  `beam_loader::Module::atom_table` (`mod.rs:307-310`); `raise_function_clause` likewise resolves
+  `function_clause` only from it (`mod.rs:283-286`). A missing name is the typed
+  `error::unsupported("maps: no '<name>' atom in the module")`, which `error::unsupported`
+  renders as the reason atom `unsupported_opcode: maps: no '<name>' atom in the module`.
 - **The engine has no global/shared atom lookup and no atom-interner seam.**
   `ExecutionContext` (`../../context.rs`) exposes no atom method; `Machine` holds no atom table;
   `beam_bifs::AtomInterner` is a `BifContext` seam available only *inside* a BIF call; a
