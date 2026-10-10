@@ -20,9 +20,9 @@
 
 use super::*;
 use crate::context::MinimalContext;
-use beam_loader::{Function, Import};
-use beam_term::{make_small, Atom};
-
+use beam_common::ExceptionClass;
+use beam_loader::{Function, Import, TestKind};
+use beam_term::{make_atom, make_small, Atom, Eterm};
 /// A one-function module whose single entry label is `entry`.
 fn module_with_function(code: Vec<Instr>, imports: Vec<Import>) -> (Module, Atom) {
     let mut module = Module::default();
@@ -363,7 +363,206 @@ fn step_instruction_out_of_range_is_a_typed_error() {
         .is_err());
 }
 
-/// A module whose `n` imports are `erlang:f0/2` .. `erlang:f<n-1>/2`,
+// ---- the `NO_FAIL` failure semantics of `test`/`select_val` ------------
+
+/// The `(class, live reason term)` of the uncaught raise one step of `machine`
+/// at `pc` produced. Panics unless the step raised, and unless the raise carries
+/// a live reason term, so a test can never pass by observing a different outcome
+/// than the one it pins.
+fn step_uncaught_raise(
+    module: &Module,
+    labels: &LabelMap,
+    pc: u32,
+    machine: &mut Machine,
+) -> (ExceptionClass, Eterm) {
+    let err = machine
+        .step_instruction(module, labels, 0, pc, &mut MinimalContext::new())
+        .expect_err("the step raises");
+    match err {
+        BeamError::Raise(raise) => {
+            let live = raise
+                .live_reason
+                .as_ref()
+                .expect("an uncaught reason carries its term");
+            (
+                raise.class,
+                *live.downcast_ref::<Eterm>().expect("the reason term"),
+            )
+        }
+        other => panic!("expected an uncaught raise, got {other:?}"),
+    }
+}
+
+/// A `test` whose operand is not a tuple and whose failure operand is the
+/// `f,0` sentinel raises class `error` with the **bare** atom
+/// `function_clause` — the failed-clause reason `func_info` raises, with the
+/// arguments in the stacktrace rather than in the reason.
+#[test]
+fn test_with_no_fail_raises_function_clause() {
+    let (mut module, _) = module_with_function(
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Test {
+                kind: TestKind::IsTuple,
+                fail: NO_FAIL,
+                args: vec![Operand::X(0)],
+            },
+            Instr::Return,
+        ],
+        Vec::new(),
+    );
+    let reason_atom = module.atom_table.intern("function_clause");
+    module.atom_table.intern("error");
+    let labels = build_label_map(&module);
+    let mut machine = Machine::new();
+    // A small integer is not a tuple, so the test fails.
+    machine.set_x(0, make_small(1)).unwrap();
+
+    let (class, reason) = step_uncaught_raise(&module, &labels, 1, &mut machine);
+    assert_eq!(class, ExceptionClass::Error);
+    assert_eq!(reason, make_atom(reason_atom));
+    // The machine records exactly the same pending class + reason term.
+    assert_eq!(machine.pending_class(), Some(ExceptionClass::Error));
+    assert_eq!(
+        machine.pending_exception(),
+        Some((ExceptionClass::Error, make_atom(reason_atom)))
+    );
+}
+
+/// The same for `select_val`: a scrutinee matching no alternative with an `f,0`
+/// failure operand raises class `error` with the bare atom `function_clause`.
+#[test]
+fn select_val_with_no_fail_raises_function_clause() {
+    let (mut module, _) = module_with_function(
+        vec![
+            Instr::Label(Label(1)),
+            Instr::SelectVal {
+                value: Operand::X(0),
+                fail: NO_FAIL,
+                pairs: vec![(Operand::Integer(1), Label(3))],
+            },
+            Instr::Label(Label(2)),
+            Instr::Return,
+            Instr::Label(Label(3)),
+            Instr::Return,
+        ],
+        Vec::new(),
+    );
+    let reason_atom = module.atom_table.intern("function_clause");
+    module.atom_table.intern("error");
+    let labels = build_label_map(&module);
+    let mut machine = Machine::new();
+    // `2` matches neither alternative.
+    machine.set_x(0, make_small(2)).unwrap();
+
+    let (class, reason) = step_uncaught_raise(&module, &labels, 1, &mut machine);
+    assert_eq!(class, ExceptionClass::Error);
+    assert_eq!(reason, make_atom(reason_atom));
+    assert_eq!(
+        machine.pending_exception(),
+        Some((ExceptionClass::Error, make_atom(reason_atom)))
+    );
+}
+
+/// A module that never mentions `function_clause` cannot name the reason, so a
+/// `test` `NO_FAIL` failure stays the honest typed error — never a substituted
+/// atom.
+#[test]
+fn test_with_no_fail_on_a_module_without_function_clause_is_the_typed_gap() {
+    let (module, _) = module_with_function(
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Test {
+                kind: TestKind::IsTuple,
+                fail: NO_FAIL,
+                args: vec![Operand::X(0)],
+            },
+            Instr::Return,
+        ],
+        Vec::new(),
+    );
+    // The synthetic module's table holds no `function_clause` atom.
+    assert!(module.atom_table.lookup("function_clause").is_none());
+    let labels = build_label_map(&module);
+    let mut machine = Machine::new();
+    machine.set_x(0, make_small(1)).unwrap();
+
+    let err = machine
+        .step_instruction(&module, &labels, 0, 1, &mut MinimalContext::new())
+        .unwrap_err();
+    match err {
+        BeamError::Raise(raise) => assert_eq!(
+            raise.reason.as_atom(),
+            Some("unsupported_opcode: test: no 'function_clause' atom in the module")
+        ),
+        other => panic!("expected the typed gap, got {other:?}"),
+    }
+}
+
+/// The `select_val` spelling of the same typed gap.
+#[test]
+fn select_val_with_no_fail_on_a_module_without_function_clause_is_the_typed_gap() {
+    let (module, _) = module_with_function(
+        vec![
+            Instr::Label(Label(1)),
+            Instr::SelectVal {
+                value: Operand::X(0),
+                fail: NO_FAIL,
+                pairs: vec![(Operand::Integer(1), Label(3))],
+            },
+            Instr::Label(Label(2)),
+            Instr::Return,
+            Instr::Label(Label(3)),
+            Instr::Return,
+        ],
+        Vec::new(),
+    );
+    assert!(module.atom_table.lookup("function_clause").is_none());
+    let labels = build_label_map(&module);
+    let mut machine = Machine::new();
+    machine.set_x(0, make_small(2)).unwrap();
+
+    let err = machine
+        .step_instruction(&module, &labels, 0, 1, &mut MinimalContext::new())
+        .unwrap_err();
+    match err {
+        BeamError::Raise(raise) => assert_eq!(
+            raise.reason.as_atom(),
+            Some("unsupported_opcode: select_val: no 'function_clause' atom in the module")
+        ),
+        other => panic!("expected the typed gap, got {other:?}"),
+    }
+}
+
+/// A live fail label is unchanged: the failed test **branches** to it, it does
+/// not raise.
+#[test]
+fn test_with_a_live_fail_label_branches_instead_of_raising() {
+    let (module, _) = module_with_function(
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Test {
+                kind: TestKind::IsTuple,
+                fail: Label(2),
+                args: vec![Operand::X(0)],
+            },
+            Instr::Label(Label(2)),
+            Instr::Return,
+        ],
+        Vec::new(),
+    );
+    // No `function_clause`/`error` atom is needed: a live fail label never
+    // builds a reason.
+    let labels = build_label_map(&module);
+    let mut machine = Machine::new();
+    machine.set_x(0, make_small(1)).unwrap();
+
+    let step = machine
+        .step_instruction(&module, &labels, 0, 1, &mut MinimalContext::new())
+        .unwrap();
+    assert_eq!(step, Step::Goto { func: 0, pc: 2 });
+    assert_eq!(machine.pending_exception(), None);
+}/// A module whose `n` imports are `erlang:f0/2` .. `erlang:f<n-1>/2`,
 /// interned into its own atom table.
 fn module_with_imports(n: u32) -> Module {
     let (mut module, _) =

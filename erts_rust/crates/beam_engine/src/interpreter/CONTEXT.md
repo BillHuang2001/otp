@@ -51,7 +51,12 @@ Ground truth (read-only, never modify): `../../../../../erts/emulator/beam/emu/*
   `Machine::drive`, which knows the run's true entry module.
 - **`FuncInfo` is NOT a metadata no-op** — a failed head-pattern/guard jumps into it and it raises class `error` with the
   bare atom `function_clause`. Inlining it as a no-op would loop on the entry label.
-- `Test`/`SelectVal` raise on a `NO_FAIL` failure; a comparison `Test`/`SelectVal` uses `cmp` (`=:=`) vs `cmp_arith` (`==`).
+- `Test`/`SelectVal` raise on a `NO_FAIL` failure: class `error` with the **bare atom** `function_clause` (the
+  failed-clause reason `func_info` raises — C's plain `FAIL(Fail)` sets no reason, so the `f,0` sentinel goes through
+  `i_func_info_IaaI` → `handle_error`), resolved only from the running module's atom table via
+  `raise_function_clause_no_fail` in `dispatch.rs`; a module without that atom stays the typed
+  `unsupported("test: …"/"select_val: … no 'function_clause' atom in the module")`. A comparison `Test`/`SelectVal` uses
+  `cmp` (`=:=`) vs `cmp_arith` (`==`).
 - `gc_bif`/`bif` decode a boxed-term test only where the family/`predicates` do; the small-int `'+'`/`'-'`/`'*'` and the
   eight comparison BIFs have baseline-JIT inline paths (see `../jit/baseline/emit/`), everything else deopts to
   `jit_step_one` (`../jit/baseline/runtime.rs`), which calls `step_instruction`.

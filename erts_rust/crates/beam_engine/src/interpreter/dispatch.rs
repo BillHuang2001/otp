@@ -247,7 +247,7 @@ impl Machine {
                 if self.eval_test(module, *kind, args, ctx)? {
                     Ok(Step::Next)
                 } else if *fail == NO_FAIL {
-                    Err(error::unsupported("test/no_fail"))
+                    raise_function_clause_no_fail(self, module, "test")
                 } else {
                     let (func, pc) = resolve(labels, *fail)?;
                     Ok(Step::Goto { func, pc })
@@ -268,7 +268,9 @@ impl Machine {
                         let (func, pc) = resolve(labels, label)?;
                         Ok(Step::Goto { func, pc })
                     }
-                    None if *fail == NO_FAIL => Err(error::unsupported("select_val/no_fail")),
+                    None if *fail == NO_FAIL => {
+                        raise_function_clause_no_fail(self, module, "select_val")
+                    }
                     None => {
                         let (func, pc) = resolve(labels, *fail)?;
                         Ok(Step::Goto { func, pc })
@@ -641,4 +643,46 @@ impl Machine {
         let (func, pc) = handle.labels.resolve(label)?;
         Ok(Some((context, func, pc)))
     }
+}
+
+/// Raise the failure of a `test`/`select_val` whose failure operand is the
+/// [`NO_FAIL`] sentinel (`f,0`) — "raise on failure" rather than "branch to
+/// label 0".
+///
+/// C's plain `FAIL(Fail)` macro only sets the instruction pointer
+/// (`emu/macros.tab:56-60`) and sets **no** reason, so a `test`/`select_val` that
+/// cannot branch has to raise through the failed-clause path: `func_info` is the
+/// instruction a failed head-pattern/guard jumps to, and `i_func_info_IaaI`
+/// (`../../erts/emulator/beam/emu/beam_emu.c:578-583`) unconditionally sets
+/// `c_p->freason = EXC_FUNCTION_CLAUSE` and `goto handle_error`, which
+/// (`../../erts/emulator/beam/beam_common.c:448-544`, `expand_error_value`)
+/// materializes class `error` with the **bare atom** `function_clause` — the call
+/// arguments ride in the stacktrace, never in the reason.
+///
+/// `what` names the raising instruction (`"test"`/`"select_val"`) for the typed
+/// error a module that cannot name the reason produces. The reason atom is
+/// resolved **only** in the running module's atom table: a module that never
+/// mentions `function_clause` yields the honest typed `unsupported`, never a
+/// substituted atom (an atom index is valid only against the table it is read
+/// with).
+fn raise_function_clause_no_fail(
+    machine: &mut Machine,
+    module: &Module,
+    what: &str,
+) -> Result<Step> {
+    let atom = module.atom_table.lookup("function_clause").ok_or_else(|| {
+        error::unsupported(&format!(
+            "{what}: no 'function_clause' atom in the module"
+        ))
+    })?;
+    let reason = make_atom(atom);
+    // Install the `error` class atom when the module has it; the throw consults it
+    // only when the raise actually lands. A module without it still propagates a
+    // typed `BeamError::Raise(..)` uncaught, and a landing fails with a typed
+    // `unsupported` — the `install_class_atom` contract (mirrors the `FuncInfo`
+    // arm above and `families/exceptions.rs::raise_error_atom`).
+    if let Some(class_atom) = module.atom_table.lookup(ExceptionClass::Error.as_str()) {
+        machine.set_class_atom(ExceptionClass::Error, make_atom(class_atom));
+    }
+    machine.throw_error(reason)
 }
