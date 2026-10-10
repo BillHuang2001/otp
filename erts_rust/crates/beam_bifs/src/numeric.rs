@@ -418,13 +418,22 @@ fn format_fixed(value: f64, decimals: i64, compact: bool) -> Result<String> {
 /// decimal that round-trips, written as `std::to_chars` writes it and then
 /// rewritten by hand into the oracle's form.
 ///
+/// This is also the **plain float leaf of the printer**: `io_lib:write1/4`'s
+/// float clause is `io_lib_format:fwrite_g(Float)` and `fwrite_g/1` is exactly
+/// `float_to_list(Float, [short])` (`lib/stdlib/src/io_lib_format.erl:758-760`),
+/// so `~w`/`~p`/`~W`/`~P` render every float through here too
+/// ([`crate::print`]). The domain is finite floats: OTP has no representable
+/// `inf`/`NaN` at all (a `NEW_FLOAT_EXT` image with exponent `16#7FF` is
+/// rejected by `binary_to_term/1`), so there is no oracle behaviour to match
+/// beyond it — see `crate::print::format_float`.
+///
 /// # Errors
 ///
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a rendering the
 /// oracle's buffer cannot hold (`do_float_to_charbuf` converts `to_chars`'s zero
 /// return into `badarg`). An `f64` never comes close to 255 characters, so this
 /// mirrors the C's guard rather than a reachable limit.
-fn format_short(value: f64) -> Result<String> {
+pub(crate) fn format_short(value: f64) -> Result<String> {
     let out = shorter(to_chars_general(value).into_bytes());
     if out.len() > FLOAT_BUF_CHARS {
         return Err(badarg());
