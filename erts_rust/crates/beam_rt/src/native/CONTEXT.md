@@ -168,8 +168,9 @@ for an unregistered `registered_name`), so the list is a genuine, shorter-by-con
   of truth shared by `erlang:group_leader/0`, the `/2` BIFs and this item. It is this runtime's real
   pid, not the oracle's `<0.70.0>` io process.
 - **`reductions`** is this process's real counter (the absolute value differs — the code differs).
-- **`error_handler`** (the atom `error_handler`), **`suspending`** (`[]`) and **`last_calls`** (`false`)
-  are unchanging runtime defaults — the facts they report are true of this runtime.
+- **`error_handler`** (the atom `error_handler`) and **`suspending`** (`[]`) are unchanging runtime
+  defaults — the facts they report are true of this runtime. **`last_calls`** is the exception: it is
+  hard-coded `false` while `Process::save_calls()` holds a real flag — see its table row.
 - **`message_queue_data`** is `on_heap` because that is this runtime's real **current** placement
   (`beam_message::Queue` is heap-resident FIFO). The one divergence is an **explicit**
   `process_flag(message_queue_data, off_heap)`, which `process.rs` accepts and ignores — so such a
