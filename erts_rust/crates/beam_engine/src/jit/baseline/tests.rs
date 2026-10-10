@@ -1494,3 +1494,255 @@ fn a_linked_chain_records_the_last_block_entry_as_the_position() {
     // position differs, exactly as the block-granularity contract intends.
     assert_eq!(error_reason(&baseline_err), error_reason(&interpreter_err));
 }
+
+// ---------------------------------------------------------------------------
+// resuming a suspension parked inside a cross-module callee
+// ---------------------------------------------------------------------------
+
+/// A tiny in-memory mailbox for the cross-module resume test: a `Vec` of messages
+/// plus a scan position, so the test can fill the queue **between** the suspension
+/// and the resume.
+///
+/// Only the scan methods this receive shape reaches are overridden; the marker
+/// family keeps the [`Mailbox`] trait's typed `unsupported` default (the receive
+/// below has no `recv_marker_*` instruction).
+#[derive(Clone, Default)]
+struct ResumeMailbox {
+    /// The queued messages, in arrival order.
+    messages: std::rc::Rc<std::cell::RefCell<Vec<Eterm>>>,
+    /// The scan position `loop_rec` peeks at; `loop_rec_end` advances it.
+    scan: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+impl ResumeMailbox {
+    /// An empty mailbox.
+    fn new() -> ResumeMailbox {
+        ResumeMailbox::default()
+    }
+
+    /// Queue `message` as the next arrival.
+    fn push(&self, message: Eterm) {
+        self.messages.borrow_mut().push(message);
+    }
+
+    /// The queued messages, in arrival order.
+    fn messages(&self) -> Vec<Eterm> {
+        self.messages.borrow().clone()
+    }
+}
+
+impl crate::Mailbox for ResumeMailbox {
+    fn send_message(&mut self, _to: Eterm, message: Eterm) -> Result<()> {
+        self.push(message);
+        Ok(())
+    }
+
+    fn receive_next(&mut self) -> Result<Option<Eterm>> {
+        let scan = self.scan.get();
+        Ok(self.messages.borrow().get(scan).copied())
+    }
+
+    fn receive_skip(&mut self) -> Result<()> {
+        self.scan.set(self.scan.get() + 1);
+        Ok(())
+    }
+
+    fn receive_remove(&mut self) -> Result<()> {
+        let scan = self.scan.get();
+        let mut messages = self.messages.borrow_mut();
+        if scan < messages.len() {
+            messages.remove(scan);
+        }
+        self.scan.set(0);
+        Ok(())
+    }
+
+    fn receive_reset(&mut self) -> Result<()> {
+        self.scan.set(0);
+        Ok(())
+    }
+
+    // The receive below has no `recv_marker_*` instruction, so the marker family is
+    // the seam's honest "this mailbox cannot serve it" answer, never a silent no-op.
+    fn receive_marker_reserve(&mut self) -> Result<Eterm> {
+        Err(crate::error::unsupported("receive_marker_reserve"))
+    }
+
+    fn receive_marker_bind(&mut self, _marker: Eterm, _reference: Eterm) -> Result<()> {
+        Err(crate::error::unsupported("receive_marker_bind"))
+    }
+
+    fn receive_marker_use(&mut self, _reference: Eterm) -> Result<()> {
+        Err(crate::error::unsupported("receive_marker_use"))
+    }
+
+    fn receive_marker_clear(&mut self, _reference: Eterm) -> Result<()> {
+        Err(crate::error::unsupported("receive_marker_clear"))
+    }
+}
+
+/// A context whose cross-module-call seam resolves `callee_x:g/0` to `entry`
+/// (against the shared `Arc` handle the engine keeps alive while a frame can return
+/// into the callee) and whose mailbox is `mailbox`.
+fn cross_resume_context(
+    callee: &std::sync::Arc<Module>,
+    entry: Label,
+    mailbox: ResumeMailbox,
+) -> MinimalContext {
+    let handle = std::sync::Arc::clone(callee);
+    let mut ctx = MinimalContext::with_external_resolver(Box::new(move |module, function, arity| {
+        if module == "callee_x" && function == "g" && arity == 0 {
+            Ok(Some((std::sync::Arc::clone(&handle), entry)))
+        } else {
+            Ok(None)
+        }
+    }));
+    ctx.set_mailbox(Box::new(mailbox));
+    ctx
+}
+
+/// The caller/callee pair the cross-module resume test drives: `caller_x:f/0`
+/// allocates a frame and `call_ext`s `callee_x:g/0`, whose body scans its mailbox
+/// (`loop_rec`/`remove_message`/`return`) and suspends on an empty one
+/// (`wait`), resuming at the `loop_rec`.
+///
+/// The callee's `wait` re-enters **after** the `allocate`, exactly like the compiler's
+/// own receive loop, so a resume pushes no second frame.
+fn cross_resume_modules() -> (Module, Atom, std::sync::Arc<Module>) {
+    let callee_module = build_module(
+        "callee_x",
+        &[],
+        vec![(
+            "g",
+            0,
+            vec![
+                Instr::Label(Label(1)), // the function label
+                Instr::Label(Label(2)), // the export entry (`allocate`)
+                Instr::Allocate {
+                    stack_need: beam_loader::HeapNeed::Words(0),
+                    live: 0,
+                },
+                Instr::Label(Label(3)), // the `loop_rec` the `wait` resumes at
+                Instr::LoopRec {
+                    fail: Label(4),
+                    dst: Operand::X(0),
+                },
+                Instr::RemoveMessage,
+                Instr::Deallocate(0),
+                Instr::Return,
+                Instr::Label(Label(4)), // the empty-mailbox arm
+                Instr::Wait { target: Label(3) },
+            ],
+        )],
+        &[("g", 0, Label(2))],
+    );
+    let callee = std::sync::Arc::new(callee_module);
+
+    let caller = build_module(
+        "caller_x",
+        &[("callee_x", "g", 0)],
+        vec![(
+            "f",
+            0,
+            vec![
+                Instr::Label(Label(1)),
+                Instr::Label(Label(2)),
+                Instr::Allocate {
+                    stack_need: beam_loader::HeapNeed::Words(0),
+                    live: 0,
+                },
+                Instr::CallExt {
+                    arity: 0,
+                    target: ImportRef(0),
+                },
+                Instr::DeallocateReturn(0),
+            ],
+        )],
+        &[("f", 0, Label(2))],
+    );
+    let name = export_atom(&caller, "f");
+    (caller, name, callee)
+}
+
+/// Park `caller_x:f/0` on an empty mailbox, deliver one message and resume — all on
+/// `tier` — returning `(parked, resumed, remaining messages)`.
+fn park_and_resume(
+    caller: &Module,
+    name: Atom,
+    callee: &std::sync::Arc<Module>,
+    tier: Tier,
+) -> (RunOutcome, RunOutcome, Vec<Eterm>) {
+    let mailbox = ResumeMailbox::new();
+    let mut ctx = cross_resume_context(callee, Label(2), mailbox.clone());
+    let mut machine = Machine::new();
+
+    let parked = machine
+        .run_export_outcome_with_tier(caller, name, 0, &[], &mut ctx, tier)
+        .expect("the empty mailbox parks the process");
+    let (func, pc) = match parked {
+        RunOutcome::Wait { func, pc } => (func, pc),
+        ref other => panic!("expected a wait, got {other:?}"),
+    };
+    // The process is parked **inside the callee**, i.e. in a non-zero module
+    // context: the caller's `call_ext` entered the callee's context, whose registered
+    // handle and module must survive the suspension for the resume to land in it.
+    assert_ne!(
+        machine.current_context(),
+        0,
+        "the suspension must be parked in the callee's module context, not the caller's"
+    );
+
+    mailbox.push(make_small(42));
+    let resumed = machine
+        .resume_outcome_with_tier(caller, func, pc, &mut ctx, tier)
+        .expect("the resume completes");
+    (parked, resumed, mailbox.messages())
+}
+
+/// A suspension parked inside a **cross-module callee** resumes on the native tier and
+/// completes with the interpreter's exact result.
+///
+/// The caller `call_ext`s `callee_x:g/0` through the host's
+/// [`ExecutionContext::resolve_external_call`](crate::ExecutionContext::resolve_external_call)
+/// seam, so the callee runs in the caller's **own** machine and its `receive` parks
+/// the process in the callee's module context. [`Machine::resume_outcome_with_tier`]
+/// with [`Tier::BaselineJit`] therefore starts the driver in that context (read from
+/// `Machine::current_context`), re-binds the callee's module, label map and literal
+/// area, resolves its compiled blocks through `NativeCode::module_blocks`, re-enters
+/// the callee's `(func, pc)`, and the resumed slice unwinds back through the caller's
+/// frame to the identical [`RunOutcome::Returned`].
+///
+/// Without the cross-module resume handling this is the exact case that failed: a
+/// resume that assumed the entry module/context would either run the callee's address
+/// as a caller-module address (a wrong result) or report a typed `unsupported`.
+#[test]
+fn a_suspension_inside_a_cross_module_callee_resumes_on_the_baseline_tier() {
+    let (caller, name, callee) = cross_resume_modules();
+
+    let (interpreter_parked, interpreter_resumed, interpreter_rest) =
+        park_and_resume(&caller, name, &callee, Tier::Interpreter);
+    let (baseline_parked, baseline_resumed, baseline_rest) =
+        park_and_resume(&caller, name, &callee, Tier::BaselineJit);
+
+    assert!(
+        matches!(&interpreter_parked, RunOutcome::Wait { .. }),
+        "the interpreter must park too, got {interpreter_parked:?}"
+    );
+    assert_eq!(
+        baseline_parked, interpreter_parked,
+        "both tiers must report the same resume address for the parked receive"
+    );
+    assert_eq!(
+        interpreter_resumed,
+        RunOutcome::Returned(make_small(42)),
+        "the resumed receive yields the delivered message through the caller's return"
+    );
+    assert_eq!(
+        baseline_resumed, interpreter_resumed,
+        "a resume inside a cross-module callee must be interpreter-identical on the baseline tier"
+    );
+    assert!(
+        baseline_rest.is_empty() && interpreter_rest.is_empty(),
+        "`remove_message` unlinked the matched message on both tiers"
+    );
+}
