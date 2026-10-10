@@ -75,7 +75,7 @@ pub(crate) fn run_commands(
         // block, so a `term`/`bytes` captured before that allocation is stale
         // (the frozen reserve, then read, then write ordering).
         let (_, orig, _, end) = read_ctx(machine, ctx, ctx_op, "bs_match")?;
-        let bytes = raw::subject_bytes(orig)?;
+        let (bytes, off) = raw::subject_bytes(orig)?;
         let Operand::Atom(command) = &commands[i] else {
             return Err(error::unsupported(
                 "bs_match: command list does not start with an atom",
@@ -128,7 +128,7 @@ pub(crate) fn run_commands(
                 if nbits > end.saturating_sub(pos) {
                     return fail_step(machine, module, labels, fail, ctx_op, ctx);
                 }
-                let value = read_integer_field(machine, ctx, bytes, pos, nbits, flags)?;
+                let value = read_integer_field(machine, ctx, bytes, pos + off, nbits, flags)?;
                 pos += nbits;
                 // The C advances `sb->start` (inside `erts_bs_get_integer_2`) *before*
                 // it binds `$Dst`, so the advance is mirrored first: `Dst` may be the
@@ -154,7 +154,7 @@ pub(crate) fn run_commands(
                 if nbits > end.saturating_sub(pos) {
                     return fail_step(machine, module, labels, fail, ctx_op, ctx);
                 }
-                let out = extract_bits(bytes, pos, nbits)?;
+                let out = extract_bits(bytes, pos + off, nbits)?;
                 let value = raw::make_bits(machine, ctx, &out, nbits)?;
                 pos += nbits;
                 // `i_bs_get_fixed_binary` does `sb->start += size;` *before*
@@ -170,7 +170,7 @@ pub(crate) fn run_commands(
             "get_tail" => {
                 let dst = cmd_at(commands, i + 3)?;
                 let nbits = end.saturating_sub(pos);
-                let out = extract_bits(bytes, pos, nbits)?;
+                let out = extract_bits(bytes, pos + off, nbits)?;
                 let value = raw::make_bits(machine, ctx, &out, nbits)?;
                 write_operand(machine, dst, value)?;
                 i += 4;
@@ -191,7 +191,7 @@ pub(crate) fn run_commands(
                 if bits > 64 || bits > end.saturating_sub(pos) {
                     return fail_step(machine, module, labels, fail, ctx_op, ctx);
                 }
-                if read_uint_be(bytes, pos, bits)? != want as u64 {
+                if read_uint_be(bytes, pos + off, bits)? != want as u64 {
                     return fail_step(machine, module, labels, fail, ctx_op, ctx);
                 }
                 pos += bits;

@@ -171,8 +171,8 @@ pub(super) fn exec(
             // deliberately leaves the position unchanged.
             let (_, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_tail")?;
             let nbits = end.saturating_sub(start);
-            let bytes = raw::subject_bytes(orig)?;
-            let out = extract_bits(bytes, start, nbits)?;
+            let (bytes, off) = raw::subject_bytes(orig)?;
+            let out = extract_bits(bytes, start + off, nbits)?;
             let value = raw::make_bits(machine, ctx, &out, nbits)?;
             write_operand(machine, dst, value)?;
             Ok(Some(Step::Next))
@@ -207,8 +207,8 @@ pub(super) fn exec(
             if nbits > end.saturating_sub(start) {
                 return fail_step(machine, module, labels, *fail, ctx_op, ctx);
             }
-            let bytes = raw::subject_bytes(orig)?;
-            let value = read_integer_field(machine, ctx, bytes, start, nbits, *flags)?;
+            let (bytes, off) = raw::subject_bytes(orig)?;
+            let value = read_integer_field(machine, ctx, bytes, start + off, nbits, *flags)?;
             write_operand(machine, dst, value)?;
             // `read_integer_field` allocates (a bignum) through the rooted seam, so a
             // moving collector may have relocated the context read above: re-read the
@@ -242,8 +242,8 @@ pub(super) fn exec(
             if nbits > remaining {
                 return fail_step(machine, module, labels, *fail, ctx_op, ctx);
             }
-            let bytes = raw::subject_bytes(orig)?;
-            let out = extract_bits(bytes, start, nbits)?;
+            let (bytes, off) = raw::subject_bytes(orig)?;
+            let out = extract_bits(bytes, start + off, nbits)?;
             let value = raw::make_bits(machine, ctx, &out, nbits)?;
             write_operand(machine, dst, value)?;
             // `raw::make_bits` reserves through the rooted seam, so a moving collector
@@ -296,8 +296,8 @@ pub(super) fn exec(
                 return fail_step(machine, module, labels, *fail, ctx_op, ctx);
             }
             let pattern = module.strings.get(*offset as usize..).unwrap_or(&[]);
-            let bytes = raw::subject_bytes(orig)?;
-            if size > pattern.len() * 8 || !bits_equal(bytes, start, pattern, 0, size) {
+            let (bytes, off) = raw::subject_bytes(orig)?;
+            if size > pattern.len() * 8 || !bits_equal(bytes, start + off, pattern, 0, size) {
                 return fail_step(machine, module, labels, *fail, ctx_op, ctx);
             }
             raw::set_ctx_start(term, start + size);
@@ -325,8 +325,8 @@ pub(super) fn exec(
             if !matches!(nbits, 0 | 16 | 32 | 64) || nbits > end.saturating_sub(start) {
                 return fail_step(machine, module, labels, *fail, ctx_op, ctx);
             }
-            let bytes = raw::subject_bytes(orig)?;
-            let value = read_float_field(bytes, start, nbits, *flags)?;
+            let (bytes, off) = raw::subject_bytes(orig)?;
+            let value = read_float_field(bytes, start + off, nbits, *flags)?;
             let float = crate::terms::make_float_rooted(machine, ctx, value)?;
             write_operand(machine, dst, float)?;
             // `make_float` reserves through the rooted seam, so a moving collector may
@@ -344,8 +344,8 @@ pub(super) fn exec(
             dst,
         } => {
             let (term, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_utf8")?;
-            let bytes = raw::subject_bytes(orig)?;
-            match decode_utf8(bytes, start, end) {
+            let (bytes, off) = raw::subject_bytes(orig)?;
+            match decode_utf8(bytes, start + off, end + off) {
                 Some((value, len)) => {
                     let t = make_small_checked(value as i64)?;
                     write_operand(machine, dst, t)?;
@@ -363,8 +363,8 @@ pub(super) fn exec(
             dst,
         } => {
             let (term, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_utf16")?;
-            let bytes = raw::subject_bytes(orig)?;
-            match decode_utf16(bytes, start, end, *flags) {
+            let (bytes, off) = raw::subject_bytes(orig)?;
+            match decode_utf16(bytes, start + off, end + off, *flags) {
                 Some((value, len)) => {
                     let t = make_small_checked(value as i64)?;
                     write_operand(machine, dst, t)?;
@@ -385,8 +385,8 @@ pub(super) fn exec(
             dst,
         } => {
             let (term, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_utf32")?;
-            let bytes = raw::subject_bytes(orig)?;
-            match decode_utf32(bytes, start, end) {
+            let (bytes, off) = raw::subject_bytes(orig)?;
+            match decode_utf32(bytes, start + off, end + off) {
                 Some((value, len)) => {
                     let t = make_small_checked(value as i64)?;
                     write_operand(machine, dst, t)?;
@@ -410,8 +410,8 @@ pub(super) fn exec(
         } => {
             let flags = *flags;
             let (term, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_skip_utf16")?;
-            let bytes = raw::subject_bytes(orig)?;
-            match decode_utf16(bytes, start, end, flags) {
+            let (bytes, off) = raw::subject_bytes(orig)?;
+            match decode_utf16(bytes, start + off, end + off, flags) {
                 Some((_, len)) => {
                     raw::set_ctx_start(term, start + len);
                     Ok(Some(Step::Next))
@@ -770,7 +770,7 @@ mod tests {
         assert_eq!(step, Step::Next);
         let accumulator = machine.x(0).expect("the accumulator");
         assert_eq!(
-            raw::heap_bits(accumulator).map(|(_, bits)| bits),
+            raw::heap_bits(accumulator).map(|(_, bits, _)| bits),
             Some(0),
             "`bs_init_writable` returns a 0-bit bitstring"
         );
@@ -817,7 +817,7 @@ mod tests {
         assert_eq!(step, Step::Next);
         let built = machine.x(3).expect("the built binary");
         assert_eq!(
-            raw::heap_bits(built).map(|(_, bits)| bits),
+            raw::heap_bits(built).map(|(_, bits, _)| bits),
             Some(0),
             "a `private_append` of nothing onto `<<>>` is `<<>>`"
         );

@@ -57,7 +57,7 @@ pub(crate) fn enter_match(
 ) -> Result<Option<Eterm>> {
     let value = read_operand(machine, ctx, subject)?;
     let extra = operand_slack_words(subject);
-    if let Some((_, bits)) = raw::heap_bits(value) {
+    if let Some((_, bits, _)) = raw::heap_bits(value) {
         // A heap binary: the context starts at bit 0 and spans its whole size.
         let context = raw::make_ctx(machine, ctx, 0, bits, extra, |m, slack| {
             read_operand_slack(m, subject, slack)
