@@ -207,29 +207,13 @@ impl Machine {
             // the entry label and re-run the clause tests forever — the
             // `proplists:get_value(a, undefined)` hang.
             Instr::FuncInfo { .. } => {
-                // Resolve the reason atom in the running module's atom table; a module
-                // that never mentions it cannot name the reason, so a missing atom is a
-                // typed `unsupported` (never a substituted, wrong atom).
-                let atom = module.atom_table.lookup("function_clause").ok_or_else(|| {
-                    error::unsupported("func_info: no 'function_clause' atom in the module")
-                })?;
-                let reason = make_atom(atom);
-                // Install the `error` class atom when the module has it; the throw
-                // consults it only when the raise actually lands. A module without it
-                // still propagates a typed `BeamError::Raise(..)` uncaught, and a
-                // landing fails with a typed `unsupported` — the `install_class_atom`
-                // contract (mirrors `families/exceptions.rs::raise_error_atom`).
-                if let Some(class_atom) = module.atom_table.lookup(ExceptionClass::Error.as_str())
-                {
-                    self.set_class_atom(ExceptionClass::Error, make_atom(class_atom));
-                }
                 // The frames an *uncaught* `function_clause` carries (the boot path's
                 // failure mode) are attached uniformly as the raise leaves the machine
                 // ([`Machine::with_uncaught_frames`], via `step_instruction`), so this
                 // arm stays the plain raise and every raise kind shares one frame
                 // derivation. A caught raise is unaffected (the frames are metadata on
                 // the uncaught `Raise` only).
-                self.throw_error(reason)
+                raise_function_clause_no_fail(self, module, "func_info")
             }
             Instr::Move { src, dst } => {
                 let value = read_operand(self, ctx, src)?;
@@ -645,27 +629,38 @@ impl Machine {
     }
 }
 
-/// Raise the failure of a `test`/`select_val` whose failure operand is the
-/// [`NO_FAIL`] sentinel (`f,0`) — "raise on failure" rather than "branch to
-/// label 0".
+/// Raise the failed-clause reason: class `error` with the **bare atom**
+/// `function_clause` — the engine's ONE definition of the `NO_FAIL` reason.
 ///
-/// C's plain `FAIL(Fail)` macro only sets the instruction pointer
-/// (`emu/macros.tab:56-60`) and sets **no** reason, so a `test`/`select_val` that
-/// cannot branch has to raise through the failed-clause path: `func_info` is the
-/// instruction a failed head-pattern/guard jumps to, and `i_func_info_IaaI`
-/// (`../../erts/emulator/beam/emu/beam_emu.c:578-583`) unconditionally sets
-/// `c_p->freason = EXC_FUNCTION_CLAUSE` and `goto handle_error`, which
-/// (`../../erts/emulator/beam/beam_common.c:448-544`, `expand_error_value`)
+/// C's `func_info` is the instruction a failed head-pattern/guard jumps to, and
+/// `i_func_info_IaaI` (`../../erts/emulator/beam/emu/beam_emu.c:578-583`)
+/// unconditionally sets `c_p->freason = EXC_FUNCTION_CLAUSE` and `goto handle_error`,
+/// which (`../../erts/emulator/beam/beam_common.c:448-544`, `expand_error_value`)
 /// materializes class `error` with the **bare atom** `function_clause` — the call
-/// arguments ride in the stacktrace, never in the reason.
+/// arguments ride in the stacktrace, never in a `{function_clause, Args}` tuple.
 ///
-/// `what` names the raising instruction (`"test"`/`"select_val"`) for the typed
-/// error a module that cannot name the reason produces. The reason atom is
-/// resolved **only** in the running module's atom table: a module that never
-/// mentions `function_clause` yields the honest typed `unsupported`, never a
-/// substituted atom (an atom index is valid only against the table it is read
-/// with).
-fn raise_function_clause_no_fail(
+/// C's plain `FAIL(Fail)` (`emu/macros.tab:56-60`) sets **no** reason, so a
+/// branchless `$FAIL` sentinel (`{f,0}`) failure has nothing to raise on its own and
+/// is routed to that same `func_info` behaviour — which is why `test`/`select_val`
+/// and the maps read path share this reason.
+///
+/// It is engine-defined: the installed `erlc` never emits `{f,0}` for
+/// `test`/`select_val`/`get_map_elements`/`has_map_fields` (it always supplies a real
+/// fail label), so no corpus case can reach it.
+///
+/// The reason atom is resolved **only** from the running module's own atom table, so
+/// a module that never mentions `function_clause` yields the honest typed
+/// `error::unsupported("<what>: no 'function_clause' atom in the module")` and NEVER
+/// a substituted atom index (an atom index is valid only against the table it is read
+/// with). The `error` class atom is installed only when the module has it; the throw
+/// consults it only when the raise actually lands, so a module without it still
+/// propagates a typed `BeamError::Raise(..)` uncaught and a landing fails with a typed
+/// `unsupported` — the `install_class_atom` contract (mirrors
+/// `families/exceptions.rs::raise_error_atom`).
+///
+/// `what` names the raising instruction/site (`"func_info"`, `"test"`,
+/// `"select_val"`, `"maps"`) for the typed error above.
+pub(crate) fn raise_function_clause_no_fail(
     machine: &mut Machine,
     module: &Module,
     what: &str,
@@ -676,11 +671,7 @@ fn raise_function_clause_no_fail(
         ))
     })?;
     let reason = make_atom(atom);
-    // Install the `error` class atom when the module has it; the throw consults it
-    // only when the raise actually lands. A module without it still propagates a
-    // typed `BeamError::Raise(..)` uncaught, and a landing fails with a typed
-    // `unsupported` — the `install_class_atom` contract (mirrors the `FuncInfo`
-    // arm above and `families/exceptions.rs::raise_error_atom`).
+    // Install the `error` class atom when the module has it (see the doc above).
     if let Some(class_atom) = module.atom_table.lookup(ExceptionClass::Error.as_str()) {
         machine.set_class_atom(ExceptionClass::Error, make_atom(class_atom));
     }

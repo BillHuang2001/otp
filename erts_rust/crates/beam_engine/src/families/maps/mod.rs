@@ -108,9 +108,13 @@
 //! `fail == NO_FAIL`** has no ground truth. It is therefore engine-defined and raises
 //! class `error` with the **bare atom** `function_clause` — the reason C gives a
 //! head/guard/pattern failure that finds no branch (`emu/beam_emu.c:578-583`
-//! `i_func_info_IaaI`, `beam_common.c:448-544`). The tag is resolved **only** from the
-//! running module's atom table: a module that cannot name it yields the documented
-//! typed `error::unsupported`, never a substituted atom. The non-map `source` case
+//! `i_func_info_IaaI`, `beam_common.c:448-544`). The raise is the engine's single
+//! failed-clause definition, [`raise_function_clause_no_fail`] (in
+//! `crate::interpreter::dispatch`), which `fail_or_function_clause` calls with
+//! `what = "maps"`; that helper's doc carries the full ground truth and the
+//! by-name/typed-gap contract (the tag is resolved **only** from the running module's
+//! atom table, a module that cannot name it yielding the documented typed
+//! `error::unsupported`, never a substituted atom). The non-map `source` case
 //! is unrelated and stays `{badmap, Source}` (the compiler's own `is_map` guard
 //! reason).
 //!
@@ -134,7 +138,7 @@ mod read;
 mod tests;
 mod write;
 
-use crate::interpreter::LabelMap;
+use crate::interpreter::{raise_function_clause_no_fail, LabelMap};
 
 use beam_common::{ExceptionClass, Result};
 use beam_loader::{Instr, Label, MapWriteArgs, Module, Operand, NO_FAIL};
@@ -248,11 +252,11 @@ fn fail_or_raise(
 }
 
 /// The fail-label-only failure path (the read instructions' absent key): jump to
-/// `fail`, or — when `fail` is [`NO_FAIL`] — raise the bare atom `function_clause`.
-///
-/// The ground truth never sets a reason here (the read path's C failure is the plain
-/// `$FAIL($Fail)`), so this branchless failure is engine-defined; see the
-/// "absent-key `NO_FAIL` reason" section in the module docs.
+/// `fail`, or — when `fail` is [`NO_FAIL`] — raise the bare atom `function_clause`
+/// through the engine's single failed-clause definition,
+/// [`raise_function_clause_no_fail`] (which carries the ground truth and the
+/// by-name/typed-gap contract; see the "absent-key `NO_FAIL` reason" section in the
+/// module docs).
 fn fail_or_function_clause(
     machine: &mut Machine,
     module: &Module,
@@ -260,34 +264,10 @@ fn fail_or_function_clause(
     fail: Label,
 ) -> Result<Step> {
     if fail == NO_FAIL {
-        raise_function_clause(machine, module)
+        raise_function_clause_no_fail(machine, module, "maps")
     } else {
         goto(labels, fail)
     }
-}
-
-/// Raise class `error` with the **bare atom** `function_clause`.
-///
-/// This is the reason C gives a head/guard/pattern failure that finds no branch
-/// (`emu/beam_emu.c:578-583` `i_func_info_IaaI`, `beam_common.c:448-544`), and the
-/// reason this engine gives the read instructions' `NO_FAIL` absent-key branch (the
-/// ground truth sets no reason: it is a plain `$FAIL`, and the compiler never emits
-/// [`NO_FAIL`] for the matching forms).
-///
-/// The atom is resolved **only** from the running module's atom table: a module that
-/// never mentions `function_clause` cannot name the reason, so a missing atom is a
-/// documented typed `error::unsupported` (never a substituted, wrong atom). The
-/// `error` class atom is installed when the module has it, so a landing can place it
-/// in `x(3)`.
-fn raise_function_clause(machine: &mut Machine, module: &Module) -> Result<Step> {
-    let atom = module
-        .atom_table
-        .lookup("function_clause")
-        .ok_or_else(|| error::unsupported("maps: no 'function_clause' atom in the module"))?;
-    if let Some(class_atom) = module.atom_table.lookup(ExceptionClass::Error.as_str()) {
-        machine.set_class_atom(ExceptionClass::Error, make_atom(class_atom));
-    }
-    machine.throw_error(make_atom(atom))
 }
 
 /// Raise `{Tag,Value}` as a class-`error` exception (the `{badmap,Source}` /
