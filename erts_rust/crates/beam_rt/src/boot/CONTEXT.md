@@ -135,9 +135,9 @@ configuration and it runs **all 22 directives to completion**, ending at the fin
   CLI's own parser (`crate::cli::parse`, not `parse_with_env`: a test must not depend on `ERL_*FLAGS`)
   over the CLI argv `beam_rt -noshell -boot bootstrap/bin/start` — and `tests/boot.rs` mirrors it
   (`boot_cli_runtime`). The **four automatic flags** (`root`/`home`/`progname`/`bindir`) are served
-  by `init:get_argument/1` but are not command-line flags, so they never appear in
-  `init:get_arguments/0` — and they are no longer a boot determinant: the real script runs to
-  `{progress,started}` under a `RuntimeConfig::default()` runtime too
+  by `init:get_argument/1` *and* prepended to `init:get_arguments/0`
+  (`../native/init.rs::get_arguments`, in the oracle's order) — and they are not a boot determinant:
+  the real script runs to `{progress,started}` under a `RuntimeConfig::default()` runtime too
   (`tests/a9_native_floor.rs::script_id_is_the_loaded_boot_scripts_real_header`).
 - **The kernel processes are ready when instruction 20 runs.** The three `{kernelProcess, …}` bursts
   drive until their directive's MFA returns, so `whereis(application_controller)` answers a live,
@@ -214,14 +214,18 @@ because it cannot be duplicated.
    The `apply`/`apply_last` opcode family has no such gap: `families/funs.rs::apply_target` consults `ExecutionContext::resolve_external_call` first and enters a resolved callee **in-machine**.
    A boot `{apply, …}` directive and the `-eval` path are unaffected — both run on a blocking-aware, pump-capable entry.
    The boot-logger gap is the separate `call_ext`-encoded `erlang:apply/2,3` one, recorded in the crate `CONTEXT.md` (`## Notes for Agents`, `## Known Issues`) and not repeated here.
-2. **`beam_rt` `../native.rs`** — the io-device read path completes from library code
-   (`file:read/2`, `io:scan_erl_exprs/4`, `io:parse_erl_exprs/4`); only `file:read_line/1`'s
-   `{get_line,…}` request is still the typed `unsupported` gap (the served device surface is
-   itemised in `../native/CONTEXT.md`).
-3. **`beam_rt` `../native/init.rs` — `init:get_arguments/0` lists only the command-line flags**, so it
-   omits the oracle's automatic `root`/`bindir`/`progname`/`home` (all four ARE served by
-   `init:get_argument/1`, which is what the boot chain needs).
-4. **`beam_bifs`.** Whatever the started applications still need past the above.
+2. **`beam_rt` `../native/` — the io-device read path completes from library code.**
+   `{get_until,Enc,_Prompt,Mod,Func,XtraArgs}` and `{get_line,Enc,_Prompt}` are both real request arms
+   (`../native/file_server.rs` dispatches each to `get_until::serve`/`get_line::serve`), so
+   `file:read/2`, `io:scan_erl_exprs/4` and `io:parse_erl_exprs/4` complete and agree with the oracle
+   (`../tests/io_scan.rs`), and `io:get_line/2`/`file:read_line/1` through the `{get_line,…}` arm
+   (the colocated `file_server/get_line/tests.rs`).
+   Residual typed gaps in that family include a request `Enc` that is neither `latin1` nor `unicode`
+   (`../native/file_server/get_line.rs`'s request-encoding check, `../native/file_server/get_until.rs`'s)
+   and — for `{get_until,…}` only — a user-supplied continuation whose own code blocks in a `receive`
+   (`../native/file_server/get_until.rs`, module header "A blocking continuation is a typed gap").
+   The served device surface and the full gap list are itemised in `../native/CONTEXT.md`.
+3. **`beam_bifs`.** Whatever the started applications still need past the above.
 
 ## Constraints
 - **No silent skip.** A preloaded `.beam` that is missing or malformed is a typed `BeamError` (a missing
@@ -293,15 +297,17 @@ service is a `beam_process::Process` born `Runnable` and never enqueued (the `in
 precedent), so the runner never executes it and `ProcessEntry` needs no new variant;
 `Runtime::service_file_requests` drains its mailbox as an additive `scheduler_pass` step and delivers
 the replies, which is what lets `c:erlangrc/0`'s `gen_server:call` at instruction 20 complete. The
-request/reply surface, the errno mapping, the io-device and the three remaining gaps live in
+request/reply surface, the errno mapping, the io-device and the remaining gaps live in
 [`../native/CONTEXT.md`](../native/CONTEXT.md)'s `file_server.rs` subsection.
 - **Starting the real `file_server` is not a substitute.** Its `gen_server:init_it` registers, acks
   and then enters `loop`'s `receive` — a suspend the engine's non-blocking `fold_outcome` folds into
   `error::blocked()` for a **scheduled** process (owner: `beam_engine`; the seam is pinned by
   `../tests/proc_lib_start.rs`), so the child dies right after acking. A native service sidesteps that.
 - **The native service is deliberately narrow.** It serves the `file_server`/`file`/`io` requests a
-  native `std::fs` host can answer faithfully and returns the typed `unsupported` gap for the rest
-  (notably `{get_until,…}`, which needs the real `erl_scan:tokens/4`).
+  native `std::fs` host (or, for the two incremental readers, the engine) can answer faithfully and
+  returns the typed `unsupported` gap for the rest — `setopts`/`getopts`/`pread`/`pwrite`/`advise`/
+  `allocate`/…, a non-`latin1` `{get_chars,…}`/`{put_chars,…}`, and a request `Enc` that is neither
+  `latin1` nor `unicode`.
 
 ## Routing Table
 - `../boot.rs` → registry + core-atom seed + banner (module root; also `mod preloaded` + `mod bootscript` + `mod drive`)
