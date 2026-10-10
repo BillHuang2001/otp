@@ -177,20 +177,37 @@ impl LineBuffer {
 
     /// Delivers the trailing partial line as-is (called on EOF or `stop`).
     ///
-    /// Returns the partial line as a single frame (with a held `\r` restored), or an
-    /// empty vector when nothing is held. Complete lines handed out by
-    /// [`LineBuffer::take_lines`] are unaffected; the buffer is left empty and back in its
-    /// initial state.
+    /// Returns the buffered bytes as frames (with a held `\r` restored), or an empty vector
+    /// when nothing is held. Complete lines handed out by [`LineBuffer::take_lines`] are
+    /// unaffected; the buffer is left empty and back in its initial state.
+    ///
+    /// A full line at the length limit followed by a held `\r` is delivered as **two**
+    /// frames — `[full-line]` then `["\r"]` — matching the two `flush_linebuf` calls the C
+    /// makes in that state (`io.c:3221-3226`: the `LINEBUF_CR_AFTER` arm returns the full
+    /// line and resets to `LINEBUF_CR_INSIDE`, whose next call restores the `\r`). The bytes
+    /// are identical to joining them; only the split differs.
     pub fn flush_all(&mut self) -> Vec<Vec<u8>> {
-        if matches!(self.state, State::CrInside | State::CrAfter) {
-            // Restore the `\r` that was withheld pending a possible `\n`.
-            self.line.push(b'\r');
-        }
-        self.state = State::Main;
-        if self.line.is_empty() {
-            Vec::new()
-        } else {
-            vec![std::mem::take(&mut self.line)]
+        match std::mem::replace(&mut self.state, State::Main) {
+            State::CrInside => {
+                // Restore the `\r` that was withheld pending a possible `\n`.
+                self.line.push(b'\r');
+                vec![std::mem::take(&mut self.line)]
+            }
+            State::CrAfter => {
+                // A full line at the limit plus a held `\r`: the C delivers the line and
+                // then the `\r` by two separate calls. The line is non-empty here by
+                // construction (`CrAfter` is entered only from `Full`, which implies the
+                // limit was reached and `max_len != 0`).
+                let line = std::mem::take(&mut self.line);
+                vec![line, vec![b'\r']]
+            }
+            State::Main | State::Full => {
+                if self.line.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![std::mem::take(&mut self.line)]
+                }
+            }
         }
     }
 
@@ -311,6 +328,39 @@ mod tests {
         let mut buf = LineBuffer::new(DEFAULT_MAX_LINE_LEN);
         assert!(lines(&mut buf, b"partial\r").is_empty());
         assert_eq!(buf.flush_all(), vec![b"partial\r".to_vec()]);
+    }
+
+    #[test]
+    fn a_lone_carriage_return_is_flushed_as_a_frame() {
+        let mut buf = LineBuffer::new(DEFAULT_MAX_LINE_LEN);
+        assert!(lines(&mut buf, b"\r").is_empty());
+        assert_eq!(buf.pending(), 1, "the held `\\r` counts as pending");
+        assert_eq!(buf.flush_all(), vec![b"\r".to_vec()]);
+        assert_eq!(buf.pending(), 0);
+    }
+
+    #[test]
+    fn flush_splits_a_full_line_and_its_held_carriage_return_like_the_c() {
+        // A full line at the limit followed by a `\r` with no `\n` yet: the C's
+        // `flush_linebuf` (`io.c:3221-3226`) delivers the full line and then the `\r`
+        // through two separate calls, so two frames leave the buffer here.
+        let mut buf = LineBuffer::new(4);
+        assert!(lines(&mut buf, b"abcd").is_empty());
+        assert!(lines(&mut buf, b"\r").is_empty());
+        assert_eq!(buf.pending(), 5, "the full line plus the held `\\r`");
+        assert_eq!(buf.flush_all(), vec![b"abcd".to_vec(), b"\r".to_vec()]);
+        assert_eq!(buf.pending(), 0);
+        assert!(buf.flush_all().is_empty());
+    }
+
+    #[test]
+    fn flush_delivers_a_full_line_with_no_pending_carriage_return() {
+        // The `LINEBUF_FULL`/`LINEBUF_MAIN` arms of `flush_linebuf` deliver the buffered
+        // full line as one frame.
+        let mut buf = LineBuffer::new(4);
+        assert!(lines(&mut buf, b"abcd").is_empty());
+        assert_eq!(buf.flush_all(), vec![b"abcd".to_vec()]);
+        assert!(buf.flush_all().is_empty());
     }
 
     #[test]
