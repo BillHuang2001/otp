@@ -78,8 +78,20 @@
 //! oracle's loaded-vs-unloaded MFA resolution, nor the module's checksum-derived
 //! `new_uniq` for the *bare* `Exported`/loaded distinction).
 //!
-//! # The arity split (`fun_to_list/1` vs `fun_info/2`)
+//! # Produced atoms are interned on demand
 //!
+//! The value atoms this module **produces** — `type`'s `external`/`local` and the
+//! `undefined` of the external-fun items — go through
+//! [`BifContext::intern_atom`](crate::context::BifContext::intern_atom) (the
+//! `AtomInterner` seam), never the lookup-only
+//! [`BifContext::atom`](crate::context::BifContext::atom). Neither `external` nor
+//! `local` is guaranteed to be in the runtime's table (neither is in `beam_rt`'s
+//! `CORE_ATOMS`), and a lookup miss there is an **uncatchable**
+//! [`BeamError::TermNotFound`](beam_common::BeamError::TermNotFound) that kills the
+//! process instead of answering `{type,external}` — oracle:
+//! `erlang:fun_info(fun lists:reverse/1, type)` ⇒ `{type,external}`.
+//!
+//! # The arity split (`fun_to_list/1` vs `fun_info/2`)//!
 //! An `EXPORT_EXT` (external) fun stores its arity twice: the header's 8-bit
 //! field and, in this runtime, descriptor word 3 — the inlined `Export`'s
 //! `info.mfa.arity` ([`beam_term::fun::fun_true_arity`]). The C reads the two
@@ -146,33 +158,37 @@ fn fun_info_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         // C's `switch (what)` matches no `am_*` for a list/tuple/number.
         return Err(error::badarg());
     }
-    let item = match ctx.atoms().name(atom_val(what)) {
-        Some(name) => name,
-        // An atom index that is not interned has no item name.
-        None => return Err(error::badarg()),
-    };
+    // Classified as an owned value, not as a *borrow* of the context's atom table:
+    // the `type`/`refc`/`new_index` arms **produce** the atoms `external`/`local`/
+    // `undefined`, and producing an atom needs the mutable context
+    // ([`BifContext::intern_atom`]).
+    let item = item_of(ctx, what);
 
     let external = beam_codec::term::fun_kind_term(fun)? == beam_codec::term::FunKind::External;
 
     let value = match item {
-        // `am_type`: local (incl. a decoded `NEW_FUN_EXT`) vs external.
-        "type" => ctx.atom(if external { "external" } else { "local" })?,
+        // `am_type`: local (incl. a decoded `NEW_FUN_EXT`) vs external. The two
+        // value atoms are produced here, so they are interned on demand — neither
+        // `external` nor `local` is guaranteed to be in the runtime's table, and the
+        // lookup-only `BifContext::atom` would abort the whole process with an
+        // uncatchable `TermNotFound`.
+        Item::Type => ctx.intern_atom(if external { "external" } else { "local" })?,
         // `am_arity`: the *closure* arity (total lambda arity minus the captures).
         // The C reads `fun_arity(funp)` — the **header's 8-bit field**, so an
         // `EXPORT_EXT` fun with true arity 256 reports `0` and true arity 300
         // reports `44` (oracle-verified). Only `fun_to_list/1` renders the true
         // arity; do not switch this to `access::fun_true_arity`.
-        "arity" => ctx.int(beam_codec::term::fun_arity_term(fun)? as i64)?,
+        Item::Arity => ctx.int(beam_codec::term::fun_arity_term(fun)? as i64)?,
         // `am_env`: the free variables in `env` order; `[]` for an external fun.
-        "env" => {
+        Item::Env => {
             let env = beam_codec::term::fun_env(fun)?;
             let owned = env.to_vec();
             ctx.list(&owned)?
         }
         // `am_refc`: always 1 for a local/imported fun, `undefined` for external.
-        "refc" => {
+        Item::Refc => {
             if external {
-                ctx.atom("undefined")?
+                ctx.intern_atom("undefined")?
             } else {
                 ctx.int(1)?
             }
@@ -180,16 +196,16 @@ fn fun_info_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         // `am_undefined` items: the C reports `undefined` for every fun that is
         // not local. A local/imported fun needs `ErlFunEntry` fields the frozen
         // descriptor does not carry — the documented typed gap.
-        "new_index" | "new_uniq" | "index" | "uniq" => {
+        Item::Undefined => {
             if external {
-                ctx.atom("undefined")?
+                ctx.intern_atom("undefined")?
             } else {
                 return Err(error::unsupported_bif());
             }
         }
         // `am_module`: the export's module atom for an external fun; a local fun
         // would need `ErlFunEntry.module` (absent from the descriptor).
-        "module" => {
+        Item::Module => {
             if external {
                 let name = atom_term_name(ctx, fun_module(fun)?)?;
                 ctx.atom(&name)?
@@ -199,7 +215,7 @@ fn fun_info_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         }
         // `am_name`: the export's function atom for an external fun; a local fun
         // needs the resolved MFA (`erts_get_fun_mfa`).
-        "name" => {
+        Item::Name => {
             if external {
                 let name = atom_term_name(ctx, fun_function(fun)?)?;
                 ctx.atom(&name)?
@@ -208,13 +224,57 @@ fn fun_info_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
             }
         }
         // Every other item atom (`function`, `md5`, `nargs`, …) is `badarg`.
-        _ => return Err(error::badarg()),
+        Item::Other => return Err(error::badarg()),
     };
 
     // `TUPLE2(hp, what, val)` — the item argument is reused as element 1.
     ctx.tuple(&[what, value])
 }
 
+/// A `fun_info/2` item — the C `switch (what)` of `fun_info_2`
+/// (`erl_bif_info.c:3951-4014`).
+///
+/// The item is classified into an owned value instead of holding the `&str`
+/// borrowed from `ctx.atoms()`, because three arms *produce* atoms and therefore
+/// need the mutable context (`BifContext::intern_atom`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Item {
+    /// `type` — `external`/`local`.
+    Type,
+    /// `arity` — the header's 8-bit closure arity.
+    Arity,
+    /// `env` — the free-variable list.
+    Env,
+    /// `refc` — `1` for a local/imported fun, `undefined` for an external one.
+    Refc,
+    /// `new_index`/`new_uniq`/`index`/`uniq` — `undefined` for an external fun, the
+    /// documented typed gap for a local/imported one.
+    Undefined,
+    /// `module`.
+    Module,
+    /// `name`.
+    Name,
+    /// Any other item atom (`function`, `md5`, `nargs`, `foo`, …) ⇒ `badarg`.
+    Other,
+}
+
+/// Classifies the already-known-to-be-atom item term `what`.
+///
+/// An atom index that is absent from the context's table names no item, exactly
+/// like an unknown item name: both are the C `default` arm ⇒ [`Item::Other`]
+/// (`badarg`).
+fn item_of(ctx: &BifContext<'_>, what: Eterm) -> Item {
+    match ctx.atoms().name(atom_val(what)) {
+        Some("type") => Item::Type,
+        Some("arity") => Item::Arity,
+        Some("env") => Item::Env,
+        Some("refc") => Item::Refc,
+        Some("new_index" | "new_uniq" | "index" | "uniq") => Item::Undefined,
+        Some("module") => Item::Module,
+        Some("name") => Item::Name,
+        _ => Item::Other,
+    }
+}
 // ---------------------------------------------------------------------------
 // erlang:fun_info_mfa/1
 // ---------------------------------------------------------------------------
@@ -411,4 +471,182 @@ fn quoted_atom(name: &str) -> String {
         out.push('\'');
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use beam_alloc::Heap;
+    use beam_common::BeamError;
+    use beam_process::ProcessId;
+    use beam_term::{make_small, AtomTable};
+
+    /// The test `AtomInterner` — a `RefCell`-wrapped table, the shape a runtime
+    /// installs when its interner **is** the atom table. Implementing the seam for
+    /// `RefCell<AtomTable>` keeps the cases below free of a bespoke mock struct.
+    impl crate::context::AtomInterner for std::cell::RefCell<AtomTable> {
+        fn intern(&mut self, name: &str) -> beam_term::Atom {
+            self.borrow_mut().intern(name)
+        }
+    }
+
+    /// The item, module and function atoms of the cases below — deliberately
+    /// **without** `external`, `local` and `undefined`, the three atoms this module
+    /// *produces*. A lookup-only construction of them would therefore abort with an
+    /// uncatchable `TermNotFound`.
+    fn item_atoms() -> AtomTable {
+        let mut atoms = AtomTable::new();
+        atoms.seed([
+            "type",
+            "arity",
+            "env",
+            "refc",
+            "new_index",
+            "new_uniq",
+            "index",
+            "uniq",
+            "module",
+            "name",
+            "lists",
+            "reverse",
+            "foo",
+        ]);
+        atoms
+    }
+
+    /// An `EXPORT_EXT` (external) `lists:reverse/arity` fun term on the context heap.
+    fn external_fun(ctx: &mut BifContext<'_>, arity: usize) -> Eterm {
+        let module = ctx.atom("lists").expect("seeded module");
+        let function = ctx.atom("reverse").expect("seeded function");
+        beam_codec::term::make_fun_external(ctx.heap(), arity, atom_val(module), atom_val(function))
+            .expect("the external fun fits")
+    }
+
+    /// A `make_fun3` (`FunKind::Local`) fun term plus the storage owning its words
+    /// (`[header, uniq, index]`, no free variables).
+    fn local_fun(arity: u32, uniq: u64, index: u32) -> (Box<[Eterm]>, Eterm) {
+        let header = beam_term::FUN_SUBTAG | ((arity as usize) << 8);
+        let words: Box<[Eterm]> = vec![
+            Eterm::from_raw(header),
+            Eterm::from_raw(uniq as usize),
+            Eterm::from_raw(index as usize),
+        ]
+        .into_boxed_slice();
+        let term = beam_term::make_boxed(words.as_ptr());
+        (words, term)
+    }
+
+    /// The name the *interner's* table has for the atom term `term` (the produced
+    /// tag is interned there, not in the context's own table).
+    fn interned_name(interner: &std::cell::RefCell<AtomTable>, term: Eterm) -> Option<String> {
+        interner.borrow().name(atom_val(term)).map(str::to_owned)
+    }
+
+    /// `fun_info(F, type)` ⇒ `{type,external}` even when `external` is absent from the
+    /// runtime's table: the BIF **produces** that atom, so it is interned through the
+    /// `AtomInterner` seam. Before the fix this was an uncatchable
+    /// `BeamError::TermNotFound` that killed the process (oracle:
+    /// `erlang:fun_info(fun lists:reverse/1, type)` ⇒ `{type,external}`).
+    #[test]
+    fn fun_info_type_interns_external_on_demand() {
+        let mut heap = Heap::new(4096).expect("test heap");
+        let atoms = item_atoms();
+        let mut interner = std::cell::RefCell::new(AtomTable::new());
+        let tag = {
+            let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+                .with_atom_interner(&mut interner);
+            let fun = external_fun(&mut ctx, 1);
+            let item = ctx.atom("type").expect("seeded item");
+            let info = fun_info_2(&mut ctx, &[fun, item]).expect("type");
+            assert_eq!(access::tuple_size(info), 2);
+            // `TUPLE2(hp, what, val)` reuses the item argument as element 1.
+            assert_eq!(access::tuple_element(info, 0), item);
+            access::tuple_element(info, 1)
+        };
+        assert_eq!(interned_name(&interner, tag).as_deref(), Some("external"));
+    }
+
+    /// The same for a `make_fun3` local fun ⇒ `{type,local}` (`local` is likewise not
+    /// guaranteed to be interned).
+    #[test]
+    fn fun_info_type_interns_local_on_demand() {
+        let mut heap = Heap::new(4096).expect("test heap");
+        let atoms = item_atoms();
+        let mut interner = std::cell::RefCell::new(AtomTable::new());
+        let (_words, fun) = local_fun(1, 0x1234, 1);
+        let tag = {
+            let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+                .with_atom_interner(&mut interner);
+            let item = ctx.atom("type").expect("seeded item");
+            let info = fun_info_2(&mut ctx, &[fun, item]).expect("type");
+            access::tuple_element(info, 1)
+        };
+        assert_eq!(interned_name(&interner, tag).as_deref(), Some("local"));
+    }
+
+    /// The `undefined` value of the external-fun items is interned the same way
+    /// (`refc` and the four `undefined` identity items).
+    #[test]
+    fn fun_info_undefined_values_are_interned_on_demand() {
+        let mut heap = Heap::new(4096).expect("test heap");
+        let atoms = item_atoms();
+        let mut interner = std::cell::RefCell::new(AtomTable::new());
+        let tags = {
+            let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+                .with_atom_interner(&mut interner);
+            let fun = external_fun(&mut ctx, 1);
+            let mut tags = Vec::new();
+            for item_name in ["refc", "new_index", "new_uniq", "index", "uniq"] {
+                let item = ctx.atom(item_name).expect("seeded item");
+                let info = fun_info_2(&mut ctx, &[fun, item]).expect(item_name);
+                tags.push(access::tuple_element(info, 1));
+            }
+            tags
+        };
+        for tag in tags {
+            assert_eq!(interned_name(&interner, tag).as_deref(), Some("undefined"));
+        }
+    }
+
+    /// Without an interner the produced atom stays the typed `TermNotFound` — never
+    /// a fabricated index and never a wrong tag.
+    #[test]
+    fn a_produced_atom_without_an_interner_is_the_typed_gap() {
+        let mut heap = Heap::new(4096).expect("test heap");
+        let atoms = item_atoms();
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let fun = external_fun(&mut ctx, 1);
+        let item = ctx.atom("type").expect("seeded item");
+        assert!(matches!(
+            fun_info_2(&mut ctx, &[fun, item]),
+            Err(BeamError::TermNotFound)
+        ));
+    }
+
+    /// The item classification is unchanged: an unknown item atom and a non-atom item
+    /// are both the C `default` arm's `badarg`, and identifiers are still resolved.
+    #[test]
+    fn item_classification_is_unchanged() {
+        let mut heap = Heap::new(4096).expect("test heap");
+        let atoms = item_atoms();
+        let mut interner = std::cell::RefCell::new(AtomTable::new());
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+            .with_atom_interner(&mut interner);
+        let fun = external_fun(&mut ctx, 1);
+
+        let foo = ctx.atom("foo").expect("seeded item");
+        assert!(matches!(fun_info_2(&mut ctx, &[fun, foo]), Err(BeamError::BadArg)));
+        assert!(matches!(
+            fun_info_2(&mut ctx, &[fun, make_small(1)]),
+            Err(BeamError::BadArg)
+        ));
+        // A non-fun is `badarg` before the item is examined.
+        let type_item = ctx.atom("type").expect("seeded item");
+        assert!(matches!(
+            fun_info_2(&mut ctx, &[make_small(1), type_item]),
+            Err(BeamError::BadArg)
+        ));
+        assert_eq!(item_of(&ctx, type_item), Item::Type);
+        assert_eq!(item_of(&ctx, foo), Item::Other);
+    }
 }
