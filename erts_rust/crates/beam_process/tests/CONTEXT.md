@@ -216,9 +216,10 @@ SMP pool:
   `heap_and_mailbox_mut` + `send_fragmented`)
 - `process_exit_observer.rs`, `port_monitor_cleanup.rs` → the process-death observer seam and the
   death-side port-monitor cleanup
-- `dict_oracle.rs`, `registry_monitors.rs`, `monitor_tag.rs`, `port_monitor_cleanup.rs` (oracle tests) →
-  `erl`-cross-checked process-dictionary, process-control and port-monitor evidence (loud skip when `erl`
-  is absent); their driver is the shared `common/mod.rs`
+- `dict_oracle.rs`, `registry_monitors.rs`, `monitor_tag.rs`, `lifecycle_oracle.rs`,
+  `port_monitor_cleanup.rs` (oracle tests) →
+  `erl`-cross-checked process-dictionary, process-control, lifecycle and port-monitor evidence (loud skip
+  when `erl` is absent); their driver is the shared `common/mod.rs`
 - `ports.rs`, `remote.rs` → the port table and distributed links/monitors
 - `smp.rs`, `lock_scope.rs`, `timers.rs`, `dirty.rs`, `progress.rs` → the SMP pool (see
   `../src/smp/CONTEXT.md`)
