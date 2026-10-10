@@ -30,15 +30,14 @@
 //! | key | why it is a gap |
 //! |---|---|
 //! | `allocator` | this runtime does not identify the host C allocator (`{glibc, …}`) |
-//! | `dist` / `dist_ctrl` | no live distribution wire state (the listener never reaches `Established`) |
 //! | `time_offset`/`time_correction`/`time_warp_mode`/`tolerant_timeofday` | no time-correction service |
 //! | `start_time` / `end_time` | no time server |
 //! | `os_monotonic_time_source` / `os_system_time_source` | no time-source introspection |
 //! | `cpu_topology` | no CPU-topology detection |
 //! | `check_io` | no poll-set introspection |
 //! | `c_compiler_used` | not built by a C compiler |
-//! | `embedded_3pps` | bundles no third-party libraries |
-//! | `system_logger` | no logger process |
+//! | `embedded_3pps` | embeds none of ERTS's third-party C libraries |
+//! | `system_logger` | no logger process to name |
 //! | `info` / `procs` / `loaded` | no memory/process/loaded-code self-description dumps |
 
 use beam_common::Result;
@@ -58,8 +57,6 @@ pub(crate) fn try_value(key: &str, _rt: &Runtime) -> Option<Result<InfoValue>> {
     }
     let reason = match key {
         "allocator" => "this runtime does not identify the host C allocator",
-        "dist" => "this runtime does not report distribution state",
-        "dist_ctrl" => "this runtime models no distribution controllers",
         "time_offset" | "time_correction" | "time_warp_mode" | "tolerant_timeofday" => {
             "this runtime has no time-correction service"
         }
@@ -70,8 +67,13 @@ pub(crate) fn try_value(key: &str, _rt: &Runtime) -> Option<Result<InfoValue>> {
         "cpu_topology" => "this runtime does not detect CPU topology",
         "check_io" => "this runtime has no poll-set introspection",
         "c_compiler_used" => "this runtime was not built by a C compiler",
-        "embedded_3pps" => "this runtime bundles no third-party libraries",
-        "system_logger" => "this runtime has no logger process",
+        "embedded_3pps" => {
+            "this runtime embeds none of ERTS's third-party C libraries; \
+             its dependencies are Rust crates, a different set this key does not describe"
+        }
+        "system_logger" => {
+            "this runtime runs no logger process, so it has no logger pid to report"
+        }
         "info" | "procs" | "loaded" => "this runtime has no self-description dump",
         // Unreachable while `UNSUPPORTED_KEYS` and this match stay in sync; the guard
         // below keeps them honest rather than silently answering `None`.
