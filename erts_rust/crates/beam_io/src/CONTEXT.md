@@ -11,29 +11,17 @@ Module wiring + root re-exports + `prelude`: `src/lib.rs`. Every module below is
 crate root and in `prelude`.
 
 ## Known Issues (durable gotchas — not fixed by changing this file)
-- **`PortNotification` carries a bare `PortId`, but port numbers are reused.** `PortTable::alloc`
-  pops a freed number off its free list (`../../beam_process/src/port.rs:104-118`) and
-  `PortRegistry::close` releases the id immediately (`registry.rs:548-558`) while the id is queued in
-  `self.closed` for a *later* round. A `PortNotification::Closed { port }` produced by
-  `execute_port_tasks` (`registry.rs:261-265`) can therefore name a **different, re-opened** port.
-  Consumers that act on `Closed` (today `beam_rt` ignores it) must not trust the bare number; a
-  generation/ref in the notification, or non-reusing ids, is the fix.
-- **`PortRegistry::handle_events` never drains `self.closed`.** Only `execute_port_tasks` drains it
-  (`registry.rs:261-265`), so a caller that drives the registry through `handle_events` alone
-  accumulates `self.closed` without bound and never sees a `Closed` notification. `handle_events`
-  also returns the count of **events naming a live port** (`registry.rs:191-195`), not the number of
-  tasks run. `beam_rt` avoids this by using `schedule_events` + `execute_port_tasks` directly.
-- **The driver `consume()`-vs-returned-count invariant is contract-only.** A driver's `output` /
-  `ready_output` must shorten the queue by calling `ctx.output().consume(n)` for every byte it
-  returns; nothing checks it (`port.rs` merely forwards the returned count — `Port::run_task`
-  discards it, `port.rs:342-345`). A driver that returns `Ok(n)` without consuming leaves the bytes
-  queued, so they are written **again** on the next drive (duplicated bytes). All in-tree drivers do
-  consume (`drivers/fd.rs:413`, `drivers/spawn.rs:999`), so this is a trap for new drivers only.
+- **A `PortNotification::Closed` names a number that is retired *with the report*.** `PortRegistry::close`
+  queues the id in `self.closed` and keeps it **allocated** in `ids`; the reporting round
+  (`execute_port_tasks` and `handle_events`, both via `take_closed_notifications`) mints the `Closed`
+  and releases the number there. So a `close` + `open` before the next round cannot make the deferred
+  `Closed` name a reused, live port. A consumer must act on a `Closed` in the round that delivered it —
+  the number may be handed out again immediately afterwards.
 - **No `Driver::flush`; a close drops queued bytes.** `Port::close` / `PortRegistry::close`
-  (`port.rs:597-615`, `registry.rs:548-558`) run `stop` and release the id without draining either
-  queue, whereas the C calls `flush` before `terminate_port` and parks a port with a non-empty `ioq`
-  in `ERTS_PORT_SFLG_CLOSING` (`../../../erts/emulator/beam/io.c:3659-3700,3946-3956`). Mitigated at
-  the call site only (`beam_rt` sends `notify_port_exit` before `registry.close`).
+  (`port.rs`, `registry.rs`) run `stop` and queue the close without draining either queue, whereas the C
+  calls `flush` before `terminate_port` and parks a port with a non-empty `ioq` in
+  `ERTS_PORT_SFLG_CLOSING` (`../../../erts/emulator/beam/io.c:3659-3700,3946-3956`). Mitigated at the
+  call site only (`beam_rt` sends `notify_port_exit` before `registry.close`).
 
 ## Routing Table
 - `lib.rs` → crate docs, module wiring, root re-exports, `prelude`
