@@ -24,10 +24,1085 @@
 //! callback slot end to end through a real C driver `.so` opened as a port and compares both
 //! runtimes. Case ids use the `driver_extra/…` prefix. See the node `CONTEXT.md`
 //! ("How to add a corpus case").
+//!
+//! # What this group adds
+//!
+//! [`super::driver_abi`] already pins the port lifecycle, the allocator family, the
+//! `erl_drv_{mutex,cond,rwlock,tsd,thread}_*` synchronisation family, the timers, `driver_select`,
+//! `driver_system_info`, the registry slots and the six `ErlDrvTerm` operand shapes its delivery
+//! family drives. This group widens the same end-to-end shape over the surfaces that group left
+//! untouched, one selector per slot:
+//!
+//! * **the deprecated wall clock** — `driver_get_now/1`, the only `ERL_DRV_DEPRECATED_FUNC` of the
+//!   frozen table: the `NULL`-out-parameter refusal, the three-field `megasecs`/`secs`/`microsecs`
+//!   breakdown, its epoch anchoring and its non-decreasing read (selectors `1`, `2`, `5`, `6`);
+//! * **the port-timeslice accounting** — `erl_drv_consume_timeslice/2`, whose small-`percent` arm
+//!   is the frozen `0` both runtimes answer (selectors `3`, `7`, `8`);
+//! * **the time-offset family** — `erl_drv_time_offset/1`'s **unit consistency** (the phase-free
+//!   property; its absolute value differs by construction, see *Known gaps*) (`4`, `9`);
+//! * **the zero-length allocator edges** — `driver_alloc(0)` / `driver_alloc_binary(0)` (`10`, `11`);
+//! * **further synchronisation shapes** — a *shared* reader lock taken twice
+//!   (`erl_drv_rwlock_tryrlock/1`), a held mutex's second `trylock`, and two live threads that
+//!   `erl_drv_equal_tids/2` orders apart (`12`, `13`, `14`);
+//! * **further `driver_select` shapes** — a combined read+write arm and an idempotent re-arm
+//!   (`15`, `16`);
+//! * **further timer shapes** — a re-armed port timer whose remaining time must not grow (`17`);
+//! * **a shorter `driver_vec_to_buf/3`** — the truncated linearisation (`18`);
+//! * **the remaining `ErlDrvTerm` operand tags** — the delivery family over `ERL_DRV_UINT`,
+//!   `ERL_DRV_INT64`, `ERL_DRV_UINT64`, `ERL_DRV_BINARY`, `ERL_DRV_MAP`, `ERL_DRV_TUPLE`,
+//!   `ERL_DRV_STRING_CONS`, `ERL_DRV_BUF2BINARY`, `ERL_DRV_EXT2TERM`, `ERL_DRV_FLOAT` and
+//!   combinations of them, which [`super::driver_abi`] pinned for only six shapes (selectors
+//!   `100..=120`).
+//!
+//! # The shape of a case
+//!
+//! One shared Erlang module ([`DRIVER_EXTRA_MODULE_SOURCE`]) opens the fixture
+//! (`{spawn_driver, Dir ++ "/driver_extra"}`, with the `erl_ddll` fallback the oracle needs) and
+//! sends a **one-byte selector** through `port_command/2`; the fixture's `output` callback
+//! dispatches on that byte:
+//!
+//! * selectors `< 100` — the driver runs one ABI check and answers with a single status byte
+//!   (`'1'` pass `= 49`); the module's `classify/1` reads that byte;
+//! * selectors `100..=120` — the driver *delivers a decoded term* through `erl_drv_output_term/3`
+//!   and emits **no** byte payload, so the owner's own message is the whole observable; the
+//!   module's `classify_term/1` encodes it as the base-256 value of its canonical
+//!   `term_to_binary/1` image. The C queues the term itself as the message, never a
+//!   `{Port, Term}` wrapper (`io.c:6162-6176`).
+//!
+//! # The observable (honest, never asserted module-side)
+//!
+//! `classify/1` and `classify_term/1` **return exactly what the driver delivered**, encoded as a
+//! stable integer — they never compare against an expectation and never raise. Nothing arriving
+//! within the module's own 2 s bound is the sentinel `-1`. The **golden is the oracle's own
+//! answer** (verified per case with `differential run <id>`), so the corpus self-tests and a
+//! runtime that answers differently is a *differing observable* (a `Mismatch`). Only the surfaces
+//! on which the two runtimes genuinely agree are kept here; every divergence is a documented
+//! handoff (see *Known gaps*), never a corpus case.
+//!
+//! # The fixture
+//!
+//! One fixture ([`DRIVER_EXTRA_C`]) carries one ABI check (or one delivery spec) per selector the
+//! group drives. Every `driver_*` / `erl_drv_*` slot it references is exported by the loading
+//! `beam_rt` binary (`-Wl,--export-dynamic`), so `dlopen(RTLD_NOW)` resolves on both runtimes.
+//! The two `driver_get_now/1` calls carry the header's deliberate
+//! `ERL_DRV_DEPRECATED_FUNC` attribute, so the fixture silences that one diagnostic for itself
+//! rather than let a warning pollute a build log.
+//!
+//! A driver must never leak output at `stop` time (the adapters drop it) and must never close a
+//! selected descriptor inside its own callback (the poller deregisters it right afterwards), so
+//! the fixture keeps its pipe descriptors open and only answers from a live callback.
+//!
+//! # Known gaps (why the group is not larger)
+//!
+//! Every slot below is exported by `beam_rt` yet cannot be pinned end to end, because the two
+//! runtimes answer *differently* for a live port — each is a genuine divergence (a handoff to the
+//! owning crate), never a capability gap the group could record as `unsupported`:
+//!
+//! * **`ERL_DRV_LIST`** — the C pops the top of the decode stack as the **tail** and conses the
+//!   `n - 1` values below it onto that tail (`io.c:6043-6055`), so a spec of `LIST 2` over the
+//!   stack `[1, 2]` builds the *improper* `[1|2]`; [`beam_abi`'s decoder] builds a **proper** list
+//!   of all `n` values instead (`[1,2]`). Measured: the oracle delivers `[1|2]` (ETF image
+//!   base-256 `620622257615890077016322`) where the Rust runtime delivers `[1,2]`
+//!   (`144495584870658`). Owner: `beam_abi` (`decode_term_spec`).
+//! * **`driver_sizeq/1`** — on a freshly opened driver port the oracle answers `0` (an empty
+//!   output queue) where the Rust runtime answers a non-zero size, so no queue-family shape (and
+//!   the `driver_pushq`/`driver_peekq`/`driver_deq` round trip built on it) can agree. Owner:
+//!   `beam_rt` / `beam_io` (`crates/beam_rt/src/port/driver.rs`).
+//! * **`driver_dl_open/1` + `driver_dl_close/1`** — the oracle **aborts the whole VM** (a core
+//!   dump) on `driver_dl_open(NULL)` followed by `driver_dl_close/1` (measured), so the
+//!   dynamic-loading round trip is unpinnable end to end. The refusal half (`driver_dl_open/1` on
+//!   a non-library path answers `NULL` with a message in `driver_dl_error/0`) is already pinned by
+//!   [`super::driver_abi`]'s selector `49`. Owner: `beam_abi` / the oracle itself.
+//! * **the process-monitor family** (`driver_monitor_process` / `driver_demonitor_process` /
+//!   `driver_get_monitored_process` / `driver_compare_monitors`) and the **port data lock**
+//!   (`driver_pdl_*`) — `beam_rt`'s driver host leaves every hook at its `DriverHost` default
+//!   (`beam_abi::driver::host::DriverHost::monitor_process`/`pdl_create` answer `None`), so the
+//!   oracle creates a monitor/PDL the Rust runtime refuses. Owner: `beam_rt` / `beam_io`.
+//! * **`erl_drv_time_offset/1`'s absolute value** — the C reports the real monotonic↔system
+//!   offset, the Rust runtime anchors monotonic time on the system clock and so reports `0`; only
+//!   its unit consistency is pinned (`4`, `9`), never the magnitude. Owner: `beam_rt` / `beam_abi`.
+//! * **`driver_async/5`** and `erl_drv_set_os_pid/2` / `erl_drv_init_ack/2` / `driver_exit/2` /
+//!   `driver_failure_*` — the async pool, the OS-pid record and the port-closing slots either have
+//!   no Rust hook or terminate the connected process, so no live-port shape can agree (the first
+//!   is already documented by [`super::driver_abi`]). Owner: `beam_rt` / `beam_io`.
+//!
+//! # Skip policy (contract A.4 needs host tools, like A.3)
+//!
+//! A C-compiled fixture needs a C compiler *and* the host `erl_driver.h`; when either is missing
+//! the harness reports `Verdict::Skipped` with a loud reason — never a pass.
 
-use super::Case;
+use super::{Case, CaseKind, Contract, Golden, ModuleRun};
+use crate::module_build::NifFixture;
 
-/// The A.4 widened cases.
+/// The embedded Erlang half: open the fixture, send one selector byte, return the driver's
+/// answer as a stable integer.
+///
+/// The module **reports what actually happened** — it never asserts a value and never raises —
+/// so the observable is honest and the golden is simply the oracle's own answer. Nothing here
+/// prints a path (the fixture is reached through a name that differs by construction between the
+/// two runtimes).
+const DRIVER_EXTRA_MODULE_SOURCE: &str = r#"-module(driver_extra).
+-export([classify/1, classify_term/1]).
+
+%% Send one selector byte to the C fixture and encode the answer it delivered as an integer.
+%%
+%% Nothing is compared here. A status selector leaves the answer on the `driver_output` byte
+%% channel as `{Port, {data, Bytes}}`, which becomes the base-256 value of the bytes; no such
+%% message within the module's own 2 s bound is the sentinel `-1`. The harness compares this
+%% integer against the oracle's, so a runtime that behaves differently is a visible divergence,
+%% never a hidden one.
+classify(N) ->
+    Dir = filename:dirname(code:which(?MODULE)),
+    P = open(Dir),
+    true = erlang:port_command(P, <<N>>),
+    wait(P).
+
+%% Only the `driver_output*` byte channels carry the answer as `{Port, {data, Bytes}}`. Any other
+%% message (a delivery selector emits its term instead, so `classify_term/1` is the entry point
+%% for those) is skipped rather than mistaken for the answer.
+wait(P) ->
+    receive
+        {P, {data, Data}} -> bytes_code(iolist_to_binary(Data));
+        _Other -> wait(P)
+    after 2000 -> -1
+    end.
+
+%% Send one selector byte to the C fixture and encode the term it **delivered** as an integer.
+%%
+%% The driver's `erl_drv_output_term` call queues the decoded term itself as the message
+%% (`io.c:6162-6176`), so the message that arrives *is* the whole observable — its canonical
+%% `term_to_binary/1` image, read as a base-256 integer, is byte-exact and stable across VM starts
+%% (no delivery spec here touches a pid, a ref or a port, whose image is per-VM-start). The
+%% delivery selectors emit no byte payload, so the first message is the delivered term; nothing
+%% arriving within the module's own 2 s bound is the sentinel `-1`.
+classify_term(N) ->
+    Dir = filename:dirname(code:which(?MODULE)),
+    P = open(Dir),
+    true = erlang:port_command(P, <<N>>),
+    wait_term(P).
+
+wait_term(_P) ->
+    receive
+        Term -> bytes_code(term_to_binary(Term))
+    after 2000 -> -1
+    end.
+
+%% The bytes a `driver_output`-family call delivered, as a base-256 integer.
+bytes_code(Bin) -> bytes_code(Bin, 0).
+
+bytes_code(<<>>, Acc) -> Acc;
+bytes_code(<<B, Rest/binary>>, Acc) -> bytes_code(Rest, Acc * 256 + B).
+
+%% Reach the driver the way each runtime can, without changing the argv:
+%%   * the oracle refuses a path in `{spawn_driver, _}` (`badarg`) and needs the object
+%%     pre-loaded by `erl_ddll:load_driver/2`, then opened by the bare driver name;
+%%   * the Rust runtime has no `erl_ddll` BIF and takes the object path as the name.
+open(Dir) ->
+    try open_port({spawn_driver, Dir ++ "/driver_extra"}, [binary]) of
+        P when is_port(P) -> P
+    catch
+        _:_ -> open_loaded(Dir)
+    end.
+
+open_loaded(Dir) ->
+    ok = erl_ddll:load_driver(Dir, "driver_extra"),
+    open_port({spawn_driver, "driver_extra"}, [binary]).
+"#;
+
+/// The fixture: one ABI check (or one delivery spec) per selector the group drives.
+///
+/// Only `driver_*` / `erl_drv_*` slots the Rust runtime exports are referenced; every one of
+/// them resolves at `dlopen(RTLD_NOW)` out of the loading process's dynamic symbol table.
+const DRIVER_EXTRA_C: &str = r#"/* A real driver .so (contract A.4): the deprecated wall clock, the port-timeslice
+ * accounting, the time-offset unit consistency, the zero-length allocator edges, further
+ * synchronisation / select / timer / linearisation shapes, and the delivery family over the
+ * remaining ErlDrvTerm operand tags. */
+#include <erl_driver.h>
+#include <stdint.h>
+#include <string.h>
+#include <unistd.h>
+
+/* `driver_get_now/1` is the frozen table's one `ERL_DRV_DEPRECATED_FUNC`; silence only that
+ * diagnostic, so the fixture builds warning-free without weakening anything else. */
+#if defined(__GNUC__)
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+
+typedef struct {
+    ErlDrvPort port;
+    int rfd; /* read end of the select pipe (or -1) */
+    int wfd; /* write end of the select pipe (or -1) */
+} extra_state;
+
+static void ex_answer(extra_state *st, int ok) {
+    char c = ok ? '1' : '0';
+    (void) driver_output(st->port, &c, 1);
+}
+
+/* -- the deprecated wall clock (`driver_get_now/1`) ---------------------------------------- */
+
+/* The C's `NULL` out-parameter refusal (`io.c:6962`). */
+static int chk_get_now_null(void) { return driver_get_now(NULL) == -1; }
+
+/* The three-field breakdown: `secs` is the second within a megasecond and `microsecs` the
+ * microsecond within a second, so both are strictly below a million on either runtime. */
+static int chk_get_now_breakdown(void) {
+    ErlDrvNowData now;
+    memset(&now, 0, sizeof(now));
+    if (driver_get_now(&now) != 0)
+        return 0;
+    return now.secs < 1000000 && now.microsecs < 1000000;
+}
+
+/* The epoch is a Unix-anchored wall clock on both runtimes: `megasecs` counts whole megaseconds
+ * since it, so any date past 2001-09-09 leaves it at or above a thousand. */
+static int chk_get_now_epoch(void) {
+    ErlDrvNowData now;
+    memset(&now, 0, sizeof(now));
+    if (driver_get_now(&now) != 0)
+        return 0;
+    return now.megasecs >= 1000;
+}
+
+/* The C enforces a non-decreasing clock (`io.c:6863-6876`); the Rust runtime reads the realtime
+ * clock. A read taken a few milliseconds later is at or after the first on either. */
+static int chk_get_now_non_decreasing(void) {
+    ErlDrvNowData first, later;
+    memset(&first, 0, sizeof(first));
+    memset(&later, 0, sizeof(later));
+    if (driver_get_now(&first) != 0)
+        return 0;
+    usleep(1500);
+    if (driver_get_now(&later) != 0)
+        return 0;
+    return later.megasecs > first.megasecs
+        || (later.megasecs == first.megasecs && later.secs >= first.secs);
+}
+
+/* -- the port-timeslice accounting (`erl_drv_consume_timeslice/2`) -------------------------- */
+
+/* The C charges `percent` (clamped to [1,100]) hundredths of a timeslice against the port's
+ * reduction budget and only forces a yield once that budget is spent (`CONTEXT_REDS` = 4000,
+ * `erl_port_task.c:1282-1297`). A freshly started port has a spent budget of zero, so any small
+ * `percent` — including the `0` and the negative the C clamps to `1` — answers the frozen "no
+ * yield yet" code `0`, which is also this runtime's whole answer. */
+static int chk_consume_small(extra_state *st) {
+    return erl_drv_consume_timeslice(st->port, 1) == 0;
+}
+
+static int chk_consume_zero(extra_state *st) {
+    return erl_drv_consume_timeslice(st->port, 0) == 0;
+}
+
+static int chk_consume_negative(extra_state *st) {
+    return erl_drv_consume_timeslice(st->port, -5) == 0;
+}
+
+/* -- the time-offset family (`erl_drv_time_offset/1`) -------------------------------------- */
+
+/* The absolute offset is not pinnable (the C reports the real monotonic↔system offset, the Rust
+ * runtime always `0`); its **unit consistency** is: a coarse reading is the finer one converted
+ * down, on both. */
+static int chk_time_offset_sec_from_usec(void) {
+    return erl_drv_time_offset(ERL_DRV_SEC)
+        == erl_drv_convert_time_unit(erl_drv_time_offset(ERL_DRV_USEC), ERL_DRV_USEC, ERL_DRV_SEC);
+}
+
+static int chk_time_offset_msec_from_usec(void) {
+    return erl_drv_time_offset(ERL_DRV_MSEC)
+        == erl_drv_convert_time_unit(erl_drv_time_offset(ERL_DRV_USEC), ERL_DRV_USEC, ERL_DRV_MSEC);
+}
+
+/* -- the zero-length allocator edges -------------------------------------------------------- */
+
+/* `driver_alloc(0)` must hand out a pointer a `driver_free/1` accepts, never `NULL`. */
+static int chk_alloc_zero(void) {
+    char *p = (char *) driver_alloc(0);
+    if (p == NULL)
+        return 0;
+    driver_free(p);
+    return 1;
+}
+
+/* `driver_alloc_binary(0)` must lay out a zero-length payload. */
+static int chk_alloc_binary_zero(void) {
+    ErlDrvBinary *b = driver_alloc_binary(0);
+    int ok;
+    if (b == NULL)
+        return 0;
+    ok = (b->orig_size == 0);
+    driver_free_binary(b);
+    return ok;
+}
+
+/* -- further synchronisation shapes --------------------------------------------------------- */
+
+/* Read locks are shared: a second `tryrlock` on the same thread must succeed as the first did. */
+static int chk_rwlock_shared_readers(void) {
+    ErlDrvRWLock *l = erl_drv_rwlock_create("driver_extra_rwlock");
+    int ok = 0;
+    if (l != NULL) {
+        ok = (erl_drv_rwlock_tryrlock(l) == 0) && (erl_drv_rwlock_tryrlock(l) == 0);
+        if (ok) {
+            erl_drv_rwlock_runlock(l);
+            erl_drv_rwlock_runlock(l);
+        }
+        erl_drv_rwlock_destroy(l);
+    }
+    return ok;
+}
+
+/* A mutex this thread already holds must refuse the second `trylock`. */
+static int chk_mutex_second_trylock_refused(void) {
+    ErlDrvMutex *m = erl_drv_mutex_create("driver_extra_mutex");
+    int ok = 0;
+    if (m != NULL) {
+        ok = (erl_drv_mutex_trylock(m) == 0) && (erl_drv_mutex_trylock(m) != 0);
+        erl_drv_mutex_unlock(m);
+        erl_drv_mutex_destroy(m);
+    }
+    return ok;
+}
+
+static void *ex_thread_body(void *arg) { return arg; }
+
+/* Two live threads are two distinct handles. */
+static int chk_tids_distinct(void) {
+    ErlDrvTid a = NULL, b = NULL;
+    void *res = NULL;
+    int ok;
+    if (erl_drv_thread_create("driver_extra_t1", &a, ex_thread_body, NULL, NULL) != 0)
+        return 0;
+    if (erl_drv_thread_create("driver_extra_t2", &b, ex_thread_body, NULL, NULL) != 0) {
+        (void) erl_drv_thread_join(a, &res);
+        return 0;
+    }
+    ok = (erl_drv_equal_tids(a, b) == 0);
+    (void) erl_drv_thread_join(a, &res);
+    (void) erl_drv_thread_join(b, &res);
+    return ok;
+}
+
+/* -- further `driver_select` / timer / linearisation shapes --------------------------------- */
+
+/* The pipe the select selectors arm; created once and deliberately never closed (the port's
+ * poller deregisters a selection *after* the driver's `stop` callback). */
+static int ex_pipe(extra_state *st) {
+    int fds[2];
+    if (st->rfd >= 0)
+        return 1;
+    if (pipe(fds) != 0)
+        return 0;
+    st->rfd = fds[0];
+    st->wfd = fds[1];
+    return 1;
+}
+
+/* A combined read+write interest arms and releases as one. */
+static int chk_select_read_write(extra_state *st) {
+    int ok = 0;
+    if (ex_pipe(st)) {
+        ok = (driver_select(st->port, (ErlDrvEvent) (intptr_t) st->rfd,
+                            ERL_DRV_READ | ERL_DRV_WRITE, 1) == 0);
+        if (ok)
+            ok = (driver_select(st->port, (ErlDrvEvent) (intptr_t) st->rfd,
+                                ERL_DRV_READ | ERL_DRV_WRITE, 0) == 0);
+    }
+    return ok;
+}
+
+/* Re-arming an already armed interest is idempotent. */
+static int chk_select_rearm_idempotent(extra_state *st) {
+    int ok = 0;
+    if (ex_pipe(st)) {
+        ok = (driver_select(st->port, (ErlDrvEvent) (intptr_t) st->rfd, ERL_DRV_READ, 1) == 0);
+        if (ok)
+            ok = (driver_select(st->port, (ErlDrvEvent) (intptr_t) st->rfd, ERL_DRV_READ, 1) == 0);
+        if (ok)
+            ok = (driver_select(st->port, (ErlDrvEvent) (intptr_t) st->rfd, ERL_DRV_READ, 0) == 0);
+    }
+    return ok;
+}
+
+/* Re-arming a port timer with a shorter delay must leave a positive remaining time no larger
+ * than the first reading. */
+static int chk_timer_rearm_shrinks(extra_state *st) {
+    unsigned long first = 0, second = 0;
+    int a = driver_set_timer(st->port, 50000);
+    int r1 = driver_read_timer(st->port, &first);
+    int b = driver_set_timer(st->port, 1000);
+    int r2 = driver_read_timer(st->port, &second);
+    (void) driver_cancel_timer(st->port);
+    return a == 0 && b == 0 && r1 == 0 && r2 == 0 && first > 0 && second > 0 && second <= first;
+}
+
+/* A buffer shorter than the vector linearises only the requested prefix. */
+static int chk_vec_to_buf_prefix(void) {
+    SysIOVec iov[1];
+    ErlIOVec ev;
+    char in[4], out[4];
+    memcpy(in, "wxyz", 4);
+    iov[0].iov_base = in;
+    iov[0].iov_len = 4;
+    ev.vsize = 1;
+    ev.size = 4;
+    ev.iov = iov;
+    ev.binv = NULL;
+    memset(out, 0, sizeof(out));
+    return driver_vec_to_buf(&ev, out, 3) == 3 && memcmp(out, "wxy", 3) == 0;
+}
+
+/* -- the ErlDrvTerm *delivery* family over the remaining operand tags ----------------------- */
+
+static void ex_send(extra_state *st, ErlDrvTermData *spec, int len) {
+    (void) erl_drv_output_term(driver_mk_port(st->port), spec, len);
+}
+
+/* Each `shape` builds one well-formed `ErlDrvTerm` spec and delivers it. No byte payload is
+ * emitted, so the delivered term is the whole observable; every operand is a value whose ETF
+ * image is byte-exact and VM-start-independent (no pid, ref or port). */
+static void ex_deliver(extra_state *st, int shape) {
+    ErlDrvTermData sp[24];
+    static int64_t i64_negative = -7;
+    static int64_t i64_large = 4611686018427387904LL; /* 2^62 */
+    static uint64_t u64_small = 5;
+    static uint64_t u64_huge = 9223372036854775808ULL; /* 2^63 */
+    static double f64 = 1.5;
+    static const char ext_ok42[] = {131, 104, 2, 119, 2, 111, 107, 97, 42};
+    static const char ext_list[] = {131, 108, 0, 0, 0, 2, 97, 1, 97, 2, 106};
+    static const char three[] = {1, 2, 3};
+    static const char abc[] = "abc";
+    ErlDrvBinary *b;
+    switch (shape) {
+    case 0: sp[0] = ERL_DRV_UINT; sp[1] = 42; ex_send(st, sp, 2); return;
+    case 1: sp[0] = ERL_DRV_UINT; sp[1] = (ErlDrvTermData) 1099511627776ULL; ex_send(st, sp, 2); return;
+    case 2: sp[0] = ERL_DRV_INT64; sp[1] = (ErlDrvTermData) (intptr_t) &i64_negative; ex_send(st, sp, 2); return;
+    case 3: sp[0] = ERL_DRV_UINT64; sp[1] = (ErlDrvTermData) (intptr_t) &u64_small; ex_send(st, sp, 2); return;
+    case 4:
+        b = driver_alloc_binary(3);
+        if (b == NULL)
+            return;
+        memcpy(b->orig_bytes, three, 3);
+        sp[0] = ERL_DRV_BINARY; sp[1] = (ErlDrvTermData) (intptr_t) b; sp[2] = 3; sp[3] = 0;
+        ex_send(st, sp, 4);
+        driver_free_binary(b);
+        return;
+    case 5: sp[0] = ERL_DRV_UINT; sp[1] = 0; ex_send(st, sp, 2); return;
+    case 6: sp[0] = ERL_DRV_INT64; sp[1] = (ErlDrvTermData) (intptr_t) &i64_large; ex_send(st, sp, 2); return;
+    case 7: sp[0] = ERL_DRV_UINT64; sp[1] = (ErlDrvTermData) (intptr_t) &u64_huge; ex_send(st, sp, 2); return;
+    case 8:
+        /* An `ERL_DRV_BINARY` window: offset 1, size 2 of a three-byte payload. */
+        b = driver_alloc_binary(3);
+        if (b == NULL)
+            return;
+        memcpy(b->orig_bytes, three, 3);
+        sp[0] = ERL_DRV_BINARY; sp[1] = (ErlDrvTermData) (intptr_t) b; sp[2] = 2; sp[3] = 1;
+        ex_send(st, sp, 4);
+        driver_free_binary(b);
+        return;
+    case 9:
+        /* `ERL_DRV_STRING` with a zero length: the empty list. */
+        sp[0] = ERL_DRV_STRING; sp[1] = (ErlDrvTermData) (intptr_t) "x"; sp[2] = 0;
+        ex_send(st, sp, 3);
+        return;
+    case 10:
+        /* `ERL_DRV_STRING_CONS` onto the empty list: the character list "hi". */
+        sp[0] = ERL_DRV_NIL; sp[1] = ERL_DRV_STRING_CONS;
+        sp[2] = (ErlDrvTermData) (intptr_t) "hi"; sp[3] = 2;
+        ex_send(st, sp, 4);
+        return;
+    case 11:
+        sp[0] = ERL_DRV_INT; sp[1] = 1;
+        sp[2] = ERL_DRV_INT; sp[3] = 2;
+        sp[4] = ERL_DRV_INT; sp[5] = 3;
+        sp[6] = ERL_DRV_TUPLE; sp[7] = 3;
+        ex_send(st, sp, 8);
+        return;
+    case 12:
+        sp[0] = ERL_DRV_INT; sp[1] = 1;
+        sp[2] = ERL_DRV_INT; sp[3] = 2;
+        sp[4] = ERL_DRV_INT; sp[5] = 3;
+        sp[6] = ERL_DRV_INT; sp[7] = 4;
+        sp[8] = ERL_DRV_MAP; sp[9] = 2;
+        ex_send(st, sp, 10);
+        return;
+    case 13:
+        /* An `ERL_DRV_EXT2TERM` image of `[1,2]`. */
+        sp[0] = ERL_DRV_EXT2TERM; sp[1] = (ErlDrvTermData) (intptr_t) ext_list;
+        sp[2] = (ErlDrvTermData) sizeof(ext_list);
+        ex_send(st, sp, 3);
+        return;
+    case 14:
+        sp[0] = ERL_DRV_BUF2BINARY; sp[1] = (ErlDrvTermData) (intptr_t) abc; sp[2] = 3;
+        ex_send(st, sp, 3);
+        return;
+    case 15:
+        sp[0] = ERL_DRV_ATOM; sp[1] = (ErlDrvTermData) (intptr_t) driver_mk_atom("ok");
+        sp[2] = ERL_DRV_INT; sp[3] = 7;
+        sp[4] = ERL_DRV_TUPLE; sp[5] = 2;
+        ex_send(st, sp, 6);
+        return;
+    case 16:
+        sp[0] = ERL_DRV_INT; sp[1] = (ErlDrvTermData) -7;
+        ex_send(st, sp, 2);
+        return;
+    case 17:
+        sp[0] = ERL_DRV_INT; sp[1] = 0;
+        ex_send(st, sp, 2);
+        return;
+    case 18:
+        /* An atom (both atom tables already hold) paired with a byte-string operand. */
+        sp[0] = ERL_DRV_ATOM; sp[1] = (ErlDrvTermData) (intptr_t) driver_mk_atom("error");
+        sp[2] = ERL_DRV_BUF2BINARY; sp[3] = (ErlDrvTermData) (intptr_t) abc; sp[4] = 3;
+        sp[5] = ERL_DRV_TUPLE; sp[6] = 2;
+        ex_send(st, sp, 7);
+        return;
+    case 19:
+        sp[0] = ERL_DRV_NIL; sp[1] = ERL_DRV_NIL; sp[2] = ERL_DRV_TUPLE; sp[3] = 2;
+        ex_send(st, sp, 4);
+        return;
+    case 20:
+        sp[0] = ERL_DRV_FLOAT; sp[1] = (ErlDrvTermData) (intptr_t) &f64;
+        ex_send(st, sp, 2);
+        return;
+    default:
+        return;
+    }
+}
+
+/* -- the selectors ------------------------------------------------------------------------- */
+
+static void ex_dispatch(extra_state *st, unsigned char sel) {
+    switch (sel) {
+    case 1: ex_answer(st, chk_get_now_null()); break;
+    case 2: ex_answer(st, chk_get_now_breakdown()); break;
+    case 3: ex_answer(st, chk_consume_small(st)); break;
+    case 4: ex_answer(st, chk_time_offset_sec_from_usec()); break;
+    case 5: ex_answer(st, chk_get_now_epoch()); break;
+    case 6: ex_answer(st, chk_get_now_non_decreasing()); break;
+    case 7: ex_answer(st, chk_consume_zero(st)); break;
+    case 8: ex_answer(st, chk_consume_negative(st)); break;
+    case 9: ex_answer(st, chk_time_offset_msec_from_usec()); break;
+    case 10: ex_answer(st, chk_alloc_zero()); break;
+    case 11: ex_answer(st, chk_alloc_binary_zero()); break;
+    case 12: ex_answer(st, chk_rwlock_shared_readers()); break;
+    case 13: ex_answer(st, chk_mutex_second_trylock_refused()); break;
+    case 14: ex_answer(st, chk_tids_distinct()); break;
+    case 15: ex_answer(st, chk_select_read_write(st)); break;
+    case 16: ex_answer(st, chk_select_rearm_idempotent(st)); break;
+    case 17: ex_answer(st, chk_timer_rearm_shrinks(st)); break;
+    case 18: ex_answer(st, chk_vec_to_buf_prefix()); break;
+    /* The delivery family: nothing is answered through the byte channel — the delivered term is
+     * the observable. */
+    case 100: ex_deliver(st, 0); break;
+    case 101: ex_deliver(st, 1); break;
+    case 102: ex_deliver(st, 2); break;
+    case 103: ex_deliver(st, 3); break;
+    case 104: ex_deliver(st, 4); break;
+    case 105: ex_deliver(st, 5); break;
+    case 106: ex_deliver(st, 6); break;
+    case 107: ex_deliver(st, 7); break;
+    case 108: ex_deliver(st, 8); break;
+    case 109: ex_deliver(st, 9); break;
+    case 110: ex_deliver(st, 10); break;
+    case 111: ex_deliver(st, 11); break;
+    case 112: ex_deliver(st, 12); break;
+    case 113: ex_deliver(st, 13); break;
+    case 114: ex_deliver(st, 14); break;
+    case 115: ex_deliver(st, 15); break;
+    case 116: ex_deliver(st, 16); break;
+    case 117: ex_deliver(st, 17); break;
+    case 118: ex_deliver(st, 18); break;
+    case 119: ex_deliver(st, 19); break;
+    case 120: ex_deliver(st, 20); break;
+    default: ex_answer(st, 0); break;
+    }
+}
+
+/* -- the entry points ---------------------------------------------------------------------- */
+
+static ErlDrvData ex_start(ErlDrvPort port, char *command) {
+    extra_state *st;
+    (void) command;
+    st = (extra_state *) driver_alloc(sizeof(extra_state));
+    if (st == NULL)
+        return (ErlDrvData) -1;
+    st->port = port;
+    st->rfd = -1;
+    st->wfd = -1;
+    return (ErlDrvData) st;
+}
+
+static void ex_stop(ErlDrvData drv_data) {
+    if (drv_data != NULL)
+        driver_free(drv_data);
+}
+
+static void ex_output(ErlDrvData drv_data, char *buf, ErlDrvSizeT len) {
+    extra_state *st = (extra_state *) drv_data;
+    if (st == NULL || len < 1)
+        return;
+    ex_dispatch(st, (unsigned char) buf[0]);
+}
+
+static ErlDrvEntry ex_entry = {
+    .init = NULL,
+    .start = ex_start,
+    .stop = ex_stop,
+    .output = ex_output,
+    .driver_name = "driver_extra",
+    .extended_marker = ERL_DRV_EXTENDED_MARKER,
+    .major_version = ERL_DRV_EXTENDED_MAJOR_VERSION,
+    .minor_version = ERL_DRV_EXTENDED_MINOR_VERSION,
+};
+
+DRIVER_INIT(driver_extra) {
+    return &ex_entry;
+}
+"#;
+
+/// The compiled driver every case loads (written next to the `.beam` as `driver_extra.so`).
+const DRIVER_EXTRA: NifFixture = NifFixture::CompiledLibrary {
+    name: "driver_extra",
+    c_source: DRIVER_EXTRA_C,
+};
+
+/// Build one module-run case over [`DRIVER_EXTRA_MODULE_SOURCE`] with [`DRIVER_EXTRA`] as its
+/// `.so`.
+///
+/// `golden` is the **oracle's own** integer answer for `selector`, verified per case with
+/// `differential run <id>`.
+fn case(
+    id: &'static str,
+    description: &'static str,
+    selector: &'static [i64],
+    golden: &'static str,
+) -> Case {
+    module_case(id, description, selector, golden, "classify")
+}
+
+/// The same over the **delivery** entry point (`classify_term/1`): the fixture's selector emits an
+/// `ErlDrvTerm` spec through `erl_drv_output_term/3` and *no* byte payload, so the observable is
+/// the ETF image of the term the owner received.
+fn delivery_case(
+    id: &'static str,
+    description: &'static str,
+    selector: &'static [i64],
+    golden: &'static str,
+) -> Case {
+    module_case(id, description, selector, golden, "classify_term")
+}
+
+/// One module-run case over [`DRIVER_EXTRA_MODULE_SOURCE`] with [`DRIVER_EXTRA`] as its `.so`.
+fn module_case(
+    id: &'static str,
+    description: &'static str,
+    selector: &'static [i64],
+    golden: &'static str,
+    function: &'static str,
+) -> Case {
+    Case {
+        id,
+        description,
+        contracts: &[Contract::DriverAbi, Contract::BeamAsm],
+        kind: CaseKind::Module(ModuleRun {
+            source: DRIVER_EXTRA_MODULE_SOURCE,
+            module: "driver_extra",
+            function,
+            arity: 1,
+            args: selector,
+            nif: Some(DRIVER_EXTRA),
+        }),
+        golden: Golden {
+            stdout: Some(golden),
+            exit_code: 0,
+        },
+    }
+}
+
+/// The widened A.4 group: one case per driver C ABI surface the two runtimes drive identically.
+///
+/// Every golden is the oracle's own answer (the status byte `'1'` is `49`; a delivery case's
+/// golden is the base-256 value of the delivered term's canonical ETF image): each case reports
+/// the driver-backed port's real behaviour, so a runtime that answers otherwise is a `Mismatch` —
+/// which is why only the agreeing surfaces appear here (see the module docs' *Known gaps*).
 pub(crate) fn group() -> Vec<Case> {
-    Vec::new()
+    vec![
+        case(
+            "driver_extra/driver_get_now_refuses_a_null_out_parameter",
+            "driver_get_now/1 answers its -1 refusal for a NULL out-parameter",
+            &[1],
+            "49",
+        ),
+        case(
+            "driver_extra/driver_get_now_fills_a_bounded_breakdown",
+            "driver_get_now/1 fills megasecs/secs/microsecs with secs and microsecs below a million",
+            &[2],
+            "49",
+        ),
+        case(
+            "driver_extra/driver_get_now_is_anchored_at_the_unix_epoch",
+            "driver_get_now/1's megasecs field counts whole megaseconds since a Unix-like epoch",
+            &[5],
+            "49",
+        ),
+        case(
+            "driver_extra/driver_get_now_reads_are_non_decreasing",
+            "a later driver_get_now/1 read is at or after an earlier one",
+            &[6],
+            "49",
+        ),
+        case(
+            "driver_extra/erl_drv_consume_timeslice_small_percent_answers_no_yield",
+            "erl_drv_consume_timeslice/2 with a small percent does not exhaust the port's budget: 0",
+            &[3],
+            "49",
+        ),
+        case(
+            "driver_extra/erl_drv_consume_timeslice_zero_percent_answers_no_yield",
+            "erl_drv_consume_timeslice/2 with the C's 0 percent (clamped to 1) answers no yield: 0",
+            &[7],
+            "49",
+        ),
+        case(
+            "driver_extra/erl_drv_consume_timeslice_negative_percent_answers_no_yield",
+            "erl_drv_consume_timeslice/2 with a negative percent (clamped to 1) answers no yield: 0",
+            &[8],
+            "49",
+        ),
+        case(
+            "driver_extra/erl_drv_time_offset_seconds_is_the_microsecond_reading_converted",
+            "erl_drv_time_offset/1 in seconds is its microsecond reading converted to seconds",
+            &[4],
+            "49",
+        ),
+        case(
+            "driver_extra/erl_drv_time_offset_milliseconds_is_the_microsecond_reading_converted",
+            "erl_drv_time_offset/1 in milliseconds is its microsecond reading converted to milliseconds",
+            &[9],
+            "49",
+        ),
+        case(
+            "driver_extra/driver_alloc_answers_a_pointer_for_a_zero_length",
+            "driver_alloc/1 hands out a pointer for a zero length and driver_free/1 releases it",
+            &[10],
+            "49",
+        ),
+        case(
+            "driver_extra/driver_alloc_binary_lays_out_a_zero_length_payload",
+            "driver_alloc_binary/1 answers a zero-orig_size binary for a zero length",
+            &[11],
+            "49",
+        ),
+        case(
+            "driver_extra/erl_drv_rwlock_tryrlock_admits_two_readers",
+            "two erl_drv_rwlock_tryrlock/1 read locks are shared: both succeed",
+            &[12],
+            "49",
+        ),
+        case(
+            "driver_extra/erl_drv_mutex_trylock_refuses_a_held_mutex",
+            "erl_drv_mutex_trylock/1 succeeds once then refuses the same thread's second attempt",
+            &[13],
+            "49",
+        ),
+        case(
+            "driver_extra/erl_drv_equal_tids_orders_two_threads_apart",
+            "erl_drv_equal_tids/2 answers 0 for two distinct live threads",
+            &[14],
+            "49",
+        ),
+        case(
+            "driver_extra/driver_select_arms_and_releases_a_read_write_interest",
+            "driver_select/4 arms and releases a combined read+write descriptor interest",
+            &[15],
+            "49",
+        ),
+        case(
+            "driver_extra/driver_select_re_arm_is_idempotent",
+            "a second driver_select/4 arm of the same interest is accepted, then released",
+            &[16],
+            "49",
+        ),
+        case(
+            "driver_extra/driver_set_timer_re_arm_leaves_a_shorter_remaining_time",
+            "driver_read_timer/2's remaining time does not grow when the timer is re-armed shorter",
+            &[17],
+            "49",
+        ),
+        case(
+            "driver_extra/driver_vec_to_buf_linearises_a_shorter_prefix",
+            "driver_vec_to_buf/3 copies only the requested prefix of a vector",
+            &[18],
+            "49",
+        ),
+        delivery_case(
+            "driver_extra/erl_drv_output_term_delivers_a_uint_operand",
+            "erl_drv_output_term/3 delivers 42 built from an ERL_DRV_UINT operand",
+            &[100],
+            "8610090",
+        ),
+        delivery_case(
+            "driver_extra/erl_drv_output_term_delivers_a_large_uint_operand",
+            "erl_drv_output_term/3 delivers 2^40 built from an ERL_DRV_UINT operand",
+            &[101],
+            "620659583449595801239553",
+        ),
+        delivery_case(
+            "driver_extra/erl_drv_output_term_delivers_a_negative_int64_operand",
+            "erl_drv_output_term/3 delivers -7 built from an ERL_DRV_INT64 operand",
+            &[102],
+            "144461225000953",
+        ),
+        delivery_case(
+            "driver_extra/erl_drv_output_term_delivers_a_uint64_operand",
+            "erl_drv_output_term/3 delivers 5 built from an ERL_DRV_UINT64 operand",
+            &[103],
+            "8610053",
+        ),
+        delivery_case(
+            "driver_extra/erl_drv_output_term_delivers_a_driver_binary_operand",
+            "erl_drv_output_term/3 delivers <<1,2,3>> built from an ERL_DRV_BINARY operand",
+            &[104],
+            "2424377751406135804419",
+        ),
+        delivery_case(
+            "driver_extra/erl_drv_output_term_delivers_a_zero_uint_operand",
+            "erl_drv_output_term/3 delivers 0 built from an ERL_DRV_UINT operand",
+            &[105],
+            "8610048",
+        ),
+        delivery_case(
+            "driver_extra/erl_drv_output_term_delivers_a_large_int64_operand",
+            "erl_drv_output_term/3 delivers 2^62 built from an ERL_DRV_INT64 operand",
+            &[106],
+            "40675555905685676169325707328",
+        ),
+        delivery_case(
+            "driver_extra/erl_drv_output_term_delivers_a_bignum_uint64_operand",
+            "erl_drv_output_term/3 delivers 2^63 built from an ERL_DRV_UINT64 operand",
+            &[107],
+            "40675555905685676169325707392",
+        ),
+        delivery_case(
+            "driver_extra/erl_drv_output_term_delivers_a_driver_binary_window",
+            "erl_drv_output_term/3's ERL_DRV_BINARY operand delivers the requested offset+size window",
+            &[108],
+            "9470225591430152707",
+        ),
+        delivery_case(
+            "driver_extra/erl_drv_output_term_delivers_an_empty_string_operand",
+            "erl_drv_output_term/3 delivers [] built from a zero-length ERL_DRV_STRING operand",
+            &[109],
+            "33642",
+        ),
+        delivery_case(
+            "driver_extra/erl_drv_output_term_conses_a_string_operand_onto_nil",
+            "erl_drv_output_term/3 delivers \"hi\" from an ERL_DRV_STRING_CONS operand onto the empty list",
+            &[110],
+            "144495584897129",
+        ),
+        delivery_case(
+            "driver_extra/erl_drv_output_term_delivers_a_three_tuple_operand",
+            "erl_drv_output_term/3 delivers {1,2,3} built from a three-arity ERL_DRV_TUPLE",
+            &[111],
+            "2424018414519376306435",
+        ),
+        delivery_case(
+            "driver_extra/erl_drv_output_term_delivers_a_two_pair_map_operand",
+            "erl_drv_output_term/3 delivers #{1=>2,3=>4} built from a two-pair ERL_DRV_MAP",
+            &[112],
+            "2666186124930067372160847936971012",
+        ),
+        delivery_case(
+            "driver_extra/erl_drv_output_term_delivers_an_ext2term_list_operand",
+            "erl_drv_output_term/3 delivers [1,2] decoded from an ERL_DRV_EXT2TERM image",
+            &[113],
+            "144495584870658",
+        ),
+        delivery_case(
+            "driver_extra/erl_drv_output_term_delivers_a_buf2binary_operand",
+            "erl_drv_output_term/3 delivers <<\"abc\">> built from an ERL_DRV_BUF2BINARY operand",
+            &[114],
+            "2424377751406142120547",
+        ),
+        delivery_case(
+            "driver_extra/erl_drv_output_term_delivers_an_existing_atom_with_an_int",
+            "erl_drv_output_term/3 delivers {ok,7} — an atom both atom tables already hold",
+            &[115],
+            "2424018157238192136455",
+        ),
+        delivery_case(
+            "driver_extra/erl_drv_output_term_delivers_a_negative_int_operand",
+            "erl_drv_output_term/3 delivers -7 built from an ERL_DRV_INT operand",
+            &[116],
+            "144461225000953",
+        ),
+        delivery_case(
+            "driver_extra/erl_drv_output_term_delivers_a_zero_int_operand",
+            "erl_drv_output_term/3 delivers 0 built from an ERL_DRV_INT operand",
+            &[117],
+            "8610048",
+        ),
+        delivery_case(
+            "driver_extra/erl_drv_output_term_delivers_an_atom_and_binary_tuple",
+            "erl_drv_output_term/3 delivers {error,<<\"abc\">>} from an atom plus a byte-string operand",
+            &[118],
+            "11447102099669137158451310979070794806682211",
+        ),
+        delivery_case(
+            "driver_extra/erl_drv_output_term_delivers_a_pair_of_empty_lists",
+            "erl_drv_output_term/3 delivers {[],[]} built from two ERL_DRV_NIL operands",
+            &[119],
+            "564385704554",
+        ),
+        delivery_case(
+            "driver_extra/erl_drv_output_term_delivers_a_float_operand",
+            "erl_drv_output_term/3 delivers 1.5 built from an ERL_DRV_FLOAT operand",
+            &[120],
+            "619925890775301805309952",
+        ),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    //! Invariants of the widened A.4 group: every case is a module-run case claiming
+    //! [`Contract::DriverAbi`], it drives the shared module with the real C fixture, and its
+    //! golden is the oracle's integer answer for its one selector byte.
+
+    use super::{group, CaseKind, Contract, NifFixture};
+    use std::collections::HashSet;
+
+    /// The one selector family whose observable is a **delivered term** rather than a
+    /// `driver_output` status byte, and the module entry point it must drive.
+    const DELIVERY_SELECTORS: std::ops::RangeInclusive<i64> = 100..=120;
+
+    /// The module entry point a case drives: `classify/1` for the status family,
+    /// `classify_term/1` for the `ErlDrvTerm` delivery family.
+    fn expected_function(selector: i64) -> &'static str {
+        if DELIVERY_SELECTORS.contains(&selector) {
+            "classify_term"
+        } else {
+            "classify"
+        }
+    }
+
+    #[test]
+    fn every_case_is_a_driver_module_run_over_the_compiled_fixture() {
+        let mut selectors = HashSet::new();
+        let mut sources = HashSet::new();
+        for case in group() {
+            assert!(
+                case.id.starts_with("driver_extra/"),
+                "case {} is outside the driver_extra group",
+                case.id
+            );
+            assert!(!case.description.is_empty(), "case {} has no description", case.id);
+            assert_eq!(
+                case.contracts,
+                &[Contract::DriverAbi, Contract::BeamAsm],
+                "case {}: a driver case evidences A.4 and the compiled .beam (A.2)",
+                case.id
+            );
+            let CaseKind::Module(run) = case.kind else {
+                panic!("case {}: an A.4 case must be a module-run case", case.id);
+            };
+            assert_eq!(run.module, "driver_extra", "case {}", case.id);
+            assert_eq!(
+                run.function,
+                expected_function(run.args[0]),
+                "case {}: selector {} must drive its family's entry point",
+                case.id,
+                run.args[0]
+            );
+            assert_eq!(run.arity, 1, "case {}", case.id);
+            let Some(NifFixture::CompiledLibrary { name, c_source }) = run.nif else {
+                panic!("case {}: the driver must be a real C-compiled .so", case.id);
+            };
+            assert_eq!(name, "driver_extra", "case {}: the driver name is fixed", case.id);
+            sources.insert(c_source);
+            assert!(
+                selectors.insert(run.args[0]),
+                "case {}: selector {} is used twice",
+                case.id,
+                run.args[0]
+            );
+            // The golden is the oracle's own integer answer: it is never asserted module-side.
+            let golden = case.golden.stdout.expect("a golden stdout");
+            assert!(
+                !golden.is_empty() && golden.bytes().all(|b| b.is_ascii_digit()),
+                "case {}: the golden must be the oracle's integer answer, got {golden:?}",
+                case.id
+            );
+            assert_eq!(case.golden.exit_code, 0, "case {}", case.id);
+        }
+        assert_eq!(selectors.len(), group().len(), "every selector is distinct");
+        assert_eq!(sources.len(), 1, "the group rests on one C fixture");
+    }
+
+    #[test]
+    fn the_group_is_materially_larger_than_the_status_family_alone() {
+        let cases = group();
+        assert!(cases.len() >= 25, "the widened group must add at least 25 cases");
+        for case in &cases {
+            let CaseKind::Module(run) = case.kind else {
+                panic!("case {}: not a module-run case", case.id);
+            };
+            assert_eq!(run.args.len(), 1, "case {}: one selector byte", case.id);
+            let selector = run.args[0];
+            assert!(
+                selector > 0 && selector < 256,
+                "case {}: the selector must be a port_command byte, got {selector}",
+                case.id
+            );
+        }
+    }
+
+    /// The status selectors answer the single status byte `'1'` (integer `49`), so their golden is
+    /// `49`; the delivery selectors answer the base-256 value of the delivered term's ETF image —
+    /// never `49`.
+    #[test]
+    fn the_goldens_are_the_status_byte_or_a_delivered_term_value() {
+        let mut status = 0;
+        let mut deliveries = 0;
+        for case in group() {
+            let CaseKind::Module(run) = case.kind else { unreachable!() };
+            let golden = case.golden.stdout.unwrap();
+            if DELIVERY_SELECTORS.contains(&run.args[0]) {
+                deliveries += 1;
+                assert_ne!(
+                    golden, "49",
+                    "case {}: a delivery selector has the delivered term as its payload",
+                    case.id
+                );
+            } else {
+                status += 1;
+                assert_eq!(golden, "49", "case {}: a status selector is the '1' byte", case.id);
+            }
+        }
+        assert_eq!(status, 18, "the eighteen status selectors");
+        assert_eq!(deliveries, DELIVERY_SELECTORS.count(), "one delivery case per selector");
+    }
+
+    /// The delivery family must actually cover the operand tags [`super::driver_abi`] left
+    /// unexercised — `ERL_DRV_UINT`, `ERL_DRV_INT64`, `ERL_DRV_UINT64`, `ERL_DRV_BINARY`,
+    /// `ERL_DRV_MAP`, a three-arity `ERL_DRV_TUPLE`, `ERL_DRV_STRING_CONS` and `ERL_DRV_EXT2TERM`
+    /// — because a dropped selector would silently shrink the surface.
+    #[test]
+    fn the_delivery_family_covers_the_widened_operand_tags() {
+        let selectors: HashSet<i64> = group()
+            .into_iter()
+            .map(|case| match case.kind {
+                CaseKind::Module(run) => run.args[0],
+                _ => unreachable!("every A.4 case is a module-run case"),
+            })
+            .collect();
+        for selector in [100, 101, 102, 103, 104, 106, 107, 108, 110, 111, 112, 113, 114] {
+            assert!(
+                selectors.contains(&selector),
+                "selector {selector} (a widened operand tag) is missing"
+            );
+        }
+    }
 }
