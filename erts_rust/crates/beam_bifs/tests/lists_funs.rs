@@ -25,18 +25,25 @@
 //!
 //! A `BifFn` cannot execute BEAM code, so these BIFs call their fun through the
 //! public [`FunCaller`] seam. The tests therefore install a **mock** caller: the
-//! "fun" argument is a small-integer sentinel naming the operation, and the mock
-//! supplies the behaviour (a real `beam_rt` would resolve a closure reference
-//! there). Every expected value is the value the OTP 29 / erts-17.1 `erl` oracle
+//! fun argument is a real `EXPORT_EXT` fun term whose *function* atom names the
+//! operation, and the mock supplies the behaviour (a real `beam_rt` would resolve a
+//! closure reference there). A fun-taking BIF validates its fun argument with the
+//! oracle's `is_function(F, Arity)` clause-head guard, so the argument must be a real
+//! fun of the right arity — an opaque sentinel never reaches the mock (see
+//! [`mock_fun`]). Every expected value is the value the OTP 29 / erts-17.1 `erl` oracle
 //! produced for the equivalent Erlang fun, so the assertions pin the *oracle's*
 //! semantics rather than this implementation's.
 
 use beam_alloc::Heap;
 use beam_bifs::{default_registry, BifContext, BifRegistry, FunCaller};
 use beam_common::{BeamError, ExceptionClass, ExitReason, Result};
-use beam_codec::term::{cons_head, cons_tail, tuple_arity, tuple_element};
+use beam_codec::term::{
+    cons_head, cons_tail, fun_function, make_fun_external, tuple_arity, tuple_element,
+};
 use beam_process::ProcessId;
-use beam_term::{is_list, is_nil, is_small, make_atom, make_small, signed_value, AtomTable, Eterm, NIL};
+use beam_term::{
+    atom_val, is_list, is_nil, is_small, make_atom, make_small, signed_value, AtomTable, Eterm, NIL,
+};
 
 /// `fun(X) -> X * X end`.
 const SQUARE: i64 = 1;
@@ -71,23 +78,70 @@ const POSITIVE: i64 = 14;
 /// mutually `Fun`-equivalent.
 const KEY_LESS_EQ: i64 = 15;
 
+/// The `(operation, arity, function-atom)` triple of every mock fun.
+///
+/// The mock's fun argument is a **real** `EXPORT_EXT` fun term: a fun-taking BIF
+/// validates it with the oracle's `is_function(F, Arity)` clause-head guard, so an
+/// opaque small-integer sentinel is rejected with `error:function_clause` before the
+/// mock is ever consulted. The operation is therefore carried in the fun's *function*
+/// atom, which [`MockFuns::operation`] decodes back through the seeded [`AtomTable`].
+///
+/// The arity is the one the equivalent Erlang fun has — `map/2`/`filter/2`/`foreach/2`
+/// call [`FunCaller`] with one argument and `foldl/3`/`foldr/3`/`sort/2`/`zipwith/3`/…
+/// with two, so the fun the mock is handed must match.
+const MOCK_FUNS: [(i64, usize, &str); 15] = [
+    (SQUARE, 1, "f_square"),
+    (ADD, 2, "f_add"),
+    (DOUBLE, 1, "f_double"),
+    (CONS, 2, "f_cons"),
+    (IS_EVEN, 1, "f_is_even"),
+    (LT3, 1, "f_lt3"),
+    (GT2, 1, "f_gt2"),
+    (LESS_EQ, 2, "f_less_eq"),
+    (LESS, 2, "f_less"),
+    (DUPLICATE, 1, "f_duplicate"),
+    (ACC_TEN, 2, "f_acc_ten"),
+    (IDENTITY, 1, "f_identity"),
+    (RAISES, 1, "f_raises"),
+    (POSITIVE, 1, "f_positive"),
+    (KEY_LESS_EQ, 2, "f_key_less_eq"),
+];
+
+/// The fun term the mock recognizes as `operation`: an `EXPORT_EXT` fun of the
+/// operation's true arity whose function atom names it.
+///
+/// Built on the *context* heap (the BIF only hands the term straight back to the
+/// [`FunCaller`], never copying it), so a test can build it mid-walk with nothing but
+/// its `BifContext`.
+fn mock_fun(ctx: &mut BifContext<'_>, operation: i64) -> Eterm {
+    let (_, arity, name) =
+        MOCK_FUNS.iter().find(|(id, _, _)| *id == operation).expect("a known mock operation");
+    let module = atom_val(ctx.atom("mock").expect("seeded"));
+    let function = atom_val(ctx.atom(name).expect("seeded"));
+    make_fun_external(ctx.heap(), *arity, module, function).expect("the mock fun fits")
+}
+
 fn seeded_atoms() -> AtomTable {
     let mut atoms = AtomTable::new();
-    atoms.seed(["true", "false", "ok", "a", "b", "c"]);
+    atoms.seed(["true", "false", "ok", "a", "b", "c", "mock"]);
+    atoms.seed(MOCK_FUNS.iter().map(|(_, _, name)| *name));
     atoms
 }
 
-/// The mock `FunCaller`: it recognises the sentinel fun term and computes the
-/// operation's result on **its own** heap.
+/// The mock `FunCaller`: it decodes the operation a mock fun term names and computes
+/// the operation's result on **its own** heap.
 struct MockFuns {
     heap: &'static mut Heap,
+    /// The seeded atom table, kept to resolve a mock fun's function atom back to its
+    /// operation after `with_mock` has returned.
+    atoms: &'static AtomTable,
     truth: Eterm,
     falsity: Eterm,
     calls: Vec<(i64, Vec<Eterm>)>,
 }
 
 impl MockFuns {
-    fn new(atoms: &AtomTable) -> MockFuns {
+    fn new(atoms: &'static AtomTable) -> MockFuns {
         let atom = |name: &str| make_atom(atoms.lookup(name).expect("seeded atom"));
         // Leaked on purpose, for the same reason as the context heap in `with_mock`:
         // the funs that build terms (`CONS`, `DUPLICATE`, `ACC_TEN`) allocate here,
@@ -96,10 +150,26 @@ impl MockFuns {
         let heap: &'static mut Heap = Box::leak(Box::new(Heap::new(8192).expect("mock heap")));
         MockFuns {
             heap,
+            atoms,
             truth: atom("true"),
             falsity: atom("false"),
             calls: Vec::new(),
         }
+    }
+
+    /// The operation the mock fun term `fun` names.
+    ///
+    /// Every fun argument reaching the mock is one [`mock_fun`] built, so its function
+    /// atom is a seeded [`MOCK_FUNS`] name; anything else is a test bug, not an input
+    /// the BIF could produce.
+    fn operation(&self, fun: Eterm) -> i64 {
+        let function = fun_function(fun).expect("a mock fun argument is an external fun");
+        let name = self.atoms.name(function).expect("the mock fun's function atom is seeded");
+        MOCK_FUNS
+            .iter()
+            .find(|(_, _, atom)| *atom == name)
+            .map(|(id, _, _)| *id)
+            .unwrap_or_else(|| panic!("unknown mock fun {name}"))
     }
 
     fn boolean(&self, value: bool) -> Eterm {
@@ -126,7 +196,7 @@ fn key(term: Eterm) -> i64 {
 
 impl FunCaller for MockFuns {
     fn call_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
-        let operation = number(fun);
+        let operation = self.operation(fun);
         self.calls.push((operation, args.to_vec()));
         match operation {
             SQUARE => Ok(make_small(number(args[0]) * number(args[0]))),
@@ -161,15 +231,18 @@ impl FunCaller for MockFuns {
 /// mock fun caller installed, returning the closure's value and the recorded calls.
 fn with_mock<R>(f: impl FnOnce(&BifRegistry, &mut BifContext<'_>) -> R) -> (R, Vec<(i64, Vec<Eterm>)>) {
     let registry = default_registry();
-    let atoms = seeded_atoms();
+    // Leaked for the same reason as the heap: the mock resolves a mock fun's function
+    // atom through this table *after* `with_mock` has returned, and the expected
+    // atom values must be identical for every seed sequence.
+    let atoms: &'static AtomTable = Box::leak(Box::new(seeded_atoms()));
     // Leaked on purpose: the closure's results are `Eterm`s that point into this
     // heap, and the tests inspect them *after* `with_mock` returns. Freeing the
     // heap here would make those reads a use-after-free.
     let heap: &'static mut Heap = Box::leak(Box::new(Heap::new(65_536).expect("test heap")));
-    let mut mock = MockFuns::new(&atoms);
+    let mut mock = MockFuns::new(atoms);
     let result = {
         let mut ctx =
-            BifContext::new(heap, &atoms, ProcessId::new(1, 0)).with_fun_caller(&mut mock);
+            BifContext::new(heap, atoms, ProcessId::new(1, 0)).with_fun_caller(&mut mock);
         f(&registry, &mut ctx)
     };
     (result, mock.calls)
@@ -202,7 +275,7 @@ fn int_list(ctx: &mut BifContext<'_>, items: &[i64]) -> Eterm {
 fn map_applies_the_fun_left_to_right() {
     let ((), calls) = with_mock(|reg, ctx| {
         let list = int_list(ctx, &[1, 2, 3]);
-        let fun = make_small(SQUARE);
+        let fun = mock_fun(ctx, SQUARE);
         let args = [fun, list];
         let mapped = reg.call("lists", "map", 2, ctx, &args).expect("lists:map/2");
         // Oracle: lists:map(fun(X) -> X * X end, [1,2,3]) => [1,4,9].
@@ -223,7 +296,7 @@ fn map_applies_the_fun_left_to_right() {
 #[test]
 fn map_of_the_empty_list_calls_nothing() {
     let (mapped, calls) = with_mock(|reg, ctx| {
-        let args = [make_small(SQUARE), NIL];
+        let args = [mock_fun(ctx, SQUARE), NIL];
         reg.call("lists", "map", 2, ctx, &args).expect("lists:map/2")
     });
     assert_eq!(mapped, NIL);
@@ -232,6 +305,8 @@ fn map_of_the_empty_list_calls_nothing() {
 
 #[test]
 fn map_rejects_a_non_list_and_an_improper_list() {
+    // The fun is a **real** arity-1 fun ([`mock_fun`]), so `map/2`'s clause-head guard
+    // `is_function(F, 1)` passes and the list shape is what decides the failure.
     // A **non-list** matches neither clause of `map/2`'s own
     // `case List of [Hd|Tail] -> …; [] -> … end`, so the oracle raises
     // `{case_clause, a}`. `case_clause` is not a predefined emulator atom and this
@@ -240,7 +315,7 @@ fn map_rejects_a_non_list_and_an_improper_list() {
     // by `tests/lists_errors.rs`, which seeds the tag.
     let ((), calls) = with_mock(|reg, ctx| {
         let non_list = ctx.atom("a").expect("seeded");
-        let args = [make_small(SQUARE), non_list];
+        let args = [mock_fun(ctx, SQUARE), non_list];
         assert!(matches!(
             reg.call("lists", "map", 2, ctx, &args),
             Err(BeamError::BadArg)
@@ -254,7 +329,7 @@ fn map_rejects_a_non_list_and_an_improper_list() {
     // `lists:map(fun(X) -> X end, [1|2])` calls the fun on `1` and then fails).
     let ((), calls) = with_mock(|reg, ctx| {
         let improper = ctx.cons(make_small(1), make_small(2)).expect("fits");
-        let args = [make_small(SQUARE), improper];
+        let args = [mock_fun(ctx, SQUARE), improper];
         assert!(matches!(
             reg.call("lists", "map", 2, ctx, &args),
             Err(BeamError::Raise(r))
@@ -272,7 +347,7 @@ fn map_rejects_a_non_list_and_an_improper_list() {
     let (mapped, calls) = with_mock(|reg, ctx| {
         let a = ctx.atom("a").expect("seeded");
         let list = ctx.list(&[a]).expect("fits");
-        let args = [make_small(IDENTITY), list];
+        let args = [mock_fun(ctx, IDENTITY), list];
         reg.call("lists", "map", 2, ctx, &args).expect("lists:map/2")
     });
     let a = make_atom(seeded_atoms().lookup("a").expect("seeded"));
@@ -284,7 +359,7 @@ fn map_rejects_a_non_list_and_an_improper_list() {
 fn foreach_visits_every_element_and_returns_ok() {
     let (result, calls) = with_mock(|reg, ctx| {
         let list = int_list(ctx, &[1, 2, 3]);
-        let args = [make_small(DOUBLE), list];
+        let args = [mock_fun(ctx, DOUBLE), list];
         reg.call("lists", "foreach", 2, ctx, &args)
             .expect("lists:foreach/2")
     });
@@ -297,7 +372,7 @@ fn foreach_visits_every_element_and_returns_ok() {
 fn filter_keeps_the_true_elements_in_order() {
     let (kept, calls) = with_mock(|reg, ctx| {
         let list = int_list(ctx, &[1, 2, 3, 4]);
-        let args = [make_small(IS_EVEN), list];
+        let args = [mock_fun(ctx, IS_EVEN), list];
         reg.call("lists", "filter", 2, ctx, &args)
             .expect("lists:filter/2")
     });
@@ -310,7 +385,7 @@ fn filter_keeps_the_true_elements_in_order() {
 fn filter_rejects_a_non_boolean_predicate_result() {
     let ((), calls) = with_mock(|reg, ctx| {
         let list = int_list(ctx, &[1]);
-        let args = [make_small(IDENTITY), list];
+        let args = [mock_fun(ctx, IDENTITY), list];
         // Oracle: `{bad_filter, 1}` — an error, never a truthy value.
         assert!(matches!(
             reg.call("lists", "filter", 2, ctx, &args),
@@ -324,7 +399,7 @@ fn filter_rejects_a_non_boolean_predicate_result() {
 fn foldl_and_foldr_walk_in_opposite_directions() {
     let (sum, foldl_calls) = with_mock(|reg, ctx| {
         let list = int_list(ctx, &[1, 2, 3]);
-        let args = [make_small(ADD), make_small(0), list];
+        let args = [mock_fun(ctx, ADD), make_small(0), list];
         reg.call("lists", "foldl", 3, ctx, &args)
             .expect("lists:foldl/3")
     });
@@ -344,7 +419,7 @@ fn foldl_and_foldr_walk_in_opposite_directions() {
 
     let (built, foldr_calls) = with_mock(|reg, ctx| {
         let list = int_list(ctx, &[1, 2, 3]);
-        let args = [make_small(CONS), NIL, list];
+        let args = [mock_fun(ctx, CONS), NIL, list];
         reg.call("lists", "foldr", 3, ctx, &args)
             .expect("lists:foldr/3")
     });
@@ -367,7 +442,7 @@ fn foldl_and_foldr_walk_in_opposite_directions() {
 #[test]
 fn foldl_returns_the_accumulator_for_the_empty_list() {
     let (acc, calls) = with_mock(|reg, ctx| {
-        let args = [make_small(ADD), make_small(41), NIL];
+        let args = [mock_fun(ctx, ADD), make_small(41), NIL];
         reg.call("lists", "foldl", 3, ctx, &args)
             .expect("lists:foldl/3")
     });
@@ -380,7 +455,7 @@ fn all_and_any_short_circuit() {
     // `all(fun(X) -> X > 2 end, [1,2,3])` decides on the very first element.
     let (result, calls) = with_mock(|reg, ctx| {
         let list = int_list(ctx, &[1, 2, 3]);
-        let args = [make_small(GT2), list];
+        let args = [mock_fun(ctx, GT2), list];
         reg.call("lists", "all", 2, ctx, &args).expect("lists:all/2")
     });
     assert_eq!(result, make_atom(seeded_atoms().lookup("false").expect("seeded")));
@@ -389,7 +464,7 @@ fn all_and_any_short_circuit() {
     // `any(fun(X) -> X < 3 end, [1,2,3])` decides on the very first element.
     let (result, calls) = with_mock(|reg, ctx| {
         let list = int_list(ctx, &[1, 2, 3]);
-        let args = [make_small(LT3), list];
+        let args = [mock_fun(ctx, LT3), list];
         reg.call("lists", "any", 2, ctx, &args).expect("lists:any/2")
     });
     assert_eq!(result, make_atom(seeded_atoms().lookup("true").expect("seeded")));
@@ -399,9 +474,9 @@ fn all_and_any_short_circuit() {
     // answers without calling the fun at all.
     let (result, calls) = with_mock(|reg, ctx| {
         let list = int_list(ctx, &[1, 2, 3]);
-        let args = [make_small(POSITIVE), list];
+        let args = [mock_fun(ctx, POSITIVE), list];
         let all = reg.call("lists", "all", 2, ctx, &args).expect("lists:all/2");
-        let args = [make_small(IS_EVEN), NIL];
+        let args = [mock_fun(ctx, IS_EVEN), NIL];
         let empty = reg.call("lists", "any", 2, ctx, &args).expect("lists:any/2");
         (all, empty)
     });
@@ -414,14 +489,15 @@ fn all_and_any_short_circuit() {
 fn takewhile_dropwhile_and_splitwith_are_lazy() {
     let ((taken, dropped, split), _) = with_mock(|reg, ctx| {
         let list = int_list(ctx, &[1, 2, 3, 1]);
+        let predicate = mock_fun(ctx, LT3);
         let take = reg
-            .call("lists", "takewhile", 2, ctx, &[make_small(LT3), list])
+            .call("lists", "takewhile", 2, ctx, &[predicate, list])
             .expect("lists:takewhile/2");
         let drop = reg
-            .call("lists", "dropwhile", 2, ctx, &[make_small(LT3), list])
+            .call("lists", "dropwhile", 2, ctx, &[predicate, list])
             .expect("lists:dropwhile/2");
         let split = reg
-            .call("lists", "splitwith", 2, ctx, &[make_small(LT3), list])
+            .call("lists", "splitwith", 2, ctx, &[predicate, list])
             .expect("lists:splitwith/2");
         (take, drop, split)
     });
@@ -436,7 +512,7 @@ fn takewhile_dropwhile_and_splitwith_are_lazy() {
     let ((), calls) = with_mock(|reg, ctx| {
         let improper = ctx.cons(make_small(1), make_small(2)).expect("fits");
         for name in ["takewhile", "dropwhile", "splitwith"] {
-            let args = [make_small(GT2), improper];
+            let args = [mock_fun(ctx, GT2), improper];
             let result = reg.call("lists", name, 2, ctx, &args).expect("stops early");
             if name == "dropwhile" {
                 // Oracle: lists:dropwhile(fun(X) -> X > 2 end, [1|2]) => [1|2].
@@ -452,7 +528,7 @@ fn takewhile_dropwhile_and_splitwith_are_lazy() {
     let ((), _) = with_mock(|reg, ctx| {
         let improper = ctx.cons(make_small(1), make_small(2)).expect("fits");
         for name in ["takewhile", "dropwhile", "splitwith"] {
-            let args = [make_small(LT3), improper];
+            let args = [mock_fun(ctx, LT3), improper];
             assert!(matches!(
                 reg.call("lists", name, 2, ctx, &args),
                 Err(BeamError::Raise(r))
@@ -467,7 +543,7 @@ fn takewhile_dropwhile_and_splitwith_are_lazy() {
 fn partition_splits_in_order() {
     let (result, calls) = with_mock(|reg, ctx| {
         let list = int_list(ctx, &[1, 2, 3, 4]);
-        let args = [make_small(GT2), list];
+        let args = [mock_fun(ctx, GT2), list];
         reg.call("lists", "partition", 2, ctx, &args)
             .expect("lists:partition/2")
     });
@@ -481,7 +557,7 @@ fn partition_splits_in_order() {
 fn flatmap_concatenates_and_rejects_a_non_list_result() {
     let (flat, calls) = with_mock(|reg, ctx| {
         let list = int_list(ctx, &[1, 2]);
-        let args = [make_small(DUPLICATE), list];
+        let args = [mock_fun(ctx, DUPLICATE), list];
         reg.call("lists", "flatmap", 2, ctx, &args)
             .expect("lists:flatmap/2")
     });
@@ -491,7 +567,7 @@ fn flatmap_concatenates_and_rejects_a_non_list_result() {
 
     let ((), _) = with_mock(|reg, ctx| {
         let list = int_list(ctx, &[1]);
-        let args = [make_small(IDENTITY), list];
+        let args = [mock_fun(ctx, IDENTITY), list];
         // Oracle: `List ++ Rest` with a non-list is `badarg`.
         assert!(matches!(
             reg.call("lists", "flatmap", 2, ctx, &args),
@@ -505,7 +581,7 @@ fn zipwith_pairs_and_rejects_a_length_mismatch() {
     let (zipped, calls) = with_mock(|reg, ctx| {
         let left = int_list(ctx, &[1, 2]);
         let right = int_list(ctx, &[10, 20]);
-        let args = [make_small(ADD), left, right];
+        let args = [mock_fun(ctx, ADD), left, right];
         reg.call("lists", "zipwith", 3, ctx, &args)
             .expect("lists:zipwith/3")
     });
@@ -515,7 +591,7 @@ fn zipwith_pairs_and_rejects_a_length_mismatch() {
     let ((), _) = with_mock(|reg, ctx| {
         let left = int_list(ctx, &[1, 2, 3]);
         let right = int_list(ctx, &[10, 20]);
-        let args = [make_small(ADD), left, right];
+        let args = [mock_fun(ctx, ADD), left, right];
         // `lists:zipwith/3` is `zipwith(F, Xs, Ys, fail)`, whose `fail` mode has no
         // clause for a length mismatch — *it does not stop at the shorter list*.
         // Verified against the oracle: `lists:zipwith(fun(X,Y) -> X+Y end, [1,2], [3])`
@@ -527,7 +603,7 @@ fn zipwith_pairs_and_rejects_a_length_mismatch() {
                 if r.class == ExceptionClass::Error
                     && r.reason == ExitReason::atom("function_clause")
         ));
-        let empty = [make_small(ADD), NIL, NIL];
+        let empty = [mock_fun(ctx, ADD), NIL, NIL];
         assert_eq!(
             reg.call("lists", "zipwith", 3, ctx, &empty)
                 .expect("both empty"),
@@ -540,7 +616,7 @@ fn zipwith_pairs_and_rejects_a_length_mismatch() {
 fn mapfoldl_and_mapfoldr_accumulate_in_opposite_directions() {
     let (left, left_calls) = with_mock(|reg, ctx| {
         let list = int_list(ctx, &[1, 2, 3]);
-        let args = [make_small(ACC_TEN), make_small(0), list];
+        let args = [mock_fun(ctx, ACC_TEN), make_small(0), list];
         reg.call("lists", "mapfoldl", 3, ctx, &args)
             .expect("lists:mapfoldl/3")
     });
@@ -555,7 +631,7 @@ fn mapfoldl_and_mapfoldr_accumulate_in_opposite_directions() {
 
     let (right, right_calls) = with_mock(|reg, ctx| {
         let list = int_list(ctx, &[1, 2, 3]);
-        let args = [make_small(ACC_TEN), make_small(0), list];
+        let args = [mock_fun(ctx, ACC_TEN), make_small(0), list];
         reg.call("lists", "mapfoldr", 3, ctx, &args)
             .expect("lists:mapfoldr/3")
     });
@@ -573,14 +649,14 @@ fn mapfoldl_and_mapfoldr_accumulate_in_opposite_directions() {
 fn sort2_sorts_stably_and_usort2_collapses_equivalent_runs() {
     let (sorted, _) = with_mock(|reg, ctx| {
         let list = int_list(ctx, &[3, 1, 2]);
-        let args = [make_small(LESS_EQ), list];
+        let args = [mock_fun(ctx, LESS_EQ), list];
         reg.call("lists", "sort", 2, ctx, &args).expect("lists:sort/2")
     });
     assert_eq!(ints(sorted), vec![1, 2, 3]);
 
     let (unique, _) = with_mock(|reg, ctx| {
         let list = int_list(ctx, &[3, 1, 2, 1]);
-        let args = [make_small(LESS_EQ), list];
+        let args = [mock_fun(ctx, LESS_EQ), list];
         reg.call("lists", "usort", 2, ctx, &args).expect("lists:usort/2")
     });
     // Oracle: lists:usort(fun(A,B) -> A =< B end, [3,1,2,1]) => [1,2,3]. `usort/2`
@@ -601,11 +677,12 @@ fn sort2_sorts_stably_and_usort2_collapses_equivalent_runs() {
         let two_a = ctx.tuple(&[make_small(2), a]).expect("fits");
         let equal_keys = ctx.list(&[one_a, one_b]).expect("fits");
         let out_of_order = ctx.list(&[two_a, one_b]).expect("fits");
+        let ordering = mock_fun(ctx, KEY_LESS_EQ);
         let stable = reg
-            .call("lists", "sort", 2, ctx, &[make_small(KEY_LESS_EQ), equal_keys])
+            .call("lists", "sort", 2, ctx, &[ordering, equal_keys])
             .expect("lists:sort/2");
         let reordered = reg
-            .call("lists", "sort", 2, ctx, &[make_small(KEY_LESS_EQ), out_of_order])
+            .call("lists", "sort", 2, ctx, &[ordering, out_of_order])
             .expect("lists:sort/2");
         (stable, reordered)
     });
@@ -633,7 +710,7 @@ fn sort2_sorts_stably_and_usort2_collapses_equivalent_runs() {
         let first = ctx.tuple(&[make_small(1), a]).expect("fits");
         let second = ctx.tuple(&[make_small(1), b]).expect("fits");
         let list = ctx.list(&[first, second]).expect("fits");
-        let args = [make_small(KEY_LESS_EQ), list];
+        let args = [mock_fun(ctx, KEY_LESS_EQ), list];
         reg.call("lists", "usort", 2, ctx, &args).expect("lists:usort/2")
     });
     let order = elements(unique);
@@ -645,15 +722,15 @@ fn sort2_sorts_stably_and_usort2_collapses_equivalent_runs() {
     // (oracle: lists:usort(fun(A,B) -> A < B end, [3,1,2,1]) => [1,1,2,3]).
     let (unique, _) = with_mock(|reg, ctx| {
         let list = int_list(ctx, &[3, 1, 2, 1]);
-        let args = [make_small(LESS), list];
+        let args = [mock_fun(ctx, LESS), list];
         reg.call("lists", "usort", 2, ctx, &args).expect("lists:usort/2")
     });
     assert_eq!(ints(unique), vec![1, 1, 2, 3]);
 
     let (empty, _) = with_mock(|reg, ctx| {
-        let args = [make_small(LESS_EQ), NIL];
+        let args = [mock_fun(ctx, LESS_EQ), NIL];
         let sorted = reg.call("lists", "sort", 2, ctx, &args).expect("lists:sort/2");
-        let args = [make_small(LESS_EQ), NIL];
+        let args = [mock_fun(ctx, LESS_EQ), NIL];
         let unique = reg.call("lists", "usort", 2, ctx, &args).expect("lists:usort/2");
         (sorted, unique)
     });
@@ -669,7 +746,7 @@ fn keymap_maps_only_the_indexed_tuple_element() {
         let first = ctx.tuple(&[a, make_small(1)]).expect("fits");
         let second = ctx.tuple(&[b, make_small(2)]).expect("fits");
         let list = ctx.list(&[first, second]).expect("fits");
-        let args = [make_small(DOUBLE), make_small(2), list];
+        let args = [mock_fun(ctx, DOUBLE), make_small(2), list];
         reg.call("lists", "keymap", 3, ctx, &args)
             .expect("lists:keymap/3")
     });
@@ -687,7 +764,7 @@ fn keymap_maps_only_the_indexed_tuple_element() {
         let good = ctx.tuple(&[a, make_small(1)]).expect("fits");
         let bad = ctx.atom("b").expect("seeded");
         let list = ctx.list(&[good, bad]).expect("fits");
-        let args = [make_small(DOUBLE), make_small(2), list];
+        let args = [mock_fun(ctx, DOUBLE), make_small(2), list];
         assert!(matches!(
             reg.call("lists", "keymap", 3, ctx, &args),
             Err(BeamError::BadArg)
@@ -700,7 +777,7 @@ fn keymap_maps_only_the_indexed_tuple_element() {
 fn a_failing_fun_is_propagated_verbatim() {
     let ((), _) = with_mock(|reg, ctx| {
         let list = int_list(ctx, &[1]);
-        let args = [make_small(RAISES), list];
+        let args = [mock_fun(ctx, RAISES), list];
         match reg.call("lists", "map", 2, ctx, &args) {
             Err(error) => assert!(matches!(error, BeamError::BadArg)),
             other => panic!("expected the fun's own error, got {other:?}"),
@@ -724,24 +801,24 @@ fn without_a_fun_caller_every_fun_taking_bif_is_a_typed_unsupported() {
     let list = ctx.list(&[first, second]).expect("fits");
 
     let cases: [(&str, u32, Vec<Eterm>); 18] = [
-        ("map", 2, vec![make_small(SQUARE), list]),
-        ("filter", 2, vec![make_small(IS_EVEN), list]),
-        ("foldl", 3, vec![make_small(ADD), make_small(0), list]),
-        ("foldr", 3, vec![make_small(CONS), NIL, list]),
-        ("foreach", 2, vec![make_small(DOUBLE), list]),
-        ("sort", 2, vec![make_small(LESS_EQ), list]),
-        ("usort", 2, vec![make_small(LESS_EQ), list]),
-        ("flatmap", 2, vec![make_small(DUPLICATE), list]),
-        ("zipwith", 3, vec![make_small(ADD), list, list]),
-        ("mapfoldl", 3, vec![make_small(ACC_TEN), make_small(0), list]),
-        ("mapfoldr", 3, vec![make_small(ACC_TEN), make_small(0), list]),
-        ("all", 2, vec![make_small(IS_EVEN), list]),
-        ("any", 2, vec![make_small(IS_EVEN), list]),
-        ("takewhile", 2, vec![make_small(LT3), list]),
-        ("dropwhile", 2, vec![make_small(LT3), list]),
-        ("partition", 2, vec![make_small(GT2), list]),
-        ("splitwith", 2, vec![make_small(LT3), list]),
-        ("keymap", 3, vec![make_small(DOUBLE), make_small(2), list]),
+        ("map", 2, vec![mock_fun(&mut ctx, SQUARE), list]),
+        ("filter", 2, vec![mock_fun(&mut ctx, IS_EVEN), list]),
+        ("foldl", 3, vec![mock_fun(&mut ctx, ADD), make_small(0), list]),
+        ("foldr", 3, vec![mock_fun(&mut ctx, CONS), NIL, list]),
+        ("foreach", 2, vec![mock_fun(&mut ctx, DOUBLE), list]),
+        ("sort", 2, vec![mock_fun(&mut ctx, LESS_EQ), list]),
+        ("usort", 2, vec![mock_fun(&mut ctx, LESS_EQ), list]),
+        ("flatmap", 2, vec![mock_fun(&mut ctx, DUPLICATE), list]),
+        ("zipwith", 3, vec![mock_fun(&mut ctx, ADD), list, list]),
+        ("mapfoldl", 3, vec![mock_fun(&mut ctx, ACC_TEN), make_small(0), list]),
+        ("mapfoldr", 3, vec![mock_fun(&mut ctx, ACC_TEN), make_small(0), list]),
+        ("all", 2, vec![mock_fun(&mut ctx, IS_EVEN), list]),
+        ("any", 2, vec![mock_fun(&mut ctx, IS_EVEN), list]),
+        ("takewhile", 2, vec![mock_fun(&mut ctx, LT3), list]),
+        ("dropwhile", 2, vec![mock_fun(&mut ctx, LT3), list]),
+        ("partition", 2, vec![mock_fun(&mut ctx, GT2), list]),
+        ("splitwith", 2, vec![mock_fun(&mut ctx, LT3), list]),
+        ("keymap", 3, vec![mock_fun(&mut ctx, DOUBLE), make_small(2), list]),
     ];
     for (name, arity, args) in cases {
         match registry.call("lists", name, arity, &mut ctx, &args) {
@@ -758,14 +835,15 @@ fn without_a_fun_caller_every_fun_taking_bif_is_a_typed_unsupported() {
     // `lists:sort(F, [X])` => `[X]` — the ordering fun is never applied). That is
     // precisely why the cases above use a two-element list.
     let single = ctx.list(&[make_small(1)]).expect("fits");
+    let ordering = mock_fun(&mut ctx, LESS_EQ);
     for name in ["sort", "usort"] {
         let sorted = registry
-            .call("lists", name, 2, &mut ctx, &[make_small(LESS_EQ), single])
+            .call("lists", name, 2, &mut ctx, &[ordering, single])
             .expect("no comparison needed");
         assert_eq!(ints(sorted), vec![1]);
         assert_eq!(
             registry
-                .call("lists", name, 2, &mut ctx, &[make_small(LESS_EQ), NIL])
+                .call("lists", name, 2, &mut ctx, &[ordering, NIL])
                 .expect("no comparison needed"),
             NIL
         );

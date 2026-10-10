@@ -40,6 +40,12 @@
 //! `keymap/3`'s `element/2`) are pinned too, so a regression cannot hide behind the
 //! structured-reason path.
 //!
+//! A **fun** argument is checked first: every fun-taking `lists.erl` function whose
+//! clause head carries `is_function(F, Arity)` (`map/2`, `foreach/2`, `filter/2`,
+//! `foldl/3`, `foldr/3`, …) raises the bare `error:function_clause` for a non-fun or a
+//! fun of the wrong arity — *before* the list argument is looked at, so the
+//! list-shape reasons above are only reachable with a fun of the right arity.
+//!
 //! The fun-taking functions are exercised through a stub [`FunCaller`]: it answers
 //! arity-1 calls with a configurable boolean *verdict* (so `all/2`/`any/2` can be made
 //! to walk past their short-circuit) and any other arity with its last argument (the
@@ -150,7 +156,12 @@ fn assert_badarg(result: Result<Eterm>) {
     assert!(matches!(result, Err(BeamError::BadArg)), "expected badarg, got {result:?}");
 }
 
-/// A stand-in for a fun argument: the stub `FunCaller` never inspects it.
+/// A stand-in for a fun argument that is **not** a fun: the stub `FunCaller` never
+/// inspects it, and it only ever reaches a BIF whose clause head does *not* guard on
+/// the fun (`all/2`/`any/2` case the list first, the explicit-`badarg` BIFs never look
+/// at a fun). Every BIF with an `is_function(F, Arity)` head guard takes [`real_fun`]
+/// instead — a non-fun fails that guard with `error:function_clause` before the list is
+/// walked.
 fn a_fun() -> Eterm {
     make_small(0)
 }
@@ -173,11 +184,14 @@ fn improper(ctx: &mut BifContext<'_>, head: i64, tail: Eterm) -> Eterm {
 
 #[test]
 fn map_of_a_non_list_is_case_clause_and_of_an_improper_tail_function_clause() {
-    // Oracle: lists:map(fun(X) -> X end, a) => error:{case_clause, a}.
+    // Oracle: lists:map(fun(X) -> X end, a) => error:{case_clause, a}. The fun is a
+    // **real** arity-1 fun, so `map/2`'s clause-head guard `is_function(F, 1)` passes
+    // and the failure is the walk's own `case`.
     let (_, case_clause) = atom("case_clause");
     let (result, non_list) = run(true, |reg, ctx| {
         let non_list = ctx.atom("a").expect("seeded");
-        (reg.call("lists", "map", 2, ctx, &[a_fun(), non_list]), non_list)
+        let fun = real_fun(ctx, 1);
+        (reg.call("lists", "map", 2, ctx, &[fun, non_list]), non_list)
     });
     assert_tagged(result, case_clause, non_list);
 
@@ -185,31 +199,111 @@ fn map_of_a_non_list_is_case_clause_and_of_an_improper_tail_function_clause() {
     // `map_1/2` worker has no clause for the non-list tail.
     let result = run(true, |reg, ctx| {
         let list = improper(ctx, 1, ctx.int(2).expect("fits"));
-        reg.call("lists", "map", 2, ctx, &[a_fun(), list])
+        let fun = real_fun(ctx, 1);
+        reg.call("lists", "map", 2, ctx, &[fun, list])
     });
     assert_function_clause(result);
+
+    // A first argument that is **not** an arity-1 fun fails the clause head
+    // `map(F, List) when is_function(F, 1)` *before* the list argument is ever
+    // inspected, so the reason is the bare `error:function_clause` for **every** list
+    // shape — the `{case_clause, V}`/`function_clause` split above is unreachable with
+    // a non-fun. Probed against the oracle:
+    //   lists:map(5, [1])                  => error:function_clause
+    //   lists:map(5, x)                    => error:function_clause
+    //   lists:map(5, [])                   => error:function_clause
+    //   lists:map(fun(X, Y) -> X end, [1]) => error:function_clause
+    //   lists:map(fun(X, Y) -> X end, x)   => error:function_clause
+    //   lists:map(fun() -> 1 end, [1])     => error:function_clause
+    //   lists:map({a, b}, x)               => error:function_clause
+    for list in [0, 1, 2] {
+        let result = run(true, |reg, ctx| {
+            let arg = match list {
+                0 => NIL,
+                1 => ctx.list(&[ctx.int(1).expect("fits")]).expect("fits"),
+                _ => ctx.atom("a").expect("seeded"),
+            };
+            let non_fun = ctx.int(5).expect("fits");
+            reg.call("lists", "map", 2, ctx, &[non_fun, arg])
+        });
+        assert_function_clause(result);
+    }
+
+    // A fun of the *wrong* arity fails it too, again for both list shapes.
+    for list in [false, true] {
+        let result = run(true, |reg, ctx| {
+            let arg = if list {
+                ctx.list(&[ctx.int(1).expect("fits")]).expect("fits")
+            } else {
+                ctx.atom("a").expect("seeded")
+            };
+            let fun = real_fun(ctx, 2);
+            reg.call("lists", "map", 2, ctx, &[fun, arg])
+        });
+        assert_function_clause(result);
+    }
 }
 
 #[test]
 fn foldl_of_a_non_list_is_case_clause_and_of_an_improper_tail_function_clause() {
     let (_, case_clause) = atom("case_clause");
 
-    // Oracle: lists:foldl(F, 0, a) => error:{case_clause, a}.
+    // Oracle: lists:foldl(fun(X, A) -> X + A end, 0, a) => error:{case_clause, a} —
+    // with a **real** arity-2 fun, so the clause-head guard `is_function(F, 2)` passes
+    // and `foldl/3`'s own `case` reports.
     let (result, non_list) = run(true, |reg, ctx| {
         let non_list = ctx.atom("a").expect("seeded");
         let zero = ctx.int(0).expect("fits");
-        let result = reg.call("lists", "foldl", 3, ctx, &[a_fun(), zero, non_list]);
+        let fun = real_fun(ctx, 2);
+        let result = reg.call("lists", "foldl", 3, ctx, &[fun, zero, non_list]);
         (result, non_list)
     });
     assert_tagged(result, case_clause, non_list);
 
-    // Oracle: lists:foldl(F, 0, [1|2]) => error:function_clause.
+    // Oracle: lists:foldl(fun(X, A) -> X + A end, 0, [1|2]) => error:function_clause.
     let result = run(true, |reg, ctx| {
         let zero = ctx.int(0).expect("fits");
         let list = improper(ctx, 1, ctx.int(2).expect("fits"));
-        reg.call("lists", "foldl", 3, ctx, &[a_fun(), zero, list])
+        let fun = real_fun(ctx, 2);
+        reg.call("lists", "foldl", 3, ctx, &[fun, zero, list])
     });
     assert_function_clause(result);
+
+    // A first argument that is not an arity-2 fun fails the clause head
+    // `foldl(F, Accu, List) when is_function(F, 2)` before the list argument is
+    // touched — the bare `error:function_clause` whatever the list shape. Probed:
+    //   lists:foldl(5, 0, [1])                => error:function_clause
+    //   lists:foldl(5, 0, a)                  => error:function_clause
+    //   lists:foldl(fun(X) -> X end, 0, [1])  => error:function_clause
+    //   lists:foldl(fun(X, Y, Z) -> X end, 0, [1]) => error:function_clause
+    for list in [0, 1, 2] {
+        let result = run(true, |reg, ctx| {
+            let arg = match list {
+                0 => NIL,
+                1 => ctx.list(&[ctx.int(1).expect("fits")]).expect("fits"),
+                _ => ctx.atom("a").expect("seeded"),
+            };
+            let zero = ctx.int(0).expect("fits");
+            let non_fun = ctx.int(5).expect("fits");
+            reg.call("lists", "foldl", 3, ctx, &[non_fun, zero, arg])
+        });
+        assert_function_clause(result);
+    }
+
+    // An arity-1 fun fails it too, for both a proper list and a non-list.
+    for list in [false, true] {
+        let result = run(true, |reg, ctx| {
+            let arg = if list {
+                ctx.list(&[ctx.int(1).expect("fits")]).expect("fits")
+            } else {
+                ctx.atom("a").expect("seeded")
+            };
+            let zero = ctx.int(0).expect("fits");
+            let fun = real_fun(ctx, 1);
+            reg.call("lists", "foldl", 3, ctx, &[fun, zero, arg])
+        });
+        assert_function_clause(result);
+    }
 }
 
 #[test]
@@ -271,34 +365,78 @@ fn all_and_any_reach_an_improper_tail_only_without_a_short_circuit() {
 fn filter_reports_the_bad_generator_value() {
     let (_, bad_generator) = atom("bad_generator");
 
-    // Oracle: lists:filter(fun(_) -> true end, a) => error:{bad_generator, a}.
+    // Oracle: lists:filter(fun(_) -> true end, a) => error:{bad_generator, a} — the
+    // fun is a **real** arity-1 fun, so the clause-head guard `is_function(Pred, 1)`
+    // passes and the comprehension's generator reports.
     let (result, non_list) = run(true, |reg, ctx| {
         let non_list = ctx.atom("a").expect("seeded");
-        (reg.call("lists", "filter", 2, ctx, &[a_fun(), non_list]), non_list)
+        let fun = real_fun(ctx, 1);
+        (reg.call("lists", "filter", 2, ctx, &[fun, non_list]), non_list)
     });
     assert_tagged(result, bad_generator, non_list);
 
-    // Oracle: lists:filter(P, [1|2]) => {bad_generator, 2} — the non-list *remainder*,
-    // not the argument.
+    // Oracle: lists:filter(fun(_) -> true end, [1|2]) => {bad_generator, 2} — the
+    // non-list *remainder*, not the argument.
     let (result, two) = run(true, |reg, ctx| {
         let two = ctx.int(2).expect("fits");
         let list = improper(ctx, 1, two);
-        (reg.call("lists", "filter", 2, ctx, &[a_fun(), list]), two)
+        let fun = real_fun(ctx, 1);
+        (reg.call("lists", "filter", 2, ctx, &[fun, list]), two)
     });
     assert_tagged(result, bad_generator, two);
 
-    // Oracle: lists:filter(P, [1,2|3]) => {bad_generator, 3}.
+    // Oracle: lists:filter(fun(_) -> true end, [1,2|3]) => {bad_generator, 3}.
     let (result, three) = run(true, |reg, ctx| {
         let three = ctx.int(3).expect("fits");
         let inner = improper(ctx, 2, three);
         let list = improper(ctx, 1, inner);
-        (reg.call("lists", "filter", 2, ctx, &[a_fun(), list]), three)
+        let fun = real_fun(ctx, 1);
+        (reg.call("lists", "filter", 2, ctx, &[fun, list]), three)
     });
     assert_tagged(result, bad_generator, three);
 
     // The empty list filters to itself and calls nothing.
-    let result = run(true, |reg, ctx| reg.call("lists", "filter", 2, ctx, &[a_fun(), NIL]));
+    let result = run(true, |reg, ctx| {
+        let fun = real_fun(ctx, 1);
+        reg.call("lists", "filter", 2, ctx, &[fun, NIL])
+    });
     assert_eq!(result.expect("the empty list filters to itself"), NIL);
+
+    // A first argument that is not an arity-1 fun fails the clause head
+    // `filter(Pred, List) when is_function(Pred, 1)` *before* the generator is
+    // entered, so the `{bad_generator, V}` shape is unreachable with a non-fun — the
+    // reason is the bare `error:function_clause`. Probed:
+    //   lists:filter(5, [1])                 => error:function_clause
+    //   lists:filter(5, x)                   => error:function_clause
+    //   lists:filter(5, [])                  => error:function_clause
+    //   lists:filter(fun(X, Y) -> X end, [1]) => error:function_clause
+    //   lists:filter(fun(X, Y) -> X end, x)  => error:function_clause
+    for list in [0, 1, 2] {
+        let result = run(true, |reg, ctx| {
+            let arg = match list {
+                0 => NIL,
+                1 => ctx.list(&[ctx.int(1).expect("fits")]).expect("fits"),
+                _ => ctx.atom("a").expect("seeded"),
+            };
+            let non_fun = ctx.int(5).expect("fits");
+            reg.call("lists", "filter", 2, ctx, &[non_fun, arg])
+        });
+        assert_function_clause(result);
+    }
+
+    // A fun of the wrong arity fails it too, again for both list shapes.
+    for list in [false, true] {
+        let result = run(true, |reg, ctx| {
+            let arg = if list {
+                ctx.list(&[ctx.int(1).expect("fits")]).expect("fits")
+            } else {
+                ctx.atom("a").expect("seeded")
+            };
+            let fun = real_fun(ctx, 2);
+            reg.call("lists", "filter", 2, ctx, &[fun, arg])
+        });
+        assert_function_clause(result);
+    }
 }
 
 #[test]
