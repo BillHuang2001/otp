@@ -184,7 +184,8 @@ pub(super) fn lower_instr(raw: &RawInstr) -> Result<Instr> {
         // `select_tuple_arity Tuple Fail {Arity,Label}*` — the alternatives arrive as
         // one flattened `z,1` argument list, exactly like `select_val`.
         Opcode::select_tuple_arity => Ok(Instr::SelectTupleArity {
-            tuple: op(ops, 0)?,            fail: as_label(operand(ops, 1)?)?,
+            tuple: op(ops, 0)?,
+            fail: as_label(operand(ops, 1)?)?,
             destinations: value_label_pairs(operand(ops, 2)?)?,
         }),
         Opcode::put_list => Ok(Instr::PutList {
