@@ -19,7 +19,8 @@
 // %CopyrightEnd%
 
 //! The **whole-file-descriptor** family of the runtime-native `prim_file:*` floor
-//! (contract **A.7**): `open/2`, `read/2`, `write/2`, `close/1`, `position/2`.
+//! (contract **A.7**): `open/2`, `read/2`, `write/2`, `close/1`, `position/2`, `pread/2,3`,
+//! `pwrite/2,3`, `truncate/1`, `sync/1`, `datasync/1` and `write_file/2`.
 //!
 //! These are the primitives `file.erl` delegates a **raw** file to; in the oracle they are
 //! the pure-Erlang wrappers of `erts/preloaded/src/prim_file.erl` over the C NIFs of
@@ -76,6 +77,14 @@
 //! | `write/2` | `prim_file.erl:247-263` + `write_nif_impl` (`prim_file_nif.c:664-682`, `enif_inspect_iovec`) | `ok` for `<<…>>`/`"…"`/`[<<"a">>,<<"b">>]`/`[<<"ab">>,[<<"c">>]]`/`[]`/`<<>>`; `{error,badarg}` for `foo`/`[256]`/`[-1]`/`[1.5]`/`[1\|2]`/`<<1:4>>`; a read-only fd⇒`{error,ebadf}`; a directory fd⇒`{error,ebadf}` |
 //! | `close/1` | `prim_file.erl:154-160` + `close_nif` (`prim_file_nif.c:612-631`) | `ok`; a second close⇒`{error,einval}`; a malformed descriptor⇒`{error,badarg}` |
 //! | `position/2` | `prim_file.erl:306-334` (`position/2` + `position_1/3`) + `efile_seek` (`unix_prim_file.c:502-533`) | `{ok,N}`; `bof`/`cur`/`eof`⇒offset 0; a bare integer `N`⇒`{N,bof}`; `{eof,-1}` on an 11-byte file⇒`{ok,10}`; `{bof,-1}`/`-3`⇒`{error,einval}`; `foo`/`{1,bof}`/`{bof,foo}`/`{bof,1.0}`/`{bof,1,2}`⇒`{error,badarg}`; past EOF⇒`{ok,100}`; a closed fd⇒`{error,einval}` |
+//! | `pread/3` | `prim_file.erl:336-342` (`pread/3`) + `pread_nif_impl` (`prim_file_nif.c:712-750`) + `efile_preadv` (`unix_prim_file.c:393-450`) | `pread(Fd,0,3)`⇒`{ok,<<"012">>}`; `pread(Fd,9,5)` on an 11-byte file⇒`{ok,<<"9a">>}`; `pread(Fd,0,0)`/`(Fd,11,3)`⇒`eof`; the cursor is **not** moved; `-1`/a float/a bigint⇒`{error,einval}`; a non-numeric offset or size⇒`{error,badarg}`; a `[write]` fd⇒`{error,ebadf}`; a `[directory]` fd⇒`{error,eisdir}`; a closed fd⇒`{error,einval}` |
+//! | `pread/2` | `prim_file.erl:344-368` (`pread_list/3`) | `pread(F,[{0,3},{6,5}])`⇒`{ok,[<<"012">>,<<"6789a">>]}`; `pread(F,[{0,3},{100,5}])`⇒`{ok,[<<"012">>,eof]}`; `pread(F,[])`⇒`{ok,[]}` (also on a **closed** fd); `pread(closed,[{0,1}])`⇒`{error,einval}`; `[{0,foo}]`⇒`{error,badarg}` |
+//! | `pwrite/3` | `prim_file.erl:370-391` (`pwrite/3`) + `pwrite_nif_impl` (`prim_file_nif.c:752-780`) + `efile_pwritev` (`unix_prim_file.c:452-506`) | `pwrite(Fd,0,<<"XY">>)`⇒`ok` (cursor unchanged); `pwrite(Fd,0,<<>>)`⇒`ok`; `-1`/a float/a bigint⇒`{error,einval}`; a bad payload or non-numeric offset⇒`{error,badarg}`; a `[read]` fd or a `[directory]` fd⇒`{error,ebadf}`; a closed fd⇒`{error,einval}` |
+//! | `pwrite/2` | `prim_file.erl:393-418` (`pwrite_list/3`) | `pwrite(F,[{0,<<"A">>},{2,<<"B">>}])`⇒`ok`; `pwrite(F,[])`⇒`ok` (also closed); `[{0,<<"A">>},{1,foo}]`⇒`{error,badarg}`; `[{-1,<<"A">>}]`⇒`{error,{0,einval}}`; a closed fd with a non-empty list⇒`{error,{0,einval}}`; a `[directory]` fd⇒`{error,{0,ebadf}}` |
+//! | `truncate/1` | `prim_file.erl:265-272` (`truncate/1`) + `truncate_nif_impl` (`unix_prim_file.c:693-710`: `lseek(SEEK_CUR)` then `ftruncate(2)`) | `truncate(Fd)` at position 0 on an 11-byte file⇒`ok`, host size 0; after `position(Fd,4)`⇒`ok`, host size 4; a `[write]` fd⇒`ok`; a `[read]` fd / a `[directory]` fd / a closed fd⇒`{error,einval}` |
+//! | `sync/1` | `prim_file.erl:290-298` (`sync/1`) + `sync_nif` (`unix_prim_file.c:542-568`, `fsync(2)`) | `ok` for a `[read]`, a `[write]`, a `[read,write]` or a `[directory]` fd; a closed fd⇒`{error,einval}` |
+//! | `datasync/1` | `prim_file.erl:299-304` (`datasync/1`) + `sync_nif` with `data = 1` (`fdatasync(2)`) | as `sync/1` with the data-only host call |
+//! | `write_file/2` | `prim_file.erl:574-584` (`write_file/2`, a `read_file_info`/`open`/`write`/`close` composition) | `write_file(P,<<"hello">>)`⇒`ok` (host contents `<<"hello">>`); overwriting a 10-byte file with `<<"AB">>`⇒`ok`, size 2; a directory⇒`{error,eisdir}`; a missing parent⇒`{error,enoent}`; `<<>>`/`[]`⇒`{error,enoent}`; an atom path / a NUL path / a bad payload (`foo`, `[1\|2]`)⇒`{error,badarg}`; a char-list payload⇒`ok`; `write_file/3` is **not exported** (`error:undef`) |
 //!
 //! # The mode list (`open/2`)
 //!
@@ -103,9 +112,11 @@
 //! * **A malformed `Data` map is uniformly `{error,badarg}`.** The oracle raises
 //!   `{badmatch, Data}` from `get_fd_data/1` when `owner` is absent
 //!   (`prim_file.erl:500-504`), raises `function_clause` for a term that is not a
-//!   `#file_descriptor{}` at all, and throws `{error,ebadf}` when `handle` is absent on the
-//!   read path (`:506-510`); this runtime answers the single `{error,badarg}` value for all
-//!   of them. Never a panic, never a fabricated success.
+//!   `#file_descriptor{}` at all (every entry, and likewise for the `pread/2`/`pwrite/2`
+//!   list forms whose argument is not a list of proper pairs), and throws
+//!   `{error,ebadf}` when `handle` is absent on the read path (`:506-510`); this runtime
+//!   answers the single `{error,badarg}` value for all of them. Never a panic, never a
+//!   fabricated success.
 //! * **A non-integer `read/2` size is `{error,badarg}`, not `badarith`.** The oracle's
 //!   `read_1/5` computes `RASz + RSz`, which raises `badarith` for an atom, a list or any
 //!   other non-number (`prim_file.erl:192`). `read_1/5`'s own guard also fires first for a
@@ -120,15 +131,23 @@
 //! * **`close/1` cannot report a close(2) failure.** The descriptor is closed by
 //!   `std::fs::File`'s `Drop`, whose result cannot be observed; the oracle forwards
 //!   `efile_close`'s errno.
+//! * **`datasync/1` on a descriptor that is not open for writing.** The host's
+//!   `fdatasync(2)` refuses a read-only descriptor with `EBADF` where the oracle answers
+//!   `ok` — its `efile_sync` flushes *every* descriptor with `fsync(2)`
+//!   (`unix_prim_file.c:542-568`), which Linux accepts on a read-only descriptor. The
+//!   refused data-only flush is therefore retried as the full `fsync(2)` (see
+//!   `sync_descriptor`), so `sync/1` and `datasync/1` answer `ok` for a `[read]` fd as the
+//!   oracle does. An unusable descriptor is caught before the flush (`{error,einval}`).
 //! * **The iodata walk is iterative and bounded by nesting, not by recursion.** `write/2`
 //!   flattens the argument with an explicit pending list (as `erl_unicode.c`'s filename walk
 //!   is), so no nesting can exhaust the Rust stack; a nesting deeper than
 //!   [`MAX_IODATA_DEPTH`] is `{error,badarg}`.
 
 use std::fs::{File, OpenOptions};
+use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 
 use beam_common::{BeamError, Result};
 use beam_engine::terms;
@@ -708,7 +727,18 @@ impl RuntimeContext<'_> {
 
     /// The shared body of `sync/1` and `datasync/1`: decode the descriptor, then run the
     /// host's flush.
-    fn sync_descriptor(&mut self, args: &[Eterm], flush: fn(&File) -> io::Result<()>) -> Result<Eterm> {
+    ///
+    /// `// documented divergence:` the host's data-only flush (`fdatasync(2)`) refuses a
+    /// descriptor that is not open for writing (`EBADF`) where the oracle's `efile_sync`
+    /// answers `ok` (`unix_prim_file.c:542-568`; that build flushes every descriptor with
+    /// `fsync(2)`, which Linux accepts on a read-only descriptor). A refused data-only
+    /// flush therefore retries as the full `fsync(2)` before reporting a failure — a
+    /// descriptor that really is unusable is already the `{error,einval}` above.
+    fn sync_descriptor(
+        &mut self,
+        args: &[Eterm],
+        flush: fn(&File) -> io::Result<()>,
+    ) -> Result<Eterm> {
         let fd = *args.first().ok_or(BeamError::BadArg)?;
         let Some(descriptor) = self.decode_descriptor(fd) else {
             return self.error_tuple("badarg");
@@ -716,7 +746,10 @@ impl RuntimeContext<'_> {
         self.check_owner(&descriptor)?;
         let outcome = match self.runtime.open_files_mut().get_mut(&descriptor.id) {
             None => None,
-            Some(file) => Some(flush(file)),
+            Some(file) => Some(match flush(file) {
+                Err(error) if error.raw_os_error() == Some(libc::EBADF) => file.sync_all(),
+                outcome => outcome,
+            }),
         };
         match outcome {
             None => self.error_tuple("einval"),
@@ -1030,6 +1063,99 @@ fn read_extent(file: &mut File, count: usize) -> std::io::Result<Vec<u8>> {
     Ok(buffer)
 }
 
+/// One positioned read of at most `count` bytes at `offset` **without moving the
+/// descriptor's cursor** (`efile_preadv`, `unix_prim_file.c:393-450`), the counterpart of
+/// [`read_extent`] for `pread`.
+///
+/// `pread(2)` is `FileExt::read_at`, which leaves the descriptor's file position untouched —
+/// the whole observable difference between `pread` and `read`. The destination is pre-sized
+/// to `count` and an unsatisfiable reservation is the NIF's own `ENOMEM`
+/// (`prim_file_nif.c:642-644`), exactly as [`read_extent`] does it.
+fn pread_extent(file: &File, offset: u64, count: usize) -> io::Result<Vec<u8>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let mut buffer: Vec<u8> = Vec::new();
+    buffer
+        .try_reserve_exact(count)
+        .map_err(|_| io::Error::from_raw_os_error(libc::ENOMEM))?;
+    buffer.resize(count, 0);
+    let read = file.read_at(&mut buffer, offset)?;
+    buffer.truncate(read);
+    Ok(buffer)
+}
+
+/// One positioned write of the whole `bytes` slice at `offset` **without moving the
+/// descriptor's cursor** (`efile_pwritev`, `unix_prim_file.c:452-506`), the counterpart of
+/// [`pread_extent`] for `pwrite`.
+///
+/// `pwrite(2)` is `FileExt::write_all_at`: it leaves the descriptor's file position
+/// untouched, and `write_all` semantics are what the C's `writev` loop provides.
+fn write_at(file: &File, offset: u64, bytes: &[u8]) -> io::Result<()> {
+    file.write_all_at(bytes, offset)
+}
+
+/// The errno atom name of a host I/O failure, as a `String` (`{error, Reason}`'s `Reason`).
+///
+/// Thin wrapper over [`super::prim::errno_name`] so the `pwrite/2` list walk can build its
+/// `{error, {Successes, Reason}}` reason from an [`io::Error`] the same way
+/// [`RuntimeContext::error_tuple_for`] does.
+fn errno_reason(error: &io::Error) -> String {
+    super::prim::errno_name(error.raw_os_error().unwrap_or(0))
+}
+
+/// A `pread/3` size/offset argument, classified exactly as the C's `enif_is_number` +
+/// `enif_get_int64` pair does (`prim_file_nif.c:717-727`).
+///
+/// `BadArg` is the C's `!enif_is_number` (a non-number: an atom, a list, a tuple, a
+/// binary, …) and `EInval` the number that does not fit a non-negative `int64` (a float or
+/// a bignum — `enif_is_number` accepts them, `enif_get_int64` then fails).
+enum NumArg {
+    /// A small integer (always an `int64`).
+    Value(i64),
+    /// Not a number at all ⇒ `{error,badarg}`.
+    BadArg,
+    /// A number outside the `int64` range (or a float) ⇒ `{error,einval}`.
+    EInval,
+}
+
+/// Classifies `term` the way `enif_is_number` + `enif_get_int64` do.
+fn number_arg(term: Eterm) -> NumArg {
+    if is_small(term) {
+        return NumArg::Value(signed_value(term));
+    }
+    // `enif_is_number` accepts a float or a bignum but `enif_get_int64` then refuses it,
+    // which the C turns into `EINVAL` (`:722-727`).
+    if terms::float_value(term).is_ok() {
+        return NumArg::EInval;
+    }
+    if beam_codec::term::big_parts(term).is_ok() {
+        return NumArg::EInval;
+    }
+    // Every other term — including `[]`, the one list `beam_term::is_list/1` rejects.
+    NumArg::BadArg
+}
+
+/// The `{Offset, Size}` / `{Offset, IOData}` pair at the head of a `pread/2`/`pwrite/2`
+/// list cell, or `None` when the head is not a 2-tuple (the wrapper's `function_clause`,
+/// answered here as the value `{error,badarg}`).
+fn two_tuple(cell: Eterm) -> Option<(Eterm, Eterm)> {
+    let head = terms::cons_head(cell).ok()?;
+    if terms::tuple_arity(head).ok()? != 2 {
+        return None;
+    }
+    let first = terms::tuple_element(head, 0).ok()?;
+    let second = terms::tuple_element(head, 1).ok()?;
+    Some((first, second))
+}
+
+/// One element of a `pread/2` answer: the atom `eof`, or the bytes of the positioned read.
+enum ReadPiece {
+    /// The kernel returned nothing (`bytes_read == 0`) ⇒ the bare atom `eof`.
+    Eof,
+    /// The bytes the kernel returned ⇒ a binary.
+    Bytes(Vec<u8>),
+}
 /// The flattened bytes of a `write/2` iodata argument — `erlang:iolist_to_iovec/1`'s walk
 /// (`erl_bif_binary.c`), `None` for the `badarg` it raises.
 ///
