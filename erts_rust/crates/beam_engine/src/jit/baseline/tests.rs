@@ -1048,12 +1048,15 @@ fn seam_context(callee: &std::sync::Arc<Module>) -> MinimalContext {
 }
 
 /// A `call_ext` the host resolves through [`ExecutionContext::resolve_external_call`]
-/// runs the callee **in this machine** on the interpreter (a module-context
-/// switch). A compiled block has one module's code, label map and literal area
-/// bound, so the native tier reports the documented typed error for that
-/// `Step::Enter` — never a wrong result and never a silent continue.
+/// runs the callee **in this machine** on a module-context switch, and the native tier
+/// drives that switch exactly as the interpreter does: the compiled block's per-instruction
+/// deopt reports the resolved target with the [`ENTER`] word (never a wrong result, never a
+/// silent continue), the driver performs the context switch and enters the callee's own
+/// compiled blocks — or, for a callee the tier has no blocks for, its documented
+/// per-instruction interpreter step — and the callee's `return` unwinds back into the
+/// caller's frame.
 #[test]
-fn a_resolved_cross_module_call_is_a_typed_error_on_the_baseline_tier() {
+fn a_resolved_cross_module_call_runs_on_the_baseline_tier() {
     let callee_module = build_module(
         "callee_x",
         &[],
@@ -1114,21 +1117,22 @@ fn a_resolved_cross_module_call_is_a_typed_error_on_the_baseline_tier() {
         RunOutcome::Returned(make_small(99))
     );
 
+    // The baseline tier drives the same module-context switch (through the block's
+    // `ENTER` word), so it produces the identical result.
     let mut baseline = Machine::new();
     let mut baseline_ctx = seam_context(&callee);
-    let err = baseline
-        .run_export_outcome_with_tier(
-            &caller,
-            name,
-            0,
-            &[],
-            &mut baseline_ctx,
-            Tier::BaselineJit,
-        )
-        .expect_err("a compiled block cannot switch module context");
     assert_eq!(
-        error_reason(&err),
-        "unsupported_opcode: jit: module context switch outside the interpreter driver"
+        baseline
+            .run_export_outcome_with_tier(
+                &caller,
+                name,
+                0,
+                &[],
+                &mut baseline_ctx,
+                Tier::BaselineJit,
+            )
+            .expect("baseline run through the seam"),
+        RunOutcome::Returned(make_small(99))
     );
 }
 
@@ -1138,11 +1142,17 @@ fn a_resolved_cross_module_call_is_a_typed_error_on_the_baseline_tier() {
 // ---------------------------------------------------------------------------
 
 /// The native export entry must record the same run-entry position as the
-/// interpreter's **for an export that is not the module's first function**: the
-/// recorded `(func, arity)` and the last interpreted `(func, pc)` both name
-/// function index `1`, which only the interpreter's own `train` (the phase-8
-/// green thread) and the compiled blocks' deopts can reach — so the two agree
-/// only if `run_native_outcome` ran the interpreter's own `enter_run`.
+/// interpreter's **for an export that is not the module's first function**:
+/// `entry_call` names function index `1`, which only the interpreter's own
+/// `enter_run` (the phase-8 green thread) can record — so the two agree only if
+/// `run_native_outcome` ran the interpreter's own `enter_run`.
+///
+/// `current_code` at the end of the run is the position of the last position *recorded*,
+/// and both tiers record the trailing `return`: the interpreter steps it, and the native
+/// tier's compiled block reaches it through its documented per-instruction deopt. The
+/// block prologue's own block-entry record (`(1, 0)`) is therefore superseded — the
+/// separate linked-chain test pins the case where a natively executed block is the last
+/// thing to record.
 #[test]
 fn the_baseline_entry_records_the_same_run_position_as_the_interpreter() {
     let module = build_module(
@@ -1388,4 +1398,99 @@ fn the_block_spills_its_cached_registers_before_a_helper_call() {
              block must have spilled its resident"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// the block-entry position store
+// ---------------------------------------------------------------------------
+
+/// A position recorded from a **natively executed block's own prologue**.
+///
+/// Every compiled block opens by calling `jit_set_position(rt, func, pc)` with its
+/// own `(func, pc)`, so `Machine::current_code` advances at **block granularity**
+/// even when a linked branch carries control from one block to the next without ever
+/// returning to the driver. The observation uses a block whose execution ends through
+/// the linked tail call's **checked frame pop**: a `deallocate` that no longer matches
+/// the live frame is raised by `jit_tail_call`, which is not an *interpreted*
+/// instruction (the interpreter's own `call_last` does the pop in its instruction
+/// body). So the recorded position is not overwritten afterwards, and the tier's
+/// position is exactly the entry of the last block the linked chain reached.
+///
+/// The interpreter steps the `call_last` instruction, so it records that instruction's
+/// address; the native tier, which linked the `jump` into the successor block and then
+/// popped the frame in the helper, records that successor block's entry. Both report the
+/// same error — the position is the only difference, and it is the block-granularity
+/// contract this store exists for.
+#[test]
+fn a_linked_chain_records_the_last_block_entry_as_the_position() {
+    // `f/0`: block A (`Label(1)`, an inlined `move`, a linked `jump`) transfers straight
+    // into block B (`Label(2)`, the linked `call_last` whose frame pop fails), so the
+    // last block the chain reached is B, at pc 3.
+    let module = build_module(
+        "linked_position",
+        &[],
+        vec![(
+            "f",
+            0,
+            vec![
+                Instr::Label(Label(1)),
+                Instr::Move {
+                    src: Operand::Integer(5),
+                    dst: Operand::X(0),
+                },
+                Instr::Jump { target: Label(2) },
+                Instr::Label(Label(2)),
+                Instr::CallLast {
+                    arity: 0,
+                    target: Label(3),
+                    deallocate: 5,
+                },
+                Instr::Label(Label(3)),
+                Instr::Return,
+            ],
+        )],
+        &[("f", 0, Label(1))],
+    );
+    let name = export_atom(&module, "f");
+
+    let mut baseline = Machine::new();
+    let mut baseline_ctx = MinimalContext::new();
+    let baseline_err = baseline
+        .run_export_outcome_with_tier(
+            &module,
+            name,
+            0,
+            &[],
+            &mut baseline_ctx,
+            Tier::BaselineJit,
+        )
+        .expect_err("the linked tail call's checked frame pop raises");
+    assert_eq!(
+        baseline.current_code(),
+        Some((0, 3)),
+        "the native tier records the entry of the last linked block, not an \
+         interpreted instruction"
+    );
+
+    let mut interpreter = Machine::new();
+    let mut interpreter_ctx = MinimalContext::new();
+    let interpreter_err = interpreter
+        .run_export_outcome_with_tier(
+            &module,
+            name,
+            0,
+            &[],
+            &mut interpreter_ctx,
+            Tier::Interpreter,
+        )
+        .expect_err("the interpreter's own `call_last` pop raises too");
+    assert_eq!(
+        interpreter.current_code(),
+        Some((0, 4)),
+        "the interpreter steps the `call_last` instruction and records its address"
+    );
+
+    // The tier and the interpreter raise the identical error — only the recorded
+    // position differs, exactly as the block-granularity contract intends.
+    assert_eq!(error_reason(&baseline_err), error_reason(&interpreter_err));
 }

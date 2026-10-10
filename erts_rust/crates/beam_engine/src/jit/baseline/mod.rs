@@ -182,7 +182,7 @@ mod tests;
 // outside this module (`crate::jit::baseline::…`) stays exactly what it was.
 pub(crate) use emit::compile_module;
 pub use runtime::{decode_target, decode_wait, encode_target, encode_wait, ENTER, ERROR, HALT, WAIT_BIT};
-pub(crate) use runtime::{jit_step_one, JitRuntime};
+pub(crate) use runtime::{jit_set_position, jit_step_one, JitRuntime};
 
 use runtime::NativeBlock;
 // ---------------------------------------------------------------------------
@@ -525,13 +525,16 @@ pub(crate) fn run_compiled_label_outcome(
 /// slice's [`Machine::reductions`](crate::Machine::reductions) matches the
 /// interpreter's.
 ///
-/// The compiled blocks, the label map and the literal area are all bound for the
-/// **entry** module (context `0`). A process suspended **inside a cross-module
-/// callee** (a non-zero module context) cannot be served here — a
-/// [`Step::Enter`](crate::Step::Enter) is the interpreter driver's job, exactly as
-/// [`jit_step_one`] documents — so it is the typed error
-/// `unsupported("jit: cannot resume in a non-entry module context")`, never a
-/// silently wrong result.
+/// `module` is the run's **entry** module (context `0`). A process suspended
+/// **inside a cross-module callee** (a non-zero module context) is served the same
+/// way the interpreter's resume serves it ([`Machine::resume_outcome`]): the driver
+/// reads the context the process blocked in from
+/// [`Machine::current_context`](crate::Machine::current_context), lands in it
+/// ([`switch_into`] re-binds the callee's module, label map and literal area and
+/// resolves its compiled blocks through [`NativeCode::module_blocks`]), and re-enters
+/// the callee's own `(func, pc)`. The entry module's compiled blocks are not entered
+/// in that context; every address the tier has no block for stays on the documented
+/// per-instruction deopt.
 pub(crate) fn run_compiled_resume_outcome(
     compiled: &CompiledModule,
     machine: &mut Machine,
@@ -540,11 +543,6 @@ pub(crate) fn run_compiled_resume_outcome(
     pc: u32,
     ctx: &mut dyn ExecutionContext,
 ) -> Result<RunOutcome> {
-    if machine.current_context() != 0 {
-        return Err(error::unsupported(
-            "jit: cannot resume in a non-entry module context",
-        ));
-    }
     // One resume is one scheduling slice: start the reduction count at zero, exactly
     // as `Machine::drive` does for the interpreter's resume (`run_loop` -> `drive`).
     machine.reset_reductions();
@@ -819,6 +817,14 @@ fn switch_into(
         let handle = machine
             .module_context(context)
             .ok_or_else(|| error::unsupported("jit: unknown module context"))?;
+        // Bind the callee's literal area, exactly as [`Machine::drive`] does when it
+        // lands in a non-entry context. The `switch_context` above already did it when
+        // the machine was elsewhere, but it is a no-op for the context **already**
+        // current — which is precisely the resume case ([`run_compiled_resume_outcome`]
+        // re-enters the context the process blocked in), where the entry module's
+        // literals would otherwise stay bound and resolve an `Operand::Literal` against
+        // the wrong module.
+        machine.set_literals(handle.module.literals.clone());
         let module = &*handle.module as *const Module;
         let labels = &handle.labels as *const LabelMap;
         // Resolve the callee's compiled blocks once per context. A context the tier

@@ -91,8 +91,8 @@ use beam_loader::{Instr, Module};
 use crate::interpreter::{self, LabelMap};
 use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg, DEFAULT_CAPACITY};
 
-use super::runtime::{encode_target, StepHelper, RUNTIME_XREGS_DISP};
-use super::{jit_step_one, CompiledModule};
+use super::runtime::{encode_target, PositionHelper, StepHelper, RUNTIME_XREGS_DISP};
+use super::{jit_set_position, jit_step_one, CompiledModule};
 
 mod aggregate;
 mod arith;
@@ -298,8 +298,12 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
 
 /// A generous byte-count estimate for the code `module` lowers to.
 ///
-/// A block costs a prologue/epilogue pair (~64 bytes) plus its inlined
-/// instructions; a `move`/`swap` whose operands live in `machine.x` is at most two
+/// A block costs a prologue/epilogue pair plus its inlined
+/// instructions; the prologue carries the six callee-saved pushes, the `rt`-slot
+/// setup, the position-store helper call ([`emit_position_store`] — the same
+/// three-argument indirect-call sequence as one deopt, ~40 bytes) and the cached
+/// register loads, so [`BLOCK_BYTES`] covers it. A `move`/`swap` whose operands live
+/// in `machine.x` is at most two
 /// loads plus two stores (~28 bytes), so [`INSTRUCTION_BYTES`] is budgeted per
 /// instruction. A `gc_bif` costs either the helper call sequence (~50 bytes) or,
 /// when the small-int fast path lowers it, the whole guarded sequence plus its
@@ -341,7 +345,7 @@ fn code_capacity_estimate(module: &Module) -> usize {
             }
         }
     }
-    128 * blocks
+    BLOCK_BYTES * blocks
         + INSTRUCTION_BYTES * instructions
         + FAST_PATH_BYTES * gc_bifs
         + COMPARE_PATH_BYTES * cmp_bifs
@@ -349,6 +353,12 @@ fn code_capacity_estimate(module: &Module) -> usize {
         + TUPLE_PATH_BYTES * tuple_paths
         + DEFAULT_CAPACITY
 }
+
+/// The code-size budget reserved for one compiled block (see
+/// [`code_capacity_estimate`]): the prologue (six callee-saved pushes, the 24-byte
+/// `rt`-slot reservation, the `rbx` load, the [`emit_position_store`] helper call)
+/// and the epilogue (the frame teardown and `ret`) plus their padding.
+const BLOCK_BYTES: usize = 192;
 
 /// The code-size budget reserved for one instruction (see
 /// [`code_capacity_estimate`]).
@@ -422,7 +432,17 @@ fn emit_block(
     buffer.lea(Reg::Rsp, Reg::Rsp, -24)?;
     buffer.mov_mr(Reg::Rsp, RUNTIME_SLOT_DISP, Reg::Rdi)?;
     // rbx = rt->x_regs, the base of `machine.x` the cached slots are indexed from.
+    // Loaded **before** the position store below: `rbx` is callee-saved, so the helper
+    // call preserves it, and the cached x-registers are loaded only *after* the call,
+    // so nothing a block keeps live across the call sits in caller-saved scratch.
     buffer.mov_rm(Reg::Rbx, Reg::Rdi, RUNTIME_XREGS_DISP)?;
+    // Record this block's own `(func, pc)` as the machine's execution position, so
+    // `Machine::current_code` (and the `process_info/2` position items built from it)
+    // advances at block granularity even across a **linked** branch, which never
+    // returns to the driver. A parked `receive` and a raise stay exact because both go
+    // through the interpreted deopt (`jit_step_one`), which records the *instruction*
+    // address itself. See `jit_set_position`.
+    emit_position_store(buffer, func, start as u32)?;
     for (x, reg) in &allocation.slots {
         touch(highest_touched, *x);
         buffer.mov_rm(*reg, Reg::Rbx, x_offset(*x))?;
@@ -730,6 +750,26 @@ fn emit_block(
     buffer.bind(done)?;
     emit_frame_teardown(buffer)?;
     buffer.ret()
+}
+
+/// Emit the prologue's position store: call `jit_set_position(rt, func, pc)` so the
+/// machine records this block's entry `(func, pc)` as its current execution position.
+///
+/// `rt` is read out of the prologue-reserved stack slot ([`RUNTIME_SLOT_DISP`]), so
+/// this may be emitted anywhere after that slot is written. The helper clobbers only
+/// caller-saved registers, so a block must have loaded nothing it needs into them at
+/// the call; every cached x-register and `rbx` live in callee-saved registers, which
+/// the helper preserves ([`emit_block`] emits this before loading the cached
+/// x-registers for exactly that reason). `rsp` is already 16-byte aligned at the call
+/// (see [`SAVED_REGISTERS`]). The helper returns nothing — a position store cannot
+/// fail — so `rax` is not consulted.
+fn emit_position_store(buffer: &mut CodeBuffer, func: u32, pc: u32) -> Result<()> {
+    buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)?;
+    buffer.mov_ri(Reg::Rsi, i64::from(func))?;
+    buffer.mov_ri(Reg::Rdx, i64::from(pc))?;
+    let helper: PositionHelper = jit_set_position;
+    buffer.mov_ri(Reg::R11, helper as *const () as i64)?;
+    buffer.call_r(Reg::R11)
 }
 
 /// Emit the spill-then-helper sequence for instruction `(func, pc)` — **without**

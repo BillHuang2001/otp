@@ -142,6 +142,7 @@ fn the_compiled_function_runs_the_export_natively() {
         labels: &labels as *const _,
         ctx: ctx_ptr,
         error: None,
+        enter: None,
     };
 
     let word = code
