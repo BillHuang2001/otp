@@ -52,6 +52,16 @@ impl<'a> Decoder<'a> {
     /// environment — the inlined-descriptor replacement for the C `Export`
     /// (`num_free == 0`).
     ///
+    /// **The arity is also bounded by a 32-bit field.** The C reads the arity as a
+    /// 64-bit `Sint` (`Sint arity = signed_val(temp);`, `external.c:5028`) and passes
+    /// it to `erts_export_get_or_make_stub(Eterm, Eterm, unsigned)`
+    /// (`export.h:137`), so it is truncated to its low 32 bits before it is stored in
+    /// `ErtsCodeMFA.arity`, a `Uint` (`code_ix.h:89-97`) — the same 32-bit width as
+    /// `ErlFunEntry.arity` (`erl_fun.h:43`). The encoder then reads those 32 bits back
+    /// (`external.c:4000`/`:5912`). So `2^32` decodes to arity 0, `2^32 + 7` to 7 and
+    /// `3 * 2^31` to `0x8000_0000` (verified against erts-17.1), and this decoder
+    /// truncates the same way rather than keeping the full 60-bit small.
+    ///
     /// **The arity is not bounded by the 8-bit fun-header field.** In C the true
     /// arity never lives in the term: the fun is the shared `Export` lambda built by
     /// `create_shared_lambda` (`export.c:46-58`), whose header field is 8 bits — so
@@ -64,7 +74,8 @@ impl<'a> Decoder<'a> {
     /// function, arity]`, 4 words), so [`crate::term::fun_true_arity_term`] reports
     /// the true value the encoder emits while [`crate::term::fun_arity_term`] keeps
     /// the header mask — the same split as the oracle. Every non-negative arity is
-    /// therefore materialized faithfully: there is no `SystemLimit` on this path.
+    /// therefore materialized faithfully (modulo the 32-bit truncation above): there
+    /// is no `SystemLimit` on this path.
     pub(super) fn decode_export(&mut self, heap: &mut Heap, atoms: &mut AtomTable) -> Result<Eterm> {
         let module = self.decode_node_atom(heap, atoms)?;
         let function = self.decode_node_atom(heap, atoms)?;
@@ -77,6 +88,13 @@ impl<'a> Decoder<'a> {
         let Ok(arity) = usize::try_from(signed_value(arity)) else {
             return Err(bad_arg());
         };
+        // The C truncates the 64-bit `Sint` to the 32-bit `unsigned` parameter of
+        // `erts_export_get_or_make_stub` (`export.h:137`) and keeps the result in
+        // `ErtsCodeMFA.arity`, a `Uint` (`code_ix.h:89-97`), so only the low 32 bits
+        // survive (`external.c:5028-5038`); the encoder reads them back
+        // (`external.c:4000`/`:5912`). Verified against erts-17.1: `2^32` ⇒ 0,
+        // `2^32 + 7` ⇒ 7, `3 * 2^31` ⇒ `0x8000_0000`, `2^32 - 1` ⇒ `0xFFFF_FFFF`.
+        let arity = arity & 0xFFFF_FFFF;
         crate::term::make_fun_external(heap, arity, atom_val(module), atom_val(function))
     }
 
