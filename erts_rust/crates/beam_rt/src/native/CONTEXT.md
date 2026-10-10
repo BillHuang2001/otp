@@ -35,7 +35,8 @@ per-function bodies. Files:
 | `group_leader.rs` | `erlang:group_leader/2` + `erts_internal:group_leader/2,3` over `Runtime::group_leaders` (per-process, default the root pid; see below) |
 | `port.rs` | `erlang:port_command/2,3` and the closed-port half of `erlang:port_info/1,2` (the `PortHook` seam cannot express those) |
 | `application.rs` | `application:get_env/1,2,3`, `get_all_env/1`, `get_key/2`, `get_application/0` (always `undefined` — there is no application controller and no owning application), `loaded_applications/0`, `which_applications/0` over a minimal native `.app` view |
-| `erts_internal.rs` | the `erts_internal` floor (14 BIFs) — see below |
+| `erts_internal.rs` | the `erts_internal` floor (`erts_internal_call`; the dispatch table is the source of truth) — see below |
+| `erts_internal/trace.rs` | the `erts_internal:trace/3` + `:trace_pattern/3` handler bodies (`erlang:trace/2,3` and `erlang:trace_pattern/2,3` call them) + their private pattern/target helpers, over `crate::trace` — see below |
 | `prim.rs` | the `prim_file` floor (27 entries) — see below |
 | `prim_file.rs` | the whole-file-descriptor half of the `prim_file` floor (`open/2` `read/2` `write/2` `close/1` `position/2` `pread/2,3` `pwrite/2,3` `truncate/1` `sync/1` `datasync/1` `write_file/2` `set_cwd/1` `ipread_s32bu_p32bu/3` `get_handle/1`) + its unit tests |
 | `file_server.rs` | the native **`file_server_2` service** (contract A.9) — the registered service process + its native io-devices, the `gen_server`/`file`/`io` wire, and the scheduler-pass step that services their mailboxes (see below) |
@@ -207,6 +208,8 @@ claim so it falls through to the registry. `get_dflags/0`'s five flag words are
 | `processes_next/1` | `bif.c:4111-4120` | `{NextIndex, [Pid]}` / `{Limit, []}`; `badarg` past the limit. **Divergence:** index-addressed over *this* table, one pid per call (the C ptab is paginated) |
 | `term_to_string/1` | `bif.c:4160-4189` | the `~w` rendering as a string, one line, no newline |
 | `term_to_string/2` | `bif.c:4160-4189` | the `undefined` limit form is exact; a **numeric** limit is a typed `unsupported` (the `~P` depth directive is not exposed by `../format.rs`); a limit `<= 1` or a non-integer/non-`undefined` limit is `badarg` |
+| `trace/3` | `erl_bif_trace.c` (`trace_3`) | body of `erlang:trace/2,3` (handler in `erts_internal/trace.rs`, over `crate::trace`): `PidSpec` selects the tracees (a pid the table holds, or the group atoms `all`/`existing`/`existing_processes`/`processes`), `How` sets (`true`)/clears (`false`) their flags, `FlagList` the flag set; the **caller** becomes the tracer. Returns the tracee count. The port/`new`-style PidSpecs and a non-`true`/`false` `How` are the typed/`badarg` paths |
+| `trace_pattern/3` | `erl_bif_trace.c` (`trace_pattern_3`) | body of `erlang:trace_pattern/2,3`: installs/removes a per-function trace pattern over `MFA` (each of module/function/arity a name or the `'_'` wildcard); consults `crate::trace`'s `PatternTable` |
 
 Documented divergences (deterministic, never a wrong value):
 - `term_type/1` reports every byte-aligned binary as `sub_binary`: the real
@@ -236,7 +239,7 @@ system (`std::fs`/`std::env`) — "primitive" is exactly what this layer is for.
 | `make_link/2` | `prim_file.erl:829-834` → `efile_make_hard_link` = `link(2)` (`unix_prim_file.c:963-969`) | `ok`; an existing link name ⇒ `{error,eexist}`; a missing source ⇒ `{error,enoent}`; bad path ⇒ `{error,badarg}` |
 | `make_symlink/2` | `prim_file.erl:835-840` → `efile_make_soft_link` = `symlink(2)` (`unix_prim_file.c:971-977`) | `ok` (the target need not exist); an existing link name ⇒ `{error,eexist}`; bad path ⇒ `{error,badarg}` |
 | `altname/1` | `prim_file.erl:842-848`; on Unix `efile_altname` is a constant `ENOTSUP` (`unix_prim_file.c:1085-1090`) | `{error,enotsup}` for every valid path (it does **not** return its argument); a bad path ⇒ `{error,badarg}` |
-| `open/2` | `prim_file.erl:132-141` (`open_nif(encode_path(Name), Modes)` → `make_fd/2` → `#file_descriptor{module = prim_file, data = build_fd_data(...)}`), `build_fd_data/5` (`:512-527`); C `efile_open` (`unix_prim_file.c:173-226`) + `efile_translate_modelist` (`common/prim_file_nif.c:500-539`) | `{ok, {file_descriptor, prim_file, Data}}` where `Data` is the oracle's map shape (`handle`, `owner`, plus `r_buffer`/`r_ahead_size` only for a **read-capable** descriptor) plus the private `fd_registry_id`. Modes follow the C's flags (`read`→`O_RDONLY`; `write` alone→`O_TRUNC\|O_WRONLY\|O_CREAT`; read+write→`O_RDWR\|O_CREAT`; `append`→`O_APPEND` and no `O_TRUNC`; `exclusive`, `sync`, `{read_ahead,S}`); **every** unmodelled option (`raw`, `binary`, `list`, `compress`, `retry_read`, …) is silently ignored, exactly as the C does. `{error,badarg}` for a bad path or a non-list mode list; `{error,enoent}`/`{error,eisdir}`/`{error,eexist}`/`{error,eacces}`/… from the errno; a `directory`-mode open is the honest `unsupported` gap (`std::fs::File` cannot `OPENDIR`) |
+| `open/2` | `prim_file.erl:132-141` (`open_nif(encode_path(Name), Modes)` → `make_fd/2` → `#file_descriptor{module = prim_file, data = build_fd_data(...)}`), `build_fd_data/5` (`:512-527`); C `efile_open` (`unix_prim_file.c:173-226`) + `efile_translate_modelist` (`common/prim_file_nif.c:500-539`) | `{ok, {file_descriptor, prim_file, Data}}` where `Data` is the oracle's map shape (`handle`, `owner`, plus `r_buffer`/`r_ahead_size` only for a **read-capable** descriptor) plus the private `fd_registry_id`. Modes follow the C's flags (`read`→`O_RDONLY`; `write` alone→`O_TRUNC\|O_WRONLY\|O_CREAT`; read+write→`O_RDWR\|O_CREAT`; `append`→`O_APPEND` and no `O_TRUNC`; `exclusive`, `sync`, `{read_ahead,S}`); **every** unmodelled option (`raw`, `binary`, `list`, `compress`, `retry_read`, …) is silently ignored, exactly as the C does. `{error,badarg}` for a bad path or a non-list mode list; `{error,enoent}`/`{error,eisdir}`/`{error,eexist}`/`{error,eacces}`/… from the errno; a `directory`-mode open is **served** (a real `O_DIRECTORY` plus the post-open type checks — `open(D,[directory,read])` ⇒ `{ok,Fd}`, `open(File,[directory])` ⇒ `{error,enotdir}`, `skip_type_check` skips them) |
 | `read/2` | `prim_file.erl:162-171` + `read_1/5` (`:180-204`) → `read_nif`; C `read_nif_impl` (`common/prim_file_nif.c:632-663`) | `{ok, Binary}` (`N` bytes, fewer at EOF) \| `eof` (0 bytes read and `N` ≠ 0) \| `{error, Reason}`. One `read(2)` of at most `N`: **read-ahead is not reproduced** (`prim_buffer` is never called — its only export is `on_load/0`; divergence documented in `prim_file.rs`). `N` must be a non-negative integer (`-1` ⇒ `{error,badarg}`, `1 bsl 80` ⇒ `{error,einval}`); a write-only descriptor ⇒ `{error,ebadf}`; a malformed `Data` ⇒ `{error,badarg}`; a closed/unknown handle ⇒ `{error,einval}` |
 | `write/2` | `prim_file.erl:247-263` → `write_nif`; C `write_nif_impl` (`common/prim_file_nif.c:664-682`, `enif_inspect_iovec`) | `ok` \| `{error, Reason}`; the argument is iodata (a byte-aligned binary, a char list of byte-sized integers, proper sub-lists, `[]`, `<<>>`); an atom, a float, a negative/overflowing integer, a non-byte-aligned binary or an improper tail ⇒ `{error,badarg}`; a read-only descriptor ⇒ `{error,ebadf}` |
 | `close/1` | `prim_file.erl:154-160` → `close_nif`; C `close_nif` (`common/prim_file_nif.c:612-631`) | `ok`; releases the registry entry, so a second `close` and every later op on that handle ⇒ `{error,einval}` (the C `file_handle_wrapper` CLOSED branch); an unknown/non-resource handle ⇒ `{error,badarg}` |
@@ -380,11 +383,12 @@ The reply tag is **paired** with the request tag, never echoed: `{io_request, �
   (`unsupported: …`, CLI exit 3) and anything else as the bare `error:undef`.
 - **`code:*` is the native floor, not a live `code_server`** — `code.rs`'s behaviour must not
   change (see `../CONTEXT.md`; OTP's real `code_server.beam` needs facilities outside this crate).
-- **Files ~1000 lines of production code** (pre-existing oversize: `application.rs`, `process.rs`).
-  `erts_internal.rs` (~1737 total / ~786 production) and `prim.rs` (~1261 / ~623) are mostly
-  comprehensive test modules; each has one responsibility and is kept single-file because the
-  routing table names it — split if a second responsibility appears. Split by responsibility;
-  every public item documented.
+- **Files ~1000 lines of production code.** Pre-existing oversize (single-responsibility, kept
+  whole because the routing table names them): `application.rs`, `process.rs`; `prim.rs` (~3237
+  total / ~805 production) and `prim_file.rs` (~1536 total) are mostly comprehensive test modules.
+  `erts_internal.rs`'s tracing half is split out into `erts_internal/trace.rs` (~310 production),
+  leaving `erts_internal.rs` at ~968 production / 2265 total. Split by responsibility; every public
+  item documented.
 
 ## Test Strategy
 - **Unit tests** colocated per module (`#[cfg(test)] mod tests`), driving the floor through the
@@ -418,14 +422,23 @@ The reply tag is **paired** with the request tag, never echoed: `{io_request, �
   served set; edit there to add an arm)
 - `memory/` → `erlang:process_info/1,2` (this file's detailed surface) + `memory/tests.rs`
 - `erts_internal.rs` → the `erts_internal` floor (`erts_internal_call`): `term_type/1`,
-  `get_dflags/0`, `beamfile_chunk/2`, `map_to_tuple_keys/1`, `binary_to_integer/2`,
-  `list_to_integer/2`, `time_unit/0`, `perf_counter_unit/0`, `get_creation/0`,
-  `is_process_alive/1`, `no_aux_work_threads/0`, `processes_next/1`, `term_to_string/1,2` + its
-  unit tests
-- `prim.rs` → the `prim_file` floor (`prim_file_call`) + its unit tests: the path contract
-  (`encode_path`/`collect_path`), the `errno`→atom table, and the served entries `get_cwd/0,1`,
-  `read_file/1`, `delete/1`, `rename/2`, `make_dir/1`, `del_dir/1`, `read_link/1`, `make_link/2`,
-  `make_symlink/2`, `altname/1`
+  `get_dflags/0`, `beamfile_chunk/2`, `beamfile_module_md5/1`, `map_to_tuple_keys/1`,
+  `binary_to_integer/2`, `list_to_integer/2`, `time_unit/0`, `perf_counter_unit/0`,
+  `get_creation/0`, `is_process_alive/1,2`, `process_flag/3`, `group_leader/2,3`,
+  `no_aux_work_threads/0`, `processes_next/1`, `term_to_string/1,2`, and the `trace/3` +
+  `trace_pattern/3` dispatch arms (whose bodies live in `erts_internal/trace.rs`) + its unit tests
+- `erts_internal/trace.rs` → the `erts_internal:trace/3` + `:trace_pattern/3` handler bodies (the
+  functions `erlang:trace/2,3` and `erlang:trace_pattern/2,3` call) and their private
+  pattern/target helpers, over `crate::trace` (no colocated tests — the tracing behaviour is pinned
+  by `../tests/trace*.rs`)
+- `prim.rs` → the path half of the `prim_file` floor (`prim_file_call`) + its unit tests: the path
+  contract (`encode_path`/`collect_path`), the `errno`→atom table, and the served entries
+  `get_cwd/0,1`, `read_file/1`, `delete/1`, `rename/2`, `make_dir/1`, `del_dir/1`, `read_link/1`,
+  `make_link/2`, `make_symlink/2`, `altname/1`
+- `prim_file.rs` → the file-descriptor half of the `prim_file` floor + its unit tests: `open/2`
+  (incl. a `directory`-mode `O_DIRECTORY` open), `read/2`, `write/2`, `close/1`, `position/2`,
+  `pread/2,3`, `pwrite/2,3`, `truncate/1`, `sync/1`, `datasync/1`, `write_file/2`, `set_cwd/1`,
+  `ipread_s32bu_p32bu/3`, `get_handle/1`
 - `file_server.rs` → the native `file_server_2` service (`FileServices`, its `Device` io-devices and
   the request/reply wire) + its unit tests; the pass step is `Runtime::service_file_requests`
   (owned by `../runtime/scheduler.rs`)
@@ -455,10 +468,15 @@ needs:
   `spawn_request/4`, `spawn_init/1`. Needs the distribution controller protocol, a live node
   identity feeding `erlang:node/0`, connection/channel multiplexing, remote spawn, and the
   `-connect_all`/`+zdbbl` configuration surface.
-- **Tracing / breakpoints (`dbg`):** `breakpoint/4`, `notify_breakpoint_hit/3`, `trace/3,4`,
-  `trace_info/3`, `trace_pattern/3,4`, `trace_session_create/3`, `trace_session_destroy/1`. Needs
-  the trace/breakpoint machinery, the match-spec compiler and per-process trace flags (plus a
-  group leader to deliver trace messages to).
+- **Tracing / breakpoints (`dbg`) — the debugger half only:** `erts_internal:trace_session_create/3`,
+  `:trace_session_destroy/1`, `:trace/4`, `:trace_pattern/4`, `:trace_info/3`,
+  `:notify_breakpoint_hit/3`, `erts_debug:breakpoint/2`, `erl_debugger:breakpoint/3`,
+  `:breakpoints/1,3` and the `erts_trace_cleaner:*` pair (`bif.tab:799-805`, `:822-825`) stay gaps.
+  The **process-tracing core IS served**: `erts_internal:trace/3` + `:trace_pattern/3`
+  (`erts_internal/trace.rs`) and `erlang:trace/2,3`, `trace_pattern/2,3`, `trace_info/2`,
+  `trace_delivered/1` plus the `seq_trace*` family (`../native.rs`) over `crate::trace`. The
+  residual gaps need the debugger/breakpoint machinery and the trace-session bookkeeping, and the
+  `/4` + `trace_info/3` surfaces add a flag/match-spec dimension `crate::trace` does not expose.
 - **Microstate accounting / scheduler wall time:** `await_microstate_accounting_modifications/3`,
   `gather_microstate_accounting_result/2`, `await_sched_wall_time_modifications/2`,
   `gather_sched_wall_time_result/1`, `mc_iterator/1`, `mc_refill/1`, `scheduler_wall_time/1`,
