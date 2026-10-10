@@ -769,12 +769,44 @@ impl RuntimeContext<'_> {
 
     /// `erlang:module_loaded(Module)`: whether `Module` is loaded (or preloaded).
     ///
-    /// Preloaded modules count because they are available before any `.beam` is read — the
-    /// oracle answers `true` for e.g. `persistent_term`. A non-atom argument is `badarg`.
+    /// # The oracle's semantics
+    ///
+    /// `erts/emulator/beam/beam_bif_load.c:738-752` (`module_loaded_1`): the argument must be
+    /// an atom (`badarg` otherwise) and the answer is `true` iff the module is in the **code
+    /// table** *with current code* — `erts_get_module(Atom, erts_active_code_ix())` finds it,
+    /// its `curr.code_hdr` is set, and no `-on_load` is pending. Merely being *available* on
+    /// the code path is **not** enough: a fresh node answers `false` for `digraph` and
+    /// `xmerl_scan`, although `code:which/1` resolves both.
+    ///
+    /// This runtime's code table is the shared [`CodeServer`] cache, so the answer is the
+    /// preloaded registry (the 22 `.beam`s of the emulator image, [`PreloadedModules`]) or a
+    /// module the cache really holds — loaded at boot, by `code:ensure_loaded/1`, by the
+    /// boot-script path ([`Runtime::boot_from_script`](crate::Runtime::boot_from_script)) or
+    /// by a call the runtime resolved on demand. A non-atom argument is `badarg`, the
+    /// oracle's own reason.
+    ///
+    /// # `// documented divergence:` the boot set is this runtime's own
+    ///
+    /// The oracle also answers `true` for `lists`, `kernel` and every other module its node
+    /// start-up loads: `bootstrap/bin/start.boot`'s three `primLoad` batches (29 + 86 + 87
+    /// names) put them in the code table before `-eval` runs. This runtime's `-eval`/`run`
+    /// boot ([`Runtime::boot`](crate::Runtime::boot)) loads **only** the 22 preloaded
+    /// `.beam`s and does not run that script, so `lists`/`kernel` genuinely are **not** loaded
+    /// here and `false` is the truthful answer about this runtime's state — not a missing
+    /// lookup: `code:ensure_loaded(lists)` (or any real call into the module) flips it to
+    /// `true`, exactly as in the oracle, and the `-boot FILE` action, which *does* run the
+    /// script, loads both for real. What this answer must never become is a "is on the code
+    /// path" shortcut (`find_file(…).is_some()`): that would answer `true` for `digraph` too,
+    /// where the oracle answers `false`. Closing the residue means booting the full script
+    /// (the CLI/runtime node's boot policy), never fabricating the answer here.
     pub(super) fn module_loaded_1(&mut self, args: &[Eterm]) -> Result<Eterm> {
         let name = self
             .atom_name(*args.first().ok_or(BeamError::BadArg)?)
             .ok_or(BeamError::BadArg)?;
+        // `// documented divergence:` the oracle's boot script has already put `lists`,
+        // `kernel` and ~200 other modules in its code table by the time `-eval` runs; this
+        // runtime's boot loads only the preloaded set, so a module it has not loaded gets the
+        // truthful `false` rather than a fabricated `true`.
         let loaded = self.runtime.preloaded().is_preloaded(&name)
             || self.runtime.code_server.is_loaded(&name);
         self.atom(if loaded { "true" } else { "false" })
@@ -817,7 +849,7 @@ mod tests {
     //! own process table, port registry and module set.
 
     use super::*;
-    use crate::native::test_support::{atom, call, runtime};
+    use crate::native::test_support::{atom, call, runtime, system_runtime};
     use beam_process::PortId;
     use beam_term::make_small;
 
@@ -1050,5 +1082,52 @@ mod tests {
             call(&mut runtime, "erlang", "module_loaded", &[make_small(42)]),
             Err(BeamError::BadArg)
         ));
+    }
+
+    /// The stand-in for the modules the *oracle's* boot script loads: a name that is
+    /// **resolvable on the code path** but not loaded answers the truthful `false` here, and
+    /// flips to `true` once the floor's own `code:ensure_loaded/1` has really loaded it.
+    ///
+    /// This is the unit-level guard for the documented divergence in [`module_loaded_1`]: the
+    /// oracle's answer for `lists` is `true` (its `start.boot` `primLoad`s it), this runtime's
+    /// boot does not, and the predicate must follow *this* runtime's real code table rather
+    /// than resolve-ability — so before the load the name is a resolvable path and still
+    /// `false`.
+    ///
+    /// Skips **loudly** when no system Erlang install is reachable (the load needs one).
+    #[test]
+    fn a_resolvable_but_unloaded_module_is_false_until_it_is_loaded() {
+        let Some(mut runtime) = system_runtime() else {
+            return;
+        };
+        let lists = atom(&mut runtime, "lists");
+
+        let which = call(&mut runtime, "code", "which", &[lists]).expect("code:which/1");
+        assert!(
+            terms::list_elements(which).is_ok(),
+            "`lists.beam` must be resolvable on the code path (a path string) for this test \
+             to measure what it claims"
+        );
+        assert!(!runtime.code_server().is_loaded("lists"), "nothing loaded it yet");
+        let answer =
+            call(&mut runtime, "erlang", "module_loaded", &[lists]).expect("module_loaded/1");
+        assert_eq!(
+            atom_name(&runtime, answer),
+            Some("false"),
+            "resolvable on the code path is not loaded"
+        );
+
+        call(&mut runtime, "code", "ensure_loaded", &[lists]).expect("code:ensure_loaded/1");
+        assert!(
+            runtime.code_server().is_loaded("lists"),
+            "the load must really have put `lists` in the shared cache"
+        );
+        let answer =
+            call(&mut runtime, "erlang", "module_loaded", &[lists]).expect("module_loaded/1");
+        assert_eq!(
+            atom_name(&runtime, answer),
+            Some("true"),
+            "a module this runtime really loaded counts"
+        );
     }
 }
