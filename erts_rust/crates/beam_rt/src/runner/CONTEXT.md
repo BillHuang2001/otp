@@ -117,9 +117,11 @@ the park/resume and the admission point can never drift:
 * `resume_from_process_roots` is the context's `RuntimeContext::resync_parked_roots`: it copies the
   process's authoritative root set back into the machine and, if the slices no longer match, **halts the
   process's collection** (`Runtime::halt_process_gc`) rather than run against inconsistent roots.
-The runner's raise arm likewise copies the recorded exit reason through `Runtime::try_stabilize_escaped`,
-so a reason that genuinely cannot be copied is the honest `error:system_limit`, never a stored dangling
-word.
+The runner's raise arm likewise copies the recorded exit reason through
+`Runtime::try_stabilize_escaped_with` — with the **same machine's** `refc_binaries()` as the copy's
+off-heap source, so a reason that *is* an engine-built off-heap binary (`exit(<<big/binary>>)`) is
+resolved and shared instead of tripping the valve; a reason that genuinely cannot be copied is still
+the honest `error:system_limit`, never a stored dangling word.
 
 ## Measured: why the default is the safe `auto` mode
 Release build (`cargo build --release -p beam_rt`), no per-process `erl` start-up (the system code
