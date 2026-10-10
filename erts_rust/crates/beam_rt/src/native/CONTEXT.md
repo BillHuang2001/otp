@@ -320,14 +320,10 @@ integer is `file.erl`'s `{N,bof}` shorthand), `{get_chars,Enc,Prompt,N}` (shaped
 from the open mode), `{put_chars,Enc,Chars}`, `{get_until,Enc,Prompt,Mod,Func,XtraArgs}` (plus
 the legacy 4-tuple form, whose encoding defaults to `latin1`), and `{get_line,Enc,_Prompt}` (plus
 the legacy 2-tuple form, encoding defaulted to `latin1` — `file:read_line/1`'s request). Two
-requests run Erlang code or need their own loop: [`file_server/get_until.rs`](file_server/get_until.rs)
-owns the device read loop (shared with `{get_chars,…}` through
-[`beam_io::io_device::IoDevice`]) and an engine-backed [`Continuation`] that loads `Mod` and runs
-`Mod:Func(Cont, Data | eof, XtraArgs…)` on the interpreter;
-[`file_server/get_line.rs`](file_server/get_line.rs) supplies a [`Continuation`] reproducing
-`io_lib:collect_line/4` (a `\n` terminates; one `\r` immediately before the `\n` is dropped; a
-chunk-final `\r` is carried) and the `cast/4` reply table. Every other request is the typed
-`unsupported` gap.
+requests run Erlang code and own their read loop
+([`file_server/get_until.rs`](file_server/get_until.rs),
+[`file_server/get_line.rs`](file_server/get_line.rs)) — see the capability-gaps subsection below.
+Every other request is the typed `unsupported` gap.
 The reply tag is **paired** with the request tag, never echoed: `{io_request, …}` is answered
 `{io_reply, ReplyAs, Reply}` and `{file_request, …}` with `{file_reply, ReplyAs, Reply}`
 (`file_io_server.erl:199-239`), because every caller matches the reply on its **own** tag
