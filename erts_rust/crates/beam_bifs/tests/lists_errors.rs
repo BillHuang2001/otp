@@ -42,9 +42,12 @@
 //!
 //! A **fun** argument is checked first: every fun-taking `lists.erl` function whose
 //! clause head carries `is_function(F, Arity)` (`map/2`, `foreach/2`, `filter/2`,
-//! `foldl/3`, `foldr/3`, …) raises the bare `error:function_clause` for a non-fun or a
-//! fun of the wrong arity — *before* the list argument is looked at, so the
-//! list-shape reasons above are only reachable with a fun of the right arity.
+//! `foldl/3`, `foldr/3`, `all/2`, `any/2`, …) raises the bare
+//! `error:function_clause` for a non-fun or a fun of the wrong arity — *before* the
+//! list argument is looked at, so the list-shape reasons above are only reachable with
+//! a fun of the right arity. The two partial cases (`sort/2`'s unguarded
+//! `[X, Y | T]` clause and `zipwith/3`'s `([], [])`-only guard) are pinned in
+//! `tests/lists_fun_guards.rs`.
 //!
 //! The fun-taking functions are exercised through a stub [`FunCaller`]: it answers
 //! arity-1 calls with a configurable boolean *verdict* (so `all/2`/`any/2` can be made
@@ -157,11 +160,13 @@ fn assert_badarg(result: Result<Eterm>) {
 }
 
 /// A stand-in for a fun argument that is **not** a fun: the stub `FunCaller` never
-/// inspects it, and it only ever reaches a BIF whose clause head does *not* guard on
-/// the fun (`all/2`/`any/2` case the list first, the explicit-`badarg` BIFs never look
-/// at a fun). Every BIF with an `is_function(F, Arity)` head guard takes [`real_fun`]
-/// instead — a non-fun fails that guard with `error:function_clause` before the list is
-/// walked.
+/// inspects it, so it is used only where the *fun guard* itself is the point — every
+/// fun-taking `lists.erl` function carries `is_function(F, Arity)` on its clause head
+/// and rejects a non-fun with the bare `error:function_clause` before the list argument
+/// is looked at (`all/2`/`any/2`/`keymap/3`'s `[]` clause/…). Tests that pin a
+/// *list-shape* reason instead pass [`real_fun`] of the matching arity, so the guard is
+/// not the reason under test. (The explicit-`badarg` BIFs — `member/2`, `keyfind/3`, … —
+/// take no fun at all.)
 fn a_fun() -> Eterm {
     make_small(0)
 }
@@ -310,19 +315,64 @@ fn foldl_of_a_non_list_is_case_clause_and_of_an_improper_tail_function_clause() 
 fn all_and_any_of_a_non_list_are_case_clause() {
     let (_, case_clause) = atom("case_clause");
 
+    // `all/2`/`any/2` guard their clause head with `is_function(Pred, 1)`, so the
+    // list-shape reason is only reachable with a **real** arity-1 fun.
     // Oracle: lists:all(fun(_) -> true end, a) => error:{case_clause, a}.
     let (result, non_list) = run(true, |reg, ctx| {
         let non_list = ctx.atom("a").expect("seeded");
-        (reg.call("lists", "all", 2, ctx, &[a_fun(), non_list]), non_list)
+        let fun = real_fun(ctx, 1);
+        (reg.call("lists", "all", 2, ctx, &[fun, non_list]), non_list)
     });
     assert_tagged(result, case_clause, non_list);
 
     // Oracle: lists:any(fun(_) -> false end, a) => error:{case_clause, a}.
     let (result, non_list) = run(false, |reg, ctx| {
         let non_list = ctx.atom("a").expect("seeded");
-        (reg.call("lists", "any", 2, ctx, &[a_fun(), non_list]), non_list)
+        let fun = real_fun(ctx, 1);
+        (reg.call("lists", "any", 2, ctx, &[fun, non_list]), non_list)
     });
     assert_tagged(result, case_clause, non_list);
+
+    // A **non-fun** never reaches the `case`: the guard is the clause head, so the
+    // reason is the bare `error:function_clause` for **every** list shape (before
+    // the guard these calls returned a fabricated `true`/`false`). Probed:
+    //   lists:all(5, [])  => error:function_clause
+    //   lists:all(5, [1]) => error:function_clause
+    //   lists:all(5, a)   => error:function_clause
+    //   lists:any(5, [])  => error:function_clause
+    //   lists:any(5, [1]) => error:function_clause
+    //   lists:any(5, a)   => error:function_clause
+    for name in ["all", "any"] {
+        for list in [0, 1, 2] {
+            let result = run(true, |reg, ctx| {
+                let arg = match list {
+                    0 => NIL,
+                    1 => ctx.list(&[ctx.int(1).expect("fits")]).expect("fits"),
+                    _ => ctx.atom("a").expect("seeded"),
+                };
+                reg.call("lists", name, 2, ctx, &[a_fun(), arg])
+            });
+            assert_function_clause(result);
+        }
+    }
+
+    // A fun of the *wrong* arity fails the guard too, again for every list shape.
+    // Probed: lists:all(fun(X, Y) -> X end, a) => error:function_clause,
+    //         lists:any(fun(X, Y) -> X end, a) => error:function_clause.
+    for name in ["all", "any"] {
+        for list in [0, 1, 2] {
+            let result = run(true, |reg, ctx| {
+                let arg = match list {
+                    0 => NIL,
+                    1 => ctx.list(&[ctx.int(1).expect("fits")]).expect("fits"),
+                    _ => ctx.atom("a").expect("seeded"),
+                };
+                let fun = real_fun(ctx, 2);
+                reg.call("lists", name, 2, ctx, &[fun, arg])
+            });
+            assert_function_clause(result);
+        }
+    }
 }
 
 #[test]
@@ -330,11 +380,14 @@ fn all_and_any_reach_an_improper_tail_only_without_a_short_circuit() {
     let (_, truth) = atom("true");
     let (_, falsity) = atom("false");
 
+    // The walk (and therefore the improper tail) is only reachable with a **real**
+    // arity-1 fun — the clause head guards `is_function(Pred, 1)`.
     // A `true` verdict keeps `all/2` walking, so it reaches the improper tail:
     // oracle: lists:all(fun(_) -> true end, [1|2]) => error:function_clause.
     let result = run(true, |reg, ctx| {
         let list = improper(ctx, 1, ctx.int(2).expect("fits"));
-        reg.call("lists", "all", 2, ctx, &[a_fun(), list])
+        let fun = real_fun(ctx, 1);
+        reg.call("lists", "all", 2, ctx, &[fun, list])
     });
     assert_function_clause(result);
 
@@ -342,23 +395,45 @@ fn all_and_any_reach_an_improper_tail_only_without_a_short_circuit() {
     // oracle: lists:all(fun(_) -> false end, [1|2]) => false.
     let result = run(false, |reg, ctx| {
         let list = improper(ctx, 1, ctx.int(2).expect("fits"));
-        reg.call("lists", "all", 2, ctx, &[a_fun(), list])
+        let fun = real_fun(ctx, 1);
+        reg.call("lists", "all", 2, ctx, &[fun, list])
     });
     assert_eq!(result.expect("short-circuits to false"), falsity);
 
     // `any/2` is the mirror image: a `false` verdict walks on to the tail…
     let result = run(false, |reg, ctx| {
         let list = improper(ctx, 1, ctx.int(2).expect("fits"));
-        reg.call("lists", "any", 2, ctx, &[a_fun(), list])
+        let fun = real_fun(ctx, 1);
+        reg.call("lists", "any", 2, ctx, &[fun, list])
     });
     assert_function_clause(result);
 
     // …and a `true` verdict short-circuits: oracle => true.
     let result = run(true, |reg, ctx| {
         let list = improper(ctx, 1, ctx.int(2).expect("fits"));
-        reg.call("lists", "any", 2, ctx, &[a_fun(), list])
+        let fun = real_fun(ctx, 1);
+        reg.call("lists", "any", 2, ctx, &[fun, list])
     });
     assert_eq!(result.expect("short-circuits to true"), truth);
+
+    // A **non-fun** fails the clause head before the walk starts, so the improper
+    // tail is never reached: the bare `error:function_clause` is the *guard's*, not
+    // the tail's. Each probe deliberately runs the verdict that would have
+    // short-circuited before the guard landed (a fabricated `false` for `all/2`,
+    // `true` for `any/2`); the guard now reports first. Probed:
+    //   lists:all(5, [1|2]) => error:function_clause
+    //   lists:any(5, [1|2]) => error:function_clause
+    let result = run(false, |reg, ctx| {
+        let list = improper(ctx, 1, ctx.int(2).expect("fits"));
+        reg.call("lists", "all", 2, ctx, &[a_fun(), list])
+    });
+    assert_function_clause(result);
+
+    let result = run(true, |reg, ctx| {
+        let list = improper(ctx, 1, ctx.int(2).expect("fits"));
+        reg.call("lists", "any", 2, ctx, &[a_fun(), list])
+    });
+    assert_function_clause(result);
 }
 
 #[test]
@@ -545,6 +620,10 @@ fn keysort_reports_case_clause_function_clause_and_badarg() {
 
 #[test]
 fn keymap_splits_function_clause_from_element_badarg() {
+    // The fun is a **real** arity-1 fun throughout, so the `[]` clause's
+    // `is_function(Fun, 1)` conjunct is not the reason under test — the list shape
+    // and the element checks are. (A non-fun is exercised separately at the end.)
+    //
     // The argument is not a list at all — no clause matches:
     // oracle: lists:keymap(F, 1, a) => function_clause,
     //         lists:keymap(F, 1, {a,b}) => function_clause,
@@ -559,7 +638,8 @@ fn keymap_splits_function_clause_from_element_badarg() {
             } else {
                 ctx.atom("a").expect("seeded")
             };
-            reg.call("lists", "keymap", 3, ctx, &[a_fun(), index, list])
+            let fun = real_fun(ctx, 1);
+            reg.call("lists", "keymap", 3, ctx, &[fun, index, list])
         });
         assert_function_clause(result);
     }
@@ -572,7 +652,8 @@ fn keymap_splits_function_clause_from_element_badarg() {
         let pair = ctx.tuple(&[a, b]).expect("fits");
         let list = ctx.cons(pair, ctx.int(2).expect("fits")).expect("fits");
         let one = ctx.int(1).expect("fits");
-        reg.call("lists", "keymap", 3, ctx, &[a_fun(), one, list])
+        let fun = real_fun(ctx, 1);
+        reg.call("lists", "keymap", 3, ctx, &[fun, one, list])
     });
     assert_function_clause(result);
 
@@ -582,7 +663,8 @@ fn keymap_splits_function_clause_from_element_badarg() {
     //         lists:keymap(F, 0, [{a,b}]) => badarg.
     let result = run(true, |reg, ctx| {
         let zero = ctx.int(0).expect("fits");
-        reg.call("lists", "keymap", 3, ctx, &[a_fun(), zero, NIL])
+        let fun = real_fun(ctx, 1);
+        reg.call("lists", "keymap", 3, ctx, &[fun, zero, NIL])
     });
     assert_function_clause(result);
 
@@ -592,7 +674,8 @@ fn keymap_splits_function_clause_from_element_badarg() {
         let pair = ctx.tuple(&[a, b]).expect("fits");
         let list = ctx.list(&[pair]).expect("fits");
         let zero = ctx.int(0).expect("fits");
-        reg.call("lists", "keymap", 3, ctx, &[a_fun(), zero, list])
+        let fun = real_fun(ctx, 1);
+        reg.call("lists", "keymap", 3, ctx, &[fun, zero, list])
     });
     assert_badarg(result);
 
@@ -604,7 +687,8 @@ fn keymap_splits_function_clause_from_element_badarg() {
         let pair = ctx.tuple(&[a]).expect("fits");
         let list = ctx.list(&[pair]).expect("fits");
         let two = ctx.int(2).expect("fits");
-        reg.call("lists", "keymap", 3, ctx, &[a_fun(), two, list])
+        let fun = real_fun(ctx, 1);
+        reg.call("lists", "keymap", 3, ctx, &[fun, two, list])
     });
     assert_badarg(result);
 
@@ -615,7 +699,8 @@ fn keymap_splits_function_clause_from_element_badarg() {
         let two = ctx.int(2).expect("fits");
         let list = ctx.list(&[pair, two]).expect("fits");
         let one = ctx.int(1).expect("fits");
-        reg.call("lists", "keymap", 3, ctx, &[a_fun(), one, list])
+        let fun = real_fun(ctx, 1);
+        reg.call("lists", "keymap", 3, ctx, &[fun, one, list])
     });
     assert_badarg(result);
 
@@ -626,9 +711,27 @@ fn keymap_splits_function_clause_from_element_badarg() {
         let pair = ctx.tuple(&[a, b]).expect("fits");
         let list = ctx.list(&[pair]).expect("fits");
         let one = ctx.int(1).expect("fits");
-        reg.call("lists", "keymap", 3, ctx, &[a_fun(), one, list])
+        let fun = real_fun(ctx, 1);
+        reg.call("lists", "keymap", 3, ctx, &[fun, one, list])
     });
     assert!(result.is_ok(), "a well-formed tuple list still maps");
+
+    // A **non-fun** still yields the bare `error:function_clause` for the shapes whose
+    // reason is the fun guard — the empty list (`[]` clause's `is_function(Fun, 1)`)
+    // and a non-list (no clause matches at all) — matching the oracle. Probed:
+    //   lists:keymap(5, 1, []) => error:function_clause
+    //   lists:keymap(5, 1, a)  => error:function_clause
+    for list in [0, 1] {
+        let result = run(true, |reg, ctx| {
+            let arg = match list {
+                0 => NIL,
+                _ => ctx.atom("a").expect("seeded"),
+            };
+            let one = ctx.int(1).expect("fits");
+            reg.call("lists", "keymap", 3, ctx, &[a_fun(), one, arg])
+        });
+        assert_function_clause(result);
+    }
 }
 
 #[test]
@@ -684,6 +787,14 @@ fn the_explicit_argument_rejections_stay_badarg() {
     // BIFs: a non-list haystack/tuple list is the C's explicit `badarg`, never a
     // no-clause failure (oracle-verified). The tuple-list walkers take an extra
     // `Index` argument (arity 3); `member/2` is the arity-2 form.
+    //
+    // None of the four takes a *fun*, so none carries an `is_function(F, Arity)`
+    // clause guard and the fun-guard extension cannot move these to
+    // `function_clause`: `badarg` is the whole story for a bad list argument here.
+    // Probed: lists:member(a, a) => error:badarg,
+    //         lists:keymember(a, 1, a) => error:badarg,
+    //         lists:keysearch(a, 1, a) => error:badarg,
+    //         lists:keyfind(a, 1, a) => error:badarg.
     for (name, arity) in [("member", 2u32), ("keymember", 3), ("keysearch", 3), ("keyfind", 3)] {
         let result = run(true, |reg, ctx| {
             let a = ctx.atom("a").expect("seeded");

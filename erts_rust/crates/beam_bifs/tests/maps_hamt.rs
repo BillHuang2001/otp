@@ -46,10 +46,10 @@ use std::rc::Rc;
 
 use beam_alloc::Heap;
 use beam_bifs::{default_registry, BifContext, BifRegistry, FunCaller};
-use beam_codec::term::{cons_head, cons_tail, make_binary, tuple_arity, tuple_element};
+use beam_codec::term::{cons_head, cons_tail, fun_function, make_binary, make_fun_external, tuple_arity, tuple_element};
 use beam_common::{BeamError, Result};
 use beam_process::ProcessId;
-use beam_term::{atom_val, compare, is_atom, is_list, is_nil, is_small, make_atom, make_small, signed_value, AtomTable, Eterm, NIL};
+use beam_term::{atom_val, compare, is_atom, is_list, is_nil, is_small, make_atom, make_small, signed_value, Atom, AtomTable, Eterm, NIL};
 
 /// The atoms every case below names. Only interned names resolve without an
 /// `AtomInterner` seam, so the table is seeded up front. `a`, `b`, `c` are seeded in
@@ -101,6 +101,13 @@ const ORACLE_SCALED: &str = "maps:from_list([{N,N*10} || N <- lists:seq(1,33)])"
 fn seeded_atoms() -> AtomTable {
     let mut atoms = AtomTable::new();
     atoms.seed(ATOMS);
+    // Appended, never inserted, so the indices of `ATOMS` — which the flat-map key
+    // order depends on — are unchanged. The mock funs need their own atoms: a
+    // `fun`-taking BIF validates its fun argument with the oracle's
+    // `is_function(Fun, Arity)` clause-head guard, so the mock's fun must be a real
+    // fun term, not an opaque sentinel.
+    atoms.seed(["mock"]);
+    atoms.seed(MOCK_FUNS.iter().map(|(_, _, name)| *name));
     atoms
 }
 
@@ -1206,23 +1213,74 @@ const KEY: i64 = 4;
 /// A fun whose body raises `badarg`; the BIF must propagate it untouched.
 const RAISES: i64 = 5;
 
-/// The mock `FunCaller`: the "fun" argument is a small-integer sentinel naming the
-/// operation, and the mock supplies the behaviour (a real `beam_rt` resolves a
-/// closure there). Every recorded call is `(operation, arguments)`.
+/// The `(operation, true arity, function-atom)` triple of every mock fun.
+///
+/// The mock's fun argument is a **real** `EXPORT_EXT` fun term (see [`mock_fun`]):
+/// a `fun`-taking `maps` BIF validates its fun with the oracle's
+/// `is_function(Fun, Arity)` clause-head guard, so an opaque small-integer sentinel
+/// would be rejected with the plain `error:badarg` before the mock is consulted. The
+/// operation is therefore carried in the fun's *function* atom, which
+/// [`MockFuns::operation`] decodes back through the seeded [`AtomTable`].
+const MOCK_FUNS: [(i64, u32, &str); 5] = [
+    (KEY_PLUS_VALUE, 2, "f_key_plus_value"),
+    (ACC_PLUS_VALUE, 3, "f_acc_plus_value"),
+    (VALUE_GT_30, 2, "f_value_gt_30"),
+    (KEY, 2, "f_key"),
+    (RAISES, 2, "f_raises"),
+];
+
+/// The fun term the mock recognizes as `operation`: an `EXPORT_EXT` fun of the
+/// operation's true arity whose function atom names it.
+fn mock_fun(ctx: &mut BifContext<'_>, operation: i64) -> Eterm {
+    let (_, arity, name) =
+        MOCK_FUNS.iter().find(|(id, _, _)| *id == operation).expect("a known mock operation");
+    let module = atom_val(ctx.atom("mock").expect("seeded"));
+    let function = atom_val(ctx.atom(name).expect("seeded"));
+    make_fun_external(ctx.heap(), *arity as usize, module, function).expect("the mock fun fits")
+}
+
+/// The mock `FunCaller`: the "fun" argument is a real `EXPORT_EXT` fun term whose
+/// function atom names the operation, and the mock supplies the behaviour (a real
+/// `beam_rt` resolves a closure there). Every recorded call is
+/// `(operation, arguments)`.
 struct MockFuns {
     truth: Eterm,
     falsity: Eterm,
+    /// `(function atom, operation)` for every [`MOCK_FUNS`] entry, so `call_fun` can
+    /// decode the operation a fun term names without holding the atom table.
+    ops: Vec<(Atom, i64)>,
     calls: Rc<RefCell<Vec<(i64, Vec<Eterm>)>>>,
 }
 
 impl MockFuns {
     fn new(atoms: &AtomTable) -> MockFuns {
         let atom = |name: &str| make_atom(atoms.lookup(name).expect("seeded atom"));
+        let ops = MOCK_FUNS
+            .iter()
+            .map(|(id, _, name)| {
+                (atoms.lookup(name).expect("a seeded mock fun name"), *id)
+            })
+            .collect();
         MockFuns {
             truth: atom("true"),
             falsity: atom("false"),
+            ops,
             calls: Rc::new(RefCell::new(Vec::new())),
         }
+    }
+
+    /// The operation the mock fun term `fun` names.
+    ///
+    /// Every fun argument reaching the mock is one [`mock_fun`] built, so its function
+    /// atom is a seeded [`MOCK_FUNS`] name; anything else is a test bug, not an input
+    /// the BIF could produce.
+    fn operation(&self, fun: Eterm) -> i64 {
+        let function = fun_function(fun).expect("a mock fun argument is an external fun");
+        self.ops
+            .iter()
+            .find(|(atom, _)| *atom == function)
+            .map(|(_, id)| *id)
+            .unwrap_or_else(|| panic!("unknown mock fun {:?}", function))
     }
 
     fn boolean(&self, value: bool) -> Eterm {
@@ -1236,7 +1294,7 @@ impl MockFuns {
 
 impl FunCaller for MockFuns {
     fn call_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
-        let operation = number(fun);
+        let operation = self.operation(fun);
         self.calls.borrow_mut().push((operation, args.to_vec()));
         match operation {
             KEY_PLUS_VALUE => Ok(make_small(number(args[0]) + number(args[1]))),
@@ -1280,7 +1338,8 @@ fn hamt_fun_bifs_traverse_in_storage_order() {
 
         // maps:map(fun(K,V) -> K+V end, M): the keys are unchanged, the values are
         // the fun's results — in the map's stored order.
-        let mapped = call(reg, ctx, "maps", "map", &[make_small(KEY_PLUS_VALUE), m]);
+        let map_fun = mock_fun(ctx, KEY_PLUS_VALUE);
+        let mapped = call(reg, ctx, "maps", "map", &[map_fun, m]);
         assert!(is_hamt(mapped));
         assert_eq!(size_of(reg, ctx, mapped), 33);
         assert_eq!(
@@ -1295,26 +1354,22 @@ fn hamt_fun_bifs_traverse_in_storage_order() {
         calls.borrow_mut().clear();
 
         // maps:fold(fun(_K,V,Acc) -> Acc+V end, 0, M) => lists:sum(seq(1,33)) = 561.
-        let total = call(
-            reg,
-            ctx,
-            "maps",
-            "fold",
-            &[make_small(ACC_PLUS_VALUE), make_small(0), m],
-        );
+        let fold_fun = mock_fun(ctx, ACC_PLUS_VALUE);
+        let total = call(reg, ctx, "maps", "fold", &[fold_fun, make_small(0), m]);
         assert_eq!(number(total), 561);
         assert_eq!(visited(calls).len(), 33);
         calls.borrow_mut().clear();
 
         // maps:filter(fun(_K,V) -> V > 30 end, M) keeps 31, 32 and 33.
-        let kept = call(reg, ctx, "maps", "filter", &[make_small(VALUE_GT_30), m]);
+        let filter_fun = mock_fun(ctx, VALUE_GT_30);
+        let kept = call(reg, ctx, "maps", "filter", &[filter_fun, m]);
         assert_eq!(size_of(reg, ctx, kept), 3);
         assert_eq!(keys_of(reg, ctx, kept), vec![31, 32, 33]);
         assert_eq!(visited(calls).len(), 33);
         calls.borrow_mut().clear();
 
         // maps:foreach/2 visits every pair and returns `ok`.
-        let ok = call(reg, ctx, "maps", "foreach", &[make_small(KEY_PLUS_VALUE), m]);
+        let ok = call(reg, ctx, "maps", "foreach", &[map_fun, m]);
         assert!(same(ctx, ok, ctx.atom("ok").expect("seeded")));
         assert_eq!(visited(calls), HAMT_33_ORDER.iter().map(|&k| (k, k)).collect::<Vec<_>>());
         calls.borrow_mut().clear();
@@ -1322,8 +1377,9 @@ fn hamt_fun_bifs_traverse_in_storage_order() {
         // A non-boolean predicate result is `error:{case_clause, Value}` for the
         // **first** pair visited — which pins the traversal order to the HAMT's.
         let first_key = HAMT_33_ORDER[0];
+        let key_fun = mock_fun(ctx, KEY);
         assert_reason(
-            invoke(reg, ctx, "maps", "filter", &[make_small(KEY), m]),
+            invoke(reg, ctx, "maps", "filter", &[key_fun, m]),
             ctx,
             "case_clause",
             int(first_key),
@@ -1331,7 +1387,8 @@ fn hamt_fun_bifs_traverse_in_storage_order() {
         calls.borrow_mut().clear();
 
         // A fun's own failure propagates verbatim.
-        match invoke(reg, ctx, "maps", "map", &[make_small(RAISES), m]) {
+        let raises_fun = mock_fun(ctx, RAISES);
+        match invoke(reg, ctx, "maps", "map", &[raises_fun, m]) {
             Err(error) => assert!(matches!(error, BeamError::BadArg)),
             other => panic!("expected the fun's own error, got {other:?}"),
         }

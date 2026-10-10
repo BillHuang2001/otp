@@ -68,6 +68,16 @@
 //! `case_clause`. Milestone-1 collapses all of these to
 //! [`BeamError::BadArg`](beam_common::BeamError::BadArg) (see the errors section).
 //!
+//! # The `is_function(Fun, Arity)` clause guard
+//!
+//! Every fun-taking `lists.erl` function guards its clause head with
+//! `is_function(Fun, Arity)`, so a **non-fun** or a wrong-arity fun is the bare
+//! `error:function_clause` — raised *before* the list argument is looked at, hence
+//! for every list shape including `[]` (see [`require_fun`]). Two functions guard only
+//! part of their clause set, so a wrong fun there is *not* rejected up front: `sort/2`'s
+//! `[X, Y | T]` clause (a non-fun reaches the call layer as `error:{badfun,5}`) and
+//! `zipwith/3` (only its `([], [])` terminal clause is guarded).
+//!
 //! # `sort/2` and `usort/2` — the ordering fun
 //!
 //! `Fun(A, B)` is the `=<` relation, so it is probed in **both** directions: only
@@ -322,12 +332,27 @@ fn call_filter_predicate(ctx: &mut BifContext<'_>, fun: Eterm, elem: Eterm) -> R
 ///
 /// A wrong fun is a **guard** failure, so the oracle raises
 /// `error:function_clause` *before* the list is walked — even for an empty list the
-/// fun would never be called on. Probed `error:function_clause`:
+/// fun would never be called on. Probed `error:function_clause` (non-fun `5`, or a
+/// fun of the wrong arity, for every list shape `[]` / `[1]` / a non-list):
 /// `lists:map(5, [])`, `lists:map(5, [1])`, `lists:filter(5, [])`,
-/// `lists:foldl(5, 0, [])`, `lists:foreach(5, [])`, `lists:sort(5, [])`,
-/// `lists:usort(5, [])`, `lists:all(5, [])`, `lists:any(5, [])`,
+/// `lists:foldl(5, 0, [])`, `lists:foldr(5, 0, [])`, `lists:foreach(5, [])`,
+/// `lists:all(5, [])`, `lists:any(5, [])`, `lists:flatmap(5, [])`,
 /// `lists:takewhile(5, [])`, `lists:dropwhile(5, [])`, `lists:splitwith(5, [])`,
-/// `lists:partition(5, [])`, `lists:sort(fun(A) -> A end, [1,2])`.
+/// `lists:partition(5, [])`, `lists:mapfoldl(5, 0, [])`, `lists:mapfoldr(5, 0, [])`,
+/// `lists:usort(5, [])`, `lists:sort(5, [])`, `lists:sort(5, [1])`,
+/// `lists:sort(fun(A) -> A end, [])`, `lists:zipwith(5, [], [])`.
+///
+/// Two functions guard only part of their clause set, so a wrong fun is **not**
+/// rejected up front and the guard must not be applied at their entry (see the
+/// per-function notes):
+/// * `lists:sort/2`'s `[X, Y | T]` clause is unguarded — `lists:sort(5, [1,2])`
+///   reaches the *call* layer and is `error:{badfun,5}` (a wrong-arity fun is
+///   `error:{badarity, …}`), not `function_clause`; only the `[]`/`[_]` clauses
+///   carry the guard.
+/// * `lists:zipwith/3` guards only its `([], [])` terminal clause —
+///   `lists:zipwith(5, [1], [2])` is `error:{badfun,5}`, while a length mismatch
+///   (`lists:zipwith(5, [], [1])`, `lists:zipwith(5, [1,2], [])`) fails its own
+///   clause set and is `function_clause` regardless of the fun.
 fn require_fun(fun: Eterm, arity: u32) -> Result<()> {
     match fun_arity(fun) {
         Some(n) if n == arity => Ok(()),
@@ -1366,6 +1391,9 @@ fn foldr3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 fn all2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
     let list = args[1];
+    // `all(Pred, List) when is_function(Pred, 1)` — the guard runs *before* the
+    // `case List of … end`, so a wrong fun is `function_clause` even for a non-list.
+    require_fun(fun, 1)?;
     if !is_nil(list) && !is_list(list) {
         // `case List of [Hd | Tail] -> …; [] -> true end` matches neither clause.
         return Err(case_clause(ctx, list)?);
@@ -1401,6 +1429,8 @@ fn all2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 fn any2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
     let list = args[1];
+    // `any(Pred, List) when is_function(Pred, 1)` — same ordering as `all/2`.
+    require_fun(fun, 1)?;
     if !is_nil(list) && !is_list(list) {
         // `case List of [Hd | Tail] -> …; [] -> false end` matches neither clause.
         return Err(case_clause(ctx, list)?);
@@ -1429,6 +1459,8 @@ fn any2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// not a proper list (`List ++ Rest` is `badarg` in the oracle).
 fn flatmap2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
+    // `flatmap(Fun, List) when is_function(Fun, 1)`.
+    require_fun(fun, 1)?;
     let elems = proper_list(args[1]).ok_or_else(function_clause)?;
     let mut flat: Vec<Eterm> = Vec::new();
     for elem in elems {
@@ -1441,6 +1473,8 @@ fn flatmap2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `takewhile(Pred, List)` — the longest prefix whose elements satisfy `Pred`.
 fn takewhile2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    // `takewhile(Pred, List) when is_function(Pred, 1)`.
+    require_fun(args[0], 1)?;
     let (taken, _rest) = take_while_prefix(ctx, args[0], args[1])?;
     build_list(ctx, &taken, NIL)
 }
@@ -1448,6 +1482,8 @@ fn takewhile2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `dropwhile(Pred, List)` — `List` with its longest `Pred`-satisfying prefix
 /// removed (the remainder is returned as-is, sharing its tail).
 fn dropwhile2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    // `dropwhile(Pred, List) when is_function(Pred, 1)`.
+    require_fun(args[0], 1)?;
     let (_taken, rest) = take_while_prefix(ctx, args[0], args[1])?;
     Ok(rest)
 }
@@ -1455,6 +1491,8 @@ fn dropwhile2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `partition(Pred, List)` — `{Satisfied, NotSatisfied}`, both order-preserving.
 fn partition2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
+    // `partition(Pred, L) when is_function(Pred, 1)`.
+    require_fun(fun, 1)?;
     let elems = proper_list(args[1]).ok_or_else(function_clause)?;
     let mut satisfied = Vec::new();
     let mut not_satisfied = Vec::new();
@@ -1473,6 +1511,8 @@ fn partition2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `splitwith(Pred, List)` — `{takewhile(Pred, List), dropwhile(Pred, List)}` in a
 /// single pass (`splitwith_1`).
 fn splitwith2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    // `splitwith(Pred, List) when is_function(Pred, 1)`.
+    require_fun(args[0], 1)?;
     let (taken, rest) = take_while_prefix(ctx, args[0], args[1])?;
     let taken = build_list(ctx, &taken, NIL)?;
     ctx.tuple(&[taken, rest])
@@ -1482,6 +1522,8 @@ fn splitwith2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// applied left to right; the mapped values are in element order.
 fn mapfoldl3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
+    // `mapfoldl(Fun, Acc0, List) when is_function(Fun, 2)`.
+    require_fun(fun, 2)?;
     let mut acc = args[1];
     let elems = proper_list(args[2]).ok_or_else(function_clause)?;
     let mut mapped = Vec::with_capacity(elems.len());
@@ -1499,6 +1541,8 @@ fn mapfoldl3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// (`mapfoldr_1` conses without reversing its accumulator).
 fn mapfoldr3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
+    // `mapfoldr(Fun, Acc0, List) when is_function(Fun, 2)`.
+    require_fun(fun, 2)?;
     let mut acc = args[1];
     let elems = proper_list(args[2]).ok_or_else(function_clause)?;
     let mut mapped = vec![NIL; elems.len()];
@@ -1518,6 +1562,11 @@ fn mapfoldr3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// a length mismatch, so `zipwith(F, [1,2,3], [10,20])` raises `function_clause`
 /// exactly like `zip/2`. The `trim`/`{pad, …}` behaviours live in `zipwith/4`, which
 /// this module does not register.
+///
+/// The `is_function(F, 2)` guard sits on the **`([], [])` terminal clause only**
+/// (probed: `lists:zipwith(5, [], [])` ⇒ `function_clause`, while
+/// `lists:zipwith(5, [1], [2])` reaches the call layer and is `error:{badfun,5}`),
+/// so the non-empty walk must **not** pre-check the fun.
 fn zipwith3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
     let mut left = args[1];
@@ -1530,7 +1579,11 @@ fn zipwith3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
                 left = cdr(left);
                 right = cdr(right);
             }
-            (false, false) if is_nil(left) && is_nil(right) => break,
+            (false, false) if is_nil(left) && is_nil(right) => {
+                // `zipwith(F, [], [], fail) when is_function(F, 2)`.
+                require_fun(fun, 2)?;
+                break;
+            }
             _ => return Err(function_clause()),
         }
     }
@@ -1538,9 +1591,17 @@ fn zipwith3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 }
 
 /// `sort(Fun, List)` — a **stable** sort in the `Fun` (`=<`) order.
+///
+/// Only the `[]`/`[_]` clauses carry `when is_function(Fun, 2)`; the `[X, Y | T]`
+/// clause does **not**, so a wrong fun is a guard failure just for a list of fewer
+/// than two elements (probed: `lists:sort(5, [])`/`lists:sort(5, [1])` ⇒
+/// `error:function_clause`, `lists:sort(5, [1,2])` ⇒ `error:{badfun,5}`).
 fn sort2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
     let elems = proper_list(args[1]).ok_or_else(function_clause)?;
+    if elems.len() < 2 {
+        require_fun(fun, 2)?;
+    }
     let sorted = merge_sort_elems(elems, |a, b| fun_order(ctx, fun, a, b))?;
     ctx.list(&sorted)
 }
@@ -1563,6 +1624,9 @@ fn sort2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// prepending are held *reversed* so the prepend is a `push`.
 fn usort2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
+    // Every `usort/2` clause carries `when is_function(Fun, 2)` (probed for `[]`,
+    // `[1]` and `[1,2]` ⇒ `error:function_clause`).
+    require_fun(fun, 2)?;
     let elems = proper_list(args[1]).ok_or_else(function_clause)?;
     let sorted = usort_1_entry(ctx, fun, &elems)?;
     ctx.list(&sorted)
@@ -2144,10 +2208,12 @@ mod tests {
         with_heap(65_536, f)
     }
 
-    /// A mock [`crate::FunCaller`] for the ordering funs of `sort/2`/`usort/2`: the
-    /// "fun" term is a small-integer sentinel naming the *exact* Erlang comparator
-    /// the oracle was probed with. `true`/`false` come from the seeded atom table
-    /// (the runtime's boolean atoms are not at fixed indices).
+    /// A mock [`crate::FunCaller`] for the ordering funs of `sort/2`/`usort/2`: a
+    /// **real** `EXPORT_EXT` fun of arity 2 whose *function-name* atom carries the
+    /// small-integer sentinel naming the *exact* Erlang comparator the oracle was
+    /// probed with (the fun must be a genuine arity-2 fun term so `usort/2`'s
+    /// `is_function(Fun, 2)` clause guard passes). `true`/`false` come from the
+    /// seeded atom table (the runtime's boolean atoms are not at fixed indices).
     struct OrderFuns {
         truth: Eterm,
         falsity: Eterm,
@@ -2164,11 +2230,27 @@ mod tests {
     const ORDER_LT: i64 = 104;
     /// `fun(A, B) -> A > B end` — a non-total strict descending order.
     const ORDER_GT: i64 = 105;
+
+    /// The comparator sentinel `id` as a real arity-2 `EXPORT_EXT` fun term — its
+    /// function-name atom is `Atom::from_raw(id)`, which the mock decodes.
+    fn order_fun(ctx: &mut BifContext<'_>, id: i64) -> Eterm {
+        beam_codec::term::make_fun_external(
+            ctx.heap(),
+            2,
+            beam_term::Atom::from_raw(0),
+            beam_term::Atom::from_raw(id as u32),
+        )
+        .expect("the external fun fits")
+    }
+
     impl crate::FunCaller for OrderFuns {
         fn call_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
             let a = beam_term::signed_value(args[0]);
             let b = beam_term::signed_value(args[1]);
-            let result = match beam_term::signed_value(fun) {
+            let id = beam_codec::term::fun_function(fun)
+                .expect("the mock only ever sees an EXPORT_EXT fun")
+                .raw() as i64;
+            let result = match id {
                 ALWAYS_FALSE => false,
                 ALWAYS_TRUE => true,
                 ORDER_ASC => a <= b,
@@ -2196,8 +2278,8 @@ mod tests {
     /// Calls `usort/2` with the sentinel comparator `id` on `list` and renders the
     /// result with `~w`.
     fn show_usort(ctx: &mut BifContext<'_>, id: i64, list: Eterm) -> String {
-        let args = vec![make_small(id), list];
-        let out = usort2(ctx, &args).expect("usort/2 should succeed");
+        let fun = order_fun(ctx, id);
+        let out = usort2(ctx, &[fun, list]).expect("usort/2 should succeed");
         pretty(ctx, out)
     }
 
@@ -3072,7 +3154,7 @@ mod tests {
             let improper = ctx
                 .cons(make_small(1), ctx.atom("a").expect("seeded"))
                 .expect("the cons fits");
-            let args = vec![make_small(ORDER_ASC), improper];
+            let args = vec![order_fun(ctx, ORDER_ASC), improper];
             rejects_clause!(ctx, usort2, [args[0], args[1]]);
         });
     }

@@ -52,9 +52,10 @@
 //!
 //! # The `fun`-taking BIFs
 //!
-//! `map/2`, `fold/3`, `filter/2` and `foreach/2` are real `erl_map.c` BIFs, so
-//! they are registered here rather than left to `maps.erl`. They call their fun
-//! through [`BifContext::call_fun`] (the [`crate::FunCaller`] seam); with no caller
+//! `map/2`, `fold/3`, `filter/2` and `foreach/2` are stdlib `maps.erl` functions
+//! (`bif.tab` declares none of them), so they are registered here as fast paths
+//! mirroring that module's clause structure. They call their fun through
+//! [`BifContext::call_fun`] (the [`crate::FunCaller`] seam); with no caller
 //! installed they raise `unsupported_bif`, and a fun's own failures propagate
 //! verbatim.
 //!
@@ -68,9 +69,13 @@
 //! * The traversal order is the map's **stored** order (`map_pairs_storage_order`),
 //!   so a `fold` that accumulates into a list sees the oracle's pair sequence.
 //!
-//! The fun argument is **not** arity-checked here — that is the runtime's job when
-//! it invokes it — so `maps:map(5, #{})` returns `#{}` where the oracle raises
-//! `badarg` (documented gap: a non-fun is only detected once a fun call happens).
+//! Every one of them first applies the oracle's `is_function(Fun, Arity)`
+//! clause-head guard ([`require_fun`]). `maps.erl`'s fallback clause raises the
+//! **plain atom** `badarg` — not the `function_clause` `lists.erl`'s guards raise —
+//! and the guard fires before the map argument is inspected or walked, so a non-fun
+//! (or a fun of the wrong arity) is `badarg` even for an empty map or a non-map
+//! second argument. A **valid** fun paired with a non-map argument is instead the
+//! structured `error:{badmap, Term}` from [`map_pairs`].
 //!
 //! # Key identity is exact (`=:=`)
 //!
@@ -715,11 +720,43 @@ fn predicate_holds(ctx: &mut BifContext<'_>, result: Eterm) -> Result<bool> {
     }
 }
 
+/// The oracle's `is_function(Fun, Arity)` clause-head guard for the `fun`-taking
+/// `maps` BIFs.
+///
+/// `maps.erl`'s fallback clause raises the **plain atom** `error:badarg` — not the
+/// `function_clause` the `lists.erl` guards raise — for a non-fun or a fun of the
+/// wrong arity (`map/2` at `maps.erl:943`, `foreach/2` at `:845`, `fold/3` at
+/// `:896`, `filter/2` at `:739`). The guard sits on the *first* clause head, so it
+/// fires **before** the map argument is inspected or the map is walked: a bad fun
+/// is `badarg` even for an empty map or a non-map second argument, and the map is
+/// never a fabricated success. Oracle-pinned (OTP 29 / erts-17.1):
+/// `maps:map(5, #{})`, `maps:map(fun(_K) -> ok end, #{})` and
+/// `maps:map(5, not_a_map)` ⇒ `error:badarg`, while
+/// `maps:map(fun(_,_) -> ok end, not_a_map)` ⇒ `error:{badmap,not_a_map}` (the
+/// guard passes first, then the map is not a map).
+///
+/// Not shared with `lists.rs`'s `require_fun`: that item is private (`fn`, not
+/// `pub(crate)`) *and* it raises the wrong reason (`error:function_clause`) for
+/// `maps`, so promoting it would not produce the oracle's `badarg`.
+fn require_fun(fun: Eterm, arity: u32) -> Result<()> {
+    match access::fun_arity(fun) {
+        Some(n) if n == arity => Ok(()),
+        _ => Err(badarg()),
+    }
+}
+
 /// `maps:map(Fun, Map)` — `Fun(Key, Value)` supplies each value.
 ///
 /// The keys and their order are unchanged; only the values are the fun's results.
+///
+/// # Errors
+///
+/// The plain `error:badarg` for a bad `Fun` ([`require_fun`]), the structured
+/// `error:{badmap, Map}` for a non-map second argument, or whatever `Fun` raises.
 fn map_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
+    // `map(Fun, Map) when is_map(Map), is_function(Fun, 2)` … else `badarg`.
+    require_fun(fun, 2)?;
     let pairs = map_pairs(ctx, args[1])?;
     let mut out: Vec<(Eterm, Eterm)> = Vec::with_capacity(pairs.len());
     for (key, value) in pairs {
@@ -730,8 +767,16 @@ fn map_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 }
 
 /// `maps:fold(Fun, Init, Map)` — `Acc = Fun(Key, Value, Acc)` over every pair.
+///
+/// # Errors
+///
+/// The plain `error:badarg` for a bad `Fun` ([`require_fun`]) — checked before
+/// `Init`/`Map` are looked at — the structured `error:{badmap, Map}` for a non-map
+/// third argument, or whatever `Fun` raises.
 fn fold_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
+    // `fold(Fun, Init, Map) when is_map(Map), is_function(Fun, 3)` … else `badarg`.
+    require_fun(fun, 3)?;
     let mut acc = args[1];
     let pairs = map_pairs(ctx, args[2])?;
     for (key, value) in pairs {
@@ -741,8 +786,17 @@ fn fold_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 }
 
 /// `maps:filter(Pred, Map)` — the `{Key, Value}` pairs whose predicate is `true`.
+///
+/// # Errors
+///
+/// The plain `error:badarg` for a bad `Pred` ([`require_fun`]), the structured
+/// `error:{badmap, Map}` for a non-map second argument, the structured
+/// `error:{case_clause, Value}` for a non-boolean predicate result, or whatever
+/// `Pred` raises.
 fn filter_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
+    // `filter(Pred, Map) when is_map(Map), is_function(Pred, 2)` … else `badarg`.
+    require_fun(fun, 2)?;
     let pairs = map_pairs(ctx, args[1])?;
     let mut out: Vec<(Eterm, Eterm)> = Vec::new();
     for (key, value) in pairs {
@@ -755,8 +809,15 @@ fn filter_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 }
 
 /// `maps:foreach(Fun, Map)` — `Fun(Key, Value)` for its side effects; `ok`.
+///
+/// # Errors
+///
+/// The plain `error:badarg` for a bad `Fun` ([`require_fun`]), the structured
+/// `error:{badmap, Map}` for a non-map second argument, or whatever `Fun` raises.
 fn foreach_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
+    // `foreach(Fun, Map) when is_map(Map), is_function(Fun, 2)` … else `badarg`.
+    require_fun(fun, 2)?;
     let pairs = map_pairs(ctx, args[1])?;
     for (key, value) in pairs {
         ctx.call_fun(fun, &[key, value])?;
