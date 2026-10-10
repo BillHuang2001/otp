@@ -493,6 +493,16 @@ dominates the small shapes.)
 - **Scheduler coupling is absent by design.** `Queue` is a pure FIFO; selective-receive waiting,
   `after`, the save queue, signal/priority ordering and the message-queue length semantics of
   `ErtsSignalPrivQueues` are `beam_process`'s.
+- **No logical-size / reduction-accounting surface.** `Message` exposes no size accessor (no
+  `logical_size()`/word count); a host that must charge the sender's message-copy reductions or
+  report a message's size derives it itself — `beam_term::size_object(payload)` for a heap-resident
+  payload, `Fragments::total_used_words()` for a fragment-resident one. The C sender charge is
+  `size_object_litopt(message) / ERTS_MSG_COPY_WORDS_PER_REDUCTION` (64 release; `erl_message.c:881-886`;
+  same at `erl_proc_sig_queue.c:2284-2289`) plus a fixed 4 (`bif.c:2742`/`:2862`), in **heap words**:
+  an off-heap refc binary contributes only its 8-word `[BinRef][ErlSubBits]` handle (`copy.c:219-242`),
+  **not** its payload length. A payload's logical byte size is charged to the *holder's* virtual
+  binary heap (`bin_vheap`, `erl_gc.c:3046,3051`) / `virtual_reds` (`erl_process.c:9678`), a separate
+  mechanism this crate does not model.
 - **`Message.token` is a plain field (`NIL` when absent).** The seq-trace / distribution-token
   machinery that fills it is `beam_dist`/`beam_rt`.
 - **The binary/node lists are carried but not yet consumed.** `beam_process`/`beam_rt` must own a
