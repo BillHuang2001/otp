@@ -563,6 +563,168 @@ static int chk_pdl_lock_unlock_refc(extra_state *st) {
     return ok && (driver_pdl_get_refc(pdl) == 1);
 }
 
+/* -- the driver-private queue's zero-length / empty-queue edges ----------------------------- */
+
+/* A zero-length append is accepted and touches nothing: the byte count stays `0`
+ * (`erts_ioq_enqv`'s `size <= skip` early return, `erl_io_queue.c:246-247`). */
+static int chk_enq_zero(extra_state *st) {
+    char one = 'z';
+    return driver_enq(st->port, &one, 0) == 0 && driver_sizeq(st->port) == 0;
+}
+
+/* The same zero-length no-op for the head-inserting sibling. */
+static int chk_pushq_zero(extra_state *st) {
+    char one = 'z';
+    return driver_pushq(st->port, &one, 0) == 0 && driver_sizeq(st->port) == 0;
+}
+
+/* `driver_enq_bin` with `len == 0` returns before touching the queue (`io.c:6846-6848`). */
+static int chk_enq_bin_zero(extra_state *st) {
+    ErlDrvBinary *b = driver_alloc_binary(4);
+    int ok;
+    if (b == NULL)
+        return 0;
+    ok = (driver_enq_bin(st->port, b, 0, 0) == 0) && (driver_sizeq(st->port) == 0);
+    driver_free_binary(b);
+    return ok;
+}
+
+/* The same zero-length no-op for `driver_pushq_bin`. */
+static int chk_pushq_bin_zero(extra_state *st) {
+    ErlDrvBinary *b = driver_alloc_binary(4);
+    int ok;
+    if (b == NULL)
+        return 0;
+    ok = (driver_pushq_bin(st->port, b, 0, 0) == 0) && (driver_sizeq(st->port) == 0);
+    driver_free_binary(b);
+    return ok;
+}
+
+/* `driver_deq` of zero bytes drains nothing and reports the remaining size, which is `0` on a
+ * fresh port (`io.c:6807-6813`). */
+static int chk_deq_zero(extra_state *st) {
+    return driver_deq(st->port, 0) == 0;
+}
+
+/* `driver_deq` of more than the queue holds answers the `(ErlDrvSizeT) -1` refusal and leaves the
+ * queue untouched (`erts_ioq_deq`, `erl_io_queue.c:347-352`). */
+static int chk_deq_over_size(extra_state *st) {
+    return driver_deq(st->port, 1) == (ErlDrvSizeT) -1 && driver_sizeq(st->port) == 0;
+}
+
+/* `driver_peekqv` on an empty queue reports a zero size and zeroes the caller's vector
+ * (`erts_ioq_peekqv`, `erl_io_queue.c:379-394`). */
+static int chk_peekqv_empty(extra_state *st) {
+    ErlIOVec ev;
+    ErlDrvSizeT n;
+    memset(&ev, 0xff, sizeof(ev));
+    n = driver_peekqv(st->port, &ev);
+    return n == 0 && ev.vsize == 0 && ev.size == 0;
+}
+
+/* A vector whose every byte is skipped enqueues nothing and answers `0`
+ * (`erts_ioq_enqv`, `erl_io_queue.c:300-306`). */
+static int chk_enqv_all_skipped(extra_state *st) {
+    SysIOVec iov[1];
+    ErlIOVec ev;
+    char in[3];
+    memcpy(in, "abc", 3);
+    iov[0].iov_base = in;
+    iov[0].iov_len = 3;
+    ev.vsize = 1;
+    ev.size = 3;
+    ev.iov = iov;
+    ev.binv = NULL;
+    return driver_enqv(st->port, &ev, 3) == 0 && driver_sizeq(st->port) == 0;
+}
+
+/* The same all-skipped no-op for `driver_pushqv`. */
+static int chk_pushqv_all_skipped(extra_state *st) {
+    SysIOVec iov[1];
+    ErlIOVec ev;
+    char in[3];
+    memcpy(in, "abc", 3);
+    iov[0].iov_base = in;
+    iov[0].iov_len = 3;
+    ev.vsize = 1;
+    ev.size = 3;
+    ev.iov = iov;
+    ev.binv = NULL;
+    return driver_pushqv(st->port, &ev, 3) == 0 && driver_sizeq(st->port) == 0;
+}
+
+/* `driver_vec_to_buf` with a zero length copies nothing and reports `0` (`io.c:6510-6530`). */
+static int chk_vec_to_buf_zero_len(void) {
+    SysIOVec iov[1];
+    ErlIOVec ev;
+    char in[3], out[1];
+    memcpy(in, "abc", 3);
+    iov[0].iov_base = in;
+    iov[0].iov_len = 3;
+    ev.vsize = 1;
+    ev.size = 3;
+    ev.iov = iov;
+    ev.binv = NULL;
+    out[0] = 0;
+    return driver_vec_to_buf(&ev, out, 0) == 0;
+}
+
+/* -- the time-conversion zero edge ---------------------------------------------------------- */
+
+/* A zero reading converts to zero in every direction (`io.c:6984-6992`). */
+static int chk_convert_zero(void) {
+    return erl_drv_convert_time_unit(0, ERL_DRV_SEC, ERL_DRV_NSEC) == 0
+        && erl_drv_convert_time_unit(0, ERL_DRV_USEC, ERL_DRV_MSEC) == 0;
+}
+
+/* -- further synchronisation accessors ------------------------------------------------------ */
+
+/* A freshly created opts record carries the C's "platform default" stack marker `-1`
+ * (`erl_drv_thread.c:585-593`). */
+static int chk_thread_opts_default_stack(void) {
+    ErlDrvThreadOpts *opts = erl_drv_thread_opts_create("driver_extra_opts");
+    int ok = 0;
+    if (opts != NULL) {
+        ok = (opts->suggested_stack_size == -1);
+        erl_drv_thread_opts_destroy(opts);
+    }
+    return ok;
+}
+
+/* A named condition variable's accessor returns the name it was created with
+ * (`erl_drv_thread.c:283-286`). */
+static int chk_cond_name(void) {
+    ErlDrvCond *c = erl_drv_cond_create("driver_extra_cond");
+    int ok = 0;
+    if (c != NULL) {
+        char *n = erl_drv_cond_name(c);
+        ok = (n != NULL) && (strcmp(n, "driver_extra_cond") == 0);
+        erl_drv_cond_destroy(c);
+    }
+    return ok;
+}
+
+/* The same for a named read/write lock (`erl_drv_thread.c:365-368`). */
+static int chk_rwlock_name(void) {
+    ErlDrvRWLock *l = erl_drv_rwlock_create("driver_extra_rwlock_name");
+    int ok = 0;
+    if (l != NULL) {
+        char *n = erl_drv_rwlock_name(l);
+        ok = (n != NULL) && (strcmp(n, "driver_extra_rwlock_name") == 0);
+        erl_drv_rwlock_destroy(l);
+    }
+    return ok;
+}
+
+/* A null handle's name accessor is `NULL` on both runtimes (`erl_drv_thread.c:283,365`). */
+static int chk_cond_name_null(void) {
+    return erl_drv_cond_name(NULL) == NULL;
+}
+
+static int chk_rwlock_name_null(void) {
+    return erl_drv_rwlock_name(NULL) == NULL;
+}
+
 /* -- the ErlDrvTerm *delivery* family over the remaining operand tags ----------------------- */
 static void ex_send(extra_state *st, ErlDrvTermData *spec, int len) {
     (void) erl_drv_output_term(driver_mk_port(st->port), spec, len);
@@ -710,6 +872,24 @@ static void ex_dispatch(extra_state *st, unsigned char sel) {
     case 22: ex_answer(st, chk_pdl_create(st)); break;
     case 23: ex_answer(st, chk_pdl_refc_inc_dec(st)); break;
     case 24: ex_answer(st, chk_pdl_lock_unlock_refc(st)); break;
+    /* The queue's zero-length / empty-queue edges, the conversion zero edge, the further
+     * synchronisation accessors and the port-to-term null edge. */
+    case 25: ex_answer(st, chk_enq_zero(st)); break;
+    case 26: ex_answer(st, chk_pushq_zero(st)); break;
+    case 27: ex_answer(st, chk_enq_bin_zero(st)); break;
+    case 28: ex_answer(st, chk_pushq_bin_zero(st)); break;
+    case 29: ex_answer(st, chk_deq_zero(st)); break;
+    case 30: ex_answer(st, chk_deq_over_size(st)); break;
+    case 31: ex_answer(st, chk_peekqv_empty(st)); break;
+    case 32: ex_answer(st, chk_enqv_all_skipped(st)); break;
+    case 33: ex_answer(st, chk_pushqv_all_skipped(st)); break;
+    case 34: ex_answer(st, chk_vec_to_buf_zero_len()); break;
+    case 35: ex_answer(st, chk_convert_zero()); break;
+    case 36: ex_answer(st, chk_thread_opts_default_stack()); break;
+    case 37: ex_answer(st, chk_cond_name()); break;
+    case 38: ex_answer(st, chk_rwlock_name()); break;
+    case 39: ex_answer(st, chk_cond_name_null()); break;
+    case 40: ex_answer(st, chk_rwlock_name_null()); break;
     /* The delivery family: nothing is answered through the byte channel — the delivered term is
      * the observable. */
     case 100: ex_deliver(st, 0); break;
@@ -1066,6 +1246,102 @@ pub(crate) fn group() -> Vec<Case> {
             &[24],
             "49",
         ),
+        case(
+            "driver_extra/driver_enq_of_zero_bytes_is_a_no_op",
+            "driver_enq/3 with a zero length is accepted and leaves the private queue empty",
+            &[25],
+            "49",
+        ),
+        case(
+            "driver_extra/driver_pushq_of_zero_bytes_is_a_no_op",
+            "driver_pushq/3 with a zero length is accepted and leaves the private queue empty",
+            &[26],
+            "49",
+        ),
+        case(
+            "driver_extra/driver_enq_bin_of_zero_length_is_a_no_op",
+            "driver_enq_bin/4 with a zero length is accepted and leaves the private queue empty",
+            &[27],
+            "49",
+        ),
+        case(
+            "driver_extra/driver_pushq_bin_of_zero_length_is_a_no_op",
+            "driver_pushq_bin/4 with a zero length is accepted and leaves the private queue empty",
+            &[28],
+            "49",
+        ),
+        case(
+            "driver_extra/driver_deq_of_zero_bytes_reports_the_remaining_size",
+            "driver_deq/2 with a zero size drains nothing and reports the remaining size (0 on a fresh port)",
+            &[29],
+            "49",
+        ),
+        case(
+            "driver_extra/driver_deq_beyond_the_queue_size_is_refused",
+            "driver_deq/2 for more bytes than the queue holds answers (ErlDrvSizeT)-1 and leaves the queue untouched",
+            &[30],
+            "49",
+        ),
+        case(
+            "driver_extra/driver_peekqv_on_an_empty_queue_reports_a_zero_vector",
+            "driver_peekqv/2 on an empty queue reports 0 and zeroes the caller's vsize/size",
+            &[31],
+            "49",
+        ),
+        case(
+            "driver_extra/driver_enqv_with_every_byte_skipped_enqueues_nothing",
+            "driver_enqv/3 whose skip covers the whole vector answers 0 and leaves the queue empty",
+            &[32],
+            "49",
+        ),
+        case(
+            "driver_extra/driver_pushqv_with_every_byte_skipped_enqueues_nothing",
+            "driver_pushqv/3 whose skip covers the whole vector answers 0 and leaves the queue empty",
+            &[33],
+            "49",
+        ),
+        case(
+            "driver_extra/driver_vec_to_buf_with_a_zero_length_copies_nothing",
+            "driver_vec_to_buf/3 with a zero length copies nothing and reports 0",
+            &[34],
+            "49",
+        ),
+        case(
+            "driver_extra/erl_drv_convert_time_unit_maps_zero_to_zero",
+            "erl_drv_convert_time_unit/3 converts a zero reading to zero in either direction",
+            &[35],
+            "49",
+        ),
+        case(
+            "driver_extra/erl_drv_thread_opts_create_seeds_the_default_stack",
+            "erl_drv_thread_opts_create/1 seeds suggested_stack_size with the C's platform-default marker -1",
+            &[36],
+            "49",
+        ),
+        case(
+            "driver_extra/erl_drv_cond_name_reports_the_created_name",
+            "erl_drv_cond_name/1 answers the name its condition variable was created with",
+            &[37],
+            "49",
+        ),
+        case(
+            "driver_extra/erl_drv_rwlock_name_reports_the_created_name",
+            "erl_drv_rwlock_name/1 answers the name its read/write lock was created with",
+            &[38],
+            "49",
+        ),
+        case(
+            "driver_extra/erl_drv_cond_name_answers_null_for_a_null_handle",
+            "erl_drv_cond_name/1 answers NULL for a null condition-variable handle",
+            &[39],
+            "49",
+        ),
+        case(
+            "driver_extra/erl_drv_rwlock_name_answers_null_for_a_null_handle",
+            "erl_drv_rwlock_name/1 answers NULL for a null read/write lock handle",
+            &[40],
+            "49",
+        ),
         delivery_case(
             "driver_extra/erl_drv_output_term_delivers_a_uint_operand",
             "erl_drv_output_term/3 delivers 42 built from an ERL_DRV_UINT operand",
@@ -1359,7 +1635,7 @@ mod tests {
                 assert_eq!(golden, "49", "case {}: a status selector is the '1' byte", case.id);
             }
         }
-        assert_eq!(status, 24, "the twenty-four status selectors");
+        assert_eq!(status, 40, "the forty status selectors");
         assert_eq!(deliveries, DELIVERY_SELECTORS.count(), "one delivery case per selector");
         assert_eq!(builtin, 2, "the two built-in-driver cases");
     }
