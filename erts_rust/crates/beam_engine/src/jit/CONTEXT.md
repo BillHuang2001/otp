@@ -31,7 +31,7 @@ deopt are the load-bearing contracts.
 - `cranelift/` → the optional Cranelift hot tier (feature-gated); see its own `CONTEXT.md`.
 - `emitter/` → the x86-64 encoder + executable `CodeBuffer`; see its own `CONTEXT.md`.
 - `cache.rs` → cross-run compiled-block cache + host code-map entry; `tiering.rs` → tier policy; `mod.rs` → the tier seam.
-- `bench/` → the in-crate tier measurement harness — a **`pub mod bench`** (not `#[cfg(test)]`): a nine-workload interpreter-vs-baseline tier table (`fib`/`kernel`/`wide`/`aggr`/`cmp` + `build`/`map`/`select`/`walk`), the `support.rs` scaffolding shared with `cranelift/bench.rs`, and the per-workload result checks; its `#[test]` entry points live in the thin `tests/jit_bench.rs`. See its own `CONTEXT.md`.
+- `bench/` → the in-crate tier measurement harness — a **`pub mod bench`** (not `#[cfg(test)]`): a ten-workload interpreter-vs-baseline tier table (`fib`/`kernel`/`wide`/`aggr`/`cmp` + `build`/`map`/`select`/`walk` + the cross-module `cross/2`), the `support.rs` scaffolding shared with `cranelift/bench.rs`, and the per-workload result checks; its `#[test]` entry points live in the thin `tests/jit_bench.rs`. See its own `CONTEXT.md`.
 - The **baseline inline set** now includes the boxed-term header `TestKind`s: the word-level `Test`s (`is_nil`/`is_atom`/`is_list`/`is_nonempty_list`/`is_boolean`) plus **14** header kinds (`is_integer`/`is_number`/`is_float`/`is_tuple`/`is_map`/`is_bitstring`/`is_binary`/`is_function`/`is_function2`/`is_tagged_tuple`/`test_arity`/`is_pid`/`is_port`/`is_reference`); everything else still deopts (see `baseline/emit/CONTEXT.md`).
 
 ## Constraints
