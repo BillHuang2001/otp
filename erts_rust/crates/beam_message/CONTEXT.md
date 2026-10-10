@@ -345,12 +345,13 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
 - `tests/copy.rs` — the flat-copy correctness evidence: nested-graph equality, a `100_000`-element
   deep list (no stack overflow), literal sharing by identity, MSO refcount + slot rewrite, heap
   exhaustion ⇒ `AllocKind::Message`, and a 40-key HAMT map copied as a whole trie.
-- `tests/classes.rs` — **term-class completeness**: every class copied and asserted `=:=` (or via the
-  `thing` accessors for external things): immediates; proper and improper cons lists; tuples/records
-  (nested + the shared zero-arity literal); flat map and HAMT map (head-array/head-bitmap/inner-node +
-  collision tuples); on-heap bitstrings (aligned + non-aligned); refc binary; MSO container; all three
-  fun kinds (the External case pins the widened 4-word `[header, module, function, arity]` block, incl.
-  the true-arity word); external pid/port/ref.
+- `tests/classes.rs` — **term-class completeness for the off-heap-free classes**: immediates; proper
+  and improper cons lists; tuples (nested + the shared zero-arity literal) and a native `RECORD_SUBTAG`
+  record; flat map and HAMT map (head-bitmap/inner-node); all three fun kinds (the External case pins
+  the widened 4-word `[header, module, function, arity]` block, incl. the true-arity word); on-heap
+  bitstrings (byte-aligned + non-byte-aligned). The off-heap classes are covered by their own files:
+  refc binary → `binary.rs`, MSO container → `copy.rs`/`sizing.rs`, external pid/port/ref →
+  `external.rs`. **Not covered by any copy test:** boxed float, bignum, and HAMT collision tuples.
 - `tests/guards.rs` — **non-term and cycle guards + the relocation invariant**: `is_shared`/`shallow`
   reject every bare header word (incl. `THE_NON_VALUE`/`HEADER_SUB_BITS`) with a typed `BadArg` and
   write nothing; a forged cyclic graph (self-cons, self-tuple, 2-cell, 100-cell) returns a typed
