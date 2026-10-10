@@ -97,7 +97,7 @@ fn output_and_input_round_trip_through_the_reactor() {
 }
 
 #[test]
-fn close_releases_the_id_for_reuse() {
+fn a_close_retires_the_id_only_once_it_is_reported() {
     let mut poller = poller();
     let mut registry = PortRegistry::new();
 
@@ -110,12 +110,31 @@ fn close_releases_the_id_for_reuse() {
     assert!(registry.contains(second));
     assert_eq!(registry.len(), 1);
 
-    let reused = registry.open(&mut poller, fd_port()).expect("opens");
-    assert_eq!(reused, first, "the released port number is reused");
-    assert_eq!(registry.len(), 2);
+    // The number of an unreported close stays reserved: the port-task round that reports the
+    // close is what retires it, so a deferred `Closed` notification can never name a live port.
+    let fresh = registry.open(&mut poller, fd_port()).expect("opens");
+    assert_ne!(
+        fresh, first,
+        "an unreported close keeps its number out of circulation"
+    );
 
-    registry.close(&mut poller, second).expect("closes");
-    registry.close(&mut poller, reused).expect("closes");
+    let round = registry
+        .execute_port_tasks(&mut poller, DEFAULT_READINESS_RED_BUDGET)
+        .expect("the round runs");
+    assert!(
+        round
+            .notifications
+            .contains(&PortNotification::Closed { port: first }),
+        "the round reports the close that retires the number"
+    );
+
+    // Retired with the report: the number is handed out again.
+    let reused = registry.open(&mut poller, fd_port()).expect("opens");
+    assert_eq!(reused, first, "the reported close retired its number");
+
+    for id in [second, fresh, reused] {
+        registry.close(&mut poller, id).expect("closes");
+    }
     assert!(registry.is_empty());
 }
 
@@ -156,12 +175,13 @@ fn unknown_event_keys_are_ignored() {
         Event::new(token, 4242, Ready::default()),
         Event::new(token, WAKER_KEY, Ready::default()),
     ];
-    assert_eq!(
-        registry
-            .handle_events(&mut poller, &forged)
-            .expect("dispatching is a no-op"),
-        0,
-        "events for unknown keys are skipped"
+    let outcome = registry
+        .handle_events(&mut poller, &forged)
+        .expect("dispatching is a no-op");
+    assert_eq!(outcome.ran, 0, "events for unknown keys schedule no task");
+    assert!(
+        outcome.notifications.is_empty(),
+        "events for unknown keys report nothing"
     );
     assert!(registry.contains(id), "the live port is untouched");
     assert_eq!(registry.len(), 1);

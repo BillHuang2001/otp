@@ -382,3 +382,54 @@ fn a_port_data_notification_wakes_a_blocked_process() {
 
     registry.close(&mut poller, id).expect("closes");
 }
+
+/// A [`PortNotification::Closed`] **never names a reused port number**: a closed port keeps its
+/// number reserved until the reporting round mints the notification, so a `close` followed by an
+/// `open` before that round cannot make the deferred close name the freshly opened (live) port.
+///
+/// The evidence is the observable invariant a consumer depends on — a `Closed` always names a
+/// number that is *not* a live port — plus the re-open that had to take a different number.
+#[test]
+fn a_closed_notification_never_names_a_reused_port_number() {
+    let mut poller = poller();
+    let mut registry = PortRegistry::new();
+
+    let first = registry.open(&mut poller, fd_port()).expect("the port opens");
+    registry.close(&mut poller, first).expect("the port closes");
+
+    // Re-opening before the reporting round must NOT take the closed port's number.
+    let second = registry
+        .open(&mut poller, fd_port())
+        .expect("a second port opens");
+    assert_ne!(
+        second, first,
+        "an unreported close keeps its number out of circulation"
+    );
+    assert!(registry.contains(second));
+
+    let round = registry
+        .execute_port_tasks(&mut poller, DEFAULT_READINESS_RED_BUDGET)
+        .expect("the round runs");
+    let closed = match round.notifications.as_slice() {
+        [PortNotification::Closed { port }] => *port,
+        other => panic!("expected exactly one Closed notification, got {other:?}"),
+    };
+    assert_eq!(closed, first, "the notification names the port that closed");
+    assert!(
+        !registry.contains(closed),
+        "a Closed notification never names a live (reused) port"
+    );
+
+    // The round retired the number, so it is free for the next open — with no second report.
+    let reused = registry
+        .open(&mut poller, fd_port())
+        .expect("a third port opens");
+    assert_eq!(reused, first, "the reported close retired the number");
+    let later = registry
+        .execute_port_tasks(&mut poller, DEFAULT_READINESS_RED_BUDGET)
+        .expect("the round runs");
+    assert!(later.notifications.is_empty(), "the close is reported once");
+
+    registry.close(&mut poller, second).expect("closes");
+    registry.close(&mut poller, reused).expect("closes");
+}
