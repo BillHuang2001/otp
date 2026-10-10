@@ -328,9 +328,6 @@ fn args_source(args: &[Arg]) -> String {
 
 /// The pinned goldens are what this crate's registry renders.
 #[test]
-#[ignore = "fix (2) not implemented yet: `~x`/`~X` reject a non-byte prefix element \
-            with `badarg`; the oracle emits the integer elements of a deep character \
-            list verbatim. Un-ignored once `src/io.rs`'s `prefix_arg` walks the prefix."]
 fn the_pinned_goldens_match_the_registry() {
     let reg = default_registry();
     let atoms = seeded_atoms();
@@ -449,9 +446,6 @@ fn parse_codes_line(line: &str) -> String {
 /// Every pinned golden is the live oracle's own output. Skips loudly when no
 /// oracle is available.
 #[test]
-#[ignore = "fix (2) not implemented yet: `~x`/`~X` reject a non-byte prefix element \
-            with `badarg`; the oracle emits the integer elements of a deep character \
-            list verbatim. Un-ignored once `src/io.rs`'s `prefix_arg` walks the prefix."]
 fn the_pinned_goldens_match_the_live_oracle() {
     let Some(oracle) = resolve_oracle() else {
         eprintln!();
@@ -527,9 +521,6 @@ impl WriteCase {
 /// oracle's own stdout bytes — a `deep_char_list`-valid prefix element is its
 /// UTF-8 encoding.
 #[test]
-#[ignore = "fix (2) not implemented yet: `~x`/`~X` reject a non-byte prefix element \
-            with `badarg`; the oracle emits the integer elements of a deep character \
-            list verbatim. Un-ignored once `src/io.rs`'s `prefix_arg` walks the prefix."]
 fn the_write_path_matches_the_live_oracle() {
     const WRITE_CASES: &[WriteCase] = &[
         WriteCase { format: "~.16x", args: &[Arg::Small(255), Arg::Ints(&[256])] },

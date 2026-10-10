@@ -54,6 +54,18 @@
 //! implies — lowercase digits for `~+`, uppercase for `~#`), and the float
 //! directives `~e`/`~f`/`~g`.
 //!
+//! # `~x`/`~X`: the prefix, verbatim
+//!
+//! The `~x`/`~X` prefix is an atom's name or a **deep** character list
+//! (`io_lib:deep_char_list/1`): an integer element is emitted **verbatim** — it is
+//! not restricted to a byte, so `io_lib:format("~.16x",[255,[256]])` ⇒
+//! `[256,102,102]`. Only integers `0 =< C < 16#D800`, `16#DFFF < C < 16#FFFE` or
+//! `16#FFFF < C =< 16#10FFFF` are accepted (nested lists are walked); anything else
+//! — a negative, a surrogate, `16#FFFE`/`16#FFFF`, a value past `16#10FFFF`, a
+//! binary, an improper list, a non-list/non-atom prefix — is `badarg`. Each prefix
+//! integer counts as **one** character for the field width / truncation
+//! (`io_lib:chars_length/1`).
+//!
 //! # `~c`/`~tc`: the code point, verbatim
 //!
 //! `io_lib_format:control_small($c,…)` has two clauses: `~tc` renders the integer
@@ -152,7 +164,7 @@ use beam_common::Result;
 use beam_term::{atom_val, signed_value, Eterm};
 
 use crate::access::{
-    float_value, is_atom, is_big, is_float, is_small, is_tuple, tuple_element, tuple_size,
+    float_value, is_atom, is_big, is_float, is_list, is_small, is_tuple, tuple_element, tuple_size,
 };
 use crate::arith::int_from_mag;
 use crate::bits;
@@ -719,7 +731,7 @@ fn dispatch(
             Ok(Piece::small(radix_chunk(
                 arg,
                 base,
-                "",
+                Chunk::List(Vec::new()),
                 ctrl == b'B',
                 spec,
             )?))
@@ -731,7 +743,7 @@ fn dispatch(
             Ok(Piece::small(radix_chunk(
                 arg,
                 base,
-                &prefix,
+                prefix,
                 ctrl == b'X',
                 spec,
             )?))
@@ -744,7 +756,7 @@ fn dispatch(
             Ok(Piece::small(radix_chunk(
                 arg,
                 base,
-                &format!("{base}#"),
+                radix_prefix(base),
                 ctrl == b'#',
                 spec,
             )?))
@@ -795,12 +807,61 @@ fn take_float(args: &[Eterm], next_arg: &mut usize) -> Result<f64> {
     Ok(float_value(arg))
 }
 
-/// `io_lib_format:prefixed_integer`'s prefix: an atom's name or a character list.
-fn prefix_arg(ctx: &BifContext<'_>, arg: Eterm) -> Result<String> {
+/// `io_lib_format:prefixed_integer`'s prefix: an atom's name or a **deep**
+/// character list.
+///
+/// The oracle's non-atom clause is guarded by
+/// `true = io_lib:deep_char_list(Prefix)` and then passes `Prefix` through
+/// **unmapped** (`prefixed_integer` builds `term([Prefix|S], …)`), so a prefix
+/// element is emitted **verbatim** — not restricted to a byte. `deep_char_list/1`
+/// (`../../lib/stdlib/src/io_lib.erl`) accepts an integer `0 =< C < 16#D800`,
+/// `16#DFFF < C < 16#FFFE` or `16#FFFF < C =< 16#10FFFF`, recursing into nested
+/// lists, and `false` for everything else. Each accepted integer becomes a raw
+/// [`Chunk::Int`] so it is materialized as itself and counted as **one** character
+/// by [`Chunk::flat_len`] (`io_lib:chars_length/1`).
+///
+/// # Errors
+///
+/// `badarg` for a non-atom/non-list prefix, an improper list, a non-integer
+/// element, or an integer outside the ranges above
+/// (`io_lib:format("~.16x",[255,[65535]])` ⇒ `error:badarg`).
+fn prefix_arg(ctx: &BifContext<'_>, arg: Eterm) -> Result<Chunk> {
     if is_atom(arg) {
-        return Ok(ctx.atoms().name(atom_val(arg)).ok_or_else(badarg)?.to_string());
+        let name = ctx.atoms().name(atom_val(arg)).ok_or_else(badarg)?;
+        return Ok(Chunk::text(name));
     }
-    byte_string(&proper_list(arg).ok_or_else(badarg)?)
+    let mut out = Vec::new();
+    push_prefix_elements(arg, &mut out)?;
+    Ok(Chunk::List(out))
+}
+
+/// `io_lib:deep_char_list/1` over a term, appending one [`Chunk::Int`] per accepted
+/// integer element (recursing into nested lists).
+fn push_prefix_elements(term: Eterm, out: &mut Vec<Chunk>) -> Result<()> {
+    let elems = proper_list(term).ok_or_else(badarg)?;
+    for elem in elems {
+        if is_list(elem) {
+            push_prefix_elements(elem, out)?;
+        } else if is_deep_char(elem) {
+            out.push(Chunk::Int(elem));
+        } else {
+            return Err(badarg());
+        }
+    }
+    Ok(())
+}
+
+/// `io_lib:deep_char_list/1`'s per-element range test: `0 =< C < 16#D800`,
+/// `16#DFFF < C < 16#FFFE` or `16#FFFF < C =< 16#10FFFF`. A bignum is never in
+/// range (its magnitude is at least `2^59`).
+fn is_deep_char(term: Eterm) -> bool {
+    if !is_small(term) {
+        return false;
+    }
+    let value = signed_value(term);
+    (0..0xD800).contains(&value)
+        || (0xE000..0xFFFE).contains(&value)
+        || (0x10000..=0x10FFFF).contains(&value)
 }
 
 /// Renders the `~s` argument: an atom's name, a proper list of byte-sized small
@@ -979,31 +1040,47 @@ fn newline_chunk(spec: &Spec) -> Result<Chunk> {
 ///
 /// The sign is emitted **before** the prefix
 /// (`io_lib:format("~.16#",[-255])` ⇒ `"-16#FF"`); the prefix itself is never
-/// case-folded, only the digits are.
-fn radix_chunk(value: Eterm, base: usize, prefix: &str, upper: bool, spec: &Spec) -> Result<Chunk> {
+/// case-folded, only the digits are. `prefix` is the directive's own prefix as a
+/// chunk: empty for `~b`/`~B` and the literal `Base#` for `~+`/`~#` (see
+/// [`radix_prefix`]), or the caller's `(Integer, Prefix)` argument for `~x`/`~X`
+/// (see [`prefix_arg`]) — which is emitted verbatim, so a raw [`Chunk::Int`]
+/// prefix element survives with [`Chunk::flat_len`] counting it as one character.
+fn radix_chunk(value: Eterm, base: usize, prefix: Chunk, upper: bool, spec: &Spec) -> Result<Chunk> {
     if !(2..=36).contains(&base) {
+        return Err(badarg());
+    }
+    if !is_small(value) && !is_big(value) {
         return Err(badarg());
     }
     let digits = integer_digits(value, base as u32)?;
     let (sign, magnitude) = match digits.strip_prefix('-') {
-        Some(rest) => ("-", rest),
-        None => ("", digits.as_str()),
+        Some(rest) => (true, rest),
+        None => (false, digits.as_str()),
     };
-    let mut text = String::with_capacity(sign.len() + prefix.len() + magnitude.len());
-    text.push_str(sign);
-    text.push_str(prefix);
-    if upper {
-        text.push_str(magnitude);
+    let magnitude = if upper {
+        magnitude.to_owned()
     } else {
-        text.push_str(&magnitude.to_ascii_lowercase());
+        magnitude.to_ascii_lowercase()
+    };
+    let mut items = Vec::with_capacity(3);
+    if sign {
+        items.push(Chunk::Char('-'));
     }
+    items.push(prefix);
+    items.push(Chunk::text(&magnitude));
     Ok(field_chunk(
-        Chunk::text(&text),
+        Chunk::List(items),
         spec.width,
         spec.left,
         None,
         spec.pad,
     ))
+}
+
+/// The `Base#` prefix the `~+`/`~#` forms imply
+/// (`io_lib_format:control_small($+…)`).
+fn radix_prefix(base: usize) -> Chunk {
+    Chunk::text(&format!("{base}#"))
 }
 
 /// `fwrite_e`/`float_e` — a float in scientific notation with `p` significands
