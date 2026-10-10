@@ -286,6 +286,7 @@ mod tests {
             "z",
             "$1",
             "$2",
+            "$_",
             "$end_of_table",
         ]);
         atoms
@@ -368,12 +369,16 @@ mod tests {
         ctx.list(&[clause]).expect("fits")
     }
 
-    /// `[{{z}, [], [true]}]` — a spec whose head matches no 2-tuple object.
+    /// `[{{z}, [], ['$_']}]` — a spec whose head matches no 2-tuple object.
+    ///
+    /// The body is the **key-preserving** `'$_'`, which `ets:select_replace/2`
+    /// accepts (the oracle: `ets:select_replace(T, [{z, [], ['$_']}])` ⇒ `0`)
+    /// whereas a body of the bare atom `true` is `error:badarg`.
     fn no_match_spec(ctx: &mut BifContext<'_>) -> Eterm {
         let z = ctx.atom("z").expect("seeded");
         let head = ctx.tuple(&[z]).expect("fits");
         let guards = ctx.list(&[]).expect("fits");
-        let body = ctx.list(&[ctx.atom("true").expect("seeded")]).expect("fits");
+        let body = ctx.list(&[ctx.atom("$_").expect("seeded")]).expect("fits");
         let clause = ctx.tuple(&[head, guards, body]).expect("fits");
         ctx.list(&[clause]).expect("fits")
     }

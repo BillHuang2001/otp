@@ -76,7 +76,7 @@
 //! * the ownership verbs `ets:give_away/3` and `ets:setopts/2` live in
 //!   [`super::adopt`].
 //!
-//! The genuine remaining gaps are:
+//! The two remaining keys are genuine typed gaps:
 //!
 //! * **`ets:slot/2`** — returns the objects of an internal tree node / hash bucket
 //!   slot; the contract pins the *interior layout*, which the crate contract
@@ -88,11 +88,10 @@
 //!   send messages, and a single reply would leave that `receive` **blocked
 //!   forever** — so it stays a typed gap. (`ets:all/0` itself is served directly in
 //!   [`super::adopt`].)
-//! * **`ets:setopts/2`'s `{protection, _}` sub-option** — `beam_ets::Table` has no
-//!   access setter, so that single sub-option is the typed `unsupported_bif` gap.
 //!
-//! `ets:slot/2` and `ets:internal_request_all/0` are registered through the
-//! `RuntimeHooks` stub in `src/runtime/other.rs`.
+//! Both are registered through the `RuntimeHooks` stub in `src/runtime/other.rs`.
+//! `ets:setopts/2`'s `{protection, P}` sub-option is **not** a gap: [`super::adopt`]
+//! applies it through the owner-gated `Table::setopts(Some(owner), SetOpt::Access(P))`.
 //!
 //! `ets:fun2ms/1` and `ets:repair_continuation/2` are **not** `bif.tab` entries:
 //! they are pure `stdlib/src/ets.erl` functions (a `parse_transform` helper and a
