@@ -46,6 +46,17 @@ map for the source subtree and the notes the child nodes inherit.
   `with_local_node`, and its `decode_term_bif` still calls `decode_term`, so the demotion
   is inert end-to-end until a host installs the identity.
 
+## Known Issues
+- **A foreign local reference can exceed the M1 id space.** The packed id is 18+14+32
+  bits (`ref_wire`), but the frozen M1 internal-reference thing stores it in one 60-bit
+  small, so only ids `< 2^59` are representable. A reference **this** runtime produced
+  always fits and round-trips exactly; an arbitrary *oracle* `make_ref()` carries a
+  nonzero scheduler `thr_id` in `num[1]` bits 0..15 (dropped by the `REF1_NUM_MASK`
+  unpack) and a 30-bit `num[1]` field, so its packed id can exceed the small range —
+  decoding one with an identity installed yields a typed `SystemLimit` (never a wrong
+  ref), and even a smaller one cannot re-encode byte-exactly (the `thr_id` bits are
+  gone). This is a documented, honest limitation, not a bug.
+
 ## Routing Table
 - `lib.rs` → crate wiring, root re-exports, the single `#[allow(unsafe_code)] mod term;`
 - `ref_wire.rs` → internal-reference `id` ↔ wire-number mapping (`REF_MASK`/`REF1_NUM_MASK`, pack/unpack)
