@@ -80,7 +80,11 @@ Honors the crate-layer root-set contract: `x_reg_array[0..Live)` **plus the whol
     the nursery to the smallest curated size covering `need_words`; a fail-fast typed `AllocKind::Heap`
     when the policy's ceiling makes the request unreachable). Both route through one shared
     `run_rooted_collection` helper that writes every root region back even when the collection action
-    returned `Err` (see Design Decisions).
+    returned `Err` (see Design Decisions), re-installing each queued message around its relocated
+    payload through `Message::with_payload`, so the message keeps its **whole envelope** — `from`,
+    `token`, off-heap handles, refc binaries, node entries and (for an oversized payload that lives
+    *in* them, not in the nursery) its `Fragments` chain — see `mailbox`. A fragment-resident payload
+    is outside every evacuated range, so the collector leaves it in place.
   - **relocation exemption:** `set_relocation_exempt(&mut self, exempt: bool)` /
     `is_relocation_exempt(&self) -> bool` (default `false`) — a per-`Process` flag a host sets when it
     holds live terms from this process's young heap in Rust locals / nested-`Machine` registers that are
