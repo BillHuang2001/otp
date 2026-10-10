@@ -527,7 +527,9 @@ silently-accepted wrong value:
   can never pass for a structural reason.
 - **`tests/real_modules.rs`:** the broad real-OTP LOAD sweep. The `lib` root is discovered
   generically — `$ERTS_LIB_DIR` when set, else `erl -noshell -eval 'io:format("~s",[code:lib_dir()])'`
-  (no hardcoded app names) — then every `.beam` under it is collected recursively (each versioned app
+  (no hardcoded app names; the discovery helpers `otp_lib_dir`/`lib_sweep`/`app_ebin`/`has_beams`/
+  `skip_reason`/`rel_label` live in `tests/common/mod.rs` and are shared with `tests/generic_census.rs`)
+  — then every `.beam` under it is collected recursively (each versioned app
   dir's `ebin`, plus doc/examples & `proper_ext`). On this install that is **34 applications / 1366
   modules**; every one is loaded through the public pipeline and must load (zero failures tolerated: any
   parse failure fails the test, and each is printed by relative path with its exact typed error), plus
@@ -545,9 +547,11 @@ silently-accepted wrong value:
   loud skip without OTP), and hand-built malformed-`Recs` images rejected with `BeamError::BadArg` through
   the whole `load` pipeline — each next to a well-formed **control** image (same `AtU8`/`Code`, only the
   `Recs` payload varying) that genuinely loads, so the negative cases cannot pass for a structural reason.
-- **`tests/generic_census.rs`:** the residual `Instr::Generic` census over every installed
-  stdlib/kernel/compiler `.beam` — asserts the unmodelled-opcode set equals the documented baseline, so a
-  newly-emitted unmodelled opcode fails the test; loud skip when `erl`/OTP is absent.
+- **`tests/generic_census.rs`:** the residual `Instr::Generic` census over every `.beam` of the whole
+  installed OTP `lib` root (all 34 apps / ≈1366 modules — the same generic, `code:lib_dir()`-based
+  recursive discovery as `tests/real_modules.rs`, shared via `tests/common/mod.rs`) — asserts the
+  unmodelled-opcode set equals the documented baseline (currently empty), so a newly-emitted unmodelled
+  opcode fails the test; loud skip when `erl`/OTP is absent.
 - **`tests/line_info.rs`:** `linecov.beam` carries a typed `Instr::ExecutableLine` and `dbgline.beam` a
   typed `Instr::DebugLine` (neither on `Generic`); asserts the `Line` table and every function's
   `Instr::FuncInfo` are preserved (the runtime needs `current_location`/stack traces).
@@ -599,9 +603,9 @@ silently-accepted wrong value:
   `-`-prefixed obsolete/transform-only entries the compiler never emits (`is_constant/2`, `make_fun2/1`,
   `allocate_zero/2`, the legacy `bs_*` forms, …); the 60th is **`set_tuple_element/3` (opcode 67)** — a
   non-obsolete `genop.tab` entry that is also never emitted (the compiler emits `put_tuple2`). The
-  compiler emits none of the 60, so the observed residual census over the installed stdlib/kernel/compiler
-  modules is **empty** (`tests/generic_census.rs` pins it); it is a deliberate, lossless gap — never a
-  wrong result.
+  compiler emits none of the 60, so the observed residual census over the whole installed OTP `lib` root
+  (all 34 apps / ≈1366 modules) is **empty** (`tests/generic_census.rs` pins it); it is a deliberate,
+  lossless gap — never a wrong result.
 - **Previously-unexercised variants are now fixture-proven reachable (not merely claimed).** The on-PATH
   OTP-29 `erlc` DOES emit the native-record family: the committed `nr_def`/`nr_use` pair lowers 186-191
   typed. `executable_line` (183) / `debug_line` (184) are reachable via `+line_coverage` /`+beam_debug_info`
@@ -662,14 +666,14 @@ silently-accepted wrong value:
 - `tests/fixtures/README.md` → regeneration commands + the full wire summary
 - `tests/` → container/IR/widened-IR/records/negative/real-module integration tests
 - `tests/records.rs` → `Recs`-chunk integration tests: declaration order, every default encoding, name/atom lookups, the pinned-`ORACLE` ↔ live-`erl` `records:get_definition/2` cross-check (bounded), and malformed-image rejection through `load` beside a well-formed control image
-- `tests/generic_census.rs` → the residual `Instr::Generic` census over the installed OTP (asserts the unmodelled-opcode set equals the documented baseline)
-- `tests/real_modules.rs` → broad real-OTP `.beam` LOAD sweep over the whole `lib` root (all 34 apps / 1366 modules recursively; every discovered module must load; loud skip when `erl`/OTP is absent) + the nested fun-literal MFA check over `maps`/`gen_server`
+- `tests/generic_census.rs` → the residual `Instr::Generic` census over the whole installed OTP `lib` root (all 34 apps / ≈1366 modules, discovered via the shared `tests/common/mod.rs` helpers; asserts the unmodelled-opcode set equals the documented baseline)
+- `tests/real_modules.rs` → broad real-OTP `.beam` LOAD sweep over the whole `lib` root (all 34 apps / 1366 modules recursively, discovered via the shared `tests/common/mod.rs` helpers; every discovered module must load; loud skip when `erl`/OTP is absent) + the nested fun-literal MFA check over `maps`/`gen_server`
 - `tests/native_record.rs` → the OTP-29 native-record family (186-191) over the committed `nr_def`/`nr_use` fixtures + the `erl_eval` `is_any_native_record` positive control + a stdlib/kernel/compiler sweep asserting no family member lowers to `Instr::Generic`
 - `tests/line_info.rs` → typed `executable_line`/`debug_line` (the `linecov`/`dbgline` fixtures) + line-table/`func_info` preservation
 - `tests/bs_test_tail.rs` → typed `bs_test_tail2` over the `bstail` fixture
 - `tests/chunks.rs` → the whole-corpus chunk-id classification checker + the `Attr`/`CInf`/`Meta` oracle round-trip cross-check
 - `tests/literals.rs` → the two `LitT` framings (map-free literals byte-exact; map-bearing ones against the oracle) + the map-normalization pin + the whole-corpus literal round-trip/oracle sweep
-- `tests/common/mod.rs` → `tests/`-level test-support module (not a test target of its own): raw, non-normalizing ETF payload inspection (`raw_map_key_names`) used by `tests/literals.rs`
+- `tests/common/mod.rs` → `tests/`-level test-support module (not a test target of its own): the generic installed-OTP discovery shared by `tests/real_modules.rs` and `tests/generic_census.rs` (`otp_lib_dir`/`all_otp_beams`/`lib_sweep`/`app_ebin`/`has_beams`/`skip_reason`/`rel_label`), plus raw, non-normalizing ETF payload inspection (`raw_map_key_names`) used by `tests/literals.rs`
 - `tests/load_cost.rs` → the committed module-load-cost measurement (ns/instruction, bytes/second)
 - `tests/fixtures/{nr_def,nr_use,linecov,dbgline,bstail}.{erl,beam}` → native-record / line / test-tail oracle fixtures
 - `tests/fixtures/literals_fixture.erl` + `literals_{verbatim,compressed}.beam` + `literals_oracle.escript` → the `LitT` framing fixtures + the Erlang-side literal oracle (`<otp-lib-root>` walk mode / `--reencode <beam-file>` mode)
