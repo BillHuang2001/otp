@@ -180,8 +180,8 @@
 //!   compares keys arithmetically (`erl_db_tree.c` `cmp_key_eq`, `CMP =
 //!   erts_cmp(a, b, 0, 0)`), so it interleaves integers and floats
 //!   (`-3 < -2.5 < 0 < 1.5 < 5`) and `1` and `1.0` are the *same* key.
-//!   `beam_ets` reproduces this (`compare::cmp_arith`), so
-//!   [`KNOWN_DIVERGENCES`] is empty and every case is compared strictly.
+//!   `beam_ets` reproduces this (`compare::cmp_arith`), so no key-ordering case
+//!   is a recorded divergence and every one is compared strictly.
 //! * **A replacing insert also replaces the stored key term**: inserting
 //!   `{1.0,b}` over `{1,a}` collapses to one object and makes `ets:first`/
 //!   `ets:last`/`ets:next` report the *last-inserted* key term (`1.0`, and `1` in

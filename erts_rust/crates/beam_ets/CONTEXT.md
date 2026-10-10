@@ -529,15 +529,16 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   cross-checks every newly-copyable boxed kind (hash map, each fun kind, external pid/port/ref, bitstring,
   refc binary) through `Table::insert`/`lookup` against the oracle's `phash2`.
 - **Differential evidence suite** (the compatibility gate): `tests/differential.rs` runs **157 cases**
-  (14 group files `tests/differential/battery/*.rs`, the embedded oracle program in
-  `erl_program.rs`) identically under the system `erl` (OTP 29.1.1 / erts-17.1) and under `beam_ets`,
-  comparing canonical renderings line-by-line — **every case agrees**. `KNOWN_DIVERGENCES` records the
-  2 match-spec-arithmetic cases, where `beam_ets` answers the typed `unsupported_ets` the corpus shows as
+  (13 case-group files under `tests/differential/battery/` plus the shared harness `battery/mod.rs`, the
+  embedded oracle program in `erl_program.rs`) identically under the system `erl` (OTP 29.1.1 / erts-17.1)
+  and under `beam_ets`, comparing canonical renderings line-by-line — **no case is a mismatch**: every
+  case agrees except the 2 recorded typed divergences. `KNOWN_DIVERGENCES` records those (the
+  match-spec-arithmetic cases), where `beam_ets` answers the typed `unsupported_ets` the corpus shows as
   a loud honest gap, never a wrong result. The oracle is **required by default** — a genuinely absent
   `erl` FAILS the cross-check rather than skipping it (`BEAM_ETS_ALLOW_NO_ORACLE=1` opts out with a loud
   skip; `BEAM_ETS_REQUIRE_ORACLE=1` forces the requirement).
-- **Gates:** `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_ets` is green
-  (0 failures across every test binary, including the 8 compile-fail doctests); `… --workspace` likewise.
+- **Gate (this crate):** `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_ets`
+  is green (0 failures across every test binary, including the 8 doctests — 5 of them `compile_fail`).
   Forced-oracle: `BEAM_ETS_REQUIRE_ORACLE=1 erts_rust/scripts/cargo.sh test
   --manifest-path erts_rust/Cargo.toml -p beam_ets --test differential`.
 
@@ -559,13 +560,12 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   remains host-side is the *rendering* — `TableInfo::write_concurrency` is still a `bool`, so the `auto`
   atom / the normalized `{debug_hash_fixed_number_of_locks, Nlocks}` tuple is supplied by the
   `beam_bifs` `TableProfile` sidecar. The stored `FixedLocks` count is the requested, un-normalized one.
-- **The owner-death transition's runtime caller indexes `named_table`s only.** `Table::owner_died` is
-  driven by `beam_rt::runtime::ets_owner::drain_ets_owner_exits` (over the `EtsExitObserver` installed
-  on the `ProcessTable`), and `beam_bifs`'s `ets:new/2` records the owner; the residual gap is that the
-  runtime's `OwnerIndex` is populated from the `named_table`s seen at `ets:new/2`, so a dead owner's
-  **unnamed** table is not reclaimed. The closing API,
-  `beam_bifs::TableRegistry::handles_owned_by` (which does cover unnamed tables), exists but is not yet
-  the runtime's index (`ETS_SURFACE.md` §7.4).
+- **The owner-death transition's runtime caller reclaims named and unnamed tables alike.** `Table::owner_died`
+  is driven by `beam_rt::runtime::ets_owner::drain_ets_owner_exits` (over the `EtsExitObserver` installed
+  on the `ProcessTable`), and `beam_bifs`'s `ets:new/2` records the owner. The set of tables a dead owner
+  owned is the `beam_bifs::TableRegistry::handles_owned_by` roster — **unnamed** tables included — with the
+  `OwnerIndex` recorded at `ets:new/2` unioned in for the one thing the roster cannot supply, the
+  **registered name** a `named_table`'s drop must release (`ETS_SURFACE.md` §7.4).
 - **`TableInfo::entries` renders `owner` as `undefined` and `id` as a small integer.** The crate's own
   15-field proplist has no pid/ref term; the observable `ets:info/1,2` bridge in `beam_bifs` substitutes
   the recorded owner pid and the tid reference, so the BIF output matches the oracle. `heir` is `none`
@@ -666,13 +666,6 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 - **`beam_bifs` — the `auto` / `{debug_hash_fixed_number_of_locks, Nlocks}` rendering stays host-side.**
   `TableInfo::write_concurrency` is a `bool`, so the `TableProfile` sidecar must supply the `auto` atom /
   the normalized lock count (`TableOptions` stores the *requested*, un-normalized count).
-- **`beam_bifs`/`beam_rt` — the runtime owner index is `named_table`-only.** The owner is recorded
-  (`ets:new/2` calls `Table::set_owner`), the access gate is enforced (`take_table_gated`), and the
-  process-exit hook exists (`beam_process::ProcessExitObserver`, driven by
-  `beam_rt::runtime::ets_owner::drain_ets_owner_exits` → `Table::owner_died`); the residual is that the
-  runtime's `OwnerIndex` is built from the `named_table`s seen at `ets:new/2`, so a dead owner's **unnamed**
-  table is not reclaimed. `beam_bifs::TableRegistry::handles_owned_by` (which covers unnamed tables) exists
-  but is not yet the runtime's index (`ETS_SURFACE.md` §7.4).
 
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
@@ -681,7 +674,8 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 - `src/store/mod.rs` → `TermStore` (table-owned arena + copy/free/relinquish/reuse) — the copy boundary
 - `src/store/tests.rs` → the `TermStore` unit-test module
 - `src/table/mod.rs` → `Table`/`TableId`/`OwnerId`, constructors, metadata/ownership accessors (incl. the live `access` field + `set_access`), write ops, access checks, `select_all`, module wiring
-- `src/table/tests.rs` → the table-level unit tests (write ops, metadata, access/protection, ownership/heir, counters, the store-accounting cases)- `src/table/read.rs` → the read/navigation `impl Table` (incl. `is_named_table`)
+- `src/table/tests.rs` → the table-level unit tests (write ops, metadata, access/protection, ownership/heir, counters, the store-accounting cases)
+- `src/table/read.rs` → the read/navigation `impl Table` (incl. `is_named_table`)
 - `src/table/rename.rs` → `Table::rename` + `RenameOutcome` (`ets:rename/2` semantics)
 - `src/table/shared.rs` → `SharedTable` (the locked handle) + its unit tests
 - `src/table/view/mod.rs`, `view/read.rs`, `view/write.rs`, `view/term.rs`, `view/iter.rs` → the guard-scoped `TableRead`/`TableWrite`/`TableTerm` views (the aliasing defence, incl. `TableWrite::set_access`) + the view-borrowed traversal API (iterators / `foldl` / `foldr` / `tab2list_into`)
@@ -697,12 +691,13 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 - `src/interior_parity.rs` → cross-interior equivalence + default-selection tests (`#[cfg(test)]`)
 - `src/interior_bench.rs` → the interior microbenchmarks (`#[cfg(test)]`)
 - `src/ordered_interior/{mod,sorted,node,tree,iter}.rs` → the B+-tree `ordered_set` interior (conditional separator refresh via `InsertStep`, single-descent `insert_new`), the sorted-`Vec` alternative, the node arena, the tree ops, the iterator
-- `src/ordered_interior/tests.rs` → the ordered-interior unit tests (B+-tree invariants, the sorted-`Vec` interior, the `cmp_arith` key-order cases)- `src/select/{mod,pattern,expr,exec,run,continuation}.rs` → the match-spec compiler, executor, runner and continuations (`MatchContinuation` carries the table id + registered name + spec + direction + position)
+- `src/ordered_interior/tests.rs` → the ordered-interior unit tests (B+-tree invariants, the sorted-`Vec` interior, the `cmp_arith` key-order cases)
+- `src/select/{mod,pattern,expr,exec,run,continuation}.rs` → the match-spec compiler, executor, runner and continuations (`MatchContinuation` carries the table id + registered name + spec + direction + position)
 - `src/info.rs` → `TableInfo` + `entries` (the 15-field `ets:info` pairs)
 - `src/error.rs` → `badarg`/`unsupported` failure constructors
 - `tests/common/mod.rs` → shared integration-test helpers; `tests/common/oracle.rs` → the live-`erl` plumbing
-- `tests/ets_*.rs` → public-API integration tests by concern (basic/order/select/bag/info/nav/access/set_access/update/replace/continuation/continuation_direction/ownership/fixtable/shared/options/rename/reclamation/concurrency), plus `tests/select.rs` and `tests/match_spec_run.rs`
-- `tests/differential.rs` + `tests/differential/{battery/*,erl_program.rs}` → the differential evidence suite vs the system `erl` (157 cases, 14 battery groups)
+- `tests/ets_*.rs` → public-API integration tests by concern (basic/order/select/bag/info/nav/access/set_access/update/replace/continuation/continuation_direction/ownership/fixtable/shared/options/rename/reclamation/concurrency/store_terms), plus `tests/select.rs` and `tests/match_spec_run.rs`
+- `tests/differential.rs` + `tests/differential/{battery/*,erl_program.rs}` → the differential evidence suite vs the system `erl` (157 cases, 13 battery groups)
 - `ETS_SURFACE.md` → the `ets:*` coverage census + the oracle-probed semantic facts + the runtime-level gaps and the exact API each needs
 - `../../erts/emulator/beam/erl_db.c` / `erl_db_hash.c` / `erl_db_tree.c` / `erl_db_util.c` / `erl_db*.h` → the API, interiors, key/match handling and flags being mirrored (read-only)
 
