@@ -122,6 +122,12 @@ pub fn vector_fixture_source() -> PathBuf {
     fixture_dir().join("vector_driver.c")
 }
 
+/// The committed `outputv`+`output`+`ready_output` fixture (`host_driver_both.c`): `host_driver.c`
+/// with the entry's `outputv` slot set to `host_outputv`, so all three write-side callbacks are
+/// declared at once (the C's `outputv`-over-`output` preference, `io.c:1782`).
+pub fn both_fixture_source() -> PathBuf {
+    fixture_dir().join("host_driver_both.c")
+}
 /// Compile the fixture into a loadable `.so`, or print a loud `SKIP:` and answer `None` when the
 /// toolchain is unavailable (never a silent pass, never a failure for a missing toolchain).
 pub fn fixture_so() -> Option<PathBuf> {
@@ -153,6 +159,10 @@ pub fn vector_fixture_so() -> Option<PathBuf> {
     compile_fixture(&vector_fixture_source(), "vector_driver")
 }
 
+/// The same for the both-write-callbacks fixture (`host_driver_both.c`).
+pub fn both_fixture_so() -> Option<PathBuf> {
+    compile_fixture(&both_fixture_source(), "host_driver_both")
+}
 /// Compile `src` into `<scratch>/<stem>.so`, skipping loudly when `cc`/`erl_driver.h` are absent.
 fn compile_fixture(src: &Path, stem: &str) -> Option<PathBuf> {
     let Some(include) = erl_include_dir() else {

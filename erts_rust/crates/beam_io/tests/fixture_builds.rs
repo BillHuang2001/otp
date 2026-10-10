@@ -26,8 +26,9 @@
 //! Its `driver_*` imports are left **undefined** by the linker, exactly like a real OTP driver, so
 //! they can only be resolved out of the *loading process*'s dynamic symbol table. The
 //! `ready_async`-less variant (`host_driver_no_ready_async.c`), the `process_exit`-less variant
-//! (`host_driver_no_process_exit.c`) and the `outputv`-only sibling (`vector_driver.c`) are the same
-//! kind of object with a different callback shape. This test does two things for each of them:
+//! (`host_driver_no_process_exit.c`), the `outputv`-only sibling (`vector_driver.c`) and the
+//! `outputv`+`output`+`ready_output` sibling (`host_driver_both.c`) are the same kind of object with
+//! a different callback shape. This test does two things for each of them:
 //!
 //! 1. compiles the fixture with the system `cc` against the system `erl_driver.h` and asserts a
 //!    shared object was produced (the fixture must stay buildable — a broken fixture is a hard
@@ -78,6 +79,14 @@ fn vector_fixture_source() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/vector_driver.c")
 }
 
+/// The committed `outputv`+`output`+`ready_output` fixture (`host_driver_both.c`): `host_driver.c`
+/// with the entry's `outputv` slot set to the vector callback (`host_outputv`), so an entry that
+/// declares all three write-side slots at once exists — the shape the C's `outputv`-over-`output`
+/// preference (`io.c:1782`) is about. Its entry keeps `host_driver.c`'s `driver_name`, so it is
+/// loaded under `"host_driver"`.
+fn both_fixture_source() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/host_driver_both.c")
+}
 /// Force the `#[no_mangle]` `driver_*` host symbols into this test binary's **dynamic** symbol
 /// table (see `tests/abi_driver.rs`, which carries the long explanation).
 ///
@@ -174,6 +183,16 @@ fn host_driver_no_process_exit_variant_builds_and_loads() {
         "host_driver_no_process_exit",
         "host_driver",
     );
+}
+
+/// The same for the both-write-callbacks fixture (`host_driver_both.c`): `host_driver.c` with the
+/// entry's `outputv` slot set, so an entry declaring `outputv` **and** `output` **and**
+/// `ready_output` at once exists. It must stay buildable and loadable, so
+/// `tests/abi_driver.rs`'s both-callbacks preference test can rely on it. Its entry keeps the
+/// `driver_name` of the fixture it `#include`s, so it is loaded under `"host_driver"`.
+#[test]
+fn host_driver_both_variant_builds_and_loads() {
+    build_and_load(both_fixture_source(), "host_driver_both", "host_driver");
 }
 
 /// The include-directory helper must return a directory that really holds the driver header (the
