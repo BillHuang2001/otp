@@ -40,6 +40,7 @@ group's `try_inline_*`; **`Ok(false)` means "lowered nothing"** and the arm then
 | Arity switch | `SelectTupleArity` | `aggregate.rs::try_inline_select_tuple_arity` | `aggregate.rs::select_tuple_arity_plan` |
 | Cons readers | `GetList`,`GetHd`,`GetTl` | `aggregate.rs::try_inline_get_{list,hd,tl}` via `emit_list_read` | `get_{list,hd,tl}_shape` -> `shape` |
 | Tuple read | `GetTupleElement` | `aggregate.rs::try_inline_get_tuple_element` via `emit_tuple_read` | `get_tuple_element_shape` |
+| Tuple write | `SetTupleElement` | `aggregate.rs::try_inline_set_tuple_element` via `emit_tuple_write` | `set_tuple_element_shape` |
 | Arithmetic gc_bif | `GcBif` (`+`/`-`/`*`) | `arith.rs::try_inline_gc_bif` | `arith.rs::fast_arith` |
 | Comparisons | `Bif` (and `GcBif` fallback) | `compare.rs::try_inline_comparison` | `compare.rs::comparison_shape` |
 | Jump | `Jump` | `link.rs::Linker::emit_exit` | resolved label -> linked or return-to-driver |
@@ -75,6 +76,15 @@ Note `GcBif` tries arith **then** comparison; `Bif` tries only comparison
   the guard is `is_list` / `is_tuple` and can only ever *reject* (a non-cons/non-tuple source, or an
   out-of-range element, branches to the helper, whose interpreter step raises the exact
   `{badmatch,Source}` or the typed `unsupported`). An arity-switch plan on a non-tuple deopts the same way.
+- **Tuple writer** (`aggregate.rs::set_tuple_element_shape`): the **target tuple** must be an in-bound
+  x-register, the **element** must be an immediate constant word (`operands.rs::constant_word`) or an
+  in-bound x-register — a value needing heap materialisation (a bignum/float/literal operand) is *not*
+  a lowered shape and deopts to the interpreter, which materialises it exactly. The lowering is the same
+  `is_tuple` header guard the reads use plus a range guard (`offset < arity`) and a **literal-area**
+  guard: the interpreter refuses a `TAG_LITERAL_PTR` target with a typed `unsupported` (writing shared
+  module constants would corrupt them), so the emitted guard rejects that bit too, branching to the
+  helper. The store writes the word `8*(1+offset)` past the header — the exact word
+  `get_tuple_element` reads — straight through scratch (no write barrier, no cached-register clobber).
 - **arith** (`arith.rs::fast_arith`): only `erlang` `+`/`-`/`*` at arity 2, `args.len() == 2`, in-bound
   x destination, every operand loadable (in-bound x or small-int constant).
 - **compare** (`compare.rs::comparison_shape`): only the eight `erlang` comparison ops at arity 2; both
@@ -156,7 +166,8 @@ out-of-bound register is never counted. Every non-selected register is read/writ
 - `arith.rs` -> `SmallArith`, `fast_arith`, `import_names`, `try_inline_gc_bif` (+ the small-int constants).
 - `compare.rs` -> `ComparisonOp`, `comparison_shape`, `cmp_operand`, `comparison_guard`, `try_inline_comparison`.
 - `aggregate.rs` -> `ListShape`/`get_*_shape`/`emit_list_read`, `TupleReadShape`/`get_tuple_element_shape`/
-  `emit_tuple_read`, `AritySwitchPlan`/`select_tuple_arity_plan`/`try_inline_select_tuple_arity`,
+  `emit_tuple_read`, `TupleWriteShape`/`TupleWriteValue`/`set_tuple_element_shape`/`emit_tuple_write`/
+  `try_inline_set_tuple_element`, `AritySwitchPlan`/`select_tuple_arity_plan`/`try_inline_select_tuple_arity`,
   `emit_tuple_header_guard`.
 - `link.rs` -> `Linker` (`is_compiled`, `emit_exit`, `emit_tail_exit`), `emit_frame_teardown`, and the
   byte-level linker unit tests (the only tests in this node).

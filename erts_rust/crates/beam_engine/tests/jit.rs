@@ -2460,3 +2460,213 @@ fn the_arity_switch_is_inlined_and_caches_its_registers() {
     assert_eq!(compiled.cached_registers(), &[0u32, 1]);
     assert_eq!(compiled.highest_native_register(), Some(1));
 }
+
+// ---------------------------------------------------------------------------
+// The tuple writer (`set_tuple_element`)
+// ---------------------------------------------------------------------------
+//
+// `set_tuple_element Element Tuple Offset` overwrites one element word of a tuple **in
+// place**. The tier inlines it behind the same `is_tuple` header guard the reads use
+// plus a range and literal-area guard; a target that is not a uniquely-owned tuple, an
+// out-of-range `offset` or a shared-literal-area term branches to the helper, whose
+// interpreter step raises the exact `{badmatch, Source}` (or reports the typed
+// `unsupported`). Every fixture interns `badmatch` for the same reason the read fixtures
+// do.
+
+/// `read/1` — build `{1, 1, 1}`, destructively overwrite one element, then read the
+/// overwritten element back and return it:
+///
+/// ```text
+///   put_tuple2 x1 {1, 1, 1}
+///   set_tuple_element <element> x1 <offset>
+///   get_tuple_element x1 <offset> x0
+///   return
+/// ```
+///
+/// The tuple is built **inside** the module (never passed in) so each tier run mutates
+/// its own copy, and the returned element pins the store.
+fn tuple_write_module(element: Operand, offset: u32) -> Module {
+    arity_module("tuple_write", "read", 1, &[], |module| {
+        module.atom_table.intern("badmatch");
+        vec![
+            Instr::Label(Label(1)),
+            Instr::PutTuple2 {
+                dst: Operand::X(1),
+                elements: vec![Operand::Integer(1), Operand::Integer(1), Operand::Integer(1)],
+            },
+            Instr::SetTupleElement {
+                element,
+                tuple: Operand::X(1),
+                offset,
+            },
+            Instr::GetTupleElement {
+                source: Operand::X(1),
+                element: offset,
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ]
+    })
+}
+
+/// `read/2` — `set_tuple_element <element> x1 <offset>`, the target tuple arriving as
+/// the **second argument** (so a rejected target is the caller's own term, and the
+/// `{badmatch, Source}` reason can be built in the caller's heap for comparison):
+///
+/// ```text
+///   set_tuple_element <element> x1 <offset>
+///   get_tuple_element x1 <offset> x0
+///   return
+/// ```
+fn tuple_write_arg_module(element: Operand, offset: u32) -> Module {
+    arity_module("tuple_write_arg", "read", 2, &[], |module| {
+        module.atom_table.intern("badmatch");
+        vec![
+            Instr::Label(Label(1)),
+            Instr::SetTupleElement {
+                element,
+                tuple: Operand::X(1),
+                offset,
+            },
+            Instr::GetTupleElement {
+                source: Operand::X(1),
+                element: offset,
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ]
+    })
+}
+
+/// `read/2` — a lone `set_tuple_element x0 x1 0`: the only instruction of the block the
+/// tier can lower natively, so the registers it caches are evidence the write was
+/// inlined (a deopted instruction contributes no native touch at all).
+///
+/// ```text
+///   set_tuple_element x0 x1 0
+///   return
+/// ```
+fn tuple_write_only_module() -> Module {
+    arity_module("tuple_write_only", "read", 2, &[], |_| {
+        vec![
+            Instr::Label(Label(1)),
+            Instr::SetTupleElement {
+                element: Operand::X(0),
+                tuple: Operand::X(1),
+                offset: 0,
+            },
+            Instr::Return,
+        ]
+    })
+}
+
+#[test]
+fn tuple_writes_match_the_interpreter_on_real_tuples() {
+    // Every offset of the built 3-tuple, with an **immediate** element operand (the
+    // inlined path stores the constant word directly).
+    for offset in 0u32..3 {
+        let module = tuple_write_module(Operand::Integer(42), offset);
+        assert_eq!(
+            agree_module(&module, "read", 1, &[NIL])
+                .unwrap_or_else(|err| panic!("set_tuple_element 42 x1 {offset}: {err:?}")),
+            make_small(42),
+            "offset {offset} of a built 3-tuple"
+        );
+    }
+    // An **x-register** element operand — the argument itself.
+    let module = tuple_write_module(Operand::X(0), 1);
+    assert_eq!(
+        agree_module(&module, "read", 1, &[make_small(99)]).expect("register element"),
+        make_small(99)
+    );
+    // `NIL` is a constant immediate word too (not a pointer into a tuple).
+    let module = tuple_write_module(Operand::Nil, 2);
+    assert_eq!(
+        agree_module(&module, "read", 1, &[NIL]).expect("nil element"),
+        NIL
+    );
+}
+
+#[test]
+fn an_out_of_range_tuple_write_offset_deopts_and_agrees_with_the_interpreter() {
+    // The offset bound is the second half of the guard: an offset at/past the tuple's
+    // arity is rejected, and the helper raises the exact `{badmatch, Source}`.
+    let mut heap = Heap::new(64);
+    let empty = heap.tuple(&[]).expect("an arity-0 tuple");
+    let pair = heap
+        .tuple(&[make_small(1), make_small(2)])
+        .expect("a tuple term");
+
+    for (what, offset, source) in [
+        ("offset 0 of a 0-tuple", 0u32, empty),
+        ("offset 2 of a 2-tuple", 2, pair),
+        ("offset 9 of a 2-tuple", 9, pair),
+    ] {
+        let module = tuple_write_arg_module(Operand::Integer(7), offset);
+        let expected = heap
+            .tuple(&[make_atom(atom(&module, "badmatch")), source])
+            .expect("the expected {badmatch, Source} reason");
+        assert_badmatch_raise(&module, what, source, expected);
+    }
+}
+
+#[test]
+fn a_non_tuple_tuple_write_target_deopts_and_agrees_with_the_interpreter() {
+    // The other guard half: `NIL`, a small integer, an atom and a cons cell are not
+    // boxed arityvals, so the block deopts and the helper raises the exact
+    // `{badmatch, Source}`.
+    let mut heap = Heap::new(64);
+    let cons = heap.cons(make_small(1), NIL).expect("a cons cell");
+    let module = tuple_write_arg_module(Operand::Integer(7), 0);
+    let read = make_atom(atom(&module, "read"));
+
+    for source in [NIL, make_small(7), read, cons] {
+        let expected = heap
+            .tuple(&[make_atom(atom(&module, "badmatch")), source])
+            .expect("the expected {badmatch, Source} reason");
+        assert_badmatch_raise(&module, "non-tuple target", source, expected);
+    }
+}
+
+#[test]
+fn a_literal_area_tuple_write_target_deopts_and_agrees_with_the_interpreter() {
+    // A tuple in a shared literal area (the `TAG_LITERAL_PTR` bit on its boxed word) is
+    // **not** writable: the interpreter refuses it with the typed `unsupported` rather
+    // than corrupting a module's constants, and the tier's literal-area guard must
+    // reject the same term — else it would write shared storage and diverge.
+    let mut heap = Heap::new(64);
+    let triple = heap
+        .tuple(&[make_small(1), make_small(2), make_small(3)])
+        .expect("a tuple term");
+    let literal = beam_term::make_literal(triple);
+    assert!(beam_term::is_literal(literal), "the literal-area bit is set");
+
+    let module = tuple_write_arg_module(Operand::Integer(7), 1);
+    let agreed = agree_module(&module, "read", 2, &[NIL, literal]);
+    assert!(
+        matches!(agreed, Err(BeamError::Raise(_))),
+        "a literal-area target must be refused by both tiers, got {agreed:?}"
+    );
+    // Neither tier wrote: the tuple is byte-identical to a freshly built `{1, 2, 3}`.
+    let unchanged = heap
+        .tuple(&[make_small(1), make_small(2), make_small(3)])
+        .expect("the expected tuple");
+    assert!(
+        beam_term::eq(triple, unchanged, &module.atom_table),
+        "a refused write must leave the tuple untouched"
+    );
+}
+
+#[test]
+fn the_tuple_write_is_inlined_and_caches_its_registers() {
+    // Structural evidence that the tuple write is lowered natively: `x0` (the value) and
+    // `x1` (the target) are named by no other inlinable instruction of
+    // `tuple_write_only/2`, so they are resident only because the write was inlined. A
+    // deopted instruction contributes no native touch, which would leave the set empty.
+    let compiled = BaselineJit::new()
+        .compile(&tuple_write_only_module())
+        .expect("compile the set_tuple_element fixture");
+    assert_eq!(compiled.cached_registers(), &[0u32, 1]);
+    assert_eq!(compiled.highest_cached_register(), Some(1));
+    assert_eq!(compiled.highest_native_register(), Some(1));
+}
