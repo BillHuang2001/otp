@@ -101,10 +101,22 @@
 //! `1.0e5` ⇒ `"1.0e5"`, `0.1` ⇒ `"0.1"`, `1.0` ⇒ `"1.0"`. The domain is finite
 //! floats — OTP represents no `inf`/`NaN` (see [`format_float`]).
 //!
+//! # Atoms
+//!
+//! An atom is rendered by the oracle's `io_lib:write_atom_as_latin1/1` (the
+//! latin1 clause of `write1/4`, which `~w`, `~W`, `~p` and `~P` all take): bare
+//! when `io_lib:quote_atom/2` is false — the name is not an
+//! `erl_scan:reserved_word/1`, its first character is a lowercase letter
+//! (`a..z`, `ß..ÿ` except `÷`) and every character matches `name_char/1` (`a..z`,
+//! `ß..ÿ` except `÷`, `A..Z`, `À..Þ` except `×`, `0..9`, `_`, `@`) — and
+//! `'…'`-quoted with `io_lib:string_char(unicode_as_latin1, …)` escaping
+//! otherwise. So `héllo` is **bare** (`io_lib:format("~w",['héllo'])` ⇒
+//! `[104,233,108,108,111]`), `and`/`Hello`/`_foo`/`a b`/`a÷b` are quoted, a
+//! control character is an octal/`\n`/`\t`/… escape, `16#7F` is `\d`, and a
+//! character above `16#FF` is `\x{H}`. See [`format_atom`].
+//!
 //! # Deviations from the oracle (documented)
 //!
-//! * **Quoted atoms are not re-escaped** (a `'` inside a name is printed verbatim)
-//!   — such atoms are not produced by Milestone-1.
 //! * **Non-byte-aligned bitstrings** render as the oracle's `<<X:L>>` (whole leading
 //!   bytes, then the trailing `L` bits as `Value:L`), e.g. `<<1:1>>`, `<<23:5>>`,
 //!   `<<0,1:1>>`. The `~p` printable-string rule never applies to them.
@@ -864,25 +876,144 @@ fn format_big_decimal(negative: bool, digits: &[u64]) -> String {
     out
 }
 
-/// Renders an atom name: bare when it matches `[a-z][A-Za-z0-9_@]*`, else quoted.
+/// Renders an atom name the way the oracle's atom leaf does — `~w`/`~p` take the
+/// latin1 clause of `io_lib:write1/4`, i.e. `io_lib:write_atom_as_latin1/1`:
+/// **bare** when [`is_bare_atom`] (the oracle's `io_lib:quote_atom/2` is `false`),
+/// otherwise wrapped in `'…'` with every character escaped by [`escape_atom_char`]
+/// (`io_lib:string_char(unicode_as_latin1, …)`).
+///
+/// So `héllo` renders bare (`io_lib:format("~w",['héllo'])` ⇒
+/// `[104,233,108,108,111]`), while `_foo`/`Hello`/`a b`/`and`/a control character/
+/// `16#7F`/`16#80..16#9F`/`a÷b` are quoted, and a character above `16#FF` becomes
+/// the `\x{H}` escape inside the quotes (`Ā` ⇒ `'\x{100}'`).
 fn format_atom(name: &str) -> String {
     if is_bare_atom(name) {
-        name.to_string()
-    } else {
-        format!("'{name}'")
+        return name.to_string();
+    }
+    let mut out = String::with_capacity(name.len() + 2);
+    out.push('\'');
+    for c in name.chars() {
+        escape_atom_char(c, &mut out);
+    }
+    out.push('\'');
+    out
+}
+
+/// `io_lib:quote_atom/2` — whether the atom name needs **no** quotes.
+///
+/// The name must not be an Erlang reserved word ([`is_reserved_word`]), its
+/// **first** character must be a lowercase letter (`a..z`, or `ß..ÿ` except `÷`)
+/// and every character must satisfy the oracle's `name_char/1`: `a..z`, `ß..ÿ`
+/// except `÷`, `A..Z`, `À..Þ` except `×`, `0..9`, `_` or `@` (`io_lib.erl`).
+///
+/// This is **not** the `~p` printable-latin1 rule ([`latin1_printable_char`] /
+/// `io_lib:printable_latin1_list/1`), which is a different predicate: a space,
+/// `16#A0`, a leading digit or a leading uppercase letter are *printable* yet
+/// still force quotes here, while `héllo` (bare) and `a÷b` (quoted, `÷` is
+/// excluded) are rendered exactly as the oracle renders them.
+fn is_bare_atom(name: &str) -> bool {
+    if is_reserved_word(name) {
+        return false;
+    }
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if is_atom_name_initial(first) => chars.all(is_atom_name_char),
+        _ => false,
     }
 }
 
-/// Whether `name` is a bare atom name (`[a-z][A-Za-z0-9_@]*`).
-fn is_bare_atom(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    match bytes.first() {
-        Some(&first) if first.is_ascii_lowercase() => {}
-        _ => return false,
+/// `quote_atom/2`'s first-character clause: `a..z`, or `ß..ÿ` except `÷`.
+fn is_atom_name_initial(c: char) -> bool {
+    matches!(c, 'a'..='z') || (('\u{00DF}'..='\u{00FF}').contains(&c) && c != '\u{00F7}')
+}
+
+/// The oracle's `name_char/1`: `a..z`, `ß..ÿ` except `÷`, `A..Z`, `À..Þ` except
+/// `×`, `0..9`, `_` and `@`.
+fn is_atom_name_char(c: char) -> bool {
+    matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '@')
+        || (('\u{00DF}'..='\u{00FF}').contains(&c) && c != '\u{00F7}')
+        || (('\u{00C0}'..='\u{00DE}').contains(&c) && c != '\u{00D7}')
+}
+
+/// `erl_scan:reserved_word/1` — the fixed reserved words of `erl_scan.erl` plus
+/// the `erl_features:keywords/0` set of the default feature configuration
+/// (`maybe`/`else`; the `maybe_expr` feature is on by default in erts-17.1, so a
+/// default oracle quotes both). A reserved word is always quoted, e.g.
+/// `io_lib:format("~w",['and'])` ⇒ `"'and'"` while `'rec'`/`'query'` stay bare.
+fn is_reserved_word(name: &str) -> bool {
+    matches!(
+        name,
+        "after"
+            | "begin"
+            | "case"
+            | "try"
+            | "cond"
+            | "catch"
+            | "andalso"
+            | "orelse"
+            | "end"
+            | "fun"
+            | "if"
+            | "let"
+            | "of"
+            | "receive"
+            | "when"
+            | "bnot"
+            | "not"
+            | "div"
+            | "rem"
+            | "band"
+            | "and"
+            | "bor"
+            | "bxor"
+            | "bsl"
+            | "bsr"
+            | "or"
+            | "xor"
+            | "maybe"
+            | "else"
+    )
+}
+
+/// `io_lib:string_char(unicode_as_latin1, C, $\', Tail)` — one character of a
+/// **quoted** atom, appended to `out`.
+///
+/// The oracle's clause order is reproduced exactly: the quote character and `\`
+/// escape first, then `16#20..16#7E` verbatim, then `16#A0..16#FF` verbatim (the
+/// `unicode_as_latin1` clause), then anything above `16#FF` as `\x{Hex}` with
+/// **uppercase** hex digits (`integer_to_list(C, 16)`), then the `\n \r \t \v \b
+/// \f \e` mnemonics, `16#7F` as `\d`, and every remaining character below `16#A0`
+/// as three octal digits. So `'\x{0}'` ⇒ `'\000'`, `'\x{1B}'` ⇒ `'\e'`,
+/// `'\x{7F}'` ⇒ `'\d'`, `'\x{80}'` ⇒ `'\200'`, `Ā` (U+0100) ⇒ `'\x{100}'`,
+/// `a'b` ⇒ `a\'b`, and `a"b`/`'a\xA0b'` keep `"`/`16#A0` verbatim.
+fn escape_atom_char(c: char, out: &mut String) {
+    let code = c as u32;
+    match c {
+        '\'' => out.push_str("\\'"),
+        '\\' => out.push_str("\\\\"),
+        _ if (0x20..=0x7E).contains(&code) => out.push(c),
+        _ if (0xA0..=0xFF).contains(&code) => out.push(c),
+        '\n' => out.push_str("\\n"),
+        '\r' => out.push_str("\\r"),
+        '\t' => out.push_str("\\t"),
+        '\u{0B}' => out.push_str("\\v"),
+        '\u{08}' => out.push_str("\\b"),
+        '\u{0C}' => out.push_str("\\f"),
+        '\u{1B}' => out.push_str("\\e"),
+        '\u{7F}' => out.push_str("\\d"),
+        _ if code > 0xFF => {
+            out.push_str("\\x{");
+            out.push_str(&format!("{code:X}"));
+            out.push('}');
+        }
+        // Every other character below `16#A0`: three octal digits.
+        _ => {
+            out.push('\\');
+            for shift in [6, 3, 0] {
+                out.push(char::from(b'0' + ((code >> shift) & 7) as u8));
+            }
+        }
     }
-    bytes[1..]
-        .iter()
-        .all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'@')
 }
 
 /// Renders a float exactly as the oracle's plain (non-`~e`/`~f`/`~g`) float leaf
@@ -1423,17 +1554,172 @@ mod tests {
 
     #[test]
     fn bare_atom_name_rule() {
+        // `io_lib:quote_atom/2` — bare names.
         assert!(is_bare_atom("a"));
         assert!(is_bare_atom("hello"));
         assert!(is_bare_atom("x1_@z"));
         assert!(is_bare_atom("foo@bar"));
+        assert!(is_bare_atom("héllo"));
+        assert!(is_bare_atom("café"));
+        assert!(is_bare_atom("àbc"));
+        assert!(is_bare_atom("ß"));
+        assert!(is_bare_atom("ÿ"));
+        assert!(is_bare_atom("a1@_Z"));
+        // Quoted: an empty name, a bad first character, a bad later character.
         assert!(!is_bare_atom(""));
         assert!(!is_bare_atom("Foo"));
         assert!(!is_bare_atom("_foo"));
         assert!(!is_bare_atom("1x"));
         assert!(!is_bare_atom("a-b"));
+        assert!(!is_bare_atom(" a"));
+        assert!(!is_bare_atom("a b"));
+        assert!(!is_bare_atom("a.b"));
+        assert!(!is_bare_atom("a\nb"));
+        // `÷` is excluded from `ß..ÿ` in both positions, `×` from `À..Þ`.
+        assert!(!is_bare_atom("÷a"));
+        assert!(!is_bare_atom("a÷"));
+        assert!(!is_bare_atom("a×b"));
+        assert!(is_bare_atom("aØb"));
+        // A leading character above `16#FF` is never a name initial.
+        assert!(!is_bare_atom("Āa"));
+        assert!(!is_bare_atom("aĀ"));
+        // Reserved words are always quoted, other short names are not.
+        assert!(!is_bare_atom("and"));
+        assert!(is_bare_atom("rec"));
+        assert!(is_bare_atom("query"));
         assert_eq!(format_atom("_foo"), "'_foo'");
         assert_eq!(format_atom(""), "''");
+        assert_eq!(format_atom("héllo"), "héllo");
+        assert_eq!(format_atom("and"), "'and'");
+    }
+
+    #[test]
+    fn atom_quoting_and_escaping_match_the_oracle() {
+        // Every expectation below is the flattened `io_lib:format("~w",[A])` of the
+        // system `erl` (OTP 29.1.1 / erts-17.1), probed with
+        // `binary_to_atom(<<B>>, latin1)` for the whole byte range and with
+        // `binary_to_atom(unicode:characters_to_binary([C]), utf8)` above it.
+        let cases: &[(&str, &str)] = &[
+            ("a", "a"),
+            ("abc", "abc"),
+            ("x1_@z", "x1_@z"),
+            ("héllo", "héllo"),
+            ("café", "café"),
+            ("àbc", "àbc"),
+            ("ß", "ß"),
+            ("ÿ", "ÿ"),
+            ("", "''"),
+            ("Hello", "'Hello'"),
+            ("_foo", "'_foo'"),
+            ("1x", "'1x'"),
+            ("a-b", "'a-b'"),
+            ("a b", "'a b'"),
+            ("a'b", "'a\\'b'"),
+            ("a\\b", "'a\\\\b'"),
+            // `"` is *not* escaped inside a quoted atom (the quote is `'`).
+            ("a\"b", "'a\"b'"),
+            // Control characters: the mnemonics, then three octal digits.
+            ("a\x08b", "'a\\bb'"),
+            ("a\tb", "'a\\tb'"),
+            ("a\nb", "'a\\nb'"),
+            ("a\x0bb", "'a\\vb'"),
+            ("a\x0cb", "'a\\fb'"),
+            ("a\rb", "'a\\rb'"),
+            ("a\x1bb", "'a\\eb'"),
+            ("\0", "'\\000'"),
+            ("\x01", "'\\001'"),
+            ("\x0e", "'\\016'"),
+            ("\x1f", "'\\037'"),
+            // `16#7F` is `\d`, `16#80..16#9F` are octal, `16#A0..16#FF` verbatim.
+            ("a\x7fb", "'a\\db'"),
+            ("\u{80}", "'\\200'"),
+            ("a\u{9f}b", "'a\\237b'"),
+            ("\u{a0}", "'\u{a0}'"),
+            ("a\u{a0}b", "'a\u{a0}b'"),
+            ("ø", "ø"),
+            ("÷", "'÷'"),
+            // Above `16#FF`: `\x{H}` with uppercase hex digits.
+            ("Ā", "'\\x{100}'"),
+            ("aĀ", "'a\\x{100}'"),
+            ("\u{12c}", "'\\x{12C}'"),
+            ("\u{7ff}", "'\\x{7FF}'"),
+            ("\u{1f600}", "'\\x{1F600}'"),
+            ("\u{10ffff}", "'\\x{10FFFF}'"),
+            // Reserved words are quoted.
+            ("and", "'and'"),
+            ("end", "'end'"),
+            ("fun", "'fun'"),
+            ("maybe", "'maybe'"),
+            ("else", "'else'"),
+            ("rec", "rec"),
+            ("query", "query"),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(format_atom(name), *expected, "atom {name:?}");
+        }
+
+        // The byte-code sweep of the **bareness** decision, derived from the
+        // oracle's `quote_atom/2`: a single-character name is bare iff the
+        // character is an `a..z` / `ß..ÿ`-minus-`÷` initial (a one-character name
+        // has no later character to check).
+        for code in 0u32..=0x2FF {
+            let Some(c) = char::from_u32(code) else {
+                continue;
+            };
+            let name = c.to_string();
+            let expected = matches!(c, 'a'..='z')
+                || (('\u{00DF}'..='\u{00FF}').contains(&c) && c != '\u{00F7}');
+            assert_eq!(is_bare_atom(&name), expected, "single char {code:#X}");
+        }
+
+        // The **later-character** sweep: `"a" + C` is bare iff `name_char(C)`.
+        for code in 0u32..=0x2FF {
+            let Some(c) = char::from_u32(code) else {
+                continue;
+            };
+            let name = format!("a{c}");
+            let expected = matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '@')
+                || (('\u{00DF}'..='\u{00FF}').contains(&c) && c != '\u{00F7}')
+                || (('\u{00C0}'..='\u{00DE}').contains(&c) && c != '\u{00D7}');
+            assert_eq!(is_bare_atom(&name), expected, "trailing char {code:#X}");
+        }
+
+        // The escaping sweep for the whole latin1 range: every byte `0..=255` in
+        // a name that is always quoted (`"a" + C + " "`). The oracle's expected
+        // escape is spelled out by the same `string_char(unicode_as_latin1, …)`
+        // clause table (probed for all 256 values).
+        for code in 0u32..=0xFF {
+            let c = char::from_u32(code).expect("a byte is a char");
+            let name = format!("a{c} ");
+            let rendered = format_atom(&name);
+            assert!(
+                rendered.starts_with('\'') && rendered.ends_with('\''),
+                "{code:#X}"
+            );
+            let inner = &rendered[1..rendered.len() - 1];
+            let expected = match code {
+                0x27 => "a\\' ".to_string(),
+                0x5C => "a\\\\ ".to_string(),
+                0x08 => "a\\b ".to_string(),
+                0x09 => "a\\t ".to_string(),
+                0x0A => "a\\n ".to_string(),
+                0x0B => "a\\v ".to_string(),
+                0x0C => "a\\f ".to_string(),
+                0x0D => "a\\r ".to_string(),
+                0x1B => "a\\e ".to_string(),
+                0x7F => "a\\d ".to_string(),
+                c if (0x20..=0x7E).contains(&c) || (0xA0..=0xFF).contains(&c) => {
+                    format!("a{} ", char::from_u32(c).expect("a char"))
+                }
+                c => format!(
+                    "a\\{}{}{} ",
+                    char::from(b'0' + ((c >> 6) & 7) as u8),
+                    char::from(b'0' + ((c >> 3) & 7) as u8),
+                    char::from(b'0' + (c & 7) as u8)
+                ),
+            };
+            assert_eq!(inner, expected, "escaping byte {code:#X}");
+        }
     }
 
     #[test]
