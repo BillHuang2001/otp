@@ -153,14 +153,14 @@
 //! `unsupported_bif` gap until a host installs it.)
 //!
 //! Four `ets` keys stay honest typed gaps, each for a reason no `BifFn` can
-//! satisfy (see [`adopt`] and [`extra`]): `ets:slot/2` (C-interior `db_slot`), and
+//! satisfy (see [`adopt`] and [`extra`]): `ets:slot/2` (C-interior `db_slot`) and
 //! `ets:internal_request_all/0` (a ref + one reply message per scheduler, which
 //! needs process messaging), both seam-backed through the `RuntimeHooks` stub in
-//! `src/runtime/other.rs`; plus the `ets:setopts/2` `{protection, _}` sub-option
-//! (no post-creation access setter in `beam_ets`). `ets:fun2ms/1` and
-//! `ets:repair_continuation/2` are pure `stdlib/src/ets.erl` functions — **not**
-//! `bif.tab` entries — so the registry can never dispatch them and they stay
-//! unregistered.
+//! `src/runtime/other.rs`, plus `ets:fun2ms/1` and `ets:repair_continuation/2` —
+//! pure `stdlib/src/ets.erl` functions, **not** `bif.tab` entries — so the registry
+//! can never dispatch them and they stay unregistered. `ets:setopts/2`'s
+//! `{protection, P}` sub-option is **not** a gap: [`adopt`] applies it through the
+//! owner-gated `Table::setopts(Some(owner), SetOpt::Access(P))`.
 //!
 //! # The `*_lookup` family (see [`nav`] for the BIFs)
 //!
