@@ -2390,3 +2390,68 @@ fn a_rooted_allocation_is_declined_when_a_live_root_lives_in_an_unscanned_region
         "the aliased young child is still intact"
     );
 }
+
+/// The nested blocking pump ([`super::pump_until_returned`], the engine of
+/// [`RuntimeContext::run_export_blocking`]/[`run_label_blocking`]) must not spin without end
+/// when a process stays **runnable forever**: its `ran == 0` exit never triggers, so only the
+/// wall-clock cap can end the drive.
+///
+/// `step` here always reports progress (`Ok(Some(Wait))`) — exactly the shape of a
+/// perpetually runnable queue. Without the cap the loop below would never return; with it the
+/// drive gives up with the typed diagnostic, so this is a genuine regression guard. The cap
+/// is injected (production uses the generous [`super::BLOCKING_PUMP_DEADLINE`]) so the test
+/// spins only for `limit`, not for the ten seconds the production bound allows.
+#[test]
+fn a_perpetually_runnable_blocking_pump_gives_up_at_the_wall_clock_cap() {
+    let limit = std::time::Duration::from_millis(20);
+    let mut steps = 0u64;
+    let error = super::pump_until_returned(limit, RunOutcome::Wait { func: 0, pc: 0 }, |_f, _p| {
+        steps += 1;
+        Ok(Some(RunOutcome::Wait { func: 0, pc: 0 }))
+    })
+    .expect_err("an always-runnable pump must not run forever");
+    assert!(steps > 0, "the drive pumped at least once before giving up");
+    assert_eq!(
+        error.to_string(),
+        crate::error::message(format!(
+            "blocking pump: the scheduler was still runnable after {} ms",
+            limit.as_millis()
+        ))
+        .to_string(),
+        "the drive reports the typed deadline diagnostic, never a hang and never a value"
+    );
+    // The production cap is a safety net, not an ordinary path: it must stay generous
+    // (comfortably above the boot drive's own 10 s pass budget), so a silent shrink below the
+    // workloads it protects is itself a regression.
+    assert!(
+        super::BLOCKING_PUMP_DEADLINE >= std::time::Duration::from_secs(10),
+        "the blocking-pump cap must not be tightened below the workloads it protects"
+    );
+}
+
+/// The **normal** path: a machine that returns ends the drive immediately, however short the
+/// cap is — the deadline is a safety net, never the ordinary exit.
+#[test]
+fn a_returned_blocking_machine_ends_the_pump_without_the_cap() {
+    let value = super::pump_until_returned(
+        std::time::Duration::ZERO,
+        RunOutcome::Returned(make_small(7)),
+        |_f, _p| panic!("a returned machine never pumps"),
+    )
+    .expect("a returned machine yields its value");
+    assert_eq!(signed_value(value), 7);
+}
+
+/// A `step` that reports **nothing ran** (`Ok(None)` — a context that may not pump, or a
+/// drained queue) keeps the engine's honest typed `blocked` gap, and does so before the cap
+/// (checked first) could fire.
+#[test]
+fn a_step_that_reports_nothing_ran_keeps_the_typed_blocked_gap() {
+    let error = super::pump_until_returned(
+        super::BLOCKING_PUMP_DEADLINE,
+        RunOutcome::Wait { func: 0, pc: 0 },
+        |_f, _p| Ok(None),
+    )
+    .expect_err("nothing ran is the blocked gap");
+    assert_eq!(error.to_string(), beam_engine::blocked().to_string());
+}

@@ -90,6 +90,7 @@ mod tests;
 
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use beam_abi::nif::loader::NifCallError;
 use beam_bifs::{BifContext, OutputSink};
@@ -129,6 +130,55 @@ use self::runtime_hooks::RuntimeHooksBridge;
 /// child it waits on run and re-scanned, and a pump that reports nothing ran ends the wait
 /// with the honest typed [`beam_engine::blocked`] gap instead of spinning.
 const RUN_EXPORT_PUMP_SLICES: u64 = 64;
+
+/// The wall-clock safety cap on a nested blocking pump (see [`pump_until_returned`]).
+///
+/// [`RuntimeContext::run_export_blocking`] and [`RuntimeContext::run_label_blocking`] drive
+/// the scheduler while a cross-module callee is suspended in a `receive` (one bounded round
+/// of [`RUN_EXPORT_PUMP_SLICES`] slices per wait). That loop normally ends as soon as a pump
+/// reports **nothing ran** — the callee's peer has answered or is itself blocked — but a
+/// process that stays **runnable forever** reports progress on every round and would spin the
+/// pump without end. This bound is the nested pump's counterpart of the boot drive's
+/// `DRIVE_DEADLINE`: checked between pump rounds, it turns an unbounded pump into a typed
+/// diagnostic instead of a hang. It is deliberately generous — no legitimate
+/// single-pass/`-eval`/boot workload (a `proc_lib` start, a `gen_server` round trip, an
+/// io-device read) comes close — so the cap fires only on a genuine infinite pump.
+const BLOCKING_PUMP_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Drives a machine suspended in a `receive` to its `return`, one scheduler pump per wait.
+///
+/// `step` performs exactly one pump-and-resume for the `(func, pc)` a [`RunOutcome::Wait`]
+/// reports — it advances the scheduler by a bounded number of slices and resumes the machine
+/// — or returns `Ok(None)` when the mailbox cannot have changed (this context may not
+/// re-enter the scheduler, or the pump reported nothing ran). The loop ends when the machine
+/// returns, when `step` reports `Ok(None)` (the honest [`beam_engine::blocked`] gap), or when
+/// `limit` elapses — the typed deadline diagnostic, the safety net for a process that stays
+/// runnable forever. `limit` is a parameter rather than [`BLOCKING_PUMP_DEADLINE`] directly
+/// so the deadline path is unit-testable with a short bound.
+fn pump_until_returned<F>(limit: Duration, mut outcome: RunOutcome, mut step: F) -> Result<Eterm>
+where
+    F: FnMut(u32, u32) -> Result<Option<RunOutcome>>,
+{
+    let deadline = Instant::now() + limit;
+    loop {
+        match outcome {
+            RunOutcome::Returned(value) => return Ok(value),
+            RunOutcome::Wait { func, pc } => {
+                if Instant::now() >= deadline {
+                    return Err(error::message(format!(
+                        "blocking pump: the scheduler was still runnable after {} ms",
+                        limit.as_millis()
+                    )));
+                }
+                match step(func, pc)? {
+                    None => return Err(beam_engine::blocked()),
+                    Some(next) => outcome = next,
+                }
+            }
+        }
+    }
+}
+
 /// The engine's host: the runtime, borrowed for the duration of one run, plus the
 /// output sink that run writes to.
 ///
@@ -789,7 +839,10 @@ impl<'a> RuntimeContext<'a> {
     /// second process from within a slice — so it keeps the plain non-blocking entry's typed
     /// [`beam_engine::blocked`] gap. A pump that reports **nothing ran** (`0`) is the same
     /// honest gap: no process could have changed the mailbox, so spinning further would only
-    /// hang, never produce a value.
+    /// hang, never produce a value. A process that stays **runnable forever**, by contrast,
+    /// reports progress on every round; [`pump_until_returned`] then gives up when its
+    /// [`BLOCKING_PUMP_DEADLINE`] wall-clock cap elapses and reports a typed
+    /// [`error::message`] diagnostic rather than spinning without end.
     ///
     /// # Why the paused terms stay valid
     ///
@@ -813,22 +866,10 @@ impl<'a> RuntimeContext<'a> {
         // whole run (see [`Self::with_relocation_exempt`]).
         self.with_relocation_exempt(|this| {
             let mut machine = Machine::new();
-            let mut outcome = machine.run_export_outcome(module, function, arity, args, this)?;
-            loop {
-                match outcome {
-                    RunOutcome::Returned(value) => return Ok(value),
-                    RunOutcome::Wait { func, pc } => {
-                        if !this.may_pump_scheduler() {
-                            return Err(beam_engine::blocked());
-                        }
-                        let ran = this.runtime.pump_scheduler(RUN_EXPORT_PUMP_SLICES)?;
-                        if ran == 0 {
-                            return Err(beam_engine::blocked());
-                        }
-                        outcome = machine.resume_outcome(module, func, pc, this)?;
-                    }
-                }
-            }
+            let outcome = machine.run_export_outcome(module, function, arity, args, this)?;
+            pump_until_returned(BLOCKING_PUMP_DEADLINE, outcome, |func, pc| {
+                this.pump_once(&mut machine, module, func, pc)
+            })
         })
     }
 
@@ -855,7 +896,10 @@ impl<'a> RuntimeContext<'a> {
     /// second process from within a slice — so it keeps the plain non-blocking entry's typed
     /// [`beam_engine::blocked`] gap. A pump that reports **nothing ran** (`0`) is the same
     /// honest gap: no process could have changed the mailbox, so spinning further would only
-    /// hang, never produce a value.
+    /// hang, never produce a value. A process that stays **runnable forever**, by contrast,
+    /// reports progress on every round; [`pump_until_returned`] then gives up when its
+    /// [`BLOCKING_PUMP_DEADLINE`] wall-clock cap elapses and reports a typed
+    /// [`error::message`] diagnostic rather than spinning without end.
     ///
     /// # Why the paused terms stay valid
     ///
@@ -879,23 +923,36 @@ impl<'a> RuntimeContext<'a> {
         // whole run (see [`Self::with_relocation_exempt`]).
         self.with_relocation_exempt(|this| {
             let mut machine = Machine::new();
-            let mut outcome = machine.run_label_outcome(module, label, arity, args, this)?;
-            loop {
-                match outcome {
-                    RunOutcome::Returned(value) => return Ok(value),
-                    RunOutcome::Wait { func, pc } => {
-                        if !this.may_pump_scheduler() {
-                            return Err(beam_engine::blocked());
-                        }
-                        let ran = this.runtime.pump_scheduler(RUN_EXPORT_PUMP_SLICES)?;
-                        if ran == 0 {
-                            return Err(beam_engine::blocked());
-                        }
-                        outcome = machine.resume_outcome(module, func, pc, this)?;
-                    }
-                }
-            }
+            let outcome = machine.run_label_outcome(module, label, arity, args, this)?;
+            pump_until_returned(BLOCKING_PUMP_DEADLINE, outcome, |func, pc| {
+                this.pump_once(&mut machine, module, func, pc)
+            })
         })
+    }
+
+    /// One pump-and-resume of a blocked cross-module run: advance the scheduler, then resume
+    /// `machine` at the address its [`RunOutcome::Wait`] reported.
+    ///
+    /// `Ok(None)` means the mailbox cannot have changed since the last scan — either this
+    /// context may not re-enter the scheduler ([`RuntimeContext::for_process`] is itself
+    /// inside a slice) or the pump reported nothing ran — both the honest
+    /// [`beam_engine::blocked`] gap (see [`RuntimeContext::run_export_blocking`]). A pump
+    /// error (a process-table/port failure) is propagated unchanged.
+    fn pump_once(
+        &mut self,
+        machine: &mut Machine,
+        module: &Module,
+        func: u32,
+        pc: u32,
+    ) -> Result<Option<RunOutcome>> {
+        if !self.may_pump_scheduler() {
+            return Ok(None);
+        }
+        let ran = self.runtime.pump_scheduler(RUN_EXPORT_PUMP_SLICES)?;
+        if ran == 0 {
+            return Ok(None);
+        }
+        Ok(Some(machine.resume_outcome(module, func, pc, self)?))
     }
 
     /// Records the module whose **code** this context is about to execute — the BIF call
