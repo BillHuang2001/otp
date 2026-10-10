@@ -74,7 +74,6 @@
 //! `unprefixed_integer`/`prefixed_integer` guard demands, else `badarg`. The sign
 //! precedes the prefix (`io_lib:format("~.16#",[-255])` ⇒ `"-16#FF"`).
 //!
-//!
 //! Every directive accepts the full control-sequence prefix of
 //! `io_lib_format:collect_cseq/2`: an optional `-` (**left** adjust), a decimal
 //! **field width** (or `*` to take it from the next argument), an optional `.`

@@ -18,24 +18,20 @@
 //
 // %CopyrightEnd%
 
-//! Oracle cross-checks for the two `Chunk`-shaped corners of the shared
-//! `io`/`io_lib` format engine (public API only, driven through [`BifRegistry`]):
+//! Oracle cross-checks for the `~c`/`~tc` **code-point** corner of the shared
+//! `io`/`io_lib` format engine (public API only, driven through [`BifRegistry`]).
 //!
-//! 1. **`~c`/`~tc` with a code point outside the `char` range.** The oracle's
-//!    `io_lib_format:control_small($c,…)` has two clauses: `~tc` renders the
-//!    integer **verbatim** (`char(A, …)` is `[A]`) and `~c` renders only its low
-//!    byte (`char(A band 255, …)`). So `io_lib:format("~tc",[1114112])` ⇒
-//!    `[1114112]`, `~tc` of the surrogate `55296` ⇒ `[55296]`, `~tc` of `-1` ⇒
-//!    `[-1]`, `~tc` of a bignum ⇒ that bignum, while `~c` of `257`/`-1`/
-//!    `1 bsl 100` ⇒ `[1]`/`[255]`/`[0]`. The rendered code point travels as a
-//!    [`beam_bifs`]-internal raw-integer chunk; `io:format` then writes a valid
-//!    scalar as its UTF-8 encoding and raises `badarg` for one the oracle's
-//!    unicode device refuses (`io:format("~tc",[1114112])` ⇒ `error:badarg`).
-//! 2. **Base directives with non-byte prefix elements.** `~x`/`~X`'s `Prefix` is
-//!    an atom (its name) or a **deep** character list (`io_lib:deep_char_list/1`)
-//!    whose elements are emitted **verbatim**, so
-//!    `io_lib:format("~.16x",[255,[256]])` ⇒ `[256,102,102]` — an element is not
-//!    restricted to a byte.
+//! The oracle's `io_lib_format:control_small($c,…)` has two clauses: `~tc` renders
+//! the integer **verbatim** (`char(A, …)` is `[A]`) and `~c` renders only its low
+//! byte (`char(A band 255, …)`). So `io_lib:format("~tc",[1114112])` ⇒
+//! `[1114112]`, `~tc` of the surrogate `55296` ⇒ `[55296]`, `~tc` of `-1` ⇒
+//! `[-1]`, `~tc` of a bignum ⇒ that bignum, while `~c` of `257`/`-1`/
+//! `1 bsl 100` ⇒ `[1]`/`[255]`/`[0]`. The rendered code point travels as a
+//! [`beam_bifs`]-internal raw-integer chunk; `io:format` then writes a valid
+//! scalar as its UTF-8 encoding and raises `badarg` for one the oracle's
+//! unicode device refuses (`io:format("~tc",[1114112])` ⇒ `error:badarg`).
+//!
+//! The `~x`/`~X` **prefix** corner lives in the sibling `tests/io_prefix.rs`.
 //!
 //! Both sides are compared **element by element**: the Rust side renders
 //! `io_lib:format(F, A)` and prints the flattened element codes, the oracle side
@@ -54,7 +50,7 @@ use beam_alloc::Heap;
 use beam_bifs::{default_registry, BifContext, BifRegistry, BytesSink};
 use beam_common::{BeamError, Result};
 use beam_process::ProcessId;
-use beam_term::{is_big, is_small, signed_value, AtomTable, Eterm};
+use beam_term::{is_list, is_small, signed_value, AtomTable, Eterm};
 
 /// The limbs of `1 bsl 100` (`2^100 = 2^64 * 2^36`), least significant first.
 const SHIFTED_100: &[u64] = &[0, 1 << 36];
@@ -76,17 +72,8 @@ enum Arg {
     Small(i64),
     /// An arbitrary-precision integer: `(negative, limbs, decimal source)`.
     Big(bool, &'static [u64], &'static str),
-    /// A character list (an Erlang string).
+    /// A character list (an Erlang string) of ASCII characters.
     Str(&'static str),
-    /// A proper list of small integers (a character list that may hold code points
-    /// above 255).
-    Ints(&'static [i64]),
-    /// A character list holding one nested list: `[[inner], n]`.
-    NestedList(&'static [i64], i64),
-    /// An improper list `[head | tail]`.
-    Improper(i64, i64),
-    /// A binary of the given bytes.
-    Binary(&'static [u8]),
 }
 
 /// The oracle's rendering of a case.
@@ -112,7 +99,7 @@ struct Case {
 /// Every case, each expectation captured from erts-17.1 with
 /// `erl -noshell -eval 'io:format("~w~n",[io_lib:format(F,A)]).'`.
 const CASES: &[Case] = &[
-    // ---- fix (1): `~tc` carries the code point verbatim ------------------------
+    // ---- `~tc` carries the code point verbatim --------------------------------
     Case { format: "~tc", args: &[Arg::Small(1114112)], want: Want::Codes("1114112") },
     Case { format: "~tc", args: &[Arg::Small(0x110000)], want: Want::Codes("1114112") },
     Case { format: "~tc", args: &[Arg::Small(55296)], want: Want::Codes("55296") },
@@ -139,7 +126,7 @@ const CASES: &[Case] = &[
     Case { format: "~2.1tc", args: &[Arg::Small(1114112)], want: Want::Codes("32,1114112") },
     Case { format: "~5tc", args: &[Arg::Small(-1)], want: Want::Codes("-1,-1,-1,-1,-1") },
     Case { format: "~tc", args: &[Arg::Str("a")], want: Want::BadArg },
-    // ---- fix (1): `~c` keeps only the low byte --------------------------------
+    // ---- `~c` keeps only the low byte -----------------------------------------
     Case { format: "~c", args: &[Arg::Small(256)], want: Want::Codes("0") },
     Case { format: "~c", args: &[Arg::Small(257)], want: Want::Codes("1") },
     Case { format: "~c", args: &[Arg::Small(-1)], want: Want::Codes("255") },
@@ -167,78 +154,6 @@ const CASES: &[Case] = &[
         want: Want::Codes("1"),
     },
     Case { format: "~c", args: &[Arg::Str("a")], want: Want::BadArg },
-    // ---- fix (2): non-byte prefix elements ------------------------------------
-    Case {
-        format: "~.16x",
-        args: &[Arg::Small(255), Arg::Ints(&[256])],
-        want: Want::Codes("256,102,102"),
-    },
-    Case {
-        format: "~.16X",
-        args: &[Arg::Small(255), Arg::Ints(&[256])],
-        want: Want::Codes("256,70,70"),
-    },
-    Case {
-        format: "~.16X",
-        args: &[Arg::Small(-255), Arg::Ints(&[256])],
-        want: Want::Codes("45,256,70,70"),
-    },
-    Case { format: "~.16x", args: &[Arg::Small(255), Arg::Ints(&[])], want: Want::Codes("102,102") },
-    Case {
-        format: "~.16x",
-        args: &[Arg::Small(255), Arg::Ints(&[300])],
-        want: Want::Codes("300,102,102"),
-    },
-    Case {
-        format: "~.16x",
-        args: &[Arg::Small(255), Arg::Ints(&[1114111])],
-        want: Want::Codes("1114111,102,102"),
-    },
-    Case {
-        format: "~.16x",
-        args: &[Arg::Small(255), Arg::Ints(&[65536])],
-        want: Want::Codes("65536,102,102"),
-    },
-    Case {
-        format: "~.16x",
-        args: &[Arg::Small(255), Arg::NestedList(&[65], 66)],
-        want: Want::Codes("65,66,102,102"),
-    },
-    Case {
-        format: "~.16x",
-        args: &[Arg::Small(255), Arg::Ints(&[65, 66])],
-        want: Want::Codes("65,66,102,102"),
-    },
-    // The field width counts each prefix element as one character (`term/6` with
-    // `latin1` uses `io_lib:chars_length/1`).
-    Case {
-        format: "~10.16x",
-        args: &[Arg::Small(255), Arg::Ints(&[256])],
-        want: Want::Codes("32,32,32,32,32,32,32,256,102,102"),
-    },
-    Case {
-        format: "~5.16x",
-        args: &[Arg::Small(255), Arg::Ints(&[256])],
-        want: Want::Codes("32,32,256,102,102"),
-    },
-    Case {
-        format: "~-10.16x",
-        args: &[Arg::Small(255), Arg::Ints(&[256])],
-        want: Want::Codes("256,102,102,32,32,32,32,32,32,32"),
-    },
-    // A prefix element outside the oracle's character range, an improper list and
-    // a non-list/non-atom prefix are all `badarg` (`io_lib:deep_char_list/1`).
-    Case { format: "~.16x", args: &[Arg::Small(255), Arg::Ints(&[-1])], want: Want::BadArg },
-    Case { format: "~.16x", args: &[Arg::Small(255), Arg::Ints(&[65534])], want: Want::BadArg },
-    Case { format: "~.16x", args: &[Arg::Small(255), Arg::Ints(&[65535])], want: Want::BadArg },
-    Case { format: "~.16x", args: &[Arg::Small(255), Arg::Ints(&[55296])], want: Want::BadArg },
-    Case { format: "~.16x", args: &[Arg::Small(255), Arg::Ints(&[1114112])], want: Want::BadArg },
-    Case { format: "~.16x", args: &[Arg::Small(255), Arg::Improper(1, 2)], want: Want::BadArg },
-    Case { format: "~.16x", args: &[Arg::Small(255), Arg::Binary(b"1")], want: Want::BadArg },
-    Case { format: "~.16x", args: &[Arg::Small(255), Arg::Small(16)], want: Want::BadArg },
-    // An atom prefix is its name, emitted as characters.
-    Case { format: "~.16x", args: &[Arg::Small(255), Arg::Str("ab")], want: Want::Codes("97,98,102,102") },
-    Case { format: "~.16x", args: &[Arg::Small(255), Arg::Str("")], want: Want::Codes("102,102") },
 ];
 
 fn seeded_atoms() -> AtomTable {
@@ -261,30 +176,6 @@ fn build_arg(ctx: &mut BifContext<'_>, arg: &Arg) -> Eterm {
                 .collect();
             ctx.list(&elems).expect("a short list fits")
         }
-        Arg::Ints(values) => {
-            let elems: Vec<Eterm> = values
-                .iter()
-                .map(|&v| ctx.int(v).expect("a code point fits"))
-                .collect();
-            ctx.list(&elems).expect("a short list fits")
-        }
-        Arg::NestedList(inner, tail) => {
-            let inner_elems: Vec<Eterm> = inner
-                .iter()
-                .map(|&v| ctx.int(v).expect("a code point fits"))
-                .collect();
-            let inner = ctx.list(&inner_elems).expect("a short list fits");
-            let tail = ctx.int(*tail).expect("a code point fits");
-            ctx.list(&[inner, tail]).expect("a short list fits")
-        }
-        Arg::Improper(head, tail) => {
-            let head = ctx.int(*head).expect("a small int fits");
-            let tail = ctx.int(*tail).expect("a small int fits");
-            ctx.cons(head, tail).expect("a cons fits")
-        }
-        Arg::Binary(bytes) => ctx
-            .make_binary(bytes)
-            .expect("a short binary fits"),
     }
 }
 
@@ -298,30 +189,26 @@ fn element_codes(term: Eterm) -> String {
 }
 
 fn collect_codes(term: Eterm, out: &mut Vec<String>) {
-    if !is_small(term) && !is_big(term) {
-        let mut cursor = term;
-        while is_list(cursor) {
-            collect_codes(beam_codec::term::cons_head(cursor).expect("a cons head"), out);
-            cursor = beam_codec::term::cons_tail(cursor).expect("a cons tail");
-        }
-        assert_eq!(cursor, beam_term::NIL, "io_lib:format returned an improper list");
+    if is_small(term) {
+        out.push(signed_value(term).to_string());
         return;
     }
-    out.push(if is_small(term) {
-        signed_value(term).to_string()
-    } else {
-        beam_codec::term::big_parts(term)
-            .map(|(negative, limbs)| {
-                // `~w` prints the bignum's decimal; render it through the crate's
-                // own integer renderer by round-tripping the term through `~b`.
-                format!(
-                    "{}{}",
-                    if negative { "-" } else { "" },
-                    decimal_of(limbs)
-                )
-            })
-            .expect("a bignum splits")
-    });
+    // `beam_term::is_big/1` is `unsafe`; the safe `big_parts` probe doubles as the
+    // bignum test (`beam_codec` is the crate's safe term-construction surface).
+    if let Ok((negative, limbs)) = beam_codec::term::big_parts(term) {
+        out.push(format!(
+            "{}{}",
+            if negative { "-" } else { "" },
+            decimal_of(limbs)
+        ));
+        return;
+    }
+    let mut cursor = term;
+    while is_list(cursor) {
+        collect_codes(beam_codec::term::cons_head(cursor).expect("a cons head"), out);
+        cursor = beam_codec::term::cons_tail(cursor).expect("a cons tail");
+    }
+    assert_eq!(cursor, beam_term::NIL, "io_lib:format returned an improper list");
 }
 
 /// The decimal rendering of a little-endian `u64` limb vector.
@@ -354,8 +241,6 @@ fn decimal_of(limbs: &[u64]) -> String {
     out
 }
 
-use beam_term::is_list;
-
 /// Renders one case through `io_lib:format/2`, returning its element codes or the
 /// typed `badarg`.
 fn render(ctx: &mut BifContext<'_>, reg: &BifRegistry, case: &Case) -> Result<String> {
@@ -386,19 +271,6 @@ fn describe(case: &Case) -> String {
             Arg::Small(value) => value.to_string(),
             Arg::Big(negative, _, src) => format!("{}{src}", if *negative { "-" } else { "" }),
             Arg::Str(text) => format!("{text:?}"),
-            Arg::Ints(values) => format!(
-                "[{}]",
-                values.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
-            ),
-            Arg::NestedList(inner, tail) => format!(
-                "[[{}],{tail}]",
-                inner.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
-            ),
-            Arg::Improper(head, tail) => format!("[{head}|{tail}]"),
-            Arg::Binary(bytes) => format!(
-                "<<{}>>",
-                bytes.iter().map(u8::to_string).collect::<Vec<_>>().join(",")
-            ),
         })
         .collect();
     format!("io_lib:format({:?}, [{}])", case.format, args.join(", "))
@@ -483,19 +355,6 @@ fn args_source(args: &[Arg]) -> String {
             Arg::Big(negative, _, src) => format!("{}{src}", if *negative { "-" } else { "" }),
             // An Erlang string literal — every case is ASCII with no escapes.
             Arg::Str(text) => format!("{text:?}"),
-            Arg::Ints(values) => format!(
-                "[{}]",
-                values.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
-            ),
-            Arg::NestedList(inner, tail) => format!(
-                "[[{}],{tail}]",
-                inner.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
-            ),
-            Arg::Improper(head, tail) => format!("[{head}|{tail}]"),
-            Arg::Binary(bytes) => format!(
-                "<<{}>>",
-                bytes.iter().map(u8::to_string).collect::<Vec<_>>().join(",")
-            ),
         })
         .collect();
     format!("[{}]", parts.join(","))
@@ -604,18 +463,29 @@ fn the_pinned_goldens_match_the_live_oracle() {
     }
 }
 
+/// One `io:format(F, A)` case: the format and its arguments.
+struct WriteCase {
+    format: &'static str,
+    args: &'static [Arg],
+}
+
+impl WriteCase {
+    /// The format string as an Erlang literal.
+    fn args_format(&self) -> String {
+        format!("{:?}", self.format)
+    }
+
+    /// The argument list as Erlang source.
+    fn args_source(&self) -> String {
+        args_source(self.args)
+    }
+}
+
 /// The `io:format` **write** path: the bytes the crate hands its sink are the
 /// oracle's own stdout bytes — the UTF-8 encoding of a valid code point, or
 /// nothing at all (the call raises `badarg`).
 #[test]
 fn the_write_path_matches_the_live_oracle() {
-    /// One `io:format(F, A)` case: the format, its arguments as Erlang source, and
-    /// the argument list built on the Rust side.
-    struct WriteCase {
-        format: &'static str,
-        args: &'static [Arg],
-    }
-
     const WRITE_CASES: &[WriteCase] = &[
         WriteCase { format: "~tc", args: &[Arg::Small(0x10FFFF)] },
         WriteCase { format: "~tc", args: &[Arg::Small(0x100)] },
@@ -624,8 +494,6 @@ fn the_write_path_matches_the_live_oracle() {
         WriteCase { format: "~c", args: &[Arg::Small(255)] },
         WriteCase { format: "~c", args: &[Arg::Small(256)] },
         WriteCase { format: "~c", args: &[Arg::Small(-1)] },
-        WriteCase { format: "~.16x", args: &[Arg::Small(255), Arg::Ints(&[256])] },
-        WriteCase { format: "~.16x", args: &[Arg::Small(255), Arg::Ints(&[0x10FFFF])] },
     ];
 
     // The refusal cases: the oracle's device rejects the code point, so
@@ -705,7 +573,7 @@ fn the_write_path_matches_the_live_oracle() {
     // The oracle's own stdout bytes, one process per case (the stream must not be
     // mixed with a `~w` frame). `-noshell` writes the device's bytes verbatim.
     for (case, want) in WRITE_CASES.iter().zip(&ours) {
-        let eval = format!("io:format({:?},{}).", case.args_format(), case.args_source());
+        let eval = format!("io:format({},{}).", case.args_format(), case.args_source());
         let output = Command::new(&oracle)
             .arg("-noshell")
             .arg("-eval")
@@ -757,17 +625,5 @@ fn the_write_path_matches_the_live_oracle() {
             case.args_source(),
             String::from_utf8_lossy(&output.stdout)
         );
-    }
-}
-
-impl WriteCase {
-    /// The format string as an Erlang literal.
-    fn args_format(&self) -> String {
-        format!("{:?}", self.format)
-    }
-
-    /// The argument list as Erlang source.
-    fn args_source(&self) -> String {
-        args_source(self.args)
     }
 }
