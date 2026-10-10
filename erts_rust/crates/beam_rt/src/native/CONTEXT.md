@@ -170,11 +170,11 @@ for an unregistered `registered_name`), so the list is a genuine, shorter-by-con
 - **`error_handler`** (the atom `error_handler`) and **`suspending`** (`[]`) are unchanging runtime
   defaults — the facts they report are true of this runtime. **`last_calls`** is the exception: it is
   hard-coded `false` while `Process::save_calls()` holds a real flag — see its table row.
-- **`message_queue_data`** is `on_heap` because that is this runtime's real **current** placement
-  (`beam_message::Queue` is heap-resident FIFO). The one divergence is an **explicit**
-  `process_flag(message_queue_data, off_heap)`, which `process.rs` accepts and ignores — so such a
-  process reports `on_heap` where the oracle reports `off_heap`. Honouring it needs per-process
-  storage in `beam_process::Process` (a cross-crate handoff, not a value this floor may fabricate).
+- **`message_queue_data`** is `on_heap`, this runtime's real **current** placement
+  (`beam_message::Queue` is heap-resident). The one divergence: an **explicit**
+  `process_flag(message_queue_data, off_heap)` is accepted-and-ignored, so such a process reports
+  `on_heap` where the oracle reports `off_heap` — honouring it needs per-process storage in
+  `beam_process::Process` (a cross-crate handoff).
 - **`trace`** is the **live** per-process ERTS tracee-flag bitmask as an **integer**, never the
   `trace_info(P, flags)` atom list (oracle `{trace,0}` untraced, `{trace,1024}` after `[call]`,
   `{trace,32763895}` after `[all]`). `trace_bitmask` maps `flags_to_atoms(flags)` through the
