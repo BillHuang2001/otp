@@ -164,13 +164,13 @@
 //!   `V4_PORT_EXT` / reference whose node and creation name this node decodes to
 //!   the **internal** form (the oracle's `dec_is_this_node` branches) —
 //!   `binary_to_term(term_to_binary(self())) =:= self()`. With no identity the wire
-//!   form (an external id) is produced, byte-for-byte as before. One limit follows
-//!   from the M1 internal-reference substitution: its id is a single 60-bit small
-//!   (`beam_term`'s frozen 4-word block), so a wire reference whose numbers pack past
-//!   60 bits — every real `make_ref()` image — is the typed `SystemLimit` rather than a
-//!   truncated id (`beam_codec::ref_wire`'s module doc; the C's `ErtsORefThing` holds
-//!   3+ 32-bit numbers, which this representation does not model). The unit test
-//!   `the_oracle_reference_image_is_a_typed_id_width_gap` pins it.
+//!   form (an external id) is produced. The reference demotion is
+//!   **representability-gated**: the M1 internal-reference substitution stores its id in
+//!   a single 60-bit small (`beam_term`'s frozen 4-word block), so a wire reference whose
+//!   numbers pack past 60 bits — every real `make_ref()` image — keeps the faithful
+//!   **external** reference form (a byte-exact round-trip), never a truncated or
+//!   substituted id (`beam_codec::ref_wire::representable_ref_id`; the C's
+//!   `ErtsORefThing` holds 3+ 32-bit numbers, which this representation does not model).
 //! * **`integer_to_binary/1,2` and `binary_to_integer/1,2` promote to bignums.**
 //!   A value outside the 60-bit small range becomes an arbitrary-precision bignum
 //!   exactly as the oracle's does; only a magnitude past the bignum limb bound is
@@ -1076,8 +1076,9 @@ fn binary_to_term_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a non-binary, a
 /// malformed/truncated image, an unknown option, or `safe` with an image that
 /// would create an atom; the codec's `unsupported_external_term` raise for a tag
-/// it cannot build (funs, exports, records, `LOCAL`) and `SystemLimit` for a local
-/// reference id that does not fit the M1 block's 60-bit slot.
+/// it cannot build (funs, exports, records, `LOCAL`). A local reference id that
+/// does not fit the M1 internal-ref block's 60-bit slot is not an error: the
+/// decoder keeps the faithful external reference form for it.
 fn decode_term_bif(
     ctx: &mut BifContext<'_>,
     input: Eterm,
@@ -3024,7 +3025,7 @@ mod tests {
             }
         });
     }
-    /// The oracle's own `term_to_binary(make_ref())` image is a **typed gap** here.
+    /// The oracle's own `term_to_binary(make_ref())` image.
     ///
     /// ORACLE (OTP 29.1.1 / erts-17.1):
     /// `erl -noshell -eval 'io:format("~w~n",[binary_to_list(term_to_binary(make_ref()))]),halt(0).'`
@@ -3032,10 +3033,9 @@ mod tests {
     /// — a `NEWER_REFERENCE_EXT` (`90`) with 3 numbers `0x000261DB`, `0x1DB80002`,
     /// `0x43AA4C1A`. The third is `>= 2^28`, so the packed M1 id
     /// (`(n0 & 0x3FFFF) | (n1 & 0xFFFC0000) | (n2 << 32)`) reaches past the 60-bit small
-    /// the internal-ref block stores. This crate reports the typed `SystemLimit` rather
-    /// than a truncated/substituted id (the width limit is `beam_codec::ref_wire`'s, see
-    /// its module doc): the *self-consistent* round trip above is what this runtime
-    /// guarantees for its own references.
+    /// the internal-ref block stores, so the local-node demotion does not apply: the decode
+    /// keeps the faithful **external** reference form (which re-encodes to these very
+    /// bytes), never a truncated/substituted id (`beam_codec::ref_wire::representable_ref_id`).
     #[test]
     fn the_oracle_reference_image_is_a_typed_id_width_gap() {
         let mut oracle = vec![VERSION_MAGIC, 90, 0, 3, 119, 13];
