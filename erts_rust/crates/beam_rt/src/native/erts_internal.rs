@@ -54,6 +54,8 @@
 //! | `erts_internal:no_aux_work_threads/0` | `erl_process.c:9234-9237` (`:6219-6223`) | `erl`→`17` (16 schedulers + 1 + no dirty-alloc instances); `erl +S 1`→`2` |
 //! | `erts_internal:processes_next/1` | `bif.c:4111-4120` | `processes_next(1000000000000)`→`badarg`; `foo`→`badarg` |
 //! | `erts_internal:term_to_string/1,2` | `bif.c:4160-4189` | `{a,1}`→`"{a,1}"` (one line, `~w`); a limit `1`→`error:badarg` |
+//! | `erts_internal:garbage_collect/1` | `bif.c:4081-4094` | `minor`/`major`→`true` (a request is recorded); `foo`/`1`→`error:badarg` |
+//! | `erlang:garbage_collect/0,1` | `erlang.erl:3051-3066` (both reduce to that `erts_internal` BIF) | `()`→`true`; `(self())`→`true`; `(LivePid)`→`true`; `(DeadPid)`→`false`; `(foo\|123\|[Pid])`→`error:badarg`; `/2` is a typed gap |
 //!
 //! # Deliberate Milestone-1 divergences (documented, deterministic)
 //!
@@ -268,35 +270,103 @@ impl RuntimeContext<'_> {
         }
     }
 
-    // -- erts_internal:garbage_collect/1 --------------------------------------
+    // -- erlang:garbage_collect/0,1 and erts_internal:garbage_collect/1 --------
 
-    /// `erts_internal:garbage_collect/1` — the runtime's **on-demand collection**, and the
-    /// BIF `erlang:garbage_collect/0,1` reduce to.
+    /// `erlang:garbage_collect/0` — collect the **calling** process
+    /// (`erts/preloaded/src/erlang.erl:3051-3053`, whose body is
+    /// `erts_internal:garbage_collect(major)`).
     ///
-    /// # Ground truth
+    /// The oracle's answer is `true`. `erlang` is a floor namespace
+    /// ([`super::FLOOR_MODULES`]), so its `.beam` body is never entered and the floor owns
+    /// this name.
     ///
-    /// `erts/emulator/beam/bif.c:4080-4094` (`erts_internal_garbage_collect_1`): the atom
-    /// `minor` requests a relaxed collection, `major` a fullsweep and anything else is
-    /// `badarg` (`am_badarg`); the C then runs `erts_garbage_collect` and returns `am_true`.
-    /// `erlang:garbage_collect/0` (`erts/preloaded/src/erlang.erl:3038-3040`) is the wrapper
-    /// `erts_internal:garbage_collect(major)`, and `erlang:garbage_collect/1` is
-    /// `erlang:garbage_collect(Pid, [])` — which for `self()` reaches this BIF too.
+    /// # Errors
+    ///
+    /// Only the BIF heap's own exhaustion; the oracle's `/0` never raises.
+    pub(super) fn garbage_collect_0(&mut self) -> Result<Eterm> {
+        self.request_own_gc();
+        self.atom("true")
+    }
+
+    /// `erlang:garbage_collect/1` — collect `Pid`
+    /// (`erts/preloaded/src/erlang.erl:3055-3066`, the wrapper `erlang:garbage_collect(Pid, [])`).
+    ///
+    /// # Ground truth (oracle probes, OTP 29.1.1 / erts-17.1)
+    ///
+    /// `garbage_collect(Pid, [])` (`erlang.erl:3121-3147`) is **synchronous**: for `Pid`
+    /// equal to `self()` it calls `erts_internal:garbage_collect(major)` and returns its
+    /// `true`; for any other pid it sends the system task
+    /// `{garbage_collect, ReqId, major}` (`erts/emulator/beam/erl_process.c:11309-11419`,
+    /// `request_system_task/4`) and blocks on `{garbage_collect, ReqId, GCResult}`. Probing
+    /// the live oracle:
+    ///
+    /// | call | oracle |
+    /// |---|---|
+    /// | `garbage_collect(self())` | `true` |
+    /// | `garbage_collect(LivePid)` | `true` |
+    /// | `garbage_collect(DeadPid)` | `false` |
+    /// | `garbage_collect(foo \| 123 \| [Pid])` | `error:badarg` |
+    /// | `garbage_collect(ExternalPid)` (`node = n1`) | `error:badarg` |
+    ///
+    /// The `badarg` cases are the C's own argument test: the target must be an **internal**
+    /// (node-local) pid, or an external pid whose distribution entry is *this* node's
+    /// (`erl_process.c:11319-11324`) — any other term, and any pid naming another node, is
+    /// `am_badarg`. The `false` is the reply a target that terminated before the request
+    /// could be satisfied produces (`erlang.erl:3097-3103`).
     ///
     /// # This runtime
     ///
+    /// An internal pid the process table holds is a live local process: the oracle's `true`
+    /// is returned and a **request** is recorded for it through the one latch
+    /// ([`Runtime::request_gc`](crate::runtime::Runtime), see [`Self::request_own_gc`]) —
+    /// never a fabricated collection. The request is served at the target's next
+    /// heap-admission point or park, which is exactly the BEAM's own
+    /// "handled when appropriate" wording; this runtime cannot *block* the caller on a
+    /// cross-process system task, so the answer is the accepted request rather than the
+    /// target's completion report (the timing divergence is documented, the value is not
+    /// invented).
+    ///
+    /// A pid the table does not hold is the oracle's `false`: the request cannot be honoured,
+    /// so none is recorded and nothing is pretended.
+    ///
+    /// Any term that is not an internal pid — including an **external** (wire) pid, which
+    /// this runtime cannot resolve to a live local process and cannot send a request to
+    /// (it has no distribution links) — is the oracle's `badarg`, the C's `am_badarg` for a
+    /// non-local target. A `true` is never fabricated for a node this runtime cannot reach.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] for a non-pid (or non-internal-pid) argument; the BIF heap's own
+    /// exhaustion otherwise.
+    pub(super) fn garbage_collect_1(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let term = *args.first().ok_or(BeamError::BadArg)?;
+        let pid = ProcessId::from_eterm(term)?;
+        if !self.process_table_mut().contains(pid) {
+            // The request cannot be honoured: the oracle's `false`, and nothing recorded.
+            return self.atom("false");
+        }
+        // A live local process: accept the request exactly as `erts_internal:garbage_collect/1`
+        // does for the calling process (the same latch, no second mechanism).
+        self.runtime.request_gc(pid);
+        self.atom("true")
+    }
+
+    /// Records a GC request for the **calling** process — the body `erlang:garbage_collect/0`
+    /// and `erts_internal:garbage_collect/1` share.
+    ///
     /// A collection's root set is the **executing machine's** `x[0..live)` plus its Erlang
     /// stack, and a BIF running inside [`ExecutionContext`](beam_engine::ExecutionContext)
-    /// owns neither — so this BIF records a *request* on the runtime
+    /// owns neither — so the BIF records a *request* on the runtime
     /// ([`Runtime::request_gc`](crate::runtime::Runtime)) and returns the oracle's `true`.
     /// The request is served at the engine's heap-admission point
     /// ([`crate::context::gc::ensure_heap`]) or, if the process parks first, at the runner's
     /// park arm (`Runtime::serve_gc_request`) — both of which own the machine's root set.
     ///
-    /// The value is therefore the oracle's `true` for `minor` **and** `major` alike: the
-    /// runtime records *that* a collection was asked for, and the two modes differ only in
-    /// the collector's own escalation policy (`beam_gc::Collector::collect` picks a minor or
-    /// a fullsweep from the live set and the growth table), which this BIF does not
-    /// second-guess.
+    /// Only a **scheduled process** — the one whose young heap the collector owns — can be
+    /// collected. Every other context (the `-eval` evaluator, a single-pass `run_*`)
+    /// allocates on the pointer-stable runtime arena, which no collection ever moves, so a
+    /// request for it would be a no-op pretending to be work; the call is the oracle's `true`
+    /// and nothing more.
     ///
     /// **No collection is ever pretended.** `Runtime::gc_stats()`'s `collections` moves only
     /// when a collection really ran. A request from a process whose collection is pinned,
@@ -306,10 +376,28 @@ impl RuntimeContext<'_> {
     /// the counters untouched. A request that no collection point is ever reached for (a
     /// process that asks and then returns without allocating or parking) is pruned when its
     /// heap dies; there is nothing left to collect.
+    fn request_own_gc(&mut self) {
+        if !self.owns_process_table() {
+            let pid = self.pid();
+            self.runtime.request_gc(pid);
+        }
+    }
+
+    /// `erts_internal:garbage_collect/1` — the runtime's **on-demand collection**, which
+    /// both `erlang:garbage_collect/0` and `/1`'s `self()` clause reduce to.
     ///
-    /// A context that is not a scheduled slice (the `-eval` evaluator, a single-pass
-    /// `run_*`) allocates on the pointer-stable arena, which no collection touches, so no
-    /// request is recorded for it: the call is the oracle's `true` and nothing more.
+    /// # Ground truth
+    ///
+    /// `erts/emulator/beam/bif.c:4081-4094` (`erts_internal_garbage_collect_1`): the atom
+    /// `minor` requests a relaxed collection, `major` a fullsweep and anything else is
+    /// `badarg` (`am_badarg`); the C then runs `erts_garbage_collect` and returns `am_true`.
+    ///
+    /// The value is the oracle's `true` for `minor` **and** `major` alike: the runtime
+    /// records *that* a collection was asked for, and the two modes differ only in the
+    /// collector's own escalation policy (`beam_gc::Collector::collect` picks a minor or a
+    /// fullsweep from the live set and the growth table), which this BIF does not
+    /// second-guess. The latch, the serving points and the honest refusals are
+    /// [`Self::request_own_gc`]'s.
     ///
     /// # Errors
     ///
@@ -321,13 +409,7 @@ impl RuntimeContext<'_> {
             Some("minor") | Some("major") => {}
             _ => return Err(BeamError::BadArg),
         }
-        // Only a scheduled process — the one whose heap the collector owns — can be
-        // collected. Every other context runs on the runtime-wide arena, which the
-        // collector never moves, so a request for it would be a no-op pretending to be work.
-        if !self.owns_process_table() {
-            let pid = self.pid();
-            self.runtime.request_gc(pid);
-        }
+        self.request_own_gc();
         self.atom("true")
     }
 
@@ -2325,6 +2407,67 @@ mod tests {
             "a non-scheduled context owns no movable heap to collect"
         );
     }
+
+    /// `erlang:garbage_collect/0` answers the oracle's `true` and records **no** request —
+    /// this context is not a scheduled slice, so it owns no movable heap to collect.
+    ///
+    /// Oracle (`erl -noshell -eval 'erlang:garbage_collect()'`): `true`.
+    #[test]
+    fn erlang_garbage_collect_0_answers_the_oracles_true() {
+        let mut runtime = runtime();
+        let answer =
+            call(&mut runtime, "erlang", "garbage_collect", &[]).expect("the oracle's `true`");
+        assert_eq!(runtime.atom_name_of(answer), Some("true"));
+        assert_eq!(
+            runtime.gc_stats().collections,
+            0,
+            "a non-scheduled context owns no movable heap to collect"
+        );
+    }
+
+    /// `erlang:garbage_collect/1` mirrors the oracle: a **live local pid** (the caller's own
+    /// `self()`) ⇒ `true` and a request recorded for that pid; a well-formed internal pid the
+    /// table does not hold ⇒ the oracle's `false` with nothing recorded; anything that is not
+    /// an internal pid ⇒ the C's `badarg`.
+    ///
+    /// Oracle: `garbage_collect(self())` ⇒ `true`, `(foo | 123 | [Pid])` ⇒ `error:badarg`,
+    /// and a pid that has already died ⇒ `false`.
+    #[test]
+    fn erlang_garbage_collect_1_matches_the_oracle() {
+        let mut runtime = runtime();
+        let me = runtime.self_pid();
+
+        // A live local pid: the oracle's `true`, and the request lands on the **target**.
+        let answer = call(&mut runtime, "erlang", "garbage_collect", &[me.to_eterm()])
+            .expect("a live local pid is served");
+        assert_eq!(runtime.atom_name_of(answer), Some("true"));
+        assert!(
+            runtime.gc_request_pending(me),
+            "the request is recorded for the target pid"
+        );
+
+        // A pid the table does not hold: the oracle's `false`, and nothing is pretended.
+        let absent = make_internal_pid(make_pid_data(1, 0x0FFF_FFFF));
+        let answer = call(&mut runtime, "erlang", "garbage_collect", &[absent]).expect("served");
+        assert_eq!(runtime.atom_name_of(answer), Some("false"));
+        let absent_pid = ProcessId::from_eterm(absent).expect("a well-formed internal pid");
+        assert!(
+            !runtime.gc_request_pending(absent_pid),
+            "a request that cannot be honoured is never recorded"
+        );
+
+        // Anything that is not an internal pid is the C's `am_badarg`.
+        let foo = atom(&mut runtime, "foo");
+        let not_a_pid = heap_term(&mut runtime, |context| {
+            terms::make_list(context, &[me.to_eterm()])
+        });
+        for bad in [foo, make_small(123), not_a_pid] {
+            let error = call(&mut runtime, "erlang", "garbage_collect", &[bad])
+                .expect_err("only an internal pid is accepted");
+            assert!(matches!(error, BeamError::BadArg), "got {error:?}");
+        }
+    }
+
     /// A BIF this module does not serve is `None` from `erts_internal_call`, so the call
     /// falls through — never a fabricated value. On a code-path-less runtime the module
     /// load then fails honestly.

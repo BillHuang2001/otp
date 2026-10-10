@@ -270,6 +270,30 @@ pub(crate) trait NifHostServices {
         let _ = pid;
         None
     }
+
+    /// Whether `port` names a **live** port — the one relation behind [`NifHost::is_port_alive`]
+    /// (`!!erts_port_lookup`, `erl_nif.c:2344`).
+    ///
+    /// The default `None` is "this provider cannot answer" (there is no port registry). A provider
+    /// that *holds* the registry always answers: a term that is not a port names no live port, so
+    /// it is `Some(false)` — never a fabricated `true`.
+    fn is_port_alive(&mut self, port: Eterm) -> Option<bool> {
+        let _ = port;
+        None
+    }
+
+    /// Send `data` to the port `port` — the relation behind [`NifHost::port_command`]
+    /// (`erts_port_output_async`, `erl_nif.c:1097-1133`: the **port's input direction**, the same
+    /// stream `erlang:port_command/2` writes to).
+    ///
+    /// `Some(true)` when the bytes were handed to the port; `Some(false)` for every way the C's
+    /// `enif_port_command` reports failure (a non-port, non-iodata data, a port the runtime does
+    /// not hold, a failed write). The default `None` is "cannot answer" — `enif_port_command` maps
+    /// both a `false` and a `None` to its own `0`, and never a fabricated `1`.
+    fn port_command(&mut self, port: Eterm, data: Eterm) -> Option<bool> {
+        let _ = (port, data);
+        None
+    }
 }
 
 /// The concrete [`NifHostServices`] over a runtime's own reference id space, reference registry
@@ -286,6 +310,13 @@ pub(crate) struct RuntimeNifServices<'a> {
     pub(crate) references: &'a mut HashMap<Eterm, Option<MonitorRef>>,
     /// The process table a registered name is resolved against.
     pub(crate) processes: &'a ProcessTable,
+    /// The runtime's port registry — where [`NifHostServices::is_port_alive`] and
+    /// [`NifHostServices::port_command`] are answered (contract A.4).
+    ///
+    /// A `&RefCell` (not `&mut`) so it is a **disjoint** borrow of the runtime that co-exists with
+    /// the other fields; the lock is taken only for the length of one port operation. A nested
+    /// borrow is reported as the "cannot answer" `None`, never a panic.
+    pub(crate) ports: &'a std::cell::RefCell<crate::port::PortRegistry>,
 }
 
 impl NifHostServices for RuntimeNifServices<'_> {
@@ -314,6 +345,38 @@ impl NifHostServices for RuntimeNifServices<'_> {
     /// a non-internal-pid term is `Some(false)`.
     fn is_process_alive(&mut self, pid: Eterm) -> Option<bool> {
         Some(ProcessId::from_eterm(pid).is_ok_and(|pid| self.processes.is_process_alive(pid)))
+    }
+
+    /// The port registry's own liveness test — the relation
+    /// [`NifHost::is_port_alive`] answers, `erl_nif.c:2344`'s `!!erts_port_lookup`. A term that is
+    /// not a port names no live port, so it is `Some(false)`; the registry being borrowed is the
+    /// only "cannot answer".
+    fn is_port_alive(&mut self, port: Eterm) -> Option<bool> {
+        let Ok(id) = beam_process::PortId::from_eterm(port) else {
+            return Some(false);
+        };
+        let registry = self.ports.try_borrow().ok()?;
+        Some(registry.is_live(id))
+    }
+
+    /// Writes `data` to `port`'s stream — the C's `erts_port_output_async(prt, c_p->common.id,
+    /// msg)` (`erl_nif.c:1097-1133`), i.e. the port's **input** direction, which is exactly what
+    /// [`crate::port::PortRegistry::write_command`] does for `erlang:port_command/2,3`.
+    ///
+    /// `data` is flattened with [`crate::native::port::iodata_bytes`] — the port stream's own
+    /// acceptance rule. Every failure the C reports as `0` (a non-port, non-iodata data, a port the
+    /// runtime does not hold, a failed write) is `Some(false)`; only a borrowed registry is `None`.
+    /// Never a fabricated `true`.
+    fn port_command(&mut self, port: Eterm, data: Eterm) -> Option<bool> {
+        let Ok(id) = beam_process::PortId::from_eterm(port) else {
+            return Some(false);
+        };
+        let mut bytes = Vec::new();
+        if crate::native::port::iodata_bytes(data, &mut bytes).is_err() {
+            return Some(false);
+        }
+        let mut registry = self.ports.try_borrow_mut().ok()?;
+        Some(registry.write_command(id, &bytes).is_ok())
     }
 }
 
@@ -535,6 +598,29 @@ impl NifHost for NifHostImpl<'_> {
         self.services.as_mut()?.is_process_alive(pid)
     }
 
+    /// `enif_is_port_alive(env, port)` — whether `port` names a live port.
+    ///
+    /// Delegates to the borrowed [`NifHostServices`], whose provider holds the runtime's port
+    /// registry and answers the C's own relation (`!!erts_port_lookup`, `erl_nif.c:2344`). A
+    /// non-port term names no live port, so the provider's `Some(false)` — not the "cannot answer"
+    /// `None`; with no provider (the load/unload host) the trait default `None` is returned, and
+    /// `enif_is_port_alive` then answers `0` — never a fabricated liveness.
+    fn is_port_alive(&mut self, port: Eterm) -> Option<bool> {
+        self.services.as_mut()?.is_port_alive(port)
+    }
+
+    /// `enif_port_command(env, to_port, msg_env, msg)` — send `msg` to `to_port`.
+    ///
+    /// Delegates to the borrowed [`NifHostServices`], which flattens the message as iodata and
+    /// writes it to the port's stream (the C's `erts_port_output_async`, the port's input
+    /// direction). A non-port, non-iodata data or a port the runtime does not hold is the
+    /// provider's `Some(false)`, which `beam_abi` turns into the C's `0`; with no provider (the
+    /// load/unload host) the trait default `None` is returned for the same `0` — never a fabricated
+    /// `1`.
+    fn port_command(&mut self, port: Eterm, data: Eterm) -> Option<bool> {
+        self.services.as_mut()?.port_command(port, data)
+    }
+
     /// `enif_is_current_process_alive(env)` — whether **this host's** process is still alive.
     ///
     /// The C asks the calling process's own PCB, `!ERTS_PROC_IS_EXITING(c_p)` (`erl_nif.c:2319`),
@@ -740,6 +826,7 @@ mod tests {
             refs: &mut runtime.refs,
             references: &mut runtime.references,
             processes: &runtime.processes,
+            ports: &runtime.ports,
         }
     }
 

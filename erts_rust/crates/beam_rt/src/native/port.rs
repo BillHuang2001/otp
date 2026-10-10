@@ -216,9 +216,10 @@ impl RuntimeContext<'_> {
     ///
     /// The reply is an Erlang **list of byte integers** — `write_port_control_result`
     /// (`io.c:4098-4175`) renders the bytes with `buf_to_intlist` whenever the driver did **not**
-    /// set `PORT_CONTROL_FLAG_BINARY` (a binary is the flag's own form, and the driver adapter
-    /// tracks no control flags yet), which is what the oracle answers for every reply length
-    /// below the flag.
+    /// set `PORT_CONTROL_FLAG_BINARY`. A driver that *did* set the flag — `set_port_control_flags`
+    /// from its `control` callback, recorded in the port's control-flag cell — gets a **binary**
+    /// instead, which is the oracle's own shape for both modes (measured: a list reply is
+    /// `[97,98,99]`, a flagged reply `<<97,98,99>>`, and a `NULL` reply pointer `[]`).
     ///
     /// # Errors
     ///
@@ -231,17 +232,25 @@ impl RuntimeContext<'_> {
         let operation = Self::term_to_uint(*args.get(1).ok_or(BeamError::BadArg)?)?;
         let data = *args.get(2).ok_or(BeamError::BadArg)?;
         // The registry is reached through a cheap clone of its `Rc` handle, exactly as
-        // `port_command` does, so the reply term is built after the borrow is released.
+        // `port_command` does, so the reply term is built after the borrow is released. The
+        // binary/list decision is read *after* the call: that is when the driver's `control`
+        // callback has had its chance to set `PORT_CONTROL_FLAG_BINARY` (`io.c:4403-4411`).
         let ports = std::rc::Rc::clone(&self.runtime.ports);
-        let reply = {
+        let (reply, binary) = {
             let mut registry = ports
                 .try_borrow_mut()
                 .map_err(|_| error::unsupported("the port table is already in use"))?;
             let mut bytes = Vec::new();
             self.iodata_bytes(data, &mut bytes)?;
-            registry.port_control(port, &operation.to_string(), &bytes)?
+            let reply = registry.port_control(port, &operation.to_string(), &bytes)?;
+            let binary = registry.control_binary(port);
+            (reply, binary)
         };
-        Self::int_list(self, &reply)
+        if binary {
+            terms::make_heap_binary(self, &reply)
+        } else {
+            Self::int_list(self, &reply)
+        }
     }
 
     /// `term` as a `Uint` — the C's `term_to_Uint`: a non-negative integer that fits `UINT_MAX`,

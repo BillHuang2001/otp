@@ -149,9 +149,11 @@ use std::time::{Duration, Instant};
 pub mod driver;
 pub(crate) mod watch;
 use beam_alloc::Heap;
+use beam_abi::driver::types::PORT_CONTROL_FLAG_BINARY;
 use beam_bifs::PortHook;
 use beam_common::{BeamError, Result};
 use beam_engine::terms;
+use libc::c_int;
 use beam_io::{
     Driver, Event, Poller, PortCommandOptions, PortExitReason, PortNotification,
     PortRegistry as IoPortRegistry, SpawnDriver, SpawnOptions, SpawnSpec, SpawnStream,
@@ -352,6 +354,18 @@ struct PortMeta {
     ///
     /// `None` for every port without a C driver (a `spawn`/`fd` port).
     driver_atoms: Option<driver::DriverAtoms>,
+    /// The control flags a `{spawn_driver, Name}` port's C driver last set through
+    /// `set_port_control_flags` — the C's `prt->control_flags` (`io.c:5318`).
+    ///
+    /// Read **after** a `control` callback to pick the reply's Erlang form: a list of byte
+    /// integers, or a binary when `PORT_CONTROL_FLAG_BINARY` is set (`write_port_control_result`,
+    /// `io.c:4133-4175`). Seized from the host with [`driver::DriverPort::control_flags`] before
+    /// the host is moved into the port lifecycle (the boxed driver exposes no host), the same way
+    /// [`PortMeta::driver_terms`] and [`PortMeta::driver_atoms`] are.
+    ///
+    /// `None` for every port without a C driver (a `spawn`/`fd` port) — one whose `control` reply
+    /// is the oracle's own `badarg`.
+    driver_control_flags: Option<Rc<Cell<c_int>>>,
 }
 
 /// A message a live port has produced: the child's stream bytes, or its reaped exit status.
@@ -628,6 +642,23 @@ impl PortRegistry {
     /// its own (see [`driver::DriverPortAdapter::control_reply`]).
     pub fn port_control(&mut self, id: PortId, op: &str, arg: &[u8]) -> Result<Vec<u8>> {
         self.registry.port_control(&mut self.poller, id, op, arg)
+    }
+
+    /// Whether `id`'s C driver asked for a **binary** `erlang:port_control/3` reply
+    /// (`PORT_CONTROL_FLAG_BINARY`).
+    ///
+    /// The C reads the port's `control_flags` **after** the driver's `control` callback and renders
+    /// the reply as a binary when that bit is set, as a list of byte integers otherwise
+    /// (`write_port_control_result`, `io.c:4133-4175`). Call this after
+    /// [`PortRegistry::port_control`], which is when the driver has set its flags.
+    ///
+    /// `false` for an unknown port and for every port without a C driver (a `spawn`/`fd` port),
+    /// whose `control` reply is the oracle's `badarg` in the first place.
+    pub fn control_binary(&self, id: PortId) -> bool {
+        self.meta
+            .get(&id.number())
+            .and_then(|meta| meta.driver_control_flags.as_ref())
+            .is_some_and(|flags| flags.get() & PORT_CONTROL_FLAG_BINARY != 0)
     }
 
     /// The registry's port-number table, mutably — the seam the **port-monitor** BIFs drive.
@@ -1548,6 +1579,10 @@ impl PortHook for RuntimePorts {
             // The same seize for the names the driver may intern in a later callback: without this
             // handle a name it predicts would never reach the live atom table.
             let driver_atoms = host.pending_atoms();
+            // And for the port's control flags: the driver sets them from inside a `control`
+            // callback through `set_port_control_flags`, and the runtime reads them back to pick
+            // the reply's Erlang form (a list, or a binary in `PORT_CONTROL_FLAG_BINARY` mode).
+            let driver_control_flags = host.control_flags();
             let adapter =
                 driver::DriverPortAdapter::load(&candidates, &driver_name, host, spec.command.clone())
                     .map_err(|_| BeamError::BadArg)?;
@@ -1563,6 +1598,7 @@ impl PortHook for RuntimePorts {
                 kind: PortName::SpawnDriver,
                 driver_terms: Some(driver_terms),
                 driver_atoms: Some(driver_atoms),
+                driver_control_flags: Some(driver_control_flags),
             };
             let mut registry = self.registry_mut()?;
             return registry.register(Box::new(adapter), meta);
@@ -1590,9 +1626,10 @@ impl PortHook for RuntimePorts {
             owner: self.owner,
             kind: spec.kind,
             // A `spawn`/`fd` port has no C driver, so it has neither driver term queue nor names
-            // a driver interned.
+            // a driver interned, nor control flags.
             driver_terms: None,
             driver_atoms: None,
+            driver_control_flags: None,
         };
         // The registry stays borrowed across `register`: starting a port cannot re-enter a
         // port operation, and a nested borrow is a typed error rather than a panic.
