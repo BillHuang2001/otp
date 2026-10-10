@@ -71,11 +71,11 @@
 //!   (`first_lookup`/`next_lookup`, resp. `last_lookup`/`prev_lookup`) and applies
 //!   `lists:foldl`/`lists:foldr` to each key's object list. `foldr` therefore
 //!   reverses each key's object list for every kind, but walks the keys backwards
-//!   only where the interior can — for a **hash** kind (`set`/`bag`/
-//!   `duplicate_bag`) `ets:last_lookup`/`ets:prev_lookup` alias the forward
-//!   primitives ([`has_backward_walk`]), so `foldr` visits the keys in the *same*
-//!   order as `foldl` and only the objects within each key are reversed (a `bag`
-//!   holding `{1,a},{1,b}` yields `a,b` for `foldl` and `b,a` for `foldr`); an
+//!   only where the interior can — `beam_ets`'s hash interiors define `last`/`prev`
+//!   as `first`/`next` (`erl_db_hash.c:853-856`), so for a **hash** kind
+//!   (`set`/`bag`/`duplicate_bag`) `foldr` visits the keys in the *same* order as
+//!   `foldl` and only the objects within each key are reversed (a `bag` holding
+//!   `{1,a},{1,b}` yields `a,b` for `foldl` and `b,a` for `foldr`); an
 //!   `ordered_set` additionally walks its keys last-to-first, so there `foldr` is
 //!   the exact reverse of `foldl`. An **empty table returns
 //!   `Acc0` without ever calling the fun** (so a non-fun is only observable on a
@@ -150,7 +150,7 @@ use crate::print::proper_list;
 use crate::registry::BifRegistry;
 
 use super::resolve::{caller_owner, owner_of, resolve_handle, Gate};
-use super::{copy_out, has_backward_walk, restore_table, take_table_gated};
+use super::{copy_out, restore_table, take_table_gated};
 
 /// Registers the adopted `ets:*` verbs (see the module docs for the scope and for
 /// the honest gaps).
@@ -446,10 +446,11 @@ fn fold(ctx: &mut BifContext<'_>, args: &[Eterm], reverse: bool) -> Result<Eterm
 /// *keys*, each key's object list folded with `lists:foldl`/`lists:foldr`. That
 /// gives two independent directions:
 ///
-/// * the **key walk** — reversed only when the interior can actually walk
-///   backwards, i.e. only for an `ordered_set` ([`has_backward_walk`]); a hash
-///   kind's `last_lookup`/`prev_lookup` alias the *forward* primitives, so `foldr`
-///   visits the keys in the very same order as `foldl` there;
+/// * the **key walk** — a `foldr` starts at [`Table::last`] and steps with
+///   [`Table::prev`]; only an `ordered_set` actually walks backwards, because a
+///   hash interior's `last`/`prev` **are** its `first`/`next`
+///   (`erl_db_hash.c:853-856`), so `foldr` visits a hash kind's keys in the very
+///   same order as `foldl`;
 /// * the **object list of each key** — reversed for `foldr` (the `lists:foldr`
 ///   over `Objects`), for every kind.
 ///
@@ -462,8 +463,7 @@ fn collect_objects(
     out: &mut Vec<Eterm>,
     ctx: &mut BifContext<'_>,
 ) -> Result<()> {
-    let backward_keys = reverse && has_backward_walk(table);
-    let mut key = if backward_keys {
+    let mut key = if reverse {
         table.last(atoms)
     } else {
         table.first(atoms)
@@ -479,7 +479,7 @@ fn collect_objects(
                 out.push(copy_out(object, ctx)?);
             }
         }
-        key = match if backward_keys {
+        key = match if reverse {
             table.prev(current, atoms)
         } else {
             table.next(current, atoms)

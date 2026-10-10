@@ -121,7 +121,7 @@ segment wider than 64 bits is *unsupported*; a bignum is `system_limit`.
 ## Scheduler / runner
 A blocked receiver is resumed by a sender (send→wake→resume), a due `send_after/3` timer, or a fired
 `receive ... after T` deadline. `src/runner/` returns `RunOutcome::Yield` once the per-slice budget is
-spent (one reduction per heap-admission point, `ensure_heap`), keeping the parked `Machine` at
+spent (one reduction per heap-admission point, `ensure_heap`/`ensure_heap_full`), keeping the parked `Machine` at
 `current_code` and letting the scheduler re-enqueue — so an allocating loop is pre-empted and a second
 runnable process interleaves (`tests/preempt.rs`). Gaps: a loop **without** an allocation has no
 admission point; a `receive ... after T` whose delay is `after infinity` or is not a statically
@@ -261,8 +261,9 @@ heaps (the BIF-heap pool + the `-eval` heap) are plain bump arenas sized `config
 is a **real** cap on that capacity (`runtime.rs::term_heap_words`). The `system_limit` translation is
 applied **after** the copy engine's own retry (so `deliver_message` still matches the **raw**
 `AllocKind::Message` to trigger the heap-fragment retry). This crate **does** drive `beam_gc`: a *scheduled* process allocates on its own young heap and is
-collected at `ExecutionContext::ensure_heap` (armed by the slice's `BudgetContext`, roots = `x[0..live)`
-plus the Erlang stack), pinned by `tests/gc_collect.rs` and reported by `Runtime::gc_stats()`; every
+collected at `ExecutionContext::ensure_heap`/`ensure_heap_full` (sharing `collect_or_grow`; the latter is the
+full-root door `test_heap` reaches, handing over the FR file too; armed by the slice's `BudgetContext`, roots
+= `x[0..live)` plus the Erlang stack), pinned by `tests/gc_collect.rs` and reported by `Runtime::gc_stats()`; every
 other context is a no-op on the unbounded arena. The limits are honest and measured: a workload that
 allocates only through `ExecutionContext::alloc_words` (no `test_heap` admission point, as real Cowboy
 `cowboy_bstr`-style code does) always falls back to the pointer-stable arena and is never collected
@@ -274,7 +275,7 @@ become `error::system_limit` via `error::enforce_term_heap_limit` — `AllocKind
 bump allocator) **and** `AllocKind::Message` (the copy engine's destination-heap exhaustion, classified
 by `beam_message::is_message_heap_exhaustion`) → CLI `beam_rt: system_limit`, exit 1.
 **On-demand heap growth is adopted at the engine's heap-admission point and on the `beam_process`
-message-delivery path.** `src/context/gc.rs::ensure_heap` runs the collector's on-demand **growth**
+message-delivery path.** `src/context/gc.rs::ensure_heap`/`ensure_heap_full` (sharing `collect_or_grow`) run the collector's on-demand **growth**
 (`Process::ensure_capacity`) whenever the process's own heap-size policy can reach the request
 (`HeapPolicy::next_words(need, 0) >= need`) and a plain `Process::collect` otherwise, so a `test_heap`
 request larger than the nursery is admitted by growing it in place (`tests/heap_growth.rs`).
@@ -341,12 +342,6 @@ re-fetch.
   a pid image carries reflect a live `-sname`/`-name` node; the residual is the **creation** — the hook
   still reports the fixed `0` where a live `crate::dist::DistNode::creation()` exists, so an internal
   pid/port image on a wired node encodes creation `0`.
-* **`beam_codec` / `beam_bifs` — the local-identifier decode.** `binary_to_term/1` must normalise a
-  local-node `NEW_PID_EXT` (`88`)/`V4_PORT_EXT` to an **internal** pid/port (the C's
-  `dec_pid`/`dec_is_this_node`, `external.c:3123-3195`), which needs the local identity installed on the
-  decoder (`beam_codec::Decoder::with_local_node` from `beam_bifs::binconv::decode_term_bif`; `beam_bifs`'s
-  `binconv.rs` never installs it). Until then `binary_to_term(term_to_binary(self())) =:= self()` is
-  `false` — `tests/pid_roundtrip.rs` pins that as a deliberate tripwire.
 * **Distribution, phase 2** — the inbound link/exit/monitor/alias `DOP_*` families need a
   `beam_process` **remote-peer** seam (plus an alias table); `DOP_SEND`/`DOP_REG_SEND` already reach
   local mailboxes, and a live-peer loop past the handshake needs the `FragmentAssembler` receive-buffer

@@ -176,10 +176,10 @@
 //! `ets:select_reverse/1,2,3` lives in the child module [`reverse`] and is a thin
 //! wrapper over `beam_ets`'s native reverse family
 //! (`Table::select_reverse`/`select_reverse_limit`/`select_reverse_continue`): for
-//! an `ordered_set` results come in **descending** key order, for the hash kinds
-//! the oracle leaves the order unspecified and the native form yields the reverse
-//! of `select`'s order. Reverse continuations live in the *shared*
-//! [`TableRegistry::continuations`] map alongside the forward ones — a
+//! an `ordered_set` results come in **descending** key order, while a hash kind has
+//! no backward walk — its `last`/`prev` are `first`/`next` — so the reverse yields
+//! `select`'s own sequence, element for element. Reverse continuations live in the
+//! *shared* [`TableRegistry::continuations`] map alongside the forward ones — a
 //! [`Continuation`] records the **direction** it was minted with, and
 //! `ets:select/1` / `ets:select_reverse/1` share one dispatcher
 //! ([`dispatch_continuation`]) so resuming follows the *stored* direction, as the
@@ -1131,21 +1131,19 @@ fn first_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `ets:last(Tab)` — the last key in the table's iteration order.
 ///
-/// A **hash** kind (`set`/`bag`/`duplicate_bag`) has no backward walk, and the
-/// oracle aliases `ets:last/1` to `ets:first/1` there — the C runs the *forward*
-/// primitive for every non-`ordered_set` kind. Only an `ordered_set` reads the
-/// real end of its order. This mirrors `nav::last_lookup_1` exactly (the two
-/// verbs must never disagree). Verified against the system `erl` (OTP 29.1.1 /
-/// erts-17.1): keys `[6,3,4,8,1]` in a `set` give `first` `6`/`last` `6`, while an
-/// `ordered_set` gives `first` `1`/`last` `8`.
+/// The hash-kind alias is [`Table::last`]'s own: a hash interior defines its
+/// `last_key` as `first_key` (the C
+/// `db_first_hash, db_next_hash, db_first_hash, db_next_hash` function table,
+/// `../../erts/emulator/beam/erl_db_hash.c:853-856`), so `ets:last/1` answers
+/// `ets:first/1`'s key for `set`/`bag`/`duplicate_bag` and only an `ordered_set`
+/// reads the real end of its order. Delegating keeps this verb and
+/// `nav::last_lookup_1` from ever disagreeing. Verified against the system `erl`
+/// (OTP 29.1.1 / erts-17.1): keys `[6,3,4,8,1]` in a `set` give `first` `6`/`last`
+/// `6`, while an `ordered_set` gives `first` `1`/`last` `8`.
 fn last_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
-    let key = if table.kind().is_ordered() {
-        table.last(ctx.atoms())
-    } else {
-        table.first(ctx.atoms())
-    };
+    let key = table.last(ctx.atoms());
     restore_table(ctx, handle, table)?;
     key_or_end(ctx, key)
 }
@@ -1172,13 +1170,14 @@ fn next_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `ets:prev(Tab, Key)` — the key preceding `Key` (mirrors [`next_2`]).
 ///
-/// Mirroring [`last_1`]'s alias: a **hash** kind answers with the *forward* step
-/// ([`Table::next`] — the oracle's behaviour: `prev` is aliased to `next` there),
-/// only an `ordered_set` with the real predecessor. The chosen primitive's
-/// `badarg` (a hash kind requires the anchor key to be present) propagates
-/// unchanged. Verified against the system `erl` (OTP 29.1.1 / erts-17.1): keys
-/// `[6,3,4,8,1]` give `next(T,3)` `4`/`prev(T,3)` `4` for a `set` and
-/// `next(T,3)` `4`/`prev(T,3)` `1` for an `ordered_set`.
+/// As with [`last_1`], the hash-kind alias is [`Table::prev`]'s own: a hash
+/// interior defines its `prev_key` as `next_key` (the same C function table), so a
+/// `set`/`bag`/`duplicate_bag` answers what [`Table::next`] answers and only an
+/// `ordered_set` steps to the real predecessor. [`Table::prev`]'s `badarg` (a hash
+/// kind requires the anchor key to be present) propagates unchanged. Verified
+/// against the system `erl` (OTP 29.1.1 / erts-17.1): keys `[6,3,4,8,1]` give
+/// `next(T,3)` `4`/`prev(T,3)` `4` for a `set` and `next(T,3)` `4`/`prev(T,3)` `1`
+/// for an `ordered_set`.
 fn prev_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let key = args[1];
@@ -1187,11 +1186,7 @@ fn prev_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         restore_table(ctx, handle, table)?;
         return Err(badarg());
     }
-    let outcome = if table.kind().is_ordered() {
-        table.prev(key, ctx.atoms())
-    } else {
-        table.next(key, ctx.atoms())
-    };
+    let outcome = table.prev(key, ctx.atoms());
     restore_table(ctx, handle, table)?;
     key_or_end(ctx, outcome?)
 }
@@ -1539,21 +1534,6 @@ pub(super) fn key_or_end(ctx: &mut BifContext<'_>, key: Option<Eterm>) -> Result
 /// working.
 pub(super) fn is_end_of_table_key(ctx: &BifContext<'_>, key: Eterm) -> bool {
     is_atom(key) && ctx.atoms().name(atom_val(key)) == Some(END_OF_TABLE)
-}
-
-/// Whether `table`'s interior implements a genuine **backward** key walk.
-///
-/// Only an `ordered_set` does. The hash interiors (`set`/`bag`/`duplicate_bag`)
-/// define no `last_key`/`prev_key`, so the oracle **aliases** the reverse
-/// navigators to the forward ones for them — `ets:last/1` ≡ `ets:first/1`,
-/// `ets:prev/2` ≡ `ets:next/2`, `ets:last_lookup/1` ≡ `ets:first_lookup/1` and
-/// `ets:prev_lookup/2` ≡ `ets:next_lookup/2` (pinned in [`nav`]).
-///
-/// This is the single home of that rule: the `nav` bridge and the `adopt` fun-folds
-/// both key off it, and `beam_ets::Table::last`/`prev` are left alone so the
-/// interior keeps its own semantics.
-pub(super) fn has_backward_walk(table: &Table) -> bool {
-    table.kind().is_ordered()
 }
 
 /// The 1-based element position argument of `lookup_element`/`update_element`,

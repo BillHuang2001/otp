@@ -503,24 +503,27 @@ impl RecordSource for RecordBridge<'_> {
 
 /// The `beam_bifs` local-node-identity seam: this runtime's **own** node.
 ///
-/// The identity is runtime state, not a constant. `term_to_binary/1` of an **internal**
-/// pid/port id needs the local node's name atom and creation to emit `NEW_PID_EXT`
-/// (`88`)/`V4_PORT_EXT` (`120`), and `node/0` is the identity's atom. The runtime is the only
-/// thing that knows it — `-name`/`-sname` makes it a distributed node named `node@host`,
-/// otherwise it is the fixed `nonode@nohost` — and it is interned in the one shared atom table
-/// at construction ([`Runtime::local_node`] is that single source of truth), so the hook is
-/// filled from there rather than from a hard-coded name.
+/// The identity is runtime state, not a constant, and **both** directions consume it.
+/// `term_to_binary/1` of an **internal** pid/port id needs the local node's name atom and
+/// creation to emit `NEW_PID_EXT` (`88`)/`V4_PORT_EXT` (`120`), and `node/0` is the identity's
+/// atom. The runtime is the only thing that knows it — `-name`/`-sname` makes it a distributed
+/// node named `node@host`, otherwise it is the fixed `nonode@nohost` — and it is interned in the
+/// one shared atom table at construction ([`Runtime::local_node`] is that single source of
+/// truth), so the hook is filled from there rather than from a hard-coded name.
 ///
-/// The decoding direction is supposed to read the *same* identity: `binary_to_term/1` would
-/// use it to recognise an incoming identifier that names this node (`beam_codec`'s
-/// `is_local_node`, the C's `dec_is_this_node`) and normalise it to an internal id. That half
-/// is not implemented — `beam_bifs` never installs a local node on its decoder — so the hook
-/// is consumed by the encoder only today.
+/// The decoding direction reads the *same* identity: `beam_bifs::binconv::decode_term_bif`
+/// installs it on `beam_codec`'s decoder (`Decoder::with_local_node`; the compressed path
+/// goes through the free `decode_term_with_local_node`), which uses it to recognise an
+/// incoming identifier that names this node (`beam_codec`'s `is_local_node`, the C's
+/// `dec_is_this_node`) and demote it back to an **internal** id. So `beam_codec`'s encoder
+/// writes the local-node image and the decoder normalises it — which is what makes
+/// `binary_to_term(term_to_binary(self())) =:= self()` hold (and the `~w` printer render it,
+/// matching the oracle).
 ///
-/// Keeping the identity live is what makes the two directions agree on a **named** node once
-/// the decoder half lands: the atom `term_to_binary` writes for an internal pid is the very
-/// atom a decoded `NEW_PID_EXT` is compared against, so a `-sname`/`-name` runtime no longer
-/// stamps its pids with `nonode@nohost`.
+/// Keeping the identity live is what makes the two directions agree on a **named** node: the
+/// atom `term_to_binary` writes for an internal pid is the very atom a decoded `NEW_PID_EXT`
+/// is compared against, so a `-sname`/`-name` runtime no longer stamps its pids with
+/// `nonode@nohost`.
 ///
 /// The atom is `Copy` (resolved once, before the context borrows the shared table), so the
 /// hook needs **no** runtime borrow and can be installed in every
@@ -538,10 +541,10 @@ impl LocalNode for NodeIdentity {
         // creation is not carried here — this seam's struct holds only the node atom, and
         // its shape is pinned by the colocated unit test — so the name is live while the
         // creation stays the undistributed default. The encoder reads this hook, so
-        // `term_to_binary/1` of an internal pid stamps exactly this identity. The decoder
-        // does **not** read it yet (`beam_bifs`'s `binary_to_term/1` never installs a local
-        // node on its `beam_codec` decoder), so a decoded local identifier stays external —
-        // a `beam_bifs` gap this crate only supplies the identity for.
+        // `term_to_binary/1` of an internal pid stamps exactly this identity; the decoder
+        // reads it too — `beam_bifs`'s `binary_to_term/1` (`binconv::decode_term_bif`)
+        // installs it on its `beam_codec` decoder, so a decoded local identifier is demoted
+        // back to the internal id and `binary_to_term(term_to_binary(self())) =:= self()`.
         self.node.map(|node| (node, 0))
     }
 }
