@@ -397,14 +397,24 @@ The rationale (why) behind the frozen API and constraints lives in **`DESIGN_DEC
   signal-vs-message ordering barrier remain follow-ups. The queue itself is unbounded (a `VecDeque`,
   matching the oracle's effectively-unbounded signal queue) with total, defensive GC gather/scatter — it
   has no overflow or panic path.
-- **`Message::from` is not a GC root, yet a named-monitor `'DOWN'` stores an on-heap term in it (un-relocated young-heap root).**
-  `Process::run_rooted_collection` gathers only each queued message's `payload` (`src/process.rs:945`) and re-enqueues every drained
-  envelope around that relocated payload (`:974`), so `from` is **never** relocated. The ordinary send path stores an internal-pid
-  immediate (relocation-free), but `ProcessTable`'s named-monitor DOWN enqueues `Message::new(term, target_term)` where `target_term`
-  is the on-heap `{Name, node}` tuple (`src/ptab.rs:1919`) — so after a collection that message's `from` is a stale young-heap pointer
-  (the copy inside `payload` is relocated, the `from` copy is not). Reachable via `erlang:monitor(process, Name)` on a named target
-  plus a later GC; not on the `format_exception` path (no monitor). `Process::exit_reason` (`:291`) is likewise not gathered, but it is
-  set only in `terminate_into` (`src/ptab.rs:1415`) immediately before the PCB is dropped, so no collection runs after it.
+- **`Message::from` is NOT a GC root — every producer must store an immediate.** `Process::run_rooted_collection`
+  gathers only each queued message's `payload` (`src/process.rs`) and re-enqueues the envelope around that relocated payload, so
+  `from`/`token` are never relocated. `Message::from` must therefore be an **immediate**, matching the C's
+  `ASSERT(is_immed(ERL_MESSAGE_FROM(msg)))` (`erl_proc_sig_queue.c:8441`), where the `{Name,node}` pair / external pid live in the
+  message **body** instead. Every in-crate producer now satisfies this: the send paths store the sender pid immediate; a
+  process-monitor `'DOWN'` stores the resolved target pid immediate (`build_and_enqueue_down`); a **failed-by-name** named monitor
+  stores the `system` atom (`deliver_named_noproc_down`, the C's `am_system`); the port builders store the port immediate; the
+  **remote** DOWN/EXIT store the **node atom** (`enqueue_remote_down_message`/`enqueue_remote_exit_message`, the C's DIST_PROC/
+  DIST_PORT rule). `tests/message_from_is_immediate.rs` pins each. Residual (host contract, not fixed here): a caller that hands
+  `Process::deliver` an on-heap `from` term gets no relocation — the general hardening (a `beam_message::Message` `from` setter +
+  gathering `from` in the root set) is owned by the sibling `beam_message`/host.
+- **`Process::exit_reason` is not gathered, but is unreachable by a collection (audited).** It is written only in
+  `terminate_into` (`src/ptab.rs`), immediately **after** `take(pid)` and before the PCB drop, and read only through
+  `ProcessTable::exit_reason` — which needs a live pid `take` has already removed — so no collection can invalidate it. Caveat:
+  a future change that reads it post-collection or re-inserts a terminated PCB would need it rooted. (Divergence from the C, which
+  keeps a dead pid's exit reason observable via `process_info`; here `exit_reason` answers `TermNotFound`.)
+- **`Message::token` has no producer in this crate** (always `NIL`) and is likewise not gathered — a future `with_token` of an
+  on-heap term would hit the same class as `from`.
 - **The `noproc` DOWN is delivered eagerly (documented deviation).** `monitor/2` on a non-live target
   materialises `{'DOWN', Ref, process, Target, noproc}` straight into the watcher's mailbox, so
   `process_info(self(), message_queue_len)` reports 1 immediately after the call where the oracle reports
