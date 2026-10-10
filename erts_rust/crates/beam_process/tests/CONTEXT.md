@@ -158,14 +158,28 @@ SMP pool:
     during development, then restored). Deterministic — every size from the public heap-policy arithmetic,
     no sleeps / wall-clock bounds.
 29. `common/mod.rs` — the **shared oracle driver** used by `registry_monitors.rs`, `dict_oracle.rs`,
-    `monitor_tag.rs`, `capability_inventory.rs` and `port_monitor_cleanup.rs`: `ERL_TIMEOUT`,
-    `erl_stdout`, `expect_oracle` and `strip_logger_reports` (+ 4 unit tests for the normalizer). It runs
+    `monitor_tag.rs`, `lifecycle_oracle.rs`, `capability_inventory.rs` and `port_monitor_cleanup.rs`:
+    `ERL_TIMEOUT`, `erl_stdout`, `expect_oracle` and `strip_logger_reports` (+ 4 unit tests for the
+    normalizer). It runs
     `erl -noshell -kernel logger_level none -eval …` (the `none` level deterministically suppresses the
     `=ERROR REPORT====` block a crashed probe helper would otherwise race onto **stdout**) and normalizes
     the captured stdout (a report block — a line starting with `=`, through the next blank line — is
     removed), so a comparison is exact and never flaky. A support module (subdirectory files are not
     compiled as test targets); it carries `#![allow(dead_code)]` because not every including binary uses
     every helper.
+30. `lifecycle_oracle.rs` (7 tests) — the **lifecycle / process-control semantics** cross-checked against
+    the real `erl` (skips loudly when absent), filling the cases the other `oracle_*` suites leave
+    unpinned: link exit propagation from a **live** linked origin (a non-trapping peer dies, a trapping
+    peer survives with `{'EXIT', A, {bad,1}}`, and the watcher's DOWN carries the same structured
+    reason); **`kill` under `trap_exit`** (an untrappable `killed` death of a trapping process, with a
+    trapping link peer receiving `{'EXIT', P, killed}` and a `killed` DOWN); the `noproc`/`normal`/
+    `killed` exit-reason **shapes** at a trapping peer (incl. an explicit `killed` being *trappable*,
+    unlike the `kill` sentinel); `erlang:exit/2` propagating a structured reason verbatim with `From` the
+    signaller; the registry's `register`/`whereis`/`registered`/`unregister` round trip; `demonitor`
+    `[info]` bool semantics (with the born-down divergence **documented, not asserted for parity**); and
+    `demonitor(Ref, [flush])` removing a queued DOWN for a **pid** target. Every oracle expression is
+    synchronized on a message (no sleeps); variable names are kept distinct per receive in the `-eval`
+    text so no earlier binding is silently re-used as a pattern.
 
 ## Constraints
 - **Anti-flakiness (BINDING).** Every assertion is forced by **synchronization**, never a bare
