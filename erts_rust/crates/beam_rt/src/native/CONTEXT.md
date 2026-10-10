@@ -559,7 +559,7 @@ needs:
 - **`last_calls` ⇒ `false` is a real divergence** — `Process::save_calls()` holds a real flag (`memory/mod.rs:803`).
 - `application.rs:388-409` `app_env_props` reads the `.app` resource's `env` list verbatim, so kernel's start-time `logger`/`connect_all` injections are absent ⇒ `application:get_env(kernel,connect_all)` is `undefined` here vs `{ok,true}` on the oracle.
 - `init:get_argument(bindir)` (`init.rs:89`) real value unused (falls through to `error`; the doc at `:140` records it).
-- `file_server.rs` does not serve `{write_file,Name,Data}` (`:337-357`) though `prim_file:write_file/2` IS implemented (`prim.rs:188`).
+- `file_server.rs` does not serve `{write_file,Name,Data}` (`:338-352`, its served server request surface) though `prim_file:write_file/2` IS implemented (`prim.rs:188`).
 - `context/process_bridge.rs:323-331` `process_flag(error_handler, A)` accepts an atom where the oracle raises `badarg` (owner `context/`).
 All other constants are truthful defaults or derive from real state (`application.rs:98`/`:194-196`, `code.rs:49`/`:183-185`, `init.rs:127-175`, `port.rs:148-154`/`:282-301`).
 
