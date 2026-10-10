@@ -496,6 +496,12 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   reference** (an on-heap `Ref` thing), whose C hash mixes `internal_ref_numbers(x)[0]` (an id of the
   running node's container this representation does not carry). Maps to `BeamError::BadArg` (never a
   wrong hash value). The internal structural `term_hash` is unaffected (deterministic fallback).
+- `TermError::BadRef` — a reference layout helper or accessor was applied to a term that is not an M1
+  internal-reference thing: `boxed::internal_ref_id` on a non-term, a boxed term of another kind, a
+  *C-layout* `ErtsORefThing` block (whose M1 id word does not exist), or a block whose id word is not a
+  non-negative small integer. Maps to `BeamError::BadArg` (never a wrong id). Deliberately distinct from
+  `RefIdentityUnavailable` (a well-formed M1 reference with an unreproducible C hash) and from
+  `NotATerm` (the word is not a term at all).
 
 ## Constraints
 - **Bit-exact layout (Level-1 drop-in).** Every constant, mask, shift and encoding must match
