@@ -310,9 +310,10 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   truth is an internal `Expr::Bool` (independent of whether `true`/`false` are interned). Anything
   outside the recognised set ⇒ `compile`/`expr` `badarg`.
 - `exec.rs` — `impl Table`'s select family + `pub enum BodyKind` (`WholeObject`/`AllBindings`/
-  `LiteralTrue`) that reuses the compiler for `ets:match*`. `select_replace` is value-validated (the
-  clause value must be a tuple of arity ≥ keypos whose keypos element equals the matched key, else
-  whole-call `badarg`), supported on set/ordered_set/duplicate_bag (`bag` ⇒ `badarg`). A BODY runtime
+  `LiteralTrue`) that reuses the compiler for `ets:match*`. `select_replace` runs the C's **static** body
+  check (`static_keeps_key`/`clause_keeps_key`, mirroring `db_match_keeps_key`): a body that is not
+  `'$_'`/`{{…}}`/`{const,{…}}`/`{element,KeyPos,'$_'}` is whole-call `badarg` even when nothing matches;
+  supported on set/ordered_set/duplicate_bag (`bag` ⇒ `badarg`). A BODY runtime
   failure is replaced by the atom `EXIT` and evaluation continues (the C `FAIL_TERM`). `guards_hold`
   returns `Result<bool>`: a guard the oracle would itself raise (`BadArg`) or a non-`true`/non-boolean
   guard skips the clause, while a **capability gap** (e.g. the `ArithHook`'s `unsupported_ets`)
@@ -421,8 +422,9 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 - **Ownership/heir semantics are a `Table`-level concern, not an access-mode one.** `give_away/3` and
   `setopts/2` do not consult `protection`; they are owner-gated. The heir is stored as a full `Heir`
   for the runtime's `{'ETS-TRANSFER',…}` message, but `ets:info` renders only the pid.
-- **`insert_list` is atomic; `select_replace/2` is a two-phase value-validated rewrite** (any invalid
-  value aborts with `badarg` leaving the table unchanged; the C check is static — see Known Issues).
+- **`insert_list` is atomic; `select_replace/2` is a two-phase rewrite with the C's static body check**
+  (a body outside `'$_'`/`{{…}}`/`{const,{…}}`/`{element,KeyPos,'$_'}` aborts with `badarg` — even with
+  no match — leaving the table unchanged; a valid body is applied atomically).
 - **Match-spec arithmetic routes through the `ArithHook` seam** (a `thread_local`), keeping wave-1
   `beam_ets` free of a `beam_bifs` dependency; candidate to lift into `beam_term` later.
 - **Continuations are opaque owned values, not terms** (table id + compiled spec + limit + position),
@@ -522,23 +524,21 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `BEAM_ETS_BENCH_SIZES`/`BEAM_ETS_BENCH_SHAPES`.
 - Crate-level integration over the **public API**: `tests/ets_{basic,order,select,bag,info,nav,access,
   update,replace,continuation,continuation_direction,set_access,ownership,fixtable,shared,options,rename,
-  reclamation,concurrency}.rs`, `tests/select.rs`, `tests/match_spec_run.rs`, sharing helpers from
-  `tests/common/`, and the live-`erl` plumbing in `tests/common/oracle.rs`.
+  reclamation,concurrency,store_terms}.rs`, `tests/select.rs`, `tests/match_spec_run.rs`, sharing helpers
+  from `tests/common/`, and the live-`erl` plumbing in `tests/common/oracle.rs`. `ets_store_terms.rs`
+  cross-checks every newly-copyable boxed kind (hash map, each fun kind, external pid/port/ref, bitstring,
+  refc binary) through `Table::insert`/`lookup` against the oracle's `phash2`.
 - **Differential evidence suite** (the compatibility gate): `tests/differential.rs` runs **157 cases**
   (14 group files `tests/differential/battery/*.rs`, the embedded oracle program in
   `erl_program.rs`) identically under the system `erl` (OTP 29.1.1 / erts-17.1) and under `beam_ets`,
-  comparing canonical renderings line-by-line. Every case agrees **except** `select_guard_is_integer3`,
-  which is red: it exposed that `guard::is_integer3` compares the upper bound the wrong way (see Known
-  Issues) — the gate doing its job. `KNOWN_DIVERGENCES` records the 2 match-spec-arithmetic cases, where
-  `beam_ets` answers the typed `unsupported_ets` the corpus shows as a loud honest gap, never a wrong
-  result. The oracle is **required by default** — a genuinely absent `erl` FAILS the cross-check rather
-  than skipping it (`BEAM_ETS_ALLOW_NO_ORACLE=1` opts out with a loud skip;
-  `BEAM_ETS_REQUIRE_ORACLE=1` forces the requirement).
-- **Gates:** `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_ets`
-  currently reports **528 passed / 2 failed** — the 2 failures are the two differential tests that
-  compare `select_guard_is_integer3`; every other case and every other test binary is green (including
-  the 8 compile-fail doctests). `… --workspace` inherits those same 2 failures; every other crate is
-  unaffected. Forced-oracle: `BEAM_ETS_REQUIRE_ORACLE=1 erts_rust/scripts/cargo.sh test
+  comparing canonical renderings line-by-line — **every case agrees**. `KNOWN_DIVERGENCES` records the
+  2 match-spec-arithmetic cases, where `beam_ets` answers the typed `unsupported_ets` the corpus shows as
+  a loud honest gap, never a wrong result. The oracle is **required by default** — a genuinely absent
+  `erl` FAILS the cross-check rather than skipping it (`BEAM_ETS_ALLOW_NO_ORACLE=1` opts out with a loud
+  skip; `BEAM_ETS_REQUIRE_ORACLE=1` forces the requirement).
+- **Gates:** `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_ets` is green
+  (0 failures across every test binary, including the 8 compile-fail doctests); `… --workspace` likewise.
+  Forced-oracle: `BEAM_ETS_REQUIRE_ORACLE=1 erts_rust/scripts/cargo.sh test
   --manifest-path erts_rust/Cargo.toml -p beam_ets --test differential`.
 
 ## Known Issues (honest gaps — not full parity)
@@ -607,8 +607,16 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   ordinal, so a mutation between chunks can skip or repeat an object relative to the oracle. Every
   single-chunk and no-mutation-between-chunks case agrees (the 157-case battery covers the latter); the
   divergence only appears across a resume straddling a mutation.
-- **Deep-copy is a subset.** Funs, hash-maps, records, external pid/port/ref and off-heap bin
-  refs/sub-bitstrings cannot be copied into table storage (`insert` ⇒ `BadArg`).
+- **Deep-copy covers every kind the oracle accepts in `ets:insert/2`.** Immediates, cons cells, tuples,
+  flat **and hash** maps (HAMT/collision nodes copied node-by-node, no `AtomTable` needed), funs (all
+  three kinds — header/descriptor verbatim + deep-copied env), boxed leaves (float, bignum, internal ref,
+  on-heap bitstring), **external pid/port/reference** (raw data words, `node` slot deep-copied) and
+  **sub-bitstrings / off-heap refc binaries** (re-materialised as self-contained on-heap bitstrings — the
+  payload is gathered, no off-heap pointer survives) all copy into table storage. The residual typed gaps
+  (`BadArg`, never a wrong result) are a bare `BinRef` root (never a standalone term), a native record
+  (`RECORD_SUBTAG`), the reserved boxed subtags, a bare header word, and a malformed `ErlSubBits` (null
+  base or `end < start`). Evidence: `src/store/tests.rs` (per-kind units + the accounting invariant) and
+  `tests/ets_store_terms.rs` (live-oracle cross-check).
 - **The match-spec compiler covers essentially the whole `guard_tab[]`.** The decoder
   (`src/select/expr/{mod,guard}.rs`) accepts the connectives, the comparisons, the type tests, the
   guard BIFs (`element/2`, `size/1`, `hd/1`, `tl/1`, `length/1`, `map_get/2`, `is_map_key/2`,
@@ -629,20 +637,19 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   calling process: a semantic under-match); `abs/1`/`bnot/1` on a bignum, `trunc`/`round`/`ceil`/`floor`
   beyond the 60-bit small range and non-small-integer arithmetic via `DefaultArithHook` are the typed
   `unsupported_ets`; `binary_part/2,3` on a non-byte-aligned source is `badarg`, as the oracle.
-  **`is_integer/3` is defective:** `guard::is_integer3` compares the lower bound correctly but the upper
-  one the wrong way (`Value >= Upper` instead of `Value =< Upper`), so it misses the interior of the
-  range and over-matches everything at or above `Upper` — `{'is_integer','$2',5,25}` over
-  `{1,3}`/`{2,10}`/`{3,30}` selects `[3]` here and `[2]` in the oracle (the differential case
-  `select_guard_is_integer3` is red on exactly this; the fix is that one comparison). `byte_size`/
+  `byte_size`/
   `bit_size` on an off-heap refc binary are **parity** (the `[BinRef][ErlSubBits]` root classifies as a
   bitstring). A match-spec **body** runtime failure yields the atom `EXIT` resolved from the caller's
   `AtomTable` (`select::exec::exit_term`), so a host running a raising body must pre-intern `EXIT`
   (real runtimes do); an uninterned `EXIT` ⇒ typed `badarg`.
-- **`select_replace/2`'s key check is value-based, not the C's static syntactic check.** The oracle
-  (`db_match_keeps_key`) rejects a body that is not syntactically `'$_'`/`{{…}}`/`{const,{…}}`/
-  `{element,KeyPos,'$_'}` even when nothing matches; this crate validates the *value*, so an exotic
-  multi-expression body diverges (pinned by the `recorded_divergence_*` tests). Wherever the oracle
-  accepts, the results agree.
+- **`select_replace/2`'s key check is the C's static syntactic check** (`db_match_keeps_key`). A
+  replacement clause whose body is not syntactically `'$_'`/`{{…}}`/`{const,{…}}`/`{element,KeyPos,'$_'}`
+  is `badarg` for the whole call, even when nothing matches, exactly like the oracle (pinned by the
+  `static_check_*` tests and the `replace` battery). The check runs on the decoded AST
+  (`select::exec::{static_keeps_key, clause_keeps_key}`); two exotic shapes remain approximated (a
+  call-shaped raw tuple inside a `{const, X}` subterm compared against a literal head tuple, and the
+  double-tuple unwrap inside a const subterm) — reachable only from hand-written specs, never a wrong
+  result for any spec the battery or the oracle probes exercise.
 - **`cmp_arith`'s big-integer↔float key comparison is a best-effort `f64` approximation** (a
   pre-existing `beam_term` gap). ERTS compares an integer key against a float key numerically;
   `number_as_f64` rounds an out-of-range bignum to `±inf`. Every representable integer/float pair

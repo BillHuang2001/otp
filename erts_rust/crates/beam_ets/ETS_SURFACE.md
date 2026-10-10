@@ -1,7 +1,7 @@
 # ETS surface census — where every `ets:*` operation lives
 Static census of the **real** ETS surface OTP 29 / erts-17.1 exposes, against this workspace.
 Purpose: a future agent must not re-derive "is `ets:X` implemented, and where?".
-Gate source of truth for *behaviour* is the differential suite (`tests/differential.rs`, **135 cases**,
+Gate source of truth for *behaviour* is the differential suite (`tests/differential.rs`, **157 cases**,
 live oracle, `mismatch = 0`, `KNOWN_DIVERGENCES` empty); this file is the *coverage* map.
 Three owners exist:
 * **`beam_ets`** (this crate) — the table state + the observable `ets:*` semantics.
@@ -55,7 +55,7 @@ Three owners exist:
 | `select/2`, `select/3`, `select/1` | implemented | `beam_ets::Table::{select, select_limit, select_continue}` |
 | `select_count/2` | implemented | `beam_ets::Table::select_count` |
 | `select_delete/2` | implemented | `beam_ets::Table::select_delete` |
-| `select_replace/2` | implemented | `beam_ets::Table::select_replace` (two-phase value-validated rewrite; `bag` ⇒ `badarg`, `duplicate_bag` rewrites each matched copy) |
+| `select_replace/2` | implemented | `beam_ets::Table::select_replace` (the C's **static** body check `db_match_keeps_key`: a body outside `'$_'`/`{{…}}`/`{const,{…}}`/`{element,KeyPos,'$_'}` ⇒ whole-call `badarg` even with no match; then a two-phase rewrite — `bag` ⇒ `badarg`, `duplicate_bag` rewrites each matched copy) |
 | `select_reverse/1,2,3` | implemented | `beam_bifs::ets::reverse` (**read**-gated), thin wrappers over `beam_ets::Table::{select_reverse, select_reverse_limit, select_reverse_continue}`; `/1` shares the direction-aware `dispatch_continuation` with `ets:select/1`, so a resumed continuation keeps its original direction |
 | `match/2`, `match/3`, `match/1` | implemented | `beam_ets::Table::{match_, match_limit, match_continue}` |
 | `match_object/2`, `/3`, `/1` | implemented | `beam_ets::Table::{match_object, match_object_limit, match_object_continue}` |
@@ -75,7 +75,7 @@ Three owners exist:
 | `table/1,2`, `clear/1` | missing | stdlib `ets.erl` wrappers |
 | `size/1` | not an OTP export | correct absence (`ets:info(T, size)` is the spelling) |
 ## 6. Oracle-probed semantic facts pinned by the differential suite
-These are the reference answers, each compared against the live `erl` (`tests/differential`, 135 cases).
+These are the reference answers, each compared against the live `erl` (`tests/differential`, 157 cases).
 * **Access matrix.** `requester == owner` ⇒ read + write always. Otherwise: `public` ⇒ read + write;
   `protected` ⇒ read only; `private` ⇒ neither. Every denial is `badarg`.
   * `ets:info/1` and `ets:info/2` are **never** access-gated (a non-owner may `info` a `private` table).
@@ -126,6 +126,15 @@ These are the reference answers, each compared against the live `erl` (`tests/di
   and `update_element` are `badarg`; `select_replace/2` works on `duplicate_bag` but is `badarg` on
   `bag`; hash-kind navigation raises `badarg` for an absent anchor (an `ordered_set` reads it as a
   range bound).
+* **`select_replace/2` enforces the C's static body check** (`db_match_keeps_key`): a replacement clause
+  whose body is not syntactically `'$_'`, a tuple construction `{{…}}`, `{const,{…}}` or
+  `{element,KeyPos,'$_'}` (with `KeyPos` the *table's* keypos) makes the whole call `badarg` even when
+  nothing matches, and the table is unchanged; `bag` is `badarg` regardless. The check runs before the
+  traversal, so a never-matching head still rejects.
+* **The copy boundary is complete.** `ets:insert/2` accepts every kind the oracle accepts — flat and
+  hash maps, funs (local/external/imported), external pid/port/reference and bitstrings/refc binaries
+  included — deep-copied into table-owned storage; only a bare `BinRef`, a native record, the reserved
+  subtags and a malformed `ErlSubBits` are the typed `badarg` (never a wrong result).
 * **Read results and the copy boundary.** A read returns a term **aliasing table-owned storage**; a
   term read through the multi-threaded handle ([`SharedTable`]) is a guard-scoped `TableTerm` that
   cannot outlive its guard (a compile error), and callers that need to keep a term copy it out
