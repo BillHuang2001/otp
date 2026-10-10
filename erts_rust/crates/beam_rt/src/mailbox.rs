@@ -28,9 +28,12 @@
 //!
 //! * the **scan cursor** ([`QueueCursor`]) that `loop_rec` peeks at and `loop_rec_end`
 //!   advances;
-//! * the **marker table** the `recv_marker_*` prologue saves positions in.
+//! * the **marker table** the `recv_marker_*` prologue saves positions in;
+//! * the **retained payloads** — the heap fragments and off-heap refc-binary handles of every
+//!   message removed on `remove_message`, kept alive past the message's own drop so the term
+//!   the running code bound stays valid ([`MailboxState::remove_at`]).
 //!
-//! Neither can live in a per-call context: a `receive` that suspends on an empty
+//! None of this state can live in a per-call context: a `receive` that suspends on an empty
 //! mailbox is resumed later — possibly only after another process has delivered a
 //! message — and the scan must continue exactly where it stopped. The state is
 //! therefore stored **per process**, keyed by [`ProcessId`](beam_process::ProcessId) in
@@ -48,6 +51,7 @@
 //! `unsafe`-free: every queue access is a bounds-safe [`Queue`] method (a past-the-end
 //! cursor or an empty queue yields `None`, never a panic).
 
+use beam_alloc::RefcBinary;
 use beam_message::{Fragments, Message, Queue, QueueCursor};
 use beam_term::{is_small, make_small, Eterm};
 
@@ -94,6 +98,20 @@ pub(crate) struct MailboxState {
     /// mailbox from outside `beam_process` (see the crate `CONTEXT.md` handoff). The
     /// fragments are released when the process's scan state is.
     retained_fragments: Vec<Fragments>,
+    /// The off-heap refc-binary handles of every removed message whose payload owned one.
+    ///
+    /// A payload copied **from another process** carries its off-heap payloads as
+    /// [`RefcBinary`] handles on the message envelope ([`Message::binaries`]): the copy
+    /// re-registers each off-heap binary it moved, and the message — not the receiver's
+    /// machine — owns those handles. The running code holds only the copied term, so
+    /// dropping the message on `remove_message` would release the last handle (once the
+    /// sender has terminated) and leave the bound term pointing at freed memory. The handles
+    /// are kept alive here instead, exactly like [`MailboxState::retained_fragments`]: each
+    /// clone bumps the payload's reference count, so the payload survives the `Message`
+    /// drop, and the runner can resolve the term's payload when it copies the term out of the
+    /// process ([`Runtime::stabilize_term_with`](crate::runtime::Runtime::stabilize_term_with)).
+    /// Released when the process's scan state is.
+    retained_binaries: Vec<RefcBinary>,
 }
 
 impl MailboxState {
@@ -104,19 +122,39 @@ impl MailboxState {
         self.retained_fragments.len()
     }
 
-    /// Removes the message at `cursor`, keeping a **fragment-resident** payload alive.
+    /// The off-heap refc-binary handles this scan is keeping alive (see
+    /// [`MailboxState::retained_binaries`]).
     ///
-    /// The only difference from a bare [`Queue::remove_at`] is what happens to a message
-    /// that owns [`Fragments`]: they are taken off the message (which is then dropped) and
-    /// retained on this state, so the payload term the running code holds stays valid. A
-    /// message whose payload lives in the receiver's heap is dropped exactly as before.
+    /// The runner feeds these into the copy's **source** off-heap table when it transports a
+    /// process's return value or exit reason onto the runtime's pointer-stable arena, so a
+    /// binary **received from another process** resolves like a locally built one.
+    pub(crate) fn retained_binaries(&self) -> &[RefcBinary] {
+        &self.retained_binaries
+    }
+
+    /// Removes the message at `cursor`, keeping a **fragment-resident** or **off-heap**
+    /// payload alive.
+    ///
+    /// The only difference from a bare [`Queue::remove_at`] is what happens to a message that
+    /// owns [`Fragments`] or refc-binary handles: the fragments are taken off the message and
+    /// the handles cloned (refcount++) onto this state before the message drops, so the
+    /// payload term the running code holds stays valid (see
+    /// [`MailboxState::retained_fragments`] and [`MailboxState::retained_binaries`]). A
+    /// message whose payload lives entirely in the receiver's heap is dropped exactly as
+    /// before.
     pub(crate) fn remove_at(&mut self, queue: &mut Queue, cursor: QueueCursor) {
         if let Some(mut message) = queue.remove_at(cursor) {
             if let Some(fragments) = message.fragments_mut() {
                 self.retained_fragments.push(std::mem::take(fragments));
             }
+            // Clone (refcount++) the envelope's refc-binary handles before the message drops,
+            // so a payload that arrived from another process outlives it.
+            self.retained_binaries
+                .extend(message.binaries().iter().cloned());
         }
-    }    /// `loop_rec`: the payload of the message at the scan position, `None` when the
+    }
+
+    /// `loop_rec`: the payload of the message at the scan position, `None` when the
     /// scan is exhausted (an empty queue, or every candidate already scanned past).
     ///
     /// **Peeks** — the cursor does not move; only [`MailboxState::skip`] advances it.
@@ -135,8 +173,8 @@ impl MailboxState {
     /// first message.
     ///
     /// A cursor past the end (an empty queue) removes nothing but still repositions. A
-    /// removed message that owns heap [`Fragments`] hands them to this state so the payload
-    /// stays valid ([`MailboxState::remove_at`]).
+    /// removed message that owns heap [`Fragments`] or off-heap refc-binary handles hands them
+    /// to this state so the payload stays valid ([`MailboxState::remove_at`]).
     pub(crate) fn remove(&mut self, queue: &mut Queue) {
         self.remove_at(queue, self.cursor);
         self.cursor = queue.cursor();

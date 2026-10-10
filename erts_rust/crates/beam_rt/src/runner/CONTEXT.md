@@ -23,13 +23,16 @@ module free of a module-context switch (`Step::Enter`), the interpreter everywhe
 * [`run`] — `RuntimeRunner`: the `ProcessRunner` implementation (one reduction slice) — the tier
   selection (once, at the first entry) and the tier-aware first-entry/resume execution, the
   parked-machine root publication (`publish_parked_roots`/`resume_from_process_roots`) and the
-  recorded outcome. Both recorded terms are transported with the **machine's off-heap handles**
-  (`engine.machine.refc_binaries()`, which is why they are stabilized *before* the engine goes back
-  into — or is dropped out of — `RunnerState`): the return value through
+  recorded outcome. Both recorded terms are transported with an off-heap source table built by
+  [`source_binaries`] — the executing **machine's** handles (`engine.machine.refc_binaries()`)
+  **unioned** with the handles the pid's scan retained from the messages it received
+  (`MailboxState::retained_binaries`), since a payload the process *received from another process*
+  carries its handles on the message envelope, not on this machine. They are stabilized *before*
+  the engine goes back into — or is dropped out of — `RunnerState`: the return value through
   `Runtime::stabilize_term_with`, the exit reason through `Runtime::try_stabilize_escaped_with`. An
-  engine-built off-heap binary (`bs_init_writable`/`bs_create_bin` above the on-heap limit) is
-  therefore copied rather than refused with `badarg` (the return path) or kept un-copied against a
-  dangling payload (the exit path).
+  off-heap binary (`bs_init_writable`/`bs_create_bin` above the on-heap limit) is therefore copied
+  rather than refused with `badarg` (the return path) or kept un-copied against a dangling payload
+  (the exit path) — whether the process **built** it or **received** it.
 * [`budget`] — the slice's reduction budget and the wrapper context that charges it. As the
   scheduled path's outermost `ExecutionContext` it forwards every engine seam it does not itself
   implement — `send_message_with_off_heap` in particular, whose trait default would otherwise drop
@@ -121,10 +124,11 @@ the park/resume and the admission point can never drift:
   process's authoritative root set back into the machine and, if the slices no longer match, **halts the
   process's collection** (`Runtime::halt_process_gc`) rather than run against inconsistent roots.
 The runner's raise arm likewise copies the recorded exit reason through
-`Runtime::try_stabilize_escaped_with` — with the **same machine's** `refc_binaries()` as the copy's
-off-heap source, so a reason that *is* an engine-built off-heap binary (`exit(<<big/binary>>)`) is
-resolved and shared instead of tripping the valve; a reason that genuinely cannot be copied is still
-the honest `error:system_limit`, never a stored dangling word.
+`Runtime::try_stabilize_escaped_with` — with the copy's off-heap source built by `source_binaries`
+(the **same machine's** `refc_binaries()` unioned with the handles the pid retained from received
+messages), so a reason that *is* an off-heap binary (`exit(<<big/binary>>)`) is resolved and shared
+instead of tripping the valve, whether the process built it or received it; a reason that genuinely
+cannot be copied is still the honest `error:system_limit`, never a stored dangling word.
 
 ## Measured: why the default is the safe `auto` mode
 Release build (`cargo build --release -p beam_rt`), no per-process `erl` start-up (the system code
@@ -194,6 +198,10 @@ predicate-guarded `Auto`** — never the switch-blind `Baseline`, whose slice co
 * End-to-end: `slice:fib/1 10` through the scheduled path (`RuntimeRunner`) records `55` under both an
   explicit `JitMode::Auto` (→ baseline) and `JitMode::Interpreter`, and the scheduler path records it
   under whatever mode the environment selects.
+* The two transport sites' off-heap resolution is covered end to end by
+  `tests/engine_off_heap_transport.rs` — the `Returned`/exit-reason arms for a binary the process
+  **built** *and* one it **received from another process** (`received_off_heap_binaries_survive_the_transport_copy`),
+  each byte-compared with the live oracle.
 * Crate gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt`.
 
 ## Known Issues / Handoffs
@@ -224,8 +232,9 @@ predicate-guarded `Auto`** — never the switch-blind `Baseline`, whose slice co
 * `entry.rs` → `ProcessEntry`, `ProcessEngine` (incl. the remembered `tier`) + `RunnerState` (the
   `jit_mode`/`jit_safety` fields and the `jit_mode()` accessor).
 * `run.rs` → `RuntimeRunner`: the (first-entry) tier selection and the tier-aware resume, the
-  parked-machine root publication (`publish_parked_roots`/`resume_from_process_roots`) and the
-  exit-reason stabilization.
+  parked-machine root publication (`publish_parked_roots`/`resume_from_process_roots`), the
+  off-heap source-table build (`source_binaries` — the machine's handles unioned with the pid's
+  retained mailbox binaries) and the return-value / exit-reason stabilization.
 * `budget.rs` → the reduction budget + the charging wrapper context.
 * `tier.rs` → the tier mode + its `BEAM_RT_TIER` semantics (`mode_from_value`), the environment default,
   the selection and the switch-safety predicate.

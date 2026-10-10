@@ -99,6 +99,32 @@ fn resume_from_process_roots(ctx: &mut RuntimeContext<'_>, pid: ProcessId, machi
     ctx.resync_parked_roots(pid, machine);
 }
 
+/// The copy's **source** off-heap table for a term about to leave `pid`'s process: the payload
+/// handles `machine_handles` the running machine built, followed by the handles `pid` retained
+/// from the messages it received ([`MailboxState::retained_binaries`], reachable through
+/// [`Runtime::mailboxes`](crate::runtime::Runtime)).
+///
+/// A term the process **built** resolves through its machine's handles
+/// ([`Machine::refc_binaries`](beam_engine::Machine::refc_binaries)); a term it **received from
+/// another process** resolves through the handles the removed message left on its scan state,
+/// because the machine that built that payload is a different process. A term may hold both, so
+/// the two sets are combined.
+///
+/// `None` when `pid` retained nothing — the caller then passes `machine_handles` straight
+/// through, which is the common case and allocates nothing.
+fn source_binaries(
+    runtime: &Runtime,
+    pid: ProcessId,
+    machine_handles: &[beam_alloc::RefcBinary],
+) -> Option<Vec<beam_alloc::RefcBinary>> {
+    let retained = runtime.mailboxes.get(&pid)?.retained_binaries();
+    if retained.is_empty() {
+        return None;
+    }
+    let mut combined: Vec<beam_alloc::RefcBinary> = machine_handles.to_vec();
+    combined.extend_from_slice(retained);
+    Some(combined)
+}
 impl ProcessRunner for RuntimeRunner<'_> {
     /// Runs one slice of process `pid`: its first entry, or the resume of the `receive`
     /// that suspended it.
@@ -438,13 +464,21 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 //
                 // The machine is still in scope and holds the off-heap payload handles for
                 // the refc binaries it built (a `bs_init_writable` accumulator, or any
-                // `bs_create_bin` result above the on-heap limit), so the copy resolves them
-                // through this machine's handles instead of refusing the term with the empty
-                // source table the simple form uses (see
+                // `bs_create_bin` result above the on-heap limit); a binary the process
+                // **received** from another process carries its handles on this pid's scan
+                // state instead. The copy's source table is the union of the two
+                // (`source_binaries`), so both resolve instead of refusing the term with the
+                // empty source table the simple form uses (see
                 // [`Runtime::stabilize_term_with`](crate::runtime::Runtime::stabilize_term_with)).
-                let value = self
-                    .runtime
-                    .stabilize_term_with(value, engine.machine.refc_binaries())?;
+                let value = {
+                    let retained =
+                        source_binaries(self.runtime, pid, engine.machine.refc_binaries());
+                    let src: &[beam_alloc::RefcBinary] = match retained.as_deref() {
+                        Some(combined) => combined,
+                        None => engine.machine.refc_binaries(),
+                    };
+                    self.runtime.stabilize_term_with(value, src)?
+                };
                 self.state.results.insert(pid, value);
                 Ok(RunOutcome::Exit(normal(self.runtime)))
             }
@@ -499,12 +533,20 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 // `Runtime::try_stabilize_escaped_with`.
                 //
                 // The machine is still in scope and owns the off-heap payload handles for the
-                // refc binaries it built, so the copy resolves them (a reason like
-                // `exit(<<big/binary>>)` would otherwise trip the valve over a payload the
-                // empty source table could not resolve).
-                let reason = self
-                    .runtime
-                    .try_stabilize_escaped_with(reason, engine.machine.refc_binaries())?;
+                // refc binaries it built, while a binary the process **received** from another
+                // process carries its handles on this pid's scan state; the copy's source table
+                // is the union of the two (`source_binaries`), so a reason like
+                // `exit(<<big/binary>>)` resolves either kind rather than tripping the valve
+                // over a payload the empty source table could not resolve.
+                let reason = {
+                    let retained =
+                        source_binaries(self.runtime, pid, engine.machine.refc_binaries());
+                    let src: &[beam_alloc::RefcBinary] = match retained.as_deref() {
+                        Some(combined) => combined,
+                        None => engine.machine.refc_binaries(),
+                    };
+                    self.runtime.try_stabilize_escaped_with(reason, src)?
+                };
                 self.state.exits.insert(pid, reason);
                 // Keep the original error as well: the reason *term* above is what the exit
                 // propagates, but only the error carries the raise class and the

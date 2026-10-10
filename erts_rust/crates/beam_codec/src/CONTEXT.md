@@ -15,7 +15,8 @@ map for the source subtree and the notes the child nodes inherit.
 - **M1 internal-reference seam (this node).** `ref_wire.rs` (crate-internal) maps a
   60-bit internal-reference `id` ↔ the 3 wire numbers of a `REFERENCE_EXT` /
   `NEW_REFERENCE_EXT` / `NEWER_REFERENCE_EXT` image (`ref_id_to_numbers` /
-  `ref_numbers_to_id`, `REF_MASK`/`REF1_NUM_MASK`/`REF_NUMBERS`); `term::ref`
+  `ref_numbers_to_id`, `representable_ref_id` — the "fits the internal id slot" gate the
+  local-node demotion consults — plus `REF_MASK`/`REF1_NUM_MASK`/`REF_NUMBERS`); `term::ref`
   (`internal_ref_id`/`make_internal_ref`) is the safe wrapper over
   `beam_term::boxed`'s frozen M1 block. The single place either mapping is written —
   both children must route through it, never re-derive it.
@@ -37,14 +38,18 @@ map for the source subtree and the notes the child nodes inherit.
 - Build/test with the wrapper: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_codec --no-fail-fast` (`$HOME` is read-only). Never `cd`.
 - Sibling `../tests/` (integration binaries) is **read-only** for this node — escalate
   test changes to `..`.
-- Local-node identifier round-trip: a local-node pid/port/ref now demotes to this
+- Local-node identifier round-trip: a local-node pid/port/ref demotes to this
   runtime's internal form on decode (when an identity is installed) and an internal
-  ref now encodes as a 3-number `NEWER_REFERENCE_EXT` (when an identity is installed);
-  both are inert with no identity (the distribution path is untouched). `decode_term`
-  stays identity-free — use `decode_term_with_local_node` for `binary_to_term`.
-- The runtime seam is not wired yet: `beam_bifs::binconv` builds its `Decoder` without
-  `with_local_node`, and its `decode_term_bif` still calls `decode_term`, so the demotion
-  is inert end-to-end until a host installs the identity.
+  ref encodes as a 3-number `NEWER_REFERENCE_EXT` (when an identity is installed);
+  both are inert with no identity (the distribution path is untouched). A **reference**
+  demotes only when its packed id fits the internal id slot, else it stays the faithful
+  external reference. `decode_term` stays identity-free — use
+  `decode_term_with_local_node` for `binary_to_term`.
+- The runtime seam is wired for the identity: `beam_bifs::binconv::decode_term_bif`
+  installs `Decoder::with_local_node` (via `BifContext::local_node`) and the
+  identity-aware entry point for the compressed path, so `binary_to_term` demotes a
+  local identifier end-to-end. The `LOCAL_EXT` node hash is still not installed by any
+  host (consumed unchecked) — a `beam_rt`/`beam_bifs` call.
 
 ## Known Issues
 - **A foreign local reference can exceed the M1 id space.** The packed id is 18+14+32
@@ -52,10 +57,15 @@ map for the source subtree and the notes the child nodes inherit.
   small, so only ids `< 2^59` are representable. A reference **this** runtime produced
   always fits and round-trips exactly; an arbitrary *oracle* `make_ref()` carries a
   nonzero scheduler `thr_id` in `num[1]` bits 0..15 (dropped by the `REF1_NUM_MASK`
-  unpack) and a 30-bit `num[1]` field, so its packed id can exceed the small range —
-  decoding one with an identity installed yields a typed `SystemLimit` (never a wrong
-  ref), and even a smaller one cannot re-encode byte-exactly (the `thr_id` bits are
-  gone). This is a documented, honest limitation, not a bug.
+  unpack) and a 30-bit `num[1]` field, so its packed id can exceed the small range. The
+  local-node demotion is **representability-gated** (`ref_wire::representable_ref_id`):
+  a local reference past the small range keeps the faithful **external** reference form
+  (never a truncated id, never a wrong term, never an error), so even such an image
+  round-trips byte-exactly — only the *internal* shape is out of reach; and a
+  representable foreign id loses the `num[1]` `thr_id`/marker bits the unpack masks, so
+  its internal re-encode need not be byte-identical. Widening the id
+  slot is a `beam_term` layout decision (**owner: `beam_term`**). This is a documented,
+  honest limitation, not a bug.
 
 ## Routing Table
 - `lib.rs` → crate wiring, root re-exports, the single `#[allow(unsafe_code)] mod term;`

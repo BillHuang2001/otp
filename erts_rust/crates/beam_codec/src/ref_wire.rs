@@ -53,9 +53,14 @@
 //! low bits of `num[1]`, plus a 30-bit `num[1]` field — identity the frozen 60-bit
 //! M1 id has no room for. Such a reference **cannot** round-trip byte-exactly and is
 //! not faked here: the unpack masks `num[1]` down to `REF1_NUM_MASK` (dropping the
-//! `thr_id`/marker bits, exactly as the value reconstruction does) and an id that
-//! does not fit a 60-bit small is refused by
-//! [`crate::term::make_internal_ref`] with a typed error — never a substituted id.
+//! `thr_id`/marker bits, exactly as the value reconstruction does).
+//!
+//! A wire image whose packed id does **not** fit the 60-bit small the M1 id slot
+//! holds (a `num[2] >= 2^28`, i.e. essentially every oracle-minted `#Ref<…>`) is
+//! therefore **not** demoted to the internal form: [`representable_ref_id`] reports
+//! `None` for it and the decoder keeps the faithful **external** reference form
+//! (which already round-trips byte-exactly), rather than refusing the image with an
+//! error or substituting a truncated id.
 
 /// `REF_MASK` (`erl_bif_unique.h:115`, `:127`): the 18-bit reference number carried
 /// in `num[0]`, bounded by `MAX_REFERENCE` (`1 << _REF_NUM_SIZE`).
@@ -98,6 +103,22 @@ pub(crate) fn ref_numbers_to_id(numbers: &[u32]) -> u64 {
     (at(0) & u64::from(REF_MASK))
         | (at(1) & u64::from(REF1_NUM_MASK))
         | (at(2) << 32)
+}
+
+/// The packed internal-reference `id` of a wire reference image, **when it fits**
+/// the single small-integer word the M1 internal-reference thing stores
+/// ([`beam_term::prelude::MAX_SMALL`]); `None` when it does not.
+///
+/// The decoder's local-node demotion is gated on this: a local reference whose
+/// packed id is representable materializes as the internal form, otherwise the
+/// faithful **external** reference form is kept (see the module doc). Mirroring the
+/// small-int range check here — rather than hard-coding a width — keeps the id slot
+/// a [`beam_term`] layout decision.
+///
+/// Never truncates: the id is either the exact pack of `numbers` or absent.
+pub(crate) fn representable_ref_id(numbers: &[u32]) -> Option<u64> {
+    let id = ref_numbers_to_id(numbers);
+    (id <= beam_term::prelude::MAX_SMALL as u64).then_some(id)
 }
 
 #[cfg(test)]
@@ -171,5 +192,33 @@ mod tests {
         // Every 60-bit id is reconstructed exactly, including the boundary.
         let max = (1u64 << 60) - 1;
         assert_eq!(ref_numbers_to_id(&ref_id_to_numbers(max)), max);
+    }
+
+    #[test]
+    fn representable_ref_id_admits_exactly_the_small_range() {
+        // The largest representable id — `MAX_SMALL` — is admitted, and its own wire
+        // numbers pack back to it.
+        let max = beam_term::prelude::MAX_SMALL as u64;
+        assert_eq!(representable_ref_id(&ref_id_to_numbers(max)), Some(max));
+        assert_eq!(representable_ref_id(&ref_id_to_numbers(0)), Some(0));
+        assert_eq!(
+            representable_ref_id(&ref_id_to_numbers(1 << 40)),
+            Some(1 << 40)
+        );
+        // One past the small range is **not** representable — no truncation.
+        assert_eq!(
+            representable_ref_id(&ref_id_to_numbers(beam_term::prelude::MAX_SMALL as u64 + 1)),
+            None
+        );
+        // A wire image whose `num[2] >= 2^27` cannot be a small: the packed id's top
+        // 32 bits already exceed the small range.
+        assert_eq!(representable_ref_id(&[0, 0, 1 << 27]), None);
+        assert_eq!(
+            representable_ref_id(&[0, 0, (1 << 27) - 1]),
+            Some((1u64 << 59) - (1u64 << 32))
+        );
+        // The zero-padding of a short image keeps `[r0]` representable (`r0` is
+        // bounded by `MAX_REFERENCE` on the wire).
+        assert_eq!(representable_ref_id(&[REF_MASK]), Some(u64::from(REF_MASK)));
     }
 }

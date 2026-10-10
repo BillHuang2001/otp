@@ -1039,6 +1039,95 @@
     }
 
     #[test]
+    fn a_local_reference_too_large_for_the_internal_form_stays_external() {
+        use crate::term::internal_ref_id;
+
+        // The gate fixture: a local-node `NEWER_REFERENCE_EXT` (90) whose third
+        // number is `0xA02C04B4`, so the packed id is far past `MAX_SMALL` — the
+        // internal M1 reference's slot cannot hold it. Such an image must still
+        // decode (a well-formed wire reference is never an error) to the faithful
+        // **external** form.
+        let image: Vec<u8> = vec![
+            131, 90, 0, 3, 119, 13, b'n', b'o', b'n', b'o', b'd', b'e', b'@', b'n', b'o', b'h',
+            b'o', b's', b't', 0, 0, 0, 0, 0, 2, 35, 202, 52, 184, 0, 8, 160, 44, 4, 180,
+        ];
+        let mut heap = Heap::new(64).expect("tiny heap allocation");
+        let mut atoms = AtomTable::new();
+        let node = atoms.intern("nonode@nohost");
+        let term = decode_term_with_local_node(&image, &mut heap, &mut atoms, node, 0, None)
+            .expect("a well-formed local wire reference decodes");
+
+        // Not the internal form…
+        assert!(
+            internal_ref_id(term).is_err(),
+            "an unrepresentable id must not become an internal reference"
+        );
+        // …the external reference instead, with every number and the creation kept.
+        let (ref_node, ids, creation) = external_ref_parts(term).expect("external reference");
+        assert_eq!(atoms.name(atom_val(ref_node)), Some("nonode@nohost"));
+        assert_eq!(ids, [0x0002_23CA, 0x34B8_0008, 0xA02C_04B4]);
+        assert_eq!(creation, 0);
+
+        // …and it re-encodes byte-for-byte: the external form is the faithful
+        // representation of this image.
+        assert_eq!(crate::encode_term(term, &atoms).unwrap(), image);
+    }
+
+    #[test]
+    fn a_local_new_reference_ext_too_large_for_the_internal_form_stays_external() {
+        use crate::term::internal_ref_id;
+
+        // The same rule for the compact `NEW_REFERENCE_EXT` (114) form: `r0` is 0,
+        // the following two numbers pack an id past `MAX_SMALL`
+        // (`0xB8000000 << 32 | 0x0223CA34 & REF1_NUM_MASK`), so the internal form is
+        // out of reach. The image re-encodes as the modern 3-number `90` form.
+        let mut image = vec![131, 114, 0, 3];
+        image.extend_from_slice(&NODE_N1);
+        image.push(0); // creation
+        image.extend_from_slice(&0u32.to_be_bytes()); // r0
+        image.extend_from_slice(&0x0223_CA34u32.to_be_bytes());
+        image.extend_from_slice(&0xB800_0000u32.to_be_bytes());
+
+        let mut heap = Heap::new(64).expect("tiny heap allocation");
+        let mut atoms = AtomTable::new();
+        let node = atoms.intern("n1");
+        let term = decode_term_with_local_node(&image, &mut heap, &mut atoms, node, 0, None)
+            .expect("a well-formed local wire reference decodes");
+        assert!(internal_ref_id(term).is_err());
+
+        let (ref_node, ids, creation) = external_ref_parts(term).expect("external reference");
+        assert_eq!(atoms.name(atom_val(ref_node)), Some("n1"));
+        assert_eq!(ids, [0, 0x0223_CA34, 0xB800_0000]);
+        assert_eq!(creation, 0);
+
+        let mut expected = vec![131, 90, 0, 3];
+        expected.extend_from_slice(&NODE_N1);
+        expected.extend_from_slice(&0u32.to_be_bytes()); // creation
+        for id in ids {
+            expected.extend_from_slice(&id.to_be_bytes());
+        }
+        assert_eq!(crate::encode_term(term, &atoms).unwrap(), expected);
+    }
+
+    #[test]
+    fn a_local_reference_with_a_representable_id_still_demotes() {
+        use crate::term::internal_ref_id;
+
+        // The boundary: a packed id exactly at `MAX_SMALL` is still representable, so
+        // the demotion happens — the gate is the small-int range, not a narrower one.
+        let max = beam_term::prelude::MAX_SMALL as u64;
+        let numbers = crate::ref_wire::ref_id_to_numbers(max);
+        let mut image = vec![131, 90, 0, 3];
+        image.extend_from_slice(&NODE_N1);
+        image.extend_from_slice(&0u32.to_be_bytes()); // creation
+        for number in numbers {
+            image.extend_from_slice(&number.to_be_bytes());
+        }
+        let (_h, _a, term) = decode_with_local_node(&image, 0);
+        assert_eq!(internal_ref_id(term).unwrap(), max);
+    }
+
+    #[test]
     fn a_compressed_local_image_demotes_through_the_entry_point() {
         use beam_term::prelude::is_internal_pid;
 
