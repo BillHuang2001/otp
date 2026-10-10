@@ -21,13 +21,14 @@
 //! **The mature generation stays proportional to the LIVE set** — the regression gate for the
 //! fullsweep sizing rule.
 //!
-//! `tests/steady_state.rs` pins the quiescent heap under a *forced* fullsweep-per-round cadence
-//! (`fullsweep_after == 0`), and `tests/nursery_bounded.rs` / `tests/memory_overhead.rs` /
-//! `tests/retained_vs_live.rs` all use that same control for the same reason. This file is the
-//! one that *omits* it: it runs the **default cadence** (`fullsweep_after = 65535`, every other
-//! sizing field at its [`HeapPolicy::default`] value) over a long-lived, *bounded* live set
-//! rebuilt fresh every round, and asserts the mature generation's capacity converges to a
-//! **constant**.
+//! `tests/steady_state.rs` pins the whole quiescent heap (nursery, mature capacity, mature
+//! occupancy and total heap) under the **default** cadence, and `tests/nursery_bounded.rs` /
+//! `tests/memory_overhead.rs` / `tests/retained_vs_live.rs` isolate the nursery or the retained
+//! word accounting under a *forced* fullsweep-per-round cadence (`fullsweep_after == 0`). This
+//! file is the one that isolates the **mature capacity** under the default cadence
+//! (`fullsweep_after = 65535`, every other sizing field at its [`HeapPolicy::default`] value)
+//! over a long-lived, *bounded* live set rebuilt fresh every round, and asserts the mature
+//! generation's capacity converges to a **constant**.
 //!
 //! That is exactly the property a fullsweep must have and the one a "size the fresh mature space
 //! from the pre-collection occupancy" rule breaks. Between two fullsweeps the mature generation

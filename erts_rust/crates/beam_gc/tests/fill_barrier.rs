@@ -418,8 +418,10 @@ fn immix_collect_major_reports_typed_heap_exhaustion_before_any_copy() {
     let err = collector
         .collect_major(&mut roots)
         .expect_err("the clamped region cannot hold the live set");
-    // 300 nursery words need ceil(300 / 16) = 19 lines; the fresh region offers 16.
-    assert_heap_exhausted(&err, 19 * 16);
+    // The fullsweep now sizes from the **exact live line need**: line-granular allocation
+    // charges one whole 16-word line per live object (a 3-word tuple still occupies a line), so
+    // the 100 live tuples need 100 lines and the fresh region offers only 16.
+    assert_heap_exhausted(&err, 100 * 16);
 
     assert_eq!(immix_state(&collector), state, "nothing was copied");
     assert_roots_untouched(&roots, collector.young(), &before);

@@ -159,13 +159,19 @@ const GARBAGE_C: usize = 1500;
 /// The heap policy both strategies share: identical sizes, and the fullsweep cadence
 /// disabled so every collection is one this file explicitly asked for — the measurement must
 /// not depend on which collection a policy happened to pick.
+///
+/// The fullsweep now sizes the fresh region from the **exact live word count**, so
+/// workload 3's 64-block region (larger than its ~1536-word live set) would otherwise be shrunk
+/// and relocated out from under the measurement. `min_heap_words` is pinned to the same
+/// 64 blocks, so `capacity == min_heap_words` and `should_shrink` can never fire: the region
+/// keeps all 32 live blocks **and** room for the promotion the workload is about.
 fn policy() -> HeapPolicy {
     HeapPolicy {
         fullsweep_after: 65535,
         initial_young_words: 8192,
         // 64 Immix blocks: enough for workload 3's 32 live blocks *and* its promotion.
         initial_mature_words: 16384,
-        min_heap_words: 8192,
+        min_heap_words: 16384,
         ..HeapPolicy::default()
     }
 }

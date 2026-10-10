@@ -40,26 +40,21 @@
 //!    every round. The **nursery** must stay bounded (a constant) while the **mature**
 //!    generation absorbs the growth, with every live term intact.
 //!
-//! ## The policy, and the one collection-control override
+//! ## The policy
 //!
 //! Both tests run under the **default sizing policy** — every sizing field at its
 //! [`HeapPolicy::default`] value, so there is **no `min_heap_words` pin**, no `max_heap_words`
-//! cap and the crate-default 233-word young / 233-word mature initial sizes. Test 2 uses the
-//! literal `HeapPolicy::default()` verbatim. Test 1 additionally forces `fullsweep_after = 0`
-//! so **each round's collection is a fullsweep**.
+//! cap, the crate-default 233-word young / 233-word mature initial sizes and the default
+//! fullsweep cadence (`fullsweep_after = 65535`). Neither test overrides a sizing knob.
 //!
-//! That override is a *measurement control*, not a sizing knob, and it is deliberate: the
-//! default cadence (`fullsweep_after = 65535`) does **not** reach a quiescent *capacity* under a
-//! fresh-graph workload, because a minor never touches the mature space — the garbage a
-//! just-promoted graph becomes keeps accumulating in the mature generation until a fullsweep,
-//! and each fullsweep then sizes the fresh mature space from its (garbage-inflated)
-//! pre-collection occupancy (`Collector::collect_major` sizes from `young.used + mature.used`),
-//! so the mature capacity creeps up one growth-table step per fullsweep (measured: 233 → 376 →
-//! 610 → 987 → … → 6772 words over 200 rounds for the copying strategy). Forcing a fullsweep
-//! per round removes that *separate* between-fullsweep accumulation effect so the loop measures
-//! the sizing fixed point itself. The 65535-cadence creep is called out honestly in the
-//! completion report rather than asserted here; the default *cadence* under a **stable reused**
-//! live set does converge (every collection is then a minor promoting nothing live).
+//! Test 1 deliberately runs that **default cadence** rather than forcing a fullsweep per round:
+//! the fullsweep now sizes its fresh mature space from the **exact reachable live word count**
+//! (`collect_major` → `crate::live`), not from the (garbage-inflated) pre-collection occupancy,
+//! so the mature capacity converges under the very cadence a plain process runs — the strongest
+//! form of the regression assertion. Sizing it from the occupancy instead makes
+//! [`HeapPolicy::should_grow`] fire on every fullsweep and creeps the capacity up one
+//! growth-table step per fullsweep, without bound, for a live set that never changes. The same
+//! property, isolated from the nursery, is pinned by `tests/mature_capacity_convergence.rs`.
 //!
 //! ## Determinism
 //!
@@ -158,26 +153,26 @@ struct Steady {
     total_heap_size: usize,
 }
 
-/// The converged steady state for the **copying** strategy. Each round's fullsweep rebuilds the
-/// mature space from the live set (60 words) plus the round's allocation, so it settles at the
-/// smallest growth-table size covering `young.used(210) + mature.used(60) + need_reserve(64) =
-/// 334`, which is 376; the nursery stays at the default 233.
+/// The converged steady state for the **copying** strategy. The fullsweep now sizes the fresh
+/// mature space from the **exact** reachable live word count (60 words) plus the reserve — not
+/// from the round's occupancy — so `mature_after_fullsweep(233, 60, 0)` neither grows nor
+/// shrinks the default 233-word mature capacity; the nursery stays at the default 233.
 const COPYING_STEADY: Steady = Steady {
     young_capacity: DEFAULT_NURSERY,
-    mature_capacity: 376,
+    mature_capacity: 233,
     mature_occupancy: LIVE_WORDS,
-    total_heap_size: 233 + 376,
+    total_heap_size: 233 + 233,
 };
 
-/// The converged steady state for the **mark-region** strategy. The line-granular mature space
-/// rounds each 3-word live tuple up to one 16-word line, so 20 live tuples occupy 20 lines =
-/// 320 resident words, and the region settles at 1024 words (4 whole 256-word blocks — the
-/// line-rounded growth-table fixed point); the nursery stays at the default 233.
+/// The converged steady state for the **mark-region** strategy. The exact-live sizing asks the
+/// policy for `next_words(2 * (60 + need_reserve(64))) = 376` words; the line-granular region
+/// rounds that request up to two whole 256-word blocks (512), and the 20 live tuples occupy 20
+/// lines = 320 resident words. The nursery stays at the default 233.
 const IMMIX_STEADY: Steady = Steady {
     young_capacity: DEFAULT_NURSERY,
-    mature_capacity: 1024,
+    mature_capacity: 512,
     mature_occupancy: LIVE_TUPLES as usize * 16,
-    total_heap_size: 233 + 1024,
+    total_heap_size: 233 + 512,
 };
 
 /// The pinned expectation for a strategy.
@@ -188,15 +183,11 @@ fn expected(kind: MatureKind) -> Steady {
     }
 }
 
-/// The default **sizing** policy with the collection cadence forced to a fullsweep per round
-/// (the measurement control documented in the module header): every sizing field — including
-/// `min_heap_words` (0, i.e. *no floor*) and the 233/233 initial young/mature sizes — is the
-/// crate default.
+/// The **default** sizing policy, verbatim — no sizing override at all, and the default
+/// fullsweep cadence (`fullsweep_after = 65535`). The quiescent heap must converge under the
+/// exact configuration a plain `HeapPolicy::default()` process runs (see the module header).
 fn steady_policy() -> HeapPolicy {
-    HeapPolicy {
-        fullsweep_after: 0,
-        ..HeapPolicy::default()
-    }
+    HeapPolicy::default()
 }
 
 /// **TEST 1** — the quiescent heap converges to a constant and stays there.
@@ -224,6 +215,7 @@ fn the_quiescent_heap_converges_to_a_constant() {
 
         let mut roots: Vec<Eterm> = Vec::new();
         let mut samples: Vec<Steady> = Vec::with_capacity(MEASURED);
+        let mut kinds: Vec<CollectionKind> = Vec::with_capacity(WARMUP + MEASURED);
 
         for round in 0..(WARMUP + MEASURED) {
             // A fresh bounded live graph (the previous round's is now unreachable garbage)...
@@ -238,11 +230,7 @@ fn the_quiescent_heap_converges_to_a_constant() {
             }
 
             let collection = c.collect(&mut roots).expect("collect");
-            assert_eq!(
-                collection.kind,
-                CollectionKind::Major,
-                "{kind:?}: `fullsweep_after == 0` must force a fullsweep (round {round})"
-            );
+            kinds.push(collection.kind);
             assert!(
                 collection.stats.words_reclaimed > 0,
                 "{kind:?}: a fresh graph plus {} garbage words must reclaim something \
@@ -274,6 +262,21 @@ fn the_quiescent_heap_converges_to_a_constant() {
         }
 
         assert_eq!(samples.len(), MEASURED, "{kind:?}: one sample per measured round");
+
+        // ---- the default cadence really exercised both collection kinds ----
+        // The capacity converges only because the default cadence *does* escalate to a
+        // fullsweep once the mature space can no longer receive the nursery (a fresh graph per
+        // round fills it), and the rounds in between run minors. Asserting both happened keeps
+        // the convergence honest: it is the sizing of the real fullsweep, not a run that never
+        // reached one.
+        assert!(
+            kinds.contains(&CollectionKind::Minor),
+            "{kind:?}: the default cadence must run minors"
+        );
+        assert!(
+            kinds.contains(&CollectionKind::Major),
+            "{kind:?}: the default cadence must escalate to a fullsweep"
+        );
 
         // ---- the converged constant: min == max for all four observables ----
         let young: Vec<usize> = samples.iter().map(|s| s.young_capacity).collect();

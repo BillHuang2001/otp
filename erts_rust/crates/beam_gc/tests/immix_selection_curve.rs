@@ -514,11 +514,18 @@ impl Dist {
 
 /// The heap policy every axis-1 shape shares: a nursery that holds the whole corpus, the
 /// fullsweep cadence disabled, and the fixed [`AXIS1_MATURE_WORDS`] mature capacity.
+///
+/// The fullsweep is now sized from the **exact live word count**, which for these small live
+/// sets is far below the line-rounded region size, so `should_shrink` would otherwise fire and
+/// relocate the region out from under the measurement. Pinning `min_heap_words` to the region
+/// keeps `capacity == min_heap_words`, so `should_shrink` can never fire and the region stays
+/// the fixed, in-place size the axis is defined over.
 fn axis1_policy() -> HeapPolicy {
     HeapPolicy {
         fullsweep_after: 65535,
         initial_young_words: 8192,
         initial_mature_words: AXIS1_MATURE_WORDS,
+        min_heap_words: AXIS1_MATURE_WORDS,
         need_reserve_words: 64,
         ..HeapPolicy::default()
     }

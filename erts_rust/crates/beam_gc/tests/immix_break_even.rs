@@ -252,13 +252,25 @@ impl Law {
 /// mark-region fullsweep **in place** (neither `should_grow` nor `should_shrink` fires), so
 /// the pinning (or partial-block evacuation) regime is what is measured, never a relocating
 /// fullsweep.
+///
+/// The fullsweep is now sized from the **exact live word count**, which for a small-object
+/// live set is far below the line-rounded region size, so `should_shrink` would otherwise fire
+/// and relocate the region. `min_heap_words` is therefore pinned to the (whole-block-aligned)
+/// intended region: with `capacity == min_heap_words`, `should_shrink` can never fire, and
+/// `should_grow` does not either (the region already covers `live.words + reserve` with room to
+/// spare), so the region stays the in-place fixed point the measurement needs.
 fn policy(shape: Shape, objects: usize) -> HeapPolicy {
     let need_reserve_words = 64;
     let live_line_words = objects * shape.lines() * LINE_WORDS;
+    // Round the intended region up to a whole number of Immix blocks, so the region the
+    // collector builds and its `min_heap_words` floor agree exactly.
+    let mature_words =
+        (2 * (live_line_words + need_reserve_words)).div_ceil(BLOCK_WORDS) * BLOCK_WORDS;
     HeapPolicy {
         fullsweep_after: 65535,
         initial_young_words: live_line_words + 4096,
-        initial_mature_words: 2 * (live_line_words + need_reserve_words),
+        initial_mature_words: mature_words,
+        min_heap_words: mature_words,
         need_reserve_words,
         ..HeapPolicy::default()
     }
