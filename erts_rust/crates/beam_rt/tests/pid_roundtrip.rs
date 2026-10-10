@@ -35,11 +35,22 @@
 //!   the runtime's **live** node ([`Runtime::local_node`]) rather than a hard-coded
 //!   `nonode@nohost`, so `node/0` and the node atom a pid image carries agree with the oracle
 //!   on an undistributed runtime *and* on a `-sname`/`-name` node.
-//! * **The decode half is `beam_bifs`'s** and is *not* landed: a decoded `NEW_PID_EXT` stays
-//!   an external id (`beam_bifs/src/binconv.rs`'s module docs, lines 154-163 — the decoder
-//!   never installs `beam_codec::Decoder::with_local_node`). The last test below pins that
-//!   recorded gap **exactly**, so its closure cannot pass unnoticed: it flips to the oracle's
-//!   answers the moment the sibling half normalises a local id.
+//! * **The decode half is `beam_bifs`'s**, and it **is landed**: `binary_to_term/1` installs the
+//!   same identity from the `BifContext::local_node` seam this crate supplies, and `beam_codec`
+//!   demotes a `NEW_PID_EXT` naming the local node back to the internal immediate (the C's
+//!   `dec_pid`/`dec_is_this_node`). So the round trip is an **identity** —
+//!   `binary_to_term(term_to_binary(self())) =:= self()` is `true` and the `~w` printer renders
+//!   it. The last test pins both, plus the **negative control** proving the demotion is
+//!   *identity-gated*, not unconditional: the very same wire image, decoded with **no** identity
+//!   installed, stays an **external** pid.
+//!
+//! # The pid *number* is own-state — never compared textually
+//!
+//! This runtime's root process is `init`, so the pid it prints has a different number from the
+//! oracle's `<0.10.0>` by construction. Only the `=:=` identity and the `<…>` render *shape* are
+//! asserted against the oracle; the node name the image carries is covered by the sibling tests
+//! ([`node_is_the_runtimes_own_node_and_the_oracle_agrees`] and
+//! [`a_pid_image_carries_the_runtimes_own_node`]).
 //!
 //! # Oracle ground truth (OTP 29.1.1 / erts-17.1)
 //!
@@ -62,10 +73,12 @@ mod support;
 
 use std::process::{Command, Output};
 
+use beam_alloc::Heap;
 use beam_bifs::NullSink;
 use beam_engine::ExecutionContext;
 use beam_rt::{Runtime, RuntimeContext};
-use beam_term::Eterm;
+use beam_term::prelude::{is_external_pid, is_internal_pid};
+use beam_term::{AtomTable, Eterm};
 
 /// The loud-skip banner for this suite.
 const BANNER: &str = "pid_roundtrip";
@@ -234,25 +247,28 @@ fn a_pid_image_carries_the_runtimes_own_node() {
 }
 
 // ---------------------------------------------------------------------------------------
-// The reported divergence: the decode half is `beam_bifs`'s and is NOT landed.
+// The local pid round trip: an identity — and a demotion that is identity-gated.
 // ---------------------------------------------------------------------------------------
 
-/// **A tripwire, pinned exactly.** The oracle's `binary_to_term/1` normalises a decoded
-/// identifier that names the local node back to an **internal** id (`dec_pid`,
-/// `external.c:3175-3195`), so the round trip is an identity and the `~w` printer prints it.
+/// **The local pid round trip is an identity, and the demotion it rests on is identity-gated.**
 ///
-/// This runtime's decoder never installs the local-node identity
-/// (`beam_bifs/src/binconv.rs`'s `decode_term_bif` decodes through `Decoder::new(..)`), so the
-/// decoded pid stays an **external** id: equality with the internal `self()` is `false`, and
-/// the M1 printer (which renders `is_internal_pid` only — `beam_bifs/src/print.rs:440-450`)
-/// rejects it with `badarg`.
+/// The oracle's `binary_to_term/1` normalises a decoded identifier that names the local node
+/// back to an **internal** id (`dec_pid`, `external.c:3175-3195`), so the round trip is an
+/// identity and the `~w` printer prints it. This runtime now reproduces both halves:
+/// `beam_bifs`' `binary_to_term/1` installs the local node identity from the
+/// `BifContext::local_node` seam that `beam_rt` supplies (`src/context/bridges.rs`'s
+/// `NodeIdentity`), and `beam_codec` demotes a matching `NEW_PID_EXT` to the internal immediate.
 ///
-/// **When `beam_bifs` lands the local-node normalisation this test must be inverted**: the
-/// oracle's two lines below become this runtime's answers too (`true`, and a `<0.<N>.<S>>`
-/// render with an empty stderr and exit 0). It fails loudly by design so that closing the gap
-/// — and the matching `tools/differential/divergences.md` entry — cannot go unnoticed.
+/// The pid's **number** is own-state (this runtime's root is `init`, so it prints `<0.0.0>`
+/// where the oracle prints `<0.10.0>`), so it is deliberately **not** compared textually: only
+/// the `=:=` identity and the `<…>` render *shape* are pinned.
+///
+/// The final block is the **negative control** that keeps the demotion honest: the *same* wire
+/// image, decoded with **no** identity installed, must stay an **external** pid. Without it this
+/// test would also pass if the decoder demoted unconditionally — which would be a wrong result
+/// for a genuinely remote pid on a distributed node.
 #[test]
-fn the_local_pid_round_trip_is_the_recorded_beam_bifs_gap() {
+fn the_local_pid_round_trip_is_an_identity() {
     let Some(oracle) = support::require_oracle(BANNER) else {
         return;
     };
@@ -282,7 +298,7 @@ fn the_local_pid_round_trip_is_the_recorded_beam_bifs_gap() {
         "the oracle prints the round-tripped pid as a pid, got {printed:?}"
     );
 
-    // -- this runtime: the decoded id is external, so neither holds -------------------
+    // -- this runtime: the same identity ---------------------------------------------
     let probed = w_probe("binary_to_term(term_to_binary(self())) =:= self()");
     let ours = beam_rt(&["-noshell", "-eval", &probed]);
     assert_eq!(
@@ -291,27 +307,88 @@ fn the_local_pid_round_trip_is_the_recorded_beam_bifs_gap() {
         "`=:=` is a plain comparison, not a raise (stderr: {})",
         String::from_utf8_lossy(&ours.stderr)
     );
+    assert!(
+        ours.stderr.is_empty(),
+        "`=:= self()` writes nothing to stderr, got {:?}",
+        String::from_utf8_lossy(&ours.stderr)
+    );
     assert_eq!(
         String::from_utf8_lossy(&ours.stdout).trim(),
-        "false",
-        "the decoded id is still external, so it is not `=:= self()`"
+        "true",
+        "the decoded local pid is `=:= self()`"
     );
 
+    // -- and this runtime prints it — never the old `error:badarg` --------------------
     let probed = w_probe_unhalted("binary_to_term(term_to_binary(self()))");
     let ours = beam_rt(&["-noshell", "-eval", &probed]);
     assert_eq!(
         ours.status.code(),
-        Some(1),
-        "the `~w` printer rejects the external id with a runtime error"
+        Some(0),
+        "the `~w` printer renders the decoded pid (stderr: {})",
+        String::from_utf8_lossy(&ours.stderr)
     );
     assert!(
-        ours.stdout.is_empty(),
-        "nothing is printed before the raise, got {:?}",
-        String::from_utf8_lossy(&ours.stdout)
+        ours.stderr.is_empty(),
+        "a printable pid writes nothing to stderr, got {:?}",
+        String::from_utf8_lossy(&ours.stderr)
     );
-    assert_eq!(
-        String::from_utf8_lossy(&ours.stderr).trim(),
-        "beam_rt: badarg",
-        "the printer's rejection is the bare `badarg`"
+    let rendered = String::from_utf8_lossy(&ours.stdout).trim().to_string();
+    assert!(
+        rendered.starts_with('<') && rendered.ends_with('>'),
+        "the decoded pid renders as a pid, got `{rendered}`"
+    );
+
+    // -- the negative control: the demotion is *identity-gated*, not unconditional ----
+    //
+    // Encode this runtime's internal pid to the wire **with** the identity installed, then
+    // decode the very same bytes twice: with **no** identity the pid must stay **external**
+    // (the honest result for a remote pid), and with it the pid must come back **internal**.
+    // Structural predicates only — never a textual pid comparison.
+    let rt = runtime();
+    let pid = rt.self_pid().to_eterm();
+    let node = rt.local_node();
+    let node_name = rt
+        .atom_name_of(rt.local_node_term())
+        .expect("the runtime's node atom has a name")
+        .to_string();
+
+    let mut encoder = beam_codec::Encoder::new(rt.atoms()).with_local_node(node, 0);
+    encoder
+        .encode(pid)
+        .expect("an internal pid encodes once the node identity is installed");
+    let image = encoder.finish();
+
+    // Decoded with NO identity: an external pid, never the internal immediate.
+    let mut bare_heap = Heap::new(256).expect("a decode heap");
+    let mut bare_atoms = AtomTable::new();
+    let external = beam_codec::decode_term(&image, &mut bare_heap, &mut bare_atoms)
+        .expect("the pid image decodes without an identity");
+    // SAFETY: `external` was just decoded onto `bare_heap`; `is_external_pid` reads only a boxed
+    // term's header word, which is live and aligned here.
+    assert!(
+        unsafe { is_external_pid(external) },
+        "without the local identity the image must stay an EXTERNAL pid, got {external:?}"
+    );
+    assert!(
+        !is_internal_pid(external),
+        "an external pid is never an internal immediate, got {external:?}"
+    );
+
+    // Decoded WITH the identity installed: the local-node pid demotes to the internal form.
+    let mut heap = Heap::new(256).expect("a decode heap");
+    let mut atoms = AtomTable::new();
+    let local_node = atoms.intern(&node_name);
+    let demoted = beam_codec::decode_term_with_local_node(
+        &image,
+        &mut heap,
+        &mut atoms,
+        local_node,
+        0,
+        None,
+    )
+    .expect("the same image decodes once the identity is installed");
+    assert!(
+        is_internal_pid(demoted),
+        "with the local identity the pid must demote to the internal form, got {demoted:?}"
     );
 }
