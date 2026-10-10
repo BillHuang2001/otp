@@ -242,47 +242,95 @@ pub unsafe extern "C" fn enif_inspect_binary(
     1
 }
 
-/// Append the bytes of an iolist (or a binary) to `out`; `false` for anything else.
-fn flatten_iolist(term: Eterm, out: &mut Vec<u8>) -> bool {
-    if !is_term_word(term) {
-        return false;
-    }
-    if prelude::is_nil(term) {
-        return true;
-    }
-    // SAFETY: `is_bitstring` only dereferences the header of a boxed term.
-    if unsafe { prelude::is_binary(term) } {
-        // SAFETY: `term` is a live byte-aligned bitstring.
-        let bits = unsafe { prelude::bitstring_size(term) };
-        // SAFETY: as above.
-        let (base, offset, _) = unsafe { prelude::bitstring_parts(term) };
-        if offset & 7 != 0 || base.is_null() {
+/// Append the flattened bytes of the iolist **object** `obj` to `out`; `false` on a type error.
+///
+/// This is the C's object walk (`generic_iolist_size`, `erts/emulator/beam/erl_iolist.c:150-233`,
+/// called with `Unit = 8`). An *object* — the top-level term, the tail of a list, or a list nested
+/// in head position — must be a **list**, a **byte-aligned bitstring**, or **`nil`**. Anything else
+/// (a bare integer, a float, an atom, a non-byte-aligned bitstring, …) is a type error and fails the
+/// whole iolist. Note in particular that a **bare byte integer is NOT an iolist**: a byte is only
+/// ever accepted in the *head* position of a cons cell (see [`flatten_iolist_element`]).
+///
+/// The tail is walked iteratively (the `while (is_list(obj))` loop), so a long proper list costs no
+/// stack; only *nesting* recurses, exactly as the C's estack does not.
+fn flatten_iolist(obj: Eterm, out: &mut Vec<u8>) -> bool {
+    let mut obj = obj;
+    loop {
+        if !is_term_word(obj) {
             return false;
         }
-        // SAFETY: the byte payload base+offset/8 is `bits/8` bytes long.
-        let bytes = unsafe { core::slice::from_raw_parts(base.add(offset / 8), bits / 8) };
-        out.extend_from_slice(bytes);
-        return true;
-    }
-    if prelude::is_list(term) {
-        // SAFETY: `term` is a live cons cell.
-        let (head, tail) = unsafe { (prelude::car(term), prelude::cdr(term)) };
-        return flatten_iolist(head, out) && flatten_iolist(tail, out);
-    }
-    if prelude::is_small(term) {
-        let v = prelude::signed_value(term);
-        if (0..=255).contains(&v) {
-            out.push(v as u8);
+        if prelude::is_nil(obj) {
             return true;
         }
+        // SAFETY: `is_binary` only dereferences the header of a boxed term.
+        if unsafe { prelude::is_binary(obj) } {
+            return push_bitstring_bytes(obj, out);
+        }
+        if !prelude::is_list(obj) {
+            return false;
+        }
+        // SAFETY: `obj` is a live cons cell.
+        let (head, tail) = unsafe { (prelude::car(obj), prelude::cdr(obj)) };
+        if !flatten_iolist_element(head, out) {
+            return false;
+        }
+        obj = tail;
+    }
+}
+
+/// Append the bytes of one list **element** — the `CAR` of a cons cell — to `out`.
+///
+/// The C accepts an element only in the head position (`erl_iolist.c:167-204`): a **byte** (a small
+/// integer in `0..=255`), a **byte-aligned bitstring**, a **nested list**, or **`nil`**. A small
+/// integer outside `0..=255` (`256`, `-1`) is a type error — it is *not* a byte merely because it is
+/// small — and so is every other term.
+fn flatten_iolist_element(head: Eterm, out: &mut Vec<u8>) -> bool {
+    if !is_term_word(head) {
+        return false;
+    }
+    if prelude::is_byte(head) {
+        out.push(prelude::signed_value(head) as u8);
+        return true;
+    }
+    // SAFETY: `is_binary` only dereferences the header of a boxed term.
+    if unsafe { prelude::is_binary(head) } {
+        return push_bitstring_bytes(head, out);
+    }
+    if prelude::is_nil(head) {
+        return true;
+    }
+    if prelude::is_list(head) {
+        return flatten_iolist(head, out);
     }
     false
 }
 
+/// Append the bytes of the byte-aligned bitstring `term` (`false` when its base is not byte-aligned).
+fn push_bitstring_bytes(term: Eterm, out: &mut Vec<u8>) -> bool {
+    // SAFETY: `term` is a live byte-aligned bitstring (the caller tested `is_binary`).
+    let bits = unsafe { prelude::bitstring_size(term) };
+    // SAFETY: as above; `bitstring_parts` reports `(base, bit_offset, bit_size)`.
+    let (base, offset, _) = unsafe { prelude::bitstring_parts(term) };
+    if offset & 7 != 0 || base.is_null() {
+        // An unaligned base cannot be exposed as a byte run without a bit-shifting copy; refuse
+        // honestly rather than emit shifted bytes.
+        return false;
+    }
+    // SAFETY: the payload starts at `base + offset/8` and is `bits/8` bytes long (`is_binary`).
+    let bytes = unsafe { core::slice::from_raw_parts(base.add(offset / 8), bits / 8) };
+    out.extend_from_slice(bytes);
+    true
+}
+
 /// `int enif_inspect_iolist_as_binary(ErlNifEnv*, ERL_NIF_TERM term, ErlNifBinary* bin);`
 ///
-/// A flat binary yields the same zero-copy view as [`enif_inspect_binary`]; a list is flattened into
-/// a freshly `malloc`'d (owned) buffer the caller must release.
+/// A flat, byte-aligned binary yields the same zero-copy view as [`enif_inspect_binary`];
+/// otherwise the term is flattened into a freshly `malloc`'d (owned) buffer the caller must release.
+/// The shape rules are the C's (`erl_nif.c:1385-1407` over `erl_iolist.c:150-233`): an integer is
+/// only ever a **byte in head position** of a cons cell, so a bare integer, a non-byte integer
+/// (`256`, `-1`), an improper-list tail, and a non-byte-aligned bitstring are all refused with `0`.
+/// An empty iolist (`[]`, or any byte-less one) is accepted with a **non-NULL** dummy `data` and
+/// `size == 0` — the shape `enif_inspect_iolist_as_binary` gives `nil` in the C (`erl_nif.c:1392`).
 ///
 /// # Safety
 ///
@@ -305,19 +353,20 @@ pub unsafe extern "C" fn enif_inspect_iolist_as_binary(
         return 0;
     }
     let len = bytes.len();
-    // SAFETY: `bytes` is a live slice of `len` bytes.
-    // SAFETY: a fresh writable `len`-byte block.
-    let data = if len == 0 {
-        core::ptr::null_mut()
-    } else {
-        let p = unsafe { libc::malloc(len) }.cast::<c_uchar>();
-        if p.is_null() {
-            return 0;
-        }
-        // SAFETY: `p` is `len` writable bytes and `bytes` has `len` readable bytes (disjoint).
-        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), p, len) };
-        p
-    };
+    // The C gives the empty iolist a *non-NULL* dummy `data` (`bin->data = (unsigned char
+    // *)&bin->data;`, `erl_nif.c:1392`). Here the dummy is a one-byte **owned** block instead: the
+    // pointer is non-NULL, `size` is `0`, and `enif_release_binary` stays a well-defined `free` of
+    // the block this module allocated (the C's dummy is not a heap block at all).
+    let alloc_bytes = if len == 0 { 1 } else { len };
+    // SAFETY: a fresh writable `alloc_bytes`-byte block.
+    let data = unsafe { libc::malloc(alloc_bytes) }.cast::<c_uchar>();
+    if data.is_null() {
+        return 0;
+    }
+    if len > 0 {
+        // SAFETY: `data` is `len` writable bytes and `bytes` has `len` readable bytes (disjoint).
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), data, len) };
+    }
     // SAFETY: `bin` is non-null and writable; the buffer is owned (marker null).
     unsafe {
         bin.write(ErlNifBinary {
