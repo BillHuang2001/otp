@@ -116,7 +116,9 @@ mod run;
 
 pub use continuation::MatchContinuation;
 pub use exec::BodyKind;
-pub use expr::{ArithHook, ArithOp, CmpOp, DefaultArithHook, Expr, TypeTest};
+pub use expr::{
+    set_self_hook, ArithHook, ArithOp, CmpOp, DefaultArithHook, Expr, SelfHook, TypeTest,
+};
 pub use pattern::Pattern;
 pub use run::match_spec_run;
 
