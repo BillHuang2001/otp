@@ -73,20 +73,23 @@ The message itself is `RuntimeContext::signal_notify_message(name)` → `(from, 
   `fun` argument already holds — a nested borrow is a typed gap, never a panic.
 
 ## Known Issues (this is a floor, not the full C `io.c`)
-- **The driver `control` callback is routed; only a reply *source* is a gap**: `DriverPortAdapter::control`
-  parses the verb as a decimal `c_uint` (the `term_to_Uint` convention `erts_internal:port_control/3` uses,
-  `erl_bif_port.c:322-340`), runs the entry's `control`, and reproduces the C's codes exactly — an **absent**
-  slot and a **negative** `cres` are both `badarg` (`io.c:4035`/`4074`), a `NULL` reply pointer is the C's
-  `NIL` (an empty reply, `io.c:4126`), and the reply bytes come from the buffer the driver was handed.
-  A reply the driver answers from **its own** memory is the typed *unsupported* gap (reading it needs the raw
-  access `beam_rt`'s `#![deny(unsafe_code)]` forbids) — never a fabricated or truncated reply; closing it needs
-  a safe copy helper on `beam_abi`'s `DriverLibrary` (see Handoffs). The BIF that reaches it,
-  `erlang:port_control/3`, is served by the **native floor** (`../native/port.rs`'s `port_control`, dispatched
-  from `../native.rs`'s `try_native`) — it is *not* a `PortHook` method and *not* in `../error.rs`'s
-  `KNOWN_UNIMPLEMENTED_ERLANG_BIFS` — so the only residual gap here is that reply *source*.
-- **`erlang:port_control/3` on a built-in (`spawn`/`spawn_executable`/`fd`) port answers `[]` where the oracle raises `badarg`.** The native floor forwards every non-`close` verb through `beam_io::PortRegistry::port_control` to the port's `Driver::control`; the built-in drivers do not override `control`, whose default returns `Ok(Vec::new())` (`beam_io/src/driver.rs:293-301`), so the runtime answers an empty **list** for a port whose driver has no `control` callback (verified: `beam_rt -eval 'port_control(open_port({spawn,"cat"},[]),1,<<"x">>)'` → `[]`; the oracle → `error:badarg`). The `{spawn_driver, Name}` path is unaffected (an absent `control` slot there is `badarg`). Closing it needs the built-in drivers' `control` (owner: `beam_io`) to fail like the C for a driver with no `control` slot.
-- **`port_info` `input`/`output` are hardcoded to `0`** (`../port.rs:1083-1084`). The oracle reports cumulative per-port byte counts (verified: after `port_command(P,<<"hello">>)` the oracle answers `{input,5}`, `beam_rt` answers `{input,0}`), so these two `{Item, Value}` pairs diverge once bytes flow; `beam_rt` keeps only the **node-global** `IoCounters` behind `erlang:statistics(io)`, never per-port totals. Not caught by the gate: the differential `port_info` case compares only the key set `connected,id,links,name,os_pid` (`tools/differential/src/corpus/driver.rs:567`), filtering `input`/`output` out.
-- **`driver_async` schedules nothing**: `DriverHost::r#async` keeps the frozen default `-1`. The async callbacks are `Option<unsafe extern "C" fn(*mut c_void)>`, which `beam_rt` (`#![deny(unsafe_code)]`) cannot call; `beam_abi` exposes **no safe runner** for the `invoke`/`free` pair (`DriverLibrary::ready_async(data, tdata)` *is* safely callable, and `beam_io`'s `Driver::drive_async` exists). The C's in-band behaviour when the async pool is empty (`erl_async.c:604-613`: `(*invoke)(data)`, then `async_ready` → the entry's `ready_async`, then `free(data)` if a `ready_async` slot exists) is the reference. Returning a handle without running the job would be fabricated success, so the honest `-1` stands (see Handoffs — the `beam_abi` async-runner item).
+- **`erlang:port_control/3` is live end to end**: the native floor (`../native/port.rs`'s `port_control`,
+  dispatched from `../native.rs`'s `try_native` — it is *not* a `PortHook` method and *not* in `../error.rs`'s
+  `KNOWN_UNIMPLEMENTED_ERLANG_BIFS`) validates `Port`/`Operation`/`Data` (`term_to_Uint` + `erts_iolist_to_buf`,
+  `erl_bif_port.c:322-360`) and forwards the verb to `PortRegistry::port_control`, which reaches the driver as
+  the decimal `c_uint` string via `DriverPortAdapter::control`. The callback reproduces the C's codes exactly —
+  an **absent** `control` slot and a **negative** `cres` are both `badarg` (`io.c:4035`/`4074`) — and the reply
+  bytes come from the buffer the driver was handed. An **internal/built-in** port
+  (`{spawn,_}`/`{spawn_executable,_}`/`{fd,_}`) is `badarg` for **every** verb, the C's own
+  `if (!prt->drv_ptr->control) return ERTS_PORT_OP_BADARG;` (`io.c:4035`).
+  **Reply encoding** (`write_port_control_result`, `io.c:4098-4175`): the bytes render as a **list of byte
+  integers** at every length — there is no size threshold — and as a **binary** only when the driver set
+  `PORT_CONTROL_FLAG_BINARY` through `set_port_control_flags`, a per-port flag that **persists** across calls;
+  a `NULL` reply pointer is the C's `NIL` (the bare `[]`). The one residual gap is a reply the driver answers
+  from **its own** memory (a pointer addressing neither the reply buffer nor the request buffer), which is the
+  typed *unsupported* — reading it needs the raw access `beam_rt`'s `#![deny(unsafe_code)]` forbids — never a
+  fabricated or truncated reply; closing it needs a safe copy helper on `beam_abi`'s `DriverLibrary` (see
+  Handoffs).- **`driver_async` schedules nothing**: `DriverHost::r#async` keeps the frozen default `-1`. The async callbacks are `Option<unsafe extern "C" fn(*mut c_void)>`, which `beam_rt` (`#![deny(unsafe_code)]`) cannot call; `beam_abi` exposes **no safe runner** for the `invoke`/`free` pair (`DriverLibrary::ready_async(data, tdata)` *is* safely callable, and `beam_io`'s `Driver::drive_async` exists). The C's in-band behaviour when the async pool is empty (`erl_async.c:604-613`: `(*invoke)(data)`, then `async_ready` → the entry's `ready_async`, then `free(data)` if a `ready_async` slot exists) is the reference. Returning a handle without running the job would be fabricated success, so the honest `-1` stands (see Handoffs — the `beam_abi` async-runner item).
 - A queued `TermQueue` entry carries no sending-port identity (the C stamps `from = prt->common.id`).
 - **Driver-interned atoms land at the port boundary, not inline**: a name first interned *inside* a driver callback (`erl_drv_output_term`/`binary_to_term`/`intern_atom` — all sharing this path) gets a **predicted** index, because the live table is borrowed for the whole callback and this crate is `#![deny(unsafe_code)]`. `PortRegistry::commit_driver_atoms` — driven from `RuntimePorts::deliver_port_messages`, committing `code_server.atoms_mut()` — lands it at exactly that index; a prediction the table has moved past is **reported** (`dropped` and printed), never interned at a foreign index (which would make the driver's already-built term name a different atom).
 - The exact success code of the four term-emitting calls differs: the C returns `1` for a well-formed spec, this runtime's `send_term` returns `0` (the **accept/refuse split** agrees and is pinned by the `driver_abi` corpus).
@@ -96,8 +99,7 @@ The message itself is `RuntimeContext::signal_notify_message(name)` → `(from, 
 - `os:set_signal/2`'s notification is **dropped when no `erl_signal_server` is registered** — the C's own behaviour (`signal_notify_requested`, `sys.c:589-604` sends nothing when the process is absent), never an error. The `-eval` receive path (`poll_port_messages`) can only observe its own mailbox, so it drops a `PortEvent::Signal`; the scheduler path (`deliver_port_messages`) is the one that delivers it.
 
 ## Notes for Agents
-- The `RuntimePorts::port_control` doc comment (`../port.rs:1272-1274`) still claims the port-control BIF arm "does not exist" and calls the method uncalled-for; the arm **does** exist (`../native/port.rs`) and calls `PortRegistry::port_control` directly, so only the doc comment is stale (the `RuntimePorts::port_control` method itself is retained-but-uncalled — see the API Surface note).
-- The colocated signal tests share **one** `watch::test_guard()` lock so they serialize on the process-global signal dispositions.
+- The `erlang:port_control/3` BIF arm is the **native floor** (`../native/port.rs`'s `port_control`, dispatched from `../native.rs`'s `try_native`), which calls `PortRegistry::port_control` directly; `RuntimePorts::port_control` is retained-but-uncalled (see the API Surface note).- The colocated signal tests share **one** `watch::test_guard()` lock so they serialize on the process-global signal dispositions.
 - Signal tests send with `Command::new("kill") -USR1 <pid>` on `std::process::id()` — **never** `libc::raise`, which would need `unsafe`. A test that calls `run_scheduled` must account for the port loop parking (the scheduler's quiescence predicate — `Runtime::is_nt` reads `PortRegistry::has_nothing_to_poll`; see `../runtime/CONTEXT.md`).
 
 ## Test Strategy
@@ -168,7 +170,7 @@ The message itself is `RuntimeContext::signal_notify_message(name)` → `(from, 
 - `watch.rs` → the `os:set_signal/2` delivery half (facility + `SignalWatch` + the `{notify,Signal}` name builder).
 - `../port.rs` → the A.4 `PortHook` provider, the poller/`PortRegistry`, the port-task round and the message builders.
 - `tests.rs` → that provider's unit suite (`open_port/2`'s decode, the `port_info` vocabulary, the port-message pump, the `next_deadline` clamp and the read path).
-- `../native/port.rs` → the native `port_command/2,3` + `port_info` closed-port/`registered_name` floor.
+- `../native/port.rs` → the native `port_command/2,3` + `port_control/3` + `port_info` closed-port/`registered_name` floor (the `/3` arity's list-vs-binary reply rule included).
 - `../context/signal.rs` → the `os:set_signal/2` answer surface (delegates the facility to `watch.rs`).
 - `../context/` → installs `RuntimePorts` as the `PortHook` on every registered-BIF arm.
 - `../runtime/CONTEXT.md` → the scheduler pass that pumps the registry.

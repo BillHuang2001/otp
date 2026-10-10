@@ -62,18 +62,19 @@
 //! four counter sequences), the emulator information block (`system_info`) and the
 //! extra-environment family (`alloc_env`/`free_env`/`make_copy`).
 //!
-//! Four hooks need state the host does not own — a fresh reference (`enif_make_ref`), a name lookup
-//! (`enif_whereis_pid`) and the two liveness answers (`enif_is_process_alive`,
-//! `enif_is_current_process_alive`) — and reach it through the optional [`NifHostServices`] provider
-//! threaded in at construction. The **per-call** host (built by
+//! Six hooks need state the host does not own — a fresh reference (`enif_make_ref`), a name lookup
+//! (`enif_whereis_pid`), the two liveness answers (`enif_is_process_alive`,
+//! `enif_is_current_process_alive`) and the two port relations (`enif_is_port_alive`,
+//! `enif_port_command`) — and reach it through the optional [`NifHostServices`] provider threaded in
+//! at construction. The **per-call** host (built by
 //! [`RuntimeContext::try_call_nif`](crate::context::RuntimeContext)) carries a
-//! [`RuntimeNifServices`] over the runtime's reference-id allocator, its reference registry and its
-//! process table, so all four are live there. The **load/unload** host (built by
+//! [`RuntimeNifServices`] over the runtime's reference-id allocator, its reference registry, its
+//! process table and its port registry, so all six are live there. The **load/unload** host (built by
 //! [`NifBridge::load_nif`](crate::context::bridges::NifBridge)) is *moved into* the runtime's NIF
 //! registry, so it cannot borrow the runtime and is built with `services = None`: those hooks then
 //! stay the trait default (the typed `None`), so a `load`/`unload` callback can never fabricate a
-//! reference, a pid or a liveness answer. `erlang:load_nif/2` on an already-loaded module is a
-//! `reload` (the oracle's rule since OTP 20).
+//! reference, a pid, a liveness answer or a delivery. `erlang:load_nif/2` on an already-loaded module
+//! is a `reload` (the oracle's rule since OTP 20).
 //!
 //! # Hooks still at the trait default — and exactly why
 //!
@@ -93,13 +94,6 @@
 //!   to the calling process and reports whether its timeslice is exhausted. The provider holds the
 //!   process table **immutably** (`Process::bump_reductions` takes `&mut`), and the hook's `bool`
 //!   cannot express "unsupported": the honest answer is the default `false` ("do not yield").
-//! * **`is_port_alive`** / **`port_command`** (`:2340-2357`, `:1097-1133`) — the port table is this
-//!   crate's [`PortRegistry`](crate::port::PortRegistry) and `Runtime::ports` is an `Rc<RefCell<..>>`,
-//!   so a *cheap clone* reaches its `contains`/`write_command` (the
-//!   [`crate::context::ProcessBridge`] pattern). To close: **one field** on [`RuntimeNifServices`]
-//!   plus one line at its construction site in `crate::context`. The C sends a **term**
-//!   (`erts_port_output_async`), so faithfulness needs the term-carrying driver path too. Defaults:
-//!   `None` ⇒ `0` and `0`.
 //! * **`whereis_port`** (`:1182`) — resolves a name to a **port**. This runtime's name registry holds
 //!   pids only and `erlang:register/2` refuses a port (`ProcessId::from_eterm`), so no atom can ever
 //!   name a port here: `None` (⇒ `0`) is the *provable* answer, not a missing feature.
