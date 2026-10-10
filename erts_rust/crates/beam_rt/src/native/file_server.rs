@@ -215,7 +215,21 @@ impl Runtime {
                 };
                 // A reply to a caller that has since died is dropped, exactly as `gen:reply/2`
                 // swallows its own send failure.
-                match table.deliver_simple(target, service.to_eterm(), envelope) {
+                // A reply to a caller that has since died is dropped, exactly as `gen:reply/2`
+                // swallows its own send failure. The delivery is the runtime's one
+                // **fragment-aware** path (`RuntimeContext::deliver_in_table`), which falls
+                // back to a heap fragment on the copier's refusal: a caller that is
+                // **relocation-exempt** (a process under the `-eval` evaluator or a nested
+                // machine, whose roots a collection cannot publish) refuses the collection an
+                // exhausted delivery would otherwise run, so the fragment is what lets its
+                // reply land at all.
+                match RuntimeContext::deliver_in_table(
+                    self,
+                    table,
+                    target,
+                    service.to_eterm(),
+                    envelope,
+                ) {
                     Ok(_) => delivered += 1,
                     Err(BeamError::TermNotFound) => {}
                     Err(err) => return Err(err),
