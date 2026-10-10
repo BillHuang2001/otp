@@ -602,19 +602,27 @@ pub(crate) fn heap_available(ctx: &RuntimeContext<'_>) -> usize {
 /// tracks the live set.
 ///
 /// Everything **else** — an `-eval`/single-pass context (no process table), a pinned or halted
-/// process, a process the table no longer holds — keeps the pointer-stable arena, byte for byte
-/// as before this seam existed. The one refusal is a **collectable** slice process whose own
-/// young heap cannot serve the request: the block is *not* taken from the arena (the arena is a
-/// region the collector does not scan, so a term built there and handed straight back to the
-/// machine as a live root can neither keep nor relocate the young words it reaches — see
-/// [`root_is_unscanned`]), and the young heap's own typed allocation error is returned instead.
-/// This seam has no root set, so it cannot collect to make room; the engine reaches an admission
-/// point (`ensure_heap`) before it constructs terms, so the young heap normally has room here.
+/// process, a process the table no longer holds, **and a collectable slice process whose own
+/// young heap cannot serve the request** — keeps the pointer-stable arena, byte for byte as
+/// before this seam existed. A fallback is never an error: the arena cannot fail where the
+/// young heap could.
+///
+/// # Why the arena fallback stays for a collectable slice process
+///
+/// This seam is the **unrooted** allocation path (`beam_engine::terms::sink::ContextSink`,
+/// metadata-only builds): it is handed **no** root set, so it can neither collect nor safely
+/// grow — calling `Process::ensure_capacity` here would collect against the possibly-stale
+/// published `process.regs`, relocating a heap out from under live machine terms (a wrong
+/// result). The arena block it hands out is a container in an unscanned region, but that is
+/// already made sound by the admission-point valve ([`root_is_unscanned`]: `ensure_heap`/
+/// `ensure_heap_full` **decline** any collection whose root set reaches such a container), so
+/// such a root stays valid and no young word it reaches is moved. Returning the young heap's
+/// typed `Err` here instead would only kill a process (e.g. the boot chain) that the arena keeps
+/// alive, and the engine reaches an admission point (`ensure_heap`) before it constructs terms.
 ///
 /// # Errors
 ///
-/// The young heap's `Alloc(AllocKind::Heap)` for a collectable slice process whose own heap
-/// cannot serve the request; the arena's allocation failure for every other context.
+/// Propagates the arena's allocation failure only.
 pub(crate) fn alloc_words(ctx: &mut RuntimeContext<'_>, n: usize) -> Result<*mut Eterm> {
     let RuntimeContext {
         runtime,
@@ -626,17 +634,8 @@ pub(crate) fn alloc_words(ctx: &mut RuntimeContext<'_>, n: usize) -> Result<*mut
         if runtime.gc_process_enabled(*mailbox_pid) {
             if let Some(process) = table.get_mut(*mailbox_pid) {
                 let fill = runtime.gc_scratch(n.saturating_sub(1));
-                match bump(process.heap_mut(), n, fill) {
-                    Ok(block) => return Ok(block),
-                    // A **collectable** slice process must not place this term in the
-                    // pointer-stable arena: the block is handed straight back to the machine as
-                    // a live root, and the arena is a region the collector does not scan, so the
-                    // term can neither keep nor relocate the young words it reaches (see
-                    // [`root_is_unscanned`]). This seam has no root set, so it cannot collect to
-                    // make room; the young heap's honest refusal is returned instead. The engine
-                    // reaches an admission point (`ensure_heap`) before it constructs terms, so
-                    // the young heap normally has room here.
-                    Err(error) => return Err(error),
+                if let Ok(block) = bump(process.heap_mut(), n, fill) {
+                    return Ok(block);
                 }
             }
             runtime.note_gc_fallback();
