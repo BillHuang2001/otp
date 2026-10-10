@@ -67,9 +67,10 @@ use crate::context::BifContext;
 use crate::registry::BifRegistry;
 
 use super::{
-    copy_out, copy_out_list, has_backward_walk, restore_table, resolve, take_table_gated,
-    END_OF_TABLE,
+    copy_out, copy_out_list, has_backward_walk, is_end_of_table_key, restore_table, resolve,
+    take_table_gated, END_OF_TABLE,
 };
+use crate::error::badarg;
 
 /// Registers the `*_lookup` BIFs.
 pub(super) fn register(reg: &mut BifRegistry) {
@@ -133,11 +134,17 @@ fn last_lookup_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// [`Table::next`]'s `badarg` propagates unchanged: a hash kind requires the
 /// anchor key to be present (as does the `'$end_of_table'` anchor itself), while
-/// an `ordered_set` reads it as a range bound.
+/// an `ordered_set` reads it as a range bound — **except** that the
+/// `'$end_of_table'` atom is rejected outright (the C `db_next_tree_common`'s
+/// unconditional `DB_ERROR_BADKEY`), never read as a greatest-bound.
 fn next_lookup_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let key = args[1];
     let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
+    if has_backward_walk(&table) && is_end_of_table_key(ctx, key) {
+        restore_table(ctx, handle, table)?;
+        return Err(badarg());
+    }
     let outcome = table.next(key, ctx.atoms());
     match outcome {
         Ok(next) => key_objects(ctx, handle, table, next),
@@ -154,12 +161,19 @@ fn next_lookup_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// Mirroring [`next_lookup_2`]'s alias: a **hash** kind answers with the *forward*
 /// step ([`Table::next`] — the oracle's behaviour), only an `ordered_set` with
-/// [`Table::prev`]. The chosen primitive's `badarg` propagates as the oracle's.
+/// [`Table::prev`]. The chosen primitive's `badarg` propagates as the oracle's,
+/// and an `ordered_set` rejects the `'$end_of_table'` anchor outright (the C
+/// `db_prev_tree_common`'s unconditional `DB_ERROR_BADKEY`), like [`next_lookup_2`].
 fn prev_lookup_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let key = args[1];
     let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
-    let outcome = if has_backward_walk(&table) {
+    let backward = has_backward_walk(&table);
+    if backward && is_end_of_table_key(ctx, key) {
+        restore_table(ctx, handle, table)?;
+        return Err(badarg());
+    }
+    let outcome = if backward {
         table.prev(key, ctx.atoms())
     } else {
         table.next(key, ctx.atoms())

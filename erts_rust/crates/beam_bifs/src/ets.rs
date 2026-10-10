@@ -1152,10 +1152,19 @@ fn last_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `ets:next(Tab, Key)` — the key following `Key` (an `ordered_set` reads `Key`
 /// as a range bound; the hash kinds require it present, else `badarg`).
+///
+/// An `ordered_set` additionally **rejects** the `'$end_of_table'` anchor with
+/// `badarg` (see [`is_end_of_table_key`]) — the C `db_next_tree_common`'s
+/// unconditional `DB_ERROR_BADKEY`; without it the anchor would be read as a
+/// greatest-bound and answer `'$end_of_table'` where the oracle raises.
 fn next_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let key = args[1];
     let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
+    if table.kind().is_ordered() && is_end_of_table_key(ctx, key) {
+        restore_table(ctx, handle, table)?;
+        return Err(badarg());
+    }
     let outcome = table.next(key, ctx.atoms());
     restore_table(ctx, handle, table)?;
     key_or_end(ctx, outcome?)
@@ -1174,6 +1183,10 @@ fn prev_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let key = args[1];
     let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
+    if table.kind().is_ordered() && is_end_of_table_key(ctx, key) {
+        restore_table(ctx, handle, table)?;
+        return Err(badarg());
+    }
     let outcome = if table.kind().is_ordered() {
         table.prev(key, ctx.atoms())
     } else {
@@ -1511,6 +1524,21 @@ pub(super) fn key_or_end(ctx: &mut BifContext<'_>, key: Option<Eterm>) -> Result
         Some(key) => copy_out(key, ctx),
         None => ctx.intern_atom(END_OF_TABLE),
     }
+}
+
+/// Whether `key` is the atom `'$end_of_table'` — the anchor an **`ordered_set`**
+/// `next`/`prev`/`next_lookup`/`prev_lookup` rejects with `badarg`.
+///
+/// The C `db_next_tree_common`/`db_prev_tree_common`
+/// (`../../erts/emulator/beam/erl_db_tree.c:654,729`) return `DB_ERROR_BADKEY`
+/// unconditionally on that atom — even when it is a *stored* key of the tree — so
+/// the four ordered walkers must raise `badarg` instead of reading it as a range
+/// bound. A hash kind does **not** special-case it (`db_next_hash_common` merely
+/// requires the anchor be present), so this predicate is consulted only for an
+/// `ordered_set`; a hash kind whose stored key really is `'$end_of_table'` keeps
+/// working.
+pub(super) fn is_end_of_table_key(ctx: &BifContext<'_>, key: Eterm) -> bool {
+    is_atom(key) && ctx.atoms().name(atom_val(key)) == Some(END_OF_TABLE)
 }
 
 /// Whether `table`'s interior implements a genuine **backward** key walk.
