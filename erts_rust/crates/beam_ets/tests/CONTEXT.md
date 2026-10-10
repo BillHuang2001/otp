@@ -34,7 +34,7 @@ Read together with `../CONTEXT.md` (crate API + design) and `../ETS_SURFACE.md` 
 ## Routing Table
 - `ets_basic.rs` → insert/lookup/delete/delete_object/delete_all_objects/take/tab2list, insert_list atomicity, memory-bounded churn per kind/interior
 - `ets_order.rs` → `ordered_set` key-order (incl. arithmetic `1 == 1.0` keys), `first`/`next`/`last`/`prev`
-- `ets_nav.rs` → navigation on every kind (absent anchors, `'$end_of_table'` → `None`)
+- `ets_nav.rs` → navigation on every kind (absent anchors, `'$end_of_table'` → `None`); plus the `take`+re-anchoring battery (`take_reanchoring_matches_the_recorded_oracle_figures` offline + `take_reanchoring_agrees_with_the_live_oracle` — after `take`, a hash kind's `next`/`prev` on the taken key is `badarg` while `ordered_set` reads it as a range bound)
 - `ets_bag.rs` → `bag`/`duplicate_bag` multi-object semantics + `lookup_element_all`
 - `ets_select.rs`, `select.rs`, `match_spec_run.rs` → match-spec compile/exec, `select*`/`match*`, `fun2ms`-shaped specs
 - `ets_continuation.rs` → limited/continuation forms: fixed-expectation pins (its live-oracle battery is in the `_direction` sibling, so it needs no gate)
@@ -47,7 +47,7 @@ Read together with `../CONTEXT.md` (crate API + design) and `../ETS_SURFACE.md` 
 - `ets_access.rs` → access matrix (`public`/`protected`/`private`) over the read/write surface
 - `ets_options.rs` → `TableOptions` parsing/reporting
 - `ets_fixtable.rs` → `safe_fixtable/2` deferred reclamation
-- `ets_reclamation.rs` → the index key-anchor invariant + memory-accounting stress (see `../CONTEXT.md` Known Issues / Design Decisions)
+- `ets_reclamation.rs` → the index key-anchor invariant + memory-accounting stress (see `../CONTEXT.md` Known Issues / Design Decisions); plus `ets_info_memory_is_in_the_oracles_ballpark` (100k objects, `ets:info(T,memory)` same order of magnitude as the live oracle, ratio bounded by 10×, all 4 kinds)
 - `ets_shared.rs` → `Send`/`Sync`, the `SharedTable` lock, no-lost-update concurrency, guard-scoped read aliasing note
 - `ets_concurrency.rs` → lock independence, serial equivalence, no-lost-update check-then-act, live-oracle winner count
 - `differential.rs` + `differential/` → the differential battery (embedded table + live oracle); `battery/` and `erl_program.rs`

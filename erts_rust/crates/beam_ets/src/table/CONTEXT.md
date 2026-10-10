@@ -60,8 +60,6 @@ advisory only (throughput, never results) — see the crate `CONTEXT.md`.
   inside the op loop propagates a failure (reachable only on scratch-heap exhaustion, since every
   op is pre-validated) **before** `relocate_rebuilt_object` runs, leaving the interior holding a
   caller-heap-built object — a dangling hazard the A.1 boundary forbids once that heap dies.
-- **Stale doc comment**: `OwnerId` (`mod.rs:109`) still says "M1 skeleton: access is not yet
-  enforced by owner", but `can_read`/`can_write` + `TableAccess` do enforce access by owner.
 - **`compile_fail` doctests are bare** (no `E0xxx` codes): `view/term.rs:47`, `view/iter.rs:255,283,372`,
   `shared.rs:59`. Verified non-vacuous today (their imports resolve), but a future API rename could
   silently make them vacuous.
