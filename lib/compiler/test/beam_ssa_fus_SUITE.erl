@@ -27,41 +27,42 @@
 %% `no_ssa_opt_fus' turns it back into a no-op while `no_ssa_opt' skips the
 %% whole beam_ssa_opt pass.
 %%
-%% Fusion 1 (the only transformation implemented) rewrites the last
-%% instruction of a block
+%% Four transformations are implemented (there is no Fusion 3):
 %%
-%%     has_map_field(Map, Key) -> Bool
-%%     br Bool, LSucc, LFail
+%% Fusion 1 removes a `has_map_field(Map, Key)' test whose success edge is
+%% nothing but the extraction of the very same key - `get_map_element(Map, Key)'
+%% plus its `succeeded' guard. The extraction takes the place of the test (one
+%% `get_map_elements' BEAM instruction) and keeps the test's false label as its
+%% failure edge, so the map is looked up once instead of twice.
 %%
-%% followed on the success edge by nothing but
+%% Fusion 2 generalises Fusion 1 to a chain of map-key tests that is covered
+%% exactly by a following chain of map-key extractions.
 %%
-%%     get_map_element(Map, Key) -> GV
-%%     succeeded:guard GV -> Bool2
-%%     br Bool2, LSS, LFail2
+%% Fusion 5 is the same redundancy for the other spelling of an extraction:
+%% `maps:get/2' is a guard BIF and never lowers to a `get_map_element'
+%% instruction - the front end pairs the `map_get/2' BIF with a
+%% `{succeeded,body}' marker instead - but the `has_map_field' test of
+%% `is_map_key/2' makes that lookup redundant in exactly the same way.
 %%
-%% into a single `get_map_element' (which the code generator turns into one
-%% `get_map_elements' BEAM instruction) with the failure edge redirected to
-%% LFail. The `has_map_field' test disappears, i.e. the map is looked up once
-%% instead of twice.
-%%
-%% The transformation requires the type analysis to have proven that Map is a
-%% map at the test site (a `get_map_elements' instruction requires a map
-%% operand, while `is_map_key/2' simply returns false for a non-map), so a
-%% guard of the form `is_map(M), is_map_key(Key, M)' is what makes the pass
-%% fire. Everything else is left untouched.
+%% Both map fusions require the type analysis to have proven that Map is a map
+%% at the test site (a `get_map_elements' instruction requires a map operand,
+%% while `is_map_key/2' simply returns false for a non-map), so a guard of the
+%% form `is_map(M), is_map_key(Key, M)' is what makes them fire. The pass also
+%% requires the *same* variable to be tested and looked up, and keeps the
+%% failure edge of the rewritten lookup at the test's original false label, so
+%% both the terms that take the "key missing" branch and the exceptions raised
+%% on the other paths are unchanged.
 %%
 %% Fusion 4 folds a multiplication by an integer constant whose result is
-%% immediately multiplied by a second integer constant:
+%% immediately multiplied by a second integer constant, `(V * K1) * K2' into
+%% `V * (K1 * K2)'. It requires the type analysis to have proven V to be an
+%% integer, which makes the fold exact (`*' is associative for integers but not
+%% for floats) and keeps the failure set unchanged (`badarith' cannot be reached
+%% for a proven integer). The `is_integer/1' guard is what makes the pass fire:
+%% an unguarded chain, a chain guarded by `is_float/1', or a chain interrupted
+%% by another operation must stay untouched.
 %%
-%%     D1 = V * K1,  D2 = D1 * K2   ->   D2 = V * (K1 * K2)
-%%
-%% It requires the type analysis to have proven V to be an integer, which makes
-%% the fold exact (`*' is associative for integers but not for floats) and keeps
-%% the failure set unchanged (`badarith' cannot be reached for a proven
-%% integer). The `is_integer/1' guard is what makes the pass fire: an unguarded
-%% chain, a chain guarded by `is_float/1', or a chain interrupted by another
-%% operation must stay untouched.
-%%%% The test approach: a small probe module is compiled with each of the option
+%% The test approach: a small probe module is compiled with each of the option
 %% sets in opt_sets/0 and each build is executed. For every case we check
 %%
 %%   * that all the builds return exactly the same values *and* the same
@@ -84,6 +85,10 @@
          no_fusion_different_key/1,
          no_fusion_not_sole_success_edge/1,
          error_semantics/1,
+         fuse_maps_get/1,
+         no_fusion_maps_get/1,
+         maps_get_exception_equivalence/1,
+         fusion_opt_kill_switches/1,
          fuse_const_mul_chain/1,
          no_fusion_const_mul_chain/1]).
 
@@ -104,6 +109,10 @@ groups() ->
        no_fusion_different_key,
        no_fusion_not_sole_success_edge,
        error_semantics,
+       fuse_maps_get,
+       no_fusion_maps_get,
+       maps_get_exception_equivalence,
+       fusion_opt_kill_switches,
        fuse_const_mul_chain,
        no_fusion_const_mul_chain]}].
 
@@ -351,10 +360,11 @@ no_fusion_not_sole_success_edge(Config) ->
     ?assert(has_instr(Fusion, get_map_elements)),
     ok.
 
-%% `maps:get/2' is compiled to the `map_get/2' BIF (and never to a
-%% `get_map_element' instruction), so this probe is not fused even though it
-%% has an `is_map/1' guard. The BIF raises `{badmap,Term}' for a non-map, and
-%% that exception must be identical in every build.
+%% `maps:get/2' on an operand whose type is not known at all: there is no
+%% `is_map_key/2' test to make the lookup redundant, so this probe is a strict
+%% no-op in every build. It pins the `badkey'/`badmap' exceptions of the
+%% `map_get/2' BIF down: the lookup may only ever be replaced where the test has
+%% already proven the operand to be a map and the key to be present.
 error_semantics(Config) ->
     Builds = build_probe(Config, "beam_ssa_fus_badmap", badmap_probe()),
 
@@ -372,6 +382,192 @@ error_semantics(Config) ->
                           ?assertNot(has_instr(Code, has_map_fields)),
                           ?assertNot(has_instr(Code, get_map_elements))
                   end, Builds),
+    ok.
+
+%%============================================================================
+%% Fusion 5
+%%============================================================================
+
+%% Fusion 5, positive case: `maps:get/2' is a guard BIF, so it is emitted as
+%% the `map_get/2' BIF and never as a `get_map_element' instruction - but the
+%% `has_map_field' test of `is_map_key/2' makes the lookup redundant anyway, so
+%% with the pass enabled the pair is replaced by a single `get_map_elements' and
+%% the BIF is gone.
+%%
+%% `get_again/1' uses the looked-up value twice, which is *not* a decline
+%% condition: the fused lookup keeps the lookup's destination, so all of its
+%% uses stay valid (only the *test's* result and the `succeeded' marker must have
+%% a single use). `get_other/1' tests a second key first, so only the test of the
+%% looked-up key is removed and the other test stays.
+fuse_maps_get(Config) ->
+    Builds = build_probe(Config, "beam_ssa_fus_mg", maps_get_probe()),
+
+    Args = [{[#{a => 1}], {ok,1}},
+            {[#{a => x}], {ok,x}},
+            {[#{a => undefined}], {ok,undefined}},
+            {[#{}], {ok,no}},
+            {[[]], {ok,no}},
+            {[42], {ok,no}}],
+    check_calls(Builds, get, Args),
+    check_calls(Builds, get_again, [{[#{a => 1}], {ok,{1,1}}},
+                                    {[#{}], {ok,no}},
+                                    {[42], {ok,no}}]),
+    check_calls(Builds, get_other, [{[#{a => 1, b => 2}], {ok,1}},
+                                    {[#{b => 2}], {ok,no}},
+                                    {[#{a => 1}], {ok,no}},
+                                    {[42], {ok,no}}]),
+
+    Fusion = code(fusion, Builds),
+    %% The guard BIF and the redundant test are gone; `get/1' and `get_other/1'
+    %% each have exactly one lookup left (a single `get_map_elements' per key).
+    ?assert(has_instr(Fusion, get_map_elements)),
+    ?assertNot(has_instr(Fusion, map_get)),
+    ?assertEqual([{atom,a}], get_map_keys(Fusion, get)),
+    ?assertEqual([{atom,a}], get_map_keys(Fusion, get_other)),
+    ?assertEqual(1, count_instr(Fusion, get, get_map_elements)),
+    ?assertEqual(0, count_instr(Fusion, get, has_map_fields)),
+    ?assertEqual(1, count_instr(Fusion, get_again, get_map_elements)),
+    ?assertEqual(0, count_instr(Fusion, get_again, map_get)),
+    %% `get_other/1' keeps the test of the *other* key.
+    ?assertEqual(1, count_instr(Fusion, get_other, has_map_fields)),
+    ?assertEqual(0, count_instr(Fusion, get_other, map_get)),
+
+    %% The fused lookup takes the place of the test, so a missing key must fail
+    %% exactly where the test was false (LFail) and not somewhere the lookup
+    %% would have raised.
+    ?assertEqual(fail_label(Fusion, get, is_map),
+                 fail_label(Fusion, get, get_map_elements)),
+
+    %% Without the pass - including with it explicitly turned off - the
+    %% redundant test is still there, next to the guard BIF.
+    lists:foreach(fun(Set) ->
+                          Code = code(Set, Builds),
+                          ?assert(has_instr(Code, has_map_fields)),
+                          ?assert(has_instr(Code, map_get)),
+                          ?assertNot(has_instr(Code, get_map_elements))
+                  end, [plain,no_fus_plain,no_fus]),
+
+    %% `no_ssa_opt' skips the SSA type analysis too, so `is_map_key/2' stays an
+    %% ordinary BIF and there is no `has_map_field' to fuse.
+    lists:foreach(fun(Set) ->
+                          Code = code(Set, Builds),
+                          ?assert(has_instr(Code, is_map_key)),
+                          ?assertNot(has_instr(Code, has_map_fields)),
+                          ?assertNot(has_instr(Code, get_map_elements))
+                  end, [no_ssa_opt,no_ssa_opt_fus]),
+    ok.
+
+%% None of these shapes may fuse, and the disassembly is identical with and
+%% without the pass:
+%%
+%%   * the success edge of the test is not solely the lookup - `notsole/1' does
+%%     something else first, and the two key tests of `two_keys/1' are coalesced
+%%     into one multi-key test whose success edge holds *two* lookups;
+%%   * the operand of `is_map_key/2' is not proven to be a map - `nomap/1' has no
+%%     `is_map/1' guard, so the guard stays a plain BIF and no `has_map_field'
+%%     instruction is created at all, while the lookup the pass would substitute
+%%     for it would raise `{badmap,Term}' for a non-map.
+no_fusion_maps_get(Config) ->
+    Builds = build_probe(Config, "beam_ssa_fus_mgneg", maps_get_neg_probe()),
+
+    M12 = #{a => 1, b => 2},
+    check_calls(Builds, notsole, [{[#{a => 1}], {ok,{[a],1}}},
+                                  {[M12], {ok,{maps:keys(M12),1}}},
+                                  {[#{}], {ok,no}},
+                                  {[42], {ok,no}}]),
+    check_calls(Builds, two_keys, [{[M12], {ok,{1,2}}},
+                                   {[#{a => 1}], {ok,no}},
+                                   {[#{}], {ok,no}},
+                                   {[42], {ok,no}}]),
+    check_calls(Builds, nomap, [{[#{a => 1}], {ok,1}},
+                                {[#{}], {ok,no}},
+                                {[42], {ok,no}},
+                                {[[]], {ok,no}}]),
+
+    Plain = code(plain, Builds),
+    Fusion = code(fusion, Builds),
+    ?assertEqual(shape(Plain), shape(Fusion)),
+    lists:foreach(fun(Fun) ->
+                          ?assertEqual(func_shape(Plain, Fun),
+                                       func_shape(Fusion, Fun)),
+                          %% The test and the lookups are still both there (two
+                          %% lookups in `two_keys/1') and no lookup was fused.
+                          ?assert(count_instr(Fusion, Fun, has_map_fields) > 0),
+                          ?assert(count_instr(Fusion, Fun, map_get) > 0),
+                          ?assertEqual(0, count_instr(Fusion, Fun, get_map_elements))
+                  end, [notsole, two_keys]),
+    ?assertEqual(1, count_instr(Fusion, nomap, is_map_key)),
+    ?assertEqual(0, count_instr(Fusion, nomap, has_map_fields)),
+    ?assertEqual(0, count_instr(Fusion, nomap, get_map_elements)),
+    ok.
+
+%% Execution equivalence (flag ON vs OFF) for the paths that decide whether the
+%% transformation is allowed to fire: the lookup may only be replaced where the
+%% test has proven the operand to be a map *and* the key to be present, because
+%% a fused `get_map_elements' fails to the test's false label instead of
+%% raising. `keydiff/1' looks the key up that was *not* tested, `other_map/2'
+%% looks the tested key up in a *different* variable from which nothing is known
+%% (so a non-map must still raise `{badmap,Term}' even though the tested
+%% variable is a map), and `get/1' is the control that does fuse.
+maps_get_exception_equivalence(Config) ->
+    Neg = build_probe(Config, "beam_ssa_fus_mgneg", maps_get_neg_probe()),
+    Builds = build_probe(Config, "beam_ssa_fus_mg", maps_get_probe()),
+
+    check_calls(Neg, keydiff, [{[#{a => 1, b => 2}], {ok,2}},
+                               {[#{a => 1}], {error,{badkey,b}}},
+                               {[#{}], {ok,no}},
+                               {[42], {ok,no}}]),
+    check_calls(Neg, other_map, [{[#{a => 1}, #{a => 2}], {ok,2}},
+                                 {[#{a => 1}, #{}], {error,{badkey,a}}},
+                                 {[#{a => 1}, 42], {error,{badmap,42}}},
+                                 {[#{a => 1}, []], {error,{badmap,[]}}},
+                                 {[#{a => 1}, y], {error,{badmap,y}}},
+                                 {[#{}, #{a => 2}], {ok,no}}]),
+    check_calls(Builds, get, [{[#{a => 1}], {ok,1}},
+                              {[#{}], {ok,no}},
+                              {[#{b => 1}], {ok,no}},
+                              {[42], {ok,no}},
+                              {[[]], {ok,no}}]),
+
+    %% The control really does fuse ...
+    Fusion = code(fusion, Builds),
+    ?assertEqual(1, count_instr(Fusion, get, get_map_elements)),
+    ?assertEqual(0, count_instr(Fusion, get, map_get)),
+    %% ... while both mismatching lookups are left exactly as they are, so the
+    %% instructions that can raise are still there, in the same order.
+    Plain = code(plain, Neg),
+    FusedNeg = code(fusion, Neg),
+    lists:foreach(fun(Fun) ->
+                          ?assertEqual(func_shape(Plain, Fun),
+                                       func_shape(FusedNeg, Fun)),
+                          ?assertEqual(1, count_instr(FusedNeg, Fun, has_map_fields)),
+                          ?assertEqual(1, count_instr(FusedNeg, Fun, map_get)),
+                          ?assertEqual(0, count_instr(FusedNeg, Fun, get_map_elements))
+                  end, [keydiff, other_map]),
+    ok.
+
+%% The pass is off by default and every kill switch is really a no-op: with the
+%% enabling option absent (or cancelled by the derived `no_ssa_opt_fus'), the
+%% build must be *identical* to the default build, and a `no_ssa_opt' build must
+%% be unaffected by the presence of `fusion_opt'. The `fusion' build is the
+%% positive control that makes the equality checks non-vacuous.
+fusion_opt_kill_switches(Config) ->
+    Builds = build_probe(Config, "beam_ssa_fus_mg", maps_get_probe()),
+
+    Plain = code(plain, Builds),
+    Fusion = code(fusion, Builds),
+    ?assertNotEqual(shape(Plain), shape(Fusion)),
+    ?assert(has_instr(Fusion, get_map_elements)),
+    ?assertNot(has_instr(Plain, get_map_elements)),
+
+    lists:foreach(fun(Set) ->
+                          ?assertEqual({Set,Plain}, {Set,code(Set, Builds)})
+                  end, [no_fus_plain,no_fus]),
+
+    NoSsaOpt = code(no_ssa_opt, Builds),
+    ?assertEqual(NoSsaOpt, code(no_ssa_opt_fus, Builds)),
+    ?assert(has_instr(NoSsaOpt, is_map_key)),
+    ?assertNot(has_instr(NoSsaOpt, get_map_elements)),
     ok.
 
 %%============================================================================
@@ -589,6 +785,77 @@ badmap_probe() ->
     "\n"
     "e(M) -> maps:get(a, M).\n".
 
+%%============================================================================
+%% Fusion 5 probe modules
+%%============================================================================
+%% The shapes the pass fires on: the `is_map/1' guard is what proves the operand
+%% of the `is_map_key/2' test to be a map, and `maps:get/2' is the lookup the
+%% test makes redundant. `get_again/1' uses the looked-up value twice and
+%% `get_other/1' tests a second key before the lookup.
+maps_get_probe() ->
+    "-module(beam_ssa_fus_mg).\n"
+    "-export([get/1,get_again/1,get_other/1]).\n"
+    "\n"
+    "get(M) when is_map(M), is_map_key(a, M) ->\n"
+    "    maps:get(a, M);\n"
+    "get(_) ->\n"
+    "    no.\n"
+    "\n"
+    "get_again(M) when is_map(M), is_map_key(a, M) ->\n"
+    "    V = maps:get(a, M),\n"
+    "    {V, V};\n"
+    "get_again(_) ->\n"
+    "    no.\n"
+    "\n"
+    "get_other(M) when is_map(M), is_map_key(b, M), is_map_key(a, M) ->\n"
+    "    maps:get(a, M);\n"
+    "get_other(_) ->\n"
+    "    no.\n".
+
+%% The shapes that must not fuse because the lookup does not match the test:
+%% the success edge of the test is not solely the lookup (`notsole/1' does
+%% something else first, and the two key tests of `two_keys/1' are coalesced
+%% into one multi-key test whose success edge holds two lookups), the operand of
+%% `is_map_key/2' is not proven to be a map (`nomap/1' has no `is_map/1' guard,
+%% so its guard stays a plain BIF), the extracted key is not the tested one
+%% (`keydiff/1' - a missing key must still raise `{badkey,b}') and the lookup is
+%% on a different variable than the tested map (`other_map/2' - a non-map must
+%% still raise `{badmap,Term}').
+maps_get_neg_probe() ->
+    "-module(beam_ssa_fus_mgneg).\n"
+    "-export([notsole/1,two_keys/1,nomap/1,keydiff/1,other_map/2]).\n"
+    "\n"
+    "notsole(M) when is_map(M), is_map_key(a, M) ->\n"
+    "    L = maps:keys(M),\n"
+    "    {L, maps:get(a, M)};\n"
+    "notsole(_) ->\n"
+    "    no.\n"
+    "\n"
+    "two_keys(M) when is_map(M), is_map_key(a, M), is_map_key(b, M) ->\n"
+    "    {maps:get(a, M), maps:get(b, M)};\n"
+    "two_keys(_) ->\n"
+    "    no.\n"
+    "\n"
+    "nomap(M) when is_map_key(a, M) ->\n"
+    "    maps:get(a, M);\n"
+    "nomap(_) ->\n"
+    "    no.\n"
+    "\n"
+    "keydiff(M) when is_map(M), is_map_key(a, M) ->\n"
+    "    maps:get(b, M);\n"
+    "keydiff(_) ->\n"
+    "    no.\n"
+    "\n"
+    "other_map(M, N) when is_map(M), is_map_key(a, M) ->\n"
+    "    maps:get(a, N);\n"
+    "other_map(_, _) ->\n"
+    "    no.\n".
+
+%% The lookups that must NOT be substituted for the test because they do not
+%% match it: a different key (`keydiff/1') and a different - unproven - map
+%% operand (`other_map/2'). Both are consumed by the exception-equivalence
+%% testcase.
+
 %% Chains of multiplications by integer constants under an `is_integer/1'
 %% guard, which is what lets the type analysis prove the operand to be an
 %% integer (Fusion 4).
@@ -623,13 +890,16 @@ mulchain_neg_probe() ->
 %% pass and then kills it again with the negation that
 %% beam_ssa_opt:passes_1/2 derives from the pass list, and `no_ssa_opt' skips
 %% the whole beam_ssa_opt pass. `no_fus_plain' is the negation without the
-%% enabling option, which is accepted (and ignored) as well.
+%% enabling option, which is accepted (and ignored) as well, and
+%% `no_ssa_opt_fus' is the enabling option combined with the option that
+%% disables the pass it is looked up in: both must be no-ops.
 opt_sets() ->
     [{fusion,       [binary,fusion_opt]},
      {plain,        [binary]},
      {no_fus_plain, [binary,no_ssa_opt_fus]},
      {no_fus,       [binary,fusion_opt,no_ssa_opt_fus]},
-     {no_ssa_opt,   [binary,no_ssa_opt]}].
+     {no_ssa_opt,   [binary,no_ssa_opt]},
+     {no_ssa_opt_fus,[binary,fusion_opt,no_ssa_opt]}].
 
 %% Write `Source' - a complete module named `Mod' - to a fresh scratch
 %% directory and compile it with every option set in opt_sets/0.
@@ -744,17 +1014,46 @@ instr_name(I) when is_tuple(I) ->
         bif -> element(2, I);
         gc_bif -> element(2, I);
         Name -> Name
-    end;instr_name(_) ->
+    end;
+instr_name(_) ->
     none.
 
-%% The number of `Name' instructions in the function `Fun'. Fails if the
-%% function is missing - which is what makes a count assertion a real check
-%% that the function was compiled.
-count_instr(Code, Fun, Name) ->
+%% The instruction list of the function `Fun' in `Code'. Fails if the function
+%% is missing - which is what makes a per-function assertion a real check that
+%% the function was compiled.
+function_code(Code, Fun) ->
     case [Is || {function,N,_,_,Is} <- Code, N =:= Fun] of
-        [Is] -> length([I || I <- Is, instr_name(I) =:= Name]);
+        [Is] -> Is;
         Other -> ct:fail({missing_function, Fun, Other})
     end.
+
+%% The instruction names of the function `Fun', in order: used to compare a
+%% single function of two builds.
+func_shape(Code, Fun) ->
+    [instr_name(I) || I <- function_code(Code, Fun)].
+
+%% The failure label of the single `Name' instruction of the function `Fun'.
+%% `test', `bif' and `gc_bif' carry it in the second element; a plain
+%% instruction such as `get_map_elements' carries it directly after its name.
+%% Fails unless exactly one such instruction has one.
+fail_label(Code, Fun, Name) ->
+    case [Fail || I <- function_code(Code, Fun),
+                  instr_name(I) =:= Name,
+                  Fail <- [fail_of(I)],
+                  Fail =/= none] of
+        [Fail] -> Fail;
+        Other -> ct:fail({unexpected_fail_labels, Fun, Name, Other})
+    end.
+
+fail_of({test,_,Fail,_}) -> Fail;
+fail_of({bif,_,Fail,_,_}) -> Fail;
+fail_of({gc_bif,_,Fail,_,_,_}) -> Fail;
+fail_of({get_map_elements,Fail,_,_}) -> Fail;
+fail_of(_) -> none.
+
+%% The number of `Name' instructions in the function `Fun'.
+count_instr(Code, Fun, Name) ->
+    length([I || I <- function_code(Code, Fun), instr_name(I) =:= Name]).
 
 %% The number of multiplication instructions in the function `Fun'. A
 %% multiplication by a constant is emitted as the `*' BIF for an integer
@@ -769,10 +1068,7 @@ count_mul(Code, Fun) ->
 %% operand; used to check that a chain was folded into a single multiplication
 %% by the *product* of the chain's constants.
 mul_constant(Code, Fun) ->
-    Is = case [Is0 || {function,N,_,_,Is0} <- Code, N =:= Fun] of
-             [Is1] -> Is1;
-             Other -> ct:fail({missing_function, Fun, Other})
-         end,
+    Is = function_code(Code, Fun),
     case [K || I <- Is, {integer,K} <- mul_args(I)] of
         [K] -> K;
         Constants -> ct:fail({unexpected_multiplication, Fun, Constants})
@@ -788,7 +1084,8 @@ mul_args({gc_bif,'*',_Fail,_Live,Args,_Dst}) ->
 mul_args(_) ->
     [].
 
-%% A compact description of the code - the instruction names in order - used%% to compare builds without dumping complete instruction lists on failure.
+%% A compact description of the code - the instruction names in order - used to
+%% compare builds without dumping complete instruction lists on failure.
 shape(Code) ->
     [{Name,Arity,[instr_name(I) || I <- Is]} ||
         {function,Name,Arity,_,Is} <- Code].
@@ -797,10 +1094,7 @@ shape(Code) ->
 %% list of operands. Fails if the function does not contain exactly one such
 %% instruction - which is what makes the fused form one *multi-key* lookup.
 get_map_keys(Code, Fun) ->
-    Is = case [Is0 || {function,Name,_,_,Is0} <- Code, Name =:= Fun] of
-             [Is1] -> Is1;
-             Other -> ct:fail({missing_function, Fun, Other})
-         end,
+    Is = function_code(Code, Fun),
     case [List || {get_map_elements,_,_,{list,List}} <- Is] of
         [List] -> lists:sort(keys_of(List));
         Lists -> ct:fail({unexpected_get_map_elements, Fun, Lists})
