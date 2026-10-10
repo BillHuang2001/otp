@@ -65,7 +65,7 @@ instead of a substituted atom.
     (`:176`) and `badkey` (`:177`); `Runtime::new` seeds it before any load
     (`../../../beam_rt/src/runtime.rs:477-478`); `CodeServer::load_bytes` clones the shared table
     into each module (`../../../beam_rt/src/codeserver.rs:345`). So in a `beam_rt` run both tags
-    always resolve.
+    always resolve (and `function_clause`, which `CORE_ATOMS` also carries, resolves there too).
   - engine test host: `SEED_ATOMS` (`../../../tests/support/atoms.rs:61-95`) is appended to every
     module loaded through it (`:164-171`).
   - `beam_loader::load`/`load_file` (`../../../../beam_loader/src/load.rs:43-71`) builds a
@@ -74,7 +74,9 @@ instead of a substituted atom.
     builds `{badmap,X}`), so the `badmap` tag is nameable even there, but it does **not** intern
     `badkey` (verified on `../tests/fixtures/mapfx.beam` atoms: `badmap` present, `badkey`
     absent; likewise for a `put_map_exact`-only module) — the oracle produces `{badkey,Key}` from
-    its globally interned `error_atom` table (`beam_common.c:382-406`).
+    its globally interned `error_atom` table (`beam_common.c:382-406`). `function_clause` is
+    interned by the compiler for any module with a head clause, so a real matching module names
+    it; a module that does not is the typed gap.
 
 ## Reachability of the `NO_FAIL` raises from compiler-emitted code
 Verified against the system `erlc` (OTP 29) disassembly:
