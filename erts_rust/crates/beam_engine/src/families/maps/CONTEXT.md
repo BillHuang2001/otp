@@ -34,7 +34,7 @@ Ground truth (read-only): `../../../../erts/emulator/beam/emu/map_instrs.tab:49-
 `fail_or_raise` (`mod.rs:238`) forwards the `{Tag,Value}` raise to `raise_error_tuple`
 (`mod.rs:280`); `fail_or_function_clause` (`mod.rs:260`) forwards the absent-key `NO_FAIL` branch to
 the engine's single failed-clause definition `raise_function_clause_no_fail`
-(`crate::interpreter::dispatch`; call site `mod.rs:267`, `what = "maps"`), which throws class `error`
+(`dispatch.rs`; call site `mod.rs:267`, `what = "maps"`), which throws class `error`
 with the bare atom `function_clause` (no tuple — the reason is not `{Tag,Value}`).
 
 ### The absent-key `NO_FAIL` reason (engine-defined)
@@ -45,7 +45,8 @@ The read path's C failure is the plain `$FAIL($Fail)` (`emu/map_instrs.tab:49-12
 It is engine-defined: class `error`, reason the **bare atom** `function_clause` — the reason C gives
 a head/guard/pattern failure with no branch (`emu/beam_emu.c:578-583` `i_func_info_IaaI`). The raise
 is the engine's single failed-clause definition,
-`crate::interpreter::dispatch::raise_function_clause_no_fail` (`what = "maps"`), which resolves the
+`crate::interpreter::raise_function_clause_no_fail` (a `pub(crate)` re-export of
+`dispatch.rs`; `what = "maps"`), which resolves the
 tag by name from the running module's atom table (like `badmap`/`badkey`), so a module that cannot
 name it yields the typed `error::unsupported("maps: no 'function_clause' atom in the module")`
 instead of a substituted atom.
@@ -53,7 +54,7 @@ instead of a substituted atom.
 ## The reason-atom contract (load-bearing)
 - `raise_error_tuple` resolves the tag **only** from the running module's
   `beam_loader::Module::atom_table` (`mod.rs:287-290`); `raise_function_clause_no_fail`
-  (`crate::interpreter::dispatch`) likewise resolves `function_clause` only from it. A missing name is
+  (`dispatch.rs`) likewise resolves `function_clause` only from it. A missing name is
   the typed `error::unsupported("maps: no '<name>' atom in the module")`, which `error::unsupported`
   renders as the reason atom `unsupported_opcode: maps: no '<name>' atom in the module`.
 - **The engine has no global/shared atom lookup and no atom-interner seam.**
@@ -167,7 +168,7 @@ Verified against the system `erlc` (OTP 29) disassembly:
   table it is read with.
 - `raise_error_tuple` installs the `error` class atom only when the module can name it
   (`mod.rs:297-299`), and `raise_function_clause_no_fail` does the same
-  (`crate::interpreter::dispatch`), so an uncaught
+  (`dispatch.rs`), so an uncaught
   raise still propagates as `Err(BeamError::Raise(..))`.
 - The same by-name/typed-gap pattern is used by the exceptions family
   (`../exceptions/raise.rs:52-86`), so a change to this contract is a two-site change.

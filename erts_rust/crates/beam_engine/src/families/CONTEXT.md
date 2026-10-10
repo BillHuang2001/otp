@@ -43,7 +43,7 @@ semantically identical to the old first-claim-wins probe loop (see the module do
   ("create: no record definition table for another module", `:756-758`). **The running module's own
   `put_record/6` create form IS implemented** (`create_native_record`, `:643-732`) — see Known Issues.
 - `maps/mod.rs:260-271` `fail_or_function_clause` (absent key + `NO_FAIL` ⇒ the bare atom
-  `function_clause`, through the shared `crate::interpreter::dispatch::raise_function_clause_no_fail`);
+  `function_clause`, through the shared `crate::interpreter::raise_function_clause_no_fail`);
   `:238-252` `fail_or_raise`/`:280-301` `raise_error_tuple` raise
   `{badmap,_}`/`{badkey,_}`; a missing tag atom ⇒ `unsupported`.
 - `exceptions/mod.rs:155-157` `Raise` with no `pending_class`; `:167-171` `try_case` without `THE_NON_VALUE`;
