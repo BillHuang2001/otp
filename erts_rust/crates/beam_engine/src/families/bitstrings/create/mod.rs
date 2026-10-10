@@ -18,7 +18,7 @@
 //
 // %CopyrightEnd%
 
-//! Bitstring **construction**: `bs_create_bin` (and the `bs_init_writable` gap).
+//! Bitstring **construction**: `bs_create_bin` and `bs_init_writable`.
 //!
 //! Ground truth (read-only): `emu/bs_instrs.tab` (`i_bs_create_bin` `:415`,
 //! `i_bs_private_append`), the segment table `emu/generators.tab` and the flag bits
