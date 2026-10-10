@@ -141,19 +141,20 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   in `tools/bench/results/`) — read it there rather than duplicating numbers. Headlines since M1: the
   registered-BIF dispatch hot path fell from ~10.6 µs to ~116 ns/call and the registry lookup is now
   allocation-free; the `foreign` per-call gap vs the system runtime is ~54×–72× (was 703×–9891× at M1).
-- **Contract A.9 (build/bootstrapping) — no self-hosted build; boot stops early.** `beam_rt` loads the 22
-  preloaded modules on startup. Its boot-script executor (a public path the CLI does **not** drive)
-  runs `bootstrap/bin/start.boot` instructions 0–15 and stops at instruction 16,
-  `{apply,{application,load,[{application,stdlib,…}]}}`, with a typed `exit noproc` (no live
-  `application_controller`); instructions 17+ are unreached. The remaining blocker is the residual
-  `beam_engine` behaviour: a raise/`receive` from a cross-module callee (the `proc_lib:sync_start/2`-class
-  startup) is not suspended into the caller's frame, so instruction 16 still aborts — no committed
-  reproducer exists yet. The `beam_bifs` `ets` links formerly blamed here are implemented (`ets:new/2`
-  accepts the full option matrix incl. `{read_concurrency,true}`, and a `named_table` name resolves —
-  `beam_bifs/src/ets/resolve.rs`), and the `call_ext` seam is resolve-first / blocking-aware
-  (`beam_engine/src/families/funs/mod.rs`). `beam_rt` still runs no live
-  `code_server`/`application_controller`/`logger` process (a runtime-native `code:*`/`init:*` floor
-  stands in). A.9's differential coverage is boot/version observability only. Per-crate detail:
+- **Contract A.9 (build/bootstrapping) — boot-to-completion achieved; no self-hosted build.** `beam_rt`
+  loads the 22 preloaded modules on startup, and its boot-script executor drives the real
+  `bootstrap/bin/start.boot` (OTP 30 / erts-17.1, 22 instructions) **to completion** — all 22 directives
+  through the final `{progress,started}` (index 21); the `-boot` CLI also exits 0 with empty
+  stdout/stderr. The last working link is instruction 20 `{apply,{c,erlangrc,[]}}`, unblocked by the
+  runtime-native `file_server_2` service (`crates/beam_rt/src/native/file_server.rs`). Instruction 16's
+  former `exit noproc` abort is gone: the `{kernelProcess,…}` servers survive their short-lived directive
+  process via the unlink in `crates/beam_rt/src/boot/drive.rs`, and the `call_ext` seam is resolve-first /
+  blocking-aware, so a cross-module `receive` suspends the caller
+  (`crates/beam_engine/src/families/funs/mod.rs`, pinned by `crates/beam_rt/tests/proc_lib_start.rs`).
+  A.9's remaining gaps are fidelity ones: **no self-hosted build** (the Rust runtime does not compile/run
+  itself), and a plain runtime runs **no live** `code_server`/`logger`/`erl_prim_loader` process or, off
+  the `-boot` path, `application_controller` — `code:*`/`init:*`/`application:*` queries are served by a
+  native floor (`crates/beam_rt/src/native/{code,init,application}.rs`). Per-crate detail:
   `crates/CONTEXT.md` (A.9 status) and `crates/beam_rt/src/boot/CONTEXT.md`.
 - **Honest coverage gaps** (per-crate `Known Issues`): the Cranelift hot tier (`jit-cranelift`,
   default-OFF, not on `beam_rt`'s path — the baseline JIT tier is wired for the first module entry);
