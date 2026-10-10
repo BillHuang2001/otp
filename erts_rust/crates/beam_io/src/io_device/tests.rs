@@ -83,6 +83,8 @@ enum Step {
         reply: Reply,
         leftover: Leftover,
     },
+    /// The continuation itself fails (`Mod:Func` raising) with `badmatch`.
+    Fail,
 }
 
 /// A continuation that returns a scripted sequence of outcomes and records every
@@ -139,6 +141,7 @@ impl Continuation for Mock {
         match self.steps.pop_front() {
             Some(Step::More) => Ok(Applied::More(cont)),
             Some(Step::Done { reply, leftover }) => Ok(Applied::Done { reply, leftover }),
+            Some(Step::Fail) => Err(BeamError::BadMatch),
             // The script ran out: answer with everything accumulated so far.
             None => Ok(Applied::Done {
                 reply: Reply::List(cont),
@@ -547,6 +550,39 @@ fn a_unicode_leftover_is_converted_and_joined_with_the_incomplete_tail() {
     expected.extend_from_slice(&[0xC3, 0xA9]); // U+00E9
     expected.push(0xC3); // the pending incomplete tail
     assert_eq!(device.buffer(), expected.as_slice());
+}
+
+#[test]
+fn a_later_more_iteration_failure_keeps_the_pending_tail_in_the_device_state() {
+    // `get_chars_apply` is entered from `get_chars_notempty` with the pending incomplete tail
+    // *as the device buffer* (`file_io_server.erl:611-615`), so a failure raised inside it —
+    // the continuation's own `Mod:Func` raising included — is caught with that tail still in
+    // `State#state{buf=B}` (`:686-691`).
+    //
+    // `read` #1 yields "a" plus the first two bytes of U+2022 (`E2 82`) and returns
+    // `{more, S1}` with the tail `E2 82`; `read` #2 completes "•b" and returns `{more, S2}`
+    // with the tail `E2 82` again; `read` #3 completes "•" but the continuation then raises.
+    let (source, reads) =
+        ScriptedSource::new(&[&[0x61, 0xE2, 0x82], &[0xA2, 0x62, 0xE2, 0x82], &[0xA2]]);
+    let mut device = IoDevice::new(source, Encoding::Unicode, FileDataMode::Binary);
+    let mut cont = Mock::new(vec![Step::More, Step::More, Step::Fail]);
+
+    let error = device
+        .get_until(&mut cont, Encoding::Unicode)
+        .expect_err("the continuation failed in the second {{more,…}} iteration");
+
+    assert!(matches!(error, BeamError::BadMatch), "{error:?}");
+    assert_eq!(reads.get(), 3, "the loop read a third chunk before failing");
+    assert_eq!(
+        cont.seen.len(),
+        3,
+        "the continuation was applied once per read"
+    );
+    assert_eq!(
+        device.buffer(),
+        &[0xE2, 0x82],
+        "the failing iteration's pending incomplete tail is kept as the device buffer"
+    );
 }
 
 #[test]

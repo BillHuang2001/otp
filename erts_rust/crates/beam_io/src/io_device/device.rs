@@ -277,7 +277,14 @@ impl IoDevice {
         let size = read_size(self.read_mode);
         match self.source.read_chunk(size) {
             Ok(Some(bytes)) => {
-                let mut concatenated = pending;
+                // The oracle threads `State#state{buf=B}` into `get_chars_apply`
+                // (`file_io_server.erl:611-615`), so a failure raised *inside* it — the
+                // continuation's own `Mod:Func` raising included — is caught with the pending
+                // incomplete tail still in the device buffer (`:686-691`). Write it back before
+                // the apply: the `Done` arm overwrites it and every `{more,…}` iteration
+                // re-sets it, so the success paths are unchanged.
+                let mut concatenated = pending.clone();
+                self.buffer = pending;
                 concatenated.extend_from_slice(&bytes);
                 self.get_chars_apply(
                     continuation,
