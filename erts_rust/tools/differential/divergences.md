@@ -10,26 +10,10 @@ crate below must close the gap, after which a case can be added to the corpus.
 `beam_rt: unsupported: …` / exit-3 convention — are recorded in the allowlist table above,
 not here: today only `wire/new_fun_ext_encode` remains.)
 ## A.3 — NIF C ABI (owner: `beam_abi` / `beam_rt` NifHost)
-- `enif_clear_env` clears a pending exception in the Rust runtime but not in the oracle
-  (`crates/beam_abi/src/nif/enif/exception.rs`). (On the *process* env it is illegal C and
-  SIGSEGVs the oracle.) The clean-env shape agrees and is pinned.
-- Host hooks whose success path has no implementation (a case would be a plain-value
-  mismatch):
-  `enif_make_ref` (oracle a fresh ref → `1`, rust falls back to `enif_make_badarg` → `error:badarg`);
-  `enif_term_to_binary` on a valid term (oracle `1`, rust `0`);
-  `enif_binary_to_term` on a valid encoding (oracle the byte count consumed — `3` for the
-  3-byte `<<131,97,42>>` — rust `0`);
-  `enif_make_existing_atom` / `enif_make_existing_atom_len` on a name held in the **committed**
-  atom table but **not** interned during the call, e.g. `enif_make_existing_atom(env, "ok", …)`
-  (oracle `1`, rust `0` — `NifHost::existing_atom` is a `None` stub,
-  `crates/beam_abi/src/nif/host.rs`; this is distinct from the within-call hit, which agrees and
-  is pinned in `nif_abi`);
-  `enif_whereis_pid` on a **registered** name (oracle `1`, rust `0`).
-  Their *failure* shapes (a missing atom/name, malformed ETF) DO agree and are pinned.
 - `enif_make_unique_integer` values differ by design (crate counters vs emulator state);
   only the property shapes (`positive` / `monotonic` / default negative) are pinned.
 - `enif_system_info` is only partially pinned: `otp_release` (oracle `"29"` vs rust `"30"`),
-  `async_threads` / `scheduler_threads` (real counts vs `0`/`1`) and `dirty_scheduler_support`
+  `async_threads` / `scheduler_threads` (the runtime's own counts) and `dirty_scheduler_support`
   (oracle `1` vs rust `0`) are **not** asserted, only the frozen version macros + the
   `thread_support`/`smp_support`/`erts_version` fields.
 - `enif_max_atom_cache_index()` differs (oracle `2038`, rust `0`) — only the frozen
@@ -41,10 +25,6 @@ not here: today only `wire/new_fun_ext_encode` remains.)
 - `enif_getenv`'s "too small" path leaves `*value_size` at `capacity-1` in the oracle vs the
   needed capacity in the rust runtime (the success path and the missing-key refusal DO agree
   and are pinned).
-- `enif_inspect_iolist_as_binary` called on a **bare byte integer** (`enif_make_int(env, 65)`) is
-  refused by the oracle (`0`) but accepted by the rust runtime (`1`). The same byte inside a list
-  agrees and is pinned. Owner: `beam_abi`
-  (`crates/beam_abi/src/nif/enif/mem.rs::flatten_iolist`).
 
 ## A.4 — driver C ABI (owner: `beam_rt` / `beam_io`; `beam_abi` for the timer units)
 - **Landed:** `erl_drv_output_term` / `erl_drv_send_term` / `driver_output_term` /
@@ -82,14 +62,10 @@ not here: today only `wire/new_fun_ext_encode` remains.)
   unpinnable, to re-check before treating any as a runtime gap.
 - `erl_errno_id/1` returns a short POSIX symbol (`enoent`, `einval`, `errno_0`) in the oracle
   but `strerror` prose in the rust runtime.
-- `driver_pdl_*` succeed in the oracle but return `NULL` in the rust runtime;
-  `driver_pdl_get_refc(NULL)` SIGSEGVs the oracle, so the family stays unpinned.
-- `get_port_flags` → oracle `1`, rust `0`; `set_port_control_flags` has no effect in the rust
-  runtime.
+- `driver_pdl_get_refc(NULL)` SIGSEGVs the oracle, so the `driver_pdl_*` family stays unpinned
+  (the PDL calls themselves now succeed in both).
 - `driver_async_port_key/1` → oracle `3`, rust `0`; `erl_drv_consume_timeslice/2` → oracle
   `1`/`1`, rust `0`/`0`.
-- The `driver_output*` return code is the delivered byte count in the oracle but `0` in the
-  rust runtime (the rust seam ignores `driver_output_binary`'s return value).
 - `driver_peekq`/`driver_deq`/`driver_peekqv` differ (port-handle/queue-shape).
 - `erl_drv_busy_msgq_limits` writes the handle in the rust runtime instead of leaving the
   bounds; `erl_drv_getenv` sets `size` on an absent key in the rust runtime;
@@ -99,19 +75,11 @@ not here: today only `wire/new_fun_ext_encode` remains.)
   `driver_get_monitored_process` / `driver_compare_monitors` succeeds in the oracle but is refused
   by the rust runtime (the `DriverHost` hooks are left at `None`), so no case pins it.
   Owner: `beam_rt` / `beam_io`.
-- `driver_sizeq/1` on a **fresh driver port** is `0` in the oracle but non-zero in the rust
-  runtime. This is distinct from the `driver_enq`/`driver_sizeq` probe hazard above, which hangs
-  the oracle. Owner: `beam_rt` / `beam_io`.
 
 ## A.5 — distribution wire / ETF (owner: `beam_codec`, `beam_rt`)
 - A `[compressed]` image is **not** byte-identical: the framing (`131,80`), the 32-bit
   uncompressed size and the trailing Adler-32 match, but the zlib deflate middle differs.
   Only `binary_to_term(term_to_binary(T, [compressed])) =:= T` round trips are pinned.
-- A `MAP_EXT` (116) blob with **more than 32 key/value pairs** decodes in the oracle
-  (`maps:size` -> `33`) but the Rust runtime aborts with `beam_rt: system_limit` / empty
-  stdout (exit 1). `system_limit` is a plain Erlang reason, outside the runtime's documented
-  `unsupported` convention, so a case would be a `mismatch` — hence deliberately not pinned.
-  Owner: `beam_term` / `beam_codec`.
 - The `[used]` byte count of `binary_to_term/2` on a `[compressed]` image differs by 1 byte —
   a consequence of the differing zlib bodies above (the compressed image's size is not
   byte-stable, so it is unpinnable; only the round trip is pinned).
@@ -119,14 +87,6 @@ not here: today only `wire/new_fun_ext_encode` remains.)
   integer binary segment wider than 64 bits — are no longer divergences: `beam_rt` now evaluates
   each shape, so they are pinned as **agreeing** regression cases; see the table above, owner
   `beam_rt`.)
-- `binary_to_term(term_to_binary(self()))` yields the pid in the oracle but **raises** in the rust
-  runtime (empty stdout, exit 1), so `binary_to_term(term_to_binary(self())) =:= self()` is `true`
-  (oracle) vs `false` (rust). Owner: `beam_bifs` / `beam_rt`.
-- A `NEWER_REFERENCE_EXT` (90) blob with `Len = 1` naming the **local** node is normalised to
-  `Len = 3` on re-encode by the oracle but preserved as `Len = 1` by the rust runtime, so the
-  images differ byte-wise. Owner: `beam_codec`.
-- `binary_to_term(term_to_binary(make_ref()))` is an honest rust capability gap
-  (`beam_rt: unsupported: external_term`, exit 3) — neither a case nor a mismatch.
 
 ## A.7 — process signals (owner: `beam_bifs` / `beam_process`)
 - A `{'DOWN', …}` for a monitored **port** is not delivered after `port_close/1`: the oracle
@@ -135,48 +95,38 @@ not here: today only `wire/new_fun_ext_encode` remains.)
   `error:badarg` in the Rust runtime. (The monitor **creation** now agrees and is pinned.)
 
 ## A.7 — program result / CLI (owner: `beam_rt` / `beam_engine`, `beam_bifs`)
-- A **zero-length binary** returned as a program's result is rejected by the Rust CLI
-  (`beam_rt: badarg`, exit 1) where the oracle prints `<<>>`.
-  Owner: `beam_rt` / `beam_engine`.
-- `erl_error:format_exception/3` with a **heap-allocated** reason (`{A,B}` / `{A,B,C}`, whose
-  rendered text is longer than 2 chars) **SIGSEGVs** the rust runtime (exit 139) while the oracle
-  returns a value. The only agreeing shape is `format_exception(error, badarg, [])`.
-  Owner: `beam_bifs` / `beam_engine`.
-- `filelib:is_dir/1`, `filelib:is_file/1`, `filelib:wildcard/1`, `re:version/0` and `re:split/2`
-  are honest rust capability gaps (`beam_rt: unsupported: …`, exit 3) — neither cases nor
-  mismatches.
+- `filelib:is_dir/1` / `is_file/1` / `is_regular/1` (and a literal-path `filelib:wildcard/1`)
+  still hit the typed `#file_info{}` `access(2)` gap on an **existing** path
+  (`beam_rt: unsupported: file_server: …`, exit 3); their absent-path answers and the glob
+  `filelib:wildcard/1` path agree and are pinned. `re:version/0` and `re:split/2` remain rust
+  capability gaps (`beam_rt: unsupported: re:version/0` / `re:compile/2`, exit 3) — neither
+  cases nor mismatches.
 
 ## A.9 — preloaded / boot (owner: `beam_rt`, `beam_bifs`)
-- `code:get_mode/0` → oracle `interactive`, rust `badarg`.
-- `init:get_argument(root|home|progname)` → each runtime reports **its own** automatic value:
-  the oracle `{ok,[[Path]]}` (and `progname` = `erl`), the rust runtime `root`/`home` from its own
-  state and `progname` = `beam_rt`, the basename it was invoked as (`{ok,[["beam_rt"]]}`).
 - `init:get_arguments/0` → the oracle reports every flag **plus** its automatic
   `root`/`bindir`/`progname`/`home` entries, the rust runtime only its modelled flags.
-- `application:get_all_key/1` and `application:get_key/1` → oracle `{ok,KeyList}`, rust `badarg`
-  / `undefined`.
-- `application:get_application/0` and `/1` → oracle `undefined` / `{ok,App}`, rust `badarg`.
+  (`init:get_argument(root|home|progname|bindir)` returns the same automatic value in both and
+  is pinned.)
 - `erlang:module_info(exports)` → oracle the export table, rust `undef`
   (`lists:module_info(exports)` works but with a different entry order).
 - `whereis(code_server|erl_prim_loader|kernel_sup)` → oracle a pid, rust `undefined`.
-- Further surfaces found while probing: `code:lib_dir/2` (a path vs `badarg`, e.g.
-  `code:lib_dir(kernel, ebin)`),
-  `code:get_path/0` (differing path lists), `init:script_id/0` (`{"Erlang/OTP","29"}` vs
-  `badarg`), `application:get_key(stdlib, mod)` (`{ok,[]}` vs `undefined`),
-  `application:get_application(kernel)` (`{ok,kernel}` vs `badarg`),
+- Further surfaces found while probing: `code:get_path/0` (differing path lists),
+  `init:script_id/0` (rust `beam_rt: unsupported: init:script_id/0 (no boot script has been
+  loaded)`, exit 3; the oracle `{"Erlang/OTP","29"}`),
   `erl_prim_loader:get_path/0` (`{ok,Paths}` vs `badarg`),
   `erlang:system_info(logical_processors)` (16 vs 14),
   `erlang:system_info(heap_sizes)` (the rust list has an extra entry),
   `erlang:module_loaded(lists|kernel)` (`true` vs `false`).
-- `erlang:check_old_code/1`, `erlang:system_info(loaded)` and `erlang:system_info(check_io)`
+- `erlang:system_info(loaded)` and `erlang:system_info(check_io)`
   are honest capability gaps (rust exit 3 / `beam_rt: unsupported: …`) — neither cases nor
   mismatches; safe to pin as allowlisted cases once wanted.
 - `erlang:function_exported/3` is `false` in the rust runtime for `kernel` and `code` (the
   oracle says `true`); it agrees for the preloaded modules and for the file-loaded `lists`.
 - `erlang:system_info(schedulers|dirty_cpu_schedulers|dirty_io_schedulers)` → oracle
   `16`/`16`/`10`, rust `14`/`0`/`0`.
-- `erlang:system_info(endian)` and `erlang:system_info(build_type)` raise `badarg` in the rust
-  runtime (oracle `little` / `opt`).
+- `erlang:system_info(build_type)` is an honest rust capability gap (exit 3 /
+  `beam_rt: unsupported: …`; the oracle answers `opt`) — neither a case nor a mismatch.
+  (`erlang:system_info(endian)` now agrees — `little` in both — and is pinned.)
 - `persistent_term:info/0` returns zero-valued counters in the rust runtime (the oracle reports
   live `count`/`memory`).
 - `erlang:system_info(tolerant_timeofday)` is an honest rust capability gap (exit 3 /
