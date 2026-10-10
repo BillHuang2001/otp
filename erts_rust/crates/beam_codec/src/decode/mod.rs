@@ -30,6 +30,17 @@
 //! [`crate::term`]. The fun/export tag arms' helpers live in the child [`fun`]
 //! module and the native-record arm in the child [`record`] module, each as a second
 //! `impl` block on [`Decoder`].
+//!
+//! ## Nesting depth is bounded (no abort on hostile input)
+//!
+//! [`Decoder::decode`] is recursive, so a deeply nested image could otherwise
+//! exhaust the native stack and **abort the process** (a Rust stack overflow, not a
+//! typed error). `decode` therefore refuses any term nested deeper than
+//! [`MAX_DECODE_DEPTH`] with `BeamError::SystemLimit`, and only *nesting* is bounded:
+//! a long (wide) list or tuple decodes iteratively and is unaffected. This is a
+//! deliberate, documented divergence from C `dec_term`
+//! (`../../erts/emulator/beam/external.c`), which has no explicit depth limit and
+//! relies on the emulator thread's stack.
 
 mod fun;
 mod record;
@@ -70,6 +81,34 @@ const BIG_DIGIT_BYTES: usize = size_of::<u64>();
 /// `external.c:4810`) enforces it only for its own first number.
 const MAX_REFERENCE: u32 = 1 << 18;
 
+/// The maximum **nesting depth** [`Decoder::decode`] will recurse to.
+///
+/// `decode` is recursive: a tuple/list/map element, a map key/value, the node atom
+/// of an external identifier, a fun/record sub-term and the `LOCAL_EXT` wrapper all
+/// re-enter it. Without a bound, a deeply nested image (e.g. ~55 KB of nested
+/// 1-tuples) exhausts the native stack and Rust **aborts the process** with a stack
+/// overflow — hostile input turned into a crash, never a typed error. This bound
+/// converts that into a `BeamError::SystemLimit`.
+///
+/// This is a **documented divergence** from C `dec_term`
+/// (`../../erts/emulator/beam/external.c`), which has no explicit depth limit: it
+/// recurses on the emulator thread's stack. A bounded depth is the deliberate
+/// choice here — a typed resource error is strictly better than an abort.
+///
+/// The value is measurement-driven. Each nesting level costs roughly 340 bytes of
+/// native stack in the dev profile; on a **2 MiB** thread stack (the Rust default
+/// for spawned threads, and four times *smaller* than the 8 MiB main thread) the
+/// recursion first hits the guard page — and aborts — at a nesting depth of about
+/// **6250** (measured: a nested-1-tuple image decodes at depth 6200 and aborts at
+/// 6300). The limit is set to 1/4 of that measured cliff so the guard trips long
+/// before the stack is anywhere near exhaustion, leaving room for the deeper
+/// per-level frames of a debug build or a future code change.
+///
+/// Only **depth** is bounded, never length: the list spine and a tuple's elements
+/// are decoded iteratively (a loop feeding a `Vec`), so a 1,000,000-element list
+/// and a 100,000-element tuple still decode — this constant bounds nesting alone.
+const MAX_DECODE_DEPTH: usize = 1500;
+
 /// Incremental external term format decoder.
 ///
 /// `new` requires and consumes the leading version byte `131`; `new_body`
@@ -83,6 +122,11 @@ pub struct Decoder<'a> {
     /// The off-heap binary host, when a large binary's payload should live off the
     /// process heap (see [`Decoder::with_off_heap`]).
     off_heap: Option<&'a mut dyn OffHeapBinaries>,
+    /// The current nesting depth of [`Decoder::decode`], bounded by
+    /// [`MAX_DECODE_DEPTH`]. Incremented on entry and decremented on **every** exit
+    /// path (see `decode`), so it tracks the live recursion depth, not the number of
+    /// terms decoded.
+    depth: usize,
 }
 
 impl<'a> Decoder<'a> {
@@ -95,17 +139,17 @@ impl<'a> Decoder<'a> {
         if reader.u8()? != VERSION_MAGIC {
             return Err(bad_arg());
         }
-        Ok(Decoder { reader, cache: None, off_heap: None })
+        Ok(Decoder { reader, cache: None, off_heap: None, depth: 0 })
     }
 
     /// Creates a decoder for a body: **no** leading version byte.
     pub fn new_body(bytes: &'a [u8]) -> Decoder<'a> {
-        Decoder { reader: Reader::new(bytes), cache: None, off_heap: None }
+        Decoder { reader: Reader::new(bytes), cache: None, off_heap: None, depth: 0 }
     }
 
     /// Attaches the distribution atom cache used to resolve `ATOM_CACHE_REF` (`82`).
     pub fn with_atom_cache(self, cache: &'a AtomCache) -> Decoder<'a> {
-        Decoder { reader: self.reader, cache: Some(cache), off_heap: self.off_heap }
+        Decoder { reader: self.reader, cache: Some(cache), off_heap: self.off_heap, depth: self.depth }
     }
 
     /// Attaches the [`OffHeapBinaries`] host that owns the payload of a **large**
@@ -123,7 +167,7 @@ impl<'a> Decoder<'a> {
     /// [`crate::term::bitstring_bytes`]/[`crate::term::bitstring_size_bits`] read both
     /// representations, so `byte_size/1`, the contents and the ETF image cannot differ.
     pub fn with_off_heap(self, host: &'a mut dyn OffHeapBinaries) -> Decoder<'a> {
-        Decoder { reader: self.reader, cache: self.cache, off_heap: Some(host) }
+        Decoder { reader: self.reader, cache: self.cache, off_heap: Some(host), depth: self.depth }
     }
 
     /// Decodes the next term into `heap`, interning its atoms into `atoms`.
@@ -146,7 +190,37 @@ impl<'a> Decoder<'a> {
     /// a [`FunKind::External`](crate::FunKind) fun and [`Tag::NewFun`] a
     /// [`FunKind::Imported`](crate::FunKind) one (see [`Decoder::decode_export`] and
     /// [`Decoder::decode_new_fun`]).
+    ///
+    /// **Nesting is bounded.** `decode` recurses on every nesting level (a
+    /// tuple/list/map element, a map key/value, an identifier's node atom, a
+    /// fun/record sub-term, the `LOCAL_EXT` wrapper), so a deeply nested image is
+    /// refused with `BeamError::SystemLimit` once the depth reaches
+    /// [`MAX_DECODE_DEPTH`] — a typed resource error instead of the native **stack
+    /// overflow / process abort** an unbounded recursion would cause. Only *depth* is
+    /// bounded: a wide (long) list or tuple is decoded iteratively and is never
+    /// affected (see [`MAX_DECODE_DEPTH`]).
     pub fn decode(&mut self, heap: &mut Heap, atoms: &mut AtomTable) -> Result<Eterm> {
+        // Bound the recursion *before* descending a level, so an over-deep image
+        // returns a typed error rather than exhausting the native stack. C
+        // `dec_term` has no such limit (it relies on the emulator thread's stack);
+        // the bounded divergence is deliberate and documented at the constant.
+        if self.depth >= MAX_DECODE_DEPTH {
+            return Err(system_limit());
+        }
+        self.depth += 1;
+        // The decrement runs on *every* exit path because the inner result is
+        // captured before returning (the recursive arms, the `LOCAL_EXT` wrapper's
+        // early `self.decode(...)`, and any `?` inside `decode_inner` all land here).
+        // `decode_inner` never panics, so the counter cannot leak.
+        let result = self.decode_inner(heap, atoms);
+        self.depth -= 1;
+        result
+    }
+
+    /// The recursive term walker behind [`Decoder::decode`], which owns the depth
+    /// accounting. Kept as a separate function so the guard has exactly one
+    /// increment and one decrement that no early `return` inside the walker can skip.
+    fn decode_inner(&mut self, heap: &mut Heap, atoms: &mut AtomTable) -> Result<Eterm> {
         let byte = self.reader.u8()?;
         let tag = Tag::from_byte(byte).ok_or_else(bad_arg)?;
         match tag {
