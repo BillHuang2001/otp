@@ -39,6 +39,24 @@
 //! `unsafe` is confined to the raw word read/write of the copy loop; every `unsafe` block carries
 //! a `// SAFETY:` rationale.
 //!
+//! # One traversal for a clean destination (the single-pass fast path)
+//!
+//! The copier's default shape is **two traversals**: [`preflight_words`] sizes the graph against
+//! the destination's free words, then [`shallow`] + the worklist loop write it. A destination that
+//! is **clean** — `Heap::used() == 0` and an off-heap table empty in all three of its lists — has
+//! no partially-built state to preserve, and is the shape the common case actually has (a fresh
+//! [`HeapFragment`](crate::HeapFragment) region, a fresh receiver/message heap), so for it the
+//! copier runs the writing traversal **alone**: [`try_copy_fast`] copies through a
+//! [`TrialTarget`] — a bump pointer over the destination heap's own *unwritten* words — and
+//! commits with a single `alloc_words`. A copy that turns out not to fit is abandoned and the
+//! preflight path below re-derives the same typed outcome, so nothing about the error contract
+//! (`AllocKind::Message` exhaustion, `BadArg` for a malformed/cyclic graph, send atomicity)
+//! changes. Because the trial never advances the destination's `used`/`peak`, a refused copy has
+//! provably written nothing at all — the strongest form of the crate's "no partial write on
+//! refusal" rule, and the one `tests/sizing.rs` pins. A **dirty** destination keeps the sized
+//! path: its roll-back would need a `truncate(mark)` API that [`beam_alloc::Heap`] does not
+//! expose.
+//!
 //! # Cycle guard on the preflight
 //!
 //! A term the engine builds is always acyclic, but a *forged* term (a raw write into the heap)
@@ -49,7 +67,11 @@
 //! that walk shows the graph does not fit does it (a) reject a cyclic graph with a typed
 //! [`BeamError::BadArg`](beam_common::BeamError::BadArg) via [`is_acyclic`], or (b) fall back to
 //! `size_object` on a graph now known to be acyclic. A cyclic graph is therefore always a typed
-//! error, never a hang, while a normal (acyclic) graph is sized exactly as before.
+//! error, never a hang, while a normal (acyclic) graph is sized exactly as before. The fast path
+//! inherits the same guarantee from the other direction: its trial target hands out only the
+//! destination's finite free words, so a forged cycle exhausts them (in at most
+//! `available / 2` objects), the attempt is abandoned and the preflight path's
+//! [`is_acyclic`] check re-derives the typed `BadArg`.
 
 use std::collections::HashSet;
 
@@ -59,6 +81,99 @@ use beam_term::prelude::*;
 
 use crate::layout;
 use crate::off_heap::OffHeapTable;
+
+/// The **destination-word source** of a copy: the real destination heap, or — for
+/// [`copy_struct`]'s optimistic single-pass fast path — a [`TrialTarget`], a bump pointer over
+/// the destination heap's own unwritten words.
+///
+/// Abstracting the two is what lets the fast path reuse [`shallow`] *unchanged* (no copy logic is
+/// duplicated): the [`Heap`] implementation is today's `alloc_words`, the trial hands out the very
+/// same words but keeps the heap's `used`/`peak` at zero until the copy has succeeded.
+pub(crate) trait CopyTarget {
+    /// Reserves `n` contiguous words of the destination for one object and returns their base.
+    ///
+    /// The returned words are **uninitialised**: the caller must write them before they are read,
+    /// and must not use them after the owning target is gone. The region never moves, so the
+    /// pointer stays valid for the target's lifetime. (Returning uninitialised memory as a raw
+    /// pointer is safe; reading it is not, which is why every write below is an `unsafe` block.)
+    fn reserve(&mut self, n: usize) -> Result<*mut Eterm>;
+
+    /// Writes the M1 off-heap reference container `[HEADER_BIN_REF, slot, 0]` and returns it.
+    fn off_heap_container(&mut self, slot: usize) -> Result<Eterm>;
+}
+
+impl CopyTarget for Heap {
+    fn reserve(&mut self, n: usize) -> Result<*mut Eterm> {
+        // SAFETY: the words are written by the copy that reserves them before anything reads
+        // them, and the heap never reallocates.
+        unsafe { self.alloc_words(n) }
+    }
+
+    fn off_heap_container(&mut self, slot: usize) -> Result<Eterm> {
+        layout::make_off_heap_container(self, slot)
+    }
+}
+
+/// The optimistic attempt's destination: a bump pointer over the **unwritten** words of the
+/// destination heap (`[hp, hend)`).
+///
+/// It hands out exactly the words the heap itself would, without touching the heap's `used` or
+/// `peak` — so an attempt that fails leaves the destination provably untouched, and one that
+/// succeeds is committed by [`try_copy_fast`] with a single `alloc_words(written)`.
+struct TrialTarget {
+    hp: *mut Eterm,
+    free: usize,
+    written: usize,
+}
+
+impl TrialTarget {
+    /// A trial over the words `to` has not handed out yet.
+    fn over(to: &Heap) -> TrialTarget {
+        TrialTarget {
+            hp: to.hp(),
+            free: to.available(),
+            written: 0,
+        }
+    }
+
+    /// The number of words the trial handed out (the commit size).
+    fn written(&self) -> usize {
+        self.written
+    }
+}
+
+impl CopyTarget for TrialTarget {
+    fn reserve(&mut self, n: usize) -> Result<*mut Eterm> {
+        if n > self.free {
+            // The one failure the trial reports: the destination cannot hold this object. It is
+            // never surfaced — `copy_struct` abandons the attempt and re-runs the preflight path,
+            // which raises the crate's typed `AllocKind::Message` refusal.
+            return Err(crate::error::heap_exhausted(n));
+        }
+        let p = self.hp;
+        // SAFETY: `hp` is the bump pointer of the destination heap's own region with `n <= free`
+        // words still ahead of it, so the advanced pointer stays inside (at worst one-past-the-end
+        // of) that region; `add` reads and writes no memory.
+        self.hp = unsafe { self.hp.add(n) };
+        self.free -= n;
+        self.written += n;
+        Ok(p)
+    }
+
+    fn off_heap_container(&mut self, slot: usize) -> Result<Eterm> {
+        // The same M1 encoding `layout::make_off_heap_container` writes for a real destination
+        // heap; that writer is typed on `&mut Heap`, so the trial carries its own copy of the
+        // three writes. `tests/single_pass.rs` pins that the two agree.
+        let p = self.reserve(ERL_BIN_REF_SIZE)?;
+        // SAFETY: `p` heads `ERL_BIN_REF_SIZE` exclusively-owned words of the trial region.
+        unsafe {
+            *p = HEADER_BIN_REF;
+            *p.add(1) = Eterm::from_raw(slot);
+            *p.add(2) = Eterm::from_raw(0);
+        }
+        Ok(make_boxed(p as *const Eterm))
+    }
+}
 
 /// The copy boundary: the source process's off-heap table (to resolve off-heap references) and
 /// the destination's (where the referenced off-heap objects are re-registered).
@@ -362,7 +477,7 @@ pub(crate) fn preflight_words(term: Eterm, limit: usize) -> Result<usize> {
 ///
 /// A source payload that no held handle owns is a malformed graph (the M1 encoding has no other
 /// way to recover the handle) and yields [`BeamError::BadArg`](beam_common::BeamError::BadArg).
-fn copy_refc_binary(to: &mut Heap, ctx: &mut CopyContext<'_>, src: Eterm) -> Result<Eterm> {
+fn copy_refc_binary<A: CopyTarget>(to: &mut A, ctx: &mut CopyContext<'_>, src: Eterm) -> Result<Eterm> {
     // SAFETY: `src` is a live refc binary, so its `ErlSubBits` words 1..4 are initialised and its
     // `orig` slot is a live `BinRef` term.
     let (base_flags, start, end, orig) = unsafe { sub_bits_parts(src) };
@@ -375,8 +490,7 @@ fn copy_refc_binary(to: &mut Heap, ctx: &mut CopyContext<'_>, src: Eterm) -> Res
         .ok_or_else(crate::error::bad_term)?;
     ctx.dst_off_heap_mut().push_binary(handle);
 
-    // SAFETY: `alloc_words` returns `ERL_REFC_BITS_SIZE` exclusively-owned, writable words.
-    let dst = unsafe { to.alloc_words(ERL_REFC_BITS_SIZE)? };
+    let dst = to.reserve(ERL_REFC_BITS_SIZE)?;
     // SAFETY: `dst` owns all 8 words of the pair and `src`'s `ErlSubBits` words 1..3 are live; the
     // `orig` slot is rewritten to the copied `BinRef` so the root reaches the destination copy.
     unsafe {
@@ -405,7 +519,7 @@ fn copy_refc_binary(to: &mut Heap, ctx: &mut CopyContext<'_>, src: Eterm) -> Res
 /// `start`, packed MSB-first (the bit order [`write_heap_bits`] expects). `size` is at most
 /// [`ERL_ONHEAP_BITS_LIMIT`] for a genuine match context (its `orig` is an on-heap bitstring),
 /// matching the C's `ASSERT(erl_sub_bits_is_match_context(from_sb))`.
-fn copy_match_context(to: &mut Heap, src: Eterm) -> Result<Eterm> {
+fn copy_match_context<A: CopyTarget>(to: &mut A, src: Eterm) -> Result<Eterm> {
     // SAFETY: `src` is a live match-context `ErlSubBits`, so its words 1..4 are initialised and
     // the window `start..end` is covered by its base storage.
     let (_base_flags, start, end, _orig) = unsafe { sub_bits_parts(src) };
@@ -420,8 +534,7 @@ fn copy_match_context(to: &mut Heap, src: Eterm) -> Result<Eterm> {
         }
     }
 
-    // SAFETY: `alloc_words` returns `heap_bits_size_words(size)` exclusively-owned, writable words.
-    let dst = unsafe { to.alloc_words(heap_bits_size_words(size))? };
+    let dst = to.reserve(heap_bits_size_words(size))?;
     // SAFETY: `dst` owns `heap_bits_size_words(size)` words and `bytes` holds `ceil(size / 8)`;
     // `?` maps a `TermError` into the crate error via `From<TermError> for BeamError`.
     Ok(unsafe { write_heap_bits(dst, &bytes, size)? })
@@ -433,8 +546,8 @@ fn copy_match_context(to: &mut Heap, src: Eterm) -> Result<Eterm> {
 /// Shared terms (immediates, literals, the zero-arity tuple literal) are returned unchanged.
 /// An off-heap **MSO** container and a **refc binary** are refcounted into `ctx`'s destination
 /// table, never deep-copied; an external pid/port/reference registers its node there too.
-pub(crate) fn shallow(
-    to: &mut Heap,
+pub(crate) fn shallow<A: CopyTarget>(
+    to: &mut A,
     ctx: &mut CopyContext<'_>,
     src: Eterm,
     work: &mut Vec<Fixup>,
@@ -450,8 +563,7 @@ pub(crate) fn shallow(
                 let cell = list_val(src);
                 (*cell, *cell.add(1))
             };
-            // SAFETY: `alloc_words` returns two exclusively-owned, writable words.
-            let dst = unsafe { to.alloc_words(2)? };
+            let dst = to.reserve(2)?;
             // SAFETY: `dst` is the base of those two words.
             unsafe {
                 *dst = head;
@@ -472,7 +584,7 @@ pub(crate) fn shallow(
                     .clone_slot(src_slot)
                     .ok_or_else(crate::error::bad_term)?;
                 let dst_slot = ctx.dst_off_heap_mut().push(handle);
-                return layout::make_off_heap_container(to, dst_slot);
+                return to.off_heap_container(dst_slot);
             }
 
             // A refc binary (the `[BinRef][ErlSubBits]` pair) shares its off-heap payload.
@@ -512,8 +624,7 @@ pub(crate) fn shallow(
             // SAFETY: `src` is a live boxed term, so `src_obj` heads the live, initialized object
             // `header` names, making its per-object word count well-defined.
             let words = unsafe { layout::object_words(header, src_obj) };
-            // SAFETY: `alloc_words` returns `words` exclusively-owned, writable words.
-            let dst = unsafe { to.alloc_words(words)? };
+            let dst = to.reserve(words)?;
             // SAFETY: `src_obj` addresses `words` live words and `dst` is a distinct,
             // non-overlapping `words`-word region (a separate, never-reallocated heap).
             unsafe { core::ptr::copy_nonoverlapping(src_obj, dst, words) };
@@ -538,6 +649,50 @@ pub(crate) fn shallow(
     }
 }
 
+/// Whether `to`/`ctx` is a **clean** destination: the heap has handed out no word (`used() == 0`)
+/// and the off-heap table holds nothing in **any** of its three lists (no MSO handle, no refc
+/// binary, no node reference).
+///
+/// Only such a destination is admitted to the single-pass fast path, because only it is fully
+/// roll-back-able with the available API: the heap's bump pointer is still at its base (the
+/// fast path never moves it before it succeeds, and `Heap::reset` could rewind it anyway), and
+/// the off-heap table can be emptied wholesale by
+/// [`OffHeapTable::rollback`](crate::off_heap::OffHeapTable::rollback) without discarding
+/// references that were already there. This is the shape the common case actually presents — a
+/// fresh message-fragment region, or a receiver heap a previous message left empty.
+fn is_clean_destination(to: &Heap, ctx: &CopyContext<'_>) -> bool {
+    to.used() == 0 && ctx.dst_off_heap().is_fully_empty()
+}
+
+/// The optimistic **single-pass** copy: [`shallow`] + the worklist loop with no preflight
+/// traversal, writing into a [`TrialTarget`] over the destination heap's own unwritten words and
+/// committing the heap with one `alloc_words` when the whole graph has been materialised.
+///
+/// Returns the copied root. Every failure leaves the destination heap's `used`/`peak` at zero and
+/// exactly the off-heap references the caller must roll back (none on the success path) — the
+/// caller re-runs the sized path, which re-derives the crate's typed outcome.
+fn try_copy_fast(term: Eterm, to: &mut Heap, ctx: &mut CopyContext<'_>) -> Result<Eterm> {
+    let mut trial = TrialTarget::over(to);
+    let mut work: Vec<Fixup> = Vec::new();
+    let root = shallow(&mut trial, ctx, term, &mut work)?;
+    while let Some((slot, src)) = work.pop() {
+        let copied = shallow(&mut trial, ctx, src, &mut work)?;
+        // SAFETY: `slot` was recorded by `shallow` as a reference word inside an object it just
+        // materialised in the trial region (words of the destination heap, which never
+        // reallocates), so the word is still live, exclusively owned by this copy and writable.
+        unsafe { *slot = copied };
+    }
+
+    // Commit: every word the trial handed out has already been written, so the destination's bump
+    // pointer now advances over exactly those words — the one allocation the heap sees, in place
+    // of one per object. (`reserve` bounded each request by `to.available()`, so this cannot
+    // fail; propagating instead of asserting keeps the function panic-free.)
+    let written = trial.written();
+    // SAFETY: `written <= to.available()`, and the words were written by the copy above.
+    let _ = unsafe { to.alloc_words(written) }?;
+    Ok(root)
+}
+
 /// Copies `term`'s graph into `to`, returning the copied root.
 ///
 /// Iterative (an explicit worklist); immediates and literal-area terms are shared (returned
@@ -549,7 +704,35 @@ pub(crate) fn shallow(
 ///
 /// This is the **flat** copy: a subterm occurring twice is copied twice. See
 /// [`copy_struct_shared`](crate::copy_struct_shared) for the sharing-preserving variant.
+///
+/// A **clean** destination (see [`is_clean_destination`]) is served by a single traversal
+/// ([`try_copy_fast`]); any destination takes the preflight-then-write path. Either way a copy
+/// that does not fit is the typed [`AllocKind::Message`](beam_common::AllocKind) refusal, a
+/// malformed/cyclic graph is [`BeamError::BadArg`](beam_common::BeamError::BadArg), and a refusal
+/// writes no destination word.
 pub fn copy_struct(term: Eterm, to: &mut Heap, ctx: &mut CopyContext<'_>) -> Result<Eterm> {
+    // The optimistic single-pass attempt: a clean destination — an empty heap *and* an empty
+    // off-heap table — has no partial state worth preserving, so its copy needs no preflight
+    // traversal. `try_copy_fast` writes through a trial bump pointer that leaves the heap's
+    // `used`/`peak` untouched, so a failed attempt is fully roll-back-able: the heap needs no
+    // rewind (nothing was handed out of it) and the three off-heap lists are drained (releasing
+    // the refcounts the attempt took).
+    //
+    // A *dirty* destination keeps the sized path below: rolling one back would need a
+    // `truncate(mark)` API that `beam_alloc::Heap` does not expose.
+    if is_clean_destination(to, ctx) {
+        match try_copy_fast(term, to, ctx) {
+            Ok(root) => return Ok(root),
+            Err(_) => {
+                // Abandon the attempt completely, then let the preflight path below re-derive the
+                // crate's typed outcome (`AllocKind::Message`, `BadArg`, …) — the optimistic path
+                // must never surface a raw `AllocKind::Heap` from its trial target.
+                to.reset();
+                ctx.dst_off_heap_mut().rollback();
+            }
+        }
+    }
+
     // Preflight the destination capacity against the whole graph's flat word count, so the common
     // exhaustion is attributed to the message heap (`AllocKind::Message`) up front rather than
     // surfacing mid-copy as a bare heap failure — and so a graph too large for `to` is refused
