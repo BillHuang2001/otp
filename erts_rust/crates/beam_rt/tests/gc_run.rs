@@ -224,3 +224,55 @@ fn the_runtime_renders_the_allocating_module_exactly_like_the_oracle() {
         "the runtime's ~w rendering of w:f9() must equal the oracle's"
     );
 }
+
+/// **The fix, end to end, on the *scheduled* path** — the path the `beam_rt run` CLI action
+/// drives.
+///
+/// Same fixture, same oracle comparison as
+/// [`the_runtime_renders_the_allocating_module_exactly_like_the_oracle`], but executed through
+/// [`Runtime::run_scheduled`], which `spawn_process`es the export and pumps the **full**
+/// scheduler. This is the path where a collection is driven from the runner's `BudgetContext`
+/// rather than the single-pass `run_function`, and where a rooted term whose children live on
+/// the young heap must survive the move: the runtime must render `w:f9()` byte-identically to
+/// the oracle and terminate normally — never park on a heap the collector corrupted, never
+/// print a garbled value.
+#[test]
+fn the_scheduled_path_renders_the_allocating_module_exactly_like_the_oracle() {
+    let Some(oracle) = support::require_oracle("gc_run") else {
+        return;
+    };
+    let Some(erlc) = resolve_erlc() else {
+        skip_loudly("no `erlc` available (and none beside $ERTS_ORACLE)");
+        return;
+    };
+    let Some(fixture) = build_fixture(&erlc) else {
+        return;
+    };
+    let Some(expected) = support::oracle_eval(&oracle, Some(&fixture.dir), ORACLE_EVAL) else {
+        skip_loudly("the oracle probe could not answer for the fixture");
+        return;
+    };
+    assert!(
+        !expected.is_empty(),
+        "the oracle rendered nothing for w:f9()"
+    );
+
+    let mut rt = Runtime::with_defaults().expect("the default runtime");
+    let value = rt
+        .run_scheduled(
+            fixture.beam.to_str().expect("the fixture path is UTF-8"),
+            "f9",
+            0,
+            &[],
+        )
+        .expect("w:f9() runs to completion on the scheduled path");
+    let rendered = rt
+        .format_term_w(value, None)
+        .expect("the result is printable");
+    eprintln!("gc_run (scheduled): runtime rendered {rendered:?}; oracle rendered {expected:?}");
+    assert_eq!(
+        rendered.trim(),
+        expected.trim(),
+        "the scheduled path's ~w rendering of w:f9() must equal the oracle's"
+    );
+}
