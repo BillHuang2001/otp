@@ -216,6 +216,19 @@ pub struct Runtime {
     /// resets it (there is no GC), so a term built on it stays valid for the runtime's
     /// lifetime.
     pub(crate) eval_heap: Heap,
+    /// The **destination** off-heap table for every copy onto [`Runtime::eval_heap`].
+    ///
+    /// A copy of a term that references an off-heap object (the 8-word `[BinRef][ErlSubBits]`
+    /// refc-binary pair, or an MSO container) does not deep-copy the payload: it re-registers
+    /// the *owning handle* in the copy's destination table
+    /// ([`beam_message::CopyContext::dst_off_heap_mut`]). That table therefore **owns** the
+    /// payload references the copied term depends on, so it must outlive both the copied term
+    /// and [`Runtime::eval_heap`] — which is exactly why it is a `Runtime` field rather than a
+    /// throwaway local (a dropped destination table would free the payloads a stabilized term
+    /// still points at). It is only ever grown, never reset: like `eval_heap` it is a
+    /// runtime-lifetime store (Milestone 1 has no GC), so it can never free a payload a
+    /// stabilized term still needs.
+    pub(crate) eval_off_heap: beam_message::OffHeapTable,
     /// The `ets:*` tables.
     ///
     /// Shared through an [`Rc`]`<`[`RefCell`]`>` so a BIF call can hold the registry for
@@ -566,6 +579,7 @@ impl Runtime {
             gc: GcState::new(),
             info_heap: Heap::new(INFO_HEAP_WORDS)?,
             eval_heap: Heap::new(heap_words)?,
+            eval_off_heap: beam_message::OffHeapTable::new(),
             tables: Rc::new(RefCell::new(TableRegistry::new())),
             ets_owners,
             ports,
@@ -884,6 +898,54 @@ impl Runtime {
     /// (see [`crate::error::enforce_term_heap_limit`]).
     pub(crate) fn stabilize_term(&mut self, term: Eterm) -> Result<Eterm> {
         beam_message::copy_struct_simple(term, &mut self.eval_heap)
+            .map_err(error::enforce_term_heap_limit)
+    }
+
+    /// [`Runtime::stabilize_term`] for a term that may reference the **off-heap payloads** an
+    /// engine machine built (`Machine::refc_binaries`), resolved against `src_binaries`.
+    ///
+    /// A `bs_init_writable`/`bs_create_bin` result larger than
+    /// [`beam_term::refc::ERL_ONHEAP_BINARY_LIMIT`] bytes is a frozen 8-word
+    /// `[BinRef][ErlSubBits]` pair whose payload lives off the process heap, owned by a
+    /// [`beam_alloc::RefcBinary`] handle the machine keeps (`Machine::refc_binaries`). The copy
+    /// engine resolves such a pair by its data pointer through the copy's **source** off-heap
+    /// table ([`beam_message::OffHeapTable::binary_by_data_ptr`]); the empty source table the
+    /// simple form uses cannot serve that lookup, so a plain `stabilize_term` of an
+    /// engine-built off-heap binary is refused with [`BeamError::BadArg`] (a **wrong** answer
+    /// where the term is perfectly copyable).
+    ///
+    /// This form fixes that: it clones each `src_binaries` handle (refcount++) into a source
+    /// table, copies with a real [`beam_message::CopyContext`], and pushes the referenced
+    /// handles into [`Runtime::eval_off_heap`] — the destination table that **owns** the payload
+    /// references the copy depends on. `src_binaries` must be the payload handles of the
+    /// machine that built `term`; the caller (the runner, which drives that machine) is the only
+    /// one that can name them.
+    ///
+    /// # Errors
+    ///
+    /// As [`Runtime::stabilize_term`]: the documented `error:system_limit` when the copy
+    /// genuinely does not fit the arena ([`crate::error::enforce_term_heap_limit`]).
+    pub(crate) fn stabilize_term_with(
+        &mut self,
+        term: Eterm,
+        src_binaries: &[beam_alloc::RefcBinary],
+    ) -> Result<Eterm> {
+        // No engine handles reachable on this path: the simple, documented form is exactly
+        // equivalent (an empty source table cannot resolve an off-heap payload either way).
+        if src_binaries.is_empty() {
+            return self.stabilize_term(term);
+        }
+        // The copy's source table: one clone (refcount++) per engine payload handle, so the
+        // lookup in `copy_refc_binary` resolves `term`'s `BinRef.val` to a live handle.
+        let mut source = beam_message::OffHeapTable::new();
+        for handle in src_binaries {
+            source.push_binary(handle.clone());
+        }
+        // `eval_off_heap` is the copy's destination table: the `RefcBinary` handles the copy
+        // re-registers there own the payloads the copied term points at, so they must outlive
+        // the copy — which is why they live on the runtime (see the field docs).
+        let mut ctx = beam_message::CopyContext::new(&source, &mut self.eval_off_heap);
+        beam_message::copy_struct(term, &mut self.eval_heap, &mut ctx)
             .map_err(error::enforce_term_heap_limit)
     }
     /// Ensures `heap_need` words are available in the arena.
@@ -1856,6 +1918,138 @@ mod tests {
         );
     }
 
+    /// The off-heap payload owner a `beam_codec::term::make_refc_binary` call needs: exactly the
+    /// role `beam_engine`'s `Machine::refc_binaries` plays (and the shape of the handles the
+    /// runner passes to [`Runtime::stabilize_term_with`]).
+    struct RefcPayloads(Vec<beam_alloc::RefcBinary>);
+
+    impl beam_codec::OffHeapBinaries for RefcPayloads {
+        fn alloc_refc_payload(&mut self, bytes: &[u8]) -> Result<*mut Eterm> {
+            let handle = beam_alloc::RefcBinary::new(bytes)?;
+            let data = handle.data_ptr();
+            self.0.push(handle);
+            Ok(data.cast::<Eterm>())
+        }
+    }
+
+    /// Builds the frozen 8-word `[BinRef][ErlSubBits]` pair over a fresh off-heap payload of 200
+    /// bytes — the genuine representation `bs_init_writable`/`bs_create_bin` produce above
+    /// [`beam_term::refc::ERL_ONHEAP_BINARY_LIMIT`], and the one the transport copy must resolve.
+    ///
+    /// Returns the source heap (which owns the pair — it must outlive the term), the payload
+    /// handles and the term.
+    fn off_heap_binary() -> (Heap, RefcPayloads, Vec<u8>, Eterm) {
+        let bytes: Vec<u8> = (0..200u32).map(|i| (i % 251) as u8).collect();
+        assert!(bytes.len() > beam_term::refc::ERL_ONHEAP_BINARY_LIMIT);
+        let mut heap = Heap::new(16).expect("the source heap");
+        let mut payloads = RefcPayloads(Vec::new());
+        let term =
+            beam_codec::term::make_refc_binary(&mut heap, &mut payloads, &bytes, 0, bytes.len() * 8)
+                .expect("the source refc-binary term");
+        assert_eq!(payloads.0.len(), 1, "one off-heap payload");
+        (heap, payloads, bytes, term)
+    }
+
+    /// An engine-built **off-heap** binary (the 8-word `[BinRef][ErlSubBits]` pair whose payload
+    /// a `beam_alloc::RefcBinary` handle owns) must survive the transport copy onto the runtime's
+    /// long-lived arena.
+    ///
+    /// The copy engine resolves the payload by its data pointer through the copy's **source**
+    /// off-heap table (`beam_message::copy::copy_refc_binary`), so the *empty* table the simple
+    /// form uses refuses the term with `BadArg` — the wrong answer this test pins the fix
+    /// against. [`Runtime::stabilize_term_with`] builds that table from the caller's handles (the
+    /// runner passes `Machine::refc_binaries()`), and its **destination** table
+    /// ([`Runtime::eval_off_heap`]) owns the payload references the copied term depends on — the
+    /// refcount assertions below are that ownership invariant.
+    #[test]
+    fn an_engine_built_off_heap_binary_survives_the_transport_copy() {
+        let (_source_heap, payloads, bytes, term) = off_heap_binary();
+        assert_eq!(payloads.0[0].refcount(), 1, "only the source machine owns it");
+
+        let mut rt = Runtime::new(RuntimeConfig::new().with_heap_words(MIN_HEAP_WORDS))
+            .expect("the small-heap runtime");
+
+        // The documented degradation: with no reachable engine handles, the empty-source copy
+        // cannot resolve the payload and refuses the term.
+        assert!(
+            matches!(rt.stabilize_term(term), Err(BeamError::BadArg)),
+            "the empty-source copy refuses an engine-built off-heap binary"
+        );
+
+        // The machine-aware form copies it, resolving the payload through the handles.
+        let copied = rt
+            .stabilize_term_with(term, &payloads.0)
+            .expect("an engine-built off-heap binary stabilizes through its handles");
+
+        // Byte-identical: `compare::eq` compares bitstrings bit by bit (contents, not pointers),
+        // against an independently built on-heap reference holding the same bytes.
+        let mut reference_heap = Heap::new(64).expect("the reference heap");
+        let reference =
+            beam_codec::term::make_binary(&mut reference_heap, &bytes).expect("the reference");
+        assert!(
+            beam_term::compare::eq(copied, reference, rt.atoms()),
+            "the stabilized copy reads back byte-identical"
+        );
+
+        // The destination table owns a second reference to the payload, so the copied term can
+        // never dangle once the source engine is dropped.
+        assert_eq!(
+            payloads.0[0].refcount(),
+            2,
+            "the destination table holds its own reference"
+        );
+        assert_eq!(rt.eval_off_heap.binaries().len(), 1);
+        drop(payloads);
+        let held = rt.eval_off_heap.binaries();
+        assert_eq!(held[0].refcount(), 1, "the runtime keeps the payload alive");
+        assert_eq!(
+            held[0].as_bytes(),
+            bytes.as_slice(),
+            "the destination table owns the copied payload"
+        );
+    }
+
+    /// The escape-store form of the same transport copy: a term carrying an engine-built off-heap
+    /// binary must stabilize **through the machine's handles** rather than trip the global
+    /// "capability gap" valve over a payload the empty source table could not resolve.
+    ///
+    /// The empty-source call is the documented degradation — it keeps the original term and
+    /// freezes every process heap ([`Runtime::try_stabilize_escaped`]) — so it is asserted
+    /// **after** the resolving form, and it pins that the unresolvable case still behaves exactly
+    /// as before.
+    #[test]
+    fn the_escape_store_stabilization_resolves_engine_off_heap_handles() {
+        let (_source_heap, payloads, bytes, term) = off_heap_binary();
+        let mut rt = Runtime::new(RuntimeConfig::new().with_heap_words(MIN_HEAP_WORDS))
+            .expect("the small-heap runtime");
+        assert!(rt.gc_enabled(), "a fresh runtime collects");
+
+        let copied = rt
+            .try_stabilize_escaped_with(term, &payloads.0)
+            .expect("the exit-reason copy resolves the engine's handles");
+        let mut reference_heap = Heap::new(64).expect("the reference heap");
+        let reference =
+            beam_codec::term::make_binary(&mut reference_heap, &bytes).expect("the reference");
+        assert!(
+            beam_term::compare::eq(copied, reference, rt.atoms()),
+            "the escaped copy reads back byte-identical"
+        );
+        assert!(
+            rt.gc_enabled(),
+            "a resolved off-heap payload must NOT trip the escape-store valve"
+        );
+
+        // The unresolvable form: the original term is kept (never a dangling copy) and every
+        // process heap is frozen.
+        let kept = rt
+            .try_stabilize_escaped(term)
+            .expect("the documented degradation keeps the original term");
+        assert_eq!(kept, term, "the original term is returned unchanged");
+        assert!(
+            !rt.gc_enabled(),
+            "the empty-source capability gap freezes collection"
+        );
+    }
     /// `erlang:statistics(runtime)` is read from the runtime's **one** long-lived CPU-time
     /// clock, so its anchor persists: the first read's delta is the whole total (the clock's
     /// anchor starts at 0, the C's `runtime_prev.data.user = 0`), and every later read's delta

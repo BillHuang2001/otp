@@ -353,6 +353,10 @@ impl Runtime {
     /// The **escape-store** stabilization, with its two failure classes kept apart: copies
     /// `term` onto the pointer-stable arena and returns the copy.
     ///
+    /// This is exactly [`Runtime::try_stabilize_escaped_with`] against an **empty** off-heap
+    /// source table; a caller that holds the machine which built `term` uses that sibling, so an
+    /// engine-built off-heap binary is resolved instead of tripping the valve.
+    ///
     /// A term on a scheduled process's young heap is only kept alive while it is reachable
     /// from that process's root set ([`Process::collect`](beam_process::Process::collect)), so
     /// a term parked in a *runtime*-level store (a timer's message, a pending spawn's entry or
@@ -395,7 +399,31 @@ impl Runtime {
     /// [`BeamError::SystemLimit`] when the term genuinely cannot be copied onto the arena. The
     /// valve is **not** tripped in that case.
     pub(crate) fn try_stabilize_escaped(&mut self, term: Eterm) -> Result<Eterm> {
-        match self.stabilize_term(term) {
+        self.try_stabilize_escaped_with(term, &[])
+    }
+
+    /// [`Runtime::try_stabilize_escaped`] for a term that may reference the off-heap payload
+    /// handles an engine machine built, resolved against `src_binaries`.
+    ///
+    /// The escape-store stabilization itself is unchanged (same two failure classes, same valve
+    /// trip); only the copy's **source** off-heap table differs — it is built from
+    /// `src_binaries` instead of being empty
+    /// ([`Runtime::stabilize_term_with`](crate::runtime::Runtime::stabilize_term_with), the
+    /// documented empty-source degradation unchanged). A caller that holds the machine which
+    /// built `term` (the runner's exit-reason arm) therefore stabilizes a term carrying an
+    /// engine-built off-heap binary **correctly**, instead of tripping the valve over a payload
+    /// the empty table simply could not resolve.
+    ///
+    /// # Errors
+    ///
+    /// As [`Runtime::try_stabilize_escaped`]: [`BeamError::SystemLimit`] when the term genuinely
+    /// cannot be copied onto the arena (the valve is **not** tripped then).
+    pub(crate) fn try_stabilize_escaped_with(
+        &mut self,
+        term: Eterm,
+        src_binaries: &[beam_alloc::RefcBinary],
+    ) -> Result<Eterm> {
+        match self.stabilize_term_with(term, src_binaries) {
             Ok(copy) => Ok(copy),
             // A genuine failure: the term does not fit the arena. Report it honestly — never
             // store the un-copied term, never freeze collection over it.
