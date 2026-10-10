@@ -683,6 +683,17 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   binary and atom keys (atom keys are index-parity-safe because the `AtomTable` is seeded from the
   runtime's own `atom.names`, the source ERTS initializes its atom table from), plus a flat-map
   observation. Skips loudly when `erl` is absent.
+- `tests/internal_ref.rs` — the **M1 internal-reference layout** suite (public API only): the four words
+  `write_internal_ref` emits are pinned literally against
+  `[make_header(3, REF_SUBTAG), make_small(0), make_small(0), make_small(id)]` (plus the raw `0xD0`
+  header), so a drift in this crate — or in the byte-identical `beam_process`/`beam_bifs`/`beam_rt`
+  producers it must match — is caught here rather than by a cross-crate dependency (this crate is a
+  dependency sink and must not gain one); the writer→accessor round-trip over the id range (0 … 255 …
+  `MAX_SMALL`); the typed errors (an id that does not fit a small `⇒ SmallIntOutOfRange`; the accessor on
+  a non-term / an immediate / a tuple / a **C-layout arity-2 block** / a non-small id word `⇒ BadRef`);
+  that the block sizes as the frozen four words (`size_object`); and the ordering contract — two
+  references with the same id are `=:=` (`Ref =:= binary_to_term(term_to_binary(Ref))`) while
+  different ids are ordered, never equal.
 - Exhaustive cross-checks against the real system ERTS belong to `tools/differential` (the
   compatibility gate); `tests/oracle.rs` is the crate-local map/bitstring/bignum smoke slice and
   `tests/map_hash.rs` the map-storage-order slice.
