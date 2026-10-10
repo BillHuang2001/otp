@@ -177,7 +177,7 @@ use beam_term::compare::{cmp_arith, eq};
 use beam_term::{atom_val, signed_value, AtomTable, Eterm, NIL};
 
 use crate::access::{
-    car, cdr, is_atom, is_list, is_nil, is_small, is_tuple, tuple_element, tuple_size,
+    car, cdr, fun_arity, is_atom, is_list, is_nil, is_small, is_tuple, tuple_element, tuple_size,
 };
 use crate::context::BifContext;
 use crate::error::{badarg, function_clause, structured_error, system_limit};
@@ -469,8 +469,9 @@ fn reverse1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         return Err(function_clause());
     }
     let tail = cdr(list);
-    if !is_list(tail) {
-        // `[X | non-list]` matches neither `[_]` nor `[A, B | L]`.
+    if !is_nil(tail) && !is_list(tail) {
+        // `[X | non-list]` with a *non-empty* non-list tail matches neither `[_]`
+        // nor `[A, B | L]`; a `NIL` tail is exactly `[_]`, handled just below.
         return Err(function_clause());
     }
     if is_nil(tail) {
@@ -1080,8 +1081,9 @@ fn keysort(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         return Err(case_clause(ctx, list)?);
     }
     let tail = cdr(list);
-    if !is_list(tail) {
-        // `[X | non-list]` matches neither `[_]` nor `[X, Y | T]`.
+    if !is_nil(tail) && !is_list(tail) {
+        // `[X | non-list]` with a *non-empty* non-list tail matches neither `[_]`
+        // nor `[X, Y | T]`; a `NIL` tail is exactly `[_]`, handled just below.
         return Err(case_clause(ctx, list)?);
     }
     if is_nil(tail) {
@@ -1906,10 +1908,12 @@ fn rufmerge2_1(
 /// # Errors
 ///
 /// `error:function_clause` when the argument is not a list at all, when the walk runs
-/// off an improper tail, or when `Index` is not an integer `>= 1` **and** the list is
-/// empty (the `[]` clause's guard) — probed: `keymap(F,1,a)` ⇒ `function_clause`,
-/// `keymap(F,1,{a,b})` ⇒ `function_clause`, `keymap(F,1,[{a,b}|2])` ⇒
-/// `function_clause`, `keymap(F,0,[])` ⇒ `function_clause`. `badarg` when `element/2`
+/// off an improper tail, or when the **empty-list** clause's guard fails — `Index` is
+/// not an integer `>= 1`, or `Fun` is not a fun of arity 1 (probed: `keymap(F,1,a)`
+/// ⇒ `function_clause`, `keymap(F,1,{a,b})` ⇒ `function_clause`,
+/// `keymap(F,1,[{a,b}|2])` ⇒ `function_clause`, `keymap(F,0,[])` ⇒
+/// `function_clause`, `keymap(non_fun,1,[])` ⇒ `function_clause`,
+/// `keymap(fun(_,_) -> 0 end,1,[])` ⇒ `function_clause`). `badarg` when `element/2`
 /// rejects the element it is handed — a non-tuple, a tuple shorter than `Index`, or a
 /// non-integer/out-of-range `Index` on a **non-empty** list (probed:
 /// `keymap(F,1,[a,b])` ⇒ `badarg`, `keymap(F,2,[{a}])` ⇒ `badarg`,
@@ -1941,6 +1945,15 @@ fn keymap3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     match small_int(index_term) {
         Ok(index) if index >= 1 => {}
         _ => return Err(function_clause()),
+    }
+    // The guard's `is_function(Fun, 1)` conjunct is only reachable via the `[]`
+    // clause: a non-empty list matches the *unguarded* first clause, so its fun is
+    // applied regardless of its fun-ness/arity (a `{badfun, F}`/`{badarity, …}` is
+    // that call's own error, raised through `FunCaller`). `mapped.is_empty()` is
+    // exactly "the argument was `[]`", so the check is inert for every list the
+    // first clause already handled.
+    if mapped.is_empty() && fun_arity(fun) != Some(1) {
+        return Err(function_clause());
     }
     build_list(ctx, &mapped, NIL)
 }
@@ -2230,6 +2243,8 @@ mod tests {
         with_ctx(|ctx| {
             show!(ctx, reverse1, [ints(ctx, &[1, 2, 3])], "[3,2,1]");
             show!(ctx, reverse1, [NIL], "[]");
+            // `reverse([_] = L) -> L` — a one-element list comes back untouched.
+            show!(ctx, reverse1, [ints(ctx, &[1])], "[1]");
             show!(ctx, reverse2, [ints(ctx, &[1, 2]), NIL], "[2,1]");
 
             // `reverse([], Tail)` is `Tail` itself — it is never checked to be a list.

@@ -50,7 +50,7 @@ use beam_bifs::{default_registry, BifContext, BifRegistry, FunCaller};
 use beam_codec::term::{tuple_arity, tuple_element};
 use beam_common::{BeamError, ExceptionClass, ExitReason, Result};
 use beam_process::ProcessId;
-use beam_term::{make_atom, make_small, AtomTable, Eterm, NIL};
+use beam_term::{atom_val, make_atom, make_small, AtomTable, Eterm, NIL};
 
 /// The atoms the reasons and the probes need. `case_clause`/`bad_generator` are the
 /// structured-reason tags; neither is a predefined emulator atom, so they are resolved
@@ -153,6 +153,16 @@ fn assert_badarg(result: Result<Eterm>) {
 /// A stand-in for a fun argument: the stub `FunCaller` never inspects it.
 fn a_fun() -> Eterm {
     make_small(0)
+}
+
+/// A **real** `EXPORT_EXT` fun term of arity `arity`, so a fun-*ness*/*arity* check
+/// (the `[]` clause's `is_function(Fun, 1)` guard) observes the true arity — unlike
+/// [`a_fun`], which is an opaque small-int sentinel.
+fn real_fun(ctx: &mut BifContext<'_>, arity: usize) -> Eterm {
+    let module = atom_val(ctx.atom("a").expect("seeded"));
+    let function = atom_val(ctx.atom("b").expect("seeded"));
+    beam_codec::term::make_fun_external(ctx.heap(), arity, module, function)
+        .expect("the external fun fits")
 }
 
 /// The improper list `[head | tail]` on `ctx`'s heap.
@@ -280,7 +290,8 @@ fn filter_reports_the_bad_generator_value() {
     // Oracle: lists:filter(P, [1,2|3]) => {bad_generator, 3}.
     let (result, three) = run(true, |reg, ctx| {
         let three = ctx.int(3).expect("fits");
-        let list = improper(ctx, 1, improper(ctx, 2, three));
+        let inner = improper(ctx, 2, three);
+        let list = improper(ctx, 1, inner);
         (reg.call("lists", "filter", 2, ctx, &[a_fun(), list]), three)
     });
     assert_tagged(result, bad_generator, three);
@@ -310,7 +321,9 @@ fn reverse1_rejects_a_non_list_and_a_bad_tail_but_reverse2_stays_badarg() {
     // …but from two elements on the clause hands its tail to the `reverse/2` BIF:
     // oracle: lists:reverse([1,2|3]) => error:badarg.
     let result = run(true, |reg, ctx| {
-        let list = improper(ctx, 1, improper(ctx, 2, ctx.int(3).expect("fits")));
+        let three = ctx.int(3).expect("fits");
+        let inner = improper(ctx, 2, three);
+        let list = improper(ctx, 1, inner);
         reg.call("lists", "reverse", 1, ctx, &[list])
     });
     assert_badarg(result);
@@ -481,25 +494,71 @@ fn keymap_splits_function_clause_from_element_badarg() {
 }
 
 #[test]
+fn keymap_empty_list_requires_an_arity_1_fun() {
+    // The `[]` clause's guard is `is_integer(Index), Index >= 1, is_function(Fun, 1)`,
+    // so an empty list with a *valid* `Index` still rejects a fun of the wrong arity
+    // (or a non-fun) — the crate returned `[]` unconditionally before this guard was
+    // modelled. Probed:
+    //   lists:keymap(fun(X) -> X end, 1, [])     => []
+    //   lists:keymap(non_fun, 1, [])             => error:function_clause
+    //   lists:keymap(fun(_, _) -> ok end, 1, []) => error:function_clause
+    let result = run(true, |reg, ctx| {
+        let one = ctx.int(1).expect("fits");
+        let fun = real_fun(ctx, 1);
+        reg.call("lists", "keymap", 3, ctx, &[fun, one, NIL])
+    });
+    assert_eq!(result.expect("an arity-1 fun maps [] to []"), NIL);
+
+    // A non-fun (the opaque stub sentinel) fails the guard.
+    let result = run(true, |reg, ctx| {
+        let one = ctx.int(1).expect("fits");
+        reg.call("lists", "keymap", 3, ctx, &[a_fun(), one, NIL])
+    });
+    assert_function_clause(result);
+
+    // A fun of arity 2 fails it too.
+    let result = run(true, |reg, ctx| {
+        let one = ctx.int(1).expect("fits");
+        let fun = real_fun(ctx, 2);
+        reg.call("lists", "keymap", 3, ctx, &[fun, one, NIL])
+    });
+    assert_function_clause(result);
+
+    // ...but the guard is inert once the walk has consumed an element: a non-empty
+    // list matches the *unguarded* first clause, so the same arity-2 fun is applied
+    // (here by the stub caller) rather than rejected. Probed: the fun-ness guard
+    // never fires for a non-empty list.
+    let result = run(true, |reg, ctx| {
+        let a = ctx.atom("a").expect("seeded");
+        let b = ctx.atom("b").expect("seeded");
+        let pair = ctx.tuple(&[a, b]).expect("fits");
+        let list = ctx.list(&[pair]).expect("fits");
+        let one = ctx.int(1).expect("fits");
+        let fun = real_fun(ctx, 2);
+        reg.call("lists", "keymap", 3, ctx, &[fun, one, list])
+    });
+    assert!(result.is_ok(), "a non-empty list never consults the [] clause's guard");
+}
+
+#[test]
 fn the_explicit_argument_rejections_stay_badarg() {
-    // `member/2`, `keymember/3` and `keysearch/3` are real `bif.tab` BIFs: a non-list
-    // haystack/tuple list is the C's explicit `badarg`, never a no-clause failure
-    // (oracle-verified).
-    for name in ["member", "keymember", "keysearch"] {
+    // `member/2`, `keymember/3`, `keysearch/3` and `keyfind/3` are real `bif.tab`
+    // BIFs: a non-list haystack/tuple list is the C's explicit `badarg`, never a
+    // no-clause failure (oracle-verified). The tuple-list walkers take an extra
+    // `Index` argument (arity 3); `member/2` is the arity-2 form.
+    for (name, arity) in [("member", 2u32), ("keymember", 3), ("keysearch", 3), ("keyfind", 3)] {
         let result = run(true, |reg, ctx| {
             let a = ctx.atom("a").expect("seeded");
-            reg.call("lists", name, 2, ctx, &[a, a])
+            let args = if arity == 2 {
+                vec![a, a]
+            } else {
+                let one = ctx.int(1).expect("fits");
+                vec![a, one, a]
+            };
+            reg.call("lists", name, arity, ctx, &args)
         });
         assert_badarg(result);
     }
-
-    // `keyfind/3` likewise (arity 3).
-    let result = run(true, |reg, ctx| {
-        let a = ctx.atom("a").expect("seeded");
-        let one = ctx.int(1).expect("fits");
-        reg.call("lists", "keyfind", 3, ctx, &[a, one, a])
-    });
-    assert_badarg(result);
 }
 
 #[test]
