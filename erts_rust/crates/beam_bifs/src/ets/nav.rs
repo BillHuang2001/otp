@@ -362,6 +362,92 @@ mod tests {
         ));
     }
 
+    /// The `'$end_of_table'` anchor is `badarg` for the ordered `*_lookup` walkers
+    /// too — `ets:next_lookup/2` and `ets:prev_lookup/2` — mirroring
+    /// `ets.rs::next_2`/`prev_2` (the same C `DB_ERROR_BADKEY`): even when the atom
+    /// is a **stored** key, and on an empty table.
+    ///
+    /// A hash kind is unaffected: with `'$end_of_table'` stored, `next_lookup/2`
+    /// walks forward from it (the oracle's `db_next_hash_common` only requires the
+    /// anchor be present) and `prev_lookup/2` aliases that step.
+    ///
+    /// Oracle probe (`erl -noshell`, OTP 29.1.1 / erts-17.1): an `ordered_set`
+    /// holding `{1,10},{2,20},{3,30}` answers `badarg` for
+    /// `ets:next_lookup(T,'$end_of_table')` and
+    /// `ets:prev_lookup(T,'$end_of_table')`; storing `'$end_of_table'` leaves both
+    /// `badarg`; an empty table is the same; a `set` with `'$end_of_table'` stored
+    /// answers normally.
+    #[test]
+    fn ordered_lookups_reject_the_end_of_table_anchor() {
+        let (mut heap, atoms, mut reg) = parts();
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut reg);
+        let handle = new_table(&mut ctx, "mytab", "ordered_set");
+        let eot = ctx.atom(END_OF_TABLE).expect("seeded");
+
+        // An empty `ordered_set` rejects the anchor as well.
+        assert!(matches!(
+            next_lookup_2(&mut ctx, &[handle, eot]),
+            Err(BeamError::BadArg)
+        ));
+        assert!(matches!(
+            prev_lookup_2(&mut ctx, &[handle, eot]),
+            Err(BeamError::BadArg)
+        ));
+
+        insert_all(&mut ctx, handle, &[1, 2, 3]);
+        let one = ctx.int(1).expect("fits");
+        let three = ctx.int(3).expect("fits");
+        // Ordinary range-bound walks are unaffected; an *absent* anchor that is
+        // not the walk's terminator is `badarg` nonetheless.
+        assert_eq!(
+            rows(next_lookup_2(&mut ctx, &[handle, one]).expect("next_lookup(1)")),
+            (2, vec![(2, 20)])
+        );
+        assert!(matches!(
+            next_lookup_2(&mut ctx, &[handle, eot]),
+            Err(BeamError::BadArg)
+        ));
+        assert!(matches!(
+            prev_lookup_2(&mut ctx, &[handle, eot]),
+            Err(BeamError::BadArg)
+        ));
+
+        // The atom **stored** as a key: still rejected.
+        let eot_obj = ctx.tuple(&[eot, eot]).expect("fits");
+        insert_2(&mut ctx, &[handle, eot_obj]).expect("insert");
+        assert!(matches!(
+            next_lookup_2(&mut ctx, &[handle, eot]),
+            Err(BeamError::BadArg)
+        ));
+        assert!(matches!(
+            prev_lookup_2(&mut ctx, &[handle, eot]),
+            Err(BeamError::BadArg)
+        ));
+
+        // Every rejection restored the table: the real walk still answers.
+        assert_eq!(
+            rows(prev_lookup_2(&mut ctx, &[handle, three]).expect("prev_lookup(3)")),
+            (2, vec![(2, 20)])
+        );
+
+        // A hash kind is unaffected: with the atom stored it is an ordinary key,
+        // so the forward step walks from it and the backward one aliases it.
+        let hashed = new_table(&mut ctx, "dupb", "set");
+        for obj in [
+            ctx.tuple(&[one, one]).expect("fits"),
+            ctx.tuple(&[eot, eot]).expect("fits"),
+        ] {
+            insert_2(&mut ctx, &[hashed, obj]).expect("insert");
+        }
+        let next = next_lookup_2(&mut ctx, &[hashed, eot]).expect("next_lookup(eot) on a set");
+        let prev = prev_lookup_2(&mut ctx, &[hashed, eot]).expect("prev_lookup(eot) on a set");
+        assert!(
+            beam_term::compare::eq(next, prev, ctx.atoms()),
+            "a hash kind aliases prev_lookup to next_lookup"
+        );
+    }
+
     /// The hash kinds alias `last_lookup` to `first` and `prev_lookup` to `next`
     /// (the oracle's behaviour: a hash interior has no backward walk). The hash
     /// *order* is unspecified, so the aliases are asserted for every stored key

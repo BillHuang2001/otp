@@ -1789,6 +1789,15 @@ mod tests {
         new_2(ctx, &[name, opts]).expect("ets:new")
     }
 
+    /// Creates a table of `kind` in `ctx` and returns its handle (like
+    /// [`new_table`], which fixes the `set` kind).
+    fn new_table_of(ctx: &mut BifContext<'_>, name: &str, kind: &str) -> Eterm {
+        let name = ctx.atom(name).expect("seeded");
+        let kind = ctx.atom(kind).expect("seeded");
+        let opts = ctx.list(&[kind]).expect("fits");
+        new_2(ctx, &[name, opts]).expect("ets:new")
+    }
+
     /// Builds the 2-tuple `{key, value}` in `ctx`.
     fn pair(ctx: &mut BifContext<'_>, key: &str, value: i64) -> Eterm {
         let k = ctx.atom(key).expect("seeded");
@@ -2295,6 +2304,95 @@ mod tests {
             next_2(&mut ctx, &[handle, b]),
             Err(BeamError::BadArg)
         ));
+    }
+
+    /// The `'$end_of_table'` **anchor** is `badarg` for the `ordered_set` walkers
+    /// `ets:next/2` and `ets:prev/2` (the `*_lookup` pair is pinned in
+    /// [`super::nav`]) — even when that atom is itself a **stored** key, and even
+    /// on an empty table.
+    ///
+    /// The C `db_next_tree_common`/`db_prev_tree_common`
+    /// (`../../erts/emulator/beam/erl_db_tree.c:654,729`) return `DB_ERROR_BADKEY`
+    /// unconditionally on `am_EOT`, so the atom is never read as a range bound. A
+    /// hash kind has no such special-case (`db_next_hash_common`), so there the
+    /// atom is an ordinary key.
+    ///
+    /// Oracle probe (`erl -noshell`, OTP 29.1.1 / erts-17.1), an `ordered_set`
+    /// holding `{1,1},{2,2},{3,3}`: `ets:next(T,'$end_of_table')` and
+    /// `ets:prev(T,'$end_of_table')` both raise `badarg`; storing
+    /// `'$end_of_table'` as a key leaves both `badarg`; an empty `ordered_set` is
+    /// `badarg` too.
+    #[test]
+    fn ordered_set_next_and_prev_reject_the_end_of_table_anchor() {
+        let (mut heap, atoms, mut reg) = parts();
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut reg);
+        let handle = new_table_of(&mut ctx, "mytab", "ordered_set");
+        let eot = ctx.atom(END_OF_TABLE).expect("seeded");
+
+        // An empty `ordered_set` rejects the anchor as well.
+        assert!(matches!(
+            next_2(&mut ctx, &[handle, eot]),
+            Err(BeamError::BadArg)
+        ));
+        assert!(matches!(
+            prev_2(&mut ctx, &[handle, eot]),
+            Err(BeamError::BadArg)
+        ));
+
+        // Three integer-keyed objects: an *absent* anchor that is not the walk's
+        // terminator is still rejected (the C checks the atom before any range
+        // logic), while the ordinary walks are unaffected.
+        let one = ctx.int(1).expect("fits");
+        let two = ctx.int(2).expect("fits");
+        let three = ctx.int(3).expect("fits");
+        let a = ctx.atom("a").expect("seeded");
+        for key in [one, two, three] {
+            let obj = ctx.tuple(&[key, a]).expect("fits");
+            insert_2(&mut ctx, &[handle, obj]).expect("insert");
+        }
+        assert_eq!(next_2(&mut ctx, &[handle, one]).expect("next(1)"), two);
+        assert_eq!(prev_2(&mut ctx, &[handle, three]).expect("prev(3)"), two);
+        assert!(matches!(
+            next_2(&mut ctx, &[handle, eot]),
+            Err(BeamError::BadArg)
+        ));
+        assert!(matches!(
+            prev_2(&mut ctx, &[handle, eot]),
+            Err(BeamError::BadArg)
+        ));
+
+        // The atom **stored** as a key: the anchor is rejected even though it is
+        // present in the tree (the C rejects `am_EOT` before it ever looks it up).
+        let eot_obj = ctx.tuple(&[eot, eot]).expect("fits");
+        insert_2(&mut ctx, &[handle, eot_obj]).expect("insert");
+        assert!(matches!(
+            next_2(&mut ctx, &[handle, eot]),
+            Err(BeamError::BadArg)
+        ));
+        assert!(matches!(
+            prev_2(&mut ctx, &[handle, eot]),
+            Err(BeamError::BadArg)
+        ));
+
+        // Every rejection restored the table: the real walk still answers.
+        assert_eq!(next_2(&mut ctx, &[handle, one]).expect("still live"), two);
+
+        // A hash kind is unaffected: with the atom stored it is an ordinary key,
+        // so `ets:next/2` walks from it and `ets:prev/2` aliases that step.
+        let hashed = new_table_of(&mut ctx, "mytab", "set");
+        for obj in [
+            ctx.tuple(&[one, a]).expect("fits"),
+            ctx.tuple(&[eot, a]).expect("fits"),
+        ] {
+            insert_2(&mut ctx, &[hashed, obj]).expect("insert");
+        }
+        let next = next_2(&mut ctx, &[hashed, eot]).expect("next(eot) on a set is not badarg");
+        let prev = prev_2(&mut ctx, &[hashed, eot]).expect("prev(eot) on a set is not badarg");
+        assert!(
+            beam_term::compare::eq(next, prev, &atoms),
+            "a hash kind aliases prev to next"
+        );
     }
 
     #[test]
