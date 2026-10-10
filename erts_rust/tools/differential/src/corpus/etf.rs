@@ -1004,4 +1004,44 @@ mod tests {
             );
         }
     }
+
+    /// The local pid/reference **identity** round trips (A.2/A.5): the image bytes are
+    /// per-VM-start, so the golden is the stable `~w` rendering of the identity/shape predicate.
+    #[test]
+    fn local_pid_and_reference_round_trips_are_pinned_by_identity() {
+        let cases = group();
+        // The identity/shape cases also evidence the distribution id contract (A.5); the
+        // stable-term compressed round trip is pure ETF (A.2).
+        for (id, contracts, stdout) in [
+            (
+                "etf/roundtrip_self_pid_identity",
+                &[Contract::BeamAsm, Contract::Distribution][..],
+                "ok true",
+            ),
+            (
+                "etf/roundtrip_reference_shape",
+                &[Contract::BeamAsm, Contract::Distribution][..],
+                "ok true",
+            ),
+            (
+                "etf/roundtrip_compressed_stable_term",
+                &[Contract::BeamAsm][..],
+                "ok true",
+            ),
+            (
+                "etf/roundtrip_compressed_pid_ref_payload",
+                &[Contract::BeamAsm, Contract::Distribution][..],
+                "ok {true,true,64}",
+            ),
+        ] {
+            let case = cases.iter().find(|c| c.id == id).expect("registered");
+            assert_eq!(case.contracts, contracts, "{id}");
+            assert_eq!(case.kind_label(), "value", "{id}");
+            assert_eq!(
+                case.golden,
+                Golden { stdout: Some(stdout), exit_code: 0 },
+                "{id}"
+            );
+        }
+    }
 }
