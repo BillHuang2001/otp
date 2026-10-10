@@ -139,38 +139,16 @@ opt(StMap, FuncDb) ->
         [[io_lib:format("  ~p in ~s: ~p~n", [Var,ff(F),Info])
           || {F,Var,Info} <- ValuesToTrack]]),
 
-    Result =
-        try
-            %% Find initial values.
-            {InitialsToPatch,ForceCopy} = find_initial_values(ValuesToTrack, StMap, FuncDb),
-            %% Patch instructions and initial values.
-            patch_instructions(Applicable, InitialsToPatch,
-                               ForceCopy, StMap, FuncDb)
-        catch
-            throw:too_deep ->
-                %% Give up and leave the module unmodified.
-                {StMap,FuncDb}
-        end,
-    case get('$fbip_opt') of
-        true ->
-            %% Opt-in FBIP pass (enabled by the +fbip_opt option; flagged
-            %% by beam_ssa_opt:late_epilogue_passes/1). Runs after the
-            %% regular alias and destructive-update transforms.
-            %%
-            %% The pass declares a cheap eligibility precondition (the
-            %% module contains a copying update_record) and runs under the
-            %% opt-in per-pass budget/watchdog when one of the
-            %% ssa_opt_budget/ssa_opt_watchdog/ssa_opt_gates options is
-            %% given; otherwise beam_ssa_opt_budget:run/5 calls the pass
-            %% directly.
-            {StMap1,FuncDb1} = Result,
-            beam_ssa_opt_budget:run(ssa_opt_fbip,
-                                    fun({SM,FD}) -> beam_ssa_fbip:opt(SM, FD) end,
-                                    fun({SM,_FD}) -> beam_ssa_fbip:eligible(SM) end,
-                                    true,
-                                    {StMap1,FuncDb1});
-        _ ->
-            Result
+    try
+        %% Find initial values.
+        {InitialsToPatch,ForceCopy} = find_initial_values(ValuesToTrack, StMap, FuncDb),
+        %% Patch instructions and initial values.
+        patch_instructions(Applicable, InitialsToPatch,
+                           ForceCopy, StMap, FuncDb)
+    catch
+        throw:too_deep ->
+            %% Give up and leave the module unmodified.
+            {StMap,FuncDb}
     end.
 
 find_applicable_instructions(Funs, StMap) ->

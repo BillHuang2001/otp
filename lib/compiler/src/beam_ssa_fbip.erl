@@ -37,9 +37,11 @@
 %% uniquely owned by h1/1 and used exactly once, yet the compiler still
 %% emits a copying `update_record` for it.
 %%
-%% The pass is only run when the `fbip_opt` option is given; the gating
-%% is done by beam_ssa_destructive_update:opt/2, which invokes this pass
-%% after the regular alias/destructive-update transforms.
+%% The pass is only run when the `fbip_opt' option is given: it is then
+%% registered as a module-level pass in
+%% beam_ssa_opt:epilogue_module_passes/1, after the regular alias and
+%% destructive-update transforms. Its kill switch, `no_ssa_opt_fbip', is
+%% derived from that registration like for every other pass.
 %%
 %% == Algorithm ==
 %%
@@ -222,9 +224,9 @@ opt(StMap, FuncDb) ->
     {StMap1, FuncDb}.
 
 %% Eligibility precondition used by the opt-in per-pass budget/watchdog
-%% driver (`beam_ssa_opt_budget', wired in
-%% `beam_ssa_destructive_update:opt/2'): true when at least one function in
-%% the module contains an `update_record' that is not already `inplace',
+%% driver (`beam_ssa_opt_budget', consulted from the `ssa_opt_fbip' entry of
+%% `beam_ssa_opt:epilogue_module_passes/1'): true when at least one function
+%% in the module contains an `update_record' that is not already `inplace',
 %% i.e. an update that the pass could possibly rewrite.
 %%
 %% This is only a NECESSARY condition - a cheap filter, O(number of

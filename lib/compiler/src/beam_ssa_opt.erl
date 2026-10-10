@@ -394,7 +394,29 @@ epilogue_module_passes(Opts) ->
             fun({StMap, FuncDb}) ->
                     beam_ssa_destructive_update:opt(StMap, FuncDb)
             end}],
-    passes_1_module(Ps0, Opts).
+    Ps = case member(fbip_opt, Opts) of
+             true ->
+                 %% Opt-in FBIP pass. Registered as a named module pass
+                 %% (rather than being invoked from another pass) so that
+                 %% passes/3 derives its kill switch no_ssa_opt_fbip, like
+                 %% every other pass. Module pass funs are not wrapped by
+                 %% wrap_fun/3, so the pass runs itself through the opt-in
+                 %% per-pass budget/watchdog driver.
+                 Ps0 ++ [{ssa_opt_fbip,
+                          fun({StMap,FuncDb}) ->
+                                  beam_ssa_opt_budget:run(ssa_opt_fbip,
+                                                          fun({SM,FD}) ->
+                                                                  beam_ssa_fbip:opt(SM, FD)
+                                                          end,
+                                                          fun({SM,_FD}) ->
+                                                                  beam_ssa_fbip:eligible(SM)
+                                                          end,
+                                                          true,
+                                                          {StMap,FuncDb})
+                          end}];
+             false -> Ps0
+         end,
+    passes_1_module(Ps, Opts).
 
 early_epilogue_passes(Opts) ->
     Ps = [?PASS(ssa_opt_type_finish),
@@ -404,11 +426,6 @@ early_epilogue_passes(Opts) ->
     passes_1(Ps, Opts).
 
 late_epilogue_passes(Opts) ->
-    %% Record whether the opt-in FBIP pass should run. This function is
-    %% evaluated while the phase list is built (before any pass runs), so
-    %% the flag is available to beam_ssa_destructive_update:opt/2, which
-    %% invokes beam_ssa_fbip:opt/2.
-    put('$fbip_opt', member(fbip_opt, Opts)),
     Ps = [%% Run live one more time to clean up after the previous
           %% epilogue passes.
           ?PASS(ssa_opt_live),
@@ -429,10 +446,11 @@ late_epilogue_passes(Opts) ->
 passes_1(Ps, Opts0) ->
     passes(Ps, Opts0, func).
 
-%% Module-level pass lists run in the compiling process: the opt-in FBIP gate
-%% is evaluated inside beam_ssa_destructive_update:opt/2 (see
-%% beam_ssa_opt_budget), and these passes have their own internal convergence
-%% caps. They are therefore neither time bounded nor skipped.
+%% Module-level pass lists run in the compiling process: the opt-in FBIP pass
+%% declares its own eligibility gate and bounds itself with
+%% beam_ssa_opt_budget:run/5, and the other module-level passes have their own
+%% internal convergence caps. The module-level pass funs are therefore not
+%% wrapped by wrap_fun/3.
 passes_1_module(Ps, Opts0) ->
     passes(Ps, Opts0, module).
 

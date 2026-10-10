@@ -81,6 +81,8 @@
 %% The number of blocks is reported to `classify/2' but does NOT influence
 %% the thresholds or the allowance, which are computed from the number of
 %% instructions alone.
+%% Only FUNCTION-level runs are classified: a module-level pass is handed no
+%% function, so it is registered nowhere and gets no effort level.
 %%
 %% == Per-function allowance ==
 %%
@@ -163,9 +165,8 @@
 %% `get_stats/0' and the `function_size/0' / `function_budget/0' /
 %% `function_over_budget/0' / `effort/0' / `remaining/0' queries. A watchdog
 %% child starts with a copy of the parent's process dictionary, so a pass
-%% that reads process-dictionary state (for example the FBIP flag
-%% `$fbip_opt' set by `beam_ssa_opt:late_epilogue_passes/1') sees exactly
-%% what it would have seen when run in the parent.
+%% that reads process-dictionary state sees exactly what it would have seen
+%% when run in the parent.
 %%
 %% == Query surface for the opt-in passes ==
 %%
@@ -190,9 +191,14 @@
 %%     instead of using the fixed effort levels.
 %%   * `classify/2' is pure and exported so that the model can be exercised
 %%     directly; passes do not need it.
-%%   * A pass invoked from inside another pass (the FBIP pass, run by
-%%     `beam_ssa_destructive_update:opt/2') goes through `run/5' like any
-%%     other pass and is therefore bounded and skipped in the same way.
+%%   * A MODULE-level pass (one that is handed `{StMap,FuncDb}' instead of a
+%%     single function's state, such as the opt-in FBIP pass
+%%     `beam_ssa_fbip:opt/2') goes through `run/5' as well, and is therefore
+%%     gated, budgeted and watched over in the same way. It is not a
+%%     function, though, so it is registered in no per-function bookkeeping:
+%%     the per-function queries are `undefined' while it runs and its own
+%%     allowance is never consulted (only the cumulative budget and the
+%%     watchdog bound it, in addition to its gate).
 %%
 %% == Statistics ==
 %%
@@ -200,9 +206,9 @@
 %% `ran', `gated', `over_budget' (skipped because the cumulative budget was
 %% exhausted), `function_over_budget' (skipped because the current
 %% function's own allowance was exhausted), `timed_out', `effort' (how many
-%% distinct functions were first classified at each level) and `passes' (the
-%% same counters per pass). The counters are only collected when the
-%% machinery is enabled.
+%% distinct functions were first classified at each level; a module-level
+%% pass contributes no function) and `passes' (the same counters per pass).
+%% The counters are only collected when the machinery is enabled.
 -module(beam_ssa_opt_budget).
 -moduledoc false.
 
@@ -374,7 +380,8 @@ classify(_Blocks, Instructions) when is_integer(Instructions) ->
     {Level, max(?FN_MIN_MS, ?FN_BASE_MS - Size div ?FN_INSTRS_PER_MS)}.
 
 %% The size of the function the framework most recently saw, or `undefined'
-%% when the machinery is disabled or no function has been seen yet.
+%% when the machinery is disabled, no function has been seen yet, or the most
+%% recent run was a module-level pass.
 -spec function_size() -> size() | undefined.
 function_size() ->
     case get(?KEY) of
@@ -383,7 +390,8 @@ function_size() ->
     end.
 
 %% The time allowance (milliseconds) of the current function, or
-%% `undefined' when the machinery is disabled or no function has been seen.
+%% `undefined' when the machinery is disabled, no function has been seen, or
+%% the most recent run was a module-level pass.
 -spec function_budget() -> non_neg_integer() | undefined.
 function_budget() ->
     case fn_entry() of
@@ -392,7 +400,8 @@ function_budget() ->
     end.
 
 %% True when the current function's own allowance is exhausted. Never true
-%% while the machinery is disabled or before the first function is seen.
+%% while the machinery is disabled, before the first function is seen, or
+%% during a module-level pass (which has no allowance of its own).
 -spec function_over_budget() -> boolean().
 function_over_budget() ->
     case fn_entry() of
@@ -401,9 +410,10 @@ function_over_budget() ->
     end.
 
 %% The effort allowed for the current function. `undefined' when the
-%% machinery is disabled or no function has been seen yet, `none' when the
-%% cumulative budget is exhausted (nothing is allowed any more), otherwise
-%% the level the current function was classified at.
+%% machinery is disabled, no function has been seen yet, or the most recent
+%% run was a module-level pass; `none' when the cumulative budget is
+%% exhausted (nothing is allowed any more), otherwise the level the current
+%% function was classified at.
 -spec effort() -> effort() | undefined.
 effort() ->
     case get(?KEY) of
@@ -420,7 +430,10 @@ effort() ->
             undefined
     end.
 
-%% The per-function bookkeeping of the current function, or `undefined'.
+%% The per-function bookkeeping of the current function, or `undefined' when
+%% the machinery is disabled, no function has been seen, or the most recent
+%% run was a module-level pass (`observe/1' records the atom `module' as the
+%% current run in that case, which matches neither clause below).
 fn_entry() ->
     case get(?KEY) of
         #{current := {Id, _Size}, fns := Fns} -> maps:get(Id, Fns, undefined);
@@ -435,16 +448,21 @@ fn_skipping_active() ->
 
 %% Take note of the function the pass fun was handed: extract its id and its
 %% SSA size, classify it when it is seen for the first time, and remember
-%% the size as "the size of the most recently seen function". Robust by
-%% construction: an unexpected state shape yields the id `undefined' and the
-%% size `{0,0}' instead of an exception.
+%% the size as "the size of the most recently seen function". A module-level
+%% pass (a state that does not describe a single function) has no function
+%% to classify: nothing is registered, and the state is marked as such so
+%% that the per-function allowance is not applied to it.
 observe(State) ->
     case get(?KEY) of
         undefined ->
             ok;
         BudgetState ->
-            {Id, Size} = fn_info(State),
-            put(?KEY, observe_1(Id, Size, BudgetState))
+            case fn_info(State) of
+                {Id, Size} ->
+                    put(?KEY, observe_1(Id, Size, BudgetState));
+                module ->
+                    put(?KEY, BudgetState#{current := module})
+            end
     end.
 
 observe_1(Id, Size, #{fns := Fns} = State) ->
@@ -479,9 +497,10 @@ bump_effort(#{level := Level}, Stats) ->
     Effort = Effort0#{Level => maps:get(Level, Effort0) + 1},
     Stats#{effort := Effort}.
 
-%% The function id and the SSA size carried by the pass state. Only the
-%% function-level state `{#opt_st{},FuncDb}' carries them; anything else
-%% yields `{undefined,{0,0}}'.
+%% The function id and the SSA size carried by the pass state, or `module'
+%% for a state that does not describe a single function (a module-level
+%% pass, such as the opt-in FBIP pass). Only the function-level state
+%% `{#opt_st{},FuncDb}' carries a function's id and size.
 fn_info(State) ->
     try
         {#opt_st{ssa=Ssa, anno=Anno}, _FuncDb} = State,
@@ -490,7 +509,7 @@ fn_info(State) ->
         %% a construct, not a bare anno map.)
         {maps:get(func_info, Anno, undefined), ssa_size(Ssa)}
     catch
-        _:_ -> {undefined, {0, 0}}
+        _:_ -> module
     end.
 
 %% The number of blocks and the total number of instructions of a
@@ -529,9 +548,9 @@ wrap_fun(Name, Fun, Gate, Skippable) ->
     end.
 
 %% Run one pass under the eligibility gate, the cumulative budget, the
-%% per-function allowance and the watchdog. Also used directly by passes that
-%% are invoked from another pass rather than from a phase pass list (the
-%% opt-in FBIP pass).
+%% per-function allowance and the watchdog. Also used directly for the opt-in
+%% FBIP pass, which is a module-level pass and is therefore not wrapped by
+%% `wrap_fun/4' (see `beam_ssa_opt:epilogue_module_passes/1').
 -spec run(atom(), fun((state()) -> state()), gate(), boolean(), state()) ->
           state().
 run(Name, Fun, Gate, Skippable, State) ->
@@ -563,7 +582,10 @@ run(Name, Fun, Gate, Skippable, State) ->
 %% skippable is never skipped, whatever the bounds say (see the module
 %% comment). The cumulative budget is checked first, so a skip caused by the
 %% compilation's budget is counted as such even when the function's own
-%% allowance happens to be exhausted as well.
+%% allowance happens to be exhausted as well. The per-function allowance
+%% only applies to a function-level run: a module-level pass (which
+%% `observe/1' marks as `module', see `fn_entry/0') is bounded by the
+%% cumulative budget alone.
 skip_reason(false) ->
     none;
 skip_reason(true) ->
