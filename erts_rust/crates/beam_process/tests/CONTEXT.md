@@ -176,7 +176,24 @@ SMP pool:
     builders only collect without growing, and the exemption test FAILS (a `relocation_exempt` raise
     instead of the raw `Alloc`) the moment the short-circuit is removed.** Deterministic — every size
     from the public heap-policy arithmetic, no sleeps / wall-clock bounds / oracle.
-30. `common/mod.rs` — the **shared oracle driver** used by `registry_monitors.rs`, `dict_oracle.rs`,
+30. `gc_refc_binary_message.rs` (1 test) — the collection's **mailbox rebuild preserves a queued
+    message's off-heap ownership**. A 200-byte payload (> `ERL_ONHEAP_BINARY_LIMIT` = 64, so its bytes
+    live in an off-heap counted `beam_alloc::RefcBinary`) is written as the 8-word `[BinRef][ErlSubBits]`
+    pair, its handle registered in the source `OffHeapTable`, and delivered through
+    `ProcessTable::deliver(to, from, term, &src_off_heap)`; the copy shares the payload, so the queued
+    message owns a handle (refcount 2). The sender's table is then dropped, leaving the **message the
+    sole owner** (refcount 1), and `Process::collect` runs on the receiver while the message is queued.
+    The test asserts the rebuilt envelope still carries the counted binary (`binaries().len() == 1`,
+    same `data_ptr`, refcount unchanged, `logical_binary_bytes()` = the payload length) and that the
+    relocated payload is still a readable refc binary with the original bytes whose (post-copy)
+    `BinRef.val` — reached through the `ErlSubBits.orig` fix-up, not by assuming adjacency — is the very
+    same off-heap pointer. **Discriminating by construction: FAILS (an empty `binaries()`, the payload
+    already freed) the moment the rebuild goes back to `Message::new(...)` plus the token/off-heap
+    builders instead of `Message::with_payload`, which keeps the whole envelope.** The handle assertion
+    is checked before the payload is read, so a pre-fix run never dereferences the freed bytes;
+    deterministic — a fixed payload pattern and an explicit `collect`, no sleeps / wall-clock bounds /
+    oracle.
+31. `common/mod.rs` — the **shared oracle driver** used by `registry_monitors.rs`, `dict_oracle.rs`,
     `monitor_tag.rs`, `lifecycle_oracle.rs`, `capability_inventory.rs` and `port_monitor_cleanup.rs`:
     `ERL_TIMEOUT`, `erl_stdout`, `expect_oracle` and `strip_logger_reports` (+ 4 unit tests for the
     normalizer). It runs
@@ -186,7 +203,7 @@ SMP pool:
     removed), so a comparison is exact and never flaky. A support module (subdirectory files are not
     compiled as test targets); it carries `#![allow(dead_code)]` because not every including binary uses
     every helper.
-31. `lifecycle_oracle.rs` (7 tests) — the **lifecycle / process-control semantics** cross-checked against
+32. `lifecycle_oracle.rs` (7 tests) — the **lifecycle / process-control semantics** cross-checked against
     the real `erl` (skips loudly when absent), filling the cases the other `oracle_*` suites leave
     unpinned: link exit propagation from a **live** linked origin (a non-trapping peer dies, a trapping
     peer survives with `{'EXIT', A, {bad,1}}`, and the watcher's DOWN carries the same structured
@@ -199,7 +216,7 @@ SMP pool:
     `demonitor(Ref, [flush])` removing a queued DOWN for a **pid** target. Every oracle expression is
     synchronized on a message (no sleeps); variable names are kept distinct per receive in the `-eval`
     text so no earlier binding is silently re-used as a pattern.
-32. `terminate_best_effort.rs` (2 tests) — the **best-effort termination cascade** of
+33. `terminate_best_effort.rs` (2 tests) — the **best-effort termination cascade** of
     `ProcessTable::terminate`/`terminate_with_ports`: a dying process is reclaimed *first*, so a
     per-peer signalling failure is dropped-and-logged (ERTS's `erts_dsig_drop`) and the cascade
     continues, letting the process-death observer and the port-monitor cleanup always run. Two
@@ -233,15 +250,16 @@ SMP pool:
 - Run the whole crate gate with
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_process` (never `cd`,
   sandbox `$HOME` is read-only). Cross-checks against the real system ERTS belong to the sibling
-  `../../../tools/differential/` harness, not here. Current: **413 passed, 0 failed, 1 ignored**.
+  `../../../tools/differential/` harness, not here. Current: **414 passed, 0 failed, 1 ignored**.
 
 ## Routing Table
 - `scheduler.rs`, `messaging.rs`, `signals.rs`, `gc.rs`, `priority.rs`, `pending_signals.rs`,
   `preemption.rs`, `dict.rs`, `fragments.rs`, `scheduler_ports.rs`, `exhaustion.rs`,
-  `signal_exhaustion.rs`, `gc_exemption.rs` →
+  `signal_exhaustion.rs`, `gc_exemption.rs`, `gc_refc_binary_message.rs` →
   the single-threaded scheduler (incl. the port-aware slice cleanup), mailbox, signals, GC roots, PCB state,
   pre-emption/fairness, the collect-grow-and-retry exhaustion path of `Process::deliver` and the
-  `{'EXIT',…}`/`{'DOWN',…}` signal builders, and the host-controllable GC relocation exemption
+  `{'EXIT',…}`/`{'DOWN',…}` signal builders, the host-controllable GC relocation exemption, and the
+  collection's mailbox rebuild of a message that owns an off-heap refc binary
 - `registry_monitors.rs`, `monitor_tag.rs`, `capability_inventory.rs`, `process_info_source.rs`,
   `spawn_options.rs`, `lifecycle_oracle.rs` → the process-control surface: name registry + monitors (incl.
   the `monitor/3` user tag), the typed-error/capability inventory, the `process_info` item→accessor

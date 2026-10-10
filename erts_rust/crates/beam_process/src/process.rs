@@ -857,9 +857,10 @@ impl Process {
     /// ([`SignalQueue::gather_roots`]) — all in-heap sub-rootsets: the queue is drained, every
     /// payload and the dict/saved-arg/signal words are appended to the root buffer, the
     /// collector runs, and each region is written back (registers via
-    /// [`Registers::scatter_roots`], messages rebuilt from their relocated payloads, then the
-    /// dict, the saved args and the pending signals scattered back) in the SAME order it was
-    /// gathered.
+    /// [`Registers::scatter_roots`], each drained message re-enqueued around its **relocated**
+    /// payload via [`Message::with_payload`] — preserving the envelope's full ownership
+    /// (`from`/`token`/`off_heap`/`binaries`/`nodes`/`fragments`), then the dict, the saved args
+    /// and the pending signals scattered back) in the SAME order it was gathered.
     ///
     /// The outgoing port-monitor set ([`Process::port_monitors`]) is deliberately **not**
     /// gathered: a [`PortWatch`] holds a reference and a port number, both plain values
@@ -922,6 +923,11 @@ impl Process {
     /// roots have already been relocated in place, so leaving them unwritten would corrupt the
     /// heap. On a fail-fast / pre-copy failure the roots are un-relocated and the write-back is
     /// a harmless no-op (it rewrites the same values and rebuilds equivalent messages).
+    ///
+    /// The mailbox is rebuilt in FIFO order through [`Message::with_payload`], which replaces only
+    /// the payload term: each envelope keeps everything else it owns — its `off_heap` MSO handles,
+    /// its counted refc `binaries`, its `nodes` references and its fragment chain — alongside the
+    /// relocated payload.
     fn run_rooted_collection<F>(&mut self, collect: F) -> Result<Collection>
     where
         F: FnOnce(&mut Collector, &mut [Eterm]) -> Result<Collection>,
@@ -932,8 +938,8 @@ impl Process {
         let x_live = self.regs.gather_roots(&mut roots);
         let reg_words = roots.len();
 
-        // 2. Drain the mailbox, appending each payload as a root. The messages themselves
-        //    are rebuilt below, because `Message` has no payload setter.
+        // 2. Drain the mailbox, appending each payload as a root. The drained envelopes are
+        //    re-enqueued below around their relocated payloads.
         let mut drained: Vec<Message> = Vec::new();
         while let Some(message) = self.mailbox.dequeue() {
             roots.push(message.payload());
@@ -957,13 +963,15 @@ impl Process {
         // 5. Write the (relocated) registers and stack words back.
         self.regs.scatter_roots(&roots, x_live);
 
-        // 6. Rebuild every message around its relocated payload, preserving FIFO order.
+        // 6. Re-enqueue every drained envelope around its relocated payload, preserving FIFO
+        //    order. `with_payload` replaces only the payload term, so the envelope's full
+        //    ownership travels with it: `from`/`token`/`off_heap`/`binaries`/`nodes`/`fragments`.
+        //    Rebuilding with `Message::new` instead would drop the `binaries` (freeing a shared
+        //    refc payload the relocated `BinRef.val` still points at) and the `fragments` (a
+        //    use-after-free for a fragment-resident payload).
         let payloads = &roots[reg_words..mail_words];
         for (index, message) in drained.into_iter().enumerate() {
-            let rebuilt = Message::new(payloads[index], message.from())
-                .with_token(message.token())
-                .with_off_heap(message.off_heap().to_vec());
-            self.mailbox.enqueue(rebuilt);
+            self.mailbox.enqueue(message.with_payload(payloads[index]));
         }
 
         // 7. Write the relocated dictionary, saved-argument and pending-signal words back, in
