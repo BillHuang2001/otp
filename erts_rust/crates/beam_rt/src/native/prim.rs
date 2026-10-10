@@ -2951,6 +2951,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).expect("a creatable scratch dir");
         std::fs::write(dir.join("p"), b"0123456789a").expect("a writable seed file");
+        write_ipread_fixture(&dir.join("ip"));
     }
 
     /// The `-eval` the oracle runs: exactly the sequence `runtime_answers` performs, each
@@ -2990,8 +2991,20 @@ E2 = file:read_file(E),
 E3 = prim_file:write_file("{dir}/",<<"x">>),
 E4 = prim_file:write_file("{dir}/missing/child",<<"x">>),
 S1 = prim_file:set_cwd("{dir}"),
+{{ok,Fd5}} = prim_file:open("{dir}/ip",[read]),
+I1 = prim_file:ipread_s32bu_p32bu(Fd5,0,100),
+I2 = prim_file:ipread_s32bu_p32bu(Fd5,0,3),
+I3 = prim_file:ipread_s32bu_p32bu(Fd5,100,100),
+I4 = prim_file:ipread_s32bu_p32bu(Fd5,-1,10),
+I5 = prim_file:ipread_s32bu_p32bu(Fd5,0,infinity),
+%% `get_handle`'s *value* is the process's own descriptor number, so only its shape
+%% (`byte_size/1`, `is_binary/1`) and the closed-descriptor answer are comparable.
+G1 = byte_size(prim_file:get_handle(Fd5)),
+G2 = is_binary(prim_file:get_handle(Fd5)),
+prim_file:close(Fd5),
+G3 = prim_file:get_handle(Fd5),
 lists:foreach(fun(X) -> io:format("~p~n",[X]) end,
-              [A1,A2,A3,A4,A5,B1,B2,B3,B4,C1,C2,C3,D1,D2,E1,E2,E3,E4,S1]),
+              [A1,A2,A3,A4,A5,B1,B2,B3,B4,C1,C2,C3,D1,D2,E1,E2,E3,E4,S1,I1,I2,I3,I4,I5,G1,G2,G3]),
 halt(0).
 "#
         )
@@ -3095,6 +3108,58 @@ halt(0).
         // S1 — set_cwd.
         let target = chars(&mut runtime, dir_text);
         let answer = prim_file(&mut runtime, "set_cwd", &[target]);
+        answers.push(answer);
+
+        // I1..I5 / G1..G3 — the two families closed by this module. `get_handle`'s **value**
+        // is the process's own descriptor number (the entry's documented divergence), so only
+        // its shape and the closed-descriptor answer are comparable with the oracle.
+        let ip = path_in(&mut runtime, &dir.to_path_buf(), "ip");
+        let modes = list(&mut runtime, &[read]);
+        let answer = prim_file(&mut runtime, "open", &[ip, modes]);
+        let fd5 = ok_value(&runtime, answer);
+        let answer = prim_file(
+            &mut runtime,
+            "ipread_s32bu_p32bu",
+            &[fd5, make_small(0), make_small(100)],
+        );
+        answers.push(answer);
+        let answer = prim_file(
+            &mut runtime,
+            "ipread_s32bu_p32bu",
+            &[fd5, make_small(0), make_small(3)],
+        );
+        answers.push(answer);
+        let answer = prim_file(
+            &mut runtime,
+            "ipread_s32bu_p32bu",
+            &[fd5, make_small(100), make_small(100)],
+        );
+        answers.push(answer);
+        let answer = prim_file(
+            &mut runtime,
+            "ipread_s32bu_p32bu",
+            &[fd5, make_small(-1), make_small(10)],
+        );
+        answers.push(answer);
+        let infinity = atom(&mut runtime, "infinity");
+        let answer = prim_file(
+            &mut runtime,
+            "ipread_s32bu_p32bu",
+            &[fd5, make_small(0), infinity],
+        );
+        answers.push(answer);
+        let answer = prim_file(&mut runtime, "get_handle", &[fd5]);
+        let width = terms::binary_bytes(answer).expect("a bare descriptor binary").len();
+        answers.push(make_small(width as i64));
+        let answer = prim_file(&mut runtime, "get_handle", &[fd5]);
+        let is_binary = if terms::binary_bytes(answer).is_ok() {
+            atom(&mut runtime, "true")
+        } else {
+            atom(&mut runtime, "false")
+        };
+        answers.push(is_binary);
+        assert_ok(&mut runtime, "close", &[fd5]);
+        let answer = prim_file(&mut runtime, "get_handle", &[fd5]);
         answers.push(answer);
 
         answers
