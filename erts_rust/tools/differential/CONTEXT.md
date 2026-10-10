@@ -82,7 +82,7 @@ The binary's own `run`/`suite` exit codes are unchanged (`0` agree / `1` mismatc
 - **No coupling to `crates/*` internals** (crate deps are `serde` + `serde_json` only). No `clap`; arg parsing is hand-rolled `std`. `unsafe` is **forbidden**.
 - **Loud failures:** stderr messages + nonzero exit; never silently swallow an error. Machine-readable JSON, stable schema, written under the gitignored `out/` (or `--out <dir>`).
 - Files target ~1000 lines; split by responsibility. Apache-2.0. The corpus group files are **data registries** (one embedded module/expression per case) and legitimately run past the soft target (`wire.rs`, `wire_extra.rs`, `errors.rs`, `nif_abi.rs`, `nif_abi_extra.rs`, `driver_abi.rs`, `driver_abi_extra.rs`, `mexec_extra.rs`, `boot_prereq.rs`, `boot_extra.rs`); do not split them for line count alone. The `report` module is a directory module split by responsibility.
-- The built-in corpus is the **conformance corpus** (1628 cases) and runs end to end in CI; keep it fast enough for that and reserve the heavy external suites (root §6) for milestones.
+- The built-in corpus is the **conformance corpus** (1633 cases) and runs end to end in CI; keep it fast enough for that and reserve the heavy external suites (root §6) for milestones.
 - **Never assert a golden whose output is order-unstable.** A `~w` rendering of a multi-key map (or any structure containing one) has a per-VM-start iteration order, so compare it structurally (`maps:size`, `lists:sort(maps:keys(M))`, single-key maps) instead. Same rule for pids/refs/ports/creation values that vary per VM start, and for a `load_nif` failure message that embeds a temp-dir path — assert a shape or classify into an integer, or use a deterministic decode→re-encode round-trip.
 
 ## Design Decisions
@@ -127,15 +127,15 @@ The binary's own `run`/`suite` exit codes are unchanged (`0` agree / `1` mismatc
 - The driver echo round trip runs only once `beam_rt run` drives the full scheduler (`Runtime::run_scheduled`); a single engine pass never runs the scheduler's port half, so the receiver blocks and the CLI exits `3` with `beam_rt: unsupported: ... blocked` (a capability gap, never a mismatch, never a hang).
 
 ## Known Issues / Notes for Agents
-- **The Rust side is a partial runtime; today's gate is 0 mismatches** (1628-case corpus). The **module-run** cases (embedded sources, the native-record group, the NIF `.so` groups, the C-driver groups, the real-system-module `mexec`/`mexec_extra` groups) `agree`, and the **eval** cases `agree` where the `-eval` evaluator supports them — `beam_rt` has a real Erlang-expression evaluator and does **not** auto-print the result. A capability gap is `unsupported`, never a mismatch: either the raise escapes and the CLI exits `3` (`beam_rt: unsupported: …`), or (for a probe-wrapped case) the probe *catches* it and prints one `exception <class> <reason>` line whose reason follows the `unsupported` convention.
-  - Current rollup (**stable across repeated runs**): **1628 total · 1626 agree · 0 mismatch · 2 unsupported · 0 skipped**; both gaps are recorded in `known-gaps.txt` (`allowed=2 unauthorized=0 stale=0`), so `gate.sh` → exit `0`.
+- **The Rust side is a partial runtime; today's gate is 0 mismatches** (1633-case corpus). The **module-run** cases (embedded sources, the native-record group, the NIF `.so` groups, the C-driver groups, the real-system-module `mexec`/`mexec_extra` groups) `agree`, and the **eval** cases `agree` where the `-eval` evaluator supports them — `beam_rt` has a real Erlang-expression evaluator and does **not** auto-print the result. A capability gap is `unsupported`, never a mismatch: either the raise escapes and the CLI exits `3` (`beam_rt: unsupported: …`), or (for a probe-wrapped case) the probe *catches* it and prints one `exception <class> <reason>` line whose reason follows the `unsupported` convention.
+  - Current rollup (**stable across repeated runs**): **1633 total · 1631 agree · 0 mismatch · 2 unsupported · 0 skipped**; both gaps are recorded in `known-gaps.txt` (`allowed=2 unauthorized=0 stale=0`), so `gate.sh` → exit `0`.
   - Per-contract rollup (A.1–A.9; a case may declare several contracts, so the column totals exceed `summary.total`):
 
 | Contract | total | agree | mismatch | unsupported | skipped |
 |---|---|---|---|---|---|
 | A.1 | 163 | 163 | 0 | 0 | 0 |
-| A.2 | 575 | 575 | 0 | 0 | 0 |
-| A.3 | 223 | 223 | 0 | 0 | 0 |
+| A.2 | 580 | 580 | 0 | 0 | 0 |
+| A.3 | 228 | 228 | 0 | 0 | 0 |
 | A.4 | 190 | 190 | 0 | 0 | 0 |
 | A.5 | 328 | 327 | 0 | 1 | 0 |
 | A.6 | 44 | 44 | 0 | 0 | 0 |
@@ -220,7 +220,7 @@ Corpus groups (`src/corpus/*`; each file's own module doc is the per-case refere
 - `src/corpus/nif.rs` -> A.3: the observable `erlang:nif_error/1,2` reason shapes
 - `src/corpus/nif_so.rs` -> A.3 end to end: `load_nif/2` of a real `cc`-built `.so` (round trips + a NIF `badarg`) and the `load_failed`/`bad_lib`/reload shapes, integer-classified
 - `src/corpus/nif_res.rs` -> A.3 end to end: the resource type + the `enif_make_resource`→`enif_get_resource` round trip, `enif_ioq_*`, the `erl_drv_thread`/sync and extra-environment families (a destructor is not pinned)
-- `src/corpus/nif_abi.rs` -> A.3 end to end (104 cases, integer-classified): one shared C `.so` whose single `ErlNifFunc` entry `probe/1` switches on an integer selector over the `enif_*` surface
+- `src/corpus/nif_abi.rs` -> A.3 end to end (109 cases, integer-classified): one shared C `.so` whose single `ErlNifFunc` entry `probe/1` switches on an integer selector over the `enif_*` surface, incl. the now-agreeing host-hooked slots (`enif_term_to_binary`, `enif_binary_to_term`, `enif_make_ref`, `enif_make_existing_atom`, `enif_whereis_pid`)
 - `src/corpus/nif_abi_extra.rs` -> A.3 end to end (80 cases, `nif_extra/…`): a second C `.so` over the `enif_*` boundary/edge/refusal shapes and the map/IOQ/thread families — its extra `probe_term/2` entry takes an Erlang-built term (from the module's `built_term/1`) so the iolist positional-shape rules and bit-offset string/binary shapes (which the C API cannot construct) are pinnable
 - `src/corpus/records.rs` -> A.1/A.2/A.7: `erlc`-compiled native-record runs + `records:create/4`/`update/4`/`get_definition/2`
 - `src/corpus/ets.rs` -> A.7/A.1: the plain `ets:*` BIF surface + table-type and option handling
