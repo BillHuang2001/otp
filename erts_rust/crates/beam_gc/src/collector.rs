@@ -179,17 +179,25 @@ impl Collector {
         let mut from = FromSet::new();
         from.add(&self.young);
         from.add(&self.mature);
-        let used = self.young.used_words();
-        let live = used + self.mature.used_words();
-        // Size the fresh space from the heap policy: grow, shrink or keep the current
-        // mature capacity (`HeapPolicy::mature_after_fullsweep`, the C
-        // `adjust_after_fullsweep`).
+        // Size the fresh space from the **exact live word count** of the graph this
+        // fullsweep evacuates — the C `adjust_after_fullsweep`'s
+        // `need_after = (HEAP_TOP(p) - HEAP_START(p)) + need + …` (`erl_gc.c:2072`), never
+        // the pre-collection occupancy. A fullsweep-sized generational heap is *full* when
+        // the cadence fires (live data plus every promotion the minors since the last
+        // fullsweep made, all of it garbage by now), so feeding the policy the occupancy
+        // makes its `should_grow` fire on every fullsweep and the mature capacity creeps up
+        // one growth-table step per fullsweep, without bound, for a live set that never
+        // changes (see [`crate::live`]).
+        let live = crate::live::live(&from, roots).words;
+        // Grow, shrink or keep the current mature capacity
+        // (`HeapPolicy::mature_after_fullsweep`, the C `adjust_after_fullsweep`).
         let size = self
             .policy
             .mature_after_fullsweep(self.mature.capacity_words(), live, 0);
         let alloc = self.young.allocator().clone();
         // Sized up front so the copy always fits — a collection never leaves the
-        // from-space half-forwarded.
+        // from-space half-forwarded. With `live` exact, this is an exact fit test rather
+        // than an upper bound.
         let mut fresh = HeapSpace::with_allocator(alloc, size)?;
         // `max_heap_words` can clamp `size` below the live set: report the typed heap
         // exhaustion before copying anything, so a doomed fullsweep leaves both from-spaces

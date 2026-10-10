@@ -333,14 +333,14 @@ impl ImmixSpace {
     /// rounded up to a whole number of blocks (at least one), over the default
     /// allocator.
     pub fn new(capacity_words: usize) -> Result<ImmixSpace> {
-        ImmixSpace::build(Heap::new(block_count(capacity_words) * BLOCK_WORDS)?)
+        ImmixSpace::build(Heap::new(blocks_for(capacity_words) * BLOCK_WORDS)?)
     }
 
     /// As [`new`](ImmixSpace::new), backed by `alloc`.
     pub fn with_allocator(alloc: AllocRef, capacity_words: usize) -> Result<ImmixSpace> {
         ImmixSpace::build(Heap::with_allocator(
             alloc,
-            block_count(capacity_words) * BLOCK_WORDS,
+            blocks_for(capacity_words) * BLOCK_WORDS,
         )?)
     }
 
@@ -689,7 +689,11 @@ impl ImmixSpace {
     }
 }
 
-/// The number of blocks `capacity_words` needs: at least one, rounded up.
-fn block_count(capacity_words: usize) -> usize {
-    capacity_words.div_ceil(BLOCK_WORDS).max(1)
+/// The number of whole blocks a `capacity_words` target maps to: at least one,
+/// rounded **down**. A line-granular region can only be grown in whole blocks, so
+/// rounding down is what makes a policy target that lands *inside* the current
+/// block count a no-op instead of a spurious relocation (e.g. 320 words of target
+/// over a current 1-block/256-word region stays at 1 block, not 2).
+fn blocks_for(capacity_words: usize) -> usize {
+    (capacity_words / BLOCK_WORDS).max(1)
 }

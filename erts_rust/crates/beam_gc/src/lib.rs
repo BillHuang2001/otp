@@ -42,7 +42,8 @@
 //! legacy `erts/emulator/beam/erl_gc.c` + `copy.c` are the ground-truth behaviour.
 //!
 //! `unsafe` is confined to `copy.rs` and `immix_collector.rs` (the word-level copier and
-//! the promotion driver), `immix/` (the mark-region space's word-level mark/evacuation
+//! the promotion driver), `live.rs` (the read-only live-graph counter a fullsweep sizes
+//! itself from), `immix/` (the mark-region space's word-level mark/evacuation
 //! walks), the raw-pointer range tests in `space.rs` and the two narrow `NonNull`-deref /
 //! `Box::from_raw` blocks in `mso.rs`; `policy.rs`, `stats.rs` and the collector driving
 //! logic are safe Rust.
@@ -55,6 +56,7 @@ mod error; // pub(crate) helpers only — NOT public
 pub mod heap_info;
 pub mod immix;
 pub mod immix_collector;
+pub(crate) mod live; // the read-only live-graph counter — NOT public
 pub mod mso;
 pub mod policy;
 pub mod selection;
