@@ -307,11 +307,13 @@ The **local record** of a process's relationships with processes on other nodes;
   (alloc/reuse + relationship round-trips), `progress` (generation bump), `ptab` (alloc/remove/reuse +
   serial bump, name registry, stale-pid rejection, `deliver` wake list, `take` clearing a pending wake,
   the trap/link-`EXIT`/`{'DOWN'}` paths waking a blocked recipient).
-- **`tests/` — the integration evidence pinning the M1 guarantees.** **31 files**, one topic each; the
+- **`tests/` — the integration evidence pinning the M1 guarantees.** **32 files**, one topic each; the
   authoritative per-file list lives in **`tests/CONTEXT.md`**. In short: `scheduler`/`messaging`/
   `signals`/`gc`/`priority`/`pending_signals`/`dict`/`dict_oracle`/`fragments` cover the single-threaded
   scheduler, the mailbox, signals, PCB state and the dictionary (including its `erl`-cross-checked
-  structural key/value equality); `ports`/`remote` the port table and distributed links/monitors;
+  structural key/value equality); `message_relocation` the collection's queued-message re-install (a
+  fragment-resident payload keeps its `Fragments`, a heap-resident one keeps its refc-binary/node
+  lists, FIFO order is preserved); `ports`/`remote` the port table and distributed links/monitors;
   `process_exit_observer`/`port_monitor_cleanup` the process-death observer seam and the death-side
   port-monitor cleanup (incl. `erl`-cross-checked oracle probes); `smp`/`lock_scope`/`timers`/`dirty`/
   `progress` the SMP pool; `registry_monitors`/`monitor_tag` the
@@ -349,8 +351,8 @@ The **local record** of a process's relationships with processes on other nodes;
   hanging.
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p
   beam_process` and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
-  Current total: **413 passed / 0 failed / 1 ignored** (161 in-module unit + integration across the
-  31 `tests/` files + 1 doctest; the ignored test is the documented non-yielding-runner hang failure mode
+  Current total: **417 passed / 0 failed / 1 ignored** (161 in-module unit + integration across the
+  32 `tests/` files + 1 doctest; the ignored test is the documented non-yielding-runner hang failure mode
   in `preemption.rs`), warning-free. The `oracle_*` suites share **one** `erl` driver
   (`tests/common/mod.rs`), run with `-kernel logger_level none` and normalized stdout so a crashed
   probe helper's `=ERROR REPORT====` block can never make a comparison flaky (see `tests/CONTEXT.md`). Always go through `../../scripts/cargo.sh` (`$HOME` is read-only),
@@ -387,21 +389,6 @@ The rationale (why) behind the frozen API and constraints lives in **`DESIGN_DEC
   signal-vs-message ordering barrier remain follow-ups. The queue itself is unbounded (a `VecDeque`,
   matching the oracle's effectively-unbounded signal queue) with total, defensive GC gather/scatter — it
   has no overflow or panic path.
-- **The safepoint collect rebuilds each queued message *without* its refc-binary/node ownership (lost-reference defect).**
-  `Process::run_rooted_collection` (`src/process.rs:938-967`) drains the mailbox and rebuilds every `Message` as
-  `Message::new(payload, from).with_token(token).with_off_heap(off_heap.to_vec())` — preserving `payload`/`from`/`token`/`off_heap` only.
-  A `Message` also owns `binaries: Vec<RefcBinary>` and `nodes: Vec<NodeEntry>` (`../../beam_message/src/message.rs:44-52`), populated by
-  `send`'s `enqueue_copied` (`../../beam_message/src/mailbox.rs:153-162`); both are dropped by the rebuild.
-  Dropping `binaries` releases a counted `RefcBinary`, and `RefcBinary::drop` frees the shared payload on the last reference
-  (`../../beam_alloc/src/binary.rs:264-282`) — so a collection with a queued message whose payload is a refc binary leaves the relocated
-  on-heap `BinRef.val` pointing at freed memory (the copy shares, never deep-copies, the payload: `../../beam_message/src/copy.rs:365-394`).
-  Reachability today: latent through the `beam_rt` runtime (its `deliver_message`/`send_fragmented_message` pass an **empty** source
-  off-heap table, so `copy_refc_binary` fails `bad_term` before a message is built), but **live** for any crate caller of
-  `ProcessTable::deliver(to, from, term, src_off_heap)` whose source table holds a refc binary the payload references, and it becomes a
-  live runtime UAF once source off-heap registration lands. The `nodes` half is reachable via an external-pid payload (that copy needs
-  no source table: `.../copy.rs:497-505`) but is benign in M1 — `NodeEntry` has no `Drop` and its count is non-observable bookkeeping, so
-  the count merely leaks. Fix: carry `.with_binaries(message.binaries().to_vec()).with_nodes(message.nodes().to_vec())` through the
-  rebuild. No test covers a message carrying off-heap ownership across a collection (`tests/gc.rs` roots only immediate/cons/tuple payloads).
 - **The `noproc` DOWN is delivered eagerly (documented deviation).** `monitor/2` on a non-live target
   materialises `{'DOWN', Ref, process, Target, noproc}` straight into the watcher's mailbox, so
   `process_info(self(), message_queue_len)` reports 1 immediately after the call where the oracle reports
