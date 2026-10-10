@@ -206,7 +206,7 @@ The single place that mutates ≥2 processes (mirrors the C ptab lock domain); M
     `signals(pid) -> Result<&SignalQueue>`.
   - **arbitrary pid terms:** `link_term`/`unlink_term(a, b: Eterm)`, `monitor_term(watcher, target:
     Eterm, kind) -> Result<MonitorRef>`, `send_exit_term(from, to: Eterm, reason)` — a local pid routes
-    to the local op, an external pid is recorded + routed (see `remote.rs`); `remote_links(pid)`/
+    to the local op, an external pid is routed as `DistSignal::Exit2` (`DOP_EXIT2`, see `remote.rs`); `remote_links(pid)`/
     `remote_monitors(pid)`.
   - **distribution seam:** `set_dist_router(Box<dyn DistSignalRouter>)`, `take_dist_router()`,
     `has_dist_router() -> bool`.
@@ -267,7 +267,7 @@ The **local record** of a process's relationships with processes on other nodes;
 - `RemotePid { node: Eterm, number: u32, serial: u32, creation: u32 }` (`Copy`) — a decomposed external pid (the `[header, node, creation, data]` thing), holding no boxed pointer into another heap; `from_eterm(term) -> Result<RemotePid>` (`BadArg` unless an external pid), `to_eterm(self, &mut Heap) -> Result<Eterm>`.
 - `PidTarget { Local(ProcessId), Remote(RemotePid) }` — `from_eterm(term) -> Result<PidTarget>` (external ⇒ `Remote`, internal ⇒ `Local`, else `BadArg`).
 - `RemoteMonitor { reference: MonitorRef, remote: RemotePid, kind: MonitorKind }` — an outgoing monitor on a remote process/port.
-- `DistSignal { Link { from, to }, Unlink { from, to }, Monitor { watcher, target, reference, kind }, Demonitor { watcher, target, reference }, Exit { from, to, reason } }` — the control signal the runtime routes to the remote node (the `DOP_*` mapping is documented on the module).
+- `DistSignal { Link { from, to }, Unlink { from, to }, Monitor { watcher, target, reference, kind }, Demonitor { watcher, target, reference }, Exit { from, to, reason }, Exit2 { from, to, reason } }` — the control signal the runtime routes to the remote node. `Exit` is a **link** exit → `{DOP_EXIT, From, To, Reason}` → `Dop::Exit`; `Exit2` is `erlang:exit/2` → `{DOP_EXIT2, From, To, Reason}` → `Dop::Exit2` (distinct opcodes with distinct receipt semantics); the full `DOP_*` mapping is documented on the module.
 - `DistSignalRouter { fn route(&mut self, signal: DistSignal) -> Result<()>; }` — **the distribution seam**: implemented downstream (`beam_rt`) over `beam_dist`; `route` must serialise the signal **synchronously** (`reason` may live in the signaller's heap, which the caller may drop right after). The table's remote records (`remote_links`/`remote_monitors`) and `set_dist_router`/`has_dist_router` are on `ptab.rs`. **This seam is OUTBOUND only** (local → remote): there is no inbound control-message (`DOP_LINK`/`DOP_MONITOR_P`/…) interpreter here — an inbound handler belongs to `beam_rt` (see Known Issues).
 ### `port.rs` — the port-id table + ownership / link / monitor surface
 `PortTable` is the number table the C keeps alongside the pid table, extended with the relationships a dying port must resolve; port *behaviour* (driver, scheduling, read path) is `beam_io`'s. The crate-root re-export keeps `beam_process::PortTable` resolving here.

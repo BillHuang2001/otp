@@ -1450,7 +1450,9 @@ impl ProcessTable {
 
         // 4. Remote links and monitors: a dying process leaves the node's records, and every
         //    remote link partner must be told the process is gone. This runs before
-        //    `drop(process)` because `reason` may live in the dying heap the router reads.
+        //    `drop(process)` because `reason` may live in the dying heap the router reads. A
+        //    link partner's death is the **link** exit, so it routes `DistSignal::Exit`
+        //    (`DOP_EXIT`) — never `DistSignal::Exit2` (`erlang:exit/2`'s `DOP_EXIT2`).
         for remote in self.remote_links.remove(&pid).unwrap_or_default() {
             self.route(DistSignal::Exit {
                 from: pid,
@@ -2115,7 +2117,8 @@ impl ProcessTable {
     }
 
     /// `erlang:exit/2` against an arbitrary pid term: a local pid exits through
-    /// [`ProcessTable::send_exit`], an external pid is routed as a `DOP_EXIT` control signal.
+    /// [`ProcessTable::send_exit`], an external pid is routed as a `DOP_EXIT2` control signal
+    /// ([`DistSignal::Exit2`] — a plain exit signal, *not* the link exit `DOP_EXIT`).
     ///
     /// # Errors
     ///
@@ -2124,7 +2127,7 @@ impl ProcessTable {
     pub fn send_exit_term(&mut self, from: ProcessId, to: Eterm, reason: Eterm) -> Result<()> {
         match PidTarget::from_eterm(to)? {
             PidTarget::Local(pid) => self.send_exit(from, pid, reason),
-            PidTarget::Remote(remote) => self.route(DistSignal::Exit {
+            PidTarget::Remote(remote) => self.route(DistSignal::Exit2 {
                 from,
                 to: remote,
                 reason,
