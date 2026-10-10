@@ -3,7 +3,7 @@
 ## Intent
 The two live, statically-linked `erl_driver` (port) drivers that are OS-independent: `inet_drv.c` (the Erlang socket driver backing `gen_tcp`/`gen_udp`/`gen_sctp`, `inet_tcp`/`inet_udp`/`inet_sctp`, `local_tcp`/`local_udp`, all via the preloaded `prim_inet`) and `ram_file_drv.c` (in-memory file backing `lib/kernel`'s `ram_file`).
 Both are compiled into `beam` via `DRV_OBJS` in `../Makefile.in` and registered at VM start through the generated `driver_tab[]`.
-`inet_drv.c` is ~15.9k lines (the VM's largest single source of socket semantics); `ram_file_drv.c` is ~534 lines.
+`inet_drv.c` is ~15.9k lines (the VM's largest single source of socket semantics); `ram_file_drv.c` is ~515 lines.
 
 ## API Surface
 Public (to Erlang) surface is the drivers' registered names and the port-control / port-command wire protocol, not C symbols.
@@ -17,7 +17,7 @@ All real entries set `extended_marker=ERL_DRV_EXTENDED_MARKER`, major/minor = `E
 `tcp_inet_driver_entry` flags = `ERL_DRV_FLAG_USE_PORT_LOCKING|ERL_DRV_FLAG_SOFT_BUSY`; udp/sctp flags = `ERL_DRV_FLAG_USE_PORT_LOCKING`; placeholder flags = 0.
 `tcp_inet_driver_entry` callback set: init `tcp_inet_init` (`:11749`, returns 0), start `tcp_inet_start` (`:11785`), stop `tcp_inet_stop` (`:11895`), output `tcp_inet_command` (`:12629`), control `tcp_inet_ctl` (`:11952`), timeout `tcp_inet_timeout` (`:12547`), outputv `tcp_inet_commandv` (`:12657`), flush `tcp_inet_flush` (`:12708`), process_exit `tcp_inet_process_exit` (`:12732`), stop_select `inet_stop_select` (`:12773`), emergency_close `inet_emergency_close` (`:10862`); finish/handle/ready_async/call/event/handle2 are NULL.
 udp/sctp entries use `packet_inet_init`/`packet_inet_stop`/`packet_inet_command`/`packet_inet_ctl`/`packet_inet_timeout` and have no outputv/flush/process_exit.
-`ram_file_drv.c` registers `ram_file_driver_entry` (`ram_file_drv.c:106`), name `"ram_file_drv"`, flags 0; callbacks: init `rfile_init` (`:168`), start `rfile_start` (`:173`), stop `rfile_stop` (`:189`), output `rfile_command` (`:397`); everything else NULL (ready_input/ready_output/control/timeout/outputv/flush/call/event/process_exit/stop_select).
+`ram_file_drv.c` registers `ram_file_driver_entry` (`ram_file_drv.c:106`), name `"ram_file_drv"`, flags 0; callbacks: init `rfile_init` (`:148`), start `rfile_start` (`:153`), stop `rfile_stop` (`:169`), output `rfile_command` (`:377`); everything else NULL (ready_input/ready_output/control/timeout/outputv/flush/call/event/process_exit/stop_select).
 
 ## Registration & driver table
 `inet_init` (`inet_drv.c:4526`) runs at emulator start; it calls `add_driver_entry(&tcp_inet_driver_entry)` (`:4599`), `add_driver_entry(&udp_inet_driver_entry)` (`:4601`, `HAVE_UDP`), `add_driver_entry(&sctp_inet_driver_entry)` (`:4635`/`:4679`), then `remove_driver_entry(&inet_driver_entry)` (`:4688`) to drop the placeholder.
@@ -63,12 +63,11 @@ Caller liveness: `driver_monitor_process`/`driver_demonitor_process` on async co
 - TCP/UDP/SCTP are three separate driver entries (own `driver_name`, independently present) that share descriptor code, rather than one driver with a protocol switch.
 - `inet_driver_entry` exists only so the name-derived `driver_tab` has an entry to register for `inet_drv.o`; its `init` registers the real drivers, then removes itself.
 - The driver manages sockets through the emulator pollset (port locking on, soft-busy) rather than dirty schedulers; this is why there are no async threads here.
-- `ram_file_drv` keeps the whole file in one resizable `ErlDrvBinary` (`RamFile` at `ram_file_drv.c:137`; grow by `BFILE_BLOCK` rounding in `ram_file_expand` `:290`), a deliberate simplification over a block vector.
+- `ram_file_drv` keeps the whole file in one resizable `ErlDrvBinary` (`RamFile` at `ram_file_drv.c:137`; grow by `BFILE_BLOCK` rounding in `ram_file_expand` `:270`), a deliberate simplification over a block vector.
 
 ## Known Issues / Gotchas
 - The `dummy_tcp_driver_entry`/`dummy_udp_driver_entry`/`dummy_sctp_driver_entry` structs (`inet_drv.c:2196/2212/2229`, win32-only `#ifdef __WIN32__`) are defined but never referenced or `add_driver_entry`'d anywhere in the tree — they are dead code, not a runtime fallback.
-- `ram_file_drv.c`'s `#ifdef LOADABLE` block (`:147`-`:166`, `driver_init`/`rfile_finish`) is dead: the driver is static-only.
-- `ram_file_drv.c`'s `rfile_command` (`:397`) silently ignores unknown opcodes ("let the caller hang", `:531`) — no reply is sent, which is expected by `ram_file.erl` for unsupported ops.
+- `ram_file_drv.c`'s `rfile_command` (`:377`) silently ignores unknown opcodes ("let the caller hang", `:512`) — no reply is sent, which is expected by `ram_file.erl` for unsupported ops.
 - `inet_drv.c` uses the private `prim_inet` protocol as its control ABI (magic-number-offset cmd + packed binaries), not `erl_driver`'s higher-level helpers; the Erlang half must stay in sync (`erts/preloaded/src/prim_inet.erl`).
 - The socket `driver_select` event is the OS fd on unix and a Winsock event handle on win32 (`inet_descriptor.event`, `:1225`), so event-based reasoning differs per platform.
 - `INET_MAX_ASYNC` is 1 (one outstanding async op per descriptor); a descriptor running multi-accept keeps additional ops in a separate list.
@@ -87,7 +86,7 @@ Caller liveness: `driver_monitor_process`/`driver_demonitor_process` on async co
 
 ## Routing Table
 - (no child nodes) — this directory has no subdirectories.
-- `../unix/`, `../win32/`, `../vxworks/` → platform-specific drivers (in `../`; `unix/` + `vxworks/` are legacy/non-linked)
+- `../win32/` → win32-specific driver (`registry_drv.c`)
 - `../nifs/` → NIF counterparts incl. the newer `socket` API (`prim_socket_nif.c`), `prim_file`, `zlib`, `zstd`
 - `../beam/` → `erl_driver.h` (driver API), `io.c` (driver_tab registration), `packet_parser.c`
 - `../sys/` → pollset (`erl_check_io`), `sys_*` helpers, `erts_sys_ddll_*`

@@ -2,8 +2,7 @@
 
 ## Intent
 Legacy `erl_driver`-style (port) drivers that are compiled *into* the `beam` executable, as opposed to loadable drivers or the NIFs in `../nifs/`.
-Split by OS capability instead of by `#ifdef` walls: `common/` holds code that must compile on every platform, `unix/` / `win32/` / `vxworks/` hold platform-specific code.
-Only a small number of drivers are alive here today; the rest of `common/`/`unix/` is legacy source that is no longer linked (see Known Issues).
+Split by OS capability instead of by `#ifdef` walls: `common/` holds code that must compile on every platform, `win32/` holds platform-specific code.
 
 ## API Surface
 A driver becomes available to Erlang only if its object file is listed in `DRV_OBJS` in `../Makefile.in` (win32 additionally adds `registry_drv.o`).
@@ -20,13 +19,13 @@ Live drivers:
   An in-memory file implemented inside a port; consumed by `lib/kernel/src/ram_file.erl` (`open_port({spawn, "ram_file_drv"}, ...)`) and special-cased by `lib/runtime_tools/src/instrument.erl` (driver-level binary instrumentation).
 - `win32/registry_drv.c` → symbol `registry_driver_entry`, driver name `"registry__drv__"` (win32 only).
   Consumed by `lib/stdlib/src/win32reg.erl`, which appends a `"r"`/`"w"` mode suffix to the port name.
-- `unix/` currently holds no sources: `bin_drv.c` was deleted as provably dead (not in `DRV_OBJS`, no `#include`, no symbol/name reference anywhere in the repo — see `../beam/check_dead_sources.py`).
-- `vxworks/vxworks_resolv.c`: not a driver at all and not compiled — it only defined `erl_gethostbyname`/`erl_gethostbyaddr` shims for the long-removed header `erl_resolv.h`.
+- `unix/` holds no driver sources.
+- `vxworks/` holds no driver sources.
 
 ## Constraints
 - OS-specific code belongs in `unix/` (and `win32/`); `common/` must compile on all platforms and is compiled with `-Idrivers/common -Idrivers/$(ERLANG_OSTYPE)` so it may include headers from the matching OS directory.
 - The public driver API is `../beam/erl_driver.h` (plus `../sys/$(ERLANG_OSTYPE)/driver_int.h`); these files include it as `"erl_driver.h"` and are the in-tree reference users of it.
-- `ERLANG_OSTYPE` is only `unix` or `win32` (set in `../configure.ac`), so `vxworks/` is never selected by the wildcard `DRV_OSTYPE_SRC`.
+- `ERLANG_OSTYPE` is only `unix` or `win32` (set in `../configure.ac`).
 - Adding/removing a driver means editing `DRV_OBJS` in `../Makefile.in` and, if a new file name is used, exporting the matching `<base>driver_entry` symbol; the symbol name is derived mechanically, so renaming a file silently breaks the generated table link.
 - Never edit the generated `$(TTF_DIR)/driver_tab.c`; regenerate via the `driver_tab.c:` rule in `../Makefile.in`.
 - Do not copy code from here into `../nifs/` (or vice versa) without checking the `erl_driver` vs `erl_nif` semantics — the APIs differ in threading, scheduling (no dirty schedulers for ports) and process-exit signalling.
@@ -39,16 +38,13 @@ Live drivers:
 - SCTP support is optional at runtime: with `HAVE_SCTP_BINDX` the symbols are linked in directly, otherwise the driver `dlopen`s `LIBSCTP` and resolves the symbols dynamically, falling back to "not supported".
 
 ## Known Issues / Gotchas
-- A `.c` file here is NOT necessarily built: the globs `DRV_COMMON_SRC`/`DRV_OSTYPE_SRC` feed only `.depend`/`compile_commands.json`, while `DRV_OBJS` decides what gets linked. Check `DRV_OBJS` in `../Makefile.in` (or run `../beam/check_dead_sources.py`) before assuming a source is live — three legacy sources sat here unbuilt (`unix/bin_drv.c`, `unix/multi_drv.c`, `unix/sig_drv.c`) and have been deleted as dead.
-- `unix/bin_drv.c` is unreachable by every mechanism, so it is a safe deletion candidate: it is absent from `DRV_OBJS` (so `utils/make_driver_tab` never emits `bin_driver_entry` into `driver_tab.c`), drivers are registered only by walking the generated `driver_tab[]` at `../beam/io.c:3043` (there is no name-string registration path), and the name string `"binary_filer"` and symbol `bin_driver_entry` occur nowhere else in the repository. The `bin_drv` matches in `../beam/{erl_binary.h,erl_nif.c,dist.c,io.c,erl_bif_info.c}` are `erts_bin_drv_alloc*`, an unrelated identifier; the in-tree `../beam/check_dead_sources.py` + `dead_source_report.txt` confirm this is the only deletable file in the tree.
-- `vxworks/` is stale/unsupported: nothing in the emulator build or configure references vxworks any more, and the file targets a removed header.
+- A `.c` file here is NOT necessarily built: `DRV_OBJS` in `../Makefile.in` decides what is linked, not the `DRV_COMMON_SRC`/`DRV_OSTYPE_SRC` globs — check `DRV_OBJS` (or run `../beam/check_dead_sources.py`) before assuming a source is live.
 - `inet_drv.c` is 15879 lines and by far the largest source of port/driver behaviour in the VM; it is the file to read for socket semantics, but avoid wholesale reformatting (huge conflict surface).
 - `inet_drv.c` uses **no async threads**: the string `driver_async` occurs 0 times and every `ready_async` field is NULL. All I/O is non-blocking sockets driven by `driver_select` readiness plus an internal async-op queue (`INET_MAX_ASYNC = 1` ring at `inet_drv.c:1069`/`:1252` plus an unbounded multi-accept list). `driver_output_term` is also never used — all term replies go through `erl_drv_send_term`.
 - Both link-time state (`driver_tab`, `inet_driver_entry`'s init) and runtime dynamism (`add_driver_entry`/`remove_driver_entry`) are involved, so a driver's presence at runtime is not visible from the table alone.
 - Drivers are statically linked and therefore cannot be unloaded or reloaded at runtime; recompiling any of them requires exiting and restarting the emulator.
 - Driver naming is the ABI used by Erlang code (`"tcp_inet"`, `"ram_file_drv"`, `"registry__drv__"` with its double-underscore suffix); changing a `driver_name` breaks the matching Erlang module silently at runtime, not at build time.
 - `inet_drv.c` shares packet/header-parsing logic with the `decode_packet` BIF (`../beam/packet_parser.c` was split out of it), so packet-option changes may need to be mirrored there.
-- `ram_file_drv.c`'s `#ifdef LOADABLE` block (`driver_init`) is dead code: the driver is static-only.
 
 ## Dependencies
 - POSIX/Winsock sockets, `netdb`/`resolv`, and for SCTP either headers plus `-lsctp` (`LIBSCTP`, passed as `-DLIBSCTP=...` by the `drivers/common/%.c` rule) or runtime `dlopen` of the same library.
@@ -77,10 +73,10 @@ Live drivers:
 - `../../test/` → erts-level port/launcher suites; `../../preloaded/src/prim_inet.erl` → the Erlang half of the inet driver
 
 ## Routing Table
-- `common/` → platform-independent drivers: `inet_drv.c` (15879 lines; `inet`/`tcp_inet`/`udp_inet`/`sctp_inet`), `ram_file_drv.c` (534 lines; `ram_file_drv`)
-- `unix/` → unix-specific driver sources (currently none: the three legacy sources that lived here were unbuilt and are deleted)
+- `common/` → platform-independent drivers: `inet_drv.c` (15879 lines; `inet`/`tcp_inet`/`udp_inet`/`sctp_inet`), `ram_file_drv.c` (~515 lines; `ram_file_drv`)
+- `unix/` → unix-specific driver sources (holds no driver sources)
 - `win32/` → win32-specific driver: `registry_drv.c` (~556 lines; `registry__drv__`), used by `lib/stdlib` `win32reg`
-- `vxworks/` → stale portability leftovers, never compiled; do not invest analysis here
+- `vxworks/` → holds no driver sources
 - `../nifs/` → NIF counterparts and the newer `socket`/`prim_file`/`zlib` implementations (sibling — read-only, escalate writes to `../`)
 - `../beam/` → driver/port core, `erl_driver.h` public API (sibling — read-only, escalate writes to `../`)
 - `../sys/` → OS abstractions and pollset used by these drivers (sibling — read-only, escalate writes to `../`)

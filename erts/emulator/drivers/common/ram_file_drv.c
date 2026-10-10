@@ -144,26 +144,6 @@ typedef struct ram_file {
     ErlDrvSSizeT end;            /* end position in buffer */
 } RamFile;
 
-#ifdef LOADABLE
-static int rfile_finish(DriverEntry* drv)
-{
-    return 0;
-}
-
-DriverEntry* driver_init(void *handle)
-{
-    ram_file_driver_entry.handle = handle;
-    ram_file_driver_entry.driver_name = "ram_file_drv";
-    ram_file_driver_entry.finish = rfile_finish;
-    ram_file_driver_entry.init = rfile_init;
-    ram_file_driver_entry.start = rfile_start;
-    ram_file_driver_entry.stop = rfile_stop;
-    ram_file_driver_entry.output = rfile_command;
-    ram_file_driver_entry.ready_input = NULL;
-    ram_file_driver_entry.ready_output = NULL;
-    return &ram_file_driver_entry;
-}
-#endif
 
 static int rfile_init(void)
 {
