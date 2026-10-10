@@ -207,6 +207,23 @@ impl ExecutionContext for BudgetContext<'_, '_> {
         ExecutionContext::send_message(self.inner, to, message)
     }
 
+    /// Forwarded like [`send_message`](ExecutionContext::send_message) — and **load-bearing** for
+    /// the scheduler path.
+    ///
+    /// The slice's machine runs on *this* wrapper, so the engine's `send` arm calls
+    /// `send_message_with_off_heap` on the wrapper: without this forward the **default** body would
+    /// run, forwarding to `send_message` and **discarding** `src_binaries`, so an engine-built
+    /// off-heap refc binary in a message would be refused by the receiver-side copy with
+    /// `BeamError::BadArg` — the send-path half of the transport bug, reachable only from a
+    /// scheduled process. Forwarding the slice reaches [`RuntimeContext`]'s own override.
+    fn send_message_with_off_heap(
+        &mut self,
+        to: Eterm,
+        message: Eterm,
+        src_binaries: &[beam_alloc::RefcBinary],
+    ) -> Result<()> {
+        ExecutionContext::send_message_with_off_heap(self.inner, to, message, src_binaries)
+    }
     fn receive_next(&mut self) -> Result<Option<Eterm>> {
         ExecutionContext::receive_next(self.inner)
     }

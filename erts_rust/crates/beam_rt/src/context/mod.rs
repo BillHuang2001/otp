@@ -452,32 +452,65 @@ impl<'a> RuntimeContext<'a> {
     /// trace event emitted — the delivery half of [`ExecutionContext::send_message`], and the
     /// delivery a trace event itself uses (so emitting an event never emits an event).
     ///
-    /// `deliver_simple` pushes a woken recipient onto the table's wake list, so the wake
-    /// survives for the scheduler pass; the outcome itself needs no action here. A payload the
-    /// recipient's heap cannot hold is retried through the heap-fragment model
-    /// ([`Self::send_fragmented_message`]) exactly as
-    /// [`send_message`](ExecutionContext::send_message) documents; every other failure — the
-    /// table's typed not-found for a pid no process exists for, and a genuine exhaustion — is
-    /// propagated, the latter translated to the emulator's documented
-    /// `error:system_limit` ([`error::enforce_term_heap_limit`]).
+    /// This is the **no-off-heap** form: it hands [`Self::deliver_message_with_off_heap`] an
+    /// empty source table, so every runtime-internal delivery (`trace.rs`,
+    /// `native/process/exit.rs`, [`Self::deliver_in_table`]) is byte-identical to before. The
+    /// engine's `send` seam carries the sender machine's refc-binary handles and goes through
+    /// the `_with_off_heap` form instead.
     ///
-    /// # Ordering (the oversized-message retry)
-    ///
-    /// The retry is triggered by the **raw** [`AllocKind::Message`] failure
-    /// `deliver_simple` returns: it means *the payload did not fit the receiver's heap* and
-    /// is *not* fatal. The translation to `error:system_limit` is therefore applied only to
-    /// what remains **after** the retry has run (the retry's own failure, and the
-    /// non-`Message` arm) — translating the first result would turn the retry trigger into a
-    /// hard error and break every oversized delivery.
+    /// A delivery pushes a woken recipient onto the table's wake list, so the wake survives for
+    /// the scheduler pass; the outcome itself needs no action here.
     pub(crate) fn deliver_message(
         &mut self,
         to: ProcessId,
         from: Eterm,
         message: Eterm,
     ) -> Result<()> {
-        match self.process_table_mut().deliver_simple(to, from, message) {
+        let source = OffHeapTable::new();
+        self.deliver_message_with_off_heap(to, from, message, &source)
+    }
+
+    /// [`Self::deliver_message`] for a sender that holds the term's **source off-heap table**
+    /// — the payload handles the receiver-side copy resolves a refc binary by
+    /// (`beam_message`'s `copy_refc_binary` looks a payload up by its data pointer through the
+    /// copy's source table).
+    ///
+    /// `src` is the sender's own table: for the engine's `send` seam it is the in-flight
+    /// machine's refc-binary handles, so `self() ! <<0:(1200)/integer>>` — an engine-built
+    /// off-heap binary — is copied into the receiver instead of being refused with
+    /// [`BeamError::BadArg`]. A sender with no off-heap payload (every runtime-internal
+    /// delivery, and a plain on-heap message) passes an **empty** table, exactly as
+    /// [`Self::deliver_message`] always did.
+    ///
+    /// # Ownership
+    ///
+    /// `src` is **borrowed for the whole call** — the [`CopyContext`] the receiver's copy runs
+    /// under resolves payloads through it for the copy's duration — so the caller must keep it
+    /// alive until this returns. The **destination** side is the receiver's own off-heap table
+    /// (`ProcessTable::deliver` → `Process::deliver` → `beam_message::send` drains it into the
+    /// queued [`Message`]), or the fragment's own table on the fallback, so — unlike the
+    /// process-return path — **no** runtime-level destination table
+    /// ([`Runtime::eval_off_heap`](crate::runtime::Runtime)) is needed. A handle must never be
+    /// reconstructed from a raw payload data pointer.
+    ///
+    /// # Ordering (the oversized-message retry)
+    ///
+    /// The retry is triggered by the **raw** [`AllocKind::Message`] failure `deliver` returns:
+    /// it means *the payload did not fit the receiver's heap* and is *not* fatal. The
+    /// translation to `error:system_limit` is therefore applied only to what remains **after**
+    /// the retry has run (the retry's own failure, and the non-`Message` arm) — translating the
+    /// first result would turn the retry trigger into a hard error and break every oversized
+    /// delivery.
+    pub(crate) fn deliver_message_with_off_heap(
+        &mut self,
+        to: ProcessId,
+        from: Eterm,
+        message: Eterm,
+        src: &OffHeapTable,
+    ) -> Result<()> {
+        match self.process_table_mut().deliver(to, from, message, src) {
             Err(BeamError::Alloc(failure)) if failure.kind == AllocKind::Message => self
-                .send_fragmented_message(to, from, message)
+                .send_fragmented_message(to, from, message, src)
                 .map_err(error::enforce_term_heap_limit),
             other => other.map(|_| ()).map_err(error::enforce_term_heap_limit),
         }
@@ -531,8 +564,10 @@ impl<'a> RuntimeContext<'a> {
     /// [`Fragments`](beam_message::Fragments) chain, and the enqueued
     /// [`Message`](beam_message::Message) owns that chain, so its payload has a stable home
     /// the receiver's heap is not involved in. The off-heap objects the payload references
-    /// are refcounted into the **fragment's** table (the copy's source is the same empty
-    /// [`OffHeapTable`] `deliver_simple` uses, so the fragment owns them).
+    /// are refcounted into the **fragment's** table through the preflight's **source** table
+    /// `src` — the sender's own handles
+    /// ([`Self::deliver_message_with_off_heap`]'s) — so an engine-built off-heap binary in an
+    /// oversized payload is resolved exactly as on the ordinary path.
     ///
     /// # The redundant preflight, and why it is harmless
     ///
@@ -555,20 +590,25 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// The failures are **raw**: the fragment's host-allocation failure and the copy
     /// engine's exhaustion ([`AllocKind::Message`]). The single caller
-    /// ([`Self::deliver_message`]) translates a genuine exhaustion to `error:system_limit`
-    /// with [`error::enforce_term_heap_limit`]; that translation lives at the call site
-    /// because the `Message` kind must stay recognizable as the retry trigger on the
-    /// first `deliver_simple` attempt.
-    fn send_fragmented_message(&mut self, to: ProcessId, from: Eterm, message: Eterm) -> Result<()> {
-        // An empty source off-heap table: the sender's term carries no off-heap slot this
-        // runtime can resolve (the engine seam hands over only the term), exactly as
-        // `deliver_simple` assumes.
-        let source = OffHeapTable::new();
+    /// ([`Self::deliver_message_with_off_heap`]) translates a genuine exhaustion to
+    /// `error:system_limit` with [`error::enforce_term_heap_limit`]; that translation lives
+    /// at the call site because the `Message` kind must stay recognizable as the retry
+    /// trigger on the first `deliver` attempt.
+    fn send_fragmented_message(
+        &mut self,
+        to: ProcessId,
+        from: Eterm,
+        message: Eterm,
+        src: &OffHeapTable,
+    ) -> Result<()> {
+        // `src` is the sender's own source off-heap table (the engine seam's machine handles
+        // on the `send` path), borrowed for the whole call: the preflight resolves a refc
+        // binary's payload through it exactly as the ordinary delivery did.
         // A fresh destination off-heap table: the fragment path gives the payload to the
         // **fragment's** own table (see `beam_message::send_fragmented`), so this one is
         // only the preflight's — which cannot succeed here — and stays empty.
         let mut dst = OffHeapTable::new();
-        let mut ctx = CopyContext::new(&source, &mut dst);
+        let mut ctx = CopyContext::new(src, &mut dst);
         let process = self
             .process_table_mut()
             .get_mut(to)
@@ -2046,26 +2086,34 @@ impl ExecutionContext for RuntimeContext<'_> {
     ///
     /// `to` is resolved with [`ProcessId::from_eterm`] (a non-pid is [`BeamError::BadArg`])
     /// and the message is copied into the recipient's heap and enqueued by
-    /// [`ProcessTable::deliver_simple`] (an unknown pid is the table's typed
+    /// [`ProcessTable::deliver`] (an unknown pid is the table's typed
     /// `TermNotFound`). The sender is this context's pid, so `self() ! M` reaches the very
     /// mailbox the following `receive` scans.
     ///
-    /// A delivery that wakes a blocked recipient reports [`DeliverOutcome::Woke`]; the
-    /// wake is **recorded on the process table's wake list** (not lost) and a later
-    /// scheduler pass absorbs it by calling `Scheduler::resume_woken`. Milestone 1 has no
-    /// scheduler loop, so nothing enqueues the woken process here — which is why a
-    /// self-delivery is the `Enqueued` case this crate relies on.
+    /// This is the **no-off-heap** form: it delegates to
+    /// [`Self::send_message_with_off_heap`] with an empty handle slice, so the trace events
+    /// and the delivery live in one place. A sender whose message may hold an engine-built
+    /// off-heap binary goes through the `_with_off_heap` form.
+    fn send_message(&mut self, to: Eterm, message: Eterm) -> Result<()> {
+        self.send_message_with_off_heap(to, message, &[])
+    }
+
+    /// `send` with the **source off-heap table** the receiver-side copy needs.
     ///
-    /// **A payload the recipient's heap cannot hold does not fail**: the copy engine
-    /// preflights the receiver's young heap and reports
-    /// [`Alloc(AllocKind::Message)`](beam_common::BeamError::Alloc) for a message larger
-    /// than it, exactly as the C `erts_try_alloc_message_on_heap` does. That case is
-    /// retried through the **heap-fragment** model ([`Self::send_fragmented_message`]),
-    /// which is how the real system delivers a large message at all. A **genuine**
-    /// exhaustion — the copy that still does not fit after the retry, or a non-message-heap
-    /// allocation failure — becomes the emulator's documented `error:system_limit`
-    /// ([`error::enforce_term_heap_limit`]), not the internal `allocation failure: …` text;
-    /// the ordinary (small-payload) path is unchanged.
+    /// `src_binaries` are the payload handles of the machine that built `message` — the
+    /// in-flight `Machine::refc_binaries()` slice the engine's `send` arm hands over
+    /// ([`ExecutionContext::send_message_with_off_heap`]). A `bs_init_writable` /
+    /// `bs_create_bin` result over `beam_term::refc::ERL_ONHEAP_BINARY_LIMIT` bytes is stored
+    /// **off** the process heap, so the copy into the recipient
+    /// ([`ProcessTable::deliver`]) resolves a refc binary by its data pointer through this
+    /// table; without it the copy would refuse the whole message with
+    /// [`BeamError::BadArg`]. An empty slice (every runtime-internal send, and any message
+    /// with no off-heap payload) is byte-identical to the no-off-heap path.
+    ///
+    /// The source table is a **local that outlives the whole delivery call** — the copy
+    /// borrows it for the copy's duration — and `deliver_message_with_off_heap` reads it. The
+    /// destination is the receiver's own off-heap table, so no runtime-level table is needed
+    /// (see [`Self::deliver_message_with_off_heap`]).
     ///
     /// A completed send also produces **events** (contract A.8, item 1): the ordinary
     /// `{trace, Sender, send, Msg, To}` — when the *sending* process is `[send]`-traced — and
@@ -2074,12 +2122,27 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// payload ([`Self::trace_send_events`]). A third event follows when the **receiver** is
     /// `['receive']`-traced: `{trace, Receiver, 'receive', Msg}`, emitted here (never from the
     /// internal delivery bypass, which would recurse) by [`Self::trace_receive_events`].
-    ///
-    /// [`DeliverOutcome::Woke`]: beam_process::DeliverOutcome::Woke
-    fn send_message(&mut self, to: Eterm, message: Eterm) -> Result<()> {
+    fn send_message_with_off_heap(
+        &mut self,
+        to: Eterm,
+        message: Eterm,
+        src_binaries: &[beam_alloc::RefcBinary],
+    ) -> Result<()> {
         let target = ProcessId::from_eterm(to)?;
         let from = self.mailbox_pid.to_eterm();
-        self.deliver_message(target, from, message)?;
+        if src_binaries.is_empty() {
+            self.deliver_message(target, from, message)?;
+        } else {
+            // The sender's source off-heap table, built from the machine's handles (each
+            // `clone` bumps the `RefcBinary` refcount). It is a local that must outlive the
+            // whole delivery: the receiver-side copy borrows it (see
+            // `deliver_message_with_off_heap`).
+            let mut source = OffHeapTable::new();
+            for handle in src_binaries {
+                source.push_binary(handle.clone());
+            }
+            self.deliver_message_with_off_heap(target, from, message, &source)?;
+        }
         self.trace_send_events(to, message)?;
         // The delivered message is also a `receive` event for the **receiver** — gated on the
         // receiver's own `receive` flag, emitted after the `send` event, and emitted here (the
