@@ -883,9 +883,8 @@ impl Runtime {
     /// emulator's documented `error:system_limit` — an honest error, never a dangling term
     /// (see [`crate::error::enforce_term_heap_limit`]).
     pub(crate) fn stabilize_term(&mut self, term: Eterm) -> Result<Eterm> {
-        let __r = beam_message::copy_struct_simple(term, &mut self.eval_heap);
-        eprintln!("DEBUG stabilize term raw={:#x} ok={} err={:?}", term.raw(), __r.is_ok(), __r.as_ref().err());
-        __r.map_err(error::enforce_term_heap_limit)
+        beam_message::copy_struct_simple(term, &mut self.eval_heap)
+            .map_err(error::enforce_term_heap_limit)
     }
     /// Ensures `heap_need` words are available in the arena.
     ///
@@ -1721,9 +1720,7 @@ impl Runtime {
             Some(module) => &module.atom_table,
             None => code_server.atoms(),
         };
-        let __fr = format::term_to_string_with(registry, info_heap, table, *self_pid, term, control);
-        eprintln!("DEBUG format term raw={:#x} ok={} err={:?}", term.raw(), __fr.is_ok(), __fr.as_ref().err());
-        __fr
+        format::term_to_string_with(registry, info_heap, table, *self_pid, term, control)
     }
 
     /// Boots on demand (idempotent).

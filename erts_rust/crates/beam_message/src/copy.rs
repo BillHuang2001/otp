@@ -575,14 +575,6 @@ pub(crate) fn shallow<A: CopyTarget>(
             Ok(make_list(dst as *const Eterm))
         }
         PrimaryTag::Boxed => {
-            {
-                let hdr = unsafe { *boxed_val(src) };
-                eprintln!("DEBUG shallow boxed src={:#x} hdr={:#x} words={} offheap={} refc={} matchctx={}",
-                    src.raw(), hdr.raw(),
-                    unsafe { layout::object_words(hdr, boxed_val(src)) },
-                    layout::is_off_heap_term(src), layout::is_refc_binary_term(src),
-                    layout::is_match_context_term(src));
-            }
             // An off-heap MSO reference is refcounted, never deep-copied: clone the source handle
             // (bumping the MSO refcount) into the destination table and write the new slot.
             if layout::is_off_heap_term(src) {
