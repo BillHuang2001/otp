@@ -108,8 +108,11 @@ impl fmt::Display for TableId {
 
 /// The owning process of a table.
 ///
-/// M1 **skeleton**: access is not yet enforced by owner (see the crate
-/// `CONTEXT.md`, Known Issues).
+/// An opaque identifier: this crate has no pid term and no process-liveness
+/// concept. Ownership **is** enforced — [`can_read`](crate::can_read)/
+/// [`can_write`](crate::can_write) compare the owner against the requester and
+/// [`TableAccess`] re-checks every operation — so this is a real owner, just not
+/// a BEAM pid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OwnerId(u64);
 

@@ -37,9 +37,10 @@
 //! 1. `keys.len() == children.len()` on a branch, and both arrays are strictly
 //!    ascending in arithmetic key order (`beam_term::compare::cmp_arith`).
 //! 2. `separator[i] == max(children[i])` for every child.
-//! 3. Every node except the root holds at least [`MIN_OCCUPANCY`]
-//!    entries/children; the root leaf may be empty (that is the empty tree) and a
-//!    root branch has at least two children.
+//! 3. Every node holds at most [`ORDER`] entries/children (the fan-out that
+//!    bounds node size and makes a split amortized `O(1)`), and every node except
+//!    the root holds at least [`MIN_OCCUPANCY`]; the root leaf may be empty (that
+//!    is the empty tree) and a root branch has at least two children.
 //! 4. All leaves are at the same depth.
 //! 5. The leaf chain visits every leaf exactly once, left to right.
 //!
@@ -831,6 +832,14 @@ impl Tree {
         match self.store.node(id) {
             Node::Leaf(leaf) => {
                 assert!(!leaf.entries.is_empty(), "a reachable leaf holds entries");
+                // Invariant 3's upper bound: the fan-out `ORDER` bounds every
+                // node, so a split is amortized `O(1)` per insert (one per
+                // `ORDER / 2` inserts) and no node can grow without bound.
+                assert!(
+                    leaf.entries.len() <= ORDER,
+                    "a leaf holds at most {ORDER} entries (has {})",
+                    leaf.entries.len()
+                );
                 if !is_root {
                     assert!(
                         leaf.entries.len() >= MIN_OCCUPANCY,
@@ -856,6 +865,13 @@ impl Tree {
                     branch.keys.len(),
                     branch.children.len(),
                     "a branch has one separator per child"
+                );
+                // Invariant 3's upper bound (see the leaf arm): `ORDER` bounds a
+                // branch's child count too, so a split is amortized `O(1)`.
+                assert!(
+                    branch.children.len() <= ORDER,
+                    "a branch keeps at most {ORDER} children (has {})",
+                    branch.children.len()
                 );
                 if is_root {
                     assert!(
