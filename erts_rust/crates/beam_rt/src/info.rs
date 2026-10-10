@@ -45,6 +45,7 @@
 //! | [`schedulers`] | processor/scheduler/multi-scheduling keys |
 //! | [`memory`] | GC/heap policy keys, `allocated_areas`, `alloc_util_allocators`, `garbage_collection` |
 //! | [`dist`] | the distribution-state keys `dist` / `dist_ctrl` (answered only in the oracle's non-distributed state) |
+//! | [`time`] | the ERTS monotonic-time interface constants `start_time` / `end_time` |
 //! | [`unsupported`] | the oracle's keys for facilities this runtime does not have — an honest capability gap |
 //!
 //! # Implemented vs unsupported vs badarg
@@ -86,6 +87,7 @@ mod limits;
 mod memory;
 mod schedulers;
 mod system;
+mod time;
 mod unsupported;
 
 // The host-identity helpers (`os_type`, `system_architecture`) live in their own child
@@ -172,6 +174,9 @@ pub const SUPPORTED_KEYS: &[&str] = &[
     // -- `dist`: the distribution-state keys (see [`dist`]) --
     "dist",
     "dist_ctrl",
+    // -- `time`: the ERTS monotonic-time interface constants (see [`time`]) --
+    "start_time",
+    "end_time",
 ];
 
 /// The keys the oracle accepts but this runtime answers with an honest **capability
@@ -189,8 +194,6 @@ pub const UNSUPPORTED_KEYS: &[&str] = &[
     "time_correction",
     "time_warp_mode",
     "tolerant_timeofday",
-    "start_time",
-    "end_time",
     "os_monotonic_time_source",
     "os_system_time_source",
     // CPU-topology *detection*, poll-set introspection, C-compiler/3PP identification.
@@ -324,7 +327,13 @@ pub const INFO_ATOMS: &[&str] = &[
 /// map-shaped key (`max_heap_size`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InfoValue {
-    /// A small integer (materialized as a small-int immediate).
+    /// A 64-bit signed integer.
+    ///
+    /// Materialized as a small-int immediate when it fits the 60-bit small range and as a
+    /// one-digit bignum otherwise — exactly the C's `make_time_val`
+    /// (`erl_time_sup.c:2133-2146`: `IS_SSMALL(val)` → `make_small`, else
+    /// `erts_sint64_to_big`), which is how the oracle answers `system_info(end_time)`
+    /// (a value outside the small range).
     Int(i64),
     /// A string (materialized as a list of byte-sized small integers, as the oracle does).
     Str(String),
@@ -358,15 +367,14 @@ impl InfoValue {
     ///
     /// # Errors
     ///
-    /// * [`BeamError::SystemLimit`] when an [`InfoValue::Int`] does not fit a 60-bit
-    ///   small integer (impossible for the keys of this crate);
     /// * [`BeamError::TermNotFound`] when an atom this value names is not interned in
     ///   `atoms` — never an invented atom. A runtime materializing this crate's keys
     ///   seeds [`INFO_ATOMS`], which covers every atom the surface can emit;
-    /// * the heap's allocation failure for a string, a list, a tuple, a map or a binary.
+    /// * the heap's allocation failure for a string, a list, a tuple, a map, a binary or
+    ///   the block of an [`InfoValue::Int`] outside the small range.
     pub fn to_eterm(&self, heap: &mut Heap, atoms: &AtomTable) -> Result<Eterm> {
         match self {
-            InfoValue::Int(value) => try_make_small(*value).map_err(|_| BeamError::SystemLimit),
+            InfoValue::Int(value) => integer_term(heap, *value),
             InfoValue::Str(text) => {
                 let mut list = NIL;
                 for byte in text.bytes().rev() {
@@ -426,6 +434,21 @@ fn atom_term(atoms: &AtomTable, name: &str) -> Result<Eterm> {
         .ok_or(BeamError::TermNotFound)
 }
 
+/// A 64-bit signed integer as a term: a small-int immediate when it fits the 60-bit small
+/// range, else a one-digit bignum.
+///
+/// The C's `make_time_val` (`erl_time_sup.c:2133-2146`) picks between exactly these two
+/// representations (`IS_SSMALL(val)` → `make_small`, else `erts_sint64_to_big`), and
+/// `erts_sint64_to_big` writes one `ErtsDigit` on `ARCH_64` (`big.c:2357-2364`,
+/// `big.h:120-121`), which is what [`beam_codec::term::make_big`] writes for a single
+/// digit. The magnitude comes from `unsigned_abs`, so `i64::MIN` cannot overflow.
+fn integer_term(heap: &mut Heap, value: i64) -> Result<Eterm> {
+    match try_make_small(value) {
+        Ok(small) => Ok(small),
+        Err(_) => beam_codec::term::make_big(heap, value < 0, &[value.unsigned_abs()]),
+    }
+}
+
 /// Computes the `system_info/1` value of `key` against a runtime.
 ///
 /// # Errors
@@ -449,6 +472,9 @@ pub fn system_info_value(key: &str, rt: &Runtime) -> Result<InfoValue> {
         return result;
     }
     if let Some(result) = dist::try_value(key, rt) {
+        return result;
+    }
+    if let Some(result) = time::try_value(key, rt) {
         return result;
     }
     if let Some(result) = unsupported::try_value(key, rt) {
@@ -688,7 +714,7 @@ mod tests {
         }
         // The surface is the union of the family modules; keep the count pinned so a key
         // dropped from a family is caught.
-        assert_eq!(SUPPORTED_KEYS.len(), 65);
+        assert_eq!(SUPPORTED_KEYS.len(), 67);
         let mut sorted: Vec<&str> = SUPPORTED_KEYS.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
@@ -713,7 +739,7 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), UNSUPPORTED_KEYS.len(), "no duplicate keys");
-        assert_eq!(sorted.len(), 17);
+        assert_eq!(sorted.len(), 15);
     }
 
     #[test]

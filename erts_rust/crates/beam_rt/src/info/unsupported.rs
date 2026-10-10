@@ -31,7 +31,6 @@
 //! |---|---|
 //! | `allocator` | this runtime does not identify the host C allocator (`{glibc, …}`) |
 //! | `time_offset`/`time_correction`/`time_warp_mode`/`tolerant_timeofday` | no time-correction service |
-//! | `start_time` / `end_time` | no time server |
 //! | `os_monotonic_time_source` / `os_system_time_source` | no time-source introspection |
 //! | `cpu_topology` | no CPU-topology detection |
 //! | `check_io` | no poll-set introspection |
@@ -60,7 +59,6 @@ pub(crate) fn try_value(key: &str, _rt: &Runtime) -> Option<Result<InfoValue>> {
         "time_offset" | "time_correction" | "time_warp_mode" | "tolerant_timeofday" => {
             "this runtime has no time-correction service"
         }
-        "start_time" | "end_time" => "this runtime has no time server",
         "os_monotonic_time_source" | "os_system_time_source" => {
             "this runtime has no time-source introspection"
         }

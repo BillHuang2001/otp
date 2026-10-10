@@ -30,8 +30,9 @@
 //! * [`ORACLE_EQUAL_KEYS`] — the oracle's printed value must equal this runtime's
 //!   rendered value (whitespace-normalized, because `~p` wraps long lists across
 //!   lines). These are either interface constants any erts-17.1 build reports the same
-//!   way (`nif_version`, `driver_version`, the limits, the GC policy rows, …) or facts
-//!   about the shared host (`wordsize`, `os_type`, `os_version`, `machine`).
+//!   way (`nif_version`, `driver_version`, the monotonic-time interface constants
+//!   `start_time`/`end_time`, the limits, the GC policy rows, …) or facts about the
+//!   shared host (`wordsize`, `os_type`, `os_version`, `machine`).
 //! * [`SHAPE_ONLY_KEYS`] — only the *shape* is compared, never the value. These split
 //!   into two honest groups:
 //!     1. this runtime's own version strings, which are deliberately its **own**
@@ -107,6 +108,13 @@ const ORACLE_EQUAL_KEYS: &[&str] = &[
     // gap instead (see `src/info/dist.rs`).
     "dist",
     "dist_ctrl",
+    // The ERTS monotonic-time interface constants. They are compile-time constants of the
+    // erts-17.1 interface — byte-identical on every run of every build of that release — so
+    // they are compared for **value**, not merely shape (see
+    // `the_monotonic_time_interface_constants_match_the_oracle`, which re-probes the oracle
+    // and pins the recorded figures).
+    "start_time",
+    "end_time",
 ];
 
 /// Keys for which only the **shape** is comparable: this runtime's own version strings
@@ -146,8 +154,6 @@ const ORACLE_ACCEPTED_UNSUPPORTED_KEYS: &[&str] = &[
     "time_correction",
     "time_warp_mode",
     "tolerant_timeofday",
-    "start_time",
-    "end_time",
     "os_monotonic_time_source",
     "os_system_time_source",
     "cpu_topology",
@@ -563,6 +569,69 @@ fn the_port_limit_matrix_matches_the_oracle() {
             "ERL_MAX_PORTS={value}"
         );
     }
+}
+
+/// The ERTS monotonic-time **interface constants** `system_info(start_time)` /
+/// `system_info(end_time)` — against the live oracle.
+///
+/// These two keys are *not* measured instants and do not come from a time server: they are
+/// compile-time constants of the erts-17.1 monotonic-time interface
+/// (`erts_get_monotonic_{start,end}_time` returning
+/// `make_time_val(ERTS_MONOTONIC_TIME_{START,END}_EXTERNAL)`, `erl_time_sup.c:2148-2158`;
+/// `erl_time.h:312-323`/`403-407`), so every run of every erts-17.1 build answers the same
+/// pair — which is why they are compared for **equality** rather than shape.
+///
+/// The recorded figures are the oracle's own answers, re-probed below so a stale table
+/// cannot pass silently (the same guard `tests/garbage_collect.rs` uses). Oracle:
+/// `erl -noshell -eval 'io:format("~p ~p~n",[erlang:system_info(start_time),erlang:system_info(end_time)]),halt().'`
+/// prints `-576460752000000000 8646911283000000000` — run twice, identical both times.
+const ORACLE_START_TIME: i64 = -576_460_752_000_000_000;
+const ORACLE_END_TIME: i64 = 8_646_911_283_000_000_000;
+
+#[test]
+fn the_monotonic_time_interface_constants_match_the_oracle() {
+    // The values are constants, so they cannot drift between runs — probe twice and require
+    // both runs (and the recorded table) to agree.
+    let expr = "io:format(\"~p ~p~n\", \
+                [erlang:system_info(start_time), erlang:system_info(end_time)]), halt(0).";
+    let expected = format!("{ORACLE_START_TIME} {ORACLE_END_TIME}");
+    for run in 1..=2 {
+        let Some(oracle) = oracle_run(&[], &[], expr) else {
+            eprintln!(
+                "SKIP the_monotonic_time_interface_constants_match_the_oracle: no system `erl`"
+            );
+            return;
+        };
+        assert_eq!(
+            oracle, expected,
+            "the live oracle's answer on run {run} (the recorded ground truth must be re-probed)"
+        );
+    }
+
+    // `end_time` lies outside the 60-bit small range, so the oracle's `make_time_val`
+    // materializes a bignum; pinned so the recorded value cannot be replaced by a truncated
+    // small, and so this runtime's identical choice is checked against the oracle's.
+    let kinds = "io:format(\"~p ~p~n\", \
+                 [abs(erlang:system_info(start_time)) < 1152921504606846976, \
+                  abs(erlang:system_info(end_time)) < 1152921504606846976]), halt(0).";
+    let Some(oracle) = oracle_run(&[], &[], kinds) else {
+        eprintln!("SKIP the_monotonic_time_interface_constants_match_the_oracle: no system `erl`");
+        return;
+    };
+    assert_eq!(
+        oracle, "true false",
+        "the oracle's start_time is a small integer and its end_time a bignum"
+    );
+
+    let rt = Runtime::new(RuntimeConfig::default()).expect("the default runtime");
+    assert_eq!(
+        render(&system_info_value("start_time", &rt).expect("start_time")),
+        ORACLE_START_TIME.to_string()
+    );
+    assert_eq!(
+        render(&system_info_value("end_time", &rt).expect("end_time")),
+        ORACLE_END_TIME.to_string()
+    );
 }
 
 /// `{wordsize, W}` — the second tuple key the oracle answers, and a genuine fact about
