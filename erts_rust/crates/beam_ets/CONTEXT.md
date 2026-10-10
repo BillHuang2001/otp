@@ -721,6 +721,15 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   call-shaped raw tuple inside a `{const, X}` subterm compared against a literal head tuple, and the
   double-tuple unwrap inside a const subterm) — reachable only from hand-written specs, never a wrong
   result for any spec the battery or the oracle probes exercise.
+- **`select_replace/2` on a `duplicate_bag` grows the table arena monotonically until the table is
+  dropped/reset.** Its affected keys are rebuilt from `Table::take`'s checked-out copies
+  (`src/select/exec.rs:692-701`), and `take` **relinquishes** those copies
+  (`src/table/read.rs:291-293`): the words stay valid and are never handed out again but stop counting
+  toward `memory()`, so the arena keeps them until `delete_all_objects`/drop
+  (`src/store/mod.rs:339-355`). Each such call therefore permanently retains one copy of every affected
+  key's objects. It is the price of guaranteeing no replacement ever reads reclaimed storage (a
+  replacement may equal the object it replaces, which `delete_object`'s "remove **every** equal object"
+  rule would then remove). No test asserts boundedness for this path.
 - **`cmp_arith`'s big-integer↔float key comparison is a best-effort `f64` approximation** (a
   pre-existing `beam_term` gap). ERTS compares an integer key against a float key numerically;
   `number_as_f64` rounds an out-of-range bignum to `±inf`. Every representable integer/float pair
