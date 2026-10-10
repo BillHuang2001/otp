@@ -48,6 +48,17 @@
 //!   (`15`, `16`);
 //! * **further timer shapes** — a re-armed port timer whose remaining time must not grow (`17`);
 //! * **a shorter `driver_vec_to_buf/3`** — the truncated linearisation (`18`);
+//! * **the driver-private port queue** — `driver_sizeq/1` on a **fresh** port and the
+//!   `driver_enq`/`driver_pushq`/`driver_peekq`/`driver_deq` round trip, drained back to empty
+//!   (`19`, `20`; see *Known gaps* for the hang a non-empty queue causes);
+//! * **the port state flags** — `get_port_flags/1` reports the frozen `PORT_FLAG_BINARY` for a
+//!   `binary` port (`21`);
+//! * **the port data lock family** — `driver_pdl_create/1` and the `driver_pdl_inc_refc`/
+//!   `driver_pdl_dec_refc`/`driver_pdl_get_refc`/`driver_pdl_lock`/`driver_pdl_unlock` reference
+//!   count shape (`22`, `23`, `24`);
+//! * **the built-in driver name resolution** — `open_port({spawn_driver, "tcp_inet"}, Opts)`
+//!   resolves the name the emulator links in statically to a live driver port
+//!   ([`DRIVER_BUILTIN_MODULE_SOURCE`]; no C fixture);
 //! * **the remaining `ErlDrvTerm` operand tags** — the delivery family over `ERL_DRV_UINT`,
 //!   `ERL_DRV_INT64`, `ERL_DRV_UINT64`, `ERL_DRV_BINARY`, `ERL_DRV_MAP`, `ERL_DRV_TUPLE`,
 //!   `ERL_DRV_STRING_CONS`, `ERL_DRV_BUF2BINARY`, `ERL_DRV_EXT2TERM`, `ERL_DRV_FLOAT` and
@@ -56,7 +67,8 @@
 //!
 //! # The shape of a case
 //!
-//! One shared Erlang module ([`DRIVER_EXTRA_MODULE_SOURCE`]) opens the fixture
+//! Two Erlang modules carry the group. The **fixture** cases use
+//! [`DRIVER_EXTRA_MODULE_SOURCE`], which opens the fixture
 //! (`{spawn_driver, Dir ++ "/driver_extra"}`, with the `erl_ddll` fallback the oracle needs) and
 //! sends a **one-byte selector** through `port_command/2`; the fixture's `output` callback
 //! dispatches on that byte:
@@ -69,12 +81,16 @@
 //!   `term_to_binary/1` image. The C queues the term itself as the message, never a
 //!   `{Port, Term}` wrapper (`io.c:6162-6176`).
 //!
+//! The **built-in-driver** cases use [`DRIVER_BUILTIN_MODULE_SOURCE`], which opens a driver port by
+//! a name the emulator itself owns; they carry no C fixture (`nif: None`), so they need no C
+//! compiler.
+//!
 //! # The observable (honest, never asserted module-side)
 //!
-//! `classify/1` and `classify_term/1` **return exactly what the driver delivered**, encoded as a
-//! stable integer — they never compare against an expectation and never raise. Nothing arriving
-//! within the module's own 2 s bound is the sentinel `-1`. The **golden is the oracle's own
-//! answer** (verified per case with `differential run <id>`), so the corpus self-tests and a
+//! `classify/1`, `classify_term/1` and `probe/1` **return exactly what the runtime did**, encoded
+//! as a stable integer — they never compare against an expectation and never raise. Nothing
+//! arriving within the module's own 2 s bound is the sentinel `-1`. The **golden is the oracle's
+//! own answer** (verified per case with `differential run <id>`), so the corpus self-tests and a
 //! runtime that answers differently is a *differing observable* (a `Mismatch`). Only the surfaces
 //! on which the two runtimes genuinely agree are kept here; every divergence is a documented
 //! handoff (see *Known gaps*), never a corpus case.
@@ -94,30 +110,33 @@
 //!
 //! # Known gaps (why the group is not larger)
 //!
-//! Every slot below is exported by `beam_rt` yet cannot be pinned end to end, because the two
-//! runtimes answer *differently* for a live port — each is a genuine divergence (a handoff to the
-//! owning crate), never a capability gap the group could record as `unsupported`:
+//! Every slot below is exported by `beam_rt` yet cannot be pinned end to end, because either the
+//! two runtimes answer *differently* for a live port (a genuine divergence, a handoff to the owning
+//! crate) or the oracle itself cannot complete the call:
 //!
+//! * **a non-empty driver-private queue at port close hangs the oracle** — `driver_enq` /
+//!   `driver_pushq` leave bytes in `prt->ioq` when the callback returns; measured, the oracle then
+//!   answers the probe but **never exits** (killed after 25 s, exit `137`), so a shape that leaves
+//!   the queue non-empty is unpinnable. Only the round trip that **drains the queue back to empty**
+//!   before returning is pinned (`20`). Owner: the oracle's port-close path, not a runtime gap.
+//! * **`driver_pdl_get_refc(NULL)` SIGSEGVs the oracle** (measured), so the PDL family's
+//!   `NULL`/foreign-handle shapes are unpinnable; only the live-handle create/refcount shapes are
+//!   pinned (`22`, `23`, `24`). Owner: the oracle itself.
 //! * **`ERL_DRV_LIST`** — the C pops the top of the decode stack as the **tail** and conses the
 //!   `n - 1` values below it onto that tail (`io.c:6043-6055`), so a spec of `LIST 2` over the
 //!   stack `[1, 2]` builds the *improper* `[1|2]`; [`beam_abi`'s decoder] builds a **proper** list
 //!   of all `n` values instead (`[1,2]`). Measured: the oracle delivers `[1|2]` (ETF image
 //!   base-256 `620622257615890077016322`) where the Rust runtime delivers `[1,2]`
 //!   (`144495584870658`). Owner: `beam_abi` (`decode_term_spec`).
-//! * **`driver_sizeq/1`** — on a freshly opened driver port the oracle answers `0` (an empty
-//!   output queue) where the Rust runtime answers a non-zero size, so no queue-family shape (and
-//!   the `driver_pushq`/`driver_peekq`/`driver_deq` round trip built on it) can agree. Owner:
-//!   `beam_rt` / `beam_io` (`crates/beam_rt/src/port/driver.rs`).
 //! * **`driver_dl_open/1` + `driver_dl_close/1`** — the oracle **aborts the whole VM** (a core
 //!   dump) on `driver_dl_open(NULL)` followed by `driver_dl_close/1` (measured), so the
 //!   dynamic-loading round trip is unpinnable end to end. The refusal half (`driver_dl_open/1` on
 //!   a non-library path answers `NULL` with a message in `driver_dl_error/0`) is already pinned by
 //!   [`super::driver_abi`]'s selector `49`. Owner: `beam_abi` / the oracle itself.
 //! * **the process-monitor family** (`driver_monitor_process` / `driver_demonitor_process` /
-//!   `driver_get_monitored_process` / `driver_compare_monitors`) and the **port data lock**
-//!   (`driver_pdl_*`) — `beam_rt`'s driver host leaves every hook at its `DriverHost` default
-//!   (`beam_abi::driver::host::DriverHost::monitor_process`/`pdl_create` answer `None`), so the
-//!   oracle creates a monitor/PDL the Rust runtime refuses. Owner: `beam_rt` / `beam_io`.
+//!   `driver_get_monitored_process` / `driver_compare_monitors`) — `beam_rt`'s driver host leaves
+//!   its hooks at the `DriverHost` default (`monitor_process` answers `None`), so the oracle
+//!   creates a monitor the Rust runtime refuses. Owner: `beam_rt` / `beam_io`.
 //! * **`erl_drv_time_offset/1`'s absolute value** — the C reports the real monotonic↔system
 //!   offset, the Rust runtime anchors monotonic time on the system clock and so reports `0`; only
 //!   its unit consistency is pinned (`4`, `9`), never the magnitude. Owner: `beam_rt` / `beam_abi`.
@@ -129,8 +148,8 @@
 //! # Skip policy (contract A.4 needs host tools, like A.3)
 //!
 //! A C-compiled fixture needs a C compiler *and* the host `erl_driver.h`; when either is missing
-//! the harness reports `Verdict::Skipped` with a loud reason — never a pass.
-
+//! the harness reports `Verdict::Skipped` with a loud reason — never a pass. The built-in-driver
+//! cases carry no fixture, so they are not subject to that skip.
 use super::{Case, CaseKind, Contract, Golden, ModuleRun};
 use crate::module_build::NifFixture;
 
@@ -452,8 +471,99 @@ static int chk_vec_to_buf_prefix(void) {
     return driver_vec_to_buf(&ev, out, 3) == 3 && memcmp(out, "wxy", 3) == 0;
 }
 
-/* -- the ErlDrvTerm *delivery* family over the remaining operand tags ----------------------- */
+/* -- the driver-private port queue (`driver_enq` / `driver_pushq` / `driver_sizeq` /
+ *    `driver_peekq` / `driver_deq`) ---------------------------------------------------------- */
 
+/* A **fresh** driver port's private queue is empty: `driver_sizeq` answers `0`
+ * (`io.c:6827-6834`). */
+static int chk_sizeq_fresh(extra_state *st) {
+    return driver_sizeq(st->port) == 0;
+}
+
+/* The queue round trip: `driver_enq` appends at the tail, `driver_pushq` prepends at the head,
+ * `driver_peekq` reports one iovec entry per enqueue and `driver_deq` drops from the head —
+ * answering the bytes that **remain** (`io.c:6807-6813`), or `(ErlDrvSizeT) -1` for a request
+ * larger than the queue (`io.c:6810`).
+ *
+ * The queue is drained back to **empty** before the callback returns: a driver that leaves its
+ * private queue non-empty at port close makes the oracle hang (measured — see *Known gaps*), so
+ * only the fully drained round trip is pinnable. */
+static int chk_queue_round_trip(extra_state *st) {
+    SysIOVec *iov;
+    int vlen = -1;
+    if (driver_enq(st->port, "abc", 3) != 0)
+        return 0;
+    if (driver_sizeq(st->port) != 3)
+        return 0;
+    if (driver_pushq(st->port, "de", 2) != 0)
+        return 0;
+    if (driver_sizeq(st->port) != 5)
+        return 0;
+    iov = driver_peekq(st->port, &vlen);
+    if (iov == NULL || vlen != 2)
+        return 0;
+    if (iov[0].iov_len != 2 || iov[1].iov_len != 3)
+        return 0;
+    if (memcmp(iov[0].iov_base, "de", 2) != 0 || memcmp(iov[1].iov_base, "abc", 3) != 0)
+        return 0;
+    if (driver_deq(st->port, 2) != 3)
+        return 0;
+    if (driver_deq(st->port, 99) != (ErlDrvSizeT) -1)
+        return 0;
+    if (driver_sizeq(st->port) != 3)
+        return 0;
+    if (driver_deq(st->port, 3) != 0)
+        return 0;
+    return driver_sizeq(st->port) == 0;
+}
+
+/* -- the port state flags (`get_port_flags`) ------------------------------------------------- */
+
+/* `get_port_flags` reads the port **state** bits, not `prt->control_flags` (`io.c:5325-5344`): a
+ * port opened with the `binary` option reports the frozen `PORT_FLAG_BINARY` (1) and nothing else. */
+static int chk_port_flags_binary(extra_state *st) {
+    return get_port_flags(st->port) == PORT_FLAG_BINARY;
+}
+
+/* -- the port data lock family (`driver_pdl_*`) ---------------------------------------------- */
+
+/* A valid port admits exactly one data lock and its handle is non-null (`io.c:6717-6734`). */
+static int chk_pdl_create(extra_state *st) {
+    return driver_pdl_create(st->port) != NULL;
+}
+
+/* A fresh PDL's reference count is 1 on creation (`pdl_init_refc`, `io.c:6634-6638`), and
+ * `inc_refc`/`dec_refc` return the value *after* the change (`pdl_inctest_refc`/`pdl_dectest_refc`,
+ * `io.c:6655-6678`). */
+static int chk_pdl_refc_inc_dec(extra_state *st) {
+    ErlDrvPDL pdl = driver_pdl_create(st->port);
+    if (pdl == NULL)
+        return 0;
+    if (driver_pdl_get_refc(pdl) != 1)
+        return 0;
+    if (driver_pdl_inc_refc(pdl) != 2)
+        return 0;
+    if (driver_pdl_dec_refc(pdl) != 1)
+        return 0;
+    return driver_pdl_get_refc(pdl) == 1;
+}
+
+/* `driver_pdl_lock` raises the count **before** taking the lock and `driver_pdl_unlock` lowers it
+ * **after** releasing it, so the count reads one higher for the duration of the critical section
+ * (`io.c:6736-6757`). */
+static int chk_pdl_lock_unlock_refc(extra_state *st) {
+    ErlDrvPDL pdl = driver_pdl_create(st->port);
+    int ok;
+    if (pdl == NULL)
+        return 0;
+    ok = (driver_pdl_get_refc(pdl) == 1);
+    driver_pdl_lock(pdl);
+    ok = ok && (driver_pdl_get_refc(pdl) == 2);
+    driver_pdl_unlock(pdl);
+    return ok && (driver_pdl_get_refc(pdl) == 1);
+}
+
+/* -- the ErlDrvTerm *delivery* family over the remaining operand tags ----------------------- */
 static void ex_send(extra_state *st, ErlDrvTermData *spec, int len) {
     (void) erl_drv_output_term(driver_mk_port(st->port), spec, len);
 }
@@ -592,6 +702,14 @@ static void ex_dispatch(extra_state *st, unsigned char sel) {
     case 16: ex_answer(st, chk_select_rearm_idempotent(st)); break;
     case 17: ex_answer(st, chk_timer_rearm_shrinks(st)); break;
     case 18: ex_answer(st, chk_vec_to_buf_prefix()); break;
+    /* The driver-private queue family (drained to empty), the port state flags and the port data
+     * lock family. */
+    case 19: ex_answer(st, chk_sizeq_fresh(st)); break;
+    case 20: ex_answer(st, chk_queue_round_trip(st)); break;
+    case 21: ex_answer(st, chk_port_flags_binary(st)); break;
+    case 22: ex_answer(st, chk_pdl_create(st)); break;
+    case 23: ex_answer(st, chk_pdl_refc_inc_dec(st)); break;
+    case 24: ex_answer(st, chk_pdl_lock_unlock_refc(st)); break;
     /* The delivery family: nothing is answered through the byte channel — the delivered term is
      * the observable. */
     case 100: ex_deliver(st, 0); break;
@@ -667,6 +785,51 @@ const DRIVER_EXTRA: NifFixture = NifFixture::CompiledLibrary {
     c_source: DRIVER_EXTRA_C,
 };
 
+/// The embedded Erlang half of the **built-in-driver** sub-family: open a driver port by the name
+/// the emulator links in statically, and encode the open/resolution shape as a stable integer.
+///
+/// `tcp_inet` is one of the oracle's statically linked drivers
+/// (`erts/emulator/drivers/common/inet_drv.c:1348`), so the C resolves `{spawn_driver, "tcp_inet"}`
+/// against its **loaded-driver list** rather than a `.so` (`io.c:599-628`). The Rust runtime must
+/// resolve the same name the same way. The module compares nothing and asserts nothing: it encodes
+/// what it observed, so a runtime that resolves differently reports a differing integer (a visible
+/// divergence), never an exit-code-only difference. A refused/raised open is caught and encoded as
+/// `-1` for the same reason.
+///
+/// This sub-family needs **no** C fixture: it drives a name the emulator itself owns.
+const DRIVER_BUILTIN_MODULE_SOURCE: &str = r#"-module(driver_builtin).
+-export([probe/1]).
+
+%% Open a built-in emulator driver port and encode the observed open/resolution shape as an integer.
+%%
+%% Nothing is compared here. The integer is the observed shape, so the harness's diff against the
+%% oracle is honest; a failed open is caught and encoded rather than raised, so a runtime that cannot
+%% resolve the name still reports a stable integer.
+probe(N) ->
+    try
+        P = open_port({spawn_driver, "tcp_inet"}, opts(N)),
+        Shape = shape(P),
+        _ = (catch erlang:port_close(P)),
+        Shape
+    catch
+        _:_ -> -1
+    end.
+
+%% The option list a case drives.
+opts(1) -> [];
+opts(_) -> [binary].
+
+%% The observable shape of a resolved built-in driver port:
+%%   * 1 — a live port which reports `tcp_inet` as its registered driver name;
+%%   * 0 — a live port whose name is not `tcp_inet` (a wrong resolution);
+%%   * -1 — no port at all (a refused or raised open, encoded by `probe/1`).
+shape(P) ->
+    case is_port(P) andalso erlang:port_info(P, name) =:= {name, "tcp_inet"} of
+        true -> 1;
+        false -> 0
+    end.
+"#;
+
 /// Build one module-run case over [`DRIVER_EXTRA_MODULE_SOURCE`] with [`DRIVER_EXTRA`] as its
 /// `.so`.
 ///
@@ -720,12 +883,43 @@ fn module_case(
     }
 }
 
+/// One module-run case over [`DRIVER_BUILTIN_MODULE_SOURCE`]: it opens a **built-in** emulator
+/// driver port by name and needs no C fixture (`nif: None`).
+///
+/// `golden` is the **oracle's own** integer answer for `arg`, verified per case with
+/// `differential run <id>`.
+fn builtin_case(
+    id: &'static str,
+    description: &'static str,
+    arg: &'static [i64],
+    golden: &'static str,
+) -> Case {
+    Case {
+        id,
+        description,
+        contracts: &[Contract::DriverAbi, Contract::BeamAsm],
+        kind: CaseKind::Module(ModuleRun {
+            source: DRIVER_BUILTIN_MODULE_SOURCE,
+            module: "driver_builtin",
+            function: "probe",
+            arity: 1,
+            args: arg,
+            nif: None,
+        }),
+        golden: Golden {
+            stdout: Some(golden),
+            exit_code: 0,
+        },
+    }
+}
+
 /// The widened A.4 group: one case per driver C ABI surface the two runtimes drive identically.
 ///
 /// Every golden is the oracle's own answer (the status byte `'1'` is `49`; a delivery case's
-/// golden is the base-256 value of the delivered term's canonical ETF image): each case reports
-/// the driver-backed port's real behaviour, so a runtime that answers otherwise is a `Mismatch` —
-/// which is why only the agreeing surfaces appear here (see the module docs' *Known gaps*).
+/// golden is the base-256 value of the delivered term's canonical ETF image; a built-in-driver
+/// case's golden is the observed open/resolution shape): each case reports the driver-backed
+/// port's real behaviour, so a runtime that answers otherwise is a `Mismatch` — which is why only
+/// the agreeing surfaces appear here (see the module docs' *Known gaps*).
 pub(crate) fn group() -> Vec<Case> {
     vec![
         case(
@@ -834,6 +1028,42 @@ pub(crate) fn group() -> Vec<Case> {
             "driver_extra/driver_vec_to_buf_linearises_a_shorter_prefix",
             "driver_vec_to_buf/3 copies only the requested prefix of a vector",
             &[18],
+            "49",
+        ),
+        case(
+            "driver_extra/driver_sizeq_is_zero_on_a_fresh_port",
+            "driver_sizeq/1 answers 0 for a freshly opened driver port's empty private queue",
+            &[19],
+            "49",
+        ),
+        case(
+            "driver_extra/driver_queue_enq_pushq_peekq_deq_round_trip",
+            "driver_enq/3 appends, driver_pushq/3 prepends, driver_peekq/2 chunks per enqueue and driver_deq/2 drains from the head, answering the remaining size",
+            &[20],
+            "49",
+        ),
+        case(
+            "driver_extra/driver_get_port_flags_reports_the_binary_stream_flag",
+            "get_port_flags/1 reports the port state's PORT_FLAG_BINARY (1) for a `binary` port",
+            &[21],
+            "49",
+        ),
+        case(
+            "driver_extra/driver_pdl_create_answers_a_non_null_handle",
+            "driver_pdl_create/1 admits one port data lock for a valid port and answers a non-null handle",
+            &[22],
+            "49",
+        ),
+        case(
+            "driver_extra/driver_pdl_reference_count_follows_inc_and_dec",
+            "a fresh PDL's driver_pdl_get_refc/1 is 1 and driver_pdl_inc_refc/1 / driver_pdl_dec_refc/1 return the value reached",
+            &[23],
+            "49",
+        ),
+        case(
+            "driver_extra/driver_pdl_lock_raises_and_unlock_lowers_the_reference_count",
+            "driver_pdl_lock/1 raises the count before locking and driver_pdl_unlock/1 lowers it after unlocking",
+            &[24],
             "49",
         ),
         delivery_case(
@@ -962,23 +1192,44 @@ pub(crate) fn group() -> Vec<Case> {
             &[120],
             "619925890775301805309952",
         ),
+        builtin_case(
+            "driver_extra/builtin_tcp_inet_resolves_to_a_live_port",
+            "open_port({spawn_driver,\"tcp_inet\"},[]) resolves the built-in driver name to a live port whose name is tcp_inet",
+            &[1],
+            "1",
+        ),
+        builtin_case(
+            "driver_extra/builtin_tcp_inet_resolves_with_the_binary_option",
+            "open_port({spawn_driver,\"tcp_inet\"},[binary]) resolves the built-in driver name to a live port whose name is tcp_inet",
+            &[2],
+            "1",
+        ),
     ]
 }
-
 #[cfg(test)]
 mod tests {
     //! Invariants of the widened A.4 group: every case is a module-run case claiming
     //! [`Contract::DriverAbi`], it drives the shared module with the real C fixture, and its
     //! golden is the oracle's integer answer for its one selector byte.
 
-    use super::{group, CaseKind, Contract, NifFixture};
+    use super::{group, CaseKind, Contract, ModuleRun, NifFixture};
     use std::collections::HashSet;
 
     /// The one selector family whose observable is a **delivered term** rather than a
     /// `driver_output` status byte, and the module entry point it must drive.
     const DELIVERY_SELECTORS: std::ops::RangeInclusive<i64> = 100..=120;
 
-    /// The module entry point a case drives: `classify/1` for the status family,
+    /// The module name and entry point of the **built-in-driver** sub-family — the cases that open a
+    /// driver name the emulator itself links in, so they carry no C fixture.
+    const BUILTIN_MODULE: &str = "driver_builtin";
+    const BUILTIN_FUNCTION: &str = "probe";
+
+    /// Whether `run` is a built-in-driver case rather than a fixture case.
+    fn is_builtin(run: &ModuleRun) -> bool {
+        run.module == BUILTIN_MODULE
+    }
+
+    /// The module entry point a **fixture** case drives: `classify/1` for the status family,
     /// `classify_term/1` for the `ErlDrvTerm` delivery family.
     fn expected_function(selector: i64) -> &'static str {
         if DELIVERY_SELECTORS.contains(&selector) {
@@ -989,9 +1240,10 @@ mod tests {
     }
 
     #[test]
-    fn every_case_is_a_driver_module_run_over_the_compiled_fixture() {
+    fn every_case_is_a_driver_module_run_over_the_right_fixture() {
         let mut selectors = HashSet::new();
         let mut sources = HashSet::new();
+        let mut builtin = 0;
         for case in group() {
             assert!(
                 case.id.starts_with("driver_extra/"),
@@ -1008,24 +1260,38 @@ mod tests {
             let CaseKind::Module(run) = case.kind else {
                 panic!("case {}: an A.4 case must be a module-run case", case.id);
             };
-            assert_eq!(run.module, "driver_extra", "case {}", case.id);
-            assert_eq!(
-                run.function,
-                expected_function(run.args[0]),
-                "case {}: selector {} must drive its family's entry point",
-                case.id,
-                run.args[0]
-            );
             assert_eq!(run.arity, 1, "case {}", case.id);
-            let Some(NifFixture::CompiledLibrary { name, c_source }) = run.nif else {
-                panic!("case {}: the driver must be a real C-compiled .so", case.id);
-            };
-            assert_eq!(name, "driver_extra", "case {}: the driver name is fixed", case.id);
-            sources.insert(c_source);
+            if is_builtin(&run) {
+                // The built-in-driver sub-family drives a name the emulator owns: it must carry
+                // **no** fixture (a `.so` it never loads would only make the case depend on a C
+                // compiler that it does not need).
+                builtin += 1;
+                assert!(
+                    run.nif.is_none(),
+                    "case {}: a built-in-driver case needs no C fixture",
+                    case.id
+                );
+                assert_eq!(run.function, BUILTIN_FUNCTION, "case {}", case.id);
+            } else {
+                assert_eq!(run.module, "driver_extra", "case {}", case.id);
+                assert_eq!(
+                    run.function,
+                    expected_function(run.args[0]),
+                    "case {}: selector {} must drive its family's entry point",
+                    case.id,
+                    run.args[0]
+                );
+                let Some(NifFixture::CompiledLibrary { name, c_source }) = run.nif else {
+                    panic!("case {}: the driver must be a real C-compiled .so", case.id);
+                };
+                assert_eq!(name, "driver_extra", "case {}: the driver name is fixed", case.id);
+                sources.insert(c_source);
+            }
             assert!(
-                selectors.insert(run.args[0]),
-                "case {}: selector {} is used twice",
+                selectors.insert((run.module, run.args[0])),
+                "case {}: (module {}, selector {}) is used twice",
                 case.id,
+                run.module,
                 run.args[0]
             );
             // The golden is the oracle's own integer answer: it is never asserted module-side.
@@ -1037,10 +1303,14 @@ mod tests {
             );
             assert_eq!(case.golden.exit_code, 0, "case {}", case.id);
         }
-        assert_eq!(selectors.len(), group().len(), "every selector is distinct");
-        assert_eq!(sources.len(), 1, "the group rests on one C fixture");
+        assert_eq!(
+            selectors.len(),
+            group().len(),
+            "every (module, selector) pair is distinct"
+        );
+        assert_eq!(sources.len(), 1, "the fixture sub-family rests on one C fixture");
+        assert_eq!(builtin, 2, "the two built-in-driver cases");
     }
-
     #[test]
     fn the_group_is_materially_larger_than_the_status_family_alone() {
         let cases = group();
@@ -1061,15 +1331,23 @@ mod tests {
 
     /// The status selectors answer the single status byte `'1'` (integer `49`), so their golden is
     /// `49`; the delivery selectors answer the base-256 value of the delivered term's ETF image —
-    /// never `49`.
+    /// never `49`; the built-in-driver cases answer the observed open/resolution shape.
     #[test]
-    fn the_goldens_are_the_status_byte_or_a_delivered_term_value() {
+    fn the_goldens_are_the_status_byte_a_delivered_term_value_or_a_builtin_shape() {
         let mut status = 0;
         let mut deliveries = 0;
+        let mut builtin = 0;
         for case in group() {
             let CaseKind::Module(run) = case.kind else { unreachable!() };
             let golden = case.golden.stdout.unwrap();
-            if DELIVERY_SELECTORS.contains(&run.args[0]) {
+            if is_builtin(&run) {
+                builtin += 1;
+                assert_eq!(
+                    golden, "1",
+                    "case {}: a resolved built-in driver port is the shape 1",
+                    case.id
+                );
+            } else if DELIVERY_SELECTORS.contains(&run.args[0]) {
                 deliveries += 1;
                 assert_ne!(
                     golden, "49",
@@ -1081,10 +1359,10 @@ mod tests {
                 assert_eq!(golden, "49", "case {}: a status selector is the '1' byte", case.id);
             }
         }
-        assert_eq!(status, 18, "the eighteen status selectors");
+        assert_eq!(status, 24, "the twenty-four status selectors");
         assert_eq!(deliveries, DELIVERY_SELECTORS.count(), "one delivery case per selector");
+        assert_eq!(builtin, 2, "the two built-in-driver cases");
     }
-
     /// The delivery family must actually cover the operand tags [`super::driver_abi`] left
     /// unexercised — `ERL_DRV_UINT`, `ERL_DRV_INT64`, `ERL_DRV_UINT64`, `ERL_DRV_BINARY`,
     /// `ERL_DRV_MAP`, a three-arity `ERL_DRV_TUPLE`, `ERL_DRV_STRING_CONS` and `ERL_DRV_EXT2TERM`
