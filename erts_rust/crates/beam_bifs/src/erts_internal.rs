@@ -112,9 +112,7 @@
 //!   shared-term walk, the emulator's internal state and the BEAM code loader).
 //! * Typed gaps *inside* a registered BIF (each returns
 //!   [`crate::error::unsupported_bif`], never a wrong value):
-//!   `map_hashmap_children/1` on a hash-map node (the raw slot walk,
-//!   `erl_map.c:3425-3461`, needs a node-interior accessor the LCA does not expose —
-//!   see its own doc); `flat_size/1` for the divergent representations above.
+//!   `flat_size/1` for the divergent representations above.
 //!   `term_type/1` distinguishes the on-heap (`heap_binary`) from the off-heap
 //!   (`sub_binary`) bitstring by the layout rule itself; the C `refc_binary` name is
 //!   unreachable because a bare `BinRef` header is not `is_bitstring`, so such a term
@@ -124,7 +122,7 @@
 //!   [`map_next_3`]).
 use beam_common::{BeamError, Result};
 use beam_term::prelude::{boxed_val, make_small, signed_value};
-use beam_term::{atom_val, Eterm};
+use beam_term::{atom_val, Eterm, NIL};
 
 use crate::access;
 use crate::arith;
@@ -426,16 +424,23 @@ fn map_to_tuple_keys_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm
 }
 
 /// `erts_internal:map_hashmap_children/1` — the slot values of one hashmap node
-/// (`erl_map.c:3425-3461`). Only the two non-node cases are reproducible here.
+/// (`erl_map.c:3425-3461`).
 ///
 /// The C returns the node's own **in-heap slot words** — every leaf cons cell, every
 /// sub-node term and every collision tuple of the node reached by the argument — in
-/// reverse slot order. Reaching them needs a node-interior accessor: a head-array
-/// node is `[hdr][size][16 slots]`, a bitmap node `[hdr][(size)][n slots]` and a
-/// collision node a plain arityval tuple, and the slot words are pointers into the
-/// existing map. `beam_term::map`'s public surface is pairs-level only
-/// (`map_pairs`/`map_pairs_storage_order`/`map_size`/`map_get`) and this crate
-/// confines `unsafe` to `src/access.rs`, so a node argument stays the typed gap.
+/// **reverse slot order** (`res = CONS(hp, *ptr++, res)` walks the slots forward, so
+/// the last slot ends up first). The argument must be a *map* term; an inner node or
+/// a collision node is only reachable by handing back one of the node terms a
+/// previous call returned (`is_map` accepts the inner-node header too, and
+/// `erl_map.c:3435-3453` carries a branch for each class).
+///
+/// Oracle-pinned (OTP 29.1.1 / erts-17.1; see the module tests):
+/// `map_hashmap_children(#{a => 1, b => 2})` ⇒ `error:badarg` (a flat map),
+/// `map_hashmap_children(1)` ⇒ `error:{badmap, 1}`, and for
+/// `maps:from_list([{N, N} || N <- lists:seq(1, 33)])` the 13-slot head node yields
+/// `[[22|22], #{21 => 21,5 => 5,27 => 27,26 => 26}, …]` — the leaf cons cells are the
+/// very words the map stores, so a consumer (the oracle's `erts_debug:size/1`) sees
+/// the shared leaves.
 fn map_hashmap_children_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let term = args[0];
     if !access::is_map(term) {
@@ -445,7 +450,14 @@ fn map_hashmap_children_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Et
         // `HAMT_SUBTAG_HEAD_FLATMAP` ⇒ the C raises `badarg`.
         return Err(badarg());
     }
-    Err(unsupported_bif())
+    let node = access::hamt_node(term)?;
+    // The C's `while(sz--) res = CONS(hp, *ptr++, res)` conses the slots in
+    // storage order onto the accumulator, so the result lists them reversed.
+    let mut result = NIL;
+    for slot in node.slots {
+        result = ctx.cons(slot, result)?;
+    }
+    Ok(result)
 }
 
 /// The HAMT positional walk's per-call chunk cap, `MAP_SMALL_MAP_LIMIT`
@@ -810,6 +822,7 @@ pub(crate) fn register(reg: &mut BifRegistry) {
 mod tests {
     use super::*;
     use beam_alloc::Heap;
+    use beam_common::ExitReason;
     use beam_process::ProcessId;
     use beam_term::AtomTable;
 
@@ -957,6 +970,193 @@ mod tests {
                 expected_rest,
                 ctx.atoms()
             ));
+        });
+    }
+
+    /// One slot of a hash-map node, as the oracle probe's `shape/1` renders it: a
+    /// leaf kv cons cell (identified by its key, the head of both of its words) or a
+    /// sub-node (identified by its own child count).
+    #[derive(Debug, PartialEq, Eq)]
+    enum Child {
+        Leaf(i64),
+        Node(usize),
+    }
+
+    /// Calls `map_hashmap_children/1` and reads the result **inside** the call's heap
+    /// scope (the returned list and its cons cells are heap terms), reporting each
+    /// slot as a [`Child`].
+    fn child_shapes(ctx: &mut BifContext<'_>, node: Eterm) -> Result<Vec<Child>> {
+        let list = map_hashmap_children_1(ctx, &[node])?;
+        let mut shapes = Vec::new();
+        let mut cell = list;
+        while access::is_list(cell) {
+            let child = access::car(cell);
+            if access::is_list(child) {
+                // A leaf is the map's own `[Key|Value]` cons cell; the probe's maps
+                // store `K => K`, so both words are the key.
+                let head = access::car(child);
+                assert_eq!(access::cdr(child), head, "a leaf is a [K|K] pair");
+                shapes.push(Child::Leaf(signed_value(head)));
+            } else {
+                let inner = map_hashmap_children_1(ctx, &[child])?;
+                shapes.push(Child::Node(list_len(inner)));
+            }
+            cell = access::cdr(cell);
+        }
+        assert!(access::is_nil(cell), "the result is a proper list");
+        Ok(shapes)
+    }
+
+    /// The length of a proper list built by this module.
+    fn list_len(mut cell: Eterm) -> usize {
+        let mut len = 0;
+        while access::is_list(cell) {
+            len += 1;
+            cell = access::cdr(cell);
+        }
+        assert!(access::is_nil(cell), "a proper list");
+        len
+    }
+
+    /// `N => N` integer pairs for `N` in `1..=keys`, inserted in ascending order.
+    fn int_pairs(keys: std::ops::RangeInclusive<i64>) -> Vec<(Eterm, Eterm)> {
+        keys.map(|key| (make_small(key), make_small(key))).collect()
+    }
+
+    /// Oracle probe (OTP 29.1.1 / erts-17.1, `erl` on `PATH`) — the whole pin this
+    /// module's `map_hashmap_children/1` expectations were taken from:
+    ///
+    /// ```text
+    /// erts_internal:map_hashmap_children(#{a => 1, b => 2})       => error:badarg
+    /// erts_internal:map_hashmap_children(#{})                     => error:badarg
+    /// erts_internal:map_hashmap_children(1)                       => error:{badmap,1}
+    /// erts_internal:map_hashmap_children("abc")                   => error:{badmap,"abc"}
+    /// erts_internal:map_hashmap_children({a,b})                   => error:{badmap,{a,b}}
+    /// erts_internal:map_hashmap_children(#{}, x)                  => error:undef
+    /// erts_internal:map_hashmap_children()                        => error:undef
+    ///
+    /// M33 = maps:from_list([{N,N} || N <- lists:seq(1,33)]).
+    ///   length(erts_internal:map_hashmap_children(M33))           => 13
+    ///   [[22|22], #{21=>21,5=>5,27=>27,26=>26}, #{3=>3,16=>16,30=>30},
+    ///    #{11=>11,17=>17,24=>24,14=>14,33=>33}, #{20=>20,6=>6},
+    ///    #{32=>32,1=>1,25=>25,28=>28}, [15|15], #{10=>10,23=>23,9=>9},
+    ///    [8|8], [31|31], #{29=>29,13=>13,2=>2,7=>7}, #{12=>12,19=>19},
+    ///    #{18=>18,4=>4}]
+    ///   children of the level-1 nodes, in the same order:
+    ///     [4, 2, 5, 2, 4, 3, 4, 2, 2]
+    ///
+    /// so the head's slot **storage** order is the reverse of the printed list: the
+    /// C accumulates `res = CONS(hp, *ptr++, res)` while walking forward.
+    /// ```
+    #[test]
+    fn map_hashmap_children_lists_the_head_slots_in_reverse_like_the_oracle() {
+        with_ctx(|ctx| {
+            let map = access::make_map(ctx.heap(), &int_pairs(1..=33)).expect("the map fits");
+            assert!(access::is_hashmap(map));
+            let shapes = child_shapes(ctx, map).expect("a HAMT head node");
+            assert_eq!(
+                shapes,
+                vec![
+                    Child::Leaf(22),
+                    Child::Node(4),
+                    Child::Node(2),
+                    Child::Node(5),
+                    Child::Node(2),
+                    Child::Node(4),
+                    Child::Leaf(15),
+                    Child::Node(3),
+                    Child::Leaf(8),
+                    Child::Leaf(31),
+                    Child::Node(4),
+                    Child::Node(2),
+                    Child::Node(2),
+                ],
+                "the oracle's 13-slot head node for the 33-key map"
+            );
+        });
+    }
+
+    /// The result is the node's own slot words, in reverse storage order — the C's
+    /// `while(sz--) res = CONS(hp, *ptr++, res)` (`erl_map.c:3455-3460`).
+    #[test]
+    fn map_hashmap_children_reverses_the_node_storage_order() {
+        with_ctx(|ctx| {
+            let map = access::make_map(ctx.heap(), &int_pairs(1..=40)).expect("the map fits");
+            let slots = access::hamt_node(map).expect("a head node").slots;
+            let list = map_hashmap_children_1(ctx, &[map]).expect("a HAMT head node");
+            let mut got = Vec::new();
+            let mut cell = list;
+            while access::is_list(cell) {
+                got.push(access::car(cell));
+                cell = access::cdr(cell);
+            }
+            assert!(access::is_nil(cell), "a proper list");
+            let mut expected = slots;
+            expected.reverse();
+            assert_eq!(got, expected, "reverse storage order, same words");
+        });
+    }
+
+    /// A HAMT **inner** node handed straight back (the oracle lets a caller do exactly
+    /// this) is walked like a head node. Oracle pin: for the 40-key map the head's
+    /// slot in **storage** order is `#{18 => 18,4 => 4,34 => 34}`, whose children are
+    /// `[{leaf,34},{leaf,4},{leaf,18}]` in that order.
+    #[test]
+    fn map_hashmap_children_accepts_a_hamt_inner_node() {
+        with_ctx(|ctx| {
+            let map = access::make_map(ctx.heap(), &int_pairs(1..=40)).expect("the map fits");
+            let node = {
+                let slots = access::hamt_node(map).expect("a head node").slots;
+                slots
+                    .into_iter()
+                    .find(|slot| !access::is_list(*slot))
+                    .expect("the 40-key head has sub-nodes")
+            };
+            assert!(access::is_map(node), "an inner node is still is_map");
+            assert!(!access::is_hashmap(node), "but not is_hashmap");
+            let shapes = child_shapes(ctx, node).expect("an inner node is walkable");
+            assert_eq!(
+                shapes,
+                vec![Child::Leaf(34), Child::Leaf(4), Child::Leaf(18)],
+                "the 40-key head's storage-order-first sub-node",
+            );
+        });
+    }
+
+    /// A flat map is `badarg` (the C's `HAMT_SUBTAG_HEAD_FLATMAP` arm) and any other
+    /// term is the structured `{badmap, Term}` — never a fabricated list.
+    #[test]
+    fn map_hashmap_children_rejects_flat_maps_and_non_maps() {
+        with_ctx(|ctx| {
+            let flat = access::make_flatmap(ctx.heap(), &[]).expect("the empty map");
+            assert!(access::is_flatmap(flat));
+            assert!(
+                matches!(
+                    map_hashmap_children_1(ctx, &[flat]),
+                    Err(BeamError::BadArg)
+                ),
+                "a flat map is badarg"
+            );
+
+            let expected_tag = ctx.atom("badmap").unwrap();
+            for term in [make_small(1), ctx.atom("b").unwrap(), ctx.tuple(&[make_small(1)]).unwrap()] {
+                let expected = ctx.tuple(&[expected_tag, term]).unwrap();
+                match map_hashmap_children_1(ctx, &[term]) {
+                    Err(BeamError::Raise(raise)) => {
+                        assert_eq!(raise.reason, ExitReason::Structured);
+                        let reason = raise
+                            .live_reason()
+                            .and_then(|live| live.downcast_ref::<Eterm>())
+                            .copied()
+                            .expect("a live reason term");
+                        assert!(
+                            beam_term::compare::eq(reason, expected, ctx.atoms()),
+                            "expected {{badmap, {term:?}}}"
+                        );
+                    }
+                    other => panic!("expected a raised {{badmap, _}}, got {other:?}"),
+                }
+            }
         });
     }
 

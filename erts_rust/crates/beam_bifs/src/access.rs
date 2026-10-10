@@ -40,10 +40,14 @@
 
 use beam_alloc::Heap;
 use beam_common::{BeamError, Result};
-use beam_term::prelude::{boxed_val, make_boxed, make_header, make_small, signed_value, try_make_small};
+use beam_term::prelude::{
+    boxed_val, is_arity_value, is_boxed_term, make_boxed, make_header, make_small, signed_value,
+    try_make_small,
+};
 use beam_term::{
-    Atom, AtomTable, Eterm, BITSTRING_TAG_MASK, ERL_HEAP_BITS_SIZE, HEADER_ARITY_OFFS,
-    HEADER_FLONUM, HEAP_BITS_SUBTAG, REF_SUBTAG,
+    Atom, AtomTable, Eterm, BITSTRING_TAG_MASK, ERL_HEAP_BITS_SIZE, HAMT_SUBTAG_HEAD_ARRAY,
+    HAMT_SUBTAG_HEAD_BITMAP, HAMT_SUBTAG_NODE_BITMAP, HEADER_ARITY_OFFS, HEADER_FLONUM,
+    HEADER_MAP_SUBTAG_MASK, HEAP_BITS_SUBTAG, REF_SUBTAG,
 };
 
 // ---------------------------------------------------------------------------
@@ -682,6 +686,119 @@ pub(crate) fn map_get(term: Eterm, key: Eterm, atoms: &AtomTable) -> Result<Opti
     Ok(beam_term::map::map_get(term, key, atoms)?)
 }
 
+// ---------------------------------------------------------------------------
+// Hash-map (HAMT) node interiors
+//
+// The frozen node layout is owned by `beam_term::map` (a sibling crate); the
+// accessors below are the crate's read-only view of it, mirroring the C's
+// `hashmap_node_size` / the `hashmap_info` walk's node switch
+// (`erl_map.c:2296-2320`, `erl_map.c:3490-3536`):
+//
+// | node | header | words | layout |
+// |---|---|---|---|
+// | head, 16 slots | `HAMT_SUBTAG_HEAD_ARRAY` | `18` | `[hdr][size][16 slots]` |
+// | head, bitmap | `HAMT_SUBTAG_HEAD_BITMAP(bmp)` | `2 + n` | `[hdr][size][n slots]` |
+// | inner, bitmap | `HAMT_SUBTAG_NODE_BITMAP(bmp)` | `1 + n` | `[hdr][n slots]` |
+// | collision | `make_arityval(n)` | `1 + n` | a tuple of `n` kv cons cells |
+//
+// with `n = popcount(bmp)`. A slot is one **term word**: a leaf cons cell, a
+// sub-node or — at the last level — a collision tuple.
+// ---------------------------------------------------------------------------
+
+/// The class of a hash-map node, read from its header word
+/// (`_HEADER_MAP_SUBTAG_MASK`, `erl_map.h:169`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum HamtNode {
+    /// `HAMT_SUBTAG_HEAD_ARRAY` — the head node with all 16 slots present,
+    /// `[hdr][size][16 slots]`.
+    HeadArray,
+    /// `HAMT_SUBTAG_HEAD_BITMAP(bmp)` — the head node holding only the slots the
+    /// bitmap marks, `[hdr][size][n slots]`.
+    HeadBitmap,
+    /// `HAMT_SUBTAG_NODE_BITMAP(bmp)` — an inner node, `[hdr][n slots]`.
+    InnerBitmap,
+    /// A collision node — a plain `make_arityval(n)` tuple of `n` kv cons cells.
+    Collision,
+}
+
+/// The class of the hash-map node `term` — `None` for anything that is not a
+/// hash-map node (a leaf cons cell, a flat map, an immediate, a tuple, …).
+///
+/// An inner node and a collision node are *not* reachable as an ordinary Erlang
+/// term, but both are returned by [`crate::erts_internal::map_hashmap_children/1`],
+/// which the oracle lets a caller hand straight back to it (`erl_map.c:3425`),
+/// so the classification covers all four classes.
+///
+/// A collision node's header is an arityval, i.e. *not* a map header, so it is
+/// told apart by [`is_arity_value`] after the map-header test fails.
+pub(crate) fn hamt_node_kind(term: Eterm) -> Option<HamtNode> {
+    if !is_boxed_term(term) {
+        return None;
+    }
+    // SAFETY: `term` is a live boxed term (and not a bare header word), so
+    // `boxed_val` points at its header word.
+    let header = unsafe { *boxed_val(term) };
+    if beam_term::is_map_header(header) {
+        match header.raw() & HEADER_MAP_SUBTAG_MASK {
+            HAMT_SUBTAG_HEAD_ARRAY => Some(HamtNode::HeadArray),
+            HAMT_SUBTAG_HEAD_BITMAP => Some(HamtNode::HeadBitmap),
+            HAMT_SUBTAG_NODE_BITMAP => Some(HamtNode::InnerBitmap),
+            // The remaining map tag is the flat map, which has no HAMT interior.
+            _ => None,
+        }
+    } else if is_arity_value(header) {
+        Some(HamtNode::Collision)
+    } else {
+        None
+    }
+}
+
+/// A hash-map node's interior: its class and its slot words in **storage order**,
+/// exactly as the C reads them (`*ptr++`, `erl_map.c:3490-3536`).
+pub(crate) struct HamtNodeView {
+    /// The node's class.
+    pub kind: HamtNode,
+    /// The slot words in storage order (slot `0` first).
+    pub slots: Vec<Eterm>,
+}
+/// Reads the interior of the hash-map node `term` (see [`HamtNode`] for the
+/// layout; `hashmap_node_size`, `erl_map.c:2296-2320`).
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] when `term` is not a well-formed hash-map node — not a
+/// node at all, or a bitmap node with no slot set.
+pub(crate) fn hamt_node(term: Eterm) -> Result<HamtNodeView> {
+    let kind = hamt_node_kind(term).ok_or(BeamError::BadArg)?;
+    let base = boxed_val(term);
+    // SAFETY: `term` is a live boxed hash-map node, so `base` points at its
+    // header word (word 0 of its block).
+    let header = unsafe { *base };
+    // `slots_off` is the word offset of slot 0 (`hashmap_node_size`'s `*nodep`
+    // advancement: the head's `size` word sits between the header and the slots).
+    let (slots_off, count) = match kind {
+        HamtNode::HeadArray => (2usize, 16usize),
+        HamtNode::HeadBitmap | HamtNode::InnerBitmap => {
+            let bitmap = beam_term::map_header_val(header) as u16;
+            let slots_off = if kind == HamtNode::HeadBitmap { 2 } else { 1 };
+            (slots_off, bitmap.count_ones() as usize)
+        }
+        HamtNode::Collision => (1usize, beam_term::header_arity(header)),
+    };
+    if count == 0 {
+        // A bitmap node always has at least one slot and a collision node at
+        // least two (`ASSERT(sz >= 1)` / `ASSERT(sz >= 2)`); a zero-slot header
+        // is malformed, and `count - 1` indexing downstream would underflow.
+        return Err(BeamError::BadArg);
+    }
+    let mut slots = Vec::with_capacity(count);
+    for i in 0..count {
+        // SAFETY: the node owns `slots_off + count` words (the frozen layout
+        // above), so slot `i` lies inside its own live block.
+        slots.push(unsafe { *base.add(slots_off + i) });
+    }
+    Ok(HamtNodeView { kind, slots })
+}
 // ---------------------------------------------------------------------------
 // Native records (`beam_term::record` owns the frozen layout; `erl_record.h`)
 //
