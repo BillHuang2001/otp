@@ -45,7 +45,7 @@ fn atoms() -> AtomTable {
         "d", "x", "y", "ok", ">", "<", "=:=", "=/=", "==", "=<", ">=", "andalso", "orelse",
         "or", "not", "const", "hd", "tl", "length", "abs", "size", "element", "self", "is_integer",
         "is_float", "is_number", "is_atom", "is_list", "is_tuple", "is_binary", "is_bitstring",
-        "is_map", "/", "div",
+        "is_map", "/", "div", "*", "+",
     ] {
         atoms.intern(name);
     }
@@ -741,6 +741,19 @@ fn float(heap: &mut Heap, value: f64) -> Eterm {
     }
 }
 
+/// A positive bignum term on the test heap (an operand outside the default arith
+/// hook's answerable subset; least-significant digit first).
+fn bignum(heap: &mut Heap, digits: &[u64]) -> Eterm {
+    // SAFETY: `alloc_words(big_size_words(digits.len()))` hands back exactly the
+    // exclusively-owned, writable words `write_big` fills, and the heap outlives the
+    // term (it is never reset here).
+    unsafe {
+        let hp = heap
+            .alloc_words(big_size_words(digits.len()))
+            .expect("test heap has room for a bignum");
+        write_big(hp, false, digits)
+    }
+}
 /// A flat-map (`#{…}`, at most `MAP_SMALL_MAP_LIMIT` keys) term on the test heap.
 fn flat_map(heap: &mut Heap, pairs: &[(Eterm, Eterm)], atoms: &AtomTable) -> Eterm {
     let words = map_words_capacity(pairs.len());
@@ -1283,25 +1296,63 @@ fn a_head_map_binds_literal_keys_and_pattern_values() {
 // The guard-error classification over `ets:match_spec_run/2`
 //
 // The run-level mirror of `tests/select.rs`'s P0 guard tests: a guard this runtime
-// CANNOT evaluate is a typed error (the run is `Err`, never a silent `Ok([])`); a
-// guard the ORACLE itself raises merely skips the clause (`Ok([])`).
+// CANNOT evaluate (a capability gap, e.g. the default `ArithHook` refusing bignum
+// arithmetic) is a typed error (the run is `Err`, never a silent `Ok([])`); a guard
+// the ORACLE itself raises merely skips the clause (`Ok([])`); and a guard the
+// default hook CAN evaluate — every float operation — agrees with the oracle.
 // ===========================================================================
 
 #[test]
-fn unevaluable_guard_is_a_typed_error() {
+fn float_guard_arithmetic_is_evaluated_in_a_run() {
     // erl: `ets:match_spec_run([{1,10},{2,20}], ets:match_spec_compile([
-    //      {{'$1','$2'},[{'=:=',{'/',4,2},2.0}],['$1']}]))` -> `[1,2]`
-    // (`4/2` is `2.0`, so the guard holds and the body returns each key). This crate's
-    // default `ArithHook` refuses `/` (its Erlang result is always a float), so the
-    // guard cannot be evaluated: the run is the typed `unsupported_ets` raise — NEVER
-    // `Ok([])`, which would be a silent under-match (the P0 guard-error classification).
+    //      {{'$1','$2'},[{'=:=',{'/',4,2},2.0}],['$1']}]))` -> `[1,2]`, and likewise
+    //      for `[{'=:=',{'*',20,1.5},30.0}]`.
+    // (`4/2` is the float `2.0` and `20 * 1.5` the float `30.0`, so each guard holds
+    // and the body returns each key.) The default `ArithHook` computes those floats, so
+    // the run agrees with the oracle. `=:=` is exact, so this pins the *float* result,
+    // not merely a numeric one.
     let atoms = atoms();
     let mut heap = Heap::new(8192).expect("test heap");
     let head = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+    let input = pair_list(&mut heap, &[(1, 10), (2, 20)]);
+    let body = [at(&atoms, "$1")];
+
     let rhs = float(&mut heap, 2.0);
     let div = call(&mut heap, at(&atoms, "/"), &[make_small(4), make_small(2)]);
     let guard = tup(&mut heap, &[at(&atoms, "=:="), div, rhs]);
+    assert_eq!(
+        run_one(input, head, &[guard], &body, &atoms, &mut heap).unwrap(),
+        vec![make_small(1), make_small(2)],
+        "the float `4/2` guard holds for both elements"
+    );
+
+    let rhs = float(&mut heap, 30.0);
+    let fractional = float(&mut heap, 1.5);
+    let product = call(&mut heap, at(&atoms, "*"), &[make_small(20), fractional]);
+    let guard = tup(&mut heap, &[at(&atoms, "=:="), product, rhs]);
+    assert_eq!(
+        run_one(input, head, &[guard], &body, &atoms, &mut heap).unwrap(),
+        vec![make_small(1), make_small(2)],
+        "the float `20 * 1.5` guard holds for both elements"
+    );
+}
+
+#[test]
+fn a_bignum_arithmetic_operand_is_still_a_typed_error() {
+    // erl: `ets:match_spec_run([{1,10},{2,20}], ets:match_spec_compile([
+    //      {{'$1','$2'},[{'=:=',{'+',1 bsl 200,0},1 bsl 200}],['$1']}]))` -> `[1,2]`
+    // (the guard evaluates to a bignum, so it holds for both elements). The default
+    // `ArithHook` has no bignum arithmetic, so the guard cannot be evaluated: the run
+    // is the typed `unsupported_ets` raise — NEVER `Ok([])`, which would be a silent
+    // under-match (the P0 guard-error classification).
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let head = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
     let input = pair_list(&mut heap, &[(1, 10), (2, 20)]);
+    // 2^200: limb 3 covers bits 192..256, so bit 200 is bit 8 of it.
+    let power = bignum(&mut heap, &[0, 0, 0, 1 << 8]);
+    let sum = call(&mut heap, at(&atoms, "+"), &[power, make_small(0)]);
+    let guard = tup(&mut heap, &[at(&atoms, "=:="), sum, power]);
     let err = run_one(input, head, &[guard], &[at(&atoms, "$1")], &atoms, &mut heap)
         .expect_err("a guard this runtime cannot evaluate is never a silent non-match");
     let raise = err

@@ -63,7 +63,7 @@ fn atoms() -> AtomTable {
 ///
 /// `EXIT` is deliberately **not** in the shared [`atoms`]: the crate reports the
 /// typed `badarg` capability gap when the caller's table has not interned it, and
-/// the pre-existing `arithmetic_outside_the_small_integer_subset_is_a_typed_error`
+/// the pre-existing `float_arithmetic_is_computed_and_bignum_results_are_a_typed_error`
 /// pins that non-interned outcome for a body `{div,1,0}`/`{rem,1,0}` (see the note
 /// there). A real runtime always interns `EXIT` (`beam_rt::boot::CORE_ATOMS`), so
 /// the `EXIT`-body tests below use this table instead of perturbing the shared one.
@@ -155,6 +155,20 @@ fn assert_unsupported_arithmetic(err: BeamError, what: &str) {
             .starts_with("unsupported_ets: match-spec arithmetic"),
         "the raise names the unsupported arithmetic ({what})"
     );
+}
+
+/// Assert a selected body produced exactly the float `expected` (`float` terms are
+/// not renderable, so a test compares the `f64` payload directly).
+fn assert_float(term: Eterm, expected: f64, what: &str) {
+    // SAFETY: `is_float` classifies its argument by its tag/header word only, so it
+    // is sound for any live term.
+    assert!(
+        unsafe { is_float(term) },
+        "{what} must be a float term, not a non-float"
+    );
+    // SAFETY: `is_float` established a live boxed float.
+    let value = unsafe { float_value(term) };
+    assert_eq!(value, expected, "{what} must be the float {expected}");
 }
 
 const KINDS: [TableKind; 4] = [
@@ -746,12 +760,15 @@ fn arithmetic_in_a_guard_matches_the_oracle() {
 }
 
 #[test]
-fn arithmetic_outside_the_small_integer_subset_is_a_typed_error() {
-    // erl: `/` ALWAYS yields a float (`4/2` -> 2.0); `MAX_SMALL + 1` and
-    //      `MAX_SMALL * 2` overflow into bignums; `1 + 1.5` is 2.5. None of those is
-    //      answerable as a small integer by the default hook, so each is the typed
-    //      `unsupported_ets` raise rather than a wrong result. `1 div 0`/`1 rem 0`
-    //      raise `badarg` in the oracle.
+fn float_arithmetic_is_computed_and_bignum_results_are_a_typed_error() {
+    // erl: `/` ALWAYS yields a float (`2/2` -> 1.0, `1/2` -> 0.5); a float operand
+    //      promotes `+`/`*` to a float (`1 + 1.5` -> 2.5, `20 * 1.5` -> 30.0) and
+    //      unary `-` of a float is a float; a float that OVERFLOWS raises
+    //      (`1.0e308 * 1.0e308`); meanwhile `MAX_SMALL + 1` / `MAX_SMALL * 2` still
+    //      overflow into bignums. The default hook answers every float op exactly
+    //      and keeps the *bignum* results (which it cannot materialise) as its typed
+    //      `unsupported_ets` raise rather than a wrong small integer. `div`/`rem`
+    //      by zero raise `badarg` in the oracle.
     let atoms = atoms();
     let mut heap = Heap::new(8192).expect("test heap");
     let mut table = new_table(TableKind::Set);
@@ -760,12 +777,59 @@ fn arithmetic_outside_the_small_integer_subset_is_a_typed_error() {
         .unwrap();
     let head = at(&atoms, "_");
 
-    // `/` — the oracle's result is always a float.
-    let div = call(&mut heap, at(&atoms, "/"), &[make_small(4), make_small(2)]);
-    let err = select_one(&table, head, &[], &[div], &atoms, &mut heap).unwrap_err();
-    assert_unsupported_arithmetic(err, "'/'");
+    // `2/2` is the FLOAT `1.0`, not the integer `1` — and `1/2` is `0.5`.
+    let div = call(&mut heap, at(&atoms, "/"), &[make_small(2), make_small(2)]);
+    let got = select_one(&table, head, &[], &[div], &atoms, &mut heap).unwrap();
+    assert_float(got[0], 1.0, "2/2");
 
-    // Overflow into a bignum (`MAX_SMALL + 1`).
+    let div = call(&mut heap, at(&atoms, "/"), &[make_small(1), make_small(2)]);
+    let got = select_one(&table, head, &[], &[div], &atoms, &mut heap).unwrap();
+    assert_float(got[0], 0.5, "1/2");
+
+    // A float operand promotes `+`/`*` to a float.
+    let fractional = float(&mut heap, 1.5);
+    let sum = call(&mut heap, at(&atoms, "+"), &[make_small(1), fractional]);
+    let got = select_one(&table, head, &[], &[sum], &atoms, &mut heap).unwrap();
+    assert_float(got[0], 2.5, "1 + 1.5");
+
+    let fractional = float(&mut heap, 1.5);
+    let product = call(&mut heap, at(&atoms, "*"), &[make_small(20), fractional]);
+    let got = select_one(&table, head, &[], &[product], &atoms, &mut heap).unwrap();
+    assert_float(got[0], 30.0, "20 * 1.5");
+
+    // Unary `+`/`-` of a float are floats.
+    let fractional = float(&mut heap, 1.5);
+    let negated = call(&mut heap, at(&atoms, "-"), &[fractional]);
+    let got = select_one(&table, head, &[], &[negated], &atoms, &mut heap).unwrap();
+    assert_float(got[0], -1.5, "unary - on 1.5");
+
+    let fractional = float(&mut heap, 1.5);
+    let positive = call(&mut heap, at(&atoms, "+"), &[fractional]);
+    let got = select_one(&table, head, &[], &[positive], &atoms, &mut heap).unwrap();
+    assert_float(got[0], 1.5, "unary + on 1.5");
+
+    // `2 + 2` is still the *small integer* 4 (the integer path is untouched).
+    let sum = call(&mut heap, at(&atoms, "+"), &[make_small(2), make_small(2)]);
+    let got = select_one(&table, head, &[], &[sum], &atoms, &mut heap).unwrap();
+    assert_eq!(got, vec![make_small(4)], "2 + 2 is the small integer 4");
+
+    // A float operation that overflows raises — never an `inf` term.
+    let huge = float(&mut heap, 1.0e308);
+    let overflow = call(&mut heap, at(&atoms, "*"), &[huge, huge]);
+    let err = select_one(&table, head, &[], &[overflow], &atoms, &mut heap).unwrap_err();
+    assert!(
+        matches!(err, BeamError::BadArg),
+        "1.0e308 * 1.0e308 is badarg"
+    );
+
+    // `/` by a zero float raises too.
+    let one = float(&mut heap, 1.0);
+    let zero = float(&mut heap, 0.0);
+    let by_zero = call(&mut heap, at(&atoms, "/"), &[one, zero]);
+    let err = select_one(&table, head, &[], &[by_zero], &atoms, &mut heap).unwrap_err();
+    assert!(matches!(err, BeamError::BadArg), "1.0/0.0 is badarg");
+
+    // A *bignum* result stays the typed `unsupported` gap (`MAX_SMALL + 1`).
     let overflow = call(
         &mut heap,
         at(&atoms, "+"),
@@ -792,18 +856,6 @@ fn arithmetic_outside_the_small_integer_subset_is_a_typed_error() {
     );
     let err = select_one(&table, head, &[], &[overflow], &atoms, &mut heap).unwrap_err();
     assert_unsupported_arithmetic(err, "2 bsl 62");
-
-    // A float operand (`1 + 1.5` is 2.5 in the oracle).
-    let fractional = float(&mut heap, 1.5);
-    let float_sum = call(&mut heap, at(&atoms, "+"), &[make_small(1), fractional]);
-    let err = select_one(&table, head, &[], &[float_sum], &atoms, &mut heap).unwrap_err();
-    assert_unsupported_arithmetic(err, "1 + 1.5");
-
-    // …and unary `+` on a float is refused the same way (it is not the identity
-    // this hook can answer with).
-    let unary_float = call(&mut heap, at(&atoms, "+"), &[fractional]);
-    let err = select_one(&table, head, &[], &[unary_float], &atoms, &mut heap).unwrap_err();
-    assert_unsupported_arithmetic(err, "unary + on 1.5");
 
     // `div`/`rem` by zero — the oracle raises `badarg`.
     for op in ["div", "rem"] {
@@ -897,9 +949,9 @@ impl ArithHook for TruncatingDivHook {
 
 #[test]
 fn a_custom_arith_hook_takes_over_and_the_default_returns() {
-    // The seam `eval` reaches for: with no hook, `/` is outside the default's
-    // small-integer subset (its Erlang result is a float); with one installed, `/`
-    // is whatever the hook answers; clearing it restores the default.
+    // The seam `eval` reaches for: with no hook, `/` answers the float the oracle
+    // computes (`4/2` is `2.0`); with one installed, `/` is whatever the hook
+    // answers; clearing it restores the default.
     let atoms = atoms();
     let mut heap = Heap::new(8192).expect("test heap");
     let mut table = new_table(TableKind::Set);
@@ -909,11 +961,12 @@ fn a_custom_arith_hook_takes_over_and_the_default_returns() {
     let head = at(&atoms, "_");
     let body = call(&mut heap, at(&atoms, "/"), &[make_small(4), make_small(2)]);
 
-    let err = select_one(&table, head, &[], &[body], &atoms, &mut heap).unwrap_err();
-    assert_unsupported_arithmetic(err, "'/' with no hook");
+    let got = select_one(&table, head, &[], &[body], &atoms, &mut heap).unwrap();
+    assert_float(got[0], 2.0, "4/2 with the default hook");
 
     set_arith_hook(Some(Rc::new(TruncatingDivHook) as Rc<dyn ArithHook>));
-    // The custom hook answers `/`; everything else still goes through the default.
+    // The custom hook answers `/` (with a small integer); everything else still goes
+    // through the default.
     let got = select_one(&table, head, &[], &[body], &atoms, &mut heap).unwrap();
     assert_eq!(got, vec![make_small(2)]);
     let product = call(
@@ -927,8 +980,8 @@ fn a_custom_arith_hook_takes_over_and_the_default_returns() {
     );
 
     set_arith_hook(None);
-    let err = select_one(&table, head, &[], &[body], &atoms, &mut heap).unwrap_err();
-    assert_unsupported_arithmetic(err, "'/' after clearing the hook");
+    let got = select_one(&table, head, &[], &[body], &atoms, &mut heap).unwrap();
+    assert_float(got[0], 2.0, "4/2 after clearing the hook");
 }
 
 #[test]
@@ -2526,8 +2579,9 @@ fn ordered_set_merges_arithmetic_key_duplicates_while_hash_kinds_keep_them_disti
 //     of a non-list, `div`/`rem` by zero, `map_get/2` with an absent key, … — makes
 //     the clause fail (`Ok(false)`), with NO error (the C `matchCatch`);
 //   * a guard this runtime CANNOT evaluate (a capability gap, e.g. the default
-//     `ArithHook` refusing `/` or bignum/float arithmetic) is a typed error that is
-//     PROPAGATED, never turned into a silent non-match (workspace `CONTEXT.md` §3).
+//     `ArithHook` refusing bignum arithmetic or a result outside the 60-bit small
+//     range) is a typed error that is PROPAGATED, never turned into a silent
+//     non-match (workspace `CONTEXT.md` §3).
 // ===========================================================================
 
 /// `select` a one-clause spec `{head, [guard], ['$1']}` and return the matched keys.
@@ -2608,17 +2662,20 @@ fn guard_probe_table(atoms: &AtomTable, heap: &mut Heap) -> Table {
 }
 
 #[test]
-fn unevaluable_guard_is_a_typed_error_never_a_silent_non_match() {
-    // oracle (OTP 29 / erts-17.1) on the `{1,10}`/`{2,20}` table, head `{'$1','$2'}`:
-    //   `ets:select(T, [{{'$1','$2'},[{'=:=',{'/',4,2},2.0}],['$1']}])` -> `[1,2]`
-    // `4/2` is `2.0`, so the guard HOLDS for both objects and the body returns each
-    // key. This crate's default `ArithHook` refuses `/` (its Erlang result is always a
-    // float), so the guard cannot be evaluated: every select-family entry must return
-    // the typed `unsupported_ets` raise — never `[]`/`0`/`Ok`, which would be a silent
-    // under-match (the P0 guard-error classification).
+fn a_float_guard_is_evaluated_and_never_a_silent_non_match() {
+    // oracle (OTP 29 / erts-17.1), `ordered_set`, head `{'$1','$2'}`:
+    //   `ets:select(T, [{{'$1','$2'},[{'=:=',{'/',4,2},2.0}],['$1']}])`  -> `[1,2]`
+    //   `ets:select_count(T, …)` (same spec)                             -> `0`
+    //   `ets:select_delete(T, …)` (same spec)                            -> `0`
+    //   `ets:select_replace(T, [{{'$1','$2'},[…],['$_']}])`              -> `2`
+    // `4/2` is the float `2.0`, so the guard HOLDS for both objects and the body
+    // returns each key. The default `ArithHook` computes that float, so every
+    // select-family entry agrees with the oracle. (`=:=` is exact, so an *integer* `2`
+    // would not satisfy the guard: this pins the float result, not merely a numeric
+    // one. The body `'$1'` is no `true`, so nothing is counted or deleted.)
     let atoms = atoms();
     let mut heap = Heap::new(8192).expect("test heap");
-    let mut table = new_table(TableKind::Set);
+    let mut table = new_table(TableKind::OrderedSet);
     table
         .insert(tup(&mut heap, &[make_small(1), make_small(10)]), &atoms)
         .unwrap();
@@ -2629,32 +2686,41 @@ fn unevaluable_guard_is_a_typed_error_never_a_silent_non_match() {
     let rhs = float(&mut heap, 2.0);
     let div = call(&mut heap, at(&atoms, "/"), &[make_small(4), make_small(2)]);
     let guard = exact_guard(&mut heap, &atoms, div, rhs);
-    let spec = compile(spec1(&mut heap, head, &[guard], &[at(&atoms, "$_")]), &atoms).unwrap();
+    let spec = compile(spec1(&mut heap, head, &[guard], &[at(&atoms, "$1")]), &atoms).unwrap();
 
-    assert_unsupported_arithmetic(table.select(&spec, &atoms, &mut heap).unwrap_err(), "'/'");
-    assert_unsupported_arithmetic(
-        table.select_count(&spec, &atoms, &mut heap).unwrap_err(),
-        "'/'",
-    );
-    assert_unsupported_arithmetic(
-        table.select_delete(&spec, &atoms, &mut heap).unwrap_err(),
-        "'/'",
-    );
-    assert_unsupported_arithmetic(
-        table.select_replace(&spec, &atoms, &mut heap).unwrap_err(),
-        "'/'",
+    assert_eq!(
+        table.select(&spec, &atoms, &mut heap).unwrap(),
+        vec![make_small(1), make_small(2)],
+        "the float guard holds for both objects"
     );
     assert_eq!(
-        table.size(),
-        2,
-        "a refused select_delete/select_replace left the table unchanged"
+        table.select_count(&spec, &atoms, &mut heap).unwrap(),
+        0,
+        "the body `'$1'` is not `true`"
     );
+    assert_eq!(
+        table.select_delete(&spec, &atoms, &mut heap).unwrap(),
+        0,
+        "the body `'$1'` is not `true`"
+    );
+
+    // The identity replace body `'$_'` rewrites both matched objects.
+    let replace_spec =
+        compile(spec1(&mut heap, head, &[guard], &[at(&atoms, "$_")]), &atoms).unwrap();
+    assert_eq!(
+        table.select_replace(&replace_spec, &atoms, &mut heap).unwrap(),
+        2,
+        "both objects are replaced by themselves"
+    );
+    assert_eq!(table.size(), 2, "the objects are unchanged");
 }
 
 #[test]
 fn an_oracle_raising_guard_skips_the_clause_without_an_error() {
-    // The A1-vs-A2 distinction: A1's `/` guard is a *capability gap* (typed error);
-    // the guards here RAISE in the ORACLE itself, so the clause is merely unmet and
+    // The oracle-raise rule (its companion
+    // `a_float_guard_is_evaluated_and_never_a_silent_non_match` pins the other
+    // direction — a guard this runtime CAN evaluate): the guards here RAISE in the
+    // ORACLE itself, so the clause is merely unmet and
     // the whole call succeeds with an empty/zero result. oracle (OTP 29 / erts-17.1)
     // on `{1,10}`/`{2,20}`, head `{'$1','$2'}`:
     //   `{'=:=',{element,9,'$1'},1}`  -> select `[]`, select_count `0`, select_delete `0`
