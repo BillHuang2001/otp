@@ -209,13 +209,11 @@ valve **only** for the documented off-heap-payload capability gap, where the ori
 because it cannot be duplicated.
 
 ### Remaining gaps (owner per link)
-1. **`beam_engine`.** `Instr::Apply`/`ApplyLast` (`families/funs.rs::apply_target`) dispatch through the
-   synchronous `call_bif` instead of the `resolve_external_call`/`Step::Enter` seam, so a **scheduled**
-   process's `gen_server:call` to the native `file_server_2` service folds into `error::blocked()`
-   instead of suspending (a boot `{apply, …}` directive is unaffected — it runs in a non-slice machine
-   with a blocking-aware entry). A `func_info`-driven raise also carries an EMPTY
-   `Raise.stacktrace.frames`, so a boot-path `function_clause` is unlocalizable; and a native service
-   hosts no engine, so the `{get_until,…}` io request (`erl_scan:tokens/4`) cannot be served here.
+1. **`beam_engine`'s `call_fun` arm + `beam_rt`'s `apply_fun`.** A **scheduled** process's `file:*` call reaches the native `file_server_2` service through `gen:call/4`'s `do_for_proc/2`, which applies a **fun**.
+   That apply is `call_fun` → `ExecutionContext::apply_fun` → `../context/mod.rs::run_label_blocking`, a **value**-returning seam that a slice context may not pump, so the closure's blocking `receive` folds into the typed `error::blocked()` instead of suspending (pinned by `../context/mod.rs::blocking_fun_apply`'s control case).
+   The `apply`/`apply_last` opcode family has no such gap: `families/funs.rs::apply_target` consults `ExecutionContext::resolve_external_call` first and enters a resolved callee **in-machine**.
+   A boot `{apply, …}` directive and the `-eval` path are unaffected — both run on a blocking-aware, pump-capable entry.
+   The boot-logger gap is the separate `call_ext`-encoded `erlang:apply/2,3` one, recorded in the crate `CONTEXT.md` (`## Notes for Agents`, `## Known Issues`) and not repeated here.
 2. **`beam_rt` `../native.rs`** — the io-device read path completes from library code
    (`file:read/2`, `io:scan_erl_exprs/4`, `io:parse_erl_exprs/4`); only `file:read_line/1`'s
    `{get_line,…}` request is still the typed `unsupported` gap (the served device surface is
