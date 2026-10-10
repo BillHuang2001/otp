@@ -345,12 +345,13 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
 - `tests/copy.rs` — the flat-copy correctness evidence: nested-graph equality, a `100_000`-element
   deep list (no stack overflow), literal sharing by identity, MSO refcount + slot rewrite, heap
   exhaustion ⇒ `AllocKind::Message`, and a 40-key HAMT map copied as a whole trie.
-- `tests/classes.rs` — **term-class completeness**: every class copied and asserted `=:=` (or via the
-  `thing` accessors for external things): immediates; proper and improper cons lists; tuples/records
-  (nested + the shared zero-arity literal); flat map and HAMT map (head-array/head-bitmap/inner-node +
-  collision tuples); on-heap bitstrings (aligned + non-aligned); refc binary; MSO container; all three
-  fun kinds (the External case pins the widened 4-word `[header, module, function, arity]` block, incl.
-  the true-arity word); external pid/port/ref.
+- `tests/classes.rs` — **term-class completeness for the off-heap-free classes**: immediates; proper
+  and improper cons lists; tuples (nested + the shared zero-arity literal) and a native `RECORD_SUBTAG`
+  record; flat map and HAMT map (head-bitmap/inner-node); all three fun kinds (the External case pins
+  the widened 4-word `[header, module, function, arity]` block, incl. the true-arity word); on-heap
+  bitstrings (byte-aligned + non-byte-aligned). The off-heap classes are covered by their own files:
+  refc binary → `binary.rs`, MSO container → `copy.rs`/`sizing.rs`, external pid/port/ref →
+  `external.rs`. **Not covered by any copy test:** boxed float, bignum, and HAMT collision tuples.
 - `tests/guards.rs` — **non-term and cycle guards + the relocation invariant**: `is_shared`/`shallow`
   reject every bare header word (incl. `THE_NON_VALUE`/`HEADER_SUB_BITS`) with a typed `BadArg` and
   write nothing; a forged cyclic graph (self-cons, self-tuple, 2-cell, 100-cell) returns a typed
@@ -494,6 +495,16 @@ dominates the small shapes.)
 - **Scheduler coupling is absent by design.** `Queue` is a pure FIFO; selective-receive waiting,
   `after`, the save queue, signal/priority ordering and the message-queue length semantics of
   `ErtsSignalPrivQueues` are `beam_process`'s.
+- **No logical-size / reduction-accounting surface.** `Message` exposes no size accessor (no
+  `logical_size()`/word count); a host that must charge the sender's message-copy reductions or
+  report a message's size derives it itself — `beam_term::size_object(payload)` for a heap-resident
+  payload, `Fragments::total_used_words()` for a fragment-resident one. The C sender charge is
+  `size_object_litopt(message) / ERTS_MSG_COPY_WORDS_PER_REDUCTION` (64 release; `erl_message.c:881-886`;
+  same at `erl_proc_sig_queue.c:2284-2289`) plus a fixed 4 (`bif.c:2742`/`:2862`), in **heap words**:
+  an off-heap refc binary contributes only its 8-word `[BinRef][ErlSubBits]` handle (`copy.c:219-242`),
+  **not** its payload length. A payload's logical byte size is charged to the *holder's* virtual
+  binary heap (`bin_vheap`, `erl_gc.c:3046,3051`) / `virtual_reds` (`erl_process.c:9678`), a separate
+  mechanism this crate does not model.
 - **`Message.token` is a plain field (`NIL` when absent).** The seq-trace / distribution-token
   machinery that fills it is `beam_dist`/`beam_rt`.
 - **The binary/node lists are carried but not yet consumed.** `beam_process`/`beam_rt` must own a
@@ -501,6 +512,13 @@ dominates the small shapes.)
   today nothing sweeps them, the `Message`'s own `Drop` releases them. A **fragmented** message instead
   leaves those lists empty: its payload's off-heap objects live in the fragment's `off_heap` table until
   `Fragments::move_into` hands them to the destination table.
+- **Copy-coverage gap: boxed floats and bignums are never exercised.** No test under `tests/` builds or
+  copies a `HEADER_FLONUM` float or a `HEADER_POS_BIG`/`HEADER_NEG_BIG` bignum (the only appearance of a
+  float header is the *bare non-term* `HEADER_FLONUM` in `guards.rs`), so the copier's generic
+  `object_words`+`copy_nonoverlapping` arm is untested for those two classes. The LCA sizes them
+  correctly (`beam_term::layout::object_words`'s default arm = `thing_arityval + 1`, i.e. `2` for a
+  flonum and `big_size_words(n)` for a bignum), but a regression there would not be caught. HAMT
+  *collision* tuples are likewise unexercised (`copy.rs` deliberately does not force one).
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude` (incl. `is_message_heap_exhaustion`)
 - `src/copy.rs` → the iterative `copy_struct` engine (the `unsafe` core) + `CopyContext` + the cycle-safe `preflight_words`/`bounded_words`/`is_acyclic` + `size_of_copy`
