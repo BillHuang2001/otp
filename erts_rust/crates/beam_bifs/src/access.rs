@@ -547,10 +547,13 @@ pub(crate) fn bitstring_bits(term: Eterm) -> Result<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
-// Flat maps (`beam_term::thing` owns the layout)
+// Maps (`beam_term::map` owns both layouts: flat map and HAMT hash map)
 //
-// Reserved for the `maps` module BIFs, which land later; every item is exercised by
-// the tests below until then (hence the `#[allow(dead_code)]`).
+// `is_flatmap`/`is_hashmap`/`make_flatmap`/`flatmap_pairs` are the flat-map half of
+// this surface and keep their original shapes for existing callers; the `map_*`/
+// `make_map` items below handle **both** representations (the crate's `maps` BIFs
+// need a map with more than `MAP_SMALL_MAP_LIMIT` distinct keys to be a real HAMT,
+// not a `system_limit`).
 // ---------------------------------------------------------------------------
 
 /// `is_flatmap(x)` — a flat map (a small map), as opposed to a hashmap.
@@ -562,10 +565,7 @@ pub(crate) fn is_flatmap(x: Eterm) -> bool {
     unsafe { beam_term::is_flatmap(x) }
 }
 
-/// `is_hashmap(x)`.
-// A documented part of the `access.rs` surface reserved for dependents: M1 builds no
-// hashmaps (every M1 map is a flat map), so no BIF dispatches on it yet.
-#[allow(dead_code)]
+/// `is_hashmap(x)` — a hash map (a HAMT), i.e. a map above `MAP_SMALL_MAP_LIMIT`.
 #[inline]
 pub(crate) fn is_hashmap(x: Eterm) -> bool {
     // SAFETY: as [`is_flatmap`].
@@ -609,6 +609,77 @@ pub(crate) fn flatmap_pairs(term: Eterm) -> Result<(Vec<Eterm>, Vec<Eterm>)> {
     // alive regardless).
     let (keys, values) = unsafe { beam_term::thing::flatmap_parts(term) };
     Ok((keys.to_vec(), values.to_vec()))
+}
+
+/// Builds a map from `(key, value)` pairs on `heap`, choosing the representation
+/// ERTS does: at most `MAP_SMALL_MAP_LIMIT` (32) **distinct** keys give a flat map
+/// (keys stored in `erts_cmp_flatmap_keys` order), more give a HAMT hash map whose
+/// stored pair order is the oracle's `maps:to_list/1` order.
+///
+/// This is the layout-owning [`beam_term::map::write_map`] behind the crate's map
+/// producers. The pair order of `pairs` is irrelevant: `write_map` sorts a flat map
+/// and places a hash map's keys by `erts_map_hash`, collapsing duplicate keys
+/// **last value wins** in both cases.
+///
+/// The atom table passed to `write_map` is a **fresh empty one**. The builder
+/// consults it only to name atoms in a *tie-break* (`compare::cmp_atoms`, reached
+/// from `cmp`/`eq` for keys whose hashes collide); an unknown name falls back to the
+/// raw atom index, so the result stays deterministic and — because distinct atoms
+/// have distinct indices — never merges two distinct keys. The same substitution
+/// (`beam_abi`'s driver host `map_term`) is used there for the same reason: taking
+/// `ctx.atoms()` alongside `ctx.heap()` would need two simultaneous borrows of
+/// [`BifContext`](crate::context::BifContext).
+///
+/// # Errors
+///
+/// Propagates [`BeamError::Alloc`](beam_common::BeamError::Alloc) when `heap` cannot
+/// fit the block, and the builder's own `TermError` (reconciled to
+/// [`BeamError::BadArg`]) for a malformed key.
+pub(crate) fn make_map(heap: &mut Heap, pairs: &[(Eterm, Eterm)]) -> Result<Eterm> {
+    let atoms = AtomTable::new();
+    let words = beam_term::map::map_words_capacity(pairs.len());
+    // SAFETY: `alloc_words` hands out `words` exclusively-owned, writable words.
+    let p = unsafe { heap.alloc_words(words)? };
+    // SAFETY: `p` is the base of those `words` words; `write_map` writes every word
+    // it needs (the reservation is a documented upper bound, so trailing words may
+    // stay unwritten) and returns a boxed root into the same block, which stays live
+    // and unmoved for as long as `heap` does, which the caller keeps alive.
+    Ok(unsafe { beam_term::map::write_map(p, pairs, &atoms)? })
+}
+
+/// The `(key, value)` pairs of **any** map — flat map or HAMT — in the order the map
+/// **stores** them: a flat map's keys-tuple order, a hash map's HAMT slot traversal
+/// order. That is the order the oracle's `maps:keys/1`, `maps:values/1` and
+/// `maps:to_list/1` report.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] when `term` is not a map.
+pub(crate) fn map_pairs_storage_order(term: Eterm) -> Result<Vec<(Eterm, Eterm)>> {
+    Ok(beam_term::map::map_pairs_storage_order(term)?)
+}
+
+/// The number of keys in **any** map — flat map or HAMT (`erts_map_size`).
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] when `term` is not a map.
+pub(crate) fn map_size(term: Eterm) -> Result<usize> {
+    Ok(beam_term::map::map_size(term, &AtomTable::new())?)
+}
+
+/// The value bound to `key` in **any** map — flat map or HAMT — or `None`.
+///
+/// The key match is the frozen exact (`=:=`) one (`beam_term::map::map_get`), so the
+/// caller must have classified `term` as a map first. `atoms` is the caller's real
+/// table (it decides only the atom-name tie-break inside `=:=`); no heap is involved,
+/// so a BIF can pass `ctx.atoms()` here.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] when `term` is not a map.
+pub(crate) fn map_get(term: Eterm, key: Eterm, atoms: &AtomTable) -> Result<Option<Eterm>> {
+    Ok(beam_term::map::map_get(term, key, atoms)?)
 }
 
 // ---------------------------------------------------------------------------
