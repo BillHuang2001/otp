@@ -92,22 +92,27 @@ Verified against the system `erlc` (OTP 29) disassembly:
 - `../../../tests/gaps.rs:274-322` pins the missing-atom gap (`put_map_assoc/no_fail`,
   `put_map_exact/no_fail`) with a hand-built `Module` + `MinimalContext` (which cannot name the
   tag).
-- `../../../tests/maps.rs` runs the real oracle fixture `../tests/fixtures/mapfx.beam`.
+- `../../../tests/maps.rs` runs the real oracle fixture `../tests/fixtures/mapfx.beam` **both
+  ways**, so the reason term — never just `BeamError::Raise(_)` — is asserted:
+  `exact_with_a_missing_key_raises_badkey` loads it through the **seeded** host
+  (`support::ModuleHost` + `SEED_ATOMS`) and asserts the raise's live reason term
+  (`Raise::live_reason`) is the locally built `{badkey,a}` tuple;
+  `exact_with_a_missing_key_on_an_unseeded_module_is_the_typed_gap` loads it with the private
+  `beam_loader::load_file` table and asserts the exact typed
+  `unsupported_opcode: maps: no 'badkey' atom in the module` (and no reason term). Neither can
+  pass on the other's error.
 - No differential-gate coverage of the compiled instruction path: the `errors/badmap_reason`,
   `errors/badmap_list_value`, `errors/badkey_reason`, `errors/badkey_compound_key` cases are all
   `CaseKind::Eval` (the `maps:get` BIF path), not a compiled `put_map_*`.
 
 ## Known Issues
-- `../../../tests/maps.rs:249-259` (`exact_with_a_missing_key_raises_badkey`) loads the fixture
-  with `beam_loader::load_file` (private table, no `badkey`) and asserts only
-  `matches!(err, BeamError::Raise(_))`. Both the correct `{badkey,a}` raise and the
-  `unsupported` gap error are `BeamError::Raise(_)`, so the test passes either way and does
-  **not** verify the oracle reason; the reason itself is never inspected.
-- Parent docs are stale: `../CONTEXT.md` Handoff #7 (and `../../../../crates/CONTEXT.md`) still
-  describe gap #7 as a live gap "nameable only once #2 lands", while the Handoff-#2 blocker
-  (`CORE_ATOMS` gaining the `error_atom` tail) has landed for host-loaded modules. The
-  still-true part is narrower: a host that loads modules with an unseeded private table gets the
-  typed gap for the `badkey` case.
+- **Nameability is a host load-time obligation** (see "The reason-atom contract" above). A host
+  loading a module with the private, unseeded `beam_loader::load_file` table gets the typed
+  `unsupported` for the `badkey` case — the installed `erlc` interns `badmap` itself (its
+  `test,is_map` guard fail path builds `{badmap,X}`) but not `badkey`. The seeded hosts
+  (`beam_rt::boot::CORE_ATOMS`, the test `SEED_ATOMS`) name both, so the raise is the oracle's
+  `{badkey,Key}`/`{badmap,Source}` exactly. No engine seam resolves a tag outside the running
+  module's table; none should.
 - `lookup`/`position` are O(n) scans (no hash) and `put_map_assoc` is O(n²) in the pair count
   (`write.rs:105`); correct but unoptimised.
 - `write.rs:165` (`put_map_exact: key vanished across the reserve`) is a defensive typed error

@@ -34,11 +34,36 @@
 //! read path can be exercised against an arbitrary frozen node shape; a hashmap the
 //! *engine builds* comes from `put_map_assoc`/`put_map_exact` crossing the flat-map
 //! limit (`beam_term::map::write_map`).
+//!
+//! # The two load paths (atom nameability)
+//!
+//! The engine resolves a raise's tag atom (the `badmap`/`badkey` of a `NO_FAIL`
+//! map update) **only** from the running module's atom table and never
+//! substitutes a foreign index — an atom index is meaningful only against the
+//! table it is read with. Which tag is nameable is therefore a *load-time* host
+//! obligation:
+//!
+//! * [`load`] uses `beam_loader::load_file`'s **private** table — exactly what the
+//!   compiler emitted. The installed `erlc` interns `badmap` itself (its own
+//!   `is_map` guard builds `{badmap,X}`) but **not** `badkey`, so an unseeded
+//!   `put_map_exact` `NO_FAIL` raise is the honest typed gap
+//!   (`tests/maps.rs::exact_with_a_missing_key_on_an_unseeded_module_is_the_typed_gap`).
+//! * [`load_seeded`] loads the *same* fixture through the seeded host
+//!   ([`support::ModuleHost`]), which appends [`support::SEED_ATOMS`] — the
+//!   runtime's globally interned vocabulary, the test analogue of
+//!   `beam_rt::boot::CORE_ATOMS` — so `{badkey,Key}` is nameable and raised
+//!   exactly (`tests/maps.rs::exact_with_a_missing_key_raises_badkey`).
 
-use beam_common::BeamError;
-use beam_engine::{terms, Machine, MinimalContext};
+mod support;
+
+use std::sync::Arc;
+
+use beam_common::{BeamError, ExceptionClass};
+use beam_engine::{terms, ExecutionContext, Machine, MinimalContext};
 use beam_loader::{load_file, Module};
 use beam_term::{cmp, make_atom, make_small, Atom, Eterm};
+
+use support::ModuleHost;
 
 /// The committed oracle fixture (this crate owns it, unlike `slice.beam`).
 const MAPFX_BEAM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mapfx.beam");
@@ -51,12 +76,30 @@ fn atom(module: &Module, name: &str) -> Atom {
         .unwrap_or_else(|| panic!("atom {name:?} not interned in module"))
 }
 
+/// Load the fixture through `beam_loader::load_file`'s **private, unseeded** table
+/// (only what the compiler emitted — see the module docs).
 fn load() -> Module {
     load_file(MAPFX_BEAM).expect("load mapfx.beam")
 }
 
+/// Load the fixture through the **seeded** host ([`ModuleHost`] +
+/// [`support::SEED_ATOMS`]), i.e. with the runtime's globally interned atoms
+/// (`badmap`, `badkey`, …) appended to the module's table — the production
+/// contract `beam_rt::boot::CORE_ATOMS` supplies before any load.
+///
+/// Returns the host (the one shared heap/atom table, kept alive for the run) and
+/// the loaded module.
+fn load_seeded() -> (ModuleHost, Arc<Module>) {
+    let mut host = ModuleHost::new(".");
+    host.register("mapfx", MAPFX_BEAM);
+    let module = host
+        .load("mapfx")
+        .expect("load mapfx.beam through the seeded host");
+    (host, module)
+}
+
 /// A flat map keyed by `entries` (names resolved through `module`'s atom table).
-fn flatmap(ctx: &mut MinimalContext, module: &Module, entries: &[(&str, i64)]) -> Eterm {
+fn flatmap(ctx: &mut dyn ExecutionContext, module: &Module, entries: &[(&str, i64)]) -> Eterm {
     let pairs: Vec<(Eterm, Eterm)> = entries
         .iter()
         .map(|(name, value)| (make_atom(atom(module, name)), make_small(*value)))
@@ -83,6 +126,23 @@ fn entry(map: Eterm, module: &Module, key: &str) -> Option<Eterm> {
         .into_iter()
         .find(|(candidate, _)| cmp(*candidate, target, &module.atom_table).is_eq())
         .map(|(_, value)| value)
+}
+
+/// The **live reason term** an uncaught raise carries out of the machine
+/// ([`beam_common::Raise::live_reason`]), or `None` when the error is not a
+/// term-carrying raise.
+///
+/// An uncaught structured raise (`{badmap,_}`/`{badkey,_}`) rides out as
+/// `ExitReason::Structured` + a live `Eterm` reason; an engine *diagnostic*
+/// (`crate::error::unsupported`) is a bare-atom `Raise` with no term.
+fn live_reason(err: &BeamError) -> Option<Eterm> {
+    match err {
+        BeamError::Raise(raise) => raise
+            .live_reason()
+            .and_then(|live| live.downcast_ref::<Eterm>())
+            .copied(),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -248,14 +308,57 @@ fn exact_updates_an_existing_key() {
 
 #[test]
 fn exact_with_a_missing_key_raises_badkey() {
+    // `mapfx:exact(#{b => 2})` is `put_map_exact` with `no_fail` and key `a`
+    // absent. The oracle raises `error:{badkey,a}` (verified: `erl -noshell -eval
+    // 'mapfx:exact(#{b => 2})'`). The reason is nameable because the seeded host
+    // interns the runtime's globally interned atoms into the module's table, so
+    // the **actual reason term** is asserted here — never just `Raise(_)`.
+    let (mut host, module) = load_seeded();
+    let source = flatmap(&mut host, &module, &[("b", 2)]);
+    let err = host.call("mapfx", "exact", &[source]).unwrap_err();
+
+    let expected = terms::make_tuple(
+        &mut host,
+        &[
+            make_atom(atom(&module, "badkey")),
+            make_atom(atom(&module, "a")),
+        ],
+    )
+    .expect("build the {badkey, a} reason");
+
+    let BeamError::Raise(raise) = &err else {
+        panic!("exact/1 on a map without key `a` must raise, got {err:?}");
+    };
+    assert_eq!(raise.class, ExceptionClass::Error);
+    let reason = live_reason(&err).expect("the {badkey, a} raise carries the live reason term");
+    assert!(
+        cmp(reason, expected, &module.atom_table).is_eq(),
+        "the raise reason must be {{badkey, a}}"
+    );
+}
+
+#[test]
+fn exact_with_a_missing_key_on_an_unseeded_module_is_the_typed_gap() {
+    // The SAME fixture loaded through `beam_loader::load_file`'s **private**
+    // table holds only what the compiler emitted: `badmap` (its own `is_map`
+    // guard's reason) but NOT `badkey`. The engine therefore cannot name
+    // `{badkey,a}` and reports its typed gap — a documented capability limit and
+    // never a fabricated atom index (an index is valid only against the table it
+    // is read with).
     let module = load();
     let mut ctx = MinimalContext::new();
     let source = flatmap(&mut ctx, &module, &[("b", 2)]);
-    // `put_map_exact` carries no fail label, so the reason is `{badkey, a}`.
-    assert!(matches!(
-        run(&mut ctx, &module, "exact", &[source]).unwrap_err(),
-        BeamError::Raise(_)
-    ));
+    let err = run(&mut ctx, &module, "exact", &[source]).unwrap_err();
+    let got = match &err {
+        BeamError::Raise(raise) => raise.reason.as_atom().unwrap_or("<non-atom reason>"),
+        other => panic!("exact/1 on a missing key must raise, got {other:?}"),
+    };
+    println!("GAP: put_map_exact/no_fail (unseeded module) — {got}");
+    assert_eq!(got, "unsupported_opcode: maps: no 'badkey' atom in the module");
+    assert!(
+        live_reason(&err).is_none(),
+        "the typed gap is an engine diagnostic and carries no reason term"
+    );
 }
 
 #[test]
