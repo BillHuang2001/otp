@@ -23,9 +23,12 @@
 //!
 //! A process running as a scheduler slice allocates on **its own**
 //! [`beam_process::Process`] young heap and is collected at the heap-admission point, so its
-//! peak memory is bounded by its live set instead of growing with the loop count. Everything
-//! outside a scheduled slice keeps the runtime's pointer-stable arena, byte for byte as
-//! before — see [`crate::runtime::gc`] for the state, the accounting and the safety valves.
+//! peak memory is bounded by its live set instead of growing with the loop count. That point
+//! also **grows** the nursery when a request is larger than it
+//! ([`Process::ensure_capacity`], the collector's on-demand growth seam) rather than leaving
+//! the request to the arena. Everything outside a scheduled slice keeps the runtime's
+//! pointer-stable arena, byte for byte as before — see [`crate::runtime::gc`] for the state,
+//! the accounting and the safety valves.
 //!
 //! # Why the gate is a *per-call* latch
 //!
@@ -206,12 +209,28 @@ pub(crate) fn scatter_roots(
 }
 
 /// The engine's heap-admission point for a scheduled slice: collect the running process's
-/// own heap when it cannot satisfy `heap_need` more words — or when a `garbage_collect` BIF
-/// asked for one.
+/// own heap when it cannot satisfy `heap_need` more words — **growing** it when the
+/// request is larger than the nursery — or when a `garbage_collect` BIF asked for one.
 ///
 /// `armed` is the slice latch (see the module docs). When it is not set, when the running
 /// process is not collectable, or when the call site's module is not known to be float-free,
 /// this is a no-op — exactly the pre-collector runtime.
+///
+/// # Growth
+///
+/// The collection this runs is the collector's on-demand growth seam
+/// ([`Process::ensure_capacity`]) whenever the process's own heap-size policy can actually
+/// reach `heap_need` — a plain [`Process::collect`] otherwise. The difference is that a
+/// collection sizes the nursery from what it left alive in it, not from what the caller is
+/// about to allocate, so a request larger than the nursery could never be met by collecting
+/// alone: the allocation would fall back to the pointer-stable arena ([`alloc_words`]) on
+/// every round. Growing the now-empty nursery to cover the request is what keeps such a
+/// workload on the process's own — reclaimable — heap.
+///
+/// A policy that genuinely cannot reach `heap_need` (`+hmax N` below it) is the second
+/// branch: `Process::ensure_capacity` refuses such a request **before** collecting, so this
+/// keeps today's behaviour exactly — the same collection runs, and the allocation falls back
+/// to the arena. Never a fabricated collection, never a new failure mode.
 ///
 /// # Forced collections
 ///
@@ -228,8 +247,9 @@ pub(crate) fn scatter_roots(
 ///
 /// This deliberately has **no** failure mode that could reach the program: a collection is
 /// an optimization of an unbounded arena and must never turn a working program into a
-/// failing one. A failed (or mis-sized) collection halts collection for that process
-/// ([`Runtime::halt_process_gc`](crate::runtime::gc)) and reports success.
+/// failing one. A failed (or mis-sized) collection — or a refused grow — halts collection
+/// for that process ([`Runtime::halt_process_gc`](crate::runtime::gc)) and reports success,
+/// leaving the allocation to fall back to the arena exactly as it did before.
 pub(crate) fn ensure_heap(
     ctx: &mut RuntimeContext<'_>,
     heap_need: u32,
@@ -298,7 +318,28 @@ pub(crate) fn ensure_heap(
         return Ok(());
     }
 
-    match process.collect() {
+    // The action: a plain collection, or — when the process's own heap-size policy can
+    // actually reach `heap_need` — the collector's on-demand **growth** seam
+    // ([`Process::ensure_capacity`]), which runs exactly the same collection and then sizes
+    // the now-empty nursery to fit the request. Without this step a request larger than the
+    // nursery could never be met by collecting alone: the allocation would fall back to the
+    // pointer-stable arena ([`alloc_words`]) on every round instead of being reclaimed with
+    // the heap it belongs to.
+    //
+    // `Process::ensure_capacity` fails **fast** — before it collects — when
+    // `HeapPolicy::next_words(need, 0) < need`, i.e. when a bounded policy (`+hmax N`) cannot
+    // reach the request at all. That case keeps today's behaviour exactly: the collection
+    // still runs, and the allocation falls back to the arena — never a fabricated
+    // collection, never a new failure mode. A genuine collection (or growth) failure still
+    // halts only this process's collection, exactly as before.
+    let need = heap_need as usize;
+    let growable = process.collector().policy().next_words(need, 0) >= need;
+    let action = if growable {
+        process.ensure_capacity(need)
+    } else {
+        process.collect()
+    };
+    match action {
         Ok(collection) => {
             runtime.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
         }
