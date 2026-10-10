@@ -29,10 +29,11 @@
     };
 
     use super::*;
+    use crate::decode::Decoder;
     use crate::error::is_unsupported;
     use crate::term::{
         make_big, make_external_pid, make_external_port, make_external_ref, make_flatmap,
-        make_float,
+        make_float, make_internal_ref,
     };
 
     /// A heap large enough for every term a test builds (tests pass a bigger one
@@ -510,6 +511,100 @@
         expected.extend_from_slice(&9u32.to_be_bytes());
         expected.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3]);
         assert_eq!(encode_term_body(r, &atoms).unwrap(), expected);
+    }
+
+    #[test]
+    fn internal_ref_uses_local_node_for_newer_reference_ext() {
+        let mut atoms = AtomTable::new();
+        let sysname = atoms.intern("nonode@nohost");
+        let mut heap = new_heap(1 << 12);
+
+        // The exact `NEWER_REFERENCE_EXT` body: `[90][len = 3:u16 BE][node atom]`
+        // `[creation:u32 BE]` followed by the three big-endian numbers the id packs
+        // into. The numbers come from `ref_wire` (the single place the mapping is
+        // written) — never re-derived here.
+        let expected = |creation: u32, id: u64| {
+            let mut e = vec![90u8];
+            e.extend_from_slice(&3u16.to_be_bytes());
+            e.extend_from_slice(&[119, 13]);
+            e.extend_from_slice(b"nonode@nohost");
+            e.extend_from_slice(&creation.to_be_bytes());
+            for number in crate::ref_wire::ref_id_to_numbers(id) {
+                e.extend_from_slice(&number.to_be_bytes());
+            }
+            e
+        };
+
+        // A high-bit id: the whole identity sits in the third number, and the first
+        // stays below `MAX_REFERENCE` so the local reference is oracle-valid.
+        let high: u64 = 1 << 45;
+        assert_eq!(crate::ref_wire::ref_id_to_numbers(high), [0, 0, 1 << 13]);
+        assert!(crate::ref_wire::ref_id_to_numbers(high)[0] < (1 << 18));
+        let r = make_internal_ref(&mut heap, high).unwrap();
+        let mut encoder = Encoder::new(&atoms).with_local_node(sysname, 0);
+        encoder.encode(r).unwrap();
+        let image = encoder.finish();
+        assert_eq!(image[0], 131);
+        assert_eq!(&image[1..], &expected(0, high)[..]);
+        assert_eq!(
+            image,
+            vec![
+                131, 90, 0, 3, 119, 13, 110, 111, 110, 111, 100, 101, 64, 110, 111, 104, 111,
+                115, 116, // "nonode@nohost"
+                0, 0, 0, 0, // creation = 0
+                0, 0, 0, 0, // n0
+                0, 0, 0, 0, // n1
+                0, 0, 0x20, 0, // n2 = 8192
+            ]
+        );
+
+        // An id spanning all three number slots (with a non-zero creation), encoded
+        // without the version byte.
+        let spread: u64 = (1 << 40) | (1 << 20) | 5;
+        assert_eq!(
+            crate::ref_wire::ref_id_to_numbers(spread),
+            [5, 1 << 20, 1 << 8]
+        );
+        let r = make_internal_ref(&mut heap, spread).unwrap();
+        let mut body_encoder = Encoder::new_body(&atoms).with_local_node(sysname, 7);
+        body_encoder.encode(r).unwrap();
+        let body = body_encoder.finish();
+        assert_eq!(body, expected(7, spread));
+        let mut literal = vec![90u8];
+        literal.extend_from_slice(&3u16.to_be_bytes());
+        literal.extend_from_slice(&[119, 13]);
+        literal.extend_from_slice(b"nonode@nohost");
+        literal.extend_from_slice(&7u32.to_be_bytes());
+        literal.extend_from_slice(&5u32.to_be_bytes());
+        literal.extend_from_slice(&(1u32 << 20).to_be_bytes());
+        literal.extend_from_slice(&(1u32 << 8).to_be_bytes());
+        assert_eq!(body, literal);
+
+        // The image is wire-valid: a plain decode (no local node — the demotion of a
+        // local reference to an internal one is a separate, not-yet-implemented decode
+        // gap) yields an *external* reference, and re-encoding it reproduces the same
+        // three numbers, so nothing here depends on that demotion.
+        let mut decoder = Decoder::new_body(&body);
+        let decoded = decoder.decode(&mut heap, &mut atoms).unwrap();
+        decoder.finish().unwrap();
+        assert!(crate::term::external_ref_parts(decoded).is_ok());
+        assert_eq!(encode_term_body(decoded, &atoms).unwrap(), body);
+    }
+
+    #[test]
+    fn internal_ref_without_a_local_node_is_unsupported() {
+        let atoms = AtomTable::new();
+        let mut heap = new_heap(64);
+        let r = make_internal_ref(&mut heap, 1 << 45).unwrap();
+
+        // Without a local node identity an internal reference has no wire image: its
+        // node atom/creation are the runtime's, and the three numbers alone do not
+        // identify a node.
+        let mut bare = Encoder::new(&atoms);
+        let err = bare
+            .encode(r)
+            .expect_err("an internal ref without a local node is unsupported");
+        assert!(is_unsupported(&err));
     }
 
     #[test]
