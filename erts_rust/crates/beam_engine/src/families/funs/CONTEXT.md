@@ -1,0 +1,54 @@
+# `beam_engine::families::funs` — fun / closure instruction family
+
+## Intent
+Owns the closure and fun-application opcodes of the typed-IR engine:
+`Instr::MakeFun3`, `CallFun`, `CallFun2`, `Apply`, `ApplyLast` (ownership table:
+`../mod.rs:142-147`).
+Builds local closures and dispatches fun/`M:F` application; `apply`/`apply_last` are the
+**dynamic-entry** point of the cross-module-call seam.
+Ground truth (read-only, never modify): `emu/instrs.tab` (`i_make_fun3` :545,
+`i_call_fun`/`i_call_fun_last` :363/:371, `apply`/`apply_last` :298/:306) and
+`beam_common.c` (`call_fun` :1604, `fixed_apply` :1528, `apply` :1433).
+
+## API Surface (`mod.rs`)
+- `pub(crate) fn exec(machine, module, labels, instr, func, pc, ctx) -> Result<Option<Step>>` — `mod.rs:113`; the per-family seam contract (`Ok(Some)` executed / `Ok(None)` not my variant / `Err` raised).
+- `mod.rs:259` `register_args` — collect `x(0)..x(arity-1)`.
+- `mod.rs:302` `apply_target` — the `fixed_apply` shape (`module=x(arity)`, `function=x(arity+1)`).
+- `mod.rs:268` `enum ApplyTarget { Called(Eterm), Enter{context,func,pc}, Raised(Step) }`.
+- `mod.rs:360` `raise_badarg` — catchable `badarg` raise for a non-atom `apply` target.
+- `mod.rs:379` `atom_name` — atom-index → name via the running module's table (typed `BadArg` otherwise).
+- `MakeFun3` (`:125`) builds via `terms::make_fun_rooted`; header arity = `descriptor.arity - num_free`.
+- `CallFun`/`CallFun2` (`:161`/`:176`) route through `ExecutionContext::apply_fun` (host seam; default typed `unsupported`).
+
+## The cross-module call seam (load-bearing — verify here, do not trust summaries)
+- `apply`/`apply_last` resolve their target through `ExecutionContext::resolve_external_call` **FIRST** (`mod.rs:330`), which answers with the callee's **shared `Arc<Module>`** + its export entry `Label`. `apply_target` registers that module as a context and returns `ApplyTarget::Enter{context,func,pc}` (`mod.rs:331-336`). Only the seam's `Ok(None)` default falls back to the synchronous `ctx.call_bif` (`mod.rs:338-339`) → `ApplyTarget::Called`.
+- `Instr::Apply`'s `Enter` arm stores the **caller's** return address `(func, pc+1, current_context)` in the live frame, then returns `Step::Enter` (`mod.rs:204-219`) — the same discipline as a local `Instr::Call`, so a `receive` inside the callee suspends **this** process and its `return` unwinds into the caller's frame.
+- `Instr::ApplyLast`'s `Enter` arm returns `Step::Enter` after the frame is already popped (`mod.rs:228`, `:246-248`), so the callee runs on the caller's frame.
+- The seam's `Step::Enter` is folded by the module-context-aware driver (`../../../src/machine/drive.rs:140-158`: switch context + re-bind the literal area); the callee's `Step::Wait` becomes `RunOutcome::Wait` (`drive.rs:159-161`), leaving the suspended frame's module context for `resume_outcome`.
+- A `raise` from a cross-module callee lands in the **caller's** catch frame: the landing is reported as `Step::Enter` into the handler's context (see `../exceptions/tests/cross_module.rs:21-60`, which pins the `proc_lib:init_p_do_apply/3` `try apply/3 catch ... end` shape).
+- The `Instr::CallExt*` core arm (NOT this family) uses the same seam via `interpreter/dispatch.rs:374-386` (`resolve_external_entry` → `resolve_external_call`, `dispatch.rs:622-643`).
+
+## Constraints
+- `#![deny(unsafe_code)]` crate-wide; this node has no `unsafe`.
+- Errors are `beam_common::{Result, BeamError}` only — never a panic, never a wrong result; a non-atom target is the C's catchable `badarg` raise (`raise_badarg`), or the typed `BeamError::BadArg` when no catch frame / the `badarg` atom is absent.
+- Term construction/inspection only via `crate::terms` / `beam_term`.
+
+## Test Strategy (`tests.rs`, hand-built synthetic modules; the loader is not involved)
+- `MakeFun3`: `make_fun3_builds_a_closure_with_the_descriptor_fields` (:128), `..._with_no_free_variables` (:166), `..._with_a_missing_descriptor_is_a_typed_error` (:196), `..._with_a_free_variable_count_mismatch_is_a_typed_error` (:222).
+- `call_fun`/`call_fun2`: `call_fun_dispatches_the_fun_in_x_arity` (:254), `call_fun_without_an_apply_hook_is_a_typed_unsupported` (:279), `call_fun_with_an_out_of_range_fun_register_is_a_typed_error` (:301), `call_fun2_dispatches_the_fun_in_its_operand` (:324).
+- `apply` synchronous + badarg raise: `apply_dispatches_module_and_function_from_x_arity` (:373), `apply_with_a_non_atom_module_is_a_typed_error` (:400), `apply_badarg_lands_in_a_live_catch_frame` (:428), `apply_last_badarg_lands_in_a_live_catch_frame` (:466), `apply_badarg_without_a_catch_frame_is_the_typed_error` (:496), `apply_badarg_without_the_badarg_atom_falls_back_to_the_typed_error` (:521).
+- `apply_last` frame/continuation: `apply_last_pops_the_frame_and_returns_through_the_continuation` (:547), `apply_last_reports_a_context_switch_when_the_continuation_is_in_another_module` (:615), `apply_last_at_the_bottom_frame_finishes_the_run` (:675).
+- **Cross-module seam** (the key coverage): `apply_enters_a_resolved_callee_in_the_same_machine` (:870), `apply_into_a_cross_module_receive_suspends_and_resumes` (:925 — drives `run_label_outcome`→`RunOutcome::Wait{0,0}` then a send + `resume_outcome`→`RunOutcome::Returned`), `apply_without_the_seam_keeps_the_synchronous_bif_path` (:962), `apply_last_pops_its_frame_then_enters_a_resolved_callee` (:1009).
+- Router declination: `non_fun_variants_return_none` (:721).
+- The `TestMailbox` stub (`:1094-1152`) implements the receive seam for the cross-module receive test; markers are the typed `unsupported`.
+
+## Known Issues / Notes for Agents
+- **No TODO/FIXME/limitation marker in this node** — the cross-module seam is implemented on both the `Apply`/`ApplyLast` path here and the `CallExt*` path (`interpreter/dispatch.rs`), and adopted by the `beam_rt` host (`RuntimeContext::resolve_external_call`).
+- **A raise/receive from a cross-module callee IS propagated, not folded into `blocked()`.** The old claim that the `Instr::CallExt` arm folds a callee suspend into `beam_engine::blocked()` is **stale** — the arm resolves the seam first (`interpreter/dispatch.rs:374-386`). `blocked()` is only the **non-blocking** entries' report for a `receive` with no message (`crate::error::blocked`); a host that pumps (beam_rt) or a caller driving `resume_outcome` gets `RunOutcome::Wait`.
+- Non-zero `wait_timeout` has **no host timer** — it suspends like `wait` and resumes only on a message (`../receive.rs:147-163`, `../CONTEXT.md` Known Issues). Not cross-module-specific.
+
+## See Also
+- `../CONTEXT.md` → the family seam router + ownership + capability-gap list.
+- `../../../CONTEXT.md` → the crate API surface (the `ExecutionContext` seam, Handoff #10 cross-module call, Handoff #1 receive/cross-module suspension).
+- `../exceptions/tests/cross_module.rs` → the raise-side containment tests.
+- `../../../src/machine/drive.rs` → how `Step::Enter`/`Step::Wait` are folded.
