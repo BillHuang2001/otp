@@ -32,11 +32,17 @@
 %%
 %%   It is driven by `run_stage2_suites.sh' in this directory, which builds a
 %%   rig compiler for the host (`lib/compiler/scripts/host_env.sh build'),
-%%   compiles the suites with that compiler into a private scratch ebin and
-%%   then runs
+%%   compiles the suites into a private scratch ebin and then runs
 %%
 %%       erl -noshell -pa "$RIG_EBIN" -pa "$SCRATCH/ebin" \
 %%           -run stage2_suite_driver main "$REPORT" SUITE...
+%%
+%%   `-pa "$RIG_EBIN"' must come *first*: the suites only drive the compiler
+%%   (`compile:file/2') and call the in-tree pass modules
+%%   (`beam_ssa_loop_opt:opt/1') directly, which is the whole point of the run.
+%%   The report header prints `code:which(compile)' and checks it against
+%%   `$STAGE2_RIG_EBIN' (exported by the runner), so a run that accidentally
+%%   used the host compiler says so instead of silently producing nonsense.
 %%
 %%   `-run' passes every command-line argument as a flat string list, so
 %%   `main/1' receives `[Report, Suite | _]'.  Without arguments it runs the
@@ -56,15 +62,23 @@
 %%     `ct:fail/1' is just `exit({test_case_failed,Reason})' and is rendered
 %%     as such.
 %%
-%% NATIVE RECORDS
-%%   A suite that includes `beam_ssa.hrl'/`beam_types.hrl' (only
-%%   `beam_ssa_loop_opt_SUITE' among the Stage-2 suites) is compiled by the rig
-%%   compiler into the OTP-30-only `update_record_id' instruction, which the
-%%   OTP-29 host emulator refuses to load.  Such a suite is transparently
-%%   recompiled with `no_native_record_opt' and loaded from memory; a `NOTE'
-%%   line says so.  The test cases that build a native record then fail with
-%%   `error:{badrecord,...}' -- a host limitation, never a suite failure -- and
-%%   the ones that only compile and run probe modules still give a real result.%%
+%% HOST ADAPTATION OF THE SUITES
+%%   The suites are compiled by the *host* `erlc' from a scratch copy of the
+%%   sources in which `lib/compiler/scripts/host_env_xform.py' has flattened the
+%%   OTP-30 native records onto classic tuple records -- the very same rewriting
+%%   the rig compiler itself was built with.  A suite that builds
+%%   `#b_set{}'/`#b_literal{}'/`#t_integer{}'/`#opt_st{}' terms therefore builds
+%%   the tuples the rig's pass modules expect, instead of native-record terms
+%%   that the host runtime cannot represent (and that made it reject the beam
+%%   outright with "Use of opcode 193").  See run_stage2_suites.sh for the
+%%   details of that compilation path.
+%%
+%%   Every suite listed in `$STAGE2_FLATTENED_SUITES' (space-separated, set by
+%%   the runner for the suites whose own source or whose headers the transform
+%%   rewrote) is preceded by a `NOTE' saying so.  Such a suite gives a *host*
+%%   result: it exercises the pass logic, never the OTP-30 native-record
+%%   mechanism, and must not be mistaken for a run on a real OTP-30 build.
+%%
 %% RESULTS
 %%   One `PASS' / `FAIL' / `SKIP' / `WARN' line per testcase, a per-suite and a
 %%   final summary, all of it printed on stdout *and* accumulated into the
@@ -137,12 +151,79 @@ default_report() ->
 %%--------------------------------------------------------------------------
 
 run_suites(Suites) ->
+    Flattened = flattened_suites(),
     St0 = emit(#st{}, ["",
-                       "==== Stage-2 compiler-pass Common Test suites ====",
-                       "compiler used: " ++ fmt(code:which(compile)),
-                       "suites: " ++
-                           string:join([atom_to_list(S) || S <- Suites], ", ")]),
+                       "==== Stage-2 compiler-pass Common Test suites ===="]
+                           ++ compiler_lines()
+                           ++ ["suites: " ++
+                                   string:join([atom_to_list(S) || S <- Suites],
+                                               ", ")]
+                           ++ flattened_header(Flattened)),
     do_suites(Suites, St0).
+
+%% `code:which(compile)' must be the rig compiler: the suites drive it with
+%% `compile:file/2' and call its pass modules directly, and the host compiler's
+%% default pipeline knows nothing about the opt-in Stage-2 pass flags.  The
+%% runner exports the rig's ebin in `$STAGE2_RIG_EBIN' so the check is possible.
+compiler_lines() ->
+    Which = case code:which(compile) of
+                Path when is_list(Path) -> Path;
+                Other -> fmt(Other)
+            end,
+    ["compiler used: " ++ Which] ++ rig_check(Which).
+
+rig_check(Which) ->
+    case os:getenv("STAGE2_RIG_EBIN") of
+        Rig when is_list(Rig), Rig =/= "" ->
+            Dir = filename:absname(Rig),
+            case lists:prefix(Dir ++ "/", filename:absname(Which)) of
+                true ->
+                    ["rig compiler: verified -- code:which(compile) is inside"
+                     " $STAGE2_RIG_EBIN (" ++ Dir ++ ")"];
+                false ->
+                    ["WARNING: code:which(compile) is NOT inside"
+                     " $STAGE2_RIG_EBIN (" ++ Dir ++ "); the suites would drive"
+                     " the wrong compiler and the results are meaningless"]
+            end;
+        _ ->
+            ["rig compiler: $STAGE2_RIG_EBIN is not set, so it could not be"
+             " verified that code:which(compile) is the rig compiler"]
+    end.
+
+%% The suites the runner had to compile from flattened sources.
+flattened_suites() ->
+    case os:getenv("STAGE2_FLATTENED_SUITES") of
+        false ->
+            [];
+        "" ->
+            [];
+        List ->
+            [list_to_atom(S) || S <- string:split(List, " ", all), S =/= ""]
+    end.
+
+flattened_header([]) ->
+    [];
+flattened_header(Suites) ->
+    ["host adaptation: " ++
+         string:join([atom_to_list(S) || S <- Suites], ", ") ++
+         " (compiled from host_env_xform.py-flattened sources;",
+     "                 see the NOTE before the suite)"].
+
+%% The honest, per-suite note: this suite's result is a host-rig result.
+flattened_note(Suite) ->
+    ["NOTE " ++ atom_to_list(Suite) ++ ": host-only adaptation -- it builds the"
+     " OTP-30",
+     "     native records #b_set{}/#b_literal{}/#t_integer{}/#opt_st{}, which"
+     " the host",
+     "     runtime cannot even represent, so the runner compiled it with the"
+     " *host* erlc",
+     "     from a host_env_xform.py-flattened copy of its source: native"
+     " records became",
+     "     classic tuple records, exactly as they did for the rig's pass"
+     " modules, so both",
+     "     sides agree on tuple records.  This exercises the pass logic, NOT"
+     " the OTP-30",
+     "     native-record mechanism, and is NOT a real OTP-30 run."].
 
 do_suites([], St) ->
     final_summary(St);
@@ -169,15 +250,16 @@ run_one_suite(Suite, St0) ->
 %% Load the suite, then run init_per_suite / all/0 / end_per_suite.
 do_suite(Suite, St0) ->
     Priv = priv_dir(Suite),
-    case load_or_rescue(Suite) of
-        {ok, []} ->
-            do_suite_1(Suite, Priv, St0);
-        {ok, Note} ->
-            do_suite_1(Suite, Priv, emit(St0, Note));
+    St1 = case lists:member(Suite, flattened_suites()) of
+              true -> emit(St0, flattened_note(Suite));
+              false -> St0
+          end,
+    case load(Suite) of
+        ok ->
+            do_suite_1(Suite, Priv, St1);
         {error, Reason} ->
-            record(St0, fail, Suite, '<load>', Reason)
+            record(St1, fail, Suite, '<load>', Reason)
     end.
-
 do_suite_1(Suite, Priv, St0) ->
     Config0 = [{priv_dir, Priv}],
     case call(Suite, init_per_suite, [Config0]) of
@@ -203,95 +285,6 @@ load(Suite) ->
         {ok, Suite} -> ok;
         Other -> {error, Other}
     end.
-
-%% Load a suite, falling back to a `no_native_record_opt' recompile when the
-%% beam the rig compiler produced cannot be loaded by the *host* runtime.
-%%
-%% WHY THE FALLBACK IS NEEDED: the SSA records are OTP-30 *native records*
-%% (`beam_ssa.hrl' and `beam_types.hrl' are `-import_record' headers), so the
-%% rig compiler emits the OTP-30-only `update_record_id' instruction, which the
-%% OTP-29 host emulator refuses to load at all ("This BEAM file was compiled
-%% for a later version of the runtime system ... Use of opcode 193; this
-%% emulator supports only up to 191").  With `no_native_record_opt' the suite
-%% is loadable and only the test cases that actually *build* a #b_set{}/
-%% #b_literal{}/#t_integer{} value fail -- with a precise
-%% `error:{badrecord,{beam_ssa,b_literal}}', because the host runtime has no
-%% native-record term type -- instead of the whole suite being unrunnable.
-%% The fallback is reported in the output so such a failure is never mistaken
-%% for a suite failure.
-load_or_rescue(Suite) ->
-    case load(Suite) of
-        ok ->
-            {ok, []};
-        {error, Reason} ->
-            case native_record_rescue(Suite) of
-                ok ->
-                    {ok, ["NOTE " ++ atom_to_list(Suite) ++
-                          ": the rig-compiled beam cannot be loaded by the"
-                          " host runtime (" ++ fmt(Reason) ++ ")",
-                          "     recompiled it with +no_native_record_opt and"
-                          " loaded that instead; test cases that build native",
-                          "     records (#b_*{}/#t_*{}) then fail with"
-                          " `badrecord' -- a host limitation, not a suite"
-                          " failure."]};
-                {error, Rescued} ->
-                    {error, {load_failed, Reason, rescue_failed, Rescued}}
-            end
-    end.
-
-%% Recompile the suite from source with the native-record optimisation off and
-%% load the resulting binary. Uses the compiler that is first on the code path,
-%% i.e. the rig compiler (the runner starts `erl' with `-pa $RIG_EBIN').
-native_record_rescue(Suite) ->
-    case suite_source(Suite) of
-        {ok, Src} ->
-            Opts = [binary, return_errors, return_warnings,
-                    no_native_record_opt | inc_opts(filename:dirname(Src))],
-            case compile:file(Src, Opts) of
-                {ok, Suite, Bin} -> load_binary(Suite, Bin);
-                {ok, Suite, Bin, _Warnings} -> load_binary(Suite, Bin);
-                {ok, Other, _Bin, _Warnings} ->
-                    {error, {wrong_module, Other}};
-                {error, Errors, Warnings} ->
-                    {error, {recompile_failed, Errors, Warnings}};
-                Other ->
-                    {error, {recompile_failed, Other}}
-            end;
-        {error, Reason} ->
-            {error, Reason}
-    end.
-
-load_binary(Suite, Bin) ->
-    case code:load_binary(Suite, atom_to_list(Suite) ++ ".erl", Bin) of
-        {module, Suite} -> ok;
-        Other -> {error, {load_binary_failed, Other}}
-    end.
-
-%% The suite's source file. Prefer the repo-root-relative path (the runner
-%% starts erl in the repository root), so the recompiled module carries the
-%% same `?FILE' as the other suites; `STAGE2_SUITE_SRC_DIR' -- the absolute
-%% path of this directory, set by run_stage2_suites.sh -- is the fallback.
-suite_source(Suite) ->
-    Base = atom_to_list(Suite) ++ ".erl",
-    Dir = case os:getenv("STAGE2_SUITE_SRC_DIR") of
-              false -> "lib/compiler/test";
-              "" -> "lib/compiler/test";
-              D -> D
-          end,
-    Candidates = [filename:join("lib/compiler/test", Base),
-                  filename:join(Dir, Base)],
-    case [F || F <- Candidates, filelib:is_regular(F)] of
-        [File | _] -> {ok, File};
-        [] -> {error, {no_suite_source, Candidates}}
-    end.
-
-%% The include directories the suite sources need when they are recompiled
-%% here: `-I lib/compiler/src' (beam_ssa.hrl, beam_types.hrl) and
-%% `-I lib/stdlib/include', both derived from the test directory.
-inc_opts(TestDir) ->
-    [{i, filename:absname(filename:join([TestDir, "..", "src"]))},
-     {i, filename:absname(filename:join([TestDir, "..", "..",
-                                         "stdlib", "include"]))}].
 
 %% Walk all/0: bare testcase atoms and {group,G} / {group,G,Props} entries.
 walk_all(Suite, Config, St0) ->
