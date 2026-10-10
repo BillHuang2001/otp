@@ -63,7 +63,7 @@ Caller liveness: `driver_monitor_process`/`driver_demonitor_process` on async co
 - TCP/UDP/SCTP are three separate driver entries (own `driver_name`, independently present) that share descriptor code, rather than one driver with a protocol switch.
 - `inet_driver_entry` exists only so the name-derived `driver_tab` has an entry to register for `inet_drv.o`; its `init` registers the real drivers, then removes itself.
 - The driver manages sockets through the emulator pollset (port locking on, soft-busy) rather than dirty schedulers; this is why there are no async threads here.
-- `ram_file_drv` keeps the whole file in one resizable `ErlDrvBinary` (`RamFile` at `ram_file_drv.c:137`; grow by `BFILE_BLOCK` rounding in `ram_file_expand` `:290`), a deliberate simplification over a block vector.
+- `ram_file_drv` keeps the whole file in one resizable `ErlDrvBinary` (`RamFile` at `ram_file_drv.c:137`; grow by `BFILE_BLOCK` rounding in `ram_file_expand` `:270`), a deliberate simplification over a block vector.
 
 ## Known Issues / Gotchas
 - The `dummy_tcp_driver_entry`/`dummy_udp_driver_entry`/`dummy_sctp_driver_entry` structs (`inet_drv.c:2196/2212/2229`, win32-only `#ifdef __WIN32__`) are defined but never referenced or `add_driver_entry`'d anywhere in the tree — they are dead code, not a runtime fallback.
