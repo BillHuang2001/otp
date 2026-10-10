@@ -826,6 +826,12 @@ pub(crate) fn hamt_node(term: Eterm) -> Result<HamtNodeView> {
 /// (`TermError::BadRecord` reconciled to `badarg`); otherwise propagates
 /// [`BeamError::Alloc`](beam_common::BeamError::Alloc) when `heap` cannot fit the
 /// block.
+/// Leaves the cached definition hash (definition word 2) as the `0` placeholder —
+/// a fabricated value. The `records` module must therefore build records through
+/// [`beam_codec::term::make_record`](beam_codec::term::make_record), which writes
+/// the real `compute_record_definition_hash` value (this writer is retained only
+/// because the `compare` test suite pins the record layout through it).
+#[allow(dead_code)]
 pub(crate) fn native_record_write(
     heap: &mut Heap,
     module: Atom,
