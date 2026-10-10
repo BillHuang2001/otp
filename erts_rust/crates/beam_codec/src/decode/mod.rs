@@ -396,13 +396,14 @@ impl<'a> Decoder<'a> {
                 // A **local node's** reference materializes as *this* runtime's internal
                 // reference (`ref_ext_common`'s `dec_is_this_node` branch,
                 // `external.c:4821-4862`): the single wire number is the id, zero-padded
-                // to `ERTS_REF_NUMBERS`. Inert unless `Decoder::with_local_node` installed
-                // the identity (see [`local_node`]).
+                // to `ERTS_REF_NUMBERS`. The demotion is representability-gated — an id
+                // the internal form's small-int slot cannot hold keeps the external
+                // form (see [`crate::ref_wire::representable_ref_id`]). Inert unless
+                // `Decoder::with_local_node` installed the identity (see [`local_node`]).
                 if self.is_local_node(node, creation) {
-                    return crate::term::make_internal_ref(
-                        heap,
-                        crate::ref_wire::ref_numbers_to_id(&[r0]),
-                    );
+                    if let Some(id) = crate::ref_wire::representable_ref_id(&[r0]) {
+                        return crate::term::make_internal_ref(heap, id);
+                    }
                 }
                 crate::term::make_external_ref(heap, node, &[r0], creation)
             }
@@ -453,12 +454,12 @@ impl<'a> Decoder<'a> {
                 };
                 // Local-node demotion: an internal reference (see the `Tag::Reference`
                 // arm and `ref_ext_common`, `external.c:4821-4862`). The empty `len == 0`
-                // slice maps to id 0 — exactly the C's zeroed padding.
+                // slice maps to id 0 — exactly the C's zeroed padding. Representability-gated:
+                // an id the internal form cannot hold keeps the external form.
                 if self.is_local_node(node, creation) {
-                    return crate::term::make_internal_ref(
-                        heap,
-                        crate::ref_wire::ref_numbers_to_id(&ids),
-                    );
+                    if let Some(id) = crate::ref_wire::representable_ref_id(&ids) {
+                        return crate::term::make_internal_ref(heap, id);
+                    }
                 }
                 crate::term::make_external_ref(heap, node, &ids, creation)
             }
@@ -497,12 +498,13 @@ impl<'a> Decoder<'a> {
                 };
                 // Local-node demotion (see the `Tag::Reference` arm): the C's
                 // `ref_ext_common` builds the internal reference from only the first
-                // `ERTS_REF_NUMBERS` numbers, zero-padding a shorter image.
+                // `ERTS_REF_NUMBERS` numbers, zero-padding a shorter image. Gated on the
+                // packed id fitting the internal form's small-int slot, so a larger id
+                // keeps the external form instead of failing.
                 if self.is_local_node(node, creation) {
-                    return crate::term::make_internal_ref(
-                        heap,
-                        crate::ref_wire::ref_numbers_to_id(&ids),
-                    );
+                    if let Some(id) = crate::ref_wire::representable_ref_id(&ids) {
+                        return crate::term::make_internal_ref(heap, id);
+                    }
                 }
                 crate::term::make_external_ref(heap, node, &ids, creation)
             }
@@ -987,8 +989,9 @@ pub fn decode_term(bytes: &[u8], heap: &mut Heap, atoms: &mut AtomTable) -> Resu
 /// # Errors
 ///
 /// Every error [`decode_term`] reports, plus `BeamError::BadArg` for a mismatched
-/// `LOCAL_EXT` hash and `BeamError::SystemLimit` for a local reference id that does
-/// not fit the M1 block's 60-bit slot.
+/// `LOCAL_EXT` hash. A local reference whose packed id does not fit the internal
+/// form's small-int slot is **not** an error: it decodes to the faithful external
+/// reference form (see [`crate::ref_wire::representable_ref_id`]).
 pub fn decode_term_with_local_node(
     bytes: &[u8],
     heap: &mut Heap,

@@ -42,6 +42,12 @@
 //!   node keeps any `r0`, a local one is `BadArg`. (`REFERENCE_EXT` (101) and
 //!   `NEW_REFERENCE_EXT` (114) enforce the same bound unconditionally, *before*
 //!   the node is resolved — `external.c:4757`/`:4782` — and are unchanged here.)
+//!   The local-node **demotion** of a reference — the C's
+//!   `ref_ext_common` internal-`ErtsORefThing` branch, `external.c:4821-4862` — is
+//!   representability-gated: the internal form's id slot holds one 60-bit small, so
+//!   an image whose packed id does not fit keeps the faithful **external** reference
+//!   form (`crate::ref_wire::representable_ref_id`), never a truncated id and never
+//!   an error.
 //! * **D6 — local pid/port bounds.** `dec_pid` rejects a pid whose node is the
 //!   local node with `number > ERTS_MAX_INTERNAL_PID_NUMBER` or
 //!   `serial > ERTS_MAX_INTERNAL_PID_SERIAL` (`external.c:3175-3179`); the port arm

@@ -474,6 +474,65 @@ fn the_oracle_agrees_on_the_legacy_local_reference() {
 }
 
 // ---------------------------------------------------------------------------
+// 7. An id past the internal form's slot keeps the external form
+// ---------------------------------------------------------------------------
+
+/// The differential gate's `wire_extra/ids_local_reference_rereencode_identity`
+/// fixture: a local-node `NEWER_REFERENCE_EXT` (`90`) whose third number is
+/// `0xA02C04B4`, so the packed id is far past `MAX_SMALL`.
+const UNREPRESENTABLE_LOCAL_REF: [u8; 35] = [
+    131, 90, 0, 3, 119, 13, 110, 111, 110, 111, 100, 101, 64, 110, 111, 104, 111, 115, 116, 0, 0,
+    0, 0, 0, 2, 35, 202, 52, 184, 0, 8, 160, 44, 4, 180,
+];
+
+/// The local-node **demotion** is representability-gated: the internal M1 reference
+/// stores its whole identity in one 60-bit small, so an image whose packed id is past
+/// `MAX_SMALL` decodes to the faithful **external** reference form — never a
+/// truncation, never a `SystemLimit` — and re-encodes byte-for-byte.
+#[test]
+fn an_unrepresentable_local_reference_stays_external_and_round_trips() {
+    let mut atoms = AtomTable::new();
+    let node = atoms.intern(LOCAL_NODE);
+    let mut heap = new_heap(64);
+    let term = decode_with_identity(&UNREPRESENTABLE_LOCAL_REF, &mut heap, &mut atoms, node, 0);
+
+    // Not the internal form: the packed id cannot fit the M1 block's slot.
+    assert!(
+        internal_ref_id(term).is_err(),
+        "an unrepresentable id must stay external, got {term:?}"
+    );
+    // The faithful external reference, with every number and the creation preserved.
+    let (ref_node, ids, creation) =
+        external_ref_parts(term).expect("an unrepresentable local reference is external");
+    assert_eq!(atoms.name(atom_val(ref_node)), Some(LOCAL_NODE));
+    assert_eq!(ids, [0x0002_23CA, 0x34B8_0008, 0xA02C_04B4]);
+    assert_eq!(creation, 0);
+    // …and it round-trips byte-for-byte.
+    assert_eq!(
+        encode_with_identity(term, &atoms, node, 0),
+        UNREPRESENTABLE_LOCAL_REF
+    );
+}
+
+/// The gate's other side: an id that *is* representable — the largest 60-bit small
+/// (`MAX_SMALL`) — still demotes, so the gate is the small-int range and nothing
+/// narrower.
+#[test]
+fn a_local_reference_at_the_internal_slots_maximum_still_demotes() {
+    let max = beam_term::prelude::MAX_SMALL as u64;
+    let mut image = vec![VERSION_MAGIC, NEWER_REFERENCE_EXT, 0, 3];
+    image.extend_from_slice(&utf8_atom(LOCAL_NODE));
+    image.extend_from_slice(&0u32.to_be_bytes()); // creation
+    image.extend_from_slice(&((max & 0x3_FFFF) as u32).to_be_bytes()); // num[0]
+    image.extend_from_slice(&((max & 0xFFFC_0000) as u32).to_be_bytes()); // num[1]
+    image.extend_from_slice(&((max >> 32) as u32).to_be_bytes()); // num[2]
+
+    let (mut heap, mut atoms, node) = decode_target();
+    let term = decode_with_identity(&image, &mut heap, &mut atoms, node, 0);
+    assert_eq!(internal_ref_id(term).unwrap(), max);
+}
+
+// ---------------------------------------------------------------------------
 // Oracle resolution and process plumbing
 // ---------------------------------------------------------------------------
 
