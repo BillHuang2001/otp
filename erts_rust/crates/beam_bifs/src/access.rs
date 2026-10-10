@@ -45,7 +45,7 @@ use beam_term::prelude::{
     try_make_small,
 };
 use beam_term::{
-    Atom, AtomTable, Eterm, BITSTRING_TAG_MASK, ERL_HEAP_BITS_SIZE, HAMT_SUBTAG_HEAD_ARRAY,
+    Atom, AtomTable, Eterm, ERL_HEAP_BITS_SIZE, HAMT_SUBTAG_HEAD_ARRAY,
     HAMT_SUBTAG_HEAD_BITMAP, HAMT_SUBTAG_NODE_BITMAP, HEADER_ARITY_OFFS, HEADER_FLONUM,
     HEADER_MAP_SUBTAG_MASK, HEAP_BITS_SUBTAG, REF_SUBTAG,
 };
@@ -490,30 +490,52 @@ pub(crate) fn bitstring_bit_size(term: Eterm) -> Result<usize> {
 
 /// Copies the bytes of a byte-aligned bitstring (a *binary*) out of the term.
 ///
+/// **Both** frozen bitstring representations are handled, through the LCA reader
+/// [`beam_term::bitstring::bitstring_parts`]:
+///
+/// * an **on-heap** `ErlHeapBits` (`[thing_word, n_bits, data…]`), whose base is
+///   `boxed_val(term) + 2` with a zero bit offset — the bytes are stored in address
+///   order (`erl_bits.h`: the data area is byte-addressed);
+/// * an **off-heap** `ErlSubBits` window (a `[BinRef][ErlSubBits]` refc binary, e.g.
+///   built by `beam_engine`'s `bs_create_bin` for any payload above 64 bytes, or a
+///   match context), whose base is `base_flags & !ERL_SUB_BITS_FLAG_MASK` and whose
+///   start is a **bit** offset into that storage.
+///
+/// When that window starts on a byte boundary the answer is the contiguous slice
+/// `base + offset_bits / 8`; when it starts mid-byte there is no contiguous byte
+/// image, so the bits are re-packed MSB-first by [`bitstring_bits`] — never a
+/// guessed image.
+///
 /// # Errors
 ///
-/// [`BeamError::BadArg`] when `term` is not a byte-aligned bitstring. An off-heap
-/// `SUB_BITS` thing is also rejected: Milestone-1 builds none (every binary this
-/// crate creates is on-heap), and its bytes live behind a `BinRef`/match-context
-/// indirection that no M1 producer creates.
+/// [`BeamError::BadArg`] when `term` is not a byte-aligned bitstring.
 #[allow(dead_code)]
 pub(crate) fn binary_bytes(term: Eterm) -> Result<Vec<u8>> {
     if !is_binary(term) {
         return Err(BeamError::BadArg);
     }
-    // SAFETY: [`is_binary`] confirmed `term` is a boxed, byte-aligned bitstring, so
-    // its header word is a live term word.
-    let header = unsafe { *boxed_val(term) };
-    if header.raw() & BITSTRING_TAG_MASK != HEAP_BITS_SUBTAG {
-        return Err(BeamError::BadArg);
+    // SAFETY: [`is_binary`] confirmed `term` is a live, byte-aligned bitstring (heap
+    // or sub), so `bitstring_parts` reads only that term's own words and returns a
+    // base pointer into storage backing bits `offset_bits..offset_bits + size_bits`
+    // — kept alive by `term` for the whole of the copy below.
+    let (base, offset_bits, size_bits) = unsafe { beam_term::bitstring::bitstring_parts(term) };
+    let nbytes = size_bits / 8;
+    if offset_bits & 7 != 0 {
+        // A mid-byte window has no contiguous byte image: re-pack bit by bit.
+        return bitstring_bits(term);
     }
-    // SAFETY: a heap bitstring is `[header, size, data…]`, so word 2 begins the live
-    // data area, which holds `ceil(byte_len / 8)` words — i.e. at least `byte_len`
-    // initialised bytes (`erl_bits.h`: the data area is byte-addressed).
-    let data = unsafe { boxed_val(term).add(HEAP_BITS_PREFIX_WORDS).cast::<u8>() };
-    let nbytes = unsafe { beam_term::bitstring_size(term) } / 8;
-    // SAFETY: the `nbytes` bytes just described are initialised and in bounds; the
-    // copy goes out byte by byte, so it is endianness-agnostic.
+    if nbytes == 0 {
+        // No bytes to read — return before touching `base`, which may be null or
+        // dangling for a zero-length window (`from_raw_parts` is UB for a zero-length
+        // slice built from such a pointer).
+        return Ok(Vec::new());
+    }
+    // SAFETY: `offset_bits` and `size_bits` are both multiples of 8 (`is_binary`), so
+    // bits `offset_bits..offset_bits + size_bits` are exactly the `nbytes > 0`
+    // initialised bytes at `base + offset_bits / 8`, all inside the live storage the
+    // base pointer covers; the copy goes out byte by byte, so it is
+    // endianness-agnostic.
+    let data = unsafe { base.add(offset_bits / 8) };
     Ok(unsafe { core::slice::from_raw_parts(data, nbytes) }.to_vec())
 }
 
@@ -951,6 +973,7 @@ pub(crate) fn native_record_is_native(rec: Eterm, module: Atom, name: Atom) -> b
 mod tests {
     use super::*;
     use beam_alloc::Heap;
+    use beam_alloc::RefcBinary;
     use beam_common::BeamError;
     use beam_process::ProcessId;
     use beam_term::{is_boxed, make_small, NIL};
@@ -1089,6 +1112,89 @@ mod tests {
             let header = unsafe { *boxed_val(bin) };
             assert_eq!(header, make_header(arity, HEAP_BITS_SUBTAG));
         }
+    }
+
+    /// The bytes `<<(I rem 256) || I <- lists:seq(1, N)>>` holds — the oracle's
+    /// >64-byte subject for the off-heap refc-binary path.
+    fn ramp(n: usize) -> Vec<u8> {
+        (1..=n).map(|i| (i % 256) as u8).collect()
+    }
+
+    /// Builds the off-heap `[BinRef][ErlSubBits]` pair the engine's `bs_create_bin`
+    /// writes for a payload above `ERL_ONHEAP_BINARY_LIMIT` (64) bytes, and returns
+    /// the boxed root.
+    ///
+    /// `payload` owns the storage the pair points into and must outlive every use of
+    /// the returned term.
+    fn refc_binary(
+        heap: &mut Heap,
+        payload: &RefcBinary,
+        offset_bits: usize,
+        size_bits: usize,
+    ) -> Eterm {
+        let base = payload.data_ptr();
+        // SAFETY: `alloc_words` hands out `ERL_REFC_BITS_SIZE` (8) exclusively-owned,
+        // writable words — exactly the pair `write_refc_binary` fully writes.
+        let hp = unsafe { heap.alloc_words(beam_term::refc::ERL_REFC_BITS_SIZE) }
+            .expect("the 8-word pair fits");
+        // SAFETY: `hp` is that reserved pair; `base` is the first byte of `payload`'s
+        // live, `UNIT_SIZE`-aligned data area (kept alive by the caller), which covers
+        // bits `offset_bits..offset_bits + size_bits`.
+        unsafe {
+            beam_term::refc::write_refc_binary(
+                hp,
+                base.cast::<Eterm>(),
+                core::ptr::null_mut(),
+                base,
+                offset_bits,
+                size_bits,
+            )
+        }
+    }
+
+    #[test]
+    fn binary_bytes_reads_an_off_heap_refc_binary() {
+        let mut heap = Heap::new(64).expect("test heap");
+        let data = ramp(96);
+        assert!(data.len() > 64, "the subject must exceed ERL_ONHEAP_BINARY_LIMIT");
+        let payload = RefcBinary::new(&data).expect("the off-heap payload allocates");
+
+        // The whole-binary view: `start = 0`, the full bit size.
+        let root = refc_binary(&mut heap, &payload, 0, data.len() * 8);
+        assert!(is_bitstring(root));
+        assert!(is_binary(root));
+        assert_eq!(bitstring_bit_size(root).unwrap(), data.len() * 8);
+        assert_eq!(
+            binary_bytes(root).unwrap(),
+            data,
+            "the off-heap payload must be read verbatim, not from boxed_val + 2"
+        );
+        // The bit-by-bit reader agrees (it re-packs the same bits MSB-first).
+        assert_eq!(bitstring_bits(root).unwrap(), data);
+
+        // A byte-aligned SUB_WINDOW: `start = 8` bits, one byte shorter.
+        let window = refc_binary(&mut heap, &payload, 8, (data.len() - 1) * 8);
+        assert!(is_binary(window));
+        assert_eq!(bitstring_bit_size(window).unwrap(), (data.len() - 1) * 8);
+        assert_eq!(binary_bytes(window).unwrap(), data[1..].to_vec());
+
+        // A multi-byte-aligned interior window (`start = 64` bits).
+        let inner = refc_binary(&mut heap, &payload, 64, 8 * 8);
+        assert!(is_binary(inner));
+        assert_eq!(binary_bytes(inner).unwrap(), data[8..16].to_vec());
+
+        // A mid-byte window has no contiguous byte image, so it is re-packed bit by
+        // bit: `start = 4`, size 8 bits ⇒ the low nibble of `data[0]` (0x01) then the
+        // high nibble of `data[1]` (0x02) ⇒ `0b0001_0000`.
+        let mid = refc_binary(&mut heap, &payload, 4, 8);
+        assert!(is_binary(mid), "an 8-bit window is byte aligned");
+        assert_eq!(binary_bytes(mid).unwrap(), vec![0x10]);
+        assert_eq!(binary_bytes(mid).unwrap(), bitstring_bits(mid).unwrap());
+
+        // A zero-length window must not touch the base pointer.
+        let empty = refc_binary(&mut heap, &payload, 0, 0);
+        assert!(is_binary(empty));
+        assert_eq!(binary_bytes(empty).unwrap(), Vec::<u8>::new());
     }
 
     #[test]
