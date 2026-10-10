@@ -50,7 +50,7 @@ Term order is never re-implemented here (workspace Prevent-Duplication rule).
   and are unreachable from the public API; panics are never control flow for runtime data.
 - The B+-tree assumes `cmp_arith` is a strict total order (its only caveat is the documented
   `beam_term` best-effort `f64` comparison for out-of-range bignum<->float keys).
-- Files target ~1000 lines; the big test module lives in `mod.rs`.
+- Files target ~1000 lines; the big test module is the `tests` submodule in `tests.rs`.
 
 ## Test Strategy
 `check_invariants` walks the whole tree against all five invariants (incl.
@@ -61,7 +61,7 @@ Term order is never re-implemented here (workspace Prevent-Duplication rule).
 periodically re-asserts `check_invariants`, checks membership/`lookup` and
 `first`/`last`/`next`/`prev` (incl. bounds), walks the full ascending key run, removes every third key,
 re-checks membership + the walk, re-inserts everything, walks again, then drains back to empty — all
-with immediates (no `Heap`), so it measures the index alone (~0.4 s). `mod.rs` tests cover the empty
+with immediates (no `Heap`), so it measures the index alone (~0.4 s). `tests.rs` tests cover the empty
 case, replace/`insert_new`/`delete_object`, mixed key classes, present/absent/boundary navigation, the
 replace-key-term rule, and memory monotonicity; both interiors are driven through the `Interior` seam
 by shared helpers. `../interior_parity.rs` proves the B+-tree and the sorted `Vec` produce identical
@@ -77,12 +77,12 @@ tautologies.
 - `next_from`/`prev_from` with `inclusive = true` has no production consumer yet: only `Tree::next`/
   `prev` call them (`inclusive = false`). It is the range API a later `ets:select`/`ets:next`-style
   scan wires up (documented in `mod.rs`).
-- The `borrowing_from_the_left_sibling_keeps_the_separator_exact` test comment (`mod.rs:851-853`)
+- The `borrowing_from_the_left_sibling_keeps_the_separator_exact` test comment (`tests.rs`)
   says the merged first leaf holds "30 entries"; the arithmetic gives 31 (15 + 16), and the merge
   happens inside the delete of 15, not a subsequent one. The scenario itself is correct; cosmetic.
 
 ## Routing Table
-- `mod.rs` → `OrderedSetInterior` (B+-tree facade + `Interior` impl) and its test module
+- `mod.rs` → `OrderedSetInterior` (B+-tree facade + `Interior` impl); declares `mod tests;` → `tests.rs` (the crate's biggest test module)
 - `tree.rs` → `Tree`: insert/split, delete/borrow-or-merge, navigation, `check_invariants`
 - `node.rs` → `Node`/`LeafNode`/`BranchNode`/`Entry`, the `NodeStore` arena, `search_entries`, `child_index`, `ORDER`/`MIN_OCCUPANCY`
 - `iter.rs` → `LeafIter` (the leaf-chain ordered iterator)
