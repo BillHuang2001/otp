@@ -100,6 +100,7 @@ use beam_abi::nif::loader::NifCallError;
 use beam_bifs::{BifContext, OutputSink};
 use beam_common::{AllocKind, BeamError, Result};
 use beam_engine::context::RootSet;
+use beam_engine::machine::WaitDeadline;
 use beam_engine::{terms, ExecutionContext, Machine, RunOutcome};
 use beam_loader::{Atom, Label, Module};
 use beam_message::{CopyContext, Message, OffHeapTable, Queue};
@@ -148,6 +149,22 @@ const RUN_EXPORT_PUMP_SLICES: u64 = 64;
 /// single-pass/`-eval`/boot workload (a `proc_lib` start, a `gen_server` round trip, an
 /// io-device read) comes close — so the cap fires only on a genuine infinite pump.
 const BLOCKING_PUMP_DEADLINE: Duration = Duration::from_secs(10);
+
+/// The longest [`RuntimeContext::pump_once`] sleeps between two scheduler rounds while it
+/// waits a parked `receive … after T` out (see its docs for the whole design).
+///
+/// The nested pump owns no timer — the engine arms none for a `wait_timeout` — so the
+/// deadline is recovered from the machine and waited for here. The wait must neither
+/// busy-spin (a bare retry loop would burn a core for the whole delay) nor sleep past the
+/// deadline (the timeout must fire **no earlier** than `T`, and a message a runnable peer
+/// delivers must still win promptly), so every round sleeps `min(remaining, this)` and then
+/// pumps the scheduler again.
+///
+/// It is deliberately a **local** constant rather than the scheduler pass's own sleep bound:
+/// that one (`scheduler.rs`'s private `TIMER_PUMP_SLICE`) caps how long a *pass* may sleep on
+/// the runtime's own timer heap, while this one caps a sleep **between** two passes of a
+/// nested run whose timer that heap never learns about.
+const DEADLINE_PUMP_SLEEP: Duration = Duration::from_millis(5);
 
 /// Drives a machine suspended in a `receive` to its `return`, one scheduler pump per wait.
 ///
@@ -842,11 +859,14 @@ impl<'a> RuntimeContext<'a> {
     /// `may_pump_scheduler() == false`) must never re-enter the scheduler — that would run a
     /// second process from within a slice — so it keeps the plain non-blocking entry's typed
     /// [`beam_engine::blocked`] gap. A pump that reports **nothing ran** (`0`) is the same
-    /// honest gap: no process could have changed the mailbox, so spinning further would only
-    /// hang, never produce a value. A process that stays **runnable forever**, by contrast,
-    /// reports progress on every round; [`pump_until_returned`] then gives up when its
-    /// [`BLOCKING_PUMP_DEADLINE`] wall-clock cap elapses and reports a typed
-    /// [`error::message`] diagnostic rather than spinning without end.
+    /// honest gap — no process could have changed the mailbox — **unless** the parked
+    /// `receive` has a statically readable finite `after T`: that deadline is the nested run's
+    /// own to wait out ([`RuntimeContext::pump_once`]), so an empty run queue is then the
+    /// expected state and the bound is the delay itself, not `0`. A process that stays
+    /// **runnable forever**, by contrast, reports progress on every round;
+    /// [`pump_until_returned`] then gives up when its [`BLOCKING_PUMP_DEADLINE`] wall-clock
+    /// cap elapses and reports a typed [`error::message`] diagnostic rather than spinning
+    /// without end.
     ///
     /// # Why the paused terms stay valid
     ///
@@ -899,11 +919,14 @@ impl<'a> RuntimeContext<'a> {
     /// `may_pump_scheduler() == false`) must never re-enter the scheduler — that would run a
     /// second process from within a slice — so it keeps the plain non-blocking entry's typed
     /// [`beam_engine::blocked`] gap. A pump that reports **nothing ran** (`0`) is the same
-    /// honest gap: no process could have changed the mailbox, so spinning further would only
-    /// hang, never produce a value. A process that stays **runnable forever**, by contrast,
-    /// reports progress on every round; [`pump_until_returned`] then gives up when its
-    /// [`BLOCKING_PUMP_DEADLINE`] wall-clock cap elapses and reports a typed
-    /// [`error::message`] diagnostic rather than spinning without end.
+    /// honest gap — no process could have changed the mailbox — **unless** the parked
+    /// `receive` has a statically readable finite `after T`: that deadline is the nested run's
+    /// own to wait out ([`RuntimeContext::pump_once`]), so an empty run queue is then the
+    /// expected state and the bound is the delay itself, not `0`. A process that stays
+    /// **runnable forever**, by contrast, reports progress on every round;
+    /// [`pump_until_returned`] then gives up when its [`BLOCKING_PUMP_DEADLINE`] wall-clock
+    /// cap elapses and reports a typed [`error::message`] diagnostic rather than spinning
+    /// without end.
     ///
     /// # Why the paused terms stay valid
     ///
@@ -939,9 +962,52 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// `Ok(None)` means the mailbox cannot have changed since the last scan — either this
     /// context may not re-enter the scheduler ([`RuntimeContext::for_process`] is itself
-    /// inside a slice) or the pump reported nothing ran — both the honest
-    /// [`beam_engine::blocked`] gap (see [`RuntimeContext::run_export_blocking`]). A pump
-    /// error (a process-table/port failure) is propagated unchanged.
+    /// inside a slice) or the pump reported nothing ran **and** the parked `receive` has no
+    /// finite deadline to wait for — both the honest [`beam_engine::blocked`] gap (see
+    /// [`RuntimeContext::run_export_blocking`]). A pump error (a process-table/port failure)
+    /// is propagated unchanged.
+    ///
+    /// # The finite `after T` a nested run must wait out itself
+    ///
+    /// The engine arms **no** timer for a `receive … after T`: a non-zero `wait_timeout`
+    /// simply suspends at its scan label, and the host recovers the deadline from the machine
+    /// through [`Machine::wait_deadline`](beam_engine::Machine::wait_deadline) — the
+    /// [`WaitDeadline { delay_ms, resume }`](WaitDeadline) pair, whose `resume` is the
+    /// `timeout` opcode directly after the parked `wait_timeout` (the C-faithful timed-out
+    /// path: the `timeout` instruction resets the scan and continues).
+    ///
+    /// A **scheduled** process gets that timer from the scheduler pass (a receive deadline it
+    /// arms and resumes), but the machine a nested run drives is not scheduled, so nothing
+    /// would ever fire its deadline: with no other process runnable the pump reports `0` on
+    /// **every** round, so folding that into `Ok(None)` would turn a finite `after T` that only
+    /// its own timeout can satisfy into the typed `blocked()` gap. When the parked
+    /// `wait_timeout` carries a statically readable finite delay this method therefore waits it
+    /// out:
+    ///
+    /// * **Each round** advances the runtime by [`RUN_EXPORT_PUMP_SLICES`] slices. A pump that
+    ///   reported progress means the mailbox may have changed, so the machine is resumed at the
+    ///   address the [`RunOutcome::Wait`] reported: a matching message **wins the race** and its
+    ///   outcome is returned immediately (a message arriving before `T` cancels the deadline,
+    ///   exactly as in the C).
+    /// * **`ran == 0` does not end this branch.** An empty run queue is the *expected* state
+    ///   here — nobody but the timeout can answer the receive — so the bound is the finite
+    ///   delay itself, never an unbounded wait and never a busy-spin: each round sleeps
+    ///   `min(remaining, DEADLINE_PUMP_SLEEP)` before pumping again.
+    /// * **The timeout fires only once the wall clock has really reached `start + delay_ms`**
+    ///   (`Instant` is monotonic and the target is never clamped below `T`), so it can never be
+    ///   delivered early — a wrong value. The resume then re-enters the machine at the `timeout`
+    ///   continuation and that outcome is returned.
+    /// * A resume that re-parks the machine at a **different** suspension (it took the message
+    ///   and its body blocked again) is handed straight back to the driver loop
+    ///   ([`pump_until_returned`]), which re-enters here with the new address so **that**
+    ///   receive's own deadline is recovered and waited for in turn. Firing the old `timeout`
+    ///   continuation there would continue an abandoned receive.
+    ///
+    /// The wait is bounded by `delay_ms` alone, so the outer [`BLOCKING_PUMP_DEADLINE`] —
+    /// checked by [`pump_until_returned`] *between* rounds — never truncates it: a
+    /// `receive … after 60000` really waits its full minute, exactly as the oracle does. The cap
+    /// still protects a process that keeps returning to the driver loop without ever reaching a
+    /// deadline, which is what it is for.
     fn pump_once(
         &mut self,
         machine: &mut Machine,
@@ -952,11 +1018,60 @@ impl<'a> RuntimeContext<'a> {
         if !self.may_pump_scheduler() {
             return Ok(None);
         }
-        let ran = self.runtime.pump_scheduler(RUN_EXPORT_PUMP_SLICES)?;
-        if ran == 0 {
-            return Ok(None);
+        // The parked `receive`'s statically readable finite deadline, when it has one: a bare
+        // `wait`, an `after infinity`, an unreadable delay and "not parked at a wait_timeout at
+        // all" all mean "no deadline" (the honest answer, never a guessed one).
+        let finite = match machine.wait_deadline(module) {
+            Some(WaitDeadline {
+                delay_ms: Some(delay_ms),
+                resume,
+            }) => Some((delay_ms, resume)),
+            _ => None,
+        };
+        let Some((delay_ms, resume)) = finite else {
+            // No deadline: one pump, and a pump that changed nothing ends the drive with the
+            // typed gap (the mailbox cannot have changed).
+            let ran = self.runtime.pump_scheduler(RUN_EXPORT_PUMP_SLICES)?;
+            if ran == 0 {
+                return Ok(None);
+            }
+            return Ok(Some(machine.resume_outcome(module, func, pc, self)?));
+        };
+        let target = Instant::now() + Duration::from_millis(delay_ms);
+        loop {
+            if self.runtime.pump_scheduler(RUN_EXPORT_PUMP_SLICES)? > 0 {
+                let outcome = machine.resume_outcome(module, func, pc, self)?;
+                match outcome {
+                    RunOutcome::Returned(_) => return Ok(Some(outcome)),
+                    RunOutcome::Wait { func: f, pc: p } => {
+                        // The machine re-parked. If it is no longer waiting on **this** receive
+                        // (the message arrived and its body blocked in a new one), hand the new
+                        // position back to the driver: it re-enters here and recovers the new
+                        // receive's own deadline.
+                        if machine.wait_deadline(module)
+                            != Some(WaitDeadline {
+                                delay_ms: Some(delay_ms),
+                                resume,
+                            })
+                        {
+                            return Ok(Some(RunOutcome::Wait { func: f, pc: p }));
+                        }
+                    }
+                }
+            }
+            let now = Instant::now();
+            if now >= target {
+                // The deadline has really elapsed: continue at the `timeout` opcode.
+                return Ok(Some(
+                    machine.resume_outcome(module, resume.0, resume.1, self)?,
+                ));
+            }
+            std::thread::sleep(
+                target
+                    .saturating_duration_since(now)
+                    .min(DEADLINE_PUMP_SLEEP),
+            );
         }
-        Ok(Some(machine.resume_outcome(module, func, pc, self)?))
     }
 
     /// Records the module whose **code** this context is about to execute — the BIF call

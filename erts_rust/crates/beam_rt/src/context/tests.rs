@@ -20,7 +20,7 @@
 
 use beam_bifs::{AtomInterner, BifRegistry, BytesSink, LocalFunIdentity, LocalNode};
 use beam_engine::RunOutcome;
-use beam_term::{atom_val, is_small, make_small, signed_value, Atom, AtomTable, NIL};
+use beam_term::{atom_val, is_small, make_atom, make_small, signed_value, Atom, AtomTable, NIL};
 
 use super::*;
 use crate::config::RuntimeConfig;
@@ -2646,4 +2646,122 @@ fn a_step_that_reports_nothing_ran_keeps_the_typed_blocked_gap() {
     )
     .expect_err("nothing ran is the blocked gap");
     assert_eq!(error.to_string(), beam_engine::blocked().to_string());
+}
+
+// -----------------------------------------------------------------------
+// the nested run's own finite `receive … after T` deadline
+// -----------------------------------------------------------------------
+
+/// The committed `receive … after T` fixture (regeneration recipe in
+/// `tests/fixtures/README.md`): every export pins one literal-timeout opcode shape.
+const RECV_AFTER_BEAM: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/recv_after.beam"
+);
+
+/// A **nested run** — the [`RuntimeContext::run_export_blocking`] route the `-eval` driver
+/// and the fun bridge use — really delivers the timeout value of a finite
+/// `receive … after T` that only its own deadline can satisfy.
+///
+/// The engine arms **no** timer for a `wait_timeout`, and the machine a nested run drives is
+/// not a scheduled process, so no scheduler pass ever fires this deadline: with an empty run
+/// queue the pump reports `0` on every round. [`super::RuntimeContext::pump_once`] therefore
+/// recovers the deadline through
+/// [`Machine::wait_deadline`](beam_engine::Machine::wait_deadline) and waits it out itself —
+/// without that, this very call is the typed `blocked()` gap. Oracle:
+/// `recv_after:after20()` ⇒ `timeout`.
+#[test]
+fn a_nested_finite_receive_delivers_its_timeout() {
+    let image = beam_loader::load_file(RECV_AFTER_BEAM).expect("load recv_after.beam");
+    // The fixture's own `timeout` atom is the one its code stream carries, so the term the
+    // machine returns is exactly this atom.
+    let expected = image
+        .atom_table
+        .lookup("timeout")
+        .expect("the fixture names `timeout`");
+    let mut rt = runtime();
+
+    let started = Instant::now();
+    let value = {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        ctx.run_export(&image, "after20", 0, &[])
+            .expect("the nested run waits its own deadline out")
+    };
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        value,
+        make_atom(expected),
+        "the `after` body ran: the timeout value, never the typed `blocked()` gap"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(20),
+        "the timeout is never delivered before its 20 ms delay has really elapsed \
+         (took {elapsed:?})"
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "the wait ends at the deadline rather than spinning out the safety cap \
+         (took {elapsed:?})"
+    );
+}
+
+/// The negative control for the case above: a parked `receive … after infinity` compiles to a
+/// bare `wait`, so [`Machine::wait_deadline`](beam_engine::Machine::wait_deadline) reports
+/// `delay_ms: None` — no deadline to wait for. The unchanged pump rule therefore stands: one
+/// pump that reports nothing ran is the honest typed `blocked()` gap, never a wait for a
+/// deadline that does not exist (and never a hang).
+#[test]
+fn a_nested_infinite_receive_keeps_the_typed_blocked_gap() {
+    let image = beam_loader::load_file(RECV_AFTER_BEAM).expect("load recv_after.beam");
+    let mut rt = runtime();
+    let error = {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        ctx.run_export(&image, "wait_forever", 0, &[])
+            .expect_err("`after infinity` has no deadline to wait for")
+    };
+    assert_eq!(error.to_string(), beam_engine::blocked().to_string());
+}
+
+/// The **other** half of the finite-`after` branch: a message that arrives before the deadline
+/// wins the race, and the abandoned deadline is not also fired.
+///
+/// Oracle: a receiver parked in `receive X -> X after 2000 -> timeout end` that is sent a
+/// message returns **that message** — the send cancels the deadline, so the answer is neither
+/// `timeout` nor a wait for the full 2000 ms. The message reaches the very mailbox the nested
+/// run scans through the pump itself (`erlang:send_after/3`'s due deadline is fired by the
+/// scheduler pass), so this pins the "a pump that reported progress resumes the machine and a
+/// non-`Wait` outcome is returned at once" half of
+/// [`super::RuntimeContext::pump_once`] on the finite path.
+#[test]
+fn a_message_beats_a_nested_finite_receive_deadline() {
+    let image = beam_loader::load_file(RECV_AFTER_BEAM).expect("load recv_after.beam");
+    let mut rt = runtime();
+    let me = self_term(&rt);
+    let message = make_small(42);
+
+    let mut ctx = RuntimeContext::new(&mut rt);
+    // 5 ms — far below `after2000/0`'s 2000 ms deadline, so the message can only win it.
+    let _reference = ctx
+        .call_bif("erlang", "send_after", 3, &[make_small(5), me, message])
+        .expect("arm a 5 ms timer to the runtime's own mailbox");
+
+    let started = Instant::now();
+    let value = ctx
+        .run_export(&image, "after2000", 0, &[])
+        .expect("the pump delivers the timed message and the receive takes it");
+    let elapsed = started.elapsed();
+
+    assert_eq!(value, message, "the message cancelled the deadline");
+    assert!(
+        elapsed < Duration::from_millis(1000),
+        "the 2000 ms deadline was abandoned, not waited out (took {elapsed:?})"
+    );
+    let mailbox = ctx
+        .runtime
+        .processes
+        .get(ctx.runtime.self_pid)
+        .expect("the runtime process")
+        .mailbox();
+    assert!(mailbox.is_empty(), "the receive removed the message");
 }
