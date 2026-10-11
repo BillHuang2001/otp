@@ -22,9 +22,10 @@ Suites that need the oracle skip **loudly** when `erl`/`erlc` are absent. `tests
 * A.5 distribution → `dist.rs`, `dist_delivery.rs`, `node_cookie.rs`, `pid_roundtrip.rs`
 * A.3 NIF / off-heap → `nif.rs` (real C NIF), `etf_roundtrip_pid_ref.rs`, `engine_off_heap_transport.rs`
 * Processes / spawn / monitor / signals → `spawn_monitor.rs`, `spawn_from_slice.rs`, `spawn_opts.rs`, `monitor.rs`, `alias.rs` (reference aliases as `send` destinations: `alias/1`, `unalias/1`, `monitor/3`'s `{alias, Mode}`, the compiled `Alias ! Msg` and the `erlang:send/2` route, `gen:reply/2` and real `gen_server` calls), `exit.rs`, `group_leader.rs`, `timers.rs`, `proc_seams.rs`
-* GC / heap → `gc_collect.rs`, `gc_run.rs`, `heap_growth.rs`, `heap_limits.rs`, `garbage_collect.rs`
+* GC / heap → `gc_collect.rs`, `gc_run.rs`, `heap_growth.rs`, `heap_limits.rs`, `garbage_collect.rs`, `eval_exempt_receiver_signal.rs` (a `'DOWN'`/`'EXIT'` control signal aimed at the `-eval` route's relocation-exempt root, with a roomy and with a saturated nursery)
 * ETS → `ets_owner.rs`
-* Errors / terms → `structured_errors.rs`, `function_clause.rs`, `send.rs`, `eval.rs` (the `-eval` evaluator + the differential corpus's `Eval` probes)
+* Errors / terms → `structured_errors.rs`, `function_clause.rs`, `send.rs`, `eval.rs` (the `-eval` evaluator + the differential corpus's `Eval` probes), `eval_order.rs` (the `-eval` evaluator's sub-expression evaluation order, oracle-cross-checked)
+* A.9 build/bootstrapping → `compile_file.rs` (`compile:forms/2` and `compile:file/2` driven in-process, with the artifact differentially compared to the oracle's)
 * File I/O / io → `file_server.rs`, `io_scan.rs`, `empty_binary_result.rs`
 * Harness + fixtures → `support/mod.rs` (bounded child runner, oracle discovery, `skip_loudly`), `fixtures/` (committed `.beam`/`.erl`/`.c` + `fixtures/README.md` — what each fixture is and how each is (re)built)
 
