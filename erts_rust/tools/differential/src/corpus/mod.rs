@@ -671,10 +671,11 @@ mod tests {
                             // (see `super::driver_c`).
                             | Contract::DriverAbi
                             // `selfhost` (A.9): a module-run case that compiles a module
-                            // **in-process** — `compile:file/2` in the calling process
-                            // (`no_spawn_compiler_process`, `deterministic`) writing the
-                            // object code into the case's own outdir — evidences the
-                            // build/bootstrapping contract directly: hosting that route is a
+                            // **in-process** — `compile:file/2` (`deterministic`) writing the
+                            // object code into the case's own outdir, both in the calling
+                            // process (`no_spawn_compiler_process`) and through `compile:file/2`'s
+                            // own compiler process (the default shape) — evidences the
+                            // build/bootstrapping contract directly: hosting those routes is a
                             // prerequisite of the self-hosted build (see `super::selfhost`).
                             | Contract::Build
                     )),
