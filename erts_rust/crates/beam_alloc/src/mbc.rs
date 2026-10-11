@@ -191,10 +191,6 @@ pub struct MbcCarrier {
     live_blocks: usize,
 }
 
-// The allocator wiring (a follow-up task) adopts this module; until then only this
-// module's own tests drive it, so the operational API is not reachable from a
-// non-test build's dead-code analysis yet.
-#[allow(dead_code)]
 impl MbcCarrier {
     /// Maps a carrier of `size` bytes (rounded up to [`UNIT_SIZE`], at least
     /// [`MIN_MBC_BLOCK_SIZE`]) and turns the whole of it into one free block.
