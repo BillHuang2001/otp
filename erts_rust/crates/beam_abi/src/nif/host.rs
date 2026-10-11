@@ -120,6 +120,14 @@ pub trait NifHost {
     }
 
     /// The NIF library's private data pointer (C `enif_priv_data`); default: null.
+    ///
+    /// **This hook is the fallback source, not the primary one.** `enif_priv_data` answers the
+    /// private pointer of the library the call belongs to — [`crate::nif::loader::NifLibrary`]
+    /// publishes the pointer its `load` callback produced for the duration of
+    /// [`crate::nif::loader::NifLibrary::call`], and that published value (the C's
+    /// `env->mod_nif->priv_data`) wins whenever a library call is in progress. This hook is consulted
+    /// only when **no** library call is in flight, so it exists for a host that manages private data
+    /// itself; its default null matches the C's answer for a call env whose `load` stored nothing.
     fn priv_data(&mut self) -> *mut c_void {
         core::ptr::null_mut()
     }

@@ -38,7 +38,8 @@
 //!   touched; a serviced registration returns the host's non-negative code (`:1464`, `:1467`), and
 //!   an unserviceable one is negative (the documented `retval < 0` failure idiom).
 //! * `enif_priv_data` — `env->mod_nif->priv_data` (`erl_nif.c:609-612`), the pointer the library's
-//!   `load` callback stored.
+//!   `load` callback stored; the host's [`beam_abi::NifHost::priv_data`] hook is the source only when
+//!   no library call is in progress.
 //! * `enif_make_copy` — `make_copy(dst_env, src_term, NULL)` (`erl_nif.c:1194-1197`). With no copy
 //!   engine behind the `NifHost::make_copy` hook this crate answers `THE_NON_VALUE` (raw 0) — never
 //!   a term aliasing the source env's memory.
@@ -61,7 +62,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use beam_abi::common::{ErlNifSelectFlags, ERL_NIF_SELECT_INVALID_EVENT};
-use beam_abi::nif::enif::{enif_alloc_env, enif_free_env};
+use beam_abi::nif::enif::{enif_alloc_env, enif_free_env, enif_priv_data};
 use beam_abi::nif::loader::load;
 use beam_abi::nif::types::{ErlNifEnv, ErlNifEvent};
 use beam_abi::{NifEnv, NifHost};
@@ -343,33 +344,38 @@ fn select_reproduces_the_cs_invalid_event_and_failure_codes() {
 // ---------------------------------------------------------------------------------------------
 
 #[test]
-fn priv_data_and_make_copy_go_through_the_host_hooks() {
+fn priv_data_is_the_library_pointer_and_the_host_is_the_no_call_fallback() {
     let Some(so) = compile_fixture() else { return };
     let Some(path) = so_path(&so) else { return };
 
-    // A host WITH private data: the fixture's `enif_priv_data(env) != NULL`.
+    // The fixture's `load` callback stored `&priv_marker`, so inside a call `enif_priv_data` answers
+    // that pointer — `env->mod_nif->priv_data` — whatever the host hook says.
     let (mut host, lib) = loaded(&path, None, true);
     {
         let mut env = NifEnv::new(&mut host);
         assert_same(
             lib.call(&mut env, "priv_data", 0, &[]).expect("priv_data/0"),
             make_small(1),
-            "enif_priv_data reports the host's private data pointer",
+            "enif_priv_data reports the library's stored private pointer",
         );
         assert_same(
             lib.call(&mut env, "make_copy", 0, &[]).expect("make_copy/0"),
             make_small(0),
             "with no copy engine the answer is THE_NON_VALUE",
         );
+        // Outside a call the library is not in flight, so the host hook is the source: non-NULL on a
+        // host that has private data of its own...
+        // SAFETY: `env` is a live env.
+        assert!(!unsafe { enif_priv_data(env.as_ptr()) }.is_null());
     }
 
-    // A host WITHOUT private data answers NULL (as a call env whose `load` stored nothing).
-    let (mut host, lib) = loaded(&path, None, false);
+    // ...and NULL on a host without private data.
+    let (mut host, _lib) = loaded(&path, None, false);
     let mut env = NifEnv::new(&mut host);
-    assert_same(
-        lib.call(&mut env, "priv_data", 0, &[]).expect("priv_data/0"),
-        make_small(0),
-        "a host without private data reports NULL",
+    // SAFETY: `env` is a live env.
+    assert!(
+        unsafe { enif_priv_data(env.as_ptr()) }.is_null(),
+        "a host without private data answers NULL outside a library call"
     );
 }
 
