@@ -36,6 +36,8 @@
 //!   process-only registry cannot resolve) ⇒ [`named_port_monitor`],
 //! * an `erlang:monitor/3` `{tag, Tag}` whose `Tag` is not a heap-independent immediate ⇒
 //!   [`unsupported_tag`],
+//! * an `erlang:monitor/3` `{alias, Mode}` option on a **port** monitor (whose DOWN/reply cleanup
+//!   sites hold no port table) ⇒ [`unsupported_port_monitor_alias`],
 //! * a genuinely unimplemented capability ⇒ [`unsupported`] (a BEAM `error` raise), so a caller
 //!   never receives a wrong result in place of a typed diagnostic,
 //! * a collection / nursery growth refused because the process is **relocation-exempt** ⇒
@@ -108,6 +110,21 @@ pub(crate) fn relocation_exempt(what: &str) -> BeamError {
 /// (`ProcessTable::monitor_term` and `ProcessTable::monitor_named`) share this one reason.
 pub(crate) fn named_port_monitor() -> BeamError {
     unsupported("monitor/2: named port monitor (the local name registry holds processes only)")
+}
+
+/// The typed diagnostic for an `erlang:monitor/3` `{alias, Mode}` option on a **port** monitor.
+///
+/// A `reply_demonitor` alias must be consumed where a message is delivered *through* it, and
+/// that site ([`ProcessTable::alias_reply_delivered`](crate::ptab::ProcessTable::alias_reply_delivered))
+/// holds no [`PortTable`](crate::port::PortTable) — so the port's incoming
+/// [`PortMonitor`](crate::port::PortMonitor) could not be removed together with the alias.
+/// Leaving it behind would make a later
+/// [`port_closed`](crate::ptab::ProcessTable::port_closed) deliver a `{'DOWN', …}` the oracle
+/// never delivers (a **wrong result**), so the honest typed diagnostic is raised instead. No
+/// caller in OTP combines the two (`gen`'s call paths alias a **process** monitor), and the
+/// `{tag, Tag}` option is unaffected.
+pub(crate) fn unsupported_port_monitor_alias() -> BeamError {
+    unsupported("monitor/3: {alias, Mode} on a port monitor (the DOWN and reply paths hold no port table)")
 }
 
 /// The typed diagnostic for an `erlang:monitor/3` `{tag, Tag}` whose `Tag` is **not** a

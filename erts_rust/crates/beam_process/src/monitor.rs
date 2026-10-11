@@ -68,13 +68,38 @@
 //! shared and never moves. A tag that is not an immediate is therefore rejected by the
 //! `ptab.rs` entry points with a typed `unsupported`, so a caller never gets a wrong result.
 //!
-//! Legacy C ground truth (read-only): `erts/emulator/beam/erl_monitor_link.c`.
+//! # Reference aliases (`erlang:alias/1`, `erlang:unalias/1`, `erlang:monitor/3` `{alias, Mode}`)
+//!
+//! An **alias** is a reference a process may be **sent to**: `Alias ! Msg` delivers `Msg` to the
+//! process that created the alias, and the alias **expires** according to its [`UnaliasMode`].
+//! `erlang:alias/1` mints a standalone alias; `erlang:monitor/3`'s `{alias, Mode}` option makes a
+//! monitor's own reference double as one (the C spells both with `erts_make_pid_ref`, the
+//! pid-carrying reference).
+//!
+//! The mode is what makes an alias more than a ref, and its rule is applied at exactly two
+//! points (see `ptab.rs`):
+//!
+//! * where the monitor's **DOWN** is produced, and
+//! * where the monitor is removed by an explicit `erlang:demonitor/1`.
+//!
+//! `explicit_unalias` survives **both** (it lives on as a standalone alias until an explicit
+//! `erlang:unalias/1`), `demonitor` dies at the DOWN, and `reply_demonitor` dies at the DOWN *and*
+//! the moment a message is delivered through it (the reply).
+//!
+//! The creator — the process a message sent to the alias is delivered to — is not part of the
+//! reference here (this crate's [`MonitorRef`] is a bare id; the C packs the creator pid into the
+//! reference), so it is carried beside the mode in the [`AliasEntry`] side table on
+//! [`ProcessTable`](crate::ptab::ProcessTable), exactly like the `{tag, Tag}` user tag above.
+//!
+//! Legacy C ground truth (read-only): `erts/emulator/beam/erl_monitor_link.c`,
+//! `erts/emulator/beam/bif.c` (`erts_monitor_opts`, `monitor`, `demonitor`, `alias_1`,
+//! `unalias_1`) and `erts/emulator/beam/erl_proc_sig_queue.c` (the alias-message and DOWN paths).
 
 use beam_alloc::Heap;
 use beam_common::Result;
 use beam_term::prelude::{
-    boxed_val, header_subtag, is_boxed_term, is_tuple, make_atom, make_boxed, make_header,
-    make_small, signed_value, tuple_element, tuple_size, Atom, Eterm, REF_SUBTAG,
+    boxed_val, header_subtag, internal_ref_id, is_boxed_term, is_tuple, make_atom, make_boxed,
+    make_header, make_small, signed_value, tuple_element, tuple_size, Atom, Eterm, REF_SUBTAG,
 };
 
 use crate::pid::{PortId, ProcessId};
@@ -116,6 +141,73 @@ impl MonitorRef {
         }
         Ok(make_boxed(p as *const Eterm))
     }
+
+    /// Decodes an on-heap internal reference thing — the inverse of [`MonitorRef::to_eterm`].
+    ///
+    /// This is the **destination-to-key** seam of the send path: a message addressed to a
+    /// reference (an `erlang:alias/1` alias, or a `erlang:monitor/3` `{alias, Mode}` monitor's
+    /// own reference) carries the reference **term**, which must be turned back into the
+    /// [`MonitorRef`] the table's alias/demonitor lookup is keyed by.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BeamError::BadArg`] for anything that is not an internal reference: a non-term
+    /// word, a boxed term of another kind, a C-layout reference block, or a block whose id word
+    /// is not a non-negative small integer.
+    ///
+    /// # Robustness
+    ///
+    /// The read is delegated to `beam_term`'s sanctioned M1 reference accessor
+    /// (`internal_ref_id`), which proves the boxed-ness, the `REF_SUBTAG` header **and** the
+    /// payload arity before it touches the id word, so no word is ever read before its existence
+    /// is established (a C-layout three-word block is refused rather than over-read). Its
+    /// `TermError::BadRef` maps to `BadArg` — the oracle's answer for a non-reference argument.
+    pub fn from_eterm(term: Eterm) -> Result<MonitorRef> {
+        // SAFETY: `internal_ref_id` validates every read itself — it rejects a word that is not a
+        // boxed term, a boxed term whose header does not carry `REF_SUBTAG`, a C-layout ref block
+        // (arity 2) and a block whose id word is not a non-negative small integer.
+        let id = unsafe { internal_ref_id(term) }?;
+        Ok(MonitorRef { id })
+    }
+}
+
+/// When a reference **alias** expires — the `erlang:alias/1` and `erlang:monitor/3`
+/// `{alias, Mode}` mode.
+///
+/// The atom-to-mode parse (`explicit_unalias` / `demonitor` / `reply_demonitor`) is the BIF
+/// layer's job (`beam_rt`); this enum is the typed decision the table acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnaliasMode {
+    /// `explicit_unalias` (the C `ERTS_ML_STATE_ALIAS_UNALIAS`, and `erlang:alias/0`'s default):
+    /// the alias is removed **only** by an explicit `erlang:unalias/1`. The monitored target's
+    /// DOWN does not remove it, and neither does an explicit `erlang:demonitor/1` — in both cases
+    /// it lives on as a **standalone** alias (the C replaces the monitor entry with an
+    /// `ERTS_MON_TYPE_ALIAS` one).
+    ExplicitUnalias,
+    /// `demonitor` (the C `ERTS_ML_STATE_ALIAS_DEMONITOR`): the alias is removed when the
+    /// monitor's DOWN is delivered, or when an explicit `erlang:demonitor/1` removes the monitor.
+    /// A message delivered through it does **not** remove it.
+    Demonitor,
+    /// `reply_demonitor` (the C `ERTS_ML_STATE_ALIAS_ONCE`, `erlang:alias([reply])`): the alias is
+    /// removed when a message is delivered through it (the reply) **and** when the monitor's DOWN
+    /// is delivered (or an explicit `erlang:demonitor/1` removes the monitor).
+    ReplyDemonitor,
+}
+
+/// One live alias: **who** a message sent to the reference is delivered to, and **when** the alias
+/// expires.
+///
+/// The C packs the creator's pid into the reference itself (`erts_make_pid_ref`) and keeps the
+/// mode in the monitor entry's flags; this crate's [`MonitorRef`] is a bare id, so both are held
+/// here instead, in the [`ProcessTable`](crate::ptab::ProcessTable) alias side table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AliasEntry {
+    /// The process that created the alias (`erlang:alias/1`'s caller, or the `watcher` of a
+    /// `erlang:monitor/3` `{alias, Mode}` monitor): the process a message sent to the reference is
+    /// **delivered to**.
+    pub owner: ProcessId,
+    /// The rule that expires this alias.
+    pub mode: UnaliasMode,
 }
 
 /// Whether `payload` is the `{'DOWN', Reference, _, _, _}` message for `reference`.
@@ -450,6 +542,66 @@ mod tests {
             let other = second.to_eterm(&mut heap).expect("the ref thing fits");
             assert_ne!(*p.add(3), *boxed_val(other).add(3));
         }
+    }
+
+    #[test]
+    fn monitor_ref_from_eterm_round_trips_and_rejects_every_non_ref() {
+        use beam_term::prelude::AtomTable;
+
+        let mut refs = RefAllocator::new();
+        let reference = refs.next();
+        let _ = refs.next();
+        let second = refs.next();
+
+        let mut heap = Heap::new(16).expect("test heap");
+        let term = reference.to_eterm(&mut heap).expect("the ref thing fits");
+        assert_eq!(
+            MonitorRef::from_eterm(term).expect("an internal ref thing decodes"),
+            reference
+        );
+        // A distinct reference decodes to its own id (the id lives in the last word).
+        let other = second.to_eterm(&mut heap).expect("the ref thing fits");
+        assert_eq!(MonitorRef::from_eterm(other).expect("decodes"), second);
+        assert_ne!(
+            MonitorRef::from_eterm(term).expect("decodes"),
+            MonitorRef::from_eterm(other).expect("decodes")
+        );
+
+        // Non-references: a small integer, a pid immediate, a tuple, a bare header word (the ABI's
+        // `THE_NON_VALUE`) — every one is `badarg`, never a wrong id.
+        for bad in [
+            make_small(7),
+            pid(3).to_eterm(),
+            make_atom(AtomTable::new().intern("not_a_ref")),
+            make_header(3, REF_SUBTAG),
+        ] {
+            assert!(
+                matches!(MonitorRef::from_eterm(bad), Err(BeamError::BadArg)),
+                "a non-reference must be badarg: {bad:?}"
+            );
+        }
+        let tuple = heap.tuple(&[make_small(1), make_small(2)]).expect("fits");
+        assert!(matches!(
+            MonitorRef::from_eterm(tuple),
+            Err(BeamError::BadArg)
+        ));
+
+        // A C-layout reference block (header arity 2, three words) is refused rather than
+        // over-read (its id slot does not exist).
+        let c_layout = {
+            let p = unsafe { heap.alloc_words(3) }.expect("fits");
+            // SAFETY: the three words are exclusively owned and written before escaping.
+            unsafe {
+                *p = make_header(2, REF_SUBTAG);
+                *p.add(1) = make_small(0);
+                *p.add(2) = make_small(0);
+            }
+            make_boxed(p as *const Eterm)
+        };
+        assert!(matches!(
+            MonitorRef::from_eterm(c_layout),
+            Err(BeamError::BadArg)
+        ));
     }
 
     #[test]
