@@ -28,7 +28,10 @@
 //!   lowered up front into **one** sealed [`CodeBuffer`], with a single whole-module
 //!   block-entry table. Because all blocks share a mapping the seam-time
 //!   [`Linker`](super::emit) can link a taken branch to a successor block of **another
-//!   function** (`fib/1`'s tail call into `fib/3`) as a direct jump. This is the layout
+//!   function** (`fib/1`'s tail call into `fib/3`) as a direct jump. The register-file
+//!   guard for this layout is therefore the artifact's **whole-module** highest
+//!   natively-touched register ([`CompiledModule::native_entry`]) — a link may run code
+//!   in another function without returning to the driver. This is the layout
 //!   [`JitBackend::compile`](crate::jit::JitBackend::compile) and
 //!   [`CodeCache::get_or_compile`](crate::jit::cache::CodeCache::get_or_compile)
 //!   produce, and the one every whole-module introspection answers for.
@@ -39,7 +42,10 @@
 //!   sealed [`CodeBuffer`] on that function's first entry ([`CompiledFunction`]). A
 //!   fresh runtime process (a drop-in CLI/`erlc` run, a `tools/bench` sample) therefore
 //!   pays only for the functions it actually enters, while a hot function still compiles
-//!   on its own first entry and keeps its native loop.
+//!   on its own first entry and keeps its native loop. Each function links only its own
+//!   blocks, so this layout's register-file guard is the **entered function's** own
+//!   bound; a cross-function transfer returns the `(func, pc)` word to the driver, which
+//!   re-checks the target function's bound on its own entry.
 //!
 //! The two layouts answer the same queries, and every multi-mapping (lazy) answer is
 //! the aggregate over the functions **currently** compiled: introspection that must
@@ -83,10 +89,6 @@ struct EagerLayout {
     /// that address compiled no block. A flat index (not a `HashMap`) because the
     /// driver probes it on every cross-block jump.
     entries: Vec<Vec<Option<*const u8>>>,
-    /// Per-function `highest_native_register`: the register-file guard the driver
-    /// applies when entering a block **of that function** (see
-    /// [`CompiledModule::native_entry`]).
-    native_bounds: Vec<Option<u32>>,
     /// The whole-module register/block summary.
     summary: Summary,
 }
@@ -159,19 +161,23 @@ fn max_option(a: Option<u32>, b: Option<u32>) -> Option<u32> {
 
 impl CompiledModule {
     /// The **eager** artifact: the sealed buffer `buffer` holds every function's
-    /// blocks, `entries[func][pc]` is the block table, and `native_bounds[func]` the
-    /// per-function register-file guard.
+    /// blocks and `entries[func][pc]` is the block table.
+    ///
+    /// The register-file guard for the eager layout is the **whole-module**
+    /// [`Summary::highest_native_register`] (carried in `summary`), never a per-function
+    /// bound: the seal-time `Linker` links a local tail call directly into another
+    /// function's block within the shared mapping, so entry to a block of *any* function
+    /// may run code that touches the whole module's highest register — the same guarantee
+    /// the pre-split guard gave (see [`CompiledModule::native_entry`]).
     pub(crate) fn eager(
         buffer: CodeBuffer,
         entries: Vec<Vec<Option<*const u8>>>,
-        native_bounds: Vec<Option<u32>>,
         summary: Summary,
     ) -> CompiledModule {
         CompiledModule {
             layout: Layout::Eager(EagerLayout {
                 buffer,
                 entries,
-                native_bounds,
                 summary,
             }),
         }
@@ -207,15 +213,28 @@ impl CompiledModule {
         }
     }
 
-    /// The native entry for `(func, pc)` **together with the register-file bound of the
-    /// function that owns it** — the driver's entry point, and the one place a lazy
-    /// artifact compiles a function.
+    /// The native entry for `(func, pc)` **together with the register-file bound the run
+    /// must satisfy before entering it** — the driver's entry point, and the one place a
+    /// lazy artifact compiles a function.
     ///
     /// `module` is the artifact's own module (the driver holds the active one). For the
     /// lazy layout, a function that has not been entered before is lowered here, once,
     /// and cached; a compilation failure is reported as `None`, which the driver
     /// already interprets as "no native code here" and answers with exactly one
     /// interpreter step — the interpreter-identical behaviour, never a wrong result.
+    ///
+    /// The bound differs by layout, and the difference is load-bearing:
+    ///
+    /// * **Eager** — the **whole-module** `summary.highest_native_register`. The
+    ///   seal-time `Linker` links a local tail call (`call_last`/`call_only`) directly
+    ///   into a successor block **of another function** within the one shared mapping,
+    ///   without returning to the driver; the entered function's own bound therefore
+    ///   does not cover the code such a link runs, so only the whole-module max does.
+    /// * **Lazy** — the **entered function's** own
+    ///   `function.summary.highest_native_register`. Each function owns its own mapping
+    ///   and links only intra-function blocks; a cross-function transfer is absent from
+    ///   the map, so the block returns the target's `(func, pc)` word to the driver,
+    ///   which re-checks the target function's own bound on its own entry.
     pub(crate) fn native_entry(
         &self,
         module: &Module,
@@ -225,8 +244,7 @@ impl CompiledModule {
         match &self.layout {
             Layout::Eager(eager) => {
                 let entry = eager_entry(eager, func, pc)?;
-                let bound = eager.native_bounds.get(func as usize).copied().flatten();
-                Some((entry, bound))
+                Some((entry, eager.summary.highest_native_register))
             }
             Layout::Lazy(_) => {
                 let function = self.function(module, func)?;

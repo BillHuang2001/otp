@@ -50,9 +50,11 @@
 //! whole block ([`Allocation`]): an x-register is either *always* held in its
 //! machine register (and written back at every block exit) or *never* cached, so
 //! the two representations can never disagree. The highest x-register index a block
-//! touches natively — cached or direct — is recorded **per function** (in the
-//! function's [`Summary`], or the whole-module one [`compile_module`] merges) so the
-//! driver can refuse native entry to a machine whose register file does not cover the
+//! touches natively — cached or direct — is recorded per function (in the function's
+//! [`Summary`]); [`compile_module`] merges those into the whole-module [`Summary`],
+//! and that whole-module bound is the register-file guard the driver applies when
+//! entering an **eager** artifact — the one shared mapping whose seal-time links may
+//! tail-call across functions — while the **lazy** layout guards on the single
 //! function it is about to enter (see [`enter_compiled`](super::enter_compiled)).
 //!
 //! **Direct block-to-block linking.** A taken branch to a successor basic block
@@ -259,10 +261,6 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
     }
 
     let mut summary = Summary::default();
-    // Per-function `highest_native_register`: the register-file guard the driver
-    // applies when it enters a block **of that function** (the eager summary above
-    // answers the whole-module question; this answers the entry-time one).
-    let mut native_bounds: Vec<Option<u32>> = vec![None; module.functions.len()];
     for func_index in 0..module.functions.len() {
         let func_summary = emit_function(
             &mut buffer,
@@ -272,12 +270,11 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
             func_index as u32,
             &mut entries[func_index],
         )?;
-        native_bounds[func_index] = func_summary.highest_native_register;
         summary.merge(&func_summary);
     }
 
     buffer.seal()?;
-    Ok(CompiledModule::eager(buffer, entries, native_bounds, summary))
+    Ok(CompiledModule::eager(buffer, entries, summary))
 }
 
 /// Lower **one** function of `module` into its own native artifact.

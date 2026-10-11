@@ -435,10 +435,13 @@ pub(crate) fn run_compiled_resume_outcome(
 
 /// The baseline tier's [`NativeCode`] lookup for `compiled`.
 ///
-/// The register-file guard is computed **per function** at entry time by
-/// [`enter_compiled`] (from the bound [`CompiledModule::native_entry`] returns), not
-/// once for a whole module: a lazy artifact compiles a function only on first entry, so
-/// the function's own highest natively-touched register is what the guard needs.
+/// The register-file guard is applied at entry time by [`enter_compiled`] (from the
+/// bound [`CompiledModule::native_entry`] returns), and the bound it uses depends on the
+/// artifact's layout: an **eager** artifact is guarded by the **whole-module** highest
+/// natively-touched register (its seal-time links may tail-call across functions inside
+/// the one shared mapping), while a **lazy** artifact is guarded by the bound of the
+/// single function being entered (a cross-function transfer round-trips through the
+/// driver and is re-checked there).
 fn block_entries(compiled: &CompiledModule) -> BlockEntries<'_> {
     BlockEntries { compiled }
 }
@@ -471,10 +474,18 @@ impl NativeCode for BlockEntries<'_> {
 /// [`NativeCode::enter`]'s body, shared with the driver's cross-module path. For a
 /// lazy artifact this is the compile-on-entry point: [`CompiledModule::native_entry`]
 /// lowers the owning function on first sight and returns the block's entry together
-/// with **that function's** register-file bound. A block is then entered only when the
-/// running machine's register file covers every register it touches natively; a run
-/// whose file is too short (or an address with no compiled block) returns `None` and
-/// stays on the interpreter step.
+/// with the register-file bound the layout requires. A block is then entered only when
+/// the running machine's register file covers every register it may touch natively; a
+/// run whose file is too short (or an address with no compiled block) returns `None`
+/// and stays on the interpreter step.
+///
+/// The bound is layout-dependent (see [`CompiledModule::native_entry`]): an **eager**
+/// artifact reports the **whole-module** max, because its seal-time links tail-call
+/// directly into other functions' blocks within the shared mapping — the entered
+/// function's own bound would not cover the code such a link runs. A **lazy** artifact
+/// reports the entered **function's** own bound, which is sufficient because each
+/// function owns its mapping and a cross-function transfer returns to the driver (and
+/// is re-checked there on the target function's own entry).
 fn enter_compiled(
     compiled: &CompiledModule,
     module: &Module,
@@ -634,8 +645,8 @@ struct CalleeCode {
     context: u32,
     /// The callee's compiled blocks, from the tier's own store
     /// ([`NativeCode::module_blocks`]); `None` when the tier has none, in which case the
-    /// driver runs the module on its per-instruction interpreter step. The per-function
-    /// register-file guard is applied at entry time ([`enter_compiled`]), not here.
+    /// driver runs the module on its per-instruction interpreter step. The register-file
+    /// guard is applied at entry time ([`enter_compiled`]), not here.
     compiled: Option<Rc<CompiledModule>>,
 }
 
