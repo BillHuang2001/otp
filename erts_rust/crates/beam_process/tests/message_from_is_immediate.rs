@@ -122,7 +122,7 @@ fn fill_remaining_nursery(process: &mut Process) {
 }
 
 // ---------------------------------------------------------------------------
-// Producer 1: the named-monitor DOWN (`build_and_enqueue_down`, site 2)
+// Producer 1: the named-monitor DOWN (`deliver_down_message`, site 2)
 // ---------------------------------------------------------------------------
 
 #[test]
