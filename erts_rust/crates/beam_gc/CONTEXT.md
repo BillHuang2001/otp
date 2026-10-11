@@ -111,7 +111,8 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   - `should_collect(need_words)`; `collect(&mut self, roots) -> Result<Collection>` (reuses
     `Collection`/`CollectionKind`; no new variant); `collect_minor`/`collect_major` (`-> Result<GcStats>`) to
     force a specific collection; `ensure_capacity(need_words, roots)` (same semantics as `Collector`);
-    `minor_gcs()`; `impl HeapObservable`
+    `grow_nursery(need_words)`/`young_contains(ptr)`/`young_space_count()` (the chain seam + observables,
+    same semantics as `Collector`); `minor_gcs()`; `impl HeapObservable`
   - A fullsweep that cannot fit its promotion grows the region (`grow_major`); a `max_heap_words` cap the
     promotion cannot fit returns the typed `heap_exhausted` **before any copy**. Coverage:
     `src/immix_collector/grow_tests.rs`.
