@@ -284,6 +284,32 @@ SMP pool:
     drives three real **GenImmix fullsweeps** through `Process::collect` (`CollectionKind::Major`).
     Deterministic — the strategy/kind assertions and the fixed collect counts, no sleeps / wall-clock
     bounds / oracle.
+37. `off_heap_binaries.rs` (9 tests) — the **process-owned off-heap refc-binary list and its sweep**
+    (`Process::register_off_heap_binary`/`off_heap_binary`/`off_heap_binaries`/`off_heap_binary_count`/
+    `off_heap_binary_bytes`/`declare_off_heap_binary_dead`/`sweep_off_heap_binaries`/
+    `retain_off_heap_binaries`, over the `beam_gc::OffHeap` the process owns). **(Acceptance 1)**
+    `a_live_owned_binary_survives_a_sweep_and_a_collection`: a 200-byte off-heap payload named by a real
+    on-heap `[BinRef][ErlSubBits]` pair rooted in `x(0)` (so a genuine reference is relocated) and also
+    held by a second counted handle survives both a sweep and a `Process::collect` **byte-intact**
+    (`as_bytes()` unchanged, same `data_ptr`) at a consistent refcount (neither over- nor
+    under-decremented). **(Acceptance 2)** `a_declared_dead_owned_binary_is_released_exactly_once`: on an
+    **injected** `AllocRef` the declared-dead payload's block/byte accounting drops to 0
+    (`live_blocks`/`live_bytes`), a second sweep of the same slot releases nothing and the destructor
+    never runs again. **(Acceptance 3)** `slot_indices_stay_valid_across_a_sweep`: a surviving entry
+    keeps its original slot (intact), the released slot resolves to `None` — never to an unrelated
+    shifted-in entry (the list never shifts/reorders/reuses a slot) — and a fresh registration appends at
+    a new index. Plus: `a_sweep_never_frees_a_payload_another_owner_still_holds` (the no-over-decrement
+    half), `a_collection_drives_the_off_heap_sweep` (a rooted collection reclaims a declared death on its
+    own, leaving an undeclared sibling untouched), `registering_a_payload_twice_keeps_one_slot_and_one_reference`
+    (the `MSO(p)` one-reference-per-object invariant), `a_dropped_process_releases_the_binaries_it_still_owns`
+    (the process-death reclamation endpoint of the conservative fallback), `a_faithful_liveness_predicate_can_drive_the_sweep`
+    (the `retain_off_heap_binaries` seam for a party that *can* walk the heap) and
+    `a_collection_without_a_declaration_releases_nothing` (the conservative default). **Every assertion
+    fails to compile on the pre-change code** — HEAD had no process-owned off-heap list and no sweep on
+    the process path, so the registration/read/sweep API does not exist; the released-count and
+    slot-resolution assertions have no old-code counterpart (there was no list to release from).
+    Deterministic — a fixed position-dependent payload, an injected allocator, explicit
+    `collect()`/sweep calls; no sleeps / wall-clock bounds / oracle.
 
 ## Constraints
 - **Anti-flakiness (BINDING).** Every assertion is forced by **synchronization**, never a bare
@@ -303,18 +329,19 @@ SMP pool:
 - Run the whole crate gate with
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_process` (never `cd`,
   sandbox `$HOME` is read-only). Cross-checks against the real system ERTS belong to the sibling
-  `../../../tools/differential/` harness, not here. Current: **431 passed, 0 failed, 1 ignored**.
+  `../../../tools/differential/` harness, not here. Current: **441 passed, 0 failed, 1 ignored**.
 
 ## Routing Table
 - `scheduler.rs`, `messaging.rs`, `signals.rs`, `gc.rs`, `priority.rs`, `pending_signals.rs`,
   `preemption.rs`, `dict.rs`, `fragments.rs`, `scheduler_ports.rs`, `exhaustion.rs`,
   `signal_exhaustion.rs`, `gc_exemption.rs`, `message_relocation.rs`, `gc_refc_binary_message.rs`,
-  `off_heap_send_isolation.rs`, `message_from_is_immediate.rs` →
+  `off_heap_send_isolation.rs`, `message_from_is_immediate.rs`, `off_heap_binaries.rs` →
   the single-threaded scheduler (incl. the port-aware slice cleanup), mailbox, signals, GC roots, PCB state,
   pre-emption/fairness, the collect-grow-and-retry exhaustion path of `Process::deliver` and the
-  `{'EXIT',…}`/`{'DOWN',…}` signal builders, the host-controllable GC relocation exemption, and the
+  `{'EXIT',…}`/`{'DOWN',…}` signal builders, the host-controllable GC relocation exemption, the
   collection's queued-message re-install (a fragment-resident/off-heap-owning message keeps its whole
-  envelope across a collect)
+  envelope across a collect), and the **process-owned off-heap refc-binary list** (registration, the
+  caller-declared sweep on the collection path, slot stability, and the conservative predicate)
 - `registry_monitors.rs`, `monitor_tag.rs`, `capability_inventory.rs`, `process_info_source.rs`,
   `spawn_options.rs`, `collector_dispatch.rs`, `lifecycle_oracle.rs` → the process-control surface: name registry + monitors (incl.
   the `monitor/3` user tag), the typed-error/capability inventory, the `process_info` item→accessor

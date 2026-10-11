@@ -34,7 +34,10 @@ Honors the crate-layer root-set contract: `x_reg_array[0..Live)` **plus the whol
   is below it, so a default process still collects with the copying space), `relocation_exempt: bool`,
   `off_heap: beam_message::OffHeapTable` (the process's **persistent** off-heap table — a queued
   signal's reason objects and a host's moved-fragment objects; the send path stages through its own
-  fresh table, never this one), `mailbox: beam_message::Queue`, `regs: Registers`, `dict: Dict`, `saved_args:
+  fresh table, never this one), `owned_binaries: beam_gc::OffHeap` + `owned_binary_slots: usize` +
+  `dead_binaries: Vec<usize>` (the process's **owned off-heap refc-binary list**, its slot-space
+  counter and its declared-death worklist — see the owned-off-heap-binaries bullet below),
+  `mailbox: beam_message::Queue`, `regs: Registers`, `dict: Dict`, `saved_args:
   SavedArgs`, `signals: SignalQueue`, `reductions: u64`, `links: Links`, `monitors: Monitors`
   (outgoing process monitors), `monitored_by: Vec<MonitoredBy>` (incoming),
   `port_monitors: Vec<PortWatch>` (outgoing port watches), `exit_reason: Option<Eterm>`.
@@ -52,6 +55,22 @@ Honors the crate-layer root-set contract: `x_reg_array[0..Live)` **plus the whol
     `dict(_mut)`, `saved_args(_mut)`, `signals(_mut)`/`pending_signals()`, `off_heap(_mut)`,
     `links(_mut)`, `monitors(_mut)`, `monitored_by(_mut)`, `port_monitors(_mut)`,
     `exit_reason`/`set_exit_reason`.
+  - **owned off-heap binaries:** the process's second, **process-owned** `beam_gc::OffHeap` (distinct
+    from `off_heap` — that table is the message-transit one and is never swept). API:
+    `register_off_heap_binary(RefcBinary) -> usize` (takes ownership of one handle; **one slot per
+    payload** — a duplicate registration returns the existing slot and drops the surplus handle, the
+    legacy `MSO(p)` invariant), the read accessors `off_heap_binary(slot) -> Option<&RefcBinary>`,
+    `off_heap_binaries() -> impl Iterator<Item = &RefcBinary>` (live, slot order),
+    `off_heap_binary_count()`, `off_heap_binary_bytes()` (the live payload bytes — the `system_info`
+    memory hook); the explicit **provable-death** signal
+    `declare_off_heap_binary_dead(slot) -> bool`; the sweep drive points
+    `sweep_off_heap_binaries() -> usize` (**crate-driven**: the last step of every
+    `run_rooted_collection`, releasing exactly the declared-dead entries and retaining everything
+    else) and `retain_off_heap_binaries(is_live) -> usize` (the caller-predicate form, for a party
+    that *can* decide liveness — a collector/host heap scan). Slots are stable for the process's
+    lifetime (a survivor keeps its slot, a released slot answers `None` and is never reused). See
+    `DESIGN_DECISIONS.md` for why the release is deferred, why the list holds one reference per
+    payload, and why the predicate cannot be more precise from inside this crate.
   - **split borrows** (each destructures `self`; safe Rust, no raw pointer, so the compiler proves the
     two `&mut` are disjoint fields of `AnyCollector`/`Process`): `heap_and_off_heap_mut(&mut self) -> (&mut
     Heap, &mut OffHeapTable)` hands out the young heap and the off-heap table together, so a caller can
@@ -99,6 +118,10 @@ Honors the crate-layer root-set contract: `x_reg_array[0..Live)` **plus the whol
     is outside every evacuated range, so the collector leaves it in place.
     A queued payload referencing an off-heap refc binary therefore stays alive across the
     collection (the `tests/gc_refc_binary_message.rs` bullet in Test Strategy).
+    Every construction ends with `sweep_off_heap_binaries()` — the process's **owned off-heap
+    refc-binary reclamation** (see the owned-off-heap-binaries bullet above). It is a no-op unless
+    the caller declared a death, so a collection can never free a payload no caller asserted dead;
+    releasing a payload moves no heap word, which is why it runs after the write-back.
   - **relocation exemption:** `set_relocation_exempt(&mut self, exempt: bool)` /
     `is_relocation_exempt(&self) -> bool` (default `false`) — a per-`Process` flag a host sets when it
     holds live terms from this process's young heap in Rust locals / nested-`Machine` registers that are
@@ -320,8 +343,9 @@ The **local record** of a process's relationships with processes on other nodes;
   (`exit_policy` table; builder arity + head/tag atoms), `signal_queue` (FIFO, GC round-trip), `port`
   (alloc/reuse + relationship round-trips), `progress` (generation bump), `ptab` (alloc/remove/reuse +
   serial bump, name registry, stale-pid rejection, `deliver` wake list, `take` clearing a pending wake,
-  the trap/link-`EXIT`/`{'DOWN'}` paths waking a blocked recipient).
-- **`tests/` — the integration evidence pinning the M1 guarantees.** **36 files**, one topic each; the
+  the trap/link-`EXIT`/`{'DOWN'}` paths waking a blocked recipient), `process` (the PCB flags/state and
+  the owned off-heap binary registration/dedup/declared-death sweep).
+- **`tests/` — the integration evidence pinning the M1 guarantees.** **37 files**, one topic each; the
   authoritative per-file list lives in **`tests/CONTEXT.md`**. In short: `scheduler`/`messaging`/
   `signals`/`gc`/`priority`/`pending_signals`/`dict`/`dict_oracle`/`fragments` cover the single-threaded
   scheduler, the mailbox, signals, PCB state and the dictionary (including its `erl`-cross-checked
@@ -353,7 +377,13 @@ The **local record** of a process's relationships with processes on other nodes;
   `collector().kind()` is the strategy its policy resolves to — `Immix` at/above
   `beam_gc::IMMIX_BREAK_EVEN_WORDS`, `Copying` below it and for a default policy; the default's
   `CollectionKind` cadence is unchanged; and the selected strategy collects through the process root
-  set, an Immix fullsweep included); and `terminate_best_effort` the
+  set, an Immix fullsweep included); `off_heap_binaries` the **owned off-heap refc-binary list and its
+  sweep** (a live payload — still named by an on-heap `BinRef` pair and/or a second owner's handle —
+  survives a sweep *and* a collection byte-intact at a consistent refcount; a declared-dead entry is
+  released exactly once at refcount 0 with no double free, observed through an injected allocator's
+  `live_blocks`/`live_bytes`; slot indices stay valid across a sweep and a released slot never resolves
+  to a shifted-in entry; the collection itself drives the sweep; dedup keeps one slot/reference per
+  payload); and `terminate_best_effort` the
   best-effort termination cascade (a failing `DistSignalRouter` and an unreachable peer heap must not
   abort a death — the observer and the port-monitor cleanup still run). `tests/lock_scope.rs` is the
   bounded-quantum-lock evidence (a slice = `ceil(budget/quantum)` runner invocations under one slice; a
@@ -373,8 +403,8 @@ The **local record** of a process's relationships with processes on other nodes;
   hanging.
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p
   beam_process` and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
-  Current total: **431 passed / 0 failed / 1 ignored** (re-run for the live count; in-module unit +
-  integration across the 36 files under `tests/` + 1 doctest; the ignored test is the documented non-yielding-runner hang failure mode
+  Current total: **441 passed / 0 failed / 1 ignored** (re-run for the live count; in-module unit +
+  integration across the 37 files under `tests/` + 1 doctest; the ignored test is the documented non-yielding-runner hang failure mode
   in `preemption.rs`), warning-free. The `oracle_*` suites share **one** `erl` driver
   (`tests/common/mod.rs`), run with `-kernel logger_level none` and normalized stdout so a crashed
   probe helper's `=ERROR REPORT====` block can never make a comparison flaky (see `tests/CONTEXT.md`). Always go through `../../scripts/cargo.sh` (`$HOME` is read-only),
@@ -411,6 +441,21 @@ The rationale (why) behind the frozen API and constraints lives in **`DESIGN_DEC
   signal-vs-message ordering barrier remain follow-ups. The queue itself is unbounded (a `VecDeque`,
   matching the oracle's effectively-unbounded signal queue) with total, defensive GC gather/scatter — it
   has no overflow or panic path.
+- **Off-heap refc-binary reclamation is caller-declared only — there is no automatic liveness scan
+  (owner: `beam_gc` for a public scan-driven predicate, `beam_rt` to drive it).** `Process` now owns
+  the off-heap refc binaries it registers (`owned_binaries`) and **sweeps** them on the process path
+  (`run_rooted_collection`'s last step + `sweep_off_heap_binaries()`) with a deliberately
+  **conservative** predicate: an entry is released only when the caller has asserted the death
+  (`declare_off_heap_binary_dead`). Deciding liveness faithfully would require walking the heap for
+  nested on-heap `BinRef`/`ErlSubBits` containers, and that walk (`beam_gc`'s `copy::move_size` /
+  `for_each_ref` via `live.rs`) is `pub(crate)` to `beam_gc`; a shallow raw-word scan from here would
+  be **unsound** (a `BinRef` may live in the mature space, in a message's `Fragments`, or inside
+  another off-heap payload). Consequences, all leak-not-dangle: a payload no caller declares stays
+  owned until the process dies (its `Drop` frees it at reference count 0); an off-heap binary crossing
+  into a process through the **copy engine** is still owned by the `Message`/`OffHeapTable`, not by
+  `owned_binaries`, so nothing registers it there automatically; and a relocation-exempt process never
+  runs a collection, so its declared deaths wait for an explicit sweep. `retain_off_heap_binaries`
+  is the seam for whoever can walk the heap. Evidence: `tests/off_heap_binaries.rs`.
 - **`Message::from` is NOT a GC root — every producer must store an immediate.** `Process::run_rooted_collection`
   gathers only each queued message's `payload` (`src/process.rs`) and re-enqueues the envelope around that relocated payload, so
   `from`/`token` are never relocated. `Message::from` must therefore be an **immediate**, matching the C's
@@ -532,7 +577,7 @@ The rationale (why) behind the frozen API and constraints lives in **`DESIGN_DEC
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/pid.rs` → `ProcessId`/`PortId` (bit-exact internal pid/port immediates) + id limits
 - `src/registers.rs` → `XRegs`, `Stack`, `Registers` (the root-set containers); `MAX_REG`/`MAX_ARG`
-- `src/process.rs` → `Process` (PCB) incl. `status`/`status_atom`, `with_policy_and_priority`, the `port_monitors` watch set and the per-process **relocation exemption** (`set_relocation_exempt`/`is_relocation_exempt`, honoured by `deliver`/`collect`/`ensure_capacity`/`collect_if_needed`); the `heap_and_off_heap_mut` and `heap_and_mailbox_mut` split borrows; `ProcessState`, `ProcessFlags`, `DeliverOutcome`, `Process::wake`, the priority/`save_calls` accessors, message delivery (raw-refusal short-circuit for an exempt receiver) + GC entry (`collect`/`ensure_capacity` over the shared `run_rooted_collection`) + the dict/saved-args/signal sub-rootsets; the **GC strategy dispatch** — the collector field is a `beam_gc::AnyCollector` built from the spawn policy (`collector() -> &beam_gc::AnyCollector`, whose `kind()` is the strategy the policy resolved to)
+- `src/process.rs` → `Process` (PCB) incl. `status`/`status_atom`, `with_policy_and_priority`, the `port_monitors` watch set and the per-process **relocation exemption** (`set_relocation_exempt`/`is_relocation_exempt`, honoured by `deliver`/`collect`/`ensure_capacity`/`collect_if_needed`); the **owned off-heap refc-binary list** (`register_off_heap_binary`/`off_heap_binary`/`off_heap_binaries`/`off_heap_binary_count`/`off_heap_binary_bytes`, the explicit-death `declare_off_heap_binary_dead`, and the sweep drive points `sweep_off_heap_binaries` (run by every `run_rooted_collection`) / `retain_off_heap_binaries`); the `heap_and_off_heap_mut` and `heap_and_mailbox_mut` split borrows; `ProcessState`, `ProcessFlags`, `DeliverOutcome`, `Process::wake`, the priority/`save_calls` accessors, message delivery (raw-refusal short-circuit for an exempt receiver) + GC entry (`collect`/`ensure_capacity` over the shared `run_rooted_collection`) + the dict/saved-args/signal sub-rootsets + the off-heap binary sweep; the **GC strategy dispatch** — the collector field is a `beam_gc::AnyCollector` built from the spawn policy (`collector() -> &beam_gc::AnyCollector`, whose `kind()` is the strategy the policy resolved to)
 - `src/dict.rs` → `Dict` (process dictionary: put/get/erase/get_keys + GC gather/scatter; keys and `get_keys/1` values compare structurally via `beam_term::compare::eq` through an `Rc<AtomTable>` handle)
 - `src/fragments.rs` → `SavedArgs` (saved BIF/NIF argument roots + GC gather/scatter)
 - `src/run_queue.rs` → `Priority` (max/high/normal/low) + `RunQueue` (four per-priority FIFOs + the LOW/NORMAL fairness-deviation note + `split_off_half` for work stealing + `reprioritize`)
@@ -550,7 +595,7 @@ The rationale (why) behind the frozen API and constraints lives in **`DESIGN_DEC
 - `src/port.rs` → `PortTable` (id alloc + ownership/link/monitor surface, the incoming half of a port monitor), `PortMonitor`, `PortClose`
 - `src/ptab.rs` → `ProcessTable` (pid alloc/lookup + name registry incl. `name_of` + the monitor hub (`monitor`/`noproc`, `demonitor`/`demonitor_flush`, `monitor_named`/`set_local_node`, `monitor_port(_term)`/`demonitor_port`, and the `*_with_tag` variants over their `tags` side table; a target's death resolves both halves — the watcher's outgoing `Monitor` is dropped) + the signal/link hub (incl. a non-live `link` signalling `noproc` from the dead target, and the shared `grow_receiver_for_signal` collect-grow-and-retry-once exhaustion policy its signal builders — `build_signal_term`/`copy_reason_onto`/`deliver_head_signal` — use) + decoupled signal servicing (`service_signals`, `service_signals_with_ports`) + termination (`terminate`, `terminate_with_ports`, the port-threaded `terminate_into` cascade — **best-effort per peer**: `pid` is reclaimed first, so a per-peer failure (a local exit/DOWN signal that cannot be queued, a remote `route` transport error) is dropped-and-logged via `beam_common::beam_error!` and the cascade continues, so the death observer and the port-monitor cleanup always run and `terminate` answers `Ok` for a live pid) + the process-death observer seam + the wake list + `is_process_alive`/`exit_reason` + the remote records + the distribution seam), `ExitEffect`
 - `src/error.rs` → `pub(crate)` error constructors incl. the typed-`unsupported` and typed-`relocation_exempt` raise constructors (no new error type)
-- `tests/*.rs` (34 files) → the integration evidence; the authoritative per-file list is in `tests/CONTEXT.md` (`off_heap_send_isolation.rs` = the send-path staging-table isolation (a send must not drain the receiver's persistent off-heap table); `message_from_is_immediate.rs` = every signal path's `Message::from` is an immediate and survives a collection; `lock_scope.rs` = the bounded-quantum-lock + 1-vs-4-scheduler determinism evidence; `scheduler_ports.rs` = the port-aware scheduler slice cleanup; `exhaustion.rs` = deliver collect-grow-and-retry + on-demand `ensure_capacity` + fail-fast typed exhaustion; `signal_exhaustion.rs` = the same exhaustion policy on the `{'EXIT',…}`/`{'DOWN',…}` signal builders (oversized reason ⇒ nursery grown and delivered; exempt receiver ⇒ raw refusal, no relocation); `gc_exemption.rs` = the host-controllable relocation exemption (the discriminating no-collect/no-relocate white-box evidence + the unexempt counterpart); `lifecycle_oracle.rs` = the `erl`-cross-checked lifecycle semantics (link exit propagation, `kill` under `trap_exit`, exit-reason shapes, `erlang:exit/2` reasons, the registry round trip, `demonitor` `[info]`/`[flush]`); `dict_oracle.rs`/`registry_monitors.rs`/`monitor_tag.rs`/`port_monitor_cleanup.rs` = `erl`-cross-checked semantics; `preemption.rs` = the measured fairness evidence; `capability_inventory.rs` = the typed-error inventory; `split_borrow.rs` = the two split-borrow evidence sets (`heap_and_off_heap_mut` + `Fragments::move_into`; `heap_and_mailbox_mut` + `send_fragmented`); `process_exit_observer.rs`/`port_monitor_cleanup.rs` = the death-side observer + port-monitor cleanup evidence; `terminate_best_effort.rs` = the best-effort termination cascade (a failing `DistSignalRouter` / an unreachable peer heap must not abort the death))
+- `tests/*.rs` (37 files) → the integration evidence; the authoritative per-file list is in `tests/CONTEXT.md` (`off_heap_binaries.rs` = the **process-owned off-heap refc-binary list and its sweep** (a live payload named by an on-heap `[BinRef][ErlSubBits]` pair survives a sweep + a collection byte-intact at a consistent refcount; a declared-dead entry is released exactly once at refcount 0 on the injected allocator's `live_blocks`/`live_bytes`; slots stay valid across a sweep; a faithful caller predicate can drive it); `off_heap_send_isolation.rs` = the send-path staging-table isolation (a send must not drain the receiver's persistent off-heap table); `message_from_is_immediate.rs` = every signal path's `Message::from` is an immediate and survives a collection; `lock_scope.rs` = the bounded-quantum-lock + 1-vs-4-scheduler determinism evidence; `scheduler_ports.rs` = the port-aware scheduler slice cleanup; `exhaustion.rs` = deliver collect-grow-and-retry + on-demand `ensure_capacity` + fail-fast typed exhaustion; `signal_exhaustion.rs` = the same exhaustion policy on the `{'EXIT',…}`/`{'DOWN',…}` signal builders (oversized reason ⇒ nursery grown and delivered; exempt receiver ⇒ raw refusal, no relocation); `gc_exemption.rs` = the host-controllable relocation exemption (the discriminating no-collect/no-relocate white-box evidence + the unexempt counterpart); `lifecycle_oracle.rs` = the `erl`-cross-checked lifecycle semantics (link exit propagation, `kill` under `trap_exit`, exit-reason shapes, `erlang:exit/2` reasons, the registry round trip, `demonitor` `[info]`/`[flush]`); `dict_oracle.rs`/`registry_monitors.rs`/`monitor_tag.rs`/`port_monitor_cleanup.rs` = `erl`-cross-checked semantics; `preemption.rs` = the measured fairness evidence; `capability_inventory.rs` = the typed-error inventory; `split_borrow.rs` = the two split-borrow evidence sets (`heap_and_off_heap_mut` + `Fragments::move_into`; `heap_and_mailbox_mut` + `send_fragmented`); `process_exit_observer.rs`/`port_monitor_cleanup.rs` = the death-side observer + port-monitor cleanup evidence; `terminate_best_effort.rs` = the best-effort termination cascade (a failing `DistSignalRouter` / an unreachable peer heap must not abort the death))
 - `tests/CONTEXT.md` → per-file topic list, the anti-flakiness constraint, the gate command
 - `../../erts/emulator/beam/erl_process.{c,h}` → PCB, scheduler, run queues (read-only ground truth)
 - `../../erts/emulator/beam/erl_thr_progress.c` → the thread-progress barrier ground truth (read-only)
