@@ -3,7 +3,7 @@ name = "beam_io"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Poller/reactor (epoll/kqueue/io_uring), ports and built-in drivers."
+description = "Poller/reactor (epoll/kqueue; no io_uring backend), ports and built-in drivers."
 
 [dependencies]
 beam_common = { path = "../beam_common" }
