@@ -1882,12 +1882,13 @@ fn the_served_statistics_counters_read_the_runtimes_own_state() {
 
 /// A module that imports `erlang:load_nif/2` is recognised as one whose own code **reads its
 /// call site** (see [`module_observes_its_call_site`]), so the cross-module call seam never
-/// enters it in-machine under the *caller's* identity. Every other import is ignored —
-/// including `erlang:term_to_binary/1,2` and `erlang:external_size/1,2`, whose local-fun
-/// `NEW_FUN_EXT` identity is derived by searching every loaded module ([`FunIdentityBridge`]),
-/// not the caller alone, so a stale call site can no longer make it name the wrong module.
+/// enters it in-machine under the *caller's* identity. Every other import is ignored, except
+/// the fun-image BIFs: `erlang:term_to_binary/1,2` and `erlang:external_size/1,2` no longer need
+/// the call site (their local-fun `NEW_FUN_EXT` identity is derived by searching every loaded
+/// module, [`FunIdentityBridge`]) but are kept on the synchronous route as the conservative
+/// guard against the park-window relocation hazard the predicate documents.
 #[test]
-fn only_the_load_nif_import_makes_a_module_site_observant() {
+fn the_call_site_and_guarded_imports_keep_a_callee_off_the_in_machine_route() {
     /// A synthetic module importing exactly `imports` (as `{module, function, arity}`).
     fn module_importing(imports: &[(&str, &str, u32)]) -> Module {
         let mut module = Module::default();
@@ -1903,21 +1904,27 @@ fn only_the_load_nif_import_makes_a_module_site_observant() {
         module
     }
 
-    for observant in [("erlang", "load_nif", 2)] {
-        assert!(
-            module_observes_its_call_site(&module_importing(&[observant])),
-            "{observant:?} reads the call site"
-        );
-    }
-    // The same *names* in a foreign module, a different arity of the same name, and the
-    // fun-image BIFs (now module-independent) are all not the runtime's call-site-reading BIF.
-    for ordinary in [
-        ("erlang", "load_nif", 1),
-        ("erlang", "load_nif", 3),
+    for observant in [
+        ("erlang", "load_nif", 2),
         ("erlang", "term_to_binary", 1),
         ("erlang", "term_to_binary", 2),
         ("erlang", "external_size", 1),
         ("erlang", "external_size", 2),
+    ] {
+        assert!(
+            module_observes_its_call_site(&module_importing(&[observant])),
+            "{observant:?} keeps its module off the in-machine route"
+        );
+    }
+    // The same *names* in a foreign module, a different arity of the same name, and every
+    // unrelated import are all not the runtime's guarded BIFs.
+    for ordinary in [
+        ("erlang", "load_nif", 1),
+        ("erlang", "load_nif", 3),
+        ("erlang", "term_to_binary", 0),
+        ("erlang", "term_to_binary", 3),
+        ("erlang", "external_size", 0),
+        ("erlang", "external_size", 3),
         ("some_module", "load_nif", 2),
         ("some_module", "term_to_binary", 1),
         ("erlang", "+", 2),
@@ -1925,7 +1932,7 @@ fn only_the_load_nif_import_makes_a_module_site_observant() {
     ] {
         assert!(
             !module_observes_its_call_site(&module_importing(&[ordinary])),
-            "{ordinary:?} must not make a module site-observant"
+            "{ordinary:?} must not keep a module off the in-machine route"
         );
     }
     // The predicate is "any import matches", not "the first does".

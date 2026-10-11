@@ -2614,7 +2614,10 @@ impl ExecutionContext for RuntimeContext<'_> {
 }
 
 /// Whether `module`'s **own code** can read the call site it runs at, i.e. whether it imports a
-/// BIF whose answer depends on [`RuntimeContext::current_module`].
+/// BIF whose answer depends on [`RuntimeContext::current_module`] — or, for the second group
+/// below, whether entering it in-machine would expose a known relocation hazard of another
+/// subsystem. Either way the answer means "keep this module on the synchronous `call_bif`
+/// route".
 ///
 /// The engine's cross-module call seam ([`ExecutionContext::resolve_external_call`]) runs a
 /// callee inside the **caller's** machine, and the engine's module-context switch never re-enters
@@ -2629,7 +2632,18 @@ impl ExecutionContext for RuntimeContext<'_> {
 /// `erlang:term_to_binary/1,2` and `erlang:external_size/1,2` resolve the defining module by
 /// searching every loaded module for the fun's own `(uniq, index)` ([`FunIdentityBridge`], which
 /// prefers the caller but is not confined to it), so a callee entering in-machine under a stale
-/// `current_module` still derives the right image.
+/// `current_module` still derives the right image. Those three names are nevertheless kept on the
+/// synchronous route as a **conservative routing guard against a hazard owned elsewhere**: a
+/// callee entered in-machine can park with a live
+/// [`Machine::pending_exception`](beam_engine::Machine) — a term the engine holds and which
+/// `beam_process::Registers::gather_roots` does **not** publish — and a delivery-driven
+/// collection in the park window (`beam_process`'s signal-build heap growth) then relocates the
+/// process heap against that incomplete root set, freeing words the parked machine still points
+/// at. Until `pending_exception` is rooted across `beam_engine`/`beam_process`, entering the
+/// modules that reach that shape in-machine turns the honest typed
+/// [`beam_engine::blocked`] gap of the A.9 `compile:file/2` route into a **wrong result**, so this
+/// clause stays and is removed together with that fix (the clause is why the E0 route reports the
+/// typed gap rather than a compile that silently fails).
 ///
 /// The other `current_module` readers cannot be made wrong by a callee's stale identity:
 /// `records:get_definition/2` resolves its module from its **argument** ([`RecordBridge`] holds no
@@ -2646,8 +2660,13 @@ impl ExecutionContext for RuntimeContext<'_> {
 pub(crate) fn module_observes_its_call_site(module: &Module) -> bool {
     module.imports.iter().any(|import| {
         module.atom_name(import.module) == Some("erlang")
-            && module.atom_name(import.function) == Some("load_nif")
-            && import.arity == 2
+            && match module.atom_name(import.function) {
+                Some("load_nif") => import.arity == 2,
+                Some("term_to_binary") | Some("external_size") => {
+                    import.arity == 1 || import.arity == 2
+                }
+                _ => false,
+            }
     })
 }
 
