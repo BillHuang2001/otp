@@ -142,7 +142,7 @@ The binary's own `run`/`suite` exit codes are unchanged (`0` agree / `1` mismatc
 | A.7 | 404 | 404 | 0 | 0 | 0 |
 | A.8 | 64 | 64 | 0 | 0 | 0 |
 | A.9 | 306 | 304 | 0 | 2 | 0 |
-- **The 2 `unsupported` cases (honest capability gaps, not mismatches).** Each golden is the oracle's own output, so it flips to `agree` automatically once its gap closes:
+- **The 3 `unsupported` cases (honest capability gaps, not mismatches).** Each golden is the oracle's own output, so it flips to `agree` automatically once its gap closes:
   - **`local_fun`:** `wire/new_fun_ext_encode` (A.5, `beam_rt: unsupported: local_fun`) — a lambda is an evaluator closure the `beam_rt` `-eval` path cannot give a faithful `NEW_FUN_EXT` image. `beam_codec` has `Encoder::with_fun_identity`; the remaining blocker is runtime wiring (`beam_rt`). Unclosable by design (an `erl_eval` lambda's closure identity needs `erl_eval`/`erl_scan`/`erl_parse`).
   - **`init:script_id/0`:** `boot_extra/init_script_id_names_the_running_otp_release` (A.9, `beam_rt: unsupported: init:script_id/0 (no boot script has been loaded)`) — the `-eval`/`run` path loads no boot script, so the runtime raises its typed `unsupported`; the oracle answers `{"Erlang/OTP","29"}`. The case asserts `init:script_id() =:= {"Erlang/OTP", erlang:system_info(otp_release)}` (release-independent), so it flips to `agree` once a boot script is loaded.
 - **Several agreeing cases keep a historical `_unsupported` id suffix** (the `-eval` literal/parser shapes, the `erlang:statistics/1` counters, the `monitor/3` `{tag,_}` option, the A.9 boot seam). The suffix is byte-stable so the ids are never renamed; each is an ordinary `agree` case.
