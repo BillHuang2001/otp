@@ -264,7 +264,8 @@ pub struct Machine {
     /// [`Machine::reset`](crate::machine::Machine::reset) leaves it `false`, so a run
     /// that never latches it (e.g. a direct `Machine::step_instruction` call in a
     /// test) cannot leak a stale value from an earlier run.
-    pub(crate) reduce_on: bool,    /// The code address the machine is currently executing, or was most recently
+    pub(crate) reduce_on: bool,
+    /// The code address the machine is currently executing, or was most recently
     /// **suspended** at: `(function index, code offset)`.
     ///
     /// Updated by [`Machine::step_instruction`](crate::machine::Machine) — the
