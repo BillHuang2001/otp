@@ -192,22 +192,12 @@ valve **only** for the documented off-heap-payload capability gap, where the ori
 because it cannot be duplicated.
 
 ### Remaining gaps (owner per link)
-1. **`beam_engine` — a nested run's `receive … after T` timeout does not fire.** The whole-file `file`
-   family completes from a scheduled process, but the **incremental io-device read** (`file:read/2`,
-   `file:read_line/1`) from a scheduled process exits 3 (`unsupported: opcode: run: process blocked
-   (no message available)`) where the `-eval`/pump-capable route agrees with the oracle; it is item 7 of
-   [`../M1_GAPS.md`](../M1_GAPS.md)'s OTP-lifecycle survey.
-2. **`beam_rt` `../native/` — the io-device read path completes from library code.**
-   `{get_until,Enc,_Prompt,Mod,Func,XtraArgs}` and `{get_line,Enc,_Prompt}` are both real request arms
-   (`../native/file_server.rs` dispatches each to `get_until::serve`/`get_line::serve`), so
-   `file:read/2`, `io:scan_erl_exprs/4` and `io:parse_erl_exprs/4` complete and agree with the oracle
-   on the `-eval` route (`../tests/io_scan.rs`), and `io:get_line/2`/`file:read_line/1` through the
-   `{get_line,…}` arm
-   (the colocated `file_server/get_line/tests.rs`).
-   Residual typed gaps in that family include a request `Enc` that is neither `latin1` nor `unicode`
-   (`../native/file_server/get_line.rs`'s request-encoding check, `../native/file_server/get_until.rs`'s)
-   and — for `{get_until,…}` only — a user-supplied continuation whose own code blocks in a `receive`
-   (`../native/file_server/get_until.rs`, module header "A blocking continuation is a typed gap").
+1. **`beam_engine`/`beam_process` — a scheduled `compile:file/2` is the one remaining blocked report.** The incremental io-device read (`file:read/2`, `file:read_line/1`, `io:scan_erl_exprs/4`, `io:parse_erl_exprs/4`) completes from a **scheduled** process and agrees with the oracle (`../tests/scheduled_io_device.rs`, `../tests/io_scan.rs`), as does a `receive … after T` timeout reached through a nested run.
+   The single remaining `unsupported: opcode: run: process blocked (no message available)` is a scheduled `compile:file/2`, a **root-publication gap in a delivery-driven collection** (a live `Machine::pending_exception` term outside `Registers::gather_roots`) that is **not** a read-path issue; [`../M1_GAPS.md`](../M1_GAPS.md)'s OTP-lifecycle survey carries the detail.
+2. **`beam_rt` `../native/` — the io-device read path completes from library code on both routes.**
+   `{get_until,Enc,_Prompt,Mod,Func,XtraArgs}` and `{get_line,Enc,_Prompt}` are both real request arms (`../native/file_server.rs` dispatches each to `get_until::serve`/`get_line::serve`), and the service answers with the tag paired to the request, so `file:read/2`, `io:scan_erl_exprs/4`, `io:parse_erl_exprs/4` and `file:read_line/1` complete and agree with the oracle from the pumped `-eval` route (`../tests/io_scan.rs`) and from a **scheduled** `run` process (`../tests/scheduled_io_device.rs`), and `io:get_line/2` runs through the same `{get_line,…}` arm (the colocated `file_server/get_line/tests.rs`).
+   The residual io-device divergence is a `{get_chars,…}` on a `{encoding,unicode}` **stream** counting BYTES where the oracle counts CHARACTERS, documented in `../native/file_server/CONTEXT.md`.
+   Residual typed gaps in that family include a request `Enc` that is neither `latin1` nor `unicode` (`../native/file_server/get_line.rs`'s request-encoding check, `../native/file_server/get_until.rs`'s) and — for `{get_until,…}` only — a user-supplied continuation whose own code blocks in a `receive` (`../native/file_server/get_until.rs`, module header "A blocking continuation is a typed gap").
    The served device surface and the full gap list are itemised in `../native/CONTEXT.md`.
 3. **`beam_bifs`.** Whatever the started applications still need past the above.
 
