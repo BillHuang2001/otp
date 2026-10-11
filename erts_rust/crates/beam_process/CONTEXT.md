@@ -641,7 +641,7 @@ The rationale (why) behind the frozen API and constraints lives in **`DESIGN_DEC
 - `src/signal.rs` → `SignalAtoms` (incl. `port`/`noproc`), `ExitSignal`, `ReasonClass`, `ExitPolicy`/`exit_policy`, the signal-message builders (exit + `process`/`port`/remote `DOWN`)
 - `src/signal_queue.rs` → `SignalQueue` + `PendingSignal`/`PendingSignalKind` (the decoupled pending-signal queue + its GC gather/scatter)
 - `src/link.rs` → `Links` (bidirectional link set)
-- `src/monitor.rs` → `MonitorRef`, `MonitorKind` (+ `type_name`/`from_type_name`), `PortWatch`, `Monitor`, `MonitoredBy` (field sets frozen — no `tag` field), `Monitors`, `RefAllocator`, `payload_is_down_for`
+- `src/monitor.rs` → `MonitorRef` (+ `to_eterm`/`from_eterm`), `MonitorKind` (+ `type_name`/`from_type_name`), `UnaliasMode`/`AliasEntry` (the reference-alias mode + one alias-table entry), `PortWatch`, `Monitor`, `MonitoredBy` (field sets frozen — no `tag`/`alias` field), `Monitors`, `RefAllocator`, `payload_is_down_for`
 - `src/remote.rs` → `RemotePid`, `PidTarget`, `RemoteMonitor`, `DistSignal`, `DistSignalRouter` (the distribution seam)
 - `src/exit_observer.rs` → `ProcessExitObserver` + `ProcessExit` (the process-death observer seam; invoked once per death by `terminate_into`)
 - `src/port.rs` → `PortTable` (id alloc + ownership/link/monitor surface, the incoming half of a port monitor), `PortMonitor`, `PortClose`
