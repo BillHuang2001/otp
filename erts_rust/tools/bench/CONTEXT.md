@@ -440,7 +440,7 @@ Structural facts that are not numbers (and so belong here):
 ## Reading the current sys-vs-rust gap (verified)
 
 The `foreign` per-call, `list_walk` per-element, and `copy_bound`/`gc_bound` per-op gaps (their current values
-are in `RESULTS.md` §3.4/§3.5) are **real runtime costs, not harness artifacts**. The startup-cancelled metric
+are in `RESULTS.md` §3.4–§3.7) are **real runtime costs, not harness artifacts**. The startup-cancelled metric
 reproduces with a plain shell loop calling `beam_rt -pa <dir> run <mod.beam> <mod>:<fun>/1 <N>` — so CLI
 re-entry, per-call module reloads and per-call GC are all ruled out. It is a `beam_rt` host-context cost:
 `beam_engine`'s interpreter dispatch is itself O(1) and allocation-free per instruction, and the runtime-side
