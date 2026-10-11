@@ -173,6 +173,7 @@ Current: **585 passing / 0 failing / 2 ignored** — **409** lib in-module (`#[c
 - The C-driver suites and the `erl`-oracle cases **skip loudly** without `cc`/`erl_nif.h`/`erl`.
   The C-driver fixtures assert a real `beam_abi::driver::loader::load`; **linking needs BOTH `build.rs`'s `-Wl,--export-dynamic` and a `driver_api_table()` reference from the test binary** (either alone ⇒ `dlopen(RTLD_NOW)` fails with `undefined symbol: driver_mk_port`).
 - The signal suite is serialized on a global `Mutex` (the facility is process-global) and the `cpu_time` suite asserts only monotone/structural properties (real syscalls never exact values).
+- The `drivers::spawn` in-module suite waits on the **condition** (the child-exit latch / the EOF latch) under a 60 s hang guard — never a wall-clock budget tuned for an idle host — and polls the driver's cached reap (`exited()`/`take_exit_status()`), **never `waitpid(2)`** from a test (a raw `waitpid` would steal the driver's reap); the `fs_access` suite skips its `uid == 0`-sensitive refusal case loudly.
 
 ## Design Decisions
 - **`mio` backend.** A portable, safe `Poll`/`Registry`/`Waker` with a one-shot re-arm matching the C's `EPOLLONESHOT`/`EV_ONESHOT`; the public API is **mio-independent** (`RawFd` + `Interest`/`Token`/`Ready`), so an io_uring/`/dev/poll` backend is a drop-in.
