@@ -60,7 +60,7 @@ Oracle answers below are from the system `erl` (OTP 29.1.1 / erts-17.1).
 * **`erl_ddll:loaded_drivers/0`** (`hook_sets.rs:348`) — oracle (this host) `{ok,["tcp_inet","udp_inet","ram_file_drv"]}`. Backing: the `DRIVER_ENTRIES` thread-local registry in `../port/driver.rs:633-643`. Needs a **safe** accessor for `ErlDrvEntry.driver_name` (this crate is `#![deny(unsafe_code)]`); the answer would be this runtime's really-`dlopen`ed C drivers (`spawn` is a Rust driver) — honest but different.
 
 ### NOT closable — genuine, correctly-typed gaps (do not "close")
-* `erlang:alias/1`/`unalias/1` (`hook_sets.rs:365,440`): oracle `unalias(make_ref())` ⇒ `false` (no alias exists); real aliases need monitor-tag plumbing `beam_process` does not expose.
+* `erlang:alias/1`/`unalias/1` (`hook_sets.rs:365,440`): oracle `unalias(make_ref())` ⇒ `false` (no alias exists); `alias/1` ⇒ `unsupported: erlang:alias/1` on this runtime. `beam_process` now exposes the alias plumbing (`create_alias`/`resolve_alias`/`alias_reply_delivered`) and the *send* half is wired (see the alias section above), so closing the creation half is a matter of serving these two BIFs here plus `erlang:monitor/3`'s `{alias, Mode}` form.
 * `statistics(active_tasks|active_tasks_all|total_active_tasks|total_active_tasks_all)`: needs a scheduler's current-process flag; `beam_process::Scheduler` records none (`runtime_hooks.rs:1062-1067`).
 * `statistics(microstate_accounting)`: oracle returns a **non-empty** list of per-thread counters/maps; no MSACC machinery exists.
 * `erts_internal:gather_carrier_info/1`, `erts_internal:ets_super_user/1`: allocator / pid-domain introspection not exposed here.
