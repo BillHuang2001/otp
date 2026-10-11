@@ -47,10 +47,8 @@
 ///   per-process slice budget `DEFAULT_REDUCTIONS_PER_SLICE = CONTEXT_REDS as u32`.
 /// * `beam_rt::info::schedulers` (`crates/beam_rt/src/info/schedulers.rs`) reports
 ///   `erlang:system_info(context_reductions)` as `CONTEXT_REDS`.
-///
-/// One local transcription remains and has yet to adopt this definition:
-///
-/// * `beam_io::port_task::CONTEXT_REDS` (`crates/beam_io/src/port_task.rs`)
+/// * `beam_io::port_task` (`crates/beam_io/src/port_task.rs`) re-exports it and derives its
+///   port-task reduction budgets from it.
 pub const CONTEXT_REDS: usize = 4000;
 
 #[cfg(test)]
