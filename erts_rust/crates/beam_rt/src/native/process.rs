@@ -48,7 +48,7 @@ use std::rc::Rc;
 use beam_common::{BeamError, Result};
 use beam_engine::terms;
 use beam_gc::HeapPolicy;
-use beam_process::{MonitorKind, MonitorRef, Priority, ProcessId};
+use beam_process::{MonitorKind, MonitorRef, Priority, ProcessId, UnaliasMode};
 use beam_term::{atom_val, is_atom, is_small, signed_value, Eterm};
 
 use crate::context::RuntimeContext;
@@ -129,6 +129,83 @@ impl RuntimeContext<'_> {
         let (_reference, term) = self.mint_reference()?;
         self.runtime.references.insert(term, None);
         Ok(term)
+    }
+
+    // -- erlang:alias/1, erlang:unalias/1 ------------------------------------
+
+    /// `erlang:alias/1`: a fresh **standalone reference alias** owned by the caller — a
+    /// reference a process may be sent to (`Alias ! Msg` delivers `Msg` to the caller).
+    ///
+    /// `Opts` is `[explicit_unalias | reply | priority]` (the C's `alias_1`,
+    /// `bif.c:5903-5930`):
+    ///
+    /// * `explicit_unalias` — also the default — keeps the alias until an explicit
+    ///   `erlang:unalias/1`;
+    /// * `reply` makes it a **reply-once** alias (the C's `ERTS_ML_STATE_ALIAS_ONCE`): the
+    ///   first message delivered through it consumes it;
+    /// * `priority` is accepted and **ignored** (the C's `ERTS_ML_FLG_PRIO_ALIAS` only
+    ///   affects the priority signal queue, which this runtime does not model).
+    ///
+    /// A repeated mode follows the C's last-wins assignment. Anything else — a tuple
+    /// included — is the oracle's `badarg`, as is a non-list (an improper tail included).
+    ///
+    /// An alias is **not** a monitor (the C's `ERTS_MON_TYPE_ALIAS`): `erlang:demonitor/1`
+    /// of one answers `true` and leaves the alias in place, exactly as it does for a bare
+    /// `make_ref/0` reference (and `demonitor/2`'s `[info]` boolean is `false`, the oracle's
+    /// answer for a reference that is not a monitor). Only [`Self::unalias_1`] clears it.
+    ///
+    /// The reference is recorded in [`Runtime::references`](crate::Runtime::references) as
+    /// `Some(reference)` — the same shape a monitor records — because that term-keyed registry
+    /// is what tells an alias reference apart from the plain `make_ref/0` ones: both are
+    /// references this runtime minted, and the two id spaces (this runtime's and the process
+    /// table's) are independent, so comparing decoded ids could confuse them.
+    pub(super) fn alias_1(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let options =
+            terms::list_elements(*args.first().ok_or(BeamError::BadArg)?).map_err(|_| BeamError::BadArg)?;
+        let mut mode = UnaliasMode::ExplicitUnalias;
+        for option in options {
+            match self.atom_name(option).as_deref() {
+                Some("explicit_unalias") => mode = UnaliasMode::ExplicitUnalias,
+                Some("reply") => mode = UnaliasMode::ReplyDemonitor,
+                Some("priority") => {}
+                _ => return Err(BeamError::BadArg),
+            }
+        }
+        let owner = self.pid();
+        let reference = self.process_table_mut().create_alias(owner, mode)?;
+        let term = self.reference_term(reference)?;
+        self.runtime.references.insert(term, Some(reference));
+        Ok(term)
+    }
+
+    /// `erlang:unalias/1`: clears the alias the caller holds under `Alias`, answering whether
+    /// one was cleared — the C's `unalias_1` (`bif.c:5947-5978`).
+    ///
+    /// A term that is not a reference at all is the oracle's `badarg`; a reference that backs
+    /// no alias of the caller's — a plain `make_ref/0` reference, a timer's, a monitor's, an
+    /// already-cleared alias, another process's alias — answers `false`.
+    ///
+    /// # Why the term-keyed registry decides
+    ///
+    /// The C reads the creator pid straight out of the reference thing; this crate may not
+    /// (`beam_term::boxed_val` is `unsafe`), so the *term* is the key: only [`Self::alias_1`]
+    /// (and a `{alias, Mode}` monitor, recorded by the monitor path) registers a term as
+    /// `Some(reference)`. A term the registry holds as `None` — a bare `make_ref/0` — or does
+    /// not hold at all (a timer reference) is **not** an alias, so the answer is `false`
+    /// without consulting the table: comparing the decoded id alone would be wrong, because
+    /// this runtime's reference allocator and the process table's are independent and can mint
+    /// the same number.
+    pub(super) fn unalias_1(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let term = *args.first().ok_or(BeamError::BadArg)?;
+        // A non-reference is the oracle's `badarg`; the crate-local `TermError` that
+        // `from_eterm` reports for one is deliberately not surfaced.
+        let _reference = MonitorRef::from_eterm(term).map_err(|_| BeamError::BadArg)?;
+        let owner = self.pid();
+        let cleared = match self.runtime.references.get(&term).copied() {
+            Some(Some(reference)) => self.process_table_mut().unalias(owner, reference)?,
+            Some(None) | None => false,
+        };
+        self.atom(if cleared { "true" } else { "false" })
     }
 
     // -- erlang:spawn/1,2,3, spawn_link/1,2,3, spawn_opt/2,3,4 ----------------
@@ -851,7 +928,7 @@ mod tests {
     use super::*;
     use crate::native::test_support::{atom, call, runtime, system_runtime};
     use beam_process::PortId;
-    use beam_term::make_small;
+    use beam_term::{make_small, NIL};
 
     /// Whether `term` is a reference, asked through the registry's own `is_reference/1`.
     fn is_reference(runtime: &mut crate::Runtime, term: Eterm) -> bool {
@@ -870,6 +947,20 @@ mod tests {
         runtime.atom_name_of(term)
     }
 
+    /// A list built on the process heap by the runtime's own term constructors.
+    fn make_list(runtime: &mut crate::Runtime, elements: &[Eterm]) -> Eterm {
+        let mut sink = beam_bifs::NullSink;
+        let mut context = RuntimeContext::with_output(runtime, &mut sink);
+        terms::make_list(&mut context, elements).expect("a list")
+    }
+
+    /// A tuple built on the process heap by the runtime's own term constructors.
+    fn make_tuple(runtime: &mut crate::Runtime, elements: &[Eterm]) -> Eterm {
+        let mut sink = beam_bifs::NullSink;
+        let mut context = RuntimeContext::with_output(runtime, &mut sink);
+        terms::make_tuple(&mut context, elements).expect("a tuple")
+    }
+
     #[test]
     fn make_ref_returns_a_fresh_reference_each_time() {
         let mut runtime = runtime();
@@ -878,6 +969,150 @@ mod tests {
         assert!(is_reference(&mut runtime, first), "make_ref/0 is a reference");
         assert!(is_reference(&mut runtime, second));
         assert_ne!(first, second, "a reference is never reused");
+    }
+
+    #[test]
+    fn alias_mints_a_reference_the_table_can_deliver_to_and_unalias_clears_it() {
+        let mut runtime = runtime();
+        let empty = make_list(&mut runtime, &[]);
+        let alias = call(&mut runtime, "erlang", "alias", &[empty]).expect("erlang:alias/1");
+        assert!(is_reference(&mut runtime, alias), "alias/1 answers a reference");
+        assert_ne!(
+            alias,
+            call(&mut runtime, "erlang", "make_ref", &[]).expect("make_ref/0"),
+            "the alias is freshly minted"
+        );
+        // The alias really is a send destination: the send path's own lookup resolves it to
+        // the creating process.
+        let reference = MonitorRef::from_eterm(alias).expect("an alias is a reference");
+        assert_eq!(
+            runtime.processes().resolve_alias(reference),
+            Some(runtime.self_pid()),
+            "a message sent to the alias is delivered to its creator"
+        );
+        // `unalias/1` answers `true` once and `false` thereafter (the oracle's answer).
+        let answer = call(&mut runtime, "erlang", "unalias", &[alias]).expect("unalias/1");
+        assert_eq!(atom_name(&runtime, answer), Some("true"));
+        assert_eq!(runtime.processes().resolve_alias(reference), None);
+        let answer = call(&mut runtime, "erlang", "unalias", &[alias]).expect("unalias/1");
+        assert_eq!(atom_name(&runtime, answer), Some("false"));
+    }
+
+    #[test]
+    fn alias_parses_its_option_list_like_the_oracle() {
+        let mut runtime = runtime();
+        // The three accepted shapes: the default, an explicit mode and `priority`.
+        for options in [
+            vec!["explicit_unalias"],
+            vec!["reply"],
+            vec!["priority"],
+            vec!["explicit_unalias", "reply"],
+            vec!["reply", "priority"],
+        ] {
+            let atoms: Vec<Eterm> = options.iter().map(|name| atom(&mut runtime, name)).collect();
+            let list = make_list(&mut runtime, &atoms);
+            let alias = call(&mut runtime, "erlang", "alias", &[list])
+                .unwrap_or_else(|error| panic!("alias({options:?}): {error}"));
+            assert!(is_reference(&mut runtime, alias), "alias({options:?}) is a reference");
+            let cleared = call(&mut runtime, "erlang", "unalias", &[alias]).expect("unalias/1");
+            assert_eq!(
+                atom_name(&runtime, cleared),
+                Some("true"),
+                "alias({options:?}) is a clearable alias"
+            );
+        }
+        // Anything else is the oracle's `badarg`: another atom, a tuple, a non-list element,
+        // and a non-list argument. (`NIL` — the empty list — is the valid default form, so it
+        // is asserted separately below.)
+        let bad = atom(&mut runtime, "bad");
+        let a = atom(&mut runtime, "a");
+        let b = atom(&mut runtime, "b");
+        let tuple = make_tuple(&mut runtime, &[a, b]);
+        for argument in [
+            make_list(&mut runtime, &[bad]),
+            make_list(&mut runtime, &[tuple]),
+            make_list(&mut runtime, &[make_small(1)]),
+            make_small(1),
+            bad,
+            tuple,
+        ] {
+            assert!(
+                matches!(
+                    call(&mut runtime, "erlang", "alias", &[argument]),
+                    Err(BeamError::BadArg)
+                ),
+                "alias({argument:?}) is badarg"
+            );
+        }
+        // The empty list is the documented default (`erlang:alias/0` is `erlang:alias([])`).
+        let alias = call(&mut runtime, "erlang", "alias", &[NIL]).expect("alias([])");
+        assert!(is_reference(&mut runtime, alias));
+        let cleared = call(&mut runtime, "erlang", "unalias", &[alias]).expect("unalias/1");
+        assert_eq!(atom_name(&runtime, cleared), Some("true"));
+        // `[reply | foo]` — an improper tail — is `badarg` too.
+        let improper = {
+            let mut sink = beam_bifs::NullSink;
+            let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
+            terms::make_cons(&mut context, make_small(1), bad).expect("an improper list")
+        };
+        assert!(
+            matches!(
+                call(&mut runtime, "erlang", "alias", &[improper]),
+                Err(BeamError::BadArg)
+            ),
+            "an improper option list is badarg"
+        );
+    }
+
+    #[test]
+    fn unalias_rejects_a_non_reference_and_answers_false_for_a_plain_one() {
+        let mut runtime = runtime();
+        // A plain `make_ref/0` reference is not an alias, and the oracle answers `false`.
+        let plain = call(&mut runtime, "erlang", "make_ref", &[]).expect("make_ref/0");
+        let answer = call(&mut runtime, "erlang", "unalias", &[plain]).expect("unalias/1");
+        assert_eq!(atom_name(&runtime, answer), Some("false"));
+        // A monitor's reference is not an alias either.
+        let process = atom(&mut runtime, "process");
+        let me = runtime.self_pid().to_eterm();
+        let monitored =
+            call(&mut runtime, "erlang", "monitor", &[process, me]).expect("erlang:monitor/2");
+        let answer = call(&mut runtime, "erlang", "unalias", &[monitored]).expect("unalias/1");
+        assert_eq!(atom_name(&runtime, answer), Some("false"));
+        // Anything that is not a reference at all is `badarg`, the oracle's reason.
+        let notaref = atom(&mut runtime, "notaref");
+        for argument in [make_small(42), notaref, NIL] {
+            assert!(
+                matches!(
+                    call(&mut runtime, "erlang", "unalias", &[argument]),
+                    Err(BeamError::BadArg)
+                ),
+                "unalias({argument:?}) is badarg"
+            );
+        }
+    }
+
+    #[test]
+    fn demonitor_of_an_alias_is_true_and_leaves_the_alias_alone() {
+        let mut runtime = runtime();
+        let empty = make_list(&mut runtime, &[]);
+        let alias = call(&mut runtime, "erlang", "alias", &[empty]).expect("erlang:alias/1");
+        // Oracle: `demonitor(Alias)` ⇒ `true`, and the alias survives it.
+        let answer = call(&mut runtime, "erlang", "demonitor", &[alias]).expect("demonitor/1");
+        assert_eq!(atom_name(&runtime, answer), Some("true"));
+        let answer = call(&mut runtime, "erlang", "unalias", &[alias]).expect("unalias/1");
+        assert_eq!(atom_name(&runtime, answer), Some("true"), "the alias survived");
+        // An alias is not a monitor, so `demonitor/2`'s `[info]` boolean is `false` — the
+        // oracle's exact answer for `demonitor(alias([reply]), [info])`.
+        let alias = call(&mut runtime, "erlang", "alias", &[empty]).expect("erlang:alias/1");
+        let info = atom(&mut runtime, "info");
+        let info_list = make_list(&mut runtime, &[info]);
+        let answer = call(&mut runtime, "erlang", "demonitor", &[alias, info_list])
+            .expect("demonitor/2");
+        assert_eq!(atom_name(&runtime, answer), Some("false"));
+        // ... and the plain form still answers `true`.
+        let answer =
+            call(&mut runtime, "erlang", "demonitor", &[alias, empty]).expect("demonitor/2");
+        assert_eq!(atom_name(&runtime, answer), Some("true"));
     }
 
     #[test]
