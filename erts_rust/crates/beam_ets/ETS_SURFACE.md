@@ -243,15 +243,14 @@ These are the reference answers, each compared against the live `erl` (`tests/di
    `TableRead::{iter_keys, iter_keys_rev, iter_objects, iter_objects_rev, foldl, foldr, tab2list_into}`,
    `TableTerm::tuple_elements` and the copy-out `TableTerm::copy_into` — so `beam_bifs` can adopt the
    safe views instead of the raw read family. `Table::set_owner` **is** called (at `ets:new/2`, §7.2).
-7. **Match-spec arithmetic is the small-int/float subset only.** `src/select/expr/arith.rs`'s
+7. **Match-spec arithmetic operators default to the small-int/float subset.** `src/select/expr/arith.rs`'s
    `DefaultArithHook` computes checked `i64` arithmetic and faithful float `+ - * /`, and raises the
    typed `unsupported_ets` for a bignum operand or an integer result that leaves the 60-bit small
-   range. Full arithmetic needs a host-installed hook (`beam_ets::select::expr::set_arith_hook`), so
-   the owners are the number/arithmetic layer (**`beam_term`**, which exposes no big
-   add/sub/compare LCA today) and the runtime (**`beam_bifs`**/**`beam_rt`**, which would install an
-   `ArithHook` on the calling thread). No host installs one yet (`set_arith_hook` appears only in
-   this crate's source and tests), so it stays a typed gap — never a wrong result. This crate never
-   grows its own arithmetic (workspace Prevent-Duplication rule).
+   range. Full arithmetic is a host-installed hook (`beam_ets::select::expr::set_arith_hook`), and the
+   runtime installs one: **`beam_bifs`** (`beam_bifs/src/ets/arith_hook.rs`, arbitrary precision over
+   `beam_term`'s number layer) opens it around every match-spec-evaluating BIF, so the runtime answers
+   the oracle's value while the un-hooked `DefaultArithHook` stays the typed gap — never a wrong result.
+   This crate never grows its own arithmetic (workspace Prevent-Duplication rule).
 8. **`{write_concurrency,_}` is advisory.** `read_concurrency`/`write_concurrency` are parsed and
    reported (`TableOptions`/`TableInfo`) but there is no fine-grained locking; every correctness
    property rests on `SharedTable`'s coarse `Arc<RwLock<Table>>`, whose one `write()` guard spans a
