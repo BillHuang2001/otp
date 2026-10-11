@@ -45,9 +45,12 @@
 //! * `case()` — the E0 route (`no_spawn_compiler_process`): it reports the integer `1` once the
 //!   produced `<outdir>/selfhost.beam` reads back as a non-empty binary, and a distinct integer
 //!   otherwise.
-//! * `sched_case()` — the default shape: it reports `erlang:phash2/1` of the produced `.beam`'s
-//!   `Code` chunk (read back with `beam_lib:chunks/2`), the integer both runtimes must agree on
-//!   because `deterministic` makes two compilations of one source byte-identical.
+//! * `sched_case()` — the default shape: it compiles the staged source **twice** with
+//!   `deterministic` and reports `1` iff the two produced `.beam`s' `Code` chunks (read back
+//!   with `beam_lib:chunks/2`) are byte-identical, a distinct integer otherwise. That equality
+//!   is the documented `deterministic` acceptance criterion, and unlike a bytecode hash it is
+//!   independent of the compiler release and the host, so the oracle reproduces it unchanged on
+//!   any OTP release.
 //!
 //! In both cases the compile's own failure is deliberately **not** caught: a runtime that
 //! cannot host the route must raise its typed capability gap (the CLI then exits `3`), never a
@@ -126,11 +129,13 @@ produced(Beam) ->
 /// * no `no_spawn_compiler_process`, so `compile:file/2` spawns its own compiler process and
 ///   the caller parks in the receive that waits for it — the `erl -noshell -s compile …` /
 ///   `erlc` shape;
-/// * its observable is the produced object code itself: the `.beam` the route wrote into
-///   `<outdir, Dir>` is read back and reduced to `erlang:phash2/1` of its `Code` chunk
-///   (through `beam_lib:chunks/2`). `deterministic` makes two compilations of one source
-///   byte-identical, so that integer is a stable module-run golden (and, once the host runs
-///   the compiler, a real `.beam`-parity assertion rather than a mere "it returned").
+/// * its observable is the produced object code itself, compared against itself: the source is
+///   compiled **twice** and the two `.beam`s' `Code` chunks (read back through
+///   `beam_lib:chunks/2` before the second compile overwrites the first) must be
+///   byte-identical. `deterministic` is exactly the guarantee that they are, so the integer (a
+///   plain `1`) is release- and host-independent — no bytecode hash, so no compiler-version
+///   drift — while still asserting a real `.beam`-parity property once the host runs the
+///   compiler, rather than a mere "it returned".
 const SELFHOST_SCHED_SOURCE: &str = r#"-module(selfhost_sched).
 -export([compile_self/0]).
 
@@ -138,19 +143,30 @@ const SELFHOST_SCHED_SOURCE: &str = r#"-module(selfhost_sched).
 %% `no_spawn_compiler_process`, so `compile:file/2` spawns its compiler process while this one
 %% parks in the receive that waits for it — the `erl -noshell -s compile …` / `erlc` shape.
 %% `{outdir, Dir}` makes its last pass (`save_binary`) write `<outdir>/selfhost_sched.beam`
-%% through the file server. The observable is `phash2/1` of the produced `.beam`'s `Code`
-%% chunk: `deterministic` makes two compilations of one source byte-identical, so the integer
-%% is stable.
+%% through the file server. The observable is the `deterministic` guarantee itself: two
+%% compilations of the staged source produce byte-identical `Code` chunks (1), else a distinct
+%% integer. No bytecode hash is reported, so the golden never depends on the compiler release.
 compile_self() ->
     Dir = filename:dirname(code:which(?MODULE)),
     Source = filename:join(Dir, "selfhost_sched.erl"),
     Staged = filename:join(Dir, "selfhost_sched.staged.erl"),
     {ok, Src} = file:read_file(Source, [raw]),
     ok = file:write_file(Staged, Src),
+    First = compile_code(Source, Dir),
+    Second = compile_code(Source, Dir),
+    case First =:= Second of
+        true -> 1;
+        false -> 2
+    end.
+
+%% One scheduled compile: `compile:file/2`'s own compiler process writes
+%% `<outdir>/selfhost_sched.beam` through the file server, and the produced `.beam`'s `Code`
+%% chunk is read back before the next compile overwrites it.
+compile_code(Source, Dir) ->
     {ok, _Mod} = compile:file(Source, [deterministic, {outdir, Dir}]),
     Beam = filename:join(Dir, "selfhost_sched.beam"),
     {ok, {?MODULE, [{"Code", Code}]}} = beam_lib:chunks(Beam, ["Code"]),
-    erlang:phash2(Code).
+    Code.
 "#;
 
 /// The E0 route case: the in-process `compile:file/2` (`no_spawn_compiler_process`).
@@ -182,7 +198,7 @@ fn sched_case() -> Case {
         id: "selfhost/scheduled_process_compile_file_deterministic",
         description: "the A.9 default shape: recompile the module's own source through \
                       compile:file/2's own compiler process (deterministic, {outdir, Dir}) and \
-                      report erlang:phash2/1 of the produced .beam's Code chunk",
+                      report whether two such compilations yield byte-identical Code chunks",
         contracts: &[Contract::BeamAsm, Contract::Build],
         kind: CaseKind::Module(ModuleRun {
             source: SELFHOST_SCHED_SOURCE,
@@ -193,7 +209,7 @@ fn sched_case() -> Case {
             nif: None,
         }),
         golden: Golden {
-            stdout: Some("7806190"),
+            stdout: Some("1"),
             exit_code: 0,
         },
     }
@@ -247,7 +263,7 @@ mod tests {
         assert_eq!(run_of(&cases[0]).module, "selfhost");
         assert_eq!(run_of(&cases[1]).module, "selfhost_sched");
         assert_eq!(cases[0].golden.stdout, Some("1"));
-        assert_eq!(cases[1].golden.stdout, Some("7806190"));
+        assert_eq!(cases[1].golden.stdout, Some("1"));
     }
 
     #[test]
@@ -274,7 +290,7 @@ mod tests {
     }
 
     #[test]
-    fn the_scheduled_shape_drops_no_spawn_and_reports_the_code_chunk_hash() {
+    fn the_scheduled_shape_drops_no_spawn_and_compares_two_deterministic_object_codes() {
         let cases = group();
         let run = run_of(&cases[1]);
         for needle in [
@@ -283,10 +299,16 @@ mod tests {
             "file:write_file(Staged, Src)",
             "compile:file(Source, [deterministic, {outdir, Dir}])",
             "beam_lib:chunks(Beam, [\"Code\"])",
-            "erlang:phash2(Code).",
+            "First =:= Second",
         ] {
             assert!(run.source.contains(needle), "the route needs {needle:?}");
         }
+        // The observable is a release-independent equality of two compilations, never a
+        // compiler-version-dependent bytecode hash.
+        assert!(
+            !run.source.contains("phash2"),
+            "the golden must not embed a compiler-version-dependent hash"
+        );
         // The shape is the *default* `compile:file/2`: without the option the compiler runs in
         // its own process (the `erl -noshell -s compile …` / `erlc` shape) — that spawn is the
         // whole difference from the E0 case.
@@ -294,7 +316,7 @@ mod tests {
             !run.source.contains("[no_spawn_compiler_process"),
             "the default shape must not keep the compile in the calling process"
         );
-        // The staging write must precede the compile (see the E0 case), and the compile must
+        // The staging write must precede the compile (see the E0 case), and each compile must
         // be observed through the object code it wrote.
         let write = run.source.find("file:write_file(Staged").expect("staging");
         let compile = run.source.find("compile:file(Source").expect("compile");
