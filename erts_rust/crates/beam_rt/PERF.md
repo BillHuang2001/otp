@@ -1,11 +1,11 @@
-# `beam_rt` — performance snapshot (`BEFORE` → `AFTER`)
+# `beam_rt` — performance snapshot (`BEFORE` → `AFTER` → `CURRENT`)
 
-Two **current-state** measurement snapshots of the Rust runtime, taken at two commits with the
-**same method** so the two behavioural changes that landed between them — the execution-tier default
-and the registered-BIF dispatch prologue — can be read off directly. The `BEFORE` snapshot below is
-the original record and is kept **verbatim**; the `AFTER` snapshot is measured on the current tree.
-It is **not** a change log and it does **not** supersede the tool-specific records — for the bench
-driver's full environment record, its per-target tables and its methodology see
+Three **dated, HEAD-labelled** measurement snapshots of the Rust runtime, each taken with the **same
+method** so the behavioural changes that landed between them can be read off directly. `BEFORE` and
+`AFTER` are **historical records kept verbatim** — their figures describe the tree at *their* HEAD, not
+today's — and `CURRENT` is measured at the HEAD named in its own section and is the snapshot to quote
+for the present tree. This file is **not** a change log and does **not** supersede the tool-specific
+records — for the bench driver's full environment record, its per-target tables and its methodology see
 [`../../tools/bench/RESULTS.md`](../../tools/bench/RESULTS.md); for the per-call harness and the
 dispatch-cost narrative see [`TRACE_AND_PERF.md`](TRACE_AND_PERF.md).
 
@@ -352,104 +352,15 @@ registered-BIF round trip to **~79–96 ns/call**, a **≈ 3.5×** reduction, wh
 interpreter pinned, *every* loop (inlined or not) is ~715–751 ns/call, because the interpreter has no
 native `gc_bif` fast path.
 
-## The one-shot cold-start cost — verified characterisation
-
-**The single biggest caveat in the `AFTER` table**: the always-JIT default regresses a
-**short-lived process that enters a large Erlang module graph**, because the baseline tier
-**compiles a module on its first entry** and a one-shot process never amortises it.
-
-Re-verified on the current tree (`86c09ad30c`) with the same `--full` focused cross-runtime pass,
-**3 default passes + 3 `BEAM_RT_TIER=interpreter` passes**, block-interleaved, each column the
-**min over its 3** (host 1-min `/proc/loadavg` ≈ 11–30 throughout):
-
-| workload | case | metric | default (min3) | `BEAM_RT_TIER=interpreter` (min3) | default/interp |
-|---|---|---|---|---|---|
-| `slice` | `string_str_length` | `wall_ms` | **345.03** | **30.62** | **11.27× worse** |
-| `slice` | `queue_from_size` | `wall_ms` | 24.28 | 15.04 | 1.61× worse |
-| `slice` | `add` / `fib` | `wall_ms` | 12.41 / 12.69 | 12.55 / 13.34 | 0.99× / 0.95× |
-| `foreign` | `cowboy_bstr:to_lower/1` | `ns_per_call` | 17 038 | 20 401 | **0.835×** |
-| `foreign` | `cowboy_bstr:capitalize_token/1` | `ns_per_call` | 20 879 | 25 077 | **0.833×** |
-| `foreign` | `emqx_base62:encode/1` | `ns_per_call` | 8 665 | 12 182 | **0.711×** |
-| `foreign` | `emqx_base62:decode/1` | `ns_per_call` | 15 243 | 19 339 | **0.788×** |
-| `list_walk` | — | `ns_per_element` | 141.66 | 143.42 | 0.988× |
-| `copy_bound` | `etf_roundtrip` / `ets_copy` | `ns_per_op` | 83 313 / 3 458 | 81 271 / 3 332 | 1.025× / 1.038× |
-| `copy_bound` | `send_recv` | `ns_per_op` | 216 416 | 146 084 | **1.481× worse** |
-| `gc_bound` | `churn` | `ns_per_op` | 128 662 | 263 375 | **0.489×** |
-| `baseline` | — | `startup_ms` | 13.11 | 12.54 | 1.046× |
-
-The tier effect is therefore: a **1.2×–1.4× win** on `foreign`, a **2× win** on `gc_bound churn`,
-neutral on `list_walk`/`baseline`/`copy_bound`'s `etf_roundtrip`+`ets_copy`, and a **regression**
-on the three cases that re-enter a fresh module graph on a short-lived process
-(`string_str_length` 11.3×, `queue_from_size` 1.61×, `send_recv` 1.48×).
-
-**It is a per-`beam_rt`-OS-process cold start, amortised inside a long-running node — not a per-call
-cost, and not a per-process cost.** Two facts fix the shape:
-
-1. **The compiled-block cache is one `thread_local!` per OS thread, shared by every process**
-   (`crates/beam_engine/src/jit/cache.rs`: `thread_local! { static CODE_CACHE: RefCell<CodeCache> = … }`,
-   keyed by `ModuleKey { name, fingerprint }` over a deterministic hash of the decoded IR). Every
-   `beam_rt` execution is on one thread, so a long-running node (EMQX/Cowboy behind this runtime)
-   compiles a given module **once** and every later process on it reuses the artifact. The regression
-   is only ever paid by a **fresh `beam_rt` OS process** that enters a big module graph and exits.
-2. **Every regressing bench row is exactly that shape.** `tools/bench/src/workloads/slice.rs`'s
-   `execute_case` spawns a **new OS process per sample** (`for _ in 0..runs { Command::new(program) … }`,
-   `runs_for(Full) = 25`) and `slice` is scored as **whole-process wall** — so each of the 25 samples
-   pays the full compile. In one process the work is one-shot anyway: `string:length/1` once costs
-   ~644 ms and *twice* ~611 ms (same work, one compile).
-
-`queue_from_size` (`bslice_queue:from_size/1` → `queue:from_list/1`) and `copy_bound/send_recv` are the
-same shape at smaller scale: a fresh process whose first entry pulls in a module graph the process
-barely uses. Every case is still **correct** (the `run` argument/result self-check passes); `BEFORE`
-cannot be compared to `AFTER` on *whole-process* wall time for a module-graph-heavy case without
-holding the tier constant — hence the `INTERP` column.
-
-### Why the tier decision cannot be moved into `src/runner/` (verified)
-
-A **bounded warm-up** is the obvious mitigation — keep a process on `Tier::Interpreter` for its first
-slice(s) and switch it to the selected tier on a later resume. It is **unsound here**, and the reason
-is measured, not stylistic:
-
-- **The tier decision is only observable at a slice boundary, and the slice boundary is the reduction
-  budget.** In `runner/run.rs` the tier is read from `ProcessEngine::tier` when `engine.parked` is
-  `Some(_)` and selected once when it is `None`; `runner/budget.rs`'s `BudgetProbe::charge` is called
-  from `ensure_heap`/`ensure_heap_full` **only**, i.e. from `Instr::AllocateHeap`/`Instr::TestHeap`
-  (`beam_engine/src/interpreter/dispatch.rs`), which is exactly what makes the slice `Yield`.
-  So "switch on the first *charged* slice" is identical to "switch exactly when the budget was
-  exhausted" — there is no independent notion of "this process has done real work".
-- **The workloads the JIT wins on are single-slice processes that charge *zero* reductions.** Measured
-  with `erlang:process_info(self(), reductions)` at the end of the run (release `beam_rt`, at or above
-  each workload's real loop count): `cowboy_bstr:to_lower/1` N=20 000 → **0** charged;
-  `capitalize_token/1` → **0**; `emqx_base62:decode/1` → **0**; `lists:sum(lists:seq(1,1_000_000))`
-  (`list_walk`'s shape) → **0**; `emqx_base62:encode/1` → 4 000; the `gc_bound churn` shape
-  (cons-churn + `length`/`list_to_binary`/`list_to_tuple`, N=200 000) → 4 000. A binary-accumulating
-  or `call_ext`-only loop allocates no cons cell, reaches no `test_heap`/`allocate_heap`, and
-  therefore never pre-empts.
-- **So the warm-up would cost the very win this workstream exists for.** "First slice on the
-  interpreter" puts `foreign` (the 1.2×–1.4× win) and `list_walk` on the interpreter for their whole
-  life, because they *complete* inside their first slice — reverting `to_lower` from 17 038 to its
-  20 401 ns/call control figure. The policy removes the 11.3× regression only by removing the
-  `foreign` win with it, while `gc_bound churn` (which *does* pre-empt, 4 000 charged) keeps its win
-  either way. There is **no in-crate quantity that distinguishes "this process is hot" from "this
-  process happened to allocate"**.
-- A budget-shortening variant fails for the same reason (a 0-charge loop yields at *every* budget),
-  and a wall-clock/instruction-count variant needs an engine-side signal the runner cannot see.
-
-**The real lever is engine-side, and it is not this node's to pull**: `baseline::compile_module`
-compiles an **entire module** (all functions, all blocks) on first entry, so entering `string` once to
-compute `length("hello")` compiles the whole `string` module (≈7 995 IR instructions; `unicode`,
-which `string:length/1` also enters, is ≈6 270). Per-function (or per-label) lazy compilation, or a
-"compile on the *second* entry of a module", would shrink the compile volume by roughly an order of
-magnitude and is the sound fix. Closing it also removes the *other* precondition a policy would need:
-a running process has no admission point at all in a loop that allocates without
-`test_heap`/`allocate_heap`, so it cannot be re-decided mid-life. Both are `crates/beam_engine/**`.
-
 ## Caveats that invalidate a comparison
 
-- **A one-shot, module-graph-heavy process pays the whole compile cost** (see the section above for
-  the verified characterisation: `string_str_length` 11.27×, `queue_from_size` 1.61×,
-  `send_recv` 1.48× worse than the interpreter column). It is a per-`beam_rt`-OS-process cold start
-  amortised across a long-running node (one thread-local compiled-block cache), so the *interpreter*
-  column is the controlled comparison for a one-shot case.
+- **A one-shot, module-graph-heavy process paid the whole compile cost at this HEAD** — the
+  `string_str_length` 11.27×, `queue_from_size` 1.61× and `send_recv` 1.48× regressions the `AFTER`
+  table records were the **eager whole-module compile** this HEAD carried; the `CURRENT` snapshot below
+  measures the post-lazy-compile behaviour of the same shape (≈ 1.2×, see its cold-start section). What
+  remains is a per-`beam_rt`-OS-process cold start amortised across a long-running node (one
+  thread-local compiled-function cache), so the *interpreter* column is the controlled comparison for a
+  one-shot case.
 - **Absolute latencies are load-polluted** (see the host-load caveat); only ratios/minima are signal.
   `sys` startup `min` moved from 136.52 ms (`BEFORE`) to 160.47 ms (`AFTER`) purely from host
   contention — the `sys` runtime did not change between the snapshots.
@@ -464,12 +375,209 @@ a running process has no admission point at all in a loop that allocates without
   `elixir_compiler`) remain out of scope for this Rust-side snapshot exactly as in `BEFORE`
   (`emqx` still `skipped(emqx-requires-otp-28)`).
 
+# `CURRENT` snapshot — HEAD `da82ffe33c`
+
+## Method
+
+| item | value |
+|---|---|
+| HEAD | `da82ffe33c0896eeb99385ed32ea3eb17a7ed814` (`da82ffe33c`, 2026-10-12 06:18 +0800) — the merge of the two commits that landed the runner's per-instruction reduction charge and `RuntimeContext`'s `reduce` opt-out |
+| Date (UTC) | 2026-10-11 22:14–22:40 UTC |
+| Host / kernel | Linux 7.2.9 `x86_64`, `nproc` = **14** — the **same shared, oversubscribed** host, but this pass ran in a **light window** (see the caveat) |
+| Toolchain | `rustc 1.98.1`, `cargo 1.98.0` |
+| Oracle (`sys`) | system `erl`, **OTP 29.1.1 / erts-17.1** (`/nix/store/khp1dd3fk8476mwg62cinwvk5a17r53s-erlang-29.1.1/.../bin/erl`) |
+| Rust runtime (`rust`) | `erts_rust/target/release/beam_rt` (release), `erlang:system_info(otp_release)` = `"30"` |
+| N | **3** default (`JitMode::Auto`) passes **+ 3** `BEAM_RT_TIER=interpreter` passes; each set reported as the **min over its 3**, with the observed range quoted |
+| Host load (1-min `/proc/loadavg`) | default passes `13.64 → 8.12`, `7.47 → 1.99`, `1.99 → 1.27`; interpreter passes `0.77 → 1.45`, `1.45 → 1.13`, `1.04 → 1.35` — i.e. **≈ 0.8–14** (mostly < 8), far below `BEFORE`/`AFTER`'s ≈ 20–55 |
+
+### Commands
+
+```sh
+# build the runtime and the driver
+erts_rust/scripts/cargo.sh build --release --manifest-path erts_rust/Cargo.toml -p bench -p beam_rt
+
+# 3 x the focused cross-runtime pass on the CURRENT default (Auto => baseline JIT)
+for i in 1 2 3; do
+  erts_rust/target/release/bench run --full --runtime all \
+    --workloads baseline,slice,foreign,list_walk,copy_bound,gc_bound \
+    --out-file $TMPDIR/perf-now/full$i.json
+  erts_rust/target/release/bench compare $TMPDIR/perf-now/full$i.json   # rust/sys within one report
+done
+
+# 3 x the SAME pass with the interpreter pinned — the tier-attribution point
+for i in 1 2 3; do
+  BEAM_RT_TIER=interpreter erts_rust/target/release/bench run --full --runtime all \
+    --workloads baseline,slice,foreign,list_walk,copy_bound,gc_bound \
+    --out-file $TMPDIR/perf-now/interp$i.json
+done
+```
+
+`bench` spawns the runtime with an **inherited environment**, so exporting `BEAM_RT_TIER=interpreter`
+on the driver reaches every spawned `beam_rt` (the same mechanism `AFTER` uses). The raw harness JSON
+was written under `$TMPDIR/perf-now/` and is **ephemeral** (not committed — this task adds only this
+file); re-run the commands above to regenerate.
+
+### Host-load caveat (read before quoting any absolute number)
+
+The host is the same shared/oversubscribed one `BEFORE`/`AFTER` describe, but this pass ran in a
+**light window**: the 1-min `/proc/loadavg` stayed at **≈ 0.8–14** (mostly below 8) against
+`BEFORE`/`AFTER`'s ≈ 20–55. **Absolute latencies here are therefore lower than the two earlier
+snapshots for that reason alone** — `sys` startup `min` reads **98.64 ms** against `AFTER`'s 160.47 ms,
+although the `sys` runtime did not change between the snapshots. **Absolute latencies are not
+comparable across the three snapshots**; only the **ratios** and the **minima** are signal, and the
+driver is runtime-major (all `sys` rows, then all `rust` rows) within one report, so the mitigation is
+again the three **block-interleaved** passes (`sys,rust | sys,rust | sys,rust`). Read the `CURRENT`
+figures as a **loaded-host measurement in a light window**, not a clean-machine number.
+
+## Current figures (`rust` / `sys`, min of 3, `--full` focused cross-runtime pass)
+
+Same reading convention as `BEFORE`/`AFTER` (**< 1 ⇒ Rust cheaper, > 1 ⇒ Rust dearer**; the ratio is
+the headline). `sys` is the min-of-3 over the default set (the oracle does not see the tier); the two
+`rust` columns are the min-of-3 of the **default** and of the **`BEAM_RT_TIER=interpreter`** sets.
+`slice` is per-case **whole-process** wall (one call per process); the
+`foreign`/`list_walk`/`copy_bound`/`gc_bound` rows are **startup-cancelled marginals**
+(`(mean wall@N − mean wall@0) / N`), the interpreter-throughput signal.
+
+| workload | case | metric (unit) | **rust/sys default (min3)** | range | rust/sys INTERP (min3) | sys (min3) | rust default (min3) | rust INTERP (min3) |
+|---|---|---|---|---|---|---|---|---|
+| `baseline` | — | `startup_ms` (ms) | **0.141** | 0.141–0.168 | 0.144 | 98.64 | 14.56 | 13.99 |
+| `slice` | `add` | `wall_ms` (ms) | **0.104** | 0.104–0.139 | 0.117 | 110.61 | 15.36 | 13.88 |
+| `slice` | `fib` | `wall_ms` (ms) | **0.107** | 0.107–0.141 | 0.134 | 110.34 | 12.77 | 15.38 |
+| `slice` | `pick` | `wall_ms` (ms) | **0.120** | 0.120–0.132 | 0.120 | 107.55 | 14.11 | 14.13 |
+| `slice` | `calendar_last_day` | `wall_ms` (ms) | **0.124** | 0.124–0.154 | 0.120 | 112.71 | 15.47 | 14.76 |
+| `slice` | `queue_from_size` | `wall_ms` (ms) | **0.185** | 0.185–0.197 | 0.137 | 107.66 | 20.80 | 17.09 |
+| `slice` | `gb_trees_size` | `wall_ms` (ms) | **0.124** | 0.124–0.151 | 0.126 | 113.64 | 14.62 | 14.71 |
+| `slice` | `base64_encode_size` | `wall_ms` (ms) | **0.118** | 0.118–0.145 | 0.138 | 109.70 | 14.42 | 16.23 |
+| `slice` | `ordsets_from_size` | `wall_ms` (ms) | **0.124** | 0.124–0.133 | 0.130 | 117.64 | 14.59 | 15.68 |
+| `slice` | `string_str_length` | `wall_ms` (ms) | **0.297** | 0.297–0.333 | 0.238 | 113.40 | 35.34 | 27.28 |
+| `foreign` | `cowboy_bstr:to_lower/1` | `ns_per_call` (ns) | **46.75** | 46.755–48.989 | 55.57 | 343.00 | 16 453.22 | 18 832.03 |
+| `foreign` | `cowboy_bstr:capitalize_token/1` | `ns_per_call` (ns) | **64.46** | 64.463–68.124 | 76.29 | 304.17 | 20 374.27 | 23 692.45 |
+| `foreign` | `emqx_base62:encode/1` | `ns_per_call` (ns) | **41.48** | 41.484–44.988 | 59.43 | 190.51 | 8 542.00 | 11 672.37 |
+| `foreign` | `emqx_base62:decode/1` | `ns_per_call` (ns) | **49.74** | 49.736–52.828 | 70.23 | 289.88 | 14 996.48 | 20 045.53 |
+| `list_walk` | — | `ns_per_element` (ns) | **58.14** | 58.145–60.106 | 63.74 | 2.45 | 143.40 | 156.15 |
+| `copy_bound` | `etf_roundtrip` | `ns_per_op` (ns) | **109.05** | 109.046–113.693 | 111.01 | 650.76 | 71 597.74 | 72 285.68 |
+| `copy_bound` | `ets_copy` | `ns_per_op` (ns) | **13.95** | 13.952–14.181 | 14.28 | 222.17 | 3 150.75 | 3 216.32 |
+| `copy_bound` | `send_recv` | `ns_per_op` (ns) | **145.51** | 145.511–150.696 | 101.65 | 1 455.51 | 215 321.19 | 147 862.60 |
+| `gc_bound` | `churn` | `ns_per_op` (ns) | **29.90** | 29.904–30.194 | 55.18 | 4 283.39 | 129 331.85 | 240 007.25 |
+
+**Reading.** Whole-process cost is still far lower under Rust (`baseline` startup **0.141×**, `slice`
+cases **0.104×–0.297×**), while the per-unit interpreter cost is still far higher
+(**13.9×–145.5×** across the startup-cancelled marginals). `slice` peak RSS remains the one
+like-for-like cross-runtime memory row (one call per process): `sys` **71.57 MB**, `rust` **27.48 MB**
+→ rust **2.60× lower** (essentially unchanged from `AFTER`'s 2.46×); the loop workloads' rust peak RSS
+grows with the per-runtime loop count `N` (`RESULTS.md` §6.7) and is **not** comparable. The `foreign`
+per-call gap vs the system runtime (**41×–64×**) sits in the same band as `AFTER`'s (**37×–55×**) — the
+`CURRENT` default runs the baseline tier on the *whole* process, so this is the tier-inclusive figure.
+
+## `rust` default vs `BEAM_RT_TIER=interpreter` — the tier effect (min of 3)
+
+Both columns are the **min of 3** of the `rust` metric; `< 1×` means the baseline JIT is faster.
+
+| workload | case | metric | default (min3) | `BEAM_RT_TIER=interpreter` (min3) | default/interp |
+|---|---|---|---|---|---|
+| `baseline` | — | `startup_ms` | 14.56 | 13.99 | 1.041× |
+| `slice` | `add` | `wall_ms` | 15.36 | 13.88 | 1.106× |
+| `slice` | `fib` | `wall_ms` | 12.77 | 15.38 | 0.831× |
+| `slice` | `pick` | `wall_ms` | 14.11 | 14.13 | 0.998× |
+| `slice` | `calendar_last_day` | `wall_ms` | 15.47 | 14.76 | 1.048× |
+| `slice` | `queue_from_size` | `wall_ms` | 20.80 | 17.09 | **1.217× worse** |
+| `slice` | `gb_trees_size` | `wall_ms` | 14.62 | 14.71 | 0.994× |
+| `slice` | `base64_encode_size` | `wall_ms` | 14.42 | 16.23 | 0.889× |
+| `slice` | `ordsets_from_size` | `wall_ms` | 14.59 | 15.68 | 0.931× |
+| `slice` | `string_str_length` | `wall_ms` | 35.34 | 27.28 | **1.295× worse** |
+| `foreign` | `cowboy_bstr:to_lower/1` | `ns_per_call` | 16 453.22 | 18 832.03 | **0.874×** |
+| `foreign` | `cowboy_bstr:capitalize_token/1` | `ns_per_call` | 20 374.27 | 23 692.45 | **0.860×** |
+| `foreign` | `emqx_base62:encode/1` | `ns_per_call` | 8 542.00 | 11 672.37 | **0.732×** |
+| `foreign` | `emqx_base62:decode/1` | `ns_per_call` | 14 996.48 | 20 045.53 | **0.748×** |
+| `list_walk` | — | `ns_per_element` | 143.40 | 156.15 | **0.918×** |
+| `copy_bound` | `etf_roundtrip` | `ns_per_op` | 71 597.74 | 72 285.68 | 0.990× |
+| `copy_bound` | `ets_copy` | `ns_per_op` | 3 150.75 | 3 216.32 | 0.980× |
+| `copy_bound` | `send_recv` | `ns_per_op` | 215 321.19 | 147 862.60 | **1.456× worse** |
+| `gc_bound` | `churn` | `ns_per_op` | 129 331.85 | 240 007.25 | **0.539×** |
+
+**Reading the tier effect.** The baseline JIT is a clear win for **`foreign`** (**0.73×–0.87×**) and
+**`gc_bound churn`** (**0.539×**), and neutral for `baseline`, `list_walk` and most `slice` cases —
+where the whole-process wall is dominated by `beam_rt` startup, not the interpreted loop. The only real
+regressions are the **module-graph-heavy one-shot** rows, `slice`'s `string_str_length` (**1.295×**),
+`queue_from_size` (**1.217×**) and `copy_bound`'s `send_recv` (**1.456×**): the first-entry compile cost
+the section below characterises. `fib`/`base64_encode_size`/`ordsets_from_size` read *better* on the
+default column, but by less than the per-pass spread (the `slice` range column above is up to ≈35 %), so
+they are not attributed to the tier.
+
+## The one-shot cold-start cost — current characterisation
+
+The tier's cost is a **one-shot, first-entry compile** that a short-lived process cannot amortise. The
+engine's baseline driver now compiles **lazily per function** (on first entry of a `(func, pc)`, one
+sealed mapping per function; the eager whole-module `JitBackend::compile` is retained only for the
+whole-module introspection surface and `jit_bench`), so the regression a module-graph-heavy one-shot
+process pays is now **small**. Measured here at this HEAD with the same `--full` focused pass, **3
+default + 3 `BEAM_RT_TIER=interpreter` passes**, each column the **min over its 3** (host 1-min
+`/proc/loadavg` ≈ 0.8–14 throughout):
+
+| workload | case | metric | default (min3) | `BEAM_RT_TIER=interpreter` (min3) | default/interp |
+|---|---|---|---|---|---|
+| `slice` | `string_str_length` | `wall_ms` | **35.34** | **27.28** | **1.295× worse** |
+| `slice` | `queue_from_size` | `wall_ms` | 20.80 | 17.09 | 1.217× worse |
+| `slice` | `add` / `fib` | `wall_ms` | 15.36 / 12.77 | 13.88 / 15.38 | 1.106× / 0.831× |
+| `foreign` | `cowboy_bstr:to_lower/1` | `ns_per_call` | 16 453 | 18 832 | **0.874×** |
+| `foreign` | `cowboy_bstr:capitalize_token/1` | `ns_per_call` | 20 374 | 23 692 | **0.860×** |
+| `foreign` | `emqx_base62:encode/1` | `ns_per_call` | 8 542 | 11 672 | **0.732×** |
+| `foreign` | `emqx_base62:decode/1` | `ns_per_call` | 14 996 | 20 046 | **0.748×** |
+| `list_walk` | — | `ns_per_element` | 143.40 | 156.15 | **0.918×** |
+| `copy_bound` | `etf_roundtrip` / `ets_copy` | `ns_per_op` | 71 598 / 3 151 | 72 286 / 3 216 | 0.990× / 0.980× |
+| `copy_bound` | `send_recv` | `ns_per_op` | 215 321 | 147 863 | **1.456× worse** |
+| `gc_bound` | `churn` | `ns_per_op` | 129 332 | 240 007 | **0.539×** |
+| `baseline` | — | `startup_ms` | 14.56 | 13.99 | 1.041× |
+
+So `string_str_length`'s whole-process regression over the interpreter is **≈ 1.3×** here (min-of-3),
+down from the `AFTER`-HEAD's **11.27×** under the eager whole-module compile (the eager figure for the
+same shape measured **≈ 12.3×** at that HEAD). `crates/beam_engine/MEASURED.md` records the same
+behaviour independently for the `string_str_length` shape — the `beam_rt run <bslice_string.beam>
+bslice_string:str_length/1 '"hello"'` repro, **N=30 interleaved samples**: default (baseline-JIT) **min
+31.86 ms** vs `BEAM_RT_TIER=interpreter` **min 25.51 ms** → **≈ 1.22–1.25×**, and the equivalent
+`tools/bench` `slice` workload read **31.97 ms default / 31.92 ms interpreter** (min-of-3) — against the
+eager whole-module compile it replaced at **405.29 ms / 33.68 ms → ≈ 12.3×**. The point estimate depends
+on host load and on how many of the *entered* functions the process actually runs, so read **≈ 1.2–1.3×**
+for this shape, not one number.
+
+**`jit_bench` caveat.** `beam_engine`'s `jit_bench` drives the **eager** whole-module artifact only
+(`JitBackend::compile`), so it pins the eager/hot path and does **not** capture the lazy per-entry path.
+The lazy path is measured by this focused cross-runtime pass and by `crates/beam_engine/MEASURED.md`'s
+cold-start section, never by `jit_bench`.
+
+The shape of what remains (the `AFTER` analysis minus the now-removed eager whole-module compile):
+
+- It is a **per-`beam_rt`-OS-process** cold start, not a per-call or a per-process cost: the
+  compiled-function cache is one `thread_local!` per OS thread, shared by every process of one runtime,
+  never across OS processes, so a long-running node compiles a given function **once** and every later
+  process on it reuses the artifact.
+- `tools/bench/src/workloads/slice.rs`'s `execute_case` spawns a **new OS process per sample**
+  (`runs_for(Full) = 25`) and `slice` is scored as **whole-process wall**, so every sample pays the
+  first-entry compile of exactly the functions it enters — which is why the module-graph-heavy `slice`
+  rows are the ones that move.
+- On the **native** tier a natively linked loop still charges no reduction mid-block (it charges only at
+  a deopt or a heap-admission boundary — see the crate `CONTEXT.md`); on the **interpreter** tier the
+  budget is now charged per interpreted instruction, so a non-allocating loop *is* pre-emptible there.
+  That is a pre-emption property, not a cost one: the two columns above differ only by the tier.
+
+## Caveats that invalidate a comparison (`CURRENT`)
+
+- **Absolute latencies are load-polluted**, and this pass ran in a **light window** (≈ 0.8–14 versus
+  `BEFORE`/`AFTER`'s ≈ 20–55); only ratios/minima are signal. Do **not** compare absolute ms/ns across
+  the three snapshots (`sys` startup `min` 98.64 ms here vs 160.47 ms `AFTER` is host load alone).
+- **The `CURRENT` figures are min-of-3 within their own mode**, exactly as `BEFORE`/`AFTER`'s are; the
+  `sys` and `rust` columns of a ratio can therefore come from *different* passes.
+- **Nothing was skipped**: all six `Runtimes::Both` workloads ran in all six passes (`status=ok`) on
+  both runtimes. The `SysOnly` external targets (`cowboy`, `khepri`, `plb`, `emqx`, `erlc_compiler`,
+  `elixir_compiler`) were **not run** in this pass — sys-only, so there is no Rust-side figure to
+  snapshot (`BEFORE`/`AFTER` record `emqx` as `skipped(emqx-requires-otp-28)`).
+
 ## See Also
 
 - [`../../tools/bench/RESULTS.md`](../../tools/bench/RESULTS.md) → the bench driver's authoritative
   environment record, per-target tables, methodology and honesty audit (this file links to it and does
   not reproduce it). Its `m6` bands are a **different, far more heavily loaded** pass and are not the
-  `AFTER` baseline.
+  `CURRENT` baseline.
 - [`TRACE_AND_PERF.md`](TRACE_AND_PERF.md) → the `perf_bif` harness, the dispatch-cost narrative and the
   execution-trace seam.
 - [`CONTEXT.md`](CONTEXT.md) → the runtime crate's contracts and current state.
