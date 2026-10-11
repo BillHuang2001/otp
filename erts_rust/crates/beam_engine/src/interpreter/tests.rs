@@ -207,7 +207,7 @@ fn gc_bif_marshalling_errors_propagate_instead_of_branching() {
     let err = machine
         .step_instruction(&module, &labels, 0, 1, &mut ctx)
         .unwrap_err();
-    match err {
+    match *err {
         BeamError::Raise(raise) => assert_eq!(
             raise.reason.as_atom(),
             Some("unsupported_opcode: call: import out of range")
@@ -221,7 +221,9 @@ fn gc_bif_marshalling_errors_propagate_instead_of_branching() {
     let mut machine = Machine::new();
     let mut ctx = MinimalContext::new();
     assert!(matches!(
-        machine.step_instruction(&module, &labels, 0, 1, &mut ctx),
+        machine
+            .step_instruction(&module, &labels, 0, 1, &mut ctx)
+            .map_err(|err| *err),
         Err(BeamError::BadArg)
     ));
 }
@@ -378,7 +380,7 @@ fn step_uncaught_raise(
     let err = machine
         .step_instruction(module, labels, 0, pc, &mut MinimalContext::new())
         .expect_err("the step raises");
-    match err {
+    match *err {
         BeamError::Raise(raise) => {
             let live = raise
                 .live_reason
@@ -490,7 +492,7 @@ fn test_with_no_fail_on_a_module_without_function_clause_is_the_typed_gap() {
     let err = machine
         .step_instruction(&module, &labels, 0, 1, &mut MinimalContext::new())
         .unwrap_err();
-    match err {
+    match *err {
         BeamError::Raise(raise) => assert_eq!(
             raise.reason.as_atom(),
             Some("unsupported_opcode: test: no 'function_clause' atom in the module")
@@ -525,7 +527,7 @@ fn select_val_with_no_fail_on_a_module_without_function_clause_is_the_typed_gap(
     let err = machine
         .step_instruction(&module, &labels, 0, 1, &mut MinimalContext::new())
         .unwrap_err();
-    match err {
+    match *err {
         BeamError::Raise(raise) => assert_eq!(
             raise.reason.as_atom(),
             Some("unsupported_opcode: select_val: no 'function_clause' atom in the module")

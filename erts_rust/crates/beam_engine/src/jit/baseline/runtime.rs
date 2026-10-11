@@ -264,7 +264,7 @@ pub(crate) extern "C" fn jit_step_one(rt: *mut JitRuntime<'_>, func: u32, pc: u3
         }
         Ok(Step::Done) => HALT,
         Err(err) => {
-            runtime.error = Some(err);
+            runtime.error = Some(*err);
             ERROR
         }
     }

@@ -1036,7 +1036,7 @@ fn drive(
         let step = step.map_err(|err| {
             // SAFETY: `machine_ptr` points at the live driver-owned `Machine`; no
             // native code is running here.
-            unsafe { (*machine_ptr).with_uncaught_frames(err, Some(module), func, pc) }
+            unsafe { (*machine_ptr).with_uncaught_frames(*err, Some(module), func, pc) }
         })?;
         match step {
             Step::Next => pc += 1,
