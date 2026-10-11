@@ -141,6 +141,12 @@ Module pass `ssa_opt_bc_size` (`beam_ssa_opt.erl:317-321`). Computes the exact s
 - `beam_asm.erl` is compiled with `-DCOMPILER_VSN` (version recorded in the generated binary); `core_parse.erl` is compiled with `+inline` stripped (inlining it is slow with no benefit).
 - `genop.tab` is the opcode source table (executable, Perl input).
 
+## Default-path runtime model (`compile:file/2`)
+- `compile:file/2` runs the ENTIRE compilation in a worker spawned by `spawn_monitor` (`compile.erl:1246-1249`) and blocks on the `{'DOWN',…}` receive (`compile.erl:1250-1252`); `no_spawn_compiler_process` makes it run in the caller instead (`compile.erl:1242-1244`). Only `file/2`, `env_default_opts/0`, `do_compile/2`'s `expand_opts` and the spawn/receive execute in the caller; `internal/2`, `passes/2`, every pass and the error/warning reporting run in the worker.
+- `?DEFAULT_OPTIONS = [verbose,report_errors,report_warnings]` (`compile.erl:275`) is added only by `file/1`/`forms/1`/`string/1`; `file(File, [])` uses `env_default_opts() ++ []` (`compile.erl:979`), so with `ERL_COMPILER_OPTIONS` unset it carries no `report_*` flags, prints nothing, and returns a bare `error` / `{ok,Mod}` (no `error_logger`/`logger` involved anywhere in the app — grep-clean).
+- `parse_module/2` (`compile.erl:2134`) → `do_parse_module/2` (`:2219`) calls `epp:parse_file(File, Opts)` arity 2 (`:2229`); that spawns the epp server process (`epp.erl:386`) and performs the `{features,…}` receive (`epp.erl:687`). The epp server reads via `file:open(Name,[read])` (`epp.erl:1007`) + `io:scan_erl_form/4` (`io.erl:1471`, a synchronous `receive` at `io.erl:1671`).
+- Errors/warnings reach the group leader only: `io:put_chars/1` in `report_warnings/1` (`compile.erl:3089`) and `io:fwrite` in `sys_messages:list_errors/3` (`sys_messages.erl:56,62`).
+
 ## Constraints
 - The compiler must build very early: it is the first group in `lib/Makefile` (`ERTS_APPLICATIONS = stdlib sasl kernel compiler`) and may only depend on `kernel` + `stdlib` at compile time.
 - `compiler.app.src` declares `{applications,[kernel,stdlib]}`; `crypto` is a **runtime** dependency only (debug_info encryption) — used via `beam_lib:get_crypto_key/1` and `crypto:crypto_one_time/6` in `compile.erl` `encrypt_debug_info`/`debug_info_key` handling.
