@@ -467,7 +467,7 @@ impl FreeList {
     /// pointer that is not a node of any free list at all; `new_size` must be a
     /// `UNIT_SIZE`-granular block size of at least [`MIN_FREE_BLOCK_SIZE`] bytes with
     /// `payload`'s block actually spanning it.
-    #[allow(dead_code)] // adopted by the allocator's coalescing pass (see "Adoption")
+    #[allow(dead_code)] // not used yet (coalescing unlinks/links with remove/insert — see "Adoption")
     pub(crate) unsafe fn refile(
         &mut self,
         old_class: usize,
