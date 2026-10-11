@@ -99,12 +99,16 @@
 //!   thread — neither sound). The observable contract is therefore implemented here, which is also
 //!   what the C does: the lock and the reference count live in the PDL object itself. Only
 //!   `driver_pdl_create` delegates (handle identity + the host's one-PDL-per-port rule).
-//! * `driver_monitor_process` cannot distinguish, through
-//!   [`DriverHost::monitor_process`](crate::driver::host::DriverHost::monitor_process)'s `Option`,
-//!   the host's "the process is dead" from "no callback"; `None` is rendered as the documented
-//!   `< 0` code, and a `process` operand that cannot name a process at all (neither an internal nor
-//!   an external pid term — which the C would hand straight to its monitor-signal machinery) as the
-//!   positive [`ERL_DRV_MONITOR_NOT_ALIVE`] code.
+//! * `driver_monitor_process` reaches the host through the **three-way**
+//!   [`DriverHost::monitor_process_result`](crate::driver::host::DriverHost::monitor_process_result)
+//!   hook, so all three C outcomes are expressible: [`MonitorResult::Ok`] ⇒ `0` (the holder is
+//!   filled), [`MonitorResult::NotAlive`] ⇒ the positive [`ERL_DRV_MONITOR_NOT_ALIVE`] (`1`), and
+//!   [`MonitorResult::Error`] ⇒ the negative [`ERL_DRV_MONITOR_ERROR`] (`-1`). A `process` operand
+//!   that cannot name a process at all (neither an internal nor an external pid term — which the C
+//!   would hand straight to its monitor-signal machinery) is likewise the positive
+//!   [`ERL_DRV_MONITOR_NOT_ALIVE`] code. The two-way
+//!   [`DriverHost::monitor_process`](crate::driver::host::DriverHost::monitor_process) hook remains
+//!   the compatibility subset the three-way one defaults to (`Some` ⇒ `Ok`, `None` ⇒ `Error`).
 //! * `driver_compare_monitors` with a `NULL` operand is ordered (`NULL` first) where the C's
 //!   `memcmp` would fault; `driver_demonitor_process`/`driver_get_monitored_process` with a `NULL`
 //!   monitor answer the C's port-failure values (`-1` / `driver_term_nil`) instead of faulting.
@@ -121,6 +125,7 @@ use libc::{c_int, c_ulong};
 use beam_term::prelude::{is_boxed, is_external_pid, is_internal_pid, Eterm};
 
 use crate::driver::api::ErlDrvApi;
+use crate::driver::host::MonitorResult;
 use crate::driver::types::{
     ErlDrvMonitor, ErlDrvNowData, ErlDrvPDL, ErlDrvPort, ErlDrvSInt, ErlDrvTermData,
 };
@@ -137,6 +142,14 @@ pub const ERL_DRV_MONITOR_OK: c_int = 0;
 pub const ERL_DRV_MONITOR_NOT_ALIVE: c_int = 1;
 /// Invalid port, or a driver without a `process_exit` callback (`io.c:7021`, `io.c:7055`).
 pub const ERL_DRV_MONITOR_ERROR: c_int = -1;
+
+// The C distinguishes the three outcomes by their *sign* (`erl_driver.md`, `driver_monitor_process`:
+// "Returns `0` on success, `< 0` if no callback is provided, and `> 0` if the process is no longer
+// alive"). Pin those signs at compile time so a future edit cannot silently collapse two of them
+// onto one side of zero — which is exactly the bug the three-way [`MonitorResult`] closes.
+const _: () = assert!(ERL_DRV_MONITOR_OK == 0);
+const _: () = assert!(ERL_DRV_MONITOR_NOT_ALIVE > 0);
+const _: () = assert!(ERL_DRV_MONITOR_ERROR < 0);
 
 /// The count reported for a `NULL`/foreign PDL handle.
 ///
@@ -402,13 +415,14 @@ pub unsafe extern "C" fn driver_monitor_process(
     if !names_a_process(pid) {
         return ERL_DRV_MONITOR_NOT_ALIVE;
     }
-    match env.host().monitor_process(pid) {
-        Some(mon) => {
+    match env.host().monitor_process_result(pid) {
+        MonitorResult::Ok(mon) => {
             // SAFETY: `monitor` is non-null and writable (checked above).
             unsafe { core::ptr::write(monitor, mon) };
             ERL_DRV_MONITOR_OK
         }
-        None => ERL_DRV_MONITOR_ERROR,
+        MonitorResult::NotAlive => ERL_DRV_MONITOR_NOT_ALIVE,
+        MonitorResult::Error => ERL_DRV_MONITOR_ERROR,
     }
 }
 
@@ -684,6 +698,18 @@ mod tests {
         bytes == &expected.data[..]
     }
 
+    /// How [`TestHost`] answers the three-way monitor hook — the three C outcomes of
+    /// `driver_monitor_process` (`io.c:7012-7038`).
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum MonitorMode {
+        /// Arm for real (the C's `0`): the host installs and records a monitor.
+        Arm,
+        /// The process is not alive (the C's `1`, `ERL_DRV_MONITOR_NOT_ALIVE`).
+        NotAlive,
+        /// The host cannot monitor (the C's `-1`, `ERL_DRV_MONITOR_ERROR`).
+        Error,
+    }
+
     /// A family-local [`DriverHost`]: a real arena/atom table, one PDL slot (the C's
     /// `pp->port_data_lock`), a monitor table, and a settable caller pid.
     struct TestHost {
@@ -696,6 +722,8 @@ mod tests {
         reuse_handle: bool,
         monitors: Vec<(ErlDrvMonitor, Eterm)>,
         next_monitor: u64,
+        /// The outcome [`TestHost`]'s three-way monitor hook reports.
+        monitor_mode: MonitorMode,
     }
 
     impl TestHost {
@@ -708,6 +736,7 @@ mod tests {
                 reuse_handle: false,
                 monitors: Vec::new(),
                 next_monitor: 1,
+                monitor_mode: MonitorMode::Arm,
             }
         }
 
@@ -754,6 +783,19 @@ mod tests {
             Some(mon)
         }
 
+        /// The three-way hook: [`MonitorMode::Arm`] arms through the two-way
+        /// [`monitor_process`](DriverHost::monitor_process), the other two report the C's positive
+        /// "not alive" (`1`) and negative failure (`-1`) codes directly.
+        fn monitor_process_result(&mut self, pid: Eterm) -> MonitorResult {
+            match self.monitor_mode {
+                MonitorMode::Arm => match self.monitor_process(pid) {
+                    Some(mon) => MonitorResult::Ok(mon),
+                    None => MonitorResult::Error,
+                },
+                MonitorMode::NotAlive => MonitorResult::NotAlive,
+                MonitorMode::Error => MonitorResult::Error,
+            }
+        }
         fn demonitor_process(&mut self, mon: *const ErlDrvMonitor) -> c_int {
             match self.monitors.iter().position(|(m, _)| is_monitor(mon, m)) {
                 Some(i) => {
@@ -965,6 +1007,61 @@ mod tests {
                 ERL_DRV_MONITOR_ERROR
             );
         }
+    }
+
+    /// The three C outcomes of `driver_monitor_process` are all reachable through the three-way
+    /// [`DriverHost::monitor_process_result`] hook (`io.c:7012-7038`, `do_driver_monitor_process`):
+    /// `0` armed with the holder filled, `1` not alive, `-1` failure. The C distinguishes them by
+    /// **sign**, which is precisely why the earlier two-way `Option` hook could not express the
+    /// middle one (`None` only ever meant `-1`).
+    #[test]
+    fn the_three_way_monitor_result_maps_onto_the_c_reason_codes() {
+        let mut host = TestHost::new();
+        let pid = TestHost::pid();
+        let mut env = DriverEnv::new(&mut host);
+        let port = env.as_port();
+
+        // --- `MonitorResult::Ok` -> the C's `0`, holder filled (`io.c:7037`) ---------------------
+        host.monitor_mode = MonitorMode::Arm;
+        let mut mon = monitor(0);
+        // SAFETY: `port` is live and `mon` is writable.
+        assert_eq!(
+            unsafe { driver_monitor_process(port, pid.raw() as ErlDrvTermData, &mut mon) },
+            ERL_DRV_MONITOR_OK
+        );
+        assert!(
+            is_monitor(&mon, &monitor(1)),
+            "the armed path must write the host's monitor into the holder"
+        );
+
+        // --- `MonitorResult::NotAlive` -> the C's positive `1` (`io.c:7031`) ---------------------
+        host.monitor_mode = MonitorMode::NotAlive;
+        let mut not_mon = monitor(0);
+        // SAFETY: `port` is live and `not_mon` is writable.
+        assert_eq!(
+            unsafe { driver_monitor_process(port, pid.raw() as ErlDrvTermData, &mut not_mon) },
+            ERL_DRV_MONITOR_NOT_ALIVE
+        );
+        assert!(
+            !is_monitor(&not_mon, &monitor(1)),
+            "a not-alive result must not write the holder"
+        );
+
+        // --- `MonitorResult::Error` -> the C's negative `-1` (`io.c:7020-7021`) ------------------
+        host.monitor_mode = MonitorMode::Error;
+        let mut err_mon = monitor(0);
+        // SAFETY: `port` is live and `err_mon` is writable.
+        assert_eq!(
+            unsafe { driver_monitor_process(port, pid.raw() as ErlDrvTermData, &mut err_mon) },
+            ERL_DRV_MONITOR_ERROR
+        );
+        assert!(
+            !is_monitor(&err_mon, &monitor(1)),
+            "a failed arm must not write the holder"
+        );
+
+        // Only the armed case reached the host's two-way hook, so exactly one monitor is registered.
+        assert_eq!(host.monitors.len(), 1, "only the armed case installs a monitor");
     }
 
     #[test]

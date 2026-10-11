@@ -104,7 +104,7 @@ pub use crate::nif::term::{eterm_from_nif, nif_from_eterm, ERL_NIF_TERM, ERL_NIF
 pub use crate::nif::host::{NifEnv, NifHost};
 pub use crate::driver::async_job::{AsyncCallback, AsyncJob};
 pub use crate::driver::current_host::with_current_host;
-pub use crate::driver::host::{DriverEnv, DriverHost};
+pub use crate::driver::host::{DriverEnv, DriverHost, MonitorResult};
 pub use crate::driver::drv::{monitor_from_identity, monitor_identity};
 pub use beam_term::Eterm;
 
