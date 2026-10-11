@@ -133,7 +133,7 @@ Runner rule: every selected **(workload × runtime)** pair yields **exactly one*
   explicit `… : not-run (unsupported: …)` note, while the compute loop, the startup summary and every other
   metric are still produced. A genuine (non-capability-gap) probe failure is surfaced verbatim, never
   fabricated. Note: the loop is dominated by the natively-served `lists:seq/2`+`lists:sum/1`, so a
-  near-parity rust figure reflects the native floor, **not** interpreter throughput (that is
+  near-parity rust figure reflects the native floor, **not** execution throughput (that is
   `foreign`/`list_walk`).
 - `erlc_compiler`: compiles a bounded deterministic slice (first 30 `.erl` of each corpus) of the in-repo
   OTP `lib/stdlib/src` **and** the Elixir checkout's `lib/elixir/src` (both read-only) with `erlc` into a
@@ -190,10 +190,11 @@ Runner rule: every selected **(workload × runtime)** pair yields **exactly one*
   honest note). Every runtime's stdout must equal `N × per_call` (recorded in an `observed stdout:` note); a
   Rust exit `3` records the capability gap and emits **no** timing. `foreign` peak RSS is **not** a
   like-for-like memory comparison (rust RSS scales with the loop count — see Known Issues); `slice` is.
-- `list_walk`: **the permanent, reproducible interpreter-throughput signal** — an in-tree embedded
+- `list_walk`: **the permanent, reproducible per-element dispatch-throughput signal** — an in-tree embedded
   `bench_list_walk` module with a **BIF-free, non-tail-recursive `sum/1`** over a fixed-length list, built
-  by an interpreted `build/2` (no `lists:seq/2`), so the whole program exercises only the interpreter
-  (~7 dispatched instructions per element, the same shape as `crates/beam_engine/tests/engine_bench.rs`).
+  by a pure-Erlang `build/2` recursion (no native `lists:seq/2`), so the whole program exercises only the
+  engine's per-element dispatch/return path (~7 dispatched instructions per element, the same shape as
+  `crates/beam_engine/tests/engine_bench.rs`; the baseline tier does not inline that recursion).
   `walk(N)` sums the list `N` times and returns the deterministic `N × (LEN×(LEN+1)/2)`; `LEN = 1000` (a
   Rust const formatted into the Erlang source so the two cannot drift). The Rust and oracle sides use
   per-runtime loop counts (`n_rust` = 1 000, `n_sys` = 100 000 ⇒ 10⁶ vs 10⁸ elements). It uses the same
@@ -204,7 +205,7 @@ Runner rule: every selected **(workload × runtime)** pair yields **exactly one*
   the wall-clock rows do not). Each run's stdout is checked against the deterministic constant; a Rust exit
   `3` records the capability gap and emits **no** timing. `probe()` ⇒ `skipped(erlc-absent)` without `erlc`.
 - `copy_bound`: **the messaging / term-copy-bound metric** — the term-copy boundary run under *both* runtimes. One embedded `bench_copy_bound` module (generated from the crate's constants, so Rust and Erlang cannot drift) with three cases, each copying the **same structured payload** (a 5-key map) and validating the round-trip with a bound-variable pattern (a real equality test that raises on a corrupted copy): `etf_roundtrip` (`term_to_binary/1` + `binary_to_term/1` — the External Term Format wire codec, contract A.5); `ets_copy` (`ets:insert/2` + `ets:lookup/2` — the ETS copy boundary, one table+key per process so the measured work is the copy, not table growth); `send_recv` (a term sent to a second process, round-tripped through `term_to_binary/1` there, and sent back — **both directions** of the process copy boundary, with an `after` guard so a missing reply fails loudly, never hangs). It uses the shared startup-cancelled per-op recipe (run at `N` and at `0`, with a per-case per-runtime `N`; `etf_roundtrip` 5 000/1 500 000, `ets_copy` 100 000/2 000 000, `send_recv` 2 000/500 000 rust/sys; `--quick` ⇒ 3 runs/case, `--full` ⇒ 10), reporting `case_<name>_wall_ms`, `case_<name>_startup_ms`, `case_<name>_peak_rss_bytes`, `case_<name>_ns_per_op` (`(mean wall@N − mean wall@0) / N × 1e6`, only when positive) and the deterministic, contention-immune `case_<name>_ops` = `N`. A Rust exit `3` records the capability gap and emits **no** timing; an embedded-module compile failure is `failed(module-compile-failed)` (the source is ours), never a skip; `probe()` ⇒ `skipped(erlc-absent)` via the shared `slice::resolve_erlc()` lookup.
-- `gc_bound`: **the GC-bound metric** — allocate-and-abandon garbage churn under *both* runtimes. One embedded `bench_gc_bound` module whose single `churn/1` case, per iteration, builds and abandons three `LEN`=256-sized structures — an interpreted-recursion list (`build_list/2`, *not* a native `lists:seq/2`), a 256-byte binary built from an interpreted char list, and a tuple built from another interpreted list — then checks the two O(1)-checkable ones (`byte_size`/`tuple_size`) so a silently-dropped allocation fails loudly. It uses the same shared startup-cancelled per-op recipe (run at `N` and at `0`; `n_rust` = 2 000, `n_sys` = 200 000; `--quick` ⇒ 3 runs, `--full` ⇒ 10), reporting `case_churn_wall_ms`, `case_churn_startup_ms`, `case_churn_peak_rss_bytes`, `case_churn_ns_per_op` (`(mean wall@N − mean wall@0) / N × 1e6`, only when positive) and the deterministic, contention-immune `case_churn_ops` = `N`. The row measures the allocate-and-abandon wall time and **claims no collection count** (whether a runtime's collector runs during the loop is its own admission policy); a Rust exit `3` ⇒ an honest `skipped(unsupported-case)` with **no** timing, and a compile failure is `failed(module-compile-failed)`; `probe()` ⇒ `skipped(erlc-absent)` via `slice::resolve_erlc()`.
+- `gc_bound`: **the GC-bound metric** — allocate-and-abandon garbage churn under *both* runtimes. One embedded `bench_gc_bound` module whose single `churn/1` case, per iteration, builds and abandons three `LEN`=256-sized structures — a pure-Erlang recursion list (`build_list/2`, *not* a native `lists:seq/2`), a 256-byte binary built from an Erlang-level char list, and a tuple built from another Erlang list — then checks the two O(1)-checkable ones (`byte_size`/`tuple_size`) so a silently-dropped allocation fails loudly. It uses the same shared startup-cancelled per-op recipe (run at `N` and at `0`; `n_rust` = 2 000, `n_sys` = 200 000; `--quick` ⇒ 3 runs, `--full` ⇒ 10), reporting `case_churn_wall_ms`, `case_churn_startup_ms`, `case_churn_peak_rss_bytes`, `case_churn_ns_per_op` (`(mean wall@N − mean wall@0) / N × 1e6`, only when positive) and the deterministic, contention-immune `case_churn_ops` = `N`. The row measures the allocate-and-abandon wall time and **claims no collection count** (whether a runtime's collector runs during the loop is its own admission policy); a Rust exit `3` ⇒ an honest `skipped(unsupported-case)` with **no** timing, and a compile failure is `failed(module-compile-failed)`; `probe()` ⇒ `skipped(erlc-absent)` via `slice::resolve_erlc()`.
 
 ### Result JSON schema (stable — `SCHEMA_VERSION = 1`)
 Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in **milliseconds** (f64).
@@ -424,8 +425,8 @@ Structural facts that are not numbers (and so belong here):
   (`baseline`, `slice`, `foreign`, `list_walk`, `copy_bound`, `gc_bound`); every other workload is `SysOnly`
   (see the table above).
 - `baseline`'s compute loop is dominated by the natively-served `lists:seq/2` + `lists:sum/1`, so its
-  near-parity result reads as the **native floor**, not interpreter throughput. The interpreter-throughput
-  signals are `list_walk` (ns/element) and `foreign` (ns/call of real foreign code).
+  near-parity result reads as the **native floor**, not execution throughput. The per-unit
+  execution-throughput signals are `list_walk` (ns/element) and `foreign` (ns/call of real foreign code).
 - `slice` runs one call per process, while `foreign`/`list_walk`/`copy_bound`/`gc_bound` loop many ops per
   process at a per-runtime loop count `N`, so peak RSS is like-for-like only for `slice`.
 
@@ -442,15 +443,25 @@ Structural facts that are not numbers (and so belong here):
 The `foreign` per-call, `list_walk` per-element, and `copy_bound`/`gc_bound` per-op gaps (their current values
 are in `RESULTS.md` §3.4–§3.7) are **real runtime costs, not harness artifacts**. The startup-cancelled metric
 reproduces with a plain shell loop calling `beam_rt -pa <dir> run <mod.beam> <mod>:<fun>/1 <N>` — so CLI
-re-entry, per-call module reloads and per-call GC are all ruled out. It is a `beam_rt` host-context cost:
-`beam_engine`'s interpreter dispatch is itself O(1) and allocation-free per instruction, and the runtime-side
-dispatch costs behind it are `beam_rt` measurements owned by `../../crates/beam_rt/CONTEXT.md` (measured via
-that crate's `examples/perf_bif.rs`), not `bench` output.
+re-entry, per-call module reloads and per-call GC are all ruled out. It is a `beam_rt` per-call host-context
+cost: the engine's dispatch arm is itself O(1) and allocation-free per instruction, and the runtime-side costs
+behind it are `beam_rt` measurements owned by `../../crates/beam_rt/PERF.md` (the per-call dispatch section)
+and `../../crates/beam_rt/CONTEXT.md`, not `bench` output.
+
+**The `beam_rt` execution tier defaults to the native baseline JIT** (`JitMode::Auto` ⇒ `Tier::BaselineJit` on
+a process's first entry, remembered across pre-emptions and suspends; `BEAM_RT_TIER=interpreter` is the only
+kill switch), and its runtime path compiles **per function, lazily** on a function's first entry — so a fresh
+process pays only for the functions it actually enters, and is **not** paying a whole-module compile. The
+eager whole-module artifact (`JitBackend::compile`/`CodeCache::get_or_compile`) serves the whole-module
+introspection surface and the `beam_engine` `jit_bench` harness only, so `jit_bench` pins the **hot** path and
+not the lazy runtime path's per-entry cost. The current tier and one-shot cold-start figures (a
+module-graph-heavy `slice` case at **~1.2×** the interpreter tier) live in
+`../../crates/beam_engine/MEASURED.md` and `../../crates/beam_rt/PERF.md` — they are not re-measured here.
 
 Consequence for reading results: startup latency is the trustworthy cross-runtime comparison for
 whole-process cost (and, on `slice`, peak RSS); the `foreign`/`list_walk`/`copy_bound`/`gc_bound`
-per-call/per-element/per-op rows are snapshots of the term-copy/interpreter/GC cost and should be re-run via
-the Runbook rather than adjusted.
+per-call/per-element/per-op rows are snapshots of the term-copy / per-element dispatch / GC cost and should be
+re-run via the Runbook rather than adjusted.
 
 ## Known Issue — rust peak RSS scales with the loop count `N`
 
