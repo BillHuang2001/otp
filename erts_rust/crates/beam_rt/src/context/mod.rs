@@ -540,8 +540,20 @@ impl<'a> RuntimeContext<'a> {
         from: Eterm,
         message: Eterm,
     ) -> Result<()> {
-        let source = OffHeapTable::new();
-        self.deliver_message_with_off_heap(to, from, message, &source)
+        // The sender passed no handles of its own, but `message` may still carry an off-heap
+        // payload that **escaped** the nested run which built it: that payload's handle lives
+        // in the runtime's escaped-payload store, and the receiver-side copy resolves a refc
+        // binary by its data pointer through the source table it is handed
+        // ([`Runtime::off_heap_source`]). `None` (no handle anywhere) is the documented empty
+        // -source form — the fast path, byte-identical to before.
+        let source = self.runtime.off_heap_source(&[]);
+        match &source {
+            Some(source) => self.deliver_message_with_off_heap(to, from, message, source),
+            None => {
+                let empty = OffHeapTable::new();
+                self.deliver_message_with_off_heap(to, from, message, &empty)
+            }
+        }
     }
 
     /// [`Self::deliver_message`] for a sender that holds the term's **source off-heap table**
@@ -890,10 +902,20 @@ impl<'a> RuntimeContext<'a> {
         // whole run (see [`Self::with_relocation_exempt`]).
         self.with_relocation_exempt(|this| {
             let mut machine = Machine::new();
-            let outcome = machine.run_export_outcome(module, function, arity, args, this)?;
-            pump_until_returned(BLOCKING_PUMP_DEADLINE, outcome, |func, pc| {
-                this.pump_once(&mut machine, module, func, pc)
-            })
+            let result = match machine.run_export_outcome(module, function, arity, args, this) {
+                Ok(outcome) => pump_until_returned(BLOCKING_PUMP_DEADLINE, outcome, |func, pc| {
+                    this.pump_once(&mut machine, module, func, pc)
+                }),
+                Err(err) => Err(err),
+            };
+            // The machine is dropped when this scope ends, releasing every off-heap payload
+            // handle it built — but the returned term (and any term the callee stored where
+            // this run cannot see it) may still point at one. Adopt them into the runtime's
+            // escaped-payload store **before** that drop, on every path, so no live term can
+            // dangle (see `Runtime::adopt_escaped_binaries`).
+            this.runtime
+                .adopt_escaped_binaries(machine.refc_binaries());
+            result
         })
     }
 
@@ -950,10 +972,17 @@ impl<'a> RuntimeContext<'a> {
         // whole run (see [`Self::with_relocation_exempt`]).
         self.with_relocation_exempt(|this| {
             let mut machine = Machine::new();
-            let outcome = machine.run_label_outcome(module, label, arity, args, this)?;
-            pump_until_returned(BLOCKING_PUMP_DEADLINE, outcome, |func, pc| {
-                this.pump_once(&mut machine, module, func, pc)
-            })
+            let result = match machine.run_label_outcome(module, label, arity, args, this) {
+                Ok(outcome) => pump_until_returned(BLOCKING_PUMP_DEADLINE, outcome, |func, pc| {
+                    this.pump_once(&mut machine, module, func, pc)
+                }),
+                Err(err) => Err(err),
+            };
+            // As [`Self::run_export_blocking`]: adopt the closure's off-heap payload handles
+            // before the machine holding them is dropped.
+            this.runtime
+                .adopt_escaped_binaries(machine.refc_binaries());
+            result
         })
     }
 
@@ -2427,18 +2456,19 @@ impl ExecutionContext for RuntimeContext<'_> {
     ) -> Result<()> {
         let (target, reference) = self.resolve_send_target(to)?;
         let from = self.mailbox_pid.to_eterm();
-        if src_binaries.is_empty() {
-            self.deliver_message(target, from, message)?;
-        } else {
-            // The sender's source off-heap table, built from the machine's handles (each
-            // `clone` bumps the `RefcBinary` refcount). It is a local that must outlive the
-            // whole delivery: the receiver-side copy borrows it (see
-            // `deliver_message_with_off_heap`).
-            let mut source = OffHeapTable::new();
-            for handle in src_binaries {
-                source.push_binary(handle.clone());
-            }
-            self.deliver_message_with_off_heap(target, from, message, &source)?;
+        // The copy's source off-heap table: the sender machine's own handles (`src_binaries`)
+        // **unioned** with the runtime's escaped-payload store
+        // ([`Runtime::off_heap_source`]). The union matters because a term this sender holds
+        // may reference a payload built by a nested run whose machine has already been dropped
+        // — `result ! B` after `B = compile:forms(...)` — and the receiver-side copy resolves
+        // every refc binary by its data pointer through the source table, so a handle missing
+        // from it refuses the whole message with `BeamError::BadArg`. `None` (no handle in
+        // either family, i.e. a plain on-heap message) keeps the documented empty-source fast
+        // path.
+        let source = self.runtime.off_heap_source(src_binaries);
+        match &source {
+            Some(source) => self.deliver_message_with_off_heap(target, from, message, source)?,
+            None => self.deliver_message(target, from, message)?,
         }
         // An **alias** destination is consumed by the message that went through it (see
         // `resolve_send_target`): the delivery is done, so the `reply_demonitor` rule can

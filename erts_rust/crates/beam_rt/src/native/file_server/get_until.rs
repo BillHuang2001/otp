@@ -301,6 +301,10 @@ impl EngineContinuation<'_> {
             ctx.enter_module(&module);
             machine.run_export_outcome(&module, function, self.arity, &args, &mut ctx)
         };
+        // Adopt the machine's off-heap payload handles **before** it is dropped and before the
+        // `?`: both the returned value and a failure's live reason term may still point at a
+        // payload this short-lived machine built (see `Runtime::adopt_escaped_binaries`).
+        self.runtime.adopt_escaped_binaries(machine.refc_binaries());
         let outcome =
             outcome.map_err(|failure| error::name_atom_raise(failure, self.runtime.atoms()))?;
         match outcome {

@@ -298,8 +298,100 @@ fn send_message_to_an_unknown_pid_is_the_tables_typed_error() {
 }
 
 // -----------------------------------------------------------------------
-// Reference aliases as `send` destinations
+// Escaped off-heap refc binaries (a nested run's payload)
 // -----------------------------------------------------------------------
+
+/// The off-heap payload owner a `beam_codec::term::make_refc_binary` call needs — exactly the
+/// role `beam_engine`'s `Machine::refc_binaries` plays for a **nested run**
+/// ([`RuntimeContext::run_export_blocking`]/[`RuntimeContext::run_label_blocking`], a boot
+/// `{apply, …}` directive, the `{get_until, …}` io-device continuation), whose short-lived
+/// machine `beam_rt` drops the moment the run returns.
+struct NestedRunPayloads(Vec<beam_alloc::RefcBinary>);
+
+impl beam_codec::OffHeapBinaries for NestedRunPayloads {
+    fn alloc_refc_payload(&mut self, bytes: &[u8]) -> Result<*mut Eterm> {
+        let handle = beam_alloc::RefcBinary::new(bytes)?;
+        let data = handle.data_ptr();
+        self.0.push(handle);
+        Ok(data.cast::<Eterm>())
+    }
+}
+
+/// Builds the frozen 8-word `[BinRef][ErlSubBits]` pair over a fresh off-heap payload of 200
+/// bytes — the genuine representation `bs_create_bin` produces above
+/// [`beam_term::refc::ERL_ONHEAP_BINARY_LIMIT`]. Returns the source heap (which owns the pair and
+/// must outlive the term), the payload owner, its bytes and the term.
+fn escaped_off_heap_binary() -> (beam_alloc::Heap, NestedRunPayloads, Vec<u8>, Eterm) {
+    let bytes: Vec<u8> = (0..200u32).map(|i| (i % 251) as u8).collect();
+    assert!(bytes.len() > beam_term::refc::ERL_ONHEAP_BINARY_LIMIT);
+    let mut heap = beam_alloc::Heap::new(16).expect("the source heap");
+    let mut payloads = NestedRunPayloads(Vec::new());
+    let term =
+        beam_codec::term::make_refc_binary(&mut heap, &mut payloads, &bytes, 0, bytes.len() * 8)
+            .expect("the source refc-binary term");
+    assert_eq!(payloads.0.len(), 1, "one off-heap payload");
+    (heap, payloads, bytes, term)
+}
+
+/// **The escaped-payload delivery, end to end.** A message carrying an off-heap refc binary whose
+/// only owner was a **nested run's** machine — already dropped by the time the message is sent —
+/// must still reach the receiver.
+///
+/// This is the defect `A = base64:encode(<<…>>), X1 = binary:encode_hex(A), _ =
+/// base64:encode(<<…>>), X2 = binary:encode_hex(A)` (`X1 == X2` on the oracle: the second
+/// allocation used to reuse the first binary's freed block) and
+/// `B = compile:forms(F, [no_spawn_compiler_process]), self() ! B` (`error:badarg`) pin, reproduced
+/// without the compiler. The copy engine resolves a refc binary **by its data pointer** through the
+/// copy's source table, and a sender holding no handles of its own (`erlang:send/2`/`'!'/2` through
+/// the `SendBridge`, and every runtime-internal delivery) passes an empty one — so only the
+/// runtime's escaped-payload store can resolve it.
+#[test]
+fn a_delivery_resolves_an_escaped_off_heap_payload_through_the_runtime_store() {
+    let (_source_heap, payloads, bytes, term) = escaped_off_heap_binary();
+
+    let mut rt = runtime();
+    let pid = self_term(&rt);
+
+    // The pre-fix behaviour, asserted first: the payload's only owner is still the (here:
+    // simulated) nested-run machine and the store is empty, so the receiver-side copy cannot
+    // resolve the term and refuses the whole message.
+    {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        assert!(
+            matches!(ctx.send_message(pid, term), Err(BeamError::BadArg)),
+            "without the escaped-payload store the delivery is refused"
+        );
+    }
+    assert!(
+        queued_payloads(&rt, rt.self_pid()).is_empty(),
+        "a refused delivery enqueues nothing"
+    );
+
+    // The nested run returns and its machine is dropped — `beam_rt` adopts the handles first.
+    rt.adopt_escaped_binaries(&payloads.0);
+    drop(payloads);
+
+    // The sender holds **no** handles of its own, yet the delivery must resolve the escaped
+    // payload: the store's clone is the only thing keeping it alive.
+    {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        ctx.send_message(pid, term).expect("the escaped payload resolves");
+    }
+    let queued = queued_payloads(&rt, rt.self_pid());
+    assert_eq!(queued.len(), 1, "the message arrived");
+    let mut reference_heap = beam_alloc::Heap::new(64).expect("the reference heap");
+    let reference =
+        beam_codec::term::make_binary(&mut reference_heap, &bytes).expect("the reference");
+    assert!(
+        beam_term::compare::eq(queued[0], reference, rt.atoms()),
+        "the delivered binary reads back byte-identical to the payload that escaped"
+    );
+    assert_eq!(
+        rt.eval_off_heap.binaries()[0].refcount(),
+        2,
+        "the receiver's message owns its own reference to the shared payload"
+    );
+}
 
 /// The on-heap reference thing for `reference`, built on a pooled BIF heap — the production
 /// route (`src/native/process.rs::reference_term`), so the term stays valid after the heap goes
