@@ -471,10 +471,7 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
 - **epmd frames its requests but not its replies.** A client *request* is 2-byte length-framed
   (`epmd_port.c`), but `epmd` writes every *reply* body straight to the socket with no length prefix
   (`epmd_srv.c` `reply()`); the client reads it unframed/self-delimiting — by tag for `'y'`/`'v'`/`'w'`,
-  and "read until the transport goes quiet" for the open-ended `NAMES_RESP` line list. An earlier note
-  here that "epmd over raw TCP is blocked in this sandbox" was a misdiagnosis: the old client wrongly
-  re-read the reply through `read_packet`, so the first two reply bytes were parsed as a bogus ~30 KB
-  length. Requests are unchanged; only the three response readers changed.
+  and "read until the transport goes quiet" for the open-ended `NAMES_RESP` line list.
 - **There is ONE status→error mapping, shared.** `handshake::status_error(&Status)` is the single
   source; `connection.rs` and `driver.rs` both delegate to it (their private duplicates were deleted).
   It returns `BeamError` values backed by `std::io::ErrorKind` — no new `BeamError` variant and no
