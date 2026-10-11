@@ -24,19 +24,19 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use beam_common::{BeamError, ExitReason};
 use beam_engine::jit::cache::{baseline_cache_len, clear_baseline_cache};
+use beam_engine::machine::WaitDeadline;
 use beam_engine::{Machine, Mailbox, MinimalContext, RunOutcome as EngineOutcome, Tier};
-use beam_loader::{Function, HeapNeed, Import, ImportRef, Instr, Label, Module, Operand};
+use beam_loader::{Export, Function, HeapNeed, Import, ImportRef, Instr, Label, Module, Operand};
 use beam_process::{ProcessId, ProcessRunner, ProcessTable, RunOutcome as ProcOutcome, SignalAtoms};
 use beam_term::{make_atom, make_small, signed_value, Atom, AtomTable, Eterm};
 
 use super::budget::BudgetProbe;
 use super::entry::{ProcessEntry, RunnerState};
 use super::perf::record_baseline_code;
-use super::reason::{exit_reason, normal, parked_receive_timeout, timeout_delay};
+use super::reason::{exit_reason, normal};
 use super::run::RuntimeRunner;
 use super::tier::{jit_is_switch_safe, mode_from_value, select_entry_tier, JitMode};
 use crate::runtime::Runtime;
@@ -315,15 +315,31 @@ fn a_finite_receive_recovers_its_timed_out_continuation() {
     // The engine parks at `Scan` (the `wait_timeout` jump-back target), and — per the C
     // (`emu/msg_instrs.tab:356-379`: on timeout control goes to the instruction
     // *following* `wait_timeout`) — the timed-out continuation is the `timeout` opcode.
+    //
+    // The deadline is recovered through `Machine::wait_deadline` on a **really parked**
+    // machine (an unparked one has no `current_code` and reports `None`), which is exactly
+    // what the runner's `Wait` arm consumes.
     let module = beam_loader::load_file(recv_after_fixture()).expect("recv_after.beam");
-    let machine = Machine::new();
     let (func, wait_index, scan) = finite_receive(&module, "after20");
+    let after20 = module.atom_table.lookup("after20").expect("after20 is interned");
 
-    let (delay, resume) = parked_receive_timeout(&machine, &module, func, scan)
-        .expect("after20 arms a 20 ms deadline");
-    assert_eq!(delay, Duration::from_millis(20));
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::with_mailbox(Box::new(EmptyMailbox));
+    let outcome = machine
+        .run_export_outcome(&module, after20, 0, &[], &mut ctx)
+        .expect("run after20/0");
     assert_eq!(
-        resume,
+        outcome,
+        EngineOutcome::Wait { func, pc: scan },
+        "a non-zero `after` with no message parks at the scan address"
+    );
+
+    let deadline = machine
+        .wait_deadline(&module)
+        .expect("after20 arms a 20 ms deadline");
+    assert_eq!(deadline.delay_ms, Some(20));
+    assert_eq!(
+        deadline.resume,
         (func, wait_index as u32 + 1),
         "resume at the instruction after wait_timeout"
     );
@@ -338,24 +354,24 @@ fn an_infinite_receive_arms_no_deadline() {
     // `after infinity` compiles to a bare `wait`: there is no `wait_timeout` to recover
     // a delay from, so the process parks indefinitely (never a fabricated deadline).
     let module = beam_loader::load_file(recv_after_fixture()).expect("recv_after.beam");
-    let machine = Machine::new();
     let atom = module.atom_table.lookup("wait_forever").expect("wait_forever");
     let function = module.function(atom, 0).expect("wait_forever/0");
     assert!(
         !function.code.iter().any(|i| matches!(i, Instr::WaitTimeout { .. })),
         "a bare wait has no wait_timeout at all"
     );
-    let scan = function
-        .code
-        .iter()
-        .find_map(|instr| match instr {
-            Instr::Wait { target } => Some(function.labels[target] as u32),
-            _ => None,
-        })
-        .expect("the bare wait's resume label");
-    let func = module.functions.iter().position(|f| f.name == atom).unwrap() as u32;
+
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::with_mailbox(Box::new(EmptyMailbox));
+    let outcome = machine
+        .run_export_outcome(&module, atom, 0, &[], &mut ctx)
+        .expect("run wait_forever/0");
+    assert!(
+        matches!(outcome, EngineOutcome::Wait { .. }),
+        "a bare wait parks, got {outcome:?}"
+    );
     assert_eq!(
-        parked_receive_timeout(&machine, &module, func, scan),
+        machine.wait_deadline(&module),
         None,
         "an infinite receive never times out"
     );
@@ -363,25 +379,24 @@ fn an_infinite_receive_arms_no_deadline() {
 
 #[test]
 fn a_timeout_delay_must_be_a_statically_known_positive_millisecond_count() {
+    // The delay decoding is the engine's `Machine::timeout_delay` (the runner no longer
+    // owns a copy); this pins the value semantics the `delay_ms: Some(d)` gate relies on.
     let module = beam_loader::load_file(recv_after_fixture()).expect("recv_after.beam");
     let machine = Machine::new();
     // A literal positive delay is a deadline.
-    assert_eq!(
-        timeout_delay(&machine, &module, &Operand::Integer(20)),
-        Some(Duration::from_millis(20))
-    );
+    assert_eq!(machine.timeout_delay(&module, &Operand::Integer(20)), Some(20));
     // Zero and negative are not delays (the engine handles a bad/`0` time itself), and
     // neither is a register the machine cannot resolve — an honest "no deadline" rather
     // than a guessed one.
-    assert_eq!(timeout_delay(&machine, &module, &Operand::Integer(0)), None);
-    assert_eq!(timeout_delay(&machine, &module, &Operand::Integer(-1)), None);
+    assert_eq!(machine.timeout_delay(&module, &Operand::Integer(0)), None);
+    assert_eq!(machine.timeout_delay(&module, &Operand::Integer(-1)), None);
     assert_eq!(
-        timeout_delay(&machine, &module, &Operand::X(0)),
+        machine.timeout_delay(&module, &Operand::X(0)),
         None,
         "an unset x register is no delay"
     );
     assert_eq!(
-        timeout_delay(&machine, &module, &Operand::Y(0)),
+        machine.timeout_delay(&module, &Operand::Y(0)),
         None,
         "no frame ⇒ no Y slot to read; a parked frame's slot IS read (see the y-delay tests)"
     );
@@ -514,25 +529,29 @@ fn a_y_register_receive_delay_is_armed_and_fires() {
 
     // The Y slot of the parked frame IS readable — the deadline is a real 20 ms, not a guess.
     assert_eq!(machine.y(0), Some(make_small(20)));
-    assert_eq!(
-        timeout_delay(&machine, &module, &Operand::Y(0)),
-        Some(Duration::from_millis(20))
-    );
-    let (delay, resume) = parked_receive_timeout(&machine, &module, 0, 3)
+    assert_eq!(machine.timeout_delay(&module, &Operand::Y(0)), Some(20));
+    let deadline = machine
+        .wait_deadline(&module)
         .expect("the y-register delay arms a 20 ms deadline");
-    assert_eq!(delay, Duration::from_millis(20));
-    assert_eq!(resume, (0, 9), "resume at the `timeout` after wait_timeout");
+    assert_eq!(
+        deadline,
+        WaitDeadline {
+            delay_ms: Some(20),
+            resume: (0, 9)
+        },
+        "resume at the `timeout` after wait_timeout"
+    );
     assert_eq!(module.functions[0].code[9], Instr::Timeout);
 
     // ...and it fires: resuming at the recovered address runs the timed-out continuation.
     let fired = machine
-        .resume_outcome(&module, resume.0, resume.1, &mut ctx)
+        .resume_outcome(&module, deadline.resume.0, deadline.resume.1, &mut ctx)
         .expect("a fired deadline resumes at the timeout instruction");
     assert_eq!(fired, EngineOutcome::Returned(make_small(7)));
 
     // Bounds: the frame owns exactly one Y slot, and an out-of-range one is no deadline.
     assert_eq!(machine.y(1), None, "the frame has one Y slot");
-    assert_eq!(timeout_delay(&machine, &module, &Operand::Y(1)), None);
+    assert_eq!(machine.timeout_delay(&module, &Operand::Y(1)), None);
 }
 
 #[test]
@@ -548,11 +567,305 @@ fn a_y_register_delay_that_is_not_a_positive_integer_arms_nothing() {
 
     let (outcome, machine, _ctx) = park_on_y_delay(&module);
     // A non-integer delay still suspends (it is not the small integer 0), so the machine IS
-    // parked — and the unreadable slot must therefore stay "no deadline", not become one.
+    // parked — and the unreadable slot must therefore stay "no deadline", not become one: the
+    // runner arms a timer only when `delay_ms` is `Some`.
     assert_eq!(outcome, EngineOutcome::Wait { func: 0, pc: 3 });
     assert_eq!(machine.y(0), Some(make_atom(infinity)));
-    assert_eq!(timeout_delay(&machine, &module, &Operand::Y(0)), None);
-    assert_eq!(parked_receive_timeout(&machine, &module, 0, 3), None);
+    assert_eq!(machine.timeout_delay(&module, &Operand::Y(0)), None);
+    let deadline = machine
+        .wait_deadline(&module)
+        .expect("a parked wait_timeout still has a `resume`");
+    assert_eq!(
+        deadline.delay_ms, None,
+        "an unreadable delay arms no timer, so the process parks indefinitely"
+    );
+    assert_eq!(deadline.resume, (0, 9), "the timed-out continuation is still resolved");
+}
+
+// -- a cross-module park: the deadline belongs to the CALLEE ---------------
+
+/// Map every [`Instr::Label`] in `code` to its index (the synthetic-module builders here
+/// share the shape of the engine's own `Fixture`).
+fn labels_of(code: &[Instr]) -> BTreeMap<Label, usize> {
+    let mut labels = BTreeMap::new();
+    for (index, instr) in code.iter().enumerate() {
+        if let Instr::Label(label) = instr {
+            labels.insert(*label, index);
+        }
+    }
+    labels
+}
+
+/// The caller module `m`: `run/0` allocates its own frame, `call_ext`s `c:recv_timeout/0`,
+/// then deallocates and returns the callee's value.
+///
+/// It contains **no** `wait_timeout` at all, which is the crux of the cross-module case: a
+/// deadline recovered by scanning this (entry) module would find nothing.
+fn cross_caller_module() -> (Module, Atom) {
+    let mut module = Module::default();
+    module.name = module.atom_table.intern("m");
+    let import_module = module.atom_table.intern("c");
+    let import_function = module.atom_table.intern("recv_timeout");
+    module.imports.push(Import {
+        module: import_module,
+        function: import_function,
+        arity: 0,
+    });
+    let name = module.atom_table.intern("run");
+    let module_atom = module.name;
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Allocate {
+            stack_need: HeapNeed::Words(0),
+            live: 0,
+        },
+        Instr::CallExt {
+            target: ImportRef(0),
+            arity: 0,
+        },
+        Instr::Deallocate(0),
+        Instr::Return,
+    ];
+    let labels = labels_of(&code);
+    module.functions.push(Function {
+        func_label: Label(1),
+        entry_label: Label(1),
+        module: module_atom,
+        name,
+        arity: 0,
+        code,
+        blocks: Vec::new(),
+        labels,
+    });
+    module.exports.push(Export {
+        function: name,
+        arity: 0,
+        label: Label(1),
+    });
+    (module, name)
+}
+
+/// The callee module `c`: `recv_timeout/0` — `receive foo -> foo after 20 -> timed_out end`
+/// whose timed-out branch moves a distinctive atom into `x(0)`. Its `wait_timeout` sits at
+/// code index 5 and the `timeout` continuation at index 6.
+fn cross_callee_module() -> Arc<Module> {
+    let mut module = Module::default();
+    module.name = module.atom_table.intern("c");
+    let timed_out = module.atom_table.intern("timed_out");
+    let name = module.atom_table.intern("recv_timeout");
+    let module_atom = module.name;
+    let code = vec![
+        Instr::Label(Label(10)),
+        Instr::LoopRec {
+            fail: Label(11),
+            dst: Operand::X(0),
+        },
+        Instr::RemoveMessage,
+        Instr::Return,
+        Instr::Label(Label(11)),
+        Instr::WaitTimeout {
+            target: Label(10),
+            time: Operand::Integer(20),
+        },
+        Instr::Timeout,
+        Instr::Move {
+            src: Operand::Atom(timed_out),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let labels = labels_of(&code);
+    module.functions.push(Function {
+        func_label: Label(10),
+        entry_label: Label(10),
+        module: module_atom,
+        name,
+        arity: 0,
+        code,
+        blocks: Vec::new(),
+        labels,
+    });
+    module.exports.push(Export {
+        function: name,
+        arity: 0,
+        label: Label(10),
+    });
+    Arc::new(module)
+}
+
+/// The whole point of the fix: a machine parked inside a **cross-module callee** has its
+/// deadline recovered through the **entry** module the runner passes.
+///
+/// The defect this guards: the runner used to recover a parked receive's deadline by
+/// scanning the process's **entry** module (`parked_receive_timeout(&machine, &entry_module,
+/// func, pc)`). A `call_ext*` the host resolved through
+/// [`ExecutionContext::resolve_external_call`](beam_engine::ExecutionContext::resolve_external_call)
+/// is entered **in the calling machine**, so its `receive … after T` parks at a `wait_timeout`
+/// in the **callee's** instruction stream — which the entry module does not contain. The
+/// entry-module read therefore found nothing, armed no timer, and the process parked forever.
+/// `Machine::wait_deadline` resolves the callee module internally, so passing the entry module
+/// is correct and sufficient.
+#[test]
+fn a_cross_module_park_recovers_the_callee_deadline_through_the_entry_module() {
+    let (caller, run) = cross_caller_module();
+    let callee = cross_callee_module();
+
+    let mut ctx = MinimalContext::with_mailbox(Box::new(EmptyMailbox));
+    let resolved = Arc::clone(&callee);
+    ctx.set_external_resolver(Box::new(move |module, function, arity| {
+        if module != "c" {
+            return Ok(None);
+        }
+        let Some(function) = resolved.atom_table.lookup(function) else {
+            return Ok(None);
+        };
+        Ok(resolved
+            .export(function, arity)
+            .map(|label| (Arc::clone(&resolved), label)))
+    }));
+
+    let mut machine = Machine::new();
+    let outcome = machine
+        .run_export_outcome(&caller, run, 0, &[], &mut ctx)
+        .expect("run m:run/0");
+    assert!(
+        matches!(outcome, EngineOutcome::Wait { .. }),
+        "the callee's receive parks the calling process, got {outcome:?}"
+    );
+
+    // The entry module has no `wait_timeout` at all — reading it alone (the pre-fix behaviour)
+    // can only lose the deadline, which is exactly how the process used to park forever.
+    assert!(
+        !caller.functions[0]
+            .code
+            .iter()
+            .any(|instr| matches!(instr, Instr::WaitTimeout { .. })),
+        "the entry module holds no wait_timeout: the deadline lives in the callee"
+    );
+
+    // Yet the deadline IS recovered by passing the ENTRY module: the callee's `after 20`,
+    // with the callee's own `timeout` continuation (func 0, code index 6).
+    let deadline = machine
+        .wait_deadline(&caller)
+        .expect("the callee's finite delay is recovered through the entry module");
+    assert_eq!(
+        deadline,
+        WaitDeadline {
+            delay_ms: Some(20),
+            resume: (0, 6)
+        }
+    );
+
+    // Firing it runs the callee's `after` clause and returns its value through the caller.
+    let resumed = machine
+        .resume_outcome(&caller, deadline.resume.0, deadline.resume.1, &mut ctx)
+        .expect("resume at the callee's `timeout` continuation");
+    let timed_out = make_atom(
+        callee
+            .atom_table
+            .lookup("timed_out")
+            .expect("the callee's after clause names `timed_out`"),
+    );
+    assert_eq!(resumed, EngineOutcome::Returned(timed_out));
+}
+
+/// Compile each `(module-name, source)` into one fresh temp dir and return that dir; `None`
+/// when no runnable `erlc` is on `PATH` (the caller skips loudly). A spawned `erlc` that
+/// *ran* and exited non-zero is a harness failure, so it panics with the captured stderr.
+fn compile_modules(tag: &str, sources: &[(&str, &str)]) -> Option<std::path::PathBuf> {
+    let dir = std::env::temp_dir().join(format!("beam_rt_runner_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("the scratch directory is creatable");
+    for (name, source) in sources {
+        std::fs::write(dir.join(format!("{name}.erl")), source)
+            .unwrap_or_else(|error| panic!("write {name}.erl: {error}"));
+        let output = std::process::Command::new("erlc")
+            .arg("+deterministic")
+            .arg(format!("{name}.erl"))
+            .current_dir(&dir)
+            .output()
+            .ok()?;
+        assert!(
+            output.status.success(),
+            "the system `erlc` exited {} compiling {name}.erl\n  stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Some(dir)
+}
+
+/// The end-to-end proof of the fixed runner arm: a **scheduled** process whose `call_ext`
+/// parks inside a cross-module **callee**'s `receive … after 20` must have its timer armed.
+///
+/// The caller's `run/0` tail-calls `xm_callee:recv_timeout/0`, which the real
+/// [`RuntimeContext`](crate::context::RuntimeContext) enters **in this machine**, so the
+/// `wait_timeout` is in the callee's stream. Before the fix the runner scanned the entry
+/// module (which has no `wait_timeout`), armed nothing and the process parked forever; the
+/// observable here is the engine's `parked_timeout` handle.
+#[test]
+fn a_process_parked_in_a_cross_module_callee_arms_the_callee_timeout() {
+    let callee = "\
+-module(xm_callee).
+-export([recv_timeout/0]).
+recv_timeout() ->
+    receive
+        foo -> foo
+    after 20 ->
+        timed_out
+    end.
+";
+    let caller = "\
+-module(xm_caller).
+-export([run/0]).
+run() ->
+    xm_callee:recv_timeout().
+";
+    let Some(dir) = compile_modules("xmod", &[("xm_callee", callee), ("xm_caller", caller)])
+    else {
+        eprintln!("SKIP: no system `erlc` on PATH -- the cross-module park test is skipped");
+        return;
+    };
+
+    let mut rt = runtime();
+    rt.add_code_path(&dir);
+    let mut state = RunnerState::default();
+    let mut table = table();
+    let pid = table.spawn_default().expect("a fresh process");
+    let module = Arc::new(
+        beam_loader::load_file(dir.join("xm_caller.beam")).expect("load the compiled caller"),
+    );
+    let run = module.atom_table.lookup("run").expect("run/0 is interned");
+    state.spawn(
+        pid,
+        ProcessEntry::Export {
+            module,
+            function: run,
+            arity: 0,
+        },
+        Vec::new(),
+    );
+
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 1_000)
+            .expect("the slice runs")
+    };
+    assert_eq!(
+        outcome,
+        ProcOutcome::Wait,
+        "the callee's `after T` parks the calling process"
+    );
+    assert!(
+        state
+            .engines
+            .get(&pid)
+            .is_some_and(|engine| engine.parked_timeout.is_some()),
+        "the callee's deadline is armed through the entry module (the pre-fix arm lost it)"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 // -- execution-tier selection (`super::tier`) -----------------------------
 
