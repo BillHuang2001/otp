@@ -25,15 +25,11 @@ not here.)
 - `enif_getenv`'s "too small" path leaves `*value_size` at `capacity-1` in the oracle vs the
   needed capacity in the rust runtime (the success path and the missing-key refusal DO agree
   and are pinned).
-
-- `enif_compare/2` on **mixed-type / atom** pairs diverges: `enif_compare(1, 1.0)` → oracle `0`,
-  the rust runtime non-zero; `enif_compare('alpha', 'beta')` → oracle `-1`, the rust runtime
-  non-zero. The rust `enif_compare` (`crates/beam_abi/src/nif/enif/pred.rs`) compares through
-  `no_atoms()`, so it cannot rank atoms or mixed numerics like the oracle. No case pins it.
-  Owner: `beam_abi`.
-- `enif_priv_data/1` (extra-environment family) diverges: the oracle answers the pointer the load
-  callback stored, the rust runtime leaves the `NifHost::priv_data` hook at its default and answers
-  `NULL` (`0` vs `11`). No case pins it. Owner: `beam_rt` (`NifHost`) / `beam_abi`.
+- `enif_compare/2` falls back to `beam_term` index order for a **nested** (tuple / list / map)
+  atom pair; the top-level mixed-numeric and atom-pair rankings use the C's arithmetic `CMP` /
+  name order and are pinned (`nif_extra/compare_int_one_equals_float_one`,
+  `nif_extra/compare_alpha_orders_before_beta`). No case pins the nested shape. Owner: `beam_abi`;
+  pinned by `crates/beam_abi/tests/nif_compare.rs`.
 
 ## A.4 — driver C ABI (owner: `beam_rt` / `beam_io`; `beam_abi` for the timer units)
 - **Landed:** `erl_drv_output_term` / `erl_drv_send_term` / `driver_output_term` /
@@ -71,8 +67,7 @@ not here.)
   unpinnable, to re-check before treating any as a runtime gap.
 - `driver_mk_port(NULL)` returns the nil term in the rust runtime but crashes the **oracle** VM
   (an exit signal with empty stdout) — a probe hazard, unpinnable; excluded from the `driver_extra`
-  block. `erl_drv_cond_name`/`erl_drv_rwlock_name` on an object created with a NULL name deviate
-  too (oracle `"unknown"`, rust `NULL`) and are likewise unpinned.
+  block.
 - `erl_errno_id/1` returns a short POSIX symbol (`enoent`, `einval`, `errno_0`) in the oracle
   but `strerror` prose in the rust runtime.
 - `driver_pdl_get_refc(NULL)` SIGSEGVs the oracle, so the `driver_pdl_*` family stays unpinned

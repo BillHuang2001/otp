@@ -443,8 +443,11 @@ pub(crate) fn group() -> Vec<Case> {
             description: "port_command/2 on a closed port raises badarg",
             contracts: &[Contract::DriverAbi],
             kind: CaseKind::Eval {
-                // A write to an already-reaped port is an error, not a silent no-op.
-                expr: "begin P=open_port({spawn,\"true\"},[]), port_close(P), port_command(P,<<\"x\">>) end",
+                // `cat` keeps the port open until `port_close/1` (a self-exiting child such as
+                // `true` may race this case and be auto-closed before the explicit close), so the
+                // write legitimately happens *after* a `port_close/1`. A write to a closed port is
+                // an error, not a silent no-op.
+                expr: "begin P=open_port({spawn,\"cat\"},[]), port_close(P), port_command(P,<<\"x\">>) end",
                 extra_argv: &[],
                 probe: Probe::TermToBinary,
             },
@@ -518,12 +521,14 @@ pub(crate) fn group() -> Vec<Case> {
             description: "port_info/1 on a closed spawn port is undefined",
             contracts: &[Contract::DriverAbi],
             kind: CaseKind::Eval {
-                expr: "begin P = open_port({spawn,\"true\"},[]), port_close(P), erlang:port_info(P) end",
+                // `cat` keeps the port open until `port_close/1` (a self-exiting child such as
+                // `true` may race this case and be auto-closed before the explicit close).
+                expr: "begin P = open_port({spawn,\"cat\"},[]), port_close(P), erlang:port_info(P) end",
                 extra_argv: &[],
                 probe: Probe::TermToBinary,
             },
             golden: Golden {
-                // erts answers the atom `undefined` for a reaped port, not a proplist.
+                // erts answers the atom `undefined` for a port closed by `port_close/1`.
                 stdout: Some("ok <<131,119,9,117,110,100,101,102,105,110,101,100>>"),
                 exit_code: 0,
             },
@@ -767,7 +772,10 @@ pub(crate) fn group() -> Vec<Case> {
             description: "erlang:ports/0 drops a port after it has been closed",
             contracts: &[Contract::DriverAbi],
             kind: CaseKind::Eval {
-                expr: "begin P = open_port({spawn,\"true\"},[]), port_close(P), lists:member(P, erlang:ports()) end",
+                // `cat` keeps the port open until `port_close/1` (a self-exiting child such as
+                // `true` may race this case and be auto-closed before the explicit close), so the
+                // membership check really runs against a closed port.
+                expr: "begin P = open_port({spawn,\"cat\"},[]), port_close(P), lists:member(P, erlang:ports()) end",
                 extra_argv: &[],
                 probe: Probe::TermToBinary,
             },
@@ -781,7 +789,9 @@ pub(crate) fn group() -> Vec<Case> {
             description: "port_info/2 on a closed spawn port is undefined",
             contracts: &[Contract::DriverAbi],
             kind: CaseKind::Eval {
-                expr: "begin P = open_port({spawn,\"true\"},[]), port_close(P), erlang:port_info(P, name) end",
+                // `cat` keeps the port open until `port_close/1` (a self-exiting child such as
+                // `true` may race this case and be auto-closed before the explicit close).
+                expr: "begin P = open_port({spawn,\"cat\"},[]), port_close(P), erlang:port_info(P, name) end",
                 extra_argv: &[],
                 probe: Probe::TermToBinary,
             },
@@ -934,6 +944,41 @@ mod tests {
             Some("ok <<131,119,9,117,110,100,101,102,105,110,101,100>>")
         );
         assert_eq!(case.golden.exit_code, 0);
+    }
+
+    /// The cases whose *point* is the explicit `port_close/1` must open a **non-self-exiting**
+    /// child (`cat`, which reads stdin forever), so the port is still open when the close
+    /// happens. A self-exiting child (`true`) is reaped by the runtime long before the case
+    /// would be done; under a load spike the port is then already auto-closed, `port_close/1`
+    /// itself raises `badarg`, and the case races its own golden (`undefined`/`false` would come
+    /// out as `exception error badarg`). Verified against the oracle: inserting a 300 ms delay
+    /// before the close makes the `"true"` form raise `badarg` while the `"cat"` form still
+    /// answers the golden.
+    #[test]
+    fn explicit_close_cases_open_a_non_self_exiting_child() {
+        for id in [
+            "driver/port_command_after_close_is_badarg",
+            "driver/port_info_after_close_is_undefined",
+            "driver/port_info2_after_close_is_undefined",
+            "driver/ports_excludes_a_closed_port",
+        ] {
+            let case = find_case(id).unwrap_or_else(|| panic!("case {id} is not registered"));
+            let CaseKind::Eval { expr, .. } = case.kind else {
+                panic!("case {id} must be a plain eval case");
+            };
+            assert!(
+                expr.contains("open_port({spawn,\"cat\"},[])"),
+                "case {id}: the explicit close needs a non-self-exiting child (`cat`)"
+            );
+            assert!(
+                !expr.contains("\"true\""),
+                "case {id}: a self-exiting child would auto-close the port before `port_close/1`"
+            );
+            assert!(
+                expr.contains("port_close(P)"),
+                "case {id}: the port must be closed explicitly"
+            );
+        }
     }
 
     #[test]

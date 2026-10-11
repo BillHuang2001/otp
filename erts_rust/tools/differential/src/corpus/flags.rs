@@ -55,7 +55,13 @@
 //! `max_heap_size` / minimum-heap-size flags by **acceptance**: the switch is consumed from the
 //! argv before `init`, so it has no `init`/`system_info` observable, and the case asserts the
 //! runtime still boots and a tiny bounded allocation returns its value.
-
+//!
+//! One environment case pins a **host** configuration knob rather than an `ERL_*` variable:
+//! `BEAM_RT_GC_STRATEGY=immix` is this runtime's default-OFF opt-in for the mark-region mature
+//! generation, read once at start-up and invisible to `init`. The oracle ignores it entirely,
+//! so the case pins only that the opt-in does **not** perturb observable semantics for an
+//! allocation that really grows the process heap (the runtime has no CLI or `system_info`
+//! surface for the strategy; `beam_rt`'s `tests/gc_strategy.rs` pins the selector itself).
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
 /// The A.6 cases: the `-noshell` flag and an arbitrary user flag.
@@ -739,6 +745,31 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // --- the runtime's own GC-strategy opt-in: configuration by environment ------------
+        // `BEAM_RT_GC_STRATEGY=immix` is a **host** knob (not an `ERL_*` variable and not an
+        // init argument): the runtime reads it once at start-up and the *oracle ignores it*, so
+        // the only differential property it has is that selecting the mark-region mature
+        // generation does not perturb observable semantics. The probe therefore allocates
+        // enough (`lists:seq/2` builds 100000 cons cells) that the process heap really grows and
+        // the collector runs, and asserts the result is unchanged. The selector itself — the
+        // break-even rule that maps the raised mature size onto `MatureKind::Immix` — is pinned
+        // inside the runtime by `beam_rt`'s `tests/gc_strategy.rs`, which can read a live
+        // process's collector; no CLI/`system_info` surface exposes it.
+        Case {
+            id: "flags/env_gc_strategy_immix_keeps_observable_semantics",
+            description: "the default-OFF BEAM_RT_GC_STRATEGY=immix opt-in is accepted and leaves a heap-growing allocation unchanged",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::EvalEnv {
+                expr: "length(lists:seq(1,100000))",
+                extra_argv: &[],
+                env: &[("BEAM_RT_GC_STRATEGY", "immix")],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 100000"),
+                exit_code: 0,
+            },
+        },
     ]
 }
 
@@ -795,7 +826,11 @@ mod tests {
                 expr.starts_with("init:get_argument(")
                     || expr == "init:get_plain_arguments()"
                     || expr.starts_with("erlang:system_info(")
-                    || expr == "length(lists:seq(1,1000))",
+                    || expr == "length(lists:seq(1,1000))"
+                    // The `BEAM_RT_GC_STRATEGY` host opt-in has no `init`/`system_info`
+                    // observable either, so it too is pinned by acceptance — with an
+                    // allocation big enough to grow the heap (see `flags/env_gc_strategy_*`).
+                    || expr == "length(lists:seq(1,100000))",
                 "case {}: A.6 is observed through init:get_argument/1, get_plain_arguments/0, \
                  (for a +-flag) erlang:system_info/1, or (for an argv flag with no other \
                  observable) the bounded-allocation acceptance probe, got {expr}",
@@ -819,14 +854,19 @@ mod tests {
                 "case {}: unexpected golden {golden:?}",
                 case.id
             );
-            // An environment-variable case pins either the `ERL_*FLAGS` merge or the
-            // `ERL_MAX_PORTS` port-table request, so it must declare a non-empty environment
-            // drawn from the documented variable set.
+            // An environment-variable case pins either the `ERL_*FLAGS` merge, the
+            // `ERL_MAX_PORTS` port-table request, or this runtime's own GC-strategy opt-in
+            // (`BEAM_RT_GC_STRATEGY`, which the oracle ignores), so it must declare a non-empty
+            // environment drawn from the documented variable set.
             for (name, value) in case.env() {
                 assert!(
                     matches!(
                         *name,
-                        "ERL_AFLAGS" | "ERL_FLAGS" | "ERL_ZFLAGS" | "ERL_MAX_PORTS"
+                        "ERL_AFLAGS"
+                            | "ERL_FLAGS"
+                            | "ERL_ZFLAGS"
+                            | "ERL_MAX_PORTS"
+                            | "BEAM_RT_GC_STRATEGY"
                     ),
                     "case {}: unexpected environment variable {name}",
                     case.id

@@ -659,5 +659,90 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // --- `erlang:send/3`: the option list belongs to the BIF, the delivery to the host --
+        // `send_3` (`bif.c::send_3`) parses its own option list — a proper list of the atoms
+        // `noconnect`/`nosuspend`/`priority`, order- and duplicate-insensitive — *before* the
+        // destination is validated, then delegates the delivery. Its *successful* answer is the
+        // atom `ok`, never the message (`send/2` returns the message), and an unknown option is
+        // `badarg`. Every golden below is the live oracle's output.
+        Case {
+            id: "bifs/send_3_noconnect_answers_ok",
+            description: "erlang:send/3 with the noconnect option answers the atom ok for a local destination",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "erlang:send(self(), hello, [noconnect])",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok ok"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/send_3_options_are_a_set",
+            description: "erlang:send/3 accepts a multi-element option list (the options are a set)",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "erlang:send(self(), hello, [nosuspend, noconnect])",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok ok"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/send_3_unknown_option_is_badarg",
+            description: "erlang:send/3 rejects an option that is not one of noconnect/nosuspend/priority with badarg",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "erlang:send(self(), hello, [bogus])",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("exception error badarg"),
+                exit_code: 1,
+            },
+        },
+        Case {
+            id: "bifs/send_3_delivers_the_message_to_self",
+            description: "a noconnect send to the calling process really enqueues the message",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // The `after 0` clause keeps the case self-terminating: a runtime that dropped
+                // the message answers `timeout` instead of `delivered`.
+                expr: "begin erlang:send(self(), hello, [noconnect]), \
+                       receive hello -> delivered after 0 -> timeout end end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok delivered"),
+                exit_code: 0,
+            },
+        },
+        // --- `beam_lib:md5/1`: the module digest of a real `.beam` image ---------------------
+        Case {
+            id: "bifs/beam_lib_md5_of_a_real_module_is_a_sixteen_byte_binary",
+            description: "beam_lib:md5/1 hashes a loaded module's .beam image into a 16-byte digest",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // `code:which/1` locates the installed `lists.beam` and `beam_lib:md5/1` hashes
+                // it. The digest *bytes* are installation-dependent, so only their shape is
+                // pinned (an MD5 is always a 16-byte binary); the `{ok,{Module,Digest}}` wrapper
+                // itself is asserted by the pattern match, which both runtimes must satisfy.
+                expr: "begin {ok,{lists,Digest}} = beam_lib:md5(code:which(lists)), \
+                       {is_binary(Digest), byte_size(Digest)} end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {true,16}"),
+                exit_code: 0,
+            },
+        },
     ]
 }
