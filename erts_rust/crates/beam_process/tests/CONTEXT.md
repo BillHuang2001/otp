@@ -68,7 +68,7 @@ Single-threaded scheduler, mailbox, signals, GC roots, PCB state:
     `alloc_pid` + `HeapPolicy::from_spawn_opts(min_heap, min_bin_vheap, fullsweep)` +
     `Process::with_policy_and_priority` + `ProcessTable::insert` + priority-correct enqueue, and
     `{link,_}`/`{monitor,_}` through the table. The applied heap policy is proven to have reached the
-    collector honestly via `Collector::policy()` (and its `fullsweep_due`/initial-space sizing). This
+    collector honestly via `AnyCollector::policy()` (and its `fullsweep_due`/initial-space sizing). This
     is the contract the sibling `beam_rt`/`beam_bifs` spawn-option path adopts.
 15. `ports.rs` — `PortTable` relationship round-trips + `ProcessTable::port_closed` (`{'DOWN', …}` for
     a monitor, `{'EXIT', Port, Reason}` for a trapping linked process, termination for a non-trapping
@@ -264,7 +264,28 @@ SMP pool:
     named-monitor DOWN (`from == system`), a remote DOWN and a remote EXIT (`from == node`, body still the
     external pid), and the collection case (a nursery GC then `is_immediate(from)` + `from` unchanged,
     the relocated payload still carrying `{Name,Node}`). **5 of the 6 FAIL on the pre-fix code** (which
-    stored an on-heap `from`) — verified by reverting.## Constraints
+    stored an on-heap `from`) — verified by reverting.
+36. `collector_dispatch.rs` (4 tests) — the **GC strategy dispatch on the production `Process`
+    path**: `Process` owns a `beam_gc::AnyCollector`, so the mature generation a real process collects
+    with is the one its heap policy resolves to. (i) `a_runtime_spawned_process_selects_the_strategy_its_policy_implies`
+    spawns through the production entry point (`ProcessTable::spawn(policy)`) and asserts
+    `collector().kind()` — `MatureKind::Immix` for `initial_mature_words >= beam_gc::IMMIX_BREAK_EVEN_WORDS`
+    (with `mature_choice().source == Automatic`), `Copying` one word below and for the default policy;
+    **this assertion has no pre-change counterpart** (the field was the concrete `Collector`, so no
+    strategy question could be asked of a process). (ii)
+    `the_default_process_keeps_the_pre_change_collection_cadence` pins the default's
+    `CollectionKind` sequence literally (`[Minor × 4]`, `minor_gcs == 4`, zero majors — the default
+    `fullsweep_after = 65_535` never fires) and the growth seam's kind. (iii)
+    `the_selected_strategy_collects_through_the_process` plants live x-register/stack/mailbox roots and
+    asserts they survive structurally across three `collect()`s + `ensure_capacity` +
+    `collect_if_needed` + a later delivery, for **both** a default and an Immix-configured process; and
+    `an_immix_process_survives_a_fullsweep_through_the_process` gives the Immix process
+    `fullsweep_after = 0` (the rule reads the mature *size*, so the policy still resolves to Immix) and
+    drives three real **GenImmix fullsweeps** through `Process::collect` (`CollectionKind::Major`).
+    Deterministic — the strategy/kind assertions and the fixed collect counts, no sleeps / wall-clock
+    bounds / oracle.
+
+## Constraints
 - **Anti-flakiness (BINDING).** Every assertion is forced by **synchronization**, never a bare
   `std::thread::sleep`: `mpsc` channels + `recv_timeout` carry the completion signals,
   `std::sync::Barrier`/gates coordinate concurrency, and `SchedulerPool::wait_idle(Some(timeout))` is
@@ -282,7 +303,7 @@ SMP pool:
 - Run the whole crate gate with
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_process` (never `cd`,
   sandbox `$HOME` is read-only). Cross-checks against the real system ERTS belong to the sibling
-  `../../../tools/differential/` harness, not here. Current: **427 passed, 0 failed, 1 ignored**.
+  `../../../tools/differential/` harness, not here. Current: **431 passed, 0 failed, 1 ignored**.
 
 ## Routing Table
 - `scheduler.rs`, `messaging.rs`, `signals.rs`, `gc.rs`, `priority.rs`, `pending_signals.rs`,
@@ -295,9 +316,11 @@ SMP pool:
   collection's queued-message re-install (a fragment-resident/off-heap-owning message keeps its whole
   envelope across a collect)
 - `registry_monitors.rs`, `monitor_tag.rs`, `capability_inventory.rs`, `process_info_source.rs`,
-  `spawn_options.rs`, `lifecycle_oracle.rs` → the process-control surface: name registry + monitors (incl.
+  `spawn_options.rs`, `collector_dispatch.rs`, `lifecycle_oracle.rs` → the process-control surface: name registry + monitors (incl.
   the `monitor/3` user tag), the typed-error/capability inventory, the `process_info` item→accessor
-  mapping, the spawn-option composition, and the lifecycle semantics (link exit propagation, `kill` under
+  mapping, the spawn-option composition and the GC **strategy dispatch** (the strategy a process's
+  policy resolves to, the unchanged default cadence, and collection through the process root set), and
+  the lifecycle semantics (link exit propagation, `kill` under
   `trap_exit`, exit-reason shapes, `erlang:exit/2` propagation, the registry round trip, `demonitor`
   `[info]`/`[flush]`)
 - `split_borrow.rs` → the two `Process` split borrows (`heap_and_off_heap_mut` + `Fragments::move_into`;

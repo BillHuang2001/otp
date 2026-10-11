@@ -26,7 +26,7 @@
 //! reduction counter, the link/monitor sets and the termination reason.
 //!
 //! Nothing here is reimplemented from a sibling: the mailbox is `beam_message::Queue`, the
-//! copy engine is `beam_message::send`/`receive`, the heaps are `beam_gc::Collector` over
+//! copy engine is `beam_message::send`/`receive`, the heaps are `beam_gc::AnyCollector` over
 //! `beam_alloc::Heap`, and the off-heap objects are `beam_message::OffHeapTable`.
 //!
 //! Legacy C ground truth (read-only): `erl_process.{c,h}` (the PCB and its state),
@@ -34,7 +34,7 @@
 
 use beam_alloc::Heap;
 use beam_common::{AllocKind, BeamError, Result};
-use beam_gc::{Collection, Collector, HeapPolicy};
+use beam_gc::{AnyCollector, Collection, HeapPolicy};
 use beam_message::{copy_struct, CopyContext, Message, OffHeapTable, Queue};
 use beam_term::prelude::Eterm;
 
@@ -243,7 +243,13 @@ pub struct Process {
     /// [`Process::set_save_calls`]); the tracing subsystem itself is absent in M1.
     save_calls: u16,
     /// The two-generation collector owning the young (mutator) and mature heaps.
-    collector: Collector,
+    ///
+    /// The **strategy-dispatching** collector ([`beam_gc::AnyCollector`]): its mature generation
+    /// is the copying space or the mark-region (GenImmix) space, chosen at construction by the
+    /// automatic rule from the policy's initial mature size (or by an explicit pin when the
+    /// caller builds it from a [`beam_gc::GcConfig`]). A default policy resolves to the copying
+    /// space, so this is behaviour-identical to owning the concrete collector.
+    collector: AnyCollector,
     /// Whether this process is **relocation-exempt** (default `false`).
     ///
     /// A host (e.g. `beam_rt`) may hold live terms from this process's young heap in Rust locals
@@ -342,7 +348,7 @@ impl Process {
             flags,
             priority,
             save_calls: 0,
-            collector: Collector::new(policy)?,
+            collector: AnyCollector::new(policy)?,
             relocation_exempt: false,
             off_heap: OffHeapTable::new(),
             mailbox: Queue::new(),
@@ -587,7 +593,7 @@ impl Process {
     /// message onto a process's heap in one step.
     ///
     /// `self` is destructured internally, so the compiler proves the two references are disjoint
-    /// borrows of distinct fields of `Collector`/`Process`. Safe Rust only — no raw pointers and
+    /// borrows of distinct fields of `AnyCollector`/`Process`. Safe Rust only — no raw pointers and
     /// no `unsafe`.
     pub fn heap_and_off_heap_mut(&mut self) -> (&mut Heap, &mut OffHeapTable) {
         let Process {
@@ -610,7 +616,7 @@ impl Process {
     /// without destructuring `Process` or reimplementing the enqueue.
     ///
     /// `self` is destructured internally, so the compiler proves the two references are disjoint
-    /// borrows of distinct fields of `Collector`/`Process`. Safe Rust only — no raw pointers and
+    /// borrows of distinct fields of `AnyCollector`/`Process`. Safe Rust only — no raw pointers and
     /// no `unsafe`.
     pub fn heap_and_mailbox_mut(&mut self) -> (&mut Heap, &mut Queue) {
         let Process {
@@ -802,7 +808,13 @@ impl Process {
     }
 
     /// The process's garbage collector.
-    pub fn collector(&self) -> &Collector {
+    ///
+    /// The strategy-dispatching [`beam_gc::AnyCollector`]: its mature generation is whichever
+    /// strategy the policy's configuration resolved to ([`beam_gc::AnyCollector::kind`] names
+    /// it), so a caller inspects the mature space through the geometry accessors
+    /// ([`beam_gc::AnyCollector::mature_capacity_words`] and its siblings) rather than a
+    /// strategy-specific `mature()` reference.
+    pub fn collector(&self) -> &AnyCollector {
         &self.collector
     }
 
@@ -921,8 +933,9 @@ impl Process {
     /// Gathers the process root set, runs `collect` over it and writes every region back — the
     /// shared body of [`Process::collect`] and [`Process::ensure_capacity`].
     ///
-    /// `collect` is the collection action: [`Collector::collect`] for a plain collection, or
-    /// [`Collector::ensure_capacity`] for an on-demand nursery growth. Every region is written
+    /// `collect` is the collection action: [`beam_gc::AnyCollector::collect`] for a plain
+    /// collection, or [`beam_gc::AnyCollector::ensure_capacity`] for an on-demand nursery growth.
+    /// Every region is written
     /// back **even when the action returned `Err`**: an `ensure_capacity` failure can happen
     /// *after* its collection succeeded (the nursery growth was refused), at which point the
     /// roots have already been relocated in place, so leaving them unwritten would corrupt the
@@ -938,7 +951,7 @@ impl Process {
     /// would leak the refcounts the message held on its off-heap objects.
     fn run_rooted_collection<F>(&mut self, collect: F) -> Result<Collection>
     where
-        F: FnOnce(&mut Collector, &mut [Eterm]) -> Result<Collection>,
+        F: FnOnce(&mut AnyCollector, &mut [Eterm]) -> Result<Collection>,
     {
         // 1. The flat root slice: `x[0..live)`, then the whole stack, then one word per
         //    queued mailbox payload. `reg_words` is where the mailbox roots start.
