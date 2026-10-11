@@ -45,7 +45,7 @@ Drift-guarded by `native.rs::tests::every_floor_module_is_a_real_try_native_arm`
 |---|---|
 | `../native.rs` (parent) | module docs, `try_native`, the shared helpers (`atom`/`atom_name`/`charlist`/`render`/`string_list`/`write_output`/`chars_to_string`), and the arms whose bodies live here: the `erlang` core (`halt/0,1,2`, `display/1`, `apply/2,3`, `system_info/1`, `send_after/3`, `cancel_timer/1`, `make_ref/0`, `pre_loaded/0`, `module_loaded/1`), `io:put_chars/1,2`, `os:cmd/1`, the `seq_trace`/`seq_trace_info`/`seq_trace_print`/`system_flag(reset_seq_trace)` family over `crate::seq_trace`, and the `trace`/`trace_info`/`trace_delivered`/`trace_pattern` family over `crate::trace` |
 | `init.rs` | `init:get_argument/1` (a command-line flag from `RuntimeConfig::init_args`, plus the four **automatic** flags `root`/`home`/`progname`/`bindir`), `get_arguments/0`, `get_plain_arguments/0`, `get_status/0`, `script_id/0`, `stop/0,1`, `restart/0`, `boot/1` |
-| `code.rs` | `code:get_path/0`, `all_loaded/0`, `which/1`, `is_loaded/1`, `is_sticky/1,2`, `ensure_loaded/1`, `load_file/1`, `lib_dir/0,1,2`, `root_dir/0`, `get_mode/0` |
+| `code.rs` | `code:get_path/0`, `all_loaded/0`, `which/1`, `is_loaded/1`, `is_sticky/1,2`, `ensure_loaded/1`, `load_file/1`, `lib_dir/0,1,2`, `priv_dir/1`, `root_dir/0`, `get_mode/0` |
 | `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) | `erlang:make_ref/0`, `spawn/1,2,3`, `spawn_link/1,2,3`, `spawn_opt/2,3,4`, `spawn_monitor/1,2,3,4`, `ports/0`, `processes/0`, `pre_loaded/0`, `group_leader/0`, `whereis/1`, `register/2`, `unregister/1`, `module_loaded/1`; the monitor family (`monitor/2,3`, `demonitor/1,2`) in `process/monitor.rs`; `exit/2,3` in `process/exit.rs` |
 | `node.rs` | `erlang:is_alive/0`, `get_cookie/0`, `set_cookie/2`, `nodes/0,1` |
 | `memory/` | `erlang:process_info/1,2` — the per-process introspection surface (+ `memory/tests.rs`) |
@@ -86,6 +86,10 @@ init's receive loop) whereas this one returns after booting.
 `code:load_file/1` really loads (`{module,M}` from `CodeServer::load`) with the oracle's
 `{error,sticky_directory|nofile|badfile}` vocabulary. `code:get_mode/0` reads the code server's
 `interactive`/`embedded` mode from the `-mode` init argument (`code.erl:1741-1765`).
+`code:priv_dir/1` is `lib_dir(App, priv)` — the application directory **joined** with `priv`, never
+`stat`ed (the code server rewrites `{priv_dir,App}` into `{lib_dir,App,priv}`,
+`code_server.erl:1058-1059`), with the guard's atom/string forms accepted and `{error,bad_name}`
+for a name the code server does not know (`code.erl:978-980`).
 **`code:*` is the native floor, not a live `code_server`** — OTP's real `code_server.beam` needs
 facilities outside this crate, so `code.rs`'s behaviour must not change (see `../CONTEXT.md`).
 `code:is_loaded/1` and `code:which/1` report **path resolvability**, not the code server's load
@@ -345,12 +349,13 @@ system (`std::fs`/`std::env`) — "primitive" is exactly what this layer is for.
 returns `None`, so the call falls through to the preloaded `.beam` (an honest
 `erlang:nif_error(undef)`).
 
-**Served (27 entries; per-entry ground truth/probes in each module's own rustdoc table):**
+**Served (33 entries; per-entry ground truth/probes in each module's own rustdoc table):**
 * **path half** (`prim.rs`): `get_cwd/0,1`, `read_file/1`, `delete/1`, `rename/2`, `make_dir/1`,
-  `del_dir/1`, `read_link/1`, `make_link/2`, `make_symlink/2`, `altname/1`.
+  `del_dir/1`, `read_link/1`, `make_link/2`, `make_symlink/2`, `altname/1`, `read_file_info/1,2`,
+  `read_link_info/1,2`.
 * **fd half** (`prim_file.rs`): `open/2`, `read/2`, `write/2`, `close/1`, `position/2`,
   `pread/2,3`, `pwrite/2,3`, `truncate/1`, `sync/1`, `datasync/1`, `write_file/2`, `set_cwd/1`,
-  `ipread_s32bu_p32bu/3`, `get_handle/1`.
+  `ipread_s32bu_p32bu/3`, `get_handle/1`, `read_handle_info/1,2`.
 
 **Invariants:** every path-only entry is a direct NIF call wrapped by `try … catch error:badarg ->
 {error,badarg}` in `prim_file.erl`, so a **bad path is always the value `{error,badarg}`, never a
@@ -374,11 +379,8 @@ only export is `on_load/0`); `get_handle/1`'s fd *number* is this runtime's own;
 file's raw bytes goes through `beam_codec::term::make_binary` on the pointer-stable `eval_heap` (no
 64-byte limit, unlike `beam_engine::terms::make_heap_binary`).
 
-**Typed gaps** (explicit `unsupported`, never a silent wrong value): `read_file_info/1,2`,
-`read_link_info/1,2`, `read_handle_info/1,2` (every `#file_info{}` field is safe-`std`-derivable
-**except** `access` — `access(2)` / `geteuid`+`getegid`, absent from safe `std`; the default
-`local` time type is **not** a blocker, `posixtime_to_universaltime/1` +
-`universaltime_to_localtime/1` are served), `write_file_info/2,3`, `advise/4`, `allocate/3`,
+**Typed gaps** (explicit `unsupported`, never a silent wrong value): `write_file_info/2,3`,
+`advise/4`, `allocate/3`,
 `list_dir/1`/`list_dir_all/1` (raw `readdir(3)` order, unpinnable), `read_line/1` (its Erlang body
 drives the `prim_buffer:*` resource NIFs, all `undef`), `file_desc_to_ref/2`. **Deliberately
 unclaimed** because the oracle answers the same: `copy/2`, `write_file/3`, `delayed_close/1`
@@ -454,18 +456,19 @@ readers. **Full detail: [`file_server/CONTEXT.md`](file_server/CONTEXT.md).**
 - `prim.rs` → the path half of the `prim_file` floor (`prim_file_call`) + its unit tests: the path
   contract (`encode_path`/`collect_path`), the `errno`→atom table, and the served entries
   `get_cwd/0,1`, `read_file/1`, `delete/1`, `rename/2`, `make_dir/1`, `del_dir/1`, `read_link/1`,
-  `make_link/2`, `make_symlink/2`, `altname/1`
+  `make_link/2`, `make_symlink/2`, `altname/1`, `read_file_info/1,2`, `read_link_info/1,2`
 - `prim_file.rs` → the file-descriptor half of the `prim_file` floor + its unit tests: `open/2`
   (incl. a `directory`-mode `O_DIRECTORY` open), `read/2`, `write/2`, `close/1`, `position/2`,
   `pread/2,3`, `pwrite/2,3`, `truncate/1`, `sync/1`, `datasync/1`, `write_file/2`, `set_cwd/1`,
-  `ipread_s32bu_p32bu/3`, `get_handle/1`
+  `ipread_s32bu_p32bu/3`, `get_handle/1`, `read_handle_info/1,2`
 - `file_server.rs` (+ `file_server/`) → the native `file_server_2` service, its io-devices, the
   request/reply wire and the `{get_until,…}`/`{get_line,…}` readers
   ([`file_server/CONTEXT.md`](file_server/CONTEXT.md)); the pass step is
   `Runtime::service_file_requests` (owned by `../runtime/scheduler.rs`)
 - `init.rs` / `code.rs` / `application.rs` → the preloaded-module surfaces (contract A.7) — the
   `init` automatic flags (`root`/`home`/`progname`/`bindir`) + `init:script_id/0` + the
-  termination/reboot family, the code server's `get_mode/0` and `lib_dir/2`, and the `application`
+  termination/reboot family, the code server's `get_mode/0`, `lib_dir/2` and `priv_dir/1`, and the
+  `application`
   config view (`get_key/1,2`, `get_all_key/1`, `get_application/0,1`)
 - `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) / `port.rs` → the process/spawn (incl.
   `spawn_monitor`) and registry/reference surfaces, the monitor/demonitor and exit-signalling
@@ -554,7 +557,7 @@ needs:
   forms the seam cannot express) and, for the `erts_internal:port_*` spellings this floor does not
   claim, by the `beam_bifs` registry over its `RuntimeHooks` seam.
 - **`prim_*` preloaded driver modules:** the `prim_file` subset `prim.rs` + `prim_file.rs` serve (the
-  **27** entries above) is on the floor; **every other** `prim_file` entry and all of
+  **33** entries above) is on the floor; **every other** `prim_file` entry and all of
   `erl_prim_loader`, `prim_inet`, `prim_socket`, `prim_net`, `prim_zip`, `prim_buffer`, `prim_eval`
   are **Not implemented** and still fall through to a real preloaded-`.beam` load (they ship in the
   `erts` `ebin`, which is on the code path) whose `-nifs()`/`erlang:load_nif` entry then needs the
@@ -563,8 +566,7 @@ needs:
     `FileExt::read_at`/`write_at`), `truncate/1`, `sync/1`, `datasync/1`, `write_file/2`, `set_cwd/1`,
     `ipread_s32bu_p32bu/3`, `get_handle/1`; `copy/3` works (pure Erlang); `open(D,[directory,read])`
     ⇒ `{ok,Fd}` (`std::fs::File` opens with `O_DIRECTORY`; `open(D,[read])` ⇒ `{error,eisdir}`).
-  * **Typed gaps:** `read_file_info/1,2`, `read_link_info/1,2`, `read_handle_info/1,2` (the
-    `access(2)`/`geteuid`+`getegid` facility safe `std` lacks), `write_file_info/2,3`, `advise/4`,
+  * **Typed gaps:** `write_file_info/2,3`, `advise/4`,
     `allocate/3`, `file_desc_to_ref/2`, and `prim_file:read_line/1` (its Erlang body drives the
     `prim_buffer:*` resource NIFs — the library-level `file:read_line/1` is served by the
     `file_server_2` `{get_line,…}` arm,
@@ -576,9 +578,9 @@ needs:
     `copy/2`, `write_file/3`, `delayed_close/1` (unexported ⇒ `error:undef`), `sendfile/8`
     (`{error,enotsup}`/`badarg`), `internal_get_nif_resource/1` (no NIF-resource model).
   * Remaining machinery: `prim_socket`/`prim_net`/`prim_inet`, `prim_zip` (zlib), `prim_buffer`,
-    `erl_prim_loader` (boot loader protocol), `prim_eval`. **Missing `beam_io` facilities:** a safe
-    `path_access` + `process_credentials()` (closes the whole `#file_info{}` family) and a raw-syscall
-    floor `fadvise`/`fallocate`/`chmod`/`chown`/`utimes`.
+    `erl_prim_loader` (boot loader protocol), `prim_eval`. **Missing `beam_io` facilities:** a
+    raw-syscall floor
+    `fadvise`/`fallocate`/`chmod`/`chown`/`utimes`.
 
 ## Known Issues
 
@@ -644,8 +646,9 @@ closable the same way and the floor already serves both, so only `/2` stays list
   boot sequence (no application-owned process or port exists to take down, and modules are never
   unloaded); `init:boot/1` returns `ok` where the real `boot/1` never returns (it enters init's
   receive loop). Pinned by `../tests/native_init.rs`.
-- `file_server.rs` serves `read_file_info/1`/`read_link_info/1`'s **stat failure** path only (see
-  [`file_server/CONTEXT.md`](file_server/CONTEXT.md)); it does not serve
+- `file_server.rs` serves the whole `read_file_info/1`/`read_link_info/1` reply — the 14-tuple
+  `#file_info{}` record, with its `access` slot from a real `access(2)` probe — over its
+  `stat`/`lstat` calls (see [`file_server/CONTEXT.md`](file_server/CONTEXT.md)); it does not serve
   `{write_file,Name,Data}` though `prim_file:write_file/2` IS implemented (`prim.rs`).
 - `application:get_application/1` on a non-atom that is not a pid leaves the function with no clause
   (`function_clause`, the oracle's own shape); the oracle's extra `is_pid/1` clause answers

@@ -3088,15 +3088,11 @@ mod tests {
 
     /// The `prim_file` entries this floor cannot serve are **claimed** so a caller gets the
     /// honest `unsupported: …` capability gap (CLI exit 3) instead of falling through into
-    /// the preloaded `prim_file.beam` — where `read_info_1`'s and `read_handle_info_1`'s
-    /// `catch error:_ -> {error,badarg}` swallow the inner `undef` and answer a *value* the
-    /// oracle never returns.
+    /// the preloaded `prim_file.beam`, whose `catch error:_ -> {error,badarg}` wrappers swallow
+    /// the inner `undef` and answer a *value* the oracle never returns.
     ///
-    /// The oracle's own answers, verified live against OTP 29.1.1 / erts-17.1: for a regular
-    /// file `read_file_info/1`⇒`{ok,{file_info,69,regular,read_write,
-    /// {{Y,M,D},{H,Mi,S}}×3,33188,1,Dev,0,Ino,Uid,Gid}}` (`read_link_info/1` and
-    /// `read_handle_info/1` the same), `write_file_info/2`⇒`ok`,
-    /// `advise(Fd,0,1,sequential)`⇒`ok`, `allocate(Fd,0,10)`⇒`ok`,
+    /// The oracle's own answers, verified live against OTP 29.1.1 / erts-17.1:
+    /// `write_file_info/2`⇒`ok`, `advise(Fd,0,1,sequential)`⇒`ok`, `allocate(Fd,0,10)`⇒`ok`,
     /// `list_dir/1`⇒`{ok,[Names]}` in raw `readdir(3)` order, `read_line(Fd)`⇒`{ok,Line}`
     /// and `file_desc_to_ref(1,[])`⇒`{ok,{file_descriptor,prim_file,#{…}}}`.
     ///
@@ -3113,12 +3109,6 @@ mod tests {
         let three = [path, path, path];
         let four = [path, path, path, path];
         for (function, args) in [
-            ("read_file_info", &one[..]),
-            ("read_file_info", &two[..]),
-            ("read_link_info", &one[..]),
-            ("read_link_info", &two[..]),
-            ("read_handle_info", &one[..]),
-            ("read_handle_info", &two[..]),
             ("write_file_info", &two[..]),
             ("write_file_info", &three[..]),
             ("advise", &four[..]),

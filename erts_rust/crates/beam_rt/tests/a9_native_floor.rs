@@ -38,7 +38,7 @@
 //! | `init:get_argument/1` | the four automatic flags (`root`, `home`, `progname`, `bindir`) and an absent flag |
 //! | `init:script_id/0` | the **loaded** boot script's real header, and the typed gap on the default boot path |
 //! | `code:lib_dir/2` | the app dir joined with any subdir, `{error,bad_name}`, `function_clause` |
-//! | `filelib:is_dir/1, is_file/1, is_regular/1, wildcard/1` | the absent-path answers, and the precise typed gap on success |
+//! | `filelib:is_dir/1, is_file/1, is_regular/1, wildcard/1` | the absent-path answers and the served success path (a real `#file_info{}`) |
 //!
 //! `erlang:module_loaded/1`'s boot-set divergence is **not** re-tested here — it is pinned by the
 //! sibling [`module_loaded.rs`](module_loaded) suite; this suite only adds the complementary
@@ -70,8 +70,9 @@
 //!   OTP 30's, so its real header is `{"Erlang/OTP","30"}`; the OTP-29 oracle's own `start.boot`
 //!   carries `"29"`. The release differs, not the mechanism — and the test **derives** the
 //!   expected header from the script through the oracle, so a release bump cannot make it lie.
-//! * **`filelib` on an existing path.** The `#file_info{}` `access` slot is `access(2)`-derived in
-//!   the oracle and unreachable from safe Rust, so the success path is a precise typed gap.
+//! * **`filelib` on an existing path.** The `#file_info{}` `access` slot is `access(2)`-derived
+//!   in the oracle and served here through `beam_io`'s `access(2)` probe, so the success path
+//!   answers the oracle's own value (`filelib:is_dir/1` ⇒ `true`) rather than a typed gap.
 //!
 //! # Toolchain
 //!
@@ -843,11 +844,6 @@ fn lib_dir_2_reports_a_non_atom_argument_as_function_clause() {
 // 7. filelib existence probes (the file_server_2 read_file_info seam)
 // ---------------------------------------------------------------------------------------
 
-/// The exact reason the native `file_server_2` service reports when a `stat(2)` **succeeded** and
-/// the reply would need the `#file_info{}` `access` slot (`src/native/file_server/file_info.rs`).
-const FILE_INFO_GAP: &str = "file_server: the #file_info{} `access` slot needs access(2), which \
-                             no safe std API exposes";
-
 /// A private temporary directory, removed when the test ends.
 struct TempDir(PathBuf);
 
@@ -893,31 +889,24 @@ fn filelib_existence_probes_agree_that_an_absent_path_does_not_exist() {
     }
 }
 
-/// The **success** path stays an honest capability gap: the `#file_info{}` `access` slot is
-/// `access(2)`-derived in the oracle (`unix_prim_file.c:739-769`) and no safe `std` API exposes
-/// `access(2)`/`geteuid(2)`, so the runtime must not invent the field — handing a fabricated
-/// record to `filelib:is_dir/1` would turn the oracle's truthful `true` into a divergence.
+/// The **success** path is served: the native `file_server_2` service builds the whole
+/// `#file_info{}` record, with the `access` slot derived from a real `access(2)` probe
+/// (`beam_io`'s `fs_access`), so every `filelib` existence probe on an **existing** path answers
+/// the oracle's own value instead of raising a capability gap.
 #[test]
-fn filelib_existence_probes_on_an_existing_path_are_the_access_capability_gap() {
+fn filelib_existence_probes_on_an_existing_path_agree_with_the_oracle() {
     let dir = TempDir::new("existing");
     std::fs::write(dir.0.join("sample.txt"), b"x").expect("a temporary file");
-    for call in [
-        format!("filelib:is_dir({})", dir.literal(".")),
-        format!("filelib:is_file({})", dir.literal("sample.txt")),
-        format!("filelib:is_regular({})", dir.literal("sample.txt")),
-        format!("filelib:wildcard({})", dir.literal("sample.txt")),
+    let sample = dir.literal("sample.txt");
+    for (call, expected) in [
+        (format!("filelib:is_dir({})", dir.literal(".")), "true".to_string()),
+        (format!("filelib:is_file({sample})"), "true".to_string()),
+        (format!("filelib:is_regular({sample})"), "true".to_string()),
+        (
+            format!("filelib:wildcard({sample})"),
+            format!("[{sample}]"),
+        ),
     ] {
-        let error = raise_of(&call);
-        assert_eq!(
-            beam_rt::error::unsupported_reason(&error).as_deref(),
-            Some(FILE_INFO_GAP),
-            "`{call}` must stay the precise typed `access` gap, got {error:?}"
-        );
-    }
-    // The oracle answers a real boolean here — exactly the answer a fabricated `access` would risk
-    // turning into a divergence.
-    if let Some(answer) = oracle_renders(&format!("filelib:is_file({})", dir.literal("sample.txt")))
-    {
-        assert_eq!(answer, "true", "the oracle sees the existing file");
+        assert_eq!(agrees_with_the_oracle(&call), expected, "`{call}`");
     }
 }
