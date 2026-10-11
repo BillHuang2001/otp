@@ -77,10 +77,12 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   (the `ets:take/2` check-out: the object stays valid, its runs are never handed out again, but it
   stops counting toward `words()`), `reset()`, `words()`, `blocks()`, `memory()`. `impl Drop` frees
   every block.
-- Deep-copy **supported subset**: immediates, cons/list cells, tuples, **flat maps**, pointer-free
-  boxed leaves (float, bignum, internal ref, on-heap bitstring). **Unsupported** (⇒ `BadArg`): funs,
-  hash-maps, records, external pid/port/ref, off-heap bin refs/sub-bitstrings. Every table read can
-  only contain what an insert could store, so the copier is complete for table contents.
+- Deep-copy **covers every kind `ets:insert/2` accepts**: immediates, cons/list cells, tuples, flat
+  **and hash** maps, funs (all three kinds), pointer-free boxed leaves (float, bignum, internal ref,
+  on-heap bitstring), external pid/port/ref, and sub-bitstrings / off-heap refc binaries
+  (re-materialised as self-contained on-heap bitstrings). The residual `BadArg`s (a bare `BinRef`
+  root, a native record, the reserved boxed subtags, a bare header word, a malformed `ErlSubBits`)
+  are never a user-visible inserted term — see Known Issues.
 
 ### `table/mod.rs` — the `Table` handle + ops
 - `pub struct TableId(u64)`: `new(u64)`, `raw()`, `next()` (process-global monotonic), `Display`.
