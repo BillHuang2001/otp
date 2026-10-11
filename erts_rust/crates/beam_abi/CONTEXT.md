@@ -373,11 +373,10 @@ Ground truth `../../erts/emulator/beam/erl_nif.c` (`erts_load_nif`, line 4729) �
   | 15 | `upgrade` veto ≠ 0 (4996) | `upgrade` | `Library upgrade-call unsuccessful (<veto>).` |
 - **`check_is_nifable`** (`erl_nif.c:4721`): `!mod_code->are_nifs || mod_code->are_nifs[func_ix]`, `are_nifs` built from the `op_nif_start` opcode (`emu_load.c:1414`). Compiler rule (`v3_core.erl:335-339`): a module calling `load_nif/2` gets `nif_start` inserted into **every** function **unless** it has an explicit `-nifs([...])` attribute (then only the listed functions are marked) — so check #10 is reachable only via `-nifs`.
 - **Version constants** (`erl_nif.h:67-91`): major 2 / minor 18 / min-required-major-on-load 2 / `ERL_NIF_MIN_ERTS_VERSION` `"erts-14.0"` / `ERL_NIF_VM_VARIANT` `"beam.vanilla"`. `AT_LEAST_VERSION` (`erl_nif.c:4580`) compares `major*0x100+minor`; `create_lib` (`erl_nif.c:4586`) makes a "modern" copy defaulting absent fields (`vm_variant`, `"beam.vanilla"`, `min_erts`, `"erts-?"`, `sizeof_ErlNifResourceTypeInit`, `options`, `funcs[].flags`).
-- Empirical raw outputs (module `m`, NIF entry name `m`): success `ok`; missing path → `{error,{load_failed,"Failed to load NIF library: '.../nope.so: cannot open shared object file: No such file or directory'"}}`; text file → `{error,{load_failed,"Failed to load NIF library: '.../nota.so: file too short'"}}`; major 99 → `{error,{bad_lib,"That 'm' NIF library needs erts-99.0 or newer. ..."}}`; no `nif_init` → `{error,{bad_lib,"Failed to find library init function: '.../emptysym.so: undefined symbol: _nif_init'"}}`; reload → `{error,{reload,"NIF library already loaded (reload disallowed since OTP 20)."}}`; `-on_load` calling `load_nif` succeeds and the module's NIF is callable; `apply/3` → the stub error.
+- Empirical raw outputs (module `m`, NIF entry name `m`): success `ok`; missing path and a text file both `{error,{load_failed,"Failed to load NIF library: '...'…"}}`; major 99 → `{error,{bad_lib,"That 'm' NIF library needs erts-99.0 or newer. …"}}`; no `nif_init` → `{error,{bad_lib,"Failed to find library init function: '.../emptysym.so: undefined symbol: _nif_init'"}}`; reload → `{error,{reload,"NIF library already loaded (reload disallowed since OTP 20)."}}`; `-on_load` calling `load_nif` succeeds and the module's NIF is callable; `apply/3` → the stub error.
 - (Note: in this Nix-packaged runtime `code:lib_dir(erts,include)` points at a non-existent path; the real header is `.../lib/erlang/erts-17.1/include/erl_nif.h`.)
 
 ## NIF host layer
-### `enif_*` functions (`src/nif/enif/`)
 ### `enif_*` functions (`src/nif/enif/`)
 Every one is `#[no_mangle] pub unsafe extern "C"` with the exact signature of its matching `nif::api`
 field, driving the `NifEnv`/`NifHost` seam (`beam_term`, `beam_alloc::Heap`, `NifHost::intern_atom`). By family:
@@ -420,7 +419,7 @@ field, driving the `NifEnv`/`NifHost` seam (`beam_term`, `beam_alloc::Heap`, `Ni
   drive existing hooks, no new state. Monitor payload = the C's 3-word reference block in the 32-byte
   `ErlNifMonitor` (bytes 24..32 zeroed).
 - **`exception`** — `enif_make_badarg`, `enif_raise_exception`, `enif_has_pending_exception`,
-  `enif_clear_env` .
+  `enif_clear_env`.
 - **`threads`** — the 34 mutex/cond/rwlock/tsd/thread slots: cast-and-forward facades over
   `crate::sync`; only `enif_thread_type` and `enif_thread_name`/`erl_drv_thread_name` (the `*_name`
   accessors) do more.
@@ -458,7 +457,7 @@ symbols in the final link.
 `load(path, module, host, load_info) -> Result<NifLibrary, NifLoadError>` does `dlopen(path+".so", RTLD_NOW|RTLD_LOCAL)`, `dlsym("nif_init")` (fallback `_nif_init`), validates in the oracle's exact order (the table above) and invokes `entry.load`. `NifLibrary::call(env, name, arity, args)` looks the function up by `(name, arity)`, calls `fptr(env.as_ptr(), arity, args.as_ptr())`, and turns a pending env exception into `NifCallError::Raised`; for the call's duration it publishes the library's `priv_data` on a crate-private thread-local stack with the same push/pop-token discipline as the host stack — the only source of `enif_priv_data`'s `env->mod_nif->priv_data`. `Drop` runs `entry.unload` then `dlclose`. `Reload`/`Upgrade`/`OldCode` exist for surface completeness but `load()` never produces them (no module-instance / old-code state here).
 
 ### Symbol-export mechanism (load-bearing)
-A NIF `.so` leaves `enif_*` and a driver `.so` leaves `driver_*`/`erl_drv_*` **undefined**; the dynamic linker binds them, at `dlopen(RTLD_NOW)`, against the **loading process's** dynamic symbol table, so `build.rs` emits `cargo::rustc-link-arg-tests=-Wl,--export-dynamic` for each `beam_abi` test binary. Proven: `nm -D --undefined-only test_nif.so` lists the used `enif_*` as `U` and `test_driver.so` lists its `driver_*`/`erl_drv_*` as `U`; the same names appear `T` in the test binary's `.dynsym`; loading the same `.so` from a process that does **not** export them fails with `undefined symbol: enif_make_int`. (`cargo::rustc-link-arg-bins`, `[[bin]]`)
+A NIF `.so` leaves `enif_*` and a driver `.so` leaves `driver_*`/`erl_drv_*` **undefined**; the dynamic linker binds them, at `dlopen(RTLD_NOW)`, against the **loading process's** dynamic symbol table, so `build.rs` emits `cargo::rustc-link-arg-tests=-Wl,--export-dynamic` for each `beam_abi` test binary. Proven: `nm -D --undefined-only test_nif.so` lists the used `enif_*` as `U` and `test_driver.so` lists its `driver_*`/`erl_drv_*` as `U`; the same names appear `T` in the test binary's `.dynsym`; loading the same `.so` from a process that does **not** export them fails with `undefined symbol: enif_make_int`. The `cargo::rustc-link-arg-bins` counterpart must **not** be emitted: this package has no `[[bin]]` target and cargo hard-errors on it.
 
 ## Driver host layer
 ### `driver_*` / `erl_drv_*` functions (`src/driver/drv/`)
@@ -472,7 +471,7 @@ Every one is `#[no_mangle] pub unsafe extern "C"` with the exact signature of it
 - **`registry`** — `add_driver_entry`, `remove_driver_entry`, `with_current_host`, `-1`, `0`, `driver_lock_driver`, `driver_create_port`, `env_for` Ground truth `io.c:7640`/`7698`/`7324`/`786`.
 
 ### The safe async-job runner (`src/driver/async_job.rs`)
-`driver_async`'s last three operands (`async_invoke`, `async_data`, `async_free`, `erl_driver.h:605-607`) **are** a C async job; the driver-facing half is `driver_async` → `DriverHost::r#async`, the **host** half is `AsyncJob` (`invoke`/`free`/`data` arrive as raw C pointers, which a runtime that forbids `unsafe` — `beam_rt`, `#![deny(unsafe_code)]`, `pub type AsyncCallback = unsafe extern "C" fn(*mut c_void)`
+`driver_async`'s last three operands (`async_invoke`, `async_data`, `async_free`, `erl_driver.h:605-607`) **are** a C async job. The driver-facing half is `driver_async` → `DriverHost::r#async`; the **host** half is `AsyncJob`, which closes the gap for a runtime that forbids `unsafe` (the sibling `beam_rt` is `#![deny(unsafe_code)]`). `pub type AsyncCallback = unsafe extern "C" fn(*mut c_void)`.
 - `pub struct AsyncJob` — the single `unsafe` entry point `AsyncJob::new -> Option<AsyncJob>` (its `# Safety` section is the caller's promise that the three operands are a live C async job; `None` when `async_invoke` is `NULL` — nothing to run, the caller still owns the data). Everything after it is **safe**: `invoke(&self) -> *mut c_void` runs `(*async_invoke)(async_data)` and returns the data for `ready_async`; `finish(self)` runs `(*async_free)(async_data)` **exactly once** (the handle is consumed); `data()`/`has_invoke()`/`has_free()` inspect the operands without dereferencing them; `Drop` frees a still-held job **without** invoking it; `Debug` never touches the pointers.
 - **Inert by default.** `DriverHost::r#async`, its signature and its `-1` default are **unchanged** — a host with no async pool keeps answering `-1` and opts in by constructing a job and running it (`+A 0`). Re-exported as `beam_abi::{AsyncJob, AsyncCallback}`. Owner of the *adoption* half (`beam_rt`): implement `DriverHost::r#async`, poll/drain `ready_async`, keep the driver object mapped while a job is outstanding, implement `driver_async_port_key`.
 
@@ -491,12 +490,16 @@ Every one is `#[no_mangle] pub unsafe extern "C"` with the exact signature of it
 - **`enif_alloc_env` answers `NULL`** only with the host's `alloc_env` at its trait default, or with no
   `NifEnv` live (outside a NIF call). `beam_rt`'s `NifHostImpl` implements `alloc_env`/`free_env`/
   `make_copy` (`beam_rt/src/nif.rs`) over the one shared pooled BIF heap, so the runtime's message-env
-  idiom works and `make_copy` is the identity .
+  idiom works and `make_copy` is the identity (a crate-owned env would carry unusable atoms).
 - **NIF host hooks the runtime does not implement.** `NifHostImpl` overrides only
   `heap`/`intern_atom`/`atom_name`/`self_pid`/`alloc_env`/`free_env`/`make_copy`; the rest sit at their
   default `None`/`false`/`null`, so the matching `enif_*` entries answer the C's failure (or raise
   `badarg`, for `enif_make_ref`) where the oracle succeeds — the hook list is in *The host seam*.
-  Closing them is a `beam_rt` change (`beam_codec`, `term_to_binary`, `binary_to_term`, `make_ref`, `existing_atom`, `PendingInterner`, `whereis_pid`, `erts_version`, `otp_release`, `scheduler_threads`, `dirty_scheduler_support`, `0`, `1`). The `beam_abi` side is complete.
+  Closing each is a `beam_rt` change: `term_to_binary`/`binary_to_term` over `beam_codec`; `make_ref`;
+  `existing_atom` over the committed table **and** the in-flight `PendingInterner`; `whereis_pid` over
+  the process registry; `system_info` with the real `erts_version`/`otp_release`/`scheduler_threads`/
+  `dirty_scheduler_support` (the built-in fallback rounds the last to `0` where the C reports `1`).
+  The `beam_abi` side is complete.
 - **No scheduler threads.** `enif_thread_type` reports only `ERL_NIF_THR_UNDEFINED` (foreign thread) or
   `ERL_NIF_THR_OTHER` (`sync::thread_create`), never a scheduler/dirty-scheduler type; `*_name`
   reproduces the C's `no_name` = `"unknown"` for a **live** NULL-named handle (`sync::no_name()`/
@@ -539,10 +542,19 @@ Every one is `#[no_mangle] pub unsafe extern "C"` with the exact signature of it
   adjacent, `enif_release_binary` differs from the oracle only under `#ifdef DEBUG`
   (`erl_nif.c:1451-1461`). Pinned by the `mem.rs` unit tests and
   `tests/nif_bitslice.rs`/`tests/nif_subbin.rs`.
-- **`beam_rt`/`beam_io`-owned halves of the A.4 driver surface** : the monitor family needs the `DriverHost` hooks (`process_exit`, `io.c:6998-6999`, `:7065-7081`, `:7104-7118`, `:7150+`); `driver_pdl_create` needs a **per-port-stable**
-  host handle (a second create on the same port ⇒ `NULL`); `driver_sizeq` must make the host answer `0`
-  on an empty-but-allocated queue; `driver_async` needs the host to run the `AsyncJob`; the A.4
-  differential corpus exercises `beam_rt`'s `DriverPort` host, not `beam_io`'s `AbiHost`.
+- **`driver_monitor_process`/`driver_demonitor_process`/`driver_get_monitored_process`** — the A.4
+  driver-monitor family. The **`beam_abi` half is complete**: the reason codes are honoured, the
+  monitor's 24-byte identity is exposed safely (`monitor_identity`/`monitor_from_identity`), and
+  `driver_compare_monitors` is a finished `memcmp`. The host half is owned by `beam_rt`/`beam_io`,
+  which must implement `DriverHost::monitor_process`/`demonitor_process`/`get_monitored_process`
+  (registration, liveness, the per-port monitor tree) and fire `process_exit` (`io.c:6998-6999`,
+  `:7065-7081`, `:7104-7118`, `:7150+`).
+- **Other `beam_rt`/`beam_io`-owned halves of the A.4 driver surface** (the operand handling and
+  return-code mapping here are oracle-exact): `driver_pdl_create` needs a **per-port-stable** host
+  handle (a second create on the same port ⇒ `NULL`); `driver_sizeq` must make the host answer `0` on
+  an empty-but-allocated queue; `driver_async` needs the host to run the `AsyncJob`. The A.4
+  differential corpus exercises `beam_rt`'s `DriverPort` host, not `beam_io`'s `AbiHost`, so those
+  fixes must land there.
 - Malformed-term guard: a bare `THE_NON_VALUE` / `HEADER`-tagged word is rejected at the
   term-inspecting entry points (the C would deref it); a *forged* pointer-tagged word is still
   undetectable from the word alone, exactly as in the C.
@@ -572,7 +584,7 @@ Every one is `#[no_mangle] pub unsafe extern "C"` with the exact signature of it
 
 ## Notes for Agents
 - **Read the legacy headers before touching a layout**: `../../erts/emulator/beam/erl_nif.h`, `erl_nif_api_funcs.h`, `erl_drv_nif.h`, `erl_driver.h` — field order and integer widths must match exactly, and the asserts are the enforcement. Cite the header line where a value is non-obvious.
-- `../../../erts/emulator/beam/global.h` line ~57 holds the real `struct enif_environment_t` body — `ErlNifEnv`, `nif::host::NifEnv`, `as_ptr`, `from_opaque`
+- `../../../erts/emulator/beam/global.h` line ~57 holds the real `struct enif_environment_t` body — emulator-internal and **not** to be replicated: `ErlNifEnv` stays opaque here, its Rust analogue for a live call being `nif::host::NifEnv`, reached only through `as_ptr`/`from_opaque`.
 - `erl_int_sizes_config.h` (included by `erl_drv_nif.h`) fixes `SIZEOF_LONG == 8` on this target, which is why the 4 `enif_*64` table entries are excluded from `ErlNifApi`.
 - **A family's slots live in that family's file** — to extend a family, edit the family file's body and add the slot to its `populate`; do not touch the `ENIF_API`/`DRIVER_API` chain in `mod.rs`.
 - Building: **never `cd`**; use `../scripts/cargo.sh build -p beam_abi` / `../scripts/cargo.sh test -p beam_abi` (the sandbox `$HOME` is read-only; the wrapper picks a writable `CARGO_HOME`).
