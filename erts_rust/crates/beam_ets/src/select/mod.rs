@@ -94,7 +94,6 @@
 //!   guards/bodies bullets above).
 //! * `self/0` has no process identity at the ETS layer and raises, so a guard
 //!   using it never matches (the clause is skipped).
-//! * `abs/1` accepts small integers only (bignums/floats raise).
 //! * A **body** whose value is a boolean (e.g. `[{'is_integer','$1'}]`) is rendered
 //!   as the atom `true`/`false`, so the caller's `AtomTable` must have interned
 //!   them; guard *truth* is unaffected, since it is computed internally.

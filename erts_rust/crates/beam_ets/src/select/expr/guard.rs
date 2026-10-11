@@ -51,9 +51,13 @@ pub(super) fn tuple_size_of(operand: Eterm) -> Result<Eterm> {
 /// `byte_size/1` (`bytes`) / `bit_size/1`: the bitstring's bit count, or its byte
 /// count `NBYTES(bits) = (bits + 7) / 8` (`erts/emulator/beam/erl_bits.h:27`).
 ///
-/// A non-bitstring is the oracle's `badarg`. An **off-heap** (refc) binary is a
-/// typed capability gap rather than a `badarg`: it *is* a bitstring, so reporting
-/// `badarg` would let a guard silently under-match (workspace `CONTEXT.md` §3).
+/// A non-bitstring is the oracle's `badarg`. An **off-heap** (refc) binary is
+/// handled: its on-heap `[BinRef][ErlSubBits]` pair is rooted at the `ErlSubBits`
+/// (`beam_term::refc`), which classifies as `TermClass::Bitstring`, so the size is
+/// read exactly — oracle parity, not a gap. The `TermClass::BinRef` arm below is
+/// therefore reachable only for a **bare** `BinRef` word, which is never a
+/// standalone user-visible term (a `BinRef` only ever appears as the first word of
+/// that pair).
 pub(super) fn bitstring_length(operand: Eterm, bytes: bool) -> Result<Eterm> {
     match super::classify(operand) {
         // SAFETY: the class established a live `ErlHeapBits`/`ErlSubBits` block, which
@@ -62,8 +66,11 @@ pub(super) fn bitstring_length(operand: Eterm, bytes: bool) -> Result<Eterm> {
             let bits = unsafe { bitstring_size(operand) };
             Ok(make_small(if bytes { (bits + 7) / 8 } else { bits } as i64))
         }
+        // A bare `BinRef` is not a bitstring root, so `bitstring_size` would read its
+        // `val` pointer word as a bit size — report the documented gap rather than take
+        // a wild read.
         TermClass::BinRef => Err(unsupported(
-            "match-spec 'byte_size'/'bit_size' on an off-heap (refc) binary",
+            "match-spec 'byte_size'/'bit_size': a bare BinRef is not a bitstring root",
         )),
         _ => Err(badarg()),
     }
@@ -99,16 +106,64 @@ pub(super) fn write_float_term(heap: &mut Heap, value: f64) -> Result<Eterm> {
     }
 }
 
+/// Materialise a fresh bignum term on `heap` (`digits` are least-significant-first
+/// `u64` limbs, exactly `beam_term::write_big`'s input).
+fn write_big_term(heap: &mut Heap, negative: bool, digits: &[u64]) -> Result<Eterm> {
+    // SAFETY: `alloc_words(big_size_words(digits.len()))` hands back that many
+    // exclusively-owned, writable words — exactly `write_big`'s precondition (one
+    // header word plus one word per digit), every one of which `write_big` writes
+    // before the term escapes; the heap outlives it. `digits` is non-empty (both
+    // callers guarantee it), so the zero-width-bignum case cannot arise.
+    unsafe {
+        let words = heap.alloc_words(big_size_words(digits.len()))?;
+        Ok(write_big(words, negative, digits))
+    }
+}
+
+/// The sign and the least-significant-first `u64` magnitude limbs of a finite,
+/// **integral** `f64` whose magnitude is at least `2^59`.
+///
+/// A finite `f64` is `mantissa * 2^exp` with a 53-bit `mantissa`
+/// (`(1 << 52) | fraction`) and `exp = biased_exponent - 1075`. At or above `2^59`
+/// the biased exponent is at least `1082`, so `exp >= 7` — always non-negative,
+/// hence the value is the mantissa shifted **left** (no right shift, so no rounding
+/// is involved and the conversion is exact at any magnitude up to `2^1024`).
+fn f64_magnitude_limbs(value: f64) -> (bool, Vec<u64>) {
+    debug_assert!(
+        value.is_finite() && value.fract() == 0.0 && value.abs() >= 576_460_752_303_423_488.0,
+        "f64_magnitude_limbs takes a finite integral value whose magnitude is at least 2^59"
+    );
+    let bits = value.to_bits();
+    let negative = (bits >> 63) != 0;
+    let mantissa = (bits & ((1u64 << 52) - 1)) | (1u64 << 52);
+    let exp = (((bits >> 52) & 0x7FF) as i64 - 1075) as u32;
+    let word_shift = (exp / 64) as usize;
+    let bit_shift = exp % 64;
+    // `mantissa` is 53 bits wide, so a `bit_shift` in `0..=63` splits it across at
+    // most two adjacent words (`bit_shift == 0` puts nothing in the high word).
+    let mut limbs = vec![0u64; word_shift + 2];
+    limbs[word_shift] |= mantissa << bit_shift;
+    if bit_shift != 0 {
+        limbs[word_shift + 1] |= mantissa >> (64 - bit_shift);
+    }
+    // Canonicalise: the most significant limb is non-zero (`mantissa >= 2^52`).
+    while limbs.len() > 1 && limbs[limbs.len() - 1] == 0 {
+        limbs.pop();
+    }
+    (negative, limbs)
+}
+
 /// `trunc/1` (`round == false`) / `round/1`.
 ///
 /// An integer operand is the **identity** (what `erl` returns). A float truncates
 /// toward zero (`f64::trunc`) or rounds **half away from zero** (`f64::round` is
 /// exactly Erlang's — verified against `erl`: `round(2.5)` is `3`, `round(-2.5)` is
-/// `-3`, `round(2.4)` is `2`, `trunc(1.9)` is `1`, `trunc(-1.9)` is `-1`). A result
-/// outside the 60-bit small range is a bignum in the oracle (`round(1.0e30)`), so it
-/// is the typed `unsupported_ets` — never a truncated wrong integer. A non-number is
-/// the oracle's `badarg`.
-pub(super) fn integral_of(operand: Eterm, round: bool) -> Result<Eterm> {
+/// `-3`, `round(2.4)` is `2`, `trunc(1.9)` is `1`, `trunc(-1.9)` is `-1`). A finite
+/// integral result outside the 60-bit small range is a **bignum** in the oracle
+/// (`round(1.0e30)` is `1000000000000000019884624838656`), materialised exactly
+/// from the float's bits by [`float_to_integer`] — never a truncated wrong integer.
+/// A non-number is the oracle's `badarg`.
+pub(super) fn integral_of(operand: Eterm, round: bool, heap: &mut Heap) -> Result<Eterm> {
     match super::classify(operand) {
         // An integer operand is returned unchanged (`trunc/1`/`round/1` are the
         // identity on integers, including a bignum).
@@ -117,7 +172,7 @@ pub(super) fn integral_of(operand: Eterm, round: bool) -> Result<Eterm> {
             // SAFETY: the class established a live float block.
             let value = unsafe { float_value(operand) };
             let integral = if round { value.round() } else { value.trunc() };
-            float_to_small(integral, "trunc'/'round")
+            float_to_integer(integral, heap, "trunc'/'round")
         }
         _ => Err(badarg()),
     }
@@ -125,15 +180,18 @@ pub(super) fn integral_of(operand: Eterm, round: bool) -> Result<Eterm> {
 
 /// `ceil/1` (`up = true`) / `floor/1` (`up = false`). Identity on an integer
 /// (small **and** bignum) — `ceil(7)` is `7` and returns the operand's own term,
-/// exactly as `erl` does.
-pub(super) fn ceil_floor(operand: Eterm, up: bool) -> Result<Eterm> {
+/// exactly as `erl` does. A float's ceiling/floor outside the 60-bit small range is
+/// a **bignum** in the oracle (`ceil(1.0e30)` is `1000000000000000019884624838656`,
+/// `floor(-1.0e30)` is its negation), materialised by [`float_to_integer`].
+pub(super) fn ceil_floor(operand: Eterm, up: bool, heap: &mut Heap) -> Result<Eterm> {
     match super::classify(operand) {
         TermClass::Small | TermClass::Big => Ok(operand),
         TermClass::Float => {
             // SAFETY: classify() established a live float block.
             let v = unsafe { float_value(operand) };
-            float_to_small(
+            float_to_integer(
                 if up { v.ceil() } else { v.floor() },
+                heap,
                 if up { "ceil" } else { "floor" },
             )
         }
@@ -141,27 +199,37 @@ pub(super) fn ceil_floor(operand: Eterm, up: bool) -> Result<Eterm> {
     }
 }
 
-/// The shared `f64` → small-integer conversion of `ceil/1`, `floor/1`, `trunc/1`
-/// and `round/1`.
+/// The shared `f64` → integer conversion of `ceil/1`, `floor/1`, `trunc/1` and
+/// `round/1`: the small-range fast path is a 60-bit immediate, and a finite
+/// integral result outside that range is the oracle's **bignum**, materialised
+/// exactly (the value is `mantissa * 2^exp` with `exp >= 7`, so no rounding is
+/// involved — see [`f64_magnitude_limbs`]).
 ///
-/// A result outside the 60-bit small range (or a non-finite one) is a **bignum**
-/// in the oracle, so it is the typed `unsupported_ets` — never a truncated wrong
-/// integer.
-fn float_to_small(value: f64, what: &str) -> Result<Eterm> {
+/// The caller passes an already-integral value (`trunc`/`round`/`ceil`/`floor` of a
+/// float), so an in-range value casts exactly. A **non-finite** value is the one
+/// case with no oracle counterpart: `erl` cannot hold an `±inf`/`NaN` float
+/// (`binary_to_term/1` rejects the encoding with `badarg`, verified against erts-17.1)
+/// and this runtime's arithmetic hook refuses a float overflow, so it is a typed
+/// capability gap rather than a fabricated integer.
+fn float_to_integer(value: f64, heap: &mut Heap, what: &str) -> Result<Eterm> {
     // `2^59` is the exclusive bound of the 60-bit small range.
     const BOUND: f64 = 576_460_752_303_423_488.0;
-    if !value.is_finite() || value.abs() >= BOUND {
+    if !value.is_finite() {
         return Err(unsupported(&format!(
-            "match-spec '{what}': the result is not a small integer"
+            "match-spec '{what}': a non-finite float result"
         )));
     }
-    // `|value| < 2^59` and `value` is integer-valued, so the cast is exact and in
-    // range.
-    try_make_small(value as i64).map_err(|_| {
-        unsupported(&format!(
-            "match-spec '{what}': the result is not a small integer"
-        ))
-    })
+    if value.abs() < BOUND {
+        // `|value| < 2^59` and `value` is integral, so the cast is exact and in
+        // range.
+        return try_make_small(value as i64).map_err(|_| {
+            unsupported(&format!(
+                "match-spec '{what}': the result is not a small integer"
+            ))
+        });
+    }
+    let (negative, digits) = f64_magnitude_limbs(value);
+    write_big_term(heap, negative, &digits)
 }
 
 /// `max/2` (`want_max = true`) / `min/2`. Pure **term order** (`cmp_arith`):
@@ -415,14 +483,101 @@ pub(super) fn xor(a: Eterm, b: Eterm, atoms: &AtomTable) -> Result<bool> {
     Ok(left != right)
 }
 
-/// `bnot/1` — the bitwise complement of a small integer (a 60-bit small's
-/// complement is always a 60-bit small). A **bignum** operand needs bignum
-/// arithmetic and is the typed `unsupported_ets` (never a wrong answer), and any
-/// other operand is the oracle's `badarg`.
-pub(super) fn bnot(operand: Eterm) -> Result<Eterm> {
+/// `abs/1` — the absolute value, sign-corrected at the term layer.
+///
+/// * A **small** integer keeps the 60-bit immediate fast path — except
+///   `abs(MIN_SMALL)` (= `2^59`, exactly one past `MAX_SMALL`), whose oracle result
+///   is a **bignum**.
+/// * A **float** yields the boxed `|value|` (`abs(-1.5)` is `1.5`).
+/// * A **bignum** keeps its magnitude digits verbatim and drops the sign bit (the
+///   magnitude of a canonical bignum is already least-significant-first), so
+///   `abs(-(1 bsl 70))` re-materialises `1 bsl 70` exactly.
+///
+/// Any other operand is the oracle's `badarg`.
+pub(super) fn abs_of(operand: Eterm, heap: &mut Heap) -> Result<Eterm> {
+    match super::classify(operand) {
+        TermClass::Small => {
+            let magnitude = signed_value(operand).unsigned_abs();
+            if magnitude <= MAX_SMALL as u64 {
+                return Ok(make_small(magnitude as i64));
+            }
+            // Only `abs(MIN_SMALL)` reaches here: its magnitude is exactly `2^59`,
+            // so the oracle's result is a bignum.
+            write_big_term(heap, false, &[magnitude])
+        }
+        // SAFETY: the class established a live float block.
+        TermClass::Float => write_float_term(heap, unsafe { float_value(operand) }.abs()),
+        // SAFETY: the class established a live bignum block, which is all
+        // `big_parts` reads (its sign word and least-significant-first digits).
+        TermClass::Big => {
+            let (_, digits) = unsafe { big_parts(operand) };
+            write_big_term(heap, false, digits)
+        }
+        _ => Err(badarg()),
+    }
+}
+
+/// `bnot/1` — the bitwise complement, `bnot(N) = -N - 1`.
+///
+/// A **small** operand stays in the 60-bit small range: `!v` for `v` in
+/// `-2^59..=2^59-1` is itself in that range, so it is the immediate
+/// `make_small(!signed_value(operand))` (e.g. `bnot(MIN_SMALL)` is `2^59 - 1`).
+///
+/// A **bignum** operand is complemented exactly (`erl` returns a bignum):
+/// * a non-negative `N` becomes `-(N + 1)`, an add-one-with-carry that may grow a new
+///   high limb (`bnot(2^64 - 1)` is `-2^64`);
+/// * a negative `N = -M` becomes the positive `M - 1`, a subtract-one-with-borrow
+///   whose result is re-canonicalised of any high zero limb (`bnot(-2^64)` is
+///   `2^64 - 1`).
+///
+/// Any other operand is the oracle's `badarg`.
+pub(super) fn bnot(operand: Eterm, heap: &mut Heap) -> Result<Eterm> {
     match super::classify(operand) {
         TermClass::Small => Ok(make_small(!signed_value(operand))),
-        TermClass::Big => Err(unsupported("match-spec 'bnot': a bignum operand")),
+        // SAFETY: the class established a live bignum block, which is all
+        // `big_parts` reads (its sign word and least-significant-first digits).
+        TermClass::Big => {
+            let (negative, digits) = unsafe { big_parts(operand) };
+            if negative {
+                // `N = -M`, so `bnot(N) = M - 1`: subtract one with borrow, high
+                // limbs first becoming all-ones while the borrow propagates.
+                let mut limbs = digits.to_vec();
+                let mut index = 0;
+                while index < limbs.len() && limbs[index] == 0 {
+                    limbs[index] = u64::MAX;
+                    index += 1;
+                }
+                if index == limbs.len() {
+                    // A zero bignum (never produced by a canonical producer, which
+                    // strips high zero digits): no `M >= 1`, so refuse rather than
+                    // fabricate a value.
+                    return Err(badarg());
+                }
+                limbs[index] -= 1;
+                while limbs.len() > 1 && limbs[limbs.len() - 1] == 0 {
+                    limbs.pop();
+                }
+                write_big_term(heap, false, &limbs)
+            } else {
+                // `N >= 0`, so `bnot(N) = -(N + 1)`: add one with carry, appending a
+                // new high limb when every digit carries out.
+                let mut limbs = digits.to_vec();
+                let mut index = 0;
+                loop {
+                    if index == limbs.len() {
+                        limbs.push(1);
+                        break;
+                    }
+                    let (sum, carry) = limbs[index].overflowing_add(1);
+                    limbs[index] = sum;
+                    if !carry {
+                        break;
+                    }
+                    index += 1;
+                }
+                write_big_term(heap, true, &limbs)
+            }
+        }
         _ => Err(badarg()),
     }
 }
@@ -589,5 +744,197 @@ pub(super) fn self_term() -> Result<Eterm> {
     match self_hook() {
         Some(hook) => hook.self_pid(),
         None => Err(badarg()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the numeric guard helpers that materialise a **bignum**: the
+    //! `abs/1`/`bnot/1` bignum paths and the `trunc/1`/`round/1`/`ceil/1`/`floor/1`
+    //! float→bignum conversion. The expectations are the values the system `erl`
+    //! (OTP 29 / erts-17.1) produces through `ets:select/2`, quoted beside each case.
+
+    use super::super::classify;
+    use super::{abs_of, bnot, ceil_floor, integral_of, write_float_term};
+    use beam_alloc::Heap;
+    use beam_common::BeamError;
+    use beam_term::{
+        big_parts, big_size_words, float_value, make_small, signed_value, write_big, Eterm,
+        TermClass, MAX_SMALL, MIN_SMALL, NIL,
+    };
+
+    /// A scratch heap with room for every bignum/float block a test builds.
+    fn heap() -> Heap {
+        Heap::new(256).expect("test heap")
+    }
+
+    /// A bignum term on `heap` (least-significant-first `u64` digits).
+    fn big(heap: &mut Heap, negative: bool, digits: &[u64]) -> Eterm {
+        // SAFETY: `alloc_words(big_size_words(digits.len()))` hands back exactly those
+        // exclusively-owned, writable words, every one of which `write_big` fills; the
+        // heap is a never-relocating arena that outlives the term.
+        unsafe {
+            let hp = heap
+                .alloc_words(big_size_words(digits.len()))
+                .expect("the heap has room for a bignum");
+            write_big(hp, negative, digits)
+        }
+    }
+
+    /// A float term on `heap`.
+    fn float_term(heap: &mut Heap, value: f64) -> Eterm {
+        write_float_term(heap, value).expect("the heap has room for a float")
+    }
+
+    /// Assert `term` is a bignum with exactly this sign and least-significant-first
+    /// digits.
+    fn assert_big(term: Eterm, negative: bool, digits: &[u64]) {
+        let class = classify(term);
+        assert_eq!(class, TermClass::Big, "the result must be a bignum, got {class:?}");
+        // SAFETY: `classify` established a live bignum block, which is all `big_parts`
+        // reads; the heap owning the term is still alive in this call.
+        let (got_negative, got_digits) = unsafe { big_parts(term) };
+        assert_eq!(got_negative, negative, "the bignum's sign");
+        assert_eq!(got_digits, digits, "the bignum's digits (LS-first)");
+    }
+
+    /// The `f64` value of a term one of these tests produced as a float.
+    fn as_float(term: Eterm) -> f64 {
+        assert_eq!(classify(term), TermClass::Float, "expected a float term");
+        // SAFETY: the assertion above established a live boxed float.
+        unsafe { float_value(term) }
+    }
+
+    #[test]
+    fn abs_of_a_small_integer_stays_small_except_min_small() {
+        // erl: `abs(-3)` is 3 and `abs(MAX_SMALL)` is MAX_SMALL.
+        let mut heap = heap();
+        assert_eq!(signed_value(abs_of(make_small(-3), &mut heap).unwrap()), 3);
+        let max = abs_of(make_small(MAX_SMALL), &mut heap).unwrap();
+        assert_eq!(signed_value(max), MAX_SMALL);
+
+        // erl: `abs(-576460752303423488)` is `576460752303423488` (= 2^59) — the one
+        // small operand whose absolute value is a BIGNUM.
+        let min = abs_of(make_small(MIN_SMALL), &mut heap).unwrap();
+        assert_big(min, false, &[1u64 << 59]);
+    }
+
+    #[test]
+    fn abs_of_a_bignum_keeps_its_magnitude() {
+        // erl: `abs(-(1 bsl 70))` == `abs(1 bsl 70)` == `1180591620717411303424`
+        // (= 2^70); `abs(-(2^64 + 5))` == `18446744073709551621`.
+        let mut heap = heap();
+        let magnitude = [0u64, 1u64 << 6]; // 2^70 = 2^(64 + 6)
+        assert_big(abs_of(big(&mut heap, false, &magnitude), &mut heap).unwrap(), false, &magnitude);
+        assert_big(abs_of(big(&mut heap, true, &magnitude), &mut heap).unwrap(), false, &magnitude);
+
+        let other = [5u64, 1u64]; // 2^64 + 5
+        assert_big(abs_of(big(&mut heap, true, &other), &mut heap).unwrap(), false, &other);
+    }
+
+    #[test]
+    fn abs_of_a_float_is_the_boxed_magnitude() {
+        // erl: `abs(-1.5)` is the float `1.5`.
+        let mut heap = heap();
+        let result = abs_of(float_term(&mut heap, -1.5), &mut heap).unwrap();
+        assert_eq!(as_float(result), 1.5);
+    }
+
+    #[test]
+    fn bnot_of_a_small_integer_is_the_immediate_complement() {
+        // erl: `bnot(0)` is -1, `bnot(-1)` is 0, `bnot(MAX_SMALL)` is MIN_SMALL and
+        // `bnot(MIN_SMALL)` is `576460752303423487` (= 2^59 - 1 = MAX_SMALL).
+        let mut heap = heap();
+        assert_eq!(signed_value(bnot(make_small(0), &mut heap).unwrap()), -1);
+        assert_eq!(signed_value(bnot(make_small(-1), &mut heap).unwrap()), 0);
+        assert_eq!(
+            signed_value(bnot(make_small(MAX_SMALL), &mut heap).unwrap()),
+            MIN_SMALL
+        );
+        assert_eq!(
+            signed_value(bnot(make_small(MIN_SMALL), &mut heap).unwrap()),
+            MAX_SMALL
+        );
+    }
+
+    #[test]
+    fn bnot_of_a_non_negative_bignum_adds_one_and_negates() {
+        // erl: `bnot(18446744073709551615)` (= 2^64 - 1) is `-18446744073709551616`
+        // (= -2^64) — the add-one carry GROWS a high limb.
+        let mut heap = heap();
+        let result = bnot(big(&mut heap, false, &[u64::MAX]), &mut heap).unwrap();
+        assert_big(result, true, &[0, 1]);
+
+        // erl: `bnot(18446744073709551616)` (= 2^64) is `-18446744073709551617`.
+        let result = bnot(big(&mut heap, false, &[0, 1]), &mut heap).unwrap();
+        assert_big(result, true, &[1, 1]);
+    }
+
+    #[test]
+    fn bnot_of_a_negative_bignum_subtracts_one_and_canonicalises() {
+        // erl: `bnot(-18446744073709551616)` (= -(2^64)) is `18446744073709551615` —
+        // the subtract-one borrow leaves a high zero limb that is stripped.
+        let mut heap = heap();
+        let result = bnot(big(&mut heap, true, &[0, 1]), &mut heap).unwrap();
+        assert_big(result, false, &[u64::MAX]);
+
+        // erl: `bnot(-(2^64 + 5))` is `18446744073709551620` (= 2^64 + 4).
+        let result = bnot(big(&mut heap, true, &[5, 1]), &mut heap).unwrap();
+        assert_big(result, false, &[4, 1]);
+    }
+
+    #[test]
+    fn integral_conversions_of_a_large_float_materialise_the_oracle_bignum() {
+        // erl: `trunc(1.0e30)` == `round(1.0e30)` == `ceil(1.0e30)` ==
+        //      `1000000000000000019884624838656`, and the negatives for `floor(-1.0e30)`
+        //      etc. == `-1000000000000000019884624838656`.
+        // The limbs are the exact integer decomposed least-significant-first.
+        const ONE_E30: [u64; 2] = [0x4675_0000_0000_0000, 0x0000_000C_9F2C_9CD0];
+        let mut heap = heap();
+
+        for round in [false, true] {
+            let result = integral_of(float_term(&mut heap, 1.0e30), round, &mut heap).unwrap();
+            assert_big(result, false, &ONE_E30);
+            let result = integral_of(float_term(&mut heap, -1.0e30), round, &mut heap).unwrap();
+            assert_big(result, true, &ONE_E30);
+        }
+        for up in [false, true] {
+            let result = ceil_floor(float_term(&mut heap, 1.0e30), up, &mut heap).unwrap();
+            assert_big(result, false, &ONE_E30);
+            let result = ceil_floor(float_term(&mut heap, -1.0e30), up, &mut heap).unwrap();
+            assert_big(result, true, &ONE_E30);
+        }
+    }
+
+    #[test]
+    fn the_float_to_bignum_shift_covers_limb_boundaries() {
+        // erl: `trunc(18446744073709551616.0)` (= 2^64) is `18446744073709551616` and
+        // `trunc(8.307674973655724e+34)` (= 2^116) is `83076749736557242056487941267521536`.
+        let mut heap = heap();
+        let two_64 = float_term(&mut heap, 2f64.powi(64));
+        let result = integral_of(two_64, false, &mut heap).unwrap();
+        assert_big(result, false, &[0, 1]); // 2^64 = 2^(64 + 0)
+
+        let two_116 = float_term(&mut heap, 2f64.powi(116));
+        let result = integral_of(two_116, false, &mut heap).unwrap();
+        assert_big(result, false, &[0, 1u64 << 52]); // 2^116 = 2^52 * 2^64
+    }
+
+    #[test]
+    fn a_non_number_operand_is_badarg() {
+        // erl raises `badarg` for `abs`/`bnot`/`trunc`/`round`/`ceil`/`floor` of a
+        // non-number (here the empty list).
+        let mut heap = heap();
+        for error in [
+            abs_of(NIL, &mut heap),
+            bnot(NIL, &mut heap),
+            integral_of(NIL, false, &mut heap),
+            ceil_floor(NIL, true, &mut heap),
+        ] {
+            assert!(
+                matches!(error, Err(BeamError::BadArg)),
+                "a non-number operand is badarg"
+            );
+        }
     }
 }
