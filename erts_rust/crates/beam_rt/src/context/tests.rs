@@ -18,7 +18,7 @@
 //
 // %CopyrightEnd%
 
-use beam_bifs::{AtomInterner, BifRegistry, BytesSink, LocalFunIdentity, LocalNode};
+use beam_bifs::{AtomInterner, BifFn, BifRegistry, BytesSink, LocalFunIdentity, LocalNode};
 use beam_engine::RunOutcome;
 use beam_term::{atom_val, is_small, make_atom, make_small, signed_value, Atom, AtomTable, NIL};
 
@@ -233,6 +233,259 @@ fn the_registry_is_the_core_bif_set() {
     }
     assert!(!rt.registry.contains("erlang", "nope", 0));
     assert!(!core.contains("erlang", "nope", 0));
+}
+
+// -----------------------------------------------------------------------
+// the dispatch memo (`RuntimeContext::dispatch`)
+// -----------------------------------------------------------------------
+//
+// `call_bif` answers a registered call out of `RuntimeContext::dispatch`'s memo instead of
+// re-running the dispatch prologue (`registry.lookup` + the whole `uses_*` hook roster) on
+// every call. A memo **hit** must therefore be identical to what the uncached prologue would
+// have produced: the memo may only skip *work*, never change an answer. These cases pin that
+// against the uncached oracle below — on a registered BIF, a hook-gated BIF of every arm, a
+// name no registry owns, and a pair of keys that share a memo slot while carrying *different*
+// answers (the eviction case, where a hit decided by anything weaker than the full key would
+// return the wrong answer).
+//
+// Why a cached answer can never go stale (the soundness argument, also stated on
+// `super::DispatchMemo`): every input the answer is built from is immutable for the life of
+// the runtime. `beam_bifs`' `needs_*` rosters are `&'static` tables (the predicates are pure
+// `binary_search` membership tests), and `Runtime::registry` is an `Rc<BifRegistry>` built once
+// at boot — `BifRegistry::register` takes `&mut self`, is boot-time only, and nothing in this
+// crate ever calls `Rc::make_mut`/`Rc::get_mut` on it. The one **runtime-mutable** dispatch
+// input, the NIF registry that `erlang:load_nif/2` grows, is deliberately **not** memoized:
+// `RuntimeContext::call_bif` still runs `try_call_nif` first on every call, so a library loaded
+// mid-slice wins immediately (`../../tests/nif.rs` loads a real `.so` and pins that precedence).
+// The memo lives on the context, so it is exactly as long-lived as one run (`call_bif`);
+// a fresh context starts empty and recomputes on first use.
+
+/// Keys spanning the answer space the memo has to keep apart: registered arithmetic, one
+/// registered key for each hook-gated arm, a registered `RuntimeHooks` key, long-standing
+/// stdlib/ETS registrations and names no registry owns.
+///
+/// Longer than [`DISPATCH_MEMO_SLOTS`], so a full pass over them evicts continuously — the
+/// churn case below is not vacuous — and it contains at least one same-slot pair whose two
+/// answers differ (asserted, not assumed).
+const DISPATCH_PROBE_KEYS: &[(&str, &str, u32)] = &[
+    ("erlang", "+", 2),
+    ("erlang", "*", 2),
+    ("erlang", "put", 2),
+    ("erlang", "whereis", 1),
+    ("erlang", "load_nif", 2),
+    ("records", "get_definition", 2),
+    ("erlang", "send", 2),
+    ("erlang", "get_module_info", 1),
+    ("persistent_term", "get", 1),
+    ("erlang", "start_timer", 3),
+    ("erlang", "term_to_binary", 1),
+    ("erlang", "memory", 0),
+    ("lists", "reverse", 1),
+    ("ets", "new", 2),
+    ("erlang", "nope", 0),
+    ("nosuchmod", "nope", 3),
+];
+
+/// The answer the **uncached** dispatch prologue produces for `key`: the `beam_bifs` registry
+/// implementation plus one fresh evaluation of every `uses_*` hook predicate — exactly the two
+/// inputs [`RuntimeContext::dispatch`] memoizes, but recomputed from scratch here.
+fn uncached_dispatch(rt: &Runtime, key: (&str, &str, u32)) -> (Option<BifFn>, DispatchHooks) {
+    let (module, function, arity) = key;
+    (
+        rt.registry.lookup(module, function, arity),
+        DispatchHooks::of(module, function, arity),
+    )
+}
+
+/// A dispatch answer as a comparable value: `(is-registered, BIF address, hook roster)`.
+///
+/// The `BifFn` itself is not comparable (`fn` pointers have neither `Debug` nor `PartialEq`),
+/// so the implementation is compared by address — two lookups of the same key necessarily
+/// yield the same address.
+type AnswerShape = (bool, Option<usize>, DispatchHooks);
+
+fn shape(answer: (Option<BifFn>, DispatchHooks)) -> AnswerShape {
+    (answer.0.is_some(), answer.0.map(|f| f as usize), answer.1)
+}
+
+#[test]
+fn a_dispatch_memo_hit_answers_what_the_uncached_prologue_would() {
+    let mut rt = runtime();
+    let mut ctx = RuntimeContext::new(&mut rt);
+    for &(module, function, arity) in DISPATCH_PROBE_KEYS {
+        let expected = shape(uncached_dispatch(ctx.runtime, (module, function, arity)));
+        // The first call is a miss: it computes the answer and memoizes it in the slot.
+        let miss = ctx.dispatch(module, function, arity);
+        assert_eq!(
+            shape((miss.bif, miss.hooks)),
+            expected,
+            "the memo miss for {module}:{function}/{arity} must equal the uncached prologue"
+        );
+        let entry = ctx.dispatch_memo.slots[dispatch_slot(module, function, arity)]
+            .as_ref()
+            .expect("the miss memoized its answer");
+        assert_eq!(
+            (entry.module.as_str(), entry.function.as_str(), entry.arity),
+            (module, function, arity),
+            "the memoized entry is tagged with the key it answers"
+        );
+        // Every later call is a hit (until a collision evicts it): same answer, always.
+        for _ in 0..3 {
+            let hit = ctx.dispatch(module, function, arity);
+            assert_eq!(
+                shape((hit.bif, hit.hooks)),
+                expected,
+                "a memo hit for {module}:{function}/{arity} must equal the uncached prologue"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_memoized_hook_roster_mirrors_the_beam_bifs_predicates_field_for_field() {
+    // A hit returns the *memoized* roster, so a mis-mapped field would answer a different arm
+    // than `beam_bifs` routes the key through — a wrong seam (and so a wrong result) rather
+    // than a slow one. Compare the memoized roster to the raw predicates (not to
+    // `DispatchHooks::of`, which built it) so a mapping bug cannot hide behind itself.
+    let mut rt = runtime();
+    let mut ctx = RuntimeContext::new(&mut rt);
+    let mut any_claimed = false;
+    let mut any_unclaimed = false;
+    for &(module, function, arity) in DISPATCH_PROBE_KEYS {
+        let hooks = ctx.dispatch(module, function, arity).hooks;
+        assert_eq!(
+            hooks.dict,
+            beam_bifs::needs_dict_hook(module, function, arity),
+            "{module}:{function}/{arity} dict arm"
+        );
+        assert_eq!(
+            hooks.process_hook,
+            beam_bifs::needs_process_hook(module, function, arity),
+            "{module}:{function}/{arity} process arm"
+        );
+        assert_eq!(
+            hooks.nif_loader,
+            beam_bifs::needs_nif_loader(module, function, arity),
+            "{module}:{function}/{arity} NIF-loader arm"
+        );
+        assert_eq!(
+            hooks.record_source,
+            beam_bifs::needs_record_source(module, function, arity),
+            "{module}:{function}/{arity} record-source arm"
+        );
+        assert_eq!(
+            hooks.send_hook,
+            beam_bifs::needs_send_hook(module, function, arity),
+            "{module}:{function}/{arity} send arm"
+        );
+        assert_eq!(
+            hooks.module_info,
+            beam_bifs::needs_module_info(module, function, arity),
+            "{module}:{function}/{arity} module-info arm"
+        );
+        assert_eq!(
+            hooks.persistent_term,
+            beam_bifs::needs_persistent_term(module, function, arity),
+            "{module}:{function}/{arity} persistent-term arm"
+        );
+        assert_eq!(
+            hooks.runtime_hooks,
+            beam_bifs::needs_runtime_hooks(module, function, arity),
+            "{module}:{function}/{arity} runtime-hooks arm"
+        );
+        assert_eq!(
+            hooks.fun_identity,
+            beam_bifs::needs_local_fun_identity(module, function, arity),
+            "{module}:{function}/{arity} local-fun-identity gate"
+        );
+        assert_eq!(
+            hooks.memory_hook,
+            beam_bifs::needs_memory_hook(module, function, arity),
+            "{module}:{function}/{arity} memory-hook gate"
+        );
+        any_claimed |= hooks != DispatchHooks::default();
+        any_unclaimed |= hooks == DispatchHooks::default();
+    }
+    // A probe set that claimed no arm (or claimed every key) would make the mirror above
+    // vacuous, so both sides of the mapping must occur.
+    assert!(any_claimed, "the probe set must contain a hook-gated key");
+    assert!(any_unclaimed, "the probe set must contain an ungated key");
+}
+
+#[test]
+fn a_dispatch_memo_slot_collision_cannot_change_an_answer() {
+    let mut rt = runtime();
+    let mut ctx = RuntimeContext::new(&mut rt);
+    // Every unordered pair of probe keys that share a memo slot while carrying **different**
+    // answers. These are exactly the pairs an eviction could corrupt: with a 8-slot
+    // direct-mapped memo the second key overwrites the first, so the first's next call has to
+    // recompute — and a hit decided by anything weaker than the whole key (the slot, the
+    // arity, a module-only compare) would return the evicted key's answer instead.
+    let mut colliding: Vec<((&str, &str, u32), (&str, &str, u32))> = Vec::new();
+    for (i, a) in DISPATCH_PROBE_KEYS.iter().enumerate() {
+        for b in &DISPATCH_PROBE_KEYS[i + 1..] {
+            if dispatch_slot(a.0, a.1, a.2) != dispatch_slot(b.0, b.1, b.2) {
+                continue;
+            }
+            if shape(uncached_dispatch(ctx.runtime, *a)) != shape(uncached_dispatch(ctx.runtime, *b))
+            {
+                colliding.push((*a, *b));
+            }
+        }
+    }
+    // A concrete, stable instance of the situation, so the guard below can never pass
+    // vacuously: `erlang:send/2` is registered and needs the delivery hook, while a name no
+    // registry owns shares its slot carrying a completely different answer.
+    assert_eq!(dispatch_slot("erlang", "send", 2), dispatch_slot("nosuchmod", "nope", 3));
+    assert!(
+        !colliding.is_empty(),
+        "the probe set must contain a slot collision between two different answers"
+    );
+    for (a, b) in colliding {
+        // Interleave the two keys: `b` evicts `a`, so the third call is a recompute. Every
+        // answer must still equal the uncached prologue — an eviction costs work, never a
+        // result.
+        for (key, label) in [(a, "first"), (b, "colliding"), (a, "recomputed")] {
+            let got = ctx.dispatch(key.0, key.1, key.2);
+            assert_eq!(
+                shape((got.bif, got.hooks)),
+                shape(uncached_dispatch(ctx.runtime, key)),
+                "the {label} answer for {}/{}/{} (slot {}) changed across a collision",
+                key.0,
+                key.1,
+                key.2,
+                dispatch_slot(key.0, key.1, key.2),
+            );
+        }
+    }
+}
+
+#[test]
+fn the_dispatch_memo_stays_correct_under_slot_churn() {
+    let mut rt = runtime();
+    let mut ctx = RuntimeContext::new(&mut rt);
+    let expected: Vec<AnswerShape> = DISPATCH_PROBE_KEYS
+        .iter()
+        .map(|&key| shape(uncached_dispatch(ctx.runtime, key)))
+        .collect();
+    // The probe set is deliberately larger than the memo, so one pass over it evicts and
+    // recomputes continuously and three passes make every hit/miss interleaving occur.
+    assert!(
+        DISPATCH_PROBE_KEYS.len() > DISPATCH_MEMO_SLOTS,
+        "the probe set must not fit the memo, or no churn happens"
+    );
+    for pass in 0..3 {
+        for (key, want) in DISPATCH_PROBE_KEYS.iter().zip(&expected) {
+            let got = ctx.dispatch(key.0, key.1, key.2);
+            assert_eq!(
+                shape((got.bif, got.hooks)),
+                *want,
+                "pass {pass}: {}/{} answer changed under slot churn",
+                key.0,
+                key.1
+            );
+        }
+    }
 }
 
 // -----------------------------------------------------------------------
