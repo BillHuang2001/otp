@@ -47,11 +47,16 @@ The tool-driven workloads (`khepri`, `emqx`, `plb`) resolve their external tool 
 3. an **automatic Nix-store scan** for `/nix/store/*<tool>*/bin/<tool>`, ranked **by the version named in
    the entry** (descending) — the random 32-char hash prefix never participates, so the "newest installed"
    preference is real and a too-old version cannot win by accident; **no store hash or version is baked in**;
-4. **`$BENCH_TRY_NIX`** (opt-in, default off): a validated `nix shell nixpkgs#<attr> --command <tool>` shim — last.
+4. **`$BENCH_TRY_NIX`** (opt-in, default off): a validated `nix shell nixpkgs#<attr> --command <tool>` shim — last, consulted **only** when steps 1–3 find nothing.
 Steps 1–3 are subprocess-free and memoised in a process-global cache, so `probe()` / `bench list` stay cheap.
 A `None` means the tool is genuinely unavailable ⇒ the caller keeps its honest `skipped(<tool>-absent)`.
-**Consequence:** `rebar3` (3.27.1) and `dotnet` (newest installed SDK) resolve with **no `PATH` prefix and
-no `$BENCH_TRY_NIX`**, so `khepri` and `plb` run by default on this host.
+`available()` (the `probe()` predicate) returns true when steps 1–3 resolve the tool **or** `$BENCH_TRY_NIX` is set, so `probe_ready` can read true while the later `command_for()` `--version` validation fails; the workload still reports honestly and never fabricates a number.
+**Verified in this sandbox:** the store scan resolves `rebar3` (3.27.1) and `dotnet` with no `PATH` prefix and no `$BENCH_TRY_NIX`, so `khepri` and `plb` run on this host.
+`$BENCH_TRY_NIX` is also verified to work here (it fetches `rebar3` 3.27.1 + Erlang/OTP 28 from `cache.nixos.org`; the network is available), but it stays the last resort described above.
+`dotnet` is **store state, not repo state**: the default store-scan path expects a .NET SDK in the store, and the SDK PLB targets (.NET 9) is realized with `nix build --no-link nixpkgs#dotnet-sdk_9` (9.0.318) before the version-ranked scan resolves it and `plb` runs.
+A store without that entry still has `plb.probe()` read ready yet the build fails with `NETSDK1045` ⇒ `failed(plb-build-failed)` — recorded honestly, never papered over.
+**Flake NOTE (do NOT edit `../../flake.nix`):** it lists `rebar3` in `oracleDeps` but no .NET SDK; adding one there would make `plb` reproducible.
+The sandbox record of what each tool-driven target actually does here is `results/m6-tool-targets-notes.md`.
 
 ### `beam_rt` is a REAL runtime (self-checked)
 `beam_rt` is a working Rust runtime (real `-eval` evaluator, a global-atom `code:*`/`init:*` floor, native
@@ -114,6 +119,8 @@ Runner rule: every selected **(workload × runtime)** pair yields **exactly one*
 | `slice` | compute | committed `slice.beam` fixture + stdlib wrapper modules, run under **each scheduled runtime** | **runs** (sys+rust) | `erlc-absent`, `fixture-missing`, `runtime-unsupported` |
 | `foreign` | compute | **real Cowboy + EMQX modules** (`cowboy_bstr.erl`, `emqx_base62.erl`) compiled with the system `erlc`, run under **both** runtimes | **runs** (sys+rust) | `erlc-absent`, `sources-missing`, `runtime-unsupported` |
 | `list_walk` | compute | in-tree embedded `bench_list_walk` module (BIF-free recursive `sum/1` list walk), run under **both** runtimes | **runs** (sys+rust) | `erlc-absent` |
+| `copy_bound` | messaging | in-tree embedded `bench_copy_bound` module (ETF / ETS / two-process copy round-trips), run under **both** runtimes | **runs** (sys+rust) | `erlc-absent`, `module-compile-failed`, `runtime-unsupported` |
+| `gc_bound` | gc | in-tree embedded `bench_gc_bound` module (allocate-and-abandon garbage churn), run under **both** runtimes | **runs** (sys+rust) | `erlc-absent`, `module-compile-failed`, `runtime-unsupported` |
 
 - `baseline` (always-on): N runs of `<erl> -noshell -eval 'halt().'` ⇒ startup-latency `Summary` (p50/p99);
   a fixed in-VM compute loop `-eval 'S = lists:sum(lists:seq(1,1000000)), io:format("~p~n",[S]), halt().'`
@@ -195,6 +202,8 @@ Runner rule: every selected **(workload × runtime)** pair yields **exactly one*
   contention-immune** companion `case_list_walk_elements` = `N × LEN` (stays valid on a loaded host where
   the wall-clock rows do not). Each run's stdout is checked against the deterministic constant; a Rust exit
   `3` records the capability gap and emits **no** timing. `probe()` ⇒ `skipped(erlc-absent)` without `erlc`.
+- `copy_bound`: **the messaging / term-copy-bound metric** — the term-copy boundary run under *both* runtimes. One embedded `bench_copy_bound` module (generated from the crate's constants, so Rust and Erlang cannot drift) with three cases, each copying the **same structured payload** (a 5-key map) and validating the round-trip with a bound-variable pattern (a real equality test that raises on a corrupted copy): `etf_roundtrip` (`term_to_binary/1` + `binary_to_term/1` — the External Term Format wire codec, contract A.5); `ets_copy` (`ets:insert/2` + `ets:lookup/2` — the ETS copy boundary, one table+key per process so the measured work is the copy, not table growth); `send_recv` (a term sent to a second process, round-tripped through `term_to_binary/1` there, and sent back — **both directions** of the process copy boundary, with an `after` guard so a missing reply fails loudly, never hangs). It uses the shared startup-cancelled per-op recipe (run at `N` and at `0`, with a per-case per-runtime `N`; `etf_roundtrip` 5 000/1 500 000, `ets_copy` 100 000/2 000 000, `send_recv` 2 000/500 000 rust/sys; `--quick` ⇒ 3 runs/case, `--full` ⇒ 10), reporting `case_<name>_wall_ms`, `case_<name>_startup_ms`, `case_<name>_peak_rss_bytes`, `case_<name>_ns_per_op` (`(mean wall@N − mean wall@0) / N × 1e6`, only when positive) and the deterministic, contention-immune `case_<name>_ops` = `N`. A Rust exit `3` records the capability gap and emits **no** timing; an embedded-module compile failure is `failed(module-compile-failed)` (the source is ours), never a skip; `probe()` ⇒ `skipped(erlc-absent)` via the shared `slice::resolve_erlc()` lookup.
+- `gc_bound`: **the GC-bound metric** — allocate-and-abandon garbage churn under *both* runtimes. One embedded `bench_gc_bound` module whose single `churn/1` case, per iteration, builds and abandons three `LEN`=256-sized structures — an interpreted-recursion list (`build_list/2`, *not* a native `lists:seq/2`), a 256-byte binary built from an interpreted char list, and a tuple built from another interpreted list — then checks the two O(1)-checkable ones (`byte_size`/`tuple_size`) so a silently-dropped allocation fails loudly. It uses the same shared startup-cancelled per-op recipe (run at `N` and at `0`; `n_rust` = 2 000, `n_sys` = 200 000; `--quick` ⇒ 3 runs, `--full` ⇒ 10), reporting `case_churn_wall_ms`, `case_churn_startup_ms`, `case_churn_peak_rss_bytes`, `case_churn_ns_per_op` (`(mean wall@N − mean wall@0) / N × 1e6`, only when positive) and the deterministic, contention-immune `case_churn_ops` = `N`. The row measures the allocate-and-abandon wall time and **claims no collection count** (whether a runtime's collector runs during the loop is its own admission policy); a Rust exit `3` ⇒ an honest `skipped(unsupported-case)` with **no** timing, and a compile failure is `failed(module-compile-failed)`; `probe()` ⇒ `skipped(erlc-absent)` via `slice::resolve_erlc()`.
 
 ### Result JSON schema (stable — `SCHEMA_VERSION = 1`)
 Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in **milliseconds** (f64).
@@ -250,15 +259,18 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
 - `src/workloads/tool.rs` → shared external-tool resolution (`available`, `command_for`, `extra_tool_dirs`,
   the Nix-store scan with **version-aware** ranking, `parse_tool_path`, `REPO_SKIP_NAMES`).
 - `src/workloads/baseline.rs` · `erlc_compiler.rs` · `elixir_compiler.rs` · `plb.rs` · `cowboy.rs` ·
-  `khepri.rs` · `emqx.rs` · `slice.rs` · `foreign.rs` · `list_walk.rs` → one file per workload (probe + run).
+  `khepri.rs` · `emqx.rs` · `slice.rs` · `foreign.rs` · `list_walk.rs` · `copy_bound.rs` · `gc_bound.rs`
+  → one file per workload (probe + run).
   `slice.rs` also exposes `pub(crate) resolve_erlc()` (the shared `$ERLC`/`PATH` lookup reused by
-  `foreign.rs` and `list_walk.rs`).
+  `foreign.rs`, `list_walk.rs`, `copy_bound.rs` and `gc_bound.rs`).
 - `tests/integration.rs` → hermetic synthetic-report round-trip + `compare` tests (no oracle needed), plus
-  the cross-runtime regression guard (`foreign` **and** `list_walk` stay `Runtimes::Both` / Compute / A.1+A.2).
+  the cross-runtime regression guard (`foreign`, `list_walk`, `copy_bound` and `gc_bound` stay
+  `Runtimes::Both`, each with its own category/contracts: `foreign`/`list_walk` Compute·A.1+A.2,
+  `copy_bound` Messaging·A.1+A.5, `gc_bound` Gc·A.1).
 - `tests/oracle_smoke.rs` → `baseline` smoke test against the real oracle (no-op skip when unresolved).
 - `RESULTS.md` → the definitive results summary (tables, commands, verified skips, host-load record, caveats).
-- `results/` → committed raw `Report` JSON + `bench compare` diffs: `m5-*` = the current run; `m4-*` = the
-  previous run, kept as the regression baseline.
+- `results/` → committed raw `Report` JSON + `bench compare` diffs: `m6-*` = the current run; `m5-*`/`m4-*` =
+  the previous runs, kept as the regression baseline.
 
 ## Constraints
 - `#![forbid(unsafe_code)]`; **no new crates** (deps resolve offline: `serde`, `serde_json`, `beam_common`).
@@ -285,19 +297,26 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
   Never hardcode the worktree path.
 - Toolchain in this sandbox: `erl`/`erlc`/`escript`/`make`/`mix`/`elixir`/`curl`/`git`/`nix`/`jq` **present**;
   `rebar3`, `dotnet`, `wrk`, `h2load`, `bombardier`, `ab`, `/usr/bin/time` **absent from `PATH`** — but
-  `rebar3` and `dotnet` are in the Nix store and are resolved by the shared store scan (see above), so
-  `khepri` and `plb` run with **no `PATH` prefix and no `$BENCH_TRY_NIX`**. Network is available (erlang.mk
+  `rebar3` and `dotnet` resolve from the Nix store via the shared store scan (see above), so `khepri` and
+  `plb` run with **no `PATH` prefix and no `$BENCH_TRY_NIX`** (the .NET 9 SDK must first be realized in the
+  store — see the tool-resolution section). Network is available (erlang.mk
   can git-fetch cowlib/ranch). Oracle is OTP 29.1.1 / erts-17.1. After
   `scripts/cargo.sh build --release --workspace`, `../../target/release/beam_rt` is built ⇒ the `rust`
   runtime resolves and passes the self-check (`supported: true`).
 - **`$BENCH_TOOL_PATH`** (colon-separated `bin` dirs, searched before the store scan) is the documented way
   to force a specific tool build; **`$BENCH_TRY_NIX`** (opt-in, default off) is the last-resort
   `nix shell nixpkgs#<attr> --command <tool>` fallback. Neither is required for the default path.
-- **`emqx` needs an OTP-28 toolchain.** It drives EMQX's real `make`/`mix` build, but EMQX pins OTP 28 and
-  the host `erl` is OTP 29, so `:ezstd`'s `env.mk` make-target (generated via `erl -noshell -s init stop
-  -eval …`, an idiom OTP 29 no longer evaluates) fails ⇒ `skipped(emqx-requires-otp-28)`. Swapping the whole
-  toolchain (the OTP-28 store `erl` cannot be paired with the OTP-29-built Elixir/`mix`) is out of the
-  driver's scope; the reason/notes record the exact mechanism.
+- **`emqx` needs an OTP-28 toolchain.** It drives EMQX's real `make`/`mix` build, but the checkout pins OTP 28
+  (`erlang 28.5.0.7-2` in `.tool-versions` and `env.sh`) while the host `erl` is OTP 29, so `:ezstd`'s
+  `env.mk` make-target (generated via `erl -noshell -s init stop -eval …`, an idiom that prints nothing under
+  OTP 29 because `init stop` halts before the `-eval`) writes nothing and the build aborts ⇒
+  `skipped(emqx-requires-otp-28)`. Swapping the whole toolchain (the OTP-28 store `erl` cannot be paired with
+  the OTP-29-built Elixir/`mix`) is out of the driver's scope; the reason/notes record the exact mechanism.
+- **`khepri`'s suite may run under an Erlang other than the reported oracle.** The store `rebar3` is an
+  escript whose shebang points at an Erlang/OTP 28 `escript`, so it runs the Khepri suite under OTP 28 while a
+  `SysOnly` tool-driven row's `runtimes[]` version describes the driver's resolved oracle (`erl` on `PATH`,
+  OTP 29). The measured wall time is real; the reported runtime version on such a row describes the driver's
+  runtime, not necessarily the Erlang the external tool chose. No metric is fabricated.
 - **Cowboy** builds a relx release in the scratch copy (network fetch of cowlib+ranch); the release
   start script `foreground` **`exec`s** `erlexec`, so killing the spawned child stops the VM and its pid
   is the Erlang VM (so `VmHWM` polling works).
@@ -316,8 +335,8 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
   (`Runtimes::SysOnly`): `erlc_compiler` shells out to the system `erlc`, `elixir_compiler` to the installed
   `elixirc`. Nothing in the driver runs any compiler **under `beam_rt`**, so the crate exercises no compiler
   under the Rust runtime and no genuine self-hosted build. Genuine end-to-end `beam_rt` execution is confined
-  to `baseline`, `slice`, `foreign`, and `list_walk`; the full target apps (Cowboy release, EMQX, Khepri,
-  Elixir) are all `SysOnly` and report `skipped(runtime-unsupported)` under `rust`.
+  to `baseline`, `slice`, `foreign`, `list_walk`, `copy_bound` and `gc_bound`; the full target apps (Cowboy
+  release, EMQX, Khepri, Elixir) are all `SysOnly` and report `skipped(runtime-unsupported)` under `rust`.
 - `out/` is gitignored by `../../.gitignore` (`/tools/bench/out/`); the standard scratch artifact is
   `out/target-bench.json` (via `--out-file`). Durable, reviewable results go to the **tracked** `results/`
   directory (see `RESULTS.md`), which is for committed milestone numbers only.
@@ -328,17 +347,20 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
   `--help`, `--out-file`, error cases), `probe` decision helpers, `compare` (deltas), `scratch`
   (RAII/copy/skip), `http_load` (loopback keep-alive server + pure parsers), `workloads::tool`
   (tool/argv + the version-aware store ranking), `workloads::plb` (a run with no result JSON is a
-  *failed* row, never `ok`), `workloads::foreign` and `workloads::list_walk` (case tables, per-side argv,
-  the startup-cancelling per-call/per-element math, deterministic stdout).
+  *failed* row, never `ok`), `workloads::foreign`, `workloads::list_walk`, `workloads::copy_bound` and
+  `workloads::gc_bound` (case tables, per-side argv, the startup-cancelling per-op/per-call/per-element
+  math, deterministic stdout).
 - Library integration test: build a synthetic in-memory `Report`, serialize, reload, and compare —
-  hermetic, no oracle needed; plus the `Runtimes::Both` regression guard for `foreign`/`list_walk`.
-- Oracle-dependent smoke tests (`baseline`; `foreign`/`list_walk` per-runtime) run only when `erl`/`erlc`
-  resolve, and are a no-op skip otherwise, so `cargo test -p bench` stays green in any environment.
+  hermetic, no oracle needed; plus the `Runtimes::Both` regression guard for `foreign`, `list_walk`,
+  `copy_bound` and `gc_bound`.
+- Oracle-dependent smoke tests (`baseline`; `foreign`/`list_walk`/`copy_bound`/`gc_bound` per-runtime) run
+  only when `erl`/`erlc` resolve, and are a no-op skip otherwise, so `cargo test -p bench` stays green in any
+  environment.
 - Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p bench` GREEN and
   `... test --workspace` GREEN, plus a demonstrated `run --quick` producing real numbers for
-  `baseline`/`erlc_compiler`/`elixir_compiler`/`cowboy`/`khepri`/`plb`/`foreign`/`list_walk` and honest
-  `skipped(reason)` rows for the rest. The milestone gate is the `--full` run archived in `results/` and
-  summarised in `RESULTS.md`, which must be refreshed whenever the numbers change.
+  `baseline`/`erlc_compiler`/`elixir_compiler`/`cowboy`/`khepri`/`plb`/`foreign`/`list_walk`/`copy_bound`/
+  `gc_bound` and honest `skipped(reason)` rows for the rest. The milestone gate is the `--full` run archived
+  in `results/` and summarised in `RESULTS.md`, which must be refreshed whenever the numbers change.
 
 ## Runbook — reproducing the sys-vs-rust numbers
 
@@ -349,30 +371,31 @@ produced. Build both the driver and the Rust runtime once, then run the workload
 # 1. build the driver AND the runtime (from the repo root; the wrapper supplies a writable CARGO_HOME)
 erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --release -p beam_rt -p bench
 
-# 2. the FULL report (--full, BOTH runtimes, all 10 workloads) — minutes (host-load dependent)
+# 2. the FULL report (--full, BOTH runtimes, all 12 workloads) — minutes (host-load dependent)
 erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- \
-    run --full --runtime all --out-file erts_rust/tools/bench/results/m5-bench-full-runtimes-all.json --verbose
+    run --full --runtime all --out-file erts_rust/tools/bench/results/m6-bench-full-runtimes-all.json --verbose
 
 # 3. the FOCUSED cross-runtime report — the reliable source for sys-vs-rust tables:
-#    only the four cross-runtime workloads, so both sides see the same machine conditions
+#    only the six cross-runtime workloads, so both sides see the same machine conditions
 erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- \
-    run --full --runtime all --workloads baseline,slice,foreign,list_walk \
-    --out-file erts_rust/tools/bench/results/m5-bench-xrun.json --verbose
+    run --full --runtime all --workloads baseline,slice,foreign,list_walk,copy_bound,gc_bound \
+    --out-file erts_rust/tools/bench/results/m6-bench-xrun.json --verbose
 
 # 4. the tool-driven workloads (rebar3/dotnet resolve from the Nix store — no PATH prefix, no BENCH_TRY_NIX)
 erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- \
     run --quick --runtime sys --workloads khepri,plb \
-    --out-file erts_rust/tools/bench/results/m5-bench-plb.json --verbose
+    --out-file erts_rust/tools/bench/results/m6-bench-plb.json --verbose
+# (plb needs a .NET 9 SDK in the store: nix build --no-link nixpkgs#dotnet-sdk_9)
 # (emqx needs an OTP-28 host — here it reports skipped(emqx-requires-otp-28))
 
 # 5. compare (cross-runtime inside one report, or two files)
-erts_rust/target/release/bench compare erts_rust/tools/bench/results/m5-bench-xrun.json
+erts_rust/target/release/bench compare erts_rust/tools/bench/results/m6-bench-xrun.json
 ```
 
-`foreign` and `list_walk` run under **both** runtimes; every other repo workload is `sys`-only, so a
-`--runtime all` report shows a genuine sys-vs-rust row only for `baseline`, `slice`, `foreign`, and
-`list_walk`. Read the numbers as *reproducible on this host*, not milestone results (single host, finite
-sample counts).
+`foreign`, `list_walk`, `copy_bound` and `gc_bound` run under **both** runtimes; every other repo workload is
+`sys`-only, so a `--runtime all` report shows a genuine sys-vs-rust row only for `baseline`, `slice`,
+`foreign`, `list_walk`, `copy_bound` and `gc_bound`. Read the numbers as *reproducible on this host*, not
+milestone results (single host, finite sample counts).
 
 > **Always measure on a quiet host.** The benchmark host is shared and the absolute latencies move
 > several-fold with its load: the quiet primary run is the headline and the contended runs are the error
@@ -381,56 +404,59 @@ sample counts).
 > cross-runtime comparison — the focused `xrun` mitigates this.
 
 **Skip reasons on this host:** `emqx` → `skipped(emqx-requires-otp-28)` (EMQX pins OTP 28; host is OTP 29).
-Everything else probes ready; `khepri`/`plb` run once the store-scan resolution is in place.
+Everything else probes ready; `khepri` runs once the `rebar3` store entry is present and `plb` once a .NET 9
+SDK is realized in the store (`nix build --no-link nixpkgs#dotnet-sdk_9`).
 
 ## Measured — where the numbers live
 
 **`RESULTS.md` is the authoritative source for every measured number** (one table per workload category,
 the environment record, the exact reproduction commands, the `/proc/loadavg` record, the stability bounds
 and a "what these numbers do and do not mean" section). The raw harness JSON behind it is committed under
-`results/`: `m5-*` = the current run (the primary full run, the focused cross-runtime run, the PLB run at
-the default resolution, the superseded forced-SDK attempt, and the cross-runtime diff); `m4-*` = the
-previous run, kept as the regression baseline.
+`results/`: `m6-*` = the current run (the focused cross-runtime report, the per-target external-workload
+reports, the cross-runtime diff, and the `m6-tool-targets-notes.md`/`m6-load-record.md` records); `m5-*`/`m4-*`
+= the previous runs, kept as the regression baseline.
 This file deliberately restates none of those numbers — read them there, and regenerate with the Runbook
 above rather than quoting a stale copy.
 
 Structural facts that are not numbers (and so belong here):
-- `--runtime all` yields a genuine sys-vs-rust row only for the four `Runtimes::Both` workloads
-  (`baseline`, `slice`, `foreign`, `list_walk`); every other workload is `SysOnly` (see the table above).
+- `--runtime all` yields a genuine sys-vs-rust row only for the six `Runtimes::Both` workloads
+  (`baseline`, `slice`, `foreign`, `list_walk`, `copy_bound`, `gc_bound`); every other workload is `SysOnly`
+  (see the table above).
 - `baseline`'s compute loop is dominated by the natively-served `lists:seq/2` + `lists:sum/1`, so its
   near-parity result reads as the **native floor**, not interpreter throughput. The interpreter-throughput
   signals are `list_walk` (ns/element) and `foreign` (ns/call of real foreign code).
-- `slice` runs one call per process and `foreign`/`list_walk` loop many calls per process at a per-runtime
-  loop count `N`, so peak RSS is like-for-like only for `slice`.
+- `slice` runs one call per process, while `foreign`/`list_walk`/`copy_bound`/`gc_bound` loop many ops per
+  process at a per-runtime loop count `N`, so peak RSS is like-for-like only for `slice`.
 
 > **`ERTS_STDLIB_DIR` note (a real `beam_rt` behavior):** the Rust runtime resolves its system code path
 > by spawning `erl` once per OS process unless `ERTS_STDLIB_DIR` is pre-set, so that spawn is inside the
-> `_startup_ms` metric (and the `baseline`/`slice`/`foreign`/`list_walk` walls). `bench` does **not** set
-> it — the harness is a pure driver/observer and never mutates the runtime's environment beyond argv — and
-> the per-call/per-element metric cancels the cost.
+> `_startup_ms` metric (and the `baseline`/`slice`/`foreign`/`list_walk`/`copy_bound`/`gc_bound` walls). `bench`
+> does **not** set it — the harness is a pure driver/observer and never mutates the runtime's environment
+> beyond argv — and the per-op/per-call/per-element metric cancels the cost.
 
 ## Reading the current sys-vs-rust gap (verified)
 
-The `foreign` per-call and `list_walk` per-element gaps (their current values are in `RESULTS.md` §3.4/§3.5)
-are **real runtime costs, not harness artifacts**. The startup-cancelled metric reproduces with a plain
-shell loop calling `beam_rt -pa <dir> run <mod.beam> <mod>:<fun>/1 <N>` — so CLI re-entry, per-call module
-reloads and per-call GC are all ruled out. It is a `beam_rt` host-context cost: `beam_engine`'s interpreter
-dispatch is itself O(1) and allocation-free per instruction, and the runtime-side dispatch costs behind it
-are `beam_rt` measurements owned by `../../crates/beam_rt/CONTEXT.md` (measured via that crate's
-`examples/perf_bif.rs`), not `bench` output.
+The `foreign` per-call, `list_walk` per-element, and `copy_bound`/`gc_bound` per-op gaps (their current values
+are in `RESULTS.md` §3.4/§3.5) are **real runtime costs, not harness artifacts**. The startup-cancelled metric
+reproduces with a plain shell loop calling `beam_rt -pa <dir> run <mod.beam> <mod>:<fun>/1 <N>` — so CLI
+re-entry, per-call module reloads and per-call GC are all ruled out. It is a `beam_rt` host-context cost:
+`beam_engine`'s interpreter dispatch is itself O(1) and allocation-free per instruction, and the runtime-side
+dispatch costs behind it are `beam_rt` measurements owned by `../../crates/beam_rt/CONTEXT.md` (measured via
+that crate's `examples/perf_bif.rs`), not `bench` output.
 
 Consequence for reading results: startup latency is the trustworthy cross-runtime comparison for
-whole-process cost (and, on `slice`, peak RSS); the `foreign`/`list_walk` per-call/per-element rows are
-snapshots of the interpreter cost and should be re-run via the Runbook rather than adjusted.
+whole-process cost (and, on `slice`, peak RSS); the `foreign`/`list_walk`/`copy_bound`/`gc_bound`
+per-call/per-element/per-op rows are snapshots of the term-copy/interpreter/GC cost and should be re-run via
+the Runbook rather than adjusted.
 
 ## Known Issue — rust peak RSS scales with the loop count `N`
 
 `beam_rt` now has a **GC adoption** (`crates/beam_rt/src/runtime/gc.rs`, `context/gc.rs` — a per-process
 collector at the engine's heap-admission point), but it does **not bound peak RSS on the paths `bench`
 drives**: a controlled probe (a fresh list built and walked in a tail loop) reads rust peak `VmHWM`
-growing with `N` while the oracle stays flat. So the rust `foreign`/`list_walk` per-case
-`case_<name>_peak_rss_bytes` grows with the calibrated loop count and sits **above** the sys figures —
-these are **not** like-for-like memory comparisons. `slice` (one call per process, `N`=1) is the
+growing with `N` while the oracle stays flat. So the rust `foreign`/`list_walk`/`copy_bound`/`gc_bound`
+per-case `case_<name>_peak_rss_bytes` grows with the calibrated loop count and sits **above** the sys
+figures — these are **not** like-for-like memory comparisons. `slice` (one call per process, `N`=1) is the
 comparable per-process memory metric. The figures are in `RESULTS.md`.
 
 ## Honesty audit — measurement-integrity notes (current state)
@@ -443,9 +469,9 @@ Remaining labelling wrinkles — none fabricates a value:
 - **`foreign` maps an `erlc` compile failure to `skipped(sources-missing)`** (`src/workloads/foreign.rs:560`):
   when the sources *are* present but `erlc` fails, the row is a skip (the staging note carries the error),
   not `failed` — a real compile regression of the foreign sources can read as a benign skip. Contrast
-  `list_walk`, which treats the identical shape as `failed(module-compile-failed)`
-  (`src/workloads/list_walk.rs:509`), and `slice`, which maps a failed fixture rebuild to
-  `skipped(fixture-missing)` (`src/workloads/slice.rs:560`).
+  `list_walk`, `copy_bound` and `gc_bound`, which treat the identical shape as `failed(module-compile-failed)`
+  (`src/workloads/list_walk.rs:509`, `copy_bound.rs`, `gc_bound.rs`), and `slice`, which maps a failed fixture
+  rebuild to `skipped(fixture-missing)` (`src/workloads/slice.rs:560`).
 - **`erlc_compiler`'s `files_per_sec`/`loc_per_sec` divide the *attempted* file/LOC count** by the wall time
   (`src/workloads/erlc_compiler.rs:296,300`: `total_files`/`total_loc` from `files.len()`), not the
   `files_compiled` (produced `.beam`) count, so a partial `erlc` run overstates throughput relative to
@@ -458,15 +484,16 @@ Remaining labelling wrinkles — none fabricates a value:
 - `proc.rs:126` (`h.join().unwrap_or_default()`) collapses a panicked stdout/stderr drain thread to an empty
   string; the drain threads have no realistic panic path, so this is latent, not active.
 
-The `foreign`/`list_walk` per-call/per-element methodology is implemented exactly as `RESULTS.md` states
-(startup-cancelled `(mean wall@N − mean wall@0) / N`), and the registered-BIF `~116 ns/call` headline is
-**not** produced here — it is a `beam_rt` measurement (`../crates/beam_rt/CONTEXT.md`, `examples/perf_bif.rs`).
+The `foreign`/`list_walk`/`copy_bound`/`gc_bound` startup-cancelled methodology is implemented exactly as
+`RESULTS.md` states (startup-cancelled `(mean wall@N − mean wall@0) / N`), and the registered-BIF
+`~116 ns/call` headline is **not** produced here — it is a `beam_rt` measurement
+(`../crates/beam_rt/CONTEXT.md`, `examples/perf_bif.rs`).
 
 ## See Also
 - `RESULTS.md` → the current results summary (one table per workload category, exact reproduction
   commands, verified skip reasons, host-load record, stability, and "what these numbers mean").
 - `results/` → the raw harness JSON behind `RESULTS.md` (committed, so the numbers stay reviewable)
-  plus the `bench compare` diffs (`m5-*` current, `m4-*` previous).
+  plus the `bench compare` diffs (`m6-*` current, `m5-*`/`m4-*` previous).
 - `../CONTEXT.md` → the `tools/` node's binding shared conventions (runtime resolution, exit codes, JSON, `out/`).
 - `../../CONTEXT.md` §6/§7 → test strategy, the differential gate, staging.
 - `../../../ERTS_RUST_REWRITE_TEST_PROJECTS.md` → the concrete target workloads + build/bench entry points.
