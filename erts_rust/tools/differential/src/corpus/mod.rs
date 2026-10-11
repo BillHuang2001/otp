@@ -70,6 +70,7 @@
 //! | [`modules`] | A.2/A.1/A.7 — a freshly `erlc`-compiled module run under both runtimes |
 //! | [`mexec`] | A.2/A.7 — a *real* system stdlib/kernel module executed end to end |
 //! | [`records`] | A.1/A.2/A.7 — native records: the `records:*` BIFs + the native-record opcodes |
+//! | [`selfhost`] | A.9/A.2 — the E0 route of the self-hosted build: an *in-process* `compile:file/2` |
 //!
 //! A.3 is reachable **end to end**, not only through its raise surface: the [`nif_so`] group
 //! runs a compiled module that `erlang:load_nif/2`s a **real `.so`** (built into the case's
@@ -110,6 +111,7 @@ mod printing;
 mod proc_control;
 mod proc_signals;
 mod records;
+mod selfhost;
 mod semantics;
 mod system_info;
 mod terms;
@@ -433,6 +435,7 @@ fn build_corpus() -> Vec<Case> {
     cases.extend(mexec::group());
     cases.extend(mexec_extra::group());
     cases.extend(modules::group());
+    cases.extend(selfhost::group());
     cases
 }
 
@@ -667,6 +670,13 @@ mod tests {
                             // `stop`) evidences the driver C ABI end to end
                             // (see `super::driver_c`).
                             | Contract::DriverAbi
+                            // `selfhost` (A.9): a module-run case that compiles a module
+                            // **in-process** — `compile:file/2` in the calling process
+                            // (`no_spawn_compiler_process`, `deterministic`) writing the
+                            // object code into the case's own outdir — evidences the
+                            // build/bootstrapping contract directly: hosting that route is a
+                            // prerequisite of the self-hosted build (see `super::selfhost`).
+                            | Contract::Build
                     )),
                 "case {}: a module-run case may only claim the contracts it evidences",
                 case.id
