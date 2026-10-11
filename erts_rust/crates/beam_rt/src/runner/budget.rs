@@ -168,6 +168,26 @@ impl ExecutionContext for BudgetContext<'_, '_> {
     ) -> Result<Option<(Arc<Module>, Label)>> {
         ExecutionContext::resolve_external_call(self.inner, module, function, arity)
     }
+
+    /// Forwarded like every other method (the wrapper redirects only
+    /// [`ensure_heap`](ExecutionContext::ensure_heap)) — and **load-bearing** for the scheduled
+    /// path.
+    ///
+    /// The slice's machine runs on *this* wrapper, so the engine's `CallFun`/`CallFun2` arms
+    /// consult the closure resolver here: without the forward the engine would see the trait
+    /// default (`Ok(None)`) and fold a blocking local closure into the value-returning
+    /// [`apply_fun`](ExecutionContext::apply_fun) fallback, whose nested machine may not re-enter
+    /// the scheduler. Forwarding lets the engine `Step::Enter` the closure body **inside this
+    /// same machine**, so a `receive` in it suspends the process through the ordinary
+    /// [`RunOutcome::Wait`](beam_process::RunOutcome::Wait) path and it is resumed by a real send.
+    fn resolve_local_fun(
+        &mut self,
+        fun: Eterm,
+        args: &[Eterm],
+    ) -> Result<Option<(Arc<Module>, Label)>> {
+        ExecutionContext::resolve_local_fun(self.inner, fun, args)
+    }
+
     /// Charge one reduction, then serve the request by delegating — **arming the GC latch**
     /// for that one admission point first.
     ///
