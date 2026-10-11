@@ -414,6 +414,20 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
     spawn/harness lives in `tests/common/mod.rs`. All skip honestly (clear `eprintln`) only when `erl`
     is absent on `PATH`; never fake a pass. Opcodes/paths that cannot be exercised against a live peer
     are pinned by **byte-exact golden vectors** instead (labelled as such).
+  - `tests/two_node_loopback.rs` — the **hermetic two-node loopback** (contract A.5's "two connected
+    nodes", in one process, no `erl`/`epmd`, bounded waits): two named endpoints with distinct
+    creations handshake over a real loopback socket and exchange `DOP_REG_SEND`/`DOP_SEND(_SENDER)`
+    **both ways**; a monitor round-trip; a tick answered per side; a >`DIST_FRAGMENT_SIZE` message both
+    ways (`'E'` frames proven via a spy transport); an `InboundSink` routing a delivery
+    (`DeliveryOutcome::Delivered`, not `Unsupported`); a `ConnectionDriver` pair over two real
+    non-blocking `TcpStream`s; peer-death evidence (clean close → `Closed`, abrupt drop → typed error);
+    and the v6 "no `DOP_NODEUP`/`DOP_NODEDOWN`" pin.
+  - `tests/hermetic_epmd.rs` — a test-local `epmd` **registry stub** (an **independent** hand-written
+    request decoder / reply encoder, so the round-trip is not self-consistent by construction) driving
+    the crate's `EpmdClient` (`publish`/`port_please`/`names`/`stop`) hermetically, plus an **oracle
+    cross-check** that spawns a real node with `erl -epmd_port <stub>` and asserts the stub parsed the
+    node's `ALIVE2_REQ` and the crate's client resolved its port. Needs no host `epmd`; skips loudly
+    only when `erl` is absent.
 
 ## Design Decisions
 - **MD5 is implemented in-tree, not via a dependency.** The digest is one 16-byte hash; `md-5` would
