@@ -215,6 +215,28 @@ impl DriverMonitors {
         marked
     }
 
+    /// The distinct processes this port currently watches, in installation order.
+    ///
+    /// The runtime's exit sweep asks this for each port's watch set and tests every name it returns
+    /// against the live process table, so a dead monitored process can be marked through
+    /// [`DriverMonitors::note_process_exit`] without this module ever seeing that table. A pid
+    /// watched by several monitors is reported **once** (the number of monitors is not what the
+    /// sweep needs), and a nested borrow (impossible in practice — see
+    /// [`DriverMonitors::install`]) is answered empty, the same "no monitors" a caller reads from
+    /// [`DriverMonitors::has_pending`], never a panic.
+    pub fn monitored_pids(&self) -> Vec<ProcessId> {
+        let Ok(inner) = self.inner.try_borrow() else {
+            return Vec::new();
+        };
+        let mut pids: Vec<ProcessId> = Vec::new();
+        for entry in inner.entries.iter() {
+            if !pids.contains(&entry.pid) {
+                pids.push(entry.pid);
+            }
+        }
+        pids
+    }
+
     /// Whether this port holds any monitor on `pid` — the runtime's "does this port still watch that
     /// process" test.
     pub fn monitors(&self, pid: ProcessId) -> bool {

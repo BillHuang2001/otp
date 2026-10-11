@@ -164,6 +164,38 @@ pub(crate) fn register_control_port(
     name: &'static str,
     verbs: Vec<ControlVerb>,
 ) -> (PortId, Rc<Cell<libc::c_int>>) {
+    register_driver_port(runtime, name, verbs, None)
+}
+
+/// Registers a [`ControlDriver`] as a live `{spawn_driver, _}`-kind port that **holds the
+/// driver-monitor tree** `monitors`, so a test can drive the runtime's dead-monitor sweep
+/// ([`Runtime::drain_driver_monitor_exits`](crate::runtime::Runtime)) against a real port's
+/// metadata without a C compiler.
+///
+/// The tree is the caller's own handle (shared by `Rc` with the registered port, exactly as
+/// [`super::driver::DriverPort::monitors`] is with a real C host), so the caller can install
+/// monitors on it and read the marks the sweep leaves.
+///
+/// # Panics
+///
+/// As for [`register_control_port`].
+pub(crate) fn register_monitored_port(
+    runtime: &mut Runtime,
+    name: &'static str,
+    monitors: Rc<super::driver::DriverMonitors>,
+) -> PortId {
+    let (id, _flags) = register_driver_port(runtime, name, Vec::new(), Some(monitors));
+    id
+}
+
+/// The one body behind both fixtures above: a [`ControlDriver`] with `verbs` registered under
+/// `name`, carrying `driver_monitors` when the caller asked for a monitor tree.
+fn register_driver_port(
+    runtime: &mut Runtime,
+    name: &'static str,
+    verbs: Vec<ControlVerb>,
+    driver_monitors: Option<Rc<super::driver::DriverMonitors>>,
+) -> (PortId, Rc<Cell<libc::c_int>>) {
     let flags = Rc::new(Cell::new(0));
     let driver = ControlDriver {
         name,
@@ -179,11 +211,12 @@ pub(crate) fn register_control_port(
         monitors: Vec::new(),
         owner: OWNER,
         // No driver interned a name and no driver host emitted a term: this fixture only drives
-        // the control path, so both handles are absent — but the control-flag cell *is* shared,
-        // since that is exactly what `port_control` reads back.
+        // the control and monitor paths, so both handles are absent — but the control-flag cell
+        // *is* shared, since that is exactly what `port_control` reads back.
         driver_terms: None,
         driver_atoms: None,
         driver_control_flags: Some(Rc::clone(&flags)),
+        driver_monitors,
         input: Cell::new(0),
         output: Cell::new(0),
     };

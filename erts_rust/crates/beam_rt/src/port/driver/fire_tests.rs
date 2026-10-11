@@ -25,12 +25,14 @@
 //!
 //! # What is pinned, and where
 //!
-//! The runtime side that *marks* a monitor pending (the process-exit observer / scheduler-pass drain)
-//! is a higher scope's obligation, so every case here marks through the **shared**
-//! [`DriverMonitors`] handle the port seizes from the host — exactly the handle that scope will hold.
-//! The observable is the driver's own callback: a real C driver compiled at test time whose
-//! `process_exit` writes a marker-file line carrying the first 8 bytes of the `ErlDrvMonitor` the
-//! runtime handed it.
+//! The firing half is pinned here; the runtime's **marking** half (the pass-boundary sweep that
+//! turns a dead monitored process into a pending monitor) is pinned in `crate::port::monitor_tests`
+//! and, end to end through the production `open_port` path, by
+//! [`the_runtime_marks_a_dead_monitored_process_and_the_port_fires_process_exit`] below. Every other
+//! case here marks through the **shared** [`DriverMonitors`] handle the port seizes from the host —
+//! exactly the handle that sweep holds. The observable is the driver's own callback: a real C driver
+//! compiled at test time whose `process_exit` writes a marker-file line carrying the first 8 bytes of
+//! the `ErlDrvMonitor` the runtime handed it.
 //!
 //! * **fire once** — the port reports `has_pending_async() == true` for a marked monitor, a real
 //!   `beam_io` port-task round runs the drive point, the fixture writes its marker exactly once
@@ -41,7 +43,10 @@
 //!   state `driver_get_monitored_process` answers from);
 //! * **teardown** — after [`beam_io::Driver::stop`] nothing is pending and no later round writes a
 //!   marker; the same for an adapter dropped without `stop`;
-//! * **no spurious drive point** — a fresh port with no monitors answers `false`.
+//! * **no spurious drive point** — a fresh port with no monitors answers `false`;
+//! * **the production path, end to end** — a port opened through `open_port({spawn_driver, …})`
+//!   captures the driver's monitor tree in its metadata, the runtime's own sweep marks a watched
+//!   process that is not in the live table, and the very next port round fires the callback.
 //!
 //! # How the fixture reaches what it needs
 //!
@@ -49,7 +54,8 @@
 //! `-Wl,--export-dynamic`, so the fixture imports **no** `driver_*` symbol — and needs none, because
 //! `process_exit` receives its `ErlDrvData` state and the `ErlDrvMonitor *` as arguments. The one
 //! thing it cannot get from a callback is the marker-file path, which the test hands it in the
-//! loader's `command` string.
+//! loader's `command` string — as the whole command (the suite's own shape), or as the second token
+//! when the command is the production `open_port` name `<driver object> <marker path>`.
 //!
 //! # Skip policy
 //!
@@ -63,12 +69,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use beam_abi::{monitor_from_identity, monitor_identity, ErlDrvMonitor};
 use beam_alloc::Heap;
+use beam_bifs::PortHook;
 use beam_io::registry::PortRegistry;
 use beam_io::Poller;
-use beam_process::{PortId, ProcessId};
-use beam_term::AtomTable;
+use beam_process::{PortId, ProcessId, ProcessTable, SignalAtoms};
+use beam_term::{make_atom, AtomTable, NIL};
 
 use super::{DriverMonitors, DriverPort, DriverPortAdapter};
+use crate::config::RuntimeConfig;
+use crate::port::{RuntimePorts, PORT_POLL_SLICE};
+use crate::Runtime;
 
 /// The fixture: a driver whose entry declares a `process_exit` slot and records every firing in a
 /// marker file.
@@ -96,12 +106,19 @@ static rt_state rt_state_storage;
 
 static ErlDrvData rt_start(ErlDrvPort port, char *command) {
     rt_state *st = &rt_state_storage;
-    char marker[RT_MARKER_MAX];
-    marker[0] = '\0';
+    char first[RT_MARKER_MAX];
+    char second[RT_MARKER_MAX];
+    const char *marker;
+    first[0] = '\0';
+    second[0] = '\0';
     if (command == NULL)
         return (ErlDrvData) -1;
-    if (sscanf(command, "%511s", marker) != 1 || marker[0] == '\0')
+    /* One token is the marker path itself (the suite hands the loader the marker as the command);
+     * two are `<driver object> <marker path>`, the shape the production `open_port` name has — its
+     * first token is the object the driver was loaded from. */
+    if (sscanf(command, "%511s %511s", first, second) < 1 || first[0] == '\0')
         return (ErlDrvData) -1;
+    marker = (second[0] != '\0') ? second : first;
     st->marker_fd = open(marker, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (st->marker_fd < 0)
         return (ErlDrvData) -1;
@@ -740,5 +757,92 @@ fn a_port_with_no_pending_monitor_is_never_driven() {
         ..
     } = open;
     ports.close(&mut poller, id).expect("the port closes");
+    fixture.cleanup();
+}
+
+// ---------------------------------------------------------------------------------------------
+// The production marking route, end to end
+// ---------------------------------------------------------------------------------------------
+
+/// The runtime's own sweep and the port's drive point, together: a port opened through the
+/// **production** `open_port({spawn_driver, …})` path captures its driver's monitor tree in its
+/// [`PortMeta`](crate::port::PortMeta), the runtime's sweep marks a watched process the live table
+/// does not hold, and the **same** port round fires the fixture's `process_exit`.
+///
+/// Discriminates: with only the firing half (the state before the marking route existed) nothing
+/// called `note_process_exit` in production, so the marker file stayed empty however many rounds
+/// ran; and an `open_port` arm that did not seize `host.monitors()` would leave the sweep with no
+/// tree to mark, with the same empty marker.
+#[test]
+fn the_runtime_marks_a_dead_monitored_process_and_the_port_fires_process_exit() {
+    let Some(fixture) = build_fixture("rt_fire_runtime") else {
+        return;
+    };
+    let mut rt = Runtime::new(RuntimeConfig::default()).expect("the default runtime");
+    // A private table is enough: the provider only *decodes* the name with it, and the port is
+    // registered in the runtime's own registry (`Rc::clone(&rt.ports)`).
+    let mut atoms = AtomTable::new();
+    let tag = make_atom(atoms.intern("spawn_driver"));
+    let atoms = Rc::new(atoms);
+    let mut heap = Heap::new(512).expect("a test heap");
+    // The production `Name`: the prefix up to the first blank is the driver object to load, and the
+    // rest is the command the driver's `start` receives (here, the marker path).
+    let command = format!(
+        "{} {}",
+        fixture.stem.with_extension("so").display(),
+        fixture.marker.display()
+    );
+    let command = crate::port::charlist(&mut heap, &command).expect("a command string");
+    let name = heap.tuple(&[tag, command]).expect("a name tuple");
+
+    let owner = ProcessId::new(1, 0);
+    let mut hook = RuntimePorts::new(Rc::clone(&rt.ports), Rc::clone(&atoms), owner);
+    let id = hook
+        .open_port(name, NIL)
+        .expect("the fixture driver loads and registers through the production path");
+
+    // The port's metadata captured the real C host's monitor tree — shared by `Rc`, so this is the
+    // very tree `driver_monitor_process` installs into.
+    let monitors = {
+        let cell = Rc::clone(&rt.ports);
+        let registry = cell.try_borrow().expect("the port registry is free");
+        registry
+            .driver_monitors(id)
+            .expect("a C driver port seizes its driver's monitor tree")
+    };
+    let watched = ProcessId::new(4242, 0);
+    let expected = hex8(identity_of(&monitors.install(watched)));
+
+    let mut table = ProcessTable::new(SignalAtoms::from_table(rt.code_server_atoms_mut()));
+    assert!(
+        !table.contains(watched),
+        "the watched pid must not be a live process"
+    );
+
+    assert_eq!(
+        rt.drain_driver_monitor_exits(&table)
+            .expect("the sweep cannot fail"),
+        1,
+        "the runtime marks the watched process the live table does not hold"
+    );
+    assert!(
+        monitors.has_pending(),
+        "the mark is pending on the port's own monitor tree"
+    );
+
+    rt.deliver_port_messages(&mut table, PORT_POLL_SLICE)
+        .expect("the port round runs");
+    assert_eq!(
+        fixture.firings(),
+        vec![expected],
+        "the same round's port tasks fired the driver's `process_exit` with the very monitor the \
+         sweep marked"
+    );
+    assert!(
+        !monitors.has_pending(),
+        "the fired monitor was unlinked, exactly as the C unlinks it as it fires"
+    );
+
+    hook.close_port(id).expect("the port closes");
     fixture.cleanup();
 }

@@ -411,6 +411,21 @@ struct PortMeta {
     /// `None` for every port without a C driver (a `spawn`/`fd` port) — one whose `control` reply
     /// is the oracle's own `badarg`.
     driver_control_flags: Option<Rc<Cell<c_int>>>,
+    /// The monitor tree a `{spawn_driver, Name}` port's C driver holds on Erlang processes
+    /// (`driver_monitor_process`) — the C's per-port monitor list.
+    ///
+    /// Seized from the host with [`driver::DriverPort::monitors`] **before** the host is moved into
+    /// the port lifecycle (the boxed driver exposes no host), the same way
+    /// [`PortMeta::driver_terms`], [`PortMeta::driver_atoms`] and
+    /// [`PortMeta::driver_control_flags`] are. The runtime owns the *observing* half the hook seam
+    /// cannot reach — it holds the live process table — so it sweeps every monitored pid at the
+    /// scheduler-pass boundary ([`PortRegistry::note_driver_monitor_exits`]) and marks the ones the
+    /// table no longer holds, which is what makes the port's later drive point fire the driver's
+    /// `ErlDrvEntry::process_exit` callback.
+    ///
+    /// `None` for every port without a C driver (a `spawn`/`fd` port) and for a built-in driver
+    /// port, which holds no such tree.
+    driver_monitors: Option<Rc<driver::DriverMonitors>>,
     /// Cumulative bytes this port has delivered **into** Erlang — `port_info(Port, input)`.
     ///
     /// Bumped exactly where the node-global [`IoCounters::input`] is (the bytes of a
@@ -782,7 +797,57 @@ impl PortRegistry {
             .is_some_and(|flags| flags.get() & PORT_CONTROL_FLAG_BINARY != 0)
     }
 
-    /// The registry's port-number table, mutably — the seam the **port-monitor** BIFs drive.
+    /// The process-monitor tree a `{spawn_driver, Name}` port's C driver holds — the handle the
+    /// runtime **marks** a dead monitored process through, so the port's later drive point fires
+    /// `ErlDrvEntry::process_exit`.
+    ///
+    /// Taken before the driver host is boxed into the port lifecycle and stored in the port's
+    /// [`PortMeta`] ([`PortMeta::driver_monitors`]); shared by `Rc`, so this is the very tree the
+    /// driver's own `driver_monitor_process`/`driver_demonitor_process` hooks touch.
+    ///
+    /// `None` for an unknown port, for a `spawn`/`fd` port and for a built-in driver port — none of
+    /// which has a C driver that could hold a monitor.
+    pub(crate) fn driver_monitors(&self, id: PortId) -> Option<Rc<driver::DriverMonitors>> {
+        self.meta
+            .get(&id.number())
+            .and_then(|meta| meta.driver_monitors.as_ref())
+            .map(Rc::clone)
+    }
+
+    /// Marks every monitor a port's C driver holds on a process the live `table` **no longer
+    /// holds**, answering how many monitors were newly marked.
+    ///
+    /// This is the runtime's **observing** half of the A.4 monitor family: the driver hook seam
+    /// (`driver_monitor_process`) lets a C driver install a watch, but the per-port host holds only
+    /// its owning pid — not the process table — so *this* sweep is where a monitored process's death
+    /// is noticed. Every live port whose C driver holds monitors contributes its distinct watched
+    /// pids ([`driver::DriverMonitors::monitored_pids`]); each one the table does not hold is marked
+    /// through [`driver::DriverMonitors::note_process_exit`]. Both a monitor installed on a pid that
+    /// was already dead and a cascade of deaths since the last sweep are therefore marked, and
+    /// marking is **idempotent** — a second sweep marks nothing new, so a deferred one costs nothing
+    /// but a repeat.
+    ///
+    /// The mark is a fact about the port's own metadata, not a message: nothing is delivered, so the
+    /// caller (a scheduler pass, immediately before its port round) simply proceeds and the
+    /// **same** round's port tasks fire the driver's `process_exit` for the newly pending monitors
+    /// (the port asks for a drive point as soon as one is pending,
+    /// [`driver::DriverPortAdapter::has_pending_async`]).
+    pub(crate) fn note_driver_monitor_exits(&self, table: &ProcessTable) -> usize {
+        let mut marked = 0usize;
+        for number in self.meta.keys().copied() {
+            // Through the accessor, so "which ports even have a monitor tree" and "how one is read"
+            // stay one answer (a port without a C driver contributes nothing).
+            let Some(monitors) = self.driver_monitors(PortId::new(number)) else {
+                continue;
+            };
+            for pid in monitors.monitored_pids() {
+                if !table.contains(pid) {
+                    marked += monitors.note_process_exit(pid);
+                }
+            }
+        }
+        marked
+    }    /// The registry's port-number table, mutably — the seam the **port-monitor** BIFs drive.
     ///
     /// This is the **same** [`beam_process::PortTable`] instance
     /// [`beam_io::PortRegistry::open`] allocates from and [`PortRegistry::close`] releases
@@ -1745,11 +1810,12 @@ impl PortHook for RuntimePorts {
                     monitors: Vec::new(),
                     owner: self.owner,
                     kind: PortName::SpawnDriverBuiltin,
-                    // A built-in driver has no C host, so it has no term queue, interns no name and
-                    // sets no control flags.
+                    // A built-in driver has no C host, so it has no term queue, interns no name,
+                    // sets no control flags and holds no process monitors.
                     driver_terms: None,
                     driver_atoms: None,
                     driver_control_flags: None,
+                    driver_monitors: None,
                     input: Cell::new(0),
                     output: Cell::new(0),
                 };
@@ -1781,6 +1847,10 @@ impl PortHook for RuntimePorts {
             // callback through `set_port_control_flags`, and the runtime reads them back to pick
             // the reply's Erlang form (a list, or a binary in `PORT_CONTROL_FLAG_BINARY` mode).
             let driver_control_flags = host.control_flags();
+            // And for the monitors the driver may install through `driver_monitor_process`: the
+            // runtime sweeps this handle at the scheduler-pass boundary to mark a monitored process
+            // that has died, and the port's own drive point fires the driver's `process_exit`.
+            let driver_monitors = host.monitors();
             let adapter =
                 driver::DriverPortAdapter::load(&candidates, &driver_name, host, spec.command.clone())
                     .map_err(|_| BeamError::BadArg)?;
@@ -1797,6 +1867,7 @@ impl PortHook for RuntimePorts {
                 driver_terms: Some(driver_terms),
                 driver_atoms: Some(driver_atoms),
                 driver_control_flags: Some(driver_control_flags),
+                driver_monitors: Some(driver_monitors),
                 input: Cell::new(0),
                 output: Cell::new(0),
             };
@@ -1825,10 +1896,11 @@ impl PortHook for RuntimePorts {
             owner: self.owner,
             kind: spec.kind,
             // A `spawn`/`fd` port has no C driver, so it has neither driver term queue nor names
-            // a driver interned, nor control flags.
+            // a driver interned, nor control flags, nor process monitors.
             driver_terms: None,
             driver_atoms: None,
             driver_control_flags: None,
+            driver_monitors: None,
             input: Cell::new(0),
             output: Cell::new(0),
         };
@@ -1890,6 +1962,33 @@ impl Runtime {
             .iter()
             .map(|monitor| monitor.watcher)
             .collect())
+    }
+
+    /// Marks the driver monitors whose watched process has died, at a scheduler-pass boundary.
+    ///
+    /// This is the runtime's **observing** half of the A.4 monitor family (see
+    /// [`PortRegistry::note_driver_monitor_exits`]): it sweeps every live port's C-driver monitor
+    /// tree against the live `table` and marks each watched pid the table no longer holds, so the
+    /// **same** pass's port round fires the driver's `ErlDrvEntry::process_exit` for it. It must run
+    /// *before* [`Runtime::deliver_port_messages`] for that to happen in one round; nothing is
+    /// delivered here, so the pass does not go round again for it.
+    ///
+    /// The registry is taken with `try_borrow` on a **cloned** [`Rc`] (so the returned borrow is of
+    /// the clone, not of the runtime field) exactly like [`Runtime::port_monitors`]: a nested borrow
+    /// — an in-flight port BIF — is **deferred**, answering `Ok(0)` and leaving every tree as it was.
+    /// Nothing is lost by deferring: a mark is idempotent state in the port's own metadata, so the
+    /// next pass re-discovers the same dead pids.
+    ///
+    /// # Errors
+    ///
+    /// Never today: a live borrow is deferred rather than reported (there is no obligation to
+    /// discharge, only a repeated scan).
+    pub(crate) fn drain_driver_monitor_exits(&mut self, table: &ProcessTable) -> Result<usize> {
+        let cell = Rc::clone(&self.ports);
+        let Ok(registry) = cell.try_borrow() else {
+            return Ok(0);
+        };
+        Ok(registry.note_driver_monitor_exits(table))
     }
 
     /// Drives the port poller for up to `timeout` and **delivers** every message the ports
@@ -2330,6 +2429,11 @@ fn byte_count(count: u64) -> Result<Eterm> {
 #[cfg(test)]
 mod tests;
 
+/// The A.4 **driver-monitor marking** suite: the runtime's pass-boundary sweep over every live
+/// port's C-driver monitor tree (see `src/port/monitor_tests.rs`). A separate file so the suite
+/// does not grow this one.
+#[cfg(test)]
+mod monitor_tests;
 /// Test-only helpers for the provider's own suite and the native floor's port tests: a
 /// minimal always-ready driver and the port-registration helper (see `src/port/test_support.rs`).
 #[cfg(test)]
