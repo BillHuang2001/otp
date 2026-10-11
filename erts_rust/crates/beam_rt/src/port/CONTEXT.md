@@ -35,7 +35,7 @@ The `DriverHost` registry hooks carry the C's exact codes: `add_driver_entry`/`r
 The precise symbols of `driver.rs`:
 - `DriverPort` (`driver.rs:481`) — `impl beam_abi::DriverHost` (`driver.rs:720`); the concrete host behind
   the opaque `*mut ErlDrvPort_` a driver callback receives. The port handle **is** the per-port
-  `DriverEnv`'s address. Its `binary_to_term` (`driver.rs:760`) is the `beam_codec`-backed decode above.
+  `DriverEnv`'s address. Its `binary_to_term` (`driver.rs:760`) is the `beam_codec`-backed decode above. It also keeps the per-port monitor tree (`monitors()` → `driver::DriverMonitors`) and the `has_process_exit` flag its `monitor_process` hook answers from.
 - `Driver { library, host: Box<DriverPort> }` (`364`) — field order is load-bearing (`library` drops first).
 - `DriverPortAdapter` (`999`) — `impl beam_io::Driver` over a loaded C driver: `load`/`name`/`state`/`selected`,
   plus the callback mapping `start`/`output`/`ready_input`/`ready_output`/`control`/`timeout`/`stop`.
