@@ -501,6 +501,15 @@ pub unsafe extern "C" fn driver_compare_monitors(
 /// nothing — it is a copy, so the caller may drop the monitor immediately.
 ///
 /// The counterpart for the write side is [`monitor_from_identity`].
+//
+// The pointer-validity contract is the caller's, exactly as for the other raw-pointer ABI wrappers
+// of this crate (`crate::driver::loader` allows the same lint with the same rationale): a `NULL`
+// `mon` is accepted and answered with `None`, while a non-null operand must point at a live
+// `ErlDrvMonitor` — the same operand the C's `memcmp`/`sys_memcpy` dereferences (`io.c:6998`,
+// `io.c:7142`). The whole point of this accessor is that a `#![deny(unsafe_code)]` host
+// (`beam_rt`/`beam_io`) can read the identity without writing `unsafe`, so it must stay a safe
+// `pub fn`; the lint is allowed instead of marking it `unsafe fn`.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[must_use]
 pub fn monitor_identity(mon: *const ErlDrvMonitor) -> Option<[u8; REF_THING_COMPARE_BYTES]> {
     if mon.is_null() {
