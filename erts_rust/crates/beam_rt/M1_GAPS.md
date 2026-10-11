@@ -444,8 +444,14 @@ cross-module call or a fun application). The whole-file `file` family completes 
 process (`file:read_file/1`, `file:write_file/2`, `file:open/2` for read and write, `file:close/1`,
 `file:list_dir/1`, `file:get_cwd/0`, `file:consult/1`, `file:read_file_info/1`/`read_link_info/1` (an
 existing path `read_write`) and `filelib:is_file/1` — an existing path `true`, an absent one `false`);
-the incremental io-device read path completes on both routes for a pure `file:read/2` sequence and a
-pure `file:read_line/1` sequence (its mixed-order divergence is the item below).
+the incremental io-device read path agrees with the oracle on both routes — a pure `file:read/2`
+sequence, a pure `file:read_line/1` sequence and a **mixed** one (`file:read/2` after a
+`file:read_line/1`, and a bare `file:position(H,cur)`) — because the device is buffer-first:
+`reply_get_chars` consults the stashed read-ahead leftover before the OS file, and the `{position,At}`
+arm compensates for it (`cur` is answered logically; a successful seek clears the buffer). The one
+documented divergence left is `{get_chars,…}` on a `{encoding,unicode}` device, which counts **bytes**
+where the oracle counts **characters**
+([`src/native/file_server/CONTEXT.md`](src/native/file_server/CONTEXT.md)).
 
 ### Confirmed failing — root cause and repro
 1. **`logger` / `error_logger` cannot emit a report on a plain runtime.** `logger:warning/1`,`notice/1`,
@@ -466,18 +472,7 @@ pure `file:read_line/1` sequence (its mixed-order divergence is the item below).
    `{error,{not_started,sasl}}`. The native floor answers only the read-only queries (items in "Works
    today"); no application's `start/2` runs and no supervision tree becomes live. Repro:
    `ap:start_sasl/0`, `ap:start_syntax/0`, `ap:ensure_syntax/0`.
-3. **A `file:read/2` after a `file:read_line/1` returns `eof` where the oracle returns the remaining
-   bytes — a wrong result, on both routes.** With a `data.txt` of `line1\nline2\nrest`: `r0/0` opens the
-   file, `file:read(F,6)`, `file:read_line(F)`, `file:read(F,4)` → the oracle
-   `{{ok,"line1\n"},{ok,"line2\n"},{ok,"rest"}}`, this runtime `{{ok,"line1\n"},{ok,"line2\n"},eof}`;
-   `x1/0` (`file:read_line(F)` then `file:read(F,100)`) → the oracle `{ok,"line2\nrest"}`, this runtime
-   `eof`. A pure `read`/`read` sequence and a pure `read_line`/`read_line`/`read_line` sequence both
-   agree with the oracle on both routes, so only the two requests disagree on the device's position.
-   Root cause: `reply_get_chars` (`src/native/file_server.rs:662-694`) reads straight from the OS file
-   at its current offset and never consults the device's stashed read-ahead buffer, whereas the
-   `{get_line,…}` path (`src/native/file_server/get_line.rs`) reads ahead in chunks and stashes the tail.
-   Owned here (the native `file_server_2`).
-4. **`code:get_object_code/1` raises `badarg`** (oracle: `{Module,Binary,Filename}`); `code:which/1` and
+3. **`code:get_object_code/1` raises `badarg`** (oracle: `{Module,Binary,Filename}`); `code:which/1` and
    `code:load_file/1` are fine. `erlang:module_loaded/1` is truthful to this runtime's own loaded set, so
    `module_loaded(lists)` is `false` until `lists` is demanded (oracle: `true`).
 
@@ -488,8 +483,8 @@ including one reached through a **nested** run (a cross-module call or a fun app
 `receive` waiting for a message resumes correctly on both. The `unsupported: opcode: run: process
 blocked (no message available)` a scheduled `run` can still report (the A.9 E0 compile case) is a
 root-publication gap in a delivery-driven collection, not a route asymmetry. The incremental `file` read
-path agrees with the oracle on both routes for a pure read or a pure line sequence; its mixed-order
-divergence (item 3) is route-independent, so it is a `file_server_2` position bug.
+path agrees with the oracle on both routes — pure read, pure line and mixed order alike (the device is
+buffer-first).
 
 ## GC-relocation hazards (what a MOVING engine heap would invalidate)
 The engine's `alloc_words` seam funnels into ONE pointer-stable `Runtime::arena` (`MinimalContext`, chunked but never moved), which is why the stores below are safe today; routing `alloc_words` onto a per-process **moving** heap would dangle every store that pins a raw engine-arena `Eterm` outside the GC root set.
