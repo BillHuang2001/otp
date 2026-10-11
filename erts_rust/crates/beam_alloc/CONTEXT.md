@@ -325,10 +325,6 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
 - Allocation alignment is capped at the OS page size; super-aligned mappings are not carried through
   end-to-end (the `mseg` super-align constant/`is_super_aligned` predicate exist, the caller does not
   request them yet). The packed `bhdr` word bounds the largest encodable block (`block::MAX_BLOCK_SIZE`).
-- **`ReservedHeap` carries no growth policy and no interior-pointer fix-up** (by design): `try_grow`
-  only executes the host's request, and `relocate` is a rigid constant-delta move whose interior
-  pointers the host must re-base (or move via the collector's pointer-aware copy). No outer crate
-  drives a `ReservedHeap` yet — adoption is a host handoff (see Handoffs).
 - `erts_alloc`/`enif_alloc` **C ABI shims** are out of scope (owned by `beam_abi`); bit-level
   `SubBits`/`Bitstring` and the on-heap `BinRef` layout are out of scope (owned by `beam_term`).
 
