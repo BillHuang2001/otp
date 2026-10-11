@@ -157,25 +157,29 @@ SMP pool:
     guard makes both the no-relocation assertions and the defensive-entry assertions fail — verified
     during development, then restored). Deterministic — every size from the public heap-policy arithmetic,
     no sleeps / wall-clock bounds.
-29. `signal_exhaustion.rs` (4 tests) — the **signal builders' exhaustion policy**: the
-    `copy_reason_onto`/`build_signal_term`/`deliver_head_signal` paths (through the shared
-    `grow_receiver_for_signal`) treat a full receiver heap exactly as `Process::deliver` does. A
+29. `signal_exhaustion.rs` (4 tests) — the **signal builders' exhaustion policy** on the
+    *enqueue* side: `copy_reason_onto` (the reason copy a signal's enqueue performs into the
+    receiver's own heap) and the shared `grow_receiver_for_signal` treat a full receiver heap
+    exactly as `Process::deliver` does. A
     `{'EXIT', From, Reason}` whose copied reason is one word **larger** than the receiver's whole
     bounded nursery is delivered: the refused copy collected once (`minor_gcs` up), grew the nursery on
     demand to `next_heap_size(payload, 0)`, moved the base, and lands whole and exactly once in FIFO
     order ahead of a following delivery (`an_oversized_exit_reason_grows_the_receivers_nursery_and_is_delivered`);
     the same for a monitor `{'DOWN', …}` carrying a large reason
     (`an_oversized_down_reason_grows_the_watchers_nursery_and_is_delivered`). A **relocation-exempt**
-    receiver instead surfaces the **raw** `Err(BeamError::Alloc(AllocKind::Heap | Message))` and neither
-    `minor_gcs()` nor the nursery `base()` moves, nothing is written and nothing is enqueued
+    receiver cannot take that copy at all (its heap must not move, so it is never grown), so the raw
+    `Err(BeamError::Alloc(AllocKind::Heap | Message))` surfaces out of the **enqueue-time**
+    `copy_reason_onto`: neither `minor_gcs()` nor the nursery `base()` moves, nothing is written or
+    enqueued
     (`a_relocation_exempt_receiver_surfaces_the_raw_refusal_without_relocating`); and the typed failure
     leaves **no partial enqueue** (the signal is not queued, the mailbox is empty) with the receiver
     still delivering a fitting signal afterwards
     (`a_refused_signal_leaves_no_partial_state_and_the_receiver_still_delivers`). **Discriminating by
     construction: the two delivery tests FAIL (a typed `Alloc` out of `terminate`) the moment the
     builders only collect without growing, and the exemption test FAILS (a `relocation_exempt` raise
-    instead of the raw `Alloc`) the moment the short-circuit is removed.** Deterministic — every size
-    from the public heap-policy arithmetic, no sleeps / wall-clock bounds / oracle.
+    instead of the raw `Alloc`) the moment the short-circuit is removed.** The exemption case here is
+    the **enqueue-time** refusal only; the apply-time build's own exempt fallback (which *does* deliver)
+    is entry 39. Deterministic — sizes from the public heap-policy arithmetic, no sleeps / oracle.
 30. `gc_refc_binary_message.rs` (1 test) — the collection's **mailbox rebuild preserves a queued
     message's off-heap ownership**. A 200-byte payload (> `ERL_ONHEAP_BINARY_LIMIT` = 64, so its bytes
     live in an off-heap counted `beam_alloc::RefcBinary`) is written as the 8-word `[BinRef][ErlSubBits]`
@@ -231,7 +235,7 @@ SMP pool:
     monitor still listed) the moment the per-peer `?`-propagation is restored.** Deterministic —
     the refusal size is the exempt peer's own bounded nursery capacity + 1 word, no sleeps /
     wall-clock bounds / oracle.
-33. `message_relocation.rs` (4 tests) — the collection's **queued-message re-install**: a collection
+34. `message_relocation.rs` (4 tests) — the collection's **queued-message re-install**: a collection
     (`Process::collect`/`ensure_capacity` via `run_rooted_collection`) must carry a queued message's
     **whole envelope** — it re-installs each message with `Message::with_payload`, so a fragment-resident
     payload keeps its `Fragments` chain and a heap-resident one keeps its refc-binary/node lists. A
@@ -251,21 +255,21 @@ SMP pool:
     `Message::new(payload, from).with_token(..).with_off_heap(..)` form, which drops `fragments`/
     `binaries`/`nodes`) — verified by temporarily restoring step 6, then reverting. Deterministic — the
     fragment/ownership assertions, no sleeps / wall-clock bounds / oracle.
-34. `off_heap_send_isolation.rs` (2 tests) — the **send-path staging-table isolation**: `Process::deliver`
+35. `off_heap_send_isolation.rs` (2 tests) — the **send-path staging-table isolation**: `Process::deliver`
     stages its copy through a fresh per-send `OffHeapTable`, so a send must NOT drain the receiver's
     **persistent** off-heap table (a queued signal's reason objects / a host's moved-fragment objects). A
     200-byte refc binary pushed onto `process.off_heap_mut()` stays present with the same
     `data_ptr`/refcount after a delivery to that same process, and the queued message owns only what it
     copied (a payload that really references an off-heap binary is still captured). **Both tests FAIL on
     the pre-fix code** (which passed `self.off_heap` as the drained destination) — verified by reverting.
-35. `message_from_is_immediate.rs` (6 tests) — every signal path's `Message::from` is an **immediate**
+36. `message_from_is_immediate.rs` (6 tests) — every signal path's `Message::from` is an **immediate**
     (the C's `is_immed(ERL_MESSAGE_FROM)` invariant) and survives a collection: a named-monitor DOWN
     (`from == target.to_eterm()`, body still `{Name,Node}`), an ordinary-monitor DOWN, a failed-by-name
     named-monitor DOWN (`from == system`), a remote DOWN and a remote EXIT (`from == node`, body still the
     external pid), and the collection case (a nursery GC then `is_immediate(from)` + `from` unchanged,
     the relocated payload still carrying `{Name,Node}`). **5 of the 6 FAIL on the pre-fix code** (which
     stored an on-heap `from`) — verified by reverting.
-36. `collector_dispatch.rs` (4 tests) — the **GC strategy dispatch on the production `Process`
+37. `collector_dispatch.rs` (4 tests) — the **GC strategy dispatch on the production `Process`
     path**: `Process` owns a `beam_gc::AnyCollector`, so the mature generation a real process collects
     with is the one its heap policy resolves to. (i) `a_runtime_spawned_process_selects_the_strategy_its_policy_implies`
     spawns through the production entry point (`ProcessTable::spawn(policy)`) and asserts
@@ -284,7 +288,7 @@ SMP pool:
     drives three real **GenImmix fullsweeps** through `Process::collect` (`CollectionKind::Major`).
     Deterministic — the strategy/kind assertions and the fixed collect counts, no sleeps / wall-clock
     bounds / oracle.
-37. `off_heap_binaries.rs` (9 tests) — the **process-owned off-heap refc-binary list and its sweep**
+38. `off_heap_binaries.rs` (9 tests) — the **process-owned off-heap refc-binary list and its sweep**
     (`Process::register_off_heap_binary`/`off_heap_binary`/`off_heap_binaries`/`off_heap_binary_count`/
     `off_heap_binary_bytes`/`declare_off_heap_binary_dead`/`sweep_off_heap_binaries`/
     `retain_off_heap_binaries`, over the `beam_gc::OffHeap` the process owns). **(Acceptance 1)**
@@ -311,6 +315,27 @@ SMP pool:
     Deterministic — a fixed position-dependent payload, an injected allocator, explicit
     `collect()`/sweep calls; no sleeps / wall-clock bounds / oracle.
 
+39. `signal_fragment_fallback.rs` (3 tests) — the **heap-fragment fallback on the signal-application
+    path** (`build_signal_message` / `enqueue_fragment_signal` / the queued `deliver_head_signal`) for a
+    **relocation-exempt** receiver: an apply-time build its heap refuses is instead built on a 64-word
+    scratch arena and copied **whole** into a fresh `beam_message::HeapFragment` the queued `Message`
+    owns (the C's model — `erl_proc_sig_queue.c` builds every signal message into the message's own
+    fragment) rather than being lost. A **controlled experiment** on a 7-word nursery drained to one
+    word short of the four-word head build, each case first asserting that refusal and that a refused
+    request writes nothing: (1) an exempt watcher still receives its
+    `{'DOWN', Ref, process, Target, noproc}` — exactly once, FIFO behind the fixture's filler, the
+    five-tuple structurally equal to the expected one (`compare::eq`, so the boxed reference compares by
+    content), `fragments().is_some()` with `fragment.contains(payload)`, while
+    `minor_gcs()`/`young().base()`/`heap_used_words()` are **unchanged**; (2) the same for a trapping
+    receiver's `{'EXIT', Dying, normal}`; (3) the **non-exempt contrast** — the identical refusal takes
+    the other arm: `minor_gcs()` up by exactly one, the nursery grown to `next_heap_size(reserve, 0)`
+    and relocated (`base()` moved), the filler promoted to mature, the EXIT built on the **new** nursery
+    (`fragments()` is `None`, `contains_term(payload)` young, not mature) — so the fallback did not
+    replace the grow-and-retry path. **Discriminating by construction: against the pre-fix commit
+    `360a4c6536`, cases 1 and 2 FAIL with the raw `Alloc(AllocFailure { requested: 32, kind: Heap })`
+    out of `terminate` (signal lost) while case 3 passes.** Deterministic — sizes from the public
+    heap-policy arithmetic, no sleeps / wall-clock bounds / oracle.
+
 ## Constraints
 - **Anti-flakiness (BINDING).** Every assertion is forced by **synchronization**, never a bare
   `std::thread::sleep`: `mpsc` channels + `recv_timeout` carry the completion signals,
@@ -329,16 +354,21 @@ SMP pool:
 - Run the whole crate gate with
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_process` (never `cd`,
   sandbox `$HOME` is read-only). Cross-checks against the real system ERTS belong to the sibling
-  `../../../tools/differential/` harness, not here. Current: **441 passed, 0 failed, 1 ignored**.
+  `../../../tools/differential/` harness, not here. Current: **463 passed, 0 failed, 1 ignored** (166 in-module unit tests + 296
+  across the 39 integration targets here + 1 doctest; the single ignore is the documented
+  non-yielding-runner hang failure mode in `preemption.rs`).
 
 ## Routing Table
 - `scheduler.rs`, `messaging.rs`, `signals.rs`, `gc.rs`, `priority.rs`, `pending_signals.rs`,
   `preemption.rs`, `dict.rs`, `fragments.rs`, `scheduler_ports.rs`, `exhaustion.rs`,
-  `signal_exhaustion.rs`, `gc_exemption.rs`, `message_relocation.rs`, `gc_refc_binary_message.rs`,
+  `signal_exhaustion.rs`, `signal_fragment_fallback.rs`, `gc_exemption.rs`, `message_relocation.rs`,
+  `gc_refc_binary_message.rs`,
   `off_heap_send_isolation.rs`, `message_from_is_immediate.rs`, `off_heap_binaries.rs` →
   the single-threaded scheduler (incl. the port-aware slice cleanup), mailbox, signals, GC roots, PCB state,
   pre-emption/fairness, the collect-grow-and-retry exhaustion path of `Process::deliver` and the
-  `{'EXIT',…}`/`{'DOWN',…}` signal builders, the host-controllable GC relocation exemption, the
+  `{'EXIT',…}`/`{'DOWN',…}` signal builders (both the enqueue-time reason copy and the
+  relocation-exempt receivers' apply-time heap-fragment fallback), the host-controllable GC relocation
+  exemption, the
   collection's queued-message re-install (a fragment-resident/off-heap-owning message keeps its whole
   envelope across a collect), and the **process-owned off-heap refc-binary list** (registration, the
   caller-declared sweep on the collection path, slot stability, and the conservative predicate)
