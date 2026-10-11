@@ -499,7 +499,9 @@ fn refc_binary_words(t: Eterm, ctx: &CopyContext<'_>) -> usize {
     } else {
         heap_bits_size_words(end.raw().saturating_sub(start.raw()))
     }
-}/// Copies the refc-binary term `src` (the 8-word `[BinRef(3)][ErlSubBits(5)]` pair whose root is
+}
+
+/// Copies the refc-binary term `src` (the 8-word `[BinRef(3)][ErlSubBits(5)]` pair whose root is
 /// the `ErlSubBits`) onto `to`, **sharing** its off-heap payload.
 ///
 /// Ground truth: `copy.c:812-848`. The source `BinRef.val` is the payload's first data byte; the
