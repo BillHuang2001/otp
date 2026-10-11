@@ -592,8 +592,8 @@ constructors only (no new error enum).
 - `src/space.rs` → `HeapSpace` (copying semi-space over `beam_alloc::Heap`) + `FromSet`
 - `src/nursery.rs` → `Nursery`: the young nursery as a **chain of spaces** — the **no-relocation** growth seam (`grow`), the collapse to one space after a collection (`collapse`), and the every-space range test / from-set (`spaces`/`contains`/`add_to_from_set`/`used_words`/`capacity_words`)
 - `src/copy.rs` → the Cheney copy engine: `Copier`, `forward_roots`/`complete`, `collect`, and the copy-specific `pub(crate)` primitives; all per-object sizing/walking is delegated to `beam_term::layout`
-- `src/collector.rs` → the two-generation `Collector`: minor/major driver, bounded nursery re-size, mature sizing from the `live.rs` exact count, capacity pre-check, `ensure_capacity`
-- `src/live.rs` → the **exact-live counter** (`live`/`live_full` + `Live { words, lines }`); its `#[cfg(test)]` module pins it against a real collection, incl. the mature generation and a relocating major
+- `src/collector.rs` → the two-generation `Collector`: minor/major driver over the nursery chain, bounded nursery collapse, mature sizing from the `live.rs` exact count, capacity pre-check, `ensure_capacity`/`grow_nursery`, `young_contains`/`young_space_count`
+- `src/live.rs` → the **exact-live counter** (`live`/`live_full` + `Live { words, lines }`); its `#[cfg(test)]` module pins it against a real collection, incl. the mature generation, a relocating major and a **chained nursery**
 - `src/config.rs` → GC-strategy seam: `GcConfig`, `MatureKind`, `MatureSelection`, `mature()`/`mature_choice()`, `growable`
 - `src/selection.rs` → the **automatic rule**: `IMMIX_BREAK_EVEN_WORDS`/`IMMIX_BREAK_EVEN_BLOCKS`, `select_mature`, `mature_words_of`, `resolve_mature`/`choice_for`, `MatureSource`, `MatureChoice`
 - `src/immix/mod.rs` → `ImmixSpace` geometry, block metadata, line-granular allocation, accounting views (`ImmixStats`/`ImmixCounters`)
