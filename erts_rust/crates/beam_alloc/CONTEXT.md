@@ -408,4 +408,3 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
   `push_children` reads `*base.add(i)` for `i in 0..count`, guarded only by the documented "live word"
   caller invariant (an OOB read/hang, not a wrap) — the `beam_term` owner may want an arity
   plausibility bound.
-- **`beam_gc`:** expected to replace its own `RefCount` with `pub use beam_alloc::RefCount;`.
