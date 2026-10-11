@@ -138,6 +138,10 @@ fn match_spec_compile_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eter
 /// non-reference. `List` must be a proper list; anything else is `badarg` (raised
 /// by [`beam_ets::match_spec_run`]).
 fn match_spec_run_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    // The stored spec's guards/bodies may compute arithmetic; install this crate's
+    // arbitrary-precision `ArithHook` over `beam_ets` for the run
+    // (`super::arith_hook`).
+    let _arith = super::arith_hook::PrecisionArith::install();
     let handle = ref_thing_id(args[1])?;
     let raw = {
         let tables = ctx.tables().ok_or_else(unsupported_bif)?;
@@ -172,6 +176,7 @@ fn match_spec_run_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// does not know (a table handle, a continuation, a forged id) and any
 /// non-reference. `List` must be a proper list or `[]`; anything else is `badarg`.
 fn match_spec_run_r_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let _arith = super::arith_hook::PrecisionArith::install();
     let handle = ref_thing_id(args[1])?;
     let raw = {
         let tables = ctx.tables().ok_or_else(unsupported_bif)?;

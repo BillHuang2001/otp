@@ -80,6 +80,10 @@ pub(super) fn register(reg: &mut BifRegistry) {
 /// outside the supported subset is `badarg`, as is an unknown or non-table first
 /// argument.
 fn select_reverse_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    // The spec's guards/bodies may compute arithmetic; install this crate's
+    // arbitrary-precision `ArithHook` over `beam_ets` for the traversal
+    // (`super::arith_hook`).
+    let _arith = super::arith_hook::PrecisionArith::install();
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let spec = compile(args[1], ctx.atoms())?;
     let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
@@ -101,6 +105,7 @@ fn select_reverse_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// that direction: a backward walk for an `ordered_set`, and for a hash kind the
 /// same sequence the forward walk would give (see the module docs).
 fn select_reverse_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let _arith = super::arith_hook::PrecisionArith::install();
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let spec = compile(args[1], ctx.atoms())?;
     // A non-integer or a negative limit is `badarg` here; `0` is rejected by
