@@ -30,11 +30,13 @@ use std::path::{Path, PathBuf};
 use crate::workload::Workload;
 
 pub mod baseline;
+pub mod copy_bound;
 pub mod cowboy;
 pub mod elixir_compiler;
 pub mod emqx;
 pub mod erlc_compiler;
 pub mod foreign;
+pub mod gc_bound;
 pub mod khepri;
 pub mod list_walk;
 pub mod plb;
@@ -124,6 +126,8 @@ pub fn registry() -> Vec<Box<dyn Workload>> {
         Box::new(slice::Slice),
         Box::new(foreign::Foreign),
         Box::new(list_walk::ListWalk),
+        Box::new(copy_bound::CopyBound),
+        Box::new(gc_bound::GcBound),
     ]
 }
 
@@ -200,7 +204,9 @@ mod tests {
                 "emqx",
                 "slice",
                 "foreign",
-                "list_walk"
+                "list_walk",
+                "copy_bound",
+                "gc_bound"
             ]
         );
     }
