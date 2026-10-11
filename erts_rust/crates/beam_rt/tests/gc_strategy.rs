@@ -48,18 +48,24 @@
 //!    `beam_rt` process before the configuration knobs existed;
 //! 3. a runtime whose `HeapOptions` carry the Immix policy selects `MatureKind::Immix`, from
 //!    the automatic rule (**not** a pin) — the assertion with no pre-change counterpart;
-//! 4. the boundary one word below the break-even still selects `MatureKind::Copying`.
+//! 4. the boundary one word below the break-even still selects `MatureKind::Copying`;
+//! 5. the config-implied mark-region strategy really **runs** a fullsweep workload;
+//! 6. a **live payload** survives real collections on the mark-region path, across a
+//!    fullsweep on every collection, with every element verified — the correctness evidence
+//!    for the Immix path end to end (see [`a_live_payload_survives_a_fullsweep_on_the_immix_path`]).
 //!
-//! Nothing here measures time: the work is a spawn and a table read, so the suite is
-//! deterministic (no wall-clock assertion anywhere).
+//! Nothing here measures time: the work is a spawn, some scheduler slices and a table read,
+//! so the suite is deterministic (no wall-clock assertion anywhere).
 //!
-//! # Fixture
+//! # Fixtures
 //!
-//! The process is spawned at the committed `tests/fixtures/heap_growth.beam` (`run/1`, the
-//! growth loop `tests/heap_growth.rs` uses — see `tests/fixtures/README.md` for the recipe),
-//! loaded through the runtime's own `load_module`, and **not** run: the strategy is fixed when
-//! the process is created, so spawning it is the whole workload. A missing system Erlang
-//! installation is a **loud skip**, never a silent pass.
+//! Acceptances 1–4 spawn a process at the committed `tests/fixtures/heap_growth.beam` (`run/1`,
+//! the growth loop `tests/heap_growth.rs` uses) and **never** run it: the strategy is fixed when
+//! the process is created, so spawning it is the whole workload. Acceptance 5 runs that fixture
+//! as a real scheduled process; acceptance 6 runs the committed
+//! `tests/fixtures/gc_payload.beam` (`run/1`, a long-lived payload plus short-lived churn — see
+//! `tests/fixtures/README.md` for the recipe). Every fixture is loaded through the runtime's own
+//! `load_module`. A missing system Erlang installation is a **loud skip**, never a silent pass.
 
 // The shared helper module is compiled into every integration-test binary, so this binary
 // would otherwise warn on the entry points it does not call.
@@ -79,6 +85,20 @@ const HEAP_GROWTH_BEAM: &str = concat!(
     "/tests/fixtures/heap_growth.beam"
 );
 
+/// The runtime-shaped GC workload: `run(N)` builds a 64-element long-lived payload, churns N
+/// rounds of short-lived garbage while keeping it live, and returns the payload.
+const GC_PAYLOAD_BEAM: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/gc_payload.beam"
+);
+
+/// [`GC_PAYLOAD_BEAM`]'s payload element count (`gc_payload:payload_length/0`).
+const PAYLOAD_LENGTH: i64 = 64;
+
+/// The churn rounds acceptance 6 runs — enough for many collections at the 233-word default
+/// nursery, with `fullsweep_after(0)` making every one of them a fullsweep.
+const PAYLOAD_ROUNDS: i64 = 200;
+
 /// The emulator's default initial mature-generation size in words — the `beam_gc` default
 /// [`HeapOptions::default`] carries, and a value far below the break-even.
 const DEFAULT_INITIAL_MATURE_WORDS: usize = 233;
@@ -92,17 +112,22 @@ const WORKLOAD_ITERATIONS: i64 = 500;
 /// (the loop finishes in milliseconds), never a performance assertion.
 const WORKLOAD_DEADLINE: Duration = Duration::from_secs(120);
 
-/// A runtime with `config` and the fixture loaded, or `None` after a loud skip.
+/// A runtime with `config` and the fixture `beam` loaded, or `None` after a loud skip.
 ///
 /// The runtime is built through the crate's **own** path (`Runtime::new` → `boot` →
 /// `load_module`), never from a hand-built process or collector, so what the assertions read
 /// is what the real runtime creates.
-fn runtime_with(config: RuntimeConfig) -> Option<Runtime> {
+fn runtime_with_fixture(config: RuntimeConfig, beam: &str) -> Option<Runtime> {
     support::require_oracle("gc_strategy")?;
     let mut rt = Runtime::new(config).expect("the runtime");
     rt.boot().expect("the boot sequence runs");
-    rt.load_module(HEAP_GROWTH_BEAM).expect("the fixture loads");
+    rt.load_module(beam).expect("the fixture loads");
     Some(rt)
+}
+
+/// [`runtime_with_fixture`] on the strategy-probe fixture.
+fn runtime_with(config: RuntimeConfig) -> Option<Runtime> {
+    runtime_with_fixture(config, HEAP_GROWTH_BEAM)
 }
 
 /// What a live process's collector reports about its mature-generation strategy.
@@ -405,4 +430,98 @@ fn the_config_implied_strategy_runs_a_fullsweep_workload() {
         "fullsweep_after 0 makes every collection a fullsweep; {immix_run:?}"
     );
     assert_no_gc_failures(&immix_rt, &immix_run);
+}
+
+/// **Acceptance 6 — a LIVE payload survives real collections on the mark-region path.**
+///
+/// Acceptances 3–5 prove the *strategy*; this one proves the mark-region path **collects a
+/// running process correctly**, which is a different claim: the strategy test never runs a
+/// process at all, and the fullsweep test of acceptance 5 runs a workload whose whole live
+/// set is a single integer. Here a **live, structurally checkable payload** — the 64-element
+/// list `tests/fixtures/gc_payload.beam`'s `run/1` builds and keeps reachable across every
+/// round of short-lived churn — is held across real collections driven by the runtime's own
+/// GC doors (the engine's heap-admission point), with `fullsweep_after(0)` so **every**
+/// collection is a fullsweep — the one collection that touches (and, on this strategy,
+/// relocates or pins) the mature generation the payload is promoted into.
+///
+/// Asserted: the process's own collector really is the mark-region one while it runs; the
+/// workload returned its payload; **every element of that payload is intact**; the run drove
+/// collections and fullsweeps (`gc_stats().collections > 0`, `major == collections`); and no
+/// collection failed, halted a process or tripped a valve.
+///
+/// The payload check is deliberately structural rather than `x(0) == N`: a collection that
+/// relocated the heap against an incomplete root set would leave the payload's X/Y register
+/// (or a pointer it holds) dangling, so the term would come back with a wrong element, a
+/// wrong field, or not be a proper list at all — the assertion genuinely fails in that case.
+///
+/// **The assertion with no pre-change counterpart** is `the process's collector is
+/// `MatureKind::Immix`` **while it holds a live payload across a fullsweep**: before the
+/// configuration knobs, the runtime's own path could not reach the mark-region strategy at
+/// all (`initial_mature_words` was fixed at the emulator default, far below the break-even),
+/// so no live-payload collection could ever run on the Immix path.
+#[test]
+fn a_live_payload_survives_a_fullsweep_on_the_immix_path() {
+    if host_opted_into_immix("gc_strategy") {
+        return;
+    }
+    let config = RuntimeConfig::new().with_heap_options(
+        HeapOptions::new()
+            .with_initial_mature_words(IMMIX_BREAK_EVEN_WORDS)
+            .with_fullsweep_after(0),
+    );
+    let Some(mut rt) = runtime_with_fixture(config, GC_PAYLOAD_BEAM) else {
+        return;
+    };
+    let before = rt.gc_stats();
+    let pid = rt
+        .spawn_process("gc_payload", "run", vec![make_small(PAYLOAD_ROUNDS)])
+        .expect("the payload workload is spawned");
+
+    // The strategy is fixed at spawn time; the collection counters are cumulative, so the
+    // last sample taken **while the process is still in the table** (the scheduler removes a
+    // terminated process at once) reports the whole run.
+    let mut kind = None;
+    let mut fullsweeps = 0u64;
+    let deadline = Instant::now() + WORKLOAD_DEADLINE;
+    while rt.process_result(pid).is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "gc_payload:run/1 with N={PAYLOAD_ROUNDS} did not terminate within {}s",
+            WORKLOAD_DEADLINE.as_secs()
+        );
+        rt.run_one_slice().expect("a scheduler slice runs");
+        if let Some(process) = rt.processes().get(pid) {
+            let collector = process.collector();
+            kind = Some(collector.kind());
+            fullsweeps = collector.stats().major_collections;
+        }
+    }
+
+    // 1. The mark-region strategy really ran the process.
+    assert_eq!(
+        kind,
+        Some(MatureKind::Immix),
+        "the spawned process must collect with the configured mark-region strategy"
+    );
+    // 2. It really ran fullsweeps on that strategy.
+    assert!(
+        fullsweeps > 0,
+        "fullsweep_after 0 makes every collection a fullsweep; saw {fullsweeps}"
+    );
+    // 3. The payload came back intact, element by element.
+    let payload = rt.process_result(pid).expect("the workload returned its payload");
+    support::check_gc_payload(payload, PAYLOAD_LENGTH);
+    // 4. The runtime's own counters agree, and nothing failed.
+    let after = rt.gc_stats();
+    let collections = after.collections - before.collections;
+    assert!(collections > 0, "the workload really collected; {after:?}");
+    assert_eq!(
+        after.major - before.major,
+        collections,
+        "fullsweep_after 0 makes every collection a fullsweep; {after:?}"
+    );
+    assert_eq!(after.errors, 0, "no collection failed; {after:?}");
+    assert_eq!(after.halted, 0, "no process halted its collection; {after:?}");
+    assert_eq!(after.valve_trips, 0, "no escape-store valve tripped; {after:?}");
+    assert!(!after.disabled, "collection was never disabled; {after:?}");
 }
