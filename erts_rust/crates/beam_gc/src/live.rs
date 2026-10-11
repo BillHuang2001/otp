@@ -871,4 +871,110 @@ mod tests {
             assert_eq!(stats.objects_copied, 2, "len = {len}: the SubBits and its BinRef");
         }
     }
+
+    // -----------------------------------------------------------------------
+    // The CHAINED nursery (a growth-retained space) — the hole the counter had
+    // -----------------------------------------------------------------------
+    //
+    // Every test above counts a **single** from-space. A growth
+    // ([`crate::nursery::Nursery::grow`], reached through
+    // [`Collector::grow_nursery`](crate::Collector::grow_nursery) /
+    // [`GenImmixCollector::grow_nursery`]) instead retains the space it replaces, so the
+    // nursery becomes a chain of spaces. The counter must cover the whole chain — a
+    // retained space is still part of the nursery a collection evacuates — or a fullsweep
+    // would size itself from a fraction of the live set. That is exactly what these two
+    // tests pin, one per collector: `live` / `live_full` over a chained nursery must equal a
+    // real fullsweep's `GcStats::words_copied` (and, for the mark-region collector, occupy
+    // exactly the counted lines).
+
+    use crate::collector::Collector;
+
+    /// Builds `a1 = {1, 2}` and `a2 = {a1, 3}` in `space` — the terms that end up in the
+    /// space a growth retires.
+    fn build_a(space: &mut HeapSpace) -> (Eterm, Eterm) {
+        let a1 = space
+            .heap_mut()
+            .tuple(&[make_small(1), make_small(2)])
+            .expect("a1");
+        let a2 = space
+            .heap_mut()
+            .tuple(&[a1, make_small(3)])
+            .expect("a2");
+        (a1, a2)
+    }
+
+    /// Builds `b1 = {a2, 4}` (a reference back across the growth boundary) and `b2 = [5]` in
+    /// `space` — the terms in the fresh space a growth installed.
+    fn build_b(space: &mut HeapSpace, a2: Eterm) -> (Eterm, Eterm) {
+        let b1 = space
+            .heap_mut()
+            .tuple(&[a2, make_small(4)])
+            .expect("b1");
+        let b2 = space.heap_mut().cons(make_small(5), NIL).expect("b2");
+        (b1, b2)
+    }
+
+    /// The copying counter ([`live`]) over a **chained** nursery equals a real fullsweep's
+    /// `words_copied` — the retained space and the fresh one are both counted.
+    #[test]
+    fn live_matches_a_full_sweep_on_a_chained_nursery() {
+        let policy = HeapPolicy {
+            initial_young_words: 64,
+            initial_mature_words: 256,
+            ..HeapPolicy::default()
+        };
+        let mut c = Collector::new(policy).expect("collector");
+
+        let (a1, a2) = build_a(c.young_mut());
+        c.grow_nursery(4096).expect("grow"); // A is retired, B is current
+        let (b1, b2) = build_b(c.young_mut(), a2);
+        let mut roots = vec![a1, a2, b1, b2];
+
+        assert!(c.young_space_count() >= 2, "the nursery chain is live");
+        assert_eq!(c.mature().used_words(), 0, "nothing has been promoted yet");
+
+        let mut from = FromSet::new();
+        c.nursery().add_to_from_set(&mut from); // the WHOLE chain
+        let counted = live(&from, &roots);
+
+        let stats = c.collect_major(&mut roots).expect("a fullsweep");
+        assert_eq!(
+            counted.words, stats.words_copied,
+            "the counter must equal the fullsweep's copy on a chained nursery"
+        );
+        assert_eq!(c.young_space_count(), 1, "the fullsweep collapses the chain");
+    }
+
+    /// The mark-region counter ([`live_full`]) over a **chained** nursery equals a real
+    /// fullsweep's `words_copied` and its line need.
+    #[test]
+    fn live_full_matches_a_full_sweep_on_a_chained_nursery() {
+        let policy = HeapPolicy {
+            initial_young_words: 64,
+            initial_mature_words: 512,
+            ..HeapPolicy::default()
+        };
+        let mut c = GenImmixCollector::from_policy(policy).expect("collector");
+
+        let (a1, a2) = build_a(c.young_mut());
+        c.grow_nursery(4096).expect("grow"); // A is retired, B is current
+        let (b1, b2) = build_b(c.young_mut(), a2);
+        let mut roots = vec![a1, a2, b1, b2];
+
+        assert!(c.young_space_count() >= 2, "the nursery chain is live");
+        assert_eq!(c.mature().used_lines(), 0, "nothing has been promoted yet");
+
+        let counted = live_full(c.nursery(), c.mature(), &roots);
+        let stats = c.collect_major(&mut roots).expect("a fullsweep");
+        assert_eq!(
+            counted.words, stats.words_copied,
+            "the counter must equal the fullsweep's copy on a chained nursery"
+        );
+        assert_eq!(
+            counted.lines,
+            c.mature().used_lines(),
+            "the promotion must occupy exactly the counted lines"
+        );
+        assert_eq!(c.young_space_count(), 1, "the fullsweep collapses the chain");
+    }
 }
