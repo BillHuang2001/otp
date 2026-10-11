@@ -319,10 +319,11 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `orelse`/`or`, `not`, `const`, bare truthiness; comparisons `=:=`/`=/=`/`==`/`/=`/`<`/`=<`/`>`/`>=`
   (structural `cmp` for exact, `cmp_arith` for `==`-family); type tests `is_atom/integer/float/number/
   tuple/list/binary/bitstring/map/pid/port/reference/function/boolean`; guard BIFs `element/2`, `abs/1`
-  (int or float; a bignum operand ⇒ typed `unsupported`), `size/1`, `hd/1`, `tl/1`, `length/1`,
-  `map_get/2`, `is_map_key/2`, `map_size/1`, `tuple_size/1`, `byte_size/1`, `bit_size/1`, `float/1`,
-  `trunc/1`, `round/1` (a result beyond the 60-bit small range ⇒ typed `unsupported`), and `self/0`
-  (a typed `badarg` — see Known Issues). Map **construction** is supported in guards and bodies.
+  (int, float or bignum — `abs(MIN_SMALL)` materialises the bignum `2^59`), `size/1`, `hd/1`, `tl/1`,
+  `length/1`, `map_get/2`, `is_map_key/2`, `map_size/1`, `tuple_size/1`, `byte_size/1`, `bit_size/1`,
+  `float/1`, `trunc/1`, `round/1`, `ceil/1`, `floor/1` (an integral result outside the small range is
+  materialised as the oracle's **bignum**, from the float's bits), `bnot/1` (a bignum operand returns
+  `-N-1`), and `self/0` (a typed `badarg` — see Known Issues). Map **construction** is supported in guards and bodies.
   Map/tuple/binary operands are read through `beam_term` primitives (`map::map_get`/`map_size`, …),
   never a local reader. **Arithmetic** (`+ - * / div rem band bor bxor bsl bsr`, unary `+`/`-`) routes
   through the `pub trait ArithHook` seam (default methods) with `DefaultArithHook` installed via a
