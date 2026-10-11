@@ -94,6 +94,7 @@ Only **frozen contracts and non-obvious behaviour** are listed; rustdoc carries 
 ### `src/abi/` — the driver C-ABI host layer (A.4)
 Presents a **loaded C driver** (`beam_abi::driver::loader::load`) as a `Driver`; a `pub` sub-tree (`pub use crate::abi::*`); the only place in this crate holding raw `ErlDrv*` pointers and calling foreign code.
 Four modules — `host.rs` (`PortHost` + `AbiHost`), `job.rs` (`AsyncJobs`, the bounded `driver_async` pool), `port.rs` (`DriverPort`, which prefers the entry's **`outputv`** on both write paths, plus the once-only `stop_select`), `table.rs` (the process-global `DriverTable` + the four registry slots reproducing the oracle's `0,1,0,-1`).
+`AbiHost` also exposes `queue_head` — the safe `&[u8]` companion of the raw `driver_peekq` hook, exactly as `DriverState::queue_len()` is the companion of `sizeq` — so a caller reads the driver queue with no `unsafe`.
 Full detail is in the child node **`src/abi/CONTEXT.md`** — read it there.
 
 ### `io_device/` — the io-device request layer (`{get_until, Enc, Prompt, Mod, Func, XtraArgs}`)
