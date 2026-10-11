@@ -8,6 +8,113 @@ Format: one entry per major change — date, area, what changed and why. Newest 
 
 ---
 
+## 2026-10-10 — Milestone 6: GC root-set completion (the P0 fix), mailbox use-after-free, heap-sizing defect, bounded ETF decode, 3-word External fun descriptor, ETS navigation, IO framing + ABI fixes, boot-to-completion
+Scope: a correctness-and-robustness milestone. The headline structural change is the **completion of
+the frozen root-set contract** — the class of defect that produced an intermittent `SIGSEGV` — plus
+two further use-after-free-class fixes in the message layer and a heap-sizing defect that made
+mature capacity grow without bound. Also: the ETF decoder is now depth-bounded against hostile input,
+the on-heap External-fun descriptor became 3 words (a real term-layout correction), ETS navigation
+was re-derived from the oracle, and the `beam_rt` boot-script executor now drives the real
+`bootstrap/bin/start.boot` to completion. Verified: `cargo build --workspace --all-targets`
+warning-free, `cargo test --workspace --no-fail-fast` green (8200 passed / 0 failed / 5 ignored), and
+the differential gate **`total=1839 agree=1837 mismatch=0 unsupported=2 skipped=0 allowed=2`** → exit 0.
+- **Area:** `erts_rust/crates/beam_rt` (`context/mod.rs`), `erts_rust/crates/beam_process`, `erts_rust/crates/beam_gc`
+- **Change (THE P0 FIX):** a GC collection could run with an **incomplete root set**.
+  `RuntimeContext` implemented only the narrow `ExecutionContext::ensure_heap`, inheriting the
+  trait default for `ensure_heap_full` (which discards the frame-register root) and
+  `alloc_words_rooted` (which discards the caller's roots) — so a live `x[2]` could sit outside
+  `x[0..live)` while a collection relocated the heap. Reproduced as an intermittent `SIGSEGV` in
+  `beam_term::list::car` ← `lists`' `Instr::GetList` ← `beam_rt::runner::run`.
+  **Structural fix:** the only doors a host may use to reach the heap-admission point are now
+  `ensure_heap_full` and `alloc_words_rooted`, both rooted over the **whole machine root set**
+  (`publish_roots_full`/`scatter_roots_full`); a shared `collect_or_grow(process, heap_need)` helper
+  serves both. An **unscanned-root decline valve** (`root_is_unscanned`) makes the runtime decline to
+  collect (grow instead) rather than relocate against a root set it cannot prove complete —
+  correctness over collections. `Message::from` is now required to be an **immediate** at every
+  producer (`beam_process/src/ptab.rs`: 4 on-heap producers fixed to the C's `am_system` / target-pid /
+  node-atom conventions, matching `ASSERT(is_immed(ERL_MESSAGE_FROM(msg)))`).
+  Consequence: the `erl_error:format_exception/3` repro runs to a byte-identical oracle result.
+- **Area:** `erts_rust/crates/beam_process` (`src/process.rs`)
+- **Change:** a **use-after-free** in the message queue: `run_rooted_collection` rebuilt queued
+  messages with `Message::new(..).with_token(..).with_off_heap(..)`, silently dropping the message's
+  `fragments`/`binaries`/`nodes` — a relocated message lost its off-heap handles. Rebuilt through
+  `message.with_payload(payload)` so every field survives relocation.
+- **Area:** `erts_rust/crates/beam_process` (`src/process.rs`), `erts_rust/crates/beam_message`
+- **Change:** the process's persistent `off_heap` table had **dual duty** — `copy_reason_onto`
+  registered a queued signal's reason objects into it while the send path drained that same table
+  (`mailbox::enqueue_copied`), so a later delivery could steal a queued reason's handles. The send
+  path now stages through a **fresh, empty** off-heap table.
+- **Area:** `erts_rust/crates/beam_gc` (new `src/live.rs`)
+- **Change:** the **heap-sizing defect** — mature capacity grew 233 → 6772 words over a steady-state
+  loop because the sizing decision used an over-approximation of live data. Replaced with an **exact
+  reachable-live counter** (`live_full`/`lines_for`, the same walk the collector performs), so capacity
+  is a function of true live words and stays constant (`tests/steady_state.rs`,
+  `tests/offheap_steady_state.rs`). `OffHeap::sweep` is now **slot-stable** (released slots are kept
+  in place; the on-heap reference stores a slot index, so the old compacting `retain` was unsafe to
+  call). `AnyCollector` became a complete strategy-agnostic drop-in for the concrete `Collector`
+  (`should_collect`, `mature_capacity/used/available`, `mature_contains`); the GenImmix verdict is
+  measured in `beam_gc/MEASURED.md` (Immix moves 35.7 % fewer words but needs a 3.79× larger mature
+  footprint and a longer fullsweep pause) → **`MatureKind::Copying` stays the default**.
+- **Area:** `erts_rust/crates/beam_codec` (`src/decode`, `src/compress.rs`)
+- **Change:** the ETF decoder was **unbounded in recursion depth** — hostile input could exhaust the
+  stack. Added `MAX_DECODE_DEPTH = 1500` plus a hostile-input corpus and a ~5000-term round-trip
+  property test. Also: `COMPRESSED` now exposes the number of source bytes it **consumed on the wire**
+  (`decode_term_with_local_node_used`, `compress::decompress_bounded_used`) — the `binary_to_term/2`
+  `[used]` capability the distribution reader needs, previously emulated downstream by an O(n) binary
+  search.
+- **Area:** `erts_rust/crates/beam_term` (`src/fun.rs`), `erts_rust/crates/beam_codec`, `erts_rust/crates/beam_gc`
+- **Change:** the on-heap **External fun descriptor is 3 words** (`[module][function][arity]`), not 2 —
+  `desc_words` = 2 / 3 / 10 for `Local`/`External`/`Imported`. This is a real term-layout correction:
+  the block size, the GC copy sizing (`fun_block_words`), and the codec's `EXPORT_EXT` handling all
+  follow. Added `beam_term::write_internal_ref` / `INTERNAL_REF_WORDS` for the internal-reference form.
+- **Area:** `erts_rust/crates/beam_ets` (`src/table/mod.rs`, `src/select`)
+- **Change:** `select_replace/2` on a `duplicate_bag` rebuilt affected keys from checked-out `take`
+  copies whose store storage was never freed — an unbounded leak. Added `Table::replace_key`, which
+  validates + deep-copies first (rollback on rejection), frees the old key through the ordinary removal
+  path, then installs the already-stored roots. Hash kinds were re-derived from the oracle: they have
+  **no backward walk** (`last_key ≡ first_key`, `prev_key ≡ next_key`) — the previous "reverse walk"
+  was a fabricated behaviour. `ordered_set` continuations are key-anchored (`Cursor::{Begin,Anchor,Position}`).
+- **Area:** `erts_rust/crates/beam_io` (`src/drivers`)
+- **Change:** 13 real defects fixed in the port/driver layer, notably `tcp_inet`'s `{packet,N}`
+  framing (every framed send was mis-framed), `EINTR` retry, and the `AbiHost` port-queue family.
+- **Area:** `erts_rust/crates/beam_process` (`src/signal.rs`, `src/ptab.rs`)
+- **Change:** the signal-build **grow policy** — an oversized `{'EXIT',…}` reason was lost because the
+  build buffer could not grow; `DistSignal::Exit`/`Exit2` split; best-effort termination cascade.
+- **Area:** `erts_rust/crates/beam_abi`
+- **Change:** the NIF/driver ABI's iolist, UTF-8 string/atom and bit-offset paths were wrong
+  (`enif_inspect_iolist_as_binary`: a byte integer is a byte only in head/CAR position; `enif_get_string`
+  UTF-8 truncation; `enif_inspect_binary` bit offset; `enif_make_sub_binary`). Added a safe
+  `driver/async_job.rs` async runner (`AsyncJob`/`AsyncCallback`).
+- **Area:** `erts_rust/crates/beam_engine` (`src/families/*`, `src/terms/update.rs`, `src/jit`)
+- **Change:** the whole non-obsolete `genop.tab` opcode set is now modelled — the last one
+  (`set_tuple_element/3`) landed as an in-place heap write with the baseline JIT inlined and
+  literal-area-guarded. The whole-OTP corpus (1366 `.beam`, 2,888,257 instructions) lowers with
+  **0 unmodelled opcodes**. A raise now carries a `raise_snapshot` stack trace; `badmap`/`badkey`
+  sealed; native cross-module `call_ext` via an `ENTER = -3` block-ABI word.
+- **Area:** `erts_rust/crates/beam_loader`
+- **Change:** the loader's instruction roster is 134/193 typed; the literal pool, line/range tables
+  and the `ops.tab` transforms are all lowered from the real `.beam` chunks.
+- **Area:** `erts_rust/crates/beam_rt` (`src/boot`, `src/native`), `erts_rust/tools/differential`
+- **Change:** the boot-script executor now drives the real `bootstrap/bin/start.boot` — **all 22
+  directives** to `{progress,started}` (the `-boot` CLI exits 0 with empty stdout/stderr); the
+  `{kernelProcess,…}` servers survive their directive process, and instruction 20's
+  `{apply,{c,erlangrc,[]}}` is answered by the runtime-native `file_server_2` service. The native floor
+  gained `init:boot/1`, `init:stop/0,1`, `init:restart/0`, `code:load_file/1` and the automatic
+  `init:get_arguments/0` entries. The differential corpus grew **1633 → 1839** cases (A.3 +32, A.4 +16,
+  A.5 +88, A.9 +70) and `gate.sh --strict` is green with a fresh 2-entry allowlist.
+- **Area:** `erts/` (legacy C)
+- **Change:** the in-tree dead-source checker was replaced by a **2-tier transitive-closure** analysis
+  (`--root`, STRICT tier, `--write-report`) that covers the whole `erts/` tree, and 4 genuinely dead
+  sources plus one dead `#ifdef LOADABLE` block were removed. Every remaining `.c` is referenced by an
+  explicit object list, so the parity-gated removal plan and its 5-point per-file gate are documented
+  in `erts/emulator/beam/CONTEXT.md` rather than acted on optimistically.
+- **Area:** `lib/compiler` (Stage 2)
+- **Change:** loop optimisation (with an arith-LICM), operation fusion (a new `has_map_field` +
+  `maps:get/2` fusion) and FBIP (in-place `update_record` on a fresh, uniquely-owned source) are
+  implemented, wired with derived kill switches, and proved sound by an equivalence harness
+  (996 probe modules / ~156k compared calls, 0 mismatches). Two soundness holes were found and closed
+  (`bsl`/`bsr` are not LICM-safe; a fresh *binary* is not a valid in-place `update_record` source).
+
 ## 2026-10-09 — Milestone 5: in-machine cross-module calls, ETS lifetime/concurrency fixes, per-object reclamation, slim IR + superinstruction, NIF/driver ABI completion, signal/ddll facilities, Stage-2 compiler passes
 Scope: a broad correctness + performance milestone across the runtime. The headline structural
 changes are (a) a **suspendable cross-module call seam** so a `receive` inside a callee parks and

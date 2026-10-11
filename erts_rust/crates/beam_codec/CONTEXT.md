@@ -10,7 +10,7 @@ Ground truth = legacy C `../../erts/emulator/beam/external.c` (`erts_encode_ext`
 ## Status
 **Implemented.** Every module carries real bodies — `tag`, `reader`/`writer`, `atom_cache`, `off_heap`, `compress` (zlib), `encode`/`decode` (incl. `decode/local_node.rs`), the `term` forwarding layer (over `beam_term::{thing,fun,bitstring,refc,record,hashing}`) and `error`.
 Test count at this HEAD: **421 tests**, 0 failures (`../../scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_codec --no-fail-fast`; re-run for the live figure).
-Differential gate: **`total=1567 agree=1566 mismatch=0 unsupported=1 skipped=0`**, exit **0** with the single allowlist entry `wire/new_fun_ext_encode` (the deliberately unclosable `erl_eval` lambda; `../tools/differential/GAPS.md` — re-run `../tools/differential/gate.sh` for the live per-contract split).
+Differential gate: **`total=1839 agree=1837 mismatch=0 unsupported=2 skipped=0`**, exit **0** with the allowlisted capability gaps `wire/new_fun_ext_encode` (the deliberately unclosable `erl_eval` lambda) and `boot_extra/init_script_id_names_the_running_otp_release` (`../tools/differential/GAPS.md` — re-run `../tools/differential/gate.sh` for the live per-contract split).
 The full producible tag set round-trips with **no recognized tag left `unsupported`**; a `FunKind::Local` (`make_fun3`) fun encodes as `NEW_FUN_EXT` (`112`) when the caller supplies the module identity its layout lacks (§Tag coverage, §Fun identity).
 
 ## API Surface (FROZEN — dependents route here)

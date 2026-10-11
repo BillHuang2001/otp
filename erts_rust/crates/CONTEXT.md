@@ -102,7 +102,7 @@ built first-class; other crates deliver their Stage-scoped core in parallel.
 | `beam_gc` | generational Cheney copying + immix mature generation (measurement-gated) + MSO refcount |
 | `beam_message` | `copy_struct` + send/receive envelope + the `QueueCursor` scan position |
 | `beam_process` | `Process`, run queue, scheduler loop, resume-on-send, signals/links/monitors |
-| `beam_bifs` | `BifRegistry` + the whole declared `bif.tab` surface (556 BIFs; registry 637 keys) + the host seams |
+| `beam_bifs` | `BifRegistry` + the whole declared `bif.tab` surface (556 BIFs; registry 640 keys) + the host seams |
 | `beam_ets` | `set` (CHAMP) + `ordered_set` (K-ary B+-tree) + `bag`/`duplicate_bag` (chained) over `new/insert/lookup/delete/select` |
 | `beam_io` | `mio` poller/reactor + `Port`/`PortRegistry` + port-task scheduling + built-in `fd`/`efile` **and OS-child `spawn`** drivers |
 | `beam_rt` | boot/CLI/`system_info` + the executor runner (send/receive) + the `PortHook` provider + end-to-end vertical-slice integration test |
@@ -132,10 +132,10 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 - **Funs / exports** (`beam_term::fun`) — the on-heap `ErlFunThing` interior, as heap-agnostic
   writers/readers. Header word = `FUN_SUBTAG | arity<<8 | num_free<<16 | external<<24 | imported<<25`
   (the first three fields are C's `MAKE_FUN_HEADER` encoding). Three kinds: `Local` (descriptor
-  `[uniq:u64][index:u32]` — what `beam_engine`'s `make_fun3` builds), `External` (`[module][function]`,
+  `[uniq:u64][index:u32]` — what `beam_engine`'s `make_fun3` builds), `External` (`[module][function][arity]`,
   an `EXPORT_EXT` literal), `Imported` (10-word descriptor: module, 16-byte MD5, index, old_index,
   old_uniq, creator pid — a `NEW_FUN_EXT` literal). `env` follows the descriptor; block =
-  `1 + desc_words(kind) + num_free`, with `desc_words` = 2 / 2 / 10. The C's out-of-line
+  `1 + desc_words(kind) + num_free`, with `desc_words` = 2 / 3 / 10. The C's out-of-line
   `ErlFunEntry`/`Export` `entry` pointer is **inlined into the term** — the same documented M1
   substitution as the external-pid `node` slot. `beam_gc` sizes/scans fun copies through
   `fun_block_words`/`fun_env_offset`, and `compare`/`hashing` order/hash funs structurally per the C
@@ -213,7 +213,7 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 ## Status
 - **All 15 crates architected, implemented and tested.** `scripts/cargo.sh build --manifest-path
   erts_rust/Cargo.toml --workspace --all-targets` is warning-free and `scripts/cargo.sh test
-  --manifest-path erts_rust/Cargo.toml --workspace --no-fail-fast` is green (**~6180 passed / 0
+  --manifest-path erts_rust/Cargo.toml --workspace --no-fail-fast` is green (**8200 passed / 0
   failed**; the exact count moves as tests are added — re-run the command for the current figure).
   **CI exists:** `.github/workflows/erts_rust.yml` (triggered on any `erts_rust/**` change or PR)
   builds the workspace, runs this test command, runs a non-blocking clippy, and runs the differential
@@ -225,9 +225,10 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 - **Engine execution breadth reaches beyond stdlib/kernel/compiler:** `beam_engine`'s `tests/apps_lists.rs`
   runs oracle-cross-checked functions from parsetools (yecc/leex), syntax_tools, xmerl, inets, edoc, eunit,
   dialyzer, asn1 and snmp; `tests/census.rs` reaches **1366/1366 modules / 2,888,257 instructions with
-  zero unmodelled opcodes** (the 12 unused `Instr` variants are the seven native-record variants — an
+  zero unmodelled opcodes** (the 13 unused `Instr` variants are the seven native-record variants — an
   OTP-29 feature this toolchain does not enable — plus `Deallocate` (every corpus `deallocate` is
-  fused into `DeallocateReturn` by the loader), `BsTestTail2`, `ExecutableLine`, `DebugLine` and
+  fused into `DeallocateReturn` by the loader), `BsTestTail2`, `ExecutableLine`, `DebugLine`,
+  `SetTupleElement` (the corpus lowers no in-place tuple write: `setelement/3` builds a fresh tuple) and
   the `Generic` sentinel).
 - **Vertical slice WORKS end-to-end**: `beam_loader` + `beam_engine` + `beam_rt` load a real `.beam`
   (fixture `beam_loader/tests/fixtures/slice.beam`, built with the system `erlc`) and execute it:
@@ -245,10 +246,10 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   messages **delivered to the owning process**, so a receiver blocked on port data is woken through
   `beam_process`'s resume-on-send rather than only by an explicit `send` (`beam_rt/tests/port_wake.rs`);
   `erlang:port_close/1` returns the oracle's `true`. The **differential gate reports 0 mismatches**:
-  `summary: total=1213 agree=1210 mismatch=0 unsupported=3 skipped=0` (`../tools/differential/gate.sh` →
-  exit 3 until the allowlist is refreshed); re-run `gate.sh` for the live per-contract split. Of the three
-  `unsupported` cases (A.5 `wire/new_fun_ext_encode`; A.7 `proc_signals/statistics_runtime`; A.9
-  `boot/proc_lib_start_link_blocks_the_boot_path`), the one unclosable by design is
+  `summary: total=1839 agree=1837 mismatch=0 unsupported=2 skipped=0 allowed=2` (`../tools/differential/gate.sh`
+  → exit 0); re-run `gate.sh` for the live per-contract split. The two recorded capability gaps (the
+  `known-gaps.txt` ratchet allowlist) are A.5 `wire/new_fun_ext_encode` and A.9
+  `boot_extra/init_script_id_names_the_running_otp_release`. The one unclosable by design is
   `wire/new_fun_ext_encode` (A.5): its
   `-eval` `fun() -> ok end` is an `erl_eval` *template* closure (the arity-selected `-expr/6-fun-7-`
   slot) whose single free variable is erl_eval's internal `Info` tuple holding the clause in `erl_parse`
@@ -267,8 +268,8 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   to (de-duplication). Writers take a caller-provided `*mut Eterm`; allocation stays in `beam_alloc`.
 - **Stage-1 execution tiers shipped (`beam_engine`).** The typed-IR seam carries a direct-threaded interpreter plus a real native baseline tier (`src/jit/`): `src/jit/baseline/` lowers each IR basic block to an x86-64 `extern "C"` function (block ABI returns `(func<<32|pc)`, `HALT=-1`, `ERROR=-2`; `rbx` = x-register array base) with a driver loop that deopts to the interpreter's own `step_instruction` for anything it does not inline. A cross-run compiled-block cache (`src/jit/cache.rs`) and a block linker (`src/jit/baseline/emit/link.rs`) reuse and chain compiled blocks, and a local tail call (`call_last`/`call_only`) is linked natively. `tests/jit_real_module.rs` is the real-`erlc`-module tier-equivalence gate — **736/736** oracle-checked comparisons agree with zero divergences. An optional Cranelift hot tier (`src/jit/cranelift/`) sits behind the default-OFF `jit-cranelift` feature. Correctness (interpreter-identical results) is the deliverable; the tiers are not on `beam_rt`'s execution path yet — the engine's outcome-aware `run_export_outcome_with_tier`/`run_label_outcome_with_tier` entries are landed, so `beam_rt` adopts a tier by routing a process through them (`beam_engine/CONTEXT.md` Handoff #9) — and deeper inlining is later work.
 - **BIF surface complete (`beam_bifs`).** The registry covers the whole declared `bif.tab` surface —
-  **556 declared BIFs (registry 637 keys = 556 declared + 81 non-table keys: 79 stdlib fast paths +
-  `erlang:memory/0,1`)** — via two defaulted seams (`RuntimeHooks::call`, `MemoryHook::memory`).
+  **556 declared BIFs (registry 640 keys = 556 declared + 84 non-table keys: 79 stdlib fast paths +
+  `erlang:memory/0,1` + the OTP-30 `pid_to_binary`/`ref_to_binary`/`port_to_binary`)** — via two defaulted seams (`RuntimeHooks::call`, `MemoryHook::memory`).
   Registered-but-unadopted BIFs return the typed `unsupported_bif` until a host hook is installed, so
   the runtime-coupled families are registered here while their behaviour remains a host gap.
 - **Data-structure and runtime defaults.** `beam_ets`: `set` → CHAMP, `ordered_set` → K-ary B+-tree
@@ -368,23 +369,24 @@ is **no self-hosted build** (the Rust runtime does not compile and run itself).
 - **Remaining A.9 gaps (fidelity, not boot-completion):**
   1. **No self-hosted build.** The Rust runtime does not compile/run itself; the compiler bootstrap
      (Stage 2, `../lib/compiler`) is not wired into `beam_rt`.
-  2. **No live `code_server`/`erl_prim_loader`/`logger`/`application_controller` process** on a plain
-     runtime. `code:*` (except `code:load_file/1`), `init:*` (except `init:boot/1`,`init:stop/0,1`,
-     `init:restart/0`), and the `application:*` queries are served by a native floor
+  2. **No live `code_server`/`erl_prim_loader`/`application_controller` process** on a plain
+     runtime. `code:*`, `init:*` and the `application:*` queries are served by a native floor
      (`beam_rt/src/native/{code,init,application}.rs`). On the `-boot` path the real
      `application_controller:start/1` IS spawned and stays registered (instruction 14).
   3. **`logger` never registers**: instruction 13's `{kernelProcess,logger,{logger_server,start_link,[]}}`
-     spawns but does not reach its registration (`beam_rt/src/boot/bootscript.rs` comment; the boot
-     completes without it). `error_logger` has no process (only `error_logger:warning_map/0` via the
-     `RuntimeHooks` bridge).
-  4. **`init:get_arguments/0` omits the automatic `root`/`bindir`/`progname`/`home`** (they ARE served by
-     `init:get_argument/1`, which the boot chain uses).
-  5. **The native `file_server_2` is not the real Erlang `file_server`** — a mailbox-drained
-     `beam_process::Process` (`beam_rt/src/native/file_server.rs`); `{get_until,…}` and
-     `file:read_line/1` (`{get_line,…}`) are the typed `unsupported` gaps.
-  6. **Latent:** the nested `RuntimeContext` blocking pump (`beam_rt/src/context/mod.rs`) loops until the
-     machine returns or a pump reports 0, with no wall-clock cap (the `DRIVE_DEADLINE` bounds only the
-     outer boot drive); a perpetually runnable boot-spawned process would not be bounded.
+     spawns but does not reach its registration, so the boot completes without a live `logger`. Root
+     cause is engine-side (`beam_rt/HANDOFF_boot_apply_seam.md` Seam 1): `proc_lib:init_p_do_apply/3`
+     compiles to a **non-tail** `{call_ext,3,{extfunc,erlang,apply,3}}`, which the `CallExt*` arms fold
+     into the native `apply_dynamic` whose pump is gated off for a scheduled process. The companion
+     Seam 2 is `Instr::CallFun`/`CallFun2` → `ExecutionContext::apply_fun` → `run_label_blocking`
+     (a scheduled process's closure body cannot suspend). `error_logger` has no process (only
+     `error_logger:warning_map/0` via the `RuntimeHooks` bridge).
+  4. **The native `file_server_2` is not the real Erlang `file_server`** — a mailbox-drained
+     `beam_process::Process` (`beam_rt/src/native/file_server.rs`). The `{get_until,…}` and
+     `{get_line,…}` families ARE served for regular files.
+  5. **`init:restart/0` and `init:boot/1` are unprobeable under a bounded probe** (they re-run the boot
+     chain); `init:stop/0,1` and `init:get_arguments/0` (including the automatic
+     `root`/`bindir`/`progname`/`home`) are implemented and oracle-cross-checked.
 
 ## Known Structural Debt (candidates for the next pass)
 - The map/bitstring/refc handoffs above are only partly adopted: `beam_codec` forwards to `beam_term`

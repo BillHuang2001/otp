@@ -111,7 +111,8 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   own `CONTEXT.md`; all implemented and tested. Verify the node tree via the routing table below.
 - **Build/test:** build with `scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace
   --all-targets` (warning-free); test with `scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml
-  --workspace --no-fail-fast`. The suite is green (6700+ passing / 0 failing).
+  --workspace --no-fail-fast`. The suite is green (8200 passed / 0 failed; ~45 min wall on a loaded
+  host, so run it in crate chunks when iterating).
 - **CI runs the workspace and the gate:** `.github/workflows/erts_rust.yml` (path-triggered on
   `erts_rust/**` and on the workflow file itself, plus `workflow_dispatch`) installs the pinned
   toolchain (`rust-toolchain.toml`), then runs `cargo build --workspace --all-targets`,
@@ -123,11 +124,15 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   job; `3` no mismatch but the **ratchet** must be updated (an unrecorded capability gap appeared, or a
   recorded one closed and went stale) → **fails the job**. Parity claims are therefore CI-checked, not
   manual-only.
-- **Vertical slice WORKS:** `beam_loader` + `beam_engine` + `beam_rt` load a real `.beam` (produced by
-  the system `erlc`) and execute it — `beam_rt run <slice.beam> slice:add/2 2 3` → `5`,
-  `slice:fib/1 10` → `55`. The supported opcode subset is documented honestly per crate; anything
-  outside it returns a typed `BeamError` (never a wrong result).
-- **Compatibility gate (`tools/differential`):** `gate.sh` is authoritative — re-run it for the live
+- **Vertical slice WORKS and now spans real stdlib:** `beam_loader` + `beam_engine` + `beam_rt` load a
+  real `.beam` (produced by the system `erlc`) and execute it — `beam_rt run <slice.beam> slice:add/2 2 3` →
+  `5`, `slice:fib/1 10` → `55`. Every non-obsolete `genop.tab` opcode is now modelled (the whole-OTP
+  `.beam` census lowers with **zero residual `Generic` opcodes**), and dozens of real `lists`/`string`/
+  `ordsets`/`proplists`/`maps`/`queue`/`gb_trees`/`calendar`/`filename`/`base64`/`unicode` functions run
+  with byte-identical oracle results. Anything outside the supported surface returns a typed `BeamError`
+  (never a wrong result).
+- **Compatibility gate (`tools/differential`):** `summary: total=1839 agree=1837 mismatch=0 unsupported=2
+  skipped=0 allowed=2` → `gate.sh --strict` exits 0. `gate.sh` is authoritative — re-run it for the live
   per-contract split. **No case disagrees**; the recorded capability gaps (the `known-gaps.txt` ratchet
   allowlist) are `wire/new_fun_ext_encode` (unclosable — an `erl_eval` lambda's closure identity needs
   `erl_eval`/`erl_scan`/`erl_parse`) and `boot_extra/init_script_id_names_the_running_otp_release` (A.9 —
@@ -170,18 +175,20 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
 - **Stage 4 adoption:** the copying collector IS driven by `beam_rt` at the engine heap-admission
   point (`beam_rt/src/context/gc.rs`), conservatively gated (a process is pinned once a live float
   register is seen, halted on a collection error, and a global valve disables collection once an escaped
-  runtime store holds an off-heap term). The GenImmix mature generation (`beam_gc`, `AnyCollector`/
-  `select_mature`) is implemented but its strategy dispatch is unreached at runtime — the
-  `IMMIX_BREAK_EVEN_WORDS` auto-selection runs only in `beam_gc` tests. `OffHeap::sweep` and
-  `beam_gc::HeapFragment`/`FragmentChain`/`FragmentRoots` likewise have no production consumer (the
-  production fragment model is `beam_message`'s).
+  runtime store holds an off-heap term). The GenImmix mature generation (`beam_gc`; `AnyCollector` is now
+  a complete strategy-agnostic drop-in for the concrete `Collector`, with the `IMMIX_BREAK_EVEN_WORDS`
+  auto-selection rule) is measured (`beam_gc/MEASURED.md`) and the **host-side switch is the remaining
+  step** — `beam_process::Process` still holds the concrete `Collector` (see the Handoffs section of
+  `crates/beam_gc/CONTEXT.md` for the exact call sites). The production fragment model is
+  `beam_message`'s; `beam_gc::OffHeap` is the MSO slot store and its `sweep` is now slot-stable.
 - **Stage 6 (Level-2 clean-room VM):** new ISA + full toolchain — research track with an explicit exit
   criterion (Part II §H).
-- **Legacy-C removal:** delete the corresponding C under `../erts/emulator/beam/` module-by-module as
-  each Rust crate reaches differential parity. The legacy tree is still the OTP build's DEFAULT runtime
-  (`FLAVOR=jit`), and nothing under `erts/emulator/beam/` is unreferenced by the build — the in-tree
-  `check_dead_sources.py` reports `deletable: 0` and every `.c` has an explicit object-list entry — so
-  removal is parity-gated, never build-reference-gated.
+- **Legacy-C removal:** delete the corresponding C under `../erts/` module-by-module as each Rust crate
+  reaches differential parity. Every surviving `.c` is referenced by an explicit object list in a build
+  recipe (the 2-tier transitive checker `../erts/emulator/beam/check_dead_sources.py` — `--root`, STRICT
+  closure, `--write-report` — finds only 1 actionable candidate, a documented false positive), so removal
+  is parity-gated, never build-reference-gated. The parity matrix, the 5-point per-file gate and the
+  ordered removal sequence live in `../erts/emulator/beam/CONTEXT.md`.
 
 ## Routing Table
 - `crates/beam_common/` → shared error/result types, config, logging, feature flags, version constants (lowest common ancestor)

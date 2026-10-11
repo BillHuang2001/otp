@@ -150,7 +150,7 @@ the default on a fresh `tb` fixture: `tb:cnt/1 20000000` (non-allocating tail lo
 **10.648 s** vs the default **0.079 s**, and `tb:fib/1 27` (allocating tree recursion) interpreter
 **0.296 s** vs **0.205 s**. The unset `BEAM_RT_TIER` resolves to exactly `Auto` (timings identical to
 `BEAM_RT_TIER=auto`), and the FULL differential suite under the new default is
-`total=1213 agree=1211 mismatch=0 unsupported=2` (A.9 `155/155` agree) — so the default is CI-checked
+`total=1839 agree=1837 mismatch=0 unsupported=2` (A.9 `155/155` agree) — so the default is CI-checked
 corpus-correct.
 
 **Conclusion.** The tier is taken on a process's **first** entry and then carried for its whole life: a
