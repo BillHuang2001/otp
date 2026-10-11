@@ -33,8 +33,11 @@
 //! # One context, three dispatch routes
 //!
 //! The engine routes `call_ext*` **and** `apply`/`apply_last` through
-//! [`ExecutionContext::call_bif`], and `call_fun`/`call_fun2` through
-//! [`ExecutionContext::apply_fun`]. So [`RuntimeContext::call_bif`] serves, in order:
+//! [`ExecutionContext::call_bif`] — unless the host can run the callee in-machine, which the
+//! [`ExecutionContext::resolve_external_call`] seam reports — and `call_fun`/`call_fun2`
+//! through the in-machine [`ExecutionContext::resolve_local_fun`] seam **first**, falling back
+//! to the value-returning [`ExecutionContext::apply_fun`]. So [`RuntimeContext::call_bif`]
+//! serves, in order:
 //!
 //! 1. the **runtime-native floor** ([`crate::native`]: `halt`, `display`,
 //!    `io:put_chars`, `erlang:apply`, `init:get_argument`);
