@@ -2794,6 +2794,17 @@ impl ExecutionContext for RuntimeContext<'_> {
         Ok(())
     }
 
+    /// This runtime has no slice budget outside the runner: the trait's default `reduce` is a
+    /// no-op here, so this is the documented "provably the default no-op" opt-out. The engine
+    /// then skips the per-instruction `&mut dyn ExecutionContext` vtable crossing for every
+    /// non-budgeted run — the single-pass `Runtime::run_*` paths and every nested in-machine run
+    /// a BIF or `apply` starts. The one host that declares `true` and charges the budget is the
+    /// runner's `BudgetContext` (`src/runner/budget.rs`), whose trait impl does not forward this
+    /// answer to its inner context.
+    fn wants_reduce(&self) -> bool {
+        false
+    }
+
     /// Whether the running process requests the `call`/`return_from`/`return_to` execution
     /// trace family (contract A.8).
     ///
