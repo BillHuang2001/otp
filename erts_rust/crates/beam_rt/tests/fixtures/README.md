@@ -204,10 +204,11 @@ wait_forever()-> receive X -> X after infinity -> timeout end.
 Any byte change in a fixture invalidates the expected values in the tests that load it;
 re-derive them from the system `erl`, do **not** guess.
 
-## GC fixtures (`gc_loop` · `gc_ints` · `gc_floats` · `heap_growth`, committed)
+## GC fixtures (`gc_loop` · `gc_ints` · `gc_floats` · `heap_growth` · `gc_payload`, committed)
 
-These four are committed oracle fixtures for the process-heap collector
-(`tests/gc_collect.rs` and `tests/heap_growth.rs`):
+These five are committed oracle fixtures for the process-heap collector
+(`tests/gc_collect.rs`, `tests/heap_growth.rs`, `tests/gc_strategy.rs` and
+`tests/gc_immix_payload.rs`):
 
 * `gc_loop.beam` — `loop/1` tail-recursively conses every iteration (`build/1`), so a
   scheduled process really allocates; the acceptance evidence that the collector runs at the
@@ -222,11 +223,18 @@ These four are committed oracle fixtures for the process-heap collector
   `run/1` repeats it, discarding each tuple, so a runtime that cannot grow the nursery must
   fall back to the pointer-stable arena on every iteration. Pins the growable-heap seam
   (`Process::ensure_capacity` behind `ensure_heap`).
+* `gc_payload.beam` — `run(N)` builds a **long-lived payload** of `payload_length()` (64)
+  tuples `{K, K + 1, [K, K + 2, K + 3]}` (~768 words), then churns `N` rounds of short-lived
+  garbage (~576 words per round, above the fresh nursery), reading `erlang:length(Payload)`
+  *after* each round's allocation so the payload stays a live root across every heap-admission
+  point, and finally **returns the payload** (a structurally checkable term: element `i` is
+  keyed `64 - i`). The witness that a collection on the mature strategy did not relocate the
+  heap out from under a live term.
 
-All four are path-free (`+deterministic`) and regenerate with the same scratch-dir recipe:
+All five are path-free (`+deterministic`) and regenerate with the same scratch-dir recipe:
 
 ```sh
-for f in gc_loop gc_ints gc_floats heap_growth; do
+for f in gc_loop gc_ints gc_floats heap_growth gc_payload; do
     SCRATCH="$TMPDIR/beam_rt_${f}_fix"
     rm -rf "$SCRATCH"; mkdir -p "$SCRATCH/gen"
     cp "$f.erl" "$SCRATCH/gen/"

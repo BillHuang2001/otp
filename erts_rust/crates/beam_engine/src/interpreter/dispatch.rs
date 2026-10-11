@@ -28,11 +28,12 @@
 
 use beam_common::{ExceptionClass, Result};
 use beam_loader::{ImportRef, Instr, Module, NO_FAIL};
-use beam_term::{cmp, make_atom, NIL};
+use beam_term::{cmp, is_atom, is_list, is_nil, make_atom, atom_val, Eterm, NIL};
 
 use crate::context::ExecutionContext;
 use crate::error;
 use crate::families;
+use crate::families::funs::{apply_target, raise_badarg, ApplyTarget};
 use crate::machine::{Continuation, Machine, RunOutcome};
 use crate::operand::{read_operand, write_operand};
 use crate::Step;
@@ -357,6 +358,11 @@ impl Machine {
                 // resumes *this* process through it: enter the callee's code with the
                 // caller's return address stored in the live frame, exactly like the
                 // local `Instr::Call` (the callee's `return` reads it back).
+                if let Some(target) =
+                    self.resolve_call_ext_apply(module, labels, *target, ctx)?
+                {
+                    return self.apply_import_target(target, ImportFrame::Call, func, pc);
+                }
                 if let Some((context, callee, callee_pc)) =
                     self.resolve_external_entry(module, labels, *target, ctx)?
                 {
@@ -386,6 +392,11 @@ impl Machine {
                 // A tail call: the caller's frame is reused, so nothing is stored —
                 // the callee's `return` follows the frame's *existing* continuation
                 // (exactly like the local `Instr::CallOnly`).
+                if let Some(target) =
+                    self.resolve_call_ext_apply(module, labels, *target, ctx)?
+                {
+                    return self.apply_import_target(target, ImportFrame::Only, func, pc);
+                }
                 if let Some((context, callee, callee_pc)) =
                     self.resolve_external_entry(module, labels, *target, ctx)?
                 {
@@ -436,6 +447,11 @@ impl Machine {
                 // behind (the local `Instr::CallLast` discipline); once it is
                 // resolved, entering the callee is the only step that depends on the
                 // popped frame and nothing may fail after it.
+                if let Some(target) =
+                    self.resolve_call_ext_apply(module, labels, *target, ctx)?
+                {
+                    return self.apply_import_target(target, ImportFrame::Last(*deallocate), func, pc);
+                }
                 if let Some((context, callee, callee_pc)) =
                     self.resolve_external_entry(module, labels, *target, ctx)?
                 {
@@ -627,6 +643,228 @@ impl Machine {
         let (func, pc) = handle.labels.resolve(label)?;
         Ok(Some((context, func, pc)))
     }
+
+    /// The `call_ext*`-encoded `erlang:apply/3` special case — C's
+    /// `fixed_apply`'s `/* Handle apply of apply/3 ... */` path
+    /// (`../../erts/emulator/beam/beam_common.c:1554-1557`, which falls through to
+    /// `apply()` lines 1433-1524).
+    ///
+    /// `erlang:apply/3` is a **floor** module in the runtime, so
+    /// [`ExecutionContext::resolve_external_call`] declines it and a `call_ext`
+    /// would otherwise fold into the host's synchronous `apply` BIF, which runs the
+    /// callee on a *fresh* machine — a `receive` inside the callee then dies in the
+    /// uncatchable typed `blocked()` gap instead of suspending *this* process. C
+    /// instead resolves the export and **jumps into its code in the same process**,
+    /// so the callee's `receive` suspends the caller normally.
+    ///
+    /// This method returns `Ok(None)` for any import that is not `erlang:apply/3`
+    /// (the caller keeps its normal seam/BIF route). `erlang:apply/2` is **not** a
+    /// `fixed_apply` shape: it is `apply(Fun, Args)` — a *fun* applied to an argument
+    /// list — which C compiles to the dedicated `i_apply_fun` instruction
+    /// (`emu/ops.tab:872`; `APPLY_FUN` → `apply_fun(c_p, x(0), x(1), reg)`,
+    /// `emu/instrs.tab:314-334`) and never routes through `apply()`/`fixed_apply`
+    /// (`beam_common.c:1555` special-cases **only** `arity == 3`). Treating it as the
+    /// `fixed_apply` module/function shape would fabricate `Module:Function()`
+    /// semantics, so arity 2 falls through unchanged to the ordinary export/BIF
+    /// route — the host's own `erlang:apply/2`.
+    ///
+    /// Otherwise it decodes the call exactly as C's `apply()` does and hands the
+    /// outcome to
+    /// [`funs::apply_target`](crate::families::funs::apply_target):
+    ///
+    /// * unwrap C's nested `apply of apply/3` shape (a 3-element `[M, F, Args]`
+    ///   argument list where `M == erlang`, `F == apply`) in a loop;
+    /// * walk the argument list into `x(0..N)` (`error:system_limit` past C's
+    ///   `MAX_ARG`; a non-proper list is `badarg`);
+    /// * place the resolved `Module` at `x(N)` and `Function` at `x(N+1)` (the
+    ///   `fixed_apply` register shape) and dispatch through
+    ///   [`funs::apply_target`](crate::families::funs::apply_target).
+    ///
+    /// Every shape error (a non-atom module/function, a non-list/non-proper `Args`)
+    /// is the **catchable** `badarg` the oracle produces — raised through
+    /// [`funs::raise_badarg`](crate::families::funs::raise_badarg), which resolves
+    /// the `badarg` atom from the **running** module's table (never a fabricated
+    /// atom). The returned [`ApplyTarget`] carries the dispatch, and the caller
+    /// applies its own `CallExt*` frame discipline.
+    fn resolve_call_ext_apply(
+        &mut self,
+        module: &Module,
+        labels: &LabelMap,
+        target: ImportRef,
+        ctx: &mut dyn ExecutionContext,
+    ) -> Result<Option<ApplyTarget>> {
+        let (module_name, function_name, import_arity) = labels.import_target(module, target)?;
+        if module_name != "erlang" || function_name != "apply" {
+            return Ok(None);
+        }
+        if import_arity != 3 {
+            return Ok(None);
+        }
+        // C's `apply()` argument decode (`beam_common.c:1439-1441`): `reg[0] = Module`,
+        // `reg[1] = Function`, `reg[2] = Args`. This is the `fixed_apply` shape only —
+        // C reaches `apply()` from `fixed_apply` exactly for the arity-3 case
+        // (`beam_common.c:1554-1557`).
+        let mut module_term = self.x(0).ok_or_else(|| error::bad_register(0))?;
+        let mut function_term = self.x(1).ok_or_else(|| error::bad_register(1))?;
+        let mut args_term = self.x(2).ok_or_else(|| error::bad_register(2))?;
+        // `erlang`/`apply` are resolved against the running module's atom table: an
+        // atom index is meaningful only against the table it is read with, so a
+        // module that cannot name `erlang`/`apply` simply never matches.
+        let erlang_atom = module.atom_table.lookup("erlang");
+        let apply_atom = module.atom_table.lookup("apply");
+        // C's `apply()` checks `is_not_atom(function)` up front, before the loop.
+        if !is_atom(function_term) {
+            return Ok(Some(ApplyTarget::Raised(raise_badarg(self, module)?)));
+        }
+        // C's nested `apply of apply/3` unwrap (`beam_common.c:1462-1497`): while the
+        // target is `erlang:apply` and `Args` is exactly `[M, F, Inner]`, replace
+        // `(Module, Function, Args)` with `(M, F, Inner)` and repeat.
+        loop {
+            if !is_atom(module_term) {
+                return Ok(Some(ApplyTarget::Raised(raise_badarg(self, module)?)));
+            }
+            let is_erlang = erlang_atom.is_some_and(|a| atom_val(module_term) == a);
+            let is_apply = apply_atom.is_some_and(|a| atom_val(function_term) == a);
+            if !(is_erlang && is_apply) {
+                break;
+            }
+            let Some((m, f, inner)) = unwrap_apply3(args_term) else {
+                break;
+            };
+            module_term = m;
+            function_term = f;
+            args_term = inner;
+            if !is_atom(function_term) {
+                return Ok(Some(ApplyTarget::Raised(raise_badarg(self, module)?)));
+            }
+        }
+        // Walk the argument list into `x(0..N)` (C's `beam_common.c:1503-1516`). A
+        // list longer than C's `MAX_ARG` (`erl_vm.h:48`, 255) is `error:system_limit`;
+        // a non-proper tail is `badarg`.
+        let mut count: u32 = 0;
+        let mut cursor = args_term;
+        while is_list(cursor) {
+            if count as usize >= MAX_ARG {
+                return Ok(Some(ApplyTarget::Raised(
+                    self.raise_bif_error(module, beam_common::BeamError::SystemLimit)?,
+                )));
+            }
+            let element = crate::terms::cons_head(cursor)?;
+            self.set_x(count, element)?;
+            count += 1;
+            cursor = crate::terms::cons_tail(cursor)?;
+        }
+        if !is_nil(cursor) {
+            return Ok(Some(ApplyTarget::Raised(raise_badarg(self, module)?)));
+        }
+        // `fixed_apply`'s register shape for the resolved `M`/`F`: the module is
+        // `x(N)` and the function is `x(N+1)`, with the arguments in `x(0..N)`.
+        self.set_x(count, module_term)?;
+        self.set_x(count + 1, function_term)?;
+        Ok(Some(apply_target(self, module, count, ctx)?))
+    }
+
+    /// Apply an arm's own frame discipline to an [`ApplyTarget`] produced by
+    /// [`Machine::resolve_call_ext_apply`].
+    ///
+    /// The `call_ext*` forms differ only in their frame handling
+    /// ([`ImportFrame`]): a non-tail `call_ext` stores its continuation on the
+    /// **enter** path and yields `Step::Next` on a synchronous value; the tail forms
+    /// store nothing (the frame's existing continuation is reused) and the
+    /// `call_ext_last` form pops the frame **before** entering (or, on a synchronous
+    /// value, before following the now-current caller's continuation). A
+    /// [`ApplyTarget::Raised`] leaves the caller's frame untouched and its landed
+    /// `x(0..=3)` registers are returned as-is.
+    fn apply_import_target(
+        &mut self,
+        target: ApplyTarget,
+        frame: ImportFrame,
+        func: u32,
+        pc: u32,
+    ) -> Result<Step> {
+        match target {
+            ApplyTarget::Enter {
+                context,
+                func: target_func,
+                pc: target_pc,
+            } => {
+                match frame {
+                    ImportFrame::Call => {
+                        self.set_continuation(Continuation::Address {
+                            func,
+                            pc: pc + 1,
+                            context: self.current_context(),
+                        })?;
+                    }
+                    ImportFrame::Only => {}
+                    ImportFrame::Last(deallocate) => self.pop_frame_checked(deallocate)?,
+                }
+                Ok(Step::Enter {
+                    context,
+                    func: target_func,
+                    pc: target_pc,
+                })
+            }
+            ApplyTarget::Called(value) => {
+                self.set_x(0, value)?;
+                match frame {
+                    ImportFrame::Call => Ok(Step::Next),
+                    ImportFrame::Only => self.continuation_step(),
+                    ImportFrame::Last(deallocate) => {
+                        self.pop_frame_checked(deallocate)?;
+                        self.continuation_step()
+                    }
+                }
+            }
+            ApplyTarget::Raised(step) => Ok(step),
+        }
+    }
+}
+
+/// The frame discipline a `call_ext*` form applies to its resolved target.
+///
+/// See [`Machine::apply_import_target`].
+enum ImportFrame {
+    /// `call_ext`: a non-tail call — the caller's next instruction is stored as the
+    /// live frame's continuation on the enter path, and a synchronous value is
+    /// followed by `Step::Next`.
+    Call,
+    /// `call_ext_only`: a tail call — nothing is stored; the frame's *existing*
+    /// continuation is followed, and a synchronous value is followed through
+    /// [`Machine::continuation_step`].
+    Only,
+    /// `call_ext_last`: a tail call that pops the `deallocate` frame before entering
+    /// the callee (or before following the successor frame's continuation).
+    Last(u32),
+}
+
+/// The argument count past which C's `apply()` raises `error:system_limit`
+/// (`../../erts/emulator/beam/erl_vm.h:48`, `MAX_ARG = 255`).
+const MAX_ARG: usize = 255;
+
+/// C's `apply of apply/3` argument-list shape (`beam_common.c:1472-1495`): a
+/// **3-element** list `[M, F, Inner]`, returning the three elements. Anything else
+/// yields `None` (C `break`s out of the unwrap loop).
+fn unwrap_apply3(list: Eterm) -> Option<(Eterm, Eterm, Eterm)> {
+    if !is_list(list) {
+        return None;
+    }
+    let m = crate::terms::cons_head(list).ok()?;
+    let tail = crate::terms::cons_tail(list).ok()?;
+    if !is_list(tail) {
+        return None;
+    }
+    let f = crate::terms::cons_head(tail).ok()?;
+    let tail2 = crate::terms::cons_tail(tail).ok()?;
+    if !is_list(tail2) {
+        return None;
+    }
+    let inner = crate::terms::cons_head(tail2).ok()?;
+    let tail3 = crate::terms::cons_tail(tail2).ok()?;
+    if !is_nil(tail3) {
+        return None;
+    }
+    Some((m, f, inner))
 }
 
 /// Raise the failed-clause reason: class `error` with the **bare atom**

@@ -394,7 +394,7 @@ impl RuntimeContext<'_> {
     ///
     /// The value is the oracle's `true` for `minor` **and** `major` alike: the runtime
     /// records *that* a collection was asked for, and the two modes differ only in the
-    /// collector's own escalation policy (`beam_gc::Collector::collect` picks a minor or a
+    /// collector's own escalation policy (`beam_gc::AnyCollector::collect` picks a minor or a
     /// fullsweep from the live set and the growth table), which this BIF does not
     /// second-guess. The latch, the serving points and the honest refusals are
     /// [`Self::request_own_gc`]'s.

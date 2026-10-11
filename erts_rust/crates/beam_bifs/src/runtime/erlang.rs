@@ -27,7 +27,7 @@
 //! answer only the running runtime has**: process control (`spawn/3`,
 //! `spawn_link/3`, `spawn_opt/4`, `link/1,2`, `unlink/1`, `monitor/2,3`,
 //! `demonitor/1,2`, `exit/2,3`, `exit_signal/2,3`, `hibernate/3`,
-//! `resume_process/1`, `send/3`, `alias/1`, `unalias/1`), the timer wheel
+//! `resume_process/1`, `alias/1`, `unalias/1`), the timer wheel
 //! (`start_timer/3,4`, `send_after/3,4`, `cancel_timer/1,2`, `read_timer/1,2`),
 //! code loading (`function_exported/3`, `module_loaded/1`, `loaded/0`,
 //! `pre_loaded/0`, `check_old_code/1`, `delete_module/1`, `is_builtin/3`,
@@ -43,9 +43,12 @@
 //! in the Stage-5 runtime (schedulers, code store, timer wheel, node tables),
 //! which is a different crate this layer may not touch.
 //!
+//! `erlang:send/3` is deliberately **not** here: its option list is parsed in
+//! [`crate::proc`] next to `send/2`, and only the delivery is a seam (`SendHook`).
+//!
 //! # One seam, one honest gap
 //!
-//! **74 of the 77** keys therefore resolve through the **single**
+//! **73 of the 76** keys therefore resolve through the **single**
 //! [`RuntimeHooks`](crate::context::RuntimeHooks) dispatcher (via
 //! [`BifContext::call_runtime_bif`](crate::context::BifContext::call_runtime_bif)),
 //! which is handed the `(module, function, arity)` identity verbatim so the
@@ -71,11 +74,11 @@
 //! [`crate::RUNTIME_HOOKS_BIFS`]** — a seam-registered key is unreachable behind the
 //! runtime's native floor, while a real `BifFn` is reachable through the registry.
 //!
-//! # Roster (77 keys, all `bif.tab`-declared)
+//! # Roster (76 keys, all `bif.tab`-declared)
 //!
 //! `../../erts/emulator/beam/bif.tab` lines: 59, 66, 67, 81, 88, 96, 99, 106,
 //! 107, 108, 109, 112, 113, 114, 128, 141, 142, 144, 156, 159-167, 205, 212,
-//! 213, 218-223, 225, 228, 252-259, 265, 266, 268, 271, 277-279, 288, 325,
+//! 213, 218-223, 225, 228, 252-259, 265, 266, 268, 271, 277-279, 288,
 //! 470, 528, 529, 582, 596-600, 604, 605, 611, 668, 772-775, 814, 815, 846.
 
 use std::sync::OnceLock;
@@ -156,7 +159,6 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     runtime_bif!(reg, "erlang", read_timer, 1);
     runtime_bif!(reg, "erlang", read_timer, 2);
     runtime_bif!(reg, "erlang", resume_process, 1);
-    runtime_bif!(reg, "erlang", send, 3);
     runtime_bif!(reg, "erlang", send_after, 3);
     runtime_bif!(reg, "erlang", send_after, 4);
     runtime_bif!(reg, "erlang", seq_trace, 2);
@@ -180,7 +182,7 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     runtime_bif!(reg, "erlang", unalias, 1);
     runtime_bif!(reg, "erlang", unlink, 1);
     // The three keys this family owns for real (see `REAL_BIFS`). They are
-    // registered on top of the seam roster above and keep `reg.len() == 77`
+    // registered on top of the seam roster above and keep `reg.len() == 76`
     // because they are *not* among the `runtime_bif!` keys.
     reg.register("erlang", "is_builtin", 3, is_builtin_3);
     reg.register("erlang", "term_to_iovec", 1, term_to_iovec_1);
@@ -585,10 +587,10 @@ mod tests {
     }
 
     #[test]
-    fn register_installs_all_seventy_seven_keys() {
+    fn register_installs_all_seventy_six_keys() {
         let mut reg = BifRegistry::new();
         register(&mut reg);
-        assert_eq!(reg.len(), 77, "the 77 runtime-coupled erlang keys");
+        assert_eq!(reg.len(), 76, "the 76 runtime-coupled erlang keys");
         // A spot-check across the families: process control, code loading, node
         // introspection, the timer wheel, the distribution layer.
         for (name, arity) in [

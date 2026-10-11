@@ -39,14 +39,14 @@
 //! | [`DictHook`] | [`DICT_HOOK_BIFS`] | 7 |
 //! | [`ProcessHook`] | [`PROCESS_HOOK_BIFS`] | 11 |
 //! | [`PortHook`] | [`PORT_HOOK_BIFS`] | 4 |
-//! | [`SendHook`] | [`SEND_HOOK_BIFS`] | 2 |
+//! | [`SendHook`] | [`SEND_HOOK_BIFS`] | 3 |
 //! | [`NifLoader`] | [`NIF_LOADER_BIFS`] | 1 |
 //! | [`RecordSource`] | [`RECORD_SOURCE_BIFS`] | 1 |
 //! | [`ModuleInfo`] | [`MODULE_INFO_BIFS`] | 2 |
 //! | [`PersistentTerm`] | [`PERSISTENT_TERM_BIFS`] | 7 |
 //! | [`FunCaller`] | [`FUN_CALLER_BIFS`] | 22 |
 //! | [`LocalNode`] | [`LOCAL_NODE_BIFS`] | 6 |
-//! | [`RuntimeHooks`] | [`RUNTIME_HOOKS_BIFS`] | 188 |
+//! | [`RuntimeHooks`] | [`RUNTIME_HOOKS_BIFS`] | 187 |
 //!
 //! # Why the sets live **here**, not in the host
 //!
@@ -100,7 +100,7 @@
 //! | `RuntimeContext::uses_send_hook` | [`needs_send_hook`] |
 //! | `RuntimeContext::uses_module_info` | [`needs_module_info`] |
 //! | `RuntimeContext::uses_persistent_term` | [`needs_persistent_term`] |
-//! | `RuntimeContext::uses_runtime_hooks` | [`needs_runtime_hooks`] (the whole 188-key seam) |
+//! | `RuntimeContext::uses_runtime_hooks` | [`needs_runtime_hooks`] (the whole 187-key seam) |
 //! | — (the port hook is installed unconditionally today) | [`needs_port_hook`] |
 //! | — (the fun caller is gated by `reentrancy_capable(args)` today) | [`needs_fun_caller`] |
 //! | — (the local node is installed unconditionally today) | [`needs_local_node`] |
@@ -201,8 +201,9 @@ pub const PORT_HOOK_BIFS: &[(&str, &str, u32)] = &[
     ("erlang", "port_info", 2),
 ];
 
-/// The registered BIFs that read the [`SendHook`] seam — `erlang:send/2` and its
-/// quoted alias `erlang:'!'/2`, the same `src/proc.rs` implementation.
+/// The registered BIFs that read the [`SendHook`] seam — `erlang:send/2`, its quoted
+/// alias `erlang:'!'/2` and the options-aware `erlang:send/3`, all three the `src/proc.rs`
+/// implementations (`send/2` and `"!"/2` are the *same* `BifFn`).
 ///
 /// `erlang:self/0` shares the module but reads only the injected
 /// [`BifContext::self_pid`](crate::context::BifContext::self_pid), so it is absent.
@@ -210,6 +211,7 @@ pub const PORT_HOOK_BIFS: &[(&str, &str, u32)] = &[
 pub const SEND_HOOK_BIFS: &[(&str, &str, u32)] = &[
     ("erlang", "!", 2),
     ("erlang", "send", 2),
+    ("erlang", "send", 3),
 ];
 
 /// The registered BIFs that read the [`NifLoader`] seam — `erlang:load_nif/2`, the
@@ -320,9 +322,9 @@ pub const LOCAL_NODE_BIFS: &[(&str, &str, u32)] = &[
 /// through the `runtime_bif!` macro in `src/runtime/`, each bridging to
 /// [`BifContext::call_runtime_bif`](crate::context::BifContext::call_runtime_bif).
 ///
-/// The union of the four `runtime_bif!` family modules: `runtime/erlang.rs` (77),
+/// The union of the four `runtime_bif!` family modules: `runtime/erlang.rs` (76),
 /// `runtime/erts_internal.rs` (56), `runtime/erts_debug.rs` (18) and
-/// `runtime/other.rs` (44) = **195** registered keys, of which **188** forward to the
+/// `runtime/other.rs` (44) = **194** registered keys, of which **187** forward to the
 /// seam — the seven keys with real implementations (`erlang:is_builtin/3`,
 /// `erlang:term_to_iovec/1,2`, `erts_debug:map_info/1`,
 /// `erts_debug:unaligned_bitstring/2`, `erts_internal:ets_raw_first/1` and
@@ -419,7 +421,6 @@ pub const RUNTIME_HOOKS_BIFS: &[(&str, &str, u32)] = &[
     ("erlang", "read_timer", 1),
     ("erlang", "read_timer", 2),
     ("erlang", "resume_process", 1),
-    ("erlang", "send", 3),
     ("erlang", "send_after", 3),
     ("erlang", "send_after", 4),
     ("erlang", "seq_trace", 2),
@@ -857,11 +858,11 @@ mod tests {
     }
 
     #[test]
-    fn send_hook_bifs_are_both_send_names() {
+    fn send_hook_bifs_are_every_send_name() {
         // `erlang:self/0` shares the module but reads only the injected pid.
         assert_eq!(
             SEND_HOOK_BIFS,
-            &[("erlang", "!", 2), ("erlang", "send", 2)]
+            &[("erlang", "!", 2), ("erlang", "send", 2), ("erlang", "send", 3)]
         );
     }
 
@@ -1134,7 +1135,7 @@ mod tests {
     /// magnitude explicit).
     #[test]
     fn runtime_hooks_bifs_has_the_expected_size() {
-        assert_eq!(RUNTIME_HOOKS_BIFS.len(), 188);
+        assert_eq!(RUNTIME_HOOKS_BIFS.len(), 187);
     }
 
     /// The module-doc table at the top of this file is the human-readable record of the
@@ -1317,7 +1318,7 @@ mod tests {
                 needs_send_hook,
                 "needs_send_hook",
                 &[
-                    ("erlang", "send", 3), // wrong arity; a runtime-hooks key
+                    ("erlang", "send", 1), // wrong arity
                     ("erlang", "self", 0), // the same module, but reads only the pid
                     ("erlang", "!", 1),    // wrong arity
                     ("maps", "send", 2),   // wrong module

@@ -111,8 +111,11 @@
 
 use core::cmp::Ordering;
 
+use beam_alloc::Heap;
 use beam_common::{BeamError, Result};
-use beam_term::{signed_value, Eterm, MAX_SMALL, MIN_SMALL};
+use beam_ets::ArithOp;
+use beam_process::ProcessId;
+use beam_term::{signed_value, AtomTable, Eterm, MAX_SMALL, MIN_SMALL};
 
 use crate::access;
 use crate::context::BifContext;
@@ -519,6 +522,71 @@ fn shift_amount(b: &Big) -> (bool, Option<usize>) {
     };
     (b.negative, magnitude)
 }
+/// The match-spec arithmetic seam: evaluate one [`ArithOp`] over its
+/// already-evaluated operands with this crate's **arbitrary-precision** operators —
+/// the implementation behind the `beam_ets` `ArithHook` this crate installs
+/// ([`crate::ets::arith_hook`]).
+///
+/// It reuses the registered `erlang` operator implementations verbatim (the same
+/// functions [`register`] wires up), so a match-spec guard or body computes exactly
+/// what the corresponding Erlang expression computes: a bignum operand or an
+/// out-of-range result is the same promoted integer (`1 bsl 100`, `(1 bsl 100) + 1`),
+/// `/` is always a float, and `bsl`/`bsr` follow the C `erts_shift` count-flip and
+/// saturation rules. This lifts the `DefaultArithHook` subset gap (checked small-int
+/// arithmetic only).
+///
+/// # Errors
+///
+/// Every failure the oracle raises for the operation — a non-number operand
+/// (`badarith`), `div`/`rem` by a zero divisor, a float overflow, a left shift past
+/// the bignum cap (`system_limit`) — is reported as [`BeamError::BadArg`], the one
+/// class the match-spec executor treats as the oracle's own raise (an unmet guard /
+/// the body sentinel `EXIT`; `../beam_ets/src/select/exec.rs`). A wrong operand count
+/// is `badarg` too; it is only reachable by calling the seam directly, since the
+/// decoder rejects every other arity at compile time.
+pub(crate) fn match_spec_arith(
+    op: ArithOp,
+    args: &[Eterm],
+    atoms: &AtomTable,
+    heap: &mut Heap,
+) -> Result<Eterm> {
+    // The operators read no process identity, so a placeholder pid is harmless here
+    // (they only touch the heap and the atom table, both borrowed from the caller).
+    let mut ctx = BifContext::new(heap, atoms, ProcessId::new(0, 0));
+    let outcome = match (op, args.len()) {
+        // Unary `+`/`-` reuse the identity / the negation.
+        (ArithOp::Add, 1) => identity(&mut ctx, args),
+        (ArithOp::Sub, 1) => negate(&mut ctx, args),
+        (ArithOp::Add, 2) => add(&mut ctx, args),
+        (ArithOp::Sub, 2) => sub(&mut ctx, args),
+        (ArithOp::Mul, 2) => mul(&mut ctx, args),
+        (ArithOp::Div, 2) => divide(&mut ctx, args),
+        (ArithOp::IntDiv, 2) => int_div(&mut ctx, args),
+        (ArithOp::Rem, 2) => int_rem(&mut ctx, args),
+        (ArithOp::Band, 2) => band(&mut ctx, args),
+        (ArithOp::Bor, 2) => bor(&mut ctx, args),
+        (ArithOp::Bxor, 2) => bxor(&mut ctx, args),
+        (ArithOp::Bsl, 2) => bsl(&mut ctx, args),
+        (ArithOp::Bsr, 2) => bsr(&mut ctx, args),
+        _ => return Err(badarg()),
+    };
+    outcome.map_err(oracle_arith_class)
+}
+
+/// The error class the match-spec executor expects: the oracle's `badarith` (a
+/// non-number operand, a zero divisor, a float overflow) and `system_limit` (an
+/// oversized shift) are both caught by the C `matchCatch` deep inside the matcher
+/// and never surface — they are the executor's own `badarg`, so they are mapped to
+/// it here (a guard clause is skipped, a failing body becomes the `EXIT` sentinel).
+/// Any other error is a genuine capability gap and is passed through untouched.
+fn oracle_arith_class(error: BeamError) -> BeamError {
+    match error {
+        BeamError::BadArg => BeamError::BadArg,
+        BeamError::BadArith | BeamError::SystemLimit => badarg(),
+        other => other,
+    }
+}
+
 /// Registers the `erlang` arithmetic BIFs.
 pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("erlang", "+", 2, add);
@@ -2053,5 +2121,140 @@ mod tests {
             assert!(reg.contains("erlang", name, arity), "missing erlang:{name}/{arity}");
         }
         assert_eq!(reg.len(), 15);
+    }
+
+    // ------------------------------------------------- match-spec arithmetic
+    //
+    // The `match_spec_arith` seam feeds the `beam_ets` match-spec `ArithHook`. It
+    // must produce the *oracle's* value where the default hook's small-int subset
+    // refuses, and it must report the oracle's raise as `badarg` (the class the
+    // match-spec executor treats as an unmet guard / the body `EXIT`).
+
+    /// Runs a `match_spec_arith` body over one live heap + atom table.
+    ///
+    /// Every operand **and** result term must be built and inspected inside `f`: the
+    /// terms are pointers into `heap` (a fixed-capacity bump arena that never
+    /// reallocates), so a term escaping the closure — or a second heap created per
+    /// call — would dangle the moment that heap is dropped.
+    fn with_spec<R>(f: impl FnOnce(&mut Heap, &AtomTable) -> R) -> R {
+        let mut heap = Heap::new(TEST_HEAP_WORDS).expect("test heap");
+        let atoms = atoms();
+        f(&mut heap, &atoms)
+    }
+
+    /// Assert a match-spec arithmetic refusal is the executor's `badarg` (never the
+    /// oracle's own `badarith`/`system_limit`, which would be wrongly propagated as a
+    /// capability gap).
+    fn assert_spec_badarg(result: Result<Eterm>) {
+        match result.expect_err("expected a refusal") {
+            BeamError::BadArg => {}
+            other => panic!("expected badarg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn match_spec_arith_computes_bignums_the_default_hook_refuses() {
+        with_spec(|heap, atoms| {
+            // erl: `1 bsl 100` is the bignum 1267650600228229401496703205376 — outside
+            // the `DefaultArithHook` subset.
+            let shifted =
+                match_spec_arith(ArithOp::Bsl, &[make_small(1), make_small(100)], atoms, heap)
+                    .unwrap();
+            assert_eq!(parts(shifted), (false, limbs(1u128 << 100)));
+
+            // erl: `(1 bsl 100) + 1` — a bignum operand *and* a bignum result.
+            let sum = match_spec_arith(ArithOp::Add, &[shifted, make_small(1)], atoms, heap)
+                .unwrap();
+            assert_eq!(value(sum), (1i128 << 100) + 1);
+
+            // erl: `(1 bsl 100) band (1 bsl 100)` — the bitwise ops accept bignums too.
+            let masked = match_spec_arith(ArithOp::Band, &[shifted, shifted], atoms, heap)
+                .unwrap();
+            assert_eq!(parts(masked), (false, limbs(1u128 << 100)));
+        });
+    }
+
+    #[test]
+    fn match_spec_arith_promotes_a_result_just_past_the_small_range() {
+        with_spec(|heap, atoms| {
+            // erl: `576460752303423487 + 1` is `576460752303423488` = 2^59, the first
+            // integer past the 60-bit small range (a bignum the default hook refuses).
+            let sum =
+                match_spec_arith(ArithOp::Add, &[make_small(MAX_SMALL), make_small(1)], atoms, heap)
+                    .unwrap();
+            assert_eq!(value(sum), i128::from(MAX_SMALL) + 1);
+            assert!(!access::is_small(sum), "2^59 must be a bignum, not a small int");
+        });
+    }
+
+    #[test]
+    fn match_spec_arith_keeps_the_oracle_float_and_unary_semantics() {
+        with_spec(|heap, atoms| {
+            // erl: `/` always yields a float (`7/2` is `3.5`), even over bignum operands.
+            let quotient =
+                match_spec_arith(ArithOp::Div, &[make_small(7), make_small(2)], atoms, heap)
+                    .unwrap();
+            assert_eq!(float(quotient), 3.5);
+
+            // erl: unary `-` of a bignum negates it.
+            let power =
+                match_spec_arith(ArithOp::Bsl, &[make_small(1), make_small(100)], atoms, heap)
+                    .unwrap();
+            let negated = match_spec_arith(ArithOp::Sub, &[power], atoms, heap).unwrap();
+            assert_eq!(value(negated), -(1i128 << 100));
+
+            // erl: unary `+` is the identity. The operator re-materializes the integer on
+            // the heap (`int_term`), so identity here is the *value*, not the pointer —
+            // both the sign/limbs and the exact numeric value must match the operand.
+            let identity_of = match_spec_arith(ArithOp::Add, &[power], atoms, heap).unwrap();
+            assert_eq!(parts(identity_of), parts(power));
+            assert_eq!(value(identity_of), value(power));
+        });
+    }
+
+    #[test]
+    fn match_spec_arith_reports_the_oracles_raises_as_badarg() {
+        with_spec(|heap, atoms| {
+            // erl raises `badarith` for a non-number operand; the match-spec executor must
+            // see `badarg`, exactly like the default hook's equivalent (`1 + []`).
+            assert_spec_badarg(match_spec_arith(ArithOp::Add, &[make_small(1), NIL], atoms, heap));
+            // erl raises `badarith` for `div`/`rem` by zero.
+            assert_spec_badarg(match_spec_arith(
+                ArithOp::IntDiv,
+                &[make_small(1), make_small(0)],
+                atoms,
+                heap,
+            ));
+            assert_spec_badarg(match_spec_arith(
+                ArithOp::Rem,
+                &[make_small(1), make_small(0)],
+                atoms,
+                heap,
+            ));
+            // erl raises `system_limit` for a left shift past the bignum cap
+            // (`1 bsl 1073741824`); the executor must still see its own `badarg`.
+            assert_spec_badarg(match_spec_arith(
+                ArithOp::Bsl,
+                &[make_small(1), make_small(1 << 30)],
+                atoms,
+                heap,
+            ));
+        });
+    }
+
+    #[test]
+    fn match_spec_arith_rejects_a_wrong_operand_count() {
+        with_spec(|heap, atoms| {
+            // Only reachable by calling the seam directly (the decoder rejects every other
+            // arity at compile time), but it must not fabricate a value.
+            assert_spec_badarg(match_spec_arith(
+                ArithOp::Add,
+                &[make_small(1), make_small(2), make_small(3)],
+                atoms,
+                heap,
+            ));
+            assert_spec_badarg(match_spec_arith(ArithOp::Mul, &[make_small(2)], atoms, heap));
+            assert_spec_badarg(match_spec_arith(ArithOp::Band, &[], atoms, heap));
+        });
     }
 }

@@ -66,8 +66,15 @@
 //!   appends the name to its `struct ErlDrvTid_` record instead.
 //! * **`try_lock`'s busy code is pthread's `EBUSY`** (as the C's `ethread`). A *null* handle yields
 //!   `EINVAL` where the C calls `erts_exit` (`erl_drv_thread.c:208,400-412`).
-//! * **An unnamed object returns null** from its `*_name` accessor. The C returns the static
-//!   string `"unknown"` (`no_name`, `erl_drv_thread.c:99,135`).
+//! * **An unnamed object has no *stored* name here**, so this layer's `*_name` accessors report it
+//!   as null. The C instead stores the static string `no_name` = `"unknown"` in every handle it
+//!   creates with a NULL name (`erl_drv_thread.c:99,135`; assigned at `:170`, `:264`, `:341`, `:639`,
+//!   `:678`) and answers `handle ? handle->name : NULL` (`:198`, `:283`, `:365`, `:656`), so a
+//!   **live** handle never answers null. [`no_name`] is that string; the **driver** facade
+//!   (`crate::driver::drv::threads`) renders the unnamed state with it, so contract A.4 is
+//!   byte-exact. The **NIF** facade over this layer (`crate::nif::enif`) still reports null — a
+//!   documented deviation of that facade, even though the C's `enif_*_name` is a one-line forward to
+//!   the same implementation (`erl_nif.c:2405-2441`).
 //! * **Handle misuse never aborts.** A null handle is a no-op (destroy/lock/signal) or the
 //!   documented failure code (`EINVAL`); the C calls `erts_exit(ERTS_ABORT_EXIT, ...)`.
 //! * **`cond_wait` makes a single `pthread_cond_wait` call.** The C retries until it returns `0`
@@ -159,11 +166,32 @@ fn copy_name(name: *const c_char) -> Option<Vec<u8>> {
 
 /// The `char *` a `*_name` accessor returns for a stored name: a pointer into the object's own
 /// NUL-terminated buffer (stable until the object is destroyed), or null when unnamed.
+///
+/// A frozen ABI whose C stores `no_name` for a handle created with a NULL name renders that null with
+/// [`no_name`] instead (see the module docs).
 fn name_ptr(name: &Option<Vec<u8>>) -> *mut c_char {
     match name {
         Some(bytes) => bytes.as_ptr() as *mut c_char,
         None => ptr::null_mut(),
     }
+}
+
+/// The C's `no_name` string (`erl_drv_thread.c:99`, assigned `"unknown"` at `:135`).
+///
+/// The C stores a pointer to it in every handle it creates with a NULL name
+/// (`erl_drv_thread.c:170`, `:264`, `:341`, `:639`, `:678`, `:772`), so its `*_name` accessors — all
+/// shaped `handle ? handle->name : NULL` (`:198`, `:283`, `:365`, `:656`) — answer it for every
+/// **live** handle and reserve null for a **null handle**. NUL-terminated and `'static`, so a pointer
+/// to it is never dangling.
+static NO_NAME: [u8; 8] = *b"unknown\0";
+
+/// The C's `no_name` as the `char *` a frozen ABI's `*_name` accessor reports for a **live** handle
+/// created with a NULL name: the string `"unknown"` (never null, never dangling).
+///
+/// This layer keeps the unnamed state as a null name ([`name_ptr`]); a facade that must reproduce the
+/// C's `*_name` contract renders it with this function (the driver facade does — see the module docs).
+pub fn no_name() -> *mut c_char {
+    NO_NAME.as_ptr() as *mut c_char
 }
 
 /// Bit-cast a platform `pthread_t` into the C `void *` tid handle.
@@ -857,12 +885,25 @@ pub unsafe fn thread_join(tid: Tid, out_resp: *mut *mut c_void) -> c_int {
 ///
 /// Null is returned for an unnamed thread, for an unknown tid, and for a thread that has already
 /// been joined (its entry is retired). The returned buffer stays valid until that thread is joined.
+///
+/// [`thread_created_unnamed`] tells the two null cases that matter apart: a thread this layer created
+/// with a NULL name (which the C reports as [`no_name`], `erl_drv_thread.c:638-639`) versus a tid this
+/// layer does not know.
 pub fn thread_name(tid: Tid) -> *mut c_char {
     let threads = created_threads();
     match threads.get(&tid_key(tid)).and_then(|name| name.as_deref()) {
         Some(bytes) => bytes.as_ptr() as *mut c_char,
         None => ptr::null_mut(),
     }
+}
+
+/// Whether `tid` is a thread created through this layer **with a NULL name** — the state the C stores
+/// as its [`no_name`] pointer in the tid record (`erl_drv_thread.c:638-639`).
+///
+/// `false` for a named created thread, for a tid this layer did not create, and for a null tid — the
+/// last two are indistinguishable here, since no handle of a foreign thread is ever registered.
+pub fn thread_created_unnamed(tid: Tid) -> bool {
+    !tid.is_null() && matches!(created_threads().get(&tid_key(tid)), Some(None))
 }
 
 /// The type of the calling thread — `ERL_NIF_THR_*` (`enif_thread_type`, `erl_nif.c:3606-3625`).

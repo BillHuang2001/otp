@@ -16,10 +16,14 @@ Ground truth (read-only, never modify): `../../../../../erts/emulator/beam/emu/*
 - `dispatch.rs` — `run_loop`/`run_loop_with_map` (thin run entries over `Machine::drive`), `enter_run` (the per-run
   prologue that binds the literal area and records the entry call), **`Machine::step_instruction`** (the one-instruction
   dispatcher — also the JIT deopt target — which wraps the body `step_instruction_inner` with the uniform raise
-  funnel, see below), `return_step`, `resolve_external_entry` (the `call_ext*` cross-module seam).
+  funnel, see below), `return_step`, `resolve_call_ext_apply` (the `erlang:apply/3` special case — C's
+  `fixed_apply`→`apply()`), `resolve_external_entry` (the `call_ext*` cross-module seam), `apply_import_target` +
+  `ImportFrame` (the arm's own frame discipline over a resolved target).
 - `bif.rs` — `exec_bif` (`gc_bif`/`bif`/`bif0` operand marshalling + the fail-label/raise split), `call_import`
-  (`call_ext*`), `raise_bif_error` (the catch-aware raise, shared with the families), `dispatch_wide`;
-  `STACK_ARGS = 2` (arities ≤ it marshal through a fixed stack array, larger ones through the reusable `args_scratch`).
+  (`call_ext*`), `raise_bif_error` (the catch-aware raise, shared with the families — `families::funs::apply_target`
+  for an applied-target host BIF error, and `families::funs::call_fun` for the closure-apply fallback),
+  `dispatch_wide`; `STACK_ARGS = 2` (arities ≤ it marshal through a fixed stack array, larger ones through the
+  reusable `args_scratch`).
 - `test.rs` — `Machine::eval_test` (all 25 `TestKind`s) + `eval_is_function2`/`eval_is_tagged_tuple`/`eval_test_arity`.
 - `trace.rs` — the contract-A.8 `call`/`return_from`/`return_to` emission (gated on `Machine::trace_on`).
 - `tests.rs` — the unit tests migrated from the former single-file `interpreter.rs`.
@@ -27,7 +31,9 @@ Ground truth (read-only, never modify): `../../../../../erts/emulator/beam/emu/*
 ## Instruction ownership
 - **Core arms executed inline in `step_instruction`** (`dispatch.rs`): the metadata no-ops (`Label`, `Line`,
   `IntCodeEnd`, `ExecutableLine`, `DebugLine`, `NifStart`, `OnLoad`); `FuncInfo`; `Move`/`Swap`/`InitYregs`;
-  `Test`; `SelectVal`; `Jump`; `GcBif`/`Bif`/`Bif0`; `Call`/`CallLast`/`CallOnly`/`CallExt`/`CallExtOnly`/`CallExtLast`;
+  `Test`; `SelectVal`; `Jump`; `GcBif`/`Bif`/`Bif0`; `Call`/`CallLast`/`CallOnly`/`CallExt`/`CallExtOnly`/`CallExtLast`
+  (each `CallExt*` arm first special-cases an `erlang:apply/3` import through `resolve_call_ext_apply`, and otherwise
+  resolves the callee through the `call_ext*` cross-module seam);
   `Allocate`/`AllocateHeap`/`TestHeap`/`Deallocate`/`DeallocateReturn`/`Trim`; `Return`; `Generic`.
 - **Everything else** falls to the catch-all `other => families::dispatch(...)` arm → the single owning family (tuples,
   records, lists, funs, exceptions, floats, maps, bitstrings, receive); an unclaimed or declined variant is the typed

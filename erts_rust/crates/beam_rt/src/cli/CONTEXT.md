@@ -56,6 +56,7 @@ All three share two goals: a tokenized environment flag must be indistinguishabl
 | `+JPperfdirectory Dir` | where the perf files are written (default `/tmp`; `ERL_SYM_MAP_FILE` overrides the map file's whole path) → `PerfMapConfig` (preserved verbatim) |
 | `run <file.beam> <mod>:<func>/<arity> [arg…]` | the vertical slice: load the file, run, print the result |
 An unmodeled `-FLAG`/`+FLAG` is **data, not a usage error** (it is preserved, and a `-`-flag is recorded); only a **stray positional argument** (outside `run`) is a usage error (exit 2).
+Two [`HeapOptions`](../config.rs) knobs have **no CLI arm** (the emulator has no `+h`-style switch for either, so they are host/test knobs, not part of this surface): the policy's `initial_mature_words` and its `fullsweep_after`. `ERL_FULLSWEEP_AFTER` is parsed into `ErlEnv` but **not** applied; `BEAM_RT_GC_STRATEGY` (the default-OFF `immix` opt-in) is read by `Runtime::new`, never by this parser — neither is an init argument.
 
 ### The `-boot` boot action
 The bare `Boot` action — the invocation with no `-eval`/`-s`/`-run`/`run` — is the one that drives a boot script: `../cli.rs`'s `run_boot_script` boots the 22 preloaded modules, resolves the `-boot` value exactly as `init`'s `get_boot/2` does and executes the script through the A.7 boot-script executor (`Runtime::boot_from_script`).

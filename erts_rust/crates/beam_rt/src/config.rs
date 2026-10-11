@@ -26,10 +26,19 @@
 //! `init:get_argument/1`) and the **action** the CLI was asked to perform
 //! (`-version`, `-eval`, `-s`, `-run`, `run`, …). The parser that fills it in lives in
 //! [`crate::cli`].
+//!
+//! Two knobs here deliberately sit **outside** that CLI surface, because the emulator has no
+//! switch for either: [`HeapOptions::set_initial_mature_words`] (which mature-generation
+//! size `beam_gc`'s automatic rule resolves a strategy from) and
+//! [`HeapOptions::set_fullsweep_after`]. They are host/test knobs, reachable from a program
+//! through `RuntimeConfig::with_heap_options` and from the host through the default-OFF
+//! `BEAM_RT_GC_STRATEGY` opt-in ([`GcStrategy`], read by [`strategy_env_default`] and
+//! applied once by [`crate::Runtime::new`]) — never as an init argument, never as a flag.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
-use beam_gc::{next_heap_size, HeapPolicy, DEFAULT_MIN_HEAP_WORDS};
+use beam_gc::{next_heap_size, HeapPolicy, DEFAULT_MIN_HEAP_WORDS, IMMIX_BREAK_EVEN_WORDS};
 
 use crate::cli::ErlEnv;
 use crate::config::Action::{Boot, Version};
@@ -182,6 +191,67 @@ impl HeapOptions {
         self.max_heap_flags = flags;
     }
 
+    /// Sets the policy's **initial mature-generation size**, in term words.
+    ///
+    /// This is `beam_gc::HeapPolicy::initial_mature_words` — the size the collector's mature
+    /// space is created with — and it is the **only** input of `beam_gc`'s automatic
+    /// mature-strategy rule (`beam_gc::selection::select_mature`, applied by
+    /// [`GcConfig::new`](beam_gc::GcConfig::new) inside `AnyCollector::new`): a value
+    /// **at or above** [`beam_gc::IMMIX_BREAK_EVEN_WORDS`] resolves to the mark-region
+    /// (`MatureKind::Immix`) mature generation, anything **below** it to the copying one
+    /// (`MatureKind::Copying`, the default at the emulator's 233 words).
+    ///
+    /// # The emulator reality
+    ///
+    /// The emulator has **no `+h`-style switch** for this: `+hms`/`+hmbs`/`+hmax`/`+hmaxk`/
+    /// `+hmaxel`/`+hmaxib` are the whole heap-emulator flag surface ([`HeapOptions`]'s type
+    /// docs state the rounding rule), and none of them touches the mature-generation size.
+    /// So this is a **host/test knob**, not a contract-A.6 CLI surface: it is how a caller
+    /// (or the [`GcStrategy`] opt-in) selects a non-default mature strategy without inventing
+    /// a flag the oracle does not have. It is additive — [`HeapOptions::default`] is
+    /// unchanged by its existence.
+    pub fn set_initial_mature_words(&mut self, words: usize) {
+        self.policy.initial_mature_words = words;
+    }
+
+    /// Sets the policy's **`fullsweep_after`** — the number of minor collections before a
+    /// fullsweep is forced (`0` forces one on every collection).
+    ///
+    /// This is `beam_gc::HeapPolicy::fullsweep_after`, the C `max_gen_gcs`
+    /// (`erl_process.h:1145`), whose default is 65535 (`erl_init.c:843`). The emulator's
+    /// switch for it *is* the `ERL_FULLSWEEP_AFTER` environment variable, which this runtime
+    /// parses into [`ErlEnv`] but does **not** apply — wiring that would
+    /// be an oracle-visible behaviour change, out of this knob's scope. Reaching a fullsweep
+    /// inside a bounded workload (i.e. driving the mature generation at all) is what a host
+    /// uses it for here.
+    pub fn set_fullsweep_after(&mut self, after: u32) {
+        self.policy.fullsweep_after = after;
+    }
+
+    /// Applies a [`GcStrategy`] request to this option set.
+    ///
+    /// [`GcStrategy::EmulatorDefault`] changes **nothing** (the emulator's own policy, and
+    /// the copying mature generation the automatic rule picks below the break-even);
+    /// [`GcStrategy::Immix`] raises the policy's initial mature generation to
+    /// [`beam_gc::IMMIX_BREAK_EVEN_WORDS`] so the automatic rule resolves to the mark-region
+    /// strategy.
+    ///
+    /// # Why a size, not a pin
+    ///
+    /// `beam_gc` can be told the strategy explicitly (`GcConfig::immix`), but the host that
+    /// spawns processes (`beam_process::ProcessTable::spawn`) accepts only a
+    /// [`HeapPolicy`] — there is no `GcConfig`/`MatureSelection` parameter anywhere on the
+    /// process or the process table. The policy's mature size is therefore the only lever a
+    /// **runtime-configured** strategy has, and driving the automatic rule with it yields the
+    /// same observable strategy ([`MatureKind::Immix`](beam_gc::MatureKind::Immix), with
+    /// [`MatureSource::Automatic`](beam_gc::MatureSource::Automatic) rather than a pin)
+    /// through the one seam that exists.
+    pub fn set_gc_strategy(&mut self, strategy: GcStrategy) {
+        if let GcStrategy::Immix = strategy {
+            self.set_initial_mature_words(IMMIX_BREAK_EVEN_WORDS);
+        }
+    }
+
     /// [`set_min_heap_words`](HeapOptions::set_min_heap_words), chainable.
     pub fn with_min_heap_words(mut self, words: usize) -> HeapOptions {
         self.set_min_heap_words(words);
@@ -205,6 +275,89 @@ impl HeapOptions {
         self.set_max_heap_flags(flags);
         self
     }
+
+    /// [`set_initial_mature_words`](HeapOptions::set_initial_mature_words), chainable.
+    pub fn with_initial_mature_words(mut self, words: usize) -> HeapOptions {
+        self.set_initial_mature_words(words);
+        self
+    }
+
+    /// [`set_fullsweep_after`](HeapOptions::set_fullsweep_after), chainable.
+    pub fn with_fullsweep_after(mut self, after: u32) -> HeapOptions {
+        self.set_fullsweep_after(after);
+        self
+    }
+
+    /// [`set_gc_strategy`](HeapOptions::set_gc_strategy), chainable.
+    pub fn with_gc_strategy(mut self, strategy: GcStrategy) -> HeapOptions {
+        self.set_gc_strategy(strategy);
+        self
+    }
+}
+
+/// The **mature-generation strategy** the runtime asks `beam_gc` for when it creates a
+/// process.
+///
+/// `beam_gc` decides a process's mature strategy from the heap policy it is handed: the
+/// automatic rule ([`beam_gc::selection::select_mature`]) picks the mark-region
+/// (`MatureKind::Immix`) space at/above [`beam_gc::IMMIX_BREAK_EVEN_WORDS`] mature words and
+/// the copying space (`MatureKind::Copying`) below it. This enum names the request the
+/// *runtime* makes on top of that rule, resolved by [`strategy_from_value`] /
+/// [`strategy_env_default`] and applied by [`HeapOptions::set_gc_strategy`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GcStrategy {
+    /// The emulator's own behaviour: the configured [`HeapPolicy`] is used exactly as it is
+    /// (the default policy's 233 mature words ⇒ the copying mature generation). **The
+    /// default, and the value of every unrecognised `BEAM_RT_GC_STRATEGY` setting.**
+    #[default]
+    EmulatorDefault,
+    /// Request the **mark-region** mature generation: raise the policy's initial mature
+    /// generation to [`beam_gc::IMMIX_BREAK_EVEN_WORDS`], so `beam_gc`'s automatic rule
+    /// resolves to [`MatureKind::Immix`](beam_gc::MatureKind::Immix) — reached through the
+    /// rule, never an explicit pin (see [`HeapOptions::set_gc_strategy`]).
+    ///
+    /// This is a measurement/host opt-in, **not** an emulator default: `beam_gc`'s own
+    /// break-even measurement (`beam_gc/MEASURED.md`) is why the mark-region space is not
+    /// selected by default.
+    Immix,
+}
+
+/// [`GcStrategy`] for one `BEAM_RT_GC_STRATEGY` value — the **pure** resolution, and the
+/// single definition of that variable's semantics.
+///
+/// * `Some("immix")` (any ASCII case) → [`GcStrategy::Immix`] — the opt-in.
+/// * everything else → [`GcStrategy::EmulatorDefault`], i.e. **no change**: `None` (the
+///   variable is unset), the empty string, a named strategy this runtime keeps as its
+///   default (`"copying"`), and every unrecognised value. An unknown value is deliberately
+///   *not* an error — a typo leaves the emulator behaviour in place rather than silently
+///   switching the collector.
+///
+/// Pure (no environment read), so a test can pin the semantics without mutating the process
+/// environment (the crate is `#![deny(unsafe_code)]`, and `set_var` is `unsafe` in edition
+/// 2024).
+pub fn strategy_from_value(value: Option<&str>) -> GcStrategy {
+    match value {
+        Some(name) if name.eq_ignore_ascii_case("immix") => GcStrategy::Immix,
+        _ => GcStrategy::EmulatorDefault,
+    }
+}
+
+/// The process-wide GC strategy from the `BEAM_RT_GC_STRATEGY` environment variable.
+///
+/// The variable's semantics are [`strategy_from_value`]'s; an unset value, the empty string
+/// and any unrecognised value are [`GcStrategy::EmulatorDefault`] (today's behaviour), and
+/// only `immix` opts in. Read **once** (a `OnceLock`), like `BEAM_RT_TIER`, so a long-running
+/// process pays no repeated `getenv`.
+///
+/// The variable is a **host/test knob**, not part of the A.6 command-line surface: it is
+/// applied by [`Runtime::new`](crate::Runtime::new) to the owned configuration **before** it
+/// is stored — so it is invisible to `init:get_argument/1` (which reads the parsed
+/// [`InitArgs`], untouched) and adds no CLI flag. The pure
+/// [`RuntimeConfig::new`]/[`RuntimeConfig::default`] constructors stay environment-free.
+pub fn strategy_env_default() -> GcStrategy {
+    static DEFAULT: OnceLock<GcStrategy> = OnceLock::new();
+    *DEFAULT
+        .get_or_init(|| strategy_from_value(std::env::var("BEAM_RT_GC_STRATEGY").ok().as_deref()))
 }
 
 /// The parsed **init arguments**: for every command-line flag, the list of its
@@ -620,6 +773,106 @@ mod tests {
         assert_eq!(
             HeapOptions::new().with_max_heap_flags(flags).max_heap_flags(),
             flags
+        );
+    }
+
+    /// The two host/test knobs added to [`HeapOptions`] are **additive**: the emulator
+    /// defaults ([`HeapOptions::default`]) are byte-identical with them present, and each
+    /// setter/`with_*` round-trips exactly one policy field.
+    ///
+    /// The default mature-generation size is the C's `H_DEFAULT_SIZE` (233) — the same figure
+    /// the default `min_heap_size` uses — and the default `fullsweep_after` is 65535
+    /// (`erl_init.c:843`), so the automatic mature-strategy rule keeps the copying space
+    /// (233 < [`beam_gc::IMMIX_BREAK_EVEN_WORDS`]).
+    #[test]
+    fn mature_size_and_fullsweep_are_additive_host_knobs() {
+        let default = HeapOptions::default();
+        assert_eq!(default.policy().initial_mature_words, 233);
+        assert_eq!(default.policy().fullsweep_after, 65_535);
+        assert_eq!(
+            default.policy().initial_mature_words,
+            beam_gc::HeapPolicy::default().initial_mature_words
+        );
+        // `new()` and `default()` agree, and neither knob changes anything else.
+        assert_eq!(HeapOptions::new(), default);
+        assert_eq!(default.clone().with_initial_mature_words(233), default);
+        assert_eq!(default.clone().with_fullsweep_after(65_535), default);
+
+        // The setters round-trip.
+        let mut heap = HeapOptions::new();
+        heap.set_initial_mature_words(IMMIX_BREAK_EVEN_WORDS);
+        heap.set_fullsweep_after(1);
+        assert_eq!(heap.policy().initial_mature_words, IMMIX_BREAK_EVEN_WORDS);
+        assert_eq!(heap.policy().fullsweep_after, 1);
+        // … and only those fields moved.
+        assert_eq!(heap.policy().min_heap_words, default.policy().min_heap_words);
+        assert_eq!(
+            heap.policy().min_bin_vheap_words,
+            default.policy().min_bin_vheap_words
+        );
+        assert_eq!(heap.policy().max_heap_words, default.policy().max_heap_words);
+        assert_eq!(heap.max_heap_flags(), default.max_heap_flags());
+        // The `with_*` forms chain to the same state.
+        assert_eq!(
+            HeapOptions::new()
+                .with_initial_mature_words(IMMIX_BREAK_EVEN_WORDS)
+                .with_fullsweep_after(1),
+            heap
+        );
+    }
+
+    /// `BEAM_RT_GC_STRATEGY`'s semantics, pinned **without** touching the process
+    /// environment (a test that set the real variable would race every other test in this
+    /// binary, and `set_var` is `unsafe`).
+    #[test]
+    fn gc_strategy_from_value_is_the_single_definition() {
+        // Unset, empty, the default strategy named explicitly and any typo all mean "no
+        // change" — never an error and never a silent switch of the collector.
+        for value in [None, Some(""), Some("copying"), Some("nope"), Some("im mix")] {
+            assert_eq!(
+                strategy_from_value(value),
+                GcStrategy::EmulatorDefault,
+                "{value:?} must leave the emulator behaviour in place"
+            );
+        }
+        // `immix` opts in, in any ASCII case.
+        for value in ["immix", "Immix", "IMMIX"] {
+            assert_eq!(strategy_from_value(Some(value)), GcStrategy::Immix);
+        }
+        // The default value of the type is the emulator behaviour.
+        assert_eq!(GcStrategy::default(), GcStrategy::EmulatorDefault);
+    }
+
+    /// Applying a strategy moves **exactly** the mature-generation size — the one lever a
+    /// runtime-configured strategy has (`ProcessTable::spawn` takes only a `HeapPolicy`, so
+    /// there is no `MatureSelection` pin to set).
+    #[test]
+    fn applying_a_gc_strategy_only_moves_the_mature_size() {
+        let default = HeapOptions::default();
+        // The emulator default changes nothing at all.
+        assert_eq!(default.clone().with_gc_strategy(GcStrategy::EmulatorDefault), default);
+        // The opt-in raises the mature generation to the rule's break-even (so the automatic
+        // rule resolves to the mark-region strategy) and nothing else.
+        let immix = default.clone().with_gc_strategy(GcStrategy::Immix);
+        assert_eq!(immix.policy().initial_mature_words, IMMIX_BREAK_EVEN_WORDS);
+        assert_eq!(immix.policy().min_heap_words, default.policy().min_heap_words);
+        assert_eq!(immix.policy().fullsweep_after, default.policy().fullsweep_after);
+        assert_eq!(
+            immix.policy().min_bin_vheap_words,
+            default.policy().min_bin_vheap_words
+        );
+        // A `set_gc_strategy` on an already-configured option set is equivalent.
+        let mut heap = HeapOptions::default();
+        heap.set_gc_strategy(GcStrategy::Immix);
+        assert_eq!(heap, immix);
+        // The break-even really is the automatic rule's switch-over point.
+        assert_eq!(
+            beam_gc::select_mature(immix.policy().initial_mature_words),
+            beam_gc::MatureKind::Immix
+        );
+        assert_eq!(
+            beam_gc::select_mature(default.policy().initial_mature_words),
+            beam_gc::MatureKind::Copying
         );
     }
 

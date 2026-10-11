@@ -85,7 +85,7 @@ Only **frozen contracts and non-obvious behaviour** are listed; rustdoc carries 
   `SpawnSpec { Spawn { command, argv }, SpawnExecutable { path }, Fd { fd } }` = the term-free `open_port/2` `Name` (`command()` = the `port_info(Port, name)` value, `fd:<N>` for the descriptor form); `SpawnOptions { stream, cd, env, args, exit_status }` (Default `list`); `StreamOptions { stderr_to_stdout, eof }` (Default both `false`) shapes only the child's streams.
   `build_command(spec, options)` sets argv, shell-vs-direct, `{cd,…}`/`{env,…}` and the standard streams (`stdin`/`stdout` piped, `stderr` inherited or — under `stderr_to_stdout` — an **exact fd-1 duplicate** via `pre_exec` `dup2(1,2)`); an empty command/path or argv⇒`BadArg`.
   `SpawnDriver` (`name() == "spawn"`) is **constructed** (`with_stream_options`), **really spawning** in the constructor and reaping eagerly; accessors `os_pid`/`command`/`stream`/`eof`/`exited()`, plus the once-only `take_exit_status()`/`take_eof()`.
-  A failed spawn is either an `access(X_OK)`-rejected path (a constructor `BeamError::Raise` with the errno atom) or a path the check accepts but `exec` rejects (a searchable **directory**, a no-executable-format file) — the latter **opens the port**, the child's `_exit(errno)` becoming the exit status.
+  A failed spawn is either an `access(X_OK)`-rejected path (a constructor `BeamError::Raise` with the errno atom; the check delegates to `crate::fs_access::try_access`) or a path the check accepts but `exec` rejects (a searchable **directory**, a no-executable-format file) — the latter **opens the port**, the child's `_exit(errno)` becoming the exit status.
   `stop`/`Drop` kill + reap + deregister/close every descriptor, but an adopted `{fd,N}` is **never** closed.
   **The only module here that may spawn OS children** (project invariant).
 - `inet/` — the built-in **`tcp_inet`** TCP socket driver and its `{packet, N}` framing, applied on **both** the read path (`packet.rs`/`frame.rs`) and the send path (`verb_send` prepends the 1-/2-/4-byte big-endian length header).
@@ -94,6 +94,7 @@ Only **frozen contracts and non-obvious behaviour** are listed; rustdoc carries 
 ### `src/abi/` — the driver C-ABI host layer (A.4)
 Presents a **loaded C driver** (`beam_abi::driver::loader::load`) as a `Driver`; a `pub` sub-tree (`pub use crate::abi::*`); the only place in this crate holding raw `ErlDrv*` pointers and calling foreign code.
 Four modules — `host.rs` (`PortHost` + `AbiHost`), `job.rs` (`AsyncJobs`, the bounded `driver_async` pool), `port.rs` (`DriverPort`, which prefers the entry's **`outputv`** on both write paths, plus the once-only `stop_select`), `table.rs` (the process-global `DriverTable` + the four registry slots reproducing the oracle's `0,1,0,-1`).
+`AbiHost` also exposes `queue_head` — the safe `&[u8]` companion of the raw `driver_peekq` hook, exactly as `DriverState::queue_len()` is the companion of `sizeq` — so a caller reads the driver queue with no `unsafe`.
 Full detail is in the child node **`src/abi/CONTEXT.md`** — read it there.
 
 ### `io_device/` — the io-device request layer (`{get_until, Enc, Prompt, Mod, Func, XtraArgs}`)
@@ -139,11 +140,22 @@ Full detail is in the child node **`src/abi/CONTEXT.md`** — read it there.
   Path spelling is the caller's: **no** `.so` suffix is appended (unlike `erts_sys_ddll_open`).
   The `-Wl,--export-dynamic` requirement is a property of the **loading** link, shared with `beam_abi`/`beam_rt` (an `RTLD_NOW` load resolves `enif_*`/`driver_*` out of the loading executable's `.dynsym`); this crate's part is its `build.rs`.
 
+### `fs_access.rs` — the safe `access(2)` / `geteuid(2)` / `getegid(2)` floor
+- `AccessMode { Exists, Read, Write, Execute }` (`ALL`; `libc_mode()` reads `libc`'s `F_OK`/`R_OK`/`W_OK`/`X_OK` — no re-spelled constants).
+- `try_access(&Path, AccessMode) -> Result<()>` — the crate's **one `access(2)` call site**, errno-preserving: `Ok(())` iff the kernel grants the mode, `Err(BeamError::Io(err))` carrying the untouched `access(2)` errno on refusal (an `EINTR` wait is retried), `Err(BeamError::BadArg)` for an interior-NUL path.
+  This is the form a caller needs when the *reason* matters (the spawn driver's `X_OK` render as `error:enoent`/`error:eacces`).
+- `access(&Path, AccessMode) -> Result<bool>` — the boolean form: a **refusal** (`EACCES`/`ENOENT`/`ENOTDIR`/`ELOOP`/`ENAMETOOLONG`/`EPERM`/`EROFS`/`ETXTBSY`) is `Ok(false)`, only a genuine syscall failure is `BeamError::Io` (never a silently-wrong "no access").
+- `path_access(&Path) -> Result<(bool /*read*/, bool /*write*/)>` — the `#file_info{}` `access` slot: the reference's two **independent** `R_OK`/`W_OK` probes (`efile_read_info`, `unix_prim_file.c:754-762`), each [`access`], so a refusal is `false`, not an error (a writable-but-unreadable path answers `(false, true)`).
+- `process_credentials() -> Result<(u32 /*euid*/, u32 /*egid*/)>` — `geteuid(2)`/`getegid(2)`, the **effective** ids the reference's handle-based `check_access` compares a `stat` against (`unix_prim_file.c:771-801`).
+  Takes no argument and cannot fail (POSIX), so it always returns `Ok`; the `Result` only keeps the module's uniform fallible signature.
+- `unsafe` appears only in the two syscall wrappers, each with a `// SAFETY:` rationale.
+  Re-exported at the crate root and in `prelude`.
+
 ## Constraints
 - Errors: **`beam_common::{Result, BeamError}` only**; I/O/syscall failures⇒`BeamError::Io`, argument faults⇒`BeamError::BadArg`, id/registration exhaustion⇒`BeamError::SystemLimit`.
   Never panic on runtime data, never `unwrap()`, never `todo!`/`unreachable!` in shipped code.
-- **Safe Rust by default.** `unsafe` only in the raw syscall wrappers (`libc::read`/`write`/`pipe`/`fcntl`/`open`/`dup`/`fstat`/`lseek`/`fsync`/`ftruncate`/`close`, the spawn driver's `fork`/`execve`/`waitpid`/`access`/`dup2`, the `inet` socket helpers incl.
-  `setsockopt`/`getsockopt` in `drivers/inet/sys.rs`, the `cpu_time.rs` `getrusage`/`clock_gettime`, the `signal.rs` `pipe2`/`sigaction`, the `ddll.rs` `dlopen`/`dlsym`/`dlclose`), `mio::unix::SourceFd` construction, and the `abi` host's raw `ErlDrv*` handling.
+- **Safe Rust by default.** `unsafe` only in the raw syscall wrappers (`libc::read`/`write`/`pipe`/`fcntl`/`open`/`dup`/`fstat`/`lseek`/`fsync`/`ftruncate`/`close`, the spawn driver's `fork`/`execve`/`waitpid`/`dup2`, the `inet` socket helpers incl.
+  `setsockopt`/`getsockopt` in `drivers/inet/sys.rs`, the `cpu_time.rs` `getrusage`/`clock_gettime`, the `signal.rs` `pipe2`/`sigaction`, the `ddll.rs` `dlopen`/`dlsym`/`dlclose`, the `fs_access.rs` `access`/`geteuid`/`getegid`), `mio::unix::SourceFd` construction, and the `abi` host's raw `ErlDrv*` handling.
   Every `unsafe` block carries a preceding `// SAFETY:` rationale; `unsafe_op_in_unsafe_fn` stays clean.
 - **Port ids come from `beam_process::PortTable`** — no second number allocator; `PortId` encoding stays `beam_term`'s internal-port immediate; a failed `start` runs the driver's teardown (deregistering any fd) and releases the number — no id-space/poller leak.
 - **Single-thread invariant (enforced).** `Port`/`PortRegistry` are **not** thread-safe and this crate has no locking: create and drive them from **one OS thread**.
@@ -156,11 +168,12 @@ Full detail is in the child node **`src/abi/CONTEXT.md`** — read it there.
 
 ## Test Strategy
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io` **GREEN**, and `... build --workspace --all-targets` **GREEN, warning-free**.
-Current: **574 passing / 0 failing / 2 ignored** — **398** lib in-module (`#[cfg(test)]`) + **173** across the 18 `tests/*.rs` suites + **5** doctests (3 passed: the `!Send`/`!Sync` compile-fail pins on `PortRegistry` + the `IoDevice` example; 2 `ignore`d: `cpu_time::RuntimeClock`, `port`).
-- **In-module (398):** `drivers` 200 (`inet` 125, `spawn` 23, `line_buffer` 16, `fd` 14, `efile` 13, `binary_io` 9), `io_device` 41 (`tests` 26, `encoding` 7, `source` 5, `continuation` 3), `abi` 35 (`host_tests` 17, `port` 8, `table` 7, `job` 3), `registry` 27, `signal` 20, `port_task` 16, `poller` 12, `timer` 12, `ddll` 11, `queue` 8, `driver` 6, `cpu_time` 6, `error` 4.
+Current: **585 passing / 0 failing / 2 ignored** — **409** lib in-module (`#[cfg(test)]`) + **173** across the 18 `tests/*.rs` suites + **5** doctests (3 passed: the `!Send`/`!Sync` compile-fail pins on `PortRegistry` + the `IoDevice` example; 2 `ignore`d: `cpu_time::RuntimeClock`, `port`).
+- **In-module (409):** `drivers` 200 (`inet` 125, `spawn` 23, `line_buffer` 16, `fd` 14, `efile` 13, `binary_io` 9), `io_device` 41 (`tests` 26, `encoding` 7, `source` 5, `continuation` 3), `abi` 36 (`host_tests` 18, `port` 8, `table` 7, `job` 3), `registry` 27, `signal` 20, `port_task` 16, `poller` 12, `timer` 12, `ddll` 11, `fs_access` 10, `queue` 8, `driver` 6, `cpu_time` 6, `error` 4.
 - The C-driver suites and the `erl`-oracle cases **skip loudly** without `cc`/`erl_nif.h`/`erl`.
   The C-driver fixtures assert a real `beam_abi::driver::loader::load`; **linking needs BOTH `build.rs`'s `-Wl,--export-dynamic` and a `driver_api_table()` reference from the test binary** (either alone ⇒ `dlopen(RTLD_NOW)` fails with `undefined symbol: driver_mk_port`).
 - The signal suite is serialized on a global `Mutex` (the facility is process-global) and the `cpu_time` suite asserts only monotone/structural properties (real syscalls never exact values).
+- The `drivers::spawn` in-module suite waits on the **condition** (the child-exit latch / the EOF latch) under a 60 s hang guard — never a wall-clock budget tuned for an idle host — and polls the driver's cached reap (`exited()`/`take_exit_status()`), **never `waitpid(2)`** from a test (a raw `waitpid` would steal the driver's reap); the `fs_access` suite skips its `uid == 0`-sensitive refusal case loudly.
 
 ## Design Decisions
 - **`mio` backend.** A portable, safe `Poll`/`Registry`/`Waker` with a one-shot re-arm matching the C's `EPOLLONESHOT`/`EV_ONESHOT`; the public API is **mio-independent** (`RawFd` + `Interest`/`Token`/`Ready`), so an io_uring/`/dev/poll` backend is a drop-in.
@@ -187,8 +200,8 @@ Current: **574 passing / 0 failing / 2 ignored** — **398** lib in-module (`#[c
   `beam_rt` mitigates by notifying the port owner before closing.
 - **A multi-fd driver's readiness is not per-fd.** `DriverState::fd_armed` always hands `ready_input`/`ready_output` the first `BTreeMap`-ordered fd matching the direction, so a port with ≥2 fds selected the same way would starve the others; correcting it needs the fired fd reported through the poller/`DriverContext` (a frozen-seam change).
   Harmless for every current driver (one fd each).
-- **File sizes (`wc -l`).** Over 1000: `src/drivers/spawn.rs` 1966, `src/drivers/inet/tests.rs` 1602, `src/registry.rs` 1518, `src/drivers/efile.rs` 1404, `src/drivers/inet/mod.rs` 1331, `src/drivers/inet/packet.rs` 1245, `src/drivers/fd.rs` 1193, `src/signal.rs` 1105, `src/abi/port.rs` 1017 — each is a source half plus its suite (or, for `inet`, a subtree with its own child doc).
-  `src/abi/host.rs` is now **879** with its in-module suite split out into `src/abi/host_tests.rs` (710); all other modules are under 1000.
+- **File sizes (`wc -l`).** Over 1000: `src/drivers/spawn.rs` 1978, `src/drivers/inet/tests.rs` 1602, `src/registry.rs` 1518, `src/drivers/efile.rs` 1404, `src/drivers/inet/mod.rs` 1331, `src/drivers/inet/packet.rs` 1245, `src/drivers/fd.rs` 1193, `src/signal.rs` 1105, `src/abi/port.rs` 1017 — each is a source half plus its suite (or, for `inet`, a subtree with its own child doc).
+  `src/abi/host.rs` is now **902** with its in-module suite split out into `src/abi/host_tests.rs` (775); all other modules are under 1000 (the new `src/fs_access.rs` is 645).
   If a source half grows, split its test module into a sibling `tests/` file (as `src/drivers/inet/` and `src/abi/` already do).
 
 ## Handoff to beam_rt — the CPU-time facility
@@ -199,6 +212,7 @@ Current: **574 passing / 0 failing / 2 ignored** — **398** lib in-module (`#[c
 
 ## Handoffs (beam_rt — out of this node)
 **Runtime adoption still owed** (seams exist and are tested here):
+- **The `#file_info{}` `access`/`uid`/`gid` success path → `beam_io::fs_access`.** The safe floor now exists here (`path_access(&Path) -> Result<(read, write)>`, `process_credentials() -> Result<(euid, egid)>`, plus the boolean `access` and the errno-preserving `try_access`); `beam_rt`'s `prim_file` floor (`crates/beam_rt/src/native/prim.rs:107-109`; the handoff at `beam_rt/CONTEXT.md:243`) still answers the typed `unsupported` for an existing-path `#file_info{}` and can now adopt it.
 - **The `tcp_inet` driver is unreachable through the runtime's `open_port/2`.** `open_port({spawn_driver,"tcp_inet"}, …)` never finds the built-in: `beam_rt`'s `driver_lookup` (`crates/beam_rt/src/port.rs:1670`, used from the `SpawnDriver` branch at `:1322`) only `dlopen`s `.so` candidates and never consults `beam_io::DriverRegistry::with_builtins()` (`src/driver.rs`), so the open is `badarg`; `make_tcp_inet` and its registry entry are implemented and tested here.
   **Owner: `beam_rt` (its driver resolver).**
 - **Four `tcp_inet` capabilities need a cross-crate seam** — `{active,N|once}`/`{deliver,…}`/`active_count` input delivery, `send_timeout`/`send_timeout_close`, `controlling_process`, and the async-op queue.
@@ -243,6 +257,7 @@ Current: **574 passing / 0 failing / 2 ignored** — **398** lib in-module (`#[c
 - `src/signal.rs` → `Signal`/`Disposition`/`SignalFacility`
 - `src/cpu_time.rs` → `CpuTimes`, `process_cpu_times`, `thread_cpu_times`, `RuntimeClock`
 - `src/ddll.rs` → `DynLib`, `DynLibFlags`, `DllError`/`DllErrorKind`, `ERRCODE_TAB`/`errcode_to_atom`/`atom_to_errcode`/`format_error_text`/`symbol_name`
+- `src/fs_access.rs` → `AccessMode`, `try_access`/`access`/`path_access`, `process_credentials` (the crate's only `access(2)`/`geteuid(2)`/`getegid(2)` site)
 - `src/drivers/fd.rs` → `FdDriver` (line/phase modes, `control`, EOF de-registration, the write-slot seams)
 - `src/drivers/line_buffer.rs` → `LineBuffer`, `DEFAULT_MAX_LINE_LEN`; `src/drivers/binary_io.rs` → `Phase`, `PhaseChange`
 - `src/drivers/efile.rs` → `EfileDriver`, `make_efile`, `FileDataMode`
@@ -286,6 +301,8 @@ Current: **574 passing / 0 failing / 2 ignored** — **398** lib in-module (`#[c
 - Read `../CONTEXT.md` (crate-layer contracts, the poller/`Port`/driver-registry seam), `../beam_process/CONTEXT.md` (`PortTable`/`PortId`, `Scheduler`/`ProcessTable`) and `../../CONTEXT.md` §1 A.4/§3 before changing this crate.
 - Build/test: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io` (sandbox `$HOME` is read-only — always the wrapper).
   Never `cd`; never touch `../../tools/`.
+- `src/fs_access.rs` is the crate's **only** `access(2)`/`geteuid(2)`/`getegid(2)` call site (the spawn driver's `X_OK` check delegates to `fs_access::try_access`).
+  A new `access(2)` use belongs there, never as a second `unsafe` wrapper.
 - A driver never touches the queues or the poller directly — it goes through `DriverContext`.
   When a `Port` method calls the driver, **destructure `self`** (`let Port { driver, input, output, id, .. }`) so the driver and its context borrow disjoint fields; do not add a combined raw-pointer accessor.
 - `Poller::poll` returns owned events and is `EINTR`-tolerant; call `registry.handle_events(&mut poller, &events)` after it, or drive the queue explicitly with `schedule_events` + `execute_port_tasks`.

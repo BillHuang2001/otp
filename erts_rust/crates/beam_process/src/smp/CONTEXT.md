@@ -108,7 +108,7 @@ bounds are required (removing them breaks compilation and the `shared_table_is_s
 `ProcessTable` is `!Send` for **five** reasons (each reproduced, with the soundness argument, in the
 `// SAFETY:` comments on the impls in `mod.rs`):
 1. `beam_alloc::Heap`'s `base: *mut Eterm` (`beam_alloc/src/heap.rs`), reached via `Process.collector →
-   beam_gc::Collector → HeapSpace → beam_alloc::Heap`.
+   beam_gc::AnyCollector → HeapSpace → beam_alloc::Heap`.
 2. `beam_gc::MsoHandle`'s `ptr: NonNull<Mso>` (`beam_gc/src/mso.rs`), reached via
    `beam_message::OffHeapTable`.
 3. `Dict.atoms: Rc<AtomTable>` (`dict.rs`) — `Rc`'s refcount is not atomic, so `Rc` is `!Send`.

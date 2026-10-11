@@ -585,6 +585,56 @@ pub trait ExecutionContext {
         Ok(None)
     }
 
+    /// Resolve a **closure application** into a lambda the **same machine** can
+    /// execute — the in-machine *closure-apply* seam.
+    ///
+    /// A `call_fun`/`call_fun2` is otherwise dispatched through the
+    /// **value-returning** [`apply_fun`](ExecutionContext::apply_fun): the host
+    /// runs the closure and hands back its result, so a host that enters the
+    /// closure on a *fresh* machine cannot let a `receive`/`wait` inside it
+    /// suspend the *calling* process — the block surfaces as the typed
+    /// [`crate::error::blocked`] at the call site (and a raise inside the closure
+    /// escapes the caller's `try`/`catch`).
+    ///
+    /// A host that owns the closure's defining module overrides this method and
+    /// returns `Some((callee_module, lambda_entry_label))` so the engine enters
+    /// the lambda body **in this machine**, exactly as C's `call_fun`
+    /// (`../../erts/emulator/beam/beam_common.c:1604`) dispatches to the fun
+    /// body's code in the same process:
+    ///
+    /// * `callee_module` is the host-owned handle of the module that defines the
+    ///   closure. It is kept alive by the engine for as long as a suspended frame
+    ///   can return into it, so the host must hand over a **shared** handle (an
+    ///   `Arc<Module>` it already owns) — the engine dedups module contexts by
+    ///   `Arc::ptr_eq`.
+    /// * `lambda_entry_label` is the lambda's **`FunT` entry label** — the label
+    ///   [`Machine::run_label`](crate::Machine::run_label) enters the closure body
+    ///   at. The engine resolves it against the callee's **own** label map, so an
+    ///   unknown label is the typed [`crate::error::unknown_label`], never a jump
+    ///   into the wrong module.
+    ///
+    /// The engine places the registers itself (C's `call_fun`): the call `args`
+    /// are already in `x(0..arity)`, and the engine copies the closure's free
+    /// variables into `x(arity..)` — which is why the host is handed the `args`
+    /// (it reuses its existing `(uniq, index)` → `(module, label)` lookup and need
+    /// not repeat the combined-argument ordering).
+    ///
+    /// The default body returns `Ok(None)` — "I cannot run this closure in your
+    /// machine" — which keeps the value-returning
+    /// [`apply_fun`](ExecutionContext::apply_fun) fallback (fun kinds with no local
+    /// label: external `fun M:F/A` and the `-eval` evaluator's own closure), so
+    /// every existing host is unchanged.
+    ///
+    /// [`apply_fun`]: ExecutionContext::apply_fun
+    fn resolve_local_fun(
+        &mut self,
+        fun: Eterm,
+        args: &[Eterm],
+    ) -> Result<Option<(Arc<Module>, Label)>> {
+        let _ = (fun, args);
+        Ok(None)
+    }
+
     /// The **per-instruction reduction hook**: charge `n` reductions for the
     /// instruction the engine has just executed.
     ///
@@ -678,6 +728,16 @@ pub type ApplyHook = Box<dyn FnMut(Eterm, &[Eterm]) -> Result<Eterm>>;
 /// unset, so `resolve_external_call` stays the trait's `Ok(None)` default.
 pub type ExternalResolver =
     Box<dyn FnMut(&str, &str, u32) -> Result<Option<(Arc<Module>, Label)>>>;
+
+/// A local-closure resolver: the pluggable body of
+/// [`ExecutionContext::resolve_local_fun`].
+///
+/// Maps a fun/closure value plus its call `args` to the closure's **defining
+/// module handle** and its lambda entry [`Label`], or `None` to keep the
+/// value-returning [`apply_fun`](ExecutionContext::apply_fun) fallback.
+/// [`MinimalContext::new`] leaves it unset, so `resolve_local_fun` stays the
+/// trait's `Ok(None)` default.
+pub type LocalFunResolver = Box<dyn FnMut(Eterm, &[Eterm]) -> Result<Option<(Arc<Module>, Label)>>>;
 
 /// The first region's **reservation** in `Eterm` words (4 MiB).
 ///
@@ -888,6 +948,9 @@ pub struct MinimalContext {
     /// An optional cross-module-call resolver (the
     /// [`ExecutionContext::resolve_external_call`] body).
     external_resolver: Option<ExternalResolver>,
+    /// An optional local-closure resolver (the
+    /// [`ExecutionContext::resolve_local_fun`] body).
+    local_fun_resolver: Option<LocalFunResolver>,
     /// An optional mailbox (the body of the nine receive-seam methods).
     mailbox: Option<Box<dyn Mailbox>>,
     /// The pointer-stable heap backing [`ExecutionContext::alloc_words`].
@@ -918,6 +981,7 @@ impl MinimalContext {
             hook,
             apply_hook: None,
             external_resolver: None,
+            local_fun_resolver: None,
             mailbox: None,
             heap: ContextHeap::new(),
         }
@@ -965,6 +1029,21 @@ impl MinimalContext {
     /// Install (or replace) the cross-module-call resolver.
     pub fn set_external_resolver(&mut self, resolver: ExternalResolver) {
         self.external_resolver = Some(resolver);
+    }
+
+    /// A context with the given local-closure resolver and the default
+    /// (rejecting) BIF hook.
+    ///
+    /// Combine with a BIF hook via [`set_bif_hook`](MinimalContext::set_bif_hook).
+    pub fn with_local_fun_resolver(resolver: LocalFunResolver) -> MinimalContext {
+        let mut ctx = MinimalContext::new();
+        ctx.local_fun_resolver = Some(resolver);
+        ctx
+    }
+
+    /// Install (or replace) the local-closure resolver.
+    pub fn set_local_fun_resolver(&mut self, resolver: LocalFunResolver) {
+        self.local_fun_resolver = Some(resolver);
     }
 
     /// Install (or replace) the mailbox.
@@ -1066,6 +1145,23 @@ impl ExecutionContext for MinimalContext {
             Some(resolver) => resolver(module, function, arity),
             None => {
                 let _ = (module, function, arity);
+                Ok(None)
+            }
+        }
+    }
+
+    fn resolve_local_fun(
+        &mut self,
+        fun: Eterm,
+        args: &[Eterm],
+    ) -> Result<Option<(Arc<Module>, Label)>> {
+        // Without an installed resolver there is no closure registry to consult,
+        // so the in-machine route declines and the value-returning `apply_fun`
+        // fallback stays the dispatch route (the trait default).
+        match self.local_fun_resolver.as_mut() {
+            Some(resolver) => resolver(fun, args),
+            None => {
+                let _ = (fun, args);
                 Ok(None)
             }
         }

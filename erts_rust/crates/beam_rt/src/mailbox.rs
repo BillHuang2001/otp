@@ -29,9 +29,10 @@
 //! * the **scan cursor** ([`QueueCursor`]) that `loop_rec` peeks at and `loop_rec_end`
 //!   advances;
 //! * the **marker table** the `recv_marker_*` prologue saves positions in;
-//! * the **retained payloads** — the heap fragments and off-heap refc-binary handles of every
-//!   message removed on `remove_message`, kept alive past the message's own drop so the term
-//!   the running code bound stays valid ([`MailboxState::remove_at`]).
+//! * the **retained payloads** — the heap fragments and the off-heap refc-binary, MSO and
+//!   external-node objects of every message removed on `remove_message`, kept alive past the
+//!   message's own drop so the term the running code bound stays valid
+//!   ([`MailboxState::remove_at`]).
 //!
 //! None of this state can live in a per-call context: a `receive` that suspends on an empty
 //! mailbox is resumed later — possibly only after another process has delivered a
@@ -52,7 +53,7 @@
 //! cursor or an empty queue yields `None`, never a panic).
 
 use beam_alloc::RefcBinary;
-use beam_message::{Fragments, Message, Queue, QueueCursor};
+use beam_message::{Fragments, Message, MsoHandle, NodeEntry, Queue, QueueCursor};
 use beam_term::{is_small, make_small, Eterm};
 
 /// The small-integer base of the opaque marker terms [`MailboxState::reserve`] hands out.
@@ -112,6 +113,28 @@ pub(crate) struct MailboxState {
     /// process ([`Runtime::stabilize_term_with`](crate::runtime::Runtime::stabilize_term_with)).
     /// Released when the process's scan state is.
     retained_binaries: Vec<RefcBinary>,
+    /// The off-heap MSO handles of every removed message whose payload owned one.
+    ///
+    /// A payload carrying an **off-heap MSO reference** (the frozen `[HEADER_BIN_REF, slot, 0]`
+    /// container term) resolves its object through the copy's **source** off-heap table by the
+    /// `slot` the term records ([`Message::off_heap`] holds the handles in that slot order).
+    /// Dropping the message on `remove_message` would release the last handle (once the sender has
+    /// terminated) and free the object under the bound term. The handles are therefore cloned
+    /// (refcount++) here, exactly like [`MailboxState::retained_binaries`] — and kept **in the
+    /// message's own order**, because the source table the runner rebuilds must place each handle
+    /// on the same slot its container term names ([`MailboxState::retained_off_heap`]). Released
+    /// when the process's scan state is.
+    retained_off_heap: Vec<MsoHandle>,
+    /// The external-thing node references of every removed message that held one.
+    ///
+    /// A payload holding an **external pid/port/reference** carries the refcounted
+    /// `(node, creation)` identities the copy registered on the envelope ([`Message::nodes`]).
+    /// The received payload's identity is kept alive here alongside the other off-heap families;
+    /// each retained [`NodeEntry`] is a bare *handle* on the shared interior
+    /// ([`NodeEntry::handle`], which does **not** register a reference), so nothing is released
+    /// when this state drops and the object's own count is untouched. Released when the process's
+    /// scan state is.
+    retained_nodes: Vec<NodeEntry>,
 }
 
 impl MailboxState {
@@ -132,16 +155,39 @@ impl MailboxState {
         &self.retained_binaries
     }
 
+    /// The off-heap MSO handles this scan is keeping alive (see
+    /// [`MailboxState::retained_off_heap`]).
+    ///
+    /// The runner feeds these into the copy's **source** off-heap table — **in this order**, so
+    /// each retained handle lands on the same slot the removed message's container term names —
+    /// when it transports a process's return value or exit reason onto the runtime's
+    /// pointer-stable arena.
+    pub(crate) fn retained_off_heap(&self) -> &[MsoHandle] {
+        &self.retained_off_heap
+    }
+
+    /// The external-thing node identities this scan is keeping alive (see
+    /// [`MailboxState::retained_nodes`]).
+    ///
+    /// The runner surfaces these alongside the retained binaries and MSO handles so the whole
+    /// retained family travels together. The copy engine registers a **fresh** [`NodeEntry`] for
+    /// every external thing it copies and never consults a source node list, so these are the
+    /// retained identity made visible rather than an input the copier reads.
+    pub(crate) fn retained_nodes(&self) -> &[NodeEntry] {
+        &self.retained_nodes
+    }
+
     /// Removes the message at `cursor`, keeping a **fragment-resident** or **off-heap**
     /// payload alive.
     ///
     /// The only difference from a bare [`Queue::remove_at`] is what happens to a message that
-    /// owns [`Fragments`] or refc-binary handles: the fragments are taken off the message and
-    /// the handles cloned (refcount++) onto this state before the message drops, so the
+    /// owns off-heap objects: the [`Fragments`] are taken off the message, the envelope's
+    /// refc-binary and MSO handles are cloned (refcount++) onto this state, and its external-thing
+    /// node identities are retained as share handles — all before the message drops — so the
     /// payload term the running code holds stays valid (see
-    /// [`MailboxState::retained_fragments`] and [`MailboxState::retained_binaries`]). A
-    /// message whose payload lives entirely in the receiver's heap is dropped exactly as
-    /// before.
+    /// [`MailboxState::retained_fragments`], [`MailboxState::retained_binaries`],
+    /// [`MailboxState::retained_off_heap`] and [`MailboxState::retained_nodes`]). A message whose
+    /// payload lives entirely in the receiver's heap is dropped exactly as before.
     pub(crate) fn remove_at(&mut self, queue: &mut Queue, cursor: QueueCursor) {
         if let Some(mut message) = queue.remove_at(cursor) {
             if let Some(fragments) = message.fragments_mut() {
@@ -151,6 +197,16 @@ impl MailboxState {
             // so a payload that arrived from another process outlives it.
             self.retained_binaries
                 .extend(message.binaries().iter().cloned());
+            // Clone (refcount++) the envelope's MSO handles, keeping the envelope's **order** so
+            // the copy source table the runner rebuilds places each handle on the same slot the
+            // removed container term names.
+            self.retained_off_heap
+                .extend(message.off_heap().iter().cloned());
+            // Retain a share handle on each of the envelope's external-thing node identities. A
+            // `NodeEntry` handle shares the interior without registering a reference, so the
+            // envelope's own count is left untouched.
+            self.retained_nodes
+                .extend(message.nodes().iter().map(NodeEntry::handle));
         }
     }
 
@@ -173,8 +229,9 @@ impl MailboxState {
     /// first message.
     ///
     /// A cursor past the end (an empty queue) removes nothing but still repositions. A
-    /// removed message that owns heap [`Fragments`] or off-heap refc-binary handles hands them
-    /// to this state so the payload stays valid ([`MailboxState::remove_at`]).
+    /// removed message that owns off-heap objects — heap [`Fragments`], refc-binary or MSO
+    /// handles, external-thing node identities — hands them to this state so the payload stays
+    /// valid ([`MailboxState::remove_at`]).
     pub(crate) fn remove(&mut self, queue: &mut Queue) {
         self.remove_at(queue, self.cursor);
         self.cursor = queue.cursor();
@@ -390,9 +447,9 @@ mod tests {
         assert_ne!(first, second);
     }
 
-    /// The scan keeps only **fragment-resident** payloads alive: an ordinary message whose
-    /// payload lives in the receiver's own heap is dropped exactly as before, so the
-    /// fragment path adds no retention to the common case.
+    /// The scan keeps only **off-heap-owning** payloads alive: an ordinary message whose
+    /// payload lives in the receiver's own heap is dropped exactly as before, so the retention
+    /// path adds nothing to the common case.
     #[test]
     fn removing_a_heap_resident_message_retains_nothing() {
         let mut queue = queue_of(&[1, 2, 3]);
@@ -401,8 +458,141 @@ mod tests {
         state.remove(&mut queue);
         assert_eq!(payloads(&queue), vec![1, 3]);
         assert_eq!(state.retained(), 0, "a heap-resident payload needs no keeping");
+        assert!(state.retained_binaries().is_empty());
+        assert!(state.retained_off_heap().is_empty());
+        assert!(state.retained_nodes().is_empty());
     }
 
+    /// **The scan retains the removed message's MSO handles.**
+    ///
+    /// A payload carrying an off-heap MSO reference resolves its object through the copy's source
+    /// off-heap table by the slot the container term records, so the envelope's handles must
+    /// outlive the message exactly like a refc binary's. The discriminator is the MSO's reference
+    /// count: an `observer` clone plus the message's own handle make `2`, and `remove_at` must
+    /// **clone** the envelope's handle onto the scan state for the count to still be `2` after the
+    /// message drops. On the pre-fix code the message's handle is the last one, dropped with the
+    /// message, so the count falls to `1` and the first assertion below fails.
+    #[test]
+    fn removing_a_message_retains_its_off_heap_handles() {
+        let handle = beam_gc::Mso::new(0u32, 16);
+        let observer = handle.clone();
+        assert_eq!(observer.refcount(), 2, "the observer plus the message's handle");
+
+        let mut queue = Queue::new();
+        queue.enqueue(Message::new(make_small(1), NIL).with_off_heap(vec![handle]));
+        let mut state = MailboxState::default();
+        let cursor = queue.cursor();
+        state.remove_at(&mut queue, cursor);
+
+        assert_eq!(
+            observer.refcount(),
+            2,
+            "the scan retained a clone of the MSO handle"
+        );
+        assert_eq!(state.retained_off_heap().len(), 1);
+        assert_eq!(
+            state.retained_off_heap()[0].refcount(),
+            2,
+            "the retained handle names the message's own object"
+        );
+    }
+
+    /// **The scan retains the removed message's external-thing node identities**, symmetric with
+    /// the refc-binary and MSO families.
+    ///
+    /// The retained handle names the same `(node, creation)` identity the removed message held. On
+    /// the pre-fix code this test cannot even be *expressed* — there is no `retained_nodes`
+    /// accessor — so its discriminator is the accessor's existence rather than a runtime count: a
+    /// [`NodeEntry`] handle shares its interior **without** registering a reference, so dropping
+    /// the message's entry moves no observable count.
+    #[test]
+    fn removing_a_message_retains_its_node_entries() {
+        use beam_term::prelude::*;
+
+        let mut atoms = AtomTable::new();
+        let node = make_atom(atoms.intern("nonode@nohost"));
+        let entry = NodeEntry::new(node, 3);
+        let observer = entry.handle();
+
+        let mut queue = Queue::new();
+        queue.enqueue(Message::new(make_small(1), NIL).with_nodes(vec![entry]));
+        let mut state = MailboxState::default();
+        let cursor = queue.cursor();
+        state.remove_at(&mut queue, cursor);
+
+        assert_eq!(
+            state.retained_nodes().len(),
+            1,
+            "the scan retained the removed message's node entry"
+        );
+        let retained = &state.retained_nodes()[0];
+        assert!(
+            retained.identity_eq(node, 3),
+            "the retained entry names the same node identity"
+        );
+        assert!(
+            retained.same_node(&observer),
+            "the retained entry is the same node the message held"
+        );
+    }
+
+    /// **The runtime's transport-copy source builder surfaces the retained off-heap handles.**
+    ///
+    /// The `remove_at` retention above is only observable to a transport copy if the builder the
+    /// runner calls ([`Runtime::source_payloads`]) carries it. This drives the real data flow: the
+    /// MSO-carrying message goes into a **live runtime's** pid mailbox, is removed through the same
+    /// `remove_at`, its scan state is installed on the runtime, and the builder must then carry the
+    /// handle. On the pre-fix code the retained list is empty, so the builder's `off_heap` is empty
+    /// and the first assertion fails.
+    ///
+    /// A full `stabilize_term_with` resolution of a term carrying an actual off-heap container is
+    /// **not** driven here: no safe public API can synthesize the bare container term
+    /// (`beam_message::layout::make_off_heap_container` is `pub(crate)`, and
+    /// `beam_term::refc::write_bin_ref` is `unsafe`), `beam_rt` is `#![deny(unsafe_code)]`, and no
+    /// production path builds one — so this data-flow assertion is the honest route.
+    #[test]
+    fn the_copy_source_builder_includes_the_retained_off_heap_handles() {
+        use crate::runtime::Runtime;
+
+        let mut rt = Runtime::with_defaults().expect("the default runtime");
+        let pid = rt.self_pid();
+        let handle = beam_gc::Mso::new(0u32, 16);
+        let observer = handle.clone();
+
+        // Queue the carrying message in the pid's own mailbox...
+        {
+            let process = rt.processes.get_mut(pid).expect("the runtime's own process");
+            let mailbox = process.mailbox_mut();
+            mailbox.enqueue(Message::new(make_small(1), NIL).with_off_heap(vec![handle]));
+        }
+        // ...and remove it through the scan state the receive seam drives.
+        let mut state = MailboxState::default();
+        {
+            let process = rt.processes.get_mut(pid).expect("the runtime's own process");
+            let mailbox = process.mailbox_mut();
+            let cursor = mailbox.cursor();
+            state.remove_at(mailbox, cursor);
+        }
+        assert_eq!(observer.refcount(), 2, "the removal retained the handle");
+        rt.mailboxes.insert(pid, state);
+
+        // The builder the runner calls must now carry the retained handle.
+        let payloads = rt.source_payloads(pid, &[]);
+        assert_eq!(
+            payloads.off_heap.len(),
+            1,
+            "the copy-source builder surfaces the retained MSO handle"
+        );
+        assert!(
+            payloads.binaries.is_empty(),
+            "no refc binary was involved"
+        );
+        assert_eq!(
+            observer.refcount(),
+            3,
+            "the builder owns its own clone of the handle"
+        );
+    }
     /// A payload **larger than the receiver's whole heap** is delivered intact — through the
     /// heap-fragment model — and still wakes the blocked receiver.
     ///

@@ -372,6 +372,13 @@ constructors only (no new error enum).
   fewer words while pausing longer, so **`MatureKind::Copying` remains the default** and Immix stays a
   size-/latency-tolerant option auto-selected at ≥ `IMMIX_BREAK_EVEN_WORDS` configured mature words or by an
   explicit pin.
+- **Runtime-shaped dispatch measured (`../beam_rt/tests/gc_immix_payload.rs`, `tests/gc_strategy.rs`).** The
+  same workload driven through the runtime's own GC doors with a runtime-spawned process reproduces the
+  small-object/high-churn verdict at the break-even (Copying at `initial_mature_words` 2047 vs Immix at
+  2048): Immix moves 1.146× the words for 6.57× the mature occupancy, which is why the automatic rule's
+  default stays Copying and `MatureKind::Immix` remains an opt-in (`BEAM_RT_GC_STRATEGY=immix` raises the
+  spawned policy's mature generation past the break-even). Load-invariant counts only — the host is heavily
+  loaded, so timings are not asserted.
 
 ## Constraints
 - **Errors:** `beam_common::{Result, BeamError}` only. Heap exhaustion while copying a term is
@@ -471,19 +478,18 @@ constructors only (no new error enum).
 - Cross-checks against the real system ERTS belong to `../tools/differential/`, not here.
 
 ## Known Gaps (intentionally NOT covered in Milestone-1)
-- **The mark-region strategy *dispatch* is not reached in production — the host switch remains.** The
-  `beam_gc` side is a complete drop-in enabler: `AnyCollector::new(policy)` is the `Collector::new`
-  counterpart, `should_collect` and the mature geometry accessors are strategy-agnostic, and
-  `tests/production_dispatch.rs` proves a process-shaped workload runs identically through either strategy.
-  `selection::select_mature` chooses `Immix` only at/above `IMMIX_BREAK_EVEN_WORDS` (8 whole blocks = 2048
-  words of configured mature generation), which the default 233-word policy never reaches — so
-  `GcConfig::default()` / `AnyCollector::from_config(default)` / `AnyCollector::new(default policy)` build the
-  copying `Collector`; the mark-region path is reached only by a caller that opts in (`GcConfig::immix` /
-  `MatureSelection::Explicit`) or configures a large mature generation. What REMAINS is the host switch in
-  `beam_process`/`beam_rt` (see Handoffs): the runtime still builds the concrete copying `Collector`
-  (`beam_process::Process`), which `beam_rt` **does** drive at its heap-admission point
-  (`beam_rt/src/context/gc.rs::ensure_heap` → `Process::collect`), and `beam_rt` **does** use `HeapInfo`.
-  Only the strategy *dispatch* stays unreached in production — Stage-5 work.
+- **The mark-region strategy is reachable in production; the DEFAULT remains the copying `Collector`.** The
+  dispatch IS on the production path: `beam_process::Process` owns an `AnyCollector` built from the spawn
+  policy (`AnyCollector::new(policy)`), exposes it as `collector() -> &AnyCollector`, and `beam_rt` drives it
+  at its heap-admission point (`src/context/gc.rs::{ensure_heap, ensure_heap_full}` → `Process::collect` /
+  `ensure_capacity`), reading the mature generation through the geometry accessors (`mature_contains` in the
+  unscanned-root valve, `mature_used_words` in the memory hook). `selection::select_mature` chooses `Immix`
+  only at/above `IMMIX_BREAK_EVEN_WORDS` (8 whole blocks = 2048 words of configured mature generation),
+  which the default 233-word policy never reaches — so `GcConfig::default()` / `AnyCollector::new(default
+  policy)` build the copying `Collector` and the default path keeps its Copying behaviour (the corpus gate
+  reports 0 mismatches). Immix is reached by a policy that configures a large mature generation (the
+  automatic rule — `beam_rt`'s default-OFF `BEAM_RT_GC_STRATEGY=immix` opt-in does exactly that) or by an
+  explicit `GcConfig::immix` / `MatureSelection::Explicit` pin.
 - **The Immix region never reallocates in place; the collector grows it by relocation.** `ImmixSpace` wraps
   a `beam_alloc::Heap` and is never resized in place. Instead a major replaces the whole region: the live set
   is relocated into a fresh `ImmixSpace` sized by the policy — the `mature_after_fullsweep` target
@@ -504,39 +510,38 @@ constructors only (no new error enum).
   are treated as permanent and left verbatim.
 - **A.6 runtime heap options** (`+hms`, `+hmbs`, …) — this crate exposes `HeapPolicy`, not the CLI
   surface (owned by `beam_rt`).
-- **`OffHeap` is on the production path as the MSO slot store; off-heap *liveness* is caller-driven.**
-  `OffHeap` holds both MSO and refc-binary entries and IS the production MSO slot store inside
-  `beam_message::OffHeapTable` (which stores the slot index an on-heap container names). Real refc binaries
-  do **not** use it: their on-heap `BinRef.val` holds a raw payload pointer, not a slot. `sweep` is
-  slot-stable and therefore safe to drive, but the liveness predicate — determining WHICH on-heap `val` slot
-  is still referenced — is `beam_process`'s concern (Stage 5), not the collector's, so no production caller
-  exists yet.
+- **`OffHeap` is on the production path as both the MSO slot store and the process's binary store; its
+  liveness predicate is caller-driven and deliberately conservative.** `OffHeap` holds both MSO and
+  refc-binary entries and IS the production MSO slot store inside `beam_message::OffHeapTable` (which stores
+  the slot index an on-heap container names). `beam_process::Process` additionally owns a dedicated `OffHeap`
+  (`owned_binaries`) for the `RefcBinary` payloads it takes ownership of (`Process::register_off_heap_binary`)
+  and drives `OffHeap::sweep` as the last step of every rooted collection
+  (`Process::sweep_off_heap_binaries`), with a predicate that releases only entries the caller declared dead
+  and retains anything undecided (leak-not-dangle).
+  **The remaining gap is the marking half, and it is this crate's:** the walk deciding whether an on-heap
+  `BinRef`/`ErlSubBits` (possibly inside another off-heap payload) still names a payload lives in
+  `live.rs`/`copy.rs` and is `pub(crate)`, so a public, scan-driven liveness enumeration over a heap would
+  let a caller release undecided entries instead of retaining them;
+  `Process::retain_off_heap_binaries(is_live)` is the seam such a host drives.
 
-## Handoffs (owned by other nodes — NOT yet adopted)
-- **The host should adopt the strategy-dispatching `AnyCollector`** — the remaining half of the mark-region
-  adoption (see Known Gaps). The dispatch seam is ready (`AnyCollector` is a drop-in for the concrete
-  `Collector`, proven by `tests/production_dispatch.rs`); the exact call sites for the switch:
-  - `beam_process`: the `Process.collector` field is the concrete `Collector` (`src/process.rs:345`,
-    `Collector::new`); switching it to `AnyCollector` is a one-line construction change
-    (`AnyCollector::new(policy)`). The type also appears in `Process::collector() -> &Collector`
-    (`src/process.rs:805`), the `run_rooted_collection` closure bound `FnOnce(&mut Collector, &mut [Eterm])`
-    (`src/process.rs:941`), and tests that read `collector().mature()` (e.g. `tests/spawn_options.rs`).
-  - `beam_rt`: `src/context/gc.rs::root_is_unscanned` tests
-    `in_heap_block(process.collector().mature().heap(), ptr)` → becomes `AnyCollector::mature_contains(ptr)`
-    (the host's `in_heap_block` tests the whole block `[hp-used, hend)` whereas `mature_contains` mirrors the
-    spaces' own tests — both are sound over-approximations for that valve, so the host may keep its young
-    test and only swap the mature half); and `src/context/memory_hook.rs` reads
-    `collector.mature().used_words()` → `AnyCollector::mature_used_words()`.
-  - `beam_message`: `OffHeapTable` may legitimately drive `beam_gc::OffHeap::sweep` — its module doc's
-    "never sweeps because sweep compacts the slots" rationale no longer holds, since the list is slot-stable
-    and the liveness predicate is `beam_process`'s concern.
-- **The runtime should adopt the growth seam** (`beam_rt`): `beam_rt/src/context/gc.rs::ensure_heap` never
-  calls `ensure_capacity`; `RuntimeConfig.heap_words` defaults to `DEFAULT_HEAP_WORDS = 1<<24` and
-  exhaustion becomes `error:system_limit`, so a real growable heap cannot grow past that ceiling. Give the
-  engine context a `beam_gc` collector and call `collector.ensure_capacity(heap_need, &mut roots)` from
-  `ensure_heap` (the root set — `x_regs[0..live]` ++ stack — is already threaded there), keeping the
-  `system_limit` translation for a returned typed error. `HeapPolicy::unbounded()`/`GcConfig::growable()`
-  express "no cap".
+## Handoffs (owned by other nodes)
+- **The strategy switch is adopted; the residual is an explicit pin on the process-construction path.**
+  `beam_process::Process` holds an `AnyCollector` and exposes `collector() -> &AnyCollector`; its
+  `run_rooted_collection` bound is `FnOnce(&mut AnyCollector, &mut [Eterm])`; `beam_rt` uses
+  `AnyCollector::mature_contains` (the unscanned-root valve) and `AnyCollector::mature_used_words` (the
+  memory hook). `ProcessTable::spawn` takes only a `HeapPolicy`, so the strategy is always resolved by the
+  automatic rule (`MatureSource::Automatic`): `beam_rt`'s default-OFF `BEAM_RT_GC_STRATEGY=immix` opt-in
+  reaches Immix by raising the policy's mature-generation size past the break-even, never as an override. An
+  explicit `GcConfig`/`MatureSelection` pin would need a parameter on the process-construction path (owner:
+  `beam_process`).
+- `beam_message`: `OffHeapTable` may legitimately drive `beam_gc::OffHeap::sweep` — its module doc's
+  "never sweeps because sweep compacts the slots" rationale no longer holds, since the list is slot-stable.
+- **The growth seam is adopted by the runtime.** `beam_rt/src/context/gc.rs`'s shared `collect_or_grow`
+  (behind both admission doors, `ensure_heap`/`ensure_heap_full`) grows the running process's nursery through
+  `Process::ensure_capacity` when the policy admits the request and otherwise collects, and `Process::deliver`
+  retries a refused copy the same way; a bounded `+hmax N` policy the request cannot reach still refuses, and
+  that exhaustion raises `error:system_limit`. `HeapPolicy::unbounded()`/`GcConfig::growable()` express
+  "no cap".
 - **Test-id / MSO / `compare` caveats (cross-crate).** A pid is a heap term via
   `beam_term::thing::write_external_pid` (4 words) **and** `beam_term::compare::eq` orders it
   **structurally through its parts** (field order per the C `erts_cmp`), with `external_pid_parts`
@@ -546,8 +551,9 @@ constructors only (no new error enum).
   Covered by `tests/stress_cross_generation.rs`.
 - **`HeapInfo` is surfaced by the runtime.** `beam_rt` builds it directly (`HeapInfo::new` and
   `HeapObservable`) for `erlang:process_info(Pid, garbage_collection)` and `system_info(garbage_collection)`,
-  in `GARBAGE_COLLECTION_KEYS` order (`beam_rt/src/native/memory/mod.rs`, `src/info/memory.rs`); only
-  `AnyCollector::heap_info()` itself still has no production caller (no outer crate uses `AnyCollector` yet).
+  in `GARBAGE_COLLECTION_KEYS` order (`beam_rt/src/native/memory/mod.rs`, `src/info/memory.rs`);
+  `AnyCollector` is the production collector type, but `AnyCollector::heap_info()` itself is still called
+  only from tests — the runtime derives `HeapInfo` from the `HeapObservable` items directly.
 - **Repo-root owned** (`../../CHANGE.md`): owed entries for the heap-sizing policy (the C-faithful
   per-collection growth/shrink, the `min_bin_vheap_words`/`fullsweep_after` fields and `HeapInfo`) and the
   measured GenImmix decision.

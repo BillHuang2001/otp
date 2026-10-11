@@ -22,7 +22,7 @@
 //! the out-of-band term stabilization.
 //!
 //! A scheduled process allocates on its **own** [`beam_process::Process`] young heap and the
-//! collector behind it (`beam_gc::Collector`, reached through
+//! collector behind it (`beam_gc::AnyCollector`, reached through
 //! [`Process::collect`](beam_process::Process::collect)) runs at the engine's
 //! heap-admission point — see [`crate::context::gc`] for the GC point itself. This module
 //! holds the state that decision needs and the two safety valves that keep the change
@@ -60,7 +60,7 @@ use beam_loader::Module;
 use beam_process::{ProcessId, ProcessTable};
 use beam_term::Eterm;
 
-use super::Runtime;
+use super::{Runtime, SourcePayloads};
 
 /// A snapshot of this runtime's process-heap collection activity.
 ///
@@ -399,20 +399,21 @@ impl Runtime {
     /// [`BeamError::SystemLimit`] when the term genuinely cannot be copied onto the arena. The
     /// valve is **not** tripped in that case.
     pub(crate) fn try_stabilize_escaped(&mut self, term: Eterm) -> Result<Eterm> {
-        self.try_stabilize_escaped_with(term, &[])
+        self.try_stabilize_escaped_with(term, &SourcePayloads::default())
     }
 
     /// [`Runtime::try_stabilize_escaped`] for a term that may reference the off-heap payload
-    /// handles an engine machine built, resolved against `src_binaries`.
+    /// handles an engine machine built or the mailbox retained from a received message, resolved
+    /// against `src`.
     ///
     /// The escape-store stabilization itself is unchanged (same two failure classes, same valve
-    /// trip); only the copy's **source** off-heap table differs — it is built from
-    /// `src_binaries` instead of being empty
+    /// trip); only the copy's **source** off-heap table differs — it is built from `src` instead
+    /// of being empty
     /// ([`Runtime::stabilize_term_with`](crate::runtime::Runtime::stabilize_term_with), the
-    /// documented empty-source degradation unchanged). A caller that holds the machine which
-    /// built `term` (the runner's exit-reason arm) therefore stabilizes a term carrying an
-    /// engine-built off-heap binary **correctly**, instead of tripping the valve over a payload
-    /// the empty table simply could not resolve.
+    /// documented empty-source degradation unchanged). A caller that holds the handles behind
+    /// `term` (the runner's exit-reason arm) therefore stabilizes a term carrying an engine-built
+    /// off-heap binary — or a received off-heap payload — **correctly**, instead of tripping the
+    /// valve over a payload the empty table simply could not resolve.
     ///
     /// # Errors
     ///
@@ -421,9 +422,9 @@ impl Runtime {
     pub(crate) fn try_stabilize_escaped_with(
         &mut self,
         term: Eterm,
-        src_binaries: &[beam_alloc::RefcBinary],
+        src: &SourcePayloads,
     ) -> Result<Eterm> {
-        match self.stabilize_term_with(term, src_binaries) {
+        match self.stabilize_term_with(term, src) {
             Ok(copy) => Ok(copy),
             // A genuine failure: the term does not fit the arena. Report it honestly — never
             // store the un-copied term, never freeze collection over it.

@@ -25,14 +25,42 @@
 //! `enif_is_number`, `enif_is_exception`, `enif_is_identical`, `enif_compare`, `enif_hash`,
 //! `enif_term_type`, `enif_term_size`.
 //!
-//! [`enif_compare`], [`enif_is_identical`] and [`enif_hash`] take no env parameter, hence no host and
-//! no atom-name table: bit-identical words take the raw-word fast path and distinct atoms fall back
-//! to `beam_term`'s index ordering (exact for non-atom terms).
+//! [`enif_compare`], [`enif_is_identical`] and [`enif_hash`] take no env parameter, so bit-identical
+//! words always take the raw-word fast path; [`enif_is_identical`] (the exact `EQ`) and
+//! [`enif_hash`] (the term word's PHASH2) need nothing beyond it.
+//!
+//! [`enif_compare`] is the **arithmetic** comparison — the C is `CMP(lhs, rhs)`, i.e.
+//! `erts_cmp(lhs, rhs, exact=0, eq_only=0)` (`erl_nif.c:1548`) — so `1` and `1.0` compare equal.
+//! Two *top-level atoms* are ordered by their **names**, the C's `erts_cmp_atoms`
+//! (`erl_utils.h:193-215`): byte-lexicographic, a name that is a proper prefix of the other sorting
+//! first. An atom's name is resolved in three steps — the current env's **per-call atom record**
+//! ([`current_recorded_atom_name`]; an atom interned *earlier in this same call* by
+//! `enif_make_atom`), then the current NIF host ([`with_current_host`] →
+//! [`crate::nif::host::NifHost::atom_name`]), then the raw atom index.
+//!
+//! The record step is what makes the common C idiom — `enif_compare(enif_make_atom(env, "a"),
+//! enif_make_atom(env, "b"))`, both operands built inside the one call — order by name. The real
+//! runtime does **not** commit a freshly interned atom to the global table until the call returns
+//! (see [`NifEnv::record_atom`]), so the host's reverse lookup cannot see the pair; the env's record
+//! can, and [`current_recorded_atom_name`] reaches it from this env-less entry point through the
+//! same thread-local stack the host is published on.
+//!
+//! # Current limitation: an atom pair *nested* inside a compound
+//!
+//! Atoms compared inside a tuple, list, map or fun still order by raw **atom index**:
+//! `beam_term`'s structural comparison takes a concrete `beam_term::AtomTable`, and this crate has
+//! none to hand it (`NifHost` exposes an atom-name *lookup*, not the table itself — and a re-derived
+//! table would not carry the runtime's indices). So `enif_compare({alpha}, {beta})` and
+//! `enif_compare([alpha], [beta])` may order either way, where the C answers `-1`. Closing that
+//! needs a comparison entry point in `beam_term` that takes a name resolver (or a `NifHost`
+//! atom-table hook); the structural comparison is deliberately not duplicated here. (This is the
+//! only remaining index fallback; the top-level pair no longer falls back for a *name*.)
 
 use super::*;
 
 use libc::{c_int, size_t};
 
+use crate::nif::host::{current_recorded_atom_name, with_current_host};
 use crate::nif::types::{ErlNifHash, ErlNifTermType};
 
 /// Populate the `ErlNifApi` slots this file owns (see the module docs).
@@ -260,6 +288,11 @@ pub unsafe extern "C" fn enif_is_identical(lhs: ERL_NIF_TERM, rhs: ERL_NIF_TERM)
 
 /// `int enif_compare(ERL_NIF_TERM lhs, ERL_NIF_TERM rhs);` — `-1`, `0` or `1`.
 ///
+/// The C `enif_compare` is `CMP(lhs, rhs)` = `erts_cmp(lhs, rhs, exact=0, eq_only=0)`, the
+/// **arithmetic** comparison (so `1 == 1.0`), with the two atoms of a top-level atom pair ordered by
+/// name (`erts_cmp_atoms`, resolved record → host → index; see the module docs). The nested-atom
+/// limitation is documented at the module level.
+///
 /// # Safety
 ///
 /// Both arguments are any terms; no pointers.
@@ -269,11 +302,54 @@ pub unsafe extern "C" fn enif_compare(lhs: ERL_NIF_TERM, rhs: ERL_NIF_TERM) -> c
     if a.raw() == b.raw() {
         return 0;
     }
-    match prelude::cmp(a, b, &no_atoms()) {
+    if let Some(ord) = cmp_atom_names(a, b) {
+        return sign(ord);
+    }
+    sign(prelude::cmp_arith(a, b, &no_atoms()))
+}
+
+/// `erts_cmp`'s difference folded into `enif_compare`'s `-1`/`0`/`1` (`erl_nif.c:1548-1558`).
+fn sign(ord: core::cmp::Ordering) -> c_int {
+    match ord {
         core::cmp::Ordering::Less => -1,
         core::cmp::Ordering::Equal => 0,
         core::cmp::Ordering::Greater => 1,
     }
+}
+
+/// `erts_cmp_atoms` (`erts/emulator/beam/erl_utils.h:193-215`) for a pair of **top-level** atoms:
+/// the atom *names* compared byte-lexicographically (a shorter name that is a prefix sorts first).
+/// `None` when the pair is not atom/atom or when neither [`atom_name`] resolution step yields both
+/// names — the caller then falls back to the arithmetic term comparison (which orders a top-level
+/// atom pair by index).
+///
+/// The C caches the first name bytes in the atom header and `memcmp`s the rest and finally compares
+/// the lengths; that is exactly `Ord` on the two name byte strings, so it is reproduced directly.
+fn cmp_atom_names(a: Eterm, b: Eterm) -> Option<core::cmp::Ordering> {
+    if !prelude::is_atom(a) || !prelude::is_atom(b) {
+        return None;
+    }
+    let name_a = atom_name(a)?;
+    let name_b = atom_name(b)?;
+    Some(name_a.as_bytes().cmp(name_b.as_bytes()))
+}
+
+/// The *name* of a top-level atom term, in the C's resolution order:
+///
+/// 1. the **current env's per-call atom record** ([`current_recorded_atom_name`]) — an atom interned
+///    earlier in *this same call* by `enif_make_atom` and friends, which the runtime has not yet
+///    committed to the global table and which [`crate::nif::host::NifHost::atom_name`] therefore
+///    cannot see (see [`NifEnv::record_atom`]);
+/// 2. the **current host** ([`with_current_host`] → [`crate::nif::host::NifHost::atom_name`]) — an
+///    atom the runtime already holds.
+///
+/// `None` when both miss, or when no NIF call is in progress (no live env ⇒ no current host and no
+/// current record): the caller falls back to the raw atom index.
+fn atom_name(atom: Eterm) -> Option<String> {
+    if let Some(name) = current_recorded_atom_name(atom) {
+        return Some(name);
+    }
+    with_current_host(|host| host.atom_name(atom))?
 }
 
 /// `ErlNifUInt64 enif_hash(ErlNifHash type, ERL_NIF_TERM term, ErlNifUInt64 salt);`

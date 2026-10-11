@@ -326,7 +326,10 @@ re-fetch.
   list** and a `!Send`-friendly `SchedulerPool` for SMP adoption (`Runtime` holds `Rc`/`RefCell` tables
   and `*mut Eterm` heaps, so `beam_process`'s `unsafe impl Send` escape is unavailable here). Without
   that drain this crate keeps composing the public fragment primitives directly and
-  `MailboxState::remove_at` retains a removed message's `Fragments` so a just-bound payload stays valid.
+  `MailboxState::remove_at` retains a removed message's heap `Fragments` and its whole off-heap
+  family so a just-bound payload stays valid — the refc-binary and MSO handles (the MSO handles in
+  the envelope's own order, so their `[HEADER_BIN_REF, slot, 0]` container terms resolve against the
+  copy's rebuilt source table) and the external-thing node identities (`NodeEntry` share handles).
   The `*_with_ports` scheduler forms exist, but this crate does not route its slices through them
   (holding the port-registry borrow across interpreted code turns every port BIF into the typed
   `unsupported`; `Runtime::with_port_table`), so the pass discharges the same obligations at its round

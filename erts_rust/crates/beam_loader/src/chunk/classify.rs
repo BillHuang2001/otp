@@ -29,7 +29,7 @@
 //!   at this layer, but the payload is materialized rather than dropped).
 //! * **[`ChunkClass::ToolingOnly`]** — recognized but deliberately left unparsed
 //!   because its payload is only meaningful to tooling (ExDoc, the debugger, the
-//!   compiler itself), never to the runtime.
+//!   compiler itself) and is never read by this loader.
 //!
 //! This module is the single in-code enumeration of that decision so the committed
 //! `tests/chunks.rs` checker can walk the whole installed OTP corpus and assert that
@@ -171,7 +171,7 @@ pub const CHUNK_KINDS: &[ChunkKind] = &[
         id: ChunkId::DBGB,
         name: "DbgB",
         class: ChunkClass::ToolingOnly,
-        reason: "legacy emulator debug-table chunk; tooling-only, never read by the runtime",
+        reason: "legacy emulator debug table, absent from modern modules (the compiler emits Dbgi); feeds the module checksum and is served by the reference runtime's code:get_debug_info/1, but retained here only raw in Chunks::raw (payload never decoded)",
     },
     ChunkKind {
         id: ChunkId::RECS,

@@ -26,15 +26,15 @@
 //! reduction counter, the link/monitor sets and the termination reason.
 //!
 //! Nothing here is reimplemented from a sibling: the mailbox is `beam_message::Queue`, the
-//! copy engine is `beam_message::send`/`receive`, the heaps are `beam_gc::Collector` over
+//! copy engine is `beam_message::send`/`receive`, the heaps are `beam_gc::AnyCollector` over
 //! `beam_alloc::Heap`, and the off-heap objects are `beam_message::OffHeapTable`.
 //!
 //! Legacy C ground truth (read-only): `erl_process.{c,h}` (the PCB and its state),
 //! `erl_message.h` (`ERL_MESSAGE_*`) and `erl_gc.c` (`erts_garbage_collect`).
 
-use beam_alloc::Heap;
+use beam_alloc::{Heap, RefcBinary};
 use beam_common::{AllocKind, BeamError, Result};
-use beam_gc::{Collection, Collector, HeapPolicy};
+use beam_gc::{AnyCollector, Collection, HeapPolicy, OffHeap, OffHeapEntry};
 use beam_message::{copy_struct, CopyContext, Message, OffHeapTable, Queue};
 use beam_term::prelude::Eterm;
 
@@ -243,7 +243,13 @@ pub struct Process {
     /// [`Process::set_save_calls`]); the tracing subsystem itself is absent in M1.
     save_calls: u16,
     /// The two-generation collector owning the young (mutator) and mature heaps.
-    collector: Collector,
+    ///
+    /// The **strategy-dispatching** collector ([`beam_gc::AnyCollector`]): its mature generation
+    /// is the copying space or the mark-region (GenImmix) space, chosen at construction by the
+    /// automatic rule from the policy's initial mature size (or by an explicit pin when the
+    /// caller builds it from a [`beam_gc::GcConfig`]). A default policy resolves to the copying
+    /// space, so this is behaviour-identical to owning the concrete collector.
+    collector: AnyCollector,
     /// Whether this process is **relocation-exempt** (default `false`).
     ///
     /// A host (e.g. `beam_rt`) may hold live terms from this process's young heap in Rust locals
@@ -257,6 +263,31 @@ pub struct Process {
     relocation_exempt: bool,
     /// The process's off-heap (MSO) handles.
     off_heap: OffHeapTable,
+    /// The process's **owned** off-heap binary list: the reclamation home for the refc binaries
+    /// whose ownership the process has taken ([`Process::register_off_heap_binary`]).
+    ///
+    /// This is a separate, **slot-stable** [`beam_gc::OffHeap`] from the one inside
+    /// [`Process::off_heap`] (see the type-level docs on that table): the process's persistent
+    /// `off_heap` table is the **message-transit / queued-signal** table the copy boundary writes
+    /// into and *deliberately never sweeps*, whereas this list is the one list the process itself
+    /// **sweeps** ([`Process::sweep_off_heap_binaries`], driven automatically at the end of a
+    /// rooted collection). The two hold different objects (this one holds only [`RefcBinary`]
+    /// payloads the process owns; `off_heap` holds MSO handles and the refc binaries that travel
+    /// with a copied message/fragment), so no handle is ever owned twice — never register the same
+    /// payload in both.
+    owned_binaries: OffHeap,
+    /// The number of slots `owned_binaries` has ever handed out — i.e. the next fresh slot index.
+    ///
+    /// `beam_gc::OffHeap` exposes no "slot count" accessor and `iter()` skips released slots, so
+    /// the container cannot enumerate its own slot space; this mirror (maintained only by
+    /// [`Process::register_off_heap_binary`], the only operation that appends a slot) is what lets
+    /// [`Process::owned_binary_slot`] scan every slot — live *and* released — by index. A sweep
+    /// only marks slots released, so it never changes this count.
+    owned_binary_slots: usize,
+    /// The payload pointers (`RefcBinary::data_ptr`) of the owned binaries the caller has
+    /// **declared dead**: the reclamation worklist [`Process::sweep_off_heap_binaries`] consumes.
+    /// It is a receiver-side, purely local list, never exposed to the heap.
+    dead_binaries: Vec<usize>,
     /// The mailbox.
     mailbox: Queue,
     /// The root-set containers (x-registers + Erlang stack).
@@ -342,9 +373,12 @@ impl Process {
             flags,
             priority,
             save_calls: 0,
-            collector: Collector::new(policy)?,
+            collector: AnyCollector::new(policy)?,
             relocation_exempt: false,
             off_heap: OffHeapTable::new(),
+            owned_binaries: OffHeap::new(),
+            owned_binary_slots: 0,
+            dead_binaries: Vec::new(),
             mailbox: Queue::new(),
             regs: Registers::new(),
             dict: Dict::new(),
@@ -575,6 +609,168 @@ impl Process {
         &mut self.off_heap
     }
 
+    /// Registers `binary` in the process's **owned** off-heap binary list and returns its slot.
+    ///
+    /// This is the process-path **binary-ownership home**: the process takes ownership of the
+    /// payload (the list holds one reference to it) so that a later
+    /// [`sweep_off_heap_binaries`](Process::sweep_off_heap_binaries) can reclaim it. The slot is
+    /// **stable for the process's lifetime** — the list never shifts, reorders or reuses a slot —
+    /// so a slot returned here stays resolvable
+    /// ([`off_heap_binary`](Process::off_heap_binary)) across any number of sweeps.
+    ///
+    /// The list holds at most **one** reference per payload (the legacy VM's `MSO(p)` invariant): a
+    /// payload already registered (same [`RefcBinary::data_ptr`], the frozen `BinRef.val`
+    /// contract) keeps its existing slot and the surplus handle is dropped, so
+    /// `register(handle.clone())` leaves the reference count unchanged. Because a payload therefore
+    /// names exactly one slot, a declared-dead slot unambiguously names the payload to release.
+    ///
+    /// # The caller's contract
+    ///
+    /// The process cannot decide on its own whether an off-heap payload is still reachable — the
+    /// on-heap `BinRef` that names it is nested inside boxed terms, and walking them is a
+    /// collection's job, not this crate's. So registration only makes the process the *owner*; the
+    /// payload is released only when the caller **declares it dead**
+    /// ([`declare_off_heap_binary_dead`](Process::declare_off_heap_binary_dead)) — the one
+    /// provable-death signal available without a heap traversal — or supplies a faithful predicate
+    /// through [`retain_off_heap_binaries`](Process::retain_off_heap_binaries). Everything else is
+    /// conservatively retained (leak-not-dangle). See `DESIGN_DECISIONS.md`.
+    pub fn register_off_heap_binary(&mut self, binary: RefcBinary) -> usize {
+        let data_ptr = binary.data_ptr() as usize;
+        match self.owned_binary_slot(data_ptr) {
+            // Already owned: the list keeps its single reference and the surplus handle drops.
+            Some(slot) => slot,
+            None => {
+                let slot = self.owned_binaries.insert(OffHeapEntry::Binary(binary));
+                self.owned_binary_slots = slot + 1;
+                slot
+            }
+        }
+    }
+
+    /// The owned off-heap binary at `slot`, or `None` when the slot is out of range **or has been
+    /// released** by a sweep (a released slot is never reused, so it can never resolve to an
+    /// unrelated payload).
+    pub fn off_heap_binary(&self, slot: usize) -> Option<&RefcBinary> {
+        self.owned_binaries.get(slot).and_then(OffHeapEntry::as_binary)
+    }
+
+    /// The **live** owned off-heap binaries, in slot order (released slots skipped).
+    pub fn off_heap_binaries(&self) -> impl Iterator<Item = &RefcBinary> {
+        self.owned_binaries.iter().filter_map(OffHeapEntry::as_binary)
+    }
+
+    /// The number of **live** owned off-heap binaries (a released slot is not counted).
+    pub fn off_heap_binary_count(&self) -> usize {
+        self.owned_binaries.len()
+    }
+
+    /// The total payload bytes of the **live** owned off-heap binaries (the off-heap payload the
+    /// process is charged for, the `system_info` memory accounting hook).
+    pub fn off_heap_binary_bytes(&self) -> usize {
+        self.owned_binaries.overhead_bytes()
+    }
+
+    /// Declares the owned off-heap binary at `slot` **dead** and returns whether a live entry was
+    /// marked.
+    ///
+    /// This is the caller's **assertion** that nothing references the payload any more — no on-heap
+    /// `BinRef`/`ErlSubBits` pair, and no other owner's handle. It is the only *provable-death*
+    /// signal this crate can act on without a heap traversal, so it is deliberately explicit: the
+    /// runtime (or the collector-side scan that owns liveness) is the party that can know it.
+    ///
+    /// The payload is **not** released here — the declaration is recorded and consumed by the next
+    /// sweep ([`sweep_off_heap_binaries`](Process::sweep_off_heap_binaries)), which every rooted
+    /// collection drives automatically. That deferred release is what makes the sweep the single
+    /// place a death turns into a reclaim, so a run of declarations costs one sweep, not one sweep
+    /// each; retaining a declared-dead payload until then is always safe (leak-not-dangle).
+    ///
+    /// `false` for an out-of-range or already-released slot (and for an entry that is not a binary:
+    /// this list only ever registers binaries, so that case cannot arise from this API).
+    pub fn declare_off_heap_binary_dead(&mut self, slot: usize) -> bool {
+        let Some(binary) = self
+            .owned_binaries
+            .get(slot)
+            .and_then(OffHeapEntry::as_binary)
+        else {
+            return false;
+        };
+        let data_ptr = binary.data_ptr() as usize;
+        if !self.dead_binaries.contains(&data_ptr) {
+            self.dead_binaries.push(data_ptr);
+        }
+        true
+    }
+
+    /// Reclaims the **declared-dead** owned off-heap binaries by driving
+    /// [`beam_gc::OffHeap::sweep`] over the process's owned list, and returns how many entries were
+    /// released.
+    ///
+    /// This is the process-path reclamation step. Every rooted collection runs it automatically
+    /// (`run_rooted_collection`'s last step, after the roots are scattered back), and a host can
+    /// also force it directly. Each released entry is dropped exactly once, so the payload is freed
+    /// exactly at reference count 0 (and only when the process held the last handle); a released
+    /// slot is never reused and a second sweep releases nothing further.
+    ///
+    /// # The predicate is CONSERVATIVE
+    ///
+    /// An entry is released **only** when it has been declared dead. Every other entry is retained,
+    /// including an entry whose liveness the process cannot decide — the list is swept with a
+    /// predicate (`release iff declared dead`) that can never report a possibly-live payload dead,
+    /// because deciding liveness would need a heap traversal this crate does not have. The
+    /// residual is a **leak, never a dangle**: a payload no caller declares stays owned by the
+    /// process until the process dies (its `Drop` frees it) — see `DESIGN_DECISIONS.md` for the
+    /// exact gap and its owner.
+    pub fn sweep_off_heap_binaries(&mut self) -> usize {
+        // Take the declarations: this sweep is the single place they turn into releases (the list
+        // is cleared by the move, so the same payload is never declared twice).
+        let dead = core::mem::take(&mut self.dead_binaries);
+        self.retain_off_heap_binaries(|binary| -> bool {
+            !dead.contains(&(binary.data_ptr() as usize))
+        })
+    }
+
+    /// Reclaims every **live** owned off-heap binary `is_live` reports dead, and returns how many
+    /// entries were released.
+    ///
+    /// The caller-supplied-predicate half of the sweep seam, for a party that *can* decide liveness
+    /// faithfully — a collector-side or host-side heap scan that walks the on-heap `BinRef`/MSO
+    /// containers and reports which payload pointers it still found. The predicate is applied to
+    /// each **live** entry (released slots are skipped), and the slot stability contract holds: a
+    /// survivor keeps its original slot, a released slot answers `None` and is never reused.
+    ///
+    /// A caller that cannot walk the heap must not use this to guess: reporting a still-referenced
+    /// payload dead releases the process's ownership of it, so a genuine `BinRef` would then dangle
+    /// once the process's handle was the last one. Use
+    /// [`declare_off_heap_binary_dead`](Process::declare_off_heap_binary_dead) for an asserted
+    /// death and [`sweep_off_heap_binaries`](Process::sweep_off_heap_binaries) for the automatic
+    /// conservative path.
+    pub fn retain_off_heap_binaries<F>(&mut self, mut is_live: F) -> usize
+    where
+        F: FnMut(&RefcBinary) -> bool,
+    {
+        self.owned_binaries.sweep(|entry| match entry.as_binary() {
+            Some(binary) => is_live(binary),
+            // This list only ever registers binaries; an MSO entry is foreign here — retain it.
+            None => true,
+        })
+    }
+
+    /// The slot of the live owned binary whose payload starts at `data_ptr`, or `None`.
+    ///
+    /// The [`RefcBinary::data_ptr`] identity (the frozen `BinRef.val` contract: the *first payload
+    /// byte*) is what makes the list's slot↔payload association a bijection, so a declared-dead
+    /// payload names exactly one slot. Slots are scanned **by index** over the whole slot space
+    /// (a released slot is skipped by `get`, so it can never match).
+    fn owned_binary_slot(&self, data_ptr: usize) -> Option<usize> {
+        (0..self.owned_binary_slots).find(|&slot| {
+            self.owned_binaries
+                .get(slot)
+                .and_then(OffHeapEntry::as_binary)
+                .map(|binary| binary.data_ptr() as usize)
+                == Some(data_ptr)
+        })
+    }
+
     /// The process's young (mutator) heap **and** its off-heap (MSO) table, as two disjoint
     /// mutable borrows.
     ///
@@ -587,7 +783,7 @@ impl Process {
     /// message onto a process's heap in one step.
     ///
     /// `self` is destructured internally, so the compiler proves the two references are disjoint
-    /// borrows of distinct fields of `Collector`/`Process`. Safe Rust only — no raw pointers and
+    /// borrows of distinct fields of `AnyCollector`/`Process`. Safe Rust only — no raw pointers and
     /// no `unsafe`.
     pub fn heap_and_off_heap_mut(&mut self) -> (&mut Heap, &mut OffHeapTable) {
         let Process {
@@ -610,7 +806,7 @@ impl Process {
     /// without destructuring `Process` or reimplementing the enqueue.
     ///
     /// `self` is destructured internally, so the compiler proves the two references are disjoint
-    /// borrows of distinct fields of `Collector`/`Process`. Safe Rust only — no raw pointers and
+    /// borrows of distinct fields of `AnyCollector`/`Process`. Safe Rust only — no raw pointers and
     /// no `unsafe`.
     pub fn heap_and_mailbox_mut(&mut self) -> (&mut Heap, &mut Queue) {
         let Process {
@@ -802,7 +998,13 @@ impl Process {
     }
 
     /// The process's garbage collector.
-    pub fn collector(&self) -> &Collector {
+    ///
+    /// The strategy-dispatching [`beam_gc::AnyCollector`]: its mature generation is whichever
+    /// strategy the policy's configuration resolved to ([`beam_gc::AnyCollector::kind`] names
+    /// it), so a caller inspects the mature space through the geometry accessors
+    /// ([`beam_gc::AnyCollector::mature_capacity_words`] and its siblings) rather than a
+    /// strategy-specific `mature()` reference.
+    pub fn collector(&self) -> &AnyCollector {
         &self.collector
     }
 
@@ -867,6 +1069,11 @@ impl Process {
     /// collector classifies it as foreign to every evacuated range and leaves it exactly where
     /// it is; the message keeps owning the fragment chain that holds it.
     ///
+    /// The last step is [`Process::sweep_off_heap_binaries`] — the process's off-heap
+    /// refc-binary reclamation, run after every root region is back in place. It releases only the
+    /// binaries the caller has declared dead and retains everything else (the conservative
+    /// predicate — liveness of an off-heap payload cannot be decided without a heap traversal).
+    ///
     /// The outgoing port-monitor set ([`Process::port_monitors`]) is deliberately **not**
     /// gathered: a [`PortWatch`] holds a reference and a port number, both plain values
     /// rather than heap terms, so it cannot be relocated and needs no root.
@@ -921,8 +1128,9 @@ impl Process {
     /// Gathers the process root set, runs `collect` over it and writes every region back — the
     /// shared body of [`Process::collect`] and [`Process::ensure_capacity`].
     ///
-    /// `collect` is the collection action: [`Collector::collect`] for a plain collection, or
-    /// [`Collector::ensure_capacity`] for an on-demand nursery growth. Every region is written
+    /// `collect` is the collection action: [`beam_gc::AnyCollector::collect`] for a plain
+    /// collection, or [`beam_gc::AnyCollector::ensure_capacity`] for an on-demand nursery growth.
+    /// Every region is written
     /// back **even when the action returned `Err`**: an `ensure_capacity` failure can happen
     /// *after* its collection succeeded (the nursery growth was refused), at which point the
     /// roots have already been relocated in place, so leaving them unwritten would corrupt the
@@ -938,7 +1146,7 @@ impl Process {
     /// would leak the refcounts the message held on its off-heap objects.
     fn run_rooted_collection<F>(&mut self, collect: F) -> Result<Collection>
     where
-        F: FnOnce(&mut Collector, &mut [Eterm]) -> Result<Collection>,
+        F: FnOnce(&mut AnyCollector, &mut [Eterm]) -> Result<Collection>,
     {
         // 1. The flat root slice: `x[0..live)`, then the whole stack, then one word per
         //    queued mailbox payload. `reg_words` is where the mailbox roots start.
@@ -987,6 +1195,15 @@ impl Process {
         self.dict.scatter_roots(&roots, dict_start);
         self.saved_args.scatter_roots(&roots, saved_start);
         self.signals.scatter_roots(&roots, signals_start);
+
+        // 8. Reclaim the off-heap binaries the caller declared dead. The roots are all back in
+        //    place, so the heap is consistent; the sweep releases only declared-dead entries (the
+        //    conservative predicate — see `sweep_off_heap_binaries`), and because liveness cannot
+        //    be decided here (an on-heap `BinRef` is nested inside boxed terms) everything else is
+        //    retained. A no-op for a process that owns no off-heap binaries. This is deliberately
+        //    *after* the write-back: releasing a payload never moves a heap word, and doing it last
+        //    keeps it off the relocation path.
+        self.sweep_off_heap_binaries();
 
         action
     }
@@ -1289,11 +1506,56 @@ mod tests {
         let process = Process::new(pid(6)).expect("the default heap allocates");
         // A fresh nursery cannot satisfy an absurd request ...
         assert!(process.should_collect(usize::MAX / 2));
-        // ... but a small one fits.
+        // ... but a small one does.
         assert!(!process.should_collect(1));
         assert_eq!(process.heap_used_words(), 0);
     }
 
+    #[test]
+    fn owned_off_heap_binaries_register_by_payload_and_sweep_only_declared_deaths() {
+        use beam_alloc::RefcBinary;
+
+        let mut process = Process::new(pid(30)).expect("the default heap allocates");
+        assert_eq!(process.off_heap_binary_count(), 0);
+        assert_eq!(process.off_heap_binary_bytes(), 0);
+        assert!(process.off_heap_binary(0).is_none());
+
+        // A registration moves the handle in and lands at slot 0; a second registration of the
+        // same payload (same `data_ptr`) keeps that slot and drops the surplus handle.
+        let payload = RefcBinary::new(b"a 200-byte off-heap payload ...").expect("allocate");
+        let data_ptr = payload.data_ptr();
+        let slot = process.register_off_heap_binary(payload.clone());
+        assert_eq!(slot, 0);
+        assert_eq!(process.register_off_heap_binary(payload.clone()), slot);
+        assert_eq!(process.off_heap_binary_count(), 1, "one entry per payload");
+        assert_eq!(
+            process.off_heap_binary(slot).expect("slot 0").refcount(),
+            2,
+            "the local owner plus the list's single handle"
+        );
+        assert_eq!(process.off_heap_binary_bytes(), payload.len());
+        assert_eq!(
+            process.off_heap_binaries().map(|b| b.data_ptr()).collect::<Vec<_>>(),
+            vec![data_ptr],
+        );
+
+        // Nothing declared dead: a sweep releases nothing (the conservative default).
+        assert_eq!(process.sweep_off_heap_binaries(), 0);
+        assert_eq!(process.off_heap_binary_count(), 1);
+
+        // Declared dead: the next sweep releases it, and the slot is gone for good.
+        assert!(process.declare_off_heap_binary_dead(slot));
+        assert_eq!(process.sweep_off_heap_binaries(), 1);
+        assert_eq!(process.off_heap_binary_count(), 0);
+        assert_eq!(process.off_heap_binary_bytes(), 0);
+        assert!(process.off_heap_binary(slot).is_none());
+        assert_eq!(process.sweep_off_heap_binaries(), 0, "a released slot is not released again");
+        assert!(!process.declare_off_heap_binary_dead(slot));
+
+        // The payload outlives the release: the local owner still holds a handle.
+        assert_eq!(payload.refcount(), 1);
+        assert_eq!(payload.data_ptr(), data_ptr);
+    }
     #[test]
     fn collect_reclaims_with_an_empty_mailbox_and_no_roots() {
         let mut process = Process::new(pid(7)).expect("the default heap allocates");

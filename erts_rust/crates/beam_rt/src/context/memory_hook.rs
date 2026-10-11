@@ -138,7 +138,7 @@ impl RuntimeMemory {
                 // systematically under-report a long-lived process (`processes_used` would
                 // even fall *below* the oracle's ratio against `processes`).
                 process_used +=
-                    (collector.young().used_words() + collector.mature().used_words()) as u64 * word;
+                    (collector.young().used_words() + collector.mature_used_words()) as u64 * word;
             }
         }
         RuntimeMemory {

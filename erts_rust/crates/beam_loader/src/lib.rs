@@ -60,6 +60,7 @@
 #![warn(missing_docs)]
 
 pub mod attributes;
+pub mod checksum;
 pub mod chunk;
 pub mod container;
 pub mod decoded;

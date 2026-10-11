@@ -83,7 +83,7 @@ pub(crate) const UNCLAIMED_PREFIX: &str = "widened opcode not yet executed";
 mod bitstrings;
 pub(crate) mod exceptions;
 mod floats;
-mod funs;
+pub(crate) mod funs;
 mod lists;
 mod maps;
 mod receive;

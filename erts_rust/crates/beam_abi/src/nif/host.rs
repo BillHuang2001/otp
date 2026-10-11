@@ -39,11 +39,20 @@
 //! atom interned earlier in the *same* call — the record restores that visibility for
 //! `enif_get_atom`/`enif_make_existing_atom`. See [`NifEnv::record_atom`] for the full account.
 //!
+//! The record is reachable from an `enif_*` entry point that takes **no env argument** — the one
+//! such entry point that needs it is `enif_compare`, whose C signature is
+//! `enif_compare(ERL_NIF_TERM, ERL_NIF_TERM)` yet which must order two top-level atoms this call
+//! interned by their *names*. The record is therefore stored as `Rc<RefCell<…>>` and a handle to it
+//! is published on the same thread-local stack as the host ([`current_recorded_atom_name`] reads
+//! it back); the interior mutability is what lets it be read while the env is mutably borrowed by
+//! the call in progress.
+//!
 //! `unsafe` is confined to [`NifEnv::host`] and [`NifEnv::from_opaque`], each documented with a
 //! `# Safety` section / `// SAFETY:` rationale (workspace `CONTEXT.md` §3).
 
 use core::cell::RefCell;
 use core::sync::atomic::{AtomicU64, Ordering};
+use std::rc::Rc;
 
 use libc::{c_int, c_void};
 
@@ -120,6 +129,14 @@ pub trait NifHost {
     }
 
     /// The NIF library's private data pointer (C `enif_priv_data`); default: null.
+    ///
+    /// **This hook is the fallback source, not the primary one.** `enif_priv_data` answers the
+    /// private pointer of the library the call belongs to — [`crate::nif::loader::NifLibrary`]
+    /// publishes the pointer its `load` callback produced for the duration of
+    /// [`crate::nif::loader::NifLibrary::call`], and that published value (the C's
+    /// `env->mod_nif->priv_data`) wins whenever a library call is in progress. This hook is consulted
+    /// only when **no** library call is in flight, so it exists for a host that manages private data
+    /// itself; its default null matches the C's answer for a call env whose `load` stored nothing.
     fn priv_data(&mut self) -> *mut c_void {
         core::ptr::null_mut()
     }
@@ -307,21 +324,49 @@ pub trait NifHost {
 // Each entry carries the token of the [`NifEnv`] that published it, so an out-of-order drop removes
 // exactly its own entry instead of whichever one happens to be on top.
 //
+// Each entry also carries a handle to that env's **per-call atom record** ([`NifEnv::record_atom`]),
+// so the record is reachable from an `enif_*` entry point that takes no env argument
+// ([`current_recorded_atom_name`], used by `enif_compare`). Sharing it as an `Rc<RefCell<…>>` —
+// rather than moving a `&mut` borrow onto the stack — is what makes it readable *while* the env is
+// mutably borrowed by the call in progress; see [`RecordedAtoms`].
+//
 // The store is **thread-local**, not global: a NIF call is made on one thread and [`NifEnv`] is not
-// `Send` (it holds a raw host pointer), so the host a thread publishes is only ever read back on
-// that same thread.
+// `Send` (it holds a raw host pointer and an `Rc`), so the host a thread publishes is only ever read
+// back on that same thread.
+
+/// The shared per-call atom record of one [`NifEnv`] (see [`NifEnv::record_atom`]).
+///
+/// `Rc<RefCell<…>>` rather than a plain `Vec` field, because the record must be readable from an
+/// entry point that takes **no env argument** while the env itself is mutably borrowed by the NIF
+/// call in progress: `enif_compare` (`nif::enif::pred`) is exactly that entry point — its C
+/// signature is `enif_compare(ERL_NIF_TERM, ERL_NIF_TERM)` — and a top-level atom pair must be
+/// ordered by name, including two atoms interned moments earlier *in this call* (whose names the
+/// host has not committed yet, see [`NifEnv::record_atom`]). The env keeps one handle and the
+/// thread-local [`CURRENT_HOSTS`] entry keeps another, so the reader never needs a second
+/// `&mut NifEnv`; interior mutability supplies the shared access.
+///
+/// The `Rc` is also what keeps [`NifEnv`] `!Send` (reinforcing the raw host pointer's own
+/// `!Send`/`!Sync`), and the record lives and dies with the env that owns it.
+type RecordedAtoms = Rc<RefCell<Vec<(usize, String)>>>;
 
 thread_local! {
-    /// The hosts published by the [`NifEnv`]s live on this thread, innermost (current) last.
-    static CURRENT_HOSTS: RefCell<Vec<(u64, *mut dyn NifHost)>> = const { RefCell::new(Vec::new()) };
+    /// The envs published by the [`NifEnv`]s live on this thread, innermost (current) last.
+    ///
+    /// Each entry is `(token, host, atom_record)`: the token identifies the publishing [`NifEnv`]
+    /// (so `Drop` removes exactly its own entry), the host is that call's [`NifHost`], and the atom
+    /// record is the same env's per-call record of interned atoms, shared as described at
+    /// [`RecordedAtoms`].
+    static CURRENT_HOSTS: RefCell<Vec<(u64, *mut dyn NifHost, RecordedAtoms)>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 /// Identity of the next [`NifEnv`] (see [`CURRENT_HOSTS`]); drawn once per env, never reused.
 static NEXT_ENV_TOKEN: AtomicU64 = AtomicU64::new(1);
 
-/// Publish `host` as the host of the NIF call whose env carries `token` ([`NifEnv::new`]).
-fn push_current_host(token: u64, host: *mut dyn NifHost) {
-    CURRENT_HOSTS.with(|stack| stack.borrow_mut().push((token, host)));
+/// Publish `host` (and its env's atom record) as the NIF call whose env carries `token`
+/// ([`NifEnv::new`]).
+fn push_current_host(token: u64, host: *mut dyn NifHost, recorded_atoms: RecordedAtoms) {
+    CURRENT_HOSTS.with(|stack| stack.borrow_mut().push((token, host, recorded_atoms)));
 }
 
 /// Remove `token`'s entry, wherever it sits ([`NifEnv`]'s `Drop`).
@@ -332,7 +377,7 @@ fn push_current_host(token: u64, host: *mut dyn NifHost) {
 fn pop_current_host(token: u64) {
     CURRENT_HOSTS.with(|stack| {
         let mut stack = stack.borrow_mut();
-        if let Some(pos) = stack.iter().position(|&(t, _)| t == token) {
+        if let Some(pos) = stack.iter().position(|entry| entry.0 == token) {
             stack.remove(pos);
         }
     });
@@ -345,7 +390,7 @@ fn pop_current_host(token: u64) {
 /// entry point that takes no argument and so cannot name a host itself. The thread-local borrow is
 /// released before `f` runs, so `f` may itself construct an env (a nested push).
 pub(crate) fn with_current_host<R>(f: impl FnOnce(&mut dyn NifHost) -> R) -> Option<R> {
-    let host = CURRENT_HOSTS.with(|stack| stack.borrow().last().map(|&(_, host)| host))?;
+    let host = CURRENT_HOSTS.with(|stack| stack.borrow().last().map(|entry| entry.1))?;
     // SAFETY: the entry was pushed by a live `NifEnv`, which by its own contract keeps the host
     // alive until that env is dropped, and dropping the env removes the entry — so a host named by
     // an entry on the stack is live. An env holds only the raw pointer (`NifEnv::host` is the only
@@ -353,6 +398,35 @@ pub(crate) fn with_current_host<R>(f: impl FnOnce(&mut dyn NifHost) -> R) -> Opt
     // `&mut dyn NifHost` into that host is outstanding here, and this reborrow is scoped to `f`.
     let host: &mut dyn NifHost = unsafe { &mut *host };
     Some(f(host))
+}
+
+/// The name `atom` was interned under **through the innermost live [`NifEnv`]** on this thread
+/// during the current NIF call, if any.
+///
+/// The atom-record counterpart of [`with_current_host`], and its *raison d'être* is the same: an
+/// `enif_*` entry point that takes no env argument. `enif_compare` (`nif::enif::pred`) is the one
+/// that needs it — it must order two top-level atoms by *name* (`erts_cmp_atoms`), and the host's
+/// reverse lookup cannot resolve a name that is still pending (see
+/// [`NifEnv::record_atom`]) — so this reads the current env's per-call record for it.
+///
+/// Answers `None` when no env is live (this thread is outside a NIF call) or when the innermost env
+/// did not record `atom`; the caller then falls back to [`NifHost::atom_name`] and, failing that,
+/// the raw atom index.
+pub(crate) fn current_recorded_atom_name(atom: Eterm) -> Option<String> {
+    // Clone the shared record handle out of the stack first, so the thread-local borrow is released
+    // before the record itself is borrowed (a nested env push inside the read could otherwise
+    // conflict) and no borrow of the stack is held while the caller continues.
+    let record =
+        CURRENT_HOSTS.with(|stack| stack.borrow().last().map(|entry| Rc::clone(&entry.2)))?;
+    let target = atom.raw();
+    let mut found = None;
+    for (raw, name) in record.borrow().iter() {
+        if *raw == target {
+            found = Some(name.clone());
+            break;
+        }
+    }
+    found
 }
 
 /// The maximum number of atoms one [`NifEnv`] records for the duration of a NIF call.
@@ -385,16 +459,22 @@ pub struct NifEnv {
     /// the raw term word. Consulted by the atom accessors *before* [`NifHost::atom_name`] /
     /// [`NifHost::existing_atom`] (see [`NifEnv::record_atom`] for why). It lives and dies with the
     /// env, so it never leaks across NIF calls.
-    recorded_atoms: Vec<(usize, String)>,
+    ///
+    /// Shared (`Rc`) with this env's [`CURRENT_HOSTS`] entry, so the env-less `enif_compare` can
+    /// read it through [`current_recorded_atom_name`]; see [`RecordedAtoms`] for why it is
+    /// interior-mutable rather than a plain field.
+    recorded_atoms: RecordedAtoms,
 }
 
 impl NifEnv {
     /// Wrap `host` in a fresh per-call environment (no pending exception).
     ///
-    /// The env also **publishes `host` as the current NIF-call host on this thread** (removed again
-    /// by `Drop`) — the mechanism `enif_alloc_env` uses to reach a host from an entry point that
-    /// takes no argument (see `with_current_host` below). Constructing one is therefore reserved for
-    /// a real call env: it is what "this thread is inside a NIF call" means to this crate.
+    /// The env also **publishes `host` — and a handle to this env's per-call atom record — as the
+    /// current NIF call on this thread** (removed again by `Drop`) — the mechanism `enif_alloc_env`
+    /// uses to reach a host from an entry point that takes no argument, and the mechanism
+    /// `enif_compare` uses to reach the record (see `with_current_host` /
+    /// [`current_recorded_atom_name`] below). Constructing one is therefore reserved for a real call
+    /// env: it is what "this thread is inside a NIF call" means to this crate.
     pub fn new(host: &mut dyn NifHost) -> NifEnv {
         // SAFETY: the only thing reinterpreted here is the erased trait-object lifetime. The
         // C-facing env has no lifetime parameter (`struct enif_environment_t` is plain C), so the
@@ -407,12 +487,15 @@ impl NifEnv {
         // the environment is used (`NifEnv` is not `Clone`, so there is exactly one handle).
         let host: *mut dyn NifHost = unsafe { core::mem::transmute(host) };
         let token = NEXT_ENV_TOKEN.fetch_add(1, Ordering::Relaxed);
-        push_current_host(token, host);
+        // One allocation per call, shared by this env and its `CURRENT_HOSTS` entry, so the record
+        // is readable through the thread-local while `self` is mutably borrowed by the call.
+        let recorded_atoms: RecordedAtoms = Rc::new(RefCell::new(Vec::new()));
+        push_current_host(token, host, Rc::clone(&recorded_atoms));
         NifEnv {
             host,
             token,
             pending_exception: None,
-            recorded_atoms: Vec::new(),
+            recorded_atoms,
         }
     }
 
@@ -479,24 +562,28 @@ impl NifEnv {
     /// its own pending interner resolves the same divergence without it. The two mechanisms are
     /// complementary: the record is consulted first, and only a miss falls through to the host.
     pub(crate) fn record_atom(&mut self, atom: Eterm, name: &str) {
-        if self.recorded_atoms.len() >= MAX_RECORDED_ATOMS {
+        let mut record = self.recorded_atoms.borrow_mut();
+        if record.len() >= MAX_RECORDED_ATOMS {
             return;
         }
-        if self.recorded_atoms.iter().any(|(raw, _)| *raw == atom.raw()) {
+        if record.iter().any(|(raw, _)| *raw == atom.raw()) {
             return;
         }
-        self.recorded_atoms.push((atom.raw(), name.to_string()));
+        record.push((atom.raw(), name.to_string()));
     }
 
     /// The name `atom` was interned under **through this env** during the current call, if any.
     ///
     /// The `enif_get_atom`/`enif_get_atom_length` fast path (see `nif::enif::get`); a miss falls
-    /// back to [`NifHost::atom_name`].
-    pub(crate) fn recorded_atom_name(&self, atom: Eterm) -> Option<&str> {
+    /// back to [`NifHost::atom_name`]. Read through the shared per-call record (see
+    /// [`RecordedAtoms`]), so it is also the store `enif_compare` reaches via
+    /// [`current_recorded_atom_name`].
+    pub(crate) fn recorded_atom_name(&self, atom: Eterm) -> Option<String> {
         self.recorded_atoms
+            .borrow()
             .iter()
             .find(|(raw, _)| *raw == atom.raw())
-            .map(|(_, name)| name.as_str())
+            .map(|(_, name)| name.clone())
     }
 
     /// The atom interned **through this env** under `name` during the current call, if any.
@@ -506,6 +593,7 @@ impl NifEnv {
     /// interned earlier in the call is found **without creating one**.
     pub(crate) fn recorded_atom(&self, name: &str) -> Option<Eterm> {
         self.recorded_atoms
+            .borrow()
             .iter()
             .find(|(_, recorded)| recorded == name)
             .map(|(raw, _)| Eterm::from_raw(*raw))
@@ -649,7 +737,7 @@ mod tests {
         let mut env = NifEnv::new(&mut host);
         assert_eq!(env.recorded_atom_name(atom), None, "nothing recorded yet");
         env.record_atom(atom, "just_now");
-        assert_eq!(env.recorded_atom_name(atom), Some("just_now"));
+        assert_eq!(env.recorded_atom_name(atom).as_deref(), Some("just_now"));
         assert_eq!(env.recorded_atom("just_now"), Some(atom));
         // A different term word is not resolved by the record.
         assert_eq!(env.recorded_atom_name(make_small(7)), None);
@@ -665,7 +753,7 @@ mod tests {
             env.record_atom(atom, "dup");
         }
         assert_eq!(
-            env.recorded_atoms.len(),
+            env.recorded_atoms.borrow().len(),
             1,
             "a repeated term word is recorded once"
         );
@@ -673,8 +761,46 @@ mod tests {
         for i in 0..(MAX_RECORDED_ATOMS as u32 + 8) {
             env.record_atom(make_atom(Atom::from_raw(i)), "bounded");
         }
-        assert_eq!(env.recorded_atoms.len(), MAX_RECORDED_ATOMS);
-        assert_eq!(env.recorded_atom_name(atom), Some("dup"));
+        assert_eq!(env.recorded_atoms.borrow().len(), MAX_RECORDED_ATOMS);
+        assert_eq!(env.recorded_atom_name(atom).as_deref(), Some("dup"));
+    }
+
+    #[test]
+    fn the_atom_record_is_reachable_from_an_env_less_entry_point() {
+        let mut host = TestHost::new();
+        let atom = host.intern_atom("reachable").expect("interns unconditionally");
+        // Outside any NIF call there is no current record...
+        assert_eq!(current_recorded_atom_name(atom), None);
+        {
+            let mut env = NifEnv::new(&mut host);
+            // ...the env publishes its record for as long as it is live (this is how the env-less
+            // `enif_compare` resolves an atom interned earlier in the same call)...
+            env.record_atom(atom, "reachable");
+            assert_eq!(
+                current_recorded_atom_name(atom).as_deref(),
+                Some("reachable")
+            );
+            assert_eq!(current_recorded_atom_name(make_small(1)), None);
+        }
+        // ...and withdrawing the env withdraws the record again.
+        assert_eq!(current_recorded_atom_name(atom), None);
+    }
+
+    #[test]
+    fn the_innermost_env_record_wins_over_an_enclosing_one() {
+        let mut host = TestHost::new();
+        let atom = host.intern_atom("shadowed").expect("interns unconditionally");
+        let mut outer = NifEnv::new(&mut host);
+        outer.record_atom(atom, "outer");
+        assert_eq!(current_recorded_atom_name(atom).as_deref(), Some("outer"));
+        {
+            // A nested call publishes its own (empty) record; a miss in the inner env's record does
+            // not leak the outer name, matching `with_current_host`'s innermost-wins rule.
+            let mut inner = NifEnv::new(&mut host);
+            inner.record_atom(atom, "inner");
+            assert_eq!(current_recorded_atom_name(atom).as_deref(), Some("inner"));
+        }
+        assert_eq!(current_recorded_atom_name(atom).as_deref(), Some("outer"));
     }
 
     #[test]

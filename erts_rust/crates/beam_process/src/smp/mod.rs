@@ -133,7 +133,7 @@ pub struct SharedProcessTable {
 
 // SAFETY: `ProcessTable` is `!Send` for exactly five reasons, each accounted for here:
 //   1. `beam_alloc::Heap.base: *mut Eterm` (`beam_alloc/src/heap.rs`), reached via
-//      `Process.collector → beam_gc::Collector → HeapSpace → beam_alloc::Heap`. The heap uniquely
+//      `Process.collector → beam_gc::AnyCollector → HeapSpace → beam_alloc::Heap`. The heap uniquely
 //      owns the block; the pointer targets a carrier block owned by a `Send` (`Arc<dyn Allocator>`
 //      over a `Send + Sync` allocator) whose address is stable across the move, and nothing aliases
 //      it concurrently.

@@ -31,7 +31,7 @@
 //! | `enif_alloc_env` | `erts_alloc_fnf(ERTS_ALC_T_NIF, sizeof(struct enif_msg_environment_t))` + `setup_nif_env(msg_env, NULL, NULL)` (`:669-675`) | delegates to [`NifHost::alloc_env`] on the host of the **current NIF call** — see "How `enif_alloc_env` finds its host" below |
 //! | `enif_free_env` | `enif_clear_env(env); erts_free(ERTS_ALC_T_NIF, env);` (`:676-680`) | delegates to [`NifHost::free_env`] — the host owns every env it allocated ([`NifHost::alloc_env`]) |
 //! | `enif_make_copy` | `make_copy(dst_env, src_term, NULL)` — `size_object` + `copy_struct` onto `dst_env`'s heap (`:1194-1197`, `:843-858`) | delegates to [`NifHost::make_copy`]; when the hook is unsupported it answers `THE_NON_VALUE` |
-//! | `enif_priv_data` | `env->mod_nif->priv_data` (`:609-612`) | delegates to [`NifHost::priv_data`] — the pointer the library's `load` callback produced (the loader keeps it in [`crate::nif::loader::NifLibrary::priv_data`]) |
+//! | `enif_priv_data` | `env->mod_nif->priv_data` (`:609-612`) | the private pointer of the **library whose call this is** — published on the calling thread by [`crate::nif::loader::NifLibrary::call`] and read back here; [`NifHost::priv_data`] is the fallback when no library call is in progress |
 //!
 //! # How `enif_alloc_env` finds its host
 //!
@@ -70,10 +70,16 @@
 //!   [`NifHost::free_env`], which frees it when the host owns it and reports `false` otherwise (a
 //!   per-call env, or a host with no envs of its own) — the pointer is then left alone rather than
 //!   freed across allocators.
-//! * **`enif_priv_data` on a message env** answers the host's value where the C would read
+//! * **`enif_priv_data` answers the in-flight library's pointer first, then the host's.** While a NIF
+//!   call is in progress the answer is the calling library's private pointer (what its `load`
+//!   callback stored, `erl_nif.c:5003`) — `env->mod_nif->priv_data` verbatim, including when it is
+//!   `NULL`, because the library is authoritative for its own private data. With no library call in
+//!   progress there is no library to name and the answer is [`NifHost::priv_data`], whose default
+//!   `NULL` is also the C's answer for a call env whose `load` stored nothing.
+//! * **`enif_priv_data` on a message env** answers that same library pointer where the C would read
 //!   `NULL->priv_data` and fault (`env->mod_nif` is `NULL` for an `enif_alloc_env` env,
-//!   `setup_nif_env(msg_env, NULL, NULL)`, `:641`). A host without private data answers `NULL`; the
-//!   C's answer for a *call* env with a `load` callback that stored nothing is `NULL` too.
+//!   `setup_nif_env(msg_env, NULL, NULL)`, `:641`); outside a library call it answers the host's
+//!   value.
 //! * **`enif_make_copy` never aliases the source.** With no copy engine behind the hook the answer is
 //!   `THE_NON_VALUE` (the C's own "no term" word, `erl_term.h`; the crate's `prelude::is_non_value`
 //!   and every term predicate reject it), never `src_term` itself — returning the source term would
@@ -215,8 +221,15 @@ pub unsafe extern "C" fn enif_make_copy(
 
 /// `void* enif_priv_data(ErlNifEnv* env);`
 ///
-/// The private data pointer the library's `load` callback stored ([`NifHost::priv_data`]); a host
-/// without private data answers `NULL` (as the C does for a call env whose `load` stored nothing).
+/// The private data pointer of the **library the call belongs to** — the value that library's `load`
+/// callback stored, which [`crate::nif::loader::NifLibrary::call`] publishes for the duration of the
+/// call and this function reads back. That *is* the C's `env->mod_nif->priv_data`
+/// (`erl_nif.c:609-612`), so it wins over [`NifHost::priv_data`]. With **no library call in
+/// progress** on this thread (no library to name) the answer falls back to [`NifHost::priv_data`],
+/// which is what a host that manages private data itself reports.
+///
+/// A published `NULL` is answered as `NULL` rather than falling through to the host: the library is
+/// authoritative for its own private data, exactly as `lib->priv_data` is in the C.
 ///
 /// # Safety
 ///
@@ -225,11 +238,18 @@ pub unsafe extern "C" fn enif_make_copy(
 pub unsafe extern "C" fn enif_priv_data(
     env: *mut crate::nif::types::ErlNifEnv,
 ) -> *mut c_void {
-    match unsafe { env_mut(env) } {
-        Some(e) => e.host().priv_data(),
-        // The C reads `env->mod_nif->priv_data` (`erl_nif.c:609-612`) and faults on a null env.
-        None => core::ptr::null_mut(),
+    // The C reads `env->mod_nif->priv_data` (`erl_nif.c:609-612`) and faults on a null env; `NULL` is
+    // this boundary's answer where the C dereferences it (see the module docs).
+    let Some(e) = (unsafe { env_mut(env) }) else {
+        return core::ptr::null_mut();
+    };
+    // `Some` iff a library call is in progress on this thread. That library's pointer **is**
+    // `env->mod_nif->priv_data`, whatever the host hook would say.
+    if let Some(priv_data) = crate::nif::loader::current_priv_data() {
+        return priv_data;
     }
+    // No library call in progress: the host hook is the only remaining source.
+    e.host().priv_data()
 }
 
 #[cfg(test)]

@@ -269,3 +269,54 @@ pub fn oracle_eval(oracle: &Path, code_dir: Option<&Path>, expr: &str) -> Option
         Probe::TimedOut | Probe::Failed => None,
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// The `gc_payload` fixture's structural check
+// ---------------------------------------------------------------------------------------
+
+/// Verifies the committed `gc_payload` fixture's returned payload **element by element**,
+/// through the frozen term accessors only (`beam_engine::terms`, `beam_term`).
+///
+/// The fixture (`tests/fixtures/gc_payload.erl`, used by `tests/gc_strategy.rs` and
+/// `tests/gc_immix_payload.rs`) returns `[{K, K + 1, [K, K + 2, K + 3]} | ...]` for
+/// `K = length, length - 1, ..., 1`, so element `i` (0-based) has the key `length - i`. A
+/// collection that relocated the heap against an incomplete root set would corrupt the term,
+/// and this check is what makes that visible: it fails on a wrong element count, a wrong
+/// tuple field, a wrong inner list, or a container that is no longer a proper term.
+///
+/// `length` is the fixture's payload size (`gc_payload:payload_length/0`; 64 today).
+/// `#[allow(dead_code)]`: only the two GC suites call it, and this module is compiled into
+/// every integration-test binary.
+#[allow(dead_code)]
+pub fn check_gc_payload(payload: beam_term::Eterm, length: i64) {
+    use beam_engine::terms;
+    use beam_term::signed_value;
+
+    let elements = terms::list_elements(payload).expect("the payload is a proper list");
+    assert_eq!(
+        elements.len(),
+        length as usize,
+        "the payload's element count survived the collections"
+    );
+    for (index, element) in elements.iter().enumerate() {
+        let key = length - index as i64;
+        let field = |position: usize| {
+            signed_value(
+                terms::tuple_element(*element, position)
+                    .unwrap_or_else(|e| panic!("payload element {index} field {position}: {e:?}")),
+            )
+        };
+        assert_eq!(field(0), key, "payload element {index} key");
+        assert_eq!(field(1), key + 1, "payload element {index} key + 1");
+        let inner = terms::tuple_element(*element, 2)
+            .unwrap_or_else(|e| panic!("payload element {index} list: {e:?}"));
+        let inner = terms::list_elements(inner)
+            .unwrap_or_else(|e| panic!("payload element {index} is a proper list: {e:?}"));
+        let ints: Vec<i64> = inner.iter().copied().map(signed_value).collect();
+        assert_eq!(
+            ints,
+            vec![key, key + 2, key + 3],
+            "payload element {index} inner list"
+        );
+    }
+}
