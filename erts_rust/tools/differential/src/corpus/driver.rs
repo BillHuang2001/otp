@@ -172,13 +172,17 @@ pub(crate) fn group() -> Vec<Case> {
             description: "port_close/1 closes the port the spawn driver opened",
             contracts: &[Contract::DriverAbi],
             kind: CaseKind::Eval {
-                expr: "erlang:port_close(open_port({spawn,\"true\"},[]))",
+                // `cat` keeps the port open until `port_close/1` (a self-exiting child such as
+                // `true` may race this case and be auto-closed before the explicit close), so the
+                // explicit close is the one that actually closes the port.
+                expr: "begin P = open_port({spawn,\"cat\"},[]), port_close(P) end",
                 extra_argv: &[],
                 probe: Probe::Value,
             },
             golden: Golden {
                 // `port_close/1` kills and reaps the child and answers `true` (the oracle's
-                // `erts_internal:port_close/1` value, not `ok`).
+                // `erts_internal:port_close/1` value, not `ok`) — the program name never shows up
+                // in the return value.
                 stdout: Some("ok true"),
                 exit_code: 0,
             },
@@ -957,6 +961,7 @@ mod tests {
     #[test]
     fn explicit_close_cases_open_a_non_self_exiting_child() {
         for id in [
+            "driver/port_close_through_spawn_driver",
             "driver/port_command_after_close_is_badarg",
             "driver/port_info_after_close_is_undefined",
             "driver/port_info2_after_close_is_undefined",
