@@ -45,20 +45,27 @@
 //! can, and [`current_recorded_atom_name`] reaches it from this env-less entry point through the
 //! same thread-local stack the host is published on.
 //!
-//! # Current limitation: an atom pair *nested* inside a compound
+//! # Atom ordering inside a compound
 //!
-//! Atoms compared inside a tuple, list, map or fun still order by raw **atom index**:
-//! `beam_term`'s structural comparison takes a concrete `beam_term::AtomTable`, and this crate has
-//! none to hand it (`NifHost` exposes an atom-name *lookup*, not the table itself — and a re-derived
-//! table would not carry the runtime's indices). So `enif_compare({alpha}, {beta})` and
-//! `enif_compare([alpha], [beta])` may order either way, where the C answers `-1`. Closing that
-//! needs a comparison entry point in `beam_term` that takes a name resolver (or a `NifHost`
-//! atom-table hook); the structural comparison is deliberately not duplicated here. (This is the
-//! only remaining index fallback; the top-level pair no longer falls back for a *name*.)
+//! An atom pair **nested** inside a tuple, list, map or fun is ordered by its **names** too, when the
+//! current NIF host exposes its global atom table ([`crate::nif::host::NifHost::atom_table`]):
+//! [`enif_compare`], [`enif_is_identical`] and [`enif_hash`] reach the current host through
+//! [`with_current_host`] and hand its `beam_term::AtomTable` to `beam_term`'s structural
+//! comparison/hashing, so `enif_compare({alpha}, {beta})` answers `-1` (the C's answer) rather than an
+//! index-dependent value. [`with_host_atoms`] is that bridge; the comparison runs **inside** the host
+//! borrow (its result cannot borrow the table).
+//!
+//! The hook is consulted only while a NIF call is live. With no live env (this thread is outside a
+//! NIF call) or a host that leaves [`crate::nif::host::NifHost::atom_table`] at its default `None`,
+//! `beam_term` keeps its documented **raw-index** fallback for an atom whose name it cannot resolve;
+//! the answer for a non-atom key is unaffected either way. The top-level atom pair never relies on the
+//! hook for a resolvable *name*: `erts_cmp_atoms` is applied directly (record → host name lookup).
 
 use super::*;
 
 use libc::{c_int, size_t};
+
+use beam_term::atom::AtomTable;
 
 use crate::nif::host::{current_recorded_atom_name, with_current_host};
 use crate::nif::types::{ErlNifHash, ErlNifTermType};
@@ -273,6 +280,9 @@ pub unsafe extern "C" fn enif_is_exception(
 
 /// `int enif_is_identical(ERL_NIF_TERM lhs, ERL_NIF_TERM rhs);`
 ///
+/// The C's exact `EQ`: identical words are equal terms, and a nested atom pair is compared by name
+/// when the current host exposes its atom table (see the module docs).
+///
 /// # Safety
 ///
 /// Both arguments are any terms; no pointers.
@@ -283,15 +293,19 @@ pub unsafe extern "C" fn enif_is_identical(lhs: ERL_NIF_TERM, rhs: ERL_NIF_TERM)
         // The C `EQ` macro's fast path: bit-identical words are equal terms.
         return 1;
     }
-    prelude::eq(a, b, &no_atoms()) as c_int
+    let identical = match with_host_atoms(|atoms| prelude::eq(a, b, atoms)) {
+        Some(identical) => identical,
+        None => prelude::eq(a, b, &no_atoms()),
+    };
+    identical as c_int
 }
 
 /// `int enif_compare(ERL_NIF_TERM lhs, ERL_NIF_TERM rhs);` — `-1`, `0` or `1`.
 ///
 /// The C `enif_compare` is `CMP(lhs, rhs)` = `erts_cmp(lhs, rhs, exact=0, eq_only=0)`, the
 /// **arithmetic** comparison (so `1 == 1.0`), with the two atoms of a top-level atom pair ordered by
-/// name (`erts_cmp_atoms`, resolved record → host → index; see the module docs). The nested-atom
-/// limitation is documented at the module level.
+/// name (`erts_cmp_atoms`, resolved record → host → index; see the module docs). A nested atom pair
+/// is ordered by name too, through the current host's atom table (see the module docs).
 ///
 /// # Safety
 ///
@@ -305,7 +319,11 @@ pub unsafe extern "C" fn enif_compare(lhs: ERL_NIF_TERM, rhs: ERL_NIF_TERM) -> c
     if let Some(ord) = cmp_atom_names(a, b) {
         return sign(ord);
     }
-    sign(prelude::cmp_arith(a, b, &no_atoms()))
+    let ord = match with_host_atoms(|atoms| prelude::cmp_arith(a, b, atoms)) {
+        Some(ord) => ord,
+        None => prelude::cmp_arith(a, b, &no_atoms()),
+    };
+    sign(ord)
 }
 
 /// `erts_cmp`'s difference folded into `enif_compare`'s `-1`/`0`/`1` (`erl_nif.c:1548-1558`).
@@ -320,8 +338,8 @@ fn sign(ord: core::cmp::Ordering) -> c_int {
 /// `erts_cmp_atoms` (`erts/emulator/beam/erl_utils.h:193-215`) for a pair of **top-level** atoms:
 /// the atom *names* compared byte-lexicographically (a shorter name that is a prefix sorts first).
 /// `None` when the pair is not atom/atom or when neither [`atom_name`] resolution step yields both
-/// names — the caller then falls back to the arithmetic term comparison (which orders a top-level
-/// atom pair by index).
+/// names — the caller then falls back to the arithmetic term comparison (which orders an atom pair by
+/// name when the current host exposes its table, else by raw index; see [`with_host_atoms`]).
 ///
 /// The C caches the first name bytes in the atom header and `memcmp`s the rest and finally compares
 /// the lengths; that is exactly `Ord` on the two name byte strings, so it is reproduced directly.
@@ -332,6 +350,23 @@ fn cmp_atom_names(a: Eterm, b: Eterm) -> Option<core::cmp::Ordering> {
     let name_a = atom_name(a)?;
     let name_b = atom_name(b)?;
     Some(name_a.as_bytes().cmp(name_b.as_bytes()))
+}
+
+/// Run `f` with the **current NIF host's atom table** ([`crate::nif::host::NifHost::atom_table`]),
+/// when a NIF call is live (see [`with_current_host`]) and the host exposes its table.
+///
+/// This is the bridge that lets the env-less comparison/hash entry points order an atom *nested*
+/// inside a compound by its **name** instead of its raw interned index: `beam_term`'s structural
+/// comparison/hashing takes a concrete [`AtomTable`], and the current host is where the runtime's
+/// global table lives (the same table [`crate::nif::host::NifHost::atom_name`] reads). `f` runs
+/// **inside** the host borrow, so it must return an owned value rather than a borrow of the table
+/// (hence the closure-returning-`Ordering`/`bool`/`u64` shape at every call site).
+///
+/// `None` when no NIF call is in progress (no live env), or when the host leaves
+/// [`crate::nif::host::NifHost::atom_table`] at its default — the caller then falls back to
+/// [`no_atoms`] and `beam_term`'s documented raw-index behavior.
+fn with_host_atoms<R>(f: impl FnOnce(&AtomTable) -> R) -> Option<R> {
+    with_current_host(|host| host.atom_table().map(f))?
 }
 
 /// The *name* of a top-level atom term, in the C's resolution order:
@@ -354,6 +389,10 @@ fn atom_name(atom: Eterm) -> Option<String> {
 
 /// `ErlNifUInt64 enif_hash(ErlNifHash type, ERL_NIF_TERM term, ErlNifUInt64 salt);`
 ///
+/// The `ErlNifHash`-type-specific mixing (`InternalHash` = salted `^`, `Phash2` = low 27 bits) is
+/// unchanged; only the base `prelude::term_hash` now sees the current host's atom table, so an atom
+/// nested inside a compound hashes by name (see the module docs).
+///
 /// # Safety
 ///
 /// `term` is any term; no pointers.
@@ -363,11 +402,22 @@ pub unsafe extern "C" fn enif_hash(
     term: ERL_NIF_TERM,
     salt: u64,
 ) -> u64 {
+    let hash = hash_term(t(term));
     match hash_type {
         // An implementation-defined internal hash; salted, like the C.
-        ErlNifHash::InternalHash => prelude::term_hash(t(term), &no_atoms()) ^ salt,
+        ErlNifHash::InternalHash => hash ^ salt,
         // `erlang:phash2/1` — the low 27 bits, unsalted (as the C ignores the salt here).
-        ErlNifHash::Phash2 => prelude::term_hash(t(term), &no_atoms()) & ((1 << 27) - 1),
+        ErlNifHash::Phash2 => hash & ((1 << 27) - 1),
+    }
+}
+
+/// `prelude::term_hash` of `term`, resolved with the current host's atom table when one is available
+/// (this env-less entry point reaches it through [`with_host_atoms`]); the [`no_atoms`] fallback
+/// otherwise, which is `beam_term`'s documented raw-index behavior.
+fn hash_term(term: Eterm) -> u64 {
+    match with_host_atoms(|atoms| prelude::term_hash(term, atoms)) {
+        Some(hash) => hash,
+        None => prelude::term_hash(term, &no_atoms()),
     }
 }
 
