@@ -79,7 +79,9 @@ Legacy C ground truth (read-only): `erts/emulator/beam/io.c` (the `LineBuf` `LIN
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io` (sandbox `$HOME`
 is read-only — always the wrapper). Real-pipe/socketpair/reactor round-trips for `fd`/`efile`, real
 children for `spawn`, loopback TCP + `erl`-oracle cross-checks for `inet`. Byte-framing is asserted
-against the C `read_linebuf` cases in `line_buffer.rs`'s in-module suite.
+against the C `read_linebuf` cases in `line_buffer.rs`'s in-module suite. The `spawn` suite's
+child-exit and end-of-file waits are **condition-based under a 60 s hang guard**, never a wall-clock
+budget tuned for an idle host (see *Notes for Agents*).
 
 ## Routing Table
 - `fd.rs` → `FdDriver` + `set_nonblocking` (the shared non-blocking wrapper)
