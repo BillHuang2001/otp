@@ -91,9 +91,10 @@
 //! counts** — the registers its inlinable instructions would reference, weighted by
 //! how often they appear and ties broken by ascending index — so the most-used
 //! (longest-live-range) registers become resident; the direct `machine.x` accesses
-//! are the fill/spill for the rest. The highest x-register index any block touches
-//! natively is recorded on the artifact so the driver can refuse native entry to a
-//! register file that does not cover it.
+//! are the fill/spill for the rest. The highest x-register index any block of a
+//! function touches natively is recorded **per function** on the artifact, so the
+//! driver can refuse native entry to a register file that does not cover the function
+//! it is about to enter.
 //!
 //! # What is inlined, what is helper-executed
 //!
@@ -145,6 +146,30 @@
 //! what gives the tier full opcode coverage with interpreter-identical semantics on
 //! day one; see `emit` for the emitted sequence.
 //!
+//! # Two compilation layouts (eager / lazy)
+//!
+//! [`CompiledModule`] is *what* the tier runs; *how* it was lowered is one of two
+//! layouts (see [`code`]):
+//!
+//! * **Eager** ([`CompiledModule::eager`], produced by [`compile_module`]): every
+//!   function is lowered up front into **one** sealed [`CodeBuffer`], and the
+//!   seal-time `Linker` links a taken branch to a successor block of **another**
+//!   function as a direct jump. This is what [`JitBackend::compile`] and
+//!   [`CodeCache::get_or_compile`](crate::jit::cache::CodeCache::get_or_compile)
+//!   produce, and the layout every whole-module introspection query answers for.
+//! * **Lazy** ([`CompiledModule::lazy`], produced by
+//!   [`CodeCache::compiled_handle`](crate::jit::cache::CodeCache::compiled_handle) —
+//!   the path behind [`run_baseline_cached*`](crate::jit::cache)): the artifact starts
+//!   with **nothing** compiled, and each function is lowered into its **own** sealed
+//!   [`CodeBuffer`] on that function's first entry, through
+//!   [`NativeCode::enter`] → [`CompiledModule::native_entry`]. A fresh process
+//!   therefore pays only for the functions it actually enters. Because a lazy
+//!   function's block map covers just that one function, a branch to another
+//!   function's block is absent from it: the `Linker` emits the target's `(func, pc)`
+//!   word and the driver compiles that function on entry.
+//!
+//! [`CodeBuffer`]: crate::jit::emitter::CodeBuffer
+//!
 //! # `unsafe`
 //!
 //! This is a designated JIT unsafe zone: it reconstructs `&mut Machine` /
@@ -167,7 +192,6 @@ use beam_term::Eterm;
 use crate::context::ExecutionContext;
 use crate::error;
 use crate::interpreter;
-use crate::jit::emitter::CodeBuffer;
 use crate::jit::JitBackend;
 use crate::machine::{Machine, RunOutcome};
 use crate::Step;
@@ -184,7 +208,6 @@ mod tests;
 // exactly what it was.
 pub(crate) use emit::compile_module;
 pub use code::CompiledModule;
-pub(crate) use code::{CompiledFunction, Summary};
 pub use runtime::{decode_target, decode_wait, encode_target, encode_wait, ENTER, ERROR, HALT, WAIT_BIT};
 pub(crate) use runtime::{jit_ext_call, jit_set_position, jit_step_one, JitRuntime};
 
@@ -205,7 +228,11 @@ use runtime::NativeBlock;
 /// semantics.
 pub(crate) trait NativeCode {
     /// Run `(func, pc)` natively if this tier compiled it for that address.
-    fn enter(&self, rt: *mut JitRuntime<'_>, func: u32, pc: u32) -> Option<i64>;
+    ///
+    /// `module` is the artifact's own (active) module — the one the driver has bound
+    /// for this context — which a lazy artifact needs so it can compile a function on
+    /// its first entry ([`CompiledModule::native_entry`]).
+    fn enter(&self, rt: *mut JitRuntime<'_>, module: &Module, func: u32, pc: u32) -> Option<i64>;
 
     /// The compiled blocks this tier holds for `module` — a module the driver has
     /// switched **into** (a non-entry module context) — or `None` when it has none.
@@ -287,156 +314,6 @@ impl JitBackend for BaselineJit {
     }
 }
 
-/// The artifact [`BaselineJit::compile`] produces: one sealed, executable
-/// [`CodeBuffer`] plus the `(func, pc)` → native-entry table.
-///
-/// The buffer is `mmap`ped read+write, filled, and flipped to read+execute by
-/// [`CodeBuffer::seal`] — never writable and executable at the same time (see
-/// [`crate::jit::emitter`]). The entries are raw pointers into that mapping, so a
-/// `CompiledModule` must outlive every call into it and is neither `Send` nor
-/// `Sync`.
-pub struct CompiledModule {
-    /// The sealed code mapping every entry points into.
-    buffer: CodeBuffer,
-    /// The native entry point of the block starting at `[func][pc]`, or `None` when
-    /// that address compiled no block. A flat index (not a `HashMap`) because the
-    /// driver probes it on every cross-block jump.
-    entries: Vec<Vec<Option<*const u8>>>,
-    /// The number of compiled blocks (`entries`' `Some` count).
-    block_count: usize,
-    /// Every x-register any block caches in a machine register (sorted, deduped).
-    cached_registers: Vec<u32>,
-    /// The highest x-register index any block caches in a machine register.
-    highest_cached_register: Option<u32>,
-    /// The highest x-register index any block touches natively — a cached load,
-    /// the exit spill, or a direct `machine.x` access for a register beyond the
-    /// cache budget.
-    ///
-    /// The driver refuses to enter native code when the running machine's register
-    /// file is not at least this long (see [`run_compiled`]): every one of those
-    /// accesses is unchecked.
-    highest_native_register: Option<u32>,
-}
-
-impl CompiledModule {
-    /// The native entry point of the block starting at `(func, pc)`, if one was
-    /// compiled.
-    pub fn entry(&self, func: u32, pc: u32) -> Option<*const u8> {
-        self.entries
-            .get(func as usize)
-            .and_then(|row| row.get(pc as usize))
-            .copied()
-            .flatten()
-    }
-
-    /// The number of compiled blocks.
-    pub fn block_count(&self) -> usize {
-        self.block_count
-    }
-
-    /// Every x-register any block holds in a machine register (sorted ascending,
-    /// deduped across blocks).
-    ///
-    /// The allocator is usage-weighted ([`allocate_registers`]), so this is the set
-    /// of the most-used registers rather than the first-appearing ones; a register
-    /// **not** in it is addressed directly in `machine.x`.
-    pub fn cached_registers(&self) -> &[u32] {
-        &self.cached_registers
-    }
-
-    /// The highest x-register index cached in a machine register by any block.
-    pub fn highest_cached_register(&self) -> Option<u32> {
-        self.highest_cached_register
-    }
-
-    /// The highest x-register index any block touches natively (cached in a machine
-    /// register, spilled back, or addressed directly in `machine.x`).
-    pub fn highest_native_register(&self) -> Option<u32> {
-        self.highest_native_register
-    }
-
-    /// The number of bytes of machine code emitted.
-    pub fn code_len(&self) -> usize {
-        self.buffer.len()
-    }
-
-    /// The `[start, end)` address range of the executable code mapping.
-    ///
-    /// Every entry [`CompiledModule::entry`] returns lies inside it.
-    pub fn code_address_range(&self) -> (usize, usize) {
-        let start = self.buffer.code_ptr() as usize;
-        (start, start + self.buffer.len())
-    }
-
-    /// The **real** generated code regions of this artifact, one per compiled basic
-    /// block, in ascending address order.
-    ///
-    /// This is the queryable counterpart of the sealed [`CodeBuffer`] mapping a host
-    /// needs to describe the code it is running (e.g. the `+JPperf` perf-map file
-    /// `beam_rt` writes): every [`CodeRegion::start`] is the **actual** address
-    /// [`CompiledModule::entry`] returns for that block — never a synthesised or
-    /// rounded one — and its [`CodeRegion::size`] runs to the next block's entry, or
-    /// to the end of [`CompiledModule::code_address_range`] for the last block.
-    ///
-    /// `module` supplies the names: each [`CodeRegion::name`] is
-    /// `<module>:<function>/<arity>/<pc>`, the block's origin in the IR. Because the entries
-    /// are distinct points of one buffer ordered by emission, the returned regions
-    /// are **disjoint and cover no gap larger than the block padding they measure**;
-    /// an artifact that compiled no block yields an empty map.
-    pub fn code_map(&self, module: &Module) -> Vec<CodeRegion> {
-        // `(address, func, pc)` for every compiled block entry.
-        let mut blocks: Vec<(usize, u32, u32)> = Vec::new();
-        for (func, row) in self.entries.iter().enumerate() {
-            for (pc, slot) in row.iter().enumerate() {
-                if let Some(entry) = slot {
-                    blocks.push((*entry as usize, func as u32, pc as u32));
-                }
-            }
-        }
-        // Emission order is already ascending, but sort so the public contract does
-        // not depend on the emitter's block ordering.
-        blocks.sort_by_key(|(address, _, _)| *address);
-
-        let (_, end) = self.code_address_range();
-        let module_name = module.atom_name(module.name).unwrap_or_default().to_owned();
-
-        let mut regions = Vec::with_capacity(blocks.len());
-        let mut index = 0;
-        while index < blocks.len() {
-            let (start, func, pc) = blocks[index];
-            // Skip any further entry that shares this address: two entries at one
-            // address describe the same code, and measuring them separately would
-            // emit a zero-size region.
-            let mut next = index + 1;
-            while next < blocks.len() && blocks[next].0 == start {
-                next += 1;
-            }
-            let region_end = blocks.get(next).map_or(end, |(address, _, _)| *address);
-            // A BEAM module may define several functions under one name (different
-            // arities, e.g. `fib/1` and `fib/3`), so the name carries the arity too:
-            // `<module>:<function>/<arity>/<pc>` identifies the block's IR origin
-            // unambiguously.
-            let (function_name, arity) = module
-                .functions
-                .get(func as usize)
-                .map(|function| {
-                    (
-                        module.atom_name(function.name).unwrap_or_default(),
-                        function.arity,
-                    )
-                })
-                .unwrap_or_default();
-            regions.push(CodeRegion {
-                start,
-                size: region_end - start,
-                name: format!("{module_name}:{function_name}/{arity}/{pc}"),
-            });
-            index = next;
-        }
-        regions
-    }
-}
-
 // ---------------------------------------------------------------------------
 // The driver
 // ---------------------------------------------------------------------------
@@ -455,7 +332,7 @@ pub(crate) fn run_compiled(
     args: &[Eterm],
     ctx: &mut dyn ExecutionContext,
 ) -> Result<Eterm> {
-    let code = block_entries(compiled, machine);
+    let code = block_entries(compiled);
     run_native(machine, module, function, arity, args, ctx, &code)
 }
 
@@ -475,7 +352,7 @@ pub(crate) fn run_compiled_outcome(
     args: &[Eterm],
     ctx: &mut dyn ExecutionContext,
 ) -> Result<RunOutcome> {
-    let code = block_entries(compiled, machine);
+    let code = block_entries(compiled);
     run_native_outcome(machine, module, function, arity, args, ctx, &code)
 }
 
@@ -496,7 +373,7 @@ pub(crate) fn run_compiled_label_outcome(
     args: &[Eterm],
     ctx: &mut dyn ExecutionContext,
 ) -> Result<RunOutcome> {
-    let code = block_entries(compiled, machine);
+    let code = block_entries(compiled);
     run_native_label_outcome(machine, module, label, arity, args, ctx, &code)
 }
 
@@ -552,41 +429,29 @@ pub(crate) fn run_compiled_resume_outcome(
     machine.reset_reductions();
     machine.enter_run(module, func);
     let labels = interpreter::build_label_map(module);
-    let code = block_entries(compiled, machine);
+    let code = block_entries(compiled);
     drive(machine, module, labels, func, pc, ctx, &code)
 }
 
-/// The baseline tier's [`NativeCode`] lookup for `compiled`, carrying whether the
-/// running machine's register file is wide enough to enter native code.
+/// The baseline tier's [`NativeCode`] lookup for `compiled`.
 ///
-/// A block loads its cached x-registers out of `machine.x` — and addresses the
-/// registers beyond the cache budget there directly — without a bounds check, so a
-/// machine whose register file is shorter than the highest natively-touched index
-/// cannot enter native code; such a run stays on the interpreter step.
-fn block_entries<'a>(compiled: &'a CompiledModule, machine: &Machine) -> BlockEntries<'a> {
-    let native_ok = match compiled.highest_native_register {
-        Some(highest) => machine.x.len() > highest as usize,
-        None => true,
-    };
-    BlockEntries {
-        compiled,
-        native_ok,
-    }
+/// The register-file guard is computed **per function** at entry time by
+/// [`enter_compiled`] (from the bound [`CompiledModule::native_entry`] returns), not
+/// once for a whole module: a lazy artifact compiles a function only on first entry, so
+/// the function's own highest natively-touched register is what the guard needs.
+fn block_entries(compiled: &CompiledModule) -> BlockEntries<'_> {
+    BlockEntries { compiled }
 }
 
 /// The baseline tier's [`NativeCode`]: any compiled basic block may be entered.
 struct BlockEntries<'a> {
     /// The compiled block table the addresses are looked up in.
     compiled: &'a CompiledModule,
-    /// Whether the running machine's register file covers every register the
-    /// compiled blocks touch natively; when it does not, no block may be entered
-    /// (see [`run_compiled`]).
-    native_ok: bool,
 }
 
 impl NativeCode for BlockEntries<'_> {
-    fn enter(&self, rt: *mut JitRuntime<'_>, func: u32, pc: u32) -> Option<i64> {
-        enter_compiled(self.compiled, self.native_ok, rt, func, pc)
+    fn enter(&self, rt: *mut JitRuntime<'_>, module: &Module, func: u32, pc: u32) -> Option<i64> {
+        enter_compiled(self.compiled, module, rt, func, pc)
     }
 
     /// A cross-module callee is not part of the caller-owned artifact, so the tier's
@@ -603,20 +468,30 @@ impl NativeCode for BlockEntries<'_> {
 
 /// Run `(func, pc)` in `compiled` natively, or report "no native entry here".
 ///
-/// [`NativeCode::enter`]'s body, shared with the driver's cross-module path: a block
-/// is entered only when the running machine's register file covers every register the
-/// artifact touches natively ([`block_entries`]).
+/// [`NativeCode::enter`]'s body, shared with the driver's cross-module path. For a
+/// lazy artifact this is the compile-on-entry point: [`CompiledModule::native_entry`]
+/// lowers the owning function on first sight and returns the block's entry together
+/// with **that function's** register-file bound. A block is then entered only when the
+/// running machine's register file covers every register it touches natively; a run
+/// whose file is too short (or an address with no compiled block) returns `None` and
+/// stays on the interpreter step.
 fn enter_compiled(
     compiled: &CompiledModule,
-    native_ok: bool,
+    module: &Module,
     rt: *mut JitRuntime<'_>,
     func: u32,
     pc: u32,
 ) -> Option<i64> {
-    if !native_ok {
-        return None;
+    let (block_entry, bound) = compiled.native_entry(module, func, pc)?;
+    if let Some(highest) = bound {
+        // SAFETY: `rt` is the live driver-owned runtime block and its `machine`
+        // pointer points at the driver's live `Machine`; the driver holds no
+        // `&mut` alias while a native call is in flight.
+        let x_len = unsafe { (*(*rt).machine).x.len() };
+        if x_len <= highest as usize {
+            return None;
+        }
     }
-    let block_entry = compiled.entry(func, pc)?;
     // SAFETY: `block_entry` points just past the start of a complete native
     // function emitted by `emit_block` with exactly the `NativeBlock` signature
     // (`extern "C" fn(*mut JitRuntime) -> i64`), inside a buffer sealed
@@ -663,7 +538,8 @@ fn enter_machine(
 /// The second path is not an emergency fallback: it is each tier's documented
 /// per-instruction deopt, and it is also what happens for every address the tier
 /// compiled no entry point for (and, for the baseline tier, when the running
-/// machine's register file is too small — see [`run_compiled`]).
+/// machine's register file is too small for the function it would enter — see
+/// [`enter_compiled`]).
 ///
 /// This is the **non-blocking** form: a run that suspends in a `receive` (whether
 /// the suspension came from the driver's own interpreter step or from a block's
@@ -758,11 +634,9 @@ struct CalleeCode {
     context: u32,
     /// The callee's compiled blocks, from the tier's own store
     /// ([`NativeCode::module_blocks`]); `None` when the tier has none, in which case the
-    /// driver runs the module on its per-instruction interpreter step.
+    /// driver runs the module on its per-instruction interpreter step. The per-function
+    /// register-file guard is applied at entry time ([`enter_compiled`]), not here.
     compiled: Option<Rc<CompiledModule>>,
-    /// Whether the running machine's register file covers every register those blocks
-    /// touch natively (the same guard [`block_entries`] applies to the entry module).
-    native_ok: bool,
 }
 
 /// The native driver's "which module is executing" state.
@@ -844,23 +718,11 @@ fn switch_into(
                 // runs it on its per-instruction interpreter step, exactly as it does an
                 // address its entry artifact did not compile.
                 let compiled = code.module_blocks(&handle.module);
-                let native_ok = match &compiled {
-                    Some(compiled) => match compiled.highest_native_register {
-                        Some(highest) => machine.x.len() > highest as usize,
-                        None => true,
-                    },
-                    None => false,
-                };
-                state.callees.push(CalleeCode {
-                    context,
-                    compiled,
-                    native_ok,
-                });
+                state.callees.push(CalleeCode { context, compiled });
                 index
             }
         };
-        let resolved = &state.callees[index];
-        state.active = if resolved.native_ok {
+        state.active = if state.callees[index].compiled.is_some() {
             Some(index)
         } else {
             None
@@ -960,13 +822,20 @@ fn drive(
         // Native entry for the ACTIVE module: the caller-owned artifact in context
         // `0`, the callee's blocks (if the tier has any) in a non-entry context.
         let native = match state.active {
-            None if state.context == 0 => code.enter(&mut rt, func, pc),
+            // Context 0 is the caller-owned entry artifact; the active module there is
+            // `state.module`, i.e. the run's entry module. `state.module` is a raw
+            // pointer at a `Module` the driver holds alive for the whole loop (the
+            // caller's entry module, or a callee's `Arc<Module>` in
+            // `state.callee_module`), and no `&mut` aliases it while native code runs.
+            None if state.context == 0 => code.enter(&mut rt, unsafe { &*state.module }, func, pc),
             None => None,
             Some(index) => {
                 let resolved = &state.callees[index];
                 match &resolved.compiled {
+                    // SAFETY: `state.module` points at the live active module (see the
+                    // context-0 arm above); no `&mut` aliases it while native code runs.
                     Some(compiled) => {
-                        enter_compiled(compiled, resolved.native_ok, &mut rt, func, pc)
+                        enter_compiled(compiled, unsafe { &*state.module }, &mut rt, func, pc)
                     }
                     None => None,
                 }

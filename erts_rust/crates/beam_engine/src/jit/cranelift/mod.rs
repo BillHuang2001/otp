@@ -531,7 +531,10 @@ struct CompiledEntries<'a> {
 }
 
 impl NativeCode for CompiledEntries<'_> {
-    fn enter(&self, rt: *mut JitRuntime<'_>, func: u32, pc: u32) -> Option<i64> {
+    fn enter(&self, rt: *mut JitRuntime<'_>, module: &Module, func: u32, pc: u32) -> Option<i64> {
+        // The Cranelift tier compiles each function once at its entry `pc`, so it has
+        // no lazy compile-on-entry and ignores the active module the driver supplies.
+        let _ = module;
         // The compiled function starts at the IR function's entry `pc`; entering it
         // anywhere else would run the wrong code, so every other address stays on the
         // driver's interpreter step (the documented per-instruction deopt).

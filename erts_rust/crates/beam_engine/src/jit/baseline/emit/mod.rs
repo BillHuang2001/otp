@@ -30,9 +30,12 @@
 //! guarded aggregate readers plus the tuple writer ([`aggregate`]: the cons-cell
 //! readers `get_list`/`get_hd`/`get_tl`, the tuple readers `get_tuple_element` /
 //! `select_tuple_arity`, and the destructive `set_tuple_element`).
-//! [`compile_module`] lowers every basic block of a module into the
-//! [`CompiledModule`] artifact. See `super` for the block ABI (in `runtime`) and the
-//! driver that runs the emitted code.
+//! Two compilation entry points produce the artifact: [`compile_module`] lowers
+//! **every** function of a module up front into one shared, eagerly-compiled
+//! [`CompiledModule`], while [`compile_function`] lowers **one** function into its own
+//! sealed artifact (the [`CompiledFunction`] the lazy layout fills on first entry).
+//! Both share the per-function [`emit_function`]. See `super` for the block ABI (in
+//! `runtime`) and the driver that runs the emitted code.
 //!
 //! **Only [`CACHE_REGISTERS`]`.len()` x-registers are held in machine registers**;
 //! every other x-register a block names is addressed **directly in `machine.x`**
@@ -47,18 +50,24 @@
 //! whole block ([`Allocation`]): an x-register is either *always* held in its
 //! machine register (and written back at every block exit) or *never* cached, so
 //! the two representations can never disagree. The highest x-register index a block
-//! touches natively — cached or direct — is recorded on the [`CompiledModule`] so
-//! [`run_compiled`](super::run_compiled) can refuse native entry to a machine whose
-//! register file does not cover it.
+//! touches natively — cached or direct — is recorded **per function** (in the
+//! function's [`Summary`], or the whole-module one [`compile_module`] merges) so the
+//! driver can refuse native entry to a machine whose register file does not cover the
+//! function it is about to enter (see [`enter_compiled`](super::enter_compiled)).
 //!
 //! **Direct block-to-block linking.** A taken branch to a successor basic block
 //! that this compilation emitted does not return its `(func, pc)` word to the
 //! driver: [`Linker::emit_exit`] tears down the current block's frame (spilling the
 //! cached x-registers first — the tier's whole liveness/root-set model) and jumps
 //! **straight to the successor block's native entry**, whose own prologue rebuilds
-//! its frame. `compile_module` reserves one entry label per block *before* emitting
+//! its frame. Both entry points reserve one entry label per block *before* emitting
 //! any code, so a forward branch is an ordinary `rel32` fixup resolved at `bind`
-//! time — never a post-`seal` patch, so the W^X policy is unchanged. Every
+//! time — never a post-`seal` patch, so the W^X policy is unchanged. A branch is
+//! linked only when its target is in the **same compilation's** block map:
+//! [`compile_module`]'s map spans the whole module (so a cross-function branch links
+//! directly), while [`compile_function`]'s covers just that function, so a branch to
+//! another function returns its word and the driver compiles that function on entry.
+//! Every
 //! continuation that is **not** a compiled block's entry (an address inside a
 //! block, an empty block, an unresolved label, a function's end) keeps the
 //! documented deopt: spill, materialise the `encode_target` word in `rax`, and jump
@@ -75,7 +84,8 @@
 //!
 //! The emitter is split by responsibility across this directory: this file owns the
 //! compiled-block shape (the register-file constants, the allocation artifact,
-//! [`emit_block`], the deopt-and-continue sequence and [`compile_module`]);
+//! [`emit_block`], the deopt-and-continue sequence and the two entry points
+//! [`compile_module`] and [`compile_function`] via [`emit_function`]);
 //! [`regalloc`] the register allocator, [`operands`] the operand/constant readers,
 //! [`r#move`] the inline `move`/`swap`, [`test`] the word-level `test` subset,
 //! [`select`] the exact-value switch, [`arith`] the guarded small-int fast path,

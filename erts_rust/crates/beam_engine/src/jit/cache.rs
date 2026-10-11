@@ -71,10 +71,22 @@
 //!
 //! # Cache miss vs. cache hit
 //!
-//! Both are O(1) map operations plus the (bounded) fingerprint: a miss compiles once and
-//! inserts; a hit just returns the stored reference. No unbounded work is added to the
-//! run path — a miss costs exactly the compilation the caller already paid before, and
+//! Both are O(1) map operations plus the (bounded) fingerprint: a miss inserts; a hit
+//! just returns the stored reference. No unbounded work is added to the run path —
 //! every subsequent run of the same module pays only the key probe.
+//!
+//! # Two artifact layouts (eager / lazy)
+//!
+//! The cache stores [`CompiledModule`]s in both of the layouts the baseline tier
+//! produces (see [`crate::jit::baseline`]):
+//!
+//! * [`CodeCache::get_or_compile`] always produces a fully-lowered **eager** artifact:
+//!   every function is compiled up front into one sealed mapping, which is what a
+//!   whole-module query (`code_map`) and a cross-function direct block link need.
+//! * [`CodeCache::compiled_handle`] — the path behind `run_baseline_cached*` and
+//!   [`cached_module_blocks`] — stages a **lazy** artifact instead: nothing is lowered
+//!   up front, and each function is compiled on its **first entry** by the native
+//!   driver. A fresh process therefore pays only for the functions it enters.
 
 use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
@@ -276,20 +288,26 @@ impl CodeCache {
         }
     }
 
-    /// An owned handle to `module`'s compiled artifact, compiling it on first sight.
+    /// An owned handle to `module`'s **lazy** compiled artifact, cached on first sight.
     ///
-    /// Exactly [`CodeCache::get_or_compile`] except that the artifact is handed back as
-    /// an [`Rc`] **clone** instead of a borrow: the cache borrow ends with this call, so
-    /// the caller can hold the handle (and the executable mapping behind it) across
-    /// arbitrary other cache access — it stays alive even if the entry is later cleared.
-    /// This is what a cross-module caller (the native driver entering a callee's blocks)
-    /// needs; a compile failure behaves as in [`CodeCache::get_or_compile`].
+    /// The artifact is staged as [`CompiledModule::lazy`] — **nothing** is lowered here;
+    /// each function is lowered on its **first entry** by the native driver
+    /// ([`CompiledModule::native_entry`]). This is the artifact the runtime path
+    /// ([`run_baseline_cached*`]) runs and the one a cross-module callee resolves to, so
+    /// a fresh process pays only for the functions it actually enters.
+    ///
+    /// Exactly [`CodeCache::get_or_compile`] otherwise, except that the artifact is handed
+    /// back as an [`Rc`] **clone** instead of a borrow: the cache borrow ends with this
+    /// call, so the caller can hold the handle (and the executable mappings behind it)
+    /// across arbitrary other cache access — it stays alive even if the entry is later
+    /// cleared. This is what a cross-module caller (the native driver entering a callee's
+    /// blocks) needs.
     pub(crate) fn compiled_handle(&mut self, module: &Module) -> Result<Rc<CompiledModule>> {
         let key = ModuleKey::of(module);
         if let Some(existing) = self.entries.get(&key) {
             return Ok(Rc::clone(existing));
         }
-        let compiled = baseline::compile_module(module)?;
+        let compiled = CompiledModule::lazy(module);
         self.compiles += 1;
         let handle = Rc::new(compiled);
         self.entries.insert(key, Rc::clone(&handle));
@@ -385,8 +403,9 @@ thread_local! {
 /// Run exported `function/arity` on the baseline tier, reusing the **per-thread** cache.
 ///
 /// This is what [`Machine::run_with_tier`] runs for [`Tier::BaselineJit`](crate::jit::Tier::BaselineJit):
-/// the module is compiled into the thread's cache on first sight and every later run of
-/// the same module reuses that artifact with no recompile.
+/// the module is staged into the thread's cache on first sight (a **lazy** artifact:
+/// its functions compile on first entry) and every later run of the same module reuses
+/// that artifact with no re-stage.
 ///
 /// A **re-entrant** call (a BIF or fun application that itself runs a baseline export on
 /// this thread while the cache is already borrowed) does not panic: it compiles its module
@@ -426,15 +445,17 @@ pub(crate) fn run_baseline_cached(
 ///
 /// The native driver's [`NativeCode::module_blocks`](crate::jit::baseline::NativeCode::module_blocks)
 /// hook: a `call_ext*` the host resolved runs in another module, and the driver needs
-/// that module's block table to run it natively. The module is compiled into the
-/// per-thread cache on first sight (pure, bounded) and an owned handle is returned so
-/// the driver holds the code across its own `&mut Machine` calls.
+/// that module's block table to run it natively. The module is staged into the
+/// per-thread cache on first sight as a **lazy** artifact (nothing is lowered here;
+/// each of its functions compiles on first entry — see [`CodeCache::compiled_handle`])
+/// and an owned handle is returned so the driver holds the code across its own
+/// `&mut Machine` calls.
 ///
-/// `None` means "no native blocks available here" — the cache is genuinely re-entrant
+/// `None` means "no native blocks available here": the cache is genuinely re-entrant
 /// (its `RefCell` is already borrowed, e.g. a driver reached through another cached
-/// entry), or compilation failed. The driver then runs that module on its
-/// per-instruction interpreter step, exactly as it does an address its entry artifact
-/// did not compile, so the run stays interpreter-identical.
+/// entry). The driver then runs that module on its per-instruction interpreter step,
+/// exactly as it does an address its entry artifact did not compile, so the run stays
+/// interpreter-identical.
 pub(crate) fn cached_module_blocks(module: &Module) -> Option<Rc<CompiledModule>> {
     CODE_CACHE.with(|cell| {
         let mut cache = cell.try_borrow_mut().ok()?;
@@ -522,8 +543,8 @@ pub(crate) fn run_baseline_cached_label_outcome(
 /// [`Machine::resume_outcome_with_tier`](crate::Machine::resume_outcome_with_tier)
 /// runs for [`Tier::BaselineJit`](crate::jit::Tier::BaselineJit): the tier seam's
 /// resume path, so a slice that suspended on the native tier resumes on it. Like the
-/// other cached entries the module is compiled into the thread's cache on first sight
-/// (a hit reuses the artifact with no recompile), and the machine is **not** reset —
+/// other cached entries the module is staged into the thread's cache on first sight (a
+/// **lazy** artifact, so a hit re-stages nothing), and the machine is **not** reset —
 /// [`baseline::run_compiled_resume_outcome`] re-enters the suspended process at
 /// `(func, pc)`.
 ///
