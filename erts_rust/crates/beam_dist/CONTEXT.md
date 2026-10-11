@@ -543,6 +543,23 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
   is `DeliveryOutcome::Unsupported`; and the node does **not** advertise `DFLAG_PUBLISHED`/visibility at
   startup (no `publish_flag` caller). The value/connection layer plus this accept-only wiring is the
   whole of the current distribution support.
+- **`epmd::lookup`/`epmd::lookup_port` are pinned to `127.0.0.1:4369`.** Only the address-taking
+  `EpmdClient::connect(addr)`/`epmd::connect(addr)` can reach a non-default `epmd` (e.g. one an `erl`
+  node was pointed at with `-epmd_port N`); there is no `lookup_port_at(addr, name)` convenience and
+  the `lookup_port`-only "unknown name → `Io(NotFound)`" translation is therefore not reachable
+  against a custom epmd (use `port_please` + `Port2Resp::is_not_registered` there).
+- **The blocking `Connection` does not distinguish a clean peer EOF from malformed data.** The
+  transport seam maps a short/zero-length read to `BeamError::BadArg` (`src/transport.rs`), so a peer
+  closing the socket surfaces as `BadArg` — indistinguishable from garbage. The non-blocking
+  `ConnectionDriver` (the runtime's path) *does* distinguish it: the runtime's 0-byte read →
+  `feed_eof()` → `StepOutcome::Closed`. Tick *scheduling* and the `net_ticktime` `{nodedown,Node}`
+  decision are `net_kernel`'s (Erlang, `lib/kernel/src/net_kernel.erl`) job, not this crate's; this
+  crate only answers an inbound tick.
+- **No safe pid/reference term builder at the value layer.** Constructing an external pid or a
+  reference needs the `unsafe` raw-heap writers in `beam_term` (`boxed::write_external_pid` /
+  `write_internal_ref`), which a `#![deny(unsafe_code)]` crate cannot call; the loopback tests model
+  pids/refs as small-int stand-ins (the `tests/delivery.rs` convention). A safe term-marshalling seam
+  would be a separate addition.
 
 ## Notes for Agents
 - **`LOCAL_EXT` (`121`) now exists in the sibling `beam_codec`**: `Encoder::finish_local(hash: u32)`
