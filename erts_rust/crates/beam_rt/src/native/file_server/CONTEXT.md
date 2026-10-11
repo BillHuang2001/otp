@@ -74,6 +74,24 @@ The reply tag is **paired** with the request tag, never echoed: `{io_request, �
 `{io_reply, ReplyAs, Reply}` and `{file_request, …}` with `{file_reply, ReplyAs, Reply}`
 (`file_io_server.erl:199-239`), because every caller matches the reply on its **own** tag
 (`io.erl:1670`'s `execute_request` matches `io_reply`).
+### The shared read buffer (`State#state.buf`)
+`{get_line,…}`/`{get_until,…}` read *ahead*: they pull more bytes off the device than they return,
+and what they read past the reply is the device's buffer for the next request — the oracle's
+`State#state.buf`, held as `Device::buf` (`../file_server.rs`). All three consuming arms share that
+one buffer, so any mix of them on one device agrees with the oracle:
+* `{get_chars,Enc,_Prompt,N}` serves the buffer **first** (`get_chars(N, OutEnc, #state{buf=Buf,…})`,
+  `file_io_server.erl:508-528`): it takes `min(N, buf)` off the front and reads only what is still
+  missing until `N` bytes are collected or the read hits end of file; a request that obtained
+  **nothing at all** answers the atom `eof` (the `eof when BufSize =:= 0` clause, `:529-530`). A
+  request for `0` bytes answers the empty cast and leaves the buffer untouched (`:506-507`). This
+  arm reads only what it still needs, so `physical offset == logical position + buf.len()` holds
+  after every request (the oracle instead over-reads up to `?READ_SIZE_BINARY` and subtracts the
+  buffer again in `position/3` — observationally the same).
+* `{position,At}` compensates for the buffer (`file_request({position,At}, _)`, `:319-326` →
+  `position/3`, `:970-977`): `cur` → `{cur, -byte_size(Buf)}`, `{cur, Offs}` →
+  `{cur, Offs - byte_size(Buf)}`, and every other form (`bof`/`eof`/a bare integer/`{bof,N}`/
+  `{eof,N}`) passes through unchanged. A **successful** seek clears the buffer (`std_reply/2`,
+  `:344-348`), so the logical position the caller observes is the physical one.
 ### The `getopts`/`setopts` read-mode surface — `setopts.rs`
 `{setopts, Opts}` reproduces `file_io_server:setopts/2` (`:718-728`) faithfully: the three list
 transforms in order (`expand_encoding/1` → `proplists:substitute_negations([{list,binary}], …)` →
@@ -91,9 +109,10 @@ headed `binary`/`encoding`; otherwise the reply is the **value** `{error,enotsup
   decodes `{more,Cont}`/`{done,Reply,Buf}` and stashes `Buf` as the device's `State#state.buf`.
   Typed gaps: a continuation suspending in a `receive`; a leftover that is a deep iolist /
   non-charlist / negative code point / non-byte-aligned bitstring; an encoding other than
-  `latin1`/`unicode`; a pid with no registered device ("closed io device"). The `{get_chars,…}` arm
-  ignores the stashed buffer and a `{utf16,_}`/`{utf32,_}` **stream** is read as `latin1` (both
-  shared divergences).
+  `latin1`/`unicode`; a pid with no registered device ("closed io device"). The `{get_chars,…}`
+  arm serves the stashed buffer **before** any fresh read and `{position,At}` compensates for
+  it (see *The shared read buffer* above), and a
+  `{utf16,_}`/`{utf32,_}` **stream** is read as `latin1` (a divergence).
 * **`{get_line,Enc,_Prompt}` is served** by [`get_line.rs`](get_line.rs): the same loop drives the
   `LineContinuation` (the oracle's `io_lib:collect_line/4` + `cast/4`), so
   `file:read_line/1`/`io:get_line/2` complete. Typed gaps: a request `Enc` that is neither `latin1`
@@ -108,22 +127,35 @@ headed `binary`/`encoding`; otherwise the reply is the **value** `{error,enotsup
   (the oracle crashes the device's `case`).
 * **Other io-device requests stay the typed `unsupported` gap** — `pread`/`pwrite`/`advise`/
   `allocate`/`read_handle_info`, the legacy `put_chars` arities, and a non-`latin1`
-  `put_chars`/`get_chars` encoding.
-* **A scheduled process's incremental io-device read cannot complete** — `file:read/2` and
-  `file:read_line/1` from a scheduled `run` fold into `unsupported: opcode: run: process blocked
-  (no message available)` (they agree with the oracle under `-eval`); the whole-file service requests
-  (`file:read_file/1`, `file:write_file/2`, `file:open/2` for read and write, `file:close/1`,
-  `file:list_dir/1`, `file:get_cwd/0`) complete from a scheduled process. Owner: **`beam_engine`**
-  (a nested run's `receive … after T` timeout does not fire). `epp:open/2` (`-eval` route included)
-  still dies with the same `blocked` gap because `epp` **spawns** an `epp` server (`epp.erl:386`) —
-  the file-server gaps it would otherwise hit (write mode, `io:setopts/2` on a device) are closed.
-* **The io-device read path completes from library code, `{get_line,…}` included.**
-  `io:request/2` loads the `io` module body, `net_kernel:dflag_unicode_io/1` is served (the
-  `RuntimeHooks` bridge) and the service answers with the tag **paired** to the request, so
+  `put_chars` encoding.
+* **A `{get_chars,…}` on a `unicode` **stream** counts BYTES, where the oracle counts
+  CHARACTERS.** `reply_get_chars` moves `N` raw bytes; the oracle's
+  `get_chars(N, OutEnc, #state{unic=unicode})` clause (`file_io_server.erl:536-577`) walks
+  `N` characters (`count_and_find/3`) and converts (`cast/4`). Over a file
+  `<<"abc",16#c3,16#a5,"def\n">>` (`abcådef\n`), as measured on the live `erl`
+  (OTP 29.1.1 / erts-17.1) vs this runtime:
+
+  | call | oracle | this runtime |
+  |---|---|---|
+  | `file:read(F,2)` | `{ok,"ab"}` | `{ok,"ab"}` |
+  | `file:read(F,3)` | `{ok,"abc"}` | `{ok,"abc"}` |
+  | `file:read(F,4)` | `{ok,"abcå"}` | `{ok,"abcÃ"}` |
+  | `file:read(F,8)` | `{ok,"abcådef\n"}` | `{ok,"abcÃ¥def"}` |
+  | `read(4)` then `read_line` | `{{ok,"abcå"},{ok,"def\n"}}` | `exit: invalid_unicode` |
+
+  The divergence is masked whenever the content is ASCII or `N` lands on a character boundary,
+  which is why the `latin1` cases agree exactly. It is a **documented divergence, not a typed
+  gap**: returning a typed gap for a `unicode` device would regress the ASCII-content case, which
+  agrees today. Owner: this node (`reply_get_chars`).
+* **The io-device read path completes from library code on every route, `{get_line,…}`
+  included.** `io:request/2` loads the `io` module body, `net_kernel:dflag_unicode_io/1` is served
+  (the `RuntimeHooks` bridge) and the service answers with the tag **paired** to the request, so
   `file:read/2`, `io:scan_erl_exprs/4`, `io:parse_erl_exprs/4` and `file:read_line/1` all complete
-  and agree with the oracle on the `-eval` route — the first three in `../../tests/io_scan.rs`, `file:read_line/1` through
+  and agree with the oracle both from the pumped `-eval` root and from a **scheduled** `run`
+  process — the first three in `../../tests/io_scan.rs`, `file:read_line/1` through
   the `{get_line,…}` arm above, cross-checked by
-  [`get_line/tests.rs`](get_line/tests.rs)'s `the_replies_match_the_live_oracle`.
+  [`get_line/tests.rs`](get_line/tests.rs)'s `the_replies_match_the_live_oracle`; the scheduled
+  route by `../../tests/scheduled_io_device.rs`.
 ## Constraints
 - **`#![deny(unsafe_code)]`** — the crate-wide rule covers this whole node. Terms are built and read
   only through `beam_engine::terms`, `beam_codec::term`, `beam_loader::container` and `beam_term`.

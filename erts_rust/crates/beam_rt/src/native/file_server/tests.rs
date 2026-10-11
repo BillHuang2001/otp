@@ -791,6 +791,253 @@ fn setopts_changes_what_the_next_read_decodes() {
     );
 }
 
+// -- the shared read buffer (`State#state.buf`) ---------------------------------------
+
+/// The `{get_chars, latin1, '', N}` io request `file:read/2` sends (`file.erl:1634`).
+fn get_chars_request(runtime: &mut Runtime, n: i64) -> Eterm {
+    build(runtime, |ctx| {
+        let get_chars = ctx.atom("get_chars").expect("an atom");
+        let latin1 = ctx.atom("latin1").expect("an atom");
+        let prompt = ctx.atom("").expect("the empty atom");
+        terms::make_tuple(ctx, &[get_chars, latin1, prompt, make_small(n)]).expect("a tuple")
+    })
+}
+
+/// The `{get_line, latin1, ''}` io request `file:read_line/1` sends
+/// (`file.erl:1695-1696`).
+fn get_line_request(runtime: &mut Runtime) -> Eterm {
+    build(runtime, |ctx| {
+        let get_line = ctx.atom("get_line").expect("an atom");
+        let latin1 = ctx.atom("latin1").expect("an atom");
+        let prompt = ctx.atom("").expect("the empty atom");
+        terms::make_tuple(ctx, &[get_line, latin1, prompt]).expect("a tuple")
+    })
+}
+
+/// The `{position, At}` file request `file:position/2` sends (`file.erl:1954-1955`).
+fn position_request(runtime: &mut Runtime, at: Eterm) -> Eterm {
+    build(runtime, |ctx| {
+        let position = ctx.atom("position").expect("an atom");
+        terms::make_tuple(ctx, &[position, at]).expect("a tuple")
+    })
+}
+
+/// The bare `cur` location of `file.erl`'s `location()`.
+fn cur_atom(runtime: &mut Runtime) -> Eterm {
+    build(runtime, |ctx| ctx.atom("cur").expect("an atom"))
+}
+
+/// A `{cur, Offs}` location.
+fn cur_offset(runtime: &mut Runtime, offset: i64) -> Eterm {
+    build(runtime, |ctx| {
+        let cur = ctx.atom("cur").expect("an atom");
+        terms::make_tuple(ctx, &[cur, make_small(offset)]).expect("a tuple")
+    })
+}
+
+/// The `{get_chars, latin1, '', N}` reads on one handle must not lose the bytes the
+/// `{get_line, …}` in between read ahead. File `<<"line1\nline2\nrest">>` opened `[read]`;
+/// the live oracle (`erl -noshell -eval … -s init stop`) answers
+///
+/// ```text
+/// read(6)/read_line/read(4) -> {ok,"line1\n"} {ok,"line2\n"} {ok,"rest"}
+/// ```
+///
+/// The bare device replies asserted below are the same three values the `file:*` wrappers
+/// box (the third one is the regression: it is the bytes the `{get_line, …}` had stashed,
+/// which a buffer-blind `get_chars` answered `eof` for).
+#[test]
+fn get_chars_serves_the_buffer_a_get_line_stashed() {
+    let mut runtime = runtime();
+    let mut table = table(&mut runtime);
+    let file = TempPath::new("stashed_list");
+    std::fs::write(file.path(), b"line1\nline2\nrest").expect("a fixture file");
+    let modes = mode_list(&mut runtime, &["read"]);
+    let device = open_device(&mut runtime, &mut table, file.path(), modes);
+
+    let request = get_chars_request(&mut runtime, 6);
+    assert_eq!(
+        device_render(&mut runtime, device, request),
+        "[108,105,110,101,49,10]"
+    );
+    let request = get_line_request(&mut runtime);
+    assert_eq!(
+        device_render(&mut runtime, device, request),
+        "[108,105,110,101,50,10]"
+    );
+    let request = get_chars_request(&mut runtime, 4);
+    assert_eq!(
+        device_render(&mut runtime, device, request),
+        "[114,101,115,116]"
+    );
+}
+
+/// The same mixed sequence on a `[read,binary]` device: the oracle answers
+///
+/// ```text
+/// {ok,<<"line1\n">>} {ok,<<"line2\n">>} {ok,<<"rest">>}
+/// ```
+///
+/// A `0`-count read on the same device is the empty binary — `cast(<<>>, binary, latin1,
+/// latin1)` (`file_io_server.erl:507`, `:784-785`).
+#[test]
+fn get_chars_serves_the_stashed_buffer_in_binary_mode() {
+    let mut runtime = runtime();
+    let mut table = table(&mut runtime);
+    let file = TempPath::new("stashed_binary");
+    std::fs::write(file.path(), b"line1\nline2\nrest").expect("a fixture file");
+    let modes = mode_list(&mut runtime, &["read", "binary"]);
+    let device = open_device(&mut runtime, &mut table, file.path(), modes);
+
+    let request = get_chars_request(&mut runtime, 6);
+    assert_eq!(
+        device_render(&mut runtime, device, request),
+        "<<108,105,110,101,49,10>>"
+    );
+    let request = get_line_request(&mut runtime);
+    assert_eq!(
+        device_render(&mut runtime, device, request),
+        "<<108,105,110,101,50,10>>"
+    );
+    let request = get_chars_request(&mut runtime, 0);
+    assert_eq!(device_render(&mut runtime, device, request), "<<>>");
+    let request = get_chars_request(&mut runtime, 4);
+    assert_eq!(
+        device_render(&mut runtime, device, request),
+        "<<114,101,115,116>>"
+    );
+}
+
+/// `{position, cur}` after a `{get_line, …}` answers the **logical** position, not the
+/// device's physical offset: the read-ahead left 10 bytes in the buffer, so the oracle's
+/// `position/3` (`file_io_server.erl:970-977`) subtracts them. File
+/// `<<"line1\nline2\nrest">>`, the live oracle answers
+///
+/// ```text
+/// read_line/position(cur)/read(4)       -> {ok,"line1\n"} {ok,6} {ok,"line"}
+/// read_line/position({cur,2})/read(4)   -> {ok,"line1\n"} {ok,8} {ok,"ne2\n"}
+/// ```
+///
+/// and the seek clears the stashed buffer (`std_reply/2`, `file_io_server.erl:344-348`), so
+/// the following read comes from the logical position.
+#[test]
+fn position_cur_compensates_for_the_stashed_buffer() {
+    let mut runtime = runtime();
+    let mut table = table(&mut runtime);
+    let file = TempPath::new("position_cur");
+    std::fs::write(file.path(), b"line1\nline2\nrest").expect("a fixture file");
+    let modes = mode_list(&mut runtime, &["read"]);
+
+    // `cur`: 6 - 10 = the physical 16 - 10.
+    let device = open_device(&mut runtime, &mut table, file.path(), modes.clone());
+    let request = get_line_request(&mut runtime);
+    assert_eq!(
+        device_render(&mut runtime, device, request),
+        "[108,105,110,101,49,10]"
+    );
+    let at = cur_atom(&mut runtime);
+    let request = position_request(&mut runtime, at);
+    assert_eq!(device_render(&mut runtime, device, request), "{ok,6}");
+    let request = get_chars_request(&mut runtime, 4);
+    assert_eq!(
+        device_render(&mut runtime, device, request),
+        "[108,105,110,101]"
+    );
+
+    // `{cur, Offs}`: 6 + 2 = the physical 16 - 10 + 2.
+    let device = open_device(&mut runtime, &mut table, file.path(), modes);
+    let request = get_line_request(&mut runtime);
+    assert_eq!(
+        device_render(&mut runtime, device, request),
+        "[108,105,110,101,49,10]"
+    );
+    let at = cur_offset(&mut runtime, 2);
+    let request = position_request(&mut runtime, at);
+    assert_eq!(device_render(&mut runtime, device, request), "{ok,8}");
+    let request = get_chars_request(&mut runtime, 4);
+    assert_eq!(
+        device_render(&mut runtime, device, request),
+        "[110,101,50,10]"
+    );
+}
+
+/// A `0`-count read answers the empty cast and leaves the stashed leftover **untouched**
+/// (`get_chars(0, Enc, State)`, `file_io_server.erl:506-507`). File
+/// `<<"line1\nline2\nrest">>`; the live oracle answers
+///
+/// ```text
+/// position(cur)/read(0)/read_line -> {ok,0} {ok,[]} {ok,"line1\n"}
+/// ```
+///
+/// and the `0`-count read repeated after that line keeps the line reader's leftover
+/// (`"line2\nrest"`) in place for the reads that follow.
+#[test]
+fn get_chars_zero_preserves_the_stashed_buffer() {
+    let mut runtime = runtime();
+    let mut table = table(&mut runtime);
+    let file = TempPath::new("zero_count");
+    std::fs::write(file.path(), b"line1\nline2\nrest").expect("a fixture file");
+    let modes = mode_list(&mut runtime, &["read"]);
+    let device = open_device(&mut runtime, &mut table, file.path(), modes);
+
+    let at = cur_atom(&mut runtime);
+    let request = position_request(&mut runtime, at);
+    assert_eq!(device_render(&mut runtime, device, request), "{ok,0}");
+    let request = get_chars_request(&mut runtime, 0);
+    assert_eq!(device_render(&mut runtime, device, request), "[]");
+    let request = get_line_request(&mut runtime);
+    assert_eq!(
+        device_render(&mut runtime, device, request),
+        "[108,105,110,101,49,10]"
+    );
+
+    // A non-empty buffer survives the `0`-count read: the next reads serve `"line2\nrest"`
+    // from it without touching the file.
+    let request = get_chars_request(&mut runtime, 0);
+    assert_eq!(device_render(&mut runtime, device, request), "[]");
+    let request = get_chars_request(&mut runtime, 4);
+    assert_eq!(
+        device_render(&mut runtime, device, request),
+        "[108,105,110,101]"
+    );
+    let request = get_chars_request(&mut runtime, 6);
+    assert_eq!(
+        device_render(&mut runtime, device, request),
+        "[50,10,114,101,115,116]"
+    );
+}
+
+/// A read is `eof` only when **nothing at all** was obtained — the buffered bytes still
+/// count, and a short read that returns fewer than `N` bytes is not an end of file. File
+/// `<<"line1\nline2\nrest">>`; the live oracle answers
+///
+/// ```text
+/// read(16)/read(4) -> {ok,"line1\nline2\nrest"} eof
+/// read(20)         -> {ok,"line1\nline2\nrest"}
+/// ```
+#[test]
+fn get_chars_reports_eof_only_when_nothing_was_obtained() {
+    let mut runtime = runtime();
+    let mut table = table(&mut runtime);
+    let file = TempPath::new("eof_tail");
+    std::fs::write(file.path(), b"line1\nline2\nrest").expect("a fixture file");
+    let modes = mode_list(&mut runtime, &["read"]);
+    let whole = "[108,105,110,101,49,10,108,105,110,101,50,10,114,101,115,116]";
+
+    let device = open_device(&mut runtime, &mut table, file.path(), modes.clone());
+    let request = get_chars_request(&mut runtime, 16);
+    assert_eq!(device_render(&mut runtime, device, request), whole);
+    let request = get_chars_request(&mut runtime, 4);
+    assert_eq!(device_render(&mut runtime, device, request), "eof");
+
+    // A request for more than the file holds answers what is left, never `eof`.
+    let device = open_device(&mut runtime, &mut table, file.path(), modes);
+    let request = get_chars_request(&mut runtime, 20);
+    assert_eq!(device_render(&mut runtime, device, request), whole);
+    let request = get_chars_request(&mut runtime, 1);
+    assert_eq!(device_render(&mut runtime, device, request), "eof");
+}
+
 // -- the live-oracle cross-check ------------------------------------------------------
 
 /// How long an oracle probe may run before it is killed and reaped.
@@ -826,8 +1073,7 @@ fn resolve_oracle() -> Option<PathBuf> {
 fn oracle_render(oracle: &Path, probe: &str) -> Option<String> {
     use std::process::{Command, Stdio};
 
-    let mut command = Command::new(oracle);
-    command
+    let mut command = Command::new(oracle);    command
         .arg("-noshell")
         .arg("-eval")
         .arg(format!("io:format(\"~w\", [{probe}])"))
@@ -1095,6 +1341,76 @@ fn the_getopts_answers_match_the_live_oracle() {
         return;
     };
     assert_eq!(rendered, "{ok,{ok,[97,98,99,229,100,101,102,10]}}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The mixed `file:read/2`/`file:read_line/1`/`file:position/2` sequences re-run against
+/// the **live** oracle on one handle per case, over a file whose content is exactly
+/// `<<"line1\nline2\nrest">>`. Every case mixes the readers on the same device, so a reply
+/// that ignores the stashed `State#state.buf` diverges here. Skips **loudly** when no
+/// oracle is installed.
+#[test]
+fn the_buffered_read_answers_match_the_live_oracle() {
+    let Some(oracle) = resolve_oracle() else {
+        eprintln!();
+        eprintln!("========== beam_rt file_server buffered-read oracle SKIPPED ==========");
+        eprintln!("no `erl` on $PATH (and no executable $ERTS_ORACLE): the oracle");
+        eprintln!("comparison cannot run. Set $ERTS_ORACLE (or install Erlang/OTP)");
+        eprintln!("and re-run. NOT a pass.");
+        eprintln!("=====================================================================");
+        eprintln!();
+        return;
+    };
+    let dir = unique_path("oracle_buffered_read");
+    std::fs::create_dir_all(&dir).expect("a private temporary directory");
+
+    let sequence = |body: &str| {
+        format!("begin {{ok,F}}=file:open(\"{{p}}\",[read]), {body}, file:close(F), {{A,B,C,D}} end")
+    };
+    let cases: [String; 8] = [
+        // The repro: a `read_line` between two `read`s.
+        "A=file:read(F,6), B=file:read_line(F), C=file:read(F,4), D=ok".to_string(),
+        // A `read_line` after a 2-byte read.
+        "A=file:read(F,2), B=file:read_line(F), C=file:read(F,4), D=ok".to_string(),
+        // Three fixed-size reads straddling the second line.
+        "A=file:read(F,6), B=file:read(F,4), C=file:read(F,4), D=file:read(F,4)".to_string(),
+        // `position(cur)` compensates for the line reader's read-ahead.
+        "A=file:read_line(F), B=file:position(F,cur), C=file:read(F,4), D=ok".to_string(),
+        // ... and the seek clears the buffer, so the next line reader starts there.
+        "A=file:read_line(F), B=file:position(F,cur), C=file:read_line(F), D=ok".to_string(),
+        // A `0`-count read at the start, then the first line.
+        "A=file:position(F,cur), B=file:read(F,0), C=file:read_line(F), D=ok".to_string(),
+        // Reading the whole file then past its end.
+        "A=file:read(F,16), B=file:read(F,4), C=ok, D=ok".to_string(),
+        // A `0`-count read does not consume the line reader's leftover.
+        "A=file:read_line(F), B=file:read(F,0), C=file:read(F,4), D=ok".to_string(),
+    ];
+    for (index, body) in cases.iter().enumerate() {
+        let path = dir.join(format!("case{index}.bin"));
+        std::fs::write(&path, b"line1\nline2\nrest").expect("a fixture file");
+        let template = sequence(body);
+        let Some(rendered) = compare_with_oracle(&oracle, &template, &path) else {
+            return;
+        };
+        eprintln!("case {index}: {rendered}");
+    }
+
+    // The same repro on a `[read,binary]` device.
+    let path = dir.join("binary.bin");
+    std::fs::write(&path, b"line1\nline2\nrest").expect("a fixture file");
+    let Some(rendered) = compare_with_oracle(
+        &oracle,
+        "begin {ok,F}=file:open(\"{p}\",[read,binary]), A=file:read(F,6), \
+         B=file:read_line(F), C=file:read(F,4), file:close(F), {A,B,C} end",
+        &path,
+    ) else {
+        return;
+    };
+    assert_eq!(
+        rendered,
+        "{{ok,<<108,105,110,101,49,10>>},{ok,<<108,105,110,101,50,10>>},{ok,<<114,101,115,116>>}}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
