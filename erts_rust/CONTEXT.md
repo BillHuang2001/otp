@@ -131,8 +131,8 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   `ordsets`/`proplists`/`maps`/`queue`/`gb_trees`/`calendar`/`filename`/`base64`/`unicode` functions run
   with byte-identical oracle results. Anything outside the supported surface returns a typed `BeamError`
   (never a wrong result).
-- **Compatibility gate (`tools/differential`):** `summary: total=1839 agree=1837 mismatch=0 unsupported=2
-  skipped=0 allowed=2` → `gate.sh --strict` exits 0. `gate.sh` is authoritative — re-run it for the live
+- **Compatibility gate (`tools/differential`):** `summary: total=1848 agree=1845 mismatch=0 unsupported=3
+  skipped=0 allowed=3` → `gate.sh --strict` exits 0. `gate.sh` is authoritative — re-run it for the live
   per-contract split. **No case disagrees**; the recorded capability gaps (the `known-gaps.txt` ratchet
   allowlist) are `wire/new_fun_ext_encode` (unclosable — an `erl_eval` lambda's closure identity needs
   `erl_eval`/`erl_scan`/`erl_parse`) and `boot_extra/init_script_id_names_the_running_otp_release` (A.9 —
@@ -176,9 +176,13 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   (pumping) process — the route on which the `file` read path already agrees with the oracle. Two
   compilations of one source are byte-identical under `+deterministic` (`{deterministic,true}` strips
   the path-bearing `CInf`/`Line` fields; the `Code` chunk matches either way), so a byte comparison or a
-  `beam_lib:chunks` comparison is a valid acceptance criterion. A **scheduled-process** invoke (the
-  `erl -noshell -s compile` / `erlc` shape) additionally needs the two open engine apply seams
-  (`crates/beam_rt/HANDOFF_boot_apply_seam.md`).
+  `beam_lib:chunks` comparison is a valid acceptance criterion. The two engine call seams this needed
+  (`call_ext`-encoded `erlang:apply/3`, and `call_fun`/`call_fun2` for a scheduled process) are both
+  **closed**; `beam_engine`'s `resolve_local_fun` is implemented by `beam_rt`. The remaining E0 blocker
+  is a single `beam_engine` bitstring-matching operand-order bug (`bs_get_binary2`/`bs_get_integer2`/
+  `bs_get_float2` write the destination register before `reread_ctx`/`set_ctx_start` when
+  `dst == ctx`), and a **scheduled-process** invoke (the `erl -noshell -s compile` / `erlc` shape)
+  additionally needs a nested-run `receive … after T` timeout that can fire.
 - **Honest coverage gaps** (per-crate `Known Issues`): the Cranelift hot tier (`jit-cranelift`,
   default-OFF, not on `beam_rt`'s path — the baseline JIT tier is wired for the first module entry);
   full match-spec compiler; ETS concurrency; `put_record/6`'s create form; several

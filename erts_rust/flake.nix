@@ -36,7 +36,8 @@
         oracleDeps = with pkgs; [
           erlang         # system ERTS baseline (differential oracle, differential harness)
           elixir         # Elixir toolchain (compiler-throughput benchmark target)
-          rebar3         # build tool for khepri / emqx targets
+          rebar3         # build tool for the khepri / emqx targets
+          dotnet-sdk_9   # .NET SDK for the `plb` (Benchmarks Game) target
         ];
 
         toolDeps = with pkgs; [
