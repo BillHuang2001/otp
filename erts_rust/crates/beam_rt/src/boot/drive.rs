@@ -342,31 +342,40 @@ pub(super) fn apply_boot_call(
         context.enter_module(&module);
         machine.run_export_outcome(&module, function, arity, args, &mut context)
     };
-    let mut outcome = entered.map_err(|err| error::name_atom_raise(err, runtime.atoms()))?;
-    loop {
-        match outcome {
-            // `init` discards an `apply` directive's value, exactly as it discards `-s`'s.
-            RunOutcome::Returned(_) => return Ok(()),
-            RunOutcome::Wait { func, pc } => {
-                // The process suspended in a `receive`: let the scheduler advance (the
-                // boot-spawned process that must answer it is on the run queue), then resume
-                // the same machine at the reported address.
-                let ran = drive_scheduler(runtime, deadline, APPLY_BLOCK_SLICES)?;
-                if ran == 0 {
-                    // Nothing left that could wake the receiver: report it exactly as the
-                    // engine's non-blocking entries do, rather than spinning out the deadline.
-                    return Err(beam_engine::blocked());
+    // The whole directive runs inside this closure so that **every** exit — the returned value,
+    // the typed `blocked()` gap and a raise — reaches the adoption step below: `init` discards
+    // an `apply` directive's value, but the function may still have stored a term that
+    // references an off-heap payload this short-lived machine built (see
+    // `Runtime::adopt_escaped_binaries`).
+    let result = (|| -> Result<()> {
+        let mut outcome = entered.map_err(|err| error::name_atom_raise(err, runtime.atoms()))?;
+        loop {
+            match outcome {
+                // `init` discards an `apply` directive's value, exactly as it discards `-s`'s.
+                RunOutcome::Returned(_) => return Ok(()),
+                RunOutcome::Wait { func, pc } => {
+                    // The process suspended in a `receive`: let the scheduler advance (the
+                    // boot-spawned process that must answer it is on the run queue), then resume
+                    // the same machine at the reported address.
+                    let ran = drive_scheduler(runtime, deadline, APPLY_BLOCK_SLICES)?;
+                    if ran == 0 {
+                        // Nothing left that could wake the receiver: report it exactly as the
+                        // engine's non-blocking entries do, rather than spinning out the deadline.
+                        return Err(beam_engine::blocked());
+                    }
+                    let resumed = {
+                        let mut context = RuntimeContext::new(runtime);
+                        context.enter_module(&module);
+                        machine.resume_outcome(&module, func, pc, &mut context)
+                    };
+                    outcome =
+                        resumed.map_err(|err| error::name_atom_raise(err, runtime.atoms()))?;
                 }
-                let resumed = {
-                    let mut context = RuntimeContext::new(runtime);
-                    context.enter_module(&module);
-                    machine.resume_outcome(&module, func, pc, &mut context)
-                };
-                outcome =
-                    resumed.map_err(|err| error::name_atom_raise(err, runtime.atoms()))?;
             }
         }
-    }
+    })();
+    runtime.adopt_escaped_binaries(machine.refc_binaries());
+    result
 }
 
 /// Dispatches one boot-script `{apply, …}` through the runtime's non-blocking BIF chain.
