@@ -31,7 +31,16 @@
 //! `function_exported/3` answers for the preloaded-module set, the whole-set invariants of the
 //! preloaded floor (all sticky, all in `code:all_loaded/0`), the kernel application's
 //! registered-name manifest, and the live floors of the preloaded `persistent_term`/`atomics`
-//! modules.
+//! modules. It also completes the per-member coverage of that floor: membership of every
+//! preloaded module in `erlang:pre_loaded/0`, `code:is_loaded/1` and `code:which/1` for each
+//! remaining preloaded module, `code:is_sticky/1` across the boot-loaded module set, the
+//! `module_info(exports)` membership queries for `lists`/`init`, each key of the kernel
+//! application's `.app` resource (`applications`/`included_applications`/
+//! `optional_applications`/`start_phases`/`maxT`/`modules`/`registered`), the
+//! `application:get_all_key/1` key manifest, the absent `init` arguments
+//! (`mode`/`console`/`pa`), and the emulator's scheduling/limit constants
+//! (`multi_scheduling`, `multi_scheduling_blockers`, `break_ignored`, `thread_pool_size`,
+//! `port_limit`, `process_limit`, `fullsweep_after`).
 //!
 //! Every assertion is **structural** or a **release-stable value** wherever the value is
 //! machine/release-dependent (the oracle is OTP 29 while the rewrite targets OTP 30, so the
@@ -1004,6 +1013,448 @@ pub(crate) fn group() -> Vec<Case> {
             "filelib:wildcard/1 is the empty list for a path that does not exist",
             "filelib:wildcard(\"/nonexistent/boot_extra_absent_dir/*\")",
             "ok []",
+        ),
+        // --- Remaining members of the frozen preloaded set --------------------------------
+        // The sections above pin membership for the first half of the preloaded set; these
+        // complete it, so a single missing/extra member cannot slip past.
+        eval(
+            "boot_extra/pre_loaded_members_include_erl_init",
+            "the boot-time `erl_init` module is preloaded",
+            "lists:member(erl_init, erlang:pre_loaded())",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/pre_loaded_members_include_prim_buffer",
+            "the `prim_buffer` module is preloaded",
+            "lists:member(prim_buffer, erlang:pre_loaded())",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/pre_loaded_members_include_prim_eval",
+            "the `prim_eval` module is preloaded",
+            "lists:member(prim_eval, erlang:pre_loaded())",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/pre_loaded_members_include_prim_net",
+            "the `prim_net` module is preloaded",
+            "lists:member(prim_net, erlang:pre_loaded())",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/pre_loaded_members_include_prim_inet",
+            "the `prim_inet` module is preloaded",
+            "lists:member(prim_inet, erlang:pre_loaded())",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/pre_loaded_members_include_erl_tracer",
+            "the `erl_tracer` module is preloaded",
+            "lists:member(erl_tracer, erlang:pre_loaded())",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/pre_loaded_members_include_erts_code_purger",
+            "the `erts_code_purger` module is preloaded",
+            "lists:member(erts_code_purger, erlang:pre_loaded())",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/pre_loaded_members_include_erts_trace_cleaner",
+            "the `erts_trace_cleaner` module is preloaded",
+            "lists:member(erts_trace_cleaner, erlang:pre_loaded())",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/pre_loaded_is_a_list",
+            "erlang:pre_loaded/0 returns a list and not another collection",
+            "is_list(erlang:pre_loaded())",
+            "ok true",
+        ),
+        // --- code:is_loaded/1 and code:which/1 for the remaining preloaded modules -------
+        // The code server must resolve *every* member of the frozen preloaded set before any
+        // file is readable; these pin the remaining members individually.
+        eval(
+            "boot_extra/code_is_loaded_erl_init_is_preloaded",
+            "code:is_loaded(erl_init) is the {file,preloaded} pair",
+            "code:is_loaded(erl_init)",
+            "ok {file,preloaded}",
+        ),
+        eval(
+            "boot_extra/code_which_erl_init_is_preloaded",
+            "code:which/1 reports the atom `preloaded` for the preloaded `erl_init` module",
+            "code:which(erl_init)",
+            "ok preloaded",
+        ),
+        eval(
+            "boot_extra/code_is_loaded_erts_dirty_process_signal_handler_is_preloaded",
+            "code:is_loaded/1 reports {file,preloaded} for `erts_dirty_process_signal_handler`",
+            "code:is_loaded(erts_dirty_process_signal_handler)",
+            "ok {file,preloaded}",
+        ),
+        eval(
+            "boot_extra/code_which_erts_dirty_process_signal_handler_is_preloaded",
+            "code:which/1 reports the atom `preloaded` for `erts_dirty_process_signal_handler`",
+            "code:which(erts_dirty_process_signal_handler)",
+            "ok preloaded",
+        ),
+        eval(
+            "boot_extra/code_is_loaded_erts_literal_area_collector_is_preloaded",
+            "code:is_loaded/1 reports {file,preloaded} for `erts_literal_area_collector`",
+            "code:is_loaded(erts_literal_area_collector)",
+            "ok {file,preloaded}",
+        ),
+        eval(
+            "boot_extra/code_which_erts_literal_area_collector_is_preloaded",
+            "code:which/1 reports the atom `preloaded` for `erts_literal_area_collector`",
+            "code:which(erts_literal_area_collector)",
+            "ok preloaded",
+        ),
+        eval(
+            "boot_extra/code_is_loaded_erts_trace_cleaner_is_preloaded",
+            "code:is_loaded/1 reports {file,preloaded} for `erts_trace_cleaner`",
+            "code:is_loaded(erts_trace_cleaner)",
+            "ok {file,preloaded}",
+        ),
+        eval(
+            "boot_extra/code_which_erts_trace_cleaner_is_preloaded",
+            "code:which/1 reports the atom `preloaded` for `erts_trace_cleaner`",
+            "code:which(erts_trace_cleaner)",
+            "ok preloaded",
+        ),
+        eval(
+            "boot_extra/code_is_loaded_prim_buffer_is_preloaded",
+            "code:is_loaded/1 reports {file,preloaded} for `prim_buffer`",
+            "code:is_loaded(prim_buffer)",
+            "ok {file,preloaded}",
+        ),
+        eval(
+            "boot_extra/code_which_prim_buffer_is_preloaded",
+            "code:which/1 reports the atom `preloaded` for `prim_buffer`",
+            "code:which(prim_buffer)",
+            "ok preloaded",
+        ),
+        eval(
+            "boot_extra/code_is_loaded_prim_eval_is_preloaded",
+            "code:is_loaded/1 reports {file,preloaded} for `prim_eval`",
+            "code:is_loaded(prim_eval)",
+            "ok {file,preloaded}",
+        ),
+        eval(
+            "boot_extra/code_which_prim_eval_is_preloaded",
+            "code:which/1 reports the atom `preloaded` for `prim_eval`",
+            "code:which(prim_eval)",
+            "ok preloaded",
+        ),
+        eval(
+            "boot_extra/code_is_loaded_prim_socket_is_preloaded",
+            "code:is_loaded/1 reports {file,preloaded} for `prim_socket`",
+            "code:is_loaded(prim_socket)",
+            "ok {file,preloaded}",
+        ),
+        eval(
+            "boot_extra/code_which_prim_socket_is_preloaded",
+            "code:which/1 reports the atom `preloaded` for `prim_socket`",
+            "code:which(prim_socket)",
+            "ok preloaded",
+        ),
+        // --- code:is_sticky/1 across the boot-loaded module floor -------------------------
+        // Sticky modules may not be purged; the boot chain relies on the boot-critical modules
+        // being sticky while a module that was never loaded is (trivially) not.
+        eval(
+            "boot_extra/code_is_sticky_init_is_true",
+            "code:is_sticky/1 reports the booted `init` module as sticky",
+            "code:is_sticky(init)",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/code_is_sticky_lists_is_true",
+            "code:is_sticky/1 reports the file-loaded `lists` module as sticky",
+            "code:is_sticky(lists)",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/code_is_sticky_unknown_module_is_false",
+            "code:is_sticky/1 reports a module that was never loaded as not sticky",
+            "code:is_sticky(no_such_module_xyz)",
+            "ok false",
+        ),
+        // --- The code server's loaded registry --------------------------------------------
+        eval(
+            "boot_extra/code_all_loaded_is_a_list",
+            "code:all_loaded/0 returns a list (the code server's loaded registry)",
+            "is_list(code:all_loaded())",
+            "ok true",
+        ),
+        // --- `erlang:module_loaded/1` for the remaining preloaded modules ----------------
+        eval(
+            "boot_extra/module_loaded_erl_init_is_true",
+            "erlang:module_loaded/1 reports the preloaded `erl_init` module as loaded",
+            "erlang:module_loaded(erl_init)",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/module_loaded_prim_buffer_is_true",
+            "erlang:module_loaded/1 reports the preloaded `prim_buffer` module as loaded",
+            "erlang:module_loaded(prim_buffer)",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/module_loaded_prim_eval_is_true",
+            "erlang:module_loaded/1 reports the preloaded `prim_eval` module as loaded",
+            "erlang:module_loaded(prim_eval)",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/module_loaded_erts_code_purger_is_true",
+            "erlang:module_loaded/1 reports the preloaded `erts_code_purger` module as loaded",
+            "erlang:module_loaded(erts_code_purger)",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/module_loaded_zlib_is_true",
+            "erlang:module_loaded/1 reports the preloaded `zlib` module as loaded",
+            "erlang:module_loaded(zlib)",
+            "ok true",
+        ),
+        // --- The export tables of the boot-loaded modules ---------------------------------
+        // `module_info(exports)` is the module's own export list; a boot target must answer it
+        // for the file-loaded modules too, not just for the preloaded floor.
+        eval(
+            "boot_extra/lists_module_info_exports_contains_reverse_1",
+            "the `lists` module's export table contains the {reverse,1} entry",
+            "lists:member({reverse,1}, lists:module_info(exports))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/lists_module_info_exports_contains_map_2",
+            "the `lists` module's export table contains the {map,2} entry",
+            "lists:member({map,2}, lists:module_info(exports))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/lists_module_info_exports_contains_foldl_3",
+            "the `lists` module's export table contains the {foldl,3} entry",
+            "lists:member({foldl,3}, lists:module_info(exports))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/init_module_info_exports_contains_get_status_0",
+            "the preloaded `init` module's export table contains the {get_status,0} entry",
+            "lists:member({get_status,0}, init:module_info(exports))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/init_module_info_exports_contains_get_argument_1",
+            "the preloaded `init` module's export table contains the {get_argument,1} entry",
+            "lists:member({get_argument,1}, init:module_info(exports))",
+            "ok true",
+        ),
+        // --- The kernel application's `.app` resource, key by key -------------------------
+        // Each key the boot chain reads from an application resource is pinned by its
+        // release-stable value or by membership; the version strings and host paths are never
+        // asserted by value.
+        eval(
+            "boot_extra/application_get_key_stdlib_applications_is_kernel_only",
+            "application:get_key(stdlib, applications) is exactly the kernel dependency",
+            "application:get_key(stdlib, applications) =:= {ok,[kernel]}",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/application_get_key_kernel_included_applications_is_empty",
+            "application:get_key(kernel, included_applications) is the empty list",
+            "application:get_key(kernel, included_applications) =:= {ok,[]}",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/application_get_key_kernel_optional_applications_is_empty",
+            "application:get_key(kernel, optional_applications) is the empty list",
+            "application:get_key(kernel, optional_applications) =:= {ok,[]}",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/application_get_key_kernel_start_phases_is_undefined",
+            "application:get_key(kernel, start_phases) is {ok,undefined} (kernel declares no start phases)",
+            "application:get_key(kernel, start_phases) =:= {ok,undefined}",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/application_get_key_kernel_maxT_is_infinity",
+            "application:get_key(kernel, maxT) is the unbounded `infinity` termination timeout",
+            "application:get_key(kernel, maxT) =:= {ok,infinity}",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/application_get_key_kernel_modules_contains_kernel",
+            "the kernel application's module list contains the `kernel` module",
+            "lists:member(kernel, element(2, application:get_key(kernel, modules)))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/application_get_key_kernel_modules_contains_code",
+            "the kernel application's module list contains the `code` module",
+            "lists:member(code, element(2, application:get_key(kernel, modules)))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/application_get_key_stdlib_modules_contains_lists",
+            "the stdlib application's module list contains the `lists` module",
+            "lists:member(lists, element(2, application:get_key(stdlib, modules)))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/application_get_key_kernel_registered_names_file_server_2",
+            "the kernel registered-name manifest names `file_server_2` (the boot-time file server)",
+            "lists:member(file_server_2, element(2, application:get_key(kernel, registered)))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/application_get_key_kernel_registered_names_code_server",
+            "the kernel registered-name manifest names `code_server`",
+            "lists:member(code_server, element(2, application:get_key(kernel, registered)))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/application_get_key_kernel_registered_names_kernel_sup",
+            "the kernel registered-name manifest names `kernel_sup`",
+            "lists:member(kernel_sup, element(2, application:get_key(kernel, registered)))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/application_get_all_key_kernel_has_env_key",
+            "application:get_all_key(kernel)'s key names contain `env`",
+            "lists:keymember(env, 1, element(2, application:get_all_key(kernel)))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/application_get_all_key_kernel_has_description_key",
+            "application:get_all_key(kernel)'s key names contain `description`",
+            "lists:keymember(description, 1, element(2, application:get_all_key(kernel)))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/application_get_all_key_kernel_has_modules_key",
+            "application:get_all_key(kernel)'s key names contain `modules`",
+            "lists:keymember(modules, 1, element(2, application:get_all_key(kernel)))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/application_get_all_key_kernel_has_registered_key",
+            "application:get_all_key(kernel)'s key names contain `registered`",
+            "lists:keymember(registered, 1, element(2, application:get_all_key(kernel)))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/application_get_all_key_kernel_has_applications_key",
+            "application:get_all_key(kernel)'s key names contain `applications`",
+            "lists:keymember(applications, 1, element(2, application:get_all_key(kernel)))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/application_get_application_1_file_module_is_kernel",
+            "application:get_application/1 maps the kernel application's `file` module to kernel",
+            "application:get_application(file)",
+            "ok {ok,kernel}",
+        ),
+        eval(
+            "boot_extra/application_get_application_1_erts_module_is_undefined",
+            "application:get_application/1 is `undefined` for the `erts` module (erts is not a loaded application)",
+            "application:get_application(erts)",
+            "ok undefined",
+        ),
+        eval(
+            "boot_extra/application_get_env_stdlib_restricted_shell_is_undefined",
+            "application:get_env/2 reports `undefined` for an unset stdlib key",
+            "application:get_env(stdlib, restricted_shell) =:= undefined",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/loaded_applications_includes_kernel",
+            "the boot script has loaded `kernel` (it appears in loaded_applications/0)",
+            "lists:keymember(kernel, 1, application:loaded_applications())",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/loaded_applications_excludes_erts",
+            "`erts` is not a loaded application (it is the emulator, not an application the boot script starts)",
+            "lists:keymember(erts, 1, application:loaded_applications())",
+            "ok false",
+        ),
+        eval(
+            "boot_extra/which_applications_is_a_list",
+            "application:which_applications/0 returns a list",
+            "is_list(application:which_applications())",
+            "ok true",
+        ),
+        // --- `init`'s argument table for flags that were never given ----------------------
+        eval(
+            "boot_extra/init_get_argument_mode_is_error",
+            "with no -mode given, init:get_argument(mode) is the atom `error`",
+            "init:get_argument(mode)",
+            "ok error",
+        ),
+        eval(
+            "boot_extra/init_get_argument_console_is_error",
+            "with no -console given, init:get_argument(console) is the atom `error`",
+            "init:get_argument(console)",
+            "ok error",
+        ),
+        eval(
+            "boot_extra/init_get_argument_pa_absent_is_error",
+            "with no -pa given, init:get_argument(pa) is the atom `error`",
+            "init:get_argument(pa)",
+            "ok error",
+        ),
+        eval(
+            "boot_extra/init_get_arguments_is_a_list",
+            "init:get_arguments/0 returns a list",
+            "is_list(init:get_arguments())",
+            "ok true",
+        ),
+        // --- Emulator scheduling / limit constants of the booted system -------------------
+        // The runtime's scheduling mode and the emulator's resource limits are the frozen
+        // emulator constants a booted system reports; volatile counts are pinned by shape.
+        eval(
+            "boot_extra/system_info_multi_scheduling_is_enabled",
+            "erlang:system_info(multi_scheduling) reports the enabled multi-scheduler mode",
+            "erlang:system_info(multi_scheduling) =:= enabled",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/system_info_multi_scheduling_blockers_is_empty",
+            "erlang:system_info(multi_scheduling_blockers) is the empty blocker list",
+            "erlang:system_info(multi_scheduling_blockers) =:= []",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/system_info_break_ignored_is_false",
+            "with no +B override, erlang:system_info(break_ignored) is `false`",
+            "erlang:system_info(break_ignored) =:= false",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/system_info_thread_pool_size_is_positive",
+            "erlang:system_info(thread_pool_size) is a positive integer (value is host-dependent)",
+            "erlang:system_info(thread_pool_size) > 0",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/system_info_port_limit_is_positive",
+            "erlang:system_info(port_limit) is a positive integer limit",
+            "erlang:system_info(port_limit) > 0",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/system_info_process_limit_is_positive",
+            "erlang:system_info(process_limit) is a positive integer limit",
+            "erlang:system_info(process_limit) > 0",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/system_info_fullsweep_after_pair_shape",
+            "erlang:system_info(fullsweep_after) is the {fullsweep_after,Words} pair",
+            "begin F = erlang:system_info(fullsweep_after), is_tuple(F) andalso element(1, F) =:= fullsweep_after andalso is_integer(element(2, F)) end",
+            "ok true",
         ),
     ]
 }

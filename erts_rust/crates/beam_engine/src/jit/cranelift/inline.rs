@@ -549,7 +549,8 @@ pub(super) fn inline_test(
     args: &[Operand],
     labels: &LabelMap,
 ) -> Option<TestPlan> {
-    // A `NO_FAIL` test *raises* on failure (the interpreter's typed `test/no_fail`),
+    // A `NO_FAIL` test *raises* on failure (class `error`, the bare atom
+    // `function_clause` — the interpreter's shared `raise_function_clause_no_fail`),
     // so it is never inlined: the helper reproduces that exactly.
     if fail == NO_FAIL {
         return None;

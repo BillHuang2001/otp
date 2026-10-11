@@ -99,7 +99,10 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   -> OwnerDeath`, `info() -> TableInfo`, `rename(name, is_taken) -> Result<RenameOutcome>`.
 - **Writes** (object = the whole tuple; key from `keypos`): `insert` (upsert), `insert_new -> bool`,
   `insert_list(&[object])` (**ATOMIC** — validates and deep-copies the whole list first), `delete(key)`,
-  `delete_object(object)`, `delete_all_objects()`.
+  `delete_object(object)`, `delete_all_objects()`, plus the `pub(crate)` `replace_key(key, &[object])` —
+  the storage-faithful key rebuild behind a `duplicate_bag` `select_replace/2` (validates and deep-copies
+  the whole new list **before** removing the key's old objects, so a rebuild reclaims the objects it
+  replaces instead of checking them out).
 - **Reads:** `lookup(key) -> Vec<Eterm>` (0/1 for set/ordered_set), `member`, `lookup_element(key, pos)`
   / `lookup_element_or(key, pos, default)` (scalar; `unsupported` raise for the multi kinds),
   `lookup_element_all(key, pos) -> Vec<Eterm>` / `lookup_element_all_or(..) -> Option<Vec<Eterm>>` (the
@@ -450,6 +453,20 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 - **`insert_list` is atomic; `select_replace/2` is a two-phase rewrite with the C's static body check**
   (a body outside `'$_'`/`{{…}}`/`{const,{…}}`/`{element,KeyPos,'$_'}` aborts with `badarg` — even with
   no match — leaving the table unchanged; a valid body is applied atomically).
+- **A `duplicate_bag` replacement rebuilds the key and reclaims the objects it replaces.** Several
+  objects share a key and the replacement must land on the **specific** matched object, so the affected
+  key's whole object list is rebuilt: the current objects are read through `Table::lookup` (they alias
+  live table storage), each replacement is computed on the caller's scratch heap, and
+  `Table::replace_key` deep-copies the new list into table storage **first** and only then removes the
+  old objects through the ordinary freeing path (`delete`). Copying before freeing is what guarantees no
+  replacement reads reclaimed storage, and the ordinary freeing path is what keeps the store's
+  free-run reuse at a steady state — a rebuild from `Table::take`'s checked-out copies (whose storage
+  `relinquish` holds for the table's lifetime) would map a fresh block per round instead. A
+  replacement that equals the object it replaces is harmless because the rebuild never removes an
+  object *by value*, which `delete_object`'s "remove **every** equal object" rule would. Pinned by
+  `table::tests::a_duplicate_bag_replacement_reclaims_the_replaced_objects` (the store's block count
+  and live words stay at their warmup floor across 100 rounds) and the oracle-visible
+  `ets_replace::repeated_identical_replacement_on_a_duplicate_bag_is_stable`.
 - **Match-spec arithmetic routes through the `ArithHook` seam** (a `thread_local`), keeping wave-1
   `beam_ets` free of a `beam_bifs` dependency; candidate to lift into `beam_term` later.
 - **Continuations are opaque owned values, not terms** (table id + compiled spec + limit + position),
@@ -562,8 +579,10 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   kind/options, key validation, store copy/free/reuse/relinquish, table insert/take accounting,
   hash-interior ops, CHAMP ops (round-trip, 2000-key churn, collision node, canonicalization,
   memory monotonicity), B+-tree invariants (incl. 10 000-key churn), the sorted-`Vec` interior, the
-  mixed-class order test, select compile/execute, info, owner-death, the heir forms/reclaim, and the
-  guard-scoped views (incl. the aliasing defence and the `compile_fail` doctests).
+  mixed-class order test, select compile/execute, info, owner-death, the heir forms/reclaim, the
+  duplicate_bag `select_replace` rebuild's storage floor (the store's `words`/`blocks` stay at their
+  warmup floor across repeated replacement), and the guard-scoped views (incl. the aliasing defence and
+  the `compile_fail` doctests).
 - **Cross-interior equivalence + defaults** (`interior_parity.rs`): a shared LCG operation script drives
   chained vs CHAMP (identical traces, order-insensitive) and B+-tree vs sorted `Vec` (order-sensitive
   tail), pins the default selectors, and pins the `cmp`→`cmp_arith` arithmetic-key behaviour (the
@@ -578,7 +597,9 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   reclamation,concurrency,store_terms}.rs`, `tests/select.rs`, `tests/match_spec_run.rs`, sharing helpers
   from `tests/common/`, and the live-`erl` plumbing in `tests/common/oracle.rs`. `ets_store_terms.rs`
   cross-checks every newly-copyable boxed kind (hash map, each fun kind, external pid/port/ref, bitstring,
-  refc binary) through `Table::insert`/`lookup` against the oracle's `phash2`.
+  refc binary) through `Table::insert`/`lookup` against the oracle's `phash2`. `ets_replace.rs` also
+  pins that 100 repeats of the identical `duplicate_bag` replacement stay oracle-identical (`{ok:3,…}`
+  and the same `tab2list`) with a flat `Table::memory`.
 - **Differential evidence suite** (the compatibility gate): `tests/differential.rs` runs **159 cases**
   (13 case-group files under `tests/differential/battery/` plus the shared harness `battery/mod.rs`, the
   embedded oracle program in `erl_program.rs`) identically under the system `erl` (OTP 29.1.1 / erts-17.1)
@@ -593,7 +614,7 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   survives a delete of the last-yielded (anchor) key, and a delete/insert behind the cursor does not
   shift the next chunk.
 - **Gate (this crate):** `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_ets`
-  is green — **25 test binaries, 557 passed / 0 failed** (including the 8 doctests — 5 of them
+  is green — **25 test binaries, 559 passed / 0 failed** (including the 8 doctests — 5 of them
   `compile_fail`); with the oracle required, the battery emits and compares all **159** cases
   (`[differential] oracle: … — 159 cases emitted` / `— comparing 159 cases against beam_ets`).
   Forced-oracle: `BEAM_ETS_REQUIRE_ORACLE=1 erts_rust/scripts/cargo.sh test

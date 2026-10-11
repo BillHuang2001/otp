@@ -63,7 +63,10 @@ pub mod writer;
 pub mod prelude;
 
 pub use crate::atom_cache::{AtomCache, AtomCacheWriter};
-pub use crate::decode::{decode_term, decode_term_with_local_node, Decoder};
+pub use crate::decode::{
+    decode_term, decode_term_used, decode_term_with_local_node, decode_term_with_local_node_used,
+    is_compressed_image, Decoder,
+};
 pub use crate::off_heap::OffHeapBinaries;
 pub use crate::encode::{
     encode_term, encode_term_body, encode_term_body_compressed, encode_term_compressed,

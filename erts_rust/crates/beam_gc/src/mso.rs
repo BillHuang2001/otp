@@ -37,7 +37,10 @@
 //! The list exposes slot-indexed read access alongside the push-only writes: while
 //! [`OffHeap::push`] is fire-and-forget, [`OffHeap::insert`] returns the slot an entry was
 //! stored under, and [`OffHeap::get`]/[`OffHeap::iter`] read the entries back (by slot, or
-//! in slot order), so an on-heap reference that stores a slot number can resolve it.
+//! in slot order), so an on-heap reference that stores a slot number can resolve it. Slots
+//! are **stable for the list's lifetime**: [`OffHeap::sweep`] releases dead entries *in
+//! place* — it never shifts, reorders or reuses a slot — so a `val` word a collection wrote
+//! stays resolvable across any number of sweeps.
 //!
 //! This module is safe Rust apart from two narrow `unsafe` blocks — the `NonNull` deref in
 //! [`MsoHandle`] and the `Box::from_raw` free in its `Drop` — each of which carries a
@@ -221,6 +224,16 @@ impl From<RefcBinary> for OffHeapEntry {
 /// off-heap payload is freed when the released handle held the last reference (an
 /// [`Mso`] payload at its zero refcount, a [`RefcBinary`]'s bytes at theirs).
 ///
+/// # Slot stability
+///
+/// Storage is **slot-stable**: the list is addressed by the slot index an on-heap
+/// off-heap reference stores in its `val` word. [`sweep`](OffHeap::sweep) releases a dead
+/// entry *in place* (marks its slot released) and never removes, shifts, reorders or reuses
+/// a slot, so every **surviving** entry keeps its original slot index for the list's whole
+/// lifetime — a `val` word a collection wrote stays resolvable across any number of sweeps.
+/// A released slot resolves to `None` ([`get`](OffHeap::get)) and is never handed out again:
+/// [`insert`](OffHeap::insert) always appends at a fresh index.
+///
 /// # The liveness contract
 ///
 /// *Which* on-heap reference keeps a registered off-heap object alive — the `BinRef`
@@ -231,7 +244,12 @@ impl From<RefcBinary> for OffHeapEntry {
 /// applies the caller's predicate and releases everything else. That keeps the "what is
 /// a root" policy in one place (the process) and this list a pure ownership container.
 pub struct OffHeap {
-    entries: Vec<OffHeapEntry>,
+    /// One slot per registered object, in slot order; `None` marks a slot a sweep released.
+    /// A slot is never removed, so `entries.len()` is the next fresh slot index.
+    entries: Vec<Option<OffHeapEntry>>,
+    /// The number of **live** (non-released) entries, maintained by `push`/`insert`/`sweep`
+    /// so [`len`](OffHeap::len)/[`is_empty`](OffHeap::is_empty) stay O(1).
+    live: usize,
 }
 
 impl OffHeap {
@@ -239,15 +257,19 @@ impl OffHeap {
     pub fn new() -> OffHeap {
         OffHeap {
             entries: Vec::new(),
+            live: 0,
         }
     }
 
-    /// Adds an off-heap object to the list.
+    /// Adds an off-heap object to the list, appending it at a fresh slot.
     ///
     /// Accepts anything convertible into an [`OffHeapEntry`]: a [`MsoHandle`] (e.g. the
-    /// result of [`Mso::new`]) or a [`RefcBinary`].
+    /// result of [`Mso::new`]) or a [`RefcBinary`]. The slot it lands at is stable for the
+    /// list's lifetime (see the type-level *slot stability* contract); use
+    /// [`insert`](OffHeap::insert) when that slot is needed.
     pub fn push(&mut self, entry: impl Into<OffHeapEntry>) {
-        self.entries.push(entry.into());
+        self.entries.push(Some(entry.into()));
+        self.live += 1;
     }
 
     /// Adds an off-heap object to the list and returns its slot.
@@ -255,55 +277,73 @@ impl OffHeap {
     /// The returned slot is the index the on-heap off-heap-reference container stores in
     /// its `val` word (mirroring `beam_message::OffHeapTable::push`), so the object is
     /// resolvable again with [`get`](OffHeap::get). Slots are stable for the list's
-    /// lifetime: `insert` only ever appends and never reuses or reorders an existing slot.
-    /// (A [`sweep`](OffHeap::sweep) that releases an entry *does* compact the list, shifting
-    /// the surviving entries down.)
+    /// lifetime: `insert` only ever appends, at an index no earlier entry (live or
+    /// released) occupied, so neither a later [`insert`](OffHeap::insert) nor a
+    /// [`sweep`](OffHeap::sweep) that releases other entries ever invalidates a returned slot.
     pub fn insert(&mut self, entry: impl Into<OffHeapEntry>) -> usize {
-        self.entries.push(entry.into());
+        self.entries.push(Some(entry.into()));
+        self.live += 1;
         self.entries.len() - 1
     }
 
-    /// The entry at `slot`, or `None` when the slot is out of range.
+    /// The live entry at `slot`, or `None` when the slot is out of range **or has been
+    /// released** by a [`sweep`](OffHeap::sweep).
     pub fn get(&self, slot: usize) -> Option<&OffHeapEntry> {
-        self.entries.get(slot)
+        self.entries.get(slot).and_then(Option::as_ref)
     }
 
-    /// Iterates the entries in slot order.
+    /// Iterates the **live** entries in slot order, skipping released slots.
     pub fn iter(&self) -> impl Iterator<Item = &OffHeapEntry> {
-        self.entries.iter()
+        self.entries.iter().filter_map(Option::as_ref)
     }
 
-    /// The number of off-heap objects held.
+    /// The number of **live** off-heap objects held (released slots are not counted).
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.live
     }
 
-    /// Whether the list holds no off-heap objects.
+    /// Whether the list holds no live off-heap objects (it may still have released slots).
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.live == 0
     }
 
-    /// The bookkeeping overhead of the list, in bytes: the sum over its entries of each
-    /// object's apparent size ([`OffHeapEntry::overhead_bytes`]) — an MSO's
+    /// The bookkeeping overhead of the list, in bytes: the sum over its **live** entries of
+    /// each object's apparent size ([`OffHeapEntry::overhead_bytes`]) — an MSO's
     /// Erlang-visible size or a binary's payload length. This is the off-heap payload
     /// the process is charged for, not the list's own `Vec` capacity.
     pub fn overhead_bytes(&self) -> usize {
-        self.entries.iter().map(OffHeapEntry::overhead_bytes).sum()
+        self.iter().map(OffHeapEntry::overhead_bytes).sum()
     }
 
-    /// Retains the entries for which `is_live` returns `true`, releasing the rest, and
-    /// returns how many were released.
+    /// Releases, **in place**, the entries for which `is_live` returns `false`, and returns
+    /// how many were released.
     ///
-    /// Dropping a rejected entry runs its refcount decrement, which frees the off-heap
+    /// A released entry's slot is left in the list as a released slot, so every
+    /// **surviving** entry keeps its original slot index — a `val` word that names a
+    /// survivor stays valid (the type-level *slot stability* contract). A released slot is
+    /// never reused: a later [`insert`](OffHeap::insert) appends at a fresh index, so a `val`
+    /// that names a released slot resolves to `None` ([`get`](OffHeap::get)) rather than to
+    /// an unrelated object.
+    ///
+    /// Dropping a released entry runs its refcount decrement, which frees the off-heap
     /// payload when the list held the last reference (the MSO destructor at zero; a
-    /// `RefcBinary`'s buffer at zero). The caller decides liveness — see the type-level
-    /// *liveness contract*.
+    /// `RefcBinary`'s buffer at zero). Each released entry is dropped **exactly once** — a
+    /// slot already released by an earlier sweep is left untouched and its destructor never
+    /// runs again. The caller decides liveness — see the type-level *liveness contract*.
     pub fn sweep<F: FnMut(&OffHeapEntry) -> bool>(&mut self, mut is_live: F) -> usize {
-        let before = self.entries.len();
-        // Dropping the rejected entries runs their destructors (and frees the objects whose
-        // last reference this list held).
-        self.entries.retain(|entry| is_live(entry));
-        before - self.entries.len()
+        let mut released = 0;
+        for slot in &mut self.entries {
+            // An already-released slot (`None`) is dead for good: leave it alone, and never
+            // call `is_live` for it again.
+            if slot.as_ref().is_some_and(|entry| !is_live(entry)) {
+                // Releasing in place: this drops the entry exactly once, running its refcount
+                // decrement (and freeing the object whose last reference this list held).
+                *slot = None;
+                released += 1;
+            }
+        }
+        self.live -= released;
+        released
     }
 }
 
@@ -457,8 +497,11 @@ mod tests {
         assert_eq!(off_heap.len(), 1);
         assert_eq!(off_heap.overhead_bytes(), 10);
         assert_eq!(drops.load(Ordering::SeqCst), 2);
+        let survivor = off_heap
+            .get(0)
+            .expect("the survivor is still reachable at its original slot");
         assert_eq!(
-            off_heap.entries[0]
+            survivor
                 .as_mso()
                 .expect("the survivor is an MSO entry")
                 .downcast_ref::<DropCounter>()
@@ -490,7 +533,7 @@ mod tests {
         // (and its payload) alive.
         drop(handle);
         assert_eq!(
-            off_heap.entries[0].as_mso().expect("an MSO entry").refcount(),
+            off_heap.get(0).expect("slot 0").as_mso().expect("an MSO entry").refcount(),
             1
         );
         assert_eq!(drops.load(Ordering::SeqCst), 0);
@@ -501,7 +544,7 @@ mod tests {
         two.push(shared.clone());
         two.push(shared);
         assert_eq!(
-            two.entries[0].as_mso().expect("an MSO entry").refcount(),
+            two.get(0).expect("slot 0").as_mso().expect("an MSO entry").refcount(),
             2
         );
         assert_eq!(two.sweep(|_| false), 2);
@@ -529,7 +572,9 @@ mod tests {
         assert_eq!(off_heap.overhead_bytes(), observer.len());
         assert_eq!(observer.as_bytes(), b"hello off-heap binary");
         assert_eq!(
-            off_heap.entries[0]
+            off_heap
+                .get(0)
+                .expect("the entry is still at its original slot 0")
                 .as_binary()
                 .map(RefcBinary::as_bytes),
             Some(&b"hello off-heap binary"[..])
@@ -583,8 +628,17 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 1, "the MSO payload was destroyed");
         assert_eq!(off_heap.len(), 1);
         assert_eq!(off_heap.overhead_bytes(), binary_observer.len());
-        assert!(off_heap.entries[0].as_binary().is_some());
-        assert!(off_heap.entries[0].as_mso().is_none());
+        // The MSO (slot 0) was released in place; the binary survives at its **original** slot 1
+        // — a sweep must not shift a survivor down into the released slot.
+        let survivor = off_heap
+            .get(1)
+            .expect("the binary survives at its original slot");
+        assert!(survivor.as_binary().is_some());
+        assert!(survivor.as_mso().is_none());
+        assert!(
+            off_heap.get(0).is_none(),
+            "the released MSO slot resolves to `None`, never to the shifted-in binary"
+        );
         assert_eq!(
             binary_observer.refcount(),
             2,
@@ -736,5 +790,97 @@ mod tests {
 
         // Interleaving an insert after the retaining sweep still appends: the next slot is 3.
         assert_eq!(off_heap.insert(Mso::new(counter(&drops, 3), 40)), 3);
+    }
+
+    /// **The slot-stable sweep contract**, which the previous compaction (a `Vec::retain`) broke:
+    /// releasing a *middle* entry must not shift the survivors down, because an on-heap off-heap
+    /// reference stores the slot index in its `val` word. Fails on the old compacting code — there
+    /// the survivor of slot 4 would have moved to slot 3 and slot 1 would name it.
+    #[test]
+    fn sweep_releases_in_place_and_keeps_every_surviving_slot_stable() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut off_heap = OffHeap::new();
+
+        // Five entries at slots 0..=4, each with a distinguishable size and payload value.
+        for (value, size) in [(0u32, 10usize), (1, 20), (2, 30), (3, 40), (4, 50)] {
+            assert_eq!(
+                off_heap.insert(Mso::new(counter(&drops, value), size)),
+                value as usize
+            );
+        }
+        assert_eq!(off_heap.len(), 5);
+        assert_eq!(off_heap.overhead_bytes(), 150);
+
+        // Release the **middle** entries (slots 1 and 3) and keep slots 0, 2 and 4.
+        let released = off_heap.sweep(|entry| matches!(entry.apparent_size(), 10 | 30 | 50));
+        assert_eq!(released, 2, "slots 1 and 3 were released");
+        // (e) each released entry's destructor ran exactly once.
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            2,
+            "each released entry's destructor ran exactly once"
+        );
+
+        // (a) every survivor is still reachable at its **original** slot, object intact.
+        for (slot, expected_value, expected_size) in
+            [(0usize, 0u32, 10usize), (2, 2, 30), (4, 4, 50)]
+        {
+            let entry = off_heap
+                .get(slot)
+                .unwrap_or_else(|| panic!("slot {slot} must survive at its original index"));
+            assert_eq!(entry.overhead_bytes(), expected_size, "slot {slot}");
+            assert_eq!(
+                entry
+                    .as_mso()
+                    .expect("an MSO entry")
+                    .downcast_ref::<DropCounter>()
+                    .map(|c| c.value),
+                Some(expected_value),
+                "slot {slot} still names its original object"
+            );
+        }
+
+        // (b) the released slots answer `None` — never an unrelated shifted-in survivor.
+        assert!(off_heap.get(1).is_none(), "released slot 1");
+        assert!(off_heap.get(3).is_none(), "released slot 3");
+
+        // (d) the live-only views count/iterate/sum the survivors alone, in slot order.
+        assert_eq!(off_heap.len(), 3);
+        assert!(!off_heap.is_empty());
+        let live_sizes: Vec<usize> = off_heap.iter().map(OffHeapEntry::overhead_bytes).collect();
+        assert_eq!(live_sizes, vec![10, 30, 50], "only the survivors, in slot order");
+        assert_eq!(off_heap.iter().count(), off_heap.len());
+        assert_eq!(off_heap.overhead_bytes(), 90);
+
+        // (c) a further insert appends at a fresh index and never reuses the released slots.
+        assert_eq!(off_heap.insert(Mso::new(counter(&drops, 5), 60)), 5);
+        assert!(off_heap.get(1).is_none(), "slot 1 stays released");
+        assert!(off_heap.get(3).is_none(), "slot 3 stays released");
+        let fresh = off_heap.get(5).expect("the fresh entry is at slot 5");
+        assert_eq!(
+            fresh
+                .as_mso()
+                .expect("an MSO entry")
+                .downcast_ref::<DropCounter>()
+                .map(|c| c.value),
+            Some(5)
+        );
+        assert_eq!(off_heap.len(), 4);
+        assert_eq!(off_heap.overhead_bytes(), 10 + 30 + 50 + 60);
+
+        // A second sweep leaves the already-released slots untouched (no destructor runs again):
+        // exactly one *further* release, the 30-byte slot 2.
+        assert_eq!(off_heap.sweep(|entry| entry.apparent_size() != 30), 1);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            3,
+            "each released entry was dropped exactly once, ever"
+        );
+        assert_eq!(off_heap.len(), 3);
+        assert_eq!(off_heap.overhead_bytes(), 10 + 50 + 60);
+
+        // The three live entries are dropped exactly once more when the list itself drops.
+        drop(off_heap);
+        assert_eq!(drops.load(Ordering::SeqCst), 6);
     }
 }

@@ -654,6 +654,114 @@ fn select_tuple_arity_unknown_label_is_a_typed_error() {
 }
 
 // ---------------------------------------------------------------------------
+// set_tuple_element
+// ---------------------------------------------------------------------------
+
+#[test]
+fn set_tuple_element_overwrites_in_place_and_get_tuple_element_reads_it_back() {
+    // The end-to-end destructive sequence: `put_tuple2` builds `{1, 2, 3}`, an
+    // `set_tuple_element` overwrites its element word 1 with `X(1)`, and a
+    // `get_tuple_element` on the **same** tuple reads that word back. The result can
+    // only be the value the write stored — the freshly built tuple held `2` there.
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::PutTuple2 {
+            dst: Operand::X(0),
+            elements: vec![
+                Operand::Integer(1),
+                Operand::Integer(2),
+                Operand::Integer(3),
+            ],
+        },
+        Instr::SetTupleElement {
+            element: Operand::X(1),
+            tuple: Operand::X(0),
+            offset: 1,
+        },
+        Instr::GetTupleElement {
+            source: Operand::X(0),
+            element: 1,
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let mut fixture = Fixture::new();
+    let entry = fixture.add_function("f", 2, code);
+    let module = fixture.finish();
+
+    let mut ctx = MinimalContext::new();
+    let result = run(&module, entry, &[NIL, make_small(20)], &mut ctx).unwrap();
+    assert_eq!(result, make_small(20));
+}
+
+#[test]
+fn set_tuple_element_offset_zero_is_the_first_element_word() {
+    // Offset 0 is the tuple's first **data** word (the arityval header precedes it),
+    // exactly the word `get_tuple_element` with index 0 reads.
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::PutTuple2 {
+            dst: Operand::X(0),
+            elements: vec![Operand::Integer(1), Operand::Integer(2)],
+        },
+        Instr::SetTupleElement {
+            element: Operand::X(1),
+            tuple: Operand::X(0),
+            offset: 0,
+        },
+        Instr::GetTupleElement {
+            source: Operand::X(0),
+            element: 0,
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let mut fixture = Fixture::new();
+    let entry = fixture.add_function("f", 2, code);
+    let module = fixture.finish();
+
+    let mut ctx = MinimalContext::new();
+    let result = run(&module, entry, &[NIL, make_small(42)], &mut ctx).unwrap();
+    assert_eq!(result, make_small(42));
+}
+
+#[test]
+fn a_set_element_leaves_the_other_elements_and_arity_intact() {
+    // After writing element 1, reading a **different** element (2) of the same tuple
+    // still succeeds and returns its original word — the header (arity) and the
+    // untouched words survive the in-place store.
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::PutTuple2 {
+            dst: Operand::X(0),
+            elements: vec![
+                Operand::Integer(1),
+                Operand::Integer(2),
+                Operand::Integer(3),
+            ],
+        },
+        Instr::SetTupleElement {
+            element: Operand::X(1),
+            tuple: Operand::X(0),
+            offset: 1,
+        },
+        Instr::GetTupleElement {
+            source: Operand::X(0),
+            element: 2,
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let mut fixture = Fixture::new();
+    let entry = fixture.add_function("f", 2, code);
+    let module = fixture.finish();
+
+    let mut ctx = MinimalContext::new();
+    let result = run(&module, entry, &[NIL, make_small(20)], &mut ctx).unwrap();
+    assert_eq!(result, make_small(3));
+}
+
+// ---------------------------------------------------------------------------
 // put_list
 // ---------------------------------------------------------------------------
 

@@ -170,6 +170,17 @@ pub(super) fn lower_instr(raw: &RawInstr) -> Result<Instr> {
             element: as_u32(operand(ops, 1)?)?,
             dst: op(ops, 2)?,
         }),
+        // `set_tuple_element Element Tuple Offset` — the file's operand order is
+        // `s S P` (`emu/ops.tab:245`); `beam_disasm` resolves it as
+        // `{set_tuple_element,Src,Dst,{u,Off}}` (`lib/compiler/src/beam_disasm.erl:1017`).
+        // Retained for loading OTP≤28 images (the OTP-29 compiler no longer emits it).
+        // `offset` is stored **raw**, the same compiler "Position" value
+        // [`Instr::GetTupleElement::element`] holds — never scaled by 8 here.
+        Opcode::set_tuple_element => Ok(Instr::SetTupleElement {
+            element: op(ops, 0)?,
+            tuple: op(ops, 1)?,
+            offset: as_u32(operand(ops, 2)?)?,
+        }),
         // `select_tuple_arity Tuple Fail {Arity,Label}*` — the alternatives arrive as
         // one flattened `z,1` argument list, exactly like `select_val`.
         Opcode::select_tuple_arity => Ok(Instr::SelectTupleArity {

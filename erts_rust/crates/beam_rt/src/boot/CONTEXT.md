@@ -135,16 +135,55 @@ configuration and it runs **all 22 directives to completion**, ending at the fin
   CLI's own parser (`crate::cli::parse`, not `parse_with_env`: a test must not depend on `ERL_*FLAGS`)
   over the CLI argv `beam_rt -noshell -boot bootstrap/bin/start` — and `tests/boot.rs` mirrors it
   (`boot_cli_runtime`). The **four automatic flags** (`root`/`home`/`progname`/`bindir`) are served
-  by `init:get_argument/1` but are not command-line flags, so they never appear in
-  `init:get_arguments/0` — and they are no longer a boot determinant: the real script runs to
-  `{progress,started}` under a `RuntimeConfig::default()` runtime too
+  by `init:get_argument/1` *and* prepended to `init:get_arguments/0`
+  (`../native/init.rs::get_arguments`, in the oracle's order) — and they are not a boot determinant:
+  the real script runs to `{progress,started}` under a `RuntimeConfig::default()` runtime too
   (`tests/a9_native_floor.rs::script_id_is_the_loaded_boot_scripts_real_header`).
 - **The kernel processes are ready when instruction 20 runs.** The three `{kernelProcess, …}` bursts
   drive until their directive's MFA returns, so `whereis(application_controller)` answers a live,
   registered server — the directive ran `application_controller:start/1` to its `{ok, AC}` return
   (`application_controller.erl:203-211`), i.e. the AC completed `init/2` (`:531-558`) and reached
-  `gen_server:enter_loop`. `heart` and `logger` are not registered — both legitimately (heart returns
-  `ignore`; logger never reaches registration).
+  `gen_server:enter_loop`.
+  `heart` is not registered either, legitimately: `heart:start/0` returns `ignore`.
+- **`logger` is NOT registered — the `erlang:apply/3` seam gap, still open.** Instruction 13's
+  `{kernelProcess,logger,{logger_server,start_link,[]}}` makes
+  [`start_kernel_process`](drive.rs) `spawn_process` the directive, whose `gen_server:start_link/3`
+  spawns the `logger_server` child through `proc_lib:start_link/5`; the child is entered at
+  `proc_lib:init_p_do_apply/3`, whose body is `try … apply(M,F,A) … catch … end`.
+  `erlc` compiles that `apply/3` to a **`call_ext`** to `{extfunc,erlang,apply,3}` (the `call_ext*`
+  target is a literal atom even when the applied module is a variable). The engine's `CallExt` arm
+  asks [`RuntimeContext::resolve_external_call`](../context/mod.rs) first, which answers `Ok(None)`
+  for `erlang` (it is a member of [`../native`](../native/CONTEXT.md)'s `FLOOR_MODULES`), so the call
+  falls through to the synchronous `call_import` → `call_bif` → `native::apply_dynamic` →
+  `run_export` → `run_export_blocking` route. That route builds a **nested `Machine`** and pumps the
+  scheduler while the callee is suspended — but a context that *is* a scheduler slice
+  (`RuntimeContext::for_process` ⇒ `may_pump_scheduler() == false`) must not re-enter the scheduler,
+  so `pump_once` reports `Ok(None)` and the call folds into the typed `error::blocked()` sentinel
+  (`../error.rs::unsupported_reason`).
+  The sentinel is **uncatchable in practice**: the child really is inside `proc_lib`'s `try`, but
+  `Machine::raise_bif_error` can only land an error in a live catch frame when the running module's
+  atom table holds the reason atom, and no compiler emits
+  `'unsupported_opcode: run: process blocked (no message available)'` — so the raise escapes and the
+  child dies. Its registered name dies with it, the directive's parked `proc_lib:sync_start/2`
+  (timeout `infinity`) never resumes, and `whereis(logger)` stays `undefined` while the boot still
+  reaches `{progress,started}`.
+  The oracle **does** register the name (a live `logger_server` registered as `logger`; a second
+  `logger_server:start_link/0` reports `{error,{already_started,Pid}}`).
+  **A single-level fix is not enough.** The blocking callee is reached through *two* nested `apply/3`
+  levels on this path (`proc_lib:init_p_do_apply/3` → `gen:init_it/7` → `gen_server:init_it/6`), and
+  each level is a separate nested `Machine`; `gen:register_name` runs inside the deepest one, so the
+  outer process must stay alive across the whole chain.
+  The fix belongs to **`beam_engine`**: its `call_ext*` arms must give `erlang:apply/2,3` the
+  `resolve_external_call`/`Step::Enter` treatment a literal-target `call_ext` already gets. The exact
+  change, its C ground truth and why the in-crate retries (restart, or park-and-resume) are unsound
+  are recorded **once** in the crate `CONTEXT.md` (`## Notes for Agents`, the `beam_engine` bullet);
+  this node does not repeat them.
+  Pinned by `bootscript.rs::tests::the_real_boot_leaves_logger_unregistered_pending_the_apply_seam_gap`
+  (asserting the current behaviour) and the `#[ignore]`d positive
+  `bootscript.rs::tests::the_real_boot_registers_a_live_logger_process` (the oracle's behaviour,
+  which fails while the seam is open); the same gap is pinned at the CLI by
+  `../tests/boot.rs::the_cli_boot_leaves_logger_unregistered_pending_the_apply_seam_gap` and its
+  `#[ignore]`d positive counterpart.
 - **Instruction 20's `gen_server:call` suspends and resumes.** `apply_boot_call` runs `c:erlangrc/0`
   through the engine's blocking-aware entry; the scheduler pass services the `file_server_2` mailbox
   and delivers the reply (counted into the pass's `delivered` by `service_file_requests`), and the call
@@ -170,21 +209,23 @@ valve **only** for the documented off-heap-payload capability gap, where the ori
 because it cannot be duplicated.
 
 ### Remaining gaps (owner per link)
-1. **`beam_engine`.** `Instr::Apply`/`ApplyLast` (`families/funs.rs::apply_target`) dispatch through the
-   synchronous `call_bif` instead of the `resolve_external_call`/`Step::Enter` seam, so a **scheduled**
-   process's `gen_server:call` to the native `file_server_2` service folds into `error::blocked()`
-   instead of suspending (a boot `{apply, …}` directive is unaffected — it runs in a non-slice machine
-   with a blocking-aware entry). A `func_info`-driven raise also carries an EMPTY
-   `Raise.stacktrace.frames`, so a boot-path `function_clause` is unlocalizable; and a native service
-   hosts no engine, so the `{get_until,…}` io request (`erl_scan:tokens/4`) cannot be served here.
-2. **`beam_rt` `../native.rs`** — the io-device read path completes from library code
-   (`file:read/2`, `io:scan_erl_exprs/4`, `io:parse_erl_exprs/4`); only `file:read_line/1`'s
-   `{get_line,…}` request is still the typed `unsupported` gap (the served device surface is
-   itemised in `../native/CONTEXT.md`).
-3. **`beam_rt` `../native/init.rs` — `init:get_arguments/0` lists only the command-line flags**, so it
-   omits the oracle's automatic `root`/`bindir`/`progname`/`home` (all four ARE served by
-   `init:get_argument/1`, which is what the boot chain needs).
-4. **`beam_bifs`.** Whatever the started applications still need past the above.
+1. **`beam_engine`'s `call_fun` arm + `beam_rt`'s `apply_fun`.** A **scheduled** process's `file:*` call reaches the native `file_server_2` service through `gen:call/4`'s `do_for_proc/2`, which applies a **fun**.
+   That apply is `call_fun` → `ExecutionContext::apply_fun` → `../context/mod.rs::run_label_blocking`, a **value**-returning seam that a slice context may not pump, so the closure's blocking `receive` folds into the typed `error::blocked()` instead of suspending (pinned by `../context/mod.rs::blocking_fun_apply`'s control case).
+   The `apply`/`apply_last` opcode family has no such gap: `families/funs.rs::apply_target` consults `ExecutionContext::resolve_external_call` first and enters a resolved callee **in-machine**.
+   A boot `{apply, …}` directive and the `-eval` path are unaffected — both run on a blocking-aware, pump-capable entry.
+   The boot-logger gap is the separate `call_ext`-encoded `erlang:apply/2,3` one, recorded in the crate `CONTEXT.md` (`## Notes for Agents`, `## Known Issues`) and not repeated here.
+2. **`beam_rt` `../native/` — the io-device read path completes from library code.**
+   `{get_until,Enc,_Prompt,Mod,Func,XtraArgs}` and `{get_line,Enc,_Prompt}` are both real request arms
+   (`../native/file_server.rs` dispatches each to `get_until::serve`/`get_line::serve`), so
+   `file:read/2`, `io:scan_erl_exprs/4` and `io:parse_erl_exprs/4` complete and agree with the oracle
+   (`../tests/io_scan.rs`), and `io:get_line/2`/`file:read_line/1` through the `{get_line,…}` arm
+   (the colocated `file_server/get_line/tests.rs`).
+   Residual typed gaps in that family include a request `Enc` that is neither `latin1` nor `unicode`
+   (`../native/file_server/get_line.rs`'s request-encoding check, `../native/file_server/get_until.rs`'s)
+   and — for `{get_until,…}` only — a user-supplied continuation whose own code blocks in a `receive`
+   (`../native/file_server/get_until.rs`, module header "A blocking continuation is a typed gap").
+   The served device surface and the full gap list are itemised in `../native/CONTEXT.md`.
+3. **`beam_bifs`.** Whatever the started applications still need past the above.
 
 ## Constraints
 - **No silent skip.** A preloaded `.beam` that is missing or malformed is a typed `BeamError` (a missing
@@ -203,12 +244,10 @@ because it cannot be duplicated.
   `{kernelProcess, …}` burst and an `{apply, …}`'s `Wait` arm both go through
   `drive_scheduler`, which checks the deadline between slices. An execution that suspends
   *inside* a `RuntimeContext` blocking pump instead — `RunOutcome::Wait` handled by
-  `run_export_blocking`/`run_label_blocking` (`../context/mod.rs`) — loops until the machine
-  returns or a pump reports `0`, with no wall-clock cap, so a perpetually runnable process on
-  the queue would keep that pump going. On the real `start.boot` every boot-spawned process is
-  parked in a `receive`, so the queue drains and the pump returns; the gap is a latent one for
-  a boot chain that would spawn a busy process. The cap belongs in `../context/mod.rs` (this
-  node's, but not `src/boot/**`).
+  `run_export_blocking`/`run_label_blocking` (`../context/mod.rs`) — is bounded by that pump's
+  own `BLOCKING_PUMP_DEADLINE` (checked between pump rounds, ending in a typed diagnostic
+  rather than a spin) and, earlier, by a pump that reports `0`; the nested cap is documented in
+  `../context/CONTEXT.md`.
 - `bootscript.rs` is ~1756 lines (production ~700, the rest its oracle test module) — the crate's
   documented long-file precedent; `drive.rs` is ~382 lines. `#![deny(unsafe_code)]`; no `unwrap()` on
   runtime data.
@@ -258,15 +297,17 @@ service is a `beam_process::Process` born `Runnable` and never enqueued (the `in
 precedent), so the runner never executes it and `ProcessEntry` needs no new variant;
 `Runtime::service_file_requests` drains its mailbox as an additive `scheduler_pass` step and delivers
 the replies, which is what lets `c:erlangrc/0`'s `gen_server:call` at instruction 20 complete. The
-request/reply surface, the errno mapping, the io-device and the three remaining gaps live in
+request/reply surface, the errno mapping, the io-device and the remaining gaps live in
 [`../native/CONTEXT.md`](../native/CONTEXT.md)'s `file_server.rs` subsection.
 - **Starting the real `file_server` is not a substitute.** Its `gen_server:init_it` registers, acks
   and then enters `loop`'s `receive` — a suspend the engine's non-blocking `fold_outcome` folds into
   `error::blocked()` for a **scheduled** process (owner: `beam_engine`; the seam is pinned by
   `../tests/proc_lib_start.rs`), so the child dies right after acking. A native service sidesteps that.
 - **The native service is deliberately narrow.** It serves the `file_server`/`file`/`io` requests a
-  native `std::fs` host can answer faithfully and returns the typed `unsupported` gap for the rest
-  (notably `{get_until,…}`, which needs the real `erl_scan:tokens/4`).
+  native `std::fs` host (or, for the two incremental readers, the engine) can answer faithfully and
+  returns the typed `unsupported` gap for the rest — `setopts`/`getopts`/`pread`/`pwrite`/`advise`/
+  `allocate`/…, a non-`latin1` `{get_chars,…}`/`{put_chars,…}`, and a request `Enc` that is neither
+  `latin1` nor `unicode`.
 
 ## Routing Table
 - `../boot.rs` → registry + core-atom seed + banner (module root; also `mod preloaded` + `mod bootscript` + `mod drive`)

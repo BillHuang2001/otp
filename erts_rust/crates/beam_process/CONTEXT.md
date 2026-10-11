@@ -29,8 +29,9 @@ Honors the crate-layer root-set contract: `x_reg_array[0..Live)` **plus the whol
   `garbage_collecting`, `active`, `sensitive`; per-flag get/set + `bits()/from_bits()`.
 - `Process` — the PCB, owning `pid`, `state`, `flags`, `priority`, `save_calls: u16`,
   `collector: beam_gc::Collector` (young + mature heap spaces), `relocation_exempt: bool`,
-  `off_heap: beam_message::OffHeapTable`
-  (MSO handles), `mailbox: beam_message::Queue`, `regs: Registers`, `dict: Dict`, `saved_args:
+  `off_heap: beam_message::OffHeapTable` (the process's **persistent** off-heap table — a queued
+  signal's reason objects and a host's moved-fragment objects; the send path stages through its own
+  fresh table, never this one), `mailbox: beam_message::Queue`, `regs: Registers`, `dict: Dict`, `saved_args:
   SavedArgs`, `signals: SignalQueue`, `reductions: u64`, `links: Links`, `monitors: Monitors`
   (outgoing process monitors), `monitored_by: Vec<MonitoredBy>` (incoming),
   `port_monitors: Vec<PortWatch>` (outgoing port watches), `exit_reason: Option<Eterm>`.
@@ -58,7 +59,9 @@ Honors the crate-layer root-set contract: `x_reg_array[0..Live)` **plus the whol
     fragment path. These are the only two `*_mut` pairs with a real caller need (the rest were audited);
     do not add a combined raw-pointer accessor for any pair.
   - **message delivery:** `deliver(from: Eterm, term: Eterm, src_off_heap: &OffHeapTable) ->
-    Result<DeliverOutcome>` — copies `term` into the young heap (on `AllocKind::Heap`/`Message`
+    Result<DeliverOutcome>` — copies `term` into the young heap **through a fresh per-send staging
+    `OffHeapTable`** (drained into the resulting `Message`; the process's persistent `off_heap` is never
+    touched, so a send cannot steal a queued signal's off-heap handles) (on `AllocKind::Heap`/`Message`
     exhaustion it collects and grows the nursery **on demand** to fit the refused request, then retries
     once; the retry's own failure is what the delivery returns), enqueues the `Message`, then `wake()`s;
     `deliver_simple(from, term)` — the no-off-heap form; `receive(pred) -> Option<Message>` (delegates
@@ -136,7 +139,7 @@ The `Scheduler` counterpart for SMP: N scheduler threads over one shared process
 - `ThreadProgress` — the real barrier (cheap to clone; every clone shares the generation, managed-thread registry and blocking counter): `new()`, `generation()`, `bump() -> u64`, `wait(u64)` (blocks until every **active** managed thread confirmed the generation), `safepoint() -> u64` (`bump`+`wait`), `managed_thread() -> ManagedThread`, `managed_count()`, `set_waker(Arc<dyn Fn() + Send + Sync>)`, `is_blocking()`/`block()`/`unblock()`/`blocking_count()`.
 - `ManagedThread` — the per-thread slot a scheduler registers: `progress()`, `update()` (confirm the current generation), `is_active()`/`set_active(bool)` (an inactive/parked thread is already at a safepoint and is excluded from the wait), `id()`.
 ### `signal.rs` — exit signals, reasons and signal-message builders
-- `SignalAtoms { exit, down, process, port, normal, kill, killed, noproc }` — the well-known atom indices used to build signal messages; `from_table(&mut AtomTable)` interns `'EXIT'`/`'DOWN'`/`process`/`port`/`normal`/`kill`/`killed`/`noproc`; accessors incl. `port()`, `noproc()`/`noproc_term()`, `normal_term()/kill_term()/killed_term() -> Eterm`.
+- `SignalAtoms { exit, down, process, port, normal, kill, killed, noproc, system }` — the well-known atom indices used to build signal messages; `from_table(&mut AtomTable)` interns `'EXIT'`/`'DOWN'`/`process`/`port`/`normal`/`kill`/`killed`/`noproc`/`system`; accessors incl. `port()`, `noproc()`/`noproc_term()`, `system()`/`system_term()`, `normal_term()/kill_term()/killed_term() -> Eterm`. `system` is the C's `am_system`, used as the `Message::from` immediate of a failed-by-name monitor DOWN (`erl_proc_sig_queue.c:4991`).
 - `ReasonClass { Normal, Kill, Other }` + `SignalAtoms::classify(reason) -> ReasonClass`.
 - `ExitSignal { from: ProcessId, reason: Eterm }` (`Copy`).
 - `ExitPolicy { Terminate(Eterm), Trap, Ignore }` — `Trap` = deliver `{'EXIT', From, Reason}` as a message.
@@ -356,8 +359,8 @@ The **local record** of a process's relationships with processes on other nodes;
   hanging.
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p
   beam_process` and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
-  Current total: **417 passed / 0 failed / 1 ignored** (161 in-module unit + integration across the
-  32 `tests/` files + 1 doctest; the ignored test is the documented non-yielding-runner hang failure mode
+  Current total: **427 passed / 0 failed / 1 ignored** (re-run for the live count; in-module unit +
+  integration across the 34 `tests/` files + 1 doctest; the ignored test is the documented non-yielding-runner hang failure mode
   in `preemption.rs`), warning-free. The `oracle_*` suites share **one** `erl` driver
   (`tests/common/mod.rs`), run with `-kernel logger_level none` and normalized stdout so a crashed
   probe helper's `=ERROR REPORT====` block can never make a comparison flaky (see `tests/CONTEXT.md`). Always go through `../../scripts/cargo.sh` (`$HOME` is read-only),
@@ -394,14 +397,24 @@ The rationale (why) behind the frozen API and constraints lives in **`DESIGN_DEC
   signal-vs-message ordering barrier remain follow-ups. The queue itself is unbounded (a `VecDeque`,
   matching the oracle's effectively-unbounded signal queue) with total, defensive GC gather/scatter — it
   has no overflow or panic path.
-- **`Message::from` is not a GC root, yet a named-monitor `'DOWN'` stores an on-heap term in it (un-relocated young-heap root).**
-  `Process::run_rooted_collection` gathers only each queued message's `payload` (`src/process.rs:945`) and re-enqueues every drained
-  envelope around that relocated payload (`:974`), so `from` is **never** relocated. The ordinary send path stores an internal-pid
-  immediate (relocation-free), but `ProcessTable`'s named-monitor DOWN enqueues `Message::new(term, target_term)` where `target_term`
-  is the on-heap `{Name, node}` tuple (`src/ptab.rs:1919`) — so after a collection that message's `from` is a stale young-heap pointer
-  (the copy inside `payload` is relocated, the `from` copy is not). Reachable via `erlang:monitor(process, Name)` on a named target
-  plus a later GC; not on the `format_exception` path (no monitor). `Process::exit_reason` (`:291`) is likewise not gathered, but it is
-  set only in `terminate_into` (`src/ptab.rs:1415`) immediately before the PCB is dropped, so no collection runs after it.
+- **`Message::from` is NOT a GC root — every producer must store an immediate.** `Process::run_rooted_collection`
+  gathers only each queued message's `payload` (`src/process.rs`) and re-enqueues the envelope around that relocated payload, so
+  `from`/`token` are never relocated. `Message::from` must therefore be an **immediate**, matching the C's
+  `ASSERT(is_immed(ERL_MESSAGE_FROM(msg)))` (`erl_proc_sig_queue.c:8441`), where the `{Name,node}` pair / external pid live in the
+  message **body** instead. Every in-crate producer now satisfies this: the send paths store the sender pid immediate; a
+  process-monitor `'DOWN'` stores the resolved target pid immediate (`build_and_enqueue_down`); a **failed-by-name** named monitor
+  stores the `system` atom (`deliver_named_noproc_down`, the C's `am_system`); the port builders store the port immediate; the
+  **remote** DOWN/EXIT store the **node atom** (`enqueue_remote_down_message`/`enqueue_remote_exit_message`, the C's DIST_PROC/
+  DIST_PORT rule). `tests/message_from_is_immediate.rs` pins each. Residual (host contract, not fixed here): a caller that hands
+  `Process::deliver` an on-heap `from` term gets no relocation — the general hardening (a `beam_message::Message` `from` setter +
+  gathering `from` in the root set) is owned by the sibling `beam_message`/host.
+- **`Process::exit_reason` is not gathered, but is unreachable by a collection (audited).** It is written only in
+  `terminate_into` (`src/ptab.rs`), immediately **after** `take(pid)` and before the PCB drop, and read only through
+  `ProcessTable::exit_reason` — which needs a live pid `take` has already removed — so no collection can invalidate it. Caveat:
+  a future change that reads it post-collection or re-inserts a terminated PCB would need it rooted. (Divergence from the C, which
+  keeps a dead pid's exit reason observable via `process_info`; here `exit_reason` answers `TermNotFound`.)
+- **`Message::token` has no producer in this crate** (always `NIL`) and is likewise not gathered — a future `with_token` of an
+  on-heap term would hit the same class as `from`.
 - **The `noproc` DOWN is delivered eagerly (documented deviation).** `monitor/2` on a non-live target
   materialises `{'DOWN', Ref, process, Target, noproc}` straight into the watcher's mailbox, so
   `process_info(self(), message_queue_len)` reports 1 immediately after the call where the oracle reports
@@ -523,7 +536,7 @@ The rationale (why) behind the frozen API and constraints lives in **`DESIGN_DEC
 - `src/port.rs` → `PortTable` (id alloc + ownership/link/monitor surface, the incoming half of a port monitor), `PortMonitor`, `PortClose`
 - `src/ptab.rs` → `ProcessTable` (pid alloc/lookup + name registry incl. `name_of` + the monitor hub (`monitor`/`noproc`, `demonitor`/`demonitor_flush`, `monitor_named`/`set_local_node`, `monitor_port(_term)`/`demonitor_port`, and the `*_with_tag` variants over their `tags` side table; a target's death resolves both halves — the watcher's outgoing `Monitor` is dropped) + the signal/link hub (incl. a non-live `link` signalling `noproc` from the dead target, and the shared `grow_receiver_for_signal` collect-grow-and-retry-once exhaustion policy its signal builders — `build_signal_term`/`copy_reason_onto`/`deliver_head_signal` — use) + decoupled signal servicing (`service_signals`, `service_signals_with_ports`) + termination (`terminate`, `terminate_with_ports`, the port-threaded `terminate_into` cascade — **best-effort per peer**: `pid` is reclaimed first, so a per-peer failure (a local exit/DOWN signal that cannot be queued, a remote `route` transport error) is dropped-and-logged via `beam_common::beam_error!` and the cascade continues, so the death observer and the port-monitor cleanup always run and `terminate` answers `Ok` for a live pid) + the process-death observer seam + the wake list + `is_process_alive`/`exit_reason` + the remote records + the distribution seam), `ExitEffect`
 - `src/error.rs` → `pub(crate)` error constructors incl. the typed-`unsupported` and typed-`relocation_exempt` raise constructors (no new error type)
-- `tests/*.rs` (32 files) → the integration evidence; the authoritative per-file list is in `tests/CONTEXT.md` (`lock_scope.rs` = the bounded-quantum-lock + 1-vs-4-scheduler determinism evidence; `scheduler_ports.rs` = the port-aware scheduler slice cleanup; `exhaustion.rs` = deliver collect-grow-and-retry + on-demand `ensure_capacity` + fail-fast typed exhaustion; `signal_exhaustion.rs` = the same exhaustion policy on the `{'EXIT',…}`/`{'DOWN',…}` signal builders (oversized reason ⇒ nursery grown and delivered; exempt receiver ⇒ raw refusal, no relocation); `gc_exemption.rs` = the host-controllable relocation exemption (the discriminating no-collect/no-relocate white-box evidence + the unexempt counterpart); `lifecycle_oracle.rs` = the `erl`-cross-checked lifecycle semantics (link exit propagation, `kill` under `trap_exit`, exit-reason shapes, `erlang:exit/2` reasons, the registry round trip, `demonitor` `[info]`/`[flush]`); `dict_oracle.rs`/`registry_monitors.rs`/`monitor_tag.rs`/`port_monitor_cleanup.rs` = `erl`-cross-checked semantics; `preemption.rs` = the measured fairness evidence; `capability_inventory.rs` = the typed-error inventory; `split_borrow.rs` = the two split-borrow evidence sets (`heap_and_off_heap_mut` + `Fragments::move_into`; `heap_and_mailbox_mut` + `send_fragmented`); `process_exit_observer.rs`/`port_monitor_cleanup.rs` = the death-side observer + port-monitor cleanup evidence; `terminate_best_effort.rs` = the best-effort termination cascade (a failing `DistSignalRouter` / an unreachable peer heap must not abort the death))
+- `tests/*.rs` (34 files) → the integration evidence; the authoritative per-file list is in `tests/CONTEXT.md` (`off_heap_send_isolation.rs` = the send-path staging-table isolation (a send must not drain the receiver's persistent off-heap table); `message_from_is_immediate.rs` = every signal path's `Message::from` is an immediate and survives a collection; `lock_scope.rs` = the bounded-quantum-lock + 1-vs-4-scheduler determinism evidence; `scheduler_ports.rs` = the port-aware scheduler slice cleanup; `exhaustion.rs` = deliver collect-grow-and-retry + on-demand `ensure_capacity` + fail-fast typed exhaustion; `signal_exhaustion.rs` = the same exhaustion policy on the `{'EXIT',…}`/`{'DOWN',…}` signal builders (oversized reason ⇒ nursery grown and delivered; exempt receiver ⇒ raw refusal, no relocation); `gc_exemption.rs` = the host-controllable relocation exemption (the discriminating no-collect/no-relocate white-box evidence + the unexempt counterpart); `lifecycle_oracle.rs` = the `erl`-cross-checked lifecycle semantics (link exit propagation, `kill` under `trap_exit`, exit-reason shapes, `erlang:exit/2` reasons, the registry round trip, `demonitor` `[info]`/`[flush]`); `dict_oracle.rs`/`registry_monitors.rs`/`monitor_tag.rs`/`port_monitor_cleanup.rs` = `erl`-cross-checked semantics; `preemption.rs` = the measured fairness evidence; `capability_inventory.rs` = the typed-error inventory; `split_borrow.rs` = the two split-borrow evidence sets (`heap_and_off_heap_mut` + `Fragments::move_into`; `heap_and_mailbox_mut` + `send_fragmented`); `process_exit_observer.rs`/`port_monitor_cleanup.rs` = the death-side observer + port-monitor cleanup evidence; `terminate_best_effort.rs` = the best-effort termination cascade (a failing `DistSignalRouter` / an unreachable peer heap must not abort the death))
 - `tests/CONTEXT.md` → per-file topic list, the anti-flakiness constraint, the gate command
 - `../../erts/emulator/beam/erl_process.{c,h}` → PCB, scheduler, run queues (read-only ground truth)
 - `../../erts/emulator/beam/erl_thr_progress.c` → the thread-progress barrier ground truth (read-only)

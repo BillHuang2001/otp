@@ -62,11 +62,16 @@ pub struct SignalAtoms {
     kill: Atom,
     killed: Atom,
     noproc: Atom,
+    system: Atom,
 }
 
 impl SignalAtoms {
-    /// Interns `'EXIT'`, `'DOWN'`, `process`, `port`, `normal`, `kill`, `killed` and
-    /// `noproc` in `t`.
+    /// Interns `'EXIT'`, `'DOWN'`, `process`, `port`, `normal`, `kill`, `killed`, `noproc` and
+    /// `system` in `t`.
+    ///
+    /// `system` is the `'DOWN'` **sender** (`ERL_MESSAGE_FROM`) of a monitor that failed **by
+    /// name** — an `erlang:monitor(process, Name)` whose name is not registered
+    /// (`erl_proc_sig_queue.c:4991`).
     pub fn from_table(t: &mut AtomTable) -> SignalAtoms {
         SignalAtoms {
             exit: t.intern("EXIT"),
@@ -77,9 +82,9 @@ impl SignalAtoms {
             kill: t.intern("kill"),
             killed: t.intern("killed"),
             noproc: t.intern("noproc"),
+            system: t.intern("system"),
         }
     }
-
     /// The `'EXIT'` atom.
     pub fn exit(&self) -> Atom {
         self.exit
@@ -98,11 +103,12 @@ impl SignalAtoms {
     /// The `port` atom (the tag of a `{'DOWN', …}` message about a port).
     pub fn port(&self) -> Atom {
         self.port
-    }    /// The `normal` atom.
+    }
+
+    /// The `normal` atom.
     pub fn normal(&self) -> Atom {
         self.normal
     }
-
     /// The `kill` atom.
     pub fn kill(&self) -> Atom {
         self.kill
@@ -117,6 +123,12 @@ impl SignalAtoms {
     /// dead/unknown target yields.
     pub fn noproc(&self) -> Atom {
         self.noproc
+    }
+
+    /// The `system` atom — the `'DOWN'` **sender** of a monitor that failed **by name**, i.e. an
+    /// `erlang:monitor(process, Name)` whose name was not registered.
+    pub fn system(&self) -> Atom {
+        self.system
     }
 
     /// The `normal` atom as a term.
@@ -139,6 +151,11 @@ impl SignalAtoms {
         make_atom(self.noproc)
     }
 
+    /// The `system` atom as a term — an **immediate**, so it is safe to store in a message's
+    /// `from` slot (a non-root the collector never relocates).
+    pub fn system_term(&self) -> Eterm {
+        make_atom(self.system)
+    }
     /// Classifies an exit reason against the well-known atoms.
     pub fn classify(&self, reason: Eterm) -> ReasonClass {
         if !is_atom(reason) {
@@ -373,6 +390,7 @@ mod tests {
         assert_eq!(f.table.name(f.atoms.kill()), Some("kill"));
         assert_eq!(f.table.name(f.atoms.killed()), Some("killed"));
         assert_eq!(f.table.name(f.atoms.noproc()), Some("noproc"));
+        assert_eq!(f.table.name(f.atoms.system()), Some("system"));
     }
 
     #[test]
@@ -382,6 +400,14 @@ mod tests {
         assert_ne!(f.atoms.noproc_term(), f.atoms.normal_term());
     }
 
+    #[test]
+    fn system_term_is_the_immediate_system_atom() {
+        let f = fixture();
+        assert_eq!(f.atoms.system_term(), make_atom(f.atoms.system()));
+        assert_ne!(f.atoms.system_term(), f.atoms.noproc_term());
+        // The `from` slot must be an immediate so a collection can never relocate it.
+        assert!(beam_term::prelude::is_immediate(f.atoms.system_term()));
+    }
     #[test]
     fn classify_distinguishes_normal_kill_and_other() {
         let mut f = fixture();

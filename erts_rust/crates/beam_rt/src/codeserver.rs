@@ -99,6 +99,12 @@ pub struct CodeServer {
     module_paths: HashMap<String, PathBuf>,
     /// The code path: `-pa` dirs, then `-pz` dirs, then the system `ebin` dirs.
     paths: Vec<PathBuf>,
+    /// The **boot-time default** code path: the `-pa`/`-pz` directories the runtime was
+    /// configured with plus the system `ebin` directories (everything added through
+    /// [`CodeServer::add_default_path`]). Everything a boot script's `{path, …}` directive or
+    /// a later [`CodeServer::add_path`] appends on top is deliberately *not* in it, so
+    /// [`CodeServer::reset_paths_to_defaults`] can drop those again.
+    default_paths: Vec<PathBuf>,
 }
 
 impl CodeServer {
@@ -113,6 +119,7 @@ impl CodeServer {
             modules: HashMap::new(),
             module_paths: HashMap::new(),
             paths: Vec::new(),
+            default_paths: Vec::new(),
         }
     }
 
@@ -126,6 +133,38 @@ impl CodeServer {
         }
     }
 
+    /// Appends `dir` to the code path **and** records it as part of the boot-time default.
+    ///
+    /// Unlike [`CodeServer::add_path`] — what a boot script's `{path, …}` directive or
+    /// [`Runtime::add_code_path`](crate::Runtime::add_code_path) appends on top — a directory
+    /// recorded here survives [`CodeServer::reset_paths_to_defaults`]. The two kinds of
+    /// default are the `-pa`/`-pz` directories the runtime was configured with
+    /// ([`Runtime::new`](crate::Runtime::new)) and the system `ebin` directories
+    /// ([`CodeServer::add_system_paths`]), i.e. exactly the code path a fresh boot produces.
+    pub fn add_default_path(&mut self, dir: impl Into<PathBuf>) {
+        let dir = dir.into();
+        if !self.default_paths.contains(&dir) {
+            self.default_paths.push(dir.clone());
+        }
+        self.add_path(dir);
+    }
+
+    /// Resets the code path to its **boot-time default** — the code-path half of
+    /// `init:restart/0` (`erts/preloaded/src/init.erl:937-954`).
+    ///
+    /// The default is the `-pa`/`-pz` directories the runtime was configured with plus the
+    /// system `ebin` directories ([`CodeServer::add_default_path`]); every directory added on
+    /// top of them — a boot script's `{path, …}` directive, a
+    /// [`Runtime::add_code_path`](crate::Runtime::add_code_path) — is dropped, which is what
+    /// the oracle's restart achieves by re-running `boot/3`, whose own `{path, …}` directives
+    /// re-establish the list.
+    ///
+    /// The **module cache is untouched**: this runtime does not unload code (see
+    /// [`Runtime::restart`](crate::Runtime::restart)).
+    pub fn reset_paths_to_defaults(&mut self) {
+        self.paths = self.default_paths.clone();
+    }
+
     /// Appends the **system** `ebin` directories (stdlib, kernel and erts) to the code
     /// path.
     ///
@@ -134,13 +173,16 @@ impl CodeServer {
     /// resort — from the system `erl`. A failure here is a hard error: running without a
     /// standard library is never silent.
     ///
+    /// They are *boot-time default* entries ([`CodeServer::add_default_path`]), so a later
+    /// [`CodeServer::reset_paths_to_defaults`] keeps them.
+    ///
     /// # Errors
     ///
     /// A message-carrying [`beam_common::BeamError`] naming the environment variable or the
     /// `erl` invocation that failed.
     pub fn add_system_paths(&mut self) -> Result<()> {
         for dir in system_ebins()? {
-            self.add_path(dir);
+            self.add_default_path(dir);
         }
         Ok(())
     }
@@ -777,6 +819,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resetting_the_path_drops_only_what_was_added_on_top_of_the_defaults() {
+        // The boot-time default is the configured `-pa`/`-pz` directories plus the system
+        // `ebin` directories; anything a boot script's `{path, …}` directive (or a later
+        // `add_code_path`) appends is dropped by `reset_paths_to_defaults`.
+        let mut server = CodeServer::new();
+        server.add_default_path("/pa");
+        server.add_default_path("/pz");
+        assert_eq!(
+            server.paths(),
+            &[PathBuf::from("/pa"), PathBuf::from("/pz")][..]
+        );
+
+        server.add_path("/script");
+        server.add_path("/later");
+        assert_eq!(server.paths().len(), 4);
+
+        server.reset_paths_to_defaults();
+        assert_eq!(
+            server.paths(),
+            &[PathBuf::from("/pa"), PathBuf::from("/pz")][..],
+            "only the defaults survive"
+        );
+
+        // The default list itself survives a reset, is deduplicated and keeps its order, so a
+        // second reset is a no-op and re-adding a default does not reorder it.
+        server.add_default_path("/script");
+        server.add_default_path("/pa");
+        server.reset_paths_to_defaults();
+        assert_eq!(
+            server.paths(),
+            &[
+                PathBuf::from("/pa"),
+                PathBuf::from("/pz"),
+                PathBuf::from("/script")
+            ][..]
+        );
+        server.reset_paths_to_defaults();
+        assert_eq!(server.paths().len(), 3);
+    }
+
+    #[test]
+    fn the_system_paths_are_defaults_so_a_reset_keeps_them() {
+        let Some(mut server) = system_server() else {
+            return;
+        };
+        let system = server.paths().to_vec();
+        assert!(!system.is_empty(), "the system code path resolved");
+        // A boot script's `{path, …}` directive appends on top.
+        server.add_path("/from-a-boot-script");
+        assert_eq!(server.paths().len(), system.len() + 1);
+        server.reset_paths_to_defaults();
+        assert_eq!(
+            server.paths(),
+            &system[..],
+            "the system ebin directories are boot-time defaults"
+        );
+    }
     #[test]
     fn a_missing_module_raises_undef() {
         let mut server = CodeServer::new();

@@ -44,11 +44,12 @@
 //!
 //! # Locating the OTP install (generic, no hardcoded application names)
 //!
-//! The `lib` root is resolved at test time by [`otp_lib_dir`]: `$ERTS_LIB_DIR`
-//! when set (it must be the `lib` root), otherwise
-//! `erl -noshell -eval 'io:format("~s",[code:lib_dir()])'` — OTP's own
+//! The `lib` root is resolved at test time by [`otp_lib_dir`] (shared via
+//! `tests/common/mod.rs`): `$ERTS_LIB_DIR` when set (it must be the `lib` root),
+//! otherwise `erl -noshell -eval 'io:format("~s",[code:lib_dir()])'` — OTP's own
 //! `code:lib_dir/0`. The versioned application directories are the root's direct
-//! subdirectories; the `.beam` files are collected recursively beneath each.
+//! subdirectories; the `.beam` files are collected recursively beneath each
+//! ([`lib_sweep`]).
 //!
 //! # Skip-vs-assert policy (explicit)
 //!
@@ -67,188 +68,14 @@
 //! printed.
 
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use beam_codec::term::{cons_head, cons_tail, flatmap_parts, tuple_arity, tuple_element};
 use beam_codec::{fun_arity_term, fun_function, fun_kind_term, fun_module, FunKind};
 use beam_loader::Module;
 use beam_term::prelude::{is_list, Eterm};
 
-// ---------------------------------------------------------------------------
-// Locating the installed OTP `lib` root and its `ebin` directories
-// ---------------------------------------------------------------------------
-
-/// The running Erlang's `lib` root — the directory holding the versioned
-/// application directories (`stdlib-2.0`, `kernel-11.0`, …) — or `None` when it
-/// cannot be located.
-///
-/// Resolution order:
-/// 1. `$ERTS_LIB_DIR` when set (it must be the `lib` root);
-/// 2. `erl -noshell -eval 'io:format("~s",[code:lib_dir()]),halt().'` evaluated at
-///    test time (OTP's `code:lib_dir/0`).
-///
-/// A caller that gets `None` must **skip loudly** (never fail) — see
-/// [`skip_reason`].
-fn otp_lib_dir() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("ERTS_LIB_DIR") {
-        return Some(PathBuf::from(dir));
-    }
-
-    let output = Command::new("erl")
-        .args([
-            "-noshell",
-            "-eval",
-            "io:format(\"~s\",[code:lib_dir()]),halt().",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let root = String::from_utf8(output.stdout).ok()?;
-    let root = root.trim();
-    (!root.is_empty()).then(|| PathBuf::from(root))
-}
-
-/// The `ebin` directory of the running Erlang's `app` application (`stdlib`,
-/// `kernel`, `compiler`, …), or `None` when it cannot be located.
-///
-/// Resolution order:
-/// 1. `$ERTS_<APP>_DIR` (uppercased app name; accepts either the application dir
-///    — `…/lib/stdlib-8.1` — or its `ebin` subdir);
-/// 2. `erl -noshell -eval 'io:format("~s",[code:lib_dir(<app>)]),halt().'`
-///    evaluated at test time (OTP's `code:lib_dir/1` returns the *application*
-///    dir, whose `ebin` subdirectory holds the `.beam` files).
-///
-/// A caller that gets `None` must **skip loudly** (never fail) — see
-/// [`skip_reason`].
-fn app_ebin(app: &str) -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var(format!("ERTS_{}_DIR", app.to_uppercase())) {
-        let dir = PathBuf::from(dir);
-        if has_beams(&dir) {
-            return Some(dir);
-        }
-        let ebin = dir.join("ebin");
-        return has_beams(&ebin).then_some(ebin);
-    }
-
-    let eval = format!("io:format(\"~s\",[code:lib_dir({app})]),halt().");
-    let output = Command::new("erl")
-        .args(["-noshell", "-eval", &eval])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    let app_dir = PathBuf::from(stdout.trim());
-    if has_beams(&app_dir) {
-        return Some(app_dir);
-    }
-    let ebin = app_dir.join("ebin");
-    has_beams(&ebin).then_some(ebin)
-}
-
-/// True when `dir` is a directory that contains at least one `*.beam` file.
-fn has_beams(dir: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
-    };
-    entries.filter_map(|entry| entry.ok()).any(|entry| {
-        entry
-            .path()
-            .extension()
-            .map(|extension| extension == "beam")
-            .unwrap_or(false)
-    })
-}
-
-/// The reason the test should skip (and return early), or `None` when the oracle
-/// OTP install is available. `stdlib` and `kernel` are required; a caller that
-/// gets `Some` must print it and return — never fail.
-fn skip_reason() -> Option<String> {
-    if app_ebin("stdlib").is_none() {
-        return Some(
-            "SKIP: system Erlang/stdlib not found (need `erl` on PATH or $ERTS_STDLIB_DIR) — \
-             the real-module sweep requires the installed OTP `.beam` files"
-                .to_string(),
-        );
-    }
-    if app_ebin("kernel").is_none() {
-        return Some(
-            "SKIP: system Erlang/kernel not found (need `erl` on PATH or $ERTS_KERNEL_DIR) — \
-             the real-module sweep requires the installed OTP `.beam` files"
-                .to_string(),
-        );
-    }
-    None
-}
-
-// ---------------------------------------------------------------------------
-// Discovering every `.beam` under the OTP `lib` root
-// ---------------------------------------------------------------------------
-
-/// The discovered OTP install: the versioned application directories that hold at
-/// least one `.beam`, and every `.beam` file found beneath the `lib` root.
-struct LibSweep {
-    root: PathBuf,
-    /// Number of versioned application directories that contributed at least one
-    /// `.beam` file.
-    app_count: usize,
-    /// Every `.beam` file under the root, in sorted order.
-    beams: Vec<PathBuf>,
-}
-
-/// Recursively collects every `*.beam` file beneath `dir` into `out`.
-fn collect_beams(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.filter_map(|entry| entry.ok()) {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_beams(&path, out);
-        } else if path.extension().map(|ext| ext == "beam").unwrap_or(false) {
-            out.push(path);
-        }
-    }
-}
-
-/// Discovers the installed OTP applications and every `.beam` under `root`. Each
-/// direct subdirectory of `root` is a versioned application directory; one that
-/// yields no `.beam` (e.g. `erl_interface`, which ships no `ebin`) is not counted.
-fn lib_sweep(root: &Path) -> Option<LibSweep> {
-    let mut apps: Vec<PathBuf> = std::fs::read_dir(root)
-        .ok()?
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
-        .collect();
-    apps.sort();
-
-    let mut app_count = 0usize;
-    let mut beams = Vec::new();
-    for app in &apps {
-        let mut app_beams = Vec::new();
-        collect_beams(app, &mut app_beams);
-        if !app_beams.is_empty() {
-            app_count += 1;
-            beams.append(&mut app_beams);
-        }
-    }
-    beams.sort();
-    Some(LibSweep {
-        root: root.to_path_buf(),
-        app_count,
-        beams,
-    })
-}
-
-/// A short, stable label for reporting: `path` relative to `root` when possible.
-fn rel_label(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root).unwrap_or(path).display().to_string()
-}
+mod common;
+use common::{app_ebin, lib_sweep, otp_lib_dir, rel_label, skip_reason};
 
 // ---------------------------------------------------------------------------
 // The sweep
@@ -260,7 +87,7 @@ fn rel_label(root: &Path, path: &Path) -> String {
 /// loading is a regression.
 #[test]
 fn loads_every_installed_otp_beam() {
-    if let Some(reason) = skip_reason() {
+    if let Some(reason) = skip_reason("the real-module sweep") {
         eprintln!("{reason}");
         return;
     }

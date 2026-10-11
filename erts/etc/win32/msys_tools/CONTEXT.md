@@ -10,7 +10,7 @@ MSYS2 provides no `cygpath`-like helper that is good enough here, so these scrip
 translation themselves with `cmd //C echo` + `sed`.
 
 There are THREE near-duplicate shim trees under `erts/etc/win32/`:
-- `../cygwin_tools/` — Cygwin host (uses `cygpath`, has a `mingw/` variant, extra cygwin-native `vc/cc_wrap.c` + `vc/ld_wrap.c`)
+- `../cygwin_tools/` — Cygwin host (uses `cygpath`, has a `mingw/` variant)
 - `../wsl_tools/` — WSL host (uses `wslpath`, has `SetupWSLcross.bat`)
 - this one — MSYS2 host (uses `cmd //C`; has `msys2win_path.sh`/`win2msys_path.sh`; only a `vc/` variant)
 **A change here almost always must be mirrored into the other two trees**, and often also into
@@ -72,10 +72,10 @@ There are THREE near-duplicate shim trees under `erts/etc/win32/`:
   and a static config cache, so configure "builds with a cc" that happens to be a script wrapping `cl.exe`.
   `cc.sh`'s own header admits it is "made to work for Erlang builds and to make configure happy".
 - **Three near-identical copies rather than one env-detecting script**: the path-conversion primitive
-  differs per host (Cygwin `cygpath` + native `cc_wrap.c`/`ld_wrap.c`; WSL `wslpath`/`SetupWSLcross.bat`;
+  differs per host (Cygwin `cygpath`; WSL `wslpath`/`SetupWSLcross.bat`;
   MSYS2 `cmd //C`), and each environment ships a different `PATH` layout / compiler setup. The copies have
   already drifted (this tree is the only one with `msys2win_path.sh`/`win2msys_path.sh`; Cygwin is the only
-  one with `mingw/` and the C wrappers; WSL is the only one with `SetupWSLcross.bat`). This duplication is
+  one with `mingw/`; WSL is the only one with `SetupWSLcross.bat`). This duplication is
   the observed mechanism, not a single abstraction with runtime detection.
 - **MSYS2 path synthesis via `cmd //c echo`**: unlike Cygwin there is no reliable `cygpath`, so
   `msys2win_path.sh`/`win2msys_path.sh` build the conversion from `cmd` output and `sed`, including the

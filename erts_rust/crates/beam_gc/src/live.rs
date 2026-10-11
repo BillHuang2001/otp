@@ -528,4 +528,344 @@ mod tests {
             "the promotion occupies exactly the counted lines"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Mature-generation exactness (`live_full`) and the off-heap corpus
+    // -----------------------------------------------------------------------
+    //
+    // The tests above pin `live` (the copying fullsweep's counter). The ones below pin
+    // `live_full` — the counter a [`GenImmixCollector`] fullsweep sizes itself from — against
+    // a real collection through **both** of its mature paths (an in-place reclaim and a
+    // relocating resize), and pin that an **off-heap** payload is never a heap word: a refc
+    // binary is its 8-word on-heap pair whatever the payload's size.
+
+    use beam_alloc::RefcBinary;
+    use beam_term::prelude::{
+        fun_words, is_refc_binary, map_words_capacity, refc_bytes, refc_size, size_object,
+        write_fun_local, write_map, write_refc_binary, AtomTable, FunKind, ERL_REFC_BITS_SIZE,
+    };
+
+    use crate::immix_collector::GenImmixCollector;
+    use crate::policy::HeapPolicy;
+
+    /// A mark-region collector with the requested young/mature capacities (both rounded up to
+    /// whole Immix blocks) and the default policy everywhere else.
+    fn immix(young: usize, mature: usize) -> GenImmixCollector {
+        let policy = HeapPolicy {
+            initial_young_words: young,
+            initial_mature_words: mature,
+            ..HeapPolicy::default()
+        };
+        GenImmixCollector::from_policy(policy).expect("a mark-region collector")
+    }
+
+    /// Writes the frozen 8-word `[BinRef][ErlSubBits]` off-heap handle for `payload` at the top
+    /// of `c`'s nursery and returns its root (the `ErlSubBits`).
+    fn refc_handle(c: &mut GenImmixCollector, payload: &RefcBinary) -> Eterm {
+        // SAFETY: exactly `ERL_REFC_BITS_SIZE` (8) exclusively-owned words are reserved;
+        // `payload.data_ptr()` is a live, word-aligned pointer to `payload.len() * 8` bits of
+        // off-heap storage the caller keeps alive for the whole test, and `null` is the (empty)
+        // off-heap chain link.
+        unsafe {
+            let hp = c
+                .young_mut()
+                .heap_mut()
+                .alloc_words(ERL_REFC_BITS_SIZE)
+                .expect("8 words for the pair");
+            write_refc_binary(
+                hp,
+                payload.data_ptr() as *mut Eterm,
+                core::ptr::null_mut(),
+                payload.data_ptr(),
+                0,
+                payload.len() * 8,
+            )
+        }
+    }
+
+    /// Runs the fullsweep and asserts the counter sized it **exactly**: the words the promotion
+    /// copied equal [`Live::words`] and the lines it occupies equal [`Live::lines`]. The caller
+    /// must have built the corpus in the nursery of a collector whose mature generation is
+    /// still empty, so the whole live set is what the fullsweep copies.
+    fn assert_major_matches(c: &mut GenImmixCollector, counted: Live, roots: &mut [Eterm]) {
+        assert_eq!(
+            c.mature().used_lines(),
+            0,
+            "the corpus is built in the nursery: the mature generation must start empty"
+        );
+        let stats = c.collect_major(roots).expect("a fullsweep");
+        assert_eq!(
+            counted.words, stats.words_copied,
+            "the promotion must copy exactly the counted words"
+        );
+        assert_eq!(
+            counted.lines,
+            c.mature().used_lines(),
+            "the promotion must occupy exactly the counted lines"
+        );
+    }
+
+    /// One-line (3-word) and multi-line (17-word) objects: the word count is the frozen-layout
+    /// footprint and the line count the per-object [`lines_for`] sum — and a destination sized
+    /// from the word count alone would be **short** of the lines the copy needs, so the `lines`
+    /// field is load-bearing.
+    #[test]
+    fn live_full_sizes_one_line_and_multi_line_objects_exactly() {
+        let mut c = immix(4096, 512); // 2 whole blocks = 32 lines
+        let mut roots = Vec::new();
+        for i in 0..12i64 {
+            roots.push(
+                c.young_mut()
+                    .heap_mut()
+                    .tuple(&[make_small(i), make_small(2 * i)])
+                    .expect("a 3-word tuple"),
+            );
+        }
+        for i in 0..4i64 {
+            roots.push(
+                c.young_mut()
+                    .heap_mut()
+                    .tuple(&[make_small(i); 16])
+                    .expect("a 17-word tuple"),
+            );
+        }
+
+        let counted = live_full(c.young(), c.mature(), &roots);
+        assert_eq!(counted.words, 12 * 3 + 4 * 17, "twelve 3-word and four 17-word tuples");
+        assert_eq!(counted.lines, 12 + 4 * 2, "one line each, two for the 17-word tuples");
+        assert_eq!(
+            counted.words,
+            roots.iter().map(|&t| size_object(t)).sum::<usize>(),
+            "the counter must equal the frozen-layout footprint"
+        );
+        // `.lines` is not merely `lines_for(words)`: 104 words round to 7 lines, but the 16
+        // objects need 20 (line-granular allocation charges one line per object), so a region
+        // sized from `.words` alone would be short by 13 lines.
+        assert_eq!(lines_for(counted.words), 7);
+        assert!(
+            lines_for(counted.words) < counted.lines,
+            "sizing from the word count alone ({} -> {} lines) is short of the {} the copy needs",
+            counted.words,
+            lines_for(counted.words),
+            counted.lines
+        );
+
+        assert_major_matches(&mut c, counted, &mut roots);
+    }
+
+    /// A **shared subterm** and a **two-cell cycle** are counted once each, and the fullsweep
+    /// copies exactly that (the bitset dedup matches the copier's in-place markers).
+    #[test]
+    fn live_full_counts_a_shared_subterm_and_a_cycle_once() {
+        let mut c = immix(4096, 256); // one block = 16 lines
+        let shared = c
+            .young_mut()
+            .heap_mut()
+            .tuple(&[make_small(1), make_small(2)])
+            .expect("shared");
+        let left = c
+            .young_mut()
+            .heap_mut()
+            .tuple(&[shared, make_small(3)])
+            .expect("left");
+        let right = c
+            .young_mut()
+            .heap_mut()
+            .tuple(&[shared, make_small(4)])
+            .expect("right");
+        let a = c.young_mut().heap_mut().cons(make_small(5), NIL).expect("cell a");
+        let b = c.young_mut().heap_mut().cons(make_small(6), a).expect("cell b");
+        // Close the cycle with a raw write (no allocator API makes a cycle).
+        // SAFETY: `a` names a live 2-word cons cell this test allocated in the nursery, and
+        // word 1 is its cdr slot; the write stays inside the cell.
+        unsafe {
+            *ptr_val(a).add(1) = b;
+        }
+
+        let mut roots = vec![left, right, a, shared, b];
+        let counted = live_full(c.young(), c.mature(), &roots);
+        assert_eq!(
+            counted.words,
+            3 + 3 + 3 + 2 + 2,
+            "shared 3, left 3, right 3 and the two cells"
+        );
+        assert_eq!(counted.lines, 5, "one line per object");
+
+        assert_major_matches(&mut c, counted, &mut roots);
+    }
+
+    /// A fullsweep whose policy target differs from the current capacity **relocates** the whole
+    /// live set into a fresh region; the counter sizes that copy exactly too.
+    #[test]
+    fn live_full_matches_a_relocating_immix_major() {
+        // A mature generation far larger than the live set: `mature_after_fullsweep` shrinks it,
+        // so the fullsweep takes the relocating path.
+        let mut c = immix(4096, 4096);
+        let mut roots = Vec::new();
+        for i in 0..12i64 {
+            roots.push(
+                c.young_mut()
+                    .heap_mut()
+                    .tuple(&[make_small(i), make_small(2 * i)])
+                    .expect("a 3-word tuple"),
+            );
+        }
+        for i in 0..4i64 {
+            roots.push(
+                c.young_mut()
+                    .heap_mut()
+                    .tuple(&[make_small(i); 16])
+                    .expect("a 17-word tuple"),
+            );
+        }
+
+        let counted = live_full(c.young(), c.mature(), &roots);
+        assert_eq!((counted.words, counted.lines), (104, 20));
+
+        assert_eq!(c.mature().used_lines(), 0);
+        let before = c.mature().capacity_words();
+        let stats = c.collect_major(&mut roots).expect("a relocating fullsweep");
+        assert_ne!(
+            c.mature().capacity_words(),
+            before,
+            "the policy must have resized (relocated) the mature region"
+        );
+        assert_eq!(
+            counted.words, stats.words_copied,
+            "the relocation must copy exactly the counted words"
+        );
+        assert_eq!(
+            counted.lines,
+            c.mature().used_lines(),
+            "the relocation must occupy exactly the counted lines"
+        );
+    }
+
+    /// A `>32`-key HAMT map (head/internal/collision nodes) plus two funs: the counter equals the
+    /// frozen-layout footprint and sizes the fullsweep exactly.
+    #[test]
+    fn live_full_counts_a_hamt_map_and_funs_exactly() {
+        let mut c = immix(1 << 16, 1 << 15);
+        let atoms = AtomTable::new();
+
+        let n = 500usize;
+        let input: Vec<(Eterm, Eterm)> = (0..n as i64)
+            .map(|i| (make_small(i), make_small(3 * i)))
+            .collect();
+        // SAFETY: `map_words_capacity(n)` exclusively-owned, writable words are reserved and
+        // `write_map` writes a contiguous, well-formed prefix of them.
+        let map = unsafe {
+            let hp = c
+                .young_mut()
+                .heap_mut()
+                .alloc_words(map_words_capacity(n))
+                .expect("the map reservation");
+            write_map(hp, &input, &atoms).expect("a 500-key HAMT map")
+        };
+        // SAFETY: `fun_words(Local, 2) == 5` exclusively-owned words are reserved and the two
+        // free variables are immediates, so the whole block is written before it escapes.
+        let fun = unsafe {
+            let hp = c
+                .young_mut()
+                .heap_mut()
+                .alloc_words(fun_words(FunKind::Local, 2))
+                .expect("the fun reservation");
+            write_fun_local(hp, 2, 0x1234_5678_9ABC, 7, &[make_small(1), make_small(2)])
+                .expect("a local fun")
+        };
+        assert_eq!(size_object(fun), fun_words(FunKind::Local, 2));
+
+        let mut roots = vec![map, fun];
+        let counted = live_full(c.young(), c.mature(), &roots);
+        assert_eq!(
+            counted.words,
+            size_object(map) + size_object(fun),
+            "the counter must equal the frozen-layout footprint of the HAMT map plus the fun"
+        );
+
+        assert_major_matches(&mut c, counted, &mut roots);
+    }
+
+    /// An **off-heap-heavy** graph: the counter counts the 8-word on-heap handle of a refc binary,
+    /// never the off-heap payload — so it equals the frozen on-heap footprint however large the
+    /// payload is, and sizes the fullsweep exactly.
+    #[test]
+    fn live_full_counts_only_the_on_heap_half_of_a_refc_binary() {
+        let payloads: Vec<RefcBinary> = (0..6)
+            .map(|i| RefcBinary::new(&vec![i as u8; 64 * 1024]).expect("an off-heap payload"))
+            .collect();
+
+        let mut c = immix(4096, 256);
+        let mut roots = Vec::new();
+        for payload in &payloads {
+            roots.push(refc_handle(&mut c, payload));
+        }
+        roots.push(
+            c.young_mut()
+                .heap_mut()
+                .tuple(&[make_small(0), make_small(7)])
+                .expect("a holder tuple"),
+        );
+
+        let counted = live_full(c.young(), c.mature(), &roots);
+        assert_eq!(counted.words, 6 * 8 + 3, "six 8-word handles plus a 3-word tuple");
+        assert_eq!(counted.lines, 6 * 2 + 1, "two lines per pair, one for the holder");
+
+        assert_major_matches(&mut c, counted, &mut roots);
+
+        // 6 * 64 KiB of off-heap payload contributed exactly zero heap words, and the payload is
+        // byte-identical through the move.
+        for (i, root) in roots.iter().take(6).enumerate() {
+            // SAFETY: `*root` is the live, promoted `ErlSubBits` of pair `i`, whose off-heap
+            // payload `payloads[i]` is alive for the whole test.
+            unsafe {
+                assert!(is_refc_binary(*root), "pair {i}");
+                assert_eq!(refc_size(*root), payloads[i].len() * 8, "pair {i}: the window");
+                assert_eq!(
+                    refc_bytes(*root),
+                    payloads[i].as_bytes(),
+                    "pair {i}: the off-heap bytes are untouched"
+                );
+            }
+        }
+    }
+
+    /// The copying counter ([`live`]) leaves an off-heap payload out as well: a refc binary is
+    /// exactly its 8-word on-heap pair, whatever the payload's size.
+    #[test]
+    fn the_counter_ignores_the_off_heap_payload() {
+        for len in [1usize, 4096, 64 * 1024] {
+            let payload = RefcBinary::new(&vec![0xABu8; len]).expect("a payload");
+            let mut space = HeapSpace::new(64).expect("nursery");
+            // SAFETY: exactly `ERL_REFC_BITS_SIZE` (8) exclusively-owned words are reserved;
+            // `payload.data_ptr()` is a live off-heap pointer kept alive for this iteration, and
+            // `null` is the empty chain link.
+            let handle = unsafe {
+                let hp = space
+                    .heap_mut()
+                    .alloc_words(ERL_REFC_BITS_SIZE)
+                    .expect("8 words");
+                write_refc_binary(
+                    hp,
+                    payload.data_ptr() as *mut Eterm,
+                    core::ptr::null_mut(),
+                    payload.data_ptr(),
+                    0,
+                    len * 8,
+                )
+            };
+
+            let mut roots = [handle];
+            let mut from = FromSet::new();
+            from.add(&space);
+            let counted = live(&from, &roots);
+            assert_eq!(counted.words, 8, "len = {len}: only the on-heap pair is counted");
+            assert_eq!(counted.lines, 2, "len = {len}: one line per pair object");
+
+            let mut to = HeapSpace::new(8).expect("to-space");
+            let stats = Copier::new(&from, &mut to).run(&mut roots).expect("copy");
+            assert_eq!(stats.words_copied, counted.words, "len = {len}: the copier agrees");
+            assert_eq!(stats.objects_copied, 2, "len = {len}: the SubBits and its BinRef");
+        }
+    }
 }

@@ -28,9 +28,11 @@
 //! The crate `CONTEXT.md` ("Known Issues") claims that residual set is limited to the
 //! obsolete/transform-only `genop.tab` entries the standard compiler **never emits**
 //! (e.g. `is_constant/2`, `make_fun2/1`). This file *proves* that claim against the
-//! real thing: it walks every `.beam` of the installed OTP
-//! (`stdlib`/`kernel`/`compiler` `ebin` directories — the same sweep as
-//! `tests/real_modules.rs`) and collects the exact set of opcodes that arrive as
+//! real thing: it walks the **whole installed OTP `lib` root** — every versioned
+//! application directory and every `*.beam` found under it, recursively — the exact
+//! same scope and generic, `code:lib_dir()`-based discovery as
+//! `tests/real_modules.rs` (both go through the shared `tests/common/mod.rs`
+//! helper [`all_otp_beams`]), and collects the exact set of opcodes that arrive as
 //! `Instr::Generic`.
 //!
 //! [`compiler_emitted_opcodes_are_all_modelled`] is the generalisation of
@@ -55,9 +57,10 @@
 //!
 //! # Skip-vs-assert policy (explicit)
 //!
-//! A missing OTP install (no `erl`, or the `stdlib`/`kernel` `ebin` directories cannot
-//! be located) **skips LOUDLY** with a `SKIP:` line and returns — it never fails in
-//! that case, matching `tests/real_modules.rs`. It never silently passes without OTP.
+//! A missing OTP install (no `erl`, the `stdlib`/`kernel` `ebin` directories cannot be
+//! located, or the `lib` root is unreadable) **skips LOUDLY** with a `SKIP:` line and
+//! returns — it never fails in that case, matching `tests/real_modules.rs`. It never
+//! silently passes without OTP.
 //!
 //! # Running
 //!
@@ -69,10 +72,11 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use beam_loader::{Instr, Module, Opcode};
+
+mod common;
+use common::{all_otp_beams, skip_reason};
 
 /// The **pinned residual `Instr::Generic` set** — the opcodes the installed OTP
 /// compiler actually emits that `beam_loader` still leaves unmodelled, by
@@ -84,103 +88,6 @@ use beam_loader::{Instr, Module, Opcode};
 /// the sweep observes any opcode *outside* this list, or if a listed opcode stops
 /// appearing (the pin is then stale and must be tightened).
 const DOCUMENTED_GENERIC: &[&str] = &[];
-
-// ---------------------------------------------------------------------------
-// Locating the installed OTP `ebin` directories
-// ---------------------------------------------------------------------------
-
-/// The `ebin` directory of the running Erlang's `app` application (`stdlib`,
-/// `kernel`, `compiler`, …), or `None` when it cannot be located.
-///
-/// Mirrors `tests/real_modules.rs`: `$ERTS_<APP>_DIR` (the application dir or its
-/// `ebin` subdir), then `code:lib_dir/1` evaluated at test time.
-fn app_ebin(app: &str) -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var(format!("ERTS_{}_DIR", app.to_uppercase())) {
-        let dir = PathBuf::from(dir);
-        if has_beams(&dir) {
-            return Some(dir);
-        }
-        let ebin = dir.join("ebin");
-        return has_beams(&ebin).then_some(ebin);
-    }
-
-    let eval = format!("io:format(\"~s\",[code:lib_dir({app})]),halt().");
-    let output = Command::new("erl")
-        .args(["-noshell", "-eval", &eval])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    let app_dir = PathBuf::from(stdout.trim());
-    if has_beams(&app_dir) {
-        return Some(app_dir);
-    }
-    let ebin = app_dir.join("ebin");
-    has_beams(&ebin).then_some(ebin)
-}
-
-/// True when `dir` is a directory that contains at least one `*.beam` file.
-fn has_beams(dir: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
-    };
-    entries.filter_map(|entry| entry.ok()).any(|entry| {
-        entry
-            .path()
-            .extension()
-            .map(|extension| extension == "beam")
-            .unwrap_or(false)
-    })
-}
-
-/// Every `*.beam` file directly inside `dir`, name-sorted for a deterministic order.
-fn beam_files(dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut modules: Vec<PathBuf> = entries
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().map(|ext| ext == "beam").unwrap_or(false))
-        .collect();
-    modules.sort();
-    modules
-}
-
-/// The reason the test should skip (and return early), or `None` when the oracle OTP
-/// install is available. `stdlib` and `kernel` are required; a caller that gets `Some`
-/// must print it and return — never fail.
-fn skip_reason() -> Option<String> {
-    if app_ebin("stdlib").is_none() {
-        return Some(
-            "SKIP: system Erlang/stdlib not found (need `erl` on PATH or $ERTS_STDLIB_DIR) — \
-             the residual-generic census requires the installed OTP `.beam` files"
-                .to_string(),
-        );
-    }
-    if app_ebin("kernel").is_none() {
-        return Some(
-            "SKIP: system Erlang/kernel not found (need `erl` on PATH or $ERTS_KERNEL_DIR) — \
-             the residual-generic census requires the installed OTP `.beam` files"
-                .to_string(),
-        );
-    }
-    None
-}
-
-/// The installed-OTP `(app, ebin)` pairs to sweep: `stdlib`/`kernel` are required;
-/// `compiler` is swept too when present (extra evidence, never a failure).
-fn sweep_dirs() -> Vec<(&'static str, PathBuf)> {
-    let mut dirs = Vec::new();
-    for app in ["stdlib", "kernel", "compiler"] {
-        if let Some(dir) = app_ebin(app) {
-            dirs.push((app, dir));
-        }
-    }
-    dirs
-}
 
 // ---------------------------------------------------------------------------
 // The census
@@ -259,14 +166,15 @@ fn render(observed: &BTreeMap<u8, Site>) -> String {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// The residual-`Instr::Generic` census across the installed OTP: **no opcode the
-/// installed compiler emits may be left unmodelled beyond [`DOCUMENTED_GENERIC`]**.
+/// The residual-`Instr::Generic` census across the whole installed OTP: **no opcode
+/// the installed compiler emits may be left unmodelled beyond [`DOCUMENTED_GENERIC`]**.
 ///
-/// The sweep loads every `.beam` of `stdlib`/`kernel`/`compiler` through the public
-/// pipeline ([`beam_loader::load_file`]) — the same breadth evidence as
-/// `tests/real_modules.rs` — and collects the exact opcode set that arrives as
-/// [`Instr::Generic`]. The census is printed in full, so a non-empty result is
-/// immediately actionable.
+/// The sweep loads every `.beam` of the whole installed OTP `lib` root — every
+/// versioned application (all 34 apps, ≈1366 modules) — through the public pipeline
+/// ([`beam_loader::load_file`]), using the same generic discovery as
+/// `tests/real_modules.rs` (shared [`all_otp_beams`]), and collects the exact opcode
+/// set that arrives as [`Instr::Generic`]. The census is printed in full, so a
+/// non-empty result is immediately actionable.
 ///
 /// It fails when:
 /// * an observed opcode is **not** in [`DOCUMENTED_GENERIC`] — a new gap the loader
@@ -276,37 +184,36 @@ fn render(observed: &BTreeMap<u8, Site>) -> String {
 /// A missing OTP install skips loudly (see the module docs).
 #[test]
 fn compiler_emitted_opcodes_are_all_modelled() {
-    if let Some(reason) = skip_reason() {
+    if let Some(reason) = skip_reason("the residual-generic census") {
         eprintln!("{reason}");
         return;
     }
 
-    let dirs = sweep_dirs();
-    assert!(
-        !dirs.is_empty(),
-        "the residual-generic census found no OTP `ebin` directories to sweep"
-    );
+    let Some(sweep) = all_otp_beams() else {
+        eprintln!(
+            "SKIP: could not resolve/read the OTP `lib` root (need `erl` on PATH or $ERTS_LIB_DIR) \
+             — the residual-generic census requires the installed OTP `.beam` files"
+        );
+        return;
+    };
 
     let mut observed: BTreeMap<u8, Site> = BTreeMap::new();
     let mut module_count = 0usize;
     let mut instruction_count = 0usize;
-    for (app, dir) in &dirs {
-        for path in beam_files(dir) {
-            let module_name = path
-                .file_stem()
-                .map(|stem| stem.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string());
-            let module = beam_loader::load_file(&path).unwrap_or_else(|error| {
-                panic!("{} ({app}) must load: {error:?}", path.display())
-            });
-            instruction_count += module
-                .functions
-                .iter()
-                .map(|function| function.code.len())
-                .sum::<usize>();
-            census(&module, &module_name, &mut observed);
-            module_count += 1;
-        }
+    for path in &sweep.beams {
+        let module_name = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let module = beam_loader::load_file(path)
+            .unwrap_or_else(|error| panic!("{} must load: {error:?}", path.display()));
+        instruction_count += module
+            .functions
+            .iter()
+            .map(|function| function.code.len())
+            .sum::<usize>();
+        census(&module, &module_name, &mut observed);
+        module_count += 1;
     }
 
     let names = observed_names(&observed);
@@ -319,10 +226,12 @@ fn compiler_emitted_opcodes_are_all_modelled() {
     print!("CENSUS DETAIL (opcode order):\n{}", render(&observed));
 
     // Non-vacuity: the sweep must actually be broad and non-empty, or an empty census
-    // would prove nothing about "a broken walk" vs "no gaps".
+    // would prove nothing about "a broken walk" vs "no gaps". The floor is well below
+    // the real count (≈1366 modules across ≈34 apps) so an OTP point release
+    // adding/removing a few does not break it, but a broken walk does.
     assert!(
-        module_count >= 150,
-        "the census swept only {module_count} module(s) — expected stdlib+kernel (≈200)"
+        module_count >= 1000,
+        "the census swept only {module_count} module(s) — expected the full OTP `lib` root (≈1366)"
     );
     assert!(
         instruction_count > 0,

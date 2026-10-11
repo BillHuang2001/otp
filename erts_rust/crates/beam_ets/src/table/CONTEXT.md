@@ -12,6 +12,10 @@ API and its honest limits.
 ## API Surface (one file = one concern)
 - `mod.rs` — `Table` (constructors incl. explicit-interior variants, write ops, `give_away`/`setopts`,
   `info`, `select_all`, `check_read`/`check_write`), `TableId`, `OwnerId`; `NEXT_TABLE_ID`.
+  The `pub(crate)` `replace_key(key, &[object])` is the storage-faithful key rebuild behind a
+  `duplicate_bag` `select_replace/2`: it validates and deep-copies the whole new list **before**
+  removing the key's old objects, so a rebuild reclaims what it replaces instead of checking it out
+  (`take`'s semantics).
 - `read.rs` — `Table` reads/navigation: `lookup`/`member`/`lookup_element(+_or/_all/_all_or)`,
   `first`/`last`/`next`/`prev`, `take`, `size`/`is_empty`/`tab2list`/`memory`.
 - `rename.rs` — `Table::rename` + `RenameOutcome` (checked name write; registry rekey is the host's).
@@ -81,7 +85,7 @@ advisory only (throughput, never results) — see the crate `CONTEXT.md`.
   `Arc::try_unwrap`-non-unique ⇒ `Ok(None)` opt-out.
 
 ## Routing Table
-- `mod.rs` → `Table` core + write ops + access checks + `select_all`; `TableId`/`OwnerId`
+- `mod.rs` → `Table` core + write ops (`replace_key` included) + access checks + `select_all`; `TableId`/`OwnerId`
 - `read.rs` → `Table` reads, navigation, `take`
 - `rename.rs` → `Table::rename` (`ets:rename/2`)
 - `shared.rs` → `SharedTable` (the lock handle)

@@ -211,6 +211,57 @@ impl RuntimeContext<'_> {
         self.module_pair(&name)
     }
 
+    /// `code:load_file(Module)`: load `Module` from its `.beam` on the code path.
+    ///
+    /// The oracle's `code_server` order, one clause per outcome:
+    ///
+    /// 1. A **sticky** module (preloaded, or resolved under a [`STICKY_APPS`] directory) is
+    ///    refused with `{error, sticky_directory}` — unprivileged code may not (re)load it.
+    /// 2. A module that is nowhere on the code path is `{error, nofile}`
+    ///    ([`Self::no_file`], the empty half of the oracle's `load_file` pattern).
+    /// 3. Otherwise the `.beam` is loaded; success is `{module, Module}`
+    ///    ([`Self::module_pair`]) and an unloadable image is the oracle's `{error, badfile}`.
+    ///
+    /// Oracle-verified (OTP 29/erts-17.1, this host): `code:load_file(lists)` /
+    /// `code:load_file(erlang)` / `code:load_file(kernel)` ⇒ `{error,sticky_directory}`
+    /// (the oracle additionally *logs* a `Can't load module '…' that resides in sticky dir`
+    /// report on its default logger handler — not modelled here, and invisible to a caller's
+    /// return value), `code:load_file(no_such_mod_xyz)` ⇒ `{error,nofile}`, a
+    /// found-but-corrupt `.beam` ⇒ `{error,badfile}`, and a non-sticky module whose `.beam` is
+    /// findable ⇒ `{module, M}` — twice, when called twice (idempotent, answered from the code
+    /// server's cache).
+    ///
+    /// A **non-sticky** system module is only reachable when its application directory is on
+    /// the code path: this runtime resolves the system path to the `stdlib`/`kernel`/`erts`
+    /// `ebin`s only, so `code:load_file(mnesia)` — `{module,mnesia}` on the oracle, whose code
+    /// path holds every application — is the honest `{error,nofile}` here unless a `-pa` entry
+    /// supplies it (the same reason the differential corpus exercises it through a `-pa`
+    /// directory).
+    ///
+    /// A non-atom argument is `badarg` here, where the oracle raises `{function_clause,…}`
+    /// for `code:load_file/1` specifically; that is this floor's documented convention for
+    /// every `code:*` entry (see [`Self::code_is_loaded`], [`Self::code_is_sticky_1`]).
+    ///
+    /// The loader's own error (a malformed container, an unreadable file) is deliberately
+    /// folded into the oracle's single `badfile` reason, so the error half of the return value
+    /// is exactly the oracle's three-reason vocabulary `sticky_directory`/`nofile`/`badfile`
+    /// — a typed loader error would be a fourth shape the oracle never returns.
+    pub(super) fn code_load_file(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let name = self
+            .atom_name(*args.first().ok_or(BeamError::BadArg)?)
+            .ok_or(BeamError::BadArg)?;
+        if self.is_sticky(&name) {
+            return self.error_pair("sticky_directory");
+        }
+        if self.module_file(&name).is_none() {
+            return self.no_file();
+        }
+        match self.runtime.code_server.load(&name) {
+            Ok(_) => self.module_pair(&name),
+            Err(_) => self.error_pair("badfile"),
+        }
+    }
+
     /// The `{module, Module}` pair [`Self::code_ensure_loaded`] answers with.
     fn module_pair(&mut self, name: &str) -> Result<Eterm> {
         let module = self.atom("module")?;
@@ -218,11 +269,18 @@ impl RuntimeContext<'_> {
         terms::make_tuple(self, &[module, name])
     }
 
-    /// The `{error, nofile}` pair [`Self::code_ensure_loaded`] answers with.
-    fn no_file(&mut self) -> Result<Eterm> {
+    /// The `{error, Reason}` pair [`Self::code_ensure_loaded`] / [`Self::code_load_file`]
+    /// answer with.
+    fn error_pair(&mut self, reason: &str) -> Result<Eterm> {
         let error = self.atom("error")?;
-        let nofile = self.atom("nofile")?;
-        terms::make_tuple(self, &[error, nofile])
+        let reason = self.atom(reason)?;
+        terms::make_tuple(self, &[error, reason])
+    }
+
+    /// The `{error, nofile}` pair the not-found half of [`Self::code_ensure_loaded`] and
+    /// [`Self::code_load_file`] answer with.
+    fn no_file(&mut self) -> Result<Eterm> {
+        self.error_pair("nofile")
     }
 
     /// Whether `name` is sticky: preloaded, or resolved to a `.beam` under one of the
@@ -826,6 +884,134 @@ mod tests {
         );
     }
 
+    /// The `{error, Reason}` pair `answer` is, or a panic naming the shape it really is.
+    fn error_reason(runtime: &mut crate::Runtime, answer: Eterm) -> String {
+        assert_eq!(terms::tuple_arity(answer).expect("a pair"), 2, "{answer:?}");
+        assert_eq!(
+            runtime.atom_name_of(terms::tuple_element(answer, 0).unwrap()),
+            Some("error")
+        );
+        runtime
+            .atom_name_of(terms::tuple_element(answer, 1).unwrap())
+            .expect("the reason is an atom")
+            .to_string()
+    }
+
+    #[test]
+    fn code_load_file_rejects_a_non_atom_with_badarg() {
+        // The floor's convention for every `code:*` entry (the oracle's own reason for
+        // `code:load_file/1` is a `function_clause` raise — a documented divergence).
+        let mut runtime = runtime();
+        let error = call(&mut runtime, "code", "load_file", &[make_small(42)])
+            .expect_err("a non-atom names no module");
+        assert_eq!(error.as_atom(), Some("badarg"), "{error:?}");
+    }
+
+    #[test]
+    fn code_load_file_refuses_a_preloaded_module_as_sticky() {
+        // A preloaded module is sticky *independently* of any code path, so this holds on a
+        // code-path-less runtime too. Oracle-verified: `code:load_file(init)` ⇒
+        // `{error,sticky_directory}`.
+        let mut runtime = runtime();
+        for name in ["init", "erlang", "erts_internal"] {
+            let module = module_atom(&mut runtime, name);
+            let answer = call(&mut runtime, "code", "load_file", &[module]).expect("load_file/1");
+            assert_eq!(
+                error_reason(&mut runtime, answer),
+                "sticky_directory",
+                "code:load_file({name})"
+            );
+        }
+    }
+
+    #[test]
+    fn code_load_file_reports_nofile_for_an_absent_module() {
+        let mut runtime = runtime();
+        let missing = module_atom(&mut runtime, "definitely_not_a_module");
+        let answer = call(&mut runtime, "code", "load_file", &[missing]).expect("load_file/1");
+        assert_eq!(error_reason(&mut runtime, answer), "nofile");
+    }
+
+    #[test]
+    fn code_load_file_refuses_a_sticky_system_module_and_loads_a_non_sticky_one() {
+        let Some(mut runtime) = system_runtime() else {
+            return;
+        };
+        // `lists`/`kernel` resolve under the sticky `stdlib`/`kernel` directories.
+        for name in ["lists", "kernel", "proplists"] {
+            let module = module_atom(&mut runtime, name);
+            let answer = call(&mut runtime, "code", "load_file", &[module]).expect("load_file/1");
+            assert_eq!(
+                error_reason(&mut runtime, answer),
+                "sticky_directory",
+                "code:load_file({name})"
+            );
+        }
+        assert!(
+            !runtime.code_server.is_loaded("lists"),
+            "a refused sticky load must not load the module"
+        );
+
+        // A module under no sticky directory — the committed `slice.beam` fixture, which is
+        // exactly the "findable but non-sticky" shape — loads on demand and the answer is the
+        // `{module, M}` pair, idempotently.
+        runtime.code_server.add_path(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../beam_loader/tests/fixtures"
+        ));
+        let slice = module_atom(&mut runtime, "slice");
+        let answer = call(&mut runtime, "code", "load_file", &[slice]).expect("load_file/1");
+        assert_eq!(
+            runtime.atom_name_of(terms::tuple_element(answer, 0).unwrap()),
+            Some("module")
+        );
+        assert_eq!(
+            runtime.atom_name_of(terms::tuple_element(answer, 1).unwrap()),
+            Some("slice")
+        );
+        assert!(
+            runtime.code_server.is_loaded("slice"),
+            "the module really loaded"
+        );
+        let again = call(&mut runtime, "code", "load_file", &[slice]).expect("load_file/1");
+        assert_eq!(
+            runtime.atom_name_of(terms::tuple_element(again, 0).unwrap()),
+            Some("module")
+        );
+        assert_eq!(
+            runtime.atom_name_of(terms::tuple_element(again, 1).unwrap()),
+            Some("slice")
+        );
+    }
+
+    #[test]
+    fn code_load_file_maps_a_corrupt_beam_to_badfile() {
+        let mut runtime = runtime();
+        // A `bogus.beam` of garbage in a scratch `-pa` directory: found on the code path, so
+        // the not-found half cannot hide it, and the loader rejects it — the oracle's
+        // `{error,badfile}`.
+        let dir = std::env::temp_dir().join(format!("beam_rt_load_file_{}", std::process::id()));
+        if std::fs::create_dir_all(&dir).is_err() {
+            eprintln!("SKIP code:load_file/1: cannot create {}", dir.display());
+            return;
+        }
+        let path = dir.join("bogus.beam");
+        if std::fs::write(&path, b"garbage-not-a-beam").is_err() {
+            eprintln!("SKIP code:load_file/1: cannot write {}", path.display());
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        runtime.code_server.add_path(&dir);
+        let bogus = module_atom(&mut runtime, "bogus");
+        let answer = call(&mut runtime, "code", "load_file", &[bogus]).expect("load_file/1");
+        let reason = error_reason(&mut runtime, answer);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(reason, "badfile");
+        assert!(
+            !runtime.code_server.is_loaded("bogus"),
+            "a malformed image must not enter the code server's cache"
+        );
+    }
     #[test]
     fn code_all_loaded_pins_the_preloaded_atom_and_the_file_string() {
         // The oracle's entry shapes: a preloaded module's `Beam` is the **atom**

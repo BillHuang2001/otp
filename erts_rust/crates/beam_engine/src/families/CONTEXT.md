@@ -6,19 +6,19 @@ loop (`../interpreter/`) does not execute natively is routed here by [`mod.rs::d
 family that owns it.
 One family per opcode group; each exposes `exec(...) -> Result<Option<Step>>` where `Ok(Some(step))` =
 "this family executed it", `Ok(None)` = "not my variant", `Err` = the family raised.
-Family ownership is **disjoint and variant-complete** (`mod.rs:124-218`): each of the 76 claimed `Instr`
+Family ownership is **disjoint and variant-complete** (`mod.rs:121-218`): each of the 77 claimed `Instr`
 variants has exactly one owning family, so the route is a jump table on the `Instr` discriminant —
-semantically identical to the old first-claim-wins probe loop (see the module doc, `mod.rs:96-113`).
+semantically identical to the old first-claim-wins probe loop (see the module doc, `mod.rs:93-110`).
 
 ## API Surface
-- `pub(crate) fn dispatch(machine, module, labels, instr, func, pc, ctx) -> Result<Step>` — `mod.rs:115`.
-- `pub(crate) const UNCLAIMED_PREFIX: &str = "widened opcode not yet executed"` — `mod.rs:85` (frozen sentinel, pinned by `mod.rs:315`).
+- `pub(crate) fn dispatch(machine, module, labels, instr, func, pc, ctx) -> Result<Step>` — `mod.rs:112`.
+- `pub(crate) const UNCLAIMED_PREFIX: &str = "widened opcode not yet executed"` — `mod.rs:82` (frozen sentinel, pinned by `mod.rs:315`).
 - Every family: `pub(crate) fn exec(machine, module, labels, instr, func, pc, ctx) -> Result<Option<Step>>`.
 - All computation goes through `crate::context::ExecutionContext`; term construction via `crate::terms`.
   Families build no term layout of their own **except** `bitstrings/raw.rs` (see Duplication).
 
 ## Routing Table (file → owned variants)
-- `tuples.rs` — `PutTuple2` / `GetTupleElement` / `SelectTupleArity`.
+- `tuples.rs` — `PutTuple2` / `GetTupleElement` / `SetTupleElement` / `SelectTupleArity`; `SetTupleElement` is the destructive in-place write (`tuple_val(Tuple)[1 + offset]`, `../terms/update.rs`), whose non-tuple/out-of-range target raises the read path's `{badmatch, Source}` and whose literal-area target is the typed `unsupported`.
 - `records/` (`mod.rs` + `raw.rs` + `tests/`) — `UpdateRecord`, `UpdateRecordId`, and the eight native-record variants (`IsAnyNativeRecord` … `UpdateRecordId`). `raw.rs` **forwards all** record layout to `beam_term::record`.
 - `lists.rs` — `PutList` / `GetList` / `GetHd` / `GetTl`.
 - `funs/` — `MakeFun3` / `CallFun` / `CallFun2` / `Apply` / `ApplyLast` (builds closures via `crate::terms::make_fun`).
@@ -42,14 +42,16 @@ semantically identical to the old first-claim-wins probe loop (see the module do
 - `records/mod.rs:745-769` `local_definition`: a **foreign** `{Module,Name}` record id ⇒ `unsupported`
   ("create: no record definition table for another module", `:756-758`). **The running module's own
   `put_record/6` create form IS implemented** (`create_native_record`, `:643-732`) — see Known Issues.
-- `maps/mod.rs:228-238` `jump_or_unsupported` (absent key + `NO_FAIL`); `:209-223` `fail_or_raise` raises
-  `{badmap,_}`/`{badkey,_}`; `:254-257` a missing tag atom ⇒ `unsupported`.
+- `maps/mod.rs:260-271` `fail_or_function_clause` (absent key + `NO_FAIL` ⇒ the bare atom
+  `function_clause`, through the shared `crate::interpreter::raise_function_clause_no_fail`);
+  `:238-252` `fail_or_raise`/`:280-301` `raise_error_tuple` raise
+  `{badmap,_}`/`{badkey,_}`; a missing tag atom ⇒ `unsupported`.
 - `exceptions/mod.rs:155-157` `Raise` with no `pending_class`; `:167-171` `try_case` without `THE_NON_VALUE`;
   `:196-209` `catch_end` with x(1)/x(3) out of range or the missing `EXIT` atom;
   `exceptions/raise.rs:60-63,75-78` a missing tag atom ⇒ `unsupported`.
 - `exceptions/stacktrace.rs:151-156` a missing `file`/`line` atom ⇒ `unsupported`.
 - `floats/*` — a non-float FR slot or a non-finite result ⇒ the documented `badarith` failure (`arith.rs:72,98`), never a fabricated value.
-- `bitstrings/create/mod.rs:348-352` a non-first `append`/`private_append`; `:369-371` unknown segment type; `:199-201` integer size `all`; `size.rs:173-185` `raise_seg_fail`.
+- `bitstrings/create/mod.rs:369-371` unknown segment type; `:199-201` integer size `all`; `size.rs:173-185` `raise_seg_fail`.
 - `bitstrings/mod.rs` — every invalid `Sz`/flag/offset ⇒ a typed result (`read_size` `:156`, `decode_flags` `:187`, `make_small_checked` `:292`).
 - `bitstrings/matching/match_ctx.rs:56-71` unknown `bs_start_match4` fail atom; `commands.rs:173-175` unknown `bs_match` command.
 - `bitstrings/raw.rs:264-265` result > 64 bytes in `make_bits`; `:222-226` zero-width bignum; `:317-320` short buffer.
@@ -110,7 +112,7 @@ semantically identical to the old first-claim-wins probe loop (see the module do
 
 ## Test Strategy
 - Per-family `#[cfg(test)]` unit tests over hand-built `Instr`s with a recording `ExecutionContext` stub:
-  `mod.rs:250-483`, `receive.rs:282-905`, `records/tests/*`, `exceptions/tests/*`, `bitstrings/*/tests.rs`,
+  `mod.rs:250-485`, `receive.rs:282-905`, `records/tests/*`, `exceptions/tests/*`, `bitstrings/*/tests.rs`,
   `bitstrings/matching/mod.rs:408-566`, `bitstrings/raw.rs:377-439`.
 - The router's diagnostics contract is pinned by `mod.rs:315+` (`the_prefix_is_unchanged`); the receive
   family's tests assert an owned variant never reaches the sentinel again.
@@ -128,7 +130,7 @@ semantically identical to the old first-claim-wins probe loop (see the module do
   hold garbage. Not observable through the size/length-driven readers, but a divergence from the LCA invariant.
 
 ## Notes for Agents
-- The router (`mod.rs:114`) and `lists::exec` are `#[inline]`, so a dispatched instruction hands straight to its owning family.
+- The router (`mod.rs:111`) and `lists::exec` are `#[inline]`, so a dispatched instruction hands straight to its owning family.
 - A family's `Ok(None)` is **not** a silent no-op: it reaches the router's last arm and yields the sentinel.
   The only way to "claim then no-op" would be an arm returning `Ok(Some(Step::Next))` without doing the
   operation — none exists (verified across all families).

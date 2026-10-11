@@ -148,7 +148,9 @@ Both are the *only* entry points; all intermediate types are public for inspecti
     `Deallocate(u32)`, `Trim { n: u32, remaining: u32 }`, `Return`,
     `DeallocateReturn(u32)` (the loader's only superinstruction — see `src/lower/fuse.rs`).
   - **tuples** — `PutTuple2 { dst, elements: Vec<Operand> }`,
-    `GetTupleElement { source, element: u32, dst }`.
+    `GetTupleElement { source, element: u32, dst }`,
+    `SetTupleElement { element, tuple, offset: u32 }` (the OTP≤28 in-place write; `offset` is the raw
+    compiler "Position" index).
   - **lists** — `PutList { head, tail, dst }`, `GetList { source, head, tail }`,
     `GetHd { source, head }`, `GetTl { source, tail }`.
   - **maps** — `GetMapElements { fail, source, pairs: Vec<(Operand, Operand)> }`,
@@ -271,7 +273,10 @@ parsed-as-raw, or tooling-only (with a reason). `Docs` (a compressed ExDoc term)
   tagged items until `item_count` of them have been `TAG_i`; a `TAG_a <name_index>` sets the current file
   index and is consumed *in addition* (not counted), a `TAG_i <line>` emits a
   `LineEntry { file, line }` (`beam_file.c:443-602`). `items[0]` is the undefined location `{0,0}`;
-  `files[0]` is synthesized as `<module>.erl`.
+  `files[0]` is synthesized as `<module>.erl`. There is **no separate range-table / func-info
+  line-range chunk** in the `.beam` format: the runtime range table (`beam_ranges.c`) is synthesized at
+  load from this table plus the function labels, so `Module.line` plus the per-function labels is the
+  loader's complete line-info obligation.
 - **`Type`** — `u32 version` (`4` current, `3` OTP 27/28; else fallback), `i32 count` (≥1,
   `entries[0]` = "any"), then per entry a `u16 type_word` (+ optional `i64 lower`, `i64 upper`, `u8 unit-1`
   gated by `type_word` bits 13-15). Absent/incompatible ⇒ a single "any" fallback entry.
@@ -368,7 +373,7 @@ silently-accepted wrong value:
   by `(module, function, arity)` following the real `bif.tab` naming — the loader does **not** know and
   must **not** encode `bif.tab` numbering. `Module.imports` is the single source of BIF identity.
 - **`Instr` and `TestKind` live in `src/instr.rs`, re-exported from `ir.rs`.** The instruction
-  vocabulary is one large flat enum (107 variants); an enum cannot be spread across submodules and
+  vocabulary is one large flat enum (108 variants); an enum cannot be spread across submodules and
   splitting the *variants* would destroy the single-name surface the engine matches on, so it is kept in
   one dedicated module while `ir.rs` (the data types) does `pub use crate::instr::*;` so `crate::ir::Instr`,
   `crate::Instr` and `prelude::*` are unchanged. This keeps `ir.rs` focused on the module/function/table
@@ -524,7 +529,9 @@ silently-accepted wrong value:
   can never pass for a structural reason.
 - **`tests/real_modules.rs`:** the broad real-OTP LOAD sweep. The `lib` root is discovered
   generically — `$ERTS_LIB_DIR` when set, else `erl -noshell -eval 'io:format("~s",[code:lib_dir()])'`
-  (no hardcoded app names) — then every `.beam` under it is collected recursively (each versioned app
+  (no hardcoded app names; the discovery helpers `otp_lib_dir`/`lib_sweep`/`app_ebin`/`has_beams`/
+  `skip_reason`/`rel_label` live in `tests/common/mod.rs` and are shared with `tests/generic_census.rs`)
+  — then every `.beam` under it is collected recursively (each versioned app
   dir's `ebin`, plus doc/examples & `proper_ext`). On this install that is **34 applications / 1366
   modules**; every one is loaded through the public pipeline and must load (zero failures tolerated: any
   parse failure fails the test, and each is printed by relative path with its exact typed error), plus
@@ -542,9 +549,11 @@ silently-accepted wrong value:
   loud skip without OTP), and hand-built malformed-`Recs` images rejected with `BeamError::BadArg` through
   the whole `load` pipeline — each next to a well-formed **control** image (same `AtU8`/`Code`, only the
   `Recs` payload varying) that genuinely loads, so the negative cases cannot pass for a structural reason.
-- **`tests/generic_census.rs`:** the residual `Instr::Generic` census over every installed
-  stdlib/kernel/compiler `.beam` — asserts the unmodelled-opcode set equals the documented baseline, so a
-  newly-emitted unmodelled opcode fails the test; loud skip when `erl`/OTP is absent.
+- **`tests/generic_census.rs`:** the residual `Instr::Generic` census over every `.beam` of the whole
+  installed OTP `lib` root (all 34 apps / ≈1366 modules — the same generic, `code:lib_dir()`-based
+  recursive discovery as `tests/real_modules.rs`, shared via `tests/common/mod.rs`) — asserts the
+  unmodelled-opcode set equals the documented baseline (currently empty), so a newly-emitted unmodelled
+  opcode fails the test; loud skip when `erl`/OTP is absent.
 - **`tests/line_info.rs`:** `linecov.beam` carries a typed `Instr::ExecutableLine` and `dbgline.beam` a
   typed `Instr::DebugLine` (neither on `Generic`); asserts the `Line` table and every function's
   `Instr::FuncInfo` are preserved (the runtime needs `current_location`/stack traces).
@@ -590,15 +599,13 @@ silently-accepted wrong value:
   (`tests/literals.rs` + `tests/common/mod.rs` for the raw byte scan); a byte-exact assertion is only
   valid for a **map-free** literal. (This is faithful behavior, not a defect: the two images denote the
   same term.)
-- **`Instr::Generic` fallback opcodes — 133 of 193 typed, 60 Generic.** 108 opcodes lower to a named
-  `Instr` mapping (`src/lower/instr.rs`) and the 25 `is_*`/`test_arity` opcodes to `Instr::Test`, so 133
-  of the 193 `genop.tab` opcodes are typed; the other 60 keep `Instr::Generic`. 59 of those are the
+- **`Instr::Generic` fallback opcodes — 134 of 193 typed, 59 Generic.** 109 opcodes lower to a named
+  `Instr` mapping (`src/lower/instr.rs`) and the 25 `is_*`/`test_arity` opcodes to `Instr::Test`, so 134
+  of the 193 `genop.tab` opcodes are typed; the other 59 keep `Instr::Generic`. Those 59 are exactly the
   `-`-prefixed obsolete/transform-only entries the compiler never emits (`is_constant/2`, `make_fun2/1`,
-  `allocate_zero/2`, the legacy `bs_*` forms, …); the 60th is **`set_tuple_element/3` (opcode 67)** — a
-  non-obsolete `genop.tab` entry that is also never emitted (the compiler emits `put_tuple2`). The
-  compiler emits none of the 60, so the observed residual census over the installed stdlib/kernel/compiler
-  modules is **empty** (`tests/generic_census.rs` pins it); it is a deliberate, lossless gap — never a
-  wrong result.
+  `allocate_zero/2`, the legacy `bs_*` forms, …), so the observed residual census over the whole
+  installed OTP `lib` root (all 34 apps / ≈1366 modules) is **empty** (`tests/generic_census.rs` pins
+  it); it is a deliberate, lossless gap — never a wrong result.
 - **Previously-unexercised variants are now fixture-proven reachable (not merely claimed).** The on-PATH
   OTP-29 `erlc` DOES emit the native-record family: the committed `nr_def`/`nr_use` pair lowers 186-191
   typed. `executable_line` (183) / `debug_line` (184) are reachable via `+line_coverage` /`+beam_debug_info`
@@ -618,6 +625,11 @@ silently-accepted wrong value:
   `crates/beam_dist/src/auth.rs` already ships a self-contained RFC 1321 `md5`, so the algorithm belongs
   at a lowest-common-ancestor crate (`beam_codec`/`beam_common`) or behind a new dependency edge — do not
   duplicate it here.
+- **Implicit mandatory chunks are more lenient than the legacy reader.** The C errors when `ImpT`
+  (`beam_file.c:1667`) or `ExpT` (`beam_file.c:1675`) is absent; this loader requires only `AtU8` and
+  `Code` and treats every other chunk as optional (`src/chunk/mod.rs:131-138`), returning an empty
+  table instead of an error. Harmless for real images (which always carry both) — a divergence for
+  stripped/hostile inputs only.
 - **Atoms are interned into a fresh per-module `AtomTable`**, not a shared `atom.names`-seeded table;
   positional/global atom identity for preloaded modules is a `beam_rt` concern.
 
@@ -638,7 +650,7 @@ silently-accepted wrong value:
 - `src/opcode.rs` → `Opcode` enum + name/number/arity roster (derived from `../../lib/compiler/src/genop.tab`) + the derived `OnceLock` arity lookup table `src/decode.rs` dispatches on
 - `src/operand.rs` → `Operand`/`Reg`/`TypeIndex`/`AllocKind`/`HeapNeed` types
 - `src/decode.rs` → instruction-stream → `Vec<RawInstr>` (opcode + operands + byte offset) + the tagged-varint operand decoder
-- `src/instr.rs` → the typed instruction vocabulary: `Instr` (107 variants) + `TestKind`
+- `src/instr.rs` → the typed instruction vocabulary: `Instr` (108 variants) + `TestKind`
 - `src/ir.rs` → the IR data types: `Module`, `Function`, `Export`, `Import`, `FunDescriptor`, `RecordDefinition`/`RecordField`, `Block`, `LineTable`, `TypeTable`, … (+ `pub use crate::instr::*`)
 - `src/literal.rs` → `LiteralArea` / `SharedLiteralArea`: decoded `LitT` literals materialized into a heap (+ the shared `decode_terms`/`decode_terms_at_capacity` retry path)
 - `src/decoded.rs` → `DecodedTerm` / `SharedDecodedTerm`: the shared eagerly-decoded small-term holder (`terms`/`by_name`/`raw`) the `Attr`/`CInf`/`Meta` chunk tables build on
@@ -654,14 +666,14 @@ silently-accepted wrong value:
 - `tests/fixtures/README.md` → regeneration commands + the full wire summary
 - `tests/` → container/IR/widened-IR/records/negative/real-module integration tests
 - `tests/records.rs` → `Recs`-chunk integration tests: declaration order, every default encoding, name/atom lookups, the pinned-`ORACLE` ↔ live-`erl` `records:get_definition/2` cross-check (bounded), and malformed-image rejection through `load` beside a well-formed control image
-- `tests/generic_census.rs` → the residual `Instr::Generic` census over the installed OTP (asserts the unmodelled-opcode set equals the documented baseline)
-- `tests/real_modules.rs` → broad real-OTP `.beam` LOAD sweep over the whole `lib` root (all 34 apps / 1366 modules recursively; every discovered module must load; loud skip when `erl`/OTP is absent) + the nested fun-literal MFA check over `maps`/`gen_server`
+- `tests/generic_census.rs` → the residual `Instr::Generic` census over the whole installed OTP `lib` root (all 34 apps / ≈1366 modules, discovered via the shared `tests/common/mod.rs` helpers; asserts the unmodelled-opcode set equals the documented baseline)
+- `tests/real_modules.rs` → broad real-OTP `.beam` LOAD sweep over the whole `lib` root (all 34 apps / 1366 modules recursively, discovered via the shared `tests/common/mod.rs` helpers; every discovered module must load; loud skip when `erl`/OTP is absent) + the nested fun-literal MFA check over `maps`/`gen_server`
 - `tests/native_record.rs` → the OTP-29 native-record family (186-191) over the committed `nr_def`/`nr_use` fixtures + the `erl_eval` `is_any_native_record` positive control + a stdlib/kernel/compiler sweep asserting no family member lowers to `Instr::Generic`
 - `tests/line_info.rs` → typed `executable_line`/`debug_line` (the `linecov`/`dbgline` fixtures) + line-table/`func_info` preservation
 - `tests/bs_test_tail.rs` → typed `bs_test_tail2` over the `bstail` fixture
 - `tests/chunks.rs` → the whole-corpus chunk-id classification checker + the `Attr`/`CInf`/`Meta` oracle round-trip cross-check
 - `tests/literals.rs` → the two `LitT` framings (map-free literals byte-exact; map-bearing ones against the oracle) + the map-normalization pin + the whole-corpus literal round-trip/oracle sweep
-- `tests/common/mod.rs` → `tests/`-level test-support module (not a test target of its own): raw, non-normalizing ETF payload inspection (`raw_map_key_names`) used by `tests/literals.rs`
+- `tests/common/mod.rs` → `tests/`-level test-support module (not a test target of its own): the generic installed-OTP discovery shared by `tests/real_modules.rs` and `tests/generic_census.rs` (`otp_lib_dir`/`all_otp_beams`/`lib_sweep`/`app_ebin`/`has_beams`/`skip_reason`/`rel_label`), plus raw, non-normalizing ETF payload inspection (`raw_map_key_names`) used by `tests/literals.rs`
 - `tests/load_cost.rs` → the committed module-load-cost measurement (ns/instruction, bytes/second)
 - `tests/fixtures/{nr_def,nr_use,linecov,dbgline,bstail}.{erl,beam}` → native-record / line / test-tail oracle fixtures
 - `tests/fixtures/literals_fixture.erl` + `literals_{verbatim,compressed}.beam` + `literals_oracle.escript` → the `LitT` framing fixtures + the Erlang-side literal oracle (`<otp-lib-root>` walk mode / `--reencode <beam-file>` mode)

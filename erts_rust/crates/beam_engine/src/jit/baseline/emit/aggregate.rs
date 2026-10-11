@@ -18,11 +18,12 @@
 //
 // %CopyrightEnd%
 
-//! The baseline JIT's guarded aggregate readers: the cons-cell readers
-//! (`get_list`/`get_hd`/`get_tl`) and the tuple readers (`get_tuple_element`,
-//! `select_tuple_arity`) behind guards that can only ever *reject* (a non-cons or
-//! non-tuple source falls back to `jit_step_one`, which raises the interpreter's
-//! exact `{badmatch, Source}` or reports its typed `unsupported`).
+//! The baseline JIT's guarded aggregate accessors: the cons-cell readers
+//! (`get_list`/`get_hd`/`get_tl`), the tuple readers (`get_tuple_element`,
+//! `select_tuple_arity`) and the tuple writer (`set_tuple_element`) behind guards
+//! that can only ever *reject* (a non-cons or non-tuple source — or, for the writer, a
+//! shared-literal-area target — falls back to `jit_step_one`, which raises the
+//! interpreter's exact `{badmatch, Source}` or reports its typed `unsupported`).
 
 use crate::interpreter::LabelMap;
 use std::mem::size_of;
@@ -31,14 +32,14 @@ use beam_common::Result;
 use beam_loader::{Label, Operand, NO_FAIL};
 use beam_term::{
     Eterm, ARITYVAL_SUBTAG, CAR_OFFSET, CDR_OFFSET, HEADER_ARITY_OFFS, TAG_HEADER_MASK,
-    TAG_PRIMARY_BOXED, TAG_PRIMARY_LIST, TAG_PRIMARY_MASK, TAG_PTR_MASK,
+    TAG_LITERAL_PTR, TAG_PRIMARY_BOXED, TAG_PRIMARY_LIST, TAG_PRIMARY_MASK, TAG_PTR_MASK,
 };
 
 use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg};
 use crate::machine::MAX_REGISTER;
 
 use super::link::Linker;
-use super::operands::{x_offset, x_register};
+use super::operands::{constant_word, x_offset, x_register};
 use super::{emit_step_and_continue, touch, Allocation, MOVE_SCRATCH, MOVE_SCRATCH_2};
 
 // ---------------------------------------------------------------------------
@@ -720,6 +721,222 @@ fn emit_tuple_read(
         allocation,
         highest_touched,
     )?;
+    buffer.jmp(fast_done)?;
+
+    // Rejected (or not lowered): one interpreter step, then continue at `pc + 1`.
+    buffer.bind(fallback)?;
+    emit_step_and_continue(buffer, done, allocation, func, pc)?;
+    buffer.bind(fast_done)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The tuple writer
+// ---------------------------------------------------------------------------
+//
+// `set_tuple_element` (`emu/instrs.tab:845-851`, `i_set_tuple_element`) overwrites
+// one element word of a tuple **in place** — the destructive store the compiler emits
+// only for a tuple it has proved uniquely owned. The interpreter
+// (`crate::families::tuples::exec`) reads the tuple and the element value, gates the
+// tuple on `terms::tuple_arity` with `offset < arity` (otherwise it *raises*
+// `{badmatch, Source}` through `terms::badmatch_reason`), refuses a term in a shared
+// literal area with the typed `error::unsupported`, and otherwise writes the value
+// through `terms::set_tuple_element` at word `1 + offset` past the header — the very
+// word `get_tuple_element` with the same index reads.
+//
+// The subset below is lowered natively and mirrors that branch for branch:
+//
+// * the tuple must be an x-register inside the engine's [`MAX_REGISTER`] bound — a `Y`
+//   operand, a literal operand or a register past the bound deopts (the interpreter
+//   step reports the faithful `bad_register`);
+// * the element operand must be an immediate constant word
+//   ([`super::operands::constant_word`]) or an in-bound x-register: a value that needs
+//   heap materialisation (a bignum/float/literal) is not a shape the tier lowers, so
+//   it deopts to the interpreter, which materialises it exactly;
+// * the guard is the same `is_tuple` bit trick the readers use (`emit_tuple_header_guard`);
+//   its rejection branches to the helper, whose interpreter step raises the exact
+//   `{badmatch, Source}` — a non-tuple target or an out-of-range `offset`;
+// * the literal-area bit ([`TAG_LITERAL_PTR`]) is **also** tested on the source word and
+//   *rejects* to the helper: the interpreter refuses a shared-literal-area target with
+//   the typed `unsupported`, so the tier must not write it either. Both guards can only
+//   ever reject, never corrupt a module's constants.
+//
+// The store writes the element word at `8 * (1 + offset)` past the header — exactly the
+// word the read path loads. There is no write barrier: the frozen term layout is
+// immutable except for this destructive update (workspace `CONTEXT.md` §2), so the
+// tier's root-set/liveness model is unchanged and no cached register is clobbered.
+
+/// `TAG_LITERAL_PTR` as an `i64` — the literal-area bit `is_literal` tests a boxed/list
+/// word with (`beam_term::literal::is_literal`), which a write must reject.
+const LITERAL_MASK: i64 = TAG_LITERAL_PTR as i64;
+
+/// The element value a `set_tuple_element` stores.
+#[derive(Clone, Copy)]
+pub(super) enum TupleWriteValue {
+    /// A constant operand, materialised as its raw `Eterm` word.
+    Immediate(i64),
+    /// An x-register whose value is read into scratch at the store.
+    Register(u32),
+}
+
+/// The x-register operands of a tuple write the tier lowers natively: the target
+/// tuple and the element value it stores.
+#[derive(Clone, Copy)]
+pub(super) struct TupleWriteShape {
+    /// The `tuple` operand's x-register.
+    tuple: u32,
+    /// The element value to store.
+    value: TupleWriteValue,
+    /// The byte offset of the written element from the header word.
+    element_disp: i32,
+}
+
+impl TupleWriteShape {
+    /// The x-register indices the shape's native lowering touches, in emission
+    /// order (the target tuple first, then the value register when there is one).
+    pub(super) fn registers(&self) -> Vec<u32> {
+        let mut registers = vec![self.tuple];
+        if let TupleWriteValue::Register(x) = self.value {
+            registers.push(x);
+        }
+        registers
+    }
+}
+
+/// The inlinable shape of a `set_tuple_element Element Tuple Offset`, or `None` when
+/// the whole instruction must stay on the helper.
+///
+/// The target tuple must be an x-register inside [`MAX_REGISTER`]; the element value
+/// must be an immediate constant word or an in-bound x-register (a value needing heap
+/// materialisation deopts); the offset's word must be addressable — see the section
+/// comment above.
+pub(super) fn set_tuple_element_shape(
+    element: &Operand,
+    tuple: &Operand,
+    offset: u32,
+) -> Option<TupleWriteShape> {
+    Some(TupleWriteShape {
+        tuple: in_bound_x(tuple)?,
+        value: match x_register(element) {
+            Some(x) if x < MAX_REGISTER => TupleWriteValue::Register(x),
+            Some(_) => return None,
+            None => TupleWriteValue::Immediate(constant_word(element)?),
+        },
+        element_disp: element_disp(offset)?,
+    })
+}
+
+/// Emit `set_tuple_element Element Tuple Offset` natively, or report that the block
+/// must helper it.
+///
+/// Returns `true` when the whole guarded sequence was emitted, having stored the
+/// element value into the tuple's word `offset`. Returns `false` **without having
+/// emitted a byte** when the operands are not an in-bound x-register tuple plus an
+/// immediate-or-in-bound-register value ([`set_tuple_element_shape`]) — the caller
+/// then emits exactly today's `jit_step_one` step.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn try_inline_set_tuple_element(
+    buffer: &mut CodeBuffer,
+    element: &Operand,
+    tuple: &Operand,
+    offset: u32,
+    allocation: &Allocation,
+    done: CodeLabel,
+    func: u32,
+    pc: u32,
+    highest_touched: &mut Option<u32>,
+) -> Result<bool> {
+    let Some(shape) = set_tuple_element_shape(element, tuple, offset) else {
+        return Ok(false);
+    };
+    emit_tuple_write(
+        buffer,
+        &shape,
+        offset,
+        allocation,
+        done,
+        func,
+        pc,
+        highest_touched,
+    )?;
+    Ok(true)
+}
+
+/// Lower an inlinable tuple write (see the section comment above for why it is exact).
+/// The emitted shape:
+///
+/// ```text
+///   <the `emit_tuple_header_guard` sequence: the `is_tuple` guard, leaving the
+///    header word in GUARD_SCRATCH and the header pointer in MOVE_SCRATCH>
+///   mov   r10, <bound>      ; (offset + 1) << HEADER_ARITY_OFFS
+///   cmp   r8,  r10          ; the tuple's arity minus `offset + 1`
+///   jl    fallback          ; offset >= arity: the helper raises `{badmatch, Source}`
+///   mov   r10, <Tuple>      ; reload (the header guard consumed the source word)
+///   mov   r8,  LITERAL_MASK
+///   test  r10, r8           ; the literal-area bit
+///   jne   fallback          ; literal: the helper reports the typed `unsupported`
+///   mov   r10, <value>      ; the element value: an immediate word, or a register read
+///   mov   [r11 + 8*(1+offset)], r10   ; the destructive store
+///   jmp   fast_done
+/// fallback:
+///   <the `emit_step_and_continue` sequence: spend one `jit_step_one` on the
+///    instruction — which either advances and lets the block carry on at
+///    `pc + 1`, or exits to the driver with the helper's word>
+/// fast_done:
+///   <emit the rest of the block>
+/// ```
+///
+/// The value is read into scratch — never into a cache register or `machine.x` — so the
+/// tier's liveness model is unchanged: the instruction produces no destination
+/// register, and the only x-registers the lowering touches are the target tuple (read)
+/// and, for a register value, the element register (read). The fast path never spills.
+fn emit_tuple_write(
+    buffer: &mut CodeBuffer,
+    shape: &TupleWriteShape,
+    offset: u32,
+    allocation: &Allocation,
+    done: CodeLabel,
+    func: u32,
+    pc: u32,
+    highest_touched: &mut Option<u32>,
+) -> Result<()> {
+    let fallback: CodeLabel = buffer.label();
+    let fast_done: CodeLabel = buffer.label();
+
+    emit_tuple_header_guard(buffer, shape.tuple, allocation, fallback, highest_touched)?;
+
+    // `offset < arity`: the header word carries the arity above its subtag bits, so the
+    // bound is the arityval of `offset + 1` and the test is a plain `cmp`. Both operands
+    // are non-negative, so the signed `jl` is the word order. (The interpreter checks the
+    // arity bound before the literal refusal, and this mirrors that order.)
+    buffer.mov_ri(MOVE_SCRATCH_2, arity_header(i64::from(offset) + 1))?;
+    buffer.cmp_rr(GUARD_SCRATCH, MOVE_SCRATCH_2)?;
+    buffer.jcc(Cond::L, fallback)?;
+
+    // The literal-area guard: reload the source word — the header guard's `and` cleared
+    // the pointer tag *and* the literal bit from `MOVE_SCRATCH`, which must keep the
+    // header pointer for the store — and reject `TAG_LITERAL_PTR`. The interpreter
+    // refuses a shared-literal-area target rather than writing it, so the tier must too.
+    load_x(
+        buffer,
+        shape.tuple,
+        allocation,
+        MOVE_SCRATCH_2,
+        highest_touched,
+    )?;
+    buffer.mov_ri(GUARD_SCRATCH, LITERAL_MASK)?;
+    buffer.test_rr(MOVE_SCRATCH_2, GUARD_SCRATCH)?;
+    buffer.jcc(Cond::Ne, fallback)?;
+
+    // The element value into the scratch register the store reads.
+    match shape.value {
+        TupleWriteValue::Immediate(word) => buffer.mov_ri(MOVE_SCRATCH_2, word)?,
+        TupleWriteValue::Register(x) => {
+            load_x(buffer, x, allocation, MOVE_SCRATCH_2, highest_touched)?
+        }
+    }
+    // The destructive store, `8 * (1 + offset)` past the header pointer.
+    buffer.mov_mr(MOVE_SCRATCH, shape.element_disp, MOVE_SCRATCH_2)?;
     buffer.jmp(fast_done)?;
 
     // Rejected (or not lowered): one interpreter step, then continue at `pc + 1`.

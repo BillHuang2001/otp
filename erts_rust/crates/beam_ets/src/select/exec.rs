@@ -636,15 +636,17 @@ impl Table {
     /// `set`/`ordered_set` apply through [`Table::insert`], which deep-copies the
     /// replacement and reclaims the replaced object's storage. `duplicate_bag` is
     /// different: several objects share a key and the replacement must land on the
-    /// *specific* matched object, while [`Table::delete_object`] removes **every**
-    /// object equal to its argument (and would remove a just-inserted replacement
-    /// that equals the object it replaces). Its affected keys are therefore rebuilt
-    /// from [`Table::take`]'s checked-out copies — the replacements and the kept
-    /// objects are re-inserted, so no replacement can ever read storage that was
-    /// reclaimed under it. The checked-out copies stay valid for the table's
-    /// lifetime but no longer count as table memory (`take`'s documented
-    /// `relinquish` semantics), so repeated replacement on a `duplicate_bag` grows
-    /// its arena until `delete_all_objects`/drop.
+    /// *specific* matched object, so the key's whole object list is rebuilt. The
+    /// current objects are read through [`Table::lookup`] while they are still
+    /// live, each replacement is computed on the caller's scratch heap, the new
+    /// list is deep-copied into table storage **before** anything is removed, and
+    /// the key's old objects are then freed through the ordinary removal path
+    /// (`Table::replace_key`). A replacement that equals the object it replaces is
+    /// therefore harmless — the rebuild never has to remove an object *by value*,
+    /// which [`Table::delete_object`] would do over the whole key — and repeated
+    /// replacement keeps the table's storage at a stable floor (a rebuild from
+    /// [`Table::take`]'s checked-out copies would instead hold their storage for
+    /// the table's lifetime and grow the arena without bound).
     pub fn select_replace(
         &mut self,
         spec: &MatchSpec,
@@ -684,21 +686,24 @@ impl Table {
 
         // Phase 2 — apply.
         if multi {
-            // Rebuild each affected key from checked-out copies. Re-evaluating the
+            // Rebuild each affected key from its current objects. Re-evaluating the
             // spec is deterministic (head and guards are pure functions of the
-            // object), so it reproduces exactly the phase-1 decisions and count; it
-            // is what lets the replacement target the matched object rather than
-            // every object equal to it.
+            // object), so `keys` were ordered exactly so and the rebuild reproduces
+            // the phase-1 decisions and count; it is what lets the replacement
+            // target the matched object rather than every object equal to it.
             for key in keys {
-                let taken = self.take(key, atoms)?;
-                let mut rebuilt = Vec::with_capacity(taken.len());
-                for object in taken {
+                // The current objects alias live table storage — `replace_key` frees
+                // them only after it has copied the rebuilt list — so computing each
+                // replacement here reads no reclaimed words.
+                let current = self.lookup(key, atoms);
+                let mut rebuilt = Vec::with_capacity(current.len());
+                for object in current {
                     match replacement_for(spec, object, atoms, heap)? {
                         Some(replacement) => rebuilt.push(replacement),
                         None => rebuilt.push(object),
                     }
                 }
-                self.insert_list(&rebuilt, atoms)?;
+                self.replace_key(key, &rebuilt, atoms)?;
             }
         } else {
             for replacement in replacements {

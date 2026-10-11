@@ -33,6 +33,28 @@ deopt are the load-bearing contracts.
 - `cache.rs` → cross-run compiled-block cache + host code-map entry; `tiering.rs` → tier policy; `mod.rs` → the tier seam.
 - `bench/` → the in-crate tier measurement harness — a **`pub mod bench`** (not `#[cfg(test)]`): a ten-workload interpreter-vs-baseline tier table (`fib`/`kernel`/`wide`/`aggr`/`cmp` + `build`/`map`/`select`/`walk` + the cross-module `cross/2`), the `support.rs` scaffolding shared with `cranelift/bench.rs`, and the per-workload result checks; its `#[test]` entry points live in the thin `tests/jit_bench.rs`. See its own `CONTEXT.md`.
 - The **baseline inline set** now includes the boxed-term header `TestKind`s: the word-level `Test`s (`is_nil`/`is_atom`/`is_list`/`is_nonempty_list`/`is_boolean`) plus **14** header kinds (`is_integer`/`is_number`/`is_float`/`is_tuple`/`is_map`/`is_bitstring`/`is_binary`/`is_function`/`is_function2`/`is_tagged_tuple`/`test_arity`/`is_pid`/`is_port`/`is_reference`); everything else still deopts (see `baseline/emit/CONTEXT.md`).
+- **The baseline inlined *shape* set** (a compile-time, purely syntactic decision; every other shape is
+  the `_` arm's per-instruction deopt to `jit_step_one`): `Move`/`Swap` over in-bound x-registers, the
+  word-level and 14 boxed-header `Test`s, all-immediate `SelectVal`, `SelectTupleArity`, the cons
+  readers `GetList`/`GetHd`/`GetTl`, the tuple *reader* `GetTupleElement`, the tuple *writer*
+  `SetTupleElement`, the small-int `gc_bif` `'+'`/`'-'`/`'*'`, the eight
+  comparison BIFs, `Jump`, and the local tail calls `CallLast`/`CallOnly`. `CallExt*` is executed
+  natively by `jit_ext_call` but the cross-module *transfer* is a driver round-trip (see above), and
+  `FuncInfo` is deliberately never inlined (it is the failed-clause raise).
+- **`set_tuple_element` is INLINED (not a deopt).** The tier emits the same `is_tuple` header guard the
+  tuple read uses, then an `offset < arity` range guard and a **literal-area** guard, and finally the
+  destructive store of the element word into the tuple's data word `8*(1+offset)` past the header —
+  exactly the word `get_tuple_element` reads. It inlines only when the **target tuple is an in-bound
+  x-register** and the **element operand is an immediate constant word or an in-bound x-register**; an
+  element that must be heap-materialised (a bignum/float/literal operand) is not a lowered shape and
+  deopts to the interpreter, which materialises it exactly. The literal-area guard is load-bearing: the
+  interpreter refuses a `TAG_LITERAL_PTR` target with the typed `unsupported` (writing a module's shared
+  constants would corrupt them), so an inline that skipped the bit would write shared storage and diverge
+  from the interpreter — the guard only ever *rejects*, branching to the helper. The value is read into
+  scratch, so no cached register is clobbered and no destination register is produced. Pinned by
+  `tests/jit.rs::tuple_writes_match_the_interpreter_on_real_tuples`,
+  `::the_tuple_write_is_inlined_and_caches_its_registers`, and the two rejected-target tests
+  (`a_non_tuple_tuple_write_target_…`, `a_literal_area_tuple_write_target_…`).
 
 ## Constraints
 - Errors are `beam_common::{Result, BeamError}` only; no panic, no `unwrap()` on loaded data, no wrong result — an un-lowered op is a typed `unsupported`.

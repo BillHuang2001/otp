@@ -454,7 +454,25 @@ pub enum Instr {
         /// The destination operand.
         dst: Operand,
     },
-
+    /// `set_tuple_element Element Tuple Offset` — store one tuple element in place.
+    ///
+    /// The C's `set_tuple_element s S P` (`../../erts/emulator/beam/emu/ops.tab:245`,
+    /// `../../erts/emulator/beam/emu/instrs.tab:845-851`): it overwrites the tuple
+    /// `Tuple`'s word at `Offset` (a data index, 0 being the tuple tag) with
+    /// `Element`. Retained so a `.beam` produced by Erlang/OTP ≤28 — the last
+    /// toolchains that emitted this opcode — still loads into the typed IR; the
+    /// compiler no longer emits it as of OTP 29. `Offset` is stored **raw** (the same
+    /// compiler "Position" value carried by [`Instr::GetTupleElement::element`]); the
+    /// C loader pre-scales it to a byte offset at load time, but the IR keeps the
+    /// unscaled index.
+    SetTupleElement {
+        /// The element value to store (the file's source operand `s`).
+        element: Operand,
+        /// The tuple to update in place (the file's operand `S`).
+        tuple: Operand,
+        /// The raw tuple element index (the file's `{u,Off}` operand `P`).
+        offset: u32,
+    },
     // ---- lists -------------------------------------------------------------
     /// `put_list Head Tail Dst` — build a cons cell.
     PutList {
@@ -1047,11 +1065,10 @@ pub enum Instr {
     // ---- fallback ----------------------------------------------------------
     /// An opcode the loader deliberately does not model, preserved losslessly.
     ///
-    /// The residual set is the retired/transform-only `genop.tab` entries the
-    /// compiler never emits: [`Opcode::set_tuple_element`] plus the `-`-prefixed
-    /// obsolete entries (`is_constant/2`, `make_fun2/1`, `allocate_zero/2`, the
-    /// legacy `bs_*` forms, …). The compiler emits none of them, so the census over
-    /// the installed stdlib/kernel/compiler modules is empty
+    /// The residual set is the `-`-prefixed obsolete/transform-only `genop.tab`
+    /// entries the compiler never emits (`is_constant/2`, `make_fun2/1`,
+    /// `allocate_zero/2`, the legacy `bs_*` forms, …). The compiler emits none of them,
+    /// so the census over the installed stdlib/kernel/compiler modules is empty
     /// (`tests/generic_census.rs`) — no module lowers to `Generic` in practice.
     ///
     /// This variant is reached only from the single catch-all arm in `lower`
@@ -1067,7 +1084,6 @@ pub enum Instr {
         offset: u32,
     },
 }
-
 // ---- boxed operand bundles ------------------------------------------------
 //
 // The operand-heavy, non-hot instructions below carry their operands in a boxed

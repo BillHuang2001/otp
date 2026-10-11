@@ -125,12 +125,35 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
 /// inflated length `> limit` yields
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg). Never panics.
 pub fn decompress_bounded(data: &[u8], limit: usize) -> Result<Vec<u8>> {
+    decompress_bounded_used(data, limit).map(|(body, _consumed)| body)
+}
+
+/// Like [`decompress_bounded`], but also reports how many **input** bytes the zlib
+/// stream consumed.
+///
+/// The returned `usize` is the number of source bytes the decompressor read to reach
+/// the end of the stream — the deflate data plus the Adler-32 trailer — and
+/// **excludes** any bytes that follow the stream in `data`. This is what
+/// `binary_to_term/2`'s `used` option reports for a `COMPRESSED` image: the C inflates
+/// the payload and then measures the consumed input length (`external.c:1797-1801`),
+/// so bytes past a compressed image are neither read nor counted.
+///
+/// The same bound, error and never-panic rules as [`decompress_bounded`] apply: a zlib
+/// error or an inflated length `> limit` yields
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg).
+pub fn decompress_bounded_used(data: &[u8], limit: usize) -> Result<(Vec<u8>, usize)> {
     let mut decoder = ZlibDecoder::new(data);
     let mut out = Vec::new();
     let mut chunk = [0u8; 16 * 1024];
     loop {
         match decoder.read(&mut chunk) {
-            Ok(0) => return Ok(out),
+            Ok(0) => {
+                // `total_in()` is every input byte the decompressor consumed (including
+                // the Adler-32 trailer) and stops at the stream end, so it is at most
+                // `data.len()` — the `as usize` narrowing cannot lose information.
+                let consumed = decoder.total_in() as usize;
+                return Ok((out, consumed));
+            }
             Ok(read) => {
                 if out.len().saturating_add(read) > limit {
                     return Err(bad_arg());
@@ -269,6 +292,48 @@ mod tests {
             decompress_bounded(&big_packed, big.len()).unwrap(),
             big,
             "a payload above MAX_UNCOMPRESSED must inflate when the declared size says so"
+        );
+    }
+
+    #[test]
+    fn decompress_bounded_used_reports_the_consumed_stream_length() {
+        let data: Vec<u8> = (0..8192u32).map(|i| (i % 7) as u8).collect();
+        let packed = compress(&data, 6).unwrap();
+
+        // No trailing junk: the count is exactly the stream length and the payload is
+        // the original data.
+        let (body, used) = decompress_bounded_used(&packed, data.len()).unwrap();
+        assert_eq!(body, data);
+        assert_eq!(used, packed.len());
+
+        // Trailing junk after the stream must neither be read nor counted.
+        let mut with_junk = packed.clone();
+        with_junk.extend_from_slice(&[1, 2, 3, 4, 5]);
+        let (body, used) = decompress_bounded_used(&with_junk, data.len()).unwrap();
+        assert_eq!(body, data);
+        assert_eq!(
+            used,
+            packed.len(),
+            "the junk after the zlib stream must not be counted as consumed"
+        );
+    }
+
+    #[test]
+    fn decompress_bounded_used_keeps_the_bound_and_error_rules() {
+        let data = vec![b'z'; 100_000];
+        let packed = compress(&data, 6).unwrap();
+        assert_eq!(
+            decompress_bounded_used(&packed, data.len()).unwrap(),
+            (data.clone(), packed.len())
+        );
+        assert_bad_arg(decompress_bounded_used(&packed, data.len() - 1));
+        // A malformed stream is BadArg, never a panic.
+        assert_bad_arg(decompress_bounded_used(&[0x78], 1024));
+        assert_bad_arg(decompress_bounded_used(&[0x78, 0x9C], 1024));
+        // An empty payload with a zero limit is the one accepted boundary case.
+        assert_eq!(
+            decompress_bounded_used(&compress(&[], 6).unwrap(), 0).unwrap(),
+            (Vec::new(), compress(&[], 6).unwrap().len())
         );
     }
 }

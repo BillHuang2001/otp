@@ -23,14 +23,16 @@
 //! Covers every opcode variant (`get_map_elements` / `has_map_fields` /
 //! `put_map_assoc` / `put_map_exact`), both frozen map layouts (flat and HAMT,
 //! including the 32/33-key boundary), the failure paths (`fail` label, `{badmap,
-//! Source}`, `{badkey, Key}` and the documented typed-`unsupported` gaps) and the
+//! Source}`, `{badkey, Key}`, the engine-defined `NO_FAIL` absent-key
+//! `function_clause` and the documented typed-`unsupported` gap when the module
+//! cannot name it) and the
 //! dispatch contract. The instructions are hand-built [`Instr`]s driven straight
 //! through the family `exec` over a [`Machine`] and [`MinimalContext`] — the loader
 //! is not involved.
 
 use super::*;
 use crate::context::MinimalContext;
-use beam_common::BeamError;
+use beam_common::{BeamError, ExceptionClass};
 use beam_loader::{Atom, Function, MapWriteArgs, Operand};
 use beam_term::make_small;
 use std::collections::BTreeMap;
@@ -161,6 +163,40 @@ fn with_catch(body: Vec<Instr>) -> Vec<Instr> {
         Instr::Return,
     ]);
     code
+}
+
+/// The [`Raise`](beam_common::Raise) an uncaught run propagated, or a panic for a
+/// non-raise error.
+fn uncaught_raise(err: BeamError) -> beam_common::Raise {
+    match err {
+        BeamError::Raise(raise) => raise,
+        other => panic!("expected a typed raise, got {other:?}"),
+    }
+}
+
+/// The live reason *term* an uncaught structured raise rides out of the machine.
+fn live_reason_term(raise: &beam_common::Raise) -> Eterm {
+    raise
+        .live_reason()
+        .and_then(|live| live.downcast_ref::<Eterm>())
+        .copied()
+        .expect("an uncaught structured raise carries its live reason term")
+}
+
+/// Assert `err` is the class-`error` engine diagnostic whose reason atom is exactly
+/// `reason` (no term is carried for a diagnostic).
+fn assert_unsupported_reason(err: BeamError, reason: &str) {
+    let raise = uncaught_raise(err);
+    assert_eq!(raise.class, ExceptionClass::Error);
+    assert_eq!(
+        raise.reason.as_atom(),
+        Some(reason),
+        "the reported gap names the missing atom exactly"
+    );
+    assert!(
+        raise.live_reason().is_none(),
+        "a diagnostic carries no live reason term"
+    );
 }
 
 // -- get_map_elements ----------------------------------------------------
@@ -343,7 +379,65 @@ fn get_map_elements_non_map_without_fail_raises_badmap() {
 }
 
 #[test]
-fn get_map_elements_missing_key_without_fail_is_a_typed_error() {
+fn get_map_elements_missing_key_without_fail_raises_function_clause() {
+    // The read path's C failure is a plain `$FAIL` (no reason), so a missing key
+    // with `fail == NO_FAIL` is engine-defined: the bare atom `function_clause`.
+    let mut fixture = Fixture::new(&["a", "b", "function_clause", "error"]);
+    let (a, b) = (fixture.atom("a"), fixture.atom("b"));
+    let function_clause = fixture.atom("function_clause");
+    let code = with_catch(vec![Instr::GetMapElements {
+        fail: NO_FAIL,
+        source: Operand::X(0),
+        pairs: vec![(Operand::Atom(a), Operand::X(1))],
+    }]);
+    let entry = fixture.add_function("f", 1, code);
+    let module = fixture.finish();
+
+    let mut ctx = MinimalContext::new();
+    let map = make_flatmap(&mut ctx, &[(make_atom(b), make_small(1))]).unwrap();
+
+    let (result, machine) = run(&mut ctx, &module, entry, &[map]);
+    assert_eq!(machine.catch_frame_depth(), 0);
+    assert_eq!(
+        result.unwrap(),
+        make_atom(function_clause),
+        "the landed reason is the bare atom function_clause"
+    );
+}
+
+#[test]
+fn get_map_elements_missing_key_without_fail_uncaught_carries_the_bare_reason() {
+    let mut fixture = Fixture::new(&["a", "b", "function_clause", "error"]);
+    let (a, b) = (fixture.atom("a"), fixture.atom("b"));
+    let function_clause = fixture.atom("function_clause");
+    let code = with_fail_body(
+        vec![Instr::GetMapElements {
+            fail: NO_FAIL,
+            source: Operand::X(0),
+            pairs: vec![(Operand::Atom(a), Operand::X(1))],
+        }],
+        Label(2),
+    );
+    let entry = fixture.add_function("f", 1, code);
+    let module = fixture.finish();
+
+    let mut ctx = MinimalContext::new();
+    let map = make_flatmap(&mut ctx, &[(make_atom(b), make_small(1))]).unwrap();
+
+    let (result, _machine) = run(&mut ctx, &module, entry, &[map]);
+    let raise = uncaught_raise(result.unwrap_err());
+    assert_eq!(raise.class, ExceptionClass::Error);
+    assert_eq!(
+        live_reason_term(&raise),
+        make_atom(function_clause),
+        "the reason rides out of the machine as the bare atom function_clause"
+    );
+}
+
+#[test]
+fn get_map_elements_missing_key_without_fail_on_an_unseeded_module_is_the_typed_gap() {
+    // The module never names `function_clause`, so the engine refuses to substitute
+    // a foreign atom and reports the documented typed gap.
     let mut fixture = Fixture::new(&["a", "b"]);
     let (a, b) = (fixture.atom("a"), fixture.atom("b"));
     let code = with_fail_body(
@@ -361,9 +455,9 @@ fn get_map_elements_missing_key_without_fail_is_a_typed_error() {
     let map = make_flatmap(&mut ctx, &[(make_atom(b), make_small(1))]).unwrap();
 
     let (result, _machine) = run(&mut ctx, &module, entry, &[map]);
-    assert!(
-        matches!(result.unwrap_err(), BeamError::Raise(_)),
-        "an absent key with no fail label is a documented typed error"
+    assert_unsupported_reason(
+        result.unwrap_err(),
+        "unsupported_opcode: maps: no 'function_clause' atom in the module",
     );
 }
 
@@ -439,6 +533,86 @@ fn has_map_fields_non_map_jumps_to_fail() {
     let mut ctx = MinimalContext::new();
     let (result, _machine) = run(&mut ctx, &module, entry, &[make_small(0)]);
     assert_eq!(result.unwrap(), make_small(99));
+}
+
+#[test]
+fn has_map_fields_missing_key_without_fail_raises_function_clause() {
+    // Same engine-defined `NO_FAIL` absent-key reason as `get_map_elements`.
+    let mut fixture = Fixture::new(&["a", "b", "function_clause", "error"]);
+    let (a, b) = (fixture.atom("a"), fixture.atom("b"));
+    let function_clause = fixture.atom("function_clause");
+    let code = with_catch(vec![Instr::HasMapFields {
+        fail: NO_FAIL,
+        source: Operand::X(0),
+        keys: vec![Operand::Atom(a), Operand::Atom(b)],
+    }]);
+    let entry = fixture.add_function("f", 1, code);
+    let module = fixture.finish();
+
+    let mut ctx = MinimalContext::new();
+    let map = make_flatmap(&mut ctx, &[(make_atom(a), make_small(1))]).unwrap();
+
+    let (result, machine) = run(&mut ctx, &module, entry, &[map]);
+    assert_eq!(machine.catch_frame_depth(), 0);
+    assert_eq!(
+        result.unwrap(),
+        make_atom(function_clause),
+        "the landed reason is the bare atom function_clause"
+    );
+}
+
+#[test]
+fn has_map_fields_missing_key_without_fail_uncaught_carries_the_bare_reason() {
+    let mut fixture = Fixture::new(&["a", "b", "function_clause", "error"]);
+    let (a, b) = (fixture.atom("a"), fixture.atom("b"));
+    let function_clause = fixture.atom("function_clause");
+    let code = with_fail_body(
+        vec![Instr::HasMapFields {
+            fail: NO_FAIL,
+            source: Operand::X(0),
+            keys: vec![Operand::Atom(a), Operand::Atom(b)],
+        }],
+        Label(2),
+    );
+    let entry = fixture.add_function("f", 1, code);
+    let module = fixture.finish();
+
+    let mut ctx = MinimalContext::new();
+    let map = make_flatmap(&mut ctx, &[(make_atom(a), make_small(1))]).unwrap();
+
+    let (result, _machine) = run(&mut ctx, &module, entry, &[map]);
+    let raise = uncaught_raise(result.unwrap_err());
+    assert_eq!(raise.class, ExceptionClass::Error);
+    assert_eq!(
+        live_reason_term(&raise),
+        make_atom(function_clause),
+        "the reason rides out of the machine as the bare atom function_clause"
+    );
+}
+
+#[test]
+fn has_map_fields_missing_key_without_fail_on_an_unseeded_module_is_the_typed_gap() {
+    let mut fixture = Fixture::new(&["a", "b"]);
+    let (a, b) = (fixture.atom("a"), fixture.atom("b"));
+    let code = with_fail_body(
+        vec![Instr::HasMapFields {
+            fail: NO_FAIL,
+            source: Operand::X(0),
+            keys: vec![Operand::Atom(a), Operand::Atom(b)],
+        }],
+        Label(2),
+    );
+    let entry = fixture.add_function("f", 1, code);
+    let module = fixture.finish();
+
+    let mut ctx = MinimalContext::new();
+    let map = make_flatmap(&mut ctx, &[(make_atom(a), make_small(1))]).unwrap();
+
+    let (result, _machine) = run(&mut ctx, &module, entry, &[map]);
+    assert_unsupported_reason(
+        result.unwrap_err(),
+        "unsupported_opcode: maps: no 'function_clause' atom in the module",
+    );
 }
 
 // -- put_map_assoc -------------------------------------------------------

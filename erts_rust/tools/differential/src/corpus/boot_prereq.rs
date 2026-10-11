@@ -25,10 +25,9 @@
 //! started (`application:which_applications/0`, `application:loaded_applications/0`), the
 //! code server's view of the preloaded `init`, kernel's `error_logger`/`vsn` application
 //! entries, the boot script's own `register/2` + `whereis/1` and group-leader-inheritance
-//! kernel-process primitives, and the `-boot` init argument (contract A.6) with the
-//! **stopping point** of the real boot chain (`proc_lib:start_link/4`'s cross-module
-//! `proc_lib:sync_start/2` wait, folded into the engine's typed `blocked` gap ⇒ the one honest
-//! `unsupported` case here). Every other case below `agree`s.
+//! kernel-process primitives, and the `-boot` init argument (contract A.6) with the boot
+//! chain's `proc_lib:start_link/4` cross-module `proc_lib:sync_start/2` wait, which both
+//! runtimes complete. Every case in this group `agree`s.
 //!
 //! The group also pins the **booted system's own self-description** — the state a drop-in
 //! runtime must reproduce to be a plausible boot target: `init`'s recorded arguments
@@ -284,13 +283,13 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
-        // --- The `-boot` init argument and the boot chain's blocked seam -----------------
+        // --- The `-boot` init argument and the boot chain's start wait -------------------
         //
-        // The black-box CLI records `-boot FILE` as the init argument `boot` (contract A.6)
-        // but the Rust runtime does not *execute* the boot script, so the real
-        // `bootstrap/bin/start.boot` chain is stopped. `-boot start` is the value both
-        // runtimes resolve identically (the oracle appends `.boot`, so the bare `start`, not
-        // `start.boot`, is what agrees). The negative shape pins the argument's absence.
+        // The black-box CLI records `-boot FILE` as the init argument `boot` (contract A.6).
+        // `-boot start` is the value both runtimes resolve identically (the oracle appends
+        // `.boot`, so the bare `start`, not `start.boot`, is what agrees). The negative shape
+        // pins the argument's absence, and the case below drives the boot chain's own
+        // `proc_lib:start_link/4` wait.
         Case {
             id: "boot/boot_flag_is_recorded_as_init_argument",
             description: "`-boot start` is recorded as the init argument `boot` (a booted init surface)",
@@ -319,23 +318,21 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 1,
             },
         },
-        // The **stopping point** of the real boot chain, pinned as a typed capability gap.
-        // The boot path's `{kernelProcess, application_controller, {application_controller,start}}`
-        // directive is reached through `proc_lib:start_link/4`, whose cross-module
-        // `proc_lib:sync_start/2` `receive` the engine folds into `blocked()`: a boot-chain
-        // child that never acks suspends the process, so the runtime signals the engine's
-        // unchanged `blocked` diagnostic on exit 3 (never a wrong result, never a hang) while
-        // the live oracle answers the same shape. `erlang:node/0` is a child that returns
-        // normally, so the oracle produces a clean, stable line (a crashing child would emit
-        // a timestamped crash report and break the golden). NOT corpus/pinned: the sibling
-        // boot-path surfaces `application:load/1` / `application:start/1` /
-        // `whereis(application_controller)` / `init:get_arguments/0` / `code:priv_dir/1` /
-        // `application:get_all_key/1`, which currently diverge from the oracle with a *plain*
-        // Erlang reason (`exit noproc` / `undefined` / `badarg`) and would (correctly) be a
-        // `mismatch`.
+        // The boot chain's `proc_lib:start_link/4` wait. The boot path's
+        // `{kernelProcess, application_controller, {application_controller,start}}` directive is
+        // reached through `proc_lib:start_link/4`, whose cross-module `proc_lib:sync_start/2`
+        // `receive` the booted system must satisfy: the child here is `erlang:node/0`, which
+        // returns normally, so both runtimes complete the wait and the probe encodes the same
+        // clean `ok` line (a crashing child would emit a timestamped crash report and break the
+        // golden). The `catch` keeps the case about the wait itself rather than about the
+        // child's return value. The sibling boot-path surfaces `application:load/1` /
+        // `application:start/1` / `whereis(application_controller)` / `init:get_arguments/0` /
+        // `code:priv_dir/1` / `application:get_all_key/1` still diverge from the oracle with a
+        // *plain* Erlang reason (`exit noproc` / `undefined` / `badarg`) and would (correctly)
+        // be a `mismatch`, so they stay out of the corpus.
         Case {
             id: "boot/proc_lib_start_link_blocks_the_boot_path",
-            description: "the boot chain's proc_lib:start_link/4 wait is a cross-module receive the engine folds into a typed `blocked` capability gap",
+            description: "the boot chain's proc_lib:start_link/4 cross-module sync_start wait completes in both runtimes",
             contracts: &[Contract::Build],
             kind: CaseKind::Eval {
                 expr: "begin catch proc_lib:start_link(erlang, node, []), ok end",
@@ -622,11 +619,9 @@ mod tests {
     /// The one case here that takes **extra argv**: the `-boot start` CLI flag (contract A.6).
     const BOOT_FLAG_CASES: &[&str] = &["boot/boot_flag_is_recorded_as_init_argument"];
 
-    /// The one honest **capability gap** this group adds: the boot chain's `proc_lib:start_link/4`
-    /// wait, which the engine folds into a typed `blocked` diagnostic (exit 3) — classified
-    /// `unsupported`, never a `mismatch`.
-    const BOOT_GAP_CASES: &[&str] = &["boot/proc_lib_start_link_blocks_the_boot_path"];
-
+    /// The boot chain's `proc_lib:start_link/4` wait: its cross-module `proc_lib:sync_start/2`
+    /// receive completes in both runtimes, so this is an ordinary `agree` case.
+    const BOOT_CHAIN_CASES: &[&str] = &["boot/proc_lib_start_link_blocks_the_boot_path"];
     /// The **booted-system self-description** cases this group adds: plain `-eval` cases (no
     /// extra argv) whose oracle golden the Rust runtime reproduces, asserted by shape or by a
     /// release-stable value. Collected in one list so a new case cannot silently escape review.
@@ -736,33 +731,31 @@ mod tests {
     }
 
     #[test]
-    fn boot_gap_case_is_a_typed_capability_observation() {
+    fn proc_lib_start_link_case_reaches_the_boot_chain_wait() {
         let cases = group();
         let cases = cases.as_slice();
-        let case = case(cases, BOOT_GAP_CASES[0]);
-        assert_eq!(case.contracts, &[Contract::Build], "the boot-gap case");
+        let case = case(cases, BOOT_CHAIN_CASES[0]);
+        assert_eq!(case.contracts, &[Contract::Build], "the start-link case");
         assert!(
             case.extra_argv().is_empty(),
-            "the boot-gap case takes no extra argv"
+            "the start-link case takes no extra argv"
         );
         let CaseKind::Eval { expr, probe, .. } = case.kind else {
-            panic!("the boot-gap case must be an Eval case");
+            panic!("the start-link case must be an Eval case");
         };
-        assert_eq!(probe, Probe::TermToBinary, "the boot-gap case");
+        assert_eq!(probe, Probe::TermToBinary, "the start-link case");
         assert!(
             expr.contains("proc_lib:start_link"),
-            "the boot-gap case must reach the boot chain's start wait: {expr:?}"
+            "the start-link case must reach the boot chain's start wait: {expr:?}"
         );
         assert!(
             expr.contains("catch"),
-            "the boot-gap case must catch the boot chain's wait: {expr:?}"
+            "the start-link case must catch the boot chain's wait: {expr:?}"
         );
-        // The golden is the *oracle's* clean `ok` line (never a capability-gap marker), so the
-        // Rust side is the one that reports the typed gap.
+        // The golden is the oracle's clean `ok` line and the Rust runtime reproduces it exactly.
         assert_eq!(case.golden.stdout, Some("ok <<131,119,2,111,107>>"));
         assert_eq!(case.golden.exit_code, 0);
     }
-
     /// The goldens the new booted-system self-description cases may assert. The list is
     /// explicit (rather than a loose rule) so a new case cannot slip a volatile rendering past
     /// review, and the test also asserts that no entry here is unused. Volatile values (the

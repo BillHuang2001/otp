@@ -738,6 +738,49 @@ fn replace_on_a_duplicate_bag_touches_only_the_matched_object() {
 }
 
 #[test]
+fn repeated_identical_replacement_on_a_duplicate_bag_is_stable() {
+    // erl: duplicate_bag {1,10}/{1,20}/{2,30}; `ets:select_replace(T,
+    //      [{{'$1','$2'},[],[{{'$1',99}}]}])` is `3` and leaves
+    //      `srt(tab2list) == [{1,99},{1,99},{2,99}]`. Running the *identical* spec
+    //      again returns `3` and leaves the table exactly as it was — the rebuild of
+    //      each affected key reclaims the objects it replaces, so repeated
+    //      replacement is idempotent instead of leaking a generation per call (the
+    //      oracle's `ets:info(T, memory)` is stable there too).
+    //
+    //      The crate's storage-side invariant — the store's live words *and* block
+    //      count stay at their warmup floor — is pinned in-crate by
+    //      `table::tests::a_duplicate_bag_replacement_reclaims_the_replaced_objects`,
+    //      where the store's own accounting is reachable; this test pins the
+    //      observable result the oracle can also be asked for.
+    let atoms = atoms();
+    let mut heap = Heap::new(256);
+    let mut t = new_table(TableKind::DuplicateBag);
+    for (key, value) in [(1, 10), (1, 20), (2, 30)] {
+        t.insert(object(&mut heap, key, value), &atoms).unwrap();
+    }
+
+    let head = tuple_of(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+    let body = construct(&mut heap, &[at(&atoms, "$1"), make_small(99)]);
+    let spec = compile(spec1(&mut heap, head, &[], &[body]), &atoms).unwrap();
+
+    let expected = "{ok:3,[{1,99},{1,99},{2,99}]}";
+    assert_eq!(replace_line(&atoms, &mut t, &spec), expected);
+    let memory = t.memory();
+    for round in 1..=100 {
+        assert_eq!(
+            replace_line(&atoms, &mut t, &spec),
+            expected,
+            "round {round}: the replacement is not idempotent"
+        );
+        assert_eq!(
+            t.memory(),
+            memory,
+            "round {round}: `Table::memory` drifted from the warmup floor"
+        );
+    }
+}
+
+#[test]
 fn replace_whose_body_raises_is_badarg() {
     // erl: body `{hd,5}` on {1,10}/{2,20} -> `{badarg,[{1,10},{2,20}]}`.
     // `select_replace` does *not* adopt the body-`EXIT` substitution of

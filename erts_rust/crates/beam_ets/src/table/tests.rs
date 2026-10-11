@@ -397,3 +397,106 @@
             "the runtime move must not drop `decentralized_counters` either"
         );
     }
+
+    /// The atom term named `name` (interned in `atoms`).
+    fn var(atoms: &AtomTable, name: &str) -> Eterm {
+        make_atom(atoms.lookup(name).expect("interned by the test"))
+    }
+
+    /// A `{Key, Value}` object on `heap` (the corpus the `replace_key` rebuild
+    /// reclaims).
+    fn replaced_object(heap: &mut Heap, key: i64, value: i64) -> Eterm {
+        heap.tuple(&[make_small(key), make_small(value)]).unwrap()
+    }
+
+    /// `ets:select_replace/2` on a `duplicate_bag` must **reclaim** the objects it
+    /// replaces, so repeated replacement keeps the table's storage at a stable
+    /// floor.
+    ///
+    /// The key's entry is rebuilt because several objects share the key and the
+    /// replacement must land on the *specific* matched object. Rebuilding from
+    /// `Table::take`'s checked-out copies would leave each checked-out copy's
+    /// storage held for the table's lifetime (`take`'s documented `relinquish`
+    /// semantics), so every round would leak a generation of the affected keys and
+    /// the store would keep mapping fresh blocks that are never handed out again.
+    /// `Table::replace_key` instead deep-copies the rebuilt list **first** and then
+    /// frees the old objects through the ordinary removal path, so the store's
+    /// free-run reuse reaches a steady state.
+    ///
+    /// The observable `Table::memory()` (the store's *live* word count) is flat on
+    /// either implementation — the leak lived in storage the relinquished copies
+    /// still hold — so the invariant is pinned where it is visible: the store's own
+    /// `words`/`blocks` accounting.
+    #[test]
+    fn a_duplicate_bag_replacement_reclaims_the_replaced_objects() {
+        let mut atoms = AtomTable::new();
+        for name in ["$1", "$2"] {
+            atoms.intern(name);
+        }
+        let mut heap = Heap::new(4096);
+        let mut t = table(TableKind::DuplicateBag);
+
+        // Three distinct keys, three objects each. Every object matches the head,
+        // and the body rewrites the value while keeping the key, so every round
+        // replaces all nine objects and rebuilds all three keys.
+        for key in 1..=3 {
+            for value in [10, 20, 30] {
+                t.insert(replaced_object(&mut heap, key, value), &atoms)
+                    .unwrap();
+            }
+        }
+        assert_eq!(t.size(), 9);
+
+        // `[{{'$1','$2'},[],[{{'$1',99}}]}]` — the `{{ … }}` construction form whose
+        // key element is syntactically the head's key, which the static body check
+        // (`static_keeps_key`) requires.
+        let head = heap.tuple(&[var(&atoms, "$1"), var(&atoms, "$2")]).unwrap();
+        let inner = heap.tuple(&[var(&atoms, "$1"), make_small(99)]).unwrap();
+        let body = heap.tuple(&[inner]).unwrap();
+        let body_list = heap.cons(body, NIL).unwrap();
+        let clause = heap.tuple(&[head, NIL, body_list]).unwrap();
+        let spec = crate::select::compile(heap.cons(clause, NIL).unwrap(), &atoms)
+            .expect("the construction body keeps the key");
+
+        // Warmup: the first round also builds the initial free runs the later rounds
+        // reuse, so the floor is taken *after* it. A fresh scratch heap per call
+        // mirrors the BIF layer, which evaluates each request on its own heap.
+        let mut out = beam_alloc::Heap::new(4096).expect("a scratch heap is allocatable");
+        assert_eq!(t.select_replace(&spec, &atoms, &mut out).unwrap(), 9);
+        let floor_words = t.store.words();
+        let floor_blocks = t.store.blocks();
+
+        for round in 1..=100 {
+            let mut out = beam_alloc::Heap::new(4096).expect("a scratch heap is allocatable");
+            assert_eq!(
+                t.select_replace(&spec, &atoms, &mut out).unwrap(),
+                9,
+                "round {round}: every object is replaced on every round"
+            );
+            assert_eq!(
+                t.store.words(),
+                floor_words,
+                "round {round}: the live-word count drifted from the warmup floor"
+            );
+            assert_eq!(
+                t.store.blocks(),
+                floor_blocks,
+                "round {round}: the store mapped a fresh block that is never reused"
+            );
+        }
+
+        // Correctness is preserved: each key still holds its three replaced objects
+        // and nothing else, and the table is still navigable.
+        assert_eq!(t.size(), 9);
+        for key in 1..=3 {
+            let looked = t.lookup(make_small(key), &atoms);
+            assert_eq!(looked.len(), 3, "key {key} lost objects");
+            let expected = replaced_object(&mut heap, key, 99);
+            for object in looked {
+                assert!(
+                    eq(object, expected, &atoms),
+                    "key {key}: the stored object is not the replacement"
+                );
+            }
+        }
+    }

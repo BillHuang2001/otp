@@ -23,7 +23,7 @@
 //!
 //! [`BsGetInteger2`]/[`BsGetBinary2`]/[`BsGetFloat2`] — and the allocating commands of
 //! the flattened [`bs_match`](run_commands) interpreter — read their match context,
-//! take an **allocating** field read (`raw::make_big`, `raw::make_bits`,
+//! take an **allocating** field read (`raw::make_big`, `raw::make_binary`,
 //! `crate::terms::make_float` — each a rooted reservation), and then commit the
 //! advanced position back into the context. Because the reserve can run a **moving**
 //! collector
@@ -227,7 +227,7 @@ fn bs_get_float2_commits_the_advanced_position_to_the_moved_context() {
 // bs_get_binary2
 // ---------------------------------------------------------------------------
 
-/// `make_bits` reserves through the rooted seam, so the binary read collects.
+/// `make_binary` reserves through the rooted seam, so the binary read collects.
 #[test]
 fn bs_get_binary2_commits_the_advanced_position_to_the_moved_context() {
     let mut machine = Machine::with_max_register(4);
