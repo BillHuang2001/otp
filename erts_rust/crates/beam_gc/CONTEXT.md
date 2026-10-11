@@ -80,9 +80,9 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
     live term** (safe for a caller holding **no root set**); a policy ceiling that cannot reach the request
     returns the typed `heap_exhausted` and leaves the collector untouched (Design Decisions)
   - `young_contains(ptr) -> bool` — whether `ptr` is a word of **any** nursery space (current or one a growth
-    retained); `young_space_count() -> usize` — how many spaces the chain holds (`1`, or more after a growth
-    retained one, back to `1` once a collection collapses it). The nursery-range test + chain observable a
-    host's unscanned-root valve needs
+    retained): the nursery-range test the host's unscanned-root valve uses; `young_space_count() -> usize` —
+    how many spaces the chain holds (`1`, or more after a growth retained one, back to `1` once a collection
+    collapses it), a chain observable read only from tests
   - After **every** collection the chain is collapsed back to one space via `Nursery::collapse`, which re-sizes
     that space via `young_after_collection` from the round's
     **surviving** words, and a fullsweep sizes the fresh mature space via `mature_after_fullsweep` from
@@ -530,8 +530,9 @@ constructors only (no new error enum).
   dispatch IS on the production path: `beam_process::Process` owns an `AnyCollector` built from the spawn
   policy (`AnyCollector::new(policy)`), exposes it as `collector() -> &AnyCollector`, and `beam_rt` drives it
   at its heap-admission point (`src/context/gc.rs::{ensure_heap, ensure_heap_full}` → `Process::collect` /
-  `ensure_capacity`), reading the mature generation through the geometry accessors (`mature_contains` in the
-  unscanned-root valve, `mature_used_words` in the memory hook). `selection::select_mature` chooses `Immix`
+  `ensure_capacity`), reading the mature generation through two of the geometry accessors (`mature_contains`
+  in the unscanned-root valve, `mature_used_words` in the memory hook; `mature_capacity_words` / `mature_base`
+  / `mature_available_words` are read only from tests). `selection::select_mature` chooses `Immix`
   only at/above `IMMIX_BREAK_EVEN_WORDS` (8 whole blocks = 2048 words of configured mature generation),
   which the default 233-word policy never reaches — so `GcConfig::default()` / `AnyCollector::new(default
   policy)` build the copying `Collector` and the default path keeps its Copying behaviour (the corpus gate
