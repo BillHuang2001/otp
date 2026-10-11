@@ -28,49 +28,34 @@
 //! `:772-773`), and `filelib:wildcard/1`'s fully-literal case goes through `exists/2` →
 //! `file:read_link_info/1` (`:742-753` + `eval_read_link_info/2`, `:782-783`).
 //!
-//! # The reply the oracle builds
+//! # The reply
 //!
 //! `file_server.erl:141-145`/`:156-160` answers these requests with
-//! `?PRIM_FILE:read_file_info(Name)`/`read_link_info(Name)`, i.e. `prim_file`'s
-//! `read_info_1(Name, FollowLinks, TimeType)` (`erts/preloaded/src/prim_file.erl:647-665`) with
-//! `FollowLinks` = `1`/`0`. That calls `read_info_nif` and reshapes its result through
+//! `?PRIM_FILE:read_file_info(Name [, Opts])`/`read_link_info(Name [, Opts])`, i.e.
+//! `prim_file`'s `read_info_1(Name, FollowLinks, TimeType)` (`erts/preloaded/src/prim_file.erl:647-663`)
+//! with `FollowLinks` = `1`/`0`. That calls `read_info_nif` and reshapes its result through
 //! `adjust_times/2`; the NIF emits the 14-tuple
 //! `{file_info, size, type, access, atime, mtime, ctime, mode, links, major_device,
 //! minor_device, inode, uid, gid}` (`erts/emulator/nifs/common/prim_file_nif.c:996-1017`,
 //! `build_file_info/2`).
 //!
-//! # Why only the failure path is served
+//! Both halves are served here, through the **one** builder the sibling
+//! [`crate::native::prim`] module owns ([`prim::file_info_term`]), so the `#file_info{}`
+//! layout, the `access` derivation and the time conversions cannot drift:
 //!
-//! Thirteen of the fourteen fields come straight out of the `stat(2)`/`lstat(2)` result this
-//! module already performs. The **`access`** slot does not, and it is privilege-sensitive:
+//! * the **failure** path is the `stat(2)`/`lstat(2)` errno (`std::io::Error::raw_os_error`),
+//!   exactly the input `posix_error_to_tuple(erl_errno_id(errno))` takes;
+//! * the **success** path resolves `access` with two real `access(2)` probes (`R_OK` then
+//!   `W_OK`, `erts/emulator/nifs/unix/unix_prim_file.c:739-769`) through
+//!   [`beam_io::fs_access`], the crate that owns the `unsafe` FFI. `access(2)` consults the
+//!   calling process's real uid/gid, the mount's read-only flag and any ACL, so it is **not**
+//!   a function of `st_mode` alone — deriving the bits from the mode would be a fabrication
+//!   (on a host where this runtime is root a mode-`000` file answers `read_write`).
 //!
-//! * the path forms (what this module serves) resolve it with two real **`access(2)`** calls,
-//!   `R_OK` then `W_OK` — `erts/emulator/nifs/unix/unix_prim_file.c:739-769`, `efile_read_info`.
-//!   `access(2)` consults the calling process's real uid/gid, the mount's read-only flag and any
-//!   ACL, so it is **not** a function of `st_mode` alone, and it is reachable only through
-//!   `libc::access` — which `beam_rt`'s `#![deny(unsafe_code)]` forbids.
-//! * the handle form (`efile_read_handle_info` → `check_access`, `:771-801`) derives it from
-//!   `geteuid()`/`getegid()` against the mode bits, and no safe `std` API exposes the effective
-//!   uid/gid either.
-//!
-//! Deriving the bits from `MetadataExt::mode()` plus the file's *own* `uid` would be a
-//! **fabrication**, not an approximation, because the oracle's answer changes with privilege:
-//! on a host where this runtime is root (a `unshare -r` / `nix develop` user namespace), a
-//! mode-`000` file owned by that root answers `read_write` — root bypasses the mode bits in
-//! `access(2)` — while any owner-uid derivation answers `none`. Handing that wrong record to
-//! `filelib:is_dir/1` turns a truthful `true`/`false` into a **divergence**, so the success path
-//! stays the typed capability gap [`serve`] reports.
-//!
-//! The failure path has no such problem: `stat`/`lstat` fail *before* a `#file_info{}` exists,
-//! and `read_info_1/3` returns that `{error, Reason}` (`prim_file.erl:660`) before it ever looks
-//! at the time option — so the oracle's `{error, enoent}` (its
-//! `posix_error_to_tuple(erl_errno_id(errno))`) is exactly reproducible from
-//! `std::io::Error::raw_os_error()`.
-//!
-//! Closing the success path needs one capability from **`beam_io`** — the crate that is allowed
-//! `unsafe`: a safe `path_access(Path) -> (read, write)` wrapping `access(2)` (which also closes
-//! the whole `#file_info{}` family in `crate::native::prim`), plus a
-//! `process_credentials() -> (euid, egid)` for `read_handle_info/1,2`.
+//! A third form, `{read_file_info, Name, Opts}`, carries the same `[{time, posix |
+//! universal | local}]` option its `prim_file` counterpart takes; an unrecognised time type
+//! is the wrapper's **value** `{error, badarg}`, and an `Opts` that is not a proper list is
+//! that helper's uncaught `function_clause` raise.
 
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -78,25 +63,33 @@ use std::os::unix::ffi::OsStrExt;
 use beam_common::Result;
 use beam_term::prelude::*;
 
-use crate::error;
+use crate::context::RuntimeContext;
+use crate::native::prim;
 use crate::runtime::Runtime;
 
-/// Serves `{read_file_info, Name}` (`follow_links`) or `{read_link_info, Name}`
-/// (`!follow_links`) — `file_server.erl:141-145` / `:156-160`, i.e. `prim_file`'s
-/// `read_info_1(Name, FollowLinks, TimeType)` with `1` / `0` (`prim_file.erl:647-655`).
+/// Serves `{read_file_info, Name [, Opts]}` (`follow_links`) or
+/// `{read_link_info, Name [, Opts]}` (`!follow_links`) — `file_server.erl:141-145` /
+/// `:156-160`, i.e. `prim_file`'s `read_info_1(Name, FollowLinks, TimeType)` with `1` / `0`
+/// (`prim_file.erl:647-655`).
 ///
-/// A `stat`/`lstat` failure is the oracle's own `{error, Reason}` — the same syscall, so the
-/// same errno; a path `prim_file:encode_path/1` rejects is `{error, badarg}`, exactly as the
-/// sibling `{open, …}`/`{list_dir, …}` arms answer it. A **successful** stat is the typed
-/// capability gap the module docs justify, never a `#file_info{}` with an invented `access`.
+/// The option is resolved first, because the oracle's `proplist_get_value(time, Opts,
+/// local)` is evaluated **before** the path is encoded and outside the wrapper's `try`: a
+/// non-proper-list `Opts` is an uncaught `function_clause` raise. Then a `stat`/`lstat`
+/// failure is the oracle's own `{error, Reason}` (the same syscall, so the same errno), a
+/// path `prim_file:encode_path/1` rejects is `{error, badarg}` — exactly as the sibling
+/// `{open, …}`/`{list_dir, …}` arms answer it — and a successful stat is the real
+/// `{ok, #file_info{}}`, `access` included.
 ///
 /// # Errors
 ///
-/// [`crate::error::unsupported`] for every path that stats successfully (the `access` slot is
-/// not derivable from safe Rust), and the runtime's allocation diagnostics.
+/// The `function_clause` raise described above, and the runtime's allocation diagnostics.
 pub(super) fn serve(runtime: &mut Runtime, follow_links: bool, args: &[Eterm]) -> Result<Eterm> {
-    let Some(path) = runtime.encode_path(args[0]) else {
-        return runtime.error_tuple("badarg");
+    let mut ctx = RuntimeContext::new(runtime);
+    let Some(time) = ctx.file_info_time(args.get(1).copied()) else {
+        return Err(prim::function_clause());
+    };
+    let Some(path) = ctx.encode_path(args[0]) else {
+        return ctx.error_tuple("badarg");
     };
     let os_path = OsStr::from_bytes(&path);
     // `FollowLinks` is the oracle's `stat`/`lstat` choice (`unix_prim_file.c:742-750`).
@@ -105,18 +98,18 @@ pub(super) fn serve(runtime: &mut Runtime, follow_links: bool, args: &[Eterm]) -
     } else {
         std::fs::symlink_metadata(os_path)
     };
-    match stat {
-        Err(failure) => runtime.error_tuple_for(&failure),
-        Ok(_metadata) => Err(error::unsupported(
-            "file_server: the #file_info{} `access` slot needs access(2), which no safe std API \
-             exposes",
-        )),
-    }
+    let metadata = match stat {
+        Err(failure) => return ctx.error_tuple_for(&failure),
+        Ok(metadata) => metadata,
+    };
+    let access = ctx.path_access_bits(os_path);
+    ctx.file_info_reply(&metadata, access, time)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use beam_engine::terms;
     use crate::native::file_server::tests::{build, runtime};
     use crate::native::file_server::tuple_fields;
     use std::path::{Path, PathBuf};
@@ -209,25 +202,87 @@ mod tests {
         assert_eq!(error_fields(&mut runtime, reply), ["error", "badarg"]);
     }
 
-    /// The success path is the precise typed capability gap: it never produces a
-    /// `#file_info{}`, so `access` can never be invented. The reason names the missing
-    /// capability (`access(2)`), which is what a future `beam_io` facility would close.
+    /// The integer value of a `#file_info{}` field term.
+    fn number(term: Eterm) -> i64 {
+        assert!(is_small(term), "an integer field");
+        beam_term::signed_value(term)
+    }
+    /// The success path is the real `{ok, #file_info{}}`: 14 fields whose metadata-derived
+    /// values are read back from the same `stat(2)`/`lstat(2)` (`std::fs::metadata`), with the
+    /// seven `enif_make_uint` fields **truncated to 32 bits** exactly as `build_file_info/2`
+    /// emits them (`?PRIM_FILE_NIF:996-1017`). The whole-record live-oracle cross-check lives in
+    /// `crate::native::prim::tests`; this pins the `file_server_2` request path onto the same
+    /// record.
     #[test]
-    fn a_successful_stat_is_the_access_capability_gap() {
+    fn an_existing_path_answers_the_real_file_info() {
+        use std::os::unix::fs::MetadataExt;
         let mut runtime = runtime();
         let file = TempFile::new("existing");
+        let metadata = std::fs::metadata(file.path()).expect("a stat");
         for follow_links in [true, false] {
             let term = path_term(&mut runtime, file.path());
-            let error = serve(&mut runtime, follow_links, &[term])
-                .expect_err("a successful stat must stay a typed gap");
-            assert_eq!(
-                crate::error::unsupported_reason(&error).as_deref(),
-                Some(
-                    "file_server: the #file_info{} `access` slot needs access(2), which no safe \
-                     std API exposes"
-                ),
-                "the gap names the missing `access(2)` capability"
-            );
+            let reply = serve(&mut runtime, follow_links, &[term]).expect("a reply");
+            let fields = tuple_fields(reply).expect("an {ok, _} tuple");
+            assert_eq!(fields.len(), 2, "the ok wrapper");
+            assert_eq!(runtime.atom_name(fields[0]).expect("an atom"), "ok");
+            let fields = tuple_fields(fields[1]).expect("a #file_info{}");
+            assert_eq!(fields.len(), 14, "the #file_info{{}} arity");
+            assert_eq!(runtime.atom_name(fields[0]).expect("an atom"), "file_info");            assert_eq!(number(fields[1]), metadata.len() as i64);
+            assert_eq!(runtime.atom_name(fields[2]).expect("an atom"), "regular");
+            assert_eq!(runtime.atom_name(fields[3]).expect("an atom"), "read_write");
+            for when in &fields[4..7] {
+                assert_eq!(
+                    tuple_fields(*when).expect("a datetime").len(),
+                    2,
+                    "each time field is a {{Y,M,D}}/{{H,M,S}} pair"
+                );
+            }
+            assert_eq!(number(fields[7]), i64::from(metadata.mode()));
+            assert_eq!(number(fields[8]), metadata.nlink() as i64);
+            assert_eq!(number(fields[9]), i64::from(metadata.dev() as u32));
+            assert_eq!(number(fields[10]), i64::from(metadata.rdev() as u32));
+            assert_eq!(number(fields[11]), i64::from(metadata.ino() as u32));
+            assert_eq!(number(fields[12]), i64::from(metadata.uid()));
+            assert_eq!(number(fields[13]), i64::from(metadata.gid()));
         }
+    }
+
+    /// The `[{time, posix}]` option the wrapper's `adjust_times/2` recognises is carried
+    /// through, and an unrecognised one is the wrapper's **value** `{error, badarg}` — after the
+    /// stat, so the record is never built.
+    #[test]
+    fn the_time_option_selects_the_representation() {
+        let mut runtime = runtime();
+        let file = TempFile::new("time");
+        let path = path_term(&mut runtime, file.path());
+        let posix = time_option(&mut runtime, "posix");
+        let reply = serve(&mut runtime, true, &[path, posix]).expect("a reply");
+        let fields = tuple_fields(reply).expect("a tuple");
+        assert_eq!(runtime.atom_name(fields[0]).expect("an atom"), "ok");
+        let info = tuple_fields(fields[1]).expect("a #file_info{}");
+        for when in &info[4..7] {
+            assert_eq!(number(*when), metadata_seconds(&file), "raw POSIX seconds");
+        }
+        let bogus = time_option(&mut runtime, "bogus");
+        let reply = serve(&mut runtime, true, &[path, bogus]).expect("a reply");
+        assert_eq!(error_fields(&mut runtime, reply), ["error", "badarg"]);
+    }
+
+    /// `{time, Value}` on the runtime's arena.
+    fn time_option(runtime: &mut Runtime, value: &str) -> Eterm {
+        build(runtime, |ctx| {
+            let key = ctx.atom("time").expect("an atom");
+            let value = ctx.atom(value).expect("an atom");
+            let pair = terms::make_tuple(ctx, &[key, value]).expect("a tuple");
+            terms::make_list(ctx, &[pair]).expect("a list")
+        })
+    }
+    /// The file's own `st_mtime` in whole POSIX seconds — the value a `[{time,posix}]` record
+    /// reports (the NIF's `enif_int64` of `st_mtime`).
+    fn metadata_seconds(file: &TempFile) -> i64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(file.path())
+            .expect("a stat")
+            .mtime()
     }
 }

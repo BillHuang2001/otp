@@ -155,6 +155,7 @@ use beam_engine::terms;
 use beam_term::{is_atom, is_list, is_nil, is_small, make_small, signed_value, Eterm};
 
 use super::RuntimeContext;
+use super::prim::{function_clause, status_access_bits};
 use crate::error;
 use crate::runtime::Runtime;
 
@@ -933,6 +934,44 @@ impl RuntimeContext<'_> {
             Ok(()) => self.ok_atom(),
             Err(error) => self.error_tuple_for(&error),
         }
+    }
+
+    // -- prim_file:read_handle_info/1,2 ---------------------------------------
+
+    /// `prim_file:read_handle_info/1,2` — `read_handle_info_1(Fd, TimeType)`
+    /// (`prim_file.erl:668-676`): `fstat(2)` on the descriptor's own handle, with the
+    /// `access` bits from `check_access/1` (`unix_prim_file.c:771-801`) — the file's own
+    /// uid/gid against the process's **effective** credentials, never an `access(2)` probe.
+    ///
+    /// Oracle: `read_handle_info(Fd)`⇒`{ok,#file_info{}}` (a `0444` file answers `read`, a
+    /// `0644` one `read_write`); `[{time,posix}]`⇒raw POSIX seconds; a descriptor whose slot
+    /// is gone (a closed one)⇒`{error,einval}`; a term that is not a descriptor
+    /// ⇒`{error,badarg}`; a non-list `Opts`⇒an uncaught `function_clause`.
+    pub(super) fn prim_read_handle_info(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let Some(time) = self.file_info_time(args.get(1).copied()) else {
+            return Err(function_clause());
+        };
+        let Some(descriptor) = self.decode_descriptor(args[0]) else {
+            return self.error_tuple("badarg");
+        };
+        self.check_owner(&descriptor)?;
+        // The descriptor borrow stays inside the `match`: the `File` is never held across a
+        // heap-borrowing `self` call (`prim_read/2`'s pattern).
+        let stat = self
+            .runtime
+            .open_files_mut()
+            .get(&descriptor.id)
+            .map(std::fs::File::metadata);
+        let Some(stat) = stat else {
+            return self.error_tuple("einval");
+        };
+        let metadata = match stat {
+            Ok(metadata) => metadata,
+            Err(error) => return self.error_tuple_for(&error),
+        };
+        let (euid, egid) = beam_io::process_credentials()?;
+        let access = status_access_bits(&metadata, euid, egid);
+        self.file_info_reply(&metadata, access, time)
     }
 
     // -- the descriptor decode ------------------------------------------------
