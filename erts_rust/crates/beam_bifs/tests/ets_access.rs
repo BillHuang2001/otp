@@ -94,6 +94,8 @@
 //! T3 = ets:new(t3, [set, {heir, none}]), ets:info(T3, heir).          %% none
 //! ```
 
+use std::process::Command;
+
 use beam_alloc::Heap;
 use beam_bifs::{default_registry, BifContext, BifRegistry, TableRegistry};
 use beam_common::{BeamError, Result};
@@ -721,4 +723,73 @@ fn info_reports_the_owner_pid_and_the_heir() {
     let handle = new_table_with_heir(&reg, &mut heap, &atoms, &mut tables, none);
     let heir = info_field(&reg, &mut heap, &atoms, &mut tables, handle, "heir");
     assert_eq!(atoms.name(atom_val(heir)), Some("none"), "a `{{heir, none}}` option leaves the heir unset");
+}
+
+/// Runs one `-eval` statement under the system `erl`; `None` when the oracle is
+/// unavailable (the test then skips loudly, the `tests/match_spec.rs` /
+/// `tests/os_bif.rs` pattern — never a silent pass).
+fn oracle_eval(statement: &str) -> Option<String> {
+    let output = Command::new("erl")
+        .args(["-noshell", "-eval", statement, "-s", "init", "stop"])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => Some(String::from_utf8_lossy(&out.stdout).into_owned()),
+        Ok(out) => {
+            eprintln!(
+                "SKIP: the oracle `erl` failed ({}); stderr: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            None
+        }
+        Err(err) => {
+            eprintln!("SKIP: no `erl` oracle on PATH ({err})");
+            None
+        }
+    }
+}
+
+/// The live-oracle leg of [`info_reports_the_owner_pid_and_the_heir`]: in the
+/// **owning** process the oracle reports `ets:info(T, owner) =:= self()` as `true`
+/// and an unset heir as `none`, and `{heir, Pid}` records the pid. The in-crate
+/// leg asserts the same facts through the registry and then pins the oracle.
+#[test]
+fn the_live_oracle_agrees_that_the_table_owner_is_the_calling_process() {
+    let reg = default_registry();
+    let mut heap = Heap::new(1 << 20).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut tables = TableRegistry::new();
+
+    // In-crate: the owner is this context's pid, and an unset heir is `none`.
+    let handle = new_protected_table(&reg, &mut heap, &atoms, &mut tables, "set");
+    let owner = info_field(&reg, &mut heap, &atoms, &mut tables, handle, "owner");
+    assert_eq!(owner, OWNER.to_eterm(), "the table owner is the creating process");
+    let heir = info_field(&reg, &mut heap, &atoms, &mut tables, handle, "heir");
+    assert_eq!(atoms.name(atom_val(heir)), Some("none"), "an unset heir is `none`");
+
+    // In-crate: `{heir, Pid}` records the pid.
+    let handle = new_table_with_heir(&reg, &mut heap, &atoms, &mut tables, HEIR.to_eterm());
+    let heir = info_field(&reg, &mut heap, &atoms, &mut tables, handle, "heir");
+    assert_eq!(heir, HEIR.to_eterm(), "the installed heir is the recorded pid");
+
+    // The oracle side, probed with:
+    //   T = ets:new(t, [set]),
+    //   H = spawn(fun() -> receive stop -> ok end end),
+    //   T2 = ets:new(t2, [set, {heir, H}]),
+    //   io:format("~w ~w ~w~n",
+    //       [ets:info(T, owner) =:= self(), ets:info(T, heir), ets:info(T2, heir) =:= H])
+    let statement = "T = ets:new(t, [set]), \
+         H = spawn(fun() -> receive stop -> ok end end), \
+         T2 = ets:new(t2, [set, {heir, H}]), \
+         io:format(\"~w ~w ~w~n\", \
+             [ets:info(T, owner) =:= self(), ets:info(T, heir), ets:info(T2, heir) =:= H])";
+    let Some(stdout) = oracle_eval(statement) else {
+        eprintln!("SKIP: the oracle is unavailable for the ets:info owner/heir probe");
+        return;
+    };
+    assert_eq!(
+        stdout.trim(),
+        "true none true",
+        "the oracle must report the creating process as the owner, an unset heir as `none`"
+    );
 }
