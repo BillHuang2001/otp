@@ -81,15 +81,6 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
 - `reset` clears the register files, stacks, catch frames, contexts, the raise snapshot, the pending exception and
   the trace gate, but **not** the `refc_binaries` arena; a resume (`resume_outcome`) resets nothing, so the
   contexts and the raise snapshot both survive it.
-- **The on-heap refc term owns nothing: `Machine::refc_binaries` is the sole owner of an engine-built payload.**
-  A `[BinRef][ErlSubBits]` term stores only a raw, non-refcounted `BinRef.val` pointer to the payload's first byte
-  (`beam_term::refc`); the only `beam_alloc::RefcBinary` handle that keeps it alive is the one `Machine::alloc_refc_binary`
-  pushes onto `refc_binaries`. `Machine` has **no** `Drop` impl, so dropping a `Machine` drops that `Vec` and frees
-  every payload it built (unless the handle was cloned — cloning is the only refcount increment, via `RefcBinary::clone`).
-  A term that escapes the machine that built it is therefore safe **only** if its payload handle was first cloned into
-  some surviving store (a message's destination off-heap table, the runtime's stabilization table); a bare `Eterm`
-  crossing a machine boundary — a nested `run_export`/`run_label`, a fun/closure apply on a fresh `Machine` — carries
-  a dangling payload pointer once the builder machine is dropped.
 
 ## See Also
 - `../interpreter/CONTEXT.md` → the per-instruction dispatcher (`step_instruction`, also the JIT deopt target).
