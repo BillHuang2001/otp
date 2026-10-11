@@ -161,6 +161,24 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   the `-boot` path, `application_controller` — `code:*`/`init:*`/`application:*` queries are served by a
   native floor (`crates/beam_rt/src/native/{code,init,application}.rs`). Per-crate detail:
   `crates/CONTEXT.md` (A.9 status) and `crates/beam_rt/src/boot/CONTEXT.md`.
+- **A.9 — what an in-process compile actually needs (verified against the code; not yet implemented).**
+  OTP's default `compile:file/2` path (`../lib/compiler`) reaches only `kernel` + `stdlib`: `epp` (an
+  **io-device-only** client — `io:scan_erl_form/4` plus `io:getopts`/`io:setopts` with `binary` and
+  `{encoding,latin1|utf8}`), `erl_features`, `erl_scan`/`erl_parse`/`erl_lint`/`erl_expand_records`, the
+  `v3_core` → `beam_*` passes, and `save_binary`'s `file:delete`/`file:write_file/3`/`file:rename/2`. It
+  does **not** reach `logger`/`error_logger` (diagnostics go to the group leader via
+  `io:put_chars`/`io:fwrite`), a live `code_server` (no `code:*` on the default path), `open_port`,
+  `crypto`/`zlib`/`beam_lib`/`ets`/`persistent_term`/`re`, or `syntax_tools`. The blockers are therefore
+  narrow: the native `file_server_2` lacks the `{write_file,…}` / write-mode `{open,…}` / device
+  `getopts`/`{setopts,…}` requests, and the `compiler` ebin is not on the default code path.
+  `compile:file/2`'s one default spawn (`spawn_monitor` + an untimed `'DOWN'` receive) is avoidable with
+  the documented `no_spawn_compiler_process` option, which keeps the whole compile in the **calling**
+  (pumping) process — the route on which the `file` read path already agrees with the oracle. Two
+  compilations of one source are byte-identical under `+deterministic` (`{deterministic,true}` strips
+  the path-bearing `CInf`/`Line` fields; the `Code` chunk matches either way), so a byte comparison or a
+  `beam_lib:chunks` comparison is a valid acceptance criterion. A **scheduled-process** invoke (the
+  `erl -noshell -s compile` / `erlc` shape) additionally needs the two open engine apply seams
+  (`crates/beam_rt/HANDOFF_boot_apply_seam.md`).
 - **Honest coverage gaps** (per-crate `Known Issues`): the Cranelift hot tier (`jit-cranelift`,
   default-OFF, not on `beam_rt`'s path — the baseline JIT tier is wired for the first module entry);
   full match-spec compiler; ETS concurrency; `put_record/6`'s create form; several
