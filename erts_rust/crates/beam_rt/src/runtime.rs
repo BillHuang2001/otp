@@ -2433,7 +2433,10 @@ mod tests {
         // per-send source-table cost proportional to the number of *distinct* payloads.
         rt.adopt_escaped_binaries(&[kept.clone()]);
         assert_eq!(rt.eval_off_heap.binaries().len(), 1, "no duplicate store entry");
-        drop(kept);
+        // Every borrow the test took (the two source tables, the carried payload set and the
+        // sender's own handle) goes away, leaving the store's single reference — the ownership
+        // invariant that makes the payload outlive the machine that built it.
+        drop((source, carried, union, own, kept));
         assert_eq!(rt.eval_off_heap.binaries()[0].refcount(), 1, "one reference survived");
     }
 
