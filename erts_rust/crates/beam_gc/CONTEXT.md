@@ -103,7 +103,7 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   `blocks_reclaimed`/`words_reclaimed`/`words_pinned`); `pub struct ImmixCounters`.
 
 ### `immix_collector.rs` — `GenImmixCollector` (copying nursery + mark-region mature)
-- `pub struct GenImmixCollector` — the copying young `HeapSpace` paired with an `ImmixSpace` mature.
+- `pub struct GenImmixCollector` — the copying young `Nursery` chain paired with an `ImmixSpace` mature.
   - `with_config(&GcConfig)` (uses `cfg.policy()`; the `MatureKind` is ignored — this type *is* the Immix
     collector); `from_policy(policy)`; `with_allocator(alloc, policy)`
   - `policy()`; `young()`/`young_mut()`; `mature() -> &ImmixSpace`; `stats() -> GcStats`;
