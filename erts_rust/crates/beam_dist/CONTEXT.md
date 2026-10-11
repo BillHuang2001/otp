@@ -559,7 +559,7 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
   tests (`tests/live_interop.rs`, `tests/live_accept.rs`, `tests/live_driver.rs`) use them. The
   hermetic driver tests (`tests/delivery.rs`, `tests/two_node_loopback.rs`) still place small-int
   stand-ins in pid/ref positions, which compare `==` across heaps.
-- **`LOCAL_EXT` (`121`) now exists in the sibling `beam_codec`**: `Encoder::finish_local(hash: u32)`
+- **`LOCAL_EXT` (`121`) exists in the sibling `beam_codec`**: `Encoder::finish_local(hash: u32)`
   and `pub fn encode_term_local(Eterm, &AtomTable, hash: u32)` emit
   `[VERSION_MAGIC][LOCAL_EXT (121)][node-hash:4 BE][body]` with a **caller-supplied** node hash (the
   codec neither computes nor verifies it), and the decoder consumes that wrapper. This is the
