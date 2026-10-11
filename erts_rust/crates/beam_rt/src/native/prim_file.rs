@@ -155,7 +155,9 @@ use beam_engine::terms;
 use beam_term::{is_atom, is_list, is_nil, is_small, make_small, signed_value, Eterm};
 
 use super::RuntimeContext;
+use super::prim::{function_clause, status_access_bits};
 use crate::error;
+use crate::runtime::Runtime;
 
 /// The `Data` key holding this runtime's private open-file registry id.
 ///
@@ -934,6 +936,44 @@ impl RuntimeContext<'_> {
         }
     }
 
+    // -- prim_file:read_handle_info/1,2 ---------------------------------------
+
+    /// `prim_file:read_handle_info/1,2` — `read_handle_info_1(Fd, TimeType)`
+    /// (`prim_file.erl:668-676`): `fstat(2)` on the descriptor's own handle, with the
+    /// `access` bits from `check_access/1` (`unix_prim_file.c:771-801`) — the file's own
+    /// uid/gid against the process's **effective** credentials, never an `access(2)` probe.
+    ///
+    /// Oracle: `read_handle_info(Fd)`⇒`{ok,#file_info{}}` (a `0444` file answers `read`, a
+    /// `0644` one `read_write`); `[{time,posix}]`⇒raw POSIX seconds; a descriptor whose slot
+    /// is gone (a closed one)⇒`{error,einval}`; a term that is not a descriptor
+    /// ⇒`{error,badarg}`; a non-list `Opts`⇒an uncaught `function_clause`.
+    pub(super) fn prim_read_handle_info(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let Some(time) = self.file_info_time(args.get(1).copied()) else {
+            return Err(function_clause());
+        };
+        let Some(descriptor) = self.decode_descriptor(args[0]) else {
+            return self.error_tuple("badarg");
+        };
+        self.check_owner(&descriptor)?;
+        // The descriptor borrow stays inside the `match`: the `File` is never held across a
+        // heap-borrowing `self` call (`prim_read/2`'s pattern).
+        let stat = self
+            .runtime
+            .open_files_mut()
+            .get(&descriptor.id)
+            .map(std::fs::File::metadata);
+        let Some(stat) = stat else {
+            return self.error_tuple("einval");
+        };
+        let metadata = match stat {
+            Ok(metadata) => metadata,
+            Err(error) => return self.error_tuple_for(&error),
+        };
+        let (euid, egid) = beam_io::process_credentials()?;
+        let access = status_access_bits(&metadata, euid, egid);
+        self.file_info_reply(&metadata, access, time)
+    }
+
     // -- the descriptor decode ------------------------------------------------
 
     /// The runtime's private id and recorded owner of a `#file_descriptor{}` argument.
@@ -1171,6 +1211,31 @@ fn descriptor_data(fd: Eterm) -> Option<Eterm> {
         return None;
     }
     Some(data)
+}
+
+/// Moves the OS file behind a `#file_descriptor{}` term out of the runtime's open-file table.
+///
+/// `open/2` answers with a descriptor whose [`REGISTRY_ID_KEY`] entry names the
+/// [`Runtime::open_files_mut`] slot holding the live `std::fs::File`. The native
+/// `file_server_2` io-device opens its file through `prim_file:open/2` — so the flag
+/// derivation, the errno vocabulary and the post-open type checks stay in one place — and
+/// then takes the handle with this function instead of opening the same path a second time.
+///
+/// `None` for a term that is not a well-shaped descriptor, or for one whose slot is already
+/// gone (a handle that has been taken, i.e. a closed one).
+pub(super) fn take_open_file(runtime: &mut Runtime, descriptor: Eterm) -> Option<File> {
+    let data = descriptor_data(descriptor)?;
+    for (key, value) in terms::map_entries(data).ok()? {
+        if !is_small(value) {
+            continue;
+        }
+        let id = u64::try_from(signed_value(value)).ok()?;
+        let is_registry_key = runtime.atom_name_of(key) == Some(REGISTRY_ID_KEY);
+        if is_registry_key {
+            return runtime.open_files_mut().remove(&id);
+        }
+    }
+    None
 }
 
 /// One `read(2)` of at most `count` bytes (`efile_readv`,

@@ -192,15 +192,10 @@ fn listing_a_directory_returns_every_entry() {
     );
 }
 
-/// The exact reason the service reports when a `stat(2)` **succeeded** and the reply would need
-/// the `#file_info{}` `access` slot.
-const FILE_INFO_GAP: &str = "file_server: the #file_info{} `access` slot needs access(2), which \
-                             no safe std API exposes";
-
 /// `filelib:is_dir/1` / `is_file/1` / `is_regular/1` read **only** `#file_info.type`
 /// (`lib/stdlib/src/filelib.erl:273-297`) through `file:read_file_info/1`, so an **absent** path
-/// is decided by the `stat(2)` failure alone — the half of the `read_file_info/1` seam the
-/// native service serves (`{error, enoent}` ⇒ `false`).
+/// is decided by the `stat(2)` failure alone — the service answers that failure path as
+/// `{error, enoent}`, which is the oracle's own `false`.
 #[test]
 fn filelib_existence_probes_on_an_absent_path_are_false() {
     let dir = TempDir::new("filelib_absent");
@@ -236,26 +231,51 @@ fn filelib_wildcard_agrees_on_extant_and_absent_patterns() {
     }
 }
 
-/// The **success** path stays an honest capability gap, and this is the test that keeps it
-/// honest: the `#file_info{}` `access` slot is `access(2)`-derived in the oracle
-/// (`erts/emulator/nifs/unix/unix_prim_file.c:755-762`) and no safe `std` API exposes
-/// `access(2)` or `geteuid(2)`, so the runtime must not invent the field. `filelib:is_dir/1` on
-/// an **existing** directory is exactly the call a fabricated `access` would silently turn into
-/// a wrong `true`/`false`.
+/// The `#file_info{}` **success** path is served: the service builds the whole 14-tuple record,
+/// with its `access` slot derived from a real `access(2)` probe (`beam_io`'s `fs_access`), so
+/// `file:read_file_info/1` on an existing directory returns `{ok,#file_info{}}` — never a typed
+/// capability gap — and the `filelib` existence probes agree with the live oracle. The `atime`/
+/// `mtime`/`ctime` fields are volatile between two runs, so the oracle cross-check compares a
+/// stable `type`/`access`/`mode` projection; `access` is exactly the slot the old typed-gap pin
+/// was about.
 #[test]
-fn the_file_info_success_path_is_the_access_capability_gap() {
-    let dir = TempDir::new("filelib_gap");
-    let mut runtime = Runtime::with_defaults().expect("the default runtime");
+fn the_file_info_success_path_serves_a_real_record() {
+    let dir = TempDir::new("filelib_served");
+    let path = literal(dir.path());
+
+    // `filelib:is_dir/1` reads only `#file_info.type`, so an existing directory is `true`.
+    assert_eq!(
+        renders_like_the_oracle(&format!("filelib:is_dir({path})")),
+        "true",
+        "an existing directory is a directory"
+    );
+
+    // The record's tag and `type` slot are stable concrete values.
+    assert_eq!(
+        renders_like_the_oracle(&format!("element(1, element(2, file:read_file_info({path})))")),
+        "file_info",
+        "the record's tag"
+    );
+    assert_eq!(
+        renders_like_the_oracle(&format!("element(3, element(2, file:read_file_info({path})))")),
+        "directory",
+        "the record's type slot"
+    );
+
+    // Both `read_*_info` forms carry the same stable `type`/`access`/`mode` projection; the live
+    // oracle's own rendering is the expected value, which is what pins the `access` slot.
     for call in [
-        format!("file:read_file_info({})", literal(dir.path())),
-        format!("file:read_link_info({})", literal(dir.path())),
-        format!("filelib:is_dir({})", literal(dir.path())),
+        format!("file:read_file_info({path})"),
+        format!("file:read_link_info({path})"),
     ] {
-        let error = runtime.eval(&call).expect_err(&call);
-        assert_eq!(
-            beam_rt::error::unsupported_reason(&error).as_deref(),
-            Some(FILE_INFO_GAP),
-            "`{call}` must stay the precise typed `access` gap"
+        let projection = format!(
+            "{{element(3, element(2, {call})), element(4, element(2, {call})), \
+              element(8, element(2, {call}))}}"
+        );
+        let rendered = renders_like_the_oracle(&projection);
+        assert!(
+            rendered.starts_with("{directory,"),
+            "expected the `type`/`access`/`mode` projection, got {rendered}"
         );
     }
 }

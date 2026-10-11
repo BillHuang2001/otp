@@ -75,7 +75,8 @@ use beam_term::prelude::{atom_val, is_atom, is_immediate, make_atom, Atom, Eterm
 use crate::error;
 use crate::exit_observer::{ProcessExit, ProcessExitObserver};
 use crate::monitor::{
-    payload_is_down_for, Monitor, MonitorKind, MonitorRef, MonitoredBy, PortWatch, RefAllocator,
+    payload_is_down_for, AliasEntry, Monitor, MonitorKind, MonitorRef, MonitoredBy, PortWatch,
+    RefAllocator, UnaliasMode,
 };
 use crate::pid::{PortId, ProcessId, MAX_PROCESS_NUMBER};
 use crate::port::PortTable;
@@ -242,6 +243,64 @@ fn check_tag(tag: Option<Eterm>) -> Result<Option<Eterm>> {
     }
 }
 
+/// The `erlang:monitor/3` options that **outlive the call**: the `{tag, Tag}` user tag and the
+/// `{alias, Mode}` reference alias.
+///
+/// Both are exactly the options the C's `erts_monitor_opts` parses into its `add_oflags`/`tag`
+/// out-parameters (`bif.c:701-756`). This is the seam the BIF layer (`beam_rt`) passes the
+/// already-parsed option set down through; every `*_with_options` monitor entry point takes it,
+/// and the `*_with_tag` methods are its `alias: None` delegations (so their behaviour is
+/// unchanged for existing callers).
+///
+/// The atom-to-[`UnaliasMode`] parse (`explicit_unalias` / `demonitor` / `reply_demonitor`) is the
+/// caller's job, exactly as the atom-to-[`MonitorKind`] parse is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MonitorOptions {
+    /// The `{tag, Tag}` user tag that replaces the `'DOWN'` head atom (see `monitor.rs`'s
+    /// user-tag contract: it must be a heap-independent immediate).
+    pub tag: Option<Eterm>,
+    /// The `{alias, Mode}` option: when `Some`, the monitor's own reference **doubles as an
+    /// alias** for the watcher, so a message sent to it is delivered to the watcher and it
+    /// expires per `mode`.
+    pub alias: Option<UnaliasMode>,
+}
+
+impl MonitorOptions {
+    /// The `erlang:monitor/2` option set: no tag, no alias.
+    pub const NONE: MonitorOptions = MonitorOptions {
+        tag: None,
+        alias: None,
+    };
+
+    /// The `erlang:monitor/3` `{tag, Tag}`-only option set.
+    pub const fn with_tag(tag: Option<Eterm>) -> MonitorOptions {
+        MonitorOptions { tag, alias: None }
+    }
+}
+
+/// Remembers `reference` as an **alias** owned by `owner`, if the monitor carried an
+/// `{alias, Mode}` option.
+///
+/// Only an alias-flagged reference leaves an entry, so a lookup answering `None` means "not an
+/// alias" (a plain monitor reference, or one whose alias has already expired) — exactly the
+/// shape the send path needs to map to `badarg`.
+fn remember_alias(
+    aliases: &mut HashMap<MonitorRef, AliasEntry>,
+    reference: MonitorRef,
+    owner: ProcessId,
+    mode: Option<UnaliasMode>,
+) {
+    if let Some(mode) = mode {
+        aliases.insert(reference, AliasEntry { owner, mode });
+    }
+}
+
+/// Forgets `reference`'s alias — it has expired (its mode's rule fired), so it must not resolve
+/// to its owner any more.
+fn forget_alias(aliases: &mut HashMap<MonitorRef, AliasEntry>, reference: MonitorRef) {
+    aliases.remove(&reference);
+}
+
 /// Remembers `reference`'s `erlang:monitor/3` user tag, if it has one.
 ///
 /// Only a supplied tag is stored — an untagged monitor leaves no entry, so a lookup answering
@@ -335,6 +394,17 @@ pub struct ProcessTable {
     /// `demonitor`/`demonitor_flush`, the terminated target's watcher sweep, `demonitor_port` and
     /// `port_closed` — so it cannot leak.
     tags: HashMap<MonitorRef, Eterm>,
+    /// The live **reference aliases** (`erlang:alias/1` and the `erlang:monitor/3`
+    /// `{alias, Mode}` option), keyed by the alias reference, holding which process a message sent
+    /// to the reference is delivered to and the mode that expires it.
+    ///
+    /// Like [`ProcessTable::tags`] this is a **plain-value side table** the collector never scans
+    /// (owner and mode are both plain values), and it holds no term. An entry is removed when its
+    /// mode's rule fires — at the monitor's DOWN site, at an explicit `erlang:demonitor/1`, at a
+    /// reply through a `reply_demonitor` alias, or at an explicit `erlang:unalias/1` — and every
+    /// alias of a dying process goes with it (see [`ProcessTable::terminate_into`]), so a
+    /// reference can never resolve to a dead pid.
+    aliases: HashMap<MonitorRef, AliasEntry>,
     /// The atom naming the **local node**, used to spell the `{Name, LocalNode}` target of a
     /// named monitor. `None` until [`ProcessTable::set_local_node`] installs it; a named monitor
     /// requested without it is a typed [`error::unsupported`] rather than a wrong target.
@@ -363,6 +433,7 @@ impl ProcessTable {
             remote_monitors: HashMap::new(),
             named_monitors: HashMap::new(),
             tags: HashMap::new(),
+            aliases: HashMap::new(),
             local_node: None,
             router: None,
             exit_observer: None,
@@ -771,8 +842,8 @@ impl ProcessTable {
     /// recorded (there is nothing left to watch).
     ///
     /// This is the `erlang:monitor/2` form (no `{tag, Tag}` option); it delegates to
-    /// [`ProcessTable::monitor_with_tag`] with `tag = None`, so the notification carries the
-    /// default `'DOWN'` head atom.
+    /// [`ProcessTable::monitor_with_options`] with [`MonitorOptions::NONE`], so the notification
+    /// carries the default `'DOWN'` head atom.
     ///
     /// # Errors
     ///
@@ -784,7 +855,7 @@ impl ProcessTable {
         target: ProcessId,
         kind: MonitorKind,
     ) -> Result<MonitorRef> {
-        self.monitor_with_tag(watcher, target, kind, None)
+        self.monitor_with_options(watcher, target, kind, MonitorOptions::NONE)
     }
 
     /// [`ProcessTable::monitor`] with an `erlang:monitor/3` `{tag, Tag}` **user tag**: the
@@ -805,15 +876,45 @@ impl ProcessTable {
         kind: MonitorKind,
         tag: Option<Eterm>,
     ) -> Result<MonitorRef> {
+        self.monitor_with_options(watcher, target, kind, MonitorOptions::with_tag(tag))
+    }
+
+    /// [`ProcessTable::monitor`] with the full `erlang:monitor/3` option set: the `{tag, Tag}`
+    /// user tag **and** the `{alias, Mode}` reference alias.
+    ///
+    /// With `options.alias = Some(mode)` the monitor's reference also becomes an **alias** for
+    /// `watcher`, so `Ref ! Msg` delivers `Msg` to `watcher`
+    /// ([`ProcessTable::resolve_alias`]), and the alias expires per `mode`
+    /// ([`UnaliasMode`]) — see [`ProcessTable::unalias`] and
+    /// [`ProcessTable::alias_reply_delivered`].
+    ///
+    /// The alias is registered **before** the born-down check, so a monitor on an already-dead
+    /// target still applies its mode's rule at the DOWN site: an `explicit_unalias` alias lives on
+    /// as a standalone alias, while a `demonitor`/`reply_demonitor` one is gone by the time this
+    /// returns — exactly the oracle's behaviour.
+    ///
+    /// # Errors
+    ///
+    /// As [`ProcessTable::monitor`], plus [`error::unsupported_tag`] for a non-immediate tag.
+    pub fn monitor_with_options(
+        &mut self,
+        watcher: ProcessId,
+        target: ProcessId,
+        kind: MonitorKind,
+        options: MonitorOptions,
+    ) -> Result<MonitorRef> {
         if !self.contains(watcher) {
             return Err(error::unknown_process());
         }
-        let tag = check_tag(tag)?;
+        let tag = check_tag(options.tag)?;
         let reference = self.refs.next();
+        remember_alias(&mut self.aliases, reference, watcher, options.alias);
         if !self.contains(target) {
             // Nothing to watch: the monitor is born down (`noproc`), and the watcher is told so
-            // right away. No entry is recorded, so a later `demonitor` finds no local half — it
-            // reports `false`, exactly like a monitor that is already gone.
+            // right away. No monitor entry is recorded, so a later `demonitor` finds no local half
+            // — it reports `false`, exactly like a monitor that is already gone. An alias does not
+            // change that: `deliver_noproc_down` applies the mode's rule to it (an
+            // `explicit_unalias` alias survives as a standalone alias, the other two are gone).
             self.deliver_noproc_down(watcher, reference, target.to_eterm(), tag)?;
             return Ok(reference);
         }
@@ -882,6 +983,11 @@ impl ProcessTable {
         if woke {
             self.ready.push(watcher);
         }
+        // A monitor on an already-dead target is born down, so its `{alias, Mode}` alias must
+        // obey the DOWN-site rule right here: `demonitor`/`reply_demonitor` are gone by the time
+        // this returns, `explicit_unalias` lives on as a standalone alias (the oracle's
+        // behaviour, pinned by `alias.rs`).
+        self.apply_alias_on_down(reference);
         Ok(())
     }
 
@@ -931,6 +1037,8 @@ impl ProcessTable {
         if woke {
             self.ready.push(watcher);
         }
+        // Born down (an unregistered name), so the DOWN-site alias rule applies here too.
+        self.apply_alias_on_down(reference);
         Ok(())
     }
     // --- named monitors ------------------------------------------------------
@@ -975,7 +1083,7 @@ impl ProcessTable {
         node: Atom,
         kind: MonitorKind,
     ) -> Result<MonitorRef> {
-        self.monitor_named_with_tag(watcher, name, node, kind, None)
+        self.monitor_named_with_options(watcher, name, node, kind, MonitorOptions::NONE)
     }
 
     /// [`ProcessTable::monitor_named`] with an `erlang:monitor/3` `{tag, Tag}` **user tag**.
@@ -995,6 +1103,27 @@ impl ProcessTable {
         kind: MonitorKind,
         tag: Option<Eterm>,
     ) -> Result<MonitorRef> {
+        self.monitor_named_with_options(watcher, name, node, kind, MonitorOptions::with_tag(tag))
+    }
+
+    /// [`ProcessTable::monitor_named`] with the full `erlang:monitor/3` option set (see
+    /// [`ProcessTable::monitor_with_options`] for the `{alias, Mode}` contract).
+    ///
+    /// The alias is registered **before** the born-down check, so a named monitor on an
+    /// unregistered name applies its mode's rule at the immediate `noproc` DOWN.
+    ///
+    /// # Errors
+    ///
+    /// As [`ProcessTable::monitor_named`], plus [`error::unsupported_tag`] for a non-immediate
+    /// tag.
+    pub fn monitor_named_with_options(
+        &mut self,
+        watcher: ProcessId,
+        name: Atom,
+        node: Atom,
+        kind: MonitorKind,
+        options: MonitorOptions,
+    ) -> Result<MonitorRef> {
         if !self.contains(watcher) {
             return Err(error::unknown_process());
         }
@@ -1005,8 +1134,9 @@ impl ProcessTable {
             // honest answer.
             return Err(error::named_port_monitor());
         }
-        let tag = check_tag(tag)?;
+        let tag = check_tag(options.tag)?;
         let reference = self.refs.next();
+        remember_alias(&mut self.aliases, reference, watcher, options.alias);
         // `whereis` already resolves "registered but its process is gone" to `None`.
         let Some(target) = self.whereis(name) else {
             self.deliver_named_noproc_down(watcher, reference, name, node, tag)?;
@@ -1062,7 +1192,7 @@ impl ProcessTable {
         port: PortId,
         ports: &mut PortTable,
     ) -> Result<MonitorRef> {
-        self.monitor_port_with_tag(watcher, port, ports, None)
+        self.monitor_port_with_options(watcher, port, ports, MonitorOptions::NONE)
     }
 
     /// [`ProcessTable::monitor_port`] with an `erlang:monitor/3` `{tag, Tag}` **user tag**: the
@@ -1082,10 +1212,43 @@ impl ProcessTable {
         ports: &mut PortTable,
         tag: Option<Eterm>,
     ) -> Result<MonitorRef> {
+        self.monitor_port_with_options(watcher, port, ports, MonitorOptions::with_tag(tag))
+    }
+
+    /// [`ProcessTable::monitor_port`] with the full `erlang:monitor/3` option set.
+    ///
+    /// # Port monitors cannot carry an alias (a typed capability gap)
+    ///
+    /// `{alias, Mode}` on a **port** monitor is refused with the typed
+    /// [`error::unsupported_port_monitor_alias`]. A `reply_demonitor` alias must be consumed where
+    /// a message is delivered *through* it, and that site ([`ProcessTable::alias_reply_delivered`])
+    /// has no handle on the [`PortTable`] — so the incoming
+    /// [`PortMonitor`](crate::port::PortMonitor) on the port could not be removed with the alias.
+    /// Leaving it behind would make a later [`ProcessTable::port_closed`] deliver a `{'DOWN', …}`
+    /// the oracle would not (a **wrong result**), so the honest typed diagnostic is returned
+    /// instead. No caller in OTP combines the two (`gen`'s call paths alias a **process** monitor),
+    /// and the `{tag, Tag}` option is unaffected.
+    ///
+    /// # Errors
+    ///
+    /// As [`ProcessTable::monitor_port`], plus [`error::unsupported_tag`] for a non-immediate tag
+    /// and [`error::unsupported_port_monitor_alias`] for an `{alias, Mode}` option.
+    pub fn monitor_port_with_options(
+        &mut self,
+        watcher: ProcessId,
+        port: PortId,
+        ports: &mut PortTable,
+        options: MonitorOptions,
+    ) -> Result<MonitorRef> {
         if !self.contains(watcher) {
             return Err(error::unknown_process());
         }
-        let tag = check_tag(tag)?;
+        if options.alias.is_some() {
+            // See the method docs: the reply site has no port table, so a port alias could not be
+            // resolved faithfully (a later `port_closed` would deliver a spurious DOWN).
+            return Err(error::unsupported_port_monitor_alias());
+        }
+        let tag = check_tag(options.tag)?;
         let reference = self.refs.next();
         if !ports.contains(port) {
             // Nothing to watch: the port is already gone. Tell the watcher right away and
@@ -1123,7 +1286,7 @@ impl ProcessTable {
         target: Eterm,
         ports: &mut PortTable,
     ) -> Result<MonitorRef> {
-        self.monitor_port_term_with_tag(watcher, target, ports, None)
+        self.monitor_port_term_with_options(watcher, target, ports, MonitorOptions::NONE)
     }
 
     /// [`ProcessTable::monitor_port_term`] with an `erlang:monitor/3` `{tag, Tag}` **user tag**.
@@ -1139,11 +1302,30 @@ impl ProcessTable {
         ports: &mut PortTable,
         tag: Option<Eterm>,
     ) -> Result<MonitorRef> {
+        self.monitor_port_term_with_options(watcher, target, ports, MonitorOptions::with_tag(tag))
+    }
+
+    /// [`ProcessTable::monitor_port_term`] with the full `erlang:monitor/3` option set.
+    ///
+    /// A `{alias, Mode}` option is the typed [`error::unsupported_port_monitor_alias`] (see
+    /// [`ProcessTable::monitor_port_with_options`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`ProcessTable::monitor_port_term`], plus [`error::unsupported_tag`] and
+    /// [`error::unsupported_port_monitor_alias`].
+    pub fn monitor_port_term_with_options(
+        &mut self,
+        watcher: ProcessId,
+        target: Eterm,
+        ports: &mut PortTable,
+        options: MonitorOptions,
+    ) -> Result<MonitorRef> {
         if is_atom(target) {
             return Err(error::named_port_monitor());
         }
         let port = PortId::from_eterm(target)?;
-        self.monitor_port_with_tag(watcher, port, ports, tag)
+        self.monitor_port_with_options(watcher, port, ports, options)
     }
 
     /// Removes the **port** monitor `watcher` holds under `reference`, reporting whether it
@@ -1190,8 +1372,12 @@ impl ProcessTable {
         if ports.contains(watch.port) {
             ports.demonitor(watch.port, reference)?;
         }
-        // The monitor is gone, so its user tag goes with it.
+        // The monitor is gone, so its user tag goes with it — and so does its `{alias, Mode}`
+        // alias, under the same rule the DOWN site uses: `demonitor`/`reply_demonitor` expire,
+        // `explicit_unalias` survives as a standalone alias (the C's `demonitor` replaces the
+        // `UNALIAS` monitor entry with an `ERTS_MON_TYPE_ALIAS` one — `bif.c:466-489`).
         forget_tag(&mut self.tags, reference);
+        self.apply_alias_on_down(reference);
         Ok(true)
     }
 
@@ -1201,6 +1387,10 @@ impl ProcessTable {
     /// The reference may name a **local** monitor (the ordinary case, whose incoming entry on
     /// the target is dropped too) or an outgoing **remote** monitor, which is removed from the
     /// table and routed to the remote node as a `DOP_DEMONITOR_P` control signal.
+    ///
+    /// A standalone `erlang:alias/1` alias is **not** a monitor: `demonitor(Ref)` of one answers
+    /// `false` and leaves the alias alone, exactly as the C does for an `ERTS_MON_TYPE_ALIAS`
+    /// entry (`bif.c:456`).
     ///
     /// # Errors
     ///
@@ -1214,8 +1404,14 @@ impl ProcessTable {
             .get_mut(watcher)
             .and_then(|process| process.monitors_mut().remove(reference));
         let Some(monitor) = local else {
-            // No local monitor under that reference: it may be an outgoing remote one.
-            return self.demonitor_remote(watcher, reference);
+            // No local monitor under that reference: it may be an outgoing remote one. A
+            // *standalone alias* is neither, so this reports `false` and leaves the alias in
+            // place (the oracle's answer for `demonitor(alias())`).
+            let existed = self.demonitor_remote(watcher, reference)?;
+            if existed {
+                self.apply_alias_on_down(reference);
+            }
+            return Ok(existed);
         };
         // Drop the matching incoming entry from the (still living) target.
         if let Some(target) = self.get_mut(monitor.target) {
@@ -1224,8 +1420,13 @@ impl ProcessTable {
                 .retain(|entry| entry.reference != reference);
         }
         // A named monitor's `{Name, node}` descriptor dies with it — and so does its user tag.
+        // The `{alias, Mode}` alias follows the same rule as at the DOWN site (see
+        // `demonitor_port`): `demonitor`/`reply_demonitor` expire, `explicit_unalias` survives as
+        // a standalone alias (the C replaces the monitor entry with an `ERTS_MON_TYPE_ALIAS` one,
+        // `bif.c:466-489`).
         self.named_monitors.remove(&reference);
         forget_tag(&mut self.tags, reference);
+        self.apply_alias_on_down(reference);
         Ok(true)
     }
 
@@ -1313,6 +1514,165 @@ impl ProcessTable {
         Ok(true)
     }
 
+    // --- reference aliases (`erlang:alias/1`, `erlang:unalias/1`) ------------
+
+    /// Resolves a monitor reference used as a **send destination** to the process a message sent
+    /// to it must be delivered to, or `None` when the reference is not a live alias.
+    ///
+    /// This is the send path's lookup for the `alias/1` and `erlang:monitor/3 {alias, Mode}`
+    /// features: a reference minted by either is a valid `Ref ! Msg` destination, and the message
+    /// then goes to the **alias owner** — the process that created the alias
+    /// ([`AliasEntry::owner`]). Anything else answers `None`, which the BIF layer maps onto the
+    /// oracle's `badarg` for `SomeNonRef ! Msg`:
+    ///
+    /// * a plain monitor reference (never an alias, or one whose mode's rule already fired), and
+    /// * a reference whose **owner has died** — every alias of a dying process is swept by
+    ///   [`ProcessTable::terminate_into`], so this is a belt-and-braces check that a reference can
+    ///   never resolve to a dead pid.
+    ///
+    /// The lookup is read-only and holds no borrow across the check.
+    pub fn resolve_alias(&self, reference: MonitorRef) -> Option<ProcessId> {
+        let entry = self.aliases.get(&reference)?;
+        if self.contains(entry.owner) {
+            Some(entry.owner)
+        } else {
+            None
+        }
+    }
+
+    /// Mints a **standalone reference alias** owned by `owner` and returns it — the
+    /// `erlang:alias/1` operation.
+    ///
+    /// The new reference is a valid send destination
+    /// ([`ProcessTable::resolve_alias`] answers `owner`) and is removed only by
+    /// [`ProcessTable::unalias`] (for [`UnaliasMode::ExplicitUnalias`]) or by the mode's own rule
+    /// at the DOWN/reply sites. **No monitor is recorded**: like the C's `ERTS_MON_TYPE_ALIAS`
+    /// entry (`bif.c:5930-5945`), a standalone alias has no target, so
+    /// [`ProcessTable::demonitor`] of it reports `false`.
+    ///
+    /// The name "standalone" is the C's distinction: a `{alias, Mode}` alias on a monitor shares
+    /// its reference with a real monitor entry, whereas this one exists on its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::TermNotFound` when `owner` is not a live local process.
+    pub fn create_alias(&mut self, owner: ProcessId, mode: UnaliasMode) -> Result<MonitorRef> {
+        if !self.contains(owner) {
+            return Err(error::unknown_process());
+        }
+        let reference = self.refs.next();
+        remember_alias(&mut self.aliases, reference, owner, Some(mode));
+        Ok(reference)
+    }
+
+    /// `erlang:unalias/1`: clears the alias `owner` holds under `reference`, reporting whether one
+    /// was cleared.
+    ///
+    /// This is the C's `unalias_1` (`bif.c:5947-5978`) one-for-one:
+    ///
+    /// * an entry keyed by `reference` whose owner is `owner` and which genuinely carries an alias
+    ///   ⇒ the alias is cleared and `true` is returned. A **monitor** that shares the reference (a
+    ///   `{alias, Mode}` monitor) is left intact — the C only clears the alias flags, and deletes
+    ///   the entry solely when it is an `ERTS_MON_TYPE_ALIAS` standalone alias; the monitor's
+    ///   `{'DOWN', …}` is still delivered,
+    /// * no such alias (a plain monitor reference, an already-cleared alias, a reference belonging
+    ///   to **another** process, or a reference this table never minted) ⇒ `false`.
+    ///
+    /// The `Reference` parse itself (a non-reference ⇒ the oracle's `badarg`) is the BIF layer's
+    /// job: it calls [`MonitorRef::from_eterm`] before this, exactly as it does for
+    /// `erlang:demonitor/1`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::TermNotFound` when `owner` is not a live local process.
+    pub fn unalias(&mut self, owner: ProcessId, reference: MonitorRef) -> Result<bool> {
+        if !self.contains(owner) {
+            return Err(error::unknown_process());
+        }
+        match self.aliases.get(&reference) {
+            Some(entry) if entry.owner == owner => {
+                // Only the alias goes: a monitor sharing the reference keeps its `Monitor` /
+                // `MonitoredBy` records, its `named_monitors` descriptor and its user tag (the C
+                // merely clears `ERTS_ML_STATE_ALIAS_MASK`, `bif.c:5963`).
+                forget_alias(&mut self.aliases, reference);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Consumes the alias `reference` **because a message was delivered through it** — the
+    /// reply site of a `reply_demonitor` (`ERTS_ML_STATE_ALIAS_ONCE`) alias.
+    ///
+    /// The C's `handle_altact_msg` (`erl_proc_sig_queue.c:6041-6049`) does two things for an
+    /// `ALIAS_ONCE` alias when a message arrives through it: it deletes the alias entry, and —
+    /// when the entry is a **monitor** — it sends the demonitor, so the monitor dies with the
+    /// alias. A message through a `demonitor`/`explicit_unalias` alias does **not** consume it, so
+    /// any other mode (and a reference that is not a live alias at all) is a no-op.
+    ///
+    /// When a monitor shares the reference, the removal is routed through
+    /// [`ProcessTable::demonitor`] so **everything** the demonitor site resolves is resolved here
+    /// too: the watcher's outgoing record, the target's incoming one, the `named_monitors`
+    /// descriptor, the user tag and any outgoing remote half. A **standalone** `alias/1` alias has
+    /// no monitor, so `demonitor` reports `false` and only the alias entry is dropped — exactly
+    /// the C's `ERTS_MON_TYPE_ALIAS` arm.
+    ///
+    /// # Errors
+    ///
+    /// For a live owner, propagates [`ProcessTable::demonitor`]'s errors (the router's transport
+    /// errors for a remote monitor). An alias whose owner has since died is a no-op — nothing
+    /// could have been delivered through it anyway.
+    pub fn alias_reply_delivered(&mut self, reference: MonitorRef) -> Result<()> {
+        let Some(entry) = self.aliases.get(&reference).copied() else {
+            // Not an alias, or its rule already fired: the message was still delivered (the
+            // caller resolved it), but there is nothing to consume here.
+            return Ok(());
+        };
+        if entry.mode != UnaliasMode::ReplyDemonitor {
+            // `demonitor`/`explicit_unalias` aliases survive a delivery (the latter forever, the
+            // former until the monitored target goes down).
+            return Ok(());
+        }
+        if self.contains(entry.owner) {
+            // A monitor sharing the reference dies with it (`erts_proc_sig_send_demonitor`); a
+            // standalone alias is not a monitor, so this answers `false` and changes nothing.
+            self.demonitor(entry.owner, reference)?;
+        }
+        // `demonitor` already cleared the alias for the `ReplyDemonitor` mode (the DOWN-site
+        // rule); this covers the standalone-alias case `demonitor` deliberately leaves alone.
+        forget_alias(&mut self.aliases, reference);
+        Ok(())
+    }
+
+    /// Applies the **DOWN-site** alias rule for `reference`.
+    ///
+    /// The C's DOWN path (`erl_proc_sig_queue.c:6466-6493`) resolves an origin monitor's alias
+    /// exactly as its `demonitor` does (`bif.c:466-489`): `ALIAS_ONCE` (`reply_demonitor`) and
+    /// `ALIAS_DEMONITOR` (`demonitor`) delete the entry — so the alias dies with the monitor —
+    /// while `ALIAS_UNALIAS` (`explicit_unalias`) degrades the monitor entry into a standalone
+    /// `ERTS_MON_TYPE_ALIAS` one, so the **alias survives** its target's death.
+    ///
+    /// This is the rule the two DOWN materialisation sites share (the dying target's watcher sweep
+    /// in [`ProcessTable::terminate_into`], the born-down `noproc` paths, and
+    /// [`ProcessTable::port_closed`]), and it is why the born-down case needs it: the alias is
+    /// registered before the target's liveness is checked, so an `explicit_unalias` alias on an
+    /// already-dead target lives on while a `demonitor`/`reply_demonitor` one is gone by the time
+    /// the monitor call returns (oracle-verified).
+    ///
+    /// It is also the rule [`ProcessTable::demonitor`] / [`ProcessTable::demonitor_port`] apply,
+    /// because the C's `demonitor` case analysis is literally the same one.
+    ///
+    /// A reference with no alias entry is a no-op, so every site may call this unconditionally.
+    fn apply_alias_on_down(&mut self, reference: MonitorRef) {
+        match self.aliases.get(&reference) {
+            Some(entry) if entry.mode != UnaliasMode::ExplicitUnalias => {
+                forget_alias(&mut self.aliases, reference);
+            }
+            // An `explicit_unalias` alias survives the DOWN as a standalone alias (the C replaces
+            // the monitor entry rather than deleting it).
+            _ => {}
+        }
+    }
     /// Terminates `pid` with `reason`, propagating to its links and monitors and cascading
     /// through the pending-signal worklist.
     ///
@@ -1535,6 +1895,11 @@ impl ProcessTable {
                 }
             };
             forget_tag(&mut self.tags, watcher.reference);
+            // The monitor is resolved, so its `{alias, Mode}` alias follows the DOWN-site rule:
+            // `demonitor`/`reply_demonitor` expire with their monitor, while an
+            // `explicit_unalias` alias survives as a standalone alias (the C replaces the monitor
+            // entry with an `ERTS_MON_TYPE_ALIAS` one — `erl_proc_sig_queue.c:6466-6493`).
+            self.apply_alias_on_down(watcher.reference);
             if let Some(watcher_process) = self.get_mut(watcher.watcher) {
                 watcher_process.monitors_mut().remove(watcher.reference);
             }
@@ -1557,6 +1922,13 @@ impl ProcessTable {
             forget_tag(&mut self.tags, reference);
         }
 
+        // 3b. Reference aliases owned by the dying process all go with it — **including** the
+        //     standalone `erlang:alias/1` aliases, which are not monitor records and so are not
+        //     among `outgoing` above. A message sent to a reference whose owner has died has no
+        //     destination: `resolve_alias` would answer `None` anyway (it re-checks liveness), but
+        //     dropping the entries here keeps the table from accumulating records for dead pids
+        //     and makes the guarantee unconditional.
+        self.aliases.retain(|_, entry| entry.owner != pid);
         // 4. Remote links and monitors: a dying process leaves the node's records, and every
         //    remote link partner must be told the process is gone. This runs before
         //    `drop(process)` because `reason` may live in the dying heap the router reads. A
@@ -2178,7 +2550,7 @@ impl ProcessTable {
         target: Eterm,
         kind: MonitorKind,
     ) -> Result<MonitorRef> {
-        self.monitor_term_with_tag(watcher, target, kind, None)
+        self.monitor_term_with_options(watcher, target, kind, MonitorOptions::NONE)
     }
 
     /// [`ProcessTable::monitor_term`] with an `erlang:monitor/3` `{tag, Tag}` **user tag**: a
@@ -2201,7 +2573,39 @@ impl ProcessTable {
         kind: MonitorKind,
         tag: Option<Eterm>,
     ) -> Result<MonitorRef> {
-        let tag = check_tag(tag)?;
+        self.monitor_term_with_options(watcher, target, kind, MonitorOptions::with_tag(tag))
+    }
+
+    /// [`ProcessTable::monitor_term`] with the full `erlang:monitor/3` option set: the `{tag, Tag}`
+    /// user tag **and** the `{alias, Mode}` reference alias.
+    ///
+    /// Every local dispatch reaches an alias-capable entry point
+    /// ([`ProcessTable::monitor_with_options`] for a pid,
+    /// [`ProcessTable::monitor_named_with_options`] for a registered name), so a
+    /// `monitor(process, Target, [{alias, Mode}])` behaves exactly like the direct call.
+    ///
+    /// A **port** term is refused in each of its forms, as before: `MonitorKind::Port` is the typed
+    /// [`error::unsupported`] (a port term needs the port table — use
+    /// [`ProcessTable::monitor_port_term`]) and `MonitorKind::Process` is the oracle's `badarg`.
+    /// The port-table entry points do accept the `{tag, Tag}` option; an `{alias, Mode}` one is the
+    /// typed [`error::unsupported_port_monitor_alias`] there.
+    ///
+    /// A **remote** (external-pid) target accepts neither option: the wire monitor signal
+    /// (`DistSignal::Monitor` → `DOP_MONITOR_P`) carries no tag and no alias, so each is a typed
+    /// [`error::unsupported`] rather than a silently dropped option.
+    ///
+    /// # Errors
+    ///
+    /// As [`ProcessTable::monitor_term_with_tag`], plus [`error::unsupported`] for an
+    /// `{alias, Mode}` option on a remote target.
+    pub fn monitor_term_with_options(
+        &mut self,
+        watcher: ProcessId,
+        target: Eterm,
+        kind: MonitorKind,
+        options: MonitorOptions,
+    ) -> Result<MonitorRef> {
+        let tag = check_tag(options.tag)?;
         if PortId::is_port(target) {
             return match kind {
                 MonitorKind::Port => Err(error::unsupported(
@@ -2223,15 +2627,22 @@ impl ProcessTable {
                     "monitor/2: name target requires the local node (set_local_node)",
                 ));
             };
-            return self.monitor_named_with_tag(watcher, atom_val(target), node, kind, tag);
+            return self.monitor_named_with_options(watcher, atom_val(target), node, kind, options);
         }
         match PidTarget::from_eterm(target)? {
-            PidTarget::Local(pid) => self.monitor_with_tag(watcher, pid, kind, tag),
+            PidTarget::Local(pid) => self.monitor_with_options(watcher, pid, kind, options),
             PidTarget::Remote(remote) => {
                 if tag.is_some() {
                     // The wire monitor signal has no tag field (see the method docs).
                     return Err(error::unsupported(
                         "monitor/3: tag on a remote target (DOP_MONITOR_P carries no tag)",
+                    ));
+                }
+                if options.alias.is_some() {
+                    // ...and no alias field either: the remote node builds the DOWN from its own
+                    // monitor record, so it could not know when to expire the alias.
+                    return Err(error::unsupported(
+                        "monitor/3: {alias, Mode} on a remote target (DOP_MONITOR_P carries no alias)",
                     ));
                 }
                 if !self.contains(watcher) {
@@ -2256,7 +2667,6 @@ impl ProcessTable {
             }
         }
     }
-
     /// `erlang:exit/2` against an arbitrary pid term: a local pid exits through
     /// [`ProcessTable::send_exit`], an external pid is routed as a `DOP_EXIT2` control signal
     /// ([`DistSignal::Exit2`] — a plain exit signal, *not* the link exit `DOP_EXIT`).
@@ -2581,6 +2991,11 @@ impl ProcessTable {
             }
             let tag = self.tags.get(&monitor.reference).copied();
             forget_tag(&mut self.tags, monitor.reference);
+            // A port monitor cannot carry an alias in this crate
+            // (`error::unsupported_port_monitor_alias`), so this is a no-op today; it is called
+            // anyway so the DOWN site applies the one shared rule rather than relying on the
+            // invariant holding forever.
+            self.apply_alias_on_down(monitor.reference);
             self.enqueue_port_down_message(monitor.watcher, monitor.reference, port, tag, reason)?;
         }
 

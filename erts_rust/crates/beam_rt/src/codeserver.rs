@@ -166,12 +166,15 @@ impl CodeServer {
     }
 
     /// Appends the **system** `ebin` directories (stdlib, kernel and erts) to the code
-    /// path.
+    /// path, followed by the [`EXTRA_CODE_PATH_APPS`] applications (today just `compiler`).
     ///
-    /// The directories are resolved once per process (see [`system_ebins`]) from
+    /// The base directories are resolved once per process (see [`system_ebins`]) from
     /// `$ERTS_STDLIB_DIR`, from the installation's own filesystem layout, or — as a last
     /// resort — from the system `erl`. A failure here is a hard error: running without a
-    /// standard library is never silent.
+    /// standard library is never silent. The extras are then located from those *resolved*
+    /// directories ([`extra_app_ebins`]), so the acceptance rule — and `system_ebins()`
+    /// itself — is untouched; an application this host does not have is simply not added
+    /// (a path is never fabricated).
     ///
     /// They are *boot-time default* entries ([`CodeServer::add_default_path`]), so a later
     /// [`CodeServer::reset_paths_to_defaults`] keeps them.
@@ -181,7 +184,16 @@ impl CodeServer {
     /// A message-carrying [`beam_common::BeamError`] naming the environment variable or the
     /// `erl` invocation that failed.
     pub fn add_system_paths(&mut self) -> Result<()> {
-        for dir in system_ebins()? {
+        let base = system_ebins()?;
+        for dir in &base {
+            self.add_default_path(dir.clone());
+        }
+        // Applications the code path needs *beyond* the acceptance probe. `system_ebins()`
+        // keeps its exact meaning (stdlib/kernel/erts, with `lists.beam` the hard
+        // requirement), so root acceptance is unchanged; the extras are located from the
+        // *resolved* base directories, whatever their source (`native_system_ebins` or the
+        // `erl` fallback).
+        for dir in extra_app_ebins(&base) {
             self.add_default_path(dir);
         }
         Ok(())
@@ -667,6 +679,16 @@ fn erl_system_ebins() -> Result<Vec<PathBuf>> {
 /// code path must include that directory for the loader to resolve them.
 const SYSTEM_APPS: &[(&str, &str)] = &[("stdlib", "lists"), ("kernel", "kernel"), ("erts", "init")];
 
+/// Applications appended to the resolved system code path **beyond** the [`SYSTEM_APPS`]
+/// acceptance probe, each paired with a module its `ebin` must contain.
+///
+/// `compiler` is what the in-process `compile:file/2` path (contract A.9, self-hosted build)
+/// needs: the OTP compiler's public API lives in `<lib>/compiler-<vsn>/ebin`. Keeping it out
+/// of [`SYSTEM_APPS`] is deliberate — that list *is* the candidate-root acceptance probe
+/// (stdlib/`lists.beam` is the hard requirement), so adding an optional application there
+/// would change which installation roots are usable.
+const EXTRA_CODE_PATH_APPS: &[(&str, &str)] = &[("compiler", "compile")];
+
 /// The `erl -eval` program that prints the [`SYSTEM_APPS`] directories, one per line.
 ///
 /// This is the shell-out fallback's argument list ([`erl_system_ebins`]) only.
@@ -747,6 +769,35 @@ fn find_sibling_ebin(lib_root: &Path, prefix: &str, module: &str) -> Option<Path
     candidates
         .iter()
         .find_map(|candidate| app_ebin(candidate, module))
+}
+
+/// The `ebin` directories of the [`EXTRA_CODE_PATH_APPS`] applications, located from the
+/// **resolved** base `ebin` directories.
+///
+/// The `<lib>` root is derived exactly the way [`CodeServer::lib_root`] derives it — from an
+/// `…/<lib>/<app>-<vsn>/ebin` base entry — and each extra application is then looked up
+/// first in the versioned installed layout (`<lib>/<app>-<vsn>/ebin`, via
+/// [`find_sibling_ebin`]) and then in the source-tree unversioned layout
+/// (`<lib>/<app>/ebin`, via [`app_ebin`]).
+///
+/// A directory is returned only when it really holds the application's probe module, so a
+/// path is **never fabricated**; the result is empty when the base directories carry no lib
+/// root (an `$ERTS_STDLIB_DIR` pointing straight at an `ebin`, a runtime with only explicit
+/// `-pa` directories) or when the host does not have the application installed.
+fn extra_app_ebins(base: &[PathBuf]) -> Vec<PathBuf> {
+    let Some(root) = base
+        .iter()
+        .filter(|path| is_ebin(path))
+        .find_map(|path| ebin_lib_root(path))
+    else {
+        return Vec::new();
+    };
+    EXTRA_CODE_PATH_APPS
+        .iter()
+        .filter_map(|(app, module)| {
+            find_sibling_ebin(&root, app, module).or_else(|| app_ebin(&root.join(app), module))
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -132,3 +132,27 @@ crate-level ones in `../CONTEXT.md`:
 - A non-finite float result and a non-float FR slot are the documented `badarith`
   failure; a wide (> 64 bit) segment goes through the byte model (`push_wide_int`,
   `read_wide_integer_field`), so no width is silently truncated.
+
+## Known Issues
+- **`bs_get_integer2`/`bs_get_binary2`/`bs_get_float2` (`matching/mod.rs`) bind the
+  destination BEFORE committing the advanced context position, so they break when the
+  destination operand IS the match-context operand.** Each arm calls
+  `write_operand(machine, dst, value)` first (`bs_get_integer2` L216, `bs_get_binary2`
+  L256, `bs_get_float2` L339) and only then `reread_ctx(machine, ctx, ctx_op, …)` +
+  `raw::set_ctx_start(term, start + nbits)` (L221/222, L260/261, L343/344). When
+  `dst == ctx_op` (the installed `erlc` emits exactly this: `beam_asm:filter_essentials/1`
+  compiles to `{test,bs_get_binary2,{f,91},5,[{tr,{x,3},{t_bs_matchable,1}},…],{x,3}}`,
+  ctx == dst == `x(3)`), the destination write clobbers the context register, so the
+  post-write `reread_ctx` reads a binary instead of a context and the arm returns the
+  typed `unsupported("bs_get_binary2: operand is not a match context")`. Observable under
+  `beam_rt`: `compile:forms(Forms,[binary])` (and `[to_kernel]`/`[to_ssa]`/`[]` — all run
+  the `beam_asm` pass → `beam_asm:module_md5/1` → `filter_essentials/1`) yields the typed
+  error atom, while `compile:forms(Forms,[to_asm])` succeeds only because `compile.erl`
+  stops the pass pipeline before `beam_asm` (`{iff,'to_asm',{done,"S"}}`, `compile.erl:2050`).
+  The C advances `sb->start` inside `erts_bs_get_{integer,binary,float}_2` **before** the
+  instruction's `$Dst = _result` (`emu/bs_instrs.tab:182-199`/`237-258`, `erl_bits.c:314`
+  /`421`/`607`), and this node's `bs_match` command interpreter already commits before
+  binding (`commands.rs` `integer`/`binary` → `commit` then `write_operand`,
+  L136-137/L167-168). Correct order: `reread_ctx` + `set_ctx_start` **first**, then
+  `write_operand(dst, value)`. `bs_get_utf8`/`bs_get_utf16`/`bs_get_utf32` are unaffected
+  (they use the pre-computed `term` and their small-int result allocates nothing).

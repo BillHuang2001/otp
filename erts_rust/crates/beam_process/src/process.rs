@@ -129,6 +129,19 @@ const FLAG_ACTIVE: u32 = 1 << 4;
 /// The `sensitive` flag bit (`process_flag(sensitive, Bool)`).
 const FLAG_SENSITIVE: u32 = 1 << 5;
 
+/// How many envelope words one queued message contributes to a collection's root slice.
+///
+/// The order is fixed: `[payload, from, token]` — see [`Process::run_rooted_collection`], which
+/// gathers them in that order and scatters them back through
+/// [`Message::with_payload`]/[`Message::set_from`]/[`Message::set_token`].
+const MESSAGE_ROOT_WORDS: usize = 3;
+/// The offset of a message's payload word within its [`MESSAGE_ROOT_WORDS`] slice.
+const MESSAGE_ROOT_PAYLOAD: usize = 0;
+/// The offset of a message's `from` word within its [`MESSAGE_ROOT_WORDS`] slice.
+const MESSAGE_ROOT_FROM: usize = 1;
+/// The offset of a message's `token` word within its [`MESSAGE_ROOT_WORDS`] slice.
+const MESSAGE_ROOT_TOKEN: usize = 2;
+
 impl ProcessFlags {
     /// No flags set.
     pub fn new() -> ProcessFlags {
@@ -1054,15 +1067,16 @@ impl Process {
     /// Runs a safepoint collection over the whole process root set.
     ///
     /// The root set is the registers/stack ([`Registers::gather_roots`]) **plus** the
-    /// mailbox payloads, the process dictionary ([`Dict::gather_roots`]), the saved BIF/NIF
-    /// arguments ([`SavedArgs::gather_roots`]) and the pending-signal queue
-    /// ([`SignalQueue::gather_roots`]) — all in-heap sub-rootsets: the queue is drained, every
-    /// payload and the dict/saved-arg/signal words are appended to the root buffer, the
-    /// collector runs, and each region is written back (registers via
-    /// [`Registers::scatter_roots`], each message re-installed around its relocated payload
-    /// through [`Message::with_payload`] — so its `from`/`token`/off-heap handles/refc
-    /// binaries/node entries/fragment chain travel with it — then the dict, the saved args and
-    /// the pending signals scattered back) in the SAME order it was gathered.
+    /// mailbox message-envelope words, the process dictionary ([`Dict::gather_roots`]), the
+    /// saved BIF/NIF arguments ([`SavedArgs::gather_roots`]) and the pending-signal queue
+    /// ([`SignalQueue::gather_roots`]) — all in-heap sub-rootsets: the queue is drained, each
+    /// message's `payload`/`from`/`token` and the dict/saved-arg/signal words are appended to
+    /// the root buffer, the collector runs, and each region is written back (registers via
+    /// [`Registers::scatter_roots`], each message re-installed through [`Message::with_payload`]
+    /// with its relocated `from`/`token` written back through
+    /// [`Message::set_from`]/[`Message::set_token`] — its off-heap handles/refc binaries/node
+    /// entries/fragment chain travel with the [`Message::with_payload`] rebuild — then the dict,
+    /// the saved args and the pending signals scattered back) in the SAME order it was gathered.
     ///
     /// A **fragment-resident** payload (a message too large for the receiver's heap) points
     /// into the message's own [`Fragments`], not into the nursery being collected, so the
@@ -1137,28 +1151,39 @@ impl Process {
     /// heap. On a fail-fast / pre-copy failure the roots are un-relocated and the write-back is
     /// a harmless no-op (it rewrites the same values and re-installs the same payloads).
     ///
-    /// A queued message is re-installed with [`Message::with_payload`] — the relocation-safe
-    /// rebuild — so **everything but the payload word** travels across untouched: its `from`,
-    /// `token`, off-heap handle list, refc-binary list, node list and its [`Fragments`] chain
-    /// (for a payload too large for the receiver's heap, which lives *in* those fragments rather
-    /// than in the nursery being collected). Rebuilding from scratch would drop the fragment
-    /// chain — a use-after-free, since the payload would then point into freed fragments — and
-    /// would leak the refcounts the message held on its off-heap objects.
+    /// Each queued message contributes **three** envelope words to the root set — its `payload`,
+    /// its `from` and its `token`, in that order — and all three are written back afterwards. The
+    /// common case is an immediate sender pid / node atom / sysname, but the envelope is a general
+    /// term seam: a host may store a heap word in either slot (the C allows a heap `token` tuple
+    /// `erl_message.c:388-390` and a heap `Info`-tuple `from` `erl_proc_sig_queue.c:2272`), and an
+    /// un-relocated heap word would dangle into the evacuated from-space.
+    /// [`Message::with_payload`] rebuilds the message (the relocation-safe form, which carries the
+    /// off-heap handle list, the refc-binary list, the node list and the [`Fragments`] chain
+    /// across), and [`Message::set_from`]/[`Message::set_token`] write the relocated envelope
+    /// words back into it before the rebuilt message is enqueued. Rebuilding from scratch would
+    /// drop the fragment chain — a use-after-free, since the payload would then point into freed
+    /// fragments — and would leak the refcounts the message held on its off-heap objects.
     fn run_rooted_collection<F>(&mut self, collect: F) -> Result<Collection>
     where
         F: FnOnce(&mut AnyCollector, &mut [Eterm]) -> Result<Collection>,
     {
-        // 1. The flat root slice: `x[0..live)`, then the whole stack, then one word per
-        //    queued mailbox payload. `reg_words` is where the mailbox roots start.
+        // 1. The flat root slice: `x[0..live)`, then the whole stack, then three words per
+        //    queued message — `[payload, from, token]`, in that fixed order. `reg_words` is where
+        //    the mailbox roots start.
         let mut roots: Vec<Eterm> = Vec::new();
         let x_live = self.regs.gather_roots(&mut roots);
         let reg_words = roots.len();
 
-        // 2. Drain the mailbox, appending each payload as a root. The drained messages are
-        //    re-installed around their relocated payloads below.
+        // 2. Drain the mailbox, appending each message's `payload`, `from` and `token` as roots
+        //    (MESSAGE_ROOT_WORDS words per message, in that order). All three are relocatable: a
+        //    host may store a heap word in `from`/`token` (the C allows a heap `token` tuple and a
+        //    heap `Info`-tuple `from`), and the payload is the message body. The drained messages
+        //    are re-installed around their relocated words below.
         let mut drained: Vec<Message> = Vec::new();
         while let Some(message) = self.mailbox.dequeue() {
             roots.push(message.payload());
+            roots.push(message.from());
+            roots.push(message.token());
             drained.push(message);
         }
         let mail_words = roots.len();
@@ -1179,15 +1204,21 @@ impl Process {
         // 5. Write the (relocated) registers and stack words back.
         self.regs.scatter_roots(&roots, x_live);
 
-        // 6. Re-install every message around its relocated payload, preserving FIFO order.
-        //    `with_payload` swaps only the payload word, so the message keeps its `from`,
-        //    `token`, off-heap handles, refc binaries, node entries and — for an oversized
-        //    payload — its fragment chain (a fragment-resident payload is outside the
-        //    collected nursery, so the collector classified it `Foreign` and left it
+        // 6. Re-install every message around its relocated envelope words, preserving FIFO order.
+        //    A message's three roots are `[payload, from, token]` at `index * MESSAGE_ROOT_WORDS`,
+        //    so `set_from`/`set_token` write the relocated envelope words into the owned message
+        //    first and `with_payload` (which consumes it) swaps in the relocated payload last.
+        //    The off-heap handles, refc binaries, node entries and — for an oversized payload —
+        //    its fragment chain all travel across the rebuild (a fragment-resident payload is
+        //    outside the collected nursery, so the collector classified it `Foreign` and left it
         //    untouched).
-        let payloads = &roots[reg_words..mail_words];
-        for (index, message) in drained.into_iter().enumerate() {
-            self.mailbox.enqueue(message.with_payload(payloads[index]));
+        let words = &roots[reg_words..mail_words];
+        for (index, mut message) in drained.into_iter().enumerate() {
+            let base = index * MESSAGE_ROOT_WORDS;
+            message.set_from(words[base + MESSAGE_ROOT_FROM]);
+            message.set_token(words[base + MESSAGE_ROOT_TOKEN]);
+            self.mailbox
+                .enqueue(message.with_payload(words[base + MESSAGE_ROOT_PAYLOAD]));
         }
 
         // 7. Write the relocated dictionary, saved-argument and pending-signal words back, in
@@ -1576,6 +1607,75 @@ mod tests {
         assert!(!process
             .collect_if_needed(1)
             .expect("a tiny request needs no collection"));
+    }
+
+    /// Pins the mailbox half of the root walk: every queued message contributes **three**
+    /// envelope words — `[payload, from, token]` — to the flat root slice, and all three are
+    /// written back into the re-installed message.
+    ///
+    /// The test captures the `roots` slice handed to the collection action (the only way to
+    /// observe it from outside: `run_rooted_collection` is private, so an integration test under
+    /// `tests/` cannot reach it) and asserts the documented per-message order and adjacency. A
+    /// walk that gathered only the payloads leaves the `from`/`token` words out of the slice, so
+    /// it fails here.
+    ///
+    /// The envelope words must be **immediates**: `beam_message::Queue::enqueue`'s debug tripwire
+    /// rejects a non-immediate `from`/`token` (`debug_assert_enqueue_terms`), and this crate may
+    /// not edit `beam_message` — so a heap-term envelope cannot be enqueued from here (and must
+    /// not be forced past the tripwire). The values are still distinct per message, which is what
+    /// makes the presence *and* the order of each word observable.
+    #[test]
+    fn run_rooted_collection_gathers_and_scatters_the_message_envelope_words() {
+        let mut process = Process::new(pid(31)).expect("the default heap allocates");
+        let (first_payload, first_from, first_token) =
+            (make_small(41), make_small(7), make_small(8));
+        let (second_payload, second_from, second_token) =
+            (make_small(42), make_small(9), make_small(10));
+        process
+            .mailbox_mut()
+            .enqueue(Message::new(first_payload, first_from).with_token(first_token));
+        process
+            .mailbox_mut()
+            .enqueue(Message::new(second_payload, second_from).with_token(second_token));
+
+        // Capture the root slice the collection action is handed, then run a real collection so
+        // the walk's scatter step actually executes.
+        let mut captured: Vec<Eterm> = Vec::new();
+        process
+            .run_rooted_collection(|collector, roots| {
+                captured = roots.to_vec();
+                collector.collect(roots)
+            })
+            .expect("the collection succeeds");
+
+        // Every envelope word is gathered, in `[payload, from, token]` order and adjacent within
+        // its message's three-word slice.
+        let base = captured
+            .iter()
+            .position(|word| *word == first_payload)
+            .expect("the first message's payload is a root");
+        assert_eq!(captured[base + MESSAGE_ROOT_PAYLOAD], first_payload);
+        assert_eq!(captured[base + MESSAGE_ROOT_FROM], first_from);
+        assert_eq!(captured[base + MESSAGE_ROOT_TOKEN], first_token);
+
+        let base = base + MESSAGE_ROOT_WORDS;
+        assert_eq!(captured[base + MESSAGE_ROOT_PAYLOAD], second_payload);
+        assert_eq!(captured[base + MESSAGE_ROOT_FROM], second_from);
+        assert_eq!(captured[base + MESSAGE_ROOT_TOKEN], second_token);
+
+        // The scatter step wrote the words back into the re-installed envelopes, keeping FIFO.
+        let envelope: Vec<(Eterm, Eterm, Eterm)> = process
+            .mailbox()
+            .iter()
+            .map(|message| (message.payload(), message.from(), message.token()))
+            .collect();
+        assert_eq!(
+            envelope,
+            vec![
+                (first_payload, first_from, first_token),
+                (second_payload, second_from, second_token),
+            ]
+        );
     }
 
     #[test]

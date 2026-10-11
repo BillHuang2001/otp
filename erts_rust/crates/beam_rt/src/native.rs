@@ -40,7 +40,7 @@
 //! | `init:restart/0` | reboots the node **in place** (resets the code path to its boot default, re-runs the boot sequence and the loaded boot script) and answers `ok` (`init.erl:492-518,937-954`) |
 //! | `init:boot/1` | the boot **entry point**: parses the `-boot <Script>` flag out of the byte-list argument, resolves it exactly as the CLI's `-boot FILE` does and executes the script (`init.erl:585-597`) |
 //! | `os:cmd/1` | runs a command through `/bin/sh` and returns its stdout — the host's own process spawn |
-//! | `code:get_path/0`, `code:all_loaded/0`, `code:which/1`, `code:is_loaded/1`, `code:is_sticky/1,2`, `code:ensure_loaded/1`, `code:load_file/1`, `code:lib_dir/0,1`, `code:root_dir/0` | read the runtime's own [`CodeServer`](crate::CodeServer) state (the code path, the loaded/preloaded module set, the installation) |
+//! | `code:get_path/0`, `code:all_loaded/0`, `code:which/1`, `code:is_loaded/1`, `code:is_sticky/1,2`, `code:ensure_loaded/1`, `code:load_file/1`, `code:lib_dir/0,1,2`, `code:priv_dir/1`, `code:root_dir/0` | read the runtime's own [`CodeServer`](crate::CodeServer) state (the code path, the loaded/preloaded module set, the installation) |
 //! | `application:get_env/1,2,3`, `application:get_all_env/1`, `application:get_key/2`, `application:loaded_applications/0`, `application:which_applications/0` | read the runtime's own **application-config view** — the `.app` resource files of the OTP applications its code path resolves |
 //! | `prim_file:get_cwd/0,1`, `prim_file:read_file/1`, `prim_file:open/2`, `prim_file:read/2`, `prim_file:write/2`, `prim_file:close/1`, `prim_file:position/2` | the file-system **primitives** `file.erl` delegates to: they are the host's own `getcwd`/`open`/`read`/`write`/`close`/`lseek` (`std::env`/`std::fs`), which only the host can perform |
 //!
@@ -127,6 +127,48 @@ pub(crate) const FLOOR_MODULES: [&str; 8] = [
     "prim_file",
 ];
 
+/// Whether [`RuntimeContext::resolve_external_call`] must refuse to enter
+/// `(module, function, arity)` **in-machine** because the runtime-native floor owns that
+/// EXACT key.
+///
+/// The module-level rule ([`FLOOR_MODULES`]) is right for seven of the eight namespaces:
+/// practically every name in them is either a floor arm or a `beam_bifs` registry BIF, so
+/// entering the module body would run it *instead of* the host implementation — a wrong
+/// result. `io` is the exception. The floor serves only `io:put_chars/1,2` for that
+/// namespace ([`try_native`]'s `("io", "put_chars", 1 | 2)` arms); every *other* `io:*`
+/// (`io:getopts/1`, `io:setopts/2`, `io:request/2`, `io:scan_erl_form/4`, …) is an ordinary
+/// body in `lib/stdlib/src/io.erl`, and **refusing** it here routes it onto the synchronous
+/// non-pumping [`RuntimeContext::call_bif`] path instead.
+///
+/// That refusal is the defect: a **scheduled** process is a slice
+/// ([`RuntimeContext::for_process`], `may_pump_scheduler() == false`), so
+/// `run_export_blocking`'s `pump_once` returns `Ok(None)` and the callee's blocking
+/// `receive` on the io-device request/reply folds into the typed `blocked()` capability gap
+/// (`unsupported: opcode: run: process blocked (no message available)`, exit 3) instead of
+/// suspending the process. Entering the same body **in-machine** (`Ok(Some(label))`) lets
+/// that `receive` suspend the process through the ordinary `RunOutcome::Wait` path, which
+/// the scheduler resumes once the io device replies — exactly how `file:*` (a non-floor
+/// module) already works.
+///
+/// This is the contract A.9 `compile:file/2` blocker: `epp:open/1`'s server calls
+/// `io:getopts/1` and `epp:parse_file/2` calls `io:scan_erl_form/4`, both of which stopped
+/// a scheduled process here.
+///
+/// `io:put_chars/1,2` must therefore stay **refused** (the floor owns them). `io:format/2`
+/// and `io:printable_range/0` are `beam_bifs` registry BIFs and are still excluded, but by
+/// the registry check that `resolve_external_call` applies *after* this one.
+///
+/// [`try_native`]: RuntimeContext::try_native
+/// [`RuntimeContext::resolve_external_call`]: crate::context::RuntimeContext
+/// [`RuntimeContext::call_bif`]: crate::context::RuntimeContext
+/// [`RuntimeContext::for_process`]: crate::context::RuntimeContext
+pub(crate) fn floor_shadows(module: &str, function: &str, arity: u32) -> bool {
+    if module == "io" {
+        return matches!((function, arity), ("put_chars", 1 | 2));
+    }
+    FLOOR_MODULES.contains(&module)
+}
+
 impl RuntimeContext<'_> {
     /// The runtime-native BIF floor, consulted **before** the `beam_bifs` registry.
     ///
@@ -185,6 +227,7 @@ impl RuntimeContext<'_> {
             ("code", "root_dir", 0) => Some(self.code_root_dir()),
             ("code", "get_mode", 0) => Some(self.code_get_mode()),
             ("code", "lib_dir", 2) => Some(self.code_lib_dir_2(args)),
+            ("code", "priv_dir", 1) => Some(self.code_priv_dir_1(args)),
             ("application", "get_env", 1) => Some(self.application_get_env_1()),
             ("application", "get_env", 2) => Some(self.application_get_env_2(args)),
             ("application", "get_env", 3) => Some(self.application_get_env_3(args)),
@@ -893,6 +936,83 @@ mod tests {
             );
         }
     }
+
+    /// **Drift guard for the `io` exception to the floor exclusion.**
+    ///
+    /// [`floor_shadows`] refuses a whole namespace for seven of the eight floor modules but
+    /// `io` only for the keys the floor really serves (`io:put_chars/1,2`); every other
+    /// `io:*` must be entered in-machine, or a scheduled process's io-device `receive` folds
+    /// into the typed `blocked()` capability gap. This parses the `("io", "FUNC", ARITY)`
+    /// arms out of `try_native`'s own source and pins the exception against them, so adding
+    /// or removing a floor `io` arm without updating [`floor_shadows`] fails here rather than
+    /// silently mis-routing an `io:*` call.
+    #[test]
+    fn the_floor_shadows_io_exception_matches_the_floors_io_arms() {
+        let source = include_str!("native.rs");
+        let match_start = source
+            .find("fn try_native(")
+            .expect("`try_native` is the floor's dispatch entry point");
+        let match_end = match_start
+            + source[match_start..]
+                .find("\n            _ => None,")
+                .expect("`try_native`'s match ends in the `_ => None` fall-through");
+        // Every `("io", "FUNC", ARITY)` arm, taken from the arm lines themselves.
+        let mut io_keys: Vec<(String, u32)> = source[match_start..match_end]
+            .lines()
+            .filter_map(|line| line.trim_start().strip_prefix("(\"io\", \""))
+            .filter_map(|rest| rest.split_once("\", "))
+            .map(|(function, tail)| {
+                let arity = tail
+                    .split(|c: char| !c.is_ascii_digit())
+                    .next()
+                    .and_then(|digits| digits.parse::<u32>().ok())
+                    .unwrap_or_else(|| panic!("`io` arm `{function}` has no arity literal: {tail:?}"));
+                (function.to_string(), arity)
+            })
+            .collect();
+        io_keys.sort();
+        assert!(
+            !io_keys.is_empty(),
+            "the arm scan found no `io` arms — the source layout changed"
+        );
+        assert_eq!(
+            io_keys,
+            vec![("put_chars".to_string(), 1), ("put_chars".to_string(), 2)],
+            "the floor serves only `io:put_chars/1,2` for the `io` namespace — `floor_shadows` \
+             must be updated alongside any new/removed floor `io` arm"
+        );
+        // The floor's `io` keys are refused ...
+        for (function, arity) in &io_keys {
+            assert!(
+                floor_shadows("io", function, *arity),
+                "the floor owns `io:{function}/{arity}`, so `floor_shadows` must refuse it"
+            );
+        }
+        // ... and every other `io` key is entered in-machine.
+        for (function, arity) in [
+            ("getopts", 1u32),
+            ("setopts", 2),
+            ("request", 2),
+            ("scan_erl_form", 4),
+            ("format", 2),
+        ] {
+            assert!(
+                !floor_shadows("io", function, arity),
+                "`io:{function}/{arity}` is a real `io.erl` body, not a floor key: \
+                 `floor_shadows` must let it be entered in-machine"
+            );
+        }
+        // The other seven namespaces stay refused wholesale.
+        for module in FLOOR_MODULES {
+            if module != "io" {
+                assert!(
+                    floor_shadows(module, "anything", 9),
+                    "`{module}` is a floor namespace: every key must be refused"
+                );
+            }
+        }
+    }
+
     /// A tuple built on the runtime's term arena (the `halt/2` argument shape).
     fn tuple(runtime: &mut crate::runtime::Runtime, elements: &[Eterm]) -> Eterm {
         let mut sink = beam_bifs::NullSink;

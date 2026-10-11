@@ -144,46 +144,29 @@ configuration and it runs **all 22 directives to completion**, ending at the fin
   registered server — the directive ran `application_controller:start/1` to its `{ok, AC}` return
   (`application_controller.erl:203-211`), i.e. the AC completed `init/2` (`:531-558`) and reached
   `gen_server:enter_loop`.
-  `heart` is not registered either, legitimately: `heart:start/0` returns `ignore`.
-- **`logger` is NOT registered — the `erlang:apply/3` seam gap, still open.** Instruction 13's
-  `{kernelProcess,logger,{logger_server,start_link,[]}}` makes
-  [`start_kernel_process`](drive.rs) `spawn_process` the directive, whose `gen_server:start_link/3`
-  spawns the `logger_server` child through `proc_lib:start_link/5`; the child is entered at
-  `proc_lib:init_p_do_apply/3`, whose body is `try … apply(M,F,A) … catch … end`.
-  `erlc` compiles that `apply/3` to a **`call_ext`** to `{extfunc,erlang,apply,3}` (the `call_ext*`
-  target is a literal atom even when the applied module is a variable). The engine's `CallExt` arm
-  asks [`RuntimeContext::resolve_external_call`](../context/mod.rs) first, which answers `Ok(None)`
-  for `erlang` (it is a member of [`../native`](../native/CONTEXT.md)'s `FLOOR_MODULES`), so the call
-  falls through to the synchronous `call_import` → `call_bif` → `native::apply_dynamic` →
-  `run_export` → `run_export_blocking` route. That route builds a **nested `Machine`** and pumps the
-  scheduler while the callee is suspended — but a context that *is* a scheduler slice
-  (`RuntimeContext::for_process` ⇒ `may_pump_scheduler() == false`) must not re-enter the scheduler,
-  so `pump_once` reports `Ok(None)` and the call folds into the typed `error::blocked()` sentinel
-  (`../error.rs::unsupported_reason`).
-  The sentinel is **uncatchable in practice**: the child really is inside `proc_lib`'s `try`, but
-  `Machine::raise_bif_error` can only land an error in a live catch frame when the running module's
-  atom table holds the reason atom, and no compiler emits
-  `'unsupported_opcode: run: process blocked (no message available)'` — so the raise escapes and the
-  child dies. Its registered name dies with it, the directive's parked `proc_lib:sync_start/2`
-  (timeout `infinity`) never resumes, and `whereis(logger)` stays `undefined` while the boot still
-  reaches `{progress,started}`.
-  The oracle **does** register the name (a live `logger_server` registered as `logger`; a second
-  `logger_server:start_link/0` reports `{error,{already_started,Pid}}`).
-  **A single-level fix is not enough.** The blocking callee is reached through *two* nested `apply/3`
-  levels on this path (`proc_lib:init_p_do_apply/3` → `gen:init_it/7` → `gen_server:init_it/6`), and
-  each level is a separate nested `Machine`; `gen:register_name` runs inside the deepest one, so the
-  outer process must stay alive across the whole chain.
-  The fix belongs to **`beam_engine`**: its `call_ext*` arms must give `erlang:apply/2,3` the
-  `resolve_external_call`/`Step::Enter` treatment a literal-target `call_ext` already gets. The exact
-  change, its C ground truth and why the in-crate retries (restart, or park-and-resume) are unsound
-  are recorded **once** in the crate `CONTEXT.md` (`## Notes for Agents`, the `beam_engine` bullet);
-  this node does not repeat them.
-  Pinned by `bootscript.rs::tests::the_real_boot_leaves_logger_unregistered_pending_the_apply_seam_gap`
-  (asserting the current behaviour) and the `#[ignore]`d positive
-  `bootscript.rs::tests::the_real_boot_registers_a_live_logger_process` (the oracle's behaviour,
-  which fails while the seam is open); the same gap is pinned at the CLI by
-  `../tests/boot.rs::the_cli_boot_leaves_logger_unregistered_pending_the_apply_seam_gap` and its
-  `#[ignore]`d positive counterpart.
+  `heart` is not registered, legitimately: `heart:start/0` returns `ignore`.
+- **`logger` IS registered — a live `logger_server` named `logger`.** Instruction 13's
+  `{kernelProcess,logger,{logger_server,start_link,[]}}` leaves a live `logger_server` registered as
+  `logger` after the boot, matching the oracle (a second `logger_server:start_link/0` reports
+  `{error,{already_started,Pid}}`).
+  `logger_server:start_link/0` → `gen_server:start_link({local,logger}, …)` → `gen:start/6` →
+  `proc_lib:start_link/5` spawns the child and parks the caller in `proc_lib:sync_start/2`; the child
+  is entered at `proc_lib:init_p_do_apply/3`, whose `try … apply(M,F,A) …` body `erlc` compiles to a
+  **non-tail** `{call_ext,3,{extfunc,erlang,apply,3}}` (the `call_ext*` target is a literal atom even
+  when the applied module is a variable).
+  The engine's `call_ext*` arms special-case `erlang:apply/3` with C's `fixed_apply` treatment
+  (`beam_engine/src/interpreter/dispatch.rs::resolve_call_ext_apply`): it decodes `x(0)=Module`,
+  `x(1)=Function`, `x(2)=Args`, walks `Args` into `x(0..N)`, places `Module`/`Function` at
+  `x(N)`/`x(N+1)`, and dispatches the callee **in-machine** as `Step::Enter` under the arm's own
+  `CallExt*` frame discipline. The callee is reached through two nested `apply/3` levels
+  (`proc_lib:init_p_do_apply/3` → `gen:init_it/7` → `gen_server:init_it/6`) in **one** process, so a
+  blocking `receive` suspends *this* process through the ordinary `RunOutcome::Wait` path instead of
+  folding into the typed `error::blocked()`; `gen_server:init_it` reaches its
+  `register(logger, self())` and the directive's parked `sync_start/2` (timeout `infinity`) resumes.
+  The `start_kernel_process` unlink (above) then keeps the registered server alive past the
+  short-lived directive process.
+  Pinned by `bootscript.rs::tests::the_real_boot_registers_a_live_logger_process` and, at the CLI, by
+  `../tests/boot.rs::the_cli_boot_registers_a_live_logger_process`.
 - **Instruction 20's `gen_server:call` suspends and resumes.** `apply_boot_call` runs `c:erlangrc/0`
   through the engine's blocking-aware entry; the scheduler pass services the `file_server_2` mailbox
   and delivers the reply (counted into the pass's `delivered` by `service_file_requests`), and the call
@@ -209,16 +192,17 @@ valve **only** for the documented off-heap-payload capability gap, where the ori
 because it cannot be duplicated.
 
 ### Remaining gaps (owner per link)
-1. **`beam_engine`'s `call_fun` arm + `beam_rt`'s `apply_fun`.** A **scheduled** process's `file:*` call reaches the native `file_server_2` service through `gen:call/4`'s `do_for_proc/2`, which applies a **fun**.
-   That apply is `call_fun` → `ExecutionContext::apply_fun` → `../context/mod.rs::run_label_blocking`, a **value**-returning seam that a slice context may not pump, so the closure's blocking `receive` folds into the typed `error::blocked()` instead of suspending (pinned by `../context/mod.rs::blocking_fun_apply`'s control case).
-   The `apply`/`apply_last` opcode family has no such gap: `families/funs.rs::apply_target` consults `ExecutionContext::resolve_external_call` first and enters a resolved callee **in-machine**.
-   A boot `{apply, …}` directive and the `-eval` path are unaffected — both run on a blocking-aware, pump-capable entry.
-   The boot-logger gap is the separate `call_ext`-encoded `erlang:apply/2,3` one, recorded in the crate `CONTEXT.md` (`## Notes for Agents`, `## Known Issues`) and not repeated here.
+1. **`beam_engine` — a nested run's `receive … after T` timeout does not fire.** The whole-file `file`
+   family completes from a scheduled process, but the **incremental io-device read** (`file:read/2`,
+   `file:read_line/1`) from a scheduled process exits 3 (`unsupported: opcode: run: process blocked
+   (no message available)`) where the `-eval`/pump-capable route agrees with the oracle; it is item 7 of
+   [`../M1_GAPS.md`](../M1_GAPS.md)'s OTP-lifecycle survey.
 2. **`beam_rt` `../native/` — the io-device read path completes from library code.**
    `{get_until,Enc,_Prompt,Mod,Func,XtraArgs}` and `{get_line,Enc,_Prompt}` are both real request arms
    (`../native/file_server.rs` dispatches each to `get_until::serve`/`get_line::serve`), so
    `file:read/2`, `io:scan_erl_exprs/4` and `io:parse_erl_exprs/4` complete and agree with the oracle
-   (`../tests/io_scan.rs`), and `io:get_line/2`/`file:read_line/1` through the `{get_line,…}` arm
+   on the `-eval` route (`../tests/io_scan.rs`), and `io:get_line/2`/`file:read_line/1` through the
+   `{get_line,…}` arm
    (the colocated `file_server/get_line/tests.rs`).
    Residual typed gaps in that family include a request `Enc` that is neither `latin1` nor `unicode`
    (`../native/file_server/get_line.rs`'s request-encoding check, `../native/file_server/get_until.rs`'s)
@@ -248,7 +232,7 @@ because it cannot be duplicated.
   own `BLOCKING_PUMP_DEADLINE` (checked between pump rounds, ending in a typed diagnostic
   rather than a spin) and, earlier, by a pump that reports `0`; the nested cap is documented in
   `../context/CONTEXT.md`.
-- `bootscript.rs` is ~1756 lines (production ~700, the rest its oracle test module) — the crate's
+- `bootscript.rs` is ~1855 lines (production ~700, the rest its oracle test module) — the crate's
   documented long-file precedent; `drive.rs` is ~382 lines. `#![deny(unsafe_code)]`; no `unwrap()` on
   runtime data.
 
@@ -265,7 +249,11 @@ because it cannot be duplicated.
   `.boot` with `erl`, asserts the `apply` step really ran); `a_boot_spawned_process_answers_a_blocked_apply`
   (pins `drive.rs`: a `{kernelProcess, …}` burst and a later `{apply, …}` blocked on it, resumed by a
   scheduler drive, its dictionary side effect read back through `runtime.eval`); 
-  `a_malformed_boot_script_is_a_typed_error`; the burst pins
+  `a_malformed_boot_script_is_a_typed_error`; the full-script pins
+  `the_real_start_boot_completes_through_execute_reporting` (all 22 directives, ending at
+  `{progress,started}`) and `the_real_boot_registers_a_live_logger_process` (instruction 13 leaves a
+  live `logger` registered, and a second `logger_server:start_link/0` reports
+  `{error,{already_started,Pid}}`); the burst pins
   `a_kernel_process_burst_waits_for_the_directive_to_return` (a fixture whose `serve/0` `spawn_link`s a
   server that registers the directive's name **first** and only then does its real setup, and which
   registers a *second* visible name only after the server acks — so a later `{apply, …}` answers `acked`
@@ -288,7 +276,9 @@ because it cannot be duplicated.
   `-boot` CLI drive of a synthetic script; the CLI running the real `start.boot` to completion (exit 0,
   empty stdout/stderr); a synthetic-probe boot (the real script's first 20 directives + a `probe:run/0`
   `apply`, built with the oracle) proving the `application_controller` kernel process survives its
-  short-lived directive process (`whereis` = a live pid); and the preloaded-only default.
+  short-lived directive process (`whereis` = a live pid); the CLI proving the real boot leaves a
+  live `logger` registered (`the_cli_boot_registers_a_live_logger_process`); and the preloaded-only
+  default.
 
 ## Notes for Agents — the `file_server_2` link is closed
 The A.9 boot chain's last link is closed by a **runtime-native `file_server_2` service**
@@ -299,10 +289,10 @@ precedent), so the runner never executes it and `ProcessEntry` needs no new vari
 the replies, which is what lets `c:erlangrc/0`'s `gen_server:call` at instruction 20 complete. The
 request/reply surface, the errno mapping, the io-device and the remaining gaps live in
 [`../native/CONTEXT.md`](../native/CONTEXT.md)'s `file_server.rs` subsection.
-- **Starting the real `file_server` is not a substitute.** Its `gen_server:init_it` registers, acks
-  and then enters `loop`'s `receive` — a suspend the engine's non-blocking `fold_outcome` folds into
-  `error::blocked()` for a **scheduled** process (owner: `beam_engine`; the seam is pinned by
-  `../tests/proc_lib_start.rs`), so the child dies right after acking. A native service sidesteps that.
+- **The native service is used instead of the real `file_server`.** The real Erlang
+  `file_server`/`file_io_server` needs the wider `prim_file` NIF surface this runtime does not serve;
+  the native `std::fs`-backed service answers the requests it can honour faithfully and returns the
+  typed `unsupported` gap for the rest (below).
 - **The native service is deliberately narrow.** It serves the `file_server`/`file`/`io` requests a
   native `std::fs` host (or, for the two incremental readers, the engine) can answer faithfully and
   returns the typed `unsupported` gap for the rest — `setopts`/`getopts`/`pread`/`pwrite`/`advise`/

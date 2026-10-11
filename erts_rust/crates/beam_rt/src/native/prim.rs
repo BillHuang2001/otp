@@ -138,11 +138,12 @@
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{symlink, MetadataExt};
+use std::os::unix::fs::{symlink, FileTypeExt, MetadataExt};
 
 use beam_common::{BeamError, Result};
+use beam_engine::ExecutionContext;
 use beam_engine::terms;
-use beam_term::{is_atom, is_list, is_nil, is_small, signed_value, Eterm};
+use beam_term::{is_atom, is_list, is_nil, is_small, make_small, signed_value, Eterm};
 
 use super::RuntimeContext;
 use crate::error;
@@ -189,14 +190,17 @@ impl RuntimeContext<'_> {
             ("set_cwd", 1) => Some(self.prim_set_cwd(args)),
             ("ipread_s32bu_p32bu", 3) => Some(self.prim_ipread(args)),
             ("get_handle", 1) => Some(self.prim_get_handle(args)),
+            ("read_file_info", 1 | 2) => Some(self.prim_read_file_info(args, true)),
+            ("read_link_info", 1 | 2) => Some(self.prim_read_file_info(args, false)),
+            ("read_handle_info", 1 | 2) => Some(self.prim_read_handle_info(args)),
             // -- honest typed capability gaps (contract A.7) ----------------------
             //
             // Every name below is a **real** oracle BIF (`prim_file`'s own NIF surface), so
             // claiming it is what converts a caller's silent, *wrong* answer into the honest
             // `unsupported: …` gap. Left unclaimed it falls through to the preloaded
-            // `prim_file.beam`, whose `read_info_1`'s `catch error:_ -> {error,badarg}`
-            // swallows the inner `undef` — and `{error,badarg}` is a value the oracle never
-            // returns for any of them. Each reason names the facility this runtime lacks.
+            // `prim_file.beam`, whose `catch error:_ -> {error,badarg}` wrappers swallow the
+            // inner `undef` — and `{error,badarg}` is a value the oracle never returns for any
+            // of them. Each reason names the facility this runtime lacks.
             //
             // Deliberately **absent**, because the oracle itself answers `error:undef` for
             // them (verified against OTP 29.1.1 / erts-17.1) and claiming them would *create*
@@ -206,16 +210,6 @@ impl RuntimeContext<'_> {
             // other clause's documented answer is the *value* `{error,enotsup}`
             // (`prim_file.erl:438-439`) — a value this floor cannot produce without the
             // `sendfile(2)`/socket machinery, and one the fall-through already reaches.
-            ("read_file_info", 1 | 2) | ("read_link_info", 1 | 2) => Some(Err(
-                error::unsupported(
-                    "prim_file: the #file_info{} `access` slot needs access(2), which no safe \
-                     std API exposes",
-                ),
-            )),
-            ("read_handle_info", 1 | 2) => Some(Err(error::unsupported(
-                "prim_file: the #file_info{} `access` slot needs geteuid(2)/getegid(2) and the \
-                 mode bits, which no safe std API exposes",
-            ))),
             ("write_file_info", 2 | 3) => Some(Err(error::unsupported(
                 "prim_file: needs raw chmod(2)/chown(2)/utimes(2), which no safe std API exposes",
             ))),
@@ -591,6 +585,223 @@ impl RuntimeContext<'_> {
         }
     }
 
+    // -- prim_file:read_file_info/1,2 · read_link_info/1,2 · read_handle_info/1,2 ----
+    //
+    // The `#file_info{}` family. The C body is `efile_read_info`
+    // (`unix_prim_file.c:733-769`: `stat(2)`/`lstat(2)` plus two `access(2)` probes) and
+    // `efile_read_handle_info` (`:803-820`: `fstat(2)` plus `check_access/1` against the
+    // **effective** uid/gid), both feeding `build_file_info/2` (`:707-731`); the Erlang
+    // wrappers are `read_info_1/3` and `read_handle_info_1/2` (`prim_file.erl:647-676`).
+    // The whole-file-descriptor half lives in the sibling [`super::prim_file`] module.
+
+    /// `prim_file:read_file_info/1,2` **and** `prim_file:read_link_info/1,2` —
+    /// `read_info_1(Name, FollowLinks, TimeType)` with `FollowLinks` = `1` / `0`
+    /// (`prim_file.erl:647-655`).
+    ///
+    /// Oracle: `read_file_info("f")`/`read_link_info("link")`⇒`{ok,#file_info{}}` (a
+    /// 14-tuple); a missing path⇒`{error,enoent}` (the `stat(2)`/`lstat(2)` errno); a path the
+    /// wrapper rejects⇒`{error,badarg}`; `[{time,posix}]`⇒raw POSIX seconds;
+    /// `[{time,universal}]`/`[{time,local}]`⇒a `{{Y,M,D},{H,M,S}}` datetime;
+    /// `[{time,bogus}]`⇒`{error,badarg}`; a non-list `Opts`⇒an uncaught `function_clause`.
+    pub(super) fn prim_read_file_info(
+        &mut self,
+        args: &[Eterm],
+        follow_links: bool,
+    ) -> Result<Eterm> {
+        let time = match self.file_info_time(args.get(1).copied()) {
+            Some(time) => time,
+            None => return Err(function_clause()),
+        };
+        let Some(path) = self.first_path(args) else {
+            return self.error_tuple("badarg");
+        };
+        let os_path = std::ffi::OsStr::from_bytes(&path);
+        // `FollowLinks` is the oracle's `stat`/`lstat` choice (`unix_prim_file.c:742-750`).
+        let stat = if follow_links {
+            std::fs::metadata(os_path)
+        } else {
+            std::fs::symlink_metadata(os_path)
+        };
+        let metadata = match stat {
+            Err(failure) => return self.error_tuple_for(&failure),
+            Ok(metadata) => metadata,
+        };
+        let access = self.path_access_bits(os_path);
+        self.file_info_reply(&metadata, access, time)
+    }
+
+    /// The `{ok, #file_info{}}` reply for a successful `stat(2)`/`fstat(2)`.
+    ///
+    /// `access` is the bit pair the caller's own probe resolved — a path's two `access(2)`
+    /// calls for the two `read_*_info/1,2` forms, `check_access/1` for a handle — so a record
+    /// can never carry an invented one. A `TimeType` `from_posix_seconds/2` has no clause for
+    /// is the wrapper's **value** `{error, badarg}` (its `catch error:_`, `prim_file.erl:660`),
+    /// never a record.
+    pub(super) fn file_info_reply(
+        &mut self,
+        metadata: &std::fs::Metadata,
+        access: (bool, bool),
+        time: TimeType,
+    ) -> Result<Eterm> {
+        if time == TimeType::Other {
+            return self.error_tuple("badarg");
+        }
+        let info = self.file_info_term(metadata, access, time)?;
+        self.ok_tuple(info)
+    }
+
+    /// The 14-tuple `#file_info{}` `build_file_info/2` emits
+    /// (`?PRIM_FILE_NIF:992-1017`) — the field order, each field's width and the three time
+    /// conversions are the oracle's.
+    ///
+    /// The seven `enif_make_uint` fields are **truncated to 32 bits**, exactly as that emitter
+    /// does: `st_ino`/`st_dev`/`st_rdev`/`st_nlink` are 64-bit on Linux, so the oracle's
+    /// `inode`/`major_device`/… really are the low halves (verified against a live `erl`).
+    /// `size` is `enif_make_uint64` — a full 64-bit value, never truncated — and each time is
+    /// clamped to `[EFILE_MIN_FILETIME, EFILE_MAX_FILETIME]` before its conversion.
+    ///
+    /// `time` must not be [`TimeType::Other`]: the caller ([`Self::file_info_reply`]) answers
+    /// the wrapper's `{error, badarg}` for it before a record is built.
+    pub(super) fn file_info_term(
+        &mut self,
+        metadata: &std::fs::Metadata,
+        access: (bool, bool),
+        time: TimeType,
+    ) -> Result<Eterm> {
+        let tag = self.atom("file_info")?;
+        let kind = self.atom(file_type_atom(metadata))?;
+        let access = self.access_atom(access)?;
+        let size = terms::make_integer(
+            self,
+            i64::try_from(metadata.size()).map_err(|_| BeamError::SystemLimit)?,
+        )?;
+        let atime = self.time_field(metadata.atime(), time)?;
+        let mtime = self.time_field(metadata.mtime(), time)?;
+        let ctime = self.time_field(metadata.ctime(), time)?;
+        let mode = make_small(i64::from(metadata.mode()));
+        let links = make_small(i64::from(metadata.nlink() as u32));
+        let major_device = make_small(i64::from(metadata.dev() as u32));
+        let minor_device = make_small(i64::from(metadata.rdev() as u32));
+        let inode = make_small(i64::from(metadata.ino() as u32));
+        let uid = make_small(i64::from(metadata.uid()));
+        let gid = make_small(i64::from(metadata.gid()));
+        terms::make_tuple(
+            self,
+            &[
+                tag,
+                size,
+                kind,
+                access,
+                atime,
+                mtime,
+                ctime,
+                mode,
+                links,
+                major_device,
+                minor_device,
+                inode,
+                uid,
+                gid,
+            ],
+        )
+    }
+
+    /// One `#file_info{}` time field: the raw POSIX seconds clamped to the C's bounds, then
+    /// converted for `time` (`from_posix_seconds/2`, `prim_file.erl:909-912`).
+    fn time_field(&mut self, seconds: i64, time: TimeType) -> Result<Eterm> {
+        let clamped = seconds.clamp(EFILE_MIN_FILETIME, EFILE_MAX_FILETIME);
+        match time {
+            TimeType::Posix => Ok(make_small(clamped)),
+            TimeType::Universal => self.posix_to_universal(clamped),
+            TimeType::Local => {
+                let universal = self.posix_to_universal(clamped)?;
+                self.call_bif("erlang", "universaltime_to_localtime", 1, &[universal])
+            }
+            // Defensive: unreachable from the served surface (see the caller), and typed so
+            // the conversion has no silent fallback.
+            TimeType::Other => Err(error::unsupported(
+                "prim_file: an unrecognised `#file_info{}` time type",
+            )),
+        }
+    }
+
+    /// `erlang:posixtime_to_universaltime/1` through the crate's own dispatch, so the calendar
+    /// arithmetic has exactly one implementation (`beam_bifs`' `calendar` registry).
+    fn posix_to_universal(&mut self, seconds: i64) -> Result<Eterm> {
+        let argument = make_small(seconds);
+        self.call_bif("erlang", "posixtime_to_universaltime", 1, &[argument])
+    }
+
+    /// The `access` atom `efile_access_to_atom/1` produces (`unix_prim_file.c:488-498`).
+    pub(super) fn access_atom(&mut self, (readable, writable): (bool, bool)) -> Result<Eterm> {
+        let name = match (readable, writable) {
+            (true, true) => "read_write",
+            (true, false) => "read",
+            (false, true) => "write",
+            (false, false) => "none",
+        };
+        self.atom(name)
+    }
+
+    /// The **path** forms' `access` bits: two real `access(2)` probes, `R_OK` then `W_OK`
+    /// (`efile_read_info`, `unix_prim_file.c:746-754`), delegated to the crate that owns the
+    /// `unsafe` FFI (`beam_io::fs_access`).
+    ///
+    /// The C **clears** a bit whose probe failed for any reason, so a failure is `false` and
+    /// never a raise: `beam_io::fs_access::access` already folds every refusal errno
+    /// (`EACCES`, `EPERM`, `EROFS`, …) into `Ok(false)`, and the `unwrap_or` folds the
+    /// remainder the same way.
+    pub(super) fn path_access_bits(&mut self, path: &std::ffi::OsStr) -> (bool, bool) {
+        beam_io::path_access(std::path::Path::new(path)).unwrap_or((false, false))
+    }
+
+    /// `proplist_get_value(time, Opts, local)` (`prim_file.erl:882-892`), classified as the
+    /// [`TimeType`] `adjust_times/2` consumes.
+    ///
+    /// `None` is that helper's **uncaught** `function_clause` raise: it is evaluated outside
+    /// `read_info_1/3`'s `try` (`prim_file.erl:642-645`), so an `Opts` that is not a proper
+    /// list (or not a list at all) reaches the caller as a raise, never as `{error, badarg}`.
+    pub(super) fn file_info_time(&self, opts: Option<Eterm>) -> Option<TimeType> {
+        let Some(mut rest) = opts else {
+            return Some(TimeType::Local); // the `/1` wrappers' literal `local` argument
+        };
+        loop {
+            // `proplist_get_value(_Key, [], Default) -> Default`.
+            if is_nil(rest) {
+                return Some(TimeType::Local);
+            }
+            let head = terms::cons_head(rest).ok()?;
+            let tail = terms::cons_tail(rest).ok()?;
+            if matches!(terms::tuple_arity(head), Ok(2)) {
+                // `proplist_get_value(Key, [{Key, Value} | _Rest], _) -> Value`.
+                let key = terms::tuple_element(head, 0).ok()?;
+                if self.atom_name(key).as_deref() == Some("time") {
+                    let value = terms::tuple_element(head, 1).ok()?;
+                    return Some(self.time_type_of(value));
+                }
+            } else if self.atom_name(head).as_deref() == Some("time") {
+                // `proplist_get_value(Key, [Key | _Rest], _) -> true`, and `true` is a value
+                // `from_posix_seconds/2` has no clause for.
+                return Some(TimeType::Other);
+            }
+            rest = tail;
+        }
+    }
+
+    /// The `TimeType` of `from_posix_seconds/2`'s second argument: `posix`, `universal` and
+    /// `local` are the only three it has clauses for (`prim_file.erl:909-912`); every other
+    /// value — the `true` a bare `time` proplist element produces, `bogus`, an integer —
+    /// falls through to [`TimeType::Other`], which the wrapper's `catch` answers with
+    /// `{error, badarg}`.
+    fn time_type_of(&self, value: Eterm) -> TimeType {
+        match self.atom_name(value).as_deref() {
+            Some("posix") => TimeType::Posix,
+            Some("universal") => TimeType::Universal,
+            Some("local") => TimeType::Local,
+            _ => TimeType::Other,
+        }
+    }
+
     /// The single path argument of a one-path BIF, encoded — `None` for the wrapper's
     /// bad-path **value** `{error,badarg}` (`prim_file:encode_path/1`).
     fn first_path(&self, args: &[Eterm]) -> Option<Vec<u8>> {
@@ -662,6 +873,78 @@ impl RuntimeContext<'_> {
     pub(super) fn error_tuple_for(&mut self, error: &io::Error) -> Result<Eterm> {
         self.error_tuple_errno(error.raw_os_error().unwrap_or(0))
     }
+}
+
+/// `EFILE_MIN_FILETIME` — the earliest instant `build_file_info/2` reports
+/// (`MIN(EFILE_MAX_FILETIME, MAX(EFILE_MIN_FILETIME, t))`, `?PRIM_FILE_NIF:1003-1011`).
+pub(super) const EFILE_MIN_FILETIME: i64 = -2_145_916_800;
+
+/// `EFILE_MAX_FILETIME` — the latest instant `build_file_info/2` reports
+/// (`253402300799` = `9999-12-31T23:59:59Z`).
+pub(super) const EFILE_MAX_FILETIME: i64 = 253_402_300_799;
+
+/// The `TimeType` of a `#file_info{}`'s time fields — `from_posix_seconds/2`'s second
+/// argument (`prim_file.erl:909-912`), which `read_info_1/3` takes from
+/// `proplist_get_value(time, Opts, local)`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum TimeType {
+    /// Raw POSIX seconds — `adjust_times(FileInfo, posix) -> FileInfo`.
+    Posix,
+    /// `erlang:posixtime_to_universaltime/1`.
+    Universal,
+    /// `erlang:universaltime_to_localtime(erlang:posixtime_to_universaltime(S))`.
+    Local,
+    /// Anything else: the generic `adjust_times/2` clause matches, but
+    /// `from_posix_seconds/2` has no clause — so the raise inside `read_info_1/3`'s `try`
+    /// becomes the **value** `{error, badarg}`.
+    Other,
+}
+
+/// The `#file_info{}` `type` atom `build_file_info/2` derives from `st_mode`
+/// (`unix_prim_file.c:707-719`): a char/block device, a directory, a regular file, a symlink,
+/// or `other` for everything else (a fifo, a socket).
+pub(super) fn file_type_atom(metadata: &std::fs::Metadata) -> &'static str {
+    let file_type = metadata.file_type();
+    if file_type.is_char_device() || file_type.is_block_device() {
+        "device"
+    } else if file_type.is_dir() {
+        "directory"
+    } else if file_type.is_file() {
+        "regular"
+    } else if file_type.is_symlink() {
+        "symlink"
+    } else {
+        "other"
+    }
+}
+
+/// The `access` bit pair `check_access/1` derives for a **handle** (`unix_prim_file.c:771-801`):
+/// the file's own uid/gid against the process's **effective** credentials, in the C's order —
+/// the owner triple when `st_uid == geteuid()`, else the group triple when
+/// `st_gid == getegid()`, else the other triple. No `access(2)` call is made.
+pub(super) fn status_access_bits(
+    metadata: &std::fs::Metadata,
+    euid: u32,
+    egid: u32,
+) -> (bool, bool) {
+    let mode = metadata.mode();
+    if metadata.uid() == euid {
+        (mode & libc::S_IRUSR != 0, mode & libc::S_IWUSR != 0)
+    } else if metadata.gid() == egid {
+        (mode & libc::S_IRGRP != 0, mode & libc::S_IWGRP != 0)
+    } else {
+        (mode & libc::S_IROTH != 0, mode & libc::S_IWOTH != 0)
+    }
+}
+
+/// The `error:function_clause` a `prim_file` helper raises **outside** the wrapper's `try`
+/// (`proplist_get_value/3`, `prim_file.erl:882-892`) — an uncaught raise with the bare reason
+/// atom `function_clause`, not the `{error, badarg}` *value* the same wrapper's
+/// `catch error:_` produces.
+pub(super) fn function_clause() -> BeamError {
+    BeamError::Raise(beam_common::Raise::error(beam_common::ExitReason::atom(
+        "function_clause",
+    )))
 }
 
 /// The `[First, Second]` pattern of `prim_file:get_cwd/1` (`prim_file.erl:771-778`):
@@ -2805,15 +3088,11 @@ mod tests {
 
     /// The `prim_file` entries this floor cannot serve are **claimed** so a caller gets the
     /// honest `unsupported: …` capability gap (CLI exit 3) instead of falling through into
-    /// the preloaded `prim_file.beam` — where `read_info_1`'s and `read_handle_info_1`'s
-    /// `catch error:_ -> {error,badarg}` swallow the inner `undef` and answer a *value* the
-    /// oracle never returns.
+    /// the preloaded `prim_file.beam`, whose `catch error:_ -> {error,badarg}` wrappers swallow
+    /// the inner `undef` and answer a *value* the oracle never returns.
     ///
-    /// The oracle's own answers, verified live against OTP 29.1.1 / erts-17.1: for a regular
-    /// file `read_file_info/1`⇒`{ok,{file_info,69,regular,read_write,
-    /// {{Y,M,D},{H,Mi,S}}×3,33188,1,Dev,0,Ino,Uid,Gid}}` (`read_link_info/1` and
-    /// `read_handle_info/1` the same), `write_file_info/2`⇒`ok`,
-    /// `advise(Fd,0,1,sequential)`⇒`ok`, `allocate(Fd,0,10)`⇒`ok`,
+    /// The oracle's own answers, verified live against OTP 29.1.1 / erts-17.1:
+    /// `write_file_info/2`⇒`ok`, `advise(Fd,0,1,sequential)`⇒`ok`, `allocate(Fd,0,10)`⇒`ok`,
     /// `list_dir/1`⇒`{ok,[Names]}` in raw `readdir(3)` order, `read_line(Fd)`⇒`{ok,Line}`
     /// and `file_desc_to_ref(1,[])`⇒`{ok,{file_descriptor,prim_file,#{…}}}`.
     ///
@@ -2830,12 +3109,6 @@ mod tests {
         let three = [path, path, path];
         let four = [path, path, path, path];
         for (function, args) in [
-            ("read_file_info", &one[..]),
-            ("read_file_info", &two[..]),
-            ("read_link_info", &one[..]),
-            ("read_link_info", &two[..]),
-            ("read_handle_info", &one[..]),
-            ("read_handle_info", &two[..]),
             ("write_file_info", &two[..]),
             ("write_file_info", &three[..]),
             ("advise", &four[..]),
@@ -3233,5 +3506,437 @@ halt(0).
                 "the prim_file families closed here must agree with the oracle"
             );
         });
+    }
+
+    // -- the `#file_info{}` family cross-check --------------------------------
+
+    /// `term` rendered and then **whitespace-stripped**: the `~p` printer's 80-column line
+    /// wrapping differs only in layout, so the compacted form is what is comparable.
+    fn rendered_compact(runtime: &mut Runtime, term: Eterm) -> String {
+        rendered(runtime, term).split_whitespace().collect()
+    }
+
+    /// `{time, Value}` on the runtime's pointer-stable arena.
+    fn time_option(runtime: &mut Runtime, value: &str) -> Eterm {
+        heap_term(runtime, move |ctx| {
+            let key = ctx.atom("time")?;
+            let value = ctx.atom(value)?;
+            terms::make_tuple(ctx, &[key, value])
+        })
+    }
+
+    /// The read-only tree the `#file_info{}` cross-check runs on: a 6-byte `f` (`0644`), a
+    /// `0444` copy `g`, a directory `d` and a symlink `l` → `f`.
+    ///
+    /// Nothing writes it between the two halves of the comparison, so every `stat` field but
+    /// the symlink's atime is identical for both runtimes. The atime is **not**: resolving a
+    /// symlink refreshes its atime to the traversing run's own wall clock, so
+    /// `read_link_info(l)` can honestly answer a second apart —
+    /// [`assert_file_info_answers_agree`] is what keeps the comparison reliable without
+    /// masking any other difference.
+    fn prepare_file_info_tree(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).expect("a creatable scratch dir");
+        for (name, mode) in [("f", 0o644), ("g", 0o444)] {
+            let path = dir.join(name);
+            std::fs::write(&path, b"hello\n").expect("a writable file");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .expect("a settable mode");
+        }
+        std::fs::create_dir(dir.join("d")).expect("a directory");
+        let _ = std::fs::remove_file(dir.join("l"));
+        symlink("f", dir.join("l")).expect("a symlink");
+        // Follow the fresh symlink once, so the kernel's relatime rule usually applies the
+        // first traversal's atime bump here rather than inside one of the two runs. That
+        // narrows the window but does **not** make the answer deterministic: every traversal
+        // that follows the link refreshes its atime to that run's own wall clock, so
+        // `read_link_info(l)` may still answer a second apart (the tolerance
+        // `assert_file_info_answers_agree` allows).
+        let _ = std::fs::metadata(dir.join("l"));
+    }
+
+    /// This runtime's answers to the `#file_info{}` sequence, one compacted rendering per
+    /// answer — the exact sequence [`file_info_expression`] performs on the oracle.
+    fn file_info_answers(dir: &Path) -> Vec<String> {
+        let mut runtime = runtime();
+        let dir_path = dir.to_path_buf();
+        let f = path_in(&mut runtime, &dir_path, "f");
+        let g = path_in(&mut runtime, &dir_path, "g");
+        let d = path_in(&mut runtime, &dir_path, "d");
+        let l = path_in(&mut runtime, &dir_path, "l");
+        let missing = path_in(&mut runtime, &dir_path, "missing");
+        let mut bytes = dir_path.join("f").to_str().expect("a UTF-8 path").as_bytes().to_vec();
+        let binary_f = binary(&mut runtime, &bytes);
+        bytes.push(0);
+        let nul_f = binary(&mut runtime, &bytes);
+        let foo = atom(&mut runtime, "foo");
+        let posix_opt = time_option(&mut runtime, "posix");
+        let universal_opt = time_option(&mut runtime, "universal");
+        let local_opt = time_option(&mut runtime, "local");
+        let bogus_opt = time_option(&mut runtime, "bogus");
+        let posix = list(&mut runtime, &[posix_opt]);
+        let universal = list(&mut runtime, &[universal_opt]);
+        let local = list(&mut runtime, &[local_opt]);
+        let bogus = list(&mut runtime, &[bogus_opt]);
+        let time_atom = atom(&mut runtime, "time");
+        let bare_time = list(&mut runtime, &[time_atom]);
+        let read_atom = atom(&mut runtime, "read");
+        let mode_read = list(&mut runtime, &[read_atom]);
+        let mut answers: Vec<Eterm> = Vec::new();
+        answers.push(prim_file(&mut runtime, "read_file_info", &[f]));
+        answers.push(prim_file(&mut runtime, "read_file_info", &[binary_f]));
+        answers.push(prim_file(&mut runtime, "read_file_info", &[d]));
+        answers.push(prim_file(&mut runtime, "read_file_info", &[l]));
+        answers.push(prim_file(&mut runtime, "read_link_info", &[l]));
+        answers.push(prim_file(&mut runtime, "read_link_info", &[f]));
+        answers.push(prim_file(&mut runtime, "read_file_info", &[f, posix]));
+        answers.push(prim_file(&mut runtime, "read_file_info", &[f, universal]));
+        answers.push(prim_file(&mut runtime, "read_file_info", &[f, local]));
+        answers.push(prim_file(&mut runtime, "read_file_info", &[f, bogus]));
+        answers.push(prim_file(&mut runtime, "read_file_info", &[f, bare_time]));
+        answers.push(prim_file(&mut runtime, "read_file_info", &[missing]));
+        answers.push(prim_file(&mut runtime, "read_file_info", &[missing, bogus]));
+        answers.push(prim_file(&mut runtime, "read_file_info", &[nul_f]));
+        answers.push(prim_file(&mut runtime, "read_file_info", &[foo]));
+        answers.push(prim_file(&mut runtime, "read_link_info", &[d]));
+        let answer = prim_file(&mut runtime, "open", &[f, mode_read]);
+        let fd = ok_value(&runtime, answer);
+        let answer = prim_file(&mut runtime, "open", &[g, mode_read]);
+        let fd2 = ok_value(&runtime, answer);
+        answers.push(prim_file(&mut runtime, "read_handle_info", &[fd]));
+        answers.push(prim_file(&mut runtime, "read_handle_info", &[fd, posix]));
+        answers.push(prim_file(&mut runtime, "read_handle_info", &[fd2]));
+        answers.push(prim_file(&mut runtime, "read_link_info", &[d, universal]));
+        assert_ok(&mut runtime, "close", &[fd]);
+        assert_ok(&mut runtime, "close", &[fd2]);
+        answers.push(prim_file(&mut runtime, "read_handle_info", &[fd]));
+        answers.push(prim_file(&mut runtime, "read_handle_info", &[foo]));
+        answers
+            .into_iter()
+            .map(|term| rendered_compact(&mut runtime, term))
+            .collect()
+    }
+
+    /// The `-eval` the oracle runs: the same sequence, each answer printed with `~p` and
+    /// terminated by `|` so the compacted forms line up regardless of line wrapping.
+    fn file_info_expression(dir: &str) -> String {
+        format!(
+            r#"F = "{dir}/f", G = "{dir}/g", D = "{dir}/d", L = "{dir}/l", M = "{dir}/missing",
+FOO = foo,
+B = list_to_binary(F),
+{{ok,Fd}} = prim_file:open(F,[read]),
+{{ok,Fd2}} = prim_file:open(G,[read]),
+A1 = prim_file:read_file_info(F),
+A2 = prim_file:read_file_info(B),
+A3 = prim_file:read_file_info(D),
+A4 = prim_file:read_file_info(L),
+A5 = prim_file:read_link_info(L),
+A6 = prim_file:read_link_info(F),
+A7 = prim_file:read_file_info(F,[{{time,posix}}]),
+A8 = prim_file:read_file_info(F,[{{time,universal}}]),
+A9 = prim_file:read_file_info(F,[{{time,local}}]),
+A10 = prim_file:read_file_info(F,[{{time,bogus}}]),
+A11 = prim_file:read_file_info(F,[time]),
+A12 = prim_file:read_file_info(M),
+A13 = prim_file:read_file_info(M,[{{time,bogus}}]),
+A14 = prim_file:read_file_info(<<B/binary,0>>),
+A15 = prim_file:read_file_info(FOO),
+A16 = prim_file:read_link_info(D),
+A17 = prim_file:read_handle_info(Fd),
+A18 = prim_file:read_handle_info(Fd,[{{time,posix}}]),
+A19 = prim_file:read_handle_info(Fd2),
+A20 = prim_file:read_link_info(D,[{{time,universal}}]),
+ok = prim_file:close(Fd),
+ok = prim_file:close(Fd2),
+A21 = prim_file:read_handle_info(Fd),
+A22 = prim_file:read_handle_info(FOO),
+lists:foreach(fun(X) -> io:format("~p|",[X]) end,
+              [A1,A2,A3,A4,A5,A6,A7,A8,A9,A10,A11,A12,A13,A14,A15,A16,A17,A18,A19,A20,
+               A21,A22]),
+halt(0).
+"#
+        )
+    }
+
+    /// Compares the runtime's and the oracle's compacted `#file_info{}` answers, tolerating a
+    /// wall-clock drift of at most **one second** in a `{{Y,M,D},{H,M,S}}` time triple.
+    ///
+    /// Everything else must be byte-identical — every tag, size, mode, type, node/inode-ish
+    /// field, the answer ordering and the answer count — so a real difference still fails
+    /// loudly, with both full answers. Only the time triples may move, and only because the
+    /// two runs read the clock a second apart: following the symlink `l`
+    /// (`read_file_info(l)`, answer `A4`) refreshes its atime to the traversing run's own
+    /// "now", so `read_link_info(l)` (answer `A5`) may legitimately answer a second apart.
+    /// The tolerance is not a mask: a time triple that differs by two seconds — or a
+    /// non-time token that differs at all — is a mismatch.
+    fn assert_file_info_answers_agree(theirs: &[String], ours: &[String]) {
+        assert_eq!(
+            theirs.len(),
+            ours.len(),
+            "the oracle answered {} terms, this runtime {}",
+            theirs.len(),
+            ours.len()
+        );
+        for (index, (theirs, ours)) in theirs.iter().zip(ours).enumerate() {
+            if theirs == ours || answers_differ_only_by_a_second(theirs, ours) {
+                continue;
+            }
+            panic!(
+                "answer #{index} (A{}) of the #file_info{{}} family disagrees with the oracle\n\
+                 --- oracle ---\n{theirs}\n\
+                 --- runtime ---\n{ours}",
+                index + 1
+            );
+        }
+    }
+
+    /// Whether two compacted answers are identical once every `{{Y,M,D},{H,M,S}}` time triple
+    /// is taken out of the comparison — with the corresponding triples differing by at most a
+    /// second. Any other difference (a different skeleton, a different number of time triples,
+    /// or two triples more than a second apart) is `false`.
+    fn answers_differ_only_by_a_second(theirs: &str, ours: &str) -> bool {
+        let (theirs_shape, theirs_times) = split_time_triples(theirs);
+        let (ours_shape, ours_times) = split_time_triples(ours);
+        theirs_shape == ours_shape
+            && theirs_times.len() == ours_times.len()
+            && theirs_times.iter().zip(&ours_times).all(|(theirs, ours)| {
+                (time_triple_scalar(*theirs) - time_triple_scalar(*ours)).abs() <= 1
+            })
+    }
+
+    /// Splits a compacted answer into its *skeleton* — every `{{Y,M,D},{H,M,S}}` time triple
+    /// replaced by a `<t>` marker — and the six numbers of each such triple, in order of
+    /// appearance.
+    fn split_time_triples(answer: &str) -> (String, Vec<[i64; 6]>) {
+        let mut skeleton = String::with_capacity(answer.len());
+        let mut triples = Vec::new();
+        let mut index = 0;
+        while index < answer.len() {
+            if answer.as_bytes()[index] == b'{' {
+                if let Some((end, triple)) = parse_time_triple(answer, index) {
+                    skeleton.push_str("<t>");
+                    triples.push(triple);
+                    index = end;
+                    continue;
+                }
+            }
+            let character = answer[index..].chars().next().expect("a char boundary");
+            skeleton.push(character);
+            index += character.len_utf8();
+        }
+        (skeleton, triples)
+    }
+
+    /// `{{Y,M,D},{H,M,S}}` at `start`, as six numbers plus the index just past the closing
+    /// brace.
+    fn parse_time_triple(text: &str, start: usize) -> Option<(usize, [i64; 6])> {
+        let bytes = text.as_bytes();
+        if bytes.get(start) != Some(&b'{') {
+            return None;
+        }
+        let (after_date, date) = parse_int_triple(text, start + 1)?;
+        if bytes.get(after_date) != Some(&b',') {
+            return None;
+        }
+        let (after_time, time) = parse_int_triple(text, after_date + 1)?;
+        if bytes.get(after_time) != Some(&b'}') {
+            return None;
+        }
+        Some((
+            after_time + 1,
+            [date[0], date[1], date[2], time[0], time[1], time[2]],
+        ))
+    }
+
+    /// `{Int,Int,Int}` at `start`, as the three numbers plus the index just past the closing
+    /// brace.
+    fn parse_int_triple(text: &str, start: usize) -> Option<(usize, [i64; 3])> {
+        let bytes = text.as_bytes();
+        if bytes.get(start) != Some(&b'{') {
+            return None;
+        }
+        let mut index = start + 1;
+        let mut values = [0i64; 3];
+        for (slot, value) in values.iter_mut().enumerate() {
+            let (parsed, next) = parse_int(text, index)?;
+            *value = parsed;
+            index = next;
+            let expected = if slot == 2 { b'}' } else { b',' };
+            if bytes.get(index) != Some(&expected) {
+                return None;
+            }
+            index += 1;
+        }
+        Some((index, values))
+    }
+
+    /// A (possibly signed) decimal integer at `start`, as its value plus the index just past
+    /// its last digit.
+    fn parse_int(text: &str, start: usize) -> Option<(i64, usize)> {
+        let bytes = text.as_bytes();
+        let mut index = start;
+        let negative = bytes.get(index) == Some(&b'-');
+        if negative {
+            index += 1;
+        }
+        let digits = index;
+        let mut value = 0i64;
+        while let Some(digit @ b'0'..=b'9') = bytes.get(index).copied() {
+            let digit = i64::from(digit - b'0');
+            value = value.checked_mul(10)?.checked_add(digit)?;
+            index += 1;
+        }
+        if index == digits {
+            return None;
+        }
+        Some((if negative { -value } else { value }, index))
+    }
+
+    /// One `{{Y,M,D},{H,M,S}}` triple as a single comparable scalar — days since the civil
+    /// epoch × 86400 + the second of the day — so a second's drift across a minute, hour,
+    /// midnight, month or leap-year boundary is still exactly one second.
+    fn time_triple_scalar(triple: [i64; 6]) -> i64 {
+        let [year, month, day, hour, minute, second] = triple;
+        days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second
+    }
+
+    /// The number of days from `1970-01-01` to `year-month-day` in the proleptic Gregorian
+    /// calendar (Howard Hinnant's `days_from_civil`), valid for every date the file system
+    /// can report.
+    fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+        let year = if month <= 2 { year - 1 } else { year };
+        let era = if year >= 0 { year } else { year - 399 } / 400;
+        let year_of_era = year - era * 400;
+        let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+        let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+        era * 146_097 + day_of_era - 719_468
+    }
+
+    /// The `#file_info{}` family's oracle cross-check: both `read_*_info` path forms (list and
+    /// binary), both symlink answers, all four time options, a bare `time` element, a missing
+    /// path with and without an option, a NUL path, a non-path term, and the four
+    /// `read_handle_info` answers (a `0644` file, a `0444` file, a closed descriptor, a
+    /// non-descriptor) — every answer rendered compacted and compared line for line, with a
+    /// wall-clock drift of at most one second allowed **in the time triples only** (see
+    /// [`assert_file_info_answers_agree`]).
+    #[test]
+    fn the_file_info_family_agrees_with_the_oracle() {
+        let Some(oracle) = resolve_oracle() else {
+            skip_oracle_loudly("no `erl` on $PATH (and no executable $ERTS_ORACLE)");
+            return;
+        };
+        let dir = scratch_dir("file_info");
+        let dir_text = dir.to_str().expect("a UTF-8 path").to_string();
+        prepare_file_info_tree(&dir);
+
+        let ours = file_info_answers(&dir);
+        let expression = file_info_expression(&dir_text);
+        let args = ["-noshell", "-eval", expression.as_str(), "-s", "init", "stop"];
+        let Some(output) = run_oracle(&oracle, &args) else {
+            skip_oracle_loudly("the oracle probe could not answer within the bound");
+            return;
+        };
+        if !output.status.success() {
+            eprintln!(
+                "warning: the oracle exited with {:?}\n--- stderr ---\n{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            skip_oracle_loudly("the oracle probe exited with a failure");
+            return;
+        }
+        let compacted: String = String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .collect();
+        let theirs: Vec<String> = compacted
+            .split('|')
+            .filter(|answer| !answer.is_empty())
+            .map(str::to_string)
+            .collect();
+        assert_file_info_answers_agree(&theirs, &ours);
+    }
+
+    /// The tolerance [`assert_file_info_answers_agree`] grants is exactly one second **and only
+    /// inside** the `{{Y,M,D},{H,M,S}}` time triples: a one-second drift — including one that
+    /// rolls over a minute, an hour, a midnight or a leap day, where the *date* triple differs
+    /// too — is accepted, while a two-second drift, a different non-time field, an answer that
+    /// carries no time triple at all, and an answer a whole day out are all real mismatches.
+    #[test]
+    fn the_file_info_time_tolerance_is_one_second_and_time_only() {
+        // A `read_link_info(l)` answer: a symlink's atime, then its mtime/ctime (held fixed).
+        let answer = |atime: &str| {
+            format!(
+                "{{file_info,6,symlink,read_write,{atime},{{{{2024,5,1}},{{8,0,0}}}},{{{{2024,5,1}},{{8,0,1}}}},41471,1,0,0,42,1000,1000}}"
+            )
+        };
+        let base = answer("{{2024,5,3},{12,34,56}}");
+        assert!(answers_differ_only_by_a_second(
+            &base,
+            &answer("{{2024,5,3},{12,34,57}}")
+        ));
+        assert!(!answers_differ_only_by_a_second(
+            &base,
+            &answer("{{2024,5,3},{12,34,58}}")
+        ));
+        assert!(!answers_differ_only_by_a_second(
+            &base,
+            &answer("{{2024,5,3},{12,35,0}}")
+        ));
+
+        // A second's drift across a minute, an hour, a midnight and a leap day, in both
+        // directions (the scalar is the comparable one, never the fields one by one).
+        for (earlier, later) in [
+            ("{{2024,5,3},{12,34,59}}", "{{2024,5,3},{12,35,0}}"),
+            ("{{2024,5,3},{12,59,59}}", "{{2024,5,3},{13,0,0}}"),
+            ("{{2024,5,3},{23,59,59}}", "{{2024,5,4},{0,0,0}}"),
+            ("{{2023,12,31},{23,59,59}}", "{{2024,1,1},{0,0,0}}"),
+            ("{{2024,2,29},{23,59,59}}", "{{2024,3,1},{0,0,0}}"),
+        ] {
+            assert!(answers_differ_only_by_a_second(
+                &answer(earlier),
+                &answer(later)
+            ));
+            assert!(answers_differ_only_by_a_second(
+                &answer(later),
+                &answer(earlier)
+            ));
+        }
+
+        // Every non-time difference is still a mismatch: another size, no time triple at all
+        // (the posix integer form), and the same clock time one whole day out.
+        assert!(!answers_differ_only_by_a_second(
+            &base,
+            &base.replacen("{file_info,6,", "{file_info,7,", 1)
+        ));
+        assert!(!answers_differ_only_by_a_second(
+            &base,
+            &answer("1714740896")
+        ));
+        assert!(!answers_differ_only_by_a_second(
+            &base,
+            &answer("{{2024,5,4},{12,34,56}}")
+        ));
+    }
+
+    /// A `function_clause` `Opts` is an **uncaught** raise, never the wrapper's `{error,
+    /// badarg}` value: `proplist_get_value/3` is evaluated outside `read_info_1/3`'s `try`
+    /// (`prim_file.erl:642-645`, verified against the oracle).
+    #[test]
+    fn a_non_list_opts_raises_function_clause() {
+        let mut runtime = runtime();
+        let dir = scratch_dir("file_info_opts");
+        prepare_file_info_tree(&dir);
+        let f = path_in(&mut runtime, &dir, "f");
+        let not_a_list = atom(&mut runtime, "foo");
+        for function in ["read_file_info", "read_link_info", "read_handle_info"] {
+            let error = call(&mut runtime, "prim_file", function, &[f, not_a_list])
+                .expect_err("a non-list Opts must raise");
+            assert_eq!(
+                error.as_atom(),
+                Some("function_clause"),
+                "{function} must raise the bare reason atom"
+            );
+        }
     }
 }

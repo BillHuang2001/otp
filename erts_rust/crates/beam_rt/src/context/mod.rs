@@ -33,8 +33,11 @@
 //! # One context, three dispatch routes
 //!
 //! The engine routes `call_ext*` **and** `apply`/`apply_last` through
-//! [`ExecutionContext::call_bif`], and `call_fun`/`call_fun2` through
-//! [`ExecutionContext::apply_fun`]. So [`RuntimeContext::call_bif`] serves, in order:
+//! [`ExecutionContext::call_bif`] — unless the host can run the callee in-machine, which the
+//! [`ExecutionContext::resolve_external_call`] seam reports — and `call_fun`/`call_fun2`
+//! through the in-machine [`ExecutionContext::resolve_local_fun`] seam **first**, falling back
+//! to the value-returning [`ExecutionContext::apply_fun`]. So [`RuntimeContext::call_bif`]
+//! serves, in order:
 //!
 //! 1. the **runtime-native floor** ([`crate::native`]: `halt`, `display`,
 //!    `io:put_chars`, `erlang:apply`, `init:get_argument`);
@@ -1954,7 +1957,11 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// a discoverable `.beam` for one of those would run the module body *instead of* the
     /// host implementation — a wrong result — so the answer is deliberately conservative:
     ///
-    /// * a name in a namespace the floor serves ([`native::FLOOR_MODULES`]) → `Ok(None)`;
+    /// * a name the floor serves ([`native::floor_shadows`]) → `Ok(None)`. The rule is
+    ///   **key-granular**: a whole namespace in [`native::FLOOR_MODULES`] is refused, except
+    ///   `io`, where the floor owns only `io:put_chars/1,2` — every other `io:*` is a real
+    ///   `lib/stdlib/src/io.erl` body that must be entered in-machine so its blocking
+    ///   `receive` can suspend the process;
     /// * a NIF-backed name ([`Runtime::nifs`]) — and, because the interception is module-wide
     ///   at dispatch, the *whole* module carrying a loaded NIF was excluded below —, a
     ///   registered `beam_bifs` name ([`Runtime::registry`]) or the `erlang` BIF namespace →
@@ -1977,6 +1984,7 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// unchanged: the seam only ever *substitutes a routing* for a call the synchronous path
     /// would run through the same code anyway.
     ///
+    /// [`native::floor_shadows`]: crate::native::floor_shadows
     /// [`native::FLOOR_MODULES`]: crate::native::FLOOR_MODULES
     /// [`Runtime::nifs`]: crate::Runtime
     fn resolve_external_call(
@@ -1988,9 +1996,18 @@ impl ExecutionContext for RuntimeContext<'_> {
         // The floor's namespaces: `try_native` serves them for modules that are *also*
         // loadable `.beam`s (`os`, `code`, `init`, `application`, `prim_file`,
         // `erts_internal`, `erlang`, `io`), so entering the module body would shadow the host
-        // implementation. The list is the floor's own, and a unit test below pins it against
-        // `try_native`'s source so it can never drift out of the host's dispatch.
-        if crate::native::FLOOR_MODULES.contains(&module) {
+        // implementation. The exclusion is **key-granular** because one namespace is only
+        // partly floor-served: the floor owns just `io:put_chars/1,2`, while every other
+        // `io:*` (`io:getopts/1`, `io:setopts/2`, `io:request/2`, `io:scan_erl_form/4`, …) is
+        // an ordinary `lib/stdlib/src/io.erl` body. Refusing those would route them onto the
+        // synchronous non-pumping `call_bif` path, where a **scheduled** process's blocking
+        // `receive` on the io-device reply folds into the typed `blocked()` gap (exit 3)
+        // instead of suspending — the contract A.9 `compile:file/2` blocker; entering them
+        // in-machine lets that `receive` suspend the process and be resumed when the device
+        // replies. The key list is [`crate::native::floor_shadows`], whose `io` exception a
+        // unit test below pins against `try_native`'s source so it can never drift out of the
+        // host's dispatch.
+        if crate::native::floor_shadows(module, function, arity) {
             return Ok(None);
         }
         // A module with a loaded NIF library is **never** entered here, for two reasons.
@@ -2077,6 +2094,45 @@ impl ExecutionContext for RuntimeContext<'_> {
             None => Ok(None),
         }
     }
+
+    /// The **in-machine closure-apply seam** (`call_fun`/`call_fun2`): resolves a `.beam`
+    /// **local** (`make_fun3`) closure to the module that defines it and the lambda's `FunT`
+    /// entry label, so the engine enters the closure body **in this machine** — exactly as C's
+    /// `call_fun` dispatches to the fun body's code in the same process
+    /// (`../../erts/emulator/beam/beam_common.c:1604`).
+    ///
+    /// A `receive` inside the closure body therefore suspends **this** process through the
+    /// ordinary [`beam_engine::RunOutcome::Wait`] path (and a raise lands in the caller's live
+    /// `try`/`catch`), instead of the value-returning [`Self::apply_fun`] fallback running the
+    /// body on a fresh nested machine — a suspension a **scheduled** slice's context
+    /// ([`RuntimeContext::for_process`], `may_pump_scheduler() == false`) cannot resume, since a
+    /// slice may never re-enter the scheduler.
+    ///
+    /// The resolution is the shared [`RuntimeContext::local_fun_target`] seam, so a closure
+    /// resolves through exactly the lookup a fun-bodied process entry uses. The `module` it
+    /// hands back is the **same** `Arc<Module>` the code server caches, which the engine
+    /// requires because it dedups module contexts by `Arc::ptr_eq`.
+    ///
+    /// `Ok(None)` — the seam's "I cannot run this closure in your machine" — is passed through
+    /// for the two fun kinds with no local label entry, exactly the cases
+    /// [`RuntimeContext::local_fun_target`] reports `Ok(None)` for: an **external** fun
+    /// (`fun M:F/A`, the `EXPORT_EXT` encoding) and the `-eval` evaluator's own closure. They
+    /// keep the value-returning [`Self::apply_fun`] fallback, byte-identical to a host without
+    /// the seam.
+    ///
+    /// The engine places the free variables itself (`x(arity..)`, C's `call_fun` order), so
+    /// `local_fun_target` is consulted purely for resolution/validation — its combined
+    /// `args ++ free` argument list is **not** used here.
+    fn resolve_local_fun(
+        &mut self,
+        fun: Eterm,
+        args: &[Eterm],
+    ) -> Result<Option<(Arc<Module>, Label)>> {
+        Ok(self
+            .local_fun_target(fun, args)?
+            .map(|target| (target.module, target.label)))
+    }
+
     /// Ensures `heap_need` words are available for the running code, collecting the running
     /// process's own young heap when it cannot serve them (see [`crate::context::gc`]).
     ///

@@ -1215,8 +1215,8 @@ mod tests {
         //
         // The three kernel processes must survive their short-lived directive processes'
         // exits (`heart`, `logger` and `application_controller`): the unlink in
-        // `drive::start_kernel_process` keeps the `application_controller`'s server alive, so
-        // it is still registered after the whole script has run.
+        // `drive::start_kernel_process` keeps their servers alive, so `logger` and
+        // `application_controller` are still registered after the whole script has run.
         let Some(mut runtime) = system_runtime() else {
             return;
         };
@@ -1233,10 +1233,11 @@ mod tests {
             Some(&Instruction::Progress("started".to_string())),
             "the completed boot ends at the final `{{progress,started}}`"
         );
-        // The unlink in `drive::start_kernel_process` keeps the `application_controller`'s
-        // server alive past its directive process's `normal` exit. (`heart` returns without
-        // registering and `logger` never reaches its registration, so `application_controller`
-        // is the one to pin.)
+        // The unlink in `drive::start_kernel_process` keeps the kernel servers alive past
+        // their directive processes' `normal` exits. (`heart` returns without registering; the
+        // `logger` server's survival is pinned by
+        // `the_real_boot_registers_a_live_logger_process`, so `application_controller` is the
+        // one to pin here.)
         let registered = |runtime: &Runtime, name: &str| {
             runtime
                 .atoms()
@@ -1257,62 +1258,22 @@ mod tests {
     }
 
     #[test]
-    fn the_real_boot_leaves_logger_unregistered_pending_the_apply_seam_gap() {
-        // Pins a **cross-crate capability gap**, not desired behaviour. The real OTP boot
-        // leaves a live `logger_server` registered as `logger` (the oracle answers
-        // `erlang:whereis(logger)` with a pid), but this runtime does not.
-        //
-        // Instruction 13 is `{kernelProcess,logger,{logger_server,start_link,[]}}`, and
-        // `logger_server:start_link/0` -> `gen_server:start_link({local,logger}, ...)` ->
-        // `gen:start/6` -> `proc_lib:start_link/5` spawns the child and parks the caller in
-        // `proc_lib:sync_start/2`. The child's body is entered through `erlang:apply/3`
-        // (`proc_lib:init_p_do_apply/3`'s `try apply(M,F,A)`), and because `erlang` is a
-        // `crate::native::FLOOR_MODULES` member `RuntimeContext::resolve_external_call`
-        // declines the call (`Ok(None)`), so the apply runs **synchronously** instead of
-        // through the `Step::Enter` seam. When the child's `gen_server:init_it`/`init` then
-        // blocks in `receive`, the engine folds the block into the typed `error::blocked()`
-        // instead of suspending, so the child dies before `proc_lib:init_ack/2`;
-        // `gen_server:init_it` never reaches its `register(logger, self())`, and the
-        // directive's parked `sync_start/2` (timeout `infinity`) never resumes.
-        //
-        // The fix belongs to `beam_engine` (give `call_ext`/`erlang:apply/2,3` the same
-        // `resolve_external_call`/`Step::Enter` treatment the literal-target `call_ext`
-        // already gets) or to `beam_rt`'s `src/context` (intercept `erlang:apply/2,3` in
-        // `call_bif` and run the target through the blocking-aware entry) — never to this
-        // boot executor. When that seam is closed this test must be **deleted** and replaced
-        // by the positive assertion in `the_real_boot_registers_a_live_logger_process`.
-        let Some(mut runtime) = system_runtime() else {
-            return;
-        };
-        let path = Path::new(START_BOOT);
-        if !path.is_file() {
-            eprintln!("SKIP: {START_BOOT} is absent");
-            return;
-        }
-        let script = read(path).expect("the real start.boot parses");
-        execute_reporting(&mut runtime, &script)
-            .expect("the real start.boot must boot all 22 directives to `{progress,started}`");
-        assert!(
-            !is_registered(&runtime, "logger"),
-            "the `erlang:apply/3` seam gap leaves `logger` unregistered; if this now resolves, \
-             the seam is closed — delete this test and un-ignore \
-             `the_real_boot_registers_a_live_logger_process`"
-        );
-    }
-
-    #[test]
-    #[ignore = "blocked on the cross-crate erlang:apply/2,3 seam gap (beam_engine call_ext / beam_rt src/context): the proc_lib child dies before init_ack, so gen_server:init_it never registers logger"]
     fn the_real_boot_registers_a_live_logger_process() {
-        // The oracle behaviour: while the real `bootstrap/bin/start.boot` runs, instruction
-        // 13's `{kernelProcess,logger,{logger_server,start_link,[]}}` leaves `logger_server`
-        // alive and registered as `logger`, so after the boot `erlang:whereis(logger)`
-        // resolves to a live pid and a second `logger_server:start_link/0` reports
-        // `{error,{already_started,Pid}}`, exactly as under real OTP.
+        // Instruction 13's `{kernelProcess,logger,{logger_server,start_link,[]}}` leaves
+        // `logger_server` alive and registered as `logger`, so after the boot
+        // `erlang:whereis(logger)` resolves to a live pid and a second
+        // `logger_server:start_link/0` reports `{error,{already_started,Pid}}`, exactly as under
+        // real OTP.
         //
-        // It is ignored because the same boot currently leaves `logger` unregistered (see
-        // `the_real_boot_leaves_logger_unregistered_pending_the_apply_seam_gap`): running it
-        // with `--ignored` and watching it fail is the evidence for that gap. Un-ignore it
-        // when the `erlang:apply/2,3` seam is closed.
+        // The child is entered at `proc_lib:init_p_do_apply/3`, whose `try … apply(M,F,A) …`
+        // body `erlc` compiles to a **non-tail** `{call_ext,3,{extfunc,erlang,apply,3}}`. The
+        // engine's `call_ext*` arms give `erlang:apply/3` C's `fixed_apply` treatment
+        // (`beam_engine/src/interpreter/dispatch.rs::resolve_call_ext_apply`), so the callee is
+        // entered **in-machine** as `Step::Enter` and its blocking `receive` suspends *this*
+        // process through the ordinary `RunOutcome::Wait` path instead of folding into the
+        // uncatchable typed `error::blocked()`. `gen_server:init_it` therefore reaches its
+        // `register(logger, self())` and the directive's parked `proc_lib:sync_start/2`
+        // (timeout `infinity`) resumes.
         let Some(mut runtime) = system_runtime() else {
             return;
         };

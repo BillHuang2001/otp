@@ -594,6 +594,17 @@ impl Runtime {
             // `run_slice` absorbs the table's own wake list, and this is the fragment
             // counterpart, so the receiver this pass just woke still runs in this pass.
             let woke = self.absorb_fragment_wakes(&mut table, &mut scheduler);
+            // The **driver-monitor marking** half of the A.4 monitor family: a C driver that called
+            // `driver_monitor_process` watches an Erlang process, and this runtime is the only party
+            // that holds the live process table, so the surveillance is discharged here — every
+            // monitored pid the table no longer holds (a death in the slices just run, or a monitor
+            // installed on an already-dead pid) is marked, and the **same** round's port tasks below
+            // then fire the driver's `ErlDrvEntry::process_exit` for it. Nothing is delivered, so the
+            // pass does not go round again for it; a still-live port-registry borrow defers the scan
+            // (marking is idempotent state in the port metadata, so the next pass retries naturally).
+            if let Err(err) = self.drain_driver_monitor_exits(&table) {
+                break Err(err);
+            }
             // The port half: with a live port, read what it produced and deliver it into
             // the owning process's mailbox (which may wake a blocked receiver).
             match self.deliver_port_messages(&mut table, crate::port::PORT_POLL_SLICE) {
