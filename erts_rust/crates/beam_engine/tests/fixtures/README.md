@@ -221,6 +221,34 @@ does **not** return `empty`: `wait_timeout` suspends and the run reports
 `RunOutcome::Wait` (the timer is the host's job). `tests/receive.rs` asserts that
 honest outcome instead of the oracle value; every other row matches the oracle.
 
+## `applyrecv.beam` (`applyrecv.erl`) — `tests/call_ext_apply.rs`
+
+The runtime-valued `erlang:apply/3` fixture: `run(M, F, A) -> erlang:apply(M, F, A).`
+Because `M`/`F`/`A` are parameters the compiler cannot fold, the body lowers to
+`call_ext_only 3 {extfunc,erlang,apply,3}` (the shape the test re-verifies with
+`beam_disasm:file/1`). Its applied callee blocks in a `receive`, so it is the
+end-to-end evidence for the seam: the *calling* process must suspend in-machine
+(`RunOutcome::Wait`) and resume to the oracle value, instead of folding into the
+uncatchable `blocked()` at the call site.
+
+| export | Erlang | opcodes exercised |
+|---|---|---|
+| `run/3` | `run(M, F, A) -> erlang:apply(M, F, A).` | `call_ext_only 3 erlang:apply/3` (the seam), `return` |
+| `blocker/0` | `blocker() -> receive {reply, V} -> V end.` | `loop_rec`, `get_tuple_element`, `remove_message`, `wait` |
+
+Expected value (the oracle transcript quoted in the `.erl`, OTP 29 / erts-17.1):
+
+| expression | value |
+|---|---|
+| `Self=self(), P = spawn(fun() -> Self ! {done, applyrecv:run(applyrecv, blocker, [])} end), P ! {reply, 42}, receive {done, V} -> V end` | `42` |
+
+The engine drives the same scenario in one machine (the mock mailbox plays the
+sender): `run/3` resolves `applyrecv:blocker/0` in-machine, the callee's `wait`
+suspends, and the resume on the injected `{reply, 42}` returns `42`.
+`tests/call_ext_apply.rs` re-runs the transcript under the live system `erl` in a
+second test (skipping loudly when there is no runnable oracle) so a fixture
+regeneration cannot silently change the baked value.
+
 ## `bssmall.beam` (`bssmall.erl`) — `tests/bitstrings_extra_big.rs`
 
 The **at-most-64-bit** integer fields whose value can still exceed `MAX_SMALL`

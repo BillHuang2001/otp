@@ -170,14 +170,22 @@ impl Fixture {
     }
 }
 
+/// `module:name`'s atom as the loader's own [`Atom`] — a table **index**, not a
+/// term — resolved through `module`'s own table.
+///
+/// [`atom_term`] builds the *term* form; an API that takes the raw index
+/// (`Module::export`, `atom_name`) needs this one. A name the fixture forgot to
+/// intern is a test bug, so it panics rather than falling back to another table.
+fn atom(module: &Module, name: &str) -> Atom {
+    module
+        .atom_table
+        .lookup(name)
+        .unwrap_or_else(|| panic!("atom {name:?} not interned in the fixture"))
+}
+
 /// `module:name`'s atom term, resolved through `module`'s own table.
 fn atom_term(module: &Module, name: &str) -> Eterm {
-    make_atom(
-        module
-            .atom_table
-            .lookup(name)
-            .unwrap_or_else(|| panic!("atom {name:?} not interned in the fixture")),
-    )
+    make_atom(atom(module, name))
 }
 
 // ---------------------------------------------------------------------------
@@ -377,6 +385,11 @@ fn caller_apply3_module() -> (Module, Atom) {
 /// resolved target reuses the caller's frame.
 fn caller_apply3_tail_module() -> (Module, Atom) {
     let mut f = Fixture::new("m");
+    // The same caller-supplied atoms [`caller_apply3_module`] interns: the tests
+    // seed `x(0)`/`x(1)` with `c`/`recv` terms built from this very table.
+    for name in ["erlang", "apply", "c", "recv"] {
+        f.atom(name);
+    }
     let target = f.import("erlang", "apply", 3);
     let run = f.add_function(
         "run",
@@ -429,7 +442,10 @@ fn caller_apply2_module() -> (Module, Atom) {
 /// ```
 fn try_caller_apply3_module() -> (Module, Atom) {
     let mut f = Fixture::new("m");
-    for name in ["erlang", "apply", "not_apply"] {
+    // `c`/`recv` are interned so the shape-error tests can build the `M`/`F`
+    // argument terms from this module's own table (the raise itself never needs
+    // them: it is the `badarg` atom the landing resolves).
+    for name in ["erlang", "apply", "not_apply", "c", "recv"] {
         f.atom(name);
     }
     let target = f.import("erlang", "apply", 3);
@@ -802,9 +818,9 @@ fn the_fixtures_run3_is_a_call_ext_of_erlang_apply3() {
     // the blocking test silently passing for the wrong reason.
     let module = applyrecv_module();
     let run = module
-        .export(atom_term(&module, "run").try_into().expect("a run/3 export"), 3)
+        .export(atom(&module, "run"), 3)
         .expect("the fixture exports run/3");
-    // `Atom` is the loader's own type; recover it from the export table directly.
+    // Cross-check: `exports`' own row for `run/3` names the same entry label.
     let run_export = module
         .exports
         .iter()
@@ -825,7 +841,7 @@ fn the_fixtures_run3_is_a_call_ext_of_erlang_apply3() {
         })
         .expect("call_ext_only");
     assert_eq!(call.1, 3, "the apply is at arity 3");
-    let import = module.imports[call.0 .0 as usize];
+    let import = &module.imports[call.0 .0 as usize];
     assert_eq!(module.atom_name(import.module), Some("erlang"));
     assert_eq!(module.atom_name(import.function), Some("apply"));
     assert_eq!(import.arity, 3);
@@ -853,7 +869,7 @@ fn the_fixture_blocks_then_resumes_to_the_oracles_value() {
     let outcome = machine
         .run_export_outcome(
             &module,
-            atom_term(&module, "run").try_into().expect("a run/3 export"),
+            atom(&module, "run"),
             3,
             &[
                 atom_term(&module, "applyrecv"),
@@ -935,15 +951,18 @@ fn the_live_oracle_reproduces_the_baked_value() {
 }
 
 // ---------------------------------------------------------------------------
-// the seam's Ok(None) default keeps the synchronous BIF path for other imports
+// `resolve_external_call`'s Ok(None) default keeps the synchronous BIF path
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_minimal_context_without_the_seam_still_folds_a_blocking_apply() {
-    // The trait's `Ok(None)` default (a plain `MinimalContext`, no resolver) leaves
-    // the synchronous `call_bif` route intact: the applied callee cannot suspend the
-    // caller, so `blocked()` is the honest typed outcome — the very gap the seam
-    // closes for a host that owns the callee's module.
+fn a_minimal_context_without_the_seam_folds_the_apply_into_call_bif() {
+    // A plain `MinimalContext` keeps `ExecutionContext::resolve_external_call`'s
+    // `Ok(None)` default (it owns no module registry), so the applied callee cannot
+    // be entered **in this machine**: `funs::apply_target` folds the call into the
+    // host's *synchronous* `call_bif` for the triple the seam decoded — `c:recv/0`,
+    // NOT the `erlang:apply/3` import. This floor rejects every BIF, so the honest
+    // outcome is that typed raise: a synchronous host has no way to let the callee
+    // suspend the caller (the gap `TestCtx`'s resolver above closes).
     let (caller, run) = caller_apply3_module();
     let mut ctx = MinimalContext::with_bif_hook(Box::new(|module, function, arity, _args| {
         Err(beam_engine::unsupported(&format!(
@@ -952,7 +971,7 @@ fn a_minimal_context_without_the_seam_still_folds_a_blocking_apply() {
     }));
     let mut machine = Machine::new();
 
-    let outcome = machine
+    let error = machine
         .run_export_outcome(
             &caller,
             run,
@@ -960,11 +979,8 @@ fn a_minimal_context_without_the_seam_still_folds_a_blocking_apply() {
             &[atom_term(&caller, "c"), atom_term(&caller, "recv"), NIL],
             &mut ctx,
         )
-        .expect("the synchronous host answers with the result of its own apply/3");
-    assert_eq!(
-        outcome,
-        RunOutcome::Returned(make_small(0)),
-        "a host-supplied apply/3 answers synchronously"
-    );
-    let _ = reason; // the helper above is used by the catching tests' assertions
+        .expect_err("without a resolver the applied callee reaches the host as a BIF dispatch");
+    // The reason names the callee the seam decoded: proof the fold went through
+    // `call_bif` with the decoded `(M, F, A)`.
+    assert_eq!(reason(error), "unsupported_opcode: bif c:recv/0");
 }
