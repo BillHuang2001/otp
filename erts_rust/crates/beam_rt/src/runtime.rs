@@ -67,7 +67,7 @@ use beam_term::{atom_val, is_atom, make_atom, make_small, Atom, AtomTable, Eterm
 use crate::boot::bootscript::{self, BootScript, BootStop};
 use crate::boot::{self, PreloadedModules};
 use crate::codeserver::CodeServer;
-use crate::config::{ArgTerm, InitArgs, RuntimeConfig};
+use crate::config::{strategy_env_default, ArgTerm, InitArgs, RuntimeConfig};
 use crate::context::{PersistentTermStore, RuntimeContext};
 use crate::dist::{resolve_cookie, DistNode, NONODE_NAME};
 use crate::error;
@@ -528,11 +528,27 @@ impl Runtime {
     /// library directories are added lazily by [`CodeServer`] when a module is first
     /// needed, so no external process is spawned until then.
     ///
+    /// # The `BEAM_RT_GC_STRATEGY` opt-in
+    ///
+    /// The **host/test knob** `BEAM_RT_GC_STRATEGY` ([`strategy_env_default`]) is applied
+    /// here, exactly once, to the owned configuration's heap options **before** they are
+    /// stored: `immix` raises the policy's initial mature generation to `beam_gc`'s
+    /// break-even, so `default_spawn_policy` and every process spawned from this runtime
+    /// resolve to the mark-region mature strategy through `beam_gc`'s **automatic rule**. It
+    /// is deliberately **not** an init argument and **not** a CLI flag — the parsed
+    /// [`InitArgs`] are untouched, and the pure [`RuntimeConfig::new`]/[`RuntimeConfig::default`]
+    /// constructors read no environment.
+    ///
     /// # Errors
     ///
     /// Propagates heap/process allocation failures and an out-of-range `+P`-style
     /// limit.
     pub fn new(config: RuntimeConfig) -> Result<Runtime> {
+        // The GC-strategy opt-in (see the method docs): the runtime cannot pin a
+        // `MatureSelection` — `ProcessTable::spawn` takes only a `HeapPolicy` — so the
+        // request is expressed as a size here and resolved by `beam_gc`'s automatic rule.
+        let mut config = config;
+        config.heap.set_gc_strategy(strategy_env_default());
         let mut code_server = CodeServer::new();
         boot::seed_core_atoms(code_server.atoms_mut());
         // The configured `-pa`/`-pz` directories are *boot-time default* code-path entries: a
