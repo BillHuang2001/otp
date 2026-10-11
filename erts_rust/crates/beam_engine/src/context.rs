@@ -1334,7 +1334,9 @@ mod tests {
             !MinimalContext::new().wants_reduce(),
             "MinimalContext must opt out of the reduction hook"
         );
-    }    #[test]
+    }
+
+    #[test]
     fn default_apply_forwards_to_call_bif() {
         // The default `apply` delegates to `call_bif`; here `call_bif` always
         // fails, and the failure must surface identically through `apply`.
