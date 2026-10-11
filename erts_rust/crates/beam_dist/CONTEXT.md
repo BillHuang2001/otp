@@ -94,6 +94,21 @@ prints `visible=false`.
 the handshake completes incrementally and a `DOP_REG_SEND` is delivered (the node prints
 `GOT {hello,7,…}`).
 
+**Hermetic two-node loopback (no `erl`, no `epmd`), `tests/two_node_loopback.rs`.** Two in-process
+`beam_dist` endpoints — each with its own node name and creation — complete the `'N'` handshake over a
+real loopback TCP socket and exchange a name-addressed `DOP_REG_SEND` and a `DOP_SEND_SENDER` in
+**both** directions, with a monitor round-trip (`DOP_MONITOR_P` → `DOP_MONITOR_P_EXIT` /
+`DOP_PAYLOAD_MONITOR_P_EXIT`), a tick answered per side, a >`DIST_FRAGMENT_SIZE` message both ways
+(`'E'` fragment frames proven on the wire), an `InboundSink` routing a received delivery
+(`DeliveryOutcome::Delivered`), a `ConnectionDriver` pair over two real **non-blocking `TcpStream`s**,
+and peer-death evidence (a clean socket close → `StepOutcome::Closed`; an abrupt mid-frame drop → a
+typed error). This is the crate's A.5 "two connected nodes" proof and runs in CI with no external
+process. `tests/hermetic_epmd.rs` adds an in-process `epmd` **registry stub** (independent
+hand-written codecs for `ALIVE2_REQ`/`PORT2_RESP`/`NAMES`/`STOP`, deregistering on connection close)
+so the `EpmdClient` is exercised without a host `epmd`, and cross-checks the stub against a real node
+spawned with `erl -epmd_port <stub>` (the node's `ALIVE2_REQ` is parsed by the stub and its port
+resolved back through the crate's client).
+
 The **outbound atom-cache path is wired end-to-end**: `OutboundAtomCache` implements
 `beam_codec::AtomCacheWriter`, `encode_control_cached` threads the cache through a single `Encoder` per
 control message, and both `Connection::send_payload` and `ConnectionDriver::send_control` emit the real
