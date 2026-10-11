@@ -147,7 +147,8 @@ not here.)
   `16`/`16`/`10`, rust `14`/`0`/`0`.
 - `erlang:system_info(build_type)` is an honest rust capability gap (exit 3 /
   `beam_rt: unsupported: …`; the oracle answers `opt`) — neither a case nor a mismatch.
-  (`erlang:system_info(endian)` now agrees — `little` in both — and is pinned.)
+  (`erlang:system_info(endian)` agrees — `little` in both — and is pinned by the oracle-backed
+  `beam_rt` `system_info_oracle` test.)
 - `persistent_term:info/0` returns zero-valued counters in the rust runtime (the oracle reports
   live `count`/`memory`).
 - `erlang:system_info(tolerant_timeofday)` is an honest rust capability gap (exit 3 /
