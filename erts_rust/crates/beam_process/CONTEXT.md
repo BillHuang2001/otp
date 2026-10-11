@@ -441,6 +441,32 @@ The **local record** of a process's relationships with processes on other nodes;
   never `cd`, never touch `../../tools/`.
 - Cross-checks against the real system ERTS belong to the sibling `../../tools/differential/` harness,
   not here.
+## Handoffs (owned by sibling nodes — NOT yet adopted)
+- **`beam_rt` (and `beam_bifs`) must wire reference aliases to make `gen_server:call/2,3` / `sys` /
+  the whole `gen:call` family work.** The `beam_process` side is complete (the `ptab.rs` alias entry
+  points above); these sibling changes are still needed and are **not** made from this node:
+  1. `beam_rt/src/native/process/monitor.rs:127-148` (`monitor_3`) must stop rejecting `{alias, …}`:
+     parse the option list `erts_monitor_opts`-style (`{alias, explicit_unalias|demonitor|reply_demonitor}`
+     and `{tag, Tag}`; a `priority` element has no effect in this runtime) into a
+     `MonitorOptions { tag, alias }` and call the matching `*_with_options` entry point instead of
+     returning `BadArg`.
+  2. `beam_rt/src/native.rs` (`erlang:alias/1` / `erlang:unalias/1` arms, ~`:225-228`): `alias/1` parses
+     `[reply | explicit_unalias | priority]` (default `ExplicitUnalias`) and calls
+     `ProcessTable::create_alias(self_pid, mode)`; `unalias/1` does `MonitorRef::from_eterm(arg)` (a
+     `BadArg` is the oracle's `badarg`) then `ProcessTable::unalias(self_pid, reference)` (the caller is
+     live, so `TermNotFound` need not be surfaced).
+  3. `beam_rt/src/context/bridges.rs:292-319` (`SendBridge::resolve`): every reference destination
+     currently falls through to `BadArg`. Add an alias branch — on an internal ref,
+     `MonitorRef::from_eterm(to)` → `ProcessTable::resolve_alias(reference)`; `Some(owner)` delivers to
+     `owner` and, **after** a successful delivery, calls
+     `ProcessTable::alias_reply_delivered(reference)` (the mode-driven reply-site auto-removal); `None`
+     is the oracle's `badarg` (this crate resolves a dead owner to `None` too — a documented stronger
+     guarantee; the oracle silently drops a send to a non-live alias).
+  - `beam_bifs` needs no change while `beam_rt`'s native floor keeps serving `alias/1`/`unalias/1` and
+    `monitor/3` (the current arrangement); if those move into the registry, the host seam must expose
+    the same alias entry points.
+- **`beam_message` should relax the enqueue tripwire** if a future host stores a heap `from`/`token`
+  (see Known Issues); the `beam_process` gather/scatter side is already in place.
 ## Design Decisions
 The rationale (why) behind the frozen API and constraints lives in **`DESIGN_DECISIONS.md`** (this file keeps the what: API Surface, Constraints, Known Issues).
 
