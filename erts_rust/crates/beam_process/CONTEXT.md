@@ -440,6 +440,28 @@ The **local record** of a process's relationships with processes on other nodes;
 The rationale (why) behind the frozen API and constraints lives in **`DESIGN_DECISIONS.md`** (this file keeps the what: API Surface, Constraints, Known Issues).
 
 ## Known Issues (intentionally NOT covered in Milestone-1)
+- **Reference aliases are unsupported on a port monitor and on a remote target.** `monitor(port, P,
+  [{alias, _}])` and `monitor(process, RemotePid, [{alias, _}])` are typed `unsupported`s rather than
+  accepted aliases. The port case cannot be served faithfully from this crate: `alias_reply_delivered`
+  holds no `&mut PortTable`, so a `reply_demonitor` port alias could not remove the port's incoming
+  `PortMonitor`, and a later `port_closed` would then deliver a `{'DOWN', …}` the oracle never
+  delivers — a **wrong result**, so it is refused instead (reason string
+  `error::unsupported_port_monitor_alias()`, mirroring the pre-existing remote-tag diagnostic). No OTP
+  caller combines either.
+- **The `{tag, Tag}` monitor option accepts only an immediate.** The oracle accepts any term as a tag;
+  this crate refuses a non-immediate tag with a typed `unsupported`, because a tag lives in the
+  `tags: HashMap<MonitorRef, Eterm>` side table, which is **not** a GC root — a per-process-heap tag
+  could not be relocated and would dangle after a collection. Making it faithful needs a
+  gather/scatter of the tag table in the collection walk. (The `aliases` side table is the same
+  concern but its entries are plain values — no term — so it needs no rooting.)
+- **The `from`/`token` envelope roots are gathered and relocated, but no in-tree producer enqueues a
+  heap word there yet.** `beam_message::Queue::enqueue`'s debug `debug_assert_enqueue_terms` tripwire
+  still rejects a non-immediate `from`/`token`, so a host storing a heap word (the C permits a heap
+  `token` tuple, `erl_message.c:388-390`, and a heap Info-tuple `from`, `erl_proc_sig_queue.c:2272`)
+  must (a) opt into the gather — done: `run_rooted_collection` now pushes `Message::from`/`token` and
+  scatters them back through `set_from`/`set_token` — **and** (b) deliberately relax that tripwire in
+  the sibling `beam_message`, which has not happened. Until then every envelope word stays an
+  immediate and this rooting is defensive.
 - **A host holding unpublished live roots is the reason the relocation exemption exists — and the
   `beam_rt` defect it mitigates is owned there.** `Process::deliver`'s on-exhaustion collect relocates
   the young heap against the crate root set only (registers/stack + mailbox payloads + dict + saved args
