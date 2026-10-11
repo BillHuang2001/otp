@@ -82,7 +82,7 @@ The binary's own `run`/`suite` exit codes are unchanged (`0` agree / `1` mismatc
 - **No coupling to `crates/*` internals** (crate deps are `serde` + `serde_json` only). No `clap`; arg parsing is hand-rolled `std`. `unsafe` is **forbidden**.
 - **Loud failures:** stderr messages + nonzero exit; never silently swallow an error. Machine-readable JSON, stable schema, written under the gitignored `out/` (or `--out <dir>`).
 - Files target ~1000 lines; split by responsibility. Apache-2.0. The corpus group files are **data registries** (one embedded module/expression per case) and legitimately run past the soft target (`wire.rs`, `wire_extra.rs`, `errors.rs`, `nif_abi.rs`, `nif_abi_extra.rs`, `driver_abi.rs`, `driver_abi_extra.rs`, `mexec_extra.rs`, `boot_prereq.rs`, `boot_extra.rs`); do not split them for line count alone. The `report` module is a directory module split by responsibility.
-- The built-in corpus is the **conformance corpus** (1633 cases) and runs end to end in CI; keep it fast enough for that and reserve the heavy external suites (root §6) for milestones.
+- The built-in corpus is the **conformance corpus** (1839 cases) and runs end to end in CI; keep it fast enough for that and reserve the heavy external suites (root §6) for milestones.
 - **Never assert a golden whose output is order-unstable.** A `~w` rendering of a multi-key map (or any structure containing one) has a per-VM-start iteration order, so compare it structurally (`maps:size`, `lists:sort(maps:keys(M))`, single-key maps) instead. Same rule for pids/refs/ports/creation values that vary per VM start, and for a `load_nif` failure message that embeds a temp-dir path — assert a shape or classify into an integer, or use a deterministic decode→re-encode round-trip.
 
 ## Design Decisions
@@ -127,21 +127,21 @@ The binary's own `run`/`suite` exit codes are unchanged (`0` agree / `1` mismatc
 - The driver echo round trip runs only once `beam_rt run` drives the full scheduler (`Runtime::run_scheduled`); a single engine pass never runs the scheduler's port half, so the receiver blocks and the CLI exits `3` with `beam_rt: unsupported: ... blocked` (a capability gap, never a mismatch, never a hang).
 
 ## Known Issues / Notes for Agents
-- **The Rust side is a partial runtime; today's gate is 0 mismatches** (1633-case corpus). The **module-run** cases (embedded sources, the native-record group, the NIF `.so` groups, the C-driver groups, the real-system-module `mexec`/`mexec_extra` groups) `agree`, and the **eval** cases `agree` where the `-eval` evaluator supports them — `beam_rt` has a real Erlang-expression evaluator and does **not** auto-print the result. A capability gap is `unsupported`, never a mismatch: either the raise escapes and the CLI exits `3` (`beam_rt: unsupported: …`), or (for a probe-wrapped case) the probe *catches* it and prints one `exception <class> <reason>` line whose reason follows the `unsupported` convention.
-  - Current rollup (**stable across repeated runs**): **1633 total · 1631 agree · 0 mismatch · 2 unsupported · 0 skipped**; both gaps are recorded in `known-gaps.txt` (`allowed=2 unauthorized=0 stale=0`), so `gate.sh` → exit `0`.
+- **The Rust side is a partial runtime; today's gate is 0 mismatches** (1839-case corpus). The **module-run** cases (embedded sources, the native-record group, the NIF `.so` groups, the C-driver groups, the real-system-module `mexec`/`mexec_extra` groups) `agree`, and the **eval** cases `agree` where the `-eval` evaluator supports them — `beam_rt` has a real Erlang-expression evaluator and does **not** auto-print the result. A capability gap is `unsupported`, never a mismatch: either the raise escapes and the CLI exits `3` (`beam_rt: unsupported: …`), or (for a probe-wrapped case) the probe *catches* it and prints one `exception <class> <reason>` line whose reason follows the `unsupported` convention.
+  - Current rollup (**stable across repeated runs**): **1839 total · 1837 agree · 0 mismatch · 2 unsupported · 0 skipped**; both gaps are recorded in `known-gaps.txt` (`allowed=2 unauthorized=0 stale=0`), so `gate.sh` → exit `0`.
   - Per-contract rollup (A.1–A.9; a case may declare several contracts, so the column totals exceed `summary.total`):
 
 | Contract | total | agree | mismatch | unsupported | skipped |
 |---|---|---|---|---|---|
 | A.1 | 163 | 163 | 0 | 0 | 0 |
-| A.2 | 580 | 580 | 0 | 0 | 0 |
-| A.3 | 228 | 228 | 0 | 0 | 0 |
-| A.4 | 190 | 190 | 0 | 0 | 0 |
-| A.5 | 328 | 327 | 0 | 1 | 0 |
+| A.2 | 628 | 628 | 0 | 0 | 0 |
+| A.3 | 260 | 260 | 0 | 0 | 0 |
+| A.4 | 206 | 206 | 0 | 0 | 0 |
+| A.5 | 416 | 415 | 0 | 1 | 0 |
 | A.6 | 44 | 44 | 0 | 0 | 0 |
 | A.7 | 399 | 399 | 0 | 0 | 0 |
 | A.8 | 64 | 64 | 0 | 0 | 0 |
-| A.9 | 235 | 234 | 0 | 1 | 0 |
+| A.9 | 305 | 304 | 0 | 1 | 0 |
 - **The 2 `unsupported` cases (honest capability gaps, not mismatches).** Each golden is the oracle's own output, so it flips to `agree` automatically once its gap closes:
   - **`local_fun`:** `wire/new_fun_ext_encode` (A.5, `beam_rt: unsupported: local_fun`) — a lambda is an evaluator closure the `beam_rt` `-eval` path cannot give a faithful `NEW_FUN_EXT` image. `beam_codec` has `Encoder::with_fun_identity`; the remaining blocker is runtime wiring (`beam_rt`). Unclosable by design (an `erl_eval` lambda's closure identity needs `erl_eval`/`erl_scan`/`erl_parse`).
   - **`init:script_id/0`:** `boot_extra/init_script_id_names_the_running_otp_release` (A.9, `beam_rt: unsupported: init:script_id/0 (no boot script has been loaded)`) — the `-eval`/`run` path loads no boot script, so the runtime raises its typed `unsupported`; the oracle answers `{"Erlang/OTP","29"}`. The case asserts `init:script_id() =:= {"Erlang/OTP", erlang:system_info(otp_release)}` (release-independent), so it flips to `agree` once a boot script is loaded.

@@ -26,6 +26,15 @@ not here.)
   needed capacity in the rust runtime (the success path and the missing-key refusal DO agree
   and are pinned).
 
+- `enif_compare/2` on **mixed-type / atom** pairs diverges: `enif_compare(1, 1.0)` → oracle `0`,
+  the rust runtime non-zero; `enif_compare('alpha', 'beta')` → oracle `-1`, the rust runtime
+  non-zero. The rust `enif_compare` (`crates/beam_abi/src/nif/enif/pred.rs`) compares through
+  `no_atoms()`, so it cannot rank atoms or mixed numerics like the oracle. No case pins it.
+  Owner: `beam_abi`.
+- `enif_priv_data/1` (extra-environment family) diverges: the oracle answers the pointer the load
+  callback stored, the rust runtime leaves the `NifHost::priv_data` hook at its default and answers
+  `NULL` (`0` vs `11`). No case pins it. Owner: `beam_rt` (`NifHost`) / `beam_abi`.
+
 ## A.4 — driver C ABI (owner: `beam_rt` / `beam_io`; `beam_abi` for the timer units)
 - **Landed:** `erl_drv_output_term` / `erl_drv_send_term` / `driver_output_term` /
   `driver_send_term` now *deliver* the decoded `ErlDrvTerm` spec to the receiving process
@@ -60,6 +69,10 @@ not here.)
 - `driver_enq`/`driver_sizeq` as probed hangs the **oracle**; `driver_async` with a NULL port
   and `erl_drv_output_term(port, NULL, 2)` SIGSEGV the oracle — harness/probe hazards,
   unpinnable, to re-check before treating any as a runtime gap.
+- `driver_mk_port(NULL)` returns the nil term in the rust runtime but crashes the **oracle** VM
+  (an exit signal with empty stdout) — a probe hazard, unpinnable; excluded from the `driver_extra`
+  block. `erl_drv_cond_name`/`erl_drv_rwlock_name` on an object created with a NULL name deviate
+  too (oracle `"unknown"`, rust `NULL`) and are likewise unpinned.
 - `erl_errno_id/1` returns a short POSIX symbol (`enoent`, `einval`, `errno_0`) in the oracle
   but `strerror` prose in the rust runtime.
 - `driver_pdl_get_refc(NULL)` SIGSEGVs the oracle, so the `driver_pdl_*` family stays unpinned
@@ -100,6 +113,10 @@ not here.)
   `filelib:wildcard/1` path agree and are pinned. `re:version/0` and `re:split/2` remain rust
   capability gaps (`beam_rt: unsupported: re:version/0` / `re:compile/2`, exit 3) — neither
   cases nor mismatches.
+- A bare (unqualified) name in the `-eval` path resolves differently: `phash2(T)` is `error:undef`
+  under the oracle's `-eval` (a local call) but `ok …` under the rust runtime (it resolves the
+  `erlang:phash2/1` BIF). The `erlang:phash2/1`-qualified shapes agree and are pinned in
+  `phash.rs`. Owner: `beam_rt` (`-eval` evaluator).
 
 ## A.9 — preloaded / boot (owner: `beam_rt`, `beam_bifs`)
 - `init:get_arguments/0` → the oracle reports every flag **plus** its automatic
