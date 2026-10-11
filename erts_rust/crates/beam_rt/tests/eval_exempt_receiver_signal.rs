@@ -30,31 +30,23 @@
 //! never collects and never grows (`Process::ensure_capacity` refuses), so its nursery
 //! **monotonically fills** with delivered payloads and is never reclaimed.
 //!
-//! A delivery whose payload does not fit is routed to the heap-fragment model and still arrives
-//! (`RuntimeContext::deliver_message_with_off_heap` keys on the copier's raw
-//! `AllocKind::Message`), so the mailbox keeps working. A **control signal** is built on a
-//! different path: `beam_process`'s signal application allocates the `{'DOWN', …}`/`{'EXIT', …}`
-//! message *directly on the receiver's young heap*
-//! (`beam_process/src/ptab.rs::build_and_enqueue_down` → `MonitorRef::to_eterm(recipient.heap_mut())`
-//! and `build_down_message_term(recipient.heap_mut(), …)`, likewise
-//! `ptab.rs::enqueue_exit_on` → `build_exit_message(recipient.heap_mut(), …)`), and its only
-//! recovery is `ptab.rs::grow_receiver_for_signal`, which — for a **relocation-exempt**
-//! process — hands the raw refusal back verbatim by design. There is no fragment fallback on
-//! that path, so the raw `BeamError::Alloc(AllocKind::Heap)` escapes
-//! `deliver_head_signal` → `drain_signals` → `terminate_and_cascade` and aborts the whole
-//! scheduler pass, i.e. the whole `-eval` run:
+//! Both delivery paths keep working on a full nursery, each with its own fallback:
 //!
-//! ```text
-//! beam_rt: allocation failure: heap (32 bytes)      (exit 1)
-//! ```
+//! * a **message** delivery whose payload does not fit is routed to the heap-fragment model and
+//!   still arrives (`RuntimeContext::deliver_message_with_off_heap` keys on the copier's raw
+//!   `AllocKind::Message`), so the mailbox keeps working;
+//! * a **control signal** is built on a different path: `beam_process`'s signal application
+//!   allocates the `{'DOWN', …}`/`{'EXIT', …}` message *directly on the receiver's young heap*
+//!   (`beam_process/src/ptab.rs::deliver_head_signal` → `build_signal_message`), and when that
+//!   build is refused for a relocation-exempt receiver, `ptab.rs::deliver_head_signal` routes it
+//!   to `ptab.rs::enqueue_fragment_signal` instead of `ptab.rs::grow_receiver_for_signal`: the
+//!   payload is built on a scratch arena and copied into a fresh heap fragment the enqueued
+//!   message owns, so no collection runs and no heap word moves under the host's unpublished
+//!   roots. The `'DOWN'` still reaches the mailbox.
 //!
-//! The oracle answers `DOWN ok` (exit 0) for the very same expression. The defect is
-//! **not** in this crate: `beam_rt` cannot intercept a message the process table builds inside
-//! itself, and it cannot let the exempt root's heap move. The fix belongs to `beam_process`
-//! (a fragment fallback for the signal-application build, the local-receiver analogue of
-//! `erts_try_alloc_message_on_heap` → `new_message_buffer`), so the positive case is
-//! [`#[ignore]`](a_down_signal_reaches_the_eval_root_once_its_nursery_is_full) with the reason
-//! recorded on it — never a fabricated pass here.
+//! The two cases below drive the same monitor probe with a **roomy** and with a **saturated**
+//! nursery; both print `DOWN ok` (exit 0), and both are cross-checked against the system `erl`
+//! oracle when one is present.
 //!
 //! [`RuntimeContext::with_relocation_exempt`]: beam_rt::RuntimeContext
 
@@ -66,7 +58,7 @@ use std::process::Output;
 /// The executable under test, exactly as the other contract suites drive it.
 const BINARY: &str = env!("CARGO_BIN_EXE_beam_rt");
 
-/// How many `self() ! [1]` messages the **failing** probe sends before it monitors a dying
+/// How many `self() ! [1]` messages the **saturated** probe sends before it monitors a dying
 /// process.
 ///
 /// Each one is copied into the root's own young heap (2 words), and the heap is never
@@ -116,8 +108,9 @@ fn beam_rt_eval(expr: &str) -> Run {
 /// wait for the `'DOWN'` the monitor fires.
 ///
 /// The `'DOWN'` is built on the **receiving** process's heap
-/// (`beam_process/src/ptab.rs::build_and_enqueue_down`), which is exactly the allocation under
-/// test. `spawn(lists, reverse, [[a]])` keeps the probe free of any evaluator closure.
+/// (`beam_process/src/ptab.rs::deliver_head_signal` → `build_signal_message`), which is exactly
+/// the allocation under test. `spawn(lists, reverse, [[a]])` keeps the probe free of any
+/// evaluator closure.
 fn probe(pad: usize) -> String {
     format!(
         "lists:foreach(fun(I)-> self() ! [1] end, lists:seq(1,{pad})), \
@@ -158,8 +151,8 @@ fn assert_down_delivered(output: &Run, what: &str) {
 /// With the root's nursery nowhere near full, the monitor's `'DOWN'` is delivered normally and
 /// the probe prints `DOWN ok`, agreeing with the system oracle.
 ///
-/// This is the control for the ignored case below: it pins that the signal path itself works on
-/// the `-eval` route, so the failure there is heap capacity, not a broken monitor.
+/// This is the control for the saturated case below: it pins that the signal path itself works on
+/// the `-eval` route, so the saturated case is about heap capacity, not a broken monitor.
 #[test]
 fn a_down_signal_reaches_the_eval_root_while_its_nursery_has_room() {
     let expr = probe(ROOMY_PAD);
@@ -178,32 +171,31 @@ fn a_down_signal_reaches_the_eval_root_while_its_nursery_has_room() {
 }
 
 // ---------------------------------------------------------------------------------------
-// Test B — the reported defect: the same `'DOWN'` with a saturated nursery (ignored)
+// Test B — the same `'DOWN'` with a saturated nursery
 // ---------------------------------------------------------------------------------------
 
 /// The **same** monitor `'DOWN'`, now with the root's young heap already saturated by the
-/// messenger's own deliveries, aborts the whole run:
+/// messenger's own deliveries, prints `DOWN ok` (exit 0) — as the system oracle does.
 ///
-/// ```text
-/// beam_rt: allocation failure: heap (32 bytes)      (exit 1)
-/// ```
-///
-/// instead of printing `DOWN ok` (exit 0), as the system oracle does. The refusal is raised by
-/// `beam_process`'s signal application building the `'DOWN'` on the receiver's young heap
-/// (`beam_process/src/ptab.rs::build_and_enqueue_down`, via
-/// `beam_process/src/monitor.rs::MonitorRef::to_eterm`), whose only recovery
-/// (`beam_process/src/ptab.rs::grow_receiver_for_signal`) hands a **relocation-exempt**
-/// receiver's refusal back verbatim — and the `-eval` root is exempt for the whole run
-/// (`beam_rt/src/eval/mod.rs::eval`). `beam_rt` cannot fix it: the message is built inside the
-/// process table, and the exempt heap may not move. Un-ignore this test when the sibling
-/// crate's fragment fallback for the signal-application build lands.
-///
-/// `beam_process/src/ptab.rs:158` (`grow_receiver_for_signal`) and
-/// `beam_process/src/ptab.rs:1909`/`1916` (`build_and_enqueue_down`) are the exact sites.
+/// The refusal to build the `'DOWN'` on the receiver's young heap is a normal condition for a
+/// relocation-exempt receiver: `beam_process`'s signal application routes it to the
+/// heap-fragment fallback (`beam_process/src/ptab.rs::enqueue_fragment_signal`, reached from
+/// `ptab.rs::deliver_head_signal`), so the message is carried by a heap fragment it owns and the
+/// `-eval` root's heap is neither collected nor grown
+/// (`beam_rt/src/eval/mod.rs::eval` marks the root exempt for the whole run).
 #[test]
-#[ignore = "beam_process has no heap-fragment fallback for a control signal built on a relocation-exempt receiver's heap (beam_process/src/ptab.rs::grow_receiver_for_signal:158, build_and_enqueue_down:1909/1916) — un-ignore when that lands"]
 fn a_down_signal_reaches_the_eval_root_once_its_nursery_is_full() {
     let expr = probe(SATURATING_PAD);
     let output = beam_rt_eval(&expr);
     assert_down_delivered(&output, "a saturated `-eval` root");
+
+    let Some(oracle) = oracle() else {
+        return;
+    };
+    // The shared oracle probe **trims** its stdout, and `halt(0)` makes it succeed.
+    let Some(theirs) = support::oracle_eval(&oracle, None, &expr) else {
+        eprintln!("warning: the oracle could not answer the saturated probe — not compared");
+        return;
+    };
+    assert_eq!(theirs, "DOWN ok", "the system erl's rendering");
 }

@@ -203,11 +203,13 @@ fn file_probe(src: &Path, outdir: &Path) -> String {
 }
 
 /// `beam_lib:chunks/2` over `file`, reported as the md5 of its **`Code` chunk** — the chunk that is
-/// independent of the `Dbgi` options difference (see the module note).
+/// independent of the `Dbgi` options difference (see the module note). The chunk is requested and
+/// matched by its real name, `"Code"` (`beam_lib:chunks/2` rejects the lowercase `code` with
+/// `{unknown_chunk, …}`), so a digest is only ever reported for a chunk that was actually read.
 fn code_chunk_digest(oracle: &Path, file: &Path) -> Option<String> {
     let expr = format!(
-        "{{ok,{{_,Chunks}}}} = beam_lib:chunks({}, [code]),\n\
-         [{{code,C}}] = Chunks,\n\
+        "{{ok,{{_,Chunks}}}} = beam_lib:chunks({}, [\"Code\"]),\n\
+         [{{\"Code\",C}}] = Chunks,\n\
          io:format(\"code=~s~n\", [binary:encode_hex(erlang:md5(C))]),\n\
          halt(0).",
         literal(file)
@@ -340,8 +342,8 @@ fn the_in_process_compile_file_artifact_matches_the_oracle() {
         oracle_artifact.display()
     );
 
-    // ---- the Rust runtime's artifact ----
-    let ours = beam_rt_eval(&expr);
+    // ---- the Rust runtime's artifact (its own output directory) ----
+    let ours = beam_rt_eval(&file_probe(&src, &rust_out));
     if ours.code != 0 {
         report_blocker("compile:file/2", &ours);
         let listing: Vec<String> = fs::read_dir(&oracle_out)

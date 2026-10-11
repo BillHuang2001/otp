@@ -68,16 +68,18 @@
 //! the live oracle, and the expected line is also probed from the oracle itself so a stale
 //! recording cannot pass.
 //!
-//! Three known **divergences** are *reported* (both observed values pinned, never asserted
+//! Two known **divergences** are *reported* (both observed values pinned, never asserted
 //! away) by [`the_known_divergences_are_reported_with_both_observed_values`]:
 //!
 //! * a reference that is **not** a live alias — `make_ref() ! x`, or a send to an alias that was
 //!   unaliased — is this runtime's typed `badarg` where the C silently drops the message and
 //!   reports the send value (documented at `src/context/alias.rs`);
 //! * `erlang:monitor(process, self(), [{alias, _}])` registers an alias here, where the C clears
-//!   it for a self-monitor (so a send to it delivers here and is dropped there);
-//! * `erlang:alias/0` (arity 0, the documented `alias/1 == alias([])` shorthand) is not wired on
-//!   the runtime-native floor, so it raises `error:undef` where the oracle answers a reference.
+//!   it for a self-monitor (so a send to it delivers here and is dropped there).
+//!
+//! `erlang:alias/0` (arity 0, the `alias/1 == alias([])` shorthand `erlang.erl` spells
+//! `alias([])`) is served by the runtime-native floor and is one of the **agreeing** cases:
+//! both runtimes answer a reference.
 
 // The shared harness is compiled in whole, but this suite uses only its toolchain discovery,
 // bounded probe runner and oracle probe, so the unused remainder is expected here.
@@ -224,7 +226,7 @@ self_mon_alias() ->
 non_alias_reference_send() ->
     try make_ref() ! x catch C:E -> {C, E} end.
 
-%% DIVERGENCE: erlang:alias/0 is not wired on the runtime-native floor.
+%% erlang:alias/0 is the `alias([])` shorthand; both runtimes answer a reference.
 alias_zero() ->
     try is_reference(alias()) catch C:E -> {C, E} end.
 "#;
@@ -238,7 +240,7 @@ const FIXTURES: [(&str, &str); 2] = [("aliasgs", ALIASGS_SRC), ("aliasf", ALIASF
 
 /// Every case the two runtimes must print identically: the label, the fixture entry point and
 /// the exact line both runtimes print for it.
-const AGREEMENTS: [(&str, &str, &str, &str); 14] = [
+const AGREEMENTS: [(&str, &str, &str, &str); 15] = [
     (
         "monitor/3 {alias, reply_demonitor} + a compiled `Alias ! Reply`",
         "aliasf",
@@ -323,6 +325,12 @@ const AGREEMENTS: [(&str, &str, &str, &str); 14] = [
         "mon_two_unchanged",
         "{true,true}",
     ),
+    (
+        "erlang:alias/0 (the alias([]) shorthand) answers a reference",
+        "aliasf",
+        "alias_zero",
+        "true",
+    ),
 ];
 
 /// The same cases on the `-eval` route, given as `(label, value expression, printed line)`.
@@ -354,7 +362,7 @@ const EVAL_AGREEMENTS: [(&str, &str, &str); 3] = [
 
 /// Each entry: the label, the fixture entry point, this runtime's current answer and the live
 /// oracle's answer for the same workload.
-const DIVERGENCES: [(&str, &str, &str, &str, &str); 3] = [
+const DIVERGENCES: [(&str, &str, &str, &str, &str); 2] = [
     (
         "monitor/3 {alias, _} on self: an alias is registered here, the C clears it",
         "aliasf",
@@ -368,13 +376,6 @@ const DIVERGENCES: [(&str, &str, &str, &str, &str); 3] = [
         "non_alias_reference_send",
         "{error,badarg}",
         "x",
-    ),
-    (
-        "erlang:alias/0 is not wired on the floor",
-        "aliasf",
-        "alias_zero",
-        "{error,undef}",
-        "true",
     ),
 ];
 
@@ -625,7 +626,7 @@ fn alias_semantics_on_the_eval_route_match_the_live_oracle() {
     }
 }
 
-/// The three known divergences, **reported** with both observed values rather than asserted
+/// The two known divergences, **reported** with both observed values rather than asserted
 /// away. Each is a real difference from the C/oracle that the alias wiring deliberately leaves
 /// in place (see the module docs); pinning both sides keeps it visible and makes any future
 /// change to either side fail loudly and force this list to be revisited.
