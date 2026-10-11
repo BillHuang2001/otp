@@ -85,6 +85,11 @@ const COMPARABLE: &[(&str, &[i64])] = &[
     ("thread_exit_value",   &[0, 0, 99]),
     //                                  the three NAMED handles report their names
     ("names",               &[1, 1, 1]),
+    //                                  unnamed handles report "unknown"; NULL handles report NULL
+    ("names_unnamed",       &[1, 1, 1, 1, 1, 1]),
+    //                                  both creates ok; unnamed thread "unknown"; named thread named;
+    //                                  a NULL tid reports NULL
+    ("thread_names",        &[1, 1, 1, 1]),
 ];
 
 // ---------------------------------------------------------------------------------------------

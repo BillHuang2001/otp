@@ -10,9 +10,13 @@
  *
  * IMPORTANT: this fixture may reference only `enif_*` symbols the crate actually
  * defines (`Some` in the `ErlNifApi` table) — `dlopen(RTLD_NOW)` fails on any
- * unresolved import. It also must not touch `enif_thread_name`/
- * `enif_tsd_key_create`-failure shapes whose observable value differs from the
- * oracle (see `src/nif/enif/threads.rs`, "Documented deviations").
+ * unresolved import. It also must not touch `enif_tsd_key_create`-failure shapes
+ * whose observable value differs from the oracle (see src/nif/enif/threads.rs,
+ * "Documented deviations"). `enif_thread_name` IS safe to use here for a tid this
+ * fixture created (named or unnamed); only a *foreign* tid (`enif_thread_self`) or
+ * a tid read *after* the join diverges from the oracle (the C mints a
+ * `drv_thr = 0` record / reads freed memory), so those two are deliberately not
+ * exercised.
  *
  * Every NIF returns a tuple of small integers, so the SAME file can be loaded by
  * the system Erlang and its printed result compared with the Rust runtime's
@@ -35,6 +39,11 @@
  *   thread_type/0          enif_thread_type() (the one value that legitimately
  *                          differs from the oracle — see the module docs)
  *   names/0                enif_{mutex,cond,rwlock}_name on NAMED handles
+ *   names_unnamed/0        enif_{mutex,cond,rwlock}_name on handles created with
+ *                          a NULL name report "unknown"; a NULL handle reports NULL
+ *   thread_names/0         enif_thread_name on a thread created with a NULL name
+ *                          reports "unknown", on a named thread reports the name,
+ *                          and on a NULL tid reports NULL
  */
 
 #include <erl_nif.h>
@@ -369,6 +378,90 @@ static ERL_NIF_TERM names(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     return enif_make_tuple_from_array(env, arr, 3);
 }
 
+/* ---------------------------------------------------------------------------
+ * names, unnamed/null cases (the C stores its static `no_name` = "unknown" for a
+ * handle created with a NULL name; a NULL handle answers NULL)
+ * ------------------------------------------------------------------------- */
+
+static ERL_NIF_TERM names_unnamed(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+    ErlNifMutex* m = enif_mutex_create(NULL);
+    ErlNifCond* c = enif_cond_create(NULL);
+    ErlNifRWLock* l = enif_rwlock_create(NULL);
+    ERL_NIF_TERM arr[6];
+    char* mn;
+    char* cn;
+    char* ln;
+
+    (void)argc;
+    (void)argv;
+
+    mn = enif_mutex_name(m);
+    cn = enif_cond_name(c);
+    ln = enif_rwlock_name(l);
+
+    arr[0] = enif_make_int(env, mn != NULL && strcmp(mn, "unknown") == 0);
+    arr[1] = enif_make_int(env, cn != NULL && strcmp(cn, "unknown") == 0);
+    arr[2] = enif_make_int(env, ln != NULL && strcmp(ln, "unknown") == 0);
+    /* A null handle answers NULL (`handle ? handle->name : NULL`). */
+    arr[3] = enif_make_int(env, enif_mutex_name(NULL) == NULL);
+    arr[4] = enif_make_int(env, enif_cond_name(NULL) == NULL);
+    arr[5] = enif_make_int(env, enif_rwlock_name(NULL) == NULL);
+
+    enif_mutex_destroy(m);
+    enif_cond_destroy(c);
+    enif_rwlock_destroy(l);
+    return enif_make_tuple_from_array(env, arr, 6);
+}
+
+/* ---------------------------------------------------------------------------
+ * thread names
+ * ------------------------------------------------------------------------- */
+
+static void* null_worker(void* arg)
+{
+    (void)arg;
+    return NULL;
+}
+
+static ERL_NIF_TERM thread_names(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+    ErlNifTid unnamed = NULL;
+    ErlNifTid named = NULL;
+    void* r1 = NULL;
+    void* r2 = NULL;
+    ERL_NIF_TERM arr[4];
+    char* un;
+    char* nn;
+    int c1, c2;
+
+    (void)argc;
+    (void)argv;
+
+    c1 = enif_thread_create(NULL, &unnamed, null_worker, NULL, NULL);
+    if (c1 != 0)
+        unnamed = NULL;
+    c2 = enif_thread_create("named-thread", &named, null_worker, NULL, NULL);
+    if (c2 != 0)
+        named = NULL;
+
+    /* Read the names while both threads are live (a read after the join would be a
+     * use-after-free in the C). */
+    un = enif_thread_name(unnamed);
+    nn = enif_thread_name(named);
+
+    arr[0] = enif_make_int(env, c1 == 0 && c2 == 0);
+    arr[1] = enif_make_int(env, un != NULL && strcmp(un, "unknown") == 0);
+    arr[2] = enif_make_int(env, nn != NULL && strcmp(nn, "named-thread") == 0);
+    arr[3] = enif_make_int(env, enif_thread_name(NULL) == NULL);
+
+    if (unnamed)
+        enif_thread_join(unnamed, &r1);
+    if (named)
+        enif_thread_join(named, &r2);
+    return enif_make_tuple_from_array(env, arr, 4);
+}
+
 static ErlNifFunc nif_funcs[] = {
     {"mutex_basic", 0, mutex_basic, 0},
     {"cond_wait_signal", 0, cond_wait_signal, 0},
@@ -379,6 +472,8 @@ static ErlNifFunc nif_funcs[] = {
     {"thread_exit_value", 0, thread_exit_value, 0},
     {"thread_type", 0, thread_type, 0},
     {"names", 0, names, 0},
+    {"names_unnamed", 0, names_unnamed, 0},
+    {"thread_names", 0, thread_names, 0},
 };
 
 ERL_NIF_INIT(test_nif_threads, nif_funcs, NULL, NULL, NULL, NULL)

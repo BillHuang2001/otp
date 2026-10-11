@@ -54,11 +54,17 @@
 //!
 //! # Documented deviations (inherited from [`crate::sync`] — never a fabricated success)
 //!
-//! * **Names.** An **unnamed** handle yields `NULL` from its `*_name` accessor; the C returns the
-//!   static string `"unknown"` (`no_name`, `erl_drv_thread.c:99,135`). A **null handle** returns
-//!   `NULL` in both (the C guards with `dmtx ? … : NULL`, `erl_drv_thread.c:200`). Likewise
-//!   `enif_thread_name` answers `NULL` for the calling (non-created) thread and for a joined tid —
-//!   the C returns `"unknown"` for the former and reads freed memory for the latter.
+//! * **Names.** A **null handle** yields `NULL` from its `*_name` accessor — as does the C
+//!   (`dmtx ? dmtx->name : NULL`, `erl_drv_thread.c:198`, `:283`, `:365`, `:656`). A **live handle
+//!   created with a NULL name** yields the C's static string `"unknown"` (`no_name`,
+//!   `erl_drv_thread.c:99,135`, stored in the handle at `:170`/`:264`/`:341`/`:639`): [`crate::sync`]
+//!   keeps that state as a *null* name and this facade renders it ([`rendered_name`], [`sync::no_name`]).
+//!   `enif_thread_name` additionally answers `NULL` for a **tid this layer did not create** or one
+//!   already joined; the C mints a `drv_thr = 0` record with `name = "unknown"` for any thread it did
+//!   not create (`erl_drv_thread.c:664-684`, the `erl_drv_thread_self` path) and reads freed memory
+//!   after a join (`:728`). That residual is the one place this facade and its `erl_drv_*` sibling
+//!   diverge from the oracle (the foreign tid carries no record here; reproducing the C's per-thread
+//!   record needs state this layer does not keep).
 //! * **Mutex/cond/rwlock misuse never aborts.** A null handle is a no-op (`EINVAL` from the
 //!   `try*` forms); the C calls `erts_exit` (`erl_drv_thread.c:207`). Unlocking a mutex from a
 //!   *different* thread is permitted (the handle is a default, non-error-checking pthread mutex,
@@ -206,8 +212,29 @@ pub unsafe extern "C" fn enif_mutex_unlock(mtx: *mut ErlNifMutex) {
     unsafe { sync::mutex_unlock(mtx as *mut sync::Mutex) };
 }
 
-/// `char *enif_mutex_name(ErlNifMutex *mtx);` — the debug name; `NULL` for a null handle, and for an
-/// unnamed handle (the C returns `"unknown"`, see the module docs).
+/// Render a shared-layer `*_name` result the way the C's accessors do
+/// (`erl_drv_thread.c:198`, `:283`, `:365`, `:656`: `handle ? handle->name : NULL`).
+///
+/// A **null handle** answers `NULL`. A **live handle** never answers `NULL` in the C: a handle created
+/// with a NULL name carries the static `no_name` string (`"unknown"`, `erl_drv_thread.c:99,135`,
+/// stored at `:170`/`:264`/`:341`). [`crate::sync`] represents that state as a *null* name, so it is
+/// rendered as the C's `no_name` here ([`sync::no_name`]).
+///
+/// `live` must be `true` only for a non-null handle that really was created through this family;
+/// `name` is the shared layer's name for it ([`sync::mutex_name`] &c.).
+fn rendered_name(live: bool, name: *mut c_char) -> *mut c_char {
+    if !live {
+        core::ptr::null_mut()
+    } else if name.is_null() {
+        sync::no_name()
+    } else {
+        name
+    }
+}
+
+/// `char *enif_mutex_name(ErlNifMutex *mtx);` — the debug name: the name [`enif_mutex_create`] was
+/// handed, the static string `"unknown"` for a mutex created with a NULL name (`no_name`,
+/// `erl_drv_thread.c:99,170`), or `NULL` for a null handle (`:198`).
 ///
 /// # Safety
 /// `mtx` must be null or a live handle from [`enif_mutex_create`]; the name stays valid until
@@ -215,8 +242,10 @@ pub unsafe extern "C" fn enif_mutex_unlock(mtx: *mut ErlNifMutex) {
 #[no_mangle]
 pub unsafe extern "C" fn enif_mutex_name(mtx: *mut ErlNifMutex) -> *mut c_char {
     // SAFETY: `mtx` is null or a live handle; `mutex_name` returns a pointer into the handle's own
-    // NUL-terminated name buffer.
-    unsafe { sync::mutex_name(mtx as *mut sync::Mutex) }
+    // NUL-terminated name buffer (or null for a null/unnamed handle).
+    let handle = mtx as *mut sync::Mutex;
+    let name = unsafe { sync::mutex_name(handle) };
+    rendered_name(!handle.is_null(), name)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -281,15 +310,20 @@ pub unsafe extern "C" fn enif_cond_wait(cnd: *mut ErlNifCond, mtx: *mut ErlNifMu
     unsafe { sync::cond_wait(cnd as *mut sync::Cond, mtx as *mut sync::Mutex) };
 }
 
-/// `char *enif_cond_name(ErlNifCond *cnd);` — the debug name (`NULL` for a null or unnamed handle).
+/// `char *enif_cond_name(ErlNifCond *cnd);` — the debug name: the name [`enif_cond_create`] was
+/// handed, the static string `"unknown"` for a condition variable created with a NULL name
+/// (`no_name`, `erl_drv_thread.c:99,264`), or `NULL` for a null handle (`:283`).
 ///
 /// # Safety
 /// `cnd` must be null or a live handle from [`enif_cond_create`]; the name stays valid until
 /// [`enif_cond_destroy`].
 #[no_mangle]
 pub unsafe extern "C" fn enif_cond_name(cnd: *mut ErlNifCond) -> *mut c_char {
-    // SAFETY: `cnd` is null or a live handle; the name pointer belongs to the handle.
-    unsafe { sync::cond_name(cnd as *mut sync::Cond) }
+    // SAFETY: `cnd` is null or a live handle; `cond_name` returns a pointer into the handle's own
+    // NUL-terminated name buffer (or null for a null/unnamed handle).
+    let handle = cnd as *mut sync::Cond;
+    let name = unsafe { sync::cond_name(handle) };
+    rendered_name(!handle.is_null(), name)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -385,16 +419,20 @@ pub unsafe extern "C" fn enif_rwlock_rwunlock(rwlck: *mut ErlNifRWLock) {
     unsafe { sync::rwlock_write_unlock(rwlck as *mut sync::RwLock) };
 }
 
-/// `char *enif_rwlock_name(ErlNifRWLock *rwlck);` — the debug name (`NULL` for a null or unnamed
-/// handle).
+/// `char *enif_rwlock_name(ErlNifRWLock *rwlck);` — the debug name: the name [`enif_rwlock_create`]
+/// was handed, the static string `"unknown"` for a lock created with a NULL name (`no_name`,
+/// `erl_drv_thread.c:99,341`), or `NULL` for a null handle (`:365`).
 ///
 /// # Safety
 /// `rwlck` must be null or a live handle from [`enif_rwlock_create`]; the name stays valid until
 /// [`enif_rwlock_destroy`].
 #[no_mangle]
 pub unsafe extern "C" fn enif_rwlock_name(rwlck: *mut ErlNifRWLock) -> *mut c_char {
-    // SAFETY: `rwlck` is null or a live handle; the name pointer belongs to the handle.
-    unsafe { sync::rwlock_name(rwlck as *mut sync::RwLock) }
+    // SAFETY: `rwlck` is null or a live handle; `rwlock_name` returns a pointer into the handle's own
+    // NUL-terminated name buffer (or null for a null/unnamed handle).
+    let handle = rwlck as *mut sync::RwLock;
+    let name = unsafe { sync::rwlock_name(handle) };
+    rendered_name(!handle.is_null(), name)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -583,15 +621,26 @@ pub unsafe extern "C" fn enif_thread_join(tid: ErlNifTid, respp: *mut *mut c_voi
 }
 
 /// `char *enif_thread_name(ErlNifTid tid);` — the debug name of a thread created by
-/// [`enif_thread_create`]; `NULL` for a name-less thread, an unknown tid, a tid already joined, and
-/// for the calling thread when it was not created here. The C answers `"unknown"` for the last two
-/// cases (see the module docs).
+/// [`enif_thread_create`]: the name it was handed, or the static string `"unknown"` for a thread
+/// created with a NULL name (`no_name`, `erl_drv_thread.c:99,638-639`). `NULL` for a null tid
+/// (`:656`) — and for a tid this layer did not create or that has already been joined (the
+/// deviation below, identical to the driver facade's `erl_drv_thread_name`).
 ///
 /// # Safety
 /// `tid` must be null or a tid handle; the returned buffer stays valid until that thread is joined.
 #[no_mangle]
 pub unsafe extern "C" fn enif_thread_name(tid: ErlNifTid) -> *mut c_char {
-    sync::thread_name(tid as sync::Tid)
+    let handle = tid as sync::Tid;
+    // `sync::thread_name` is safe: it only reads the registry entry keyed by the tid (a raw tid is
+    // never dereferenced).
+    let name = sync::thread_name(handle);
+    if name.is_null() && sync::thread_created_unnamed(handle) {
+        // A thread this layer created with a NULL name is the C's `no_name` state (`:638-639`). Any
+        // other null — an unknown tid, a joined tid, a null handle — stays `NULL`.
+        sync::no_name()
+    } else {
+        name
+    }
 }
 
 /// `int enif_thread_type(void);` — the type of the calling thread (see the module docs for why this
@@ -682,8 +731,10 @@ mod tests {
     fn unnamed_mutex_reports_no_name() {
         let m = unsafe { enif_mutex_create(ptr::null_mut()) };
         assert!(!m.is_null());
-        // Documented deviation: the C returns the static "unknown" here.
-        assert!(unsafe { enif_mutex_name(m) }.is_null());
+        // A live handle never answers NULL: the C stores its static `no_name` ("unknown",
+        // `erl_drv_thread.c:99,135,170`) for a mutex created with a NULL name.
+        let mn = unsafe { enif_mutex_name(m) };
+        assert_eq!(unsafe { text(mn) }, "unknown");
         unsafe { enif_mutex_destroy(m) };
     }
 
@@ -706,6 +757,17 @@ mod tests {
         unsafe { enif_cond_destroy(ptr::null_mut()) };
         assert!(unsafe { enif_cond_name(ptr::null_mut()) }.is_null());
 
+        unsafe { enif_cond_destroy(c) };
+    }
+
+    #[test]
+    fn unnamed_cond_reports_no_name() {
+        let c = unsafe { enif_cond_create(ptr::null_mut()) };
+        assert!(!c.is_null());
+        // The C stores `no_name` ("unknown") for an unnamed condition variable
+        // (`erl_drv_thread.c:99,264`).
+        let cn = unsafe { enif_cond_name(c) };
+        assert_eq!(unsafe { text(cn) }, "unknown");
         unsafe { enif_cond_destroy(c) };
     }
 
@@ -824,6 +886,17 @@ mod tests {
         unsafe { enif_rwlock_destroy(l) };
     }
 
+    #[test]
+    fn unnamed_rwlock_reports_no_name() {
+        let l = unsafe { enif_rwlock_create(ptr::null_mut()) };
+        assert!(!l.is_null());
+        // The C stores `no_name` ("unknown") for an unnamed reader/writer lock
+        // (`erl_drv_thread.c:99,341`).
+        let ln = unsafe { enif_rwlock_name(l) };
+        assert_eq!(unsafe { text(ln) }, "unknown");
+        unsafe { enif_rwlock_destroy(l) };
+    }
+
     // -- thread-specific data ------------------------------------------------------------------
 
     #[test]
@@ -928,6 +1001,33 @@ mod tests {
             libc::EINVAL,
             "a null tid out-slot is refused"
         );
+    }
+
+    #[test]
+    fn unnamed_thread_reports_no_name_and_a_foreign_tid_is_null() {
+        // A thread created with a NULL name carries the C's static `no_name` ("unknown",
+        // `erl_drv_thread.c:99,638-639`), not NULL.
+        let mut tid: ErlNifTid = ptr::null_mut();
+        assert_eq!(
+            unsafe { enif_thread_create(ptr::null_mut(), &mut tid, Some(answer), ptr::null_mut(), ptr::null_mut()) },
+            0
+        );
+        let nm = unsafe { enif_thread_name(tid) };
+        assert_eq!(unsafe { text(nm) }, "unknown");
+        let mut resp = ptr_of(0);
+        assert_eq!(unsafe { enif_thread_join(tid, &mut resp) }, 0);
+        assert_eq!(resp, ptr_of(0x2a));
+        // The entry is retired by the join, so the name is gone (the C frees its record).
+        assert!(unsafe { enif_thread_name(tid) }.is_null());
+
+        // A tid this layer did not create — the calling thread's own `enif_thread_self()` — answers
+        // NULL here; the C returns "unknown" through the `drv_thr = 0` record `erl_drv_thread_self`
+        // mints (`erl_drv_thread.c:664-684`). Documented deviation (see the module docs): a foreign
+        // tid carries no record in this layer.
+        let me = unsafe { enif_thread_self() };
+        assert!(!me.is_null());
+        assert!(unsafe { enif_thread_name(me) }.is_null());
+        assert!(unsafe { enif_thread_name(ptr::null_mut()) }.is_null());
     }
 
     #[test]
