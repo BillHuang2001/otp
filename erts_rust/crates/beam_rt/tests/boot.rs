@@ -48,10 +48,10 @@
 //!    ([`the_cli_runs_the_real_boot_script_to_completion`]), and a boot with
 //!    **no** `-boot` keeps the preloaded-only drive
 //!    ([`a_boot_without_the_boot_flag_keeps_the_preloaded_only_drive`]);
-//! 7. the real boot leaves `logger` **unregistered** — a cross-crate `erlang:apply/3` seam gap,
-//!    pinned at the CLI by
-//!    [`the_cli_boot_leaves_logger_unregistered_pending_the_apply_seam_gap`] against its
-//!    `#[ignore]`d positive counterpart [`the_cli_boot_registers_a_live_logger_process`].
+//! 7. the real boot leaves a live `logger_server` registered as `logger` — instruction 13's
+//!    `{kernelProcess,logger,{logger_server,start_link,[]}}` really starts the child, so
+//!    `is_pid(erlang:whereis(logger))` is `true`
+//!    ([`the_cli_boot_registers_a_live_logger_process`]).
 //!
 //! Every test that needs the system Erlang install (the erts application's `ebin` holds the
 //! preloaded `.beam`s; the oracle is `erl`) skips **loudly** — a clear `eprintln!` and an
@@ -733,65 +733,16 @@ fn the_boot_chains_kernel_processes_survive_their_directive_processes() {
 }
 
 #[test]
-fn the_cli_boot_leaves_logger_unregistered_pending_the_apply_seam_gap() {
-    // Pins a **cross-crate capability gap**, not desired behaviour. The real OTP boot leaves a
-    // live `logger_server` registered as `logger`, so the oracle answers
-    // `is_pid(erlang:whereis(logger))` with `true`; this runtime answers `false`, because the
-    // real `start.boot`'s instruction 13 `{kernelProcess,logger,{logger_server,start_link,[]}}`
-    // enters the child through `proc_lib:init_p_do_apply/3`'s `try apply(M,F,A)`, which `erlc`
-    // compiles to a `call_ext` to `{extfunc,erlang,apply,3}`. `RuntimeContext::resolve_external_call`
-    // declines `erlang` (a `crate::native::FLOOR_MODULES` member), so the apply runs synchronously
-    // and the child folds a blocking `receive` into the typed `error::blocked()` instead of
-    // suspending — the child dies before `proc_lib:init_ack/2`, `gen_server:init_it` never reaches
-    // its `register(logger, self())`, and the name is never registered.
-    //
-    // The fix belongs to `beam_engine` (give `call_ext`/`erlang:apply/3` the same
-    // `resolve_external_call`/`Step::Enter` treatment a literal-target `call_ext` already gets) or
-    // to `beam_rt`'s `src/context` (intercept `erlang:apply/2,3` in `call_bif`) — never to the boot
-    // executor. When that seam is closed this test must be **deleted** and replaced by the positive
-    // assertion in `the_cli_boot_registers_a_live_logger_process`.
-    if booted_runtime().is_none() {
-        return;
-    }
-    let real = start_boot();
-    if !real.is_file() {
-        eprintln!("SKIP: {} is absent", real.display());
-        return;
-    }
-    let Some(probe) = build_probe_boot(&real, "lprobe", LPROBE_ERL) else {
-        return;
-    };
-    // The synthetic script is the real one's first 20 directives — including instruction 13's
-    // real `logger` kernelProcess — plus the probe, whose `run/0` reports whether `logger` is a
-    // registered pid at that point.
-    let stem = probe.dir.join("lprobe");
-    let output = beam_rt_boot(&["-noshell", "-boot", &stem.to_string_lossy()]);
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "the lprobe boot must run to completion (stderr {:?})",
-        stderr(&output)
-    );
-    let out = stdout(&output);
-    assert!(
-        out.contains("lg_is_pid=false"),
-        "the `erlang:apply/3` seam gap leaves `logger` unregistered after the real boot; if this \
-         now reports `true` the seam is closed — delete this test and un-ignore \
-         `the_cli_boot_registers_a_live_logger_process`: {out:?}"
-    );
-}
-
-#[test]
-#[ignore = "blocked on the cross-crate erlang:apply/2,3 seam gap (beam_engine CallExt seam / beam_rt src/context): the proc_lib child dies before init_ack, so gen_server:init_it never registers logger"]
 fn the_cli_boot_registers_a_live_logger_process() {
     // The oracle's behaviour: after the real `bootstrap/bin/start.boot` boots, instruction 13's
     // `{kernelProcess,logger,{logger_server,start_link,[]}}` leaves `logger_server` alive and
     // registered as `logger`, so `is_pid(erlang:whereis(logger))` is `true`.
     //
-    // It is ignored because the same boot currently leaves `logger` unregistered (see
-    // `the_cli_boot_leaves_logger_unregistered_pending_the_apply_seam_gap`): running it with
-    // `--ignored` and watching it fail is the evidence for that gap. Un-ignore it when the
-    // `erlang:apply/2,3` seam is closed.
+    // This holds now that the `call_ext` → `erlang:apply/3` seam (`fixed_apply`) runs in-machine:
+    // `proc_lib:init_p_do_apply/3`'s `try apply(M,F,A)` enters the child as an ordinary
+    // `Step::Enter`, so its blocking `receive` suspends the newly spawned process instead of
+    // folding into `error::blocked()`, and `gen_server:init_it` reaches its `register(logger,
+    // self())`.
     if booted_runtime().is_none() {
         return;
     }
