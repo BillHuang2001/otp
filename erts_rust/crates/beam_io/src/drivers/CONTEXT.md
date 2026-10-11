@@ -31,7 +31,9 @@ Legacy C ground truth (read-only): `erts/emulator/beam/io.c` (the `LineBuf` `LIN
 ## Constraints
 - Errors are `beam_common::{Result, BeamError}` only (`BadArg`/`Io`/`SystemLimit`, or `Raise` for the
   spawn errno atom). Never panic/`unwrap`/`todo!` on runtime data; all `unsafe` (raw syscalls) lives in
-  these modules with a `// SAFETY:` rationale per block.
+  these modules with a `// SAFETY:` rationale per block — except the `access(2)` behind
+  `spawn.rs`'s `check_executable`, which delegates to `crate::fs_access::try_access` (the crate's
+  single `access(2)` call site) and only renders the returned errno as the oracle's raise.
 - The byte path is **edge-triggered**: every `ready_input`/`write_pending` must drain to `EAGAIN`.
   A short write must leave the exact unwritten remainder queued and arm write readiness; a short read
   must never drop or duplicate bytes. `ByteQueue::front()` is always the whole contiguous remainder.

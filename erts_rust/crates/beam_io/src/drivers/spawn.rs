@@ -165,9 +165,10 @@ use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{IntoRawFd, RawFd};
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
-use beam_common::Result;
+use beam_common::{BeamError, Result};
 
 use crate::driver::{Driver, DriverContext};
 use crate::drivers::fd::set_nonblocking;
@@ -434,20 +435,24 @@ fn program_command(argv: &[String]) -> Result<Command> {
 /// The check runs in the *emulator's* working directory, exactly as the reference's does; a
 /// `{cd, Dir}` option is applied later, in the child.
 ///
+/// The raw syscall is [`crate::fs_access::try_access`], the crate's one `access(2)` call site —
+/// only the errno's rendering into the oracle's raise is this driver's.
+///
 /// # Errors
 ///
 /// [`error::spawn_failure`] of the failing `access(2)` — the errno atom the oracle raises
 /// (`error:enoent`, `error:eacces`, `error:enotdir`, …) — and [`beam_common::BeamError::BadArg`]
 /// for a path containing an interior NUL byte.
 fn check_executable(path: &str) -> Result<()> {
-    let name = CString::new(path.as_bytes()).map_err(|_| error::badarg())?;
-    // SAFETY: `name` is a NUL-terminated C string that outlives the call; `X_OK` only asks
-    // whether the caller may execute/search the path. `access(2)` neither retains the pointer
-    // nor writes through it, and a failure only sets `errno`.
-    if unsafe { libc::access(name.as_ptr(), libc::X_OK) } == 0 {
-        return Ok(());
-    }
-    Err(error::spawn_failure(std::io::Error::last_os_error()))
+    crate::fs_access::try_access(Path::new(path), crate::fs_access::AccessMode::Execute).map_err(
+        |err| match err {
+            // A refused check carries the untouched `access(2)` errno; render it as the
+            // oracle's raise.
+            BeamError::Io(err) => error::spawn_failure(err),
+            // The wrapper's own fault (an interior-NUL path) stays `badarg`, unchanged.
+            other => other,
+        },
+    )
 }
 
 /// Forks a child that runs `path` directly, reproducing the reference's **deferred** `exec`.
