@@ -53,6 +53,13 @@
 //!   always the 2-tuple `{Tag, Reply}` with `Tag` echoed **unchanged**.
 //! * **`file_server` request surface.** `file_server.erl:101-201` `handle_call`: the
 //!   command is the head of the `Request` tuple and the arguments its tail.
+//! * **The write path.** `{write_file, Name, Bin}` is `?PRIM_FILE:write_file(Name, Bin)`
+//!   (`file_server.erl:111-112`, the body of `file:write_file/2`), and a write-mode
+//!   `{open, Name, ModeList}` (`[write]`/`[append]`) opens the path **through the floor's
+//!   own `prim_file:open/2`** so the `get_flags` derivation, the errno vocabulary and
+//!   `efile_open`'s post-open type checks stay in one place. `file:write_file/3`
+//!   (`file.erl:1211-1241`) and `file:open/2` + `file:write/2` + `file:close/1` ride those
+//!   two arms over the io-device's already-served `put_chars`/`close` requests.
 //! * **The io-device.** A successful `{open,Name,ModeList}` returns `{ok, IoPid}`
 //!   (`file_io_server:start_link/3`, `file_io_server.erl:57-96`). `IoPid` speaks the
 //!   `{file_request,From,ReplyAs,Request}` → `{file_reply,ReplyAs,Reply}` protocol for
@@ -77,17 +84,27 @@
 //! `io_lib:collect_line/4` and casts it. The device loop is the same one `{get_until, …}`
 //! uses; this crate supplies the collect-and-cast half (see [`get_line`]).
 //!
+//! # The `{setopts, …}`/`getopts` read-mode surface
+//!
+//! Served by the [`setopts`] child module: `io:getopts/1` sends the bare atom `getopts` and
+//! `io:setopts/2` sends `{setopts, Opts}` (`file_io_server.erl:395-401`), and both arms read
+//! and write the same `Device` fields the `{get_chars, …}`/`{get_line, …}`/`{get_until, …}`
+//! readers use, so a mode change is visible to the next read exactly as it is on the oracle.
+//! The child's docs carry the wire-level notes.
+//!
 //! # Honest capability gaps (never a fabricated term)
 //!
 //! * `{read_file_info, Name}` and `{read_link_info, Name}` are **partly** served by the
 //!   [`file_info`] child: the `stat(2)`/`lstat(2)` failure is the oracle's `{error, Reason}`
 //!   verbatim, while a *successful* stat — whose reply would need the `#file_info{}` `access`
 //!   slot — stays the typed capability gap (the child's docs carry the full argument).
+//! * A `{setopts, …}` encoding with no counterpart here is the typed gap, never a fabricated
+//!   `ok` (the [`setopts`] child carries the exact rule, and the *open-time* equivalent keeps
+//!   its documented `latin1` divergence).
 //! * Every *other* request this module does not serve is reported as the typed
 //!   [`crate::error::unsupported`] gap rather than a plausible-looking wrong answer
-//!   (`setopts`, `getopts`, `pread`/`pwrite`, `advise`, `allocate`,
-//!   `read_handle_info`, the legacy `put_chars` arities, a tuple encoding,
-//!   `write_file`).
+//!   (`pread`/`pwrite`, `advise`, `allocate`, `read_handle_info`, the legacy `put_chars`
+//!   arities, a tuple encoding).
 //! * An unknown `file_server` `handle_call` request is the oracle's `{noreply, State}`:
 //!   the service replies **nothing** and carries on.
 
@@ -105,11 +122,13 @@ use beam_term::prelude::*;
 
 use crate::context::RuntimeContext;
 use crate::error;
+use crate::native::prim_file::take_open_file;
 use crate::runtime::Runtime;
 
 mod file_info;
 mod get_line;
 mod get_until;
+mod setopts;
 
 /// The native file service: the `file_server_2` process plus one **io-device** process per
 /// successful `open`.
@@ -342,6 +361,11 @@ impl Runtime {
         match (command.as_str(), args.len()) {
             ("open", 2) => self.reply_open(table, args).map(Some),
             ("read_file", 1) => self.prim_file_1("read_file", args).map(Some),
+            // `file_server.erl:111-112`: `?PRIM_FILE:write_file(Name, Bin)` — the body of
+            // `file:write_file/2` (`file.erl:1193-1194`). `file:write_file/3` reaches the same
+            // write through its own open→write→close over this module's `{open, …}` and
+            // io-device seams (`file.erl:1211-1241`, `do_write_file/3`).
+            ("write_file", 2) => self.prim_file_2("write_file", args).map(Some),
             ("delete", 1) => self.prim_file_1("delete", args).map(Some),
             ("make_dir", 1) => self.prim_file_1("make_dir", args).map(Some),
             ("del_dir", 1) => self.prim_file_1("del_dir", args).map(Some),
@@ -354,10 +378,12 @@ impl Runtime {
             ("get_cwd", 1) => self.prim_file_1("get_cwd", args).map(Some),
             ("list_dir", 1) => self.reply_list_dir(args).map(Some),
             // `file_server.erl:141-145`/`:156-160`: `read_file_info` follows symlinks
-            // (`stat(2)`), `read_link_info` does not (`lstat(2)`).
-            ("read_file_info", 1) => file_info::serve(self, true, args).map(Some),
-            ("read_link_info", 1) => file_info::serve(self, false, args).map(Some),
-            // Everything else — `write_file`, `copy`, `write_file_info`, … — has no faithful
+            // (`stat(2)`), `read_link_info` does not (`lstat(2)`). Both the 1-arity and the
+            // `Opts`-carrying 2-arity form are the same `read_info_1/3`
+            // (`file_info.rs` reads `args.get(1)`).
+            ("read_file_info", 1 | 2) => file_info::serve(self, true, args).map(Some),
+            ("read_link_info", 1 | 2) => file_info::serve(self, false, args).map(Some),
+            // Everything else — `copy`, `write_file_info`, … — has no faithful
             // native implementation here and is a typed gap, never a wrong value.
             _ => Err(error::unsupported(&format!(
                 "file_server: the `{command}/{}` request is not implemented",
@@ -368,44 +394,115 @@ impl Runtime {
 
     /// `{open, Name, ModeList}` (`file_server.erl:101-104`).
     ///
-    /// A `ModeList` that is not a list is the oracle's `{error, einval}`; a path
-    /// `prim_file` rejects is `{error, badarg}`. A **directory** is rejected *before* the
-    /// open, because Linux's `open(2)` succeeds on one while the NIF's `efile_open`
-    /// answers `EISDIR`; a missing path is the `{error, enoent}` that unblocks the boot.
-    /// A readable regular file yields `{ok, IoPid}` with a fresh native io-device.
+    /// A `ModeList` that is not a list is the oracle's `{error, einval}`
+    /// (`file_server.erl:105-106`). The mode list's **stream encoding** is then validated, and
+    /// only then is the open performed: the oracle's `file_io_server:parse_options/1` runs
+    /// before its `OpenFun` (`file_io_server.erl:90-92`), so a `valid_enc/1`-rejected encoding
+    /// is the caller's `{error, badarg}` and must never reach `open(2)` — an invalid encoding
+    /// never creates or truncates the path.
+    ///
+    /// `ModeList` is tested with the `is_list/1` **BIF** predicate, so `[]` (a proper empty
+    /// list) is accepted and an improper tail is not (`beam_term::is_list` is the cons-cell
+    /// predicate and is false for `NIL`).
+    ///
+    /// The open itself is **delegated** to the floor's own `prim_file:open/2`, the one owner
+    /// of the `get_flags` derivation (`unix_prim_file.c:142-171`), the
+    /// `posix_error_to_tuple/1` errno vocabulary and `efile_open`'s post-open type checks
+    /// (`eisdir`/`enotdir`/`exclusive`/`append`/`truncate`, `unix_prim_file.c:196-212`); its
+    /// `{error, Reason}` answer is returned verbatim. A `{ok, Descriptor}` has its OS file
+    /// **moved out** by [`take_open_file`], so the path is never opened twice and the device
+    /// owns the very handle the floor opened — which is what makes a write-mode
+    /// (`[write]`/`[append]`) open create a missing path. A readable regular file yields
+    /// `{ok, IoPid}` with a fresh native io-device.
     fn reply_open(&mut self, table: &mut ProcessTable, args: &[Eterm]) -> Result<Eterm> {
-        if !is_list(args[1]) {
+        // `file_server.erl:104-106` guards on `is_list(ModeList)` — the BIF, which is true
+        // for `[]` — and answers `{error, einval}` for anything else.
+        if terms::list_elements(args[1]).is_err() {
             return self.error_tuple("einval");
         }
-        let Some(path) = self.encode_path(args[0]) else {
+        if !self.open_encoding_is_valid(args[1]) {
             return self.error_tuple("badarg");
-        };
-        let os_path = OsStr::from_bytes(&path);
-        match std::fs::metadata(os_path) {
-            Err(failure) => self.error_tuple_for(&failure),
-            Ok(metadata) if metadata.is_dir() => self.error_tuple("eisdir"),
-            Ok(_) => match std::fs::File::open(os_path) {
-                Err(failure) => self.error_tuple_for(&failure),
-                Ok(file) => {
-                    let binary = self.open_is_binary(args[1]);
-                    let encoding = self.open_encoding(args[1]);
-                    let device = table.spawn(self.file_services.policy.clone())?;
-                    self.file_services.devices.insert(
-                        device,
-                        Device {
-                            file,
-                            binary,
-                            encoding,
-                            buf: Vec::new(),
-                        },
-                    );
-                    let ok = self.atom("ok")?;
-                    self.tuple(&[ok, device.to_eterm()])
-                }
-            },
         }
+        let reply = self.prim_file_2("open", args)?;
+        let Some(fields) = tuple_fields(reply) else {
+            return Err(error::message(
+                "file_server: prim_file:open/2 did not answer a tuple",
+            ));
+        };
+        if fields.len() != 2 {
+            return Err(error::message(
+                "file_server: prim_file:open/2 did not answer a 2-tuple",
+            ));
+        }
+        if self.atom_name(fields[0]).as_deref() != Some("ok") {
+            return Ok(reply);
+        }
+        let Some(file) = take_open_file(self, fields[1]) else {
+            return Err(error::message(
+                "file_server: prim_file:open/2's descriptor holds no open file",
+            ));
+        };
+        let binary = self.open_is_binary(args[1]);
+        let encoding = self.open_encoding(args[1]);
+        let device = table.spawn(self.file_services.policy.clone())?;
+        self.file_services.devices.insert(
+            device,
+            Device {
+                file,
+                binary,
+                encoding,
+                buf: Vec::new(),
+            },
+        );
+        let ok = self.atom("ok")?;
+        self.tuple(&[ok, device.to_eterm()])
     }
 
+    /// Whether `ModeList`'s stream-encoding options survive
+    /// `file_io_server:parse_options/1`'s validation (`file_io_server.erl:131-148`).
+    ///
+    /// `parse_options/1` expands a bare `latin1`/`unicode` atom into `{encoding, …}` first
+    /// (`expand_encoding/1`, `:150-157`) and then calls `valid_enc/1` (`:159-178`) on every
+    /// `{encoding, E}` it meets; `{error, badarg}` aborts the whole start (`:90-92`, `:107-110`).
+    /// Every other mode-list element — an unknown atom like a bare `utf16` included — is an
+    /// ordinary option and never reaches `valid_enc`, so only an explicit `{encoding, E}` pair
+    /// can be rejected here.
+    fn open_encoding_is_valid(&self, mode_list: Eterm) -> bool {
+        terms::list_elements(mode_list)
+            .map(|elements| {
+                elements.iter().all(|element| {
+                    let Some(fields) = tuple_fields(*element) else {
+                        return true;
+                    };
+                    fields.len() != 2
+                        || self.atom_name(fields[0]).as_deref() != Some("encoding")
+                        || self.valid_encoding(fields[1])
+                })
+            })
+            .unwrap_or(true)
+    }
+
+    /// `file_io_server:valid_enc/1` (`file_io_server.erl:159-178`): the encodings
+    /// `parse_options/1` accepts. Anything else is the caller's `{error, badarg}`.
+    fn valid_encoding(&self, encoding: Eterm) -> bool {
+        if matches!(
+            self.atom_name(encoding).as_deref(),
+            Some("latin1" | "utf8" | "unicode" | "utf16" | "utf32")
+        ) {
+            return true;
+        }
+        let Some(fields) = tuple_fields(encoding) else {
+            return false;
+        };
+        if fields.len() != 2 {
+            return false;
+        }
+        let kind = self.atom_name(fields[0]);
+        matches!(
+            (kind.as_deref(), self.atom_name(fields[1]).as_deref()),
+            (Some("utf16" | "utf32"), Some("big" | "little"))
+        )
+    }
     /// Whether `ModeList` selects the `binary` read mode
     /// (`file_io_server:parse_options/1` defaults to `list`).
     fn open_is_binary(&self, mode_list: Eterm) -> bool {
@@ -546,6 +643,11 @@ impl Runtime {
             // legacy 2-tuple form, which defaults the encoding to `latin1` (`:412-413`).
             ("get_line", 2) => get_line::serve(self, service, Some(args[0]), args[1]),
             ("get_line", 1) => get_line::serve(self, service, None, args[0]),
+            // The mutable read-mode/encoding surface: `io:getopts/1` sends the bare atom
+            // `getopts`, `io:setopts/2` sends `{setopts, Opts}`
+            // (`file_io_server.erl:395-401`).
+            ("getopts", 0) => self.reply_getopts(service),
+            ("setopts", 1) => self.reply_setopts(service, args[0]),
             _ => Err(error::unsupported(&format!(
                 "file_server: the `{command}/{}` io request is not implemented",
                 args.len()
@@ -608,22 +710,24 @@ impl Runtime {
 
     /// The io-device's open file.
     fn device_file(&mut self, service: ProcessId) -> Result<&mut std::fs::File> {
-        self.file_services
-            .devices
-            .get_mut(&service)
-            .map(|device| &mut device.file)
-            .ok_or_else(|| error::unsupported("file_server: a request for a closed io device"))
+        Ok(&mut self.device_mut(service)?.file)
     }
 
     /// The device's read mode (binary vs list).
     fn device_binary(&mut self, service: ProcessId) -> Result<bool> {
-        self.file_services
-            .devices
-            .get(&service)
-            .map(|device| device.binary)
-            .ok_or_else(|| error::unsupported("file_server: a request for a closed io device"))
+        Ok(self.device_mut(service)?.binary)
     }
 
+    /// The device's own entry in the service map.
+    ///
+    /// An unknown pid is a request for a device that `close` already retired — the same
+    /// "closed io device" gap every other accessor reports.
+    fn device_mut(&mut self, service: ProcessId) -> Result<&mut Device> {
+        self.file_services
+            .devices
+            .get_mut(&service)
+            .ok_or_else(|| error::unsupported("file_server: a request for a closed io device"))
+    }
     // -- term helpers -------------------------------------------------------------
     //
     // These are the small shims over the shared `RuntimeContext` builders the floor already
@@ -671,11 +775,16 @@ impl Runtime {
 
     /// `{error, Reason}` for a path `prim_file` rejects.
     fn error_tuple(&mut self, reason: &str) -> Result<Eterm> {
-        let error = self.atom("error")?;
         let reason = self.atom(reason)?;
-        self.tuple(&[error, reason])
+        self.error_of(reason)
     }
 
+    /// `{error, Reason}` for an already-built `Reason` term — the shape every request
+    /// failure the oracle *returns* takes (`file_io_server`'s `{error, Reply, State}` arms).
+    fn error_of(&mut self, reason: Eterm) -> Result<Eterm> {
+        let error = self.atom("error")?;
+        self.tuple(&[error, reason])
+    }
     /// `{error, Reason}` for a host I/O failure — the C's
     /// `posix_error_to_tuple(erl_errno_id(errno))`.
     fn error_tuple_for(&mut self, failure: &std::io::Error) -> Result<Eterm> {
@@ -844,141 +953,4 @@ fn io_error(failure: std::io::Error) -> BeamError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A runtime with the boot floor loaded, so the shared atom table holds the names the
-    /// reply shapes need.
-    ///
-    /// `pub(super)` so the `get_until` child's tests reuse the one runtime fixture rather
-    /// than booting a second, subtly different one.
-    pub(super) fn runtime() -> Runtime {
-        let mut runtime = Runtime::with_defaults().expect("a runtime");
-        runtime.boot().expect("boot");
-        runtime
-    }
-
-    /// Builds a term on `runtime`'s arena through a fresh context.
-    pub(super) fn build(
-        runtime: &mut Runtime,
-        f: impl FnOnce(&mut RuntimeContext) -> Eterm,
-    ) -> Eterm {
-        let mut ctx = RuntimeContext::new(runtime);
-        f(&mut ctx)
-    }
-
-    #[test]
-    fn the_service_is_registered_under_file_server_2() {
-        let runtime = runtime();
-        let name = runtime
-            .atoms()
-            .lookup("file_server_2")
-            .expect("the name is interned at construction");
-        let pid = runtime
-            .processes()
-            .whereis(name)
-            .expect("the service is registered");
-        assert_eq!(pid, runtime.file_services.server());
-    }
-
-    /// The `{error, enoent}` value the boot's `file:open("$HOME/.erlang",[read])` receives.
-    #[test]
-    fn the_error_tuple_shape_is_the_oracles() {
-        let mut runtime = runtime();
-        let reply = runtime.error_tuple("enoent").expect("a term");
-        let fields = tuple_fields(reply).expect("a tuple");
-        assert_eq!(runtime.atom_name(fields[0]).as_deref(), Some("error"));
-        assert_eq!(runtime.atom_name(fields[1]).as_deref(), Some("enoent"));
-    }
-
-    /// `file_io_server:parse_options/1` defaults to `list`; only an explicit `binary` in the
-    /// mode list selects the binary read mode.
-    #[test]
-    fn the_open_mode_selects_the_read_mode() {
-        let mut runtime = runtime();
-        let list_mode = build(&mut runtime, |ctx| {
-            let read = ctx.atom("read").unwrap();
-            terms::make_list(ctx, &[read]).unwrap()
-        });
-        assert!(!runtime.open_is_binary(list_mode));
-        let binary_mode = build(&mut runtime, |ctx| {
-            let read = ctx.atom("read").unwrap();
-            let binary = ctx.atom("binary").unwrap();
-            terms::make_list(ctx, &[read, binary]).unwrap()
-        });
-        assert!(runtime.open_is_binary(binary_mode));
-    }
-
-    #[test]
-    fn errno_atoms_are_the_oracle_names() {
-        let failure = std::io::Error::from_raw_os_error(libc::ENOENT);
-        assert_eq!(errno_atom(&failure).unwrap(), "enoent");
-        let failure = std::io::Error::from_raw_os_error(libc::EISDIR);
-        assert_eq!(errno_atom(&failure).unwrap(), "eisdir");
-        let failure = std::io::Error::from_raw_os_error(libc::ENOTEMPTY);
-        assert_eq!(errno_atom(&failure).unwrap(), "enotempty");
-        // An errno this runtime has no atom for is the typed gap, never an invented atom.
-        let failure = std::io::Error::from_raw_os_error(9999);
-        assert!(errno_atom(&failure).is_err());
-    }
-
-    #[test]
-    fn iodata_bytes_flattens_lists_nested_lists_and_binaries() {
-        let mut runtime = runtime();
-        let term = build(&mut runtime, |ctx| {
-            let one = make_small(65);
-            let two = make_small(66);
-            let inner = terms::make_list(ctx, &[two]).unwrap();
-            let binary = terms::make_heap_binary(ctx, b"CD").unwrap();
-            terms::make_list(ctx, &[one, inner, binary]).unwrap()
-        });
-        assert_eq!(iodata_bytes(term).unwrap(), b"ABCD");
-        // A code point above 255 has no latin1 byte, so it is not a latin1 payload.
-        assert!(iodata_bytes(make_small(300)).is_none());
-    }
-
-    /// The `[alias|Ref]` tag `gen:reply/2` sends to the alias reference is detected as an
-    /// improper list; a plain `{Pid, Ref}` tag is not.
-    #[test]
-    fn the_alias_tag_is_detected_as_an_improper_list() {
-        let mut runtime = runtime();
-        let alias_tag = build(&mut runtime, |ctx| {
-            let alias = ctx.atom("alias").unwrap();
-            terms::make_cons(ctx, alias, make_small(0)).unwrap()
-        });
-        assert!(improper_list_head(alias_tag).is_some());
-        let proper_tag = build(&mut runtime, |ctx| {
-            let alias = ctx.atom("alias").unwrap();
-            let nil_tail = terms::make_list(ctx, &[]).unwrap();
-            terms::make_cons(ctx, alias, nil_tail).unwrap()
-        });
-        assert!(improper_list_head(proper_tag).is_none());
-        assert!(improper_list_head(make_small(0)).is_none());
-    }
-
-    /// A `{position, bof}` request seeks to the start.
-    #[test]
-    fn seek_from_reads_the_position_arguments() {
-        let mut runtime = runtime();
-        let at = build(&mut runtime, |ctx| ctx.atom("bof").unwrap());
-        assert!(matches!(seek_from(at, &runtime).unwrap(), SeekFrom::Start(0)));
-        let at = build(&mut runtime, |ctx| {
-            let cur = ctx.atom("cur").unwrap();
-            terms::make_tuple(ctx, &[cur, make_small(7)]).unwrap()
-        });
-        assert!(matches!(seek_from(at, &runtime).unwrap(), SeekFrom::Current(7)));
-        // A bare integer is the `bof` shorthand of `file.erl`'s `location()`.
-        assert!(matches!(
-            seek_from(make_small(3), &runtime).unwrap(),
-            SeekFrom::Start(3)
-        ));
-        // An unknown form is the typed gap.
-        let at = build(&mut runtime, |ctx| ctx.atom("nope").unwrap());
-        assert!(seek_from(at, &runtime).is_err());
-    }
-
-    #[test]
-    fn tuple_fields_rejects_a_non_tuple() {
-        assert!(tuple_fields(make_small(1)).is_none());
-    }
-}
+mod tests;
