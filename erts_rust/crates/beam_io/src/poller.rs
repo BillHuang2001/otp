@@ -25,8 +25,8 @@
 //! descriptors** ([`RawFd`]) with an [`Interest`] mask and an opaque `u64` key, then
 //! receive owned [`Event`]s from [`Poller::poll`]. This mirrors the legacy C poll loop's
 //! one-shot readiness model (`erts/emulator/sys/common/erl_poll.c`, `erl_check_io.c`)
-//! while letting a future `io_uring`/`/dev/poll` backend be swapped in behind the same
-//! API.
+//! while keeping the registration API backend-agnostic (only the `mio` epoll/kqueue
+//! backend is implemented; an `io_uring`/`/dev/poll` backend is not).
 //!
 //! [`Token`] `0` is reserved for the poller's own asynchronous [`Waker`]; user
 //! registrations start at token `1`. The `u64` "key" travels opaquely with every event so

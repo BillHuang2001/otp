@@ -73,10 +73,10 @@ Legacy C ground truth (read-only): `erts/emulator/drivers/common/inet_drv.c`, `e
 - `PacketType::payload_range(&[u8]) -> Result<Range<usize>>` — the C's `packet_get_body` header strip: the header is removed for `Len1`/`Len2`/`Len4` and the FCGI padding subtracted for `Fcgi`; every other type (including `LineLf`) is returned **as is**, so a `{packet, line}` payload keeps its delimiter (the oracle's `gen_tcp:recv`).
 - **Three faithfully-reproduced C quirks**: `Raw` ignores `max_plen` (`:258`); line mode compares `max_plen` strictly-but `trunc_len` inclusively before a delimiter is found, and both strictly after (`:298-320`); `Raw` with an empty buffer is `NeedMore`, not `Complete(0)` (`:258`).
 
-### `frame.rs` (private) — the read-path framing glue
-- The bridge from the driver's stored `SocketOptions` to the pure decoder, called by the driver's read path; a port of the C's `tcp_remain`/`tcp_reply_data` pair.
-- `options(&SocketOptions) -> PacketOptions` (the C's arguments at `inet_drv.c:12975`; `trunc_len` stays 0 — this driver has no fixed input buffer, it accumulates into a growable `Vec`); `framed(&SocketOptions) -> Option<PacketType>` (`None` only for `Raw` and an out-of-range code); `extract(&mut Vec<u8>, &PacketOptions) -> Result<Option<Vec<u8>>>` — **exactly one** frame's payload per call, `Ok(None)` while more bytes are needed (buffer untouched), `Err(badarg)` for `Invalid`/`Err(notsup)` for `Unsupported`.
-  All three are `pub(super)`.
+### `frame.rs` (private) — the framing glue (read + send)
+- The bridge from the driver's stored `SocketOptions` to the pure decoder, called by the driver's read and send paths; a port of the C's `tcp_remain`/`tcp_reply_data`/`tcp_send` pair.
+- `options(&SocketOptions) -> PacketOptions` (the C's arguments at `inet_drv.c:12975`; `trunc_len` stays 0 — this driver has no fixed input buffer, it accumulates into a growable `Vec`); `framed(&SocketOptions) -> Option<PacketType>` (`None` only for `Raw` and an out-of-range code); `write_header(&SocketOptions, len) -> Option<Vec<u8>>` (the send-path counterpart of `extract` — the 1-/2-/4-byte big-endian length header the `send` verb prepends under `{packet,1|2|4}`, `None` for every other code); `extract(&mut Vec<u8>, &PacketOptions) -> Result<Option<Vec<u8>>>` — **exactly one** frame's payload per call, `Ok(None)` while more bytes are needed (buffer untouched), `Err(badarg)` for `Invalid`/`Err(notsup)` for `Unsupported`.
+  All four are `pub(super)`.
 
 ### `sys.rs` (private) — the raw socket syscalls
 - Every `unsafe` block of the driver lives here: `socket`/`bind`/`listen`/`accept`/`connect`/`getsockname`/`getsockopt`/`setsockopt`/`read`/`send`/`shutdown`/`close`, each with a `// SAFETY:` rationale.
@@ -100,13 +100,9 @@ All four need a change **outside** `src/drivers/inet/`; each is a real `gen_tcp`
 - **(d) The async-op queue.** `INET_MAX_ASYNC = 1` (`:1069`), `enq_async`, the `[1] ++ async_id_be16` reply and the later `{inet_async, Port, Ref, Result}` message, plus a per-port 16-bit op ref and a **second-port** `accept`.
   This floor's `recv`/`accept`/`connect` are **synchronous** (which is also why `recv` rejects the C's 8-byte `Timeout(4), Length(4)` payload with `BadArg`, and `accept` transfers the port rather than returning an async id).
 
-## Known Issues
-- **`verb_send` does not frame output.** Under `{packet,1|2|4}` the C's `tcp_send`/`tcp_sendv` (`inet_drv.c:13745-13769`, `:13861-13877`) **prepend** a 1/2/4-byte big-endian length header before the payload; this floor pushes the argument verbatim (`mod.rs:1015`), so a send under those codes is unframed where the oracle is framed (`{packet,4}` + `gen_tcp:send(C, <<"abc">>)` ⇒ the raw peer reads `<<0,0,0,3,"abc">>`). Only the read path frames (`frame.rs`/`packet.rs`).
-- **`verb_send` ignores a deferred `shutdown`.** After `shutdown(SHUT_WR|SHUT_RDWR)` deferred because output was queued (`mod.rs:1143-1147`), the C rejects a further send with `EPIPE` ⇒ `{error,closed}` and tears the socket down (`inet_drv.c:12695-12696` → `:13654-13670`); this floor instead accepts and queues the bytes (`pending_shutdown` is only re-applied when the queue drains, `mod.rs:778-781`).
-
 ## Test Strategy
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io` **GREEN** (sandbox `$HOME` read-only — always the wrapper; never `cd`).
-- **In-module (115):** `packet.rs` **62**, `tests.rs` **27**, `frame_tests.rs` **11**, `frame.rs` **9**, `opt.rs` **6**.
+- **In-module (125):** `packet.rs` **62**, `tests.rs` **29**, `frame_tests.rs` **15**, `frame.rs` **13**, `opt.rs` **6**.
 - `tests.rs` — the wire/reply vocabulary, argument decoding, the lifecycle and verb round trips over **real loopback sockets**, and the latched peer-close state machine.
 - `frame_tests.rs` — the `{packet, N}` read path over real loopback sockets, cross-checking the delivered payloads against the system `gen_tcp` oracle.
 - **Crate-level integration `tests/inet.rs` (8):** a loopback byte round trip through a `"tcp_inet"` port created via the `DriverRegistry`; a stalled write arming write-readiness + an unknown verb's `BadArg`; the post-close `[0]closed` shape; a reactor-observed peer close releasing the registration; and **three `erl`-oracle cross-checks** (`the_covered_control_replies_…`, `the_peer_close_replies_…`, `the_socket_option_replies_…`) plus `the_driver_state_option_replies_agree_with_the_erl_oracle` (10 driver-state option replies byte-for-byte).
@@ -117,10 +113,10 @@ Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p b
 - `wire.rs` → `INET_REP_*`/`INET_AF_*`/`INET_TYPE_*`/`INET_PROTO_*`/`TCP_SHUT_*`, `InetAddr`/`parse_address`, `ctl_ok`/`ctl_error`/`ctl_xerror`, `errno_name`
 - `opt.rs` → `SocketOptions`, `set_options`/`get_options`, the `INET_OPT_*`/`TCP_OPT_NODELAY`/`INET_LOPT_*`/`INET_ACTIVE`/`INET_INFINITY`/`INET_ONCE`/`INET_MULTI`/`INET_PASSIVE` codes
 - `packet.rs` → `PacketType`/`PacketLength`/`PacketOptions`/`DEFAULT_DELIMITER`, the per-type decoders, `payload_range`, `mod tests` (62)
-- `frame.rs` → `options`/`framed`/`extract`, `mod tests` (9)
+- `frame.rs` → `options`/`framed`/`write_header`/`extract`, `mod tests` (13)
 - `sys.rs` → the raw `libc` socket wrappers + `get_socket_int_option`/`set_socket_int_option`
-- `tests.rs` → the in-module suite (27)
-- `frame_tests.rs` → the in-module framing suite (11)
+- `tests.rs` → the in-module suite (29)
+- `frame_tests.rs` → the in-module framing suite (15)
 - `../../../tests/inet.rs` → the crate-level integration + `erl`-oracle suite (8) (parent node)
 
 ## See Also
