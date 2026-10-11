@@ -106,6 +106,37 @@ pub struct Machine {
     /// The faithful raw-double `FloatDef` model (`f_reg_array`) is a **deferred
     /// refinement**; the field deliberately does **not** store `f64`.
     pub(crate) fr: Vec<Eterm>,
+    /// The **written** high-water mark (exclusive) of the x-register file: one past the
+    /// highest slot a register-write seam has stored into since the last refill
+    /// ([`Machine::reset`]).
+    ///
+    /// Every x-register write the engine performs funnels through [`Machine::set_x`]
+    /// (the `move`/`get_*`/`gc_bif` destination seam and the argument seeding at a run
+    /// entry), which raises this mark. It exists so [`Machine::reset`] can refill only
+    /// the slots that may hold a term and skip the rest of the 1024-word file, which is
+    /// already `NIL` — a full refill of both files is otherwise the whole per-run floor.
+    ///
+    /// **It is a conservative approximation, never a guarantee.** A writer that can
+    /// reach the register file without going through `set_x` cannot report what it
+    /// touched: a native JIT block stores straight into `machine.x` through the raw
+    /// pointer the generated code holds, and a host handed a raw `&mut` slice
+    /// ([`Machine::x_mut`]/[`Machine::with_roots`]) may write any slot. Each such writer
+    /// sets [`Machine::regs_escaped`], which forces the next `reset` to refill the whole
+    /// file. A stale register is a WRONG RESULT, so when in doubt the reset refills in
+    /// full.
+    pub(crate) x_mark: u32,
+    /// The FR-file twin of [`Machine::x_mark`]: raised by [`Machine::set_fr`], forced
+    /// full by [`Machine::regs_escaped`].
+    pub(crate) fr_mark: u32,
+    /// Whether a writer that cannot report the register slots it touched has run since
+    /// the last refill, so [`Machine::x_mark`]/[`Machine::fr_mark`] understate the dirty
+    /// region.
+    ///
+    /// Set by [`Machine::x_mut`]/[`Machine::fr_mut`]/[`Machine::with_roots`] (the caller
+    /// may write any slot of the slice it is handed) and by the native driver before it
+    /// folds a compiled block's result ([`Machine::mark_regs_escaped`]). [`Machine::reset`]
+    /// refills the whole register files when it is set and then clears it.
+    pub(crate) regs_escaped: bool,
     /// The Erlang stack: the Y-slot words of every live frame, oldest first.
     pub(crate) stack: Vec<Eterm>,
     /// The call-frame stack (innermost last).
@@ -326,6 +357,9 @@ impl Machine {
         let mut machine = Machine {
             x: Vec::new(),
             fr: Vec::new(),
+            x_mark: 0,
+            fr_mark: 0,
+            regs_escaped: false,
             stack: Vec::new(),
             frames: Vec::new(),
             catch_frames: Vec::new(),
@@ -388,6 +422,11 @@ impl Machine {
     /// keep a term alive, never free a live one). The root-set contract itself is
     /// the frozen one on [`RootSet`].
     pub fn with_roots<R>(&mut self, live: u32, f: impl FnOnce(RootSet<'_>) -> R) -> R {
+        // The receiver is handed mutable slices of BOTH register files, so it may write
+        // any slot of either — a move that the `set_x`/`set_fr` high-water marks cannot
+        // see. Mark the files escaped so the next `reset` refills them in full rather
+        // than trusting the marks.
+        self.regs_escaped = true;
         let roots = RootSet::new(&mut self.x, &mut self.stack, &mut self.fr, live);
         f(roots)
     }

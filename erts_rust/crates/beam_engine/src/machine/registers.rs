@@ -84,7 +84,9 @@ static NIL_CHUNK: [Eterm; NIL_CHUNK_WORDS] = [Eterm::nil(); NIL_CHUNK_WORDS];
 ///
 /// The remainder path (a register file smaller than one chunk, i.e. any
 /// `Machine::with_max_register(n)` with `n < NIL_CHUNK_WORDS`) makes the function
-/// total: it handles any slice length without panicking.
+/// total: it handles any slice length without panicking. It is also what a
+/// mark-bounded refill of a few live registers goes through, so the reduced refill
+/// cost stays a straight `chunks_exact_mut` pass plus one short tail fill.
 #[inline]
 fn fill_nil(slots: &mut [Eterm]) {
     let mut chunks = slots.chunks_exact_mut(NIL_CHUNK_WORDS);
@@ -114,8 +116,14 @@ impl Machine {
     /// (all three files, disjointly borrowed) must use
     /// [`Machine::with_roots`](crate::machine::Machine::with_roots), because three
     /// separate `&mut self` accessor calls cannot coexist.
+    ///
+    /// Handing out the mutable slice **escapes the register file**: the caller may
+    /// write any slot, which the [`Machine::set_x`] high-water mark cannot observe, so
+    /// this marks the files escaped and the next [`Machine::reset`] refills them in
+    /// full (see [`Machine::regs_escaped`]).
     #[inline]
     pub fn x_mut(&mut self) -> &mut [Eterm] {
+        self.regs_escaped = true;
         &mut self.x
     }
 
@@ -133,20 +141,25 @@ impl Machine {
     /// The FR file holds `Eterm` **term slots** at Milestone 1, so a float register
     /// can hold a pointer into the process heap and must be a GC root; see
     /// [`Machine::x_mut`] for why the whole-set hand-off goes through
-    /// [`Machine::with_roots`](crate::machine::Machine::with_roots).
+    /// [`Machine::with_roots`](crate::machine::Machine::with_roots) rather than three
+    /// separate accessor calls — and for why handing the slice out escapes the file
+    /// (and so forces the next [`Machine::reset`] to refill it in full).
     #[inline]
     pub fn fr_mut(&mut self) -> &mut [Eterm] {
+        self.regs_escaped = true;
         &mut self.fr
     }
     /// Write `value` into float register `n`.
     ///
     /// Mirrors [`Machine::set_x`]: returns [`crate::error::bad_register`] if `n` is
-    /// outside the FR file.
+    /// outside the FR file, and raises [`Machine::fr_mark`] on success so
+    /// [`Machine::reset`] refills the slot.
     #[inline]
     pub fn set_fr(&mut self, n: u32, value: Eterm) -> Result<()> {
         match self.fr.get_mut(n as usize) {
             Some(slot) => {
                 *slot = value;
+                self.fr_mark = self.fr_mark.max(n + 1);
                 Ok(())
             }
             None => Err(error::bad_register(n)),
@@ -155,16 +168,34 @@ impl Machine {
 
     /// Write `v` into X register `n`.
     ///
-    /// Returns [`crate::error::bad_register`] if `n` is outside the register file.
+    /// Returns [`crate::error::bad_register`] if `n` is outside the register file, and
+    /// raises [`Machine::x_mark`] on success so [`Machine::reset`] refills the slot.
     #[inline]
     pub(crate) fn set_x(&mut self, n: u32, v: Eterm) -> Result<()> {
         match self.x.get_mut(n as usize) {
             Some(slot) => {
                 *slot = v;
+                // `n` is in range, so `n + 1` cannot overflow (`max_register` is far
+                // below `u32::MAX`).
+                self.x_mark = self.x_mark.max(n + 1);
                 Ok(())
             }
             None => Err(error::bad_register(n)),
         }
+    }
+
+    /// Declare that a writer which cannot report the register slots it touched has run,
+    /// so the next [`Machine::reset`] must refill **both** register files in full.
+    ///
+    /// The native driver calls this as soon as a compiled block has executed: generated
+    /// code stores straight into `machine.x` through the pointer it holds (and may touch
+    /// the FR file), so the [`Machine::x_mark`]/[`Machine::fr_mark`] high-water marks no
+    /// longer bound the dirty region. [`Machine::x_mut`]/[`Machine::fr_mut`]/
+    /// [`Machine::with_roots`](crate::machine::Machine::with_roots) set the same flag for
+    /// a host handed a raw slice.
+    #[inline]
+    pub(crate) fn mark_regs_escaped(&mut self) {
+        self.regs_escaped = true;
     }
 
     /// Reset to the initial state: a fresh (NIL-filled) register file and empty
@@ -184,27 +215,50 @@ impl Machine {
     ///   are only resized when their length differs from the target (which happens
     ///   once, for the first reset after `Machine::with_max_register`, and never
     ///   again in steady state), so the register base stays put across runs;
-    /// * no dirty high-water-mark bookkeeping: a **skipped** clear would leak a
-    ///   stale term into the next run, because the baseline JIT writes
-    ///   `machine.x` directly through raw pointers from generated code and can
-    ///   never report which registers it touched. The whole file is rewritten on
-    ///   every reset, so `x`/`fr` are exactly `NIL`-filled for the next run no
-    ///   matter what wrote them.
+    /// * the refill is **bounded by the written high-water mark**:
+    ///   [`Machine::x_mark`]/[`Machine::fr_mark`] record the leading slots a register-
+    ///   write seam has actually stored into since the last refill, so a run that
+    ///   touched two x-registers and no FR only pays for those two words plus the FR
+    ///   file's zero. A writer that cannot report its slots (a native JIT block, a host
+    ///   handed a raw slice) sets [`Machine::regs_escaped`] instead, and this reset then
+    ///   refills both files in full — a stale register would be a WRONG RESULT, so the
+    ///   marks are never trusted past what the seams could prove.
     #[inline]
     pub fn reset(&mut self) {
+        // The dirty region of each file: the tracked high-water mark, or the whole file
+        // when a writer that could not report its slots has run. Everything outside the
+        // region is still `NIL` from the previous refill (or the initial `resize`), so
+        // skipping it is exactly equivalent to refilling it.
+        let escaped = self.regs_escaped;
         let n = self.max_register as usize;
         if self.x.len() != n {
+            // A fresh (or resized) file is `NIL`-filled by `resize` itself.
             self.x.clear();
             self.x.resize(n, Eterm::default());
+            self.x_mark = 0;
         }
-        fill_nil(&mut self.x);
+        let x_hi = if escaped {
+            n
+        } else {
+            (self.x_mark as usize).min(n)
+        };
+        fill_nil(&mut self.x[..x_hi]);
+        self.x_mark = 0;
 
         let fr_len = MAX_FLOAT_REGISTER as usize;
         if self.fr.len() != fr_len {
             self.fr.clear();
             self.fr.resize(fr_len, Eterm::default());
+            self.fr_mark = 0;
         }
-        fill_nil(&mut self.fr);
+        let fr_hi = if escaped {
+            fr_len
+        } else {
+            (self.fr_mark as usize).min(fr_len)
+        };
+        fill_nil(&mut self.fr[..fr_hi]);
+        self.fr_mark = 0;
+        self.regs_escaped = false;
 
         self.stack.clear();
         self.frames.clear();
@@ -335,22 +389,83 @@ mod tests {
 
     #[test]
     #[allow(unsafe_code)]
-    fn reset_clears_a_register_written_through_a_raw_pointer() {
-        // The baseline JIT writes `machine.x` DIRECTLY through the raw pointer the
-        // generated code holds, so it can never notify a dirty tracker. This test
-        // stands in for that write: a raw store into register 500 must still be
-        // wiped by the next `reset`, i.e. no high-water-mark shortcut may skip it.
+    fn reset_clears_a_register_written_through_the_pointer_a_native_block_holds() {
+        // A native baseline block stores straight into `machine.x` through the raw
+        // pointer the generated code holds — a pointer taken from the file itself, so
+        // the write is invisible to the `set_x` high-water mark. The escape must
+        // therefore force a FULL refill: a raw store into register 500 is wiped by the
+        // next `reset`, i.e. no high-water-mark shortcut may skip it.
         let mut machine = Machine::new();
         // SAFETY: the store stays inside the register file's allocation
         // (`MAX_REGISTER` live words) and `Eterm` is `repr(transparent)` over a
         // machine word, so the write is in bounds and well-aligned.
         unsafe {
-            let base = machine.x.as_mut_ptr();
+            let base = machine.x_mut().as_mut_ptr();
             base.add(500).write(Eterm::from_raw(0xDEAD_BEEF));
         }
         assert_eq!(machine.x(500), Some(Eterm::from_raw(0xDEAD_BEEF)));
         machine.reset();
         assert_eq!(machine.x(500), Some(Eterm::default()));
+        assert!(machine.x.iter().all(|slot| *slot == Eterm::default()));
+        assert!(machine.fr.iter().all(|slot| *slot == Eterm::default()));
+    }
+
+    #[test]
+    fn a_mark_skipped_refill_never_leaves_a_stale_register() {
+        // The refill is bounded by the written high-water mark, so the mark must never
+        // fall *below* a slot a seam wrote — a stale register is a wrong result. Write
+        // a deeper register each round, then a shallow one (so the next mark is small),
+        // and assert both files are exactly NIL on the far side of every reset.
+        let mut machine = Machine::new();
+        for round in 0..12u32 {
+            let deep = 3 * round + 1;
+            machine.set_x(deep, Eterm::from_raw(0xABC + round as usize)).unwrap();
+            machine.set_fr(deep, Eterm::from_raw(0xDEF)).unwrap();
+            // A run that also touches only low registers, so the *next* mark is small.
+            machine.set_x(0, Eterm::from_raw(7)).unwrap();
+            machine.set_fr(0, Eterm::from_raw(7)).unwrap();
+            machine.reset();
+            assert!(
+                machine.x.iter().all(|slot| *slot == Eterm::default()),
+                "round {round}: a stale x register survived the mark-bounded refill"
+            );
+            assert!(
+                machine.fr.iter().all(|slot| *slot == Eterm::default()),
+                "round {round}: a stale FR register survived the mark-bounded refill"
+            );
+        }
+    }
+
+    #[test]
+    fn a_seam_write_is_refilled_wherever_it_lands() {
+        // The mark-bounded refill must cover the highest slot a seam wrote, not just
+        // the low ones: 700 and 900 are far outside anything a small run touches.
+        let mut machine = Machine::new();
+        machine.set_x(700, Eterm::from_raw(0x11)).unwrap();
+        machine.set_fr(900, Eterm::from_raw(0x22)).unwrap();
+        machine.reset();
+        assert_eq!(machine.x(700), Some(Eterm::default()));
+        assert_eq!(machine.get_fr(900), Some(Eterm::default()));
+        assert!(machine.x.iter().all(|slot| *slot == Eterm::default()));
+        assert!(machine.fr.iter().all(|slot| *slot == Eterm::default()));
+    }
+
+    #[test]
+    fn a_root_handoff_escapes_the_register_files() {
+        // `with_roots` hands a receiver mutable slices of both files, so the marks
+        // cannot be trusted afterwards: the next reset must refill in full. Prove it by
+        // escaping, writing a deep slot through the handed slice, and resetting — a
+        // mark-bounded refill would leave the write behind.
+        let mut machine = Machine::new();
+        machine.with_roots(u32::MAX, |roots| {
+            roots.x[800] = Eterm::from_raw(0x5A5A);
+            roots.fr[801] = Eterm::from_raw(0x5B5B);
+        });
+        assert_eq!(machine.x(800), Some(Eterm::from_raw(0x5A5A)));
+        assert_eq!(machine.get_fr(801), Some(Eterm::from_raw(0x5B5B)));
+        machine.reset();
+        assert_eq!(machine.x(800), Some(Eterm::default()));
+        assert_eq!(machine.get_fr(801), Some(Eterm::default()));
         assert!(machine.x.iter().all(|slot| *slot == Eterm::default()));
         assert!(machine.fr.iter().all(|slot| *slot == Eterm::default()));
     }
