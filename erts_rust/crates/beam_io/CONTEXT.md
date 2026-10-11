@@ -296,6 +296,8 @@ Current: **574 passing / 0 failing / 2 ignored** — **398** lib in-module (`#[c
 - Read `../CONTEXT.md` (crate-layer contracts, the poller/`Port`/driver-registry seam), `../beam_process/CONTEXT.md` (`PortTable`/`PortId`, `Scheduler`/`ProcessTable`) and `../../CONTEXT.md` §1 A.4/§3 before changing this crate.
 - Build/test: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io` (sandbox `$HOME` is read-only — always the wrapper).
   Never `cd`; never touch `../../tools/`.
+- `src/fs_access.rs` is the crate's **only** `access(2)`/`geteuid(2)`/`getegid(2)` call site (the spawn driver's `X_OK` check delegates to `fs_access::try_access`).
+  A new `access(2)` use belongs there, never as a second `unsafe` wrapper.
 - A driver never touches the queues or the poller directly — it goes through `DriverContext`.
   When a `Port` method calls the driver, **destructure `self`** (`let Port { driver, input, output, id, .. }`) so the driver and its context borrow disjoint fields; do not add a combined raw-pointer accessor.
 - `Poller::poll` returns owned events and is `EINTR`-tolerant; call `registry.handle_events(&mut poller, &events)` after it, or drive the queue explicitly with `schedule_events` + `execute_port_tasks`.
