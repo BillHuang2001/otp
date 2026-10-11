@@ -34,7 +34,7 @@ use std::path::Path;
 
 use beam_common::{BeamError, Result};
 use beam_engine::terms;
-use beam_term::Eterm;
+use beam_term::{is_atom, is_list, is_nil, is_small, signed_value, Eterm};
 
 use crate::context::RuntimeContext;
 use crate::error;
@@ -409,6 +409,87 @@ impl RuntimeContext<'_> {
         }
     }
 
+    /// `code:priv_dir(App)`: the `priv` directory of the application directory of `App`, as
+    /// a string, or `{error, bad_name}` when `App` names no installed application.
+    ///
+    /// The oracle's `priv_dir/1` (`code.erl:978-980`) is the wrapper `call({dir,{priv_dir,
+    /// App}})` behind the guard `is_atom(App); is_list(App)`, and the code server answers it
+    /// by rewriting the request into `{lib_dir,App,priv}` (`code_server.erl:1058-1059`), so
+    /// the answer is `filename:join(AppDir, "priv")` **unconditionally**: the subdirectory
+    /// is never `stat`ed — the `SubDirs` list is only non-empty for an **archive**
+    /// application directory — and an absent `priv` therefore does not change the answer.
+    /// The application directory itself comes from the code server's name table
+    /// (`code_server.erl:1018-1023`), in which a name the code server does not know is
+    /// `{error, bad_name}`; a term that is neither an atom nor a list leaves the guard with
+    /// no matching clause and raises `function_clause`.
+    ///
+    /// Like [`Self::code_lib_dir_1`], the system library directories are resolved first
+    /// (through [`CodeServer::app_dir`](crate::CodeServer::app_dir)), so the answer is the
+    /// version actually installed rather than a remembered one.
+    ///
+    /// Oracle-verified (OTP 29.1.1 / erts-17.1): `code:priv_dir(kernel)` ⇒
+    /// `…/lib/kernel-11.0.4/priv` — the reference installation keeps **no**
+    /// `kernel-<vsn>/priv` directory, which is exactly the "joined but never stat'ed" rule —
+    /// `code:priv_dir(compiler)` ⇒ `…/lib/compiler-10.0.6/priv`,
+    /// `code:priv_dir("kernel")` ⇒ the same as the atom form,
+    /// `code:priv_dir(nosuchapp_xyz)` and `code:priv_dir("nosuchapp_xyz")` ⇒
+    /// `{error,bad_name}`, `code:priv_dir([])`/`code:priv_dir([foo])`/`code:priv_dir([1|2])`
+    /// ⇒ `{error,bad_name}` (an empty or unnameable list names nothing), and
+    /// `code:priv_dir(42)` / `code:priv_dir(<<"kernel">>)` ⇒ a `function_clause` raise.
+    pub(super) fn code_priv_dir_1(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let argument = *args.first().ok_or(BeamError::BadArg)?;
+        // `is_list/1` is true for any cons cell, and the empty list is the `NIL` immediate
+        // (so it is not a LIST word here) — together they are the oracle's `is_list/1`.
+        if !is_atom(argument) && !is_list(argument) && !is_nil(argument) {
+            // The guard fails, so no clause matches: the bare-atom `function_clause` raise the
+            // engine reports for a genuine wrapper miss.
+            return Err(BeamError::Raise(beam_common::Raise::error(
+                beam_common::ExitReason::atom("function_clause"),
+            )));
+        }
+        // An atom is its own name; a list is the documented backward-compatible string form.
+        // A list that is no proper char list cannot equal any name in the code server's
+        // table, so it resolves to nothing — the oracle's own `{error, bad_name}`.
+        let name = match self.atom_name(argument) {
+            Some(name) => Some(name),
+            None => self.charlist_string(argument),
+        };
+        let found = match name {
+            Some(app) => {
+                self.runtime.code_server.add_system_paths()?;
+                self.runtime.code_server.app_dir(&app)
+            }
+            None => None,
+        };
+        match found {
+            Some(dir) => self.charlist(&dir.join("priv").display().to_string()),
+            None => {
+                let tag = self.atom("error")?;
+                let reason = self.atom("bad_name")?;
+                terms::make_tuple(self, &[tag, reason])
+            }
+        }
+    }
+
+    /// The Erlang string `term` as a Rust `String`.
+    ///
+    /// `None` unless `term` is a **proper** list of Unicode scalar code points — the only
+    /// list shape that can name an application: [`Self::code_priv_dir_1`] accepts a string
+    /// for backwards compatibility, and the oracle compares the raw term against its name
+    /// table, so any other list simply finds no name.
+    fn charlist_string(&self, term: Eterm) -> Option<String> {
+        let elements = terms::list_elements(term).ok()?;
+        let mut text = String::with_capacity(elements.len());
+        for element in elements {
+            if !is_small(element) {
+                return None;
+            }
+            let code = u32::try_from(signed_value(element)).ok()?;
+            text.push(char::from_u32(code)?);
+        }
+        Some(text)
+    }
+
     /// `code:root_dir/0`: the Erlang installation root the system booted from, as a
     /// string.
     ///
@@ -506,8 +587,8 @@ mod tests {
     //! set and the installation directories.
 
     use super::*;
-    use crate::native::test_support::{atom, call, runtime, string_of, system_runtime};
-    use beam_term::{is_atom, make_small};
+    use crate::native::test_support::{atom, call, chars, runtime, string_of, system_runtime};
+    use beam_term::make_small;
 
     #[test]
     fn code_get_path_is_a_list_of_strings() {
@@ -697,6 +778,175 @@ mod tests {
             runtime.atom_name_of(terms::tuple_element(answer, 1).unwrap()),
             Some("bad_name")
         );
+    }
+
+    #[test]
+    fn code_priv_dir_is_the_app_dir_joined_with_priv() {
+        // `code:priv_dir(App)` is `code:lib_dir(App, priv)`: the code server rewrites the
+        // request (`code_server.erl:1058-1059`) and joins unconditionally — it never stats the
+        // subdirectory (`SubDirs` is only non-empty for an **archive** application directory).
+        // On the reference installation `kernel-<vsn>/priv` really is absent, and the oracle
+        // still answers the join — which `code_priv_dir_agrees_with_the_oracle` cross-checks.
+        let Some(mut runtime) = system_runtime() else {
+            return;
+        };
+        let kernel = atom(&mut runtime, "kernel");
+        let app_dir =
+            string_of(call(&mut runtime, "code", "lib_dir", &[kernel]).expect("lib_dir"));
+        let answer = call(&mut runtime, "code", "priv_dir", &[kernel]).expect("priv_dir/1");
+        assert!(beam_term::is_list(answer), "priv_dir/1 answers a string");
+        assert_eq!(string_of(answer), format!("{app_dir}/priv"));
+
+        // The documented backward-compatible **string** form names the same application
+        // (`code.erl:980`'s guard is `is_atom(App); is_list(App)`).
+        let named = chars(&mut runtime, "kernel");
+        let answer = call(&mut runtime, "code", "priv_dir", &[named]).expect("priv_dir/1");
+        assert_eq!(string_of(answer), format!("{app_dir}/priv"));
+
+        // An installed application resolves through the code server's name table the same way
+        // (the `<lib>` sibling scan), so the join holds for it too — whatever its version.
+        let compiler = atom(&mut runtime, "compiler");
+        let app_dir =
+            string_of(call(&mut runtime, "code", "lib_dir", &[compiler]).expect("lib_dir"));
+        let answer = call(&mut runtime, "code", "priv_dir", &[compiler]).expect("priv_dir/1");
+        assert_eq!(string_of(answer), format!("{app_dir}/priv"));
+        assert!(app_dir.contains("compiler-"), "{app_dir}");
+    }
+
+    #[test]
+    fn code_priv_dir_of_an_unknown_app_is_bad_name() {
+        // The code server's name table holds no such application, so the answer is its own
+        // `{error, bad_name}` — for the atom form and the string form alike. Oracle-verified
+        // (OTP 29.1.1 / erts-17.1): `code:priv_dir(nosuchapp_xyz)` and
+        // `code:priv_dir("nosuchapp_xyz")` ⇒ `{error,bad_name}`.
+        let Some(mut runtime) = system_runtime() else {
+            return;
+        };
+        let missing = atom(&mut runtime, "definitely_not_an_otp_app");
+        let answer = call(&mut runtime, "code", "priv_dir", &[missing]).expect("priv_dir/1");
+        assert_eq!(error_reason(&mut runtime, answer), "bad_name");
+
+        let named = chars(&mut runtime, "definitely_not_an_otp_app");
+        let answer = call(&mut runtime, "code", "priv_dir", &[named]).expect("priv_dir/1");
+        assert_eq!(error_reason(&mut runtime, answer), "bad_name");
+
+        // An empty list names nothing either (the oracle's `lookup_name/2` compares the raw
+        // term against the table's own strings), and neither does a list that is no char list.
+        let unnameable = {
+            let mut sink = beam_bifs::NullSink;
+            let mut context = crate::context::RuntimeContext::with_output(&mut runtime, &mut sink);
+            let element = context.atom("not_an_app").expect("the element atom");
+            terms::make_list(&mut context, &[element]).expect("a list")
+        };
+        for argument in [beam_term::NIL, unnameable] {
+            let answer = call(&mut runtime, "code", "priv_dir", &[argument]).expect("priv_dir/1");
+            assert_eq!(error_reason(&mut runtime, answer), "bad_name", "{argument:?}");
+        }
+    }
+
+    #[test]
+    fn code_priv_dir_guards_on_atom_or_list() {
+        // Oracle-verified: `code:priv_dir(42)` leaves `code.erl:980`'s `is_atom(App);
+        // is_list(App)` guard with no matching clause, so the call raises `function_clause`.
+        // Nothing is asked of the code path, so this holds on a code-path-less runtime.
+        let mut runtime = runtime();
+        let error = call(&mut runtime, "code", "priv_dir", &[make_small(42)])
+            .expect_err("code:priv_dir(42) raises");
+        assert_eq!(error.as_atom(), Some("function_clause"), "{error}");
+        assert!(
+            crate::error::unsupported_reason(&error).is_none(),
+            "a function_clause raise is a genuine error, not a capability gap: {error}"
+        );
+    }
+
+    #[test]
+    fn code_priv_dir_agrees_with_the_oracle() {
+        // The live-oracle cross-check: the oracle's own answers for a known application, an
+        // unknown one and a non-atom argument, compared against this runtime's.
+        let Some(mut runtime) = system_runtime() else {
+            return;
+        };
+        let Some(priv_dir) = oracle_probe("io:format(\"~s\",[code:priv_dir(kernel)])") else {
+            skip_oracle_loudly();
+            return;
+        };
+        let kernel = atom(&mut runtime, "kernel");
+        let ours = call(&mut runtime, "code", "priv_dir", &[kernel]).expect("priv_dir(kernel)");
+        assert_eq!(string_of(ours), priv_dir, "code:priv_dir(kernel)");
+
+        // An unknown application: both answer the code server's own pair.
+        let Some(answer) = oracle_probe("io:format(\"~p\",[code:priv_dir(nosuchapp_xyz)])") else {
+            skip_oracle_loudly();
+            return;
+        };
+        assert_eq!(answer, "{error,bad_name}", "the oracle's own pair");
+        let missing = atom(&mut runtime, "nosuchapp_xyz");
+        let ours = call(&mut runtime, "code", "priv_dir", &[missing]).expect("priv_dir/1");
+        assert_eq!(error_reason(&mut runtime, ours), "bad_name");
+
+        // A non-atom argument: the oracle raises the same class this runtime reports.
+        let Some(shape) = oracle_probe(
+            "try code:priv_dir(42) catch Class:Reason -> io:format(\"~p:~p\",[Class,Reason]) end",
+        ) else {
+            skip_oracle_loudly();
+            return;
+        };
+        assert_eq!(shape, "error:function_clause", "the oracle's own raise shape");
+        let error = call(&mut runtime, "code", "priv_dir", &[make_small(42)])
+            .expect_err("code:priv_dir(42) raises");
+        assert_eq!(error.as_atom(), Some("function_clause"), "{error}");
+    }
+
+    /// The oracle `erl`: `$ERTS_ORACLE` when it is an executable, else `erl` on `$PATH` (the
+    /// convention `tools/differential` uses), resolved **without running** it.
+    fn oracle_erl() -> Option<std::path::PathBuf> {
+        if let Some(value) = std::env::var_os("ERTS_ORACLE") {
+            let program = std::path::PathBuf::from(&value);
+            if is_executable(&program) {
+                return Some(program);
+            }
+        }
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(|dir| dir.join("erl"))
+            .find(|candidate| is_executable(candidate))
+    }
+
+    /// Whether `candidate` is an executable regular file.
+    fn is_executable(candidate: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::metadata(candidate) {
+            Ok(metadata) => metadata.is_file() && metadata.permissions().mode() & 0o111 != 0,
+            Err(_) => false,
+        }
+    }
+
+    /// Runs the oracle `erl` on the `-eval` `program` and answers its trimmed stdout, or
+    /// `None` when the oracle cannot be resolved or the probe cannot complete.
+    ///
+    /// The program always ends with `-s init stop`, so a probe terminates on its own (a bare
+    /// `erl -noshell` never exits).
+    fn oracle_probe(program: &str) -> Option<String> {
+        let output = std::process::Command::new(oracle_erl()?)
+            .args(["-noshell", "-eval", program, "-s", "init", "stop"])
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// The loud banner for a skipped oracle comparison — a missing toolchain is never a
+    /// silent pass.
+    fn skip_oracle_loudly() {
+        eprintln!();
+        eprintln!("======= beam_rt native/code.rs ORACLE CROSS-CHECK SKIPPED =======");
+        eprintln!("no `erl` on $PATH (and no executable $ERTS_ORACLE): the oracle comparison");
+        eprintln!("cannot run. Set $ERTS_ORACLE (or install Erlang/OTP) and re-run. NOT a pass.");
+        eprintln!("===============================================================");
+        eprintln!();
     }
 
     #[test]

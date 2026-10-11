@@ -663,7 +663,6 @@ fn the_send_predicate_selects_only_the_message_sending_bifs() {
     assert!(RuntimeContext::uses_send_hook("erlang", "!", 2));
     for (module, function, arity) in [
         ("erlang", "send", 1),
-        ("erlang", "send", 3),
         ("erlang", "send_after", 3),
         ("erlang", "send_nosuspend", 2),
         ("erlang", "self", 0),
@@ -1019,7 +1018,7 @@ fn hook_rosters() -> [HookRoster; 13] {
             needs: beam_bifs::needs_send_hook,
             gate: Some(RuntimeContext::uses_send_hook as HookPred),
             misses: &[
-                ("erlang", "send", 3),
+                ("erlang", "send", 1),
                 ("erlang", "self", 0),
                 ("erlang", "!", 1),
                 ("maps", "send", 2),
