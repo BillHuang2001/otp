@@ -2077,6 +2077,45 @@ impl ExecutionContext for RuntimeContext<'_> {
             None => Ok(None),
         }
     }
+
+    /// The **in-machine closure-apply seam** (`call_fun`/`call_fun2`): resolves a `.beam`
+    /// **local** (`make_fun3`) closure to the module that defines it and the lambda's `FunT`
+    /// entry label, so the engine enters the closure body **in this machine** — exactly as C's
+    /// `call_fun` dispatches to the fun body's code in the same process
+    /// (`../../erts/emulator/beam/beam_common.c:1604`).
+    ///
+    /// A `receive` inside the closure body therefore suspends **this** process through the
+    /// ordinary [`beam_engine::RunOutcome::Wait`] path (and a raise lands in the caller's live
+    /// `try`/`catch`), instead of the value-returning [`Self::apply_fun`] fallback running the
+    /// body on a fresh nested machine — a suspension a **scheduled** slice's context
+    /// ([`RuntimeContext::for_process`], `may_pump_scheduler() == false`) cannot resume, since a
+    /// slice may never re-enter the scheduler.
+    ///
+    /// The resolution is the shared [`RuntimeContext::local_fun_target`] seam, so a closure
+    /// resolves through exactly the lookup a fun-bodied process entry uses. The `module` it
+    /// hands back is the **same** `Arc<Module>` the code server caches, which the engine
+    /// requires because it dedups module contexts by `Arc::ptr_eq`.
+    ///
+    /// `Ok(None)` — the seam's "I cannot run this closure in your machine" — is passed through
+    /// for the two fun kinds with no local label entry, exactly the cases
+    /// [`RuntimeContext::local_fun_target`] reports `Ok(None)` for: an **external** fun
+    /// (`fun M:F/A`, the `EXPORT_EXT` encoding) and the `-eval` evaluator's own closure. They
+    /// keep the value-returning [`Self::apply_fun`] fallback, byte-identical to a host without
+    /// the seam.
+    ///
+    /// The engine places the free variables itself (`x(arity..)`, C's `call_fun` order), so
+    /// `local_fun_target` is consulted purely for resolution/validation — its combined
+    /// `args ++ free` argument list is **not** used here.
+    fn resolve_local_fun(
+        &mut self,
+        fun: Eterm,
+        args: &[Eterm],
+    ) -> Result<Option<(Arc<Module>, Label)>> {
+        Ok(self
+            .local_fun_target(fun, args)?
+            .map(|target| (target.module, target.label)))
+    }
+
     /// Ensures `heap_need` words are available for the running code, collecting the running
     /// process's own young heap when it cannot serve them (see [`crate::context::gc`]).
     ///
