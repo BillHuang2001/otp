@@ -61,11 +61,12 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
 
 ### `collector.rs` — the two-generation collector
 - `pub enum CollectionKind { Minor, Major }`; `pub struct Collection { pub kind, pub stats: GcStats }`
-- `pub struct Collector` — owns `young` + `mature` `HeapSpace`s and the `HeapPolicy`.
+- `pub struct Collector` — owns the young nursery `Nursery` chain (`src/nursery.rs`) + a `mature`
+  `HeapSpace` and the `HeapPolicy`.
   - `new(policy)`; `with_allocator(alloc, policy) -> Result<Collector>`
-  - `policy()`; `young()`/`young_mut()` (the mutator allocates here); `mature() -> &HeapSpace`;
-    `stats() -> GcStats`; `minor_gcs() -> u32` (minors since the last fullsweep, `GEN_GCS`);
-    `impl HeapObservable`
+  - `policy()`; `young()`/`young_mut()` (the **current** nursery space, where the mutator allocates);
+    `mature() -> &HeapSpace`; `stats() -> GcStats`; `minor_gcs() -> u32` (minors since the last fullsweep,
+    `GEN_GCS`); `impl HeapObservable`
   - `should_collect(need_words) -> bool` — true when the nursery cannot satisfy `need_words` more
   - `collect(&mut self, roots: &mut [Eterm]) -> Result<Collection>` — picks minor vs major (policy),
     escalating a would-not-fit minor to a major
