@@ -24,7 +24,29 @@ change log.
 ## Performance measurement
 
 ### Per-call overhead regression harness
-**`examples/perf_bif.rs`** (run `erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml --release -p beam_rt --example perf_bif`): compiles `pc:add/2`/`pc:loop/2` with `erlc` and reports the marginal ns/call as a **two-point slope** `(t(N2)-t(N1))/(N2-N1)` (default N1=16M/N2=64M, best-of-5 + a warm-up per point), cancelling process start-up exactly; a non-positive slope auto-scales then fails loudly rather than reporting noise. `N-1`/`N+1` are `gc_bif` **instructions** the baseline tier inlines natively, so the figure is the native-loop cost (~2.5 ns/iter), NOT a BIF round trip (a non-inlinable BIF like `trunc/1` is ~116 ns/iter). `$PERF_BASELINE_ADD_NS`/`$PERF_BASELINE_LOOP_NS` add a delta/speedup column.
+**`examples/perf_bif.rs`** (run `erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml --release -p beam_rt --example perf_bif`): compiles `pc:add/2`/`pc:loop/2` with `erlc` and reports the marginal ns/call as a **two-point slope** `(t(N2)-t(N1))/(N2-N1)` (default N1=16M/N2=64M, best-of-5 + a warm-up per point), cancelling process start-up exactly; a non-positive slope auto-scales then fails loudly rather than reporting noise. `N-1`/`N+1` are `gc_bif` **instructions** the baseline tier inlines natively, so the figure is the native-loop cost (~2.5 ns/iter), NOT a BIF round trip — **this fixture cannot measure the registered-BIF path at all** (a BIF it does not inline, such as `trunc/1`, needs the separate recipe in the dispatch-cost section below). `$PERF_BASELINE_ADD_NS`/`$PERF_BASELINE_LOOP_NS` add a delta/speedup column.
 
 ### Dispatch cost (registered-BIF path)
-The registered-BIF path (`call_registered`) runs per call, so any handle built there must be gated by a `uses_*` predicate — a snapshot that walks the code server / process table / ETS registry, or clones the caller module, is a per-call cost. Measured: ~116 ns/call for a non-inlinable BIF (e.g. `trunc/1`), against ~10.6 µs before the `RuntimeMemory`/`FunIdentityBridge` handles were gated; the residual is dominated by `beam_bifs`'s per-lookup owned-`String` registry keys (see the `beam_bifs` Handoff in `CONTEXT.md`). An inlinable `gc_bif` arithmetic op in a tail loop is natively compiled at ~2.5 ns/iteration by the baseline tier. Measure with `examples/perf_bif.rs` before and after any change to the dispatch prologue.
+The registered-BIF path (`call_registered`) runs per call, so any handle built there must be gated by a `uses_*` predicate — a snapshot that walks the code server / process table / ETS registry, or clones the caller module, is a per-call cost — and the per-key prologue (the registry lookup plus the whole `uses_*` roster) is answered from the per-context [`dispatch` memo](src/context/CONTEXT.md#the-dispatch-memo--dispatchhooks) on every call after the first, so it is paid once per key per run. An inlinable `gc_bif` arithmetic op in a tail loop is natively compiled at ~2.5 ns/iteration by the baseline tier.
+
+Measuring the **registered-BIF** path needs a loop body carrying a BIF the baseline tier does **not** inline (so the `gc_bif`/`call_ext` really reaches `call_bif` → the registry), driven through the runtime's own `run` action, with the two loop points **interleaved** — the host is shared, so only interleaved minima are comparable. Recorded on that method: **≈ 283 → ≈ 76 ns/iter** for `pb:tr/2`'s `trunc/1` across the dispatch-memo change, against the pre-memo **≈ 302 ns/call** (`nb:bif/2`, `trunc/1`) and **≈ 322 ns/call** (`nb2:absb/2`, `abs/1`) in [`PERF.md`](PERF.md)'s *Registered-BIF (non-inlinable) per-call* section, which also holds the pre-`RuntimeMemory`/`FunIdentityBridge`-gating figure (~10.6 µs/call). That section is the authority for the `nb*` fixtures; no number is repeated here as a fresh measurement.
+
+Reproduce the `pb:tr/2` figure:
+
+```sh
+erts_rust/scripts/cargo.sh build --release --manifest-path erts_rust/Cargo.toml -p beam_rt
+mkdir -p "$TMPDIR/pbrepro"
+printf '%s\n' '-module(pb).' '-export([tr/2]).' 'tr(0, Acc) -> Acc;' \
+  'tr(N, Acc) -> tr(N-1, Acc + trunc(N)).' > "$TMPDIR/pbrepro/pb.erl"
+erlc -o "$TMPDIR/pbrepro" "$TMPDIR/pbrepro/pb.erl"
+# two interleaved points, min of N per point, slope (t(N2)-t(N1))/(N2-N1):
+for i in 1 2 3; do
+  for N in 16000000 64000000; do
+    start=$(date +%s%N)
+    erts_rust/target/release/beam_rt run "$TMPDIR/pbrepro/pb.beam" pb:tr/2 "$N" 0 > /dev/null
+    echo "N=$N $(( ($(date +%s%N) - start) / 1000000 )) ms"
+  done
+done
+```
+
+`trunc/1` compiles to a `gc_bif` the baseline tier leaves to the interpreter, so each iteration is a real `call_bif` → `call_registered` round trip; the `-`/`+` around it are inlined and cancel in the slope.
