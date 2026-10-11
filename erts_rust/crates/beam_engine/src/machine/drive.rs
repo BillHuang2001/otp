@@ -269,7 +269,9 @@ mod tests {
 
     use crate::context::{ExecutionContext, MinimalContext};
     use crate::machine::test_support::{seam, Fixture};
-    use crate::machine::{Machine, RunOutcome};    /// The caller `m`: `run/0` allocates, `call_ext`s `c:<target>/0`, then receives
+    use crate::machine::{Machine, RunOutcome};
+
+    /// The caller `m`: `run/0` allocates, `call_ext`s `c:<target>/0`, then receives
     /// (suspending on the empty mailbox).
     fn caller_then_receive(target: &str) -> (Module, Atom) {
         let mut f = Fixture::new("m");
@@ -547,7 +549,9 @@ mod tests {
             stack: &mut [Eterm],
         ) -> Result<()> {
             self.inner.ensure_heap(heap_need, live, x_regs, stack)
-        }        fn reduce(&mut self, n: u32) -> Result<()> {
+        }
+
+        fn reduce(&mut self, n: u32) -> Result<()> {
             self.charges.push(n);
             if let Some(budget) = self.budget {
                 if self.charges.len() as u32 > budget {
