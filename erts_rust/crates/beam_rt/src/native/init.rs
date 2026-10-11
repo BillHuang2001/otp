@@ -938,11 +938,21 @@ mod tests {
 
     // -- init:restart/0 and init:boot/1 ---------------------------------------
 
-    /// A binary of `bytes`, built on the runtime's pointer-stable arena.
+    /// `bytes` as an Erlang binary on a runtime heap that never moves and is never reset.
+    ///
+    /// Built by [`beam_codec::term::make_binary`] — the width-independent `ErlHeapBits`
+    /// writer the runtime's own `prim_file:read_file/1` uses — rather than
+    /// [`terms::make_heap_binary`], which refuses a byte string longer than
+    /// [`ERL_ONHEAP_BINARY_LIMIT`](beam_term::refc::ERL_ONHEAP_BINARY_LIMIT) (64) bytes.
+    /// The `-boot` value below **is** a `$TMPDIR` scratch path, so its length is the
+    /// environment's to decide: a longer `$TMPDIR` (or a wider pid/counter in the
+    /// scratch name) must not turn this test into a spurious failure.
+    /// [`terms::binary_bytes`] — what `init:boot/1`'s argument reader uses — reads the
+    /// term either way, so the assertions are unaffected.
     fn binary(runtime: &mut Runtime, bytes: &[u8]) -> Eterm {
         let mut sink = beam_bifs::NullSink;
         let mut context = RuntimeContext::with_output(runtime, &mut sink);
-        terms::make_heap_binary(&mut context, bytes).expect("a binary")
+        beam_codec::term::make_binary(context.eval_heap(), bytes).expect("a binary")
     }
 
     /// A list of `elements`, built on the runtime's pointer-stable arena.
