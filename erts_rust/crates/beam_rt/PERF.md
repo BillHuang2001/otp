@@ -560,6 +560,136 @@ The shape of what remains (the `AFTER` analysis minus the now-removed eager whol
   budget is now charged per interpreted instruction, so a non-allocating loop *is* pre-emptible there.
   That is a pre-emption property, not a cost one: the two columns above differ only by the tier.
 
+### The interpreter path's per-instruction reduction charge — controlled A/B
+
+The `INTERP` column above and `## The one-shot cold-start cost` both compare **tiers**; neither
+isolates the cost of the **per-instruction reduction charge** itself. Under
+`BEAM_RT_TIER=interpreter` every scheduled process pays, for each interpreted instruction, one
+`&mut dyn ExecutionContext` crossing plus a u32 decrement/compare: `Machine::drive` calls
+`ctx.reduce(1)?` whenever it latched `wants_reduce() == true`
+(`crates/beam_engine/src/machine/drive.rs`), and `runner/budget.rs::BudgetContext` is the only host
+that answers `true` (the single-pass `RuntimeContext` answers `false`, so those runs skip the
+crossing). A controlled A/B at **one HEAD**, with nothing else changed, measures what that charge
+costs.
+
+| variant | temporary edit (never committed) | what it removes |
+|---|---|---|
+| **A — charge ON** | none — the shipped behaviour | — |
+| **B — charge OFF** | `BudgetContext::wants_reduce() -> false` | the **hook crossing**, the charge, **and** the slice pre-emptions the charge induced on any stretch that reaches no heap-admission point |
+
+**Variant (ii) was chosen deliberately**, over the alternative (keep `wants_reduce() == true`, make
+`reduce` return `Ok(())`): that variant would have measured the charge *arithmetic* alone, whereas
+variant (ii) removes the whole mechanism and is therefore the **full-cost upper bound** on the
+per-instruction dyn call. Read every delta below as that upper bound, not as pure call overhead.
+
+| item | value |
+|---|---|
+| HEAD (one, for both variants) | `06bf44d962306b7ae91891e040f734919a494b1f` (`06bf44d962`, 2026-10-12 06:49 +0800) |
+| Date (UTC) | 2026-10-11 23:10–23:17 UTC |
+| Host / kernel | Linux 7.2.9 `x86_64`, `nproc` = **14** (the same shared, oversubscribed host) |
+| Toolchain | `rustc 1.98.1`, `cargo 1.98.0` |
+| Tier | `BEAM_RT_TIER=interpreter` (the charge is unreachable mid-block on the default baseline tier) |
+| Runtime side | `--runtime rust` only — the system-ERTS side cannot see this charge and would only double the wall time |
+| N | **5 per variant**, **alternated at run granularity** (`A B A B …`, 10 runs in ≈ 7 min) |
+| Host load (1-min `/proc/loadavg` immediately **before** each run) | A `1.06, 1.17, 1.01, 1.00, 1.00`; B `1.18, 1.18, 1.07, 1.00, 0.93` — ≈ **0.9–1.2** on a 14-CPU host, and ≤ 1.25 after every run (a light window: the `BEFORE`/`AFTER` load caveat does **not** apply to this pass) |
+| per-run figure | the report's `summary.min` for a sampled metric (`startup_ms`, `case_*_wall_ms`; 10 samples/case/run, 50 for `baseline` startup) and the scalar `value` for a throughput metric (`ns_per_call`/`ns_per_op`/`ns_per_element`) |
+| reported figure | **min over the 5** runs of that variant; the spread is that variant's full min–max over its 5 runs |
+
+```sh
+# 1. build the runtime + driver in release; keep the shipped binary aside as A
+erts_rust/scripts/cargo.sh build --release --manifest-path erts_rust/Cargo.toml -p bench -p beam_rt
+cp erts_rust/target/release/beam_rt $TMPDIR/ab/beam_rt.charge            # A — charge ON
+
+# 2. TEMPORARY, NON-COMMITTED edit to src/runner/budget.rs:
+#      fn wants_reduce(&self) -> bool { false }
+#    rebuild and keep the binary aside as B
+erts_rust/scripts/cargo.sh build --release --manifest-path erts_rust/Cargo.toml -p beam_rt
+cp erts_rust/target/release/beam_rt $TMPDIR/ab/beam_rt.nocharge         # B — charge OFF
+
+# 3. revert the edit completely — `git diff src/runner/budget.rs` is empty in the measured tree
+
+# 4. ten interleaved runs, host load recorded before each
+for v in charge nocharge charge nocharge charge nocharge charge nocharge charge nocharge; do
+  cp $TMPDIR/ab/beam_rt.$v erts_rust/target/release/beam_rt
+  cat /proc/loadavg >> $TMPDIR/ab/loadavg.log
+  BEAM_RT_TIER=interpreter erts_rust/target/release/bench run --full --runtime rust \
+    --workloads baseline,slice,foreign,list_walk,copy_bound,gc_bound --out-file $TMPDIR/ab/runN.json
+done
+```
+
+All ten reports are `status=ok` with **no** unsupported case and **no** below-timer-resolution note,
+so every row below is a real measurement (the raw JSON was written under `$TMPDIR/ab/` and is
+**ephemeral**, not committed — re-run the loop to regenerate).
+
+Result — `A/B > 1` ⇒ charge ON is dearer; the variant removed `Δ = A − B`. `baseline`/`slice` rows are
+**ms** (`startup_ms` / `case_*_wall_ms`); every other row is **ns** per unit.
+
+| workload | case | A (min5) | A range (5) | B (min5) | B range (5) | Δ (A−B) | A/B | verdict |
+|---|---|---|---|---|---|---|---|---|
+| `baseline` | — | 13.778 | 13.778–29.519 | 13.733 | 13.733–22.782 | +0.045 | 1.003× | below the spread |
+| `slice` | `add` | 13.944 | 13.944–22.224 | 14.041 | 14.041–18.066 | −0.097 | 0.993× | below the spread |
+| `slice` | `fib` | 14.076 | 14.076–22.308 | 14.043 | 14.043–25.821 | +0.033 | 1.002× | below the spread |
+| `slice` | `pick` | 13.994 | 13.994–15.611 | 14.080 | 14.080–22.873 | −0.086 | 0.994× | below the spread |
+| `slice` | `calendar_last_day` | 14.654 | 14.654–25.223 | 14.842 | 14.842–25.910 | −0.187 | 0.987× | below the spread |
+| `slice` | `queue_from_size` | 17.081 | 17.081–25.941 | 18.193 | 18.193–23.692 | −1.112 | 0.939× | below the spread |
+| `slice` | `gb_trees_size` | 14.779 | 14.779–25.063 | 14.735 | 14.735–22.510 | +0.044 | 1.003× | below the spread |
+| `slice` | `base64_encode_size` | 15.314 | 15.314–26.073 | 16.065 | 16.065–25.861 | −0.752 | 0.953× | below the spread |
+| `slice` | `ordsets_from_size` | 14.401 | 14.401–22.709 | 15.486 | 15.486–22.813 | −1.085 | 0.930× | below the spread |
+| `slice` | `string_str_length` | 27.424 | 27.424–33.580 | 29.850 | 29.850–33.510 | −2.426 | 0.919× | below the spread |
+| `foreign` | `cowboy_bstr:to_lower/1` | 18 911 | 18 911–19 594 | 18 353 | 18 353–18 798 | +558 | 1.030× | disjoint ranges; Δ inside A's own range |
+| `foreign` | `cowboy_bstr:capitalize_token/1` | 23 739 | 23 739–23 884 | 22 857 | 22 857–23 297 | +882 | 1.039× | **above the spread** (ranges disjoint) |
+| `foreign` | `emqx_base62:encode/1` | 11 625 | 11 625–11 996 | 11 259 | 11 259–11 533 | +366 | 1.032× | disjoint ranges; Δ inside A's own range |
+| `foreign` | `emqx_base62:decode/1` | 19 998 | 19 998–20 499 | 17 403 | 17 403–17 861 | +2 595 | 1.149× | **above the spread** (ranges disjoint) |
+| `copy_bound` | `etf_roundtrip` | 72 172 | 72 172–73 961 | 72 560 | 72 560–73 646 | −389 | 0.995× | below the spread |
+| `copy_bound` | `ets_copy` | 3 192 | 3 192–3 261 | 3 084 | 3 084–3 205 | +108 | 1.035× | below the spread |
+| `copy_bound` | `send_recv` | 146 599 | 146 599–150 600 | 147 884 | 147 884–150 961 | −1 285 | 0.991× | below the spread |
+| `list_walk` | — | 145.6 | 145.6–163.0 | 134.3 | 134.3–145.5 | +11.3 | 1.084× | disjoint by 0.1 ns; Δ inside A's own range |
+| `gc_bound` | `churn` | 239 053 | 239 053–245 901 | 237 677 | 237 677–240 416 | +1 376 | 1.006× | below the spread |
+
+**Verdict.**
+
+- **Above the spread — the charge's full cost is resolved:** `emqx_base62:decode/1` **+14.9 %**
+  (19 998 → 17 403 ns; ranges disjoint, Δ exceeds the larger range) and
+  `cowboy_bstr:capitalize_token/1` **+3.9 %** (23 739 → 22 857 ns; ranges disjoint, same test).
+- **Sign consistent, magnitude at the noise floor:** `cowboy_bstr:to_lower/1` (+3.0 %),
+  `emqx_base62:encode/1` (+3.3 %) and `list_walk` (+8.4 %) have **disjoint** 5-run ranges (5/5
+  rank-separated — `list_walk` only nominally so: A min 145.59 vs B max 145.46 ns, a 0.13 ns margin),
+  but in each case the delta of minima is *inside* the larger set's own min–max range. The sign is
+  rank-separable; the **magnitude is not separable from the noise floor at this N** — which is a
+  different, weaker claim than a quotable ratio.
+- **Not separable from the noise floor at this N, sign not even consistent:** every `baseline` and
+  `slice` row, all three `copy_bound` rows and `gc_bound churn` — the ranges overlap, and
+  `slice add`, `slice pick`, `slice calendar_last_day`, `slice queue_from_size`,
+  `slice base64_encode_size`, `slice ordsets_from_size`, `slice string_str_length`,
+  `copy_bound etf_roundtrip` and `copy_bound send_recv` read *cheaper* under A.
+
+Which rows could show it at all:
+
+- **Process-startup-dominated — cannot show it.** `baseline` `startup_ms` (≈ 13.7 ms of process boot)
+  and every `slice` row: `slice` is scored as **whole-process wall for one call per OS process**
+  (13.9–27.4 ms), of which the interpreted work is a small fraction. Their A/B ranges overlap with
+  10 %–115 % relative spreads.
+- **Interpreted-work marginals — the rows that *can* show it.** `foreign` (per `cowboy_bstr` /
+  `emqx_base62` call) is the only family that resolved it, at **+3.0 % to +14.9 %** of per-call time.
+  `copy_bound`'s three cases are dominated by the copy itself (`term_to_binary`/`binary_to_term`,
+  `ets:insert`/`lookup`, a send round-trip) and `gc_bound churn` by the allocate-and-abandon work plus
+  any collection (≈ 239 µs/op), so one reduction charge is a small share there — and their
+  startup-cancelled marginals are noisier (2–4 % min–max per set), which leaves it unresolved at
+  N = 5.
+- The case-to-case deltas span **+3.0 % to +14.9 %** while the three disjoint-but-inside-spread rows
+  sit at ≈ +3 % to +8 %, so the charge does **not** behave as a single per-instruction constant across
+  these workloads. That is consistent with variant (ii) also removing the **pre-emptions** the charge
+  induced (a loop that still reaches the `ensure_heap` doors keeps being charged in B; one that does
+  not is never pre-empted in B) — which is exactly why the figures here are stated as an **upper
+  bound** on the pure dyn call.
+
+**Take-away for the tree.** On the **interpreter** tier the shipped per-instruction charge costs up to
+**≈ 15 %** of per-call time on the most instruction-bound workload measured here and **≈ 3–4 %** on
+the other three `foreign` shapes; on the **default baseline-JIT** tier the hook is unreachable
+mid-block, so this cost is specific to the interpreter path and no startup-dominated or
+copy/GC-dominated row resolves it at N = 5. Nothing here changes the pre-emption property the charge
+exists for (see `src/runner/budget.rs`) — it only prices it.
+
 ## Caveats that invalidate a comparison (`CURRENT`)
 
 - **Absolute latencies are load-polluted**, and this pass ran in a **light window** (≈ 0.8–14 versus
