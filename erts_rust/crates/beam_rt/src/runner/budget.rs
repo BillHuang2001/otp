@@ -34,6 +34,35 @@
 //! [`RuntimeContext`] unchanged, so a scheduled process reports `call`/`return_from`/
 //! `return_to` events exactly as the single-pass `Runtime::run_*` path does and a
 //! `call_ext*` the host can run in-machine is entered in this very slice.
+//!
+//! # Why the per-instruction `reduce` hook is deliberately **not** charged
+//!
+//! `beam_engine` offers a second charging point, [`reduce`](ExecutionContext::reduce),
+//! called **once per interpreted instruction** — the hook that exists precisely because
+//! an allocating loop's `test_heap` is not the only shape that can monopolise a
+//! scheduler (a native baseline-JIT block reaches it only at a deopt/block boundary, so
+//! a JIT-compiled loop is charged coarsely either way). This wrapper does **not** charge
+//! the budget there, and that is a correctness decision rather than an oversight:
+//! `Machine::drive` calls `reduce` *after* `step_instruction` has already **executed**
+//! the instruction (`crates/beam_engine/src/machine/drive.rs`), while the address the
+//! machine exposes for a resume (`Machine::current_code`) is recorded by
+//! `step_instruction` at that same instruction's entry. A pre-emption raised from
+//! `reduce` would therefore park the machine on an instruction *whose effect has
+//! already happened*, and the resumed slice (`Machine::resume_outcome_with_tier`)
+//! re-executes it — a **wrong result**, not a repeated no-op: `put_list x0 x1 x1`
+//! appends the head twice (the committed `tests/fixtures/preempt.beam`'s `alloc_loop/2`
+//! is exactly that shape), a `send` delivers twice, and a `call`/`call_last` pushes/pops
+//! a frame twice.
+//!
+//! The budget is therefore charged at the one door whose re-entry is provably a no-op —
+//! [`ensure_heap`](ExecutionContext::ensure_heap)/
+//! [`ensure_heap_full`](ExecutionContext::ensure_heap_full) (reached by
+//! `test_heap`/`allocate_heap`, whose *first* effect is the idempotent heap test) — and
+//! a non-allocating loop keeps the honest limit documented on
+//! [`RuntimeRunner::run`](crate::runner::RuntimeRunner): it has no admission point and
+//! so runs to its next `return`/`wait`. Closing that limit requires `beam_engine` to
+//! offer a charge *before* an instruction's effect (or to expose the folded successor
+//! address); it cannot be done from this crate without producing a wrong result.
 
 use std::sync::Arc;
 

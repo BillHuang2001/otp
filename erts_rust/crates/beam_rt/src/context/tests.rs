@@ -24,7 +24,7 @@ use beam_term::{atom_val, is_small, make_atom, make_small, signed_value, Atom, A
 
 use super::*;
 use crate::config::RuntimeConfig;
-
+use crate::context::test_support::{compile_fixtures, resolve_erlc, skip_loudly};
 fn runtime() -> Runtime {
     Runtime::new(RuntimeConfig::default()).expect("the default runtime")
 }
@@ -2017,6 +2017,87 @@ fn the_call_seam_enters_a_float_using_module_in_machine() {
         "an arity the callee does not export is refused"
     );
 }
+// ---------------------------------------------------------------------------------------
+// The cross-module call seam's idempotence (the observer guard on the cached arm)
+// ---------------------------------------------------------------------------------------
+
+/// The `idle` fixture module: a callee that imports nothing the seam guards, so it is entered
+/// in-machine like any ordinary `.beam` body.
+const SEAM_IDLE_SRC: &str = "-module(idle).
+-export([go/0]).
+go() -> ok.
+";
+
+/// The `obs` fixture module: a callee whose **own** code imports `erlang:load_nif/2`, which is
+/// exactly what [`module_observes_its_call_site`] keys on.
+const SEAM_OBS_SRC: &str = "-module(obs).
+-export([load/1]).
+load(Path) -> erlang:load_nif(Path, 0).
+";
+
+/// **The cross-module seam is idempotent for an already-cached observer callee.**
+///
+/// The native baseline tier resolves one `call_ext*` **twice** — its `jit_ext_call` arm asks
+/// [`RuntimeContext::resolve_external_call`] and, when it declines, the whole instruction is
+/// re-run by `Machine::step_instruction`, which asks the same seam again (see
+/// [`crate::runner::tier`]). The module-observer guard ([`module_observes_its_call_site`]) must
+/// therefore hold on the **already-cached** arm too: a callee that the *first* consultation
+/// loaded (and thereby cached) must still be refused the second time.
+///
+/// While the guard lived only on the on-demand-load arm, the second consultation answered
+/// `Ok(Some(..))` and the engine entered the callee in-machine under the **caller's** module
+/// identity — for a module whose own `init/1` runs `erlang:load_nif/2`, that identity is what
+/// the loader validates `ErlNifEntry.name` against, so the load failed with `bad_lib`. The
+/// `obs` fixture here is that shape (its `erlang:load_nif/2` import is what the guard keys on).
+///
+/// `idle` is the control the fix must leave **unchanged**: a non-observer callee is still
+/// entered in-machine, on both consultations.
+#[test]
+fn the_call_seam_is_idempotent_for_a_cached_observer_callee() {
+    let Some(erlc) = resolve_erlc() else {
+        skip_loudly(
+            "cached observer callee",
+            "no `erlc` (and none beside $ERTS_ORACLE either)",
+        );
+        return;
+    };
+    let dir = compile_fixtures(
+        &erlc,
+        "observer_idempotence",
+        &[("idle", SEAM_IDLE_SRC), ("obs", SEAM_OBS_SRC)],
+    );
+
+    let mut rt = runtime();
+    rt.add_code_path(dir.path());
+    let mut ctx = RuntimeContext::new(&mut rt);
+
+    // The first consultation finds `obs` uncached, loads it on demand and refuses it (it is an
+    // observer); the load is what caches it, so the **second** consultation takes the
+    // already-cached arm — the arm the fix added the guard to, and the one that used to admit
+    // it. Both answers must be the same refusal.
+    for consultation in 1..=2 {
+        assert!(
+            ctx.resolve_external_call("obs", "load", 1)
+                .expect("the seam reports a routing, never an error")
+                .is_none(),
+            "consultation {consultation} of an observer callee must be refused: entering a \
+             module whose own `erlang:load_nif/2` runs under the caller's identity is the \
+             `bad_lib` bug the seam is idempotent to prevent"
+        );
+    }
+
+    // The control: a non-observer callee is entered in-machine, on both consultations the JIT
+    // makes — the fix must not have widened the refusal to ordinary modules.
+    for consultation in 1..=2 {
+        assert!(
+            ctx.resolve_external_call("idle", "go", 0)
+                .expect("the seam reports a routing, never an error")
+                .is_some(),
+            "consultation {consultation} of a non-observer callee must be admitted in-machine"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The `RuntimeHooksBridge` arms beyond the timer/tag families.
 //

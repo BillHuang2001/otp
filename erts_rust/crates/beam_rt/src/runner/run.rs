@@ -305,16 +305,17 @@ impl ProcessRunner for RuntimeRunner<'_> {
                             // a `call_ext*` the host resolves through
                             // `ExecutionContext::resolve_external_call` (see
                             // `src/context/mod.rs`) is entered in this same machine as a
-                            // `Step::Enter`, and a native tier has no in-machine
-                            // module-context switch — it reports the typed
-                            // `unsupported("jit: module context switch …")`, which on this
-                            // path would become the process's exit reason. `tier` is
-                            // `Tier::Interpreter` for every module the predicate cannot
-                            // prove safe; the argument and the exact conditions are in
-                            // `super::tier`. The resume path above re-enters on the tier this
-                            // process was selected for (remembered in `ProcessEngine::tier`),
-                            // so both halves of a parked-and-resumed process stay
-                            // tier-equivalent.
+                            // `Step::Enter`. The baseline-JIT driver **does** implement that
+                            // in-machine module-context switch today — it is the `ENTER`
+                            // block-ABI word, resolved and re-entered in native code (see
+                            // `crates/beam_engine/src/jit/CONTEXT.md`) — so the predicate
+                            // below is a deliberately conservative *tier-selection* policy,
+                            // not an engine limitation. `tier` is `Tier::Interpreter` for
+                            // every module the predicate does not prove safe; the predicate
+                            // and its exact conditions live in `super::tier`. The resume path
+                            // above re-enters on the tier this process was selected for
+                            // (remembered in `ProcessEngine::tier`), so both halves of a
+                            // parked-and-resumed process stay tier-equivalent.
                             //
                             // The label entry stays the equivalence-preserving route to the
                             // export: `run_label_outcome_with_tier` calls `Machine::enter_run`,

@@ -9,17 +9,17 @@ that runs **as that pid** in the caller-supplied process table, takes the pid's 
 `receive` or pre-empted on the reduction budget) and records the observable result
 (the return value on the pointer-stable arena, or the raise's reason term).
 
-This node additionally owns **static execution-tier selection**: a process's *first* entry may run on
-either tier ([`beam_engine::Tier`]), and [`tier`] decides — soundly — whether the native baseline JIT
-may be used, or the interpreter must be. The selection is **remembered on the engine**
-(`ProcessEngine::tier`) and re-used by every later re-entry, so a process keeps its tier for its whole
-life. The **default is `Auto`**: the JIT exactly where [`tier::jit_is_switch_safe`] proves the entry
-module free of a module-context switch (`Step::Enter`), the interpreter everywhere else.
+This node additionally owns **the execution-tier decision**: a process's *first* entry runs on the
+native baseline tier ([`beam_engine::Tier::BaselineJit`]) unless the mode pins the interpreter, and the
+decision is **remembered on the engine** (`ProcessEngine::tier`) and re-used by every later re-entry,
+so a process keeps its tier for its whole life. The **default is `Auto`**, which selects the baseline
+tier for **every** process entry: the engine's driver handles the module-context switch itself, so no
+per-module safety predicate exists (see `## The tier is sound for any module`).
 
 ## API Surface (crate-internal, `pub(crate)`)
 * [`entry`] — `ProcessEntry` (the runtime-scheduled entry: an export or a fun), `ProcessEngine`
   (per-pid machine/entry/parked state + the **remembered `tier`**) and `RunnerState`
-  (per-pid engine state, recorded `result`/`exit`, `jit_mode` override, `jit_safety` memo).
+  (per-pid engine state, recorded `result`/`exit`, `jit_mode` override).
 * [`run`] — `RuntimeRunner`: the `ProcessRunner` implementation (one reduction slice) — the tier
   selection (once, at the first entry) and the tier-aware first-entry/resume execution, the
   parked-machine root publication (`publish_parked_roots`/`resume_from_process_roots`), the
@@ -46,8 +46,8 @@ module free of a module-context switch (`Step::Enter`), the interpreter everywhe
   the sender machine's off-heap handles and make an engine-built off-heap send a `badarg`.
 * [`tier`] — `JitMode` (`Auto` (**the `#[default]`**) / `Interpreter` / `Baseline`),
   `mode_from_value(Option<&str>)` (**the pure** `BEAM_RT_TIER` value semantics),
-  `env_default()` (the memoized unset-variable default), `select_entry_tier(...)` and
-  `jit_is_switch_safe(runtime, module)` — the switch-safety predicate.
+  `env_default()` (the memoized unset-variable default) and `select_entry_tier(...)` — the single
+  tier-decision seam.
 * [`reason`] — the exit-reason translation only (`normal` + `exit_reason`); the finite-`receive`
   deadline recovery now lives in the engine (`Machine::wait_deadline`/`Machine::timeout_delay`), so no
   duplicated delay decoding remains here.

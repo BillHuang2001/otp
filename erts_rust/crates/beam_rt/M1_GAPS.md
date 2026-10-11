@@ -128,17 +128,18 @@ admission point; a `receive ... after T` whose delay is `after infinity` or is n
 positive integer (a Y-register slot) still parks; a **capability gap is uncatchable** on the runner path.
 
 ## Execution tier (`src/runner/tier.rs`)
-The runner's execution tier defaults to `JitMode::Auto`: a process's **first** entry runs on the native
-baseline JIT exactly where `jit_is_switch_safe` proves the entry module free of a module-context switch
-(no `Apply`/`ApplyLast`, every `CallExt*` target provably synchronous), and on the interpreter otherwise.
-`BEAM_RT_TIER` (`auto` default / `baseline` / `interpreter`) overrides it. The tier chosen at that first
-entry is **remembered on the process** (`ProcessEngine::tier`), and every later slice — a pre-emption on
-the reduction budget or a `receive` park — resumes on it through `Machine::resume_outcome_with_tier`, so
-a native-tier process is not demoted to the interpreter mid-life (a `Tier::Interpreter` process is
-unchanged). Measured: **10.648 s → 0.079 s** on a non-allocating tail loop, **0.296 s → 0.205 s** on
-allocating tree recursion and **0.180 s → 0.086 s** (≈2.1×) on the committed `preempt:alloc_loop/1`
-allocating loop, with the full suite at mismatch 0 on the new default. Residual engine gap: the JIT
-driver has no in-machine module-context switch; detail in [`src/runner/CONTEXT.md`](src/runner/CONTEXT.md).
+The runner's execution tier defaults to `JitMode::Auto`: every process's **first** entry runs on the
+native baseline JIT. No per-module predicate guards it — the engine's baseline driver handles the
+module-context switch (`Step::Enter` via `switch_into`), so no module has to be inspected first; the
+one host-side obligation (the cross-module seam must be idempotent, because the native `call_ext*` arm
+re-consults it through the interpreter-step fallback) is enforced in
+`RuntimeContext::resolve_external_call`. `BEAM_RT_TIER` (`auto` default / `baseline` / `interpreter`)
+overrides it, with `interpreter` the kill switch. The tier chosen at that first entry is **remembered
+on the process** (`ProcessEngine::tier`), and every later slice — a pre-emption on the reduction
+budget or a `receive` park — resumes on it through `Machine::resume_outcome_with_tier`, so a
+native-tier process is not demoted to the interpreter mid-life (a `Tier::Interpreter` process is
+unchanged). Measured figures and commands are in [`src/runner/tier.rs`](src/runner/tier.rs) and
+[`TEST_STRATEGY.md`](TEST_STRATEGY.md).
 
 ## NIF (A.3)
 `load_nif/2` really `dlopen`s the shared object and runs the C NIF; a load failure is the oracle's
@@ -355,11 +356,9 @@ re-fetch.
   (holding the port-registry borrow across interpreted code turns every port BIF into the typed
   `unsupported`; `Runtime::with_port_table`), so the pass discharges the same obligations at its round
   boundaries through the exit observer (`src/runtime/ets_owner.rs`).
-* **`beam_engine`** — (a) an **in-machine module-context switch** in the baseline JIT driver (a
-  `Step::Enter` there is the typed `unsupported`; hence `runner::tier::jit_is_switch_safe` refuses an
-  `Apply`/`ApplyLast` or a non-provably-synchronous `CallExt*`); (b) a `MinimalContext` **arena
-  word/byte accessor** so `erlang:memory/0,1`'s `processes`/`processes_used` can be real on the
-  `-eval`/single-pass path; (c) an **allocation-admission root-set hook** — `ExecutionContext::alloc_words`
+* **`beam_engine`** — (a) a `MinimalContext` **arena word/byte accessor** so
+  `erlang:memory/0,1`'s `processes`/`processes_used` can be real on the
+  `-eval`/single-pass path; (b) an **allocation-admission root-set hook** — `ExecutionContext::alloc_words`
   carries no root set, so an `alloc_words`-only workload is never collected.
 * **`beam_bifs` / `src/context` — the node identity.** The live node atom is fed from
   `Runtime::local_node()` and stamped on every `call_registered` arm, so `erlang:node/0` and the node atom
