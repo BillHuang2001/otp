@@ -26,7 +26,8 @@
  *   select_noservice/0    enif_select the host cannot service => -1
  *   select_x_bad/0        the same invalid-event path through enif_select_x
  *   select_x_ok/0         enif_select_x passes a serviced code through
- *   priv_data/0           enif_priv_data reaches the host's priv_data hook
+ *   priv_data/0           enif_priv_data answers the pointer nif_load stored
+ *                         (env->mod_nif->priv_data)
  *   make_copy/0           enif_make_copy with no copy engine => THE_NON_VALUE (0)
  *   alloc_env/0           enif_alloc_env reaches the host of the current NIF
  *                         call: the host's own pointer (or NULL without support)
@@ -132,7 +133,7 @@ static ERL_NIF_TERM select_x_ok(ErlNifEnv* env, int argc, const ERL_NIF_TERM arg
                                             enif_make_int(env, 1), NULL));
 }
 
-/* Whether enif_priv_data is non-NULL (the runtime's hook decides its value). */
+/* Whether enif_priv_data is non-NULL (the nif_load callback above stores a pointer). */
 static ERL_NIF_TERM priv_data(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
     (void)argc;

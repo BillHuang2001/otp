@@ -102,18 +102,24 @@
 //! * the `*_name` accessors return the object's own NUL-terminated name buffer, so a driver may
 //!   `strcmp` it against the name it passed to `*_create`.
 //!
-//! # Documented deviations from the oracle (inherited from [`crate::sync`]; never a wrong value)
+//! # Documented deviations from the oracle (mostly inherited from [`crate::sync`]; never a wrong
+//! value)
 //!
 //! The C makes every `enif_*` thread function a one-line forward to its `erl_drv_*` sibling
-//! (`erl_nif.c:2405-2441`), so both facades share one implementation and one deviation list:
+//! (`erl_nif.c:2405-2441`), so both facades share one implementation and one deviation list — the
+//! `*_name` accessors are the one place where the *facades* differ (see that bullet):
 //!
 //! * **A tid handle is the `pthread_t` bit pattern** (the C returns a per-thread `struct ErlDrvTid_ *`
 //!   record). `erl_drv_thread_self` therefore returns a handle that compares *equal* under
 //!   `erl_drv_equal_tids` to the tid a `erl_drv_thread_create` produced for the same thread, exactly
 //!   as the C guarantees; what differs is only the pointer's identity.
-//! * **An unnamed object's `*_name` accessor returns `NULL`**; the C returns the static string
-//!   `"unknown"` (`no_name`, `erl_drv_thread.c:99,135`). A *named* object returns the same string as
-//!   the C (a `strcmp` against the requested name passes on both).
+//! * **The `*_name` accessors answer the C's value for every live handle**: the name handed to
+//!   `*_create`, or the C's static string `"unknown"` (`no_name`, `erl_drv_thread.c:99,135`, stored in
+//!   the handle at `:170`/`:264`/`:341`/`:639`/`:678`) for a handle created with a NULL name — `NULL`
+//!   only for a **null handle** (`erl_drv_thread.c:198,283,365,656`). [`crate::sync`] keeps the unnamed
+//!   state as a *null* name and this file renders it ([`sync::no_name`], [`rendered_name`]). The
+//!   **NIF** facade over that same layer (`crate::nif::enif`, a sibling node) still answers `NULL`
+//!   there: it is the one remaining divergence in this family.
 //! * **`erl_drv_thread_name` is `NULL` for a thread this layer did not create**; the C mints a
 //!   `drv_thr = 0` record with `name = "unknown"` for any other thread
 //!   (`erl_drv_thread.c:664-684`). After a `erl_drv_thread_join` the entry is retired and the name
@@ -272,8 +278,30 @@ pub unsafe extern "C" fn erl_drv_mutex_unlock(mtx: *mut ErlDrvMutex) {
     unsafe { sync::mutex_unlock(mutex_handle(mtx)) }
 }
 
-/// `char *erl_drv_mutex_name(ErlDrvMutex *mtx)` (`erl_driver.h:493`) — the handle's debug name,
-/// `NULL` for a null handle or an unnamed mutex.
+/// Render a shared-layer `*_name` result the way the C's accessors do
+/// (`erl_drv_thread.c:198`, `:283`, `:365`, `:656`: `handle ? handle->name : NULL`).
+///
+/// A **null handle** answers `NULL`. A **live handle** never answers `NULL` in the C: a handle created
+/// with a NULL name carries the static `no_name` string (`"unknown"`, `erl_drv_thread.c:99,135`,
+/// stored at `:170`/`:264`/`:341`/`:639`). [`crate::sync`] represents that state as a *null* name, so
+/// it is rendered as the C's `no_name` here ([`sync::no_name`]).
+///
+/// `live` must be `true` only for a non-null handle that really was created through this family;
+/// `name` is the shared layer's name for it ([`sync::mutex_name`] &c.).
+fn rendered_name(live: bool, name: *mut c_char) -> *mut c_char {
+    if !live {
+        core::ptr::null_mut()
+    } else if name.is_null() {
+        sync::no_name()
+    } else {
+        name
+    }
+}
+
+/// `char *erl_drv_mutex_name(ErlDrvMutex *mtx)` (`erl_driver.h:493`) — the handle's debug name.
+///
+/// The name [`erl_drv_mutex_create`] was handed, the static string `"unknown"` for a mutex created
+/// with a NULL name (`no_name`, `erl_drv_thread.c:99,170`), or `NULL` for a null handle (`:198`).
 ///
 /// The pointer is valid until the handle is destroyed.
 ///
@@ -282,7 +310,9 @@ pub unsafe extern "C" fn erl_drv_mutex_unlock(mtx: *mut ErlDrvMutex) {
 #[no_mangle]
 pub unsafe extern "C" fn erl_drv_mutex_name(mtx: *mut ErlDrvMutex) -> *mut c_char {
     // SAFETY: `mtx` is null or a live handle (the caller contract).
-    unsafe { sync::mutex_name(mutex_handle(mtx)) }
+    let handle = unsafe { mutex_handle(mtx) };
+    // SAFETY: `handle` is null or a live mutex handle (as above); the accessor only reads its name.
+    rendered_name(!handle.is_null(), unsafe { sync::mutex_name(handle) })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -347,15 +377,20 @@ pub unsafe extern "C" fn erl_drv_cond_wait(cnd: *mut ErlDrvCond, mtx: *mut ErlDr
     unsafe { sync::cond_wait(cond_handle(cnd), mutex_handle(mtx)) }
 }
 
-/// `char *erl_drv_cond_name(ErlDrvCond *cnd)` (`erl_driver.h:494`) — the handle's debug name, `NULL`
-/// for a null handle or an unnamed condition variable.
+/// `char *erl_drv_cond_name(ErlDrvCond *cnd)` (`erl_driver.h:494`) — the handle's debug name.
+///
+/// The name [`erl_drv_cond_create`] was handed, the static string `"unknown"` for a condition variable
+/// created with a NULL name (`no_name`, `erl_drv_thread.c:99,264`), or `NULL` for a null handle
+/// (`:283`).
 ///
 /// # Safety
 /// `cnd` must be null or a live handle from [`erl_drv_cond_create`].
 #[no_mangle]
 pub unsafe extern "C" fn erl_drv_cond_name(cnd: *mut ErlDrvCond) -> *mut c_char {
     // SAFETY: `cnd` is null or a live handle (the caller contract).
-    unsafe { sync::cond_name(cond_handle(cnd)) }
+    let handle = unsafe { cond_handle(cnd) };
+    // SAFETY: `handle` is null or a live condition-variable handle (as above).
+    rendered_name(!handle.is_null(), unsafe { sync::cond_name(handle) })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -453,15 +488,19 @@ pub unsafe extern "C" fn erl_drv_rwlock_rwunlock(rwlck: *mut ErlDrvRWLock) {
     unsafe { sync::rwlock_write_unlock(rwlock_handle(rwlck)) }
 }
 
-/// `char *erl_drv_rwlock_name(ErlDrvRWLock *rwlck)` (`erl_driver.h:495`) — the handle's debug name,
-/// `NULL` for a null handle or an unnamed lock.
+/// `char *erl_drv_rwlock_name(ErlDrvRWLock *rwlck)` (`erl_driver.h:495`) — the handle's debug name.
+///
+/// The name [`erl_drv_rwlock_create`] was handed, the static string `"unknown"` for a lock created
+/// with a NULL name (`no_name`, `erl_drv_thread.c:99,341`), or `NULL` for a null handle (`:365`).
 ///
 /// # Safety
 /// `rwlck` must be null or a live handle from [`erl_drv_rwlock_create`].
 #[no_mangle]
 pub unsafe extern "C" fn erl_drv_rwlock_name(rwlck: *mut ErlDrvRWLock) -> *mut c_char {
     // SAFETY: `rwlck` is null or a live handle (the caller contract).
-    unsafe { sync::rwlock_name(rwlock_handle(rwlck)) }
+    let handle = unsafe { rwlock_handle(rwlck) };
+    // SAFETY: `handle` is null or a live read/write-lock handle (as above).
+    rendered_name(!handle.is_null(), unsafe { sync::rwlock_name(handle) })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -650,19 +689,31 @@ pub unsafe extern "C" fn erl_drv_thread_join(
     unsafe { sync::thread_join(tid_handle(tid), respp) }
 }
 
-/// `char *erl_drv_thread_name(ErlDrvTid tid)` (`erl_driver.h:496`) — the thread's debug name, or
-/// `NULL` for a null handle, an unnamed thread, a thread this layer did not create and a thread
-/// that has already been joined.
+/// `char *erl_drv_thread_name(ErlDrvTid tid)` (`erl_driver.h:496`) — the thread's debug name.
 ///
-/// The pointer is a NUL-terminated copy of the name passed to [`erl_drv_thread_create`], valid
-/// until that thread is joined.
+/// The name [`erl_drv_thread_create`] was handed, the static string `"unknown"` for a thread created
+/// with a NULL name (`no_name`, `erl_drv_thread.c:99,638-639`), or `NULL` for a null handle (`:656`) —
+/// and for a tid this layer did not create or that has already been joined (the deviation below).
+///
+/// The pointer is a NUL-terminated copy of the name passed to [`erl_drv_thread_create`], valid until
+/// that thread is joined.
 ///
 /// # Safety
 /// `tid` must be null or a handle from this family.
 #[no_mangle]
 pub unsafe extern "C" fn erl_drv_thread_name(tid: ErlDrvTid) -> *mut c_char {
     // SAFETY: `tid` is null or a handle from this family (the caller contract).
-    unsafe { sync::thread_name(tid_handle(tid)) }
+    let handle = unsafe { tid_handle(tid) };
+    // `sync::thread_name` is safe: it only reads the registry entry keyed by the tid (a raw tid is
+    // never dereferenced).
+    let name = sync::thread_name(handle);
+    if name.is_null() && sync::thread_created_unnamed(handle) {
+        // A thread this layer created with a NULL name is the C's `no_name` state (`:638-639`). Any other
+        // null — an unknown tid, a joined tid, a null handle — stays `NULL`.
+        sync::no_name()
+    } else {
+        name
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -797,15 +848,54 @@ mod tests {
     }
 
     #[test]
-    fn an_unnamed_mutex_reports_no_name() {
+    fn an_unnamed_mutex_reports_the_unknown_name() {
         // SAFETY: a null name is the C's "unnamed" case.
         let m = unsafe { erl_drv_mutex_create(ptr::null_mut()) };
         assert!(!m.is_null());
-        // SAFETY: `m` is live. The C would answer `"unknown"` (`erl_drv_thread.c:99,170`); this
-        // layer answers null — the documented deviation.
-        assert!(unsafe { erl_drv_mutex_name(m) }.is_null());
+        // SAFETY: `m` is live. The C stores its static `no_name` in the handle
+        // (`erl_drv_thread.c:99,135,170`) and answers it here (`:198`).
+        assert_eq!(unsafe { name_str(erl_drv_mutex_name(m)) }.as_deref(), Some("unknown"));
         // SAFETY: `m` is live; ownership transfers to `destroy`.
         unsafe { erl_drv_mutex_destroy(m) };
+    }
+
+    #[test]
+    fn unnamed_cond_rwlock_and_thread_report_the_unknown_name() {
+        // SAFETY: a null name is the C's "unnamed" case for each create call.
+        let cnd = unsafe { erl_drv_cond_create(ptr::null_mut()) };
+        // SAFETY: as above.
+        let lck = unsafe { erl_drv_rwlock_create(ptr::null_mut()) };
+        assert!(!cnd.is_null() && !lck.is_null());
+
+        // `erl_drv_thread_create` stores `no_name` for a NULL name too (`erl_drv_thread.c:638-639`).
+        let mut tid: ErlDrvTid = ptr::null_mut();
+        let magic = MAGIC as *mut c_void;
+        // SAFETY: a null name/opts means "unnamed, platform default stack"; `&mut tid` is a valid
+        // out-slot and `value_worker` is a plain entry point.
+        let res =
+            unsafe { erl_drv_thread_create(ptr::null_mut(), &mut tid, Some(value_worker), magic, ptr::null_mut()) };
+        assert_eq!(res, 0, "thread_create failed with {res}");
+        assert!(!tid.is_null());
+
+        // SAFETY: all three handles are live; each accessor reads only the object's name.
+        unsafe {
+            assert_eq!(name_str(erl_drv_cond_name(cnd)).as_deref(), Some("unknown"));
+            assert_eq!(name_str(erl_drv_rwlock_name(lck)).as_deref(), Some("unknown"));
+            assert_eq!(name_str(erl_drv_thread_name(tid)).as_deref(), Some("unknown"));
+        }
+
+        // SAFETY: `tid` is the tid from the create above, not yet joined.
+        let mut resp: *mut c_void = ptr::null_mut();
+        assert_eq!(unsafe { erl_drv_thread_join(tid, &mut resp) }, 0);
+        assert_eq!(resp as usize, MAGIC);
+        // SAFETY: the entry was retired by the join; the lookup just finds nothing.
+        assert!(unsafe { erl_drv_thread_name(tid) }.is_null());
+
+        // SAFETY: both handles are live; ownership transfers to their `destroy` calls.
+        unsafe {
+            erl_drv_cond_destroy(cnd);
+            erl_drv_rwlock_destroy(lck);
+        }
     }
 
     // -----------------------------------------------------------------------------------------

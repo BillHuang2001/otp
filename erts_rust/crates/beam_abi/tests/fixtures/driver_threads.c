@@ -39,6 +39,10 @@
  *       point). The C `erts_exit`s on every one of these (`erl_drv_thread.c:523,545,670,692,712`),
  *       so command 8 is exercised by the Rust side only and is deliberately NOT driven by the
  *       oracle run below; `A4_ORACLE_COMMANDS` in the test lists the oracle-safe commands.
+ *   9   the private state `start` returned is live
+ *   10  the four `*_name` accessors on handles created with a NULL name → "unknown"
+ *   11  the four `*_name` accessors on named handles → the name
+ *   12  the four `*_name` accessors on NULL handles → NULL
  *   99+ unknown command → -100
  *
  * Kernel-vs-header note: no assertion here depends on a constant whose value the Rust layer
@@ -408,6 +412,107 @@ static int cmd_refusals(void) {
 }
 
 /* ---------------------------------------------------------------------------------------------
+ * Commands 10-12 — every `*_name` accessor in all three states
+ *
+ * Commands 1/2/3/5 already check a *named* handle's name in passing; these three make the whole
+ * contract explicit for all four accessors at once:
+ *
+ *   10  a handle created with a NULL name → the C's static `"unknown"` (`no_name`,
+ *       `erl_drv_thread.c:99,135`, stored in the handle at `:170`/`:264`/`:341`/`:639`);
+ *   11  a named handle                   → the name it was created with;
+ *   12  a NULL handle                    → NULL (`erl_drv_thread.c:198`/`:283`/`:365`/`:656`).
+ *
+ * `"unknown"` is spelled out here rather than taken from the emulator's private header (the macro
+ * `no_name` is not part of `erl_driver.h`); the *same* literal is asserted by
+ * `tests/driver_threads.rs` against the Rust implementation, and by the oracle run for the C one.
+ * --------------------------------------------------------------------------------------------- */
+
+#define THREADS_UNKNOWN_NAME "unknown"
+
+/* `name != NULL && strcmp(name, want) == 0` — the accessors' documented contract. */
+static int name_is(char *name, const char *want) {
+    return (name != NULL) && (strcmp(name, want) == 0);
+}
+
+/* Command 10 — the four accessors on handles created with a NULL name. */
+static int cmd_names_unnamed(void) {
+    ErlDrvMutex *mtx = erl_drv_mutex_create(NULL);
+    ErlDrvCond *cnd = erl_drv_cond_create(NULL);
+    ErlDrvRWLock *lck = erl_drv_rwlock_create(NULL);
+    ErlDrvTid tid = NULL;
+    void *resp = NULL;
+    int ok;
+
+    if (!mtx || !cnd || !lck)
+        return -1;
+    /* A NULL name with no options: the C's "unnamed, platform default stack" case
+       (`erl_drv_thread.c:613-621`). */
+    if (erl_drv_thread_create(NULL, &tid, value_worker, THREADS_JOIN_MAGIC, NULL) != 0) {
+        erl_drv_mutex_destroy(mtx);
+        erl_drv_cond_destroy(cnd);
+        erl_drv_rwlock_destroy(lck);
+        return -1;
+    }
+
+    ok = name_is(erl_drv_mutex_name(mtx), THREADS_UNKNOWN_NAME)
+         && name_is(erl_drv_cond_name(cnd), THREADS_UNKNOWN_NAME)
+         && name_is(erl_drv_rwlock_name(lck), THREADS_UNKNOWN_NAME)
+         && name_is(erl_drv_thread_name(tid), THREADS_UNKNOWN_NAME);
+
+    /* The join retires the tid (the C frees its record), so nothing is read from it afterwards. */
+    ok = ok
+         && (erl_drv_thread_join(tid, &resp) == 0)
+         && (resp == THREADS_JOIN_MAGIC);
+
+    erl_drv_mutex_destroy(mtx);
+    erl_drv_cond_destroy(cnd);
+    erl_drv_rwlock_destroy(lck);
+    return ok ? 1 : -1;
+}
+
+/* Command 11 — the four accessors on named handles. */
+static int cmd_names_named(void) {
+    ErlDrvMutex *mtx = erl_drv_mutex_create("drv_c_names_mtx");
+    ErlDrvCond *cnd = erl_drv_cond_create("drv_c_names_cnd");
+    ErlDrvRWLock *lck = erl_drv_rwlock_create("drv_c_names_lck");
+    ErlDrvTid tid = NULL;
+    void *resp = NULL;
+    int ok;
+
+    if (!mtx || !cnd || !lck)
+        return -1;
+    if (erl_drv_thread_create("drv_c_names_tid", &tid, value_worker, THREADS_JOIN_MAGIC, NULL) != 0) {
+        erl_drv_mutex_destroy(mtx);
+        erl_drv_cond_destroy(cnd);
+        erl_drv_rwlock_destroy(lck);
+        return -1;
+    }
+
+    ok = name_is(erl_drv_mutex_name(mtx), "drv_c_names_mtx")
+         && name_is(erl_drv_cond_name(cnd), "drv_c_names_cnd")
+         && name_is(erl_drv_rwlock_name(lck), "drv_c_names_lck")
+         && name_is(erl_drv_thread_name(tid), "drv_c_names_tid");
+
+    ok = ok
+         && (erl_drv_thread_join(tid, &resp) == 0)
+         && (resp == THREADS_JOIN_MAGIC);
+
+    erl_drv_mutex_destroy(mtx);
+    erl_drv_cond_destroy(cnd);
+    erl_drv_rwlock_destroy(lck);
+    return ok ? 1 : -1;
+}
+
+/* Command 12 — the four accessors on a NULL handle: `NULL` is reserved for exactly this case. */
+static int cmd_names_null(void) {
+    int ok = (erl_drv_mutex_name(NULL) == NULL)
+             && (erl_drv_cond_name(NULL) == NULL)
+             && (erl_drv_rwlock_name(NULL) == NULL)
+             && (erl_drv_thread_name(NULL) == NULL);
+    return ok ? 1 : -1;
+}
+
+/* ---------------------------------------------------------------------------------------------
  * The driver entry points
  * --------------------------------------------------------------------------------------------- */
 
@@ -469,6 +574,18 @@ static ErlDrvSSizeT threads_control(ErlDrvData drv_data, unsigned int command,
     case 9:
         /* The private state is what `start` produced (a real `ErlDrvData`, never a sentinel). */
         return (ErlDrvSSizeT) ((st != NULL) && (st->marker == 0x7e44UL));
+
+    case 10:
+        /* The four `*_name` accessors on handles created with a NULL name. */
+        return (ErlDrvSSizeT) cmd_names_unnamed();
+
+    case 11:
+        /* …on named handles. */
+        return (ErlDrvSSizeT) cmd_names_named();
+
+    case 12:
+        /* …and on NULL handles. */
+        return (ErlDrvSSizeT) cmd_names_null();
 
     default:
         /* An unknown command is visible as a distinct negative marker (→ `badarg`). */

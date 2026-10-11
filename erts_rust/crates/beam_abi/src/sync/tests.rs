@@ -647,7 +647,9 @@ fn name_accessors_return_the_created_name_or_null() {
     // SAFETY: as above.
     assert_eq!(read_name(unsafe { rwlock_name(lck) }), Some("proto-lock".into()));
 
-    // Unnamed objects report null.
+    // Unnamed objects carry no *stored* name, which this layer reports as null. A frozen ABI whose C
+    // stores the static `no_name` string in the handle instead (`erl_drv_thread.c:99,135,170`) renders
+    // that state with `no_name()` — what the driver facade does.
     // SAFETY: a null name is the "unnamed" case; the handles are live.
     let unnamed_mtx = unsafe { mutex_create(ptr::null()) };
     // SAFETY: as above.
@@ -673,6 +675,17 @@ fn name_accessors_return_the_created_name_or_null() {
 }
 
 #[test]
+fn the_shared_layer_exposes_the_c_no_name_string() {
+    // The C's `no_name` (`erl_drv_thread.c:99`, assigned `"unknown"` at `:135`): what a frozen ABI
+    // reports for a **live** handle created with a NULL name, because the C stores that pointer in the
+    // handle at create time (`:170`, `:264`, `:341`, `:639`, `:678`).
+    let name = no_name();
+    assert_eq!(read_name(name), Some("unknown".into()));
+    // The C hands out one static string, never a fresh buffer — so the pointer is stable.
+    assert_eq!(no_name(), name, "`no_name` must be a single static string");
+}
+
+#[test]
 fn created_thread_names_live_in_the_registry() {
     let name = CString::new("nif-worker-1").expect("test name has no interior NUL");
     let state = empty_probe_state();
@@ -690,6 +703,8 @@ fn created_thread_names_live_in_the_registry() {
     assert_eq!(res, 0);
     // The creator can look the name up as soon as `thread_create` returns.
     assert_eq!(read_name(thread_name(tid)), Some("nif-worker-1".into()));
+    // A *named* created thread is never the "created unnamed" state.
+    assert!(!thread_created_unnamed(tid));
     // The new thread sees the same name for itself (it registers it at its entry).
     while state.seen_name.load(Ordering::SeqCst) == 0 {
         std::thread::yield_now();
@@ -701,15 +716,22 @@ fn created_thread_names_live_in_the_registry() {
     assert_eq!(join_worker(tid) as usize, MAGIC);
     // The entry was retired by the join, so the name is gone rather than dangling.
     assert!(thread_name(tid).is_null());
+    assert!(!thread_created_unnamed(tid));
 
-    // An unnamed created thread reports null (and never holds a dangling name).
+    // An unnamed created thread has no *stored* name: this layer reports null for it (never a
+    // dangling name) and `thread_created_unnamed` is what lets a facade render the C's `no_name`
+    // (`erl_drv_thread.c:638-639`) instead.
     let anonymous_state = empty_probe_state();
     let anonymous = spawn_worker(probe, &anonymous_state as *const ProbeState as *mut c_void);
     assert!(thread_name(anonymous).is_null());
+    assert!(thread_created_unnamed(anonymous), "created with a null name");
     join_worker(anonymous);
     assert!(thread_name(anonymous).is_null());
-    // An unknown tid reports null.
+    assert!(!thread_created_unnamed(anonymous), "the entry is retired by the join");
+    // An unknown tid reports null and is not a created thread.
     assert!(thread_name(0x1234 as Tid).is_null());
+    assert!(!thread_created_unnamed(0x1234 as Tid));
+    assert!(!thread_created_unnamed(ptr::null_mut()));
 }
 
 // ---------------------------------------------------------------------------------------------

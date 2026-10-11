@@ -173,6 +173,11 @@ use crate::driver::types::{ErlDrvPort, ErlDrvTermData};
 // `#[no_mangle]` and is unaffected either way).
 pub use self::mem::*;
 pub use self::port::*;
+// The two **safe** monitor accessors are not frozen C entry points (they carry no `#[no_mangle]`),
+// so they are named explicitly rather than glob-re-exported: `pdl` owns them next to the monitor
+// slots, and the crate root re-exports them as `beam_abi::{monitor_identity, monitor_from_identity}`
+// for the `#![deny(unsafe_code)]` runtime that must read a monitor's identity.
+pub use self::pdl::{monitor_from_identity, monitor_identity};
 
 #[cfg(test)]
 use crate::driver::types::ErlDrvBinary;

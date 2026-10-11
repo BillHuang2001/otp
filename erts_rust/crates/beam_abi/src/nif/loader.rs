@@ -64,8 +64,10 @@
 //! invokes the library's `unload` callback (with a live [`NifEnv`] built from that host) and then
 //! `dlclose`s. As with [`NifEnv`], the caller keeps the host alive for as long as the library.
 
+use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use libc::{c_char, c_int, c_void};
 
@@ -87,6 +89,91 @@ const LOAD_SLOGAN: &str = "Failed to load NIF library";
 
 /// The signature of a [`ErlNifFunc::fptr`] NIF implementation.
 type NifFptr = unsafe extern "C" fn(*mut ErlNifEnv, c_int, *const ERL_NIF_TERM) -> ERL_NIF_TERM;
+
+// ---------------------------------------------------------------------------------------------
+// The in-flight library's private data (the C's `env->mod_nif->priv_data`)
+// ---------------------------------------------------------------------------------------------
+//
+// `enif_priv_data` (`erl_nif.c:609-612`) answers `env->mod_nif->priv_data` — the private pointer of
+// the **library the call belongs to**, i.e. the pointer that library's `load` callback wrote into
+// `lib->priv_data` (`erl_nif.c:4976` resets it, `:5003` stores what the callback produced). The C
+// reaches that field through the environment, which points at the library; this crate's C-facing env
+// ([`NifEnv`]) carries only the *host*, so the library is published here for the duration of
+// [`NifLibrary::call`] and read back by `nif::enif::envs::enif_priv_data`.
+//
+// The store is **thread-local**, for the same reason the current-host stack is
+// (`nif::host::CURRENT_HOSTS`): a NIF call runs on the thread that entered it — in the C the call env
+// and its `mod_nif` live on that thread too — and [`NifEnv`], the only other handle on the call, is
+// not `Send` (it holds a raw host pointer). A publication therefore reaches no other thread: a
+// concurrent NIF call on another thread sees its own stack. Neither [`NifLibrary`] nor
+// [`NifLibrary::call`] changes shape or gains a non-`Send` member — the publication is a local RAII
+// guard holding only a token, so `beam_rt`'s use of a loaded library is unaffected.
+//
+// A **stack**, because a library call can nest (a NIF may call back into a second library), and each
+// guard removes exactly its own entry: nesting restores the enclosing library's pointer, and a
+// panic/unwind out of the call still restores it (`Drop` runs on unwind). Once the outermost guard is
+// gone the stack is empty, which is what makes [`NifHost::priv_data`] the fallback source again.
+
+thread_local! {
+    /// The priv-data pointers published by the library calls live on this thread, innermost (current)
+    /// last.
+    static CURRENT_PRIV_DATA: RefCell<Vec<(u64, *mut c_void)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Identity of the next [`CurrentPrivData`] guard; drawn once per guard, never reused.
+static NEXT_PRIV_DATA_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+/// Publish `priv_data` as the private pointer of the library call whose guard carries `token`.
+fn push_current_priv_data(token: u64, priv_data: *mut c_void) {
+    CURRENT_PRIV_DATA.with(|stack| stack.borrow_mut().push((token, priv_data)));
+}
+
+/// Remove `token`'s entry, wherever it sits ([`CurrentPrivData`]'s `Drop`).
+///
+/// Removing a *position* rather than the top keeps the stack sound if guards ever unwind out of
+/// nesting order: every guard removes its own entry, so the count reaches zero exactly when the
+/// outermost call is gone.
+fn pop_current_priv_data(token: u64) {
+    CURRENT_PRIV_DATA.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        if let Some(pos) = stack.iter().position(|&(t, _)| t == token) {
+            stack.remove(pos);
+        }
+    });
+}
+
+/// The private pointer of the library whose NIF call this thread is inside, if any.
+///
+/// `None` means "no library call is in progress on this thread" — the reader
+/// (`nif::enif::envs::enif_priv_data`) then falls back to its host. A published `NULL` is distinct
+/// from `None` and is answered as such: the library is authoritative for its own private data, just
+/// as `env->mod_nif->priv_data` is in the C.
+pub(crate) fn current_priv_data() -> Option<*mut c_void> {
+    CURRENT_PRIV_DATA.with(|stack| stack.borrow().last().map(|&(_, priv_data)| priv_data))
+}
+
+/// RAII publication of one library's private pointer for the duration of a [`NifLibrary::call`].
+struct CurrentPrivData {
+    /// Identity of this guard's [`CURRENT_PRIV_DATA`] entry, so `Drop` removes exactly its own.
+    token: u64,
+}
+
+impl CurrentPrivData {
+    /// Publish `priv_data` on this thread until the guard is dropped.
+    fn publish(priv_data: *mut c_void) -> CurrentPrivData {
+        let token = NEXT_PRIV_DATA_TOKEN.fetch_add(1, Ordering::Relaxed);
+        push_current_priv_data(token, priv_data);
+        CurrentPrivData { token }
+    }
+}
+
+impl Drop for CurrentPrivData {
+    /// Withdraw this guard's publication, so a reader sees the enclosing call's library again — or
+    /// no library at all, once the outermost call is over.
+    fn drop(&mut self) {
+        pop_current_priv_data(self.token);
+    }
+}
 
 // ---------------------------------------------------------------------------------------------
 // Errors
@@ -201,6 +288,10 @@ impl NifLibrary {
     /// `args` must hold exactly `arity` terms (the NIF reads `argv[0..arity]`). On return, a
     /// pending exception recorded on `env` turns the call into [`NifCallError::Raised`]; otherwise
     /// the NIF's return term is handed back.
+    ///
+    /// For the duration of the call this library's `priv_data` pointer is published on the calling
+    /// thread, which is how `enif_priv_data` answers the C's `env->mod_nif->priv_data` (see the
+    /// module section "The in-flight library's private data").
     pub fn call(
         &self,
         env: &mut NifEnv,
@@ -217,6 +308,11 @@ impl NifLibrary {
         // `Eterm` and `ERL_NIF_TERM` are both `#[repr(transparent)]` over `usize` (contract A.3),
         // so this pointer cast reinterprets nothing — it is the same array of machine words.
         let argv = args.as_ptr() as *const ERL_NIF_TERM;
+        // Publish this library's private pointer for the duration of the call — the C's call env
+        // carries it in `env->mod_nif` (`erl_nif.c:609-612`), and `enif_priv_data` reads it back
+        // (`nif::enif::envs`). The guard is held in a named binding so it lives until the NIF has
+        // returned, and restores the enclosing library's pointer even on unwind.
+        let _current_priv_data = CurrentPrivData::publish(self.priv_data);
         // SAFETY: `fptr` is the library's own implementation for exactly this `{name, arity}`; the
         // code stays mapped for as long as `self` (dropped in `Drop` via `dlclose`). `env` is a live
         // `NifEnv` and `argv` points at `args` (at least `arity` elements by contract).
@@ -556,6 +652,61 @@ impl Drop for OpenHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A non-null pointer that only ever has to round-trip (nothing dereferences it here).
+    fn marker(addr: usize) -> *mut c_void {
+        addr as *mut c_void
+    }
+
+    #[test]
+    fn the_priv_data_stack_nests_and_restores_the_outer_library() {
+        assert!(current_priv_data().is_none());
+        let outer = CurrentPrivData::publish(marker(0x11));
+        assert_eq!(current_priv_data(), Some(marker(0x11)));
+        {
+            let _inner = CurrentPrivData::publish(marker(0x22));
+            assert_eq!(current_priv_data(), Some(marker(0x22)));
+        }
+        assert_eq!(
+            current_priv_data(),
+            Some(marker(0x11)),
+            "leaving the nested call restores the enclosing library"
+        );
+        drop(outer);
+        assert!(current_priv_data().is_none(), "the outermost call withdraws");
+    }
+
+    /// A published `NULL` is an answer in its own right (a library whose `load` stored nothing),
+    /// distinct from "no library call is in progress".
+    #[test]
+    fn a_published_null_is_distinct_from_no_call() {
+        let null = CurrentPrivData::publish(core::ptr::null_mut());
+        assert_eq!(current_priv_data(), Some(core::ptr::null_mut()));
+        drop(null);
+        assert!(current_priv_data().is_none());
+    }
+
+    /// An unwind out of the call still withdraws the publication (`Drop` runs on unwind).
+    #[test]
+    fn the_publication_is_restored_on_unwind() {
+        let _outer = CurrentPrivData::publish(marker(0x11));
+        let unwound = std::panic::catch_unwind(|| {
+            let _inner = CurrentPrivData::publish(marker(0x22));
+            panic!("unwind out of the nested library call");
+        });
+        assert!(unwound.is_err(), "the panic propagated");
+        assert_eq!(current_priv_data(), Some(marker(0x11)));
+    }
+
+    /// The publication is thread-local: a concurrent NIF call on another thread sees only its own.
+    #[test]
+    fn the_publication_is_invisible_to_other_threads() {
+        let _outer = CurrentPrivData::publish(marker(0x11));
+        std::thread::spawn(|| assert!(current_priv_data().is_none()))
+            .join()
+            .expect("the sibling thread observes an empty stack");
+        assert_eq!(current_priv_data(), Some(marker(0x11)));
+    }
 
     #[test]
     fn shared_object_path_appends_the_suffix_only_when_absent() {
