@@ -48,6 +48,7 @@
 //! 6> P = spawn(...), P ! ok, erlang:send(DeadP, x).           %% x — success, dropped
 //! 7> erlang:send(Port, Data).                                 %% Data — the port write path
 //! 8> erlang:send({a, b}, x).                                  %% x — distributed send
+//! 9> A = erlang:alias([reply]), erlang:send(A, hi), receive X -> X end.  %% hi — the alias owner
 //! ```
 //!
 //! The compiled-code expectations (5 above, plus the dead pid) were checked against the
@@ -260,6 +261,24 @@ fn eval_send_to_a_non_destination_or_unregistered_name_is_badarg() {
         "io:format(\"~p~n\",[try erlang:send(no_such_name, x) catch C:E -> {C, E} end]).",
     );
     assert_eq!(atom, "{error,badarg}\n");
+}
+
+/// A **reference alias** destination: `erlang:send(Alias, Msg)` is served by the same
+/// [`SendBridge`] seam, but the destination is neither a pid nor a name — it resolves through
+/// the runtime's alias lookup (`src/context/alias.rs`, the C's `send_altact_message` arm,
+/// `bif.c:2478-2492`) to the alias **owner**, and a `reply` (reply-once) alias is consumed by
+/// the message that went through it.
+///
+/// Oracle: `{hi,hi,false}` — the BIF returns the message, the owner takes `hi`, and the
+/// `reply_demonitor` alias is gone. (`tests/alias.rs` pins the same case from compiled code.)
+#[test]
+fn eval_send_to_a_reference_alias_reaches_its_owner_and_consumes_it() {
+    let (stdout, stderr) = eval(
+        "io:format(\"~p~n\",[begin A = erlang:alias([reply]), R = erlang:send(A, hi), \
+         M = receive X -> X end, {R, M, erlang:unalias(A)} end]).",
+    );
+    assert_eq!(stdout, "{hi,hi,false}\n");
+    assert!(stderr.is_empty(), "stderr: {stderr}");
 }
 
 /// **Compiled code**: `erlang:send/2` inside a `.beam` really goes through the send seam.

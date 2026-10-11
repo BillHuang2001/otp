@@ -184,7 +184,7 @@ const FLOWS: [(&str, &str, &str); 3] = [
 ];
 
 /// The malformed calls both runtimes reject with `badarg`.
-const REJECTIONS: [(&str, &str); 9] = [
+const REJECTIONS: [(&str, &str); 11] = [
     ("monitor(process, 42)", "erlang:monitor(process, 42)"),
     ("monitor(bogus, self())", "erlang:monitor(bogus, self())"),
     ("monitor(time_offset, self())", "erlang:monitor(time_offset, self())"),
@@ -194,6 +194,14 @@ const REJECTIONS: [(&str, &str); 9] = [
     ),
     ("monitor/3 option [foo]", "erlang:monitor(process, self(), [foo])"),
     ("monitor/3 non-list options", "erlang:monitor(process, self(), foo)"),
+    (
+        "monitor/3 option {alias, bogus}",
+        "erlang:monitor(process, self(), [{alias, bogus}])",
+    ),
+    (
+        "monitor/3 option 3-tuple {tag, x, extra}",
+        "erlang:monitor(process, self(), [{tag, x, extra}])",
+    ),
     ("demonitor(42)", "erlang:demonitor(42)"),
     (
         "demonitor/2 option [bogus]",
@@ -205,10 +213,12 @@ const REJECTIONS: [(&str, &str); 9] = [
     ),
 ];
 
-/// The two target/option forms the oracle accepts and this runtime **adopts**: a port
+/// The target/option forms the oracle accepts and this runtime **adopts**: a port
 /// monitor (recorded on the runtime's authoritative port table — `beam_io`'s
-/// `PortRegistry`, the one `open_port/2` allocates from) and a per-monitor `{tag, _}`.
-const ADOPTED_TARGETS: [(&str, &str); 2] = [
+/// `PortRegistry`, the one `open_port/2` allocates from), a per-monitor `{tag, _}`, and
+/// the three `{alias, _}` modes whose monitor reference doubles as a **reference alias**
+/// (a valid `send` destination — pinned end to end by `tests/alias.rs`).
+const ADOPTED_TARGETS: [(&str, &str); 5] = [
     (
         "monitor(port, Port)",
         "erlang:monitor(port, open_port({spawn,\"true\"}, []))",
@@ -216,6 +226,18 @@ const ADOPTED_TARGETS: [(&str, &str); 2] = [
     (
         "monitor/3 option {tag, x}",
         "erlang:monitor(process, self(), [{tag, x}])",
+    ),
+    (
+        "monitor/3 option {alias, explicit_unalias}",
+        "erlang:monitor(process, self(), [{alias, explicit_unalias}])",
+    ),
+    (
+        "monitor/3 option {alias, demonitor}",
+        "erlang:monitor(process, self(), [{alias, demonitor}])",
+    ),
+    (
+        "monitor/3 option {alias, reply_demonitor}",
+        "erlang:monitor(process, self(), [{alias, reply_demonitor}])",
     ),
 ];
 
@@ -278,9 +300,11 @@ fn malformed_monitor_and_demonitor_calls_are_badarg_in_both_runtimes() {
     }
 }
 
-/// The two forms the oracle accepts and this runtime now **adopts** — a port monitor and a
-/// per-monitor `{tag, _}` — succeed silently (exit 0, nothing printed), and the live oracle
-/// answers a reference for both, so the two runtimes agree rather than both rejecting.
+/// The forms the oracle accepts and this runtime now **adopts** — a port monitor, a per-monitor
+/// `{tag, _}` and the three `{alias, _}` modes — succeed silently (exit 0, nothing printed), and
+/// the live oracle answers a reference for each, so the two runtimes agree rather than both
+/// rejecting. (The alias modes are exercised as *send* destinations end to end by
+/// `tests/alias.rs`; here only their acceptance is pinned.)
 #[test]
 fn the_formerly_inexpressible_targets_are_adopted_like_the_oracle() {
     let Some(oracle) = support::require_oracle("monitor") else {
