@@ -76,8 +76,10 @@
 //! * **Integers** are handled for small ints and for bignums up to one 64-bit limb; anything wider
 //!   fails the accessor (returns `0`) instead of truncating.
 //! * **Atom comparison / hashing** ([`enif_compare`], [`enif_is_identical`], [`enif_hash`]) has no
-//!   env parameter, hence no host, hence no atom-name table: identical terms are handled by a
-//!   raw-word fast path, and distinct atoms fall back to `beam_term`'s index fallback.
+//!   env parameter: identical terms are handled by a raw-word fast path, and distinct atoms fall
+//!   back to `beam_term`'s index fallback. [`enif_compare`] additionally orders a **top-level** atom
+//!   pair by name, resolved through the current NIF host (`super::host::with_current_host`); an atom
+//!   pair *nested* inside a compound still uses the index fallback (see [`pred`]).
 //! * **Map operations** use an empty `AtomTable` for the same reason; they are exact whenever the
 //!   key terms are not atoms (the overwhelmingly common NIF case, where the key is a term the NIF
 //!   was handed).
