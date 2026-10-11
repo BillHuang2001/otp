@@ -75,13 +75,17 @@
 //! [`Machine::resume_outcome`](beam_engine::Machine::resume_outcome).
 //!
 //! The remembered tier is observable only at such a **slice boundary**: a process that runs to
-//! completion inside its first slice never re-enters, and the budget is charged only at the
-//! engine's heap-admission points (`test_heap`/`allocate_heap`), so a binary-accumulating or
-//! `call_ext`-only hot loop charges nothing and never pre-empts. That is why the tier is selected
-//! **eagerly at the first entry** rather than after a bounded warm-up on the interpreter: the
-//! warm-up was measured and declined because it would pin exactly those zero-charge hot loops to
-//! the reference tier for their whole life. The verified characterisation (with figures) is in
-//! `PERF.md`.
+//! completion inside its first slice never re-enters. How likely that is depends on the tier.
+//! On the **interpreter** tier the slice's budget is charged once per interpreted instruction
+//! (and again at a heap-admission point), so an ordinary hot loop — allocating or not — is
+//! pre-empted at the budget. On the **native baseline** tier a compiled block runs natively and
+//! does not cross the per-instruction hook, so it charges only at a deopt or a heap-admission
+//! boundary: a binary-accumulating or `call_ext`-only loop, and equally a natively linked tail
+//! loop with no allocation, therefore charges nothing and never pre-empts. That is why the tier
+//! is selected **eagerly at the first entry** rather than after a bounded warm-up on the
+//! interpreter: the warm-up was measured and declined because it would pin exactly those
+//! hot loops to the reference tier for their whole life. The verified characterisation (with
+//! figures) is in `PERF.md`.
 //!
 //! # Why the default is the native tier
 //!

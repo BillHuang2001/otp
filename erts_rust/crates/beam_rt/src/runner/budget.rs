@@ -20,11 +20,14 @@
 
 //! The **reduction budget** of one scheduler slice and the slice context that charges it.
 //!
-//! [`BudgetProbe`] counts the reduction units a slice spends at the machine's
-//! heap-admission points; [`BudgetContext`] is the wrapper [`ExecutionContext`] that
-//! redirects an [`ensure_heap`](ExecutionContext::ensure_heap) on the slice's own machine
-//! into that probe. See [`RuntimeRunner::run`](crate::runner::RuntimeRunner) for how the
-//! probe's exhaustion becomes a pre-emption.
+//! [`BudgetProbe`] counts the reduction units a slice spends; [`BudgetContext`] is the wrapper
+//! [`ExecutionContext`] that charges it from the two seams the executing machine reaches — the
+//! interpreter's **per-instruction** hook ([`reduce`](ExecutionContext::reduce)) and the
+//! machine's **heap-admission points** ([`ensure_heap`](ExecutionContext::ensure_heap)/
+//! [`ensure_heap_full`](ExecutionContext::ensure_heap_full), reached by
+//! `test_heap`/`allocate_heap`). See
+//! [`RuntimeRunner::run`](crate::runner::RuntimeRunner) for how the probe's exhaustion becomes a
+//! pre-emption.
 //!
 //! Every other [`ExecutionContext`] method — BIF/apply dispatch, the heap, the whole
 //! receive/message seam, the cross-module-call seam
@@ -35,34 +38,26 @@
 //! `return_to` events exactly as the single-pass `Runtime::run_*` path does and a
 //! `call_ext*` the host can run in-machine is entered in this very slice.
 //!
-//! # Why the per-instruction `reduce` hook is deliberately **not** charged
+//! # Why charging the per-instruction hook is safe
 //!
-//! `beam_engine` offers a second charging point, [`reduce`](ExecutionContext::reduce),
-//! called **once per interpreted instruction** — the hook that exists precisely because
-//! an allocating loop's `test_heap` is not the only shape that can monopolise a
-//! scheduler (a native baseline-JIT block reaches it only at a deopt/block boundary, so
-//! a JIT-compiled loop is charged coarsely either way). This wrapper does **not** charge
-//! the budget there, and that is a correctness decision rather than an oversight:
-//! `Machine::drive` calls `reduce` *after* `step_instruction` has already **executed**
-//! the instruction (`crates/beam_engine/src/machine/drive.rs`), while the address the
-//! machine exposes for a resume (`Machine::current_code`) is recorded by
-//! `step_instruction` at that same instruction's entry. A pre-emption raised from
-//! `reduce` would therefore park the machine on an instruction *whose effect has
-//! already happened*, and the resumed slice (`Machine::resume_outcome_with_tier`)
-//! re-executes it — a **wrong result**, not a repeated no-op: `put_list x0 x1 x1`
-//! appends the head twice (the committed `tests/fixtures/preempt.beam`'s `alloc_loop/2`
-//! is exactly that shape), a `send` delivers twice, and a `call`/`call_last` pushes/pops
-//! a frame twice.
+//! `Machine::drive` prices an interpreted instruction **before** its body runs: it records the
+//! machine's position as that instruction (the address
+//! [`Machine::current_code`](beam_engine::Machine::current_code) hands back) and only then calls
+//! the hook. An `Err` from [`reduce`](ExecutionContext::reduce) therefore ends the run with the
+//! instruction's effect **not yet applied** and the machine parked exactly on it, so
+//! [`Machine::resume_outcome`](beam_engine::Machine::resume_outcome) applies it **exactly once**
+//! — the same guarantee C's `DISPATCH` gives by checking and consuming `FCALLS` before the body.
+//! A loop that allocates nothing (`test_heap` is unreachable from it, and a `gc_bif` reaches
+//! only [`call_bif`](ExecutionContext::call_bif)) is thereby pre-emptible, which is precisely
+//! what a heap-admission charge alone cannot do.
 //!
-//! The budget is therefore charged at the one door whose re-entry is provably a no-op —
-//! [`ensure_heap`](ExecutionContext::ensure_heap)/
-//! [`ensure_heap_full`](ExecutionContext::ensure_heap_full) (reached by
-//! `test_heap`/`allocate_heap`, whose *first* effect is the idempotent heap test) — and
-//! a non-allocating loop keeps the honest limit documented on
-//! [`RuntimeRunner::run`](crate::runner::RuntimeRunner): it has no admission point and
-//! so runs to its next `return`/`wait`. Closing that limit requires `beam_engine` to
-//! offer a charge *before* an instruction's effect (or to expose the folded successor
-//! address); it cannot be done from this crate without producing a wrong result.
+//! The two `ensure_heap` doors stay charged as well: they are the **only** charge a native
+//! baseline-JIT block reaches, because a compiled block runs natively and never crosses the
+//! per-instruction hook (see
+//! [`RuntimeRunner::run`](crate::runner::RuntimeRunner) for the residual limit that leaves on
+//! that tier). An interpreted instruction that also allocates is consequently charged twice —
+//! harmless, since pre-emption is conservative, and it leaves the native tier's fairness
+//! unchanged.
 
 use std::sync::Arc;
 
@@ -78,11 +73,12 @@ use crate::context::RuntimeContext;
 ///
 /// The [`ProcessRunner`](beam_process::ProcessRunner) contract puts the reduction count in
 /// the runner's hands (the scheduler never inspects or resets `Process::reductions`), and
-/// `beam_engine` exposes no mid-run reduction/step counter, so the count is derived from
-/// the one per-instruction seam the executing machine reaches on its own:
-/// [`ExecutionContext::ensure_heap`], called by `test_heap`/`allocate_heap` — the
-/// instructions the compiler emits once per loop iteration that allocates (the ordinary
-/// Erlang shape).
+/// `beam_engine` exposes no mid-run step counter the runner could read itself, so the count is
+/// derived from the two seams the executing machine reaches:
+/// [`ExecutionContext::reduce`] — called once per interpreted instruction, and therefore the
+/// charge that prices a loop with **no** allocation at all — and
+/// [`ExecutionContext::ensure_heap`], called by `test_heap`/`allocate_heap` (the only charge a
+/// native baseline-JIT block reaches).
 ///
 /// One charge is one reduction-like unit. When the budget runs out, `charge` reports the
 /// exhaustion through a typed error; the runner recognises it (the sticky [`exhausted`] flag
@@ -127,6 +123,10 @@ impl BudgetProbe {
 
     /// Charges one reduction unit, or reports the exhaustion.
     ///
+    /// This is the single accounting primitive of **both** of the slice's charging points — the
+    /// per-instruction [`reduce`](ExecutionContext::reduce) hook and the two `ensure_heap`
+    /// doors — so `used` is always the real work the slice did, whichever seam observed it.
+    ///
     /// # Errors
     ///
     /// A typed `unsupported`-prefixed error once the budget is spent — the runner's signal
@@ -147,15 +147,22 @@ impl BudgetProbe {
 }
 
 /// The **slice's** context: the [`RuntimeContext`] the executing machine runs on, with the
-/// slice's reduction budget charged at its heap-admission points.
+/// slice's reduction budget charged from the engine's per-instruction hook and its
+/// heap-admission points.
 ///
 /// This wrapper exists because `beam_rt` may not change `beam_engine` or its own
 /// `src/context/**`: it is handed to the machine the runner drives, and every context the
 /// engine builds *inside* that run — an external module call
 /// ([`RuntimeContext::run_export`]) or a fun application — is a plain `RuntimeContext`, so
-/// the wrapper's [`ensure_heap`](ExecutionContext::ensure_heap) is reached by the slice's own
-/// machine **only**. That is what makes the recorded resume address exact and keeps a nested
-/// run from being mistaken for the pre-empted one.
+/// the wrapper's charging is reached by the slice's own machine **only**. That is what makes
+/// the recorded resume address exact and keeps a nested run from being mistaken for the
+/// pre-empted one (nor from consuming the budget).
+///
+/// The two charging seams are declared here rather than forwarded:
+/// [`reduce`](ExecutionContext::reduce) and [`wants_reduce`](ExecutionContext::wants_reduce)
+/// are the wrapper's own, because the [`RuntimeContext`] it wraps is a
+/// *host* whose `reduce` is the default no-op and whose `wants_reduce` is `false` — the
+/// wrapper is the pre-empting host, so it must answer both for itself.
 ///
 /// Everything else — the BIF/apply dispatch, the heap, the receive seam **and the
 /// execution-trace seam** — is forwarded unchanged; the redirect is purely mechanical.
@@ -177,8 +184,9 @@ impl ExecutionContext for BudgetContext<'_, '_> {
         ExecutionContext::call_bif(self.inner, module, function, arity, args)
     }
 
-    /// Forwarded like every other method (the wrapper redirects only
-    /// [`ensure_heap`](ExecutionContext::ensure_heap)).
+    /// Forwarded like every other method (the wrapper's own overrides are
+    /// [`reduce`](ExecutionContext::reduce)/[`wants_reduce`](ExecutionContext::wants_reduce)
+    /// and the two `ensure_heap` doors).
     ///
     /// This one is **load-bearing** rather than merely faithful: the slice's machine runs on
     /// *this* wrapper, so without the forward the engine would never see the real context's
@@ -198,9 +206,9 @@ impl ExecutionContext for BudgetContext<'_, '_> {
         ExecutionContext::resolve_external_call(self.inner, module, function, arity)
     }
 
-    /// Forwarded like every other method (the wrapper redirects only
-    /// [`ensure_heap`](ExecutionContext::ensure_heap)) — and **load-bearing** for the scheduled
-    /// path.
+    /// Forwarded like every other method (see
+    /// [`resolve_external_call`](ExecutionContext::resolve_external_call) for which methods the
+    /// wrapper itself overrides) — and **load-bearing** for the scheduled path.
     ///
     /// The slice's machine runs on *this* wrapper, so the engine's `CallFun`/`CallFun2` arms
     /// consult the closure resolver here: without the forward the engine would see the trait
@@ -252,6 +260,37 @@ impl ExecutionContext for BudgetContext<'_, '_> {
         ExecutionContext::ensure_heap_full(self.inner, heap_need, roots)
     }
 
+    /// Charge the slice's budget **once per interpreted instruction** — the pre-emption seam a
+    /// non-allocating loop is reachable from.
+    ///
+    /// The engine's driver calls this before each instruction's body, which is what makes the
+    /// pre-emption exact: an `Err` here leaves the instruction un-applied and the machine parked
+    /// on it (see the module docs). The charge is `n` units — the interpreter always passes `1`,
+    /// and the loop keeps the accounting faithful for any other count — and an exhausted probe's
+    /// typed error is returned **unchanged**, so the runner's sticky-`exhausted` classification
+    /// keeps working.
+    ///
+    /// This is **not** forwarded to `inner`: the wrapped [`RuntimeContext`] is the host of the
+    /// single-pass path, whose `reduce` is the default no-op. The wrapper is the pre-empting
+    /// host of a scheduler slice, so it charges here itself.
+    fn reduce(&mut self, n: u32) -> Result<()> {
+        for _ in 0..n {
+            self.probe.charge()?;
+        }
+        Ok(())
+    }
+
+    /// The load-bearing declaration that **this** host pre-empts.
+    ///
+    /// The engine's contract is that a host may answer `false` only when its `reduce` is
+    /// provably the default no-op (it then skips the per-instruction vtable crossing). A
+    /// scheduler slice always charges, so the wrapper must answer `true` explicitly and must
+    /// **not** forward the question to `inner` — the wrapped [`RuntimeContext`] answers `false`
+    /// for the single-pass path, and inheriting that here would silently disable every
+    /// per-instruction charge and re-open the non-allocating-loop gap.
+    fn wants_reduce(&self) -> bool {
+        true
+    }
     fn heap_available(&self) -> usize {
         ExecutionContext::heap_available(&*self.inner)
     }
@@ -263,9 +302,9 @@ impl ExecutionContext for BudgetContext<'_, '_> {
     /// The engine's raw-word allocation ([`Machine::alloc_rooted`](beam_engine::Machine::alloc_rooted),
     /// reached by `terms::reserve`/`reserve_slack`): arm the GC latch and forward.
     ///
-    /// The reduction budget is **not** charged here — this is not a heap-admission point the
-    /// compiler emits once per loop, and charging it would change how many instructions a slice
-    /// runs. Arming the latch is still required: this is a legitimate collection site for the
+    /// The budget is **not** charged here: this is not one of the slice's charging seams (the
+    /// per-instruction [`reduce`](ExecutionContext::reduce) hook and the two `ensure_heap`
+    /// doors). Arming the latch is still required: this is a legitimate collection site for the
     /// slice's own machine (it is handed the whole root set), and without the latch the nested
     /// machinery would refuse to collect.
     fn alloc_words_rooted(
@@ -338,10 +377,11 @@ impl ExecutionContext for BudgetContext<'_, '_> {
         ExecutionContext::receive_marker_clear(self.inner, reference)
     }
 
-    /// Forwarded like every other method (the wrapper redirects only
-    /// [`ensure_heap`](ExecutionContext::ensure_heap)): the slice's machine latches this once
-    /// per run, so a **scheduled** process reports `call`/`return_from`/`return_to` exactly as
-    /// the single-pass `Runtime::run_*` path does.
+    /// Forwarded like every other method (see
+    /// [`resolve_external_call`](ExecutionContext::resolve_external_call) for which methods the
+    /// wrapper itself overrides): the slice's machine latches this once per run, so a
+    /// **scheduled** process reports `call`/`return_from`/`return_to` exactly as the
+    /// single-pass `Runtime::run_*` path does.
     #[inline]
     fn trace_enabled(&self) -> bool {
         ExecutionContext::trace_enabled(self.inner)
