@@ -2178,10 +2178,11 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// * a module that is **not already loaded** is loaded on demand exactly as
     ///   [`Self::call_bif`] does (so the callee's `receive` suspends *this* process in the
     ///   first call too, not only the second); a load failure → `Ok(None)`, leaving
-    ///   [`Self::call_bif`] to reproduce the identical `undef` diagnostic. A module loaded
-    ///   that way whose own code reads the call site it runs at
-    ///   ([`module_observes_its_call_site`]) → `Ok(None)` as well, so the on-demand route
-    ///   never widens the caller-identity caveat documented above;
+    ///   [`Self::call_bif`] to reproduce the identical `undef` diagnostic. A callee whose own
+    ///   code reads the call site it runs at ([`module_observes_its_call_site`]) → `Ok(None)`,
+    ///   whether it was already cached or loaded on demand by this very call — the guard is
+    ///   applied to both paths, so the answer never depends on *when* the module was cached
+    ///   (the seam is idempotent, see the note at the guard);
     /// * a function atom or export the callee does not have → `Ok(None)`, so the synchronous
     ///   path reports the oracle's `undef` byte for byte.
     ///
@@ -2250,6 +2251,11 @@ impl ExecutionContext for RuntimeContext<'_> {
         // it with a machine whose own admission point is unarmed) — exactly its behaviour
         // before this seam existed.
         //
+        // This check reads the NIF registry's own loaded-library set and nothing this seam
+        // caches, so it is **idempotent**: resolving one instruction twice answers the same.
+        // (It is also why a *second* `load_nif` call from an already-loaded module is already
+        // refused here — the library is registered by then.)
+        //
         // [`NifRegistry::lookup`]: crate::nif::NifRegistry
         if self.runtime.nifs.borrow().is_loaded(module) {
             return Ok(None);
@@ -2260,12 +2266,12 @@ impl ExecutionContext for RuntimeContext<'_> {
         if self.runtime.registry.contains(module, function, arity) {
             return Ok(None);
         }
-        // Resolve the callee's module handle. A module that is **already cached** is entered
-        // here exactly as before; an uncached one is loaded **on demand**, exactly as
-        // [`Self::call_bif`] does, so the *first* call to a module runs in this machine too.
-        // Without that, a `receive` inside the callee would fold into `error::blocked()` at the
-        // call site — which is the A.9 boot blocker: `proc_lib:sync_start/2` waits in a module
-        // its caller has not touched yet, so the first `call_ext` into it is the blocking one.
+        // Resolve the callee's module handle. A module that is **already cached** is used as
+        // is; an uncached one is loaded **on demand**, exactly as [`Self::call_bif`] does, so
+        // the *first* call to a module runs in this machine too. Without that, a `receive`
+        // inside the callee would fold into `error::blocked()` at the call site — which is the
+        // A.9 boot blocker: `proc_lib:sync_start/2` waits in a module its caller has not touched
+        // yet, so the first `call_ext` into it is the blocking one.
         //
         // The load is the same `find_module_file` + `CodeServer::load` pair [`Self::call_bif`]
         // runs, and it hands back the very same `Arc<Module>` the code server caches, so the
@@ -2280,19 +2286,27 @@ impl ExecutionContext for RuntimeContext<'_> {
                 let Ok(callee) = self.runtime.code_server.load(module) else {
                     return Ok(None);
                 };
-                // A module loaded **on demand here** is the only case this seam changes (it
-                // used to take the synchronous path), and an in-machine callee runs under the
-                // **caller's** recorded `current_module` (see the NIF exclusion above). Entering
-                // a module whose own code *reads* that call site would therefore be new
-                // exposure, so it keeps the synchronous [`Self::call_bif`] path — byte for byte
-                // its behaviour before this seam loaded it. An already-cached module is
-                // untouched by this check: entering it here is its pre-existing behaviour.
-                if module_observes_its_call_site(&callee) {
-                    return Ok(None);
-                }
                 callee
             }
         };
+        // An in-machine callee runs under the **caller's** recorded `current_module` (see the
+        // NIF exclusion above), so a module whose own code *reads* that call site
+        // ([`module_observes_its_call_site`]) keeps the synchronous [`Self::call_bif`] path,
+        // which enters it through `run_export` and sets the identity correctly.
+        //
+        // This check runs **after** the module is resolved, so it covers a module that was
+        // already cached and one this very call just loaded alike — the answer no longer
+        // depends on *when* the module was cached. That is what makes the seam **idempotent**,
+        // which the native baseline tier requires: the JIT resolves one `call_ext*` twice
+        // (`jit::baseline`'s `jit_ext_call` consults this seam, and a refusal falls back to
+        // `jit_step_one`, which runs the whole instruction through `Machine::step_instruction`
+        // — and therefore through this seam again). Answering `Ok(None)` on the first
+        // consultation and `Ok(Some(..))` on the second because the on-demand load had cached
+        // the module in between would enter the callee in-machine under the caller's identity
+        // — the observed wrong `bad_lib` on a module's own `erlang:load_nif/2`.
+        if module_observes_its_call_site(&callee) {
+            return Ok(None);
+        }
         // Resolve the export in the **callee's own** atom table (`Module` code's atoms are
         // that table's, never the runtime's shared one) and hand back the export entry label
         // the synchronous `run_export` would enter. An unknown atom or export is the
@@ -2651,9 +2665,12 @@ impl ExecutionContext for RuntimeContext<'_> {
 /// global-pattern approximation only use it conservatively.
 ///
 /// The scan is over the module's `ImpT` table ([`Module::imports`]), which is where a compiled
-/// `M:F/A` call is recorded. A call reached only through `apply/3` is not covered — that is the
-/// documented residual, and it is no wider than the exposure the seam already had for a module
-/// that was cached before the call.
+/// `M:F/A` call is recorded. A call reached only through `apply/3` (`apply(erlang, load_nif, …)`)
+/// leaves no import entry to scan and is therefore not covered — the documented residual.
+///
+/// The verdict is a property of the module's own code, so the seam can apply it to an
+/// already-cached callee and to one it just loaded alike; refusing a module never depends on
+/// *when* it was cached.
 ///
 /// [`ExecutionContext::resolve_external_call`]: beam_engine::ExecutionContext::resolve_external_call
 /// [`Module::imports`]: beam_loader::Module::imports

@@ -72,42 +72,21 @@
 //!
 //! # The execution tier of a first entry
 //!
-//! A process's **first** entry can run on either execution tier (`beam_engine::Tier`); a
-//! *resume* continues the machine it suspended in, on the interpreter, with no tier entry.
-//! [`tier`] owns the selection and the soundness argument for it: the baseline JIT is only
-//! chosen when the entry module is **provably free of a module-context switch**
-//! (`Step::Enter`) — no `apply`/`apply_last`, and every `call_ext*` target provably
-//! synchronous — because the JIT driver has no in-machine module switch and would turn such
-//! a step into a bogus exit reason. The mode is [`JitMode`](tier::JitMode):
-//! [`Auto`](tier::JitMode::Auto) — **the default**, the JIT exactly where the predicate
-//! proves the entry module switch-safe and the interpreter everywhere else — or
-//! [`Interpreter`](tier::JitMode::Interpreter) / [`Baseline`](tier::JitMode::Baseline) from
-//! `BEAM_RT_TIER` / a test.
+//! A process's **first** entry can run on either execution tier (`beam_engine::Tier`), and the
+//! chosen tier is carried across every later slice. [`tier`] owns the selection and the
+//! soundness argument for it: the engine's baseline driver handles the module-context switch
+//! (`Step::Enter`), so the native tier is sound for **any** module and [`JitMode::Auto`] —
+//! **the default** — selects it for every process entry. [`Interpreter`](tier::JitMode::Interpreter)
+//! (the `BEAM_RT_TIER=interpreter` kill switch) pins the always-correct reference tier.
 //!
-//! # Why the default is `auto`
+//! # Why the default is the native tier
 //!
-//! [`tier::jit_is_switch_safe`] is the only thing between a JIT slice and the driver's
-//! `Step::Enter` gap, so the default is the *predicate-guarded* mode, never the switch-blind
-//! [`Baseline`](tier::JitMode::Baseline): a module the predicate cannot prove safe runs on
-//! the always-correct interpreter. The measured picture (release build, no per-process `erl`
-//! start-up — the system code path resolves natively from the filesystem — alternating runs,
-//! min/median seconds):
-//!
-//! | workload | interpreter | `auto` (JIT where safe) |
-//! |---|---|---|
-//! | `walk:cnt/1 20000000` (non-allocating tail loop) | 16.05 / 17.05 | 0.116 / 0.127 |
-//! | `al:tailnoalloc/1 20000000` (non-allocating tail loop) | 19.35 | 0.114 |
-//! | `fibn:fib/1 27` (allocating tree recursion) | 0.384 / 0.403 | 0.273 / 0.284 |
-//! | `al:list/1 3000000` (allocating tail loop) | 1.34 / 1.40 | 1.27 / 1.43 |
-//! | `slice:fib/1 300000` (the slice fixture) | 0.135 / 0.183 | 0.119 / 0.226 |
-//! | `slice:fib/1 32` (the slice fixture) | 0.026 / 0.033 | 0.022 / 0.029 |
-//!
-//! Nothing regresses beyond the run-to-run noise; the 139–170× win is the
-//! no-heap-admission-point shape, which stays in its one tier-chosen slice. The ≈neutral
-//! `allocate`/`test_heap` rows are the two missing **engine** seams — no tier-aware resume (a
-//! pre-empted process is resumed on the interpreter) and no in-machine module-context switch
-//! — so a *switch-safe* module is tiered for its first slice and interpreted after a park.
-//! [`tier`] owns the full soundness argument.
+//! The baseline tier is interpreter-identical (its per-instruction deopt *is* the interpreter
+//! step) and nothing regresses, so the default no longer needs a predicate to guard it: the one
+//! host-side obligation — that the cross-module seam
+//! ([`RuntimeContext::resolve_external_call`](crate::context)) answers a repeated resolution of
+//! one `call_ext*` identically — is enforced in the seam itself, not by refusing modules a tier.
+//! [`tier`] owns the soundness argument and the measured picture.
 //!
 //! # Layout
 //!
@@ -116,7 +95,7 @@
 //! * [`run`] — the [`ProcessRunner`](beam_process::ProcessRunner) implementation
 //!   ([`RuntimeRunner`]): one reduction slice of one scheduled process.
 //! * [`budget`] — the slice's reduction budget and the wrapper context that charges it.
-//! * [`tier`] — the static execution-tier selection and the switch-safety predicate.
+//! * [`tier`] — the execution-tier selection (the `BEAM_RT_TIER` mode and its default).
 //! * [`reason`] — the exit-reason translation and the finite-`receive` deadline recovery.
 //! * [`perf`] — the `+JPperf` code-map feed (contract A.8).
 

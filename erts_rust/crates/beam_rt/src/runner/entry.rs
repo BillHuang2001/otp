@@ -176,19 +176,11 @@ pub(crate) struct RunnerState {
     /// the process environment (the crate is `#![deny(unsafe_code)]`, and `set_var` is
     /// `unsafe` in edition 2024) and the CLI is measured by setting the variable.
     pub(super) jit_mode: Option<super::tier::JitMode>,
-    /// The memoized per-module tier switch-safety verdict, keyed by module name.
-    ///
-    /// [`jit_is_switch_safe`](super::tier::jit_is_switch_safe) is evaluated once per
-    /// module per pass and is a linear scan of the module's code, so a benchmark that
-    /// spawns many processes of one module would otherwise rescan it on every spawn. The
-    /// memo is sound because a "safe" verdict is sticky — the floor list is constant and
-    /// the NIF/registry sets only grow (see `super::tier`).
-    pub(super) jit_safety: HashMap<String, bool>,
 }
 impl RunnerState {
     /// The execution-tier mode in force: the explicitly set one, else the `BEAM_RT_TIER`
     /// environment default ([`JitMode::Auto`](super::tier::JitMode::Auto) when the variable
-    /// is unset — the JIT exactly where the predicate proves it safe).
+    /// is unset — the native baseline tier for every process entry).
     pub(super) fn jit_mode(&self) -> super::tier::JitMode {
         self.jit_mode.unwrap_or_else(super::tier::env_default)
     }
