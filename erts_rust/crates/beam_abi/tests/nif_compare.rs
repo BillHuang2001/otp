@@ -35,7 +35,13 @@
 //! The `enif_*` symbols it calls are UNDEFINED in the `.so` and bind at `dlopen(RTLD_NOW)` against
 //! this test binary (`build.rs` adds `-Wl,--export-dynamic`).
 //!
-//! The third test pins the residual gap: an atom pair *nested* inside a compound still orders by
+//! The third test covers the **fresh-atom** case: a NIF that calls `enif_make_atom(env, "alpha")`
+//! and `enif_make_atom(env, "beta")` itself and then compares them, against a host whose
+//! `intern_atom` only *predicts* an index (mirroring `beam_rt`'s `PendingInterner`) so
+//! `NifHost::atom_name` cannot resolve the pair — the assertion can then pass only through the
+//! env's per-call atom record (`src/nif/host.rs`).
+//!
+//! The fourth test pins the residual gap: an atom pair *nested* inside a compound still orders by
 //! raw atom index (see the module docs of `src/nif/enif/pred.rs`); it asserts the index answer,
 //! cross-checks the oracle's name answer and says so loudly.
 //!
@@ -54,8 +60,12 @@ use std::process::Command;
 use beam_abi::nif::enif::enif_make_double;
 use beam_abi::nif::loader::{load, NifLibrary};
 use beam_abi::nif::term::eterm_from_nif;
-use beam_abi::NifEnv;
-use beam_term::prelude::{is_small, make_small, signed_value, tuple_element, tuple_size, Eterm};
+use beam_abi::{NifEnv, NifHost};
+use beam_alloc::Heap;
+use beam_term::atom::Atom;
+use beam_term::prelude::{
+    is_small, make_atom, make_small, signed_value, tuple_element, tuple_size, Eterm,
+};
 
 use common::{compile_so, skip, TestHost};
 
@@ -217,6 +227,72 @@ fn nested_atoms(env: &mut NifEnv, lib: &NifLibrary) -> Vec<i64> {
     tuple_ints(term)
 }
 
+/// `fresh_atoms/0` through the loaded library: `compare(alpha, beta)`, `compare(beta, alpha)` where
+/// **both** atoms are interned by the NIF itself, in this call.
+#[track_caller]
+fn fresh_atoms(env: &mut NifEnv, lib: &NifLibrary) -> Vec<i64> {
+    let term = lib
+        .call(env, "fresh_atoms", 0, &[])
+        .unwrap_or_else(|err| panic!("fresh_atoms/0 must be callable: {err:?}"));
+    tuple_ints(term)
+}
+
+// ---------------------------------------------------------------------------------------------
+// A host whose `intern_atom` defers the commit (the `beam_rt` `PendingInterner` shape)
+// ---------------------------------------------------------------------------------------------
+
+/// A [`NifHost`] that mirrors `beam_rt`'s `PendingInterner`
+/// (`beam_rt/src/context/bridges.rs`): [`NifHost::intern_atom`] **predicts** the next atom index
+/// and remembers the name, but nothing is committed to a committed table — so
+/// [`NifHost::atom_name`] cannot resolve any atom for the whole call.
+///
+/// That is precisely the situation the real runtime puts `enif_compare` in for a pair the NIF
+/// interned moments earlier in the same call, and it makes the env's per-call atom record the only
+/// resolver. `beta` is interned before `alpha` by the fixture, so the predicted indices run
+/// opposite to the names: an index fallback would answer `+1` where the names say `-1`.
+struct DeferredHost {
+    heap: Heap,
+    /// Names interned during the call, in intern order (the analog of `PendingInterner::names`).
+    pending: Vec<String>,
+}
+
+impl DeferredHost {
+    fn new() -> DeferredHost {
+        DeferredHost {
+            heap: Heap::new(4096).expect("a test heap is allocatable"),
+            pending: Vec::new(),
+        }
+    }
+
+    /// The names interned so far — **never** committed, so this is the only record of them.
+    fn pending(&self) -> &[String] {
+        &self.pending
+    }
+}
+
+impl NifHost for DeferredHost {
+    fn heap(&mut self) -> &mut Heap {
+        &mut self.heap
+    }
+
+    /// Predict the next index and remember the name, without committing it anywhere.
+    fn intern_atom(&mut self, name: &str) -> Option<Eterm> {
+        if let Some(offset) = self.pending.iter().position(|pending| pending == name) {
+            // A duplicate within this call reuses the predicted index.
+            return Some(make_atom(Atom::from_raw(offset as u32)));
+        }
+        let index = self.pending.len();
+        self.pending.push(name.to_string());
+        Some(make_atom(Atom::from_raw(index as u32)))
+    }
+
+    /// The committed table is empty for the whole call (nothing is ever committed), so every
+    /// lookup misses — exactly the `PendingInterner` situation.
+    fn atom_name(&mut self, _atom: Eterm) -> Option<String> {
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // The Rust runtime
 // ---------------------------------------------------------------------------------------------
@@ -307,6 +383,52 @@ fn the_same_fixture_agrees_under_the_erl_oracle() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The fresh-atom case: both operands interned *by the NIF*, in this very call
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn atoms_interned_inside_the_nif_are_ordered_by_name() {
+    let Some(so) = compile_fixture() else { return };
+    let Some(path) = so_path(&so) else { return };
+
+    // The deferred host cannot resolve *any* atom name (`atom_name` always misses, nothing is ever
+    // committed), so the pair can be ordered by name only through the env's per-call atom record.
+    let mut host = DeferredHost::new();
+    let lib = load(&path, MODULE, &mut host, Eterm::nil()).expect("the fixture must load");
+    let mut env = NifEnv::new(&mut host);
+
+    let got = fresh_atoms(&mut env, &lib);
+    drop(env);
+    assert_eq!(
+        got,
+        vec![-1, 1],
+        "the env's per-call atom record orders the fresh pair by NAME"
+    );
+
+    // What the fixture interned, and the indices the host predicted: `beta` → 0, `alpha` → 1, i.e.
+    // the index order is the reverse of the name order — so the raw-index fallback would have
+    // answered `vec![1, -1]` here.
+    assert_eq!(host.pending().len(), 2, "exactly the pair was interned");
+    assert_eq!(host.pending()[0], "beta");
+    assert_eq!(host.pending()[1], "alpha");
+    assert_eq!(
+        host.atom_name(make_atom(Atom::from_raw(1))),
+        None,
+        "the host committed no name, so it cannot have resolved the pair"
+    );
+
+    // The oracle agrees on the very same `.so`.
+    let Some(lines) = oracle_print(&so, &["fresh_atoms()".to_string()]) else {
+        return;
+    };
+    assert_eq!(
+        lines,
+        vec![erl_tuple(&[-1, 1])],
+        "the oracle orders both fresh atoms by NAME"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
 // The documented residual gap: an atom pair nested inside a compound
 // ---------------------------------------------------------------------------------------------
 
@@ -385,7 +507,7 @@ fn oracle_print(so: &Path, exprs: &[String]) -> Option<Vec<String>> {
     // replacement possible. Every `ErlNifFunc` the fixture declares must be exported here (the load
     // refuses a declared NIF the module does not have).
     let mut erl = format!("-module({MODULE}).\n");
-    erl.push_str("-export([compare/2, order_pairs/0, nested_atoms/0]).\n");
+    erl.push_str("-export([compare/2, order_pairs/0, nested_atoms/0, fresh_atoms/0]).\n");
     erl.push_str("-on_load(init/0).\n\n");
     erl.push_str(&format!(
         "init() ->\n    erlang:load_nif(\"{nif_path}\", 0).\n\n"
@@ -393,6 +515,7 @@ fn oracle_print(so: &Path, exprs: &[String]) -> Option<Vec<String>> {
     erl.push_str("compare(_, _) -> erlang:nif_error(nif_not_loaded).\n");
     erl.push_str("order_pairs() -> erlang:nif_error(nif_not_loaded).\n");
     erl.push_str("nested_atoms() -> erlang:nif_error(nif_not_loaded).\n");
+    erl.push_str("fresh_atoms() -> erlang:nif_error(nif_not_loaded).\n");
 
     let erl_file = dir.join(format!("{MODULE}.erl"));
     std::fs::write(&erl_file, erl).expect("the oracle module is writable");

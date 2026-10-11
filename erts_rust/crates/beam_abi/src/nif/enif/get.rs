@@ -219,7 +219,7 @@ pub unsafe extern "C" fn enif_get_atom(
         return 0;
     };
     let name: String = match e.recorded_atom_name(t(atom)) {
-        Some(name) => name.to_string(),
+        Some(name) => name,
         None => match e.host().atom_name(t(atom)) {
             Some(name) => name,
             None => return 0,
@@ -283,7 +283,7 @@ pub unsafe extern "C" fn enif_get_atom_length(
         return 0;
     };
     let name: String = match e.recorded_atom_name(t(atom)) {
-        Some(name) => name.to_string(),
+        Some(name) => name,
         None => match e.host().atom_name(t(atom)) {
             Some(name) => name,
             None => return 0,

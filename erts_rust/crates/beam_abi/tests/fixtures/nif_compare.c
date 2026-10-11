@@ -31,6 +31,14 @@
  *                   remaining gap: this runtime orders it by raw atom index
  *                   where the oracle orders it by name (see the module docs of
  *                   src/nif/enif/pred.rs).
+ *   fresh_atoms/0   `[enif_compare(alpha, beta), enif_compare(beta, alpha)]` where
+ *                   BOTH atoms are created inside this very call by
+ *                   `enif_make_atom` (and `beta` is created first, so the atom
+ *                   indices run opposite to the names). This is the case a NIF
+ *                   host whose `intern_atom` only *predicts* an index -- and
+ *                   therefore cannot resolve the names through `atom_name` --
+ *                   can only get right through the env's per-call atom record.
+ *                   Oracle: `{-1,1}`.
  */
 
 #include <erl_nif.h>
@@ -134,10 +142,38 @@ static ERL_NIF_TERM nested_atoms(ErlNifEnv* env, int argc, const ERL_NIF_TERM ar
     return enif_make_tuple_from_array(env, results, NESTED_COUNT);
 }
 
+/* ---------------------------------------------------------------------------
+ * the fresh-atom case: both operands are interned INSIDE this call
+ * ------------------------------------------------------------------------- */
+
+#define FRESH_COUNT 2
+
+static ERL_NIF_TERM fresh_atoms(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+    ERL_NIF_TERM results[FRESH_COUNT];
+    ERL_NIF_TERM alpha, beta;
+
+    (void)argc;
+    (void)argv;
+
+    /* `beta` is interned FIRST on purpose: the atom indices then run *opposite*
+     * to the names, so a comparison that fell back to the index would answer the
+     * opposite value. */
+    beta = enif_make_atom(env, "beta");
+    alpha = enif_make_atom(env, "alpha");
+
+    /*                                            oracle says -1 / 1 */
+    results[0] = enif_make_int(env, enif_compare(alpha, beta));
+    results[1] = enif_make_int(env, enif_compare(beta, alpha));
+
+    return enif_make_tuple_from_array(env, results, FRESH_COUNT);
+}
+
 static ErlNifFunc nif_funcs[] = {
     {"compare", 2, compare_2, 0},
     {"order_pairs", 0, order_pairs, 0},
     {"nested_atoms", 0, nested_atoms, 0},
+    {"fresh_atoms", 0, fresh_atoms, 0},
 };
 
 ERL_NIF_INIT(test_nif_compare, nif_funcs, NULL, NULL, NULL, NULL)
