@@ -75,11 +75,6 @@
 //!   pair ([`crate::refc::ERL_REFC_BITS_SIZE`], `8` words); a match context over an
 //!   on-heap bitstring instead contributes the size of the *copied* window
 //!   (`copy.c:219-242`).
-//!
-//! # Known Issues
-//!
-//! * **Native records** (`RECORD_SUBTAG`) are treated like tuples (their
-//!   field-table layout is not yet modelled).
 
 use std::collections::HashSet;
 
