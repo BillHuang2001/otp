@@ -139,6 +139,17 @@ Full detail is in the child node **`src/abi/CONTEXT.md`** — read it there.
   Path spelling is the caller's: **no** `.so` suffix is appended (unlike `erts_sys_ddll_open`).
   The `-Wl,--export-dynamic` requirement is a property of the **loading** link, shared with `beam_abi`/`beam_rt` (an `RTLD_NOW` load resolves `enif_*`/`driver_*` out of the loading executable's `.dynsym`); this crate's part is its `build.rs`.
 
+### `fs_access.rs` — the safe `access(2)` / `geteuid(2)` / `getegid(2)` floor
+- `AccessMode { Exists, Read, Write, Execute }` (`ALL`; `libc_mode()` reads `libc`'s `F_OK`/`R_OK`/`W_OK`/`X_OK` — no re-spelled constants).
+- `try_access(&Path, AccessMode) -> Result<()>` — the crate's **one `access(2)` call site**, errno-preserving: `Ok(())` iff the kernel grants the mode, `Err(BeamError::Io(err))` carrying the untouched `access(2)` errno on refusal (an `EINTR` wait is retried), `Err(BeamError::BadArg)` for an interior-NUL path.
+  This is the form a caller needs when the *reason* matters (the spawn driver's `X_OK` render as `error:enoent`/`error:eacces`).
+- `access(&Path, AccessMode) -> Result<bool>` — the boolean form: a **refusal** (`EACCES`/`ENOENT`/`ENOTDIR`/`ELOOP`/`ENAMETOOLONG`/`EPERM`/`EROFS`/`ETXTBSY`) is `Ok(false)`, only a genuine syscall failure is `BeamError::Io` (never a silently-wrong "no access").
+- `path_access(&Path) -> Result<(bool /*read*/, bool /*write*/)>` — the `#file_info{}` `access` slot: the reference's two **independent** `R_OK`/`W_OK` probes (`efile_read_info`, `unix_prim_file.c:754-762`), each [`access`], so a refusal is `false`, not an error (a writable-but-unreadable path answers `(false, true)`).
+- `process_credentials() -> Result<(u32 /*euid*/, u32 /*egid*/)>` — `geteuid(2)`/`getegid(2)`, the **effective** ids the reference's handle-based `check_access` compares a `stat` against (`unix_prim_file.c:771-801`).
+  Takes no argument and cannot fail (POSIX), so it always returns `Ok`; the `Result` only keeps the module's uniform fallible signature.
+- `unsafe` appears only in the two syscall wrappers, each with a `// SAFETY:` rationale.
+  Re-exported at the crate root and in `prelude`.
+
 ## Constraints
 - Errors: **`beam_common::{Result, BeamError}` only**; I/O/syscall failures⇒`BeamError::Io`, argument faults⇒`BeamError::BadArg`, id/registration exhaustion⇒`BeamError::SystemLimit`.
   Never panic on runtime data, never `unwrap()`, never `todo!`/`unreachable!` in shipped code.
