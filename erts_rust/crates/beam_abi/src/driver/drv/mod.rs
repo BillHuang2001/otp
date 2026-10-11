@@ -232,8 +232,8 @@ const EMPTY_DRIVER_API: ErlDrvApi = unsafe { core::mem::zeroed() };
 /// The runtime's populated `driver_*` / `erl_drv_*` table.
 ///
 /// `#[used]` keeps this static (and hence the `#[no_mangle]` functions it names) in the linkage, so a
-/// driver `.so` loaded into the process can resolve them. Slots left `None` are listed in the module
-/// header.
+/// driver `.so` loaded into the process can resolve them. Every one of the `111` LP64 slots is
+/// populated (`tests/abi_conformance.rs` asserts no field is left `None`).
 ///
 /// The table is assembled by a `const fn` `populate` chain: **each file owns the `Some(…)` list for
 /// the slots it implements** (`mem` the host-free group, `port` the port/host-dependent group, and
