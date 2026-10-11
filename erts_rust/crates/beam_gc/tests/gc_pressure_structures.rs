@@ -332,13 +332,14 @@ fn collision_node_survives_a_promotion_then_a_fullsweep() {
 fn hamt_maps_survive_every_collection_on_both_strategies() {
     const ROUNDS: usize = 4;
     for kind in [MatureKind::Copying, MatureKind::Immix] {
-        // The nursery is resized after every collection (`Collector::resize_nursery` ->
-        // `HeapPolicy::young_after_collection`, mirroring C `erl_gc.c:1493`), which *shrinks*
-        // it when a round leaves it mostly empty. Each round below reserves a fresh, growing
-        // HAMT block in the nursery (`map_words_capacity(100) == 2118` words by the last
-        // round), so pin a `min_heap_words`/`initial_young_words` floor at/above that;
-        // otherwise the resize shrinks the nursery below the next round's reservation and the
-        // build fails (a brittle test, not a collector fault).
+        // The nursery is re-sized after every collection (the chain collapses to one space,
+        // then `HeapPolicy::young_after_collection` sizes it from the surviving words,
+        // mirroring C `erl_gc.c:1493`), which *shrinks* it when a round leaves it mostly
+        // empty. Each round below reserves a fresh, growing HAMT block in the nursery
+        // (`map_words_capacity(100) == 2118` words by the last round), so pin a
+        // `min_heap_words`/`initial_young_words` floor at/above that; otherwise the resize
+        // shrinks the nursery below the next round's reservation and the build fails (a
+        // brittle test, not a collector fault).
         let config = GcConfig::copying(policy_with_min(1, 4096, 16384, 4096)).with_mature(kind);
         let mut collector = AnyCollector::from_config(&config).expect("collector");
         let atoms = AtomTable::new();
