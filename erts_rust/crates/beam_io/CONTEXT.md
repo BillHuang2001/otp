@@ -153,8 +153,8 @@ Full detail is in the child node **`src/abi/CONTEXT.md`** — read it there.
 ## Constraints
 - Errors: **`beam_common::{Result, BeamError}` only**; I/O/syscall failures⇒`BeamError::Io`, argument faults⇒`BeamError::BadArg`, id/registration exhaustion⇒`BeamError::SystemLimit`.
   Never panic on runtime data, never `unwrap()`, never `todo!`/`unreachable!` in shipped code.
-- **Safe Rust by default.** `unsafe` only in the raw syscall wrappers (`libc::read`/`write`/`pipe`/`fcntl`/`open`/`dup`/`fstat`/`lseek`/`fsync`/`ftruncate`/`close`, the spawn driver's `fork`/`execve`/`waitpid`/`access`/`dup2`, the `inet` socket helpers incl.
-  `setsockopt`/`getsockopt` in `drivers/inet/sys.rs`, the `cpu_time.rs` `getrusage`/`clock_gettime`, the `signal.rs` `pipe2`/`sigaction`, the `ddll.rs` `dlopen`/`dlsym`/`dlclose`), `mio::unix::SourceFd` construction, and the `abi` host's raw `ErlDrv*` handling.
+- **Safe Rust by default.** `unsafe` only in the raw syscall wrappers (`libc::read`/`write`/`pipe`/`fcntl`/`open`/`dup`/`fstat`/`lseek`/`fsync`/`ftruncate`/`close`, the spawn driver's `fork`/`execve`/`waitpid`/`dup2`, the `inet` socket helpers incl.
+  `setsockopt`/`getsockopt` in `drivers/inet/sys.rs`, the `cpu_time.rs` `getrusage`/`clock_gettime`, the `signal.rs` `pipe2`/`sigaction`, the `ddll.rs` `dlopen`/`dlsym`/`dlclose`, the `fs_access.rs` `access`/`geteuid`/`getegid`), `mio::unix::SourceFd` construction, and the `abi` host's raw `ErlDrv*` handling.
   Every `unsafe` block carries a preceding `// SAFETY:` rationale; `unsafe_op_in_unsafe_fn` stays clean.
 - **Port ids come from `beam_process::PortTable`** — no second number allocator; `PortId` encoding stays `beam_term`'s internal-port immediate; a failed `start` runs the driver's teardown (deregistering any fd) and releases the number — no id-space/poller leak.
 - **Single-thread invariant (enforced).** `Port`/`PortRegistry` are **not** thread-safe and this crate has no locking: create and drive them from **one OS thread**.
