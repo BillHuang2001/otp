@@ -304,6 +304,20 @@ constructors only (no new error enum).
   nursery from the (now empty) *surviving* set — a further collect would shrink it, never grow it. A
   `max_heap_words` cap that cannot reach `need_words` yields a typed `heap_exhausted` before any copy.
   `HeapPolicy::unbounded()`/`GcConfig::growable()` express "no cap" (see Handoffs).
+- **The young nursery is a CHAIN of spaces (`src/nursery.rs`), and `grow_nursery` is a NO-RELOCATION seam.**
+  `Collector`/`GenImmixCollector` own a `Nursery` — a **current** space plus the spaces a growth
+  **retired** — rather than a single `HeapSpace`. `HeapSpace` never reallocates, so growing the nursery by
+  *replacement* would strand every live word; `Nursery::grow` instead **retains** the old space and points
+  the allocator at a fresh, larger one (`target = next_words(need_words, 0).max(current_capacity)`, one
+  bounded step), so every live word keeps its **original address** and nothing is moved. That is exactly what
+  makes the seam sound for a caller holding **no root set** — the un-rooted `beam_rt` allocation path, which
+  must not collect (a copying collection may only run against a complete root set). `young()`/`young_mut()`
+  keep returning the **current** (allocatable) space, so every host site keeps compiling unchanged;
+  `young_contains` and the collection from-set cover **every** space (`Nursery::spaces`); and after any
+  collection the chain is **collapsed to exactly one space** (`Nursery::collapse`), because the collection
+  already evacuated them all. `HeapObservable::heap_size_words` reports the **summed** nursery while a chain
+  is live; `should_collect` reads the current space only (the sole allocatable one). A `max_heap_words`/
+  growth-table ceiling that cannot reach the request returns the typed `heap_exhausted` and retires nothing.
 
 - **`xptr_tag` is not needed.** The C ORs the literal bit back in only for literal-area copies
   (`copy.c:2109`); a GC collection copies only in-heap objects, so a copied pointer never carries the literal
