@@ -1083,6 +1083,341 @@ fn apply_last_pops_its_frame_then_enters_a_resolved_callee() {
 }
 
 // -----------------------------------------------------------------------
+// The closure-apply seam (`ExecutionContext::resolve_local_fun`)
+// -----------------------------------------------------------------------
+
+/// A resolver that answers **any** fun with the given callee handle and lambda
+/// entry label (the in-machine closure-apply seam).
+///
+/// The seam is handed the fun term and the call args; this test host ignores the
+/// term and always answers with the closure module/label it was built for — the
+/// engine reads the free variables from the term itself.
+fn local_fun_resolver(callee: Arc<Module>, label: Label) -> crate::context::LocalFunResolver {
+    Box::new(move |_fun, _args| Ok(Some((Arc::clone(&callee), label))))
+}
+
+#[test]
+fn resolve_local_fun_defaults_to_none() {
+    // The trait's default body declines every closure — a host that does not
+    // override it keeps the value-returning `apply_fun` route unchanged.
+    let mut ctx = MinimalContext::new();
+    assert!(ctx
+        .resolve_local_fun(make_small(0), &[make_small(1)])
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn call_fun_enters_a_resolved_local_closure_in_the_same_machine() {
+    // A host that answers `resolve_local_fun` runs the closure **in this machine**:
+    // the engine registers the closure's module context, places the call arguments
+    // (already in `x(0..arity)`) and the closure's free variables at `x(arity..)`
+    // (C's `reg[i + arity] = funp->env[i]`), stores the caller's return address in
+    // the live frame, and reports `Step::Enter`.
+    //
+    // The lambda entry `g/2` accepts `arity + num_free` = 2 args: `x(0)` is the call
+    // argument, `x(1)` the free variable. `g` returns `x(1)` verbatim, so the test
+    // proves the *free variable* reached `x(1)` by comparing it after the call.
+    let mut callee = Fixture::named("c");
+    // `g/2` returns its **second** register (`x(1)` — the free variable), so a
+    // correct placement yields the free variable's value, not the call argument.
+    let g = callee.add_function(
+        "g",
+        2,
+        vec![
+            Instr::Label(Label(20)),
+            Instr::Move {
+                src: beam_loader::Operand::X(1),
+                dst: beam_loader::Operand::X(0),
+            },
+            Instr::Return,
+        ],
+    );
+    let callee = Arc::new(callee.finish());
+    let module = Fixture::new().finish();
+
+    let mut machine = Machine::new();
+    machine.push_frame(0).unwrap();
+    let mut ctx = MinimalContext::with_local_fun_resolver(local_fun_resolver(callee, g));
+    // x(0) = the call argument (7); x(1) = a one-free-variable local closure whose
+    // capture is 99 — the `call_fun Arity` shape puts the fun in `x(arity)`.
+    let fun = terms::make_fun(&mut ctx, 1, 0, 0, &[make_small(99)]).expect("materialize the closure");
+    machine.set_x(0, make_small(7)).unwrap();
+    machine.set_x(1, fun).unwrap();
+
+    let labels = LabelMap::new();
+    let step = exec(
+        &mut machine,
+        &module,
+        &labels,
+        &Instr::CallFun { arity: 1 },
+        5,
+        7,
+        &mut ctx,
+    )
+    .expect("the closure resolves");
+    assert_eq!(
+        step,
+        Some(Step::Enter {
+            context: 1,
+            func: 0,
+            pc: 0,
+        }),
+        "the closure body is entered in its own registered context"
+    );
+    // The free variable landed at `x(arity)` = `x(1)`, the call argument stayed in x(0).
+    assert_eq!(machine.x(0), Some(make_small(7)), "the call argument stayed put");
+    assert_eq!(machine.x(1), Some(make_small(99)), "the free variable landed at x(arity)");
+    assert_eq!(
+        machine.continuation().unwrap(),
+        Continuation::Address {
+            func: 5,
+            pc: 8,
+            context: 0,
+        },
+        "the caller's return address is stored in the live frame"
+    );
+}
+
+#[test]
+fn call_fun_without_the_seam_uses_the_value_returning_fallback() {
+    // A host with no `resolve_local_fun` hook falls back to `apply_fun`, which is
+    // byte-identical to the pre-seam behaviour: the hook's value is stored in
+    // `x(0)` and the instruction reports `Step::Next`.
+    let mut fixture = Fixture::new();
+    fixture.add_fun("lambda", 1, 0, 1);
+    let entry = fixture.add_function(
+        "f",
+        1,
+        vec![
+            Instr::Label(Label(1)),
+            Instr::MakeFun3 {
+                index: 0,
+                dst: beam_loader::Operand::X(1),
+                env: Vec::new(),
+            },
+            Instr::CallFun { arity: 1 },
+            Instr::Return,
+        ],
+    );
+    let module = fixture.finish();
+
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::with_apply_hook(Box::new(|_fun, args| {
+        Ok(make_small(signed_value(args[0]) + 1))
+    }));
+    let result = machine
+        .run_label(&module, entry, 2, &[make_small(4), make_small(0)], &mut ctx)
+        .expect("the fallback applies the closure");
+    assert_eq!(result, make_small(5));
+}
+
+#[test]
+fn call_fun2_enters_a_resolved_local_closure_via_its_operand() {
+    // `call_fun2` reads the closure from its `Func` operand and uses the same
+    // in-machine seam as `call_fun`.
+    let mut callee = Fixture::named("c");
+    let g = callee.add_function(
+        "g",
+        1,
+        vec![
+            Instr::Label(Label(30)),
+            Instr::Move {
+                src: beam_loader::Operand::X(0),
+                dst: beam_loader::Operand::X(0),
+            },
+            Instr::Return,
+        ],
+    );
+    let callee = Arc::new(callee.finish());
+
+    let mut fixture = Fixture::new();
+    let unspec = fixture.atom("unsafe");
+    let module = fixture.finish();
+
+    let mut machine = Machine::new();
+    machine.push_frame(0).unwrap();
+    let mut ctx = MinimalContext::with_local_fun_resolver(local_fun_resolver(callee, g));
+    // The closure (no free variables) sits in `x(1)`, named by the `Func` operand.
+    let fun = terms::make_fun(&mut ctx, 1, 0, 0, &[]).expect("materialize the closure");
+    machine.set_x(1, fun).unwrap();
+    // `unsafe` is the compiler's type hint (a fun-table index or a safety atom); the
+    // interpreter ignores it (the loader rewrites `call_fun2` to `call_fun` + `move`).
+    let _ = unspec;
+
+    let labels = LabelMap::new();
+    let step = exec(
+        &mut machine,
+        &module,
+        &labels,
+        &Instr::CallFun2 {
+            tag: beam_loader::Operand::Atom(unspec),
+            arity: 1,
+            func: beam_loader::Operand::X(1),
+        },
+        2,
+        3,
+        &mut ctx,
+    )
+    .expect("the closure resolves");
+    assert_eq!(
+        step,
+        Some(Step::Enter {
+            context: 1,
+            func: 0,
+            pc: 0,
+        })
+    );
+    assert_eq!(
+        machine.continuation().unwrap(),
+        Continuation::Address {
+            func: 2,
+            pc: 4,
+            context: 0,
+        }
+    );
+}
+
+#[test]
+fn a_resolve_local_fun_error_lands_in_a_live_catch_frame() {
+    // The third defect: a raise from the seam routes through the catch-aware funnel
+    // (`Machine::raise_bif_error` → `Machine::throw_with_trace`), so it lands in the
+    // caller's live `try`/`catch` exactly as C's `handle_error` → `next_catch` does,
+    // instead of escaping as a `?`-propagated typed error.
+    let mut fixture = Fixture::new();
+    fixture.atom("badarg");
+    fixture.atom("error");
+    fixture.add_fun("lambda", 1, 0, 1);
+    let _entry = fixture.add_function(
+        "f",
+        1,
+        vec![
+            Instr::Label(Label(1)),
+            Instr::MakeFun3 {
+                index: 0,
+                dst: beam_loader::Operand::X(1),
+                env: Vec::new(),
+            },
+            Instr::CallFun { arity: 1 },
+            Instr::Return,
+        ],
+    );
+    let module = fixture.finish();
+    let badarg = module.atom_table.lookup("badarg").expect("interned");
+
+    let mut machine = Machine::new();
+    machine.push_frame(0).unwrap();
+    machine.push_catch_frame(CatchFrame::new(4, 6, 0));
+    let mut ctx = MinimalContext::new();
+    ctx.set_local_fun_resolver(Box::new(|_fun, _args| Err(BeamError::BadArg)));
+
+    let step = exec(
+        &mut machine,
+        &module,
+        &LabelMap::new(),
+        &Instr::CallFun { arity: 1 },
+        0,
+        0,
+        &mut ctx,
+    )
+    .expect("the seam's error is routable");
+    assert_eq!(step, Some(Step::Goto { func: 4, pc: 6 }));
+    // The C landing convention: x0 = THE_NON_VALUE, x1 = the reason `badarg`.
+    assert_eq!(machine.x(0), Some(Eterm::non_value()));
+    assert_eq!(machine.x(1), Some(make_atom(badarg)));
+}
+
+#[test]
+fn a_resolve_local_fun_error_without_a_catch_frame_is_the_typed_error() {
+    // With no live `try`/`catch` the raise cannot land, so the typed error
+    // propagates unchanged (the uncaught-error contract).
+    let mut fixture = Fixture::new();
+    fixture.atom("badarg");
+    fixture.atom("error");
+    fixture.add_fun("lambda", 1, 0, 1);
+    let _entry = fixture.add_function(
+        "f",
+        1,
+        vec![
+            Instr::Label(Label(1)),
+            Instr::MakeFun3 {
+                index: 0,
+                dst: beam_loader::Operand::X(1),
+                env: Vec::new(),
+            },
+            Instr::CallFun { arity: 1 },
+            Instr::Return,
+        ],
+    );
+    let module = fixture.finish();
+
+    let mut machine = Machine::new();
+    machine.push_frame(0).unwrap();
+    let mut ctx = MinimalContext::new();
+    ctx.set_local_fun_resolver(Box::new(|_fun, _args| Err(BeamError::BadArg)));
+
+    let err = exec(
+        &mut machine,
+        &module,
+        &LabelMap::new(),
+        &Instr::CallFun { arity: 1 },
+        0,
+        0,
+        &mut ctx,
+    )
+    .expect_err("no catch frame");
+    assert!(matches!(err, BeamError::BadArg));
+}
+
+#[test]
+fn an_unsupported_capability_gap_from_the_seam_stays_uncatchable() {
+    // A genuine capability gap (`error::unsupported`, whose reason atom the running
+    // module cannot name) must NOT be swallowed by the catch-aware funnel: it stays
+    // the uncatchable typed error even with a live catch frame.
+    let mut fixture = Fixture::new();
+    fixture.atom("badarg");
+    fixture.atom("error");
+    fixture.add_fun("lambda", 1, 0, 1);
+    let entry = fixture.add_function(
+        "f",
+        1,
+        vec![
+            Instr::Label(Label(1)),
+            Instr::MakeFun3 {
+                index: 0,
+                dst: beam_loader::Operand::X(1),
+                env: Vec::new(),
+            },
+            Instr::CallFun { arity: 1 },
+            Instr::Return,
+        ],
+    );
+    let module = fixture.finish();
+
+    let mut machine = Machine::new();
+    machine.push_frame(0).unwrap();
+    machine.push_catch_frame(CatchFrame::new(4, 6, 0));
+    let mut ctx = MinimalContext::new();
+    ctx.set_local_fun_resolver(Box::new(|_fun, _args| {
+        Err(crate::error::unsupported("resolve_local_fun: no module"))
+    }));
+
+    let err = exec(
+        &mut machine,
+        &module,
+        &LabelMap::new(),
+        &Instr::CallFun { arity: 1 },
+        0,
+        0,
+        &mut ctx,
+    )
+    .expect_err("a capability gap stays uncatchable");
+    assert!(matches!(err, BeamError::Raise(_)));
+    assert_eq!(machine.catch_frame_depth(), 1, "the handler was not used");
+    let _ = entry;
+}
+
+// -----------------------------------------------------------------------
 // The `Mailbox` seam the cross-module receive test drives
 // -----------------------------------------------------------------------
 
