@@ -41,6 +41,49 @@
 //! flattened iolist, or the copy [`enif_inspect_binary`] makes of a **byte-sized** bitstring
 //! whose start is not byte-aligned — the C's env-owned tmp object, which this crate has no
 //! env-local allocator for, so the buffer is released by [`enif_release_binary`] instead).
+//!
+//! # On-heap vs off-heap (refc) binaries — a documented representation deviation
+//!
+//! Every binary **term** this module builds is an *on-heap* `ErlHeapBits`: its payload words live in
+//! the arena the host hands out through `NifHost::heap`. The oracle switches representation at
+//! `ERL_ONHEAP_BINARY_LIMIT` (`beam_term::refc`: 64 bytes / 512 bits): above it the term is the
+//! 8-word `[BinRef][ErlSubBits]` pair over an **off-heap refcounted payload**
+//! (`erl_nif.c:1409-1421` — `enif_alloc_binary` is *always* off-heap; `erl_nif.c:1698-1757`;
+//! `enif_make_new_binary` → `erts_new_bitstring_refc`, `erl_bits.c:2811-2838`).
+//!
+//! What stays **exact**: the payload bytes, `bin.size`, `bin.data` (non-null, at least 8-byte
+//! aligned, and writable on the `enif_make_new_binary` path), the bit size, every bitstring
+//! predicate, and the byte-exact window `enif_make_sub_binary` returns (it splits on
+//! `ERL_ONHEAP_BITS_LIMIT` exactly as `erts_build_sub_bitstring` does). No path here yields a wrong
+//! byte, a wrong size, or a term that is not a bitstring.
+//!
+//! What differs, and is observable through the C ABI:
+//!
+//! * `enif_alloc_binary` leaves `bin.ref_bin == NULL`, where the C stores its off-heap `Binary*`
+//!   there. `ref_bin` is labelled "internals (avert your eyes)" in `erl_nif.h:166`, but it is a
+//!   public struct field a NIF can read.
+//! * A binary **above** the on-heap limit costs this crate `2 + ceil(size / 8)` on-heap words
+//!   (`heap_bits_size(8 * size)`), where the oracle's refc term costs `ERL_REFC_BITS_SIZE == 8`
+//!   words plus the off-heap payload — `size_object_x`'s `SUB_BITS_SUBTAG` arm counts the whole pair
+//!   and never the payload (`copy.c:219-242`). So `enif_term_size` and `erts_debug:flat_size`
+//!   disagree above the limit and agree at or below it: measured on OTP 29.1.1 / erts-17.1 through
+//!   the public `enif_*` entries, `enif_alloc_binary(65, …)` + `enif_make_binary` and
+//!   `enif_make_new_binary(65, …)` both report `8` words (`64` bytes) there and `11` words here,
+//!   while a 10-byte binary reports `4` words (`32` bytes) on both sides.
+//! * The payload is therefore not shared by reference: a term produced here is copied byte-wise
+//!   (never refcount-shared) if it is later sent to another process.
+//!
+//! This is a **deviation, not a wrong result**, and it cannot be closed inside this crate. Faithful
+//! representation needs an *owner for the off-heap payload handle that outlives the call*: the C
+//! parks the `BinRef` on the process's MSO list and lets the next minor GC release the payload
+//! (`erl_nif.c:1719-1736`, `:1737-1746`). `NifHost` exposes only the term arena — no off-heap
+//! registration — and the runtime's owners are `beam_gc::OffHeap` (the per-process `MSO(p)` list,
+//! whose `val` word convention is the payload's first byte, `beam_term::refc`) and
+//! `beam_message::OffHeapTable` (the copy engine's source table of
+//! [`beam_alloc::RefcBinary`](beam_alloc::RefcBinary) handles). Neither is reachable from a wave-0
+//! declaration crate that must not depend on `beam_gc`. Writing the pair with **no** owner would
+//! leak one payload per call and would leave `BinRef.val` dangling as soon as a caller-owned handle
+//! died, so the on-heap shape stands until the seam exists.
 
 use super::*;
 
@@ -114,6 +157,15 @@ pub unsafe extern "C" fn enif_realloc(ptr: *mut c_void, size: size_t) -> *mut c_
 const INSPECTED: *mut c_void = 1 as *mut c_void;
 
 /// `int enif_alloc_binary(size_t size, ErlNifBinary* bin);`
+///
+/// Hands back an owned, writable, uninitialised `size`-byte buffer with `ref_bin == NULL`.
+///
+/// **Representation deviation (see the module docs).** The C allocates an *off-heap refcounted*
+/// `Binary` for **every** size (`erts_bin_drv_alloc_fnf`, `erl_nif.c:1413`), stores it in
+/// `bin.ref_bin` and points `bin.data` at its payload. Here the payload is a plain `malloc` block
+/// and `ref_bin` stays `NULL`, so a NIF that inspects the (internal) `ref_bin` field sees a
+/// difference. Everything a NIF can act on is exact: `size`, a non-null payload, its writability
+/// and the ownership protocol of [`enif_realloc_binary`]/[`enif_release_binary`].
 ///
 /// # Safety
 ///
@@ -482,8 +534,16 @@ pub unsafe extern "C" fn enif_inspect_iolist_as_binary(
 
 /// `unsigned char* enif_make_new_binary(ErlNifEnv*, size_t size, ERL_NIF_TERM* termp);`
 ///
-/// Reserves an on-heap binary of `size` bytes, writes the term through `termp`, and returns a
-/// writable pointer to its payload (C semantics).
+/// Reserves a binary of `size` bytes, writes the term through `termp`, and returns a writable
+/// pointer to its payload (C semantics).
+///
+/// **Representation deviation (see the module docs).** The term is always an on-heap
+/// `ErlHeapBits`, so the returned pointer addresses this crate's heap block. Above
+/// `ERL_ONHEAP_BINARY_LIMIT` (64 bytes / 512 bits) the oracle instead allocates an off-heap
+/// refcounted payload and returns a pointer into it, giving an 8-word `[BinRef][ErlSubBits]` term
+/// (`erts_new_binary` → `erts_new_bitstring_refc`, `erl_bits.c:2811-2838`). The `size`, the
+/// writability of the returned pointer and the payload's bytes are therefore identical; the term's
+/// counted heap size is not (`enif_term_size`/`erts_debug:flat_size`).
 ///
 /// # Safety
 ///
@@ -517,8 +577,21 @@ pub unsafe extern "C" fn enif_make_new_binary(
 
 /// `ERL_NIF_TERM enif_make_binary(ErlNifEnv* env, ErlNifBinary* bin);`
 ///
-/// Builds an **on-heap** binary copying `bin`'s bytes, then consumes `bin` (releases an owned buffer
-/// and zeroes the struct) exactly as the C does.
+/// Builds an **on-heap** binary copying `bin`'s bytes, then consumes `bin`: the payload is no longer
+/// the caller's to free, and an owned buffer is released exactly once.
+///
+/// **Representation deviation (see the module docs).** At or below `ERL_ONHEAP_BINARY_LIMIT`
+/// (64 bytes / 512 bits) the C also produces an on-heap bitstring of the same `2 + ceil(size / 8)`
+/// words, so both sides agree. Above it the C keeps the off-heap refcounted payload and returns the
+/// 8-word `[BinRef][ErlSubBits]` pair (`erl_nif.c:1737-1746`; for an inspected `bin` with a null
+/// `ref_bin`, `erts_new_binary_from_data` makes the same split), while this crate writes the whole
+/// payload on-heap — the same bytes and `byte_size`, but a counted heap size of
+/// `2 + ceil(size / 8)` words instead of `8`.
+///
+/// **Consumption deviation.** The C's `enif_release_binary` clears `data`/`ref_bin` only under
+/// `#ifdef DEBUG` (`erl_nif.c:1451-1461`), so a release oracle leaves the caller's `bin.size` (and
+/// `bin.data`) readable after the call; this crate zeroes `size`/`data` on every path. The ownership
+/// transfer — the payload is no longer the caller's to release — is identical.
 ///
 /// # Safety
 ///
@@ -751,5 +824,170 @@ pub unsafe extern "C" fn enif_binary_to_term(
             sz
         }
         None => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Path-included-module-style tests for the binary family's **representation** (see the module
+    //! docs): the word counts this crate produces against the oracle's, measured through the public
+    //! `enif_*` entries.
+    //!
+    //! The oracle column is the measured `enif_term_size` (OTP 29.1.1 / erts-17.1) of the same call:
+    //!
+    //! | `size` | oracle `enif_make_new_binary` | oracle `enif_alloc_binary` + `enif_make_binary` |
+    //! |---|---|---|
+    //! | 0 | 2 words | 2 words |
+    //! | 1 | 3 words | 3 words |
+    //! | 10 | 4 words | 4 words |
+    //! | 64 | 10 words | 10 words |
+    //! | 65 | **8 words** (refc pair) | **8 words** (refc pair) |
+    //! | 100 | **8 words** (refc pair) | **8 words** (refc pair) |
+    //!
+    //! So the two sides agree at and below `ERL_ONHEAP_BINARY_LIMIT` (`2 + ceil(size / 8)` words) and
+    //! differ above it, which is the documented deviation these tests pin. The oracle's
+    //! `b.ref_bin` is non-NULL after `enif_alloc_binary` for **every** size and its `b.size` is
+    //! unchanged by `enif_make_binary` (release build).
+
+    use super::*;
+
+    use beam_alloc::Heap;
+    use beam_term::atom::AtomTable;
+
+    use crate::nif::host::NifHost;
+
+    /// The minimal host the binary family needs: an arena plus an atom table (`badarg` interning).
+    struct BinaryHost {
+        heap: Heap,
+        atoms: AtomTable,
+    }
+
+    impl BinaryHost {
+        fn new() -> BinaryHost {
+            BinaryHost {
+                heap: Heap::new(4096).expect("a small test heap is allocatable"),
+                atoms: AtomTable::new(),
+            }
+        }
+    }
+
+    impl NifHost for BinaryHost {
+        fn heap(&mut self) -> &mut Heap {
+            &mut self.heap
+        }
+
+        fn intern_atom(&mut self, name: &str) -> Option<Eterm> {
+            Some(prelude::make_atom(self.atoms.intern(name)))
+        }
+
+        fn atom_name(&mut self, atom: Eterm) -> Option<String> {
+            if !prelude::is_atom(atom) {
+                return None;
+            }
+            self.atoms
+                .name(prelude::atom_val(atom))
+                .map(str::to_string)
+        }
+    }
+
+    /// `enif_term_size` in whole words.
+    fn term_words(term: ERL_NIF_TERM) -> usize {
+        // SAFETY: `term` is a live term word returned by the call under test and `enif_term_size`
+        // dereferences nothing for a bitstring — it walks the term's shape.
+        let bytes = unsafe { enif_term_size(term) };
+        bytes / core::mem::size_of::<ERL_NIF_TERM>()
+    }
+
+    /// The oracle's word count for a fresh `size`-byte binary, below the on-heap limit.
+    fn on_heap_words(size: usize) -> usize {
+        2 + size.div_ceil(core::mem::size_of::<ERL_NIF_TERM>())
+    }
+
+    #[test]
+    fn make_new_binary_matches_the_oracle_at_or_below_the_on_heap_limit() {
+        let mut host = BinaryHost::new();
+        let mut env = NifEnv::new(&mut host);
+        for size in [0usize, 1, 10, 64] {
+            let mut term = ERL_NIF_TERM::default();
+            // SAFETY: `env` is live for the whole test and `term` is a live local.
+            let payload = unsafe { enif_make_new_binary(env.as_ptr(), size, &mut term) };
+            assert!(!payload.is_null(), "a {size}-byte payload");
+            assert_eq!(
+                term_words(term),
+                on_heap_words(size),
+                "a {size}-byte binary is on-heap on both sides"
+            );
+            // The bytes handed out are the term's own, and writable.
+            // SAFETY: `payload` is writable for `size` bytes (the call's contract).
+            unsafe { payload.write_bytes(0xAB, size) };
+            // SAFETY: `term` is a live bitstring of `size` bytes.
+            assert_eq!(unsafe { prelude::bitstring_size(t(term)) }, size * 8);
+        }
+    }
+
+    #[test]
+    fn make_new_binary_is_on_heap_above_the_limit_where_the_oracle_wraps_it_refc() {
+        let mut host = BinaryHost::new();
+        let mut env = NifEnv::new(&mut host);
+        for size in [65usize, 100] {
+            let mut term = ERL_NIF_TERM::default();
+            // SAFETY: `env` is live for the whole test and `term` is a live local.
+            let payload = unsafe { enif_make_new_binary(env.as_ptr(), size, &mut term) };
+            assert!(!payload.is_null(), "a {size}-byte payload");
+            // The deviation: `2 + ceil(size / 8)` words here, the oracle's 8-word refc pair.
+            assert_eq!(term_words(term), on_heap_words(size));
+            assert!(
+                term_words(term) > prelude::ERL_REFC_BITS_SIZE,
+                "the on-heap shape costs more than the oracle's refc pair at {size} bytes"
+            );
+            // SAFETY: `term` is a live bitstring (not a `BinRef` root), so this only reads its
+            // header and its `orig` slot.
+            assert!(
+                !unsafe { prelude::is_refc_binary(t(term)) },
+                "this crate builds no refc binary (the documented deviation)"
+            );
+            // SAFETY: `term` is a live bitstring of `size * 8` bits.
+            assert_eq!(unsafe { prelude::bitstring_size(t(term)) }, size * 8);
+        }
+    }
+
+    #[test]
+    fn alloc_binary_hands_back_a_null_ref_bin_and_a_writable_payload() {
+        let mut host = BinaryHost::new();
+        let mut env = NifEnv::new(&mut host);
+        let mut bin = ErlNifBinary {
+            size: 0,
+            data: core::ptr::null_mut(),
+            ref_bin: core::ptr::null_mut(),
+            __spare__: [core::ptr::null_mut(), core::ptr::null_mut()],
+        };
+        // SAFETY: `bin` is a live local and takes no env.
+        assert_eq!(unsafe { enif_alloc_binary(65, &mut bin) }, 1);
+        assert_eq!(bin.size, 65);
+        assert!(!bin.data.is_null());
+        assert_eq!(
+            bin.data as usize % 8,
+            0,
+            "the oracle's off-heap payload is 8-byte aligned; `malloc` keeps the same promise"
+        );
+        assert!(
+            bin.ref_bin.is_null(),
+            "the oracle stores its off-heap `Binary*` here (the documented deviation)"
+        );
+        // The payload is the caller's while the binary is owned.
+        // SAFETY: `bin.data` is writable for `bin.size` bytes.
+        unsafe { bin.data.write_bytes(0x5A, bin.size) };
+
+        // `enif_make_binary` copies those bytes into an on-heap term and consumes the struct.
+        // SAFETY: `env` is live and `bin` is a live owned binary.
+        let term = unsafe { enif_make_binary(env.as_ptr(), &mut bin) };
+        assert_eq!(term_words(term), on_heap_words(65));
+        // SAFETY: `term` is a live bitstring; `bitstring_parts` reports its payload.
+        let (base, offset, bits) = unsafe { prelude::bitstring_parts(t(term)) };
+        assert_eq!((offset, bits), (0, 65 * 8));
+        // SAFETY: the term's payload is `ceil(65 * 8 / 8)` = 65 readable bytes at `base`.
+        let bytes = unsafe { core::slice::from_raw_parts(base, 65) };
+        assert!(bytes.iter().all(|&b| b == 0x5A), "the payload was copied");
+        assert!(bin.data.is_null(), "the struct is consumed");
     }
 }
