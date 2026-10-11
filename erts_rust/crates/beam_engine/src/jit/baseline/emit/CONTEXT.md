@@ -148,10 +148,13 @@ out-of-bound register is never counted. Every non-selected register is read/writ
 - `#![allow(unsafe_code)]` at the emitter entry (`mod.rs`) because it drives the encoder; nothing here
   dereferences a raw pointer itself.
 - `emit_block` accumulates `highest_native_register` (direct `machine.x` accesses) via `touch`; the driver
-  refuses native entry to a machine whose register file does not cover **the function it would enter**
-  (each function's summary is recorded separately, so a lazy artifact's per-function bound is available at
-  entry time). `emit_function` also records `highest_cached_register` / `cached_registers` for the function;
-  `compile_module` merges them into the whole-module summary and stores the per-function `native_bounds`.
+  refuses native entry to a machine whose register file does not cover the bound the artifact's layout
+  requires. `emit_function` records `highest_cached_register` / `cached_registers` and
+  `highest_native_register` for the function it lowers; `compile_module` merges those per-function
+  summaries into the whole-module summary, and that **whole-module** `highest_native_register` is the
+  eager layout's entry guard (its seal-time links may tail-call across functions in the one shared
+  mapping). A lazy artifact keeps each function's own summary and guards entry by the entered function's
+  own bound.
 - `CodeBuffer` reservations are budgeted by `code_capacity_estimate` (whole module) / `function_capacity_estimate`
   (one function, the base of the lazy layout's buffer size). Both are loose on purpose: under-estimating
   turns a large module into a `SystemLimit` compile error. Block entry labels are reserved **before**
