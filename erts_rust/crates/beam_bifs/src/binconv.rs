@@ -81,8 +81,10 @@
 //!   `binary_to_term/1` ignores trailing bytes; `binary_to_term/2` takes `safe` and
 //!   `used` (`binary_to_term(<<131,97,17>>, [used])` is `{17, 3}` — the count
 //!   includes the `131` version byte; for a top-level `COMPRESSED` image it stops at
-//!   the zlib stream's end, so bytes after the image are *not* counted — see
-//!   [`consumed_compressed_len`]). `safe` refuses a term that would create an atom.
+//!   the zlib stream's end, so bytes after the image are *not* counted — the count
+//!   comes straight from `beam_codec`'s
+//!   [`decode_term_used`]/[`decode_term_with_local_node_used`]). `safe` refuses a
+//!   term that would create an atom.
 //!
 //! # The `term_to_binary/2` options
 //!
@@ -207,7 +209,7 @@
 
 use beam_codec::compress::compress as zlib_compress;
 use beam_codec::{
-    decode_term, decode_term_with_local_node, Decoder, Encoder, MinorVersion, COMPRESSED_EXT,
+    decode_term_used, decode_term_with_local_node_used, Encoder, MinorVersion, COMPRESSED_EXT,
     VERSION_MAGIC,
 };
 use beam_common::Result;
@@ -1056,11 +1058,12 @@ fn binary_to_term_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// Decodes an external term image (see the module docs for the atom-index
 /// coupling this relies on).
 ///
-/// A top-level `COMPRESSED` (`80`) image — the form `term_to_binary/2` with a
-/// `compressed` option produces — is unwrapped first, exactly as the oracle does
-/// (`external.c:1754-1816`); its `used` count is the image's own length, so bytes
-/// after the zlib stream are ignored *and* uncounted, like the plain case's trailing
-/// bytes (see [`consumed_compressed_len`]).
+/// The `[used]` count comes from the codec's own `[used]` entry points, which handle
+/// the top-level `COMPRESSED` (`80`) wrapper — the form `term_to_binary/2` with a
+/// `compressed` option produces — internally (`external.c:1754-1816`): a compressed
+/// image reports its own length, so bytes after the zlib stream are ignored *and*
+/// uncounted (`external.c:1797-1801`), while a plain image reports the term's own end
+/// and tolerates trailing bytes, like the oracle.
 ///
 /// The context's local node identity ([`BifContext::local_node`]) is installed on the
 /// decoder, so a wire pid/port/reference whose node atom and creation name this node
@@ -1095,36 +1098,17 @@ fn decode_term_bif(
     // the clone has the context's indices (the names are interned in order).
     let mut local = ctx.atoms().clone();
     let known = local.len();
-    let (term, position) = if is_compressed_image(&data) {
-        // `beam_codec::decode_term[_with_local_node]` owns the wrapper handling (the
-        // 4-byte size check and the inner body decode) — its `decompress_wrapper` is
-        // private, so the wrapper is recognised here with the same two-byte test it
-        // uses. The identity-aware entry point installs the identity on the inflated
-        // body, so a compressed image demotes exactly like its uncompressed twin.
-        let heap = ctx.heap();
-        let decoded = match identity {
-            Some((node, creation)) => {
-                decode_term_with_local_node(&data, heap, &mut local, node, creation, None)?
-            }
-            None => decode_term(&data, heap, &mut local)?,
-        };
-        // The wrapper's `used` count stops at the zlib stream's end (the C subtracts
-        // what the inflater left unread, `external.c:1797-1801`/`:2011-2014`), so it
-        // is the compressed image's length — *not* the whole input when trailing bytes
-        // follow.
-        let position = consumed_compressed_len(&data).unwrap_or(data.len());
-        (decoded, position)
-    } else {
-        let heap = ctx.heap();
-        // The explicit `Decoder` (rather than the free function) keeps `position()` for
-        // the `[used]` count *and* — unlike the free function — does not require the
-        // whole stream to be consumed, matching the oracle's trailing-byte tolerance.
-        let mut decoder = Decoder::new(&data)?;
-        if let Some((node, creation)) = identity {
-            decoder = decoder.with_local_node(node, creation);
+    let heap = ctx.heap();
+    // The codec's `[used]` entry points own the `COMPRESSED` wrapper handling and the
+    // consumed-source-byte count (the zlib stream end for a compressed image,
+    // `Decoder::position` otherwise) — and, unlike the `finish()`-ing `decode_term`
+    // pair, they tolerate trailing bytes, matching the oracle's `binary_to_term/2`.
+    // The identity-aware twin installs the identity on both paths.
+    let (term, position) = match identity {
+        Some((node, creation)) => {
+            decode_term_with_local_node_used(&data, heap, &mut local, node, creation, None)?
         }
-        let decoded = decoder.decode(heap, &mut local)?;
-        (decoded, decoder.position())
+        None => decode_term_used(&data, heap, &mut local)?,
     };
     if local.len() > known {
         if safe {
@@ -1151,81 +1135,6 @@ fn decode_term_bif(
     }
 }
 
-/// Whether `bytes` is a top-level `COMPRESSED` image:
-/// `[131][COMPRESSED_EXT][size:4 BE][zlib stream]`.
-///
-/// Mirrors `beam_codec::decode`'s private `is_compressed_image` (its 6-byte minimum is
-/// the C check at `external.c:1754-1759`); `beam_codec::decode_term` validates the size
-/// field and the stream, so this test only selects the entry point.
-fn is_compressed_image(bytes: &[u8]) -> bool {
-    bytes.len() >= 6 && bytes[0] == VERSION_MAGIC && bytes[1] == COMPRESSED_EXT
-}
-
-/// The number of input bytes a top-level `COMPRESSED` image actually occupies — the
-/// value the oracle's `binary_to_term/2` `[used]` reports for one.
-///
-/// `binary2term_prepare` starts the count at the whole input length and, once the zlib
-/// stream has ended, subtracts whatever is left unread in the inflater's input buffer
-/// (`external.c:1797-1801`, `:2011-2014`) — the count therefore stops at the stream's
-/// end, so bytes *after* a compressed image are neither read nor counted (unlike the
-/// plain path, whose count is the term's own end). Oracle-pinned: an input of
-/// `<<Compressed/binary, 1,2,…,10>>` reports the compressed image's length, not the ten
-/// bytes longer input.
-///
-/// `beam_codec`'s wrapper handling returns only the *term*, so the consumed length is
-/// recovered here from the two facts the wrapper guarantees. The 4-byte size field
-/// declares the inner body's length, and a **prefix** of the input inflates to exactly
-/// that body **iff** it reaches the end of the zlib stream: a truncated prefix fails
-/// (`flate2`'s reader reports an unexpected EOF — `zio::read`'s `Err(UnexpectedEof)`
-/// against slice input — and the C's `inflate` never reaches `Z_STREAM_END`), while
-/// bytes after the stream's end never change the result (inflate stops there and the
-/// reader leaves the rest unread). The predicate is therefore monotone in the prefix
-/// length, so a binary search for the **shortest** prefix that inflates to the declared
-/// size yields the exact consumed length in `O(log n)` inflates. The common case — a
-/// stream ending at the input's last byte — costs a single probe.
-///
-/// Returns `None` when the search cannot converge, i.e. when not even the whole input
-/// inflates to the declared size. [`decode_term_bif`] only calls this after
-/// `beam_codec::decode_term` accepted the very same image, which already inflates the
-/// whole input to the declared size (`decompress_wrapper`), so the fallback is
-/// unreachable in practice; it exists so a caller never gets a fabricated count.
-fn consumed_compressed_len(data: &[u8]) -> Option<usize> {
-    // Every caller checked `is_compressed_image`, so `data[2..6]` (the size field) is
-    // present.
-    let declared = u32::from_be_bytes([data[2], data[3], data[4], data[5]]) as usize;
-    let stream = &data[6..];
-    if stream.is_empty() {
-        return None;
-    }
-    let inflates_to_declared = |len: usize| -> bool {
-        matches!(
-            beam_codec::compress::decompress_bounded(&stream[..len], declared),
-            Ok(ref body) if body.len() == declared
-        )
-    };
-    // The whole input must be a valid stream — it is, after a successful decode.
-    if !inflates_to_declared(stream.len()) {
-        return None;
-    }
-    // The stream ends at the input's last byte (the common case): one probe rules the
-    // binary search out. `inflates_to_declared(0)` cannot hold (an empty input has no
-    // zlib header), so the search's lower range below is non-empty.
-    if stream.len() == 1 || !inflates_to_declared(stream.len() - 1) {
-        return Some(data.len());
-    }
-    // The shortest prefix that reaches the stream's end: `lo` converges on the first
-    // length that inflates to the declared size, `hi` is one that already does.
-    let (mut lo, mut hi) = (1usize, stream.len() - 1);
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        if inflates_to_declared(mid) {
-            hi = mid;
-        } else {
-            lo = mid + 1;
-        }
-    }
-    Some(6 + lo)
-}
 /// Registers the `erlang` binary/atom conversion and term (de)serialization BIFs.
 pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("erlang", "list_to_binary", 1, list_to_binary_1);
@@ -2654,6 +2563,8 @@ mod tests {
 
     /// `binary_to_term/2`'s `[used]` count for a top-level `COMPRESSED` image: the
     /// image's own length, so bytes after the zlib stream are ignored *and* uncounted.
+    /// A plain image, by contrast, counts its own end (its trailing bytes are uncounted
+    /// too — see the tail of the test).
     #[test]
     fn binary_to_term_used_counts_only_a_compressed_image() {
         with_ctx(|ctx| {
@@ -2668,7 +2579,7 @@ mod tests {
             let image_len = hand.len();
             hand.extend_from_slice(&[9, 8, 7, 6]);
 
-            // The premise of the search: a prefix that stops short of the zlib stream's
+            // The premise of the count: a prefix that stops short of the zlib stream's
             // end does **not** inflate to the declared size (`flate2`'s reader reports an
             // unexpected EOF), while the stream's own end does.
             let declared = body.len();
@@ -2679,8 +2590,18 @@ mod tests {
             assert!(beam_codec::compress::decompress_bounded(&stream, declared).is_ok());
             assert!(beam_codec::compress::decompress_bounded(&hand[6..], declared).is_ok());
 
-            assert_eq!(consumed_compressed_len(&hand), Some(image_len));
-            assert_eq!(consumed_compressed_len(&hand[..image_len]), Some(image_len));
+            // The codec's public `[used]` entry point — the one `decode_term_bif` uses —
+            // reports the compressed image's own length for the padded input and for the
+            // exact image alike: the count stops at the zlib stream's end.
+            let mut h = heap();
+            let mut atoms = table();
+            let (_, consumed) = beam_codec::decode_term_used(&hand, &mut h, &mut atoms)
+                .expect("the padded compressed image decodes");
+            assert_eq!(consumed, image_len);
+            let (_, consumed) =
+                beam_codec::decode_term_used(&hand[..image_len], &mut h, &mut atoms)
+                    .expect("the exact compressed image decodes");
+            assert_eq!(consumed, image_len);
 
             // The oracle reports the compressed image's length for both, not the padded
             // input's: erl ... 'binary_to_term(<<C/binary,9,8,7,6>>,[used])' ⇒
@@ -2691,6 +2612,21 @@ mod tests {
             assert_eq!(
                 int_of(access::tuple_element(wrapped, 1)),
                 image_len as i64
+            );
+            assert_eq!(values(access::tuple_element(wrapped, 0)), vec![1, 2, 3]);
+
+            // The plain path is the contrast: its count is the *term's* own end, so the
+            // same trailing bytes are not counted — `binary_to_term(<<131,107,0,3,1,2,3,
+            // 9,8,7,6>>, [used])` is `{[1,2,3], 7}`, the oracle's rule.
+            let plain = [131u8, 107, 0, 3, 1, 2, 3]; // `term_to_binary([1,2,3])`
+            let mut padded_plain = plain.to_vec();
+            padded_plain.extend_from_slice(&[9, 8, 7, 6]);
+            let blob = bin(&padded_plain);
+            let used = used_option(ctx);
+            let wrapped = binary_to_term_2(ctx, &[blob, used]).unwrap();
+            assert_eq!(
+                int_of(access::tuple_element(wrapped, 1)),
+                plain.len() as i64
             );
             assert_eq!(values(access::tuple_element(wrapped, 0)), vec![1, 2, 3]);
         });
