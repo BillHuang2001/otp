@@ -1228,14 +1228,15 @@ impl<'a> RuntimeContext<'a> {
         // the same image) of a compiled module's `make_fun3` closure needs the `NEW_FUN_EXT`
         // fields the term does not carry (module atom, module MD5, `old_index`/`old_uniq`,
         // creator pid), which only the *loaded module* knows. Like `local_node` this hook
-        // needs **no** runtime borrow — it snapshots the caller module, its `.beam` path and
-        // the node atom — but building that snapshot is not free (an `Arc` clone plus a
-        // `PathBuf` allocation), so it is built **only** for the four BIFs that consult this
-        // seam (see [`Self::uses_fun_identity`]). For every other registered call it stays
-        // `None` and no hook is installed — indistinguishable from the hook itself, because
-        // no other BIF ever calls `local_fun_identity`. With no calling module (the `-eval`
-        // evaluator) the hook answers `Ok(None)`, preserving the codec's typed
-        // `unsupported_local_fun` (see [`FunIdentityBridge`]).
+        // needs **no** runtime borrow — it snapshots every loaded module's `Arc<Module>` and
+        // `.beam` path (caller module first) plus the node atom — but building that snapshot
+        // is not free (an `Arc` clone plus a `PathBuf` per loaded module), so it is built
+        // **only** for the four BIFs that consult this seam (see [`Self::uses_fun_identity`]).
+        // For every other registered call it stays `None` and no hook is installed —
+        // indistinguishable from the hook itself, because no other BIF ever calls
+        // `local_fun_identity`. The `-eval` evaluator's own closures match no loaded module's
+        // `FunT`, so they keep the codec's typed `unsupported_local_fun` (see
+        // [`FunIdentityBridge`]).
         let mut fun_identity = if Self::uses_fun_identity(module, function, arity) {
             Some(FunIdentityBridge::new(
                 &self.runtime.code_server,
@@ -2581,16 +2582,18 @@ impl ExecutionContext for RuntimeContext<'_> {
 ///
 /// The engine's cross-module call seam ([`ExecutionContext::resolve_external_call`]) runs a
 /// callee inside the **caller's** machine, and the engine's module-context switch never re-enters
-/// this context, so a callee keeps the caller's `current_module`. The two imported BIFs that
-/// *read* that identity are:
+/// this context, so a callee keeps the caller's `current_module`. The one imported BIF that
+/// *reads* that identity is:
 ///
 /// * `erlang:load_nif/2` — the module a NIF library is registered under, which the library's own
 ///   `ErlNifEntry.name` is validated against: a stale identity is the oracle's `bad_lib` (and it
-///   is why a module carrying a *loaded* NIF is excluded from the seam altogether);
-/// * `erlang:term_to_binary/1,2` and `erlang:external_size/1,2` — the `NEW_FUN_EXT` identity
-///   (module atom, module MD5, `old_index`/`old_uniq`) of a **local** fun argument, which
-///   [`FunIdentityBridge`] derives from the calling module: a stale identity would name the wrong
-///   module.
+///   is why a module carrying a *loaded* NIF is excluded from the seam altogether).
+///
+/// The `NEW_FUN_EXT` identity of a **local** fun no longer reads the call site:
+/// `erlang:term_to_binary/1,2` and `erlang:external_size/1,2` resolve the defining module by
+/// searching every loaded module for the fun's own `(uniq, index)` ([`FunIdentityBridge`], which
+/// prefers the caller but is not confined to it), so a callee entering in-machine under a stale
+/// `current_module` still derives the right image.
 ///
 /// The other `current_module` readers cannot be made wrong by a callee's stale identity:
 /// `records:get_definition/2` resolves its module from its **argument** ([`RecordBridge`] holds no
@@ -2607,13 +2610,8 @@ impl ExecutionContext for RuntimeContext<'_> {
 pub(crate) fn module_observes_its_call_site(module: &Module) -> bool {
     module.imports.iter().any(|import| {
         module.atom_name(import.module) == Some("erlang")
-            && match module.atom_name(import.function) {
-                Some("load_nif") => import.arity == 2,
-                Some("term_to_binary") | Some("external_size") => {
-                    import.arity == 1 || import.arity == 2
-                }
-                _ => false,
-            }
+            && module.atom_name(import.function) == Some("load_nif")
+            && import.arity == 2
     })
 }
 
