@@ -76,6 +76,12 @@ impl Machine {
         ctx: &mut dyn ExecutionContext,
     ) -> Result<RunOutcome> {
         self.trace_on = ctx.trace_enabled();
+        // Latch the per-run reduction-hook gate too (see the `Machine::reduce_on`
+        // field docs): a host whose `reduce` is provably the default no-op declares
+        // `wants_reduce() == false` and the driver then skips the per-instruction
+        // vtable crossing entirely, paying one `bool` load instead. The default is
+        // conservative `true`, so a pre-empting host keeps every charge.
+        self.reduce_on = ctx.wants_reduce();
         // One `drive` call is one scheduling slice, so the reduction counter starts
         // here (the ERTS process counter, `c_p->fcalls`, is likewise reset when a
         // process is scheduled in; the host reads the count when the slice returns).
@@ -130,7 +136,9 @@ impl Machine {
             // charge — is unreachable from such a loop, so this is the only point a
             // host is offered one reduction per instruction.
             self.reductions = self.reductions.saturating_add(1);
-            ctx.reduce(1)?;
+            if self.reduce_on {
+                ctx.reduce(1)?;
+            }
             match step {
                 Step::Next => pc += 1,
                 Step::Goto { func: f, pc: p } => {

@@ -299,6 +299,7 @@ fn two_waits_module() -> (Module, beam_term::Atom) {
 /// resumed `label 2` + `wait`, then `label 3` + the `bif0` + the `return`.
 const TWO_WAITS_SLICE_STARTS: [usize; 3] = [0, 2, 4];
 const TWO_WAITS_SLICE_CHARGES: [u64; 3] = [2, 2, 3];
+
 // ---------------------------------------------------------------------------
 // A custom ExecutionContext: a counting BIF and a record-keeping reduce hook
 // ---------------------------------------------------------------------------
@@ -322,6 +323,10 @@ struct ReduceCtx {
     calls: u32,
     /// The queued messages; only the front one is ever the candidate.
     mailbox: VecDeque<Eterm>,
+    /// When set, this host declines the reduction hook (`wants_reduce() == false`),
+    /// i.e. it declares its `reduce` body is not needed. The engine must then skip
+    /// the per-instruction hook call **without** dropping the slice count.
+    decline_hook: bool,
 }
 
 impl ReduceCtx {
@@ -332,6 +337,7 @@ impl ReduceCtx {
             charges: Vec::new(),
             calls: 0,
             mailbox: VecDeque::new(),
+            decline_hook: false,
         }
     }
 
@@ -340,7 +346,13 @@ impl ReduceCtx {
         self
     }
 
-    /// Queue a message the receive's `loop_rec` will find.
+    /// Declare the `reduce` hook unnecessary: the engine skips the per-instruction
+    /// call (this host still overrides `reduce`, so it proves the gate **only**
+    /// suppresses the call, never the counter).
+    fn declining_the_hook(mut self) -> ReduceCtx {
+        self.decline_hook = true;
+        self
+    }    /// Queue a message the receive's `loop_rec` will find.
     fn deliver(&mut self, message: Eterm) {
         self.mailbox.push_back(message);
     }
@@ -385,6 +397,11 @@ impl ExecutionContext for ReduceCtx {
         Ok(())
     }
 
+    /// The per-run reduction-hook gate. Default `true` (the trait default keeps this
+    /// host receiving charges unless it declines); `decline_hook` opts out.
+    fn wants_reduce(&self) -> bool {
+        !self.decline_hook
+    }
     /// `loop_rec`: the candidate at the scan position — the front queued message, or
     /// nothing when the mailbox is empty (which is what makes the receive suspend).
     fn receive_next(&mut self) -> Result<Option<Eterm>> {
@@ -535,9 +552,38 @@ fn the_minimal_context_default_reduce_is_a_no_op_that_still_counts() {
 }
 
 // ---------------------------------------------------------------------------
-// the slice boundary: a suspend/resume charges every instruction exactly once
+// a host may decline the hook: no charges, but the slice count is unchanged
 // ---------------------------------------------------------------------------
 
+#[test]
+fn a_host_that_declines_the_reduce_hook_gets_no_charges_but_still_counts() {
+    let (module, run) = counting_loop_module();
+    let mut machine = Machine::new();
+    // This host overrides `reduce`, yet declares the hook unnecessary: the engine
+    // must skip every per-instruction call, so `charges` stays empty — proof that
+    // the gate suppresses the vtable crossing, not just a no-op body.
+    let mut ctx = ReduceCtx::new(SUCCESSFUL_CALLS).declining_the_hook();
+
+    let err = machine
+        .run_export_outcome(&module, run, 0, &[], &mut ctx)
+        .expect_err("the counter BIF stops the loop");
+    assert_eq!(reason(err), "unsupported_opcode: stop");
+
+    assert!(
+        ctx.charges.is_empty(),
+        "the declining host must receive no reduction charges, got {:?}",
+        ctx.charges
+    );
+    // The engine-side slice counter is unchanged: `Machine::reductions` still counts
+    // every interpreted instruction, so a host that polls instead of hooking is
+    // unaffected by the opt-out.
+    assert_eq!(machine.reductions(), CHARGES_FOR_CALLS);
+    assert_eq!(ctx.calls, SUCCESSFUL_CALLS + 1);
+}
+
+// ---------------------------------------------------------------------------
+// the slice boundary: a suspend/resume charges every instruction exactly once
+// ---------------------------------------------------------------------------
 /// A receive that finds no message **is** a slice: the `wait` is charged like any
 /// other instruction before the driver reports the suspension, and the resume starts
 /// a fresh slice at the `wait`'s target label — so the `wait` is never charged twice,

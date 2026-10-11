@@ -242,7 +242,29 @@ pub struct Machine {
     /// that never sets it (e.g. a direct `Machine::step_instruction` call in a test)
     /// cannot leak a stale `true` from an earlier run.
     pub(crate) trace_on: bool,
-    /// The code address the machine is currently executing, or was most recently
+    /// The **per-run reduction-hook gate**: the cached answer of
+    /// [`ExecutionContext::wants_reduce`](crate::context::ExecutionContext::wants_reduce)
+    /// for the run currently executing.
+    ///
+    /// [`Machine::drive`](crate::machine::Machine) charges one reduction per
+    /// interpreted instruction and offers each charge to the host through
+    /// [`ExecutionContext::reduce`](crate::context::ExecutionContext::reduce) — a
+    /// `&mut dyn ExecutionContext` vtable crossing the interpreter cannot elide. When
+    /// the host's [`wants_reduce`](crate::context::ExecutionContext::wants_reduce) is
+    /// `false` (its `reduce` is provably the default no-op), the driver skips that
+    /// per-instruction call so the hot path pays a single `bool` load instead.
+    ///
+    /// The default is **conservative `true`**: a host that pre-empts by returning an
+    /// error from `reduce` is never silently skipped. The slice counter
+    /// ([`Machine::reductions`](crate::machine::Machine::reductions)) is bumped on
+    /// every interpreted instruction regardless of this flag, so opting out changes
+    /// **only** whether the host hook is called, never the observable count.
+    ///
+    /// Latched at a run/resume entry exactly like [`Machine::trace_on`], and
+    /// [`Machine::reset`](crate::machine::Machine::reset) leaves it `false`, so a run
+    /// that never latches it (e.g. a direct `Machine::step_instruction` call in a
+    /// test) cannot leak a stale value from an earlier run.
+    pub(crate) reduce_on: bool,    /// The code address the machine is currently executing, or was most recently
     /// **suspended** at: `(function index, code offset)`.
     ///
     /// Updated by [`Machine::step_instruction`](crate::machine::Machine) — the
@@ -317,6 +339,7 @@ impl Machine {
             refc_binaries: Vec::new(),
             args_scratch: Vec::new(),
             trace_on: false,
+            reduce_on: false,
             current_code: None,
             entry_call: None,
             reductions: 0,

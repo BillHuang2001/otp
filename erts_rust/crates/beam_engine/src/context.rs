@@ -666,6 +666,39 @@ pub trait ExecutionContext {
         Ok(())
     }
 
+    /// Cheap reduction-hook gate: does [`reduce`](ExecutionContext::reduce) need to
+    /// be called at all for the process currently running?
+    ///
+    /// [`Machine::drive`](crate::machine::Machine) charges **one reduction per
+    /// interpreted instruction**, and that charge is also offered to the host
+    /// through [`reduce`](ExecutionContext::reduce). The hook call is a
+    /// `&mut dyn ExecutionContext` vtable crossing the interpreter cannot elide, so
+    /// the driver latches this answer **once per run** into the
+    /// `Machine::reduce_on` flag and then skips the hook call entirely on a run
+    /// whose host declares it does not need it — the per-instruction hot path pays a
+    /// single `bool` load instead.
+    ///
+    /// **The default is the CONSERVATIVE `true`**: every host keeps receiving every
+    /// charge unless it explicitly opts out, so an implementor that *does* pre-empt
+    /// by returning an error from `reduce` (e.g. a scheduler enforcing a time slice)
+    /// is never silently skipped. A host may answer `false` **only** when its
+    /// `reduce` is provably the default no-op (a test/embedding context), never when
+    /// it uses the hook for pre-emption.
+    ///
+    /// `Machine::reductions` accounting is **unaffected**: the slice counter is
+    /// still bumped on every interpreted instruction, so a host that polls
+    /// [`Machine::reductions`](crate::machine::Machine::reductions) after the slice
+    /// observes the exact same count either way; only the per-instruction hook *call*
+    /// is skipped.
+    ///
+    /// Like the A.8 tracing gate, the answer is latched at a run/resume entry, so a
+    /// host that flips it mid-run sees the change take effect at the process's next
+    /// run entry (or [`Machine::resume_outcome`](crate::machine::Machine::resume_outcome)).
+    #[inline]
+    fn wants_reduce(&self) -> bool {
+        true
+    }
+
     /// Cheap tracing gate: does the host want `call`/`return_from`/`return_to`
     /// execution-trace events reported for the process currently running?
     ///
@@ -1101,6 +1134,16 @@ impl ExecutionContext for MinimalContext {
         usize::MAX
     }
 
+    /// [`MinimalContext`] never pre-empts: its [`reduce`](ExecutionContext::reduce)
+    /// is the trait's default no-op, so the per-instruction hook call is pure
+    /// overhead here and the driver skips it. The reduction *count*
+    /// ([`Machine::reductions`](crate::machine::Machine::reductions)) is unchanged —
+    /// only the vtable crossing is elided.
+    #[inline]
+    fn wants_reduce(&self) -> bool {
+        false
+    }
+
     fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm> {
         // The region heap hands out `n` uninitialised words whose pointer stays
         // valid (and unmoved) for the life of the context: the frontier region
@@ -1278,6 +1321,20 @@ mod tests {
     }
 
     #[test]
+    fn the_reduce_gate_defaults_conservative_and_the_minimal_context_opts_out() {
+        // The trait default is `true`: a host that does not override it keeps receiving
+        // every reduction charge, so a pre-empting host is never silently skipped.
+        assert!(
+            OnlyRequired.wants_reduce(),
+            "the reduce-hook gate must default to the conservative `true`"
+        );
+        // `MinimalContext` never pre-empts (its `reduce` is the default no-op), so it
+        // opts out of the per-instruction vtable crossing.
+        assert!(
+            !MinimalContext::new().wants_reduce(),
+            "MinimalContext must opt out of the reduction hook"
+        );
+    }    #[test]
     fn default_apply_forwards_to_call_bif() {
         // The default `apply` delegates to `call_bif`; here `call_bif` always
         // fails, and the failure must surface identically through `apply`.

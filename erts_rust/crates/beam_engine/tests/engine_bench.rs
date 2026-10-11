@@ -904,6 +904,13 @@ impl ExecutionContext for CountingHost {
     fn apply_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
         self.host.apply_fun(fun, args)
     }
+
+    /// This bench host never pre-empts (it inherits the default no-op `reduce`), so
+    /// it opts out of the per-instruction reduction hook like `MinimalContext` — the
+    /// measured rows then exercise the driver's `Machine::reduce_on` opt-out path.
+    fn wants_reduce(&self) -> bool {
+        false
+    }
 }
 
 /// The **real workload**: the committed `tailcall.beam` fixture's mutually

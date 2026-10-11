@@ -240,6 +240,10 @@ impl Machine {
         // that never latches it (a bare `step_instruction` in a test) cannot inherit
         // a stale `true` from an earlier traced run.
         self.trace_on = false;
+        // The reduction-hook gate is likewise re-latched from the context at every
+        // run entry (`Machine::drive`); clearing it here keeps a run that never
+        // latches it from inheriting a stale value.
+        self.reduce_on = false;
     }
 }
 
