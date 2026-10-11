@@ -127,7 +127,18 @@
 //! the library is unloaded. What marks a monitor pending is the *runtime's* observation of a process
 //! exit (a higher scope's obligation): the tree never fires anything on its own.
 //!
-//! # What is NOT wired yet (the typed gaps)
+//! # The liveness view behind `driver_monitor_process` (the C's `1`)
+//!
+//! The C's `driver_monitor_process` has three outcomes, and the **positive** one — `1`,
+//! `ERL_DRV_MONITOR_NOT_ALIVE` — is reached when the target process is gone
+//! (`do_driver_monitor_process`, `io.c:7012-7038`). This host holds no live process table (it is
+//! built before its port is registered and is reached only through an opaque `ErlDrvPort`), so the
+//! runtime **publishes** its most recent observation into a shared [`ProcessLiveness`] handle that
+//! [`RuntimePorts::open_port`](crate::port::RuntimePorts::open_port) installs on the host
+//! ([`DriverPort::with_liveness`]) and refreshes at the start of every port round. The hook
+//! [`DriverPort::monitor_process_result`] reads it, and the observation's freshness rule — never
+//! older than the last round, `None` before the first — is spelled out there.
+//!//! # What is NOT wired yet (the typed gaps)
 //!
 //! * **`driver_async` / `driver_async_cancel`.** `Runtime` is `!Send` (it owns `Rc`/`RefCell`
 //!   tables, a `dlopen`ed library registry and pointer-stable term arenas), so a worker thread
@@ -162,9 +173,9 @@ use beam_abi::driver::types::{
 };
 use beam_abi::driver::types::ErlDrvPDL;
 use beam_abi::{
-    monitor_from_identity, monitor_identity, DriverEnv, DriverHost, ErlDrvMonitor, SysIOVec,
+    monitor_from_identity, monitor_identity, DriverEnv, DriverHost, ErlDrvMonitor, MonitorResult,
+    SysIOVec,
 };
-
 /// The per-port driver-private state the host owns: the C's driver-private byte queue
 /// (`prt->ioq`), the port **state** stream flags `driver_get_port_flags` reports, and the port's
 /// one-PDL rule (`driver_pdl_create`).
@@ -184,6 +195,7 @@ use beam_io::{DriverContext, Interest, Token};
 use beam_process::ProcessId;
 use beam_term::{make_atom, refc::ERL_ONHEAP_BINARY_LIMIT, Atom, AtomTable, Eterm};
 
+use super::ProcessLiveness;
 /// The atoms a driver first interned inside a callback, awaiting the port layer's commit.
 ///
 /// An [`AtomTable`] is **append-only** and its indices never renumber, so a name the live table
@@ -582,9 +594,17 @@ pub struct DriverPort {
     /// `beam_io`'s own host reads this field). A host nobody claimed keeps the C's "no slot" answer,
     /// which is what a bare host in a unit test gets.
     has_process_exit: bool,
-}
-
-impl DriverPort {
+    /// The runtime's most recent **process-liveness observation** — the view
+    /// [`DriverHost::monitor_process_result`] answers the C's positive
+    /// `ERL_DRV_MONITOR_NOT_ALIVE` from (see [`ProcessLiveness`]).
+    ///
+    /// This host holds no live `ProcessTable`: it is built before its port is registered and is
+    /// reached only through an opaque `ErlDrvPort`, so the runtime *publishes* what it last
+    /// observed and the hook reads that. A host nobody published a view to — a bare host in a unit
+    /// test, or a port opened before any port round ran — keeps the viewless
+    /// [`ProcessLiveness::new`], whose `is_alive` answers `None`.
+    liveness: Rc<ProcessLiveness>,
+}impl DriverPort {
     /// A host over `heap`, resolving/interning atoms against `atoms`, running as `owner`.
     pub fn new(heap: Heap, atoms: Rc<AtomTable>, owner: ProcessId) -> DriverPort {
         let interner = DriverAtoms::new(atoms.len());
@@ -604,9 +624,11 @@ impl DriverPort {
             pdl_created: false,
             monitors: DriverMonitors::new(owner),
             has_process_exit: false,
+            // No observation has been published yet: a host nobody claims answers "monitor anyway"
+            // rather than fabricating a `NotAlive` (see [`ProcessLiveness`]).
+            liveness: ProcessLiveness::new(),
         }
     }
-
     /// Records whether the loaded driver entry declares an [`ErlDrvEntry::process_exit`] slot (see
     /// [`DriverPort::has_process_exit`]).
     ///
@@ -618,6 +640,19 @@ impl DriverPort {
         self
     }
 
+    /// Installs the runtime's process-liveness view (see [`ProcessLiveness`]).
+    ///
+    /// A builder step like [`DriverPort::with_has_process_exit`] /
+    /// [`DriverPort::with_port_flags`], because the handle can only be taken once the runtime that
+    /// publishes it exists: [`RuntimePorts::open_port`](crate::port::RuntimePorts::open_port) is the
+    /// one caller, and it takes the shared handle from the same
+    /// [`PortRegistry`](crate::port::PortRegistry) the port is about to be registered in. A host
+    /// nobody claims keeps the viewless default, which answers `None` — "no observation" — never a
+    /// fabricated dead process.
+    pub(crate) fn with_liveness(mut self, liveness: Rc<ProcessLiveness>) -> DriverPort {
+        self.liveness = liveness;
+        self
+    }
     /// The port's driver-monitor tree — the handle the runtime seizes before the host is boxed into
     /// the port lifecycle and later drains to fire `ErlDrvEntry::process_exit` (see
     /// [`DriverMonitors`]).
@@ -1096,19 +1131,24 @@ impl DriverHost for DriverPort {
     /// `driver_monitor_process`: install a monitor on `pid` and hand back the holder
     /// (`io.c:6998-7015`).
     ///
-    /// The C's answer split is reproduced through the frozen `Option` hook: the wrapper returns
-    /// `ERL_DRV_MONITOR_ERROR` for `None`, so
+    /// This is the frozen seam's **two-way** subset: it can only say "armed" (`Some`) or "could not
+    /// arm" (`None`, which the wrapper maps to the C's `-1`). The C's third outcome — the **positive**
+    /// `ERL_DRV_MONITOR_NOT_ALIVE` (`1`) for a process that is not alive — is carried by
+    /// [`DriverHost::monitor_process_result`], which this host overrides
+    /// ([`DriverPort::monitor_process_result`]); `beam_abi`'s wrapper prefers that hook, so the
+    /// `1` **is** reachable end to end. Kept as the two-way answer for an implementor that only
+    /// needs the `Option` shape, so a `{spawn_driver, Name}` port's C driver gets the same
+    /// install-side behaviour either way:
     ///
     /// * an entry with **no** `process_exit` slot (the C's `-1`) is `None`;
     /// * a `pid` that is not a local process id — a non-pid term, or an external/wire pid — is
-    ///   `None` (the C's `ERL_DRV_MONITOR_NOT_ALIVE`, `1`, is **not** expressible through the seam —
-    ///   see the module docs' documented divergence);
+    ///   `None` as well on this subset (the full hook reports the C's `-1` for it too, while the C
+    ///   entry point itself pre-rejects such an operand with `1`, `io.c:7025-7028`);
     /// * otherwise `Some(monitor)`, which the wrapper writes into the driver's holder.
     ///
-    /// Liveness of a **local** pid is deliberately not checked: the host holds only its owning
-    /// `ProcessId`, not the process table, so it cannot ask whether the monitored process is still
-    /// alive — and a fabricated liveness answer would be worse than the C's own "monitor anyway"
-    /// (the C records the monitor and lets the later `process_exit` fire it).
+    /// Liveness of a **local** pid is deliberately not checked here (this hook has no view to
+    /// consult): [`DriverPort::monitor_process_result`] is the one that consults the published
+    /// observation and answers `NotAlive`.
     fn monitor_process(&mut self, pid: Eterm) -> Option<ErlDrvMonitor> {
         if !self.has_process_exit {
             return None;
@@ -1117,6 +1157,50 @@ impl DriverHost for DriverPort {
         Some(self.monitors.install(pid))
     }
 
+    /// `driver_monitor_process`: the full three-way answer (`io.c:7012-7038`,
+    /// `do_driver_monitor_process`) — the C's `0` (`ERL_DRV_MONITOR_OK`), `1`
+    /// (`ERL_DRV_MONITOR_NOT_ALIVE`) or `-1` (`ERL_DRV_MONITOR_ERROR`).
+    ///
+    /// The split, in the C's own order:
+    ///
+    /// 1. the loaded entry declares **no** `ErlDrvEntry::process_exit` slot ⇒ [`MonitorResult::Error`]
+    ///    (the C's `-1`, `io.c:7020-7021`);
+    /// 2. an operand that is not a **local** process id — a non-pid term, or an external/wire pid —
+    ///    ⇒ [`MonitorResult::Error`]: no monitor can be armed on it, and this runtime cannot tell a
+    ///    *dead* remote process from an unknown one, so it reports the honest "cannot monitor"
+    ///    rather than the positive code the C's `names_a_process` guard uses (`io.c:7025-7028`);
+    /// 3. a local pid the published observation says **is alive** ⇒
+    ///    [`MonitorResult::Ok`](MonitorResult::Ok) with the freshly minted holder — the C arms the
+    ///    monitor and lets a later `process_exit` fire it;
+    /// 4. a local pid the observation says is **dead** ⇒ [`MonitorResult::NotAlive`] — the C's `1`,
+    ///    reached when its monitor signal cannot be sent (`io.c:7031`). Nothing is installed;
+    /// 5. **no observation** (or an unreadable view) ⇒ [`MonitorResult::Ok`](MonitorResult::Ok): the
+    ///    documented non-regression fallback, "monitor it anyway". An unobserved process is not
+    ///    reported dead — a fabricated `NotAlive` would silently drop a live driver watch, and
+    ///    dropping a monitor is the one failure a driver cannot detect.
+    ///
+    /// # Freshness
+    ///
+    /// The view is the runtime's **snapshot** taken at the start of the last port round
+    /// ([`ProcessLiveness`]; published by
+    /// [`PortRegistry::refresh_liveness`](crate::port::PortRegistry)), so this hook consults an
+    /// observation at most one round old. A callback reached outside a round — the driver's own
+    /// `start`, or a `control` callback — sees the last round's view, and one reached before any
+    /// round sees `None` (outcome 5).
+    fn monitor_process_result(&mut self, pid: Eterm) -> MonitorResult {
+        if !self.has_process_exit {
+            return MonitorResult::Error;
+        }
+        let Ok(pid) = ProcessId::from_eterm(pid) else {
+            return MonitorResult::Error;
+        };
+        match self.liveness.is_alive(pid) {
+            Some(false) => MonitorResult::NotAlive,
+            // Alive, or nothing observed to contradict it: arm the monitor, exactly as the C does
+            // for a live target (outcome 3/5).
+            Some(true) | None => MonitorResult::Ok(self.monitors.install(pid)),
+        }
+    }
     /// `driver_demonitor_process`: cancel the monitor `mon` (`io.c:7065-7081`) — the C's `0` when a
     /// monitor was removed, `1` when it no longer exists.
     ///
@@ -2169,6 +2253,13 @@ mod monitor_tests;
 #[cfg(test)]
 mod fire_tests;
 
+/// The A.4 **driver-monitor liveness wiring suite**: the runtime's published process-liveness view
+/// ([`ProcessLiveness`]) reaching a real C driver's `driver_monitor_process` through the real
+/// `#[no_mangle]` entry point — a live pid answers the C's `0`, and a pid the last port round no
+/// longer observed answers its positive `1` (`ERL_DRV_MONITOR_NOT_ALIVE`, `io.c:7012-7038`). A
+/// separate file so the C fixture it compiles does not grow this one.
+#[cfg(test)]
+mod liveness_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
