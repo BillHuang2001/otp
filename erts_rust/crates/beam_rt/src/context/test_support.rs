@@ -139,28 +139,44 @@ pub(super) fn compile_fixture(
     module: &str,
     source: &str,
 ) -> FixtureDir {
+    compile_fixtures(erlc, label, &[(module, source)])
+}
+
+/// Compiles several `(module, source)` pairs with `erlc` into **one** scratch directory, so a
+/// test can load (or let the oracle load) modules that call into each other — e.g. a fun built
+/// in one module and encoded from another.
+///
+/// The directory is unique per call (the same `label`/pid/atomic-counter scheme
+/// [`compile_fixture`] uses) and removes itself on drop.
+pub(super) fn compile_fixtures(
+    erlc: &Path,
+    label: &str,
+    modules: &[(&str, &str)],
+) -> FixtureDir {
     let seq = FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
         "beam_rt_local_fun_{label}_{}_{seq}",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).expect("the test temp dir is writable");
-    let src = dir.join(format!("{module}.erl"));
-    std::fs::write(&src, source).expect("the fixture source is writable");
-    let output = Command::new(erlc)
-        .arg("-o")
-        .arg(&dir)
-        .arg(&src)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap_or_else(|e| panic!("failed to spawn erlc '{}': {e}", erlc.display()));
-    assert!(
-        output.status.success(),
-        "erlc '{}' failed with {:?}\n--- stderr ---\n{}",
-        erlc.display(),
-        output.status.code(),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    for (module, source) in modules {
+        let src = dir.join(format!("{module}.erl"));
+        std::fs::write(&src, source).expect("the fixture source is writable");
+        let output = Command::new(erlc)
+            .arg("-o")
+            .arg(&dir)
+            .arg(&src)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn erlc '{}': {e}", erlc.display()));
+        assert!(
+            output.status.success(),
+            "erlc '{}' failed on {module} with {:?}\n--- stderr ---\n{}",
+            erlc.display(),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     FixtureDir { path: dir }
 }
 

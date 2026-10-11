@@ -36,37 +36,47 @@
 //! The bridge is built **before** `call_registered` destructures the runtime: every arm of
 //! that method hands the [`BifContext`](beam_bifs::BifContext) a bridge that borrows the
 //! runtime (`FunBridge`/`SendBridge`/`NifBridge`/…) or a process table (`DictBridge`), so
-//! this hook must hold **no** borrow of either. It therefore snapshots the three things the
-//! derivation needs — the caller module's loaded IR, the `.beam` file it came from (for the
+//! this hook must hold **no** borrow of either. It therefore snapshots what the derivation
+//! needs — every loaded module's IR plus the `.beam` file it came from (the source of its
 //! lazy checksum) and the local node atom — and reads them without touching the runtime.
 //!
 //! # What it derives, and from where
 //!
 //! [`super::bridges::local_fun_identity`] turns the term plus that snapshot into a
 //! [`beam_codec::FunIdentity`]: the module atom, the `FunT` position (`old_index`) and the
-//! `FunT` entry's `uniq` (`old_uniq`) come from the **loaded module**;
-//! [`super::bridges::module_md5`] computes the 16-byte module checksum from the `.beam`
-//! image; and the creator pid is the fixed `erts_init_process_id` (`<0.0.0>`).
+//! `FunT` entry's `uniq` (`old_uniq`) come from the **loaded module that defines the
+//! fun**; [`super::bridges::module_md5`] computes that module's 16-byte checksum from its
+//! `.beam` image; and the creator pid is the fixed `erts_init_process_id` (`<0.0.0>`).
+//!
+//! # Which module defines the fun
+//!
+//! A `make_fun3` closure's term inlines only `[uniq: u64][index: u32]`
+//! ([`beam_term::fun`]) — it does **not** name its module — so the defining module is
+//! recovered by searching the loaded modules for a `FunT` entry with that
+//! `(uniq, index)`. The snapshot is ordered **caller-first**, then by module name, so the
+//! overwhelmingly common case — a module encoding its own fun — resolves against the caller
+//! exactly as it always has, while a fun that **escaped** its defining module still resolves
+//! against the module that really defines it (the deterministic scan finds it) instead of
+//! reporting the capability gap. A cross-module `(uniq, index)` collision is possible in
+//! principle; preferring the caller is then the same choice the former module-scoped
+//! derivation always made, and it is deterministic either way.
 //!
 //! # Honesty (nothing is ever fabricated)
 //!
 //! [`LocalFunIdentity::local_fun_identity`] answers `Ok(None)` — never an error and never a
 //! guessed identity — whenever the answer is genuinely unknown:
 //!
-//! * the calling context has **no** module (the `-eval` evaluator, whose `current_module`
-//!   is `None`) or the module is not on the code server's cache;
 //! * the term is **not** a local fun — every `term_to_binary` call reaches this hook, so an
 //!   integer/atom/list/binary/`EXPORT_EXT`/imported fun must be a clean no-op;
-//! * the module's `.beam` cannot be read, or its container cannot be hashed;
-//! * the module defines no `FunT` entry matching the term's `(uniq, index)`.
+//! * the local node atom is unknown (the creator pid's node cannot be built);
+//! * **no** loaded module defines a `FunT` entry matching the term's `(uniq, index)` — the
+//!   fun's defining module is not loaded here (this is what keeps the `-eval` evaluator's own
+//!   closures on the typed gap: their `uniq` is [`crate::eval::EVAL_FUN_UNIQ`], far wider
+//!   than any `FunT` entry's `u32`, so it can never match a real module);
+//! * the matching module's `.beam` cannot be read, or its container cannot be hashed.
 //!
 //! `Ok(None)` preserves the codec's typed `unsupported: … local_fun` capability gap, so a
 //! fun whose image cannot be faithfully derived is reported, never mis-encoded.
-//!
-//! The lookup is against the **caller's** module. A local fun that escaped its defining
-//! module and is encoded from a different one therefore reports the capability gap rather
-//! than the oracle's image — the derivation is module-scoped by construction (the fun term
-//! itself does not name its module).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -76,57 +86,65 @@ use beam_common::Result;
 use beam_loader::Module;
 use beam_term::{Atom, Eterm};
 
-use super::bridges::{local_fun_identity, module_md5};
+use super::bridges::{descriptor_position, local_fun_identity, module_md5};
 use crate::codeserver::CodeServer;
 
-/// The concrete [`LocalFunIdentity`]: an owned snapshot of the calling module's fun-table
+/// The concrete [`LocalFunIdentity`]: an owned snapshot of every loaded module's fun-table
 /// identity (see the module docs).
 pub(super) struct FunIdentityBridge {
-    /// The caller module's loaded IR, when it is on the code server's cache.
-    module: Option<Arc<Module>>,
-    /// The `.beam` file that module was loaded from — the source of its lazy checksum.
-    beam_path: Option<PathBuf>,
+    /// Every loaded module that has a `.beam` path, as `(loaded IR, its `.beam` file)` — the
+    /// source of the module atom/`FunT` lookup and of the lazy checksum. Ordered **caller
+    /// module first**, then the code server's name-sorted order, so the scan is
+    /// deterministic and the common self-encoding case is reached first.
+    modules: Vec<(Arc<Module>, PathBuf)>,
     /// The local node's name atom (the `NEW_PID_EXT` creator pid's node).
     node: Option<Atom>,
 }
 
 impl FunIdentityBridge {
-    /// Snapshots the identity of the module `module` (a name, or `None` for a context with
-    /// no module) plus the local node atom `node`.
+    /// Snapshots the fun-table identity of **every** loaded module, plus the local node atom
+    /// `node`; `module` (a name, or `None` for a context with no calling module) is moved to
+    /// the front of the resolution order.
     ///
     /// Every piece is cloned out of `code_server`, so the returned bridge holds no borrow
     /// and can be installed while the runtime itself is mutably borrowed (see the module
     /// docs). `module_handle`/`loaded_path` are both lookups only — they never load a
-    /// module, so this cannot have a side effect on the code server.
+    /// module, so this cannot have a side effect on the code server. A module with no known
+    /// `.beam` path (one supplied in memory) is skipped: its checksum cannot be derived, so
+    /// it could never contribute a faithful identity.
     pub(super) fn new(
         code_server: &CodeServer,
         module: Option<&str>,
         node: Option<Atom>,
     ) -> FunIdentityBridge {
-        match module {
-            Some(name) => FunIdentityBridge {
-                module: code_server.module_handle(name),
-                beam_path: code_server.loaded_path(name).map(PathBuf::from),
-                node,
-            },
-            None => FunIdentityBridge {
-                module: None,
-                beam_path: None,
-                node,
-            },
+        // `CodeServer::loaded` is name-sorted, so the snapshot order is deterministic even
+        // though the code server's own store is a `HashMap`.
+        let mut modules: Vec<(Arc<Module>, PathBuf)> = code_server
+            .loaded()
+            .into_iter()
+            .filter_map(|name| {
+                let handle = code_server.module_handle(&name)?;
+                let path = code_server.loaded_path(&name).map(PathBuf::from)?;
+                Some((handle, path))
+            })
+            .collect();
+        // Prefer the caller module: a module encoding **its own** fun is the common case, and
+        // resolving it first keeps that already-oracle-verified image byte-for-byte unchanged.
+        if let Some(caller) = module {
+            if let Some(position) = modules
+                .iter()
+                .position(|(handle, _)| handle.atom_name(handle.name) == Some(caller))
+            {
+                let preferred = modules.remove(position);
+                modules.insert(0, preferred);
+            }
         }
+        FunIdentityBridge { modules, node }
     }
 }
 
 impl LocalFunIdentity for FunIdentityBridge {
     fn local_fun_identity(&mut self, term: Eterm) -> Result<Option<beam_codec::FunIdentity>> {
-        let (Some(module), Some(path), Some(node)) = (&self.module, &self.beam_path, self.node)
-        else {
-            // No module identity to derive from (an `-eval` context, an unloaded module, or
-            // a module supplied in memory with no file): the codec keeps its typed
-            // `unsupported_local_fun`, never a fabricated image.
-            return Ok(None);
-        };
         // This hook is consulted for **every** `term_to_binary` argument. Only a local
         // (`make_fun3`) fun has an identity to derive — `fun_uniq` rejects a non-fun (as
         // well as an `EXPORT_EXT`/imported fun) before reading any descriptor word — so
@@ -134,18 +152,36 @@ impl LocalFunIdentity for FunIdentityBridge {
         if beam_engine::terms::fun_uniq(term).is_err() {
             return Ok(None);
         }
-        // The module checksum comes from the `.beam` image (the oracle's `beam_lib:md5/1`).
-        // A read or container-parse failure means "identity unavailable" — `Ok(None)`, so
-        // the encoder reports the capability gap rather than writing a wrong image.
-        let Ok(bytes) = std::fs::read(path) else {
+        // The creator pid's node is the one input no loaded module carries: without it the
+        // image cannot be built faithfully, so the codec keeps its typed gap.
+        let Some(node) = self.node else {
             return Ok(None);
         };
-        let Ok(md5) = module_md5(&bytes) else {
-            return Ok(None);
-        };
-        // The term's own `(uniq, index)` is now known to be a local fun's; the derivation
-        // resolves the `FunT` position it names (or reports "not this module's fun").
-        local_fun_identity(module, module.name, term, md5, node)
+        // The term's own identity words, now known to be a local fun's: the defining module
+        // is whichever loaded module's `FunT` declares this `(uniq, index)`.
+        let uniq = beam_engine::terms::fun_uniq(term)?;
+        let index = beam_engine::terms::fun_index(term)?;
+        for (module, path) in &self.modules {
+            if descriptor_position(module, uniq, index).is_none() {
+                continue;
+            }
+            // The module checksum comes from its `.beam` image (the oracle's
+            // `beam_lib:md5/1`). A read or container-parse failure means "identity
+            // unavailable" — `Ok(None)`, so the encoder reports the capability gap rather
+            // than writing a wrong image. The scan stops here: a later module defining the
+            // same `(uniq, index)` would be a different lambda's identity.
+            let Ok(bytes) = std::fs::read(path) else {
+                return Ok(None);
+            };
+            let Ok(md5) = module_md5(&bytes) else {
+                return Ok(None);
+            };
+            return local_fun_identity(module, module.name, term, md5, node);
+        }
+        // No loaded module defines this fun: the defining module is not loaded here (an
+        // `-eval` template closure, a module supplied in memory), so the answer is the typed
+        // capability gap, never a guessed identity.
+        Ok(None)
     }
 }
 
@@ -164,8 +200,8 @@ mod tests {
     use beam_term::Eterm;
 
     use super::super::test_support::{
-        compile_fixture, decode_hex, hex, resolve_erlc, resolve_oracle, run_oracle_probe,
-        skip_loudly,
+        compile_fixture, compile_fixtures, decode_hex, hex, resolve_erlc, resolve_oracle,
+        run_oracle_probe, skip_loudly,
     };
     use crate::runtime::Runtime;
 
@@ -239,5 +275,69 @@ io:format(\"~s~n\", [binary:encode_hex(lfunenc:enc2(1,2))])";
                 hex(&images[case])
             );
         }
+    }
+
+    /// The escaped-fun fixture: `lfuna:mk/0` builds a 0-arity local (`make_fun3`) closure, and
+    /// `lfunb:enc/1` — a **different** module — encodes whatever fun it is handed, so the
+    /// encoding really happens outside the fun's defining module.
+    const LFUNAB: &[(&str, &str)] = &[
+        (
+            "lfuna",
+            "-module(lfuna).\n-export([mk/0]).\nmk() -> fun() -> ok end.\n",
+        ),
+        (
+            "lfunb",
+            "-module(lfunb).\n-export([enc/1]).\nenc(F) -> term_to_binary(F).\n",
+        ),
+    ];
+
+    /// The oracle probe for the escaped fun: the identity always names the **defining**
+    /// module whichever module encodes the fun (the C resolves it through the fun's
+    /// `ErlFunEntry`, `external.c:3966-3993`), so the oracle's image is `lfuna`'s.
+    const ESCAPED_ORACLE_EVAL: &str = "F = lfuna:mk(), \
+io:format(\"~s~n\", [binary:encode_hex(term_to_binary(F))])";
+
+    /// A local fun that **escaped** its defining module still encodes byte-exactly: the bridge
+    /// resolves the defining module by scanning every loaded module, so `lfunb:enc/1` encoding
+    /// an `lfuna` closure finds `lfuna` even though the caller module is `lfunb`. Before the
+    /// bridge scanned, this was the honest `unsupported: … local_fun` capability gap (never a
+    /// wrong image) — it is now the oracle's image.
+    #[test]
+    fn a_fun_that_escaped_its_defining_module_still_encodes_like_the_oracle() {
+        let (Some(oracle), Some(erlc)) = (resolve_oracle(), resolve_erlc()) else {
+            skip_loudly(BANNER, "no usable `erl` and/or `erlc`");
+            return;
+        };
+        let dir = compile_fixtures(&erlc, "escaped_local_fun", LFUNAB);
+        let lines = run_oracle_probe(&oracle, dir.path(), ESCAPED_ORACLE_EVAL);
+        assert_eq!(
+            lines.len(),
+            1,
+            "the oracle must print one image, got {lines:?}"
+        );
+        let image = decode_hex(&lines[0]);
+
+        let mut runtime = Runtime::with_defaults().expect("the default runtime");
+        let fun = runtime
+            .run_function(dir.join("lfuna.beam"), "mk", 0, &[])
+            .expect("lfuna:mk/0 runs");
+        // `lfunb:enc/1` runs with `current_module` = `lfunb` and encodes an `lfuna` closure:
+        // the defining module must be found by the scan, not assumed to be the caller.
+        let term = runtime
+            .run_function(dir.join("lfunb.beam"), "enc", 1, &[fun])
+            .unwrap_or_else(|e| panic!("lfunb:enc/1 did not run: {e:?}"));
+        let (produced, offset_bits, size_bits) =
+            beam_codec::term::bitstring_bytes(term)
+                .unwrap_or_else(|e| panic!("lfunb:enc/1 did not return a binary: {e:?}"));
+        assert_eq!(offset_bits, 0, "a binary starts at bit 0");
+        assert_eq!(size_bits, produced.len() * 8, "a binary is whole bytes");
+        assert_eq!(
+            produced,
+            image.as_slice(),
+            "an escaped lfuna closure encoded from lfunb must be the oracle's image\n  \
+             ours:   {}\n  oracle: {}",
+            hex(produced),
+            hex(&image)
+        );
     }
 }

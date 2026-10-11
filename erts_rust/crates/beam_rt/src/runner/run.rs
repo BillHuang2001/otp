@@ -28,6 +28,7 @@
 //! exit reason.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use beam_common::Result;
 use beam_engine::context::RootSet;
@@ -41,7 +42,7 @@ use crate::runtime::Runtime;
 use super::budget::{BudgetContext, BudgetProbe};
 use super::entry::{ProcessEntry, RunnerState};
 use super::perf::record_baseline_code;
-use super::reason::{exit_reason, normal, parked_receive_timeout};
+use super::reason::{exit_reason, normal};
 use super::tier::select_entry_tier;
 
 /// The `beam_process::ProcessRunner` the runtime hands to the scheduler.
@@ -461,22 +462,32 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 engine.parked = Some((func, pc));
                 // A `wait_timeout` with a statically known positive delay arms a deadline
                 // now: when it fires the process resumes at the timed-out path instead of
-                // waiting for a message (see `parked_receive_timeout`). The module the
-                // timeout is recovered from is the process's **entry** module — the export's
-                // own, or the module a fun entry resolved to — exactly as the parked address
-                // is resumed against it.
+                // waiting for a message.
+                //
+                // The deadline is recovered through `Machine::wait_deadline`, which is
+                // **cross-module aware**: a machine parked inside a `call_ext*` callee the
+                // host resolved through `ExecutionContext::resolve_external_call` sits at a
+                // `wait_timeout` in the **callee's** instruction stream, so it reads that
+                // callee's own stream and falls back to the entry module (the export's own,
+                // or the module a fun entry resolved to) for a same-module park. Reading the
+                // entry module alone would lose the deadline and park the process forever.
+                //
+                // `delay_ms` is `Some(d)` exactly when the delay is statically readable (a
+                // bare `wait` — `after infinity` — and an unreadable delay both arm nothing),
+                // and `WaitDeadline::resume` is the `timeout` continuation a fired timer
+                // re-enters.
                 engine.parked_timeout = None;
                 if let Some(module) = engine.entry.entry_module() {
-                    if let Some((delay, (resume_func, resume_pc))) =
-                        parked_receive_timeout(&engine.machine, module, func, pc)
-                    {
-                        let handle = self.runtime.schedule_receive_timeout(
-                            pid,
-                            delay,
-                            resume_func,
-                            resume_pc,
-                        );
-                        engine.parked_timeout = Some(handle);
+                    if let Some(deadline) = engine.machine.wait_deadline(module) {
+                        if let Some(delay_ms) = deadline.delay_ms {
+                            let handle = self.runtime.schedule_receive_timeout(
+                                pid,
+                                Duration::from_millis(delay_ms),
+                                deadline.resume.0,
+                                deadline.resume.1,
+                            );
+                            engine.parked_timeout = Some(handle);
+                        }
                     }
                 }
                 if let Some(process) = table.get_mut(pid) {

@@ -1066,25 +1066,112 @@ impl Runtime {
             .map_err(error::enforce_term_heap_limit)
     }
 
+    /// Adopts the off-heap refc-binary payload handles a **nested run's engine machine** built
+    /// into the runtime-lifetime store ([`Runtime::eval_off_heap`]), so they outlive the drop of
+    /// the [`Machine`](beam_engine::Machine) that owns them.
+    ///
+    /// A `bs_init_writable`/`bs_create_bin` result above
+    /// [`beam_term::refc::ERL_ONHEAP_BINARY_LIMIT`] bytes is stored **off** the process heap: the
+    /// on-heap term is the frozen 8-word `[BinRef][ErlSubBits]` pair whose `BinRef.val` names the
+    /// payload, and the payload is owned by a [`beam_alloc::RefcBinary`] handle the machine keeps
+    /// ([`Machine::refc_binaries`](beam_engine::Machine::refc_binaries)), released when that
+    /// machine drops.
+    ///
+    /// A nested run
+    /// ([`RuntimeContext::run_export_blocking`](crate::context::RuntimeContext),
+    /// [`run_label_blocking`](crate::context::RuntimeContext), a boot `{apply, …}` directive, the
+    /// `{get_until, …}` io-device continuation) executes its callee on a **fresh, short-lived**
+    /// machine and hands the result back as a raw term, so that term — and every term the callee
+    /// stored where the caller cannot see it — can still point at a payload whose only owner is
+    /// about to be dropped. That is a genuine use-after-free, not a capability gap: the freed
+    /// block is reused by the next same-sized allocation and a reader sees the wrong bytes (the
+    /// `A = base64:encode(<<…>>), X1 = binary:encode_hex(A), _ = base64:encode(<<…>>), X2 =
+    /// binary:encode_hex(A)` probe, where `X1 == X2` on the oracle).
+    ///
+    /// Cloning each handle (refcount++) into [`Runtime::eval_off_heap`] hands ownership to the
+    /// runtime, which only ever grows that table (Milestone 1 is an arena that never frees), so
+    /// the payload stays valid for the runtime's lifetime. The store doubles as the **source**
+    /// table the transport copies resolve against ([`Runtime::off_heap_source`]).
+    ///
+    /// Adoption is idempotent by payload identity: a handle whose payload the store already holds
+    /// is skipped, so adopting the same machine twice cannot accumulate redundant references
+    /// (which would otherwise inflate the per-send source-table cost).
+    pub(crate) fn adopt_escaped_binaries(&mut self, handles: &[beam_alloc::RefcBinary]) {
+        for handle in handles {
+            let held = self
+                .eval_off_heap
+                .binaries()
+                .iter()
+                .any(|stored| stored.data_ptr() == handle.data_ptr());
+            if !held {
+                self.eval_off_heap.push_binary(handle.clone());
+            }
+        }
+    }
+
+    /// The **source** off-heap table a transport copy of a term leaving a process resolves its
+    /// refc binaries against: `extra` (the sending **machine's** own handles,
+    /// [`Machine::refc_binaries`](beam_engine::Machine::refc_binaries)) **unioned** with the
+    /// runtime's escaped-payload store ([`Runtime::eval_off_heap`], filled by
+    /// [`Runtime::adopt_escaped_binaries`]).
+    ///
+    /// `None` when neither family holds a handle — the documented empty-source form the simple
+    /// copy path uses (`beam_message::copy_struct_simple` / an empty
+    /// [`beam_message::OffHeapTable`]), so the overwhelmingly common plain (on-heap) message pays
+    /// nothing.
+    ///
+    /// The union is required because one message may hold **both**: a payload the running machine
+    /// built a moment ago, and one built by a nested run whose machine is already dropped. A refc
+    /// binary is resolved **by data pointer**
+    /// ([`beam_message::OffHeapTable::binary_by_data_ptr`]), so a family left out of the table
+    /// refuses the whole copy with [`BeamError::BadArg`] — a wrong answer, never a capability gap.
+    ///
+    /// The returned table is **owned** by the caller and must outlive the copy (the
+    /// [`beam_message::CopyContext`] borrows it as its source); the *destination* side is always
+    /// the receiver's own table, never this one.
+    pub(crate) fn off_heap_source(
+        &self,
+        extra: &[beam_alloc::RefcBinary],
+    ) -> Option<beam_message::OffHeapTable> {
+        let held = self.eval_off_heap.binaries();
+        if extra.is_empty() && held.is_empty() {
+            return None;
+        }
+        let mut source = beam_message::OffHeapTable::new();
+        for handle in extra {
+            source.push_binary(handle.clone());
+        }
+        for handle in held {
+            source.push_binary(handle.clone());
+        }
+        Some(source)
+    }
+
     /// The [`SourcePayloads`] a transport copy out of `pid` resolves against: the executing
     /// machine's own refc-binary handles (`machine_handles`) unioned with the payload handles
     /// `pid`'s mailbox scan retained from the messages it received
     /// ([`MailboxState`](crate::mailbox::MailboxState)'s retained binaries, MSO handles and node
-    /// identities).
+    /// identities) and with the runtime's escaped-payload store ([`Runtime::eval_off_heap`]).
     ///
     /// A term the process **built** resolves through its machine's handles
     /// ([`Machine::refc_binaries`](beam_engine::Machine::refc_binaries)); a term it **received from
     /// another process** resolves through the handles the removed message left on its scan state,
-    /// because the machine that built that payload is a different process. A term may hold both,
-    /// so the sets are combined. A pid with no scan state (it has not removed a message) yields
-    /// the machine's handles alone — and an empty result (no handle in any family) is the
-    /// documented simple, empty-source form.
+    /// because the machine that built that payload is a different process; and a term it holds
+    /// that was built by a **nested** run inside it resolves through the runtime's escaped-payload
+    /// store, because that run's own machine is already gone
+    /// ([`Runtime::adopt_escaped_binaries`]). A term may hold any combination, so the sets are
+    /// combined. A pid with no scan state (it has not removed a message) yields the machine's and
+    /// the store's handles alone — and an empty result (no handle in any family) is the documented
+    /// simple, empty-source form.
     pub(crate) fn source_payloads(
         &self,
         pid: ProcessId,
         machine_handles: &[beam_alloc::RefcBinary],
     ) -> SourcePayloads {
         let mut payloads = SourcePayloads::from_machine(machine_handles);
+        payloads
+            .binaries
+            .extend(self.eval_off_heap.binaries().iter().cloned());
         if let Some(state) = self.mailboxes.get(&pid) {
             payloads.binaries.extend_from_slice(state.retained_binaries());
             payloads.off_heap.extend_from_slice(state.retained_off_heap());
@@ -2265,6 +2352,94 @@ mod tests {
             "the empty-source capability gap freezes collection"
         );
     }
+    /// A payload that **escaped the nested run which built it** must keep its owner: the run's
+    /// `Machine` is dropped the moment the run returns, so without
+    /// [`Runtime::adopt_escaped_binaries`] the `[BinRef][ErlSubBits]` term the run returned (and
+    /// every term the callee stored elsewhere) keeps pointing at a **freed** payload — a real
+    /// use-after-free whose observable symptom is a reader seeing bytes another allocation wrote
+    /// over, not a typed error.
+    ///
+    /// The refcount assertions are the ownership invariant: the runtime's escaped-payload store
+    /// ([`Runtime::eval_off_heap`]) holds its own reference, so the payload outlives the building
+    /// machine, and [`Runtime::off_heap_source`] can then resolve it by data pointer for a
+    /// transport copy.
+    #[test]
+    fn an_adopted_escaped_payload_outlives_the_nested_run_that_built_it() {
+        let (_source_heap, payloads, bytes, _term) = off_heap_binary();
+        let data_ptr = payloads.0[0].data_ptr();
+        assert_eq!(payloads.0[0].refcount(), 1, "only the nested run's machine owns it");
+
+        let mut rt = Runtime::new(RuntimeConfig::new().with_heap_words(MIN_HEAP_WORDS))
+            .expect("the small-heap runtime");
+        // Nothing has escaped yet: the store — and therefore the copy's source table — is empty,
+        // which is the documented empty-source fast path.
+        assert!(rt.eval_off_heap.binaries().is_empty());
+        assert!(
+            rt.off_heap_source(&[]).is_none(),
+            "an empty store and no sender handle is the empty-source form"
+        );
+
+        // The nested run's machine is dropped: `beam_rt` adopts its handles first
+        // (`RuntimeContext::run_export_blocking` and its siblings).
+        rt.adopt_escaped_binaries(&payloads.0);
+        assert_eq!(payloads.0[0].refcount(), 2, "the store owns its own clone");
+        drop(payloads);
+
+        assert_eq!(
+            rt.eval_off_heap.binaries()[0].refcount(),
+            1,
+            "the runtime alone keeps the payload alive"
+        );
+        let kept = rt.eval_off_heap.binaries()[0].clone();
+        assert_eq!(kept.refcount(), 2, "this clone adds exactly one reference");
+        assert_eq!(
+            kept.as_bytes(),
+            bytes.as_slice(),
+            "the escaped payload stays byte-identical after its building machine is gone"
+        );
+        assert_eq!(kept.data_ptr(), data_ptr, "the handle still names the same payload");
+
+        // The store is now a usable copy *source*: it resolves the payload by data pointer, the
+        // lookup `beam_message::copy::copy_refc_binary` performs.
+        let source = rt
+            .off_heap_source(&[])
+            .expect("the escaped payload makes the store a source table");
+        assert_eq!(source.binaries().len(), 1);
+        assert!(
+            source.binary_by_data_ptr(data_ptr).is_some(),
+            "the store resolves the escaped payload by its data pointer"
+        );
+
+        // ...and the runner's transport-copy builder carries the store's handles, so a term a
+        // **scheduled** process holds — possibly one a nested run inside it built — stabilizes.
+        let carried = rt.source_payloads(rt.self_pid(), &[]);
+        assert!(
+            carried.binaries.iter().any(|handle| handle.data_ptr() == data_ptr),
+            "`source_payloads` carries the escaped-payload store"
+        );
+
+        // The union: a sender that *does* hold its own machine's handles gets both families, so a
+        // message holding one payload of each resolves.
+        let own = beam_alloc::RefcBinary::new(b"a payload of the sending machine").expect("a payload");
+        let union = rt
+            .off_heap_source(&[own.clone()])
+            .expect("either family makes a source table");
+        assert_eq!(union.binaries().len(), 2);
+        assert!(union.binary_by_data_ptr(data_ptr).is_some(), "the escaped family");
+        assert!(union.binary_by_data_ptr(own.data_ptr()).is_some(), "the sender's own family");
+
+        // Adoption is idempotent by payload identity: re-adopting the same payload (a machine
+        // whose handles a nested run adopted twice, say) adds no second entry — which keeps the
+        // per-send source-table cost proportional to the number of *distinct* payloads.
+        rt.adopt_escaped_binaries(&[kept.clone()]);
+        assert_eq!(rt.eval_off_heap.binaries().len(), 1, "no duplicate store entry");
+        // Every borrow the test took (the two source tables, the carried payload set and the
+        // sender's own handle) goes away, leaving the store's single reference — the ownership
+        // invariant that makes the payload outlive the machine that built it.
+        drop((source, carried, union, own, kept));
+        assert_eq!(rt.eval_off_heap.binaries()[0].refcount(), 1, "one reference survived");
+    }
+
     /// `erlang:statistics(runtime)` is read from the runtime's **one** long-lived CPU-time
     /// clock, so its anchor persists: the first read's delta is the whole total (the clock's
     /// anchor starts at 0, the C's `runtime_prev.data.user = 0`), and every later read's delta

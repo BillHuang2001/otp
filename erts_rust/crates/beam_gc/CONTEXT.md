@@ -323,6 +323,16 @@ constructors only (no new error enum).
   (`copy.c:2109`); a GC collection copies only in-heap objects, so a copied pointer never carries the literal
   bit. A literal-tagged (and every other out-of-from-space) reference fails the `FromSet.contains` test and
   is left verbatim — the C `erts_is_literal`/area-test rule (`erl_gc.c:2013,2292-2297`).
+- **The copier relocates exactly the from-set-reachable graph — nothing else.** `Copier::complete`
+  (`src/copy.rs`) walks only the objects it copied into to-space, forwarding each child slot the canonical
+  `beam_term::layout::for_each_child_slot` walk reports (a boxed tuple's arity elements included); a
+  reference the [`EvacDest`] classifies [`Target::Foreign`] is left verbatim and its target is **not
+  descended into**. So a from-space word reached *only* through a container outside the from-set — a mature
+  object during a **minor**, a literal, or an unscanned foreign region (the runtime's pooled BIF heap /
+  pointer-stable arena / `beam_message` fragment) — is neither kept alive nor updated; and because a
+  collection immediately `reset`s/replaces the nursery (`Nursery::collapse`), such a pointer reads back as
+  reused from-space. A **major** scans young *and* mature, so it repairs a mature→young pointer a minor left
+  stale; a minor never can.
 - **In-place Cheney forwarding, exactly as C.** A boxed object's **header word is overwritten** with the new
   BOXED-tagged pointer (`IS_MOVED_BOXED = !is_header`, `erl_gc.h:36`); a cons cell's car is set to
   `THE_NON_VALUE` and its cdr to the new LIST pointer (`IS_MOVED_CONS`, `erl_gc.h:37,42-55`). The scan phase

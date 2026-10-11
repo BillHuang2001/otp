@@ -100,6 +100,7 @@ use beam_abi::nif::loader::NifCallError;
 use beam_bifs::{BifContext, OutputSink};
 use beam_common::{AllocKind, BeamError, Result};
 use beam_engine::context::RootSet;
+use beam_engine::machine::WaitDeadline;
 use beam_engine::{terms, ExecutionContext, Machine, RunOutcome};
 use beam_loader::{Atom, Label, Module};
 use beam_message::{CopyContext, Message, OffHeapTable, Queue};
@@ -148,6 +149,22 @@ const RUN_EXPORT_PUMP_SLICES: u64 = 64;
 /// single-pass/`-eval`/boot workload (a `proc_lib` start, a `gen_server` round trip, an
 /// io-device read) comes close — so the cap fires only on a genuine infinite pump.
 const BLOCKING_PUMP_DEADLINE: Duration = Duration::from_secs(10);
+
+/// The longest [`RuntimeContext::pump_once`] sleeps between two scheduler rounds while it
+/// waits a parked `receive … after T` out (see its docs for the whole design).
+///
+/// The nested pump owns no timer — the engine arms none for a `wait_timeout` — so the
+/// deadline is recovered from the machine and waited for here. The wait must neither
+/// busy-spin (a bare retry loop would burn a core for the whole delay) nor sleep past the
+/// deadline (the timeout must fire **no earlier** than `T`, and a message a runnable peer
+/// delivers must still win promptly), so every round sleeps `min(remaining, this)` and then
+/// pumps the scheduler again.
+///
+/// It is deliberately a **local** constant rather than the scheduler pass's own sleep bound:
+/// that one (`scheduler.rs`'s private `TIMER_PUMP_SLICE`) caps how long a *pass* may sleep on
+/// the runtime's own timer heap, while this one caps a sleep **between** two passes of a
+/// nested run whose timer that heap never learns about.
+const DEADLINE_PUMP_SLEEP: Duration = Duration::from_millis(5);
 
 /// Drives a machine suspended in a `receive` to its `return`, one scheduler pump per wait.
 ///
@@ -523,8 +540,20 @@ impl<'a> RuntimeContext<'a> {
         from: Eterm,
         message: Eterm,
     ) -> Result<()> {
-        let source = OffHeapTable::new();
-        self.deliver_message_with_off_heap(to, from, message, &source)
+        // The sender passed no handles of its own, but `message` may still carry an off-heap
+        // payload that **escaped** the nested run which built it: that payload's handle lives
+        // in the runtime's escaped-payload store, and the receiver-side copy resolves a refc
+        // binary by its data pointer through the source table it is handed
+        // ([`Runtime::off_heap_source`]). `None` (no handle anywhere) is the documented empty
+        // -source form — the fast path, byte-identical to before.
+        let source = self.runtime.off_heap_source(&[]);
+        match &source {
+            Some(source) => self.deliver_message_with_off_heap(to, from, message, source),
+            None => {
+                let empty = OffHeapTable::new();
+                self.deliver_message_with_off_heap(to, from, message, &empty)
+            }
+        }
     }
 
     /// [`Self::deliver_message`] for a sender that holds the term's **source off-heap table**
@@ -559,6 +588,39 @@ impl<'a> RuntimeContext<'a> {
     /// first result would turn the retry trigger into a hard error and break every oversized
     /// delivery.
     pub(crate) fn deliver_message_with_off_heap(
+        &mut self,
+        to: ProcessId,
+        from: Eterm,
+        message: Eterm,
+        src: &OffHeapTable,
+    ) -> Result<()> {
+        // A delivery may **collect on the receiver's heap** — `Process::deliver`'s
+        // `ensure_capacity` refusal path drives a rooted collection — and that collection
+        // relocates against the receiver's *published* root snapshot
+        // ([`Process::registers`](beam_process::Process::registers)), not against the live
+        // machine. For the process this context belongs to that snapshot is **stale by up to
+        // one slice of instructions**, because a delivery is driven from the scheduler pump
+        // *while* the owning machine is mid-slice: the machine's x registers/the Erlang stack
+        // hold young terms the snapshot cannot see, so collecting here frees young words the
+        // running machine still points at (the `Target::Foreign` relocation hazard
+        // `crate::context::gc` documents).
+        //
+        // Exempting that process for the duration of the delivery makes `Process::deliver`
+        // surface its raw refusal instead of collecting (see
+        // [`Process::set_relocation_exempt`](beam_process::Process::set_relocation_exempt)), so
+        // no heap word moves under a term the unpublished machine still holds. The message
+        // still arrives: the refusal is exactly the signal the heap-fragment fallback below is
+        // reached on. A delivery to a process that is **not** the one this context runs as is
+        // unaffected — the exemption names this context's own pid, and another process's
+        // collection is legitimate (its roots were published when it parked).
+        self.with_relocation_exempt(|this| {
+            this.deliver_message_with_off_heap_inner(to, from, message, src)
+        })
+    }
+
+    /// The delivery body of [`Self::deliver_message_with_off_heap`], run with the sending
+    /// context's own process marked relocation-exempt (see that method for why).
+    fn deliver_message_with_off_heap_inner(
         &mut self,
         to: ProcessId,
         from: Eterm,
@@ -842,11 +904,14 @@ impl<'a> RuntimeContext<'a> {
     /// `may_pump_scheduler() == false`) must never re-enter the scheduler — that would run a
     /// second process from within a slice — so it keeps the plain non-blocking entry's typed
     /// [`beam_engine::blocked`] gap. A pump that reports **nothing ran** (`0`) is the same
-    /// honest gap: no process could have changed the mailbox, so spinning further would only
-    /// hang, never produce a value. A process that stays **runnable forever**, by contrast,
-    /// reports progress on every round; [`pump_until_returned`] then gives up when its
-    /// [`BLOCKING_PUMP_DEADLINE`] wall-clock cap elapses and reports a typed
-    /// [`error::message`] diagnostic rather than spinning without end.
+    /// honest gap — no process could have changed the mailbox — **unless** the parked
+    /// `receive` has a statically readable finite `after T`: that deadline is the nested run's
+    /// own to wait out ([`RuntimeContext::pump_once`]), so an empty run queue is then the
+    /// expected state and the bound is the delay itself, not `0`. A process that stays
+    /// **runnable forever**, by contrast, reports progress on every round;
+    /// [`pump_until_returned`] then gives up when its [`BLOCKING_PUMP_DEADLINE`] wall-clock
+    /// cap elapses and reports a typed [`error::message`] diagnostic rather than spinning
+    /// without end.
     ///
     /// # Why the paused terms stay valid
     ///
@@ -870,10 +935,20 @@ impl<'a> RuntimeContext<'a> {
         // whole run (see [`Self::with_relocation_exempt`]).
         self.with_relocation_exempt(|this| {
             let mut machine = Machine::new();
-            let outcome = machine.run_export_outcome(module, function, arity, args, this)?;
-            pump_until_returned(BLOCKING_PUMP_DEADLINE, outcome, |func, pc| {
-                this.pump_once(&mut machine, module, func, pc)
-            })
+            let result = match machine.run_export_outcome(module, function, arity, args, this) {
+                Ok(outcome) => pump_until_returned(BLOCKING_PUMP_DEADLINE, outcome, |func, pc| {
+                    this.pump_once(&mut machine, module, func, pc)
+                }),
+                Err(err) => Err(err),
+            };
+            // The machine is dropped when this scope ends, releasing every off-heap payload
+            // handle it built — but the returned term (and any term the callee stored where
+            // this run cannot see it) may still point at one. Adopt them into the runtime's
+            // escaped-payload store **before** that drop, on every path, so no live term can
+            // dangle (see `Runtime::adopt_escaped_binaries`).
+            this.runtime
+                .adopt_escaped_binaries(machine.refc_binaries());
+            result
         })
     }
 
@@ -899,11 +974,14 @@ impl<'a> RuntimeContext<'a> {
     /// `may_pump_scheduler() == false`) must never re-enter the scheduler — that would run a
     /// second process from within a slice — so it keeps the plain non-blocking entry's typed
     /// [`beam_engine::blocked`] gap. A pump that reports **nothing ran** (`0`) is the same
-    /// honest gap: no process could have changed the mailbox, so spinning further would only
-    /// hang, never produce a value. A process that stays **runnable forever**, by contrast,
-    /// reports progress on every round; [`pump_until_returned`] then gives up when its
-    /// [`BLOCKING_PUMP_DEADLINE`] wall-clock cap elapses and reports a typed
-    /// [`error::message`] diagnostic rather than spinning without end.
+    /// honest gap — no process could have changed the mailbox — **unless** the parked
+    /// `receive` has a statically readable finite `after T`: that deadline is the nested run's
+    /// own to wait out ([`RuntimeContext::pump_once`]), so an empty run queue is then the
+    /// expected state and the bound is the delay itself, not `0`. A process that stays
+    /// **runnable forever**, by contrast, reports progress on every round;
+    /// [`pump_until_returned`] then gives up when its [`BLOCKING_PUMP_DEADLINE`] wall-clock
+    /// cap elapses and reports a typed [`error::message`] diagnostic rather than spinning
+    /// without end.
     ///
     /// # Why the paused terms stay valid
     ///
@@ -927,10 +1005,17 @@ impl<'a> RuntimeContext<'a> {
         // whole run (see [`Self::with_relocation_exempt`]).
         self.with_relocation_exempt(|this| {
             let mut machine = Machine::new();
-            let outcome = machine.run_label_outcome(module, label, arity, args, this)?;
-            pump_until_returned(BLOCKING_PUMP_DEADLINE, outcome, |func, pc| {
-                this.pump_once(&mut machine, module, func, pc)
-            })
+            let result = match machine.run_label_outcome(module, label, arity, args, this) {
+                Ok(outcome) => pump_until_returned(BLOCKING_PUMP_DEADLINE, outcome, |func, pc| {
+                    this.pump_once(&mut machine, module, func, pc)
+                }),
+                Err(err) => Err(err),
+            };
+            // As [`Self::run_export_blocking`]: adopt the closure's off-heap payload handles
+            // before the machine holding them is dropped.
+            this.runtime
+                .adopt_escaped_binaries(machine.refc_binaries());
+            result
         })
     }
 
@@ -939,9 +1024,52 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// `Ok(None)` means the mailbox cannot have changed since the last scan — either this
     /// context may not re-enter the scheduler ([`RuntimeContext::for_process`] is itself
-    /// inside a slice) or the pump reported nothing ran — both the honest
-    /// [`beam_engine::blocked`] gap (see [`RuntimeContext::run_export_blocking`]). A pump
-    /// error (a process-table/port failure) is propagated unchanged.
+    /// inside a slice) or the pump reported nothing ran **and** the parked `receive` has no
+    /// finite deadline to wait for — both the honest [`beam_engine::blocked`] gap (see
+    /// [`RuntimeContext::run_export_blocking`]). A pump error (a process-table/port failure)
+    /// is propagated unchanged.
+    ///
+    /// # The finite `after T` a nested run must wait out itself
+    ///
+    /// The engine arms **no** timer for a `receive … after T`: a non-zero `wait_timeout`
+    /// simply suspends at its scan label, and the host recovers the deadline from the machine
+    /// through [`Machine::wait_deadline`](beam_engine::Machine::wait_deadline) — the
+    /// [`WaitDeadline { delay_ms, resume }`](WaitDeadline) pair, whose `resume` is the
+    /// `timeout` opcode directly after the parked `wait_timeout` (the C-faithful timed-out
+    /// path: the `timeout` instruction resets the scan and continues).
+    ///
+    /// A **scheduled** process gets that timer from the scheduler pass (a receive deadline it
+    /// arms and resumes), but the machine a nested run drives is not scheduled, so nothing
+    /// would ever fire its deadline: with no other process runnable the pump reports `0` on
+    /// **every** round, so folding that into `Ok(None)` would turn a finite `after T` that only
+    /// its own timeout can satisfy into the typed `blocked()` gap. When the parked
+    /// `wait_timeout` carries a statically readable finite delay this method therefore waits it
+    /// out:
+    ///
+    /// * **Each round** advances the runtime by [`RUN_EXPORT_PUMP_SLICES`] slices. A pump that
+    ///   reported progress means the mailbox may have changed, so the machine is resumed at the
+    ///   address the [`RunOutcome::Wait`] reported: a matching message **wins the race** and its
+    ///   outcome is returned immediately (a message arriving before `T` cancels the deadline,
+    ///   exactly as in the C).
+    /// * **`ran == 0` does not end this branch.** An empty run queue is the *expected* state
+    ///   here — nobody but the timeout can answer the receive — so the bound is the finite
+    ///   delay itself, never an unbounded wait and never a busy-spin: each round sleeps
+    ///   `min(remaining, DEADLINE_PUMP_SLEEP)` before pumping again.
+    /// * **The timeout fires only once the wall clock has really reached `start + delay_ms`**
+    ///   (`Instant` is monotonic and the target is never clamped below `T`), so it can never be
+    ///   delivered early — a wrong value. The resume then re-enters the machine at the `timeout`
+    ///   continuation and that outcome is returned.
+    /// * A resume that re-parks the machine at a **different** suspension (it took the message
+    ///   and its body blocked again) is handed straight back to the driver loop
+    ///   ([`pump_until_returned`]), which re-enters here with the new address so **that**
+    ///   receive's own deadline is recovered and waited for in turn. Firing the old `timeout`
+    ///   continuation there would continue an abandoned receive.
+    ///
+    /// The wait is bounded by `delay_ms` alone, so the outer [`BLOCKING_PUMP_DEADLINE`] —
+    /// checked by [`pump_until_returned`] *between* rounds — never truncates it: a
+    /// `receive … after 60000` really waits its full minute, exactly as the oracle does. The cap
+    /// still protects a process that keeps returning to the driver loop without ever reaching a
+    /// deadline, which is what it is for.
     fn pump_once(
         &mut self,
         machine: &mut Machine,
@@ -952,11 +1080,60 @@ impl<'a> RuntimeContext<'a> {
         if !self.may_pump_scheduler() {
             return Ok(None);
         }
-        let ran = self.runtime.pump_scheduler(RUN_EXPORT_PUMP_SLICES)?;
-        if ran == 0 {
-            return Ok(None);
+        // The parked `receive`'s statically readable finite deadline, when it has one: a bare
+        // `wait`, an `after infinity`, an unreadable delay and "not parked at a wait_timeout at
+        // all" all mean "no deadline" (the honest answer, never a guessed one).
+        let finite = match machine.wait_deadline(module) {
+            Some(WaitDeadline {
+                delay_ms: Some(delay_ms),
+                resume,
+            }) => Some((delay_ms, resume)),
+            _ => None,
+        };
+        let Some((delay_ms, resume)) = finite else {
+            // No deadline: one pump, and a pump that changed nothing ends the drive with the
+            // typed gap (the mailbox cannot have changed).
+            let ran = self.runtime.pump_scheduler(RUN_EXPORT_PUMP_SLICES)?;
+            if ran == 0 {
+                return Ok(None);
+            }
+            return Ok(Some(machine.resume_outcome(module, func, pc, self)?));
+        };
+        let target = Instant::now() + Duration::from_millis(delay_ms);
+        loop {
+            if self.runtime.pump_scheduler(RUN_EXPORT_PUMP_SLICES)? > 0 {
+                let outcome = machine.resume_outcome(module, func, pc, self)?;
+                match outcome {
+                    RunOutcome::Returned(_) => return Ok(Some(outcome)),
+                    RunOutcome::Wait { func: f, pc: p } => {
+                        // The machine re-parked. If it is no longer waiting on **this** receive
+                        // (the message arrived and its body blocked in a new one), hand the new
+                        // position back to the driver: it re-enters here and recovers the new
+                        // receive's own deadline.
+                        if machine.wait_deadline(module)
+                            != Some(WaitDeadline {
+                                delay_ms: Some(delay_ms),
+                                resume,
+                            })
+                        {
+                            return Ok(Some(RunOutcome::Wait { func: f, pc: p }));
+                        }
+                    }
+                }
+            }
+            let now = Instant::now();
+            if now >= target {
+                // The deadline has really elapsed: continue at the `timeout` opcode.
+                return Ok(Some(
+                    machine.resume_outcome(module, resume.0, resume.1, self)?,
+                ));
+            }
+            std::thread::sleep(
+                target
+                    .saturating_duration_since(now)
+                    .min(DEADLINE_PUMP_SLEEP),
+            );
         }
-        Ok(Some(machine.resume_outcome(module, func, pc, self)?))
     }
 
     /// Records the module whose **code** this context is about to execute — the BIF call
@@ -1084,14 +1261,15 @@ impl<'a> RuntimeContext<'a> {
         // the same image) of a compiled module's `make_fun3` closure needs the `NEW_FUN_EXT`
         // fields the term does not carry (module atom, module MD5, `old_index`/`old_uniq`,
         // creator pid), which only the *loaded module* knows. Like `local_node` this hook
-        // needs **no** runtime borrow — it snapshots the caller module, its `.beam` path and
-        // the node atom — but building that snapshot is not free (an `Arc` clone plus a
-        // `PathBuf` allocation), so it is built **only** for the four BIFs that consult this
-        // seam (see [`Self::uses_fun_identity`]). For every other registered call it stays
-        // `None` and no hook is installed — indistinguishable from the hook itself, because
-        // no other BIF ever calls `local_fun_identity`. With no calling module (the `-eval`
-        // evaluator) the hook answers `Ok(None)`, preserving the codec's typed
-        // `unsupported_local_fun` (see [`FunIdentityBridge`]).
+        // needs **no** runtime borrow — it snapshots every loaded module's `Arc<Module>` and
+        // `.beam` path (caller module first) plus the node atom — but building that snapshot
+        // is not free (an `Arc` clone plus a `PathBuf` per loaded module), so it is built
+        // **only** for the four BIFs that consult this seam (see [`Self::uses_fun_identity`]).
+        // For every other registered call it stays `None` and no hook is installed —
+        // indistinguishable from the hook itself, because no other BIF ever calls
+        // `local_fun_identity`. The `-eval` evaluator's own closures match no loaded module's
+        // `FunT`, so they keep the codec's typed `unsupported_local_fun` (see
+        // [`FunIdentityBridge`]).
         let mut fun_identity = if Self::uses_fun_identity(module, function, arity) {
             Some(FunIdentityBridge::new(
                 &self.runtime.code_server,
@@ -1974,7 +2152,8 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// as a module context and `Step::Enter` the callee's export entry with the caller's
     /// continuation stored in the live frame — so the callee's registers, Erlang stack and
     /// frames are the *same* root set the slice's own machine already hands
-    /// [`ExecutionContext::ensure_heap`], and the slice's per-call GC latch covers every
+    /// [`ExecutionContext::ensure_heap_full`] (every x register, the whole Erlang stack **and**
+    /// the whole FR file), and the slice's per-call GC latch covers every
     /// allocation the callee performs (see [`crate::context::gc`]). A recursion through
     /// `call_bif` instead builds a **second** [`Machine`](beam_engine::Machine) whose
     /// admission point is never armed, so every allocation past the process's young heap
@@ -2003,12 +2182,25 @@ impl ExecutionContext for RuntimeContext<'_> {
     ///   that way whose own code reads the call site it runs at
     ///   ([`module_observes_its_call_site`]) → `Ok(None)` as well, so the on-demand route
     ///   never widens the caller-identity caveat documented above;
-    /// * a callee whose code touches the machine's **float-register file** → `Ok(None)` (the
-    ///   float guard — see [`crate::context::gc`]: the in-machine callee runs under the
-    ///   caller's recorded module identity, so a collection over it could dangle a live float
-    ///   register);
     /// * a function atom or export the callee does not have → `Ok(None)`, so the synchronous
     ///   path reports the oracle's `undef` byte for byte.
+    ///
+    /// The one exclusion that is deliberately **absent** here is [`crate::context::gc`]'s
+    /// **float guard**: a callee whose code touches the machine's float-register file is
+    /// entered in-machine like any other. An in-machine callee runs under the **caller's**
+    /// recorded `current_module` (the engine's module-context switch never re-enters this
+    /// context) and may leave `Machine::fr` set, but the door the engine reaches on the
+    /// slice's own machine is [`ExecutionContext::ensure_heap_full`], which publishes the
+    /// caller's **whole FR file** as a root
+    /// ([`publish_roots_full`](crate::context::gc)) — so a collection over that machine
+    /// relocates a live float register instead of dangling it, for *any* module. A float
+    /// register left live at the end of a slice is additionally caught by the runner's
+    /// post-slice scan, which pins the process permanently
+    /// ([`crate::runner`]). The guard the two GC doors still keep
+    /// ([`module_may_be_collected`](crate::context::gc)) keys on the **caller's** module, so
+    /// refusing here would refuse a float-using callee on account of a register file the full
+    /// door publishes anyway — and would route the callee's blocking `receive` onto the
+    /// non-pumping [`Self::call_bif`] path, where it folds into the typed `blocked()` gap.
     ///
     /// Every `Ok(None)` leaves [`Self::call_bif`] — and therefore every observable result —
     /// unchanged: the seam only ever *substitutes a routing* for a call the synchronous path
@@ -2101,17 +2293,6 @@ impl ExecutionContext for RuntimeContext<'_> {
                 callee
             }
         };
-        // The **float guard** (see [`crate::context::gc`]): a module whose code touches the
-        // machine's float-register file must never be collected over — `Machine::fr` holds
-        // *terms* and is not part of the root set `ensure_heap` hands out, so a heap move with
-        // a live float register would dangle it. An in-machine callee runs under the
-        // **caller's** recorded `current_module` (the engine's module-context switch does not
-        // re-enter this context), so entering a float-using callee here could collect under a
-        // float-free caller's identity. Such a callee keeps the synchronous path instead,
-        // which never collects over it — byte for byte its behaviour before this seam.
-        if !self.runtime.module_is_float_free(module, &callee) {
-            return Ok(None);
-        }
         // Resolve the export in the **callee's own** atom table (`Module` code's atoms are
         // that table's, never the runtime's shared one) and hand back the export entry label
         // the synchronous `run_export` would enter. An unknown atom or export is the
@@ -2312,18 +2493,19 @@ impl ExecutionContext for RuntimeContext<'_> {
     ) -> Result<()> {
         let (target, reference) = self.resolve_send_target(to)?;
         let from = self.mailbox_pid.to_eterm();
-        if src_binaries.is_empty() {
-            self.deliver_message(target, from, message)?;
-        } else {
-            // The sender's source off-heap table, built from the machine's handles (each
-            // `clone` bumps the `RefcBinary` refcount). It is a local that must outlive the
-            // whole delivery: the receiver-side copy borrows it (see
-            // `deliver_message_with_off_heap`).
-            let mut source = OffHeapTable::new();
-            for handle in src_binaries {
-                source.push_binary(handle.clone());
-            }
-            self.deliver_message_with_off_heap(target, from, message, &source)?;
+        // The copy's source off-heap table: the sender machine's own handles (`src_binaries`)
+        // **unioned** with the runtime's escaped-payload store
+        // ([`Runtime::off_heap_source`]). The union matters because a term this sender holds
+        // may reference a payload built by a nested run whose machine has already been dropped
+        // — `result ! B` after `B = compile:forms(...)` — and the receiver-side copy resolves
+        // every refc binary by its data pointer through the source table, so a handle missing
+        // from it refuses the whole message with `BeamError::BadArg`. `None` (no handle in
+        // either family, i.e. a plain on-heap message) keeps the documented empty-source fast
+        // path.
+        let source = self.runtime.off_heap_source(src_binaries);
+        match &source {
+            Some(source) => self.deliver_message_with_off_heap(target, from, message, source)?,
+            None => self.deliver_message(target, from, message)?,
         }
         // An **alias** destination is consumed by the message that went through it (see
         // `resolve_send_target`): the delivery is done, so the `reply_demonitor` rule can
@@ -2432,20 +2614,36 @@ impl ExecutionContext for RuntimeContext<'_> {
 }
 
 /// Whether `module`'s **own code** can read the call site it runs at, i.e. whether it imports a
-/// BIF whose answer depends on [`RuntimeContext::current_module`].
+/// BIF whose answer depends on [`RuntimeContext::current_module`] — or, for the second group
+/// below, whether entering it in-machine would expose a known relocation hazard of another
+/// subsystem. Either way the answer means "keep this module on the synchronous `call_bif`
+/// route".
 ///
 /// The engine's cross-module call seam ([`ExecutionContext::resolve_external_call`]) runs a
 /// callee inside the **caller's** machine, and the engine's module-context switch never re-enters
-/// this context, so a callee keeps the caller's `current_module`. The two imported BIFs that
-/// *read* that identity are:
+/// this context, so a callee keeps the caller's `current_module`. The one imported BIF that
+/// *reads* that identity is:
 ///
 /// * `erlang:load_nif/2` — the module a NIF library is registered under, which the library's own
 ///   `ErlNifEntry.name` is validated against: a stale identity is the oracle's `bad_lib` (and it
-///   is why a module carrying a *loaded* NIF is excluded from the seam altogether);
-/// * `erlang:term_to_binary/1,2` and `erlang:external_size/1,2` — the `NEW_FUN_EXT` identity
-///   (module atom, module MD5, `old_index`/`old_uniq`) of a **local** fun argument, which
-///   [`FunIdentityBridge`] derives from the calling module: a stale identity would name the wrong
-///   module.
+///   is why a module carrying a *loaded* NIF is excluded from the seam altogether).
+///
+/// The `NEW_FUN_EXT` identity of a **local** fun no longer reads the call site:
+/// `erlang:term_to_binary/1,2` and `erlang:external_size/1,2` resolve the defining module by
+/// searching every loaded module for the fun's own `(uniq, index)` ([`FunIdentityBridge`], which
+/// prefers the caller but is not confined to it), so a callee entering in-machine under a stale
+/// `current_module` still derives the right image. Those three names are nevertheless kept on the
+/// synchronous route as a **conservative routing guard against a hazard owned elsewhere**: a
+/// callee entered in-machine can park with a live
+/// [`Machine::pending_exception`](beam_engine::Machine) — a term the engine holds and which
+/// `beam_process::Registers::gather_roots` does **not** publish — and a delivery-driven
+/// collection in the park window (`beam_process`'s signal-build heap growth) then relocates the
+/// process heap against that incomplete root set, freeing words the parked machine still points
+/// at. Until `pending_exception` is rooted across `beam_engine`/`beam_process`, entering the
+/// modules that reach that shape in-machine turns the honest typed
+/// [`beam_engine::blocked`] gap of the A.9 `compile:file/2` route into a **wrong result**, so this
+/// clause stays and is removed together with that fix (the clause is why the E0 route reports the
+/// typed gap rather than a compile that silently fails).
 ///
 /// The other `current_module` readers cannot be made wrong by a callee's stale identity:
 /// `records:get_definition/2` resolves its module from its **argument** ([`RecordBridge`] holds no

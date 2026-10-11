@@ -61,11 +61,30 @@
 //!
 //! # The float guard
 //!
-//! A module whose code contains a float-family instruction is **never** collected over
-//! ([`module_uses_floats`], cached per module name); everything else — most importantly a
-//! floating-point *BIF* such as `math:sqrt/1`, whose code is in another module — is then
-//! harmless, because that module's own code is never the code under a collection. An
-//! unresolvable call site (a fun entry or the `-eval` evaluator, which have no
+//! Both doors refuse to collect when the **call site's** module contains a float-family
+//! instruction ([`module_uses_floats`], cached per module name — see
+//! [`module_may_be_collected`]). The two doors do **not** need it equally:
+//!
+//! * the **full** door ([`ensure_heap_full`], and [`alloc_words_rooted`]) hands the machine's
+//!   whole [`RootSet`] over, FR file included ([`publish_roots_full`]), so a collection over it
+//!   is FR-safe for **any** module — its copy of the guard is a conservative *extra*, not what
+//!   makes a float-using module collectable;
+//! * the **narrow** door ([`ensure_heap`]) receives only the x-register prefix and the stack and
+//!   can never see the machine's FR file, so for that door the caller-module guard is
+//!   load-bearing: without it a live float register could dangle across the move. The engine
+//!   reaches only the full door (`Machine::ensure_heap`/`test_heap`/`allocate_heap` →
+//!   [`ExecutionContext::ensure_heap_full`](beam_engine::ExecutionContext::ensure_heap_full)),
+//!   so this narrow form is not on the engine's path today.
+//!
+//! The **cross-module call seam**
+//! ([`RuntimeContext::resolve_external_call`](crate::RuntimeContext)) does not consult this
+//! guard at all: a float-using callee is entered in-machine exactly like any other, which is
+//! safe because it runs under the caller's machine and that machine's collection goes through
+//! the full door. A float register still live when a slice ends is caught out of band by the
+//! runner's post-slice scan, which pins the process permanently
+//! ([`Runtime::pin_process`](crate::runtime::gc)).
+//!
+//! An unresolvable call site (a fun entry or the `-eval` evaluator, which have no
 //! `current_module`) is not collected over either — conservative, never wrong.
 
 use beam_alloc::Heap;
@@ -390,6 +409,15 @@ fn collect_or_grow(process: &mut Process, heap_need: u32) -> Result<Collection> 
 /// process is not collectable, or when the call site's module is not known to be float-free,
 /// this is a no-op — exactly the pre-collector runtime.
 ///
+/// # Why the caller-module guard is load-bearing *here*
+///
+/// This door is handed only the x-register prefix and the stack, so it can never see the
+/// machine's FR file and a collection here **would** dangle a live float register. The
+/// [`module_may_be_collected`] test on the call site's module is therefore the only thing that
+/// keeps this door sound for float code — unlike the full door
+/// ([`ensure_heap_full`]), whose copy of the same test is a conservative extra because it
+/// publishes the FR file itself ([`publish_roots_full`]). The engine reaches only the full
+/// door, so this narrow form is not on the engine's path today.///
 /// # Growth
 ///
 /// The collection this runs is the collector's on-demand growth seam
@@ -540,11 +568,14 @@ pub(crate) fn ensure_heap(
 /// `Machine::ensure_heap`/`test_heap`/`allocate_heap` through
 /// [`ExecutionContext::ensure_heap_full`](beam_engine::ExecutionContext::ensure_heap_full).
 /// The **gate order is identical** to the narrow door's — the latch, the forced-collection
-/// request, the collectability test, the float guard, the table/process lookup, the
-/// occupancy test and the "committed" request consume — and only the root hand-off differs:
+/// request, the collectability test, the caller-module float guard, the table/process lookup,
+/// the occupancy test and the "committed" request consume — and only the root hand-off differs:
 /// it publishes and scatters `roots` (every x slot, the whole stack, the whole FR file)
 /// through [`publish_roots_full`]/[`scatter_roots_full`] instead of a `live`-bounded x prefix.
-///
+/// Because the FR file is published, this door is **FR-safe for any module**: a live float
+/// register is relocated like any other root, so the [`module_may_be_collected`] test it keeps
+/// is a conservative extra rather than the thing that makes float code collectable (see the
+/// module docs' float-guard section).///
 /// # Growth
 ///
 /// This door takes the **same action** as the narrow one ([`collect_or_grow`]): the
@@ -734,10 +765,10 @@ pub(crate) fn alloc_words(ctx: &mut RuntimeContext<'_>, n: usize) -> Result<*mut
 ///   [`alloc_words`] does, and only when that bump **fails** run one collection over the
 ///   handed-in roots and retry the bump. A collection or scatter failure halts collection for
 ///   that process ([`Runtime::halt_process_gc`](crate::runtime::gc)) and falls back to the
-///   arena. The float guard and the `current_module` requirement both apply, exactly as in
-///   [`ensure_heap_full`], because a collection over a module that touches the machine's
-///   float-register file could corrupt a live float register.
-///
+///   arena. The caller-module float guard and the `current_module` requirement both apply,
+///   exactly as in [`ensure_heap_full`] — the test is conservative here too: this door
+///   publishes the machine's **whole FR file** ([`publish_roots_full`]), so a live float
+///   register is relocated, not corrupted.///
 /// # Errors
 ///
 /// Propagates the arena's allocation failure only — never a collection failure.
