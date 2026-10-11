@@ -42,6 +42,13 @@ pub trait ExecutionContext {
         -> Result<Option<(Arc<beam_loader::Module>, beam_loader::Label)>> { Ok(None) }
     /// The per-instruction reduction hook: charge `n` for the instruction just executed.
     fn reduce(&mut self, n: u32) -> Result<()> { let _ = n; Ok(()) }
+    /// Whether the host wants the per-instruction `reduce` charges at all: latched once per
+    /// run into `Machine::reduce_on` (like the A.8 trace gate), so a host whose `reduce` is
+    /// the default no-op pays a predictable branch instead of a vtable call. Defaults to the
+    /// CONSERVATIVE `true` -- a host that implements `reduce` (e.g. `beam_rt`'s scheduler)
+    /// MUST stay `true`, or its pre-emption charges would be silently dropped. The slice
+    /// counter `Machine::reductions()` is still bumped every instruction regardless.
+    fn wants_reduce(&self) -> bool { true }
     /// Contract A.8 execution-trace seam: a cheap gate + a defaulted no-op reporter.
     fn trace_enabled(&self) -> bool { false }
     fn trace_event(&mut self, event: TraceEvent<'_>) { let _ = event; }
