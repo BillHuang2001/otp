@@ -684,14 +684,15 @@ The rationale (why) behind the frozen API and constraints lives in **`DESIGN_DEC
   `noproc` signal (the `RuntimeHooksBridge::link` comment claiming the signal "simply never arrives" is
   stale — the signal is delivered); (14) the `process_flag(max_heap_size/min_heap_size/…)` arm returning the previous value;
   (15) `spawn_opt`'s `max_heap_size < min_heap_size ⇒ badarg` and honest `message_queue_data`;
-  (16) `port_info`'s `queue_size`/`locking` items; (17) **the collector type change**: `Process::collector()`
-  now returns `&beam_gc::AnyCollector`, so a host reading the mature space **by reference** must switch to
-  the geometry accessors — `beam_rt/src/context/gc.rs::root_is_unscanned`'s
-  `in_heap_block(process.collector().mature().heap(), ptr)` becomes
-  `process.collector().mature_contains(ptr as *const Eterm)` and
-  `beam_rt/src/context/memory_hook.rs`'s `collector.mature().used_words()` becomes
-  `collector.mature_used_words()`. Every other host use (`young()`, `stats()`, `minor_gcs()`, `policy()`,
-  `heap_size_words()`, `total_heap_size_words()`) resolves unchanged.## See Also
+  (16) `port_info`'s `queue_size`/`locking` items.
+  `Process::collector()` returns `&beam_gc::AnyCollector` (the mature-strategy dispatch), so a host reads the
+  mature generation through its geometry accessors (`mature_contains`, `mature_used_words`,
+  `mature_capacity_words`, `mature_base`) instead of a `&HeapSpace` — `beam_rt` does so in
+  `src/context/gc.rs` (the unscanned-root valve) and `src/context/memory_hook.rs`. Every other host use
+  (`young()`, `stats()`, `minor_gcs()`, `policy()`, `heap_size_words()`, `total_heap_size_words()`) resolves
+  unchanged.
+
+## See Also
 - `DESIGN_DECISIONS.md` → the design rationale behind the frozen API and constraints in this file.
 - `../CONTEXT.md` → crate-layer contracts, the seam types and the wave-3 dependency position.
 - `../../CONTEXT.md` → workspace contracts (§1 A.1 process semantics, §3 error strategy, §5 GC/memory model, §6 test gate).
