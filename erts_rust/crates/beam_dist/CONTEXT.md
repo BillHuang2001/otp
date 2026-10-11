@@ -116,8 +116,7 @@ control message, and both `Connection::send_payload` and `ConnectionDriver::send
 index on the payload and teaches/re-uses those refs in the header; an atom-free message emits the exact
 `131, 68, 0` header.
 
-**`epmd` over real TCP works** (an earlier "blocked in this sandbox" note was a misdiagnosis — see
-Design Decisions), covering the complete request set: `ALIVE2_REQ`/`ALIVE2_RESP`/`ALIVE2_X_RESP`,
+**`epmd` over real TCP works**, covering the complete request set: `ALIVE2_REQ`/`ALIVE2_RESP`/`ALIVE2_X_RESP`,
 `PORT2_REQ`/`PORT2_RESP` (`PORT_PLEASE2_REQ`, the same wire byte `122`/`'z'`, an alias), `NAMES_REQ`,
 and the interactive `DUMP_REQ`/`KILL_REQ`/`STOP_REQ`. `EpmdClient::connect` / `epmd::lookup_port` /
 `epmd::lookup` talk to a live `epmd`; a live test publishes a node (`ALIVE2_REQ`), looks its port up
