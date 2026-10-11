@@ -24,37 +24,24 @@
 //! # Why this is pinned here
 //!
 //! The `-eval` driver runs its whole expression with the process marked **relocation-exempt**
-//! ([`RuntimeContext::with_relocation_exempt`]), because the evaluator keeps live terms in Rust
-//! locals the process root set cannot publish, and because a message payload the evaluator has
-//! bound — removed from the mailbox — points into the root's young heap. An exempt process
-//! never collects and never grows (`Process::ensure_capacity` refuses), so its nursery
-//! **monotonically fills** with delivered payloads and is never reclaimed.
+//! ([`RuntimeContext::with_relocation_exempt`]): the evaluator keeps live terms in Rust locals
+//! the process root set cannot publish, and a message payload it has bound — removed from the
+//! mailbox — points into the root's young heap. An exempt process never collects
+//! (`Process::collect`/`Process::ensure_capacity` refuse it), so its nursery monotonically fills
+//! with delivered payloads and is never reclaimed.
 //!
-//! A delivery whose payload does not fit is routed to the heap-fragment model and still arrives
-//! (`RuntimeContext::deliver_message_with_off_heap` keys on the copier's raw
-//! `AllocKind::Message`), so the mailbox keeps working. A **control signal** is built on a
-//! different path: `beam_process`'s signal application allocates the `{'DOWN', …}`/`{'EXIT', …}`
-//! message *directly on the receiver's young heap*
-//! (`beam_process/src/ptab.rs::build_and_enqueue_down` → `MonitorRef::to_eterm(recipient.heap_mut())`
-//! and `build_down_message_term(recipient.heap_mut(), …)`, likewise
-//! `ptab.rs::enqueue_exit_on` → `build_exit_message(recipient.heap_mut(), …)`), and its only
-//! recovery is `ptab.rs::grow_receiver_for_signal`, which — for a **relocation-exempt**
-//! process — hands the raw refusal back verbatim by design. There is no fragment fallback on
-//! that path, so the raw `BeamError::Alloc(AllocKind::Heap)` escapes
-//! `deliver_head_signal` → `drain_signals` → `terminate_and_cascade` and aborts the whole
-//! scheduler pass, i.e. the whole `-eval` run:
+//! That must not break message delivery. A delivery whose payload does not fit is routed to the
+//! heap-fragment model and still arrives (`RuntimeContext::deliver_message_with_off_heap` keys on
+//! the copier's raw `AllocKind::Message`). A **control signal** is built on its own path —
+//! `beam_process`'s signal builders allocate the `{'DOWN', …}`/`{'EXIT', …}` message on the
+//! receiver's young heap — and routes a **relocation-exempt** receiver to the same heap-fragment
+//! model instead (`beam_process/src/ptab.rs::build_signal_message` → `enqueue_fragment_signal`,
+//! the local analogue of the C's `erts_alloc_message(hsz,&hp)`), so the message simply does not
+//! live on the exempt heap and the signal still arrives.
 //!
-//! ```text
-//! beam_rt: allocation failure: heap (32 bytes)      (exit 1)
-//! ```
-//!
-//! The oracle answers `DOWN ok` (exit 0) for the very same expression. The defect is
-//! **not** in this crate: `beam_rt` cannot intercept a message the process table builds inside
-//! itself, and it cannot let the exempt root's heap move. The fix belongs to `beam_process`
-//! (a fragment fallback for the signal-application build, the local-receiver analogue of
-//! `erts_try_alloc_message_on_heap` → `new_message_buffer`), so the positive case is
-//! [`#[ignore]`](a_down_signal_reaches_the_eval_root_once_its_nursery_is_full) with the reason
-//! recorded on it — never a fabricated pass here.
+//! The two probes below pin both halves: the `'DOWN'` reaches the `-eval` root while its nursery
+//! has room, and again — still `DOWN ok`, exit 0 — once the messenger's own deliveries have
+//! saturated that nursery. The roomy probe is also cross-checked against the system oracle.
 //!
 //! [`RuntimeContext::with_relocation_exempt`]: beam_rt::RuntimeContext
 
@@ -178,30 +165,19 @@ fn a_down_signal_reaches_the_eval_root_while_its_nursery_has_room() {
 }
 
 // ---------------------------------------------------------------------------------------
-// Test B — the reported defect: the same `'DOWN'` with a saturated nursery (ignored)
+// Test B — the same `'DOWN'` with a saturated nursery
 // ---------------------------------------------------------------------------------------
 
 /// The **same** monitor `'DOWN'`, now with the root's young heap already saturated by the
-/// messenger's own deliveries, aborts the whole run:
+/// messenger's own deliveries.
 ///
-/// ```text
-/// beam_rt: allocation failure: heap (32 bytes)      (exit 1)
-/// ```
-///
-/// instead of printing `DOWN ok` (exit 0), as the system oracle does. The refusal is raised by
-/// `beam_process`'s signal application building the `'DOWN'` on the receiver's young heap
-/// (`beam_process/src/ptab.rs::build_and_enqueue_down`, via
-/// `beam_process/src/monitor.rs::MonitorRef::to_eterm`), whose only recovery
-/// (`beam_process/src/ptab.rs::grow_receiver_for_signal`) hands a **relocation-exempt**
-/// receiver's refusal back verbatim — and the `-eval` root is exempt for the whole run
-/// (`beam_rt/src/eval/mod.rs::eval`). `beam_rt` cannot fix it: the message is built inside the
-/// process table, and the exempt heap may not move. Un-ignore this test when the sibling
-/// crate's fragment fallback for the signal-application build lands.
-///
-/// `beam_process/src/ptab.rs:158` (`grow_receiver_for_signal`) and
-/// `beam_process/src/ptab.rs:1909`/`1916` (`build_and_enqueue_down`) are the exact sites.
+/// The exempt nursery never reclaims, so the deliveries themselves fall back to the
+/// heap-fragment model, and the monitor's `'DOWN'` — built by `beam_process`'s signal
+/// application — is routed to that same fragment model for the exempt receiver
+/// (`beam_process/src/ptab.rs::build_signal_message` → `enqueue_fragment_signal`). The probe
+/// therefore prints `DOWN ok` (exit 0), exactly as the system oracle does, with no collection
+/// and no heap relocation.
 #[test]
-#[ignore = "beam_process has no heap-fragment fallback for a control signal built on a relocation-exempt receiver's heap (beam_process/src/ptab.rs::grow_receiver_for_signal:158, build_and_enqueue_down:1909/1916) — un-ignore when that lands"]
 fn a_down_signal_reaches_the_eval_root_once_its_nursery_is_full() {
     let expr = probe(SATURATING_PAD);
     let output = beam_rt_eval(&expr);

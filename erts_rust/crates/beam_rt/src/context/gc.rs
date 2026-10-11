@@ -27,7 +27,10 @@
 //! peak memory is bounded by its live set instead of growing with the loop count. That point
 //! also **grows** the nursery when a request is larger than it
 //! ([`Process::ensure_capacity`], the collector's on-demand growth seam) rather than leaving
-//! the request to the arena. Everything outside a scheduled slice keeps the runtime's
+//! the request to the arena. The unrooted [`alloc_words`] seam — which is handed **no** root
+//! set and so may not collect — instead grows the nursery through the **no-relocation**
+//! [`Process::grow_nursery`] seam and retries the bump, so a metadata-only allocation loop
+//! grows rather than falling back to the arena forever. Everything else keeps the runtime's
 //! pointer-stable arena, byte for byte as before — see [`crate::runtime::gc`] for the state,
 //! the accounting and the safety valves.
 //!
