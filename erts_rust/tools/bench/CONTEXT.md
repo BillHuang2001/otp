@@ -174,8 +174,9 @@ Runner rule: every selected **(workload × runtime)** pair yields **exactly one*
   `calendar`/`queue`/`gb_trees`/`base64`/`ordsets`/`string`). `--quick` ⇒ 5 timed runs/case, `--full` ⇒ 25.
   Metrics are per-case summaries `case_<name>_wall_ms` / `case_<name>_peak_rss_bytes` (peak RSS = external
   `VmHWM`); an `observed stdout:` note records the agreement, and a Rust exit `3` (`unsupported: …`) yields a
-  note and **no** timing. Because a `beam_rt` process resolves the system code path by spawning `erl` once
-  when a case first needs a system module, the wrapper cases each pay one `erl` startup; the pure-fixture cases do not.
+  note and **no** timing. A `beam_rt` process resolves the system code path with a **native filesystem probe**
+  (`crates/beam_rt/src/codeserver.rs`; the `erl` shell-out survives only as a last resort), so the wrapper cases
+  no longer pay an `erl` startup — only the cheap path probe when a case first needs a system module.
 - `foreign`: **real modules from the foreign target repos, run under *both* runtimes.** Every repo-backed
   workload is `SysOnly` (the Rust runtime cannot boot an OTP release, run `rebar3`, or act as
   `erlc`/`elixirc`), so `foreign` instead picks **pure, self-contained modules from the Cowboy and EMQX
