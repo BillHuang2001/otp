@@ -49,9 +49,19 @@ The framework is `src/beam_ssa_opt_budget.erl` (`ssa_opt_budget` / `ssa_opt_fn_b
 
 ## Dependencies
 - Compile-time: `kernel`, `stdlib` only.
-- Runtime only: `crypto` (encrypting/decrypting the `debug_info` chunk via `beam_lib:get_crypto_key/1` + `crypto:crypto_one_time/6`) — hence `DIA_PLT_APPS=crypto` in `Makefile`.
+- Runtime only: `crypto` (encrypting/decrypting the `debug_info` chunk via `beam_lib:get_crypto_key/1` + `crypto:crypto_one_time/6`) — hence `DIA_PLT_APPS=crypto` in `Makefile`. `beam_lib` is used only on the `{debug_info_key,…}`/`encrypt_debug_info` and `strip_types` paths, never by default.
+- `syntax_tools` is NOT a dependency of `compiler`: no `src/` module references it; only test suites do (`-include_lib("syntax_tools/include/merl.hrl")` in `bif_SUITE`/`bs_match_SUITE`/`guard_SUITE`) — `syntax_tools` is a *consumer* of `compile`/`cerl`.
 - Build tool: Perl (for `beam_makeops`), `sed`; yecc is bootstrapped from `bootstrap/`.
 - `make test` here force-enables the `maybe_expr` feature via `ERL_ARGS` (see `Makefile`) — required by `maybe_SUITE` and others.
+
+### Runtime facilities the default `compile:file/2` path relies on
+(Relevant when porting the compiler onto a new/from-scratch BEAM runtime.)
+- OS/FS: `file:*` (open/consult/write_file/rename/delete/get_cwd) plus `epp` reading includes; `os:getenv("ERL_COMPILER_OPTIONS")` in `env_default_opts/0` (`src/compile.erl:1215`; skipped by `noenv_file/2`).
+- Processes/messaging: every `compile:file/2` runs the compilation in a `spawn_monitor`ed child and receives its `'DOWN'` (`src/compile.erl:1246-1252`; bypassed by `no_spawn_compiler_process`); `epp` is itself a process (`Epp ! {get_features,self()}` + `receive`, `src/compile.erl:2175`).
+- `apply/3` (BIF) on the normal path: literal-argument constant folding of safe BIFs/calls (`src/sys_core_fold.erl:932`, `src/beam_ssa.erl:609`, `src/beam_ssa_type.erl:1979`, `src/beam_ssa_bc_size.erl:502`, `src/beam_ssa_bool.erl:1422`, `src/beam_ssa_dead.erl:590`).
+- Hashing/serialization: `erlang:md5/1` for the module `vsn`/`FunT` checksum (`src/beam_asm.erl:400`); `term_to_binary` for the `Dbgi`/`Docs`/`Meta` chunks and the literal table (`src/compile.erl:2292,2810,2870`, `src/beam_asm.erl:308-309`, `src/beam_dict.erl:346`).
+- Optional / NOT default-path: `crypto:*` only via `encrypt_debug_info`/`debug_info_key`; `zlib:compress` only with `compressed_literals`; `beam_lib:*` only for debug-info crypto and `strip_types`; `ets:*` only in `cerl_inline` (reached via `inline`/`{core_transform,inline}`); `code:*` only for parse-transform loading and `to_dis`; `erts_debug:flat_size` + `erlang:system_info(wordsize)` only with `time`.
+- Not used anywhere in `src/`: `persistent_term`, `erl_prim_loader`, `open_port`, `unique_integer`.
 
 ## Known Issues
 - A node with `time`/`eprof`/`tprof` options exposes internal pass timing via the process dictionary (`compile__pass_times`) — debugging aid only.

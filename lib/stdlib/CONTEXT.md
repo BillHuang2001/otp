@@ -32,6 +32,7 @@ Module inventory, grouped as in `doc/docs.exs` (`groups_for_modules`): see `src/
 - `assert.hrl` is the most widely included header in OTP (used by erts, compiler, kernel, dialyzer, common_test, …) and is documented in `doc/references/assert_hrl.md`; it is the only stdlib header with an include guard.
 - Docs are built by the repo-root `make/doc.mk` + `make/ex_doc.exs`; `doc/docs.exs` is only a per-app override (module groups and extras order).
 - `zstd` is a thin wrapper over the erts NIF (`erts/emulator/nifs/common/zstd_nif.c`); the codec lives in `erts/`.
+- Compiler-front-end modules have a *pure* runtime surface: `erl_scan`, `erl_parse`, `erl_lint`, `io_lib`, `io_lib_format`, `io_lib_pretty` call only Erlang modules (erl_anno, epp, unicode, string, lists, maps, gb_sets/ordsets/sets, string) plus `erlang:*` BIFs — no `crypto`, `zlib`, `persistent_term` or `ets`. `beam_lib` is the exception: it calls `zlib` (LitT literals + gzip input/`strip`) and `crypto` (`application:start(crypto)` for encrypted `debug_info`), does direct `file`/`filelib`/`filename` I/O, and uses a private temp `ets` table while decoding atom chunks.
 - `records` (native records, OTP 29+) and `json` (EEP-68, OTP 27+) are thin wrappers over runtime BIFs / recently added public modules.
 - Property-based suites are skipped (green) when no QuickCheck/PropEr/Triq is installed — a passing run may not have exercised them.
 
