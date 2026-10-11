@@ -146,14 +146,21 @@ use beam_abi::driver::types::{
     ERTS_INVALID_ERL_DRV_PORT, ERL_DRV_READ, ERL_DRV_USE, ERL_DRV_USE_NO_CALLBACK, ERL_DRV_WRITE,
 };
 use beam_abi::driver::types::ErlDrvPDL;
-use beam_abi::{DriverEnv, DriverHost, SysIOVec};
+use beam_abi::{monitor_identity, DriverEnv, DriverHost, ErlDrvMonitor, SysIOVec};
 
 /// The per-port driver-private state the host owns: the C's driver-private byte queue
 /// (`prt->ioq`), the port **state** stream flags `driver_get_port_flags` reports, and the port's
 /// one-PDL rule (`driver_pdl_create`).
 mod state;
 
+/// The per-port **driver monitor tree** — the state behind the three [`DriverHost`] monitor hooks
+/// (`driver_monitor_process`/`driver_demonitor_process`/`driver_get_monitored_process`, contract
+/// A.4). A private module like [`state`], re-exported because the runtime seizes the shared handle
+/// from the host before it is boxed into the port lifecycle, for its later `process_exit` drain.
+mod monitor;
+
 use state::DriverQueue;
+pub use monitor::DriverMonitors;
 use beam_common::BeamError;
 use beam_alloc::Heap;
 use beam_io::{DriverContext, Interest, Token};
@@ -541,6 +548,23 @@ pub struct DriverPort {
     /// "a port admits exactly one PDL" rule (`io.c:6716-6787`), which `beam_abi`'s PDL registry
     /// enforces by handle address.
     pdl_created: bool,
+    /// The monitors this port's driver holds on processes — the tree behind
+    /// `driver_monitor_process`/`driver_demonitor_process`/`driver_get_monitored_process`
+    /// (see [`DriverMonitors`]).
+    ///
+    /// Shared with the runtime's `PortMeta`, which seizes it with [`DriverPort::monitors`] before
+    /// the host is boxed into the port lifecycle (the boxed driver exposes no host), exactly like
+    /// [`DriverPort::term_queue`].
+    monitors: Rc<DriverMonitors>,
+    /// Whether the **loaded driver entry** declares an `ErlDrvEntry::process_exit` slot — the C's
+    /// `dp->entry->process_exit != NULL` test, which gates `driver_monitor_process` (`io.c:6998`).
+    ///
+    /// It cannot be derived inside the host hook: the host is built before the library is loaded and
+    /// the frozen [`DriverHost`] hook receives no entry, so the port lifecycle stamps it once the
+    /// two first coexist ([`DriverPortAdapter::load`], the same place
+    /// `beam_io`'s own host reads this field). A host nobody claimed keeps the C's "no slot" answer,
+    /// which is what a bare host in a unit test gets.
+    has_process_exit: bool,
 }
 
 impl DriverPort {
@@ -561,7 +585,27 @@ impl DriverPort {
             // A port opened without a stream option is the C's default `list` stream (`io.c:5338`).
             port_flags: 0,
             pdl_created: false,
+            monitors: DriverMonitors::new(owner),
+            has_process_exit: false,
         }
+    }
+
+    /// Records whether the loaded driver entry declares an [`ErlDrvEntry::process_exit`] slot (see
+    /// [`DriverPort::has_process_exit`]).
+    ///
+    /// A builder step like [`DriverPort::with_port_flags`]: [`DriverPortAdapter::load`] is the one
+    /// place the host and the loaded `ErlDrvEntry` first coexist, so it is the only caller. A host
+    /// nobody claims keeps the C's "no `process_exit` slot" answer (`false`).
+    pub fn with_has_process_exit(mut self, has_process_exit: bool) -> DriverPort {
+        self.has_process_exit = has_process_exit;
+        self
+    }
+
+    /// The port's driver-monitor tree — the handle the runtime seizes before the host is boxed into
+    /// the port lifecycle and later drains to fire `ErlDrvEntry::process_exit` (see
+    /// [`DriverMonitors`]).
+    pub fn monitors(&self) -> Rc<DriverMonitors> {
+        Rc::clone(&self.monitors)
     }
 
     /// Sets the port's **state** stream flags (see [`DriverPort::get_port_flags`]).
@@ -1028,6 +1072,58 @@ impl DriverHost for DriverPort {
     }
 
     // -----------------------------------------------------------------------------------------
+    // The driver-monitor family — `driver_monitor_process` / `driver_demonitor_process` /
+    // `driver_get_monitored_process`
+    // -----------------------------------------------------------------------------------------
+
+    /// `driver_monitor_process`: install a monitor on `pid` and hand back the holder
+    /// (`io.c:6998-7015`).
+    ///
+    /// The C's answer split is reproduced through the frozen `Option` hook: the wrapper returns
+    /// `ERL_DRV_MONITOR_ERROR` for `None`, so
+    ///
+    /// * an entry with **no** `process_exit` slot (the C's `-1`) is `None`;
+    /// * a `pid` that is not a local process id — a non-pid term, or an external/wire pid — is
+    ///   `None` (the C's `ERL_DRV_MONITOR_NOT_ALIVE`, `1`, is **not** expressible through the seam —
+    ///   see the module docs' documented divergence);
+    /// * otherwise `Some(monitor)`, which the wrapper writes into the driver's holder.
+    ///
+    /// Liveness of a **local** pid is deliberately not checked: the host holds only its owning
+    /// `ProcessId`, not the process table, so it cannot ask whether the monitored process is still
+    /// alive — and a fabricated liveness answer would be worse than the C's own "monitor anyway"
+    /// (the C records the monitor and lets the later `process_exit` fire it).
+    fn monitor_process(&mut self, pid: Eterm) -> Option<ErlDrvMonitor> {
+        if !self.has_process_exit {
+            return None;
+        }
+        let pid = ProcessId::from_eterm(pid).ok()?;
+        Some(self.monitors.install(pid))
+    }
+
+    /// `driver_demonitor_process`: cancel the monitor `mon` (`io.c:7065-7081`) — the C's `0` when a
+    /// monitor was removed, `1` when it no longer exists.
+    ///
+    /// `-1` (invalid port) is unreachable here: the frozen wrapper already answered it for a null
+    /// monitor or a port with no environment, so this hook only ever sees a live port.
+    fn demonitor_process(&mut self, mon: *const ErlDrvMonitor) -> c_int {
+        let Some(identity) = monitor_identity(mon) else {
+            return 1;
+        };
+        if self.monitors.remove(identity) {
+            0
+        } else {
+            1
+        }
+    }
+
+    /// `driver_get_monitored_process`: the pid behind `mon` (`io.c:7104`), or `None` — the wrapper's
+    /// `driver_term_nil` — for a monitor this port does not hold.
+    fn get_monitored_process(&mut self, mon: *const ErlDrvMonitor) -> Option<Eterm> {
+        let identity = monitor_identity(mon)?;
+        self.monitors.find(identity).map(ProcessId::to_eterm)
+    }
+
+    // -----------------------------------------------------------------------------------------
     // The driver-registry family (the four slots with no term services of their own)
     // -----------------------------------------------------------------------------------------
 
@@ -1210,6 +1306,11 @@ impl DriverPortAdapter {
         command: String,
     ) -> std::result::Result<DriverPortAdapter, DriverLoadError> {
         let library = load_driver(candidates, name)?;
+        // The host and the loaded entry first coexist here, so this is where the one fact the host
+        // cannot observe for itself is stamped: whether the entry declares a `process_exit` slot,
+        // which gates `driver_monitor_process` (`io.c:6998`). `beam_io`'s own host reads the very
+        // same field at its own load site.
+        let host = host.with_has_process_exit(library.entry().process_exit.is_some());
         // The C's load path records the entry as a **dynamically loaded** driver
         // (`erts_add_driver_entry(dp, dh, …)`, `io.c:7650`, `dp->handle != NULL`), which is why
         // `remove_driver_entry` refuses it. Recording the same entry here lets the frozen
@@ -1951,6 +2052,14 @@ mod control_tests;
 /// because the C entry points themselves are not nameable from this crate (see its module docs).
 #[cfg(test)]
 mod hooks_tests;
+
+/// The A.4 **driver monitor regression suite** for [`DriverPort`]'s three
+/// [`beam_abi::DriverHost`] monitor hooks — `driver_monitor_process`,
+/// `driver_demonitor_process` and `driver_get_monitored_process` — over the [`DriverMonitors`]
+/// tree behind them. A separate file so the identity/drain contract (which the runtime's later
+/// `process_exit` firing depends on) does not grow this one.
+#[cfg(test)]
+mod monitor_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
