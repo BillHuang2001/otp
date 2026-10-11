@@ -311,7 +311,10 @@ constructors only (no new error enum).
   the allocator at a fresh, larger one (`target = next_words(need_words, 0).max(current_capacity)`, one
   bounded step), so every live word keeps its **original address** and nothing is moved. That is exactly what
   makes the seam sound for a caller holding **no root set** — the un-rooted `beam_rt` allocation path, which
-  must not collect (a copying collection may only run against a complete root set). `young()`/`young_mut()`
+  must not collect (a copying collection may only run against a complete root set). That path **consumes** the
+  seam: `beam_rt`'s `alloc_words` grows the nursery (`Process::grow_nursery`) and retries the bump before its
+  arena fallback, and its admission-point root valve (`root_is_unscanned`, through `young_contains`) accepts a
+  root into **any** nursery space, so a retirement never makes a live root look unscanned. `young()`/`young_mut()`
   keep returning the **current** (allocatable) space, so every host site keeps compiling unchanged;
   `young_contains` and the collection from-set cover **every** space (`Nursery::spaces`); and after any
   collection the chain is **collapsed to exactly one space** (`Nursery::collapse`), because the collection
