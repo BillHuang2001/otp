@@ -575,8 +575,7 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
   this as "the sandbox drops name-addressed sends". There is no sandbox drop; the tuple order was wrong.
 - **In a live probe, a read timeout is NOT a peer rejection.** `TcpTransport`'s `DEFAULT_READ_TIMEOUT`
   surfaces as `Io(WouldBlock, errno 11)`: the link is still open and nothing arrived — not a refusal.
-  An orderly end-of-link is the `Ok(0)`/`Closed` path. The same confusion once produced a false
-  "the node rejects client-originated `DOP_MONITOR_P`" claim.
+  An orderly end-of-link is the `Ok(0)`/`Closed` path.
 - **A real node can be pointed at a private `epmd`** with `erl -epmd_port <N>` (`erl_epmd:get_epmd_port/0`
   reads `init:get_argument(epmd_port)`; the client connects to `127.0.0.1`). This is how
   `tests/hermetic_epmd.rs` validates the in-process stub against a real ERTS client without a host
