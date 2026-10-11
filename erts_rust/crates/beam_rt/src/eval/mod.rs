@@ -468,14 +468,20 @@ impl Evaluator<'_, '_> {
     }
 
     /// `[E1, …, En | Tail]`.
+    ///
+    /// Evaluation order matches the oracle (`erl_eval`): the elements are evaluated
+    /// **left-to-right**, then the optional tail, and only then is the cons chain built
+    /// (from the already-evaluated values, right-to-left) — so observable side effects
+    /// (an `io:format/2` inside an element) fire in source order and the tail's fire
+    /// last. Building the chain from values keeps the list's *value* unchanged.
     fn list(&mut self, elements: &[Expr], tail: Option<&Expr>, env: &mut Env) -> EResult<Eterm> {
+        let values = self.terms(elements, env)?;
         let mut acc = match tail {
             Some(tail) => self.expr(tail, env)?,
             None => NIL,
         };
-        for element in elements.iter().rev() {
-            let head = self.expr(element, env)?;
-            acc = heap!(terms::make_cons(self.ctx, head, acc));
+        for value in values.into_iter().rev() {
+            acc = heap!(terms::make_cons(self.ctx, value, acc));
         }
         Ok(acc)
     }
@@ -2565,6 +2571,73 @@ mod tests {
             .collect()
     }
 
+    /// Evaluates `expr` with `io:format/2` captured and returns exactly what it printed.
+    ///
+    /// A construct's **evaluation order** is observable only through a side effect, so the
+    /// order probes below hand each sub-expression to a "spy" closure that prints it; the
+    /// captured bytes *are* the order the sub-expressions ran in.
+    fn printed(expr: &str) -> String {
+        let mut runtime = Runtime::new(RuntimeConfig::default()).expect("a runtime");
+        let mut sink = beam_bifs::BytesSink::new();
+        let mut ctx = RuntimeContext::with_output(&mut runtime, &mut sink);
+        eval(&mut ctx, expr).unwrap_or_else(|error| panic!("{expr} failed: {error}"));
+        drop(ctx);
+        String::from_utf8_lossy(sink.contents()).into_owned()
+    }
+
+    /// A literal evaluates its sub-expressions **left-to-right in source order**, exactly as
+    /// `erl_eval` does: a list's elements before its tail, a map field's key before its
+    /// value, a binary segment's value before its size, call arguments in order.
+    ///
+    /// Every expectation below is the exact stdout the system Erlang oracle prints for the
+    /// same expression (`erl -noshell -eval '<expr>'`), so it is a real cross-check and not
+    /// just this runtime's own habit. The list cases are the regression: `Evaluator::list`
+    /// used to evaluate the elements right-to-left *and* the tail first, printing `321`/`312`
+    /// where the oracle prints `123`/`1234`.
+    #[test]
+    fn literals_evaluate_their_sub_expressions_in_source_order() {
+        const SPY: &str = r#"F = fun(X) -> io:format("~w", [X]), X end"#;
+        // `<spy>, _ = <body>, ok` — the body's sub-expressions print, in the order they run.
+        // The space around `=` avoids the `=<` token when `body` starts with `<<`.
+        let probe = |body: &str| format!("{SPY}, _ = {body}, ok");
+
+        // A list's elements are evaluated left-to-right, then its tail.
+        assert_eq!(printed(&probe("[F(1),F(2),F(3)]")), "123");
+        assert_eq!(printed(&probe("[F(1),F(2),F(3)|F(4)]")), "1234");
+        assert_eq!(printed(&probe("[F(1)|F(2)]")), "12");
+        // Only *when* the sub-expressions run changed — the list's value is untouched: the
+        // elements print `.<1>.<2>.<3>` and the finished list is `~w`-printed as `=[1,2|3]`.
+        assert_eq!(
+            printed(
+                r#"F = fun(X) -> io:format(".<~w>", [X]), X end, V = [F(1),F(2)|F(3)], io:format("=~w", [V]), ok"#
+            ),
+            ".<1>.<2>.<3>=[1,2|3]"
+        );
+
+        // A tuple's elements, in order.
+        assert_eq!(printed(&probe("{F(1),F(2),F(3)}")), "123");
+        // A map's fields in source order, each field's key before its value.
+        assert_eq!(printed(&probe("#{F(1)=>F(2), F(3)=>F(4)}")), "1234");
+        assert_eq!(
+            printed(&probe("#{F(1)=>F(2), F(3)=>F(4), F(5)=>F(6)}")),
+            "123456"
+        );
+        // A binary's segments in source order, and a segment's value before its size.
+        assert_eq!(printed(&probe("<<(F(1)):8,(F(2)):8>>")), "12");
+        assert_eq!(printed(&probe("<<(F(7)):(F(8))>>")), "78");
+        // A call's arguments, left-to-right; the spy callee prints its own arguments too.
+        assert_eq!(
+            printed(&format!(
+                r#"{SPY}, G = fun(A,B) -> io:format("~w~w", [A,B]), ok end, _ = G(F(1),F(2)), ok"#
+            )),
+            "1212"
+        );
+        // `++`/`--` evaluate their left operand before their right one.
+        assert_eq!(printed(&probe("[F(1)] ++ [F(2)]")), "12");
+        assert_eq!(printed(&probe("[F(1),F(2)] -- [F(3)]")), "123");
+        // A comprehension's template, once per generated element in generator order.
+        assert_eq!(printed(&probe("[F(X) || X <- [1,2,3]]")), "123");
+    }
     #[test]
     fn binary_comprehensions_iterate_a_segment_at_a_time() {
         // The differential `semantics/binary_comprehension` probe:
