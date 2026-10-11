@@ -130,7 +130,9 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   - `kind() -> MatureKind`; `mature_choice() -> MatureChoice`; `policy()`; `stats()`;
     `minor_gcs() -> u32`; `heap_info() -> HeapInfo` (`impl HeapObservable`).
   - `young() -> &HeapSpace`; `young_mut() -> &mut HeapSpace`; `should_collect(need_words) -> bool` — the
-    young-nursery admission signal, answered from the **shared** nursery so it is strategy-independent.
+    young-nursery admission signal; `young()`/`should_collect` read the **current** space only (the sole
+    allocatable one), so the answer is strategy-independent — while `young_contains(ptr)` covers **every**
+    space of the chain.
   - `collect(&mut self, roots) -> Result<Collection>`; `collect_minor`/`collect_major` (`-> Result<GcStats>`);
     `ensure_capacity(need_words, roots) -> Result<Collection>`.
   - The **mature generation** accessors: `mature_capacity_words()`, `mature_used_words()`,
