@@ -148,7 +148,7 @@ The message itself is `RuntimeContext::signal_notify_message(name)` → `(from, 
   caller. The oracle cross-checks run through `erl_eval`, which prints a **loud** skip banner when no
   usable `erl` is on `PATH`.
 - Colocated units in `driver.rs`: the registry-slot codes, the thread-local entry list, the
-  `armed_event` rejection, and `binary_to_term` (a decoded image, an invalid one → `None`).
+  `armed_event` rejection, and `binary_to_term` (a decoded image, an invalid one → `None`). The monitor tree + host hooks are pinned in `driver/monitor_tests.rs`, and the firing drive point in `driver/fire_tests.rs` (a real C `.so` whose `process_exit` writes a marker file, driven through a real `PortRegistry::execute_port_tasks` round).
 - The A.4 **driver-private state suite** `driver/hooks_tests.rs` pins `DriverPort`'s `DriverHost`
   hooks for the driver-private queue (`driver_enq`/`driver_pushq`/`driver_deq`/`driver_sizeq`/
   `driver_peekq`), the one-PDL rule (`driver_pdl_create`) and the port state flags
