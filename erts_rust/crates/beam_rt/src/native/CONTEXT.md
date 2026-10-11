@@ -46,7 +46,7 @@ Drift-guarded by `native.rs::tests::every_floor_module_is_a_real_try_native_arm`
 | `../native.rs` (parent) | module docs, `try_native`, the shared helpers (`atom`/`atom_name`/`charlist`/`render`/`string_list`/`write_output`/`chars_to_string`), and the arms whose bodies live here: the `erlang` core (`halt/0,1,2`, `display/1`, `apply/2,3`, `system_info/1`, `send_after/3`, `cancel_timer/1`, `make_ref/0`, `pre_loaded/0`, `module_loaded/1`), `io:put_chars/1,2`, `os:cmd/1`, the `seq_trace`/`seq_trace_info`/`seq_trace_print`/`system_flag(reset_seq_trace)` family over `crate::seq_trace`, and the `trace`/`trace_info`/`trace_delivered`/`trace_pattern` family over `crate::trace` |
 | `init.rs` | `init:get_argument/1` (a command-line flag from `RuntimeConfig::init_args`, plus the four **automatic** flags `root`/`home`/`progname`/`bindir`), `get_arguments/0`, `get_plain_arguments/0`, `get_status/0`, `script_id/0`, `stop/0,1`, `restart/0`, `boot/1` |
 | `code.rs` | `code:get_path/0`, `all_loaded/0`, `which/1`, `is_loaded/1`, `is_sticky/1,2`, `ensure_loaded/1`, `load_file/1`, `lib_dir/0,1,2`, `priv_dir/1`, `root_dir/0`, `get_mode/0` |
-| `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) | `erlang:make_ref/0`, `spawn/1,2,3`, `spawn_link/1,2,3`, `spawn_opt/2,3,4`, `spawn_monitor/1,2,3,4`, `ports/0`, `processes/0`, `pre_loaded/0`, `group_leader/0`, `whereis/1`, `register/2`, `unregister/1`, `module_loaded/1`; the monitor family (`monitor/2,3`, `demonitor/1,2`) in `process/monitor.rs`; `exit/2,3` in `process/exit.rs` |
+| `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) | `erlang:make_ref/0`, `spawn/1,2,3`, `spawn_link/1,2,3`, `spawn_opt/2,3,4`, `spawn_monitor/1,2,3,4`, `ports/0`, `processes/0`, `pre_loaded/0`, `group_leader/0`, `whereis/1`, `register/2`, `unregister/1`, `module_loaded/1`; the reference-alias family (`alias/0,1`, `unalias/1`); the monitor family (`monitor/2,3`, `demonitor/1,2`) in `process/monitor.rs`; `exit/2,3` in `process/exit.rs` |
 | `node.rs` | `erlang:is_alive/0`, `get_cookie/0`, `set_cookie/2`, `nodes/0,1` |
 | `memory/` | `erlang:process_info/1,2` — the per-process introspection surface (+ `memory/tests.rs`) |
 | `group_leader.rs` | `erlang:group_leader/2` + `erts_internal:group_leader/2,3` over `Runtime::group_leaders` |
@@ -111,7 +111,19 @@ process.
 `monitor/2,3` and `demonitor/1,2` use `ProcessTable::{monitor, monitor_named, demonitor,
 demonitor_flush}`: `[flush]` removes a queued `'DOWN'` from the caller's mailbox and `[info]`
 answers the **real** "was a monitor on record and got removed" boolean (a second
-`demonitor(Ref, [info])` is `false`; the reference stays on record so it is never `badarg`).
+`demonitor(Ref, [info])` is `false`). Only a term that is **not a reference at all** is the
+oracle's `badarg` (the C's structural `is_not_internal_ref`, `bif.c:443-450`); a reference that
+backs no recorded monitor — a bare `make_ref/0`, or an `erlang:send_after/3` timer reference the
+timer heap owns — is the "nothing was removed" answer (`demonitor/1` ⇒ `true`, `demonitor/2`'s
+`[info]` ⇒ `false`), leaving the timer pending.
+The **reference-alias** family (`alias/0,1`, `unalias/1`) rides the same table: `alias(Opts)` mints
+a fresh standalone reference alias owned by the caller and `unalias/1` clears one the caller holds,
+answering whether it did. `alias/0` is the `erlang.erl` wrapper over `alias([])`
+(`erlang.erl:2130-2133`) and, because `erlang` is a floor namespace, the wrapper is un-enterable —
+the floor owns the name and hands the shared `/1` implementation the empty option list, so both
+arities cannot drift. `Opts` is `[explicit_unalias | reply | priority]` (the C's `alias_1`,
+`bif.c:5903-5930`); anything else (a tuple included, or a non-list) is `badarg`. An alias is **not**
+a monitor, so `demonitor/1` of one answers `true` and leaves it in place.
 `exit/2,3` signals another process through `ProcessTable::send_exit`, but a **self**-directed exit
 is raised directly (non-trapping caller, or the untrappable `kill`) or delivered as `{'EXIT',
 self(), R}` via `RuntimeContext::deliver_message` (trapping caller and `Reason != kill`) — because
@@ -391,7 +403,16 @@ unclaimed** because the oracle answers the same: `copy/2`, `write_file/3`, `dela
 `file_server.rs` + `file_server/` own the runtime-native **file service**: the registered
 `file_server_2` process (never enqueued, drained by the scheduler-pass step), its per-`open` native
 io-devices, the `gen_server`/`file`/`io` request/reply wire, and the `{get_until,…}`/`{get_line,…}`
-readers. **Full detail: [`file_server/CONTEXT.md`](file_server/CONTEXT.md).**
+readers. The served `file_server` requests are `open/2` (any mode, incl. write/append),
+`read_file/1`, `write_file/2`, `delete/1`, `make_dir/1`, `del_dir/1`, `read_link/1`, `altname/1`,
+`rename/2`, `make_link/2`, `make_symlink/2`, `get_cwd/0,1`, `list_dir/1`, and
+`read_file_info/1,2`/`read_link_info/1,2` (the whole 14-tuple `#file_info{}`, its `access` slot from
+a real `access(2)` probe); the **io-device** protocol serves `close`, `position/1`, `sync`,
+`datasync`, `truncate`, `get_chars/3`, `put_chars/2`, `get_until/4,5`, `get_line/1,2` and the
+mutable read-mode/encoding surface `getopts`/`setopts(Opts)`, so `file:write_file/2,3` (over the
+write-mode `{open,…}` that delegates to `prim_file:open/2` and really creates the path),
+`file:read_line/1` and `io:getopts/1`/`io:setopts/2` round-trip to disk. **Full detail:
+[`file_server/CONTEXT.md`](file_server/CONTEXT.md).**
 
 ## Constraints
 - **`#![deny(unsafe_code)]`** — the crate-wide rule covers this whole floor. Terms are built and
@@ -462,7 +483,8 @@ readers. **Full detail: [`file_server/CONTEXT.md`](file_server/CONTEXT.md).**
   `pread/2,3`, `pwrite/2,3`, `truncate/1`, `sync/1`, `datasync/1`, `write_file/2`, `set_cwd/1`,
   `ipread_s32bu_p32bu/3`, `get_handle/1`, `read_handle_info/1,2`
 - `file_server.rs` (+ `file_server/`) → the native `file_server_2` service, its io-devices, the
-  request/reply wire and the `{get_until,…}`/`{get_line,…}` readers
+  request/reply wire, the write path (`{write_file,…}` + the delegating write-mode `{open,…}`), the
+  `{get_until,…}`/`{get_line,…}` readers and the `getopts`/`setopts` read-mode surface
   ([`file_server/CONTEXT.md`](file_server/CONTEXT.md)); the pass step is
   `Runtime::service_file_requests` (owned by `../runtime/scheduler.rs`)
 - `init.rs` / `code.rs` / `application.rs` → the preloaded-module surfaces (contract A.7) — the
@@ -646,10 +668,6 @@ closable the same way and the floor already serves both, so only `/2` stays list
   boot sequence (no application-owned process or port exists to take down, and modules are never
   unloaded); `init:boot/1` returns `ok` where the real `boot/1` never returns (it enters init's
   receive loop). Pinned by `../tests/native_init.rs`.
-- `file_server.rs` serves the whole `read_file_info/1`/`read_link_info/1` reply — the 14-tuple
-  `#file_info{}` record, with its `access` slot from a real `access(2)` probe — over its
-  `stat`/`lstat` calls (see [`file_server/CONTEXT.md`](file_server/CONTEXT.md)); it does not serve
-  `{write_file,Name,Data}` though `prim_file:write_file/2` IS implemented (`prim.rs`).
 - `application:get_application/1` on a non-atom that is not a pid leaves the function with no clause
   (`function_clause`, the oracle's own shape); the oracle's extra `is_pid/1` clause answers
   `undefined` for a pid — a documented divergence (no application-owned process runs here).
