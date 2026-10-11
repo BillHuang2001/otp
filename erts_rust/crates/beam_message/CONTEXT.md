@@ -360,7 +360,15 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   `Message` — and therefore the `Fragments` — is moved around.
 - **A refc binary whose payload no held handle owns is a malformed graph ⇒ `BeamError::BadArg`.**
   The M1 encoding has no other way to recover the handle (there is no `Binary*` back-pointer), and a
-  silent deep copy would be a wrong result.
+  silent deep copy would be a wrong result. The lookup is `OffHeapTable::binary_by_data_ptr`
+  (`off_heap.rs:218`) — a linear `data_ptr()` comparison that never dereferences the payload — so a
+  handle-less (or freed) payload is refused, never dereferenced. There is **no flatten/self-contained
+  fallback** for a refc `ErlSubBits`: `is_match_context_term` (`layout.rs:84`) explicitly excludes a
+  refc binary and `shallow` (`copy.rs:591-601`) checks `is_refc_binary_term` before
+  `is_match_context_term`, so `copy_match_context` is never reached for it and such a term is
+  *uncopyable*, not degraded. A refc payload is therefore copyable only while its `RefcBinary` handle
+  is registered in the source `OffHeapTable` (`ctx.src_off_heap`) at copy time — the source of truth a
+  host must keep alive across the copy boundary.
 - **Per-object sizing comes from the LCA; the whole-graph count is the copier's own.**
   `beam_term::layout::object_words` (the frozen term layout's owner, re-exported by `layout.rs`)
   gives the *single-object* word count the incremental allocator needs — the same split as
