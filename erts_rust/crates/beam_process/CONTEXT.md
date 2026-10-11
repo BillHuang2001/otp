@@ -428,8 +428,8 @@ The **local record** of a process's relationships with processes on other nodes;
   hanging.
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p
   beam_process` and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
-  Current total: **441 passed / 0 failed / 1 ignored** (re-run for the live count; in-module unit +
-  integration across the 37 files under `tests/` + 1 doctest; the ignored test is the documented non-yielding-runner hang failure mode
+  Current total: **459 passed / 0 failed / 1 ignored** (re-run for the live count; in-module unit +
+  integration across the 38 files under `tests/` + 1 doctest; the ignored test is the documented non-yielding-runner hang failure mode
   in `preemption.rs`), warning-free. The `oracle_*` suites share **one** `erl` driver
   (`tests/common/mod.rs`), run with `-kernel logger_level none` and normalized stdout so a crashed
   probe helper's `=ERROR REPORT====` block can never make a comparison flaky (see `tests/CONTEXT.md`). Always go through `../../scripts/cargo.sh` (`$HOME` is read-only),
