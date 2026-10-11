@@ -200,8 +200,8 @@ Current: **585 passing / 0 failing / 2 ignored** — **409** lib in-module (`#[c
   `beam_rt` mitigates by notifying the port owner before closing.
 - **A multi-fd driver's readiness is not per-fd.** `DriverState::fd_armed` always hands `ready_input`/`ready_output` the first `BTreeMap`-ordered fd matching the direction, so a port with ≥2 fds selected the same way would starve the others; correcting it needs the fired fd reported through the poller/`DriverContext` (a frozen-seam change).
   Harmless for every current driver (one fd each).
-- **File sizes (`wc -l`).** Over 1000: `src/drivers/spawn.rs` 1966, `src/drivers/inet/tests.rs` 1602, `src/registry.rs` 1518, `src/drivers/efile.rs` 1404, `src/drivers/inet/mod.rs` 1331, `src/drivers/inet/packet.rs` 1245, `src/drivers/fd.rs` 1193, `src/signal.rs` 1105, `src/abi/port.rs` 1017 — each is a source half plus its suite (or, for `inet`, a subtree with its own child doc).
-  `src/abi/host.rs` is now **879** with its in-module suite split out into `src/abi/host_tests.rs` (710); all other modules are under 1000.
+- **File sizes (`wc -l`).** Over 1000: `src/drivers/spawn.rs` 1978, `src/drivers/inet/tests.rs` 1602, `src/registry.rs` 1518, `src/drivers/efile.rs` 1404, `src/drivers/inet/mod.rs` 1331, `src/drivers/inet/packet.rs` 1245, `src/drivers/fd.rs` 1193, `src/signal.rs` 1105, `src/abi/port.rs` 1017 — each is a source half plus its suite (or, for `inet`, a subtree with its own child doc).
+  `src/abi/host.rs` is now **902** with its in-module suite split out into `src/abi/host_tests.rs` (775); all other modules are under 1000 (the new `src/fs_access.rs` is 645).
   If a source half grows, split its test module into a sibling `tests/` file (as `src/drivers/inet/` and `src/abi/` already do).
 
 ## Handoff to beam_rt — the CPU-time facility
