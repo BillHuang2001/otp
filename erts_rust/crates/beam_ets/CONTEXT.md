@@ -716,11 +716,12 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `is_function/2`, `is_integer/3`, `node/0,1`, `xor/2`, `bnot/1`, plus map **construction** in a guard
   or a body. Anything outside that set is `badarg`, like the oracle (`list_to_tuple/1` is not a
   `guard_tab` member and is `badarg` on both sides; there is no `is_record/2`, no comprehension and no
-  `process_info`-style guard). Match-spec arithmetic via the default `ArithHook` is small-int/float only
-  (checked `i64` plus faithful float `+ - * /`); full arithmetic needs a host-installed hook via
-  `set_arith_hook`, whose owners are `beam_term` (the number/arithmetic layer, which exposes no big
-  add/sub/compare LCA today) and `beam_bifs`/`beam_rt` (the installers) — no host installs one today, so
-  it stays a typed gap that this crate never fills itself. Typed divergences (always a typed error,
+  `process_info`-style guard). Match-spec **arithmetic operators** (`+ - * / div rem band bor bxor bsl
+  bsr`) go through the thread-local `ArithHook` seam: the built-in `DefaultArithHook` is small-int/float
+  only (checked `i64` plus faithful float `+ - * /`), while `beam_bifs` installs an arbitrary-precision
+  hook (`beam_bifs/src/ets/arith_hook.rs`) around every match-spec-evaluating BIF — so a bignum operand
+  or an out-of-range integer result yields the oracle's value in the runtime, the `unsupported_ets` being
+  reachable only from the un-hooked default. Typed divergences (always a typed error,
   never a wrong result): a **head** map's **keys** are literal — a variable/underscore key is `badarg`
   at every nesting depth — while its **values** are matched structurally like tuple elements, so
   `#{a => '_'}` matches `#{a => 1}` and an object carrying extra keys still matches (a wildcard/variable
