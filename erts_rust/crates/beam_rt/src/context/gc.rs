@@ -191,7 +191,7 @@ pub(crate) fn root_is_unscanned(process: &Process, term: Eterm) -> bool {
     }
     let ptr = beam_term::list::ptr_val(term) as usize;
     !in_heap_block(process.heap(), ptr)
-        && !in_heap_block(process.collector().mature().heap(), ptr)
+        && !process.collector().mature_contains(ptr as *const Eterm)
 }
 
 /// Whether **any** of the given machine roots is a container in an unscanned region (see
