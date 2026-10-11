@@ -40,17 +40,21 @@
 //! here: `process_count`, `atom_count`, `port_count`, `ets_count`, `reductions`,
 //! `total_heap_size`, `stack_size`, `memory`, `creation`, `logical_processors` and the
 //! `dirty_*` scheduler counts all differ from the oracle's by construction (this runtime's
-//! own tables are smaller) or vary per VM start — they are handoffs, not cases.
+//! own tables are smaller) or vary per VM start. Several of them are pinned instead through a
+//! **value-invariant relation** whose answer is host-independent — `process_count =:=
+//! length(processes())` and `port_count =:= length(ports())`, a positive-integer
+//! `atom_count`, an integer `ets_count`, or a per-process
+//! `reductions`/`heap_size`/`stack_size`/`total_heap_size` that is an integer — never by
+//! echoing the exact figure. See the *value-invariant introspection* block at the end.
 //!
 //! # `erlang:memory/0,1` and the tracing surface (still contract A.8)
 //!
-//! `erlang:memory/0,1` is registered but its hook is **not wired** in the Rust runtime: any
-//! call currently raises the documented capability gap (`beam_rt: unsupported: bif`, exit 3),
-//! so the harness classifies every `memory_*` case `unsupported` (honest, never a mismatch).
-//! Its goldens are the oracle's real values (the exact 9-key order, the list length, the
-//! selected-key order), so they flip to `agree` as soon as the hook lands; the volatile byte
-//! totals are never pinned. The tracing/`seq_trace` observability and the `halt` argument
-//! check below **agree** on both sides today and pin the shared surface.
+//! `erlang:memory/0,1` is served by the Rust runtime through its wired `memory` hook, so the
+//! five `memory_*` cases **agree** on both sides. Their goldens therefore pin only the
+//! host-independent structure — the exact 9-key order, the list length, the selected-key
+//! order and the fact that a total is an integer — and never the volatile byte totals. The
+//! tracing/`seq_trace` observability and the `halt` argument check below likewise **agree**
+//! on both sides and pin the shared surface.
 
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
@@ -378,9 +382,10 @@ pub(crate) fn group() -> Vec<Case> {
             "ok memory",
         ),
         // --- erlang:memory/0,1: the key set/order, never the volatile byte totals ----------
-        // The Rust runtime's `memory` hook is not wired yet, so these five are classified
-        // `unsupported` (its documented capability gap), never a mismatch. Each golden is the
-        // oracle's own output, so the case flips to `agree` once the hook is implemented.
+        // The Rust runtime serves these through its wired `memory` hook, so all five **agree**
+        // with the oracle. The goldens pin only the host-independent structure (the exact
+        // 9-key order, the list length, the selected-key order, an integer total); the volatile
+        // byte totals are never pinned.
         case(
             "system_info/memory_keys_order",
             "erlang:memory/0 reports the 9 documented keys in their exact order",
@@ -496,5 +501,76 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 1,
             },
         },
+        // --- value-invariant introspection: host-independent relations and documented types --
+        // Each case pins a *relation* or a documented type whose answer is identical on any
+        // host, instead of echoing a per-VM figure (which would differ between the two runtimes
+        // by construction). `process_count =:= length(processes())` is the canonical example:
+        // the count itself is volatile, the equality is not.
+        case(
+            "system_info/process_count_matches_processes",
+            "system_info(process_count) equals length(processes())",
+            "erlang:system_info(process_count) =:= length(erlang:processes())",
+            "ok true",
+        ),
+        case(
+            "system_info/port_count_matches_ports",
+            "system_info(port_count) equals length(ports())",
+            "erlang:system_info(port_count) =:= length(erlang:ports())",
+            "ok true",
+        ),
+        case(
+            "system_info/atom_count_is_positive_integer",
+            "system_info(atom_count) is a positive integer (the exact figure is volatile)",
+            "is_integer(erlang:system_info(atom_count)) andalso erlang:system_info(atom_count) > 0",
+            "ok true",
+        ),
+        case(
+            "system_info/ets_count_is_integer",
+            "system_info(ets_count) is an integer (the exact figure is volatile)",
+            "is_integer(erlang:system_info(ets_count))",
+            "ok true",
+        ),
+        // --- process_info/2: the per-process fields pinned through their documented type -----
+        // A figure such as the reduction count or a heap size differs per run-time and per VM
+        // start, so only its *type* is pinned; `garbage_collection` is a proplist and `status`
+        // is tagged by its own key. `trap_exit`/`registered_name`/`links` are deliberately
+        // absent: the oracle's `-eval` runs in its `init` process (trap_exit true, registered as
+        // `init`, linked to the node), so their values are not host-independent on this path.
+        case(
+            "system_info/process_info_reductions_is_integer",
+            "process_info(self(), reductions) is an integer (the exact count is volatile)",
+            "is_integer(element(2, erlang:process_info(self(), reductions)))",
+            "ok true",
+        ),
+        case(
+            "system_info/process_info_heap_size_is_integer",
+            "process_info(self(), heap_size) is an integer (the exact size is volatile)",
+            "is_integer(element(2, erlang:process_info(self(), heap_size)))",
+            "ok true",
+        ),
+        case(
+            "system_info/process_info_stack_size_is_integer",
+            "process_info(self(), stack_size) is an integer (the exact size is volatile)",
+            "is_integer(element(2, erlang:process_info(self(), stack_size)))",
+            "ok true",
+        ),
+        case(
+            "system_info/process_info_total_heap_size_is_integer",
+            "process_info(self(), total_heap_size) is an integer (the exact size is volatile)",
+            "is_integer(element(2, erlang:process_info(self(), total_heap_size)))",
+            "ok true",
+        ),
+        case(
+            "system_info/process_info_garbage_collection_is_list",
+            "process_info(self(), garbage_collection) is a proplist (its fields are volatile)",
+            "is_list(element(2, erlang:process_info(self(), garbage_collection)))",
+            "ok true",
+        ),
+        case(
+            "system_info/process_info_status_is_tagged",
+            "process_info(self(), status) is tagged by its own key",
+            "element(1, erlang:process_info(self(), status))",
+            "ok status",
+        ),
     ]
 }

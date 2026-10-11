@@ -43,9 +43,11 @@
 //! runtimes receive **identical** argv for the expression corpus cases but **different**
 //! argv for the module-run cases (the oracle's `-eval` versus the Rust `run` action), so
 //! each [`Observation`] records the argv it was actually spawned with. An environment
-//! case ([`CaseKind::EvalEnv`](crate::corpus::CaseKind::EvalEnv)) additionally spawns both
-//! runtimes with an explicit environment ([`run_with_env`]), so their `ERL_*FLAGS` merge is
-//! what is compared.
+//! case ([`CaseKind::EvalEnv`](crate::corpus::CaseKind::EvalEnv),
+//! [`CaseKind::ModuleEnv`](crate::corpus::CaseKind::ModuleEnv)) additionally spawns both
+//! runtimes with an explicit environment ([`run_with_env`]), so their `ERL_*FLAGS` merge —
+//! and, for a module-run case, the flag's *application* to the code path — is what is
+//! compared.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -352,15 +354,20 @@ pub fn run(spec: &RuntimeSpec, argv: &[String]) -> Result<Observation> {
 ///
 /// Each `(name, value)` is set on the child *in addition to* the inherited environment —
 /// the harness never clears it, so the runtime's own resolution (`$PATH`, `$TMPDIR`, …)
-/// stays undisturbed. This is how an `ERL_*FLAGS` corpus case (a
-/// [`CaseKind::EvalEnv`](crate::corpus::CaseKind::EvalEnv)) pins the environment-variable
+/// stays undisturbed. This is how an `ERL_*FLAGS` corpus case
+/// ([`CaseKind::EvalEnv`](crate::corpus::CaseKind::EvalEnv),
+/// [`CaseKind::ModuleEnv`](crate::corpus::CaseKind::ModuleEnv)) pins the environment-variable
 /// merge — `[ERL_OTP<sysver>_FLAGS] [ERL_AFLAGS] [command line] [ERL_FLAGS] [ERL_ZFLAGS]`
 /// — against the oracle: both runtimes are spawned with the identical argv **and** the
 /// identical environment, so only their behavior can differ.
+///
+/// The pairs are **owned** (`String`) because a module-run case's value may embed the
+/// compiled module's temp directory, which is only known at run time
+/// ([`crate::corpus::expand_env`]); [`own_env`] converts a case's `'static` slice.
 pub fn run_with_env(
     spec: &RuntimeSpec,
     argv: &[String],
-    env: &[(&str, &str)],
+    env: &[(String, String)],
 ) -> Result<Observation> {
     let mut cmd = Command::new(&spec.program);
     cmd.args(argv)
@@ -390,6 +397,21 @@ pub fn run_with_env(
         stderr: output.stderr,
         exit_code: output.status.code(),
     })
+}
+
+/// Own the `(name, value)` pairs of a case's `'static` environment slice, so it can be
+/// handed to [`run_with_env`].
+///
+/// A [`CaseKind::EvalEnv`](crate::corpus::CaseKind::EvalEnv) or
+/// [`CaseKind::ModuleEnv`](crate::corpus::CaseKind::ModuleEnv) case stores its environment as
+/// `&'static [(&'static str, &'static str)]` (so a [`crate::corpus::Case`] stays `Copy`);
+/// [`run_with_env`] takes owned pairs. A `ModuleEnv` value that embeds the compiled module's
+/// temp dir goes through [`crate::corpus::expand_env`] instead, which substitutes the
+/// directory at the same time.
+pub fn own_env(env: &[(&str, &str)]) -> Vec<(String, String)> {
+    env.iter()
+        .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+        .collect()
 }
 
 /// The file names tried when scanning `$PATH` for the oracle.
@@ -434,7 +456,7 @@ pub(crate) fn is_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        eval_argv, eval_argv_owned, is_transient_text_file_busy, output_with_retry,
+        eval_argv, eval_argv_owned, is_transient_text_file_busy, output_with_retry, own_env,
         resolve_oracle_from, resolve_rust_from, run, run_with_env, RuntimeId, RuntimeSource,
         RuntimeSpec,
     };
@@ -504,9 +526,12 @@ mod tests {
                 "-c".to_string(),
                 String::from("printf %s \"$DIFFERENTIAL_RUN_ENV_PROBE\""),
             ];
-            let with_env =
-                run_with_env(&spec, &argv, &[("DIFFERENTIAL_RUN_ENV_PROBE", "hello-env")])
-                    .expect("spawn sh with the probe variable");
+            let with_env = run_with_env(
+                &spec,
+                &argv,
+                &[("DIFFERENTIAL_RUN_ENV_PROBE".to_string(), "hello-env".to_string())],
+            )
+            .expect("spawn sh with the probe variable");
             assert_eq!(with_env.exit_code, Some(0));
             assert_eq!(with_env.stdout, b"hello-env");
             assert_eq!(
@@ -519,6 +544,19 @@ mod tests {
             let without_env = run(&spec, &argv).expect("spawn sh without the probe variable");
             assert_eq!(without_env.stdout, b"");
         }
+    }
+
+    #[test]
+    fn own_env_copies_the_pairs_verbatim() {
+        assert_eq!(
+            own_env(&[("ERL_AFLAGS", "-pa {dir}"), ("ERL_ZFLAGS", "+S 2")]),
+            vec![
+                ("ERL_AFLAGS".to_string(), "-pa {dir}".to_string()),
+                ("ERL_ZFLAGS".to_string(), "+S 2".to_string()),
+            ],
+            "the placeholder is left for the harness to expand"
+        );
+        assert!(own_env(&[]).is_empty());
     }
 
     #[test]

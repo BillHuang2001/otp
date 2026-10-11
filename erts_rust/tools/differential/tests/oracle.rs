@@ -33,7 +33,8 @@ use differential::corpus::{find_case, CaseKind};
 use differential::harness::{run_case, run_case_in, RuntimeContext};
 use differential::module_build;
 use differential::runtime::{
-    eval_argv, resolve_oracle, resolve_rust, resolve_rust_from, run, run_with_env, RuntimeSpec,
+    eval_argv, own_env, resolve_oracle, resolve_rust, resolve_rust_from, run, run_with_env,
+    RuntimeSpec,
 };
 
 mod common;
@@ -188,8 +189,13 @@ fn every_eval_corpus_case_matches_its_oracle_golden() {
     let mut checked = 0;
     let mut checked_env = 0;
     for case in differential::corpus::cases() {
-        // Module-run cases are compiled and checked separately (see below).
-        if matches!(case.kind, CaseKind::Module(_)) {
+        // Module-run cases (including the environment-variable `ModuleEnv` ones, whose
+        // environment embeds a `{dir}` placeholder that only exists after the compile) are
+        // compiled and checked separately (see below).
+        if matches!(
+            case.kind,
+            CaseKind::Module(_) | CaseKind::ModuleEnv { .. }
+        ) {
             continue;
         }
         checked += 1;
@@ -199,7 +205,7 @@ fn every_eval_corpus_case_matches_its_oracle_golden() {
         if !case.env().is_empty() {
             checked_env += 1;
         }
-        let observation = run_with_env(&oracle, &argv, case.env())
+        let observation = run_with_env(&oracle, &argv, &own_env(case.env()))
             .unwrap_or_else(|error| panic!("case {}: failed to run the oracle: {error}", case.id));
         let golden = check_golden(&observation, &case.golden);
         assert!(
@@ -245,8 +251,14 @@ fn module_run_cases_reproduce_their_golden_under_the_oracle() {
     let mut checked = 0;
     let mut skipped = 0;
     for case in differential::corpus::cases() {
-        let CaseKind::Module(module_run) = &case.kind else {
-            continue;
+        let module_run = match &case.kind {
+            CaseKind::Module(module_run) => module_run,
+            // An environment-variable module-run case (`ModuleEnv`, contract A.6) is driven
+            // like a plain module-run case, except its helper modules are compiled into the
+            // same dir, the oracle argv carries **no** `-pa`, and both runtimes are spawned
+            // with the case environment (its `{dir}` placeholder expanded).
+            CaseKind::ModuleEnv { run, .. } => run,
+            _ => continue,
         };
         checked += 1;
         let compiled = match module_build::build(module_run.source, module_run.module, module_run.nif)
@@ -261,8 +273,25 @@ fn module_run_cases_reproduce_their_golden_under_the_oracle() {
             }
             Err(error) => panic!("case {}: building the module failed: {error}", case.id),
         };
-        let argv = module_run.oracle_argv(compiled.dir());
-        let observation = run(&oracle, &argv).unwrap_or_else(|error| {
+        let (argv, env) = match &case.kind {
+            CaseKind::ModuleEnv { extra, env, .. } => {
+                for helper in *extra {
+                    module_build::compile_extra_into(compiled.dir(), helper.source, helper.module)
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "case {}: compiling helper {} failed: {error}",
+                                case.id, helper.module
+                            )
+                        });
+                }
+                (
+                    module_run.oracle_argv_env_only(),
+                    differential::corpus::expand_env(env, compiled.dir()),
+                )
+            }
+            _ => (module_run.oracle_argv(compiled.dir()), Vec::new()),
+        };
+        let observation = run_with_env(&oracle, &argv, &env).unwrap_or_else(|error| {
             panic!("case {}: failed to run the oracle: {error}", case.id)
         });
         let golden = check_golden(&observation, &case.golden);
