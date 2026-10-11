@@ -289,7 +289,8 @@ constructors only (no new error enum).
     `should_shrink(capacity, request)` falls it back to `next_words(request, 0)`, and otherwise the capacity
     is kept. A nursery the round left mostly empty therefore **shrinks** and one that turned out about right
     **keeps** its size — the rule the pressure tests depend on (a test that must keep a large nursery alive
-    raises `min_heap_words`).
+    raises `min_heap_words`). The capacity is therefore **bounded**: with no growth seam in play a fixed
+    live set converges to a constant, and the nursery never grows merely because a collection ran.
   - **Why the surviving set, at offset 0.** Sizing from the pre-`reset()` fill (≈ capacity) or stepping
     offset-1 `next_words(capacity.max(request), 1)` both fire on *every* collection, growing the nursery ~20 %
     each round with no bound, so RSS scales with the workload size (`MEASURED.md` records the sequence).
