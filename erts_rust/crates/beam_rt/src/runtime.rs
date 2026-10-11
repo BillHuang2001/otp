@@ -481,6 +481,44 @@ pub struct Runtime {
     boot_script_path: Option<PathBuf>,
 }
 
+/// The **owning payload handles** a transport copy resolves against: the off-heap objects a term
+/// about to leave a process may reference.
+///
+/// The three families are exactly the ones a received or locally built message can own, held in
+/// the order [`Runtime::stabilize_term_with`] rebuilds the copy's **source** off-heap table:
+/// the engine's / the mailbox's refc-binary handles, the mailbox's MSO handles (whose **order**
+/// reproduces the removed container terms' slot space) and the mailbox's external-thing node
+/// identities. [`SourcePayloads::default`] is empty — the documented empty-source form.
+///
+/// The node list is carried so the whole retained family travels together; it is deliberately
+/// **not** pushed into the source table (see [`Runtime::stabilize_term_with`]).
+#[derive(Default)]
+pub(crate) struct SourcePayloads {
+    /// The refc-binary payload handles, owned (each clone refcounts the shared payload).
+    pub(crate) binaries: Vec<beam_alloc::RefcBinary>,
+    /// The off-heap MSO handles, in the order the removed message held them.
+    pub(crate) off_heap: Vec<beam_message::MsoHandle>,
+    /// The external-thing node identities the process retained.
+    pub(crate) nodes: Vec<beam_message::NodeEntry>,
+}
+
+impl SourcePayloads {
+    /// The engine's (`Machine::refc_binaries`) handles alone, with no retained mailbox payloads.
+    pub(crate) fn from_machine(binaries: &[beam_alloc::RefcBinary]) -> SourcePayloads {
+        SourcePayloads {
+            binaries: binaries.to_vec(),
+            off_heap: Vec::new(),
+            nodes: Vec::new(),
+        }
+    }
+
+    /// Whether the handle set is empty in **every** family — the condition that lets the copy use
+    /// the documented simple, empty-source form.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.binaries.is_empty() && self.off_heap.is_empty() && self.nodes.is_empty()
+    }
+}
+
 impl Runtime {
     /// Creates a runtime for `config`.
     ///
@@ -949,7 +987,8 @@ impl Runtime {
     }
 
     /// [`Runtime::stabilize_term`] for a term that may reference the **off-heap payloads** an
-    /// engine machine built (`Machine::refc_binaries`), resolved against `src_binaries`.
+    /// engine machine built (`Machine::refc_binaries`) or the mailbox retained from a received
+    /// message, resolved against `src`.
     ///
     /// A `bs_init_writable`/`bs_create_bin` result larger than
     /// [`beam_term::refc::ERL_ONHEAP_BINARY_LIMIT`] bytes is a frozen 8-word
@@ -961,12 +1000,23 @@ impl Runtime {
     /// engine-built off-heap binary is refused with [`BeamError::BadArg`] (a **wrong** answer
     /// where the term is perfectly copyable).
     ///
-    /// This form fixes that: it clones each `src_binaries` handle (refcount++) into a source
+    /// This form fixes that: it clones each `src.binaries` handle (refcount++) into a source
     /// table, copies with a real [`beam_message::CopyContext`], and pushes the referenced
     /// handles into [`Runtime::eval_off_heap`] — the destination table that **owns** the payload
-    /// references the copy depends on. `src_binaries` must be the payload handles of the
-    /// machine that built `term`; the caller (the runner, which drives that machine) is the only
-    /// one that can name them.
+    /// references the copy depends on. `src.binaries` must be the payload handles of the machine
+    /// that built `term`; the caller (the runner, which drives that machine) is the only one that
+    /// can name them.
+    ///
+    /// The **MSO** family (`src.off_heap`) is cloned into the source table **in order**, so each
+    /// retained handle lands on the slot the removed message's off-heap container term names
+    /// ([`MailboxState::retained_off_heap`](crate::mailbox::MailboxState::retained_off_heap)) —
+    /// the `copy_struct` off-heap arm resolves a container through `source.clone_slot(slot)`. The
+    /// **node** family (`src.nodes`) is deliberately *not* pushed: the copier registers a fresh
+    /// [`beam_message::NodeEntry`] for every external thing it copies and never reads a source
+    /// node list, and `beam_message::OffHeapTable`'s `Drop` calls `release_all` on each entry it
+    /// holds — pushing the retained handles would zero the object's own count on drop. They are
+    /// carried so the whole retained family is one value; see
+    /// [`SourcePayloads`].
     ///
     /// # Errors
     ///
@@ -975,18 +1025,22 @@ impl Runtime {
     pub(crate) fn stabilize_term_with(
         &mut self,
         term: Eterm,
-        src_binaries: &[beam_alloc::RefcBinary],
+        src: &SourcePayloads,
     ) -> Result<Eterm> {
-        // No engine handles reachable on this path: the simple, documented form is exactly
+        // No off-heap handles reachable on this path: the simple, documented form is exactly
         // equivalent (an empty source table cannot resolve an off-heap payload either way).
-        if src_binaries.is_empty() {
+        if src.is_empty() {
             return self.stabilize_term(term);
         }
-        // The copy's source table: one clone (refcount++) per engine payload handle, so the
-        // lookup in `copy_refc_binary` resolves `term`'s `BinRef.val` to a live handle.
+        // The copy's source table: one clone (refcount++) per refc-binary handle (so the lookup
+        // in `copy_refc_binary` resolves `term`'s `BinRef.val` to a live handle) and one clone per
+        // MSO handle, pushed **in order** so the container terms' slots still name them.
         let mut source = beam_message::OffHeapTable::new();
-        for handle in src_binaries {
+        for handle in &src.binaries {
             source.push_binary(handle.clone());
+        }
+        for handle in &src.off_heap {
+            source.push(handle.clone());
         }
         // `eval_off_heap` is the copy's destination table: the `RefcBinary` handles the copy
         // re-registers there own the payloads the copied term points at, so they must outlive
@@ -994,6 +1048,35 @@ impl Runtime {
         let mut ctx = beam_message::CopyContext::new(&source, &mut self.eval_off_heap);
         beam_message::copy_struct(term, &mut self.eval_heap, &mut ctx)
             .map_err(error::enforce_term_heap_limit)
+    }
+
+    /// The [`SourcePayloads`] a transport copy out of `pid` resolves against: the executing
+    /// machine's own refc-binary handles (`machine_handles`) unioned with the payload handles
+    /// `pid`'s mailbox scan retained from the messages it received
+    /// ([`MailboxState`](crate::mailbox::MailboxState)'s retained binaries, MSO handles and node
+    /// identities).
+    ///
+    /// A term the process **built** resolves through its machine's handles
+    /// ([`Machine::refc_binaries`](beam_engine::Machine::refc_binaries)); a term it **received from
+    /// another process** resolves through the handles the removed message left on its scan state,
+    /// because the machine that built that payload is a different process. A term may hold both,
+    /// so the sets are combined. A pid with no scan state (it has not removed a message) yields
+    /// the machine's handles alone — and an empty result (no handle in any family) is the
+    /// documented simple, empty-source form.
+    pub(crate) fn source_payloads(
+        &self,
+        pid: ProcessId,
+        machine_handles: &[beam_alloc::RefcBinary],
+    ) -> SourcePayloads {
+        let mut payloads = SourcePayloads::from_machine(machine_handles);
+        if let Some(state) = self.mailboxes.get(&pid) {
+            payloads.binaries.extend_from_slice(state.retained_binaries());
+            payloads.off_heap.extend_from_slice(state.retained_off_heap());
+            payloads
+                .nodes
+                .extend(state.retained_nodes().iter().map(beam_message::NodeEntry::handle));
+        }
+        payloads
     }
     /// Ensures `heap_need` words are available in the arena.
     ///
@@ -2094,7 +2177,7 @@ mod tests {
 
         // The machine-aware form copies it, resolving the payload through the handles.
         let copied = rt
-            .stabilize_term_with(term, &payloads.0)
+            .stabilize_term_with(term, &SourcePayloads::from_machine(&payloads.0))
             .expect("an engine-built off-heap binary stabilizes through its handles");
 
         // Byte-identical: `compare::eq` compares bitstrings bit by bit (contents, not pointers),
@@ -2141,7 +2224,7 @@ mod tests {
         assert!(rt.gc_enabled(), "a fresh runtime collects");
 
         let copied = rt
-            .try_stabilize_escaped_with(term, &payloads.0)
+            .try_stabilize_escaped_with(term, &SourcePayloads::from_machine(&payloads.0))
             .expect("the exit-reason copy resolves the engine's handles");
         let mut reference_heap = Heap::new(64).expect("the reference heap");
         let reference =
