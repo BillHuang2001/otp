@@ -54,11 +54,15 @@
 //! to defer, so `node_down`/`port_closed` materialise it straight into the mailbox.
 //!
 //! Every signal-builder path handles a full receiver heap exactly as
-//! [`Process::deliver`](crate::process::Process::deliver) does (through
-//! [`grow_receiver_for_signal`]): the nursery is collected and grown **on demand** to cover the
-//! refused request and the build is retried once, so an oversized `{'EXIT', …}`/`{'DOWN', …}`
-//! reason is still delivered; a **relocation-exempt** receiver instead surfaces the raw
-//! `BeamError::Alloc` refusal unchanged (no collection, no growth, no retry).
+//! [`Process::deliver`](crate::process::Process::deliver) does: an **ordinary** receiver's nursery
+//! is collected and grown **on demand** to cover the refused request (through
+//! [`grow_receiver_for_signal`]) and the build is retried once, so an oversized
+//! `{'EXIT', …}`/`{'DOWN', …}` reason is still delivered; a **relocation-exempt** receiver — whose
+//! heap must not move under the host's unpublished roots — instead gets the signal delivered
+//! through a **heap fragment** ([`enqueue_fragment_signal`]): no collection, no growth, no heap
+//! relocation, the message simply does not live on the receiver's heap. That is the model the C
+//! always uses for signals (`erl_proc_sig_queue.c`: a signal message is built into the message's
+//! own heap fragment, `erts_alloc_message(hsz,&hp)` → `mp->hfrag.off_heap`).
 //!
 //! Legacy C ground truth (read-only): `erts/emulator/beam/erl_ptab.{c,h}` (the process/port
 //! table and the local name registry), `erl_process.c` (`erts_ptab_new_process`) and
@@ -69,8 +73,9 @@ use std::collections::{HashMap, VecDeque};
 use beam_alloc::Heap;
 use beam_common::{AllocFailure, AllocKind, BeamError, Result};
 use beam_gc::HeapPolicy;
-use beam_message::{Message, MsoHandle, OffHeapTable};
+use beam_message::{Fragments, HeapFragment, Message, OffHeapTable};
 use beam_term::prelude::{atom_val, is_atom, is_immediate, make_atom, Atom, Eterm};
+use beam_term::size_object;
 
 use crate::error;
 use crate::exit_observer::{ProcessExit, ProcessExitObserver};
@@ -144,18 +149,24 @@ fn lookup_mut(slots: &mut [Slot], pid: ProcessId) -> Option<&mut Process> {
     slot.process.as_mut()
 }
 
-/// The receive-side heap-exhaustion policy every signal builder shares with
+/// The receive-side heap-exhaustion policy the signal builders share with
 /// [`Process::deliver`](crate::process::Process::deliver).
 ///
 /// Copying a signal onto a receiver's heap can be refused because the nursery is full — a
-/// *normal* condition, not fatal OOM. A **relocation-exempt** receiver
+/// *normal* condition, not fatal OOM. An **ordinary** receiver's nursery is therefore collected
+/// and grown **on demand** to cover the refused request
+/// ([`Process::ensure_capacity`](crate::process::Process::ensure_capacity), seeded with the word
+/// count the copier reported) and the caller retries once; `Ok(())` means "retry now".
+///
+/// A **relocation-exempt** receiver
 /// ([`Process::is_relocation_exempt`](crate::process::Process::is_relocation_exempt)) must not
 /// collect or grow (the host holds live words outside the crate root set, so relocating would
-/// recycle them), so the raw [`BeamError::Alloc`] refusal is returned **unchanged** and the
-/// caller surfaces it — the same raw-refusal contract `deliver` honours. Otherwise the nursery
-/// is collected and grown **on demand** to cover the refused request
-/// ([`Process::ensure_capacity`](crate::process::Process::ensure_capacity), seeded with the word
-/// count the copier reported), and the caller retries once; `Ok(())` means "retry now".
+/// recycle them), so the raw [`BeamError::Alloc`] refusal is returned **unchanged**. This is now
+/// the **defensive** path: the live signal builders test `is_relocation_exempt` *first* and route
+/// an exempt receiver to the heap-fragment model ([`enqueue_fragment_signal`]) without ever
+/// reaching here, so only a builder that cannot use a fragment — the **enqueue-time** reason copy
+/// of [`copy_reason_onto`], which must land on the receiver's own heap — still surfaces the raw
+/// refusal.
 fn grow_receiver_for_signal(process: &mut Process, failure: AllocFailure) -> Result<()> {
     if process.is_relocation_exempt() {
         // The heap cannot be moved under the host's unpublished roots: hand the refusal back
@@ -173,32 +184,74 @@ fn grow_receiver_for_signal(process: &mut Process, failure: AllocFailure) -> Res
     Ok(())
 }
 
-/// Builds a signal term — together with the handles of the off-heap objects it owns — on
-/// `process`'s heap, retrying once after a collect-and-grow when the heap is exhausted (a full
-/// heap is a normal condition, not fatal OOM).
+/// Reserved words for the scratch arena a fragment-backed signal payload is built on.
+const SIGNAL_SCRATCH_WORDS: usize = 64;
+
+/// Builds a signal payload with `build` and enqueues it as `from` → `recipient`.
 ///
-/// `build` returns whatever the caller needs (the term plus the handles of the fresh off-heap
-/// table it copied into, or the term plus extra terms materialised on the same heap). It creates
-/// that table itself, so a retry always starts from a clean table and never reuses a stale handle.
-///
-/// Exhaustion is handled exactly as [`Process::deliver`](crate::process::Process::deliver)
-/// handles it, through [`grow_receiver_for_signal`]: a **relocation-exempt** `process` surfaces
-/// the raw [`BeamError::Alloc`] refusal unchanged, otherwise the nursery is collected and grown
-/// on demand and `build` is retried once.
-fn build_signal_term<T, F>(process: &mut Process, build: F) -> Result<T>
+/// Exhaustion is the shared policy: a `Heap`/`Message` refusal is a normal condition —
+/// an ordinary receiver collects and grows its nursery on demand and the build is retried
+/// once ([`grow_receiver_for_signal`]), while a **relocation-exempt** receiver (whose heap must
+/// not move under the host's unpublished roots) gets the heap-fragment model instead.
+fn build_signal_message<F>(
+    recipient: &mut Process,
+    from: Eterm,
+    reason: Eterm,
+    mut build: F,
+) -> Result<()>
 where
-    F: Fn(&mut Heap) -> Result<T>,
+    F: FnMut(&mut Heap, Eterm) -> Result<Eterm>,
 {
-    match build(process.heap_mut()) {
-        Ok(built) => Ok(built),
+    match build(recipient.heap_mut(), reason) {
+        Ok(term) => {
+            recipient.mailbox_mut().enqueue(Message::new(term, from));
+            Ok(())
+        }
         Err(BeamError::Alloc(failure))
             if matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
         {
-            grow_receiver_for_signal(process, failure)?;
-            build(process.heap_mut())
+            if recipient.is_relocation_exempt() {
+                return enqueue_fragment_signal(recipient, from, reason, &mut build);
+            }
+            grow_receiver_for_signal(recipient, failure)?;
+            let term = build(recipient.heap_mut(), reason)?;
+            recipient.mailbox_mut().enqueue(Message::new(term, from));
+            Ok(())
         }
         Err(error) => Err(error),
     }
+}
+
+/// Builds the signal payload on a scratch arena and copies the **whole** graph into a fresh
+/// [`HeapFragment`] that the enqueued [`Message`] owns — the local-receiver analogue of the send
+/// path's `send_fragmented` ([`beam_message`]), and the model the C always uses for signals
+/// (`erl_proc_sig_queue.c` builds every signal message into the message's own heap fragment).
+///
+/// This is the exhaustion fallback for a **relocation-exempt** receiver: no collection, no
+/// growth, no heap relocation — the message simply does not live on the receiver's heap.
+fn enqueue_fragment_signal<F>(
+    recipient: &mut Process,
+    from: Eterm,
+    reason: Eterm,
+    build: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Heap, Eterm) -> Result<Eterm>,
+{
+    // `reason` may still point into the receiver's young heap: build the payload around it on a
+    // scratch arena, then copy the whole graph in one go.
+    let mut scratch = Heap::new(SIGNAL_SCRATCH_WORDS)?;
+    let payload = build(&mut scratch, reason)?;
+    let mut fragment = HeapFragment::new(size_object(payload) + 8)?;
+    // `copy_struct` walks the graph by pointer, so the receiver-heap-resident `reason` subtree is
+    // copied in too; the receiver's persistent off-heap table resolves its refc binaries/MSO.
+    let root = fragment.copy_root(payload, recipient.off_heap())?;
+    let mut fragments = Fragments::new();
+    fragments.push(fragment);
+    recipient
+        .mailbox_mut()
+        .enqueue(Message::new(root, from).with_fragments(fragments));
+    Ok(())
 }
 
 /// Copies `reason` — whose heap is described by `src_off_heap` — into `process`'s own heap,
@@ -332,31 +385,6 @@ fn snapshot_off_heap(src: &OffHeapTable) -> OffHeapTable {
         snapshot.push(handle.clone());
     }
     snapshot
-}
-
-/// Builds `{'EXIT', from, reason}` on `recipient`'s heap and enqueues it as a message.
-///
-/// `reason` is already owned by `recipient`'s heap: it was copied in when the signal was
-/// enqueued (`enqueue_exit_signal`), so the delivered reason always resides in the recipient's
-/// own heap. This deliberately does **not** collect on heap exhaustion — a collection would
-/// relocate `reason`, turning the raw word stale — so a full heap surfaces as
-/// `BeamError::Alloc` and the caller retries after a collect-and-grow with a freshly read reason
-/// (see [`ProcessTable::deliver_head_signal`]).
-///
-/// # Errors
-///
-/// Propagates `BeamError::Alloc` when the message does not fit.
-fn enqueue_exit_on(
-    recipient: &mut Process,
-    atoms: &SignalAtoms,
-    from: ProcessId,
-    reason: Eterm,
-) -> Result<()> {
-    let term = build_exit_message(recipient.heap_mut(), atoms, from, reason)?;
-    recipient
-        .mailbox_mut()
-        .enqueue(Message::new(term, from.to_eterm()));
-    Ok(())
 }
 
 /// The process table, the local name registry and the signal/link/monitor hub.
@@ -938,17 +966,17 @@ impl ProcessTable {
     }
 
     /// Enqueues the immediate `{'DOWN', Ref, process, Target, noproc}` of a monitor on a
-    /// non-live target into `watcher`'s mailbox — built on the watcher's own heap — and wakes a
-    /// blocked watcher.
+    /// non-live target into `watcher`'s mailbox and wakes a blocked watcher.
     ///
     /// When `tag` is `Some`, the head atom is the caller's user tag instead of `'DOWN'`
     /// (the `erlang:monitor/3` form). Mirrors
     /// [`ProcessTable::enqueue_port_down_message`]: the build goes through
-    /// [`build_signal_term`] (so a full heap is a collection and a retry, never fatal) and the
-    /// wake is recorded on the wake list. `target` must be an immediate (a pid term or a
-    /// `{Name, Node}` pair the closure materialises itself); the `noproc` reason is an atom
-    /// immediate, so nothing relocates. An unknown watcher is a no-op (the caller has already
-    /// checked it, so only a mid-call death can reach this).
+    /// [`build_signal_message`] (so a full heap is a collection and a retry — or, for a
+    /// **relocation-exempt** watcher, a heap fragment — never fatal) and the wake is recorded on
+    /// the wake list. `target` must be an immediate (a pid term; the named form materialises its
+    /// `{Name, Node}` pair inside the closure); the `noproc` reason is an atom immediate, so
+    /// nothing relocates. An unknown watcher is a no-op (the caller has already checked it, so
+    /// only a mid-call death can reach this).
     fn deliver_noproc_down(
         &mut self,
         watcher: ProcessId,
@@ -956,30 +984,24 @@ impl ProcessTable {
         target: Eterm,
         tag: Option<Eterm>,
     ) -> Result<()> {
-        let woke = {
-            let atoms = &self.atoms;
-            let reason = atoms.noproc_term();
-            let Some(recipient) = lookup_mut(&mut self.slots, watcher) else {
-                return Ok(());
-            };
-            let (term, off_heap) = build_signal_term(recipient, |heap| {
-                let reference_term = reference.to_eterm(heap)?;
-                let term = build_down_message_term(
-                    heap,
-                    atoms,
-                    tag,
-                    reference_term,
-                    atoms.process(),
-                    target,
-                    reason,
-                )?;
-                Ok((term, Vec::<MsoHandle>::new()))
-            })?;
-            recipient
-                .mailbox_mut()
-                .enqueue(Message::new(term, target).with_off_heap(off_heap));
-            recipient.wake()
+        let atoms = self.atoms; // Copy: the build closure captures it by value.
+        let reason = atoms.noproc_term();
+        let Some(recipient) = lookup_mut(&mut self.slots, watcher) else {
+            return Ok(());
         };
+        build_signal_message(recipient, target, reason, |heap, reason| {
+            let reference_term = reference.to_eterm(heap)?;
+            build_down_message_term(
+                heap,
+                &atoms,
+                tag,
+                reference_term,
+                atoms.process(),
+                target,
+                reason,
+            )
+        })?;
+        let woke = recipient.wake();
         if woke {
             self.ready.push(watcher);
         }
@@ -995,8 +1017,9 @@ impl ProcessTable {
     /// monitor on an unregistered name into `watcher`'s mailbox, and wakes a blocked watcher.
     ///
     /// When `tag` is `Some`, the head atom is the caller's user tag instead of `'DOWN'`.
-    /// The `{Name, Node}` target is materialised on the watcher's own heap *inside* the
-    /// [`build_signal_term`] closure, so a collect-and-retry never leaves a stale word behind.
+    /// The `{Name, Node}` target is materialised *inside* the [`build_signal_message`] closure, on
+    /// whichever heap (the watcher's, or a fragment's scratch arena) the closure is handed, so a
+    /// collect-and-retry never leaves a stale word behind.
     ///
     /// The message's **`from`** is the `system` atom — an immediate — exactly as the C stores
     /// `am_system` for a monitor that failed by name (`erl_proc_sig_queue.c:4991`). `from` is
@@ -1009,31 +1032,26 @@ impl ProcessTable {
         node: Atom,
         tag: Option<Eterm>,
     ) -> Result<()> {
-        let woke = {
-            let atoms = &self.atoms;
-            let reason = atoms.noproc_term();
-            let Some(recipient) = lookup_mut(&mut self.slots, watcher) else {
-                return Ok(());
-            };
-            let (term, off_heap) = build_signal_term(recipient, |heap| {
-                let reference_term = reference.to_eterm(heap)?;
-                let target = heap.tuple(&[make_atom(name), make_atom(node)])?;
-                let term = build_down_message_term(
-                    heap,
-                    atoms,
-                    tag,
-                    reference_term,
-                    atoms.process(),
-                    target,
-                    reason,
-                )?;
-                Ok((term, Vec::<MsoHandle>::new()))
-            })?;
-            recipient
-                .mailbox_mut()
-                .enqueue(Message::new(term, atoms.system_term()).with_off_heap(off_heap));
-            recipient.wake()
+        let atoms = self.atoms; // Copy: the build closure captures it by value.
+        let reason = atoms.noproc_term();
+        let from = atoms.system_term();
+        let Some(recipient) = lookup_mut(&mut self.slots, watcher) else {
+            return Ok(());
         };
+        build_signal_message(recipient, from, reason, |heap, reason| {
+            let reference_term = reference.to_eterm(heap)?;
+            let target = heap.tuple(&[make_atom(name), make_atom(node)])?;
+            build_down_message_term(
+                heap,
+                &atoms,
+                tag,
+                reference_term,
+                atoms.process(),
+                target,
+                reason,
+            )
+        })?;
+        let woke = recipient.wake();
         if woke {
             self.ready.push(watcher);
         }
@@ -1859,7 +1877,7 @@ impl ProcessTable {
         //    `demonitor(Ref, [info])` distinguishes them — `demonitor/1` answers `true`
         //    unconditionally). Leaving it behind would dangle forever. The `named_monitors`
         //    `{Name, node}` descriptor is **not** dropped here: it is consumed by
-        //    `build_and_enqueue_down` when the (possibly deferred) DOWN is materialised, and the
+        //    `deliver_down_message` when the (possibly deferred) DOWN is materialised, and the
         //    DOWN must still carry the name.
         for watcher in watchers {
             if !self.contains(watcher.watcher) {
@@ -2166,17 +2184,19 @@ impl ProcessTable {
         }
     }
 
-    /// Builds the head signal's message, retrying once after a collect-and-grow on heap
-    /// exhaustion (the [`grow_receiver_for_signal`] policy `Process::deliver` follows).
+    /// Builds the head signal's message with `build` and enqueues it as `from` → `pid`.
     ///
     /// The queued signal is an in-heap sub-rootset, so a heap-exhaustion collection relocates
-    /// its `reason` in place: `build` is handed a freshly read reason each attempt. A
-    /// **relocation-exempt** recipient surfaces the raw `BeamError::Alloc` refusal unchanged —
-    /// no collection, no growth, no retry. On success the head signal is removed and a blocked
-    /// `pid` is woken (and recorded on the wake list).
-    fn deliver_head_signal<F>(&mut self, pid: ProcessId, mut build: F) -> Result<()>
+    /// its `reason` in place: `build` is handed a **freshly read** reason each attempt. Exhaustion
+    /// follows the shared policy: an ordinary `pid` collects and grows its nursery on demand and
+    /// the build is retried once ([`grow_receiver_for_signal`]); a **relocation-exempt** `pid`
+    /// must not have its heap move under the host's unpublished roots, so its message is built
+    /// into a heap fragment instead ([`enqueue_fragment_signal`]) — no collection, no growth, no
+    /// retry. On success the head signal is removed and a blocked `pid` is woken (and recorded on
+    /// the wake list).
+    fn deliver_head_signal<F>(&mut self, pid: ProcessId, from: Eterm, mut build: F) -> Result<()>
     where
-        F: FnMut(&mut Self, Eterm) -> Result<()>,
+        F: FnMut(&mut Heap, Eterm) -> Result<Eterm>,
     {
         let mut attempt = 0;
         loop {
@@ -2184,15 +2204,24 @@ impl ProcessTable {
                 // The queue emptied (or the process is gone): nothing to deliver.
                 return Ok(());
             };
-            match build(self, reason) {
-                Ok(()) => break,
+            let Some(recipient) = lookup_mut(&mut self.slots, pid) else {
+                return Ok(());
+            };
+            match build(recipient.heap_mut(), reason) {
+                Ok(term) => {
+                    recipient.mailbox_mut().enqueue(Message::new(term, from));
+                    break;
+                }
                 Err(BeamError::Alloc(failure))
                     if attempt == 0 && matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
                 {
                     attempt += 1;
-                    let Some(recipient) = lookup_mut(&mut self.slots, pid) else {
-                        return Ok(());
-                    };
+                    if recipient.is_relocation_exempt() {
+                        // The heap must not move under the host's unpublished roots.
+                        enqueue_fragment_signal(recipient, from, reason, &mut build)?;
+                        break;
+                    }
+                    // A collection relocates the queued reason word: re-read it next iteration.
                     grow_receiver_for_signal(recipient, failure)?;
                 }
                 Err(error) => return Err(error),
@@ -2211,46 +2240,19 @@ impl ProcessTable {
     /// Delivers the head (exit) signal of `pid` as a `{'EXIT', from, reason}` message.
     ///
     /// The reason is already owned by `pid`'s heap, so it is built without copying (the
-    /// earlier `copy_reason_onto` at enqueue time did the ownership transfer).
+    /// earlier `copy_reason_onto` at enqueue time did the ownership transfer). The message's
+    /// **`from`** is the signalling pid's immediate, as [`ProcessTable::deliver_down_message`]
+    /// documents.
     fn deliver_trapped_exit(&mut self, pid: ProcessId, from: ProcessId) -> Result<()> {
-        self.deliver_head_signal(pid, |this, reason| {
-            this.build_and_enqueue_exit(pid, from, reason)
+        let atoms = self.atoms; // Copy: the build closure captures it by value.
+        let from_term = from.to_eterm();
+        self.deliver_head_signal(pid, from_term, move |heap, reason| {
+            build_exit_message(heap, &atoms, from, reason)
         })
     }
 
     /// Delivers the head (monitor-DOWN) signal of `pid` as a `{'DOWN', …}` message — or
     /// `{Tag, …}` when the queued signal carried an `erlang:monitor/3` user tag.
-    fn deliver_down_message(
-        &mut self,
-        pid: ProcessId,
-        reference: MonitorRef,
-        target: ProcessId,
-        kind: MonitorKind,
-        tag: Option<Eterm>,
-    ) -> Result<()> {
-        self.deliver_head_signal(pid, |this, reason| {
-            this.build_and_enqueue_down(pid, reference, target, kind, tag, reason)
-        })
-    }
-
-    /// Builds `{'EXIT', from, reason}` on `pid`'s heap — `reason` already resident in that
-    /// heap — and enqueues it as a message.
-    fn build_and_enqueue_exit(
-        &mut self,
-        pid: ProcessId,
-        from: ProcessId,
-        reason: Eterm,
-    ) -> Result<()> {
-        let atoms = &self.atoms;
-        let Some(recipient) = lookup_mut(&mut self.slots, pid) else {
-            return Ok(());
-        };
-        enqueue_exit_on(recipient, atoms, from, reason)
-    }
-
-    /// Builds `{'DOWN', Ref, Kind, Target, reason}` on `pid`'s heap — `reason` already resident
-    /// in that heap — and enqueues it as a message. When `tag` is `Some`, the head atom is the
-    /// caller's `erlang:monitor/3` user tag instead of `'DOWN'`.
     ///
     /// A **named** monitor's DOWN carries the `{Name, node}` pair it was created with rather than
     /// the pid the name resolved to (the oracle's behaviour); an ordinary monitor carries the
@@ -2260,43 +2262,38 @@ impl ProcessTable {
     /// ([`ProcessId::to_eterm`]): the C requires `is_immed(ERL_MESSAGE_FROM(mp))`
     /// (`erl_proc_sig_queue.c:8441`), and a `{Name, node}`/external-pid target belongs in the
     /// message **body**, never in `from` — which is not a GC root.
-    fn build_and_enqueue_down(
+    fn deliver_down_message(
         &mut self,
         pid: ProcessId,
         reference: MonitorRef,
         target: ProcessId,
         kind: MonitorKind,
         tag: Option<Eterm>,
-        reason: Eterm,
     ) -> Result<()> {
-        let atoms = &self.atoms;
+        let atoms = self.atoms; // Copy: the build closure captures it by value.
         let named = self.named_monitors.get(&reference).copied();
-        let Some(recipient) = lookup_mut(&mut self.slots, pid) else {
-            return Ok(());
-        };
         let kind_atom = match kind {
             MonitorKind::Process => atoms.process(),
             MonitorKind::Port => atoms.port(),
         };
-        let reference_term = reference.to_eterm(recipient.heap_mut())?;
-        let target_term = match named {
-            Some(nt) => recipient
-                .heap_mut()
-                .tuple(&[make_atom(nt.name), make_atom(nt.node)])?,
-            None => target.to_eterm(),
-        };
-        let term = build_down_message_term(
-            recipient.heap_mut(),
-            atoms,
-            tag,
-            reference_term,
-            kind_atom,
-            target_term,
-            reason,
-        )?;
-        recipient
-            .mailbox_mut()
-            .enqueue(Message::new(term, target.to_eterm()));
+        let from_term = target.to_eterm();
+        self.deliver_head_signal(pid, from_term, move |heap, reason| {
+            let reference_term = reference.to_eterm(heap)?;
+            let target_term = match named {
+                Some(nt) => heap.tuple(&[make_atom(nt.name), make_atom(nt.node)])?,
+                None => target.to_eterm(),
+            };
+            build_down_message_term(
+                heap,
+                &atoms,
+                tag,
+                reference_term,
+                kind_atom,
+                target_term,
+                reason,
+            )
+        })?;
+        // The named descriptor is consumed by the delivered DOWN (its last use).
         self.named_monitors.remove(&reference);
         Ok(())
     }
@@ -2805,31 +2802,18 @@ impl ProcessTable {
         remote: RemotePid,
         reason: Eterm,
     ) -> Result<()> {
-        let woke = {
-            let atoms = &self.atoms;
-            let Some(recipient) = lookup_mut(&mut self.slots, watcher) else {
-                return Ok(());
-            };
-            let (term, off_heap) = build_signal_term(recipient, |heap| {
-                let reference_term = reference.to_eterm(heap)?;
-                // A remote monitor carries no user tag (see `monitor_term_with_tag`), so the
-                // DOWN keeps the default `'DOWN'` head atom; the closure materialises the remote
-                // pid into the message *body*.
-                let term = build_down_message_remote(
-                    heap,
-                    atoms,
-                    None,
-                    reference_term,
-                    remote,
-                    reason,
-                )?;
-                Ok((term, Vec::<MsoHandle>::new()))
-            })?;
-            recipient
-                .mailbox_mut()
-                .enqueue(Message::new(term, remote.node()).with_off_heap(off_heap));
-            recipient.wake()
+        let atoms = self.atoms; // Copy: the build closure captures it by value.
+        let Some(recipient) = lookup_mut(&mut self.slots, watcher) else {
+            return Ok(());
         };
+        build_signal_message(recipient, remote.node(), reason, |heap, reason| {
+            let reference_term = reference.to_eterm(heap)?;
+            // A remote monitor carries no user tag (see `monitor_term_with_tag`), so the
+            // DOWN keeps the default `'DOWN'` head atom; the closure materialises the remote
+            // pid into the message *body*.
+            build_down_message_remote(heap, &atoms, None, reference_term, remote, reason)
+        })?;
+        let woke = recipient.wake();
         if woke {
             self.ready.push(watcher);
         }
@@ -2850,21 +2834,15 @@ impl ProcessTable {
         remote: RemotePid,
         reason: Eterm,
     ) -> Result<()> {
-        let woke = {
-            let atoms = &self.atoms;
-            let Some(recipient) = lookup_mut(&mut self.slots, peer) else {
-                return Ok(());
-            };
-            let (term, off_heap) = build_signal_term(recipient, |heap| {
-                let from = remote.to_eterm(heap)?;
-                let term = build_exit_message_term(heap, atoms, from, reason)?;
-                Ok((term, Vec::<MsoHandle>::new()))
-            })?;
-            recipient
-                .mailbox_mut()
-                .enqueue(Message::new(term, remote.node()).with_off_heap(off_heap));
-            recipient.wake()
+        let atoms = self.atoms; // Copy: the build closure captures it by value.
+        let Some(recipient) = lookup_mut(&mut self.slots, peer) else {
+            return Ok(());
         };
+        build_signal_message(recipient, remote.node(), reason, |heap, reason| {
+            let from = remote.to_eterm(heap)?;
+            build_exit_message_term(heap, &atoms, from, reason)
+        })?;
+        let woke = recipient.wake();
         if woke {
             self.ready.push(peer);
         }
@@ -3028,49 +3006,37 @@ impl ProcessTable {
         tag: Option<Eterm>,
         reason: Eterm,
     ) -> Result<()> {
-        let woke = {
-            let atoms = &self.atoms;
-            let Some(recipient) = lookup_mut(&mut self.slots, to) else {
-                return Ok(());
-            };
-            let from = port.to_eterm();
-            let (term, off_heap) = build_signal_term(recipient, |heap| {
-                let reference_term = reference.to_eterm(heap)?;
-                let term =
-                    build_down_message_port(heap, atoms, tag, reference_term, port, reason)?;
-                Ok((term, Vec::<MsoHandle>::new()))
-            })?;
-            recipient
-                .mailbox_mut()
-                .enqueue(Message::new(term, from).with_off_heap(off_heap));
-            recipient.wake()
+        let atoms = self.atoms; // Copy: the build closure captures it by value.
+        let from = port.to_eterm();
+        let Some(recipient) = lookup_mut(&mut self.slots, to) else {
+            return Ok(());
         };
+        build_signal_message(recipient, from, reason, |heap, reason| {
+            let reference_term = reference.to_eterm(heap)?;
+            build_down_message_port(heap, &atoms, tag, reference_term, port, reason)
+        })?;
+        let woke = recipient.wake();
         if woke {
             self.ready.push(to);
         }
         Ok(())
     }
 
-    /// Enqueues `{'EXIT', Port, Reason}` into `to`'s mailbox — built on `to`'s own heap — and
-    /// wakes `to` when it was blocked.
+    /// Enqueues `{'EXIT', Port, Reason}` into `to`'s mailbox — built on `to`'s own heap, or into
+    /// a heap fragment when `to` is **relocation-exempt** (see
+    /// [`ProcessTable::deliver_head_signal`]) — and wakes `to` when it was blocked.
     ///
     /// An unknown `to` is skipped (the linked peer died earlier).
     fn enqueue_port_exit_message(&mut self, to: ProcessId, port: PortId, reason: Eterm) -> Result<()> {
-        let woke = {
-            let atoms = &self.atoms;
-            let Some(recipient) = lookup_mut(&mut self.slots, to) else {
-                return Ok(());
-            };
-            let from = port.to_eterm();
-            let (term, off_heap) = build_signal_term(recipient, |heap| {
-                let term = build_exit_message_term(heap, atoms, from, reason)?;
-                Ok((term, Vec::<MsoHandle>::new()))
-            })?;
-            recipient
-                .mailbox_mut()
-                .enqueue(Message::new(term, from).with_off_heap(off_heap));
-            recipient.wake()
+        let atoms = self.atoms; // Copy: the build closure captures it by value.
+        let from = port.to_eterm();
+        let Some(recipient) = lookup_mut(&mut self.slots, to) else {
+            return Ok(());
         };
+        build_signal_message(recipient, from, reason, |heap, reason| {
+            build_exit_message_term(heap, &atoms, from, reason)
+        })?;
+        let woke = recipient.wake();
         if woke {
             self.ready.push(to);
         }
@@ -3935,5 +3901,115 @@ mod tests {
             table.exit_reason(ProcessId::new(999, 0)),
             Err(BeamError::TermNotFound)
         ));
+    }
+
+    /// A **relocation-exempt** receiver whose nursery cannot take the apply-time
+    /// `{'EXIT', …}` build still gets the signal: the message is built on a scratch arena and
+    /// copied into a heap fragment the message owns, so nothing on the receiver's heap moves
+    /// (no collection, no growth — a relocation would recycle the host's unpublished roots).
+    #[test]
+    fn an_exempt_receiver_gets_its_apply_time_signal_through_a_heap_fragment() {
+        let mut table = table();
+        let signaller = table.spawn_default().expect("a fresh process");
+        let receiver = table.spawn_default().expect("a fresh process");
+        // A trapping receiver survives the exit and queues it as a message.
+        table
+            .get_mut(receiver)
+            .expect("the receiver is live")
+            .set_trap_exit(true);
+
+        // Leave exactly three words free in the receiver's nursery: the four-word
+        // `{'EXIT', From, Reason}` tuple (`1` header + `3` elements) cannot fit, so the build is
+        // refused and the exemption is what decides the fallback.
+        let capacity = table
+            .get(receiver)
+            .expect("the receiver is live")
+            .collector()
+            .young()
+            .capacity_words();
+        let filler_words = capacity - 3;
+        let mut src = Heap::new(filler_words + 8).expect("the source arena allocates");
+        let elems: Vec<Eterm> = (0..filler_words - 1)
+            .map(|i| make_small(i as i64))
+            .collect();
+        let filler = src.tuple(&elems).expect("the filler fits the source arena");
+        table
+            .deliver_simple(receiver, signaller.to_eterm(), filler)
+            .expect("the filler fits the receiver's nursery");
+        assert_eq!(
+            table.get(receiver).expect("live").heap_used_words(),
+            filler_words,
+            "the delivery left exactly three words free"
+        );
+
+        table
+            .set_relocation_exempt(receiver, true)
+            .expect("the receiver is live");
+        let minor_before = table.get(receiver).expect("live").collector().minor_gcs();
+        let base_before = table.get(receiver).expect("live").collector().young().base();
+
+        // The reason is an immediate, so the enqueue-time copy allocates nothing and the signal
+        // reaches the *apply* path, where the message build is the refused request.
+        table
+            .send_exit(signaller, receiver, make_small(42))
+            .expect("the trapping receiver takes the signal");
+
+        let r = table.get(receiver).expect("the receiver survived");
+        assert_eq!(
+            r.collector().minor_gcs(),
+            minor_before,
+            "an exempt receiver must not collect"
+        );
+        assert_eq!(
+            r.collector().young().base(),
+            base_before,
+            "an exempt receiver's heap must not move"
+        );
+        assert_eq!(
+            r.heap_used_words(),
+            filler_words,
+            "the fragment-built signal wrote nothing on the receiver's heap"
+        );
+        assert_eq!(r.mailbox().len(), 2, "the filler and the exit message");
+
+        let filler_msg = table
+            .get_mut(receiver)
+            .expect("live")
+            .receive(|_| true)
+            .expect("the filler");
+        assert!(
+            filler_msg.fragments().is_none(),
+            "the ordinary delivery still lives on the receiver's heap"
+        );
+        let exit_msg = table
+            .get_mut(receiver)
+            .expect("live")
+            .receive(|_| true)
+            .expect("the exit message");
+        let fragments = exit_msg
+            .fragments()
+            .expect("the exempt fallback enqueued a fragment-resident message");
+        assert_eq!(fragments.len(), 1, "one fragment carries the whole payload");
+        assert!(
+            fragments
+                .iter()
+                .next()
+                .expect("one fragment")
+                .contains(exit_msg.payload()),
+            "the payload root lives inside the fragment"
+        );
+        // SAFETY: `payload` is the live `{'EXIT', Signaller, Reason}` tuple the fragment holds;
+        // the three element slots are in bounds.
+        let payload = exit_msg.payload();
+        let (size, from, delivered) = unsafe {
+            (
+                tuple_size(payload),
+                tuple_element(payload, 1),
+                tuple_element(payload, 2),
+            )
+        };
+        assert_eq!(size, 3, "the exit message is the three-tuple EXIT/From/Reason");
+        assert_eq!(from, signaller.to_eterm(), "the signaller is the link/exit sender");
+        assert_eq!(delivered, make_small(42), "the reason is delivered verbatim");
     }
 }

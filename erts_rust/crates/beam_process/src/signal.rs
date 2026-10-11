@@ -53,6 +53,11 @@ use crate::remote::RemotePid;
 ///
 /// Interned once from the module's [`AtomTable`] so the signal machinery never re-interns
 /// a name on a hot path; the crate's other units read them through the accessors.
+///
+/// Every field is an [`Atom`] — a `Copy` immediate — so the whole set is `Copy`: a signal builder
+/// can **capture it by value** instead of borrowing `ProcessTable::atoms`, which is what lets a
+/// build closure be handed to a `&mut self` method.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SignalAtoms {
     exit: Atom,
     down: Atom,
