@@ -106,6 +106,22 @@ The reply tag is **paired** with the request tag, never echoed: `{io_request, �
 * **`file_server.rs` does not serve `{write_file,Name,Data}`** though `prim_file:write_file/2` IS
   implemented in [`../prim.rs`](../prim.rs) (the `prim_file` floor is a separate dispatch site, not
   reachable as a `file_server` request).
+* **The `{open,Name,ModeList}` arm opens the path READ-ONLY** (`../file_server.rs::reply_open` uses
+  `std::fs::File::open` and inspects `ModeList` only for `binary`/`encoding`), and its
+  `std::fs::metadata` pre-check rejects a non-existent path as `{error,enoent}`. A write/append mode
+  is therefore ignored: `file:open(_,[write])` on a new file answers `{error,enoent}` (it never
+  creates/truncates), and a device obtained through it cannot be written. Observed:
+  `file:write_file("/tmp/x","hi")` ⇒ exit 3 `unsupported: file_server: the `write_file/2` request is
+  not implemented`; `file:write_file(Path,"hi",[])` and `file:open(Path,[write])` ⇒ `{error,enoent}`.
+  **No write path is served.**
+* **In-process compilation (`compile:file/2`) cannot run here.** Besides the write gaps above, the
+  compiler front end `epp` needs `io:setopts/2` on a device (`lib/stdlib/src/epp.erl:803`;
+  `setopts`/`getopts` are the typed io-device gap) and **spawns** an `epp` server (`epp.erl:386`);
+  `epp:open/2` fails with `unsupported: opcode: run: process blocked` even on the single-pass `-eval`
+  route. Every `file:*` call made from a **scheduled** process (`beam_rt run …`) folds into the same
+  `beam_engine` `blocked()` seam first, because `file.erl` routes through
+  `gen_server:call(file_server_2, …)` (`file.erl:3039-3044`); the read path only completes on the
+  `-eval`/single-pass/boot routes, whose context may pump.
 * **A scheduled process's `gen_server:call` to the service cannot complete** — the engine's
   non-blocking `fold_outcome` folds the callee's suspend into `error::blocked()`. Owner:
   **`beam_engine`**.

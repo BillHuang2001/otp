@@ -76,6 +76,8 @@ Grouped by module (exports listed by role; see inline `-moduledoc`/`-doc` for de
 - `{applications, [stdlib]}` (see `syntax_tools.app.src`); `{runtime_dependencies, ["compiler-9.0","erts-16.0","kernel-10.3","stdlib-8.0"]}`.
 - Runtime libs used: `erl_parse`/`erl_scan` (stdlib) for parsing/`revert` compatibility, `prettypr` (in-app), `eunit` via `-include_lib` in `merl_tests.erl` only.
 - No OS/external libraries; no autoconf `configure` in this app (it is pure Erlang).
+- No NIF/runtime-service coupling: `src/` never references `crypto`, `zlib`, `persistent_term`, `ets`, `gen_server`, `os` or `erl_prim_loader`. The only runtime touch points are `file` (kernel) in `erl_comment_scan:file/1` (`file:read_file/1`) and `epp_dodger:parse_file`/`quick_parse_file` (`file:open/2`,`file:close/1`), `unicode:characters_to_list/2` in `erl_comment_scan:file/1`, and `code:load_binary/3` in `merl:compile_and_load/2` (metaprogramming only; `merl:compile/2` goes through `compile:noenv_forms/2`). The `string/1` and `parse/1,3` entry points need no file I/O.
+- BIF surface is otherwise pure: `lists`, `maps` (`to_list`/`from_list`/`merge` in `erl_syntax`), `ordsets`, `sets`, `erlang` (`max`, `error`), `io`/`io_lib`/`proplists`/`filename`/`epp`, plus erlang BIFs `binary_to_list/1`, `bit_size/1`, `is_binary/1`, `list_to_atom/1`, `element/2`, `setelement/3`, `tuple_to_list/1`, `list_to_tuple/1`.
 
 ## Test Strategy
 - Common Test suites live in the sibling `../test/` (owner of `syntax_tools_SUITE.erl` and `merl_SUITE.erl`, plus `syntax_tools_SUITE_data/`); run with `make test` from `../` (test `Makefile` compiles suites with `+nowarn_missing_spec_documented`).
@@ -87,4 +89,5 @@ Grouped by module (exports listed by role; see inline `-moduledoc`/`-doc` for de
 - `../include/merl.hrl` — the `?Q` macro header consumers include.
 - `../test/` — Common Test suites (sibling; read-only from here, escalate write changes to the app root).
 - `../ebin/` — build output (`*.beam`, generated `syntax_tools.app`/`.appup`).
-- `../../compiler/` — biggest downstream consumer of `erl_syntax`/`epp_dodger`; `../../stdlib/` — provides `erl_parse`/`erl_scan`.
+- `../../edoc/`, `../../dialyzer/` (`cerl_prettypr`, `dialyzer_dataflow`), `../../common_test/` (`ct_doctest`, `erl2html2`) and `../../diameter/src/compiler/` — the in-tree source consumers of `erl_syntax`/`erl_prettypr`/`epp_dodger`.
+- `../../compiler/` does **not** depend on `syntax_tools` in its runtime path (`compiler.app.src` lists only `[kernel, stdlib]`; no reference in `compiler/src/`) — only its `test/` suites `-include_lib` `merl.hrl`. `../../stdlib/` provides `erl_parse`/`erl_scan`/`unicode`/`file`.
