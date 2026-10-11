@@ -127,6 +127,44 @@ fn label_map_tolerates_a_sparse_id_space() {
     assert!(matches!(map.resolve(Label(2)), Err(BeamError::BadArg)));
 }
 
+/// A label id defined by two different functions resolves to the **later**
+/// function, in both table shapes.
+///
+/// `build_label_map` now collects the label tables in one traversal into an entry
+/// buffer in `(function index, label id)` order and scatters that same order, so the
+/// write stays last-wins — the invariant the previous two-pass builder had by
+/// construction. The dense table and the sorted sparse table must agree, since the
+/// two backing shapes are chosen purely by id density.
+#[test]
+fn a_label_id_defined_by_two_functions_resolves_to_the_later_one() {
+    let (first, _) = module_with_function(vec![Instr::Label(Label(1)), Instr::Return], Vec::new());
+    let (second, _) = module_with_function(vec![Instr::Label(Label(1)), Instr::Return], Vec::new());
+
+    // Dense: `count = 2`, `max = 1` => the dense slot table is chosen.
+    let mut dense = first.clone();
+    dense.functions.extend(second.functions.clone());
+    let map = build_label_map(&dense);
+    assert_eq!(map.resolve(Label(1)).unwrap(), (1, 0));
+
+    // Sparse: a far-away id forces the sorted fallback, which must agree.
+    let (far, _) = module_with_function(
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Jump {
+                target: Label(9_000_000),
+            },
+            Instr::Label(Label(9_000_000)),
+            Instr::Return,
+        ],
+        Vec::new(),
+    );
+    let mut sparse = first.clone();
+    sparse.functions.extend(far.functions);
+    let map = build_label_map(&sparse);
+    assert_eq!(map.resolve(Label(1)).unwrap(), (1, 0));
+    assert_eq!(map.resolve(Label(9_000_000)).unwrap(), (1, 2));
+}
+
 /// The builder used by tests (`new`/`insert`/`from`) replaces a repeated id
 /// (last wins), exactly like the `BTreeMap` it replaced.
 #[test]
@@ -207,7 +245,7 @@ fn gc_bif_marshalling_errors_propagate_instead_of_branching() {
     let err = machine
         .step_instruction(&module, &labels, 0, 1, &mut ctx)
         .unwrap_err();
-    match err {
+    match *err {
         BeamError::Raise(raise) => assert_eq!(
             raise.reason.as_atom(),
             Some("unsupported_opcode: call: import out of range")
@@ -221,7 +259,9 @@ fn gc_bif_marshalling_errors_propagate_instead_of_branching() {
     let mut machine = Machine::new();
     let mut ctx = MinimalContext::new();
     assert!(matches!(
-        machine.step_instruction(&module, &labels, 0, 1, &mut ctx),
+        machine
+            .step_instruction(&module, &labels, 0, 1, &mut ctx)
+            .map_err(|err| *err),
         Err(BeamError::BadArg)
     ));
 }
@@ -378,7 +418,7 @@ fn step_uncaught_raise(
     let err = machine
         .step_instruction(module, labels, 0, pc, &mut MinimalContext::new())
         .expect_err("the step raises");
-    match err {
+    match *err {
         BeamError::Raise(raise) => {
             let live = raise
                 .live_reason
@@ -490,7 +530,7 @@ fn test_with_no_fail_on_a_module_without_function_clause_is_the_typed_gap() {
     let err = machine
         .step_instruction(&module, &labels, 0, 1, &mut MinimalContext::new())
         .unwrap_err();
-    match err {
+    match *err {
         BeamError::Raise(raise) => assert_eq!(
             raise.reason.as_atom(),
             Some("unsupported_opcode: test: no 'function_clause' atom in the module")
@@ -525,7 +565,7 @@ fn select_val_with_no_fail_on_a_module_without_function_clause_is_the_typed_gap(
     let err = machine
         .step_instruction(&module, &labels, 0, 1, &mut MinimalContext::new())
         .unwrap_err();
-    match err {
+    match *err {
         BeamError::Raise(raise) => assert_eq!(
             raise.reason.as_atom(),
             Some("unsupported_opcode: select_val: no 'function_clause' atom in the module")

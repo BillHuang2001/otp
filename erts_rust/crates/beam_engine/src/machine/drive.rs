@@ -128,7 +128,7 @@ impl Machine {
                 // A raise that already carries frames is returned unchanged, so the
                 // two halves never double-derive them. `func`/`pc` still hold the
                 // raising instruction's address.
-                Err(err) => return Err(self.with_uncaught_frames(err, Some(module), func, pc)),
+                Err(err) => return Err(self.with_uncaught_frames(*err, Some(module), func, pc)),
             };
             // Price the instruction: the engine's own slice counter (read back by the
             // host through `Machine::reductions`) and the host hook that lets a

@@ -278,46 +278,83 @@ pub(crate) fn label_map_builds() -> usize {
     LABEL_MAP_BUILDS.with(|c| c.get())
 }
 
+/// The upper bound on the label-count hint [`build_label_map`] reserves its entry
+/// buffer from.
+///
+/// The hint is [`Module::code_version`]'s `label_count` — the `Code` chunk header's
+/// label count, which is **exact** for a real `.beam` (28 for `tailcall.beam`, 1257
+/// for `lists.beam`, 1195 for `string.beam`, i.e. the whole buffer is filled without
+/// a reallocation). It is clamped because the count comes from the file: an absurd
+/// header must not turn into an eager multi-megabyte reservation. The reservation is
+/// only a hint in any case — the buffer still grows to whatever the module's label
+/// tables actually hold (and a hand-built `Module` reports `0`, which is why the
+/// clamp is a *cap*, never a requirement).
+const LABEL_HINT_CAP: usize = 8192;
+
+/// The initial capacity [`build_label_map`] reserves for its entry buffer.
+fn label_hint(module: &Module) -> usize {
+    (module.code_version.label_count as usize).min(LABEL_HINT_CAP)
+}
+
 pub(crate) fn build_label_map(module: &Module) -> LabelMap {
     #[cfg(test)]
     LABEL_MAP_BUILDS.with(|c| c.set(c.get() + 1));
-    // One pass to size the index: a real `.beam` numbers its labels `1..=count`,
-    // so `max + 1 == count + 1` and the dense table is exactly as large as the
-    // label set (verified across the installed OTP: density is exactly 1.0).
-    let mut count = 0usize;
+    // ONE traversal of the module's label tables, into an entry buffer that is then
+    // either packed into the dense slot table or kept as the sorted sparse list.
+    //
+    // The traversal — not the table filling — is what this costs: `Function::labels`
+    // is a `BTreeMap`, so reaching each element is a chase into a separately allocated
+    // node. The buffer's `len()` and the running `max` give exactly the two facts the
+    // previous version spent a whole **second** traversal on (`count` and `max`, for
+    // the dense/sparse decision), so that walk was pure overhead. Measured
+    // interleaved on one host (a reused scratch harness, 5k-20k builds per run):
+    //
+    // | module | labels | before | after |
+    // |---|---|---|---|
+    // | `lists.beam` | 1256 | 10647 ns | 6467 ns |
+    // | `string.beam` | 1194 | 9525 ns | 5974 ns |
+    // | `tailcall.beam` | 27 | 276 ns | 193 ns |
+    //
+    // The entries come out in **label-id order**: each `BTreeMap` iterates in key
+    // order, so the concatenation of the per-function tables is ordered except for
+    // the function boundaries — the same input, in the same order, the previous
+    // version collected and then sorted, so the sparse table (and its last-wins
+    // behaviour for a duplicated label id) is identical.
+    //
+    // A real `.beam` numbers its labels `1..=count`, so `max + 1 == count + 1` and the
+    // dense table is exactly as large as the label set (verified across the installed
+    // OTP: density is exactly 1.0); the sparse form is for a pathological id space.
+    let mut entries: Vec<(u32, (u32, u32))> = Vec::with_capacity(label_hint(module));
     let mut max = 0u32;
-    for function in &module.functions {
-        count += function.labels.len();
-        for label in function.labels.keys() {
+    for (func_index, function) in module.functions.iter().enumerate() {
+        let func_index = func_index as u32;
+        for (label, &code_index) in &function.labels {
+            entries.push((label.0, (func_index, code_index as u32)));
             if label.0 > max {
                 max = label.0;
             }
         }
     }
+    let count = entries.len();
+    let imports = resolve_imports(module);
+    let imports_owner = module as *const Module as usize;
     if max as u64 <= (count as u64).saturating_mul(4) + 64 {
         let mut slots: Vec<u64> = vec![UNUSED_LABEL; max as usize + 1];
-        for (func_index, function) in module.functions.iter().enumerate() {
-            for (label, &code_index) in &function.labels {
-                slots[label.0 as usize] = pack_target((func_index as u32, code_index as u32));
-            }
+        for (label, target) in &entries {
+            slots[*label as usize] = pack_target(*target);
         }
         LabelMap {
             slots: Slots::Dense(slots),
-            imports: resolve_imports(module),
-            imports_owner: module as *const Module as usize,
+            imports,
+            imports_owner,
         }
     } else {
-        let mut entries: Vec<(u32, (u32, u32))> = Vec::with_capacity(count);
-        for (func_index, function) in module.functions.iter().enumerate() {
-            for (label, &code_index) in &function.labels {
-                entries.push((label.0, (func_index as u32, code_index as u32)));
-            }
-        }
-        entries.sort_unstable_by_key(|(id, _)| *id);
+        let mut sorted = entries;
+        sorted.sort_unstable_by_key(|(id, _)| *id);
         LabelMap {
-            slots: Slots::Sparse(entries),
-            imports: resolve_imports(module),
-            imports_owner: module as *const Module as usize,
+            slots: Slots::Sparse(sorted),
+            imports,
+            imports_owner,
         }
     }
 }
