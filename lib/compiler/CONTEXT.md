@@ -62,6 +62,12 @@ The framework is `src/beam_ssa_opt_budget.erl` (`ssa_opt_budget` / `ssa_opt_fn_b
 - Hashing/serialization: `erlang:md5/1` for the module `vsn`/`FunT` checksum (`src/beam_asm.erl:400`); `term_to_binary` for the `Dbgi`/`Docs`/`Meta` chunks and the literal table (`src/compile.erl:2292,2810,2870`, `src/beam_asm.erl:308-309`, `src/beam_dict.erl:346`).
 - Optional / NOT default-path: `crypto:*` only via `encrypt_debug_info`/`debug_info_key`; `zlib:compress` only with `compressed_literals`; `beam_lib:*` only for debug-info crypto and `strip_types`; `ets:*` only in `cerl_inline` (reached via `inline`/`{core_transform,inline}`); `code:*` only for parse-transform loading and `to_dis`; `erts_debug:flat_size` + `erlang:system_info(wordsize)` only with `time`.
 - Not used anywhere in `src/`: `persistent_term`, `erl_prim_loader`, `open_port`, `unique_integer`.
+- Reporting goes to the group leader only (`io:put_chars`/`io:fwrite`), never `logger`/`error_logger` (grep-clean); with `compile:file(File, [])` and `ERL_COMPILER_OPTIONS` unset nothing is printed at all — see `src/CONTEXT.md` §"Default-path runtime model".
+
+### Artifact determinism (for the Rust-rewrite differential harness)
+- The `.beam` output embeds the source location: the `CInf` chunk carries `{source,Path}` and the OTP-28+ `Line` chunk embeds the source name (stripped relative to the compiler's cwd). So the same source compiled under a different path or cwd yields byte-differing `.beam` files, while all semantic chunks (`AtU8`,`Code`,`StrT`,`ImpT`,`ExpT`,`Meta`,`LocT`,`Attr`,`Type`,`Dbgi`) stay identical; same path + same cwd yields byte-identical files.
+- `deterministic` (`erlc +deterministic` / `{deterministic,true}`) strips both (`CInf` → `[{version,…}]`, `Line` loses the name) and gives byte-identical output across paths — the recommended normalization for `cmp`-ing two compiler artifacts.
+- Alternatively compare semantic chunks, e.g. `beam_lib:chunks(File, ["AtU8","Code","StrT","ImpT","ExpT","Meta","LocT","Attr","Type","Dbgi"])`; requesting a chunk the file lacks (`LitT`/`Docs`/`Abst`) makes `beam_lib:chunks/2` return `{error,{missing_chunk,…}}`. Verified with host OTP 29.1.1.
 
 ## Known Issues
 - A node with `time`/`eprof`/`tprof` options exposes internal pass timing via the process dictionary (`compile__pass_times`) — debugging aid only.
