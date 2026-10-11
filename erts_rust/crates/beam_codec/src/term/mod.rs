@@ -275,14 +275,13 @@ pub fn make_map(
 /// The lowest common ancestor cannot produce a flat map with more than
 /// [`MAP_SMALL_MAP_LIMIT`] pairs: [`beam_term::thing::write_flatmap`] asserts that
 /// limit and [`beam_term::map::write_map`] switches to a **hash map** (a different
-/// term kind with a different interior) above it. `beam_codec` needs the oversized
-/// *flat* map nonetheless: our decoder materializes **every** `MAP_EXT` image as one
-/// flat map, and the encoder must re-emit it byte-exactly in the map's stored order
-/// (see the crate `CONTEXT.md`, §"Map key encode order"). This writer is that
-/// missing LCA entry point, verbatim: it is byte-for-byte the layout
-/// [`beam_term::thing::write_flatmap`] emits for the small case — pinned by
-/// `oversized_flatmap_layout_matches_beam_term` — so a map of any pair count
-/// round-trips as a flat map and every existing reader still applies.
+/// term kind with a different interior) above it. A caller that wants an
+/// order-preserving flat map of **any** pair count — e.g. to re-emit a stored pair
+/// order byte-exactly (see the crate `CONTEXT.md`, §"Map key encode order") — asks
+/// [`make_flatmap`] for it, so this crate supplies the missing LCA entry point: it is
+/// byte-for-byte the layout [`beam_term::thing::write_flatmap`] emits for the small
+/// case — pinned by `oversized_flatmap_layout_matches_beam_term` — so a map of any
+/// pair count round-trips as a flat map and every existing reader still applies.
 ///
 /// Layout (`erl_map.c:673-700`, `erl_map.h:181-199`): the word block
 /// `[arityval(n), k0 … k(n-1), MAP_HEADER_FLATMAP, n, keys, v0 … v(n-1)]`, where

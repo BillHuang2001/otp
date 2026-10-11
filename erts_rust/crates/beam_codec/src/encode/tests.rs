@@ -405,8 +405,8 @@
     #[test]
     fn maps_above_the_small_limit_encode_as_map_ext() {
         // A *flat* map of 40 pairs — past `MAP_SMALL_MAP_LIMIT` (32) — still encodes as a
-        // single `MAP_EXT` in stored order. (A real > 32-pair *hash map* is a different
-        // shape the encoder does not handle; see `tests/map_key_order.rs`.)
+        // single `MAP_EXT` in stored order. (A > 32-pair *hash map* is a different shape,
+        // emitted via `encode_hashmap_pairs`; see `tests/map_key_order.rs`.)
         let mut atoms = AtomTable::new();
         let mut heap = new_heap(4 + 2 * 40 + 64);
         let mut pairs = Vec::new();
