@@ -32,7 +32,7 @@
 //! * the calling module's name, when the runtime knows it ([`BifContext::current_module`])
 //!   — the oracle derives a BIF's call site from it (`erlang:load_nif/2`);
 //! * an expanding set of **optional seams**: an [`OutputSink`] (`io:format`), a
-//!   [`SendHook`] (`send/2`), a [`TableRegistry`] (`ets:*`), an [`AtomInterner`]
+//!   [`SendHook`] (`send/2`/`send/3`), a [`TableRegistry`] (`ets:*`), an [`AtomInterner`]
 //!   (the atom-creating conversions), a [`FunCaller`] (the `fun`-taking
 //!   `lists`/`maps` BIFs), a [`PortHook`] (the
 //!   port BIFs), a [`DictHook`] (the `put/2`/`get/1`/`erase/1`/`get_keys/*`
@@ -135,8 +135,8 @@ impl OutputSink for BytesSink {
 /// Delivers `term` to the process `to` (an internal pid).
 ///
 /// The runtime supplies this over `beam_process`/`beam_message`; Milestone-1 has no
-/// in-crate delivery, so the `send/2` and `"!"/2` BIFs raise `unsupported_bif`
-/// when no hook is installed.
+/// in-crate delivery, so the `send/2`, `"!"/2` and `send/3` BIFs raise
+/// `unsupported_bif` when no hook is installed.
 pub trait SendHook {
     /// Sends `term` to `to`.
     ///
@@ -144,6 +144,65 @@ pub trait SendHook {
     ///
     /// Reports a delivery failure as a [`BeamError`].
     fn send(&mut self, to: Eterm, term: Eterm) -> Result<()>;
+
+    /// Sends `term` to `to` under the `erlang:send/3` `options`.
+    ///
+    /// The default body ignores `options` and delegates to [`SendHook::send`],
+    /// answering [`SendOutcome::Ok`] — which **is** the oracle's behaviour for every
+    /// destination this runtime serves locally (`bif.c::send_3`: all three options
+    /// are no-ops for a local pid). A host that grows a remote/distributed send
+    /// overrides this method to distinguish the two option-sensitive answers the C
+    /// produces ([`SendOutcome::Noconnect`] for `noconnect` when there is no
+    /// connection, [`SendOutcome::Nosuspend`] for `nosuspend` when the send would have
+    /// had to suspend, `bif.c:2733-2746`) instead of folding them into an error.
+    ///
+    /// # Errors
+    ///
+    /// As [`SendHook::send`]: a destination the oracle rejects is
+    /// [`BeamError::BadArg`], and a destination the host cannot serve yet is a typed
+    /// capability gap — **never** a fabricated [`SendOutcome::Ok`].
+    fn send_with_options(
+        &mut self,
+        to: Eterm,
+        term: Eterm,
+        _options: SendOptions,
+    ) -> Result<SendOutcome> {
+        self.send(to, term)?;
+        Ok(SendOutcome::Ok)
+    }
+}
+
+/// The `erlang:send/3` option flags (`bif.c::send_3`, the `while (is_list(l))` walk).
+///
+/// One field per option atom: the list is a *set* of flags, so the same option may
+/// appear more than once and the order is irrelevant. An element that is none of
+/// these three, a non-list or an improper list is `badarg` (rejected by the BIF, not
+/// represented here).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SendOptions {
+    /// The `noconnect` option: do not connect to a node this node is not connected to.
+    pub noconnect: bool,
+    /// The `nosuspend` option: do not suspend the sender if the send would have to block.
+    pub nosuspend: bool,
+    /// The `priority` option: send through the `{priority, …}` alt-activation path.
+    pub priority: bool,
+}
+
+/// The outcome of an options-aware [`SendHook::send_with_options`].
+///
+/// The three variants are the C `send_3`'s three *successful* answers: the atoms `ok`,
+/// `noconnect` and `nosuspend` (`bif.c:2733-2746`). An unreachable destination is an
+/// error, not an outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendOutcome {
+    /// The message was handed to the destination — the answer `ok`.
+    Ok,
+    /// A `noconnect` send with no connection to the destination's node — the answer
+    /// `noconnect`.
+    Noconnect,
+    /// A `nosuspend` send that would have had to suspend the sender — the answer
+    /// `nosuspend`.
+    Nosuspend,
 }
 
 /// Calls an Erlang fun from inside a BIF.

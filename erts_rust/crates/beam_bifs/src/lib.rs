@@ -112,7 +112,7 @@ pub use crate::context::{
     AtomInterner, BifContext, BytesSink, DictHook, FunCaller, LocalFunIdentity, LocalNode,
     MemoryHook, ModuleInfo, NifLoadError, NifLoader, NullSink, OutputSink, PersistentTerm,
     PortHook, ProcessHook, ProcessInfoItem, RecordDefinitionView, RecordFieldView, RecordSource,
-    RuntimeHooks, SendHook, StdoutSink,
+    RuntimeHooks, SendHook, SendOptions, SendOutcome, StdoutSink,
 };
 pub use crate::error::{raise_error, raise_exit, raise_throw};
 pub use crate::ets::TableRegistry;
@@ -138,8 +138,9 @@ pub mod prelude {
         reason_term_from_exit_reason, AtomInterner, BifContext, BifFn, BifRegistry, BytesSink,
         DictHook, FunCaller, LocalFunIdentity, LocalNode, MemoryHook, ModuleInfo, NifLoadError,
         NifLoader, NullSink, OutputSink, PersistentTerm, PortHook, ProcessHook, ProcessInfoItem,
-        RecordDefinitionView, RecordFieldView, RecordSource, RuntimeHooks, SendHook, StdoutSink,
-        TableRegistry, needs_dict_hook, needs_fun_caller, needs_local_fun_identity,
+        RecordDefinitionView, RecordFieldView, RecordSource, RuntimeHooks, SendHook, SendOptions,
+        SendOutcome, StdoutSink, TableRegistry, needs_dict_hook, needs_fun_caller,
+        needs_local_fun_identity,
         needs_local_node, needs_memory_hook, needs_module_info, needs_nif_loader,
         needs_persistent_term, needs_port_hook, needs_process_hook, needs_record_source,
         needs_runtime_hooks, needs_send_hook, DICT_HOOK_BIFS, FUN_CALLER_BIFS,
