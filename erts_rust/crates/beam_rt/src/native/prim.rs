@@ -3528,8 +3528,12 @@ halt(0).
     /// The read-only tree the `#file_info{}` cross-check runs on: a 6-byte `f` (`0644`), a
     /// `0444` copy `g`, a directory `d` and a symlink `l` → `f`.
     ///
-    /// Nothing writes it between the two halves of the comparison, so every `stat` field —
-    /// including the three timestamps — is the same for both runtimes.
+    /// Nothing writes it between the two halves of the comparison, so every `stat` field but
+    /// the symlink's atime is identical for both runtimes. The atime is **not**: resolving a
+    /// symlink refreshes its atime to the traversing run's own wall clock, so
+    /// `read_link_info(l)` can honestly answer a second apart —
+    /// [`assert_file_info_answers_agree`] is what keeps the comparison reliable without
+    /// masking any other difference.
     fn prepare_file_info_tree(dir: &Path) {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::remove_dir_all(dir);
@@ -3543,10 +3547,14 @@ halt(0).
         std::fs::create_dir(dir.join("d")).expect("a directory");
         let _ = std::fs::remove_file(dir.join("l"));
         symlink("f", dir.join("l")).expect("a symlink");
-        // Follow the fresh symlink once: the kernel's relatime rule bumps a symlink's atime on
-        // its first traversal, which would otherwise happen inside one of the two runs and make
-        // the two `read_link_info(l)` answers differ by a second.
-        let _ = std::fs::metadata(dir.join("l"));    }
+        // Follow the fresh symlink once, so the kernel's relatime rule usually applies the
+        // first traversal's atime bump here rather than inside one of the two runs. That
+        // narrows the window but does **not** make the answer deterministic: every traversal
+        // that follows the link refreshes its atime to that run's own wall clock, so
+        // `read_link_info(l)` may still answer a second apart (the tolerance
+        // `assert_file_info_answers_agree` allows).
+        let _ = std::fs::metadata(dir.join("l"));
+    }
 
     /// This runtime's answers to the `#file_info{}` sequence, one compacted rendering per
     /// answer — the exact sequence [`file_info_expression`] performs on the oracle.
@@ -3651,11 +3659,167 @@ halt(0).
         )
     }
 
+    /// Compares the runtime's and the oracle's compacted `#file_info{}` answers, tolerating a
+    /// wall-clock drift of at most **one second** in a `{{Y,M,D},{H,M,S}}` time triple.
+    ///
+    /// Everything else must be byte-identical — every tag, size, mode, type, node/inode-ish
+    /// field, the answer ordering and the answer count — so a real difference still fails
+    /// loudly, with both full answers. Only the time triples may move, and only because the
+    /// two runs read the clock a second apart: following the symlink `l`
+    /// (`read_file_info(l)`, answer `A4`) refreshes its atime to the traversing run's own
+    /// "now", so `read_link_info(l)` (answer `A5`) may legitimately answer a second apart.
+    /// The tolerance is not a mask: a time triple that differs by two seconds — or a
+    /// non-time token that differs at all — is a mismatch.
+    fn assert_file_info_answers_agree(theirs: &[String], ours: &[String]) {
+        assert_eq!(
+            theirs.len(),
+            ours.len(),
+            "the oracle answered {} terms, this runtime {}",
+            theirs.len(),
+            ours.len()
+        );
+        for (index, (theirs, ours)) in theirs.iter().zip(ours).enumerate() {
+            if theirs == ours || answers_differ_only_by_a_second(theirs, ours) {
+                continue;
+            }
+            panic!(
+                "answer #{index} (A{}) of the #file_info{{}} family disagrees with the oracle\n\
+                 --- oracle ---\n{theirs}\n\
+                 --- runtime ---\n{ours}",
+                index + 1
+            );
+        }
+    }
+
+    /// Whether two compacted answers are identical once every `{{Y,M,D},{H,M,S}}` time triple
+    /// is taken out of the comparison — with the corresponding triples differing by at most a
+    /// second. Any other difference (a different skeleton, a different number of time triples,
+    /// or two triples more than a second apart) is `false`.
+    fn answers_differ_only_by_a_second(theirs: &str, ours: &str) -> bool {
+        let (theirs_shape, theirs_times) = split_time_triples(theirs);
+        let (ours_shape, ours_times) = split_time_triples(ours);
+        theirs_shape == ours_shape
+            && theirs_times.len() == ours_times.len()
+            && theirs_times.iter().zip(&ours_times).all(|(theirs, ours)| {
+                (time_triple_scalar(*theirs) - time_triple_scalar(*ours)).abs() <= 1
+            })
+    }
+
+    /// Splits a compacted answer into its *skeleton* — every `{{Y,M,D},{H,M,S}}` time triple
+    /// replaced by a `<t>` marker — and the six numbers of each such triple, in order of
+    /// appearance.
+    fn split_time_triples(answer: &str) -> (String, Vec<[i64; 6]>) {
+        let mut skeleton = String::with_capacity(answer.len());
+        let mut triples = Vec::new();
+        let mut index = 0;
+        while index < answer.len() {
+            if answer.as_bytes()[index] == b'{' {
+                if let Some((end, triple)) = parse_time_triple(answer, index) {
+                    skeleton.push_str("<t>");
+                    triples.push(triple);
+                    index = end;
+                    continue;
+                }
+            }
+            let character = answer[index..].chars().next().expect("a char boundary");
+            skeleton.push(character);
+            index += character.len_utf8();
+        }
+        (skeleton, triples)
+    }
+
+    /// `{{Y,M,D},{H,M,S}}` at `start`, as six numbers plus the index just past the closing
+    /// brace.
+    fn parse_time_triple(text: &str, start: usize) -> Option<(usize, [i64; 6])> {
+        let bytes = text.as_bytes();
+        if bytes.get(start) != Some(&b'{') {
+            return None;
+        }
+        let (after_date, date) = parse_int_triple(text, start + 1)?;
+        if bytes.get(after_date) != Some(&b',') {
+            return None;
+        }
+        let (after_time, time) = parse_int_triple(text, after_date + 1)?;
+        if bytes.get(after_time) != Some(&b'}') {
+            return None;
+        }
+        Some((
+            after_time + 1,
+            [date[0], date[1], date[2], time[0], time[1], time[2]],
+        ))
+    }
+
+    /// `{Int,Int,Int}` at `start`, as the three numbers plus the index just past the closing
+    /// brace.
+    fn parse_int_triple(text: &str, start: usize) -> Option<(usize, [i64; 3])> {
+        let bytes = text.as_bytes();
+        if bytes.get(start) != Some(&b'{') {
+            return None;
+        }
+        let mut index = start + 1;
+        let mut values = [0i64; 3];
+        for (slot, value) in values.iter_mut().enumerate() {
+            let (parsed, next) = parse_int(text, index)?;
+            *value = parsed;
+            index = next;
+            let expected = if slot == 2 { b'}' } else { b',' };
+            if bytes.get(index) != Some(&expected) {
+                return None;
+            }
+            index += 1;
+        }
+        Some((index, values))
+    }
+
+    /// A (possibly signed) decimal integer at `start`, as its value plus the index just past
+    /// its last digit.
+    fn parse_int(text: &str, start: usize) -> Option<(i64, usize)> {
+        let bytes = text.as_bytes();
+        let mut index = start;
+        let negative = bytes.get(index) == Some(&b'-');
+        if negative {
+            index += 1;
+        }
+        let digits = index;
+        let mut value = 0i64;
+        while let Some(digit @ b'0'..=b'9') = bytes.get(index).copied() {
+            let digit = i64::from(digit - b'0');
+            value = value.checked_mul(10)?.checked_add(digit)?;
+            index += 1;
+        }
+        if index == digits {
+            return None;
+        }
+        Some((if negative { -value } else { value }, index))
+    }
+
+    /// One `{{Y,M,D},{H,M,S}}` triple as a single comparable scalar — days since the civil
+    /// epoch × 86400 + the second of the day — so a second's drift across a minute, hour,
+    /// midnight, month or leap-year boundary is still exactly one second.
+    fn time_triple_scalar(triple: [i64; 6]) -> i64 {
+        let [year, month, day, hour, minute, second] = triple;
+        days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second
+    }
+
+    /// The number of days from `1970-01-01` to `year-month-day` in the proleptic Gregorian
+    /// calendar (Howard Hinnant's `days_from_civil`), valid for every date the file system
+    /// can report.
+    fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+        let year = if month <= 2 { year - 1 } else { year };
+        let era = if year >= 0 { year } else { year - 399 } / 400;
+        let year_of_era = year - era * 400;
+        let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+        let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+        era * 146_097 + day_of_era - 719_468
+    }
+
     /// The `#file_info{}` family's oracle cross-check: both `read_*_info` path forms (list and
     /// binary), both symlink answers, all four time options, a bare `time` element, a missing
     /// path with and without an option, a NUL path, a non-path term, and the four
     /// `read_handle_info` answers (a `0644` file, a `0444` file, a closed descriptor, a
-    /// non-descriptor) — every answer rendered compacted and compared line for line.
+    /// non-descriptor) — every answer rendered compacted and compared line for line, with a
+    /// wall-clock drift of at most one second allowed **in the time triples only** (see
+    /// [`assert_file_info_answers_agree`]).
     #[test]
     fn the_file_info_family_agrees_with_the_oracle() {
         let Some(oracle) = resolve_oracle() else {
@@ -3690,10 +3854,69 @@ halt(0).
             .filter(|answer| !answer.is_empty())
             .map(str::to_string)
             .collect();
-        assert_eq!(
-            theirs, ours,
-            "the #file_info{{}} family closed here must agree with the oracle"
-        );
+        assert_file_info_answers_agree(&theirs, &ours);
+    }
+
+    /// The tolerance [`assert_file_info_answers_agree`] grants is exactly one second **and only
+    /// inside** the `{{Y,M,D},{H,M,S}}` time triples: a one-second drift — including one that
+    /// rolls over a minute, an hour, a midnight or a leap day, where the *date* triple differs
+    /// too — is accepted, while a two-second drift, a different non-time field, an answer that
+    /// carries no time triple at all, and an answer a whole day out are all real mismatches.
+    #[test]
+    fn the_file_info_time_tolerance_is_one_second_and_time_only() {
+        // A `read_link_info(l)` answer: a symlink's atime, then its mtime/ctime (held fixed).
+        let answer = |atime: &str| {
+            format!(
+                "{{file_info,6,symlink,read_write,{atime},{{{{2024,5,1}},{{8,0,0}}}},{{{{2024,5,1}},{{8,0,1}}}},41471,1,0,0,42,1000,1000}}"
+            )
+        };
+        let base = answer("{{2024,5,3},{12,34,56}}");
+        assert!(answers_differ_only_by_a_second(
+            &base,
+            &answer("{{2024,5,3},{12,34,57}}")
+        ));
+        assert!(!answers_differ_only_by_a_second(
+            &base,
+            &answer("{{2024,5,3},{12,34,58}}")
+        ));
+        assert!(!answers_differ_only_by_a_second(
+            &base,
+            &answer("{{2024,5,3},{12,35,0}}")
+        ));
+
+        // A second's drift across a minute, an hour, a midnight and a leap day, in both
+        // directions (the scalar is the comparable one, never the fields one by one).
+        for (earlier, later) in [
+            ("{{2024,5,3},{12,34,59}}", "{{2024,5,3},{12,35,0}}"),
+            ("{{2024,5,3},{12,59,59}}", "{{2024,5,3},{13,0,0}}"),
+            ("{{2024,5,3},{23,59,59}}", "{{2024,5,4},{0,0,0}}"),
+            ("{{2023,12,31},{23,59,59}}", "{{2024,1,1},{0,0,0}}"),
+            ("{{2024,2,29},{23,59,59}}", "{{2024,3,1},{0,0,0}}"),
+        ] {
+            assert!(answers_differ_only_by_a_second(
+                &answer(earlier),
+                &answer(later)
+            ));
+            assert!(answers_differ_only_by_a_second(
+                &answer(later),
+                &answer(earlier)
+            ));
+        }
+
+        // Every non-time difference is still a mismatch: another size, no time triple at all
+        // (the posix integer form), and the same clock time one whole day out.
+        assert!(!answers_differ_only_by_a_second(
+            &base,
+            &base.replacen("{file_info,6,", "{file_info,7,", 1)
+        ));
+        assert!(!answers_differ_only_by_a_second(
+            &base,
+            &answer("1714740896")
+        ));
+        assert!(!answers_differ_only_by_a_second(
+            &base,
+            &answer("{{2024,5,4},{12,34,56}}")
+        ));
     }
 
     /// A `function_clause` `Opts` is an **uncaught** raise, never the wrapper's `{error,
