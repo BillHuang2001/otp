@@ -37,6 +37,10 @@
 //!   stdout + exit status are compared (a runtime's boot banner on stderr is not a
 //!   semantic difference). This is the *agreement* evidence: a compiled `.beam` executed
 //!   by the Rust runtime reproduces the oracle's value.
+//! * [`CaseKind::ModuleEnv`] — the same module-run shape, except the two runtimes are
+//!   additionally spawned with an explicit environment and the compiled directory reaches
+//!   the code path **only** through it (an `ERL_AFLAGS`-carried `-pa {dir}`), so the flag's
+//!   *application* — not its recording in `init:get_argument/1` — is pinned (contract A.6).
 //!
 //! Keep the default corpus **small and fast** (smoke level, Part I §C): heavy suites are
 //! milestone-only. Cases are grouped by the contract they exercise:
@@ -97,6 +101,7 @@ mod ets;
 mod ets_access;
 mod ets_spec;
 mod flags;
+mod flags_apply;
 mod math_bifs;
 mod mexec;
 mod mexec_extra;
@@ -258,6 +263,62 @@ pub enum CaseKind {
     /// `-noshell -pa <dir> -eval …` versus the Rust runtime's
     /// `run <dir>/<module>.beam <module>:<fun>/<arity> <args…>`.
     Module(ModuleRun),
+    /// An **environment-variable** module-run case (contract A.6): the module is compiled
+    /// exactly as for [`CaseKind::Module`], but the compiled directory is reachable **only
+    /// through the case environment** — the oracle argv carries **no** `-pa <dir>` — so the
+    /// flag's *application* is what is observed, not its recording.
+    ///
+    /// The key use is `ERL_AFLAGS=-pa {dir}`: the `run` action loads the `.beam` named on its
+    /// command line explicitly, so a genuine discriminator needs the module to call into
+    /// **another** module that lives only in that directory ([`Self::extra`]).
+    ///
+    /// A separate variant (rather than a field on [`CaseKind::Module`]) so the dozens of
+    /// existing module-run literals stay untouched; every case that does not pin an
+    /// environment reports an empty [`Case::env`].
+    ModuleEnv {
+        /// The embedded module both runtimes execute.
+        run: ModuleRun,
+        /// Additional modules compiled into the **same** temp dir as `run`, so a
+        /// cross-module call from `run` resolves only if the case environment really put
+        /// that directory on the code path.
+        extra: &'static [EmbeddedModule],
+        /// The `(name, value)` variables each runtime is spawned with, set **on top of** the
+        /// inherited environment (which is never cleared). A value may embed
+        /// [`DIR_PLACEHOLDER`], which the harness substitutes with the compiled module's
+        /// temp dir — the directory is not known until after the compile.
+        env: &'static [(&'static str, &'static str)],
+    },
+}
+
+/// The literal token a [`CaseKind::ModuleEnv`] environment value uses for the compiled
+/// module's temporary directory — known only **after** the compile, so the harness
+/// substitutes it at run time (see [`expand_env`]).
+pub const DIR_PLACEHOLDER: &str = "{dir}";
+
+/// A second module compiled into the same temp dir as a [`CaseKind::ModuleEnv`] case's
+/// [`ModuleRun`], so a cross-module call resolves only through that case's environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmbeddedModule {
+    /// The module name (must match the `-module` attribute in `source`).
+    pub module: &'static str,
+    /// The embedded Erlang source, compiled with the system `erlc` into the case's dir.
+    pub source: &'static str,
+}
+
+/// Substitute [`DIR_PLACEHOLDER`] in each of `env`'s values with `dir`.
+///
+/// This is what turns a case's static `ERL_AFLAGS=-pa {dir}` into the real spawn environment
+/// once the compiled module's temporary directory is known (see [`CaseKind::ModuleEnv`]).
+pub fn expand_env(env: &[(&str, &str)], dir: &Path) -> Vec<(String, String)> {
+    let dir = dir.display().to_string();
+    env.iter()
+        .map(|(name, value)| {
+            (
+                (*name).to_string(),
+                value.replace(DIR_PLACEHOLDER, &dir),
+            )
+        })
+        .collect()
 }
 
 /// One embedded-module function invocation (the data of a [`CaseKind::Module`] case).
@@ -313,6 +374,13 @@ impl ModuleRun {
         )
     }
 
+    /// The oracle argv of a [`CaseKind::ModuleEnv`] case: `-noshell -eval <oracle_eval>`
+    /// with **no** `-pa <dir>` — the compiled directory must reach the code path through the
+    /// case environment alone (see [`CaseKind::ModuleEnv`]).
+    pub fn oracle_argv_env_only(&self) -> Vec<String> {
+        eval_argv_owned(&self.oracle_eval(), &[])
+    }
+
     /// The Rust runtime argv: `run <dir>/<module>.beam <module>:<fun>/<arity> <args…>`.
     pub fn rust_argv(&self, dir: &Path) -> Vec<String> {
         let mut argv = vec![
@@ -344,14 +412,14 @@ impl Case {
     /// The full probe expression handed to both runtimes for this case.
     ///
     /// For a [`CaseKind::Eval`] case this is the self-terminating probe wrapper; for a
-    /// [`CaseKind::Module`] case it is the oracle's `io:format` expression (the Rust
-    /// runtime is invoked through its `run` action instead — see [`CaseKind::Module`]).
+    /// module-run case ([`CaseKind::Module`] / [`CaseKind::ModuleEnv`]) it is the oracle's
+    /// `io:format` expression (the Rust runtime is invoked through its `run` action instead).
     pub fn eval(&self) -> String {
         match &self.kind {
             CaseKind::Eval { expr, probe, .. } | CaseKind::EvalEnv { expr, probe, .. } => {
                 probe_expr(expr, *probe)
             }
-            CaseKind::Module(run) => run.oracle_eval(),
+            CaseKind::Module(run) | CaseKind::ModuleEnv { run, .. } => run.oracle_eval(),
         }
     }
 
@@ -360,7 +428,7 @@ impl Case {
     pub fn kind_label(&self) -> &'static str {
         match &self.kind {
             CaseKind::Eval { probe, .. } | CaseKind::EvalEnv { probe, .. } => probe.as_str(),
-            CaseKind::Module(_) => "module-run",
+            CaseKind::Module(_) | CaseKind::ModuleEnv { .. } => "module-run",
         }
     }
 
@@ -368,7 +436,7 @@ impl Case {
     pub fn expr(&self) -> Option<&'static str> {
         match &self.kind {
             CaseKind::Eval { expr, .. } | CaseKind::EvalEnv { expr, .. } => Some(expr),
-            CaseKind::Module(_) => None,
+            CaseKind::Module(_) | CaseKind::ModuleEnv { .. } => None,
         }
     }
 
@@ -376,15 +444,19 @@ impl Case {
     pub fn extra_argv(&self) -> &'static [&'static str] {
         match &self.kind {
             CaseKind::Eval { extra_argv, .. } | CaseKind::EvalEnv { extra_argv, .. } => extra_argv,
-            CaseKind::Module(_) => &[],
+            CaseKind::Module(_) | CaseKind::ModuleEnv { .. } => &[],
         }
     }
 
     /// The explicit environment the runtimes are spawned with (`&[]` for every case that
-    /// does not pin the `ERL_*FLAGS` merge — see [`CaseKind::EvalEnv`]).
+    /// does not pin a spawn environment — see [`CaseKind::EvalEnv`] and
+    /// [`CaseKind::ModuleEnv`]).
+    ///
+    /// A [`CaseKind::ModuleEnv`] value may embed [`DIR_PLACEHOLDER`]; the harness expands it
+    /// once the module is compiled ([`expand_env`]).
     pub fn env(&self) -> &'static [(&'static str, &'static str)] {
         match &self.kind {
-            CaseKind::EvalEnv { env, .. } => env,
+            CaseKind::EvalEnv { env, .. } | CaseKind::ModuleEnv { env, .. } => env,
             CaseKind::Eval { .. } | CaseKind::Module(_) => &[],
         }
     }
@@ -432,6 +504,7 @@ fn build_corpus() -> Vec<Case> {
     cases.extend(boot_prereq::group());
     cases.extend(boot_extra::group());
     cases.extend(flags::group());
+    cases.extend(flags_apply::group());
     cases.extend(mexec::group());
     cases.extend(mexec_extra::group());
     cases.extend(modules::group());
@@ -470,7 +543,7 @@ pub fn probe_expr(expr: &str, probe: Probe) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{cases, find_case, probe_expr, CaseKind, Contract, Probe};
+    use super::{cases, expand_env, find_case, probe_expr, CaseKind, Contract, Probe, DIR_PLACEHOLDER};
     use std::collections::HashSet;
 
     #[test]
@@ -523,7 +596,7 @@ mod tests {
         let mut env_cases = 0;
         for case in cases() {
             match &case.kind {
-                CaseKind::EvalEnv { env, .. } => {
+                CaseKind::EvalEnv { env, .. } | CaseKind::ModuleEnv { env, .. } => {
                     env_cases += 1;
                     assert!(
                         !env.is_empty(),
@@ -540,7 +613,7 @@ mod tests {
                 CaseKind::Eval { .. } | CaseKind::Module(_) => {
                     assert!(
                         case.env().is_empty(),
-                        "case {}: only an EvalEnv case may set an environment",
+                        "case {}: only an EvalEnv/ModuleEnv case may set an environment",
                         case.id
                     );
                 }
@@ -591,7 +664,7 @@ mod tests {
                         );
                     }
                 }
-                CaseKind::Module(run) => {
+                CaseKind::Module(run) | CaseKind::ModuleEnv { run, .. } => {
                     assert!(
                         !run.source.is_empty() && run.source.contains("-module("),
                         "case {}: suspicious module source",
@@ -723,6 +796,97 @@ mod tests {
         assert!(
             module_cases >= 20,
             "the corpus must carry a broad set of module-run agreement cases (got {module_cases})"
+        );
+    }
+
+    /// The `ModuleEnv` variant: an environment-variable **module-run** case, whose compiled
+    /// directory reaches the code path only through its environment (contract A.6).
+    #[test]
+    fn module_env_cases_are_registered_and_well_formed() {
+        let mut module_cases = 0;
+        for case in cases() {
+            let CaseKind::ModuleEnv { run, extra, env } = &case.kind else {
+                continue;
+            };
+            module_cases += 1;
+            assert_eq!(case.kind_label(), "module-run");
+            assert_eq!(case.expr(), None);
+            assert!(case.extra_argv().is_empty());
+            assert_eq!(case.env(), *env, "case {}: the env accessor agrees", case.id);
+            assert!(
+                !env.is_empty(),
+                "case {}: a ModuleEnv case must set an environment",
+                case.id
+            );
+            assert!(
+                case.contracts.contains(&Contract::Cli),
+                "case {}: an A.6 flag-application case must claim the CLI contract",
+                case.id
+            );
+            assert!(
+                !run.source.is_empty() && run.source.contains("-module("),
+                "case {}: suspicious module source",
+                case.id
+            );
+            // The oracle argv carries **no** `-pa <dir>`: the directory must be reachable
+            // through the environment alone, which is what makes this an *application* test.
+            assert_eq!(
+                run.oracle_argv_env_only(),
+                vec![
+                    "-noshell".to_string(),
+                    "-eval".to_string(),
+                    run.oracle_eval(),
+                ],
+                "case {}: a ModuleEnv oracle argv must not carry -pa",
+                case.id
+            );
+            for helper in *extra {
+                assert!(
+                    helper.source.contains(&format!("-module({}", helper.module)),
+                    "case {}: helper source does not declare {}",
+                    case.id,
+                    helper.module
+                );
+            }
+            // The helper(s) can only be found through the environment's `-pa`, so at least
+            // one value must name the compiled directory — through the placeholder, since
+            // the directory does not exist until the module is compiled.
+            if !extra.is_empty() {
+                assert!(
+                    env.iter()
+                        .any(|(_, value)| value.contains(DIR_PLACEHOLDER)),
+                    "case {}: the env must put the compiled dir on the code path via \
+                     {DIR_PLACEHOLDER}",
+                    case.id
+                );
+            }
+        }
+        assert!(
+            module_cases > 0,
+            "the corpus must carry environment-variable module-run cases"
+        );
+    }
+
+    /// [`expand_env`] replaces every [`DIR_PLACEHOLDER`] occurrence — in the **values** only,
+    /// never the names — and passes a value without one through unchanged.
+    #[test]
+    fn expand_env_substitutes_every_placeholder_in_the_values_only() {
+        let env = [("ERL_AFLAGS", "-pa {dir}"), ("OTHER", "{dir}/x{dir}")];
+        assert_eq!(
+            expand_env(&env, std::path::Path::new("/tmp/compiled")),
+            vec![
+                ("ERL_AFLAGS".to_string(), "-pa /tmp/compiled".to_string()),
+                (
+                    "OTHER".to_string(),
+                    "/tmp/compiled/x/tmp/compiled".to_string()
+                ),
+            ]
+        );
+        assert!(expand_env(&[], std::path::Path::new("/x")).is_empty());
+        assert_eq!(
+            expand_env(&[("A", "b")], std::path::Path::new("/x")),
+            vec![("A".to_string(), "b".to_string())],
+            "a value without the placeholder is unchanged"
         );
     }
 
