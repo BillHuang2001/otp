@@ -1390,11 +1390,24 @@ mod tests {
     use std::path::Path;
     use std::time::{Duration, Instant};
 
+    /// The generous outer **hang guard** for this suite's waits.
+    ///
+    /// Every wait below polls the *condition* it is after — the child has exited, the once-only
+    /// status is reported, the read path latched end-of-file — so it ends as soon as the
+    /// condition holds, however heavily the host is loaded; the child is waited on for as long
+    /// as it actually takes. This bound is deliberately **not** a budget tuned for an idle host
+    /// (a 5-second cap of exactly that shape was the flake: on a loaded host the child needs far
+    /// longer than that to be scheduled, run and be reaped). It exists only so a genuinely
+    /// broken driver fails a test in bounded time instead of hanging the suite, and a healthy
+    /// run returns long before it.
+    const WAIT_HANG_GUARD: Duration = Duration::from_secs(60);
+
     /// Drives `driver`'s readiness loop until its input stream latches end-of-file.
     ///
-    /// Bounded, so a broken driver fails the test instead of hanging it; the poll is retried on
-    /// `EINTR`, which the `SIGCHLD` deliveries of the parallel cases in this binary make a
-    /// normal outcome.
+    /// Waits on the **condition** (the end-of-file latch) under [`WAIT_HANG_GUARD`], never on a
+    /// wall-clock budget tuned for an idle host, so a loaded host cannot fail it; the poll is
+    /// retried on `EINTR`, which the `SIGCHLD` deliveries of the parallel cases in this binary
+    /// make a normal outcome.
     fn drive_to_eof(driver: &mut SpawnDriver) {
         let mut poller = Poller::new().expect("a poll set");
         let mut input = ByteQueue::new();
@@ -1410,7 +1423,7 @@ mod tests {
             );
             driver.start(&mut ctx).expect("the stdout registration");
         }
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + WAIT_HANG_GUARD;
         while !driver.eof() && Instant::now() < deadline {
             let events = loop {
                 match poller.poll(Some(Duration::from_millis(100))) {
@@ -1439,6 +1452,30 @@ mod tests {
         }
         assert!(driver.eof(), "the child's end-of-file is latched");
     }
+
+    /// Waits for the child's once-only `{exit_status, N}` report under [`WAIT_HANG_GUARD`].
+    ///
+    /// It polls the **condition** — the status has arrived — rather than a wall-clock budget
+    /// tuned for an idle host, so a loaded host does not fail it; the guard only stops a
+    /// genuinely broken driver from hanging the suite.
+    ///
+    /// The driver's own reap is a caching `try_wait` (`ChildProc::try_wait`), so asking it
+    /// again is idempotent: this neither double-reaps nor races the driver's teardown, and the
+    /// status stays available for the `stop`/`Drop` path.
+    fn wait_for_exit_status(driver: &mut SpawnDriver) -> i32 {
+        let deadline = Instant::now() + WAIT_HANG_GUARD;
+        loop {
+            if let Some(status) = driver.take_exit_status().expect("the wait succeeds") {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the child's exit status arrives within the hang guard"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// A `{spawn, Command}` spec (the shell form).
     fn shell(command: &str) -> SpawnSpec {
         SpawnSpec::Spawn {
@@ -1615,17 +1652,11 @@ mod tests {
             "the empty stdout reaches end of file"
         );
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut status = None;
-        while status.is_none() && Instant::now() < deadline {
-            status = driver.take_exit_status().expect("the wait succeeds");
-            if status.is_none() {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        }
+        let status = wait_for_exit_status(&mut driver);
+
         assert_eq!(
             status,
-            Some(libc::EACCES),
+            libc::EACCES,
             "the child exits with the errno its `exec` failed with"
         );
         assert_eq!(
@@ -1664,15 +1695,9 @@ mod tests {
         );
         drive_to_eof(&mut driver);
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut status = None;
-        while status.is_none() && Instant::now() < deadline {
-            status = driver.take_exit_status().expect("the wait succeeds");
-            if status.is_none() {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        }
-        assert_eq!(status, Some(libc::ENOENT), "the child's `chdir` errno");
+        let status = wait_for_exit_status(&mut driver);
+
+        assert_eq!(status, libc::ENOENT, "the child's `chdir` errno");
     }
 
     #[test]
@@ -1702,15 +1727,9 @@ mod tests {
         );
         drive_to_eof(&mut driver);
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut status = None;
-        while status.is_none() && Instant::now() < deadline {
-            status = driver.take_exit_status().expect("the wait succeeds");
-            if status.is_none() {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        }
-        assert_eq!(status, Some(libc::ENOEXEC), "the child's `exec` errno");
+        let status = wait_for_exit_status(&mut driver);
+
+        assert_eq!(status, libc::ENOEXEC, "the child's `exec` errno");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1761,9 +1780,9 @@ mod tests {
         }
         assert_eq!(poller.len(), 1, "only stdout is registered by `start`");
 
-        // Drive the real readiness loop until the child's EOF is latched (bounded, so a
-        // broken driver fails the test instead of hanging it).
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Drive the real readiness loop until the child's EOF is latched — waiting on the
+        // *condition* under the suite's hang guard, never on a budget tuned for an idle host.
+        let deadline = Instant::now() + WAIT_HANG_GUARD;
         while !driver.eof() && Instant::now() < deadline {
             let events = poller.poll(Some(Duration::from_millis(100))).expect("poll");
             if events
@@ -1795,15 +1814,9 @@ mod tests {
             ..SpawnOptions::default()
         };
         let mut driver = SpawnDriver::new(&shell("exit 7"), &options).expect("the shell starts");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut status = None;
-        while status.is_none() && Instant::now() < deadline {
-            status = driver.take_exit_status().expect("the wait succeeds");
-            if status.is_none() {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        }
-        assert_eq!(status, Some(7));
+        let status = wait_for_exit_status(&mut driver);
+
+        assert_eq!(status, 7);
         assert_eq!(
             driver.take_exit_status().expect("the wait succeeds"),
             None,
@@ -1821,15 +1834,9 @@ mod tests {
         };
         let mut driver =
             SpawnDriver::new(&shell("kill -9 $$"), &options).expect("the shell starts");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut status = None;
-        while status.is_none() && Instant::now() < deadline {
-            status = driver.take_exit_status().expect("the wait succeeds");
-            if status.is_none() {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        }
-        assert_eq!(status, Some(128 + 9));
+        let status = wait_for_exit_status(&mut driver);
+
+        assert_eq!(status, 128 + 9);
     }
 
     #[test]

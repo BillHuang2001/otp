@@ -63,6 +63,13 @@
 //! the `erlang:statistics(runtime)` counter with the oracle's `{Total, SinceLastCall}`
 //! semantics.
 //!
+//! The [`fs_access`] module is the **filesystem-access / process-credential facility** — a safe
+//! `access(2)`/`geteuid(2)`/`getegid(2)` floor behind [`path_access`] (the `#file_info{}`
+//! `access` slot), [`access`]/[`try_access`] (the single-check forms, the latter errno-preserving
+//! so a caller can reproduce the oracle's `error:enoent`/`error:eacces`) and
+//! [`process_credentials`], the raw work `beam_rt`'s native `file`/`filelib` floor cannot do
+//! itself.
+//!
 //! The [`io_device`] module is the **io-device request layer** — the DEVICE SIDE of the
 //! incremental `{get_until, Enc, Prompt, Mod, Func, XtraArgs}` request of the `io`
 //! protocol: [`IoDevice`] reproduces `file_io_server`'s read loop (read sizes, the
@@ -106,6 +113,7 @@ pub mod cpu_time;
 pub mod ddll;
 pub mod driver;
 pub mod drivers;
+pub mod fs_access;
 pub mod io_device;
 pub mod poller;
 pub mod port;
@@ -122,6 +130,7 @@ pub use crate::cpu_time::*;
 pub use crate::ddll::*;
 pub use crate::driver::*;
 pub use crate::drivers::*;
+pub use crate::fs_access::*;
 pub use crate::io_device::*;
 pub use crate::poller::*;
 pub use crate::port::*;
@@ -147,13 +156,15 @@ pub use crate::timer::*;
 /// [`Disposition`], [`SignalFacility`]), the dynamic-library primitive ([`DynLib`],
 /// [`DynLibFlags`], [`DllError`], [`DllErrorKind`], [`ERRCODE_TAB`], [`format_error_text`])
 /// and the CPU-time facility ([`CpuTimes`], [`process_cpu_times`], [`thread_cpu_times`],
-/// [`RuntimeClock`]) into scope.
+/// [`RuntimeClock`]) and the filesystem-access facility ([`AccessMode`], [`access`],
+/// [`try_access`], [`path_access`], [`process_credentials`]) into scope.
 pub mod prelude {
     pub use crate::abi::*;
     pub use crate::cpu_time::*;
     pub use crate::ddll::*;
     pub use crate::driver::*;
     pub use crate::drivers::*;
+    pub use crate::fs_access::*;
     pub use crate::io_device::*;
     pub use crate::poller::*;
     pub use crate::port::*;
