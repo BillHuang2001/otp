@@ -109,18 +109,19 @@ headed `binary`/`encoding`; otherwise the reply is the **value** `{error,enotsup
 * **Other io-device requests stay the typed `unsupported` gap** — `pread`/`pwrite`/`advise`/
   `allocate`/`read_handle_info`, the legacy `put_chars` arities, and a non-`latin1`
   `put_chars`/`get_chars` encoding.
-* **A scheduled process's `gen_server:call` to the service cannot complete** — the engine's
-  non-blocking `fold_outcome` folds the callee's suspend into `error::blocked()`. Owner:
-  **`beam_engine`**. This is now the **only** remaining in-process-compilation blocker from this
-  node's side: `epp:open/2` (`-eval` route included) dies with
-  `unsupported: opcode: run: process blocked (no message available)` because `epp` **spawns** an
-  `epp` server (`epp.erl:386`) — the file-server gaps it would otherwise hit (write mode,
-  `io:setopts/2` on a device) are closed.
+* **A scheduled process's incremental io-device read cannot complete** — `file:read/2` and
+  `file:read_line/1` from a scheduled `run` fold into `unsupported: opcode: run: process blocked
+  (no message available)` (they agree with the oracle under `-eval`); the whole-file service requests
+  (`file:read_file/1`, `file:write_file/2`, `file:open/2` for read and write, `file:close/1`,
+  `file:list_dir/1`, `file:get_cwd/0`) complete from a scheduled process. Owner: **`beam_engine`**
+  (a nested run's `receive … after T` timeout does not fire). `epp:open/2` (`-eval` route included)
+  still dies with the same `blocked` gap because `epp` **spawns** an `epp` server (`epp.erl:386`) —
+  the file-server gaps it would otherwise hit (write mode, `io:setopts/2` on a device) are closed.
 * **The io-device read path completes from library code, `{get_line,…}` included.**
   `io:request/2` loads the `io` module body, `net_kernel:dflag_unicode_io/1` is served (the
   `RuntimeHooks` bridge) and the service answers with the tag **paired** to the request, so
   `file:read/2`, `io:scan_erl_exprs/4`, `io:parse_erl_exprs/4` and `file:read_line/1` all complete
-  and agree with the oracle — the first three in `../../tests/io_scan.rs`, `file:read_line/1` through
+  and agree with the oracle on the `-eval` route — the first three in `../../tests/io_scan.rs`, `file:read_line/1` through
   the `{get_line,…}` arm above, cross-checked by
   [`get_line/tests.rs`](get_line/tests.rs)'s `the_replies_match_the_live_oracle`.
 ## Constraints

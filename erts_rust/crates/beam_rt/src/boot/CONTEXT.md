@@ -192,15 +192,17 @@ valve **only** for the documented off-heap-payload capability gap, where the ori
 because it cannot be duplicated.
 
 ### Remaining gaps (owner per link)
-1. **`beam_engine`'s `call_fun` arm + `beam_rt`'s `apply_fun`.** A **scheduled** process's `file:*` call reaches the native `file_server_2` service through `gen:call/4`'s `do_for_proc/2`, which applies a **fun**.
-   That apply is `call_fun` → `ExecutionContext::apply_fun` → `../context/mod.rs::run_label_blocking`, a **value**-returning seam that a slice context may not pump, so the closure's blocking `receive` folds into the typed `error::blocked()` instead of suspending (pinned by `../context/mod.rs::blocking_fun_apply`'s control case).
-   The `apply`/`apply_last` opcode family has no such gap: `families/funs.rs::apply_target` consults `ExecutionContext::resolve_external_call` first and enters a resolved callee **in-machine**.
-   A boot `{apply, …}` directive and the `-eval` path are unaffected — both run on a blocking-aware, pump-capable entry.
+1. **`beam_engine` — a nested run's `receive … after T` timeout does not fire.** The whole-file `file`
+   family completes from a scheduled process, but the **incremental io-device read** (`file:read/2`,
+   `file:read_line/1`) from a scheduled process exits 3 (`unsupported: opcode: run: process blocked
+   (no message available)`) where the `-eval`/pump-capable route agrees with the oracle; it is item 7 of
+   [`../M1_GAPS.md`](../M1_GAPS.md)'s OTP-lifecycle survey.
 2. **`beam_rt` `../native/` — the io-device read path completes from library code.**
    `{get_until,Enc,_Prompt,Mod,Func,XtraArgs}` and `{get_line,Enc,_Prompt}` are both real request arms
    (`../native/file_server.rs` dispatches each to `get_until::serve`/`get_line::serve`), so
    `file:read/2`, `io:scan_erl_exprs/4` and `io:parse_erl_exprs/4` complete and agree with the oracle
-   (`../tests/io_scan.rs`), and `io:get_line/2`/`file:read_line/1` through the `{get_line,…}` arm
+   on the `-eval` route (`../tests/io_scan.rs`), and `io:get_line/2`/`file:read_line/1` through the
+   `{get_line,…}` arm
    (the colocated `file_server/get_line/tests.rs`).
    Residual typed gaps in that family include a request `Enc` that is neither `latin1` nor `unicode`
    (`../native/file_server/get_line.rs`'s request-encoding check, `../native/file_server/get_until.rs`'s)
@@ -287,10 +289,10 @@ precedent), so the runner never executes it and `ProcessEntry` needs no new vari
 the replies, which is what lets `c:erlangrc/0`'s `gen_server:call` at instruction 20 complete. The
 request/reply surface, the errno mapping, the io-device and the remaining gaps live in
 [`../native/CONTEXT.md`](../native/CONTEXT.md)'s `file_server.rs` subsection.
-- **Starting the real `file_server` is not a substitute.** Its `gen_server:init_it` registers, acks
-  and then enters `loop`'s `receive` — a suspend the engine's non-blocking `fold_outcome` folds into
-  `error::blocked()` for a **scheduled** process (owner: `beam_engine`; the seam is pinned by
-  `../tests/proc_lib_start.rs`), so the child dies right after acking. A native service sidesteps that.
+- **The native service is used instead of the real `file_server`.** The real Erlang
+  `file_server`/`file_io_server` needs the wider `prim_file` NIF surface this runtime does not serve;
+  the native `std::fs`-backed service answers the requests it can honour faithfully and returns the
+  typed `unsupported` gap for the rest (below).
 - **The native service is deliberately narrow.** It serves the `file_server`/`file`/`io` requests a
   native `std::fs` host (or, for the two incremental readers, the engine) can answer faithfully and
   returns the typed `unsupported` gap for the rest — `setopts`/`getopts`/`pread`/`pwrite`/`advise`/
