@@ -68,7 +68,7 @@ Single-threaded scheduler, mailbox, signals, GC roots, PCB state:
     `alloc_pid` + `HeapPolicy::from_spawn_opts(min_heap, min_bin_vheap, fullsweep)` +
     `Process::with_policy_and_priority` + `ProcessTable::insert` + priority-correct enqueue, and
     `{link,_}`/`{monitor,_}` through the table. The applied heap policy is proven to have reached the
-    collector honestly via `Collector::policy()` (and its `fullsweep_due`/initial-space sizing). This
+    collector honestly via `AnyCollector::policy()` (and its `fullsweep_due`/initial-space sizing). This
     is the contract the sibling `beam_rt`/`beam_bifs` spawn-option path adopts.
 15. `ports.rs` — `PortTable` relationship round-trips + `ProcessTable::port_closed` (`{'DOWN', …}` for
     a monitor, `{'EXIT', Port, Reason}` for a trapping linked process, termination for a non-trapping
@@ -264,7 +264,54 @@ SMP pool:
     named-monitor DOWN (`from == system`), a remote DOWN and a remote EXIT (`from == node`, body still the
     external pid), and the collection case (a nursery GC then `is_immediate(from)` + `from` unchanged,
     the relocated payload still carrying `{Name,Node}`). **5 of the 6 FAIL on the pre-fix code** (which
-    stored an on-heap `from`) — verified by reverting.## Constraints
+    stored an on-heap `from`) — verified by reverting.
+36. `collector_dispatch.rs` (4 tests) — the **GC strategy dispatch on the production `Process`
+    path**: `Process` owns a `beam_gc::AnyCollector`, so the mature generation a real process collects
+    with is the one its heap policy resolves to. (i) `a_runtime_spawned_process_selects_the_strategy_its_policy_implies`
+    spawns through the production entry point (`ProcessTable::spawn(policy)`) and asserts
+    `collector().kind()` — `MatureKind::Immix` for `initial_mature_words >= beam_gc::IMMIX_BREAK_EVEN_WORDS`
+    (with `mature_choice().source == Automatic`), `Copying` one word below and for the default policy;
+    **this assertion has no pre-change counterpart** (the field was the concrete `Collector`, so no
+    strategy question could be asked of a process). (ii)
+    `the_default_process_keeps_the_pre_change_collection_cadence` pins the default's
+    `CollectionKind` sequence literally (`[Minor × 4]`, `minor_gcs == 4`, zero majors — the default
+    `fullsweep_after = 65_535` never fires) and the growth seam's kind. (iii)
+    `the_selected_strategy_collects_through_the_process` plants live x-register/stack/mailbox roots and
+    asserts they survive structurally across three `collect()`s + `ensure_capacity` +
+    `collect_if_needed` + a later delivery, for **both** a default and an Immix-configured process; and
+    `an_immix_process_survives_a_fullsweep_through_the_process` gives the Immix process
+    `fullsweep_after = 0` (the rule reads the mature *size*, so the policy still resolves to Immix) and
+    drives three real **GenImmix fullsweeps** through `Process::collect` (`CollectionKind::Major`).
+    Deterministic — the strategy/kind assertions and the fixed collect counts, no sleeps / wall-clock
+    bounds / oracle.
+37. `off_heap_binaries.rs` (9 tests) — the **process-owned off-heap refc-binary list and its sweep**
+    (`Process::register_off_heap_binary`/`off_heap_binary`/`off_heap_binaries`/`off_heap_binary_count`/
+    `off_heap_binary_bytes`/`declare_off_heap_binary_dead`/`sweep_off_heap_binaries`/
+    `retain_off_heap_binaries`, over the `beam_gc::OffHeap` the process owns). **(Acceptance 1)**
+    `a_live_owned_binary_survives_a_sweep_and_a_collection`: a 200-byte off-heap payload named by a real
+    on-heap `[BinRef][ErlSubBits]` pair rooted in `x(0)` (so a genuine reference is relocated) and also
+    held by a second counted handle survives both a sweep and a `Process::collect` **byte-intact**
+    (`as_bytes()` unchanged, same `data_ptr`) at a consistent refcount (neither over- nor
+    under-decremented). **(Acceptance 2)** `a_declared_dead_owned_binary_is_released_exactly_once`: on an
+    **injected** `AllocRef` the declared-dead payload's block/byte accounting drops to 0
+    (`live_blocks`/`live_bytes`), a second sweep of the same slot releases nothing and the destructor
+    never runs again. **(Acceptance 3)** `slot_indices_stay_valid_across_a_sweep`: a surviving entry
+    keeps its original slot (intact), the released slot resolves to `None` — never to an unrelated
+    shifted-in entry (the list never shifts/reorders/reuses a slot) — and a fresh registration appends at
+    a new index. Plus: `a_sweep_never_frees_a_payload_another_owner_still_holds` (the no-over-decrement
+    half), `a_collection_drives_the_off_heap_sweep` (a rooted collection reclaims a declared death on its
+    own, leaving an undeclared sibling untouched), `registering_a_payload_twice_keeps_one_slot_and_one_reference`
+    (the `MSO(p)` one-reference-per-object invariant), `a_dropped_process_releases_the_binaries_it_still_owns`
+    (the process-death reclamation endpoint of the conservative fallback), `a_faithful_liveness_predicate_can_drive_the_sweep`
+    (the `retain_off_heap_binaries` seam for a party that *can* walk the heap) and
+    `a_collection_without_a_declaration_releases_nothing` (the conservative default). **Every assertion
+    fails to compile on the pre-change code** — HEAD had no process-owned off-heap list and no sweep on
+    the process path, so the registration/read/sweep API does not exist; the released-count and
+    slot-resolution assertions have no old-code counterpart (there was no list to release from).
+    Deterministic — a fixed position-dependent payload, an injected allocator, explicit
+    `collect()`/sweep calls; no sleeps / wall-clock bounds / oracle.
+
+## Constraints
 - **Anti-flakiness (BINDING).** Every assertion is forced by **synchronization**, never a bare
   `std::thread::sleep`: `mpsc` channels + `recv_timeout` carry the completion signals,
   `std::sync::Barrier`/gates coordinate concurrency, and `SchedulerPool::wait_idle(Some(timeout))` is
@@ -282,22 +329,25 @@ SMP pool:
 - Run the whole crate gate with
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_process` (never `cd`,
   sandbox `$HOME` is read-only). Cross-checks against the real system ERTS belong to the sibling
-  `../../../tools/differential/` harness, not here. Current: **427 passed, 0 failed, 1 ignored**.
+  `../../../tools/differential/` harness, not here. Current: **441 passed, 0 failed, 1 ignored**.
 
 ## Routing Table
 - `scheduler.rs`, `messaging.rs`, `signals.rs`, `gc.rs`, `priority.rs`, `pending_signals.rs`,
   `preemption.rs`, `dict.rs`, `fragments.rs`, `scheduler_ports.rs`, `exhaustion.rs`,
   `signal_exhaustion.rs`, `gc_exemption.rs`, `message_relocation.rs`, `gc_refc_binary_message.rs`,
-  `off_heap_send_isolation.rs`, `message_from_is_immediate.rs` →
+  `off_heap_send_isolation.rs`, `message_from_is_immediate.rs`, `off_heap_binaries.rs` →
   the single-threaded scheduler (incl. the port-aware slice cleanup), mailbox, signals, GC roots, PCB state,
   pre-emption/fairness, the collect-grow-and-retry exhaustion path of `Process::deliver` and the
-  `{'EXIT',…}`/`{'DOWN',…}` signal builders, the host-controllable GC relocation exemption, and the
+  `{'EXIT',…}`/`{'DOWN',…}` signal builders, the host-controllable GC relocation exemption, the
   collection's queued-message re-install (a fragment-resident/off-heap-owning message keeps its whole
-  envelope across a collect)
+  envelope across a collect), and the **process-owned off-heap refc-binary list** (registration, the
+  caller-declared sweep on the collection path, slot stability, and the conservative predicate)
 - `registry_monitors.rs`, `monitor_tag.rs`, `capability_inventory.rs`, `process_info_source.rs`,
-  `spawn_options.rs`, `lifecycle_oracle.rs` → the process-control surface: name registry + monitors (incl.
+  `spawn_options.rs`, `collector_dispatch.rs`, `lifecycle_oracle.rs` → the process-control surface: name registry + monitors (incl.
   the `monitor/3` user tag), the typed-error/capability inventory, the `process_info` item→accessor
-  mapping, the spawn-option composition, and the lifecycle semantics (link exit propagation, `kill` under
+  mapping, the spawn-option composition and the GC **strategy dispatch** (the strategy a process's
+  policy resolves to, the unchanged default cadence, and collection through the process root set), and
+  the lifecycle semantics (link exit propagation, `kill` under
   `trap_exit`, exit-reason shapes, `erlang:exit/2` propagation, the registry round trip, `demonitor`
   `[info]`/`[flush]`)
 - `split_borrow.rs` → the two `Process` split borrows (`heap_and_off_heap_mut` + `Fragments::move_into`;

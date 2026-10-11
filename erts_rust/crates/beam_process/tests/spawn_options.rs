@@ -29,8 +29,8 @@
 //!
 //! # The honest observable of an applied heap policy
 //!
-//! `Process::collector()` returns the [`beam_gc::Collector`] the process owns, and
-//! `Collector::policy()` hands back the **exact** [`HeapPolicy`] the collector was built with. That
+//! `Process::collector()` returns the [`beam_gc::AnyCollector`] the process owns, and
+//! `AnyCollector::policy()` hands back the **exact** [`HeapPolicy`] the collector was built with. That
 //! is the read-only, truthful proof that the spawn-option policy reached the collector (there is no
 //! other public accessor for the applied policy, and `min_heap_size` has no observable *value* on a
 //! fresh process beyond it). The policy's effect is also visible *behaviourally*: the collector's
@@ -130,7 +130,7 @@ fn the_heap_policy_reaches_the_collector() {
     // The initial spaces are sized from the same policy.
     assert_eq!(collector.young().capacity_words(), policy.initial_young_words);
     assert_eq!(
-        collector.mature().capacity_words(),
+        collector.mature_capacity_words(),
         policy.initial_mature_words
     );
 }
