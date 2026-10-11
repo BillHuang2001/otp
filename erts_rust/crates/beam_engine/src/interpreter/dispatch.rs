@@ -644,12 +644,12 @@ impl Machine {
         Ok(Some((context, func, pc)))
     }
 
-    /// The `call_ext*`-encoded `erlang:apply/2,3` special case — C's
+    /// The `call_ext*`-encoded `erlang:apply/3` special case — C's
     /// `fixed_apply`'s `/* Handle apply of apply/3 ... */` path
-    /// (`../../erts/emulator/beam/beam_common.c:1539-1557`, which falls through to
+    /// (`../../erts/emulator/beam/beam_common.c:1554-1557`, which falls through to
     /// `apply()` lines 1433-1524).
     ///
-    /// `erlang:apply/2,3` is a **floor** module in the runtime, so
+    /// `erlang:apply/3` is a **floor** module in the runtime, so
     /// [`ExecutionContext::resolve_external_call`] declines it and a `call_ext`
     /// would otherwise fold into the host's synchronous `apply` BIF, which runs the
     /// callee on a *fresh* machine — a `receive` inside the callee then dies in the
@@ -657,9 +657,19 @@ impl Machine {
     /// instead resolves the export and **jumps into its code in the same process**,
     /// so the callee's `receive` suspends the caller normally.
     ///
-    /// This method returns `Ok(None)` for any import that is not `erlang:apply/2,3`
-    /// (the caller keeps its normal seam/BIF route). Otherwise it decodes the call
-    /// exactly as C's `apply()` does and hands the outcome to
+    /// This method returns `Ok(None)` for any import that is not `erlang:apply/3`
+    /// (the caller keeps its normal seam/BIF route). `erlang:apply/2` is **not** a
+    /// `fixed_apply` shape: it is `apply(Fun, Args)` — a *fun* applied to an argument
+    /// list — which C compiles to the dedicated `i_apply_fun` instruction
+    /// (`emu/ops.tab:872`; `APPLY_FUN` → `apply_fun(c_p, x(0), x(1), reg)`,
+    /// `emu/instrs.tab:314-334`) and never routes through `apply()`/`fixed_apply`
+    /// (`beam_common.c:1555` special-cases **only** `arity == 3`). Treating it as the
+    /// `fixed_apply` module/function shape would fabricate `Module:Function()`
+    /// semantics, so arity 2 falls through unchanged to the ordinary export/BIF
+    /// route — the host's own `erlang:apply/2`.
+    ///
+    /// Otherwise it decodes the call exactly as C's `apply()` does and hands the
+    /// outcome to
     /// [`funs::apply_target`](crate::families::funs::apply_target):
     ///
     /// * unwrap C's nested `apply of apply/3` shape (a 3-element `[M, F, Args]`
@@ -687,20 +697,16 @@ impl Machine {
         if module_name != "erlang" || function_name != "apply" {
             return Ok(None);
         }
-        if import_arity != 2 && import_arity != 3 {
+        if import_arity != 3 {
             return Ok(None);
         }
         // C's `apply()` argument decode (`beam_common.c:1439-1441`): `reg[0] = Module`,
-        // `reg[1] = Function`, `reg[2] = Args`. `apply/2` has no argument list, so it
-        // is the `Args = []` case — exactly what the oracle's `erlang:apply/2` BIF
-        // computes (`Module:Function()` with no arguments).
+        // `reg[1] = Function`, `reg[2] = Args`. This is the `fixed_apply` shape only —
+        // C reaches `apply()` from `fixed_apply` exactly for the arity-3 case
+        // (`beam_common.c:1554-1557`).
         let mut module_term = self.x(0).ok_or_else(|| error::bad_register(0))?;
         let mut function_term = self.x(1).ok_or_else(|| error::bad_register(1))?;
-        let mut args_term = if import_arity == 3 {
-            self.x(2).ok_or_else(|| error::bad_register(2))?
-        } else {
-            NIL
-        };
+        let mut args_term = self.x(2).ok_or_else(|| error::bad_register(2))?;
         // `erlang`/`apply` are resolved against the running module's atom table: an
         // atom index is meaningful only against the table it is read with, so a
         // module that cannot name `erlang`/`apply` simply never matches.
