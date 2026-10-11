@@ -318,9 +318,6 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
   not installed and the policy is the same default for all 12 allocators.
 - `free_list::FreeList::refile` is dead (carries `#[allow(dead_code)]`): MBC coalescing (`mbc.rs::dealloc`)
   unlinks neighbours with `remove` and re-files with `insert`, so `refile` is exercised only by its own tests.
-- `stats.rs`'s `Counters::{note_alloc_typed,note_free_typed,note_{sbc,mbc}_carrier_{up,down}}` are called by
-  the allocator wiring (`allocator/state.rs`); their `#[allow(dead_code)]` and "ahead of the allocator
-  wiring" comment are stale (the comments in `stats.rs` and `mbc.rs:195` predate the wiring).
 - Carrier pools / carrier migration between allocator instances; `madvise`/carrier shrinking.
 - `fix` (fixed-size type) allocators and `erts_alloc_permanent_aligned` cache-line-aligned permanents.
 - Runtime option parsing (`+MMscs`, `+Mea`, …) — `AllocatorConfig`/`CarrierPolicy` expose the knobs,
