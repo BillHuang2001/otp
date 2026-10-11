@@ -203,6 +203,9 @@ The message itself is `RuntimeContext::signal_notify_message(name)` → `(from, 
 ## Routing Table
 - `driver.rs` → the A.4 host + `beam_io::Driver` lifecycle above.
 - `driver/state.rs` → the per-port driver-private state: the driver's private byte queue (`prt->ioq`) as an ordered list of enqueue chunks (hook-level units colocated).
+- `driver/monitor.rs` → the per-port driver monitor tree (`DriverMonitors`): identity-keyed entries, the pending-exit marks, `take_pending`/`clear`.
+- `driver/monitor_tests.rs` → the monitor tree + host-hook regression suite (seam level).
+- `driver/fire_tests.rs` → the firing drive point: a real C driver `.so` compiled at test time whose `process_exit` writes a marker file.
 - `driver/hooks_tests.rs` → the A.4 queue / one-PDL / port-flags hook regression suite (seam level).
 - `driver/ready_output_tests.rs` → the A.4 write-path regression suite (a real C driver `.so` compiled at test time).
 - `driver/control_tests.rs` → the A.4 port-control regression suite (the reply-verb matrix + the absent slot).
