@@ -138,9 +138,9 @@ slice and a `receive` park both resume through `Machine::resume_outcome_with_tie
 process was selected for, so an *allocating* hot loop keeps its tier across every slice
 (`a_preempted_process_resumes_on_its_baseline_tier`/`a_receive_parked_process_resumes_on_its_baseline_tier`
 pin this structurally, without a timing). Per-workload speed and memory figures are **measured, never
-modelled**, and live in [`PERF.md`](PERF.md) and the bench driver's
-[`../tools/bench/RESULTS.md`](../tools/bench/RESULTS.md); they are re-measured there rather than
-transcribed here.
+modelled**, and live in [`../../PERF.md`](../../PERF.md) and the bench driver's
+[`../../../../tools/bench/RESULTS.md`](../../../../tools/bench/RESULTS.md); they are re-measured there
+rather than transcribed here.
 
 `BEAM_RT_TIER=interpreter` is the always-correct reference tier and the **only** kill switch: the
 default (`Auto`, and its `baseline` alias) puts every process on the native tier.
