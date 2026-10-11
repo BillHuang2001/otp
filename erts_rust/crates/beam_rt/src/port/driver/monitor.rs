@@ -41,12 +41,14 @@
 //!
 //! # What this module does *not* do
 //!
-//! It does **not** fire `process_exit`: the hook seam gives a per-port host no route to the live
-//! process table (it holds only its owning pid), so it cannot observe a process dying. The runtime
-//! observes process exits elsewhere and drives this tree through
-//! [`DriverMonitors::note_process_exit`] / [`DriverMonitors::take_pending`] (see those methods); a
-//! host that is never driven simply holds monitors that never fire, exactly like a port whose driver
-//! declared no `process_exit` slot.
+//! It does **not** itself fire `process_exit`, and it does **not** observe a process dying: the hook
+//! seam gives a per-port host no route to the live process table (it holds only its owning pid). The
+//! runtime observes process exits elsewhere and marks the tree through
+//! [`DriverMonitors::note_process_exit`]; the port lifecycle then fires one callback per entry
+//! [`DriverMonitors::take_pending`] yields, at the per-round drive point
+//! ([`DriverPortAdapter::drive_async`](super::DriverPortAdapter::drive_async)). A tree that is never
+//! driven simply holds monitors that never fire, exactly like a port whose driver declared no
+//! `process_exit` slot.
 
 use std::cell::RefCell;
 use std::rc::Rc;

@@ -185,6 +185,27 @@ fn note_process_exit_marks_and_drains_only_that_pids_monitors() {
     assert!(!tree.remove(alive_id));
 }
 
+/// A monitor that has **fired** is gone from the host's point of view: the drain removed it, so
+/// `driver_get_monitored_process` answers the C's `NULL` (the hook's `None`) and a later
+/// `driver_demonitor_process` reports "no longer exists" — the C unlinks a monitor as it fires
+/// (`io.c:7140-7160`). This is the state the port's `process_exit` drive point leaves behind.
+#[test]
+fn a_fired_monitor_is_no_longer_resolvable() {
+    let mut port = host();
+    let pid = ProcessId::new(10, 0);
+    let monitor = port
+        .monitor_process(pid.to_eterm())
+        .expect("the entry declares a process_exit slot");
+    let mon = &monitor as *const ErlDrvMonitor;
+
+    assert_eq!(port.monitors().note_process_exit(pid), 1);
+    assert_eq!(port.monitors().take_pending(), vec![identity_of(&monitor)]);
+
+    assert_eq!(port.get_monitored_process(mon), None);
+    assert_eq!(port.demonitor_process(mon), 1, "it no longer exists");
+    assert!(!port.monitors().monitors(pid));
+}
+
 /// `clear` empties the tree — no monitor survives, nothing is pending, and no minted identity
 /// resolves.
 #[test]
