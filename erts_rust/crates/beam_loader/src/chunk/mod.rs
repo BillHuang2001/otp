@@ -100,6 +100,14 @@ pub struct Chunks<'a> {
     pub code_version: CodeVersion,
     /// The `Code` chunk instruction stream (the bytes after the header).
     pub code_stream: &'a [u8],
+    /// Every chunk of the source container, in file order, with its **raw unpadded
+    /// payload**.
+    ///
+    /// Retained so the module checksum ([`crate::checksum::module_md5`]) can digest the
+    /// whole chunk directory — including ids that are otherwise left unparsed (`DbgB`)
+    /// or ignored — without re-reading the file. [`crate::container::RawChunk`] is
+    /// `Copy`, so this is a cheap clone of the container's directory.
+    pub raw: Vec<crate::container::RawChunk<'a>>,
 }
 
 /// Parses every known chunk out of a parsed container into a [`Chunks`] value.
@@ -172,9 +180,9 @@ pub fn parse<'a>(chunks: &Container<'a>) -> Result<Chunks<'a>> {
         .unwrap_or_default();
     let attributes = chunks.find(ChunkId::ATTR).map(|chunk| misc::raw(chunk.data));
     let compile_info = chunks.find(ChunkId::CINF).map(|chunk| misc::raw(chunk.data));
-    // `Meta` is captured raw for the (future) module checksum; it is otherwise
-    // tooling-only (see `classify`). `Docs` carries no raw copy: it is a large,
-    // compressed ExDoc payload the runtime never reads.
+    // `Meta` is captured raw for the module checksum (`src/checksum.rs`); it is
+    // otherwise tooling-only (see `classify`). `Docs` carries no raw copy: it is a
+    // large, compressed ExDoc payload the runtime never reads.
     let meta = chunks.find(ChunkId::META).map(|chunk| misc::raw(chunk.data));
 
     Ok(Chunks {
@@ -194,6 +202,7 @@ pub fn parse<'a>(chunks: &Container<'a>) -> Result<Chunks<'a>> {
         meta,
         code_version,
         code_stream,
+        raw: chunks.chunks.clone(),
     })
 }
 

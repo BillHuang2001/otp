@@ -49,10 +49,12 @@ Both are the *only* entry points; all intermediate types are public for inspecti
   pub funs: Vec<FunDescriptor>, pub records: Vec<RecordDefinition>, pub code_version: CodeVersion,
   pub types: TypeTable, pub line: LineTable, pub literals: Arc<LiteralArea>, pub strings: Vec<u8>,
   pub attributes: Option<Vec<u8>>, pub attribute_table: SharedAttributeTable, pub compile_info: Option<Vec<u8>>,
-  pub compile_info_table: SharedDecodedTerm, pub meta: Option<Vec<u8>>, pub meta_table: SharedDecodedTerm }`
+  pub compile_info_table: SharedDecodedTerm, pub meta: Option<Vec<u8>>, pub meta_table: SharedDecodedTerm,
+  pub checksum: [u8; 16] }`
   + `Module::atom_name(&self, Atom) -> Option<&str>`, `Module::export(&self, Atom, u32) -> Option<Label>`,
   `Module::function(&self, Atom, u32) -> Option<&Function>`, `Module::literal(&self, u32) -> Option<Eterm>`,
-  `Module::literals(&self) -> &LiteralArea`, `Module::fun(&self, u32) -> Option<&FunDescriptor>`,
+  `Module::literals(&self) -> &LiteralArea`, `Module::checksum(&self) -> [u8; 16]`,
+  `Module::fun(&self, u32) -> Option<&FunDescriptor>`,
   `Module::funs(&self) -> &[FunDescriptor]`, `Module::records(&self) -> &[RecordDefinition]`,
   `Module::record(&self, Atom) -> Option<&RecordDefinition>`,
   `Module::record_by_name(&self, &str) -> Option<&RecordDefinition>`,
@@ -99,6 +101,25 @@ Both are the *only* entry points; all intermediate types are public for inspecti
   `pub struct RecordField { pub name: Atom, pub default: Option<Eterm> }` — `None` is the file's
   **absent** sentinel (`u,0`), which is *distinct* from a field whose default is literally `0`
   (`i,0` ⇒ `Some(<small 0>)`); see the `Recs` default rule under Design Decisions.
+### The module checksum (`src/checksum.rs`)
+- `pub fn module_md5(raw: &[crate::container::RawChunk<'_>]) -> Result<[u8; 16]>` — computes the
+  module checksum: the 16-byte MD5 the C loader stores in `beam->checksum` (`beam_file.c:1751-1830`)
+  and the standard library's `beam_lib:md5/1` reports. It digests the **raw, unpadded payloads** of a
+  container's chunk directory in the *fixed* order
+  `Atom` (obsolete Latin-1; only if present) · `AtU8` · `Code` · `StrT` · `ImpT` · `ExpT` · `FunT'` ·
+  `LitT` · `Meta` · `Recs` · `DbgB` — `Line`/`LocT`/`Attr`/`CInf`/`Type`/`Docs`/`Dbgi` are excluded
+  (`beam_lib.erl:1380-1382`), and an absent/empty chunk contributes nothing. `FunT'` digests the
+  4-byte entry count then each 24-byte entry's first 20 bytes followed by 4 zero bytes (its trailing
+  `OldUniq` forced to zero — `beam_lib.erl:873-883`); a `FunT` that is not `4 + 24n` bytes is the C's
+  `BEAMFILE_READ_CORRUPT_LAMBDA_TABLE` ⇒ `BeamError::BadArg` (`beam_file.c:1799-1801`). Duplicate ids
+  keep the first occurrence, matching `Container::find`. Pass `Chunks::raw`.
+- `pub fn md5(data: &[u8]) -> [u8; 16]` — a self-contained RFC 1321 MD5 (no new dependency edge; the
+  crate-layer contract forbids a `beam_loader → beam_dist` edge, so the algorithm is in-tree). It is
+  pinned by the RFC 1321 §A.5 vectors and every padding boundary in `src/checksum.rs`, and the module
+  digest itself is cross-checked against `beam_lib:md5/1` in `tests/checksum.rs`.
+- `Chunks::raw: Vec<crate::container::RawChunk<'a>>` (`src/chunk/mod.rs`) retains the whole chunk
+  directory (raw payloads, file order) so the digest — and any other byte-level consumer — sees every
+  chunk, including ids the loader deliberately leaves unparsed (`DbgB`).
 ### The raw `Recs` chunk (`src/chunk/record.rs`)
 - `pub fn record::parse(data: &[u8], atoms: &[String]) -> Result<Vec<RawRecord>>` — parses a `Recs`
   payload; `atoms` (the `AtU8` names, index 0 = NIL placeholder) is needed to recognize the `true`/`false`
@@ -389,6 +410,18 @@ silently-accepted wrong value:
   confined to `beam_alloc`), so `LiteralArea` — and therefore a loaded `Module` — is **neither `Send`
   nor `Sync`**: a module stays on the thread that loaded it. Heap exhaustion while decoding is retried
   (bounded) on a larger arena rather than silently truncated.
+- **The checksum is computed inside `build_module`, from a retained raw chunk directory.** `chunk::parse`
+  keeps the container's chunk directory on `Chunks::raw` (`RawChunk` is `Copy`), and `build_module` calls
+  `checksum::module_md5(&chunks.raw)` and stores the result on `Module::checksum`. `build_module` already
+  takes `Chunks`, so this needs **no signature change** — the public `load` and every manual sibling
+  pipeline (`beam_rt`/`beam_engine`, which build `Chunks` via `chunk::parse`) get the digest for free.
+  The digest is deliberately **not** carried on `Module` as the raw bytes alone (unlike `Attr`/`CInf`/`Meta`):
+  it is a fixed 16-byte value derived from the whole directory, so it is computed once and stored as
+  `[u8; 16]` rather than re-derived per query.
+- **The MD5 lives in-tree rather than borrowing `beam_dist`'s.** The crate-layer layering contract forbids
+  a `beam_loader → beam_dist` same-wave edge and no new external crate is allowed, so `src/checksum.rs`
+  carries a self-contained RFC 1321 MD5. It is a *duplication* of the primitive `beam_dist`/`beam_rt`
+  also ship (see the structural-debt note under Known Issues) — the LCA de-dup is repo-root-owned.
 - **`beam_alloc` is the literal-materialization dependency.** `src/literal.rs` decodes through
   `beam_codec::decode_term` into a `beam_alloc::Heap`; this adds the `beam_loader → beam_alloc` edge
   (in-workspace, no cycle — `beam_codec` already depends on it). `beam_term::heap::Heap` remains a test
@@ -549,6 +582,16 @@ silently-accepted wrong value:
   loud skip without OTP), and hand-built malformed-`Recs` images rejected with `BeamError::BadArg` through
   the whole `load` pipeline — each next to a well-formed **control** image (same `AtU8`/`Code`, only the
   `Recs` payload varying) that genuinely loads, so the negative cases cannot pass for a structural reason.
+- **`tests/checksum.rs`:** the module-checksum oracle. Each committed fixture's `Module::checksum()` is
+  asserted against a **pinned** `beam_lib:md5/1` hex constant (meaningful with no `erl`), and (when `erl`
+  is available) against the live oracle driven in one batched `erl -extra <files>` invocation; a
+  generically-discovered sample of 40 installed OTP modules is loaded and cross-checked the same way
+  (loud skip of the *comparison* without `erl`, never a silent pass); plus the `load_file` digest ==
+  `checksum::module_md5` over the same file's chunks (cross-path), `Module::default().checksum()` ==
+  `[0u8;16]`, and a hand-built image whose `FunT` is not `4 + 24n` bytes rejected with `BeamError::BadArg`
+  by the public `module_md5` (both the `&[RawChunk]` and the `Container` shapes). The `src/checksum.rs`
+  unit tests additionally pin the RFC 1321 §A.5 vectors, every padding boundary, the `OldUniq` zeroing,
+  and the significant-chunk order/set.
 - **`tests/generic_census.rs`:** the residual `Instr::Generic` census over every `.beam` of the whole
   installed OTP `lib` root (all 34 apps / ≈1366 modules — the same generic, `code:lib_dir()`-based
   recursive discovery as `tests/real_modules.rs`, shared via `tests/common/mod.rs`) — asserts the
@@ -618,13 +661,6 @@ silently-accepted wrong value:
   `../../crates/CONTEXT.md`).
 - **Lowering is one peephole pass, not a full `ops.tab` transform.** `lower_instr` (`src/lower/instr.rs`) maps one decoded opcode to exactly one `Instr`. The only rewrite after that is `src/lower/fuse.rs` (`fuse`), a single forward pass that coalesces an **adjacent** `Deallocate(N); Return` pair in each function body into the one superinstruction `Instr::DeallocateReturn(N)`, run *before* `build_blocks` derives the blocks/labels (so a block's `start..end` indexes the same fused vector the engine dispatches on). `Label` is the only branch target, so two adjacent non-`Label` instructions share a block and the pair can never cross one; everything else is copied through verbatim, so `Deallocate`/`Return` stay live for hand-built modules that bypass the loader. That is the whole superinstruction surface here; the C builds a much larger set from `emu/ops.tab` in `beam_load.c` (a candidate for later). Never a correctness gap: `beam_engine`'s core `DeallocateReturn` arm executes exactly the two constituents in order.
 - **The `Instr::Generic` fallback is reached only from the single catch-all arm** (`src/lower/instr.rs:611-628`): every other arm either lowers to a named variant or returns a typed error on an operand-shape mismatch — no opcode lowers to `Generic` *conditionally*.
-- **No module MD5/checksum (the remaining recorded A.2 divergence).** The C builds `beam->checksum` as
-  an MD5 over `AtU8`+`Code`+`StrT`+`ImpT`+`ExpT`+`FunT` (each `OldUniq` zeroed)+`LitT`+`Meta`+`Recs`+`DbgB`
-  at load (`beam_file.c:1751-1830`); the loader computes no checksum (no `checksum`/`md5` symbol anywhere
-  in `src/`), so `Module` carries no MD5. Closing it is a crate-layer decision, not a `beam_loader` one:
-  `crates/beam_dist/src/auth.rs` already ships a self-contained RFC 1321 `md5`, so the algorithm belongs
-  at a lowest-common-ancestor crate (`beam_codec`/`beam_common`) or behind a new dependency edge — do not
-  duplicate it here.
 - **Implicit mandatory chunks are more lenient than the legacy reader.** The C errors when `ImpT`
   (`beam_file.c:1667`) or `ExpT` (`beam_file.c:1675`) is absent; this loader requires only `AtU8` and
   `Code` and treats every other chunk as optional (`src/chunk/mod.rs:131-138`), returning an empty
@@ -632,12 +668,18 @@ silently-accepted wrong value:
   stripped/hostile inputs only.
 - **Atoms are interned into a fresh per-module `AtomTable`**, not a shared `atom.names`-seeded table;
   positional/global atom identity for preloaded modules is a `beam_rt` concern.
+- **The in-tree MD5 is structural debt.** `src/checksum.rs` carries a self-contained RFC 1321 MD5
+  because the crate-layer layering contract forbids a `beam_loader → beam_dist` edge and no new external
+  crate is allowed. `beam_dist` (`auth::md5`) and `beam_rt` (`context::bridges::module_md5`) need the
+  same primitive, so the implementation belongs at a lowest-common-ancestor crate (`beam_common`),
+  shared instead of triplicated — de-duplicating it is repo-root-owned; do **not** add a fourth copy.
 
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/error.rs` → loader-specific error constructors over `beam_common::BeamError` (`bad_file`, `truncated`, …)
 - `src/container.rs` → `FOR1` header + chunk directory walk, `ChunkId`, raw `Chunk` iteration
-- `src/chunk/mod.rs` → chunk-parse dispatch + the assembled raw chunk set
+- `src/checksum.rs` → the module checksum: a self-contained RFC 1321 `md5` + `module_md5` (the digest `beam_lib:md5/1` reports, `beam_file.c:1751-1830`) over the fixed chunk subset with `FunT` `OldUniq` zeroing
+- `src/chunk/mod.rs` → chunk-parse dispatch + the assembled raw chunk set (`Chunks`, incl. `raw` — the retained chunk directory the checksum digests)
 - `src/chunk/atom.rs` → `AtU8` parser (UTF-8, index 0 = NIL)
 - `src/chunk/code.rs` → `Code` chunk header (format/max_opcode/label_count/function_count) + the `max_opcode` sanity window (`MIN_SUPPORTED_MAX_OPCODE` = 169, `MAX_GENERIC_OPCODE` = 193)
 - `src/chunk/table.rs` → `ExpT` / `LocT` / `ImpT` / `FunT` parsers (raw entries; `parse_locals` reuses the export reader)
@@ -664,7 +706,8 @@ silently-accepted wrong value:
 - `tests/fixtures/coverage.erl` + `coverage.beam` → the widened-IR oracle fixture
 - `tests/fixtures/records_fixture.erl` + `records_fixture.beam` → the `Recs`-chunk oracle fixture (native-record definitions for `records:get_definition/2`)
 - `tests/fixtures/README.md` → regeneration commands + the full wire summary
-- `tests/` → container/IR/widened-IR/records/negative/real-module integration tests
+- `tests/` → container/IR/widened-IR/records/checksum/negative/real-module integration tests
+- `tests/checksum.rs` → the module-checksum oracle: every committed fixture's digest against a pinned `beam_lib:md5/1` hex constant (meaningful without `erl`) *and* a live `erl` cross-check, plus a generically-discovered sample of installed OTP modules vs the live oracle, the `load_file`-digest == `module_md5` cross-path check, `Module::default()` == zeros, and a hand-built corrupt-`FunT` image rejected `BadArg`
 - `tests/records.rs` → `Recs`-chunk integration tests: declaration order, every default encoding, name/atom lookups, the pinned-`ORACLE` ↔ live-`erl` `records:get_definition/2` cross-check (bounded), and malformed-image rejection through `load` beside a well-formed control image
 - `tests/generic_census.rs` → the residual `Instr::Generic` census over the whole installed OTP `lib` root (all 34 apps / ≈1366 modules, discovered via the shared `tests/common/mod.rs` helpers; asserts the unmodelled-opcode set equals the documented baseline)
 - `tests/real_modules.rs` → broad real-OTP `.beam` LOAD sweep over the whole `lib` root (all 34 apps / 1366 modules recursively, discovered via the shared `tests/common/mod.rs` helpers; every discovered module must load; loud skip when `erl`/OTP is absent) + the nested fun-literal MFA check over `maps`/`gen_server`

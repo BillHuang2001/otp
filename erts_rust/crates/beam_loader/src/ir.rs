@@ -353,6 +353,14 @@ pub struct Module {
     /// Shared behind an [`Arc`] (the holder owns a heap), so a `Module` clone stays
     /// cheap. Reachable through [`Module::meta_term`].
     pub meta_table: SharedDecodedTerm,
+    /// The module **checksum**: the 16-byte MD5 over a fixed subset of the container.
+    ///
+    /// Computed at load time by [`crate::checksum::module_md5`] exactly as the C loader
+    /// does (`erts/emulator/beam/beam_file.c:1751-1830`), so it equals the digest
+    /// `beam_lib:md5/1` reports. It is the `uniq` a `NEW_FUN_EXT` local-fun identity
+    /// carries, and is what a `code:module_md5`-style introspection query would serve.
+    /// Reachable through [`Module::checksum`]. `[0u8; 16]` for a [`Module::default`].
+    pub checksum: [u8; 16],
 }
 
 impl Default for Module {
@@ -379,6 +387,7 @@ impl Default for Module {
             compile_info_table: Arc::new(DecodedTerm::default()),
             meta: None,
             meta_table: Arc::new(DecodedTerm::default()),
+            checksum: [0u8; 16],
         }
     }
 }
@@ -415,6 +424,19 @@ impl Module {
     /// The module's decoded static-literal area.
     pub fn literals(&self) -> &LiteralArea {
         &self.literals
+    }
+
+    /// The module's 16-byte MD5 checksum, computed at load time.
+    ///
+    /// This is the digest `beam_lib:md5/1` reports for the source `.beam` — an MD5 over
+    /// the fixed chunk subset `Atom`·`AtU8`·`Code`·`StrT`·`ImpT`·`ExpT`·`FunT'`·`LitT`·
+    /// `Meta`·`Recs`·`DbgB` (see [`crate::checksum`]). It is the `uniq` an `EXPORT_EXT`/
+    /// `NEW_FUN_EXT` lambda identity uses for cross-module validation.
+    ///
+    /// [`Module::default`] returns `[0u8; 16]`; a module produced by [`crate::load`] /
+    /// [`crate::load_file`] always carries the computed digest.
+    pub fn checksum(&self) -> [u8; 16] {
+        self.checksum
     }
 
     /// The lambda descriptor at `index` (a `make_fun3`/`call_fun2` fun-table index).

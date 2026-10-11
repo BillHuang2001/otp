@@ -193,6 +193,11 @@ pub fn build_module(
     let compile_info_table = DecodedTerm::decode(chunks.compile_info.as_deref(), &mut atom_table)?;
     let meta_table = DecodedTerm::decode(chunks.meta.as_deref(), &mut atom_table)?;
 
+    // The module checksum: the MD5 over the fixed chunk subset (`beam_file.c:1751-1830`,
+    // `beam_lib:md5/1`). Computed here so every caller of `build_module` — the public
+    // `load` and the sibling manual pipelines — gets it for free.
+    let checksum = crate::checksum::module_md5(&chunks.raw)?;
+
     Ok(Module {
         name,
         atoms,
@@ -214,6 +219,7 @@ pub fn build_module(
         compile_info_table: Arc::new(compile_info_table),
         meta: chunks.meta.clone(),
         meta_table: Arc::new(meta_table),
+        checksum,
     })
 }
 
@@ -1672,6 +1678,7 @@ mod tests {
             meta: None,
             code_version: CodeVersion::default(),
             code_stream: &[],
+            raw: Vec::new(),
         }
     }
 
