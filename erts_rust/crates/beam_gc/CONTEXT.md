@@ -467,6 +467,12 @@ constructors only (no new error enum).
   returns typed with **nothing copied**; `ensure_capacity` grows or errors typed.
 - `tests/nursery_bounded.rs` → a growing load plateaus the nursery + total heap; a garbage-heavy collection
   shrinks it; a larger request grows it via `ensure_capacity`.
+- `tests/nursery_chain.rs` → the chained-nursery **no-relocation** growth seam: `grow_nursery` preserves
+  every live term **at its original address** and runs no collection; a graph spanning the growth boundary
+  (retired↔new references) still collects correctly under BOTH strategies; `young_contains` covers every
+  nursery space (false for a foreign address) and the chain collapses to one space after a collection; a
+  request the policy ceiling cannot reach returns the typed `heap_exhausted` and leaves the collector
+  untouched; a grow-then-collect loop plateaus (nursery + chain + mature).
 - `tests/memory_overhead.rs` → per-object overhead `< 1` word (measured 0) + an RSS/word-count plateau
   (skipped loudly off-Linux).
 - `tests/stress_cross_generation.rs` → one mixed graph through 6 minors + 2 majors under both strategies:
@@ -623,6 +629,7 @@ constructors only (no new error enum).
 - `tests/allocation_heavy_workload.rs` → the allocation-heavy Copying-vs-Immix measurement (`MEASURED.md`)
 - `tests/heap_growth.rs` → on-demand growth, the mature generation's growth under a bounded nursery, the typed no-half-forward under a cap
 - `tests/nursery_bounded.rs` → the bounded-nursery evidence (nursery + total heap plateau; shrink on a garbage-heavy round)
+- `tests/nursery_chain.rs` → the `Nursery` chain: address-preserving `grow_nursery` (no collection), the growth-boundary-spanning graph, `young_contains`/`young_space_count` + the summed `heap_size_words`, the typed capped-growth error, and the collapse to one space
 - `tests/memory_overhead.rs` → per-object overhead vs the frozen layout + the RSS/word-accounting no-leak plateau
 - `tests/stress_cross_generation.rs` → the mixed-term cross-generation gate (both strategies)
 - `tests/collector_adversarial.rs` → the adversarial copy-correctness / no-leak set (both strategies)
