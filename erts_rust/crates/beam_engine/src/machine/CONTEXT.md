@@ -36,7 +36,12 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
 - `context.rs` — the `ModuleContext`/`Contexts` registry; `current_context`/`register_context`/`switch_context`/
   `module_context`.
 - `location.rs` — execution-position introspection (`current_code`, `current_function`, `current_location`,
-  `initial_call`, `current_stacktrace`).
+  `initial_call`, `current_stacktrace`, `current_module`/`active_context`) **and** the parked-`receive`
+  deadline seam `Machine::wait_deadline`/`timeout_delay` + `WaitDeadline { delay_ms, resume }`: it reads the
+  `wait_timeout` at `current_code` (the blocked instruction, exact because a blocking op is never JIT-inlined)
+  in the module `active_context()` names — the callee's own module when the park is inside a cross-module
+  callee (context != 0), else the passed entry module — and reports the `timeout` continuation (`pc + 1`) a
+  host re-enters when its own timer fires. The engine arms no timer: a non-zero `wait_timeout` just suspends.
 - `run.rs` — `run_export`/`run_label` (non-blocking) and `run_export_outcome`/`run_label_outcome`/`resume_outcome`
   (blocking-aware); the **tier-selecting** entries `run_with_tier`/`run_export_outcome_with_tier`/
   `run_label_outcome_with_tier` (first entry) and `resume_outcome_with_tier` (**resume** — a slice that suspended on a
@@ -55,6 +60,12 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   every live caller innermost first, plus the guard that a caught raise lands unchanged. `test_support.rs`
   (`cfg(test)` only) is the synthetic-module builder (`Fixture`) and cross-module seam context (`seam`) these share
   with `drive.rs`'s tests.
+- `deadline_tests.rs` — the parked-`receive` deadline driven to completion: a **nested** run through the
+  non-blocking `run_export` (whose fold to `blocked()` must leave the machine parked, so `wait_deadline` still
+  reports the deadline) and a blocking `run_export_outcome` park, each resumed at the deadline's `timeout`
+  continuation to run the `after` clause — on a real module compiled by the system `erlc` and cross-checked
+  against `erl` (loud skip when `erlc`/`erl` are absent); plus a cross-module-callee park proving the deadline
+  is read from the callee context, never the entry module.
 
 ## Constraints
 - Errors are `beam_common::{Result, BeamError}` only — no crate-local error enum, no panic, no `unwrap()` on

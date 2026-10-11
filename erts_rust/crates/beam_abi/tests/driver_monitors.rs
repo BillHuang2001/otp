@@ -79,7 +79,7 @@ use std::process::Command;
 use beam_abi::driver::drv::driver_api_table;
 use beam_abi::driver::loader::{load, DriverLibrary};
 use beam_abi::driver::types::{ErlDrvData, ErlDrvMonitor, ErlDrvPort, ErlDrvSSizeT};
-use beam_abi::{monitor_from_identity, monitor_identity, DriverEnv, DriverHost};
+use beam_abi::{monitor_from_identity, monitor_identity, DriverEnv, DriverHost, MonitorResult};
 use beam_term::prelude::{make_internal_pid, Eterm};
 use libc::{c_char, c_int, c_void};
 use common::{compile_so, skip, TestDriverHost};
@@ -109,6 +109,18 @@ const FIXTURE_IMPORTS: [&str; 10] = [
 const ERL_DRV_MONITOR_OK: c_int = 0;
 const ERL_DRV_MONITOR_NOT_ALIVE: c_int = 1;
 const ERL_DRV_MONITOR_ERROR: c_int = -1;
+
+/// How [`MonitorsHost`] answers `driver_monitor_process` — the three C outcomes of
+/// `do_driver_monitor_process` (`io.c:7012-7038`), which the C separates by **sign**.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MonitorOutcome {
+    /// Arm for real: the C's `0` (`ERL_DRV_MONITOR_OK`), the holder filled.
+    Arm,
+    /// The process is not alive: the C's `1` (`ERL_DRV_MONITOR_NOT_ALIVE`, `io.c:7031`).
+    NotAlive,
+    /// The host cannot monitor (no `process_exit`, or no live process): `-1` (`io.c:7020-7021`).
+    Error,
+}
 
 /// The identity width: `ERTS_REF_THING_SIZE(3) * sizeof(Eterm)(8)` (`io.c:6996`).
 const IDENTITY_BYTES: usize = 24;
@@ -207,6 +219,9 @@ struct MonitorsHost {
     monitors: Vec<([u8; IDENTITY_BYTES], Eterm)>,
     /// The next monitor's id, so no two monitors are ever byte-identical.
     next: u64,
+    /// The outcome [`DriverHost::monitor_process_result`] reports, i.e. which of the C's three
+    /// `driver_monitor_process` results the host pretends to reach.
+    monitor_outcome: MonitorOutcome,
 }
 
 impl MonitorsHost {
@@ -215,6 +230,7 @@ impl MonitorsHost {
             inner: TestDriverHost::new(),
             monitors: Vec::new(),
             next: 1,
+            monitor_outcome: MonitorOutcome::Arm,
         }
     }
 
@@ -223,6 +239,10 @@ impl MonitorsHost {
         self.inner.set_caller(pid);
     }
 
+    /// Choose which of the three C `driver_monitor_process` outcomes the host reports next.
+    fn set_monitor_outcome(&mut self, outcome: MonitorOutcome) {
+        self.monitor_outcome = outcome;
+    }
     /// Every byte string the fixture published through `driver_output`, in call order.
     fn outputs(&self) -> &[Vec<u8>] {
         self.inner.outputs()
@@ -272,6 +292,20 @@ impl DriverHost for MonitorsHost {
         Some(monitor_from_identity(identity))
     }
 
+    /// The **three-way** monitor hook (contract A.4, `io.c:7012-7038`): the C's `0` / `> 0` / `< 0`
+    /// all become expressible. In [`MonitorOutcome::Arm`] it delegates to the two-way
+    /// [`monitor_process`](DriverHost::monitor_process) so the identity logic stays in one place; the
+    /// other two states report the C's positive `1` and negative `-1` directly.
+    fn monitor_process_result(&mut self, pid: Eterm) -> MonitorResult {
+        match self.monitor_outcome {
+            MonitorOutcome::Arm => match self.monitor_process(pid) {
+                Some(mon) => MonitorResult::Ok(mon),
+                None => MonitorResult::Error,
+            },
+            MonitorOutcome::NotAlive => MonitorResult::NotAlive,
+            MonitorOutcome::Error => MonitorResult::Error,
+        }
+    }
     /// Remove the monitor carrying `mon`'s identity: `0` removed, `1` no such monitor (`io.c:7074`).
     fn demonitor_process(&mut self, mon: *const ErlDrvMonitor) -> c_int {
         let Some(identity) = monitor_identity(mon) else {
@@ -474,6 +508,60 @@ fn the_monitor_identity_is_what_drives_the_whole_family() {
         );
         assert!(host.armed().is_empty(), "both monitors are gone");
         assert_eq!(command(lib, data, 99), -100, "an unknown command is -100");
+    }) else {
+        return;
+    };
+}
+
+// ---------------------------------------------------------------------------------------------
+// All three `driver_monitor_process` outcomes through the real C fixture
+// ---------------------------------------------------------------------------------------------
+
+/// The three C outcomes of `driver_monitor_process` (`io.c:7012-7038`, `do_driver_monitor_process`)
+/// are reachable **end-to-end** through the real C fixture, because the three-way
+/// [`DriverHost::monitor_process_result`] hook can express the C's positive `1`
+/// (`ERL_DRV_MONITOR_NOT_ALIVE`) as well as its `0` and `-1`.
+///
+/// Fixture command 1 arms a monitor on `driver_caller(port)` — a **real internal pid**, so it passes
+/// `driver_monitor_process`'s `names_a_process` gate (`src/driver/drv/pdl.rs`) and reaches the host
+/// hook — and returns the host's code verbatim. The unit-level mapping (`MonitorResult` → the C
+/// codes) is pinned in `src/driver/drv/pdl.rs::the_three_way_monitor_result_maps_onto_the_c_reason_codes`;
+/// this drives the same mapping out of the compiled `.so`, so the C ABI's return value is what is
+/// asserted. The oracle cannot drive this path (this OTP build exports no `erlang:load_driver/2` and
+/// a monitor needs an `ErlDrvPort` a NIF lacks), which is why the coverage is the fixture + the unit
+/// test rather than a differential case.
+#[test]
+fn the_real_fixture_sees_all_three_monitor_outcomes() {
+    let Some(()) = with_session(|lib, data, host, _so| {
+        // The host arms for real: the fixture's command 1 must return the C's `0`.
+        host.set_monitor_outcome(MonitorOutcome::Arm);
+        assert_eq!(command(lib, data, 1), ERL_DRV_MONITOR_OK as ErlDrvSSizeT);
+        assert_eq!(host.armed().len(), 1, "the armed case registered a monitor");
+
+        // The host reports the process dead: the fixture must return the C's positive `1`, and the
+        // refusal must not have written the fixture's holder (no monitor registered).
+        host.set_monitor_outcome(MonitorOutcome::NotAlive);
+        assert_eq!(
+            command(lib, data, 1),
+            ERL_DRV_MONITOR_NOT_ALIVE as ErlDrvSSizeT,
+            "a not-alive host must surface the C's positive code"
+        );
+        assert_eq!(host.armed().len(), 1, "a not-alive result installs no monitor");
+
+        // The host cannot monitor: the fixture must return the C's negative `-1`.
+        host.set_monitor_outcome(MonitorOutcome::Error);
+        assert_eq!(
+            command(lib, data, 1),
+            ERL_DRV_MONITOR_ERROR as ErlDrvSSizeT,
+            "a failure the host cannot arm must surface the C's negative code"
+        );
+        assert_eq!(host.armed().len(), 1, "a failure installs no monitor");
+
+        // Back to arming: the host is live again and command 1 succeeds once more (a second monitor,
+        // distinct identity).
+        host.set_monitor_outcome(MonitorOutcome::Arm);
+        assert_eq!(command(lib, data, 1), ERL_DRV_MONITOR_OK as ErlDrvSSizeT);
+        assert_eq!(host.armed().len(), 2, "the recovered host arms again");
     }) else {
         return;
     };

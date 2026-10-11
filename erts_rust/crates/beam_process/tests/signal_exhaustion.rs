@@ -31,6 +31,13 @@
 //! no growth, no retry — because the host holds live words outside the crate root set and
 //! relocating would recycle them.
 //!
+//! That raw refusal is the **enqueue-time** behaviour — the reason copy onto the receiver's own
+//! heap, which case 3 below exercises (`send_exit` with an oversized reason) and which must land
+//! on the receiver's heap. The **apply-time** message build is different: it can live in a heap
+//! fragment, so a small reason's `{'EXIT', …}`/`{'DOWN', …}` is delivered to a relocation-exempt
+//! receiver through the fragment fallback rather than refused (its own suite,
+//! `tests/signal_fragment_fallback.rs`).
+//!
 //! The suite pins both halves of the policy from the observable end state:
 //!
 //! 1. [`an_oversized_exit_reason_grows_the_receivers_nursery_and_is_delivered`] — a link exit

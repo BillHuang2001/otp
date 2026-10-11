@@ -80,6 +80,39 @@ pub enum PortFailure<'a> {
     Error(c_int),
 }
 
+/// The three-way result of `driver_monitor_process` (workspace contract **A.4**) — the driver C
+/// ABI's *process monitor* result, mirroring the C's `0` / `> 0` / `< 0` reason codes
+/// (`erts/emulator/beam/io.c:7012-7038`, `do_driver_monitor_process`).
+///
+/// The C entry point has three outcomes, and the Rust seam must be able to express all three, so
+/// [`DriverHost::monitor_process_result`] returns this enum:
+///
+/// * [`MonitorResult::Ok`] — the C's `0` (`ERL_DRV_MONITOR_OK`, `io.c:7037`): the monitor was armed
+///   and the driver's holder was filled with the opaque [`ErlDrvMonitor`].
+/// * [`MonitorResult::NotAlive`] — the C's `> 0` (`ERL_DRV_MONITOR_NOT_ALIVE`, value `1`,
+///   `io.c:7031`): the advertised process is no longer alive. The C reaches this when its
+///   `erts_proc_sig_send_monitor` fails; a host that cannot resolve the operand to a live process
+///   reports it here.
+/// * [`MonitorResult::Error`] — the C's `< 0` (`-1`, `ERL_DRV_MONITOR_ERROR`, `io.c:7020-7021`,
+///   `:7055`): an invalid port, a driver with no `process_exit` callback, or any other failure that
+///   is *not* "the process is dead".
+///
+/// This is the **driver** monitor result. It is deliberately distinct from the **NIF** monitor
+/// family ([`NifHost::monitor_process`](crate::nif::host::NifHost::monitor_process),
+/// `enif_monitor_process`), which has its own return-code convention and its own host seam.
+//
+// Derives only `Debug, Clone, Copy`: `ErlDrvMonitor` carries no `PartialEq` (its payload is opaque
+// bytes the crate never interprets), so the enum cannot derive one either.
+#[derive(Debug, Clone, Copy)]
+pub enum MonitorResult {
+    /// The C's `0` (`ERL_DRV_MONITOR_OK`): the monitor was armed; the holder is filled.
+    Ok(ErlDrvMonitor),
+    /// The C's `> 0` (`ERL_DRV_MONITOR_NOT_ALIVE`, value `1`): the process is not alive.
+    NotAlive,
+    /// The C's `< 0` (`-1`): invalid port, or the host cannot monitor.
+    Error,
+}
+
 /// Services the runtime provides to the `erl_drv_*` implementations of one port.
 pub trait DriverHost {
     /// The term-allocation arena for the duration of the current call. Must not reallocate while the
@@ -297,9 +330,32 @@ pub trait DriverHost {
     /// Monitor the process `pid` (`driver_monitor_process`), returning the monitor holder the driver
     /// later passes to [`demonitor_process`](DriverHost::demonitor_process) /
     /// [`get_monitored_process`](DriverHost::get_monitored_process). `None` = unsupported (default).
+    ///
+    /// This is the **two-way compatibility subset**: it can only say "armed" (`Some`) or "could not
+    /// arm" (`None` → the C's `-1`). The C's third outcome — "the process is not alive" (`1`, a
+    /// *positive* code) — is inexpressible here, so the full three-way hook
+    /// [`monitor_process_result`](DriverHost::monitor_process_result) **defaults** to this method and
+    /// a host that must report "not alive" overrides that one instead. New hosts should implement
+    /// whichever of the two matches the granularity they can honestly answer.
     fn monitor_process(&mut self, pid: Eterm) -> Option<ErlDrvMonitor> {
         let _ = pid;
         None
+    }
+
+    /// Monitor the process `pid` (`driver_monitor_process`), returning the full three-way
+    /// [`MonitorResult`] (the C's `0` / `> 0` / `< 0`).
+    ///
+    /// This is the complete hook. Its default preserves the old two-way behaviour by delegating to
+    /// [`monitor_process`](DriverHost::monitor_process) — `Some(mon)` ⇒ [`MonitorResult::Ok`], `None`
+    /// ⇒ [`MonitorResult::Error`] — so an existing implementor of the two-way hook keeps working,
+    /// byte-identically, with no change. A host that can distinguish "the process is not alive"
+    /// from "cannot monitor" (the C's `1` vs `-1`) overrides **this** method and returns
+    /// [`MonitorResult::NotAlive`] for the former.
+    fn monitor_process_result(&mut self, pid: Eterm) -> MonitorResult {
+        match self.monitor_process(pid) {
+            Some(mon) => MonitorResult::Ok(mon),
+            None => MonitorResult::Error,
+        }
     }
 
     /// Cancel the monitor `mon` (`driver_demonitor_process`). `0` = ok, `-1` = fail (default:
@@ -1640,6 +1696,8 @@ mod tests {
 
         // Monitors.
         assert!(host.monitor_process(NIL).is_none());
+        // The three-way hook's default delegates to the two-way one: `None` ⇒ the C's `-1`.
+        assert!(matches!(host.monitor_process_result(NIL), MonitorResult::Error));
         assert_eq!(host.demonitor_process(core::ptr::null()), -1);
         assert!(host.get_monitored_process(core::ptr::null()).is_none());
 

@@ -155,9 +155,22 @@ The *internal* boundary the `driver_*` bodies are written against (source `src/d
   port-queue hooks `enq`/`pushq`/`deq`/`sizeq`/`peekq`, the attribute hooks
   `set_busy_port`/`set_control_flags`/`get_port_flags`, the failure/lifecycle hooks
   `failure`/`port_exit`/`busy_msgq_limits`/`init_ack`/`set_os_pid`/`async_port_key`, the monitor hooks
-  `monitor_process`/`demonitor_process`/`get_monitored_process`, the PDL hooks
+  `monitor_process`/`monitor_process_result`/`demonitor_process`/`get_monitored_process`, the PDL hooks
   `pdl_create`/`pdl_lock`/`pdl_unlock`/`pdl_get_refc`/`pdl_inc_refc`/`pdl_dec_refc`, the
   driver-registry hooks `add_driver_entry`/`remove_driver_entry`/`lock_driver`/`create_port`, `now`.
+- **The three-way monitor hook.** `monitor_process(&mut self, pid) -> Option<ErlDrvMonitor>` is the
+  **two-way compatibility subset** (`Some` ⇒ the C's `0`, `None` ⇒ `-1`) kept for source
+  compatibility; the full three-way hook is `monitor_process_result(&mut self, pid) -> MonitorResult`
+  and its **default delegates** to `monitor_process` (`Some(mon)` ⇒ `MonitorResult::Ok(mon)`, `None`
+  ⇒ `MonitorResult::Error`), so an existing two-way implementor is unchanged. `pub enum MonitorResult
+  { Ok(ErlDrvMonitor), NotAlive, Error }` (`#[derive(Debug, Clone, Copy)]` — `ErlDrvMonitor` has no
+  `PartialEq`) is the driver A.4 monitor result — distinct from the NIF monitor family
+  (`NifHost::monitor_process`/`enif_monitor_process`) — and mirrors the C's `0` / `> 0` / `< 0`
+  reason codes (`io.c:7012-7038`): `Ok` ⇒ `0` (`ERL_DRV_MONITOR_OK`), `NotAlive` ⇒ `1`
+  (`ERL_DRV_MONITOR_NOT_ALIVE`, `io.c:7031`), `Error` ⇒ `-1` (`ERL_DRV_MONITOR_ERROR`,
+  `io.c:7020-7021`). `driver_monitor_process` maps the enum onto those three codes (and pins their
+  signs with `const _: () = assert!(…)` in `src/driver/drv/pdl.rs`). Re-exported at the crate root
+  (`beam_abi::MonitorResult`).
 - `pub struct DriverEnv` — the env behind the C-facing opaque `*mut ErlDrvPort_`: `new(&mut dyn
   DriverHost)`, `host()`, `heap()`, `as_port()`, `unsafe from_port(*mut ErlDrvPort_) -> Option<&mut
   DriverEnv>`; **the `ErlDrvPort` a runtime passes to a driver callback *is* the `DriverEnv::as_port`
@@ -466,7 +479,7 @@ Every one is `#[no_mangle] pub unsafe extern "C"` with the exact signature of it
 - **`port`** (`ErlDrvPort`, `DriverEnv::as_port`) — the output family; the term-data family (`driver_output_term`/`driver_send_term`/`erl_drv_output_term`/`erl_drv_send_term` over `decode_term_spec`, decoding **all 17 `ERL_DRV_*` tags** — `ERL_DRV_PID` accepts only an internal pid, `ERL_DRV_MAP` builds via `beam_term::map` (flat ≤ 32, else HAMT; duplicate keys refused), `ERL_DRV_EXT2TERM` routes through the defaulted `DriverHost::binary_to_term`); the port queries (`driver_mk_atom`, `driver_mk_port`, `driver_connected`, `driver_caller`); the select/timer/async group.
 - **`queues`** — `driver_vec_to_buf`, `driver_enq`, `driver_pushq`, `driver_deq`, `driver_sizeq`, `driver_enq_bin`, `driver_pushq_bin`, `driver_peekq`, `driver_peekqv`, `driver_enqv`, `driver_pushqv`, `DriverHost` Oracle-measured return codes: `driver_deq` returns the **remaining** count, `(ErlDrvSizeT)-1` when over-dequeued; `driver_sizeq`'s `NOT_A_SIZE` sentinel **is** `(ErlDrvSizeT)-1` (`ErlDrvSizeT::MAX`, `queues.rs`), which the C returns only for a `NULL` queue — so an empty allocated queue must make the **host** answer `0` (`beam_rt`/`beam_io`).
 - **`threads`** — `erl_drv_*`, `crate::sync`, `ErlDrvPort`, `DriverHost`
-- **`pdl`** — `driver_pdl_create`, `lock`, `unlock`, `get_refc`, `inc_refc`, `dec_refc`, `driver_monitor_process`, `demonitor_process`, `get_monitored_process`, `compare_monitors`, `driver_get_now` `driver_compare_monitors` is **host-free and complete** (a 24-byte `memcmp` = `ERTS_REF_THING_SIZE(3)*8`, C `io.c:7142-7146`); the five refc slots never touch the host (crate-owned `PdlState`); only `driver_pdl_create` delegates — and the host must return a **per-port-stable** handle (C `pp->port_data_lock`; a second create on the same port ⇒ `NULL`). It also exposes the **safe** accessors [`monitor_identity(*const ErlDrvMonitor) -> Option<[u8; 24]>`] / [`monitor_from_identity([u8; 24]) -> ErlDrvMonitor`] (crate-root re-exports) so a `#![deny(unsafe_code)]` host can key its monitor tree on a monitor's bytes; `REF_THING_COMPARE_BYTES` (`= ERTS_REF_THING_SIZE(3) * size_of::<Eterm>()` = 24) is the single width shared with `driver_compare_monitors`, the bytes stay opaque (no encoding invented), and `monitor_identity` answers `None` for a null pointer under the `src/driver/loader.rs` wrapper convention.
+- **`pdl`** — `driver_pdl_create`, `lock`, `unlock`, `get_refc`, `inc_refc`, `dec_refc`, `driver_monitor_process`, `demonitor_process`, `get_monitored_process`, `compare_monitors`, `driver_get_now` `driver_compare_monitors` is **host-free and complete** (a 24-byte `memcmp` = `ERTS_REF_THING_SIZE(3)*8`, C `io.c:7142-7146`); the five refc slots never touch the host (crate-owned `PdlState`); only `driver_pdl_create` delegates — and the host must return a **per-port-stable** handle (C `pp->port_data_lock`; a second create on the same port ⇒ `NULL`). `driver_monitor_process` reaches the host through the three-way `DriverHost::monitor_process_result` and maps `MonitorResult::{Ok,NotAlive,Error}` onto the C's `0`/`1`/`-1` (its signs pinned by `const _: () = assert!(…)`); its `names_a_process` gate answers `1` for an operand that cannot name a process. It also exposes the **safe** accessors [`monitor_identity(*const ErlDrvMonitor) -> Option<[u8; 24]>`] / [`monitor_from_identity([u8; 24]) -> ErlDrvMonitor`] (crate-root re-exports) so a `#![deny(unsafe_code)]` host can key its monitor tree on a monitor's bytes; `REF_THING_COMPARE_BYTES` (`= ERTS_REF_THING_SIZE(3) * size_of::<Eterm>()` = 24) is the single width shared with `driver_compare_monitors`, the bytes stay opaque (no encoding invented), and `monitor_identity` answers `None` for a null pointer under the `src/driver/loader.rs` wrapper convention.
 - **`lifecycle`** — `driver_failure_eof`, `_atom`, `_posix`, `driver_failure`, `driver_exit`, `DriverHost::failure`, `port_exit`, `set_busy_port`, `set_port_control_flags`, `get_port_flags`, `erl_drv_busy_msgq_limits`, `erl_drv_init_ack`, `erl_drv_set_os_pid`, `driver_async_port_key`
 - **`registry`** — `add_driver_entry`, `remove_driver_entry`, `with_current_host`, `-1`, `0`, `driver_lock_driver`, `driver_create_port`, `env_for` Ground truth `io.c:7640`/`7698`/`7324`/`786`.
 
@@ -543,12 +556,18 @@ Every one is `#[no_mangle] pub unsafe extern "C"` with the exact signature of it
   (`erl_nif.c:1451-1461`). Pinned by the `mem.rs` unit tests and
   `tests/nif_bitslice.rs`/`tests/nif_subbin.rs`.
 - **`driver_monitor_process`/`driver_demonitor_process`/`driver_get_monitored_process`** — the A.4
-  driver-monitor family. The **`beam_abi` half is complete**: the reason codes are honoured, the
+  driver-monitor family. The **`beam_abi` half is complete**: all three C outcomes of
+  `driver_monitor_process` are expressible (the three-way `DriverHost::monitor_process_result` /
+  `MonitorResult` above — `0`/`1`/`-1`, `io.c:7012-7038`), the reason codes are honoured, the
   monitor's 24-byte identity is exposed safely (`monitor_identity`/`monitor_from_identity`), and
   `driver_compare_monitors` is a finished `memcmp`. The host half is owned by `beam_rt`/`beam_io`,
-  which must implement `DriverHost::monitor_process`/`demonitor_process`/`get_monitored_process`
+  which must implement `DriverHost::demonitor_process`/`get_monitored_process` and the monitor arming
   (registration, liveness, the per-port monitor tree) and fire `process_exit` (`io.c:6998-6999`,
-  `:7065-7081`, `:7104-7118`, `:7150+`).
+  `:7065-7081`, `:7104-7118`, `:7150+`). **`beam_rt` should override `monitor_process_result`**
+  instead of the two-way `monitor_process`: its `DriverPort` (`beam_rt/src/port/driver.rs:1112-1118`)
+  currently returns `None` for both "no `process_exit`" and "the operand is not a local pid" — the
+  first must stay `MonitorResult::Error` (`-1`, the C's `io.c:7055`) while the second must become
+  `MonitorResult::NotAlive` (the C's `1`, `io.c:7031`), which the old `Option` hook could not express.
 - **Other `beam_rt`/`beam_io`-owned halves of the A.4 driver surface** (the operand handling and
   return-code mapping here are oracle-exact): `driver_pdl_create` needs a **per-port-stable** host
   handle (a second create on the same port ⇒ `NULL`); `driver_sizeq` must make the host answer `0` on
@@ -573,7 +592,7 @@ Every one is `#[no_mangle] pub unsafe extern "C"` with the exact signature of it
 - `src/nif/loader.rs` → the dynamic NIF loader: `NifLibrary`, `NifLoadError`/`NifCallError`, `load()` (dlopen/dlsym + oracle-order validation), `NifLibrary::call` (also the `priv_data` publication behind `enif_priv_data`), `Drop` (unload + dlclose)
 - `src/driver/types.rs` → driver `#[repr(C)]` structs/enums/flags + `ErlDrvEntry` (from `erl_driver.h`) + `ERTS_INVALID_ERL_DRV_PORT` (the invalid-port sentinel, pointer `-1`)
 - `src/driver/api.rs` → `ErlDrvApi` (111-entry `driver_*`/`erl_drv_*` function table) + `ErlDrvApi::empty()`
-- `src/driver/host.rs` → the driver host seam: `DriverHost` + `DriverEnv` (`*mut ErlDrvPort_`, `as_port`, `from_port`) + `decode_term_spec` + the `with_current_host` re-export
+- `src/driver/host.rs` → the driver host seam: `DriverHost` + `DriverEnv` (`*mut ErlDrvPort_`, `as_port`, `from_port`) + the three-way `MonitorResult`/`monitor_process_result` monitor hook + `decode_term_spec` + the `with_current_host` re-export
 - `src/driver/current_host.rs` → the thread-local **current-driver-host** publication: `with_current_host(host, f)` (scoped, restores the previous host on exit, nesting-safe) plus the `pub(crate)` reader the two port-free entry-list slots use
 - `src/driver/async_job.rs` → the **safe async-job runner** (`AsyncJob`/`AsyncCallback`, crate-root re-exports): the single `unsafe` `new` constructor plus the safe `invoke`/`finish`/`data`/`has_invoke`/`has_free`; `Drop` frees a held job without invoking it, `Debug` never dereferences
 - `src/driver/drv/` → **one file per driver family** (`mem`, `port`, `queues`, `threads`, `pdl`, `lifecycle`, `registry`), each owning its `pub(super) const fn populate`; `mod.rs` holds the module docs, the shared `env_for` helper, the `#[used] static DRIVER_API` table + `driver_api_table()`, the `driver_term_nil` data symbol and `binary_payload`; `port_tests.rs` is the path-included child of `port`

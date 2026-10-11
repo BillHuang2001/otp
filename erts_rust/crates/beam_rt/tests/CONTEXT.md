@@ -21,7 +21,7 @@ Suites that need the oracle skip **loudly** when `erl`/`erlc` are absent. `tests
 * A.4 ports / drivers → `driver.rs` (real C `.so`), `port_parity.rs` (`open_port`/`port_info`/`port_command`), `port_stream.rs`, `port_wake.rs`, `port_monitor_cleanup.rs`
 * A.5 distribution → `dist.rs`, `dist_delivery.rs`, `node_cookie.rs`, `pid_roundtrip.rs`
 * A.3 NIF / off-heap → `nif.rs` (real C NIF), `etf_roundtrip_pid_ref.rs`, `engine_off_heap_transport.rs`
-* Processes / spawn / monitor / signals → `spawn_monitor.rs`, `spawn_from_slice.rs`, `spawn_opts.rs`, `monitor.rs`, `exit.rs`, `group_leader.rs`, `timers.rs`, `proc_seams.rs`
+* Processes / spawn / monitor / signals → `spawn_monitor.rs`, `spawn_from_slice.rs`, `spawn_opts.rs`, `monitor.rs`, `alias.rs` (reference aliases as `send` destinations: `alias/1`, `unalias/1`, `monitor/3`'s `{alias, Mode}`, the compiled `Alias ! Msg` and the `erlang:send/2` route, `gen:reply/2` and real `gen_server` calls), `exit.rs`, `group_leader.rs`, `timers.rs`, `proc_seams.rs`
 * GC / heap → `gc_collect.rs`, `gc_run.rs`, `heap_growth.rs`, `heap_limits.rs`, `garbage_collect.rs`
 * ETS → `ets_owner.rs`
 * Errors / terms → `structured_errors.rs`, `function_clause.rs`, `send.rs`, `eval.rs` (the `-eval` evaluator + the differential corpus's `Eval` probes)

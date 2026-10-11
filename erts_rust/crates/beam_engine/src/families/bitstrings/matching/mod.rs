@@ -213,13 +213,17 @@ pub(super) fn exec(
             }
             let (bytes, off) = raw::subject_bytes(orig)?;
             let value = read_integer_field(machine, ctx, bytes, start + off, nbits, *flags)?;
-            write_operand(machine, dst, value)?;
             // `read_integer_field` allocates (a bignum) through the rooted seam, so a
             // moving collector may have relocated the context read above: re-read the
-            // context operand before committing the new position (the frozen
+            // context operand and commit the new position **before** binding `Dst`.
+            // The C advances `sb->start` inside `erts_bs_get_integer_2` *before* the
+            // instruction's `$Dst = _result`, and `Dst` may be the context's own
+            // operand (`beam_asm:filter_essentials/1` compiles to `ctx == dst == x(3)`),
+            // so binding first would clobber the context the commit re-reads (the frozen
             // reserve, then read, then write ordering).
             let term = reread_ctx(machine, ctx, ctx_op, "bs_get_integer2")?;
             raw::set_ctx_start(term, start + nbits);
+            write_operand(machine, dst, value)?;
             Ok(Some(Step::Next))
         }
         Instr::BsGetBinary2(b) => {
@@ -253,12 +257,16 @@ pub(super) fn exec(
             // limit), so the result goes through `raw::make_binary`, which picks the
             // frozen on-heap/off-heap representation by size.
             let value = raw::make_binary(machine, ctx, &out, nbits)?;
-            write_operand(machine, dst, value)?;
             // `raw::make_binary` reserves through the rooted seam, so a moving collector
-            // may have relocated the context read above: re-read the context operand
-            // before committing the new position (reserve, then read, then write).
+            // may have relocated the context read above: re-read the context operand and
+            // commit the new position **before** binding `Dst`. The C advances `sb->start`
+            // inside `erts_bs_get_binary_2` *before* the instruction's `$Dst = _result`,
+            // and `Dst` may be the context's own operand (`beam_asm:filter_essentials/1`
+            // compiles to `ctx == dst == x(3)`), so binding first would clobber the context
+            // the commit re-reads (the frozen reserve, then read, then write ordering).
             let term = reread_ctx(machine, ctx, ctx_op, "bs_get_binary2")?;
             raw::set_ctx_start(term, start + nbits);
+            write_operand(machine, dst, value)?;
             Ok(Some(Step::Next))
         }
         Instr::BsSkipBits2 {
@@ -336,12 +344,15 @@ pub(super) fn exec(
             let (bytes, off) = raw::subject_bytes(orig)?;
             let value = read_float_field(bytes, start + off, nbits, *flags)?;
             let float = crate::terms::make_float_rooted(machine, ctx, value)?;
-            write_operand(machine, dst, float)?;
             // `make_float` reserves through the rooted seam, so a moving collector may
-            // have relocated the context read above: re-read the context operand
-            // before committing the new position (reserve, then read, then write).
+            // have relocated the context read above: re-read the context operand and
+            // commit the new position **before** binding `Dst`. The C advances `sb->start`
+            // inside `erts_bs_get_float_2` *before* the instruction's `$Dst = _result`,
+            // and `Dst` may be the context's own operand (the frozen reserve, then read,
+            // then write ordering).
             let term = reread_ctx(machine, ctx, ctx_op, "bs_get_float2")?;
             raw::set_ctx_start(term, start + nbits);
+            write_operand(machine, dst, float)?;
             Ok(Some(Step::Next))
         }
         Instr::BsGetUtf8 {
