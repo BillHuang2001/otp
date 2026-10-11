@@ -252,6 +252,7 @@ Current: **574 passing / 0 failing / 2 ignored** — **398** lib in-module (`#[c
 - `src/signal.rs` → `Signal`/`Disposition`/`SignalFacility`
 - `src/cpu_time.rs` → `CpuTimes`, `process_cpu_times`, `thread_cpu_times`, `RuntimeClock`
 - `src/ddll.rs` → `DynLib`, `DynLibFlags`, `DllError`/`DllErrorKind`, `ERRCODE_TAB`/`errcode_to_atom`/`atom_to_errcode`/`format_error_text`/`symbol_name`
+- `src/fs_access.rs` → `AccessMode`, `try_access`/`access`/`path_access`, `process_credentials` (the crate's only `access(2)`/`geteuid(2)`/`getegid(2)` site)
 - `src/drivers/fd.rs` → `FdDriver` (line/phase modes, `control`, EOF de-registration, the write-slot seams)
 - `src/drivers/line_buffer.rs` → `LineBuffer`, `DEFAULT_MAX_LINE_LEN`; `src/drivers/binary_io.rs` → `Phase`, `PhaseChange`
 - `src/drivers/efile.rs` → `EfileDriver`, `make_efile`, `FileDataMode`
