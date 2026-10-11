@@ -18,41 +18,32 @@
 //
 // %CopyrightEnd%
 
-//! The **scheduled-process** `call_fun`/`call_fun2` apply seam (owner: `beam_engine`).
+//! The **scheduled-process** `call_fun`/`call_fun2` apply seam.
 //!
-//! `beam_engine` executes `Instr::CallFun`/`Instr::CallFun2` by calling
-//! `ExecutionContext::apply_fun(fun, args)`, a **synchronous** seam that returns a *value* —
-//! so it cannot express "enter the callee in *this* machine". `beam_rt`'s implementation
-//! enters a `.beam` local (`make_fun3`) closure's label through
-//! `RuntimeContext::run_label_blocking`, which drives a **nested** `Machine` around a bounded
-//! scheduler pump. That pump is refused (`Ok(None)`) by [`RuntimeContext::for_process`], whose
-//! `may_pump_scheduler()` is `false` **exactly** because it is itself a scheduler slice — a
-//! slice may never re-enter the scheduler. The suspension then folds into the typed
-//! (and **uncatchable**) capability gap
+//! `beam_engine` executes `Instr::CallFun`/`Instr::CallFun2` by consulting
+//! `ExecutionContext::resolve_local_fun` **first**: on `Some((module, label))` it enters the
+//! closure body **in the calling machine**, so a `receive` inside it suspends the process through
+//! the ordinary `RunOutcome::Wait` path and it is resumed by a real send. Only when the resolver
+//! declines (`Ok(None)`) does the engine fall back to the value-returning
+//! `ExecutionContext::apply_fun`, whose nested `Machine` cannot re-enter the scheduler (a slice's
+//! `may_pump_scheduler()` is `false`) and so folds a suspension into the typed capability gap
 //! `unsupported_opcode: run: process blocked (no message available)`.
 //!
-//! The same code path therefore *works* on the `-eval`/single-pass/boot routes (whose context
-//! **may** pump) and *fails* as soon as the workload is a **scheduled process** — the shape
-//! `beam_rt run <file.beam> <mod>:<fun>/<arity>` uses. `gen:call/4` for a non-pid server id (a
-//! registered atom name or `{Name,Node}`) builds a closure and applies it through
-//! `do_for_proc/2`'s `call_fun`, so **every** `gen_server:call(Name, Req)` to a registered
-//! server made from a scheduled process is affected.
+//! The seam is **closed**: the scheduled slice runs its machine on `runner::budget::BudgetContext`,
+//! a wrapper that forwards every `ExecutionContext` method to the slice's real `RuntimeContext` —
+//! `resolve_local_fun` included — so the scheduled path reaches `RuntimeContext`'s closure resolver
+//! exactly as the `-eval`/single-pass/boot routes do. A scheduled process that applies a blocking
+//! closure therefore answers what the live oracle answers.
 //!
-//! # This file pins the gap; the fix is not `beam_rt`'s to make
+//! The shapes matter because `gen:call/4` for a non-pid server id (a registered atom name or
+//! `{Name,Node}`) builds a closure and applies it through `do_for_proc/2`'s `call_fun`, so **every**
+//! `gen_server:call(Name, Req)` to a registered server made from a scheduled process — the shape
+//! `beam_rt run <file.beam> <mod>:<fun>/<arity>` uses — goes through this seam.
 //!
-//! The seam is engine-side: the change belongs in `beam_engine`'s `CallFun`/`CallFun2` arms
-//! and is escalated in `HANDOFF_boot_apply_seam.md` (**Seam 2**). No in-crate fix exists —
-//! `apply_fun` returns a value, and a slice context structurally cannot re-enter the
-//! scheduler. Two tests bracket the gap:
-//!
-//! * [`a_scheduled_process_applies_a_blocking_closure_and_answers_the_oracle`] is the
-//!   **positive**, `#[ignore]`d `#[ignore = "..."]` **RED** pin: it asserts the *target*
-//!   behaviour (the scheduled `run` matches the live oracle) and **fails today**;
-//! * [`a_scheduled_process_folds_the_closure_apply_into_the_typed_blocked_gap`] is the
-//!   **active** pin of *today's* exact outcome (exit 3 and the identical stderr line), while
-//!   proving the gap is the scheduled **context** and not the code path (the `-eval`
-//!   counterpart of the *same* workload exits 0 with the oracle's line). **Delete it once the
-//!   engine fix lands.**
+//! [`a_scheduled_process_applies_a_blocking_closure_and_answers_the_oracle`] asserts the target
+//! behaviour for both shapes: the scheduled `run` exits `0`, names no `unsupported` gap, and prints
+//! the live oracle's own line, and the `-eval` counterpart of the same workload agrees with the
+//! oracle as well.
 //!
 //! The three fixture modules are compiled **at test time** with the system `erlc` into one
 //! scratch directory (a safe single `-pa` for both runtimes — it never holds a
@@ -70,12 +61,6 @@ const BANNER: &str = "scheduled apply seam";
 
 /// The executable under test.
 const BINARY: &str = env!("CARGO_BIN_EXE_beam_rt");
-
-/// Today's exact stderr for the scheduled-process closure apply — the uncatchable
-/// `unsupported` capability gap the engine folds the suspension into. The active pin asserts
-/// this line byte for byte; it disappears with the engine fix.
-const BLOCKED_LINE: &str =
-    "beam_rt: unsupported: opcode: run: process blocked (no message available)";
 
 /// `saphelper:call/1` — the module the `{call_fun,0}` instruction lives in. Handing the
 /// closure to a **second** module is what defeats the compiler's fun inlining (which would
@@ -346,16 +331,15 @@ fn oracle_line(oracle: &Path, fixtures: &Fixtures, module: &str, function: &str)
 // The tests
 // ---------------------------------------------------------------------------------------
 
-/// The **positive, RED** pin: once `beam_engine` enters the closure in the calling machine, a
-/// scheduled process that applies a blocking closure answers exactly what the live oracle
+/// A scheduled process that applies a blocking closure answers exactly what the live oracle
 /// answers.
 ///
-/// For both shapes it asserts the **target** behaviour — `beam_rt run` exits `0`, names no
-/// `unsupported` capability gap, and prints the oracle's own line — and that the `-eval`
-/// counterpart (the context that *may* pump) already agrees. It **fails today**: the scheduled
-/// `run` exits `3`, which is exactly the gap this file escalates.
+/// For both shapes it asserts `beam_rt run` exits `0`, names no `unsupported` capability gap, and
+/// prints the oracle's own line, and that the `-eval` counterpart of the same workload agrees with
+/// the oracle too. The seam is closed: `BudgetContext` forwards `resolve_local_fun` to the slice's
+/// real `RuntimeContext`, so the engine enters the closure body in the scheduled machine and a
+/// `receive` in it suspends the process instead of folding into the typed `blocked()` gap.
 #[test]
-#[ignore = "RED pin: the scheduled-process call_fun/call_fun2 seam is unclosed; the fix is an engine change escalated in HANDOFF_boot_apply_seam.md (Seam 2)"]
 fn a_scheduled_process_applies_a_blocking_closure_and_answers_the_oracle() {
     let Some((oracle, fixtures)) = fixtures_or_skip() else {
         return;
@@ -379,8 +363,8 @@ fn a_scheduled_process_applies_a_blocking_closure_and_answers_the_oracle() {
         );
         assert_eq!(ours.out, expected, "{label}: the scheduled run's answer");
 
-        // The context that **may** pump already agrees — the gap is the scheduled context, not
-        // the workload or the code path.
+        // The `-eval`/single-pass route (a context that *may* pump) is a cross-check: both
+        // routes must answer what the live oracle answers.
         let eval = run_eval_route(&fixtures, module, function);
         assert_eq!(
             eval.code, 0,
@@ -388,54 +372,5 @@ fn a_scheduled_process_applies_a_blocking_closure_and_answers_the_oracle() {
             eval.code, eval.err
         );
         assert_eq!(eval.out, expected, "{label}: the `-eval` route's answer");
-    }
-}
-
-/// The **negative, ACTIVE** pin of *today's* exact outcome — the RED side of the ignored
-/// positive above.
-///
-/// For both shapes the scheduled `run` must exit `3` with **empty** stdout and exactly
-/// [`BLOCKED_LINE`] on stderr, while the `-eval` counterpart of the *same* workload exits `0`
-/// with the oracle's line. Together that isolates the failure to the scheduled context: the
-/// code path is fine, only a slice's `call_fun`/`call_fun2` folds into the typed
-/// `blocked()` gap.
-///
-/// **Delete this test once the `beam_engine` fix lands** (and un-`#[ignore]` the positive).
-#[test]
-fn a_scheduled_process_folds_the_closure_apply_into_the_typed_blocked_gap() {
-    let Some((oracle, fixtures)) = fixtures_or_skip() else {
-        return;
-    };
-
-    for (label, module, function) in VARIANTS {
-        let ours = run_scheduled(&fixtures, module, function);
-        assert_eq!(
-            ours.code, 3,
-            "{label}: today's scheduled `run` is the typed capability gap, got exit {}: {}",
-            ours.code, ours.err
-        );
-        assert_eq!(
-            ours.out, "",
-            "{label}: the scheduled run prints nothing — nothing was computed"
-        );
-        assert_eq!(
-            ours.err, BLOCKED_LINE,
-            "{label}: the exact uncatchable gap the engine folds the closure apply into"
-        );
-
-        // Same workload, a context that may pump: it agrees with the oracle, so the gap is the
-        // scheduled **context**, not the code path.
-        let expected = oracle_line(&oracle, &fixtures, module, function);
-        let eval = run_eval_route(&fixtures, module, function);
-        assert_eq!(
-            eval.code, 0,
-            "{label}: the `-eval` route must exit 0, got {}: {}",
-            eval.code, eval.err
-        );
-        assert_eq!(
-            eval.out, expected,
-            "{label}: the `-eval` route agrees with the oracle, isolating the gap to the \
-             scheduled context"
-        );
     }
 }
