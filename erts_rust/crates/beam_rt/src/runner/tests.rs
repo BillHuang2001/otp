@@ -867,6 +867,123 @@ run() ->
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// **The A.9 E0 shape, end to end.** A **scheduled** process calls a **float-using** module
+/// across a module boundary; that callee blocks in a `receive`, so the process must suspend and
+/// be resumed by the message — and its return value is the float the callee computed.
+///
+/// Why this is the regression guard for the removed float guard in
+/// [`RuntimeContext::resolve_external_call`](crate::context::RuntimeContext): while the seam
+/// refused a float-using callee (`compile.beam` lowers `fconv`, which is what blocked the E0
+/// route), the `call_ext` fell to the synchronous `call_bif` → `run_export_blocking` path. That
+/// path builds a **nested** machine on the same context, and a nested machine's admission point
+/// is never armed (`may_pump_scheduler() == false` for a scheduled slice), so the callee's
+/// blocking `receive` could not suspend: the first slice would end in an exit carrying the
+/// typed unsupported `blocked()` gap instead of `ProcOutcome::Wait`. The seam now enters the
+/// callee in the calling machine, and the full GC door publishes that machine's whole FR file,
+/// so the float registers it leaves live are relocated rather than dangled (see
+/// `crate::context::gc`).
+#[test]
+fn a_float_using_callee_suspends_and_resumes_a_scheduled_process() {
+    let callee = "\
+-module(xmf_callee).
+-export([await/1]).
+await(Self) ->
+    receive N -> Self ! {result, N + float(N)} end.
+";
+    let caller = "\
+-module(xmf_caller).
+-export([run/0]).
+run() ->
+    Self = self(),
+    xmf_callee:await(Self),
+    receive {result, R} -> R end.
+";
+    let Some(dir) = compile_modules(
+        "xmod_float",
+        &[("xmf_callee", callee), ("xmf_caller", caller)],
+    ) else {
+        eprintln!(
+            "SKIP: no system `erlc` on PATH -- the float cross-module suspend test is skipped"
+        );
+        return;
+    };
+
+    let mut rt = runtime();
+    rt.add_code_path(&dir);
+    // Both modules are loaded through the runtime's code server, so they share its one atom
+    // table — the tuple the callee sends and the tuple the caller matches must agree on the
+    // `result` atom's index. (The entry module is loaded here rather than with
+    // `beam_loader::load_file`, whose private atom table would not be the shared one.)
+    rt.load_module(dir.join("xmf_callee.beam"))
+        .expect("the compiled callee loads");
+    rt.load_module(dir.join("xmf_caller.beam"))
+        .expect("the compiled caller loads");
+    let callee_module = rt
+        .code_server()
+        .module_handle("xmf_callee")
+        .expect("the callee is cached");
+    // The premise: the compiled callee really does lower float-family instructions
+    // (`N + float(N)` lowers to `gc_bif float`/`fconv`/`fmove`/`fadd`), so the case exercises
+    // exactly the guard the seam no longer applies.
+    assert!(
+        crate::context::gc::module_uses_floats(&callee_module),
+        "the callee's source lowers a float-family instruction"
+    );
+
+    let mut state = RunnerState::default();
+    let mut table = table();
+    let pid = table.spawn_default().expect("a fresh process");
+    let module = rt
+        .code_server()
+        .module_handle("xmf_caller")
+        .expect("the caller is cached");
+    let run = module.atom_table.lookup("run").expect("run/0 is interned");
+    state.spawn(
+        pid,
+        ProcessEntry::Export {
+            module,
+            function: run,
+            arity: 0,
+        },
+        Vec::new(),
+    );
+
+    // Slice 1: the caller enters the float-using callee in-machine and parks in its `receive`.
+    // (Before the guard was removed this was an exit carrying `unsupported: … blocked()`.)
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 1_000)
+            .expect("the slice runs")
+    };
+    assert_eq!(
+        outcome,
+        ProcOutcome::Wait,
+        "the float-using callee's blocking `receive` suspends the calling process"
+    );
+
+    // Slice 2: the value the callee awaits arrives; the process resumes inside the callee,
+    // computes `3 + float(3)`, sends itself the result and returns it.
+    table
+        .deliver_simple(pid, pid.to_eterm(), make_small(3))
+        .expect("the awaited value is delivered");
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 1_000)
+            .expect("the resume slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Exit(normal(&mut rt)));
+    let value = beam_engine::terms::float_value(state.result(pid).expect("the result is recorded"))
+        .expect("the process returns the float the callee computed");
+    assert!(
+        (value - 6.0).abs() < 1e-12,
+        "3 + float(3) is 6.0, got {value}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
 // -- execution-tier selection (`super::tier`) -----------------------------
 
 /// The committed engine harness fixture that calls **non-floor, non-registry** `.beam`

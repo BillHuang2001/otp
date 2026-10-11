@@ -2119,7 +2119,8 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// as a module context and `Step::Enter` the callee's export entry with the caller's
     /// continuation stored in the live frame — so the callee's registers, Erlang stack and
     /// frames are the *same* root set the slice's own machine already hands
-    /// [`ExecutionContext::ensure_heap`], and the slice's per-call GC latch covers every
+    /// [`ExecutionContext::ensure_heap_full`] (every x register, the whole Erlang stack **and**
+    /// the whole FR file), and the slice's per-call GC latch covers every
     /// allocation the callee performs (see [`crate::context::gc`]). A recursion through
     /// `call_bif` instead builds a **second** [`Machine`](beam_engine::Machine) whose
     /// admission point is never armed, so every allocation past the process's young heap
@@ -2148,12 +2149,25 @@ impl ExecutionContext for RuntimeContext<'_> {
     ///   that way whose own code reads the call site it runs at
     ///   ([`module_observes_its_call_site`]) → `Ok(None)` as well, so the on-demand route
     ///   never widens the caller-identity caveat documented above;
-    /// * a callee whose code touches the machine's **float-register file** → `Ok(None)` (the
-    ///   float guard — see [`crate::context::gc`]: the in-machine callee runs under the
-    ///   caller's recorded module identity, so a collection over it could dangle a live float
-    ///   register);
     /// * a function atom or export the callee does not have → `Ok(None)`, so the synchronous
     ///   path reports the oracle's `undef` byte for byte.
+    ///
+    /// The one exclusion that is deliberately **absent** here is [`crate::context::gc`]'s
+    /// **float guard**: a callee whose code touches the machine's float-register file is
+    /// entered in-machine like any other. An in-machine callee runs under the **caller's**
+    /// recorded `current_module` (the engine's module-context switch never re-enters this
+    /// context) and may leave `Machine::fr` set, but the door the engine reaches on the
+    /// slice's own machine is [`ExecutionContext::ensure_heap_full`], which publishes the
+    /// caller's **whole FR file** as a root
+    /// ([`publish_roots_full`](crate::context::gc)) — so a collection over that machine
+    /// relocates a live float register instead of dangling it, for *any* module. A float
+    /// register left live at the end of a slice is additionally caught by the runner's
+    /// post-slice scan, which pins the process permanently
+    /// ([`crate::runner`]). The guard the two GC doors still keep
+    /// ([`module_may_be_collected`](crate::context::gc)) keys on the **caller's** module, so
+    /// refusing here would refuse a float-using callee on account of a register file the full
+    /// door publishes anyway — and would route the callee's blocking `receive` onto the
+    /// non-pumping [`Self::call_bif`] path, where it folds into the typed `blocked()` gap.
     ///
     /// Every `Ok(None)` leaves [`Self::call_bif`] — and therefore every observable result —
     /// unchanged: the seam only ever *substitutes a routing* for a call the synchronous path
@@ -2246,17 +2260,6 @@ impl ExecutionContext for RuntimeContext<'_> {
                 callee
             }
         };
-        // The **float guard** (see [`crate::context::gc`]): a module whose code touches the
-        // machine's float-register file must never be collected over — `Machine::fr` holds
-        // *terms* and is not part of the root set `ensure_heap` hands out, so a heap move with
-        // a live float register would dangle it. An in-machine callee runs under the
-        // **caller's** recorded `current_module` (the engine's module-context switch does not
-        // re-enter this context), so entering a float-using callee here could collect under a
-        // float-free caller's identity. Such a callee keeps the synchronous path instead,
-        // which never collects over it — byte for byte its behaviour before this seam.
-        if !self.runtime.module_is_float_free(module, &callee) {
-            return Ok(None);
-        }
         // Resolve the export in the **callee's own** atom table (`Module` code's atoms are
         // that table's, never the runtime's shared one) and hand back the export entry label
         // the synchronous `run_export` would enter. An unknown atom or export is the

@@ -1937,6 +1937,79 @@ fn only_the_load_nif_import_makes_a_module_site_observant() {
     assert!(!module_observes_its_call_site(&module_importing(&[])));
 }
 
+// ---------------------------------------------------------------------------------------
+// The cross-module call seam vs the GC float guard (contract A.9's E0 route)
+// ---------------------------------------------------------------------------------------
+
+/// The float-using fixture (`tests/fixtures/gc_floats.beam`) — its code really lowers a
+/// float-family instruction, which is the property this case needs.
+const GC_FLOATS_BEAM: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/gc_floats.beam"
+);
+
+/// **The seam enters a float-using callee in-machine.** [`RuntimeContext::resolve_external_call`]
+/// used to refuse a module whose code touches the machine's float-register file, which routed
+/// the call onto the synchronous `call_bif` → `run_export_blocking` path: that path builds a
+/// **nested** machine whose admission point is never armed, so a `receive` in the callee cannot
+/// suspend a scheduled slice and folds into the typed `blocked()` gap — exactly the A.9 E0
+/// blocker (`compile:file/2`, whose code lowers `fconv`).
+///
+/// It no longer refuses: the door the engine reaches on a slice's own machine is
+/// [`ExecutionContext::ensure_heap_full`], which publishes the machine's **whole FR file** as a
+/// root (`crate::context::gc::publish_roots_full`), so a collection over a callee that left a
+/// float register live relocates it instead of dangling it — for any module.
+///
+/// The GC doors keep their own copy of the caller-module test (the narrow
+/// [`ExecutionContext::ensure_heap`] door cannot see the FR file), so the module is still *not*
+/// float-free — the check that makes the resolution below meaningful.
+#[test]
+fn the_call_seam_enters_a_float_using_module_in_machine() {
+    let mut rt = runtime();
+    rt.load_module(GC_FLOATS_BEAM)
+        .expect("the float fixture loads into the code server");
+    let floats = rt
+        .code_server()
+        .module_handle("gc_floats")
+        .expect("the fixture is cached under its own name");
+    assert!(
+        !rt.module_is_float_free("gc_floats", &floats),
+        "the fixture lowers a float-family instruction, so the GC doors still refuse to \
+         collect over it"
+    );
+    assert!(
+        super::gc::module_uses_floats(&floats),
+        "the property the guard keys on is the lowered float-family instruction"
+    );
+
+    let mut ctx = RuntimeContext::new(&mut rt);
+    let resolved = ctx
+        .resolve_external_call("gc_floats", "loop", 2)
+        .expect("the seam reports a routing, never an error");
+    let (module, label) = resolved.expect(
+        "a float-using callee is entered in-machine: the call site, not the callee's \
+         instruction set, is refused or admitted",
+    );
+    assert!(
+        Arc::ptr_eq(&module, &floats),
+        "the seam hands back the code server's own handle (the engine dedups contexts on it)"
+    );
+    let function = floats.atom_table.lookup("loop").expect("loop is interned");
+    assert_eq!(
+        Some(label),
+        floats.export(function, 2),
+        "the resolved label is the callee's own export entry"
+    );
+
+    // The remaining refusals are unchanged: an export the callee does not have is still
+    // `Ok(None)`, so the synchronous path reports the oracle's `undef` byte for byte.
+    assert!(
+        ctx.resolve_external_call("gc_floats", "loop", 3)
+            .expect("the seam reports a routing")
+            .is_none(),
+        "an arity the callee does not export is refused"
+    );
+}
 // ---------------------------------------------------------------------------
 // The `RuntimeHooksBridge` arms beyond the timer/tag families.
 //
