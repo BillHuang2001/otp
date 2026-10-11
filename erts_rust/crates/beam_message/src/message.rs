@@ -72,6 +72,21 @@ impl Message {
         self
     }
 
+    /// Re-targets the message's sender identity, keeping **everything else** — `payload`, `token`,
+    /// `off_heap`, `binaries`, `nodes` and `fragments`.
+    ///
+    /// Builder parity with [`with_token`](Message::with_token), for a message whose sender is not
+    /// yet known at [`Message::new`] time. To write a *relocated* `from` back into an envelope that
+    /// already exists, use the in-place [`set_from`](Message::set_from) instead.
+    ///
+    /// `from` is a term. A host that stores a heap word here must gather it as a GC root and scatter
+    /// it back with [`set_from`](Message::set_from) on every collection of the owning process — see
+    /// that method's documentation.
+    pub fn with_from(mut self, from: Eterm) -> Message {
+        self.from = from;
+        self
+    }
+
     /// Sets the off-heap objects the payload owns (they were refcounted during the copy).
     pub fn with_off_heap(mut self, off_heap: Vec<MsoHandle>) -> Message {
         self.off_heap = off_heap;
@@ -127,9 +142,47 @@ impl Message {
         self.from
     }
 
+    /// Writes a **relocated** sender identity back into the envelope — the mutating seam a host's
+    /// rooted-collection walk calls after [`from`](Message::from) has been gathered as a GC root.
+    ///
+    /// `from` is a **term**. A host that stores a heap word here (an on-heap `{Name,node}` pair, an
+    /// external pid, an Info tuple — the rare cases the legacy C also allows,
+    /// `erl_proc_sig_queue.c:2272`) must, for every collection of the owning process:
+    ///
+    /// 1. push [`from`](Message::from) into that collection's root set (alongside the message's
+    ///    payload), then
+    /// 2. write the relocated word back through this setter.
+    ///
+    /// A heap word stored here with **no** such gather survives as a **stale pointer into the
+    /// evacuated from-space** once the owning process collects. The common case — the immediate
+    /// sender pid / node atom / sysname the C asserts (`is_immed(ERL_MESSAGE_FROM(msg))`,
+    /// `erl_proc_sig_queue.c:8441`) — needs no gather and can be written at any time.
+    pub fn set_from(&mut self, from: Eterm) {
+        self.from = from;
+    }
+
     /// The sequence/distribution token ([`NIL`] when absent).
     pub fn token(&self) -> Eterm {
         self.token
+    }
+
+    /// Writes a **relocated** sequence/distribution token back into the envelope — the mutating seam
+    /// a host's rooted-collection walk calls after [`token`](Message::token) has been gathered as a
+    /// GC root.
+    ///
+    /// `token` is a **term** and, unlike `from`, the legacy C *expects* it to be a heap term on the
+    /// distribution path (its DBG assert is `token == am_undefined || token == NIL ||
+    /// is_tuple(token)`, `erl_message.c:388-390`, and it is copied with `copy_struct`). A host that
+    /// stores such a heap tuple here must, for every collection of the owning process:
+    ///
+    /// 1. push [`token`](Message::token) into that collection's root set, then
+    /// 2. write the relocated word back through this setter.
+    ///
+    /// A heap word stored here with **no** such gather survives as a **stale pointer into the
+    /// evacuated from-space** once the owning process collects. [`NIL`] (the absent-token case) is
+    /// an immediate and needs no gather.
+    pub fn set_token(&mut self, token: Eterm) {
+        self.token = token;
     }
 
     /// The off-heap objects the payload owns.
@@ -233,7 +286,13 @@ impl Queue {
     }
 
     /// Appends `message` at the tail (the queue is a FIFO).
+    ///
+    /// Under `debug_assertions` this validates the envelope's two host-relocatable words: `from` and
+    /// `token` must be **immediates** (see `debug_assert_enqueue_terms`), so a host that enqueues an
+    /// un-relocated young-heap word fails loudly here instead of leaving it dangling after the owning
+    /// process's next collection. The check is compiled out under `--release`.
     pub fn enqueue(&mut self, message: Message) {
+        debug_assert_enqueue_terms(message.from(), message.token());
         self.messages.push_back(message);
     }
 
@@ -317,6 +376,47 @@ impl Queue {
     pub(crate) fn remove_index(&mut self, index: usize) -> Option<Message> {
         self.messages.remove(index)
     }
+}
+
+/// Debug-only validation at the enqueue boundary of the two **term-carrying** envelope words a host
+/// must relocate — `from` and `token`.
+///
+/// Both must be genuine values (a bare header word such as `THE_NON_VALUE` is not a term) and must be
+/// **immediates**: the host (`beam_process::Process::run_rooted_collection`) gathers only each queued
+/// message's payload as a GC root, so a non-immediate word left in `from`/`token` would not be
+/// relocated and would dangle into the evacuated from-space after the owning process collects.
+///
+/// Legacy-C nuance: the C also *permits* a heap `token` tuple (`token == am_undefined || token == NIL
+/// || is_tuple(token)`, `erl_message.c:388-390`) and a heap Info-tuple `from`
+/// (`erl_proc_sig_queue.c:2272`), so this is a deliberate narrowing, not a C invariant. A future host
+/// opting into a heap `from`/`token` must (a) add a root-gather for these two words to its collection
+/// walk — pushing them from [`Message::from`]/[`Message::token`] and scattering them back with
+/// [`Message::set_from`]/[`Message::set_token`] — and (b) deliberately relax this tripwire.
+///
+/// Cheap and always compiled out under `--release` (`debug_assert!`).
+fn debug_assert_enqueue_terms(from: Eterm, token: Eterm) {
+    debug_assert!(
+        is_value(from),
+        "Message::from is a bare non-value header word (THE_NON_VALUE), not a term — the envelope \
+         stores a genuine term word here"
+    );
+    debug_assert!(
+        is_immediate(from),
+        "Message::from is not an immediate: a heap `from` must be gathered as a GC root by the \
+         owning process's collection walk and written back with Message::set_from before the \
+         envelope is enqueued, otherwise the word dangles into the evacuated from-space"
+    );
+    debug_assert!(
+        is_value(token),
+        "Message::token is a bare non-value header word (THE_NON_VALUE), not a term — the envelope \
+         stores a genuine term word here"
+    );
+    debug_assert!(
+        is_immediate(token),
+        "Message::token is not an immediate: a heap `token` must be gathered as a GC root by the \
+         owning process's collection walk and written back with Message::set_token before the \
+         envelope is enqueued, otherwise the word dangles into the evacuated from-space"
+    );
 }
 
 #[cfg(test)]

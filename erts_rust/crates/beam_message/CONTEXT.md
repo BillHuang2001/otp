@@ -106,8 +106,10 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
 ### `message.rs` — the envelope and the queue
 - `pub struct Message` — the copied payload plus sender identity and the off-heap objects it owns.
   - `Message::new(payload: Eterm, from: Eterm) -> Message` (token = `NIL`, no off-heap objects, no fragments)
-  - builder: `with_token(Eterm)`, `with_off_heap(Vec<MsoHandle>)`, `with_binaries(Vec<RefcBinary>)`,
-    `with_nodes(Vec<NodeEntry>)`, `with_fragments(Fragments)`
+  - builder: `with_token(Eterm)`, `with_from(Eterm)`, `with_off_heap(Vec<MsoHandle>)`,
+    `with_binaries(Vec<RefcBinary>)`, `with_nodes(Vec<NodeEntry>)`, `with_fragments(Fragments)`
+    (`with_from` is builder parity with `with_token`, for a message whose sender is not known at
+    `Message::new` time; to write a relocated `from` into an existing envelope use `set_from`)
   - accessors: `payload() -> Eterm`, `from() -> Eterm`, `token() -> Eterm`,
     `off_heap() -> &[MsoHandle]`, `binaries() -> &[RefcBinary]`, `nodes() -> &[NodeEntry]`,
     `fragments() -> Option<&Fragments>`, `fragments_mut() -> Option<&mut Fragments>`
@@ -126,9 +128,33 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
     `token`, `off_heap`, `binaries`, `nodes` AND `fragments`: the relocation-safe rebuild a collector
     must use (a from-scratch `Message::new` rebuild drops the fragment chain and the binary/node lists —
     a use-after-free a sibling currently has; see Known Issues).
+  - **envelope relocation invariant** — the envelope's GC-rooting (relocation) surface, field by
+    field:
+    | field | treatment |
+    |---|---|
+    | `payload: Eterm` | relocatable — rebuilt with `with_payload` |
+    | `from: Eterm` | relocatable — `set_from(&mut self, Eterm)` (in-place) / `with_from` (builder) |
+    | `token: Eterm` | relocatable — `set_token(&mut self, Eterm)` |
+    | `off_heap: Vec<MsoHandle>` | **not a term** (a refcounted off-heap handle over a stable slot) — no relocation |
+    | `binaries: Vec<RefcBinary>` | **not a term** (an off-heap refcounted payload handle) — no relocation |
+    | `nodes: Vec<NodeEntry>` | the node word is a sysname **atom** ⇒ immediate — immediate-required |
+    | `fragments: Option<Fragments>` | the payload points *into* the fragment region (foreign to the collected nursery) — not host-relocatable |
+    A host that stores a **heap** word in `from`/`token` must gather it as a GC root and scatter it
+    back through `set_from`/`set_token` on every collection of the owning process; with no such gather
+    the word survives as a stale pointer into the evacuated from-space. The common immediate cases (a
+    sender pid, a node atom, `NIL`) need no gather and are the only ones the enqueue tripwire admits.
 - `pub struct Queue` — the per-process FIFO message queue (a pure data structure; **no** scheduler
   coupling). `new()`/`Default`, `enqueue(Message)`, `dequeue() -> Option<Message>`,
   `peek() -> Option<&Message>`, `len()`, `is_empty()`, `clear()`, `iter() -> impl Iterator<Item=&Message>`.
+  - **enqueue tripwire** (debug-only, `debug_assert_enqueue_terms`): `Queue::enqueue` debug-asserts
+    that the enqueued message's `from` **and** `token` are genuine values (`is_value`) and
+    **immediates** (`is_immediate`), so a host that enqueues an un-relocated young-heap word — or a
+    bare header word such as `THE_NON_VALUE` — fails loudly in tests instead of leaving a dangling word
+    behind. Cheap and compiled out under `--release`. It is a deliberate narrowing of the C, which also
+    permits a heap `token` tuple (`erl_message.c:388-390`) and a heap Info-tuple `from`
+    (`erl_proc_sig_queue.c:2272`): a host opting into those must (a) add a root-gather for the two words
+    to its collection walk (push them from `Message::from`/`Message::token`, scatter them back with
+    `Message::set_from`/`Message::set_token`) and (b) deliberately relax this tripwire.
   - **positional scan cursor** (what the engine's candidate-by-candidate receive drives):
     `cursor() -> QueueCursor` (first message), `cursor_at(position) -> QueueCursor`,
     `position(QueueCursor) -> usize`, `message_at(QueueCursor) -> Option<&Message>`,
@@ -407,6 +433,13 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   `send_fragmented` and `HeapFragment::copy_root`); `logical_binary_bytes()` == the shared refc payload's
   length (and `0` with none) while `heap_words()` counts only the 8-word handle; `with_payload` preserves
   `from`/`token`/`off_heap`/`binaries`/`nodes`/`fragments`.
+- `tests/envelope_relocation.rs` — the envelope's GC-rooting (relocation) surface: `set_from`/`set_token`
+  replace **exactly** the two term words and leave the payload, the off-heap handle, the refc binary, the
+  node reference and the fragment chain untouched (asserted through the accessors, incl.
+  `HeapFragment::contains` on the payload); `with_from` re-targets the sender and keeps the rest; a
+  host-style gather/relocate/scatter round-trip moves `payload`/`from`/`token`; the debug-only enqueue
+  tripwire (`queue.enqueue`) panics on a non-immediate `from`, a non-immediate `token` and a bare
+  `THE_NON_VALUE` word, and a well-formed immediate envelope enqueues and reads back unchanged.
 - `tests/share.rs` — the sharing-preserving evidence: (a) a `1000`-element subterm repeated `N = 8`
   times ⇒ the shared destination uses `2N + 2K` words vs the flat `2N + N·2K` (a >7× saving) and every
   occurrence shares one destination address while the flat copy's are all distinct; (b) the shared copy
@@ -562,18 +595,28 @@ shared/oversubscribed host — prefer ratios.
   message COUNT) and `message_queue_data` (on_heap/off_heap) are unaffected.
 - **`Message.token` is a plain field (`NIL` when absent).** The seq-trace / distribution-token
   machinery that fills it is `beam_dist`/`beam_rt`.
+- **Cross-crate handoff: the host must gather `from`/`token` and scatter them back.** The relocation
+  surface (`with_payload`, `set_from`/`with_from`, `set_token`) and the enqueue tripwire live here, but
+  the *collection walk* that drives them is the host's — `beam_process::Process::run_rooted_collection`
+  (`src/process.rs`): its gather step (~lines 949-956) pushes **only** each queued message's
+  `payload()`, and its scatter step (~lines 980-983) re-installs the envelope with `with_payload`
+  alone, so a heap `from`/`token` is never relocated. The host must also push `message.from()` /
+  `message.token()` as roots and write them back through `Message::set_from` / `Message::set_token`.
+  `beam_process`'s own producers all store immediates (its `CONTEXT.md` pins each), so this is the
+  general hardening, not a live corruption today; a caller that hands `Process::deliver` an on-heap
+  `from` is the residual case the host gather closes.
 - **The binary/node lists are carried but not yet consumed.** `beam_process`/`beam_rt` must own a
   received message's `binaries()`/`nodes()` (they are the receiving process's off-heap references) —
   today nothing sweeps them, the `Message`'s own `Drop` releases them. A **fragmented** message instead
   leaves those lists empty: its payload's off-heap objects live in the fragment's `off_heap` table until
   `Fragments::move_into` hands them to the destination table.
-- **Cross-crate: a received message's fragments/binaries/nodes must survive a mailbox rebuild (sibling
-  `beam_process`).** `beam_process::Process::run_rooted_collection` rebuilds each queued message with
-  `Message::new(payload, from).with_token(...).with_off_heap(...)`, dropping `fragments`/`binaries`/
-  `nodes` — a use-after-free for a fragment-resident payload once source off-heap registration is live.
-  This crate supplies the correct primitive (`Message::with_payload`, which keeps every list); the fix
-  belongs to `beam_process` (reported up). `beam_rt`'s `MailboxState` only retains fragments for messages
-  it removes.
+- **Cross-crate: a received message's fragments/binaries/nodes survive a mailbox rebuild (sibling
+  `beam_process`).** `beam_process::Process::run_rooted_collection` re-installs each queued message with
+  `Message::with_payload` (`src/process.rs`), which keeps the fragment chain and the
+  off-heap / refc-binary / node lists. The one remaining gap in that rebuild is the `from`/`token`
+  gather (above): the root set holds only the payload word, so the host must add the two term words and
+  scatter them back with `set_from`/`set_token`. `beam_rt`'s `MailboxState` only retains fragments for
+  messages it removes.
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude` (incl. `is_message_heap_exhaustion`)
 - `src/copy.rs` → the iterative `copy_struct` engine (the `unsafe` core) + `CopyContext` + the cycle-safe `preflight_words`/`bounded_words`/`is_acyclic` + `size_of_copy` + the clean-destination single-pass path (`CopyTarget`/`TrialTarget`, `is_clean_destination`, `try_copy_fast`)
@@ -582,7 +625,7 @@ shared/oversubscribed host — prefer ratios.
 - `src/layout.rs` → the beam_message-specific M1 **identification + encoding** helpers for the copier: off-heap container (`is_off_heap_container`/`is_off_heap_term`/`off_heap_slot`/`make_off_heap_container`), refc binary (`is_refc_binary_term`), match context (`is_match_context_term`) and external thing (`is_external_header`/`external_node_creation`). Per-object word counts and child-slot enumeration are **not** defined here — the canonical walk (`object_words`, `for_each_child_slot`, `for_each_sizing_child_slot`) is re-exported (`pub(crate) use`) from the LCA `beam_term::layout`
 - `src/off_heap.rs` → `OffHeapTable` (MSO-typed façade over slot-indexed `beam_gc::OffHeap`, plus the refc-binary and node lists); MSO handle re-export + the `pub(crate)` `is_fully_empty`/`rollback` used by the single-pass rollback
 - `src/node.rs` → `NodeEntry`, the refcounted `(node, creation)` external-thing node identity
-- `src/message.rs` → `Message` envelope (payload/from/token + off-heap, binary and node lists + optional `Fragments`) + `Queue` FIFO + the logical-size surface (`heap_words`/`logical_binary_bytes`) and `with_payload`
+- `src/message.rs` → `Message` envelope (payload/from/token + off-heap, binary and node lists + optional `Fragments`) + the envelope relocation surface (`with_payload`, `set_from`/`with_from`, `set_token`) + the `Queue` FIFO with its debug-only enqueue tripwire (`debug_assert_enqueue_terms`) + the logical-size surface (`heap_words`/`logical_binary_bytes`)
 - `src/mailbox.rs` → `send` / `send_fragmented` / `receive` / `receive_ref` data-level primitives
 - `src/error.rs` → `pub(crate)` copy-failure constructors + the public `is_message_heap_exhaustion` predicate (no new error type)
 - `tests/copy.rs` → flat-copy correctness: nested-graph equality, deep list, literal sharing, MSO refcount, exhaustion, HAMT trie
@@ -595,6 +638,7 @@ shared/oversubscribed host — prefer ratios.
 - `tests/binary.rs` → refc-binary payload sharing (refcount, `data_ptr`, `orig` fix-up, size) + on-heap small-binary copy-by-value + `SUB_BITS` match-context flattening (no source aliasing)
 - `tests/external.rs` → external pid/port/ref verbatim copy + node linkage/refcounting
 - `tests/queue.rs` → `send`/`receive` + FIFO queue integration + the `QueueCursor` scan/remove path + send atomicity
+- `tests/envelope_relocation.rs` → the envelope relocation surface (`set_from`/`set_token`/`with_from`) + the debug-only enqueue tripwire
 - `tests/fun.rs` → closure copy correctness: `make_fun`/`make_fun3` blocks sized/walked from the frozen `beam_term::fun` layout, `=:=` equality, byte-identical `NEW_FUN_EXT`, callability, `env[0]` fix-up
 - `tests/fragments.rs` → the fragment-model evidence: `send` vs `send_fragmented` (atomicity), `move_into` (payload onto the receiver heap + off-heap transfer), the multi-fragment chain, refc-binary/map/fun fragment moves, chain-intact-on-failure, accounting
 - `tests/alloc.rs` → the allocation-failure classification contract (`AllocKind::Message` + predicate + no partial write)
