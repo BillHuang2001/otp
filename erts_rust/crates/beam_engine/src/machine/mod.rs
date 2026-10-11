@@ -278,7 +278,8 @@ pub struct Machine {
     /// for the run currently executing.
     ///
     /// [`Machine::drive`](crate::machine::Machine) charges one reduction per
-    /// interpreted instruction and offers each charge to the host through
+    /// interpreted instruction (before the instruction's effect) and offers each
+    /// charge to the host through
     /// [`ExecutionContext::reduce`](crate::context::ExecutionContext::reduce) — a
     /// `&mut dyn ExecutionContext` vtable crossing the interpreter cannot elide. When
     /// the host's [`wants_reduce`](crate::context::ExecutionContext::wants_reduce) is
@@ -299,12 +300,19 @@ pub struct Machine {
     /// The code address the machine is currently executing, or was most recently
     /// **suspended** at: `(function index, code offset)`.
     ///
-    /// Updated by [`Machine::step_instruction`](crate::machine::Machine) — the
+    /// Updated by [`Machine::drive`](crate::machine::Machine) **before** it prices
+    /// each instruction, and again by
+    /// [`Machine::step_instruction`](crate::machine::Machine) at its entry — the
     /// single choke point every *interpreted* instruction passes through (the
     /// interpreter's dispatch loop and the native tiers' per-instruction deopt
     /// helper both go through it) — and cleared by
     /// [`Machine::reset`](crate::machine::Machine::reset). `None` before the
     /// machine has interpreted anything.
+    ///
+    /// The store in the driver is what makes the pre-emption point sound: an `Err`
+    /// from [`reduce`](crate::ExecutionContext::reduce) leaves the machine parked on
+    /// the **not-yet-executed** instruction's address, so a resume at this position
+    /// applies that instruction exactly once.
     ///
     /// This is the engine's read-only "saved instruction pointer": the input to
     /// the execution-position introspection ([`Machine::current_code`], and the
@@ -328,8 +336,10 @@ pub struct Machine {
     ///
     /// Zeroed at every [`Machine::drive`](crate::machine::Machine) entry (one `drive`
     /// call is one run or one resume, i.e. one slice) and incremented once per
-    /// `step_instruction`, so [`Machine::reductions`](crate::machine::Machine) read
-    /// when the slice ends is that slice's instruction count.
+    /// instruction the driver prices — i.e. **before** the instruction's body runs —
+    /// so [`Machine::reductions`](crate::machine::Machine) read when the slice ends is
+    /// that slice's instruction count, the raising instruction and the charge a host
+    /// pre-empted on included.
     ///
     /// The engine's other charging point is
     /// [`ensure_heap`](crate::ExecutionContext::ensure_heap) (reached by

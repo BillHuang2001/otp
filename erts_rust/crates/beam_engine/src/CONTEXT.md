@@ -23,9 +23,11 @@ execution semantics are documented one level up in `../CONTEXT.md` (read it firs
 - **`machine::RunOutcome` is matched EXHAUSTIVELY cross-crate**: `beam_rt/src/boot/drive.rs` and
   `beam_rt/src/runner/run.rs`. It is exactly `{ Returned(Eterm), Wait { func, pc } }` — there is no
   yield/pre-emption variant. The reduction hook is the defaulted
-  `ExecutionContext::reduce(n) -> Result<()>`, charged **once per interpreted instruction** by
-  `Machine::drive` and observed through `Machine::reductions()`/`reset_reductions()`; a host
-  pre-empts by returning its own typed error from `reduce`.
+  `ExecutionContext::reduce(n) -> Result<()>`, charged **once per interpreted instruction, before the
+  instruction's effect**, by `Machine::drive` and observed through
+  `Machine::reductions()`/`reset_reductions()`; a host pre-empts by returning its own typed error from
+  `reduce`, which leaves the instruction unapplied and the machine parked at its `(func, pc)` so a
+  `Machine::resume_outcome` there applies it exactly once.
 - **`Step::Enter` crosses the module boundary on every tier.** A raise that lands in a catch frame
   belonging to another module context, a resolved cross-module `call_ext`, and a cross-module
   `return` onto a caller-context continuation all cross the module boundary as `Step::Enter`; the

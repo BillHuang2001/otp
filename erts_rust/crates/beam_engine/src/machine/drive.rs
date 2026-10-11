@@ -60,13 +60,18 @@ impl Machine {
     /// single `bool` load and no event is ever built. See the `Machine::trace_on`
     /// field docs for the mid-run semantics.
     ///
-    /// And charges **one reduction per interpreted instruction**: the slice's count
-    /// starts at zero here and is read back through [`Machine::reductions`], while
-    /// each charge is also offered to the host through
-    /// [`ExecutionContext::reduce`] — the only way a **non-allocating** loop can be
-    /// pre-empted, since `ensure_heap` is never reached by one. An `Err` from the
-    /// hook ends the run exactly like any other engine failure (the host has
-    /// exhausted its budget); it is never swallowed.
+    /// And charges **one reduction per interpreted instruction, before the
+    /// instruction's effect**: the slice's count starts at zero here and is read
+    /// back through [`Machine::reductions`], while each charge is also offered to
+    /// the host through [`ExecutionContext::reduce`] — the only way a
+    /// **non-allocating** loop can be pre-empted, since `ensure_heap` is never
+    /// reached by one. Because the charge precedes the body, an `Err` from the hook
+    /// ends the run **without** applying the instruction: the machine stays parked
+    /// at `(func, pc)` ([`Machine::current_code`]), so re-entering through
+    /// [`Machine::resume_outcome`] applies it **exactly once**. The counter thus also
+    /// counts a raising instruction and the charge the slice pre-empted on (the same
+    /// charge the host saw — the two always agree). An `Err` from the hook is never
+    /// swallowed: it ends the run exactly like any other engine failure.
     pub(crate) fn drive(
         &mut self,
         module: &Module,
@@ -117,6 +122,31 @@ impl Machine {
                 Some(handle) => (&handle.module, &handle.labels),
                 None => (module, entry_labels),
             };
+            // Record the machine's position as **this** instruction *before* pricing
+            // it. The store is deliberately duplicated with the one
+            // `step_instruction` does at its entry (`interpreter/dispatch.rs`): a
+            // pre-emption below happens before `step_instruction` is reached, so
+            // without this line the parked address would still be the *previous*
+            // instruction — and `Machine::current_code()` is exactly the address a
+            // host resumes at (`Machine::resume_outcome` takes the position
+            // explicitly). Keeping it here is what makes an `Err` from the hook
+            // leave the machine parked on the NOT-yet-executed instruction.
+            self.set_current_code(func, pc);
+            // Price the instruction **before** its body runs: the engine's own slice
+            // counter (read back through `Machine::reductions`) and the host hook that
+            // lets a **non-allocating** loop be pre-empted. `ensure_heap` — the only
+            // other charge — is unreachable from such a loop, so this is the only point
+            // a host is offered one reduction per instruction. Charging first is what
+            // makes a pre-emption safe: an `Err` from `reduce` stops the run with the
+            // instruction's effect NOT yet applied, so the host can resume at
+            // `(func, pc)` and have it applied exactly once (C's `DISPATCH` likewise
+            // checks/consumes `FCALLS` before the body and pre-empts without applying
+            // it). The counter is bumped as part of the same charge, so it always
+            // agrees with the hook.
+            self.reductions = self.reductions.saturating_add(1);
+            if self.reduce_on {
+                ctx.reduce(1)?;
+            }
             let step = match self.step_instruction(active_module, active_labels, func, pc, ctx) {
                 Ok(step) => step,
                 // The uniform raise funnel's second half: `step_instruction` already
@@ -130,15 +160,6 @@ impl Machine {
                 // raising instruction's address.
                 Err(err) => return Err(self.with_uncaught_frames(*err, Some(module), func, pc)),
             };
-            // Price the instruction: the engine's own slice counter (read back by the
-            // host through `Machine::reductions`) and the host hook that lets a
-            // **non-allocating** loop be pre-empted. `ensure_heap` — the only other
-            // charge — is unreachable from such a loop, so this is the only point a
-            // host is offered one reduction per instruction.
-            self.reductions = self.reductions.saturating_add(1);
-            if self.reduce_on {
-                ctx.reduce(1)?;
-            }
             match step {
                 Step::Next => pc += 1,
                 Step::Goto { func: f, pc: p } => {
@@ -204,9 +225,12 @@ impl Machine {
     /// One `drive` call — a run, or a resume of a suspended process — is one
     /// scheduling slice, and the counter is zeroed at its start, so this is that
     /// slice's work in the unit the runtime prices pre-emption in. It is the
-    /// **engine-side twin** of [`ExecutionContext::reduce`]: the hook lets a host
-    /// act *during* the slice, this accessor lets it observe *after* the slice
-    /// returns (`RunOutcome::Wait` included) without keeping its own tally.
+    /// **engine-side twin** of [`ExecutionContext::reduce`]: every charge bumps both,
+    /// so the count always includes the last charge the hook saw — the one a host
+    /// pre-empted on included — and a raising instruction (the charge precedes the
+    /// body). The hook lets a host act *during* the slice; this accessor lets it
+    /// observe *after* the slice returns (`RunOutcome::Wait` included) without
+    /// keeping its own tally.
     ///
     /// Honest by construction: only the interpreter's dispatch loop charges, so
     /// under the baseline JIT tier — where a natively executed block bypasses
@@ -239,12 +263,13 @@ mod tests {
     //! literals — a silent correctness bug — so each test pins it explicitly.
     use std::sync::Arc;
 
+    use beam_common::{BeamError, Result};
     use beam_loader::{Atom, HeapNeed, Instr, Label, Module, Operand};
-    use beam_term::make_small;
+    use beam_term::{make_small, Eterm, NIL};
 
+    use crate::context::{ExecutionContext, MinimalContext};
     use crate::machine::test_support::{seam, Fixture};
-    use crate::machine::{Machine, RunOutcome};
-    /// The caller `m`: `run/0` allocates, `call_ext`s `c:<target>/0`, then receives
+    use crate::machine::{Machine, RunOutcome};    /// The caller `m`: `run/0` allocates, `call_ext`s `c:<target>/0`, then receives
     /// (suspending on the empty mailbox).
     fn caller_then_receive(target: &str) -> (Module, Atom) {
         let mut f = Fixture::new("m");
@@ -464,5 +489,181 @@ mod tests {
             "context 0 is the borrowed entry module, reported as None"
         );
         assert_eq!(machine.catch_frame_depth(), 0, "the handler consumed its frame");
+    }
+
+    // -----------------------------------------------------------------------
+    // The reduction charge is applied BEFORE the instruction's effect
+    // -----------------------------------------------------------------------
+
+    /// A host that wraps a [`MinimalContext`] — borrowing its pointer-stable region
+    /// heap — and counts reduction charges and heap allocations.
+    ///
+    /// It is the smallest context that can *prove* an ordering: `alloc_words` is the
+    /// countable, non-idempotent effect a `put_list` produces, and `reduce` is the
+    /// pre-emption point. `wants_reduce()` is forced `true` (the engine must actually
+    /// call the hook), unlike `MinimalContext`'s own `false`.
+    struct ChargeCtx {
+        inner: MinimalContext,
+        /// The `n` of every `reduce` call, in order (the pre-empting one included).
+        charges: Vec<u32>,
+        /// Once set, `reduce` pre-empts on the charge past this many.
+        budget: Option<u32>,
+        /// How many `alloc_words` calls the host has served.
+        allocations: u32,
+    }
+
+    impl ChargeCtx {
+        fn with_budget(budget: u32) -> ChargeCtx {
+            ChargeCtx {
+                inner: MinimalContext::new(),
+                charges: Vec::new(),
+                budget: Some(budget),
+                allocations: 0,
+            }
+        }
+    }
+
+    impl ExecutionContext for ChargeCtx {
+        fn call_bif(
+            &mut self,
+            module: &str,
+            function: &str,
+            arity: u32,
+            args: &[Eterm],
+        ) -> Result<Eterm> {
+            self.inner.call_bif(module, function, arity, args)
+        }
+
+        fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm> {
+            self.allocations += 1;
+            self.inner.alloc_words(n)
+        }
+
+        fn ensure_heap(
+            &mut self,
+            heap_need: u32,
+            live: u32,
+            x_regs: &mut [Eterm],
+            stack: &mut [Eterm],
+        ) -> Result<()> {
+            self.inner.ensure_heap(heap_need, live, x_regs, stack)
+        }        fn reduce(&mut self, n: u32) -> Result<()> {
+            self.charges.push(n);
+            if let Some(budget) = self.budget {
+                if self.charges.len() as u32 > budget {
+                    return Err(crate::error::unsupported("reduction budget exhausted"));
+                }
+            }
+            Ok(())
+        }
+
+        fn wants_reduce(&self) -> bool {
+            true
+        }
+    }
+
+    /// The `.name` of a typed engine raise (the host's own reason, unsubstituted).
+    fn reason_of(error: BeamError) -> String {
+        match error {
+            BeamError::Raise(raise) => raise
+                .reason
+                .as_atom()
+                .expect("a typed engine error names its reason")
+                .to_string(),
+            other => panic!("expected a typed raise, got {other:?}"),
+        }
+    }
+
+    /// `run/0`: two `put_list`s (each building one cons cell, i.e. one 2-word heap
+    /// allocation), then `x0 = x1`, then `return`. Code index **2** is the second
+    /// `put_list` — the instruction a budget of two charges pre-empts on. The X-file
+    /// is `NIL` at reset, so the result is the two-element list `[NIL, NIL]`.
+    fn two_conses_module() -> (Module, Atom) {
+        let mut f = Fixture::new("m");
+        let run = f.add_function(
+            "run",
+            0,
+            vec![
+                Instr::Label(Label(1)),
+                Instr::PutList {
+                    head: Operand::X(0),
+                    tail: Operand::X(1),
+                    dst: Operand::X(1),
+                },
+                Instr::PutList {
+                    head: Operand::X(0),
+                    tail: Operand::X(1),
+                    dst: Operand::X(1),
+                },
+                Instr::Move {
+                    src: Operand::X(1),
+                    dst: Operand::X(0),
+                },
+                Instr::Return,
+            ],
+        );
+        f.add_export("run", 0, run);
+        let name = f.atom("run");
+        (f.finish(), name)
+    }
+
+    /// **The pre-emption point is sound**: the reduction charge is applied **before**
+    /// the instruction's body, so an `Err` from [`ExecutionContext::reduce`] leaves the
+    /// machine parked on the **not-yet-executed** instruction with its effect
+    /// un-applied; a [`Machine::resume_outcome`] at that address then applies it
+    /// **exactly once**.
+    ///
+    /// Code index 2 is a `put_list` — a countable, non-idempotent effect (one 2-word
+    /// cons-cell allocation). Under the unsound charge-after-execute order the
+    /// pre-empted `put_list` would already have built a cons and the resume would build
+    /// it again, so the returned list would be three conses long and the host would
+    /// have served three allocations instead of two.
+    #[test]
+    fn a_pre_empted_instruction_is_unapplied_and_a_resume_applies_it_exactly_once() {
+        let (module, run) = two_conses_module();
+        let mut machine = Machine::new();
+        let mut ctx = ChargeCtx::with_budget(2);
+
+        // Budget 2: the charges for code index 0 (`label`) and index 1 (the first
+        // `put_list`) are accepted; the third charge (code index 2, the second
+        // `put_list`) pre-empts **before** that instruction runs.
+        let err = machine
+            .run_export_outcome(&module, run, 0, &[], &mut ctx)
+            .expect_err("the third charge pre-empts the run");
+        assert_eq!(
+            reason_of(err),
+            "unsupported_opcode: reduction budget exhausted",
+            "the host's own typed error propagates unchanged"
+        );
+        assert_eq!(ctx.charges.len(), 3, "the pre-empting charge was offered");
+        assert_eq!(
+            machine.current_code(),
+            Some((0, 2)),
+            "the machine is parked on the NOT-yet-executed instruction"
+        );
+        assert_eq!(
+            ctx.allocations, 1,
+            "only the first `put_list` ran; the pre-empted one did NOT"
+        );
+
+        // Lift the budget and resume at the parked address: the pre-empted `put_list`
+        // is applied exactly once, then the function finishes.
+        ctx.budget = None;
+        let outcome = machine
+            .resume_outcome(&module, 0, 2, &mut ctx)
+            .expect("the resume runs the rest of the function");
+        let RunOutcome::Returned(list) = outcome else {
+            panic!("the function returns a list, got {outcome:?}");
+        };
+        assert_eq!(
+            ctx.allocations, 2,
+            "the pre-empted `put_list` ran exactly once on the resume, not twice"
+        );
+        let elems = crate::terms::list_elements(list).expect("the result is a proper list");
+        assert_eq!(
+            elems,
+            vec![NIL, NIL],
+            "the result is EXACTLY two cons cells (a third would make it three elements)"
+        );
     }
 }

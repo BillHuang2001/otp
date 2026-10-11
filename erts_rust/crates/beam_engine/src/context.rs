@@ -636,7 +636,7 @@ pub trait ExecutionContext {
     }
 
     /// The **per-instruction reduction hook**: charge `n` reductions for the
-    /// instruction the engine has just executed.
+    /// instruction the engine is about to execute.
     ///
     /// A BEAM process is pre-emptible because the runtime prices work in
     /// *reductions* and checks its budget at known points. The engine's **only**
@@ -644,18 +644,22 @@ pub trait ExecutionContext {
     /// (reached by `test_heap`/`allocate_heap`), which a tight **non-allocating**
     /// loop — the one shape that can monopolise a scheduler — never touches. This
     /// hook closes that gap: [`Machine::drive`](crate::machine::Machine) calls it
-    /// **once per interpreted instruction** with `n = 1`, after the instruction
-    /// succeeded, so a host can price instructions rather than heap admissions.
+    /// **once per interpreted instruction** with `n = 1`, **before** the
+    /// instruction's body runs, so a host can price instructions rather than heap
+    /// admissions.
     ///
     /// The default body is a **no-op** ([`Ok`]) — deliberately *not* a typed error:
     /// a host that does not pre-empt simply ignores the hook, so every existing
     /// implementor compiles and behaves byte-identically (it pays only the call).
     /// Returning `Err` propagates out of the run exactly like any other engine
     /// failure, so a host that has exhausted its budget returns **its own** typed
-    /// exhaustion error (a host that pre-empts *by failing* must remember that the
-    /// machine keeps its position: re-entering through
-    /// [`Machine::resume_outcome`](crate::machine::Machine::resume_outcome) is what
-    /// continues the process, not [`Machine::run_export`](crate::machine::Machine::run_export)).
+    /// exhaustion error. Because the charge precedes the body, that error leaves the
+    /// instruction **not applied** and the machine parked at its `(func, pc)`
+    /// ([`Machine::current_code`](crate::machine::Machine::current_code)), so a host
+    /// that pre-empts *by failing* continues the process by re-entering through
+    /// [`Machine::resume_outcome`](crate::machine::Machine::resume_outcome) — which
+    /// applies that instruction **exactly once** — not by
+    /// [`Machine::run_export`](crate::machine::Machine::run_export).
     ///
     /// The engine also counts the same charge in
     /// [`Machine::reductions`](crate::machine::Machine::reductions) — the slice's
@@ -670,8 +674,9 @@ pub trait ExecutionContext {
     /// be called at all for the process currently running?
     ///
     /// [`Machine::drive`](crate::machine::Machine) charges **one reduction per
-    /// interpreted instruction**, and that charge is also offered to the host
-    /// through [`reduce`](ExecutionContext::reduce). The hook call is a
+    /// interpreted instruction** (before the instruction's effect), and that charge
+    /// is also offered to the host through [`reduce`](ExecutionContext::reduce). The
+    /// hook call is a
     /// `&mut dyn ExecutionContext` vtable crossing the interpreter cannot elide, so
     /// the driver latches this answer **once per run** into the
     /// `Machine::reduce_on` flag and then skips the hook call entirely on a run
