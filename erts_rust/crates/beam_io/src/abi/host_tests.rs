@@ -568,17 +568,82 @@ fn the_no_port_slots_reach_the_host_only_inside_a_publication() {
 // port context's output queue.
 // -----------------------------------------------------------------------------------------------
 
-/// The head of `host`'s driver queue as `DriverHost::peekq` views it, or `None` when it is empty.
+/// The head of `host`'s driver queue, read through the **safe** [`AbiHost::queue_head`] accessor
+/// and cross-checked against the raw [`DriverHost::peekq`] view it mirrors, or `None` when empty.
+///
+/// Reading the bytes off the raw view needs `unsafe` (`iov_base` is a raw pointer); this helper
+/// needs none, which is what pins `queue_head` as a sufficient safe wrapper for `driver_peekq`.
 fn peeked_bytes(host: &mut AbiHost) -> Option<Vec<u8>> {
-    let view = DriverHost::peekq(host)?;
+    let view = DriverHost::peekq(host);
+    let head = AbiHost::queue_head(host);
+    match (&view, head) {
+        (None, None) => None,
+        (Some(view), Some(head)) => {
+            assert_eq!(view.len(), 1, "the queue is one contiguous entry");
+            assert_eq!(
+                head.len(),
+                view[0].iov_len,
+                "the safe accessor sees exactly the raw view's head length"
+            );
+            assert_eq!(
+                head.as_ptr(),
+                view[0].iov_base as *const u8,
+                "the raw view addresses the safe accessor's buffer"
+            );
+            Some(head.to_vec())
+        }
+        (view, head) => panic!(
+            "driver_peekq and AbiHost::queue_head disagree on emptiness \
+             (raw view present: {}, safe head present: {})",
+            view.is_some(),
+            head.is_some()
+        ),
+    }
+}
+
+/// [`AbiHost::queue_head`] is the safe companion of `driver_peekq`: it hands out the same head
+/// bytes as a slice without `unsafe`, is `None` exactly when the raw view is, needs no installed
+/// `DriverContext` (the queue is the host's own state, as the C's `drvport2ioq(ix)` is), and is
+/// bounded to the queue-mutation lifetime by taking `&self` while every mutating hook takes
+/// `&mut self`.
+#[test]
+fn the_queue_head_accessor_is_the_safe_peekq_view() {
+    let mut host = new_host();
+
+    // Nothing queued: the raw hook reports its `NULL` view and the accessor `None`.
+    assert!(DriverHost::peekq(&mut host).is_none());
+    assert_eq!(host.queue_head(), None);
+    assert_eq!(host.state().queue_len(), 0);
+
+    // A queued head: the accessor returns the raw view's bytes, of the raw view's length, and
+    // `driver_sizeq` counts the same bytes.
+    assert_eq!(DriverHost::enq(&mut host, b"hello", false), 0);
+    let view = DriverHost::peekq(&mut host).expect("a non-empty queue has a view");
     assert_eq!(view.len(), 1, "the queue is one contiguous entry");
-    // SAFETY: `iov_base` points into the host's own queue buffer and stays valid until the next
-    // `enq`/`pushq`/`deq` (the lifetime the C gives the pointer). The bytes are copied out
-    // immediately, before `host` is touched again.
-    Some(
-        unsafe { core::slice::from_raw_parts(view[0].iov_base as *const u8, view[0].iov_len) }
-            .to_vec(),
-    )
+    let head = host.queue_head().expect("a non-empty queue has a head");
+    assert_eq!(head, b"hello");
+    assert_eq!(head.len(), view[0].iov_len);
+    assert_eq!(
+        head.as_ptr(),
+        view[0].iov_base as *const u8,
+        "the raw view addresses the accessor's buffer"
+    );
+    assert_eq!(
+        host.state().queue_len(),
+        head.len(),
+        "the `sizeq` companion agrees with the `peekq` companion"
+    );
+
+    // The accessor follows the queue: `pushq` prepends and `deq` drops from the head.
+    assert_eq!(DriverHost::pushq(&mut host, b"xy", false), 0);
+    assert_eq!(host.queue_head(), Some(&b"xyhello"[..]));
+    assert_eq!(DriverHost::deq(&mut host, 2), 2);
+    assert_eq!(host.queue_head(), Some(&b"hello"[..]));
+
+    // A full drain takes the accessor back to `None`, like the raw view.
+    assert_eq!(DriverHost::deq(&mut host, 100), 5);
+    assert_eq!(host.queue_head(), None);
+    assert!(DriverHost::peekq(&mut host).is_none());
 }
 
 /// The five queue hooks move bytes on the driver's own queue, in the C's order; they need no

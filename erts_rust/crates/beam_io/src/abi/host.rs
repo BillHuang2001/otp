@@ -462,6 +462,29 @@ impl AbiHost {
         self.state.jobs.in_flight() > 0
     }
 
+    /// The head of the port's **driver queue** as a safe byte slice — the safe companion of
+    /// [`DriverHost::peekq`], exactly as [`DriverState::queue_len`] is the safe companion of
+    /// [`DriverHost::sizeq`].
+    ///
+    /// The raw hook [`DriverHost::peekq`] hands back `SysIOVec`s whose `iov_base` is a **raw
+    /// pointer**, so a caller that wanted the queued bytes (what `driver_peekq`/`driver_peekqv`
+    /// publish to a C driver) had to dereference it under `unsafe`. This accessor hands out the same
+    /// bytes as a borrowed slice instead, and answers `None` for an empty queue (the raw hook's
+    /// `NULL` view).
+    ///
+    /// The slice borrows the queue's own buffer, so it stays valid only until the next
+    /// [`enq`](DriverHost::enq)/[`pushq`](DriverHost::pushq)/[`deq`](DriverHost::deq) — the lifetime
+    /// the C gives the pointer it returns — which is what the `&self` borrow enforces: every hook
+    /// that mutates the queue takes `&mut self`.
+    ///
+    /// Because this host's queue is one contiguous [`ByteQueue`], the slice is the queue's whole
+    /// content — the raw view's single `vlen == 1` entry (see [`DriverHost::enq`] for that deviation
+    /// from the C's per-enqueue chunking) — and [`DriverState::queue_len`] is its length.
+    pub fn queue_head(&self) -> Option<&[u8]> {
+        let front = self.state.ioq.front();
+        (!front.is_empty()).then_some(front)
+    }
+
     /// The port's persistent state, mutably.
     pub(crate) fn state_mut(&mut self) -> &mut DriverState {
         &mut self.state
