@@ -130,6 +130,9 @@ fn comparison_flags_presence_and_status_changes() {
 /// `.beam` under *both* runtimes, so it must stay `Runtimes::Both` (schedulable under the
 /// `rust` runtime) and keep declaring the contracts it exercises. If it is ever flipped
 /// back to `SysOnly` or removed, this fails loudly — no silent loss of Rust coverage.
+///
+/// The same guard covers the three other cross-runtime signals: `list_walk` (compute),
+/// `copy_bound` (messaging/copy) and `gc_bound` (GC).
 #[test]
 fn a_real_foreign_workload_is_measured_under_both_runtimes() {
     let foreign = workload::find("foreign").expect("the `foreign` workload must be registered");
@@ -175,5 +178,44 @@ fn a_real_foreign_workload_is_measured_under_both_runtimes() {
     assert!(
         rust_capable.contains(&"list_walk"),
         "the rust-schedulable workload set must include `list_walk`; got {rust_capable:?}"
+    );
+
+    // `copy_bound` (messaging/copy-bound) and `gc_bound` (GC-bound) close the two
+    // non-compute cross-runtime gaps: both must stay registered, run under *both* runtimes,
+    // and keep their category/contracts. If either is ever flipped back to `SysOnly` or
+    // removed, this fails loudly — no silent loss of Rust coverage.
+    let copy_bound =
+        workload::find("copy_bound").expect("the `copy_bound` workload must be registered");
+    assert!(
+        matches!(copy_bound.runtimes(), Runtimes::Both),
+        "`copy_bound` must run under both runtimes, got {:?}",
+        copy_bound.runtimes()
+    );
+    assert_eq!(copy_bound.category(), Category::Messaging);
+    assert!(
+        copy_bound.contracts().contains(&"A.1") && copy_bound.contracts().contains(&"A.5"),
+        "contracts: {:?}",
+        copy_bound.contracts()
+    );
+    assert!(
+        rust_capable.contains(&"copy_bound"),
+        "the rust-schedulable workload set must include `copy_bound`; got {rust_capable:?}"
+    );
+
+    let gc_bound = workload::find("gc_bound").expect("the `gc_bound` workload must be registered");
+    assert!(
+        matches!(gc_bound.runtimes(), Runtimes::Both),
+        "`gc_bound` must run under both runtimes, got {:?}",
+        gc_bound.runtimes()
+    );
+    assert_eq!(gc_bound.category(), Category::Gc);
+    assert!(
+        gc_bound.contracts().contains(&"A.1"),
+        "contracts: {:?}",
+        gc_bound.contracts()
+    );
+    assert!(
+        rust_capable.contains(&"gc_bound"),
+        "the rust-schedulable workload set must include `gc_bound`; got {rust_capable:?}"
     );
 }
