@@ -183,9 +183,27 @@ Invocations: scheduled `beam_rt -pa DIR run DIR/<m>.beam <m>:<f>/0`; may-pump
 `erl -noshell -pa DIR -eval 'io:format("~w~n",[<m>:<f>()]), halt(0).'`.
 
 The `-eval` column agreeing with the oracle is the key isolation: the *same* code path works when the
-context may pump, so the failure is specific to the scheduled slice. (Incidental and out of scope
-here: `gen:call` with a *finite* timeout instead hits a separate `receive … after T` gap →
-`beam_rt: badarg`.)
+context may pump, so the failure is specific to the scheduled slice.
+
+Two boundary facts keep this seam from being over-claimed (both measured on the same fixture shape, a
+hand-rolled `{'$gen_call', {From, Mref}, ping}` server; oracle prints `pong`/`{ok,pong}` in every row):
+
+* **A pid destination with `infinity` does not use this seam and works**:
+  `gen:call(Pid, '$gen_call', Req, infinity)` → `{ok,pong}`. `gen:call/4`'s *first* clause matches
+  `is_pid/1` and calls `do_call/4` directly, so the blocking `receive` is ordinary machine code that
+  pauses and resumes normally. Only the **non-pid** (registered-name / `{global,…}` / `{via,…}` /
+  remote) clause builds the `Fun(Pid)` closure.
+* **A finite timeout never gets here**: `gen_server:call/2` is `gen:call/3`, whose default is
+  `?default_timeout` = 5000 (finite), so the ordinary `call/2` and `call/3` die *earlier*, of a separate
+  `beam_rt` gap — `erlang:monitor(process, P, [{alias,demonitor}])` (`gen:do_call/4`'s finite clause) is
+  unsupported and raises `badarg`, which (raised inside the same nested closure machine) escapes the
+  caller's `catch`. That gap is recorded in [`M1_GAPS.md`](M1_GAPS.md) and its real fix (alias refs) is
+  `beam_process`/`beam_bifs` work, not this seam.
+
+Consequence beyond `gen`: the scheduled-path `file`/io-device round-trip
+(`gen_server:call` to the registered `file_server_2`, observed as the `blocked()` gap rather than the
+alias `badarg`, i.e. the name + `infinity` form) is this same seam, so closing it also unblocks
+`file:read_file/1`, `file:open/2`+`read/2`+`close/1` and `file:read_line/1` for a scheduled process.
 
 ### C ground truth
 `call_fun` (`erts/emulator/beam/beam_common.c:1605`) sets up the free variables in

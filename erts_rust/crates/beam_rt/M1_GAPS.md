@@ -408,7 +408,11 @@ Exit 0 = success, 1 = runtime error, 3 = capability gap.
 (a `RuntimeHooks` bridge). A `spawn`/`spawn_link` child whose **entry function** itself blocks in a
 `receive` parks and is resumed (`spawn(M,F,[])` with the blocking receive at the top level of `M:F`,
 incl. via a cross-module call, `erlang:apply(M,F,[])`, or a local fun). Local fun application with free
-variables and a blocking `receive` works. `gen_server:cast/2` returns `ok` (it is a plain `!`). Plain
+variables works **only while the closure's body can complete without a suspension** — an already-queued
+message matches immediately, and a closure that is the process *entry* is driven in-machine by the
+runner; a closure whose body must **wait** folds into the typed `blocked()` gap (item 2 and
+[`HANDOFF_boot_apply_seam.md`](HANDOFF_boot_apply_seam.md), Seam 2). `gen_server:cast/2` returns `ok`
+(it is a plain `!`). Plain
 `!`/`receive`, `erlang:monitor(process,P)` (arity 2) and `erlang:monitor(process,P,[{tag,T}])` work.
 From `-eval` (pumped) the whole `file` read path agrees with the oracle (see "Path asymmetry").
 
@@ -429,11 +433,23 @@ From `-eval` (pumped) the whole `file` read path agrees with the oracle (see "Pa
    `erlang:monitor(process, Process, [{alias,demonitor}])`; this runtime's `monitor/3` serves only the
    `{tag,T}` option, so the alias option raises `badarg` (and the reply tag `[alias|Mref]` is then
    `badarg` too). `erlang:send/3` (the `[noconnect]` send the same clause uses) is the typed gap
-   `unsupported: erlang:send/3`. Repro: `mon:alias_mon/0`, `mon2:alias_reply/0` → `badarg` (oracle: a
-   `#Ref{}`); `gc9:gencall/0` → `badarg`; `gs:call_srv/0` → `beam_rt: error
-   {badarg,{gen_server,call,[<pid>,ping]}}`. `gen:call(P,'$gen_call',Req,infinity)` avoids the alias
-   monitor and works from `-eval`, but from a scheduled process still folds into
-   `unsupported_opcode: ... process blocked` (the enclosing `do_for_proc` fun application).
+   `unsupported: erlang:send/3`. **`gen_server:call/2` is not the infinity form**: `gen:call/3` is
+   `gen:call(Process, Label, Request, ?default_timeout)` with `?default_timeout = 5000`, so the most
+   common call form takes the finite clause too. Repro: `mon:alias_mon/0`, `mon2:alias_reply/0` →
+   `badarg` (oracle: a `#Ref{}`); `gc9:gencall/0` → `badarg`; `gs:call_srv/0` → `beam_rt: error
+   {badarg,{gen_server,call,[<pid>,ping]}}`. The measured form split (oracle prints `pong`/`{ok,pong}`
+   in every row; fixture = a hand-rolled `{'$gen_call', {From, Mref}, ping}` server):
+   | call | beam_rt, scheduled process |
+   |---|---|
+   | `gen_server:call(Pid, Req)` (arity 2 ⇒ `gen:call/3` ⇒ finite 5000) | `badarg`, wrapped `{'EXIT',{badarg,{gen_server,call,[Pid,Req]}}}`, **caught** by the caller |
+   | `gen_server:call(Pid, Req, 5000)` | the same `badarg` (caught) |
+   | `gen:call(Pid, '$gen_call', Req, infinity)` | **`{ok,pong}` — works** (the pid clause of `gen:call/4` calls `do_call/4` directly, so the blocking `receive` is ordinary machine code and suspends/resumes normally) |
+   | `gen_server:call(Name, Req)` / `(Name, Req, 5000)` | **bare `beam_rt: badarg`, uncaught** — the alias `badarg` fires first and, being raised inside the nested `do_for_proc` closure machine, escapes the caller's `catch` (see "Incidental engine observation") |
+   | `gen:call(Name, '$gen_call', Req, infinity)` | exit 3 `unsupported_opcode: ... process blocked` — **Seam 2** of [`HANDOFF_boot_apply_seam.md`](HANDOFF_boot_apply_seam.md): with the alias monitor out of the way, the *non-pid* clause of `gen:call/4` applies `fun(Pid) -> do_call(...) end` via `do_for_proc/2`'s `Fun(Pid)`, a real `call_fun`, and a scheduled process cannot suspend inside it |
+   So the two failures are separable by form: **pid + `infinity` works**; **any finite timeout** dies of
+   the `monitor/3` alias gap (a `beam_rt`-visible floor gap, whose real fix — alias refs — is
+   `beam_process`/`beam_bifs` work); **any registered-name call** dies at Seam 2 whenever the alias gap
+   is not the first thing hit.
 3. **`sys:get_state/1` and every `sys:*` request raise `badarg`.** `sys` issues
    `gen:call(Name, system, Request)` (`lib/stdlib/src/sys.erl:749`) → the same monitor-alias `badarg`.
    Repro: `ev:sysstate/0` → `beam_rt: error badarg` (oracle: `0`).
@@ -456,7 +472,9 @@ From `-eval` (pumped) the whole `file` read path agrees with the oracle (see "Pa
    `read/2` + `close/1`, `file:read_line/1`, `filelib:is_file/1` (absent path), all
    `unsupported: opcode: run: process blocked (no message available)`; each agrees with the oracle from
    `-eval` (see the path asymmetry). Root cause: the runtime-native `file_server_2` round-trip is a
-   `gen_server:call` (→ `gen:call` → ordinary blocking receive), which only the `-eval` pump can suspend.
+   `gen_server:call` to the **registered name**, and the observable is the `blocked()` gap rather than
+   the alias `badarg` — so the request uses the name + `infinity` form, i.e. **Seam 2** (a scheduled
+   process cannot suspend inside the `do_for_proc` closure), and not the `monitor/3` alias gap of item 2.
    Path-independent typed gaps in the same family: `file:write_file/2` → `file_server: the 'write_file/2'
    request is not implemented`; `file:consult/1` → `file_server: the 'getopts/0' io request is not
    implemented`; `filelib:is_file/1` on an **existing** path → `file_server: the #file_info{} 'access' slot
