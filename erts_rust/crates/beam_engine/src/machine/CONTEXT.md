@@ -48,9 +48,12 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   native tier resumes on it: `Interpreter` → `resume_outcome`, `BaselineJit` → the cached no-reset baseline resume,
   `Cranelift` → a typed error); `RunOutcome` (`Returned` / `Wait`), re-exported at the crate root.
 - `drive.rs` — **`Machine::drive`**: owns the `(func, pc)` position *and* the module context those indices belong
-  to, folds every `Step` back into that position, charges **exactly one reduction per interpreted instruction**
-  through the defaulted `ExecutionContext::reduce` (the only pre-emption point a non-allocating loop reaches;
-  read back through `Machine::reductions()`/`reset_reductions()`), and re-binds the
+  to, folds every `Step` back into that position, and charges **exactly one reduction per interpreted instruction
+  before the instruction's effect** through the defaulted `ExecutionContext::reduce` (the only pre-emption point a
+  non-allocating loop reaches; read back through `Machine::reductions()`/`reset_reductions()`). The charge precedes
+  the body (C's `DISPATCH` order), so an `Err` from the hook pre-empts the instruction **without applying it**: the
+  machine is left parked at that `(func, pc)` — recorded by `Machine::set_current_code` before the charge — and a
+  `Machine::resume_outcome` there applies it exactly once. It then re-binds the
   literal area exactly on a `Step::Enter` into a different context. It also runs the raise funnel's second half
   (`Machine::with_uncaught_frames`) over a raise that surfaced inside a cross-module callee — the driver is where
   the run's true entry module is known, so those caller frames are named against the right module.

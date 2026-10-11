@@ -182,6 +182,57 @@ pub fn compile(erlc: &Path, source: &str, module: &str) -> Result<CompiledModule
     Ok(compiled)
 }
 
+/// Compile an **additional** module (source + `.beam`) into an already-built case's temp dir.
+///
+/// This is how a `ModuleEnv` case places a *helper* module next to its `run` module: the
+/// `run` action loads only the `.beam` named on its own command line, so a cross-module call
+/// from it resolves through the runtime's code path — which, for the case, holds the temp dir
+/// only because its environment put it there (`ERL_AFLAGS=-pa <dir>`). Without the helper the
+/// case would be vacuous on the Rust side.
+///
+/// `dir` must be the temporary directory of an already compiled module
+/// ([`CompiledModule::dir`]); `source` must declare a module named `module` (and, of course, a
+/// different name than the main module). The compile is memoized exactly like [`compile`]'s —
+/// keyed by `(erlc, module, source)` — and a missing/failing `erlc` is a loud [`Error`], never
+/// a silent skip.
+pub fn compile_extra_into(dir: &Path, source: &str, module: &str) -> Result<()> {
+    let erlc = resolve_erlc()?.ok_or_else(|| {
+        Error::env(MISSING_ERLC_REASON.to_string())
+    })?;
+    compile_extra_with(&erlc, dir, source, module)
+}
+
+/// The tool-injection core of [`compile_extra_into`].
+fn compile_extra_with(erlc: &Path, dir: &Path, source: &str, module: &str) -> Result<()> {
+    let key = CacheKey {
+        erlc: erlc.to_path_buf(),
+        module: module.to_string(),
+        source: source.to_string(),
+    };
+    let beam = match cached_beam(&key) {
+        Some(beam) => beam,
+        None => {
+            let compiled = compile_with_erlc(erlc, source, module)?;
+            // A beam we cannot read afterwards cannot be run by either runtime either, so
+            // surface it loudly (and never cache it).
+            let beam = std::fs::read(compiled.beam()).map_err(|source| {
+                Error::io(
+                    format!(
+                        "failed to read the compiled beam '{}'",
+                        compiled.beam().display()
+                    ),
+                    source,
+                )
+            })?;
+            store_beam(key, beam.clone());
+            beam
+        }
+    };
+    // Written next to the case's own module, inside its temp dir (removed with it).
+    write_into_temp(dir, &dir.join(format!("{module}.erl")), source.as_bytes())?;
+    write_into_temp(dir, &dir.join(format!("{module}.beam")), &beam)
+}
+
 /// The uncached compile: run the real `erlc` into a fresh temp dir.
 fn compile_with_erlc(erlc: &Path, source: &str, module: &str) -> Result<CompiledModule> {
     let dir = fresh_temp_dir(module)?;

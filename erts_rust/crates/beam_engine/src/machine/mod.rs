@@ -106,6 +106,37 @@ pub struct Machine {
     /// The faithful raw-double `FloatDef` model (`f_reg_array`) is a **deferred
     /// refinement**; the field deliberately does **not** store `f64`.
     pub(crate) fr: Vec<Eterm>,
+    /// The **written** high-water mark (exclusive) of the x-register file: one past the
+    /// highest slot a register-write seam has stored into since the last refill
+    /// ([`Machine::reset`]).
+    ///
+    /// Every x-register write the engine performs funnels through [`Machine::set_x`]
+    /// (the `move`/`get_*`/`gc_bif` destination seam and the argument seeding at a run
+    /// entry), which raises this mark. It exists so [`Machine::reset`] can refill only
+    /// the slots that may hold a term and skip the rest of the 1024-word file, which is
+    /// already `NIL` — a full refill of both files is otherwise the whole per-run floor.
+    ///
+    /// **It is a conservative approximation, never a guarantee.** A writer that can
+    /// reach the register file without going through `set_x` cannot report what it
+    /// touched: a native JIT block stores straight into `machine.x` through the raw
+    /// pointer the generated code holds, and a host handed a raw `&mut` slice
+    /// ([`Machine::x_mut`]/[`Machine::with_roots`]) may write any slot. Each such writer
+    /// sets [`Machine::regs_escaped`], which forces the next `reset` to refill the whole
+    /// file. A stale register is a WRONG RESULT, so when in doubt the reset refills in
+    /// full.
+    pub(crate) x_mark: u32,
+    /// The FR-file twin of [`Machine::x_mark`]: raised by [`Machine::set_fr`], forced
+    /// full by [`Machine::regs_escaped`].
+    pub(crate) fr_mark: u32,
+    /// Whether a writer that cannot report the register slots it touched has run since
+    /// the last refill, so [`Machine::x_mark`]/[`Machine::fr_mark`] understate the dirty
+    /// region.
+    ///
+    /// Set by [`Machine::x_mut`]/[`Machine::fr_mut`]/[`Machine::with_roots`] (the caller
+    /// may write any slot of the slice it is handed) and by the native driver before it
+    /// folds a compiled block's result ([`Machine::mark_regs_escaped`]). [`Machine::reset`]
+    /// refills the whole register files when it is set and then clears it.
+    pub(crate) regs_escaped: bool,
     /// The Erlang stack: the Y-slot words of every live frame, oldest first.
     pub(crate) stack: Vec<Eterm>,
     /// The call-frame stack (innermost last).
@@ -242,15 +273,46 @@ pub struct Machine {
     /// that never sets it (e.g. a direct `Machine::step_instruction` call in a test)
     /// cannot leak a stale `true` from an earlier run.
     pub(crate) trace_on: bool,
+    /// The **per-run reduction-hook gate**: the cached answer of
+    /// [`ExecutionContext::wants_reduce`](crate::context::ExecutionContext::wants_reduce)
+    /// for the run currently executing.
+    ///
+    /// [`Machine::drive`](crate::machine::Machine) charges one reduction per
+    /// interpreted instruction (before the instruction's effect) and offers each
+    /// charge to the host through
+    /// [`ExecutionContext::reduce`](crate::context::ExecutionContext::reduce) — a
+    /// `&mut dyn ExecutionContext` vtable crossing the interpreter cannot elide. When
+    /// the host's [`wants_reduce`](crate::context::ExecutionContext::wants_reduce) is
+    /// `false` (its `reduce` is provably the default no-op), the driver skips that
+    /// per-instruction call so the hot path pays a single `bool` load instead.
+    ///
+    /// The default is **conservative `true`**: a host that pre-empts by returning an
+    /// error from `reduce` is never silently skipped. The slice counter
+    /// ([`Machine::reductions`](crate::machine::Machine::reductions)) is bumped on
+    /// every interpreted instruction regardless of this flag, so opting out changes
+    /// **only** whether the host hook is called, never the observable count.
+    ///
+    /// Latched at a run/resume entry exactly like [`Machine::trace_on`], and
+    /// [`Machine::reset`](crate::machine::Machine::reset) leaves it `false`, so a run
+    /// that never latches it (e.g. a direct `Machine::step_instruction` call in a
+    /// test) cannot leak a stale value from an earlier run.
+    pub(crate) reduce_on: bool,
     /// The code address the machine is currently executing, or was most recently
     /// **suspended** at: `(function index, code offset)`.
     ///
-    /// Updated by [`Machine::step_instruction`](crate::machine::Machine) — the
+    /// Updated by [`Machine::drive`](crate::machine::Machine) **before** it prices
+    /// each instruction, and again by
+    /// [`Machine::step_instruction`](crate::machine::Machine) at its entry — the
     /// single choke point every *interpreted* instruction passes through (the
     /// interpreter's dispatch loop and the native tiers' per-instruction deopt
     /// helper both go through it) — and cleared by
     /// [`Machine::reset`](crate::machine::Machine::reset). `None` before the
     /// machine has interpreted anything.
+    ///
+    /// The store in the driver is what makes the pre-emption point sound: an `Err`
+    /// from [`reduce`](crate::ExecutionContext::reduce) leaves the machine parked on
+    /// the **not-yet-executed** instruction's address, so a resume at this position
+    /// applies that instruction exactly once.
     ///
     /// This is the engine's read-only "saved instruction pointer": the input to
     /// the execution-position introspection ([`Machine::current_code`], and the
@@ -274,8 +336,10 @@ pub struct Machine {
     ///
     /// Zeroed at every [`Machine::drive`](crate::machine::Machine) entry (one `drive`
     /// call is one run or one resume, i.e. one slice) and incremented once per
-    /// `step_instruction`, so [`Machine::reductions`](crate::machine::Machine) read
-    /// when the slice ends is that slice's instruction count.
+    /// instruction the driver prices — i.e. **before** the instruction's body runs —
+    /// so [`Machine::reductions`](crate::machine::Machine) read when the slice ends is
+    /// that slice's instruction count, the raising instruction and the charge a host
+    /// pre-empted on included.
     ///
     /// The engine's other charging point is
     /// [`ensure_heap`](crate::ExecutionContext::ensure_heap) (reached by
@@ -303,6 +367,9 @@ impl Machine {
         let mut machine = Machine {
             x: Vec::new(),
             fr: Vec::new(),
+            x_mark: 0,
+            fr_mark: 0,
+            regs_escaped: false,
             stack: Vec::new(),
             frames: Vec::new(),
             catch_frames: Vec::new(),
@@ -317,6 +384,7 @@ impl Machine {
             refc_binaries: Vec::new(),
             args_scratch: Vec::new(),
             trace_on: false,
+            reduce_on: false,
             current_code: None,
             entry_call: None,
             reductions: 0,
@@ -364,6 +432,11 @@ impl Machine {
     /// keep a term alive, never free a live one). The root-set contract itself is
     /// the frozen one on [`RootSet`].
     pub fn with_roots<R>(&mut self, live: u32, f: impl FnOnce(RootSet<'_>) -> R) -> R {
+        // The receiver is handed mutable slices of BOTH register files, so it may write
+        // any slot of either — a move that the `set_x`/`set_fr` high-water marks cannot
+        // see. Mark the files escaped so the next `reset` refills them in full rather
+        // than trusting the marks.
+        self.regs_escaped = true;
         let roots = RootSet::new(&mut self.x, &mut self.stack, &mut self.fr, live);
         f(roots)
     }

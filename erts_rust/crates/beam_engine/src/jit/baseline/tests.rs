@@ -1505,6 +1505,142 @@ fn a_linked_chain_records_the_last_block_entry_as_the_position() {
 }
 
 // ---------------------------------------------------------------------------
+// the register-file guard: whole-module for the eager layout, per-function for
+// the lazy one
+// ---------------------------------------------------------------------------
+
+/// A two-function module whose `f/0` **tail-calls** into `g/0`'s first block, and
+/// whose `g/0` touches a far higher x-register than `f/0` does.
+///
+/// The eager layout links `f`'s `call_only` **directly** into `g`'s block inside the
+/// one shared mapping, so once the driver has entered `f` natively, `g`'s code runs
+/// **without any further guard**. A per-function entry bound would therefore let a
+/// short register file enter `f` and then have the linked `g` block access a register
+/// that file does not cover — the unsound narrowing this fixture pins. `f`'s exported
+/// entry block (`Label(2)`) starts at pc 1 and touches only `x0`; `g`'s block touches
+/// `x7`.
+fn tail_call_to_a_wider_function() -> Module {
+    build_module(
+        "guard_bounds",
+        &[],
+        vec![
+            (
+                "f",
+                0,
+                vec![
+                    Instr::Label(Label(1)),
+                    Instr::Label(Label(2)),
+                    Instr::Move {
+                        src: Operand::Integer(1),
+                        dst: Operand::X(0),
+                    },
+                    Instr::CallOnly {
+                        arity: 0,
+                        target: Label(3),
+                    },
+                ],
+            ),
+            (
+                "g",
+                0,
+                vec![
+                    Instr::Label(Label(3)),
+                    Instr::Move {
+                        src: Operand::Integer(7),
+                        dst: Operand::X(7),
+                    },
+                    Instr::Return,
+                ],
+            ),
+        ],
+        &[("f", 0, Label(2))],
+    )
+}
+
+/// The eager artifact's entry guard must be the **whole-module** bound (a linked tail
+/// call runs another function's code without returning to the driver), while the lazy
+/// artifact's guard stays the **entered function's** own bound (each function owns its
+/// mapping and a cross-function transfer round-trips through the driver).
+#[test]
+fn the_eager_guard_covers_the_whole_module_but_the_lazy_guard_the_entered_function() {
+    let module = tail_call_to_a_wider_function();
+    // `f/0`'s exported entry block (`Label(2)`) starts at pc 1.
+    let f_pc = 1;
+
+    // --- eager: the seal-time link runs `g`'s code straight out of `f`'s block, so
+    //     only the whole-module bound is safe to gate entry on.
+    let eager = compile_module(&module).expect("the module compiles eagerly");
+    let module_bound = eager
+        .highest_native_register()
+        .expect("the module touches registers natively");
+    assert_eq!(
+        module_bound, 7,
+        "`g`'s block is the module's highest natively-touched register (x7)"
+    );
+    let (_, f_bound) = eager
+        .native_entry(&module, 0, f_pc)
+        .expect("`f`'s entry block compiles");
+    assert_eq!(
+        f_bound,
+        Some(module_bound),
+        "the eager artifact's entry guard must be the whole-module bound: a linked \
+         tail call runs another function's code without returning to the driver"
+    );
+    assert!(
+        module_bound > 0,
+        "`g`'s bound is strictly higher than `f`'s own x0, so the guard is not vacuous"
+    );
+
+    // A file covering `f`'s own x0 but not the module's x7 is exactly the machine the
+    // pre-fix per-function bound would have let enter `f` and then run `g`'s `x7`
+    // access out of bounds. The whole-module guard refuses it.
+    let mut machine = Machine::with_max_register(1);
+    assert_eq!(machine.x.len(), 1, "the register file covers only x0");
+    let mut ctx = MinimalContext::new();
+    let labels = LabelMap::new();
+    let mut rt = JitRuntime {
+        machine: &mut machine,
+        x_regs: machine.x.as_mut_ptr(),
+        module: &module,
+        labels: &labels,
+        ctx: &mut ctx,
+        error: None,
+        enter: None,
+    };
+    assert_eq!(
+        enter_compiled(&eager, &module, &mut rt as *mut JitRuntime<'_>, 0, f_pc),
+        None,
+        "a register file covering only `f`'s own x0 must be refused entry to the \
+         eager artifact (the linked `g` block touches x7)"
+    );
+
+    // --- lazy: each function owns its mapping and a cross-function transfer returns
+    //     the `(func, pc)` word to the driver, which re-checks the target function's
+    //     own bound — so the entered function's own bound is the correct guard here.
+    let lazy = CompiledModule::lazy(&module);
+    let (_, lazy_f_bound) = lazy
+        .native_entry(&module, 0, f_pc)
+        .expect("`f` compiles on demand for the lazy artifact");
+    assert_eq!(
+        lazy_f_bound,
+        Some(0),
+        "the lazy artifact guards entry to `f` by `f`'s OWN bound (x0), not the module's"
+    );
+    let (_, lazy_g_bound) = lazy
+        .native_entry(&module, 1, 0)
+        .expect("`g` compiles on demand for the lazy artifact");
+    assert_eq!(
+        lazy_g_bound,
+        Some(module_bound),
+        "the lazy artifact guards entry to `g` by `g`'s own (still x7) bound"
+    );
+    assert!(
+        lazy_f_bound.expect("`f` touches x0") < module_bound,
+        "the lazy per-function guard stays strictly narrower than the whole-module one \
+         — safe only because a lazy cross-function transfer returns to the driver"
+    );
+}
+// ---------------------------------------------------------------------------
 // resuming a suspension parked inside a cross-module callee
 // ---------------------------------------------------------------------------
 

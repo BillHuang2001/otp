@@ -30,7 +30,10 @@ use beam_engine::jit::cache::{baseline_cache_len, clear_baseline_cache};
 use beam_engine::machine::WaitDeadline;
 use beam_engine::{Machine, Mailbox, MinimalContext, RunOutcome as EngineOutcome, Tier};
 use beam_loader::{Export, Function, HeapNeed, Import, ImportRef, Instr, Label, Module, Operand};
-use beam_process::{ProcessId, ProcessRunner, ProcessTable, RunOutcome as ProcOutcome, SignalAtoms};
+use beam_process::{
+    ProcessId, ProcessRunner, ProcessTable, RunOutcome as ProcOutcome, SignalAtoms,
+    DEFAULT_REDUCTIONS_PER_SLICE,
+};
 use beam_term::{make_atom, make_small, signed_value, Atom, AtomTable, Eterm};
 
 use super::budget::BudgetProbe;
@@ -38,7 +41,7 @@ use super::entry::{ProcessEntry, RunnerState};
 use super::perf::record_baseline_code;
 use super::reason::{exit_reason, normal};
 use super::run::RuntimeRunner;
-use super::tier::{jit_is_switch_safe, mode_from_value, select_entry_tier, JitMode};
+use super::tier::{mode_from_value, select_entry_tier, JitMode};
 use crate::runtime::Runtime;
 
 fn runtime() -> Runtime {
@@ -986,255 +989,57 @@ run() ->
 }
 // -- execution-tier selection (`super::tier`) -----------------------------
 
-/// The committed engine harness fixture that calls **non-floor, non-registry** `.beam`
-/// modules (`orddict`/`queue`), reused by relative path.
-fn stdlib_harness_fixture() -> &'static str {
-    concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../beam_engine/tests/fixtures/stdlib_more_harness.beam"
-    )
+/// The committed engine fixtures reused by relative path: `slice.beam` (the vertical slice),
+/// `stdlib_more_harness.beam` (whose code reaches other loadable `.beam`s — `orddict` and
+/// `queue`) and `funs.beam` (dynamic `apply`/`apply_last`/`call_fun`).
+fn tier_fixtures() -> [&'static str; 3] {
+    [
+        slice_fixture(),
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../beam_engine/tests/fixtures/stdlib_more_harness.beam"
+        ),
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../beam_engine/tests/fixtures/funs.beam"
+        ),
+    ]
 }
 
-/// The committed engine fixture that uses `apply`/`apply_last`/`call_fun`, reused by
-/// relative path.
-fn funs_fixture() -> &'static str {
-    concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../beam_engine/tests/fixtures/funs.beam"
-    )
-}
-
-/// A one-function synthetic module with the given `{module, function, arity}` imports and
-/// body — for the predicate branches no committed fixture exercises. A `.beam` cannot be
-/// written from this node, and the committed fixtures only cover the floor/registry/apply
-/// cases; the IR is a public `beam_loader` surface, so a crafted module is the honest way
-/// to pin the remaining branches.
-fn crafted(imports: Vec<(Atom, Atom, u32)>, code: Vec<Instr>) -> Module {
-    let mut module = Module::default();
-    module.name = module.atom_table.intern("crafted");
-    for (import_module, import_function, arity) in imports {
-        module.imports.push(Import {
-            module: import_module,
-            function: import_function,
-            arity,
-        });
+/// The **default** (`JitMode::Auto`) selects the native baseline tier for a scheduled export
+/// entry, whatever the entry module's code looks like.
+///
+/// `stdlib_more_harness` reaches other loadable `.beam`s and `funs` uses dynamic `apply` — the
+/// two shapes a retired per-module predicate used to refuse. The engine's baseline driver
+/// handles the module-context switch (`Step::Enter`) itself (`beam_engine`'s `switch_into`), so
+/// there is nothing left to refuse and the tier is chosen **without inspecting the module**.
+#[test]
+fn the_default_selects_the_baseline_tier_for_any_export_entry() {
+    let rt = runtime();
+    let mut state = RunnerState::default();
+    for fixture in tier_fixtures() {
+        let module = Arc::new(beam_loader::load_file(fixture).expect("the fixture loads"));
+        let entry = ProcessEntry::Export {
+            module,
+            function: Atom::from_raw(0),
+            arity: 0,
+        };
+        assert_eq!(
+            select_entry_tier(&rt, &mut state, &entry, JitMode::Auto),
+            Tier::BaselineJit,
+            "{fixture} is tiered natively by default"
+        );
     }
-    let name = module.atom_table.intern("f");
-    let module_atom = module.name;
-    module.functions.push(Function {
-        func_label: Label(1),
-        entry_label: Label(1),
-        module: module_atom,
-        name,
-        arity: 0,
-        code,
-        blocks: Vec::new(),
-        labels: BTreeMap::new(),
-    });
-    module
 }
 
-/// A `call_ext_only Arity, ImportRef(0)` body hitting the module's first import.
-fn call_ext_only(arity: u32) -> Vec<Instr> {
-    vec![Instr::CallExtOnly {
-        arity,
-        target: ImportRef(0),
-    }]
-}
-
-/// `slice.beam`'s only external calls are `erlang:get_module_info/1,2` — a floor namespace —
-/// so the module is provably switch-free and the auto mode selects the baseline JIT. Its
-/// arithmetic is `gc_bif`/`bif` (synchronous `call_bif`), not `call_ext`, so nothing else
-/// touches the seam.
-#[test]
-fn the_slice_module_selects_the_baseline_tier() {
-    let rt = runtime();
-    let module = beam_loader::load_file(slice_fixture()).expect("slice.beam");
-    assert!(
-        jit_is_switch_safe(&rt, &module),
-        "only the erlang floor is imported ⇒ no module-context switch can occur"
-    );
-    let mut state = RunnerState::default();
-    let entry = ProcessEntry::Export {
-        module: Arc::new(module),
-        function: Atom::from_raw(0),
-        arity: 2,
-    };
-    assert_eq!(
-        select_entry_tier(&rt, &mut state, &entry, JitMode::Auto),
-        Tier::BaselineJit
-    );
-    // The verdict is memoized under the module's name (the entry module is `slice`).
-    assert_eq!(state.jit_safety.get("slice"), Some(&true));
-}
-
-/// A module that calls a **loadable `.beam`** outside the floor/registry/NIF sets
-/// (`orddict`/`queue` here) can have its `call_ext*` entered in-machine by the seam
-/// (`Ok(Some)` ⇒ `Step::Enter`), so the auto mode keeps it on the interpreter.
-#[test]
-fn a_module_calling_a_loadable_beam_keeps_the_interpreter() {
-    let rt = runtime();
-    let module = beam_loader::load_file(stdlib_harness_fixture()).expect("the harness loads");
-    assert!(
-        !jit_is_switch_safe(&rt, &module),
-        "orddict/queue call targets are not provably synchronous"
-    );
-    let mut state = RunnerState::default();
-    let entry = ProcessEntry::Export {
-        module: Arc::new(module),
-        function: Atom::from_raw(0),
-        arity: 0,
-    };
-    assert_eq!(
-        select_entry_tier(&rt, &mut state, &entry, JitMode::Auto),
-        Tier::Interpreter
-    );
-}
-
-/// A module with a dynamic `apply`/`apply_last` can never be proven switch-free: the
-/// target is a register value, so the seam may enter it in-machine.
-#[test]
-fn a_module_using_apply_keeps_the_interpreter() {
-    let rt = runtime();
-    let module = beam_loader::load_file(funs_fixture()).expect("funs.beam");
-    assert!(!jit_is_switch_safe(&rt, &module), "apply is dynamic");
-    let mut state = RunnerState::default();
-    let entry = ProcessEntry::Export {
-        module: Arc::new(module),
-        function: Atom::from_raw(0),
-        arity: 0,
-    };
-    assert_eq!(
-        select_entry_tier(&rt, &mut state, &entry, JitMode::Auto),
-        Tier::Interpreter
-    );
-}
-
-/// A `call_ext` into a **registered** `beam_bifs` key (`lists:sort/1`) is synchronous, so a
-/// module whose only external call is registered stays switch-free.
-#[test]
-fn a_registered_call_target_is_provably_synchronous() {
-    let rt = runtime();
-    assert!(
-        rt.registry.contains("lists", "sort", 1),
-        "the fixture relies on lists:sort/1 being registered"
-    );
-    let mut module = crafted(Vec::new(), call_ext_only(1));
-    let m = module.atom_table.intern("lists");
-    let f = module.atom_table.intern("sort");
-    module.imports.push(Import {
-        module: m,
-        function: f,
-        arity: 1,
-    });
-    assert!(jit_is_switch_safe(&rt, &module));
-}
-
-/// The floor namespaces are synchronous too (the `erlang` BIF namespace is the common
-/// case), so an import from one keeps the JIT available.
-#[test]
-fn a_floor_call_target_is_provably_synchronous() {
-    let rt = runtime();
-    let mut module = crafted(Vec::new(), call_ext_only(2));
-    let m = module.atom_table.intern("erlang");
-    let f = module.atom_table.intern("get_module_info");
-    module.imports.push(Import {
-        module: m,
-        function: f,
-        arity: 2,
-    });
-    assert!(jit_is_switch_safe(&rt, &module));
-}
-
-/// A `call_ext` whose import is **not** registered and **not** a floor name stays unsafe —
-/// the seam would load the callee and enter it (`Step::Enter`).
-#[test]
-fn an_unregistered_import_keeps_the_interpreter() {
-    let rt = runtime();
-    let mut module = crafted(Vec::new(), call_ext_only(2));
-    let m = module.atom_table.intern("proplists");
-    let f = module.atom_table.intern("get_value");
-    module.imports.push(Import {
-        module: m,
-        function: f,
-        arity: 2,
-    });
-    assert!(!jit_is_switch_safe(&rt, &module));
-
-    let mut state = RunnerState::default();
-    let entry = ProcessEntry::Export {
-        module: Arc::new(module),
-        function: Atom::from_raw(0),
-        arity: 0,
-    };
-    assert_eq!(
-        select_entry_tier(&rt, &mut state, &entry, JitMode::Auto),
-        Tier::Interpreter
-    );
-}
-
-/// An import whose module/function atom is not in the module's own atom table cannot be
-/// named, so its synchronicity cannot be proven — conservatively unsafe.
-#[test]
-fn an_import_with_an_unresolvable_atom_is_unsafe() {
-    let rt = runtime();
-    // `Atom::MAX` is never in a table, so `module.atom_name` cannot resolve it.
-    let module = crafted(
-        vec![(Atom::MAX, Atom::MAX, 1)],
-        call_ext_only(1),
-    );
-    assert!(!jit_is_switch_safe(&rt, &module));
-}
-
-/// A `call_ext` whose target index is past the import table is unsafe (the loader would
-/// report an out-of-range import; the predicate must not treat it as synchronous).
-#[test]
-fn a_call_ext_past_the_import_table_is_unsafe() {
-    let rt = runtime();
-    let module = crafted(
-        Vec::new(),
-        vec![Instr::CallExt {
-            arity: 1,
-            target: ImportRef(7),
-        }],
-    );
-    assert!(!jit_is_switch_safe(&rt, &module));
-}
-
-/// The instruction's `arity` operand must agree with the import's arity — the seam is
-/// handed the import's, so a mismatch is not trusted.
-#[test]
-fn an_arity_mismatch_between_instruction_and_import_is_unsafe() {
-    let rt = runtime();
-    let mut module = crafted(Vec::new(), vec![Instr::CallExtOnly {
-        arity: 3,
-        target: ImportRef(0),
-    }]);
-    let m = module.atom_table.intern("erlang");
-    let f = module.atom_table.intern("get_module_info");
-    module.imports.push(Import {
-        module: m,
-        function: f,
-        arity: 2,
-    });
-    assert!(!jit_is_switch_safe(&rt, &module));
-}
-
-/// A module with **no** external call and no `apply` is trivially switch-free.
-#[test]
-fn a_module_with_no_external_call_is_safe() {
-    let rt = runtime();
-    let module = crafted(Vec::new(), vec![Instr::Return]);
-    assert!(jit_is_switch_safe(&rt, &module));
-}
-
-/// `JitMode::Interpreter` and `JitMode::Baseline` force the tier regardless of the
-/// predicate, so a caller (or a test) can pin either tier explicitly.
+/// `JitMode::Interpreter` forces the interpreter; the default (`JitMode::Auto`) and the
+/// explicit `JitMode::Baseline` alias select the native tier for the **same** entry, so the
+/// kill switch is the only thing that turns the tier off.
 #[test]
 fn the_mode_forces_the_tier() {
     let rt = runtime();
-    // `stdlib_more_harness` is unsafe under Auto, but Baseline forces the JIT anyway.
-    let module = Arc::new(beam_loader::load_file(stdlib_harness_fixture()).expect("harness"));
+    let harness = tier_fixtures()[1];
+    let module = Arc::new(beam_loader::load_file(harness).expect("harness"));
     let mut state = RunnerState::default();
     let entry = ProcessEntry::Export {
         module: Arc::clone(&module),
@@ -1246,29 +1051,22 @@ fn the_mode_forces_the_tier() {
         Tier::BaselineJit
     );
     assert_eq!(
-        select_entry_tier(&rt, &mut state, &entry, JitMode::Interpreter),
-        Tier::Interpreter
+        select_entry_tier(&rt, &mut state, &entry, JitMode::Auto),
+        Tier::BaselineJit,
+        "Auto and Baseline name the same tier"
     );
-    // A forced mode consults no predicate, so nothing was memoized.
-    assert!(state.jit_safety.is_empty());
-    // `slice` is safe under Auto, but Interpreter still forces the interpreter.
-    let slice = Arc::new(beam_loader::load_file(slice_fixture()).expect("slice.beam"));
-    let entry = ProcessEntry::Export {
-        module: slice,
-        function: Atom::from_raw(0),
-        arity: 2,
-    };
     assert_eq!(
         select_entry_tier(&rt, &mut state, &entry, JitMode::Interpreter),
         Tier::Interpreter
     );
 }
 
-/// A fun entry whose local target has not been resolved yet (its module is only known once
-/// the context resolves it) is conservatively interpreted — never a module the predicate
-/// could not have inspected.
+/// An unresolved fun entry (its module is only known once the context resolves the closure)
+/// takes the **same** tier as an export entry: with no per-module predicate left there is
+/// nothing a missing module name could make unsafe, and the engine's driver handles the
+/// in-machine entry.
 #[test]
-fn an_unresolved_fun_entry_is_conservatively_interpreted() {
+fn an_unresolved_fun_entry_takes_the_default_tier() {
     let rt = runtime();
     let mut state = RunnerState::default();
     let entry = ProcessEntry::Fun {
@@ -1277,56 +1075,29 @@ fn an_unresolved_fun_entry_is_conservatively_interpreted() {
     };
     assert_eq!(
         select_entry_tier(&rt, &mut state, &entry, JitMode::Auto),
-        Tier::Interpreter,
-        "an unresolved fun entry reports no module ⇒ the conservative interpreter"
+        Tier::BaselineJit,
+        "a fun entry is tiered like an export entry"
     );
-    // Nothing was inspected, so no memo entry was created.
-    assert!(state.jit_safety.is_empty());
-}
-
-/// The memoized verdict is reused: a second selection for the same module does not re-run
-/// the predicate (the memo is present after the first call).
-#[test]
-fn the_switch_safety_verdict_is_memoized_per_module() {
-    let rt = runtime();
-    let module = Arc::new(beam_loader::load_file(slice_fixture()).expect("slice.beam"));
-    let mut state = RunnerState::default();
-    assert!(state.jit_safety.is_empty());
-    let entry = ProcessEntry::Export {
-        module: Arc::clone(&module),
-        function: Atom::from_raw(0),
-        arity: 2,
-    };
     assert_eq!(
-        select_entry_tier(&rt, &mut state, &entry, JitMode::Auto),
-        Tier::BaselineJit
+        select_entry_tier(&rt, &mut state, &entry, JitMode::Interpreter),
+        Tier::Interpreter
     );
-    assert_eq!(state.jit_safety.len(), 1, "one entry per module name");
-    // A second call (a second process of the same module) hits the memo.
-    assert_eq!(
-        select_entry_tier(&rt, &mut state, &entry, JitMode::Auto),
-        Tier::BaselineJit
-    );
-    assert_eq!(state.jit_safety.len(), 1, "no new entry");
 }
-
 // -- the process-wide default mode ----------------------------------------
 
-/// The effective mode for an **unset** `BEAM_RT_TIER` is `Auto` — the JIT exactly where the
-/// soundness predicate proves the module switch-safe, the interpreter everywhere else.
-/// `"baseline"` forces the JIT and any unknown value falls back to the always-correct
-/// interpreter. Pinned through the **pure** resolution helper ([`mode_from_value`]) rather
-/// than by mutating the process environment (the crate is `#![deny(unsafe_code)]`), and the
-/// derived [`JitMode::default`] must agree with it so no call site can pick a different tier
-/// by omission.
+/// The effective mode for an **unset** `BEAM_RT_TIER` is `Auto`, which selects the native
+/// baseline tier for every process entry. `"baseline"` names that same default explicitly
+/// and any unknown value falls back to the always-correct interpreter. Pinned through the
+/// **pure** resolution helper ([`mode_from_value`]) rather than by mutating the process
+/// environment (the crate is `#![deny(unsafe_code)]`), and the derived [`JitMode::default`]
+/// must agree with it so no call site can pick a different tier by omission.
 #[test]
 fn the_unset_default_resolves_to_auto() {
     assert_eq!(
         mode_from_value(None),
         JitMode::Auto,
-        "an unset BEAM_RT_TIER is the (regression-free) switch-safe-auto default"
-    );
-    assert_eq!(
+        "an unset BEAM_RT_TIER is the native-tier default"
+    );    assert_eq!(
         mode_from_value(Some("interpreter")),
         JitMode::Interpreter
     );
@@ -1386,31 +1157,14 @@ fn fib_runs_to_the_same_result_on_both_tiers() {
             "{mode:?} tier computes fib(10) = {EXPECTED}"
         );
     }
-    // Auto took the JIT on the safe `slice` module (the predicate is exercised in the unit
-    // tests above); this test's value is that both tiers agree.
-    let mut state = RunnerState::default();
-    let rt = runtime();
-    let module = beam_loader::load_file(slice_fixture()).expect("slice.beam");
-    assert!(jit_is_switch_safe(&rt, &module), "Auto would pick the JIT");
-    let entry = ProcessEntry::Export {
-        module: Arc::new(module),
-        function: Atom::from_raw(0),
-        arity: 1,
-    };
-    assert_eq!(
-        select_entry_tier(&rt, &mut state, &entry, JitMode::Auto),
-        Tier::BaselineJit
-    );
 }
 
 /// The whole runtime's **scheduler** path (not just one slice) runs `slice:fib/1 10` and
 /// records `55` — the tier selection is wired into the real `RuntimeRunner` the scheduler
-/// drives, on whatever mode the process environment selects (an unset `BEAM_RT_TIER` ⇒
-/// `auto`, i.e. the JIT for the switch-safe `slice` module). The test asserts the *result*,
-/// so it holds on every tier.
+/// drives, on whatever mode the process environment selects (an unset `BEAM_RT_TIER` ⇒ the
+/// baseline tier for `slice`). The test asserts the *result*, so it holds on every tier.
 #[test]
-fn the_scheduler_path_computes_fib_under_the_selected_tier() {
-    let mut rt = runtime();
+fn the_scheduler_path_computes_fib_under_the_selected_tier() {    let mut rt = runtime();
     rt.load_module(slice_fixture()).expect("slice.beam loads");
     let pid = rt
         .spawn_process("slice", "fib", vec![make_small(10)])
@@ -1427,9 +1181,9 @@ fn the_scheduler_path_computes_fib_under_the_selected_tier() {
 
 /// The committed **allocating** tail-loop fixture, reused by relative path (never copied).
 ///
-/// `alloc_loop/1` builds one cons cell per iteration, so the compiler emits a `test_heap` —
-/// the runner's one reduction-budget admission point — and a small budget therefore
-/// **pre-empts** it part-way through (see the fixture's own docs).
+/// `alloc_loop/1` builds one cons cell per iteration, so the compiler emits a `test_heap` — a
+/// heap-admission point, the charge a native baseline block reaches — and a small budget
+/// therefore **pre-empts** it part-way through on either tier (see the fixture's own docs).
 fn preempt_fixture() -> &'static str {
     concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -1657,5 +1411,198 @@ fn an_interpreter_tier_process_is_unchanged_across_a_resume() {
         baseline_cache_len(),
         0,
         "an interpreter-tier process compiles no native code on either slice"
+    );
+}
+
+// -- pre-emption of a non-allocating, interpreted loop ---------------------
+
+/// The non-allocating loop's iteration count in the pre-emption tests: far above one slice's
+/// [`DEFAULT_REDUCTIONS_PER_SLICE`] budget, so the interpreter tier cannot finish it in one
+/// slice.
+const NON_ALLOCATING_N: i64 = 100_000;
+
+/// Loads `fixture` through the runtime's **code server** (so its atoms land in the runtime's
+/// one shared table, exactly as the CLI path's do) and hands back the module handle.
+fn load_module(rt: &mut Runtime, fixture: &str, name: &str) -> Arc<Module> {
+    rt.load_module(fixture).expect("the fixture loads");
+    rt.code_server()
+        .module_handle(name)
+        .expect("the loaded module is registered by name")
+}
+
+/// Spawns `preempt:spin/1` (the PRE-EMPTION fixture's non-allocating tail loop) as process
+/// `pid`.
+///
+/// `spin(N) -> spin(N, 0)` / `spin(N, Count) -> spin(N - 1, Count + 1)` is pure small-integer
+/// arithmetic and a tail call, so its disassembly is only
+/// `func_info`/`test`/`move`/`gc_bif`/`call_only`/`line`/`label`/`return` — **no** `test_heap`,
+/// `allocate` or `allocate_heap`. It therefore reaches **no heap-admission point at all**, so a
+/// pre-emption can only come from the interpreter's per-instruction reduction charge. Its
+/// result is an **iteration count** (`spin(N)` returns exactly `N`), so a skipped or
+/// double-applied instruction across a pre-emption/resume boundary changes the recorded value.
+fn spawn_non_allocating_loop(
+    state: &mut RunnerState,
+    pid: ProcessId,
+    module: Arc<Module>,
+    n: i64,
+) {
+    let function = module.atom_table.lookup("spin").expect("spin is interned");
+    state.spawn(
+        pid,
+        ProcessEntry::Export {
+            module,
+            function,
+            arity: 1,
+        },
+        vec![make_small(n)],
+    );
+}
+
+/// **A non-allocating interpreted loop IS pre-empted, and the process queued behind it really
+/// runs.**
+///
+/// The loop is `preempt:spin/1` of the PRE-EMPTION fixture and reaches no heap-admission
+/// instruction (see [`spawn_non_allocating_loop`]), so a [`ProcOutcome::Yield`] after one
+/// slice's budget can only have come from the engine's per-instruction `reduce` hook. The
+/// yield is *resumption-exact and work-preserving*: no result is recorded
+/// (`state.result(pid_a)` stays `None`) and the machine is parked at the instruction it
+/// charged for. A second, short process registered on the same table then runs to completion
+/// **while the loop is still unfinished** — the fairness a budget-ignoring runner cannot
+/// provide. Driving the loop to completion finally records exactly its iteration count, whose
+/// value is count-sensitive: a resume that skipped or double-applied an instruction would
+/// change it.
+#[test]
+fn a_non_allocating_interpreted_loop_is_pre_empted() {
+    let mut rt = runtime();
+    let mut state = RunnerState::default();
+    state.jit_mode = Some(JitMode::Interpreter);
+    let mut table = table();
+
+    // The loop and the short process `quick/0` both live in the PRE-EMPTION fixture, loaded
+    // through the runtime's code server so its atoms land in the runtime's shared table.
+    let module = load_module(&mut rt, preempt_fixture(), "preempt");
+
+    // Registered FIRST: the CPU-bound loop. Registered SECOND: the short process it must not
+    // starve.
+    let pid_a = table.spawn_default().expect("a fresh process");
+    let pid_b = table.spawn_default().expect("a fresh process");
+    spawn_non_allocating_loop(&mut state, pid_a, Arc::clone(&module), NON_ALLOCATING_N);
+    let quick = module
+        .atom_table
+        .lookup("quick")
+        .expect("quick is interned");
+    state.spawn(
+        pid_b,
+        ProcessEntry::Export {
+            module,
+            function: quick,
+            arity: 0,
+        },
+        Vec::new(),
+    );
+
+    // Slice 1: the non-allocating loop spends a whole slice's budget and yields.
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid_a, &mut table, DEFAULT_REDUCTIONS_PER_SLICE)
+            .expect("the loop's first slice runs")
+    };
+    assert_eq!(
+        outcome,
+        ProcOutcome::Yield,
+        "the per-instruction charge pre-empts a loop with no allocation at all"
+    );
+    assert!(
+        state.result(pid_a).is_none(),
+        "a pre-emption fabricates no result and loses no work"
+    );
+    assert!(
+        state
+            .engines
+            .get(&pid_a)
+            .is_some_and(|engine| engine.parked.is_some()),
+        "the pre-empted machine is parked at the instruction it charged for"
+    );
+
+    // The process behind it gets its turn while the loop is still unfinished.
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid_b, &mut table, DEFAULT_REDUCTIONS_PER_SLICE)
+            .expect("the short process's slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Exit(normal(&mut rt)));
+    assert_eq!(
+        rt.atom_name_of(state.result(pid_b).expect("quick/0 returned a value")),
+        Some("done"),
+        "the short process really ran to its return"
+    );
+    assert!(
+        state.result(pid_a).is_none(),
+        "the loop is still unfinished after the short process ran"
+    );
+
+    // Drive the loop to completion in further slices. A generous budget makes the remaining
+    // work one slice; the loop is bounded so a lost pre-emption can never hang the suite.
+    let mut slices = 1;
+    let outcome = loop {
+        let outcome = {
+            let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+            runner
+                .run(pid_a, &mut table, 5_000_000)
+                .expect("a further slice of the loop runs")
+        };
+        if outcome != ProcOutcome::Yield {
+            break outcome;
+        }
+        slices += 1;
+        assert!(slices < 64, "the loop finishes in a bounded number of slices");
+    };
+    assert_eq!(outcome, ProcOutcome::Exit(normal(&mut rt)));
+    assert_eq!(
+        signed_value(state.result(pid_a).expect("the loop returns its iteration count")),
+        NON_ALLOCATING_N,
+        "the charges cost no work: the resume applied every instruction exactly once"
+    );
+}
+
+/// **The honest native-tier contrast: a compiled block is not charged per instruction.**
+///
+/// The *same* `preempt:spin/1` call with the *same* iteration count completes inside **one**
+/// slice under the native baseline tier, even though that slice's budget is only
+/// [`DEFAULT_REDUCTIONS_PER_SLICE`]: the loop reaches no heap-admission point (see
+/// [`spawn_non_allocating_loop`]) and a natively executed block never crosses the
+/// per-instruction `reduce` hook, so nothing charges mid-block. The recorded value is still
+/// the iteration count — the tier is interpreter-identical, only its pre-emption granularity
+/// differs. This is the residual limitation the interpreter gap's closure leaves behind, and
+/// it is pinned rather than papered over.
+#[test]
+fn a_non_allocating_loop_on_the_native_tier_completes_within_one_slice() {
+    let mut rt = runtime();
+    let mut state = RunnerState::default();
+    state.jit_mode = Some(JitMode::Baseline);
+    let mut table = table();
+
+    let module = load_module(&mut rt, preempt_fixture(), "preempt");
+    let pid = table.spawn_default().expect("a fresh process");
+    spawn_non_allocating_loop(&mut state, pid, module, NON_ALLOCATING_N);
+
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, DEFAULT_REDUCTIONS_PER_SLICE)
+            .expect("the slice runs")
+    };
+    assert_eq!(
+        outcome,
+        ProcOutcome::Exit(normal(&mut rt)),
+        "a native compiled block reaches no per-instruction charge, so the loop is not \
+         pre-empted mid-block"
+    );
+    assert_eq!(
+        signed_value(state.result(pid).expect("the loop returns its iteration count")),
+        NON_ALLOCATING_N,
+        "the native tier computes the same result as the interpreter"
     );
 }

@@ -51,7 +51,7 @@ fn atoms() -> AtomTable {
         "is_binary", "is_bitstring", "is_foo", "=:=", "=/=", "==", "/=", "<", "=<", ">", ">=",
         "+", "-", "*", "/", "div", "rem", "band", "bor", "bxor", "bsl", "bsr", "$", "$1x", "$01",
         "$5", "map_get", "is_map_key", "map_size", "tuple_size", "byte_size", "bit_size", "float",
-        "trunc", "round", "list_to_tuple",
+        "trunc", "round", "list_to_tuple", "ceil", "floor", "bnot",
     ] {
         atoms.intern(name);
     }
@@ -2599,27 +2599,7 @@ fn guard_select_keys(
 /// `{'=:=', Left, Right}` — the guard form the battery below builds.
 fn exact_guard(heap: &mut Heap, atoms: &AtomTable, left: Eterm, right: Eterm) -> Eterm {
     tup(heap, &[at(atoms, "=:="), left, right])
-}
-
-/// Assert a refusal is the crate's typed `unsupported_ets` capability-gap raise whose
-/// reason atom starts with `prefix`.
-fn assert_typed_gap(err: BeamError, prefix: &str) {
-    let raise = err
-        .into_raise()
-        .expect("a capability gap is an explicit raise");
-    assert_eq!(raise.class, beam_common::ExceptionClass::Error, "{prefix}");
-    let reason = raise
-        .reason
-        .as_atom()
-        .expect("the reason is an atom")
-        .to_string();
-    assert!(
-        reason.starts_with(prefix),
-        "expected a raise whose reason starts with `{prefix}`, got `{reason}`"
-    );
-}
-
-/// The ordered guard-probe table: one object per value shape.
+}/// The ordered guard-probe table: one object per value shape.
 ///
 /// oracle (OTP 29 / erts-17.1), `ordered_set`
 /// `[{1,10},{2,{7,8}},{3,<<"hello">>},{4,#{a=>1,b=>2}},{5,[1,2,3]},{6,1.5},{7,-3}]`.
@@ -3061,14 +3041,16 @@ fn map_construction_in_a_guard_and_a_body_matches_the_oracle() {
 }
 
 // ---------------------------------------------------------------------------
-// Typed divergences (this crate is strictly LESS capable than the oracle)
+// Bignum results and a constructs-both-reject parity case
 //
-// Each is a typed `unsupported_ets` raise — never a wrong result — reported to the
-// source owner rather than asserted as oracle behaviour. `self/0` is a different
-// KIND of gap: an honest SEMANTIC under-match (it raises `badarg`, so its clause is
-// skipped, while the oracle evaluates it against the calling process); that case is
-// pinned by `documented_capability_gaps_are_typed_and_diverge_from_the_oracle` above
-// and is only referenced here.
+// The numeric guard BIFs `abs/1`, `bnot/1`, `trunc/1`, `round/1`, `ceil/1` and
+// `floor/1` materialise the oracle's BIGNUM result through `beam_term`'s big helpers
+// (never a wrong small integer), so a guard over a bignum operand — or a float whose
+// integral value leaves the 60-bit small range — is evaluated. The cases below pin
+// that against the live `erl` values quoted beside each assertion. `self/0` remains a
+// different KIND of gap — an honest SEMANTIC under-match (it raises `badarg`, so its
+// clause is skipped, while the oracle evaluates it against the calling process) —
+// pinned by `documented_capability_gaps_are_typed_and_diverge_from_the_oracle` above.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -3090,63 +3072,153 @@ fn list_to_tuple_is_not_a_guard_bif_and_is_badarg_like_the_oracle() {
     );
 }
 
-#[test]
-fn abs_on_a_bignum_is_a_typed_gap() {
-    // oracle: `abs/1` on a bignum returns a bignum (`abs(-(1 bsl 60))` is `1 bsl 60`),
-    // so a guard over it is evaluated. This crate's match-spec `abs/1` has no bignum
-    // arithmetic, so it is the typed `unsupported_ets` raise — never a `badarg` that
-    // would silently under-match.
-    let atoms = atoms();
-    let mut heap = Heap::new(8192).expect("test heap");
-    let mut table = new_table(TableKind::OrderedSet);
-    table
-        .insert(tup(&mut heap, &[make_small(1), make_small(10)]), &atoms)
-        .unwrap();
-    let head = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
-    // A 1-digit bignum `1 bsl 60` (beyond the 60-bit small-integer range).
-    // SAFETY: `big_size_words(1)` (2) exclusively-owned words for a 1-digit bignum;
-    // the heap outlives the term.
-    let big = unsafe {
-        let hp = heap.alloc_words(big_size_words(1)).expect("bignum words");
-        write_big(hp, false, &[1u64 << 60])
-    };
-    let lhs = call(&mut heap, at(&atoms, "abs"), &[big]);
-    let g = exact_guard(&mut heap, &atoms, lhs, make_small(1));
-    let spec = compile(spec1(&mut heap, head, &[g], &[at(&atoms, "true")]), &atoms).unwrap();
-    let err = table.select_count(&spec, &atoms, &mut heap).unwrap_err();
-    assert_typed_gap(err, "unsupported_ets: match-spec 'abs'");
+/// A bignum term on `heap` (least-significant-first `u64` digits).
+fn big(heap: &mut Heap, negative: bool, digits: &[u64]) -> Eterm {
+    // SAFETY: `alloc_words(big_size_words(digits.len()))` hands back exactly those
+    // exclusively-owned, writable words, every one of which `write_big` fills; the
+    // heap is a never-relocating arena that outlives the term.
+    unsafe {
+        let hp = heap
+            .alloc_words(big_size_words(digits.len()))
+            .expect("test heap has room for a bignum");
+        write_big(hp, negative, digits)
+    }
 }
 
+/// The limbs of the oracle's `trunc(1.0e30)` = `1000000000000000019884624838656`.
+const ONE_E30_LIMBS: [u64; 2] = [0x4675_0000_0000_0000, 0x0000_000C_9F2C_9CD0];
+
+/// `abs/1` on a **bignum** returns the oracle's bignum (parity, not a gap).
 #[test]
-fn trunc_and_round_beyond_the_small_range_are_a_typed_gap() {
-    // oracle: `trunc(1.0e30)` / `round(1.0e30)` return a BIGNUM
-    // (`1000000000000000019884624838656`), so the guard is evaluated. This crate's
-    // match-spec integral conversion is small-int only, so a result outside the 60-bit
-    // small range is the typed `unsupported_ets` raise — never a truncated wrong
-    // integer.
+fn abs_on_a_bignum_returns_the_oracle_bignum() {
+    // oracle (OTP 29 / erts-17.1):
+    //   ets:select(T, [{{'$1','$2'},[{'=:=',{'abs','$2'},1180591620717411303424}],['$1']}])
+    //     over `{4,-1180591620717411303424}` (i.e. `-(1 bsl 70)`) -> `[4]`
+    //   (and `abs(-576460752303423488)` = `abs(MIN_SMALL)` -> `576460752303423488`).
+    // The magnitude is materialised through `beam_term`'s big helpers, so the guard is
+    // evaluated rather than skipped.
     let atoms = atoms();
-    let mut heap = Heap::new(8192).expect("test heap");
-    let mut table = new_table(TableKind::OrderedSet);
-    table
-        .insert(tup(&mut heap, &[make_small(1), make_small(10)]), &atoms)
-        .unwrap();
+    let mut heap = Heap::new(65536).expect("test heap");
     let head = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+    let body = [at(&atoms, "$1")];
 
-    let big_float = float(&mut heap, 1.0e30);
-    let lhs = call(&mut heap, at(&atoms, "trunc"), &[big_float]);
-    let g = exact_guard(&mut heap, &atoms, lhs, make_small(1));
-    let spec = compile(spec1(&mut heap, head, &[g], &[at(&atoms, "true")]), &atoms).unwrap();
-    let err = table.select_count(&spec, &atoms, &mut heap).unwrap_err();
-    assert_typed_gap(err, "unsupported_ets: match-spec 'trunc'/'round'");
+    // abs of a bignum, both signs.
+    let magnitude = [0u64, 1u64 << 6]; // 2^70
+    for negative in [false, true] {
+        let operand = big(&mut heap, negative, &magnitude);
+        let expected = big(&mut heap, false, &magnitude);
+        let object = tup(&mut heap, &[make_small(4), operand]);
+        let input = list(&mut heap, &[object]);
+        let lhs = call(&mut heap, at(&atoms, "abs"), &[at(&atoms, "$2")]);
+        let g = exact_guard(&mut heap, &atoms, lhs, expected);
+        let spec = spec1(&mut heap, head, &[g], &body);
+        assert_eq!(
+            match_spec_run(input, spec, &atoms, &mut heap).unwrap(),
+            vec![make_small(4)],
+            "abs of a bignum =:= its magnitude"
+        );
+    }
 
-    let big_float = float(&mut heap, 1.0e30);
-    let lhs = call(&mut heap, at(&atoms, "round"), &[big_float]);
-    let g = exact_guard(&mut heap, &atoms, lhs, make_small(1));
-    let spec = compile(spec1(&mut heap, head, &[g], &[at(&atoms, "true")]), &atoms).unwrap();
-    let err = table.select_count(&spec, &atoms, &mut heap).unwrap_err();
-    assert_typed_gap(err, "unsupported_ets: match-spec 'trunc'/'round'");
+    // `abs(MIN_SMALL)` is `2^59` — a bignum, though the operand is a small integer.
+    let object = tup(&mut heap, &[make_small(5), make_small(MIN_SMALL)]);
+    let input = list(&mut heap, &[object]);
+    let expected = big(&mut heap, false, &[1u64 << 59]);
+    let lhs = call(&mut heap, at(&atoms, "abs"), &[at(&atoms, "$2")]);
+    let g = exact_guard(&mut heap, &atoms, lhs, expected);
+    let spec = spec1(&mut heap, head, &[g], &body);
+    assert_eq!(
+        match_spec_run(input, spec, &atoms, &mut heap).unwrap(),
+        vec![make_small(5)],
+        "abs(MIN_SMALL) =:= 2^59"
+    );
 }
 
+/// `bnot/1` on a **bignum** returns the oracle's bignum (parity, not a gap).
+#[test]
+fn bnot_on_a_bignum_returns_the_oracle_bignum() {
+    // oracle (OTP 29 / erts-17.1):
+    //   ets:select(T, [{{'$1','$2'},[{'=:=',{'bnot','$2'},-18446744073709551616}],['$1']}])
+    //     over `{4,18446744073709551615}` (i.e. `2^64 - 1`) -> `[4]`   (the carry grows a limb)
+    //   `bnot(-18446744073709551616)` (= `-(2^64)`) -> `18446744073709551615`.
+    let atoms = atoms();
+    let mut heap = Heap::new(65536).expect("test heap");
+    let head = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+    let body = [at(&atoms, "$1")];
+
+    // `bnot(2^64 - 1)` = `-(2^64)`.
+    let operand = big(&mut heap, false, &[u64::MAX]);
+    let expected = big(&mut heap, true, &[0, 1]);
+    let object = tup(&mut heap, &[make_small(4), operand]);
+    let input = list(&mut heap, &[object]);
+    let lhs = call(&mut heap, at(&atoms, "bnot"), &[at(&atoms, "$2")]);
+    let g = exact_guard(&mut heap, &atoms, lhs, expected);
+    let spec = spec1(&mut heap, head, &[g], &body);
+    assert_eq!(
+        match_spec_run(input, spec, &atoms, &mut heap).unwrap(),
+        vec![make_small(4)],
+        "bnot(2^64 - 1) =:= -(2^64)"
+    );
+
+    // `bnot(-(2^64))` = `2^64 - 1` (the borrow canonicalises away the high zero limb).
+    let operand = big(&mut heap, true, &[0, 1]);
+    let expected = big(&mut heap, false, &[u64::MAX]);
+    let object = tup(&mut heap, &[make_small(5), operand]);
+    let input = list(&mut heap, &[object]);
+    let lhs = call(&mut heap, at(&atoms, "bnot"), &[at(&atoms, "$2")]);
+    let g = exact_guard(&mut heap, &atoms, lhs, expected);
+    let spec = spec1(&mut heap, head, &[g], &body);
+    assert_eq!(
+        match_spec_run(input, spec, &atoms, &mut heap).unwrap(),
+        vec![make_small(5)],
+        "bnot(-(2^64)) =:= 2^64 - 1"
+    );
+}
+
+/// Assert that `trunc/round/ceil/floor` of `value` selects through a guard comparing
+/// it to `expected`.
+fn integral_guard_matches(
+    name: &str,
+    value: f64,
+    expected: Eterm,
+    atoms: &AtomTable,
+    heap: &mut Heap,
+) {
+    let head = tup(heap, &[at(atoms, "$1"), at(atoms, "$2")]);
+    let operand = float(heap, value);
+    let object = tup(heap, &[make_small(4), operand]);
+    let input = list(heap, &[object]);
+    let lhs = call(heap, at(atoms, name), &[at(atoms, "$2")]);
+    let g = exact_guard(heap, atoms, lhs, expected);
+    let spec = spec1(heap, head, &[g], &[at(atoms, "$1")]);
+    assert_eq!(
+        match_spec_run(input, spec, atoms, heap).unwrap(),
+        vec![make_small(4)],
+        "{name}({value:e}) =:= the oracle bignum"
+    );
+}
+
+/// `trunc/round/ceil/floor` whose float result leaves the 60-bit small range return
+/// the oracle's bignum (parity, not a gap).
+#[test]
+fn integral_conversions_beyond_the_small_range_return_the_oracle_bignum() {
+    // oracle (OTP 29 / erts-17.1):
+    //   trunc(1.0e30) == round(1.0e30) == ceil(1.0e30) == 1000000000000000019884624838656
+    //   floor(-1.0e30) == trunc(-1.0e30) == ceil(-1.0e30) == round(-1.0e30)
+    //                  == -1000000000000000019884624838656
+    let atoms = atoms();
+    let mut heap = Heap::new(65536).expect("test heap");
+    let positive = big(&mut heap, false, &ONE_E30_LIMBS);
+    let negative = big(&mut heap, true, &ONE_E30_LIMBS);
+
+    integral_guard_matches("trunc", 1.0e30, positive, &atoms, &mut heap);
+    integral_guard_matches("round", 1.0e30, positive, &atoms, &mut heap);
+    integral_guard_matches("ceil", 1.0e30, positive, &atoms, &mut heap);
+    integral_guard_matches("floor", 1.0e30, positive, &atoms, &mut heap);
+    integral_guard_matches("trunc", -1.0e30, negative, &atoms, &mut heap);
+    integral_guard_matches("round", -1.0e30, negative, &atoms, &mut heap);
+    integral_guard_matches("ceil", -1.0e30, negative, &atoms, &mut heap);
+    integral_guard_matches("floor", -1.0e30, negative, &atoms, &mut heap);
+}
 #[test]
 fn byte_size_and_bit_size_read_an_off_heap_refc_binary_correctly() {
     // oracle (OTP 29 / erts-17.1): `byte_size(<<"0123456789abcdefghij">>)` is 20 and

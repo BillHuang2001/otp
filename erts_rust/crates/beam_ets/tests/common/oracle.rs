@@ -19,7 +19,8 @@
 // %CopyrightEnd%
 
 //! Shared plumbing for the integration tests that shell out to the **system Erlang
-//! oracle** (`erl`/`escript` on `$PATH`, or whatever `$ERTS_ORACLE` points at).
+//! oracle** (`erl`/`erlc`/`escript` on `$PATH`, or whatever `$ERTS_ORACLE`/`$ERLC`
+//! point at).
 //!
 //! # The oracle gate
 //!
@@ -35,13 +36,16 @@
 //!   `[oracle] … SKIPPED …` to stderr and the test passes);
 //! * `BEAM_ETS_REQUIRE_ORACLE=1` still **forces** the requirement (it overrides the
 //!   opt-out), so a runner can be explicit about demanding the oracle;
-//! * a `$ERTS_ORACLE` that points at a non-executable file is a **hard error** in every
-//!   mode, since a misconfiguration must never be mistaken for "no oracle".
+//! * a `$ERTS_ORACLE` (or `$ERLC`) that points at a non-executable file is a **hard
+//!   error** in every mode, since a misconfiguration must never be mistaken for "no
+//!   oracle".
 //!
 //! Further conventions:
 //!
 //! * any scratch file lives under `env::temp_dir()` (i.e. `$TMPDIR`) and is removed
-//!   afterwards, whether or not the oracle succeeded;
+//!   afterwards, whether or not the oracle succeeded — [`Scratch`] is the RAII form
+//!   that makes that true even on a panic, and [`compile_module`] compiles an Erlang
+//!   module into one with the oracle's `erlc` ([`resolve_erlc`]);
 //! * the child is run with a wall-clock bound, so a wedged oracle fails the test
 //!   instead of hanging the suite.
 //!
@@ -52,6 +56,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -106,9 +111,12 @@ pub fn skip(test: &str, why: &str) {
     eprintln!("[oracle] {test}: SKIPPED — {why}. ({ALLOW_NO_ORACLE} is set.)");
 }
 
-/// Locate the oracle's `escript` from `$ERTS_ORACLE`, then `$PATH`.
-pub fn resolve_escript() -> Option<PathBuf> {
-    let erl = match env::var_os("ERTS_ORACLE") {
+/// Locate the oracle's `erl` from `$ERTS_ORACLE`, then `$PATH`.
+///
+/// A `$ERTS_ORACLE` that names a non-executable file is a **hard error** in every
+/// mode: a misconfiguration must never be mistaken for "no oracle on this machine".
+pub fn resolve_erl() -> Option<PathBuf> {
+    match env::var_os("ERTS_ORACLE") {
         Some(value) => {
             let candidate = PathBuf::from(&value);
             assert!(
@@ -116,15 +124,45 @@ pub fn resolve_escript() -> Option<PathBuf> {
                 "$ERTS_ORACLE is set to '{}', which is not an executable file",
                 candidate.display()
             );
-            candidate
+            Some(candidate)
         }
-        None => find_in_path("erl")?,
-    };
-    let sibling = erl.with_file_name("escript");
+        None => find_in_path("erl"),
+    }
+}
+
+/// Locate the oracle's `escript` from `$ERTS_ORACLE`, then `$PATH`.
+pub fn resolve_escript() -> Option<PathBuf> {
+    resolve_sibling_or_path(resolve_erl()?, "escript")
+}
+
+/// Locate the oracle's `erlc`: `$ERLC` when set, else the sibling of the resolved
+/// `erl`, else the first `erlc` on `$PATH`.
+///
+/// `$ERLC` is the override the project's differential/benchmark tools use; like
+/// `$ERTS_ORACLE`, a value that names a non-executable file is a **hard error** in
+/// every mode. Without it, `erlc` normally sits beside `erl` (the sibling-first order
+/// keeps the compiler with the runtime it will be paired against); the `$PATH`
+/// fallback covers a wrapper that installs only `erl`.
+pub fn resolve_erlc() -> Option<PathBuf> {
+    if let Some(value) = env::var_os("ERLC") {
+        let candidate = PathBuf::from(&value);
+        assert!(
+            is_executable(&candidate),
+            "$ERLC is set to '{}', which is not an executable file",
+            candidate.display()
+        );
+        return Some(candidate);
+    }
+    resolve_sibling_or_path(resolve_erl()?, "erlc")
+}
+
+/// `name` beside the resolved `erl`, else the first `name` on `$PATH`.
+fn resolve_sibling_or_path(erl: PathBuf, name: &str) -> Option<PathBuf> {
+    let sibling = erl.with_file_name(name);
     if is_executable(&sibling) {
         Some(sibling)
     } else {
-        find_in_path("escript")
+        find_in_path(name)
     }
 }
 
@@ -162,27 +200,111 @@ pub fn is_executable(path: &Path) -> bool {
     }
 }
 
+/// A scratch directory under `env::temp_dir()` (i.e. `$TMPDIR`), removed on drop.
+///
+/// The name is `beam_ets_<prefix>_<pid>_<n>` — the pid plus a process-global counter
+/// keep binaries *and* concurrent callers within one binary from sharing a
+/// directory. Any stale copy of the same name is removed first.
+pub struct Scratch {
+    dir: PathBuf,
+}
+
+impl Scratch {
+    /// Create the (fresh) scratch directory.
+    pub fn new(prefix: &str) -> Scratch {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = env::temp_dir().join(format!("beam_ets_{prefix}_{}_{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("the oracle scratch directory is creatable");
+        Scratch { dir }
+    }
+
+    /// The scratch directory path (hand it to `-pa`/`-o`/`-o DIR` as-is).
+    pub fn path(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Write `contents` to `name` inside the scratch directory, returning its path.
+    pub fn write(&self, name: &str, contents: &str) -> PathBuf {
+        let path = self.dir.join(name);
+        fs::write(&path, contents)
+            .unwrap_or_else(|error| panic!("cannot write the oracle file {}: {error}", path.display()));
+        path
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        // Best effort, but never silent: a leftover scratch dir must not fail the
+        // test, yet a cleanup failure is reported rather than swallowed.
+        if let Err(error) = fs::remove_dir_all(&self.dir) {
+            eprintln!(
+                "warning: could not remove the oracle scratch dir {}: {error}",
+                self.dir.display()
+            );
+        }
+    }
+}
+
+/// Compile the Erlang module `module` (source `source`) into `scratch` with `erlc`,
+/// returning the compiled `<module>.beam` path.
+///
+/// A non-zero exit, a missing `.beam` or a child that does not exit within `timeout`
+/// is a **hard failure** (the child's streams are in the panic message) — a broken
+/// toolchain must never be mistaken for a skip. The [module docs](self) explain why.
+pub fn compile_module(
+    erlc: &Path,
+    scratch: &Scratch,
+    module: &str,
+    source: &str,
+    timeout: Duration,
+) -> PathBuf {
+    let name = format!("{module}.erl");
+    let source_path = scratch.write(&name, source);
+
+    let mut command = Command::new(erlc);
+    command
+        .arg("-o")
+        .arg(scratch.path())
+        .arg(&source_path)
+        .current_dir(scratch.path());
+    let output = run_bounded(&mut command, timeout).unwrap_or_else(|error| {
+        panic!("erlc ({}) could not compile {name}: {error}", erlc.display())
+    });
+
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "erlc ({}) failed on {name} with {}:\n{stderr}",
+        erlc.display(),
+        output.status
+    );
+    let beam = scratch.path().join(format!("{module}.beam"));
+    assert!(
+        beam.is_file(),
+        "erlc ({}) produced no {}:\n{stderr}",
+        erlc.display(),
+        beam.display()
+    );
+    beam
+}
+
 /// Run `program` (an `escript` source, inline) with `args` and return its output.
 ///
 /// `scratch` names the scratch directory, which is created under `env::temp_dir()`
-/// (i.e. `$TMPDIR`) as `beam_ets_<scratch>_<pid>` — the pid keeps binaries that run
-/// concurrently from sharing it — and removed afterwards, whether or not the oracle
-/// succeeded. A non-zero exit is a hard failure (the child's streams are in the
-/// panic message); a child that does not exit within `timeout` is killed and is also
-/// a hard failure.
+/// (i.e. `$TMPDIR`) and removed afterwards, whether or not the oracle succeeded. A
+/// non-zero exit is a hard failure (the child's streams are in the panic message); a
+/// child that does not exit within `timeout` is killed and is also a hard failure.
 pub fn run_escript(escript: &Path, program: &str, args: &[String], scratch: &str, timeout: Duration) -> Output {
-    let dir = env::temp_dir().join(format!("beam_ets_{scratch}_{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("the oracle scratch directory is creatable");
-    let script = dir.join("oracle.escript");
-    fs::write(&script, program).expect("the oracle program is writable");
+    let dir = Scratch::new(scratch);
+    let script = dir.write("oracle.escript", program);
 
     let mut command = Command::new(escript);
-    command.arg(&script).args(args).current_dir(&dir);
+    command.arg(&script).args(args).current_dir(dir.path());
     let output = run_bounded(&mut command, timeout).unwrap_or_else(|error| {
         panic!("escript ({}) could not run the oracle: {error}", escript.display())
     });
-    let _ = fs::remove_dir_all(&dir);
 
     assert!(
         output.status.success(),

@@ -27,7 +27,9 @@
 //!    refcounted into the destination off-heap table, the copied `BinRef.val` is the *same* payload
 //!    pointer, and the copied `ErlSubBits.orig` is fixed up to the copied `BinRef`,
 //! 2. dropping the destination table returns the source refcount,
-//! 3. an on-heap small binary (`ErlHeapBits`) is copied **by value** (opaque interior).
+//! 3. an on-heap small binary (`ErlHeapBits`) is copied **by value** (opaque interior),
+//! 4. a refc binary whose payload **no held handle owns** is **flattened** into a fresh on-heap
+//!    bitstring (sized as that block, so a one-word-short destination is still refused atomically).
 
 use beam_alloc::{Heap, RefcBinary};
 use beam_message::off_heap::OffHeapTable;
@@ -281,25 +283,131 @@ fn a_match_context_is_flattened_and_leaves_no_dangling_source_reference() {
     assert_eq!(dst.used(), heap_bits_size_words(size));
 }
 
+/// A refc binary whose payload **no held handle owns** has no payload to share, so the copier
+/// **flattens** the window into a fresh on-heap bitstring — the same routine a `SUB_BITS` match
+/// context takes. The copy carries the source payload's bytes with its data inside the
+/// destination heap, and registers nothing in the off-heap table (there is no handle to refcount).
 #[test]
-fn a_refc_binary_with_no_owning_handle_is_a_bad_term() {
+fn a_refc_binary_with_no_owning_handle_is_flattened() {
     let bytes = payload();
+    let bits = bytes.len() * 8;
     let source_binary = RefcBinary::new(&bytes).expect("the payload allocates");
     let data_ptr = source_binary.data_ptr();
 
     let mut src = Heap::new(64).expect("source heap");
     // SAFETY: `source_binary` is alive (it is dropped at the end of the test), so the pair is live.
     let original = unsafe { refc_binary_term(&mut src, data_ptr, bytes.len()) };
+    assert!(unsafe { is_refc_binary(original) });
+    assert_eq!(
+        size_of_copy(original),
+        ERL_REFC_BITS_SIZE,
+        "the canonical flat count still sizes the whole 8-word pair"
+    );
 
-    // The source off-heap table does NOT hold the handle: the graph is malformed, not silently
-    // deep-copied.
+    // The source off-heap table does NOT hold the handle: there is no pair to share.
     let src_off = OffHeapTable::new();
     let mut dst = Heap::new(64).expect("destination heap");
     let mut dst_off = OffHeapTable::new();
-    let mut ctx = CopyContext::new(&src_off, &mut dst_off);
-    match copy_struct(original, &mut dst, &mut ctx) {
-        Err(beam_common::BeamError::BadArg) => {}
-        other => panic!("expected BadArg for an unresolved refc payload, got {other:?}"),
-    }
-    assert!(dst_off.binaries().is_empty());
+    let copy = {
+        let mut ctx = CopyContext::new(&src_off, &mut dst_off);
+        copy_struct(original, &mut dst, &mut ctx)
+            .expect("the copy flattens the payload instead of failing")
+    };
+
+    // The copy is a fresh ON-HEAP bitstring (not a refc binary), of the window's bit size.
+    assert!(
+        !unsafe { is_refc_binary(copy) },
+        "a flattened refc binary is no longer a refc binary"
+    );
+    // SAFETY: `copy` is a live boxed term.
+    let header = unsafe { *boxed_val(copy) };
+    assert_eq!(
+        header.raw() & TAG_HEADER_MASK,
+        HEAP_BITS_SUBTAG,
+        "the flattened window is an on-heap bitstring"
+    );
+    let (copied_base, copied_off, copied_size) = unsafe { bitstring_parts(copy) };
+    assert_eq!((copied_off, copied_size), (0, bits), "the whole window, base-aligned");
+    // SAFETY: the copied payload spans bits `0..bits`, i.e. `ceil(bits / 8)` live bytes at `base`.
+    let copied_bytes = unsafe { core::slice::from_raw_parts(copied_base, bits.div_ceil(8)) };
+    assert_eq!(
+        copied_bytes,
+        &bytes[..],
+        "the flattened copy carries the source payload's bytes"
+    );
+    assert_eq!(
+        dst.used(),
+        heap_bits_size_words(bits),
+        "the copy costs the flattened block, not the 8-word pair"
+    );
+
+    // The core property: the copy's data lives INSIDE the destination and NOT in the source heap or
+    // in the source payload, so it stays valid once the source process is gone.
+    assert!(
+        heap_contains(&dst, copied_base as usize),
+        "the copy's data is in the destination"
+    );
+    assert!(
+        !heap_contains(&src, copied_base as usize),
+        "no aliasing into the source heap"
+    );
+    assert_ne!(
+        copied_base as usize, data_ptr as usize,
+        "the copy does not alias the unresolvable source payload"
+    );
+
+    // Nothing is registered: there is no handle to refcount, and the source's own is untouched.
+    assert!(dst_off.binaries().is_empty(), "the flattened copy registers no refc binary");
+    assert!(dst_off.is_empty() && dst_off.nodes().is_empty(), "and no MSO/node artifact");
+    assert_eq!(source_binary.refcount(), 1, "the source holder is untouched");
+}
+
+/// The flatten fallback is **sized** as the flattened block, not as the 8-word pair: a refc binary
+/// with no held handle takes the preflight path against `heap_bits_size_words(size)`, so a dirty
+/// destination with exactly that head-room accepts the copy and one word less refuses it **before
+/// writing a word** — the no-partial-write contract the context-aware sizing exists to preserve.
+#[test]
+fn a_flattened_refc_binary_is_preflighted_at_the_flattened_size() {
+    let bytes = payload();
+    let bits = bytes.len() * 8;
+    let total = heap_bits_size_words(bits);
+    assert!(total > ERL_REFC_BITS_SIZE, "the flattened block is the larger of the two");
+
+    let source_binary = RefcBinary::new(&bytes).expect("the payload allocates");
+    let data_ptr = source_binary.data_ptr();
+    let mut src = Heap::new(64).expect("source heap");
+    // SAFETY: `source_binary` outlives `original` and `data_ptr` is `UNIT_SIZE`-aligned.
+    let original = unsafe { refc_binary_term(&mut src, data_ptr, bytes.len()) };
+    let src_off = OffHeapTable::new();
+
+    // A DIRTY destination (one word already handed out) takes the preflight path; exactly `total`
+    // words of head-room left must admit the flattened window.
+    let mut dst = Heap::new(total + 1).expect("destination heap");
+    // SAFETY: the heap owns the word.
+    unsafe { dst.alloc_words(1).expect("the pre-charge fits") };
+    let mut dst_off = OffHeapTable::new();
+    let copy = {
+        let mut ctx = CopyContext::new(&src_off, &mut dst_off);
+        copy_struct(original, &mut dst, &mut ctx)
+            .expect("the ctx-aware preflight admits the flattened window")
+    };
+    assert_eq!(dst.used(), 1 + total);
+    // SAFETY: `copy` is a live on-heap bitstring covering the whole window.
+    assert_eq!(unsafe { bitstring_parts(copy) }.2, bits);
+
+    // One word short: the whole copy is refused as a message-heap exhaustion, writing nothing.
+    let mut short = Heap::new(total + 1).expect("destination heap");
+    // SAFETY: the heap owns both words.
+    unsafe { short.alloc_words(2).expect("the pre-charge fits") };
+    let mut short_off = OffHeapTable::new();
+    let error = {
+        let mut ctx = CopyContext::new(&src_off, &mut short_off);
+        copy_struct(original, &mut short, &mut ctx).expect_err("one word short must be refused")
+    };
+    assert!(
+        beam_message::is_message_heap_exhaustion(&error),
+        "a refused flatten is a message-heap exhaustion, got {error:?}"
+    );
+    assert_eq!(short.used(), 2, "the refusal writes no word past the pre-charge");
+    assert!(short_off.binaries().is_empty(), "and registers no off-heap artifact");
 }

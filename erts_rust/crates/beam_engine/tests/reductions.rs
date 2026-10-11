@@ -29,8 +29,10 @@
 //! `test_heap`/`allocate_heap`), which a tight **non-allocating** loop — the one
 //! shape that can monopolise a scheduler — never touches. [`ExecutionContext::reduce`]
 //! closes that gap: it is called **once per interpreted instruction** with `n = 1`,
-//! after the instruction succeeded, so a host can price instructions rather than heap
-//! admissions, and can pre-empt by returning its own typed error.
+//! **before** the instruction's body runs (C's `DISPATCH` order), so a host can price
+//! instructions rather than heap admissions and can pre-empt by returning its own typed
+//! error — which leaves the instruction **un-applied** and the machine parked on it, so
+//! a `Machine::resume_outcome` at that address applies it **exactly once**.
 //!
 //! # The loop under test
 //!
@@ -41,9 +43,9 @@
 //!
 //! The `label` marker is itself an instruction the loop executes each time (the jump
 //! target is the label's own code index), which is why an `N`-call run charges
-//! `3·N + 1` reductions: `N` full iterations plus the final iteration's `label` (its
-//! raising `bif0` is **not** charged — `drive` charges only after the instruction
-//! succeeded).
+//! `3·N + 2` reductions: `N` full iterations plus the final iteration's `label` **and**
+//! its raising `bif0` (the charge precedes the body, so the instruction that ends the
+//! run is priced too).
 //!
 //! # One `drive` call is one slice — and a suspend ends it
 //!
@@ -173,8 +175,8 @@ fn counting_loop_module() -> (Module, beam_term::Atom) {
 const SUCCESSFUL_CALLS: u32 = 5;
 const INSTRUCTIONS_PER_ITERATION: u64 = 3;
 /// The exact reduction count of an [`SUCCESSFUL_CALLS`]-call run: `N` full iterations
-/// plus the final iteration's `label`.
-const CHARGES_FOR_CALLS: u64 = INSTRUCTIONS_PER_ITERATION * SUCCESSFUL_CALLS as u64 + 1;
+/// plus the final iteration's `label` **and its raising `bif0`**.
+const CHARGES_FOR_CALLS: u64 = INSTRUCTIONS_PER_ITERATION * SUCCESSFUL_CALLS as u64 + 2;
 
 // ---------------------------------------------------------------------------
 // A receive that suspends, and a module that suspends twice
@@ -299,6 +301,7 @@ fn two_waits_module() -> (Module, beam_term::Atom) {
 /// resumed `label 2` + `wait`, then `label 3` + the `bif0` + the `return`.
 const TWO_WAITS_SLICE_STARTS: [usize; 3] = [0, 2, 4];
 const TWO_WAITS_SLICE_CHARGES: [u64; 3] = [2, 2, 3];
+
 // ---------------------------------------------------------------------------
 // A custom ExecutionContext: a counting BIF and a record-keeping reduce hook
 // ---------------------------------------------------------------------------
@@ -322,6 +325,10 @@ struct ReduceCtx {
     calls: u32,
     /// The queued messages; only the front one is ever the candidate.
     mailbox: VecDeque<Eterm>,
+    /// When set, this host declines the reduction hook (`wants_reduce() == false`),
+    /// i.e. it declares its `reduce` body is not needed. The engine must then skip
+    /// the per-instruction hook call **without** dropping the slice count.
+    decline_hook: bool,
 }
 
 impl ReduceCtx {
@@ -332,6 +339,7 @@ impl ReduceCtx {
             charges: Vec::new(),
             calls: 0,
             mailbox: VecDeque::new(),
+            decline_hook: false,
         }
     }
 
@@ -340,7 +348,13 @@ impl ReduceCtx {
         self
     }
 
-    /// Queue a message the receive's `loop_rec` will find.
+    /// Declare the `reduce` hook unnecessary: the engine skips the per-instruction
+    /// call (this host still overrides `reduce`, so it proves the gate **only**
+    /// suppresses the call, never the counter).
+    fn declining_the_hook(mut self) -> ReduceCtx {
+        self.decline_hook = true;
+        self
+    }    /// Queue a message the receive's `loop_rec` will find.
     fn deliver(&mut self, message: Eterm) {
         self.mailbox.push_back(message);
     }
@@ -385,6 +399,11 @@ impl ExecutionContext for ReduceCtx {
         Ok(())
     }
 
+    /// The per-run reduction-hook gate. Default `true` (the trait default keeps this
+    /// host receiving charges unless it declines); `decline_hook` opts out.
+    fn wants_reduce(&self) -> bool {
+        !self.decline_hook
+    }
     /// `loop_rec`: the candidate at the scan position — the front queued message, or
     /// nothing when the mailbox is empty (which is what makes the receive suspend).
     fn receive_next(&mut self) -> Result<Option<Eterm>> {
@@ -427,8 +446,9 @@ fn reductions_counts_exactly_the_interpreted_instructions() {
         .expect_err("the counter BIF stops the loop");
     assert_eq!(reason(err), "unsupported_opcode: stop");
 
-    // `N` full iterations (label + bif0 + jump) plus the final iteration's label —
-    // the raising `bif0` is never charged.
+    // `N` full iterations (label + bif0 + jump) plus the final iteration's label
+    // **and its raising `bif0`** — the charge precedes the body, so the raising
+    // instruction is priced.
     assert_eq!(machine.reductions(), CHARGES_FOR_CALLS);
     // The failing call counts as a call (it is the `N + 1`th).
     assert_eq!(ctx.calls, SUCCESSFUL_CALLS + 1);
@@ -495,8 +515,12 @@ fn a_host_that_pre_empts_through_reduce_stops_the_loop_with_its_own_error() {
     // `BUDGET` charges were accepted, and the `BUDGET + 1`th returned the error.
     assert_eq!(ctx.charges.len() as u32, BUDGET + 1);
     assert_eq!(machine.reductions(), u64::from(BUDGET) + 1);
-    // 8 charges = two full iterations (6) plus `label` + `bif0` of the third.
-    assert_eq!(ctx.calls, 3);
+    // The pre-empted instruction is parked, not applied: it is the third iteration's
+    // `bif0` (code index 1 of `counting_loop_module`).
+    assert_eq!(machine.current_code(), Some((0, 1)));
+    // 8 charges = two full iterations (6) plus the third iteration's `label` and its
+    // pre-empted `bif0`, which never ran.
+    assert_eq!(ctx.calls, 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -535,9 +559,38 @@ fn the_minimal_context_default_reduce_is_a_no_op_that_still_counts() {
 }
 
 // ---------------------------------------------------------------------------
-// the slice boundary: a suspend/resume charges every instruction exactly once
+// a host may decline the hook: no charges, but the slice count is unchanged
 // ---------------------------------------------------------------------------
 
+#[test]
+fn a_host_that_declines_the_reduce_hook_gets_no_charges_but_still_counts() {
+    let (module, run) = counting_loop_module();
+    let mut machine = Machine::new();
+    // This host overrides `reduce`, yet declares the hook unnecessary: the engine
+    // must skip every per-instruction call, so `charges` stays empty — proof that
+    // the gate suppresses the vtable crossing, not just a no-op body.
+    let mut ctx = ReduceCtx::new(SUCCESSFUL_CALLS).declining_the_hook();
+
+    let err = machine
+        .run_export_outcome(&module, run, 0, &[], &mut ctx)
+        .expect_err("the counter BIF stops the loop");
+    assert_eq!(reason(err), "unsupported_opcode: stop");
+
+    assert!(
+        ctx.charges.is_empty(),
+        "the declining host must receive no reduction charges, got {:?}",
+        ctx.charges
+    );
+    // The engine-side slice counter is unchanged: `Machine::reductions` still counts
+    // every interpreted instruction, so a host that polls instead of hooking is
+    // unaffected by the opt-out.
+    assert_eq!(machine.reductions(), CHARGES_FOR_CALLS);
+    assert_eq!(ctx.calls, SUCCESSFUL_CALLS + 1);
+}
+
+// ---------------------------------------------------------------------------
+// the slice boundary: a suspend/resume charges every instruction exactly once
+// ---------------------------------------------------------------------------
 /// A receive that finds no message **is** a slice: the `wait` is charged like any
 /// other instruction before the driver reports the suspension, and the resume starts
 /// a fresh slice at the `wait`'s target label — so the `wait` is never charged twice,

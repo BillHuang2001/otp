@@ -3,8 +3,11 @@
 ## Intent
 Lower the typed IR basic blocks of a `beam_loader::Module` into native x86-64 functions for the
 **baseline** execution tier. One file per responsibility: `mod.rs` owns the compiled-block shape
-(prologue/epilogue, `emit_block`'s lowering dispatch, the deopt sequence, `spill`/`fill`,
-`compile_module`); `regalloc.rs` picks the cached x-registers; `operands.rs` reads operand shapes;
+(prologue/epilogue, `emit_block`'s lowering dispatch, the deopt sequence, `spill`/`fill`) and the two
+compilation entry points — `compile_module` (the **eager** whole-module layout: one shared
+`CodeBuffer`, a whole-module block map) and `compile_function`/`emit_function` (the **lazy** layout's
+per-function unit: its own `CodeBuffer`, a map covering only that function); `regalloc.rs` picks the
+cached x-registers; `operands.rs` reads operand shapes;
 `r#move.rs`/`test.rs`/`select.rs`/`arith.rs`/`compare.rs`/`aggregate.rs` each lower one instruction
 group; `link.rs` owns the direct block-to-block jump and the linked local tail call.
 The driver, block ABI and the three helpers (`jit_step_one`, `jit_ext_call`, `jit_tail_call`) live one
@@ -43,7 +46,7 @@ group's `try_inline_*`; **`Ok(false)` means "lowered nothing"** and the arm then
 | Tuple write | `SetTupleElement` | `aggregate.rs::try_inline_set_tuple_element` via `emit_tuple_write` | `set_tuple_element_shape` |
 | Arithmetic gc_bif | `GcBif` (`+`/`-`/`*`) | `arith.rs::try_inline_gc_bif` | `arith.rs::fast_arith` |
 | Comparisons | `Bif` (and `GcBif` fallback) | `compare.rs::try_inline_comparison` | `compare.rs::comparison_shape` |
-| Jump | `Jump` | `link.rs::Linker::emit_exit` | resolved label -> linked or return-to-driver |
+| Jump | `Jump` | `link.rs::Linker::emit_exit` | resolved label **in the block map** -> linked; otherwise return-to-driver (the target's function is compiled on entry) |
 | Local tail call | `CallLast` | `link.rs::Linker::emit_tail_exit` | `Linker::is_compiled` |
 | Local tail call (no pop) | `CallOnly` | `link.rs::Linker::emit_exit` (lowers like `Jump`) | resolved label |
 | Cross-module call | `CallExt`,`CallExtOnly`,`CallExtLast` | `mod.rs::emit_ext_call` (an `emit_helper_call` to `jit_ext_call`) | n/a — the helper resolves the import and reports `ENTER` |
@@ -111,8 +114,9 @@ frame discipline, no interpreter step — and then `emit_continue_check`. Its `N
 `jit_step_one` fallback (the synchronous `call_bif` path); its other word is the `ENTER` of a resolved
 cross-module transfer, which the driver decodes into the context switch.
 `link.rs::emit_exit`'s unlinkable path is a **different** mechanism: it is *not* a helper call — it spills,
-materialises the return word in `rax`, and jumps to `done`; the **driver** then looks up the block or
-takes one interpreter step.
+materialises the return word in `rax`, and jumps to `done`; the **driver** then looks the target up in the
+active artifact — for a lazy artifact a branch to another function is simply absent from that function's
+block map, so the driver compiles the target's function on entry — or takes one interpreter step.
 
 ## Spill/fill discipline
 - Prologue (`mod.rs::emit_block`): push `SAVED_REGISTERS` (6 callee-saved regs), reserve the 24-byte `rt`
@@ -144,10 +148,16 @@ out-of-bound register is never counted. Every non-selected register is read/writ
 - `#![allow(unsafe_code)]` at the emitter entry (`mod.rs`) because it drives the encoder; nothing here
   dereferences a raw pointer itself.
 - `emit_block` accumulates `highest_native_register` (direct `machine.x` accesses) via `touch`; the driver
-  refuses native entry to a machine whose register file does not cover it. `compile_module` also records
-  `highest_cached_register` / `cached_registers`.
-- `CodeBuffer` reservations are budgeted by `code_capacity_estimate` (loose on purpose: under-estimating
-  turns a large module into a `SystemLimit` compile error). Block entry labels are reserved **before**
+  refuses native entry to a machine whose register file does not cover the bound the artifact's layout
+  requires. `emit_function` records `highest_cached_register` / `cached_registers` and
+  `highest_native_register` for the function it lowers; `compile_module` merges those per-function
+  summaries into the whole-module summary, and that **whole-module** `highest_native_register` is the
+  eager layout's entry guard (its seal-time links may tail-call across functions in the one shared
+  mapping). A lazy artifact keeps each function's own summary and guards entry by the entered function's
+  own bound.
+- `CodeBuffer` reservations are budgeted by `code_capacity_estimate` (whole module) / `function_capacity_estimate`
+  (one function, the base of the lazy layout's buffer size). Both are loose on purpose: under-estimating
+  turns a large module into a `SystemLimit` compile error. Block entry labels are reserved **before**
   emitting, so forward branches are ordinary `rel32` fixups, never post-`seal` patching (W^X unchanged).
 - A resolved `CallExt`/`CallExtOnly`/`CallExtLast` surfaces from the `emit_ext_call` helper as the `ENTER` word with the resolved `(context, func, pc)` in the runtime's `enter` slot; the **driver** performs the switch (`Machine::switch_context` + module/label/literal re-bind + the callee's blocks via `NativeCode::module_blocks`) and re-enters native code. The transfer is still a driver round-trip (a cross-module link is unsound — separate mappings, buffer-local `rel32` fixups, a module baked into `JitRuntime`), but the *call instruction* no longer costs an interpreter step; a seam miss (the synchronous `call_bif` path) or a failed frame discipline falls back to `jit_step_one` inside the helper.
 - Never hand-edit generated data. Files ~1000 lines; split by responsibility. Apache-2.0 header on every
@@ -155,8 +165,11 @@ out-of-bound register is never counted. Every non-selected register is read/writ
 
 ## Routing Table
 - `mod.rs` -> compiled-block shape: `SAVED_REGISTERS`/`CACHE_REGISTERS`/scratch constants, `touch`/`Allocation`,
-  `compile_module`, `code_capacity_estimate` + size budgets, `emit_block` (the dispatch), `emit_helper_call`,
-  `emit_step_and_continue`, `emit_ext_call`, `emit_continue_check`, `spill`/`fill`.
+  the two compilation entry points `compile_module` (**eager**: whole-module block map + the merged
+  whole-module summary that guards entry) and
+  `compile_function` (**lazy**: one function's own buffer/entries/summary, sharing `emit_function`),
+  `code_capacity_estimate`/`function_capacity_estimate` + size budgets, `emit_block` (the dispatch),
+  `emit_helper_call`, `emit_step_and_continue`, `emit_ext_call`, `emit_continue_check`, `spill`/`fill`.
 - `regalloc.rs` -> `allocate_registers` + `cacheable_touches`.
 - `operands.rs` -> `x_offset`, `x_register`, `constant_word`, `small_word`.
 - `r#move.rs` -> `try_inline_move`, `try_inline_swap`.

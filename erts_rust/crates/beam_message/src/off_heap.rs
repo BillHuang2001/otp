@@ -29,15 +29,16 @@
 //! façade** over the shared [`beam_gc::OffHeap`] storage — the slot↔object association has
 //! exactly one home.
 //!
-//! # Slot stability (the reason this table never sweeps)
+//! # Why this table never sweeps
 //!
 //! Slots must be **stable for the table's lifetime**: the copier writes slot indices into
 //! on-heap containers, so a shifted slot would silently corrupt every reference to a later
 //! object. [`OffHeapTable`] therefore uses **only** the append-only insert/read path
 //! ([`beam_gc::OffHeap::insert`]/[`get`](OffHeapTable::get)/[`iter`](OffHeapTable::iter)),
 //! which never reuses or reorders a slot. It **never** calls [`beam_gc::OffHeap::sweep`] —
-//! that operation compacts the list and shifts the surviving slots down. Off-heap
-//! reclamation is the collector's concern (`beam_gc`), not this view's.
+//! that operation releases entries *in place* (a released slot becomes empty; it is neither
+//! reused nor moved, so surviving slots keep their indices), and reclamation is the
+//! collector's concern (`beam_gc`), not this read-only view's.
 //!
 //! # Binaries and nodes
 //!
@@ -64,8 +65,8 @@ pub use beam_gc::MsoHandle;
 ///
 /// The slot of an **MSO** handle is the value the on-heap off-heap-reference container
 /// stores in its `val` word; `push` returns it. Slots are stable for the table's lifetime
-/// (they are never reused or compacted) — see the module docs: this table deliberately
-/// never sweeps.
+/// (they are never reused or reordered) — see the module docs: this table deliberately
+/// never sweeps, because off-heap reclamation is the collector's job, not a read view's.
 ///
 /// MSO storage is delegated to [`beam_gc::OffHeap`] (the workspace's single owner of the
 /// off-heap list); this type adds the MSO-typed access the copy boundary needs, plus the

@@ -43,12 +43,14 @@ Ground truth (read-only, never modify): `../../../../../erts/emulator/beam/emu/*
 - Errors are `beam_common::Result` only — never a crate-local error enum, never a panic; an unsupported opcode/operand
   is the documented `error::unsupported`.
 - **Reduction charge.** `Machine::drive` (`../machine/drive.rs` — the hot loop these run entries delegate to)
-  charges **exactly one reduction per interpreted instruction** and offers it to the host through the defaulted
-  `ExecutionContext::reduce` hook; an `Err` from the hook ends the run exactly like any other engine failure. It is
-  the only pre-emption point a **non-allocating** loop reaches (`ensure_heap` is never called by one), and
-  `tests/reductions.rs` pins one charge per instruction.
+  charges **exactly one reduction per interpreted instruction, before the instruction's body**, and offers it to the
+  host through the defaulted `ExecutionContext::reduce` hook; an `Err` from the hook ends the run **without applying
+  the instruction**, leaving the machine parked at its `(func, pc)` for `Machine::resume_outcome` to apply exactly
+  once. It is the only pre-emption point a **non-allocating** loop reaches (`ensure_heap` is never called by one),
+  and `tests/reductions.rs` pins one charge per instruction.
 - `step_instruction` records `Machine::current_code = (func, pc)` at entry (the exact position at every interpreted
-  suspension, incl. a blocking `wait`); a natively-executed JIT block does not update it.
+  suspension, incl. a blocking `wait`); `Machine::drive` records the same position before it charges, so a
+  pre-empted instruction stays that parked address. A natively-executed JIT block does not update it.
 - **`step_instruction` wraps its body (`step_instruction_inner`) with the uniform raise funnel.** In the run's entry
   context (module context `0`) an uncaught `BeamError::Raise` gets its symbolic frames attached here via
   `Machine::with_uncaught_frames`; because this is the one body both the interpreter's dispatch loop and the native

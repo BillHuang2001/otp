@@ -29,11 +29,12 @@ The six workloads the Rust runtime itself can host (`Runtimes::Both`) — `basel
 | `baseline` | startup / CLI | `startup_ms` (mean, whole process) | 157.09 ms | 17.50 ms | **0.11×** | Rust **8.98× faster** per process |
 | `slice` (9 programs) | compute | `case_*_wall_ms` (mean, per case) | 136.22–228.73 ms | 17.92–36.90 ms | **0.078–0.241×** | Rust **4.16×–12.77× faster** |
 | `foreign` (Cowboy/EMQX source) | compute / `.beam` | `case_*_ns_per_call` | 216.54–423.66 ns | 27 184.74–41 393.44 ns | **74.9×–131.4×** | Rust **74.9×–131.4× dearer** per call |
-| `list_walk` | interpreter | `case_list_walk_ns_per_element` | 3.1312 ns | 340.5021 ns | **108.7×** | Rust **108.7× dearer** per element |
+| `list_walk` | dispatch | `case_list_walk_ns_per_element` | 3.1312 ns | 340.5021 ns | **108.7×** | Rust **108.7× dearer** per element |
 | `copy_bound` (ETF / ETS / send-recv) | Msg / copy | `case_*_ns_per_op` | 244.59–1 452.94 ns | 4 281.73–194 813.33 ns | **17.5×–188.4×** | Rust **17.5×–188.4× dearer** per op |
 | `gc_bound` (allocation churn) | GC | `case_churn_ns_per_op` | 4 643.26 ns | 258 354.39 ns | **55.6×** | Rust **55.6× dearer** per op |
 
-- **The two directions are both real and answer different questions.** Rust's *whole-process cost* is far lower (a `beam_rt` process is small and starts in ~17–37 ms), while the *per-unit execution cost* of interpreted Erlang is far higher (the interpreter throughput gap: **17×–188×**, §3.8). Startup is the trustworthy whole-process comparison; the startup-cancelled marginals are the interpreter-throughput signal.
+- **The two directions are both real and answer different questions.** Rust's *whole-process cost* is far lower (a `beam_rt` process is small and starts in ~17–37 ms), while the *per-unit execution cost* of Erlang code under `beam_rt` is far higher (the per-unit execution-throughput gap: **17×–188×**, §3.8). Startup is the trustworthy whole-process comparison; the startup-cancelled marginals are the per-unit execution-throughput signal.
+- **The one-shot cold start is bounded by per-function lazy compilation** (§3.9). A `slice` sample is a single call in a fresh process, and a module-graph-heavy case whose first entry pulls in a large Erlang module graph (`string_str_length`-style) sits at **~1.2×** the interpreter tier, not at a whole-module compile.
 - **Peak RSS is a like-for-like cross-runtime comparison only for `slice`** (one call per process). For `foreign` / `list_walk` / `copy_bound` / `gc_bound` rust peak RSS grows with the per-runtime loop count `N` and is **not** comparable (§6.7); `slice` shows rust **2.65× lower** than sys.
 - **Load caveat (read before quoting any absolute number).** The cross-runtime run was measured at 1-min `/proc/loadavg` ≈ **414–440** on a shared 14-core host; the sys-only target runs swung between **3** and **>600** (§1). Absolute latencies are inflated by contention and are **not comparable across runs**; prefer the ratios above, the startup-cancelled marginals and the deterministic counters.
 
@@ -46,7 +47,7 @@ The driver now exercises the messaging/copy, ETF, ETS and GC surfaces named in t
 | `baseline` | startup | startup / p99 tail; CLI (A.6); boot (A.7) | **both** |
 | `slice` | compute | JIT/compute (calls real `calendar`/`queue`/`gb_trees`/`base64`/`ordsets`/`string` code) | **both** |
 | `foreign` | compute | JIT/compute on **real Cowboy + EMQX source**, compiled by `erlc` (`.beam` A.2) | **both** |
-| `list_walk` | compute | JIT/compute — pure interpreter dispatch, BIF-free | **both** |
+| `list_walk` | compute | JIT/compute — a BIF-free body-recursive walk (per-element dispatch) | **both** |
 | `copy_bound` | messaging | **Msg/copy + Distrib/ETF + ETS** — `term_to_binary`/`binary_to_term`, `ets:insert`+`ets:lookup`, two-process send/receive | **both** |
 | `gc_bound` | gc | **GC** — allocate-and-abandon churn | **both** |
 | `cowboy` | io | I/O — Ranch/`epoll` socket path, `cowlib` HTTP parse, per-request process spawn | system-only |
@@ -152,7 +153,7 @@ The per-runtime loop count `N` in the `foreign`/`list_walk`/`copy_bound`/`gc_bou
 
 ## 3. Cross-runtime results (system ERTS vs Rust ERTS)
 
-`sys` = OTP 29.1.1 with the JIT; `rust` = `beam_rt`, released, a tree-walking interpreter over a supported opcode subset.
+`sys` = OTP 29.1.1 with the JIT. `rust` = `beam_rt`, released: a working runtime whose per-process execution tier **defaults to the native baseline JIT** (`JitMode::Auto` ⇒ `Tier::BaselineJit` on the process's first entry, remembered across pre-emptions and suspends; `BEAM_RT_TIER=interpreter` is the only kill switch), with anything outside the modelled `genop.tab` surface returning a typed `unsupported`/`BeamError` rather than a wrong result. Its runtime path compiles **per function, lazily** on a function's first entry (`../../crates/beam_engine/src/jit/baseline/code.rs`) — never whole-module; the current tier and one-shot cold-start figures are in `../../crates/beam_engine/MEASURED.md` and `../../crates/beam_rt/PERF.md`, summarised in §3.9.
 All tables in this section come from the **focused `xrun`** (`results/m6-bench-xrun.json`, `--full --runtime all`, load 434.54 → 415.14), which runs the six cross-runtime workloads back to back: **12/12 rows `ok`**.
 
 ### 3.1 Startup latency — `baseline` (n = 50, ms)
@@ -202,6 +203,7 @@ Wall time, **mean** (ms); per-case peak RSS, **p50** (MiB, base 2):
 Whole-workload peak RSS: sys **72 794 112 B (69.4 MiB)** / rust **27 447 296 B (26.2 MiB)** (2.65× lower).
 
 **Read the wall column as *whole-process*, not *execution*.** Each case is a single call per process, so the wall time is dominated by process boot; six of the nine also call a *system* module. Per-case `rust` peak RSS **is** the like-for-like per-process memory comparison (one call per process, no loop accumulation): rust **14.3–25.9 MiB** vs sys **66.0–66.5 MiB** (2.56×–4.63× lower).
+The `string_str_length` row is the family's **one-shot cold-start** case — the first entry pulls in a large Erlang module graph — and its current-state cost is §3.9.
 
 ### 3.4 `foreign` — real Cowboy / EMQX modules, per-call cost under both runtimes
 
@@ -217,10 +219,10 @@ The workload that measures the Rust runtime on *real target-project source* (`co
 
 All four cases ran under both runtimes (`4 ok, 0 unsupported`) and produced the same stdout (`sys`: `bstr_to_lower=45000000 bstr_capitalize_token=45000000 emqx_base62_encode=48000000 emqx_base62_decode=33000000`; `rust`: `600000 / 450000 / 400000 / 165000` = `N × per_call`).
 
-**This is the execution-bound result.** Startup is comparable while the *per-call* cost of a real foreign function is **~75×–131×** higher under `beam_rt`. The gap is a **real runtime cost, not a harness artifact**: the startup-cancelled marginal is stable and reproduces with a plain shell loop calling `beam_rt -pa <dir> run <mod.beam> <mod>:<fun>/1 <N>`. It is a `beam_rt` per-call host-context cost, not interpreter dispatch (§3.8).
+**This is the execution-bound result.** Startup is comparable while the *per-call* cost of a real foreign function is **~75×–131×** higher under `beam_rt`. The gap is a **real runtime cost, not a harness artifact**: the startup-cancelled marginal is stable and reproduces with a plain shell loop calling `beam_rt -pa <dir> run <mod.beam> <mod>:<fun>/1 <N>`. It is a `beam_rt` per-call host-context cost, not the engine's per-instruction dispatch (§3.8).
 **`foreign` peak RSS is not a like-for-like memory comparison — see §6.7.**
 
-### 3.5 `list_walk` — the interpreter-throughput metric (n = 10/case)
+### 3.5 `list_walk` — the per-element dispatch-throughput metric (n = 10/case)
 
 A **BIF-free** body-recursive walk (`walk(N)` sums a 1000-element list `N` times; `build/2` makes the list once per process) runs under both runtimes; the reported figure is the startup-cancelled **ns per walked element**.
 
@@ -230,7 +232,7 @@ A **BIF-free** body-recursive walk (`walk(N)` sums a 1000-element list `N` times
 | `rust` | 1 000 | 1 000 000 | **340.5021** | 343.16 | 24.30 | 15.0 MiB |
 
 `case_list_walk_elements` (the deterministic, contention-immune companion metric) is `1×10⁸` for sys and `1×10⁶` for rust; each run printed the deterministic constant `N × 500 500` (`rust`: `list_walk=N*500500=500500000`, `sys`: `…=50050000000`).
-`ns/element` gives a **108.74×** rust/sys ratio, consistent with the §3.4 `foreign` per-call gap and the §3.6 `copy_bound` ratios: the same interpreter-vs-JIT throughput story, applied to pure dispatch.
+`ns/element` gives a **108.74×** rust/sys ratio, consistent with the §3.4 `foreign` per-call gap and the §3.6 `copy_bound` ratios: the same per-unit execution-throughput story, applied to pure dispatch.
 
 ### 3.6 `copy_bound` — the copy boundary: ETF, ETS and process send/receive (n = 10/case)
 
@@ -261,9 +263,24 @@ The rust/sys ratio is **55.64×**. This row measures the allocate-and-abandon **
 ### 3.8 Reading the cross-runtime numbers
 
 - **Startup / whole-process cost is the trustworthy cross-runtime comparison** (§3.1, §3.3): rust is 8.98× faster at `baseline` startup and 4.16×–12.77× faster per `slice` case, with 2.65× lower per-process peak RSS. A `beam_rt` process is small and starts in ~17–37 ms.
-- **The startup-cancelled marginals are the interpreter-throughput signal** (§3.4–3.7), and they point the other way: rust costs **17.5×–188.4×** more per op/call/element. This is the real cost of interpreting (vs JIT-compiling) Erlang.
+- **The startup-cancelled marginals are the per-unit execution-throughput signal** (§3.4–3.7), and they point the other way: rust costs **17.5×–188.4×** more per op/call/element. That residual is a `beam_rt` per-call runtime cost, not the engine's per-instruction dispatch (next bullet).
 - **Only `slice` gives a like-for-like peak-RSS comparison** (§6.7). `foreign` / `list_walk` / `copy_bound` / `gc_bound` rust peak RSS grows with the per-runtime loop count `N`.
-- The gap is a **`beam_rt` host-context cost**, not `beam_engine` interpreter dispatch: the interpreter dispatch is itself O(1) and allocation-free per instruction; the runtime-side dispatch costs behind it are `beam_rt` measurements owned by `crates/beam_rt/CONTEXT.md` (measured via that crate's `examples/perf_bif.rs`), not `bench` output.
+- The gap is a **`beam_rt` per-call host-context cost**, not `beam_engine` instruction dispatch (the dispatch arm is itself O(1) and allocation-free per instruction, and the baseline tier runs the common `gc_bif` arithmetic natively): the runtime-side costs behind it are `beam_rt` measurements owned by `../../crates/beam_rt/PERF.md` (the per-call dispatch section) and `../../crates/beam_rt/CONTEXT.md`, not `bench` output.
+- **The `slice` whole-process column includes a one-shot cold start, and that cold start is bounded** (§3.9): the runtime path lowers a function on its first entry, so a process that enters a large Erlang module graph pays ~1.2× the interpreter tier rather than a whole-module compile.
+
+### 3.9 One-shot cold start — the runtime compiles per function, lazily
+
+Every `slice` case is a single call in a **fresh** `beam_rt` OS process (§3.3), so that wall column carries the cost of entering a system module for the first time. That cost is bounded by construction: the **runtime path** stages a **lazy** native artifact — one sealed mapping per function, lowered on that function's first entry of a `(func, pc)` (`../../crates/beam_engine/src/jit/baseline/code.rs`) — so a fresh process pays only for the functions it actually enters. The **eager** whole-module layout (`JitBackend::compile` / `CodeCache::get_or_compile`) exists for the whole-module introspection surface and for the `jit_bench` harness; it is **not** the runtime path.
+A module-graph-heavy case such as `string_str_length` (`string:length/1` is ~7 995 IR instructions) therefore sits at **~1.2×** the interpreter tier:
+
+| current-state figure | where it comes from |
+|---|---|
+| `bslice_string:str_length/1`, N = 30 interleaved samples — default (baseline JIT) **31.86–45.45 ms (min 31.86)** vs `BEAM_RT_TIER=interpreter` **25.51–40.48 ms (min 25.51)** ⇒ **~1.22–1.25×** | `../../crates/beam_engine/MEASURED.md` §"Measured (baseline-JIT cold start — lazy per-function compilation)" |
+| the same shape through this driver — **31.97 ms** default / **31.92 ms** `BEAM_RT_TIER=interpreter` (min-of-3) | same section of `../../crates/beam_engine/MEASURED.md` |
+| the tier defaults to the native baseline JIT for **every** process entry; `BEAM_RT_TIER=interpreter` is the only kill switch | `../../crates/beam_rt/PERF.md` §"What changed since `BEFORE`" and `../../crates/beam_rt/src/runner/tier.rs` |
+
+**Caveat — `jit_bench` pins the hot path, not this path.** The engine's `jit_bench` micro-benchmark drives the **eager** whole-module artifact only, so its interpreter → baseline-JIT speed-ups (`../../crates/beam_engine/MEASURED.md` §"Measured (JIT tier micro-benchmark …)") describe the hot path with the compile amortised away, and say nothing about the lazy runtime path's per-entry compile cost.
+The two cited documents are **current-state** records — re-run their own commands for the live figures rather than quoting this summary. And the host-load caveat applies to them exactly as it does here (§6.1): absolute latencies move with load, so read the *ratio* (default ÷ interpreter), and interleave the two modes, never a single sample.
 
 ## 4. System-ERTS target-project results (sys-only workloads)
 
@@ -413,7 +430,7 @@ Every figure below is quoted from the committed artifacts: `m6-*` (2026-10-11, c
 
 * **`baseline` `vm_memory_total_bytes` (rust)** — `m5` 801 294 B → `m6` 805 458 B (the two runtimes still report different quantities, §3.2).
 * **`foreign` rust peak RSS still scales with `N`** (§6.7).
-* **The `foreign` per-call gap is the stable interpreter-throughput story.** `m4` (quiet) 53.8×–72.0×; `m5` 53.1×–96.0× (`xrun`); `m6` **74.9×–131.4×** (`xrun`). The band widened again — the same interpreter-vs-JIT cost, read at a different host load. `list_walk` tells the same story: `m5` rust **561.67** ns/element vs sys **8.43** (66.6×) → `m6` rust **340.50** vs sys **3.13** (108.74×).
+* **The `foreign` per-call gap is the stable per-unit execution-throughput story.** `m4` (quiet) 53.8×–72.0×; `m5` 53.1×–96.0× (`xrun`); `m6` **74.9×–131.4×** (`xrun`). The band widened again — the same per-unit cost, read at a different host load. `list_walk` tells the same story: `m5` rust **561.67** ns/element vs sys **8.43** (66.6×) → `m6` rust **340.50** vs sys **3.13** (108.74×).
 
 ### New this run
 
@@ -431,7 +448,7 @@ No workload returns a hard-coded or estimated metric; a workload that fails to b
 * **Stale in-file doc:** `src/workloads/baseline.rs` (module doc and the `MEMORY_EVAL` comment) still says `erlang:memory/0,1` "is not implemented by the Rust runtime yet"; `beam_rt` now serves it via the `MemoryHook` seam and the workload records a real `vm_memory_total_bytes` for `rust` (§3.2). `is_capability_gap` survives only as a fallback classifier.
 * `proc.rs:126` (`h.join().unwrap_or_default()`) collapses a panicked stdout/stderr drain thread to an empty string; the drain threads have no realistic panic path, so this is latent, not active.
 
-The `foreign`/`list_walk`/`copy_bound`/`gc_bound` per-call/per-element/per-op methodology is implemented exactly as stated (startup-cancelled `(mean wall@N − mean wall@0) / N`), and the registered-BIF `~116 ns/call` headline is **not** produced here — it is a `beam_rt` measurement (`../crates/beam_rt/CONTEXT.md`, `examples/perf_bif.rs`).
+The `foreign`/`list_walk`/`copy_bound`/`gc_bound` per-call/per-element/per-op methodology is implemented exactly as stated (startup-cancelled `(mean wall@N − mean wall@0) / N`), and the registered-BIF dispatch cost — **≈ 79–96 ns/call** for the non-inlinable `call_ext` round trip (`../../crates/beam_rt/PERF.md`, *Registered-BIF (non-inlinable) per-call*) and **≈ 76 ns/iter** for `pb:tr/2`'s `trunc/1` (`../../crates/beam_rt/TRACE_AND_PERF.md`, *Dispatch cost (registered-BIF path)*) — is **not** produced here; it is a `beam_rt` measurement.
 
 **Reproducibility note (PLB).** The .NET SDKs are *store* state, not repository state: a fresh sandbox that has not realized `nixpkgs#dotnet-sdk_9` will again report `plb` → `failed(plb-build-failed)` (with `NETSDK1045`) even though `probe()` reads ready. That is the honest, un-fabricated outcome for that environment; the committed artifacts above were produced with the 9.x SDK present. `khepri` needs only the `rebar3` store entry and runs as-is.
 

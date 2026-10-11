@@ -27,10 +27,10 @@
  *                   the same terms. Its expected values are `ORDER_PAIRS` in
  *                   tests/nif_compare.rs.
  *   nested_atoms/0  `{alpha}` vs `{beta}` and `[alpha]` vs `[beta]`. The atom
- *                   pair is *nested* inside a compound, which is the documented
- *                   remaining gap: this runtime orders it by raw atom index
- *                   where the oracle orders it by name (see the module docs of
- *                   src/nif/enif/pred.rs).
+ *                   pair is *nested* inside a compound; it is ordered by NAME
+ *                   (through the host's exposed atom table -- see the module
+ *                   docs of src/nif/enif/pred.rs), so both runtimes answer
+ *                   `{-1,-1}`.
  *   fresh_atoms/0   `[enif_compare(alpha, beta), enif_compare(beta, alpha)]` where
  *                   BOTH atoms are created inside this very call by
  *                   `enif_make_atom` (and `beta` is created first, so the atom
@@ -114,7 +114,7 @@ static ERL_NIF_TERM order_pairs(ErlNifEnv* env, int argc, const ERL_NIF_TERM arg
 }
 
 /* ---------------------------------------------------------------------------
- * the nested-atom case (the documented remaining gap)
+ * the nested-atom case (ordered by name through the host's exposed atom table)
  * ------------------------------------------------------------------------- */
 
 #define NESTED_COUNT 2

@@ -146,7 +146,7 @@ fn the_compiled_function_runs_the_export_natively() {
     };
 
     let word = code
-        .enter(&mut rt, func, pc)
+        .enter(&mut rt, &module, func, pc)
         .expect("the entry address is compiled");
     // The native CFG ran to the function's `return`: the bottom frame's
     // continuation, i.e. HALT.

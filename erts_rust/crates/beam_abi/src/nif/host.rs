@@ -57,6 +57,7 @@ use std::rc::Rc;
 use libc::{c_int, c_void};
 
 use beam_alloc::Heap;
+use beam_term::atom::AtomTable;
 use beam_term::prelude::Eterm;
 
 use crate::common::{ErlDrvSysInfo, ErlNifSelectFlags};
@@ -73,6 +74,22 @@ pub trait NifHost {
 
     /// Reverse lookup: the text of `atom`, or `None` if it is not a valid atom term.
     fn atom_name(&mut self, atom: Eterm) -> Option<String>;
+
+    /// The runtime's **global atom table** — the name source `beam_term`'s structural comparison and
+    /// hashing use to order two atoms by their *text* (the C's `erts_cmp_atoms`). The `enif_*` entry
+    /// points that take **no env** ([`crate::nif::enif::pred`]'s `enif_compare`/`enif_is_identical`/
+    /// `enif_hash`) reach it through `with_current_host` while a NIF call is live, so an atom *nested*
+    /// inside a tuple/list/map/fun orders by name instead of by its raw interned index. Default:
+    /// `None`, which preserves `beam_term`'s raw-index fallback for an unresolvable atom name.
+    ///
+    /// **Owner: `beam_rt`'s `NifHostImpl`.** It already owns the runtime atom table
+    /// (`Rc<beam_term::AtomTable>`); implementing this as `Some(&*self.atoms)` is what brings the
+    /// name-ordered nested comparison to the runtime path. Until then the hook stays at its default
+    /// and a nested atom pair keeps the documented index fallback (never a wrong answer for a
+    /// non-atom key).
+    fn atom_table(&self) -> Option<&AtomTable> {
+        None
+    }
 
     /// `erlang:self()` within the NIF (default: unsupported).
     fn self_pid(&mut self) -> Option<Eterm> {

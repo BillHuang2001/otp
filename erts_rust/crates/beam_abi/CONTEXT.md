@@ -443,7 +443,9 @@ field, driving the `NifEnv`/`NifHost` seam (`beam_term`, `beam_alloc::Heap`, `Ni
   the map's **storage order** (`hashmap_iterator_next`). The hash arm's `ErtsDynamicWStack` is a boxed pair list; `get_pair` answers the same
   sequence.
 - **`time`** — `enif_monotonic_time`/`enif_time_offset`/`enif_convert_time_unit`/`enif_now_time`/`enif_cpu_time`/`enif_system_info`/`enif_getenv`/`enif_make_unique_integer`/`enif_consume_timeslice`/`enif_dlopen`/`enif_dlsym`;
-  the monotonic-time / time-offset relation is reproduced and `enif_time_offset/1` is oracle-pinned;
+  the monotonic-time / time-offset relation is reproduced and covered by Rust unit tests in
+  `src/nif/enif/time.rs` (`monotonic_time_is_monotone_and_unit_consistent`, `monotonic_plus_offset_is_wall_time`)
+  — there is no `erl`-oracle pin for `enif_time_offset/1`;
   `enif_system_info` (no env) reaches the host via `with_current_host` and prefers
   `NifHost::system_info`; `enif_make_unique_integer` prefers `NifHost::unique_integer`.
 - **`resources`** — the eleven slots over a crate-internal type registry + a real refcounted allocation
@@ -536,10 +538,14 @@ Every one is `#[no_mangle] pub unsafe extern "C"` with the exact signature of it
   `DriverHost`, whose **defaults** report "unsupported" (`-1`/`None`): a host only records the request,
   so "the OS poller really woke the port" is a `beam_io`/`beam_rt` concern.
 - `enif_make_map_*`/`enif_compare`/`enif_is_identical`/`enif_hash` take no env; identical terms take a
-  raw-word fast path. `enif_compare` resolves an atom pair by **name** (`current_recorded_atom_name`, `NifHost::atom_name`); the residual is a **nested** (tuple/list/map) atom pair, which
-  falls back to `beam_term`'s index order (no name-resolver entry point for a non-`AtomTable` caller) —
-  pinned by `tests/nif_compare.rs::a_nested_atom_pair_is_the_documented_index_fallback`. Exact for
-  non-atom keys.
+  raw-word fast path. `enif_compare` resolves an atom pair by **name** — a *top-level* pair through
+  `current_recorded_atom_name`/`NifHost::atom_name`, and a pair **nested** (tuple/list/map) inside a
+  compound through the current host's atom table (`NifHost::atom_table`, a defaulted hook). Only with
+  no host, or a host that exposes no table, does a nested pair fall back to `beam_term`'s raw
+  atom-index order — pinned by `tests/nif_compare.rs::a_nested_atom_pair_orders_by_name`. Exact for
+  non-atom keys. **Cross-crate need:** `beam_rt`'s `NifHostImpl` (`erts_rust/crates/beam_rt/src/nif.rs`,
+  which holds `Rc<beam_term::AtomTable>`) must override `NifHost::atom_table()` to return
+  `Some(&*self.atoms)` for the runtime path to benefit.
 - Integers: small ints + one-limb bignums; a wider value makes the accessor return `0`, never truncate.
 - **On-heap vs off-heap refc binaries (F5-class, audited — not closable inside `beam_abi`).**
   `enif_alloc_binary`/`enif_make_new_binary`/`enif_make_binary` always build an **on-heap** binary

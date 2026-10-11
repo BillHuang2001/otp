@@ -77,10 +77,12 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   (the `ets:take/2` check-out: the object stays valid, its runs are never handed out again, but it
   stops counting toward `words()`), `reset()`, `words()`, `blocks()`, `memory()`. `impl Drop` frees
   every block.
-- Deep-copy **supported subset**: immediates, cons/list cells, tuples, **flat maps**, pointer-free
-  boxed leaves (float, bignum, internal ref, on-heap bitstring). **Unsupported** (⇒ `BadArg`): funs,
-  hash-maps, records, external pid/port/ref, off-heap bin refs/sub-bitstrings. Every table read can
-  only contain what an insert could store, so the copier is complete for table contents.
+- Deep-copy **covers every kind `ets:insert/2` accepts**: immediates, cons/list cells, tuples, flat
+  **and hash** maps, funs (all three kinds), pointer-free boxed leaves (float, bignum, internal ref,
+  on-heap bitstring), external pid/port/ref, and sub-bitstrings / off-heap refc binaries
+  (re-materialised as self-contained on-heap bitstrings). The residual `BadArg`s (a bare `BinRef`
+  root, a native record, the reserved boxed subtags, a bare header word, a malformed `ErlSubBits`)
+  are never a user-visible inserted term — see Known Issues.
 
 ### `table/mod.rs` — the `Table` handle + ops
 - `pub struct TableId(u64)`: `new(u64)`, `raw()`, `next()` (process-global monotonic), `Display`.
@@ -317,10 +319,11 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `orelse`/`or`, `not`, `const`, bare truthiness; comparisons `=:=`/`=/=`/`==`/`/=`/`<`/`=<`/`>`/`>=`
   (structural `cmp` for exact, `cmp_arith` for `==`-family); type tests `is_atom/integer/float/number/
   tuple/list/binary/bitstring/map/pid/port/reference/function/boolean`; guard BIFs `element/2`, `abs/1`
-  (int or float; a bignum operand ⇒ typed `unsupported`), `size/1`, `hd/1`, `tl/1`, `length/1`,
-  `map_get/2`, `is_map_key/2`, `map_size/1`, `tuple_size/1`, `byte_size/1`, `bit_size/1`, `float/1`,
-  `trunc/1`, `round/1` (a result beyond the 60-bit small range ⇒ typed `unsupported`), and `self/0`
-  (a typed `badarg` — see Known Issues). Map **construction** is supported in guards and bodies.
+  (int, float or bignum — `abs(MIN_SMALL)` materialises the bignum `2^59`), `size/1`, `hd/1`, `tl/1`,
+  `length/1`, `map_get/2`, `is_map_key/2`, `map_size/1`, `tuple_size/1`, `byte_size/1`, `bit_size/1`,
+  `float/1`, `trunc/1`, `round/1`, `ceil/1`, `floor/1` (an integral result outside the small range is
+  materialised as the oracle's **bignum**, from the float's bits), `bnot/1` (a bignum operand returns
+  `-N-1`), and `self/0` (a typed `badarg` — see Known Issues). Map **construction** is supported in guards and bodies.
   Map/tuple/binary operands are read through `beam_term` primitives (`map::map_get`/`map_size`, …),
   never a local reader. **Arithmetic** (`+ - * / div rem band bor bxor bsl bsr`, unary `+`/`-`) routes
   through the `pub trait ArithHook` seam (default methods) with `DefaultArithHook` installed via a
@@ -713,11 +716,12 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `is_function/2`, `is_integer/3`, `node/0,1`, `xor/2`, `bnot/1`, plus map **construction** in a guard
   or a body. Anything outside that set is `badarg`, like the oracle (`list_to_tuple/1` is not a
   `guard_tab` member and is `badarg` on both sides; there is no `is_record/2`, no comprehension and no
-  `process_info`-style guard). Match-spec arithmetic via the default `ArithHook` is small-int/float only
-  (checked `i64` plus faithful float `+ - * /`); full arithmetic needs a host-installed hook via
-  `set_arith_hook`, whose owners are `beam_term` (the number/arithmetic layer, which exposes no big
-  add/sub/compare LCA today) and `beam_bifs`/`beam_rt` (the installers) — no host installs one today, so
-  it stays a typed gap that this crate never fills itself. Typed divergences (always a typed error,
+  `process_info`-style guard). Match-spec **arithmetic operators** (`+ - * / div rem band bor bxor bsl
+  bsr`) go through the thread-local `ArithHook` seam: the built-in `DefaultArithHook` is small-int/float
+  only (checked `i64` plus faithful float `+ - * /`), while `beam_bifs` installs an arbitrary-precision
+  hook (`beam_bifs/src/ets/arith_hook.rs`) around every match-spec-evaluating BIF — so a bignum operand
+  or an out-of-range integer result yields the oracle's value in the runtime, the `unsupported_ets` being
+  reachable only from the un-hooked default. Typed divergences (always a typed error,
   never a wrong result): a **head** map's **keys** are literal — a variable/underscore key is `badarg`
   at every nesting depth — while its **values** are matched structurally like tuple elements, so
   `#{a => '_'}` matches `#{a => 1}` and an object carrying extra keys still matches (a wildcard/variable
@@ -725,10 +729,10 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   under-matched); `self/0` resolves through the thread-local `SelfHook` seam (`set_self_hook`) and its
   default is the typed `badarg` — the ETS layer has no process identity, so without an installed hook a
   `self/0` guard clause is skipped and a `self/0` body is `badarg` (the oracle evaluates it against the
-  calling process: a semantic under-match); `abs/1`/`bnot/1` on a bignum, `trunc`/`round`/`ceil`/`floor`
-  beyond the 60-bit small range, and integer arithmetic whose result leaves the 60-bit small range (incl.
-  a bignum operand) via `DefaultArithHook` are the typed `unsupported_ets` (float `+ - * /` **is**
-  computed); `binary_part/2,3` on a non-byte-aligned source is `badarg`, as the oracle.
+  calling process: a semantic under-match); integer arithmetic whose result leaves the 60-bit small range
+  (incl. a bignum operand) via `DefaultArithHook` is the typed `unsupported_ets` (float `+ - * /` **is**
+  computed; `abs`/`bnot`/`trunc`/`round`/`ceil`/`floor` do handle bignums — see `select/CONTEXT.md`);
+  `binary_part/2,3` on a non-byte-aligned source is `badarg`, as the oracle.
   `byte_size`/
   `bit_size` on an off-heap refc binary are **parity** (the `[BinRef][ErlSubBits]` root classifies as a
   bitstring). A match-spec **body** runtime failure yields the atom `EXIT` resolved from the caller's
@@ -765,11 +769,6 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   span. `Table::last`/`Table::prev` are C-faithful now (the interior aliases them to `first`/`next` for
   the hash kinds, `erl_db_hash.c:853-856`), so both BIFs could call `table.last(..)`/`table.prev(..)`
   unconditionally and drop the branch (the ordered-kind `'$end_of_table'` anchor rejection stays).
-- **`beam_bifs`/`beam_rt` — install an `ArithHook` for full match-spec arithmetic.** `set_arith_hook`
-  has no production caller, so the default (`DefaultArithHook`) stays small-int/float only and a bignum
-  operand or an out-of-range integer result is the typed `unsupported_ets`. A runtime installs
-  `beam_ets::select::expr::ArithHook` per thread over `beam_term`'s number layer to lift that gap.
-
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/kind.rs` → `TableKind`, `SetInterior`/`OrderedInterior`, `Access`, `Concurrency`, `WriteConcurrency`, `TableOptions` (incl. heir + `decentralized_counters`), `can_read`/`can_write`; unit tests in `src/kind/tests.rs`

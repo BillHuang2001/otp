@@ -110,28 +110,36 @@ impl ProcessRunner for RuntimeRunner<'_> {
     ///
     /// `budget` is the slice's **reduction budget** (the C `CONTEXT_REDS`); the runner owns
     /// the reduction count (the scheduler never counts — see the [`ProcessRunner`]
-    /// contract). It is charged by [`BudgetProbe`] at the machine's heap-admission points
-    /// — every `test_heap`/`allocate_heap` instruction the executing machine runs reaches
-    /// [`ExecutionContext::ensure_heap`](beam_engine::ExecutionContext::ensure_heap) once —
-    /// and the slice **ends in [`Yield`](beam_process::RunOutcome::Yield)** once the budget
-    /// is spent, so a CPU-bound process is pre-empted and the scheduler requeues it instead
-    /// of letting it monopolize the run queue.
+    /// contract). It is charged by [`BudgetProbe`] from the seams the executing machine
+    /// reaches: on the **interpreter** path once per interpreted instruction (the engine's
+    /// per-instruction `reduce` hook, which is charged *before* the instruction's body runs)
+    /// and, on either tier, at the machine's **heap-admission points** — every
+    /// `test_heap`/`allocate_heap` the executing machine runs reaches
+    /// [`ExecutionContext::ensure_heap`](beam_engine::ExecutionContext::ensure_heap) once,
+    /// which is the only charge a natively executed baseline block reaches. The slice
+    /// **ends in [`Yield`](beam_process::RunOutcome::Yield)** once the budget is spent, so a
+    /// CPU-bound process is pre-empted and the scheduler requeues it instead of letting it
+    /// monopolize the run queue.
     ///
     /// The yield is **resumption-exact**: the machine is parked at
     /// [`Machine::current_code`](beam_engine::Machine::current_code) — the very instruction
-    /// whose `ensure_heap` ran out (the engine records it as the first statement of
-    /// `step_instruction`, and re-running `ensure_heap` from outside is a no-op) — so the
-    /// next slice resumes *at* that instruction with the registers, the stack and the frames
-    /// intact, exactly as a `receive` resume does. No result is fabricated and no work is
-    /// repeated.
+    /// the charge was taken for. The engine records that address *before* it prices the
+    /// instruction and *before* the instruction's effect, so the resume
+    /// ([`Machine::resume_outcome_with_tier`](beam_engine::Machine::resume_outcome_with_tier))
+    /// runs it **exactly once**, with the registers, the stack and the frames intact, exactly
+    /// as a `receive` resume does. No result is fabricated and no work is repeated.
     ///
     /// The budget is only charged from the **slice's own** machine: the wrapper is the
     /// context of that machine alone, and every machine a BIF reaches (an external module
     /// call, a fun apply) is built inside `RuntimeContext` with the plain context, so a
     /// nested run can never consume the budget nor be mistaken for the resumable machine.
     /// A loop the compiler emits **without** a heap test (`spin/1`-style: no allocation, so
-    /// no `test_heap`) has no admission point and therefore runs to its next
-    /// `return`/`wait` without being pre-empted — the honest limit, reported as such.
+    /// no `test_heap`) is therefore pre-empted on the interpreter tier at the budget like
+    /// any other interpreted code. The residual limit is the **native** tier: a compiled
+    /// baseline block runs natively and does not cross the per-instruction hook, so such a
+    /// loop is charged only where the block deopts or reaches a heap-admission point, and a
+    /// natively linked tail loop is not pre-empted mid-block. That is reported as such, never
+    /// worked around with a fabricated result.
     ///
     /// # Execution tier
     ///
@@ -198,13 +206,13 @@ impl ProcessRunner for RuntimeRunner<'_> {
         };
 
         // The slice's execution tier: selected at the process's **first** entry (resolved
-        // *before* the context borrows the runtime, because the switch-safety predicate reads
-        // `Runtime`'s `registry`/`nifs`, which `for_process_with_engines` takes mutably below)
-        // and then **remembered on the engine** (`ProcessEngine::tier`), so a resumed process —
-        // one that pre-empted on the reduction budget, or parked in a `receive` — re-enters on
-        // that same tier instead of falling back to the interpreter. A fun entry whose local
-        // target is only resolved by that first run reports no module here, and is
-        // conservatively interpreted.
+        // *before* the context borrows the runtime, since the context takes `Runtime` mutably
+        // below) and then **remembered on the engine** (`ProcessEngine::tier`), so a resumed
+        // process — one that pre-empted on the reduction budget, or parked in a `receive` —
+        // re-enters on that same tier instead of falling back to the interpreter. The mode alone
+        // decides: the baseline tier is sound for any module (the engine's driver handles the
+        // in-machine module-context switch — see `super::tier`), so the entry's module is not
+        // inspected.
         let tier = match engine.parked {
             Some(_) => engine.tier,
             None => {
@@ -259,8 +267,8 @@ impl ProcessRunner for RuntimeRunner<'_> {
             if engine.parked.is_some() {
                 resume_from_process_roots(&mut ctx, pid, &mut engine.machine);
             }
-            // The slice's reduction budget, charged at the machine's heap-admission points
-            // (see the `run` docs).
+            // The slice's reduction budget, charged per interpreted instruction and at the
+            // machine's heap-admission points (see the `run` docs).
             let mut probe = BudgetProbe::new(budget);
             let mut budget_ctx = BudgetContext {
                 inner: &mut ctx,
@@ -298,23 +306,21 @@ impl ProcessRunner for RuntimeRunner<'_> {
                             function,
                             arity,
                         } => match module.export(*function, *arity) {
-                            // Entered at the export's own label on the tier chosen above.
-                            //
-                            // The tier is the baseline JIT only when the module is
-                            // *provably* free of a module-context switch (`Step::Enter`):
-                            // a `call_ext*` the host resolves through
+                            // Entered at the export's own label on the tier chosen above
+                            // (`Tier::BaselineJit` under the default mode, `Tier::Interpreter`
+                            // under the `BEAM_RT_TIER=interpreter` kill switch). The baseline
+                            // driver handles the in-machine module-context switch itself: a
+                            // `call_ext*` the host resolves through
                             // `ExecutionContext::resolve_external_call` (see
                             // `src/context/mod.rs`) is entered in this same machine as a
-                            // `Step::Enter`, and a native tier has no in-machine
-                            // module-context switch — it reports the typed
-                            // `unsupported("jit: module context switch …")`, which on this
-                            // path would become the process's exit reason. `tier` is
-                            // `Tier::Interpreter` for every module the predicate cannot
-                            // prove safe; the argument and the exact conditions are in
-                            // `super::tier`. The resume path above re-enters on the tier this
-                            // process was selected for (remembered in `ProcessEngine::tier`),
-                            // so both halves of a parked-and-resumed process stay
-                            // tier-equivalent.
+                            // `Step::Enter` — the `ENTER` block-ABI word, resolved and
+                            // re-entered in native code (see
+                            // `crates/beam_engine/src/jit/CONTEXT.md`). The tier is therefore
+                            // sound for any module and needs no per-module inspection; the
+                            // selection and its soundness argument live in `super::tier`. The
+                            // resume path above re-enters on the tier this process was selected
+                            // for (remembered in `ProcessEngine::tier`), so both halves of a
+                            // parked-and-resumed process stay tier-equivalent.
                             //
                             // The label entry stays the equivalence-preserving route to the
                             // export: `run_label_outcome_with_tier` calls `Machine::enter_run`,
@@ -395,17 +401,19 @@ impl ProcessRunner for RuntimeRunner<'_> {
             record_baseline_code(self.runtime, module);
         }
 
-        // Pre-emption: the budget ran out at a heap-admission point of this slicing
-        // machine. Park it at that very instruction and hand the process back to the
+        // Pre-emption: the budget ran out at a charging point of this slicing machine
+        // (an interpreted instruction's per-instruction charge, or a heap-admission
+        // point). Park it at that very instruction and hand the process back to the
         // scheduler, which requeues it (`slice_end`'s `Yield` arm) so a second runnable
         // process gets the next slice. Nothing is recorded as a result/exit and the
         // process stays `Runnable` — it has neither returned nor blocked.
         if exhausted {
             let Some(address) = engine.machine.current_code() else {
-                // Unreachable: only `ensure_heap` (reached from `test_heap`/
-                // `allocate_heap`, which record their address first) charges the budget.
-                // Reported as a typed error rather than parked at a guessed address — no
-                // wrong result, no hang.
+                // Unreachable: both charging seams price an instruction the machine has
+                // already recorded as its position (`Machine::drive` stores it before the
+                // per-instruction charge, and a heap-admission point is reached from an
+                // instruction that recorded it in `step_instruction`). Reported as a typed
+                // error rather than parked at a guessed address — no wrong result, no hang.
                 return Err(crate::error::unsupported(
                     "preemption: the exhausted machine has no resumable instruction address",
                 ));

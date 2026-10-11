@@ -36,6 +36,11 @@
 //!   A case may carry a C/NIF **fixture** (contract A.3): a real `.so` (or a decoy file) is
 //!   materialized next to the compiled `.beam`, so the module loads it through
 //!   `code:which(?MODULE)` and the argv stays exactly the same.
+//! * Environment-variable module-run cases ([`CaseKind::ModuleEnv`]) are the same, except
+//!   both runtimes are spawned with the case's explicit environment — with the compiled
+//!   directory substituted for the case's `{dir}` placeholder and **no** `-pa <dir>` in the
+//!   oracle argv — so the *application* of an `ERL_AFLAGS`-carried flag is observed
+//!   (contract A.6).
 //!
 //! * The **oracle** is mandatory: without it there is nothing to compare against, so a
 //!   missing oracle is a loud [`Error::Env`] (exit 2) — never a fabricated result.
@@ -61,7 +66,7 @@ use crate::compare::{
     check_golden, compare_observations_with, verdict_with, FieldDiff, GoldenCheck, Observables,
     SideResult, Verdict,
 };
-use crate::corpus::{self, Case, CaseKind, Contract, Golden, ModuleRun, Probe};
+use crate::corpus::{self, Case, CaseKind, Contract, EmbeddedModule, Golden, ModuleRun, Probe};
 use crate::error::Result;
 use crate::module_build;
 use crate::runtime::{self, RuntimeSpec};
@@ -167,7 +172,7 @@ pub fn run_case_in(context: &RuntimeContext, case: &Case) -> Result<CaseOutcome>
                 observables: Observables::All,
                 golden: Some(case.golden),
                 probe_wrapped: true,
-                env: &[],
+                env: Vec::new(),
             };
             execute(context, plan, None)
         }
@@ -192,11 +197,17 @@ pub fn run_case_in(context: &RuntimeContext, case: &Case) -> Result<CaseOutcome>
                 observables: Observables::All,
                 golden: Some(case.golden),
                 probe_wrapped: true,
-                env: *env,
+                env: runtime::own_env(env),
             };
             execute(context, plan, None)
         }
-        CaseKind::Module(run) => run_module_case(context, case, run),
+        CaseKind::Module(run) => run_module_case(context, case, run, None),
+        CaseKind::ModuleEnv { run, extra, env } => run_module_case(
+            context,
+            case,
+            run,
+            Some(ModuleCaseEnv { extra, env }),
+        ),
     }
 }
 
@@ -215,7 +226,7 @@ pub fn compare_expr(expr: &str, pa: &[String]) -> Result<CaseOutcome> {
         observables: Observables::All,
         golden: None,
         probe_wrapped: true,
-        env: &[],
+        env: Vec::new(),
     };
     execute(&context, plan, None)
 }
@@ -257,7 +268,7 @@ fn execute(
     plan: RunPlan,
     _module_guard: Option<module_build::CompiledModule>,
 ) -> Result<CaseOutcome> {
-    let oracle_observation = runtime::run_with_env(&context.oracle, &plan.oracle_argv, plan.env)?;
+    let oracle_observation = runtime::run_with_env(&context.oracle, &plan.oracle_argv, &plan.env)?;
     let golden_check = match &plan.golden {
         Some(golden) => check_golden(&oracle_observation, golden),
         None => GoldenCheck::not_asserted(),
@@ -266,7 +277,7 @@ fn execute(
 
     let rust = match &context.rust {
         Some(spec) => classify_rust(
-            runtime::run_with_env(spec, &plan.rust_argv, plan.env)?,
+            runtime::run_with_env(spec, &plan.rust_argv, &plan.env)?,
             plan.probe_wrapped,
         ),
         None => SideResult::unsupported(rust_unsupported_reason()),
@@ -298,6 +309,16 @@ fn execute(
     })
 }
 
+/// The optional case environment of a **module-run** case
+/// ([`CaseKind::ModuleEnv`]): the variables each runtime is spawned with, plus the helper
+/// modules compiled into the same temp dir (see [`CaseKind::ModuleEnv`]).
+struct ModuleCaseEnv {
+    /// Helper module sources compiled into the case's temp dir.
+    extra: &'static [EmbeddedModule],
+    /// The environment, whose values may embed [`corpus::DIR_PLACEHOLDER`].
+    env: &'static [(&'static str, &'static str)],
+}
+
 /// Run a module-run case: build the embedded module (plus any C/NIF fixture), then compare
 /// the two runtimes.
 ///
@@ -309,14 +330,41 @@ fn execute(
 /// into that same temp dir, where the module finds it through `code:which(?MODULE)` — neither
 /// runtime's argv changes.
 ///
+/// A case with a [`ModuleCaseEnv`] (contract A.6) additionally
+/// * compiles its helper modules into that same temp dir, and
+/// * spawns **both** runtimes with the case environment (its `{dir}` placeholder substituted
+///   with the temp dir), with the oracle argv carrying **no** `-pa <dir>`: the directory
+///   reaches the code path only because the environment put it there.
+///
 /// A missing host tool (`erlc`, and `cc`/`erl_nif.h` for a C-compiled fixture) is a loud
 /// [`Verdict::Skipped`] with the resolver's reason: the case is never run, so it can never be
-/// reported as agreement.
-fn run_module_case(context: &RuntimeContext, case: &Case, run: &ModuleRun) -> Result<CaseOutcome> {
+/// reported as agreement. A helper module that cannot be compiled (or written) is a genuine
+/// tool/driver failure and a loud [`Error`], never a skip.
+fn run_module_case(
+    context: &RuntimeContext,
+    case: &Case,
+    run: &ModuleRun,
+    case_env: Option<ModuleCaseEnv>,
+) -> Result<CaseOutcome> {
     let compiled = match module_build::build(run.source, run.module, run.nif)? {
         module_build::Build::Compiled(compiled) => compiled,
         module_build::Build::Skipped(reason) => {
             return Ok(skipped_module_outcome(context, case, run, reason));
+        }
+    };
+    let (oracle_argv, env) = match &case_env {
+        None => (run.oracle_argv(compiled.dir()), Vec::new()),
+        Some(case_env) => {
+            for helper in case_env.extra {
+                module_build::compile_extra_into(compiled.dir(), helper.source, helper.module)?;
+            }
+            // The compiled dir is only known now, so the environment's `{dir}` placeholder is
+            // substituted here — and the oracle argv carries no `-pa`: the directory must be
+            // reachable through the environment alone.
+            (
+                run.oracle_argv_env_only(),
+                corpus::expand_env(case_env.env, compiled.dir()),
+            )
         }
     };
     let plan = RunPlan {
@@ -324,12 +372,12 @@ fn run_module_case(context: &RuntimeContext, case: &Case, run: &ModuleRun) -> Re
         description: case.description.to_string(),
         contracts: case.contracts.to_vec(),
         eval: run.oracle_eval(),
-        oracle_argv: run.oracle_argv(compiled.dir()),
+        oracle_argv,
         rust_argv: run.rust_argv(compiled.dir()),
         observables: Observables::StdoutAndExit,
         golden: Some(case.golden),
         probe_wrapped: false,
-        env: &[],
+        env,
     };
     execute(context, plan, Some(compiled))
 }
@@ -496,9 +544,13 @@ struct RunPlan {
     /// cases, whose stdout is `~w` of a result.
     probe_wrapped: bool,
     /// The explicit environment both runtimes are spawned with (the `ERL_*FLAGS` merge;
-    /// `&[]` for every case that does not pin it). See
-    /// [`CaseKind::EvalEnv`](crate::corpus::CaseKind::EvalEnv).
-    env: &'static [(&'static str, &'static str)],
+    /// empty for every case that does not pin it). See
+    /// [`CaseKind::EvalEnv`](crate::corpus::CaseKind::EvalEnv) and
+    /// [`CaseKind::ModuleEnv`](crate::corpus::CaseKind::ModuleEnv).
+    ///
+    /// **Owned** because a module-run case's value embeds the compiled module's temp dir,
+    /// which is only known after the compile ([`corpus::expand_env`]).
+    env: Vec<(String, String)>,
 }
 
 /// Build the argv an expression case gets: any `-pa <dir>` code paths, the case's own

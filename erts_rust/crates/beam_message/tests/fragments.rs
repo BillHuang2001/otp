@@ -31,7 +31,8 @@
 //!    `erts_move_multi_frags`/`erts_copy_one_frag`) and transfers the fragment's off-heap objects,
 //! 3. a **multi-fragment** chain moves every root back in order,
 //! 4. a fragmented message carrying a `RefcBinary` moves the **handle** (same `data_ptr`, the
-//!    payload never deep-copied, refcount incremented),
+//!    payload never deep-copied, refcount incremented), and one carrying an **external thing** moves
+//!    its **node reference** (the receiver's table holds the entry the fragment released),
 //! 5. fragment accounting (`used`/`capacity`/`total_used_words`/`off_heap_overhead_bytes`),
 //! 6. the **oversized-message path is atomic**: a rejected [`send`] and a rejected
 //!    [`HeapFragment::copy_root`] each write nothing (heap, off-heap table and queue unchanged), and
@@ -330,8 +331,75 @@ fn a_fragmented_message_shares_a_refc_binary_payload() {
 }
 
 #[test]
-fn fragment_accounting_reports_geometry() {
+fn a_fragmented_message_transfers_an_external_things_node_reference() {
+    let mut atoms = AtomTable::new();
+    let node = make_atom(atoms.intern("nonode@nohost"));
+
+    // The source process's heap holds an external pid; its node is registered by the copy, not
+    // pre-registered in the source table.
     let mut src = Heap::new(32).expect("source heap");
+    // SAFETY: the heap owns the 4-word external pid block.
+    let term = unsafe {
+        let hp = src.alloc_words(external_pid_size_words()).expect("the pid fits");
+        write_external_pid(hp, node, 0x1234, 0x0007, 5)
+    };
+    let src_off = OffHeapTable::new();
+
+    // A receiver heap too small for the 4-word block: the send must fragment.
+    let mut to_heap = Heap::new(2).expect("too small for the external pid");
+    let mut queue = Queue::new();
+    {
+        let mut dst_off = OffHeapTable::new();
+        let mut ctx = CopyContext::new(&src_off, &mut dst_off);
+        send_fragmented(make_small(0), term, &mut to_heap, &mut queue, &mut ctx, 0)
+            .expect("the fragmented send succeeds");
+    }
+    assert_eq!(to_heap.used(), 0);
+
+    // The fragment's copy registered the node against the FRAGMENT's table (one reference).
+    let mut message = queue.dequeue().expect("the fragmented message");
+    let only = message.fragments().expect("fragmented").iter().next().expect("one fragment");
+    assert_eq!(only.off_heap().nodes().len(), 1, "the fragment registered the node");
+    assert_eq!(only.off_heap().nodes()[0].creation(), 5);
+    let in_fragment = only.off_heap().nodes()[0].handle();
+    assert_eq!(in_fragment.refcount(), 1);
+
+    // Moving the payload onto the receiver heap hands the node reference over: the receiver's table
+    // now holds a fresh entry for the identity, and the fragment released its own.
+    let mut receiver_heap = Heap::new(32).expect("receiver heap");
+    let mut receiver_off = OffHeapTable::new();
+    let moved = message
+        .fragments_mut()
+        .expect("fragmented")
+        .move_into(&mut receiver_heap, &mut receiver_off)
+        .expect("the move succeeds");
+
+    assert_eq!(moved.len(), 1);
+    assert!(on_heap(&receiver_heap, moved[0]), "the copied thing is on the receiver heap");
+    assert_eq!(receiver_heap.used(), external_pid_size_words(), "the 4-word block, verbatim");
+    assert_eq!(receiver_off.nodes().len(), 1, "the receiver now owns the node reference");
+    assert_eq!(receiver_off.nodes()[0].node().raw(), node.raw());
+    assert_eq!(receiver_off.nodes()[0].creation(), 5);
+    assert_eq!(receiver_off.nodes()[0].refcount(), 1);
+    assert!(
+        message
+            .fragments()
+            .expect("fragmented")
+            .iter()
+            .all(|f| f.off_heap().nodes().is_empty()),
+        "every fragment gave its node reference up after the whole chain moved"
+    );
+    assert_eq!(in_fragment.refcount(), 0, "the fragment released its own entry");
+
+    // The copied thing's words are preserved verbatim, node atom included.
+    // SAFETY: `moved[0]` is a live 4-word external pid block.
+    let (c_node, c_num, c_ser, c_creation) = unsafe { external_pid_parts(moved[0]) };
+    assert_eq!(c_node.raw(), node.raw());
+    assert_eq!((c_num, c_ser, c_creation), (0x1234, 0x0007, 5));
+}
+
+#[test]
+fn fragment_accounting_reports_geometry() {    let mut src = Heap::new(32).expect("source heap");
     let term = build_list(&mut src, &[make_small(1), make_small(2), make_small(3)]);
     let src_off = OffHeapTable::new();
     let needed = size_of_copy(term);

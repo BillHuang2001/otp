@@ -76,17 +76,22 @@
 //! * **Integers** are handled for small ints and for bignums up to one 64-bit limb; anything wider
 //!   fails the accessor (returns `0`) instead of truncating.
 //! * **Atom comparison / hashing** ([`enif_compare`], [`enif_is_identical`], [`enif_hash`]) has no
-//!   env parameter: identical terms are handled by a raw-word fast path, and distinct atoms fall
-//!   back to `beam_term`'s index fallback. [`enif_compare`] additionally orders a **top-level** atom
-//!   pair by name, resolved through the current NIF host (`super::host::with_current_host`); an atom
-//!   pair *nested* inside a compound still uses the index fallback (see [`pred`]).
+//!   env parameter: identical terms are handled by a raw-word fast path. [`enif_compare`] orders an
+//!   atom pair by **name**: a *top-level* pair through the current env's per-call atom record and the
+//!   current NIF host (`super::host::with_current_host` → `NifHost::atom_name`), and a pair *nested*
+//!   inside a compound whenever the current host exposes its atom table (`NifHost::atom_table`). Only
+//!   with no host — or a host that exposes no table — does a nested pair fall back to `beam_term`'s
+//!   raw atom-index order (see [`pred`]).
 //! * **Map operations** use an empty `AtomTable` for the same reason; they are exact whenever the
 //!   key terms are not atoms (the overwhelmingly common NIF case, where the key is a term the NIF
 //!   was handed).
-//! * **No scheduler threads.** [`enif_thread_type`] reports only [`crate::sync`]'s answer —
-//!   `ERL_NIF_THR_UNDEFINED` for a foreign thread, `ERL_NIF_THR_OTHER` for a created one — and an
-//!   unnamed handle's `*_name` accessor returns `NULL` where the C returns the static string
-//!   `"unknown"`.
+//! * **No scheduler threads.** [`enif_thread_type`] never reports a scheduler type: a foreign thread
+//!   and a thread created by [`enif_thread_create`] both answer `ERL_NIF_THR_UNDEFINED` (this layer's
+//!   internal `ERL_NIF_THR_OTHER` marker for "a thread it created" is mapped to `ERL_NIF_THR_UNDEFINED`,
+//!   which is also the C's answer for such a thread — `erl_nif.c:3606-3625` knows only scheduler
+//!   threads). [`enif_thread_name`] returns the thread's debug name, or the static string `"unknown"`
+//!   for a thread created with a NULL name (the C's `no_name`); it answers `NULL` only for a null,
+//!   foreign or already-joined tid.
 //! * [`enif_make_binary`] builds an **on-heap** binary (off-heap refcounted binaries are a
 //!   `beam_alloc` concern not yet exposed here); [`enif_inspect_binary`] refuses a *bit*-offset base
 //!   instead of fabricating an unaligned pointer.

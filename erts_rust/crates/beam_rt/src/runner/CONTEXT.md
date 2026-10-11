@@ -9,17 +9,27 @@ that runs **as that pid** in the caller-supplied process table, takes the pid's 
 `receive` or pre-empted on the reduction budget) and records the observable result
 (the return value on the pointer-stable arena, or the raise's reason term).
 
-This node additionally owns **static execution-tier selection**: a process's *first* entry may run on
-either tier ([`beam_engine::Tier`]), and [`tier`] decides — soundly — whether the native baseline JIT
-may be used, or the interpreter must be. The selection is **remembered on the engine**
-(`ProcessEngine::tier`) and re-used by every later re-entry, so a process keeps its tier for its whole
-life. The **default is `Auto`**: the JIT exactly where [`tier::jit_is_switch_safe`] proves the entry
-module free of a module-context switch (`Step::Enter`), the interpreter everywhere else.
+This node additionally owns **the execution-tier decision**: a process's *first* entry runs on the
+native baseline tier ([`beam_engine::Tier::BaselineJit`]) unless the mode pins the interpreter, and the
+decision is **remembered on the engine** (`ProcessEngine::tier`) and re-used by every later re-entry,
+so a process keeps its tier for its whole life. The **default is `Auto`**, which selects the baseline
+tier for **every** process entry: the engine's driver handles the module-context switch itself, so no
+per-module safety predicate exists (see `## The tier is sound for any module`).
+The remembered tier is only *observable* at a **slice boundary** (a slice `Yield` on the reduction
+budget, or a `receive` park): a process that instead runs to completion inside its first slice never
+re-enters. On the **interpreter** tier the budget is charged once per interpreted instruction, so any
+hot loop is pre-empted at the budget; on the **native baseline** tier a compiled block runs natively
+past the per-instruction hook and charges only at a deopt or a heap-admission point, so a
+**binary-accumulating or `call_ext`-only hot loop charges nothing, never pre-empts, and could never be
+switched**. That is exactly why the tier is selected eagerly at the first entry rather than after a
+warm-up: the bounded-warm-up alternative was measured and declined because it would pin exactly those
+zero-charge native hot loops to the reference tier for their whole life (the characterisation and
+figures are in `PERF.md`).
 
 ## API Surface (crate-internal, `pub(crate)`)
 * [`entry`] — `ProcessEntry` (the runtime-scheduled entry: an export or a fun), `ProcessEngine`
   (per-pid machine/entry/parked state + the **remembered `tier`**) and `RunnerState`
-  (per-pid engine state, recorded `result`/`exit`, `jit_mode` override, `jit_safety` memo).
+  (per-pid engine state, recorded `result`/`exit`, `jit_mode` override).
 * [`run`] — `RuntimeRunner`: the `ProcessRunner` implementation (one reduction slice) — the tier
   selection (once, at the first entry) and the tier-aware first-entry/resume execution, the
   parked-machine root publication (`publish_parked_roots`/`resume_from_process_roots`), the
@@ -40,14 +50,18 @@ module free of a module-context switch (`Step::Enter`), the interpreter everywhe
   off-heap binary (`bs_init_writable`/`bs_create_bin` above the on-heap limit) is therefore copied
   rather than refused with `badarg` (the return path) or kept un-copied against a dangling payload
   (the exit path) — whether the process **built** it or **received** it.
-* [`budget`] — the slice's reduction budget and the wrapper context that charges it. As the
+* [`budget`] — the slice's reduction budget and the wrapper context that charges it: `BudgetContext`
+  declares its own `wants_reduce() == true` (the engine lets a host answer `false` only when its
+  `reduce` is provably the no-op default) and implements `reduce` to charge the probe once per
+  reduction unit the interpreter prices, so a **non-allocating** interpreted loop is pre-empted; the
+  two `ensure_heap` doors stay charged as the only charge a native compiled block reaches. As the
   scheduled path's outermost `ExecutionContext` it forwards every engine seam it does not itself
   implement — `send_message_with_off_heap` in particular, whose trait default would otherwise drop
   the sender machine's off-heap handles and make an engine-built off-heap send a `badarg`.
 * [`tier`] — `JitMode` (`Auto` (**the `#[default]`**) / `Interpreter` / `Baseline`),
   `mode_from_value(Option<&str>)` (**the pure** `BEAM_RT_TIER` value semantics),
-  `env_default()` (the memoized unset-variable default), `select_entry_tier(...)` and
-  `jit_is_switch_safe(runtime, module)` — the switch-safety predicate.
+  `env_default()` (the memoized unset-variable default) and `select_entry_tier(...)` — the single
+  tier-decision seam.
 * [`reason`] — the exit-reason translation only (`normal` + `exit_reason`); the finite-`receive`
   deadline recovery now lives in the engine (`Machine::wait_deadline`/`Machine::timeout_delay`), so no
   duplicated delay decoding remains here.
@@ -56,18 +70,16 @@ module free of a module-context switch (`Step::Enter`), the interpreter everywhe
 ## The `BEAM_RT_TIER` modes (`mode_from_value` is the single definition)
 | value | mode | meaning |
 |---|---|---|
-| unset | `Auto` | **the default**: the JIT exactly where `jit_is_switch_safe` proves the entry module switch-free, the interpreter everywhere else |
+| unset | `Auto` | **the default**: the native baseline tier for **every** process entry |
 | `auto` | `Auto` | the default, named explicitly |
-| `baseline` | `Baseline` | forced JIT (a measurement/debug override of the predicate; see the handoff below) |
-| `interpreter`, anything else | `Interpreter` | the always-correct reference tier; an unknown value resolves to it, never an error |
+| `baseline` | `Baseline` | the same selection, forced explicitly (a measurement/debugging alias of the default) |
+| `interpreter`, anything else | `Interpreter` | the always-correct reference tier, and the **kill switch**; an unknown value resolves to it, never an error |
 
-`JitMode`'s derived `Default` is `Auto`, so omitting the mode anywhere selects the predicate-guarded
-default — never the switch-blind `Baseline`; `env_default()` memoizes the environment resolution in a
-`OnceLock` (one `getenv` per process).
+`JitMode`'s derived `Default` is `Auto`, so omitting the mode anywhere selects the native tier;
+`env_default()` memoizes the environment resolution in a `OnceLock` (one `getenv` per process).
 
 ## How the tier is selected
-In [`run`]'s slice, **before** the `RuntimeContext` borrow (the predicate needs
-`runtime.registry`/`runtime.nifs`, which the context borrows mutably):
+In [`run`]'s slice, **before** the `RuntimeContext` borrow (the context takes `Runtime` mutably):
 
 ```text
 tier = match engine.parked { Some(_) => engine.tier,            // a resume re-uses the remembered tier
@@ -81,37 +93,31 @@ park — takes the `Some(_)` arm and resumes on that same tier. It is passed to 
 sites — the export entry (after `enter_run`, the export's own label) and the resolved local-fun entry —
 and to the resume through `Machine::resume_outcome_with_tier`, whose `Tier::Interpreter` arm delegates
 to the plain `Machine::resume_outcome` (so an interpreter-tier process is byte-for-byte unchanged).
-`JitMode::Auto` selects `BaselineJit` iff `jit_is_switch_safe` proves the entry module free of a
-module-context switch (see `## Known Issues`); `Baseline` forces the JIT (an explicit override of the
-predicate, a measurement/debugging knob, never chosen by `Auto`). A `ProcessEntry::Fun` whose local
-target is not resolved yet is conservatively the interpreter (its module is only known inside the
-context borrow). The mode resolves from `state.jit_mode` if set (tests), else the process-wide
-`BEAM_RT_TIER` default.
+[`select_entry_tier`] is the runner's single tier-decision seam, and the **mode alone** decides it: the
+baseline tier is sound for any module (see `## The tier is sound for any module`), so neither the
+entry's module nor its code is inspected. The mode resolves from `state.jit_mode` if set (tests), else
+the process-wide `BEAM_RT_TIER` default ([`env_default`]).
 
-## The switch-safety predicate (soundness)
-[`jit_is_switch_safe`] holds iff the module contains **no `Instr::Apply`/`Instr::ApplyLast`** and
-**every** `Instr::CallExt`/`CallExtOnly`/`CallExtLast` target is *provably synchronous*. The only
-producers of `Step::Enter` are those `CallExt*` (statically-known import) and `Apply*` (dynamic target)
-instructions — verified against `crates/beam_engine`: `CallExt*` through
-`interpreter::resolve_external_entry`, `Apply*` through `families::funs::apply_target`, and the two
-unwind/continuation producers (`Machine::continuation_step`, the `catch`-landing at
-`machine/catch.rs`) fire `Enter` only when crossing a module context the run is *already* in
-(unreachable when no instruction ever switched it out of its entry module). `CallFun`/`CallFun2` go
-through the synchronous `apply_fun` and never switch.
+## The tier is sound for any module
+[`select_entry_tier`] picks `BaselineJit` from the mode alone: there is **no module the baseline tier
+cannot run**, so there is no per-module predicate to consult. A `Step::Enter` — a step that continues
+in *another* module's code — was historically the one shape a native tier could not take (a compiled
+block's code, label map and literal area are all bound to a single module), and the engine's driver now
+handles it: a `Step::Enter` (emitted by a compiled `call_ext`/`return`, or by the interpreter's own
+step) switches the machine context (`Machine::switch_context`), rebinds the module / label map /
+literal area and continues in the **callee's** compiled blocks — including the first sight of a
+not-yet-compiled module. The transition is a driver round-trip, i.e. a performance property rather than
+a correctness one; the engine-side detail is `crates/beam_engine/src/jit/CONTEXT.md`.
 
-"Provably synchronous" is proven only from the three cheap `Ok(None)` short-circuits of
-`RuntimeContext::resolve_external_call` (evaluated in the seam's own order, with the seam's own
-arguments — the **import** `{module, function, arity}`, not the instruction operand): the floor
-namespaces ([`crate::native::FLOOR_MODULES`]), a module with a loaded NIF
-([`crate::nif::NifRegistry::is_loaded`]), or a registered `beam_bifs` key
-([`beam_bifs::BifRegistry::contains`]). The seam's other `Ok(None)` cases (load failure, float guard,
-call-site observer, unknown export) can only add safety, so the predicate is **conservative**: it may
-refuse the JIT for a module that would in fact have run fine, but it never permits one that could
-switch. An already-borrowed NIF registry (`try_borrow` err) is treated as **not safe** (never a panic).
+The one remaining host-side obligation is **enforced outright**, not through a predicate:
 
-The verdict is **sticky in the safe direction** (`FLOOR_MODULES` is constant; `load_nif` and the
-registry only ever *add*), which is what makes the per-module `jit_safety` memo sound. A stale *unsafe*
-verdict only costs the faster tier (the interpreter is always correct).
+* **The host's cross-module seam must be idempotent.** The native `call_ext*` arm resolves the import
+  through `ExecutionContext::resolve_external_call` natively, and when the host declines (`Ok(None)`)
+  the *whole instruction* is re-run by the interpreter step — which consults the same seam a **second**
+  time. A seam whose answer changed between the two consultations (a module cached by the first one)
+  would route the callee two different ways and could enter it in-machine under the caller's module
+  identity. [`RuntimeContext::resolve_external_call`](crate::context) is written to be idempotent for
+  exactly this reason, pinned by the regression tests in `src/context/tests.rs` and `tests/nif.rs`.
 
 ## Parked-machine root publication (the runner↔GC hand-off)
 A suspended process's machine lives in [`RunnerState::engines`], but its registers are only a *copy* of
@@ -140,62 +146,43 @@ so a reason that *is* an off-heap binary (`exit(<<big/binary>>)`) is resolved an
 instead of tripping the valve, whether the process built it or received it; a reason that genuinely
 cannot be copied is still the honest `error:system_limit`, never a stored dangling word.
 
-## Measured: why the default is the safe `auto` mode
-Release build (`cargo build --release -p beam_rt`), no per-process `erl` start-up (the system code
-path resolves natively from the filesystem), `beam_rt run <mod>.beam <f>/<a> <arg>` alternating between
-`BEAM_RT_TIER=interpreter` and the default, **min / median wall seconds**:
+## Measured
+The tier is taken on a process's **first** entry and then carried for its whole life: a pre-empted
+slice and a `receive` park both resume through `Machine::resume_outcome_with_tier` on the tier the
+process was selected for, so a *pre-empting* hot loop keeps its tier across every slice
+(`a_preempted_process_resumes_on_its_baseline_tier`/`a_receive_parked_process_resumes_on_its_baseline_tier`
+pin this structurally, without a timing). On the **interpreter** tier every interpreted instruction
+charges the budget, so any hot loop pre-empts (pinned by
+`a_non_allocating_interpreted_loop_is_pre_empted`). On the native tier a compiled block runs natively
+past the per-instruction hook, so a loop that reaches no heap-admission point either — a
+binary-accumulating or `call_ext`-only loop, or a natively linked tail loop with no allocation — charges
+nothing and runs to completion inside one slice on the tier its first entry selected (pinned by
+`a_non_allocating_loop_on_the_native_tier_completes_within_one_slice`).
+Per-workload speed and memory figures are **measured, never
+modelled**, and live in [`../../PERF.md`](../../PERF.md) and the bench driver's
+[`../../../../tools/bench/RESULTS.md`](../../../../tools/bench/RESULTS.md); they are re-measured there
+rather than transcribed here.
 
-| workload (module compiled with the system `erlc`) | shape (from `erlc -S`) | interpreter | `auto` (the default) |
-|---|---|---|---|
-| `walk:cnt/1 20000000` | tail loop, **no** `test_heap` | **16.05 / 17.05** | 0.116 / 0.127 |
-| `walk:sum/1 20000000` | tail loop, no `test_heap` | 14.95 / 16.07 | 0.096 / 0.116 |
-| `al:tailnoalloc/1 20000000` | tail loop, no `test_heap` | 19.35 | 0.114 |
-| `fibn:fib/1 27` | allocating tree recursion | 0.384 / 0.403 | **0.273 / 0.284** |
-| `al:list/1 3000000` | tail loop **with** `test_heap` | 1.34 / 1.40 | 1.27 / 1.43 |
-| `../../beam_loader/tests/fixtures/slice.beam slice:fib/1 300000` | bignum loop | 0.135 / 0.183 | 0.119 / 0.226 |
-| `… slice:fib/1 32` | bignum loop, trivial | 0.026 / 0.033 | 0.022 / 0.029 |
-
-A later release re-measurement (**min of 3** alternating runs on the same `$ERTS_STDLIB_DIR` host) pins
-the default on a fresh `tb` fixture: `tb:cnt/1 20000000` (non-allocating tail loop) interpreter
-**10.648 s** vs the default **0.079 s**, and `tb:fib/1 27` (allocating tree recursion) interpreter
-**0.296 s** vs **0.205 s**. The unset `BEAM_RT_TIER` resolves to exactly `Auto` (timings identical to
-`BEAM_RT_TIER=auto`), and the FULL differential suite under the new default is
-`total=1839 agree=1837 mismatch=0 unsupported=2` (A.9 `155/155` agree) — so the default is CI-checked
-corpus-correct.
-
-**Conclusion.** The tier is taken on a process's **first** entry and then carried for its whole life: a
-pre-empted slice and a `receive` park both resume through `Machine::resume_outcome_with_tier` on the tier
-the process was selected for. So the baseline JIT's win is no longer confined to a hot loop with **no**
-heap-admission point — an *allocating* loop keeps the JIT across every slice too. Measured on a release
-build, alternating runs, min of 3, on the committed `preempt:alloc_loop/1` fixture (one `test_heap` per
-iteration, so it pre-empts repeatedly; `N = 200 000`): interpreter **0.180 s** vs the default
-**0.086 s** (≈2.1×). The non-allocating rows above are the 139–170× shape (nothing can pre-empt such a
-loop, so it stays in its one tier-chosen slice); on the switch-free fixture (`slice.beam`) the JIT is not
-clearly faster (≈1.0–1.15×, inside the run-to-run noise) and it is never beyond-noise slower anywhere.
-`auto` therefore neither regresses a workload nor takes a correctness risk, because the predicate only
-ever *adds* the JIT where the entry module is proven switch-free. That is why the **default is the
-predicate-guarded `Auto`** — never the switch-blind `Baseline`, whose slice could hit the JIT driver's
-`Step::Enter` gap and turn a typed capability gap into a wrong exit reason — while
-`BEAM_RT_TIER=interpreter` pins the always-correct reference tier.
+`BEAM_RT_TIER=interpreter` is the always-correct reference tier and the **only** kill switch: the
+default (`Auto`, and its `baseline` alias) puts every process on the native tier.
 
 ## Constraints
 * **`#![deny(unsafe_code)]`**; no `unwrap()` on runtime data; typed `beam_common::Result` errors.
-* The tier predicate must run **before** the `RuntimeContext` borrow (it reads `runtime.registry`/
-  `runtime.nifs`, which the context borrows mutably).
+* The tier is resolved **before** the `RuntimeContext` borrow (the selection happens in the slice's
+  prologue, before the context takes `Runtime` mutably).
 * A test forces a tier by setting `state.jit_mode = Some(..)` — never `std::env::set_var` (edition 2024
   makes it `unsafe`). `BEAM_RT_TIER` is the CLI-facing equivalent, and its semantics are pinned through
   the pure `mode_from_value` (not through the environment).
-* `JitMode::Baseline` deliberately bypasses the predicate; it exists only for measurement, and against a
-  module that can report `Step::Enter` it hits the JIT driver's typed error (which on this path becomes
-  the process's exit reason).
+* `JitMode::Baseline` is an alias of the default selection (`Tier::BaselineJit`); only
+  `JitMode::Interpreter` turns the native tier off.
 
 ## Test Strategy
-* `#[cfg(test)]` units in [`tests`]: `select_entry_tier`/`jit_is_switch_safe` over crafted `Module`s and
-  real fixtures (slice → baseline; a loadable cross-module callee → interpreter; an `apply` → interpreter;
-  floor/registered/NIF targets safe; an unresolvable atom, an out-of-range `ImportRef` and an
-  arity mismatch unsafe; a no-`call_ext` module safe; a forced mode overrides the predicate; the memo
-  agrees with a fresh check); plus `the_unset_default_resolves_to_auto`, which pins the
-  `BEAM_RT_TIER` value semantics and `JitMode::default()` through the pure `mode_from_value`.
+* `#[cfg(test)]` units in [`tests`]: `select_entry_tier` over the real tier fixtures — the default
+  (`Auto`) and the explicit `Baseline` alias both select `BaselineJit` for **every** entry, including a
+  cross-module-calling module (`stdlib_more_harness`) and a dynamic-`apply` one (`funs`), and an
+  unresolved **fun** entry takes the same tier as an export entry; only `Interpreter` selects
+  `Tier::Interpreter`. `the_unset_default_resolves_to_auto` pins the `BEAM_RT_TIER` value semantics and
+  `JitMode::default()` through the pure `mode_from_value`.
 * Tier persistence across a resume, proven through the per-thread **baseline compiled-block cache**
   (`beam_engine::jit::cache::{baseline_cache_len, clear_baseline_cache}`) — empty the cache between the
   park and the resume, so a resume that came back on the baseline tier is the only thing that can
@@ -205,6 +192,15 @@ predicate-guarded `Auto`** — never the switch-blind `Baseline`, whose slice co
   `ProcessTable::deliver_simple` message wakes it and the resume takes it on the remembered tier), and
   `an_interpreter_tier_process_is_unchanged_across_a_resume` (same loop on `JitMode::Interpreter` records
   the same result and compiles nothing on either slice). Each asserts `ProcessEngine::tier` as well.
+* Pre-emption of a **non-allocating** loop on both tiers, over the committed `preempt` fixture's
+  `spin/1` (whose `spin/1 -> spin/2` disassembly contains no heap-admission instruction at all):
+  `a_non_allocating_interpreted_loop_is_pre_empted` (interpreter tier — a whole-budget slice yields and
+  records nothing, a second short process registered behind it runs to its `return` while the loop is
+  unfinished, and the loop's final value is its iteration count, which changes if a resume skips or
+  double-applies an instruction) and
+  `a_non_allocating_loop_on_the_native_tier_completes_within_one_slice` (the same call with the same
+  iteration count completes inside one budget-bounded slice on the native tier — the documented residual
+  limit, pinned rather than papered over).
 * End-to-end: `slice:fib/1 10` through the scheduled path (`RuntimeRunner`) records `55` under both an
   explicit `JitMode::Auto` (→ baseline) and `JitMode::Interpreter`, and the scheduler path records it
   under whatever mode the environment selects.
@@ -215,39 +211,26 @@ predicate-guarded `Auto`** — never the switch-blind `Baseline`, whose slice co
 * Crate gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt`.
 
 ## Known Issues / Handoffs
-* **`beam_engine`'s baseline JIT driver lacks a deopt seam for `Step::Enter`.** `jit::baseline`'s driver
-  (`run_compiled_outcome`, `jit_step_one`) deopts to the interpreter *step* for an unlowered
-  instruction, but when that step reports `Step::Enter` (a module-context switch) it returns the hard
-  typed `unsupported("jit: module context switch outside the interpreter driver")` — the
-  block/label-map/literal-area are all bound to one module. On the runner path that error *becomes the
-  process's exit reason*, i.e. a wrong observable result vs the oracle. A driver able to hand a
-  `Step::Enter` off to the **multi-module** interpreter driver would let the JIT run any module and
-  render this static predicate unnecessary. **Owner: `beam_engine`** (out of this node's write scope).
-  This is why the predicate exists and why the default is the guarded `Auto` mode, never the
-  switch-blind `Baseline`.
-* **A non-allocating loop has no admission point, so it cannot be pre-empted at all.** The budget is
-  charged only at `ExecutionContext::ensure_heap` (`test_heap`/`allocate_heap`), so a loop with no
-  allocation anywhere runs to its next `return`/`wait` inside the one slice that entered it — and
-  therefore never leaves its tier either. `ExecutionContext::reduce` is the seam that would add a
-  per-instruction admission point, and `BudgetContext` does not charge it. **Owner: `beam_engine`** (the
-  seam) + `budget.rs` (the charge).
-* Consequently the JIT is only reached for switch-free **entry** modules: `slice.beam` (imports only
-  `erlang:get_module_info/1,2`) does; a workload whose entry module calls a loadable cross-module `.beam`
-  (e.g. real Cowboy code, or `tools/bench`'s `list_walk`) does **not** and correctly stays on the
-  interpreter for its whole life.
+* **A natively executed compiled block is charged only at a deopt / heap-admission boundary.** The
+  per-instruction charge belongs to the interpreter's loop; the engine's baseline driver runs compiled
+  blocks and only deopts (or reaches `ensure_heap` through the host), so a natively linked tail loop that
+  neither allocates nor leaves the block still runs to its next `return`/`wait` inside the one slice that
+  entered it — and therefore never leaves its tier either. The interpreter tier carries no such limit:
+  `BudgetContext::reduce` charges every instruction there.
 
 ## Routing Table
 * `mod.rs` → module docs, sub-module wiring, root re-exports (`ProcessEntry`, `RunnerState`,
   `RuntimeRunner`).
 * `entry.rs` → `ProcessEntry`, `ProcessEngine` (incl. the remembered `tier`) + `RunnerState` (the
-  `jit_mode`/`jit_safety` fields and the `jit_mode()` accessor).
+  `jit_mode` field and the `jit_mode()` accessor).
 * `run.rs` → `RuntimeRunner`: the (first-entry) tier selection and the tier-aware resume, the
   parked-machine root publication (`publish_parked_roots`/`resume_from_process_roots`), the
   return-value / exit-reason stabilization (whose `SourcePayloads` come from
   `Runtime::source_payloads` — the machine's handles unioned with the pid's retained mailbox
   off-heap families).
-* `budget.rs` → the reduction budget + the charging wrapper context.
-* `tier.rs` → the tier mode + its `BEAM_RT_TIER` semantics (`mode_from_value`), the environment default,
-  the selection and the switch-safety predicate.
+* `budget.rs` → the reduction budget + the charging wrapper context (`wants_reduce`/`reduce`: one
+  charge per interpreted instruction, plus the two `ensure_heap` doors a native block alone reaches).
+* `tier.rs` → the tier mode + its `BEAM_RT_TIER` semantics (`mode_from_value`), the environment default
+  and the selection (`select_entry_tier`).
 * `reason.rs` / `perf.rs` → the exit-reason translation / the `+JPperf` code map.
 * `tests.rs` → the unit + scheduled-path tests above.

@@ -20,10 +20,11 @@ its compiled-opcode program. The interior is a Rust AST, not a term program.
   (`decode`/`decode_tuple`/`decode_call`), the evaluator (`eval`/`eval_term`/
   `value_bool`), the shared `classify` probe and the `ArithHook` seam
   (`DefaultArithHook`, `set_arith_hook`, thread-local); `guard.rs`: the guard-BIF
-  helpers (`element`/`size`/`tuple_size_of`/`bitstring_length`/`float_of`/
-  `integral_of`/`ceil_floor`/`max_min`/`binary_part2,3`/`is_record3`/
+  helpers (`element`/`size`/`tuple_size_of`/`bitstring_length`/`float_of`/`abs_of`/
+  `integral_of`/`ceil_floor`/`float_to_integer`/`f64_magnitude_limbs`/`write_big_term`/
+  `write_float_term`/`max_min`/`binary_part2,3`/`is_record3`/
   `is_function2`/`is_integer3`/`node0,1`/`xor`/`bnot`/`build_map`/`compare`/
-  `type_test`/`bool_term`/`bool_of_atom`/`write_float_term`) and the `SelfHook`
+  `type_test`/`bool_term`/`bool_of_atom`) and the `SelfHook`
   seam (`set_self_hook`, thread-local).
 - `exec.rs` — `impl Table`: `select`, `select_reverse`, `select_delete`, `select_count`,
   `match_object`, `match_`, `match_delete`, `select_replace`; `BodyKind`; `run_clauses`,
@@ -39,7 +40,9 @@ its compiled-opcode program. The interior is a Rust AST, not a term program.
   A term-valued body boolean (`true`/`false`) **does** need them interned; so does `EXIT`
   for the body-`FAIL_TERM` path.
 - `unsafe` only in the term-word readers (`mod.rs` tuple/list accessors, `pattern.rs`,
-  `expr/{mod,guard}.rs`), each with a `// SAFETY:` rationale.
+  `expr/{mod,guard}.rs`), each with a `// SAFETY:` rationale. A bignum result is built
+  only through `beam_term`'s `write_big`/`big_parts`/`big_size_words` (heap-agnostic
+  writers) — never a local term-layout writer.
 
 ## Known Issues (honest gaps)
 - **The guard-BIF surface is the whole C `guard_tab` class.** `expr/` decodes and
@@ -52,21 +55,33 @@ its compiled-opcode program. The interior is a Rust AST, not a term program.
   `node/0,1`, `xor/2`, `bnot/1`) and map **construction** in a guard or a body
   (`#{K => V}` — the C `dmc_map`, evaluated per object). Every case is pinned
   against the live `erl` in `tests/select.rs`/`tests/match_spec_run.rs` and the
-  differential `matchspec` group. **Remaining typed gaps** (each a typed
+  differential `matchspec` group. **Bignum results are materialised exactly, not a
+  typed gap:** `abs/1` on a bignum (and `abs(MIN_SMALL)` = the bignum `2^59`),
+  `bnot/1` on a bignum (`-N-1`), and `trunc`/`round`/`ceil`/`floor` of a float whose
+  integral value is outside the 60-bit small range (built from the float's bits) all
+  return the oracle's bignum through `beam_term`'s big helpers. Pinned by the
+  `guard.rs` unit tests, `tests/select.rs`, and the live-`erl` cross-check
+  `tests/ets_bignum_guard_oracle.rs` (an `erlc`-compiled fixture run under `erl` vs
+  the crate's own `ets:select`). **Remaining typed gaps** (each a typed
   `unsupported_ets` raise, or a `badarg` the oracle also raises — never a wrong
   result):
   - `list_to_tuple/1` is **not** in the oracle's `guard_tab`, so the oracle and this
     crate both reject it with `badarg` (a matching behaviour, not a divergence);
-  - `abs/1` and `bnot/1` on a **bignum** operand (`unsupported_ets: match-spec
-    'abs'` / `match-spec 'bnot': a bignum operand`);
-  - `trunc/1`/`round/1`/`ceil/1`/`floor/1` whose result is beyond the 60-bit small
-    range — the oracle returns a bignum (`unsupported_ets: match-spec 'trunc'/'round'`);
+  - `get_tcw`/`set_tcw`/`set_tcw_fake` are `guard_tab` pseudo-BIFs restricted to the
+    **trace** dialect (`erl_db_util.c`: their flags are `DBIF_TRACE_*` only, the
+    context check at `5540-5555`). The **table** dialect this crate models — the
+    `ets:select`/`ets:match_spec_compile` path — carries no `DCOMP_TRACE`, so the
+    oracle rejects all three with `badarg` (verified live): the decoder's fallthrough
+    `badarg` is oracle-faithful and the tcw arms are deliberately NOT implemented
+    (they belong to the unimplemented trace dialect, `ets:match_spec_test/3` with
+    `trace`);
   - `binary_part/2,3` on a source that is not byte-aligned is `badarg` (the oracle's
     own refusal, not a gap);
   - the `DefaultArithHook` subset — checked small-int `+ - *` and the integer-only
     operators plus faithful float `+ - * /` — so a bignum operand or an integer
     result outside the 60-bit small range is `unsupported_ets` (the guard-error
-    classification below); and no `is_record/2`, comprehensions or
+    classification below; a runtime installs the arbitrary-precision hook instead —
+    see the `ArithHook` Design Decision); and no `is_record/2`, comprehensions or
     `process_info`-style guards.
   `byte_size/1`/`bit_size/1` read an **off-heap** (refc) binary **correctly**: the
   on-heap `[BinRef][ErlSubBits]` pair's root classifies as `TermClass::Bitstring` and
@@ -75,7 +90,7 @@ its compiled-opcode program. The interior is a Rust AST, not a term program.
   term, which is not a user-visible term. (`tests/select.rs::
   byte_size_and_bit_size_read_an_off_heap_refc_binary_correctly`.)
 - **A bare `{}` (0-arity tuple) as a guard/body expression PANICS.** `decode_tuple`
-  (`src/select/expr/mod.rs:451`) reads `atom_name(elements[0], atoms)` after only
+  (`src/select/expr/mod.rs:458`) reads `atom_name(elements[0], atoms)` after only
   the `elements.len() == 1` construct-form check, so an empty tuple indexes an
   empty slice → index-out-of-bounds panic. `decode` recurses over tuples/lists/maps,
   so any `{}` reachable as an expression subterm triggers it (a nested `{{{}}}` too;
@@ -133,7 +148,10 @@ its compiled-opcode program. The interior is a Rust AST, not a term program.
 - **`ArithHook` is a thread-local seam** (`set_arith_hook`) so `beam_ets` (wave 1) needs
   no `beam_bifs` edge; `DefaultArithHook` is total-or-refusing (never a fabricated result:
   a bignum operand or an integer result outside the 60-bit small range → `unsupported_ets`;
-  `div`/`rem` by 0 → `badarg`; `/` always computes a float).
+  `div`/`rem` by 0 → `badarg`; `/` always computes a float). A host installs an
+  arbitrary-precision hook in its place: `beam_bifs` opens one
+  (`beam_bifs/src/ets/arith_hook.rs`) around every match-spec-evaluating BIF, so the
+  `DefaultArithHook` small-int/float subset is reachable only un-hooked.
 - **Continuations carry a cloned compiled `MatchSpec` + limit + direction + a private
   `Cursor`** (the last-yielded key for an `ordered_set`, an ordinal into iteration order for
   the hash kinds), so a `/1` resume never recompiles and keeps its direction (`select` vs
@@ -159,7 +177,8 @@ its compiled-opcode program. The interior is a Rust AST, not a term program.
 ## Test Strategy
 - Unit/module tests live with the sibling test files; the select layer's evidence is
   `../.../tests/select.rs`, `tests/match_spec_run.rs`, `tests/ets_select.rs`,
-  `tests/ets_continuation.rs`, `tests/ets_replace.rs`, and the differential group
+  `tests/ets_bignum_guard_oracle.rs`, `tests/ets_continuation.rs`, `tests/ets_replace.rs`,
+  and the differential group
   `tests/differential/battery/{matchspec,replace,continuation}.rs` (compared line-by-line
   against the live `erl`).
 - **Coverage:** the differential `matchspec` group pins the extended guard/body set
@@ -170,14 +189,19 @@ its compiled-opcode program. The interior is a Rust AST, not a term program.
   oracle, including `select_guard_is_integer3` (the inclusive `Lower..=Upper` range).
   The crate-local `tests/select.rs` / `tests/match_spec_run.rs` pin the full
   guard-BIF set (map/tuple/bitstring/float/`trunc`/`round`/`abs` + map construction,
-  each with its live-`erl` probe quoted) and the guard-error classification (an
+  each with its live-`erl` probe quoted), the bignum results (`abs`/`bnot`/`trunc`/
+  `round`/`ceil`/`floor`), and the guard-error classification (an
   unevaluable guard is a typed error; an oracle-raising guard skips the clause).
+  `tests/ets_bignum_guard_oracle.rs` is the LIVE cross-check: a generated Erlang module
+  compiled with `erlc` into `$TMPDIR`, run under the system `erl`, its `ets:select/2`
+  output compared against the crate's own evaluation (oracle required by default; loud
+  skip when `erl`/`erlc` is absent).
 
 ## Routing Table
 - `mod.rs` → `MatchSpec`/`MatchClause`/`compile`/`SelectPredicate` + term-decode helpers (`atom_name`, `var_index`, `tuple_elements`, `list_elements`)
 - `pattern.rs` → `Pattern` + head decode/match (+ dead `bound_vars`)
 - `expr/mod.rs` → `Expr`/`CmpOp`/`TypeTest`/`ArithOp`/`Value` + `ArithHook` + `decode`/`decode_tuple`/`decode_call`/`eval`/`eval_term`/`value_bool`/`classify`
-- `expr/guard.rs` → the guard-BIF helpers (incl. `ceil_floor`/`max_min`/`binary_part2,3`/`is_record3`/`is_function2`/`is_integer3`/`node0,1`/`xor`/`bnot` + `map_get`/`map_size`/`is_map_key`/`tuple_size`/`byte_size`/`bit_size`/`float`/`trunc`/`round`/`abs` + map construction) + the `SelfHook`/`set_self_hook` seam
+- `expr/guard.rs` → the guard-BIF helpers (incl. `abs_of`/`bnot`/`integral_of`/`ceil_floor`/`float_to_integer`/`f64_magnitude_limbs`/`write_big_term`/`ceil_floor`/`max_min`/`binary_part2,3`/`is_record3`/`is_function2`/`is_integer3`/`node0,1`/`xor` + `map_get`/`map_size`/`is_map_key`/`tuple_size`/`byte_size`/`bit_size`/`float`/`trunc`/`round` + map construction) + the `SelfHook`/`set_self_hook` seam
 - `exec.rs` → `impl Table` select/match/delete/replace/count + `run_clauses`/`guards_hold`/`spec_for_pattern`/`BodyKind` + the static `select_replace` body check (`static_keeps_key`/`clause_keeps_key`, the `db_match_keeps_key` mirror)
 - `run.rs` → `match_spec_run` (raw-spec list runner)
 - `continuation.rs` → `MatchContinuation` + its private `Cursor` (`Begin`/`Anchor(key)` for an `ordered_set`/`Position(ordinal)` for the hash kinds) + the limit/continue forms (`traverse`/`traverse_ordered`/`traverse_positional`/`resume`)

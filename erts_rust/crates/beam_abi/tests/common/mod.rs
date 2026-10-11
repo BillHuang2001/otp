@@ -315,6 +315,12 @@ impl beam_abi::NifHost for TestHost {
         }
         self.atoms.name(atom_val(atom)).map(str::to_string)
     }
+
+    /// Expose the owned table so an env-less comparison/hash orders an atom *nested* inside a
+    /// compound by its name (the committed-table analogue of the runtime's `atom_table` hook).
+    fn atom_table(&self) -> Option<&AtomTable> {
+        Some(&self.atoms)
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

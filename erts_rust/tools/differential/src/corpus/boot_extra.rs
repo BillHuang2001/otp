@@ -84,13 +84,15 @@
 //! | `whereis(code_server\|erl_prim_loader\|kernel_sup)` | a pid | the atom `undefined` |
 //! | `erlang:function_exported/3` on `kernel` / `code` | `true` | `false` |
 //! | `erlang:system_info(schedulers\|dirty_cpu_schedulers\|dirty_io_schedulers)` | the host's scheduler counts | different counts |
-//! | `erlang:system_info(endian)` / `erlang:system_info(build_type)` | `little` / `opt` | raises `badarg` |
 //! | `persistent_term:info/0` | the live `count`/`memory` counters | zero-valued counters |
 //!
 //! (`code:get_mode/0`, `application:get_application/0` and `init:get_argument(root\|home)` — the
 //! emulator's automatic flags — **do** agree and are pinned in the sibling `boot_prereq` group.
-//! `erlang:system_info(loaded)` and `erlang:system_info(check_io)` are capability gaps — the
-//! runtime raises its documented `unsupported` — so they are neither cases nor mismatches.) The
+//! `erlang:system_info(endian)` **does** agree too — `little` in both — and is pinned by the
+//! oracle-backed `beam_rt` `system_info_oracle` test. `erlang:system_info(loaded)`,
+//! `erlang:system_info(check_io)` and `erlang:system_info(build_type)` are capability gaps — the
+//! runtime raises its documented `unsupported` (`build_type` because this runtime's own build
+//! tier is not the oracle's release tag) — so they are neither cases nor mismatches.) The
 //! one capability gap this group *does* carry is `init:script_id/0`: the runtime reports it as
 //! `unsupported` on the `-eval`/`run` path (no boot script is loaded there), so its case is
 //! recorded in `known-gaps.txt` and the ratchet can only tighten when the gap closes.
@@ -1483,7 +1485,7 @@ mod tests {
             );
             let probe = match case.kind {
                 CaseKind::Eval { probe, .. } | CaseKind::EvalEnv { probe, .. } => probe,
-                CaseKind::Module(_) => {
+                CaseKind::Module(_) | CaseKind::ModuleEnv { .. } => {
                     panic!("case {}: an A.9 boot case must be an eval case", case.id)
                 }
             };

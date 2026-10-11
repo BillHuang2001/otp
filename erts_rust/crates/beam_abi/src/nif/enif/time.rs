@@ -48,8 +48,11 @@
 //! OFFSET(sec)  = OFFSET(ns) / 1_000_000_000      = -576460753
 //! ```
 //!
-//! `enif_time_offset/1` is pinned against the system oracle (`erlang:time_offset/0,1`) by the
-//! crate tests. `enif_monotonic_time/1` uses the *same* formula, but the oracle's **internal**
+//! `enif_time_offset/1` is covered by the Rust unit tests in this file — chiefly
+//! `monotonic_plus_offset_is_wall_time` (which asserts `enif_monotonic_time(ns) + enif_time_offset(ns)`
+//! tracks a `CLOCK_REALTIME` read) together with the per-unit offset relations pinned by
+//! `monotonic_time_is_monotone_and_unit_consistent` — and there is no `erl`-oracle pin for it.
+//! `enif_monotonic_time/1` uses the *same* formula, but the oracle's **internal**
 //! monotonic clock additionally subtracts an emulator-start snapshot, so its absolute value is
 //! anchored differently from a raw `CLOCK_MONOTONIC` read; only the invariant
 //! `monotonic + offset == system_time` is comparable across implementations (asserted in the

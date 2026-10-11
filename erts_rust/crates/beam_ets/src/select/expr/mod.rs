@@ -81,6 +81,13 @@
 //! their own [`Expr`] variants here and are evaluated by [`guard`] — mirroring the
 //! same `guard_tab` dispatch, with a typed error (never a fabricated answer) for
 //! every operand outside the implemented subset.
+//!
+//! Unlike the arithmetic operators (which refuse a bignum through the [`ArithHook`]),
+//! the numeric guard BIFs `abs/1`, `bnot/1`, `trunc/1`, `round/1`, `ceil/1` and
+//! `floor/1` **materialise the oracle's bignum result** — through `beam_term`'s big
+//! helpers (`write_big`/`big_parts`/`big_size_words`), never a local term-layout
+//! writer — so a guard over a bignum operand (or a float whose integral value leaves
+//! the 60-bit small range) is evaluated rather than skipped.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -91,7 +98,7 @@ use beam_common::Result;
 use beam_term::prelude::*;
 
 use super::{atom_name, var_index};
-use crate::error::{badarg, unsupported};
+use crate::error::badarg;
 
 mod arith;
 mod guard;
@@ -716,6 +723,15 @@ fn decode_call(name: &str, args: &[Eterm], atoms: &AtomTable, vars: &BTreeSet<u3
             }
             Ok(Expr::SelfPid)
         }
+        // The fallthrough rejects every other call with `badarg`, matching the C
+        // `dmc_fun`'s "Unknown function" error. That includes the `guard_tab`'s
+        // `get_tcw`/`set_tcw`/`set_tcw_fake` pseudo-BIFs (`erl_db_util.c:958-975`):
+        // their table entry carries `DCOMP_TRACE` and the flag check at
+        // `erl_db_util.c:5540-5555` refuses them outside the **trace** dialect, so in
+        // the **table** dialect this crate models (`ets:select`/`ets:match_spec_compile`)
+        // the oracle rejects all three with `badarg` (verified against the system
+        // `erl`). They are therefore deliberately not implemented — they belong to the
+        // unimplemented trace dialect — and this `badarg` is oracle-faithful.
         _ => Err(badarg()),
     }
 }
@@ -830,23 +846,7 @@ pub(super) fn eval(
         }
         Expr::Abs(operand) => {
             let operand = eval_term(operand, binds, object, atoms, heap)?;
-            match classify(operand) {
-                // `abs(MIN_SMALL)` is a bignum in the oracle, so the widened value is
-                // range-checked rather than handed to `make_small`.
-                TermClass::Small => try_make_small(signed_value(operand).abs())
-                    .map(Value::Term)
-                    .map_err(|_| unsupported("match-spec 'abs': the result is not a small integer")),
-                // SAFETY: the class established a live float block.
-                TermClass::Float => {
-                    let value = unsafe { float_value(operand) };
-                    guard::write_float_term(heap, value.abs()).map(Value::Term)
-                }
-                // The absolute value of a bignum needs bignum arithmetic: a typed gap,
-                // never a `badarg` that would silently under-match a guard.
-                TermClass::Big => Err(unsupported("match-spec 'abs': a bignum operand")),
-                // The oracle raises `badarg` for every other operand.
-                _ => Err(badarg()),
-            }
+            guard::abs_of(operand, heap).map(Value::Term)
         }
         Expr::Arith(op, parts) => {
             let mut values = Vec::with_capacity(parts.len());
@@ -930,11 +930,11 @@ pub(super) fn eval(
         }
         Expr::Trunc(operand) => {
             let operand = eval_term(operand, binds, object, atoms, heap)?;
-            guard::integral_of(operand, false).map(Value::Term)
+            guard::integral_of(operand, false, heap).map(Value::Term)
         }
         Expr::Round(operand) => {
             let operand = eval_term(operand, binds, object, atoms, heap)?;
-            guard::integral_of(operand, true).map(Value::Term)
+            guard::integral_of(operand, true, heap).map(Value::Term)
         }
         Expr::Map(pairs) => {
             let mut built = Vec::with_capacity(pairs.len());
@@ -953,11 +953,11 @@ pub(super) fn eval(
         Expr::SelfPid => Ok(Value::Term(guard::self_term()?)),
         Expr::Ceil(operand) => {
             let operand = eval_term(operand, binds, object, atoms, heap)?;
-            guard::ceil_floor(operand, true).map(Value::Term)
+            guard::ceil_floor(operand, true, heap).map(Value::Term)
         }
         Expr::Floor(operand) => {
             let operand = eval_term(operand, binds, object, atoms, heap)?;
-            guard::ceil_floor(operand, false).map(Value::Term)
+            guard::ceil_floor(operand, false, heap).map(Value::Term)
         }
         Expr::Max(left, right) => {
             let left = eval_term(left, binds, object, atoms, heap)?;
@@ -1009,7 +1009,7 @@ pub(super) fn eval(
         }
         Expr::Bnot(operand) => {
             let operand = eval_term(operand, binds, object, atoms, heap)?;
-            guard::bnot(operand).map(Value::Term)
+            guard::bnot(operand, heap).map(Value::Term)
         }
     }
 }

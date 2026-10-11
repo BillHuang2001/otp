@@ -26,7 +26,7 @@
 //! ([`Machine::drive`](crate::machine::Machine)) its starting position, and
 //! `enter_run` is the shared per-run prologue.
 
-use beam_common::{ExceptionClass, Result};
+use beam_common::{BeamError, ExceptionClass, Result};
 use beam_loader::{ImportRef, Instr, Module, NO_FAIL};
 use beam_term::{cmp, is_atom, is_list, is_nil, make_atom, atom_val, Eterm, NIL};
 
@@ -39,6 +39,21 @@ use crate::operand::{read_operand, write_operand};
 use crate::Step;
 
 use super::{resolve, LabelMap};
+
+/// The **hot step result**: [`Machine::step_instruction`]'s return type.
+///
+/// `Step` is 16 bytes, but a bare `Result<Step, BeamError>` is 72 bytes (the
+/// `BeamError` payload dominates), so it is returned through a caller-allocated
+/// memory **sret slot** — and the `Result` then has to be *moved* into a second
+/// slot before the raise funnel can inspect it, i.e. a 72-byte copy on **every**
+/// interpreted instruction. Boxing the error keeps the type at 16 bytes (the
+/// `Box` is niche-folded into `Step`'s spare discriminant values), so the step now
+/// returns in registers with no memory round trip at all.
+///
+/// The `Box` is paid **only on an error path** (a raise / a typed capability gap),
+/// never on the `Ok` path, and the error itself still travels out in the return
+/// value — it can neither be dropped nor leak into a later step.
+type StepResult = std::result::Result<Step, Box<BeamError>>;
 
 impl Machine {
     /// The run entry over the current module context: bind the entry module's
@@ -110,8 +125,10 @@ impl Machine {
     ///   `x(0)` with [`Machine::finish`].
     ///
     /// A raise (or any other typed error — an out-of-range `pc`/function index, an
-    /// unsupported opcode/operand) stays an `Err(beam_common::BeamError)`; it is
-    /// never a panic and never a wrong result.
+    /// unsupported opcode/operand) stays an `Err(Box<BeamError>)`; it is never a
+    /// panic and never a wrong result. The error is **boxed** so the whole `Result`
+    /// stays 16 bytes and returns **in registers** rather than through an sret
+    /// memory slot — see [`StepResult`].
     ///
     /// **The uniform raise funnel.** A raise that leaves the machine **uncaught**
     /// gets its symbolic frames attached here, at the one point the interpreter's
@@ -131,7 +148,7 @@ impl Machine {
         func: u32,
         pc: u32,
         ctx: &mut dyn ExecutionContext,
-    ) -> Result<Step> {
+    ) -> StepResult {
         // Record the machine's execution position: the read-only "saved instruction
         // pointer" behind `Machine::current_code` and the derived
         // `current_function`/`current_location`/`current_stacktrace`
@@ -147,7 +164,7 @@ impl Machine {
         // `entry_module` `Machine::raise_stacktrace` needs; in a callee context the
         // result is left for the driver, which knows the true entry module.
         if self.current_context() == 0 {
-            result.map_err(|err| self.with_uncaught_frames(err, Some(module), func, pc))
+            result.map_err(|err| Box::new(self.with_uncaught_frames(*err, Some(module), func, pc)))
         } else {
             result
         }
@@ -156,6 +173,7 @@ impl Machine {
     /// The body of one dispatch-loop iteration — the effect of the corresponding
     /// dispatch arm, without the raise funnel [`Machine::step_instruction`] wraps
     /// around it (so the driver and the native tiers share one step).
+    #[inline]
     fn step_instruction_inner(
         &mut self,
         module: &Module,
@@ -163,15 +181,15 @@ impl Machine {
         func: u32,
         pc: u32,
         ctx: &mut dyn ExecutionContext,
-    ) -> Result<Step> {
+    ) -> StepResult {
         // The instruction borrows `module` (never `self`), so mutating the machine
         // in the arms below is sound and clone-free.
         let instr = match module.functions.get(func as usize) {
             Some(function) => match function.code.get(pc as usize) {
                 Some(instr) => instr,
-                None => return Err(error::unsupported("run: pc out of range")),
+                None => return Err(Box::new(error::unsupported("run: pc out of range"))),
             },
-            None => return Err(error::unsupported("run: function index out of range")),
+            None => return Err(Box::new(error::unsupported("run: function index out of range"))),
         };
 
         match instr {
@@ -214,7 +232,7 @@ impl Machine {
                 // arm stays the plain raise and every raise kind shares one frame
                 // derivation. A caught raise is unaffected (the frames are metadata on
                 // the uncaught `Raise` only).
-                raise_function_clause_no_fail(self, module, "func_info")
+                raise_function_clause_no_fail(self, module, "func_info").map_err(Box::new)
             }
             Instr::Move { src, dst } => {
                 let value = read_operand(self, ctx, src)?;
@@ -232,7 +250,7 @@ impl Machine {
                 if self.eval_test(module, *kind, args, ctx)? {
                     Ok(Step::Next)
                 } else if *fail == NO_FAIL {
-                    raise_function_clause_no_fail(self, module, "test")
+                    raise_function_clause_no_fail(self, module, "test").map_err(Box::new)
                 } else {
                     let (func, pc) = resolve(labels, *fail)?;
                     Ok(Step::Goto { func, pc })
@@ -254,7 +272,7 @@ impl Machine {
                         Ok(Step::Goto { func, pc })
                     }
                     None if *fail == NO_FAIL => {
-                        raise_function_clause_no_fail(self, module, "select_val")
+                        raise_function_clause_no_fail(self, module, "select_val").map_err(Box::new)
                     }
                     None => {
                         let (func, pc) = resolve(labels, *fail)?;
@@ -272,13 +290,16 @@ impl Machine {
                 args,
                 dst,
                 ..
-            } => self.exec_bif(module, labels, *bif, args, *fail, dst, ctx),
+            } => self
+                .exec_bif(module, labels, *bif, args, *fail, dst, ctx)
+                .map_err(Box::new),
             Instr::Bif0 { bif, dst } => {
                 // `bif0 Bif Dst` — a non-garbage-collecting BIF with no
                 // arguments (`emu/ops.tab:984-985`, e.g. `self`/`node`). There
                 // is no fail label, so any error is a raise; C routes the call
                 // through `call_light_bif`, whose error path is catch-aware.
                 self.exec_bif(module, labels, *bif, &[], NO_FAIL, dst, ctx)
+                    .map_err(Box::new)
             }
             // `bif{1,2,3} Fail Bif Arg… Dst` — a non-garbage-collecting BIF.
             // Like the `GcBif` arm minus the heap/live check: on failure, jump
@@ -290,7 +311,9 @@ impl Machine {
                 args,
                 dst,
                 ..
-            } => self.exec_bif(module, labels, *bif, args, *fail, dst, ctx),
+            } => self
+                .exec_bif(module, labels, *bif, args, *fail, dst, ctx)
+                .map_err(Box::new),
             Instr::Call { target, .. } => {
                 // Store the continuation in the *current* frame's CP slot, tagged
                 // with the module context it points into (the one executing now).
@@ -382,7 +405,7 @@ impl Machine {
                         self.set_x(0, value)?;
                         Ok(Step::Next)
                     }
-                    Err(e) => self.raise_bif_error(module, e),
+                    Err(e) => self.raise_bif_error(module, e).map_err(Box::new),
                 }
             }
             Instr::CallExtOnly { target, arity } => {
@@ -409,9 +432,9 @@ impl Machine {
                 match self.call_import(module, labels, *target, *arity, ctx) {
                     Ok(value) => {
                         self.set_x(0, value)?;
-                        self.continuation_step()
+                        self.continuation_step().map_err(Box::new)
                     }
-                    Err(e) => self.raise_bif_error(module, e),
+                    Err(e) => self.raise_bif_error(module, e).map_err(Box::new),
                 }
             }
             Instr::CallExtLast {
@@ -466,9 +489,9 @@ impl Machine {
                     Ok(value) => {
                         self.set_x(0, value)?;
                         self.pop_frame_checked(*deallocate)?;
-                        self.continuation_step()
+                        self.continuation_step().map_err(Box::new)
                     }
-                    Err(e) => self.raise_bif_error(module, e),
+                    Err(e) => self.raise_bif_error(module, e).map_err(Box::new),
                 }
             }
             Instr::Allocate { stack_need, .. } => {
@@ -501,7 +524,7 @@ impl Machine {
             // path the popped frame's continuation now addresses.
             Instr::DeallocateReturn(n) => {
                 self.pop_frame_checked(*n)?;
-                self.return_step(module, func, ctx)
+                self.return_step(module, func, ctx).map_err(Box::new)
             }
             Instr::Trim { n, .. } => {
                 self.trim(*n)?;
@@ -517,11 +540,11 @@ impl Machine {
                 }
                 Ok(Step::Next)
             }
-            Instr::Return => self.return_step(module, func, ctx),
+            Instr::Return => self.return_step(module, func, ctx).map_err(Box::new),
             // An opcode the loader has no typed IR variant for: a residual
             // [`crate::generic`] opcode is reported as the documented
             // `unsupported(op.name())` typed error carrying its own `ops.tab` name.
-            Instr::Generic { op, .. } => crate::generic::exec(*op),
+            Instr::Generic { op, .. } => crate::generic::exec(*op).map_err(Box::new),
             // Every remaining IR variant is routed to the per-instruction-family
             // dispatch seam ([`crate::families`]). Each family is currently a stub
             // returning `Ok(None)`, so an instruction no family claims yields the
@@ -529,7 +552,8 @@ impl Machine {
             // this seam existed; a family that later implements an opcode returns
             // a [`Step`] telling the driver where to continue. Never a panic and
             // never a wrong result.
-            other => families::dispatch(self, module, labels, other, func, pc, ctx),
+            other => families::dispatch(self, module, labels, other, func, pc, ctx)
+                .map_err(Box::new),
         }
     }
 
@@ -781,7 +805,7 @@ impl Machine {
         frame: ImportFrame,
         func: u32,
         pc: u32,
-    ) -> Result<Step> {
+    ) -> StepResult {
         match target {
             ApplyTarget::Enter {
                 context,
@@ -809,10 +833,10 @@ impl Machine {
                 self.set_x(0, value)?;
                 match frame {
                     ImportFrame::Call => Ok(Step::Next),
-                    ImportFrame::Only => self.continuation_step(),
+                    ImportFrame::Only => self.continuation_step().map_err(Box::new),
                     ImportFrame::Last(deallocate) => {
                         self.pop_frame_checked(deallocate)?;
-                        self.continuation_step()
+                        self.continuation_step().map_err(Box::new)
                     }
                 }
             }

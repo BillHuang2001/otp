@@ -636,7 +636,7 @@ pub trait ExecutionContext {
     }
 
     /// The **per-instruction reduction hook**: charge `n` reductions for the
-    /// instruction the engine has just executed.
+    /// instruction the engine is about to execute.
     ///
     /// A BEAM process is pre-emptible because the runtime prices work in
     /// *reductions* and checks its budget at known points. The engine's **only**
@@ -644,18 +644,22 @@ pub trait ExecutionContext {
     /// (reached by `test_heap`/`allocate_heap`), which a tight **non-allocating**
     /// loop — the one shape that can monopolise a scheduler — never touches. This
     /// hook closes that gap: [`Machine::drive`](crate::machine::Machine) calls it
-    /// **once per interpreted instruction** with `n = 1`, after the instruction
-    /// succeeded, so a host can price instructions rather than heap admissions.
+    /// **once per interpreted instruction** with `n = 1`, **before** the
+    /// instruction's body runs, so a host can price instructions rather than heap
+    /// admissions.
     ///
     /// The default body is a **no-op** ([`Ok`]) — deliberately *not* a typed error:
     /// a host that does not pre-empt simply ignores the hook, so every existing
     /// implementor compiles and behaves byte-identically (it pays only the call).
     /// Returning `Err` propagates out of the run exactly like any other engine
     /// failure, so a host that has exhausted its budget returns **its own** typed
-    /// exhaustion error (a host that pre-empts *by failing* must remember that the
-    /// machine keeps its position: re-entering through
-    /// [`Machine::resume_outcome`](crate::machine::Machine::resume_outcome) is what
-    /// continues the process, not [`Machine::run_export`](crate::machine::Machine::run_export)).
+    /// exhaustion error. Because the charge precedes the body, that error leaves the
+    /// instruction **not applied** and the machine parked at its `(func, pc)`
+    /// ([`Machine::current_code`](crate::machine::Machine::current_code)), so a host
+    /// that pre-empts *by failing* continues the process by re-entering through
+    /// [`Machine::resume_outcome`](crate::machine::Machine::resume_outcome) — which
+    /// applies that instruction **exactly once** — not by
+    /// [`Machine::run_export`](crate::machine::Machine::run_export).
     ///
     /// The engine also counts the same charge in
     /// [`Machine::reductions`](crate::machine::Machine::reductions) — the slice's
@@ -664,6 +668,40 @@ pub trait ExecutionContext {
     fn reduce(&mut self, n: u32) -> Result<()> {
         let _ = n;
         Ok(())
+    }
+
+    /// Cheap reduction-hook gate: does [`reduce`](ExecutionContext::reduce) need to
+    /// be called at all for the process currently running?
+    ///
+    /// [`Machine::drive`](crate::machine::Machine) charges **one reduction per
+    /// interpreted instruction** (before the instruction's effect), and that charge
+    /// is also offered to the host through [`reduce`](ExecutionContext::reduce). The
+    /// hook call is a
+    /// `&mut dyn ExecutionContext` vtable crossing the interpreter cannot elide, so
+    /// the driver latches this answer **once per run** into the
+    /// `Machine::reduce_on` flag and then skips the hook call entirely on a run
+    /// whose host declares it does not need it — the per-instruction hot path pays a
+    /// single `bool` load instead.
+    ///
+    /// **The default is the CONSERVATIVE `true`**: every host keeps receiving every
+    /// charge unless it explicitly opts out, so an implementor that *does* pre-empt
+    /// by returning an error from `reduce` (e.g. a scheduler enforcing a time slice)
+    /// is never silently skipped. A host may answer `false` **only** when its
+    /// `reduce` is provably the default no-op (a test/embedding context), never when
+    /// it uses the hook for pre-emption.
+    ///
+    /// `Machine::reductions` accounting is **unaffected**: the slice counter is
+    /// still bumped on every interpreted instruction, so a host that polls
+    /// [`Machine::reductions`](crate::machine::Machine::reductions) after the slice
+    /// observes the exact same count either way; only the per-instruction hook *call*
+    /// is skipped.
+    ///
+    /// Like the A.8 tracing gate, the answer is latched at a run/resume entry, so a
+    /// host that flips it mid-run sees the change take effect at the process's next
+    /// run entry (or [`Machine::resume_outcome`](crate::machine::Machine::resume_outcome)).
+    #[inline]
+    fn wants_reduce(&self) -> bool {
+        true
     }
 
     /// Cheap tracing gate: does the host want `call`/`return_from`/`return_to`
@@ -1101,6 +1139,16 @@ impl ExecutionContext for MinimalContext {
         usize::MAX
     }
 
+    /// [`MinimalContext`] never pre-empts: its [`reduce`](ExecutionContext::reduce)
+    /// is the trait's default no-op, so the per-instruction hook call is pure
+    /// overhead here and the driver skips it. The reduction *count*
+    /// ([`Machine::reductions`](crate::machine::Machine::reductions)) is unchanged —
+    /// only the vtable crossing is elided.
+    #[inline]
+    fn wants_reduce(&self) -> bool {
+        false
+    }
+
     fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm> {
         // The region heap hands out `n` uninitialised words whose pointer stays
         // valid (and unmoved) for the life of the context: the frontier region
@@ -1275,6 +1323,22 @@ mod tests {
     fn default_alloc_words_is_a_typed_unsupported_error() {
         // A context with no exposed heap cannot serve raw words.
         assert!(OnlyRequired.alloc_words(8).is_err());
+    }
+
+    #[test]
+    fn the_reduce_gate_defaults_conservative_and_the_minimal_context_opts_out() {
+        // The trait default is `true`: a host that does not override it keeps receiving
+        // every reduction charge, so a pre-empting host is never silently skipped.
+        assert!(
+            OnlyRequired.wants_reduce(),
+            "the reduce-hook gate must default to the conservative `true`"
+        );
+        // `MinimalContext` never pre-empts (its `reduce` is the default no-op), so it
+        // opts out of the per-instruction vtable crossing.
+        assert!(
+            !MinimalContext::new().wants_reduce(),
+            "MinimalContext must opt out of the reduction hook"
+        );
     }
 
     #[test]
