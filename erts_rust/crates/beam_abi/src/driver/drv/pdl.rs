@@ -74,6 +74,14 @@
 //! longer exists"*). The header defines **no** `ERL_DRV_MONITOR_*` constants, so these are this
 //! crate's names for the C's literal values.
 //!
+//! [`monitor_identity`] / [`monitor_from_identity`] are the **safe** half of the same family. The
+//! runtime behind the seam (the sibling `beam_rt`/`beam_io`, which is `#![deny(unsafe_code)]`) must
+//! key its per-port monitor tree on a monitor's identity, but a `DriverHost` monitor hook only ever
+//! receives a raw `*const ErlDrvMonitor`. These two functions move exactly the 24 reference-thing
+//! bytes across that boundary — the read side and its write-side counterpart — so the host never
+//! has to spell an `unsafe` read of the opaque holder. The bytes stay **opaque**: no encoding is
+//! invented here (see the function docs).
+//!
 //! # The deprecated wall clock
 //!
 //! `driver_get_now(ErlDrvNowData *now)` (`io.c:6957`): `-1` for a `NULL` out-parameter, else the
@@ -136,8 +144,13 @@ pub const ERL_DRV_MONITOR_ERROR: c_int = -1;
 /// "not one of mine" answer — a reference count is never negative.
 pub const PDL_INVALID_REFCOUNT: ErlDrvSInt = -1;
 
-/// The width `driver_compare_monitors` compares:
-/// `ERTS_REF_THING_SIZE * sizeof(Eterm)` (`io.c:7146`) = `3 * 8` = 24 bytes.
+/// The width of the internal **reference thing** a monitor carries:
+/// `ERTS_REF_THING_SIZE * sizeof(Eterm)` (`io.c:6996`/`io.c:7146`) = `3 * 8` = 24 bytes on LP64.
+///
+/// It is the range `driver_monitor_process` writes into the holder (`erts_ref_to_driver_monitor`,
+/// `io.c:6998-6999`), the range `driver_compare_monitors` compares (`io.c:7145-7146`) and the range
+/// the two safe accessors ([`monitor_identity`] / [`monitor_from_identity`]) expose — one constant,
+/// one width, no duplication.
 const REF_THING_COMPARE_BYTES: usize = 3 * size_of::<Eterm>();
 
 // ---------------------------------------------------------------------------------------------
@@ -472,6 +485,76 @@ pub unsafe extern "C" fn driver_compare_monitors(
     }
 }
 
+/// The **identity** of the monitor at `mon` — its first [`REF_THING_COMPARE_BYTES`] (24) bytes, the
+/// exact range [`driver_compare_monitors`] compares (`io.c:7142-7147`) and `driver_monitor_process`
+/// writes (`erts_ref_to_driver_monitor`, `io.c:6998-6999`); `None` for a `NULL` pointer.
+///
+/// This is the one read a `#![deny(unsafe_code)]` runtime cannot spell itself: the monitor hooks of
+/// [`DriverHost`](crate::driver::host::DriverHost) receive a raw `*const ErlDrvMonitor`, and a host
+/// (the sibling `beam_rt`/`beam_io`) must key its per-port monitor registry on those bytes without
+/// writing `unsafe`. The bytes are **opaque** — they are the emulator's internal reference thing,
+/// never an encoding this crate invents — so the identity is exposed verbatim and the last
+/// `size_of::<ErlDrvMonitor>() - 24` bytes of the holder (which the C never writes) are excluded.
+///
+/// The pointer contract is the caller's, exactly as for the other raw-pointer ABI wrappers in this
+/// crate: a non-null `mon` must point at a readable `ErlDrvMonitor`, and the returned array borrows
+/// nothing — it is a copy, so the caller may drop the monitor immediately.
+///
+/// The counterpart for the write side is [`monitor_from_identity`].
+#[must_use]
+pub fn monitor_identity(mon: *const ErlDrvMonitor) -> Option<[u8; REF_THING_COMPARE_BYTES]> {
+    if mon.is_null() {
+        // The C has no failure value here (it dereferences the operand); `None` is this safe
+        // accessor's documented answer for a missing monitor, never a fabricated identity.
+        return None;
+    }
+    // SAFETY: `mon` is non-null and points at a readable `ErlDrvMonitor` (caller contract).
+    Some(unsafe { identity_bytes(mon) })
+}
+
+/// The counterpart of [`monitor_identity`]: build a monitor whose first [`REF_THING_COMPARE_BYTES`]
+/// (24) bytes are `identity` and whose trailing `size_of::<ErlDrvMonitor>() - 24` bytes are zero.
+///
+/// The C's write path (`erts_ref_to_driver_monitor`, `io.c:6998-6999`) `sys_memcpy`s exactly the
+/// reference thing into the caller's holder and leaves the trailing bytes **untouched**; a fresh
+/// caller buffer is zero there. Zeroing them here is the deterministic spelling of that fact (a
+/// `compare`/`identity` round-trip is unaffected either way — see [`monitor_identity`]).
+///
+/// The bytes are opaque: this constructor neither derives nor validates them, it only places them
+/// where the emulator places them. It exists so a `DriverHost` can produce the holder
+/// `driver_monitor_process` hands back (`DriverHost::monitor_process`) from an identity it chose,
+/// without writing `unsafe`.
+#[must_use]
+pub const fn monitor_from_identity(identity: [u8; REF_THING_COMPARE_BYTES]) -> ErlDrvMonitor {
+    let mut data = [0u8; size_of::<ErlDrvMonitor>()];
+    let mut i = 0;
+    while i < REF_THING_COMPARE_BYTES {
+        data[i] = identity[i];
+        i += 1;
+    }
+    ErlDrvMonitor { data }
+}
+
+/// The first [`REF_THING_COMPARE_BYTES`] bytes of `mon` — a monitor's internal reference thing.
+///
+/// # Safety
+///
+/// `mon` must be non-null and point at a readable `ErlDrvMonitor`.
+unsafe fn identity_bytes(mon: *const ErlDrvMonitor) -> [u8; REF_THING_COMPARE_BYTES] {
+    let mut identity = [0u8; REF_THING_COMPARE_BYTES];
+    // SAFETY: `mon` is non-null and readable for the whole holder (contract); the reference thing is
+    // its first `REF_THING_COMPARE_BYTES` bytes (`io.c:6996`), well inside the 32-byte payload, so
+    // this reads `REF_THING_COMPARE_BYTES` initialized bytes from the start of the struct.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            mon as *const u8,
+            identity.as_mut_ptr(),
+            REF_THING_COMPARE_BYTES,
+        );
+    }
+    identity
+}
+
 /// The `sys_memcmp` of two live monitors' reference things, as **unsigned** byte comparison
 /// (`< 0`, `0`, `> 0` — `memcmp`'s contract).
 ///
@@ -483,15 +566,10 @@ unsafe fn compare_monitor_payloads(
     monitor2: *const ErlDrvMonitor,
 ) -> c_int {
     // SAFETY: both pointers are non-null and readable for `REF_THING_COMPARE_BYTES` (contract).
-    let (a, b) = unsafe {
-        (
-            core::slice::from_raw_parts(monitor1 as *const u8, REF_THING_COMPARE_BYTES),
-            core::slice::from_raw_parts(monitor2 as *const u8, REF_THING_COMPARE_BYTES),
-        )
-    };
+    let (a, b) = unsafe { (identity_bytes(monitor1), identity_bytes(monitor2)) };
     for i in 0..REF_THING_COMPARE_BYTES {
         if a[i] != b[i] {
-            return (a[i] as c_int) - (b[i] as c_int);
+            return c_int::from(a[i]) - c_int::from(b[i]);
         }
     }
     0
@@ -948,6 +1026,67 @@ mod tests {
         assert_eq!(REF_THING_COMPARE_BYTES, 24, "ERTS_REF_THING_SIZE(3) * sizeof(Eterm)(8)");
     }
 
+    #[test]
+    fn monitor_identity_reads_the_24_byte_reference_thing_and_ignores_the_tail() {
+        // A missing monitor has no identity (the C would fault; `None` is the safe accessor's answer).
+        assert_eq!(monitor_identity(core::ptr::null()), None);
+
+        // A monitor whose first 24 bytes are set returns exactly those bytes.
+        let mut mon = ErlDrvMonitor { data: [0u8; MONITOR_BYTES] };
+        for (i, byte) in mon.data[..REF_THING_COMPARE_BYTES].iter_mut().enumerate() {
+            *byte = (i as u8) + 1;
+        }
+        let identity =
+            monitor_identity(&mon as *const ErlDrvMonitor).expect("a live monitor has one");
+        assert_eq!(identity.len(), REF_THING_COMPARE_BYTES);
+        assert_eq!(identity[..], mon.data[..REF_THING_COMPARE_BYTES]);
+
+        // The trailing 8 bytes are not part of the identity: changing them changes nothing.
+        let mut wide = mon;
+        wide.data[REF_THING_COMPARE_BYTES..].fill(0xff);
+        assert_eq!(monitor_identity(&wide as *const ErlDrvMonitor), Some(identity));
+    }
+
+    #[test]
+    fn monitor_from_identity_is_the_write_side_counterpart() {
+        let mut identity = [0u8; REF_THING_COMPARE_BYTES];
+        for (i, byte) in identity.iter_mut().enumerate() {
+            *byte = 0xa0u8.wrapping_add(i as u8);
+        }
+        let mon = monitor_from_identity(identity);
+        assert_eq!(mon.data[..REF_THING_COMPARE_BYTES], identity[..]);
+        assert_eq!(
+            &mon.data[REF_THING_COMPARE_BYTES..],
+            &[0u8; MONITOR_BYTES - REF_THING_COMPARE_BYTES],
+            "the bytes the C never writes are zeroed"
+        );
+        // The round-trip through the safe accessor is the identity it was built from.
+        assert_eq!(monitor_identity(&mon as *const ErlDrvMonitor), Some(identity));
+    }
+
+    #[test]
+    fn monitors_agreeing_on_the_reference_thing_compare_equal_whatever_the_tail() {
+        let a = monitor_from_identity([0x5au8; REF_THING_COMPARE_BYTES]);
+        // Same identity, different trailing bytes: still equal under the pure 24-byte `memcmp`.
+        let mut b = a;
+        b.data[REF_THING_COMPARE_BYTES..].fill(0xff);
+        // SAFETY: both are live `ErlDrvMonitor` values.
+        assert_eq!(
+            unsafe { driver_compare_monitors(&a, &b) },
+            0,
+            "only the first 24 bytes may be compared"
+        );
+
+        // One differing identity byte breaks both the comparison and the identity itself.
+        let mut c = b;
+        c.data[REF_THING_COMPARE_BYTES - 1] ^= 0x01;
+        // SAFETY: `c` is a live `ErlDrvMonitor` value.
+        assert_ne!(unsafe { driver_compare_monitors(&a, &c) }, 0);
+        assert_ne!(
+            monitor_identity(&c as *const ErlDrvMonitor),
+            monitor_identity(&a as *const ErlDrvMonitor)
+        );
+    }
     #[test]
     fn driver_get_now_fills_the_three_field_breakdown() {
         let mut now = ErlDrvNowData::default();

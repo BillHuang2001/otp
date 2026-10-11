@@ -31,6 +31,17 @@
 //! The host-free half lives in [`super::mem`]; the shared [`env_for`](super::env_for) helper, the
 //! `driver_term_nil` data symbol, the module docs and the populated table live in [`super`].
 //!
+//! # Deliberate divergences: refuse rather than fault
+//!
+//! Where the C dereferences an operand this ABI cannot vouch for, these wrappers refuse with the C's
+//! own failure value instead of faulting (the same policy [`super::pdl`]'s monitor family and the
+//! queue family follow). One case cannot be cross-checked against the oracle at all:
+//! `driver_mk_port(NULL)`. The legacy VM does **not** null-check the operand — it hands the `NULL`
+//! port to its signal path and the emulator **exits on the spot** (a probe sees an exit signal and
+//! empty stdout, so there is no observable result to pin). This wrapper keeps the safe behaviour and
+//! returns [`driver_term_nil`] for a null handle — the value the C returns for an *invalid* (but
+//! non-null) one — rather than reproducing a crash. See that function's docs.
+//!
 //! The port/host-dependent half **is** the larger half of the C's surface, so its tests (the
 //! port-pointer recovery, the term-data round-trips through the populated table, and the
 //! output/select/timer host traffic) live in the sibling `port_tests.rs`, pulled in by the
@@ -433,8 +444,13 @@ pub unsafe extern "C" fn driver_mk_atom(string: *mut c_char) -> ErlDrvTermData {
 /// invalid handle. This seam has no port term, so the handle is returned **pointer-encoded** — which
 /// is what [`erl_drv_output_term`]/[`erl_drv_send_term`] decode back through
 /// [`DriverEnv::from_port`](crate::driver::host::DriverEnv::from_port) and what
-/// [`driver_async_port_key`](crate::driver::api::ErlDrvApi::driver_async_port_key) would key on. A
-/// null handle yields [`driver_term_nil`], as the C does for an invalid one.
+/// [`driver_async_port_key`](crate::driver::api::ErlDrvApi::driver_async_port_key) would key on.
+///
+/// A null handle yields [`driver_term_nil`] — the value the C returns for an invalid (non-null)
+/// handle. That is a **deliberate, documented divergence** (see the module header): the legacy VM
+/// does not null-check the operand, and `driver_mk_port(NULL)` makes it crash (an exit signal with
+/// empty stdout), so the oracle behaviour is a probe hazard that cannot be pinned or reproduced —
+/// the safe Rust answer is kept instead.
 ///
 /// # Safety
 ///
