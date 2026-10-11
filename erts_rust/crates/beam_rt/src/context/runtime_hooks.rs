@@ -847,10 +847,10 @@ impl<'a> RuntimeHooksBridge<'a> {
     /// The C sums two **per-scheduler** accumulators: `gc_info.garbage_cols` (collections run)
     /// and `gc_info.reclaimed` (words reclaimed), plus the dirty schedulers' own
     /// (`erl_gc.c:3546-3603`). This runtime keeps neither node-globally — its GC counters live
-    /// inside each process's own [`beam_gc::Collector`]
+    /// inside each process's own [`beam_gc::AnyCollector`]
     /// ([`Runtime::gc_stats`] is the node-global *collection* count, and there is no
     /// node-global reclaimed-words figure) — so both figures are summed from every **live**
-    /// process's [`Collector::stats`](beam_gc::Collector::stats): its cumulative
+    /// process's [`AnyCollector::stats`](beam_gc::AnyCollector::stats): its cumulative
     /// `minor_collections + major_collections` and its cumulative `words_reclaimed`. Both are
     /// real measurements of work this runtime really did, and the pair comes from the same
     /// counter set so the two elements can never describe different scopes.

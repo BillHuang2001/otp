@@ -25,7 +25,7 @@
 //! place that owns both the *root set* a collection relocates and the running process's
 //! heap policy. This suite is the acceptance evidence for the second half of that seam:
 //! the admission point drives the collector's explicit **growth** step
-//! ([`Collector::ensure_capacity`](beam_gc::Collector::ensure_capacity), reached through
+//! ([`AnyCollector::ensure_capacity`](beam_gc::AnyCollector::ensure_capacity), reached through
 //! `beam_process::Process::ensure_capacity`), not only `Process::collect`.
 //!
 //! 1. **The nursery grows.** `heap_growth:sprawl/1` builds a 400-element tuple of a

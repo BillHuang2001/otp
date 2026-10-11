@@ -22,7 +22,7 @@
 //! the out-of-band term stabilization.
 //!
 //! A scheduled process allocates on its **own** [`beam_process::Process`] young heap and the
-//! collector behind it (`beam_gc::Collector`, reached through
+//! collector behind it (`beam_gc::AnyCollector`, reached through
 //! [`Process::collect`](beam_process::Process::collect)) runs at the engine's
 //! heap-admission point — see [`crate::context::gc`] for the GC point itself. This module
 //! holds the state that decision needs and the two safety valves that keep the change
