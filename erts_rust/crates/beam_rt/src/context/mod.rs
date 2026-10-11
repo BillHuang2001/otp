@@ -1957,7 +1957,11 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// a discoverable `.beam` for one of those would run the module body *instead of* the
     /// host implementation — a wrong result — so the answer is deliberately conservative:
     ///
-    /// * a name in a namespace the floor serves ([`native::FLOOR_MODULES`]) → `Ok(None)`;
+    /// * a name the floor serves ([`native::floor_shadows`]) → `Ok(None)`. The rule is
+    ///   **key-granular**: a whole namespace in [`native::FLOOR_MODULES`] is refused, except
+    ///   `io`, where the floor owns only `io:put_chars/1,2` — every other `io:*` is a real
+    ///   `lib/stdlib/src/io.erl` body that must be entered in-machine so its blocking
+    ///   `receive` can suspend the process;
     /// * a NIF-backed name ([`Runtime::nifs`]) — and, because the interception is module-wide
     ///   at dispatch, the *whole* module carrying a loaded NIF was excluded below —, a
     ///   registered `beam_bifs` name ([`Runtime::registry`]) or the `erlang` BIF namespace →
@@ -1980,6 +1984,7 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// unchanged: the seam only ever *substitutes a routing* for a call the synchronous path
     /// would run through the same code anyway.
     ///
+    /// [`native::floor_shadows`]: crate::native::floor_shadows
     /// [`native::FLOOR_MODULES`]: crate::native::FLOOR_MODULES
     /// [`Runtime::nifs`]: crate::Runtime
     fn resolve_external_call(
@@ -1991,9 +1996,18 @@ impl ExecutionContext for RuntimeContext<'_> {
         // The floor's namespaces: `try_native` serves them for modules that are *also*
         // loadable `.beam`s (`os`, `code`, `init`, `application`, `prim_file`,
         // `erts_internal`, `erlang`, `io`), so entering the module body would shadow the host
-        // implementation. The list is the floor's own, and a unit test below pins it against
-        // `try_native`'s source so it can never drift out of the host's dispatch.
-        if crate::native::FLOOR_MODULES.contains(&module) {
+        // implementation. The exclusion is **key-granular** because one namespace is only
+        // partly floor-served: the floor owns just `io:put_chars/1,2`, while every other
+        // `io:*` (`io:getopts/1`, `io:setopts/2`, `io:request/2`, `io:scan_erl_form/4`, …) is
+        // an ordinary `lib/stdlib/src/io.erl` body. Refusing those would route them onto the
+        // synchronous non-pumping `call_bif` path, where a **scheduled** process's blocking
+        // `receive` on the io-device reply folds into the typed `blocked()` gap (exit 3)
+        // instead of suspending — the contract A.9 `compile:file/2` blocker; entering them
+        // in-machine lets that `receive` suspend the process and be resumed when the device
+        // replies. The key list is [`crate::native::floor_shadows`], whose `io` exception a
+        // unit test below pins against `try_native`'s source so it can never drift out of the
+        // host's dispatch.
+        if crate::native::floor_shadows(module, function, arity) {
             return Ok(None);
         }
         // A module with a loaded NIF library is **never** entered here, for two reasons.
