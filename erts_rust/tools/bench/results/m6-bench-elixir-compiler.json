@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "tool": "bench",
+  "tool_version": "0.1.0",
+  "generated_at_unix_ms": 1791679891291,
+  "profile": "quick",
+  "runtimes": [
+    {
+      "kind": "sys",
+      "program": "/nix/store/khp1dd3fk8476mwg62cinwvk5a17r53s-erlang-29.1.1/lib/erlang/erts-17.1/bin/erl",
+      "version": "29",
+      "supported": true,
+      "notes": []
+    }
+  ],
+  "results": [
+    {
+      "workload": "elixir_compiler",
+      "runtime": "sys",
+      "category": "compiler",
+      "description": "installed system Elixir compiler (elixirc) throughput over the checkout's stdlib corpus",
+      "status": "ok",
+      "reason": null,
+      "metrics": [
+        {
+          "name": "wall_ms",
+          "unit": "ms",
+          "value": 21709.839501000002
+        },
+        {
+          "name": "files_attempted",
+          "unit": "files",
+          "value": 25.0
+        },
+        {
+          "name": "files_compiled",
+          "unit": "files",
+          "value": 39.0
+        },
+        {
+          "name": "files_per_sec",
+          "unit": "files/s",
+          "value": 1.796420466314529
+        },
+        {
+          "name": "loc_per_sec",
+          "unit": "loc/s",
+          "value": 1114.3794959371128
+        },
+        {
+          "name": "compiler_startup_ms",
+          "unit": "ms",
+          "value": 679.528277
+        }
+      ],
+      "peak_memory_bytes": 190021632,
+      "notes": [
+        "batch compile failed; per-file fallback (version skew)",
+        "compiler: Elixir 1.20.4 (compiled with Erlang/OTP 29)",
+        "corpus = the checkout's unbuilt, read-only .ex sources staged into $TMPDIR; compiler = the installed system elixirc, so a version skew with the checkout is expected",
+        "24/25 compiled; 39 .beam produced",
+        "39 .beam file(s) produced from 25 source file(s) (an Elixir source may define several modules)"
+      ]
+    }
+  ]
+}

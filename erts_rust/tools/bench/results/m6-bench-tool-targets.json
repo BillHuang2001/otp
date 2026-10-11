@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "tool": "bench",
+  "tool_version": "0.1.0",
+  "generated_at_unix_ms": 1791680084429,
+  "profile": "quick",
+  "runtimes": [
+    {
+      "kind": "sys",
+      "program": "/nix/store/khp1dd3fk8476mwg62cinwvk5a17r53s-erlang-29.1.1/lib/erlang/erts-17.1/bin/erl",
+      "version": "29",
+      "supported": true,
+      "notes": []
+    }
+  ],
+  "results": [
+    {
+      "workload": "plb",
+      "runtime": "sys",
+      "category": "compute",
+      "description": "Programming-Language-Benchmarks kernels via the dotnet tool",
+      "status": "ok",
+      "reason": null,
+      "metrics": [
+        {
+          "name": "wall_ms",
+          "unit": "ms",
+          "value": 82557.967877
+        },
+        {
+          "name": "test_time_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 10,
+            "min": 0.0,
+            "max": 3756.9797,
+            "mean": 1327.90009,
+            "p50": 639.5317,
+            "p90": 3425.5930399999997,
+            "p99": 3723.841034
+          }
+        },
+        {
+          "name": "test_mem_bytes",
+          "unit": "bytes",
+          "value": 91140096.0
+        }
+      ],
+      "peak_memory_bytes": 171868160,
+      "notes": [
+        "build stage ok (dotnet --task build took 22881 ms)"
+      ]
+    },
+    {
+      "workload": "khepri",
+      "runtime": "sys",
+      "category": "gc",
+      "description": "Khepri test suite (rebar3 eunit) — GC/data-structure bound",
+      "status": "ok",
+      "reason": null,
+      "metrics": [
+        {
+          "name": "wall_ms",
+          "unit": "ms",
+          "value": 81362.08899
+        }
+      ],
+      "peak_memory_bytes": 376324096,
+      "notes": []
+    },
+    {
+      "workload": "emqx",
+      "runtime": "sys",
+      "category": "messaging",
+      "description": "EMQX broker build (make emqx-enterprise-compile: mix deps.get + mix compile) — messaging/copy bound",
+      "status": "skipped",
+      "reason": "emqx-requires-otp-28",
+      "metrics": [],
+      "peak_memory_bytes": null,
+      "notes": [
+        "EMQX builds with Erlang/OTP 28 (env.sh OTP_VSN / .tool-versions), but `erl` on PATH is OTP 29: the umbrella build aborts in a dependency NIF (:ezstd) whose makefile generates env.mk via `erl -noshell -s init stop -eval …`, an idiom OTP 29 no longer evaluates, so `mix compile` fails with \"No rule to make target '…/env.mk'\"; no number is fabricated"
+      ]
+    }
+  ]
+}
