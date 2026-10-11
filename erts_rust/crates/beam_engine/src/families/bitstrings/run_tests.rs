@@ -290,6 +290,179 @@ fn non_byte_aligned_refc_window_reads_end_to_end_via_bs_get_integer2() {
 }
 
 // ---------------------------------------------------------------------------
+// (1b) a read whose DESTINATION is the match-context operand (`dst == ctx`)
+// ---------------------------------------------------------------------------
+
+/// `f/1` = `[bs_start_match3 X0 -> X1, move X1 -> X2, <read: ctx = X1, dst = X1>,
+/// bs_get_integer2 NO_FAIL X2 (8 bits) -> X0, return]`, driven through
+/// [`Machine::run_label`] with `x(0)` = `subject`.
+///
+/// `X2` **aliases** the context, so the trailing 8-bit read observes the position the
+/// passed-in read committed. That is only correct when the read commits the advance
+/// **before** binding its destination — here the destination *is* the context register
+/// (`dst == ctx`), the shape the installed `beam_asm` emits (`filter_essentials/1`
+/// compiles to `{test,bs_get_binary2,{f,91},5,[{tr,{x,3},{t_bs_matchable,1}},…],{x,3}}`)
+/// and the C mirrors by advancing `sb->start` inside `erts_bs_get_{integer,binary,float}_2`
+/// *before* the instruction's `$Dst = _result`. Binding first clobbers the context the
+/// commit re-reads, which is the typed
+/// `unsupported("bs_get_binary2: operand is not a match context")`.
+///
+/// Returns `(x(0) after the run, x(1) after the run)`.
+fn run_dst_eq_ctx(
+    read: Instr,
+    subject: Eterm,
+    machine: &mut Machine,
+    ctx: &mut MinimalContext,
+) -> (Eterm, Eterm) {
+    let mut fixture = Fixture::new();
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::BsStartMatch3 {
+            fail: NO_FAIL,
+            bin: Operand::X(0),
+            live: 1,
+            dst: Operand::X(1),
+        },
+        Instr::Move {
+            src: Operand::X(1),
+            dst: Operand::X(2),
+        },
+        read,
+        Instr::BsGetInteger2(Box::new(BsGetArgs {
+            fail: NO_FAIL,
+            ctx: Operand::X(2),
+            live: 3,
+            size: Operand::Integer(1),
+            unit: 8,
+            flags: 0,
+            dst: Operand::X(0),
+        })),
+        Instr::Return,
+    ];
+    let entry = fixture.add_function("f", 1, code);
+    let module = fixture.finish();
+    let result = machine
+        .run_label(&module, entry, 1, &[subject], ctx)
+        .expect("a read whose destination is the match-context operand");
+    (result, machine.x(1).expect("x(1) is in range"))
+}
+
+/// `bs_get_binary2` with `dst == ctx == x(1)` over the 8-byte subject
+/// `[AA,BB,CC,DD,EE,FF,11,22]`: `x(1)` must end up holding the 4-byte window
+/// `<<AA,BB,CC,DD>>` **and** the aliased `x(2)` must observe the committed position, so
+/// the trailing 8-bit read in `x(0)` yields `0xEE`.
+#[test]
+fn bs_get_binary2_with_dst_equal_to_the_context_commits_before_binding() {
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::new();
+    let bytes = [0xAAu8, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22];
+    let subject = make_heap_binary(&mut ctx, &bytes).expect("a heap-binary subject");
+
+    let (result, bound) = run_dst_eq_ctx(
+        Instr::BsGetBinary2(Box::new(BsGetArgs {
+            fail: NO_FAIL,
+            ctx: Operand::X(1), // == dst
+            live: 3,
+            size: Operand::Integer(4),
+            unit: 8,
+            flags: 0,
+            dst: Operand::X(1), // == ctx
+        })),
+        subject,
+        &mut machine,
+        &mut ctx,
+    );
+
+    assert_eq!(
+        bitstring(bound),
+        (vec![0xAA, 0xBB, 0xCC, 0xDD], 32),
+        "x(1) holds the 4-byte window the read extracted"
+    );
+    assert_eq!(
+        signed_value(result),
+        0xEE,
+        "x(0) reads the NEXT 8 bits through the aliased context (x(2)), so the \
+         destination binding must not have clobbered the context before the commit"
+    );
+}
+
+/// `bs_get_integer2` with `dst == ctx == x(1)` over `[AB,CD,EF,01]`: `x(1)` must hold
+/// the extracted `0xAB` **and** the aliased `x(2)` must observe the committed position,
+/// so the trailing read in `x(0)` yields `0xCD`.
+#[test]
+fn bs_get_integer2_with_dst_equal_to_the_context_commits_before_binding() {
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::new();
+    let bytes = [0xABu8, 0xCD, 0xEF, 0x01];
+    let subject = make_heap_binary(&mut ctx, &bytes).expect("a heap-binary subject");
+
+    let (result, bound) = run_dst_eq_ctx(
+        Instr::BsGetInteger2(Box::new(BsGetArgs {
+            fail: NO_FAIL,
+            ctx: Operand::X(1), // == dst
+            live: 3,
+            size: Operand::Integer(1),
+            unit: 8,
+            flags: 0,
+            dst: Operand::X(1), // == ctx
+        })),
+        subject,
+        &mut machine,
+        &mut ctx,
+    );
+
+    assert_eq!(
+        signed_value(bound),
+        0xAB,
+        "x(1) holds the extracted 8-bit field"
+    );
+    assert_eq!(
+        signed_value(result),
+        0xCD,
+        "x(0) reads the next 8 bits through the aliased context (x(2))"
+    );
+}
+
+/// `bs_get_float2` with `dst == ctx == x(1)` over `1.5:64` followed by `0x5A`: `x(1)`
+/// must hold the extracted float **and** the aliased `x(2)` must observe the committed
+/// position, so the trailing read in `x(0)` yields `0x5A`.
+#[test]
+fn bs_get_float2_with_dst_equal_to_the_context_commits_before_binding() {
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::new();
+    let mut bytes = 1.5f64.to_be_bytes().to_vec();
+    bytes.push(0x5A);
+    let subject = make_heap_binary(&mut ctx, &bytes).expect("a heap-binary subject");
+
+    let (result, bound) = run_dst_eq_ctx(
+        Instr::BsGetFloat2(Box::new(BsGetArgs {
+            fail: NO_FAIL,
+            ctx: Operand::X(1), // == dst
+            live: 3,
+            size: Operand::Integer(64),
+            unit: 1,
+            flags: 0,
+            dst: Operand::X(1), // == ctx
+        })),
+        subject,
+        &mut machine,
+        &mut ctx,
+    );
+
+    assert!(
+        crate::predicates::is_float(bound),
+        "x(1) holds the extracted float"
+    );
+    // SAFETY: `bound` is the live boxed float the read just built.
+    assert_eq!(unsafe { beam_term::thing::float_value(bound) }, 1.5);
+    assert_eq!(
+        signed_value(result),
+        0x5A,
+        "x(0) reads the next 8 bits through the aliased context (x(2))"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // (2) an `append`/`private_append` segment that is not the first
 // ---------------------------------------------------------------------------
 
