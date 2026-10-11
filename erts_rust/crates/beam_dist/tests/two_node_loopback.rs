@@ -31,13 +31,13 @@
 //! fragmentation and delivery classification, so every byte that crosses is
 //! produced and consumed by the code under test.
 //!
-//! The pattern is the one `tests/connection.rs` established: a real
-//! [`TcpListener`] is bound on `127.0.0.1:0`; only the **handshake** runs on a
-//! background thread (node A, the acceptor), and once it returns both live
-//! [`Connection`]s are owned by the test thread, so all further traffic is driven
-//! sequentially and every assertion is local. Every socket carries a finite read
-//! timeout ([`TEST_TIMEOUT`]), so a wire bug surfaces as a failed assertion rather
-//! than a hung suite.
+//! Two harnesses run here. The blocking one binds a real [`TcpListener`] on
+//! `127.0.0.1:0` and runs only the **handshake** on a background thread (node A, the
+//! acceptor); once it returns both live [`Connection`]s are owned by the test thread,
+//! so all further traffic is driven sequentially. Two tests instead drive a
+//! non-blocking [`ConnectionDriver`] per endpoint over a pair of real non-blocking
+//! `TcpStream`s, one endpoint per thread. Every socket/wait is bounded by a finite
+//! timeout ([`TEST_TIMEOUT`]), so a wire bug fails an assertion rather than hanging.
 //!
 //! Small integers model pids and references throughout. The distribution *value*
 //! layer treats those fields as opaque terms (it resolves neither a pid to a local
@@ -45,9 +45,11 @@
 //! unlike a boxed term an immediate compares `==` across the two endpoints' heaps —
 //! exactly the convention `tests/delivery.rs` uses.
 
+use std::io::{ErrorKind, Read as _, Write as _};
+use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use beam_alloc::Heap;
 use beam_codec::VERSION_MAGIC;
@@ -180,12 +182,148 @@ fn establish_drivers() -> (ConnectionDriver, ConnectionDriver) {
     panic!("the driver handshake did not complete");
 }
 
-/// Shuttles `from`'s queued output into `to` and makes one `step` of progress.
-fn relay(from: &mut ConnectionDriver, to: &mut ConnectionDriver) {
-    let out = from.take_output();
-    assert!(!out.is_empty(), "the sender produced no bytes");
-    to.feed(&out);
-    to.step().expect("receiver step");
+// ---------------------------------------------------------------------------
+// A real, non-blocking loopback harness: two `ConnectionDriver`s over genuine
+// `TcpStream`s rather than the in-memory byte shuttle above.
+// ---------------------------------------------------------------------------
+
+/// How long to sleep between non-blocking poll rounds, and the size of one read.
+const POLL_SLEEP: Duration = Duration::from_millis(2);
+const READ_BUF: usize = 64 * 1024;
+
+/// Creates a connected pair of **real, non-blocking** loopback TCP sockets (a
+/// `std::net::TcpListener` bound on `127.0.0.1:0`, a connecting client and the
+/// accepted peer, both switched to non-blocking mode).
+fn socket_pair() -> (TcpStream, TcpStream) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    let client = TcpStream::connect(addr).expect("connect to the peer");
+    let (server, _) = listener.accept().expect("accept the peer");
+    client.set_nonblocking(true).expect("non-blocking client");
+    server.set_nonblocking(true).expect("non-blocking server");
+    (client, server)
+}
+
+/// Writes `bytes` in full to a non-blocking socket, retrying `WouldBlock` with a
+/// bounded sleep (the driver never touches the socket itself).
+fn write_all_nonblocking(stream: &mut TcpStream, bytes: &[u8]) {
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    let mut written = 0;
+    while written < bytes.len() {
+        match stream.write(&bytes[written..]) {
+            Ok(0) => panic!("the socket accepted 0 bytes"),
+            Ok(n) => written += n,
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the non-blocking write did not drain within {TEST_TIMEOUT:?}",
+                );
+                thread::sleep(POLL_SLEEP);
+            }
+            Err(err) if err.kind() == ErrorKind::Interrupted => {}
+            Err(err) => panic!("socket write failed: {err:?}"),
+        }
+    }
+}
+
+/// One non-blocking `read` handed to the driver: `WouldBlock` is "no bytes right
+/// now" and a clean `Ok(0)` is end-of-stream ([`ConnectionDriver::feed_eof`]).
+fn pump_read(stream: &mut TcpStream, driver: &mut ConnectionDriver, buf: &mut [u8]) {
+    match stream.read(buf) {
+        Ok(0) => driver.feed_eof(),
+        Ok(n) => driver.feed(&buf[..n]),
+        Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {}
+        Err(err) => panic!("socket read failed: {err:?}"),
+    }
+}
+
+/// Runs [`ConnectionDriver::step`] to quiescence, then drains the driver's queued
+/// output to the real socket.
+fn step_and_flush(stream: &mut TcpStream, driver: &mut ConnectionDriver) {
+    loop {
+        match driver.step().expect("driver step") {
+            StepOutcome::WouldBlock | StepOutcome::Closed | StepOutcome::Failed => break,
+            _ => {}
+        }
+    }
+    let pending = driver.take_output();
+    if !pending.is_empty() {
+        write_all_nonblocking(stream, &pending);
+    }
+}
+
+/// What one endpoint's real-socket drive loop observed.
+struct EndpointOutcome {
+    state: DriverState,
+    peer_name: Option<Vec<u8>>,
+    peer_creation: u32,
+    established: bool,
+    received: Option<Delivery>,
+}
+
+/// Drives one endpoint over a **real non-blocking socket**: complete the `'N'`
+/// handshake, send one message, decode the peer's message — or, with `observe_close`,
+/// run on until the peer's socket closes so a clean close can be asserted.
+fn drive_exchange(
+    mut stream: TcpStream,
+    mut driver: ConnectionDriver,
+    our_pid: i64,
+    peer_pid: i64,
+    our_payload: i64,
+    observe_close: bool,
+) -> EndpointOutcome {
+    let mut atoms = AtomTable::new();
+    let mut heap = Heap::new(4096).expect("endpoint heap");
+    let mut buf = vec![0u8; READ_BUF];
+    let mut established = false;
+    let mut sent = false;
+    let mut received = None;
+    let deadline = Instant::now() + TEST_TIMEOUT;
+
+    loop {
+        step_and_flush(&mut stream, &mut driver);
+        if driver.state() == DriverState::Established {
+            established = true;
+            if !sent {
+                driver
+                    .send_message(make_small(our_pid), make_small(peer_pid), make_small(our_payload), &atoms)
+                    .expect("send our message");
+                sent = true;
+                step_and_flush(&mut stream, &mut driver);
+            }
+        }
+        pump_read(&mut stream, &mut driver, &mut buf);
+        while let Some(delivery) = driver.next_delivery(&mut heap, &mut atoms).expect("classify") {
+            received = Some(delivery);
+        }
+        let done = if observe_close {
+            driver.state() == DriverState::Closed
+        } else {
+            sent && received.is_some()
+        };
+        if done {
+            break;
+        }
+        assert!(
+            observe_close
+                || !matches!(driver.state(), DriverState::Closed | DriverState::Failed),
+            "the link ended before the exchange completed: {:?}",
+            driver.state(),
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the non-blocking endpoint did not finish within {TEST_TIMEOUT:?}",
+        );
+        thread::sleep(POLL_SLEEP);
+    }
+
+    EndpointOutcome {
+        state: driver.state(),
+        peer_name: driver.peer_name().map(|name| name.to_vec()),
+        peer_creation: driver.peer_creation(),
+        established,
+        received,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -684,47 +822,50 @@ fn an_inbound_sink_routes_a_send_into_a_local_mailbox() {
 
 #[test]
 fn a_nonblocking_two_node_pair_handshakes_and_exchanges_a_message() {
-    let (mut client, mut server) = establish_drivers();
+    // Two independent `ConnectionDriver`s — one per handshake role — complete the
+    // `'N'` handshake and exchange one message each way over TWO REAL non-blocking
+    // loopback TCP sockets: no byte shuttle, every read/write a real syscall.
+    let (client_sock, server_sock) = socket_pair();
 
-    // The handshake completed and each side learned the other's name.
-    assert_eq!(client.state(), DriverState::Established);
-    assert_eq!(server.state(), DriverState::Established);
-    assert_eq!(client.peer_name(), Some(ALPHA_NAME));
-    assert_eq!(server.peer_name(), Some(BETA_NAME));
-    assert_eq!(client.peer_creation(), ALPHA_CREATION);
-    assert_eq!(server.peer_creation(), BETA_CREATION);
+    let server = thread::spawn(move || {
+        let driver = ConnectionDriver::server(ALPHA_NAME, COOKIE, ALPHA_CREATION);
+        drive_exchange(server_sock, driver, ALPHA_PID, BETA_PID, 22, false)
+    });
+    let client = thread::spawn(move || {
+        let driver = ConnectionDriver::client(BETA_NAME, COOKIE, BETA_CREATION);
+        drive_exchange(client_sock, driver, BETA_PID, ALPHA_PID, 11, false)
+    });
 
-    let mut atoms = AtomTable::new();
-    let mut heap = Heap::new(4096).expect("heap");
+    let server = server.join().expect("server endpoint thread");
+    let client = client.join().expect("client endpoint thread");
 
-    // β (client) → α (server).
-    client
-        .send_message(make_small(BETA_PID), make_small(ALPHA_PID), make_small(11), &atoms)
-        .expect("client sends a message");
-    relay(&mut client, &mut server);
-    let msg = server
-        .next_message(&mut heap, &mut atoms)
-        .expect("decode the client's message")
-        .expect("a message");
-    assert_eq!(msg.dop, Dop::SendSender);
+    // The handshake completed on BOTH sides, each learning the other's name/creation.
+    assert_eq!(client.state, DriverState::Established);
+    assert_eq!(server.state, DriverState::Established);
+    assert_eq!(client.peer_name.as_deref(), Some(ALPHA_NAME));
+    assert_eq!(server.peer_name.as_deref(), Some(BETA_NAME));
+    assert_eq!(client.peer_creation, ALPHA_CREATION);
+    assert_eq!(server.peer_creation, BETA_CREATION);
+
+    // β (client) → α (server): the server decoded the client's DOP_SEND_SENDER.
     assert_eq!(
-        msg.terms,
-        vec![make_small(BETA_PID), make_small(ALPHA_PID), make_small(11)]
+        server.received,
+        Some(Delivery::Send {
+            from: make_small(BETA_PID),
+            to: make_small(ALPHA_PID),
+            message: make_small(11),
+            token: None,
+        }),
     );
-
-    // α (server) → β (client).
-    server
-        .send_message(make_small(ALPHA_PID), make_small(BETA_PID), make_small(22), &atoms)
-        .expect("server sends a message");
-    relay(&mut server, &mut client);
-    let msg = client
-        .next_message(&mut heap, &mut atoms)
-        .expect("decode the server's message")
-        .expect("a message");
-    assert_eq!(msg.dop, Dop::SendSender);
+    // α (server) → β (client): the client decoded the server's DOP_SEND_SENDER.
     assert_eq!(
-        msg.terms,
-        vec![make_small(ALPHA_PID), make_small(BETA_PID), make_small(22)]
+        client.received,
+        Some(Delivery::Send {
+            from: make_small(ALPHA_PID),
+            to: make_small(BETA_PID),
+            message: make_small(22),
+            token: None,
+        }),
     );
 }
 
@@ -768,7 +909,60 @@ fn dropping_one_endpoint_is_observed_as_a_closed_link_by_the_peer() {
 }
 
 // ---------------------------------------------------------------------------
-// (8) Node up/down are not v6 control opcodes.
+// (8) A *clean* socket close is reported as `Closed` (not `Failed`) by the driver.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_clean_socket_close_is_reported_as_closed_by_the_driver() {
+    let (client_sock, server_sock) = socket_pair();
+
+    // The accepting side completes the exchange and then exits its loop, dropping
+    // its socket: a CLEAN close at a frame boundary (it must first see the peer's
+    // probe message, which proves the peer reported `Established`).
+    let server = thread::spawn(move || {
+        let driver = ConnectionDriver::server(ALPHA_NAME, COOKIE, ALPHA_CREATION);
+        drive_exchange(server_sock, driver, ALPHA_PID, BETA_PID, 22, false)
+    });
+    // The connecting side keeps driving until the peer's clean close is observed.
+    let client = thread::spawn(move || {
+        let driver = ConnectionDriver::client(BETA_NAME, COOKIE, BETA_CREATION);
+        drive_exchange(client_sock, driver, BETA_PID, ALPHA_PID, 11, true)
+    });
+
+    let server = server.join().expect("server endpoint thread");
+    let client = client.join().expect("client endpoint thread");
+
+    // Both sides completed the `'N'` handshake...
+    assert_eq!(
+        server.state,
+        DriverState::Established,
+        "the accepting side completed the handshake",
+    );
+    assert!(
+        client.established,
+        "the connecting side reported `Established` before the peer closed",
+    );
+
+    // ...and a CLEAN transport close (the peer exited its driver loop and dropped
+    // its socket at a frame boundary) surfaces as `Closed` — never `Failed`.
+    //
+    // Honest finding: at THIS layer peer death is detected as a clean transport EOF
+    // (`read() == 0` → `feed_eof()` → `StepOutcome::Closed`). The `net_ticktime`
+    // timeout and the resulting `{nodedown, Node}` decision belong to `net_kernel`
+    // on the Erlang side — this crate ships no tick timer and takes no `nodedown`
+    // decision. Its complement,
+    // `dropping_one_endpoint_is_observed_as_a_closed_link_by_the_peer`, covers the
+    // other case: an abrupt *mid-frame* drop, which is a typed error rather than a
+    // clean close.
+    assert_eq!(
+        client.state,
+        DriverState::Closed,
+        "a clean peer close must be reported as `Closed`, not `Failed`",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (9) Node up/down are not v6 control opcodes.
 // ---------------------------------------------------------------------------
 
 #[test]
