@@ -48,8 +48,8 @@
 //! [`ir::Module::literal`]) and the `FunT` lambda descriptors are lowered onto
 //! [`ir::Module::funs`]. Coverage is the opcode set the compiler emits for ordinary
 //! Erlang code (typed [`instr::Instr`] variants, see [`instr`]); obsolete `genop.tab`
-//! entries and the OTP-29 native-record family round-trip losslessly as
-//! [`instr::Instr::Generic`]. The remaining intentional Milestone-1 gaps
+//! entries round-trip losslessly as [`instr::Instr::Generic`]. The remaining
+//! intentional Milestone-1 gaps
 //! (preloaded/positional atoms) are listed under "Known Issues" in the crate
 //! `CONTEXT.md`, which is the authoritative description of this crate's behaviour and
 //! frozen public API.
