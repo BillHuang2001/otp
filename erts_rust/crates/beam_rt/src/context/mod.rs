@@ -594,6 +594,39 @@ impl<'a> RuntimeContext<'a> {
         message: Eterm,
         src: &OffHeapTable,
     ) -> Result<()> {
+        // A delivery may **collect on the receiver's heap** — `Process::deliver`'s
+        // `ensure_capacity` refusal path drives a rooted collection — and that collection
+        // relocates against the receiver's *published* root snapshot
+        // ([`Process::registers`](beam_process::Process::registers)), not against the live
+        // machine. For the process this context belongs to that snapshot is **stale by up to
+        // one slice of instructions**, because a delivery is driven from the scheduler pump
+        // *while* the owning machine is mid-slice: the machine's x registers/the Erlang stack
+        // hold young terms the snapshot cannot see, so collecting here frees young words the
+        // running machine still points at (the `Target::Foreign` relocation hazard
+        // `crate::context::gc` documents).
+        //
+        // Exempting that process for the duration of the delivery makes `Process::deliver`
+        // surface its raw refusal instead of collecting (see
+        // [`Process::set_relocation_exempt`](beam_process::Process::set_relocation_exempt)), so
+        // no heap word moves under a term the unpublished machine still holds. The message
+        // still arrives: the refusal is exactly the signal the heap-fragment fallback below is
+        // reached on. A delivery to a process that is **not** the one this context runs as is
+        // unaffected — the exemption names this context's own pid, and another process's
+        // collection is legitimate (its roots were published when it parked).
+        self.with_relocation_exempt(|this| {
+            this.deliver_message_with_off_heap_inner(to, from, message, src)
+        })
+    }
+
+    /// The delivery body of [`Self::deliver_message_with_off_heap`], run with the sending
+    /// context's own process marked relocation-exempt (see that method for why).
+    fn deliver_message_with_off_heap_inner(
+        &mut self,
+        to: ProcessId,
+        from: Eterm,
+        message: Eterm,
+        src: &OffHeapTable,
+    ) -> Result<()> {
         match self.process_table_mut().deliver(to, from, message, src) {
             Err(BeamError::Alloc(failure)) if failure.kind == AllocKind::Message => self
                 .send_fragmented_message(to, from, message, src)
