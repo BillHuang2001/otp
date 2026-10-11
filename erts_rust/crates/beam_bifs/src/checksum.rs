@@ -594,15 +594,31 @@ impl Md5State {
 
     /// `pad` (`erl_md5.c:222`): `0x80`, zeros to the 56-byte boundary, then the
     /// 64-bit little-endian *bit* length. Returns the number of bytes written
-    /// (always a multiple of 64).
+    /// (always a multiple of 64: 64 or 128).
+    ///
+    /// The zero run is `(56 - filled) mod 64` with `filled = (size + 1) % 64`. C
+    /// writes that as the unsigned `(64 - 8 - filled) & (64 - 1)`, which relies on the
+    /// subtraction *wrapping* for `filled > 56` (a message length of 56..=62 beyond a
+    /// whole number of blocks, where the 8-byte length field no longer fits the final
+    /// block) and on `2^64 % 64 == 0` to recover the remainder under the mask. A
+    /// checked `usize` subtraction cannot express that. Adding the modulus *before*
+    /// subtracting keeps every operand non-negative while the mask still reduces
+    /// `mod 64`: `(56 + 64 - filled) & (64 - 1) == (56 - filled).rem_euclid(64)`.
     fn pad(&self, out: &mut [u8; 128]) -> usize {
         let size = self.len;
         let filled = (size + 1) % 64;
-        let zeroes = (64 - 8 - filled) & (64 - 1);
+        let zeroes = (56 + 64 - filled) & (64 - 1);
         out[..size].copy_from_slice(&self.buf[..size]);
         out[size] = 0x80;
         // `out[size + 1 .. size + 1 + zeroes]` is already zero.
         let pos = size + 1 + zeroes;
+        // The C's `ASSERT((pad_ptr - pad_buf) % 64 == 0)`: the padded message is a
+        // whole number of 64-byte blocks, so `pos + 8` is 64 or 128 and the 128-byte
+        // buffer holds the length field (`pos` is 56 or 120).
+        debug_assert!(
+            (pos + 8).is_multiple_of(64),
+            "the padded message must be block-aligned"
+        );
         let tot_bit_size = (self.tot_len + size as u64).wrapping_mul(8);
         out[pos..pos + 8].copy_from_slice(&tot_bit_size.to_le_bytes());
         pos + 8
@@ -851,6 +867,170 @@ mod tests {
             md5_digest(&[b'A'; 100]),
             [138, 220, 89, 55, 230, 53, 246, 201, 175, 100, 111, 11, 35, 86, 15, 174]
         );
+    }
+
+    /// A digest as lowercase hex.
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// A deterministic message whose byte `i` is `i % 251` (the `tests/checksum.rs`
+    /// corpus convention).
+    fn patterned(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// The `pad` boundary, pinned against independently computed digests.
+    ///
+    /// With `size` buffered bytes, `pad` derives `filled = (size + 1) % 64` and the
+    /// zero run `(56 - filled) mod 64` (the C writes that as the unsigned
+    /// `(64 - 8 - filled) & (64 - 1)`). For a message whose length is `56..=63` beyond
+    /// a whole number of 64-byte blocks the 8-byte length field no longer fits the
+    /// final block, so the subtraction underflows — which a checked Rust `usize`
+    /// subtraction cannot express. Every length whose byte count is `0..=64` or
+    /// `120..=128` (mod 64) is pinned here, which covers the whole boundary window
+    /// plus the explicit `55`/`56`/`63`/`64`-byte cases.
+    ///
+    /// The goldens are `md5sum` outputs over the same byte pattern, cross-checked
+    /// against Python's `hashlib`; MD5 is RFC 1321, so the digest is not in doubt and
+    /// every one of these inputs is an independently known-answer vector.
+    #[test]
+    fn md5_pad_boundary_lengths_match_known_vectors() {
+        const KNOWN: &[(usize, &str)] = &[
+            (0, "d41d8cd98f00b204e9800998ecf8427e"),
+            (1, "93b885adfe0da089cdf634904fd59f71"),
+            (2, "441077cc9e57554dd476bdfb8b8b8102"),
+            (3, "b95f67f61ebb03619622d798f45fc2d3"),
+            (4, "37b59afd592725f9305e484a5d7f5168"),
+            (5, "d05374dc381d9b52806446a71c8e79b1"),
+            (6, "d15ae53931880fd7b724dd7888b4b4ed"),
+            (7, "9aa461e1eca4086f9230aa49c90b0c61"),
+            (8, "3677509751ccf61539174d2b9635a7bf"),
+            (9, "a6e7d3b46fdfaf0bde2a1f832a00d2de"),
+            (10, "c56bd5480f6e5413cb62a0ad9666613a"),
+            (11, "5b86fa8ad8f4357ea417214182177be8"),
+            (12, "50a73d7013e9803e3b20888f8fcafb15"),
+            (13, "b20d4797e23eea3ea5778970d2e226f3"),
+            (14, "aa541e601b7b9ddd0504d19866350d4e"),
+            (15, "58b7ce493ac99c66058538dacb1e3c94"),
+            (16, "1ac1ef01e96caf1be0d329331a4fc2a8"),
+            (17, "1bdd36b0a024c90db383512607293692"),
+            (18, "633ab81aea5942052b794524e1a28477"),
+            (19, "2d325313eb5df436c078435fa0f5eff1"),
+            (20, "1549d1aae20214e065ab4b76aaac89a8"),
+            (21, "7e437c81824d3982e70c88b5da8ea94b"),
+            (22, "2f5f7e7216832ae19c353023618a35a8"),
+            (23, "6535e52506c27eaa1033891ff4f3a74e"),
+            (24, "8bd9c8efbbac58748951ca5a45cfd386"),
+            (25, "d983c63bf41853056787fe1bb764dbff"),
+            (26, "b4f24c1219fb00d081c4020c56263451"),
+            (27, "b0ae6708c5e1be10668f57d3916cf423"),
+            (28, "ba7bb5ad4dba5bde028703007969cb25"),
+            (29, "ea880e16eac1b1488aff8a25d11d6271"),
+            (30, "c7172f0903c4919eb232f18ab7a30c42"),
+            (31, "e9e77893ba926e732f483282f416ffac"),
+            (32, "b4ffcb23737cec315a4a4d1aa2a620ce"),
+            (33, "5506a276a0a9acc3093f9169c73cf8c5"),
+            (34, "e5a849897d9cc0b25b286c1f0bfb50e3"),
+            (35, "f54fa30ea7b26d3e11c54d3c8451bcf0"),
+            (36, "07602fe0229e486957081a49e3f06f83"),
+            (37, "7c4bba98253ca834bf9ed43fd8b2f959"),
+            (38, "cf8df427548bbfdb1e11143fdf008b85"),
+            (39, "1431a6895a8f435755395f9ba83e76bf"),
+            (40, "30dd5e4cae35ba892cc66d7736723980"),
+            (41, "8ee247a1063931bedaf4c2fa3e4e261a"),
+            (42, "c32ceee2d2245df8589f94fcda0c9f2c"),
+            (43, "f25fa0e071d1f1cdc6632c6b673bccd5"),
+            (44, "370491b643e97577f4f74bd88576d1ec"),
+            (45, "b292bf16e3aafaf41f19c921068214f8"),
+            (46, "52921aae5ccc9b6e8e45853419d0c80f"),
+            (47, "f1375be31969155ef76f04741cd861d7"),
+            (48, "04605ca542b2d82b9886a4b4b9acfb1c"),
+            (49, "fa887ba0fa491faaacbb82bc5fefcd5b"),
+            (50, "06470e932ad7c7cedf548b5ccb9d4806"),
+            (51, "ad130b245e2dd894267cb0ddc532d169"),
+            (52, "a9eeb95053682248608e97d79e89ca82"),
+            (53, "cc26a3dc608268b98ecd1f3946c4b718"),
+            (54, "33dd62a2df6538daf1cf821d9cde61f9"),
+            (55, "6912ee65fff2d9f9ce2508cddf8bcda0"),
+            (56, "51fdd1acda72405dfdfa03fcb85896d7"),
+            (57, "5320ef4c17ef34a0cf2db763338d25eb"),
+            (58, "9f4f41b5cde885f94cfc0e06e78f929d"),
+            (59, "e39965bc00ecacd90fd875f77eff499a"),
+            (60, "63ed72093ae09e2c8553ee069e63d702"),
+            (61, "0d08fc14ac5baa37792377355dbad0ae"),
+            (62, "f3cdffe2e160a061754a06dafcfd688b"),
+            (63, "48a6295221902e8e0938f773a7185e72"),
+            (64, "b2d3f56bc197fd985d5965079b5e7148"),
+            (120, "b7ba1efc6022e9ed272f00b8831e26e6"),
+            (121, "b0b2d719a838db877b6d6571a39a1cdc"),
+            (122, "800aa956ec16f603ecdba66c2dc6e4cf"),
+            (123, "8827d2778287c58a242acd4c549beb31"),
+            (124, "cfbc5aa0b61103c1a982d8927b26f575"),
+            (125, "a1f5b691f74f566a2be1765731084f8a"),
+            (126, "80749be03f5724fa4ca0aef8909379b7"),
+            (127, "8402b21e7bc7906493bae0dac017f1f9"),
+            (128, "37eff01866ba3f538421b30b7cbefcac"),
+            (1000, "a24f1e3ef66950e1327f210e3997ba2c"),
+            (4096, "a0c16616c91907bd14e999986cf822d5"),
+        ];
+
+        for &(len, expected) in KNOWN {
+            let data = patterned(len);
+            assert_eq!(hex(&md5_digest(&data)), expected, "md5/1 of a {len}-byte input");
+            // `md5_init`/`md5_update`/`md5_final` pad through the same `pad`; an
+            // irregular chunking must not change the digest.
+            let mut state = Md5State::new();
+            for chunk in data.chunks(7) {
+                state.update(chunk);
+            }
+            assert_eq!(
+                hex(&state.finish()),
+                expected,
+                "the streaming digest of a {len}-byte input"
+            );
+        }
+
+        // The window the defect lived in is really covered: `filled = (len + 1) % 64`
+        // is `55..=64` exactly for a 54..=63-byte buffered remainder.
+        for len in 54..=63 {
+            assert!(
+                KNOWN.iter().any(|&(n, _)| n == len),
+                "the boundary window is not covered at {len} bytes"
+            );
+        }
+    }
+
+    /// The RFC 1321 Appendix A.5 test suite, plus the classic 10^6-byte `"a"` vector
+    /// (multi-block, and its padded length field has a non-zero high word).
+    #[test]
+    fn md5_rfc_1321_suite_vectors() {
+        let cases: [(&[u8], &str); 6] = [
+            (b"a", "0cc175b9c0f1b6a831c399e269772661"),
+            (b"message digest", "f96b697d7cb7938d525a2f31aaf161d0"),
+            (b"abcdefghijklmnopqrstuvwxyz", "c3fcd3d76192e4007dfb496cca67e13b"),
+            (
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+                "d174ab98d277d9f5a5611c2c9f419d9f",
+            ),
+            (
+                b"12345678901234567890123456789012345678901234567890123456789012345678901234567890",
+                "57edf4a22be3c955ac49da2e2107b67a",
+            ),
+            // `md5("")` and `md5("abc")` are byte-pinned in `md5_known_vectors`.
+            (&[], "d41d8cd98f00b204e9800998ecf8427e"),
+        ];
+        for (data, expected) in cases {
+            assert_eq!(hex(&md5_digest(data)), expected, "md5/1 of {:?}", data);
+        }
+
+        let million_a = vec![b'a'; 1_000_000];
+        assert_eq!(hex(&md5_digest(&million_a)), "7707d6ae4e027c70eea2a935c2296f21");
+        // A split that leaves the last chunk at the pad boundary.
+        let mut state = Md5State::new();
+        state.update(&million_a[..999_993]);
+        state.update(&million_a[999_993..]);
+        assert_eq!(hex(&state.finish()), "7707d6ae4e027c70eea2a935c2296f21");
     }
 
     #[test]

@@ -847,9 +847,10 @@ fn md5_hand_crafted_contexts_are_validated() {
 // ---------------------------------------------------------------------------
 
 /// The corpus the live check re-derives: empty, single-byte, multi-block, an
-/// `NMAX`-exceeding payload and 200/1000-byte patterns.
+/// `NMAX`-exceeding payload, 200/1000-byte patterns and the 55..=62-byte MD5 `pad`
+/// boundary remainders.
 fn corpus() -> Vec<Vec<u8>> {
-    vec![
+    let mut corpus = vec![
         Vec::new(),
         b"a".to_vec(),
         b"abc".to_vec(),
@@ -861,9 +862,14 @@ fn corpus() -> Vec<Vec<u8>> {
         (0..200u32).map(|i| (i % 251) as u8).collect(),
         (0..1000u32).map(|i| (i % 251) as u8).collect(),
         vec![255u8; 6000],
-    ]
+    ];
+    // The MD5 `pad` boundary: with `size` buffered bytes the zero run is
+    // `(56 - (size + 1) % 64) mod 64`, and for a 55..=62-byte remainder the 8-byte
+    // length field no longer fits the final block. These lengths (plus the 63/64/65
+    // above) cover the whole `filled = 55..=64` window against the live oracle.
+    corpus.extend((55..63).map(|n| vec![b'A'; n]));
+    corpus
 }
-
 /// `A ++ B`.
 fn cat(a: &[u8], b: &[u8]) -> Vec<u8> {
     let mut joined = a.to_vec();
