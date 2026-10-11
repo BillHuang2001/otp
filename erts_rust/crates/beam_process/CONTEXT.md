@@ -252,6 +252,25 @@ The single place that mutates ≥2 processes (mirrors the C ptab lock domain); M
     `demonitor`/`demonitor_port`/termination/port close) — **never** in the frozen `Monitor`/`MonitoredBy`/
     `PortWatch` structs. The tag must be a heap-independent **immediate**; a non-immediate tag (or any tag
     on a **remote** external-pid target — `DOP_MONITOR_P` carries no tag) is a typed `unsupported`.
+  - **reference aliases (`erlang:monitor/3` `{alias, Mode}`, `erlang:alias/1`, `erlang:unalias/1`):**
+    a `MonitorRef` may name an **alias** — a send destination that resolves to its owner — held in the
+    private `aliases: HashMap<MonitorRef, AliasEntry>` side table (next to `tags`; nothing else stores
+    it). `MonitorOptions { tag, alias }` plus the `*_with_options` entry points (`monitor_with_options`,
+    `monitor_named_with_options`, `monitor_port_with_options`, `monitor_port_term_with_options`,
+    `monitor_term_with_options`) register the alias; the existing `*_with_tag` methods delegate with
+    `alias: None`, so their signatures are unchanged. The alias API:
+    `resolve_alias(reference) -> Option<ProcessId>` (the send-path resolver — `Some(owner)` iff the
+    reference names an alias whose owner is **live**), `create_alias(owner, mode) -> Result<MonitorRef>`
+    (`alias/1`), `unalias(owner, reference) -> Result<bool>` (`unalias/1` — clears only the alias of
+    `owner`, keeping a sharing monitor) and `alias_reply_delivered(reference) -> Result<()>` (the reply
+    site). **Auto-removal** follows the C (`bif.c:470-492`, `erl_proc_sig_queue.c:6009-6112,:6466-6493`):
+    `reply_demonitor` ⇒ gone once a message is delivered through it; `demonitor`/`reply_demonitor` ⇒
+    gone when the monitor's DOWN is materialised (the shared `apply_alias_on_down`, used by the
+    termination/`port_closed` and born-down `noproc` paths); `explicit_unalias` ⇒ survives its DOWN and
+    an explicit `demonitor` (re-derived as a standalone alias) and is cleared only by `unalias/1`. A
+    dying owner's aliases are all swept (`aliases.retain(|_, e| e.owner != pid)`), so no alias ever
+    resolves to a dead pid. A `{alias, …}` on a **port** monitor or on a **remote** external-pid target
+    is a typed `unsupported` (see Known Issues).
   - **decoupled signal servicing:** `service_signals(pid) -> Result<()>` — drains + applies the pid's
     pending-signal queue in FIFO order, cascading to any process those signals affect (the scheduler
     calls it at schedule-in); the additive `service_signals_with_ports(&mut PortTable, pid)` sibling
