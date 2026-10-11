@@ -27,13 +27,14 @@
 //!    word count is ~`1/N` of the flat copy's and every occurrence shares one destination address,
 //! 2. the shared copy is structurally `=:=` the original,
 //! 3. a graph with **no** sharing copies to exactly the flat size,
-//! 4. a shared off-heap MSO container is refcounted **once** per source identity.
+//! 4. a shared off-heap MSO container — and a shared **refc binary** — is refcounted **once** per
+//!    source identity.
 //!
 //! Note on sizing: `copy_struct_shared` preflights `beam_term::size_object` — the *flat* word count,
 //! a safe upper bound — so a destination heap is sized exactly as for `copy_struct`; the saving is
 //! in the words the copy actually *writes* (`Heap::used`).
 
-use beam_alloc::Heap;
+use beam_alloc::{Heap, RefcBinary};
 use beam_gc::Mso;
 use beam_message::off_heap::OffHeapTable;
 use beam_message::{copy_struct, copy_struct_shared, size_of_copy, CopyContext};
@@ -230,8 +231,64 @@ fn a_shared_off_heap_container_is_refcounted_once_per_identity() {
 }
 
 #[test]
-fn immediates_stay_shared_in_both_copies() {
-    let mut src = Heap::new(16).expect("source heap");
+fn a_shared_refc_binary_is_refcounted_once_per_identity() {
+    const N: usize = 4;
+
+    // A payload whose bytes are position-dependent, so a shifted copy would be visible.
+    let bytes: Vec<u8> = (0..64usize).map(|i| ((i * 3) % 251) as u8).collect();
+    let mut src_off = OffHeapTable::new();
+    src_off.push_binary(RefcBinary::new(&bytes).expect("the payload allocates"));
+    let data_ptr = src_off.binaries()[0].data_ptr();
+    assert_eq!(src_off.binaries()[0].refcount(), 1);
+
+    let mut src = Heap::new(64).expect("source heap");
+    // SAFETY: `src_off` owns the payload, which outlives `pair`, and `data_ptr` is
+    // `UNIT_SIZE`-aligned.
+    let pair = unsafe {
+        let hp = src.alloc_words(ERL_REFC_BITS_SIZE).expect("the pair fits");
+        write_refc_binary(
+            hp,
+            data_ptr as *mut Eterm,
+            core::ptr::null_mut(),
+            data_ptr,
+            0,
+            bytes.len() * 8,
+        )
+    };
+    let outer = build_list(&mut src, &vec![pair; N]);
+    let cap = size_of_copy(outer);
+
+    // Contrast case first: the flat copy registers one destination handle per occurrence.
+    let mut flat_dst = Heap::new(cap).expect("flat destination heap");
+    let mut flat_off = OffHeapTable::new();
+    let _ = copy_flat(outer, &src_off, &mut flat_dst, &mut flat_off);
+    assert_eq!(flat_off.binaries().len(), N, "the flat copy refcounts the payload N times");
+    assert_eq!(src_off.binaries()[0].refcount(), 1 + N as usize);
+
+    // The shared copy materialises the pair once: one destination handle, one new reference.
+    let mut shared_dst = Heap::new(cap).expect("shared destination heap");
+    let mut shared_off = OffHeapTable::new();
+    let shared = copy_shared(outer, &src_off, &mut shared_dst, &mut shared_off);
+
+    assert_eq!(shared_off.binaries().len(), 1, "one handle per source identity");
+    assert_eq!(shared_off.binaries()[0].data_ptr(), data_ptr, "the payload is shared");
+    assert_eq!(shared_off.binaries()[0].as_bytes(), &bytes[..]);
+    assert_eq!(
+        src_off.binaries()[0].refcount(),
+        2 + N as usize,
+        "the shared identity is refcounted exactly once more"
+    );
+
+    // All N occurrences share ONE destination pair, and the shared copy writes one pair.
+    let shared_cars = car_words(shared);
+    assert_eq!(shared_cars.len(), N);
+    assert!(shared_cars.windows(2).all(|w| w[0] == w[1]));
+    assert_eq!(shared_dst.used(), 2 * N + ERL_REFC_BITS_SIZE);
+    assert_eq!(flat_dst.used(), 2 * N + N * ERL_REFC_BITS_SIZE);
+}
+
+#[test]
+fn immediates_stay_shared_in_both_copies() {    let mut src = Heap::new(16).expect("source heap");
     let tail = src.cons(make_small(2), NIL).expect("the tail fits");
     let list = src.cons(make_small(1), tail).expect("the head fits");
 

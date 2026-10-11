@@ -30,7 +30,8 @@
 //!   message, the fragment chain's used words for a fragmented one — so an off-heap refc binary
 //!   contributes only its 8-word on-heap handle,
 //! * `logical_binary_bytes()` counts the *logical* payload bytes of the refc binaries the message
-//!   shares (a disjoint figure, accounted to the holder),
+//!   shares (a disjoint figure, accounted to the holder) — a **fragmented** message owns none (its
+//!   fragment's table does), so it reports `0`,
 //! * `with_payload` carries `from`/`token`/`off_heap`/`binaries`/`nodes`/`fragments` across the
 //!   rebuild, so a collector relocating a queued message never drops them.
 
@@ -203,8 +204,42 @@ fn logical_binary_bytes_counts_the_shared_refc_payloads() {
 }
 
 #[test]
-fn with_payload_preserves_the_whole_envelope() {
-    let mut atoms = AtomTable::new();
+fn a_fragmented_message_reports_no_logical_binary_bytes() {
+    let bytes = bytes_200();
+    let source_binary = RefcBinary::new(&bytes).expect("the payload allocates");
+    let data_ptr = source_binary.data_ptr();
+
+    let mut src_off = OffHeapTable::new();
+    src_off.push_binary(source_binary);
+    let mut src = Heap::new(32).expect("source heap");
+    // SAFETY: `src_off` owns the payload, which outlives the send, and `data_ptr` is
+    // `UNIT_SIZE`-aligned.
+    let payload = unsafe { refc_binary_term(&mut src, data_ptr, bytes.len()) };
+
+    // A receiver heap too small for the 8-word pair: the send must fragment.
+    let mut to_heap = Heap::new(4).expect("a deliberately too-small receiver heap");
+    let mut queue = Queue::new();
+    let mut dst_off = OffHeapTable::new();
+    let mut ctx = CopyContext::new(&src_off, &mut dst_off);
+    send_fragmented(make_small(7), payload, &mut to_heap, &mut queue, &mut ctx, 0)
+        .expect("the oversized send fragments");
+
+    let message = queue.peek().expect("one queued message");
+    let fragments = message.fragments().expect("the payload lives in the fragments");
+    // A fragmented payload's off-heap objects belong to the FRAGMENT's table until the receiver
+    // moves it in, so the message's own lists stay empty and it reports no logical binary bytes —
+    // even though the payload is a handle over a 200-byte shared payload.
+    assert!(message.binaries().is_empty(), "the fragment owns the binary, not the message");
+    assert_eq!(message.logical_binary_bytes(), 0);
+    assert_eq!(message.heap_words(), ERL_REFC_BITS_SIZE, "the 8-word handle's words");
+    let fragment = fragments.iter().next().expect("one fragment");
+    assert_eq!(fragment.off_heap().binaries().len(), 1, "the fragment holds the handle");
+    assert_eq!(fragment.off_heap().binaries()[0].data_ptr(), data_ptr);
+    assert_eq!(fragment.off_heap().binaries()[0].as_bytes(), &bytes[..]);
+}
+
+#[test]
+fn with_payload_preserves_the_whole_envelope() {    let mut atoms = AtomTable::new();
     let node = make_atom(atoms.intern("nonode@nohost"));
 
     let bytes = bytes_200();

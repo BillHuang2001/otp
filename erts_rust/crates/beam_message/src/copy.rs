@@ -28,7 +28,8 @@
 //! refcounted into the destination table rather than deep-copied. A `SUB_BITS` **match context**
 //! (an `ErlSubBits` over an on-heap bitstring) is instead *flattened* into a fresh on-heap
 //! bitstring, so the copy never aliases the source heap, while a **refc binary** shares its
-//! off-heap payload ([`copy_refc_binary`]).
+//! off-heap payload ([`copy_refc_binary`]) — or, when no held handle owns that payload, is
+//! flattened by the very same routine.
 //!
 //! Fidelity scope: this is a correct, *tree* copy — a subterm occurring twice is copied twice
 //! (C's default behaviour; the sharing-preserving copier is [`crate::copy_struct_shared`]). It
@@ -65,9 +66,9 @@
 //! (or exhaust memory). The copy path therefore never calls `size_object` on an unproven graph:
 //! [`preflight_words`] first runs a **bounded** walk of the copy engine's own sizing, and only if
 //! that walk shows the graph does not fit does it (a) reject a cyclic graph with a typed
-//! [`BeamError::BadArg`](beam_common::BeamError::BadArg) via [`is_acyclic`], or (b) fall back to
-//! `size_object` on a graph now known to be acyclic. A cyclic graph is therefore always a typed
-//! error, never a hang, while a normal (acyclic) graph is sized exactly as before. The fast path
+//! [`BeamError::BadArg`](beam_common::BeamError::BadArg) via [`is_acyclic`], or (b) re-run the same
+//! sizing walk unbounded on a graph now known to be acyclic. A cyclic graph is therefore always a
+//! typed error, never a hang, while a normal (acyclic) graph is sized exactly as before. The fast path
 //! inherits the same guarantee from the other direction: its trial target hands out only the
 //! destination's finite free words, so a forged cycle exhausts them (in at most
 //! `available / 2` objects), the attempt is abandoned and the preflight path's
@@ -271,20 +272,24 @@ fn needs_visit(term: Eterm) -> bool {
 /// `limit`.
 ///
 /// It mirrors [`shallow`]/[`copy_refc_binary`]'s allocation exactly: `2` words per cons cell,
-/// [`ERL_BIN_REF_SIZE`] for an off-heap MSO container, [`ERL_REFC_BITS_SIZE`] for a refc binary,
-/// nothing for the shared zero-arity-tuple literal, and the canonical
-/// `beam_term::layout::object_words` for every other boxed object (walking its child slots with
-/// `beam_term::layout::for_each_sizing_child_slot`). A `SUB_BITS` **match context** is one of those
-/// "other" objects: `beam_term::layout::object_words` returns the `heap_bits_size_words(size)` block
-/// [`copy_match_context`] writes and the sizing enumerator yields no child, so this walk sizes it
-/// exactly as the copy writes it.
+/// [`ERL_BIN_REF_SIZE`] for an off-heap MSO container, [`refc_binary_words`] for a refc binary
+/// (the 8-word `[BinRef][ErlSubBits]` pair when the source holds its payload handle, the flattened
+/// window's `heap_bits_size_words` when it does not — see that function), nothing for the shared
+/// zero-arity-tuple literal, and the canonical `beam_term::layout::object_words` for every other
+/// boxed object (walking its child slots with `beam_term::layout::for_each_sizing_child_slot`). A
+/// `SUB_BITS` **match context** is one of those "other" objects: `beam_term::layout::object_words`
+/// returns the `heap_bits_size_words(size)` block [`copy_match_context`] writes and the sizing
+/// enumerator yields no child, so this walk sizes it exactly as the copy writes it.
 ///
 /// The `limit` is what makes it cycle-safe: a forged cyclic graph revisits its own objects, so its
 /// count grows without bound and the walk stops at `limit` instead of looping forever. Every
 /// compound object contributes at least 2 words, so a graph that terminates this way always
 /// exceeds `limit` — i.e. `Some(n)` is returned only for a graph that is both acyclic and `<=
 /// limit` words.
-fn bounded_words(term: Eterm, limit: usize) -> Option<usize> {
+///
+/// `ctx` supplies the source off-heap table the sizing reads to tell a handled refc binary from one
+/// the copier will flatten.
+fn bounded_words(term: Eterm, limit: usize, ctx: &CopyContext<'_>) -> Option<usize> {
     let mut total = 0usize;
     let mut work: Vec<Eterm> = Vec::new();
     let mut current = term;
@@ -309,7 +314,7 @@ fn bounded_words(term: Eterm, limit: usize) -> Option<usize> {
                     if layout::is_off_heap_term(current) {
                         total = total.saturating_add(ERL_BIN_REF_SIZE);
                     } else if layout::is_refc_binary_term(current) {
-                        total = total.saturating_add(ERL_REFC_BITS_SIZE);
+                        total = total.saturating_add(refc_binary_words(current, ctx));
                     } else {
                         // Everything else — including a `SUB_BITS` match context, whose
                         // `object_words` is the flattened heap-bits block's size — is sized by
@@ -449,23 +454,52 @@ fn is_acyclic(term: Eterm) -> bool {
 ///   allocation-free walk that cannot hang;
 /// * a graph that does not fit is either **cyclic** (a typed
 ///   [`BeamError::BadArg`](beam_common::BeamError::BadArg) — never a hang) or simply too big, in
-///   which case the canonical `beam_term::size_object` now gives the exact count (it is safe to
-///   call because [`is_acyclic`] has just proven the graph terminates).
+///   which case the copier's own walk is re-run **unbounded** (safe now that [`is_acyclic`] has
+///   just proven the graph terminates) for the exact count, with the canonical
+///   `beam_term::size_object` as the fallback if that walk saturates.
 ///
 /// Either way the caller compares the result against `limit`; a graph that `bounded_words` accepted
-/// is guaranteed `<= limit`.
-pub(crate) fn preflight_words(term: Eterm, limit: usize) -> Result<usize> {
-    match bounded_words(term, limit) {
+/// is guaranteed `<= limit`. A graph it rejected yields a count **above** `limit` — even when
+/// `size_object` would under-report it (a refc binary the copier flattens is sized as its 8-word
+/// pair there) — so the caller's refusal is total and never leaves a partial write.
+pub(crate) fn preflight_words(term: Eterm, limit: usize, ctx: &CopyContext<'_>) -> Result<usize> {
+    match bounded_words(term, limit, ctx) {
         Some(n) => Ok(n),
         None => {
             if !is_acyclic(term) {
                 return Err(crate::error::bad_term());
             }
-            Ok(beam_term::size_object(term))
+            // Acyclic, so an unlimited re-run of the copier's own sizing terminates. It returns
+            // `Some` for every acyclic graph (the bound is `usize::MAX`, which a saturating total
+            // cannot exceed); `size_object` is the defensive fallback.
+            Ok(bounded_words(term, usize::MAX, ctx).unwrap_or_else(|| beam_term::size_object(term)))
         }
     }
 }
-/// Copies the refc-binary term `src` (the 8-word `[BinRef(3)][ErlSubBits(5)]` pair whose root is
+
+/// The destination words the copier writes for the refc binary `t`.
+///
+/// A refc binary whose payload is owned by a handle in the source process's off-heap table is
+/// copied as the 8-word `[BinRef(3)][ErlSubBits(5)]` pair ([`ERL_REFC_BITS_SIZE`]) that **shares**
+/// the payload (see [`copy_refc_binary`]). One whose payload no held handle owns has no pair to
+/// share, so the copier **flattens** it into a fresh on-heap bitstring of the window's bits — the
+/// `heap_bits_size_words(end - start)` block [`copy_match_context`] writes.
+///
+/// This sizing lives beside the flag it mirrors (`layout::is_refc_binary_term`) so the preflight
+/// and [`shallow`] never disagree about what a refc binary costs.
+fn refc_binary_words(t: Eterm, ctx: &CopyContext<'_>) -> usize {
+    // SAFETY: `t` is a live refc binary (the caller's `is_refc_binary_term` guard), so its
+    // `ErlSubBits` words 1..4 are initialised and its `orig` slot is the live `BinRef` whose `val`
+    // is the payload's first data byte.
+    let (_base_flags, start, end, orig) = unsafe { sub_bits_parts(t) };
+    // SAFETY: `orig` is the `BinRef` of a refc binary, so its two payload words are live.
+    let (val, _next) = unsafe { bin_ref_parts(orig) };
+    if ctx.src_off_heap().binary_by_data_ptr(val as *const u8).is_some() {
+        ERL_REFC_BITS_SIZE
+    } else {
+        heap_bits_size_words(end.raw().saturating_sub(start.raw()))
+    }
+}/// Copies the refc-binary term `src` (the 8-word `[BinRef(3)][ErlSubBits(5)]` pair whose root is
 /// the `ErlSubBits`) onto `to`, **sharing** its off-heap payload.
 ///
 /// Ground truth: `copy.c:812-848`. The source `BinRef.val` is the payload's first data byte; the
@@ -475,8 +509,14 @@ pub(crate) fn preflight_words(term: Eterm, limit: usize) -> Result<usize> {
 /// `orig` slot is fixed up to the **copied** `BinRef` (the bug the plain leaf treatment of a
 /// `SUB_BITS` would leave dangling).
 ///
-/// A source payload that no held handle owns is a malformed graph (the M1 encoding has no other
-/// way to recover the handle) and yields [`BeamError::BadArg`](beam_common::BeamError::BadArg).
+/// A source payload that no held handle owns has no pair to share, so the copier falls back to
+/// **flattening** the window into a fresh on-heap bitstring — exactly as it does for a `SUB_BITS`
+/// match context ([`copy_match_context`], the C's `ERTS_GET_BITSTRING_REF(from_sb) == NULL`
+/// branch). That is sound with no change to the flattener: a refc binary's `base_flags` word *is*
+/// its payload's data pointer ([`beam_term::refc::write_refc_binary`]), so the window `start..end`
+/// reads the same bits and the result's data lives inside the destination, never aliasing the
+/// source payload. Nothing is registered in the destination off-heap table, and the cost is the
+/// flattened block — which [`refc_binary_words`] sizes, so the preflight and this copy agree.
 fn copy_refc_binary<A: CopyTarget>(to: &mut A, ctx: &mut CopyContext<'_>, src: Eterm) -> Result<Eterm> {
     // SAFETY: `src` is a live refc binary, so its `ErlSubBits` words 1..4 are initialised and its
     // `orig` slot is a live `BinRef` term.
@@ -484,10 +524,9 @@ fn copy_refc_binary<A: CopyTarget>(to: &mut A, ctx: &mut CopyContext<'_>, src: E
     // SAFETY: `orig` is the `BinRef` of a refc binary, so its two payload words are live.
     let (val, next) = unsafe { bin_ref_parts(orig) };
 
-    let handle = ctx
-        .src_off_heap()
-        .binary_by_data_ptr(val as *const u8)
-        .ok_or_else(crate::error::bad_term)?;
+    let Some(handle) = ctx.src_off_heap().binary_by_data_ptr(val as *const u8) else {
+        return copy_match_context(to, src);
+    };
     ctx.dst_off_heap_mut().push_binary(handle);
 
     let dst = to.reserve(ERL_REFC_BITS_SIZE)?;
@@ -516,9 +555,11 @@ fn copy_refc_binary<A: CopyTarget>(to: &mut A, ctx: &mut CopyContext<'_>, src: E
 /// destination carries no `base_flags`/`orig` pointer into the source process's heap.
 ///
 /// The window is `size = end - start` bits taken from the source base starting at bit offset
-/// `start`, packed MSB-first (the bit order [`write_heap_bits`] expects). `size` is at most
-/// [`ERL_ONHEAP_BITS_LIMIT`] for a genuine match context (its `orig` is an on-heap bitstring),
-/// matching the C's `ASSERT(erl_sub_bits_is_match_context(from_sb))`.
+/// `start`, packed MSB-first (the bit order [`write_heap_bits`] expects). For a genuine match
+/// context (its `orig` is an on-heap bitstring) `size` is at most [`ERL_ONHEAP_BITS_LIMIT`],
+/// matching the C's `ASSERT(erl_sub_bits_is_match_context(from_sb))`; a refc binary whose payload
+/// no source handle owns takes this path too ([`copy_refc_binary`]) and its window may be larger,
+/// so the flattened block can exceed the on-heap limit (see the crate `CONTEXT.md` Known Issues).
 fn copy_match_context<A: CopyTarget>(to: &mut A, src: Eterm) -> Result<Eterm> {
     // SAFETY: `src` is a live match-context `ErlSubBits`, so its words 1..4 are initialised and
     // the window `start..end` is covered by its base storage.
@@ -545,7 +586,9 @@ fn copy_match_context<A: CopyTarget>(to: &mut A, src: Eterm) -> Result<Eterm> {
 ///
 /// Shared terms (immediates, literals, the zero-arity tuple literal) are returned unchanged.
 /// An off-heap **MSO** container and a **refc binary** are refcounted into `ctx`'s destination
-/// table, never deep-copied; an external pid/port/reference registers its node there too.
+/// table, never deep-copied — except a refc binary whose payload no source handle owns, which is
+/// flattened into an on-heap bitstring ([`copy_refc_binary`]); an external pid/port/reference
+/// registers its node there too.
 pub(crate) fn shallow<A: CopyTarget>(
     to: &mut A,
     ctx: &mut CopyContext<'_>,
@@ -700,7 +743,7 @@ fn try_copy_fast(term: Eterm, to: &mut Heap, ctx: &mut CopyContext<'_>) -> Resul
 /// off-heap **MSO** reference or **refc binary** is refcounted into `ctx`'s destination table
 /// (never deep-copied), a `SUB_BITS` **match context** is flattened into a fresh on-heap bitstring
 /// (so the copy never aliases the source heap), and an external pid/port/reference registers its
-/// node there.
+/// node there. A refc binary whose payload no source handle owns is flattened the same way.
 ///
 /// This is the **flat** copy: a subterm occurring twice is copied twice. See
 /// [`copy_struct_shared`](crate::copy_struct_shared) for the sharing-preserving variant.
@@ -740,7 +783,7 @@ pub fn copy_struct(term: Eterm, to: &mut Heap, ctx: &mut CopyContext<'_>) -> Res
     //
     // `preflight_words` is the cycle-safe form of `beam_term::size_object`: it bounds its own walk
     // by `to`'s capacity, so a forged cyclic graph is a typed error instead of an unbounded walk.
-    let needed = preflight_words(term, to.available())?;
+    let needed = preflight_words(term, to.available(), ctx)?;
     if to.available() < needed {
         return Err(crate::error::heap_exhausted(needed));
     }
