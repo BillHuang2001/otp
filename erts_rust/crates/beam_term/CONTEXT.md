@@ -250,9 +250,9 @@ itself documented non-portable across VM instances.
 ### `layout.rs` — canonical per-object layout (the single source of truth)
 The per-object layout walk every copier/sizer adopts: how many heap words one object occupies and
 which of its payload words are term references a copier must forward. Owned here (the frozen-layout
-LCA, workspace §2); `size.rs` consumes it, and the sibling copies (`beam_message::layout`,
-`beam_gc::copy`) must be derived from it rather than transcribed — both currently lack the
-`SUB_BITS` sizing arm (they fall through to `thing_arityval + 1 == 5` for a real 8-word refc pair).
+LCA, workspace §2); `size.rs` consumes it, and the sibling copies are built on it —
+`beam_message::layout` re-exports the walk and `beam_gc::copy::move_size` is `object_words` plus
+the copy-specific `ErlSubBits` override documented below.
 - `pub unsafe fn object_words(header: Eterm, ptr: *const Eterm) -> usize` — the words the boxed
   object headed by `header` at `ptr` occupies, **header word included**: tuple/record `arity + 1`;
   fun (all three kinds) `1 + fun_desc_words(kind) + fun_num_free`; flatmap `size + 3`; HAMT node
@@ -604,6 +604,10 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   masking via `boxed_val`/`list_val`. Prefer property-style loops over boundary ranges.
 - `tests/abi.rs` — `size_of::<Eterm>() == size_of::<usize>()`, `align_of` equal, `Eterm: Copy`, and a
   `repr(transparent)` assertion (round-trip `Eterm`) — the NIF-ABI guarantee.
+- `tests/non_term.rs` — the crate-wide **non-term policy** suite: a word that is not a term (the ABI's
+  `THE_NON_VALUE`, a bare `HEADER`-tagged word) must never crash or be dereferenced by any safe public
+  entry point — each returns a typed error or a defined ordering (the Constraints' "a word that is not
+  a term is never dereferenced" rule). Public API only; skips nothing.
 - Behavioural tests: atom interning/lookup/name round-trip + `atom.names` parser on an embedded
   snippet (order + `CName='printname'` + quoted names), heap cons/tuple construction + car/cdr +
   exhaustion, literal-graph tagging walk (`set_literal_tag` on a nested tuple/list).
@@ -730,7 +734,7 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
 - `src/refc.rs` → off-heap (`refc`) binaries: the `BinRef` + `ErlSubBits` on-heap pair writers/accessors, `ERL_REFC_BITS_SIZE`/`ERL_ONHEAP_*` limits, `is_refc_binary`/`refc_*`
 - `src/error.rs` → local `TermError`/`TermResult` (incl. `BadRef`; `FunIdentityUnavailable`; `TermGraphCyclic`/`TermGraphTooLarge` from bounded sizing) + the `From<TermError> for beam_common::BeamError`
   interop impl (upstream reconciliation so dependents get `?`-interop)
-- `tests/` → crate-level integration tests (bit-pattern pins `layout.rs`, ABI pins `abi.rs`, term-ordering `compare_terms.rs`, external/record comparison `compare_external.rs`, bounded sizing `size_bounded.rs`, record/internal-ref hashing `record_ref_hash.rs`, the M1 internal-reference layout `internal_ref.rs`, system-`erl` oracle cross-checks `oracle.rs`, `map_hash.rs`, `number_oracle.rs` and `compare_oracle.rs`). `record_ref_hash.rs` carries offline pins for two native records (`(make_hash2, make_hash, definition_hash)`) and, when `erlc`/`erl` are present, compiles a real `-record #r{...}` fixture and cross-checks `phash2(T,1 bsl 32)`/`phash(T,1 bsl 32)-1` (skips loudly otherwise). Its corpus uses only keys defined in `atom.names` so the oracle's atom indices agree with `AtomTable::from_atom_names` (the C record hash is not portable for keys outside `atom.names`, and a record's value walk follows the definition's sorted-key order, not the declaration order). `internal_ref.rs` pins the four written words literally (never by cross-checking the sibling producers — this crate is a dependency sink) plus the round-trip, the typed errors and the `=:=`/order behaviour of two equal-id vs different-id references.
+- `tests/` → crate-level integration tests (bit-pattern pins `layout.rs`, ABI pins `abi.rs`, non-term policy `non_term.rs`, term-ordering `compare_terms.rs`, external/record comparison `compare_external.rs`, bounded sizing `size_bounded.rs`, record/internal-ref hashing `record_ref_hash.rs`, the M1 internal-reference layout `internal_ref.rs`, system-`erl` oracle cross-checks `oracle.rs`, `map_hash.rs`, `number_oracle.rs` and `compare_oracle.rs`). `record_ref_hash.rs` carries offline pins for two native records (`(make_hash2, make_hash, definition_hash)`) and, when `erlc`/`erl` are present, compiles a real `-record #r{...}` fixture and cross-checks `phash2(T,1 bsl 32)`/`phash(T,1 bsl 32)-1` (skips loudly otherwise). Its corpus uses only keys defined in `atom.names` so the oracle's atom indices agree with `AtomTable::from_atom_names` (the C record hash is not portable for keys outside `atom.names`, and a record's value walk follows the definition's sorted-key order, not the declaration order). `internal_ref.rs` pins the four written words literally (never by cross-checking the sibling producers — this crate is a dependency sink) plus the round-trip, the typed errors and the `=:=`/order behaviour of two equal-id vs different-id references.
 
 ## Handoffs (owned by other nodes — escalate writes to the parent)
 - **The M1 internal-reference seam — this writer/accessor is the API the next consumer codes against.**
@@ -753,13 +757,6 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   emit `EXPORT_EXT`'s `info.mfa.arity` via `fun_true_arity` and reserve `fun_words(External, 0)`.
   `thing::write_external_ref` also accepts an **empty** `ids` slice (`external_ref_size_words(0) == 4`),
   so a `NEWER_REFERENCE_EXT` with zero id words round-trips. Owner: `beam_codec` (outside this node).
-- **`beam_codec` map serialization needs the stored pair order.** `beam_codec` returns a typed
-  `unsupported` for >32-key (HAMT) maps because it cannot read the order the map stores its pairs in;
-  `map::map_pairs_storage_order` supplies exactly that (flat map ⇒ keys-tuple order, hash map ⇒ HAMT
-  slot traversal order), and `write_map` now places those pairs in the oracle's `maps:to_list/1`
-  order (`erts_map_hash`, verified by `tests/map_hash.rs`), so a serializer can emit an existing
-  map's image without re-sorting it and with the oracle's key order.
-  Owner: `beam_codec` (outside this node).
 - **Record / number follow-ups for sibling nodes.** `beam_bifs` (`is_record/2,3`, `records:*`),
   `beam_codec` (`RECORD_EXT`, tag 67) and `beam_engine` (`Fconv` bignum source) can now consume
   `record::*`, `number::big_to_f64` and `hashing::compute_record_definition_hash` — the last lets
@@ -767,25 +764,18 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   `make_hash2(TUPLE(module,name,is_exported,keys-in-declaration-order))`, `erl_record.c:1041-1046`)
   instead of the `make_small(0)` placeholder they currently cache; `write_record` still takes that
   word as a caller-supplied argument.
-  `compare` and `hashing` now treat native records structurally; `size` still sizes a record like a
-  tuple (its field-table layout is not modelled).
+  `compare`, `hashing` and `size` all treat native records structurally.
 - **`beam_message` may delegate its bounded walk to `size_object_bounded`.** `beam_message/src/copy.rs`
   re-implements a bounded, cycle-safe sizing walk (`bounded_words`, `is_acyclic`, `preflight_words`) to
   guard the messaging copy boundary; `size::size_object_bounded` now provides exactly that machinery, so
   the duplicate can collapse onto it. Owner: `beam_message` (outside this node).
-- **Copier/sizer layout copies should adopt `beam_term::layout`.** `beam_message::layout::{object_words,
-  for_each_child_slot}` and `beam_gc::copy::{move_size, for_each_ref}` both **lack the `SUB_BITS` sizing
-  arm** (they fall through to `thing_arityval + 1 == 5` for a real 8-word refc pair); `beam_term::layout`
-  supplies the single canonical, correct walk they should be derived from. Owner: those crates (outside
-  this node).
-
 ## Known Issues
 - **Comparison gaps (`src/compare.rs`).** `cmp`/`eq`/`cmp_arith` faithfully reproduce
   `erts_cmp_compound` for atoms (by name), numbers (small/big/float), tuples, lists, bitstrings, maps
   (flat *and* hash — size first, then the `(key,value)` sequence in flat-map key order) and
   internal pids/ports; and — structurally, field by field in the C's order — external pids/ports/
   references and native records (so a copy of such a term equals its original). Funs are ordered
-  structurally (`cmp_funs`, `src/fun.rs`): `Local` by
+  structurally (`cmp_funs`, `src/compare.rs`): `Local` by
   `(uniq, index)` then `num_free` then env element-wise; `External` by `(module, function, arity)`
   and after any local kind; `Imported` by `(module, index, old_uniq)` then `num_free` then env; a
   mixed `Local`/`Imported` pair leads with a kind rank (because the `Local` descriptor carries no
@@ -801,7 +791,7 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   flat-map-key-order rule is used for both shapes (see `src/map.rs` docs).
 - **`Atom` identity is table-relative, not global (`src/atom.rs` + `src/compare.rs`).** `Atom` is a bare
   index into one `AtomTable`; two atoms carry the same `Eterm` only if their table interned the names in
-  the same order. The `cmp_impl` fast path (`a.raw() == b.raw()` ⇒ `Equal`, `src/compare.rs:205`) means
+  the same order. The `cmp_impl` fast path (`a.raw() == b.raw()` ⇒ `Equal`, `src/compare.rs`) means
   two atoms with the same index but *different* names (from two different tables) compare `Eq`; and an
   atom whose index is out of range of the passed table falls back to comparing raw indices. Atom
   comparison is only name-faithful when the operands and the passed `AtomTable` share one table — a
@@ -820,8 +810,6 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   slice's leading **zero** ids, so two external refs of different id-array lengths whose extra ids are
   zero compare `Equal` yet hash differently. Reachable only with a forged/foreign ref (a real ref from
   a given node always has one id length), so it is not observed through the safe API.
-- **Object-size approximation (`src/size.rs`).** Native records are treated like tuples (their
-  field-table layout is not modelled).
 - **The HAMT is `erts_map_hash`-driven (`src/map.rs` + `src/ihash.rs`).** The map trie is placed by
   the **bit-exact** `erts_map_hash` port in `src/ihash.rs` (`erl_term_hashing.c`), so a
   `write_map`-built hash map's stored pair order equals the oracle's `maps:to_list/1` order (verified
@@ -850,15 +838,16 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   readers. Safe `fn`/`const fn` cover only raw-bit inspection (primary tag, immediates,
   `is_list`/`is_nil`, `is_boxed`/`is_header`, the `*_header` subtag tests, `header_subtag`/
   `map_header_*`/`arityval`, `boxed_val`/`list_val`/`tuple_val` pointer extraction) plus
-  `cmp`/`eq`/`term_hash`/`size_object`/`AtomTable` access. A `#![deny(unsafe_code)]` consumer must
+  `cmp`/`eq`/`term_hash`/`size_object`/`AtomTable` access and the safe map readers
+  `map::{map_size,map_get,map_pairs,map_pairs_storage_order}`. A `#![deny(unsafe_code)]` consumer must
   deref `*boxed_val(t)` itself (unsafe) to reach into a tuple/list/map/float/binary; the header-word
   subtag tests (`header_subtag`, `BoxedTag::from_raw`, `is_*_header`) are safe but take a *header
   word*, not a boxed term. The public map/bitstring/refc/record APIs added for siblings
-  (`map::{write_map,map_get,map_pairs,map_put,map_remove}`, `bitstring::{bitstring_parts,bit_at,
+  (`map::{write_map,map_put,map_remove}`, `bitstring::{bitstring_parts,bit_at,
   float_bits,float_value,write_heap_bits,...}`, `refc::{bin_ref_parts,refc_bytes,...}`,
   `record::{write_record,record_get,record_is_native,record_definition_*}`) are likewise
-  `unsafe`: callers carry a `// SAFETY:` rationale. The one exception is
-  `number::{big_to_f64,number_as_f64}`, which are **safe** (a total, validated conversion — the crate's
+  `unsafe`: callers carry a `// SAFETY:` rationale. The exceptions are the safe map readers above and
+  `number::{big_to_f64,number_as_f64}` (a total, validated conversion — the crate's
   `cmp`/`size_object` convention).
 - Interior layouts that are NOT externally pinned (list chunking, ETS tree shape) are open and
   documented at their own nodes. The map (flat-map + HAMT node) layout *is* owned here (`src/map.rs`)

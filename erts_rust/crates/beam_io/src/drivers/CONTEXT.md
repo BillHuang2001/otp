@@ -50,8 +50,6 @@ Legacy C ground truth (read-only): `erts/emulator/beam/io.c` (the `LineBuf` `LIN
   `disarm_output` are no-ops for `duplex` (`spawn.rs:913-941`), so the single adopted descriptor stays
   registered both ways after read EOF (`release_stdout` is a no-op for duplex). Harmless under the
   edge-triggered poller, but a spurious `OUTPUT` task is scheduled on every write-readiness event.
-- `inet/` carries its own current defects (no send-side `{packet,N}` framing; `verb_send` ignores a
-  deferred `shutdown`) — see `inet/CONTEXT.md` › *Known Issues*.
 - Non-obvious framing divergences recorded in code: an out-of-range `{packet,N}` code is treated as
   **no framing** where the C's `packet_get_length` `default:` rejects it (`inet/frame.rs:96-105`); an
   unknown packed-address family is `badarg` where the C answers `eafnosupport` (`inet/wire.rs`).

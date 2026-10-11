@@ -539,8 +539,9 @@ impl Dop {
     /// `DOP_UNLINK` is never sent (`dist.c:2277` — the C path rejects it); its
     /// shape `{op, From, To}` yields 2. `DOP_ALTACT_SIG_SEND` is *variable*
     /// arity in C (`tuple_arity >= 4` — "the tuple might be extended with more
-    /// elements in the future"); this returns the documented minimum of 3, and
-    /// its variant handling is out of M1 scope.
+    /// elements in the future"), so this returns its documented minimum of 3;
+    /// callers use the `TOKEN` flag to locate the trailing message (`control`)
+    /// and accept any `terms.len() >= arity()` on decode.
     pub fn arity(self) -> usize {
         match self {
             Dop::Link => 2,            // {DOP_LINK, From, To}                      (dist.c:2224)

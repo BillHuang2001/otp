@@ -89,7 +89,7 @@ Only **frozen contracts and non-obvious behaviour** are listed; rustdoc carries 
   `stop`/`Drop` kill + reap + deregister/close every descriptor, but an adopted `{fd,N}` is **never** closed.
   **The only module here that may spawn OS children** (project invariant).
 - `inet/` — the built-in **`tcp_inet`** TCP socket driver and its `{packet, N}` framing, applied on **both** the read path (`packet.rs`/`frame.rs`) and the send path (`verb_send` prepends the 1-/2-/4-byte big-endian length header).
-  Full detail (the control-verb table, the option wire, the `PacketType` decoder, the four `gen_tcp` capability handoffs, the test strategy) is in the child node **`src/drivers/inet/CONTEXT.md`** — read it there; this doc only records that `tcp_inet` is one socket behind one port and is **unreachable from the running runtime today** (see *Handoffs*).
+  Full detail (the control-verb table, the option wire, the `PacketType` decoder, the four `gen_tcp` capability handoffs, the test strategy) is in the child node **`src/drivers/inet/CONTEXT.md`** — read it there; this doc only records that `tcp_inet` is one socket behind one port and is reachable as a built-in driver through the runtime's `open_port({spawn_driver,tcp_inet}, …)` path.
 
 ### `src/abi/` — the driver C-ABI host layer (A.4)
 Presents a **loaded C driver** (`beam_abi::driver::loader::load`) as a `Driver`; a `pub` sub-tree (`pub use crate::abi::*`); the only place in this crate holding raw `ErlDrv*` pointers and calling foreign code.
@@ -176,7 +176,7 @@ Current: **585 passing / 0 failing / 2 ignored** — **409** lib in-module (`#[c
 - The `drivers::spawn` in-module suite waits on the **condition** (the child-exit latch / the EOF latch) under a 60 s hang guard — never a wall-clock budget tuned for an idle host — and polls the driver's cached reap (`exited()`/`take_exit_status()`), **never `waitpid(2)`** from a test (a raw `waitpid` would steal the driver's reap); the `fs_access` suite skips its `uid == 0`-sensitive refusal case loudly.
 
 ## Design Decisions
-- **`mio` backend.** A portable, safe `Poll`/`Registry`/`Waker` with a one-shot re-arm matching the C's `EPOLLONESHOT`/`EV_ONESHOT`; the public API is **mio-independent** (`RawFd` + `Interest`/`Token`/`Ready`), so an io_uring/`/dev/poll` backend is a drop-in.
+- **`mio` backend.** A portable, safe `Poll`/`Registry`/`Waker` with a one-shot re-arm matching the C's `EPOLLONESHOT`/`EV_ONESHOT`; the public API is **mio-independent** (`RawFd` + `Interest`/`Token`/`Ready`), so a different backend could be added behind it (an io_uring/`/dev/poll` backend is **not implemented today**).
   `mio` fd registration is `os-ext`/Unix-only, so Windows/iocp is out of scope (as in `beam_abi`).
 - **The `Port` owns both `ByteQueue`s, not the driver** (the C `ioq`): `Port::output` appends then calls `Driver::output`, which **pulls** from `ctx.output()` — no double buffering.
 - **Task execution here, the scheduler thread above.** The poll loop, port run queues and scheduler-charged reductions are `beam_process`/`beam_rt`; `PortNotification` keeps the engine/runtime split and the DAG clean.
@@ -213,8 +213,6 @@ Current: **585 passing / 0 failing / 2 ignored** — **409** lib in-module (`#[c
 ## Handoffs (beam_rt — out of this node)
 **Runtime adoption still owed** (seams exist and are tested here):
 - **The `#file_info{}` `access`/`uid`/`gid` success path → `beam_io::fs_access`.** The safe floor now exists here (`path_access(&Path) -> Result<(read, write)>`, `process_credentials() -> Result<(euid, egid)>`, plus the boolean `access` and the errno-preserving `try_access`); `beam_rt`'s `prim_file` floor (`crates/beam_rt/src/native/prim.rs:107-109`; the handoff at `beam_rt/CONTEXT.md:243`) still answers the typed `unsupported` for an existing-path `#file_info{}` and can now adopt it.
-- **The `tcp_inet` driver is unreachable through the runtime's `open_port/2`.** `open_port({spawn_driver,"tcp_inet"}, …)` never finds the built-in: `beam_rt`'s `driver_lookup` (`crates/beam_rt/src/port.rs:1670`, used from the `SpawnDriver` branch at `:1322`) only `dlopen`s `.so` candidates and never consults `beam_io::DriverRegistry::with_builtins()` (`src/driver.rs`), so the open is `badarg`; `make_tcp_inet` and its registry entry are implemented and tested here.
-  **Owner: `beam_rt` (its driver resolver).**
 - **Four `tcp_inet` capabilities need a cross-crate seam** — `{active,N|once}`/`{deliver,…}`/`active_count` input delivery, `send_timeout`/`send_timeout_close`, `controlling_process`, and the async-op queue.
   Each is a real `gen_tcp` feature this floor refuses honestly today; the owner, the missing seam and the C ground truth for each are stated in **`src/drivers/inet/CONTEXT.md` › *Handoffs***.
 - **The OS-signal facility (`os:set_signal/2`).** `beam_bifs` registers `os:set_signal/2` as a `RuntimeHooks`-gated key that `beam_rt` does not install, so a call is the typed `unsupported_bif`.
@@ -241,8 +239,7 @@ Current: **585 passing / 0 failing / 2 ignored** — **409** lib in-module (`#[c
   **Runtime adoption is owed.**
 - **The `{get_until,…}` io request → `beam_io::io_device`.** `beam_io` hosts the DEVICE SIDE of the incremental reader request: `IoDevice` reproduces `file_io_server`'s `get_chars/5` → `get_chars_apply/7` loop (read sizes 8 KiB/128, the `{more,…}` re-read, the stashed leftover fed before a fresh read, `eof`, the `invalid_unicode` stop) and `io_lib:get_until/4`'s `latin1`/`unicode` conversions and reply cast. The one step that runs Erlang code — `apply(Mod, Func, [Cont, Chars | XtraArgs])` (`erl_scan:tokens/4` for the `io` module) — is the caller-supplied `Continuation` seam; `NoEngineContinuation` is its typed `unsupported` default.
   **Owner: `beam_rt`.** Replace the `_ => error::unsupported(…)` fallback in `crates/beam_rt/src/native/file_server.rs::serve_device_request` with a `("get_until", 5)` arm that decodes `Enc`/`Mod`/`Func`/`XtraArgs`, builds `IoDevice::new(self.device_file(service)?, enc, read_mode)`, and installs an engine-backed `Continuation` (running the real `Mod:Func`; `cast_reply` = `io_lib`'s list→binary cast). Until then the request stays the typed `unsupported`. The same `unicode:characters_to_binary/3` conversion also unblocks `reply_get_chars`/`reply_put_chars`, which today hard-refuse every non-`latin1` encoding.
-- **A safe filesystem accessor is owed TO `beam_rt` (a cross-crate ask from that node).** `beam_rt` is `#![deny(unsafe_code)]`, so the `access(2)`/`geteuid`/`getegid` wrappers its `#file_info{}` family needs can only live here: a safe `path_access(Path) -> (read, write)` over `access(2)` plus `process_credentials() -> (euid, egid)`.
-  **Not present yet** — nothing in `src/` wraps `access(2)` (the only raw call is `drivers/spawn.rs`'s internal `check_executable` `libc::access(name, X_OK)`). Recorded on the consumer side: `../beam_rt/M1_GAPS.md:359-363`, `../beam_rt/src/native/file_server/file_info.rs:42-73`.
+
 
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
@@ -293,7 +290,7 @@ Current: **585 passing / 0 failing / 2 ignored** — **409** lib in-module (`#[c
 - `tests/driver_table.rs` (5) → the process-global registry end-to-end: `add_loaded` → `create_port` → `start`/`output`/`stop` in order (+ `driver_output` → port data), a second port from one registration, the `badarg`/`notsup`/NUL-command failures, the reactor drive path
 - `tests/driver_registry_slots.rs` (3) → the four registry slots over a live fixture port (the oracle's `0,1,0,-1`) + the port-less defaults
 - `../beam_process/src/{ptab,scheduler,process}.rs` → `PortTable`/`PortId`, `Scheduler::resume_woken`, `ProcessTable::deliver`/`drain_woken`, `DeliverOutcome` (sibling — read-only)
-- `../beam_rt/src/port.rs` → the reference `open_port/2` term decoding (`RuntimePorts::{name_spec,command_spec,port_options,env_list,arg_list,spawn}`) that `SpawnSpec`/`SpawnOptions`/`build_command` mirror term-free, and `driver_lookup` (the `tcp_inet` reachability gap) (sibling — read-only)
+- `../beam_rt/src/port.rs` → the reference `open_port/2` term decoding (`RuntimePorts::{name_spec,command_spec,port_options,env_list,arg_list,spawn}`) that `SpawnSpec`/`SpawnOptions`/`build_command` mirror term-free, and `driver_lookup` (the driver-name split / `.so`-candidate builder) (sibling — read-only)
 - `../beam_abi/CONTEXT.md` → the frozen `ErlDrvEntry`/`ErlDrvApi` driver C ABI that `src/abi/` bridges onto the `Driver` trait (sibling — read-only)
 - `../../erts/emulator/{sys/common/erl_poll.c,sys/common/erl_check_io.c,beam/io.c,beam/erl_port.h,beam/erl_port_task.c,beam/erl_port_task.h,drivers/common/inet_drv.c,beam/packet_parser.c,beam/packet_parser.h,sys/unix/erl_child_setup.c,beam/erl_bif_ddll.c,sys/unix/sys.c,beam/erl_time_sup.c,beam/erl_bif_info.c}` → the legacy C ground truth listed under *Intent* (read-only reference)
 

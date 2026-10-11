@@ -318,9 +318,6 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
   not installed and the policy is the same default for all 12 allocators.
 - `free_list::FreeList::refile` is dead (carries `#[allow(dead_code)]`): MBC coalescing (`mbc.rs::dealloc`)
   unlinks neighbours with `remove` and re-files with `insert`, so `refile` is exercised only by its own tests.
-- `stats.rs`'s `Counters::{note_alloc_typed,note_free_typed,note_{sbc,mbc}_carrier_{up,down}}` are called by
-  the allocator wiring (`allocator/state.rs`); their `#[allow(dead_code)]` and "ahead of the allocator
-  wiring" comment are stale (the comments in `stats.rs` and `mbc.rs:195` predate the wiring).
 - Carrier pools / carrier migration between allocator instances; `madvise`/carrier shrinking.
 - `fix` (fixed-size type) allocators and `erts_alloc_permanent_aligned` cache-line-aligned permanents.
 - Runtime option parsing (`+MMscs`, `+Mea`, …) — `AllocatorConfig`/`CarrierPolicy` expose the knobs,
@@ -328,10 +325,6 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
 - Allocation alignment is capped at the OS page size; super-aligned mappings are not carried through
   end-to-end (the `mseg` super-align constant/`is_super_aligned` predicate exist, the caller does not
   request them yet). The packed `bhdr` word bounds the largest encodable block (`block::MAX_BLOCK_SIZE`).
-- **`ReservedHeap` carries no growth policy and no interior-pointer fix-up** (by design): `try_grow`
-  only executes the host's request, and `relocate` is a rigid constant-delta move whose interior
-  pointers the host must re-base (or move via the collector's pointer-aware copy). No outer crate
-  drives a `ReservedHeap` yet — adoption is a host handoff (see Handoffs).
 - `erts_alloc`/`enif_alloc` **C ABI shims** are out of scope (owned by `beam_abi`); bit-level
   `SubBits`/`Bitstring` and the on-heap `BinRef` layout are out of scope (owned by `beam_term`).
 
@@ -407,15 +400,6 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
   and `erts_alloc:info/0` are **not** wired yet.
 - **`../../CHANGE.md` entries owed to the repo-root owner:** the type-table inventory, the mseg layer,
   the typed allocator surface, the stats layer, the MBC/coalescing wiring, and the `policy.rs` thresholds.
-- **`beam_engine` / `beam_rt` — the runtime heap-growth adoption (the blocker this crate was asked to
-  unblock):** `ReservedHeap` is implemented and tested here but **no outer crate drives it yet**, so a
-  process heap still cannot grow. The adopting host follows the host-adoption contract in
-  `reserved_heap.rs`'s module docs: on an `AllocKind::Heap` exhaustion call `try_grow(n)`; after
-  `GrewInPlace` retry and re-read `limit()` (never `hp`, which cannot have moved); take the move path
-  **only** on `MoveRequired`, re-basing its roots (`x_regs[0..live]` ++ the Erlang stack, the root set
-  `beam_engine`'s `Machine::{x_mut, fr_mut, stack_mut}` supplies) and the moved region's pointer words
-  by the returned delta. `beam_engine::alloc_words` and the `beam_bifs` allocation sites are the
-  adoption points.
 - **`beam_term` (reported read-only, not fixable from here):** the crate-layer audit of
   `size_object`/`size_class` found no overflow path (`size_object` accumulates with `saturating_add`
   and its real failure modes — `TermGraphCyclic`, `TermGraphTooLarge` — already surface as typed
@@ -424,4 +408,3 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
   `push_children` reads `*base.add(i)` for `i in 0..count`, guarded only by the documented "live word"
   caller invariant (an OOB read/hang, not a wrap) — the `beam_term` owner may want an arity
   plausibility bound.
-- **`beam_gc`:** expected to replace its own `RefCount` with `pub use beam_alloc::RefCount;`.

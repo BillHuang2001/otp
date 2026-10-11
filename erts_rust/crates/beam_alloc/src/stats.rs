@@ -338,8 +338,8 @@ impl Counters {
     // The methods below are the *typed* (per-type / per-carrier-class) variants of the
     // aggregate counters above. Each records BOTH the class breakdown and the aggregate,
     // so a caller records an event exactly once: use either the typed method or the
-    // untyped aggregate method for a given event, never both. They are added here ahead
-    // of the allocator wiring that will call them (hence `allow(dead_code)`).
+    // untyped aggregate method for a given event, never both. The allocator wiring
+    // (`allocator/state.rs`) calls them.
     //
     // There is deliberately no `note_mseg_*` family: the segment allocator keeps its own
     // counters ([`crate::mseg`]) and the snapshot reads them from there, so a local copy
@@ -350,7 +350,6 @@ impl Counters {
     /// Performs the [`note_alloc`](Counters::note_alloc) aggregate accounting and updates
     /// the `ty_ix` slot of the per-type table. A `ty_ix` at or past
     /// [`STATS_TYPE_SLOTS`] is ignored (the aggregate accounting still happens).
-    #[allow(dead_code)]
     pub(crate) fn note_alloc_typed(&mut self, ty_ix: usize, bytes: usize) {
         self.note_alloc(bytes);
         if let Some(slot) = self.types.get_mut(ty_ix) {
@@ -365,7 +364,6 @@ impl Counters {
     /// Performs the [`note_free`](Counters::note_free) aggregate accounting and updates
     /// the `ty_ix` slot of the per-type table (saturating at zero). A `ty_ix` at or past
     /// [`STATS_TYPE_SLOTS`] is ignored.
-    #[allow(dead_code)]
     pub(crate) fn note_free_typed(&mut self, ty_ix: usize, bytes: usize) {
         self.note_free(bytes);
         if let Some(slot) = self.types.get_mut(ty_ix) {
@@ -375,28 +373,24 @@ impl Counters {
     }
 
     /// Records a newly mapped single-block carrier (SBC) of `bytes`.
-    #[allow(dead_code)]
     pub(crate) fn note_sbc_carrier_up(&mut self, bytes: usize) {
         self.note_carrier_up(bytes);
         self.sbc_carriers = self.sbc_carriers.saturating_add(1);
     }
 
     /// Records a single-block carrier (SBC) of `bytes` returned to the OS.
-    #[allow(dead_code)]
     pub(crate) fn note_sbc_carrier_down(&mut self, bytes: usize) {
         self.note_carrier_down(bytes);
         self.sbc_carriers = self.sbc_carriers.saturating_sub(1);
     }
 
     /// Records a newly mapped multi-block carrier (MBC) of `bytes`.
-    #[allow(dead_code)]
     pub(crate) fn note_mbc_carrier_up(&mut self, bytes: usize) {
         self.note_carrier_up(bytes);
         self.mbc_carriers = self.mbc_carriers.saturating_add(1);
     }
 
     /// Records a multi-block carrier (MBC) of `bytes` returned to the OS.
-    #[allow(dead_code)]
     pub(crate) fn note_mbc_carrier_down(&mut self, bytes: usize) {
         self.note_carrier_down(bytes);
         self.mbc_carriers = self.mbc_carriers.saturating_sub(1);

@@ -85,12 +85,12 @@ ancestor, so dependents import/re-export from here instead of transcribing their
 
 - **`CONTEXT_REDS`** (`= 4000`, `erts/emulator/beam/erl_vm.h:47`) — the ERTS reduction quantum /
   context-switch threshold; a frozen ERTS interface constant reported by
-  `erlang:system_info(context_reductions)`. Transcribed independently in three sibling crates that
-  must adopt `beam_common::CONTEXT_REDS` (**read-only here — owners to route**):
-  `beam_io::port_task::CONTEXT_REDS` (`crates/beam_io/src/port_task.rs`, `usize`); the private
-  `CONTEXT_REDS` in `beam_rt::info::schedulers` (`crates/beam_rt/src/info/schedulers.rs`, `i64`, feeds
-  `system_info(context_reductions)`); and `beam_process::DEFAULT_REDUCTIONS_PER_SLICE`
-  (`crates/beam_process/src/scheduler.rs`, `u32`, the per-process slice budget).
+  `erlang:system_info(context_reductions)`. Consumed by three sibling crates, which derive from this
+  definition rather than transcribing their own copy:
+  `beam_io::port_task::CONTEXT_REDS` (`crates/beam_io/src/port_task.rs`, `usize`) is a re-export;
+  `beam_rt::info::schedulers` (`crates/beam_rt/src/info/schedulers.rs`, `i64`) reports
+  `system_info(context_reductions)` from it; and `beam_process::DEFAULT_REDUCTIONS_PER_SLICE`
+  (`crates/beam_process/src/scheduler.rs`, `u32`, the per-process slice budget) is `CONTEXT_REDS as u32`.
 
 Other genuinely cross-crate-duplicated ERTS constants proved during the audit. Each already has (or
 needs) a canonical owner **outside** `beam_common`; adopters listed — **none edited from this node**:

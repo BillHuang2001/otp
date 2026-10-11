@@ -60,7 +60,7 @@ against the system `erl` oracle (`term_to_binary/1` of the equivalent tuple, `VE
 hex-compared). Honest wire facts pinned by the suite: there is **no** `DOP_NODEUP`/`DOP_NODEDOWN` in v6
 (node up/down are *local* emulator events, `dist.c:6931` `send_nodes_mon_msgs`), and
 `DOP_DEMONITOR_ID`/`DOP_UNLINK_MONITOR_ID`/`DOP_DEMONITOR_MONITOR_ID` **do not exist**; `Dop::from_u8`
-rejects `0, 5, 9-11, 14-15, 17, >= 38` and accepts exactly 30. `control::carries_message` (now `pub`)
+rejects `0, 5, 9-11, 14-15, 17, >= 38` and accepts exactly 30. `control::carries_message`
 classifies the 16 opcodes carrying a trailing **Message** term (the 9 send family + 5 payload-exit +
 `SPAWN_REQUEST`/`SPAWN_REQUEST_TT`); `SPAWN_REPLY`/`_TT` are excluded (`dist.c:1897` sets
 `ctx->msg = THE_NON_VALUE`).
@@ -116,8 +116,7 @@ control message, and both `Connection::send_payload` and `ConnectionDriver::send
 index on the payload and teaches/re-uses those refs in the header; an atom-free message emits the exact
 `131, 68, 0` header.
 
-**`epmd` over real TCP works** (an earlier "blocked in this sandbox" note was a misdiagnosis — see
-Design Decisions), covering the complete request set: `ALIVE2_REQ`/`ALIVE2_RESP`/`ALIVE2_X_RESP`,
+**`epmd` over real TCP works**, covering the complete request set: `ALIVE2_REQ`/`ALIVE2_RESP`/`ALIVE2_X_RESP`,
 `PORT2_REQ`/`PORT2_RESP` (`PORT_PLEASE2_REQ`, the same wire byte `122`/`'z'`, an alias), `NAMES_REQ`,
 and the interactive `DUMP_REQ`/`KILL_REQ`/`STOP_REQ`. `EpmdClient::connect` / `epmd::lookup_port` /
 `epmd::lookup` talk to a live `epmd`; a live test publishes a node (`ALIVE2_REQ`), looks its port up
@@ -472,10 +471,7 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
 - **epmd frames its requests but not its replies.** A client *request* is 2-byte length-framed
   (`epmd_port.c`), but `epmd` writes every *reply* body straight to the socket with no length prefix
   (`epmd_srv.c` `reply()`); the client reads it unframed/self-delimiting — by tag for `'y'`/`'v'`/`'w'`,
-  and "read until the transport goes quiet" for the open-ended `NAMES_RESP` line list. An earlier note
-  here that "epmd over raw TCP is blocked in this sandbox" was a misdiagnosis: the old client wrongly
-  re-read the reply through `read_packet`, so the first two reply bytes were parsed as a bogus ~30 KB
-  length. Requests are unchanged; only the three response readers changed.
+  and "read until the transport goes quiet" for the open-ended `NAMES_RESP` line list.
 - **There is ONE status→error mapping, shared.** `handshake::status_error(&Status)` is the single
   source; `connection.rs` and `driver.rs` both delegate to it (their private duplicates were deleted).
   It returns `BeamError` values backed by `std::io::ErrorKind` — no new `BeamError` variant and no
@@ -555,14 +551,15 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
   `feed_eof()` → `StepOutcome::Closed`. Tick *scheduling* and the `net_ticktime` `{nodedown,Node}`
   decision are `net_kernel`'s (Erlang, `lib/kernel/src/net_kernel.erl`) job, not this crate's; this
   crate only answers an inbound tick.
-- **No safe pid/reference term builder at the value layer.** Constructing an external pid or a
-  reference needs the `unsafe` raw-heap writers in `beam_term` (`boxed::write_external_pid` /
-  `write_internal_ref`), which a `#![deny(unsafe_code)]` crate cannot call; the loopback tests model
-  pids/refs as small-int stand-ins (the `tests/delivery.rs` convention). A safe term-marshalling seam
-  would be a separate addition.
 
 ## Notes for Agents
-- **`LOCAL_EXT` (`121`) now exists in the sibling `beam_codec`**: `Encoder::finish_local(hash: u32)`
+- **A safe pid/port/ref term builder exists.** `beam_codec::term::{make_external_pid,
+  make_external_port, make_external_ref}` are safe public wrappers over `beam_term::thing`'s raw
+  writers, so a `#![deny(unsafe_code)]` crate can materialize external pids/ports/refs; the live
+  tests (`tests/live_interop.rs`, `tests/live_accept.rs`, `tests/live_driver.rs`) use them. The
+  hermetic driver tests (`tests/delivery.rs`, `tests/two_node_loopback.rs`) still place small-int
+  stand-ins in pid/ref positions, which compare `==` across heaps.
+- **`LOCAL_EXT` (`121`) exists in the sibling `beam_codec`**: `Encoder::finish_local(hash: u32)`
   and `pub fn encode_term_local(Eterm, &AtomTable, hash: u32)` emit
   `[VERSION_MAGIC][LOCAL_EXT (121)][node-hash:4 BE][body]` with a **caller-supplied** node hash (the
   codec neither computes nor verifies it), and the decoder consumes that wrapper. This is the
@@ -578,8 +575,7 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
   this as "the sandbox drops name-addressed sends". There is no sandbox drop; the tuple order was wrong.
 - **In a live probe, a read timeout is NOT a peer rejection.** `TcpTransport`'s `DEFAULT_READ_TIMEOUT`
   surfaces as `Io(WouldBlock, errno 11)`: the link is still open and nothing arrived — not a refusal.
-  An orderly end-of-link is the `Ok(0)`/`Closed` path. The same confusion once produced a false
-  "the node rejects client-originated `DOP_MONITOR_P`" claim.
+  An orderly end-of-link is the `Ok(0)`/`Closed` path.
 - **A real node can be pointed at a private `epmd`** with `erl -epmd_port <N>` (`erl_epmd:get_epmd_port/0`
   reads `init:get_argument(epmd_port)`; the client connects to `127.0.0.1`). This is how
   `tests/hermetic_epmd.rs` validates the in-process stub against a real ERTS client without a host
