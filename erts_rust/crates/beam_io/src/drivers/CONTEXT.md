@@ -55,6 +55,21 @@ Legacy C ground truth (read-only): `erts/emulator/beam/io.c` (the `LineBuf` `LIN
   unknown packed-address family is `badarg` where the C answers `eafnosupport` (`inet/wire.rs`).
 
 ## Notes for Agents
+- **Waiting on a spawn child (from a test): poll the driver's own accessors, never `waitpid(2)`
+  directly.** `SpawnDriver` reaps eagerly, and **both** child kinds answer `try_wait` from a *cached*
+  status — `ChildProc::Standard` is a `std::process::Child` (whose `try_wait` caches) and
+  `ChildProc::Forked` is a `ForkedChild`, which stores the first `waitpid` result in `self.status`.
+  Repeating `SpawnDriver::exited`/`take_exit_status` is therefore **idempotent**: it can neither
+  double-reap nor race the driver's teardown (the teardown's `kill_and_reap` reuses that cache and so
+  needs no kill). A raw `waitpid(child_pid, ..)` issued from a test would steal the reap out from
+  under the driver and hit `ECHILD`.
+- **The spawn suite's waits poll a *condition* under a 60 s hang guard, never a 5 s budget.** The
+  in-module helpers `WAIT_HANG_GUARD`, `drive_to_eof` (end-of-file latch) and `wait_for_exit_status`
+  (once-only status) end the instant the condition holds, so a loaded host cannot fail them; the guard
+  only stops a genuinely broken driver from hanging the suite. A fixed 5-second cap of exactly that
+  shape is what made the `a_bad_cd…` / `a_file_with_no_executable_format…` tests flaky under load — on
+  a starved host the child needed just over 5 s to be scheduled, run and be reaped. Keep the `EINTR`
+  retry in the poll loop (`SIGCHLD` deliveries make it a normal outcome).
 - `EfileDriver` composes an `FdDriver`; a read+write `open` attaches **two** `dup(2)` descriptors (one
   per slot), each closed exactly once (`efile.rs:383-401`).
 - The `line` control argument accepts the `getopts` reply shape (`line,<N>`) as well as a bare decimal.
