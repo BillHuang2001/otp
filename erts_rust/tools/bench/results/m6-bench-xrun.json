@@ -14,7 +14,7 @@
     },
     {
       "kind": "rust",
-      "program": "/home/bill/Source/otp/.genesis/workers/worker_T2_A2733/erts_rust/tools/bench/../../target/release/beam_rt",
+      "program": "erts_rust/target/release/beam_rt",
       "version": "30",
       "supported": true,
       "notes": []
@@ -574,7 +574,7 @@
       ],
       "peak_memory_bytes": 71122944,
       "notes": [
-        "staged /tmp/genesis/task_949f60cb24b8da9f/bench-scratch-list_walk-5-2-1791680405012146477/bench_list_walk.beam (embedded source, LEN=1000, erlc=/nix/store/khp1dd3fk8476mwg62cinwvk5a17r53s-erlang-29.1.1/lib/erlang/erts-17.1/bin/erlc)",
+        "staged $TMPDIR/bench-scratch-list_walk-5-2-1791680405012146477/bench_list_walk.beam (embedded source, LEN=1000, erlc=/nix/store/khp1dd3fk8476mwg62cinwvk5a17r53s-erlang-29.1.1/lib/erlang/erts-17.1/bin/erlc)",
         "observed stdout: list_walk=N*500500=50050000000",
         "case list_walk: N=100000 walks (sys) at LEN=1000, i.e. 100000000 elements walked",
         "method: ns/element = (mean wall at N walks - mean wall at 0 walks) / (N * LEN) * 1e6; N is per runtime so both marginals are measurable, and the fixed process startup (incl. the Rust runtime's code-path resolution) cancels out of both sides; the module is BIF-free and builds no term",
@@ -739,7 +739,7 @@
       ],
       "peak_memory_bytes": 71897088,
       "notes": [
-        "staged /tmp/genesis/task_949f60cb24b8da9f/bench-scratch-copy_bound-5-3-1791680411211310139/bench_copy_bound.beam (embedded source, per-op increment=1, erlc=/nix/store/khp1dd3fk8476mwg62cinwvk5a17r53s-erlang-29.1.1/lib/erlang/erts-17.1/bin/erlc)",
+        "staged $TMPDIR/bench-scratch-copy_bound-5-3-1791680411211310139/bench_copy_bound.beam (embedded source, per-op increment=1, erlc=/nix/store/khp1dd3fk8476mwg62cinwvk5a17r53s-erlang-29.1.1/lib/erlang/erts-17.1/bin/erlc)",
         "case etf_roundtrip: N=1500000 (sys) copy round-trips of the 5-key payload",
         "case ets_copy: N=2000000 (sys) copy round-trips of the 5-key payload",
         "case send_recv: N=500000 (sys) copy round-trips of the 5-key payload",
@@ -809,7 +809,7 @@
       ],
       "peak_memory_bytes": 70664192,
       "notes": [
-        "staged /tmp/genesis/task_949f60cb24b8da9f/bench-scratch-gc_bound-5-4-1791680441686164130/bench_gc_bound.beam (embedded source, LEN=256, per-op increment=1, erlc=/nix/store/khp1dd3fk8476mwg62cinwvk5a17r53s-erlang-29.1.1/lib/erlang/erts-17.1/bin/erlc)",
+        "staged $TMPDIR/bench-scratch-gc_bound-5-4-1791680441686164130/bench_gc_bound.beam (embedded source, LEN=256, per-op increment=1, erlc=/nix/store/khp1dd3fk8476mwg62cinwvk5a17r53s-erlang-29.1.1/lib/erlang/erts-17.1/bin/erlc)",
         "observed stdout: churn=N*1=200000",
         "case churn: N=200000 churns (sys), each allocating and abandoning a 256-element list, a 256-byte binary and a 256-element tuple",
         "method: ns/op = (mean wall at N churns - mean wall at 0 churns) / N * 1e6; N is per runtime so both marginals are measurable, and the fixed process startup (incl. the Rust runtime's code-path resolution) cancels out of both sides",
@@ -1369,7 +1369,7 @@
       ],
       "peak_memory_bytes": 15765504,
       "notes": [
-        "staged /tmp/genesis/task_949f60cb24b8da9f/bench-scratch-list_walk-5-7-1791680488270566978/bench_list_walk.beam (embedded source, LEN=1000, erlc=/nix/store/khp1dd3fk8476mwg62cinwvk5a17r53s-erlang-29.1.1/lib/erlang/erts-17.1/bin/erlc)",
+        "staged $TMPDIR/bench-scratch-list_walk-5-7-1791680488270566978/bench_list_walk.beam (embedded source, LEN=1000, erlc=/nix/store/khp1dd3fk8476mwg62cinwvk5a17r53s-erlang-29.1.1/lib/erlang/erts-17.1/bin/erlc)",
         "observed stdout: list_walk=N*500500=500500000",
         "case list_walk: N=1000 walks (rust) at LEN=1000, i.e. 1000000 elements walked",
         "method: ns/element = (mean wall at N walks - mean wall at 0 walks) / (N * LEN) * 1e6; N is per runtime so both marginals are measurable, and the fixed process startup (incl. the Rust runtime's code-path resolution) cancels out of both sides; the module is BIF-free and builds no term",
@@ -1534,7 +1534,7 @@
       ],
       "peak_memory_bytes": 79331328,
       "notes": [
-        "staged /tmp/genesis/task_949f60cb24b8da9f/bench-scratch-copy_bound-5-8-1791680492460106781/bench_copy_bound.beam (embedded source, per-op increment=1, erlc=/nix/store/khp1dd3fk8476mwg62cinwvk5a17r53s-erlang-29.1.1/lib/erlang/erts-17.1/bin/erlc)",
+        "staged $TMPDIR/bench-scratch-copy_bound-5-8-1791680492460106781/bench_copy_bound.beam (embedded source, per-op increment=1, erlc=/nix/store/khp1dd3fk8476mwg62cinwvk5a17r53s-erlang-29.1.1/lib/erlang/erts-17.1/bin/erlc)",
         "case etf_roundtrip: N=5000 (rust) copy round-trips of the 5-key payload",
         "case ets_copy: N=100000 (rust) copy round-trips of the 5-key payload",
         "case send_recv: N=2000 (rust) copy round-trips of the 5-key payload",
@@ -1604,7 +1604,7 @@
       ],
       "peak_memory_bytes": 26525696,
       "notes": [
-        "staged /tmp/genesis/task_949f60cb24b8da9f/bench-scratch-gc_bound-5-9-1791680508299946238/bench_gc_bound.beam (embedded source, LEN=256, per-op increment=1, erlc=/nix/store/khp1dd3fk8476mwg62cinwvk5a17r53s-erlang-29.1.1/lib/erlang/erts-17.1/bin/erlc)",
+        "staged $TMPDIR/bench-scratch-gc_bound-5-9-1791680508299946238/bench_gc_bound.beam (embedded source, LEN=256, per-op increment=1, erlc=/nix/store/khp1dd3fk8476mwg62cinwvk5a17r53s-erlang-29.1.1/lib/erlang/erts-17.1/bin/erlc)",
         "observed stdout: churn=N*1=2000",
         "case churn: N=2000 churns (rust), each allocating and abandoning a 256-element list, a 256-byte binary and a 256-element tuple",
         "method: ns/op = (mean wall at N churns - mean wall at 0 churns) / N * 1e6; N is per runtime so both marginals are measurable, and the fixed process startup (incl. the Rust runtime's code-path resolution) cancels out of both sides",
