@@ -294,10 +294,11 @@ request/reply surface, the errno mapping, the io-device and the remaining gaps l
   the native `std::fs`-backed service answers the requests it can honour faithfully and returns the
   typed `unsupported` gap for the rest (below).
 - **The native service is deliberately narrow.** It serves the `file_server`/`file`/`io` requests a
-  native `std::fs` host (or, for the two incremental readers, the engine) can answer faithfully and
-  returns the typed `unsupported` gap for the rest — `setopts`/`getopts`/`pread`/`pwrite`/`advise`/
-  `allocate`/…, a non-`latin1` `{get_chars,…}`/`{put_chars,…}`, and a request `Enc` that is neither
-  `latin1` nor `unicode`.
+  native `std::fs` host (or, for the two incremental readers, the engine) can answer faithfully —
+  including the read-mode surface (`getopts`/`{setopts, Opts}`) and the write path — and returns the
+  typed `unsupported` gap for the rest: `pread`/`pwrite`/`advise`/`allocate`/…, a non-`latin1`
+  `{get_chars,…}`/`{put_chars,…}`, a `{setopts,…}` selecting an unmodelled `utf16`/`utf32` encoding,
+  and a request `Enc` that is neither `latin1` nor `unicode`.
 
 ## Routing Table
 - `../boot.rs` → registry + core-atom seed + banner (module root; also `mod preloaded` + `mod bootscript` + `mod drive`)
