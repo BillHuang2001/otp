@@ -103,7 +103,11 @@ and drives them through `Machine::run_label`/`Machine::run_export`, pinning
   `0x58 0x6B`), and
 - a `bs_create_bin` whose `append`/`private_append` segment is **not the first**
   (segment list `[integer,1,1,nil,7,8] [<ty>,2,1,nil,{x,0},all]`, `f/1` exported at
-  `Label(1)`), over a heap-binary source and over a 65-byte refc source;
+  `Label(1)`), over a heap-binary source and over a 65-byte refc source, and
+- a `bs_get_integer2`/`bs_get_binary2`/`bs_get_float2` whose **destination IS the match
+  context operand** (`dst == ctx`, with the context aliased in a second register so the
+  committed position stays observable), pinning that the advance is committed *before*
+  the destination binding (the shape the installed `beam_asm:filter_essentials/1` emits);
 plus a live oracle cross-check (`bitsrun:first3/1` = `7` over `<<16#E5>>`,
 `bitsrun:tail16/1` = `516`, `bitsrun:rest16/1` = a 543-bit result and
 `bitsrun:rest16bin/1` = a 544-bit `Rest/binary` result, both over the `1..=70` payload and
