@@ -100,8 +100,8 @@ Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p b
 
 ## Routing Table
 - `mod.rs` → host-layer docs + module wiring + re-exports
-- `host.rs` → `PortHost`, `LocalAtomPortHost`, `DriverState`/`SelectedFd`, `AbiHost`, `DriverIdentity`
-- `host_tests.rs` → the `#[path]`-included `mod tests` of `host.rs` (context slot, `driver_select` + the `ERL_DRV_USE` release, the driver queue hooks, timer, `driver_async`, the four registry hooks)
+- `host.rs` → `PortHost`, `LocalAtomPortHost`, `DriverState`/`SelectedFd` (its `queue_len` == `driver_sizeq`), `AbiHost` (its `queue_head` == the safe `driver_peekq` read), `DriverIdentity`
+- `host_tests.rs` → the `#[path]`-included `mod tests` of `host.rs` (context slot, `driver_select` + the `ERL_DRV_USE` release, the driver queue hooks + the safe `queue_head` accessor, timer, `driver_async`, the four registry hooks)
 - `job.rs` → `AsyncJobs`, `AsyncCompletion`, `AsyncData`, `KeepAlive`
 - `port.rs` → `DriverPort`, `load`/`from_library`/`poll_async`/`write_driver`, `make_loaded`, `LibraryKeepAlive`, the `stop_select` firing, `driver_flags`/`is_start_failure`/`load_failure`
 - `table.rs` → `DriverTable`, `RegisteredDriver`, `entry_identity`
