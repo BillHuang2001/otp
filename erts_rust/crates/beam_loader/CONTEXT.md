@@ -261,11 +261,11 @@ chunk entry * :  u8[4] chunk_id | u32 size | size bytes | (4 - size%4)%4 zero pa
 `"BEAM"` is the form type, **there is no `BEAM` chunk**. Chunks parse until EOF; unknown ids skipped;
 duplicate ids → first wins; chunk order is not significant. Chunk ids: `AtU8` (atoms), `Code`
 (instructions), `StrT`, `ImpT`, `ExpT`, `LocT` (JIT-only locals), `FunT`, `LitT`, `Attr`, `CInf`,
-`Line`, `Type`, `Meta`, `DbgB` (legacy debug), `Dbgi` (compiler debug info), `Docs` (ExDoc),
-`Recs`, obsolete `Atom`. The ids the installed corpus actually uses are classified in
-`src/chunk/classify.rs` (`ChunkClass`) and enforced by `tests/chunks.rs`: each is parsed+exposed,
-parsed-as-raw, or tooling-only (with a reason). `Docs` (a compressed ExDoc term), `DbgB`/`Dbgi`
-(debug info) and the obsolete `Atom` chunk are the tooling-only ids.
+`Line`, `Type`, `Meta`, `DbgB` (legacy emulator debug table, absent from modern modules),
+`Dbgi` (compiler debug info), `Docs` (ExDoc), `Recs`, obsolete `Atom`. The ids the installed corpus
+actually uses are classified in `src/chunk/classify.rs` (`ChunkClass`) and enforced by `tests/chunks.rs`:
+each is parsed+exposed, parsed-as-raw, or tooling-only (with a reason). `Docs` (a compressed ExDoc term),
+`DbgB`/`Dbgi` (debug info) and the obsolete `Atom` chunk are the tooling-only ids.
 ### Per-chunk layouts (`src/chunk/`)
 - **`AtU8`** — `i32 count` (negative ⇒ "long" varint lengths, real count = `-count`); then per atom a
   length (varint if long, else `u8`) + UTF-8 bytes. **UTF-8, not Latin-1** (`beam_file.c:291`).
@@ -322,9 +322,10 @@ parsed-as-raw, or tooling-only (with a reason). `Docs` (a compressed ExDoc term)
   `beam_asm.erl:236,309` writes it, `erl_bif_info.c:5896-5918` serves `module_info(compile)`) and
   `Meta` → the feature-metadata property list (`Module::meta_term`/`meta_by_name`, `compile.erl:2269-2295`).
   Each chunk's raw bytes stay on the module too (`Module::attributes`/`compile_info`/`meta`).
-  `Docs`/`DbgB`/`Dbgi` are tooling-only ids whose payloads are deliberately **not** parsed: they are large
-  and near-universal, and eagerly materializing them would regress the measured module-load cost
-  (`tests/load_cost.rs`).
+  `Docs`/`DbgB`/`Dbgi` are tooling-only ids whose payloads are deliberately **not** parsed: `Docs`/`Dbgi`
+  are large and near-universal, and eagerly materializing them would regress the measured module-load cost
+  (`tests/load_cost.rs`); `DbgB` is the legacy emulator debug table, absent from modern modules (which
+  emit `Dbgi`), and this loader keeps it only as raw bytes in `Chunks.raw`.
 - **`Recs`** — `u32 version` (must be `0`; a non-zero version means "no records" — chunk-absent,
   *not* an error, `beam_file.c:1335-1348`), `i32 record_count` (`≥ 0`; negative ⇒ `BadArg`),
   `i32 total_field_count` (informational; `≥ 0`), then `record_count` record entries EACH encoded as
@@ -657,15 +658,20 @@ silently-accepted wrong value:
   lowering is covered by `src/lower/instr.rs` unit tests only. None of these falls back to `Generic`. Their
   *execution* is oracle-checked one level up at the `../tools/differential` gate (its `records.rs` `nr_native`
   module, run under both runtimes through `beam_rt`); `beam_engine`'s own suite covers them structurally
-  only, and `put_record/6`'s cross-module create form is a typed `unsupported` there (see
-  `../../crates/CONTEXT.md`).
-- **Lowering is one peephole pass, not a full `ops.tab` transform.** `lower_instr` (`src/lower/instr.rs`) maps one decoded opcode to exactly one `Instr`. The only rewrite after that is `src/lower/fuse.rs` (`fuse`), a single forward pass that coalesces an **adjacent** `Deallocate(N); Return` pair in each function body into the one superinstruction `Instr::DeallocateReturn(N)`, run *before* `build_blocks` derives the blocks/labels (so a block's `start..end` indexes the same fused vector the engine dispatches on). `Label` is the only branch target, so two adjacent non-`Label` instructions share a block and the pair can never cross one; everything else is copied through verbatim, so `Deallocate`/`Return` stay live for hand-built modules that bypass the loader. That is the whole superinstruction surface here; the C builds a much larger set from `emu/ops.tab` in `beam_load.c` (a candidate for later). Never a correctness gap: `beam_engine`'s core `DeallocateReturn` arm executes exactly the two constituents in order.
+  only, and only `put_record/6`'s **foreign** create form (an id naming another module) is a typed
+  `unsupported` there — the **local** create form is built by the engine from the running module's own
+  `Recs` (see `../../crates/CONTEXT.md`).
+- **Lowering is one peephole pass, not a full `ops.tab` transform.** `lower_instr` (`src/lower/instr.rs`) maps one decoded opcode to exactly one `Instr`. The only rewrite after that is `src/lower/fuse.rs` (`fuse`), a single forward pass that coalesces an **adjacent** `Deallocate(N); Return` pair in each function body into the one superinstruction `Instr::DeallocateReturn(N)`, run *before* `build_blocks` derives the blocks/labels (so a block's `start..end` indexes the same fused vector the engine dispatches on). `Label` is the only branch target, so two adjacent non-`Label` instructions share a block and the pair can never cross one; everything else is copied through verbatim, so `Deallocate`/`Return` stay live for hand-built modules that bypass the loader. That is the whole superinstruction surface here; the C builds a much larger set from `emu/ops.tab` in `beam_load.c`. An audit of that transform surface — `erts/emulator/beam/beam_load.c` plus the `=>` transforms in `erts/emulator/beam/emu/ops.tab` / `beam_transform_helpers.c` — concluded it is **complete for correctness**: every load-time rewrite the C applies is performance-only (generic→specific selection, peephole/superinstruction fusion, `select`-family sorting/splitting/table-building, flat-map/record key sorting, precomputed key hashes) or constant folding (`is_integer Fail=f i => _`, `test_arity Fail=f c => jump Fail`, …) that the interpreter's generic semantics already satisfy. The only data-dependent rewrite — native-record/`Recs` resolution — is reproduced at runtime by the engine from the loaded module's own `Recs`. No transform changes observable behavior, so the missing ones are pure performance (a candidate for later); the sole genuine capability gap is the **foreign** native-record create form (a typed `unsupported` in the engine, never a wrong result). Never a correctness gap: `beam_engine`'s core `DeallocateReturn` arm executes exactly the two constituents in order.
 - **The `Instr::Generic` fallback is reached only from the single catch-all arm** (`src/lower/instr.rs:611-628`): every other arm either lowers to a named variant or returns a typed error on an operand-shape mismatch — no opcode lowers to `Generic` *conditionally*.
 - **Implicit mandatory chunks are more lenient than the legacy reader.** The C errors when `ImpT`
   (`beam_file.c:1667`) or `ExpT` (`beam_file.c:1675`) is absent; this loader requires only `AtU8` and
   `Code` and treats every other chunk as optional (`src/chunk/mod.rs:131-138`), returning an empty
   table instead of an error. Harmless for real images (which always carry both) — a divergence for
   stripped/hostile inputs only.
+- **The raw `DbgB` bytes are retained only transiently.** `Chunks::raw` carries them (for the module
+  checksum), but they are dropped once `build_module` assembles the `Module`, so nothing downstream can
+  reach the payload: `code:get_debug_info/1` parity (an A.8/introspection concern) would need the raw
+  payload exposed on `Module` — a documented future gap, not implemented here.
 - **Atoms are interned into a fresh per-module `AtomTable`**, not a shared `atom.names`-seeded table;
   positional/global atom identity for preloaded modules is a `beam_rt` concern.
 - **The in-tree MD5 is structural debt.** `src/checksum.rs` carries a self-contained RFC 1321 MD5
@@ -687,7 +693,7 @@ silently-accepted wrong value:
 - `src/chunk/types.rs` → `Type` chunk parser (`TypeTable`)
 - `src/chunk/literal.rs` → `LitT` framing parser (both the verbatim and the zlib/RFC1950-compressed form) → raw ETF payloads
 - `src/chunk/classify.rs` → `ChunkClass`/`ChunkKind`/`CHUNK_KINDS`/`classify`: the per-chunk-id classification (parsed+exposed / parsed-as-raw / tooling-only + reason) the corpus checker test enforces
-- `src/chunk/misc.rs` → `StrT` / `CInf` / `Attr` / `Meta` raw capture (`CInf`/`Meta` are decoded one layer up via `src/decoded.rs`; `DbgB`/`Dbgi` deliberately unparsed, tooling-only)
+- `src/chunk/misc.rs` → `StrT` / `CInf` / `Attr` / `Meta` raw capture (`CInf`/`Meta` are decoded one layer up via `src/decoded.rs`; `DbgB` — the legacy emulator debug table, retained raw only for the checksum — and `Dbgi` deliberately unparsed, tooling-only)
 - `src/chunk/record.rs` → `Recs` parser: `RawRecord`/`RawRecordField`/`RawRecordDefault` + `parse` (raw-tag defaults, declaration order)
 - `src/opcode.rs` → `Opcode` enum + name/number/arity roster (derived from `../../lib/compiler/src/genop.tab`) + the derived `OnceLock` arity lookup table `src/decode.rs` dispatches on
 - `src/operand.rs` → `Operand`/`Reg`/`TypeIndex`/`AllocKind`/`HeapNeed` types
