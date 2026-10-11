@@ -36,7 +36,12 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
 - `context.rs` — the `ModuleContext`/`Contexts` registry; `current_context`/`register_context`/`switch_context`/
   `module_context`.
 - `location.rs` — execution-position introspection (`current_code`, `current_function`, `current_location`,
-  `initial_call`, `current_stacktrace`).
+  `initial_call`, `current_stacktrace`, `current_module`/`active_context`) **and** the parked-`receive`
+  deadline seam `Machine::wait_deadline`/`timeout_delay` + `WaitDeadline { delay_ms, resume }`: it reads the
+  `wait_timeout` at `current_code` (the blocked instruction, exact because a blocking op is never JIT-inlined)
+  in the module `active_context()` names — the callee's own module when the park is inside a cross-module
+  callee (context != 0), else the passed entry module — and reports the `timeout` continuation (`pc + 1`) a
+  host re-enters when its own timer fires. The engine arms no timer: a non-zero `wait_timeout` just suspends.
 - `run.rs` — `run_export`/`run_label` (non-blocking) and `run_export_outcome`/`run_label_outcome`/`resume_outcome`
   (blocking-aware); the **tier-selecting** entries `run_with_tier`/`run_export_outcome_with_tier`/
   `run_label_outcome_with_tier` (first entry) and `resume_outcome_with_tier` (**resume** — a slice that suspended on a
