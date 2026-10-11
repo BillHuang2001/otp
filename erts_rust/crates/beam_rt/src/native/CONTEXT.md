@@ -680,9 +680,11 @@ All other constants are truthful defaults or derive from real state (`applicatio
 The per-call dispatch arm for every native BIF is a registration in `../native.rs` (one level up,
 outside *this* node's scope). The `("code","get_mode",0)` arm is reachable and agrees with the
 oracle (`interactive`), though the parent's module-doc table still omits it (the table now also lists
-`code:load_file/1` and the `init:stop/0,1`/`restart/0`/`boot/1` arms). The `file_server_2` service's
-remaining cross-node gap — a scheduled `gen_server:call` to the service (**`beam_engine`**) — is
-itemised in [`file_server/CONTEXT.md`](file_server/CONTEXT.md).
+`code:load_file/1` and the `init:stop/0,1`/`restart/0`/`boot/1` arms). The `file_server_2` service
+answers a **scheduled** process's `gen_server:call` — `file:read/2`/`file:read_line/1`/`io:*` from a
+`run` process complete through the ordinary `RunOutcome::Wait` suspend/resume
+(`../../tests/scheduled_io_device.rs`), so no cross-node gap remains (detail in
+[`file_server/CONTEXT.md`](file_server/CONTEXT.md)).
 
 ## See Also
 - `../CONTEXT.md` → the crate façade, the CLI/`system_info` surfaces, and the A.8 contract.
