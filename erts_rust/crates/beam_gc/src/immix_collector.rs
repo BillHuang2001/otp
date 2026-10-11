@@ -101,6 +101,7 @@ use crate::copy::{for_each_ref, forward_slot, move_size, EvacDest, Target};
 use crate::error::heap_exhausted;
 use crate::heap_info::HeapObservable;
 use crate::immix::{lines_for, ImmixSpace, ImmixStats, LINE_WORDS};
+use crate::nursery::Nursery;
 use crate::policy::HeapPolicy;
 use crate::space::{FromSet, HeapSpace};
 use crate::stats::GcStats;
@@ -237,8 +238,9 @@ type YoungScan = (usize, Vec<(*mut Eterm, Eterm)>);
 /// Reports the number of Immix **lines** a promotion of that graph will occupy (`needed`)
 /// and each nursery reference word pointing **into** `mature` (kept order-aligned with the
 /// mature terms they hold). Worklist-based, so a deep list cannot grow the real stack; the
-/// graph is a DAG, so the visited set also keeps `needed` an exact object count.
-fn scan_young(roots: &[Eterm], young: &HeapSpace, mature: &ImmixSpace) -> Result<YoungScan> {
+/// graph is a DAG, so the visited set also keeps `needed` an exact object count. `young` is
+/// the whole nursery chain, so a growth-retained space is scanned too.
+fn scan_young(roots: &[Eterm], young: &Nursery, mature: &ImmixSpace) -> Result<YoungScan> {
     let mut seen: HashSet<usize> = HashSet::new();
     let mut work: Vec<*mut Eterm> = Vec::new();
     let mut needed = 0usize;
@@ -282,10 +284,10 @@ fn scan_young(roots: &[Eterm], young: &HeapSpace, mature: &ImmixSpace) -> Result
     Ok((needed, refs))
 }
 
-/// Seeds the worklist with `term` when it is a live nursery object.
+/// Seeds the worklist with `term` when it is a live nursery-chained object.
 fn seed_young(
     term: Eterm,
-    young: &HeapSpace,
+    young: &Nursery,
     seen: &mut HashSet<usize>,
     work: &mut Vec<*mut Eterm>,
 ) {
@@ -306,7 +308,7 @@ fn seed_young(
 /// an [`ImmixSpace`] rather than a [`HeapSpace`].
 pub struct GenImmixCollector {
     policy: HeapPolicy,
-    young: HeapSpace,
+    nursery: Nursery,
     mature: ImmixSpace,
     minor_since_major: u32,
     stats: GcStats,
@@ -330,11 +332,11 @@ impl GenImmixCollector {
 
     /// Creates an Immix-backed collector with `policy`, backed by `alloc`.
     pub fn with_allocator(alloc: AllocRef, policy: HeapPolicy) -> Result<GenImmixCollector> {
-        let young = HeapSpace::with_allocator(alloc.clone(), policy.initial_young_words)?;
+        let nursery = Nursery::new(alloc.clone(), policy.initial_young_words)?;
         let mature = ImmixSpace::with_allocator(alloc, policy.initial_mature_words)?;
         Ok(GenImmixCollector {
             policy,
-            young,
+            nursery,
             mature,
             minor_since_major: 0,
             stats: GcStats::default(),
@@ -347,14 +349,25 @@ impl GenImmixCollector {
         &self.policy
     }
 
-    /// The young (nursery) copying space.
+    /// The young (nursery) space the mutator allocates in.
+    ///
+    /// A [growth](Self::grow_nursery) retains the space it replaced, so this is the **current**
+    /// space only: the retained ones are still part of the nursery for a collection and a
+    /// range test ([`young_contains`](Self::young_contains),
+    /// [`young_space_count`](Self::young_space_count)), but nothing new is allocated in them.
     pub fn young(&self) -> &HeapSpace {
-        &self.young
+        self.nursery.current()
     }
 
     /// The young (nursery) space, mutably — where the mutator allocates.
     pub fn young_mut(&mut self) -> &mut HeapSpace {
-        &mut self.young
+        self.nursery.current_mut()
+    }
+
+    /// The nursery chain, crate-visibly — the collection and range-test half of the nursery
+    /// ([`crate::live`]'s tests size a fullsweep from it).
+    pub(crate) fn nursery(&self) -> &Nursery {
+        &self.nursery
     }
 
     /// The mature mark-region space.
@@ -384,7 +397,7 @@ impl GenImmixCollector {
     }    /// Whether the nursery can no longer satisfy `need_words` more words — the same signal
     /// [`crate::Collector`] uses (an exact-fit allocation still fits).
     pub fn should_collect(&self, need_words: usize) -> bool {
-        self.young.available_words() < need_words
+        self.nursery.current().available_words() < need_words
     }
 
     /// Runs a collection, picking minor vs major by policy and escalating a would-not-fit
@@ -395,7 +408,7 @@ impl GenImmixCollector {
     /// escalation makes the major's in-place reclaim, rather than a doomed copy, the way
     /// room is found.
     pub fn collect(&mut self, roots: &mut [Eterm]) -> Result<Collection> {
-        let (needed, refs) = scan_young(roots, &self.young, &self.mature)?;
+        let (needed, refs) = scan_young(roots, &self.nursery, &self.mature)?;
         let tight = self.mature.free_lines() < needed;
         let kind = if self.policy.fullsweep_due(self.minor_since_major) || tight {
             CollectionKind::Major
@@ -415,7 +428,7 @@ impl GenImmixCollector {
     /// too-large minor is a typed heap exhaustion *before* a single word is copied (never a
     /// half-forwarded heap); [`collect`](Self::collect) escalates to a major instead.
     pub fn collect_minor(&mut self, roots: &mut [Eterm]) -> Result<GcStats> {
-        let (needed, _refs) = scan_young(roots, &self.young, &self.mature)?;
+        let (needed, _refs) = scan_young(roots, &self.nursery, &self.mature)?;
         if self.mature.free_lines() < needed {
             return Err(heap_exhausted(needed.saturating_mul(LINE_WORDS)));
         }
@@ -427,7 +440,7 @@ impl GenImmixCollector {
     /// Runs a **major** collection: reclaim the mature generation in place, then promote
     /// the nursery into it.
     pub fn collect_major(&mut self, roots: &mut [Eterm]) -> Result<GcStats> {
-        let (needed, refs) = scan_young(roots, &self.young, &self.mature)?;
+        let (needed, refs) = scan_young(roots, &self.nursery, &self.mature)?;
         let stats = self.run_major(roots, needed, refs)?;
         self.accumulate(&stats, CollectionKind::Major);
         Ok(stats)
@@ -438,7 +451,7 @@ impl GenImmixCollector {
     ///
     /// It collects once (a minor, escalated to a major when the promotion would not fit),
     /// then grows the now-empty nursery to the smallest curated size that covers
-    /// `need_words` (via the shared [`crate::collector::grow_nursery`]). The returned
+    /// `need_words` (via the shared [`crate::nursery::Nursery::grow`]). The returned
     /// [`Collection`] is the one it ran; afterwards `young().available_words() >= need_words`
     /// or the typed heap-exhaustion error is returned (never a half-forwarded heap, never an
     /// unbounded loop).
@@ -453,9 +466,39 @@ impl GenImmixCollector {
             return Err(heap_exhausted(need_words));
         }
         let collection = self.collect(roots)?;
-        crate::collector::grow_nursery(&mut self.young, &self.policy, need_words)?;
+        self.nursery.grow(&self.policy, need_words)?;
         Ok(collection)
     }
+
+    /// Enlarges the young nursery so a `need_words`-word allocation can proceed, **without
+    /// collecting and without moving any live term** — the no-relocation growth seam, the
+    /// [`crate::Collector::grow_nursery`] counterpart for the mark-region strategy.
+    ///
+    /// It is safe for a caller that holds no root set (so cannot collect): the space it
+    /// replaces is **retained** and every live word stays addressable at its original address,
+    /// so a chained nursery is just as collectable later as a single space
+    /// ([`young_contains`](Self::young_contains) covers the retained spaces and the next
+    /// collection evacuates them all). When the current space already has room this is a
+    /// no-op; when a [`max_heap_words`](HeapPolicy::max_heap_words) (or growth-table) ceiling
+    /// cannot reach the request, the typed heap-exhaustion
+    /// [`BeamError`](beam_common::BeamError) is returned and the collector is left untouched.
+    pub fn grow_nursery(&mut self, need_words: usize) -> Result<()> {
+        self.nursery.grow(&self.policy, need_words)
+    }
+
+    /// Whether `ptr` addresses a word of **any** nursery space — the current one or a retired
+    /// one a [growth](Self::grow_nursery) retained. The nursery-range test a host's
+    /// unscanned-root valve needs.
+    pub fn young_contains(&self, ptr: *const Eterm) -> bool {
+        self.nursery.contains(ptr)
+    }
+
+    /// How many spaces the nursery chain holds: `1` until a [growth](Self::grow_nursery)
+    /// retains a space, back to `1` once a collection collapses the chain.
+    pub fn young_space_count(&self) -> usize {
+        self.nursery.space_count()
+    }
+
     /// Folds one collection's [`GcStats`] into the collector's accumulated counters.
     fn accumulate(&mut self, stats: &GcStats, kind: CollectionKind) {
         self.stats.words_copied += stats.words_copied;
@@ -470,23 +513,27 @@ impl GenImmixCollector {
     /// Promotes the nursery's live terms into the mature space and resets the nursery.
     ///
     /// The caller has already checked that `mature.free_lines()` covers the promotion's
-    /// `needed` lines, so this never has to roll a half-finished copy back.
+    /// `needed` lines, so this never has to roll a half-finished copy back. Every space of a
+    /// chained nursery is promoted out of, and the chain is then
+    /// [collapsed](crate::nursery::Nursery::collapse) back to one space.
     fn run_minor(&mut self, roots: &mut [Eterm]) -> Result<GcStats> {
-        let mut from = PromoteFrom {
-            nursery: FromSet::new(),
+        let from = PromoteFrom {
+            nursery: {
+                let mut set = FromSet::new();
+                self.nursery.add_to_from_set(&mut set);
+                set
+            },
             mature: None,
         };
-        from.nursery.add(&self.young);
         let mut stats = promote(&from, &mut self.mature, roots)?;
-        let used = self.young.used_words();
+        let used = self.nursery.used_words();
         // The nursery words that were not promoted were garbage: promotion is the whole of
         // a minor's reclamation.
         stats.words_reclaimed = used.saturating_sub(stats.words_copied);
-        self.young.reset();
         self.minor_since_major += 1;
         // What the minor left in the nursery is exactly what it promoted (see
         // `HeapPolicy::young_after_collection`), never the pre-collection fill.
-        self.resize_nursery(stats.words_copied)?;
+        self.nursery.collapse(&self.policy, stats.words_copied)?;
         Ok(stats)
     }
 
@@ -511,7 +558,7 @@ impl GenImmixCollector {
         // pre-collection occupancy, whose garbage would make the policy's `should_grow`
         // fire on every fullsweep and creep the region up without bound (see
         // [`crate::live`]).
-        let live = crate::live::live_full(&self.young, &self.mature, roots);
+        let live = crate::live::live_full(self.nursery(), &self.mature, roots);
         let capacity = self.mature.capacity_words();
         let target = self.policy.mature_after_fullsweep(capacity, live.words, 0);
         if target != capacity {
@@ -539,22 +586,24 @@ impl GenImmixCollector {
             return self.grow_major(roots, needed, live.lines);
         }
 
-        let mut from = PromoteFrom {
-            nursery: FromSet::new(),
+        let from = PromoteFrom {
+            nursery: {
+                let mut set = FromSet::new();
+                self.nursery.add_to_from_set(&mut set);
+                set
+            },
             mature: None,
         };
-        from.nursery.add(&self.young);
-        let used = self.young.used_words();
+        let used = self.nursery.used_words();
         let mut stats = promote(&from, &mut self.mature, roots)?;
         let nursery_garbage = used.saturating_sub(stats.words_copied);
         // Total words reclaimed: the mature generation's in-place reclaim plus the nursery
         // words that died (they were never promoted).
         stats.words_reclaimed = immix.words_reclaimed + nursery_garbage;
-        self.young.reset();
         self.minor_since_major = 0;
         // The fullsweep promoted the nursery's live words into the mature region, so the
         // nursery's surviving occupancy is zero and the resize can only shrink it.
-        self.resize_nursery(0)?;
+        self.nursery.collapse(&self.policy, 0)?;
         Ok(stats)
     }
 
@@ -632,7 +681,7 @@ impl GenImmixCollector {
         target: usize,
         live_lines: usize,
     ) -> Result<GcStats> {
-        let used = self.young.used_words();
+        let used = self.nursery.used_words();
         let before = self.mature.used_words().saturating_add(used);
 
         let alloc = self.mature.allocator().clone();
@@ -657,7 +706,7 @@ impl GenImmixCollector {
             let from = PromoteFrom {
                 nursery: {
                     let mut set = FromSet::new();
-                    set.add(&self.young);
+                    self.nursery.add_to_from_set(&mut set);
                     set
                 },
                 mature: Some(&self.mature),
@@ -668,30 +717,13 @@ impl GenImmixCollector {
             stats
         };
         stats.words_reclaimed = before.saturating_sub(stats.words_copied);
-        self.young.reset();
         self.minor_since_major = 0;
         // No in-place reclaim ran, so there is nothing to report for it.
         self.last_immix = None;
         // The relocation copied every live word — the nursery's included — into the fresh
         // mature region, so the nursery's surviving occupancy is zero.
-        self.resize_nursery(0)?;
+        self.nursery.collapse(&self.policy, 0)?;
         Ok(stats)
-    }
-
-    /// Sizes the (now empty) nursery for the next round from the heap-size policy
-    /// ([`HeapPolicy::young_after_collection`]) — the same bounded rule the copying
-    /// [`crate::Collector`] applies: `live_words` is what the collection left *in the
-    /// nursery* (the promoted words for a minor, `0` after a fullsweep), and the capacity
-    /// never grows merely because a collection ran. The space is only replaced when the
-    /// target differs.
-    fn resize_nursery(&mut self, live_words: usize) -> Result<()> {
-        let capacity = self.young.capacity_words();
-        let target = self.policy.young_after_collection(capacity, live_words);
-        if target != capacity {
-            let alloc = self.young.allocator().clone();
-            self.young = HeapSpace::with_allocator(alloc, target)?;
-        }
-        Ok(())
     }
 }
 
@@ -701,15 +733,16 @@ impl HeapObservable for GenImmixCollector {
         self.minor_since_major
     }
 
-    /// The nursery (the "heap" in the C sense) capacity, in words.
+    /// The nursery (the "heap" in the C sense) capacity, in words — the **summed** capacity of
+    /// every nursery space, so a chained nursery reports its full size.
     fn heap_size_words(&self) -> usize {
-        self.young.capacity_words()
+        self.nursery.capacity_words()
     }
 
     /// The nursery plus the mark-region mature generation (the C's `heap_sz + old heap`),
     /// in words.
     fn total_heap_size_words(&self) -> usize {
-        self.young.capacity_words() + self.mature.capacity_words()
+        self.nursery.capacity_words() + self.mature.capacity_words()
     }
 
     fn heap_policy(&self) -> &HeapPolicy {

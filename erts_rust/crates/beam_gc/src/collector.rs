@@ -35,6 +35,7 @@ use beam_term::prelude::Eterm;
 use crate::copy::Copier;
 use crate::error::heap_exhausted;
 use crate::heap_info::HeapObservable;
+use crate::nursery::Nursery;
 use crate::policy::HeapPolicy;
 use crate::space::{FromSet, HeapSpace};
 use crate::stats::GcStats;
@@ -59,7 +60,7 @@ pub struct Collection {
 /// The two-generation collector owning the young and mature spaces.
 pub struct Collector {
     policy: HeapPolicy,
-    young: HeapSpace,
+    nursery: Nursery,
     mature: HeapSpace,
     minor_since_major: u32,
     stats: GcStats,
@@ -73,11 +74,11 @@ impl Collector {
 
     /// Creates a collector with the given `policy`, backed by `alloc`.
     pub fn with_allocator(alloc: AllocRef, policy: HeapPolicy) -> Result<Collector> {
-        let young = HeapSpace::with_allocator(alloc.clone(), policy.initial_young_words)?;
+        let nursery = Nursery::new(alloc.clone(), policy.initial_young_words)?;
         let mature = HeapSpace::with_allocator(alloc, policy.initial_mature_words)?;
         Ok(Collector {
             policy,
-            young,
+            nursery,
             mature,
             minor_since_major: 0,
             stats: GcStats::default(),
@@ -89,14 +90,25 @@ impl Collector {
         &self.policy
     }
 
-    /// The young (nursery) space.
+    /// The young (nursery) space the mutator allocates in.
+    ///
+    /// A [growth](Self::grow_nursery) retains the space it replaced, so this is the **current**
+    /// space only: the retained ones are still part of the nursery for a collection and a
+    /// range test ([`young_contains`](Self::young_contains),
+    /// [`young_space_count`](Self::young_space_count)), but nothing new is allocated in them.
     pub fn young(&self) -> &HeapSpace {
-        &self.young
+        self.nursery.current()
     }
 
     /// The young (nursery) space, mutably — where the mutator allocates.
     pub fn young_mut(&mut self) -> &mut HeapSpace {
-        &mut self.young
+        self.nursery.current_mut()
+    }
+
+    /// The nursery chain, crate-visibly — the collection and range-test half of the nursery
+    /// ([`crate::live`]'s tests size a fullsweep from it).
+    pub(crate) fn nursery(&self) -> &Nursery {
+        &self.nursery
     }
 
     /// The mature space.
@@ -117,14 +129,14 @@ impl Collector {
 
     /// Whether the nursery can no longer satisfy `need_words` more words.
     pub fn should_collect(&self, need_words: usize) -> bool {
-        self.young.available_words() < need_words
+        self.nursery.current().available_words() < need_words
     }
 
     /// Runs a collection, picking minor vs major by policy and escalating a
     /// would-not-fit minor to a major.
     pub fn collect(&mut self, roots: &mut [Eterm]) -> Result<Collection> {
         let kind = if self.policy.fullsweep_due(self.minor_since_major)
-            || self.mature.available_words() < self.young.used_words()
+            || self.mature.available_words() < self.nursery.used_words()
         {
             CollectionKind::Major
         } else {
@@ -144,15 +156,17 @@ impl Collector {
     /// not; a **direct** call instead reports the typed heap exhaustion *before* a single
     /// word is copied, so a too-small mature space can never leave the nursery
     /// half-forwarded.
+    ///
+    /// Every space of a chained nursery is evacuated, and the chain is then
+    /// [collapsed](crate::nursery::Nursery::collapse) back to one space.
     pub fn collect_minor(&mut self, roots: &mut [Eterm]) -> Result<GcStats> {
-        let needed = self.young.used_words();
+        let needed = self.nursery().used_words();
         if self.mature.available_words() < needed {
             return Err(heap_exhausted(needed));
         }
         let mut from = FromSet::new();
-        from.add(&self.young);
+        self.nursery.add_to_from_set(&mut from);
         let stats = Copier::new(&from, &mut self.mature).run(roots)?;
-        self.young.reset();
         self.minor_since_major += 1;
         self.stats.words_copied += stats.words_copied;
         self.stats.words_reclaimed += stats.words_reclaimed;
@@ -164,7 +178,7 @@ impl Collector {
         // surviving usage (`erl_gc.c:1493`). Never the pre-collection fill: a nursery is only
         // collected when it is full, so that stale count is ≈ the capacity and would grow the
         // nursery on every collection, without bound.
-        self.resize_nursery(stats.words_copied)?;
+        self.nursery.collapse(&self.policy, stats.words_copied)?;
         Ok(stats)
     }
 
@@ -175,9 +189,12 @@ impl Collector {
     /// [`max_heap_words`](HeapPolicy::max_heap_words) clamp that size below the live set,
     /// the typed heap exhaustion is returned *before* a single word is copied rather than
     /// mid-copy.
+    ///
+    /// Every space of a chained nursery is evacuated, and the chain is then
+    /// [collapsed](crate::nursery::Nursery::collapse) back to one space.
     pub fn collect_major(&mut self, roots: &mut [Eterm]) -> Result<GcStats> {
         let mut from = FromSet::new();
-        from.add(&self.young);
+        self.nursery.add_to_from_set(&mut from);
         from.add(&self.mature);
         // Size the fresh space from the **exact live word count** of the graph this
         // fullsweep evacuates — the C `adjust_after_fullsweep`'s
@@ -194,7 +211,7 @@ impl Collector {
         let size = self
             .policy
             .mature_after_fullsweep(self.mature.capacity_words(), live, 0);
-        let alloc = self.young.allocator().clone();
+        let alloc = self.nursery().current().allocator().clone();
         // Sized up front so the copy always fits — a collection never leaves the
         // from-space half-forwarded. With `live` exact, this is an exact fit test rather
         // than an upper bound.
@@ -207,7 +224,6 @@ impl Collector {
         }
         let stats = Copier::new(&from, &mut fresh).run(roots)?;
         self.mature = fresh; // drops the old mature space
-        self.young.reset();
         self.minor_since_major = 0;
         self.stats.words_copied += stats.words_copied;
         self.stats.words_reclaimed += stats.words_reclaimed;
@@ -217,7 +233,7 @@ impl Collector {
         // mature space, so the nursery's surviving occupancy is now zero: the resize can only
         // bring it down towards its reserved minimum, never up (sizing it from the live set
         // would make the nursery track the mature generation's contents).
-        self.resize_nursery(0)?;
+        self.nursery.collapse(&self.policy, 0)?;
         Ok(stats)
     }
 
@@ -249,56 +265,37 @@ impl Collector {
             return Err(heap_exhausted(need_words));
         }
         let collection = self.collect(roots)?;
-        grow_nursery(&mut self.young, &self.policy, need_words)?;
+        self.nursery.grow(&self.policy, need_words)?;
         Ok(collection)
     }
 
-    /// Sizes the (now empty) nursery for the next round from the heap-size policy
-    /// ([`HeapPolicy::young_after_collection`]), where `live_words` is the number of words the
-    /// collection **left in the nursery** — the promoted words for a minor, `0` after a
-    /// fullsweep. A nursery the round left mostly empty shrinks, one that is already about
-    /// right keeps its size, and the capacity never grows merely because a collection ran (see
-    /// that method's contract); the space is only replaced when the target differs, so a
-    /// steady-state workload pays nothing.
-    fn resize_nursery(&mut self, live_words: usize) -> Result<()> {
-        let capacity = self.young.capacity_words();
-        let target = self.policy.young_after_collection(capacity, live_words);
-        if target != capacity {
-            let alloc = self.young.allocator().clone();
-            self.young = HeapSpace::with_allocator(alloc, target)?;
-        }
-        Ok(())
+    /// Enlarges the young nursery so a `need_words`-word allocation can proceed, **without
+    /// collecting and without moving any live term** — the no-relocation growth seam.
+    ///
+    /// It is safe for a caller that holds no root set (so cannot collect): the space it
+    /// replaces is **retained** and every live word stays addressable at its original address,
+    /// so a chained nursery is just as collectable later as a single space
+    /// ([`young_contains`](Self::young_contains) covers the retained spaces and the next
+    /// collection evacuates them all). When the current space already has room this is a
+    /// no-op; when a [`max_heap_words`](HeapPolicy::max_heap_words) (or growth-table) ceiling
+    /// cannot reach the request, the typed heap-exhaustion
+    /// [`BeamError`](beam_common::BeamError) is returned and the collector is left untouched.
+    pub fn grow_nursery(&mut self, need_words: usize) -> Result<()> {
+        self.nursery.grow(&self.policy, need_words)
     }
-}
 
-/// Grows an **empty** nursery to the smallest size the policy allows that covers
-/// `need_words`, or returns the typed heap exhaustion when no such size exists.
-///
-/// Shared by both mature-generation strategies (the copying [`Collector`] and
-/// [`crate::GenImmixCollector`]) so the growth arithmetic lives in exactly one place. The
-/// caller has just collected, so `nursery` is empty: this only ever *replaces* it with a
-/// larger space, never moving a live term. Each step targets
-/// `policy.next_words(need_words, 0)` (the smallest curated size that covers the request,
-/// floored by [`min_heap_words`](HeapPolicy::min_heap_words) and clamped by
-/// [`max_heap_words`](HeapPolicy::max_heap_words)); the loop is bounded because it stops as
-/// soon as the target no longer exceeds the current capacity.
-pub(crate) fn grow_nursery(
-    nursery: &mut HeapSpace,
-    policy: &HeapPolicy,
-    need_words: usize,
-) -> Result<()> {
-    while nursery.available_words() < need_words {
-        let capacity = nursery.capacity_words();
-        let target = policy.next_words(need_words, 0);
-        if target <= capacity {
-            // The policy's ceiling (or the growth table's) leaves no room to grow, so
-            // `need_words` is unreachable under this policy.
-            return Err(heap_exhausted(need_words));
-        }
-        let alloc = nursery.allocator().clone();
-        *nursery = HeapSpace::with_allocator(alloc, target)?;
+    /// Whether `ptr` addresses a word of **any** nursery space — the current one or a retired
+    /// one a [growth](Self::grow_nursery) retained. The nursery-range test a host's
+    /// unscanned-root valve needs.
+    pub fn young_contains(&self, ptr: *const Eterm) -> bool {
+        self.nursery.contains(ptr)
     }
-    Ok(())
+
+    /// How many spaces the nursery chain holds: `1` until a [growth](Self::grow_nursery)
+    /// retains a space, back to `1` once a collection collapses the chain.
+    pub fn young_space_count(&self) -> usize {
+        self.nursery.space_count()
+    }
 }
 
 impl HeapObservable for Collector {
@@ -307,14 +304,15 @@ impl HeapObservable for Collector {
         self.minor_since_major
     }
 
-    /// The nursery (the "heap" in the C sense) capacity, in words.
+    /// The nursery (the "heap" in the C sense) capacity, in words — the **summed** capacity of
+    /// every nursery space, so a chained nursery reports its full size.
     fn heap_size_words(&self) -> usize {
-        self.young.capacity_words()
+        self.nursery.capacity_words()
     }
 
     /// The nursery plus the mature generation (the C's `heap_sz + old heap`), in words.
     fn total_heap_size_words(&self) -> usize {
-        self.young.capacity_words() + self.mature.capacity_words()
+        self.nursery.capacity_words() + self.mature.capacity_words()
     }
 
     fn heap_policy(&self) -> &HeapPolicy {

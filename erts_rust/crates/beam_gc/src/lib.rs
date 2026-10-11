@@ -58,6 +58,7 @@ pub mod immix;
 pub mod immix_collector;
 pub(crate) mod live; // the read-only live-graph counter — NOT public
 pub mod mso;
+mod nursery; // the young nursery chain (the no-relocation growth seam) — NOT public
 pub mod policy;
 pub mod selection;
 pub mod space;

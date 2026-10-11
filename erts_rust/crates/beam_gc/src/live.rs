@@ -66,7 +66,8 @@ use beam_term::prelude::{is_header, primary_tag, ptr_val, Eterm, PrimaryTag};
 
 use crate::copy::{for_each_ref, move_size};
 use crate::immix::{lines_for, ImmixSpace};
-use crate::space::{FromSet, HeapSpace};
+use crate::nursery::Nursery;
+use crate::space::FromSet;
 
 /// The exact size of the live graph a fullsweep has to evacuate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,12 +137,13 @@ pub(crate) fn live(from: &FromSet, roots: &[Eterm]) -> Live {
     Live { words, lines }
 }
 
-/// Counts the graph a **mark-region** fullsweep evacuates: the nursery's live region, plus
-/// the whole span of the mark-region mature space (that space's own `contains` covers its
-/// free lines as well, so its from-range is `base .. base + capacity`).
-pub(crate) fn live_full(nursery: &HeapSpace, mature: &ImmixSpace, roots: &[Eterm]) -> Live {
+/// Counts the graph a **mark-region** fullsweep evacuates: the nursery's live region (every
+/// space of a chained nursery), plus the whole span of the mark-region mature space (that
+/// space's own `contains` covers its free lines as well, so its from-range is
+/// `base .. base + capacity`).
+pub(crate) fn live_full(nursery: &Nursery, mature: &ImmixSpace, roots: &[Eterm]) -> Live {
     let mut from = FromSet::new();
-    from.add(nursery);
+    nursery.add_to_from_set(&mut from);
     let base = mature.base() as usize;
     from.add_range(base, base + mature.capacity_words() * size_of::<Eterm>());
     live(&from, roots)
@@ -229,6 +231,7 @@ mod tests {
     use beam_term::prelude::{make_small, ptr_val, NIL};
 
     use crate::copy::Copier;
+    use crate::space::HeapSpace;
 
     use super::*;
 
@@ -513,7 +516,7 @@ mod tests {
             );
         }
 
-        let counted = live_full(collector.young(), collector.mature(), &roots);
+        let counted = live_full(collector.nursery(), collector.mature(), &roots);
         assert_eq!(counted.words, 8 * 4, "8 four-word tuples");
         assert_eq!(counted.lines, 8, "one line per tuple");
 
@@ -630,7 +633,7 @@ mod tests {
             );
         }
 
-        let counted = live_full(c.young(), c.mature(), &roots);
+        let counted = live_full(c.nursery(), c.mature(), &roots);
         assert_eq!(counted.words, 12 * 3 + 4 * 17, "twelve 3-word and four 17-word tuples");
         assert_eq!(counted.lines, 12 + 4 * 2, "one line each, two for the 17-word tuples");
         assert_eq!(
@@ -683,7 +686,7 @@ mod tests {
         }
 
         let mut roots = vec![left, right, a, shared, b];
-        let counted = live_full(c.young(), c.mature(), &roots);
+        let counted = live_full(c.nursery(), c.mature(), &roots);
         assert_eq!(
             counted.words,
             3 + 3 + 3 + 2 + 2,
@@ -719,7 +722,7 @@ mod tests {
             );
         }
 
-        let counted = live_full(c.young(), c.mature(), &roots);
+        let counted = live_full(c.nursery(), c.mature(), &roots);
         assert_eq!((counted.words, counted.lines), (104, 20));
 
         assert_eq!(c.mature().used_lines(), 0);
@@ -776,7 +779,7 @@ mod tests {
         assert_eq!(size_object(fun), fun_words(FunKind::Local, 2));
 
         let mut roots = vec![map, fun];
-        let counted = live_full(c.young(), c.mature(), &roots);
+        let counted = live_full(c.nursery(), c.mature(), &roots);
         assert_eq!(
             counted.words,
             size_object(map) + size_object(fun),
@@ -807,7 +810,7 @@ mod tests {
                 .expect("a holder tuple"),
         );
 
-        let counted = live_full(c.young(), c.mature(), &roots);
+        let counted = live_full(c.nursery(), c.mature(), &roots);
         assert_eq!(counted.words, 6 * 8 + 3, "six 8-word handles plus a 3-word tuple");
         assert_eq!(counted.lines, 6 * 2 + 1, "two lines per pair, one for the holder");
 

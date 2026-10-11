@@ -100,10 +100,10 @@ fn nursery_cells(c: &mut GenImmixCollector, back_reference: Eterm) -> Vec<Eterm>
 /// promotion's exact line count, and the exact line need of the whole live set the
 /// fallback has to relocate (what `run_major` passes through to `grow_major`).
 fn reach_the_in_place_shortfall(c: &mut GenImmixCollector, roots: &mut [Eterm]) -> (usize, usize) {
-    let (needed, refs) = scan_young(roots, &c.young, &c.mature).expect("scan the nursery");
+    let (needed, refs) = scan_young(roots, c.nursery(), &c.mature).expect("scan the nursery");
     // The exact live line need, read *before* the reclaim moves anything (the counter is
     // read-only, the reclaim is not).
-    let live_lines = crate::live::live_full(&c.young, &c.mature, roots).lines;
+    let live_lines = crate::live::live_full(c.nursery(), &c.mature, roots).lines;
     let mut promoted: Vec<Eterm> = refs.iter().map(|(_, term)| *term).collect();
     c.mature
         .collect(roots, &mut promoted)

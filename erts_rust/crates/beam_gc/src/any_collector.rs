@@ -281,6 +281,44 @@ impl AnyCollector {
             AnyCollector::Immix(c) => c.ensure_capacity(need_words, roots),
         }
     }
+
+    /// Enlarges the young nursery so a `need_words`-word allocation can proceed, **without
+    /// collecting and without moving any live term** — forwarded to whichever strategy is
+    /// selected (both expose the identical seam): [`Collector::grow_nursery`] /
+    /// [`GenImmixCollector::grow_nursery`].
+    ///
+    /// It is safe for a caller that holds no root set: the space it replaces is retained (the
+    /// nursery becomes a chain of spaces), so every live word stays addressable at its original
+    /// address. When the policy's [`max_heap_words`](HeapPolicy::max_heap_words) (or the growth
+    /// table's ceiling) cannot reach the request the typed heap-exhaustion error is returned
+    /// instead. This is strategy-agnostic — the caller does not need to know which mature
+    /// generation is in use.
+    pub fn grow_nursery(&mut self, need_words: usize) -> Result<()> {
+        match self {
+            AnyCollector::Copying(c) => c.grow_nursery(need_words),
+            AnyCollector::Immix(c) => c.grow_nursery(need_words),
+        }
+    }
+
+    /// Whether `ptr` addresses a word of **any** nursery space (current or one a
+    /// [growth](AnyCollector::grow_nursery) retained) — forwarded to whichever strategy is
+    /// selected, so the answer is strategy-agnostic.
+    pub fn young_contains(&self, ptr: *const Eterm) -> bool {
+        match self {
+            AnyCollector::Copying(c) => c.young_contains(ptr),
+            AnyCollector::Immix(c) => c.young_contains(ptr),
+        }
+    }
+
+    /// How many spaces the nursery chain holds (`1`, or more after a
+    /// [growth](AnyCollector::grow_nursery) retained a space) — forwarded to whichever
+    /// strategy is selected, so the answer is strategy-agnostic.
+    pub fn young_space_count(&self) -> usize {
+        match self {
+            AnyCollector::Copying(c) => c.young_space_count(),
+            AnyCollector::Immix(c) => c.young_space_count(),
+        }
+    }
 }
 
 impl HeapObservable for AnyCollector {
