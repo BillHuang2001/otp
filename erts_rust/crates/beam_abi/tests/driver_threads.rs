@@ -43,7 +43,9 @@
 //! unlock/destroy, a genuine cross-thread `erl_drv_cond_wait`/`signal`/`broadcast` handshake, the
 //! read/write-lock round trip, per-thread TSD values across threads, thread create/name/join with
 //! `erl_drv_thread_self`/`erl_drv_equal_tids` evaluated *inside* the worker, `erl_drv_thread_exit`
-//! delivering its response, and the thread-options record.
+//! delivering its response, the thread-options record, and the four `*_name` accessors in all three
+//! states: a handle created with a NULL name reports the C's static `"unknown"`, a named handle its
+//! name, and a NULL handle `NULL` (commands 10-12).
 //! What is *not* proven here: a real emulator port table behind the driver — the test host is
 //! `common::TestDriverHost`, so "the port is really live in an emulator" is a `beam_rt` concern.
 //!
@@ -119,7 +121,7 @@ const FIXTURE_IMPORTS: [&str; 35] = [
 
 /// Every `control` command the fixture answers with `1` when its assertions held, plus the
 /// documented no-op (`0` → `0`) and the unknown-command marker (`99` → `-100`).
-const COMMANDS: [(u32, c_int); 11] = [
+const COMMANDS: [(u32, c_int); 14] = [
     (0, 0),
     (1, 1),
     (2, 1),
@@ -130,14 +132,21 @@ const COMMANDS: [(u32, c_int); 11] = [
     (7, 1),
     (8, 1),
     (9, 1),
+    (10, 1),
+    (11, 1),
+    (12, 1),
     (99, -100),
 ];
 
 /// The commands the *oracle* may drive: everything except command 8, whose refusals are this
-/// layer's documented behaviour where the C `erts_exit`s (`erl_drv_thread.c:523,545,670,692,712`)
+/// layer's documented behaviour where the C `erts_exit`s (`erl_drv_thread.c:523,545,670,692,712`),
 /// and except command 9, which needs the `start`-returned private state that a `spawn_driver` port
 /// does provide but whose assertion is Rust-side only.
-const ORACLE_COMMANDS: [u32; 9] = [0, 1, 2, 3, 4, 5, 6, 7, 99];
+///
+/// Commands 10-12 (the `*_name` accessors on an unnamed, a named and a NULL handle) **are** driven by
+/// the oracle: they are exactly the C contract `erl_drv_thread.c:99,135,170,198,264,283,341,365,678`
+/// defines, so both runtimes must answer the same on them.
+const ORACLE_COMMANDS: [u32; 12] = [0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 99];
 
 // ---------------------------------------------------------------------------------------------
 // Helpers (the same idiom as `tests/driver_lifecycle.rs`)
