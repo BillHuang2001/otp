@@ -77,25 +77,12 @@
 //! # Why the default is the native tier
 //!
 //! The tier costs nothing observable (it is interpreter-identical, including every `RunOutcome`
-//! suspension address and every typed error) and never regresses a workload, so the **default
-//! selects the baseline tier for every process entry**. Measured on a release build with no
-//! per-process `erl` start-up (the system code path resolves natively from the filesystem),
-//! alternating runs, min wall seconds:
-//!
-//! | workload | shape | interpreter | baseline (the default) |
-//! |---|---|---|---|
-//! | `slice:fib/1 300000` (committed fixture) | bignum loop | 0.141 s | 0.113 s |
-//! | `preempt:alloc_loop/1 200000` (committed fixture) | allocating `test_heap` loop, pre-empted every slice | 4.51 s | 0.298 s |
-//!
-//! The `preempt` row is the shape that used to be *refused* the JIT entirely: `alloc_loop/1`
-//! allocates in every iteration, so the slice's reduction budget pre-empts it at a
-//! `test_heap` admission point and the process is resumed — on the remembered tier — many
-//! times. With the tier carried across a resume and no switch-safety gate to fail, it keeps the
-//! native tier for its whole life instead of running every slice on the interpreter.
+//! suspension address and every typed error), so the **default selects the baseline tier for
+//! every process entry**; measured workload figures live in `erts_rust/tools/bench/RESULTS.md`
+//! and are re-measured there rather than transcribed here.
 //!
 //! [`BEAM_RT_TIER=interpreter`](JitMode::Interpreter) is the kill switch that pins the
-//! reference tier; the pre-JIT measurements and every differential-gate baseline are taken
-//! there.
+//! reference tier; every differential-gate baseline is taken there.
 
 use std::sync::OnceLock;
 
