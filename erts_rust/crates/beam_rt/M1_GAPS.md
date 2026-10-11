@@ -378,12 +378,6 @@ re-fetch.
   `ets:new/2` path via `Runtime::own_heir_gift`), and this runtime mints an unnamed table's tid ref via
   `runtime::ets_owner::tid_ref_thing` (a shared `beam_bifs::access::make_ref_thing` or
   `MonitorRef::from_id(u64)` would remove that loop).
-* **`beam_gc` — peak RSS still grows in N.** The retained set grows because `beam_gc`'s `resize_nursery`
-  feeds `young_after_collection` the **pre-reset** used count, and `young_after_collection`
-  (`src/policy.rs`) steps one growth-table entry upward (`next_words(…, 1)`) rather than settling on the
-  C's fixed point, so a process under sustained allocation steps up once per collection and never reaches
-  a steady state (`collect_major`'s transient is ≈2×). `memory(system)` is flat, so no `beam_rt` change
-  is the lever — the sizing policy is `beam_gc`'s.
 * **`beam_io` — the port table sits behind one `RefCell`.** `Runtime::with_port_table` is the short-borrow
   seam and the quiescence predicate reads `PortRegistry::has_nothing_to_poll`, but `beam_io::PortRegistry`
   keeps its `ids` port-number table private behind the same single `RefCell` as the live ports, so the
