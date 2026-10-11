@@ -728,10 +728,10 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   under-matched); `self/0` resolves through the thread-local `SelfHook` seam (`set_self_hook`) and its
   default is the typed `badarg` — the ETS layer has no process identity, so without an installed hook a
   `self/0` guard clause is skipped and a `self/0` body is `badarg` (the oracle evaluates it against the
-  calling process: a semantic under-match); `abs/1`/`bnot/1` on a bignum, `trunc`/`round`/`ceil`/`floor`
-  beyond the 60-bit small range, and integer arithmetic whose result leaves the 60-bit small range (incl.
-  a bignum operand) via `DefaultArithHook` are the typed `unsupported_ets` (float `+ - * /` **is**
-  computed); `binary_part/2,3` on a non-byte-aligned source is `badarg`, as the oracle.
+  calling process: a semantic under-match); integer arithmetic whose result leaves the 60-bit small range
+  (incl. a bignum operand) via `DefaultArithHook` is the typed `unsupported_ets` (float `+ - * /` **is**
+  computed; `abs`/`bnot`/`trunc`/`round`/`ceil`/`floor` do handle bignums — see `select/CONTEXT.md`);
+  `binary_part/2,3` on a non-byte-aligned source is `badarg`, as the oracle.
   `byte_size`/
   `bit_size` on an off-heap refc binary are **parity** (the `[BinRef][ErlSubBits]` root classifies as a
   bitstring). A match-spec **body** runtime failure yields the atom `EXIT` resolved from the caller's
