@@ -48,7 +48,7 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
 
 ### `live.rs` — the exact-live counter
 - `pub(crate) fn live(from: &FromSet, roots: &[Eterm]) -> Live`;
-  `pub(crate) fn live_full(young: &HeapSpace, mature: &ImmixSpace, roots: &[Eterm]) -> Live`;
+  `pub(crate) fn live_full(nursery: &Nursery, mature: &ImmixSpace, roots: &[Eterm]) -> Live`;
   `pub(crate) struct Live { pub words: usize, pub lines: usize }` — `words` = the exact
   `GcStats::words_copied` a copy would report; `lines` = the per-object `lines_for` sum line-granular
   allocation charges (not `lines_for(words)`, which rounds the total once).
