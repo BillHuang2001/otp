@@ -74,6 +74,15 @@
 //! [`Tier::Interpreter`](beam_engine::Tier::Interpreter) delegates to the plain
 //! [`Machine::resume_outcome`](beam_engine::Machine::resume_outcome).
 //!
+//! The remembered tier is observable only at such a **slice boundary**: a process that runs to
+//! completion inside its first slice never re-enters, and the budget is charged only at the
+//! engine's heap-admission points (`test_heap`/`allocate_heap`), so a binary-accumulating or
+//! `call_ext`-only hot loop charges nothing and never pre-empts. That is why the tier is selected
+//! **eagerly at the first entry** rather than after a bounded warm-up on the interpreter: the
+//! warm-up was measured and declined because it would pin exactly those zero-charge hot loops to
+//! the reference tier for their whole life. The verified characterisation (with figures) is in
+//! `PERF.md`.
+//!
 //! # Why the default is the native tier
 //!
 //! The tier costs nothing observable (it is interpreter-identical, including every `RunOutcome`

@@ -352,19 +352,104 @@ registered-BIF round trip to **~79–96 ns/call**, a **≈ 3.5×** reduction, wh
 interpreter pinned, *every* loop (inlined or not) is ~715–751 ns/call, because the interpreter has no
 native `gc_bif` fast path.
 
+## The one-shot cold-start cost — verified characterisation
+
+**The single biggest caveat in the `AFTER` table**: the always-JIT default regresses a
+**short-lived process that enters a large Erlang module graph**, because the baseline tier
+**compiles a module on its first entry** and a one-shot process never amortises it.
+
+Re-verified on the current tree (`86c09ad30c`) with the same `--full` focused cross-runtime pass,
+**3 default passes + 3 `BEAM_RT_TIER=interpreter` passes**, block-interleaved, each column the
+**min over its 3** (host 1-min `/proc/loadavg` ≈ 11–30 throughout):
+
+| workload | case | metric | default (min3) | `BEAM_RT_TIER=interpreter` (min3) | default/interp |
+|---|---|---|---|---|---|
+| `slice` | `string_str_length` | `wall_ms` | **345.03** | **30.62** | **11.27× worse** |
+| `slice` | `queue_from_size` | `wall_ms` | 24.28 | 15.04 | 1.61× worse |
+| `slice` | `add` / `fib` | `wall_ms` | 12.41 / 12.69 | 12.55 / 13.34 | 0.99× / 0.95× |
+| `foreign` | `cowboy_bstr:to_lower/1` | `ns_per_call` | 17 038 | 20 401 | **0.835×** |
+| `foreign` | `cowboy_bstr:capitalize_token/1` | `ns_per_call` | 20 879 | 25 077 | **0.833×** |
+| `foreign` | `emqx_base62:encode/1` | `ns_per_call` | 8 665 | 12 182 | **0.711×** |
+| `foreign` | `emqx_base62:decode/1` | `ns_per_call` | 15 243 | 19 339 | **0.788×** |
+| `list_walk` | — | `ns_per_element` | 141.66 | 143.42 | 0.988× |
+| `copy_bound` | `etf_roundtrip` / `ets_copy` | `ns_per_op` | 83 313 / 3 458 | 81 271 / 3 332 | 1.025× / 1.038× |
+| `copy_bound` | `send_recv` | `ns_per_op` | 216 416 | 146 084 | **1.481× worse** |
+| `gc_bound` | `churn` | `ns_per_op` | 128 662 | 263 375 | **0.489×** |
+| `baseline` | — | `startup_ms` | 13.11 | 12.54 | 1.046× |
+
+The tier effect is therefore: a **1.2×–1.4× win** on `foreign`, a **2× win** on `gc_bound churn`,
+neutral on `list_walk`/`baseline`/`copy_bound`'s `etf_roundtrip`+`ets_copy`, and a **regression**
+on the three cases that re-enter a fresh module graph on a short-lived process
+(`string_str_length` 11.3×, `queue_from_size` 1.61×, `send_recv` 1.48×).
+
+**It is a per-`beam_rt`-OS-process cold start, amortised inside a long-running node — not a per-call
+cost, and not a per-process cost.** Two facts fix the shape:
+
+1. **The compiled-block cache is one `thread_local!` per OS thread, shared by every process**
+   (`crates/beam_engine/src/jit/cache.rs`: `thread_local! { static CODE_CACHE: RefCell<CodeCache> = … }`,
+   keyed by `ModuleKey { name, fingerprint }` over a deterministic hash of the decoded IR). Every
+   `beam_rt` execution is on one thread, so a long-running node (EMQX/Cowboy behind this runtime)
+   compiles a given module **once** and every later process on it reuses the artifact. The regression
+   is only ever paid by a **fresh `beam_rt` OS process** that enters a big module graph and exits.
+2. **Every regressing bench row is exactly that shape.** `tools/bench/src/workloads/slice.rs`'s
+   `execute_case` spawns a **new OS process per sample** (`for _ in 0..runs { Command::new(program) … }`,
+   `runs_for(Full) = 25`) and `slice` is scored as **whole-process wall** — so each of the 25 samples
+   pays the full compile. In one process the work is one-shot anyway: `string:length/1` once costs
+   ~644 ms and *twice* ~611 ms (same work, one compile).
+
+`queue_from_size` (`bslice_queue:from_size/1` → `queue:from_list/1`) and `copy_bound/send_recv` are the
+same shape at smaller scale: a fresh process whose first entry pulls in a module graph the process
+barely uses. Every case is still **correct** (the `run` argument/result self-check passes); `BEFORE`
+cannot be compared to `AFTER` on *whole-process* wall time for a module-graph-heavy case without
+holding the tier constant — hence the `INTERP` column.
+
+### Why the tier decision cannot be moved into `src/runner/` (verified)
+
+A **bounded warm-up** is the obvious mitigation — keep a process on `Tier::Interpreter` for its first
+slice(s) and switch it to the selected tier on a later resume. It is **unsound here**, and the reason
+is measured, not stylistic:
+
+- **The tier decision is only observable at a slice boundary, and the slice boundary is the reduction
+  budget.** In `runner/run.rs` the tier is read from `ProcessEngine::tier` when `engine.parked` is
+  `Some(_)` and selected once when it is `None`; `runner/budget.rs`'s `BudgetProbe::charge` is called
+  from `ensure_heap`/`ensure_heap_full` **only**, i.e. from `Instr::AllocateHeap`/`Instr::TestHeap`
+  (`beam_engine/src/interpreter/dispatch.rs`), which is exactly what makes the slice `Yield`.
+  So "switch on the first *charged* slice" is identical to "switch exactly when the budget was
+  exhausted" — there is no independent notion of "this process has done real work".
+- **The workloads the JIT wins on are single-slice processes that charge *zero* reductions.** Measured
+  with `erlang:process_info(self(), reductions)` at the end of the run (release `beam_rt`, at or above
+  each workload's real loop count): `cowboy_bstr:to_lower/1` N=20 000 → **0** charged;
+  `capitalize_token/1` → **0**; `emqx_base62:decode/1` → **0**; `lists:sum(lists:seq(1,1_000_000))`
+  (`list_walk`'s shape) → **0**; `emqx_base62:encode/1` → 4 000; the `gc_bound churn` shape
+  (cons-churn + `length`/`list_to_binary`/`list_to_tuple`, N=200 000) → 4 000. A binary-accumulating
+  or `call_ext`-only loop allocates no cons cell, reaches no `test_heap`/`allocate_heap`, and
+  therefore never pre-empts.
+- **So the warm-up would cost the very win this workstream exists for.** "First slice on the
+  interpreter" puts `foreign` (the 1.2×–1.4× win) and `list_walk` on the interpreter for their whole
+  life, because they *complete* inside their first slice — reverting `to_lower` from 17 038 to its
+  20 401 ns/call control figure. The policy removes the 11.3× regression only by removing the
+  `foreign` win with it, while `gc_bound churn` (which *does* pre-empt, 4 000 charged) keeps its win
+  either way. There is **no in-crate quantity that distinguishes "this process is hot" from "this
+  process happened to allocate"**.
+- A budget-shortening variant fails for the same reason (a 0-charge loop yields at *every* budget),
+  and a wall-clock/instruction-count variant needs an engine-side signal the runner cannot see.
+
+**The real lever is engine-side, and it is not this node's to pull**: `baseline::compile_module`
+compiles an **entire module** (all functions, all blocks) on first entry, so entering `string` once to
+compute `length("hello")` compiles the whole `string` module (≈7 995 IR instructions; `unicode`,
+which `string:length/1` also enters, is ≈6 270). Per-function (or per-label) lazy compilation, or a
+"compile on the *second* entry of a module", would shrink the compile volume by roughly an order of
+magnitude and is the sound fix. Closing it also removes the *other* precondition a policy would need:
+a running process has no admission point at all in a loop that allocates without
+`test_heap`/`allocate_heap`, so it cannot be re-decided mid-life. Both are `crates/beam_engine/**`.
+
 ## Caveats that invalidate a comparison
 
-- **The new always-JIT default regresses short-lived processes that enter a large Erlang module
-  graph.** `slice/string_str_length` (`bslice_string:str_length/1` → `string:length/1`) went from
-  **32.85 ms to 405.29 ms** (12.3×) under the *default*, while the *interpreter* column reproduces
-  `BEFORE` exactly (33.68 ms). Verified independently of `bench`, on the CLI, and it is a **per-process
-  JIT warm-up**, not a per-call cost — in one process, `string:length/1` once costs ~644 ms and
-  `string:length/1` *twice* costs ~611 ms (same work, one compile). The same shape is visible at
-  smaller scale in `slice/queue_from_size` (21.85 → 35.85 ms). Every case is still **correct** (the
-  `run` argument/result self-check passes); it is a cold-start cost the tier selection does not yet
-  amortise for a one-shot process. This is the single biggest caveat in the `AFTER` table and is
-  flagged for the workstream that owns tier selection — `BEFORE` cannot be compared to `AFTER` on
-  *whole-process* wall time for a module-graph-heavy case without holding the tier constant.
+- **A one-shot, module-graph-heavy process pays the whole compile cost** (see the section above for
+  the verified characterisation: `string_str_length` 11.27×, `queue_from_size` 1.61×,
+  `send_recv` 1.48× worse than the interpreter column). It is a per-`beam_rt`-OS-process cold start
+  amortised across a long-running node (one thread-local compiled-block cache), so the *interpreter*
+  column is the controlled comparison for a one-shot case.
 - **Absolute latencies are load-polluted** (see the host-load caveat); only ratios/minima are signal.
   `sys` startup `min` moved from 136.52 ms (`BEFORE`) to 160.47 ms (`AFTER`) purely from host
   contention — the `sys` runtime did not change between the snapshots.

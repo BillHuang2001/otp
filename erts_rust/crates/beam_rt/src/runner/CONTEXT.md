@@ -15,6 +15,13 @@ decision is **remembered on the engine** (`ProcessEngine::tier`) and re-used by 
 so a process keeps its tier for its whole life. The **default is `Auto`**, which selects the baseline
 tier for **every** process entry: the engine's driver handles the module-context switch itself, so no
 per-module safety predicate exists (see `## The tier is sound for any module`).
+The remembered tier is only *observable* at a **slice boundary** (a slice `Yield` on the reduction
+budget, or a `receive` park): a process that instead runs to completion inside its first slice never
+re-enters. That is exactly why the tier is selected eagerly at the first entry rather than after a
+warm-up — the budget is charged only at the engine's heap-admission points
+(`test_heap`/`allocate_heap`), so a **binary-accumulating or `call_ext`-only hot loop charges nothing,
+never pre-empts, and could never be switched**; the bounded-warm-up alternative was measured and
+declined on those grounds (the characterisation and figures are in `PERF.md`).
 
 ## API Surface (crate-internal, `pub(crate)`)
 * [`entry`] — `ProcessEntry` (the runtime-scheduled entry: an export or a fun), `ProcessEngine`
@@ -135,9 +142,11 @@ cannot be copied is still the honest `error:system_limit`, never a stored dangli
 ## Measured
 The tier is taken on a process's **first** entry and then carried for its whole life: a pre-empted
 slice and a `receive` park both resume through `Machine::resume_outcome_with_tier` on the tier the
-process was selected for, so an *allocating* hot loop keeps its tier across every slice
+process was selected for, so a *pre-empting* hot loop keeps its tier across every slice
 (`a_preempted_process_resumes_on_its_baseline_tier`/`a_receive_parked_process_resumes_on_its_baseline_tier`
-pin this structurally, without a timing). Per-workload speed and memory figures are **measured, never
+pin this structurally, without a timing). A hot loop that charges no reductions at all — a
+binary-accumulating or `call_ext`-only loop — reaches no heap-admission point, so it never pre-empts
+and simply runs to completion inside one slice on the tier its first entry selected. Per-workload speed and memory figures are **measured, never
 modelled**, and live in [`../../PERF.md`](../../PERF.md) and the bench driver's
 [`../../../../tools/bench/RESULTS.md`](../../../../tools/bench/RESULTS.md); they are re-measured there
 rather than transcribed here.
