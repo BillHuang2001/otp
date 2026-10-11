@@ -40,7 +40,7 @@ use beam_bifs::{
 use beam_common::{BeamError, Result};
 use beam_engine::ExecutionContext;
 use beam_loader::Module;
-use beam_process::{PortId, ProcessId, ProcessTable};
+use beam_process::{MonitorRef, PortId, ProcessId, ProcessTable};
 use beam_term::{atom_val, is_atom, Atom, AtomTable, Eterm};
 
 use crate::codeserver::CodeServer;
@@ -48,6 +48,7 @@ use crate::error;
 use crate::nif::{NifEntry, NifHostImpl};
 use crate::runtime::Runtime;
 
+use super::alias::alias_destination;
 use super::RuntimeContext;
 
 /// A cloneable, shared `io:format` destination.
@@ -254,6 +255,9 @@ impl DictHook for DictBridge<'_> {
 ///   "name → id" resolution the C does with `erts_whereis_name_to_id` (`bif.c:2507`), and the
 ///   message is delivered to the registered process. A name that is *not* registered is the
 ///   oracle's `error:badarg` (`bif.c:2536`, `SEND_BADARG`).
+/// * A **reference alias** (an `erlang:alias/1` / `erlang:monitor/3` `{alias, Mode}` reference) —
+///   the message goes to the alias **owner**, and the reference is consumed after the successful
+///   delivery (see [`SendBridge::resolve`] and [`super::alias`]).
 /// * A destination the oracle accepts but this runtime cannot serve yet is an honest typed
 ///   **capability gap** rather than a fabricated value:
 ///   * a **port** (`erlang:send(Port, Data)`, `bif.c:2551-2613`) needs the port subsystem's
@@ -282,28 +286,38 @@ pub(super) struct SendBridge<'a> {
 }
 
 impl SendBridge<'_> {
-    /// Resolves a `send` destination term to the internal pid term to deliver to.
+    /// Resolves a `send` destination term to the internal pid term to deliver to, plus the
+    /// **alias reference to consume** once the message has been delivered (`None` for every
+    /// other destination).
     ///
     /// # Errors
     ///
     /// [`BeamError::BadArg`] for the destinations the oracle rejects with `badarg`; a typed
     /// capability gap ([`crate::error::unsupported`]) for the ones it accepts but this
     /// runtime cannot serve yet (see the struct docs).
-    fn resolve(&self, to: Eterm) -> Result<Eterm> {
+    fn resolve(&self, to: Eterm) -> Result<(Eterm, Option<MonitorRef>)> {
+        // The table every destination is resolved against: the pass table in a scheduler
+        // slice, else the runtime's own (the same choice `process_table`/`process_table_mut`
+        // make on the outer context).
+        let table: &ProcessTable = match self.mailbox_table {
+            Some(ref table) => table,
+            None => &self.runtime.processes,
+        };
         if ProcessId::is_process(to) {
-            return Ok(to);
+            return Ok((to, None));
         }
         if is_atom(to) {
-            let table: &ProcessTable = match self.mailbox_table {
-                Some(ref table) => table,
-                None => &self.runtime.processes,
-            };
             return match table.whereis(atom_val(to)) {
-                Some(pid) => Ok(pid.to_eterm()),
+                Some(pid) => Ok((pid.to_eterm(), None)),
                 // An atom name no process is registered under: the oracle's only failing
                 // (correctly typed) destination (`bif.c:2536`).
                 None => Err(BeamError::BadArg),
             };
+        }
+        if let Some((owner, reference)) = alias_destination(table, to) {
+            // A live **alias**: the message goes to its owner and the reference is consumed
+            // after a successful delivery (the C's `send_altact_message` arm, `bif.c:2478-2492`).
+            return Ok((owner.to_eterm(), Some(reference)));
         }
         if PortId::from_eterm(to).is_ok() {
             return Err(error::unsupported(
@@ -321,30 +335,43 @@ impl SendBridge<'_> {
 
 impl SendHook for SendBridge<'_> {
     fn send(&mut self, to: Eterm, term: Eterm) -> Result<()> {
-        let target = self.resolve(to)?;
+        let (target, reference) = self.resolve(to)?;
         // The nested context inherits the sender's identity (pid + table) so the delivery
-        // runs exactly as the compiled `send` instruction's does.
-        let mut ctx = RuntimeContext {
-            runtime: self.runtime,
-            output: self.output.clone(),
-            mailbox_pid: self.mailbox_pid,
-            mailbox_table: self.mailbox_table.as_deref_mut(),
-            may_pump_scheduler: self.may_pump_scheduler,
-            current_module: self.current_module.clone(),
-            engines: self.engines,
-            // A **nested** run: the delivery itself allocates no roots to relocate, and the
-            // latch must never be inherited (see `context::gc`).
-            gc_armed: false,
+        // runs exactly as the compiled `send` instruction's does. It is scoped to the
+        // delivery: it borrows the runtime **and** the pass table, so both must be free again
+        // before the alias can be consumed through the table it was resolved against.
+        let delivered = {
+            let mut ctx = RuntimeContext {
+                runtime: self.runtime,
+                output: self.output.clone(),
+                mailbox_pid: self.mailbox_pid,
+                mailbox_table: self.mailbox_table.as_deref_mut(),
+                may_pump_scheduler: self.may_pump_scheduler,
+                current_module: self.current_module.clone(),
+                engines: self.engines,
+                // A **nested** run: the delivery itself allocates no roots to relocate, and
+                // the latch must never be inherited (see `context::gc`).
+                gc_armed: false,
+            };
+            match ctx.send_message(target, term) {
+                // No process for the pid: the C drops the message and reports success
+                // (`bif.c:2478-2480`); the table's typed not-found is that same case.
+                Err(BeamError::TermNotFound) => Ok(()),
+                delivered => delivered,
+            }
         };
-        match ctx.send_message(target, term) {
-            // No process for the pid: the C drops the message and reports success
-            // (`bif.c:2478-2480`); the table's typed not-found is that same case.
-            Err(BeamError::TermNotFound) => Ok(()),
-            delivered => delivered,
+        // Only a **successful** delivery consumes the alias.
+        delivered?;
+        if let Some(reference) = reference {
+            let table: &mut ProcessTable = match self.mailbox_table {
+                Some(ref mut table) => table,
+                None => &mut self.runtime.processes,
+            };
+            table.alias_reply_delivered(reference)?;
         }
+        Ok(())
     }
 }
-
 /// The `{Name, Node}` pair of an atom/atom 2-tuple destination, if `to` is one.
 ///
 /// The C only treats a 2-tuple of **atoms** as a remote send (`bif.c:2614-2621`); every other

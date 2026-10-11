@@ -77,6 +77,7 @@
 //! still runs on the runtime's pointer-stable
 //! [`MinimalContext`](beam_engine::MinimalContext) arena, byte for byte as before.
 
+mod alias;
 mod bridges;
 mod fun_identity;
 pub(crate) mod gc;
@@ -102,7 +103,7 @@ use beam_engine::context::RootSet;
 use beam_engine::{terms, ExecutionContext, Machine, RunOutcome};
 use beam_loader::{Atom, Label, Module};
 use beam_message::{CopyContext, Message, OffHeapTable, Queue};
-use beam_process::{ProcessId, ProcessTable};
+use beam_process::{MonitorRef, ProcessId, ProcessTable};
 use beam_term::Eterm;
 
 use crate::error;
@@ -1861,6 +1862,35 @@ impl RuntimeContext<'_> {
         let index = terms::fun_index(fun)? as usize;
         crate::eval::apply_eval_closure(self, fun, index, args)
     }
+
+    /// The internal pid a `send` destination names, plus the **alias reference to consume**
+    /// once the message has been delivered.
+    ///
+    /// A pid is passed through; anything else is tried as a reference **alias**
+    /// ([`alias::alias_destination`], the C's `send_altact_message` arm,
+    /// `../../erts/emulator/beam/bif.c:2478-2492`), which resolves to the alias **owner** and
+    /// returns the reference so the caller can consume it after a successful delivery —
+    /// `gen_server:reply/2`'s `Alias ! {Tag, Reply}` (`../lib/stdlib/src/gen_server.erl:549-553`)
+    /// is exactly that compiled `send`, and without this a reply could never reach an alias.
+    ///
+    /// The lookup is read-only (a `&self` borrow of the process table the context resolves
+    /// against — the pass table in a scheduler slice, else the runtime's own), so the caller
+    /// can deliver with `&mut self` afterwards.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] for everything that is neither an internal pid nor a live alias
+    /// reference — the destinations the oracle rejects with `badarg` (see the [`alias`] module's
+    /// divergence note for a reference that is not a live alias).
+    pub(crate) fn resolve_send_target(&self, to: Eterm) -> Result<(ProcessId, Option<MonitorRef>)> {
+        match ProcessId::from_eterm(to) {
+            Ok(pid) => Ok((pid, None)),
+            Err(not_a_pid) => match alias::alias_destination(self.process_table(), to) {
+                Some((owner, reference)) => Ok((owner, Some(reference))),
+                None => Err(not_a_pid),
+            },
+        }
+    }
 }
 impl ExecutionContext for RuntimeContext<'_> {
     /// The runtime's unified dispatch — see the module docs.
@@ -2230,9 +2260,10 @@ impl ExecutionContext for RuntimeContext<'_> {
     }
     /// `send`: deliver `message` to the pid term `to`.
     ///
-    /// `to` is resolved with [`ProcessId::from_eterm`] (a non-pid is [`BeamError::BadArg`])
-    /// and the message is copied into the recipient's heap and enqueued by
-    /// [`ProcessTable::deliver`] (an unknown pid is the table's typed
+    /// `to` is resolved by [`RuntimeContext::resolve_send_target`]: an internal pid, or a
+    /// reference that is a live **alias** (whose message goes to the alias owner); anything
+    /// else is [`BeamError::BadArg`]. The message is copied into the recipient's heap and
+    /// enqueued by [`ProcessTable::deliver`] (an unknown pid is the table's typed
     /// `TermNotFound`). The sender is this context's pid, so `self() ! M` reaches the very
     /// mailbox the following `receive` scans.
     ///
@@ -2261,6 +2292,11 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// destination is the receiver's own off-heap table, so no runtime-level table is needed
     /// (see [`Self::deliver_message_with_off_heap`]).
     ///
+    /// `to` is resolved by [`Self::resolve_send_target`] — a pid, or a reference that is a
+    /// live **alias** (the compiled `Alias ! Msg` of `gen_server:reply/2`, delivered to the
+    /// alias owner and consuming the reference). A `reply_demonitor` alias is consumed only
+    /// **after** the delivery succeeded.
+    ///
     /// A completed send also produces **events** (contract A.8, item 1): the ordinary
     /// `{trace, Sender, send, Msg, To}` — when the *sending* process is `[send]`-traced — and
     /// the sequential-trace `{seq_trace, Label, {send, …}}` when its token has the `send`
@@ -2274,7 +2310,7 @@ impl ExecutionContext for RuntimeContext<'_> {
         message: Eterm,
         src_binaries: &[beam_alloc::RefcBinary],
     ) -> Result<()> {
-        let target = ProcessId::from_eterm(to)?;
+        let (target, reference) = self.resolve_send_target(to)?;
         let from = self.mailbox_pid.to_eterm();
         if src_binaries.is_empty() {
             self.deliver_message(target, from, message)?;
@@ -2288,6 +2324,13 @@ impl ExecutionContext for RuntimeContext<'_> {
                 source.push_binary(handle.clone());
             }
             self.deliver_message_with_off_heap(target, from, message, &source)?;
+        }
+        // An **alias** destination is consumed by the message that went through it (see
+        // `resolve_send_target`): the delivery is done, so the `reply_demonitor` rule can
+        // fire. This is reached only after a successful delivery, so a failed one leaves the
+        // alias alone (the C's alias-message site runs on the *receiver* side).
+        if let Some(reference) = reference {
+            self.process_table_mut().alias_reply_delivered(reference)?;
         }
         self.trace_send_events(to, message)?;
         // The delivered message is also a `receive` event for the **receiver** — gated on the

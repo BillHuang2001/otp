@@ -297,6 +297,199 @@ fn send_message_to_an_unknown_pid_is_the_tables_typed_error() {
     );
 }
 
+// -----------------------------------------------------------------------
+// Reference aliases as `send` destinations
+// -----------------------------------------------------------------------
+
+/// The on-heap reference thing for `reference`, built on a pooled BIF heap — the production
+/// route (`src/native/process.rs::reference_term`), so the term stays valid after the heap goes
+/// back to the pool (a `beam_alloc::Heap` never resets).
+fn alias_reference_term(rt: &mut Runtime, reference: MonitorRef) -> Eterm {
+    let mut heap = rt.take_bif_heap().expect("a pooled BIF heap");
+    let term = reference.to_eterm(&mut heap).expect("the ref thing");
+    rt.put_bif_heap(heap);
+    term
+}
+
+/// The payloads of every message queued for `pid`, oldest first.
+fn queued_payloads(rt: &Runtime, pid: ProcessId) -> Vec<Eterm> {
+    rt.processes
+        .get(pid)
+        .expect("the process is live")
+        .mailbox()
+        .iter()
+        .map(|message| message.payload())
+        .collect()
+}
+
+/// The compiled `Dest ! Msg` operator (`gen_server:reply/2`'s `Alias ! {Tag, Reply}`) reaches
+/// the alias **owner**, and a `reply_demonitor` alias is consumed by that delivery.
+///
+/// `Instr::Send` calls `ExecutionContext::send_message_with_off_heap` directly
+/// (`../beam_engine/src/families/receive.rs:110-113`), so this is the seam that has to resolve a
+/// reference destination — without it the reply could never reach its alias.
+///
+/// Oracle (system `erl`, OTP 29 / `erts-17.1`):
+/// `A = alias(), A ! hi, receive X -> X end` ⇒ `hi`, and after the alias is consumed a second
+/// reference send no longer resolves (that half is `beam_process`'s own contract,
+/// `tests/alias.rs`).
+#[test]
+fn a_compiled_send_to_an_alias_reference_reaches_the_owner_and_consumes_the_alias() {
+    let mut rt = runtime();
+    let owner = rt.self_pid();
+    let reference = rt
+        .processes
+        .create_alias(owner, beam_process::UnaliasMode::ReplyDemonitor)
+        .expect("a live owner mints an alias");
+    let to = alias_reference_term(&mut rt, reference);
+    assert!(
+        !ProcessId::is_process(to),
+        "an alias is a reference term, never a pid"
+    );
+
+    {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        ctx.send_message_with_off_heap(to, make_small(7), &[])
+            .expect("a send to a live alias is delivered to its owner");
+        assert_eq!(
+            queued_payloads(ctx.runtime, owner),
+            vec![make_small(7)],
+            "the alias send reached the owner's mailbox"
+        );
+    }
+
+    assert_eq!(
+        rt.processes.resolve_alias(reference),
+        None,
+        "a reply_demonitor alias is consumed by the message that went through it"
+    );
+}
+
+/// An `explicit_unalias` alias **survives** a delivery — only `erlang:unalias/1` clears it (the
+/// C's `handle_altact_msg` drops the alias only for `ERTS_ML_STATE_ALIAS_ONCE`).
+#[test]
+fn an_explicit_unalias_alias_survives_the_send() {
+    let mut rt = runtime();
+    let owner = rt.self_pid();
+    let reference = rt
+        .processes
+        .create_alias(owner, beam_process::UnaliasMode::ExplicitUnalias)
+        .expect("a live owner mints an alias");
+    let to = alias_reference_term(&mut rt, reference);
+
+    {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        ctx.send_message(to, make_small(1))
+            .expect("a send to a live alias is delivered to its owner");
+    }
+
+    assert_eq!(queued_payloads(&rt, owner), vec![make_small(1)]);
+    assert_eq!(
+        rt.processes.resolve_alias(reference),
+        Some(owner),
+        "explicit_unalias is not a reply-time expiry"
+    );
+}
+
+/// `erlang:send(Alias, Msg)` — the BIF route (the `SendHook` bridge) — resolves the same alias
+/// and returns the message, as the oracle does.
+#[test]
+fn the_send_bif_delivers_through_an_alias_reference() {
+    let mut rt = runtime();
+    let owner = rt.self_pid();
+    let reference = rt
+        .processes
+        .create_alias(owner, beam_process::UnaliasMode::ReplyDemonitor)
+        .expect("a live owner mints an alias");
+    let to = alias_reference_term(&mut rt, reference);
+
+    {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        let answer = ctx
+            .call_bif("erlang", "send", 2, &[to, make_small(9)])
+            .expect("erlang:send/2 to a live alias");
+        assert_eq!(signed_value(answer), 9, "a send returns the message");
+        assert_eq!(
+            queued_payloads(ctx.runtime, owner),
+            vec![make_small(9)],
+            "the BIF send reached the owner's mailbox"
+        );
+    }
+
+    assert_eq!(
+        rt.processes.resolve_alias(reference),
+        None,
+        "the BIF delivery consumes a reply_demonitor alias too"
+    );
+}
+
+/// `resolve_send_target`'s contract on both seams: a pid passes through with **nothing** to
+/// consume, a live alias maps to its owner plus the reference to consume, and a reference that
+/// is not a live alias is the typed `badarg` (both as the compiled send and as the BIF).
+///
+/// The non-alias reference is a **table-minted** one (a plain `erlang:monitor/2` reference), not
+/// an `erlang:make_ref/0` one: `make_ref/0` mints from the *runtime's* reference allocator while
+/// monitors and aliases mint from the **process table's**, so the two id spaces can hand out the
+/// same id — see the hazard note in [`super::alias`].
+#[test]
+fn resolve_send_target_maps_pids_and_live_aliases_and_rejects_other_references() {
+    let mut rt = runtime();
+    let owner = rt.self_pid();
+    let alias = rt
+        .processes
+        .create_alias(owner, beam_process::UnaliasMode::ReplyDemonitor)
+        .expect("a live owner mints an alias");
+    let alias_term = alias_reference_term(&mut rt, alias);
+    // A reference from the table's own allocator that is **not** an alias: a monitor.
+    let monitor = rt
+        .processes
+        .monitor_with_tag(owner, owner, beam_process::MonitorKind::Process, None)
+        .expect("a monitor reference");
+    let monitor_term = alias_reference_term(&mut rt, monitor);
+
+    {
+        let mut ctx = RuntimeContext::new(&mut rt);
+
+        let (target, consume) = ctx
+            .resolve_send_target(owner.to_eterm())
+            .expect("a pid is a destination");
+        assert_eq!(target, owner, "a pid passes through");
+        assert_eq!(consume, None, "a pid has no alias to consume");
+
+        let (target, consume) = ctx
+            .resolve_send_target(alias_term)
+            .expect("a live alias is a destination");
+        assert_eq!(target, owner, "an alias resolves to its owner");
+        assert_eq!(
+            consume,
+            Some(alias),
+            "the reference must be consumed after delivery"
+        );
+
+        assert!(
+            matches!(ctx.resolve_send_target(monitor_term), Err(BeamError::BadArg)),
+            "a monitor reference is not an alias"
+        );
+        assert!(
+            matches!(ctx.send_message(monitor_term, make_small(4)), Err(BeamError::BadArg)),
+            "a monitor reference is not a compiled-send destination"
+        );
+        assert!(
+            matches!(
+                ctx.call_bif("erlang", "send", 2, &[monitor_term, make_small(4)]),
+                Err(BeamError::BadArg)
+            ),
+            "a monitor reference is not a send-BIF destination"
+        );
+
+        assert_eq!(
+            queued_payloads(ctx.runtime, owner),
+            Vec::<Eterm>::new(),
+            "no refused destination delivered anything"
+        );
+    }
+}
+
 #[test]
 fn receive_next_peeks_and_the_scan_operations_position_the_mailbox() {
     let mut rt = runtime();
