@@ -157,6 +157,8 @@ impl FunCaller for FunBridge<'_> {
             // A **nested** run: it must never collect the process heap, because the root set
             // the machine would hand out belongs to the outer machine (see `context::gc`).
             gc_armed: false,
+                // A nested run keeps its own (empty) memo: see `super::DispatchMemo`.
+                dispatch_memo: super::DispatchMemo::default(),
         };
         ctx.apply_fun(fun, args)
     }
@@ -352,6 +354,8 @@ impl SendHook for SendBridge<'_> {
                 // A **nested** run: the delivery itself allocates no roots to relocate, and
                 // the latch must never be inherited (see `context::gc`).
                 gc_armed: false,
+                // A nested run keeps its own (empty) memo: see `super::DispatchMemo`.
+                dispatch_memo: super::DispatchMemo::default(),
             };
             match ctx.send_message(target, term) {
                 // No process for the pid: the C drops the message and reports success
@@ -452,7 +456,7 @@ impl beam_bifs::NifLoader for NifBridge<'_> {
         let mut host = Box::new(NifHostImpl::new(
             heap,
             Rc::clone(&self.atoms),
-            self.interner.clone(),
+            self.interner.share(),
             self.self_pid,
             schedulers,
             None,
@@ -586,23 +590,38 @@ impl LocalNode for NodeIdentity {
 /// interner records the names and predicts that index; the caller commits them, in order,
 /// after the call. A name seen twice in one call is deduplicated and returns the same index.
 ///
-/// # Why the inner state is shared (`Rc<RefCell<…>>`)
+/// # Why the state is shared only while it has to be
 ///
 /// One `erlang:load_nif/2` call has **two** new-atom writers: the BIF layer (through
 /// [`BifContext`]'s [`AtomInterner`]) and the NIF host the load runs against
 /// ([`NifHostImpl`](crate::nif::NifHostImpl)'s `enif_make_atom`). They may interleave, so two
-/// independent predicted-index lists would hand out colliding indices. A cloneable handle over
+/// independent predicted-index lists would hand out colliding indices. A second handle over
 /// one shared list makes both writers agree on `base + <names recorded>`, and the single
 /// [`PendingInterner::commit`] by the caller lands every name at exactly its predicted index.
-/// The handle is **not** shared across calls: each call gets a fresh one rooted at the table's
-/// current length.
-#[derive(Clone)]
+///
+/// That second handle is the **exception**, not the rule: a registered BIF call (and a NIF
+/// call, whose host is the only writer) never shares, so [`PendingInterner::new`] keeps the
+/// state **inline** and the ordinary call pays no `Rc`/`RefCell` allocation at all.
+/// [`PendingInterner::share`] promotes an inline handle into the shared cell on demand — the
+/// only allocation the interner ever makes, paid by exactly the calls that need a second
+/// writer. The handle is **not** shared across calls: each call gets a fresh one rooted at
+/// the table's current length.
 pub(crate) struct PendingInterner {
-    /// The shared base + recorded names (one allocation per call).
-    inner: Rc<RefCell<PendingInternerInner>>,
+    /// The base + recorded names, inline until [`PendingInterner::share`] is called.
+    state: InternerState,
+}
+
+/// The two shapes a [`PendingInterner`] handle takes.
+enum InternerState {
+    /// A single owner: the state lives inline (a `RefCell` for interior mutability), so a
+    /// call that never shares allocates nothing.
+    Inline(RefCell<PendingInternerInner>),
+    /// At least one second handle exists; every handle shares this one cell.
+    Shared(Rc<RefCell<PendingInternerInner>>),
 }
 
 /// The mutable half of a [`PendingInterner`].
+#[derive(Default)]
 struct PendingInternerInner {
     /// The shared table's length when the call began: the first new name's index.
     base: usize,
@@ -612,12 +631,46 @@ struct PendingInternerInner {
 
 impl PendingInterner {
     /// A pending interner rooted at `base` (the current shared-table length).
+    ///
+    /// Allocation-free: the state stays inline until [`PendingInterner::share`] is called.
     pub(crate) fn new(base: usize) -> PendingInterner {
         PendingInterner {
-            inner: Rc::new(RefCell::new(PendingInternerInner {
+            state: InternerState::Inline(RefCell::new(PendingInternerInner {
                 base,
                 names: Vec::new(),
             })),
+        }
+    }
+
+    /// A second handle over the **same** state, for a call with two new-atom writers.
+    ///
+    /// The handle is `self` made shared: an inline state is promoted into a fresh shared cell
+    /// (the one allocation this type can make), an already-shared one simply hands out another
+    /// owner of the cell it has. Both handles must therefore be kept alive for the duration of
+    /// the call — dropping either one early would let the *other* writer's recorded names be
+    /// committed (or not) against a different list.
+    pub(crate) fn share(&mut self) -> PendingInterner {
+        // Swap in an empty inline state and move the real one out — allocation-free, and it
+        // works for both shapes: a shared cell is reused, an inline one becomes a fresh cell.
+        let taken = std::mem::replace(
+            &mut self.state,
+            InternerState::Inline(RefCell::new(PendingInternerInner::default())),
+        );
+        let cell = match taken {
+            InternerState::Shared(cell) => cell,
+            InternerState::Inline(inner) => Rc::new(inner),
+        };
+        self.state = InternerState::Shared(Rc::clone(&cell));
+        PendingInterner {
+            state: InternerState::Shared(cell),
+        }
+    }
+
+    /// Runs `f` over the mutable record, whichever shape the handle has.
+    fn with_inner<R>(&self, f: impl FnOnce(&mut PendingInternerInner) -> R) -> R {
+        match &self.state {
+            InternerState::Inline(cell) => f(&mut cell.borrow_mut()),
+            InternerState::Shared(cell) => f(&mut cell.borrow_mut()),
         }
     }
 
@@ -633,7 +686,7 @@ impl PendingInterner {
     /// interns nothing. Skipping the `atoms_mut()` borrow when nothing was recorded keeps
     /// the no-copy fast path.
     pub(crate) fn is_empty(&self) -> bool {
-        self.inner.borrow().names.is_empty()
+        self.with_inner(|inner| inner.names.is_empty())
     }
 
     /// Commits the recorded names into `atoms`, in intern order.
@@ -641,25 +694,27 @@ impl PendingInterner {
     /// Must be called once the BIF/host has returned and released its borrow of the table, so
     /// each name lands at exactly the index the interner predicted.
     pub(crate) fn commit(&self, atoms: &mut AtomTable) {
-        for name in self.inner.borrow_mut().names.drain(..) {
-            atoms.intern(&name);
-        }
+        self.with_inner(|inner| {
+            for name in inner.names.drain(..) {
+                atoms.intern(&name);
+            }
+        });
     }
 }
 
 impl AtomInterner for PendingInterner {
     fn intern(&mut self, name: &str) -> Atom {
-        let mut inner = self.inner.borrow_mut();
-        if let Some(offset) = inner.names.iter().position(|pending| pending == name) {
-            // A duplicate within this call reuses the predicted index.
-            return Atom::from_raw((inner.base + offset) as u32);
-        }
-        let index = inner.base + inner.names.len();
-        inner.names.push(name.to_string());
-        Atom::from_raw(index as u32)
+        self.with_inner(|inner| {
+            if let Some(offset) = inner.names.iter().position(|pending| pending == name) {
+                // A duplicate within this call reuses the predicted index.
+                return Atom::from_raw((inner.base + offset) as u32);
+            }
+            let index = inner.base + inner.names.len();
+            inner.names.push(name.to_string());
+            Atom::from_raw(index as u32)
+        })
     }
 }
-
 /// The `FunT` position of the lambda descriptor `(uniq, index)` in `module`, if it
 /// defines one.
 ///

@@ -97,7 +97,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use beam_abi::nif::loader::NifCallError;
-use beam_bifs::{BifContext, OutputSink};
+use beam_bifs::{BifContext, BifFn, OutputSink};
 use beam_common::{AllocKind, BeamError, Result};
 use beam_engine::context::RootSet;
 use beam_engine::machine::WaitDeadline;
@@ -278,8 +278,162 @@ pub struct RuntimeContext<'a> {
     /// would corrupt (see [`crate::context::gc`]). It is never set for a plain
     /// [`RuntimeContext`].
     gc_armed: bool,
+    /// The memo of [`RuntimeContext::dispatch`] answers, so a hot call site pays the dispatch
+    /// prologue once instead of once per call (see [`DispatchMemo`] for the soundness argument).
+    dispatch_memo: DispatchMemo,
 }
 
+/// The number of `(module, function, arity)` keys a context's dispatch memo holds.
+///
+/// The memo is **direct-mapped**: [`dispatch_slot`] picks the slot, so a collision simply
+/// overwrites and the next call for the evicted key recomputes. A miss can therefore cost a
+/// call (the prologue it rebuilds), never change its answer.
+const DISPATCH_MEMO_SLOTS: usize = 8;
+
+/// The slot `(module, function, arity)` is memoized in.
+///
+/// Deliberately trivial (three length/multiplier mixes and a mask): it only has to spread the
+/// handful of distinct keys a real call site dispatches, and it must cost far less than the
+/// memo lookup it indexes.
+fn dispatch_slot(module: &str, function: &str, arity: u32) -> usize {
+    (module.len().wrapping_mul(7)
+        ^ function.len().wrapping_mul(13)
+        ^ (arity as usize).wrapping_mul(29))
+        & (DISPATCH_MEMO_SLOTS - 1)
+}
+
+/// The `beam_bifs` hook roster one `(module, function, arity)` key needs.
+///
+/// One field per `uses_*` predicate — i.e. per mutually-exclusive bridge arm plus the two
+/// build gates (`fun_identity`, `memory_hook`) — so [`RuntimeContext::call_registered`] can
+/// select its arm from one value instead of running thirteen `binary_search`es over
+/// [`beam_bifs`]' `&'static` rosters (each of which is a chain of `bcmp` calls across a crate
+/// boundary, and together the dominant cost of the dispatch prologue).
+///
+/// [`DispatchHooks::of`] is the **only** place the predicates are evaluated, and it calls the
+/// same `uses_*` functions the arms are documented against, so the roster can never drift from
+/// what `beam_bifs` routes through each seam.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct DispatchHooks {
+    /// [`RuntimeContext::uses_dict`] — the process-dictionary arm.
+    dict: bool,
+    /// [`RuntimeContext::uses_process_hook`] — the process/name/global-state arm.
+    process_hook: bool,
+    /// [`RuntimeContext::uses_nif_loader`] — the `load_nif/2` arm.
+    nif_loader: bool,
+    /// [`RuntimeContext::uses_record_source`] — the record-source arm.
+    record_source: bool,
+    /// [`RuntimeContext::uses_send_hook`] — the message-delivery arm.
+    send_hook: bool,
+    /// [`RuntimeContext::uses_module_info`] — the module-info arm.
+    module_info: bool,
+    /// [`RuntimeContext::uses_persistent_term`] — the persistent-term arm.
+    persistent_term: bool,
+    /// [`RuntimeContext::uses_runtime_hooks`] — the timer/reference/link arm.
+    runtime_hooks: bool,
+    /// [`RuntimeContext::uses_fun_identity`] — the local-fun-identity build gate.
+    fun_identity: bool,
+    /// [`RuntimeContext::uses_memory_hook`] — the `erlang:memory/0,1` build gate.
+    memory_hook: bool,
+}
+
+impl DispatchHooks {
+    /// The predicates for `(module, function, arity)`, evaluated once.
+    fn of(module: &str, function: &str, arity: u32) -> DispatchHooks {
+        let roster = [
+            RuntimeContext::uses_dict(module, function, arity),
+            RuntimeContext::uses_process_hook(module, function, arity),
+            RuntimeContext::uses_nif_loader(module, function, arity),
+            RuntimeContext::uses_record_source(module, function, arity),
+            RuntimeContext::uses_send_hook(module, function, arity),
+            RuntimeContext::uses_module_info(module, function, arity),
+            RuntimeContext::uses_persistent_term(module, function, arity),
+            RuntimeContext::uses_runtime_hooks(module, function, arity),
+            RuntimeContext::uses_fun_identity(module, function, arity),
+            RuntimeContext::uses_memory_hook(module, function, arity),
+        ];
+        let [dict, process_hook, nif_loader, record_source, send_hook, module_info, persistent_term, runtime_hooks, fun_identity, memory_hook] =
+            roster;
+        DispatchHooks {
+            dict,
+            process_hook,
+            nif_loader,
+            record_source,
+            send_hook,
+            module_info,
+            persistent_term,
+            runtime_hooks,
+            fun_identity,
+            memory_hook,
+        }
+    }
+}
+
+/// The cachable part of a dispatch answer for one `(module, function, arity)` key.
+///
+/// The key itself is not part of it — the caller already holds it.
+#[derive(Clone, Copy)]
+struct DispatchAnswer {
+    /// The `beam_bifs` implementation registered for the key, if any. `Some` is exactly
+    /// [`BifRegistry::contains`](beam_bifs::BifRegistry::contains) being `true`, so
+    /// [`RuntimeContext::call_bif`] uses it in place of the registry lookup.
+    bif: Option<BifFn>,
+    /// The [`beam_bifs`] hook roster the key needs.
+    hooks: DispatchHooks,
+}
+
+/// The per-context memo of [`RuntimeContext::dispatch`] answers.
+///
+/// # Why a cached answer can never go stale (the soundness argument)
+///
+/// Every input the answer is built from is **immutable for the life of the runtime**:
+///
+/// * the [`beam_bifs`] `needs_*` rosters are `&'static` tables (the `needs_*` predicates are
+///   pure `binary_search` membership tests over them);
+/// * [`Runtime::registry`] is a shared `Rc<BifRegistry>` built once at boot by
+///   [`BifRegistry::with_core_bifs`](beam_bifs::BifRegistry::with_core_bifs) with no interior
+///   mutability — `BifRegistry::register` takes `&mut self` and is boot-time only, and nothing
+///   in this crate ever takes a mutable borrow of it (`Rc::make_mut`/`Rc::get_mut` are never
+///   called on it).
+///
+/// So neither the implementation for a key nor its hook roster can change under a cached
+/// answer, and no invalidation is needed.
+///
+/// The one **runtime-mutable** dispatch input is the NIF registry (`load_nif/2` installs a
+/// library that then replaces the Erlang stub of the same key). It is deliberately **not**
+/// memoized: [`RuntimeContext::call_bif`] still consults
+/// [`RuntimeContext::try_call_nif`] first on every call, so a NIF loaded mid-slice wins
+/// immediately.
+///
+/// The memo lives on the [`RuntimeContext`], not on the runtime, so it is exactly as long-lived
+/// as one context (one scheduler slice, one `-eval`, one nested run) — a fresh context
+/// recomputes on first use, which is why no cross-context staleness question arises.
+///
+/// [`Runtime::registry`]: crate::Runtime
+struct DispatchMemo {
+    /// The memoized keys, `None` for a slot that has not been used yet.
+    slots: [Option<DispatchEntry>; DISPATCH_MEMO_SLOTS],
+}
+
+impl Default for DispatchMemo {
+    fn default() -> Self {
+        DispatchMemo {
+            slots: std::array::from_fn(|_| None),
+        }
+    }
+}
+
+/// One memoized [`DispatchAnswer`], tagged with the key it was computed for.
+struct DispatchEntry {
+    /// The key's module (an exact `&str` comparison decides a hit).
+    module: String,
+    /// The key's function.
+    function: String,
+    /// The key's arity.
+    arity: u32,
+    /// The memoized answer.
+    answer: DispatchAnswer,
+}
 impl<'a> RuntimeContext<'a> {
     /// A context over `runtime`, with the default (stdout) output sink, running as the
     /// runtime's own process.
@@ -294,6 +448,7 @@ impl<'a> RuntimeContext<'a> {
             current_module: None,
             engines: None,
             gc_armed: false,
+            dispatch_memo: DispatchMemo::default(),
         }
     }
 
@@ -309,6 +464,7 @@ impl<'a> RuntimeContext<'a> {
             current_module: None,
             engines: None,
             gc_armed: false,
+            dispatch_memo: DispatchMemo::default(),
         }
     }
 
@@ -341,6 +497,7 @@ impl<'a> RuntimeContext<'a> {
             current_module: None,
             engines: None,
             gc_armed: false,
+            dispatch_memo: DispatchMemo::default(),
         }
     }
 
@@ -1192,12 +1349,42 @@ impl<'a> RuntimeContext<'a> {
     /// [`DictBridge`] (resolving the table the same way the mailbox/`self` seam does)
     /// **instead of** the fun-caller bridge. No dict BIF applies a fun argument, so nothing
     /// is lost (see [`DictBridge`]).
+    /// The memoized dispatch answer for `(module, function, arity)` — the `beam_bifs`
+    /// registry implementation (if any) plus the hook roster the key needs.
+    ///
+    /// A miss computes the answer — one registry `lookup` plus one evaluation of each
+    /// `uses_*` predicate, the dispatch prologue's dominant cost — and memoizes it; a slot
+    /// collision overwrites, and the evicted key recomputes on its next call. See
+    /// [`DispatchMemo`] for why a cached answer can never go stale, and note that the answer
+    /// deliberately says nothing about the **NIF registry**, which `call_bif` still consults
+    /// first on every call.
+    fn dispatch(&mut self, module: &str, function: &str, arity: u32) -> DispatchAnswer {
+        let slot = dispatch_slot(module, function, arity);
+        if let Some(entry) = &self.dispatch_memo.slots[slot] {
+            if entry.arity == arity && entry.module == module && entry.function == function {
+                return entry.answer;
+            }
+        }
+        let answer = DispatchAnswer {
+            bif: self.runtime.registry.lookup(module, function, arity),
+            hooks: DispatchHooks::of(module, function, arity),
+        };
+        self.dispatch_memo.slots[slot] = Some(DispatchEntry {
+            module: module.to_string(),
+            function: function.to_string(),
+            arity,
+            answer,
+        });
+        answer
+    }
+
     fn call_registered(
         &mut self,
         module: &str,
         function: &str,
         arity: u32,
         args: &[Eterm],
+        hooks: DispatchHooks,
     ) -> Result<Eterm> {
         // Cheap handles that do NOT borrow the runtime: the runtime stays free for the
         // fun-caller bridge.
@@ -1215,33 +1402,33 @@ impl<'a> RuntimeContext<'a> {
         // Whether this is a process-dictionary BIF, which needs the running process's
         // `Dict` (a `&mut ProcessTable`) rather than a fun-caller bridge — the two borrows
         // cannot co-exist (see the method docs).
-        let uses_dict = Self::uses_dict(module, function, arity);
+        let uses_dict = hooks.dict;
         // Whether this is one of the eleven process/name/global-state BIFs, which need the
         // process-table/port-registry bridge (a `&mut ProcessTable` borrow, like the dict
         // arm — see [`ProcessBridge`]).
-        let uses_process_hook = Self::uses_process_hook(module, function, arity);
+        let uses_process_hook = hooks.process_hook;
         // Whether this is `erlang:load_nif/2`, which needs the NIF-loading bridge (also a
         // `&mut Runtime` borrow, and therefore a third mutually exclusive arm).
-        let uses_nif_loader = Self::uses_nif_loader(module, function, arity);
+        let uses_nif_loader = hooks.nif_loader;
         // Whether this is `records:get_definition/2`, which needs the record-source bridge
         // (a `&CodeServer` borrow, and therefore a fourth mutually exclusive arm).
-        let uses_record_source = Self::uses_record_source(module, function, arity);
+        let uses_record_source = hooks.record_source;
         // Whether this is `erlang:send/2`/`erlang:'!'/2`, which need the message-delivery
         // bridge (a fifth arm: it borrows the whole `Runtime` like the fun-caller bridge, and
         // the two cannot co-exist — see [`SendBridge`]).
-        let uses_send_hook = Self::uses_send_hook(module, function, arity);
+        let uses_send_hook = hooks.send_hook;
         // Whether this is `erlang:get_module_info/1,2`, which needs the module-info bridge
         // (a `&CodeServer` borrow, and therefore its own mutually exclusive arm).
-        let uses_module_info = Self::uses_module_info(module, function, arity);
+        let uses_module_info = hooks.module_info;
         // Whether this is one of the seven `persistent_term:*` BIFs, which need the
         // node-global store bridge (a cheap `Rc` clone: no runtime borrow at all).
-        let uses_persistent_term = Self::uses_persistent_term(module, function, arity);
+        let uses_persistent_term = hooks.persistent_term;
         // Whether this is one of the runtime-coupled BIF families (the timers, the loaded
         // export check, the link set) that only the running runtime can answer, and which
         // need the timer heap / reference space / process table (`&mut Runtime` plus a
         // `&mut ProcessTable`, like the dict arm — and therefore its own mutually exclusive
         // arm; see [`RuntimeHooksBridge`]).
-        let uses_runtime_hooks = Self::uses_runtime_hooks(module, function, arity);
+        let uses_runtime_hooks = hooks.runtime_hooks;
         // The local-node identity: **this runtime's own node** — the configured
         // `node@host` atom when `-name`/`-sname` made it a distributed node, else the fixed
         // `nonode@nohost` ([`Runtime::local_node`] is the single source of truth for both).
@@ -1253,10 +1440,10 @@ impl<'a> RuntimeContext<'a> {
         let mut local_node = NodeIdentity {
             node: Some(self.runtime.local_node()),
         };
-        // The caller's module name, cloned out *before* `self` is destructured: it outlives
-        // the `BifContext` borrow below (the context stores `&str`, but a local `String` is
-        // the owner), and it is forwarded to both the NIF bridge and the nested fun bridge.
-        let caller_module = self.current_module.clone();
+        // The caller's module name is **not** cloned here: only the NIF-loading, `send` and
+        // fun-caller arms consume it, and a registered BIF call may not pay an owned `String`
+        // for them. The borrow below serves the one pre-destructure consumer (the fun-identity
+        // snapshot); the destructure then moves the field out as `caller_module` for the arms.
         // The local-fun identity: `term_to_binary/1,2` (and `external_size/1,2`, which sizes
         // the same image) of a compiled module's `make_fun3` closure needs the `NEW_FUN_EXT`
         // fields the term does not carry (module atom, module MD5, `old_index`/`old_uniq`,
@@ -1270,10 +1457,10 @@ impl<'a> RuntimeContext<'a> {
         // `local_fun_identity`. The `-eval` evaluator's own closures match no loaded module's
         // `FunT`, so they keep the codec's typed `unsupported_local_fun` (see
         // [`FunIdentityBridge`]).
-        let mut fun_identity = if Self::uses_fun_identity(module, function, arity) {
+        let mut fun_identity = if hooks.fun_identity {
             Some(FunIdentityBridge::new(
                 &self.runtime.code_server,
-                caller_module.as_deref(),
+                self.current_module.as_deref(),
                 local_node.node,
             ))
         } else {
@@ -1288,7 +1475,7 @@ impl<'a> RuntimeContext<'a> {
         // loaded module's `.beam` (one `stat` syscall per module, ~23 after boot), so building
         // it on *every* registered BIF call would add ~10 us to each arithmetic operation. No
         // other BIF consults the [`MemoryHook`] seam.
-        let mut memory = if Self::uses_memory_hook(module, function, arity) {
+        let mut memory = if hooks.memory_hook {
             Some(RuntimeMemory::new(
                 Rc::clone(&atoms),
                 self.mailbox_table
@@ -1307,9 +1494,10 @@ impl<'a> RuntimeContext<'a> {
                 mailbox_pid,
                 mailbox_table,
                 may_pump_scheduler,
-                current_module: _,
+                current_module: caller_module,
                 engines,
                 gc_armed: _,
+                dispatch_memo: _,
             } = self;
             // Re-entry happens only when the BIF *applies a fun argument* (the fun-taking
             // `lists:*`/`maps:*` BIFs): the applied fun can call back into the runtime and
@@ -1404,7 +1592,7 @@ impl<'a> RuntimeContext<'a> {
                 let mut bridge = NifBridge {
                     runtime,
                     atoms: Rc::clone(&atoms),
-                    interner: pending.clone(),
+                    interner: pending.share(),
                     self_pid: self_pid.to_eterm(),
                 };
                 let mut context = BifContext::new(&mut heap, &atoms, self_pid)
@@ -1464,7 +1652,7 @@ impl<'a> RuntimeContext<'a> {
                     mailbox_pid: *mailbox_pid,
                     mailbox_table: mailbox_table.as_deref_mut(),
                     may_pump_scheduler: *may_pump_scheduler,
-                    current_module: caller_module,
+                    current_module: caller_module.clone(),
                     engines: *engines,
                 };
                 let mut context = BifContext::new(&mut heap, &atoms, self_pid)
@@ -1579,7 +1767,7 @@ impl<'a> RuntimeContext<'a> {
                     mailbox_pid: *mailbox_pid,
                     mailbox_table: mailbox_table.as_deref_mut(),
                     may_pump_scheduler: *may_pump_scheduler,
-                    current_module: caller_module,
+                    current_module: caller_module.clone(),
                     engines: *engines,
                 };
                 let mut context = BifContext::new(&mut heap, &atoms, self_pid)
@@ -1835,7 +2023,7 @@ impl<'a> RuntimeContext<'a> {
             return Ok(None);
         }
         let atoms = self.runtime.code_server.atoms_handle();
-        let interner = PendingInterner::new(atoms.len());
+        let mut interner = PendingInterner::new(atoms.len());
         let heap = self.runtime.take_bif_heap()?;
         let self_pid = self.mailbox_pid.to_eterm();
         let schedulers = crate::info::schedulers_count(self.runtime) as i32;
@@ -1859,7 +2047,7 @@ impl<'a> RuntimeContext<'a> {
         let mut host = NifHostImpl::new(
             heap,
             Rc::clone(&atoms),
-            interner.clone(),
+            interner.share(),
             self_pid,
             schedulers,
             Some(&mut services),
@@ -2095,7 +2283,8 @@ impl ExecutionContext for RuntimeContext<'_> {
             // there is the same documented limit (see `error::enforce_term_heap_limit`).
             return result.map_err(error::enforce_term_heap_limit);
         }
-        if self.runtime.registry.contains(module, function, arity) {
+        let dispatch = self.dispatch(module, function, arity);
+        if dispatch.bif.is_some() {
             // A table-creating `ets:new/2` is observed here so the runtime's owner index can
             // release the table when its creator dies (see `crate::runtime::ets_owner`). Only
             // a `named_table` is reachable through the registry's *public* surface, so only it
@@ -2109,7 +2298,7 @@ impl ExecutionContext for RuntimeContext<'_> {
                     .filter(|term| beam_term::is_atom(*term))
                     .map(beam_term::atom_val);
                 let before = name.and_then(|atom| self.runtime.tables.borrow().lookup_name(atom));
-                let result = self.call_registered(module, function, arity, args);
+                let result = self.call_registered(module, function, arity, args, dispatch.hooks);
                 if let (Some(atom), Ok(_)) = (name, &result) {
                     let after = self.runtime.tables.borrow().lookup_name(atom);
                     if let Some(handle) = after.filter(|handle| Some(*handle) != before) {
@@ -2121,7 +2310,7 @@ impl ExecutionContext for RuntimeContext<'_> {
                 }
                 return result;
             }
-            return self.call_registered(module, function, arity, args);
+            return self.call_registered(module, function, arity, args, dispatch.hooks);
         }
         if module == "erlang" {
             // The **effective** gap set: the curated list intersected with what the live
@@ -2178,10 +2367,11 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// * a module that is **not already loaded** is loaded on demand exactly as
     ///   [`Self::call_bif`] does (so the callee's `receive` suspends *this* process in the
     ///   first call too, not only the second); a load failure → `Ok(None)`, leaving
-    ///   [`Self::call_bif`] to reproduce the identical `undef` diagnostic. A module loaded
-    ///   that way whose own code reads the call site it runs at
-    ///   ([`module_observes_its_call_site`]) → `Ok(None)` as well, so the on-demand route
-    ///   never widens the caller-identity caveat documented above;
+    ///   [`Self::call_bif`] to reproduce the identical `undef` diagnostic. A callee whose own
+    ///   code reads the call site it runs at ([`module_observes_its_call_site`]) → `Ok(None)`,
+    ///   whether it was already cached or loaded on demand by this very call — the guard is
+    ///   applied to both paths, so the answer never depends on *when* the module was cached
+    ///   (the seam is idempotent, see the note at the guard);
     /// * a function atom or export the callee does not have → `Ok(None)`, so the synchronous
     ///   path reports the oracle's `undef` byte for byte.
     ///
@@ -2250,6 +2440,11 @@ impl ExecutionContext for RuntimeContext<'_> {
         // it with a machine whose own admission point is unarmed) — exactly its behaviour
         // before this seam existed.
         //
+        // This check reads the NIF registry's own loaded-library set and nothing this seam
+        // caches, so it is **idempotent**: resolving one instruction twice answers the same.
+        // (It is also why a *second* `load_nif` call from an already-loaded module is already
+        // refused here — the library is registered by then.)
+        //
         // [`NifRegistry::lookup`]: crate::nif::NifRegistry
         if self.runtime.nifs.borrow().is_loaded(module) {
             return Ok(None);
@@ -2260,12 +2455,12 @@ impl ExecutionContext for RuntimeContext<'_> {
         if self.runtime.registry.contains(module, function, arity) {
             return Ok(None);
         }
-        // Resolve the callee's module handle. A module that is **already cached** is entered
-        // here exactly as before; an uncached one is loaded **on demand**, exactly as
-        // [`Self::call_bif`] does, so the *first* call to a module runs in this machine too.
-        // Without that, a `receive` inside the callee would fold into `error::blocked()` at the
-        // call site — which is the A.9 boot blocker: `proc_lib:sync_start/2` waits in a module
-        // its caller has not touched yet, so the first `call_ext` into it is the blocking one.
+        // Resolve the callee's module handle. A module that is **already cached** is used as
+        // is; an uncached one is loaded **on demand**, exactly as [`Self::call_bif`] does, so
+        // the *first* call to a module runs in this machine too. Without that, a `receive`
+        // inside the callee would fold into `error::blocked()` at the call site — which is the
+        // A.9 boot blocker: `proc_lib:sync_start/2` waits in a module its caller has not touched
+        // yet, so the first `call_ext` into it is the blocking one.
         //
         // The load is the same `find_module_file` + `CodeServer::load` pair [`Self::call_bif`]
         // runs, and it hands back the very same `Arc<Module>` the code server caches, so the
@@ -2280,19 +2475,27 @@ impl ExecutionContext for RuntimeContext<'_> {
                 let Ok(callee) = self.runtime.code_server.load(module) else {
                     return Ok(None);
                 };
-                // A module loaded **on demand here** is the only case this seam changes (it
-                // used to take the synchronous path), and an in-machine callee runs under the
-                // **caller's** recorded `current_module` (see the NIF exclusion above). Entering
-                // a module whose own code *reads* that call site would therefore be new
-                // exposure, so it keeps the synchronous [`Self::call_bif`] path — byte for byte
-                // its behaviour before this seam loaded it. An already-cached module is
-                // untouched by this check: entering it here is its pre-existing behaviour.
-                if module_observes_its_call_site(&callee) {
-                    return Ok(None);
-                }
                 callee
             }
         };
+        // An in-machine callee runs under the **caller's** recorded `current_module` (see the
+        // NIF exclusion above), so a module whose own code *reads* that call site
+        // ([`module_observes_its_call_site`]) keeps the synchronous [`Self::call_bif`] path,
+        // which enters it through `run_export` and sets the identity correctly.
+        //
+        // This check runs **after** the module is resolved, so it covers a module that was
+        // already cached and one this very call just loaded alike — the answer no longer
+        // depends on *when* the module was cached. That is what makes the seam **idempotent**,
+        // which the native baseline tier requires: the JIT resolves one `call_ext*` twice
+        // (`jit::baseline`'s `jit_ext_call` consults this seam, and a refusal falls back to
+        // `jit_step_one`, which runs the whole instruction through `Machine::step_instruction`
+        // — and therefore through this seam again). Answering `Ok(None)` on the first
+        // consultation and `Ok(Some(..))` on the second because the on-demand load had cached
+        // the module in between would enter the callee in-machine under the caller's identity
+        // — the observed wrong `bad_lib` on a module's own `erlang:load_nif/2`.
+        if module_observes_its_call_site(&callee) {
+            return Ok(None);
+        }
         // Resolve the export in the **callee's own** atom table (`Module` code's atoms are
         // that table's, never the runtime's shared one) and hand back the export entry label
         // the synchronous `run_export` would enter. An unknown atom or export is the
@@ -2651,9 +2854,12 @@ impl ExecutionContext for RuntimeContext<'_> {
 /// global-pattern approximation only use it conservatively.
 ///
 /// The scan is over the module's `ImpT` table ([`Module::imports`]), which is where a compiled
-/// `M:F/A` call is recorded. A call reached only through `apply/3` is not covered — that is the
-/// documented residual, and it is no wider than the exposure the seam already had for a module
-/// that was cached before the call.
+/// `M:F/A` call is recorded. A call reached only through `apply/3` (`apply(erlang, load_nif, …)`)
+/// leaves no import entry to scan and is therefore not covered — the documented residual.
+///
+/// The verdict is a property of the module's own code, so the seam can apply it to an
+/// already-cached callee and to one it just loaded alike; refusing a module never depends on
+/// *when* it was cached.
 ///
 /// [`ExecutionContext::resolve_external_call`]: beam_engine::ExecutionContext::resolve_external_call
 /// [`Module::imports`]: beam_loader::Module::imports

@@ -18,117 +18,86 @@
 //
 // %CopyrightEnd%
 
-//! **Execution-tier selection** for the runner's first entry, and the soundness
-//! argument for putting a scheduled process on the native baseline tier.
+//! **Execution-tier selection** for the runner's first entry, and the soundness argument for
+//! putting every scheduled process on the native baseline tier.
 //!
-//! # Why a tier cannot be chosen blindly
+//! # The two tiers
 //!
-//! The engine's baseline-JIT driver
-//! ([`beam_engine`]'s `jit::baseline::run_compiled_outcome`) runs one module's compiled
-//! basic blocks and deopts to the interpreter step for anything it does not inline. It has
-//! **no in-machine module-context switch**: when a step reports
-//! [`Step::Enter`](beam_engine::interpreter) — "continue in *another* module's code" — the
-//! driver cannot rebind the block/label/literal context and returns the hard typed
-//! `unsupported("jit: module context switch outside the interpreter driver")`. On the
-//! runner path that error becomes the process's **exit reason**, i.e. a *wrong observable
-//! result* against the oracle — so the tier must never be selected for a module from which
-//! that step is reachable.
+//! [`Tier::Interpreter`] is the direct-threaded interpreter
+//! ([`beam_engine`]'s `interpreter`) — the reference semantics every other tier must match.
+//! [`Tier::BaselineJit`] is the engine's native baseline tier (`beam_engine`'s `jit::baseline`):
+//! it compiles each IR basic block to an x86-64 `extern "C"` function and runs the module
+//! through a driver loop whose **per-instruction deopt** is literally
+//! `Machine::step_instruction` — the interpreter's own step. Anything a block does not inline
+//! (and every instruction the tier has no lowering for) therefore runs the *same* semantics,
+//! one instruction at a time, so the tier is interpreter-identical by construction rather than
+//! by parallel implementation.
 //!
-//! # The only producers of a module-context switch
+//! # Why the baseline tier is sound for *any* module
 //!
-//! `Step::Enter` is produced by exactly three instruction shapes (verified against the
-//! engine source):
+//! A step that reports [`Step::Enter`](beam_engine::interpreter) — "continue in *another*
+//! module's code" — was historically the one shape a native tier could not take: a compiled
+//! block's code, label map and literal area are all bound to a single module. The engine's
+//! driver now handles it. A `Step::Enter` (raised by its own interpreter step, or handed back
+//! as the `ENTER` word by a compiled `call_ext`/`return`) switches the machine context
+//! (`Machine::switch_context`), rebinds the module / label map / literal area and continues in
+//! the **callee's** compiled blocks — including the first sight of a module the context switch
+//! has not compiled yet. The transition is a driver round-trip by construction (each
+//! `CompiledModule` owns its own executable mapping and the runtime's module/label pointers are
+//! baked for one module), which is a performance property, not a correctness one.
 //!
-//! * [`Instr::CallExt`]/[`Instr::CallExtOnly`]/[`Instr::CallExtLast`] — via
-//!   `resolve_external_entry` → [`ExecutionContext::resolve_external_call`]; the step is
-//!   produced **iff** that seam answers `Ok(Some((callee, label)))` for a *statically
-//!   known* `{module, function, arity}` (the import table's).
-//! * [`Instr::Apply`]/[`Instr::ApplyLast`] — via `apply_target` →
-//!   [`ExecutionContext::resolve_external_call`] on a **dynamic** `x(arity)`/`x(arity+1)`
-//!   module/function, so the target can never be proven synchronous statically.
-//! * [`Instr::CallFun`]/[`Instr::CallFun2`] are **safe**: they go through the synchronous
-//!   [`ExecutionContext::apply_fun`] and never report `Step::Enter`.
+//! Two further producers — the interpreter's `return_step` and `Machine`'s `catch`-landing —
+//! emit `Step::Enter` only when returning/raising *across* a module context the run is already
+//! in, so they need no separate handling.
 //!
-//! Two further producers (`the interpreter's `return_step` and `Machine`'s
-//! `catch`-landing) emit `Step::Enter` only when *returning/raising across* a module
-//! context the run is **already in** — unreachable when no instruction ever switched the
-//! run out of its entry module, so they add no precondition.
+//! There is therefore **no module the baseline tier cannot run**, and no per-module
+//! switch-safety predicate is needed. One host-side obligation remains, and it is enforced
+//! outright rather than by a predicate:
 //!
-//! # The predicate
-//!
-//! [`jit_is_switch_safe`] therefore holds exactly when the module contains **no
-//! `Apply`/`ApplyLast`** and **every** `CallExt*` target is *provably synchronous*.
-//! Synchronous is proven by the three `Ok(None)` short-circuits of
-//! [`RuntimeContext::resolve_external_call`](crate::context) — the floor namespaces
-//! ([`crate::native::FLOOR_MODULES`]), a module with a loaded NIF
-//! ([`crate::nif::NifRegistry::is_loaded`]), and a registered `beam_bifs` key
-//! ([`beam_bifs::BifRegistry::contains`]) — evaluated **in that order, with the very same
-//! arguments the seam receives**. Those three checks are the *sufficient* conditions for
-//! `Ok(None)`; the seam's remaining `Ok(None)` cases (a load failure, the float guard, a
-//! call-site observer, an unknown export) can only add safety, so the predicate is
-//! **conservative** — it may refuse the JIT for a module that would in fact have run fine,
-//! but it never permits one that could switch.
-//!
-//! The verdict is **sticky in the safe direction**: `FLOOR_MODULES` is a constant and the
-//! NIF/registry checks only ever gain entries (a `load_nif` *adds* a loaded library; no
-//! registry key is ever removed at run time), so a module proven safe stays safe. That is
-//! what makes the per-module memo in [`RunnerState`](super::RunnerState) sound; a stale
-//! *unsafe* verdict it might retain is only a missed optimisation (the interpreter is
-//! always correct), never a wrong result.
+//! * **The host's cross-module seam must be idempotent.** The native `call_ext*` arm resolves
+//!   the import through [`ExecutionContext::resolve_external_call`] natively, and when the host
+//!   declines (`Ok(None)`) the *whole instruction* is re-run by the interpreter step — which
+//!   consults the same seam a **second** time. A seam whose answer changed between the two
+//!   consultations (a module cached by the first one) would route the callee two different ways
+//!   and could enter it in-machine under the caller's module identity. See
+//!   [`RuntimeContext::resolve_external_call`](crate::context), which is written to be
+//!   idempotent for exactly this reason.
 //!
 //! # The tier survives a suspension
 //!
 //! The tier is chosen for a process's **first** entry and remembered on its engine
 //! ([`ProcessEngine::tier`](super::entry::ProcessEngine)): a slice that pre-empts on the
 //! reduction budget, or a `receive` that parks, re-enters through
-//! [`Machine::resume_outcome_with_tier`](beam_engine::Machine::resume_outcome_with_tier)
-//! on that **same** tier instead of dropping to the interpreter, so an allocating hot loop
-//! keeps its tier across its whole life. An interpreter-tier process is unaffected —
+//! [`Machine::resume_outcome_with_tier`](beam_engine::Machine::resume_outcome_with_tier) on that
+//! **same** tier instead of dropping to the interpreter, so an allocating hot loop keeps its tier
+//! across its whole life. An interpreter-tier process is unaffected —
 //! [`Tier::Interpreter`](beam_engine::Tier::Interpreter) delegates to the plain
 //! [`Machine::resume_outcome`](beam_engine::Machine::resume_outcome).
 //!
-//! # Why the default is `auto`
+//! The remembered tier is observable only at such a **slice boundary**: a process that runs to
+//! completion inside its first slice never re-enters, and the budget is charged only at the
+//! engine's heap-admission points (`test_heap`/`allocate_heap`), so a binary-accumulating or
+//! `call_ext`-only hot loop charges nothing and never pre-empts. That is why the tier is selected
+//! **eagerly at the first entry** rather than after a bounded warm-up on the interpreter: the
+//! warm-up was measured and declined because it would pin exactly those zero-charge hot loops to
+//! the reference tier for their whole life. The verified characterisation (with figures) is in
+//! `PERF.md`.
 //!
-//! The tier costs nothing observable and never regresses a workload, so the **default is
-//! [`JitMode::Auto`]** — the JIT exactly where the soundness predicate proves the entry
-//! module free of a module-context switch, the always-correct interpreter everywhere else.
-//! Measured on the release build with no per-process `erl` start-up (the system code path
-//! resolves natively from the filesystem), alternating runs: **min / median wall seconds**:
+//! # Why the default is the native tier
 //!
-//! | workload | shape | interpreter | `auto` |
-//! |---|---|---|---|
-//! | `walk:cnt/1 20000000` | non-allocating tail loop | 16.05 / 17.05 s | 0.116 / 0.127 s |
-//! | `al:tailnoalloc/1 20000000` | non-allocating tail loop | 19.35 s | 0.114 s |
-//! | `fibn:fib/1 27` | allocating tree recursion | 0.384 / 0.403 s | 0.273 / 0.284 s |
-//! | `al:list/1 3000000` | allocating tail loop (`test_heap`) | 1.34 / 1.40 s | 1.27 / 1.43 s |
-//! | `slice:fib/1 300000` (the fixture) | bignum loop | 0.135 / 0.183 s | 0.119 / 0.226 s |
-//! | `slice:fib/1 32` (the fixture) | bignum loop, trivial | 0.026 / 0.033 s | 0.022 / 0.029 s |
+//! The tier costs nothing observable (it is interpreter-identical, including every `RunOutcome`
+//! suspension address and every typed error), so the **default selects the baseline tier for
+//! every process entry**; measured workload figures live in `erts_rust/tools/bench/RESULTS.md`
+//! and are re-measured there rather than transcribed here.
 //!
-//! The 139–170× win is the no-heap-admission-point shape (nothing can pre-empt such a loop,
-//! so it stays in its one tier-chosen slice). The allocating rows above are a snapshot from
-//! before the tier was carried across a park, so they are the conservative figure: a loop that
-//! **does** allocate is pre-empted and resumed, and it now keeps the JIT across every slice
-//! (see above). The committed `preempt:alloc_loop/1` fixture — one `test_heap` per iteration,
-//! so it pre-empts repeatedly — measures **min 0.180 s** on the interpreter vs **min 0.086 s**
-//! on `auto` (≈2.1×) on a release build, 3 alternating runs at N = 200 000. The default is
-//! **not** the switch-blind [`JitMode::Baseline`] for exactly one reason: the predicate is what
-//! keeps a switch out of a JIT slice, and the engine's `Step::Enter` deopt seam is still
-//! missing, so a slice that could switch would turn a typed gap into a wrong exit reason.
-//!
-//! One residual engine seam caps the tier; it does not make the default unsafe:
-//!
-//! * **No in-machine module-context switch.** A step that reports `Step::Enter` ("continue
-//!   in another module's code") is the JIT driver's hard typed
-//!   `unsupported("jit: module context switch outside the interpreter driver")` — which is
-//!   why [`jit_is_switch_safe`] must hold before a module may be tiered.
+//! [`BEAM_RT_TIER=interpreter`](JitMode::Interpreter) is the kill switch that pins the
+//! reference tier; every differential-gate baseline is taken there.
 
 use std::sync::OnceLock;
 
 use beam_engine::Tier;
-use beam_loader::{ImportRef, Instr, Module};
 
 use super::entry::{ProcessEntry, RunnerState};
-use crate::nif::NifRegistry;
 use crate::runtime::Runtime;
 
 /// How the runner picks the execution tier for a process.
@@ -139,45 +108,38 @@ use crate::runtime::Runtime;
 /// [`Machine::resume_outcome_with_tier`](beam_engine::Machine::resume_outcome_with_tier).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum JitMode {
-    /// The baseline JIT exactly when [`jit_is_switch_safe`] proves the entry module free
-    /// of a module-context switch; the interpreter otherwise. **The default.**
+    /// The native baseline tier for **every** process entry. **The default.**
     ///
-    /// This is both the unset-`BEAM_RT_TIER` default and the `BEAM_RT_TIER=auto` value: a
-    /// module the predicate cannot prove safe runs on the always-correct interpreter, so
-    /// the default carries no correctness risk (see the module docs for the measurements
-    /// and the residual engine seams).
+    /// This is both the unset-`BEAM_RT_TIER` default and the `BEAM_RT_TIER=auto` value. It is
+    /// the same selection [`JitMode::Baseline`] forces: the engine's driver handles the
+    /// module-context switch, so there is no module that has to be inspected (or refused)
+    /// first — see the module docs for the soundness argument.
     #[default]
     Auto,
-    /// The interpreter unconditionally (the reference tier).
+    /// The interpreter unconditionally (the reference tier, and the kill switch).
     ///
-    /// The `BEAM_RT_TIER=interpreter` value: it is the tier the differential gate and the
-    /// pre-JIT measurements are taken against, and the one to pin when a divergence is
-    /// being chased.
+    /// The `BEAM_RT_TIER=interpreter` value: the tier the differential gate and the pre-JIT
+    /// measurements are taken against, and the one to pin when a divergence is being chased.
     Interpreter,
-    /// The baseline JIT unconditionally.
+    /// The native baseline tier for **every** process entry, requested explicitly.
     ///
-    /// This is an **explicit override of the safety predicate** (a measurement/debugging
-    /// knob), so it is only ever chosen deliberately, never by [`JitMode::Auto`]. Against
-    /// a module that can report a module-context switch (`Step::Enter`) it hits the JIT
-    /// driver's typed `unsupported("jit: module context switch outside the interpreter
-    /// driver")` — which on the runner path becomes the process's exit reason — so it must
-    /// not be used to run unknown code.
+    /// The `BEAM_RT_TIER=baseline` value. It selects exactly what [`JitMode::Auto`] selects
+    /// today, so it is a measurement/debugging alias of the default rather than a different
+    /// policy; the two are kept distinct because the environment surface names both and
+    /// `interpreter` must remain the only value that turns the tier off.
     Baseline,
 }
 
 /// [`JitMode`] for one `BEAM_RT_TIER` value — the **pure** resolution, and the single
 /// definition of the variable's semantics.
 ///
-/// * `None` (the variable is unset) → [`JitMode::Auto`] — **the default**: the JIT exactly
-///   where [`jit_is_switch_safe`] proves the entry module free of a module-context switch,
-///   the interpreter everywhere else (no measurable regression on any workload — see the
-///   module docs).
+/// * `None` (the variable is unset) → [`JitMode::Auto`] — **the default**: the native baseline
+///   tier for every process entry (see the module docs).
 /// * `Some("auto")` → [`JitMode::Auto`] — the same mode, named explicitly.
-/// * `Some("baseline")` → [`JitMode::Baseline`] — the forced measurement/debug override of
-///   the predicate (see [`JitMode::Baseline`] for its risk).
-/// * `Some("interpreter")` and any other value → [`JitMode::Interpreter`] — an unknown
-///   value resolves to the always-correct interpreter rather than being an error (so a typo
-///   re-enables the reference tier instead of silently enabling the JIT).
+/// * `Some("baseline")` → [`JitMode::Baseline`] — the same selection, forced explicitly.
+/// * `Some("interpreter")` and any other value → [`JitMode::Interpreter`] — an unknown value
+///   resolves to the always-correct interpreter rather than being an error (so a typo re-enables
+///   the reference tier instead of silently enabling the JIT).
 ///
 /// Pure (no environment read), so a test can pin the semantics without mutating the
 /// process environment (the crate is `#![deny(unsafe_code)]`, and `set_var` is `unsafe` in
@@ -203,106 +165,28 @@ pub(super) fn env_default() -> JitMode {
 
 /// The execution tier for a process's first entry.
 ///
-/// Resolves the entry module (a [`ProcessEntry::Fun`] whose local target has not been
-/// resolved yet is conservatively the interpreter, because its module is only known once
-/// the context — which this must run *before* — resolves it) and, for
-/// [`JitMode::Auto`], consults the memoized switch-safety verdict.
+/// `runtime`, `state` and `entry` are not consulted: the baseline tier is sound for any module
+/// (see the module docs), so the mode alone decides. The parameters are kept because this is the
+/// runner's single tier-decision seam — a future policy (a Cranelift hot tier, a per-module
+/// measurement) would read them here, and the caller
+/// ([`RuntimeRunner`](super::RuntimeRunner)) resolves the tier **before** it builds the
+/// [`RuntimeContext`](crate::context::RuntimeContext) that borrows the runtime.
+///
+/// The tier is chosen from the [`ProcessEntry`] alone, i.e. **before** a fun entry's local
+/// launch target has been resolved (that resolution needs the context, and happens on the same
+/// first run). That is not a limitation here: the selection does not depend on the module, and
+/// the remembered tier is used by the label entry the resolved fun takes.
 ///
 /// Called **once** per process, at its first entry; the caller remembers the answer on the
 /// engine, so no later slice selects a tier again (see [`JitMode`]).
 pub(super) fn select_entry_tier(
-    runtime: &Runtime,
-    state: &mut RunnerState,
-    entry: &ProcessEntry,
+    _runtime: &Runtime,
+    _state: &mut RunnerState,
+    _entry: &ProcessEntry,
     mode: JitMode,
 ) -> Tier {
     match mode {
         JitMode::Interpreter => Tier::Interpreter,
-        JitMode::Baseline => Tier::BaselineJit,
-        JitMode::Auto => match entry.entry_module() {
-            Some(module) if module_is_switch_safe(runtime, state, module) => Tier::BaselineJit,
-            _ => Tier::Interpreter,
-        },
+        JitMode::Auto | JitMode::Baseline => Tier::BaselineJit,
     }
-}
-
-/// [`jit_is_switch_safe`] memoized per module name in `state`.
-///
-/// A module with no resolvable name is never memoized (and is never safe): the name is the
-/// only key the runner has, so an unnamed module stays on the interpreter rather than
-/// sharing a memo entry with a different one.
-fn module_is_switch_safe(runtime: &Runtime, state: &mut RunnerState, module: &Module) -> bool {
-    let Some(name) = module.atom_name(module.name) else {
-        return false;
-    };
-    if let Some(&safe) = state.jit_safety.get(name) {
-        return safe;
-    }
-    let safe = jit_is_switch_safe(runtime, module);
-    state.jit_safety.insert(name.to_string(), safe);
-    safe
-}
-
-/// Whether `module`'s code can run on the baseline JIT **without ever** reporting a
-/// module-context switch (`Step::Enter`).
-///
-/// `true` iff the module has no `apply`/`apply_last` and every `call_ext*` target is
-/// provably synchronous — see the module docs for the argument and the exact conditions.
-/// A module that cannot be proven safe is reported unsafe, so a `false` verdict only ever
-/// costs the faster tier, never a wrong result.
-pub(super) fn jit_is_switch_safe(runtime: &Runtime, module: &Module) -> bool {
-    // Conservative: a registry already borrowed elsewhere cannot be inspected, and the
-    // borrow always succeeds on the runner path (this runs before the context is built).
-    let Ok(nifs) = runtime.nifs.try_borrow() else {
-        return false;
-    };
-    for function in &module.functions {
-        for instr in &function.code {
-            match instr {
-                // A dynamic `M,F,A`: the target is a register value, so it can never be
-                // proven synchronous.
-                Instr::Apply { .. } | Instr::ApplyLast { .. } => return false,
-                Instr::CallExt { target, arity }
-                | Instr::CallExtOnly { target, arity }
-                | Instr::CallExtLast { target, arity, .. } => {
-                    if !call_ext_is_synchronous(runtime, module, *target, *arity, &nifs) {
-                        return false;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    true
-}
-
-/// Whether one `call_ext*`'s target is provably synchronous — i.e. whether
-/// [`RuntimeContext::resolve_external_call`](crate::context) is guaranteed to answer
-/// `Ok(None)` for it, leaving the call on the synchronous `call_bif` path.
-///
-/// The seam is handed the **import entry's** `{module, function, arity}`
-/// (`beam_engine`'s `interpreter::import_target`), so the registry lookup uses that arity;
-/// an instruction whose `arity` operand disagrees with the import is not trusted.
-fn call_ext_is_synchronous(
-    runtime: &Runtime,
-    module: &Module,
-    target: ImportRef,
-    instruction_arity: u32,
-    nifs: &NifRegistry,
-) -> bool {
-    let Some(import) = module.imports.get(target.0 as usize) else {
-        return false;
-    };
-    if import.arity != instruction_arity {
-        return false;
-    }
-    let (Some(module_name), Some(function_name)) = (
-        module.atom_name(import.module),
-        module.atom_name(import.function),
-    ) else {
-        return false;
-    };
-    crate::native::FLOOR_MODULES.contains(&module_name)
-        || nifs.is_loaded(module_name)
-        || runtime.registry.contains(module_name, function_name, import.arity)
 }
