@@ -87,4 +87,5 @@ Grouped by module (exports listed by role; see inline `-moduledoc`/`-doc` for de
 - `../include/merl.hrl` — the `?Q` macro header consumers include.
 - `../test/` — Common Test suites (sibling; read-only from here, escalate write changes to the app root).
 - `../ebin/` — build output (`*.beam`, generated `syntax_tools.app`/`.appup`).
-- `../../compiler/` — biggest downstream consumer of `erl_syntax`/`epp_dodger`; `../../stdlib/` — provides `erl_parse`/`erl_scan`.
+- `../../edoc/`, `../../dialyzer/` (`cerl_prettypr`, `dialyzer_dataflow`), `../../common_test/` (`ct_doctest`, `erl2html2`) and `../../diameter/src/compiler/` — the in-tree source consumers of `erl_syntax`/`erl_prettypr`/`epp_dodger`.
+- `../../compiler/` does **not** depend on `syntax_tools` in its runtime path (`compiler.app.src` lists only `[kernel, stdlib]`; no reference in `compiler/src/`) — only its `test/` suites `-include_lib` `merl.hrl`. `../../stdlib/` provides `erl_parse`/`erl_scan`/`unicode`/`file`.
