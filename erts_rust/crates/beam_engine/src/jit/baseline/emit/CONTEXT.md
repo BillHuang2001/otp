@@ -165,7 +165,8 @@ out-of-bound register is never counted. Every non-selected register is read/writ
 
 ## Routing Table
 - `mod.rs` -> compiled-block shape: `SAVED_REGISTERS`/`CACHE_REGISTERS`/scratch constants, `touch`/`Allocation`,
-  the two compilation entry points `compile_module` (**eager**: whole-module block map + `native_bounds`) and
+  the two compilation entry points `compile_module` (**eager**: whole-module block map + the merged
+  whole-module summary that guards entry) and
   `compile_function` (**lazy**: one function's own buffer/entries/summary, sharing `emit_function`),
   `code_capacity_estimate`/`function_capacity_estimate` + size budgets, `emit_block` (the dispatch),
   `emit_helper_call`, `emit_step_and_continue`, `emit_ext_call`, `emit_continue_check`, `spill`/`fill`.
