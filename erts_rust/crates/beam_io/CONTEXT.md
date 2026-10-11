@@ -212,6 +212,7 @@ Current: **585 passing / 0 failing / 2 ignored** — **409** lib in-module (`#[c
 
 ## Handoffs (beam_rt — out of this node)
 **Runtime adoption still owed** (seams exist and are tested here):
+- **The `#file_info{}` `access`/`uid`/`gid` success path → `beam_io::fs_access`.** The safe floor now exists here (`path_access(&Path) -> Result<(read, write)>`, `process_credentials() -> Result<(euid, egid)>`, plus the boolean `access` and the errno-preserving `try_access`); `beam_rt`'s `prim_file` floor (`crates/beam_rt/src/native/prim.rs:107-109`; the handoff at `beam_rt/CONTEXT.md:243`) still answers the typed `unsupported` for an existing-path `#file_info{}` and can now adopt it.
 - **The `tcp_inet` driver is unreachable through the runtime's `open_port/2`.** `open_port({spawn_driver,"tcp_inet"}, …)` never finds the built-in: `beam_rt`'s `driver_lookup` (`crates/beam_rt/src/port.rs:1670`, used from the `SpawnDriver` branch at `:1322`) only `dlopen`s `.so` candidates and never consults `beam_io::DriverRegistry::with_builtins()` (`src/driver.rs`), so the open is `badarg`; `make_tcp_inet` and its registry entry are implemented and tested here.
   **Owner: `beam_rt` (its driver resolver).**
 - **Four `tcp_inet` capabilities need a cross-crate seam** — `{active,N|once}`/`{deliver,…}`/`active_count` input delivery, `send_timeout`/`send_timeout_close`, `controlling_process`, and the async-op queue.
