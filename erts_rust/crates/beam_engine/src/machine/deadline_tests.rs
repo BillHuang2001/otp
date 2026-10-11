@@ -77,14 +77,17 @@ recv() ->
     end.
 ";
 
-/// Compile [`AFTER_SRC`] into a fresh temp dir and return that dir; `None` when no
-/// runnable `erlc` is on `PATH` at all (the caller skips loudly).
+/// Compile [`AFTER_SRC`] into a per-`tag` fresh temp dir and return that dir; `None`
+/// when no runnable `erlc` is on `PATH` at all (the caller skips loudly).
+///
+/// The `tag` names the scratch directory so tests running in parallel on the same host
+/// never share a path (and thus never race on a partially-written `afterrecv.beam`).
 ///
 /// `None` means `erlc` could not be **spawned**. An `erlc` that *ran* and exited
 /// non-zero is a **harness** failure (the source is valid Erlang), so it panics with the
 /// captured stderr rather than masquerading as an absent toolchain.
-fn compile_after() -> Option<PathBuf> {
-    let dir = std::env::temp_dir().join("beam_engine_machine_deadline_oracle");
+fn compile_after(tag: &str) -> Option<PathBuf> {
+    let dir = std::env::temp_dir().join(format!("beam_engine_machine_deadline_oracle_{tag}"));
     std::fs::create_dir_all(&dir)
         .unwrap_or_else(|error| panic!("create {}: {error}", dir.display()));
     std::fs::write(dir.join("afterrecv.erl"), AFTER_SRC)
@@ -156,7 +159,7 @@ fn reason(error: BeamError) -> String {
 
 #[test]
 fn a_nested_after_timeout_fires_when_the_engine_deadline_is_resumed() {
-    let Some(dir) = compile_after() else {
+    let Some(dir) = compile_after("nested") else {
         eprintln!("SKIP: no system `erlc` on PATH -- the nested `after T` test is skipped");
         return;
     };
@@ -209,7 +212,7 @@ fn a_nested_after_timeout_fires_when_the_engine_deadline_is_resumed() {
 fn a_blocking_entry_after_timeout_fires_at_the_deadline() {
     // The blocking-aware entry reports the suspension (instead of folding it); the same
     // deadline -> resume path must then run the `after` clause.
-    let Some(dir) = compile_after() else {
+    let Some(dir) = compile_after("blocking") else {
         eprintln!("SKIP: no system `erlc` on PATH -- the blocking `after T` test is skipped");
         return;
     };

@@ -1139,6 +1139,36 @@ impl Process {
         self.run_rooted_collection(|collector, roots| collector.ensure_capacity(need_words, roots))
     }
 
+    /// A **no-relocation** growth passthrough: enlarges the young nursery so a `need_words`-word
+    /// allocation can proceed, **without collecting and without moving any live term** —
+    /// [`beam_gc::AnyCollector::grow_nursery`] forwarded for the process's own collector
+    /// (strategy-agnostic across the mature-generation dispatch).
+    ///
+    /// The space the growth replaces is **retained** (the nursery becomes a chain of spaces) and
+    /// never collapses here, so every live word stays addressable at its **original address** and
+    /// no collection runs.
+    ///
+    /// Because nothing moves, this call is **not** gated by
+    /// [`relocation_exempt`](Process::set_relocation_exempt) and carries **no** relocation-exempt
+    /// guard: unlike [`Process::collect`] / [`Process::ensure_capacity`] (which collect first and
+    /// so refuse an exempt process with the typed `relocation_exempt` raise), this call is legal
+    /// and succeeds for an exempt process — which is exactly the point, because a host holding an
+    /// incomplete or unpublished root set (the `-eval` evaluator, a nested `Machine`) may call it
+    /// safely.
+    ///
+    /// Returns the resulting young-nursery capacity in words
+    /// ([`beam_gc::HeapSpace::capacity_words`] of the now-current nursery space).
+    ///
+    /// # Errors
+    ///
+    /// When [`max_heap_words`](beam_gc::HeapPolicy::max_heap_words) (or the growth table's
+    /// ceiling) cannot reach `need_words`, the typed [`BeamError::Alloc`] heap-exhaustion error is
+    /// returned and the collector is left untouched; it is propagated unchanged (never swallowed).
+    pub fn grow_nursery(&mut self, need_words: usize) -> Result<usize> {
+        self.collector.grow_nursery(need_words)?;
+        Ok(self.collector.young().capacity_words())
+    }
+
     /// Gathers the process root set, runs `collect` over it and writes every region back — the
     /// shared body of [`Process::collect`] and [`Process::ensure_capacity`].
     ///
@@ -1305,7 +1335,7 @@ mod tests {
     //! the link/monitor accessors and the collect policy. Message delivery and the full
     //! safepoint collection are exercised by the `tests/` integration suite.
 
-    use beam_term::prelude::{make_small, AtomTable, NIL};
+    use beam_term::prelude::{make_small, ptr_val, AtomTable, NIL};
 
     use super::*;
     use crate::monitor::{Monitor, MonitorKind, RefAllocator};
@@ -1607,6 +1637,70 @@ mod tests {
         assert!(!process
             .collect_if_needed(1)
             .expect("a tiny request needs no collection"));
+    }
+
+    /// [`Process::grow_nursery`] enlarges the nursery **in place**: it retains the space it
+    /// replaces (`young_space_count` grows), runs **no** collection (`minor_gcs` is unchanged)
+    /// and relocates **no** live term (a captured word keeps its exact address and value).
+    ///
+    /// It also pins the absence of a relocation-exempt guard: growth is legal for an exempt
+    /// process (the host holding an incomplete root set), unlike [`Process::collect`] /
+    /// [`Process::ensure_capacity`], and still moves nothing.
+    #[test]
+    fn grow_nursery_enlarges_without_collecting_or_relocating() {
+        let mut process = Process::new(pid(40)).expect("the default heap allocates");
+
+        // A live term in the young heap, captured by address.
+        let term = process
+            .heap_mut()
+            .tuple(&[make_small(1), make_small(2)])
+            .expect("the tuple fits");
+        let ptr = ptr_val(term);
+        // SAFETY: the tuple was just allocated in the process's young heap, so the header word at
+        // `ptr` is live; the growth retains the space holding it, so the word stays readable.
+        let header_before = unsafe { *ptr };
+
+        let spaces_before = process.collector().young_space_count();
+        let cap_before = process.collector().young().capacity_words();
+        let minors_before = process.collector().minor_gcs();
+
+        let grown = process
+            .grow_nursery(4096)
+            .expect("the default policy grows on demand");
+
+        // (1) Growth happened: a space was retained and the current capacity grew past the request.
+        assert!(process.collector().young_space_count() > spaces_before);
+        assert!(process.collector().young().capacity_words() > cap_before);
+        assert!(grown >= 4096, "the returned capacity covers the request");
+
+        // (2) No collection ran.
+        assert_eq!(process.collector().minor_gcs(), minors_before);
+
+        // (3) The live term is at its EXACT same address, word for word.
+        assert!(process.collector().young_contains(ptr));
+        // SAFETY: as above — the retained space still holds the tuple's header.
+        assert_eq!(unsafe { *ptr }, header_before);
+
+        // (4) No exemption guard: an exempt process may grow, and still nothing moves.
+        process.set_relocation_exempt(true);
+        assert!(process.grow_nursery(16384).is_ok());
+        assert!(process.collector().young_contains(ptr));
+        assert_eq!(process.collector().minor_gcs(), minors_before);
+        // SAFETY: as above — the address is unchanged across both growths.
+        assert_eq!(unsafe { *ptr }, header_before);
+    }
+
+    /// A nursery request the policy's ceiling cannot reach yields the typed
+    /// [`BeamError::Alloc`] heap-exhaustion error (propagated unchanged through `?`), leaving the
+    /// collector untouched.
+    #[test]
+    fn grow_nursery_returns_the_typed_heap_exhaustion_error_under_a_cap() {
+        let mut process = Process::with_policy(pid(41), HeapPolicy::from_min_max(0, 512))
+            .expect("the capped heap allocates");
+        let err = process
+            .grow_nursery(1_000_000)
+            .expect_err("the ceiling makes the request unreachable");
+        assert!(matches!(err, BeamError::Alloc(_)));
     }
 
     /// Pins the mailbox half of the root walk: every queued message contributes **three**

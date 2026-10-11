@@ -31,23 +31,22 @@
 //! [`CodeServer::add_system_paths`]: beam_rt::CodeServer::add_system_paths
 //! [`EXTRA_CODE_PATH_APPS`]: (crate-internal) `codeserver::EXTRA_CODE_PATH_APPS`
 //!
-//! # Green vs reported-only (read this before changing an assertion)
+//! # What this suite asserts
 //!
-//! The in-process compile path is **not complete yet**: the real `bootstrap`-independent
-//! `compile:file/2` run currently stops on a typed engine gap (see the two tests below and the
-//! module note at the bottom). Every test here is therefore written to be **honest**:
+//! This suite is a **strict differential gate** for the in-process compile path, not a report-only
+//! scaffold. Every probe really runs OTP's compiler under the built `beam_rt` binary and the
+//! observable results are asserted against the system oracle:
 //!
-//! * It always *runs* the attempt under the built `beam_rt` binary and prints the observed outcome.
-//! * When the runtime raises a typed `unsupported`/other error, the test prints the **precise
-//!   blocker** (exit code + stderr) and returns — it never fabricates a pass and never asserts a
-//!   result the runtime did not produce.
-//! * When the runtime *does* produce an artifact, the strict differential asserts (byte-for-byte
-//!   against an oracle run with the **identical** option list, plus the `Code` chunk against
-//!   `erlc +deterministic`) become live automatically — no one has to remember to un-ignore
-//!   anything. A real divergence then fails loudly.
+//! * `the_in_process_compiler_is_reachable` asserts the runtime completes the `compile:forms/2`
+//!   probe, that the probe printed one of its own three result shapes, and that the printed shape
+//!   is `assert_eq!`-equal to the oracle's answer.
+//! * `the_in_process_compile_file_artifact_matches_the_oracle` asserts the runtime completed
+//!   `compile:file/2`, that the artifact exists, that it is **byte-for-byte** identical to an
+//!   oracle run with the **identical** option list, and that its `Code` chunk matches
+//!   `erlc +deterministic` (through `beam_lib:chunks/2`).
 //!
-//! So this suite is **green by default while the path is blocked** and becomes a real gate the
-//! moment the engine gap closes.
+//! A real divergence fails the suite. A missing toolchain (`erl`/`erlc`) is a **loud** skip
+//! (`support::require_oracle` / `support::skip_loudly`), never a silent pass.
 //!
 //! # Why the artifact comparison is shaped the way it is
 //!
@@ -64,12 +63,11 @@
 //!
 //! Every probe is `beam_rt -noshell -eval '<expr>'`. The `-eval` driver runs on the runtime's root
 //! process and **pumps the scheduler** through `Runtime::pump_scheduler`, which is what the native
-//! `file_server_2` read path needs; it is also the route on which the `file` read path already
-//! agrees with the oracle. The `run <file.beam> <m>:<f>/<n>` alternative (a *scheduled* process) is
-//! documented in `beam_rt`'s CLI surface and reaches the same compile path; this suite uses `-eval`
-//! because it needs no compiled fixture.
-//!
-//! A missing toolchain (`erl`/`erlc`) is a **loud** skip, never a silent pass.
+//! `file_server_2` read path needs; it is the route on which the in-process compile completes (the
+//! native `file_server_2` also serves `save_binary`'s write, so `compile:file/2`'s artifact lands
+//! on disk), and it needs no compiled fixture. A compile driven from a **scheduled** process
+//! instead stops with the typed `unsupported: opcode: run: process blocked (no message available)`
+//! — a cross-crate root-publication gap owned by `beam_engine`/`beam_process`, not by this node.
 
 // The shared harness is compiled in whole, but this suite uses only its bounded runner and its
 // toolchain discovery; the unused remainder is expected here — the same shape `tests/io_scan.rs`
@@ -169,7 +167,7 @@ fn write_source(dir: &Path) -> PathBuf {
 // ---------------------------------------------------------------------------------------
 
 /// The abstract forms of a tiny module, spelled out so the probe needs **no** parser and no `epp`:
-/// this isolates the compiler passes from the io-device/file read path (the de-risk step).
+/// this isolates the compiler passes from the io-device/file read path.
 const FORMS: &str = "[{attribute,1,module,hello},\
      {attribute,2,export,[{add,2}]},\
      {function,3,add,2,[{clause,3,[{var,3,'A'},{var,3,'B'}],[],\
@@ -190,8 +188,8 @@ fn forms_probe() -> String {
     )
 }
 
-/// The **end-to-end** probe: `compile:file/2` with the exact option list the oracle is given in
-/// parallel ([`file_opts`]).
+/// The **end-to-end** probe: `compile:file/2` with the exact option list both runtimes are given
+/// (the oracle is asked this same expression, only with its own output directory).
 fn file_probe(src: &Path, outdir: &Path) -> String {
     format!(
         "R = compile:file({}, [no_spawn_compiler_process, deterministic, {{outdir, {}}}]),\n\
@@ -203,11 +201,14 @@ fn file_probe(src: &Path, outdir: &Path) -> String {
 }
 
 /// `beam_lib:chunks/2` over `file`, reported as the md5 of its **`Code` chunk** — the chunk that is
-/// independent of the `Dbgi` options difference (see the module note).
+/// independent of the `Dbgi` options difference (see *Why the artifact comparison is shaped the way
+/// it is* above). The chunk is requested and matched by its real name, `"Code"`
+/// (`beam_lib:chunks/2` rejects the lowercase `code` with `{unknown_chunk, …}`), so a digest is only
+/// ever reported for a chunk that was actually read.
 fn code_chunk_digest(oracle: &Path, file: &Path) -> Option<String> {
     let expr = format!(
-        "{{ok,{{_,Chunks}}}} = beam_lib:chunks({}, [code]),\n\
-         [{{code,C}}] = Chunks,\n\
+        "{{ok,{{_,Chunks}}}} = beam_lib:chunks({}, [\"Code\"]),\n\
+         [{{\"Code\",C}}] = Chunks,\n\
          io:format(\"code=~s~n\", [binary:encode_hex(erlang:md5(C))]),\n\
          halt(0).",
         literal(file)
@@ -225,42 +226,26 @@ fn code_chunk_digest(oracle: &Path, file: &Path) -> Option<String> {
     Some(answered.out)
 }
 
-/// Reports a `beam_rt` probe that did **not** complete: the typed capability gap (exit 3), a
-/// runtime error (exit 1) or a usage error (exit 2). Never a pass, never a panic — the caller
-/// returns and the suite stays green while the path is blocked.
-fn report_blocker(what: &str, run: &Run) {
-    eprintln!();
-    eprintln!("--- {what}: the Rust runtime did not complete the compile ---");
-    eprintln!("exit code: {}", run.code);
-    if !run.err.is_empty() {
-        eprintln!("stderr:    {}", run.err);
-    }
-    if !run.out.is_empty() {
-        eprintln!("stdout:    {}", run.out);
-    }
-    eprintln!("(reported-only: this is an honest capability gap, not a test failure)");
-    eprintln!();
-}
-
 // ---------------------------------------------------------------------------------------
-// Test 1 (de-risk): the compiler is reachable in-process
+// Test 1: the compiler is reachable in-process
 // ---------------------------------------------------------------------------------------
 
-/// **De-risk first.** `compile:forms/2` over hand-written abstract forms reaches the compiler
-/// passes with no `epp`/io-device/file-read involvement — so it isolates "is the compiler loadable
-/// and executable in-process?" from "can the runtime write the artifact?".
+/// `compile:forms/2` over hand-written abstract forms reaches the compiler passes with no
+/// `epp`/io-device/file-read involvement, so it isolates "is the compiler loadable and executable
+/// in-process?" from "can the runtime write the artifact?" — the two facilities the end-to-end test
+/// below needs together.
 ///
-/// The outcome is *printed* in every case. When the runtime compiles the forms, the byte size is
-/// compared to the oracle's; when it raises, the precise blocker is reported and the test returns.
+/// Asserts the runtime completed the probe and printed one of the probe's own result shapes, then
+/// `assert_eq!`-compares that shape with the oracle's answer.
 #[test]
 fn the_in_process_compiler_is_reachable() {
     let expr = forms_probe();
     let ours = beam_rt_eval(&expr);
-
-    if ours.code != 0 {
-        report_blocker("compile:forms/2 over hand-written forms", &ours);
-        return;
-    }
+    assert_eq!(
+        ours.code, 0,
+        "compile:forms/2 must complete in-process: exit {} — {}",
+        ours.code, ours.err
+    );
     eprintln!("compile:forms/2 under beam_rt: {}", ours.out);
     assert!(
         ours.out.starts_with("COMPILED") || ours.out.starts_with("OTHER") || ours.out.starts_with("ERRORS"),
@@ -277,18 +262,11 @@ fn the_in_process_compiler_is_reachable() {
         "the oracle must run the same probe: exit {} — {}",
         theirs.code, theirs.err
     );
-    if ours.out == theirs.out {
-        // The oracle's own `compile:forms/2` answer — the comparison this suite is for.
-        eprintln!("compile:forms/2 agrees with the oracle");
-    } else {
-        eprintln!(
-            "compile:forms/2 DIVERGES: beam_rt {} vs oracle {}",
-            ours.out, theirs.out
-        );
-        // A real divergence is reported, never hidden — but it is not asserted away here: the
-        // strict differential lives in the end-to-end test below, and this probe's own no-toolchain
-        // path must stay meaningful.
-    }
+    assert_eq!(
+        ours.out, theirs.out,
+        "compile:forms/2 must agree with the oracle"
+    );
+    eprintln!("compile:forms/2 agrees with the oracle");
 }
 
 // ---------------------------------------------------------------------------------------
@@ -299,12 +277,13 @@ fn the_in_process_compiler_is_reachable() {
 /// `compile:file(F, [no_spawn_compiler_process, deterministic, {outdir, D}])` — the *identical*
 /// option list, so the `Dbgi` chunk matches too — and their artifacts are compared:
 ///
-/// 1. byte-for-byte (the honest comparison, since the recorded options now agree);
+/// 1. byte-for-byte (the honest comparison: the two runs record the same `Dbgi` options, because
+///    their option lists are identical);
 /// 2. the `Code` chunk against `erlc +deterministic` (via `beam_lib:chunks/2`) — the chunk that is
 ///    identical even between the two different option lists.
 ///
-/// While the in-process path is blocked the test reports the blocker (exit code + stderr) and
-/// returns; once the runtime writes an artifact, the asserts below are live.
+/// The runtime's probe must complete and its artifact must exist; both are asserted before the
+/// differential, so a regression surfaces as a failure rather than a report.
 #[test]
 fn the_in_process_compile_file_artifact_matches_the_oracle() {
     let Some(oracle) = support::require_oracle("compile_file") else {
@@ -340,36 +319,21 @@ fn the_in_process_compile_file_artifact_matches_the_oracle() {
         oracle_artifact.display()
     );
 
-    // ---- the Rust runtime's artifact ----
-    let ours = beam_rt_eval(&expr);
-    if ours.code != 0 {
-        report_blocker("compile:file/2", &ours);
-        let listing: Vec<String> = fs::read_dir(&oracle_out)
-            .map(|entries| {
-                entries
-                    .filter_map(|entry| entry.ok())
-                    .map(|entry| {
-                        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                        format!("{} ({size} bytes)", entry.path().display())
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        eprintln!("NOTE: the oracle's reference artifact(s): {listing:?}");
-        return;
-    }
-    let rust_artifact = rust_out.join("hello.beam");
+    // ---- the Rust runtime's artifact (its own output directory) ----
+    let ours = beam_rt_eval(&file_probe(&src, &rust_out));
+    assert_eq!(
+        ours.code, 0,
+        "compile:file/2 must complete in-process: exit {} — {}",
+        ours.code, ours.err
+    );
     eprintln!("compile:file/2 under beam_rt: {}", ours.out);
-    if !rust_artifact.is_file() {
-        // The compile returned but no file landed: the write path (native `file_server_2`) is the
-        // gap — reported, not asserted away.
-        eprintln!(
-            "REPORTED: the runtime completed the compile ({}) but wrote no {}",
-            ours.out,
-            rust_artifact.display()
-        );
-        return;
-    }
+    let rust_artifact = rust_out.join("hello.beam");
+    assert!(
+        rust_artifact.is_file(),
+        "the runtime reported {:?} but wrote no {}",
+        ours.out,
+        rust_artifact.display()
+    );
 
     // ---- 1. byte-for-byte against the oracle's identical-option run ----
     let mine = fs::read(&rust_artifact).expect("the Rust artifact");
@@ -402,32 +366,22 @@ fn the_in_process_compile_file_artifact_matches_the_oracle() {
         erlc_run.err
     );
     let erlc_artifact = erlc_out.join("hello.beam");
-    let mine_code = code_chunk_digest(&oracle, &rust_artifact);
-    let erlc_code = code_chunk_digest(&oracle, &erlc_artifact);
-    if let (Some(mine), Some(theirs)) = (mine_code, erlc_code) {
-        assert_eq!(
-            mine, theirs,
-            "the `Code` chunk must match `erlc +deterministic`'s (the Dbgi options differ by design)"
-        );
-        eprintln!("Code chunk agrees with erlc +deterministic");
-    }
+    let mine_code = code_chunk_digest(&oracle, &rust_artifact)
+        .expect("beam_lib:chunks/2 must digest the runtime's artifact");
+    let erlc_code = code_chunk_digest(&oracle, &erlc_artifact)
+        .expect("beam_lib:chunks/2 must digest erlc's artifact");
+    assert_eq!(
+        mine_code, erlc_code,
+        "the `Code` chunk must match `erlc +deterministic`'s (the Dbgi options differ by design)"
+    );
+    eprintln!("Code chunk agrees with erlc +deterministic");
 }
 
 // ---------------------------------------------------------------------------------------
-// Notes for whoever un-blocks the path
+// Current state
 // ---------------------------------------------------------------------------------------
-
-// At the time of writing, `compile:forms/2` stops under `beam_rt` with
 //
-//     beam_rt: unsupported: opcode: bs_get_binary2: operand is not a match context   (exit 3)
-//
-// reached while assembling the module. `to_asm` succeeds (all SSA passes + codegen run), which
-// localises it to `beam_asm` (assembly), not the passes and not the io-device/file path:
-// `beam_asm:module_md5/1` (line 232) calls `beam_asm:filter_essentials/1`, whose head pattern
-// compiles to a `bs_get_binary2` whose **destination register is the match-context register
-// itself** (`{test,bs_get_binary2,{f,91},5,[{tr,{x,3},…},…],{x,3}}`).
-// The engine arm is `beam_engine/src/families/bitstrings/matching/mod.rs:225-262`: it writes `dst`
-// (line 256) *before* re-reading the context operand (line 260), so a reused context register is
-// read back as the freshly built binary. The C and the engine's own `bs_match` command interpreter
-// (`families/bitstrings/matching/commands.rs`, the `binary` command) both advance the position
-// **before** binding `$Dst` for exactly this reason. That arm is `beam_engine`'s to fix.
+// `compile:file/2` completes in-process on the pumping `-eval` route: it drives the real
+// `../lib/compiler` under `beam_rt`, its artifact is byte-identical to the oracle's identical
+// option-list run, and its `Code` chunk matches `erlc +deterministic`. The write path is the native
+// `file_server_2` service, which serves `save_binary`'s write requests.

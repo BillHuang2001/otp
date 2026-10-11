@@ -22,8 +22,14 @@ module free of a module-context switch (`Step::Enter`), the interpreter everywhe
   (per-pid engine state, recorded `result`/`exit`, `jit_mode` override, `jit_safety` memo).
 * [`run`] — `RuntimeRunner`: the `ProcessRunner` implementation (one reduction slice) — the tier
   selection (once, at the first entry) and the tier-aware first-entry/resume execution, the
-  parked-machine root publication (`publish_parked_roots`/`resume_from_process_roots`) and the
-  recorded outcome. Both recorded terms are transported with the `SourcePayloads` built by
+  parked-machine root publication (`publish_parked_roots`/`resume_from_process_roots`), the
+  parked-receive deadline rearming and the recorded outcome.
+  The parked `receive … after T` deadline is recovered with the engine's **cross-module-aware**
+  `Machine::wait_deadline` (passed the process's entry module; it reads the callee module the machine
+  is really parked in, so a `call_ext*` callee's `after T` is not lost), `delay_ms == Some(d)` gates
+  the arming — a bare `wait`/unreadable delay arms nothing — and `WaitDeadline::resume` is the
+  `timeout` continuation the fired timer re-enters.
+  Both recorded terms are transported with the `SourcePayloads` built by
   [`Runtime::source_payloads`](crate::runtime::Runtime::source_payloads) — the executing **machine's**
   handles (`engine.machine.refc_binaries()`) **unioned** with the whole off-heap family the pid's scan
   retained from the messages it received (`MailboxState::retained_binaries`/`retained_off_heap`/
@@ -42,7 +48,9 @@ module free of a module-context switch (`Step::Enter`), the interpreter everywhe
   `mode_from_value(Option<&str>)` (**the pure** `BEAM_RT_TIER` value semantics),
   `env_default()` (the memoized unset-variable default), `select_entry_tier(...)` and
   `jit_is_switch_safe(runtime, module)` — the switch-safety predicate.
-* [`reason`] — the exit-reason translation and the finite-`receive` deadline recovery.
+* [`reason`] — the exit-reason translation only (`normal` + `exit_reason`); the finite-`receive`
+  deadline recovery now lives in the engine (`Machine::wait_deadline`/`Machine::timeout_delay`), so no
+  duplicated delay decoding remains here.
 * [`perf`] — the `+JPperf` code-map feed (contract A.8).
 
 ## The `BEAM_RT_TIER` modes (`mode_from_value` is the single definition)

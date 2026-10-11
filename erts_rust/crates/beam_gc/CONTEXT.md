@@ -311,7 +311,10 @@ constructors only (no new error enum).
   the allocator at a fresh, larger one (`target = next_words(need_words, 0).max(current_capacity)`, one
   bounded step), so every live word keeps its **original address** and nothing is moved. That is exactly what
   makes the seam sound for a caller holding **no root set** — the un-rooted `beam_rt` allocation path, which
-  must not collect (a copying collection may only run against a complete root set). `young()`/`young_mut()`
+  must not collect (a copying collection may only run against a complete root set). That path **consumes** the
+  seam: `beam_rt`'s `alloc_words` grows the nursery (`Process::grow_nursery`) and retries the bump before its
+  arena fallback, and its admission-point root valve (`root_is_unscanned`, through `young_contains`) accepts a
+  root into **any** nursery space, so a retirement never makes a live root look unscanned. `young()`/`young_mut()`
   keep returning the **current** (allocatable) space, so every host site keeps compiling unchanged;
   `young_contains` and the collection from-set cover **every** space (`Nursery::spaces`); and after any
   collection the chain is **collapsed to exactly one space** (`Nursery::collapse`), because the collection
@@ -323,6 +326,16 @@ constructors only (no new error enum).
   (`copy.c:2109`); a GC collection copies only in-heap objects, so a copied pointer never carries the literal
   bit. A literal-tagged (and every other out-of-from-space) reference fails the `FromSet.contains` test and
   is left verbatim — the C `erts_is_literal`/area-test rule (`erl_gc.c:2013,2292-2297`).
+- **The copier relocates exactly the from-set-reachable graph — nothing else.** `Copier::complete`
+  (`src/copy.rs`) walks only the objects it copied into to-space, forwarding each child slot the canonical
+  `beam_term::layout::for_each_child_slot` walk reports (a boxed tuple's arity elements included); a
+  reference the [`EvacDest`] classifies [`Target::Foreign`] is left verbatim and its target is **not
+  descended into**. So a from-space word reached *only* through a container outside the from-set — a mature
+  object during a **minor**, a literal, or an unscanned foreign region (the runtime's pooled BIF heap /
+  pointer-stable arena / `beam_message` fragment) — is neither kept alive nor updated; and because a
+  collection immediately `reset`s/replaces the nursery (`Nursery::collapse`), such a pointer reads back as
+  reused from-space. A **major** scans young *and* mature, so it repairs a mature→young pointer a minor left
+  stale; a minor never can.
 - **In-place Cheney forwarding, exactly as C.** A boxed object's **header word is overwritten** with the new
   BOXED-tagged pointer (`IS_MOVED_BOXED = !is_header`, `erl_gc.h:36`); a cons cell's car is set to
   `THE_NON_VALUE` and its cdr to the new LIST pointer (`IS_MOVED_CONS`, `erl_gc.h:37,42-55`). The scan phase

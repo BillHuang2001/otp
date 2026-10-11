@@ -27,7 +27,10 @@
 //! peak memory is bounded by its live set instead of growing with the loop count. That point
 //! also **grows** the nursery when a request is larger than it
 //! ([`Process::ensure_capacity`], the collector's on-demand growth seam) rather than leaving
-//! the request to the arena. Everything outside a scheduled slice keeps the runtime's
+//! the request to the arena. The unrooted [`alloc_words`] seam — which is handed **no** root
+//! set and so may not collect — instead grows the nursery through the **no-relocation**
+//! [`Process::grow_nursery`] seam and retries the bump, so a metadata-only allocation loop
+//! grows rather than falling back to the arena forever. Everything else keeps the runtime's
 //! pointer-stable arena, byte for byte as before — see [`crate::runtime::gc`] for the state,
 //! the accounting and the safety valves.
 //!
@@ -61,15 +64,34 @@
 //!
 //! # The float guard
 //!
-//! A module whose code contains a float-family instruction is **never** collected over
-//! ([`module_uses_floats`], cached per module name); everything else — most importantly a
-//! floating-point *BIF* such as `math:sqrt/1`, whose code is in another module — is then
-//! harmless, because that module's own code is never the code under a collection. An
-//! unresolvable call site (a fun entry or the `-eval` evaluator, which have no
+//! Both doors refuse to collect when the **call site's** module contains a float-family
+//! instruction ([`module_uses_floats`], cached per module name — see
+//! [`module_may_be_collected`]). The two doors do **not** need it equally:
+//!
+//! * the **full** door ([`ensure_heap_full`], and [`alloc_words_rooted`]) hands the machine's
+//!   whole [`RootSet`] over, FR file included ([`publish_roots_full`]), so a collection over it
+//!   is FR-safe for **any** module — its copy of the guard is a conservative *extra*, not what
+//!   makes a float-using module collectable;
+//! * the **narrow** door ([`ensure_heap`]) receives only the x-register prefix and the stack and
+//!   can never see the machine's FR file, so for that door the caller-module guard is
+//!   load-bearing: without it a live float register could dangle across the move. The engine
+//!   reaches only the full door (`Machine::ensure_heap`/`test_heap`/`allocate_heap` →
+//!   [`ExecutionContext::ensure_heap_full`](beam_engine::ExecutionContext::ensure_heap_full)),
+//!   so this narrow form is not on the engine's path today.
+//!
+//! The **cross-module call seam**
+//! ([`RuntimeContext::resolve_external_call`](crate::RuntimeContext)) does not consult this
+//! guard at all: a float-using callee is entered in-machine exactly like any other, which is
+//! safe because it runs under the caller's machine and that machine's collection goes through
+//! the full door. A float register still live when a slice ends is caught out of band by the
+//! runner's post-slice scan, which pins the process permanently
+//! ([`Runtime::pin_process`](crate::runtime::gc)).
+//!
+//! An unresolvable call site (a fun entry or the `-eval` evaluator, which have no
 //! `current_module`) is not collected over either — conservative, never wrong.
 
 use beam_alloc::Heap;
-use beam_common::Result;
+use beam_common::{BeamError, Result};
 use beam_engine::context::RootSet;
 use beam_gc::{Collection, CollectionKind};
 use beam_loader::{Instr, Module};
@@ -166,12 +188,12 @@ fn in_heap_block(heap: &Heap, ptr: usize) -> bool {
 /// Whether `term` is a **container living in a region the collector does not scan** — the
 /// precondition that makes a collection of the owning process unsound.
 ///
-/// A copying collector relocates exactly the words it finds in its *from* set (the young space,
-/// plus the mature space for a major) and classifies every other address as
-/// [`Target::Foreign`](beam_gc): it leaves such a pointer where it is **and does not follow it**
-/// — so a young word a foreign container points *at* is neither kept alive by it nor updated
-/// when it moves. A term with heap children is therefore only safe in a *scanned* region. The
-/// unscanned regions this runtime really creates are the pooled BIF heaps
+/// A copying collector relocates exactly the words it finds in its *from* set (every space of
+/// the young nursery chain, plus the mature space for a major) and classifies every other
+/// address as [`Target::Foreign`](beam_gc): it leaves such a pointer where it is **and does not
+/// follow it** — so a young word a foreign container points *at* is neither kept alive by it nor
+/// updated when it moves. A term with heap children is therefore only safe in a *scanned*
+/// region. The unscanned regions this runtime really creates are the pooled BIF heaps
 /// ([`Runtime::take_bif_heap`]), the `-eval` heap ([`Runtime::stabilize_term`]), the
 /// pointer-stable arena ([`crate::context::gc::alloc_words`]'s fallback) and a
 /// [`beam_message`] heap fragment.
@@ -179,9 +201,10 @@ fn in_heap_block(heap: &Heap, ptr: usize) -> bool {
 /// The test is the conservative *complement* of the scanned set, so it needs no enumeration of
 /// the open-ended unscanned side: a term is safe exactly when it is an **immediate** (neither
 /// boxed nor a cons), a **literal** (a frozen code constant in the literal area, which never
-/// points into a movable heap), or a pointer into the process's own **young** or **mature**
-/// heap. Anything else — including a container handed back by a registered BIF or built on the
-/// arena — declines the collection.
+/// points into a movable heap), or a pointer into the process's own **young** heap — **any**
+/// nursery space, the current one or one a [`Process::grow_nursery`] growth retained, since a
+/// collection evacuates the whole chain — or its **mature** heap. Anything else — including a
+/// container handed back by a registered BIF or built on the arena — declines the collection.
 pub(crate) fn root_is_unscanned(process: &Process, term: Eterm) -> bool {
     if !beam_term::prelude::is_boxed(term) && !beam_term::prelude::is_list(term) {
         return false;
@@ -191,6 +214,7 @@ pub(crate) fn root_is_unscanned(process: &Process, term: Eterm) -> bool {
     }
     let ptr = beam_term::list::ptr_val(term) as usize;
     !in_heap_block(process.heap(), ptr)
+        && !process.collector().young_contains(ptr as *const Eterm)
         && !process.collector().mature_contains(ptr as *const Eterm)
 }
 
@@ -390,6 +414,15 @@ fn collect_or_grow(process: &mut Process, heap_need: u32) -> Result<Collection> 
 /// process is not collectable, or when the call site's module is not known to be float-free,
 /// this is a no-op — exactly the pre-collector runtime.
 ///
+/// # Why the caller-module guard is load-bearing *here*
+///
+/// This door is handed only the x-register prefix and the stack, so it can never see the
+/// machine's FR file and a collection here **would** dangle a live float register. The
+/// [`module_may_be_collected`] test on the call site's module is therefore the only thing that
+/// keeps this door sound for float code — unlike the full door
+/// ([`ensure_heap_full`]), whose copy of the same test is a conservative extra because it
+/// publishes the FR file itself ([`publish_roots_full`]). The engine reaches only the full
+/// door, so this narrow form is not on the engine's path today.///
 /// # Growth
 ///
 /// The collection this runs is the collector's on-demand growth seam
@@ -540,11 +573,14 @@ pub(crate) fn ensure_heap(
 /// `Machine::ensure_heap`/`test_heap`/`allocate_heap` through
 /// [`ExecutionContext::ensure_heap_full`](beam_engine::ExecutionContext::ensure_heap_full).
 /// The **gate order is identical** to the narrow door's — the latch, the forced-collection
-/// request, the collectability test, the float guard, the table/process lookup, the
-/// occupancy test and the "committed" request consume — and only the root hand-off differs:
+/// request, the collectability test, the caller-module float guard, the table/process lookup,
+/// the occupancy test and the "committed" request consume — and only the root hand-off differs:
 /// it publishes and scatters `roots` (every x slot, the whole stack, the whole FR file)
 /// through [`publish_roots_full`]/[`scatter_roots_full`] instead of a `live`-bounded x prefix.
-///
+/// Because the FR file is published, this door is **FR-safe for any module**: a live float
+/// register is relocated like any other root, so the [`module_may_be_collected`] test it keeps
+/// is a conservative extra rather than the thing that makes float code collectable (see the
+/// module docs' float-guard section).///
 /// # Growth
 ///
 /// This door takes the **same action** as the narrow one ([`collect_or_grow`]): the
@@ -675,23 +711,26 @@ pub(crate) fn heap_available(ctx: &RuntimeContext<'_>) -> usize {
 /// tracks the live set.
 ///
 /// Everything **else** — an `-eval`/single-pass context (no process table), a pinned or halted
-/// process, a process the table no longer holds, **and a collectable slice process whose own
-/// young heap cannot serve the request** — keeps the pointer-stable arena, byte for byte as
-/// before this seam existed. A fallback is never an error: the arena cannot fail where the
-/// young heap could.
+/// process, a process the table no longer holds, and a request the young heap cannot meet even
+/// after a growth — keeps the pointer-stable arena, byte for byte as before this seam existed.
+/// A fallback is never an error: the arena cannot fail where the young heap could.
 ///
-/// # Why the arena fallback stays for a collectable slice process
+/// # Grow-and-retry before the arena
 ///
 /// This seam is the **unrooted** allocation path (`beam_engine::terms::sink::ContextSink`,
-/// metadata-only builds): it is handed **no** root set, so it can neither collect nor safely
-/// grow — calling `Process::ensure_capacity` here would collect against the possibly-stale
-/// published `process.regs`, relocating a heap out from under live machine terms (a wrong
-/// result). The arena block it hands out is a container in an unscanned region, but that is
-/// already made sound by the admission-point valve ([`root_is_unscanned`]: `ensure_heap`/
-/// `ensure_heap_full` **decline** any collection whose root set reaches such a container), so
-/// such a root stays valid and no young word it reaches is moved. Returning the young heap's
-/// typed `Err` here instead would only kill a process (e.g. the boot chain) that the arena keeps
-/// alive, and the engine reaches an admission point (`ensure_heap`) before it constructs terms.
+/// metadata-only builds): it is handed **no** root set, so it may neither collect nor hand a
+/// collection roots. A young-heap refusal that is a **capacity** failure is therefore met by
+/// [`Process::grow_nursery`] — the **no-relocation** growth seam, which retires the space it
+/// replaces without moving a single live term, so it is safe against a root set the caller
+/// cannot publish — and the bump is then retried. Only when the growth itself fails (the
+/// policy's ceiling cannot reach the request) or the retried bump still does not fit does the
+/// block come from the pointer-stable arena, byte for byte as before this seam existed. A
+/// refusal that is **not** a capacity failure (an impossible request past
+/// [`MAX_ARITYVAL`](beam_term::MAX_ARITYVAL)) goes straight to the arena: growth cannot fix it.
+///
+/// Because growth retains the space it replaces, a root can point into a *retired* nursery
+/// space; the admission-point valve ([`root_is_unscanned`]) accepts a pointer into **any**
+/// nursery space for exactly that reason, so such a root never wrongly declines a collection.
 ///
 /// # Errors
 ///
@@ -706,9 +745,27 @@ pub(crate) fn alloc_words(ctx: &mut RuntimeContext<'_>, n: usize) -> Result<*mut
     if let Some(table) = mailbox_table {
         if runtime.gc_process_enabled(*mailbox_pid) {
             if let Some(process) = table.get_mut(*mailbox_pid) {
-                let fill = runtime.gc_scratch(n.saturating_sub(1));
-                if let Ok(block) = bump(process.heap_mut(), n, fill) {
-                    return Ok(block);
+                // The first attempt: the pool's placeholder fill is scoped so its `&mut runtime`
+                // borrow has ended before any later `runtime` call.
+                let first = {
+                    let fill = runtime.gc_scratch(n.saturating_sub(1));
+                    bump(process.heap_mut(), n, fill)
+                };
+                match first {
+                    Ok(block) => return Ok(block),
+                    // A capacity refusal: grow the nursery (no relocation, no collection) and
+                    // retry the bump. Growth that cannot reach the request, or a retry that
+                    // still does not fit, falls through to the arena.
+                    Err(BeamError::Alloc(_)) => {
+                        if process.grow_nursery(n).is_ok() {
+                            let fill = runtime.gc_scratch(n.saturating_sub(1));
+                            if let Ok(block) = bump(process.heap_mut(), n, fill) {
+                                return Ok(block);
+                            }
+                        }
+                    }
+                    // Any other refusal (an impossible request) cannot be fixed by growth.
+                    Err(_) => {}
                 }
             }
             runtime.note_gc_fallback();
@@ -734,10 +791,10 @@ pub(crate) fn alloc_words(ctx: &mut RuntimeContext<'_>, n: usize) -> Result<*mut
 ///   [`alloc_words`] does, and only when that bump **fails** run one collection over the
 ///   handed-in roots and retry the bump. A collection or scatter failure halts collection for
 ///   that process ([`Runtime::halt_process_gc`](crate::runtime::gc)) and falls back to the
-///   arena. The float guard and the `current_module` requirement both apply, exactly as in
-///   [`ensure_heap_full`], because a collection over a module that touches the machine's
-///   float-register file could corrupt a live float register.
-///
+///   arena. The caller-module float guard and the `current_module` requirement both apply,
+///   exactly as in [`ensure_heap_full`] — the test is conservative here too: this door
+///   publishes the machine's **whole FR file** ([`publish_roots_full`]), so a live float
+///   register is relocated, not corrupted.///
 /// # Errors
 ///
 /// Propagates the arena's allocation failure only — never a collection failure.
@@ -833,14 +890,14 @@ pub(crate) fn alloc_words_rooted(
 
 #[cfg(test)]
 mod tests {
-    //! Unit tests for the two mechanical pieces of the adoption: the float guard scan and
-    //! the safe heap bump. The collection itself is exercised end to end by
-    //! `tests/gc_collect.rs` (it needs a real `.beam`, the engine and the scheduler).
+    //! Unit tests for the mechanical pieces of the adoption: the float guard scan, the safe
+    //! heap bump, and the unrooted seam's grow-and-retry (which needs no `.beam` and so is
+    //! asserted here). The collection itself is exercised end to end by `tests/gc_collect.rs`
+    //! (it needs a real `.beam`, the engine and the scheduler).
 
     use beam_alloc::Heap;
     use beam_loader::load_file;
     use beam_term::prelude::{header_arity, is_small, make_small, NIL};
-
     use super::*;
 
     /// This crate's float fixture (`tests/fixtures/gc_floats.beam`): float arithmetic across
@@ -928,5 +985,77 @@ mod tests {
             assert!(!beam_term::prelude::is_boxed(word));
             assert!(!beam_term::prelude::is_list(word));
         }
+    }
+
+    /// **The unrooted allocation seam grows the nursery instead of permanently falling back to
+    /// the arena.**
+    ///
+    /// `alloc_words` is the engine's metadata-only `ContextSink` path: it is handed **no** root
+    /// set, so it may not collect. A full young heap is therefore met by
+    /// [`Process::grow_nursery`] — the no-relocation growth seam (it retires the space it
+    /// replaces and moves no live term) — and the bump is retried; only a growth that cannot
+    /// reach the request falls through to the pointer-stable arena. Before that step a full
+    /// nursery sent **every** subsequent block to the runtime-wide arena forever, so a churn
+    /// loop's peak memory grew without bound.
+    ///
+    /// The loop asserts the three observable consequences directly on the seam: every block is
+    /// served from a **nursery space** (never the arena), the nursery **grows** (its chain gains
+    /// a space), and the runtime records **no** arena fallback.
+    #[test]
+    fn alloc_words_grows_the_nursery_and_never_falls_back_to_the_arena() {
+        // The context shape of a scheduled slice: a real runtime plus the process table the pid
+        // belongs to (two separate values, exactly as the runner's `take_processes` split — the
+        // runtime does not own this table here).
+        let mut rt = Runtime::with_defaults().expect("the default runtime");
+        let mut table = ProcessTable::new(beam_process::SignalAtoms::from_table(
+            &mut beam_term::AtomTable::new(),
+        ));
+        let pid = table
+            .spawn_default()
+            .expect("spawn a process in the pass table");
+
+        let initial_spaces = table
+            .get(pid)
+            .expect("the spawned process")
+            .collector()
+            .young_space_count();
+        assert_eq!(
+            initial_spaces, 1,
+            "a fresh process has a single nursery space"
+        );
+
+        // Each block consumes BLOCK_WORDS of the (233-word) initial nursery, so a loop of ROUNDS
+        // calls exhausts the current space repeatedly and must grow the nursery each time.
+        const BLOCK_WORDS: usize = 8;
+        const ROUNDS: usize = 1_000;
+        for round in 0..ROUNDS {
+            let block = {
+                let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+                alloc_words(&mut ctx, BLOCK_WORDS).expect("the block is served")
+            };
+            assert!(
+                table
+                    .get(pid)
+                    .expect("the process is still in the table")
+                    .collector()
+                    .young_contains(block as *const Eterm),
+                "round {round}: the block must be served from a nursery space, never the arena"
+            );
+        }
+
+        let grown_spaces = table
+            .get(pid)
+            .expect("the process is still in the table")
+            .collector()
+            .young_space_count();
+        assert!(
+            grown_spaces > initial_spaces,
+            "the loop must have grown the nursery ({initial_spaces} -> {grown_spaces} spaces)"
+        );
+        assert_eq!(
+            rt.gc_stats().fallbacks,
+            0,
+            "no allocation may fall back to the pointer-stable arena once growth is available"
+        );
     }
 }

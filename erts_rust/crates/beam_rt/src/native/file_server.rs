@@ -84,6 +84,17 @@
 //! `io_lib:collect_line/4` and casts it. The device loop is the same one `{get_until, …}`
 //! uses; this crate supplies the collect-and-cast half (see [`get_line`]).
 //!
+//! # The stashed read buffer (`State#state.buf`)
+//!
+//! `{get_line, …}`/`{get_until, …}` read *ahead* — they pull more bytes off the device than they
+//! return — and what they read past the reply is the device's buffer for the next request
+//! (the oracle's `State#state.buf`). Three arms therefore share that one buffer: the next
+//! `{get_chars, …}` (this module), `{get_line, …}` and `{get_until, …}` all consume it **before**
+//! any fresh read, `{position, cur}`/`{position, {cur, Offs}}` compensates for it (the physical
+//! file offset is ahead of the logical position by exactly the buffer's length), and a successful
+//! seek clears it (`std_reply/2`, `file_io_server.erl:344-348`). Every read here reads only what
+//! it still needs, so that invariant holds for an arbitrary mix of the three requests.
+//!
 //! # The `{setopts, …}`/`getopts` read-mode surface
 //!
 //! Served by the [`setopts`] child module: `io:getopts/1` sends the bare atom `getopts` and
@@ -162,9 +173,11 @@ struct Device {
     /// modelled and also read as `latin1` (a documented divergence, unchanged by the
     /// `{get_until,…}` work).
     encoding: Encoding,
-    /// The leftover `{get_until, …}` request stashed in the device (`State#state.buf`): the
-    /// bytes a continuation reported as unconsumed, fed to the next request before any
-    /// fresh read.
+    /// The leftover the device's read-ahead stashed (`State#state.buf`): the bytes a
+    /// `{get_line,…}`/`{get_until,…}` request read past what it returned. The next
+    /// `{get_chars,…}`/`{get_line,…}`/`{get_until,…}` request consumes it **before** any fresh
+    /// read, `{position,cur}` compensates for it, and a successful seek clears it — so
+    /// `logical position + buf.len()` is always the physical file offset.
     buf: Vec<u8>,
 }
 
@@ -623,9 +636,14 @@ impl Runtime {
                 Ok((ok, false))
             }
             ("position", 1) => {
-                let seek = seek_from(args[0], self)?;
+                // `file_io_server:file_request({position,At}, _)` (`:319-326`) compensates the
+                // request for the stashed buffer (`position/3`, `:970-977`) and then always
+                // replies through `std_reply/2` (`:344-348`), which clears `State#state.buf`.
+                let buffered = self.device_mut(service)?.buf.len();
+                let seek = self.position_seek(args[0], buffered)?;
                 let file = self.device_file(service)?;
                 let position = file.seek(seek).map_err(io_error)?;
+                self.device_mut(service)?.buf.clear();
                 let ok = self.atom("ok")?;
                 let value = make_small(i64::try_from(position).map_err(|_| BeamError::SystemLimit)?);
                 let reply = self.tuple(&[ok, value])?;
@@ -655,10 +673,20 @@ impl Runtime {
         }
     }
 
-    /// `{get_chars, Enc, _Prompt, N}` → `Data | eof` (`file_io_server.erl:509-575`).
+    /// `{get_chars, Enc, _Prompt, N}` → `Data | eof` (`file_io_server.erl:506-535`).
     ///
     /// Only the byte-oriented `latin1` encoding is served: a request in any other encoding
     /// would need `unicode:characters_to_binary/3`, which this native process does not host.
+    ///
+    /// The device's stashed leftover (`State#state.buf`, the bytes a preceding
+    /// `{get_line,…}`/`{get_until,…}` read ahead and did not consume) is served **first**, so
+    /// any mix of the three requests on one device agrees with the oracle. A request for `0`
+    /// bytes answers the empty cast and leaves that leftover untouched (`get_chars(0, Enc,
+    /// State)`, `:506-507`); otherwise `min(N, buf)` is taken off the front, the remainder is
+    /// read from the file until `N` bytes are collected or the read hits end of file, and a
+    /// request that obtained **nothing at all** answers the atom `eof` (the oracle's
+    /// `eof when BufSize =:= 0`, `:529-530`). The reply is a binary or a char list of small
+    /// ints per the device's read mode (`cast/4`, `:782-802`).
     fn reply_get_chars(&mut self, service: ProcessId, args: &[Eterm]) -> Result<(Eterm, bool)> {
         if self.atom_name(args[0]).as_deref() != Some("latin1") {
             return Err(error::unsupported(
@@ -673,21 +701,51 @@ impl Runtime {
             return Err(error::unsupported("file_server: a negative `get_chars` count"));
         };
         let binary = self.device_binary(service)?;
-        let mut buffer = vec![0u8; count];
-        let read = if count == 0 {
-            0
-        } else {
-            self.device_file(service)?.read(&mut buffer).map_err(io_error)?
-        };
-        buffer.truncate(read);
-        if read == 0 && count != 0 {
+        if count == 0 {
+            // `get_chars(0, Enc, State) -> {reply, cast(<<>>, …), State}` (`:506-507`): the
+            // empty cast, with the stashed leftover preserved for the next request.
+            let data = if binary {
+                self.binary(&[])?
+            } else {
+                self.list(&[])?
+            };
+            return Ok((data, false));
+        }
+        // `get_chars(N, OutEnc, #state{buf=Buf, …})` (`:508-528`): `Buf` first, then a fresh
+        // read for what is still missing.
+        let device = self.device_mut(service)?;
+        let taken = count.min(device.buf.len());
+        let mut collected: Vec<u8> = device.buf.drain(..taken).collect();
+        if collected.len() < count {
+            // Read only what is still needed, so the device's physical offset stays exactly
+            // `logical position + buf.len()` — the invariant `position_seek` below relies on
+            // (the oracle over-reads by up to `?READ_SIZE_BINARY` and subtracts the buffer
+            // again in `position/3`, which is observationally the same).
+            let file = &mut device.file;
+            let mut remaining = count - collected.len();
+            let mut chunk = [0u8; 8192];
+            while remaining > 0 {
+                let want = remaining.min(chunk.len());
+                // A single `read(2)` may be a short read; only `0` means end of file.
+                let read = file.read(&mut chunk[..want]).map_err(io_error)?;
+                if read == 0 {
+                    break;
+                }
+                collected.extend_from_slice(&chunk[..read]);
+                remaining -= read;
+            }
+        }
+        if collected.is_empty() {
             let eof = self.atom("eof")?;
             return Ok((eof, false));
         }
         let data = if binary {
-            self.binary(&buffer)?
+            self.binary(&collected)?
         } else {
-            let bytes: Vec<Eterm> = buffer.iter().map(|byte| make_small(i64::from(*byte))).collect();
+            let bytes: Vec<Eterm> = collected
+                .iter()
+                .map(|byte| make_small(i64::from(*byte)))
+                .collect();
             self.list(&bytes)?
         };
         Ok((data, false))
@@ -728,6 +786,35 @@ impl Runtime {
             .get_mut(&service)
             .ok_or_else(|| error::unsupported("file_server: a request for a closed io device"))
     }
+
+    /// The `SeekFrom` a `{position, At}` request denotes, with `cur`/`{cur, Offs}`
+    /// compensated for the stashed buffer — `file_io_server:position/3` (`:970-977`):
+    ///
+    /// ```text
+    /// {cur, Offs} -> {cur, Offs - byte_size(Buf)}
+    /// cur         -> {cur, -byte_size(Buf)}
+    /// _           -> At
+    /// ```
+    ///
+    /// The compensation is what makes the *logical* position — the one the caller observes —
+    /// correct: the device's physical offset is ahead of it by exactly `buf.len()` after a
+    /// `{get_line,…}`/`{get_until,…}` read-ahead. Every other form (`bof`/`eof`/a bare
+    /// integer/`{bof,N}`/`{eof,N}`) is passed through unchanged.
+    fn position_seek(&self, at: Eterm, buffered: usize) -> Result<SeekFrom> {
+        let buffered = i64::try_from(buffered).map_err(|_| BeamError::SystemLimit)?;
+        if let Some(fields) = tuple_fields(at) {
+            if fields.len() == 2
+                && is_small(fields[1])
+                && self.atom_name(fields[0]).as_deref() == Some("cur")
+            {
+                return Ok(SeekFrom::Current(signed_value(fields[1]) - buffered));
+            }
+        } else if self.atom_name(at).as_deref() == Some("cur") {
+            return Ok(SeekFrom::Current(-buffered));
+        }
+        seek_from(at, self)
+    }
+
     // -- term helpers -------------------------------------------------------------
     //
     // These are the small shims over the shared `RuntimeContext` builders the floor already
@@ -846,6 +933,10 @@ fn improper_list_head(term: Eterm) -> Option<Eterm> {
 }
 
 /// The `SeekFrom` a `{position, At}` request denotes (`file_io_server.erl:268-273`).
+///
+/// The bare `cur`/`{cur, Offs}` forms are parsed here as an un-adjusted relative seek;
+/// [`Runtime::position_seek`] is the entry point that compensates them for the device's
+/// stashed buffer (`file_io_server:position/3`).
 fn seek_from(at: Eterm, runtime: &Runtime) -> Result<SeekFrom> {
     // A bare integer is the `bof` shorthand of `file.erl`'s `location()`
     // (`integer() | {bof,integer()} | cur | {cur,integer()} | eof | {eof,integer()}`).

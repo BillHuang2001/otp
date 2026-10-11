@@ -141,7 +141,7 @@
 //! crate is `#![deny(unsafe_code)]` and never panics on runtime data).
 
 use std::cell::{Cell, RefCell, RefMut};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::RawFd;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -544,6 +544,75 @@ impl IoCounters {
     }
 }
 
+/// The runtime's most recent **process-liveness observation**, published for the per-port driver
+/// hosts to read.
+///
+/// # Why this exists
+///
+/// A C driver's `driver_monitor_process` has three outcomes, not two: the C answers `0` (armed),
+/// `1` (`ERL_DRV_MONITOR_NOT_ALIVE`, the advertised process is gone) or `-1` (no `process_exit`
+/// slot / invalid port), and `do_driver_monitor_process`
+/// (`erts/emulator/beam/io.c:7012-7038`) reaches the positive one exactly when the monitor cannot
+/// be armed because the target is no longer alive. A per-port [`driver::DriverPort`] host is built
+/// **before** its port is registered and holds no process table — only its owning [`ProcessId`] —
+/// so it cannot ask that question itself. The runtime therefore **publishes** what it last observed
+/// into this shared view, and the host queries it from inside the callback.
+///
+/// # A snapshot, not a live query
+///
+/// The view is a *snapshot* of the live pids taken at a moment the runtime chose
+/// ([`PortRegistry::refresh_liveness`]), refreshed at the **start of every port round** — the one
+/// place driver callbacks run — so a callback reached from inside a round consults an observation
+/// at most one round old.
+///
+/// A callback that runs **outside** a round (the driver's own `start` during `open_port/2`, or a
+/// `control` callback during `erlang:port_control/3`) sees the view from the last round; with no
+/// round yet the view is `None`, which the host answers by installing the monitor anyway — the
+/// C's own "monitor the target" behaviour for a process it believes alive. That fallback is
+/// explicit and documented, never a fabricated `NotAlive`: a process nobody has observed is not
+/// reported dead.
+///
+/// # Borrowing
+///
+/// [`ProcessLiveness::observe`] / [`clear`](ProcessLiveness::clear) run from the runtime, never
+/// from inside a driver callback, and never re-enter, so they may use `borrow_mut`.
+/// [`is_alive`](ProcessLiveness::is_alive) is called *from* a driver callback — which may itself
+/// hold unrelated runtime state borrowed — so it is `try_borrow`-based and answers `None` ("no
+/// observation available") rather than panicking.
+#[derive(Debug)]
+pub(crate) struct ProcessLiveness {
+    /// The observed live pids, or `None` when no observation is being kept (nothing can ask for
+    /// one yet — see [`PortRegistry::refresh_liveness`]).
+    live: RefCell<Option<HashSet<ProcessId>>>,
+}
+
+impl ProcessLiveness {
+    /// A viewless observation — the state a port host starts in.
+    pub(crate) fn new() -> Rc<ProcessLiveness> {
+        Rc::new(ProcessLiveness {
+            live: RefCell::new(None),
+        })
+    }
+
+    /// Replaces the view with `pids` — the runtime's most recent observation of who is alive.
+    pub(crate) fn observe(&self, pids: impl Iterator<Item = ProcessId>) {
+        *self.live.borrow_mut() = Some(pids.collect());
+    }
+
+    /// Drops the view back to "no observation" (nothing can ask for one — see
+    /// [`PortRegistry::refresh_liveness`]).
+    pub(crate) fn clear(&self) {
+        *self.live.borrow_mut() = None;
+    }
+
+    /// Whether the last observation saw `pid`, or `None` when there is no observation to consult
+    /// (or the cell is unreadable).
+    pub(crate) fn is_alive(&self, pid: ProcessId) -> Option<bool> {
+        let live = self.live.try_borrow().ok()?;
+        live.as_ref().map(|live| live.contains(&pid))
+    }
+}
+
 /// The runtime's port subsystem state: one poller, one `beam_io` port registry, the
 /// `port_info` metadata and the term arena.
 ///
@@ -583,6 +652,11 @@ pub struct PortRegistry {
     /// The signal self-pipe's registration with [`PortRegistry::poller`] — the delivery half of
     /// `os:set_signal/2` (see [`watch`]).
     watch: watch::SignalWatch,
+    /// The runtime's most recent process-liveness observation, shared with every
+    /// `{spawn_driver, Name}` port's [`driver::DriverPort`] host — the state behind
+    /// `driver_monitor_process`'s positive `ERL_DRV_MONITOR_NOT_ALIVE` (see
+    /// [`ProcessLiveness`]).
+    liveness: Rc<ProcessLiveness>,
 }
 
 impl PortRegistry {
@@ -607,6 +681,7 @@ impl PortRegistry {
             heap: Heap::new(PORT_HEAP_WORDS)?,
             io_counters: Rc::new(IoCounters::default()),
             watch: watch::SignalWatch::new(),
+            liveness: ProcessLiveness::new(),
         })
     }
 
@@ -628,6 +703,40 @@ impl PortRegistry {
     /// borrowing this registry.
     pub fn io_counters(&self) -> Rc<IoCounters> {
         Rc::clone(&self.io_counters)
+    }
+
+    /// The shared process-liveness view a `{spawn_driver, Name}` port's C-driver host answers
+    /// `driver_monitor_process` from (see [`ProcessLiveness`]).
+    ///
+    /// A cheap [`Rc`] clone, taken while the driver host is built in
+    /// [`RuntimePorts::open_port`] — the host outlives every later borrow, so it must hold the
+    /// handle rather than ask the registry.
+    pub(crate) fn liveness(&self) -> Rc<ProcessLiveness> {
+        Rc::clone(&self.liveness)
+    }
+
+    /// Republishes the runtime's liveness observation for the per-port driver hosts.
+    ///
+    /// **Gated on a live `{spawn_driver, Name}` port.** Only that kind of port has a C driver that
+    /// can call `driver_monitor_process` (`meta.driver_monitors` is `Some` exactly then), so with
+    /// none of them the view is *cleared* and no snapshot is ever built — a runtime that never
+    /// opened such a port pays nothing for this. With one, `table.pids()` is collected, which is
+    /// the whole cost of the observation.
+    ///
+    /// Called at the **start of every port round** — the one place driver callbacks normally run
+    /// — so the view a callback consults is at most one round old. A callback reached outside a
+    /// round (`start`, `control`) sees the last round's view, or `None` when no round has run yet;
+    /// the host's fallback for `None` is to install the monitor (see [`ProcessLiveness`]).
+    fn refresh_liveness(&self, table: &ProcessTable) {
+        if self
+            .meta
+            .values()
+            .any(|meta| meta.driver_monitors.is_some())
+        {
+            self.liveness.observe(table.pids());
+        } else {
+            self.liveness.clear();
+        }
     }
 
     /// Registers `driver` as a new port and records its `port_info` `meta`.
@@ -1834,7 +1943,12 @@ impl PortHook for RuntimePorts {
             // The port's **state** stream flags, which `driver_get_port_flags` reports: the C reads
             // `ERTS_PORT_SFLG_BINARY_IO`/`ERTS_PORT_SFLG_LINEBUF_IO` (`io.c:5338-5341`) set by the
             // very stream option the port was opened with (`erl_bif_port.c:985-990`).
-            .with_port_flags(stream.port_flags());
+            .with_port_flags(stream.port_flags())
+            // The liveness view this host answers `driver_monitor_process`'s positive
+            // `ERL_DRV_MONITOR_NOT_ALIVE` from: the runtime's most recent observation, published
+            // by [`PortRegistry::refresh_liveness`] at the start of each port round (see
+            // [`ProcessLiveness`]).
+            .with_liveness(registry.liveness());
             // Seize the driver's term queue **before** the host is moved into the port lifecycle
             // (the boxed driver exposes no host): it is the handle a driver callback's
             // `erl_drv_output_term`/`erl_drv_send_term` pushes onto and
@@ -2041,6 +2155,9 @@ impl Runtime {
                 .ports
                 .try_borrow_mut()
                 .map_err(|_| error::unsupported("the port table is already in use"))?;
+            // The round is where driver callbacks run, so the liveness view their hosts query is
+            // refreshed from the live table first (see [`PortRegistry::refresh_liveness`]).
+            registry.refresh_liveness(table);
             registry.pump(timeout)?
         };
         // A driver callback cannot mint an atom (the live table is borrowed for the whole
@@ -2161,9 +2278,14 @@ impl RuntimeContext<'_> {
         // `native.rs` follows).
         let registry = Rc::clone(&self.runtime.ports);
         let events = {
+            // Same rule as the scheduler path's round: the liveness view is refreshed from the
+            // live table immediately before any driver callback can run (see
+            // [`PortRegistry::refresh_liveness`]).
+            let table = self.process_table();
             let mut registry = registry
                 .try_borrow_mut()
                 .map_err(|_| error::unsupported("the port table is already in use"))?;
+            registry.refresh_liveness(table);
             registry.pump(timeout)?
         };
         let mut messages = Vec::with_capacity(events.len());

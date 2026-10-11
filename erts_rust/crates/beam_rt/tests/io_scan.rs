@@ -37,14 +37,31 @@
 //!
 //! # What is compared
 //!
-//! Every probe below is run **twice** — once under the built `beam_rt` binary
-//! ([`CARGO_BIN_EXE_beam_rt`]) and once under the system `erl` — and the two stdouts must
-//! be **equal**. The oracle is the expected value, so a divergence shows up as a mismatch
-//! instead of being hardcoded away. Two probes (`dflag_unicode_io/1` on `self()`, and the
-//! 5-byte `file:read/2`) additionally assert the exact value, so they still discriminate
-//! without a toolchain.
+//! Every probe below is run under the built `beam_rt` binary ([`CARGO_BIN_EXE_beam_rt`]) and
+//! (where the toolchain allows) under the system `erl`, and the printed lines must be
+//! **equal**. The oracle is the expected value, so a divergence shows up as a mismatch
+//! instead of being hardcoded away. Several probes additionally assert the **exact** value
+//! (`dflag_unicode_io/1` on `self()`, the 5-byte `file:read/2`, and every buffered-read
+//! sequence line below), so they still discriminate without a toolchain.
 //!
-//! A missing `erl` is a **loud** skip, never a silent pass (`tests/support/mod.rs`).
+//! # Two routes, one compiled function
+//!
+//! The `-eval` probes drive the **pumped** route: `Runtime::eval` runs on the root process and
+//! pumps the scheduler, so an io-device `receive` is resumed inside the same call.
+//!
+//! The buffered-read sequences — `file:read/2` interleaved with `file:read_line/1` and
+//! `file:position/2` — are additionally driven through `run <fixture.beam> ioseq:<fun>/1`, a
+//! genuine **scheduled** process on the real scheduler/poller. Both routes call the *same*
+//! compiled function, so the only difference between them is the execution route. Each
+//! sequence line is asserted equal to a **pinned** value on **all three** of the scheduled
+//! `run` line, the `-eval` line and the live oracle's line, so a divergence confined to one
+//! route is a mismatch rather than a hardcoded-away agreement.
+//!
+//! The fixture module is compiled **at test time** with the system `erlc` (resolved the way
+//! `tests/scheduled_io_device.rs` does: a sibling of the resolved oracle first, then `$PATH`);
+//! it is never a committed `.beam`.
+//!
+//! A missing `erl` **or** `erlc` is a **loud** skip, never a silent pass (`tests/support/mod.rs`).
 //!
 //! # Note on the probe shape
 //!
@@ -70,7 +87,7 @@ mod support;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// The executable under test, exactly as the other contract suites drive it.
@@ -112,8 +129,9 @@ const SCAN_BODY: &str = "A=io:scan_erl_exprs(D,\"\",{1,1},[]), io:format(\"~p~n\
 /// requesting process's young heap by the first reply and then held in the evaluator's
 /// environment while two further replies are delivered to the same process. A later delivery
 /// that does not fit would collect that heap, publishing only the process's own containers,
-/// and recycle the words `A` points at (the pre-fix symptom: `badarg` from the `~p` printer,
-/// where the oracle prints the token list).
+/// and recycle the words `A` points at — so the runtime keeps the process relocation-exempt
+/// for the whole `-eval` driver, and the held term survives for the `~p` printer to render
+/// the token list the oracle prints.
 const HOLD_AND_PRINT_FIRST_BODY: &str = "A=io:scan_erl_exprs(D,\"\",{1,1},[]),\
      B=io:scan_erl_exprs(D,\"\",{1,1},[]),\
      C=io:scan_erl_exprs(D,\"\",{1,1},[]),\
@@ -327,4 +345,279 @@ fn a_scan_result_held_across_later_requests_matches_the_live_oracle() {
         "the first form's end position, got {out}"
     );
     agrees_with_the_oracle("a held io:scan_erl_exprs/4 result", &expr, &out);
+}
+
+// ---------------------------------------------------------------------------------------
+// The buffered-read sequence fixture (compiled at test time — never committed as a `.beam`)
+// ---------------------------------------------------------------------------------------
+
+/// The fixture module, compiled with `erlc` into a scratch dir. One export per read
+/// sequence; each returns the tuple of results it observed on **one** device.
+///
+/// `mixed/1` interleaves `read/2` with `read_line/1` (the buffered path: `reply_get_chars`
+/// consumes the device's stashed read-ahead leftover before reading the OS file, and
+/// `read_line/1` drops the newline it consumed); `line_then_read/1` exercises a `read/2` that
+/// must resume past a buffered line; `position_cur/1` and `position_cur_2/1` exercise
+/// `file:position/2` over a device holding a stashed buffer (the arm answers the **logical**
+/// position and clears the buffer on a successful seek); `at_eof/1` is the negative control —
+/// a genuine `eof` still answers `eof`.
+const SEQUENCE_SOURCE: &str = "\
+-module(ioseq).
+-export([mixed/1, line_then_read/1, position_cur/1, position_cur_2/1, at_eof/1]).
+
+mixed(Path) ->
+    {ok, F} = file:open(Path, [read]),
+    A = file:read(F, 6),
+    B = file:read_line(F),
+    C = file:read(F, 4),
+    ok = file:close(F),
+    {A, B, C}.
+
+line_then_read(Path) ->
+    {ok, F} = file:open(Path, [read]),
+    A = file:read_line(F),
+    B = file:read(F, 100),
+    ok = file:close(F),
+    {A, B}.
+
+position_cur(Path) ->
+    {ok, F} = file:open(Path, [read]),
+    A = file:read_line(F),
+    P = file:position(F, cur),
+    B = file:read(F, 4),
+    ok = file:close(F),
+    {A, P, B}.
+
+position_cur_2(Path) ->
+    {ok, F} = file:open(Path, [read]),
+    A = file:read_line(F),
+    P = file:position(F, {cur, 2}),
+    B = file:read(F, 4),
+    ok = file:close(F),
+    {A, P, B}.
+
+at_eof(Path) ->
+    {ok, F} = file:open(Path, [read]),
+    A = file:read(F, 16),
+    B = file:read(F, 4),
+    ok = file:close(F),
+    {A, B}.
+";
+
+/// The data file every sequence reads: 16 bytes, two newline-terminated lines and a
+/// newline-free tail.
+const SEQUENCE_DATA: &str = "line1\nline2\nrest";
+
+/// The pinned `mixed/1` line: `read/2` (6) → `read_line/1` → `read/2` (4). `file:read/2` on a
+/// `[read]` **list**-mode device answers a string; `~w` renders it as its integer list.
+const PINNED_MIXED: &str =
+    "{{ok,[108,105,110,101,49,10]},{ok,[108,105,110,101,50,10]},{ok,[114,101,115,116]}}";
+
+/// The pinned `line_then_read/1` line: `read_line/1` consumes `line1\n`, so the `read/2`
+/// returns the rest of the file from `line2\n` on.
+const PINNED_LINE_THEN_READ: &str =
+    "{{ok,[108,105,110,101,49,10]},{ok,[108,105,110,101,50,10,114,101,115,116]}}";
+
+/// The pinned `position_cur/1` line: after `read_line/1` the **logical** position is 6 (end of
+/// `line1\n`), and the following `read/2` resumes there.
+const PINNED_POSITION_CUR: &str =
+    "{{ok,[108,105,110,101,49,10]},{ok,6},{ok,[108,105,110,101]}}";
+
+/// The pinned `position_cur_2/1` line: `{cur, 2}` lands two bytes into `line2\n`, i.e.
+/// logical position 8.
+const PINNED_POSITION_CUR_2: &str =
+    "{{ok,[108,105,110,101,49,10]},{ok,8},{ok,[110,101,50,10]}}";
+
+/// The pinned `at_eof/1` line: the first `read/2` drains the 16-byte file and the second is a
+/// genuine `eof` — the negative control that a buffered device still reports `eof`.
+const PINNED_AT_EOF: &str =
+    "{{ok,[108,105,110,101,49,10,108,105,110,101,50,10,114,101,115,116]},eof}";
+
+/// The compiled fixture plus the data file it reads, in one scratch directory (removed on
+/// drop). The directory holds no `lists.beam`, so it is a safe single `-pa` for the oracle.
+struct SequenceFixture {
+    dir: TempDir,
+    beam: PathBuf,
+    data: PathBuf,
+}
+
+/// The compiler: a sibling of the resolved oracle first (the same installation), then `$PATH`
+/// — the same resolution `tests/scheduled_io_device.rs` uses.
+fn resolve_erlc() -> Option<PathBuf> {
+    if let Some(dir) = support::resolve_oracle().as_deref().and_then(Path::parent) {
+        let candidate = dir.join("erlc");
+        if support::is_executable(&candidate) {
+            return Some(candidate);
+        }
+    }
+    support::find_on_path("erlc")
+}
+
+/// Writes [`SEQUENCE_SOURCE`] and [`SEQUENCE_DATA`] into a fresh scratch directory and
+/// compiles the module with `erlc`; `None` with a loud skip when the toolchain cannot.
+fn build_sequence_fixture(erlc: &Path, label: &str) -> Option<SequenceFixture> {
+    let dir = TempDir::new(label);
+    let source = dir.0.join("ioseq.erl");
+    fs::write(&source, SEQUENCE_SOURCE).expect("write the sequence fixture source");
+    let data = dir.0.join("data");
+    fs::write(&data, SEQUENCE_DATA).expect("write the sequence data file");
+    let output = match Command::new(erlc)
+        .arg("-o")
+        .arg(&dir.0)
+        .arg(&source)
+        .stdin(Stdio::null())
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => {
+            support::skip_loudly("io_scan", &format!("cannot run `erlc`: {error}"));
+            return None;
+        }
+    };
+    if !output.status.success() {
+        support::skip_loudly(
+            "io_scan",
+            &format!(
+                "`erlc` exited with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        );
+        return None;
+    }
+    let beam = dir.0.join("ioseq.beam");
+    if !beam.is_file() {
+        support::skip_loudly("io_scan", &format!("`erlc` produced no {}", beam.display()));
+        return None;
+    }
+    Some(SequenceFixture { dir, beam, data })
+}
+
+/// The toolchain gate shared by the sequence tests: the resolved oracle and the compiled
+/// fixture, or `None` after a loud skip.
+fn sequence_fixture_or_skip(label: &str) -> Option<(PathBuf, SequenceFixture)> {
+    let oracle = support::require_oracle("io_scan")?;
+    let Some(erlc) = resolve_erlc() else {
+        support::skip_loudly("io_scan", "no `erlc` available (and none beside $ERTS_ORACLE)");
+        return None;
+    };
+    let fixture = build_sequence_fixture(&erlc, label)?;
+    Some((oracle, fixture))
+}
+
+/// `beam_rt run <beam> ioseq:<function>/1 "<data>"` — the **scheduled** process route.
+fn beam_rt_run(beam: &Path, function: &str, data: &Path) -> Run {
+    let spec = format!("ioseq:{function}/1");
+    let beam = beam.to_str().expect("an ASCII fixture path");
+    let data = literal(data);
+    run(Path::new(BINARY), &["run", beam, &spec, &data])
+}
+
+/// `beam_rt -noshell -pa <dir> -eval <expr>` — the **pumped** `-eval` route, loading the
+/// scratch dir so the same compiled function is reachable.
+fn beam_rt_eval_with_path(dir: &Path, expr: &str) -> Run {
+    let dir = dir.to_str().expect("an ASCII scratch path");
+    run(Path::new(BINARY), &["-noshell", "-pa", dir, "-eval", expr])
+}
+
+/// The `-eval`-route program for `ioseq:<function>/1`, printed with `~w` so the line matches
+/// the `run` action's own printer (only `~p` line-wraps).
+fn eval_program(function: &str, data: &Path) -> String {
+    format!(
+        "io:format(\"~w~n\",[ioseq:{function}({})]), halt(0).",
+        literal(data)
+    )
+}
+
+/// The live oracle's line for `ioseq:<function>/1`, loaded from the same scratch dir.
+fn oracle_line(oracle: &Path, dir: &Path, function: &str, data: &Path) -> String {
+    support::oracle_eval(oracle, Some(dir), &eval_program(function, data))
+        .unwrap_or_else(|| panic!("the live oracle could not answer ioseq:{function}/1"))
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Runs `ioseq:<function>/1` on **both** routes (scheduled `run` and pumped `-eval`) and
+/// under the live oracle, asserting all three print exactly `expected`.
+///
+/// `expected` is pinned, so the probe discriminates even where the oracle comparison cannot
+/// run; the oracle then proves the pinned value **is** the reference answer.
+fn assert_sequence_agrees(oracle: &Path, fixture: &SequenceFixture, function: &str, expected: &str) {
+    let scheduled = beam_rt_run(&fixture.beam, function, &fixture.data);
+    assert_eq!(
+        scheduled.code, 0,
+        "ioseq:{function}/1 on a scheduled process exited {}: {}",
+        scheduled.code, scheduled.err
+    );
+    assert_eq!(
+        scheduled.out, expected,
+        "the scheduled `run` line for ioseq:{function}/1"
+    );
+
+    let pumped = beam_rt_eval_with_path(&fixture.dir.0, &eval_program(function, &fixture.data));
+    assert_eq!(
+        pumped.code, 0,
+        "ioseq:{function}/1 on the -eval route exited {}: {}",
+        pumped.code, pumped.err
+    );
+    assert_eq!(pumped.out, expected, "the -eval line for ioseq:{function}/1");
+
+    assert_eq!(
+        oracle_line(oracle, &fixture.dir.0, function, &fixture.data),
+        expected,
+        "the pinned value must be the live oracle's ioseq:{function}/1 line"
+    );
+}
+
+/// `file:read/2` → `file:read_line/1` → `file:read/2` on one device: the `read_line/1`
+/// consumes the newline it saw, so the trailing `read/2` resumes exactly after it — the mixed
+/// buffered-read shape, on both routes and the oracle.
+#[test]
+fn a_mixed_read_read_line_read_sequence_matches_the_live_oracle() {
+    let Some((oracle, fixture)) = sequence_fixture_or_skip("seq_mixed") else {
+        return;
+    };
+    assert_sequence_agrees(&oracle, &fixture, "mixed", PINNED_MIXED);
+}
+
+/// `file:read_line/1` then a large `file:read/2`: the `read/2` drains the rest of the file,
+/// stashed leftover and all.
+#[test]
+fn a_read_line_then_read_sequence_matches_the_live_oracle() {
+    let Some((oracle, fixture)) = sequence_fixture_or_skip("seq_line_read") else {
+        return;
+    };
+    assert_sequence_agrees(&oracle, &fixture, "line_then_read", PINNED_LINE_THEN_READ);
+}
+
+/// A bare `file:position(F, cur)` after a `read_line/1` reports the **logical** position (past
+/// the consumed line), and the following `read/2` resumes there.
+#[test]
+fn a_position_cur_after_a_read_line_matches_the_live_oracle() {
+    let Some((oracle, fixture)) = sequence_fixture_or_skip("seq_pos_cur") else {
+        return;
+    };
+    assert_sequence_agrees(&oracle, &fixture, "position_cur", PINNED_POSITION_CUR);
+}
+
+/// `file:position(F, {cur, 2})` after a `read_line/1` lands two bytes into the next line, and
+/// the following `read/2` resumes there.
+#[test]
+fn a_position_cur_2_after_a_read_line_matches_the_live_oracle() {
+    let Some((oracle, fixture)) = sequence_fixture_or_skip("seq_pos_cur2") else {
+        return;
+    };
+    assert_sequence_agrees(&oracle, &fixture, "position_cur_2", PINNED_POSITION_CUR_2);
+}
+
+/// The negative control: a device that has genuinely reached end of file still answers `eof`
+/// to a further `read/2` — the buffered path never fabricates data.
+#[test]
+fn a_genuine_eof_after_a_full_read_matches_the_live_oracle() {
+    let Some((oracle, fixture)) = sequence_fixture_or_skip("seq_eof") else {
+        return;
+    };
+    assert_sequence_agrees(&oracle, &fixture, "at_eof", PINNED_AT_EOF);
 }

@@ -21,26 +21,18 @@
 //! A **scheduled** process must be able to complete an **io-device round trip** —
 //! `io:getopts/1`, `io:setopts/2` and `io:scan_erl_form/4`.
 //!
-//! # The defect this pins
+//! # Why these are scheduled-process probes
 //!
-//! `RuntimeContext::resolve_external_call` refused **every** module in
-//! [`FLOOR_MODULES`](beam_rt) wholesale, `io` included. The floor serves only
-//! `io:put_chars/1,2` for that namespace; every other `io:*` is an ordinary
-//! `lib/stdlib/src/io.erl` body that posts an `{io_request, …}` to the device and
-//! blocks in a `receive` for the reply. Refusing it routed the call onto the
-//! synchronous **non-pumping** `call_bif` path, where a scheduled process (a slice,
-//! `may_pump_scheduler() == false`) folds that `receive` into the typed `blocked()`
-//! capability gap:
-//!
-//! ```text
-//! beam_rt: unsupported: opcode: run: process blocked (no message available)   (exit 3)
-//! ```
-//!
-//! Entering the body **in-machine** instead lets the `receive` suspend the process
-//! through the ordinary `RunOutcome::Wait` path, which the scheduler resumes once the
-//! device replies — exactly how `file:*` (a non-floor module) already worked. This was
-//! the contract A.9 `compile:file/2` blocker: `epp:open/1`'s server calls
-//! `io:getopts/1` and `epp:parse_file/2` calls `io:scan_erl_form/4`.
+//! `io` is an ordinary `lib/stdlib/src/io.erl` module rather than a floor one: every `io:*`
+//! function here (other than the floor's `io:put_chars/1,2`) posts an `{io_request, …}` to
+//! the device and blocks in a `receive` for the reply. A scheduled process must complete
+//! that round trip through the ordinary `RunOutcome::Wait` path — the scheduler resumes it
+//! once the device replies — so `resolve_external_call` enters the body **in-machine**
+//! instead of routing it onto the synchronous, **non-pumping** `call_bif` path, where a
+//! slice (`may_pump_scheduler() == false`) would fold the `receive` into the typed
+//! `blocked()` capability gap and exit 3. This is also the contract A.9 `compile:file/2`
+//! path: `epp:open/1`'s server calls `io:getopts/1` and `epp:parse_file/2` calls
+//! `io:scan_erl_form/4`.
 //!
 //! # What this test does
 //!
@@ -294,10 +286,10 @@ fn assert_scheduled_agrees(fixture: &Fixture, oracle: &Path, function: &str, exp
 
 /// A scheduled process completes an io-device round trip and answers the oracle.
 ///
-/// Before the fix every probe below exited 3 with
-/// `unsupported: opcode: run: process blocked (no message available)` — the io-device
-/// `receive` folded into the typed block because the callee ran on the non-pumping
-/// synchronous path.
+/// Each probe enters the callee **in-machine**, so its io-device `receive` suspends the
+/// process through `RunOutcome::Wait` and the scheduler resumes it when the device replies,
+/// instead of folding the call into the typed `blocked()` gap on the non-pumping synchronous
+/// path.
 #[test]
 fn a_scheduled_process_completes_an_io_device_round_trip() {
     let Some(oracle) = support::require_oracle("scheduled io-device") else {

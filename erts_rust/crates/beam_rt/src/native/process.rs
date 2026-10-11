@@ -38,10 +38,11 @@
 //! monitor) in [`Runtime::references`](crate::Runtime::references). Reading a reference
 //! thing's payload (its id word) needs `beam_term::boxed_val`, which is `unsafe`, and this
 //! crate is `#![deny(unsafe_code)]`, so that term-keyed registry is the only way a later BIF
-//! can recover what a reference stands for; it is also what makes `demonitor/1`'s argument
-//! check exact (a term with no entry is not a reference this runtime minted, and the
-//! oracle's reason for that is `badarg`). The monitor half of the registry — and the
-//! monitors themselves — is [`monitor`].
+//! can recover what a reference stands for. [`monitor`] documents what it means for
+//! `demonitor/1,2`: a reference with no recorded monitor — a timer's, which the timer heap
+//! owns — simply has nothing to remove (the oracle answers `true`, or `false` with `[info]`),
+//! while a term that is not a reference at all is the oracle's `badarg`. The monitor half of
+//! the registry — and the monitors themselves — is [`monitor`].
 
 use std::rc::Rc;
 
@@ -49,7 +50,7 @@ use beam_common::{BeamError, Result};
 use beam_engine::terms;
 use beam_gc::HeapPolicy;
 use beam_process::{MonitorKind, MonitorRef, Priority, ProcessId, UnaliasMode};
-use beam_term::{atom_val, is_atom, is_small, signed_value, Eterm};
+use beam_term::{atom_val, is_atom, is_small, signed_value, Eterm, NIL};
 
 use crate::context::RuntimeContext;
 use crate::error;
@@ -131,7 +132,19 @@ impl RuntimeContext<'_> {
         Ok(term)
     }
 
-    // -- erlang:alias/1, erlang:unalias/1 ------------------------------------
+    // -- erlang:alias/0,1, erlang:unalias/1 ----------------------------------
+
+    /// `erlang:alias/0`: the `erlang.erl` shorthand for `erlang:alias([])`
+    /// (`erlang.erl:2130-2133`, whose doc is `equiv => alias([])`) — the `explicit_unalias`
+    /// default — so the option list is the **empty list**.
+    ///
+    /// The `/0` arm is dispatched directly (the `erlang.erl` wrapper cannot run: `erlang` is a
+    /// floor namespace) and hands [`Self::alias_1`] that empty list, so both arities share one
+    /// implementation and cannot drift. An empty `args` is exactly why the arm may not be
+    /// routed through `alias_1` itself, whose `args.first().ok_or(BadArg)` would raise.
+    pub(super) fn alias_0(&mut self) -> Result<Eterm> {
+        self.alias_1(&[NIL])
+    }
 
     /// `erlang:alias/1`: a fresh **standalone reference alias** owned by the caller — a
     /// reference a process may be sent to (`Alias ! Msg` delivers `Msg` to the caller).
@@ -969,6 +982,42 @@ mod tests {
         assert!(is_reference(&mut runtime, first), "make_ref/0 is a reference");
         assert!(is_reference(&mut runtime, second));
         assert_ne!(first, second, "a reference is never reused");
+    }
+
+    /// Oracle-verified (OTP 29/erts-17.1): `erlang:alias()` is a reference (the `erlang.erl`
+    /// wrapper `alias/0` over `alias([])`) that `erlang:unalias/1` clears, answering `true`
+    /// once and `false` thereafter.
+    #[test]
+    fn alias_of_no_arguments_is_a_fresh_clearable_alias() {
+        let mut runtime = runtime();
+        // The `/0` arm is dispatched with an **empty** argument list — the shape the wrapper
+        // `erlang:alias([])` reaches `alias/1` with.
+        let alias = call(&mut runtime, "erlang", "alias", &[]).expect("erlang:alias/0");
+        assert!(is_reference(&mut runtime, alias), "alias/0 answers a reference");
+        assert_ne!(
+            alias,
+            call(&mut runtime, "erlang", "make_ref", &[]).expect("make_ref/0"),
+            "the alias is freshly minted"
+        );
+        // The explicit empty option list is the whole difference from `alias/1`: an alias
+        // minted through `/0` is a send destination like any other.
+        let reference = MonitorRef::from_eterm(alias).expect("an alias is a reference");
+        assert_eq!(
+            runtime.processes().resolve_alias(reference),
+            Some(runtime.self_pid()),
+            "a message sent to the alias is delivered to its creator"
+        );
+        // `explicit_unalias` is the default, so `unalias/1` clears it: `true` then `false`.
+        let answer = call(&mut runtime, "erlang", "unalias", &[alias]).expect("unalias/1");
+        assert_eq!(atom_name(&runtime, answer), Some("true"));
+        assert_eq!(runtime.processes().resolve_alias(reference), None);
+        let answer = call(&mut runtime, "erlang", "unalias", &[alias]).expect("unalias/1");
+        assert_eq!(atom_name(&runtime, answer), Some("false"));
+
+        // A second call mints a *different* alias (the id space never repeats).
+        let second = call(&mut runtime, "erlang", "alias", &[]).expect("erlang:alias/0");
+        assert!(is_reference(&mut runtime, second));
+        assert_ne!(alias, second, "each alias/0 is freshly minted");
     }
 
     #[test]
