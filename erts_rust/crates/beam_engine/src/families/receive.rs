@@ -62,7 +62,9 @@
 //!   arrives. There is **no host timer at Milestone 1**, so a non-zero timeout
 //!   suspends until a message arrives (the `Time` operand selects between "do not
 //!   suspend" and "suspend", exactly as C's `timeout_value == make_small(0)`
-//!   test does) — the engine does not invent a timer.
+//!   test does) — the engine does not invent a timer. A host that owns a clock
+//!   recovers a *finite* `after T` through [`Machine::wait_deadline`] and resumes at
+//!   the `timeout` continuation when its timer fires.
 //!
 //! Every failure is a typed [`beam_common::BeamError`]: `read_operand`/
 //! `write_operand` and the host seam propagate theirs, a missing target label is

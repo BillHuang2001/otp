@@ -91,7 +91,7 @@ semantically identical to the old first-claim-wins probe loop (see the module do
   `exceptions/`, `tuples.rs`, `lists.rs`, `receive.rs`.
 
 ## Other semantics / divergence notes
-- `receive.rs:156-163` `WaitTimeout`: a non-zero timeout suspends **with no timer** (M1 gap); only the small integer `0` falls through to `pc+1`.
+- `receive.rs:156-163` `WaitTimeout`: a non-zero timeout suspends **with no timer** (the engine arms none); only the small integer `0` falls through to `pc+1`. A host recovers the parked deadline through `Machine::wait_deadline` and re-enters at the `timeout` continuation (`../machine/CONTEXT.md`, pinned by `../machine/deadline_tests.rs`).
 - `receive.rs:266-280` `marker_call` classifies "host does not serve markers" by **exact string match** on `unsupported_opcode: {method}` — a fragile, string-based error taxonomy (documented as the discriminator).
 - `bitstrings/create/segments.rs:96-101` `float_source`: a **bignum** float-segment value yields `None` ⇒ `badarg`, even though `beam_term::number::big_to_f64` exists and is used by `floats/convert.rs`. Missed reuse.
 - `bitstrings/matching/reads.rs:288-326` `decode_utf8` ignores `BSF_LITTLE` (documented: `bs_get_utf8 -little` is not meaningful in ERTS).

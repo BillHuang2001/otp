@@ -60,6 +60,12 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   every live caller innermost first, plus the guard that a caught raise lands unchanged. `test_support.rs`
   (`cfg(test)` only) is the synthetic-module builder (`Fixture`) and cross-module seam context (`seam`) these share
   with `drive.rs`'s tests.
+- `deadline_tests.rs` — the parked-`receive` deadline driven to completion: a **nested** run through the
+  non-blocking `run_export` (whose fold to `blocked()` must leave the machine parked, so `wait_deadline` still
+  reports the deadline) and a blocking `run_export_outcome` park, each resumed at the deadline's `timeout`
+  continuation to run the `after` clause — on a real module compiled by the system `erlc` and cross-checked
+  against `erl` (loud skip when `erlc`/`erl` are absent); plus a cross-module-callee park proving the deadline
+  is read from the callee context, never the entry module.
 
 ## Constraints
 - Errors are `beam_common::{Result, BeamError}` only — no crate-local error enum, no panic, no `unwrap()` on

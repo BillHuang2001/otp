@@ -56,10 +56,15 @@
 //! * `location` — the read-only execution-position introspection
 //!   ([`Machine::current_code`]/[`Machine::entry_call`] and the derived
 //!   [`Machine::current_function`]/[`Machine::initial_call`]/
-//!   [`Machine::current_location`]/[`Machine::current_stacktrace`]).
+//!   [`Machine::current_location`]/[`Machine::current_stacktrace`]), plus the
+//!   parked-`receive` deadline seam
+//!   ([`Machine::wait_deadline`]/[`Machine::timeout_delay`] and [`WaitDeadline`]).
 //! * `tests` — the cross-cutting end-to-end tests (the uniform raise funnel's
 //!   symbolic frames, run through real run entries), over the synthetic-module
 //!   scaffolding in `test_support`.
+//! * `deadline_tests` — the parked-`receive` deadline driven to completion on a real
+//!   compiled module (`erlc`) and cross-checked against the system `erl`, including the
+//!   nested / blocking run path a fired `after T` has to work through.
 //! * `test_support` — the `cfg(test)`-only synthetic-module builder (`Fixture`)
 //!   and the cross-module seam context (`seam`) the `machine` tests share.
 use beam_common::{ExceptionClass, Result};
@@ -79,6 +84,8 @@ use self::catch::UNRESOLVED_CLASS_ATOMS;
 
 mod catch;
 mod context;
+#[cfg(test)]
+mod deadline_tests;
 mod drive;
 mod frames;
 mod location;
