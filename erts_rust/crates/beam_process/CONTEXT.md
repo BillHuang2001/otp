@@ -111,11 +111,15 @@ Honors the crate-layer root-set contract: `x_reg_array[0..Live)` **plus the whol
     the nursery to the smallest curated size covering `need_words`; a fail-fast typed `AllocKind::Heap`
     when the policy's ceiling makes the request unreachable). Both route through one shared
     `run_rooted_collection` helper that writes every root region back even when the collection action
-    returned `Err` (see Design Decisions), re-installing each queued message around its relocated
-    payload through `Message::with_payload`, so the message keeps its **whole envelope** — `from`,
-    `token`, off-heap handles, refc binaries, node entries and (for an oversized payload that lives
-    *in* them, not in the nursery) its `Fragments` chain — see `mailbox`. A fragment-resident payload
-    is outside every evacuated range, so the collector leaves it in place.
+    returned `Err` (see Design Decisions). Each queued message contributes **three** roots — its
+    `payload()`, `from()` and `token()` — and all three are written back into the re-installed
+    envelope: the payload through `Message::with_payload` (the relocation-safe rebuild) and
+    `from`/`token` through `Message::set_from`/`set_token`, so the message keeps its **whole
+    envelope** — `from`, `token`, off-heap handles, refc binaries, node entries and (for an oversized
+    payload that lives *in* them, not in the nursery) its `Fragments` chain — see `mailbox` (the
+    off-heap handles, refc binaries, node entries and `Fragments` are not terms and travel
+    untouched). A fragment-resident payload is outside every evacuated range, so the collector leaves
+    it in place.
     A queued payload referencing an off-heap refc binary therefore stays alive across the
     collection (the `tests/gc_refc_binary_message.rs` bullet in Test Strategy).
     Every construction ends with `sweep_off_heap_binaries()` — the process's **owned off-heap
