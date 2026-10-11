@@ -23,11 +23,12 @@ module free of a module-context switch (`Step::Enter`), the interpreter everywhe
 * [`run`] — `RuntimeRunner`: the `ProcessRunner` implementation (one reduction slice) — the tier
   selection (once, at the first entry) and the tier-aware first-entry/resume execution, the
   parked-machine root publication (`publish_parked_roots`/`resume_from_process_roots`) and the
-  recorded outcome. Both recorded terms are transported with an off-heap source table built by
-  [`source_binaries`] — the executing **machine's** handles (`engine.machine.refc_binaries()`)
-  **unioned** with the handles the pid's scan retained from the messages it received
-  (`MailboxState::retained_binaries`), since a payload the process *received from another process*
-  carries its handles on the message envelope, not on this machine. They are stabilized *before*
+  recorded outcome. Both recorded terms are transported with the `SourcePayloads` built by
+  [`Runtime::source_payloads`](crate::runtime::Runtime::source_payloads) — the executing **machine's**
+  handles (`engine.machine.refc_binaries()`) **unioned** with the whole off-heap family the pid's scan
+  retained from the messages it received (`MailboxState::retained_binaries`/`retained_off_heap`/
+  `retained_nodes`), since a payload the process *received from another process* carries its handles on
+  the message envelope, not on this machine. They are stabilized *before*
   the engine goes back into — or is dropped out of — `RunnerState`: the return value through
   `Runtime::stabilize_term_with`, the exit reason through `Runtime::try_stabilize_escaped_with`. An
   off-heap binary (`bs_init_writable`/`bs_create_bin` above the on-heap limit) is therefore copied
@@ -124,9 +125,10 @@ the park/resume and the admission point can never drift:
   process's authoritative root set back into the machine and, if the slices no longer match, **halts the
   process's collection** (`Runtime::halt_process_gc`) rather than run against inconsistent roots.
 The runner's raise arm likewise copies the recorded exit reason through
-`Runtime::try_stabilize_escaped_with` — with the copy's off-heap source built by `source_binaries`
-(the **same machine's** `refc_binaries()` unioned with the handles the pid retained from received
-messages), so a reason that *is* an off-heap binary (`exit(<<big/binary>>)`) is resolved and shared
+`Runtime::try_stabilize_escaped_with` — with the copy's `SourcePayloads` built by
+`Runtime::source_payloads` (the **same machine's** `refc_binaries()` unioned with the whole off-heap
+family the pid retained from received messages — refc binaries, MSO handles and node identities),
+so a reason that *is* an off-heap binary (`exit(<<big/binary>>)`) is resolved and shared
 instead of tripping the valve, whether the process built it or received it; a reason that genuinely
 cannot be copied is still the honest `error:system_limit`, never a stored dangling word.
 
@@ -233,8 +235,9 @@ predicate-guarded `Auto`** — never the switch-blind `Baseline`, whose slice co
   `jit_mode`/`jit_safety` fields and the `jit_mode()` accessor).
 * `run.rs` → `RuntimeRunner`: the (first-entry) tier selection and the tier-aware resume, the
   parked-machine root publication (`publish_parked_roots`/`resume_from_process_roots`), the
-  off-heap source-table build (`source_binaries` — the machine's handles unioned with the pid's
-  retained mailbox binaries) and the return-value / exit-reason stabilization.
+  return-value / exit-reason stabilization (whose `SourcePayloads` come from
+  `Runtime::source_payloads` — the machine's handles unioned with the pid's retained mailbox
+  off-heap families).
 * `budget.rs` → the reduction budget + the charging wrapper context.
 * `tier.rs` → the tier mode + its `BEAM_RT_TIER` semantics (`mode_from_value`), the environment default,
   the selection and the switch-safety predicate.
