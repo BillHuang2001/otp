@@ -299,7 +299,7 @@ constructors only (no new error enum).
 - **On-demand growth is an explicit seam, not a collect side effect.** Growth normally happens *only* inside
   a collection; `ensure_capacity(need_words, roots)` (on `Collector`/`GenImmixCollector`/`AnyCollector`)
   adds the caller-driven path a runtime needs when the mutator demands room: it collects once to reclaim,
-  then grows the now-empty nursery to the smallest curated size covering `need_words` (`grow_nursery`, one
+  then grows the now-empty nursery to the smallest curated size covering `need_words` (`Nursery::grow`, one
   bounded step). It cannot "collect until it fits" because `young_after_collection` re-sizes the next
   nursery from the (now empty) *surviving* set — a further collect would shrink it, never grow it. A
   `max_heap_words` cap that cannot reach `need_words` yields a typed `heap_exhausted` before any copy.
