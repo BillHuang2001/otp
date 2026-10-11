@@ -192,12 +192,12 @@ default (`Auto`, and its `baseline` alias) puts every process on the native tier
   `ProcessTable::deliver_simple` message wakes it and the resume takes it on the remembered tier), and
   `an_interpreter_tier_process_is_unchanged_across_a_resume` (same loop on `JitMode::Interpreter` records
   the same result and compiles nothing on either slice). Each asserts `ProcessEngine::tier` as well.
-* Pre-emption of a **non-allocating** loop on both tiers, over the committed `gc_ints` fixture (whose
-  `l1/1 -> loop/2` disassembly contains no heap-admission instruction at all):
+* Pre-emption of a **non-allocating** loop on both tiers, over the committed `preempt` fixture's
+  `spin/1` (whose `spin/1 -> spin/2` disassembly contains no heap-admission instruction at all):
   `a_non_allocating_interpreted_loop_is_pre_empted` (interpreter tier — a whole-budget slice yields and
   records nothing, a second short process registered behind it runs to its `return` while the loop is
-  unfinished, and the loop's final value is a checksum computed independently in Rust, whose
-  order-sensitive recurrence would change if a resume re-applied an instruction) and
+  unfinished, and the loop's final value is its iteration count, which changes if a resume skips or
+  double-applies an instruction) and
   `a_non_allocating_loop_on_the_native_tier_completes_within_one_slice` (the same call with the same
   iteration count completes inside one budget-bounded slice on the native tier — the documented residual
   limit, pinned rather than papered over).

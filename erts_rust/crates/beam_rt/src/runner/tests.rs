@@ -1416,39 +1416,10 @@ fn an_interpreter_tier_process_is_unchanged_across_a_resume() {
 
 // -- pre-emption of a non-allocating, interpreted loop ---------------------
 
-/// The committed **non-allocating** tail-loop fixture, reused by relative path (never copied).
-///
-/// `l1/1 -> loop/2` is a pure small-integer tail recursion whose disassembly is only
-/// `func_info`/`test`/`move`/`gc_bif`/`call_only`/`return`. There is **no** `test_heap`,
-/// `allocate` or `allocate_heap` in it, and a `gc_bif` reaches only
-/// [`ExecutionContext::call_bif`](beam_engine::ExecutionContext::call_bif) — never
-/// `ensure_heap` — so the loop has **no heap-admission point at all**. It is therefore exactly
-/// the shape whose pre-emption can only come from the interpreter's per-instruction reduction
-/// charge.
-fn gc_ints_fixture() -> &'static str {
-    concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/gc_ints.beam"
-    )
-}
-
 /// The non-allocating loop's iteration count in the pre-emption tests: far above one slice's
-/// [`DEFAULT_REDUCTIONS_PER_SLICE`] budget.
+/// [`DEFAULT_REDUCTIONS_PER_SLICE`] budget, so the interpreter tier cannot finish it in one
+/// slice.
 const NON_ALLOCATING_N: i64 = 100_000;
-
-/// `gc_ints:l1(N)`, computed independently in Rust.
-///
-/// The Erlang loop is `loop(N, Acc) -> loop(N - 1, (Acc + N) rem 1000003)` from `Acc = 0`, so
-/// the recurrence is **order-sensitive**: a step applied twice (a resumed instruction re-run)
-/// or skipped would change the value. That is what makes this a check on the resume's
-/// exactness rather than only on the loop having finished.
-fn expected_checksum(n: i64) -> i64 {
-    let mut acc: i64 = 0;
-    for step in (1..=n).rev() {
-        acc = (acc + step) % 1_000_003;
-    }
-    acc
-}
 
 /// Loads `fixture` through the runtime's **code server** (so its atoms land in the runtime's
 /// one shared table, exactly as the CLI path's do) and hands back the module handle.
@@ -1459,14 +1430,23 @@ fn load_module(rt: &mut Runtime, fixture: &str, name: &str) -> Arc<Module> {
         .expect("the loaded module is registered by name")
 }
 
-/// Spawns `gc_ints:l1/1` (the committed non-allocating tail loop) as process `pid`.
+/// Spawns `preempt:spin/1` (the PRE-EMPTION fixture's non-allocating tail loop) as process
+/// `pid`.
+///
+/// `spin(N) -> spin(N, 0)` / `spin(N, Count) -> spin(N - 1, Count + 1)` is pure small-integer
+/// arithmetic and a tail call, so its disassembly is only
+/// `func_info`/`test`/`move`/`gc_bif`/`call_only`/`line`/`label`/`return` — **no** `test_heap`,
+/// `allocate` or `allocate_heap`. It therefore reaches **no heap-admission point at all**, so a
+/// pre-emption can only come from the interpreter's per-instruction reduction charge. Its
+/// result is an **iteration count** (`spin(N)` returns exactly `N`), so a skipped or
+/// double-applied instruction across a pre-emption/resume boundary changes the recorded value.
 fn spawn_non_allocating_loop(
     state: &mut RunnerState,
     pid: ProcessId,
     module: Arc<Module>,
     n: i64,
 ) {
-    let function = module.atom_table.lookup("l1").expect("l1 is interned");
+    let function = module.atom_table.lookup("spin").expect("spin is interned");
     state.spawn(
         pid,
         ProcessEntry::Export {
@@ -1481,15 +1461,16 @@ fn spawn_non_allocating_loop(
 /// **A non-allocating interpreted loop IS pre-empted, and the process queued behind it really
 /// runs.**
 ///
-/// The loop reaches no heap-admission instruction (see [`gc_ints_fixture`]), so a
-/// [`ProcOutcome::Yield`] after one slice's budget can only have come from the engine's
-/// per-instruction `reduce` hook. The yield is *resumption-exact and work-preserving*: no
-/// result is recorded (`state.result(pid_a)` stays `None`) and the machine is parked at the
-/// instruction it charged for. A second, short process registered on the same table then runs
-/// to completion **while the loop is still unfinished** — the fairness a budget-ignoring
-/// runner cannot provide. Driving the loop to completion finally records exactly the checksum
-/// computed independently in Rust, whose order-sensitive recurrence would change if the resume
-/// re-applied (or skipped) an instruction.
+/// The loop is `preempt:spin/1` of the PRE-EMPTION fixture and reaches no heap-admission
+/// instruction (see [`spawn_non_allocating_loop`]), so a [`ProcOutcome::Yield`] after one
+/// slice's budget can only have come from the engine's per-instruction `reduce` hook. The
+/// yield is *resumption-exact and work-preserving*: no result is recorded
+/// (`state.result(pid_a)` stays `None`) and the machine is parked at the instruction it
+/// charged for. A second, short process registered on the same table then runs to completion
+/// **while the loop is still unfinished** — the fairness a budget-ignoring runner cannot
+/// provide. Driving the loop to completion finally records exactly its iteration count, whose
+/// value is count-sensitive: a resume that skipped or double-applied an instruction would
+/// change it.
 #[test]
 fn a_non_allocating_interpreted_loop_is_pre_empted() {
     let mut rt = runtime();
@@ -1497,24 +1478,23 @@ fn a_non_allocating_interpreted_loop_is_pre_empted() {
     state.jit_mode = Some(JitMode::Interpreter);
     let mut table = table();
 
-    // The loop's module and the short process's module, both through the runtime's code server
-    // so their atoms live in the runtime's shared table.
-    let gc_module = load_module(&mut rt, gc_ints_fixture(), "gc_ints");
-    let quick_module = load_module(&mut rt, preempt_fixture(), "preempt");
+    // The loop and the short process `quick/0` both live in the PRE-EMPTION fixture, loaded
+    // through the runtime's code server so its atoms land in the runtime's shared table.
+    let module = load_module(&mut rt, preempt_fixture(), "preempt");
 
     // Registered FIRST: the CPU-bound loop. Registered SECOND: the short process it must not
     // starve.
     let pid_a = table.spawn_default().expect("a fresh process");
     let pid_b = table.spawn_default().expect("a fresh process");
-    spawn_non_allocating_loop(&mut state, pid_a, gc_module, NON_ALLOCATING_N);
-    let quick = quick_module
+    spawn_non_allocating_loop(&mut state, pid_a, Arc::clone(&module), NON_ALLOCATING_N);
+    let quick = module
         .atom_table
         .lookup("quick")
         .expect("quick is interned");
     state.spawn(
         pid_b,
         ProcessEntry::Export {
-            module: quick_module,
+            module,
             function: quick,
             arity: 0,
         },
@@ -1581,20 +1561,20 @@ fn a_non_allocating_interpreted_loop_is_pre_empted() {
     };
     assert_eq!(outcome, ProcOutcome::Exit(normal(&mut rt)));
     assert_eq!(
-        signed_value(state.result(pid_a).expect("the loop returns a checksum")),
-        expected_checksum(NON_ALLOCATING_N),
+        signed_value(state.result(pid_a).expect("the loop returns its iteration count")),
+        NON_ALLOCATING_N,
         "the charges cost no work: the resume applied every instruction exactly once"
     );
 }
 
 /// **The honest native-tier contrast: a compiled block is not charged per instruction.**
 ///
-/// The *same* `gc_ints:l1/1` call with the *same* iteration count completes inside **one**
+/// The *same* `preempt:spin/1` call with the *same* iteration count completes inside **one**
 /// slice under the native baseline tier, even though that slice's budget is only
 /// [`DEFAULT_REDUCTIONS_PER_SLICE`]: the loop reaches no heap-admission point (see
-/// [`gc_ints_fixture`]) and a natively executed block never crosses the per-instruction
-/// `reduce` hook, so nothing charges mid-block. The recorded value is still the independently
-/// computed checksum — the tier is interpreter-identical, only its pre-emption granularity
+/// [`spawn_non_allocating_loop`]) and a natively executed block never crosses the
+/// per-instruction `reduce` hook, so nothing charges mid-block. The recorded value is still
+/// the iteration count — the tier is interpreter-identical, only its pre-emption granularity
 /// differs. This is the residual limitation the interpreter gap's closure leaves behind, and
 /// it is pinned rather than papered over.
 #[test]
@@ -1604,7 +1584,7 @@ fn a_non_allocating_loop_on_the_native_tier_completes_within_one_slice() {
     state.jit_mode = Some(JitMode::Baseline);
     let mut table = table();
 
-    let module = load_module(&mut rt, gc_ints_fixture(), "gc_ints");
+    let module = load_module(&mut rt, preempt_fixture(), "preempt");
     let pid = table.spawn_default().expect("a fresh process");
     spawn_non_allocating_loop(&mut state, pid, module, NON_ALLOCATING_N);
 
@@ -1621,8 +1601,8 @@ fn a_non_allocating_loop_on_the_native_tier_completes_within_one_slice() {
          pre-empted mid-block"
     );
     assert_eq!(
-        signed_value(state.result(pid).expect("the loop returns a checksum")),
-        expected_checksum(NON_ALLOCATING_N),
+        signed_value(state.result(pid).expect("the loop returns its iteration count")),
+        NON_ALLOCATING_N,
         "the native tier computes the same result as the interpreter"
     );
 }
