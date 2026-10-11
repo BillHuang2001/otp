@@ -625,6 +625,12 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
 - `tests/live_accept.rs` → real-`erl` server-side `'N'` handshake + Rust→node→Rust `DOP_REG_SEND` round
   trip (full `node@host` + epmd creation) + published-vs-hidden peer visibility
 - `tests/live_driver.rs` → real-`erl` non-blocking `ConnectionDriver` handshake + send
+- `tests/two_node_loopback.rs` → hermetic in-process two-node loopback (two named `beam_dist`
+  endpoints over a real loopback socket: bidirectional `DOP_REG_SEND`/`DOP_SEND_SENDER`, monitor
+  round-trip, ticks, >`DIST_FRAGMENT_SIZE` both ways, an `InboundSink` routing a delivery, a real
+  non-blocking-socket `ConnectionDriver` pair, clean-close vs abrupt-drop peer death) — no `erl`/`epmd`
+- `tests/hermetic_epmd.rs` → test-local `epmd` registry stub (ALIVE2/PORT2/NAMES/STOP) + the crate
+  client hermetically + an `erl -epmd_port <stub>` oracle cross-check — no host `epmd`
 - `../../../erts/emulator/beam/dist.h` · `dist.c` · `external.c` · `external.h` · `packet_parser.c` →
   authoritative flags/opcodes/header/framing/fragmentation (read-only)
 - `../../../erts/doc/guides/erl_dist_protocol.md` + `erl_ext_dist.md` → the wire guides (read-only)
