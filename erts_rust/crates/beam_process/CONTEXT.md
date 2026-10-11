@@ -376,7 +376,12 @@ The **local record** of a process's relationships with processes on other nodes;
   scheduler, the mailbox, signals, PCB state and the dictionary (including its `erl`-cross-checked
   structural key/value equality); `message_relocation` the collection's queued-message re-install (a
   fragment-resident payload keeps its `Fragments`, a heap-resident one keeps its refc-binary/node
-  lists, FIFO order is preserved); `ports`/`remote` the port table and distributed links/monitors;
+  lists, FIFO order is preserved; the in-file
+  `process::tests::run_rooted_collection_gathers_and_scatters_the_message_envelope_words` pins the
+  three-word `[payload, from, token]` envelope root and fails if the walk gathers only payloads);
+  `alias` the `erl`-cross-checked reference-alias semantics (resolution, the three un-alias modes'
+  auto-removal, `unalias`, the dead-owner sweep, the typed port/remote refusals);
+  `ports`/`remote` the port table and distributed links/monitors;
   `process_exit_observer`/`port_monitor_cleanup` the process-death observer seam and the death-side
   port-monitor cleanup (incl. `erl`-cross-checked oracle probes); `smp`/`lock_scope`/`timers`/`dirty`/
   `progress` the SMP pool; `registry_monitors`/`monitor_tag` the
