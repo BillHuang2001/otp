@@ -134,7 +134,8 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
     allocatable one), so the answer is strategy-independent — while `young_contains(ptr)` covers **every**
     space of the chain.
   - `collect(&mut self, roots) -> Result<Collection>`; `collect_minor`/`collect_major` (`-> Result<GcStats>`);
-    `ensure_capacity(need_words, roots) -> Result<Collection>`.
+    `ensure_capacity(need_words, roots) -> Result<Collection>`; `grow_nursery(need_words) -> Result<()>` (the
+    chain's no-relocation growth seam); `young_contains(ptr) -> bool`; `young_space_count() -> usize`.
   - The **mature generation** accessors: `mature_capacity_words()`, `mature_used_words()`,
     `mature_available_words()` (mark-region figures are line-rounded — `used_lines * LINE_WORDS`, i.e. "at
     least this many words"), `mature_base() -> *mut Eterm`, `mature_contains(ptr: *const Eterm) -> bool`.
