@@ -95,8 +95,11 @@
 //! [`crate::error::unsupported`], and a non-atom `apply` target is the C's
 //! `badarg` **raise** — catchable through [`raise_badarg`] (landing in a live
 //! `try`/`catch`), or the typed [`BeamError::BadArg`] when there is no catch
-//! frame to land in (or the module cannot name `badarg`). Never a panic and never
-//! a wrong result.
+//! frame to land in (or the module cannot name `badarg`). A **host BIF error**
+//! from an applied target is the same catchable raise — routed through
+//! [`Machine::raise_bif_error`](crate::machine::Machine::raise_bif_error) — so it
+//! lands in a live `try`/`catch` too rather than escaping the caller. Never a
+//! panic and never a wrong result.
 
 use crate::interpreter::LabelMap;
 
@@ -226,6 +229,17 @@ pub(crate) fn exec(
 
         // `apply_last Arity Deallocate` — pop the frame, then apply and continue
         // through the machine's continuation (a tail call).
+        //
+        // **Pop timing (deliberate).** The pop precedes `apply_target`, matching
+        // C's `i_apply_last`: `$APPLY` (`i_apply_last`) resolves the export and
+        // `$deallocate` runs *before* the resolved callee executes, so a raise from
+        // the callee (e.g. `erlang:error/1`) happens with this frame already gone
+        // (`emu/instrs.tab:266-272`). Only C's own resolution failure
+        // (`fixed_apply` returning NULL ⇒ `badarg`/`system_limit`) keeps the frame;
+        // a raise there still lands correctly through the engine because the
+        // handler of a `try` enclosing this tail call lives in an *outer* frame that
+        // the pop does not touch — pinned by
+        // `tests/call_ext_apply.rs::a_host_bif_error_from_a_tail_apply_last_lands_in_the_enclosing_try`.
         Instr::ApplyLast { arity, deallocate } => {
             machine.pop_frame_checked(*deallocate)?;
             match apply_target(machine, module, *arity, ctx)? {
@@ -361,8 +375,13 @@ pub(crate) enum ApplyTarget {
     /// callee's registered module context and its export entry. The instruction
     /// applies its own frame discipline and reports [`Step::Enter`].
     Enter { context: u32, func: u32, pc: u32 },
-    /// The target shape was invalid — a non-atom module/function — and the C's
-    /// `badarg` raise was routed through the machine (see [`raise_badarg`]). The
+    /// The target dispatch **raised** instead of returning a value: either the
+    /// target shape was invalid — a non-atom module/function — or the host BIF the
+    /// target resolved to failed. Both are the C's catchable raise
+    /// (`fixed_apply`'s `badarg`, and `$HANDLE_APPLY_ERROR` → `handle_error` →
+    /// `next_catch` for a BIF failure, `emu/instrs.tab:234-296`), routed through
+    /// the machine (see [`raise_badarg`] and
+    /// [`Machine::raise_bif_error`](crate::machine::Machine::raise_bif_error)). The
     /// `Step` is the handler landing the raise produced (a live catch frame); the
     /// landed registers (`x(0) = THE_NON_VALUE`, `x(1..=3)`) must not be clobbered.
     Raised(Step),
@@ -381,8 +400,13 @@ pub(crate) enum ApplyTarget {
 /// where `fixed_apply` (`beam_common.c:1528`) resolves the export and jumps into
 /// its code in the same process. When the host declines (`Ok(None)` — the seam's
 /// default) the target is applied through
-/// [`ExecutionContext::call_bif`](crate::ExecutionContext::call_bif), byte-identical
-/// to the previous synchronous route. This also covers the C's `apply of apply/3`
+/// [`ExecutionContext::call_bif`](crate::ExecutionContext::call_bif); a **host BIF
+/// error** is not allowed to escape the caller's live `try`/`catch` — it is routed
+/// through [`Machine::raise_bif_error`](crate::machine::Machine::raise_bif_error)
+/// (the C's `$HANDLE_APPLY_ERROR` → `handle_error` → `next_catch`) and reported as
+/// [`ApplyTarget::Raised`], while a successful value is reported as
+/// [`ApplyTarget::Called`] (the previous synchronous route, byte-identical). This
+/// also covers the C's `apply of apply/3`
 /// special case (`beam_common.c:1554-1557`): `x(0)`/`x(1)`/`x(2)` are then handed
 /// straight to `erlang:apply/3` as its `M,F,Args` arguments, which is exactly what
 /// the recursion into `apply()` computes.
@@ -422,8 +446,25 @@ pub(crate) fn apply_target(
         let (func, pc) = handle.labels.resolve(label)?;
         return Ok(ApplyTarget::Enter { context, func, pc });
     }
-    ctx.call_bif(module_name, function_name, arity, &args)
-        .map(ApplyTarget::Called)
+    // The host could not run the callee in-machine: dispatch it through the
+    // synchronous BIF path. A **host BIF error** is not allowed to escape the
+    // caller's live `try`/`catch`: C routes every apply failure through
+    // `$HANDLE_APPLY_ERROR` → `handle_error` → `next_catch`
+    // (`../../erts/emulator/beam/emu/instrs.tab:234-296`,
+    // `../../erts/emulator/beam/beam_common.c:1539-1557`), so the raise is
+    // catchable. [`Machine::raise_bif_error`] implements exactly that contract
+    // (a routable raise lands in the innermost live catch frame; a genuine
+    // capability gap — whose reason atom the running module cannot name — stays
+    // the uncatchable typed `Err`, and with no catch frame the error propagates
+    // unchanged), so the single call here covers the `apply`/`apply_last` arms
+    // **and** the `call_ext erlang:apply/3` seam route (both consume
+    // [`ApplyTarget`]). Engine-diagnostic `Err`s from *outside* the host BIF call
+    // (an out-of-range register, the resolver / label resolution above) keep their
+    // `?` and are never wrapped — only the host's own BIF outcome is.
+    match ctx.call_bif(module_name, function_name, arity, &args) {
+        Ok(value) => Ok(ApplyTarget::Called(value)),
+        Err(e) => Ok(ApplyTarget::Raised(machine.raise_bif_error(module, e)?)),
+    }
 }
 
 /// Raise the `badarg` semantic error through the machine, landing it in a live

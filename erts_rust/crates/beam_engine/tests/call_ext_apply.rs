@@ -74,7 +74,7 @@ use std::process::Command;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use beam_common::{BeamError, Result};
+use beam_common::{BeamError, ExitReason, Raise, Result};
 use beam_engine::context::BifHook;
 use beam_engine::{terms, ExecutionContext, Machine, MinimalContext, RunOutcome};
 use beam_loader::{
@@ -444,8 +444,10 @@ fn try_caller_apply3_module() -> (Module, Atom) {
     let mut f = Fixture::new("m");
     // `c`/`recv` are interned so the shape-error tests can build the `M`/`F`
     // argument terms from this module's own table (the raise itself never needs
-    // them: it is the `badarg` atom the landing resolves).
-    for name in ["erlang", "apply", "not_apply", "c", "recv"] {
+    // them: it is the `badarg` atom the landing resolves). `boom` is the reason
+    // atom a *host BIF error* landing resolves (the applied-target tests below),
+    // so it must live in this module's table too.
+    for name in ["erlang", "apply", "not_apply", "c", "recv", "boom"] {
         f.atom(name);
     }
     let target = f.import("erlang", "apply", 3);
@@ -983,4 +985,349 @@ fn a_minimal_context_without_the_seam_folds_the_apply_into_call_bif() {
     // The reason names the callee the seam decoded: proof the fold went through
     // `call_bif` with the decoded `(M, F, A)`.
     assert_eq!(reason(error), "unsupported_opcode: bif c:recv/0");
+}
+
+// ---------------------------------------------------------------------------
+// (6) a host BIF error from an applied target is the catchable raise the oracle
+//     produces — C's `$HANDLE_APPLY_ERROR` → `handle_error` → `next_catch`
+// ---------------------------------------------------------------------------
+
+/// A BIF floor that raises `error:boom` for the applied `erlang:error/1` (the
+/// *host BIF error* an applied target produces) and rejects everything else.
+///
+/// `boom` is an atom the caller fixtures intern, and the raise is class `error`
+/// with a bare-atom reason — the shape `beam_bifs`'s `erlang:error/1` raises and
+/// the shape `Machine::raise_bif_error` lands in a live catch frame
+/// (`x(1) = boom`, `x(3) = error`).
+fn boom_raising() -> BifHook {
+    Box::new(|module, function, arity, _args| {
+        if module == "erlang" && function == "error" && arity == 1 {
+            return Err(BeamError::Raise(Raise::error(ExitReason::atom("boom"))));
+        }
+        Err(beam_engine::unsupported(&format!(
+            "bif {module}:{function}/{arity}"
+        )))
+    })
+}
+
+/// The `Instr::Apply` caller `m:run/0` — `run() -> try apply(erlang, error,
+/// [boom]) catch C:R -> R end`:
+///
+/// ```text
+/// m:run/0:
+///     allocate 1
+///     try y0 {handler}
+///     move {atom,erlang} -> x1
+///     move {atom,error}  -> x2
+///     move {atom,boom}   -> x0      ; the single applied argument
+///     apply 1
+///     try_end y0
+///     deallocate 1
+///     return
+///   {handler}:
+///     try_case y0
+///     move x1 -> x0                 ; the reason the raise landed
+///     deallocate 1
+///     return
+/// ```
+fn try_apply_module() -> (Module, Atom) {
+    let mut f = Fixture::new("m");
+    let erlang = f.atom("erlang");
+    let error = f.atom("error");
+    let boom = f.atom("boom");
+    let run = f.add_function(
+        "run",
+        0,
+        vec![
+            Instr::Label(Label(100)),
+            Instr::Allocate {
+                stack_need: HeapNeed::Words(1),
+                live: 0,
+            },
+            Instr::Try {
+                frame: Operand::Y(0),
+                fail: Label(103),
+            },
+            Instr::Move {
+                src: Operand::Atom(erlang),
+                dst: Operand::X(1),
+            },
+            Instr::Move {
+                src: Operand::Atom(error),
+                dst: Operand::X(2),
+            },
+            Instr::Move {
+                src: Operand::Atom(boom),
+                dst: Operand::X(0),
+            },
+            Instr::Apply { arity: 1 },
+            Instr::TryEnd {
+                frame: Operand::Y(0),
+            },
+            Instr::Deallocate(1),
+            Instr::Return,
+            Instr::Label(Label(103)),
+            Instr::TryCase {
+                frame: Operand::Y(0),
+            },
+            Instr::Move {
+                src: Operand::X(1),
+                dst: Operand::X(0),
+            },
+            Instr::Deallocate(1),
+            Instr::Return,
+        ],
+    );
+    f.add_export("run", 0, run);
+    let run_atom = f.atom("run");
+    (f.finish(), run_atom)
+}
+
+/// [`try_apply_module`] without the `try`: the same `apply(erlang, error,
+/// [boom])`, whose raise has **no** live catch frame to land in.
+fn bare_apply_module() -> (Module, Atom) {
+    let mut f = Fixture::new("m");
+    let erlang = f.atom("erlang");
+    let error = f.atom("error");
+    let boom = f.atom("boom");
+    let run = f.add_function(
+        "run",
+        0,
+        vec![
+            Instr::Label(Label(100)),
+            Instr::Allocate {
+                stack_need: HeapNeed::Words(0),
+                live: 0,
+            },
+            Instr::Move {
+                src: Operand::Atom(erlang),
+                dst: Operand::X(1),
+            },
+            Instr::Move {
+                src: Operand::Atom(error),
+                dst: Operand::X(2),
+            },
+            Instr::Move {
+                src: Operand::Atom(boom),
+                dst: Operand::X(0),
+            },
+            Instr::Apply { arity: 1 },
+            Instr::Deallocate(0),
+            Instr::Return,
+        ],
+    );
+    f.add_export("run", 0, run);
+    let run_atom = f.atom("run");
+    (f.finish(), run_atom)
+}
+
+/// The enclosing-frame **tail** twin: `m:outer/0 -> try inner/0 catch C:R -> R
+/// end`, where `m:inner/0` is `apply_last 1 0` (the `i_apply_last` shape a tail
+/// `run() -> apply(erlang, error, [boom])` compiles to). The live `try` is in the
+/// **enclosing** frame, so `inner`'s `apply_last` pops only its own frame and the
+/// handler-owning frame survives the raise's landing.
+fn enclosing_try_apply_last_module() -> (Module, Atom) {
+    let mut f = Fixture::new("m");
+    let erlang = f.atom("erlang");
+    let error = f.atom("error");
+    let boom = f.atom("boom");
+    // `inner/0` — the tail `apply_last`.
+    let inner = f.add_function(
+        "inner",
+        0,
+        vec![
+            Instr::Label(Label(200)),
+            Instr::Allocate {
+                stack_need: HeapNeed::Words(0),
+                live: 0,
+            },
+            Instr::Move {
+                src: Operand::Atom(erlang),
+                dst: Operand::X(1),
+            },
+            Instr::Move {
+                src: Operand::Atom(error),
+                dst: Operand::X(2),
+            },
+            Instr::Move {
+                src: Operand::Atom(boom),
+                dst: Operand::X(0),
+            },
+            Instr::ApplyLast {
+                arity: 1,
+                deallocate: 0,
+            },
+        ],
+    );
+    // `outer/0` — the live `try` in the enclosing frame.
+    let outer = f.add_function(
+        "outer",
+        0,
+        vec![
+            Instr::Label(Label(100)),
+            Instr::Allocate {
+                stack_need: HeapNeed::Words(1),
+                live: 0,
+            },
+            Instr::Try {
+                frame: Operand::Y(0),
+                fail: Label(103),
+            },
+            Instr::Call {
+                arity: 0,
+                target: inner,
+            },
+            Instr::TryEnd {
+                frame: Operand::Y(0),
+            },
+            Instr::Deallocate(1),
+            Instr::Return,
+            Instr::Label(Label(103)),
+            Instr::TryCase {
+                frame: Operand::Y(0),
+            },
+            Instr::Move {
+                src: Operand::X(1),
+                dst: Operand::X(0),
+            },
+            Instr::Deallocate(1),
+            Instr::Return,
+        ],
+    );
+    f.add_export("outer", 0, outer);
+    let outer_atom = f.atom("outer");
+    (f.finish(), outer_atom)
+}
+
+#[test]
+fn a_host_bif_error_from_the_call_ext_apply_seam_is_caught() {
+    // Oracle (OTP 29.1.1 / erts-17.1):
+    //   `try erlang:apply(erlang, error, [boom]) catch C:R -> {C,R} end`
+    //     ⇒ {error,boom}
+    // (the `apply(erlang, error, [boom])` sugar compiles to the very same
+    //  `call_ext 3 {extfunc,erlang,apply,3}` the fixture below builds). The seam
+    // decodes M/F/A and the host **declines** the target as a module
+    // (`resolve_external_call` → `Ok(None)`), so `apply_target` folds it into
+    // `call_bif`; its `error:boom` raise must land in the live `try`, exactly as
+    // C's `$HANDLE_APPLY_ERROR` → `handle_error` → `next_catch` does.
+    let (caller, run) = try_caller_apply3_module();
+    let mut ctx = TestCtx::new(callees(), boom_raising());
+    let boom = terms::make_list(&mut ctx, &[atom_term(&caller, "boom")]).expect("build [boom]");
+    let mut machine = Machine::new();
+
+    let outcome = machine
+        .run_export_outcome(
+            &caller,
+            run,
+            3,
+            &[
+                atom_term(&caller, "erlang"),
+                atom_term(&caller, "error"),
+                boom,
+            ],
+            &mut ctx,
+        )
+        .expect("the applied floor BIF's error must land in the live try frame");
+
+    // The handler returns `x(1)` = the reason the raise landed.
+    assert_eq!(outcome, RunOutcome::Returned(atom_term(&caller, "boom")));
+    assert_eq!(
+        machine.catch_frame_depth(),
+        0,
+        "the handler opcode consumed the frame the raise landed in"
+    );
+}
+
+#[test]
+fn a_host_bif_error_from_the_apply_instruction_is_caught() {
+    // Oracle: `try apply(erlang, error, [boom]) catch C:R -> R end` ⇒ boom.
+    // The `Instr::Apply` arm consumes the same `ApplyTarget::Raised` the
+    // `call_ext erlang:apply/3` seam route produces, so this pins the second
+    // route independently.
+    let (caller, run) = try_apply_module();
+    let mut ctx = TestCtx::new(callees(), boom_raising());
+    let mut machine = Machine::new();
+
+    let outcome = machine
+        .run_export_outcome(&caller, run, 0, &[], &mut ctx)
+        .expect("the applied floor BIF's error must land in the live try frame");
+
+    assert_eq!(outcome, RunOutcome::Returned(atom_term(&caller, "boom")));
+}
+
+#[test]
+fn a_host_bif_error_from_a_tail_apply_last_lands_in_the_enclosing_try() {
+    // The `Instr::ApplyLast` arm pops its own frame **before** the target is
+    // applied; C's `i_apply_last` also runs `$deallocate` before dispatching a
+    // resolved callee (`emu/instrs.tab:266-272`). The live `try` here is in the
+    // **enclosing** frame, which the pop does not touch, so the handler-owning
+    // frame survives the raise's landing and the tail apply reports the oracle's
+    // value.
+    let (caller, run) = enclosing_try_apply_last_module();
+    let mut ctx = TestCtx::new(callees(), boom_raising());
+    let mut machine = Machine::new();
+
+    let outcome = machine
+        .run_export_outcome(&caller, run, 0, &[], &mut ctx)
+        .expect("the tail apply's error must land in the enclosing try frame");
+
+    assert_eq!(outcome, RunOutcome::Returned(atom_term(&caller, "boom")));
+    assert_eq!(
+        machine.frame_depth(),
+        1,
+        "both the tail apply's own frame and the handler's frame are gone"
+    );
+}
+
+#[test]
+fn a_host_bif_error_from_apply_without_a_catch_frame_propagates_the_typed_raise() {
+    // With **no** live `try` the raise cannot land: `raise_bif_error` returns the
+    // error unchanged, so the applied BIF's own class/reason propagate — never a
+    // fabricated `badarg`, never a panic.
+    let (caller, run) = bare_apply_module();
+    let mut ctx = TestCtx::new(callees(), boom_raising());
+    let mut machine = Machine::new();
+
+    let error = machine
+        .run_export_outcome(&caller, run, 0, &[], &mut ctx)
+        .expect_err("an uncaught applied-BIF raise cannot land");
+
+    assert_eq!(reason(error), "boom");
+    assert_eq!(machine.catch_frame_depth(), 0);
+}
+
+#[test]
+fn a_capability_gap_from_an_applied_target_stays_uncatchable() {
+    // The `rejecting()` floor answers with the engine's typed `unsupported`
+    // diagnostic — a reason atom no module can name. Even inside a live `try` it
+    // must stay the uncatchable typed error: the funnel refuses to substitute a
+    // *different, wrong* atom, so the handler is never entered.
+    let (caller, run) = try_caller_apply3_module();
+    let mut ctx = TestCtx::new(callees(), rejecting());
+    let boom = terms::make_list(&mut ctx, &[atom_term(&caller, "boom")]).expect("build [boom]");
+    let mut machine = Machine::new();
+
+    let err = machine
+        .run_export_outcome(
+            &caller,
+            run,
+            3,
+            &[
+                atom_term(&caller, "erlang"),
+                atom_term(&caller, "error"),
+                boom,
+            ],
+            &mut ctx,
+        )
+        .expect_err("a capability gap is not catchable");
+
+    assert!(
+        matches!(err, BeamError::Raise(_)),
+        "the gap keeps its typed raise, got {err:?}"
+    );
+    assert_eq!(
+        machine.catch_frame_depth(),
+        1,
+        "the handler must not have been entered"
+    );
 }
