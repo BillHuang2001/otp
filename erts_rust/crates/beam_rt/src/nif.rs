@@ -788,11 +788,11 @@ mod tests {
             table.intern(name);
         }
         let atoms = Rc::new(table);
-        let interner = PendingInterner::new(atoms.len());
+        let mut interner = PendingInterner::new(atoms.len());
         let host = NifHostImpl::new(
             Heap::new(256).expect("a test heap"),
             Rc::clone(&atoms),
-            interner.clone(),
+            interner.share(),
             make_small(7),
             1,
             None,
@@ -907,11 +907,11 @@ mod tests {
         let mut table = AtomTable::new();
         let known = table.intern("known");
         let atoms = Rc::new(table);
-        let interner = PendingInterner::new(atoms.len());
+        let mut interner = PendingInterner::new(atoms.len());
         let mut host = NifHostImpl::new(
             Heap::new(256).expect("a test heap"),
             Rc::clone(&atoms),
-            interner.clone(),
+            interner.share(),
             make_small(7),
             1,
             None,
