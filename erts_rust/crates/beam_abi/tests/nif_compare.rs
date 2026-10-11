@@ -41,9 +41,10 @@
 //! `NifHost::atom_name` cannot resolve the pair — the assertion can then pass only through the
 //! env's per-call atom record (`src/nif/host.rs`).
 //!
-//! The fourth test pins the residual gap: an atom pair *nested* inside a compound still orders by
-//! raw atom index (see the module docs of `src/nif/enif/pred.rs`); it asserts the index answer,
-//! cross-checks the oracle's name answer and says so loudly.
+//! The fourth test covers a **nested atom pair**: `{alpha}` vs `{beta}` / `[alpha]` vs `[beta]`. It
+//! is ordered by *name* through the current host's atom table (`NifHost::atom_table`, see the module
+//! docs of `src/nif/enif/pred.rs`), so it asserts `{-1, -1}` — matching the oracle — with the two
+//! atoms interned `beta`-first so an index fallback would still answer the opposite.
 //!
 //! # Skip-vs-fail policy
 //!
@@ -429,29 +430,28 @@ fn atoms_interned_inside_the_nif_are_ordered_by_name() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The documented residual gap: an atom pair nested inside a compound
+// An atom pair nested inside a compound (ordered by name via `NifHost::atom_table`)
 // ---------------------------------------------------------------------------------------------
 
 #[test]
-fn a_nested_atom_pair_is_the_documented_index_fallback() {
+fn a_nested_atom_pair_orders_by_name() {
     let Some(so) = compile_fixture() else { return };
     let Some(path) = so_path(&so) else { return };
 
     let mut host = TestHost::new();
-    // Intern `beta` FIRST: the nested path orders by raw atom index, so this makes the index order
-    // the reverse of the name order — which is what exposes the gap. (`enif_compare` itself would
-    // still answer -1 here; only the comparison *inside* the tuple/list falls back.)
+    // Intern `beta` FIRST: the two atoms then have an index order opposite to their name order, so a
+    // comparison that ignored the exposed table would still answer `{+1, +1}` here. `atom_table` now
+    // hands this same table to the structural comparison, so the nested pair follows the names.
     let _beta = host.atom("beta");
     let _alpha = host.atom("alpha");
     let lib = load(&path, MODULE, &mut host, Eterm::nil()).expect("the fixture must load");
     let mut env = NifEnv::new(&mut host);
 
     let got = nested_atoms(&mut env, &lib);
-    // `alpha` has the higher index, so the index fallback answers `Greater` for both compounds.
     assert_eq!(
         got,
-        vec![1, 1],
-        "a nested atom pair is still ordered by raw atom index (see src/nif/enif/pred.rs)"
+        vec![-1, -1],
+        "a nested atom pair is ordered by NAME through the host's exposed atom table"
     );
 
     let Some(lines) = oracle_print(&so, &["nested_atoms()".to_string()]) else {
@@ -462,10 +462,10 @@ fn a_nested_atom_pair_is_the_documented_index_fallback() {
         vec![erl_tuple(&[-1, -1])],
         "the oracle orders the nested atoms by NAME: enif_compare({{alpha}}, {{beta}}) == -1"
     );
-    assert_ne!(
+    assert_eq!(
         lines[0],
         erl_tuple(&got),
-        "the nested-atom gap looks CLOSED — update the pred.rs module docs and this test"
+        "this crate and the oracle must agree on the nested-atom pair"
     );
 }
 
