@@ -156,6 +156,7 @@ use beam_term::{is_atom, is_list, is_nil, is_small, make_small, signed_value, Et
 
 use super::RuntimeContext;
 use crate::error;
+use crate::runtime::Runtime;
 
 /// The `Data` key holding this runtime's private open-file registry id.
 ///
@@ -1171,6 +1172,31 @@ fn descriptor_data(fd: Eterm) -> Option<Eterm> {
         return None;
     }
     Some(data)
+}
+
+/// Moves the OS file behind a `#file_descriptor{}` term out of the runtime's open-file table.
+///
+/// `open/2` answers with a descriptor whose [`REGISTRY_ID_KEY`] entry names the
+/// [`Runtime::open_files_mut`] slot holding the live `std::fs::File`. The native
+/// `file_server_2` io-device opens its file through `prim_file:open/2` — so the flag
+/// derivation, the errno vocabulary and the post-open type checks stay in one place — and
+/// then takes the handle with this function instead of opening the same path a second time.
+///
+/// `None` for a term that is not a well-shaped descriptor, or for one whose slot is already
+/// gone (a handle that has been taken, i.e. a closed one).
+pub(super) fn take_open_file(runtime: &mut Runtime, descriptor: Eterm) -> Option<File> {
+    let data = descriptor_data(descriptor)?;
+    for (key, value) in terms::map_entries(data).ok()? {
+        if !is_small(value) {
+            continue;
+        }
+        let id = u64::try_from(signed_value(value)).ok()?;
+        let is_registry_key = runtime.atom_name_of(key) == Some(REGISTRY_ID_KEY);
+        if is_registry_key {
+            return runtime.open_files_mut().remove(&id);
+        }
+    }
+    None
 }
 
 /// One `read(2)` of at most `count` bytes (`efile_readv`,
