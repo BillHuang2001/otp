@@ -94,7 +94,8 @@
 //!   engine state + recorded outcomes ([`RunnerState`]).
 //! * [`run`] — the [`ProcessRunner`](beam_process::ProcessRunner) implementation
 //!   ([`RuntimeRunner`]): one reduction slice of one scheduled process.
-//! * [`budget`] — the slice's reduction budget and the wrapper context that charges it.
+//! * [`budget`] — the slice's reduction budget and the wrapper context that charges it (once
+//!   per interpreted instruction, and at the machine's heap-admission points).
 //! * [`tier`] — the execution-tier selection (the `BEAM_RT_TIER` mode and its default).
 //! * [`reason`] — the exit-reason translation and the finite-`receive` deadline recovery.
 //! * [`perf`] — the `+JPperf` code-map feed (contract A.8).

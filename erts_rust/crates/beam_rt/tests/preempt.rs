@@ -26,11 +26,15 @@
 //! the process at the **tail** of the run queue, so the next slice goes to whatever was queued
 //! behind it ([`beam_process::Scheduler::run_slice`], `beam_rt/src/runner/`).
 //!
-//! Pre-emption is **cooperative**: a runner that ignored its budget would run the whole
-//! CPU-bound process inside the one `run` call the scheduler makes and only then return, so a
-//! short process that was spawned *second* would never get a turn until the first had finished
-//! entirely. This suite pins the property that distinguishes the two behaviours, by observing
-//! the order in which two processes' results become available:
+//! The budget is charged **per interpreted instruction** (through the engine's `reduce` hook)
+//! as well as at the heap-admission points (`test_heap`/`allocate_heap`, `beam_rt/src/runner/`),
+//! so a budget-ignoring runner is exactly what the per-instruction charge prevents: it would run
+//! the whole CPU-bound process inside the one `run` call the scheduler makes and only then
+//! return, leaving a short process that was spawned *second* no turn until the first had
+//! finished entirely. A pre-empted process is parked at the **un-applied** instruction and
+//! resumes it exactly once, so the yield loses and repeats no work. This suite pins the property
+//! that distinguishes the two behaviours, by observing the order in which two processes' results
+//! become available:
 //!
 //! * spawn a CPU-bound process (an allocating loop) **first**, so it is at the head of the run
 //!   queue, and a short non-allocating process **second**, so it sits behind it;
@@ -47,8 +51,13 @@
 //!
 //! `tests/fixtures/preempt.beam` (source `preempt.erl`, both committed) is the image. Its
 //! `alloc_loop/1` is a tail-recursive accumulator that builds one cons cell per iteration, so
-//! the compiler emits a `test_heap` before each allocation -- the one per-instruction seam the
-//! reduction budget is charged at. `quick/0` returns the atom `done` in a single slice.
+//! the compiler emits a `test_heap` before each allocation: the reduction budget is charged both
+//! per interpreted instruction (via the engine's `reduce` hook) and at those heap-admission
+//! points, so a call with a large `N` yields part-way through and finishes over several slices.
+//! The fixture also exports the non-allocating `spin/1`/`spin/2` tail-recursive counter -- only
+//! small-integer arithmetic plus a tail call, so the compiler emits no
+//! `test_heap`/`allocate_heap` -- which is the loop a non-allocating workload is pre-empted on
+//! through the per-instruction charge alone. `quick/0` returns the atom `done` in a single slice.
 //!
 //! The committed image is used directly (no toolchain needed beyond the system installation
 //! the boot sequence resolves); [`a_freshly_compiled_fixture_shows_the_same_interleaving`]
