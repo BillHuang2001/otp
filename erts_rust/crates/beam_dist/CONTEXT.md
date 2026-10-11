@@ -60,7 +60,7 @@ against the system `erl` oracle (`term_to_binary/1` of the equivalent tuple, `VE
 hex-compared). Honest wire facts pinned by the suite: there is **no** `DOP_NODEUP`/`DOP_NODEDOWN` in v6
 (node up/down are *local* emulator events, `dist.c:6931` `send_nodes_mon_msgs`), and
 `DOP_DEMONITOR_ID`/`DOP_UNLINK_MONITOR_ID`/`DOP_DEMONITOR_MONITOR_ID` **do not exist**; `Dop::from_u8`
-rejects `0, 5, 9-11, 14-15, 17, >= 38` and accepts exactly 30. `control::carries_message` (now `pub`)
+rejects `0, 5, 9-11, 14-15, 17, >= 38` and accepts exactly 30. `control::carries_message`
 classifies the 16 opcodes carrying a trailing **Message** term (the 9 send family + 5 payload-exit +
 `SPAWN_REQUEST`/`SPAWN_REQUEST_TT`); `SPAWN_REPLY`/`_TT` are excluded (`dist.c:1897` sets
 `ctx->msg = THE_NON_VALUE`).
