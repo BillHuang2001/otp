@@ -91,11 +91,12 @@ use beam_loader::{ImportRef, Instr, Module};
 use crate::interpreter::{self, LabelMap};
 use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg, DEFAULT_CAPACITY};
 
+use super::code::{CompiledFunction, CompiledModule, Summary};
 use super::runtime::{
     encode_target, ExtCallHelper, PositionHelper, StepHelper, EXT_CALL, EXT_CALL_LAST,
     EXT_CALL_ONLY, RUNTIME_XREGS_DISP,
 };
-use super::{jit_ext_call, jit_set_position, jit_step_one, CompiledModule};
+use super::{jit_ext_call, jit_set_position, jit_step_one};
 
 mod aggregate;
 mod arith;
@@ -204,7 +205,16 @@ impl Allocation {
     }
 }
 
-/// Lower every `Function`'s every `Block` of `module` into a native function.
+/// Lower every `Function`'s every `Block` of `module` into **one** native artifact.
+///
+/// This is the **eager** layout: every function is lowered up front into a single
+/// shared [`CodeBuffer`], and the whole-module block map is registered before any
+/// code is emitted, so a taken branch to a successor block — including one of
+/// **another** function (`fib/1`'s tail call into `fib/3`) — is linked directly at
+/// `bind` time (see [`Linker`]). It is what
+/// [`JitBackend::compile`](crate::jit::JitBackend::compile) and
+/// [`CodeCache::get_or_compile`](crate::jit::cache::CodeCache::get_or_compile)
+/// produce, and the layout every whole-module introspection query answers for.
 pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
     let labels = interpreter::build_label_map(module);
     let mut buffer = CodeBuffer::with_capacity(code_capacity_estimate(module))?;
@@ -217,17 +227,14 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
         .iter()
         .map(|function| vec![None; function.code.len()])
         .collect();
-    let mut block_count = 0usize;
-    let mut cached_registers: Vec<u32> = Vec::new();
-    let mut highest_cached_register: Option<u32> = None;
-    let mut highest_native_register: Option<u32> = None;
 
     // Reserve one entry label per non-empty compiled block **before** emitting any
     // code, so a branch to a successor block — usually a forward reference, e.g. a
-    // `jump` to a block emitted later or a `fail` label — is resolved by the
-    // buffer's ordinary `rel32` fixup machinery at `bind` time, before `seal` flips
-    // the mapping to read+execute. Each label is bound at its block's entry offset
-    // below, exactly where the driver's `entries` slot points.
+    // `jump` to a block emitted later, a `fail` label, or a block of a **later
+    // function** — is resolved by the buffer's ordinary `rel32` fixup machinery at
+    // `bind` time, before `seal` flips the mapping to read+execute. Each label is
+    // bound at its block's entry offset below, exactly where the driver's `entries`
+    // slot points.
     let mut block_labels: BTreeMap<(u32, u32), CodeLabel> = BTreeMap::new();
     for (func_index, function) in module.functions.iter().enumerate() {
         let code = &function.code;
@@ -241,64 +248,137 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
         }
     }
 
-    for (func_index, function) in module.functions.iter().enumerate() {
-        let func = func_index as u32;
-        let code = &function.code;
-        for block in &function.blocks {
-            let start = block.start;
-            let end = block.end.min(code.len());
-            if start >= end {
-                // An empty block has no instruction to run natively; the interpreter
-                // step handles that address exactly as before.
-                continue;
-            }
-            let allocation = allocate_registers(module, code, start, end);
-            for (x, _) in &allocation.slots {
-                touch(&mut highest_cached_register, *x);
-                if !cached_registers.contains(x) {
-                    cached_registers.push(*x);
-                }
-            }
-
-            // Bind this block's reserved entry label to the offset it is about to be
-            // emitted at (the slot `entries[func_index][start]` will point at). The
-            // key always exists: it was reserved for exactly these non-empty blocks.
-            buffer.bind(block_labels[&(func, start as u32)])?;
-            let offset = buffer.len();
-            emit_block(
-                &mut buffer,
-                module,
-                &labels,
-                &block_labels,
-                func,
-                code,
-                start,
-                end,
-                &allocation,
-                &mut highest_native_register,
-            )?;
-            // SAFETY: the block was fully emitted (no error), so `offset` is the
-            // start of a complete native function inside the buffer;
-            // `offset + emitted < capacity` was enforced by every emission call.
-            let entry = unsafe { buffer.code_ptr().add(offset) };
-            // `start < end <= code.len()`, so the slot always exists.
-            entries[func_index][start] = Some(entry);
-            block_count += 1;
-        }
+    let mut summary = Summary::default();
+    // Per-function `highest_native_register`: the register-file guard the driver
+    // applies when it enters a block **of that function** (the eager summary above
+    // answers the whole-module question; this answers the entry-time one).
+    let mut native_bounds: Vec<Option<u32>> = vec![None; module.functions.len()];
+    for func_index in 0..module.functions.len() {
+        let func_summary = emit_function(
+            &mut buffer,
+            module,
+            &labels,
+            &block_labels,
+            func_index as u32,
+            &mut entries[func_index],
+        )?;
+        native_bounds[func_index] = func_summary.highest_native_register;
+        summary.merge(&func_summary);
     }
 
     buffer.seal()?;
-    cached_registers.sort_unstable();
-    Ok(CompiledModule {
+    Ok(CompiledModule::eager(buffer, entries, native_bounds, summary))
+}
+
+/// Lower **one** function of `module` into its own native artifact.
+///
+/// This is the **lazy** layout's unit of work: the artifact ([`CompiledFunction`])
+/// owns its own sealed [`CodeBuffer`], and its block map — `(func, pc)` keys, all of
+/// them this one function — is registered before any code is emitted, so a branch to
+/// a successor block of **this** function is still linked directly. A branch to a
+/// block of another function is simply absent from that map, which is exactly the
+/// documented unlinkable exit: the block returns the target's `(func, pc)` word to
+/// the driver, which compiles that function on entry (see
+/// [`CompiledModule::native_entry`](super::code::CompiledModule::native_entry)).
+///
+/// Each function gets its **own** mapping ([`CodeBuffer`]), so a lazy artifact never
+/// holds code for a function the run has not entered.
+pub(crate) fn compile_function(
+    module: &Module,
+    labels: &LabelMap,
+    func: u32,
+) -> Result<CompiledFunction> {
+    let function = module
+        .functions
+        .get(func as usize)
+        .ok_or_else(|| crate::error::unsupported("jit: no such function"))?;
+    let mut buffer =
+        CodeBuffer::with_capacity(function_capacity_estimate(&function.code, function.blocks.len()) + DEFAULT_CAPACITY)?;
+    let mut entries: Vec<Option<*const u8>> = vec![None; function.code.len()];
+    let mut block_labels: BTreeMap<(u32, u32), CodeLabel> = BTreeMap::new();
+    for block in &function.blocks {
+        let start = block.start;
+        let end = block.end.min(function.code.len());
+        if start >= end {
+            continue;
+        }
+        block_labels.insert((func, start as u32), buffer.label());
+    }
+    let summary = emit_function(&mut buffer, module, labels, &block_labels, func, &mut entries)?;
+    buffer.seal()?;
+    Ok(CompiledFunction {
         buffer,
         entries,
-        block_count,
-        cached_registers,
-        highest_cached_register,
-        highest_native_register,
+        summary,
     })
 }
 
+/// Lower every non-empty block of function `func` into `buffer`, binding the
+/// pre-reserved entry label of each and filling `entries[start]` with its native
+/// entry point.
+///
+/// Returns the function's register/block [`Summary`]. `block_labels` is the block map
+/// a taken branch is resolved against: the **whole-module** map for [`compile_module`]
+/// (so a cross-function branch links directly) or just this function's blocks for
+/// [`compile_function`] (so a cross-function branch is the unlinkable exit the driver
+/// turns into compile-on-entry). The reserved label of a block always exists, and no
+/// label is created without being bound here, so a buffer always seals.
+fn emit_function(
+    buffer: &mut CodeBuffer,
+    module: &Module,
+    labels: &LabelMap,
+    block_labels: &BTreeMap<(u32, u32), CodeLabel>,
+    func: u32,
+    entries: &mut [Option<*const u8>],
+) -> Result<Summary> {
+    let function = &module.functions[func as usize];
+    let code = &function.code;
+    let mut summary = Summary::default();
+    for block in &function.blocks {
+        let start = block.start;
+        let end = block.end.min(code.len());
+        if start >= end {
+            // An empty block has no instruction to run natively; the interpreter
+            // step handles that address exactly as before.
+            continue;
+        }
+        let allocation = allocate_registers(module, code, start, end);
+        for (x, _) in &allocation.slots {
+            touch(&mut summary.highest_cached_register, *x);
+            if !summary.cached_registers.contains(x) {
+                summary.cached_registers.push(*x);
+            }
+        }
+
+        // Bind this block's reserved entry label to the offset it is about to be
+        // emitted at (the slot `entries[start]` will point at). The key always
+        // exists: it was reserved for exactly these non-empty blocks.
+        buffer.bind(block_labels[&(func, start as u32)])?;
+        let offset = buffer.len();
+        emit_block(
+            buffer,
+            module,
+            labels,
+            block_labels,
+            func,
+            code,
+            start,
+            end,
+            &allocation,
+            &mut summary.highest_native_register,
+        )?;
+        // SAFETY: the block was fully emitted (no error), so `offset` is the
+        // start of a complete native function inside the buffer;
+        // `offset + emitted < capacity` was enforced by every emission call.
+        let entry = unsafe { buffer.code_ptr().add(offset) };
+        // `start < end <= code.len()`, so the slot always exists.
+        entries[start] = Some(entry);
+        summary.block_count += 1;
+    }
+    summary.cached_registers.sort_unstable();
+    summary.cached_registers.dedup();
+    Ok(summary)
+}
 /// A generous byte-count estimate for the code `module` lowers to.
 ///
 /// A block costs a prologue/epilogue pair plus its inlined
@@ -321,32 +401,35 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
 /// not the fast path claims it, and [`CodeBuffer::with_capacity`] rounds the total
 /// up to whole pages.
 fn code_capacity_estimate(module: &Module) -> usize {
-    let mut instructions = 0usize;
-    let mut blocks = 0usize;
+    module
+        .functions
+        .iter()
+        .map(|function| function_capacity_estimate(&function.code, function.blocks.len()))
+        .sum::<usize>()
+        + DEFAULT_CAPACITY
+}
+
+/// The per-function part of [`code_capacity_estimate`]; also the base of the lazy
+/// layout's per-function buffer size ([`compile_function`], which adds its own
+/// [`DEFAULT_CAPACITY`] headroom).
+fn function_capacity_estimate(code: &[Instr], blocks: usize) -> usize {
+    let instructions = code.len();
     let mut gc_bifs = 0usize;
     let mut cmp_bifs = 0usize;
     let mut list_reads = 0usize;
     let mut tuple_paths = 0usize;
-    for function in &module.functions {
-        instructions += function.code.len();
-        blocks += function.blocks.len();
-        for instr in &function.code {
-            match instr {
-                Instr::Bif { .. } => cmp_bifs += 1,
-                Instr::GcBif { .. } => {
-                    gc_bifs += 1;
-                    cmp_bifs += 1;
-                }
-                Instr::GetList { .. } | Instr::GetHd { .. } | Instr::GetTl { .. } => {
-                    list_reads += 1
-                }
-                Instr::GetTupleElement { .. } => tuple_paths += 1,
-                Instr::SetTupleElement { .. } => tuple_paths += 1,
-                Instr::SelectTupleArity { destinations, .. } => {
-                    tuple_paths += 1 + destinations.len()
-                }
-                _ => {}
+    for instr in code {
+        match instr {
+            Instr::Bif { .. } => cmp_bifs += 1,
+            Instr::GcBif { .. } => {
+                gc_bifs += 1;
+                cmp_bifs += 1;
             }
+            Instr::GetList { .. } | Instr::GetHd { .. } | Instr::GetTl { .. } => list_reads += 1,
+            Instr::GetTupleElement { .. } => tuple_paths += 1,
+            Instr::SetTupleElement { .. } => tuple_paths += 1,
+            Instr::SelectTupleArity { destinations, .. } => tuple_paths += 1 + destinations.len(),
+            _ => {}
         }
     }
     BLOCK_BYTES * blocks
@@ -355,9 +438,7 @@ fn code_capacity_estimate(module: &Module) -> usize {
         + COMPARE_PATH_BYTES * cmp_bifs
         + LIST_PATH_BYTES * list_reads
         + TUPLE_PATH_BYTES * tuple_paths
-        + DEFAULT_CAPACITY
 }
-
 /// The code-size budget reserved for one compiled block (see
 /// [`code_capacity_estimate`]): the prologue (six callee-saved pushes, the 24-byte
 /// `rt`-slot reservation, the `rbx` load, the [`emit_position_store`] helper call)

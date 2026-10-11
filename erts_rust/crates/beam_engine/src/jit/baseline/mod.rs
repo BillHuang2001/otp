@@ -168,19 +168,23 @@ use crate::context::ExecutionContext;
 use crate::error;
 use crate::interpreter;
 use crate::jit::emitter::CodeBuffer;
-use crate::jit::{CodeRegion, JitBackend};
+use crate::jit::JitBackend;
 use crate::machine::{Machine, RunOutcome};
 use crate::Step;
 
+mod code;
 mod emit;
 mod runtime;
 
 #[cfg(test)]
 mod tests;
 
-// The block ABI lives in `runtime`; re-export its names here so every item path
-// outside this module (`crate::jit::baseline::…`) stays exactly what it was.
+// The block ABI lives in `runtime` and the artifact in `code`; re-export their names
+// here so every item path outside this module (`crate::jit::baseline::…`) stays
+// exactly what it was.
 pub(crate) use emit::compile_module;
+pub use code::CompiledModule;
+pub(crate) use code::{CompiledFunction, Summary};
 pub use runtime::{decode_target, decode_wait, encode_target, encode_wait, ENTER, ERROR, HALT, WAIT_BIT};
 pub(crate) use runtime::{jit_ext_call, jit_set_position, jit_step_one, JitRuntime};
 
