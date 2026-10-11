@@ -75,7 +75,16 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
     failed collection never leaves the from-space half-forwarded
   - `ensure_capacity(&mut self, need_words, roots) -> Result<Collection>` — the **on-demand growth seam**
     (Design Decisions); mirrored on `GenImmixCollector`/`AnyCollector`
-  - After **every** collection the empty nursery is re-sized via `young_after_collection` from the round's
+  - `grow_nursery(&mut self, need_words) -> Result<()>` — the **no-relocation** growth seam: enlarges the
+    nursery so a `need_words`-word allocation can proceed **without collecting and without moving a single
+    live term** (safe for a caller holding **no root set**); a policy ceiling that cannot reach the request
+    returns the typed `heap_exhausted` and leaves the collector untouched (Design Decisions)
+  - `young_contains(ptr) -> bool` — whether `ptr` is a word of **any** nursery space (current or one a growth
+    retained); `young_space_count() -> usize` — how many spaces the chain holds (`1`, or more after a growth
+    retained one, back to `1` once a collection collapses it). The nursery-range test + chain observable a
+    host's unscanned-root valve needs
+  - After **every** collection the chain is collapsed back to one space via `Nursery::collapse`, which re-sizes
+    that space via `young_after_collection` from the round's
     **surviving** words, and a fullsweep sizes the fresh mature space via `mature_after_fullsweep` from
     `live.rs`'s **exact reachable live word count** — never the pre-collection occupancy (Design Decisions).
 
