@@ -30,7 +30,10 @@ use beam_engine::jit::cache::{baseline_cache_len, clear_baseline_cache};
 use beam_engine::machine::WaitDeadline;
 use beam_engine::{Machine, Mailbox, MinimalContext, RunOutcome as EngineOutcome, Tier};
 use beam_loader::{Export, Function, HeapNeed, Import, ImportRef, Instr, Label, Module, Operand};
-use beam_process::{ProcessId, ProcessRunner, ProcessTable, RunOutcome as ProcOutcome, SignalAtoms};
+use beam_process::{
+    ProcessId, ProcessRunner, ProcessTable, RunOutcome as ProcOutcome, SignalAtoms,
+    DEFAULT_REDUCTIONS_PER_SLICE,
+};
 use beam_term::{make_atom, make_small, signed_value, Atom, AtomTable, Eterm};
 
 use super::budget::BudgetProbe;
@@ -1178,9 +1181,9 @@ fn the_scheduler_path_computes_fib_under_the_selected_tier() {    let mut rt = r
 
 /// The committed **allocating** tail-loop fixture, reused by relative path (never copied).
 ///
-/// `alloc_loop/1` builds one cons cell per iteration, so the compiler emits a `test_heap` —
-/// the runner's one reduction-budget admission point — and a small budget therefore
-/// **pre-empts** it part-way through (see the fixture's own docs).
+/// `alloc_loop/1` builds one cons cell per iteration, so the compiler emits a `test_heap` — a
+/// heap-admission point, the charge a native baseline block reaches — and a small budget
+/// therefore **pre-empts** it part-way through on either tier (see the fixture's own docs).
 fn preempt_fixture() -> &'static str {
     concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -1408,5 +1411,218 @@ fn an_interpreter_tier_process_is_unchanged_across_a_resume() {
         baseline_cache_len(),
         0,
         "an interpreter-tier process compiles no native code on either slice"
+    );
+}
+
+// -- pre-emption of a non-allocating, interpreted loop ---------------------
+
+/// The committed **non-allocating** tail-loop fixture, reused by relative path (never copied).
+///
+/// `l1/1 -> loop/2` is a pure small-integer tail recursion whose disassembly is only
+/// `func_info`/`test`/`move`/`gc_bif`/`call_only`/`return`. There is **no** `test_heap`,
+/// `allocate` or `allocate_heap` in it, and a `gc_bif` reaches only
+/// [`ExecutionContext::call_bif`](beam_engine::ExecutionContext::call_bif) — never
+/// `ensure_heap` — so the loop has **no heap-admission point at all**. It is therefore exactly
+/// the shape whose pre-emption can only come from the interpreter's per-instruction reduction
+/// charge.
+fn gc_ints_fixture() -> &'static str {
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/gc_ints.beam"
+    )
+}
+
+/// The non-allocating loop's iteration count in the pre-emption tests: far above one slice's
+/// [`DEFAULT_REDUCTIONS_PER_SLICE`] budget.
+const NON_ALLOCATING_N: i64 = 100_000;
+
+/// `gc_ints:l1(N)`, computed independently in Rust.
+///
+/// The Erlang loop is `loop(N, Acc) -> loop(N - 1, (Acc + N) rem 1000003)` from `Acc = 0`, so
+/// the recurrence is **order-sensitive**: a step applied twice (a resumed instruction re-run)
+/// or skipped would change the value. That is what makes this a check on the resume's
+/// exactness rather than only on the loop having finished.
+fn expected_checksum(n: i64) -> i64 {
+    let mut acc: i64 = 0;
+    for step in (1..=n).rev() {
+        acc = (acc + step) % 1_000_003;
+    }
+    acc
+}
+
+/// Loads `fixture` through the runtime's **code server** (so its atoms land in the runtime's
+/// one shared table, exactly as the CLI path's do) and hands back the module handle.
+fn load_module(rt: &mut Runtime, fixture: &str, name: &str) -> Arc<Module> {
+    rt.load_module(fixture).expect("the fixture loads");
+    rt.code_server()
+        .module_handle(name)
+        .expect("the loaded module is registered by name")
+}
+
+/// Spawns `gc_ints:l1/1` (the committed non-allocating tail loop) as process `pid`.
+fn spawn_non_allocating_loop(
+    state: &mut RunnerState,
+    pid: ProcessId,
+    module: Arc<Module>,
+    n: i64,
+) {
+    let function = module.atom_table.lookup("l1").expect("l1 is interned");
+    state.spawn(
+        pid,
+        ProcessEntry::Export {
+            module,
+            function,
+            arity: 1,
+        },
+        vec![make_small(n)],
+    );
+}
+
+/// **A non-allocating interpreted loop IS pre-empted, and the process queued behind it really
+/// runs.**
+///
+/// The loop reaches no heap-admission instruction (see [`gc_ints_fixture`]), so a
+/// [`ProcOutcome::Yield`] after one slice's budget can only have come from the engine's
+/// per-instruction `reduce` hook. The yield is *resumption-exact and work-preserving*: no
+/// result is recorded (`state.result(pid_a)` stays `None`) and the machine is parked at the
+/// instruction it charged for. A second, short process registered on the same table then runs
+/// to completion **while the loop is still unfinished** — the fairness a budget-ignoring
+/// runner cannot provide. Driving the loop to completion finally records exactly the checksum
+/// computed independently in Rust, whose order-sensitive recurrence would change if the resume
+/// re-applied (or skipped) an instruction.
+#[test]
+fn a_non_allocating_interpreted_loop_is_pre_empted() {
+    let mut rt = runtime();
+    let mut state = RunnerState::default();
+    state.jit_mode = Some(JitMode::Interpreter);
+    let mut table = table();
+
+    // The loop's module and the short process's module, both through the runtime's code server
+    // so their atoms live in the runtime's shared table.
+    let gc_module = load_module(&mut rt, gc_ints_fixture(), "gc_ints");
+    let quick_module = load_module(&mut rt, preempt_fixture(), "preempt");
+
+    // Registered FIRST: the CPU-bound loop. Registered SECOND: the short process it must not
+    // starve.
+    let pid_a = table.spawn_default().expect("a fresh process");
+    let pid_b = table.spawn_default().expect("a fresh process");
+    spawn_non_allocating_loop(&mut state, pid_a, gc_module, NON_ALLOCATING_N);
+    let quick = quick_module
+        .atom_table
+        .lookup("quick")
+        .expect("quick is interned");
+    state.spawn(
+        pid_b,
+        ProcessEntry::Export {
+            module: quick_module,
+            function: quick,
+            arity: 0,
+        },
+        Vec::new(),
+    );
+
+    // Slice 1: the non-allocating loop spends a whole slice's budget and yields.
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid_a, &mut table, DEFAULT_REDUCTIONS_PER_SLICE)
+            .expect("the loop's first slice runs")
+    };
+    assert_eq!(
+        outcome,
+        ProcOutcome::Yield,
+        "the per-instruction charge pre-empts a loop with no allocation at all"
+    );
+    assert!(
+        state.result(pid_a).is_none(),
+        "a pre-emption fabricates no result and loses no work"
+    );
+    assert!(
+        state
+            .engines
+            .get(&pid_a)
+            .is_some_and(|engine| engine.parked.is_some()),
+        "the pre-empted machine is parked at the instruction it charged for"
+    );
+
+    // The process behind it gets its turn while the loop is still unfinished.
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid_b, &mut table, DEFAULT_REDUCTIONS_PER_SLICE)
+            .expect("the short process's slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Exit(normal(&mut rt)));
+    assert_eq!(
+        rt.atom_name_of(state.result(pid_b).expect("quick/0 returned a value")),
+        Some("done"),
+        "the short process really ran to its return"
+    );
+    assert!(
+        state.result(pid_a).is_none(),
+        "the loop is still unfinished after the short process ran"
+    );
+
+    // Drive the loop to completion in further slices. A generous budget makes the remaining
+    // work one slice; the loop is bounded so a lost pre-emption can never hang the suite.
+    let mut slices = 1;
+    let outcome = loop {
+        let outcome = {
+            let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+            runner
+                .run(pid_a, &mut table, 5_000_000)
+                .expect("a further slice of the loop runs")
+        };
+        if outcome != ProcOutcome::Yield {
+            break outcome;
+        }
+        slices += 1;
+        assert!(slices < 64, "the loop finishes in a bounded number of slices");
+    };
+    assert_eq!(outcome, ProcOutcome::Exit(normal(&mut rt)));
+    assert_eq!(
+        signed_value(state.result(pid_a).expect("the loop returns a checksum")),
+        expected_checksum(NON_ALLOCATING_N),
+        "the charges cost no work: the resume applied every instruction exactly once"
+    );
+}
+
+/// **The honest native-tier contrast: a compiled block is not charged per instruction.**
+///
+/// The *same* `gc_ints:l1/1` call with the *same* iteration count completes inside **one**
+/// slice under the native baseline tier, even though that slice's budget is only
+/// [`DEFAULT_REDUCTIONS_PER_SLICE`]: the loop reaches no heap-admission point (see
+/// [`gc_ints_fixture`]) and a natively executed block never crosses the per-instruction
+/// `reduce` hook, so nothing charges mid-block. The recorded value is still the independently
+/// computed checksum — the tier is interpreter-identical, only its pre-emption granularity
+/// differs. This is the residual limitation the interpreter gap's closure leaves behind, and
+/// it is pinned rather than papered over.
+#[test]
+fn a_non_allocating_loop_on_the_native_tier_completes_within_one_slice() {
+    let mut rt = runtime();
+    let mut state = RunnerState::default();
+    state.jit_mode = Some(JitMode::Baseline);
+    let mut table = table();
+
+    let module = load_module(&mut rt, gc_ints_fixture(), "gc_ints");
+    let pid = table.spawn_default().expect("a fresh process");
+    spawn_non_allocating_loop(&mut state, pid, module, NON_ALLOCATING_N);
+
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, DEFAULT_REDUCTIONS_PER_SLICE)
+            .expect("the slice runs")
+    };
+    assert_eq!(
+        outcome,
+        ProcOutcome::Exit(normal(&mut rt)),
+        "a native compiled block reaches no per-instruction charge, so the loop is not \
+         pre-empted mid-block"
+    );
+    assert_eq!(
+        signed_value(state.result(pid).expect("the loop returns a checksum")),
+        expected_checksum(NON_ALLOCATING_N),
+        "the native tier computes the same result as the interpreter"
     );
 }

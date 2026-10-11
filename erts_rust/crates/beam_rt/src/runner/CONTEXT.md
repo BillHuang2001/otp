@@ -17,11 +17,14 @@ tier for **every** process entry: the engine's driver handles the module-context
 per-module safety predicate exists (see `## The tier is sound for any module`).
 The remembered tier is only *observable* at a **slice boundary** (a slice `Yield` on the reduction
 budget, or a `receive` park): a process that instead runs to completion inside its first slice never
-re-enters. That is exactly why the tier is selected eagerly at the first entry rather than after a
-warm-up — the budget is charged only at the engine's heap-admission points
-(`test_heap`/`allocate_heap`), so a **binary-accumulating or `call_ext`-only hot loop charges nothing,
-never pre-empts, and could never be switched**; the bounded-warm-up alternative was measured and
-declined on those grounds (the characterisation and figures are in `PERF.md`).
+re-enters. On the **interpreter** tier the budget is charged once per interpreted instruction, so any
+hot loop is pre-empted at the budget; on the **native baseline** tier a compiled block runs natively
+past the per-instruction hook and charges only at a deopt or a heap-admission point, so a
+**binary-accumulating or `call_ext`-only hot loop charges nothing, never pre-empts, and could never be
+switched**. That is exactly why the tier is selected eagerly at the first entry rather than after a
+warm-up: the bounded-warm-up alternative was measured and declined because it would pin exactly those
+zero-charge native hot loops to the reference tier for their whole life (the characterisation and
+figures are in `PERF.md`).
 
 ## API Surface (crate-internal, `pub(crate)`)
 * [`entry`] — `ProcessEntry` (the runtime-scheduled entry: an export or a fun), `ProcessEngine`
@@ -47,7 +50,11 @@ declined on those grounds (the characterisation and figures are in `PERF.md`).
   off-heap binary (`bs_init_writable`/`bs_create_bin` above the on-heap limit) is therefore copied
   rather than refused with `badarg` (the return path) or kept un-copied against a dangling payload
   (the exit path) — whether the process **built** it or **received** it.
-* [`budget`] — the slice's reduction budget and the wrapper context that charges it. As the
+* [`budget`] — the slice's reduction budget and the wrapper context that charges it: `BudgetContext`
+  declares its own `wants_reduce() == true` (the engine lets a host answer `false` only when its
+  `reduce` is provably the no-op default) and implements `reduce` to charge the probe once per
+  reduction unit the interpreter prices, so a **non-allocating** interpreted loop is pre-empted; the
+  two `ensure_heap` doors stay charged as the only charge a native compiled block reaches. As the
   scheduled path's outermost `ExecutionContext` it forwards every engine seam it does not itself
   implement — `send_message_with_off_heap` in particular, whose trait default would otherwise drop
   the sender machine's off-heap handles and make an engine-built off-heap send a `badarg`.
@@ -144,9 +151,14 @@ The tier is taken on a process's **first** entry and then carried for its whole 
 slice and a `receive` park both resume through `Machine::resume_outcome_with_tier` on the tier the
 process was selected for, so a *pre-empting* hot loop keeps its tier across every slice
 (`a_preempted_process_resumes_on_its_baseline_tier`/`a_receive_parked_process_resumes_on_its_baseline_tier`
-pin this structurally, without a timing). A hot loop that charges no reductions at all — a
-binary-accumulating or `call_ext`-only loop — reaches no heap-admission point, so it never pre-empts
-and simply runs to completion inside one slice on the tier its first entry selected. Per-workload speed and memory figures are **measured, never
+pin this structurally, without a timing). On the **interpreter** tier every interpreted instruction
+charges the budget, so any hot loop pre-empts (pinned by
+`a_non_allocating_interpreted_loop_is_pre_empted`). On the native tier a compiled block runs natively
+past the per-instruction hook, so a loop that reaches no heap-admission point either — a
+binary-accumulating or `call_ext`-only loop, or a natively linked tail loop with no allocation — charges
+nothing and runs to completion inside one slice on the tier its first entry selected (pinned by
+`a_non_allocating_loop_on_the_native_tier_completes_within_one_slice`).
+Per-workload speed and memory figures are **measured, never
 modelled**, and live in [`../../PERF.md`](../../PERF.md) and the bench driver's
 [`../../../../tools/bench/RESULTS.md`](../../../../tools/bench/RESULTS.md); they are re-measured there
 rather than transcribed here.
@@ -180,6 +192,15 @@ default (`Auto`, and its `baseline` alias) puts every process on the native tier
   `ProcessTable::deliver_simple` message wakes it and the resume takes it on the remembered tier), and
   `an_interpreter_tier_process_is_unchanged_across_a_resume` (same loop on `JitMode::Interpreter` records
   the same result and compiles nothing on either slice). Each asserts `ProcessEngine::tier` as well.
+* Pre-emption of a **non-allocating** loop on both tiers, over the committed `gc_ints` fixture (whose
+  `l1/1 -> loop/2` disassembly contains no heap-admission instruction at all):
+  `a_non_allocating_interpreted_loop_is_pre_empted` (interpreter tier — a whole-budget slice yields and
+  records nothing, a second short process registered behind it runs to its `return` while the loop is
+  unfinished, and the loop's final value is a checksum computed independently in Rust, whose
+  order-sensitive recurrence would change if a resume re-applied an instruction) and
+  `a_non_allocating_loop_on_the_native_tier_completes_within_one_slice` (the same call with the same
+  iteration count completes inside one budget-bounded slice on the native tier — the documented residual
+  limit, pinned rather than papered over).
 * End-to-end: `slice:fib/1 10` through the scheduled path (`RuntimeRunner`) records `55` under both an
   explicit `JitMode::Auto` (→ baseline) and `JitMode::Interpreter`, and the scheduler path records it
   under whatever mode the environment selects.
@@ -190,12 +211,12 @@ default (`Auto`, and its `baseline` alias) puts every process on the native tier
 * Crate gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt`.
 
 ## Known Issues / Handoffs
-* **A non-allocating loop has no admission point, so it cannot be pre-empted at all.** The budget is
-  charged only at `ExecutionContext::ensure_heap` (`test_heap`/`allocate_heap`), so a loop with no
-  allocation anywhere runs to its next `return`/`wait` inside the one slice that entered it — and
-  therefore never leaves its tier either. `ExecutionContext::reduce` is the seam that would add a
-  per-instruction admission point, and `BudgetContext` does not charge it. **Owner: `beam_engine`** (the
-  seam) + `budget.rs` (the charge).
+* **A natively executed compiled block is charged only at a deopt / heap-admission boundary.** The
+  per-instruction charge belongs to the interpreter's loop; the engine's baseline driver runs compiled
+  blocks and only deopts (or reaches `ensure_heap` through the host), so a natively linked tail loop that
+  neither allocates nor leaves the block still runs to its next `return`/`wait` inside the one slice that
+  entered it — and therefore never leaves its tier either. The interpreter tier carries no such limit:
+  `BudgetContext::reduce` charges every instruction there.
 
 ## Routing Table
 * `mod.rs` → module docs, sub-module wiring, root re-exports (`ProcessEntry`, `RunnerState`,
@@ -207,7 +228,8 @@ default (`Auto`, and its `baseline` alias) puts every process on the native tier
   return-value / exit-reason stabilization (whose `SourcePayloads` come from
   `Runtime::source_payloads` — the machine's handles unioned with the pid's retained mailbox
   off-heap families).
-* `budget.rs` → the reduction budget + the charging wrapper context.
+* `budget.rs` → the reduction budget + the charging wrapper context (`wants_reduce`/`reduce`: one
+  charge per interpreted instruction, plus the two `ensure_heap` doors a native block alone reaches).
 * `tier.rs` → the tier mode + its `BEAM_RT_TIER` semantics (`mode_from_value`), the environment default
   and the selection (`select_entry_tier`).
 * `reason.rs` / `perf.rs` → the exit-reason translation / the `+JPperf` code map.
