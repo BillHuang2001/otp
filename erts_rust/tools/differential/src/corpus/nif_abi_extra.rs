@@ -33,7 +33,7 @@
 //! bare local call would keep running the `erlang:nif_error/1` stub):
 //!
 //! * `probe/1(Selector)` — the original entry: the C builds every term it needs with the public
-//!   `enif_*` constructors (selectors `1`..`62`);
+//!   `enif_*` constructors (selectors `1`..`83`, `67`/`68` excepted — see the second widening below);
 //! * `probe_term/2(Selector, Term)` — the term-driven entry: the C observes a term the module
 //!   built in Erlang (selectors `>= 100`), which the NIF C API cannot build itself — there is no
 //!   bitstring constructor, so a **non-byte-aligned bitstring** (and a window of one) can only be
@@ -77,6 +77,30 @@
 //! * the **exception** slot lifting a non-atom reason into Erlang, plus a clean process env;
 //! * the deterministic **`enif_convert_time_unit`** pair and **`enif_monotonic_time`**'s
 //!   monotonicity (its absolute value is documented to differ and is never asserted).
+//!
+//! A second widening (selectors `63`..`83`, still on `probe/1`) extends the same families with the
+//! shapes the first block left out, every one of them answered alike by both runtimes:
+//!
+//! * the remaining **`enif_term_type`** lattice points (a bignum, a cons cell, a two-entry map, a
+//!   tuple) and three more **`enif_compare`** points (an integer against the equal float, two atom
+//!   names, a tuple before a map);
+//! * **`enif_is_pid`** on the `enif_make_pid(enif_self)` term and **`enif_is_map`** on a map that
+//!   holds a pair;
+//! * the other **integer boundary** pairs (`UINT_MAX`, `LONG_MIN`, `INT_MIN`, `ULONG_MAX` round
+//!   trips and `enif_get_int` refusing `INT_MIN - 1`);
+//! * **`enif_make_map_from_arrays`** with two distinct pairs and **`enif_make_map_put`**
+//!   overwriting an existing key (the size stays put, the value is replaced);
+//! * the **string/atom buffer** edges: an exactly-fitting `enif_get_string` buffer, its refusal of
+//!   a binary subject, a **UTF-8** atom name read back under `ERL_NIF_UTF8` (and refused under
+//!   `ERL_NIF_LATIN1`, the atom not being Latin-1 representable) plus its
+//!   `enif_get_atom_length(ERL_NIF_UTF8)` byte count;
+//! * one further **`enif_convert_time_unit`** pair (ns -> us).
+//!
+//! Two candidates in that widening are deliberately **not** adopted — `enif_compare(1, 1.0)`
+//! (the oracle answers `0`, this runtime a non-zero) and `enif_compare('alpha', 'beta')` (the
+//! oracle `-1`, this runtime a non-zero): each is a plain *differing value*, so a case would be a
+//! mismatch rather than a capability gap. They stay recorded as a divergence, never as a corpus
+//! case, which is why selectors `67` and `68` are absent from the sequence.
 //!
 //! Not pinned anywhere (a real, documented divergence — recorded as a gap, never a corpus case):
 //! the atom-cache slots, `enif_term_to_binary` on a valid term, `enif_binary_to_term` on a valid
@@ -210,6 +234,7 @@ reason_code(_) -> 9.
 /// referenced. Each branch returns an integer: `1` when the C ABI contract held, `0` otherwise.
 const NIF_EXTRA_C: &str = r#"/* A second real NIF exercising the enif_* C ABI end to end (contract A.3). */
 #include <erl_nif.h>
+#include <limits.h>
 #include <string.h>
 #include <stdint.h>
 
@@ -753,6 +778,171 @@ static ERL_NIF_TERM probe(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
         return enif_make_int(env, b >= a ? 1 : 0);
     }
 
+    /* ------------------------------------ the remaining enif_term_type lattice points */
+    case 63: {                                 /* term_type of a bignum is Integer */
+        ERL_NIF_TERM t = enif_make_uint64(env, (ErlNifUInt64) 1 << 63);
+        return enif_make_int(env,
+            enif_term_type(env, t) == ERL_NIF_TERM_TYPE_INTEGER ? 1 : 0);
+    }
+    case 64: {                                 /* term_type of a cons cell is List */
+        ERL_NIF_TERM arr[1];
+        arr[0] = enif_make_int(env, 7);
+        return enif_make_int(env,
+            enif_term_type(env, enif_make_list_from_array(env, arr, 1)) == ERL_NIF_TERM_TYPE_LIST
+                ? 1 : 0);
+    }
+    case 65: {                                 /* term_type of a 2-entry map is Map */
+        ERL_NIF_TERM keys[2], vals[2], m;
+        keys[0] = enif_make_atom(env, "a"); vals[0] = enif_make_int(env, 1);
+        keys[1] = enif_make_atom(env, "b"); vals[1] = enif_make_int(env, 2);
+        if (!enif_make_map_from_arrays(env, keys, vals, 2, &m))
+            return enif_make_int(env, 0);
+        return enif_make_int(env,
+            enif_term_type(env, m) == ERL_NIF_TERM_TYPE_MAP ? 1 : 0);
+    }
+    case 66: {                                 /* term_type of a 2-tuple is Tuple */
+        ERL_NIF_TERM arr[2];
+        arr[0] = enif_make_int(env, 1);
+        arr[1] = enif_make_int(env, 2);
+        return enif_make_int(env,
+            enif_term_type(env, enif_make_tuple_from_array(env, arr, 2))
+                == ERL_NIF_TERM_TYPE_TUPLE ? 1 : 0);
+    }
+
+    /* --------------------------------------------- more enif_compare order lattice points */
+    case 69: {                                 /* a tuple orders before a map */
+        ERL_NIF_TERM arr[1];
+        arr[0] = enif_make_int(env, 1);
+        return enif_make_int(env,
+            enif_compare(enif_make_tuple_from_array(env, arr, 1), enif_make_new_map(env)) == -1
+                ? 1 : 0);
+    }
+
+    /* --------------------------------------------------------------- more predicates */
+    case 70: {                                 /* is_pid accepts the pid from enif_self */
+        ErlNifPid pid;
+        if (enif_self(env, &pid) == NULL)
+            return enif_make_int(env, 0);
+        return enif_make_int(env, enif_is_pid(env, enif_make_pid(env, &pid)) ? 1 : 0);
+    }
+    case 71: {                                 /* is_map accepts a map that holds a pair */
+        ERL_NIF_TERM m;
+        if (!enif_make_map_put(env, enif_make_new_map(env), enif_make_atom(env, "k"),
+                               enif_make_int(env, 1), &m))
+            return enif_make_int(env, 0);
+        return enif_make_int(env, enif_is_map(env, m) ? 1 : 0);
+    }
+
+    /* ----------------------------------------------- the other integer boundary pairs */
+    case 72: {                                 /* UINT_MAX survives make_uint/get_uint */
+        ERL_NIF_TERM t = enif_make_uint(env, (unsigned) UINT_MAX);
+        unsigned v = 0;
+        return enif_make_int(env,
+            (enif_get_uint(env, t, &v) && v == (unsigned) UINT_MAX) ? 1 : 0);
+    }
+    case 73: {                                 /* LONG_MIN survives make_long/get_long */
+        ERL_NIF_TERM t = enif_make_long(env, (long) LONG_MIN);
+        long v = 0;
+        return enif_make_int(env, (enif_get_long(env, t, &v) && v == LONG_MIN) ? 1 : 0);
+    }
+    case 74: {                                 /* INT_MIN survives make_int/get_int */
+        ERL_NIF_TERM t = enif_make_int(env, (int) INT_MIN);
+        int v = 0;
+        return enif_make_int(env, (enif_get_int(env, t, &v) && v == INT_MIN) ? 1 : 0);
+    }
+    case 75: {                                 /* ULONG_MAX survives make_ulong/get_ulong */
+        ERL_NIF_TERM t = enif_make_ulong(env, (unsigned long) ULONG_MAX);
+        unsigned long v = 0;
+        return enif_make_int(env,
+            (enif_get_ulong(env, t, &v) && v == ULONG_MAX) ? 1 : 0);
+    }
+    case 76: {                                 /* get_int refuses a value below INT_MIN */
+        ERL_NIF_TERM t = enif_make_int64(env, (ErlNifSInt64) INT_MIN - 1);
+        int v = 0;
+        return enif_make_int(env, enif_get_int(env, t, &v) ? 0 : 1);
+    }
+
+    /* ------------------------------------------------------- more map build/lookup edges */
+    case 77: {                                 /* make_map_from_arrays with two distinct pairs */
+        ERL_NIF_TERM keys[2], vals[2], m, v = 0;
+        size_t sz = 0;
+        keys[0] = enif_make_atom(env, "a"); vals[0] = enif_make_int(env, 1);
+        keys[1] = enif_make_atom(env, "b"); vals[1] = enif_make_int(env, 2);
+        if (!enif_make_map_from_arrays(env, keys, vals, 2, &m))
+            return enif_make_int(env, 0);
+        if (!enif_get_map_size(env, m, &sz) || sz != 2)
+            return enif_make_int(env, 0);
+        if (!enif_get_map_value(env, m, keys[1], &v))
+            return enif_make_int(env, 0);
+        return enif_make_int(env, enif_is_identical(v, vals[1]) ? 1 : 0);
+    }
+    case 78: {                                 /* putting an existing key updates in place */
+        ERL_NIF_TERM m1, m2, v = 0;
+        size_t sz = 0;
+        int iv = 0;
+        if (!enif_make_map_put(env, enif_make_new_map(env), enif_make_atom(env, "k"),
+                               enif_make_int(env, 1), &m1))
+            return enif_make_int(env, 0);
+        if (!enif_make_map_put(env, m1, enif_make_atom(env, "k"), enif_make_int(env, 2), &m2))
+            return enif_make_int(env, 0);
+        if (!enif_get_map_size(env, m2, &sz) || sz != 1)
+            return enif_make_int(env, 0);
+        if (!enif_get_map_value(env, m2, enif_make_atom(env, "k"), &v))
+            return enif_make_int(env, 0);
+        if (!enif_get_int(env, v, &iv) || iv != 2)
+            return enif_make_int(env, 0);
+        return enif_make_int(env, 1);
+    }
+
+    /* -------------------------------------------------------------- string / atom edges */
+    case 79: {                                 /* an exactly-fitting LATIN1 string buffer */
+        ERL_NIF_TERM arr[3];
+        char buf[4];
+        int r;
+        arr[0] = enif_make_int(env, 'a');
+        arr[1] = enif_make_int(env, 'b');
+        arr[2] = enif_make_int(env, 'c');
+        r = enif_get_string(env, enif_make_list_from_array(env, arr, 3), buf, sizeof(buf),
+                            ERL_NIF_LATIN1);
+        if (r != 4 || memcmp(buf, "abc", 4) != 0)
+            return enif_make_int(env, -100);
+        return enif_make_int(env, r);
+    }
+    case 80: {                                 /* get_string refuses a binary subject */
+        char buf[8];
+        return enif_make_int(env,
+            enif_get_string(env, make_bytes(env, "ab", 2), buf, sizeof(buf), ERL_NIF_LATIN1)
+                ? 0 : 1);
+    }
+    case 81: {                                 /* a UTF-8 atom name reads back under UTF8 only */
+        static const char utf8_name[3] = {(char) 0xE2, (char) 0x82, (char) 0xAC};  /* U+20AC */
+        ERL_NIF_TERM atom = 0;
+        char buf[8];
+        int r, latin1;
+        if (!enif_make_new_atom_len(env, utf8_name, sizeof(utf8_name), &atom, ERL_NIF_UTF8))
+            return enif_make_int(env, 0);
+        r = enif_get_atom(env, atom, buf, sizeof(buf), ERL_NIF_UTF8);
+        latin1 = enif_get_atom(env, atom, buf, sizeof(buf), ERL_NIF_LATIN1);
+        return enif_make_int(env, (r == 4 && !latin1) ? 1 : 0);
+    }
+    case 82: {                                 /* get_atom_length counts the UTF-8 bytes (3) */
+        static const char utf8_name[3] = {(char) 0xE2, (char) 0x82, (char) 0xAC};  /* U+20AC */
+        ERL_NIF_TERM atom = 0;
+        unsigned n = 0;
+        if (!enif_make_new_atom_len(env, utf8_name, sizeof(utf8_name), &atom, ERL_NIF_UTF8))
+            return enif_make_int(env, 0);
+        if (!enif_get_atom_length(env, atom, &n, ERL_NIF_UTF8))
+            return enif_make_int(env, 0);
+        return enif_make_int(env, (n == 3) ? 1 : 0);
+    }
+
+    /* ---------------------------------------------------------------- time unit pairs */
+    case 83: {                                 /* convert_time_unit 1e9 ns -> 1e6 us */
+        ErlNifTime us =
+            enif_convert_time_unit((ErlNifTime) 1000000000, ERL_NIF_NSEC, ERL_NIF_USEC);
+        return enif_make_int(env, us == 1000000 ? 1 : 0);
+    }
+
     default:
         break;
     }
@@ -1142,6 +1332,130 @@ pub(crate) fn group() -> Vec<Case> {
         case("nif_extra/time_convert_sec_to_nsec", "enif_convert_time_unit maps 1 s to 1e9 ns", &[60], "1"),
         case("nif_extra/time_convert_sec_to_msec", "enif_convert_time_unit maps 1 s to 1000 ms", &[61], "1"),
         case("nif_extra/time_monotonic_non_decreasing", "enif_monotonic_time never runs backwards", &[62], "1"),
+        // --- enif_term_type: the remaining lattice points -----------------------------------
+        case(
+            "nif_extra/term_type_bignum_is_integer",
+            "enif_term_type reports Integer for a bignum (2^63)",
+            &[63],
+            "1",
+        ),
+        case(
+            "nif_extra/term_type_cons_cell_is_list",
+            "enif_term_type reports List for a cons cell",
+            &[64],
+            "1",
+        ),
+        case(
+            "nif_extra/term_type_two_entry_map_is_map",
+            "enif_term_type reports Map for a map built by enif_make_map_from_arrays",
+            &[65],
+            "1",
+        ),
+        case(
+            "nif_extra/term_type_two_tuple_is_tuple",
+            "enif_term_type reports Tuple for a 2-tuple",
+            &[66],
+            "1",
+        ),
+        // --- enif_compare: more order-lattice points ----------------------------------------
+        // Selectors 67 and 68 are deliberately absent: `enif_compare(1, 1.0)` and
+        // `enif_compare('alpha', 'beta')` really diverge between the two runtimes (a plain
+        // differing value, hence a mismatch), so they are recorded as a gap, never as a case.
+        case(
+            "nif_extra/compare_tuple_before_map",
+            "enif_compare orders a tuple before a map (-1)",
+            &[69],
+            "1",
+        ),
+        // --- more predicates ----------------------------------------------------------------
+        case(
+            "nif_extra/pred_is_pid_of_self",
+            "enif_is_pid accepts the pid term written by enif_make_pid(enif_self)",
+            &[70],
+            "1",
+        ),
+        case(
+            "nif_extra/pred_is_map_with_one_pair",
+            "enif_is_map accepts a map that holds one pair",
+            &[71],
+            "1",
+        ),
+        // --- the remaining integer boundary pairs -------------------------------------------
+        case(
+            "nif_extra/int_get_uint_uint_max_roundtrip",
+            "UINT_MAX survives an enif_make_uint/enif_get_uint round trip",
+            &[72],
+            "1",
+        ),
+        case(
+            "nif_extra/int_get_long_long_min_roundtrip",
+            "LONG_MIN survives an enif_make_long/enif_get_long round trip",
+            &[73],
+            "1",
+        ),
+        case(
+            "nif_extra/int_get_int_int_min_roundtrip",
+            "INT_MIN survives an enif_make_int/enif_get_int round trip",
+            &[74],
+            "1",
+        ),
+        case(
+            "nif_extra/int_get_ulong_ulong_max_roundtrip",
+            "ULONG_MAX survives an enif_make_ulong/enif_get_ulong round trip",
+            &[75],
+            "1",
+        ),
+        case(
+            "nif_extra/int_get_int_rejects_below_int_min",
+            "enif_get_int refuses INT_MIN - 1",
+            &[76],
+            "1",
+        ),
+        // --- map build / lookup edges --------------------------------------------------------
+        case(
+            "nif_extra/map_make_map_from_arrays_two_pairs",
+            "enif_make_map_from_arrays builds a 2-entry map with both values reachable",
+            &[77],
+            "1",
+        ),
+        case(
+            "nif_extra/map_make_map_put_overwrites_existing_key",
+            "enif_make_map_put on an existing key keeps the size and replaces the value",
+            &[78],
+            "1",
+        ),
+        // --- string / atom buffer edges ------------------------------------------------------
+        case(
+            "nif_extra/string_get_exactly_fitting_buffer",
+            "enif_get_string fills an exactly-fitting LATIN1 buffer and answers 4",
+            &[79],
+            "4",
+        ),
+        case(
+            "nif_extra/string_get_rejects_binary_end",
+            "enif_get_string refuses a binary subject",
+            &[80],
+            "1",
+        ),
+        case(
+            "nif_extra/atom_new_atom_utf8_name_reads_back",
+            "a UTF-8 atom name reads back under ERL_NIF_UTF8 (4 bytes) and is refused under LATIN1",
+            &[81],
+            "1",
+        ),
+        case(
+            "nif_extra/atom_get_atom_length_utf8_bytes",
+            "enif_get_atom_length counts the UTF-8 byte budget of a multibyte atom (3)",
+            &[82],
+            "1",
+        ),
+        // --- time unit pairs ------------------------------------------------------------------
+        case(
+            "nif_extra/time_convert_nsec_to_usec",
+            "enif_convert_time_unit maps 1e9 ns to 1e6 us",
+            &[83],
+            "1",
+        ),
         // --- enif_inspect_iolist_as_binary: the C's positional shape rules ------------------
         case(
             "nif_extra/iolist_refuses_bare_byte_integer",
@@ -1380,6 +1694,13 @@ mod tests {
             "enif_has_pending_exception",
             "enif_convert_time_unit",
             "enif_monotonic_time",
+            "enif_make_uint",
+            "enif_make_long",
+            "enif_make_ulong",
+            "enif_is_pid",
+            "enif_is_map",
+            "enif_make_pid",
+            "enif_self",
         ] {
             assert!(
                 super::NIF_EXTRA_C.contains(symbol),
