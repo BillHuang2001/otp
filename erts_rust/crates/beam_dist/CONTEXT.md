@@ -555,13 +555,14 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
   `feed_eof()` → `StepOutcome::Closed`. Tick *scheduling* and the `net_ticktime` `{nodedown,Node}`
   decision are `net_kernel`'s (Erlang, `lib/kernel/src/net_kernel.erl`) job, not this crate's; this
   crate only answers an inbound tick.
-- **No safe pid/reference term builder at the value layer.** Constructing an external pid or a
-  reference needs the `unsafe` raw-heap writers in `beam_term` (`boxed::write_external_pid` /
-  `write_internal_ref`), which a `#![deny(unsafe_code)]` crate cannot call; the loopback tests model
-  pids/refs as small-int stand-ins (the `tests/delivery.rs` convention). A safe term-marshalling seam
-  would be a separate addition.
 
 ## Notes for Agents
+- **A safe pid/port/ref term builder exists.** `beam_codec::term::{make_external_pid,
+  make_external_port, make_external_ref}` are safe public wrappers over `beam_term::thing`'s raw
+  writers, so a `#![deny(unsafe_code)]` crate can materialize external pids/ports/refs; the live
+  tests (`tests/live_interop.rs`, `tests/live_accept.rs`, `tests/live_driver.rs`) use them. The
+  hermetic driver tests (`tests/delivery.rs`, `tests/two_node_loopback.rs`) still place small-int
+  stand-ins in pid/ref positions, which compare `==` across heaps.
 - **`LOCAL_EXT` (`121`) now exists in the sibling `beam_codec`**: `Encoder::finish_local(hash: u32)`
   and `pub fn encode_term_local(Eterm, &AtomTable, hash: u32)` emit
   `[VERSION_MAGIC][LOCAL_EXT (121)][node-hash:4 BE][body]` with a **caller-supplied** node hash (the
