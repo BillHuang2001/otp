@@ -38,8 +38,12 @@
 //! A reference term is the address of a freshly allocated 4-word thing, so the term is a
 //! unique key; the entry is `Some(MonitorRef)` for a monitor reference and `None` for a
 //! bare `make_ref/0` ([`Runtime::refs_mut`](crate::Runtime::refs_mut)). That is also what
-//! makes `demonitor/1`'s argument check exact: a term with no entry is not a reference
-//! this runtime minted, and the oracle's reason for that is `badarg`.
+//! makes `demonitor/1`'s argument check exact: a term with no entry that is **not a
+//! reference** is the oracle's `badarg`, while a *reference* with no entry — an
+//! `erlang:send_after/3` timer reference, which the timer heap owns — backs no monitor and
+//! so has nothing to remove (`demonitor/1` answers `true`; `demonitor/2`'s `[info]` boolean
+//! is `false`), exactly as the oracle's `demonitor(make_ref())` does. The C's own test is the
+//! purely structural `is_not_internal_ref` (`bif.c:443-450`).
 //!
 //! # The targets the oracle accepts
 //!
@@ -84,7 +88,9 @@ use std::rc::Rc;
 
 use beam_common::{BeamError, Result};
 use beam_engine::terms;
-use beam_process::{MonitorKind, MonitorOptions, PortTable, ProcessId, ProcessTable, UnaliasMode};
+use beam_process::{
+    MonitorKind, MonitorOptions, MonitorRef, PortTable, ProcessId, ProcessTable, UnaliasMode,
+};
 use beam_term::{atom_val, is_atom, Atom, Eterm};
 
 use crate::context::RuntimeContext;
@@ -161,10 +167,10 @@ impl RuntimeContext<'_> {
 
     /// `erlang:demonitor(Ref)`: removes the monitor and answers `true`.
     ///
-    /// A reference this runtime minted always answers `true` — including a bare
-    /// `make_ref/0` reference and an already-demonitored one, both of which the oracle also
-    /// answers `true` for. Anything that is not such a reference is `badarg` (the oracle's
-    /// reason for `demonitor(not_a_ref)`).
+    /// A reference always answers `true` — a monitor's (whatever the removal did), a bare
+    /// `make_ref/0` reference, an `erlang:send_after/3` timer reference, and an
+    /// already-demonitored one. Only a term that is **not a reference at all** is `badarg`
+    /// (the oracle's reason for `demonitor(not_a_ref)`).
     pub(in crate::native) fn demonitor_1(&mut self, args: &[Eterm]) -> Result<Eterm> {
         let term = *args.first().ok_or(BeamError::BadArg)?;
         // The removal's own report is discarded: `demonitor/1` answers `true` whatever it
@@ -412,15 +418,26 @@ impl RuntimeContext<'_> {
     ///
     /// # Errors
     ///
-    /// `badarg` for a term that is not a reference this runtime minted (see the module
-    /// docs) — the oracle's reason for `demonitor(not_a_ref)`. A propagation failure from
-    /// either table is reported rather than swallowed.
+    /// `badarg` for a term that is **not a reference at all** (see the module docs) — the
+    /// oracle's reason for `demonitor(not_a_ref)`. A *reference* that backs no recorded
+    /// monitor is not an error: it is the "nothing was removed" answer (`Ok(false)`), which
+    /// `demonitor/1` reports as `true` and `demonitor/2`'s `[info]` as `false`. A propagation
+    /// failure from either table is reported rather than swallowed.
     fn remove_monitor(&mut self, term: Eterm, flush: bool) -> Result<bool> {
+        // Only a term that is **not a reference** is the oracle's `badarg` — the C's
+        // `is_not_internal_ref` test (`bif.c:443-450`). The crate-local `TermError` that
+        // `from_eterm` reports for one is deliberately not surfaced.
+        let _reference = MonitorRef::from_eterm(term).map_err(|_| BeamError::BadArg)?;
         let Some(entry) = self.runtime.references.get(&term).copied() else {
-            return Err(BeamError::BadArg);
+            // A reference this runtime minted for something **other** than a monitor — an
+            // `erlang:send_after/3` timer reference, which the timer heap owns and never
+            // records here — has no monitor to remove, so the oracle's answer is "nothing
+            // removed": `demonitor/1` answers `true` and `demonitor/2`'s `[info]` boolean is
+            // `false` (verified on OTP 29/erts-17.1).
+            return Ok(false);
         };
         let Some(reference) = entry else {
-            // A bare `make_ref/0` reference backs no monitor; the oracle still answers
+            // A bare `make_ref/0` reference backs no monitor either; the oracle still answers
             // `true` for `demonitor/1` on it.
             return Ok(false);
         };
@@ -455,7 +472,7 @@ mod tests {
 
     use super::*;
     use beam_bifs::NullSink;
-    use beam_term::{make_small, NIL};
+    use beam_term::{make_small, signed_value, NIL};
 
     use crate::native::test_support::{atom, call, runtime};
 
@@ -552,7 +569,7 @@ mod tests {
         let plain = call(&mut runtime, "erlang", "make_ref", &[]).expect("make_ref/0");
         let answer = call(&mut runtime, "erlang", "demonitor", &[plain]).expect("demonitor/1");
         assert_eq!(atom_name(&runtime, answer), Some("true"));
-        // Anything that is not a reference this runtime minted is `badarg`.
+        // Anything that is not a reference at all is `badarg`.
         for argument in [make_small(42), atom(&mut runtime, "notaref"), NIL] {
             assert!(
                 matches!(
@@ -562,6 +579,55 @@ mod tests {
                 "demonitor({argument:?}) is badarg"
             );
         }
+    }
+
+    /// Oracle-verified (OTP 29/erts-17.1): a timer reference is **not** a monitor, so
+    /// `demonitor(T)` answers `true`, `demonitor(T, [info])` answers `false`, and the timer
+    /// itself is untouched (`cancel_timer(T)` still reports the remaining time).
+    #[test]
+    fn demonitor_of_a_timer_reference_answers_true_and_leaves_the_timer_pending() {
+        let mut runtime = runtime();
+        let me = runtime.self_pid().to_eterm();
+        let message = atom(&mut runtime, "x");
+        let timer = call(
+            &mut runtime,
+            "erlang",
+            "send_after",
+            &[make_small(10_000), me, message],
+        )
+        .expect("erlang:send_after/3");
+        assert!(is_reference(&mut runtime, timer), "a timer answers a reference");
+
+        // `demonitor/1` answers `true`, and the timer really is still pending: a timer
+        // reference lives in the timer heap, never in `Runtime::references`.
+        let answer = call(&mut runtime, "erlang", "demonitor", &[timer]).expect("demonitor/1");
+        assert_eq!(atom_name(&runtime, answer), Some("true"));
+        assert_eq!(
+            runtime.timers.pending_count(),
+            1,
+            "demonitor does not cancel the timer"
+        );
+
+        // `[info]` reports the truthful "nothing was removed"; `[flush]` answers `true`.
+        let info = atom(&mut runtime, "info");
+        let info_list = make_list(&mut runtime, &[info]);
+        let answer =
+            call(&mut runtime, "erlang", "demonitor", &[timer, info_list]).expect("demonitor/2");
+        assert_eq!(atom_name(&runtime, answer), Some("false"));
+        let flush = atom(&mut runtime, "flush");
+        let flush_list = make_list(&mut runtime, &[flush]);
+        let answer =
+            call(&mut runtime, "erlang", "demonitor", &[timer, flush_list]).expect("demonitor/2");
+        assert_eq!(atom_name(&runtime, answer), Some("true"));
+
+        // The timer the handle names is still cancellable for its full delay.
+        let remaining =
+            call(&mut runtime, "erlang", "cancel_timer", &[timer]).expect("cancel_timer/1");
+        let millis = signed_value(remaining);
+        assert!(
+            (0..=10_000).contains(&millis),
+            "the timer survived the demonitor: {millis}"
+        );
     }
 
     #[test]
