@@ -769,11 +769,6 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   span. `Table::last`/`Table::prev` are C-faithful now (the interior aliases them to `first`/`next` for
   the hash kinds, `erl_db_hash.c:853-856`), so both BIFs could call `table.last(..)`/`table.prev(..)`
   unconditionally and drop the branch (the ordered-kind `'$end_of_table'` anchor rejection stays).
-- **`beam_bifs`/`beam_rt` — install an `ArithHook` for full match-spec arithmetic.** `set_arith_hook`
-  has no production caller, so the default (`DefaultArithHook`) stays small-int/float only and a bignum
-  operand or an out-of-range integer result is the typed `unsupported_ets`. A runtime installs
-  `beam_ets::select::expr::ArithHook` per thread over `beam_term`'s number layer to lift that gap.
-
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/kind.rs` → `TableKind`, `SetInterior`/`OrderedInterior`, `Access`, `Concurrency`, `WriteConcurrency`, `TableOptions` (incl. heir + `decentralized_counters`), `can_read`/`can_write`; unit tests in `src/kind/tests.rs`
