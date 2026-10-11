@@ -138,7 +138,8 @@
 //! ([`DriverPort::with_liveness`]) and refreshes at the start of every port round. The hook
 //! [`DriverPort::monitor_process_result`] reads it, and the observation's freshness rule — never
 //! older than the last round, `None` before the first — is spelled out there.
-//!//! # What is NOT wired yet (the typed gaps)
+//!
+//! # What is NOT wired yet (the typed gaps)
 //!
 //! * **`driver_async` / `driver_async_cancel`.** `Runtime` is `!Send` (it owns `Rc`/`RefCell`
 //!   tables, a `dlopen`ed library registry and pointer-stable term arenas), so a worker thread
@@ -604,7 +605,9 @@ pub struct DriverPort {
     /// test, or a port opened before any port round ran — keeps the viewless
     /// [`ProcessLiveness::new`], whose `is_alive` answers `None`.
     liveness: Rc<ProcessLiveness>,
-}impl DriverPort {
+}
+
+impl DriverPort {
     /// A host over `heap`, resolving/interning atoms against `atoms`, running as `owner`.
     pub fn new(heap: Heap, atoms: Rc<AtomTable>, owner: ProcessId) -> DriverPort {
         let interner = DriverAtoms::new(atoms.len());

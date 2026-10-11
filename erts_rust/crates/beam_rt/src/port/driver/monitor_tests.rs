@@ -389,20 +389,13 @@ fn a_non_pid_term_is_an_error() {
 /// The term is built without `unsafe` — an ETF `NEW_PID_EXT` (88) image is decoded onto a test heap
 /// — and the case asserts first that it really is *not* an internal pid, so it discriminates the
 /// local/external split rather than restating the non-pid case.
-///
-/// **Ignored:** the hand-built image is not accepted by this workspace's `beam_codec` decoder
-/// (`decode_term` answers `BadArg` for it), so the case cannot run until the image is replaced by
-/// one the decoder round-trips. The behaviour it targets is already pinned: the non-pid case above
-/// covers the "not a process id" refusal at this seam, and
-/// `liveness_tests::a_dead_local_process_answers_the_cs_positive_not_alive` drives the same refusal
-/// split through the real `driver_monitor_process` entry point.
 #[test]
-#[ignore = "the hand-built NEW_PID_EXT ETF image is rejected by beam_codec::decode_term"]
 fn an_external_pid_term_is_an_error() {
-    // [VERSION_MAGIC][NEW_PID_EXT][SMALL_ATOM_UTF8_EXT "foo@bar"][number][serial][creation]
-    let image: [u8; 22] = [
+    // [VERSION_MAGIC][NEW_PID_EXT][SMALL_ATOM_UTF8_EXT "foo@bar"]
+    // [number:u32][serial:u32][creation:u32]
+    let image: [u8; 23] = [
         131, 88, 119, 7, b'f', b'o', b'o', b'@', b'b', b'a', b'r', 0, 0, 0, 10, 0, 0, 0, 0, 0, 0,
-        0,
+        0, 0,
     ];
     let mut heap = Heap::new(256).expect("a test heap");
     let mut atoms = AtomTable::new();
