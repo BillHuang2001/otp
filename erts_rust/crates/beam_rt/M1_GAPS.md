@@ -190,17 +190,23 @@ notification, so a queued `port_command` buffer reaches the driver whether or no
 writable fd. The driver's `control` callback **is** routed behind `erlang:port_control/3`, and
 `ERL_DRV_USE`'s `stop_select` **fires** on the cancel/deselect handback. The **driver-private queue**
 (`driver_enq`/`driver_pushq`/`driver_deq`/`driver_sizeq`/`driver_peekq` — a fresh port's `sizeq` is `0`),
-`driver_pdl_create` and the port **state** flags (`get_port_flags`; `set_control_flags` stores into the
-port's own control-flags cell) are implemented, so the host covers **23 of the 40** `DriverHost` hooks.
+`driver_pdl_create`, the port **state** flags (`get_port_flags`; `set_control_flags` stores into the
+port's own control-flags cell) and the **process-monitor family**
+(`driver_monitor_process`/`_demonitor_process`/`_get_monitored_process` over the per-port monitor tree,
+the C's `process_exit` fired per round, and `monitor_process_result`'s three-way answer from the
+published `ProcessLiveness` view) are implemented, so the host covers **27 of the 41** `DriverHost` hooks.
+The monitor residual is that the view is a **per-round snapshot**, so a callback reached **outside** a
+round (a driver's own `start` during `open_port/2`, a `control` during `port_control/3`) consults the
+previous round's snapshot, and one reached before any round answers `Ok`, never a fabricated `NotAlive`.
 Typed gaps: `driver_async` (no async pool; `Runtime` is `!Send` and the `invoke`/`free` pair is
-`unsafe`); the process-monitor family (`driver_monitor_process`/`_demonitor_process`/
-`_get_monitored_process` — a returned monitor could never be correlated again without a safe
-`monitor_identity` reader on `beam_abi`); a `control` reply the driver answered from **its own** memory
-(needs a safe copy helper on `beam_abi`); an OS child (`os_pid` is `undefined` for a driver port, and
-`take_exit_status` is always `Ok(None)`); a built-in (`spawn`/`spawn_executable`/`fd`) port's
-`port_control/3` answering `[]` where the oracle raises `badarg` (a gap owned by `beam_io`'s default
-`Driver::control`); and a driver arming **more than one** registration per direction (the typed
-`unsupported`).
+`unsafe`, and `async_port_key` keeps the default `-1`); a `control` reply the driver answered from
+**its own** memory (needs a safe copy helper on `beam_abi`); a NULL driver reply with
+`PORT_CONTROL_FLAG_BINARY` set (answers `<<>>` where the C answers `[]`); an OS child (`os_pid` is
+`undefined` for a driver port, and `take_exit_status` is always `Ok(None)`); a built-in
+(`spawn`/`spawn_executable`/`fd`) port's `port_control/3` answering `[]` where the oracle raises
+`badarg` (a gap owned by `beam_io`'s default `Driver::control`); a driver arming **more than one**
+registration per direction (the typed `unsupported`); and `PORT_FLAG_LINE`, unreachable (`[line]` is
+whitelisted-but-inert).
 The six `erl_ddll` registry BIFs (`loaded_drivers/0`, `try_load/3`, `try_unload/2`, `monitor/2`,
 `demonitor/1`, `info/2`) stay typed `unsupported`: `loaded_drivers/0` would report this runtime's own
 (empty) driver set where the oracle lists its statically-linked `tcp_inet`/`udp_inet`/`ram_file_drv` — a
@@ -305,10 +311,24 @@ re-fetch.
   (OTP 30 / erts-17.1, **22 instructions**) to `{progress,started}` (the CLI `-boot` action exits `0`),
   so the differential case `boot/proc_lib_start_link_blocks_the_boot_path` **agrees** with the oracle;
   `-boot FILE` drives it (`src/cli.rs::drive`), a plain start keeps the preloaded-only floor, and the
-  boot leaves a live `logger_server` registered as `logger`. Remaining cross-node gaps: (1)
-  **`beam_engine`** — a nested run's `receive … after T` timeout does not fire, so it folds into
-  `error::blocked()` (the OTP-lifecycle item 7); (2) **`beam_bifs`** — whatever the started applications
-  still need. Detail: [`src/boot/CONTEXT.md`](src/boot/CONTEXT.md).
+  boot leaves a live `logger_server` registered as `logger`. The remaining cross-node gap is
+  **`beam_bifs`** — whatever the started applications still need. Detail:
+  [`src/boot/CONTEXT.md`](src/boot/CONTEXT.md).
+* **A.9 E0 — in-process compilation works and is byte-identical; the *scheduled* route is the blocker.**
+  `compile:file(File, [no_spawn_compiler_process, deterministic, {outdir, Dir}])` runs **in-process** and
+  writes a `.beam` **byte-identical** to the oracle's identical-option run (`cmp` clean; the `Code` chunk
+  matches `erlc +deterministic`) — `tests/compile_file.rs`. The corpus case
+  `selfhost/in_process_compile_file_no_spawn_deterministic` (a scheduled `run`) still reports
+  `unsupported: opcode: run: process blocked (no message available)`, so its
+  `tools/differential/known-gaps.txt` entry stays (repo-root owned, not editable from here). The cause is
+  a **root-publication** gap: a delivery-driven receiver-heap collection in the park window
+  (`beam_process::ptab` signal/message growth → `Process::ensure_capacity` → `run_rooted_collection`)
+  relocates the heap against an incomplete root set, because a live `Machine::pending_exception` term is
+  not in `Registers::gather_roots`. Three-file fix: `beam_engine` — a `Machine::pending_exception_mut()`
+  write accessor (the read `pending_exception()` is already `pub`); `beam_process` — an extra-root
+  `Vec<Eterm>` on `Registers` carried by `gather_roots`/`scatter_roots`; `beam_rt` —
+  `src/runner/run.rs::publish_parked_roots` feeding it. Cheaper alternative (needs only the accessor):
+  `gc::halt_process_gc(pid)` in the park/yield arms when a pending exception exists.
 * **The native `file_server_2` service** (`src/native/file_server.rs`) answers the
   `{'$gen_call',{Pid,Tag},Request}` / `{file_request|io_request,From,ReplyAs,Request}` wire and the
   server/io-device request surface `lib/kernel/src/file.erl` issues (`{open,…}`, `read_file`, `list_dir`,
@@ -350,21 +370,22 @@ re-fetch.
   `beam_process` **remote-peer** seam (plus an alias table); `DOP_SEND`/`DOP_REG_SEND` already reach
   local mailboxes, and a live-peer loop past the handshake needs the `FragmentAssembler` receive-buffer
   coupling.
-* **`beam_io` / `beam_abi` lifecycle.** The **process-monitor family** is blocked on a safe `beam_abi`
-  reader `monitor_identity(mon: *const ErlDrvMonitor) -> Option<[u8; 24]>`: the frozen hook
-  `monitor_process(&mut self, pid: Eterm) -> Option<ErlDrvMonitor>` never sees the caller's out-parameter,
-  and `demonitor_process`/`get_monitored_process` receive an `*const ErlDrvMonitor` whose 24-byte identity
-  may not be read under `#![deny(unsafe_code)]`, so the three stay the C's failure code. `driver_async`
-  needs a `beam_abi::DriverHost` seam that can fire `ready_async` (since `beam_rt` is
-  `#![deny(unsafe_code)]`); a `control` reply the driver answered from its own memory needs a safe copy
-  helper; a per-registration `ErlDrvEvent` identity is still owed. `erl_drv_monotonic_time`'s phase differs
-  because `beam_abi/src/driver/drv/mem.rs` reads `CLOCK_MONOTONIC` from the system epoch where the oracle
-  returns the Erlang monotonic time (a process-global origin shared with `beam_bifs`' `time.rs`).
-* **`beam_io` — a safe filesystem accessor.** A safe `path_access(Path)` (a `libc::access` wrapper) plus
-  `process_credentials()` (effective uid/gid) would close the `#file_info{}` **`access`** slot, and so the
-  `filelib`/`file:read_file_info` existing-path **success** cases; only the stat-failure path is served
-  today (`src/native/file_server/file_info.rs`), because `access(2)` is reachable only through `libc::access`,
-  which `#![deny(unsafe_code)]` forbids.
+* **`beam_io` / `beam_abi` lifecycle.** The **process-monitor family is live**: a safe
+  `beam_abi::monitor_identity(mon: *const ErlDrvMonitor) -> Option<[u8; 24]>` reader exists, so
+  `driver_monitor_process`/`_demonitor_process`/`_get_monitored_process` do the C's job over the
+  per-port monitor tree and `monitor_process_result` answers from the published `ProcessLiveness` view
+  (residual: the per-round snapshot freshness above). `driver_async` still needs a `beam_abi::DriverHost`
+  seam that can fire `ready_async` (since `beam_rt` is `#![deny(unsafe_code)]`); a `control` reply the
+  driver answered from its own memory needs a safe copy helper; a per-registration `ErlDrvEvent` identity
+  is still owed. `erl_drv_monotonic_time`'s phase differs because `beam_abi/src/driver/drv/mem.rs` reads
+  `CLOCK_MONOTONIC` from the system epoch where the oracle returns the Erlang monotonic time (a
+  process-global origin shared with `beam_bifs`' `time.rs`).
+* **`beam_io` — the filesystem accessors are implemented.** `beam_io::path_access(Path)` (a `libc::access`
+  wrapper) and `process_credentials()` (effective uid/gid) exist in `beam_io/src/fs_access.rs`, and the
+  native floor consumes them (`src/native/prim.rs::path_access_bits`, `src/native/file_server/file_info.rs`,
+  `src/native/prim_file.rs`), so the `#file_info{}` **`access`** slot is served and
+  `file:read_file_info/1`/`file:read_link_info/1` on an existing path answer `read_write`, matching the
+  oracle.
 * **`beam_message` — an off-heap refc-binary copy mode.** `copy_struct_simple` builds **empty** source and
   destination off-heap tables, so `copy_refc_binary` cannot resolve a `RefcBinary` payload's backing store
   (`binary_by_data_ptr` misses) and returns `bad_term` (`BeamError::BadArg`). A self-contained "flatten"
@@ -411,42 +432,23 @@ Exit 0 = success, 1 = runtime error, 3 = capability gap.
 `erlang:apply(M,F,[])`, or a local fun), and so does a cross-module call whose callee parks on a
 `receive` that a later **message** matches. Local fun application with free variables works while the
 closure's body can complete without a suspension; a closure that is the process *entry* is driven
-in-machine by the runner. `gen_server:cast/2` returns `ok`
-(it is a plain `!`). Plain
-`!`/`receive`, `erlang:monitor(process,P)` (arity 2) and `erlang:monitor(process,P,[{tag,T}])` work, as
-does a `gen_server:call(Pid, Req, infinity)` / `gen:call(Pid, '$gen_call', Req, infinity)` round-trip.
-The whole-file `file` family completes from a **scheduled** process (`file:read_file/1`,
-`file:write_file/2`, `file:open/2` for read and write, `file:close/1`, `file:list_dir/1`,
-`file:get_cwd/0`, `file:consult/1`, and `filelib:is_file/1` — an existing path `true`, an absent one
-`false`); from `-eval` (pumped) the incremental io-device read path agrees too (see "Path asymmetry").
+in-machine by the runner. `gen_server:cast/2` returns `ok` (it is a plain `!`). Plain `!`/`receive`,
+`erlang:monitor(process,P)` (arity 2) and `erlang:monitor(process,P,Options)` with a `{tag,T}` and/or
+`{alias,Mode}` option work. **`gen_server:call/2,3` and `gen:call/3,4` work for a finite timeout as well
+as `infinity`** — for a pid *and* a registered `{local,Name}` — because `gen:do_call/4`'s finite-timeout
+clause (`lib/stdlib/src/gen.erl:251`, `erlang:monitor(process, Process, [{alias,demonitor}])`) and the
+`erlang:send/3 [noconnect]` it uses are both served; `sys:get_state/1` and the `sys:*` requests work too
+(`sys` issues `gen:call(Name, system, Request)`, `lib/stdlib/src/sys.erl:749`). A `receive … after T`
+that must time out delivers its timeout on **every** route, including through a nested run (a
+cross-module call or a fun application). The whole-file `file` family completes from a **scheduled**
+process (`file:read_file/1`, `file:write_file/2`, `file:open/2` for read and write, `file:close/1`,
+`file:list_dir/1`, `file:get_cwd/0`, `file:consult/1`, `file:read_file_info/1`/`read_link_info/1` (an
+existing path `read_write`) and `filelib:is_file/1` — an existing path `true`, an absent one `false`);
+the incremental io-device read path completes on both routes for a pure `file:read/2` sequence and a
+pure `file:read_line/1` sequence (its mixed-order divergence is the item below).
 
 ### Confirmed failing — root cause and repro
-1. **`gen_server:call/2,3` and `gen:call/3,4` with a finite timeout raise `badarg`.** Root cause:
-   `gen:do_call/4`'s finite-timeout clause (`lib/stdlib/src/gen.erl:251`) does
-   `erlang:monitor(process, Process, [{alias,demonitor}])`; this runtime's `monitor/3` serves only the
-   `{tag,T}` option, so the alias option raises `badarg` (and the reply tag `[alias|Mref]` is then
-   `badarg` too). `erlang:send/3` (the `[noconnect]` send the same clause uses) is the typed gap
-   `unsupported: erlang:send/3`. **`gen_server:call/2` is not the infinity form**: `gen:call/3` is
-   `gen:call(Process, Label, Request, ?default_timeout)` with `?default_timeout = 5000`, so the most
-   common call form takes the finite clause too. Repro: `mon:alias_mon/0`, `mon2:alias_reply/0` →
-   `badarg` (oracle: a `#Ref{}`); `gcx:call_pid_2/0` → `{'EXIT',{badarg,{gen_server,call,[Pid,ping,5000]}}}`;
-   `gcx:call_name_2/0` → `{'EXIT',{badarg,{gen_server,call,[Name,ping]}}}`. The measured form split
-   (oracle prints `pong`/`{ok,pong}` in every row; fixture = a hand-rolled `{'$gen_call', {From, Mref},
-   ping}` server, each call `catch`-wrapped):
-   | call | beam_rt, scheduled process |
-   |---|---|
-   | `gen_server:call(Pid, Req)` (arity 2 ⇒ `gen:call/3` ⇒ finite 5000) | `{'EXIT',{badarg,{gen_server,call,[Pid,Req,5000]}}}` — **caught** by the caller |
-   | `gen_server:call(Pid, Req, 5000)` | the same `badarg` (caught) |
-   | `gen_server:call(Pid, Req, infinity)` / `gen:call(Pid, '$gen_call', Req, infinity)` | **`pong` / `{ok,pong}` — works** (the pid clause of `gen:call/4` calls `do_call/4` directly, so the blocking `receive` is ordinary machine code and suspends/resumes normally) |
-   | `gen_server:call(Name, Req)` / `(Name, Req, 5000)` | `{'EXIT',{badarg,{gen_server,call,[Name,…]}}}` — **caught** (the alias `badarg` fires) |
-   | `gen_server:call(Name, Req, infinity)` / `gen:call(Name, '$gen_call', Req, infinity)` | **`pong` / `{ok,pong}` — works** |
-   So the split is by **timeout**, not by pid-vs-name: **`infinity` works** for both a pid and a
-   registered name; **any finite timeout** dies of the `monitor/3` alias gap (a `beam_rt`-visible floor
-   gap, whose real fix — alias refs — is `beam_process`/`beam_bifs` work).
-2. **`sys:get_state/1` and every `sys:*` request raise `badarg`.** `sys` issues
-   `gen:call(Name, system, Request)` (`lib/stdlib/src/sys.erl:749`) → the same monitor-alias `badarg`
-   (its default timeout is finite). Repro: `sy:gostate/0` → `{'EXIT',badarg}` (oracle: `[]`).
-3. **`logger` / `error_logger` cannot emit a report on a plain runtime.** `logger:warning/1`,`notice/1`,
+1. **`logger` / `error_logger` cannot emit a report on a plain runtime.** `logger:warning/1`,`notice/1`,
    `error/1` and `error_logger:info_msg/1,2`,`error_msg/2` raise `badarg`. Root cause: a plain
    `run`/`-eval` invocation loads only the preloaded modules — it does not run the boot script, so no
    `logger` process exists (the boot-script path *does* register one), the `logger` ETS config table
@@ -457,35 +459,34 @@ The whole-file `file` family completes from a **scheduled** process (`file:read_
    returns `ok` **only because it is filtered** below the default `notice` level (`allow(info)` = false).
    The residual is the missing native logger ETS floor: `lg:warn/0` → `{'EXIT',badarg}`, `lg:info/0` →
    `ok`, `lg:elog_info/0` → `{'EXIT',badarg}`.
-4. **`application:start/1,2`, `application:stop/1`, `application:ensure_all_started/1` fail.**
+2. **`application:start/1,2`, `application:stop/1`, `application:ensure_all_started/1` fail.**
    On a plain runtime no `application_controller` process exists (it is spawned only on the `-boot`
    path): `{'EXIT',{noproc,{gen_server,call,[application_controller,{load_application,sasl},infinity]}}}`
-   (scheduled) / `exit <structured reason>` (`-eval`). The native floor answers only the read-only
-   queries (items in "Works today"); no application's `start/2` runs and no supervision tree becomes
-   live. Repro: `ap:start_sasl/0`, `ap:start_syntax/0`, `ap:ensure_syntax/0`.
-5. **The incremental io-device read path from a scheduled process exits 3** — `file:read/2` and
-   `file:read_line/1` both `unsupported: opcode: run: process blocked (no message available)`; each
-   agrees with the oracle from `-eval` (see the path asymmetry). The whole-file `file` family (item in
-   "Works today") completes from a scheduled process.
-6. **`code:get_object_code/1` raises `badarg`** (oracle: `{Module,Binary,Filename}`); `code:which/1` and
+   (scheduled) / `exit <structured reason>` (`-eval`); the oracle answers `ok`/`{ok,[syntax_tools]}`/
+   `{error,{not_started,sasl}}`. The native floor answers only the read-only queries (items in "Works
+   today"); no application's `start/2` runs and no supervision tree becomes live. Repro:
+   `ap:start_sasl/0`, `ap:start_syntax/0`, `ap:ensure_syntax/0`.
+3. **A `file:read/2` after a `file:read_line/1` returns `eof` where the oracle returns the remaining
+   bytes — a wrong result, on both routes.** With a `data.txt` of `line1\nline2\nrest`: `r0/0` opens the
+   file, `file:read(F,6)`, `file:read_line(F)`, `file:read(F,4)` → the oracle
+   `{{ok,"line1\n"},{ok,"line2\n"},{ok,"rest"}}`, this runtime `{{ok,"line1\n"},{ok,"line2\n"},eof}`;
+   `x1/0` (`file:read_line(F)` then `file:read(F,100)`) → the oracle `{ok,"line2\nrest"}`, this runtime
+   `eof`. A pure `read`/`read` sequence and a pure `read_line`/`read_line`/`read_line` sequence both
+   agree with the oracle on both routes, so only the two requests disagree on the device's position.
+   Root cause: `reply_get_chars` (`src/native/file_server.rs:662-694`) reads straight from the OS file
+   at its current offset and never consults the device's stashed read-ahead buffer, whereas the
+   `{get_line,…}` path (`src/native/file_server/get_line.rs`) reads ahead in chunks and stashes the tail.
+   Owned here (the native `file_server_2`).
+4. **`code:get_object_code/1` raises `badarg`** (oracle: `{Module,Binary,Filename}`); `code:which/1` and
    `code:load_file/1` are fine. `erlang:module_loaded/1` is truthful to this runtime's own loaded set, so
    `module_loaded(lists)` is `false` until `lists` is demanded (oracle: `true`).
-7. **A `receive … after T` that must actually time out, reached through a nested run, folds into the
-   typed `blocked()` gap.** `beam_rt -noshell -eval 'ev:mailbox()'`, where `ev:mailbox/0` is
-   `receive M -> {got,M} after 100 -> none end`, exits 3 `unsupported: opcode: run: process blocked (no
-   message available)` — a module export runs as a nested run whose `after` timeout does not fire —
-   while the same export as the `run` entry (`run ev.beam ev:mailbox/0`) returns `none`. A
-   **cross-module** call behaves the same way: `mwc:call_hard/0` → `mw:to_hard/0`
-   (`receive M -> M after 20 -> timeout end`, no message) exits 3, whereas the same clause as a
-   same-module local call (`mm:go/0` → `helper/0`) returns `timeout`, and a nested call woken by a
-   **message** parks and resumes correctly (`mwc5:go/0` → `mw:wait_or_msg/0` returns the message). An
-   inline `-eval 'receive … after T …'` works (the evaluator's own receive driver).
 
-### The `-eval` vs scheduled asymmetry (the single most load-bearing observation)
+### The `-eval` vs scheduled asymmetry
 The `-eval` root process **pumps** the scheduler and can suspend a blocking call; a **scheduled**
-process (`run`) parks at its own top-level `receive` (a `receive … after T` timer fires there, and a
-`receive` waiting for a message resumes correctly), but **a nested run it enters — a cross-module call,
-or a fun application — does not deliver a `receive … after T` timeout**: it folds into the typed
-`blocked()` gap instead. Hence the incremental `file` read path **agrees under `-eval` and exits 3
-under `run`**, while a top-level `receive … after 100` **returns `none` under `run` and exits 3 under
-`-eval` in a called module function** — the two directions of the same seam, not a per-API bug.
+process (`run`) parks at its own top-level `receive`. Both routes deliver a `receive … after T` timeout,
+including one reached through a **nested** run (a cross-module call or a fun application), and a
+`receive` waiting for a message resumes correctly on both. The `unsupported: opcode: run: process
+blocked (no message available)` a scheduled `run` can still report (the A.9 E0 compile case) is a
+root-publication gap in a delivery-driven collection, not a route asymmetry. The incremental `file` read
+path agrees with the oracle on both routes for a pure read or a pure line sequence; its mixed-order
+divergence (item 3) is route-independent, so it is a `file_server_2` position bug.
