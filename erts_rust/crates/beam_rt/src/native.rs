@@ -269,6 +269,11 @@ impl RuntimeContext<'_> {
             ("erlang", "monitor", 3) => Some(self.monitor_3(args)),
             ("erlang", "demonitor", 1) => Some(self.demonitor_1(args)),
             ("erlang", "demonitor", 2) => Some(self.demonitor_2(args)),
+            // The **reference-alias** pair (bif.tab:772-773): `alias/1` mints a reference a
+            // process may be sent to; `unalias/1` clears one. Both are runtime-native because
+            // the alias table is `beam_process`'s — see [`process`](crate::native::process).
+            ("erlang", "alias", 1) => Some(self.alias_1(args)),
+            ("erlang", "unalias", 1) => Some(self.unalias_1(args)),
             ("erlang", "exit", 2) => Some(self.exit_2(args)),
             ("erlang", "exit", 3) => Some(self.exit_3(args)),
             ("erlang", "pre_loaded", 0) => Some(self.pre_loaded_0()),

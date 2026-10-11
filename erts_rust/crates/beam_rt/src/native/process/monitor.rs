@@ -49,24 +49,42 @@
 //! **port table** (`beam_io`'s `PortRegistry`, reached through
 //! [`crate::port::PortRegistry::port_table_mut`]) — the same table `open_port/2` allocates
 //! from and `port_close/1` releases, so the monitor's `{'DOWN', Ref, port, Port, Reason}`
-//! fires when the port closes. `erlang:monitor/3`'s `{tag, Tag}` option is honoured for an
-//! **immediately-representable** tag; a tag resident in a per-process heap stays the typed
-//! capability gap (`beam_process`'s `error::unsupported_tag`), because a monitor record is a
-//! plain value the collector never scans — the workspace error strategy forbids storing a word
-//! that a later collection could invalidate.
+//! fires when the port closes.
 //!
-//! # The one remaining capability gap
+//! # `erlang:monitor/3`'s option list
+//!
+//! [`RuntimeContext::monitor_options`] is the `beam_rt` side of the C's `erts_monitor_opts`
+//! (`bif.c:701-756`): it walks the list and builds the [`MonitorOptions`] the
+//! `beam_process` `*_with_options` entry points consume.
+//!
+//! * the bare atom `priority` is accepted and **ignored** (the C sets `ERTS_ML_FLG_PRIO_ML`,
+//!   which has no observable effect here),
+//! * `{tag, Tag}` supplies the `{'DOWN', …}` head atom, honoured for an
+//!   **immediately-representable** tag — one resident in a per-process heap stays the typed
+//!   capability gap (`beam_process`'s `error::unsupported_tag`), because a monitor record is
+//!   a plain value the collector never scans — and
+//! * `{alias, Mode}` makes the monitor's own reference double as a **reference alias**
+//!   (`explicit_unalias` / `demonitor` / `reply_demonitor`), so a message sent to it is
+//!   delivered to the watcher.
+//!
+//! Anything else is the oracle's `badarg`, as is a non-list. An empty list — or any list
+//! yielding [`MonitorOptions::NONE`] — is `monitor/2` byte for byte. The option list is
+//! parsed **first**, so a malformed option outranks a malformed target, exactly as in the C.
+//!
+//! # The remaining capability gaps
 //!
 //! A **named** port monitor (`monitor(port, Name)`) is the typed
 //! `beam_process`-owned `error::named_port_monitor()`: the process registry resolves names to
 //! *processes* only, so recording the process the name resolves to would be a wrong (process)
-//! monitor.
+//! monitor. An `{alias, Mode}` option on a **port** monitor is likewise
+//! `beam_process`'s typed `error::unsupported_port_monitor_alias()` (a port alias's reply
+//! site has no port table), and one on a remote target is the Milestone-1 distribution gap.
 
 use std::rc::Rc;
 
 use beam_common::{BeamError, Result};
 use beam_engine::terms;
-use beam_process::{MonitorKind, PortTable, ProcessId, ProcessTable};
+use beam_process::{MonitorKind, MonitorOptions, PortTable, ProcessId, ProcessTable, UnaliasMode};
 use beam_term::{atom_val, is_atom, Atom, Eterm};
 
 use crate::context::RuntimeContext;
@@ -106,45 +124,37 @@ impl RuntimeContext<'_> {
         let target = *args.get(1).ok_or(BeamError::BadArg)?;
         let kind = self.atom_name(kind).ok_or(BeamError::BadArg)?;
         match kind.as_str() {
-            "process" => self.monitor_process(target, None),
+            "process" => self.monitor_process(target, MonitorOptions::NONE),
             // A port monitor is recorded on the runtime's **port table** — the same one
             // `open_port/2` allocates from, so the `{'DOWN', …}` fires when the port closes.
             // The target of the oracle's `monitor(port, X)` must be a port (a non-port is
             // `badarg`, a registered *name* the typed named-port-monitor gap).
-            "port" => self.monitor_port(target, None),
+            "port" => self.monitor_port(target, MonitorOptions::NONE),
             _ => Err(BeamError::BadArg),
         }
     }
 
     /// `erlang:monitor(process, Target, Options)`: `monitor/2` plus the option list.
     ///
-    /// The only option the oracle accepts here is `{tag, Tag}` (OTP 24+), which gives the
-    /// monitor's `{'DOWN', …}` a caller-chosen tag. It is honoured for an
-    /// **immediately-representable** `Tag` (`beam_process`'s user-tag contract) on both the
-    /// process and the port target paths; every other element — an unknown atom, a 3-tuple —
-    /// is the oracle's `badarg`, as is a non-list. The empty list is `monitor/2` exactly, and
-    /// so is a `{tag, _}`-less list, byte for byte.
+    /// The options are parsed (see [`Self::monitor_options`], the C's `erts_monitor_opts`)
+    /// and forwarded to the matching `beam_process` `*_with_options` entry point: a `{tag,
+    /// Tag}` gives the monitor's `{'DOWN', …}` a caller-chosen tag and an `{alias, Mode}`
+    /// makes its reference a send destination for the watcher. Every other element — an
+    /// unknown atom, a 3-tuple, an `{alias, _}` with an unknown mode — is the oracle's
+    /// `badarg`, as is a non-list. The empty list is `monitor/2` exactly, and so is any list
+    /// yielding [`MonitorOptions::NONE`], byte for byte.
     pub(in crate::native) fn monitor_3(&mut self, args: &[Eterm]) -> Result<Eterm> {
-        let options = terms::list_elements(*args.get(2).ok_or(BeamError::BadArg)?)
-            .map_err(|_| BeamError::BadArg)?;
-        let mut tag = None;
-        for option in options {
-            match self.tag_option(option) {
-                Some(supplied) => tag = Some(supplied),
-                None => return Err(BeamError::BadArg),
-            }
+        // Parsed **first**, so a malformed option list outranks a malformed target — the C's
+        // `erts_monitor_opts` runs before `monitor()` looks at `type`/`target` at all.
+        let options = self.monitor_options(*args.get(2).ok_or(BeamError::BadArg)?)?;
+        let kind = *args.first().ok_or(BeamError::BadArg)?;
+        let target = *args.get(1).ok_or(BeamError::BadArg)?;
+        let kind = self.atom_name(kind).ok_or(BeamError::BadArg)?;
+        match kind.as_str() {
+            "process" => self.monitor_process(target, options),
+            "port" => self.monitor_port(target, options),
+            _ => Err(BeamError::BadArg),
         }
-        if let Some(tag) = tag {
-            let kind = *args.first().ok_or(BeamError::BadArg)?;
-            let target = *args.get(1).ok_or(BeamError::BadArg)?;
-            let kind = self.atom_name(kind).ok_or(BeamError::BadArg)?;
-            return match kind.as_str() {
-                "process" => self.monitor_process(target, Some(tag)),
-                "port" => self.monitor_port(target, Some(tag)),
-                _ => Err(BeamError::BadArg),
-            };
-        }
-        self.monitor_2(args)
     }
 
     // -- erlang:demonitor/1,2 -------------------------------------------------
@@ -194,9 +204,10 @@ impl RuntimeContext<'_> {
 
     /// `erlang:monitor(process, Target)` for the resolved target.
     ///
-    /// `tag` is the `erlang:monitor/3` `{tag, Tag}` option (`None` for `monitor/2`), forwarded
-    /// to the tag-aware `beam_process` entry point so the eventual `{'DOWN', …}` carries it.
-    fn monitor_process(&mut self, target: Eterm, tag: Option<Eterm>) -> Result<Eterm> {
+    /// `options` is the parsed `erlang:monitor/3` option set ([`MonitorOptions::NONE`] for
+    /// `monitor/2`), forwarded to the option-aware `beam_process` entry point so the eventual
+    /// `{'DOWN', …}` carries the user tag and the reference doubles as an alias.
+    fn monitor_process(&mut self, target: Eterm, options: MonitorOptions) -> Result<Eterm> {
         // The target is resolved **first**, so a malformed target keeps the oracle's
         // `badarg` (and a remote `{Name, Node}` its capability gap) even when the caller
         // itself has no process.
@@ -206,22 +217,22 @@ impl RuntimeContext<'_> {
             return Err(error::no_process(watcher));
         }
         let reference = match target {
-            MonitorTarget::Pid(pid) => {
-                self.process_table_mut()
-                    .monitor_with_tag(watcher, pid, MonitorKind::Process, tag)?
-            }
-            MonitorTarget::Named { name, node } => self.process_table_mut().monitor_named_with_tag(
+            MonitorTarget::Pid(pid) => self.process_table_mut().monitor_with_options(
                 watcher,
-                name,
-                node,
+                pid,
                 MonitorKind::Process,
-                tag,
+                options,
             )?,
+            MonitorTarget::Named { name, node } => self
+                .process_table_mut()
+                .monitor_named_with_options(watcher, name, node, MonitorKind::Process, options)?,
         };
         let term = self.reference_term(reference)?;
         // Recorded whatever happened, so `demonitor/1,2` recognises the reference: a
         // monitor on a pid or name the table does not hold is born down, and the oracle
-        // still lets it be demonitored.
+        // still lets it be demonitored. `Some` marks it as a **monitor** (a real `Monitor`
+        // entry, or its alias-carrying sibling), which is what `demonitor/2`'s `[info]`
+        // boolean reads.
         self.runtime.references.insert(term, Some(reference));
         Ok(term)
     }
@@ -234,13 +245,16 @@ impl RuntimeContext<'_> {
     /// this never records a process monitor for a port-typed request. A port that is already
     /// closed still yields a reference (the monitor is born down with reason `noproc`), exactly
     /// as the oracle's does, and the reference is recorded so `demonitor/1` recognises it.
-    fn monitor_port(&mut self, target: Eterm, tag: Option<Eterm>) -> Result<Eterm> {
+    ///
+    /// `options` is the parsed `erlang:monitor/3` option set; an `{alias, Mode}` in it is the
+    /// typed `beam_process` port-alias gap, propagated rather than swallowed.
+    fn monitor_port(&mut self, target: Eterm, options: MonitorOptions) -> Result<Eterm> {
         let watcher = self.pid();
         let reference = self.with_port_table(|table, ports| {
             if !table.contains(watcher) {
                 return Err(error::no_process(watcher));
             }
-            table.monitor_port_term_with_tag(watcher, target, ports, tag)
+            table.monitor_port_term_with_options(watcher, target, ports, options)
         })?;
         let term = self.reference_term(reference)?;
         self.runtime.references.insert(term, Some(reference));
@@ -337,17 +351,60 @@ impl RuntimeContext<'_> {
         )
     }
 
-    /// The `Tag` of the `{tag, Tag}` form of `erlang:monitor/3`, or `None` for any other
-    /// element (which the caller answers with the oracle's `badarg`).
-    fn tag_option(&self, option: Eterm) -> Option<Eterm> {
-        if !matches!(terms::tuple_arity(option), Ok(2)) {
-            return None;
-        }
-        match terms::tuple_element(option, 0) {
-            Ok(first) if self.atom_name(first).as_deref() == Some("tag") => {
-                terms::tuple_element(option, 1).ok()
+    /// The parsed `erlang:monitor/3` option list — the `beam_rt` side of the C's
+    /// `erts_monitor_opts` (`bif.c:701-756`).
+    ///
+    /// * the bare atom `priority` is accepted and **ignored** (the C sets
+    ///   `ERTS_ML_FLG_PRIO_ML`, whose only effect is on the priority signal queue, which this
+    ///   runtime does not model);
+    /// * `{tag, Tag}` supplies the user tag (its *immediacy* is checked downstream, by
+    ///   `beam_process`'s `check_tag`, so a heap-resident tag stays that crate's typed
+    ///   `error::unsupported_tag`);
+    /// * `{alias, Mode}` selects the reference alias's expiry rule from the atoms
+    ///   `explicit_unalias` / `demonitor` / `reply_demonitor`;
+    /// * **everything else** — another atom, a tuple of another arity, a non-tuple element, a
+    ///   2-tuple whose first element is not `tag`/`alias`, an `{alias, _}` with an unknown
+    ///   mode — is the oracle's `badarg`, as is a non-list (an improper tail included).
+    ///
+    /// A repeated option follows the C's last-wins assignment: `{tag, A}, {tag, B}` keeps `B`,
+    /// and `[reply, explicit_unalias]` keeps `explicit_unalias`.
+    fn monitor_options(&self, options: Eterm) -> Result<MonitorOptions> {
+        let elements = terms::list_elements(options).map_err(|_| BeamError::BadArg)?;
+        let mut parsed = MonitorOptions::NONE;
+        for option in elements {
+            match terms::tuple_arity(option) {
+                Ok(2) => {
+                    let first = terms::tuple_element(option, 0).map_err(|_| BeamError::BadArg)?;
+                    let second = terms::tuple_element(option, 1).map_err(|_| BeamError::BadArg)?;
+                    match self.atom_name(first).as_deref() {
+                        Some("tag") => parsed.tag = Some(second),
+                        Some("alias") => {
+                            parsed.alias =
+                                Some(self.unalias_mode(second).ok_or(BeamError::BadArg)?);
+                        }
+                        _ => return Err(BeamError::BadArg),
+                    }
+                }
+                // The C's `case am_priority` precedes its `is_not_tuple(opt)` test, so the
+                // bare atom is the one non-tuple element that is accepted.
+                _ if self.atom_name(option).as_deref() == Some("priority") => {}
+                _ => return Err(BeamError::BadArg),
             }
-            Ok(_) | Err(_) => None,
+        }
+        Ok(parsed)
+    }
+
+    /// The `erlang:monitor/3` `{alias, Mode}` mode atom as a [`UnaliasMode`], or `None` for
+    /// any other word (which the caller answers with the oracle's `badarg`).
+    ///
+    /// The three names are the C's `am_explicit_unalias` / `am_demonitor` /
+    /// `am_reply_demonitor` (`bif.c:724-737`).
+    fn unalias_mode(&self, mode: Eterm) -> Option<UnaliasMode> {
+        match self.atom_name(mode).as_deref() {
+            Some("explicit_unalias") => Some(UnaliasMode::ExplicitUnalias),
+            Some("demonitor") => Some(UnaliasMode::Demonitor),
+            Some("reply_demonitor") => Some(UnaliasMode::ReplyDemonitor),
+            _ => None,
         }
     }
 
@@ -709,15 +766,16 @@ mod tests {
     }
 
     #[test]
-    fn monitor_three_tag_option_is_adopted_and_other_options_are_badarg() {
+    fn monitor_three_parses_tag_and_alias_options_and_rejects_the_rest() {
         let mut runtime = runtime();
         let process = atom(&mut runtime, "process");
         let pid = runtime.self_pid();
         let tag = atom(&mut runtime, "tag");
+        let alias = atom(&mut runtime, "alias");
         let x = atom(&mut runtime, "x");
 
-        // `{tag, Tag}` with an immediate tag is the oracle's only accepted option here, and it
-        // is now honoured: a reference, with the monitor on record.
+        // `{tag, Tag}` with an immediate tag is honoured: a reference, with the monitor on
+        // record.
         let tag_option = make_tuple(&mut runtime, &[tag, x]);
         let options = make_list(&mut runtime, &[tag_option]);
         let reference = call(&mut runtime, "erlang", "monitor", &[process, pid.to_eterm(), options])
@@ -728,6 +786,40 @@ mod tests {
             call(&mut runtime, "erlang", "demonitor", &[reference]).expect("demonitor/1"),
             atom(&mut runtime, "true")
         );
+
+        // `{alias, Mode}` is now adopted for all three modes: a reference is answered and the
+        // monitor is recorded (the alias itself lives in `beam_process`'s alias table, reached
+        // by the send path).
+        for mode in ["explicit_unalias", "demonitor", "reply_demonitor"] {
+            let mode_atom = atom(&mut runtime, mode);
+            let alias_option = make_tuple(&mut runtime, &[alias, mode_atom]);
+            let options = make_list(&mut runtime, &[alias_option]);
+            let reference = call(
+                &mut runtime,
+                "erlang",
+                "monitor",
+                &[process, pid.to_eterm(), options],
+            )
+            .unwrap_or_else(|error| panic!("erlang:monitor/3 with {{alias, {mode}}}: {error}"));
+            assert!(
+                is_reference(&mut runtime, reference),
+                "{{alias, {mode}}} answers a reference"
+            );
+            assert_eq!(monitor_count(&runtime, pid), 1, "the monitor is recorded");
+            assert_eq!(
+                call(&mut runtime, "erlang", "demonitor", &[reference]).expect("demonitor/1"),
+                atom(&mut runtime, "true")
+            );
+            assert_eq!(monitor_count(&runtime, pid), 0, "the monitor is removed");
+        }
+
+        // `priority` is accepted and ignored; the combination with a tag still works.
+        let priority = atom(&mut runtime, "priority");
+        let options = make_list(&mut runtime, &[priority, tag_option]);
+        let reference = call(&mut runtime, "erlang", "monitor", &[process, pid.to_eterm(), options])
+            .expect("erlang:monitor/3 with priority");
+        assert!(is_reference(&mut runtime, reference));
+        call(&mut runtime, "erlang", "demonitor", &[reference]).expect("demonitor/1");
 
         // A **non-immediate** tag (a heap term) is the typed `beam_process` capability gap:
         // a monitor record is a plain value the collector never scans.
@@ -740,6 +832,22 @@ mod tests {
             crate::error::unsupported_reason(&error).is_some(),
             "a non-immediate tag is a capability gap: {error}"
         );
+
+        // An `{alias, Mode}` whose `Mode` is not one of the three atoms — an unknown atom, or a
+        // plain (monitor) reference — is the oracle's `badarg`.
+        for mode in [atom(&mut runtime, "nope"), call(&mut runtime, "erlang", "make_ref", &[])
+            .expect("make_ref/0")]
+        {
+            let bogus_alias = make_tuple(&mut runtime, &[alias, mode]);
+            let bogus = make_list(&mut runtime, &[bogus_alias]);
+            assert!(
+                matches!(
+                    call(&mut runtime, "erlang", "monitor", &[process, pid.to_eterm(), bogus]),
+                    Err(BeamError::BadArg)
+                ),
+                "{{alias, {mode:?}}} is badarg"
+            );
+        }
 
         // An unknown atom and a 3-tuple are the oracle's `badarg`; so is a non-list.
         let foo = atom(&mut runtime, "foo");
