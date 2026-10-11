@@ -29,8 +29,10 @@
 //! `test_heap`/`allocate_heap`), which a tight **non-allocating** loop — the one
 //! shape that can monopolise a scheduler — never touches. [`ExecutionContext::reduce`]
 //! closes that gap: it is called **once per interpreted instruction** with `n = 1`,
-//! after the instruction succeeded, so a host can price instructions rather than heap
-//! admissions, and can pre-empt by returning its own typed error.
+//! **before** the instruction's body runs (C's `DISPATCH` order), so a host can price
+//! instructions rather than heap admissions and can pre-empt by returning its own typed
+//! error — which leaves the instruction **un-applied** and the machine parked on it, so
+//! a `Machine::resume_outcome` at that address applies it **exactly once**.
 //!
 //! # The loop under test
 //!
@@ -41,9 +43,9 @@
 //!
 //! The `label` marker is itself an instruction the loop executes each time (the jump
 //! target is the label's own code index), which is why an `N`-call run charges
-//! `3·N + 1` reductions: `N` full iterations plus the final iteration's `label` (its
-//! raising `bif0` is **not** charged — `drive` charges only after the instruction
-//! succeeded).
+//! `3·N + 2` reductions: `N` full iterations plus the final iteration's `label` **and**
+//! its raising `bif0` (the charge precedes the body, so the instruction that ends the
+//! run is priced too).
 //!
 //! # One `drive` call is one slice — and a suspend ends it
 //!
@@ -173,8 +175,8 @@ fn counting_loop_module() -> (Module, beam_term::Atom) {
 const SUCCESSFUL_CALLS: u32 = 5;
 const INSTRUCTIONS_PER_ITERATION: u64 = 3;
 /// The exact reduction count of an [`SUCCESSFUL_CALLS`]-call run: `N` full iterations
-/// plus the final iteration's `label`.
-const CHARGES_FOR_CALLS: u64 = INSTRUCTIONS_PER_ITERATION * SUCCESSFUL_CALLS as u64 + 1;
+/// plus the final iteration's `label` **and its raising `bif0`**.
+const CHARGES_FOR_CALLS: u64 = INSTRUCTIONS_PER_ITERATION * SUCCESSFUL_CALLS as u64 + 2;
 
 // ---------------------------------------------------------------------------
 // A receive that suspends, and a module that suspends twice
@@ -444,8 +446,9 @@ fn reductions_counts_exactly_the_interpreted_instructions() {
         .expect_err("the counter BIF stops the loop");
     assert_eq!(reason(err), "unsupported_opcode: stop");
 
-    // `N` full iterations (label + bif0 + jump) plus the final iteration's label —
-    // the raising `bif0` is never charged.
+    // `N` full iterations (label + bif0 + jump) plus the final iteration's label
+    // **and its raising `bif0`** — the charge precedes the body, so the raising
+    // instruction is priced.
     assert_eq!(machine.reductions(), CHARGES_FOR_CALLS);
     // The failing call counts as a call (it is the `N + 1`th).
     assert_eq!(ctx.calls, SUCCESSFUL_CALLS + 1);
@@ -512,8 +515,12 @@ fn a_host_that_pre_empts_through_reduce_stops_the_loop_with_its_own_error() {
     // `BUDGET` charges were accepted, and the `BUDGET + 1`th returned the error.
     assert_eq!(ctx.charges.len() as u32, BUDGET + 1);
     assert_eq!(machine.reductions(), u64::from(BUDGET) + 1);
-    // 8 charges = two full iterations (6) plus `label` + `bif0` of the third.
-    assert_eq!(ctx.calls, 3);
+    // The pre-empted instruction is parked, not applied: it is the third iteration's
+    // `bif0` (code index 1 of `counting_loop_module`).
+    assert_eq!(machine.current_code(), Some((0, 1)));
+    // 8 charges = two full iterations (6) plus the third iteration's `label` and its
+    // pre-empted `bif0`, which never ran.
+    assert_eq!(ctx.calls, 2);
 }
 
 // ---------------------------------------------------------------------------
