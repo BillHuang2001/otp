@@ -429,11 +429,13 @@ Structural facts that are not numbers (and so belong here):
 - `slice` runs one call per process, while `foreign`/`list_walk`/`copy_bound`/`gc_bound` loop many ops per
   process at a per-runtime loop count `N`, so peak RSS is like-for-like only for `slice`.
 
-> **`ERTS_STDLIB_DIR` note (a real `beam_rt` behavior):** the Rust runtime resolves its system code path
-> by spawning `erl` once per OS process unless `ERTS_STDLIB_DIR` is pre-set, so that spawn is inside the
-> `_startup_ms` metric (and the `baseline`/`slice`/`foreign`/`list_walk`/`copy_bound`/`gc_bound` walls). `bench`
-> does **not** set it — the harness is a pure driver/observer and never mutates the runtime's environment
-> beyond argv — and the per-op/per-call/per-element metric cancels the cost.
+> **`ERTS_STDLIB_DIR` note (a real `beam_rt` behavior):** the Rust runtime resolves its system `ebin` path with
+> a **native filesystem probe** (`crates/beam_rt/src/codeserver.rs`: `$ERTS_STDLIB_DIR` when set, else the
+> standard OTP installation layout under the `erl` on `$PATH` — *resolved to a path, never executed* — then this
+> executable's ancestors, `$ERL_TOP`, and standard prefixes); the system `erl` is only *run* as a last resort for
+> an installation that layout cannot see. Setting `$ERTS_STDLIB_DIR` still short-circuits the probe.
+> `bench` does **not** set it — the harness is a pure driver/observer and never mutates the runtime's environment
+> beyond argv — and the per-op/per-call/per-element metric cancels any remaining startup cost by construction.
 
 ## Reading the current sys-vs-rust gap (verified)
 
