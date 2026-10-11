@@ -500,8 +500,10 @@ Remaining labelling wrinkles — none fabricates a value:
 
 The `foreign`/`list_walk`/`copy_bound`/`gc_bound` startup-cancelled methodology is implemented exactly as
 `RESULTS.md` states (startup-cancelled `(mean wall@N − mean wall@0) / N`), and the registered-BIF
-`~116 ns/call` headline is **not** produced here — it is a `beam_rt` measurement
-(`../crates/beam_rt/CONTEXT.md`, `examples/perf_bif.rs`).
+dispatch cost — **≈ 79–96 ns/call** for the non-inlinable `call_ext` round trip
+(`../../crates/beam_rt/PERF.md`, *Registered-BIF (non-inlinable) per-call*) and **≈ 76 ns/iter** for
+`pb:tr/2`'s `trunc/1` (`../../crates/beam_rt/TRACE_AND_PERF.md`, *Dispatch cost (registered-BIF path)*) —
+is **not** produced here; it is a `beam_rt` measurement.
 
 ## See Also
 - `RESULTS.md` → the current results summary (one table per workload category, exact reproduction
