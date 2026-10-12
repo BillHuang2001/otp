@@ -973,6 +973,395 @@ fn resolve_send_target_maps_pids_and_live_aliases_and_rejects_other_references()
     }
 }
 
+/// Puts the runtime's **own** reference allocator onto `id`, so its next draw mints exactly `id`.
+///
+/// [`beam_process::RefAllocator`] is monotone from `0`, so advancing a fresh allocator `id` times
+/// lands the *next* draw on `id`: the deterministic way to force the runtime's reference id space
+/// and the process table's onto the same number (the collision HAZARD-2 covers).
+fn force_next_reference_id(rt: &mut Runtime, id: u64) {
+    let mut allocator = beam_process::RefAllocator::new();
+    for _ in 0..id {
+        allocator.next();
+    }
+    rt.refs = allocator;
+}
+
+/// The **id-collision regression guard** for the provenance bridge
+/// ([`super::alias::alias_destination`]).
+///
+/// This runtime has **two independent** reference id spaces, both monotone `u64` from `0`, and both
+/// encode the very same on-heap thing `[make_header(3, REF_SUBTAG), node=0, serial=0, id]`:
+///
+/// * [`Runtime::refs`](crate::Runtime) — fed by `erlang:make_ref/0`, the NIF `make_ref`, the
+///   `erlang:send_after/3`/`start_timer` timer references and `seq_trace`;
+/// * the [`ProcessTable`]'s own allocator — fed by every `erlang:monitor/2,3` and `erlang:alias/0,1`
+///   (the `{alias, Mode}` monitor form included).
+///
+/// Resolving a `send` destination by its **decoded id** alone would therefore deliver a bare
+/// `make_ref/0` (or a timer reference) to a live alias's owner. The destination is classified by
+/// **provenance** first, so a bare runtime-minted reference is never an alias — even when its id
+/// coincides with one. The test forces the coincidence deterministically (both allocators are put on
+/// the same id), pins that the id-based lookup *would* have resolved (the pre-fix behaviour), and
+/// then asserts that all three `send` entry points reject the colliding reference with the typed
+/// `badarg` and deliver nothing.
+#[test]
+fn resolve_send_target_rejects_a_bare_reference_that_collides_with_a_live_alias() {
+    let mut rt = runtime();
+    let owner = rt.self_pid();
+
+    // 1. A live alias minted through the **real BIF** (so the runtime's provenance registry is
+    //    filled exactly as production fills it) from the process table's own allocator.
+    let alias_term = {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        ctx.call_bif("erlang", "alias", 1, &[NIL])
+            .expect("erlang:alias([])")
+    };
+    let alias = MonitorRef::from_eterm(alias_term).expect("an alias is a reference");
+
+    // 2. Force the runtime's own allocator onto the alias's id before **each** mint, so the
+    //    `make_ref/0` and the timer reference both carry exactly the alias's id.
+    force_next_reference_id(&mut rt, alias.id());
+    let bare_term = {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        ctx.call_bif("erlang", "make_ref", 0, &[])
+            .expect("erlang:make_ref/0")
+    };
+    force_next_reference_id(&mut rt, alias.id());
+    let timer_term = {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        ctx.call_bif(
+            "erlang",
+            "send_after",
+            3,
+            &[make_small(600_000), owner.to_eterm(), make_small(1)],
+        )
+        .expect("erlang:send_after/3")
+    };
+
+    // 3. The coincidence is real: three references, one id — and the id-based lookup WOULD have
+    //    resolved both colliding references to the alias (the pre-fix wrong delivery).
+    let id_of = |term: Eterm| MonitorRef::from_eterm(term).expect("a reference").id();
+    assert_eq!(id_of(bare_term), alias.id(), "the bare reference collides");
+    assert_eq!(id_of(timer_term), alias.id(), "the timer reference collides");
+    assert_eq!(
+        rt.processes.resolve_alias(MonitorRef::from_eterm(bare_term).expect("a reference")),
+        Some(owner),
+        "a by-id lookup resolves the bare reference to the alias owner — the hazard being guarded"
+    );
+    assert_eq!(
+        rt.processes.resolve_alias(MonitorRef::from_eterm(timer_term).expect("a reference")),
+        Some(owner),
+        "and the timer reference to the very same owner"
+    );
+
+    // 4. Provenance still tells the three apart.
+    assert_eq!(
+        rt.local_reference(alias_term),
+        Some(Some(alias)),
+        "the alias term's provenance is the alias reference"
+    );
+    assert_eq!(
+        rt.local_reference(bare_term),
+        Some(None),
+        "a make_ref/0 term is a bare runtime-minted reference"
+    );
+    assert_eq!(
+        rt.local_reference(timer_term),
+        Some(None),
+        "a timer reference is a bare runtime-minted reference"
+    );
+
+    // 5. Every send entry point rejects both colliding references and nothing is delivered.
+    {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        assert!(
+            matches!(ctx.resolve_send_target(bare_term), Err(BeamError::BadArg)),
+            "a bare reference must not resolve as the live alias it collides with"
+        );
+        assert!(
+            matches!(
+                ctx.resolve_send_target(timer_term),
+                Err(BeamError::BadArg)
+            ),
+            "a timer reference must not resolve as the live alias it collides with"
+        );
+        for (label, term) in [("make_ref/0", bare_term), ("timer", timer_term)] {
+            assert!(
+                matches!(ctx.send_message(term, make_small(9)), Err(BeamError::BadArg)),
+                "the compiled send must reject the colliding {label} reference"
+            );
+            assert!(
+                matches!(
+                    ctx.call_bif("erlang", "send", 2, &[term, make_small(9)]),
+                    Err(BeamError::BadArg)
+                ),
+                "the erlang:send/2 BIF must reject the colliding {label} reference"
+            );
+        }
+        assert_eq!(
+            queued_payloads(ctx.runtime, owner),
+            Vec::<Eterm>::new(),
+            "not one refused destination delivered anything to the alias owner"
+        );
+    }
+
+    // 6. The live alias itself is untouched by the colliding references and still resolves.
+    assert_eq!(
+        rt.processes.resolve_alias(alias),
+        Some(owner),
+        "the alias is still live after the refusals"
+    );
+    let ctx = RuntimeContext::new(&mut rt);
+    let (target, consume) = ctx
+        .resolve_send_target(alias_term)
+        .expect("the live alias still resolves");
+    assert_eq!(target, owner, "the alias still names its owner");
+    assert_eq!(consume, Some(alias), "and still yields the reference to consume");
+}
+
+/// The provenance classification changes **nothing** for the references the process table minted: a
+/// live alias still resolves to its owner plus the reference to consume, and a plain
+/// `erlang:monitor/2` reference is still the typed `badarg` on every send entry point.
+#[test]
+fn a_table_minted_alias_still_resolves_and_a_plain_monitor_reference_is_rejected() {
+    let mut rt = runtime();
+    let owner = rt.self_pid();
+    let process = rt.intern("process");
+    // Both references are minted through the **real BIFs**, so their provenance entries are exactly
+    // the ones production writes (`alias_1`, `monitor_process`).
+    let (alias_term, monitor_term) = {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        let alias = ctx
+            .call_bif("erlang", "alias", 1, &[NIL])
+            .expect("erlang:alias([])");
+        let monitor = ctx
+            .call_bif("erlang", "monitor", 2, &[process, owner.to_eterm()])
+            .expect("erlang:monitor(process, self())");
+        (alias, monitor)
+    };
+    let alias = MonitorRef::from_eterm(alias_term).expect("an alias is a reference");
+    let monitor = MonitorRef::from_eterm(monitor_term).expect("a monitor ref is a reference");
+    assert_ne!(alias, monitor, "the table minted two distinct references");
+
+    assert_eq!(
+        rt.local_reference(alias_term),
+        Some(Some(alias)),
+        "an alias term is recorded as its alias reference"
+    );
+    assert_eq!(
+        rt.local_reference(monitor_term),
+        Some(Some(monitor)),
+        "a monitor term is recorded as its monitor reference"
+    );
+
+    {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        let (target, consume) = ctx
+            .resolve_send_target(alias_term)
+            .expect("a live alias is a destination");
+        assert_eq!(target, owner, "an alias resolves to its owner");
+        assert_eq!(consume, Some(alias), "a reply_demonitor alias must be consumed");
+
+        assert!(
+            matches!(
+                ctx.resolve_send_target(monitor_term),
+                Err(BeamError::BadArg)
+            ),
+            "a plain monitor reference is not an alias"
+        );
+        assert!(
+            matches!(
+                ctx.send_message(monitor_term, make_small(4)),
+                Err(BeamError::BadArg)
+            ),
+            "a plain monitor reference is not a compiled-send destination"
+        );
+        assert!(
+            matches!(
+                ctx.call_bif("erlang", "send", 2, &[monitor_term, make_small(4)]),
+                Err(BeamError::BadArg)
+            ),
+            "a plain monitor reference is not a send-BIF destination"
+        );
+        assert_eq!(
+            queued_payloads(ctx.runtime, owner),
+            Vec::<Eterm>::new(),
+            "the refused monitor reference delivered nothing"
+        );
+    }
+}
+
+/// The four arms of the ONE provenance helper — [`Runtime::local_reference`] (and its
+/// [`Runtime::is_known_local_reference`] predicate) — which the send path and the timer predicates
+/// share:
+///
+/// * a `make_ref/0` term and a timer reference are **bare** runtime-minted references → `Some(None)`;
+/// * a monitor/alias reference is → `Some(Some(reference))`;
+/// * a term this runtime did **not** mint (a reference decoded from an external term — here
+///   `binary_to_term(term_to_binary(Alias))`) has **unknown provenance** → `None`, so the
+///   resolution falls back to the id the term encodes and still names the live alias.
+#[test]
+fn local_reference_classifies_all_four_provenance_arms() {
+    let mut rt = runtime();
+    let owner = rt.self_pid();
+    let process = rt.intern("process");
+    // Both table-minted references come from the **real BIFs**, so their provenance entries are the
+    // ones production writes.
+    let (alias_term, monitor_term) = {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        let alias = ctx
+            .call_bif("erlang", "alias", 1, &[NIL])
+            .expect("erlang:alias([])");
+        let monitor = ctx
+            .call_bif("erlang", "monitor", 2, &[process, owner.to_eterm()])
+            .expect("erlang:monitor(process, self())");
+        (alias, monitor)
+    };
+    let alias = MonitorRef::from_eterm(alias_term).expect("an alias is a reference");
+    let monitor = MonitorRef::from_eterm(monitor_term).expect("a monitor ref is a reference");
+
+    let (bare_term, timer_term, copy_term) = {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        let bare = ctx
+            .call_bif("erlang", "make_ref", 0, &[])
+            .expect("erlang:make_ref/0");
+        let timer = ctx
+            .call_bif(
+                "erlang",
+                "send_after",
+                3,
+                &[make_small(600_000), owner.to_eterm(), make_small(1)],
+            )
+            .expect("erlang:send_after/3");
+        // A **copy** of the alias: `binary_to_term(term_to_binary(Alias))` materializes a fresh
+        // reference term the runtime never minted, so it carries the alias's id but no provenance.
+        let image = ctx
+            .call_bif("erlang", "term_to_binary", 1, &[alias_term])
+            .expect("term_to_binary of the alias");
+        let copy = ctx
+            .call_bif("erlang", "binary_to_term", 1, &[image])
+            .expect("binary_to_term of the alias image");
+        (bare, timer, copy)
+    };
+
+    assert_eq!(
+        rt.local_reference(bare_term),
+        Some(None),
+        "make_ref/0 is a bare runtime-minted reference"
+    );
+    assert_eq!(
+        rt.local_reference(timer_term),
+        Some(None),
+        "a timer reference is a bare runtime-minted reference"
+    );
+    assert_eq!(
+        rt.local_reference(alias_term),
+        Some(Some(alias)),
+        "an alias term is recorded as its alias reference"
+    );
+    assert_eq!(
+        rt.local_reference(monitor_term),
+        Some(Some(monitor)),
+        "a monitor term is recorded as its monitor reference"
+    );
+    assert_eq!(
+        rt.local_reference(copy_term),
+        None,
+        "a decoded copy was not minted here, so its provenance is unknown"
+    );
+    assert!(
+        rt.is_known_local_reference(alias_term),
+        "an alias reference is a local reference"
+    );
+    assert!(
+        !rt.is_known_local_reference(copy_term),
+        "a decoded copy is not a reference this runtime minted"
+    );
+    assert_eq!(
+        MonitorRef::from_eterm(copy_term).expect("a reference").id(),
+        alias.id(),
+        "the copy nonetheless names the same id"
+    );
+
+    // Unknown provenance falls back to the id the term encodes — the `binary_to_term`'d alias route
+    // must still resolve the live alias it names (this is the fallback arm the class-first
+    // classification deliberately keeps).
+    let ctx = RuntimeContext::new(&mut rt);
+    let (target, consume) = ctx
+        .resolve_send_target(copy_term)
+        .expect("a decoded copy of a live alias still resolves");
+    assert_eq!(target, owner, "the decoded copy names the alias owner");
+    assert_eq!(
+        consume,
+        Some(alias),
+        "and yields the reference to consume, exactly as the original term does"
+    );
+}
+
+/// **HAZARD-2 — a known divergence from the oracle that `beam_rt` cannot close.**
+///
+/// This runtime has two **independent** reference id spaces
+/// ([`resolve_send_target_rejects_a_bare_reference_that_collides_with_a_live_alias`]) and both mint
+/// the very same on-heap thing `[make_header(3, REF_SUBTAG), 0, 0, id]`. Term comparison
+/// ([`beam_term::compare::eq`] — `=:=`) compares that payload, so a bare `erlang:make_ref/0`
+/// reference and a monitor/alias reference that happen to carry the **same id** are `=:=` here. The
+/// oracle has **one** id space, so it can never produce such a pair: this is a divergence, not
+/// desirable behaviour.
+///
+/// It is **not closable from `beam_rt`**: the provenance registry that tells the two mints apart is
+/// keyed by the term *word* (which is why the send path is already correct), while `=:=` is a
+/// `beam_term` operation over the payload `[hdr, 0, 0, id]`. Closing it needs the two allocators
+/// unified onto one id space — or aliases keyed by the reference term — which is **owned by
+/// `../beam_process/`** (`RefAllocator`/`MonitorRef` vs `Runtime::refs`).
+#[test]
+fn a_bare_reference_and_a_monitor_reference_with_equal_ids_are_exactly_equal() {
+    let mut rt = runtime();
+    // A live alias minted through the real BIF, from the process table's own allocator.
+    let alias_term = {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        ctx.call_bif("erlang", "alias", 1, &[NIL])
+            .expect("erlang:alias([])")
+    };
+    let alias = MonitorRef::from_eterm(alias_term).expect("an alias is a reference");
+
+    // Put the runtime's own allocator on the alias's id, then mint a bare `make_ref/0` reference.
+    force_next_reference_id(&mut rt, alias.id());
+    let bare_term = {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        ctx.call_bif("erlang", "make_ref", 0, &[])
+            .expect("erlang:make_ref/0")
+    };
+
+    // The two mints carry the same id ...
+    assert_eq!(
+        MonitorRef::from_eterm(bare_term).expect("a reference").id(),
+        alias.id(),
+        "the two references carry the same id"
+    );
+    // ... and compare `=:=` (the divergence): `beam_term` compares the `[hdr, 0, 0, id]` payload.
+    assert!(
+        beam_term::compare::eq(bare_term, alias_term, rt.atoms()),
+        "HAZARD-2: a bare make_ref/0 and a monitor/alias reference with the same id compare =:= \
+         here — a divergence from the oracle's single id space, not closable from beam_rt"
+    );
+    // The arithmetic `==` ordering agrees with `=:=` for two reference terms.
+    assert!(
+        beam_term::compare::cmp_arith(bare_term, alias_term, rt.atoms()).is_eq(),
+        "the arithmetic == ordering agrees with =:= for two references"
+    );
+    // Provenance still tells them apart — which is what keeps the *send* path correct.
+    assert_eq!(
+        rt.local_reference(alias_term),
+        Some(Some(alias)),
+        "the alias's provenance is still the alias reference"
+    );
+    assert_eq!(
+        rt.local_reference(bare_term),
+        Some(None),
+        "the bare reference's provenance is still 'not an alias'"
+    );
+}
+
 #[test]
 fn receive_next_peeks_and_the_scan_operations_position_the_mailbox() {
     let mut rt = runtime();
