@@ -596,6 +596,335 @@ fn corpus() -> Vec<Case> {
     ]
 }
 
+/// The option vocabulary [`option_flag_corpus`]'s closures build their argument
+/// terms from.
+///
+/// These are exactly the option *names* a case above mentions but the shared
+/// [`Fixture::new`] seed does not carry. Every one must be interned on the
+/// fixture before the sweep, for two reasons: `Fixture::atom`/`a` resolve a name
+/// through that table, and `options::parse` names each flag atom through it too.
+const OPTION_FLAG_ATOMS: &[&str] = &[
+    "caseless",
+    "dotall",
+    "multiline",
+    "dollar_endonly",
+    "extended",
+    "ungreedy",
+    "firstline",
+    "no_auto_capture",
+    "newline",
+    "crlf",
+    "anchored",
+    "notempty",
+    "notempty_atstart",
+    "notbol",
+    "noteol",
+    "match_limit",
+];
+
+/// The second corpus: the run/compile **option flags** (25 cases).
+///
+/// Each case is a `re:run` whose option list switches on one (or, for the
+/// combined cases, two) of `parse_options`' flags, so the byte-for-byte result
+/// pins the flag's *effect* — not merely that the option is accepted. The flags
+/// covered, with their cases:
+///
+/// * `caseless` (1–4) — a folded literal, a folded backreference, and the
+///   `nomatch` when the fold cannot bridge the pattern;
+/// * `dotall` (5–6) — `.` crossing a newline, and refusing to;
+/// * `multiline` (7–8) — `$`/`^` on an interior line boundary, incl. `global`;
+/// * `dollar_endonly` (9) — `$` restricted to the very end;
+/// * `extended` (10–11) — free whitespace outside a class, literal inside one;
+/// * `ungreedy` (12–13) — the default inversion, and the explicit-`?` flip-back;
+/// * `firstline` (14) — the match must start on the first line;
+/// * `no_auto_capture` (15) — unnamed groups stop capturing;
+/// * `{newline, crlf}` (16) — `^` after a CRLF pair;
+/// * `anchored` (17–18) — the start position is not searched;
+/// * `notempty` (19) / `notempty_atstart` (20) — the two empty-match refusals;
+/// * `notbol` (21) / `noteol` (22) — the two end-anchor suppressions;
+/// * `report_errors` (23–24) with `{match_limit, 0}` (24–25) — the limit's
+///   exhaustion is the returned `{error, match_limit}` value, or `nomatch`.
+fn option_flag_corpus() -> Vec<Case> {
+    vec![
+        // ---- caseless ---------------------------------------------------
+        Case {
+            name: "caseless/simple",
+            erl: r#"re:run("ABC","abc",[caseless])"#,
+            run: |f| {
+                let subject = chr(f, "ABC");
+                let pattern = bin(f, b"abc");
+                let caseless = a(f, "caseless");
+                f.run_opts(subject, pattern, &[caseless])
+            },
+        },
+        Case {
+            name: "caseless/all-index",
+            erl: r#"re:run("xabcy","(b)(c)",[caseless,{capture,all,index}])"#,
+            run: |f| {
+                let subject = chr(f, "xabcy");
+                let pattern = bin(f, b"(b)(c)");
+                let caseless = a(f, "caseless");
+                let all = a(f, "all");
+                let spec = cap_ty(f, all, "index");
+                f.run_opts(subject, pattern, &[caseless, spec])
+            },
+        },
+        Case {
+            name: "caseless/backref",
+            erl: r#"re:run("aA","(a)\\1",[caseless])"#,
+            run: |f| {
+                let subject = chr(f, "aA");
+                let pattern = bin(f, b"(a)\\1");
+                let caseless = a(f, "caseless");
+                f.run_opts(subject, pattern, &[caseless])
+            },
+        },
+        Case {
+            name: "caseless/nomatch",
+            erl: r#"re:run("ABC","abd",[caseless])"#,
+            run: |f| {
+                let subject = chr(f, "ABC");
+                let pattern = bin(f, b"abd");
+                let caseless = a(f, "caseless");
+                f.run_opts(subject, pattern, &[caseless])
+            },
+        },
+        // ---- dotall -----------------------------------------------------
+        Case {
+            name: "dotall/match",
+            erl: r#"re:run("a\nb","a.b",[dotall])"#,
+            run: |f| {
+                let subject = chr(f, "a\nb");
+                let pattern = bin(f, b"a.b");
+                let dotall = a(f, "dotall");
+                f.run_opts(subject, pattern, &[dotall])
+            },
+        },
+        Case {
+            name: "dotall/nomatch-without",
+            erl: r#"re:run("a\nb","a.b")"#,
+            run: |f| {
+                let subject = chr(f, "a\nb");
+                let pattern = bin(f, b"a.b");
+                f.run_opts(subject, pattern, &[])
+            },
+        },
+        // ---- multiline --------------------------------------------------
+        Case {
+            name: "multiline/end-anchor",
+            erl: r#"re:run("a\nb","b$",[multiline])"#,
+            run: |f| {
+                let subject = chr(f, "a\nb");
+                let pattern = bin(f, b"b$");
+                let multiline = a(f, "multiline");
+                f.run_opts(subject, pattern, &[multiline])
+            },
+        },
+        Case {
+            name: "multiline/global-caret",
+            erl: r#"re:run("a\nb\n","^",[global,multiline])"#,
+            run: |f| {
+                let subject = chr(f, "a\nb\n");
+                let pattern = bin(f, b"^");
+                let global = a(f, "global");
+                let multiline = a(f, "multiline");
+                f.run_opts(subject, pattern, &[global, multiline])
+            },
+        },
+        // ---- dollar_endonly ---------------------------------------------
+        Case {
+            name: "dollar_endonly/nomatch",
+            erl: r#"re:run("a\nb","a$",[dollar_endonly])"#,
+            run: |f| {
+                let subject = chr(f, "a\nb");
+                let pattern = bin(f, b"a$");
+                let dollar_endonly = a(f, "dollar_endonly");
+                f.run_opts(subject, pattern, &[dollar_endonly])
+            },
+        },
+        // ---- extended ---------------------------------------------------
+        Case {
+            name: "extended/whitespace",
+            erl: r#"re:run("abc","a  b  c",[extended])"#,
+            run: |f| {
+                let subject = chr(f, "abc");
+                let pattern = bin(f, b"a  b  c");
+                let extended = a(f, "extended");
+                f.run_opts(subject, pattern, &[extended])
+            },
+        },
+        Case {
+            name: "extended/class-space",
+            erl: r#"re:run("abc","a[ ]b[ ]c",[extended])"#,
+            run: |f| {
+                let subject = chr(f, "abc");
+                let pattern = bin(f, b"a[ ]b[ ]c");
+                let extended = a(f, "extended");
+                f.run_opts(subject, pattern, &[extended])
+            },
+        },
+        // ---- ungreedy ---------------------------------------------------
+        Case {
+            name: "ungreedy/lazy-default",
+            erl: r#"re:run("aaa","a+",[ungreedy])"#,
+            run: |f| {
+                let subject = chr(f, "aaa");
+                let pattern = bin(f, b"a+");
+                let ungreedy = a(f, "ungreedy");
+                f.run_opts(subject, pattern, &[ungreedy])
+            },
+        },
+        Case {
+            name: "ungreedy/flips-explicit-lazy",
+            erl: r#"re:run("aaa","a+?",[ungreedy])"#,
+            run: |f| {
+                let subject = chr(f, "aaa");
+                let pattern = bin(f, b"a+?");
+                let ungreedy = a(f, "ungreedy");
+                f.run_opts(subject, pattern, &[ungreedy])
+            },
+        },
+        // ---- firstline --------------------------------------------------
+        Case {
+            name: "firstline/nomatch",
+            erl: r#"re:run("x\naaa","a+",[firstline])"#,
+            run: |f| {
+                let subject = chr(f, "x\naaa");
+                let pattern = bin(f, b"a+");
+                let firstline = a(f, "firstline");
+                f.run_opts(subject, pattern, &[firstline])
+            },
+        },
+        // ---- no_auto_capture --------------------------------------------
+        Case {
+            name: "no_auto_capture/suppresses-groups",
+            erl: r#"re:run("xabcy","(b)(c)",[no_auto_capture])"#,
+            run: |f| {
+                let subject = chr(f, "xabcy");
+                let pattern = bin(f, b"(b)(c)");
+                let no_auto_capture = a(f, "no_auto_capture");
+                f.run_opts(subject, pattern, &[no_auto_capture])
+            },
+        },
+        // ---- {newline, crlf} --------------------------------------------
+        Case {
+            name: "newline_crlf/multiline-caret",
+            erl: r#"re:run("a\r\nb","^b",[multiline,{newline,crlf}])"#,
+            run: |f| {
+                let subject = chr(f, "a\r\nb");
+                let pattern = bin(f, b"^b");
+                let multiline = a(f, "multiline");
+                let crlf = a(f, "crlf");
+                let newline = pair(f, "newline", crlf);
+                f.run_opts(subject, pattern, &[multiline, newline])
+            },
+        },
+        // ---- anchored ---------------------------------------------------
+        Case {
+            name: "anchored/nomatch",
+            erl: r#"re:run("bac","a",[anchored,{capture,all,index}])"#,
+            run: |f| {
+                let subject = chr(f, "bac");
+                let pattern = bin(f, b"a");
+                let anchored = a(f, "anchored");
+                let all = a(f, "all");
+                let spec = cap_ty(f, all, "index");
+                f.run_opts(subject, pattern, &[anchored, spec])
+            },
+        },
+        Case {
+            name: "anchored/match",
+            erl: r#"re:run("abc","a",[anchored,{capture,all,index}])"#,
+            run: |f| {
+                let subject = chr(f, "abc");
+                let pattern = bin(f, b"a");
+                let anchored = a(f, "anchored");
+                let all = a(f, "all");
+                let spec = cap_ty(f, all, "index");
+                f.run_opts(subject, pattern, &[anchored, spec])
+            },
+        },
+        // ---- notempty / notempty_atstart --------------------------------
+        Case {
+            name: "notempty/refuses-empty",
+            erl: r#"re:run("","",[notempty,{capture,all,index}])"#,
+            run: |f| {
+                let subject = chr(f, "");
+                let pattern = bin(f, b"");
+                let notempty = a(f, "notempty");
+                let all = a(f, "all");
+                let spec = cap_ty(f, all, "index");
+                f.run_opts(subject, pattern, &[notempty, spec])
+            },
+        },
+        Case {
+            name: "notempty_atstart/match-later",
+            erl: r#"re:run("abc","b*",[notempty_atstart,{capture,all,index}])"#,
+            run: |f| {
+                let subject = chr(f, "abc");
+                let pattern = bin(f, b"b*");
+                let notempty_atstart = a(f, "notempty_atstart");
+                let all = a(f, "all");
+                let spec = cap_ty(f, all, "index");
+                f.run_opts(subject, pattern, &[notempty_atstart, spec])
+            },
+        },
+        // ---- notbol / noteol --------------------------------------------
+        Case {
+            name: "notbol/refuses-start",
+            erl: r#"re:run("abc","^a",[notbol])"#,
+            run: |f| {
+                let subject = chr(f, "abc");
+                let pattern = bin(f, b"^a");
+                let notbol = a(f, "notbol");
+                f.run_opts(subject, pattern, &[notbol])
+            },
+        },
+        Case {
+            name: "noteol/refuses-end",
+            erl: r#"re:run("abc","c$",[noteol])"#,
+            run: |f| {
+                let subject = chr(f, "abc");
+                let pattern = bin(f, b"c$");
+                let noteol = a(f, "noteol");
+                f.run_opts(subject, pattern, &[noteol])
+            },
+        },
+        // ---- report_errors / {match_limit, 0} ---------------------------
+        Case {
+            name: "report_errors/match",
+            erl: r#"re:run("abc","a",[report_errors])"#,
+            run: |f| {
+                let subject = chr(f, "abc");
+                let pattern = bin(f, b"a");
+                let report_errors = a(f, "report_errors");
+                f.run_opts(subject, pattern, &[report_errors])
+            },
+        },
+        Case {
+            name: "match_limit_zero/report-errors",
+            erl: r#"re:run("abc","a",[{match_limit,0},report_errors])"#,
+            run: |f| {
+                let subject = chr(f, "abc");
+                let pattern = bin(f, b"a");
+                let spec = pair(f, "match_limit", make_small(0));
+                let report_errors = a(f, "report_errors");
+                f.run_opts(subject, pattern, &[spec, report_errors])
+            },
+        },
+        Case {
+            name: "match_limit_zero/nomatch",
+            erl: r#"re:run("abc","a",[{match_limit,0}])"#,
+            run: |f| {
+                let subject = chr(f, "abc");
+                let pattern = bin(f, b"a");
+                let spec = pair(f, "match_limit", make_small(0));
+                f.run_opts(subject, pattern, &[spec])
+            },
+        },
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // The oracle side: one `erl -noshell -eval …` per case, bounded and skippable
 // ---------------------------------------------------------------------------
@@ -841,6 +1170,74 @@ fn the_live_oracle_agrees_on_the_re_corpus() {
 
     eprintln!(
         "[beam_bifs re] oracle cross-check RAN against '{}': {} cases agreed in {:?}.",
+        oracle.display(),
+        ran,
+        started.elapsed(),
+    );
+}
+
+/// The same differential sweep as [`the_live_oracle_agrees_on_the_re_corpus`],
+/// over [`option_flag_corpus`] — the run/compile **option flags**.
+///
+/// The fixture is the shared [`Fixture::new`] one plus [`OPTION_FLAG_ATOMS`], so
+/// each case's option atoms resolve both as term *constructors* (`a`) and as the
+/// names `options::parse` reads back off the list.
+///
+/// Skips **loudly** (and still passes) when no usable `erl` is on `$PATH`.
+#[test]
+fn oracle_cross_check_option_flags() {
+    let Some(oracle) = resolve_oracle() else {
+        eprintln!(
+            "[beam_bifs re] option-flag oracle cross-check SKIPPED: no usable `erl` on $PATH"
+        );
+        eprintln!("($ERTS_ORACLE unset or not executable, and no `erl` on $PATH).");
+        eprintln!("This test is NOT a pass — set $ERTS_ORACLE (or install Erlang/OTP).");
+        return;
+    };
+
+    let cases = option_flag_corpus();
+    let mut fx = Fixture::new();
+    // The option names the shared seed lacks (see `OPTION_FLAG_ATOMS`).
+    fx.atoms.seed(OPTION_FLAG_ATOMS.iter().copied());
+    let started = Instant::now();
+    let mut ran = 0usize;
+
+    for case in &cases {
+        // Our side, over the real dispatch path.
+        let ours = match (case.run)(&mut fx) {
+            Ok(term) => match fx.encode_hex(term) {
+                Ok(hex) => Answer::Hex(hex),
+                Err(e) => panic!(
+                    "case `{}` produced a term this crate cannot encode: {e:?}\n erl: {}",
+                    case.name, case.erl
+                ),
+            },
+            Err(_) => Answer::Raises,
+        };
+
+        // The oracle's answer for the same Erlang expression.
+        let Some(theirs) = oracle_answer(&oracle, case.erl) else {
+            eprintln!(
+                "[beam_bifs re] option-flag oracle cross-check SKIPPED (the oracle could not \
+                 answer case `{}`).",
+                case.name
+            );
+            return;
+        };
+
+        match (&ours, &theirs) {
+            (Answer::Raises, Answer::Raises) => {}
+            (Answer::Hex(ours), Answer::Hex(theirs)) if ours == theirs => {}
+            _ => panic!(
+                "case `{}` disagrees with the oracle\n erl:    {}\n oracle: {theirs:?}\n ours:   {ours:?}",
+                case.name, case.erl
+            ),
+        }
+        ran += 1;
+    }
+
+    eprintln!(
+        "[beam_bifs re] option-flag oracle cross-check RAN against '{}': {} cases agreed in {:?}.",
         oracle.display(),
         ran,
         started.elapsed(),
