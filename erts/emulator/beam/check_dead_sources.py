@@ -13,15 +13,15 @@
 #   class errs towards KEEPING a file.
 #
 # WHAT IT PROVES (decisive reference classes)
-#   A  BUILD/SCRIPT REFERENCE - a real build or script source names the file:
-#      the basename appears VERBATIM ("foo_drv.c") in any build/script source
-#      (.sh, .erl/.hrl, .escript, .nix, .toml, .yml/.yaml, Makefile*, *.mk/*.in/
-#      *.src/*.spec/*.rel/*.def/*.cmake/*.cfg/*.pro, *.ac/*.m4, configure,
-#      otp_build, CI yaml, xcomp/*.conf, the extension-less codegen tools in
+#   A  BUILD/SCRIPT REFERENCE - a real build or script source names the file: the
+#      basename appears VERBATIM ("foo_drv.c") in any build/script source (.sh,
+#      .erl/.hrl, .escript, .nix, .toml, .yml/.yaml, Makefile*, *.mk/*.in/*.src/
+#      *.spec/*.rel/*.def/*.cmake/*.cfg/*.pro, *.ac/*.m4, configure, otp_build,
+#      CI yaml, xcomp/*.conf, the extension-less codegen tools in
 #      erts/emulator/utils/, *.S, ...), or its stem appears as a whole word in a
 #      makefile-role source, or a $(wildcard ...) pattern matches the path.
-#   B  INCLUDE REFERENCE - an #include of the basename (or a path ending in it)
-#      in any other C-family source.
+#   B  INCLUDE REFERENCE - an #include of the basename (or a path ending in it) in
+#      any other C-family source.
 #   C  SYMBOL REFERENCE - an identifier the file defines (function definition,
 #      #define, typedef name) appears as a whole word in any other C-family or
 #      build/config source.
@@ -31,27 +31,24 @@
 #
 # ADVISORY (printed, never decisive)
 #   A mention in any other tracked text file (docs, CONTEXT.md, erts_rust
-#   sources, ...).  That is not a build/include/symbol reference, so it does not
-#   make a file live - it is reported only so a human can see why a grep "found"
-#   the name.
+#   sources, ...) is not a build/include/symbol reference, so it does not make a
+#   file live - it is reported only so a human can see why a grep "found" it.
 #
 # TWO TIERS
 #   STRICT (decisive)   A fixpoint / transitive-closure liveness analysis over the
-#                       build wiring.  A file is LIVE if it is
-#                         (a) a compilation unit named by a real object-list entry
-#                             - every make synthesis form is resolved back to the
-#                             sources it names:
-#                               $(VAR:%=$(OBJDIR)/%.o) / $(VAR:.c=.o)
-#                               $(patsubst %.c,$(OBJDIR)/%.o,$(VAR))
-#                               $(VAR:%=prefix/%.c) / $(addprefix D,$(notdir ...
-#                             - or covered by a $(wildcard ...) pattern, or
-#                         (b) named by a build/script/codegen source (class A), or
-#                         (c) a driver/NIF CT fixture owned by its *_SUITE.erl, or
-#                         (d) reached from a live file through an #include of its
-#                             basename or through a symbol it defines.
-#                       Everything else is STRICT DEAD.  Only candidate files
-#                       propagate liveness, so a reference that comes solely from
-#                       a DOC does NOT make a file live, and neither does text
+#                       build wiring.  A file is LIVE if it is (a) a compilation
+#                       unit named by a real object-list entry - every make
+#                       synthesis form is resolved back to the sources it names:
+#                       $(VAR:%=$(OBJDIR)/%.o) / $(VAR:.c=.o),
+#                       $(patsubst %.c,$(OBJDIR)/%.o,$(VAR)),
+#                       $(VAR:%=prefix/%.c) / $(addprefix D,$(notdir ...)) - or
+#                       covered by a $(wildcard ...) pattern, or (b) named by a
+#                       build/script/codegen source (class A), or (c) a driver/NIF
+#                       CT fixture owned by its *_SUITE.erl, or (d) reached from a
+#                       live file through an #include of its basename or through a
+#                       symbol it defines.  Everything else is STRICT DEAD.  Only
+#                       candidate files propagate liveness, so a reference from a
+#                       DOC alone does NOT make a file live, and neither does text
 #                       inside a never-compiled #if region (advisory section).
 #                       The deletion gate is "STRICT DEAD and not exempt" = 0.
 #   LOOSE (advisory)    The original single-pass A/B/C reference classes plus the
@@ -59,22 +56,21 @@
 #
 # NEVER-COMPILED #if REGIONS (advisory report section, never decisive)
 #   `#ifdef M` / `#if defined(M)` regions whose controlling macro M is never
-#   definable in this tree are reported as `file:line` + macro.  "Never
-#   definable" means, conservatively, ALL of:
-#     - M is not #define'd (or #undef'd) anywhere, even mid-line by a generator or
-#       in a commented-out `/* #define M */` enable path, and not a -D flag or an
-#       AC_DEFINE (configure.ac/xcomp) or a config.h.in template entry,
-#     - M is not a compiler/toolchain builtin or platform name ("_" / "__" names,
-#       HAVE_*, ERLANG_OSTYPE, DEBUG*, ETHR_*, AO_*, ZLIB*, PCRE*, ASMJIT*, ...),
-#     - M occurs in the tree only on preprocessor condition lines - a *use* in a
-#       C-family or build/config source would rule it out, but a mention in a doc
-#       or in a Rust comment is not a use and is ignored.
-#   Anything not decidable that way stays SILENT (no false positives), and a
-#   condition that is not a single macro (arithmetic, &&/||, function-like) is
-#   never reported.  `#ifndef M` with such an M is ALWAYS compiled, so its body is
-#   not a dead region.  These findings NEVER change the strict/actionable verdict
-#   or the exit status; a removal pass must still verify each block against the
-#   toolchain and the configure options.
+#   definable in this tree are reported as `file:line` + macro.  "Never definable"
+#   means, conservatively, ALL of: M is not #define'd (or #undef'd) anywhere, even
+#   mid-line by a generator or in a commented-out `/* #define M */` enable path,
+#   and not a -D flag or an AC_DEFINE (configure.ac/xcomp) or a config.h.in
+#   template entry; M is not a compiler/toolchain builtin or platform name ("_"/
+#   "__" names, HAVE_*, ERLANG_OSTYPE, DEBUG*, ETHR_*, AO_*, ZLIB*, PCRE*,
+#   ASMJIT*, ...); and M occurs in the tree only on preprocessor condition lines -
+#   a *use* in a C-family or build/config source would rule it out, but a mention
+#   in a doc or in a Rust comment is not a use and is ignored.  Anything not
+#   decidable that way stays SILENT (no false positives), and a condition that is
+#   not a single macro (arithmetic, &&/||, function-like) is never reported.
+#   `#ifndef M` with such an M is ALWAYS compiled, so its body is not a dead
+#   region.  These findings NEVER change the strict/actionable verdict or the exit
+#   status; a removal pass must still verify each block against the toolchain and
+#   the configure options.
 #
 # USAGE
 #   python3 check_dead_sources.py [--root DIR] [--write-report] [--explain GLOB]
@@ -155,58 +151,68 @@ WILDCARD_RE = re.compile(r"wildcard\s+([^)\n]*)")
 GLOB_CHARS = re.compile(r"[*?\[]")
 INCLUDE_RE = re.compile(r'#\s*include\s*[<"]([^">]+)[">]')
 TOKEN_RE = re.compile(r"[A-Za-z_]\w*")
+# A file-name-looking token: `[A-Za-z_][\w.\-]*\.<ext>` ending on a word boundary.
+# This is the SPEC regex; file_name_tokens() below must agree with it token for
+# token, and is used instead because the greedy `[\w.\-]*` backtracks once per
+# character of every identifier run - quadratic on the pathological inputs in the
+# tree (CT regex test outputs, the generated `configure` scripts): ~1.7 s over the
+# ~16 MB of files that even contain a `.ext` token, vs. a linear walk of the rare
+# `.ext` occurrences.  `DOT_EXT_RE` drives that walk and is also the exact
+# necessary prefilter for the spec regex: every BASENAME_RE match CONTAINS a
+# `\.ext\b`, so a file without one cannot contain a match.
+BASENAME_RE = re.compile(r"([A-Za-z_][\w.\-]*\.(?:c|h|cpp|hpp|cc|tab|inc|def))\b")
+DOT_EXT_RE = re.compile(r"\.(?:c|h|cpp|hpp|cc|tab|inc|def)\b")
+WORDDOT_RUN_RE = re.compile(r"[A-Za-z_][\w.\-]*")
+LABEL_START = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_")
+# `\w` for a str pattern is `ch.isalnum() or ch == '_'`; `[\w.\-]` adds `.`/`-`.
 MACRO_RE = re.compile(r"^\s*#\s*define\s+([A-Za-z_]\w*)", re.M)
 TYPEDEF_RE = re.compile(r"typedef[^;{}]*?([A-Za-z_]\w*)\s*;", re.S)
-# Line-start definition/prototype (OTP C style keeps these at column 0), which
-# covers both ANSI and K&R style.  `static`/`inline` definitions are FILE-LOCAL
-# and must never be used as evidence - e.g. bin_drv.c's static read_fill()
-# collides with the unrelated read_fill() of inet_drv.c.
+# Line-start definition/prototype (OTP C style keeps these at column 0), ANSI and
+# K&R alike.  `static`/`inline` definitions are FILE-LOCAL and never evidence -
+# bin_drv.c's static read_fill() collides with inet_drv.c's unrelated read_fill().
 FUNC_LINE_RE = re.compile(r"^([A-Za-z_][\w \t\*]*?)\b([A-Za-z_]\w*)\s*\(", re.M)
 GVAR_LINE_RE = re.compile(r"^([A-Za-z_][\w \t\*]*?)\b([A-Za-z_]\w*)\s*(\[[^\]]*\])?\s*=", re.M)
 HEADER_EXTS = {".h", ".hpp", ".inc"}
 
-# Object lists synthesised from a source registry - the object list names no
-# object token at all, so the registry variable must be resolved back to the
-# sources it names.
-#   $(VAR:%=$(OBJDIR)/%.o) / $(VAR:.c=.o)        - zlib's ZLIB_FILES, lib_src's
-#                                                  ETHREAD_LIB_SRC, ...
+# Object lists synthesised from a source registry name no object token at all, so
+# the registry variable must be resolved back to the sources it names.
+#   $(VAR:%=$(OBJDIR)/%.o) / $(VAR:.c=.o)   - zlib's ZLIB_FILES, ETHREAD_LIB_SRC
 SUBST_O_RE = re.compile(r"\$\(([A-Za-z_]\w*)\s*:((?:[^()\n]|\$\([^)\n]*\))*?\.o)\)")
-#   $(patsubst %.c,$(OBJDIR)/%.o,$(VAR))         - ASMJIT_OBJS over ASMJIT_CPP
+#   $(patsubst %.c,$(OBJDIR)/%.o,$(VAR))    - ASMJIT_OBJS over ASMJIT_CPP
 PATSUBST_O_RE = re.compile(r"\$\(\s*patsubst\s+%\.(?:c|cpp|cc)\s*,\s*"
                            r"(?:[^,()\n]|\$\([^)\n]*\))*?%\.o\s*,\s*\$\(([A-Za-z_]\w*)\)\s*\)")
-#   $(VAR:%=prefix/%.c)                          - ryu's RYU_SRC, zlib's ZLIB_SRC
+#   $(VAR:%=prefix/%.c)                     - ryu's RYU_SRC, zlib's ZLIB_SRC
 REGISTRY_SRC_RE = re.compile(r"\$\(\s*([A-Za-z_]\w*)\s*:\s*%=\s*([^)\n]*?%\.(?:c|cpp|cc))\s*\)")
 #   $(addprefix $(OBJDIR)/,$(notdir $(VAR:.c=.o))) - ERTS_INTERNAL_LIB_OBJS
 ADDPREFIX_NOTDIR_RE = re.compile(r"\$\(\s*addprefix\s+[^,()\n]*,\s*\$\(\s*notdir\s+"
                                  r"\$\(\s*([A-Za-z_]\w*)\s*:\s*\.c\s*=\s*\.o\s*\)\s*\)\s*\)")
 MAKE_ASSIGN_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*[:+]?=\s*(.*)$")
 # One item of a make variable that names sources: a bare object stem ("adler32")
-# or a source file, possibly reached through a make variable
-# ("$(ETHR_THR_LIB_BASE_DIR)/ethr_event.c").
+# or a source file, possibly via a make variable ("$(...)/ethr_event.c").
 SRC_TOKEN_RE = re.compile(r"^(?:[A-Za-z_][\w.\-]*|[^\s\\]*\.(?:c|cpp|cc))$")
 
 # A preprocessor condition/undef line.  `#else`/`#endif` are included: a name on
 # such a line can only be a comment (`#endif /* NAME */`), never a use.  Used to
-# prove that a macro name occurs ONLY as a condition (i.e. is neither defined nor
-# used by any code).
+# prove that a macro name occurs ONLY as a condition (neither defined nor used).
 COND_LINE_RE = re.compile(
     r"^[ \t]*#[ \t]*(?:if|ifdef|ifndef|elif|else|endif|undef)[^\n]*$", re.M)
-# re.M is REQUIRED: this regex is used both per-line (find_never_compiled_blocks)
-# and over a whole file text (Pass A's `finditer`, which must see every line).
+# re.M is REQUIRED: used both per-line (find_never_compiled_blocks) and over a
+# whole file text (Pass A's `finditer`, which must see every line).
 PP_LINE_RE = re.compile(r"^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b[ \t]*(.*?)[ \t]*$", re.M)
 IDENT_RE = re.compile(r"^[A-Za-z_]\w*$")
-# Every spelling that defines/undeclares a macro anywhere in the tree.  The
-# `#define`/`#undef` one is deliberately UNANCHORED: generators print their
-# `#define NAME` (and commented-out/disabled toggles spell it) mid-line, and a
-# macro emitted by a code generator IS definable here.
+# Every spelling that defines/undeclares a macro anywhere in the tree.  Kept as
+# three patterns on purpose: folding them into one alternation is measurably
+# SLOWER (the lookbehind and the `\s*` branch defeat the literal prefix search)
+# and this runs over every `#define`-bearing tracked file.  The first is
+# deliberately UNANCHORED: generators emit their `#define NAME` mid-line.
 DEF_NAME_RES = (re.compile(r"#[ \t]*(?:define|undef)[ \t]+([A-Za-z_]\w*)"),
                 re.compile(r"(?<![\w-])-D\s*([A-Za-z_]\w*)"),
                 re.compile(r"AC_DEFINE(?:_UNQUOTED)?\([ \t]*([A-Za-z_]\w*)"))
 
 # Conservative allow-list for the never-compiled-block detector: names in the
-# compiler/platform/toolchain namespaces can always be defined outside the
-# tracked sources (command line, compiler builtin, system/3PP headers), so a
-# region guarded by them is never reported.
+# compiler/platform/toolchain namespaces are always definable outside the tracked
+# sources (command line, compiler builtin, system/3PP headers), so a region
+# guarded by them cannot be proven dead.
 KNOWN_MACROS = {
     "unix", "linux", "WIN32", "APPLE", "DARWIN", "POSIX", "VXWORKS", "SOLARIS",
     "FREEBSD", "OPENBSD", "NETBSD", "_REENTRANT", "NDEBUG", "DEBUG", "ERLANG_OSTYPE",
@@ -229,9 +235,7 @@ SCAN_REL = Path(DEFAULT_SCAN)
 def exempt_reason(rel):
     """Why `rel` is retained although mechanically unreferenced (else None).
 
-    Used by BOTH the loose and the strict tier so they agree on what counts as
-    an intentional retention.
-    """
+    Shared by BOTH tiers so they agree on what is an intentional retention."""
     why = EXEMPT_FILES.get(rel)
     if why is not None:
         return why
@@ -276,9 +280,9 @@ def read_text(path):
 
 
 def is_codegen_source(path):
-    """Extension-less codegen tools and other build inputs that a plain suffix
-    test misses (erts/emulator/utils/beam_makeops, .../make_tables,
-    erts/preloaded/src/add_abstract_code)."""
+    """Build inputs a plain suffix test misses: the extension-less codegen tools
+    (erts/emulator/utils/beam_makeops, .../make_tables, erts/preloaded/src/
+    add_abstract_code) and the xcomp/*.conf cross-compilation descriptions."""
     s = str(path)
     if s.startswith(CODEGEN_DIRS):
         return True
@@ -314,11 +318,9 @@ def is_build_source(path):
 def guard_relevant(rel):
     """Is a *use* of a guard name in `rel` real preprocessor evidence?
 
-    A preprocessor use can only live in a C-family source or in a build/config
-    source (where -D/AC_DEFINE spell it).  A mention in a doc (CONTEXT.md, ...)
-    or in a comment of the Rust rewrite is not a use, so it must NOT defeat the
-    never-compiled-block detector.
-    """
+    Only a C-family or a build/config source can use one (-D/AC_DEFINE spell it);
+    a doc (CONTEXT.md, ...) or Rust-comment mention is not a use and must NOT
+    defeat the never-compiled-block detector."""
     p = Path(rel)
     return p.suffix.lower() in CFAMILY_EXTS or is_build_source(p)
 
@@ -326,11 +328,9 @@ def list_assignments(txt):
     """Map VAR -> set(items) for plain "VAR = a b \\\n c" assignments whose
     items all name a source (a bare object stem, or a .c/.cpp/.cc file).
 
-    Anything with a flag, a path-less expansion or a non-source token is
-    skipped, so "$(ZLIB_CFLAGS := -O2 ...)" and every flag list are ignored and
-    only the source registries (ZLIB_FILES, RYU_FILES, ETHREAD_LIB_SRC,
-    ERTS_INTERNAL_LIB_SRCS, ...) are captured.
-    """
+    Anything with a flag, a path-less expansion or a non-source token is skipped,
+    so flag lists ("$(ZLIB_CFLAGS := -O2 ...)") are ignored and only the source
+    registries (ZLIB_FILES, RYU_FILES, ETHREAD_LIB_SRC, ...) are captured."""
     assignments = {}
     for line in txt.replace("\\\n", " ").splitlines():
         m = MAKE_ASSIGN_RE.match(line)
@@ -354,11 +354,9 @@ def glob_to_regex(pattern):
     """Translate a make $(wildcard) pattern to a regex matching any path suffix.
 
     Make variable prefixes are stripped first ($(ASMJIT_DIR)/core/*.cpp becomes
-    /core/*.cpp) and the pattern is allowed to match at any directory depth, so
-    `beam/*.c` covers erts/emulator/beam/x.c without needing to know which
-    Makefile directory the pattern was written in.  A make `%` is treated as a
-    wildcard too (source-naming registries like $(RYU_FILES:%=ryu/%.c)).
-    """
+    /core/*.cpp) and the pattern may match at any directory depth, so `beam/*.c`
+    covers erts/emulator/beam/x.c without knowing which Makefile wrote it.  A make
+    `%` is a wildcard too (registries like $(RYU_FILES:%=ryu/%.c))."""
     pat = re.sub(r"\$\([^)]*\)|\$\{[^}]*\}", "", pattern).strip().replace("%", "*")
     if not pat or not GLOB_CHARS.search(pat):
         return None
@@ -389,20 +387,52 @@ def defined_names(txt):
     """Every macro name `txt` defines/undeclares (#define / #undef / -D / AC_DEFINE).
 
     Unanchored, so a generator-emitted or commented-out `#define NAME`, and a
-    `-DNAME` (which the tokenizer would otherwise see as the word "DNAME"), all
-    count as definable.
-    """
+    `-DNAME` (which the tokenizer sees as the word "DNAME"), count as definable."""
     return {n for rx in DEF_NAME_RES for n in rx.findall(txt)}
+
+
+def file_name_tokens(txt):
+    r"""The file-name tokens `BASENAME_RE` reports, in the same order.
+
+    Exactly equivalent to `[m.group(1) for m in BASENAME_RE.finditer(txt)]`, but
+    linear (see the BASENAME_RE comment).  Per `\.ext` occurrence the engine is
+    reproduced directly: the match starts at the LEFTMOST `[A-Za-z_]` at or after
+    the previous match end, walking left over `[\w.\-]` (a leading digit run is
+    skipped, a run boundary or the previous match end stops the walk); greedy
+    `[\w.\-]*` then picks the FURTHEST `.ext` inside that run; and the next match
+    can only begin after it."""
+    out = []
+    pos = 0
+    for m in DOT_EXT_RE.finditer(txt):
+        if m.start() < pos:
+            continue
+        start, j = -1, m.start()
+        while j > pos:
+            c = txt[j - 1]
+            if not (c == "." or c == "-" or c == "_" or c.isalnum()):
+                break
+            j -= 1
+            if txt[j] in LABEL_START:
+                start = j
+        if start < 0:
+            continue
+        run_end = WORDDOT_RUN_RE.match(txt, start).end()
+        # The furthest reachable `.ext`: `pos`/`start` are inside the run, and
+        # the ext itself holds no dot, so only a later occurrence can win.
+        last = m
+        for m2 in DOT_EXT_RE.finditer(txt, m.end(), run_end):
+            last = m2
+        out.append(txt[start:last.end()])
+        pos = last.end()
+    return out
 
 
 def cheap_undefinable(name):
     """Name-only filter of the never-compiled-block detector (no tree data).
 
-    Names in the compiler/platform/toolchain namespaces can always be defined
-    outside the tracked sources (command line, compiler builtin, system or 3PP
-    headers), so a region guarded by them is never reported - and this filter
-    also keeps the whole-tree work limited to the names that can matter.
-    """
+    Shares the KNOWN_MACROS/MACRO_BUILTIN_PREFIXES rationale (see the header):
+    such a region can never be proven dead.  It also keeps the whole-tree work
+    limited to the names that can matter."""
     if name in KNOWN_MACROS or name in C_KEYWORDS:
         return False
     if name.startswith("_") or "__" in name or "HAVE" in name.split("_"):
@@ -414,8 +444,7 @@ def single_macro_condition(kind, rest):
     """(macro, negated) for a simple single-macro condition, else (None, False).
 
     Anything else (arithmetic, &&/||, function-like, several identifiers) is
-    undecidable and must stay SILENT.
-    """
+    undecidable and must stay SILENT."""
     rest = rest.strip()
     if kind in ("ifdef", "ifndef"):
         if IDENT_RE.match(rest):
@@ -433,13 +462,11 @@ def find_never_compiled_blocks(txt, undefinable):
     """Never-compiled `#if` regions of `txt`.
 
     Returns [{"macro", "start", "end"}] where start/end are 1-based line numbers
-    of the `#if` directive and of the last line of its BODY (the directive line
-    and the #endif/#else line are not part of the body).  Only a positive
-    single-macro condition counts; `#ifndef M`/`#if !defined(M)` with such an M
-    is always compiled and is therefore not reported, and an undecidable
-    condition is skipped.  Nested regions inside an already-reported region are
-    not reported again.
-    """
+    of the `#if` directive and of the last line of its BODY (the directive and
+    the #endif/#else line are not part of the body).  Only a positive
+    single-macro condition counts; `#ifndef M`/`#if !defined(M)` with such an M is
+    always compiled and is not reported, an undecidable condition is skipped, and
+    regions nested inside an already-reported one are not reported again."""
     lines = txt.splitlines()
     frames = []                 # [[region or None, region_closed]]
     out = []
@@ -507,7 +534,6 @@ def main():
     own_tokens = {}        # candidate rel -> Counter of its own tokens
     live_tokens = {}       # own tokens minus never-compiled-block tokens
     globs = []             # (pattern_source_path, pattern, regex)
-    tokens_all = Counter()
     tokens_cfamily = Counter()
     tokens_build = Counter()
     stem_refs_all = {}     # stem -> list of sources mentioning it
@@ -540,7 +566,6 @@ def main():
                 if name and not negated:
                     guard_names.add(name)
 
-    basename_re = re.compile(r"([A-Za-z_][\w.\-]*\.(?:c|h|cpp|hpp|cc|tab|inc|def))\b")
     obj_token_re = re.compile(r"([A-Za-z_][\w.\-]*\.(?:o|obj))\b")
     # Everything below is restricted to the names that could ever be reported,
     # so the whole-tree work stays a single pass: erts/*_HAVE_* / __*/_* / 3PP
@@ -553,9 +578,10 @@ def main():
     interesting_guards = {n for n in guard_names if cheap_undefinable(n)}
 
     def maybe_scan_basenames(txt):
-        # Exact prefilter for basename_re (which needs one of these suffixes).
-        return (".c" in txt or ".h" in txt or ".tab" in txt or ".inc" in txt
-                or ".def" in txt)
+        # Exact prefilter for BASENAME_RE/file_name_tokens (which require one of
+        # these suffixes); far more selective than a plain ".c"/".h" substring
+        # test, which also fires on ".conf"/".cmake"/".crl".
+        return DOT_EXT_RE.search(txt) is not None
 
     # Pass B - every tracked file.
     for p in files:
@@ -586,13 +612,19 @@ def main():
                     guard_ok[name] = False    # a definition is not a condition
         if is_doc:
             continue
-        cnt = cand_cnt.get(rel)
-        if cnt is None:
-            cnt = Counter(TOKEN_RE.findall(txt))
+        # Classify before tokenizing so a file whose token counts nobody reads
+        # is not tokenized at all: only C-family sources (class C evidence),
+        # build sources (stem/basename/object indexes) and - for --explain only -
+        # the advisory "all mentions" index need them.
         is_c = p.suffix.lower() in CFAMILY_EXTS
         is_b = is_build_source(p)
-        is_m = is_makefile_source(p)
-        tokens_all.update(cnt)
+        cnt = cand_cnt.get(rel)
+        if cnt is None:
+            if is_c or is_b or args.explain is not None:
+                cnt = Counter(TOKEN_RE.findall(txt))
+            else:
+                cnt = {}
+        is_m = is_b and is_makefile_source(p)
         if is_c:
             tokens_cfamily.update(cnt)
             if rel not in cand_set:
@@ -618,9 +650,11 @@ def main():
                 stem_refs_build.setdefault(stem, []).append(rel)
                 if is_m:
                     stem_refs_make.setdefault(stem, []).append(rel)
-            if stems or maybe_scan_basenames(txt):
-                for m in basename_re.finditer(txt):
-                    base = m.group(1)
+            # Only the exact dot-extension prefilter gates the scan: `stems`
+            # being non-empty cannot produce a basename hit on its own, and the
+            # body adds nothing when no file-name token was found.
+            if maybe_scan_basenames(txt):
+                for base in file_name_tokens(txt):
                     if base in cand_by_base:
                         basename_refs.setdefault(base, []).append(rel)
             if is_m:
