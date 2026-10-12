@@ -11,7 +11,7 @@ Cargo **binary + library** crate `differential`: the library lets `cargo test` a
 Per case, each runtime is observed and compared field-by-field:
 1. **stdout bytes** (exact, byte-wise) — always compared.
 2. **exit status** (the process exit code; `None` if signalled) — always compared.
-3. **stderr bytes**, **classified** — compared for **expression** cases (`Observables::All`) through a narrow classifier: only the Rust runtime's documented one-line boot banner (`beam_rt <vsn> booted: …`, `compare::is_runtime_banner_line` / dropped by `compare::significant_stderr`) is ignored; every other stderr byte is compared exactly. Module-run cases (`Observables::StdoutAndExit`) do not compare stderr.
+3. **stderr bytes**, **classified** — compared for **expression** cases (`Observables::All`) through a narrow classifier: only the Rust runtime's documented one-line boot banner (`beam_rt <vsn> booted: …`, `compare::is_runtime_banner_line` / dropped by `compare::significant_stderr`) is ignored; every other stderr byte is compared exactly. Module-run and command cases (`Observables::StdoutAndExit`) do not compare stderr.
 4. **`term_to_binary/1` of the evaluated result** — the probe *encodes* what it observes, so the canonical ETF bytes are a first-class diff field (A.2).
 5. **exception class + reason** — surfaced because `erl -noshell -eval` prints **nothing** on an uncaught error; the harness always wraps the expression in `try … catch` (*Probe protocol*).
 6. **selected `erlang:system_info/1` keys** — covered by corpus cases (A.8).
