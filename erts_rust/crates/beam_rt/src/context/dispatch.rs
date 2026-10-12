@@ -26,43 +26,11 @@
 //! `(module, function, arity)` on the context, and [`DispatchHooks`] carries the per-key
 //! roster so `call_registered` selects its arm from one value.
 
-
-use std::rc::Rc;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-use beam_abi::nif::loader::NifCallError;
-use beam_bifs::{BifContext, BifFn, OutputSink};
-use beam_common::{AllocKind, BeamError, Result};
-use beam_engine::context::RootSet;
-use beam_engine::machine::WaitDeadline;
-use beam_engine::{terms, ExecutionContext, Machine, RunOutcome};
-use beam_loader::{Atom, Function, ImportRef, Instr, Label, Module};
-use beam_message::{CopyContext, Message, OffHeapTable, Queue};
-use beam_process::{MonitorRef, ProcessId, ProcessTable};
+use beam_bifs::BifFn;
+use beam_engine::terms;
 use beam_term::Eterm;
 
-use crate::error;
-use crate::mailbox::MailboxState;
-use crate::nif::{NifHostImpl, RuntimeNifServices};
-use crate::port::RuntimePorts;
-use crate::runner::RunnerState;
-use crate::runtime::Runtime;
-
-use super::alias;
-use super::bridges::{
-    descriptor_of, DictBridge, FunBridge, NifBridge, NodeIdentity, RecordBridge, SendBridge,
-    SharedSink,
-};
-use super::dispatch::{DispatchAnswer, DispatchHooks, DispatchMemo, dispatch_slot};
-use super::fun_identity::FunIdentityBridge;
-use super::gc_walk::process_roots_are_unscanned;
-use super::memory_hook::RuntimeMemory;
-use super::module_info::ModuleInfoBridge;
-use super::persistent_term::{PersistentTermBridge, PersistentTermStore};
-use super::process_bridge::ProcessBridge;
 use super::runtime_context::RuntimeContext;
-use super::runtime_hooks::RuntimeHooksBridge;
 
 /// The number of `(module, function, arity)` keys a context's dispatch memo holds.
 ///
@@ -215,35 +183,6 @@ pub(super) struct DispatchEntry {
     /// The memoized answer.
     pub(super) answer: DispatchAnswer,
 }
-
-    /// The memoized dispatch answer for `(module, function, arity)` — the `beam_bifs`
-    /// registry implementation (if any) plus the hook roster the key needs.
-    ///
-    /// A miss computes the answer — one registry `lookup` plus one evaluation of each
-    /// `uses_*` predicate, the dispatch prologue's dominant cost — and memoizes it; a slot
-    /// collision overwrites, and the evicted key recomputes on its next call. See
-    /// [`DispatchMemo`] for why a cached answer can never go stale, and note that the answer
-    /// deliberately says nothing about the **NIF registry**, which `call_bif` still consults
-    /// first on every call.
-    pub(super) fn dispatch(&mut self, module: &str, function: &str, arity: u32) -> DispatchAnswer {
-        let slot = dispatch_slot(module, function, arity);
-        if let Some(entry) = &self.dispatch_memo.slots[slot] {
-            if entry.arity == arity && entry.module == module && entry.function == function {
-                return entry.answer;
-            }
-        }
-        let answer = DispatchAnswer {
-            bif: self.runtime.registry.lookup(module, function, arity),
-            hooks: DispatchHooks::of(module, function, arity),
-        };
-        self.dispatch_memo.slots[slot] = Some(DispatchEntry {
-            module: module.to_string(),
-            function: function.to_string(),
-            arity,
-            answer,
-        });
-        answer
-    }
 
 impl<'a> RuntimeContext<'a> {
     /// The memoized dispatch answer for `(module, function, arity)` — the `beam_bifs`

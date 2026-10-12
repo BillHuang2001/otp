@@ -34,43 +34,17 @@
 //! inside the block**, with each method delegating to an inherent helper in the sibling module
 //! that owns that concern.
 
-
-use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use beam_abi::nif::loader::NifCallError;
-use beam_bifs::{BifContext, BifFn, OutputSink};
-use beam_common::{AllocKind, BeamError, Result};
+use beam_common::Result;
 use beam_engine::context::RootSet;
-use beam_engine::machine::WaitDeadline;
-use beam_engine::{terms, ExecutionContext, Machine, RunOutcome};
-use beam_loader::{Atom, Function, ImportRef, Instr, Label, Module};
-use beam_message::{CopyContext, Message, OffHeapTable, Queue};
-use beam_process::{MonitorRef, ProcessId, ProcessTable};
+use beam_engine::ExecutionContext;
+use beam_loader::{Label, Module};
 use beam_term::Eterm;
 
-use crate::error;
-use crate::mailbox::MailboxState;
-use crate::nif::{NifHostImpl, RuntimeNifServices};
-use crate::port::RuntimePorts;
-use crate::runner::RunnerState;
-use crate::runtime::Runtime;
-
-use super::alias;
-use super::bridges::{
-    descriptor_of, DictBridge, FunBridge, NifBridge, NodeIdentity, RecordBridge, SendBridge,
-    SharedSink,
-};
-use super::dispatch::{DispatchAnswer, DispatchHooks, DispatchMemo, dispatch_slot};
-use super::fun_identity::FunIdentityBridge;
-use super::gc_walk::process_roots_are_unscanned;
-use super::memory_hook::RuntimeMemory;
-use super::module_info::ModuleInfoBridge;
-use super::persistent_term::{PersistentTermBridge, PersistentTermStore};
-use super::process_bridge::ProcessBridge;
+use super::apply::{callee_observes_its_call_site, LocalFunTarget};
+use super::gc;
 use super::runtime_context::RuntimeContext;
-use super::runtime_hooks::RuntimeHooksBridge;
 
 impl ExecutionContext for RuntimeContext<'_> {
     /// The runtime's unified dispatch — see the module docs.
@@ -598,3 +572,4 @@ impl ExecutionContext for RuntimeContext<'_> {
     fn trace_event(&mut self, event: beam_engine::TraceEvent<'_>) {
         self.execution_trace_event(event);
     }
+}

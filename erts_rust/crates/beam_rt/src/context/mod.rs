@@ -87,36 +87,28 @@ pub use self::runtime_context::RuntimeContext;
 pub(crate) use self::apply::LocalFunTarget;
 pub(crate) use self::bridges::{module_md5, PendingInterner};
 pub(crate) use self::persistent_term::PersistentTermStore;
-use self::bridges::NodeIdentity;
 use self::dispatch::DispatchMemo;
-use self::fun_identity::FunIdentityBridge;
 
-// `tests.rs` and `pump.rs`'s inline suite glob `super::*`, so every name they assert on stays
-// in this module's namespace for the test build.
+// `tests.rs` and `pump.rs`'s inline suite reach the items they assert on through `use
+// super::*`, so every name they use stays in this module's namespace for the test build.
 #[cfg(test)]
 use std::sync::Arc;
 #[cfg(test)]
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
-use beam_bifs::BifFn;
-#[cfg(test)]
 use beam_common::{BeamError, Result};
 #[cfg(test)]
 use beam_engine::context::RootSet;
 #[cfg(test)]
-use beam_engine::{terms, Machine, RunOutcome};
+use beam_engine::{terms, ExecutionContext, Machine};
 #[cfg(test)]
-use beam_loader::{Atom, Function, ImportRef, Instr, Label, Module};
-#[cfg(test)]
-use beam_message::Message;
+use beam_loader::{Function, ImportRef, Instr, Label, Module};
 #[cfg(test)]
 use beam_process::{MonitorRef, ProcessId, ProcessTable};
 #[cfg(test)]
 use beam_term::Eterm;
 
-#[cfg(test)]
-use crate::error;
 #[cfg(test)]
 use crate::runtime::Runtime;
 
@@ -126,6 +118,10 @@ use self::apply::{
     CallSiteReadingImports,
 };
 #[cfg(test)]
+use self::bridges::NodeIdentity;
+#[cfg(test)]
 use self::dispatch::{dispatch_slot, DispatchHooks, DISPATCH_MEMO_SLOTS};
+#[cfg(test)]
+use self::fun_identity::FunIdentityBridge;
 #[cfg(test)]
 use self::pump::{pump_until_returned, BLOCKING_PUMP_DEADLINE};

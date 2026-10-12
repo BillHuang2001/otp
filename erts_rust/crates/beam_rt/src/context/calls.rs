@@ -59,40 +59,25 @@
 //! recorded names into the shared table in the same order, so each lands at exactly the
 //! predicted index. A name seen twice in one call is deduplicated and gets the same index.
 
-
 use std::rc::Rc;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use beam_abi::nif::loader::NifCallError;
-use beam_bifs::{BifContext, BifFn, OutputSink};
-use beam_common::{AllocKind, BeamError, Result};
-use beam_engine::context::RootSet;
-use beam_engine::machine::WaitDeadline;
-use beam_engine::{terms, ExecutionContext, Machine, RunOutcome};
-use beam_loader::{Atom, Function, ImportRef, Instr, Label, Module};
-use beam_message::{CopyContext, Message, OffHeapTable, Queue};
-use beam_process::{MonitorRef, ProcessId, ProcessTable};
+use beam_bifs::BifContext;
+use beam_common::Result;
+use beam_process::ProcessTable;
 use beam_term::Eterm;
 
 use crate::error;
-use crate::mailbox::MailboxState;
 use crate::nif::{NifHostImpl, RuntimeNifServices};
 use crate::port::RuntimePorts;
-use crate::runner::RunnerState;
-use crate::runtime::Runtime;
 
-use super::alias;
-use super::bridges::{
-    descriptor_of, DictBridge, FunBridge, NifBridge, NodeIdentity, RecordBridge, SendBridge,
-    SharedSink,
-};
-use super::dispatch::{DispatchAnswer, DispatchHooks, DispatchMemo, dispatch_slot};
+use super::bridges::PendingInterner;
+use super::bridges::{DictBridge, FunBridge, NifBridge, NodeIdentity, RecordBridge, SendBridge};
+use super::dispatch::DispatchHooks;
 use super::fun_identity::FunIdentityBridge;
-use super::gc_walk::process_roots_are_unscanned;
 use super::memory_hook::RuntimeMemory;
 use super::module_info::ModuleInfoBridge;
-use super::persistent_term::{PersistentTermBridge, PersistentTermStore};
+use super::persistent_term::PersistentTermBridge;
 use super::process_bridge::ProcessBridge;
 use super::runtime_context::RuntimeContext;
 use super::runtime_hooks::RuntimeHooksBridge;
