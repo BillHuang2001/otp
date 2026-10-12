@@ -6092,18 +6092,8 @@ BIF_RETTYPE dt_spread_tag_1(BIF_ALIST_1)
     if (DT_UTAG(BIF_P) != NIL) {
 	if (BIF_ARG_1 == am_true) {
 	    DT_UTAG_FLAGS(BIF_P) |= DT_UTAG_SPREADING;
-#ifdef DTRACE_TAG_HARDDEBUG
-	    erts_fprintf(stderr,
-			 "Dtrace -> (%T) start spreading tag %T\r\n",
-			 BIF_P->common.id,DT_UTAG(BIF_P));
-#endif
 	} else {
 	    DT_UTAG_FLAGS(BIF_P) &= ~DT_UTAG_SPREADING;
-#ifdef DTRACE_TAG_HARDDEBUG
-	    erts_fprintf(stderr,
-			 "Dtrace -> (%T) stop spreading tag %T\r\n",
-			 BIF_P->common.id,DT_UTAG(BIF_P));
-#endif
 	}
     }
     BIF_RET(ret);
@@ -6125,11 +6115,6 @@ BIF_RETTYPE dt_restore_tag_1(BIF_ALIST_1)
     }
     if (tpl[2] == NIL) {
 	if (DT_UTAG(BIF_P) != NIL) {
-#ifdef DTRACE_TAG_HARDDEBUG
-	    erts_fprintf(stderr,
-			 "Dtrace -> (%T) restore Killing tag!\r\n",
-			 BIF_P->common.id);
-#endif
 	}
 	DT_UTAG(BIF_P) = NIL;
 	if (SEQ_TRACE_TOKEN(BIF_P) == am_have_dt_utag) {
@@ -6138,21 +6123,6 @@ BIF_RETTYPE dt_restore_tag_1(BIF_ALIST_1)
 	DT_UTAG_FLAGS(BIF_P) = 0;
     } else {
 	x = unsigned_val(tpl[1]) & (DT_UTAG_SPREADING | DT_UTAG_PERMANENT);
-#ifdef DTRACE_TAG_HARDDEBUG
-
-	if (!(x & DT_UTAG_SPREADING) && (DT_UTAG_FLAGS(BIF_P) & 
-					 DT_UTAG_SPREADING)) {
-	    erts_fprintf(stderr,
-			 "Dtrace -> (%T) restore stop spreading "
-			 "tag %T\r\n",
-			 BIF_P->common.id, tpl[2]);
-	} else if ((x & DT_UTAG_SPREADING) && 
-		   !(DT_UTAG_FLAGS(BIF_P) & DT_UTAG_SPREADING)) {
-	    erts_fprintf(stderr,
-			 "Dtrace -> (%T) restore start spreading "
-			 "tag %T\r\n",BIF_P->common.id,tpl[2]);
-	}
-#endif
 	DT_UTAG_FLAGS(BIF_P) = x;
 	DT_UTAG(BIF_P) = tpl[2];
 	if (SEQ_TRACE_TOKEN(BIF_P) == NIL) {
