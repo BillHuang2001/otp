@@ -212,7 +212,7 @@ Non-corpus modules:
 - `src/compare.rs` -> observable diff (`Observables`), classified stderr (`is_runtime_banner_line`/`significant_stderr`), golden check, `Verdict`
 - `src/allowlist.rs` -> the known-gaps allowlist (`AllowEntry`, `Allowlist::parse`/`load`/`empty`, `get`/`contains`/`entries`/`path`)
 - `src/ratchet.rs` -> the ratcheted strict gate (`RatchetReport::classify`, `has_mismatch`, `report_from_suite`, `suite_exit_code`, `gaps_markdown`/`write_markdown`)
-- `src/harness.rs` -> orchestration: `RuntimeContext`/`resolve_context`, `run_case`/`run_case_in`/`compare_expr`/`run_suite`, per-side argv planning, env-injection and module-build routing, exit-3 classification, exit-code derivation
+- `src/harness.rs` -> orchestration: `RuntimeContext`/`resolve_context`, `run_case`/`run_case_in`/`compare_expr`/`run_suite`, per-side argv planning, env-injection / module-build / command-case routing (`run_command_case`/`skipped_command_outcome`, `RunPlan.rust_spec` — the Rust side may be `beam_rt` or the `dist_probe` helper), exit-3 classification, exit-code derivation
 - `src/report/` -> the report directory module (`mod.rs`/`model.rs`/`json.rs`/`render.rs`): the serde data model + the `summary`/`by_contract`/`ratchet` rollups, the `differential/1` schema + `write_json`, `render_human` + `render_list_grouped`
 - `src/main.rs` -> thin binary: parse args -> dispatch -> `process::exit(code)`
 - `src/test_support.rs` -> `#[cfg(test)]`-only shared helpers (`Scratch` dir, compiler stubs) for the `module_build`/`nif_build` tests
