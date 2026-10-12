@@ -120,6 +120,21 @@ impl Machine {
         self.pending_exception
     }
 
+    /// The write half of the pending-exception pair, whose read half is
+    /// [`Machine::pending_exception`].
+    ///
+    /// It hands out a mutable reference into the **same** slot the read accessor
+    /// returns, so a host that owns a moving (copying) heap can write the
+    /// **relocated** reason term back after a collection moves the process heap:
+    /// the `Eterm` reason is a GC root the collector must fix up, and
+    /// [`Machine::pending_exception`] yields only a copy of it. `None` when no
+    /// raise has been recorded.
+    ///
+    /// The slot is the pending exception `(class, reason)` set by
+    /// [`Machine::throw`]/[`Machine::throw_with_trace`].
+    pub fn pending_exception_mut(&mut self) -> Option<&mut (ExceptionClass, Eterm)> {
+        self.pending_exception.as_mut()
+    }
     /// The class of the exception currently being handled, if any.
     ///
     /// This is the engine's stand-in for C's `c_p->freason` exception class
@@ -1007,5 +1022,44 @@ mod tests {
         assert_eq!(machine.x(2), Some(NIL));
         assert_eq!(machine.x(3), Some(class_atom));
         assert_eq!(machine.catch_frame_depth(), 1, "the handler pops it");
+    }
+
+    /// `pending_exception_mut` is the write half of the `pending_exception` pair: it
+    /// hands out a reference into the machine's own slot, so a relocated reason term
+    /// written through it is what the read accessor observes next.
+    #[test]
+    fn pending_exception_mut_writes_the_same_slot_the_reader_returns() {
+        // A fresh machine has no pending exception: the write half is `None` too.
+        let mut fresh = Machine::new();
+        assert!(fresh.pending_exception_mut().is_none());
+        assert_eq!(fresh.pending_exception(), None);
+
+        // Record a raise (the whole crate's entry point: `Machine::throw`).
+        let mut machine = Machine::new();
+        let reason = Eterm::from_raw(0xBEEF);
+        assert!(matches!(
+            machine.throw(ExceptionClass::Throw, reason),
+            Err(BeamError::Raise(_))
+        ));
+        assert_eq!(
+            machine.pending_exception(),
+            Some((ExceptionClass::Throw, reason))
+        );
+
+        // Write a relocated `(class, reason)` pair through the mutable accessor.
+        let relocated = Eterm::from_raw(0xCAFE);
+        let slot = machine
+            .pending_exception_mut()
+            .expect("a raise was recorded");
+        assert_eq!(*slot, (ExceptionClass::Throw, reason));
+        slot.0 = ExceptionClass::Exit;
+        slot.1 = relocated;
+
+        // The reader observes the change: it is the same slot, not a copy.
+        assert_eq!(
+            machine.pending_exception(),
+            Some((ExceptionClass::Exit, relocated))
+        );
+        assert_eq!(machine.pending_class(), Some(ExceptionClass::Exit));
     }
 }
