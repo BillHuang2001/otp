@@ -236,11 +236,7 @@ impl Machine {
         args: &[Operand],
         ctx: &mut dyn ExecutionContext,
     ) -> Result<(Eterm, Eterm)> {
-        let a = self.test_arg(args, 0, ctx)?;
-        let b = self.test_arg(args, 1, ctx)?;
-        crate::poison::check("read", "Machine::eval_test", a);
-        crate::poison::check("read", "Machine::eval_test", b);
-        Ok((a, b))
+        Ok((self.test_arg(args, 0, ctx)?, self.test_arg(args, 1, ctx)?))
     }
 }
 

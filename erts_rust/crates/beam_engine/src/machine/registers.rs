@@ -159,7 +159,6 @@ impl Machine {
         match self.fr.get_mut(n as usize) {
             Some(slot) => {
                 *slot = value;
-                crate::poison::check("write", "Machine::set_fr", value);
                 // A *conditional* store (not `self.fr_mark.max(..)`, which always
                 // stores): the mark almost never moves in a straight-line body, so the
                 // common path must not pay a memory write on top of the register write.
@@ -182,7 +181,6 @@ impl Machine {
         match self.x.get_mut(n as usize) {
             Some(slot) => {
                 *slot = v;
-                crate::poison::check("write", "Machine::set_x", v);
                 // See `set_fr`: `n` is in range, so `n + 1` cannot overflow
                 // (`max_register` is far below `u32::MAX`), and the mark is only
                 // stored when it actually moves.

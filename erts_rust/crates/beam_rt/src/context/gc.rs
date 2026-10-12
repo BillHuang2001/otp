@@ -660,24 +660,6 @@ pub(crate) fn ensure_heap_full(
         runtime.take_gc_request(pid);
     }
 
-    // --- Diagnostic window (`BEAM_RT_POISON`, off by default): record the from-space the
-    //     collection is about to abandon and snapshot the roots, so the scatter can be audited
-    //     for a word the collector failed to relocate. A no-op when the detector is off.
-    let poison = beam_engine::poison::enabled();
-    if poison {
-        let young = process.collector().young();
-        beam_engine::poison::record_abandoned(young.base() as usize, young.top() as usize);
-        let mature_base = process.collector().mature_base() as usize;
-        let mature_used = process.collector().mature_used_words();
-        beam_engine::poison::record_abandoned(
-            mature_base,
-            mature_base + mature_used * std::mem::size_of::<Eterm>(),
-        );
-    }
-    let before_x = beam_engine::poison::snapshot(roots.x);
-    let before_stack = beam_engine::poison::snapshot(roots.stack);
-    let before_fr = beam_engine::poison::snapshot(roots.fr);
-
     if !publish_roots_full(process, &roots) {
         runtime.halt_process_gc(pid);
         return Ok(());
@@ -699,24 +681,6 @@ pub(crate) fn ensure_heap_full(
     if !scatter_roots_full(process, &mut roots) {
         runtime.halt_process_gc(pid);
         return Ok(());
-    }
-    // Diagnostic: any root that came back **unchanged** yet still points into the from-space
-    // is one the collector never published (a correct relocation would have rewritten it).
-    if poison {
-        beam_engine::poison::audit_unchanged("hold", "ensure_heap_full/roots.x", &before_x, roots.x);
-        beam_engine::poison::audit_unchanged(
-            "hold",
-            "ensure_heap_full/roots.stack",
-            &before_stack,
-            roots.stack,
-        );
-        beam_engine::poison::audit_unchanged(
-            "hold",
-            "ensure_heap_full/roots.fr",
-            &before_fr,
-            roots.fr,
-        );
-        beam_engine::poison::clear();
     }
     Ok(())
 }

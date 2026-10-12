@@ -99,7 +99,6 @@ pub mod interpreter;
 pub mod jit;
 pub mod machine;
 pub mod operand;
-pub mod poison;
 #[allow(unsafe_code)]
 mod predicates;
 mod step;
