@@ -429,11 +429,13 @@ write-mode `{open,…}` that delegates to `prim_file:open/2` and really creates 
 - **`code:*` is the native floor, not a live `code_server`** — `code.rs`'s behaviour must not
   change (see `../CONTEXT.md`; OTP's real `code_server.beam` needs facilities outside this crate).
 - **Files ~1000 lines of production code.** Pre-existing oversize (single-responsibility, kept
-  whole because the routing table names them): `application.rs`, `process.rs`; `prim.rs` (~3237
-  total / ~805 production) and `prim_file.rs` (~1536 total) are mostly comprehensive test modules.
-  `erts_internal.rs`'s tracing half is split out into `erts_internal/trace.rs` (~310 production),
-  leaving `erts_internal.rs` at ~968 production / 2265 total. Split by responsibility; every public
-  item documented.
+  whole because the routing table names them): `application.rs` (~953 production / 1661 total),
+  `process.rs` (~934 production / 1417 total); `prim.rs` (~1088 production / 3942 total) is mostly
+  its comprehensive colocated test module, and `prim_file.rs` (1601 lines, **no colocated tests** —
+  its fd-half bodies are exercised by `prim.rs`'s test module through the `prim_file_call`
+  dispatch). `erts_internal.rs`'s tracing half is split out into `erts_internal/trace.rs` (~309
+  lines), leaving `erts_internal.rs` at ~1114 production / 2483 total. Split by responsibility;
+  every public item documented.
 
 ## Test Strategy
 - **Unit tests** colocated per module (`#[cfg(test)] mod tests`), driving the floor through the
