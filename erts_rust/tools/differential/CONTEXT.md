@@ -1,3 +1,7 @@
+---
+skill:
+  - differential-add-corpus-case
+---
 # differential — Rust ERTS vs System ERTS Compatibility Gate
 
 ## Intent
