@@ -151,7 +151,7 @@ pub(crate) enum Inst {
     Cut,
     /// Accept.
     Match,
-    /// Always backtrack (a never-matching construct, e.g. `a{}`).
+    /// Always backtrack (a never-matching construct).
     Fail,
 }
 
@@ -336,7 +336,8 @@ impl Emitter {
         greedy: bool,
         possessive: bool,
     ) -> Result<()> {
-        // A min above the max can never match; `a{}` / `a{,}` are exactly this.
+        // A min above the max can never match. The syntax layer already rejects an
+        // out-of-order bound (`{2,1}`), so this is a defensive guard only.
         if let Some(max) = max {
             if max < min {
                 self.push(Inst::Fail);
@@ -748,10 +749,26 @@ mod tests {
     }
 
     #[test]
-    fn a_never_matching_brace_form_compiles_to_fail() {
-        // `a{}` compiles in the oracle but never matches.
+    fn a_brace_without_a_bound_is_a_literal() {
+        // `a{}` is a literal `a` followed by literal braces — the oracle matches
+        // `re:run("a{}", "a{}")` at `{0,3}` — never a never-matching form.
         let p = program("a{}");
-        assert!(p.insts.contains(&Inst::Fail));
+        assert!(
+            p.insts.iter().any(|i| matches!(i, Inst::Char { c, .. } if *c == b'{' as u32)),
+            "{:?}",
+            p.insts
+        );
+        assert!(
+            p.insts.iter().any(|i| matches!(i, Inst::Char { c, .. } if *c == b'}' as u32)),
+            "{:?}",
+            p.insts
+        );
+        assert_eq!(
+            p.insts.iter().filter(|i| matches!(i, Inst::Char { .. })).count(),
+            3,
+            "{:?}",
+            p.insts
+        );
     }
 
     #[test]

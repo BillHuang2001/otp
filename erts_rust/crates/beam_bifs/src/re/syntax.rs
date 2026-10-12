@@ -118,7 +118,9 @@ pub(crate) fn fold_key(c: u32) -> u32 {
         0x139..=0x147 if c % 2 == 1 => c + 1,
         0x14A..=0x176 if c % 2 == 0 => c + 1,
         0x179..=0x17D if c % 2 == 1 => c + 1,
-        0x178 => 0xFF,
+        // The (U+00FF `ÿ`, U+0178 `Ÿ`) case pair canonicalises to U+0178, so both
+        // members fold to the same key and compare equal under `caseless`.
+        0xFF => 0x178,
         0xB5 => 0x3BC,
         0x386 => 0x3AC,
         0x388..=0x38A => c + 37,
@@ -480,8 +482,9 @@ pub(crate) fn parse(
 ) -> beam_common::Result<Syntax> {
     if flags.ucp {
         // `ucp` switches `\d\w\s` and the POSIX classes to Unicode property
-        // tables; this engine has no Unicode property database, so an honest
-        // capability gap beats a Latin-1-only class that silently under-matches.
+        // tables; the engine has **no** Unicode property tables, so EVERY `[ucp]`
+        // pattern is the typed `unsupported_bif` capability gap (an honest gap
+        // beats a Latin-1-only class that silently under-matches).
         return Err(unsupported_bif());
     }
     if flags.never_utf && flags.unicode {
@@ -634,7 +637,13 @@ impl<'a> Parser<'a> {
                 _ => {}
             }
             let atom = self.parse_repeat()?;
-            items.push(atom);
+            // A zero-width no-op group (`(?i)`, `(?#…)`) parses to `Ast::Empty`;
+            // dropping it from the concatenation is exactly equivalent (an empty
+            // atom matches the empty string) and keeps the item list free of
+            // non-items.
+            if !matches!(atom, Ast::Empty) {
+                items.push(atom);
+            }
         }
         Ok(match items.len() {
             0 => Ast::Empty,
@@ -718,73 +727,96 @@ impl<'a> Parser<'a> {
     ///
     /// Returns `Ok(None)` — with the cursor restored to the `{` — when the braces
     /// do **not** form a quantifier (`{}`, `{,}`, `{x}`, an unterminated `{…`), so
-    /// the caller keeps `{` as a literal (PCRE2 10.43+).
+    /// the caller keeps `{` as a literal (PCRE2 10.43+). A non-quantifier brace is
+    /// never an error.
     ///
     /// # Errors
     ///
-    /// The oracle's own `{}` errors, reported at the closing `}`'s byte offset:
-    /// [`E_NUMBER_TOO_BIG`] for a bound above [`QUANT_MAX`] (checked first) and
-    /// [`E_NUMBERS_OUT_OF_ORDER`] when the maximum is below the minimum.
+    /// The oracle's own `{}` errors, at the **exact byte offsets PCRE2 reports**
+    /// (`pcre2_compile.c:read_repeat_counts`): [`E_NUMBER_TOO_BIG`] when a bound is
+    /// above [`QUANT_MAX`], reported just past that number's last digit, and
+    /// [`E_NUMBERS_OUT_OF_ORDER`] when the maximum is below the minimum, likewise
+    /// reported just past the maximum's last digit. The too-big check precedes the
+    /// order check.
+    ///
+    /// Whitespace inside the braces (`a{ 2 }`, which PCRE2 allows) is **not**
+    /// supported — the pre-check simply fails and the braces stay literal.
     fn brace_quantifier(&mut self) -> beam_common::Result<Option<(u32, Option<u32>, bool)>> {
-        let start = self.pos;
-        self.pos += 1; // `{`
-        let first = self.read_decimal();
-        let (min, max) = if self.eat(b',' as u32) {
-            match (first, self.read_decimal()) {
-                // `{,}` — neither bound given: not a quantifier.
-                (None, None) => {
-                    self.pos = start;
-                    return Ok(None);
+        let start = self.pos; // the `{`
+        // --- PCRE2's syntax pre-check (the `pp` walk, pcre2_compile.c:1369-1395):
+        // decide *whether* this is a quantifier before interpreting any number, so
+        // that e.g. `X{123456ABC` is a literal, not a "number too big" error.
+        let (_, after_min, had_min) = self.digits_at(start + 1);
+        let pp = after_min;
+        match self.codes.get(pp) {
+            Some(&c) if c == b'}' as u32 => {
+                if !had_min {
+                    return Ok(None); // `{}`
                 }
-                (min, max) => (min.unwrap_or(0), max),
             }
-        } else {
-            match first {
-                // `{}` — no bound at all: not a quantifier.
-                None => {
-                    self.pos = start;
-                    return Ok(None);
+            Some(&c) if c == b',' as u32 => {
+                let (_, after_max, had_max) = self.digits_at(pp + 1);
+                if self.codes.get(after_max) != Some(&(b'}' as u32)) {
+                    return Ok(None); // `{n,m,}` / an unterminated brace
                 }
-                Some(n) => (n, Some(n)),
+                if !had_max && !had_min {
+                    return Ok(None); // `{,}`
+                }
             }
-        };
-        if self.peek() != Some(b'}' as u32) {
-            // `{1,2,}`, `{65536x}`, an unterminated `{…`: not a quantifier.
-            self.pos = start;
-            return Ok(None);
+            _ => return Ok(None), // `{x}`, `{…` (unterminated), end of pattern
         }
-        // The braces close here; `here()` is the `}` the oracle points at.
-        if min > QUANT_MAX || max.is_some_and(|m| m > QUANT_MAX) {
-            return Err(ParseError::new(E_NUMBER_TOO_BIG, self.here()).into());
+
+        // --- Interpret for real (pcre2_compile.c:1397-1447). `self.pos` moves only
+        // on success; the error offsets are the indices PCRE2's `read_number`
+        // leaves `ptr` at (just past the last digit of the offending number).
+        let (min_val, after_min, _) = self.digits_at(start + 1);
+        if min_val > u64::from(QUANT_MAX) {
+            return Err(ParseError::new(E_NUMBER_TOO_BIG, self.byte_pos(after_min)).into());
         }
-        if let Some(m) = max {
-            if m < min {
-                return Err(ParseError::new(E_NUMBERS_OUT_OF_ORDER, self.here()).into());
-            }
+        if self.codes.get(after_min) == Some(&(b'}' as u32)) {
+            // `{n}`
+            self.pos = after_min + 1;
+            let n = min_val as u32;
+            return Ok(Some((n, Some(n), false)));
         }
-        self.pos += 1; // `}`
-        Ok(Some((min, max, false)))
+        // The pre-check guarantees a `,` here (`{n,}` / `{n,m}` / `{,m}`).
+        let q = after_min + 1;
+        if self.codes.get(q) == Some(&(b'}' as u32)) {
+            // `{n,}` — an unbounded maximum.
+            self.pos = q + 1;
+            return Ok(Some((min_val as u32, None, false)));
+        }
+        let (max_val, after_max, _) = self.digits_at(q);
+        if max_val > u64::from(QUANT_MAX) {
+            return Err(ParseError::new(E_NUMBER_TOO_BIG, self.byte_pos(after_max)).into());
+        }
+        if max_val < min_val {
+            // The pre-check guarantees a `}` after the maximum.
+            return Err(ParseError::new(E_NUMBERS_OUT_OF_ORDER, self.byte_pos(after_max)).into());
+        }
+        self.pos = after_max + 1; // `}`
+        Ok(Some((min_val as u32, Some(max_val as u32), false)))
     }
 
-    fn read_decimal(&mut self) -> Option<u32> {
-        let mut any = false;
+    /// Reads a decimal run at `from`.
+    ///
+    /// Returns `(value, index just past the last digit, any)`. The value saturates
+    /// at `1_000_000`; PCRE2's `read_number` overflow guard still consumes every
+    /// digit before erroring, so the returned end index is always the true end of
+    /// the number (which is what the error offset is taken from).
+    fn digits_at(&self, from: usize) -> (u64, usize, bool) {
+        let mut i = from;
         let mut value: u64 = 0;
-        while let Some(c) = self.peek() {
+        let mut any = false;
+        while let Some(&c) = self.codes.get(i) {
             if !(0x30..=0x39).contains(&c) {
                 break;
             }
             any = true;
-            value = value * 10 + u64::from(c - 0x30);
-            if value > 1_000_000 {
-                value = 1_000_001;
-            }
-            self.pos += 1;
+            value = (value * 10 + u64::from(c - 0x30)).min(1_000_000);
+            i += 1;
         }
-        if any {
-            Some(value.min(1_000_001) as u32)
-        } else {
-            None
-        }
+        (value, i, any)
     }
 
     fn parse_atom(&mut self) -> beam_common::Result<Ast> {
@@ -867,15 +899,11 @@ impl<'a> Parser<'a> {
         match self.peek() {
             Some(c) if c == b':' as u32 => {
                 self.pos += 1;
-                let inner = self.parse_alternation()?;
-                self.expect_close_paren()?;
-                Ok(inner)
+                self.inline_group_body()
             }
             Some(c) if c == b'>' as u32 => {
                 self.pos += 1;
-                let inner = self.parse_alternation()?;
-                self.expect_close_paren()?;
-                Ok(Ast::Atomic(Box::new(inner)))
+                Ok(Ast::Atomic(Box::new(self.inline_group_body()?)))
             }
             Some(c) if c == b'#' as u32 => {
                 self.pos += 1;
@@ -904,6 +932,15 @@ impl<'a> Parser<'a> {
 
     /// Parses the name in `(?<name>`, `(?'name'` or `(?P<name>` / `(?P=name)`.
     fn parse_named_group_start(&mut self) -> beam_common::Result<Ast> {
+        // `(?<=…)` / `(?<!…)`: a lookbehind `(?<` shares its prefix with a named
+        // group, so it must be refused here — before `=`/`!` is read as a name.
+        // A lookbehind is outside the supported subset (the same typed gap the
+        // `(?=`/`(?!` lookaheads take).
+        if self.peek() == Some(b'<' as u32)
+            && matches!(self.peek_at(1), Some(c) if c == b'=' as u32 || c == b'!' as u32)
+        {
+            return Err(unsupported_bif());
+        }
         let quote = self.peek();
         let mut backref = false;
         let close = if quote == Some(b'<' as u32) {
@@ -984,8 +1021,7 @@ impl<'a> Parser<'a> {
     }
 
     fn finish_group(&mut self, index: Option<u32>) -> beam_common::Result<Ast> {
-        let inner = self.parse_alternation()?;
-        self.expect_close_paren()?;
+        let inner = self.inline_group_body()?;
         Ok(match index {
             Some(index) => Ast::Capture {
                 index,
@@ -993,6 +1029,24 @@ impl<'a> Parser<'a> {
             },
             None => inner,
         })
+    }
+
+    /// Parses a group body with the inline options scoped to it: an option change
+    /// inside (`(?i)`) is undone at the group's `)`, exactly as PCRE2's
+    /// `META_OPTIONS` nest tracking does ("the option change applies for the
+    /// remainder of the enclosing group").
+    ///
+    /// The unscoped `(?i)` form is deliberately **not** routed through here: it
+    /// must leave the options in effect for the remainder of the group it sits
+    /// in, which is what its own `)` branch of [`Parser::parse_inline_options`]
+    /// does.
+    fn inline_group_body(&mut self) -> beam_common::Result<Ast> {
+        let saved = self.opts;
+        let inner = self.parse_alternation();
+        self.opts = saved;
+        let inner = inner?;
+        self.expect_close_paren()?;
+        Ok(inner)
     }
 
     fn expect_close_paren(&mut self) -> beam_common::Result<()> {
@@ -2022,14 +2076,15 @@ mod tests {
             other => panic!("{other:?}"),
         }
 
-        // A mixed flag run applies each flag it names.
+        // A mixed flag run applies each flag it names: the `i` makes the
+        // following `a` caseless (the zero-width `(?im-sx)` itself is dropped
+        // from the concatenation, so the `a` is the whole pattern).
         let s = parse_ascii("(?im-sx)a").expect("parses");
-        match s.ast {
-            Ast::Concat(items) => {
-                assert!(matches!(items[0], Ast::Char(_, true)));
-            }
-            other => panic!("{other:?}"),
-        }
+        assert!(
+            matches!(s.ast, Ast::Char(c, true) if c == 0x61),
+            "{:?}",
+            s.ast
+        );
         let s = parse_ascii("(?s)a.b").expect("parses");
         match s.ast {
             Ast::Concat(items) => assert!(matches!(items[1], Ast::AnyChar(true)), "{items:?}"),
@@ -2042,6 +2097,45 @@ mod tests {
     }
 
     #[test]
+    fn inline_options_are_scoped_to_their_enclosing_group() {
+        // 6: an unscoped `(?i)` inside a real group applies only for the
+        // remainder of that group — the `)` undoes it, exactly as PCRE2's
+        // `META_OPTIONS` nest tracking does.
+        let s = parse_ascii("((?i)a)b").expect("parses");
+        let items = match s.ast {
+            Ast::Concat(items) => items,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(s.ncap, 1);
+        assert_eq!(items.len(), 2, "{items:?}");
+        match &items[0] {
+            Ast::Capture { index, item } => {
+                assert_eq!(*index, 1);
+                assert!(
+                    matches!(**item, Ast::Char(c, true) if c == 0x61),
+                    "`a` must be caseless inside the group, got {item:?}"
+                );
+            }
+            other => panic!("expected the capturing group, got {other:?}"),
+        }
+        assert!(
+            matches!(items[1], Ast::Char(c, false) if c == 0x62),
+            "the trailing `b` must be case-SENSITIVE after the group, got {:?}",
+            items[1]
+        );
+
+        // A top-level unscoped `(?i)` still marks every following char caseless.
+        let s = parse_ascii("(?i)abc").expect("parses");
+        match s.ast {
+            Ast::Concat(items) => {
+                assert_eq!(items.len(), 3, "{items:?}");
+                assert!(items.iter().all(|i| matches!(i, Ast::Char(_, true))), "{items:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn quantifier_errors_match_the_oracle_goldens() {
         // 3d: quantifier errors point at the closing `}` (0-based byte offset).
         for (pattern, msg, pos) in [
@@ -2049,18 +2143,23 @@ mod tests {
             ("{2}", E_NOTHING_TO_REPEAT, 3),
             ("a{2}{3}", E_NOTHING_TO_REPEAT, 7),
             ("a{1,2}{3}", E_NOTHING_TO_REPEAT, 9),
+            ("a{2,3}{4}", E_NOTHING_TO_REPEAT, 9),
             ("a*{2}", E_NOTHING_TO_REPEAT, 5),
             ("a?{2}", E_NOTHING_TO_REPEAT, 5),
             ("a{,2}{3}", E_NOTHING_TO_REPEAT, 8),
+            ("a{2}{,2}", E_NOTHING_TO_REPEAT, 8),
             ("a*?*", E_NOTHING_TO_REPEAT, 4),
             ("a**", E_NOTHING_TO_REPEAT, 3),
+            ("a**?", E_NOTHING_TO_REPEAT, 3),
             ("a?*", E_NOTHING_TO_REPEAT, 3),
             ("a{2}*", E_NOTHING_TO_REPEAT, 5),
             ("a{2}??", E_NOTHING_TO_REPEAT, 6),
             ("a{2}+?", E_NOTHING_TO_REPEAT, 6),
+            ("a{2}{3}?", E_NOTHING_TO_REPEAT, 7),
             ("a{65536}", E_NUMBER_TOO_BIG, 7),
             ("a{1000000}", E_NUMBER_TOO_BIG, 9),
             ("a{,65536}", E_NUMBER_TOO_BIG, 8),
+            ("a{,1000000}", E_NUMBER_TOO_BIG, 10),
             ("a{2,65536}", E_NUMBER_TOO_BIG, 9),
             ("a{65535,65536}", E_NUMBER_TOO_BIG, 13),
             // The too-big check precedes the order check.
@@ -2091,6 +2190,8 @@ mod tests {
         assert!(parse_ascii("a{65535,65535}").is_ok());
         assert!(parse_ascii("a{0}").is_ok());
         assert!(parse_ascii("a{0,0}").is_ok());
+        // Leading zeros are digits, so `{01}` is a `{1}` quantifier.
+        assert!(parse_ascii("a{01}").is_ok());
         // A lone `{` that closes nothing is a literal as well.
         assert!(parse_ascii("a{").is_ok());
     }
