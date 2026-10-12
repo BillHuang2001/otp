@@ -97,6 +97,7 @@ mod port;
 mod print;
 mod proc;
 mod proc_reg;
+mod re;
 mod reason;
 mod records;
 mod registry;

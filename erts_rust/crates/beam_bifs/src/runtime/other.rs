@@ -22,7 +22,7 @@
 //!
 //! Every key here is a declared `bif.tab` entry whose implementation needs host
 //! machinery this crate does not own: the interpreter-level debugger tools
-//! (`erl_debugger`), PCRE (`re`), the live driver registry (`erl_ddll`), the
+//! (`erl_debugger`), the live driver registry (`erl_ddll`), the
 //! code-coverage bookkeeping (`code`), the `ets` scheduler fan-in
 //! (`internal_request_all/0`) and C-interior slot walk (`slot/2`), the
 //! tracing-state cleanup and literal-area copy protocols, and the `prim_file` NFC
@@ -30,9 +30,15 @@
 //! `error_logger` category map. Each is registered through the single
 //! [`RuntimeHooks`](crate::context::RuntimeHooks) seam, so a call answers the typed
 //! `unsupported_bif` capability gap until the runtime installs a hook -- never
-//! `undef`, never a fabricated value.
+//! `undef`, never a fabricated value. The `re` group is the exception: those 8 keys
+//! are served by the real in-crate engine (`crate::re`), not the seam.
 
 use crate::registry::BifRegistry;
+
+/// The `(module, function, arity)` keys this module registers **for real** (not
+/// through the `RuntimeHooks` seam) — a single-source alias of [`crate::re`]'s own
+/// [`REAL_BIFS`](crate::re).
+pub(crate) const REAL_BIFS: &[(&str, &str, u32)] = crate::re::REAL_BIFS;
 
 /// Registers this family's BIFs.
 pub(crate) fn register(reg: &mut BifRegistry) {
@@ -57,15 +63,9 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     crate::runtime::runtime_bif!(reg, "erl_debugger", whereis, 0);
     crate::runtime::runtime_bif!(reg, "erl_debugger", xregs_count, 1);
 
-    // `re` -- the PCRE-backed regular-expression engine.
-    crate::runtime::runtime_bif!(reg, "re", compile, 1);
-    crate::runtime::runtime_bif!(reg, "re", compile, 2);
-    crate::runtime::runtime_bif!(reg, "re", import, 1);
-    crate::runtime::runtime_bif!(reg, "re", inspect, 2);
-    crate::runtime::runtime_bif!(reg, "re", internal_run, 4);
-    crate::runtime::runtime_bif!(reg, "re", run, 2);
-    crate::runtime::runtime_bif!(reg, "re", run, 3);
-    crate::runtime::runtime_bif!(reg, "re", version, 0);
+    // `re` -- the 8 regular-expression keys are now real implementations served by
+    // the in-crate engine (`crate::re`), not `RuntimeHooks` seam keys.
+    crate::re::register(reg);
 
     // `erl_ddll` -- the dynamically linked driver loader. `format_error_int/1` is
     // the one self-contained key and is implemented for real in `src/runtime/ddll.rs`.
@@ -104,6 +104,16 @@ pub(crate) fn register(reg: &mut BifRegistry) {
 
     // `error_logger` -- the legacy warning-category map.
     crate::runtime::runtime_bif!(reg, "error_logger", warning_map, 0);
+
+    // The 8 keys this family owns for real (see `REAL_BIFS`) are registered by
+    // `crate::re::register` above; assert they really landed so the roster cannot drift
+    // from what was registered.
+    debug_assert!(
+        REAL_BIFS
+            .iter()
+            .all(|(module, function, arity)| reg.contains(module, function, *arity)),
+        "REAL_BIFS lists a key that this module does not register"
+    );
 }
 
 #[cfg(test)]
@@ -114,8 +124,10 @@ mod tests {
     use beam_process::ProcessId;
     use beam_term::{AtomTable, Eterm};
 
-    /// Every key registered here is reachable and, with no [`RuntimeHooks`] hook
-    /// installed, answers the typed capability gap rather than a fabricated value.
+    /// Every `RuntimeHooks`-seam key registered here is reachable and, with no
+    /// [`RuntimeHooks`] hook installed, answers the typed capability gap rather than a
+    /// fabricated value. (The `re` keys are real implementations — `crate::re` — and are
+    /// asserted reachable only.)
     ///
     /// [`RuntimeHooks`]: crate::context::RuntimeHooks
     #[test]
@@ -132,13 +144,6 @@ mod tests {
         let mut heap = Heap::new(8).expect("test heap");
         let atoms = AtomTable::new();
         let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
-        let args = vec![ctx.int(0).expect("small int"); 3];
-        match reg.call("re", "run", 3, &mut ctx, &args) {
-            Err(beam_common::BeamError::Raise(r)) => {
-                assert_eq!(r.reason, beam_common::ExitReason::atom("unsupported_bif"));
-            }
-            other => panic!("expected unsupported_bif, got {other:?}"),
-        }
 
         let args = vec![ctx.int(0).expect("small int"); 2];
         match reg.call("os", "set_signal", 2, &mut ctx, &args) {
@@ -167,7 +172,7 @@ mod tests {
     fn os_set_signal_is_a_roster_seam_key_forwarder() {
         assert!(
             crate::hook_sets::needs_runtime_hooks("os", "set_signal", 2),
-            "os:set_signal/2 must be in the 187-key RuntimeHooks roster"
+            "os:set_signal/2 must be in the 179-key RuntimeHooks roster"
         );
 
         let mut reg = BifRegistry::new();
