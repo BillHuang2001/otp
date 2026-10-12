@@ -206,7 +206,7 @@ Non-corpus modules:
 - `src/lib.rs` -> crate docs, module wiring, public re-exports (the public API surface)
 - `src/error.rs` -> `Error` (`Usage`/`Env`/`Io`) + `Result` + exit-code mapping
 - `src/cli.rs` -> `Command` (incl. `suite --allowlist`/`--gaps` and `list --by-contract`), hand-rolled `parse`, `--help`/usage text
-- `src/runtime.rs` -> runtime resolution (`$ERTS_ORACLE`/`erl`, `$BEAM_RT`/target, release-before-debug), `UNSUPPORTED_EXIT_CODE`, `Observation`, argv build, `run`/`run_with_env`/`own_env`, `output_with_retry`
+- `src/runtime.rs` -> runtime resolution (`$ERTS_ORACLE`/`erl`, `$BEAM_RT`/target, `$BEAM_DIST_PROBE`/target for the `dist_probe` helper — `resolve_helper`/`resolve_helper_from`/`helper_unsupported_reason`, all release-before-debug), `UNSUPPORTED_EXIT_CODE`, `Observation`, argv build, `run`/`run_with_env`/`own_env`, `output_with_retry`
 - `src/module_build.rs` -> the **Erlang** half: `erlc` resolution, embedded-module compilation into a temp dir (`CompiledModule`), `compile_extra_into` (a `ModuleEnv` helper module into an already-built dir), temp-dir helpers, the process-local `erlc` compile cache; re-exports the C/NIF build surface
 - `src/nif_build.rs` -> the **C/NIF** half (crate-private): `$CC`/`cc` resolution, the `erl_nif.h` include-dir locator, `NifFixture`, `build(…) -> Build::{Compiled,Skipped}`, the memoized `.so` compile
 - `src/compare.rs` -> observable diff (`Observables`), classified stderr (`is_runtime_banner_line`/`significant_stderr`), golden check, `Verdict`
