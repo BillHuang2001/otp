@@ -72,6 +72,8 @@ mod exec;
 #[allow(dead_code)]
 mod render;
 
+// The run-side BIF bodies (`re:run/2,3`, `re:internal_run/4`).
+mod run;
 /// The compiled-pattern tag of the plain `{re_pattern, …}` form.
 const RE_PATTERN: &str = "re_pattern";
 
@@ -405,21 +407,6 @@ fn inspect_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     ctx.tuple(&[item, list])
 }
 
-/// `re:internal_run/4` — the placeholder the engine implementation replaces.
-fn internal_run_4(_ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
-    Err(crate::error::unsupported_bif())
-}
-
-/// `re:run/2` — the placeholder the engine implementation replaces.
-fn run_2(_ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
-    Err(crate::error::unsupported_bif())
-}
-
-/// `re:run/3` — the placeholder the engine implementation replaces.
-fn run_3(_ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
-    Err(crate::error::unsupported_bif())
-}
-
 /// The `re` surface version string this engine models.
 ///
 /// This is the **compatibility-target version string of the `re` surface we
@@ -442,9 +429,9 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("re", "compile", 2, compile_2);
     reg.register("re", "import", 1, import_1);
     reg.register("re", "inspect", 2, inspect_2);
-    reg.register("re", "internal_run", 4, internal_run_4);
-    reg.register("re", "run", 2, run_2);
-    reg.register("re", "run", 3, run_3);
+    reg.register("re", "internal_run", 4, run::internal_run_4);
+    reg.register("re", "run", 2, run::run_2);
+    reg.register("re", "run", 3, run::run_3);
     reg.register("re", "version", 0, version_0);
 }
 
