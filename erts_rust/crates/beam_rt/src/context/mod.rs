@@ -606,11 +606,14 @@ impl<'a> RuntimeContext<'a> {
     /// be recycled by the *next* message's delivery. An exempt process refuses that
     /// collection instead, which is what keeps the caller's handles valid.
     ///
-    /// The scheduler slice is deliberately **not** wrapped: the runner drives it with
-    /// `run_export_outcome_with_tier`/`run_label_outcome_with_tier` directly, publishes a
-    /// parked machine's roots, and its `BudgetContext` arms the per-call GC latch for the
-    /// admission point that **is** the legitimate collection site
-    /// ([`gc::ensure_heap`](crate::context::gc::ensure_heap)).
+    /// The scheduler slice's **running** window is deliberately **not** wrapped: the runner
+    /// drives it with `run_export_outcome_with_tier`/`run_label_outcome_with_tier` directly,
+    /// and its `BudgetContext` arms the per-call GC latch for the admission point that **is**
+    /// the legitimate collection site
+    /// ([`gc::ensure_heap`](crate::context::gc::ensure_heap)). Its **parked** window is marked
+    /// by the runner instead: the Wait park arm sets the exemption
+    /// ([`runner::run`](crate::runner)) and the resume clears it, so no delivery or
+    /// `beam_process` signal relocates a waiting process's heap.
     ///
     /// # Nesting
     ///
@@ -676,13 +679,11 @@ impl<'a> RuntimeContext<'a> {
     /// Re-syncs a **resuming** machine from this context's process root set (the runner's
     /// resume seam).
     ///
-    /// A parked machine can be relocated under it: while the process waits, a delivery-driven
-    /// collection ([`Process::deliver`](beam_process::Process::deliver)'s exit cascade, which —
-    /// unlike the in-slice admission point — is **not** gated by
-    /// [`gc_process_enabled`](Runtime::gc_process_enabled)) rewrites the process's `regs` in
-    /// place, so the machine's own `x`/`stack`/`fr` point into the abandoned space. The
-    /// process's root set is the truth a resume must run from, so this copies it back into the
-    /// machine — all three containers
+    /// A parked machine can be relocated under it: while the machine is out of the runner, a
+    /// collection that ran between slices — the pre-emption (`Yield`) window, which is never
+    /// marked relocation-exempt — rewrites the process's `regs` in place, so the machine's own
+    /// `x`/`stack`/`fr` point into the abandoned space. The process's root set is the truth a
+    /// resume must run from, so this copies it back into the machine — all three containers
     /// ([`gc::scatter_roots_full`](crate::context::gc::scatter_roots_full), the FR file
     /// included). If their slice lengths no longer match, the process's collection is halted
     /// rather than run against inconsistent roots ([`crate::context::gc`] documents the
@@ -690,7 +691,7 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// The machine's live **pending-exception reason** rides the process's
     /// [`extra_roots`](beam_process::Registers::extra_roots) (published by
-    /// `runner::run::publish_parked_roots`), which the collector has already relocated in
+    /// `runner::run::publish_parked_roots`), which such a collection has already relocated in
     /// place; this reads that relocated word back into
     /// [`Machine::pending_exception_mut`](beam_engine::Machine::pending_exception_mut) so the
     /// resumed machine points at the moved term, then **clears** the process's extra roots so
@@ -922,9 +923,12 @@ impl<'a> RuntimeContext<'a> {
     /// # The receiver's own collection, and the runtime's unscanned-root valve
     ///
     /// Exempting the **sender** covers only the sender. [`Process::deliver`] can *also* collect
-    /// the **receiver's** heap: a receiver that is parked (`Waiting`) and not relocation-exempt
-    /// takes the refusal path of `deliver`, which runs a rooted collection (and an on-demand
-    /// growth) over *its* root set. The runtime's four admission doors
+    /// the **receiver's** heap: a receiver that is neither `Running` nor relocation-exempt
+    /// passes `has_unpublished_roots`, so `deliver` runs a rooted collection (and an on-demand
+    /// growth) over *its* root set — the `Runnable` shape, a process woken by a delivery or
+    /// pre-empted at a yield. (A `Waiting` receiver is exempt for its whole parked window — the
+    /// runner's Wait park arm sets the mark and the resume clears it — so it refuses the move.)
+    /// The runtime's four admission doors
     /// (`gc::{ensure_heap, ensure_heap_full, alloc_words_rooted}` and `Runtime::serve_gc_request`)
     /// refuse exactly that move when the receiver's roots reach a container the collector does
     /// not scan ([`crate::context::gc_walk`]); the delivery-driven site inside
@@ -3273,23 +3277,26 @@ fn call_site_reading_imports(module: &Module) -> CallSiteReadingImports {
 ///   Every other function of the same module — `compile:forms/2`, `compile:file/2`, and every
 ///   other `compile:*` entry — is entered in-machine, so a `receive` inside it **suspends** the
 ///   process instead of folding into the typed [`beam_engine::blocked`] gap the nested
-///   non-pumping `call_bif` route reports (the A.9 self-hosted-build blocker).
+///   non-pumping `call_bif` route reports.
 ///
 ///   The refusal is a **conservative routing guard against a hazard owned elsewhere**: a callee
 ///   entered in-machine can park with a live
-///   [`Machine::pending_exception`](beam_engine::Machine) — a term the engine holds and which
-///   `beam_process::Registers::gather_roots` does **not** publish — and a delivery-driven
-///   collection in the park window (`beam_process`'s signal-build heap growth) then relocates
-///   the process heap against that incomplete root set, freeing words the parked machine still
-///   points at. The hazard belongs to the function that issues the fun-image call, which is why
-///   the guard is scoped to it and removed together with the root-set fix.
+///   [`Machine::pending_exception`](beam_engine::Machine) — a term the engine holds, which only
+///   the runner's park arm publishes into the process root set — and a `beam_process`
+///   signal-driven heap growth would relocate the process heap against that incomplete root
+///   set, freeing words the parked machine still points at. `beam_rt` declines that collection
+///   for the parked (and woken-not-yet-resumed) window — the park arm keeps the process
+///   relocation-exempt and the resume clears the mark — so the guard's remaining job is the
+///   identity question it was written for: a fun-image call's answer depends on the module the
+///   *call instruction* sits in, which only the synchronous route can attest.
 ///
 /// # The residual (documented, not a wrong result)
 ///
 /// A fun-image call reached from an admitted function through a **local** call chain (or
-/// `apply/3`) is not seen here: a local `call` never re-consults the seam, so the park-window
-/// hazard it could reach stays uncovered by this guard. Only a `beam_engine` change that
-/// publishes the callee's own identity could remove the hazard rather than route around it.
+/// `apply/3`) is not seen here: a local `call` never re-consults the seam. That is sound — a
+/// local call stays inside the module that was entered, so the call site's module (and with it
+/// the fun image's identity) is unchanged — and the park hazard such a callee could raise is
+/// declined by the runner's park-window relocation exemption rather than by this guard.
 ///
 /// The fun-image **image derivation** itself cannot be made wrong by an in-machine callee's
 /// stale identity ([`FunIdentityBridge`] searches every loaded module), so admission never

@@ -67,12 +67,17 @@ impl<'a> RuntimeRunner<'a> {
 /// Publishes a **parked** machine's whole live root set into `pid`'s process root set.
 ///
 /// A suspended process's machine lives in [`RunnerState::engines`], but a machine's registers
-/// are only a *copy* of the process's root set. A collection driven while the process is parked
-/// — [`Process::deliver`](beam_process::Process::deliver)'s exit cascade is **not** gated by
+/// are only a *copy* of the process's root set. A collection driven from outside a slice —
+/// [`Process::deliver`](beam_process::Process::deliver)'s exit cascade and the `beam_process`
+/// signal builders are **not** gated by
 /// [`Runtime::gc_process_enabled`](crate::runtime::Runtime) — relocates the process's heap
-/// against its own `regs`, so the parked machine must have published them first; otherwise the
-/// collector runs against a partial root set and leaves a stale word in the machine's `x`
-/// ([`crate::context::gc`] documents the hand-off).
+/// against its own `regs`, so the parked machine must have published them first; otherwise
+/// such a collection would run against a partial root set and leave a stale word in the
+/// machine's `x` ([`crate::context::gc`] documents the hand-off). The **Wait** park arm
+/// additionally marks the process relocation-exempt for the parked window (cleared when the
+/// process is resumed), so a delivery or signal to a *waiting* receiver is declined rather
+/// than collected; the publication is what the **`Yield`** (pre-emption) arm — never marked
+/// exempt — and the resume's re-sync rely on.
 ///
 /// The machine's **whole** root set is published — every x register, the whole Erlang stack
 /// **and the whole FR file** ([`gc::publish_roots_full`](crate::context::gc::publish_roots_full)).
@@ -88,10 +93,10 @@ impl<'a> RuntimeRunner<'a> {
 /// *field*, not an `x`/stack/FR slot. It is therefore read out before the root-set borrow and
 /// published as the process's [`Registers::extra_roots`](beam_process::Registers::extra_roots)
 /// word — the host escape hatch `beam_process`'s `gather_roots`/`scatter_roots` relocate in
-/// place — so a collection in the park window moves it with the heap instead of leaving the
-/// machine's slot on a dead word. With **no** live pending exception the extra-root set is left
-/// **empty** (cleared, never a placeholder), so a stale root can never keep an otherwise-dead
-/// term alive.
+/// place — so a collection that does run (a `Yield`-window one) moves it with the heap and the
+/// resume re-syncs it back into the machine. With **no** live pending exception the extra-root
+/// set is left **empty** (cleared, never a placeholder), so a stale root can never keep an
+/// otherwise-dead term alive.
 ///
 /// A `pid` with no process in `table` has nothing to publish into; the machine is left as it is.
 pub(super) fn publish_parked_roots(
@@ -119,13 +124,14 @@ pub(super) fn publish_parked_roots(
 
 /// Re-syncs a machine about to **resume** from the process's authoritative root set.
 ///
-/// The twin of [`publish_parked_roots`]: while the process was parked, a delivery-driven
-/// collection may have relocated its heap and rewritten the process's `regs` in place, leaving
-/// the parked machine's own `x`/`stack` pointing into the abandoned space. The process's root
-/// set — not the machine's stale copy — is therefore the truth a resume must run from; the
-/// context method reconciles them (including reading the relocated pending-exception reason
-/// back into the machine and consuming the process's extra roots) and halts the process's
-/// collection if their slices no longer match (see [`RuntimeContext::resync_parked_roots`]).
+/// The twin of [`publish_parked_roots`]: while the machine was out of the runner — a `Yield`
+/// pre-emption, which is never marked relocation-exempt — a collection may have relocated the
+/// process's heap and rewritten the process's `regs` in place, leaving the parked machine's own
+/// `x`/`stack` pointing into the abandoned space. The process's root set — not the machine's
+/// stale copy — is therefore the truth a resume must run from; the context method reconciles
+/// them (including reading the relocated pending-exception reason back into the machine and
+/// consuming the process's extra roots) and halts the process's collection if their slices no
+/// longer match (see [`RuntimeContext::resync_parked_roots`]).
 pub(super) fn resume_from_process_roots(
     ctx: &mut RuntimeContext<'_>,
     pid: ProcessId,
@@ -550,14 +556,16 @@ impl ProcessRunner for RuntimeRunner<'_> {
                     // above — collects as usual, so nothing grows unboundedly.
                     process.set_relocation_exempt(true);
                 }
-                // Publish the machine's roots before the engine is parked: a delivery-driven
-                // collection (`Process::deliver`'s exit cascade, ungated by
-                // `gc_process_enabled`) may relocate this process's heap while it waits (see
-                // `publish_parked_roots`).
+                // Publish the machine's roots before the engine is parked. The parked process
+                // is relocation-exempt (set above), so the parked window itself is not
+                // collected over; the publication is what the `Yield` window (never exempt)
+                // and the resume's re-sync rely on (see `publish_parked_roots`).
                 publish_parked_roots(table, pid, &mut engine.machine);
-                // ...and serve a pending `garbage_collect` request (see
-                // `Runtime::request_gc`), which is why a process that asks for a collection
-                // and then blocks is still collected.
+                // A pending `garbage_collect` request (see `Runtime::request_gc`) is **not**
+                // served here: the exemption set above declines it — `serve_gc_request`
+                // consults `Process::is_relocation_exempt` before committing to a collection —
+                // so the request is consumed and dropped like any other valve-refused one.
+                // The admission points and the `Yield` arm are the sites that serve it.
                 self.runtime.serve_gc_request(table, pid);
                 self.state.engines.insert(pid, engine);
                 Ok(RunOutcome::Wait)
