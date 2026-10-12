@@ -62,7 +62,7 @@ use crate::driver::{Driver, DriverRegistry, PortExitReason};
 use crate::error;
 use crate::poller::{Event, Poller};
 use crate::port::{Port, PortCommandOptions, PortControl, PortState, DEFAULT_READINESS_RED_BUDGET};
-use crate::port_task::{PortNotification, PortTaskKind, PortTaskOutcome, Readiness};
+use crate::port_task::{LineNotification, PortNotification, PortTaskKind, PortTaskOutcome, Readiness};
 
 /// The set of live ports, keyed by port number, plus the id allocator.
 ///
@@ -279,9 +279,9 @@ impl PortRegistry {
     /// queued; a [`PortTaskKind::Timeout`] task whose deadline has not passed is not run.
     /// Afterwards every port holding buffered input has it drained into a
     /// [`PortNotification::Data`] — or, for a port in `{line, N}` mode
-    /// ([`PortRegistry::set_line_mode`]), into one [`PortNotification::DataLine`] per line
-    /// frame the read produced — and every port closed since the previous round is
-    /// reported as a [`PortNotification::Closed`].
+    /// ([`PortRegistry::set_line_mode`]), into [`LineNotification`] frames staged on the
+    /// separate line channel (drained with [`PortRegistry::take_line_notifications`]) — and
+    /// every port closed since the previous round is reported as a [`PortNotification::Closed`].
     ///
     /// # Errors
     ///
@@ -326,9 +326,10 @@ impl PortRegistry {
 
         // Harvest the data the INPUT tasks read: a port task never hands bytes up itself,
         // so the round reports them for the runtime to turn into `{Port, {data, Data}}`. A
-        // port in line mode (`PortRegistry::set_line_mode`) reports **every** frame the read
-        // produced — one read can yield many `{data, {eol|noeol, Data}}` messages — so the
-        // notifications are extended, never replaced.
+        // port in line mode (`PortRegistry::set_line_mode`) reports **no** notification here:
+        // the call stages its frames on the separate line channel instead (drained with
+        // `PortRegistry::take_line_notifications`), which is why this loop runs for *every*
+        // live port — the staging is the side effect that matters in line mode.
         let keys = self.sorted_keys();
         for key in keys {
             if let Some(port) = self.ports.get_mut(&key) {
@@ -473,7 +474,7 @@ impl PortRegistry {
     /// Enables or disables **line framing** (`{line, N}`) on port `id`'s input.
     ///
     /// `Some(max_len)` splits the bytes the port's driver hands up into
-    /// [`PortNotification::DataLine`] frames of at most `max_len` bytes (`0` = no length
+    /// [`LineNotification`] frames of at most `max_len` bytes (`0` = no length
     /// limit); `None` (the default) delivers them raw as [`PortNotification::Data`]. This is
     /// the runtime's adoption point for `open_port(..., [line])` / `[binary, {line, N}]`
     /// (`ERTS_PORT_SFLG_LINEBUF_IO`, `erl_bif_port.c:862-869,986`) — see
@@ -490,6 +491,29 @@ impl PortRegistry {
             }
             None => Err(error::badarg()),
         }
+    }
+
+    /// Drains the line frames every `{line, N}` port staged, in **port-number order**.
+    ///
+    /// This is the `{line, N}` channel's runtime entry point, the counterpart of
+    /// [`PortTaskOutcome::notifications`]: [`PortRegistry::execute_port_tasks`] harvests each
+    /// line-mode port's buffered input into frames (staging them, and reporting **no**
+    /// [`PortNotification`] for that port), and the caller then polls this to collect them —
+    /// exactly the accessor style of [`PortRegistry::take_eof`] /
+    /// [`PortRegistry::take_closed_notifications`]. Because the frames are drained here, a
+    /// caller must poll after **every** round in which a line-mode port may have read, or the
+    /// frames are lost; the port-number ordering keeps the report deterministic.
+    ///
+    /// A raw-mode registry (no line-mode port) always returns an empty `Vec`, so a caller can
+    /// poll unconditionally.
+    pub fn take_line_notifications(&mut self) -> Vec<LineNotification> {
+        let mut frames = Vec::new();
+        for key in self.sorted_keys() {
+            if let Some(port) = self.ports.get_mut(&key) {
+                frames.extend(port.take_line_frames());
+            }
+        }
+        frames
     }
 
     /// Releases port `id`'s pending partial line as `noeol` frame(s) for the next harvest.
@@ -754,7 +778,8 @@ mod tests {
     use crate::poller::{Event, Interest, Poller, Ready, Token, WAKER_KEY};
     use crate::port::{PortCommandOptions, PortControl, PortState, DEFAULT_READINESS_RED_BUDGET};
     use crate::port_task::{
-        PortNotification, PortTaskKind, Readiness, PORT_REDS_INPUT, PORT_REDS_TIMEOUT,
+        LineNotification, PortNotification, PortTaskKind, Readiness, PORT_REDS_INPUT,
+        PORT_REDS_TIMEOUT,
     };
     use beam_common::{BeamError, Result};
     use beam_process::{PortId, PortWatch, ProcessTable, SignalAtoms};
@@ -1069,9 +1094,9 @@ mod tests {
 
     // --- `{line, N}` line framing --------------------------------------------
 
-    /// A `{data, {eol|noeol, Bytes}}` notification for `port`.
-    fn line(port: PortId, bytes: &[u8], eol: bool) -> PortNotification {
-        PortNotification::DataLine {
+    /// A `{data, {eol|noeol, Bytes}}` frame for `port`, on the line channel.
+    fn line(port: PortId, bytes: &[u8], eol: bool) -> LineNotification {
+        LineNotification {
             port,
             bytes: bytes.to_vec(),
             eol,
@@ -1151,6 +1176,18 @@ mod tests {
             .notifications
     }
 
+    /// Runs one port-task round and returns the **line frames** it staged, draining the line
+    /// channel the way the runtime does ([`PortRegistry::take_line_notifications`]).
+    ///
+    /// The round itself reports no [`PortNotification`] for a line-mode port (its input rides
+    /// the line channel), so this is the line-mode analogue of [`round`].
+    fn line_round(poller: &mut Poller, registry: &mut PortRegistry) -> Vec<LineNotification> {
+        registry
+            .execute_port_tasks(poller, DEFAULT_READINESS_RED_BUDGET)
+            .expect("the round runs");
+        registry.take_line_notifications()
+    }
+
     /// A pipe port in `{line, N}` mode with `bytes` written to its read end.
     fn line_pipe(poller: &mut Poller, bytes: &[u8], max_len: usize) -> (PortRegistry, PortId) {
         let (mut registry, id) = registry_with_pipe(poller);
@@ -1166,7 +1203,7 @@ mod tests {
         let mut poller = poller();
         let (mut registry, id) = line_pipe(&mut poller, b"a\nb\nc\n", 1024);
 
-        // One read, three lines: the round reports **three** notifications, not one blob.
+        // One read, three lines: the round stages **three** line frames, not one blob.
         assert!(registry.schedule_readiness(
             id.number(),
             Readiness {
@@ -1175,7 +1212,7 @@ mod tests {
             }
         ));
         assert_eq!(
-            round(&mut poller, &mut registry),
+            line_round(&mut poller, &mut registry),
             vec![
                 line(id, b"a", true),
                 line(id, b"b", true),
@@ -1183,7 +1220,30 @@ mod tests {
             ]
         );
         // A second round has nothing left to report (the frames were drained).
-        assert!(round(&mut poller, &mut registry).is_empty());
+        assert!(line_round(&mut poller, &mut registry).is_empty());
+    }
+
+    #[test]
+    fn line_mode_ports_report_nothing_on_the_notification_channel() {
+        // The line frames must not leak onto the `PortNotification` channel: a line-mode
+        // port's round reports **no** notification at all, on either channel's first poll.
+        let mut poller = poller();
+        let (mut registry, id) = line_pipe(&mut poller, b"a\nb\n", 1024);
+        assert!(registry.schedule_readiness(
+            id.number(),
+            Readiness {
+                readable: true,
+                ..Readiness::default()
+            }
+        ));
+        assert!(
+            round(&mut poller, &mut registry).is_empty(),
+            "a line-mode port's input rides the line channel, not `PortNotification`"
+        );
+        assert_eq!(
+            registry.take_line_notifications(),
+            vec![line(id, b"a", true), line(id, b"b", true)]
+        );
     }
 
     #[test]
@@ -1199,7 +1259,10 @@ mod tests {
                 ..Readiness::default()
             }
         ));
-        assert_eq!(round(&mut poller, &mut registry), vec![line(id, b"", true)]);
+        assert_eq!(
+            line_round(&mut poller, &mut registry),
+            vec![line(id, b"", true)]
+        );
     }
 
     #[test]
@@ -1214,7 +1277,7 @@ mod tests {
             }
         ));
         assert_eq!(
-            round(&mut poller, &mut registry),
+            line_round(&mut poller, &mut registry),
             vec![
                 line(id, b"abcd", false),
                 line(id, b"efgh", true),
@@ -1226,8 +1289,8 @@ mod tests {
     #[test]
     fn one_read_yields_every_line_frame_it_contains() {
         // A single read can carry many messages: 597 `a`s and a newline at a `{line,4}` limit is
-        // 149 `noeol` chunks plus one newline-terminated `eol` — **150** notifications from one
-        // round, which is why the round harvests a `Vec` per port rather than a single one.
+        // 149 `noeol` chunks plus one newline-terminated `eol` — **150** frames from one
+        // round, which is why the port stages a queue rather than a single one.
         let mut payload = vec![b'a'; 597];
         payload.push(b'\n');
         let mut poller = poller();
@@ -1239,16 +1302,10 @@ mod tests {
                 ..Readiness::default()
             }
         ));
-        let frames = round(&mut poller, &mut registry);
+        let frames = line_round(&mut poller, &mut registry);
         assert_eq!(frames.len(), 150, "one read, 150 frames");
         assert_eq!(
-            frames
-                .iter()
-                .filter(|notification| matches!(
-                    notification,
-                    PortNotification::DataLine { eol: true, .. }
-                ))
-                .count(),
+            frames.iter().filter(|frame| frame.eol).count(),
             1,
             "exactly the newline-terminated frame is `eol` ({frames:?})"
         );
@@ -1284,6 +1341,10 @@ mod tests {
             }],
             "with line mode off the whole read crosses as one Data notification"
         );
+        assert!(
+            registry.take_line_notifications().is_empty(),
+            "a raw-mode port stages no line frames"
+        );
     }
 
     #[test]
@@ -1315,16 +1376,19 @@ mod tests {
             }
         ));
         assert_eq!(
-            round(&mut poller, &mut registry),
+            line_round(&mut poller, &mut registry),
             vec![line(id, b"a", true)],
             "the partial line is held back"
         );
 
         // The explicit flush (what `take_eof` runs) releases it, once, as `noeol`.
         registry.flush_linebuf(id).expect("the port is live");
-        assert_eq!(round(&mut poller, &mut registry), vec![line(id, b"b", false)]);
+        assert_eq!(
+            line_round(&mut poller, &mut registry),
+            vec![line(id, b"b", false)]
+        );
         assert!(
-            round(&mut poller, &mut registry).is_empty(),
+            line_round(&mut poller, &mut registry).is_empty(),
             "the flush is not repeated"
         );
 
@@ -1337,12 +1401,19 @@ mod tests {
                 ..Readiness::default()
             }
         ));
-        assert_eq!(round(&mut poller, &mut registry), vec![line(id, b"c", true)]);
+        assert_eq!(
+            line_round(&mut poller, &mut registry),
+            vec![line(id, b"c", true)]
+        );
         registry.close(&mut poller, id).expect("closes");
         assert_eq!(
             round(&mut poller, &mut registry),
             vec![PortNotification::Closed { port: id }],
             "a close reports the close and never a flushed frame"
+        );
+        assert!(
+            registry.take_line_notifications().is_empty(),
+            "a close stages no line frame"
         );
     }
 
@@ -1363,7 +1434,7 @@ mod tests {
             .expect("live")
             .schedule_task(PortTaskKind::Input));
         assert_eq!(
-            round(&mut poller, &mut registry),
+            line_round(&mut poller, &mut registry),
             vec![line(id, b"a", true)]
         );
 
@@ -1373,9 +1444,12 @@ mod tests {
             "the driver reports the end of the stream"
         );
         // …which the next round reports as a `noeol` frame; the `eof` report is once-only.
-        assert_eq!(round(&mut poller, &mut registry), vec![line(id, b"b", false)]);
+        assert_eq!(
+            line_round(&mut poller, &mut registry),
+            vec![line(id, b"b", false)]
+        );
         assert!(!registry.take_eof(id).expect("the check succeeds"));
-        assert!(round(&mut poller, &mut registry).is_empty());
+        assert!(line_round(&mut poller, &mut registry).is_empty());
     }
 
     #[test]

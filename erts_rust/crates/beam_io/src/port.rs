@@ -57,6 +57,7 @@
 //! members of the struct. Do **not** add a combined accessor that hands out `&mut` to both
 //! the driver and the queues at once — that cannot borrow-check.
 
+use std::collections::VecDeque;
 use std::time::Instant;
 
 use beam_common::Result;
@@ -66,7 +67,9 @@ use crate::driver::{Driver, DriverContext, PortArms, PortExitReason};
 use crate::drivers::line_buffer::LineBuffer;
 use crate::error;
 use crate::poller::Poller;
-use crate::port_task::{PortNotification, PortTask, PortTaskKind, PortTaskQueue, PORT_REDS_EXECUTE};
+use crate::port_task::{
+    LineNotification, PortNotification, PortTask, PortTaskKind, PortTaskQueue, PORT_REDS_EXECUTE,
+};
 use crate::queue::ByteQueue;
 
 // The registry lives in the sibling [`crate::registry`] module; re-export it here so the
@@ -115,12 +118,17 @@ pub struct Port {
     exit_notified: bool,
     /// The line-framing mode (`{line, N}`): `None` delivers raw bytes
     /// ([`PortNotification::Data`]), `Some(max_len)` splits the input into
-    /// [`PortNotification::DataLine`] frames of at most `max_len` bytes. The C's
+    /// [`LineNotification`] frames of at most `max_len` bytes. The C's
     /// `ERTS_PORT_SFLG_LINEBUF_IO` plus `linebuf->max_len` (`erl_port.h:330`).
     line_mode: Option<usize>,
     /// The line accumulator used in line mode (the C's `allocate_linebuf` state; untouched
     /// while [`Port::line_mode`] is `None`).
     line: LineBuffer,
+    /// The line frames staged for the owner in line mode, in arrival order. Populated by
+    /// [`Port::take_input_notifications`] (which frames the buffered input) and drained by
+    /// [`Port::take_line_frames`] — the separate channel a `{line, N}` port reports through,
+    /// so its input never rides [`PortNotification`].
+    pending_lines: VecDeque<LineNotification>,
 }
 
 impl Port {
@@ -139,6 +147,7 @@ impl Port {
             exit_notified: false,
             line_mode: None,
             line: LineBuffer::new(0),
+            pending_lines: VecDeque::new(),
         }
     }
 
@@ -408,7 +417,8 @@ impl Port {
     ///
     /// The frames are *staged* (see [`LineBuffer::flush_into_ready`]) rather than returned, so
     /// they ride the next [`Port::take_input_notifications`] together with any complete lines
-    /// still queued. A port in raw mode (`line_mode` is `None`) is untouched, and a repeat
+    /// still queued — and are then drained from the [`Port::take_line_frames`] channel. A port
+    /// in raw mode (`line_mode` is `None`) is untouched, and a repeat
     /// call stages nothing (a flush is idempotent), so this is safe to call on every
     /// end-of-file observation. [`Port::close`] never calls it: closing a port does **not**
     /// flush the partial line (only end-of-file does).
@@ -442,11 +452,11 @@ impl Port {
     /// [`PortNotification::Data`]: the buffered input bytes are drained out of the input queue,
     /// so a report happens **exactly once per byte**. An empty read reports nothing.
     ///
-    /// In line mode the whole buffered input is fed through the line accumulator and **every**
-    /// resulting frame is reported as a [`PortNotification::DataLine`], so a single read can
-    /// yield many notifications (a 601-byte `[line,4]` chunk is 150 of them: 149 `noeol` + 1
-    /// `eol`). An empty frame is **not** dropped here: a blank line is the oracle's
-    /// `{Port, {data, {eol, []}}}`.
+    /// In line mode this returns **no** notification: the whole buffered input is fed through
+    /// the line accumulator and every resulting frame is staged on the [`Port::take_line_frames`]
+    /// channel instead, so a single read can yield many frames (a 601-byte `[line,4]` chunk is
+    /// 150 of them: 149 `noeol` + 1 `eol`). An empty frame is **not** dropped here: a blank line
+    /// is the oracle's `{Port, {data, {eol, []}}}`.
     ///
     /// The condition is the *queue* (and, in line mode, the line accumulator), not "an `INPUT`
     /// task ran": the legacy C delivers `driver_output` to the port owner as soon as the driver
@@ -455,6 +465,10 @@ impl Port {
     /// `INPUT` task — must reach the owner on the next port-task round exactly like one made
     /// from `ready_input`. Gating the report on an `INPUT` task having run ([`Port::run_task`])
     /// would strand those bytes in the queue, which is why the gate was removed.
+    ///
+    /// In line mode the framing side effect happens even though the return value is empty, so a
+    /// round must call this for every port (as [`crate::PortRegistry::execute_port_tasks`] does)
+    /// before the frames can be drained with [`Port::take_line_frames`].
     pub(crate) fn take_input_notifications(&mut self) -> Vec<PortNotification> {
         if self.line_mode.is_none() {
             if !self.has_input() {
@@ -474,15 +488,25 @@ impl Port {
             self.line.push(&bytes);
         }
         let port = self.id;
-        self.line
-            .take_frames()
-            .into_iter()
-            .map(|frame| PortNotification::DataLine {
+        let frames = self.line.take_frames();
+        self.pending_lines
+            .extend(frames.into_iter().map(|frame| LineNotification {
                 port,
                 bytes: frame.bytes,
                 eol: frame.eol,
-            })
-            .collect()
+            }));
+        Vec::new()
+    }
+
+    /// Takes the line frames this port owes, in arrival order.
+    ///
+    /// This is the drain side of the `{line, N}` channel: the frames
+    /// [`Port::take_input_notifications`] staged out of the buffered input (plus any a
+    /// `driver_eof` flush staged, see [`Port::flush_linebuf`]). An empty `eol` frame is kept —
+    /// a blank line is the oracle's `{Port, {data, {eol, []}}}`. A port in raw mode never stages
+    /// anything, so this is empty there.
+    pub(crate) fn take_line_frames(&mut self) -> Vec<LineNotification> {
+        self.pending_lines.drain(..).collect()
     }
 
     /// Dispatches read readiness to the driver's `ready_input`.
@@ -904,16 +928,26 @@ mod tests {
     }
 
     /// The frames a port currently owes, as `(marker, bytes)` pairs: `None` is a raw
-    /// [`PortNotification::Data`] chunk, `Some(eol)` a [`PortNotification::DataLine`] frame.
+    /// [`PortNotification::Data`] chunk, `Some(eol)` a [`LineNotification`] frame.
+    ///
+    /// A round harvests both channels: [`Port::take_input_notifications`] reports the raw
+    /// payloads (and stages the line frames), [`Port::take_line_frames`] drains the staged
+    /// line frames. A port is in exactly one mode, so the two never mix.
     fn frames(port: &mut Port) -> Vec<(Option<bool>, Vec<u8>)> {
-        port.take_input_notifications()
+        let mut frames: Vec<(Option<bool>, Vec<u8>)> = port
+            .take_input_notifications()
             .into_iter()
             .map(|notification| match notification {
-                PortNotification::DataLine { bytes, eol, .. } => (Some(eol), bytes),
                 PortNotification::Data { bytes, .. } => (None, bytes),
                 other => panic!("the port reported an unexpected notification: {other:?}"),
             })
-            .collect()
+            .collect();
+        frames.extend(
+            port.take_line_frames()
+                .into_iter()
+                .map(|frame| (Some(frame.eol), frame.bytes)),
+        );
+        frames
     }
 
     #[test]

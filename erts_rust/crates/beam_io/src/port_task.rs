@@ -396,9 +396,12 @@ impl From<Ready> for Readiness {
 /// Something a port produced during an execution round, for its owner.
 ///
 /// This is the crate's notification seam: the runtime turns [`PortNotification::Data`] into
-/// the `{Port, {data, Data}}` message Erlang sees, [`PortNotification::DataLine`] into the
-/// `{Port, {data, {eol|noeol, Data}}}` message a `{line, N}` port delivers, and
-/// [`PortNotification::Closed`] into a `ERL_PORT_EXIT`-style port exit.
+/// the `{Port, {data, Data}}` message Erlang sees and [`PortNotification::Closed`] into a
+/// `ERL_PORT_EXIT`-style port exit.
+///
+/// A `{line, N}` port's input does **not** ride this enum: it is reported on the separate
+/// [`LineNotification`] channel (see there), so this enum keeps exactly its two variants and
+/// an exhaustive consumer keeps compiling unchanged.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum PortNotification {
     /// The port's driver read `bytes`, which belong to the port's owner.
@@ -409,29 +412,38 @@ pub enum PortNotification {
         /// consumer may rely on this never being empty.
         bytes: Vec<u8>,
     },
-    /// The port read one **line-framed** chunk and the bytes belong to the port's owner.
-    ///
-    /// This is the `{line, N}` mode (`ERTS_PORT_SFLG_LINEBUF_IO`): the port splits the bytes
-    /// its driver handed up into lines and wraps each one as `{eol, Data}` / `{noeol, Data}`
-    /// — the C's `deliver_linebuf_message` (`erts/emulator/beam/io.c:3454`). Unlike
-    /// [`PortNotification::Data`], an empty payload is a **real** frame here: a blank line is
-    /// the oracle's `{Port, {data, {eol, []}}}`.
-    DataLine {
-        /// The port that produced the frame.
-        port: PortId,
-        /// The frame's content bytes (the line's terminator is not included); empty for a
-        /// blank line.
-        bytes: Vec<u8>,
-        /// Whether the frame was terminated by a newline: `true` is the Erlang `eol` wrapper,
-        /// `false` the `noeol` one (a length-limited chunk, or the partial line flushed at
-        /// end-of-file).
-        eol: bool,
-    },
     /// The port was closed since the previous execution round.
     Closed {
         /// The port that closed.
         port: PortId,
     },
+}
+
+/// One **line-framed** chunk a `{line, N}` port owes its owner.
+///
+/// This is the `{line, N}` mode (`ERTS_PORT_SFLG_LINEBUF_IO`): the port splits the bytes its
+/// driver handed up into lines and wraps each one as the `{eol, Data}` / `{noeol, Data}`
+/// term of `deliver_linebuf_message` (`erts/emulator/beam/io.c:3454`; the wrapper itself is
+/// built at `io.c:3430-3435`). The bytes here are the frame's content — a consumer renders
+/// them as `{Port, {data, {eol, Bytes}}}` / `{Port, {data, {noeol, Bytes}}}`.
+///
+/// This is deliberately a **separate struct**, not a third [`PortNotification`] variant: a
+/// line-mode port's input never reaches the raw `{Port, {data, Data}}` channel, and a
+/// consumer that matches [`PortNotification`] exhaustively stays exhaustive.
+///
+/// Unlike [`PortNotification::Data`], an empty payload is a **real** frame here: a blank line
+/// is the oracle's `{Port, {data, {eol, []}}}`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct LineNotification {
+    /// The port that produced the frame.
+    pub port: PortId,
+    /// The frame's content bytes (the line's terminator is not included); empty for a blank
+    /// line.
+    pub bytes: Vec<u8>,
+    /// Whether the frame was terminated by a newline: `true` is the Erlang `eol` wrapper,
+    /// `false` the `noeol` one (a length-limited chunk, or the partial line flushed at
+    /// end-of-file).
+    pub eol: bool,
 }
 
 /// What one [`crate::PortRegistry::execute_port_tasks`] round did.

@@ -1427,24 +1427,35 @@ fn render_messages(messages: &[DataMessage]) -> String {
 }
 
 /// Runs one port-task round and returns the `{data, …}` messages it reported for `id`.
+///
+/// The two channels are merged here: raw bytes ride [`PortNotification::Data`] (the round's
+/// notifications), line frames ride the separate line channel
+/// ([`PortRegistry::take_line_notifications`]). A port is in exactly one mode, so a given port
+/// only ever produces one of the two.
 fn message_round(
     poller: &mut Poller,
     registry: &mut PortRegistry,
     id: PortId,
 ) -> Vec<DataMessage> {
-    registry
+    let outcome = registry
         .execute_port_tasks(poller, DEFAULT_READINESS_RED_BUDGET)
-        .expect("port tasks run")
+        .expect("port tasks run");
+    let mut messages: Vec<DataMessage> = outcome
         .notifications
         .into_iter()
         .filter_map(|notification| match notification {
-            PortNotification::DataLine { port, bytes, eol } if port == id => {
-                Some((Some(eol), bytes))
-            }
             PortNotification::Data { port, bytes } if port == id => Some((None, bytes)),
             _ => None,
         })
-        .collect()
+        .collect();
+    messages.extend(
+        registry
+            .take_line_notifications()
+            .into_iter()
+            .filter(|frame| frame.port == id)
+            .map(|frame| (Some(frame.eol), frame.bytes)),
+    );
+    messages
 }
 
 /// The `{data, …}` messages a real `/bin/sh -c <command>` port delivers, driven through the

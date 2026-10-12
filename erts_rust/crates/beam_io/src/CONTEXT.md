@@ -28,15 +28,21 @@ out of a read as `{eol | noeol, Data}` inside `{Port, {data, …}}` (`deliver_li
   byte-only views (`take_lines`/`drain`/`flush_all`) are the same frames with the marker dropped and
   are what the out-of-scope `drivers/binary_io.rs` still uses. The byte stream itself is unchanged
   from before the marker was added.
-- `port_task.rs` → `PortNotification::DataLine { port, bytes, eol }` (additive; `Data` untouched).
-  Unlike `Data`, an **empty payload is a real frame** here — a blank line is `{data, {eol, []}}`.
+- `port_task.rs` → `LineNotification { port, bytes, eol }` — a **separate** struct, deliberately
+  **not** a third `PortNotification` variant (a line-mode port's input never rides the raw
+  `{Port, {data, Data}}` channel, and `PortNotification` keeps exactly its two variants so an
+  exhaustive consumer stays exhaustive). Unlike `Data`, an **empty payload is a real frame**
+  here — a blank line is `{data, {eol, []}}`.
 - `port.rs` → `Port::set_line_mode(Option<usize>)` / `line_mode()` (the `SFLG` bit + `linebuf->max_len`;
   `Some(0)` = no length limit), `Port::flush_linebuf()` (the C `flush_linebuf_messages`), and
-  `take_input_notifications()` (the widened harvest: 0/1 `Data` raw, many `DataLine` framed).
+  `take_input_notifications()` (raw mode: 0/1 `Data`; line mode: **no** notification, the frames are
+  staged and drained by `take_line_frames()`).
   `Port::take_eof()` is the crate's **`driver_eof` observation point** and runs the flush.
 - `registry.rs` → `PortRegistry::set_line_mode(id, Option<usize>)` / `flush_linebuf(id)` (the runtime's
-  adoption seams), and `execute_port_tasks`'s harvest **extends** instead of pushing one notification,
-  so a single read can yield many messages (601 bytes at `{line,4}` ⇒ 150).
+  adoption seams) plus `take_line_notifications()` (drains every port's staged frames in port-number
+  order — the accessor style of `take_eof`/`take_closed_notifications`); `execute_port_tasks` still
+  harvests one `PortNotification` per port and its `notifications` carry only `PortNotification`s,
+  so a single read can stage many frames (597 bytes at `{line,4}` ⇒ 150, on the line channel).
 
 ## Known Issues (durable gotchas — not fixed by changing this file)
 - **A `PortNotification::Closed` names a number that is retired *with the report*.** `PortRegistry::close`
@@ -81,20 +87,22 @@ integration-test node, and the crate-level policy (real fds, loud skips, oracle 
   (`eol` only for a newline terminator; the limit split and the CR_AFTER split are `noeol`), the
   `{eol, []}` blank line, that every flushed frame is `noeol`, and `flush_into_ready`'s arrival order.
   `port.rs` unit-tests the port-level rule that a **close never flushes** (the held partial survives the
-  close and an explicit flush still releases it — impossible had the close reported it). `registry.rs`
-  unit-tests the round-level shapes over a real pipe port (three `eol` lines, the blank line, the
-  `{line,4}` split, raw mode off by default, `BadArg` for an unknown id, and the `take_eof`-driven
-  flush). `tests/spawn.rs` (the integration node) cross-checks the whole pinned oracle table
-  byte-for-byte against the system `erl` through a real `cat` child behind a real `[line]` /
-  `[binary, {line, N}]` port, plus the `[binary]` no-wrapper row and the close-does-not-flush rule,
-  skipping **loudly** when `erl` is absent.
+  close and an explicit flush still releases it — impossible had the close reported it) and that the
+  `take_eof` flush releases a blank-line frame. `registry.rs` unit-tests the round-level shapes over a
+  real pipe port (three `eol` lines, the blank line, the `{line,4}` split, one read ⇒ 150 frames, raw
+  mode off by default, a line-mode port reporting **nothing** on `PortNotification`, `BadArg` for an
+  unknown id, and the `take_eof`-driven flush) — all through the separate
+  `take_line_notifications` channel. `tests/spawn.rs` (the integration node) cross-checks the whole
+  pinned oracle table byte-for-byte against the system `erl` through a real `cat` child behind a real
+  `[line]` / `[binary, {line, N}]` port, plus the `[binary]` no-wrapper row and the
+  close-does-not-flush rule, skipping **loudly** when `erl` is absent.
 
 ## Routing Table
 - `lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `poller.rs` → `Poller` (`EINTR`-tolerant `poll`, `libc::poll(2)` regular-file fallback), `Token`, `Interest`, `Ready`, `Event`, `Waker`
-- `port.rs` → `Port`, `PortState`, `PortControl`, `PortCommandOptions`, `DEFAULT_READINESS_RED_BUDGET`, `refresh_timeout`; the line-framing state + `set_line_mode`/`line_mode`/`flush_linebuf`/`take_input_notifications`
-- `registry.rs` → `PortRegistry` (id allocation over `beam_process::PortTable`, reactor glue, `port_command`/`port_control`, the exit/eof/async seams, `port_table`/`port_table_mut`, `set_line_mode`/`flush_linebuf`)
-- `port_task.rs` → `PortTaskKind`/`PortTask`/`PortTaskQueue`, reduction constants, `Readiness`, `PortNotification` (`Data` + the additive `DataLine`), `PortTaskOutcome`
+- `port.rs` → `Port`, `PortState`, `PortControl`, `PortCommandOptions`, `DEFAULT_READINESS_RED_BUDGET`, `refresh_timeout`; the line-framing state + `set_line_mode`/`line_mode`/`flush_linebuf`/`take_input_notifications`/`take_line_frames`
+- `registry.rs` → `PortRegistry` (id allocation over `beam_process::PortTable`, reactor glue, `port_command`/`port_control`, the exit/eof/async seams, `port_table`/`port_table_mut`, `set_line_mode`/`flush_linebuf`/`take_line_notifications`)
+- `port_task.rs` → `PortTaskKind`/`PortTask`/`PortTaskQueue`, reduction constants, `Readiness`, `PortNotification` (`Data` + `Closed`), `LineNotification` (the separate `{line,N}` channel), `PortTaskOutcome`
 - `queue.rs` → `ByteQueue`; `timer.rs` → `Timeout`, `Timer`
 - `driver.rs` → `Driver`, `DriverContext`, `DriverFlags`, `DriverRegistry`, `PortExitReason`, `PortArms`
 - `error.rs` → `pub(crate)` typed error constructors
