@@ -156,3 +156,42 @@ erl -noshell -pa <dir> -eval 'b13:go()' -s init stop                      # NFOR
 erts_rust/target/debug/beam_rt -noshell +hms 500 run <dir>/b13.beam b13:go/0   # NFORMS=5 (masked)
 ```
 `b13.erl`'s `go/0` hard-codes an absolute path; a committed regression test must not.
+
+## Round-3 freed-block scan: NO dangling published root (decisive negative)
+
+A temporary `BEAM_RT_TRACE_ROOTS` instrument (since removed) registered every nursery block base a
+pid had ever been observed using, marked a block **voided** once `AnyCollector::young_contains(base)`
+turned false (the delivery-collapse of the nursery chain), and at every runner observation
+(`entry`, `post-resync`, `park-yield`, `park-wait`) scanned **every** holder word —
+`Process::registers()` (`regs.x` whole file, whole stack, `extra_roots`), the process dictionary,
+`saved_args`, `signals`, every mailbox `payload`/`from`/`token`, and the parked `Machine`'s
+`x`/stack/`fr`/`pending_exception` — reporting every LIST/BOXED word whose target address landed
+inside a voided block.
+
+Raw output (`b13:go/0` on the scheduled `run` route, default `+hms`):
+
+```
+ROOTS-GEOM pid=3 site=park-wait   nspaces=3 cur=0x7bbd53f66120(cap 233 used 230) freed=0
+ROOTS-GEOM pid=3 site=entry       nspaces=1 cur=0x7bbd53f66120(cap 233 used   4) freed=1
+ROOTS-GEOM pid=3 site=post-resync nspaces=1 cur=0x7bbd53f66120(cap 233 used   4) freed=1
+... (repeated across the whole run; freed stays 1)
+NFORMS=6
+```
+
+**Zero `ROOTS-DANGLING` lines** — the voided block received no holder word from any published root
+or machine root at any observation. Earlier (unfiltered) rounds only ever reported `m.x[i]` at the
+`entry` site, i.e. the **parked machine's own stale register file**, which the resume replaces
+wholesale: `beam_rt/src/context/gc.rs::scatter_roots_full` requires
+`regs.x().live_slice().len() == roots.x.len().min(MAX_REG)` and `publish_roots_full` sets
+`regs.x_mut().set_live(roots.x.len().min(MAX_REG))` (= the whole register file) before copying
+`roots.x[..live]`, so the post-resync scan is clean too.
+
+### Current invariant conclusion
+`beam_rt`'s park/resume round-trip publishes and restores the **whole** engine root set
+(`RootSet::ALL_LIVE` x + stack + FR, plus `pending_exception` via `extra_roots`), and
+`beam_process::Process::run_rooted_collection` gathers exactly those families. No published-root
+omission is observable: the surviving term is **not** reached through a voided block at all, so the
+earlier "live term left in the retired space" reading does not survive this range-based re-scan.
+The remaining candidate is a term clobbered **in place** in the still-current block (`used` cycles
+233 -> ~4 on the *same* base `...f66120`, i.e. the nursery is reused without alternating blocks) —
+inside the collector (`beam_gc`), not in `beam_rt`'s published root set.
