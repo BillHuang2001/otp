@@ -1059,9 +1059,6 @@ erts_lc_check_no_locked_of_type(erts_lock_flags_t type)
 int
 erts_lc_trylock_force_busy_flg(erts_lc_lock_t *lck, erts_lock_options_t options)
 {
-#ifdef ERTS_LC_DO_NOT_FORCE_BUSY_TRYLOCK_ON_LOCK_ORDER_VIOLATION
-    return 0;
-#else
     /*
      * Force busy trylock if locking doesn't follow lock order.
      * This in order to make sure that caller can handle
@@ -1126,7 +1123,6 @@ erts_lc_trylock_force_busy_flg(erts_lc_lock_t *lck, erts_lock_options_t options)
 
 	return 1;
     }
-#endif
 }
 
 void erts_lc_trylock_flg_x(int locked, erts_lc_lock_t *lck, erts_lock_options_t options,
