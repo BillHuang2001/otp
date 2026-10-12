@@ -1,11 +1,12 @@
 # `epp` on the scheduled (`run`) route — localization findings
 
-Status: **NOT fixed in `beam_rt`.** `beam_rt` publishes the epp process's roots correctly — the
-corrupted cell is **reachable from the process's own published `x`/`stack`** at the collecting seam —
-yet a **delivery-driven major collection** of the receiving process reclaims it. The defect is
-therefore in a sibling crate (`beam_gc`'s major from-set/descent and/or `beam_process`'s
-`deliver`-driven collection gate), **not** in this node. All instrumentation used to reach this
-conclusion has been removed from the tree; nobody should re-add it.
+Status: **NOT fixed in `beam_rt`.** The defect is a **collection-site gap in a sibling crate**: the
+receiver's mature cell *is* covered by the major collection's from-set and *is* reachable from the
+receiver's own **published** roots, yet a **delivery-driven major collection** reclaims it because the
+Cheney scan never descends through a container that lies outside the from-set. `beam_rt` publishes the
+roots correctly — and its own unscanned-root valve **would decline this very collection** (verified
+below) — but the collection runs inside `beam_process::Process::deliver` and never consults it.
+All instrumentation used to reach this conclusion has been removed from the tree.
 
 ## 1. Reproduction (deterministic)
 
@@ -32,120 +33,150 @@ stops being `[<ptr to {text_fun,F}> | <ptr to next cons>]` and reads as small in
 `[small(2) | <within-heap list ptr>]` — so the file-server side no longer sees scan options and
 `epp` produces one extra form.
 
-## 3. Where the value comes from, and where the cell lives
+## 3. Where the cell lives — and the `[base, top)` coverage verdict
 
-The `XtraArgs[1]` `Options` value at the send seam (`src/context/mod.rs::send_message_with_off_heap`)
-originates in the **epp process's own heap** (pid 3): it is the `#epp.erl_scan_opts` field of the
-process's state record, reached through the process's `x` registers / stack — a
-`beam_process::Registers` region, i.e. one of the families `Process::run_rooted_collection`
-(`beam_process/src/process.rs:1232`) gathers.
+The `Options` value at the send seam (`src/context/mod.rs::send_message_with_off_heap`) is the
+`#epp.erl_scan_opts` field of the **receiving** process's state record, reached through that process's
+own `x` registers / stack (`beam_process::Registers`) — a cell in its **mature** space.
 
-`LOCATE` of the watched cell at the seam is decisive:
-
-```
-LOCATE reply watched …-opts addr=0x…ff80 -> mature(ProcessId { number: 3 })   # the cell lives in pid3's MATURE
-```
-
-and it is reachable, at the seam **immediately before the collecting `deliver`**, from pid3's **own
-young heap** words held in its published registers:
+Geometry of the cell at the collecting instant (one representative sample; the verdict is identical
+on every sample):
 
 ```
-PATH tag=reply-target-x    who=pid3  firsthop=0x…a1b0 -> cell …-opts @0x…ff80
-LOCATE reply-target-x firsthop(…-opts) addr=0x…a1b0 -> young(ProcessId { number: 3 })
-PATH tag=reply-target-stack who=pid3 firsthop=0x…a198 -> cell …-opts @0x…ff80
-LOCATE reply-target-stack firsthop(…-opts) addr=0x…a198 -> young(ProcessId { number: 3 })
+cell_addr = 0x…e341f80                (stable; never relocated)
+mature base = 0x…e341ee0   top = 0x…e342018   used = 39 words   capacity = 233 words
+offset(cell) = (cell_addr - base)/8 = 20 words
+verdict: off_words(20) < used(39)  ⇒  IN_LIVE   — IN RANGE = YES
 ```
 
-So the first hop of the path to the mature cell is a **young, process-heap** object (not a
-literal, not off-heap, not the arena), rooted in `x`/`stack`. Both ends are inside the major
-collection's from-set (`Collector::collect_major`, `beam_gc/src/collector.rs:195-198`,
-`from.add(&self.mature)`), so a correct Cheney copy from those roots must keep it.
+**So the from-set range `Collector::collect_major` adds for the mature
+(`from.add(&self.mature)`, `beam_gc/src/collector.rs:198` → `FromSet::add` pushes
+`(space.base(), space.top())`, `beam_gc/src/space.rs`) DOES COVER the cell.** The
+“cell at/after `top` ⇒ `FromSet::contains` false ⇒ `Target::Foreign`” hypothesis is **falsified**;
+do not re-derive it. `Copier::classify_cons`/`classify_boxed` return `Target::Live` for *any*
+reference **to** this cell.
 
-## 4. The collecting window
+## 4. The collecting window, and the runtime's own valve verdict
 
-Across the request that finally delivers the corrupted payload:
+The killing collection is a single `deliver` into the epp process (pid 3):
 
 ```
-GC serve-drain pid=pid3 state=Waiting min=0 maj=2 young_avail=35 mature_avail=217
-…  (REPLY-DELIVER, then the next pass) …
-GC serve-drain pid=pid3 state=Waiting min=0 maj=3 young_avail=210 mature_avail=196
-CHANGED tag=before-reply-deliver …-opts now=[other@0x0|i2]
+PREDELIVER  to=pid3  base=0x…e341ee0  top=0x…e342018  used=39   young_spaces=1  roots=2053
+            VALVE: foreign_latch=true  phase1_unscanned_roots=[0, 1, 1024, 1027]
+            WATCH:   cell off_words=20 used=39 verdict=IN_LIVE
+            REACH:   hits=3  roots_scanned=2053
+POSTDELIVER to=pid3  base=0x…e33b9c0  top=0x…e33ba40  used=16   young_spaces=1
 ```
 
-* The collection runs **inside `Process::deliver`** — `deliver` (`beam_process/src/process.rs:912`)
-  → `ensure_capacity` (`:1171`) → `run_rooted_collection` (`:1232`) → `Collector::collect_major`
-  (`beam_gc/src/collector.rs:195`), whose `self.mature = fresh` (`:226`) **drops the old mature
-  space**. `minor_gcs` stays `0`; the mature base moves.
+* `deliver` (`beam_process/src/process.rs:912`) → `ensure_capacity` (`:1171`) →
+  `run_rooted_collection` (`:1232`) → `Collector::collect_major` (`beam_gc/src/collector.rs:195`),
+  whose `self.mature = fresh` (`:226`) drops the old mature space. `minor_gcs` stays `0`; the mature
+  base moves; live words 39 → 16. Afterwards the same stable address is found inside **another**
+  process's mature — **dropped and recycled in place**, not relocated.
 * It runs with the receiver `Waiting` and not relocation-exempt, so `has_unpublished_roots()`
   (`beam_process/src/process.rs:1097` = `exempt || state == Running`) is `false` and `deliver`'s gate
-  (`:936`) admits it.
-* After the window the same address is found inside **another** process's mature space
-  (`LOCATE reply watched …-opts addr=0x…ff80 -> mature(ProcessId { number: 2 })`), i.e. pid3's old
-  mature was released and its memory re-used — the address is stable while the contents change,
-  so nothing was *relocated*, it was **dropped and recycled in place**.
-* `beam_rt`'s four admission doors (`context/gc.rs::{ensure_heap, ensure_heap_full,
-  alloc_words_rooted}`, `Runtime::serve_gc_request`) produced no line in the window, so this node's
-  `root_is_unscanned` valve (`context/gc.rs:224`) is never consulted for this collection — the
-  collection is entirely inside `beam_process`/`beam_gc`.
+  (`:936`) admits the collection.
+* **The runtime's own valve would have declined it.** `beam_rt`'s unscanned-root valve is
+  `context/gc_walk.rs::any_root_is_unscanned` / `process_roots_are_unscanned`, whose always-run
+  **phase 1** classifies every root word with `context/gc.rs::root_is_unscanned` (`:224`). Applied to
+  the receiver's own root set at that instant it reports **four** unscanned root words
+  (`x0, x1, stack0, stack3`) — the receiver's descent latch (`Runtime::foreign_reachable(pid)`) is
+  **open** (`true`) for this pid at every delivery, not only at this one. So
+  `process_roots_are_unscanned(_, pid3, true)` is `true`, i.e. the collection is one the valve classifies
+  as **unsound**. The four valve-guarded sites are `context/gc.rs::{ensure_heap, ensure_heap_full,
+  alloc_words_rooted}` and `Runtime::serve_gc_request`; the **fifth** collection site — the
+  delivery-driven one inside `beam_process::Process::deliver` — consults **none** of them, and that is
+  the whole bug.
+* `beam_rt`'s admission doors produced no line in the window, so this node's valve is never consulted
+  for this collection — the collection is entirely inside `beam_process`/`beam_gc`.
 
-## 5. Verdict on the discriminator question
+## 5. The mechanism (why the covered, rooted cell is still lost)
 
-> Is the corrupted mature-resident cell reachable by **graph traversal (depth > 1)** from the root
-> set `run_rooted_collection` gathers at the collecting moment?
+The roots gathered by `run_rooted_collection` **do reach** the cell (`hits=3, roots_scanned=2053`),
+but every path's parent hop is an **out-of-from-set** container:
 
-**REACHABLE — from the process's own published `x`/`stack`, through a young process-heap object.**
-An earlier round reported `in-mature=0` from a walk run *at the collecting site*; this round's walk
-from the same accessor (`Process::registers()`, i.e. exactly what `run_rooted_collection` gathers)
-finds concrete paths with young, in-heap first hops. The two only reconcile if the roots the
-collector actually consumed at that instant did **not** contain those `x`/`stack` words, or if the
-copy dropped a from-set object reached through them.
+```
+root(x0) = 0x…40cc0  [OTHER]  tuple(19)  ->  0x…e341f80  [MATURE] cons(TARGET)
+root(x0) = 0x…576e0  [YOUNG]  tuple(4)   ->  0x…d1ff2c8  [OTHER] boxed -> 0x…57690 [YOUNG] tuple(6)
+                                                        -> 0x…57670 [YOUNG] cons -> TARGET
+```
 
-Because `beam_rt` publishes those words (they are present and pointing at the cell immediately
-before the collecting `deliver`, and `deliver` does not mutate the receiver's `regs`), the omission
-is **not** a `beam_rt` publish gap. The owner is one of the two sibling crates below.
+`[OTHER]` = an address that is inside **neither** the receiver's nursery chain nor its mature space —
+i.e. a region the collector does not scan (the runtime's pointer-stable arena / a pooled BIF heap / a
+message heap fragment; exactly the regions `beam_rt::context::gc::root_is_unscanned` names). The
+copier’s `impl EvacDest for Copier` (`beam_gc/src/copy.rs`) returns **`Target::Foreign`** for every
+address `!self.from.contains(ptr)` (`classify_boxed` `:334`, `classify_cons` `:350`), and
+`forward_slot` then leaves that reference **verbatim and does not follow it** — so the Cheney scan
+(`complete`/`run`) never visits the foreign container's slots and never forwards the mature cell. To-
+space therefore retains only the words declared live by the from-set *or reached from them*; the
+reachable-but-foreign-parented mature cell is not copied, `self.mature = fresh` drops the block, the
+address is recycled, and the `[small(2) | …]` corruption appears **in place at a stable address** —
+exactly the observed symptom.
+
+This also reconciles the earlier rounds: the cell is **reachable from the roots** (this round's walk,
+hits=3) *and* not **traversed by the collector** (the earlier `in-mature = 0` walk), because the two
+walks differ in whether they follow out-of-from-set containers.
 
 ## 6. What this rules out (this node stays clean)
 
-* **Not the native `file_server`/`get_until` → `beam_io::io_device::Continuation` →
-  `erl_scan:tokens/4`** path: it returns the right tokens and the right `eof`.
+* **Not a `beam_rt` publish/holder gap.** The offending root words are `pid3`'s own `x`/`stack` and
+  they *are* published (`RootSet::ALL_LIVE` at the park arm, `runner/run.rs::publish_parked_roots`);
+  the walk above proves the words are present and reach the cell. There is no missing holder.
+* **Not the `[base, top)`/from-set coverage** — see §3; the cell is `IN_LIVE`.
+* **Not the native `file_server`/`get_until` → `beam_io::io_device::Continuation` → `erl_scan:tokens/4`**
+  path: it returns the right tokens and the right `eof`.
 * **Not the message copier** (`beam_message::copy_struct`): plain cross-process sends of these shapes
   agree; the corruption is visible on the *sender's* own heap before the copy.
 * **Not `beam_engine::Machine::args_scratch`**: `dispatch_wide`
   (`beam_engine/src/interpreter/bif.rs`) hands the buffer back **empty** after `call_bif`.
-* **Not this node's park/resume publication**: `publish_parked_roots`
-  (`src/runner/run.rs:97`) publishes `RootSet::ALL_LIVE` (x + whole stack + FR) plus the
-  pending-exception reason through `extra_roots`; the walk above proves the words are there.
-* **Not a `beam_rt`-owned Rust store**: the path's first hop is a young **process-heap** object, not
-  an arena/`bif_heaps`/`persistent_term` term.
 
 ## 7. Report to the sibling owner (prose patch — NOT applied here; read-only siblings)
 
-The invariant violated is: *a collection may only reclaim a word that is not reachable from the
-roots it gathered; and if a from-set object is reachable from a root, its whole reachable transitive
-closure within the from-set must be evacuated.*
+Invariant violated: **a from-set object that is reachable from a gathered root must be evacuated, even
+when the reference is held by a container outside the from-set; equivalently, a collection must not be
+run at all when the receiver's roots reach a container the collector cannot scan.**
 
-1. **`beam_gc` — `Collector::collect_major` (`crates/beam_gc/src/collector.rs:195-226`)** and the
-   copier's from-set classification (`crates/beam_gc/src/copy.rs::EvacDest::classify_boxed`
-   `:334-348`, `classify_cons` `:350-361`) plus the Cheney scan (`forward_roots`/`scan` `:389+`).
-   The from-set is `nursery + mature` and a young→mature reference must be followed and copied. If
-   the scan stops at a boundary or the from-set build misses a retained nursery space
-   (`Nursery::add_to_from_set`), a reachable mature object is dropped. Minimal check: assert that
-   every word whose `classify_*` returns `Target::Live` is actually reserved+forwarded, and that the
-   scan revisits the whole copied closure.
-2. **`beam_process` — `Process::deliver` (`:912`) → `ensure_capacity` (`:1171`) →
-   `run_rooted_collection` (`:1232`)** with the `has_unpublished_roots` gate (`:1097`, used at
-   `:936`). If the roots gathered at this instant do not actually contain the receiver's live
-   `x`/`stack` (e.g. a stale `regs` snapshot for a `Waiting` process whose machine's registers live
-   elsewhere), then the gather is incomplete and the collection must be refused (or the roots
-   refreshed) before `collect_major` runs.
+1. **`beam_process` — the delivery-driven collection site (primary).**
+   `Process::deliver` (`crates/beam_process/src/process.rs:912`) → `ensure_capacity` (`:1171`) →
+   `run_rooted_collection` (`:1232`) runs a rooted collection with no “would this move be unsound?”
+   predicate, unlike the host's four valve-guarded sites. Minimal patch in prose: give the site the
+   host's refusal signal — either (a) extend the existing `has_unpublished_roots` gate (`:936`, flag at
+   `:1097`) with a host-supplied “decline” predicate (e.g. a `Process` flag set by the host, or a
+   closure parameter threaded from `ProcessTable::deliver`) that makes `deliver` return the raw
+   `BeamError::Alloc(AllocKind::Heap|Message)` unchanged, so the host's fragment fallback
+   (`beam_rt::context::RuntimeContext::send_fragmented_message`) delivers without moving a word; or
+   (b) make `ensure_capacity`/`run_rooted_collection` refuse when the gathered roots reach a container
+   outside the from-set — which `beam_process` cannot decide alone.
+2. **`beam_gc` — the from-set/descent design (alternative/complementary).**
+   `crates/beam_gc/src/collector.rs::collect_major` (`:195-198` from-set build, `:226`
+   `self.mature = fresh`) + `crates/beam_gc/src/copy.rs::EvacDest for Copier` (`classify_boxed` `:334`,
+   `classify_cons` `:350`; `forward_slot`) + `crates/beam_gc/src/live.rs`. Two candidate minimal
+   patches, both conservative: (a) widen the from-set with a *scannable* range that includes the
+   containers the engine legitimately holds (the Immix mature space already reports the whole
+   `[base, base+capacity)` — see `AnyCollector::mature_contains` docs) — this requires the collector to
+   be told about those regions; or (b) keep `Target::Foreign` but make the pre-scan descent follow a
+   foreign container’s slots when the caller declares them safe to walk, so any from-set word reachable
+   through them is forwarded.
+   Sub-note for (b): “my parent is not in `from`” is **not** proof that I am garbage; the correct
+   statement is only true when foreign containers cannot hold from-set pointers, which this runtime's
+   arena/BIF-heap/fragment regions violate.
 
-The evidence above (a young in-heap first hop rooted in published `x`/`stack`, dropped by a
-`deliver`-driven `collect_major`) points first at **(1)**; **(2)** is the alternative if the roots
-consumed at the collecting instant turn out to be a stale snapshot.
+Note: a **`beam_rt`-only** mitigation exists and is cheap (use the runtime's existing lever): consult
+`process_roots_are_unscanned(scratch, receiver, receiver_foreign_latch)` in
+`context/mod.rs::deliver_message_with_off_heap_inner` **before** `self.process_table_mut().deliver(…)`
+and, when it answers `true`, run that delivery with the **receiver** temporarily marked
+`set_relocation_exempt(true)` (restoring the previous mark like `with_relocation_exempt` does for the
+sender). `deliver` then returns the raw refusal and the ordinary fragment fallback delivers the
+message, so no heap word moves under an unscanned container. It is a mitigation rather than the root
+fix because a receiver whose roots ever reach an unscanned container would then never collect on the
+delivery path (its heap grows; every engine admission for it already declines anyway), and because the
+*correct* semantic (refuse a collection whose root set is unsafe) belongs to the collection site.
 
 ## 8. Regression test (blocked on the sibling fix)
 
 `tests/compile_file.rs` must drive `epp:parse_file/3` (or `compile:file/2`) through the scheduled
 `run` route on a **self-contained fixture under `tests/fixtures/`** and assert the observable result
 (parsed form count 5, or a byte-identical produced `.beam`). `b13.erl` hard-codes an absolute path and
-is therefore not committable as-is.
+is therefore not committable as-is. The test is blocked until the collection site refuses an unsafe
+root set (or the copier evacuates a from-set word through a foreign parent): with the bug present the
+scheduled route yields 6, so the assertion cannot be made green from `beam_rt` alone.
