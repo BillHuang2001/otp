@@ -36,6 +36,18 @@ blocked in `gen_server:call`'s `receive` makes progress. The requesting process 
 runtime's own `Runnable` `self_pid`, which the delivery therefore does **not** enqueue; it resumes
 through the engine's blocking-aware entry (`RunOutcome::Wait` → `Machine::resume_outcome`), not a
 scheduler slice.
+`{get_until,…}` is the one request that runs **engine code** from this step: its
+`EngineContinuation::call` (`get_until.rs`) builds args and runs `Machine::run_export_outcome` under
+a fresh `RuntimeContext::new` — the **pumping** root context (`may_pump_scheduler == true`,
+`context/mod.rs`), *not* the pass's own non-pumping `for_process` context — even though
+`service_file_requests` runs inside a `scheduler_pass` that has already moved the process table out.
+A continuation that suspends is reported as this service's **own** typed gap ("the `{get_until,…}`
+continuation suspended in a `receive`"), never `beam_engine::blocked()`, so a suspending
+`{get_until,…}` is **not** the source of a corpus `opcode: run: process blocked …` failure.
+(`{get_line,…}` runs no engine code — its `LineContinuation` is a Rust-native
+`io_lib:collect_line/4`.) Hazard: because that context may pump, a blocking
+`call_bif`/`run_export_blocking` reached from inside a continuation would re-enter `pump_scheduler`
+while the pass holds the table/scheduler out; the step does not guard against it today.
 ### The wire protocols (verbatim from `lib/`)
 | Request | Reply |
 |---|---|
