@@ -1009,6 +1009,15 @@ impl<'a> RuntimeContext<'a> {
         let (heap, mailbox) = process.heap_and_mailbox_mut();
         beam_message::send_fragmented(from, message, heap, mailbox, &mut ctx, 0)?;
         let woken = process.wake();
+        // The payload now lives in a [`HeapFragment`](beam_message::HeapFragment) — a region the
+        // receiver's collector does not scan — so the receiver's **descent gate** opens here:
+        // `receive` hands that payload to the running code as a register value, and the code can
+        // nest it inside a container built on the receiver's *own* scanned heap, which is the
+        // shape only the gated descent finds. Recorded before the wake so a receiver that was
+        // already runnable (the wake's `false` arm) is gated too. A delivery that did **not**
+        // need a fragment — the ordinary receiver-heap copy — lands on the receiver's own heap
+        // and deliberately does not open the gate (see [`crate::context::gc_walk`]).
+        self.runtime.note_foreign_reachable(to);
         if woken {
             self.runtime.note_fragment_wake(to);
         }
@@ -2418,15 +2427,13 @@ impl RuntimeContext<'_> {
         }
     }
 }
-impl ExecutionContext for RuntimeContext<'_> {
-    /// The runtime's unified dispatch — see the module docs.
+impl RuntimeContext<'_> {
+    /// The **routing** half of [`ExecutionContext::call_bif`]: pick the route that serves
+    /// `module:function/arity` and run it.
     ///
-    /// 1. The runtime-native floor ([`RuntimeContext::try_native`]).
-    /// 2. A registered `beam_bifs` BIF, with the runtime's **shared** atom table.
-    /// 3. Otherwise an external module call: the module is loaded on demand from the
-    ///    code path and run with `self` as the context. `erlang` is the BIF namespace,
-    ///    never a loadable module, so an unknown `erlang:*` call is a typed diagnostic.
-    fn call_bif(
+    /// Kept apart from the seam itself so the seam can inspect the **result** once, at the one
+    /// point every route funnels through (see [`Self::open_gate_for_foreign_result`]).
+    fn call_bif_routed(
         &mut self,
         module: &str,
         function: &str,
@@ -2490,6 +2497,61 @@ impl ExecutionContext for RuntimeContext<'_> {
         let _ = self.runtime.find_module_file(module);
         let loaded = self.runtime.code_server.load(module)?;
         self.run_export(&loaded, function, arity, args)
+    }
+
+    /// Opens the running process's **descent gate** ([`crate::context::gc_walk`]) when `term` is
+    /// a container in a region its collector does not scan.
+    ///
+    /// A registered BIF, the runtime-native floor and a NIF all build their results on a pooled
+    /// heap **outside** the process's own young/mature area, and the engine stores such a result
+    /// straight into the process's reachable graph. That is the one way a foreign container
+    /// enters the graph other than an engine arena fallback
+    /// ([`Runtime::note_gc_fallback`](crate::runtime::gc)), so it is the event that must open the
+    /// gate: the valve's always-run per-word phase still classifies the result itself while it
+    /// is a root, but the process may nest it inside a container it builds on its *own* scanned
+    /// heap — and that nested shape is exactly what the gated descent exists to find.
+    ///
+    /// This is deliberately **not** a cost on every BIF call: the gate is
+    /// [`gc::root_is_unscanned`](crate::context::gc::root_is_unscanned), which rejects every
+    /// immediate (small integers, atoms, `NIL`), every literal-area constant and every pointer
+    /// into the process's own heap in a few instructions — so the ordinary result costs two
+    /// branches and the `O(live objects)` descent stays off the allocator's path. A process with
+    /// no table (`-eval`/single-pass) or none the table still holds cannot collect, so it needs
+    /// no gate.
+    fn open_gate_for_foreign_result(&mut self, term: Eterm) {
+        let pid = self.mailbox_pid;
+        let foreign = match self
+            .mailbox_table
+            .as_deref()
+            .and_then(|table| table.get(pid))
+        {
+            Some(process) => crate::context::gc::root_is_unscanned(process, term),
+            None => false,
+        };
+        if foreign {
+            self.runtime.note_foreign_reachable(pid);
+        }
+    }
+}
+
+impl ExecutionContext for RuntimeContext<'_> {
+    /// The runtime's unified dispatch — see the module docs.
+    ///
+    /// 1. The runtime-native floor ([`RuntimeContext::try_native`]).
+    /// 2. A registered `beam_bifs` BIF, with the runtime's **shared** atom table.
+    /// 3. Otherwise an external module call: the module is loaded on demand from the
+    ///    code path and run with `self` as the context. `erlang` is the BIF namespace,
+    ///    never a loadable module, so an unknown `erlang:*` call is a typed diagnostic.
+    fn call_bif(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<Eterm> {
+        let result = self.call_bif_routed(module, function, arity, args)?;
+        self.open_gate_for_foreign_result(result);
+        Ok(result)
     }
 
     /// The engine's **cross-module call seam**
