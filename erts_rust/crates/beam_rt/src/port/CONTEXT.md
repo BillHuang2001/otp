@@ -67,8 +67,8 @@ The message itself is `RuntimeContext::signal_notify_message(name)` → `(from, 
 ## Constraints
 - Crate is `#![deny(unsafe_code)]`: the registry slots operate over a **thread-local** entry list
   `DRIVER_ENTRIES` (`805`), not a process-global `DriverTable`. The runtime drives every port on one thread.
-- Every driver callback runs under `publishing` → `beam_abi::with_current_host` (`715`), used at
-  `start` (`1485`), `ready_*` (`1337`), `output` (`1554`), `timeout` (`1696`) and `stop` (`1737`) — this is
+- Every driver callback runs under `publishing` → `beam_abi::with_current_host` (`878`), used at
+  `start` (`1838`), `ready_*` (`1664`/`1693`), `output` (`1890`), `timeout` (`2116`) and `stop` (`2156`) — this is
   what lets the two port-less registry slots reach a host during a callback.
 - The `SignalFacility` is a `thread_local` (not a `Runtime` field) for the same reason `context::trace`'s slot is: the runtime is single-threaded (`!Send`), so the slot *is* the process's one facility. A **second** live facility would re-point `beam_io`'s trampoline write end at its own pipe; the one `FacilitySlot` the slot holds — created lazily by the first `os:set_signal/2` and **never dropped** (production never drops the runtime's facility, and a test build `mem::forget`s it in `Drop` so a libtest thread teardown cannot restore the process-global dispositions under a live signal test) — is what prevents that.
 - Never a fabricated success: failures are typed `BeamError`s, and a state/lifecycle it cannot serve
