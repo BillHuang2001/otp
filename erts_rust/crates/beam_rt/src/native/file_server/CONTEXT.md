@@ -107,9 +107,10 @@ headed `binary`/`encoding`; otherwise the reply is the **value** `{error,enotsup
 * **`{get_until,Enc,_Prompt,Mod,Func,XtraArgs}` is served** by [`get_until.rs`](get_until.rs): the
   read loop drives an engine-backed `Continuation` running `Mod:Func(Cont, Data, XtraArgs…)`,
   decodes `{more,Cont}`/`{done,Reply,Buf}` and stashes `Buf` as the device's `State#state.buf`.
-  Typed gaps: a continuation suspending in a `receive`; a leftover that is a deep iolist /
+  Typed gaps: a leftover that is a deep iolist /
   non-charlist / negative code point / non-byte-aligned bitstring; an encoding other than
-  `latin1`/`unicode`; a pid with no registered device ("closed io device"). The `{get_chars,…}`
+  `latin1`/`unicode`; a pid with no registered device ("closed io device").
+  (A continuation that suspends is **not** a typed gap — see Known Issues.) The `{get_chars,…}`
   arm serves the stashed buffer **before** any fresh read and `{position,At}` compensates for
   it (see *The shared read buffer* above), and a
   `{utf16,_}`/`{utf32,_}` **stream** is read as `latin1` (a divergence).
