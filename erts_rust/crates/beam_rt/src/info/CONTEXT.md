@@ -72,7 +72,8 @@ Per-key rationale lives in `info/unsupported.rs`; the oracle answer (OTP 29.1.1 
 - `info` / `procs` / `loaded` → **binaries** (547918 / 69206 / 1906 bytes on this host): ERTS-internal text dumps (`info()` = memory+hash-table+`allocated_areas`+allocator dump; `process_info()` = per-process dump; `loaded()` = the `Current code: N\nOld code: N\n<module> <bytes>` code-ix dump — `erl_bif_info.c:2951-2980`). The memory/table *figures* are reachable (`erlang:memory/0`, `erlang:processes/0`, the code server's loaded set), but the byte-level dump format is a different emulator's. **KEEP.**
 
 ### `badarg` — keys the oracle **rejects** (pinned in tests)
-`allocator_sizes`, `beam_jit_available`, `busy_limits`, `c_library_version`, `catchlevel`, `export_count`, `export_limit`, `memory`, `module_count`, `module_limit`, `net_ticktime`, `node`, `pure`, `run_queue`, `safe_string_hash`, `total_run_queue_lengths`, `wall_clock` — plus any unknown name (`nonsense`, `Version`).
+`allocator_sizes`, `beam_jit_available`, `busy_limits`, `c_library_version`, `catchlevel`, `export_count`, `export_limit`, `instruction_counts`, `memory`, `module_count`, `module_limit`, `net_ticktime`, `node`, `pure`, `run_queue`, `safe_string_hash`, `total_run_queue_lengths`, `wall_clock` — plus any unknown name (`nonsense`, `Version`).
+(`instruction_counts` is pinned only in the integration suite's `ORACLE_REJECTED_KEYS`; the `src/info.rs` unit list is the same set minus it.)
 
 ### Per-key decisions (A.8 `system_info`)
 Explicit close/keep decisions, so the next pass does not re-litigate them; each is a key where "answer = the oracle's figure" was considered and rejected:
@@ -107,7 +108,25 @@ No new atom names were needed for `dist`/`dist_ctrl`/`Binary` (a binary carries 
 - The `{allocator, A}` rows are a live `beam_alloc` snapshot (`beam_alloc::registry::all_stats`) and the counts are real table lengths, but no test drives an allocation and observes a counter rise — "measured" here rests on the `beam_alloc` registry, not on a regression test in this node.
 - **The three key sets now cover every oracle-accepted key** (87 supported + 28 unsupported = the oracle's 115 accepted names), so an unclassified oracle-accepted key is the only way this runtime could raise `badarg` where the oracle answers a value; `tests/system_info_oracle.rs` fails if one appears. The **C-emulator internals** that stay in `UNSUPPORTED_KEYS` (each a typed exit-3 gap rather than a copied oracle figure, per-key rationale in `info/unsupported.rs`) are: `compile_info` (no C toolchain), `ethread_info` / `ethread_used_tse` (no C ethread library), `constant_pool_support` / `beam_jump_table` (no ERTS constant-pool code loading), `snifs` / `taints` (no static NIF table / taint tracking), `emu_args` (no emulator argument vector), `reader_groups_map` / `decentralized_counter_groups_map` (no reader groups / decentralized counters), `max_integer` (no `BIG_ARITY_MAX` cap), `thread_progress` (no thread-progress debug state). `literal_test` is **served** as `tag` (this runtime's frozen layout detects literals with a tag bit — the C's own word for a tag-based test) where the oracle's 64-bit build answers `range`; it is compared **shape-only**.
 - **Several `info/system.rs` literals are ERTS *runtime* flags this runtime reports at the oracle's default** (they would diverge if the flag were passed, because the CLI models none of them): `port_parallelism` (C `erts_port_parallelism`, `+spp`), `break_ignored` (C `ignore_break`, `erl_bif_info.c:3185`), `modified_timing_level` (C `erts_modified_timing_level`, `+T`), `halt_flush_timeout` (C `erts_halt_flush_timeout`, `-shutdown_time`, `infinity` = the negative default). Two `info/limits.rs` constants are flag-settable too and were confirmed against the oracle: `dist_buf_busy_limit` (`+zdbbl` — `+zdbbl 2048` ⇒ `2097152`) and `delayed_node_table_gc` (`+zdntgc` — `+zdntgc 120` ⇒ `120`); their default literals diverge under those flags. The CLI has no arm for any of them, and `record_unmodeled` **drops** an unmodeled `+flag` (it becomes neither an init arg nor an `extra_emulator_flags` entry), so there is no state to derive from today; making them live needs an A.6 change (preserve the flag) plus a `thread_pool_size`-style derivation here. By contrast these literals are genuine build constants and must stay as-is: `threads` (`true`), `async_dist` (`false`), `dynamic_trace` (`none`), `dynamic_trace_probes` (`false`), `kernel_poll` (`cfg!(unix)`, matching the C's `ERTS_ENABLE_KERNEL_POLL` build constant which `+K` does **not** affect), `update_cpu_info` (`unchanged` — the steady-state answer of the oracle's stateful `erts_update_cpu_info()` probe), `trace_control_word` (`0`), and `outstanding_system_requests_limit` (fixed at `32` — `+sss 64` does not move the oracle's value).
-- `heap_sizes` currently reports one extra trailing entry vs the oracle (138 vs 137) because `beam_gc::build_heap_sizes` (`erts_rust/crates/beam_gc/src/policy.rs:73`) stops one step short of the C's `erl_gc.c:283-291` loop, which writes the offending step then discards it via `i--`; the faithful table (and the oracle's) is 137 entries ending `885767171276247`. The fix belongs to `beam_gc` (out of this node's scope) and has been reported. `heap_sizes` stays **served** and compared **shape-only**.
+- `heap_sizes` currently reports one extra trailing entry vs the oracle (138 vs 137): the C's `erl_gc.c:283-291` loop decrements `i` after detecting the over-cap step (`i--; break;`), so the C's `num_heap_sizes` **also drops the last under-cap entry** (`num = first_offending_index - 1`), whereas `beam_gc::build_heap_sizes` (`erts_rust/crates/beam_gc/src/policy.rs:73`, `break`-before-`push`) keeps it; the faithful table (and the oracle's) is 137 entries ending `885767171276247`. The fix belongs to `beam_gc` (out of this node's scope) and has been reported. `heap_sizes` stays **served** and compared **shape-only**.
+
+## Test Inventory (in-file `#[cfg(test)]`, current counts)
+Every `*.rs` in this node (the parent `src/info.rs` + all 8 child modules) carries an in-file `#[cfg(test)]` module:
+
+| file | `#[test]` |
+|---|---|
+| `src/info.rs` (parent) | 15 |
+| `info/schedulers.rs` | 10 |
+| `info/system.rs` | 9 |
+| `info/memory.rs` | 8 |
+| `info/host.rs` | 6 |
+| `info/limits.rs` | 4 |
+| `info/dist.rs` | 4 |
+| `info/time.rs` | 3 |
+| `info/unsupported.rs` | 1 |
+| **total (this node)** | **60** |
+
+The A.8 oracle gate is the sibling integration suite `tests/system_info_oracle.rs` (**7** `#[test]`s, skips loudly without a system `erl`); the `process_info/2` / `module_info/1` sibling surfaces have their own suites (`tests/process_info_items.rs`, `tests/module_info.rs`).
 
 ## Test Strategy
 - Per-key unit tests colocated in each family module: the value **shape** (and the exact value for the constants), plus `try_value(other_key) == None` and the unknown-key `badarg`.
@@ -120,6 +139,15 @@ No new atom names were needed for `dist`/`dist_ctrl`/`Binary` (a binary carries 
   Two further tests cross-check the **oracle's own printed value** for the whole `+Q`/`ERL_MAX_PORTS` `port_limit` matrix (`+Q N` on the command line and `ERL_MAX_PORTS` through `parse_with_env`) and for the `{wordsize, internal|external}` tuple key (including the oracle's `badarg` for `{wordsize,foo}`).
   `the_monotonic_time_interface_constants_match_the_oracle` probes the oracle **twice** for `start_time`/`end_time`, requires both runs (and the **recorded** figures) to agree, and pins that the oracle's `start_time` is a small integer while its `end_time` is a bignum — the recorded table cannot go stale silently.
   It **skips loudly** when no system `erl` is executable.
+
+## Legacy C ground truth (what this node ports)
+This node reimplements the `system_info/1` arm of the legacy C emulator (read-only reference, never modified):
+- `erts/emulator/beam/erl_bif_info.c` — `system_info_1` (`:2774`) is the C entry the whole surface mirrors; the `start_time`/`end_time` arms dispatch at `:2857-2859`, the tuple keys `{wordsize,W}`/`{allocator,A}` at `:2521-2546`, the scheduler-state/statistics keys at `:3258-3352`, the `build_type`/`emu_type` shared arm at `:2800`.
+- `erts/emulator/beam/erl_time_sup.c` (`make_time_val` `:2133-2146`, `erts_get_monotonic_{start,end}_time` `:2148-2158`) + `erts/emulator/beam/erl_time.h` — the `start_time`/`end_time` interface constants (`info/time.rs`).
+- `erts/emulator/beam/erl_alloc.c` (`erts_allocated_areas` `:2580-2699`, `erts_alloc_util_allocators` `:2789`) — `alloc_util_allocators` / `allocated_areas` / `{allocator,A}` (`info/memory.rs`, `allocator_report`).
+- `erts/emulator/beam/erl_gc.c` (`erts_init_gc` `:262-291`) — `heap_sizes` / `garbage_collection` (values produced by `beam_gc`).
+- `erts/emulator/beam/erl_ptab.c` / `erl_ptab.h` + `erl_port.h` — the `port_limit` table-sizing rule (`info/limits.rs`).
+Each source module cites its own C line numbers inline; the mapping is also recorded in this file's See Also.
 
 ## See Also
 - `../CONTEXT.md` → the crate façade (`system_info_value`/`InfoValue` re-exports, the `{allocator, A}` route in `src/native.rs`, the A.8 contract).
