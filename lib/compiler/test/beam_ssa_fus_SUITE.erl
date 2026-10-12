@@ -27,7 +27,7 @@
 %% `no_ssa_opt_fus' turns it back into a no-op while `no_ssa_opt' skips the
 %% whole beam_ssa_opt pass.
 %%
-%% Four transformations are implemented (there is no Fusion 3):
+%% The transformations implemented are (there is no Fusion 3):
 %%
 %% Fusion 1 removes a `has_map_field(Map, Key)' test whose success edge is
 %% nothing but the extraction of the very same key - `get_map_element(Map, Key)'
@@ -62,6 +62,36 @@
 %% an unguarded chain, a chain guarded by `is_float/1', or a chain interrupted
 %% by another operation must stay untouched.
 %%
+%% Fusion 6 folds the constant chains of `div'/`rem'; it lives in the sibling
+%% module beam_ssa_fus_arith, which also owns Fusion 4. There are three forms:
+%%
+%%   (a) `(V div K1) div K2' -> `V div (K1 * K2)'. The product only has to be
+%%       nonzero - truncation composes for *every* pair of nonzero constants, so
+%%       `X div 3 div 3' is folded to `X div 9' - and no bound is needed, because
+%%       the intermediate `V div K1' is never larger in magnitude than `V'.
+%%   (b) `(V rem K1) rem K2' -> `V rem K2' when `K1 rem K2 =:= 0' (and both
+%%       divisors are nonzero): the intermediate is then congruent to `V' modulo
+%%       K2 and both remainders have the same sign and a magnitude below |K2|.
+%%       `X rem 4 rem 2' is folded, `X rem 3 rem 2' is not.
+%%   (c) `(V * K1) div K2' -> `V * (K1 div K2)' when `K2 =/= 0' and
+%%       `K1 rem K2 =:= 0' *and* V is proven to be an integer of finite bounded
+%%       magnitude. The bound is what keeps the fold exception preserving: the
+%%       original chain builds the intermediate product `V * K1', and an operand
+%%       large enough to exceed the arithmetic size limit would raise
+%%       `system_limit' there, which a rewrite to a smaller product would
+%%       silently drop.
+%%
+%% Unlike Fusion 4, (a) and (c) are matched in the guard-free two-block shape
+%% (and in the same-block one), because the non-raising proof of `div'/`rem' by
+%% a nonzero constant is exactly what makes the type analysis drop the
+%% `{succeeded,_}' guard of the first operation; Fusion 6 (b) and the chains
+%% that keep a guard are matched in the two-block shape like Fusion 4.
+%% Every form shares the pass's decline rules: the operand must be proven an
+%% integer (a float or untyped operand is left alone, since `div'/`rem' raise
+%% `badarith' for it), a `div'/`rem' divisor must be nonzero, the two constants
+%% must divide exactly where the value requires it, and the intermediate of the
+%% chain must be used nowhere but by the second operation.
+%%
 %% The test approach: a small probe module is compiled with each of the option
 %% sets in opt_sets/0 and each build is executed. For every case we check
 %%
@@ -90,7 +120,12 @@
          maps_get_exception_equivalence/1,
          fusion_opt_kill_switches/1,
          fuse_const_mul_chain/1,
-         no_fusion_const_mul_chain/1]).
+         no_fusion_const_mul_chain/1,
+         fuse_const_div_chain/1,
+         fuse_const_rem_chain/1,
+         fuse_const_mul_div_chain/1,
+         no_fusion_arith_intermediate_used/1,
+         fusion6_kill_switches/1]).
 
 suite() ->
     [{ct_hooks,[ts_install_cth]}].
@@ -114,7 +149,12 @@ groups() ->
        maps_get_exception_equivalence,
        fusion_opt_kill_switches,
        fuse_const_mul_chain,
-       no_fusion_const_mul_chain]}].
+       no_fusion_const_mul_chain,
+       fuse_const_div_chain,
+       fuse_const_rem_chain,
+       fuse_const_mul_div_chain,
+       no_fusion_arith_intermediate_used,
+       fusion6_kill_switches]}].
 
 init_per_suite(Config) ->
     Config.
@@ -667,9 +707,311 @@ no_fusion_const_mul_chain(Config) ->
     ok.
 
 %%============================================================================
-%% Probe modules
+%% Fusion 6 (a): the division chain
 %%============================================================================
-%% The `is_map/1' guard is what makes the pass fire: it lets the type analysis
+
+%% Fusion 6 (a), positive case: a chain of divisions by integer constants is
+%% folded into a single division by the product of the constants. The product
+%% only has to be nonzero - truncation composes for *every* pair of nonzero
+%% constants, so `nondiv/1' (`X div 3 div 3') is folded to `X div 9' as well -
+%% and no bound is needed, because the intermediate `V div K1' is never larger
+%% in magnitude than `V'. The chain is folded link by link, so `chain3/1'
+%% collapses three divisions into one.
+%%
+%% A zero divisor (either one) and an operand whose integrality was not proven
+%% (`num/1' only proves it to be a *number*, `any/1' proves nothing) are
+%% declined: `div' raises `badarith' for a zero divisor and for a non-integer
+%% operand, so rewriting those chains would not be exact.
+fuse_const_div_chain(Config) ->
+    Builds = build_probe(Config, "beam_ssa_fus_div", divchain_probe()),
+
+    Ints = [0, 1, -1, 2, 3, 5, -5, 6, 7, -7, 100,
+            1 bsl 80, 1 bsl 200, -(1 bsl 200)],
+    NotIntegers = [6.0, -2.5, a, [1]],
+    ZeroArgs = [0, 1, -1, 1 bsl 200],
+
+    check_calls(Builds, chain2, [{[X], {ok, X div 2 div 3}} || X <- Ints]),
+    check_calls(Builds, chain3, [{[X], {ok, X div 2 div 3 div 5}} || X <- Ints]),
+    check_calls(Builds, neg, [{[X], {ok, X div -2 div 3}} || X <- Ints]),
+    check_calls(Builds, nondiv, [{[X], {ok, X div 3 div 3}} || X <- Ints]),
+    check_calls(Builds, chain2,
+                [{[X], {error, function_clause}} || X <- NotIntegers]),
+    %% A zero divisor raises `badarith' in every build ...
+    check_calls(Builds, zero1, [{[X], {error, badarith}} || X <- ZeroArgs]),
+    check_calls(Builds, zero2, [{[X], {error, badarith}} || X <- ZeroArgs]),
+    %% ... and so does a float operand of a chain whose integrality is unproven.
+    check_calls(Builds, num, [{[X], {ok, X div 2 div 3}} || X <- [0, 1, -7]]),
+    check_calls(Builds, num, [{[X], {error, badarith}} || X <- [6.0, -2.5]]),
+    check_calls(Builds, num,
+                [{[X], {error, function_clause}} || X <- [a, [1]]]),
+    check_calls(Builds, any, [{[X], {ok, X div 2 div 3}} || X <- [0, 1, -7]]),
+    check_calls(Builds, any,
+                [{[X], {error, badarith}} || X <- [6.0, a, [1]]]),
+
+    Fusion = code(fusion, Builds),
+    Plain = code(plain, Builds),
+
+    %% With the pass enabled each foldable chain is a single division by the
+    %% *product* of its constants.
+    ?assertEqual(1, count_instr(Fusion, chain2, 'div')),
+    ?assertEqual(6, bif_constant(Fusion, chain2, 'div')),
+    ?assertEqual(1, count_instr(Fusion, chain3, 'div')),
+    ?assertEqual(30, bif_constant(Fusion, chain3, 'div')),
+    ?assertEqual(1, count_instr(Fusion, neg, 'div')),
+    ?assertEqual(-6, bif_constant(Fusion, neg, 'div')),
+    ?assertEqual(1, count_instr(Fusion, nondiv, 'div')),
+    ?assertEqual(9, bif_constant(Fusion, nondiv, 'div')),
+
+    %% Without the pass - including with it explicitly turned off - the two
+    %% (three) divisions are still there, and `no_ssa_opt' has them as well.
+    ?assertEqual(2, count_instr(Plain, chain2, 'div')),
+    ?assertEqual(3, count_instr(Plain, chain3, 'div')),
+    ?assertEqual(2, count_instr(Plain, neg, 'div')),
+    ?assertEqual(2, count_instr(Plain, nondiv, 'div')),
+    lists:foreach(fun(Set) ->
+                          Code = code(Set, Builds),
+                          ?assertEqual(2, count_instr(Code, chain2, 'div')),
+                          ?assertEqual(3, count_instr(Code, chain3, 'div'))
+                  end, [no_fus_plain,no_fus,no_ssa_opt]),
+
+    %% The declined chains are untouched - the same instructions in the same
+    %% order as in the default build.
+    lists:foreach(fun(Fun) ->
+                          ?assertEqual({Fun, func_shape(Plain, Fun)},
+                                       {Fun, func_shape(Fusion, Fun)}),
+                          ?assertEqual(2, count_instr(Fusion, Fun, 'div'))
+                  end, [zero1, zero2, num, any]),
+    ok.
+
+%%============================================================================
+%% Fusion 6 (b): the remainder chain
+%%============================================================================
+
+%% Fusion 6 (b), positive case: `(V rem K1) rem K2' is `V rem K2' when K1 is a
+%% multiple of K2 - the intermediate is then congruent to V modulo K2, and both
+%% remainders have the same sign and a magnitude below |K2|, so they are the
+%% same integer. `chain2/1' and `chain3/1' fold (4 is a multiple of 2, 8 of 4
+%% and 4 of 2) and so does `neg/1' (`-6 rem 3 = 0'). A chain whose constants do
+%% not divide (`nondiv/1': `3 rem 2') and one through a zero divisor are
+%% declined, the latter because `V rem 0' raises `badarith' and must keep doing
+%% so.
+fuse_const_rem_chain(Config) ->
+    Builds = build_probe(Config, "beam_ssa_fus_rem", remchain_probe()),
+
+    Ints = [0, 1, -1, 2, 3, 4, 5, -5, 6, 7, -7, 8, 9, 100,
+            1 bsl 80, 1 bsl 200, -(1 bsl 200)],
+    ZeroArgs = [0, 1, -1, 1 bsl 200],
+
+    check_calls(Builds, chain2, [{[X], {ok, X rem 4 rem 2}} || X <- Ints]),
+    check_calls(Builds, chain3, [{[X], {ok, X rem 8 rem 4 rem 2}} || X <- Ints]),
+    check_calls(Builds, neg, [{[X], {ok, X rem -6 rem 3}} || X <- Ints]),
+    check_calls(Builds, nondiv, [{[X], {ok, X rem 3 rem 2}} || X <- Ints]),
+    check_calls(Builds, chain2, [{[X], {error, function_clause}} || X <- [6.0, a]]),
+    %% A zero divisor raises `badarith' in every build.
+    check_calls(Builds, zero1, [{[X], {error, badarith}} || X <- ZeroArgs]),
+    check_calls(Builds, zero2, [{[X], {error, badarith}} || X <- ZeroArgs]),
+    %% An operand whose integrality is unproven: the same refusals as for (a).
+    check_calls(Builds, num, [{[X], {ok, X rem 4 rem 2}} || X <- [0, 1, -7]]),
+    check_calls(Builds, num, [{[X], {error, badarith}} || X <- [6.0, -2.5]]),
+    check_calls(Builds, any, [{[X], {ok, X rem 4 rem 2}} || X <- [0, 1, -7]]),
+    check_calls(Builds, any,
+                [{[X], {error, badarith}} || X <- [6.0, a, [1]]]),
+
+    Fusion = code(fusion, Builds),
+    Plain = code(plain, Builds),
+
+    %% With the pass enabled each foldable chain is a single remainder by the
+    %% *second* constant - the first one disappears with the intermediate.
+    ?assertEqual(1, count_instr(Fusion, chain2, 'rem')),
+    ?assertEqual(2, bif_constant(Fusion, chain2, 'rem')),
+    ?assertEqual(1, count_instr(Fusion, chain3, 'rem')),
+    ?assertEqual(2, bif_constant(Fusion, chain3, 'rem')),
+    ?assertEqual(1, count_instr(Fusion, neg, 'rem')),
+    ?assertEqual(3, bif_constant(Fusion, neg, 'rem')),
+
+    %% Without the pass - including with it explicitly turned off - the two
+    %% (three) remainders are still there, and `no_ssa_opt' has them as well.
+    ?assertEqual(2, count_instr(Plain, chain2, 'rem')),
+    ?assertEqual(3, count_instr(Plain, chain3, 'rem')),
+    ?assertEqual(2, count_instr(Plain, neg, 'rem')),
+    lists:foreach(fun(Set) ->
+                          Code = code(Set, Builds),
+                          ?assertEqual(2, count_instr(Code, chain2, 'rem')),
+                          ?assertEqual(3, count_instr(Code, chain3, 'rem'))
+                  end, [no_fus_plain,no_fus,no_ssa_opt]),
+
+    %% The declined chains are untouched. `zero2/1' (`X rem 0 rem 2') is
+    %% already reduced by the front end - `X rem 0' raises unconditionally, so
+    %% the second `rem' is dead - which is why it holds a single `rem' in *both*
+    %% builds; the point here is that the pass changes nothing.
+    lists:foreach(fun(Fun) ->
+                          ?assertEqual({Fun, func_shape(Plain, Fun)},
+                                       {Fun, func_shape(Fusion, Fun)})
+                  end, [nondiv, zero1, zero2, num, any]),
+    ?assertEqual(2, count_instr(Fusion, nondiv, 'rem')),
+    ?assertEqual(2, count_instr(Fusion, num, 'rem')),
+    ?assertEqual(2, count_instr(Fusion, any, 'rem')),
+    ok.
+
+%%============================================================================
+%% Fusion 6 (c): the multiplication/division chain
+%%============================================================================
+
+%% Fusion 6 (c), positive case: `(V * K1) div K2' is `V * (K1 div K2)' when K2
+%% divides K1 exactly *and* V is proven to be an integer of finite bounded
+%% magnitude. The bound is the soundness-critical condition: the original chain
+%% builds the intermediate `V * K1', and an operand large enough to exceed the
+%% arithmetic size limit raises `system_limit' there, which a rewrite to a
+%% smaller product would silently drop. So the magnitude-bounded `bounded/1'
+%% (`0 =< X < 1000') folds, while the unbounded `integer()' operand of
+%% `unbounded/1', the half-infinite `0 =< X' of `halfinf/1', a constant pair
+%% that does not divide (`nondiv/1': `5 rem 2') and a constant beyond the
+%% arithmetic cap (`bigconst/1': `K1 = 1 bsl 200') are all declined.
+fuse_const_mul_div_chain(Config) ->
+    Builds = build_probe(Config, "beam_ssa_fus_muldiv", muldivchain_probe()),
+
+    check_calls(Builds, bounded, [{[X], {ok, X * 6 div 3}} || X <- [0, 1, 2, 999]]),
+    check_calls(Builds, bounded,
+                [{[X], {error, function_clause}} ||
+                    X <- [1000, -1, 1 bsl 200, 1.5, a]]),
+    check_calls(Builds, bounded_neg,
+                [{[X], {ok, X * 6 div 3}} || X <- [0, 1, -1, 999, -999]]),
+    check_calls(Builds, bounded_neg,
+                [{[X], {error, function_clause}} ||
+                    X <- [1000, -1000, 1 bsl 200, 1.5, a]]),
+    check_calls(Builds, longer, [{[X], {ok, X * 12 div 6}} || X <- [0, 1, 999]]),
+    %% ... while the chains that must not fold keep their exact value for a
+    %% huge operand: they still build the (equally huge) intermediate product.
+    check_calls(Builds, unbounded,
+                [{[X], {ok, X * 6 div 3}} ||
+                    X <- [0, 1, -1, 7, -7, 1 bsl 80, 1 bsl 200, -(1 bsl 200)]]),
+    check_calls(Builds, unbounded,
+                [{[X], {error, function_clause}} || X <- [1.5, a]]),
+    check_calls(Builds, halfinf,
+                [{[X], {ok, X * 6 div 3}} || X <- [0, 1, 999999, 1 bsl 200]]),
+    check_calls(Builds, halfinf,
+                [{[X], {error, function_clause}} || X <- [-1, 1.5]]),
+    check_calls(Builds, nondiv, [{[X], {ok, X * 5 div 2}} || X <- [0, 1, 3, 999]]),
+    check_calls(Builds, nondiv,
+                [{[X], {error, function_clause}} || X <- [1000, -1]]),
+    check_calls(Builds, bigconst,
+                [{[X], {ok, X * (1 bsl 200) div 2}} || X <- [0, 1, 999]]),
+    check_calls(Builds, num, [{[X], {ok, X * 6 div 3}} || X <- [0, 1, -7]]),
+    %% A float operand reaches the multiplication but not the `div': `badarith'.
+    check_calls(Builds, num, [{[X], {error, badarith}} || X <- [1.5, -2.5]]),
+    check_calls(Builds, num,
+                [{[X], {error, function_clause}} || X <- [a, [1]]]),
+
+    Fusion = code(fusion, Builds),
+    Plain = code(plain, Builds),
+
+    %% The bounded chain is a single multiplication by `K1 div K2', with no
+    %% division left.
+    ?assertEqual(1, count_mul(Fusion, bounded)),
+    ?assertEqual(0, count_instr(Fusion, bounded, 'div')),
+    ?assertEqual(2, mul_constant(Fusion, bounded)),
+    ?assertEqual(1, count_mul(Fusion, bounded_neg)),
+    ?assertEqual(0, count_instr(Fusion, bounded_neg, 'div')),
+    ?assertEqual(2, mul_constant(Fusion, bounded_neg)),
+    ?assertEqual(1, count_mul(Fusion, longer)),
+    ?assertEqual(0, count_instr(Fusion, longer, 'div')),
+    ?assertEqual(2, mul_constant(Fusion, longer)),
+
+    %% Without the pass both operations are still there.
+    lists:foreach(fun(Fun) ->
+                          ?assertEqual(1, count_mul(Plain, Fun)),
+                          ?assertEqual(1, count_instr(Plain, Fun, 'div'))
+                  end, [bounded, bounded_neg, longer]),
+    lists:foreach(fun(Set) ->
+                          Code = code(Set, Builds),
+                          ?assertEqual(1, count_mul(Code, bounded)),
+                          ?assertEqual(1, count_instr(Code, bounded, 'div'))
+                  end, [no_fus_plain,no_fus,no_ssa_opt]),
+
+    %% The declined chains keep both operations, unchanged.
+    lists:foreach(fun(Fun) ->
+                          ?assertEqual({Fun, func_shape(Plain, Fun)},
+                                       {Fun, func_shape(Fusion, Fun)}),
+                          ?assertEqual(1, count_mul(Fusion, Fun)),
+                          ?assertEqual(1, count_instr(Fusion, Fun, 'div'))
+                  end, [unbounded, halfinf, nondiv, bigconst, num]),
+    ok.
+
+%% The intermediate of a chain may only be used by the second operation of the
+%% chain (and, in the two-block shape, by the first operation's own guard).
+%% Here `Y' is read twice - once by the second operation and once by the `+'
+%% that follows - so eliminating it would change the value of that other use,
+%% and every fold is declined, for each of the three pairs.
+no_fusion_arith_intermediate_used(Config) ->
+    Builds = build_probe(Config, "beam_ssa_fus_inter", intermediate_probe()),
+
+    Big = 1 bsl 200,
+    check_calls(Builds, div_used,
+                [{[X], {ok, (X div 4) + ((X div 4) div 2)}}
+                 || X <- [0, 1, -1, 7, -7, Big, -Big]]),
+    check_calls(Builds, div_used,
+                [{[X], {error, function_clause}} || X <- [7.0, a]]),
+    check_calls(Builds, rem_used,
+                [{[X], {ok, (X rem 4) + ((X rem 4) rem 2)}}
+                 || X <- [0, 1, -1, 7, -7, Big, -Big]]),
+    check_calls(Builds, rem_used,
+                [{[X], {error, function_clause}} || X <- [7.0, a]]),
+    check_calls(Builds, muldiv_used,
+                [{[X], {ok, (X * 6) + ((X * 6) div 3)}}
+                 || X <- [0, 1, 7, 998]]),
+    check_calls(Builds, muldiv_used,
+                [{[X], {error, function_clause}} || X <- [1000, -1, 1.5, a]]),
+
+    Fusion = code(fusion, Builds),
+    Plain = code(plain, Builds),
+    %% A strict no-op for this whole probe: the complete code is unchanged.
+    ?assertEqual(shape(Plain), shape(Fusion)),
+    ?assertEqual(2, count_instr(Fusion, div_used, 'div')),
+    ?assertEqual(2, count_instr(Fusion, rem_used, 'rem')),
+    ?assertEqual(1, count_mul(Fusion, muldiv_used)),
+    ?assertEqual(1, count_instr(Fusion, muldiv_used, 'div')),
+    ok.
+
+%% The pass is off by default and the derived kill switch is a real no-op for
+%% the arithmetic chains as well: with the enabling option absent (or cancelled
+%% by `no_ssa_opt_fus'), the generated code is *identical* to the default build,
+%% and a `no_ssa_opt' build is unaffected by the presence of `fusion_opt'. The
+%% `fusion' build is the positive control that makes the equality checks
+%% non-vacuous.
+fusion6_kill_switches(Config) ->
+    Builds = build_probe(Config, "beam_ssa_fus_div", divchain_probe()),
+
+    Plain = code(plain, Builds),
+    Fusion = code(fusion, Builds),
+    ?assertNotEqual(shape(Plain), shape(Fusion)),
+    ?assertEqual(1, count_instr(Fusion, chain2, 'div')),
+    ?assertEqual(2, count_instr(Plain, chain2, 'div')),
+    ?assertEqual(2, count_instr(Fusion, zero1, 'div')),
+
+    lists:foreach(fun(Set) ->
+                          ?assertEqual({Set,Plain}, {Set,code(Set, Builds)})
+                  end, [no_fus_plain,no_fus]),
+
+    NoSsaOpt = code(no_ssa_opt, Builds),
+    ?assertEqual(NoSsaOpt, code(no_ssa_opt_fus, Builds)),
+    ?assertEqual(2, count_instr(NoSsaOpt, chain2, 'div')),
+    ?assertEqual(2, count_instr(NoSsaOpt, nondiv, 'div')),
+
+    %% The identity is asserted on the generated code above; at the byte level
+    %% the strongest true statement is that the `Code' chunk - the object code
+    %% itself - is identical. The whole `.beam' is *not*, because its `CInf' and
+    %% `Dbgi' chunks record the option list and the builds were passed different
+    %% options (measured over the 755 compilable `lib/*/src/*.erl': the `Code'
+    %% chunk is identical for every one of them, no `.beam' is).
+    ?assertEqual(code_chunk(bin(plain, Builds)), code_chunk(bin(no_fus_plain, Builds))),
+    ?assertEqual(code_chunk(bin(plain, Builds)), code_chunk(bin(no_fus, Builds))),
+    %% Positive control: the enabling option does change the object code.
+    ?assertNotEqual(code_chunk(bin(plain, Builds)), code_chunk(bin(fusion, Builds))),
+    ok.
+
+%%============================================================================
+%% Probe modules
+%%============================================================================%% The `is_map/1' guard is what makes the pass fire: it lets the type analysis
 %% prove that the operand of `is_map_key/2' is a map, which turns the guard
 %% into a `has_map_field/2' SSA test. The extraction that follows it on the
 %% success edge is exactly what the pass looks for.
@@ -882,9 +1224,113 @@ mulchain_neg_probe() ->
     "no_chain(X) when is_integer(X) -> X * 2 + 3.\n".
 
 %%============================================================================
-%% Compiling, disassembling and running the probes
+%% Fusion 6 (a) probe module
 %%============================================================================
-%% The option sets every probe is compiled with.
+%% Chains of divisions by integer constants under an `is_integer/1' guard, which
+%% is what lets the type analysis prove the operand to be an integer - plus the
+%% chains that must NOT be folded: a zero divisor (either one) and an operand
+%% that is only proven to be a *number* (`num/1') or that is not proven at all
+%% (`any/1'), for which `div' would not be exact.
+divchain_probe() ->
+    "-module(beam_ssa_fus_div).\n"
+    "-export([chain2/1,chain3/1,neg/1,nondiv/1,zero1/1,zero2/1,num/1,any/1]).\n"
+    "\n"
+    "chain2(X) when is_integer(X) -> X div 2 div 3.\n"
+    "\n"
+    "chain3(X) when is_integer(X) -> X div 2 div 3 div 5.\n"
+    "\n"
+    "neg(X) when is_integer(X) -> X div -2 div 3.\n"
+    "\n"
+    "nondiv(X) when is_integer(X) -> X div 3 div 3.\n"
+    "\n"
+    "zero1(X) when is_integer(X) -> X div 0 div 3.\n"
+    "\n"
+    "zero2(X) when is_integer(X) -> X div 3 div 0.\n"
+    "\n"
+    "num(X) when is_number(X) -> X div 2 div 3.\n"
+    "\n"
+    "any(X) -> X div 2 div 3.\n".
+
+%%============================================================================
+%% Fusion 6 (b) probe module
+%%============================================================================
+%% Chains of remainders by integer constants. `chain2/1' and `chain3/1' fold
+%% (the first constant is a multiple of the second), `nondiv/1' does not
+%% (`3 rem 2 =/= 0'), and neither does a chain through a zero divisor.
+remchain_probe() ->
+    "-module(beam_ssa_fus_rem).\n"
+    "-export([chain2/1,chain3/1,neg/1,nondiv/1,zero1/1,zero2/1,num/1,any/1]).\n"
+    "\n"
+    "chain2(X) when is_integer(X) -> X rem 4 rem 2.\n"
+    "\n"
+    "chain3(X) when is_integer(X) -> X rem 8 rem 4 rem 2.\n"
+    "\n"
+    "neg(X) when is_integer(X) -> X rem -6 rem 3.\n"
+    "\n"
+    "nondiv(X) when is_integer(X) -> X rem 3 rem 2.\n"
+    "\n"
+    "zero1(X) when is_integer(X) -> X rem 4 rem 0.\n"
+    "\n"
+    "zero2(X) when is_integer(X) -> X rem 0 rem 2.\n"
+    "\n"
+    "num(X) when is_number(X) -> X rem 4 rem 2.\n"
+    "\n"
+    "any(X) -> X rem 4 rem 2.\n".
+
+%%============================================================================
+%% Fusion 6 (c) probe module
+%%============================================================================
+%% Chains of a multiplication by an integer constant followed by a division,
+%% under the guards that decide whether the fold is allowed. The operand must be
+%% a *bounded* integer: `bounded/1' and `bounded_neg/1' prove a finite range,
+%% while `unbounded/1' (an unbounded `integer()'), `halfinf/1' (`0 =< X' has no
+%% upper bound), `nondiv/1' (a constant pair that does not divide) and
+%% `bigconst/1' (a constant beyond the arithmetic cap the proof allows) must be
+%% declined - as must `num/1', whose operand is only proven to be a number.
+muldivchain_probe() ->
+    "-module(beam_ssa_fus_muldiv).\n"
+    "-export([bounded/1,bounded_neg/1,longer/1,unbounded/1,halfinf/1,\n"
+    "         nondiv/1,bigconst/1,num/1]).\n"
+    "\n"
+    "bounded(X) when is_integer(X), X >= 0, X < 1000 -> X * 6 div 3.\n"
+    "\n"
+    "bounded_neg(X) when is_integer(X), X > -1000, X < 1000 -> X * 6 div 3.\n"
+    "\n"
+    "longer(X) when is_integer(X), X >= 0, X < 1000 -> X * 12 div 6.\n"
+    "\n"
+    "unbounded(X) when is_integer(X) -> X * 6 div 3.\n"
+    "\n"
+    "halfinf(X) when is_integer(X), X >= 0 -> X * 6 div 3.\n"
+    "\n"
+    "nondiv(X) when is_integer(X), X >= 0, X < 1000 -> X * 5 div 2.\n"
+    "\n"
+    "bigconst(X) when is_integer(X), X >= 0, X < 1000 -> X * (1 bsl 200) div 2.\n"
+    "\n"
+    "num(X) when is_number(X) -> X * 6 div 3.\n".
+
+%%============================================================================
+%% Intermediate-used-elsewhere probe module
+%%============================================================================
+%% One function per pair, each reading the intermediate of the chain twice.
+intermediate_probe() ->
+    "-module(beam_ssa_fus_inter).\n"
+    "-export([div_used/1,rem_used/1,muldiv_used/1]).\n"
+    "\n"
+    "div_used(X) when is_integer(X) ->\n"
+    "    Y = X div 4,\n"
+    "    Y + Y div 2.\n"
+    "\n"
+    "rem_used(X) when is_integer(X) ->\n"
+    "    Y = X rem 4,\n"
+    "    Y + Y rem 2.\n"
+    "\n"
+    "muldiv_used(X) when is_integer(X), X >= 0, X < 1000 ->\n"
+    "    Y = X * 6,\n"
+    "    Y + Y div 3.\n".
+
+%%============================================================================
+%% Compiling, disassembling and running the probes
+%%============================================================================%% The option sets every probe is compiled with.
 %%
 %% `fusion' enables the pass, `plain' is the default, `no_fus' enables the
 %% pass and then kills it again with the negation that
@@ -991,6 +1437,38 @@ code(Set, Builds) ->
             ct:fail({missing_option_set, Set})
     end.
 
+%% The `.beam' binary of one build, for tests that have to look at the file
+%% itself rather than at the disassembly of it.
+bin(Set, Builds) ->
+    case lists:keyfind(Set, 1, Builds) of
+        {Set, _Mod, Bin, _Code} ->
+            Bin;
+        false ->
+            ct:fail({missing_option_set, Set})
+    end.
+
+%% The `Code' chunk - the object code itself - of a `.beam', extracted from the
+%% FOR1 container by hand. `beam_lib:chunks/2' cannot be asked for it: a host
+%% OTP older than the compiler that produced the file reports it as unknown
+%% (the same reason this suite disassembles the binary itself). The layout is
+%% the FOR1 header, the unsized `BEAM' form type and then, per chunk, a 4-byte
+%% id, a 32-bit size and size bytes of data, padded to a 4-byte boundary - the
+%% padding is not part of the size.
+code_chunk(Bin) ->
+    <<"FOR1", _Size:32, "BEAM", Chunks/binary>> = Bin,
+    chunk(<<"Code">>, Chunks).
+
+chunk(Id, <<CId:4/binary, Size:32, Payload:Size/binary, Rest/binary>>) ->
+    case CId of
+        Id ->
+            Payload;
+        _ ->
+            Pad = (4 - (Size rem 4)) rem 4,
+            <<_:Pad/binary, More/binary>> = Rest,
+            chunk(Id, More)
+    end;
+chunk(Id, <<>>) ->
+    ct:fail({missing_chunk, Id}).
 %% True if `Name' occurs as an instruction anywhere in the code. Both plain
 %% instructions (`get_map_elements', ...) and `test'/`bif' instructions that
 %% carry their name in the second element (`{test,has_map_fields,...}',
@@ -1084,6 +1562,28 @@ mul_args({gc_bif,'*',_Fail,_Live,Args,_Dst}) ->
 mul_args(_) ->
     [].
 
+%% The integer constant of the single `Op' BIF in `Fun'. Fails unless `Fun'
+%% contains exactly one `Op' instruction with an integer literal operand; the
+%% `div'/`rem' counterpart of `mul_constant/2', used to check that one of those
+%% chains was folded by the *combined* constant of the chain (the product for
+%% (a), the second constant for (b)). `Op' is spelled as `instr_name/1' reports
+%% it ('div', 'rem'), and both the `bif' and the `gc_bif' spelling are
+%% recognized, as in `mul_args/1'.
+bif_constant(Code, Fun, Op) ->
+    Is = function_code(Code, Fun),
+    case [K || I <- Is, {integer,K} <- bif_args(I, Op)] of
+        [K] -> K;
+        Constants -> ct:fail({unexpected_bif_constant, Fun, Op, Constants})
+    end.
+
+%% The operands of the `Op' BIF instruction, and [] for every other
+%% instruction.
+bif_args({bif,Op,_Fail,Args,_Dst}, Op) ->
+    Args;
+bif_args({gc_bif,Op,_Fail,_Live,Args,_Dst}, Op) ->
+    Args;
+bif_args(_I, _Op) ->
+    [].
 %% A compact description of the code - the instruction names in order - used to
 %% compare builds without dumping complete instruction lists on failure.
 shape(Code) ->

@@ -52,8 +52,13 @@
 %%   * `loop_arith_licm' (beam_ssa_loop_arith): an invariant `A + N' IS hoisted
 %%     out of a receive loop, while `A bsl N' inside the same shape is NOT
 %%     (a hoist would raise `system_limit' on paths the original never took).
-%%   * `fusion_opt' (beam_ssa_fus): Fusion 5, the `has_map_field' +
-%%     `maps:get/2' redundancy, plus the shapes it must not touch.
+%%   * `fusion_opt' (beam_ssa_fus, with its arithmetic half in
+%%     beam_ssa_fus_arith): Fusion 5, the `has_map_field' + `maps:get/2'
+%%     redundancy, plus the shapes it must not touch; and Fusion 6, the
+%%     constant chains of `div'/`rem' - `(V div K1) div K2', `(V rem K1) rem K2'
+%%     and the magnitude-bounded `(V * K1) div K2' - plus the chains it must
+%%     refuse (an unproven operand, a zero divisor, a constant pair that does
+%%     not divide, an unbounded operand).
 %%   * `fbip_opt' (beam_ssa_fbip): in-place `update_record' on a provably
 %%     fresh, uniquely owned source, and the shared/aliased sources that must
 %%     stay copies.
@@ -90,6 +95,7 @@
          loop_arith_licm_equivalence/1,
          fusion_opt_equivalence/1,
          fusion5_equivalence/1,
+         fusion6_equivalence/1,
          fbip_opt_equivalence/1,
          all_passes_equivalence/1,
          benchmark/1]).
@@ -111,6 +117,7 @@ groups() ->
        loop_arith_licm_equivalence,
        fusion_opt_equivalence,
        fusion5_equivalence,
+       fusion6_equivalence,
        fbip_opt_equivalence,
        all_passes_equivalence,
        benchmark]}].
@@ -186,6 +193,33 @@ fusion5_equivalence(Config) ->
     ?assert(lists:member({get2,2}, Changed), Changed),
     %% A get without a preceding `has_map_field' test must keep raising.
     ?assertNot(lists:member({get2_noguard,2}, Changed), Changed),
+    ok.
+
+%% Fusion 6 (`beam_ssa_fus_arith'): the constant chains of `div'/`rem', ON vs
+%% OFF. Every fold and every refusal has its own function in the probe, so the
+%% per-function code-change report says exactly which ones fired; the battery
+%% below executes both on the values that make the fold exact (0, 1, -1 and a
+%% range of positive and negative integers *including* bignums far past the
+%% arithmetic cap) and on the operands for which it must not be applied at all
+%% (a float, a non-number, and a zero divisor) so that the `badarith' /
+%% `function_clause' paths are compared as well.
+fusion6_equivalence(Config) ->
+    ModBase = "beam_ssa_opt_equiv_fusion6",
+    Changed = equivalence_case(Config, ModBase, fusion6_probe(ModBase),
+                               [fusion_opt], fusion6_cases()),
+    %% Positive controls: each of the three forms of Fusion 6 folded at least
+    %% one function of this probe, so the comparisons above are not vacuous.
+    ?assert(lists:member({div2,1}, Changed), Changed),
+    ?assert(lists:member({rem2,1}, Changed), Changed),
+    ?assert(lists:member({muldiv,1}, Changed), Changed),
+    %% ... and the refusals really are refusals: their code is identical OFF and
+    %% ON (an unproven operand, a zero divisor, a pair that does not divide, an
+    %% unbounded operand and a chain whose intermediate is used elsewhere).
+    lists:foreach(fun(FA) ->
+                          ?assertNot(lists:member(FA, Changed), Changed)
+                  end, [{div_any,1},{div_num,1},{rem_nondiv,1},{rem_zero,1},
+                        {div_zero,1},{muldiv_unbounded,1},{muldiv_halfinf,1},
+                        {muldiv_nondiv,1},{muldiv_used,1},{div_used,1}]),
     ok.
 
 %% The FBIP pass (beam_ssa_fbip) individually, ON vs OFF.
@@ -709,6 +743,100 @@ fusion5_cases() ->
                    [[{a, 1}]], [5]]},
      {get2_used, [[#{a => 1}, a], [#{a => 1}, b], [#{}, a],
                   [not_a_map, a]]}].
+
+%% The Fusion 6 shapes of `beam_ssa_fus_arith', one function per fold and per
+%% refusal:
+%%
+%%   div2/1, div3/1, div_neg/1  `(V div K1) div K2'  -> `V div (K1 * K2)'
+%%   rem2/1, rem3/1, rem_neg/1  `(V rem K1) rem K2'  -> `V rem K2'
+%%   muldiv/1, muldiv_long/1    `(V * K1) div K2'    -> `V * (K1 div K2)'
+%%                              (all three only with a bounded operand)
+%%
+%% and the refusals: `div_any/1' has no type proof at all, `div_num/1' proves
+%% only that the operand is a number (so `div' would raise `badarith'), the
+%% constants of `rem_nondiv/1' do not divide, `rem_zero/1' and `div_zero/1'
+%% divide by zero, and `muldiv_unbounded/1' (unbounded `integer()'),
+%% `muldiv_halfinf/1' (`0 =< X' has no upper bound), `muldiv_nondiv/1' (`5 rem
+%% 2 =/= 0') are the operands whose magnitude is not provably bounded - the
+%% soundness-critical refusal, because the original chain would raise
+%% `system_limit' for a large enough operand. `muldiv_used/1' and `div_used/1'
+%% read the intermediate of the chain twice, so it may not be eliminated.
+fusion6_probe(Mod) ->
+    ["-module(", Mod, ").\n",
+     "-export([div2/1,div3/1,div_neg/1,rem2/1,rem3/1,rem_neg/1,\n",
+     "         muldiv/1,muldiv_long/1,div_any/1,div_num/1,rem_nondiv/1,\n",
+     "         rem_zero/1,div_zero/1,muldiv_unbounded/1,muldiv_halfinf/1,\n",
+     "         muldiv_nondiv/1,muldiv_used/1,div_used/1]).\n",
+     "\n",
+     "%% Fusion 6 (a): the division chain under an integrality proof.\n",
+     "div2(X) when is_integer(X) -> X div 2 div 3.\n",
+     "\n",
+     "div3(X) when is_integer(X) -> X div 2 div 3 div 5.\n",
+     "\n",
+     "div_neg(X) when is_integer(X) -> X div -2 div 3.\n",
+     "\n",
+     "%% Fusion 6 (b): the remainder chain, whose first constant is a multiple of\n",
+     "%% the second one (4 of 2, 8 and 4 of 2, -6 of 3).\n",
+     "rem2(X) when is_integer(X) -> X rem 4 rem 2.\n",
+     "\n",
+     "rem3(X) when is_integer(X) -> X rem 8 rem 4 rem 2.\n",
+     "\n",
+     "rem_neg(X) when is_integer(X) -> X rem -6 rem 3.\n",
+     "\n",
+     "%% Fusion 6 (c): the multiplication/division chain with a magnitude-bounded\n",
+     "%% operand.\n",
+     "muldiv(X) when is_integer(X), X >= 0, X < 1000 -> X * 6 div 3.\n",
+     "\n",
+     "muldiv_long(X) when is_integer(X), X >= 0, X < 1000 -> X * 12 div 6.\n",
+     "\n",
+     "%% The refusals.\n",
+     "div_any(X) -> X div 2 div 3.\n",
+     "\n",
+     "div_num(X) when is_number(X) -> X div 2 div 3.\n",
+     "\n",
+     "rem_nondiv(X) when is_integer(X) -> X rem 3 rem 2.\n",
+     "\n",
+     "rem_zero(X) when is_integer(X) -> X rem 4 rem 0.\n",
+     "\n",
+     "div_zero(X) when is_integer(X) -> X div 0 div 3.\n",
+     "\n",
+     "muldiv_unbounded(X) when is_integer(X) -> X * 6 div 3.\n",
+     "\n",
+     "muldiv_halfinf(X) when is_integer(X), X >= 0 -> X * 6 div 3.\n",
+     "\n",
+     "muldiv_nondiv(X) when is_integer(X), X >= 0, X < 1000 -> X * 5 div 2.\n",
+     "\n",
+     "muldiv_used(X) when is_integer(X), X >= 0, X < 1000 ->\n",
+     "    Y = X * 6,\n",
+     "    Y + Y div 3.\n",
+     "\n",
+     "div_used(X) when is_integer(X) ->\n",
+     "    Y = X div 4,\n",
+     "    Y + Y div 2.\n"].
+
+%% Argument sets for the Fusion 6 probe. The values are chosen so that the
+%% battery covers what makes the folds exact and what does not:
+%%
+%%   * 0, 1 and -1, the two signs of the operands around the constants, and
+%%     bignums far past the arithmetic cap (`1 bsl 80', `1 bsl 200'), for which
+%%     the (a) and (b) folds must stay exact (and for which the un-fused (c)
+%%     chain must keep building its large intermediate);
+%%   * a float, a subnormal and a non-number, for the `badarith' of the chains
+%%     that have no integrality proof and the `function_clause' of those that
+%%     have one;
+%%   * 0 as a divisor (via `div_zero/1' and `rem_zero/1'), so that the raise the
+%%     unfused chain produces is compared.
+fusion6_cases() ->
+    Values =
+        [0, 1, -1, 2, 3, 4, 5, -5, 6, 7, -7, 8, 9, -9, 999, -999,
+         1 bsl 80, 1 bsl 200, -(1 bsl 200),
+         0.0, 1.5, -2.5, 1.0e308, 5.0e-324, not_a_number, [1], {a}],
+    Args = [[V] || V <- Values],
+    [{Fun, Args} ||
+        Fun <- [div2,div3,div_neg,rem2,rem3,rem_neg,muldiv,muldiv_long,
+                div_any,div_num,rem_nondiv,rem_zero,div_zero,
+                muldiv_unbounded,muldiv_halfinf,muldiv_nondiv,muldiv_used,
+                div_used]].
 
 %% A handful of hand-written compute kernels: a list sum, a tail-recursive
 %% count, tak/3, naive fib/1, a map-lookup kernel, a record-update loop and
