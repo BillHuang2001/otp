@@ -56,8 +56,10 @@
 //!
 //! * **Errors are return-based** (workspace `CONTEXT.md` §3): every fallible API returns
 //!   [`beam_common::Result`]; there is no crate-local error enum and nothing is swallowed.
-//! * **`unsafe`-free**: the crate is `#![deny(unsafe_code)]`. The glue is built only on the safe
-//!   peripheries of the lower crates.
+//! * **`unsafe`-free by default**: the crate is `#![deny(unsafe_code)]` and the glue is built on the
+//!   safe peripheries of the lower crates. Two narrowly-scoped `#[allow(unsafe_code)]` overrides exist:
+//!   `context/gc_walk.rs`'s sanctioned `beam_term::layout` object-walk, and `nif.rs`'s `enif_compare`/
+//!   `enif_hash` `unsafe extern "C"` calls.
 //! * **Call down, never duplicate**: BIFs come from `beam_bifs`, terms/heaps from `beam_term`/
 //!   `beam_alloc`, pids from `beam_process`, modules from `beam_loader` and execution from
 //!   `beam_engine`. The printer is the registered `io:format/2` BIF, not a second printer.

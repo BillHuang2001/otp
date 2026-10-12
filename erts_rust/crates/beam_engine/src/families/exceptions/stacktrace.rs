@@ -114,14 +114,17 @@ use crate::terms::{ContextSink, Sink};
 /// The *order* is C's: `build_stacktrace` prepends the current function last
 /// (`beam_common.c:1278-1288`), so the list runs innermost frame first.
 ///
-/// **Why a cooked trace is never landed as the raw `x(2)` trace.** C's raw trace is
-/// an opaque object of **saved code pointers** (`c_p->ftrace`), with no engine
-/// equivalent; and the oracle's own cooked `S` for `try ... catch C:R:S -> S end`
-/// additionally holds host `init:*` frames that live *outside* this engine's run. A
-/// snapshot-cooked trace is therefore a strictly-**partial** list that would still
-/// differ from the oracle's — landing it would trade this documented omission for a
-/// different, silently-partial value. So `x(2)` stays `NIL` on the compiled path (see
-/// the family docs) and this function only serves the non-`NIL` raw-trace arm.
+/// **When this is called.** C's raw trace is an opaque object of **saved code
+/// pointers** (`c_p->ftrace`), with no engine equivalent, so a landed exception still
+/// carries `x(2) = NIL`. The compiled path's `build_stacktrace` therefore cooks **this**
+/// function from the machine's raise-time snapshot whenever one is live (the compiler
+/// reaches it only from a `try`/`catch` handler clause that just landed an exception —
+/// see `super::Instr::BuildStacktrace`); a `NIL` raw trace with no recorded raise is
+/// the only shape that cooks to `NIL`. The oracle's own cooked `S` for
+/// `try ... catch C:R:S -> S end` additionally holds host `init:*`/`erl_eval` frames
+/// that live *outside* this engine's run, so a snapshot-cooked trace is a
+/// strictly-**shorter prefix** of the oracle's — the engine's frames first, never a
+/// different value at the head.
 ///
 /// The whole `[Item]` graph is sized from metadata, reserved in **one** rooted
 /// allocation ([`crate::terms::reserve_slack`]) and carved from it, so a moving

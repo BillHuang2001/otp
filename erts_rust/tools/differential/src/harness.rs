@@ -41,6 +41,12 @@
 //!   directory substituted for the case's `{dir}` placeholder and **no** `-pa <dir>` in the
 //!   oracle argv — so the *application* of an `ERL_AFLAGS`-carried flag is observed
 //!   (contract A.6).
+//! * Command cases ([`CaseKind::Command`]) spawn an external program + argv on each side
+//!   (neither an `-eval` probe nor the Rust `run` action) and compare stdout + exit status
+//!   only. The oracle side is the resolved `erl`; the Rust side is the resolved `beam_rt` or
+//!   the `dist_probe` helper ([`runtime::resolve_helper`]) — this is how the live two-node
+//!   distribution loopback (contract A.5) is pinned. A missing Rust-side program is a loud
+//!   `skipped`, never agreement.
 //!
 //! * The **oracle** is mandatory: without it there is nothing to compare against, so a
 //!   missing oracle is a loud [`Error::Env`] (exit 2) — never a fabricated result.
@@ -66,7 +72,10 @@ use crate::compare::{
     check_golden, compare_observations_with, verdict_with, FieldDiff, GoldenCheck, Observables,
     SideResult, Verdict,
 };
-use crate::corpus::{self, Case, CaseKind, Contract, EmbeddedModule, Golden, ModuleRun, Probe};
+use crate::corpus::{
+    self, Case, CaseKind, CommandProgram, CommandRun, Contract, EmbeddedModule, Golden, ModuleRun,
+    Probe,
+};
 use crate::error::Result;
 use crate::module_build;
 use crate::runtime::{self, RuntimeSpec};
@@ -173,6 +182,7 @@ pub fn run_case_in(context: &RuntimeContext, case: &Case) -> Result<CaseOutcome>
                 golden: Some(case.golden),
                 probe_wrapped: true,
                 env: Vec::new(),
+                rust_spec: context.rust.clone(),
             };
             execute(context, plan, None)
         }
@@ -198,6 +208,7 @@ pub fn run_case_in(context: &RuntimeContext, case: &Case) -> Result<CaseOutcome>
                 golden: Some(case.golden),
                 probe_wrapped: true,
                 env: runtime::own_env(env),
+                rust_spec: context.rust.clone(),
             };
             execute(context, plan, None)
         }
@@ -208,6 +219,7 @@ pub fn run_case_in(context: &RuntimeContext, case: &Case) -> Result<CaseOutcome>
             run,
             Some(ModuleCaseEnv { extra, env }),
         ),
+        CaseKind::Command(run) => run_command_case(context, case, run),
     }
 }
 
@@ -227,6 +239,7 @@ pub fn compare_expr(expr: &str, pa: &[String]) -> Result<CaseOutcome> {
         golden: None,
         probe_wrapped: true,
         env: Vec::new(),
+        rust_spec: context.rust.clone(),
     };
     execute(&context, plan, None)
 }
@@ -275,7 +288,7 @@ fn execute(
     };
     let oracle = SideResult::observed(oracle_observation);
 
-    let rust = match &context.rust {
+    let rust = match &plan.rust_spec {
         Some(spec) => classify_rust(
             runtime::run_with_env(spec, &plan.rust_argv, &plan.env)?,
             plan.probe_wrapped,
@@ -305,7 +318,7 @@ fn execute(
         verdict: derived_verdict,
         diffs,
         oracle_spec: context.oracle.clone(),
-        rust_spec: context.rust.clone(),
+        rust_spec: plan.rust_spec.clone(),
     })
 }
 
@@ -378,6 +391,7 @@ fn run_module_case(
         golden: Some(case.golden),
         probe_wrapped: false,
         env,
+        rust_spec: context.rust.clone(),
     };
     execute(context, plan, Some(compiled))
 }
@@ -398,6 +412,106 @@ fn skipped_module_outcome(
         description: case.description.to_string(),
         contracts: case.contracts.to_vec(),
         eval: run.oracle_eval(),
+        oracle_argv: Vec::new(),
+        rust_argv: Vec::new(),
+        oracle: side.clone(),
+        rust: side,
+        golden: GoldenCheck::not_asserted(),
+        golden_asserted: false,
+        verdict: Verdict::Skipped,
+        diffs: Vec::new(),
+        oracle_spec: context.oracle.clone(),
+        rust_spec: context.rust.clone(),
+    }
+}
+
+/// Run a non-CLI command case ([`CaseKind::Command`]): spawn each side's resolved program
+/// with the case's argv and compare **stdout + exit status** (stderr is not compared).
+///
+/// Each side is resolved from its [`CommandProgram`] label — `Oracle` is the resolved oracle
+/// (`context.oracle`), `Rust` is the resolved `beam_rt` (`context.rust`) and `Helper` is the
+/// resolved `dist_probe` ([`runtime::resolve_helper`]). A side whose program is absent makes
+/// the case a loud [`Verdict::Skipped`] carrying the resolver's reason — never a fabricated
+/// pass and never agreement (see [`skipped_command_outcome`]).
+///
+/// Unlike a module-run case nothing is compiled and no temp dir is needed: the argv is fixed
+/// by the case, the oracle side is spawned by [`execute`] from `context.oracle` (the corpus
+/// requires the oracle side to name [`CommandProgram::Oracle`]), and the Rust side from the
+/// resolved spec recorded in the plan.
+fn run_command_case(context: &RuntimeContext, case: &Case, run: &CommandRun) -> Result<CaseOutcome> {
+    // Resolve the oracle side to decide the skip: the corpus pins it to the resolved oracle,
+    // but a `Rust`/`Helper` oracle side is honoured (and skipped when absent).
+    match run.oracle.program {
+        CommandProgram::Oracle => {}
+        CommandProgram::Rust => {
+            if context.rust.is_none() {
+                return Ok(skipped_command_outcome(
+                    context,
+                    case,
+                    run,
+                    &rust_unsupported_reason(),
+                ));
+            }
+        }
+        CommandProgram::Helper => {
+            if runtime::resolve_helper()?.is_none() {
+                return Ok(skipped_command_outcome(
+                    context,
+                    case,
+                    run,
+                    &runtime::helper_unsupported_reason(),
+                ));
+            }
+        }
+    }
+
+    let rust_spec = match run.rust.program {
+        CommandProgram::Rust => context.rust.clone(),
+        CommandProgram::Helper => runtime::resolve_helper()?,
+        CommandProgram::Oracle => Some(context.oracle.clone()),
+    };
+    let Some(rust_spec) = rust_spec else {
+        let reason = match run.rust.program {
+            CommandProgram::Helper => runtime::helper_unsupported_reason(),
+            CommandProgram::Rust | CommandProgram::Oracle => rust_unsupported_reason(),
+        };
+        return Ok(skipped_command_outcome(context, case, run, &reason));
+    };
+
+    let plan = RunPlan {
+        case_id: case.id.to_string(),
+        description: case.description.to_string(),
+        contracts: case.contracts.to_vec(),
+        eval: run.oracle_command_line(),
+        oracle_argv: run.oracle_argv(),
+        rust_argv: run.rust_argv(),
+        observables: Observables::StdoutAndExit,
+        golden: Some(case.golden),
+        probe_wrapped: false,
+        env: Vec::new(),
+        rust_spec: Some(rust_spec),
+    };
+    execute(context, plan, None)
+}
+
+/// The outcome of a command case whose Rust-side program could not be resolved.
+///
+/// Nothing was observed, so this is a loud [`Verdict::Skipped`] carrying `reason` — never a
+/// pass and never agreement. It mirrors [`skipped_module_outcome`] (both sides
+/// `SideResult::unsupported`, empty argv, no golden asserted) and is non-fatal by default,
+/// fatal under `--strict`.
+fn skipped_command_outcome(
+    context: &RuntimeContext,
+    case: &Case,
+    run: &CommandRun,
+    reason: &str,
+) -> CaseOutcome {
+    let side = SideResult::unsupported(reason);
+    CaseOutcome {
+        case_id: case.id.to_string(),
+        description: case.description.to_string(),
+        contracts: case.contracts.to_vec(),
+        eval: run.oracle_command_line(),
         oracle_argv: Vec::new(),
         rust_argv: Vec::new(),
         oracle: side.clone(),
@@ -551,6 +665,13 @@ struct RunPlan {
     /// **Owned** because a module-run case's value embeds the compiled module's temp dir,
     /// which is only known after the compile ([`corpus::expand_env`]).
     env: Vec<(String, String)>,
+    /// The spec the Rust side is spawned from.
+    ///
+    /// For every case except [`CaseKind::Command`] this is exactly `context.rust` (so their
+    /// behaviour is unchanged); a command case may instead name the `dist_probe` **helper**
+    /// ([`runtime::resolve_helper`]) as its Rust side. `None` means no Rust-side program
+    /// exists and the side is reported *unsupported*.
+    rust_spec: Option<RuntimeSpec>,
 }
 
 /// Build the argv an expression case gets: any `-pa <dir>` code paths, the case's own

@@ -101,6 +101,22 @@ use beam_term::Eterm;
 use crate::runtime::Runtime;
 use crate::RuntimeContext;
 
+/// Whether **any** machine root handed to a collection site, or any container in the process's
+/// own root set, **reaches** a container in an unscanned region (the building block is
+/// [`root_is_unscanned`]).
+///
+/// This is the **valve** every collection site consults: it is the conservative reachability
+/// check of [`crate::context::gc_walk`]. The single-level test it replaces could only see a
+/// root's *own* address, so a scanned container holding an unscanned one holding a nursery
+/// pointer slipped through; the walk descends through the scanned region and reports that
+/// shape. Declining is the only outcome it can produce, and declining only costs a collection —
+/// the allocation falls back to the pointer-stable arena — so it can never turn a working
+/// program into a failing one.
+///
+/// It is re-exported here (rather than called by its own path at each site) so the three
+/// admission-point call sites and the runner's park arm cannot drift onto different valves.
+pub(crate) use super::gc_walk::any_root_is_unscanned;
+
 /// Whether `module`'s code contains any **float-family** instruction, i.e. anything that
 /// reads or writes the machine's float-register file
 /// ([`Machine::fr`](beam_engine::Machine)).
@@ -216,15 +232,6 @@ pub(crate) fn root_is_unscanned(process: &Process, term: Eterm) -> bool {
     !in_heap_block(process.heap(), ptr)
         && !process.collector().young_contains(ptr as *const Eterm)
         && !process.collector().mature_contains(ptr as *const Eterm)
-}
-
-/// Whether **any** of the given machine roots is a container in an unscanned region (see
-/// [`root_is_unscanned`]).
-pub(crate) fn any_root_is_unscanned<'a, I>(process: &Process, roots: I) -> bool
-where
-    I: IntoIterator<Item = &'a Eterm>,
-{
-    roots.into_iter().any(|word| root_is_unscanned(process, *word))
 }
 
 /// Hand the executing machine's live roots to `process` — the **publish** half of the GC
@@ -514,7 +521,21 @@ pub(crate) fn ensure_heap(
     // program stays correct. The test runs *after* the occupancy short-circuit (an ordinary
     // admission point that is not about to collect pays nothing) and *before* the request is
     // consumed, so a forced collection it refuses stays armed for the runner's park arm.
-    if any_root_is_unscanned(process, x_regs.iter().chain(stack.iter())) {
+    //
+    // `descend` is the pid's **foreign-reachability gate**
+    // ([`Runtime::foreign_reachable`](crate::runtime)): the per-word root phase always runs, so
+    // a root that is *itself* a foreign container is still declined here without any descent,
+    // and the descent — the `O(live objects)` half — is only paid for a process that has ever
+    // held one (see the valve's module docs). A **hit** opens the gate permanently: a foreign
+    // container really did reach a live root, which is the event the gate records.
+    let descend = runtime.foreign_reachable(pid);
+    if any_root_is_unscanned(
+        runtime.walk_scratch(),
+        process,
+        x_regs.iter().chain(stack.iter()),
+        descend,
+    ) {
+        runtime.note_foreign_reachable(pid);
         return Ok(());
     }
     // Committed: the request is answered exactly once, by this collection.
@@ -645,15 +666,20 @@ pub(crate) fn ensure_heap_full(
     // a region the collector does not scan declines the move (see [`root_is_unscanned`]), so the
     // heap keeps its terms and the unscanned root stays valid. Tested after the occupancy
     // short-circuit and before the request is consumed, so a refused forced collection stays
-    // armed for the runner's park arm.
+    // armed for the runner's park arm. The descent is gated on `pid`'s foreign-reachability bit
+    // and a hit opens it permanently, exactly as in [`ensure_heap`].
+    let descend = runtime.foreign_reachable(pid);
     if any_root_is_unscanned(
+        runtime.walk_scratch(),
         process,
         roots
             .x
             .iter()
             .chain(roots.stack.iter())
             .chain(roots.fr.iter()),
+        descend,
     ) {
+        runtime.note_foreign_reachable(pid);
         return Ok(());
     }
     if forced {
@@ -768,7 +794,7 @@ pub(crate) fn alloc_words(ctx: &mut RuntimeContext<'_>, n: usize) -> Result<*mut
                     Err(_) => {}
                 }
             }
-            runtime.note_gc_fallback();
+            runtime.note_gc_fallback(*mailbox_pid);
         }
     }
     runtime.alloc_words(n)
@@ -833,35 +859,41 @@ pub(crate) fn alloc_words_rooted(
     // The young heap refused. Only the slice's own machine may collect over the roots it
     // handed in; every other context keeps `alloc_words`' arena fallback, byte for byte.
     let Some(name) = current_module else {
-        runtime.note_gc_fallback();
+        runtime.note_gc_fallback(pid);
         return runtime.alloc_words(n);
     };
     if !module_may_be_collected(runtime, &name) {
-        runtime.note_gc_fallback();
+        runtime.note_gc_fallback(pid);
         return runtime.alloc_words(n);
     }
     let Some(process) = table.get_mut(pid) else {
-        runtime.note_gc_fallback();
+        runtime.note_gc_fallback(pid);
         return runtime.alloc_words(n);
     };
     // The unscanned-root valve (see [`root_is_unscanned`]): collecting over a root set that
     // contains a container in a region the collector does not scan would relocate the young
     // words it reaches without updating it, so this collection is declined and the block comes
     // from the pointer-stable arena — the same honest fallback every other refusal path takes.
+    // The descent is gated on `pid`'s foreign-reachability bit and a hit opens it permanently,
+    // exactly as in [`ensure_heap`].
+    let descend = runtime.foreign_reachable(pid);
     if any_root_is_unscanned(
+        runtime.walk_scratch(),
         process,
         roots
             .x
             .iter()
             .chain(roots.stack.iter())
             .chain(roots.fr.iter()),
+        descend,
     ) {
-        runtime.note_gc_fallback();
+        runtime.note_foreign_reachable(pid);
+        runtime.note_gc_fallback(pid);
         return runtime.alloc_words(n);
     }
     if !publish_roots_full(process, &roots) {
         runtime.halt_process_gc(pid);
-        runtime.note_gc_fallback();
+        runtime.note_gc_fallback(pid);
         return runtime.alloc_words(n);
     }
     match process.collect() {
@@ -870,13 +902,13 @@ pub(crate) fn alloc_words_rooted(
         }
         Err(_) => {
             runtime.halt_process_gc(pid);
-            runtime.note_gc_fallback();
+            runtime.note_gc_fallback(pid);
             return runtime.alloc_words(n);
         }
     }
     if !scatter_roots_full(process, &mut roots) {
         runtime.halt_process_gc(pid);
-        runtime.note_gc_fallback();
+        runtime.note_gc_fallback(pid);
         return runtime.alloc_words(n);
     }
     // The collection emptied (or resized) the nursery: retry the bump.
@@ -884,7 +916,7 @@ pub(crate) fn alloc_words_rooted(
     if let Ok(block) = bump(process.heap_mut(), n, fill) {
         return Ok(block);
     }
-    runtime.note_gc_fallback();
+    runtime.note_gc_fallback(pid);
     runtime.alloc_words(n)
 }
 

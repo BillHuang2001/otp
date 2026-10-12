@@ -995,8 +995,31 @@ impl Runtime {
     /// destination off-heap table ([`Runtime::eval_off_heap`]) adopts the handle, so the copied
     /// term points at the same bytes rather than at a materialized equivalent.
     pub(crate) fn stabilize_term(&mut self, term: Eterm) -> Result<Eterm> {
-        beam_message::copy_struct_simple(term, &mut self.eval_heap)
-            .map_err(error::enforce_term_heap_limit)
+        let copy = beam_message::copy_struct_simple(term, &mut self.eval_heap)
+            .map_err(error::enforce_term_heap_limit)?;
+        self.note_escaped_store_roots(term);
+        Ok(copy)
+    }
+
+    /// Opens the **escape-store** descent gate for the pid that will read a stored term back.
+    ///
+    /// [`Runtime::stabilize_term`]/[`Runtime::stabilize_term_with`] copy a term onto the
+    /// runtime's pointer-stable store ([`Runtime::eval_heap`] — the `-eval` evaluator's
+    /// pointer-stable heap, whose off-heap destination table is
+    /// [`Runtime::eval_off_heap`]). That store is a **runtime-level** region, so a container
+    /// kept in it is outside every process's scanned heap: the reading accessor hands the
+    /// arena word straight into a register, and the process can nest it inside a container it
+    /// built on its own heap — the depth-≥2 shape the valve's cheap per-word phase cannot see
+    /// (see [`crate::context::gc_walk`]).
+    ///
+    /// The store itself cannot name the pid that will read the term back, so the gate is
+    /// opened for the **runtime's own process** ([`Runtime::self_pid`]) — the pid every
+    /// `-eval`/`run` path reads a stored term as. Latching is deliberately over-approximate: a
+    /// spurious latch only ever costs the `O(live objects)` descent, never a wrong result.
+    fn note_escaped_store_roots(&mut self, term: Eterm) {
+        if beam_term::is_boxed(term) || beam_term::is_list(term) {
+            self.note_foreign_reachable(self.self_pid);
+        }
     }
 
     /// [`Runtime::stabilize_term`] for a term that may reference the **off-heap payloads** an
@@ -1059,8 +1082,10 @@ impl Runtime {
         // re-registers there own the payloads the copied term points at, so they must outlive
         // the copy — which is why they live on the runtime (see the field docs).
         let mut ctx = beam_message::CopyContext::new(&source, &mut self.eval_off_heap);
-        beam_message::copy_struct(term, &mut self.eval_heap, &mut ctx)
-            .map_err(error::enforce_term_heap_limit)
+        let copy = beam_message::copy_struct(term, &mut self.eval_heap, &mut ctx)
+            .map_err(error::enforce_term_heap_limit)?;
+        self.note_escaped_store_roots(term);
+        Ok(copy)
     }
 
     /// Adopts the off-heap refc-binary payload handles a **nested run's engine machine** built
@@ -1615,6 +1640,41 @@ impl Runtime {
         self.config.heap.policy().clone()
     }
 
+    /// Opens the **spawn-argument** descent gate for a freshly created child.
+    ///
+    /// A child's *first* root set is the argument list a spawn path hands
+    /// [`RunnerState::spawn`]/[`RunnerState::spawn_fun`], and those terms were built by the
+    /// **caller** — on the caller's own young heap, on the runtime's pointer-stable arena
+    /// ([`Runtime::materialize_args`], [`Runtime::try_stabilize_escaped`]), on a pooled BIF
+    /// heap, or in an `-eval` closure's environment. None of those regions is the child's own
+    /// scanned space, so a container among the arguments (or the entry fun's environment) can
+    /// be nested inside a container the child then builds on its **own** heap — exactly the
+    /// depth-≥2 shape the unscanned-root valve's always-run per-word phase cannot see, and
+    /// whose nested young words a collection of the child's graph would leave dangling. The
+    /// gate is therefore opened here, at the choke point every spawn path funnels through, so
+    /// the child's first collection descends instead of trusting the cheap classification.
+    ///
+    /// The test is one shape test per argument: an immediate (a small integer, an atom,
+    /// `NIL`, or an internal pid/port id) has no children and can never nest a foreign
+    /// container, so an ordinary spawn of immediates pays a handful of branches. A container
+    /// — or a boxed entry fun, whose environment is part of the child's graph — opens the
+    /// gate for the **spawned** pid (its first roots are exactly these words) and for the
+    /// **runtime's own process**: the builder that copies every parsed command-line argument
+    /// and every escape-store term onto the shared arena, and therefore may hold the same
+    /// container outside its own scanned region. A spurious latch only ever costs the
+    /// `O(live objects)` descent, never a wrong result.
+    fn note_spawn_foreign_roots(&mut self, child: ProcessId, args: &[Eterm], entry: Option<Eterm>) {
+        let is_container = |word: Eterm| beam_term::is_boxed(word) || beam_term::is_list(word);
+        if entry
+            .into_iter()
+            .chain(args.iter().copied())
+            .any(is_container)
+        {
+            self.note_foreign_reachable(child);
+            self.note_foreign_reachable(self.self_pid);
+        }
+    }
+
     /// [`Runtime::spawn_process`] under an explicit heap policy and priority — the
     /// `spawn_opt` path.
     ///
@@ -1644,6 +1704,9 @@ impl Runtime {
         // path only runs over the runtime's own table — i.e. as the runtime's root process —
         // so the parent is `self_pid` (see `RuntimeContext::owns_process_table`).
         self.inherit_group_leader(self.self_pid, pid);
+        // The child's first root set is the argument list below; open its descent gate when
+        // any argument is a container (see [`Runtime::note_spawn_foreign_roots`]).
+        self.note_spawn_foreign_roots(pid, &args, None);
         self.runner_state.spawn(pid, entry, args);
         self.enqueue_process(pid)?;
         Ok(pid)
@@ -1727,6 +1790,17 @@ impl Runtime {
             .into_iter()
             .map(|arg| self.try_stabilize_escaped(arg))
             .collect::<Result<Vec<Eterm>>>()?;
+        // The child's first roots are now the arena copies above — a region outside its own
+        // scanned heap — so open its descent gate before the record is published to the pass
+        // (see [`Runtime::note_spawn_foreign_roots`]). The builder's own pid is not carried
+        // into this record (the parent is the pass's spawning process), so the gate is
+        // latched for the runtime's own process, the owner of the arena the copies were made
+        // on, exactly as [`Runtime::note_spawn_foreign_roots`] does.
+        let entry_fun = match &spawn.entry {
+            ProcessEntry::Fun { fun, .. } => Some(*fun),
+            ProcessEntry::Export { .. } => None,
+        };
+        self.note_spawn_foreign_roots(spawn.pid, &spawn.args, entry_fun);
         self.pending_spawns.push(spawn);
         Ok(())
     }
@@ -1778,6 +1852,9 @@ impl Runtime {
         }
         // As `spawn_process_with_policy`: the child inherits the root process's group leader.
         self.inherit_group_leader(self.self_pid, pid);
+        // As `spawn_process_with_policy`, for the fun's own environment as well as the
+        // arguments (see [`Runtime::note_spawn_foreign_roots`]).
+        self.note_spawn_foreign_roots(pid, &args, Some(fun));
         self.runner_state.spawn_fun(pid, fun, args);
         self.enqueue_process(pid)?;
         Ok(pid)

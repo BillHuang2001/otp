@@ -23,7 +23,7 @@
 //! A case carries a [`Golden`] expectation of the oracle's observable output, plus a
 //! [`CaseKind`] that says how the two runtimes are driven. The golden makes the corpus
 //! self-testing: the oracle must reproduce it (if it stops, that is corpus drift — a real
-//! failure, not a skip). There are three kinds of case:
+//! failure, not a skip). There are five kinds of case:
 //!
 //! * [`CaseKind::Eval`] — a plain Erlang **expression** plus a [`Probe`]; both runtimes get
 //!   the *same* `-eval` argv. These exercise the compatibility surface an expression can
@@ -41,6 +41,10 @@
 //!   additionally spawned with an explicit environment and the compiled directory reaches
 //!   the code path **only** through it (an `ERL_AFLAGS`-carried `-pa {dir}`), so the flag's
 //!   *application* — not its recording in `init:get_argument/1` — is pinned (contract A.6).
+//! * [`CaseKind::Command`] — a **non-CLI** command case: each side is an external program +
+//!   argv (neither `-eval` nor `beam_rt run <module>`), and only stdout + exit status are
+//!   compared. This is how a surface that needs **two nodes** or a helper binary is pinned
+//!   (the live distribution loopback of contract A.5 is driven by the `dist_probe` helper).
 //!
 //! Keep the default corpus **small and fast** (smoke level, Part I §C): heavy suites are
 //! milestone-only. Cases are grouped by the contract they exercise:
@@ -57,6 +61,7 @@
 //! | [`driver_ports`] | A.4 — the `open_port/2` port-open error shapes + the missing-`spawn_executable` `enoent` shape |
 //! | [`wire`] | A.5 — the distribution wire codec (ETF cross-encoding) |
 //! | [`wire_ids`] | A.2/A.5 — `term_to_binary` of a local pid / port id, plus the A.5 node-identity surface (`node/0,1`, `nodes/0,1`, the `set_cookie/2` family) |
+//! | [`dist`] | A.5 — the live two-node distribution loopback (handshake / node visibility / term delivery) via the external `dist_probe` helper (`CaseKind::Command`) |
 //! | [`flags`] | A.6 — CLI / configuration (incl. the `+hmax`/`+hmaxk`/`+hmaxel`/`+hmaxib`/`+hms`/`+hmbs` max-heap family) |
 //! | [`bifs`] | A.7 — BIF / OTP app surface (incl. the timer, process-control and code-loading families, `erts_debug:size/1`, `erts_internal:cmp_term/2`) |
 //! | [`phash`] | A.7 — `phash/2` and `phash2/1,2` (the externally-observable legacy hashes) |
@@ -95,6 +100,7 @@ mod driver_c;
 mod driver_abi;
 mod driver_abi_extra;
 mod driver_ports;
+mod dist;
 mod errors;
 mod etf;
 mod ets;
@@ -288,6 +294,15 @@ pub enum CaseKind {
         /// temp dir — the directory is not known until after the compile.
         env: &'static [(&'static str, &'static str)],
     },
+    /// A **non-CLI command** case: each side is an external program + argv — neither the
+    /// `-eval` shape of [`CaseKind::Eval`] nor the `run` action of [`CaseKind::Module`]. Only
+    /// **stdout + exit status** are compared (stderr is not), exactly like a module-run case.
+    ///
+    /// This is how a surface the CLI cannot reach through a single process is pinned: the
+    /// live distribution two-node loopback (contract A.5) needs a *second* node and a helper
+    /// binary, so the oracle side spawns `erl` and the Rust side spawns the `dist_probe`
+    /// helper (see [`super::dist`]).
+    Command(CommandRun),
 }
 
 /// The literal token a [`CaseKind::ModuleEnv`] environment value uses for the compiled
@@ -393,6 +408,76 @@ impl ModuleRun {
     }
 }
 
+/// Which resolved program a [`CommandSpec`] names (the harness resolves each to a concrete
+/// executable — see [`crate::harness`] and [`crate::runtime`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandProgram {
+    /// The resolved oracle (the system `erl`; contract A.6).
+    Oracle,
+    /// The resolved Rust runtime (`beam_rt`).
+    Rust,
+    /// The resolved distribution helper (`dist_probe`, the live two-node loopback driver).
+    Helper,
+}
+
+impl CommandProgram {
+    /// The stable program label used in a report line (`"oracle"`/`"rust"`/`"helper"`).
+    pub fn label(&self) -> &'static str {
+        match self {
+            CommandProgram::Oracle => "oracle",
+            CommandProgram::Rust => "rust",
+            CommandProgram::Helper => "helper",
+        }
+    }
+}
+
+/// One side of a [`CaseKind::Command`] case: which resolved program to spawn, plus its argv.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandSpec {
+    /// Which resolved program this side names.
+    pub program: CommandProgram,
+    /// The argv the program is spawned with (never empty — a command case always carries
+    /// its action).
+    pub args: &'static [&'static str],
+}
+
+/// A non-CLI command case: drive each side with an external program + argv (neither `-eval`
+/// nor `beam_rt run <module>`) and compare stdout + exit status (stderr is not compared).
+///
+/// Unlike a [`ModuleRun`], nothing is compiled and no temp dir is needed — the argv is fixed
+/// at corpus-definition time. The oracle side must name [`CommandProgram::Oracle`] (the
+/// harness / corpus tests enforce it), so the golden is always the real system ERTS output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandRun {
+    /// The oracle side (must name [`CommandProgram::Oracle`]).
+    pub oracle: CommandSpec,
+    /// The Rust side (`beam_rt` or the `dist_probe` helper).
+    pub rust: CommandSpec,
+}
+
+impl CommandRun {
+    /// The oracle argv (the [`CommandSpec::args`] as owned strings).
+    pub fn oracle_argv(&self) -> Vec<String> {
+        self.oracle.args.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
+    /// The Rust-side argv (the [`CommandSpec::args`] as owned strings).
+    pub fn rust_argv(&self) -> Vec<String> {
+        self.rust.args.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
+    /// A stable, deterministic one-line rendering of the oracle command for the report — the
+    /// [`CommandProgram::label`] followed by the space-joined argv.
+    pub fn oracle_command_line(&self) -> String {
+        let mut line = self.oracle.program.label().to_string();
+        for arg in self.oracle.args {
+            line.push(' ');
+            line.push_str(arg);
+        }
+        line
+    }
+}
+
 /// One conformance case: how to drive the runtimes and what the oracle must print.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Case {
@@ -420,31 +505,33 @@ impl Case {
                 probe_expr(expr, *probe)
             }
             CaseKind::Module(run) | CaseKind::ModuleEnv { run, .. } => run.oracle_eval(),
+            CaseKind::Command(run) => run.oracle_command_line(),
         }
     }
 
-    /// The stable kind label used in listings: the probe name for eval cases, and
-    /// `"module-run"` for module cases.
+    /// The stable kind label used in listings: the probe name for eval cases,
+    /// `"module-run"` for module cases, and `"command"` for a non-CLI command case.
     pub fn kind_label(&self) -> &'static str {
         match &self.kind {
             CaseKind::Eval { probe, .. } | CaseKind::EvalEnv { probe, .. } => probe.as_str(),
             CaseKind::Module(_) | CaseKind::ModuleEnv { .. } => "module-run",
+            CaseKind::Command(_) => "command",
         }
     }
 
-    /// The plain Erlang expression (`None` for a module-run case).
+    /// The plain Erlang expression (`None` for a module-run or command case).
     pub fn expr(&self) -> Option<&'static str> {
         match &self.kind {
             CaseKind::Eval { expr, .. } | CaseKind::EvalEnv { expr, .. } => Some(expr),
-            CaseKind::Module(_) | CaseKind::ModuleEnv { .. } => None,
+            CaseKind::Module(_) | CaseKind::ModuleEnv { .. } | CaseKind::Command(_) => None,
         }
     }
 
-    /// The extra eval argv (`&[]` for a module-run case).
+    /// The extra eval argv (`&[]` for a module-run or command case).
     pub fn extra_argv(&self) -> &'static [&'static str] {
         match &self.kind {
             CaseKind::Eval { extra_argv, .. } | CaseKind::EvalEnv { extra_argv, .. } => extra_argv,
-            CaseKind::Module(_) | CaseKind::ModuleEnv { .. } => &[],
+            CaseKind::Module(_) | CaseKind::ModuleEnv { .. } | CaseKind::Command(_) => &[],
         }
     }
 
@@ -457,7 +544,7 @@ impl Case {
     pub fn env(&self) -> &'static [(&'static str, &'static str)] {
         match &self.kind {
             CaseKind::EvalEnv { env, .. } | CaseKind::ModuleEnv { env, .. } => env,
-            CaseKind::Eval { .. } | CaseKind::Module(_) => &[],
+            CaseKind::Eval { .. } | CaseKind::Module(_) | CaseKind::Command(_) => &[],
         }
     }
 
@@ -489,6 +576,7 @@ fn build_corpus() -> Vec<Case> {
     cases.extend(wire::group());
     cases.extend(wire_ids::group());
     cases.extend(wire_extra::group());
+    cases.extend(dist::group());
     cases.extend(bifs::group());
     cases.extend(phash::group());
     cases.extend(binmatch::group());
@@ -543,7 +631,10 @@ pub fn probe_expr(expr: &str, probe: Probe) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{cases, expand_env, find_case, probe_expr, CaseKind, Contract, Probe, DIR_PLACEHOLDER};
+    use super::{
+        cases, expand_env, find_case, probe_expr, CaseKind, CommandProgram, Contract, Probe,
+        DIR_PLACEHOLDER,
+    };
     use std::collections::HashSet;
 
     #[test]
@@ -610,7 +701,7 @@ mod tests {
                         case.id
                     );
                 }
-                CaseKind::Eval { .. } | CaseKind::Module(_) => {
+                CaseKind::Eval { .. } | CaseKind::Module(_) | CaseKind::Command(_) => {
                     assert!(
                         case.env().is_empty(),
                         "case {}: only an EvalEnv/ModuleEnv case may set an environment",
@@ -684,6 +775,27 @@ mod tests {
                         run.arity as usize,
                         run.args.len(),
                         "case {}: arity must match the argument count",
+                        case.id
+                    );
+                }
+                CaseKind::Command(run) => {
+                    // A command case's golden is whatever the program prints (a bare `pong`,
+                    // an integer, an ETF hex image, …), so the shared non-empty / no-trailing-
+                    // newline assertions above are all that is required of its **shape**;
+                    // here we only additionally require both sides to carry an action.
+                    assert!(
+                        !run.oracle.args.is_empty(),
+                        "case {}: a command case needs an oracle argv",
+                        case.id
+                    );
+                    assert!(
+                        !run.rust.args.is_empty(),
+                        "case {}: a command case needs a Rust argv",
+                        case.id
+                    );
+                    assert_eq!(
+                        case.golden.exit_code, 0,
+                        "case {}: a successful command run exits 0",
                         case.id
                     );
                 }
@@ -865,6 +977,52 @@ mod tests {
         assert!(
             module_cases > 0,
             "the corpus must carry environment-variable module-run cases"
+        );
+    }
+
+    /// The `Command` variant: a non-CLI command case whose oracle side is the resolved `erl`
+    /// and whose Rust side is a resolved program (`beam_rt` or the `dist_probe` helper).
+    #[test]
+    fn command_cases_are_registered_and_well_formed() {
+        let mut command_cases = 0;
+        for case in cases() {
+            let CaseKind::Command(run) = &case.kind else {
+                continue;
+            };
+            command_cases += 1;
+            assert!(
+                matches!(run.oracle.program, CommandProgram::Oracle),
+                "case {}: a command case's oracle side must name the resolved oracle",
+                case.id
+            );
+            assert!(
+                !run.oracle.args.is_empty(),
+                "case {}: a command case needs an oracle argv",
+                case.id
+            );
+            assert!(
+                !run.rust.args.is_empty(),
+                "case {}: a command case needs a Rust argv",
+                case.id
+            );
+            assert!(
+                case.contracts.contains(&Contract::Distribution),
+                "case {}: a command case must evidence the distribution contract",
+                case.id
+            );
+            assert_eq!(case.kind_label(), "command");
+            assert_eq!(case.expr(), None);
+            assert!(case.extra_argv().is_empty());
+            assert!(case.env().is_empty());
+            assert!(
+                !run.oracle_command_line().is_empty(),
+                "case {}: a command case must render an oracle command line",
+                case.id
+            );
+        }
+        assert!(
+            command_cases > 0,
+            "the corpus must carry a non-CLI command case"
         );
     }
 

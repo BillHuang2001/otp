@@ -343,10 +343,15 @@ fn put_new_matches_a_boxed_value_structurally() {
         "an equal-but-distinct value is the no-op ok, not badarg"
     );
     assert_badarg(call(&mut rt, "put_new", 2, &[equal_key, other]).expect_err("a different value"));
-    assert_eq!(
-        call(&mut rt, "get", 1, &[equal_key]).expect("get(EqualKey)"),
-        value,
-        "the rejected put_new left the stored value untouched"
+    // The stored value is compared **structurally**: `put/2` copies the key and value onto the
+    // pointer-stable arena (the escape-store treatment, so a stored word can never dangle
+    // across a process-heap collection), so the word read back is a distinct copy of `value`.
+    // The oracle behaves the same way — `erts_debug:same(V, persistent_term:get(K))` is
+    // `false` while `V =:= persistent_term:get(K)` is `true` — so identity is not the contract.
+    let stored = call(&mut rt, "get", 1, &[equal_key]).expect("get(EqualKey)");
+    assert!(
+        beam_term::compare::eq(stored, value, rt.atoms()),
+        "the rejected put_new left the stored value untouched (got {stored:?})"
     );
 }
 
@@ -574,4 +579,76 @@ fn info_keys(rt: &Runtime, map: Eterm) -> String {
         .collect();
     keys.sort();
     format!("[{}]", keys.join(","))
+}
+
+// ---------------------------------------------------------------------------------------
+// The node-global store across a process-heap collection
+// ---------------------------------------------------------------------------------------
+
+/// The committed `pt_gc` fixture: a payload built on the process's own **young heap**,
+/// stored through `persistent_term:put/2`, then churned and read back out of the store.
+const PT_GC_BEAM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/pt_gc.beam");
+
+/// The fixture's payload element count (`pt_gc:payload_length/0`).
+const PT_GC_PAYLOAD_LENGTH: i64 = 64;
+
+/// The churn rounds the workload runs — well past the default 233-word nursery, so the
+/// process's young heap fills and the collector really runs.
+const PT_GC_ROUNDS: i64 = 2_000;
+
+/// How long the workload may take before the test declares the runtime hung.
+const PT_GC_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// **A value stored through the persistent-term path must survive a process-heap
+/// collection.**
+///
+/// The store keeps its key and value as raw `Eterm` words. When a *scheduled* process
+/// supplies them (`pt_gc:run/1` builds the payload, then calls `persistent_term:put/2`), the
+/// terms live on that process's own **young heap** — the heap the collector relocates at the
+/// engine's heap-admission point (`src/context/gc.rs`). A raw word kept past a collection
+/// would dangle, so the value the store hands back must still be the one the process built.
+///
+/// `pt_gc:run/1` therefore builds the 64-element payload, stores it, churns enough
+/// short-lived garbage to drive real collections, and finally returns
+/// `persistent_term:get(pt_gc_key)` — the value read back **out of** the store. The payload
+/// must come back intact, element by element.
+///
+/// Needs the system Erlang installation (the boot sequence resolves the system code path);
+/// skips loudly without it.
+#[test]
+fn a_stored_value_survives_a_process_heap_collection() {
+    let Some(_oracle) = support::require_oracle("persistent_term") else {
+        return;
+    };
+    let mut rt = Runtime::with_defaults().expect("the default runtime");
+    rt.boot().expect("the boot sequence runs");
+    rt.load_module(PT_GC_BEAM).expect("the fixture loads");
+
+    let before = rt.gc_stats();
+    let pid = rt
+        .spawn_process("pt_gc", "run", vec![make_small(PT_GC_ROUNDS)])
+        .expect("the workload is spawned");
+
+    let deadline = std::time::Instant::now() + PT_GC_DEADLINE;
+    while rt.process_result(pid).is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pt_gc:run/1 did not terminate within {}s",
+            PT_GC_DEADLINE.as_secs()
+        );
+        rt.run_one_slice().expect("a scheduler slice runs");
+    }
+
+    // The collection really happened: without one this test would prove nothing.
+    let after = rt.gc_stats();
+    assert!(
+        after.collections > before.collections,
+        "the workload must really collect the process's own young heap \
+         (before {before:?}, after {after:?})"
+    );
+
+    let value = rt
+        .process_result(pid)
+        .expect("the workload returned the value read back out of the store");
+    support::check_gc_payload(value, PT_GC_PAYLOAD_LENGTH);
 }

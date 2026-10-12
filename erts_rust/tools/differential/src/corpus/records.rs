@@ -600,7 +600,7 @@ mod tests {
                         case.id
                     );
                 }
-                CaseKind::EvalEnv { .. } | CaseKind::ModuleEnv { .. } => {
+                CaseKind::EvalEnv { .. } | CaseKind::ModuleEnv { .. } | CaseKind::Command(_) => {
                     panic!(
                         "{}: the records group declares no environment-variable cases",
                         case.id
@@ -633,7 +633,8 @@ mod tests {
                 CaseKind::Module(run) => Some(run.function),
                 CaseKind::Eval { .. }
                 | CaseKind::EvalEnv { .. }
-                | CaseKind::ModuleEnv { .. } => None,
+                | CaseKind::ModuleEnv { .. }
+                | CaseKind::Command(_) => None,
             })
             .collect();
         // Field access, update, guard, match and the external-record paths all execute the

@@ -81,6 +81,7 @@ mod alias;
 mod bridges;
 mod fun_identity;
 pub(crate) mod gc;
+pub(crate) mod gc_walk;
 mod memory_hook;
 mod module_info;
 mod persistent_term;
@@ -102,7 +103,7 @@ use beam_common::{AllocKind, BeamError, Result};
 use beam_engine::context::RootSet;
 use beam_engine::machine::WaitDeadline;
 use beam_engine::{terms, ExecutionContext, Machine, RunOutcome};
-use beam_loader::{Atom, Label, Module};
+use beam_loader::{Atom, Function, ImportRef, Instr, Label, Module};
 use beam_message::{CopyContext, Message, OffHeapTable, Queue};
 use beam_process::{MonitorRef, ProcessId, ProcessTable};
 use beam_term::Eterm;
@@ -121,6 +122,7 @@ use self::bridges::{
     SharedSink,
 };
 use self::fun_identity::FunIdentityBridge;
+use self::gc_walk::process_roots_are_unscanned;
 use self::memory_hook::RuntimeMemory;
 use self::module_info::ModuleInfoBridge;
 use self::persistent_term::PersistentTermBridge;
@@ -604,11 +606,14 @@ impl<'a> RuntimeContext<'a> {
     /// be recycled by the *next* message's delivery. An exempt process refuses that
     /// collection instead, which is what keeps the caller's handles valid.
     ///
-    /// The scheduler slice is deliberately **not** wrapped: the runner drives it with
-    /// `run_export_outcome_with_tier`/`run_label_outcome_with_tier` directly, publishes a
-    /// parked machine's roots, and its `BudgetContext` arms the per-call GC latch for the
-    /// admission point that **is** the legitimate collection site
-    /// ([`gc::ensure_heap`](crate::context::gc::ensure_heap)).
+    /// The scheduler slice's **running** window is deliberately **not** wrapped: the runner
+    /// drives it with `run_export_outcome_with_tier`/`run_label_outcome_with_tier` directly,
+    /// and its `BudgetContext` arms the per-call GC latch for the admission point that **is**
+    /// the legitimate collection site
+    /// ([`gc::ensure_heap`](crate::context::gc::ensure_heap)). Its **parked** window is marked
+    /// by the runner instead: the Wait park arm sets the exemption
+    /// ([`runner::run`](crate::runner)) and the resume clears it, so no delivery or
+    /// `beam_process` signal relocates a waiting process's heap.
     ///
     /// # Nesting
     ///
@@ -629,6 +634,26 @@ impl<'a> RuntimeContext<'a> {
         f: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
         let pid = self.mailbox_pid;
+        self.with_pid_relocation_exempt(pid, f)
+    }
+
+    /// The **`pid`-addressed** form of [`Self::with_relocation_exempt`]: runs `f` with the
+    /// process `pid` marked relocation-exempt, restoring the previous mark whatever `f`
+    /// returns.
+    ///
+    /// [`Self::with_relocation_exempt`] is exactly `with_pid_relocation_exempt(self.mailbox_pid,
+    /// f)` (the sending context's own process); the second caller is
+    /// [`Self::deliver_message_with_off_heap_inner`], which marks the **receiver** when the
+    /// unscanned-root valve says a delivery-driven collection of *its* heap would be unsound —
+    /// a process that is not this context's own.
+    ///
+    /// A pid this context's table does not hold is not an error: there is no process to exempt,
+    /// so `f` simply runs unguarded.
+    pub(crate) fn with_pid_relocation_exempt<T>(
+        &mut self,
+        pid: ProcessId,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
         let previous = match self.process_table().is_relocation_exempt(pid) {
             Ok(previous) => Some(previous),
             // A pid with no process has no heap to move, so there is nothing to exempt.
@@ -654,13 +679,11 @@ impl<'a> RuntimeContext<'a> {
     /// Re-syncs a **resuming** machine from this context's process root set (the runner's
     /// resume seam).
     ///
-    /// A parked machine can be relocated under it: while the process waits, a delivery-driven
-    /// collection ([`Process::deliver`](beam_process::Process::deliver)'s exit cascade, which —
-    /// unlike the in-slice admission point — is **not** gated by
-    /// [`gc_process_enabled`](Runtime::gc_process_enabled)) rewrites the process's `regs` in
-    /// place, so the machine's own `x`/`stack`/`fr` point into the abandoned space. The
-    /// process's root set is the truth a resume must run from, so this copies it back into the
-    /// machine — all three containers
+    /// A parked machine can be relocated under it: while the machine is out of the runner, a
+    /// collection that ran between slices — the pre-emption (`Yield`) window, which is never
+    /// marked relocation-exempt — rewrites the process's `regs` in place, so the machine's own
+    /// `x`/`stack`/`fr` point into the abandoned space. The process's root set is the truth a
+    /// resume must run from, so this copies it back into the machine — all three containers
     /// ([`gc::scatter_roots_full`](crate::context::gc::scatter_roots_full), the FR file
     /// included). If their slice lengths no longer match, the process's collection is halted
     /// rather than run against inconsistent roots ([`crate::context::gc`] documents the
@@ -668,7 +691,7 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// The machine's live **pending-exception reason** rides the process's
     /// [`extra_roots`](beam_process::Registers::extra_roots) (published by
-    /// `runner::run::publish_parked_roots`), which the collector has already relocated in
+    /// `runner::run::publish_parked_roots`), which such a collection has already relocated in
     /// place; this reads that relocated word back into
     /// [`Machine::pending_exception_mut`](beam_engine::Machine::pending_exception_mut) so the
     /// resumed machine points at the moved term, then **clears** the process's extra roots so
@@ -883,9 +906,12 @@ impl<'a> RuntimeContext<'a> {
         // [`Process::set_relocation_exempt`](beam_process::Process::set_relocation_exempt)), so
         // no heap word moves under a term the unpublished machine still holds. The message
         // still arrives: the refusal is exactly the signal the heap-fragment fallback below is
-        // reached on. A delivery to a process that is **not** the one this context runs as is
-        // unaffected — the exemption names this context's own pid, and another process's
-        // collection is legitimate (its roots were published when it parked).
+        // reached on.
+        //
+        // The **receiver** gets the same treatment when *its* own collection would be unsound —
+        // see [`Self::deliver_message_with_off_heap_inner`] and
+        // [`Self::delivery_collection_is_unsound`], which the body below consults and then marks
+        // the receiver through [`Self::with_pid_relocation_exempt`].
         self.with_relocation_exempt(|this| {
             this.deliver_message_with_off_heap_inner(to, from, message, src)
         })
@@ -893,7 +919,58 @@ impl<'a> RuntimeContext<'a> {
 
     /// The delivery body of [`Self::deliver_message_with_off_heap`], run with the sending
     /// context's own process marked relocation-exempt (see that method for why).
+    ///
+    /// # The receiver's own collection, and the runtime's unscanned-root valve
+    ///
+    /// Exempting the **sender** covers only the sender. [`Process::deliver`] can *also* collect
+    /// the **receiver's** heap: a receiver that is neither `Running` nor relocation-exempt
+    /// passes `has_unpublished_roots`, so `deliver` runs a rooted collection (and an on-demand
+    /// growth) over *its* root set — the `Runnable` shape, a process woken by a delivery or
+    /// pre-empted at a yield. (A `Waiting` receiver is exempt for its whole parked window — the
+    /// runner's Wait park arm sets the mark and the resume clears it — so it refuses the move.)
+    /// The runtime's four admission doors
+    /// (`gc::{ensure_heap, ensure_heap_full, alloc_words_rooted}` and `Runtime::serve_gc_request`)
+    /// refuse exactly that move when the receiver's roots reach a container the collector does
+    /// not scan ([`crate::context::gc_walk`]); the delivery-driven site inside
+    /// `beam_process::Process::deliver` consults none of them, so a delivery into such a receiver
+    /// used to move its heap against a root set the runtime itself calls unsound — a live term
+    /// reachable only through a container outside the collector's from-set is left behind, the
+    /// old mature block is freed and recycled in place, and the process reads a corrupted word at
+    /// a stable address.
+    ///
+    /// [`Self::delivery_collection_is_unsound`] asks that same question for the receiver, and
+    /// when the answer is `true` this method marks the **receiver**
+    /// ([`Self::with_pid_relocation_exempt`]) for the duration of the delivery. `Process::deliver`
+    /// then returns its raw [`AllocKind::Message`] refusal **unchanged** — no collection, no
+    /// growth, no word moved — and the ordinary host fragment fallback below
+    /// ([`Self::send_fragmented_message`]) delivers the payload with no heap word moved, exactly
+    /// as it already does for a `Running` receiver. This is the runtime applying its *own* policy
+    /// consistently, not a special case: "do not relocate against a root set that reaches an
+    /// unscannable container".
+    ///
+    /// The receiver's mark is restored on every path, so a receiver the scheduler (or an outer
+    /// scope) already had exempt keeps its mark.
     fn deliver_message_with_off_heap_inner(
+        &mut self,
+        to: ProcessId,
+        from: Eterm,
+        message: Eterm,
+        src: &OffHeapTable,
+    ) -> Result<()> {
+        if !self.delivery_collection_is_unsound(to) {
+            return self.deliver_into_mailbox(to, from, message, src);
+        }
+        // The receiver's own heap must not be relocated for this delivery: exempt it, so
+        // `deliver` refuses the move and the fragment fallback delivers the message.
+        self.with_pid_relocation_exempt(to, |this| {
+            this.deliver_into_mailbox(to, from, message, src)
+        })
+    }
+
+    /// One delivery attempt into `to`'s mailbox, with the heap-fragment fallback for the
+    /// copier's raw [`AllocKind::Message`] refusal and the `error:system_limit` translation —
+    /// the shared body of [`Self::deliver_message_with_off_heap_inner`].
+    fn deliver_into_mailbox(
         &mut self,
         to: ProcessId,
         from: Eterm,
@@ -906,6 +983,63 @@ impl<'a> RuntimeContext<'a> {
                 .map_err(error::enforce_term_heap_limit),
             other => other.map(|_| ()).map_err(error::enforce_term_heap_limit),
         }
+    }
+
+    /// Whether a delivery into `to` could drive an **unsound** collection of `to`'s own heap —
+    /// i.e. whether the delivery must run with `to` marked relocation-exempt (see
+    /// [`Self::deliver_message_with_off_heap_inner`]).
+    ///
+    /// The answer is the runtime's **unscanned-root valve**, asked about the *receiver*:
+    ///
+    /// * A receiver that already refuses the delivery-driven collection needs no mark:
+    ///   [`Process::has_unpublished_roots`](beam_process::Process::has_unpublished_roots) is true
+    ///   for a relocation-exempt process and for a `Running` one (whose `regs` snapshot is stale
+    ///   mid-slice), and `deliver` returns its raw refusal for both — which is the very signal the
+    ///   fragment fallback keys on. Answering `false` here therefore changes nothing.
+    /// * Otherwise the receiver is a parked process whose roots `deliver` would publish — the
+    ///   shape the four admission doors decline. The pid's **descent latch**
+    ///   ([`Runtime::foreign_reachable`](crate::runtime::Runtime)) is the `O(1)` fast path: when it
+    ///   is open the process's reachable graph may hold a container from a region its collector
+    ///   does not scan at depth ≥ 2, and declining is the conservative (and cheap) answer — the
+    ///   `O(live objects)` descent is deliberately **not** paid on the per-send hot path.
+    /// * When the latch is closed the descent would be skipped anyway, so the walk's always-run
+    ///   per-word phase is the whole valve — the same classification the four doors run on the
+    ///   same condition ([`crate::context::gc::root_is_unscanned`]). Run it (it is `O(roots)`) and,
+    ///   on a hit, open the latch permanently, exactly as those doors do: a foreign container
+    ///   really did reach a live root, which is the event the latch records.
+    ///
+    /// A pid with no process answers `false`: there is no heap to move, and `deliver` reports the
+    /// typed not-found itself.
+    ///
+    /// Nothing here can *allow* a collection the current behaviour would decline — a `false`
+    /// answer is returned only for a receiver that is already refusing, one whose roots are all
+    /// in scanned regions, or one no table holds — so the change is strictly conservative.
+    fn delivery_collection_is_unsound(&mut self, to: ProcessId) -> bool {
+        match self.process_table().get(to) {
+            // Already refusing the collection: `deliver` will not move a word, so no mark is
+            // needed (and the fragment fallback already covers the refusal).
+            Some(process) if process.has_unpublished_roots() => return false,
+            Some(_) => {}
+            None => return false,
+        }
+        // The `O(1)` fast path: an open descent latch means the graph may hold a foreign
+        // container at depth ≥ 2, so decline rather than pay the `O(live objects)` walk.
+        if self.runtime.foreign_reachable(to) {
+            return true;
+        }
+        // The latch is closed, so the descent is skipped: the always-run per-word phase *is* the
+        // valve here. The scratch is moved out for the walk (`O(1)`) because the receiver is
+        // reached through a table that may be the runtime's own.
+        let mut scratch = self.runtime.take_walk_scratch();
+        let hit = match self.process_table().get(to) {
+            Some(process) => process_roots_are_unscanned(&mut scratch, process, false),
+            None => false,
+        };
+        self.runtime.put_walk_scratch(scratch);
+        if hit {
+            self.runtime.note_foreign_reachable(to);
+        }
+        hit
     }
 
     /// [`Self::deliver_message`] for a caller that already holds the runtime and the
@@ -1008,6 +1142,15 @@ impl<'a> RuntimeContext<'a> {
         let (heap, mailbox) = process.heap_and_mailbox_mut();
         beam_message::send_fragmented(from, message, heap, mailbox, &mut ctx, 0)?;
         let woken = process.wake();
+        // The payload now lives in a [`HeapFragment`](beam_message::HeapFragment) — a region the
+        // receiver's collector does not scan — so the receiver's **descent gate** opens here:
+        // `receive` hands that payload to the running code as a register value, and the code can
+        // nest it inside a container built on the receiver's *own* scanned heap, which is the
+        // shape only the gated descent finds. Recorded before the wake so a receiver that was
+        // already runnable (the wake's `false` arm) is gated too. A delivery that did **not**
+        // need a fragment — the ordinary receiver-heap copy — lands on the receiver's own heap
+        // and deliberately does not open the gate (see [`crate::context::gc_walk`]).
+        self.runtime.note_foreign_reachable(to);
         if woken {
             self.runtime.note_fragment_wake(to);
         }
@@ -1820,6 +1963,27 @@ impl<'a> RuntimeContext<'a> {
                 // store can compare keys/values **structurally** (`beam_term::eq`) — two
                 // structurally equal boxed terms are distinct heap words. No runtime
                 // borrow is held (it can coexist with everything).
+                //
+                // The store keeps its key and value as **raw `Eterm` words**, so a term a
+                // *scheduled* process supplied lives on that process's own young heap — the
+                // heap the collector relocates at the engine's heap-admission point
+                // ([`crate::context::gc`]). A raw word kept past a collection would dangle,
+                // so the two **storing** BIFs (`put/2`, `put_new/2`) copy their key and
+                // value onto the pointer-stable arena first: exactly the escape-store
+                // treatment every other runtime-level store already takes
+                // ([`Runtime::try_stabilize_escaped`]). The five **reading** BIFs are
+                // unaffected — every word they can hand back was stabilized when it was
+                // stored (a key they receive is only compared, never stored).
+                let stored_args = if Self::persistent_term_stores(module, function, arity) {
+                    let mut stabilized = Vec::with_capacity(args.len());
+                    for arg in args {
+                        stabilized.push(runtime.try_stabilize_escaped(*arg)?);
+                    }
+                    Some(stabilized)
+                } else {
+                    None
+                };
+                let args = stored_args.as_deref().unwrap_or(args);
                 let mut store = PersistentTermBridge::new(
                     Rc::clone(&runtime.persistent_terms),
                     Rc::clone(&atoms),
@@ -2042,6 +2206,28 @@ impl<'a> RuntimeContext<'a> {
     /// that read the [`PersistentTerm`](beam_bifs::PersistentTerm) seam.
     fn uses_persistent_term(module: &str, function: &str, arity: u32) -> bool {
         beam_bifs::needs_persistent_term(module, function, arity)
+    }
+
+    /// Whether `(module, function, arity)` is one of the **storing** `persistent_term:*`
+    /// BIFs — `put/2` and `put_new/2`, the only two keys of
+    /// [`PERSISTENT_TERM_BIFS`](beam_bifs::PERSISTENT_TERM_BIFS) that write a term into the
+    /// node-global store.
+    ///
+    /// The store keeps its key and value as **raw `Eterm` words** (`persistent_term.rs`), so
+    /// a term a *scheduled* process supplied would live on that process's own young heap —
+    /// the heap the collector relocates at the engine's heap-admission point
+    /// ([`crate::context::gc`]) — and a raw word kept past a collection would dangle. The
+    /// arguments of exactly these two keys are therefore copied onto the pointer-stable arena
+    /// before the call (the escape-store treatment, [`Runtime::try_stabilize_escaped`]).
+    ///
+    /// The other five keys (`get/0,1,2`, `erase/1`, `info/0`) read: every word they can hand
+    /// back was stabilized when it was stored, and the key they receive is only *compared*
+    /// (against the store's own stabilized words), never kept — so none of them needs a copy.
+    fn persistent_term_stores(module: &str, function: &str, arity: u32) -> bool {
+        matches!(
+            (module, function, arity),
+            ("persistent_term", "put" | "put_new", 2)
+        )
     }
 
     /// Whether `(module, function, arity)` is one of the runtime-coupled BIFs the
@@ -2374,15 +2560,13 @@ impl RuntimeContext<'_> {
         }
     }
 }
-impl ExecutionContext for RuntimeContext<'_> {
-    /// The runtime's unified dispatch — see the module docs.
+impl RuntimeContext<'_> {
+    /// The **routing** half of [`ExecutionContext::call_bif`]: pick the route that serves
+    /// `module:function/arity` and run it.
     ///
-    /// 1. The runtime-native floor ([`RuntimeContext::try_native`]).
-    /// 2. A registered `beam_bifs` BIF, with the runtime's **shared** atom table.
-    /// 3. Otherwise an external module call: the module is loaded on demand from the
-    ///    code path and run with `self` as the context. `erlang` is the BIF namespace,
-    ///    never a loadable module, so an unknown `erlang:*` call is a typed diagnostic.
-    fn call_bif(
+    /// Kept apart from the seam itself so the seam can inspect the **result** once, at the one
+    /// point every route funnels through (see [`Self::open_gate_for_foreign_result`]).
+    fn call_bif_routed(
         &mut self,
         module: &str,
         function: &str,
@@ -2448,6 +2632,61 @@ impl ExecutionContext for RuntimeContext<'_> {
         self.run_export(&loaded, function, arity, args)
     }
 
+    /// Opens the running process's **descent gate** ([`crate::context::gc_walk`]) when `term` is
+    /// a container in a region its collector does not scan.
+    ///
+    /// A registered BIF, the runtime-native floor and a NIF all build their results on a pooled
+    /// heap **outside** the process's own young/mature area, and the engine stores such a result
+    /// straight into the process's reachable graph. That is the one way a foreign container
+    /// enters the graph other than an engine arena fallback
+    /// ([`Runtime::note_gc_fallback`](crate::runtime::gc)), so it is the event that must open the
+    /// gate: the valve's always-run per-word phase still classifies the result itself while it
+    /// is a root, but the process may nest it inside a container it builds on its *own* scanned
+    /// heap — and that nested shape is exactly what the gated descent exists to find.
+    ///
+    /// This is deliberately **not** a cost on every BIF call: the gate is
+    /// [`gc::root_is_unscanned`](crate::context::gc::root_is_unscanned), which rejects every
+    /// immediate (small integers, atoms, `NIL`), every literal-area constant and every pointer
+    /// into the process's own heap in a few instructions — so the ordinary result costs two
+    /// branches and the `O(live objects)` descent stays off the allocator's path. A process with
+    /// no table (`-eval`/single-pass) or none the table still holds cannot collect, so it needs
+    /// no gate.
+    fn open_gate_for_foreign_result(&mut self, term: Eterm) {
+        let pid = self.mailbox_pid;
+        let foreign = match self
+            .mailbox_table
+            .as_deref()
+            .and_then(|table| table.get(pid))
+        {
+            Some(process) => crate::context::gc::root_is_unscanned(process, term),
+            None => false,
+        };
+        if foreign {
+            self.runtime.note_foreign_reachable(pid);
+        }
+    }
+}
+
+impl ExecutionContext for RuntimeContext<'_> {
+    /// The runtime's unified dispatch — see the module docs.
+    ///
+    /// 1. The runtime-native floor ([`RuntimeContext::try_native`]).
+    /// 2. A registered `beam_bifs` BIF, with the runtime's **shared** atom table.
+    /// 3. Otherwise an external module call: the module is loaded on demand from the
+    ///    code path and run with `self` as the context. `erlang` is the BIF namespace,
+    ///    never a loadable module, so an unknown `erlang:*` call is a typed diagnostic.
+    fn call_bif(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<Eterm> {
+        let result = self.call_bif_routed(module, function, arity, args)?;
+        self.open_gate_for_foreign_result(result);
+        Ok(result)
+    }
+
     /// The engine's **cross-module call seam**
     /// ([`ExecutionContext::resolve_external_call`]): run a `call_ext*` callee's export **in
     /// the running machine** instead of recursing through [`Self::call_bif`].
@@ -2483,8 +2722,9 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// * a module that is **not already loaded** is loaded on demand exactly as
     ///   [`Self::call_bif`] does (so the callee's `receive` suspends *this* process in the
     ///   first call too, not only the second); a load failure → `Ok(None)`, leaving
-    ///   [`Self::call_bif`] to reproduce the identical `undef` diagnostic. A callee whose own
-    ///   code reads the call site it runs at ([`module_observes_its_call_site`]) → `Ok(None)`,
+    ///   [`Self::call_bif`] to reproduce the identical `undef` diagnostic. A callee whose
+    ///   **own code for the resolved function** reads the call site it runs at
+    ///   ([`callee_observes_its_call_site`]) → `Ok(None)`,
     ///   whether it was already cached or loaded on demand by this very call — the guard is
     ///   applied to both paths, so the answer never depends on *when* the module was cached
     ///   (the seam is idempotent, see the note at the guard);
@@ -2595,9 +2835,19 @@ impl ExecutionContext for RuntimeContext<'_> {
             }
         };
         // An in-machine callee runs under the **caller's** recorded `current_module` (see the
-        // NIF exclusion above), so a module whose own code *reads* that call site
-        // ([`module_observes_its_call_site`]) keeps the synchronous [`Self::call_bif`] path,
-        // which enters it through `run_export` and sets the identity correctly.
+        // NIF exclusion above), so a callee whose own code *reads* that call site
+        // ([`callee_observes_its_call_site`]) keeps the synchronous [`Self::call_bif`] path,
+        // which enters it through `run_export` and sets the identity correctly. The guard is
+        // **module-wide** for `erlang:load_nif/2` (a local call inside the module can reach it,
+        // and a local `call` never re-consults this seam) and **per-function** for the two
+        // fun-image BIFs — see the predicate for both rationales.
+        //
+        // The callee's function atom is resolved **first** because the per-function half of the
+        // guard needs it: it is the atom `callee.export(..)` below will be asked for, and the
+        // function whose own lowered body decides the fun-image verdict. Resolving it through the
+        // **callee's own** atom table (`Module` code's atoms are that table's, never the
+        // runtime's shared one) keeps the `Ok(None)` for an unknown atom — the synchronous
+        // path's `undef` — exactly where it was.
         //
         // This check runs **after** the module is resolved, so it covers a module that was
         // already cached and one this very call just loaded alike — the answer no longer
@@ -2608,17 +2858,16 @@ impl ExecutionContext for RuntimeContext<'_> {
         // — and therefore through this seam again). Answering `Ok(None)` on the first
         // consultation and `Ok(Some(..))` on the second because the on-demand load had cached
         // the module in between would enter the callee in-machine under the caller's identity
-        // — the observed wrong `bad_lib` on a module's own `erlang:load_nif/2`.
-        if module_observes_its_call_site(&callee) {
-            return Ok(None);
-        }
-        // Resolve the export in the **callee's own** atom table (`Module` code's atoms are
-        // that table's, never the runtime's shared one) and hand back the export entry label
-        // the synchronous `run_export` would enter. An unknown atom or export is the
-        // synchronous path's `undef`.
+        // — the observed wrong `bad_lib` on a module's own `erlang:load_nif/2`. The guard is a
+        // pure function of the (immutable) loaded IR, so it answers the same both times.
         let Some(function_atom) = callee.atom_table.lookup(function) else {
             return Ok(None);
         };
+        if callee_observes_its_call_site(&callee, function_atom, arity) {
+            return Ok(None);
+        }
+        // Hand back the export entry label the synchronous `run_export` would enter. An export
+        // the callee does not have is the synchronous path's `undef`.
         match callee.export(function_atom, arity) {
             Some(label) => Ok(Some((callee, label))),
             None => Ok(None),
@@ -2946,65 +3195,170 @@ impl ExecutionContext for RuntimeContext<'_> {
     }
 }
 
-/// Whether `module`'s **own code** can read the call site it runs at, i.e. whether it imports a
-/// BIF whose answer depends on [`RuntimeContext::current_module`] — or, for the second group
-/// below, whether entering it in-machine would expose a known relocation hazard of another
-/// subsystem. Either way the answer means "keep this module on the synchronous `call_bif`
-/// route".
+/// The call-site-reading imports a module's `ImpT` declares, classified by the **scope** of
+/// the refusal each one forces — computed in **one** pass over [`Module::imports`].
 ///
-/// The engine's cross-module call seam ([`ExecutionContext::resolve_external_call`]) runs a
-/// callee inside the **caller's** machine, and the engine's module-context switch never re-enters
-/// this context, so a callee keeps the caller's `current_module`. The one imported BIF that
-/// *reads* that identity is:
+/// A callee entered in-machine through [`ExecutionContext::resolve_external_call`] runs under
+/// the **caller's** [`RuntimeContext::current_module`] (the engine's module-context switch never
+/// re-enters this context), so a callee whose own code *reads* that call site keeps the
+/// synchronous `call_bif` route, which sets the identity correctly. The two guarded groups
+/// differ in how far that refusal must reach:
 ///
-/// * `erlang:load_nif/2` — the module a NIF library is registered under, which the library's own
-///   `ErlNifEntry.name` is validated against: a stale identity is the oracle's `bad_lib` (and it
-///   is why a module carrying a *loaded* NIF is excluded from the seam altogether).
+/// * **`erlang:load_nif/2`** — the module a NIF library is registered under, which the loader
+///   validates the library's own `ErlNifEntry.name` against: a stale identity is the oracle's
+///   `bad_lib`. The refusal must be **module-wide**, because the BIF is reachable by a *local*
+///   call inside the module too and a local `call` never re-consults this seam — only refusing
+///   every function of the module is sound.
+/// * **the fun-image BIFs** `erlang:term_to_binary/1,2` / `erlang:external_size/1,2` — their
+///   local-fun `NEW_FUN_EXT` identity no longer reads the call site ([`FunIdentityBridge`]
+///   resolves the defining module by searching every loaded module for the fun's own
+///   `(uniq, index)`, caller first), so they are kept on the synchronous route only as a
+///   conservative guard against a hazard owned elsewhere, described on
+///   [`callee_observes_its_call_site`]. That hazard belongs to the **function that issues the
+///   call**, so the refusal is per-function.
 ///
-/// The `NEW_FUN_EXT` identity of a **local** fun no longer reads the call site:
-/// `erlang:term_to_binary/1,2` and `erlang:external_size/1,2` resolve the defining module by
-/// searching every loaded module for the fun's own `(uniq, index)` ([`FunIdentityBridge`], which
-/// prefers the caller but is not confined to it), so a callee entering in-machine under a stale
-/// `current_module` still derives the right image. Those three names are nevertheless kept on the
-/// synchronous route as a **conservative routing guard**: `erlang:load_nif/2` genuinely reads the
-/// call-site identity above, and the two fun-image names are routed alongside it while the A.9
-/// in-process `compile:file/2` route is settled.
+/// The scan is over the module's `ImpT` table, which is where a compiled `M:F/A` call is
+/// recorded. A call reached only through `apply/3` (`apply(erlang, load_nif, …)`) leaves no
+/// import entry to scan and is therefore not covered — the documented residual.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CallSiteReadingImports {
+    /// The module imports `erlang:load_nif/2`: refuse **every** function of the module.
+    LoadNif,
+    /// The module imports a fun-image BIF (and not `load_nif`): refuse only a function whose
+    /// **own** lowered body carries the call.
+    FunImage,
+    /// The module imports neither: it may be entered in-machine like any other `.beam` body.
+    None,
+}
+
+/// The **scope** of the call-site guard `module`'s `ImpT` forces
+/// ([`CallSiteReadingImports`]), in one pass over its imports.
 ///
-/// The parked machine's live pending-exception reason — the one term a parked machine holds that
-/// the closed [`RootSet`] shape cannot carry — **is** published as a
-/// [`Registers::extra_roots`](beam_process::Registers::extra_roots) word across the park window
-/// (`runner::run::publish_parked_roots`, read back into `Machine::pending_exception_mut` on resume
-/// by [`RuntimeContext::resync_parked_roots`]), so the park-window relocation hazard that once
-/// motivated (part of) this clause is closed. The clause itself is a separate **routing** decision
-/// — how much of the A.9 scheduled route to re-enable in-machine — and it is why the E0 route
-/// reports the honest typed [`beam_engine::blocked`] gap rather than a compile that silently fails.
+/// `load_nif` dominates: it is a whole-module refusal, so a module importing both it and a
+/// fun-image BIF answers [`CallSiteReadingImports::LoadNif`] whichever import comes first.
+fn call_site_reading_imports(module: &Module) -> CallSiteReadingImports {
+    let mut fun_image = false;
+    for import in &module.imports {
+        if module.atom_name(import.module) != Some("erlang") {
+            continue;
+        }
+        match module.atom_name(import.function) {
+            Some("load_nif") if import.arity == 2 => return CallSiteReadingImports::LoadNif,
+            Some("term_to_binary") | Some("external_size")
+                if import.arity == 1 || import.arity == 2 =>
+            {
+                fun_image = true;
+            }
+            _ => {}
+        }
+    }
+    if fun_image {
+        CallSiteReadingImports::FunImage
+    } else {
+        CallSiteReadingImports::None
+    }
+}
+
+/// Whether `module`'s **code for `function`/`arity`** can read the call site it runs at, i.e.
+/// whether entering that callee in-machine would run it under the caller's identity. The
+/// engine's cross-module call seam ([`ExecutionContext::resolve_external_call`]) refuses such a
+/// callee (`Ok(None)`), leaving it on the synchronous `call_bif` → `run_export` route, which
+/// sets the identity correctly.
 ///
-/// The other `current_module` readers cannot be made wrong by a callee's stale identity:
-/// `records:get_definition/2` resolves its module from its **argument** ([`RecordBridge`] holds no
-/// call-site state at all), and the GC float guard ([`crate::context::gc`]) / the trace
+/// # The two scopes ([`CallSiteReadingImports`])
+///
+/// * **`erlang:load_nif/2` ⇒ module-wide.** Its answer depends on
+///   [`RuntimeContext::current_module`] (the module the NIF library is registered under), and a
+///   *local* call inside the module reaches it without ever re-consulting the seam — so
+///   refusing one function would not be sound. Every function of an importing module is refused.
+/// * **`erlang:term_to_binary/1,2` / `erlang:external_size/1,2` ⇒ per-function.** The verdict is
+///   the callee **function's own** lowered body: it is refused only when one of its instructions
+///   carries an `ImportRef` resolving to one of those imports ([`function_calls_a_fun_image_bif`]).
+///   Every other function of the same module — `compile:forms/2`, `compile:file/2`, and every
+///   other `compile:*` entry — is entered in-machine, so a `receive` inside it **suspends** the
+///   process instead of folding into the typed [`beam_engine::blocked`] gap the nested
+///   non-pumping `call_bif` route reports.
+///
+///   The refusal is a **conservative routing guard against a hazard owned elsewhere**: a callee
+///   entered in-machine can park with a live
+///   [`Machine::pending_exception`](beam_engine::Machine) — a term the engine holds, which only
+///   the runner's park arm publishes into the process root set — and a `beam_process`
+///   signal-driven heap growth would relocate the process heap against that incomplete root
+///   set, freeing words the parked machine still points at. `beam_rt` declines that collection
+///   for the parked (and woken-not-yet-resumed) window — the park arm keeps the process
+///   relocation-exempt and the resume clears the mark — so the guard's remaining job is the
+///   identity question it was written for: a fun-image call's answer depends on the module the
+///   *call instruction* sits in, which only the synchronous route can attest.
+///
+/// # The residual (documented, not a wrong result)
+///
+/// A fun-image call reached from an admitted function through a **local** call chain (or
+/// `apply/3`) is not seen here: a local `call` never re-consults the seam. That is sound — a
+/// local call stays inside the module that was entered, so the call site's module (and with it
+/// the fun image's identity) is unchanged — and the park hazard such a callee could raise is
+/// declined by the runner's park-window relocation exemption rather than by this guard.
+///
+/// The fun-image **image derivation** itself cannot be made wrong by an in-machine callee's
+/// stale identity ([`FunIdentityBridge`] searches every loaded module), so admission never
+/// fabricates an image. The other `current_module` readers are equally safe:
+/// `records:get_definition/2` resolves its module from its **argument** ([`RecordBridge`] holds
+/// no call-site state at all), and the GC float guard ([`crate::context::gc`]) / the trace
 /// global-pattern approximation only use it conservatively.
 ///
-/// The scan is over the module's `ImpT` table ([`Module::imports`]), which is where a compiled
-/// `M:F/A` call is recorded. A call reached only through `apply/3` (`apply(erlang, load_nif, …)`)
-/// leaves no import entry to scan and is therefore not covered — the documented residual.
-///
-/// The verdict is a property of the module's own code, so the seam can apply it to an
-/// already-cached callee and to one it just loaded alike; refusing a module never depends on
+/// The verdict is a property of the module's immutable loaded IR, so the seam can apply it to an
+/// already-cached callee and to one it just loaded alike; refusing a callee never depends on
 /// *when* it was cached.
 ///
 /// [`ExecutionContext::resolve_external_call`]: beam_engine::ExecutionContext::resolve_external_call
 /// [`Module::imports`]: beam_loader::Module::imports
-pub(crate) fn module_observes_its_call_site(module: &Module) -> bool {
-    module.imports.iter().any(|import| {
-        module.atom_name(import.module) == Some("erlang")
-            && match module.atom_name(import.function) {
-                Some("load_nif") => import.arity == 2,
-                Some("term_to_binary") | Some("external_size") => {
-                    import.arity == 1 || import.arity == 2
-                }
-                _ => false,
-            }
+pub(crate) fn callee_observes_its_call_site(module: &Module, function: Atom, arity: u32) -> bool {
+    match call_site_reading_imports(module) {
+        CallSiteReadingImports::LoadNif => true,
+        CallSiteReadingImports::None => false,
+        CallSiteReadingImports::FunImage => match module.function(function, arity) {
+            Some(function) => function_calls_a_fun_image_bif(module, function),
+            // Conservative: the function body is not there to prove the call absent, so the
+            // module-wide verdict stands. Never admit what the guard refused before.
+            None => true,
+        },
+    }
+}
+
+/// Whether `function`'s **own** lowered body issues a guarded fun-image BIF
+/// ([`RuntimeContext::current_module`]-free, but park-hazard-bearing) — the per-function half of
+/// [`callee_observes_its_call_site`].
+///
+/// The scan covers every `beam_loader::Instr` variant that carries an [`ImportRef`]
+/// ([`Instr::CallExt`], [`Instr::CallExtOnly`], [`Instr::CallExtLast`], [`Instr::Bif0`],
+/// [`Instr::Bif`], [`Instr::GcBif`]): the compiler lowers one `erlang:term_to_binary` call to
+/// any of them depending on the call's shape (a garbage-collecting BIF, a plain one, or a real
+/// call), so all six must be inspected.
+fn function_calls_a_fun_image_bif(module: &Module, function: &Function) -> bool {
+    function.code.iter().any(|instr| {
+        let target = match instr {
+            Instr::CallExt { target, .. }
+            | Instr::CallExtOnly { target, .. }
+            | Instr::CallExtLast { target, .. } => *target,
+            Instr::Bif0 { bif, .. } | Instr::Bif { bif, .. } | Instr::GcBif { bif, .. } => *bif,
+            _ => return false,
+        };
+        import_is_a_fun_image_bif(module, target)
     })
+}
+
+/// Whether `module.imports[index]` names a guarded fun-image BIF (`erlang:term_to_binary/1,2`
+/// or `erlang:external_size/1,2`). An index outside the `ImpT` table names no import at all, so
+/// a malformed one observes nothing rather than panicking.
+fn import_is_a_fun_image_bif(module: &Module, index: ImportRef) -> bool {
+    let Some(import) = module.imports.get(index.0 as usize) else {
+        return false;
+    };
+    module.atom_name(import.module) == Some("erlang")
+        && matches!(
+            module.atom_name(import.function),
+            Some("term_to_binary") | Some("external_size")
+        )
+        && (import.arity == 1 || import.arity == 2)
 }
 
 /// The **discriminator** for [`RuntimeContext::run_label_blocking`]: applying a local

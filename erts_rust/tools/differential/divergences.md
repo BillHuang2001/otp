@@ -25,11 +25,6 @@ not here.)
 - `enif_getenv`'s "too small" path leaves `*value_size` at `capacity-1` in the oracle vs the
   needed capacity in the rust runtime (the success path and the missing-key refusal DO agree
   and are pinned).
-- `enif_compare/2` falls back to `beam_term` index order for a **nested** (tuple / list / map)
-  atom pair; the top-level mixed-numeric and atom-pair rankings use the C's arithmetic `CMP` /
-  name order and are pinned (`nif_extra/compare_int_one_equals_float_one`,
-  `nif_extra/compare_alpha_orders_before_beta`). No case pins the nested shape. Owner: `beam_abi`;
-  pinned by `crates/beam_abi/tests/nif_compare.rs`.
 
 ## A.4 — driver C ABI (owner: `beam_rt` / `beam_io`; `beam_abi` for the timer units)
 - **Landed:** `erl_drv_output_term` / `erl_drv_send_term` / `driver_output_term` /

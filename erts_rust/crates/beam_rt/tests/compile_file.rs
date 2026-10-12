@@ -61,29 +61,29 @@
 //!
 //! # Route
 //!
-//! Every probe is `beam_rt -noshell -eval '<expr>'`. The `-eval` driver runs on the runtime's root
-//! process and **pumps the scheduler** through `Runtime::pump_scheduler`, which is what the native
+//! The first two probes are `beam_rt -noshell -eval '<expr>'`. The `-eval` driver runs on the
+//! runtime's root process and **pumps the scheduler** through `Runtime::pump_scheduler`, which is what the native
 //! `file_server_2` read path needs; it is the route on which the in-process compile completes (the
 //! native `file_server_2` also serves `save_binary`'s write, so `compile:file/2`'s artifact lands
 //! on disk), and it needs no compiled fixture. A compile driven from a **scheduled** process
-//! instead stops with the typed `unsupported: opcode: run: process blocked (no message available)`
-//! — a scheduled slice's out-of-line nested run cannot pump the scheduler, so a callee that parks
-//! in a `receive` folds into the engine's `blocked` gap, and `module_observes_its_call_site` routes
-//! the whole `compile` module onto that path. That module-wide routing is what keeps the scheduled
-//! route **sound**, not merely conservative: the parked machine's live `pending_exception` reason
-//! *is* published as a `Registers::extra_roots` word across the park window
-//! (`runner/run.rs::publish_parked_roots`), but a scheduled process is not relocation-exempt and the
-//! **running** machine's `x`/stack/FR are published into `Process::regs` only at the engine's own
-//! heap-admission points (`src/context/gc.rs::ensure_heap_full`/`alloc_words_rooted`) and at a park —
-//! never around `ExecutionContext::call_bif` — so a collection at that admission point
-//! (`ensure_heap`/`ensure_heap_full` → `collect_or_grow`) would move the heap under a live mid-slice
-//! root set that does not reach a term the in-flight call chain holds outside `x`/stack/FR
-//! (`Machine::args_scratch`; a `beam_bifs` fast-path BIF's accumulator across a `ctx.call_fun`
-//! boundary). A *delivery*-driven collect of a `Running` receiver is already refused
-//! (`Process::has_unpublished_roots`). Narrowing the guard's fun-image half is therefore unsound: it
-//! turns both self-host corpus cases into a hard mismatch (`beam_term::ops: invalid boxed header
-//! subtag 0x2`, `*** Internal compiler error ***`) rather than the typed `blocked` gap.
-
+//! (`beam_rt … run <file>.beam <mod>:<fun>/2 <source> <outdir>`) completes too, and the suite's
+//! fourth test pins that: the compile parks the process in a `receive` (the io-device/file-server
+//! round trips), and the park arm keeps it **relocation-exempt** for the whole parked window
+//! (`runner/run.rs`), so a delivery- or signal-driven collection of its heap is declined while it
+//! waits. That matters because the park arm's published root set is not the whole truth mid-slice —
+//! a live `Machine::pending_exception`, or a Rust-local term held by an in-flight
+//! `beam_bifs`/`beam_engine` frame, is not in it, while the **running** machine's `x`/stack/FR reach
+//! `Process::regs` only at the engine's own heap-admission points
+//! (`src/context/gc.rs::ensure_heap_full`/`alloc_words_rooted`) and at a park, never around
+//! `ExecutionContext::call_bif`. Exempting is decline-only: the park-window delivery takes the
+//! ordinary no-relocation heap-fragment fallback, and the process's own admission point collects as
+//! usual once it is resumed and the exemption is cleared.
+//!
+//! The suite's third test deliberately takes the **other** route: `epp:parse_file/3` driven from a
+//! *scheduled* process (`beam_rt … run <file>.beam <mod>:<fun>/1 <file>`), which is the route on
+//! which a delivery-driven collection of the parked receiver used to corrupt its live scan options
+//! and answer a different form count (or `badarg`) than the oracle. It asserts the parsed
+//! `{FormCount, Tags}` — the observable result, never "no crash".
 // The shared harness is compiled in whole, but this suite uses only its bounded runner and its
 // toolchain discovery; the unused remainder is expected here — the same shape `tests/io_scan.rs`
 // uses.
@@ -109,17 +109,34 @@ struct Run {
     err: String,
 }
 
+impl Run {
+    /// The finished probe described by one collected child `output`.
+    fn from_output(output: Output) -> Run {
+        Run {
+            code: output.status.code().unwrap_or(-1),
+            out: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            err: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        }
+    }
+}
+
 /// Runs `program args` under the shared bounded runner (`/dev/null` stdin, killed at
 /// `support::PROBE_TIMEOUT`), failing loudly when the probe could not be run at all.
 fn run(program: &Path, args: &[&str]) -> Run {
-    let output: Output = support::run_bounded(program, args).unwrap_or_else(|| {
-        panic!("`{}` {args:?} could not be run to completion", program.display())
+    run_with_env(program, args, &[])
+}
+
+/// As [`run`], but with `env` applied to the child's environment (`None` **removes** a
+/// variable). The test process's own environment is never mutated, so pinning
+/// `BEAM_RT_TIER` here cannot affect any other test in the binary.
+fn run_with_env(program: &Path, args: &[&str], env: &[(&str, Option<&str>)]) -> Run {
+    let output: Output = support::run_bounded_with_env(program, args, env).unwrap_or_else(|| {
+        panic!(
+            "`{}` {args:?} (env {env:?}) could not be run to completion",
+            program.display()
+        )
     });
-    Run {
-        code: output.status.code().unwrap_or(-1),
-        out: String::from_utf8_lossy(&output.stdout).trim().to_string(),
-        err: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-    }
+    Run::from_output(output)
 }
 
 /// `beam_rt -noshell -eval <expr>` through the built binary.
@@ -393,6 +410,280 @@ fn the_in_process_compile_file_artifact_matches_the_oracle() {
 }
 
 // ---------------------------------------------------------------------------------------
+// Test 3: the scheduled-route `epp` read path
+// ---------------------------------------------------------------------------------------
+
+/// The driver module for the scheduled-route probe: `epp_forms:go/1` reads its argument through
+/// `epp:parse_file/3` and answers `{FormCount, Tags}` — a pure `~w`-printing value, so the
+/// runtime's own `run` output and the oracle's `io:format("~w~n", …)` are directly comparable.
+const EPP_FORMS_SRC: &str = include_str!("fixtures/epp_forms.erl");
+
+/// The driver's input — a tiny module in **legacy** syntax only (no maps, no binaries), so the
+/// scanner's option list genuinely lives in the plain cons cell it has always lived in.
+const EPP_INPUT_SRC: &str = include_str!("fixtures/epp_input.erl");
+
+/// What both runtimes must answer for [`EPP_INPUT_SRC`] through `epp:parse_file/3` with **no**
+/// options: `epp` prepends its own `{attribute,_,file,_}` form, so the three source forms
+/// (`-module`/`-export`/`f/0`) plus that `file` attribute and the trailing `eof` are exactly five
+/// forms, three of which are `attribute`s.
+const EPP_INPUT_FORMS: &str = "{5,[attribute,attribute,attribute,function,eof]}";
+
+/// **The scheduled-route regression.** A `beam_rt run` process — the route where the workload runs
+/// as a **scheduled** process instead of on the pumping root — parses a source file through the
+/// real `epp`/`erl_scan`/io-device read path and must answer exactly what the live oracle answers.
+///
+/// # What this pins
+///
+/// The `epp` process's live scan options live in its **mature** generation, and every path to them
+/// hops through a container *outside* the collector's from-set (this runtime's pointer-stable
+/// arena, a pooled BIF heap, a message fragment). A delivery-driven major collection of the parked
+/// receiver used to leave that mature cell behind, free the old block, and let another process
+/// recycle it in place — after which the read path answered a form too many (the original
+/// reproduction) or `badarg`. The runtime's four heap-admission doors
+/// (`context/gc.rs::{ensure_heap, ensure_heap_full, alloc_words_rooted}` and
+/// `Runtime::serve_gc_request`) already decline that collection through the unscanned-root valve
+/// (`context/gc_walk.rs`); the delivery seam now asks the same question for the **receiver** and
+/// declines it too, so the delivery takes the ordinary no-relocation heap-fragment path and the
+/// read completes.
+///
+/// The assertion is the observable the oracle produces, so a regression is a **wrong answer**
+/// (or a `badarg`), never merely a crash.
+#[test]
+fn a_scheduled_process_parses_a_source_file_like_the_oracle() {
+    let Some(oracle) = support::require_oracle("compile_file") else {
+        return;
+    };
+    let Some(erlc) = support::find_on_path("erlc") else {
+        support::skip_loudly("compile_file", "no `erlc` on $PATH");
+        return;
+    };
+
+    // ---- the driver, compiled into its own scratch directory ----
+    let driver = TempDir::new("epp_forms");
+    let driver_src = driver.0.join("epp_forms.erl");
+    fs::write(&driver_src, EPP_FORMS_SRC).expect("write the driver fixture");
+    let driver_dir = driver.0.to_string_lossy().to_string();
+    let src_arg = driver_src.to_string_lossy().to_string();
+    let built = run(&erlc, &["-o", &driver_dir, &src_arg]);
+    assert_eq!(built.code, 0, "`erlc` must build the driver: {}", built.err);
+    let driver_beam = driver.0.join("epp_forms.beam");
+    assert!(
+        driver_beam.is_file(),
+        "`erlc` wrote no {}",
+        driver_beam.display()
+    );
+
+    // ---- the input, in a directory of its own ----
+    let input_dir = TempDir::new("epp_input");
+    let input = input_dir.0.join("epp_input.erl");
+    fs::write(&input, EPP_INPUT_SRC).expect("write the input fixture");
+
+    // ---- the runtime, on the scheduled `run` route ----
+    let spec = "epp_forms:go/1";
+    let beam_arg = driver_beam.to_string_lossy().to_string();
+    let input_arg = literal(&input);
+    let ours = run(
+        Path::new(BINARY),
+        &[
+            "-noshell",
+            "-pa",
+            &driver_dir,
+            "run",
+            &beam_arg,
+            spec,
+            &input_arg,
+        ],
+    );
+    assert_eq!(
+        ours.code, 0,
+        "the scheduled route must parse the source: exit {} — {}",
+        ours.code, ours.err
+    );
+    assert!(
+        !ours.err.contains("unsupported"),
+        "the scheduled route must not report a capability gap: {}",
+        ours.err
+    );
+    let line = ours.out.lines().next().unwrap_or_default().to_string();
+    assert_eq!(
+        line, EPP_INPUT_FORMS,
+        "the scheduled route must answer the parse it drove (stdout {:?}; stderr {:?})",
+        ours.out, ours.err
+    );
+
+    // ---- the oracle, on the identical workload ----
+    let expr = format!("io:format(\"~w~n\",[epp_forms:go({input_arg})]), halt(0).");
+    let theirs = support::oracle_eval(&oracle, Some(&driver.0), &expr)
+        .unwrap_or_else(|| panic!("the live oracle could not answer `{spec}`"));
+    assert_eq!(
+        theirs, line,
+        "the scheduled route must agree with the oracle (`{spec}`)"
+    );
+    eprintln!("scheduled-route epp parse agrees with the oracle: {line}");
+}
+// ---------------------------------------------------------------------------------------
+// Test 4: the scheduled-route *in-process* compile (`no_spawn_compiler_process`)
+// ---------------------------------------------------------------------------------------
+
+/// The driver module for the scheduled-route in-process compile regression: `go/2` compiles a
+/// **separate** source file inside the calling (scheduled) process with the contract A.9 *E0*
+/// option list and answers `1`.
+const SCHED_COMPILE_DRIVER_SRC: &str = include_str!("fixtures/sched_compile_driver.erl");
+
+/// The source the driver compiles — a tiny module in plain syntax, so the compile's own readers
+/// and passes need nothing outside `kernel` + `stdlib`.
+const SCHED_COMPILE_INPUT_SRC: &str = include_str!("fixtures/sched_compile_input.erl");
+
+/// The object code the compile writes into the driver's `{outdir, Dir}`.
+const SCHED_COMPILE_INPUT_BEAM: &str = "sched_compile_input.beam";
+
+/// **The scheduled-route in-process compile regression.** A `beam_rt run` process — the route
+/// where the workload runs as a **scheduled** process instead of on the pumping root — drives
+/// OTP's compiler **in-process** (the A.9 *E0* option list: `no_spawn_compiler_process`,
+/// `deterministic`, `{outdir, Dir}`) over a small fixture source, and must answer exactly what
+/// the live oracle answers.
+///
+/// # What this pins
+///
+/// The compile parks that process in a `receive` (the io-device/file-server round trips), and
+/// while it waits a delivery- or signal-driven collection can be asked for its heap. The park
+/// arm publishes the machine's root set first, but that snapshot is not the whole truth
+/// mid-slice — a live `Machine::pending_exception` or a Rust-local term held by an in-flight
+/// `beam_bifs`/`beam_engine` frame is not in it — so a move could recycle a word a live holder
+/// still pointed at. The corruption surfaced *inside* the compile (a `beam_term` panic,
+/// `invalid boxed header subtag …`), so the observable regression is a missing/garbled artifact
+/// or a distinct integer, never the oracle's answer.
+///
+/// The park arm keeps the parked process **relocation-exempt** for its parked window, and the
+/// exemption is cleared when the process is resumed, so a park-window delivery takes the
+/// ordinary no-relocation heap-fragment path instead. This test asserts the route's observable
+/// outcome on **both** execution tiers (the default native baseline tier and the pinned
+/// `interpreter` reference tier, the one the differential gate is taken on), and it compares the
+/// produced object code **byte-for-byte** with the oracle's own identical-option run, so a
+/// plausible-looking-but-wrong artifact is a failure too.
+#[test]
+fn a_scheduled_process_compiles_a_source_file_in_process_like_the_oracle() {
+    let Some(oracle) = support::require_oracle("compile_file") else {
+        return;
+    };
+    let Some(erlc) = support::find_on_path("erlc") else {
+        support::skip_loudly("compile_file", "no `erlc` on $PATH");
+        return;
+    };
+
+    // ---- the driver, compiled into its own scratch directory ----
+    let driver = TempDir::new("sched_compile_driver");
+    let driver_src = driver.0.join("sched_compile_driver.erl");
+    fs::write(&driver_src, SCHED_COMPILE_DRIVER_SRC).expect("write the driver fixture");
+    let driver_dir = driver.0.to_string_lossy().to_string();
+    let built = run(&erlc, &["-o", &driver_dir, &driver_src.to_string_lossy()]);
+    assert_eq!(built.code, 0, "`erlc` must build the driver: {}", built.err);
+    let driver_beam = driver.0.join("sched_compile_driver.beam");
+    assert!(
+        driver_beam.is_file(),
+        "`erlc` wrote no {}",
+        driver_beam.display()
+    );
+
+    // ---- the source the driver compiles, in a directory of its own ----
+    let input = TempDir::new("sched_compile_input");
+    let input_src = input.0.join("sched_compile_input.erl");
+    fs::write(&input_src, SCHED_COMPILE_INPUT_SRC).expect("write the input fixture");
+    let src_arg = literal(&input_src);
+
+    // ---- the runtime, on the scheduled `run` route, on both execution tiers ----
+    let beam_arg = driver_beam.to_string_lossy().to_string();
+    let mut produced: Option<Vec<u8>> = None;
+    for tier in [None, Some("interpreter")] {
+        // `compile` does **not** create `{outdir, Dir}`, so a fresh directory per tier is the
+        // test's job — it also guarantees the artifact is this tier's own.
+        let out = TempDir::new("sched_compile_out");
+        let out_arg = literal(&out.0);
+        let ours = run_with_env(
+            Path::new(BINARY),
+            &[
+                "-noshell",
+                "-pa",
+                &driver_dir,
+                "run",
+                &beam_arg,
+                "sched_compile_driver:go/2",
+                &src_arg,
+                &out_arg,
+            ],
+            &[("BEAM_RT_TIER", tier)],
+        );
+        assert_eq!(
+            ours.code, 0,
+            "the scheduled in-process compile must complete with BEAM_RT_TIER={tier:?}: \
+             exit {} — {}",
+            ours.code, ours.err
+        );
+        assert!(
+            !ours.err.contains("unsupported"),
+            "the scheduled in-process compile must not report a capability gap with \
+             BEAM_RT_TIER={tier:?}: {}",
+            ours.err
+        );
+        let line = ours.out.lines().next().unwrap_or_default().to_string();
+        assert_eq!(
+            line, "1",
+            "the scheduled in-process compile must answer the E0 route's `1` with \
+             BEAM_RT_TIER={tier:?} (stdout {:?}; stderr {:?})",
+            ours.out, ours.err
+        );
+
+        // The observable of the compile is the object code it wrote, so assert it really landed.
+        let artifact = out.0.join(SCHED_COMPILE_INPUT_BEAM);
+        let bytes = fs::read(&artifact).unwrap_or_else(|error| {
+            panic!(
+                "the scheduled in-process compile reported {} but wrote no {}: {error}",
+                ours.out,
+                artifact.display()
+            )
+        });
+        assert!(
+            !bytes.is_empty(),
+            "the scheduled in-process compile must write non-empty object code ({})",
+            artifact.display()
+        );
+        eprintln!(
+            "scheduled in-process compile (BEAM_RT_TIER={tier:?}): 1, \
+             {SCHED_COMPILE_INPUT_BEAM} = {} bytes",
+            bytes.len()
+        );
+        produced = Some(bytes);
+    }
+
+    // ---- the oracle, on the identical workload ----
+    let oracle_out = TempDir::new("sched_compile_oracle_out");
+    let oracle_out_arg = literal(&oracle_out.0);
+    let expr = format!(
+        "io:format(\"~w~n\",[sched_compile_driver:go({src_arg}, {oracle_out_arg})]), halt(0)."
+    );
+    let theirs = support::oracle_eval(&oracle, Some(&driver.0), &expr)
+        .unwrap_or_else(|| panic!("the live oracle could not answer the E0 route"));
+    assert_eq!(
+        theirs, "1",
+        "the scheduled in-process compile must agree with the oracle"
+    );
+    let oracle_artifact = oracle_out.0.join(SCHED_COMPILE_INPUT_BEAM);
+    let oracle_bytes = fs::read(&oracle_artifact).unwrap_or_else(|error| {
+        panic!(
+            "the oracle reported {theirs} but wrote no {}: {error}",
+            oracle_artifact.display()
+        )
+    });
+    assert_eq!(
+        produced.expect("both tiers ran"),
+        oracle_bytes,
+        "the scheduled in-process artifact must be byte-identical to the oracle's \
+         (identical option list)"
+    );
+    eprintln!("scheduled in-process compile agrees with the oracle");
+}
+
+// ---------------------------------------------------------------------------------------
 // Current state
 // ---------------------------------------------------------------------------------------
 //
@@ -400,3 +691,11 @@ fn the_in_process_compile_file_artifact_matches_the_oracle() {
 // `../lib/compiler` under `beam_rt`, its artifact is byte-identical to the oracle's identical
 // option-list run, and its `Code` chunk matches `erlc +deterministic`. The write path is the native
 // `file_server_2` service, which serves `save_binary`'s write requests.
+//
+// On the **scheduled** `run` route a full `compile:file/2` completes too — its artifact is
+// byte-identical to the oracle's identical option-list run — because the park arm keeps the parked
+// compile process relocation-exempt for its parked window (see *Route* above); the
+// scheduled-route regressions `a_scheduled_process_parses_a_source_file_like_the_oracle` (the
+// `epp:parse_file/3` read path, which answers exactly the oracle's `{FormCount, Tags}`) and
+// `a_scheduled_process_compiles_a_source_file_in_process_like_the_oracle` (the E0 compile) pin it
+// on both execution tiers.

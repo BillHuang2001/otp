@@ -817,7 +817,7 @@ mod tests {
             let (expr, probe) = match case.kind {
                 CaseKind::Eval { expr, probe, .. } => (expr, probe),
                 CaseKind::EvalEnv { expr, probe, .. } => (expr, probe),
-                CaseKind::Module(_) | CaseKind::ModuleEnv { .. } => {
+                CaseKind::Module(_) | CaseKind::ModuleEnv { .. } | CaseKind::Command(_) => {
                     panic!("case {}: an A.6 case must be an eval case", case.id)
                 }
             };

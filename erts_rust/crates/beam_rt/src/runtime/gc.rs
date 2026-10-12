@@ -62,6 +62,8 @@ use beam_term::Eterm;
 
 use super::{Runtime, SourcePayloads};
 
+use crate::context::gc_walk::WalkScratch;
+
 /// A snapshot of this runtime's process-heap collection activity.
 ///
 /// The counters are **measured own-state** figures (they describe this runtime's own
@@ -104,6 +106,27 @@ pub(crate) struct GcState {
     /// BIF and served at a point that owns the executing machine's root set (see
     /// [`Runtime::request_gc`]).
     requested: HashSet<ProcessId>,
+    /// The **descent gate**: the pids that have ever had a container from a region their
+    /// collector does not scan enter their reachable term graph.
+    ///
+    /// [`any_root_is_unscanned`](crate::context::gc_walk) is `O(live objects)` when it
+    /// descends, so the descent is skipped unless this per-process bit is set — see that
+    /// module's "descent gate" section for the soundness argument. In one line: the walk's
+    /// always-run per-word phase already classifies every **root**, so only the *nested* shape
+    /// needs the descent, and a foreign container can only become a scanned container's child
+    /// by being *held* first — which is exactly what the events that call
+    /// [`Runtime::note_foreign_reachable`] record (an engine arena fallback, a BIF/floor/NIF
+    /// result outside the process heap, a heap-fragment delivery, a spawn argument that is not
+    /// the new process's own).
+    ///
+    /// The bit is **sticky and add-only**: it is set, never cleared while the process lives (a
+    /// gate observed open at one collection stays open at every later one), and the entry is
+    /// dropped only when the pid is gone ([`Runtime::prune_gc_requests`]).
+    foreign: HashSet<ProcessId>,
+    /// The reachability walk's **reused** scratch (its worklist and its visited set), so a
+    /// collection never allocates the descent's structures (see
+    /// [`WalkScratch`](crate::context::gc_walk::WalkScratch)).
+    walk: WalkScratch,
     /// Whether **every** process heap must stay put (the global escape-store valve).
     disabled: bool,
     /// Why the global valve tripped (the first reason wins), for diagnostics.
@@ -135,6 +158,8 @@ impl GcState {
             pinned: HashSet::new(),
             halted: HashSet::new(),
             requested: HashSet::new(),
+            foreign: HashSet::new(),
+            walk: WalkScratch::default(),
             disabled: false,
             disabled_reason: None,
             valve_trips: 0,
@@ -234,7 +259,8 @@ impl Runtime {
     ///
     /// Returns whether a collection ran. The answer is `false` — with the counters
     /// untouched, never a fabricated collection — for a request the valves refuse (a pinned
-    /// or halted pid, the global escape-store valve), for a pid the table no longer holds,
+    /// or halted pid, the global escape-store valve, or a live root that reaches a container in
+    /// a region the collector does not scan), for a pid the table no longer holds,
     /// and for a **relocation-exempt** process (the host holds live words outside this
     /// crate's root set: nothing is moved and, because nothing failed, the process's
     /// collection is *not* halted). A genuine collection failure halts that process's
@@ -252,6 +278,26 @@ impl Runtime {
         if process.is_relocation_exempt() {
             return false;
         }
+        // The **unscanned-root valve** ([`crate::context::gc_walk`]) — the same valve the
+        // admission point and the collecting allocation seam consult, here over the process's
+        // own root set (the parked machine's roots were just published into it, and a delivery
+        // may have filled its mailbox since). A container in a region the collector does not
+        // scan, reachable from a live root, makes the move unsound, so it is declined: the
+        // request is dropped exactly as the other valves drop it, and nothing is moved.
+        //
+        // The descent is gated on the pid's **foreign-reachability** bit (see
+        // [`GcState::foreign`]): a root that is itself foreign is still caught by the walk's
+        // always-run per-word phase, so the gate only ever removes the `O(live)` descent.
+        //
+        // The `hit` arm opens that bit permanently: a foreign container *did* reach a live root
+        // of this process, which is exactly the event the gate records (it can only ever make a
+        // later valve more conservative). See [`Runtime::walk_scratch`].
+        let pid_foreign = self.foreign_reachable(pid);
+        if crate::context::gc_walk::process_roots_are_unscanned(self.walk_scratch(), process, pid_foreign)
+        {
+            self.note_foreign_reachable(pid);
+            return false;
+        }
         match process.collect() {
             Ok(collection) => {
                 self.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
@@ -264,7 +310,9 @@ impl Runtime {
         }
     }
 
-    /// Drops the forced-GC requests of processes `table` no longer holds.
+    /// Drops the per-process GC state of processes `table` no longer holds: the forced-GC
+    /// requests a terminated process never reached a collection site for — its heap is gone —
+    /// and the **foreign-reachability gate** of a pid that no longer exists.
     ///
     /// A process that terminated with a request still pending (it reached no heap-admission
     /// point and no park after asking) can never be served — its heap is gone — so the entry
@@ -272,10 +320,12 @@ impl Runtime {
     /// such process. The scheduler pass prunes at its boundary, where the pass's own table
     /// holds exactly the live processes.
     pub(crate) fn prune_gc_requests(&mut self, table: &ProcessTable) {
-        if self.gc.requested.is_empty() {
-            return;
+        if !self.gc.requested.is_empty() {
+            self.gc.requested.retain(|pid| table.contains(*pid));
         }
-        self.gc.requested.retain(|pid| table.contains(*pid));
+        if !self.gc.foreign.is_empty() {
+            self.gc.foreign.retain(|pid| table.contains(*pid));
+        }
     }
 
     /// Pins `pid` on the runtime: its heap is never moved again.
@@ -297,10 +347,66 @@ impl Runtime {
         }
     }
 
-    /// Records that an engine allocation could not be served from a process young heap and
-    /// fell back to the pointer-stable arena.
-    pub(crate) fn note_gc_fallback(&mut self) {
+    /// Records that an engine allocation for `pid` could not be served from a process young
+    /// heap and fell back to the pointer-stable arena.
+    ///
+    /// It also **opens `pid`'s descent gate** ([`GcState::foreign`]): the block the caller is
+    /// handed comes from a region the collector does not scan, and the engine writes that
+    /// process's own terms into it, so from this moment the process's graph can hold a foreign
+    /// container whose children the copier would leave behind. Every fallback to the arena is
+    /// recorded the same way, so the gate can never be closed while such a block is reachable.
+    pub(crate) fn note_gc_fallback(&mut self, pid: ProcessId) {
         self.gc.fallbacks += 1;
+        self.gc.foreign.insert(pid);
+    }
+
+    /// Opens `pid`'s **descent gate** ([`GcState::foreign`]): from now on the unscanned-root
+    /// valve descends through the process's scanned graph.
+    ///
+    /// Called by the events that can put a container from an unscanned region into `pid`'s
+    /// reachable graph — the engine's arena fallback ([`Runtime::note_gc_fallback`]), a BIF /
+    /// runtime-native / NIF result built outside the process heap, a heap-fragment message
+    /// delivery, a spawn argument that is not the new process's own — and by the valve itself
+    /// when it observes such a container at a live **root**. It is deliberately **add-only**:
+    /// closing it again would let a later collection move a heap under a term the process still
+    /// holds, which is the corruption the valve exists to prevent.
+    pub(crate) fn note_foreign_reachable(&mut self, pid: ProcessId) {
+        self.gc.foreign.insert(pid);
+    }
+
+    /// Whether `pid`'s descent gate is open (see [`GcState::foreign`]) — i.e. whether the
+    /// unscanned-root valve must descend through `pid`'s scanned graph rather than run only its
+    /// per-word root phase.
+    pub(crate) fn foreign_reachable(&self, pid: ProcessId) -> bool {
+        self.gc.foreign.contains(&pid)
+    }
+
+    /// The unscanned-root valve's **reused** scratch (its worklist and its visited set).
+    ///
+    /// One instance lives here for the runtime's whole lifetime, so no walk allocates: see
+    /// [`WalkScratch`](crate::context::gc_walk::WalkScratch).
+    pub(crate) fn walk_scratch(&mut self) -> &mut WalkScratch {
+        &mut self.gc.walk
+    }
+
+    /// Moves the valve's **reused** walk scratch *out* of the runtime — the delivery seam's
+    /// disjoint-borrow door.
+    ///
+    /// The unscanned-root valve classifies a word against the *receiver's* own collector, so the
+    /// delivery seam ([`crate::context`]) must hold a `&Process` and the walk's scratch at the
+    /// same time. The receiver is reached through a process table that may be the runtime's own
+    /// (`runtime.processes`), and Rust cannot see that `ProcessTable` and `GcState` are disjoint
+    /// through a `&mut Runtime`. Moving the scratch out for the duration sidesteps that: the
+    /// swap is `O(1)` ([`std::mem::take`] leaves the empty default behind), the caller owns the
+    /// scratch while it walks, and [`Runtime::put_walk_scratch`] hands it back unchanged — so the
+    /// reuse (and the "a walk allocates nothing after warm-up" property) is preserved.
+    pub(crate) fn take_walk_scratch(&mut self) -> WalkScratch {
+        std::mem::take(&mut self.gc.walk)
+    }
+
+    /// Puts back the scratch [`Runtime::take_walk_scratch`] moved out.
+    pub(crate) fn put_walk_scratch(&mut self, scratch: WalkScratch) {
+        self.gc.walk = scratch;
     }
 
     /// Records that `pid`'s collection failed, and stops collecting for it.

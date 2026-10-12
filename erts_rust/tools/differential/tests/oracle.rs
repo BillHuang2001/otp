@@ -191,10 +191,12 @@ fn every_eval_corpus_case_matches_its_oracle_golden() {
     for case in differential::corpus::cases() {
         // Module-run cases (including the environment-variable `ModuleEnv` ones, whose
         // environment embeds a `{dir}` placeholder that only exists after the compile) are
-        // compiled and checked separately (see below).
+        // compiled and checked separately (see below); command cases are spawned directly and
+        // checked by `command_cases_reproduce_their_golden_under_the_oracle` (their argv is not
+        // an `-eval` probe).
         if matches!(
             case.kind,
-            CaseKind::Module(_) | CaseKind::ModuleEnv { .. }
+            CaseKind::Module(_) | CaseKind::ModuleEnv { .. } | CaseKind::Command(_)
         ) {
             continue;
         }
@@ -311,6 +313,43 @@ fn module_run_cases_reproduce_their_golden_under_the_oracle() {
     if skipped > 0 {
         eprintln!("NOTE: {skipped} module-run case(s) skipped for a missing host tool");
     }
+}
+
+/// Every non-CLI **command** case must reproduce its golden under the oracle too: the oracle
+/// argv is spawned directly (no `erlc`, no helper needed — the oracle side is the system
+/// `erl`). Skips loudly (never a silent pass) when `erl` is unavailable.
+#[test]
+fn command_cases_reproduce_their_golden_under_the_oracle() {
+    let Some(oracle) = oracle_or_skip() else {
+        return;
+    };
+    let mut checked = 0;
+    for case in differential::corpus::cases() {
+        let CaseKind::Command(run) = &case.kind else {
+            continue;
+        };
+        checked += 1;
+        let argv = run.oracle_argv();
+        let observation = run_with_env(&oracle, &argv, &[]).unwrap_or_else(|error| {
+            panic!("case {}: failed to run the oracle: {error}", case.id)
+        });
+        let golden = check_golden(&observation, &case.golden);
+        assert!(
+            golden.matched,
+            "case {} drifted from its golden: {:?} (stdout={:?})",
+            case.id,
+            golden.diffs,
+            String::from_utf8_lossy(&observation.stdout)
+        );
+        assert_eq!(
+            observation.exit_code,
+            Some(case.golden.exit_code),
+            "case {}: unexpected exit status (stderr={:?})",
+            case.id,
+            String::from_utf8_lossy(&observation.stderr)
+        );
+    }
+    assert!(checked > 0, "the corpus must carry command cases");
 }
 
 #[test]

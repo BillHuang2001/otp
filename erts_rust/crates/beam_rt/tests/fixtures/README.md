@@ -33,6 +33,31 @@ also the differential oracle.
   `timeout`, the compiler-folded `after 0`, a matched queued message, a message that **cancels**
   an armed deadline, and a bare `wait`).
 
+## The scheduled-route `epp` pair (`epp_forms.erl` / `epp_input.erl`, compiled at test time)
+
+`tests/compile_file.rs::a_scheduled_process_parses_a_source_file_like_the_oracle` drives the
+`epp:parse_file/3` read path from a **scheduled `run`** process, which is the route on which a
+delivery-driven collection of the parked receiver used to corrupt its live scan options:
+
+* `epp_forms.erl` is the **driver**: `go/1` takes the input source file as a char list, runs
+  `epp:parse_file(File, [], [])` and answers `{length(Forms), [element(1, F) || F <- Forms]}` — a
+  pure `~w`-printing value, so `beam_rt run …` stdout and the oracle's
+  `io:format("~w~n", [epp_forms:go(File)])` are directly comparable.
+* `epp_input.erl` is the **input**: `-module(epp_input). -export([f/0]). f() -> 1.` — legacy
+  syntax only (no maps, no binaries), so the scan options stay on the plain cons cell.
+* The driver is compiled with the system `erlc` into a scratch directory (both files'
+  **contents** are `include_str!`-embedded by the suite, so nothing is read relative to the
+  test's CWD; the scratch dir is the only `-pa` given to either runtime).
+
+Oracle (the same artifacts under the real system `erl`): `epp` prepends its own
+`{attribute, _, file, _}` form, so the answer is the three source forms plus that attribute and
+the trailing `eof`:
+
+```sh
+erl -noshell -pa "$DIR" -eval 'io:format("~w~n",[epp_forms:go("'$DIR'/epp_input.erl")]), halt(0).'
+# {5,[attribute,attribute,attribute,function,eof]}
+```
+
 ## Driver fixtures (never committed — compiled at test time)
 
 `event_driver.c` and `event_driver.erl` are the **driver event/timer** pair for
@@ -204,11 +229,11 @@ wait_forever()-> receive X -> X after infinity -> timeout end.
 Any byte change in a fixture invalidates the expected values in the tests that load it;
 re-derive them from the system `erl`, do **not** guess.
 
-## GC fixtures (`gc_loop` · `gc_ints` · `gc_floats` · `heap_growth` · `gc_payload`, committed)
+## GC fixtures (`gc_loop` · `gc_ints` · `gc_floats` · `heap_growth` · `gc_payload` · `pt_gc`, committed)
 
-These five are committed oracle fixtures for the process-heap collector
-(`tests/gc_collect.rs`, `tests/heap_growth.rs`, `tests/gc_strategy.rs` and
-`tests/gc_immix_payload.rs`):
+These six are committed oracle fixtures for the process-heap collector
+(`tests/gc_collect.rs`, `tests/heap_growth.rs`, `tests/gc_strategy.rs`,
+`tests/gc_immix_payload.rs` and `tests/persistent_term.rs`):
 
 * `gc_loop.beam` — `loop/1` tail-recursively conses every iteration (`build/1`), so a
   scheduled process really allocates; the acceptance evidence that the collector runs at the
@@ -230,11 +255,18 @@ These five are committed oracle fixtures for the process-heap collector
   point, and finally **returns the payload** (a structurally checkable term: element `i` is
   keyed `64 - i`). The witness that a collection on the mature strategy did not relocate the
   heap out from under a live term.
+* `pt_gc.beam` — `run(N)` builds the **same 64-element payload**, stores it in the node-global
+  persistent-term table (`persistent_term:put(pt_gc_key, Payload)`, so the store's raw word
+  names the process's own **young heap**), churns `N` rounds of the same short-lived garbage and
+  finally returns `persistent_term:get(pt_gc_key)` — the value read back **out of** the store.
+  The witness for `tests/persistent_term.rs::a_stored_value_survives_a_process_heap_collection`:
+  a store that kept a raw young-heap word without stabilizing it hands back a dangling/recycled
+  term (observed: a 2-element list instead of 64 elements).
 
-All five are path-free (`+deterministic`) and regenerate with the same scratch-dir recipe:
+All six are path-free (`+deterministic`) and regenerate with the same scratch-dir recipe:
 
 ```sh
-for f in gc_loop gc_ints gc_floats heap_growth gc_payload; do
+for f in gc_loop gc_ints gc_floats heap_growth gc_payload pt_gc; do
     SCRATCH="$TMPDIR/beam_rt_${f}_fix"
     rm -rf "$SCRATCH"; mkdir -p "$SCRATCH/gen"
     cp "$f.erl" "$SCRATCH/gen/"

@@ -29,15 +29,19 @@
 //! through the [`PersistentTerm`] seam, and this module is the concrete provider
 //! [`RuntimeContext::call_registered`](super::RuntimeContext::call_registered) installs.
 //!
-//! # Raw-`Eterm` storage is safe here; **comparison is structural**
+//! # Raw-`Eterm` storage is safe **because the writer stabilizes**; comparison is structural
 //!
-//! The store keeps the key and value **raw `Eterm` words**. That is exactly the C's
+//! The store keeps the key and value **raw `Eterm` words**. That mirrors the C's
 //! `erts_literal_area_term`: the table never copies a key, it *pins* the term in a literal
-//! area. It is safe in this runtime because Milestone 1 has **no GC** and every heap a term
-//! can live on is pointer-stable for the runtime's lifetime (the pointer-stable pooled BIF
-//! heap, the never-reset `eval_heap`, the process heaps and the `MinimalContext` arena) — so
-//! a stored word never dangles. Stage 4's collector must register this store as a root (see
-//! `../CONTEXT.md` §5).
+//! area. Here the *pinning* is the caller's job: a raw store holding a word from a
+//! **movable** heap would dangle the moment that heap is collected, so the concrete provider
+//! copies both arguments onto the pointer-stable arena at **put** time —
+//! [`RuntimeContext::call_registered`](super::RuntimeContext::call_registered) runs
+//! `put/2`/`put_new/2`'s key and value through
+//! [`Runtime::try_stabilize_escaped`](crate::runtime::Runtime::try_stabilize_escaped) before
+//! they reach this store (see `RuntimeContext::persistent_term_stores`). The five
+//! reading BIFs (`get/0,1,2`, `erase/1`, `info/0`) then hand back an already-stable word, and
+//! the key they receive is only *compared*, never kept.
 //!
 //! **Storage is raw; lookup is structural.** The oracle never compares two persistent-term
 //! keys by word identity: `lookup` (`erl_bif_persistent.c:1005`) hashes the key and then
@@ -68,7 +72,9 @@ use crate::error;
 /// `put/2` of an existing key (the oracle's own order is an unspecified hash-table
 /// walk and is not observable — see `beam_bifs::persistent_term`).
 ///
-/// Milestone 1 has no GC, so a stored raw `Eterm` never moves (see the module docs).
+/// Both words of an entry are **stabilized by the writer** — `put/2`/`put_new/2`'s key and
+/// value are copied onto the pointer-stable arena before they reach the store (see the module
+/// docs) — so a stored raw `Eterm` never dangles, whatever heap the caller built it on.
 pub(crate) struct PersistentTermStore {
     /// The stored `(Key, Value)` pairs, in insertion order.
     entries: Vec<(Eterm, Eterm)>,

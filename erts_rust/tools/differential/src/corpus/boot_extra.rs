@@ -1485,7 +1485,7 @@ mod tests {
             );
             let probe = match case.kind {
                 CaseKind::Eval { probe, .. } | CaseKind::EvalEnv { probe, .. } => probe,
-                CaseKind::Module(_) | CaseKind::ModuleEnv { .. } => {
+                CaseKind::Module(_) | CaseKind::ModuleEnv { .. } | CaseKind::Command(_) => {
                     panic!("case {}: an A.9 boot case must be an eval case", case.id)
                 }
             };
