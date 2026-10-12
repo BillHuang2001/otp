@@ -101,6 +101,22 @@ use beam_term::Eterm;
 use crate::runtime::Runtime;
 use crate::RuntimeContext;
 
+/// Whether **any** machine root handed to a collection site, or any container in the process's
+/// own root set, **reaches** a container in an unscanned region (the building block is
+/// [`root_is_unscanned`]).
+///
+/// This is the **valve** every collection site consults: it is the conservative reachability
+/// check of [`crate::context::gc_walk`]. The single-level test it replaces could only see a
+/// root's *own* address, so a scanned container holding an unscanned one holding a nursery
+/// pointer slipped through; the walk descends through the scanned region and reports that
+/// shape. Declining is the only outcome it can produce, and declining only costs a collection —
+/// the allocation falls back to the pointer-stable arena — so it can never turn a working
+/// program into a failing one.
+///
+/// It is re-exported here (rather than called by its own path at each site) so the three
+/// admission-point call sites and the runner's park arm cannot drift onto different valves.
+pub(crate) use super::gc_walk::any_root_is_unscanned;
+
 /// Whether `module`'s code contains any **float-family** instruction, i.e. anything that
 /// reads or writes the machine's float-register file
 /// ([`Machine::fr`](beam_engine::Machine)).
@@ -216,15 +232,6 @@ pub(crate) fn root_is_unscanned(process: &Process, term: Eterm) -> bool {
     !in_heap_block(process.heap(), ptr)
         && !process.collector().young_contains(ptr as *const Eterm)
         && !process.collector().mature_contains(ptr as *const Eterm)
-}
-
-/// Whether **any** of the given machine roots is a container in an unscanned region (see
-/// [`root_is_unscanned`]).
-pub(crate) fn any_root_is_unscanned<'a, I>(process: &Process, roots: I) -> bool
-where
-    I: IntoIterator<Item = &'a Eterm>,
-{
-    roots.into_iter().any(|word| root_is_unscanned(process, *word))
 }
 
 /// Hand the executing machine's live roots to `process` — the **publish** half of the GC

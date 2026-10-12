@@ -234,7 +234,8 @@ impl Runtime {
     ///
     /// Returns whether a collection ran. The answer is `false` — with the counters
     /// untouched, never a fabricated collection — for a request the valves refuse (a pinned
-    /// or halted pid, the global escape-store valve), for a pid the table no longer holds,
+    /// or halted pid, the global escape-store valve, or a live root that reaches a container in
+    /// a region the collector does not scan), for a pid the table no longer holds,
     /// and for a **relocation-exempt** process (the host holds live words outside this
     /// crate's root set: nothing is moved and, because nothing failed, the process's
     /// collection is *not* halted). A genuine collection failure halts that process's
@@ -250,6 +251,15 @@ impl Runtime {
             return false;
         };
         if process.is_relocation_exempt() {
+            return false;
+        }
+        // The **unscanned-root valve** ([`crate::context::gc_walk`]) — the same valve the
+        // admission point and the collecting allocation seam consult, here over the process's
+        // own root set (the parked machine's roots were just published into it, and a delivery
+        // may have filled its mailbox since). A container in a region the collector does not
+        // scan, reachable from a live root, makes the move unsound, so it is declined: the
+        // request is dropped exactly as the other valves drop it, and nothing is moved.
+        if crate::context::gc_walk::process_roots_are_unscanned(process) {
             return false;
         }
         match process.collect() {
