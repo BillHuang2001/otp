@@ -89,16 +89,6 @@ its compiled-opcode program. The interior is a Rust AST, not a term program.
   `TermClass::BinRef` → `unsupported_ets` arm is reachable only for a *bare* `BinRef`
   term, which is not a user-visible term. (`tests/select.rs::
   byte_size_and_bit_size_read_an_off_heap_refc_binary_correctly`.)
-- **An empty tuple `{}` written as a guard/body expression is `badarg`.** It is
-  neither a call (`{Name, Arg…}`) nor the `{{ … }}` construct form, so `decode_tuple`
-  rejects it before reading any element — the oracle raises `badarg`
-  (`ets:select(T,[{'$1',[],[{}]}])`, `ets:select(T,[{'$1',[{}],[ok]}])`,
-  `ets:match_spec_compile([{'$1',[],[{}]}])`) and names the reason through
-  `erlang:match_spec_test/3` ("{} is neither a function call, nor a tuple (tuples are
-  written {{ ... }})"). It is refused at **any** depth, since `decode` recurses over
-  tuples/lists/maps (a nested `{{{}}}` too), while the construct form `{{}}` and
-  `{const,{}}` still build the empty tuple `{}`. Pinned by
-  `tests/ets_empty_tuple_expr.rs`.
 - **A map in a HEAD matches structurally; its keys must be LITERAL.** `pattern.rs`
   decodes a head map to `Pattern::Map(Vec<(Eterm, Pattern)>)`: the keys stay
   literal — a variable (`'$N'`) or `'_'` key is `badarg`, at **every** nesting
