@@ -127,7 +127,7 @@ This recipe drives the pass suites (`ssa_opt_budget_SUITE`, `beam_ssa_loop_opt_S
 | `lfe_andor_SUITE.core`, `lfe_guard_SUITE.core` | LFE-derived Core Erlang suites (`+from_core`) |
 | `property_test/` | PropEr/EQC property tests (`compile_prop.erl`, `beam_types_prop.erl`) |
 | `measure_stage2_compile.sh` + `stage2_bench.erl` | Manual compile-throughput measurement of the opt-in Stage-2 passes on the whole `lib/stdlib/src` corpus (not a suite, not in CI) |
-| `run_stage2_suites.sh` + `stage2_suite_driver.erl` | Host runner for the five Stage-2 pass suites (no `ct_run`; see "Host Runner For The Stage-2 Suites"; not in CI) |
+| `run_stage2_suites.sh` + `stage2_suite_driver.erl` | Host runner for the six Stage-2 pass suites (no `ct_run`; see "Host Runner For The Stage-2 Suites"; not in CI) |
 | Fixture data dirs (`*_SUITE_data/`) | Static inputs consumed by their matching suite: `beam_doc_`, `beam_ssa_check_`, `beam_validator_` (`.S` listings), `bif_`, `compilation_`, `compile_`, `core_fold_`, `core_` (`.core`), `error_`, `inline_`, `receive_`, `record_` |
 
 ## Optimization-Correctness Guardrails (lists / maps / records / destructive update)
