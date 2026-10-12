@@ -77,7 +77,10 @@ use crate::re::options::{CompileFlags, Newline};
 use crate::re::syntax::{Assert, Ast, Ranges, Syntax};
 
 /// The image magic — 8 bytes, deliberately *not* the oracle's `re-PCRE2…`.
-const MAGIC: &[u8; 8] = b"rustre2\0";
+///
+/// `re:compile/2`'s `export` form returns it as the exported pattern's header
+/// binary ([`crate::re::compile`]), so it has one definition.
+pub(crate) const MAGIC: &[u8; 8] = b"rustre2\0";
 
 /// The image format version. A mismatch is a typed `badarg`.
 const VERSION: u8 = 1;
