@@ -4147,10 +4147,6 @@ do {							\
 } while (0)
 
 
-#ifdef ERTS_OFFHEAP_DEBUG_CHK_CIRCULAR_LIST
-#  define ERTS_OFFHEAP_VISITED_BIT ((Eterm) 1 << 31)
-#endif
-
 void
 erts_check_off_heap2(Process *p, Eterm *htop)
 {
@@ -4181,10 +4177,6 @@ repeat:
 	    ASSERT(!"erts_check_off_heap2: Invalid thing_word");
 	}
 	ERTS_CHK_OFFHEAP_ASSERT(refc >= 1);
-#ifdef ERTS_OFFHEAP_DEBUG_CHK_CIRCULAR_LIST
-	ERTS_CHK_OFFHEAP_ASSERT(!(u.hdr->thing_word & ERTS_OFFHEAP_VISITED_BIT));
-	u.hdr->thing_word |= ERTS_OFFHEAP_VISITED_BIT;
-#endif
         if (part == OLD_PART)
             ERTS_CHK_OFFHEAP_ASSERT(oheap <= u.ep && u.ep < ohtop);
         else if (part == NEW_PART && oheap <= u.ep && u.ep < ohtop)
@@ -4199,13 +4191,6 @@ repeat:
         goto repeat;
     }
 
-
-#ifdef ERTS_OFFHEAP_DEBUG_CHK_CIRCULAR_LIST
-    for (u.hdr = MSO(p).first; u.hdr; u.hdr = u.hdr->next)
-	u.hdr->thing_word &= ~ERTS_OFFHEAP_VISITED_BIT;
-    for (u.hdr = p->wrt_bins; u.hdr; u.hdr = u.hdr->next)
-        u.hdr->thing_word &= ~ERTS_OFFHEAP_VISITED_BIT;
-#endif
 }
 
 void
