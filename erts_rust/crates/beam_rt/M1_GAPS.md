@@ -583,3 +583,60 @@ the parked reason **is** rooted (see the running-window bullet in [`src/context/
 * **`beam_io` — the port table sits behind one `RefCell`** — the `ids` port-number table shares the live ports' single `RefCell`, so the runtime cannot hand the process and port tables out as disjoint borrows and does not route its slices through `Scheduler::run_ready_with_ports`; a split accessor would unblock it.
 * **`beam_bifs` — the registry dispatch cost and the hook-set drift risk** — the per-lookup owned-`String` key tuples (`contains` + `lookup` on the dispatch path) are the largest attributable residual; a borrowed-key `lookup(&str, &str, u32)` would remove them. This crate's `uses_*` gates delegate to `beam_bifs::hook_sets`' exported `needs_*`/`*_BIFS` tables, so a new consumer is picked up automatically.
 
+
+## PIN measurement — the stale word on the A.9 in-machine self-host route (A.9)
+
+Current state: the call-site guard is **module-wide** (`module_observes_its_call_site`), so both
+`selfhost/*` differential cases report the honest typed gap
+(`unsupported: opcode: run: process blocked (no message available)`), never a wrong result. The
+per-function narrowing is NOT applied.
+
+Self-contained reproducer (no differential harness needed):
+
+    SH=$TMPDIR/selfhost_repro; mkdir -p $SH
+    # write the corpus' `selfhost` module source (tools/differential/src/corpus/selfhost.rs)
+    erlc -o $SH $SH/selfhost.erl
+    <guard narrowed, see git show b3ae6c00bd>
+    ./erts_rust/target/debug/beam_rt run $SH/selfhost.beam selfhost:compile_self/0
+    # default tier: SIGABRT 134, `class: invalid boxed header subtag 0x12`
+    # BEAM_RT_TIER=interpreter: panic, exit 101, same message
+
+Measured facts (first-hand, this worktree):
+
+* **Both collections are the slice's own machine's `test_heap` admission point** — captured with
+  `Backtrace::force_capture()` inside `context/gc.rs::ensure_heap_full`. Neither is an
+  `alloc_words_rooted` collection and neither is a park/delivery collection. `heap_need = 2`,
+  `x_len = 1024`, `fr_len = 1024`, `stack_len = 14` (`selfhost`, pid 2) and `9` (`epp`, pid 3).
+  The full-root door publishes every x slot, the whole stack and the whole FR file
+  (`publish_roots_full`) and scatters all three back, with no slice-length mismatch.
+* **The corrupt term is read in a NESTED machine**, not in the slice's own:
+  `run_label_blocking` (via `apply_fun`) → interpreter `eval_test` → `beam_term::compare::cmp_impl` /
+  `class()` panic. `BEAM_RT_TIER=interpreter` + `RUST_BACKTRACE=1` names the whole chain:
+  `beam_bifs::lists::foldl3` (`crates/beam_bifs/src/lists.rs:1356`) → `FunBridge::call_fun`
+  (`src/context/bridges.rs:163`) → `RuntimeContext::apply_fun` (`src/context/mod.rs:2767`) →
+  `with_relocation_exempt` → `run_label_blocking` → `Machine::run_loop_with_label`.
+* **The stale word itself.** A term-validity watcher in `Machine::eval_test` (temporary, removed)
+  reports the operand as a boxed pointer whose target's first word is *itself* a boxed pointer:
+
+      WATCHBAD eval_test IsAtom arg0 = 0x78c8303fc422 -> invalid boxed header subtag 0x12 (header word 0x78c81dc70952)
+        current_code=Some((8, 6)) context=6 x_ptr=...
+
+  `0x12 & 0x3F` = a `TAG_PRIMARY_BOXED` word, so the pointer addresses a **slot that holds a term**
+  (a payload/element position, or a reused from-space word), not an object header. That is the
+  signature of a pointer into the **abandoned from-space after it has been handed back out for
+  fresh allocation** — the collector relocated the live set but this word was not in it.
+* The nested machine is a **cross-module context** (`context = 6`), and its x registers are seeded
+  from the `apply_fun` arguments, i.e. from `foldl3`'s Rust locals (`Fun`/`Acc`/`List`, read at
+  `../beam_bifs/src/lists.rs:1356`, outside this node's write scope).
+* Collections cannot run while `foldl3` runs: `BudgetContext::call_bif` forwards the inner
+  `&mut RuntimeContext`, whose collection latch is never armed, so every nested admission point is
+  a no-op. The corruption therefore originates in the **outer** slice machine's own `test_heap`
+  collection, and surfaces later when a value it left unrelocated is fed into a `lists:foldl/3`.
+
+Conclusion (current): the implicated holder is a `beam_bifs` fast-path **Rust local held across a
+`ctx.call_fun` boundary** — `lists:foldl/3`'s `acc`/`cur`/`elem` (and the same shape in
+`filter/2`, `foldr/3`, `all/2`, `any/2`). Confirming it needs `beam_bifs`-side instrumentation,
+which this node does not own. The minimal sound fix is therefore **not** a `beam_rt`/`beam_engine`/
+`beam_process` change: a term a `beam_bifs` BIF holds across `ctx.call_fun`/`ExecutionContext` must
+be **published as a root** for the duration of that nested run (or the nested run must be entered
+with the process's `relocation_exempt` flag observed by the admission door). Owned by `beam_bifs`.
