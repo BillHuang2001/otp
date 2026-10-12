@@ -297,7 +297,8 @@ impl Runtime {
         {
             self.note_foreign_reachable(pid);
             return false;
-        }        match process.collect() {
+        }
+        match process.collect() {
             Ok(collection) => {
                 self.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
                 true
