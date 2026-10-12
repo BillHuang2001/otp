@@ -205,28 +205,9 @@ L_Again:   /* Restart with sublist, old listend was pushed on stack */
 	} /* is_list(ioterm) */
 
 	if (!left) {
-#ifdef ALLOW_BYTE_TAIL
-	    if (is_byte(ioterm)) {
-		/* improper list with byte tail*/
-		Eterm *hp;
-		hp = HAlloc(p, 2);
-		ioterm = CONS(hp, ioterm, NIL);
-	    }
-#else
 	    ;
-#endif
 	} else if (!is_list(ioterm) && !is_nil(ioterm)) {
 	    /* improper list end */
-#ifdef ALLOW_BYTE_TAIL
-	    if (is_byte(ioterm)) {
-		unsigned char b[1];
-		b[0] = (unsigned char) unsigned_val(ioterm);
-		(*sumfun)(sum, b, 1);
-		++(*res);
-		--left;
-		ioterm = NIL;
-	    } else
-#endif 
 	    if (is_bitstring(ioterm)) {
 		int sres, serr;
 		ioterm = do_chksum(sumfun, p, ioterm, left, sum, &sres, &serr);
