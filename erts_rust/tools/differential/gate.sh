@@ -38,7 +38,7 @@
 # ---------------------------------------------------------------------------
 # WHAT IT RUNS
 # ---------------------------------------------------------------------------
-#   1. `scripts/cargo.sh build --manifest-path <erts_rust>/Cargo.toml -p beam_rt -p differential`
+#   1. `scripts/cargo.sh build --manifest-path <erts_rust>/Cargo.toml -p beam_rt -p beam_dist -p differential`
 #   2. `scripts/cargo.sh run   --manifest-path <erts_rust>/Cargo.toml -q -p differential -- \
 #          suite --strict --allowlist <script_dir>/known-gaps.txt --json --out <tmpdir>`
 # The corpus JSON report is written to `<tmpdir>/report.json`; the same JSON that the
@@ -74,9 +74,10 @@ if [ ! -f "$allowlist" ]; then
 fi
 
 # --- build the runtime + harness --------------------------------------------------------
-# Build `beam_rt` (the runtime under test) and `differential` (the harness). A build
-# failure is an environment error (exit 2) — the gate never pretends to have run.
-if ! "$cargo_sh" build --manifest-path "$manifest" -p beam_rt -p differential; then
+# Build `beam_rt` (the runtime under test), `beam_dist` (whose `dist_probe` binary is the
+# Rust side of the live distribution loopback cases) and `differential` (the harness). A
+# build failure is an environment error (exit 2) — the gate never pretends to have run.
+if ! "$cargo_sh" build --manifest-path "$manifest" -p beam_rt -p beam_dist -p differential; then
   echo "gate: build failed — cannot run the corpus" >&2
   exit 2
 fi

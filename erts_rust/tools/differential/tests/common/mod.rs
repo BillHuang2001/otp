@@ -94,6 +94,36 @@ pub fn fresh_rust_spec() -> Option<differential::runtime::RuntimeSpec> {
     .expect("the fresh beam_rt exists, so $BEAM_RT resolution cannot fail")
 }
 
+/// The freshly built `dist_probe` helper sitting next to this crate's test binary, if it
+/// exists.
+///
+/// The helper is a `beam_dist` binary, so `CARGO_BIN_EXE_dist_probe` is not defined for this
+/// package; the sibling lookup is exact — it names the same profile directory cargo built
+/// both binaries into. `None` means the helper was not built alongside this test binary (the
+/// caller must then report the Rust side of a command case honestly as a skip, never a
+/// fabricated pass). The name uses [`std::env::consts::EXE_SUFFIX`] so it stays correct on
+/// Windows.
+pub fn fresh_helper() -> Option<PathBuf> {
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_differential"));
+    let dir = exe.parent()?;
+    let candidate = dir.join(format!("dist_probe{}", std::env::consts::EXE_SUFFIX));
+    candidate.is_file().then_some(candidate)
+}
+
+/// A `RuntimeSpec` for the fresh helper, or `None` when it was not built.
+///
+/// Resolved through [`differential::runtime::resolve_helper_from`] with the fresh path passed
+/// as the `$BEAM_DIST_PROBE` value, so the spec reports `RuntimeSource::Env("$BEAM_DIST_PROBE")`
+/// — exactly as a real injection would — and can never fall back to the workspace default.
+pub fn fresh_helper_spec() -> Option<differential::runtime::RuntimeSpec> {
+    let path = fresh_helper()?;
+    differential::runtime::resolve_helper_from(
+        Some(path.into_os_string()),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+    )
+    .expect("the fresh dist_probe exists, so $BEAM_DIST_PROBE resolution cannot fail")
+}
+
 /// Serializes the integration tests that run the **real conformance corpus** under the
 /// oracle.
 ///

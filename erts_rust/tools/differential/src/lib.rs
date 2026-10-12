@@ -22,7 +22,7 @@
 //!
 //! For a given corpus case the harness runs the **real system ERTS** (the *oracle*) and
 //! the **Rust runtime** (`beam_rt`), then compares the **observable results**. There are
-//! three kinds of case ([`CaseKind`]):
+//! four kinds of case ([`CaseKind`]):
 //!
 //! * expression cases evaluate the *same* self-terminating probe under both runtimes and
 //!   compare stdout + exit status + stderr, and the case's own golden (contracts A.2/A.8).
@@ -30,6 +30,10 @@
 //!   runtime with an explicit environment, so the `ERL_*FLAGS` merge is pinnable (A.6).
 //! * module-run cases compile a tiny embedded Erlang module with the system `erlc` and
 //!   compare the value the two runtimes produce from a real `.beam` (stdout + exit status).
+//!   Environment-variable module-run cases (`ModuleEnv`) add an explicit environment.
+//! * command cases spawn an external program + argv on each side (neither an `-eval` probe
+//!   nor the Rust `run` action) and compare stdout + exit status — the shape that pins a
+//!   surface needing two nodes (the live distribution loopback, contract A.5).
 //!
 //! A Rust-side observation that exits with [`runtime::UNSUPPORTED_EXIT_CODE`] (`3`) is a
 //! documented **capability gap** and is reported `unsupported` — never a `mismatch`.
@@ -99,7 +103,10 @@ pub use compare::{
     compare_observations, compare_observations_with, verdict, verdict_with, FieldDiff, GoldenCheck,
     Observables, SideResult, Verdict,
 };
-pub use corpus::{find_case, probe_expr, Case, CaseKind, Contract, Golden, ModuleRun, Probe};
+pub use corpus::{
+    find_case, probe_expr, Case, CaseKind, CommandProgram, CommandRun, CommandSpec, Contract,
+    Golden, ModuleRun, Probe,
+};
 pub use error::{Error, Result};
 pub use harness::{
     compare_expr, run_case, run_suite, CaseOutcome, RuntimeContext, SuiteOutcome,

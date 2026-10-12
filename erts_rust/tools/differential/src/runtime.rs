@@ -29,6 +29,11 @@
 //!   otherwise the workspace-relative `target/{release,debug}/beam_rt`. Neither exists ⇒
 //!   `Ok(None)`; the harness then reports the Rust side as *unsupported* instead of
 //!   inventing a result.
+//! * the **distribution helper** (`dist_probe`, the Rust side of a live two-node loopback
+//!   case) — `$BEAM_DIST_PROBE` if set (the path must exist, else [`Error::Env`]), otherwise
+//!   the workspace-relative `target/{release,debug}/dist_probe`; neither exists ⇒ `Ok(None)`
+//!   and the case is *skipped*. It is resolved by [`resolve_helper`]/[`resolve_helper_from`]
+//!   and reported with [`RuntimeId::Rust`].
 //!
 //! The workspace default searches `release` **before** `debug` on purpose: it is what the
 //! real CLI and the CI `gate.sh` want, so the fastest artifact present is measured. That
@@ -255,6 +260,83 @@ pub fn resolve_rust_from(
     Ok(None)
 }
 
+/// Resolve the distribution helper (`dist_probe`) from the real environment.
+///
+/// The helper is the **Rust side** of a live two-node distribution loopback case
+/// ([`CaseKind::Command`](crate::corpus::CaseKind::Command)); it is driven exactly like the
+/// runtime — `$BEAM_DIST_PROBE` if set (the path must exist, else [`Error::Env`]), otherwise
+/// the workspace-relative `target/{release,debug}/dist_probe`. Neither exists ⇒ `Ok(None)`;
+/// the harness then reports the Rust side as *unsupported* instead of inventing a result.
+pub fn resolve_helper() -> Result<Option<RuntimeSpec>> {
+    resolve_helper_from(
+        std::env::var_os("BEAM_DIST_PROBE"),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+    )
+}
+
+/// Resolve the distribution helper from explicit inputs (the injectable core of
+/// [`resolve_helper`]).
+///
+/// * `beam_dist_probe` — the value of `$BEAM_DIST_PROBE`, if set. It must name an existing
+///   file, otherwise this is a loud [`Error::Env`].
+/// * `manifest_dir` — the crate directory (`$CARGO_MANIFEST_DIR`); the workspace default is
+///   `<manifest_dir>/../../target/{release,debug}/dist_probe`.
+///
+/// It is the **Rust side** of the comparison (the helper speaks for the Rust runtime's
+/// distribution stack), so it is reported with [`RuntimeId::Rust`] and no new
+/// [`RuntimeId`]/[`RuntimeSource`] variant is introduced. The `release`-before-`debug`
+/// preference mirrors [`resolve_rust_from`] and is left unchanged for the same reason.
+pub fn resolve_helper_from(
+    beam_dist_probe: Option<OsString>,
+    manifest_dir: &Path,
+) -> Result<Option<RuntimeSpec>> {
+    if let Some(value) = beam_dist_probe {
+        let program = PathBuf::from(&value);
+        if !program.is_file() {
+            return Err(Error::env(format!(
+                "$BEAM_DIST_PROBE is set to '{}', which is not an existing file",
+                program.display()
+            )));
+        }
+        return Ok(Some(RuntimeSpec {
+            id: RuntimeId::Rust,
+            program,
+            source: RuntimeSource::Env("$BEAM_DIST_PROBE"),
+        }));
+    }
+
+    let target = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .map(|workspace| workspace.join("target"))
+        .ok_or_else(|| {
+            Error::env(format!(
+                "cannot derive the workspace target directory from CARGO_MANIFEST_DIR='{}'",
+                manifest_dir.display()
+            ))
+        })?;
+
+    for profile in ["release", "debug"] {
+        let candidate = target.join(profile).join(helper_program_name());
+        if candidate.is_file() {
+            return Ok(Some(RuntimeSpec {
+                id: RuntimeId::Rust,
+                program: candidate,
+                source: RuntimeSource::WorkspaceDefault,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// The reason recorded for the Rust side of a command case when no `dist_probe` helper could
+/// be found.
+pub fn helper_unsupported_reason() -> String {
+    "no distribution helper found: $BEAM_DIST_PROBE is unset and no built dist_probe exists \
+     under the workspace target/{release,debug} directory"
+        .to_string()
+}
+
 /// Build the argv for an evaluation: `["-noshell", <extra…>, "-eval", <expr>]`.
 ///
 /// The expression corpus cases hand this same argv to both runtimes; module-run cases
@@ -438,6 +520,18 @@ fn rust_program_name() -> &'static str {
     }
 }
 
+/// The file name of the distribution helper binary inside `target/<profile>/`.
+fn helper_program_name() -> &'static str {
+    #[cfg(windows)]
+    {
+        "dist_probe.exe"
+    }
+    #[cfg(not(windows))]
+    {
+        "dist_probe"
+    }
+}
+
 #[cfg(unix)]
 pub(crate) fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -457,8 +551,8 @@ pub(crate) fn is_executable(path: &Path) -> bool {
 mod tests {
     use super::{
         eval_argv, eval_argv_owned, is_transient_text_file_busy, output_with_retry, own_env,
-        resolve_oracle_from, resolve_rust_from, run, run_with_env, RuntimeId, RuntimeSource,
-        RuntimeSpec,
+        resolve_helper_from, resolve_oracle_from, resolve_rust_from, run, run_with_env, RuntimeId,
+        RuntimeSource, RuntimeSpec,
     };
     use crate::error::Error;
     use std::ffi::OsString;
@@ -667,6 +761,57 @@ mod tests {
             .expect("resolve")
             .expect("present");
         assert_eq!(spec.program, release);
+    }
+
+    #[test]
+    fn helper_env_override_is_used_when_it_exists() {
+        let dir = Scratch::new("helper-env");
+        let probe = dir.file("dist_probe");
+        let spec = resolve_helper_from(Some(probe.clone().into_os_string()), &dir.dir)
+            .expect("resolve")
+            .expect("present");
+        assert_eq!(spec.id, RuntimeId::Rust);
+        assert_eq!(spec.program, probe);
+        assert_eq!(spec.source, RuntimeSource::Env("$BEAM_DIST_PROBE"));
+    }
+
+    #[test]
+    fn helper_env_override_that_does_not_exist_is_a_loud_env_error() {
+        let dir = Scratch::new("helper-env-missing");
+        let err = resolve_helper_from(Some(OsString::from("/nonexistent/dist_probe")), &dir.dir)
+            .expect_err("must not resolve");
+        assert!(matches!(err, Error::Env(_)), "{err:?}");
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("$BEAM_DIST_PROBE"));
+    }
+
+    #[test]
+    fn helper_defaults_to_the_workspace_target_and_is_absent_when_not_built() {
+        let dir = Scratch::new("helper-default");
+        let manifest_dir = dir.dir.join("erts_rust/tools/differential");
+        std::fs::create_dir_all(&manifest_dir).expect("create manifest dir");
+        assert_eq!(resolve_helper_from(None, &manifest_dir).expect("resolve"), None);
+
+        let probe = dir.file("erts_rust/target/debug/dist_probe");
+        let spec = resolve_helper_from(None, &manifest_dir)
+            .expect("resolve")
+            .expect("present");
+        assert_eq!(spec.program, probe);
+        assert_eq!(spec.source, RuntimeSource::WorkspaceDefault);
+
+        // release wins over debug.
+        let release = dir.file("erts_rust/target/release/dist_probe");
+        let spec = resolve_helper_from(None, &manifest_dir)
+            .expect("resolve")
+            .expect("present");
+        assert_eq!(spec.program, release);
+    }
+
+    #[test]
+    fn the_helper_unsupported_reason_names_the_override_and_the_binary() {
+        let reason = super::helper_unsupported_reason();
+        assert!(reason.contains("$BEAM_DIST_PROBE"), "{reason}");
+        assert!(reason.contains("dist_probe"), "{reason}");
     }
 
     #[test]

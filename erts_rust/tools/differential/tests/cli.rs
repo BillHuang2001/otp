@@ -144,6 +144,18 @@ fn fresh_beam_rt_env<'a>(fresh: &'a Option<PathBuf>) -> Vec<(&'static str, &'a s
         .collect()
 }
 
+/// The `$BEAM_DIST_PROBE` injection for a child invocation that would otherwise rely on
+/// **default** resolution: the freshly built `dist_probe` helper, or nothing when it was not
+/// built (the child then reports the `dist/*` command cases as `skipped` — honest, never a
+/// fabricated pass). Mirrors [`fresh_beam_rt_env`].
+fn fresh_helper_env<'a>(helper: &'a Option<PathBuf>) -> Vec<(&'static str, &'a str)> {
+    helper
+        .as_ref()
+        .map(|path| ("BEAM_DIST_PROBE", path.to_str().expect("utf-8 helper path")))
+        .into_iter()
+        .collect()
+}
+
 /// Whether the module-run cases can be exercised (they need the system `erlc`).
 fn erlc_available() -> bool {
     matches!(differential::module_build::resolve_erlc(), Ok(Some(_)))
@@ -342,6 +354,7 @@ fn the_suite_reports_module_agreement_and_expression_capability_gaps() {
     // `$BEAM_RT`) if one exists, else whatever its workspace-default resolution finds. This
     // mirrors `runtime::resolve_rust_from` so the gate can never disagree with the child.
     let fresh = common::fresh_rust_runtime();
+    let helper = common::fresh_helper();
     let default_runtime = workspace_default_runtime();
     let have_erlc = erlc_available();
     let agreement_possible = (fresh.is_some() || default_runtime.is_some()) && have_erlc;
@@ -369,8 +382,12 @@ fn the_suite_reports_module_agreement_and_expression_capability_gaps() {
     // Inject the freshly built debug `beam_rt`: the workspace default would prefer a
     // `target/release/beam_rt`, and a stale release artifact must never shadow the fresh
     // build this test is meant to exercise (when no fresh build exists the injection is
-    // empty and the child uses that very workspace default).
-    let env = fresh_beam_rt_env(&fresh);
+    // empty and the child uses that very workspace default). The fresh `dist_probe` helper is
+    // injected the same way so the `dist/*` command cases are exercised by the fresh build.
+    let env: Vec<(&str, &str)> = fresh_beam_rt_env(&fresh)
+        .into_iter()
+        .chain(fresh_helper_env(&helper))
+        .collect();
 
     let lenient = invoke(&["suite", "--json", "--out", &scratch.arg()], &env);
     let json: serde_json::Value =
@@ -487,9 +504,15 @@ fn compare_evaluates_an_ad_hoc_expression_without_a_golden() {
         return;
     }
     // Default resolution would prefer a (possibly stale) `target/release/beam_rt`; inject
-    // the freshly built debug runtime instead.
+    // the freshly built debug runtime instead. The fresh `dist_probe` helper is injected too
+    // (harmless here — a `compare` runs an expression case — but keeps the corpus-adjacent
+    // resolution consistent).
     let fresh = common::fresh_rust_runtime();
-    let env = fresh_beam_rt_env(&fresh);
+    let helper = common::fresh_helper();
+    let env: Vec<(&str, &str)> = fresh_beam_rt_env(&fresh)
+        .into_iter()
+        .chain(fresh_helper_env(&helper))
+        .collect();
     let invocation = invoke(
         &["compare", "length([a,b,c])", "--json", "--out", &Scratch::new("compare").arg()],
         &env,
@@ -748,7 +771,11 @@ fn the_ratchet_tolerates_only_the_recorded_gaps_end_to_end() {
             "--out",
             &scratch.arg(),
         ],
-        &[("BEAM_RT", fake)],
+        // The fake is injected as BOTH `$BEAM_RT` and `$BEAM_DIST_PROBE`: the `dist/*` command
+        // cases spawn the helper (not `beam_rt`), so without the second injection a built
+        // workspace would let them `agree`, their allowlist entries would go stale, and the
+        // clean run would no longer be exit 0.
+        &[("BEAM_RT", fake), ("BEAM_DIST_PROBE", fake)],
     );
     assert_eq!(clean.code, Some(0), "{}", clean.describe());
     let json: serde_json::Value = serde_json::from_str(&clean.stdout).expect("the report parses");
@@ -792,7 +819,9 @@ fn the_ratchet_tolerates_only_the_recorded_gaps_end_to_end() {
             "--out",
             &scratch.arg(),
         ],
-        &[("BEAM_RT", fake)],
+        // Both injections (see the clean run above): every case — including the `dist/*`
+        // command cases driven through the helper — must be a capability gap.
+        &[("BEAM_RT", fake), ("BEAM_DIST_PROBE", fake)],
     );
     assert_eq!(dirty.code, Some(1), "{}", dirty.describe());
     let json: serde_json::Value = serde_json::from_str(&dirty.stdout).expect("the report parses");
@@ -861,7 +890,10 @@ fn a_mismatch_is_never_masked_by_an_allowlist_end_to_end() {
             "--out",
             &scratch.arg(),
         ],
-        &[("BEAM_RT", fake)],
+        // The fake is injected as BOTH `$BEAM_RT` and `$BEAM_DIST_PROBE`: the `dist/*` command
+        // cases spawn the helper, so without the second injection (on a machine with a built
+        // helper) they would silently agree instead of diverging.
+        &[("BEAM_RT", fake), ("BEAM_DIST_PROBE", fake)],
     );
     assert_eq!(invocation.code, Some(1), "{}", invocation.describe());
     let json: serde_json::Value =
