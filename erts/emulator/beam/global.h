@@ -1217,10 +1217,6 @@ extern int stop_dist(void);
 
 void erl_progressf(char* format, ...);
 
-#ifdef MESS_DEBUG
-void print_pass_through(int, byte*, int);
-#endif
-
 /* beam_emu.c */
 int catchlevel(Process*);
 void init_emulator(void);
