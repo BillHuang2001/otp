@@ -61,8 +61,8 @@
 //!
 //! # Route
 //!
-//! Every probe is `beam_rt -noshell -eval '<expr>'`. The `-eval` driver runs on the runtime's root
-//! process and **pumps the scheduler** through `Runtime::pump_scheduler`, which is what the native
+//! The first two probes are `beam_rt -noshell -eval '<expr>'`. The `-eval` driver runs on the
+//! runtime's root process and **pumps the scheduler** through `Runtime::pump_scheduler`, which is what the native
 //! `file_server_2` read path needs; it is the route on which the in-process compile completes (the
 //! native `file_server_2` also serves `save_binary`'s write, so `compile:file/2`'s artifact lands
 //! on disk), and it needs no compiled fixture. A compile driven from a **scheduled** process
@@ -83,7 +83,12 @@
 //! (`Process::has_unpublished_roots`). Narrowing the guard's fun-image half is therefore unsound: it
 //! turns both self-host corpus cases into a hard mismatch (`beam_term::ops: invalid boxed header
 //! subtag 0x2`, `*** Internal compiler error ***`) rather than the typed `blocked` gap.
-
+//!
+//! The suite's third test deliberately takes the **other** route: `epp:parse_file/3` driven from a
+//! *scheduled* process (`beam_rt … run <file>.beam <mod>:<fun>/1 <file>`), which is the route on
+//! which a delivery-driven collection of the parked receiver used to corrupt its live scan options
+//! and answer a different form count (or `badarg`) than the oracle. It asserts the parsed
+//! `{FormCount, Tags}` — the observable result, never "no crash".
 // The shared harness is compiled in whole, but this suite uses only its bounded runner and its
 // toolchain discovery; the unused remainder is expected here — the same shape `tests/io_scan.rs`
 // uses.
@@ -393,6 +398,118 @@ fn the_in_process_compile_file_artifact_matches_the_oracle() {
 }
 
 // ---------------------------------------------------------------------------------------
+// Test 3: the scheduled-route `epp` read path
+// ---------------------------------------------------------------------------------------
+
+/// The driver module for the scheduled-route probe: `epp_forms:go/1` reads its argument through
+/// `epp:parse_file/3` and answers `{FormCount, Tags}` — a pure `~w`-printing value, so the
+/// runtime's own `run` output and the oracle's `io:format("~w~n", …)` are directly comparable.
+const EPP_FORMS_SRC: &str = include_str!("fixtures/epp_forms.erl");
+
+/// The driver's input — a tiny module in **legacy** syntax only (no maps, no binaries), so the
+/// scanner's option list genuinely lives in the plain cons cell it has always lived in.
+const EPP_INPUT_SRC: &str = include_str!("fixtures/epp_input.erl");
+
+/// What both runtimes must answer for [`EPP_INPUT_SRC`] through `epp:parse_file/3` with **no**
+/// options: `epp` prepends its own `{attribute,_,file,_}` form, so the three source forms
+/// (`-module`/`-export`/`f/0`) plus that `file` attribute and the trailing `eof` are exactly five
+/// forms, three of which are `attribute`s.
+const EPP_INPUT_FORMS: &str = "{5,[attribute,attribute,attribute,function,eof]}";
+
+/// **The scheduled-route regression.** A `beam_rt run` process — the route where the workload runs
+/// as a **scheduled** process instead of on the pumping root — parses a source file through the
+/// real `epp`/`erl_scan`/io-device read path and must answer exactly what the live oracle answers.
+///
+/// # What this pins
+///
+/// The `epp` process's live scan options live in its **mature** generation, and every path to them
+/// hops through a container *outside* the collector's from-set (this runtime's pointer-stable
+/// arena, a pooled BIF heap, a message fragment). A delivery-driven major collection of the parked
+/// receiver used to leave that mature cell behind, free the old block, and let another process
+/// recycle it in place — after which the read path answered a form too many (the original
+/// reproduction) or `badarg`. The runtime's four heap-admission doors
+/// (`context/gc.rs::{ensure_heap, ensure_heap_full, alloc_words_rooted}` and
+/// `Runtime::serve_gc_request`) already decline that collection through the unscanned-root valve
+/// (`context/gc_walk.rs`); the delivery seam now asks the same question for the **receiver** and
+/// declines it too, so the delivery takes the ordinary no-relocation heap-fragment path and the
+/// read completes.
+///
+/// The assertion is the observable the oracle produces, so a regression is a **wrong answer**
+/// (or a `badarg`), never merely a crash.
+#[test]
+fn a_scheduled_process_parses_a_source_file_like_the_oracle() {
+    let Some(oracle) = support::require_oracle("compile_file") else {
+        return;
+    };
+    let Some(erlc) = support::find_on_path("erlc") else {
+        support::skip_loudly("compile_file", "no `erlc` on $PATH");
+        return;
+    };
+
+    // ---- the driver, compiled into its own scratch directory ----
+    let driver = TempDir::new("epp_forms");
+    let driver_src = driver.0.join("epp_forms.erl");
+    fs::write(&driver_src, EPP_FORMS_SRC).expect("write the driver fixture");
+    let driver_dir = driver.0.to_string_lossy().to_string();
+    let src_arg = driver_src.to_string_lossy().to_string();
+    let built = run(&erlc, &["-o", &driver_dir, &src_arg]);
+    assert_eq!(built.code, 0, "`erlc` must build the driver: {}", built.err);
+    let driver_beam = driver.0.join("epp_forms.beam");
+    assert!(
+        driver_beam.is_file(),
+        "`erlc` wrote no {}",
+        driver_beam.display()
+    );
+
+    // ---- the input, in a directory of its own ----
+    let input_dir = TempDir::new("epp_input");
+    let input = input_dir.0.join("epp_input.erl");
+    fs::write(&input, EPP_INPUT_SRC).expect("write the input fixture");
+
+    // ---- the runtime, on the scheduled `run` route ----
+    let spec = "epp_forms:go/1";
+    let beam_arg = driver_beam.to_string_lossy().to_string();
+    let input_arg = literal(&input);
+    let ours = run(
+        Path::new(BINARY),
+        &[
+            "-noshell",
+            "-pa",
+            &driver_dir,
+            "run",
+            &beam_arg,
+            spec,
+            &input_arg,
+        ],
+    );
+    assert_eq!(
+        ours.code, 0,
+        "the scheduled route must parse the source: exit {} — {}",
+        ours.code, ours.err
+    );
+    assert!(
+        !ours.err.contains("unsupported"),
+        "the scheduled route must not report a capability gap: {}",
+        ours.err
+    );
+    let line = ours.out.lines().next().unwrap_or_default().to_string();
+    assert_eq!(
+        line, EPP_INPUT_FORMS,
+        "the scheduled route must answer the parse it drove (stdout {:?}; stderr {:?})",
+        ours.out, ours.err
+    );
+
+    // ---- the oracle, on the identical workload ----
+    let expr = format!("io:format(\"~w~n\",[epp_forms:go({input_arg})]), halt(0).");
+    let theirs = support::oracle_eval(&oracle, Some(&driver.0), &expr)
+        .unwrap_or_else(|| panic!("the live oracle could not answer `{spec}`"));
+    assert_eq!(
+        theirs, line,
+        "the scheduled route must agree with the oracle (`{spec}`)"
+    );
+    eprintln!("scheduled-route epp parse agrees with the oracle: {line}");
+}
+// ---------------------------------------------------------------------------------------
 // Current state
 // ---------------------------------------------------------------------------------------
 //
@@ -400,3 +517,9 @@ fn the_in_process_compile_file_artifact_matches_the_oracle() {
 // `../lib/compiler` under `beam_rt`, its artifact is byte-identical to the oracle's identical
 // option-list run, and its `Code` chunk matches `erlc +deterministic`. The write path is the native
 // `file_server_2` service, which serves `save_binary`'s write requests.
+//
+// On the **scheduled** `run` route a full `compile:file/2` still stops with the typed
+// `unsupported: opcode: run: process blocked (no message available)` gap (the module-wide
+// `module_observes_its_call_site` guard, see *Route* above), but the `epp:parse_file/3` read path
+// it is built on now completes and answers exactly the oracle's `{FormCount, Tags}` — the
+// scheduled-route regression `a_scheduled_process_parses_a_source_file_like_the_oracle` pins.

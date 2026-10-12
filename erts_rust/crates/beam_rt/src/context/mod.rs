@@ -122,6 +122,7 @@ use self::bridges::{
     SharedSink,
 };
 use self::fun_identity::FunIdentityBridge;
+use self::gc_walk::process_roots_are_unscanned;
 use self::memory_hook::RuntimeMemory;
 use self::module_info::ModuleInfoBridge;
 use self::persistent_term::PersistentTermBridge;
@@ -630,6 +631,26 @@ impl<'a> RuntimeContext<'a> {
         f: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
         let pid = self.mailbox_pid;
+        self.with_pid_relocation_exempt(pid, f)
+    }
+
+    /// The **`pid`-addressed** form of [`Self::with_relocation_exempt`]: runs `f` with the
+    /// process `pid` marked relocation-exempt, restoring the previous mark whatever `f`
+    /// returns.
+    ///
+    /// [`Self::with_relocation_exempt`] is exactly `with_pid_relocation_exempt(self.mailbox_pid,
+    /// f)` (the sending context's own process); the second caller is
+    /// [`Self::deliver_message_with_off_heap_inner`], which marks the **receiver** when the
+    /// unscanned-root valve says a delivery-driven collection of *its* heap would be unsound —
+    /// a process that is not this context's own.
+    ///
+    /// A pid this context's table does not hold is not an error: there is no process to exempt,
+    /// so `f` simply runs unguarded.
+    pub(crate) fn with_pid_relocation_exempt<T>(
+        &mut self,
+        pid: ProcessId,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
         let previous = match self.process_table().is_relocation_exempt(pid) {
             Ok(previous) => Some(previous),
             // A pid with no process has no heap to move, so there is nothing to exempt.
@@ -884,9 +905,12 @@ impl<'a> RuntimeContext<'a> {
         // [`Process::set_relocation_exempt`](beam_process::Process::set_relocation_exempt)), so
         // no heap word moves under a term the unpublished machine still holds. The message
         // still arrives: the refusal is exactly the signal the heap-fragment fallback below is
-        // reached on. A delivery to a process that is **not** the one this context runs as is
-        // unaffected — the exemption names this context's own pid, and another process's
-        // collection is legitimate (its roots were published when it parked).
+        // reached on.
+        //
+        // The **receiver** gets the same treatment when *its* own collection would be unsound —
+        // see [`Self::deliver_message_with_off_heap_inner`] and
+        // [`Self::delivery_collection_is_unsound`], which the body below consults and then marks
+        // the receiver through [`Self::with_pid_relocation_exempt`].
         self.with_relocation_exempt(|this| {
             this.deliver_message_with_off_heap_inner(to, from, message, src)
         })
@@ -894,7 +918,55 @@ impl<'a> RuntimeContext<'a> {
 
     /// The delivery body of [`Self::deliver_message_with_off_heap`], run with the sending
     /// context's own process marked relocation-exempt (see that method for why).
+    ///
+    /// # The receiver's own collection, and the runtime's unscanned-root valve
+    ///
+    /// Exempting the **sender** covers only the sender. [`Process::deliver`] can *also* collect
+    /// the **receiver's** heap: a receiver that is parked (`Waiting`) and not relocation-exempt
+    /// takes the refusal path of `deliver`, which runs a rooted collection (and an on-demand
+    /// growth) over *its* root set. The runtime's four admission doors
+    /// (`gc::{ensure_heap, ensure_heap_full, alloc_words_rooted}` and `Runtime::serve_gc_request`)
+    /// refuse exactly that move when the receiver's roots reach a container the collector does
+    /// not scan ([`crate::context::gc_walk`]); the delivery-driven site inside
+    /// `beam_process::Process::deliver` consults none of them, so a delivery into such a receiver
+    /// used to move its heap against a root set the runtime itself calls unsound — a live term
+    /// reachable only through a container outside the collector's from-set is left behind, the
+    /// old mature block is freed and recycled in place, and the process reads a corrupted word at
+    /// a stable address.
+    ///
+    /// [`Self::delivery_collection_is_unsound`] asks that same question for the receiver, and
+    /// when the answer is `true` this method marks the **receiver**
+    /// ([`Self::with_pid_relocation_exempt`]) for the duration of the delivery. `Process::deliver`
+    /// then returns its raw [`AllocKind::Message`] refusal **unchanged** — no collection, no
+    /// growth, no word moved — and the ordinary host fragment fallback below
+    /// ([`Self::send_fragmented_message`]) delivers the payload with no heap word moved, exactly
+    /// as it already does for a `Running` receiver. This is the runtime applying its *own* policy
+    /// consistently, not a special case: "do not relocate against a root set that reaches an
+    /// unscannable container".
+    ///
+    /// The receiver's mark is restored on every path, so a receiver the scheduler (or an outer
+    /// scope) already had exempt keeps its mark.
     fn deliver_message_with_off_heap_inner(
+        &mut self,
+        to: ProcessId,
+        from: Eterm,
+        message: Eterm,
+        src: &OffHeapTable,
+    ) -> Result<()> {
+        if !self.delivery_collection_is_unsound(to) {
+            return self.deliver_into_mailbox(to, from, message, src);
+        }
+        // The receiver's own heap must not be relocated for this delivery: exempt it, so
+        // `deliver` refuses the move and the fragment fallback delivers the message.
+        self.with_pid_relocation_exempt(to, |this| {
+            this.deliver_into_mailbox(to, from, message, src)
+        })
+    }
+
+    /// One delivery attempt into `to`'s mailbox, with the heap-fragment fallback for the
+    /// copier's raw [`AllocKind::Message`] refusal and the `error:system_limit` translation —
+    /// the shared body of [`Self::deliver_message_with_off_heap_inner`].
+    fn deliver_into_mailbox(
         &mut self,
         to: ProcessId,
         from: Eterm,
@@ -907,6 +979,63 @@ impl<'a> RuntimeContext<'a> {
                 .map_err(error::enforce_term_heap_limit),
             other => other.map(|_| ()).map_err(error::enforce_term_heap_limit),
         }
+    }
+
+    /// Whether a delivery into `to` could drive an **unsound** collection of `to`'s own heap —
+    /// i.e. whether the delivery must run with `to` marked relocation-exempt (see
+    /// [`Self::deliver_message_with_off_heap_inner`]).
+    ///
+    /// The answer is the runtime's **unscanned-root valve**, asked about the *receiver*:
+    ///
+    /// * A receiver that already refuses the delivery-driven collection needs no mark:
+    ///   [`Process::has_unpublished_roots`](beam_process::Process::has_unpublished_roots) is true
+    ///   for a relocation-exempt process and for a `Running` one (whose `regs` snapshot is stale
+    ///   mid-slice), and `deliver` returns its raw refusal for both — which is the very signal the
+    ///   fragment fallback keys on. Answering `false` here therefore changes nothing.
+    /// * Otherwise the receiver is a parked process whose roots `deliver` would publish — the
+    ///   shape the four admission doors decline. The pid's **descent latch**
+    ///   ([`Runtime::foreign_reachable`](crate::runtime::Runtime)) is the `O(1)` fast path: when it
+    ///   is open the process's reachable graph may hold a container from a region its collector
+    ///   does not scan at depth ≥ 2, and declining is the conservative (and cheap) answer — the
+    ///   `O(live objects)` descent is deliberately **not** paid on the per-send hot path.
+    /// * When the latch is closed the descent would be skipped anyway, so the walk's always-run
+    ///   per-word phase is the whole valve — the same classification the four doors run on the
+    ///   same condition ([`crate::context::gc::root_is_unscanned`]). Run it (it is `O(roots)`) and,
+    ///   on a hit, open the latch permanently, exactly as those doors do: a foreign container
+    ///   really did reach a live root, which is the event the latch records.
+    ///
+    /// A pid with no process answers `false`: there is no heap to move, and `deliver` reports the
+    /// typed not-found itself.
+    ///
+    /// Nothing here can *allow* a collection the current behaviour would decline — a `false`
+    /// answer is returned only for a receiver that is already refusing, one whose roots are all
+    /// in scanned regions, or one no table holds — so the change is strictly conservative.
+    fn delivery_collection_is_unsound(&mut self, to: ProcessId) -> bool {
+        match self.process_table().get(to) {
+            // Already refusing the collection: `deliver` will not move a word, so no mark is
+            // needed (and the fragment fallback already covers the refusal).
+            Some(process) if process.has_unpublished_roots() => return false,
+            Some(_) => {}
+            None => return false,
+        }
+        // The `O(1)` fast path: an open descent latch means the graph may hold a foreign
+        // container at depth ≥ 2, so decline rather than pay the `O(live objects)` walk.
+        if self.runtime.foreign_reachable(to) {
+            return true;
+        }
+        // The latch is closed, so the descent is skipped: the always-run per-word phase *is* the
+        // valve here. The scratch is moved out for the walk (`O(1)`) because the receiver is
+        // reached through a table that may be the runtime's own.
+        let mut scratch = self.runtime.take_walk_scratch();
+        let hit = match self.process_table().get(to) {
+            Some(process) => process_roots_are_unscanned(&mut scratch, process, false),
+            None => false,
+        };
+        self.runtime.put_walk_scratch(scratch);
+        if hit {
+            self.runtime.note_foreign_reachable(to);
+        }
+        hit
     }
 
     /// [`Self::deliver_message`] for a caller that already holds the runtime and the
