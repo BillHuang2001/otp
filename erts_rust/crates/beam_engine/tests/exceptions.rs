@@ -40,13 +40,17 @@
 //! installed `stdlib`/`kernel`/`compiler` modules and producing the system `erl`'s reason.
 
 use std::collections::BTreeMap;
+use std::process::Command;
 
 use beam_common::{BeamError, ExceptionClass, ExitReason};
 use beam_engine::{terms, ExecutionContext, Machine, MinimalContext};
 use beam_loader::{
     load_file, Export, Function, HeapNeed, Import, ImportRef, Instr, Label, Module, Operand, NO_FAIL,
 };
-use beam_term::{cmp, is_small, make_atom, make_small, signed_value, Atom, Eterm, NIL};
+use beam_term::{
+    atom_val, cmp, is_atom, is_nil, is_small, make_atom, make_small, signed_value, Atom, Eterm,
+    NIL,
+};
 
 mod support;
 
@@ -100,6 +104,45 @@ fn expect(module: &Module, name: &str, args: &[Eterm], ctx: &mut dyn ExecutionCo
     run(module, name, args, ctx)
         .0
         .unwrap_or_else(|err| panic!("{name} raised {err:?}"))
+}
+
+/// The `{Module,Function,Arity,Location}` stacktrace item the engine cooks (and the
+/// oracle prints), built from `module`'s own atom table.
+///
+/// `module` names the frame's **own** module (the item's first element): a frame is
+/// always resolved against the module its `(func, pc)` belongs to.
+fn frame(
+    ctx: &mut dyn ExecutionContext,
+    module: &Module,
+    name: &str,
+    arity: i64,
+    location: Eterm,
+) -> Eterm {
+    terms::make_tuple(
+        ctx,
+        &[
+            make_atom(module.name),
+            atom_term(module, name),
+            make_small(arity),
+            location,
+        ],
+    )
+    .expect("build a stacktrace item")
+}
+
+/// The `[{file,Name},{line,N}]` `Location` element of a stacktrace item — an Erlang
+/// string (a list of code points) for the file, exactly the oracle's shape.
+fn location(ctx: &mut dyn ExecutionContext, module: &Module, file: &str, line: i64) -> Eterm {
+    let codes: Vec<Eterm> = file
+        .chars()
+        .map(|c| make_small(i64::from(c as u32)))
+        .collect();
+    let name = terms::make_list(ctx, &codes).expect("build the file-name list");
+    let file_pair =
+        terms::make_tuple(ctx, &[atom_term(module, "file"), name]).expect("build the file pair");
+    let line_pair = terms::make_tuple(ctx, &[atom_term(module, "line"), make_small(line)])
+        .expect("build the line pair");
+    terms::make_list(ctx, &[file_pair, line_pair]).expect("build the location list")
 }
 
 /// A BIF hook: `erlang:'/'/2` raises `badarith` when the divisor is `0`, exactly
@@ -467,21 +510,31 @@ const STACKTRACE_BEAM: &str = concat!(
 );
 
 fn stacktrace_module() -> Module {
-    load_file(STACKTRACE_BEAM).expect("load stacktrace.beam")
+    let mut module = load_file(STACKTRACE_BEAM).expect("load stacktrace.beam");
+    // A real runtime keeps the well-known exception atoms — `file`/`line` included
+    // (`../../erts/emulator/beam/beam_common.c:382-406`) — globally interned; the
+    // bare loader interns only what the module's own atom chunk names. Seed them so
+    // the fixture's cooked `S` can carry its source location — the same policy the
+    // `tests/support` host applies to every module it loads (`SEED_ATOMS`).
+    module.atom_table.intern("file");
+    module.atom_table.intern("line");
+    module
 }
 
 #[test]
-fn build_stacktrace_fixture_cooks_a_nil_raw_trace_to_nil() {
+fn build_stacktrace_fixture_cooks_the_raise_snapshot_from_the_nil_raw_trace() {
     // `cap/1` is `try case X of 1 -> one end catch C:R:S -> {C,R,S} end`, so its
-    // handler moves the raw stacktrace (`x(2)`) into `x(0)` and runs
-    // `build_stacktrace` — the only shape `sys_core_fold` keeps a cooked trace for.
+    // handler moves the raw stacktrace (`x(2)`, `NIL` — the engine keeps no raw
+    // `StackTrace` object) into `x(0)` and runs `build_stacktrace` — the only shape
+    // `sys_core_fold` keeps a cooked trace for.
     //
     // ORACLE: `cap(2) = {error,{case_clause,2},[{stacktrace,cap,1,[{file,"stacktrace.erl"},{line,27}]} | <host frames>]}`.
-    // M1 captures no stacktrace, so a landed exception has `x(2) = NIL`, and C's
-    // `build_stacktrace` short-circuits a NIL raw trace to NIL
-    // (`get_trace_from_exc(NIL) == NULL`, `beam_common.c:1219-1223`). The engine
-    // therefore returns the oracle's class and reason with an EMPTY cooked trace —
-    // the documented "no stacktrace capture" gap, never a wrong reason.
+    // The raise rebuilt the machine's pre-unwind snapshot
+    // (`Machine::raise_snapshot`), and `build_stacktrace` cooks it even though the
+    // raw trace is `NIL`, so `S` is the exception's own frames: the raising `cap/1`
+    // first. The engine's list is the oracle's **prefix** — the trailing host
+    // `init:*`/`erl_eval` frames live outside this run — and the class and the
+    // reason are oracle-exact.
     let module = stacktrace_module();
     let mut ctx = MinimalContext::new();
     assert_eq!(
@@ -497,11 +550,16 @@ fn build_stacktrace_fixture_cooks_a_nil_raw_trace_to_nil() {
         &[atom_term(&module, "case_clause"), make_small(2)],
     )
     .unwrap();
+    let location = location(&mut ctx, &module, "stacktrace.erl", 27);
+    let item = frame(&mut ctx, &module, "cap", 1, location);
+    let frames = terms::make_list(&mut ctx, &[item]).unwrap();
     let expected =
-        terms::make_tuple(&mut ctx, &[atom_term(&module, "error"), reason, NIL]).unwrap();
+        terms::make_tuple(&mut ctx, &[atom_term(&module, "error"), reason, frames]).unwrap();
     assert!(
         cmp(actual, expected, &module.atom_table).is_eq(),
-        "cap(2) must be {{error,{{case_clause,2}},[]}} (M1: no stacktrace capture)"
+        "cap(2) must be \
+         {{error,{{case_clause,2}},[{{stacktrace,cap,1,[{{file,\"stacktrace.erl\"}},{{line,27}}]}}]}} \
+         — the raise-snapshot frames the engine derives"
     );
 }
 
@@ -957,17 +1015,17 @@ fn old_style_catch_builds_the_exit_tuple_without_a_stacktrace() {
 }
 
 #[test]
-fn the_try_catch_class_reason_stacktrace_shape_runs_but_the_trace_is_empty() {
+fn the_try_catch_class_reason_stacktrace_shape_cooks_the_raise_snapshot() {
     // `trace(X) -> try cc(X) catch C:R:S -> {C, R, S} end.`
     // ORACLE: `excpaths:trace(b) =
     //   {error,{case_clause,b},
     //    [{excpaths,cc,1,[{file,"excpaths.erl"},{line,52}]},
     //     {excpaths,trace,1,[{file,"excpaths.erl"},{line,71}]} | <host frames>]}`.
-    // M1 captures no stacktrace, so a landed exception has `x(2) = NIL`; C's
-    // `build_stacktrace` short-circuits a NIL raw trace to NIL
-    // (`beam_common.c:1219-1223`), so the engine reproduces the oracle's `[]`
-    // exactly on the *compiled* path and the `S` element is the only divergence
-    // (the class and the reason are oracle-exact). See the fixture report.
+    // The engine lands no raw stacktrace (`x(2) = NIL`), but it cooks its
+    // raise-snapshot frames, so `S` is exactly the oracle's leading items: the
+    // raising `cc/1` first, then its live caller `trace/1`, innermost-first. The
+    // trailing host frames live outside this run; the class and the reason are
+    // oracle-exact.
     let mut host = excpaths_host();
     let b = host.intern("b");
     let got = host
@@ -981,9 +1039,254 @@ fn the_try_catch_class_reason_stacktrace_shape_runs_but_the_trace_is_empty() {
         cmp(terms::tuple_element(reason, 1).unwrap(), b, host.atom_table()).is_eq(),
         "the reason's payload is the failing value `b`"
     );
+
+    let module = host.load("excpaths").expect("excpaths is registered");
+    let cc_location = location(&mut host, &module, "excpaths.erl", 52);
+    let cc_item = frame(&mut host, &module, "cc", 1, cc_location);
+    let trace_location = location(&mut host, &module, "excpaths.erl", 71);
+    let trace_item = frame(&mut host, &module, "trace", 1, trace_location);
+    let expected = terms::make_list(&mut host, &[cc_item, trace_item]).unwrap();
+    let cooked = terms::tuple_element(got, 2).expect("the S element");
+    assert!(
+        cmp(cooked, expected, host.atom_table()).is_eq(),
+        "the cooked `S` must be the raise-snapshot frames \
+         [{{excpaths,cc,1,[{{file,\"excpaths.erl\"}},{{line,52}}]}},\
+         {{excpaths,trace,1,[{{file,\"excpaths.erl\"}},{{line,71}}]}}]"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The caught-`S` stacktrace: `try erlang:error(badarg) catch C:R:S -> S` over
+// the committed `catchtrace.beam` fixture
+// ---------------------------------------------------------------------------
+
+/// The committed oracle fixture (produced by `erlc catchtrace.erl`).
+const CATCHTRACE_BEAM: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/catchtrace.beam"
+);
+
+/// A [`ModuleHost`] with `catchtrace` registered (the shared-atom host seeds the
+/// well-known atoms — `file`/`line` included — on load).
+fn catchtrace_host() -> ModuleHost {
+    let mut host = ModuleHost::new(".");
+    host.register("catchtrace", CATCHTRACE_BEAM);
+    host
+}
+
+/// The name of the atom `term`, resolved through the host's shared atom table.
+fn atom_name_at(host: &ModuleHost, term: Eterm) -> String {
+    assert!(
+        is_atom(term),
+        "a stacktrace field must be an atom, got {term:?}"
+    );
+    host.atom_table()
+        .name(atom_val(term))
+        .unwrap_or_else(|| panic!("the shared atom table does not name {term:?}"))
+        .to_string()
+}
+
+/// Reads an Erlang string (a proper list of code points) into a Rust `String`.
+fn erl_string(term: Eterm) -> String {
+    let codes: Vec<u32> = terms::list_elements(term)
+        .expect("an Erlang string is a proper list")
+        .into_iter()
+        .map(|code| {
+            assert!(
+                is_small(code),
+                "a string code point must be a small integer, got {code:?}"
+            );
+            signed_value(code) as u32
+        })
+        .collect();
+    codes
+        .iter()
+        .map(|&code| char::from_u32(code).expect("a string code point is a valid char"))
+        .collect()
+}
+
+/// The `(Module, Function, Arity, File, Line)` view of one cooked stacktrace item.
+///
+/// The location is the oracle's `[{file,Name},{line,N}]`; a frame with no location
+/// (the oracle's `{init,start_it,1,[]}`) yields an empty file and line `0`.
+fn frame_fields(host: &ModuleHost, item: Eterm) -> (String, String, i64, String, i64) {
     assert_eq!(
-        terms::tuple_element(got, 2).unwrap(),
-        NIL,
-        "M1 keeps no raw stacktrace, so the cooked `S` is []"
+        terms::tuple_arity(item).ok(),
+        Some(4),
+        "a cooked stacktrace item is the 4-tuple {{M,F,A,Location}}: {item:?}"
+    );
+    let module = atom_name_at(host, terms::tuple_element(item, 0).expect("module"));
+    let function = atom_name_at(host, terms::tuple_element(item, 1).expect("function"));
+    let arity_term = terms::tuple_element(item, 2).expect("arity");
+    assert!(
+        is_small(arity_term),
+        "a frame arity must be a small integer, got {arity_term:?}"
+    );
+    let arity = signed_value(arity_term);
+    let location = terms::tuple_element(item, 3).expect("location");
+    if is_nil(location) {
+        return (module, function, arity, String::new(), 0);
+    }
+    let pairs = terms::list_elements(location).expect("the location is a proper list");
+    assert_eq!(
+        pairs.len(),
+        2,
+        "the location must be [{{file,Name}},{{line,N}}], got {pairs:?}"
+    );
+    let file_pair = pairs[0];
+    let line_pair = pairs[1];
+    assert_eq!(
+        atom_name_at(host, terms::tuple_element(file_pair, 0).expect("the file key")),
+        "file",
+        "the location's first pair must be {{file,Name}}"
+    );
+    let file = erl_string(terms::tuple_element(file_pair, 1).expect("the file name"));
+    assert_eq!(
+        atom_name_at(host, terms::tuple_element(line_pair, 0).expect("the line key")),
+        "line",
+        "the location's second pair must be {{line,N}}"
+    );
+    let line_term = terms::tuple_element(line_pair, 1).expect("the line number");
+    assert!(
+        is_small(line_term),
+        "a frame line must be a small integer, got {line_term:?}"
+    );
+    (module, function, arity, file, signed_value(line_term))
+}
+
+/// Renders cooked frames in the flat `Module|Function|Arity|File|Line` form the
+/// oracle helper below prints (frames joined by `;`), so the engine's list and the
+/// oracle's can be compared as strings.
+fn render_frames(frames: &[(String, String, i64, String, i64)]) -> String {
+    frames
+        .iter()
+        .map(|(module, function, arity, file, line)| {
+            format!("{module}|{function}|{arity}|{file}|{line}")
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// The `catchtrace`-module frames the system `erl` cooks for `run/0` and `run2/0`,
+/// rendered in [`render_frames`]'s flat form; `None` when no runnable `erl` is on
+/// `PATH` (the caller skips loudly). A spawned `erl` that exits non-zero is a
+/// **harness** failure, not "no oracle" — it panics with the captured stderr so a
+/// broken oracle can never masquerade as a silent skip.
+fn oracle_catchtrace_frames() -> Option<(String, String)> {
+    let eval = concat!(
+        "Pick = fun(L) -> [X || {catchtrace,_,_,_} = X <- L] end, ",
+        "Show = fun(L) -> lists:flatten(lists:join(\";\", ",
+        "[io_lib:format(\"~s|~s|~w|~s|~w\", [M, atom_to_list(FN), A, ",
+        "proplists:get_value(file, Loc), proplists:get_value(line, Loc)]) ",
+        "|| {M,FN,A,Loc} <- Pick(L)])) end, ",
+        "io:format(\"~s~n~s~n\", [Show(catchtrace:run()), Show(catchtrace:run2())]), halt()."
+    );
+    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+    let output = Command::new("erl")
+        .args(["-noshell", "-pz", fixtures, "-eval", eval])
+        .output()
+        .ok()?;
+    assert!(
+        output.status.success(),
+        "the system `erl` exited {} for `{eval}`\n  stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut lines = text.lines();
+    let run = lines.next().unwrap_or_default().to_string();
+    let run2 = lines.next().unwrap_or_default().to_string();
+    Some((run, run2))
+}
+
+#[test]
+fn the_caught_stacktrace_names_the_raising_function_and_its_live_callers() {
+    // The fixture's two caught-`S` shapes:
+    //   run()  = `try erlang:error(badarg) catch _C:_R:S -> S end`
+    //   run2() = `try raise_badarg() catch _C:_R:S -> S end`
+    // with `raise_badarg() -> erlang:error(badarg).`
+    //
+    // ORACLE (`erl -noshell -pz <fixtures> -eval 'catchtrace:run()'`):
+    //   run()  = [{catchtrace,run,0,[{file,"catchtrace.erl"},{line,20}]} | <host frames>]
+    //   run2() = [{catchtrace,raise_badarg,0,[{file,"catchtrace.erl"},{line,26}]},
+    //             {catchtrace,run2,0,[{file,"catchtrace.erl"},{line,23}]} | <host frames>]
+    // The engine keeps no raw `StackTrace` object, but the raise rebuilt the machine's
+    // pre-unwind frame chain (`Machine::raise_snapshot`), and the handler's
+    // `build_stacktrace` cooks it — so the caught `S` is the oracle's own **leading
+    // frames**, never `[]`: the raising function first, then its live callers
+    // innermost-first. The engine's list is a strictly-shorter prefix of the oracle's
+    // (the trailing host `init:*` frames live outside this run).
+    let mut host = catchtrace_host();
+
+    let run = host
+        .call("catchtrace", "run", &[])
+        .expect("run/0 must return its caught S");
+    let run_frames: Vec<_> = terms::list_elements(run)
+        .expect("S is a list")
+        .iter()
+        .map(|&item| frame_fields(&host, item))
+        .collect();
+    assert_eq!(
+        run_frames,
+        vec![(
+            "catchtrace".to_string(),
+            "run".to_string(),
+            0,
+            "catchtrace.erl".to_string(),
+            20
+        )],
+        "run/0's caught S must name the raising function `catchtrace:run/0` first \
+         (the raising call is inline in the try body)"
+    );
+
+    let run2 = host
+        .call("catchtrace", "run2", &[])
+        .expect("run2/0 must return its caught S");
+    let run2_frames: Vec<_> = terms::list_elements(run2)
+        .expect("S is a list")
+        .iter()
+        .map(|&item| frame_fields(&host, item))
+        .collect();
+    assert_eq!(
+        run2_frames,
+        vec![
+            (
+                "catchtrace".to_string(),
+                "raise_badarg".to_string(),
+                0,
+                "catchtrace.erl".to_string(),
+                26
+            ),
+            (
+                "catchtrace".to_string(),
+                "run2".to_string(),
+                0,
+                "catchtrace.erl".to_string(),
+                23
+            ),
+        ],
+        "run2/0's caught S must name `raise_badarg/0` first, then its live caller `run2/0`"
+    );
+
+    // Oracle cross-check: re-derive the same frames from the system `erl` (skip
+    // loudly when it is absent). The oracle filters its own `S` to the `catchtrace`
+    // frames and prints them flat, so a drift in any field — module, function,
+    // arity, file or line — fails here too.
+    let Some((oracle_run, oracle_run2)) = oracle_catchtrace_frames() else {
+        eprintln!(
+            "SKIP exceptions::the_caught_stacktrace_names_the_raising_function_and_its_live_callers \
+             oracle half: no `erl` oracle on PATH"
+        );
+        return;
+    };
+    assert_eq!(
+        render_frames(&run_frames),
+        oracle_run,
+        "run/0's cooked S must equal the oracle's leading frames"
+    );
+    assert_eq!(
+        render_frames(&run2_frames),
+        oracle_run2,
+        "run2/0's cooked S must equal the oracle's leading frames"
     );
 }
