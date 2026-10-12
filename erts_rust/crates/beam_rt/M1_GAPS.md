@@ -531,22 +531,23 @@ The residual exposure is a live term held **outside** `process.regs` — a Rust 
 * **The one allocation source here:** `Runtime::alloc_words` (`runtime.rs` → `self.arena`), also reached by `RuntimeContext::alloc_words`, `runner/budget.rs`, `Runtime::materialize`/`charlist`; mailbox `Queue` payloads are copied in by `copy_struct`.
 
 ### Pinning the exposure: the running-window collections are measured, the stale holder is not
-With the fun-image guard's per-function narrowing applied, the A.9 E0 self-host shape
+The measurement that pins the exposure needs the per-function narrowing re-applied (it is **not** in
+the tree; the section at the end of this file states the tree's current state): with it, the A.9 E0
+self-host shape
 (`selfhost:compile_self/0` → `compile:file/2` with `no_spawn_compiler_process`) runs **exactly two**
 collections. Both are at the **running** machine's own `ensure_heap_full` admission point and both at
-nested-run depth 0 — the temporary counter incremented in `run_export_blocking`/`run_label_blocking`/
-`apply_fun` never reported a nested run in flight at a collection:
+nested-run depth 0 — a depth counter over `run_export_blocking`/`run_label_blocking`/`apply_fun`
+reports no nested run in flight at a collection:
 
 | # | pid | `current_module` | heap need | door | depth |
 |---|---|---|---|---|---|
 | 1 | `ProcessId{number:2,serial:0}` | `selfhost` | 2 | `ensure_heap_full` | 0 |
 | 2 | `ProcessId{number:3,serial:0}` | `epp` | 2 | `ensure_heap_full` | 0 |
 
-No `alloc_words_rooted` collection and no narrow `ensure_heap` collection ever runs, and no
-`halt_process_gc` refusal ever fires (every collection **succeeded** — instrumenting every
-`halt_process_gc` site and `collect_or_grow`'s `Err` arm produced zero markers). Skipping collection 1
-(`BEAM_GC_SKIP=selfhost`) still aborts; skipping collection 2 (`BEAM_GC_SKIP=epp`) still aborts;
-skipping **both** (`BEAM_GC_SKIP=*`) replaces the SIGABRT with the default scheduled shape's
+No `alloc_words_rooted` collection and no narrow `ensure_heap` collection ever runs, and neither door
+ever refuses a collection (no `halt_process_gc` refusal, no `collect_or_grow` `Err` arm — both
+collections **succeeded**). Suppressing collection 1 alone still aborts; suppressing collection 2 alone
+still aborts; suppressing **both** replaces the SIGABRT with the default scheduled shape's
 `*** Internal compiler error ***` / `exception exit: badarg` (prints `3`, exit 0) — so the corruption is
 collection-driven in either door and the detector (a `beam_term::class()` on a stale word, raising
 `invalid boxed header subtag`, `0x2` in some runs and `0x12` — the `ErlHeapBits` header a later
@@ -555,17 +556,14 @@ allocation reused that from-space block — in others) fires only once the from-
 held one constant small immediate, so the park-window root publication
 (`runner/run.rs::publish_parked_roots` + `RuntimeContext::resync_parked_roots`) is not the missing link
 and `Machine::args_scratch` is documented as left empty by the dispatcher
-(`../beam_engine/src/machine/mod.rs`). The surviving holder is a Rust local the in-flight call chain
-keeps outside the published `{x, stack, fr}` set, and the concrete candidate is `beam_bifs`' fast-path
-loop BIF accumulator — `../beam_bifs/src/lists.rs::foldl3`'s `acc`/`cur`/`elem` (whose `cur = cdr(cur)`
-re-reads the cons tail *after* `ctx.call_fun`), with the same shape in `filter2`/`foldr3`/`all2`/`any2`.
-Two seams would close it and **both are outside this node's write scope**: thread the machine's root set
-(or a root-refresh seam) into `ExecutionContext::call_bif`
-(`../beam_engine/src/interpreter/bif.rs:188-193`, which today publishes nothing), so a `beam_bifs` loop
-BIF can keep its accumulators reachable across the nested call; or make those loop BIFs allocate their
-accumulators through a rooted seam instead of Rust locals. Until then the fun-image half of
-`module_observes_its_call_site` stays **module-wide**, both `selfhost/*` cases stay the recorded
-`unsupported: opcode: run: process blocked (no message available)` gap, and the recorded cause in
+(`../beam_engine/src/machine/mod.rs`). The holder is a Rust local the in-flight call chain keeps outside
+the published `{x, stack, fr}` set, and the leading candidate is a `beam_bifs` fast-path loop BIF
+accumulator — `../beam_bifs/src/lists.rs::foldl3`'s `acc`/`cur`/`elem` (whose `cur = cdr(cur)` re-reads
+the cons tail *after* `ctx.call_fun`), with the same shape in `filter2`/`foldr3`/`all2`/`any2`.
+The disposition of the two collections — what the root-set audit eliminated, the leading (not yet proven)
+holder, and the `beam_bifs`-owned fix — is the section at the end of this file. Until that fix lands the
+fun-image half of `module_observes_its_call_site` stays **module-wide**, both `selfhost/*` cases stay the
+recorded `unsupported: opcode: run: process blocked (no message available)` gap, and the recorded cause in
 `tools/differential/known-gaps.txt` (an unpublished live `Machine::pending_exception`) is inaccurate —
 the parked reason **is** rooted (see the running-window bullet in [`src/context/CONTEXT.md`](src/context/CONTEXT.md)).
 
@@ -584,19 +582,22 @@ the parked reason **is** rooted (see the running-window bullet in [`src/context/
 * **`beam_bifs` — the registry dispatch cost and the hook-set drift risk** — the per-lookup owned-`String` key tuples (`contains` + `lookup` on the dispatch path) are the largest attributable residual; a borrowed-key `lookup(&str, &str, u32)` would remove them. This crate's `uses_*` gates delegate to `beam_bifs::hook_sets`' exported `needs_*`/`*_BIFS` tables, so a new consumer is picked up automatically.
 
 
-## PIN measurement — the stale word on the A.9 in-machine self-host route (A.9)
+## The stale word on the A.9 in-machine self-host route (A.9): what is eliminated, and the leading holder
 
 Current state: the call-site guard is **module-wide** (`module_observes_its_call_site`), so both
 `selfhost/*` differential cases report the honest typed gap
 (`unsupported: opcode: run: process blocked (no message available)`), never a wrong result. The
-per-function narrowing is NOT applied.
+per-function narrowing is **not** applied: re-applying it admits `compile:*` in-machine on the
+scheduled, non-relocation-exempt route and the run then corrupts (SIGABRT `invalid boxed header subtag
+0x12`, exit 134; exit 101 under `BEAM_RT_TIER=interpreter`) instead of reporting the gap.
 
-Self-contained reproducer (no differential harness needed):
+Reproducer of the corruption (needs the narrowing re-applied first; the tree ships the module-wide
+guard, so it does not fire as-is):
 
     SH=$TMPDIR/selfhost_repro; mkdir -p $SH
     # write the corpus' `selfhost` module source (tools/differential/src/corpus/selfhost.rs)
     erlc -o $SH $SH/selfhost.erl
-    <guard narrowed, see git show b3ae6c00bd>
+    # (narrow `module_observes_its_call_site` to per-function for term_to_binary/external_size)
     ./erts_rust/target/debug/beam_rt run $SH/selfhost.beam selfhost:compile_self/0
     # default tier: SIGABRT 134, `class: invalid boxed header subtag 0x12`
     # BEAM_RT_TIER=interpreter: panic, exit 101, same message
@@ -604,8 +605,8 @@ Self-contained reproducer (no differential harness needed):
 Measured facts (first-hand, this worktree):
 
 * **Both collections are the slice's own machine's `test_heap` admission point** — captured with
-  `Backtrace::force_capture()` inside `context/gc.rs::ensure_heap_full`. Neither is an
-  `alloc_words_rooted` collection and neither is a park/delivery collection. `heap_need = 2`,
+  a backtrace taken inside `context/gc.rs::ensure_heap_full`. Neither is an `alloc_words_rooted`
+  collection and neither is a park/delivery collection. `heap_need = 2`,
   `x_len = 1024`, `fr_len = 1024`, `stack_len = 14` (`selfhost`, pid 2) and `9` (`epp`, pid 3).
   The full-root door publishes every x slot, the whole stack and the whole FR file
   (`publish_roots_full`) and scatters all three back, with no slice-length mismatch.
@@ -615,8 +616,9 @@ Measured facts (first-hand, this worktree):
   `beam_bifs::lists::foldl3` (`crates/beam_bifs/src/lists.rs:1356`) → `FunBridge::call_fun`
   (`src/context/bridges.rs:163`) → `RuntimeContext::apply_fun` (`src/context/mod.rs:2767`) →
   `with_relocation_exempt` → `run_label_blocking` → `Machine::run_loop_with_label`.
-* **The stale word itself.** A term-validity watcher in `Machine::eval_test` (temporary, removed)
-  reports the operand as a boxed pointer whose target's first word is *itself* a boxed pointer:
+* **The stale word itself.** A term-validity watch on `Machine::eval_test`'s operands (an ad-hoc
+  measurement, not part of the tree) reports the operand as a boxed pointer whose target's first word
+  is *itself* a boxed pointer:
 
       WATCHBAD eval_test IsAtom arg0 = 0x78c8303fc422 -> invalid boxed header subtag 0x12 (header word 0x78c81dc70952)
         current_code=Some((8, 6)) context=6 x_ptr=...
@@ -633,37 +635,43 @@ Measured facts (first-hand, this worktree):
   a no-op. The corruption therefore originates in the **outer** slice machine's own `test_heap`
   collection, and surfaces later when a value it left unrelocated is fed into a `lists:foldl/3`.
 
-Conclusion (current): the implicated holder is a `beam_bifs` fast-path **Rust local held across a
-`ctx.call_fun` boundary** — `lists:foldl/3`'s `acc`/`cur`/`elem` (and the same shape in
-`filter/2`, `foldr/3`, `all/2`, `any/2`). Confirming it needs `beam_bifs`-side instrumentation,
-which this node does not own. The minimal sound fix is therefore **not** a `beam_rt`/`beam_engine`/
-`beam_process` change: a term a `beam_bifs` BIF holds across `ctx.call_fun`/`ExecutionContext` must
-be **published as a root** for the duration of that nested run (or the nested run must be entered
-with the process's `relocation_exempt` flag observed by the admission door). Owned by `beam_bifs`.
+**The machine's whole `RootSet` is correctly relocated at both doors (measured).** A one-off from-space
+audit run at the `ensure_heap_full` door snapshots the machine's whole root set — all 1024 `x` slots, the
+whole stack, all 1024 FR slots — records the from-space the collection is about to abandon (the
+nursery's live `[base, top)` plus the mature live words), and flags any scattered word that came back
+**unchanged** while still pointing into that abandoned range; a correct relocation always rewrites
+such a word, so the check is exact (no heuristics, no false positives). It is **silent at both
+collections**: every word the door publishes is either relocated or was never a from-space pointer.
 
-## The from-space audit: the slice door's root hand-off is sound; the producer is outside `RootSet`
+That eliminates, by measurement:
 
-`beam_engine::poison` (off by default, `BEAM_RT_POISON`) plus the host window in
-`src/context/gc.rs::ensure_heap_full` record the from-space the collection is about to abandon
-(the nursery's live `[base, top)`, plus the mature live words), snapshot the machine's whole
-`RootSet`, and audit the scattered roots for a word that came back **unchanged** yet still points
-into the abandoned range. A correct relocation always rewrites such a word, so the audit is
-exact — no false positives, no heuristics.
+* a mis-split in `beam_process::Registers::gather_roots`/`scatter_roots` and
+  `Process::run_rooted_collection`'s write-back, and
+* `publish_roots_full`/`scatter_roots_full` at that admission door.
 
-Measured on the A.9 in-machine self-host reproducer
-(`beam_rt run <selfhost.beam> selfhost:compile_self/0`, `BEAM_RT_TIER=interpreter`,
-`BEAM_RT_POISON=1`): the reproducer still corrupts (`beam_term::ops: invalid boxed header subtag
-0x32`) and the audit is **silent at both collections**. So every word of `roots.x` (1024 slots),
-`roots.stack` and `roots.fr` (1024 slots) that the slice's own admission door published back was
-either relocated or was never a from-space pointer.
+So the holder of the abandoned word is **outside the process root set** — not `{x, stack, fr}`, and
+not the mailbox/dict/saved-args/signals that `Process::collect` gathers.
 
-The consequence is that the "the machine published an unpublished `x`/stack/FR slot, or
-`publish_roots_full`/`scatter_roots_full` mis-split the files" class is **eliminated by
-measurement**: the slice door's hand-off is not the leak. The holder of the abandoned word is
-therefore **outside `RootSet`** — reachable neither by `publish_roots_full` nor by
-`Process::collect`'s gather (registers, mailbox, dict, saved args, signals) — which is exactly the
-"a `beam_bifs` Rust local held across a nested `call_fun`" producer the section above names.
+**Eliminated by measurement.** `Machine::pending_exception` is **not** the holder: across the whole run
+(2000+ `with_roots` windows) it held one constant small immediate, never a heap term, so rooting it
+cannot be the fix — and the park-window publication
+(`runner/run.rs::publish_parked_roots` + `RuntimeContext::resync_parked_roots`) is therefore not the
+missing link either. `Machine::args_scratch` is documented as left empty by the dispatcher
+(`../beam_engine/src/machine/mod.rs`).
 
-The minimal sound change is unchanged and owned by `beam_bifs`: publish the BIF's live terms as a
-process root for the duration of the nested fun application (the existing
-`beam_process::Registers::extra_roots` container is the seam for exactly such a host-held root).
+**Leading candidate — NOT yet proven.** A `beam_bifs` fast-path BIF's Rust-local accumulator held
+across a nested `ExecutionContext::call_fun`: `../beam_bifs/src/lists.rs::foldl3`'s `acc`/`cur`/`elem`
+(whose `cur = cdr(cur)` re-reads the cons tail *after* the nested call, `crates/beam_bifs/src/lists.rs:1356`),
+with the same shape in `filter/2`, `foldr/3`, `all/2`, `any/2`. The corrupt term is read in a nested
+machine built from exactly that BIF's locals (the bullet above), so the shape of the failure is: the
+**outer** slice machine's own collection relocates the heap, leaves a word `foldl3` still holds
+unrelocated, and the nested machine seeded from that word then reads it. Confirming the exact local
+needs `beam_bifs`-side instrumentation, which this node does not own.
+
+**The fix is owned by `crates/beam_bifs`:** make a looping fast-path BIF's live terms a process root
+for the duration of the nested fun application. The existing `beam_process::Registers::extra_roots`
+container is the natural seam — it is gathered **after** the stack words
+(`beam_process/src/registers.rs::gather_roots`) and scattered back (`scatter_roots`), so a term placed
+there is relocated with the heap. It is **not** a `beam_rt`/`beam_engine`/`beam_process` change. Until
+it lands, the fun-image half of `module_observes_its_call_site` stays **module-wide** and both
+`selfhost/*` cases keep their recorded typed gap.
