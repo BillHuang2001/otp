@@ -124,7 +124,7 @@ compiled-`send` seam), **reference aliases** delivered end-to-end, the process c
 strategy-agnostic `AnyCollector`, and the `.beam` module MD5. The differential harness also gained the
 `ModuleEnv` case kind. Verified: `cargo build --workspace --all-targets` warning-free, the workspace
 test suite green (0 failed), the real `start.boot` still runs to `{progress,started}`, and the
-differential gate **`total=1868 agree=1864 mismatch=0 unsupported=4 skipped=0 allowed=4`** → exit 0
+differential gate **`total=1871 agree=1869 mismatch=0 unsupported=2 skipped=0 allowed=2`** → exit 0
 (identical with `BEAM_RT_TIER=interpreter`).
 - **Area:** `erts_rust/crates/beam_engine` (`src/interpreter/dispatch.rs`), `erts_rust/crates/beam_rt`
 - **Change:** the `call_ext*` → `erlang:apply/3` seam (`resolve_call_ext_apply`) now reproduces the C's
@@ -199,8 +199,40 @@ differential gate **`total=1868 agree=1864 mismatch=0 unsupported=4 skipped=0 al
 - **Area:** `erts_rust/tools/differential`
 - **Change:** a new **`ModuleEnv`** case kind — a module-run case that additionally carries an explicit
   spawn environment (so a compiled dir reaches the code path only through `-pa` in that environment,
-  not through argv) — pins the `ERL_*FLAGS` merge (contract A.6) end to end. The corpus grew to 1868
-  cases, with value invariants added for A.8 (`process_count =:= length(processes())`).
+  not through argv) — pins the `ERL_*FLAGS` merge (contract A.6) end to end. The corpus grew to 1871
+  cases (1868 at `ModuleEnv`, +3 `dist/*`), with value invariants added for A.8
+  (`process_count =:= length(processes())`).
+- **Area:** `erts_rust/crates/beam_rt` (`src/context/mod.rs`, `src/context/gc_walk.rs`,
+  `src/runner/run.rs`), `erts_rust/crates/beam_engine` (`src/machine`), `erts_rust/crates/beam_bifs`
+- **Change (the A.9 E0 closure — the in-process-compile route now runs):** both `selfhost/*` cases went
+  from typed `unsupported` to **`agree`**. The hypothesized cause (BIF-locals unpublished as roots) was
+  wrong; three real causes were found and fixed. (1) A **nested-foreign-container gap in the GC safety
+  valve**: a heap word could reach a container whose elements are off the process heap, so the
+  completeness check never saw them; a new two-phase **descend walk** (`context/gc_walk.rs`) inspects
+  such containers recursively. It is **decline-only** — it can refuse a collection, never authorize an
+  unsound one — so it cannot produce a wrong result. (2) A signal-driven **major** collection of a
+  *`Runnable`* monitor watcher: the parked receive window is now `relocation_exempt`
+  (`src/runner/run.rs`), which is a mitigation — the root fix still belongs to
+  `beam_process/src/ptab.rs`'s signal sites (they lack the host's decline predicate).
+  (3) The engine emitted a **literal `[]` stacktrace** for a raise; `Instr::BuildStacktrace` now cooks
+  the raise snapshot. Also, `~p`/`~w` now walk lists **iteratively** (a 25 000-element list previously
+  overflowed the stack), and the per-mechanism **call-site-guard narrowing** (`callee_observes_its_call_site`)
+  was re-landed *only after* the real root cause was fixed.
+- **Area:** `erts_rust/tools/differential`, `erts_rust/crates/beam_dist`
+- **Change:** a new **`CaseKind::Command`/`CommandRun`** harness stage (a case that drives a non-CLI
+  helper binary, with its own argv/env/stdin and its own resolution variable) plus
+  `beam_dist/src/bin/dist_probe.rs` (modes `ping`/`nodes`/`term`) — the gate now has **live two-node
+  loopback** coverage for contract A.5 (`dist/*`, 3 cases, all `agree`), instead of the codec-only
+  `wire` group. Built by `gate.sh` via `-p beam_dist`.
+- **Area:** `lib/compiler` (Stage 2)
+- **Change:** new module `src/beam_ssa_fus_arith.erl` (953 lines) owns arithmetic **operation fusion** —
+  Fusion 4 moved out of `beam_ssa_fus.erl` (1064 → 819 lines) plus a new **Fusion 6**
+  (div/rem/mul constant chains). A committed equivalence harness,
+  `test/beam_ssa_opt_diff_SUITE.erl`, differential-tests the fused pass against the unfused baseline
+  (default 41 040 compared calls / 0 mismatches; enlarged 273 600 / 0). Fusion 6's reach is honest and
+  narrow (one module tree-wide: `global:random_sleep/1`). A previously prose-only "996 probe modules /
+  ~156k calls" figure was **corrected** — it was never committed and does not exist as a committed
+  result.
 - **Area:** `erts/` (legacy C)
 - **Change:** the in-tree dead-source checker was extended to cover make-variable object lists,
   CT fixtures, codegen inputs, `xcomp` configs, test corpora and never-compiled `#if` regions (a
