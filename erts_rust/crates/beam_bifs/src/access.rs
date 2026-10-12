@@ -838,8 +838,8 @@ pub(crate) fn hamt_node(term: Eterm) -> Result<HamtNodeView> {
 /// `beam_alloc::Heap`, then lays out the frozen
 /// `[field_order tuple][definition][instance]` block with
 /// [`beam_term::write_record`]. `fields` are `(key-atom-term, value)` pairs in
-/// **declaration** order; the definition hash is `make_small(0)` because this
-/// crate cannot compute the C `make_hash2` value (see `beam_term::record`).
+/// **declaration** order; the cached definition hash is left as the `0`
+/// placeholder (see below).
 ///
 /// # Errors
 ///
@@ -848,11 +848,13 @@ pub(crate) fn hamt_node(term: Eterm) -> Result<HamtNodeView> {
 /// (`TermError::BadRecord` reconciled to `badarg`); otherwise propagates
 /// [`BeamError::Alloc`](beam_common::BeamError::Alloc) when `heap` cannot fit the
 /// block.
-/// Leaves the cached definition hash (definition word 2) as the `0` placeholder —
-/// a fabricated value. The `records` module must therefore build records through
-/// [`beam_codec::term::make_record`](beam_codec::term::make_record), which writes
-/// the real `compute_record_definition_hash` value (this writer is retained only
-/// because the `compare` test suite pins the record layout through it).
+/// This writer is **not** on any runtime path: `records:create/4` and
+/// `records:update/4` build through
+/// [`beam_codec::term::make_record`](beam_codec::term::make_record), which stores
+/// the real `beam_term::hashing::compute_record_definition_hash` value at
+/// definition word 2. It is retained only because the `compare` test suite pins
+/// the record layout through it (where the stored word is irrelevant —
+/// `beam_term::hashing` recomputes the definition hash rather than reading it).
 #[allow(dead_code)]
 pub(crate) fn native_record_write(
     heap: &mut Heap,

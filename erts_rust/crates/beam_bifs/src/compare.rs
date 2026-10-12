@@ -470,10 +470,13 @@ mod tests {
     // The native-record and internal-reference classes
     // -----------------------------------------------------------------------
 
-    /// `records:create(rec, r, [{a,1}], #{is_exported => true})` — built the way
-    /// `crate::records::create/4` does, i.e. through
-    /// [`access::native_record_write`], whose cached definition hash is the
-    /// placeholder `make_small(0)`.
+    /// `records:create(rec, r, [{a,1}], #{is_exported => true})`, built through
+    /// [`access::native_record_write`] so the cached definition word (word 2) is
+    /// the `0` placeholder — deliberately **not** the real hash
+    /// `crate::records::create/4` stores (that BIF builds through
+    /// `beam_codec::term::make_record`). `beam_term::hashing` recomputes the
+    /// definition hash from the definition block rather than reading word 2, so
+    /// these values pin the *recompute* path.
     ///
     /// A **one-field** record is the shape whose oracle value is stable run to run
     /// (see the test doc comment below); a record with several keys is not.
