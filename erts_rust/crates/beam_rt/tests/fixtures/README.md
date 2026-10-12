@@ -204,11 +204,11 @@ wait_forever()-> receive X -> X after infinity -> timeout end.
 Any byte change in a fixture invalidates the expected values in the tests that load it;
 re-derive them from the system `erl`, do **not** guess.
 
-## GC fixtures (`gc_loop` · `gc_ints` · `gc_floats` · `heap_growth` · `gc_payload`, committed)
+## GC fixtures (`gc_loop` · `gc_ints` · `gc_floats` · `heap_growth` · `gc_payload` · `pt_gc`, committed)
 
-These five are committed oracle fixtures for the process-heap collector
-(`tests/gc_collect.rs`, `tests/heap_growth.rs`, `tests/gc_strategy.rs` and
-`tests/gc_immix_payload.rs`):
+These six are committed oracle fixtures for the process-heap collector
+(`tests/gc_collect.rs`, `tests/heap_growth.rs`, `tests/gc_strategy.rs`,
+`tests/gc_immix_payload.rs` and `tests/persistent_term.rs`):
 
 * `gc_loop.beam` — `loop/1` tail-recursively conses every iteration (`build/1`), so a
   scheduled process really allocates; the acceptance evidence that the collector runs at the
@@ -230,11 +230,18 @@ These five are committed oracle fixtures for the process-heap collector
   point, and finally **returns the payload** (a structurally checkable term: element `i` is
   keyed `64 - i`). The witness that a collection on the mature strategy did not relocate the
   heap out from under a live term.
+* `pt_gc.beam` — `run(N)` builds the **same 64-element payload**, stores it in the node-global
+  persistent-term table (`persistent_term:put(pt_gc_key, Payload)`, so the store's raw word
+  names the process's own **young heap**), churns `N` rounds of the same short-lived garbage and
+  finally returns `persistent_term:get(pt_gc_key)` — the value read back **out of** the store.
+  The witness for `tests/persistent_term.rs::a_stored_value_survives_a_process_heap_collection`:
+  a store that kept a raw young-heap word without stabilizing it hands back a dangling/recycled
+  term (observed: a 2-element list instead of 64 elements).
 
-All five are path-free (`+deterministic`) and regenerate with the same scratch-dir recipe:
+All six are path-free (`+deterministic`) and regenerate with the same scratch-dir recipe:
 
 ```sh
-for f in gc_loop gc_ints gc_floats heap_growth gc_payload; do
+for f in gc_loop gc_ints gc_floats heap_growth gc_payload pt_gc; do
     SCRATCH="$TMPDIR/beam_rt_${f}_fix"
     rm -rf "$SCRATCH"; mkdir -p "$SCRATCH/gen"
     cp "$f.erl" "$SCRATCH/gen/"

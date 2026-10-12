@@ -1820,6 +1820,27 @@ impl<'a> RuntimeContext<'a> {
                 // store can compare keys/values **structurally** (`beam_term::eq`) — two
                 // structurally equal boxed terms are distinct heap words. No runtime
                 // borrow is held (it can coexist with everything).
+                //
+                // The store keeps its key and value as **raw `Eterm` words**, so a term a
+                // *scheduled* process supplied lives on that process's own young heap — the
+                // heap the collector relocates at the engine's heap-admission point
+                // ([`crate::context::gc`]). A raw word kept past a collection would dangle,
+                // so the two **storing** BIFs (`put/2`, `put_new/2`) copy their key and
+                // value onto the pointer-stable arena first: exactly the escape-store
+                // treatment every other runtime-level store already takes
+                // ([`Runtime::try_stabilize_escaped`]). The five **reading** BIFs are
+                // unaffected — every word they can hand back was stabilized when it was
+                // stored (a key they receive is only compared, never stored).
+                let stored_args = if Self::persistent_term_stores(module, function, arity) {
+                    let mut stabilized = Vec::with_capacity(args.len());
+                    for arg in args {
+                        stabilized.push(runtime.try_stabilize_escaped(*arg)?);
+                    }
+                    Some(stabilized)
+                } else {
+                    None
+                };
+                let args = stored_args.as_deref().unwrap_or(args);
                 let mut store = PersistentTermBridge::new(
                     Rc::clone(&runtime.persistent_terms),
                     Rc::clone(&atoms),
@@ -2042,6 +2063,28 @@ impl<'a> RuntimeContext<'a> {
     /// that read the [`PersistentTerm`](beam_bifs::PersistentTerm) seam.
     fn uses_persistent_term(module: &str, function: &str, arity: u32) -> bool {
         beam_bifs::needs_persistent_term(module, function, arity)
+    }
+
+    /// Whether `(module, function, arity)` is one of the **storing** `persistent_term:*`
+    /// BIFs — `put/2` and `put_new/2`, the only two keys of
+    /// [`PERSISTENT_TERM_BIFS`](beam_bifs::PERSISTENT_TERM_BIFS) that write a term into the
+    /// node-global store.
+    ///
+    /// The store keeps its key and value as **raw `Eterm` words** (`persistent_term.rs`), so
+    /// a term a *scheduled* process supplied would live on that process's own young heap —
+    /// the heap the collector relocates at the engine's heap-admission point
+    /// ([`crate::context::gc`]) — and a raw word kept past a collection would dangle. The
+    /// arguments of exactly these two keys are therefore copied onto the pointer-stable arena
+    /// before the call (the escape-store treatment, [`Runtime::try_stabilize_escaped`]).
+    ///
+    /// The other five keys (`get/0,1,2`, `erase/1`, `info/0`) read: every word they can hand
+    /// back was stabilized when it was stored, and the key they receive is only *compared*
+    /// (against the store's own stabilized words), never kept — so none of them needs a copy.
+    fn persistent_term_stores(module: &str, function: &str, arity: u32) -> bool {
+        matches!(
+            (module, function, arity),
+            ("persistent_term", "put" | "put_new", 2)
+        )
     }
 
     /// Whether `(module, function, arity)` is one of the runtime-coupled BIFs the
