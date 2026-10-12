@@ -896,18 +896,19 @@ impl Process {
     /// so a payload larger than the bounded nursery is still delivered — never duplicated and
     /// never truncated.
     ///
-    /// **Relocation-exempt processes** ([`Process::set_relocation_exempt`]) never take that path:
-    /// the raw `AllocKind::Heap`/`AllocKind::Message` refusal is returned **unchanged** — no
-    /// collection, no growth, no retry — because the host holds live words outside the crate root
-    /// set and relocating would recycle them. The raw refusal is exactly the signal the host's
-    /// fragment fallback keys on, so the message is still delivered (through a fragment) without
-    /// moving a word.
+    /// **A receiver whose live terms may be outside the crate root set never takes that path**
+    /// ([`Process::has_unpublished_roots`] — a **relocation-exempt** process, whose host holds live
+    /// words outside the root set, or a **`Running`** one, whose own machine is executing and whose
+    /// `regs` snapshot is therefore stale): the raw `AllocKind::Heap`/`AllocKind::Message` refusal
+    /// is returned **unchanged** — no collection, no growth, no retry — because relocating would
+    /// recycle live words. The raw refusal is exactly the signal the host's fragment fallback keys
+    /// on, so the message is still delivered (through a fragment) without moving a word.
     ///
     /// # Errors
     ///
     /// Propagates the retry's own `BeamError::Alloc` — an `AllocKind::Message` refusal — when
-    /// the payload still does not fit under the heap policy; for a relocation-exempt process it
-    /// propagates the **first** `AllocKind::Heap`/`AllocKind::Message` refusal unchanged.
+    /// the payload still does not fit under the heap policy; for a receiver with unpublished roots
+    /// it propagates the **first** `AllocKind::Heap`/`AllocKind::Message` refusal unchanged.
     pub fn deliver(
         &mut self,
         from: Eterm,
@@ -922,18 +923,19 @@ impl Process {
             Err(BeamError::Alloc(failure))
                 if matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
             {
-                // A relocation-exempt receiver must NOT collect or grow: its heap cannot be
-                // relocated against the crate root set, because the host holds live words in Rust
-                // locals / nested-Machine registers that the root set does not publish (see
-                // [`Process::set_relocation_exempt`]). Surface the RAW refusal unchanged (`kind`
+                // A receiver with unpublished roots must NOT collect or grow: its heap cannot be
+                // relocated against the crate root set — a relocation-exempt receiver's host holds
+                // live words in Rust locals / nested-Machine registers, and a **running** receiver's
+                // own machine holds them in x/stack/float registers that `regs` (a snapshot
+                // refreshed only at a heap-admission point or a park) does not yet carry (see
+                // [`Process::has_unpublished_roots`]). Surface the RAW refusal unchanged (`kind`
                 // still Heap/Message) — that is exactly what the host's fragment fallback keys on
                 // (`beam_rt::context::RuntimeContext::deliver_message` → `send_fragmented_message`),
                 // so the message is delivered through a fragment with **no** heap word moving under
-                // the host's unpublished handles.
-                if self.relocation_exempt {
+                // the unpublished handles.
+                if self.has_unpublished_roots() {
                     return Err(BeamError::Alloc(failure));
-                }
-                // The copier reports the whole graph's flat word count in the failure (as
+                }                // The copier reports the whole graph's flat word count in the failure (as
                 // bytes) — for the preflight `AllocKind::Message` refusal and the mid-copy
                 // `AllocKind::Heap` one alike — so the words the growth must cover are
                 // recoverable from it.
@@ -943,10 +945,9 @@ impl Process {
                 // this request is about to allocate, so an oversized payload needs the
                 // on-demand growth (`Process::ensure_capacity`).
                 //
-                // This branch is reached only for a **non**-exempt process: an exempt one
-                // returned above (no collect, no growth, no retry), so the heap is never moved
-                // under the host's unpublished roots.
-                //
+                // This branch is reached only for a receiver whose live terms ARE in the crate
+                // root set (not exempt, not `Running`): any other returned above (no collect, no
+                // growth, no retry), so the heap is never moved under unpublished roots.                //
                 // The growth's own error is deliberately ignored. When the policy's ceiling
                 // makes the request unreachable, `ensure_capacity` fails **fail-fast** with
                 // `AllocKind::Heap` without touching the collector; the retry below then
@@ -1053,8 +1054,11 @@ impl Process {
     /// explicitly mark behaves exactly as before. Enabling it is the host's assertion that *every*
     /// live term from this process is reachable through the crate root set (or is otherwise safe to
     /// leave un-relocated).
-    pub fn set_relocation_exempt(&mut self, exempt: bool) {
-        self.relocation_exempt = exempt;
+    ///
+    /// This flag is **one of the two** cases of the gate every delivery-driven path tests —
+    /// [`Process::has_unpublished_roots`], whose other case is a [`ProcessState::Running`] process
+    /// (whose own machine's live terms are unpublished mid-run).
+    pub fn set_relocation_exempt(&mut self, exempt: bool) {        self.relocation_exempt = exempt;
     }
 
     /// Whether this process is **relocation-exempt** (default `false`).
@@ -1064,6 +1068,33 @@ impl Process {
         self.relocation_exempt
     }
 
+    /// Whether this process's live terms may be **outside** the crate's root set, so a
+    /// **delivery-driven** collect/grow ([`Process::deliver`] and the signal builders in
+    /// `ptab.rs`) must be refused for it and the delivery routed to the heap-fragment model.
+    ///
+    /// The gate is true in exactly two cases:
+    ///
+    /// * the process is **relocation-exempt** ([`Process::set_relocation_exempt`]) — the host holds
+    ///   live terms from this young heap in Rust locals / nested-`Machine` registers that the root
+    ///   set does not publish;
+    /// * the process state is [`ProcessState::Running`] — the single-threaded scheduler sets that
+    ///   state for the one process whose own engine machine is executing
+    ///   (`crate::scheduler::slice_begin`/`slice_end`), and a running machine's live terms are
+    ///   **not** in the root set: [`Process::regs`] is a *host-published snapshot*, refreshed only
+    ///   at the engine's heap-admission points and at a park, never between them. A delivery-driven
+    ///   collection would therefore relocate the heap against a **stale** snapshot and recycle
+    ///   words the running machine (and a `beam_bifs` fast-path BIF's Rust-local accumulator) still
+    ///   points at.
+    ///
+    /// Refusing the collect/grow is **safe and bounded**: the delivery either fits the current
+    /// nursery (no relocation, no corruption) or takes the heap-fragment fallback, and the running
+    /// process's own next heap-admission point publishes the **current** roots and collects — so
+    /// nothing accumulates unboundedly. Only the **delivery-driven** entry points are gated:
+    /// [`Process::collect`]/[`Process::ensure_capacity`] are the host's admission points, which
+    /// publish the roots *before* calling them.
+    pub fn has_unpublished_roots(&self) -> bool {
+        self.relocation_exempt || self.state == ProcessState::Running
+    }
     /// Runs a safepoint collection over the whole process root set.
     ///
     /// The root set is the registers/stack **plus** the host-published extra roots
@@ -1647,8 +1678,49 @@ mod tests {
             .expect("a tiny request needs no collection"));
     }
 
-    /// [`Process::grow_nursery`] enlarges the nursery **in place**: it retains the space it
-    /// replaces (`young_space_count` grows), runs **no** collection (`minor_gcs` is unchanged)
+    /// [`Process::has_unpublished_roots`] is the delivery-collect gate, and it is true in exactly
+    /// two cases: the per-process **relocation-exempt** flag, and a **`Running`** process state
+    /// (the single-threaded scheduler's one executing process, whose live x/stack/float registers
+    /// are held outside the `regs` root snapshot). Every other state — and a fresh process — is
+    /// false, so the ordinary collect-and-grow delivery path is untouched.
+    #[test]
+    fn has_unpublished_roots_covers_the_exemption_and_a_running_process() {
+        let mut process = Process::new(pid(41)).expect("the default heap allocates");
+        assert_eq!(process.state(), ProcessState::Runnable, "a fresh process is runnable");
+        assert!(!process.is_relocation_exempt());
+        assert!(
+            !process.has_unpublished_roots(),
+            "a runnable, non-exempt process's terms are all in the crate root set"
+        );
+
+        process.set_state(ProcessState::Running);
+        assert!(
+            process.has_unpublished_roots(),
+            "the running process's live terms are outside the crate root set"
+        );
+
+        process.set_state(ProcessState::Waiting);
+        assert!(
+            !process.has_unpublished_roots(),
+            "a waiting process's roots were published at its park"
+        );
+
+        process.set_state(ProcessState::Runnable);
+        process.set_relocation_exempt(true);
+        assert!(
+            process.has_unpublished_roots(),
+            "the exemption alone is enough (the host holds live words outside the root set)"
+        );
+
+        process.set_state(ProcessState::Running);
+        process.set_relocation_exempt(false);
+        assert!(
+            process.has_unpublished_roots(),
+            "the running state alone is enough (clearing the exemption changes nothing)"
+        );
+    }
+
+    /// [`Process::grow_nursery`] enlarges the nursery **in place**: it retains the space it    /// replaces (`young_space_count` grows), runs **no** collection (`minor_gcs` is unchanged)
     /// and relocates **no** live term (a captured word keeps its exact address and value).
     ///
     /// It also pins the absence of a relocation-exempt guard: growth is legal for an exempt

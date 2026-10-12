@@ -32,13 +32,15 @@
 //!   ([`Process::ensure_capacity`](beam_process::Process) — the shared
 //!   `grow_receiver_for_signal`) and the build is retried once, so the message ends up on the
 //!   receiver's own heap;
-//! * a **relocation-exempt** receiver
-//!   ([`Process::set_relocation_exempt`](beam_process::Process)) must **not** have its heap move
-//!   (the host holds live words outside the crate's root set, so relocating would recycle them),
-//!   so the payload is built on a 64-word scratch arena and copied **whole** into a fresh
-//!   `beam_message::HeapFragment` the enqueued `Message` owns (`enqueue_fragment_payload`): no
-//!   collection, no growth, and **nothing written on the receiver's heap** at all.
-//!
+//! * a receiver whose live terms may be **outside** the crate's root set — **relocation-exempt**
+//!   ([`Process::set_relocation_exempt`](beam_process::Process)), or **`Running`**
+//!   ([`Process::has_unpublished_roots`](beam_process::Process): the single-threaded scheduler's
+//!   one executing process, whose `regs` snapshot is refreshed only at a heap-admission point or a
+//!   park, never between them) — must **not** have its heap move (relocating would recycle the
+//!   live words the root set does not carry), so the payload is built on a 64-word scratch arena
+//!   and copied **whole** into a fresh `beam_message::HeapFragment` the enqueued `Message` owns
+//!   (`enqueue_fragment_payload`): no collection, no growth, and **nothing written on the
+//!   receiver's heap** at all.//!
 //! The fragment model is the C's: `erl_proc_sig_queue.c` builds every signal message into the
 //! message's **own** heap fragment, so a signal that cannot live on the receiver's heap is not
 //! lost — the exempt arm reproduces that model exactly where the M1 heap layout allows it.
@@ -65,7 +67,16 @@
 //!    same refusal on a receiver that is **not** exempt takes the *other* arm: one collection,
 //!    an on-demand nursery growth and a relocation, and the message lands on the receiver's
 //!    (new) heap with no fragment — the fallback did not replace the grow-and-retry path.
-//!
+//! 6. [`a_running_receiver_refuses_the_delivery_collect_and_the_fragment_fallback_still_delivers`]
+//!    — the **message-delivery** half of the same gate: `Process::deliver` to a **`Running`**
+//!    (not exempt) receiver surfaces the raw refusal and leaves the nursery untouched, and the
+//!    host's fragment fallback (`beam_message::send_fragmented`) still delivers the message.
+//! 7. [`a_running_receiver_gets_a_down_through_a_heap_fragment_without_collecting`] — a
+//!    **`Running`** (not exempt) watcher whose queued DOWN cannot be built on its heap at its
+//!    schedule-in gets the DOWN fragment-resident, with no collection and no relocation.
+//! 8. [`a_waiting_receiver_still_collects_and_grows_on_the_same_refusal`] — the **control**: the
+//!    identical refusal on the identical receiver in `ProcessState::Waiting` still takes the
+//!    collect-and-grow arm, so the gate is the *running* state, not a blanket refusal.//!
 //! Cases 1 and 2 are the regression of the apply-time fallback: on the pre-fix code each of them
 //! fails with the raw `BeamError::Alloc(AllocFailure { requested: 32, kind: Heap })` returned out
 //! of `terminate`, with **no** message queued (the signal was lost) — verified by running this
@@ -87,16 +98,15 @@
 //! forced by capacity, never by timing.
 
 use beam_alloc::Heap;
-use beam_common::Result;
+use beam_common::{AllocKind, BeamError, Result};
 use beam_gc::{next_heap_size, HeapPolicy};
-use beam_message::Message;
+use beam_message::{send_fragmented, CopyContext, Message, OffHeapTable};
 use beam_process::prelude::*;
 use beam_term::compare;
 use beam_term::list::ptr_val;
 use beam_term::prelude::{
     make_atom, make_small, size_object, tuple_element, tuple_size, AtomTable, Eterm,
 };
-
 /// The words a `{'EXIT', From, Reason}` tuple occupies on the receiver's heap: `1` header plus
 /// the three elements. This is also what the `{'DOWN', …}` build allocates **first** — its
 /// boxed monitor reference is four words (`1` header + `3` payload) — so one number covers
@@ -787,6 +797,328 @@ fn a_non_exempt_receiver_collects_relocates_and_grows_instead_of_using_a_fragmen
             .collector()
             .mature_contains(ptr_val(payload)),
         "the new message is not a promoted (mature) object"
+    );
+
+    Ok(())
+}
+
+/// The **message-delivery** half of the gate: `Process::deliver` to a **`Running`** (not
+/// relocation-exempt) receiver must not collect or grow either.
+///
+/// The single-threaded scheduler runs exactly one process, so while `pid` is `Running` the only
+/// code that can deliver to it is its **own** engine machine — whose live x/stack/float registers
+/// are *not* in `Process::regs` (a host-published snapshot, refreshed at a heap-admission point or
+/// at a park and never between them), and whose Rust-local accumulators are not published at all.
+/// A collect-grow here would relocate the heap against that stale snapshot and recycle live words.
+///
+/// So the delivery surfaces the **raw** `BeamError::Alloc` refusal — the exact signal the host's
+/// fragment fallback keys on — leaving the nursery untouched, and the fallback itself
+/// (`beam_message::send_fragmented` driven through
+/// [`Process::heap_and_mailbox_mut`](beam_process::Process::heap_and_mailbox_mut), the shape
+/// `beam_rt`'s `send_fragmented_message` drives) still delivers the message, fragment-resident.
+#[test]
+fn a_running_receiver_refuses_the_delivery_collect_and_the_fragment_fallback_still_delivers(
+) -> Result<()> {
+    let (mut table, names, atoms) = table_with_names();
+    let mut src = source();
+    let (receiver, filler) = drained_receiver(&mut table, filler_term(&mut src))?;
+    assert_head_cannot_fit(&mut table, receiver, &atoms);
+    // The payload the receiver's three free words cannot take: the same four-word tier the signal
+    // head build needs.
+    let payload = src.tuple(&[make_small(100), make_small(101), make_small(102)])?;
+    assert_eq!(
+        size_object(payload),
+        HEAD_WORDS,
+        "the fixture's payload is exactly the refused tier"
+    );
+
+    let process = table.get_mut(receiver).expect("the receiver is live");
+    process.set_state(ProcessState::Running);
+    assert!(
+        !process.is_relocation_exempt(),
+        "the gate here is the *running* state, not the exemption flag \
+         (the predicate itself is pinned by `process::tests::has_unpublished_roots_*`)"
+    );    let (minor_before, base_before, used_before) = nursery(&table, receiver);
+    let mature_before = mature_used(&table, receiver);
+
+    // The delivery surfaces the RAW refusal and enqueues nothing.
+    match table.deliver_simple(receiver, pid(99).to_eterm(), payload) {
+        Err(BeamError::Alloc(failure)) => assert!(
+            matches!(failure.kind, AllocKind::Heap | AllocKind::Message),
+            "the raw refusal keeps its Heap/Message kind, got {:?}",
+            failure.kind
+        ),
+        other => panic!("expected the raw allocation refusal, got {other:?}"),
+    }
+    assert_eq!(
+        table.get(receiver).expect("the receiver is live").mailbox().len(),
+        1,
+        "the refused delivery enqueued nothing (only the fixture's filler is queued)"
+    );
+
+    // ... and the heap is untouched: no collection, no growth, no relocation, nothing promoted.
+    let (minor_after, base_after, used_after) = nursery(&table, receiver);
+    assert_eq!(
+        minor_after, minor_before,
+        "a delivery must not collect a running receiver"
+    );
+    assert_eq!(
+        base_after, base_before,
+        "a delivery must not relocate or grow a running receiver's nursery"
+    );
+    assert_eq!(
+        used_after, used_before,
+        "the refused delivery wrote nothing on the receiver's heap"
+    );
+    assert_eq!(
+        mature_used(&table, receiver),
+        mature_before,
+        "nothing was promoted off the nursery either"
+    );
+
+    // The host's fragment fallback still delivers what the receiver's heap could not hold.
+    {
+        let process = table.get_mut(receiver).expect("the receiver is live");
+        let (heap, mailbox) = process.heap_and_mailbox_mut();
+        let src_off_heap = OffHeapTable::new();
+        let mut dst_off_heap = OffHeapTable::new();
+        let mut ctx = CopyContext::new(&src_off_heap, &mut dst_off_heap);
+        send_fragmented(pid(99).to_eterm(), payload, heap, mailbox, &mut ctx, 0)
+            .expect("the fragment fallback delivers what the receiver's heap cannot hold");
+    }
+
+    let message = signal_message(&table, receiver);
+    assert!(
+        message.fragments().is_some(),
+        "the fallback delivered the message through a heap fragment"
+    );
+    let delivered = assert_fragment_resident(message, make_small(100), None);
+    assert!(
+        !table            .get(receiver)
+            .expect("the receiver is live")
+            .collector()
+            .young()
+            .contains_term(delivered),
+        "the fragment-resident payload is NOT on the receiver's young heap"
+    );
+    assert!(
+        compare::eq(delivered, payload, &names),
+        "the fragment copy equals the delivered term element for element"
+    );
+
+    // The receiver's heap is still exactly the fixture's filler: the refusal *and* the fallback
+    // moved nothing.
+    assert_eq!(
+        nursery(&table, receiver),
+        (minor_before, base_before, used_before),
+        "neither the refusal nor the fragment fallback touched the receiver's heap"
+    );
+    let first = table
+        .get(receiver)
+        .expect("the receiver is live")
+        .mailbox()
+        .peek()
+        .expect("the filler is still first");
+    assert_eq!(first.payload(), filler, "the filler kept its place in the queue");
+    assert!(first.fragments().is_none(), "the ordinary delivery has no fragment");
+
+    Ok(())
+}
+
+/// The **schedule-in** half of the gate, and the realistic `Running` sequence: `slice_begin` marks
+/// the process `Running` and *then* applies its queued signals, so a signal for a `Running`
+/// receiver is applied while its live terms are the ones its own machine holds mid-run.
+///
+/// The queued DOWN's **reason** is the immediate `noproc` atom, so the enqueue-time copy allocates
+/// nothing and the signal *is* queued (and deferred, because the receiver is the currently
+/// executing process). The refusal is then the **apply-time build**, which cannot fit the
+/// receiver's three free words — and must not collect, because the receiver's `regs` snapshot is
+/// stale. It lands in a heap fragment instead, whole.
+#[test]
+fn a_running_receiver_gets_a_down_through_a_heap_fragment_without_collecting() -> Result<()> {
+    let (mut table, names, atoms) = table_with_names();
+    let mut src = source();
+    let reason = make_atom(atoms.noproc());
+    let (watcher, filler) = drained_receiver(&mut table, filler_term(&mut src))?;
+    assert_head_cannot_fit(&mut table, watcher, &atoms);
+    let target = table.spawn_default()?;
+
+    // The expected term: the same five-tuple the table must build, on the source arena (the
+    // reference is materialised through the same public writer the table uses).
+    let reference = table.monitor(watcher, target, MonitorKind::Process)?;
+    let reference_term = reference.to_eterm(&mut src)?;
+    let expected = src.tuple(&[
+        make_atom(atoms.down()),
+        reference_term,
+        make_atom(atoms.process()),
+        target.to_eterm(),
+        reason,
+    ])?;
+
+    let process = table.get_mut(watcher).expect("the watcher is live");
+    process.set_state(ProcessState::Running);
+    assert!(
+        !process.is_relocation_exempt(),
+        "not exempt: the gate here is the *running* state"
+    );    let (minor_before, base_before, used_before) = nursery(&table, watcher);
+    let mature_before = mature_used(&table, watcher);
+
+    // The target dies: the DOWN is queued (an immediate reason copies without allocating) and
+    // *deferred*, because the watcher is the currently executing process.
+    table.terminate(target, reason)?;
+    assert!(table.contains(watcher), "the watcher survived the target");
+    assert_eq!(
+        table.pending_signals(watcher)?,
+        1,
+        "the running receiver's signal is deferred to its schedule-in"
+    );
+    assert_eq!(
+        nursery(&table, watcher),
+        (minor_before, base_before, used_before),
+        "the deferred signal did not touch the running receiver's heap"
+    );
+
+    // The schedule-in applies it: the apply-time build cannot land on the watcher's heap, and that
+    // heap must not move, so the DOWN is built into a heap fragment.
+    table.service_signals(watcher)?;
+
+    let (minor_after, base_after, used_after) = nursery(&table, watcher);
+    assert_eq!(minor_after, minor_before, "a running receiver must not collect");
+    assert_eq!(
+        base_after, base_before,
+        "a running receiver's nursery must not be relocated or grown"
+    );
+    assert_eq!(
+        used_after, used_before,
+        "the fragment-built DOWN wrote nothing on the receiver's heap"
+    );
+    assert_eq!(
+        mature_used(&table, watcher),
+        mature_before,
+        "nothing was promoted off the nursery either"
+    );
+    assert_eq!(table.pending_signals(watcher)?, 0, "the applied signal left the queue");
+
+    let down = signal_message(&table, watcher);
+    let payload = assert_fragment_resident(
+        down,
+        make_atom(atoms.down()),
+        Some(make_atom(atoms.process())),
+    );
+    assert!(
+        compare::eq(payload, expected, &names),
+        "the fragment-resident DOWN equals the expected five-tuple element for element"
+    );
+    let first = table
+        .get(watcher)
+        .expect("the watcher is live")
+        .mailbox()
+        .peek()
+        .expect("the filler is still first");
+    assert_eq!(first.payload(), filler, "the filler kept its place in the queue");
+    assert!(first.fragments().is_none(), "the ordinary delivery has no fragment");
+
+    Ok(())
+}
+
+/// The **control** for the two cases above: the identical refusal on the identical receiver in
+/// [`ProcessState::Waiting`] still takes the collect-and-grow arm (and, unlike the running case,
+/// the signal is applied **eagerly** — a waiting receiver is exactly the case ERTS's early signal
+/// handling services before the generating operation returns).
+///
+/// Nothing about this arm changes: one collection, an on-demand nursery growth that relocates it,
+/// and the DOWN built on the receiver's **new** heap with no fragment. It is what pins that the new
+/// gate refuses the collect for a *running* receiver only, and did not replace the ordinary
+/// grow-and-retry path.
+#[test]
+fn a_waiting_receiver_still_collects_and_grows_on_the_same_refusal() -> Result<()> {
+    let (mut table, names, atoms) = table_with_names();
+    let mut src = source();
+    let reason = make_atom(atoms.noproc());
+    let (watcher, filler) = drained_receiver(&mut table, filler_term(&mut src))?;
+    assert_head_cannot_fit(&mut table, watcher, &atoms);
+    let target = table.spawn_default()?;
+    let reference = table.monitor(watcher, target, MonitorKind::Process)?;
+    let reference_term = reference.to_eterm(&mut src)?;
+    let expected = src.tuple(&[
+        make_atom(atoms.down()),
+        reference_term,
+        make_atom(atoms.process()),
+        target.to_eterm(),
+        reason,
+    ])?;
+
+    let process = table.get_mut(watcher).expect("the watcher is live");
+    process.set_state(ProcessState::Waiting);
+    assert_eq!(
+        process.state(),
+        ProcessState::Waiting,
+        "the control receiver is a blocked one"
+    );    assert!(
+        !process.has_unpublished_roots(),
+        "a waiting receiver is neither exempt nor running: its roots were published at its park"
+    );
+    let (minor_before, base_before, used_before) = nursery(&table, watcher);
+
+    // The target dies: a waiting watcher's DOWN is serviced eagerly, on the spot.
+    table.terminate(target, reason)?;
+    assert!(table.contains(watcher), "the watcher survived the target");
+    assert_eq!(table.drain_woken(), vec![watcher], "the delivery woke the blocked watcher");
+
+    // Exactly one collection ran and the emptied nursery was replaced (a relocation) ...
+    let (minor_after, base_after, used_after) = nursery(&table, watcher);
+    assert_eq!(
+        minor_after,
+        minor_before + 1,
+        "the refused build collected exactly once before retrying"
+    );
+    assert_ne!(
+        base_after, base_before,
+        "the emptied nursery was replaced: the collect-and-grow arm relocates"
+    );
+    // ... and the DOWN landed on the receiver's **own** heap, not in a fragment.
+    let down = signal_message(&table, watcher);
+    assert!(
+        down.fragments().is_none(),
+        "the ordinary arm builds on the receiver's own heap, never in a fragment"
+    );
+    let payload = down.payload();
+    assert!(
+        table
+            .get(watcher)
+            .expect("the watcher is live")
+            .collector()
+            .young()
+            .contains_term(payload),
+        "the retried build landed on the receiver's own (new) nursery"
+    );
+    assert_eq!(
+        used_after, 10,
+        "the receiver's new nursery holds exactly the build: the four-word boxed monitor \
+         reference plus the six-word DOWN five-tuple (one header + five elements)"
+    );    let _ = used_before;
+    assert!(
+        compare::eq(payload, expected, &names),
+        "the on-heap DOWN equals the expected five-tuple element for element"
+    );
+    let filler_after = table
+        .get(watcher)
+        .expect("the watcher is live")
+        .mailbox()
+        .peek()
+        .expect("the filler is still first")
+        .payload();
+    assert_ne!(
+        filler_after, filler,
+        "the collection relocated the queued filler (the fixture's address is the pre-collection one)"
+    );
+    assert!(
+        table
+            .get(watcher)
+            .expect("the watcher is live")
+            .collector()
+            .mature_contains(ptr_val(filler_after)),
+        "the promoted filler now lives in the mature generation"
     );
 
     Ok(())
