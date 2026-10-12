@@ -321,8 +321,10 @@ SMP pool:
     Deterministic — a fixed position-dependent payload, an injected allocator, explicit
     `collect()`/sweep calls; no sleeps / wall-clock bounds / oracle.
 
-39. `signal_fragment_fallback.rs` (5 tests) — the **heap-fragment fallback of the signal-delivery
-    path** at **both** refusal sites for a **relocation-exempt** receiver: the **apply-time** message
+39. `signal_fragment_fallback.rs` (8 tests) — the **heap-fragment fallback of the signal-delivery
+    path** at **both** refusal sites for a receiver with **unpublished live roots** — a
+    **relocation-exempt** process, or a **`Running`** one (`Process::has_unpublished_roots`): the
+    **apply-time** message
     build (`build_signal_message` / the queued `deliver_head_signal`, via `enqueue_fragment_signal`) and
     the **enqueue-time** reason copy (`copy_reason_onto`, via `enqueue_down_signal`'s
     `deliver_down_fragment` / `enqueue_exit_signal`'s `deliver_exit_fragment`). A refused payload is
@@ -346,7 +348,22 @@ SMP pool:
     one, the nursery grown to `next_heap_size(reserve, 0)` and relocated (`base()` moved), the filler
     promoted to mature, the EXIT built on the **new** nursery (`fragments()` is `None`,
     `contains_term(payload)` young, not mature) — so the fallback did not replace the grow-and-retry
-    path. **Discriminating by construction: against the pre-fix commit `360a4c6536`, cases 1 and 2 FAIL
+    path. (6) the **message-delivery** half of the gate: `Process::deliver` to a **`Running`** (not
+    exempt) receiver surfaces the raw refusal and enqueues nothing, leaving
+    `minor_gcs()`/`young().base()`/`heap_used_words()`/mature usage untouched, and the host's fragment
+    fallback (`beam_message::send_fragmented` through `Process::heap_and_mailbox_mut`) still delivers
+    the message whole and fragment-resident (`compare::eq` against the source term) with the fixture's
+    filler keeping its FIFO place; (7) the **schedule-in** half, the realistic `Running` sequence — a
+    queued DOWN with the immediate `noproc` reason (so the enqueue-time copy allocates nothing and the
+    signal *is* queued, deferred because the receiver is the executing process, `pending_signals` = 1)
+    is refused at the **apply-time** build at `service_signals`, so the DOWN lands fragment-resident
+    (structurally equal to the expected five-tuple) with the nursery untouched and the queue drained;
+    (8) the **control** — the identical refusal on the identical receiver in `ProcessState::Waiting`
+    takes the collect-and-grow arm (one collection, the nursery grown and relocated, the filler
+    promoted to mature, the DOWN built on the receiver's **new** nursery with no fragment, and — unlike
+    the running case — the signal serviced **eagerly**, `drain_woken()` = the receiver) — pinning that
+    the gate is the *running* state, not a blanket refusal.
+    **Discriminating by construction: against the pre-fix commit `360a4c6536`, cases 1 and 2 FAIL
     with the raw `Alloc(AllocFailure { requested: 32, kind: Heap })` out of `terminate` (signal lost)
     while case 5 passes; before the enqueue-time route, cases 3 and 4 FAIL (the drop is logged and no
     message arrives).** An exit signal to a **non-trapping** exempt receiver is *not* covered by the
@@ -372,7 +389,7 @@ SMP pool:
 - Run the whole crate gate with
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_process` (never `cd`,
   sandbox `$HOME` is read-only). Cross-checks against the real system ERTS belong to the sibling
-  `../../../tools/differential/` harness, not here. Current: **472 passed, 0 failed, 1 ignored** (173 in-module unit tests + 298
+  `../../../tools/differential/` harness, not here. Current: **476 passed, 0 failed, 1 ignored** (174 in-module unit tests + 301
   across the 39 integration targets here + 1 doctest; the single ignore is the documented
   non-yielding-runner hang failure mode in `preemption.rs`).
 
@@ -385,7 +402,7 @@ SMP pool:
   the single-threaded scheduler (incl. the port-aware slice cleanup), mailbox, signals, GC roots, PCB state,
   pre-emption/fairness, the collect-grow-and-retry exhaustion path of `Process::deliver` and the
   `{'EXIT',…}`/`{'DOWN',…}` signal builders (both the enqueue-time reason copy and the
-  relocation-exempt receivers' heap-fragment fallback, at either refusal site), the host-controllable GC relocation
+  unpublished-roots receivers' heap-fragment fallback, at either refusal site), the host-controllable GC relocation
   exemption, the
   collection's queued-message re-install (a fragment-resident/off-heap-owning message keeps its whole
   envelope across a collect), and the **process-owned off-heap refc-binary list** (registration, the
