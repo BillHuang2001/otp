@@ -140,6 +140,15 @@ The A.8 oracle gate is the sibling integration suite `tests/system_info_oracle.r
   `the_monotonic_time_interface_constants_match_the_oracle` probes the oracle **twice** for `start_time`/`end_time`, requires both runs (and the **recorded** figures) to agree, and pins that the oracle's `start_time` is a small integer while its `end_time` is a bignum — the recorded table cannot go stale silently.
   It **skips loudly** when no system `erl` is executable.
 
+## Legacy C ground truth (what this node ports)
+This node reimplements the `system_info/1` arm of the legacy C emulator (read-only reference, never modified):
+- `erts/emulator/beam/erl_bif_info.c` — `system_info_1` (`:2774`) is the C entry the whole surface mirrors; the `start_time`/`end_time` arms dispatch at `:2857-2859`, the tuple keys `{wordsize,W}`/`{allocator,A}` at `:2521-2546`, the scheduler-state/statistics keys at `:3258-3352`, the `build_type`/`emu_type` shared arm at `:2800`.
+- `erts/emulator/beam/erl_time_sup.c` (`make_time_val` `:2133-2146`, `erts_get_monotonic_{start,end}_time` `:2148-2158`) + `erts/emulator/beam/erl_time.h` — the `start_time`/`end_time` interface constants (`info/time.rs`).
+- `erts/emulator/beam/erl_alloc.c` (`erts_allocated_areas` `:2580-2699`, `erts_alloc_util_allocators` `:2789`) — `alloc_util_allocators` / `allocated_areas` / `{allocator,A}` (`info/memory.rs`, `allocator_report`).
+- `erts/emulator/beam/erl_gc.c` (`erts_init_gc` `:262-291`) — `heap_sizes` / `garbage_collection` (values produced by `beam_gc`).
+- `erts/emulator/beam/erl_ptab.c` / `erl_ptab.h` + `erl_port.h` — the `port_limit` table-sizing rule (`info/limits.rs`).
+Each source module cites its own C line numbers inline; the mapping is also recorded in this file's See Also.
+
 ## See Also
 - `../CONTEXT.md` → the crate façade (`system_info_value`/`InfoValue` re-exports, the `{allocator, A}` route in `src/native.rs`, the A.8 contract).
 - `../../CONTEXT.md` §1 A.8 → the introspection contract.
