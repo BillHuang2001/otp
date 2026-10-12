@@ -588,7 +588,8 @@ fn escaped_off_heap_binary() -> (beam_alloc::Heap, NestedRunPayloads, Vec<u8>, E
 
 /// **The escaped-payload delivery, end to end.** A message carrying an off-heap refc binary whose
 /// only owner was a **nested run's** machine — already dropped by the time the message is sent —
-/// must still reach the receiver.
+/// must still reach the receiver, and the runtime's escaped-payload store must resolve it by
+/// **sharing** (not flattening) the payload.
 ///
 /// This is the defect `A = base64:encode(<<…>>), X1 = binary:encode_hex(A), _ =
 /// base64:encode(<<…>>), X2 = binary:encode_hex(A)` (`X1 == X2` on the oracle: the second
@@ -596,31 +597,49 @@ fn escaped_off_heap_binary() -> (beam_alloc::Heap, NestedRunPayloads, Vec<u8>, E
 /// `B = compile:forms(F, [no_spawn_compiler_process]), self() ! B` (`error:badarg`) pin, reproduced
 /// without the compiler. The copy engine resolves a refc binary **by its data pointer** through the
 /// copy's source table, and a sender holding no handles of its own (`erlang:send/2`/`'!'/2` through
-/// the `SendBridge`, and every runtime-internal delivery) passes an empty one — so only the
-/// runtime's escaped-payload store can resolve it.
+/// the `SendBridge`, and every runtime-internal delivery) passes an empty one.
+///
+/// The two paths are observably distinct, and **both halves are asserted**:
+///
+/// * **flattened** (the store is empty) — `beam_message`'s `copy_refc_binary` last resort
+///   materializes the window as a fresh **on-heap** bitstring, so the delivery *succeeds*, the
+///   store stays empty and the queued message owns **no** off-heap handle;
+/// * **shared** (the store holds the adopted handle) — the copy finds the handle, so the queued
+///   message is byte-identical and owns its own reference to the **same** payload (the store's
+///   handle survives at refcount 2).
 #[test]
 fn a_delivery_resolves_an_escaped_off_heap_payload_through_the_runtime_store() {
     let (_source_heap, payloads, bytes, term) = escaped_off_heap_binary();
 
     let mut rt = runtime();
     let pid = self_term(&rt);
+    let mut reference_heap = beam_alloc::Heap::new(64).expect("the reference heap");
+    let reference =
+        beam_codec::term::make_binary(&mut reference_heap, &bytes).expect("the reference");
 
-    // The pre-fix behaviour, asserted first: the payload's only owner is still the (here:
-    // simulated) nested-run machine and the store is empty, so the receiver-side copy cannot
-    // resolve the term and refuses the whole message.
+    // -- FLATTENED: with the escaped-payload store empty the copy has no handle to share, so it
+    //    materializes the window as a fresh on-heap binary instead of refusing the message. --
     {
         let mut ctx = RuntimeContext::new(&mut rt);
-        assert!(
-            matches!(ctx.send_message(pid, term), Err(BeamError::BadArg)),
-            "without the escaped-payload store the delivery is refused"
-        );
+        ctx.send_message(pid, term)
+            .expect("without a resolvable handle the delivery flattens rather than failing");
     }
     assert!(
-        queued_payloads(&rt, rt.self_pid()).is_empty(),
-        "a refused delivery enqueues nothing"
+        rt.eval_off_heap.binaries().is_empty(),
+        "a flattened delivery registers nothing in the escaped-payload store"
+    );
+    assert_eq!(
+        queued_binary_counts(&rt, rt.self_pid()),
+        vec![0],
+        "the flattened payload is an ordinary on-heap binary — the message owns no off-heap handle"
+    );
+    assert!(
+        beam_term::compare::eq(queued_payloads(&rt, rt.self_pid())[0], reference, rt.atoms()),
+        "the flattened binary reads back byte-identical to the payload"
     );
 
-    // The nested run returns and its machine is dropped — `beam_rt` adopts the handles first.
+    // -- SHARED: the nested run returns and its machine is dropped — `beam_rt` adopts the handles
+    //    first, so the store can now resolve (and share) the escaped payload. --
     rt.adopt_escaped_binaries(&payloads.0);
     drop(payloads);
 
@@ -631,18 +650,120 @@ fn a_delivery_resolves_an_escaped_off_heap_payload_through_the_runtime_store() {
         ctx.send_message(pid, term).expect("the escaped payload resolves");
     }
     let queued = queued_payloads(&rt, rt.self_pid());
-    assert_eq!(queued.len(), 1, "the message arrived");
-    let mut reference_heap = beam_alloc::Heap::new(64).expect("the reference heap");
-    let reference =
-        beam_codec::term::make_binary(&mut reference_heap, &bytes).expect("the reference");
+    assert_eq!(queued.len(), 2, "both messages arrived");
     assert!(
-        beam_term::compare::eq(queued[0], reference, rt.atoms()),
+        beam_term::compare::eq(queued[1], reference, rt.atoms()),
         "the delivered binary reads back byte-identical to the payload that escaped"
+    );
+    assert_eq!(
+        queued_binary_counts(&rt, rt.self_pid())[1],
+        1,
+        "the shared delivery re-registered the payload's handle on the message"
     );
     assert_eq!(
         rt.eval_off_heap.binaries()[0].refcount(),
         2,
         "the receiver's message owns its own reference to the shared payload"
+    );
+}
+
+/// **The mailbox-retained SHARE route on the `erlang:send/2` BIF path.** A process that
+/// **received** an off-heap refc payload (so the only owner became the receiving process's
+/// [`MailboxState`] once the message was removed) and then **forwards** the received term with a
+/// BIF-path send must still deliver it **shared**: the copy resolves the payload through the
+/// sender's retained mailbox families ([`super::RuntimeContext::send_source`] over
+/// `Runtime::source_payloads`).
+///
+/// This is the regression guard for the family union: reverting it to the escaped-store-only table
+/// (`Runtime::off_heap_source`) leaves the store **empty** and the retained mailbox family out, so
+/// the copy can only **flatten** and the forwarded message owns no off-heap handle.
+///
+/// This is the only SHARE route a `beam_rt`-only change can reach on that path: the sending
+/// machine's own `refc_binaries()` is unobservable from here (see
+/// [`super::RuntimeContext::send_source`]'s docs for why — the in-flight `Machine` is out of
+/// `RunnerState.engines` for the slice and `ExecutionContext::call_bif`/`SendHook::send` carry no
+/// handle parameter), so the test pins exactly the mailbox family.
+///
+/// The send is the **BIF** form (`erlang:send/2` through `SendBridge` →
+/// `ExecutionContext::send_message`), never the compiled `Dest ! Msg` instruction — that
+/// instruction's `send_message_with_off_heap` arm is the one seam that *does* carry the machine's
+/// handles.
+#[test]
+fn a_bif_send_forwards_a_mailbox_retained_off_heap_payload_by_sharing_it() {
+    let (_source_heap, payloads, bytes, term) = escaped_off_heap_binary();
+    let mut rt = runtime();
+    let pid = self_term(&rt);
+
+    // 1. Receive: the delivery resolves the payload off the **sender's** handle slice, so the
+    //    queued message owns a shared handle of its own.
+    {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        ctx.send_message_with_off_heap(pid, term, &payloads.0)
+            .expect("the received payload is shared");
+    }
+    assert_eq!(
+        queued_binary_counts(&rt, rt.self_pid()),
+        vec![1],
+        "the received message owns the shared payload's handle"
+    );
+    // The received (copied) term — what the process's code would bind and later forward.
+    let received = queued_payloads(&rt, rt.self_pid())[0];
+
+    // 2. Remove: the handle moves to the process's mailbox scan state, and — with the building
+    //    run's handles dropped — that retained family is now the payload's **only** owner.
+    {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        ctx.remove_mailbox_message(0)
+            .expect("the receive removes the message");
+    }
+    drop(payloads);
+    assert_eq!(
+        rt.mailboxes
+            .get(&rt.self_pid)
+            .expect("the scan state")
+            .retained_binaries()
+            .len(),
+        1,
+        "the removed message left its off-heap handle on the scan state"
+    );
+    assert!(
+        rt.eval_off_heap.binaries().is_empty(),
+        "the runtime's escaped-payload store holds nothing — only the mailbox family can resolve"
+    );
+
+    // 3. Forward through the `erlang:send/2` BIF (the `SendBridge` route): the payload must be
+    //    SHARED again, resolved through the retained mailbox family alone.
+    let answer = {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        ctx.call_bif("erlang", "send", 2, &[pid, received])
+            .expect("erlang:send/2 forwards the received term")
+    };
+    assert!(
+        beam_term::compare::eq(answer, received, rt.atoms()),
+        "the BIF send returns the message it sent"
+    );
+    let queued = queued_payloads(&rt, rt.self_pid());
+    assert_eq!(queued.len(), 1, "the forwarded message arrived");
+    let mut reference_heap = beam_alloc::Heap::new(64).expect("the reference heap");
+    let reference =
+        beam_codec::term::make_binary(&mut reference_heap, &bytes).expect("the reference");
+    assert!(
+        beam_term::compare::eq(queued[0], reference, rt.atoms()),
+        "the forwarded binary reads back byte-identical to the received payload"
+    );
+    assert_eq!(
+        queued_binary_counts(&rt, rt.self_pid()),
+        vec![1],
+        "the forwarded message shares the payload — it owns an off-heap handle"
+    );
+    assert_eq!(
+        rt.mailboxes
+            .get(&rt.self_pid)
+            .expect("the scan state")
+            .retained_binaries()[0]
+            .refcount(),
+        2,
+        "the forwarded message owns its own reference to the mailbox-retained payload"
     );
 }
 
@@ -664,6 +785,22 @@ fn queued_payloads(rt: &Runtime, pid: ProcessId) -> Vec<Eterm> {
         .mailbox()
         .iter()
         .map(|message| message.payload())
+        .collect()
+}
+
+/// The number of off-heap **refc-binary** handles each message queued for `pid` owns, oldest
+/// first.
+///
+/// The receiver-side copy hands every payload it **shares** to the message's off-heap list, and
+/// nothing to a payload it **flattens** — so this is the observable that distinguishes a shared
+/// distribution from a flattened one (`Message::binaries`).
+fn queued_binary_counts(rt: &Runtime, pid: ProcessId) -> Vec<usize> {
+    rt.processes
+        .get(pid)
+        .expect("the process is live")
+        .mailbox()
+        .iter()
+        .map(|message| message.binaries().len())
         .collect()
 }
 
