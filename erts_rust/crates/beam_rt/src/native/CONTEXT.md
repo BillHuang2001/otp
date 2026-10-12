@@ -647,6 +647,12 @@ closable the same way and the floor already serves both, so only `/2` stays list
 `every_floor_module_is_a_real_try_native_arm`.
 
 ### Recorded gaps and fabricated values
+- **`read_file_info/1,2`, `read_link_info/1,2` and `read_handle_info/1,2` ARE served** (a real
+  14-tuple `#file_info{}`, `access` from two real `access(2)` probes via `beam_io::path_access` for
+  the path forms and `beam_io::process_credentials` + the mode bits for the handle form) — despite
+  `prim.rs`'s module-doc "Not served" list still naming them as typed gaps. Trust the dispatch
+  (`prim.rs`'s `prim_file_call` arms) and the live-oracle cross-check
+  `tests/a9_native_floor.rs::filelib_existence_probes_on_an_existing_path_agree_with_the_oracle`.
 - **`last_calls` ⇒ `false` is a real divergence** — `Process::save_calls()` holds a real flag
   (`memory/mod.rs:803`).
 - `application.rs`'s `app_env_props` reads the `.app` resource's `env` list verbatim, so kernel's
