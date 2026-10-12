@@ -67,7 +67,7 @@ A module-run case may carry `nif: Option<NifFixture>`: the fixture's artifacts (
 - Expression cases invoke both runtimes with the **same argv** (only the program path differs); module-run cases with per-side argv (*Probe protocol*); command cases with a fixed per-side program + argv (the oracle side is the resolved `erl`, the Rust side the resolved `beam_rt` or `dist_probe`).
 
 ## gate.sh — the checkable compatibility gate
-`gate.sh` wraps `differential suite --strict --allowlist known-gaps.txt` for CI: from the repo root it runs `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml -p beam_rt -p differential`, then `erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q -p differential -- suite --strict --allowlist <script_dir>/known-gaps.txt --json --out <tmpdir>`, and turns the report's **top-level `summary`** and **top-level `ratchet`** blocks into a CI exit code:
+`gate.sh` wraps `differential suite --strict --allowlist known-gaps.txt` for CI: from the repo root it runs `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml -p beam_rt -p beam_dist -p differential` (the `beam_dist` build produces the `dist_probe` helper the `dist/*` cases drive), then `erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q -p differential -- suite --strict --allowlist <script_dir>/known-gaps.txt --json --out <tmpdir>`, and turns the report's **top-level `summary`** and **top-level `ratchet`** blocks into a CI exit code:
 
 | Exit | Meaning |
 |------|---------|
