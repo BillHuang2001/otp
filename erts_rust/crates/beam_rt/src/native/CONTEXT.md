@@ -453,6 +453,14 @@ write-mode `{open,…}` that delegates to `prim_file:open/2` and really creates 
   `file_server/`'s suites are described in [`file_server/CONTEXT.md`](file_server/CONTEXT.md).
 - Test fixtures that need a real `.beam` or the system Erlang skip **loudly**
   (`system_runtime()` / the file-local `lists_beam()`); the arithmetic/`term_type` suites need none.
+- **Suites that spawn the live `erl` oracle in-process** (bounded poll/kill; skip **loudly** when
+  absent): `code.rs` (`code_priv_dir_agrees_with_the_oracle`), `memory/tests.rs`,
+  `prim.rs` (`the_unserved_prim_file_entries_are_typed_capability_gaps`,
+  `the_closed_prim_file_families_agree_with_the_erl_oracle`,
+  `the_file_info_family_agrees_with_the_oracle`), `file_server/tests.rs`
+  (`the_getopts_answers_match_the_live_oracle`) and `file_server/get_line/tests.rs`. Every other
+  in-node test quotes its oracle value in the doc comment (verified out of band) rather than
+  re-running `erl`.
 - Cross-crate integration (CLI/exit codes, the preloaded `boot/*` corpus, `-eval`) is pinned by the
   `../tests/` suites, not here. This node's A.9 native-floor surface — `application:get_all_key/1`,
   `get_key/1,2`, `get_application/0,1`; `init:get_argument/1`'s automatic flags; `init:script_id/0`;
