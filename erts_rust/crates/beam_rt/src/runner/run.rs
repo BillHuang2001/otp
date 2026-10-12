@@ -298,6 +298,11 @@ impl ProcessRunner for RuntimeRunner<'_> {
             // `resume_from_process_roots`).
             if engine.parked.is_some() {
                 resume_from_process_roots(&mut ctx, pid, &mut engine.machine);
+                // The parked window is over: clear the park arm's relocation exemption so
+                // the running slice below can collect this process normally. (A process
+                // resumed from a pre-emption was never marked; clearing is a no-op there.)
+                ctx.process_table_mut()
+                    .set_relocation_exempt(pid, false)?;
             }
             // The slice's reduction budget, charged per interpreted instruction and at the
             // machine's heap-admission points (see the `run` docs).
@@ -532,6 +537,18 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 }
                 if let Some(process) = table.get_mut(pid) {
                     process.set_state(ProcessState::Waiting);
+                    // Keep the parked process **relocation-exempt** for the whole parked
+                    // window. While it waits, a delivery or signal can drive a collection of
+                    // its heap (`Process::deliver`'s exit cascade is not gated by
+                    // `gc_process_enabled`) against the *published* root snapshot — which is
+                    // not the whole truth: a live `Machine::pending_exception` or a Rust-local
+                    // term in an in-flight `beam_bifs`/`beam_engine` frame is not in it, so a
+                    // move can recycle a word a live holder still points at. Exempting is
+                    // **decline-only**: such a delivery takes the ordinary heap-fragment
+                    // fallback (`Process::deliver`'s raw refusal), and the process's own next
+                    // admission point — after it is resumed, where the exemption is cleared
+                    // above — collects as usual, so nothing grows unboundedly.
+                    process.set_relocation_exempt(true);
                 }
                 // Publish the machine's roots before the engine is parked: a delivery-driven
                 // collection (`Process::deliver`'s exit cascade, ungated by
