@@ -640,3 +640,30 @@ which this node does not own. The minimal sound fix is therefore **not** a `beam
 `beam_process` change: a term a `beam_bifs` BIF holds across `ctx.call_fun`/`ExecutionContext` must
 be **published as a root** for the duration of that nested run (or the nested run must be entered
 with the process's `relocation_exempt` flag observed by the admission door). Owned by `beam_bifs`.
+
+## The from-space audit: the slice door's root hand-off is sound; the producer is outside `RootSet`
+
+`beam_engine::poison` (off by default, `BEAM_RT_POISON`) plus the host window in
+`src/context/gc.rs::ensure_heap_full` record the from-space the collection is about to abandon
+(the nursery's live `[base, top)`, plus the mature live words), snapshot the machine's whole
+`RootSet`, and audit the scattered roots for a word that came back **unchanged** yet still points
+into the abandoned range. A correct relocation always rewrites such a word, so the audit is
+exact — no false positives, no heuristics.
+
+Measured on the A.9 in-machine self-host reproducer
+(`beam_rt run <selfhost.beam> selfhost:compile_self/0`, `BEAM_RT_TIER=interpreter`,
+`BEAM_RT_POISON=1`): the reproducer still corrupts (`beam_term::ops: invalid boxed header subtag
+0x32`) and the audit is **silent at both collections**. So every word of `roots.x` (1024 slots),
+`roots.stack` and `roots.fr` (1024 slots) that the slice's own admission door published back was
+either relocated or was never a from-space pointer.
+
+The consequence is that the "the machine published an unpublished `x`/stack/FR slot, or
+`publish_roots_full`/`scatter_roots_full` mis-split the files" class is **eliminated by
+measurement**: the slice door's hand-off is not the leak. The holder of the abandoned word is
+therefore **outside `RootSet`** — reachable neither by `publish_roots_full` nor by
+`Process::collect`'s gather (registers, mailbox, dict, saved args, signals) — which is exactly the
+"a `beam_bifs` Rust local held across a nested `call_fun`" producer the section above names.
+
+The minimal sound change is unchanged and owned by `beam_bifs`: publish the BIF's live terms as a
+process root for the duration of the nested fun application (the existing
+`beam_process::Registers::extra_roots` container is the seam for exactly such a host-held root).
