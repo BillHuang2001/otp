@@ -236,7 +236,10 @@ sensitivity(Config) ->
            "(label / opts / kind):"),
     lists:foreach(
       fun({Label, Opts, Kind}) ->
-              Changed = proplists:get_value(Label, Cert),
+              Changed = case proplists:get_value(Label, Cert) of
+                            undefined -> [];
+                            L -> L
+                        end,
               ct:pal("  ~-10s ~-52s ~-9s ~w of ~w~s",
                      [Label, lists:flatten(io_lib:format("~w", [Opts])), Kind,
                       length(Changed), Total, describe(Changed)])
