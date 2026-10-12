@@ -109,6 +109,24 @@ No new atom names were needed for `dist`/`dist_ctrl`/`Binary` (a binary carries 
 - **Several `info/system.rs` literals are ERTS *runtime* flags this runtime reports at the oracle's default** (they would diverge if the flag were passed, because the CLI models none of them): `port_parallelism` (C `erts_port_parallelism`, `+spp`), `break_ignored` (C `ignore_break`, `erl_bif_info.c:3185`), `modified_timing_level` (C `erts_modified_timing_level`, `+T`), `halt_flush_timeout` (C `erts_halt_flush_timeout`, `-shutdown_time`, `infinity` = the negative default). Two `info/limits.rs` constants are flag-settable too and were confirmed against the oracle: `dist_buf_busy_limit` (`+zdbbl` — `+zdbbl 2048` ⇒ `2097152`) and `delayed_node_table_gc` (`+zdntgc` — `+zdntgc 120` ⇒ `120`); their default literals diverge under those flags. The CLI has no arm for any of them, and `record_unmodeled` **drops** an unmodeled `+flag` (it becomes neither an init arg nor an `extra_emulator_flags` entry), so there is no state to derive from today; making them live needs an A.6 change (preserve the flag) plus a `thread_pool_size`-style derivation here. By contrast these literals are genuine build constants and must stay as-is: `threads` (`true`), `async_dist` (`false`), `dynamic_trace` (`none`), `dynamic_trace_probes` (`false`), `kernel_poll` (`cfg!(unix)`, matching the C's `ERTS_ENABLE_KERNEL_POLL` build constant which `+K` does **not** affect), `update_cpu_info` (`unchanged` — the steady-state answer of the oracle's stateful `erts_update_cpu_info()` probe), `trace_control_word` (`0`), and `outstanding_system_requests_limit` (fixed at `32` — `+sss 64` does not move the oracle's value).
 - `heap_sizes` currently reports one extra trailing entry vs the oracle (138 vs 137) because `beam_gc::build_heap_sizes` (`erts_rust/crates/beam_gc/src/policy.rs:73`) stops one step short of the C's `erl_gc.c:283-291` loop, which writes the offending step then discards it via `i--`; the faithful table (and the oracle's) is 137 entries ending `885767171276247`. The fix belongs to `beam_gc` (out of this node's scope) and has been reported. `heap_sizes` stays **served** and compared **shape-only**.
 
+## Test Inventory (in-file `#[cfg(test)]`, current counts)
+Every `*.rs` in this node (the parent `src/info.rs` + all 8 child modules) carries an in-file `#[cfg(test)]` module:
+
+| file | `#[test]` |
+|---|---|
+| `src/info.rs` (parent) | 15 |
+| `info/schedulers.rs` | 10 |
+| `info/system.rs` | 9 |
+| `info/memory.rs` | 8 |
+| `info/host.rs` | 6 |
+| `info/limits.rs` | 4 |
+| `info/dist.rs` | 4 |
+| `info/time.rs` | 3 |
+| `info/unsupported.rs` | 1 |
+| **total (this node)** | **60** |
+
+The A.8 oracle gate is the sibling integration suite `tests/system_info_oracle.rs` (**7** `#[test]`s, skips loudly without a system `erl`); the `process_info/2` / `module_info/1` sibling surfaces have their own suites (`tests/process_info_items.rs`, `tests/module_info.rs`).
+
 ## Test Strategy
 - Per-key unit tests colocated in each family module: the value **shape** (and the exact value for the constants), plus `try_value(other_key) == None` and the unknown-key `badarg`.
   `info/limits.rs` additionally pins the whole `+Q`/`ERL_MAX_PORTS` sizing matrix (`1024→1024 … 134217727→134217727`, `legacy`/none→65536) and the default table.
