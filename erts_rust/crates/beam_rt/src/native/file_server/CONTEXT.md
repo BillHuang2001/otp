@@ -59,9 +59,13 @@ while the pass holds the table/scheduler out; the step does not guard against it
 |---|---|
 | `{'$gen_call', {Pid, Tag}, Request}` (the local `infinity` form, `gen.erl:231-250`) | `{Tag, Reply}` to `Pid`; a `[alias\|Ref]` tag is the typed `unsupported` gap (the alias delivery this runtime cannot perform), never a fabricated delivery |
 | `{file_request\|io_request, From, ReplyAs, Request}` (`file_io_server.erl:199-233`) | `{file_reply\|io_reply, ReplyAs, Reply}` to `From` |
-An unknown `file_server` request is the oracle's `{noreply, State}`: nothing is delivered. A
-`FileServices` process never runs and never collects, so a mailbox payload (already copied onto the
-service's own heap by `deliver_simple`) is stable for as long as it is read.
+An unserved `file_server` request (a tuple with an atom command head) and a well-formed
+`{'$gen_call',…}` the service does not serve are answered the typed `{error, unsupported}` — a
+**directed** divergence from the oracle's silent `{noreply, State}` catch-all
+(`file_server.erl:197-201`), which would park a `gen:call/4` caller forever; only an envelope that
+names no reachable sender is consumed with no reply. A `FileServices` process never runs and never
+collects, so a mailbox payload (already copied onto the service's own heap by `deliver_simple`) is
+stable for as long as it is read.
 ### The served request surface (`file_server:handle_call/3`, `file_server.erl:101-201`)
 | Request | Behaviour |
 |---|---|
