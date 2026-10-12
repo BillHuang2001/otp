@@ -335,6 +335,39 @@ pub struct Process {
     exit_reason: Option<Eterm>,
 }
 
+/// A host-supplied predicate that can **decline a relocating collection** of a receiver's heap.
+///
+/// This is the host's half of the same exhaustion policy
+/// [`Process::has_unpublished_roots`] implements in-crate. That crate-owned gate covers two cases:
+/// a **relocation-exempt** process and a currently [`Running`](ProcessState::Running) one. A host
+/// may know of a third — a receiver whose live root set is **not** fully scanned by its collector
+/// (a root word, or a container the receiver's scanned graph reaches, living in a region the
+/// collector does not scan) — and must be able to refuse the move. `beam_rt`'s unscanned-root
+/// decline predicate (`beam_rt/src/context/gc.rs::root_is_unscanned` and
+/// `src/context/gc_walk.rs::any_root_is_unscanned`, which it already consults at its own
+/// heap-admission points) is the motivating one.
+///
+/// Answering `true` declines only the **relocation**: a no-relocation growth
+/// ([`Process::grow_nursery`]) or a heap-fragment delivery is still permitted, so the notification
+/// is **never lost** — it is delivered through the same heap-fragment route the `Running` /
+/// relocation-exempt receiver already takes. A gate is installed on the process table
+/// ([`ProcessTable::set_collection_gate`](crate::ptab::ProcessTable::set_collection_gate)) and is
+/// consulted at every signal site in `crate::ptab`, plus by
+/// [`ProcessTable::deliver`](crate::ptab::ProcessTable::deliver) — which honours it by marking the
+/// receiver relocation-exempt for the duration of exactly one [`Process::deliver`] call, so the
+/// copy engine's raw refusal reaches the caller unchanged.
+///
+/// The predicate takes `&mut self` so a gate can keep its own state (a cache, a counter), and
+/// receives the receiver's PCB so it can consult the process itself (its pid, its heap, its
+/// collector's geometry) rather than only an id.
+pub trait CollectionGate {
+    /// Whether a **relocating** collection of `receiver`'s heap must be declined.
+    ///
+    /// `true` refuses only the move: the caller routes the delivery to a heap fragment (or grows
+    /// the nursery **without** relocating) and the message is still delivered.
+    fn declines_relocation(&mut self, receiver: &Process) -> bool;
+}
+
 impl Process {
     /// A new process with pid `pid` and the default heap policy.
     ///
@@ -1097,6 +1130,7 @@ impl Process {
     pub fn has_unpublished_roots(&self) -> bool {
         self.relocation_exempt || self.state == ProcessState::Running
     }
+
     /// Runs a safepoint collection over the whole process root set.
     ///
     /// The root set is the registers/stack **plus** the host-published extra roots

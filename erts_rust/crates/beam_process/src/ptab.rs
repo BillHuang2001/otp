@@ -57,12 +57,22 @@
 //! [`Process::deliver`](crate::process::Process::deliver) does: an **ordinary** receiver's nursery
 //! is collected and grown **on demand** to cover the refused request (through
 //! [`grow_receiver_for_signal`]) and the build is retried once, so an oversized
-//! `{'EXIT', …}`/`{'DOWN', …}` reason is still delivered; a **relocation-exempt** receiver — whose
-//! heap must not move under the host's unpublished roots — instead gets the signal delivered
-//! through a **heap fragment** ([`enqueue_fragment_signal`]): no collection, no growth, no heap
-//! relocation, the message simply does not live on the receiver's heap. That is the model the C
-//! always uses for signals (`erl_proc_sig_queue.c`: a signal message is built into the message's
-//! own heap fragment, `erts_alloc_message(hsz,&hp)` → `mp->hfrag.off_heap`).
+//! `{'EXIT', …}`/`{'DOWN', …}` reason is still delivered; a receiver the crate's own
+//! [`Process::has_unpublished_roots`](crate::process::Process::has_unpublished_roots) test covers —
+//! a **relocation-exempt** one, whose heap must not move under the host's unpublished roots, or a
+//! **`Running`** one, whose machine's `regs` snapshot is stale — **or** one whose relocating
+//! collection the host's [`CollectionGate`] declines instead gets the signal delivered through a
+//! **heap fragment** ([`enqueue_fragment_signal`]): no collection, no growth, no heap relocation,
+//! the message simply does not live on the receiver's heap. That is the model the C always uses for
+//! signals (`erl_proc_sig_queue.c`: a signal message is built into the message's own heap fragment,
+//! `erts_alloc_message(hsz,&hp)` → `mp->hfrag.off_heap`).
+//!
+//! The [`CollectionGate`] is the **host's** half of the exhaustion policy: the crate knows a
+//! process is `Running` or explicitly exempt, but only the host knows whether a receiver's live
+//! root set is fully **scanned** by its collector. Installing a gate
+//! ([`ProcessTable::set_collection_gate`]) lets it decline the *relocation* for such a receiver —
+//! at every signal site and at [`ProcessTable::deliver`] — while the notification is still
+//! delivered, through the fragment route.
 //!
 //! Legacy C ground truth (read-only): `erts/emulator/beam/erl_ptab.{c,h}` (the process/port
 //! table and the local name registry), `erl_process.c` (`erts_ptab_new_process`) and
@@ -85,7 +95,7 @@ use crate::monitor::{
 };
 use crate::pid::{PortId, ProcessId, MAX_PROCESS_NUMBER};
 use crate::port::PortTable;
-use crate::process::{DeliverOutcome, Process, ProcessState};
+use crate::process::{CollectionGate, DeliverOutcome, Process, ProcessState};
 use crate::remote::{DistSignal, DistSignalRouter, PidTarget, RemoteMonitor, RemotePid};
 use crate::run_queue::Priority;
 use crate::signal::{
@@ -158,17 +168,25 @@ fn lookup_mut(slots: &mut [Slot], pid: ProcessId) -> Option<&mut Process> {
 /// ([`Process::ensure_capacity`](crate::process::Process::ensure_capacity), seeded with the word
 /// count the copier reported) and the caller retries once; `Ok(())` means "retry now".
 ///
-/// A receiver whose live terms may be **outside** the crate root set — relocation-exempt, or
-/// [`ProcessState::Running`] (its own machine is executing, so the `regs` snapshot is stale) —
-/// must not collect or grow, so the raw [`BeamError::Alloc`] refusal is returned **unchanged**
-/// (see [`Process::has_unpublished_roots`](crate::process::Process::has_unpublished_roots)). This
-/// is a purely **defensive** path: every live caller tests `has_unpublished_roots` *first* and
-/// routes such a receiver to the heap-fragment model ([`enqueue_fragment_payload`] — the
-/// apply-time builders [`build_signal_message`]/[`deliver_head_signal`], and the enqueue-time
-/// reason copy [`copy_reason_onto`]) without ever reaching here, so this branch is only reached if
-/// a new caller forgets the pre-test.
-fn grow_receiver_for_signal(process: &mut Process, failure: AllocFailure) -> Result<()> {
-    if process.has_unpublished_roots() {
+/// A receiver whose live terms may be **outside** the crate root set — relocation-exempt,
+/// [`ProcessState::Running`] (its own machine is executing, so the `regs` snapshot is stale), or
+/// declined by the host's [`CollectionGate`] (`decline`) — must not collect or grow, so the raw
+/// [`BeamError::Alloc`] refusal is returned **unchanged** (see
+/// [`Process::has_unpublished_roots`](crate::process::Process::has_unpublished_roots)). The first
+/// two are purely **defensive**: every live caller tests `has_unpublished_roots` *first* and routes
+/// such a receiver to the heap-fragment model ([`enqueue_fragment_payload`] — the apply-time
+/// builders [`build_signal_message`]/[`deliver_head_signal`], and the enqueue-time reason copy
+/// [`copy_reason_onto`]) without ever reaching here, so those branches are only reached if a new
+/// caller forgets the pre-test. The `decline` case is different: it is a **per-receiver host
+/// predicate**, so it is passed in here as well as pre-tested, and refusing here is what keeps the
+/// guarantee "declining the relocation never moves a word" true even for the rare interleaving the
+/// pre-test could not see.
+fn grow_receiver_for_signal(
+    process: &mut Process,
+    failure: AllocFailure,
+    decline: bool,
+) -> Result<()> {
+    if process.has_unpublished_roots() || decline {
         // The heap cannot be moved under the unpublished live terms: hand the refusal back
         // verbatim (`kind` still Heap/Message) — no collection, no growth, no retry.
         return Err(BeamError::Alloc(failure));
@@ -193,12 +211,14 @@ const SIGNAL_SCRATCH_WORDS: usize = 64;
 /// an ordinary receiver collects and grows its nursery on demand and the build is retried
 /// once ([`grow_receiver_for_signal`]), while a receiver whose live terms are **not** all in the
 /// crate root set ([`Process::has_unpublished_roots`](crate::process::Process::has_unpublished_roots)
-/// — relocation-exempt, or `Running` with a stale `regs` snapshot) gets the heap-fragment model
+/// — relocation-exempt, or `Running` with a stale `regs` snapshot) **or** whose relocating
+/// collection the host's [`CollectionGate`] declines (`decline`) gets the heap-fragment model
 /// instead.
 fn build_signal_message<F>(
     recipient: &mut Process,
     from: Eterm,
     reason: Eterm,
+    decline: bool,
     mut build: F,
 ) -> Result<()>
 where
@@ -212,10 +232,10 @@ where
         Err(BeamError::Alloc(failure))
             if matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
         {
-            if recipient.has_unpublished_roots() {
+            if recipient.has_unpublished_roots() || decline {
                 return enqueue_fragment_signal(recipient, from, reason, &mut build);
             }
-            grow_receiver_for_signal(recipient, failure)?;
+            grow_receiver_for_signal(recipient, failure, decline)?;
             let term = build(recipient.heap_mut(), reason)?;
             recipient.mailbox_mut().enqueue(Message::new(term, from));
             Ok(())
@@ -229,7 +249,8 @@ where
 /// path's `send_fragmented` ([`beam_message`]), and the model the C always uses for signals
 /// (`erl_proc_sig_queue.c` builds every signal message into the message's own heap fragment).
 ///
-/// This is the exhaustion fallback for a **relocation-exempt** receiver: no collection, no
+/// This is the exhaustion fallback for a receiver whose heap must not move — **relocation-exempt**,
+/// `Running`, or declined by the host's [`CollectionGate`]: no collection, no
 /// growth, no heap relocation — the message simply does not live on the receiver's heap.
 ///
 /// `src_off_heap` describes the heap `reason` lives in — the table whose refc binaries/MSO the
@@ -287,7 +308,8 @@ where
 ///
 /// A `process` whose live terms are **not** all in the crate root set
 /// ([`Process::has_unpublished_roots`](crate::process::Process::has_unpublished_roots) — the
-/// exception is the same as in [`Process::deliver`](crate::process::Process::deliver)) is refused:
+/// exception is the same as in [`Process::deliver`](crate::process::Process::deliver)) **or** whose
+/// relocating collection the host's [`CollectionGate`] declines (`decline`) is refused:
 /// the heap must not move under live terms the root set does not carry (a host's Rust locals, or
 /// the running machine's own x/stack/float registers), so the raw [`BeamError::Alloc`] refusal is
 /// returned unchanged — no collection, no growth, no retry. That refusal is the **signal the caller
@@ -302,6 +324,7 @@ fn copy_reason_onto(
     process: &mut Process,
     reason: Eterm,
     src_off_heap: Option<&OffHeapTable>,
+    decline: bool,
 ) -> Result<Eterm> {
     let Some(src) = src_off_heap else {
         return Ok(reason);
@@ -316,10 +339,10 @@ fn copy_reason_onto(
             // fragment. The defensive branch of `grow_receiver_for_signal` would refuse
             // identically; testing here keeps the "no collect, no grow" guarantee at the one place
             // the enqueue-time copy is performed.
-            if process.has_unpublished_roots() {
+            if process.has_unpublished_roots() || decline {
                 return Err(BeamError::Alloc(failure));
             }
-            grow_receiver_for_signal(process, failure)?;
+            grow_receiver_for_signal(process, failure, decline)?;
             process.copy_into_heap(reason, src)
         }
         Err(error) => Err(error),
@@ -489,6 +512,13 @@ pub struct ProcessTable {
     /// installed and termination behaves exactly as before the seam existed. Invoked **exactly
     /// once per death** by [`ProcessTable::terminate_into`], before the dying heap is released.
     exit_observer: Option<Box<dyn ProcessExitObserver>>,
+    /// The host **collection gate** seam (see [`CollectionGate`]); `None` means no gate is
+    /// installed and only the crate's own [`Process::has_unpublished_roots`] test can decline a
+    /// relocating collection. Consulted at every signal site (and by
+    /// [`ProcessTable::deliver`]) so a host that knows a receiver's live root set is not fully
+    /// scanned can refuse the move — the notification is still delivered, through the
+    /// heap-fragment route.
+    collection_gate: Option<Box<dyn CollectionGate>>,
 }
 
 impl ProcessTable {
@@ -509,6 +539,7 @@ impl ProcessTable {
             local_node: None,
             router: None,
             exit_observer: None,
+            collection_gate: None,
         }
     }    // --- allocation / lookup -------------------------------------------------
 
@@ -703,6 +734,53 @@ impl ProcessTable {
             .map(Process::is_relocation_exempt)
             .ok_or_else(error::unknown_process)
     }
+
+    // --- host collection gate ------------------------------------------------
+
+    /// Installs the host **collection gate** seam the table consults before any *relocating*
+    /// collection of a receiver's heap (see [`CollectionGate`]).
+    ///
+    /// Without a gate only the crate's own [`Process::has_unpublished_roots`] test
+    /// (relocation-exempt, or [`ProcessState::Running`]) can decline the move. A host that knows a
+    /// receiver's live root set is not fully scanned by its collector installs a gate here, and
+    /// every signal site plus [`ProcessTable::deliver`] then declines the relocation for such a
+    /// receiver: the notification is still delivered — through the heap-fragment route the
+    /// `Running`/relocation-exempt receiver already uses — with no collection, no growth and no
+    /// word moved.
+    pub fn set_collection_gate(&mut self, gate: Box<dyn CollectionGate>) {
+        self.collection_gate = Some(gate);
+    }
+
+    /// Takes the collection gate out of the table, returning it to the caller (and restoring the
+    /// no-gate behaviour, exactly as [`ProcessTable::take_dist_router`] does for the router).
+    pub fn take_collection_gate(&mut self) -> Option<Box<dyn CollectionGate>> {
+        self.collection_gate.take()
+    }
+
+    /// Whether a collection gate is installed.
+    pub fn has_collection_gate(&self) -> bool {
+        self.collection_gate.is_some()
+    }
+
+    /// Asks the installed collection gate whether a **relocating** collection of `pid`'s heap must
+    /// be declined. `false` when no gate is installed and `false` for a pid the table does not hold
+    /// (a receiver that died earlier in the same propagation has no heap left to move).
+    ///
+    /// Split borrows of two disjoint fields (`slots` and `collection_gate`), so the gate can be
+    /// handed the receiver's PCB while the slot table stays borrowed.
+    fn declines_signal_collection(&mut self, pid: ProcessId) -> bool {
+        let ProcessTable {
+            slots,
+            collection_gate,
+            ..
+        } = self;
+        let Some(process) = lookup(slots, pid) else {
+            return false;
+        };
+        collection_gate
+            .as_deref_mut()
+            .map_or(false, |gate| gate.declines_relocation(process))
+    }
     // --- message delivery ----------------------------------------------------
 
     /// Delivers `term` (with off-heap references resolved against `src_off_heap`) from `from`
@@ -712,6 +790,21 @@ impl ProcessTable {
     /// is recorded on the table's wake list and absorbed by
     /// `crate::scheduler::Scheduler::resume_woken` at the end of the current slice, so a send
     /// during a slice never lets `run_ready` exit with a freshly-woken process still queued.
+    ///
+    /// # The host collection gate
+    ///
+    /// When the installed [`CollectionGate`] declines a relocating collection of `to`'s heap
+    /// (`declines_signal_collection`), the receiver is marked relocation-exempt for
+    /// the duration of **exactly one** [`Process::deliver`](crate::process::Process::deliver) call
+    /// and its prior flag is restored unconditionally afterwards. The delivery therefore behaves
+    /// exactly as it does for a receiver the crate already declines to move: a payload that fits
+    /// the current nursery is enqueued normally, and one that does not returns
+    /// [`Process::deliver`](crate::process::Process::deliver)'s **raw**
+    /// `BeamError::Alloc(AllocKind::Heap | AllocKind::Message)` refusal — the exact value the
+    /// host's heap-fragment fallback keys on — with **no** collection, no growth and no word moved.
+    /// Declining the relocation never loses the message: the caller's fragment route still delivers
+    /// it, and a no-relocation growth
+    /// ([`Process::grow_nursery`](crate::process::Process::grow_nursery)) stays available.
     ///
     /// # Errors
     ///
@@ -724,11 +817,27 @@ impl ProcessTable {
         term: Eterm,
         src_off_heap: &OffHeapTable,
     ) -> Result<DeliverOutcome> {
+        let decline = self.declines_signal_collection(to);
         let outcome = {
             let Some(recipient) = lookup_mut(&mut self.slots, to) else {
                 return Err(error::unknown_process());
             };
-            recipient.deliver(from, term, src_off_heap)?
+            if decline {
+                // The gate declines the move: refuse the relocating collection for the duration of
+                // this one delivery by marking the receiver relocation-exempt, so
+                // `Process::deliver` surfaces its raw `AllocKind::Heap`/`AllocKind::Message`
+                // refusal UNCHANGED (the caller's heap-fragment key) rather than collecting and
+                // moving the heap under the receiver's unscanned roots. The prior flag is restored
+                // unconditionally — before the `?` — so a host that exempts a process itself keeps
+                // its mark and an ordinary receiver is left exactly as it was.
+                let prior = recipient.is_relocation_exempt();
+                recipient.set_relocation_exempt(true);
+                let delivered = recipient.deliver(from, term, src_off_heap);
+                recipient.set_relocation_exempt(prior);
+                delivered?
+            } else {
+                recipient.deliver(from, term, src_off_heap)?
+            }
         };
         if outcome.woke() {
             self.ready.push(to);
@@ -1016,7 +1125,8 @@ impl ProcessTable {
     /// (the `erlang:monitor/3` form). Mirrors
     /// [`ProcessTable::enqueue_port_down_message`]: the build goes through
     /// [`build_signal_message`] (so a full heap is a collection and a retry — or, for a
-    /// **relocation-exempt** watcher, a heap fragment — never fatal) and the wake is recorded on
+    /// **relocation-exempt**/`Running` watcher or one the host's [`CollectionGate`] declines, a
+    /// heap fragment — never fatal) and the wake is recorded on
     /// the wake list. `target` must be an immediate (a pid term; the named form materialises its
     /// `{Name, Node}` pair inside the closure); the `noproc` reason is an atom immediate, so
     /// nothing relocates. An unknown watcher is a no-op (the caller has already checked it, so
@@ -1030,10 +1140,11 @@ impl ProcessTable {
     ) -> Result<()> {
         let atoms = self.atoms; // Copy: the build closure captures it by value.
         let reason = atoms.noproc_term();
+        let decline = self.declines_signal_collection(watcher);
         let Some(recipient) = lookup_mut(&mut self.slots, watcher) else {
             return Ok(());
         };
-        build_signal_message(recipient, target, reason, |heap, reason| {
+        build_signal_message(recipient, target, reason, decline, |heap, reason| {
             let reference_term = reference.to_eterm(heap)?;
             build_down_message_term(
                 heap,
@@ -1079,10 +1190,11 @@ impl ProcessTable {
         let atoms = self.atoms; // Copy: the build closure captures it by value.
         let reason = atoms.noproc_term();
         let from = atoms.system_term();
+        let decline = self.declines_signal_collection(watcher);
         let Some(recipient) = lookup_mut(&mut self.slots, watcher) else {
             return Ok(());
         };
-        build_signal_message(recipient, from, reason, |heap, reason| {
+        build_signal_message(recipient, from, reason, decline, |heap, reason| {
             let reference_term = reference.to_eterm(heap)?;
             let target = heap.tuple(&[make_atom(name), make_atom(node)])?;
             build_down_message_term(
@@ -1819,7 +1931,8 @@ impl ProcessTable {
     /// `pid` is reclaimed **first** (the `take` below bumps its slot serial), so by the time the
     /// per-peer signals are generated the death has *already happened*. Every per-peer step is
     /// therefore **best-effort**: a failure to queue a local `{'EXIT', …}`/`{'DOWN', …}` (an
-    /// unreachable receiver heap, or a relocation-exempt receiver refusing to grow) or to route a
+    /// unreachable receiver heap, or a relocation-exempt / host-gate-declined receiver refusing to
+    /// grow) or to route a
     /// remote [`DistSignal::Exit`] is **logged** — never silently swallowed — and the cascade
     /// **continues** to the remaining peers, so the process-death observer (step 5) and the port
     /// monitor cleanup (step 6) always run. Aborting mid-cascade instead would leave later peers
@@ -2235,14 +2348,18 @@ impl ProcessTable {
     /// follows the shared policy: an ordinary `pid` collects and grows its nursery on demand and
     /// the build is retried once ([`grow_receiver_for_signal`]); a `pid` whose live terms are not
     /// all in the crate root set
-    /// ([`Process::has_unpublished_roots`](crate::process::Process::has_unpublished_roots)) must
-    /// not have its heap move under them, so its message is built into a heap fragment instead
+    /// ([`Process::has_unpublished_roots`](crate::process::Process::has_unpublished_roots)) **or**
+    /// whose relocating collection the host's [`CollectionGate`] declines must not have its heap
+    /// move under them, so its message is built into a heap fragment instead
     /// ([`enqueue_fragment_signal`]) — no collection, no growth, no retry. On success the head
     /// signal is removed and a blocked `pid` is woken (and recorded on the wake list).
     fn deliver_head_signal<F>(&mut self, pid: ProcessId, from: Eterm, mut build: F) -> Result<()>
     where
         F: FnMut(&mut Heap, Eterm) -> Result<Eterm>,
     {
+        // Read once, before the delivery loop: the gate is consulted before the recipient borrow
+        // is taken (it needs `&mut self`), and the decline is stable for this one delivery.
+        let decline = self.declines_signal_collection(pid);
         let mut attempt = 0;
         loop {
             let Some(reason) = self.head_signal_reason(pid) else {
@@ -2261,12 +2378,13 @@ impl ProcessTable {
                     if attempt == 0 && matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
                 {
                     attempt += 1;
-                    if recipient.has_unpublished_roots() {
-                        // The heap must not move under the live terms the root set does not carry.
+                    if recipient.has_unpublished_roots() || decline {
+                        // The heap must not move under the live terms the root set does not carry,
+                        // nor under a receiver whose collection the host declined.
                         enqueue_fragment_signal(recipient, from, reason, &mut build)?;
                         break;
                     }                    // A collection relocates the queued reason word: re-read it next iteration.
-                    grow_receiver_for_signal(recipient, failure)?;
+                    grow_receiver_for_signal(recipient, failure, decline)?;
                 }
                 Err(error) => return Err(error),
             }
@@ -2346,8 +2464,9 @@ impl ProcessTable {
     /// reason already lives in `to`'s heap) so the queued reason always outlives the signaller.
     ///
     /// A `to` whose live terms are not all in the crate root set
-    /// ([`Process::has_unpublished_roots`](crate::process::Process::has_unpublished_roots)) whose
-    /// full nursery refuses that copy is the one case the queue cannot serve — the queued reason
+    /// ([`Process::has_unpublished_roots`](crate::process::Process::has_unpublished_roots)) **or**
+    /// whose relocating collection the host's [`CollectionGate`] declines, and whose
+    /// full nursery refuses that copy, is the one case the queue cannot serve — the queued reason
     /// must live on the receiver's own heap (the queue is an in-heap sub-rootset) and that heap
     /// must not be collected or grown — so a **trapping** receiver gets the
     /// `{'EXIT', From, Reason}` the queue would have delivered built into a heap fragment instead
@@ -2364,14 +2483,15 @@ impl ProcessTable {
         reason: Eterm,
         src: Option<&OffHeapTable>,
     ) -> Result<()> {
+        let decline = self.declines_signal_collection(to);
         let Some(recipient) = lookup_mut(&mut self.slots, to) else {
             return Ok(());
         };
         // Both are read before the copy: the fragment route below needs `self` again, and
         // `recipient`'s borrow must be over by then.
-        let refuses_collect = recipient.has_unpublished_roots();
+        let refuses_collect = recipient.has_unpublished_roots() || decline;
         let trapping = recipient.is_trapping_exit();
-        match copy_reason_onto(recipient, reason, src) {
+        match copy_reason_onto(recipient, reason, src, decline) {
             Ok(reason) => {
                 recipient
                     .signals_mut()
@@ -2398,8 +2518,9 @@ impl ProcessTable {
     /// carry none — and is a heap-independent immediate, carried verbatim.
     ///
     /// A `to` whose live terms are not all in the crate root set
-    /// ([`Process::has_unpublished_roots`](crate::process::Process::has_unpublished_roots)) whose
-    /// full nursery refuses that copy cannot hold the queued signal at all (see
+    /// ([`Process::has_unpublished_roots`](crate::process::Process::has_unpublished_roots)) **or**
+    /// whose relocating collection the host's [`CollectionGate`] declines, and whose
+    /// full nursery refuses that copy, cannot hold the queued signal at all (see
     /// [`ProcessTable::enqueue_exit_signal`]), so the DOWN is built into a heap fragment instead
     /// ([`ProcessTable::deliver_down_fragment`]) — a DOWN carries no exit policy, so it is the whole
     /// signal.
@@ -2413,13 +2534,14 @@ impl ProcessTable {
         reason: Eterm,
         src: Option<&OffHeapTable>,
     ) -> Result<()> {
+        let decline = self.declines_signal_collection(to);
         let Some(recipient) = lookup_mut(&mut self.slots, to) else {
             return Ok(());
         };
         // Read before the copy: the fragment route below needs `self` again, and `recipient`'s
         // borrow must be over by then.
-        let refuses_collect = recipient.has_unpublished_roots();
-        match copy_reason_onto(recipient, reason, src) {
+        let refuses_collect = recipient.has_unpublished_roots() || decline;
+        match copy_reason_onto(recipient, reason, src, decline) {
             Ok(reason) => {
                 recipient
                     .signals_mut()
@@ -2438,7 +2560,8 @@ impl ProcessTable {
 
     /// Builds the `{'EXIT', From, Reason}` a **trapping** receiver's queued exit signal would have
     /// been materialised into and enqueues it as a **heap fragment** — the enqueue-time route of
-    /// [`enqueue_fragment_payload`], taken when `to` is **relocation-exempt** and its full nursery
+    /// [`enqueue_fragment_payload`], taken when `to` is **relocation-exempt**/`Running` or the
+    /// host's [`CollectionGate`] declines and its full nursery
     /// refused the reason copy ([`ProcessTable::enqueue_exit_signal`]).
     ///
     /// The signal never reaches the queue (its reason cannot live there), so this wakes a blocked
@@ -2470,7 +2593,8 @@ impl ProcessTable {
     /// Builds the `{'DOWN', Ref, Kind, Target, Reason}` message the queue's materialiser
     /// ([`ProcessTable::deliver_down_message`]) would have built and enqueues it as a **heap
     /// fragment** — the enqueue-time route of [`enqueue_fragment_payload`], taken when `to` is
-    /// **relocation-exempt** and its full nursery refused the reason copy
+    /// **relocation-exempt**/`Running` or the host's [`CollectionGate`] declines and its full
+    /// nursery refused the reason copy
     /// ([`ProcessTable::enqueue_down_signal`]).
     ///
     /// The DOWN never reaches the queue (its reason cannot live there), so this wakes a blocked
@@ -2985,10 +3109,11 @@ impl ProcessTable {
         reason: Eterm,
     ) -> Result<()> {
         let atoms = self.atoms; // Copy: the build closure captures it by value.
+        let decline = self.declines_signal_collection(watcher);
         let Some(recipient) = lookup_mut(&mut self.slots, watcher) else {
             return Ok(());
         };
-        build_signal_message(recipient, remote.node(), reason, |heap, reason| {
+        build_signal_message(recipient, remote.node(), reason, decline, |heap, reason| {
             let reference_term = reference.to_eterm(heap)?;
             // A remote monitor carries no user tag (see `monitor_term_with_tag`), so the
             // DOWN keeps the default `'DOWN'` head atom; the closure materialises the remote
@@ -3017,10 +3142,11 @@ impl ProcessTable {
         reason: Eterm,
     ) -> Result<()> {
         let atoms = self.atoms; // Copy: the build closure captures it by value.
+        let decline = self.declines_signal_collection(peer);
         let Some(recipient) = lookup_mut(&mut self.slots, peer) else {
             return Ok(());
         };
-        build_signal_message(recipient, remote.node(), reason, |heap, reason| {
+        build_signal_message(recipient, remote.node(), reason, decline, |heap, reason| {
             let from = remote.to_eterm(heap)?;
             build_exit_message_term(heap, &atoms, from, reason)
         })?;
@@ -3190,10 +3316,11 @@ impl ProcessTable {
     ) -> Result<()> {
         let atoms = self.atoms; // Copy: the build closure captures it by value.
         let from = port.to_eterm();
+        let decline = self.declines_signal_collection(to);
         let Some(recipient) = lookup_mut(&mut self.slots, to) else {
             return Ok(());
         };
-        build_signal_message(recipient, from, reason, |heap, reason| {
+        build_signal_message(recipient, from, reason, decline, |heap, reason| {
             let reference_term = reference.to_eterm(heap)?;
             build_down_message_port(heap, &atoms, tag, reference_term, port, reason)
         })?;
@@ -3205,17 +3332,19 @@ impl ProcessTable {
     }
 
     /// Enqueues `{'EXIT', Port, Reason}` into `to`'s mailbox — built on `to`'s own heap, or into
-    /// a heap fragment when `to` is **relocation-exempt** (see
+    /// a heap fragment when `to` is **relocation-exempt**/`Running` or the host's
+    /// [`CollectionGate`] declines (see
     /// [`ProcessTable::deliver_head_signal`]) — and wakes `to` when it was blocked.
     ///
     /// An unknown `to` is skipped (the linked peer died earlier).
     fn enqueue_port_exit_message(&mut self, to: ProcessId, port: PortId, reason: Eterm) -> Result<()> {
         let atoms = self.atoms; // Copy: the build closure captures it by value.
         let from = port.to_eterm();
+        let decline = self.declines_signal_collection(to);
         let Some(recipient) = lookup_mut(&mut self.slots, to) else {
             return Ok(());
         };
-        build_signal_message(recipient, from, reason, |heap, reason| {
+        build_signal_message(recipient, from, reason, decline, |heap, reason| {
             build_exit_message_term(heap, &atoms, from, reason)
         })?;
         let woke = recipient.wake();
@@ -3231,6 +3360,7 @@ mod tests {
     //! link/monitor propagation is covered by `tests/signals.rs` and the port
     //! ownership/link/monitor surface by `crate::port` and `tests/ports.rs`.
 
+    use beam_term::compare;
     use beam_term::prelude::{
         is_tuple, make_atom, make_small, tuple_element, tuple_size, AtomTable,
     };
@@ -4093,36 +4223,12 @@ mod tests {
     fn an_exempt_receiver_gets_its_apply_time_signal_through_a_heap_fragment() {
         let mut table = table();
         let signaller = table.spawn_default().expect("a fresh process");
-        let receiver = table.spawn_default().expect("a fresh process");
+        let (receiver, filler_words) = saturated_receiver(&mut table);
         // A trapping receiver survives the exit and queues it as a message.
         table
             .get_mut(receiver)
             .expect("the receiver is live")
             .set_trap_exit(true);
-
-        // Leave exactly three words free in the receiver's nursery: the four-word
-        // `{'EXIT', From, Reason}` tuple (`1` header + `3` elements) cannot fit, so the build is
-        // refused and the exemption is what decides the fallback.
-        let capacity = table
-            .get(receiver)
-            .expect("the receiver is live")
-            .collector()
-            .young()
-            .capacity_words();
-        let filler_words = capacity - 3;
-        let mut src = Heap::new(filler_words + 8).expect("the source arena allocates");
-        let elems: Vec<Eterm> = (0..filler_words - 1)
-            .map(|i| make_small(i as i64))
-            .collect();
-        let filler = src.tuple(&elems).expect("the filler fits the source arena");
-        table
-            .deliver_simple(receiver, signaller.to_eterm(), filler)
-            .expect("the filler fits the receiver's nursery");
-        assert_eq!(
-            table.get(receiver).expect("live").heap_used_words(),
-            filler_words,
-            "the delivery left exactly three words free"
-        );
 
         table
             .set_relocation_exempt(receiver, true)
@@ -4193,5 +4299,366 @@ mod tests {
         assert_eq!(size, 3, "the exit message is the three-tuple EXIT/From/Reason");
         assert_eq!(from, signaller.to_eterm(), "the signaller is the link/exit sender");
         assert_eq!(delivered, make_small(42), "the reason is delivered verbatim");
+    }
+
+    /// A gate that declines **every** relocation, recording the pids it was asked about — the
+    /// minimal stand-in for the host's unscanned-root predicate.
+    struct AlwaysDeclines {
+        asked: Vec<ProcessId>,
+    }
+
+    impl CollectionGate for AlwaysDeclines {
+        fn declines_relocation(&mut self, receiver: &Process) -> bool {
+            self.asked.push(receiver.pid());
+            true
+        }
+    }
+
+    /// Spawns a receiver and drains its nursery to exactly **three free words** with a delivered
+    /// filler message, returning the receiver and the filler's word count.
+    ///
+    /// Three free words is one short of the four-word `{'EXIT', From, Reason}` tuple (`1` header +
+    /// `3` elements) — and of the `{'DOWN', …}` build's *first* allocation, its boxed four-word
+    /// monitor reference — so an **apply-time build** is refused by capacity and, a refused request
+    /// writing nothing, leaves the receiver's heap exactly as the fixture found it.
+    fn saturated_receiver(table: &mut ProcessTable) -> (ProcessId, usize) {
+        let receiver = table.spawn_default().expect("a fresh process");
+        let capacity = table
+            .get(receiver)
+            .expect("the receiver is live")
+            .collector()
+            .young()
+            .capacity_words();
+        let filler_words = capacity - 3;
+        let mut src = Heap::new(filler_words + 8).expect("the source arena allocates");
+        let elems: Vec<Eterm> = (0..filler_words - 1)
+            .map(|i| make_small(i as i64))
+            .collect();
+        let filler = src.tuple(&elems).expect("the filler fits the source arena");
+        table
+            .deliver_simple(receiver, ProcessId::new(999, 0).to_eterm(), filler)
+            .expect("the filler fits the receiver's nursery");
+        assert_eq!(
+            table.get(receiver).expect("live").heap_used_words(),
+            filler_words,
+            "the fixture left exactly three words free"
+        );
+        (receiver, filler_words)
+    }
+
+    /// The gate seam's own surface: `has_collection_gate`/`take_collection_gate`, and
+    /// `declines_signal_collection` answering `false` with no gate and for a pid the table does not
+    /// hold (a receiver that died earlier in the propagation has no heap left to move).
+    #[test]
+    fn the_collection_gate_seam_installs_takes_and_answers_only_for_live_pids() {
+        let mut table = table();
+        let live = table.spawn_default().expect("a fresh process");
+        let unknown = ProcessId::new(4095, 0);
+
+        assert!(!table.has_collection_gate(), "a fresh table has no gate");
+        assert!(
+            !table.declines_signal_collection(live),
+            "with no gate installed nothing declines"
+        );
+
+        table.set_collection_gate(Box::new(AlwaysDeclines { asked: Vec::new() }));
+        assert!(table.has_collection_gate());
+        assert!(
+            table.declines_signal_collection(live),
+            "the installed gate is consulted for a live receiver"
+        );
+        assert!(
+            !table.declines_signal_collection(unknown),
+            "the gate is never asked about a pid the table does not hold"
+        );
+
+        let taken = table.take_collection_gate().expect("the gate comes back out");
+        assert!(!table.has_collection_gate());
+        assert!(
+            !table.declines_signal_collection(live),
+            "taking the gate restores the no-gate behaviour"
+        );
+        drop(taken);
+    }
+
+    /// A **declining gate** — on a receiver that is neither relocation-exempt nor `Running` — routes
+    /// the apply-time `{'EXIT', …}` build through a heap fragment: the message is delivered whole,
+    /// with the receiver's nursery neither collected nor moved.
+    ///
+    /// This is the same controlled experiment
+    /// [`an_exempt_receiver_gets_its_apply_time_signal_through_a_heap_fragment`] runs, with the
+    /// **host gate** in place of the exemption flag: the crate's own gate answers `false` for this
+    /// receiver, so the decline can only have come from the host.
+    #[test]
+    fn a_declining_gate_routes_the_apply_time_signal_through_a_fragment() {
+        let mut table = table();
+        let signaller = table.spawn_default().expect("a fresh process");
+        let (receiver, filler_words) = saturated_receiver(&mut table);
+        table
+            .get_mut(receiver)
+            .expect("the receiver is live")
+            .set_trap_exit(true);
+        let receiver_state = table.get(receiver).expect("live").state();
+        assert!(
+            !table.get(receiver).expect("live").is_relocation_exempt(),
+            "the fixture's receiver is not exempt"
+        );
+        assert_ne!(
+            receiver_state,
+            ProcessState::Running,
+            "and not `Running`, so the crate's own gate is false for it"
+        );
+
+        table.set_collection_gate(Box::new(AlwaysDeclines { asked: Vec::new() }));
+        let minor_before = table.get(receiver).expect("live").collector().minor_gcs();
+        let base_before = table.get(receiver).expect("live").collector().young().base();
+
+        table
+            .send_exit(signaller, receiver, make_small(42))
+            .expect("the trapping receiver takes the signal");
+
+        let r = table.get(receiver).expect("the receiver survived");
+        assert_eq!(
+            r.collector().minor_gcs(),
+            minor_before,
+            "a declined relocation must not collect"
+        );
+        assert_eq!(
+            r.collector().young().base(),
+            base_before,
+            "a declined relocation must not move or grow the nursery"
+        );
+        assert_eq!(
+            r.heap_used_words(),
+            filler_words,
+            "the fragment-built signal wrote nothing on the receiver's heap"
+        );
+        assert_eq!(
+            r.mailbox().len(),
+            2,
+            "the notification is NOT lost: the filler and the exit message"
+        );
+        let exit_msg = {
+            table
+                .get_mut(receiver)
+                .expect("live")
+                .receive(|_| true)
+                .expect("the filler");
+            table
+                .get_mut(receiver)
+                .expect("live")
+                .receive(|_| true)
+                .expect("the exit message behind the filler")
+        };
+        let fragments = exit_msg
+            .fragments()
+            .expect("the declining gate's fallback enqueued a fragment-resident message");
+        assert!(
+            fragments
+                .iter()
+                .next()
+                .expect("one fragment")
+                .contains(exit_msg.payload()),
+            "the payload root lives inside the fragment"
+        );
+        // SAFETY: `payload` is the live `{'EXIT', Signaller, Reason}` tuple the fragment holds;
+        // elements 0..=2 are in bounds.
+        let payload = exit_msg.payload();
+        let (size, head, from, delivered) = unsafe {
+            (
+                tuple_size(payload),
+                tuple_element(payload, 0),
+                tuple_element(payload, 1),
+                tuple_element(payload, 2),
+            )
+        };
+        assert_eq!(size, 3, "the exit message is the three-tuple EXIT/From/Reason");
+        assert_eq!(head, make_atom(table.atoms.exit()), "the head is the `'EXIT'` atom");
+        assert_eq!(from, signaller.to_eterm(), "the signaller is the exit sender");
+        assert_eq!(delivered, make_small(42), "the reason is delivered verbatim");
+    }
+
+    /// The **enqueue-time** half: with the gate declining, a reason *larger than the receiver's
+    /// whole nursery* cannot be copied onto that heap, so the signal never reaches the signal queue
+    /// and the `{'EXIT', …}` is built into a heap fragment straight from the enqueue site — with
+    /// the nursery untouched and no queued signal left behind.
+    #[test]
+    fn a_declining_gate_refuses_the_enqueue_time_reason_copy_and_delivers_a_fragment() {
+        let mut table = table();
+        let signaller = table.spawn_default().expect("a fresh process");
+        let (receiver, filler_words) = saturated_receiver(&mut table);
+        table
+            .get_mut(receiver)
+            .expect("the receiver is live")
+            .set_trap_exit(true);
+
+        let capacity = table
+            .get(receiver)
+            .expect("live")
+            .collector()
+            .young()
+            .capacity_words();
+        let mut src = Heap::new(capacity + 8).expect("the source arena allocates");
+        let elems: Vec<Eterm> = (0..capacity).map(|i| make_small(i as i64)).collect();
+        let reason = src.tuple(&elems).expect("the oversized reason fits the arena");
+        assert!(
+            size_object(reason) > filler_words,
+            "the fixture's premise: the reason cannot fit the receiver's free space"
+        );
+
+        table.set_collection_gate(Box::new(AlwaysDeclines { asked: Vec::new() }));
+        let minor_before = table.get(receiver).expect("live").collector().minor_gcs();
+        let base_before = table.get(receiver).expect("live").collector().young().base();
+
+        table
+            .send_exit(signaller, receiver, reason)
+            .expect("the trapping receiver takes the signal");
+
+        let r = table.get(receiver).expect("the receiver survived");
+        assert_eq!(
+            r.collector().minor_gcs(),
+            minor_before,
+            "a declined relocation must not collect"
+        );
+        assert_eq!(
+            r.collector().young().base(),
+            base_before,
+            "a declined relocation must not move or grow the nursery"
+        );
+        assert_eq!(
+            r.heap_used_words(),
+            filler_words,
+            "the refused reason copy and the fragment build wrote nothing on the receiver's heap"
+        );
+        assert_eq!(
+            table.pending_signals(receiver).expect("live"),
+            0,
+            "the refused reason copy left no queued signal behind"
+        );
+        assert_eq!(r.mailbox().len(), 2, "the notification is NOT lost");
+        let exit_msg = {
+            table
+                .get_mut(receiver)
+                .expect("live")
+                .receive(|_| true)
+                .expect("the filler");
+            table
+                .get_mut(receiver)
+                .expect("live")
+                .receive(|_| true)
+                .expect("the exit message behind the filler")
+        };
+        let fragments = exit_msg
+            .fragments()
+            .expect("the enqueue-time fallback enqueued a fragment-resident message");
+        assert!(
+            fragments
+                .iter()
+                .next()
+                .expect("one fragment")
+                .contains(exit_msg.payload()),
+            "the payload root lives inside the fragment"
+        );
+        // SAFETY: `payload` is the live `{'EXIT', Signaller, Reason}` tuple the fragment holds;
+        // elements 0..=2 are in bounds.
+        let payload = exit_msg.payload();
+        let (size, head, from, delivered) = unsafe {
+            (
+                tuple_size(payload),
+                tuple_element(payload, 0),
+                tuple_element(payload, 1),
+                tuple_element(payload, 2),
+            )
+        };
+        assert_eq!(size, 3, "the exit message is the three-tuple EXIT/From/Reason");
+        assert_eq!(head, make_atom(table.atoms.exit()), "the head is the `'EXIT'` atom");
+        assert_eq!(from, signaller.to_eterm(), "the signaller is the exit sender");
+        assert!(
+            compare::eq(delivered, reason, &AtomTable::new()),
+            "the oversized reason is delivered whole (compared structurally: the copy lives in \
+             the fragment, not on the receiver's heap)"
+        );
+    }
+
+    /// The **delivery** half: [`ProcessTable::deliver`] consults the gate too. When it declines, the
+    /// table marks the receiver relocation-exempt for the duration of exactly one
+    /// [`Process::deliver`](crate::process::Process::deliver) call, so the copy engine's **raw**
+    /// `AllocKind::Heap`/`AllocKind::Message` refusal (the caller's heap-fragment key) reaches the
+    /// caller with the nursery untouched — and the receiver's own exemption flag is restored, so an
+    /// ordinary receiver is left exactly as it was. Taking the gate away restores the ordinary
+    /// collect-and-grow arm.
+    #[test]
+    fn a_declining_gate_makes_the_table_delivery_surface_the_raw_refusal() {
+        let mut table = table();
+        let (receiver, filler_words) = saturated_receiver(&mut table);
+        // One word more than the three free words the fixture left.
+        let mut src = Heap::new(16).expect("the source arena allocates");
+        let payload = src
+            .tuple(&[make_small(100), make_small(101), make_small(102)])
+            .expect("the payload fits the arena");
+        assert_eq!(size_object(payload), 4, "the payload is the refused four-word tier");
+        let from = ProcessId::new(998, 0).to_eterm();
+
+        table.set_collection_gate(Box::new(AlwaysDeclines { asked: Vec::new() }));
+        let minor_before = table.get(receiver).expect("live").collector().minor_gcs();
+        let base_before = table.get(receiver).expect("live").collector().young().base();
+
+        match table.deliver_simple(receiver, from, payload) {
+            Err(BeamError::Alloc(failure)) => assert!(
+                matches!(failure.kind, AllocKind::Heap | AllocKind::Message),
+                "the raw refusal keeps its Heap/Message kind, got {:?}",
+                failure.kind
+            ),
+            other => panic!("expected the raw allocation refusal, got {other:?}"),
+        }
+
+        let r = table.get(receiver).expect("live");
+        assert_eq!(
+            r.collector().minor_gcs(),
+            minor_before,
+            "a declined delivery must not collect"
+        );
+        assert_eq!(
+            r.collector().young().base(),
+            base_before,
+            "a declined delivery must not move or grow the nursery"
+        );
+        assert_eq!(
+            r.heap_used_words(),
+            filler_words,
+            "the refused delivery wrote nothing on the receiver's heap"
+        );
+        assert_eq!(r.mailbox().len(), 1, "the refused delivery enqueued nothing");
+        assert!(
+            !r.is_relocation_exempt(),
+            "the temporary exemption the gate implies is restored afterwards"
+        );
+
+        // The control: with the gate taken away the identical delivery takes the ordinary
+        // collect-and-grow arm and lands on the receiver's (new) nursery.
+        assert!(table.take_collection_gate().is_some());
+        let src_off_heap = OffHeapTable::new();
+        table
+            .deliver(receiver, from, payload, &src_off_heap)
+            .expect("the ordinary arm collects, grows and retries");
+        let delivered = {
+            let process = table.get_mut(receiver).expect("live");
+            process.receive(|_| true).expect("the filler");
+            let message = process.receive(|_| true).expect("the payload behind the filler");
+            assert!(
+                message.fragments().is_none(),
+                "the non-declined arm builds on the receiver's own heap, never in a fragment"
+            );
+            message.payload()
+        };
+        let r = table.get(receiver).expect("live");
+        assert!(
+            r.collector().minor_gcs() > minor_before,
+            "the non-declined arm collected (the relocation was not declined)"
+        );
+        assert!(
+            r.collector().young().contains_term(delivered),
+            "the retried build landed on the receiver's own (new) nursery"
+        );
     }
 }
