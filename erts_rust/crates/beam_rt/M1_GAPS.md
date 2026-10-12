@@ -341,19 +341,31 @@ re-fetch.
   half (`erlang:term_to_binary/1,2`/`external_size/1,2`, alongside the necessarily module-wide
   `erlang:load_nif/2`) stays **module-wide** because narrowing it is unsound. `compile.beam` imports
   `term_to_binary/1,2`, so a narrowed guard admits `compile:*` in-machine on the **scheduled,
-  non-relocation-exempt** route, where a delivery-driven collection inside an admitted call relocates
-  the process heap against an **incomplete** root set: the running machine's `x`/stack/FR are published
-  only at the engine heap-admission points (`context/gc.rs::ensure_heap_full` → `publish_roots_full`
-  ~:663, `alloc_words_rooted` ~:862) and at a park (`publish_parked_roots`), **never** around
-  `ExecutionContext::call_bif` (`beam_engine/src/interpreter/bif.rs:188-193`), while
-  `Process::collect`/`ensure_capacity`/`grow_receiver_for_signal` relocate against the **stale**
-  `Process::regs` (`beam_process/src/process.rs:1199-1278`, `beam_process/src/ptab.rs:170-185`) — and a
-  `beam_bifs` fast-path BIF's Rust-local accumulator is unrooted for the same reason. Narrowing the
-  guard therefore makes **both** cases a hard `mismatch` (a nondeterministic abort —
-  `beam_term::ops: invalid boxed header subtag 0x12`, exit 101 under `BEAM_RT_TIER=interpreter` on the
-  `no_spawn` case; `*** Internal compiler error ***`/`exception exit: badarg` on the scheduled one).
-  The parked-`pending_exception` rooting is not the missing piece: the hazard lives in the **running**
-  (mid-slice) window, not the park window.
+  non-relocation-exempt** route, where a collection at the running machine's **own** heap-admission
+  point (`ensure_heap`/`ensure_heap_full` → `collect_or_grow`) relocates the process heap against an
+  **incomplete** root set: the running machine's `x`/stack/FR are published into `Process::regs` only
+  at those same admission points (`context/gc.rs::ensure_heap_full` → `publish_roots_full` ~:663,
+  `alloc_words_rooted` ~:862) and at a park (`publish_parked_roots`), **never** around
+  `ExecutionContext::call_bif` (`beam_engine/src/interpreter/bif.rs:188-193`), and a term the in-flight
+  call chain holds outside `x`/stack/FR (`Machine::args_scratch`, or a `beam_bifs` fast-path BIF's
+  Rust-local accumulator held across a `ctx.call_fun` boundary) is not in the root set at all. The
+  corrupting collection is **not** a delivery: `Process::has_unpublished_roots()` (=
+  `relocation_exempt || state == ProcessState::Running`, `beam_process/src/process.rs:1097`) refuses
+  every delivery-driven collect/grow against a `Running` receiver, so the delivery paths
+  (`Process::collect`/`ensure_capacity`/`grow_receiver_for_signal`, `beam_process/src/ptab.rs`) are no
+  longer the exposure. Narrowing the guard therefore makes **both** cases a hard `mismatch`, and it is a
+  relocating-collection race rather than a difference in compile behaviour: a nursery large enough that
+  no collection occurs (`+hms 4194304`, `+hms 16777216`) makes both shapes pass (stdout `1`, exit 0) on
+  both tiers, and so does the `-eval` route, whose whole driver is wrapped in `with_relocation_exempt`
+  (3/3 runs print `1`), where the scheduled `run` route aborts 8/8 at the default nursery. The
+  reproducible signature on the `no_spawn` shape is `beam_term::ops: invalid boxed header subtag 0x2`
+  (SIGABRT, exit 134; exit 101 under `BEAM_RT_TIER=interpreter`) with first-hand backtrace `cmp_impl` ←
+  `Machine::eval_test` ← `run_label_outcome` ← `run_label_blocking` (inside `with_relocation_exempt`) ←
+  `apply_fun` ← `FunBridge::call_fun` ← `beam_bifs::lists::foldl3` (`beam_bifs/src/lists.rs:1356`); the
+  race can also surface as a wrong `3`/exit 0 instead of the abort. The scheduled shape folds into
+  `*** Internal compiler error ***`/`exception exit: badarg` (exit 1). The parked-`pending_exception`
+  rooting is not the missing piece either: the hazard lives in the **running** (mid-slice) window, not
+  the park window.
 * **The native `file_server_2` service** (`src/native/file_server.rs`) answers the
   `{'$gen_call',{Pid,Tag},Request}` / `{file_request|io_request,From,ReplyAs,Request}` wire and the
   server/io-device request surface `lib/kernel/src/file.erl` issues (`{open,…}`, `read_file`, `list_dir`,
@@ -518,7 +530,7 @@ The residual exposure is a live term held **outside** `process.regs` — a Rust 
 ## Cross-node handoffs (crate index)
 * **Differential gate** — **no case disagrees**; the sole `unsupported` is `wire/new_fun_ext_encode` (an `erl_eval` lambda's `NEW_FUN_EXT` identity — structurally unclosable). The rollup/allowlist state belongs to [`../tools/differential/CONTEXT.md`](../tools/differential/CONTEXT.md); re-run `gate.sh` for the figure.
 * **A.7/A.9 boot** — completes (the real `start.boot` to `{progress,started}`, leaving a live `logger_server` registered as `logger`); the residual is whatever the started applications still need from `beam_bifs`. Detail: [`src/boot/CONTEXT.md`](src/boot/CONTEXT.md) + [`src/native/CONTEXT.md`](src/native/CONTEXT.md).
-* **A.9 E0 — in-process compilation works and is byte-identical; the *scheduled* route stays gated.** `compile:file(File, [no_spawn_compiler_process, deterministic, {outdir, Dir}])` runs **in-process** and writes a `.beam` **byte-identical** to the oracle's identical-option run (`cmp` clean; the `Code` chunk also matches `erlc +deterministic`) — `tests/compile_file.rs`. Both `selfhost/*` corpus cases report `unsupported: opcode: run: process blocked (no message available)`, so their `tools/differential/known-gaps.txt` entries stay (**repo-root owned, not editable from here**; the cause named there — an unpublished live `Machine::pending_exception` — is inaccurate, the parked reason **is** rooted). What gates the route is the nested-non-pumping parked callee **plus** the module-wide fun-image half of `module_observes_its_call_site` — narrowing it admits `compile:*` in-machine on the scheduled, non-exempt route, where a delivery-driven collection relocates the heap under the running machine's unpublished mid-slice root set, making both cases a hard `mismatch`. Publish points, line cites and the fast-path BIF accumulator: *Cross-node handoff detail* above.
+* **A.9 E0 — in-process compilation works and is byte-identical; the *scheduled* route stays gated.** `compile:file(File, [no_spawn_compiler_process, deterministic, {outdir, Dir}])` runs **in-process** and writes a `.beam` **byte-identical** to the oracle's identical-option run (`cmp` clean; the `Code` chunk also matches `erlc +deterministic`) — `tests/compile_file.rs`. Both `selfhost/*` corpus cases report `unsupported: opcode: run: process blocked (no message available)`, so their `tools/differential/known-gaps.txt` entries stay (**repo-root owned, not editable from here**; the cause named there — an unpublished live `Machine::pending_exception` — is inaccurate, the parked reason **is** rooted). What gates the route is the nested-non-pumping parked callee **plus** the module-wide fun-image half of `module_observes_its_call_site` — narrowing it admits `compile:*` in-machine on the scheduled, non-exempt route, where a collection at the running machine's **own** heap-admission point relocates the heap against a root set that does not reach a term the in-flight call chain holds (a *delivery*-driven collect of a `Running` receiver is already refused, `Process::has_unpublished_roots`), making both cases a hard `mismatch`. Publish points, line cites and the fast-path BIF accumulator: *Cross-node handoff detail* above.
 * **The native `file_server_2` service** — its served request surface and every typed per-request gap are tabled in [`src/native/CONTEXT.md`](src/native/CONTEXT.md); a process-**alias** reply tag is the typed `unsupported`.
 * **`beam_process` / `beam_message`** — an owning drain for the wake list and a `!Send`-friendly `SchedulerPool` for SMP adoption; the split heap+mailbox borrow exists.
 * **`beam_engine`** — a `MinimalContext` arena word/byte accessor (so `erlang:memory/0,1`'s process figures are real on the single-pass path).
