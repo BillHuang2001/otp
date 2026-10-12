@@ -70,6 +70,6 @@ The pass runs the **port-less** `Scheduler::run_ready` (its port half, `Runtime:
 * `scheduler.rs` (+ `scheduler/tests.rs`) → the scheduler-pass family (one pass = processes → ports → timers → distribution, in bounded steps; the native-service step `service_file_requests` runs right after the run queue drains) + the `Runtime::with_port_table` short-borrow seam for port-aware `beam_process` operations.
 * `gc.rs` → `GcState` (the pin/halt/valve sets, the `foreign` per-pid descent latch, the `walk: WalkScratch`) + `gc_stats`/`GcStatsSnapshot` + `try_stabilize_escaped`/`try_stabilize_escaped_with` + `foreign_reachable`/`note_foreign_reachable`/`walk_scratch`.
 * `ets_owner.rs` → the `ProcessExitObserver` host (`OwnerIndex`/`EtsExitObserver`) + `Runtime::drain_ets_owner_exits`/`drain_port_monitor_exits`.
-* `../runner/` → the `ProcessRunner` (`mod.rs`/`entry.rs`/`run.rs`/`budget.rs`/`reason.rs`/`perf.rs`/`tests.rs`), re-exporting `crate::runner::{ProcessEntry, RunnerState, RuntimeRunner}`.
+* `../runner/` → the `ProcessRunner` (`mod.rs`/`entry.rs`/`run.rs`/`budget.rs`/`reason.rs`/`tier.rs`/`perf.rs`/`tests.rs`), re-exporting `crate::runner::{ProcessEntry, RunnerState, RuntimeRunner}`.
 * `../context/gc.rs` → the engine's heap-admission point (`ExecutionContext::ensure_heap`) that drives this state; `../context/gc_walk.rs` → the two-phase valve's reachability walk (`any_root_is_unscanned`/`process_roots_are_unscanned` + `WalkScratch`).
 * `../boot/CONTEXT.md`, `../cli/CONTEXT.md`, `../info/CONTEXT.md` → the boot, A.6 and A.8 surfaces layered on the façade.
