@@ -223,9 +223,9 @@ because it cannot be duplicated.
   own `BLOCKING_PUMP_DEADLINE` (checked between pump rounds, ending in a typed diagnostic
   rather than a spin) and, earlier, by a pump that reports `0`; the nested cap is documented in
   `../context/CONTEXT.md`.
-- `bootscript.rs` is ~1855 lines (production ~700, the rest its oracle test module) — the crate's
-  documented long-file precedent; `drive.rs` is ~382 lines. `#![deny(unsafe_code)]`; no `unwrap()` on
-  runtime data.
+- `bootscript.rs` is ~1855 lines (production lines 1–724, the rest its oracle test module) — the
+  crate's documented long-file precedent; `drive.rs` is ~391 lines. Both are `#![deny(unsafe_code)]`;
+  no `unwrap()` on runtime data.
 
 ## Test Strategy
 - `boot/preloaded.rs`: `boot_loads_every_preloaded_module_into_the_cache` (all 22 cached;
