@@ -607,6 +607,11 @@ constructors only (no new error enum).
   per-collection growth/shrink, the `min_bin_vheap_words`/`fullsweep_after` fields and `HeapInfo`) and the
   measured GenImmix decision.
 
+## Notes for Agents
+- **Address-level membership is public; enumeration of the nursery chain is NOT.** From outside the crate a caller reaches only the **current** nursery space (`Collector`/`GenImmixCollector`/`AnyCollector::young() -> &HeapSpace`), a space **count** (`young_space_count()`) and a membership test over **every** space (`young_contains(ptr)`); the `Nursery` chain itself (`spaces()`, the retired spaces' base/top) is `pub(crate)`, so the individual ranges of a grown chain cannot be enumerated externally. The mature side is fully addressable (`mature_base`/`mature_capacity_words`/`mature_used_words`/`mature_contains` on `AnyCollector`; `Collector::mature() -> &HeapSpace` / `GenImmixCollector::mature() -> &ImmixSpace`).
+- **There is no public from-space/"retired spaces"/epoch accessor.** `FromSet` is public and constructible (`new`/`add(&HeapSpace)`/`contains`/`words`) but `ranges()` is `pub(crate)` and the collector builds its from-set internally; a major **drops** the old mature space (`self.mature = fresh`), and any nursery growth is a `pub(crate)` detail — so a collection's from-space ranges must be captured from `young()`/`mature_base()` **before** it runs, never queried after.
+- **The single-object size helper is `beam_term::layout::object_words(header, ptr) -> usize` (`pub unsafe`, in `beam_term::prelude`), not `beam_gc::copy::move_size`.** `move_size` is `pub(crate)`; it equals `object_words` except that an `ErlSubBits` returns `ERL_SUB_BITS_SIZE` (5) there vs `object_words`' graph size (the `[BinRef][ErlSubBits]` pair, 8). `beam_term::size::size_object(Eterm)` is the whole-graph (public) size. The per-object reference walk `for_each_ref` is likewise `pub(crate)`; the public enumerator is `beam_term::layout::for_each_child_slot(header, ptr, visit)`.
+
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/space.rs` → `HeapSpace` (copying semi-space over `beam_alloc::Heap`) + `FromSet`
