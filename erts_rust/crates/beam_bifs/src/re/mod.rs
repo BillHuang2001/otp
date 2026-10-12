@@ -90,9 +90,20 @@ fn run_3(_ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
     Err(crate::error::unsupported_bif())
 }
 
-/// `re:version/0` — the placeholder the engine implementation replaces.
-fn version_0(_ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
-    Err(crate::error::unsupported_bif())
+/// The `re` surface version string this engine models.
+///
+/// This is the **compatibility-target version string of the `re` surface we
+/// model** — the value the reference oracle (`OTP 29 / erts-17.1`) reports for
+/// `re:version/0`. It is *not* an assertion that PCRE2 is present: this crate
+/// contains no PCRE, only a self-contained engine that implements a subset of
+/// the same pattern language. The string is pinned so a caller that gates
+/// behaviour on the reported `re` version sees the value it would see on the
+/// reference runtime.
+pub(crate) const RE_VERSION: &[u8] = b"10.47 2025-10-21";
+
+/// `re:version/0` — the modelled `re` surface version, as a binary.
+fn version_0(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
+    crate::bits::make_binary(ctx.heap(), RE_VERSION)
 }
 
 /// Registers the 8 real `re:*` BIFs.
