@@ -43,6 +43,7 @@ What `erts/` produces for the rest of OTP and for users:
 - `erts/Makefile` has `.NOTPARALLEL:` — the top of the erts build is intentionally serialised while the sub-directories build in parallel.
 - `erts/example/` is not built, installed or tested by the OTP build; only `example/time_compat.erl` is consumed (copied into the doc build).
 - `erts/etc/unix/gdb-tools/` is not in the repository — it is fetched by `./otp_build download_gdb_tools` (version pinned in `make/gdb_tools_vsn`).
+- **In-sandbox build verification is blocked.** From a clean checkout `erts/configure` first aborts because `$CONFIG_SHELL` names a nonexistent path (workaround: `env -u CONFIG_SHELL`) and then at `No curses library functions found` — no termcap/curses library is on the linker search path (that check is skippable with `--without-termcap`). No full `erts` configure/compile has been run in this sandbox, so dead-source/removal verdicts (see `emulator/beam/CONTEXT.md` `## Legacy C removal plan`) are mechanical reference-proofs, not build-proofs.
 
 ## Notes for Agents
 - Configure is the only way to get `erts/$(TARGET)/config.h`; without a configured tree most C files cannot be compiled or even fully parsed.
