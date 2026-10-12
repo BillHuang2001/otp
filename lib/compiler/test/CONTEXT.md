@@ -34,7 +34,8 @@ Generated clone `.erl` files and `Emakefile` are build artifacts — git-ignored
 - `erl_md5.erl` — self-contained MD5 implementation used by `misc_SUITE`'s `md5` testcase.
 - `ext_records.erl` — module exporting native records (`-export_record([...])`) consumed by `native_record_SUITE`'s external-records testcase.
 - `stage2_bench.erl` — the driver behind `measure_stage2_compile.sh` (see "Compile-Throughput Measurement"). Not a suite; listed in `MODULES` so it is linted/installed like the other support modules.
-- `stage2_suite_driver.erl` + `run_stage2_suites.sh` — the host runner for the five Stage-2 pass suites (see "Host Runner For The Stage-2 Suites"). `stage2_suite_driver` is listed in `MODULES` like the other support modules; the `.sh` wrapper is a dev helper, not installed.
+- `stage2_suite_driver.erl` + `run_stage2_suites.sh` — the host runner for the six Stage-2 pass suites (see "Host Runner For The Stage-2 Suites"). `stage2_suite_driver` is listed in `MODULES` like the other support modules; the `.sh` wrapper is a dev helper, not installed.
+- `beam_ssa_opt_diff_SUITE.erl` — the committed randomized differential-equivalence harness for the opt-in Stage-2 SSA passes, listed in `MODULES` alongside the support modules and driven by `run_stage2_suites.sh`; self-contained (generates its own probe corpus; no `*_SUITE_data`). See the routing table for its generator, option matrix and measured counts.
 - `test_lib:get_unique_files/1,2` enumerates non-cloned, non-LFE `*_SUITE` files (used for the "loaded/smoke" style suites).
 
 ## Compile-Throughput Measurement (Stage-2 passes)
