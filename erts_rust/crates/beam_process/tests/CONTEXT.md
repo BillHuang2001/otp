@@ -371,6 +371,29 @@ SMP pool:
     Deterministic — sizes from the public heap-policy arithmetic, no sleeps / wall-clock bounds /
     oracle.
 
+40. `decline_gate.rs` (4 tests) — the **host collection gate** (`CollectionGate`) of `ProcessTable`.
+    A host-installed `declines_relocation` predicate is consulted first at every signal site (OR-ed
+    with the crate-owned `Process::has_unpublished_roots`) and at `ProcessTable::deliver`, and it
+    declines only the **relocation** of a receiver's heap, so the notification is still delivered
+    through the same heap-fragment route the `Running`/relocation-exempt receiver uses. The cases:
+    (1) `a_host_gate_declines_an_oversized_link_exit_into_a_heap_fragment` — a **trapping**,
+    **non-exempt**, **non-`Running`** receiver linked to a dying peer with a reason larger than its
+    whole nursery: the enqueue-time reason copy is refused, the signal never reaches the queue, and
+    the `{'EXIT', …}` is delivered fragment-resident with the nursery neither collected nor moved
+    (`minor_gcs`, the young space's base/used words and the mature used words all unchanged) and the
+    blocked receiver woken; (2) `a_host_gate_declines_an_oversized_monitor_down_into_a_heap_fragment`
+    — the same for a **watcher**'s oversized `{'DOWN', …}`; (3)
+    `a_host_gate_declines_the_delivery_collect_and_the_flag_is_restored` — the **message-delivery**
+    half: `ProcessTable::deliver` surfaces the copy engine's **raw** `AllocKind::Heap`/
+    `AllocKind::Message` refusal with the nursery untouched (the gate marks the receiver
+    relocation-exempt for exactly one `Process::deliver`, and the prior exemption-flag value is
+    restored afterwards); (4) `without_the_gate_the_same_signals_collect_and_grow` — the **control**:
+    with no gate installed the identical refusal takes the ordinary arm (one collection, an on-demand
+    nursery growth and a relocation), so the gate is an *additional* decline, not a replacement.
+    Deterministic — every size from the public heap-policy arithmetic, every "did nothing" claim
+    checked against the receiver's own nursery observables (`minor_gcs`, the young space's
+    base/used words, the mature generation's used words); no sleeps / wall-clock bounds / oracle.
+
 ## Constraints
 - **Anti-flakiness (BINDING).** Every assertion is forced by **synchronization**, never a bare
   `std::thread::sleep`: `mpsc` channels + `recv_timeout` carry the completion signals,
@@ -389,20 +412,21 @@ SMP pool:
 - Run the whole crate gate with
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_process` (never `cd`,
   sandbox `$HOME` is read-only). Cross-checks against the real system ERTS belong to the sibling
-  `../../../tools/differential/` harness, not here. Current: **476 passed, 0 failed, 1 ignored** (174 in-module unit tests + 301
-  across the 39 integration targets here + 1 doctest; the single ignore is the documented
+  `../../../tools/differential/` harness, not here. Current: **484 passed, 0 failed, 1 ignored** (178 in-module unit tests + 305
+  across the 40 integration targets here + 1 doctest; the single ignore is the documented
   non-yielding-runner hang failure mode in `preemption.rs`).
 
 ## Routing Table
 - `scheduler.rs`, `messaging.rs`, `signals.rs`, `gc.rs`, `priority.rs`, `pending_signals.rs`,
   `preemption.rs`, `dict.rs`, `fragments.rs`, `scheduler_ports.rs`, `exhaustion.rs`,
-  `signal_exhaustion.rs`, `signal_fragment_fallback.rs`, `gc_exemption.rs`, `message_relocation.rs`,
+  `signal_exhaustion.rs`, `signal_fragment_fallback.rs`, `decline_gate.rs`, `gc_exemption.rs`, `message_relocation.rs`,
   `gc_refc_binary_message.rs`,
   `off_heap_send_isolation.rs`, `message_from_is_immediate.rs`, `off_heap_binaries.rs` →
   the single-threaded scheduler (incl. the port-aware slice cleanup), mailbox, signals, GC roots, PCB state,
   pre-emption/fairness, the collect-grow-and-retry exhaustion path of `Process::deliver` and the
   `{'EXIT',…}`/`{'DOWN',…}` signal builders (both the enqueue-time reason copy and the
-  unpublished-roots receivers' heap-fragment fallback, at either refusal site), the host-controllable GC relocation
+  heap-fragment fallback for a receiver whose relocation is declined — the crate-owned unpublished
+  roots or the host `CollectionGate` — at either refusal site), the host-controllable GC relocation
   exemption, the
   collection's queued-message re-install (a fragment-resident/off-heap-owning message keeps its whole
   envelope across a collect), and the **process-owned off-heap refc-binary list** (registration, the
