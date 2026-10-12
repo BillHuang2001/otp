@@ -333,10 +333,11 @@ impl ExecutionContext for BudgetContext<'_, '_> {
     ///
     /// The slice's machine runs on *this* wrapper, so the engine's `send` arm calls
     /// `send_message_with_off_heap` on the wrapper: without this forward the **default** body would
-    /// run, forwarding to `send_message` and **discarding** `src_binaries`, so an engine-built
-    /// off-heap refc binary in a message would be refused by the receiver-side copy with
-    /// `BeamError::BadArg` — the send-path half of the transport bug, reachable only from a
-    /// scheduled process. Forwarding the slice reaches [`RuntimeContext`]'s own override.
+    /// run, forwarding to `send_message` and **discarding** `src_binaries`, so the receiver-side
+    /// copy could not resolve — and therefore could not **share** — an engine-built off-heap refc
+    /// binary in the message; it would flatten it on-heap instead. That is the send-path half of
+    /// the transport bug, reachable only from a scheduled process. Forwarding the slice reaches
+    /// [`RuntimeContext`]'s own override.
     fn send_message_with_off_heap(
         &mut self,
         to: Eterm,
