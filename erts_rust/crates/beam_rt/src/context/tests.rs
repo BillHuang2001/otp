@@ -3049,8 +3049,11 @@ fn a_collection_is_declined_when_a_live_root_lives_in_an_unscanned_region() {
             "a cons cell built on the pooled BIF heap is not a young/mature-heap pointer, so \
              the root is unscanned"
         );
+        // `descend = true`: the reused scratch plus an unconditional descent is the walk in
+        // its fullest form, so the assertion below is about the predicate, not the gate.
+        let mut scratch = super::gc_walk::WalkScratch::default();
         assert!(
-            super::gc::any_root_is_unscanned(process, [foreign].iter()),
+            super::gc::any_root_is_unscanned(&mut scratch, process, [foreign].iter(), true),
             "`any_root_is_unscanned` must agree with the single-term predicate"
         );
     }
@@ -3132,8 +3135,17 @@ fn an_ordinary_young_only_root_set_is_never_declined() {
 
     {
         let process = table.get(pid).expect("the spawned process");
+        // `descend = true`: the strongest form of the valve, so "not declined" here really
+        // means "nothing reachable in the scanned graph is foreign" — not just the per-word
+        // root phase.
+        let mut scratch = super::gc_walk::WalkScratch::default();
         assert!(
-            !super::gc::any_root_is_unscanned(process, x.iter().chain(stack.iter()).chain(fr.iter())),
+            !super::gc::any_root_is_unscanned(
+                &mut scratch,
+                process,
+                x.iter().chain(stack.iter()).chain(fr.iter()),
+                true
+            ),
             "immediates and own-young-heap pointers are all in scanned regions, so no root \
              may be reported as unscanned"
         );
