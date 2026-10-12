@@ -69,10 +69,18 @@
 //! instead stops with the typed `unsupported: opcode: run: process blocked (no message available)`
 //! — a scheduled slice's out-of-line nested run cannot pump the scheduler, so a callee that parks
 //! in a `receive` folds into the engine's `blocked` gap, and `module_observes_its_call_site` routes
-//! the whole `compile` module onto that path. The parked machine's live `pending_exception` reason
-//! is published as a `Registers::extra_roots` word across the park window
-//! (`runner/run.rs::publish_parked_roots`), so the root set is **not** the blocker — the
-//! scheduled-route dispatch change is.
+//! the whole `compile` module onto that path. That module-wide routing is what keeps the scheduled
+//! route **sound**, not merely conservative: the parked machine's live `pending_exception` reason
+//! *is* published as a `Registers::extra_roots` word across the park window
+//! (`runner/run.rs::publish_parked_roots`), but a scheduled process is not relocation-exempt and the
+//! **running** machine's root set is published only at the engine's heap-admission points
+//! (`src/context/gc.rs::ensure_heap_full`/`alloc_words_rooted`) and at a park — never around
+//! `ExecutionContext::call_bif` — so a delivery-driven collection inside an in-machine `compile:*`
+//! call (`Process::collect`/`ensure_capacity` relocate against the stale `Process::regs`) would move
+//! the heap under a live mid-slice root set. Narrowing the guard's fun-image half is therefore
+//! unsound: it turns both self-host corpus cases into a **nondeterministic** hard mismatch
+//! (`beam_term::ops: invalid boxed header subtag 0x12`, `*** Internal compiler error ***`) rather
+//! than the typed `blocked` gap.
 
 // The shared harness is compiled in whole, but this suite uses only its bounded runner and its
 // toolchain discovery; the unused remainder is expected here — the same shape `tests/io_scan.rs`
