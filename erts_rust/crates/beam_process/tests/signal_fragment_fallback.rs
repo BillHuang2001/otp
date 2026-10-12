@@ -22,9 +22,11 @@
 //! [`ProcessTable`](beam_process::ProcessTable)'s signal-delivery path.
 //!
 //! A signal whose message cannot be built on the receiving process's own young heap is a
-//! *normal* condition, and the two arms of the exhaustion policy handle it differently
-//! (`src/ptab.rs`'s `build_signal_message` for an apply-time build, `deliver_head_signal` for
-//! a queued signal):
+//! *normal* condition, and the two arms of the exhaustion policy handle it differently. The
+//! refusal reaches the policy from either of two places — the **apply-time message build**
+//! (`src/ptab.rs`'s `build_signal_message` for a born/port/remote DOWN, `deliver_head_signal` for
+//! a queued signal) or the **enqueue-time reason copy** (`copy_reason_onto`, on a nursery too full
+//! for the reason itself) — and both go through the same policy:
 //!
 //! * an **ordinary** receiver has its nursery collected and grown **on demand**
 //!   ([`Process::ensure_capacity`](beam_process::Process) — the shared
@@ -34,33 +36,49 @@
 //!   ([`Process::set_relocation_exempt`](beam_process::Process)) must **not** have its heap move
 //!   (the host holds live words outside the crate's root set, so relocating would recycle them),
 //!   so the payload is built on a 64-word scratch arena and copied **whole** into a fresh
-//!   `beam_message::HeapFragment` the enqueued `Message` owns (`enqueue_fragment_signal`): no
+//!   `beam_message::HeapFragment` the enqueued `Message` owns (`enqueue_fragment_payload`): no
 //!   collection, no growth, and **nothing written on the receiver's heap** at all.
 //!
 //! The fragment model is the C's: `erl_proc_sig_queue.c` builds every signal message into the
 //! message's **own** heap fragment, so a signal that cannot live on the receiver's heap is not
 //! lost — the exempt arm reproduces that model exactly where the M1 heap layout allows it.
 //!
-//! The three cases are one **controlled experiment**: the same receiver state, the same
-//! immediate reason, the same failing build — the *only* difference is the exemption flag.
+//! Cases 1 and 2 are one **controlled experiment**: the same receiver state, the same immediate
+//! reason (which the enqueue-time copy takes without allocating, so only the *apply-time* build is
+//! refused), the same failing build — the *only* difference is the exemption flag. Cases 3 and 4
+//! are the same experiment for the **enqueue-time** refusal: the reason itself is larger than the
+//! receiver's whole nursery, so the signal cannot even be queued on an exempt receiver and must be
+//! delivered fragment-resident straight from the enqueue site. Case 5 pins the other arm.
 //!
 //! 1. [`an_exempt_receiver_gets_a_monitor_down_through_a_heap_fragment`] — a saturated-nursery
 //!    relocation-exempt **watcher** still receives its `{'DOWN', Ref, process, Target, noproc}`,
-//!    fragment-resident and whole, with the nursery untouched.
+//!    fragment-resident and whole, with the nursery untouched (an apply-time refusal).
 //! 2. [`an_exempt_receiver_gets_a_link_exit_through_a_heap_fragment`] — the same for a trapping
-//!    receiver's `{'EXIT', Dying, normal}`.
-//! 3. [`a_non_exempt_receiver_collects_relocates_and_grows_instead_of_using_a_fragment`] — the
+//!    receiver's `{'EXIT', Dying, normal}` (an apply-time refusal).
+//! 3. [`an_exempt_receiver_gets_a_down_reason_larger_than_its_nursery_through_a_fragment`] — the
+//!    same watcher, with a reason larger than the nursery: the **enqueue-time** reason copy is the
+//!    refused request, the signal is never queued, and the DOWN is still delivered whole,
+//!    fragment-resident, with a blocked watcher woken by the delivery.
+//! 4. [`an_exempt_receiver_gets_an_oversized_link_exit_through_a_fragment`] — the same for a
+//!    trapping receiver's oversized `{'EXIT', Dying, Reason}`.
+//! 5. [`a_non_exempt_receiver_collects_relocates_and_grows_instead_of_using_a_fragment`] — the
 //!    same refusal on a receiver that is **not** exempt takes the *other* arm: one collection,
 //!    an on-demand nursery growth and a relocation, and the message lands on the receiver's
 //!    (new) heap with no fragment — the fallback did not replace the grow-and-retry path.
 //!
-//! Cases 1 and 2 are the regression: on the pre-fix code each of them fails with the raw
-//! `BeamError::Alloc(AllocFailure { requested: 32, kind: Heap })` returned out of `terminate`,
-//! with **no** message queued (the signal was lost) — verified by running this very file against
-//! the pre-fix commit `360a4c6536`, where cases 1 and 2 fail with that error and case 3 passes.
-//! Case 3 pins that the non-exempt arm is *unchanged* — it is the arm the pre-fix code already
-//! had, and it is the reason the two exempt cases are a controlled experiment rather than a
+//! Cases 1 and 2 are the regression of the apply-time fallback: on the pre-fix code each of them
+//! fails with the raw `BeamError::Alloc(AllocFailure { requested: 32, kind: Heap })` returned out
+//! of `terminate`, with **no** message queued (the signal was lost) — verified by running this
+//! very file against the pre-fix commit `360a4c6536`, where cases 1 and 2 fail with that error and
+//! case 3 passes. Cases 3 and 4 are the regression of the enqueue-time route: on the code before
+//! it, `terminate_into` logs `dropping DOWN signal …` (or drops the exit) and **no** message
+//! arrives. Case 5 pins that the non-exempt arm is *unchanged* — it is the arm the pre-fix code
+//! already had, and it is the reason the exempt cases are a controlled experiment rather than a
 //! broad-brush "signals work" check.
+//!
+//! What the exemption does **not** cover is an exit signal to a **non-trapping** receiver: it
+//! would have to *terminate* it, and a termination is the caller's cascade, not a message a
+//! fragment could carry — so that refusal is still surfaced (`tests/signal_exhaustion.rs`).
 //!
 //! Determinism: no sleep, no wall-clock bound and no oracle. Every size is derived from the
 //! public heap-policy arithmetic — [`HeapPolicy::initial_young_words`] (the nursery), the
@@ -75,7 +93,9 @@ use beam_message::Message;
 use beam_process::prelude::*;
 use beam_term::compare;
 use beam_term::list::ptr_val;
-use beam_term::prelude::{make_atom, make_small, tuple_element, tuple_size, AtomTable, Eterm};
+use beam_term::prelude::{
+    make_atom, make_small, size_object, tuple_element, tuple_size, AtomTable, Eterm,
+};
 
 /// The words a `{'EXIT', From, Reason}` tuple occupies on the receiver's heap: `1` header plus
 /// the three elements. This is also what the `{'DOWN', …}` build allocates **first** — its
@@ -99,6 +119,11 @@ const NURSERY_WORDS: usize = HEAD_WORDS + FREE_WORDS;
 /// The filler message's size in words: `1` header plus two immediate elements — exactly the
 /// words the drain occupies, leaving [`FREE_WORDS`] free.
 const FILLER_WORDS: usize = NURSERY_WORDS - FREE_WORDS;
+
+/// The words the enqueue-time cases' reason occupies: one word more than the receiver's **whole**
+/// nursery, so it is the *reason copy* onto the receiver's own heap that is refused — the signal
+/// cannot even be queued, and the apply-time message build is never reached.
+const OVERSIZED_REASON_WORDS: usize = NURSERY_WORDS + 1;
 
 /// A pid with the given number and serial 0 (only used for an envelope `from` here).
 fn pid(number: u64) -> ProcessId {
@@ -134,6 +159,17 @@ fn filler_term(src: &mut Heap) -> Eterm {
         .map(|i| make_small(i as i64))
         .collect();
     src.tuple(&elems).expect("the filler fits the source arena")
+}
+
+/// The enqueue-time cases' reason: an [`OVERSIZED_REASON_WORDS`]-word tuple of distinct small
+/// integers, so it cannot fit the receiver's nursery (the reason copy is refused) and a truncated
+/// or duplicated copy cannot pass a structural comparison.
+fn oversized_reason(src: &mut Heap) -> Eterm {
+    let elems: Vec<Eterm> = (0..OVERSIZED_REASON_WORDS - 1)
+        .map(|i| make_small(i as i64))
+        .collect();
+    src.tuple(&elems)
+        .expect("the oversized reason fits the source arena")
 }
 
 /// Spawns the case's receiver — a [`small_nursery`] process — and drains its nursery to exactly
@@ -395,6 +431,209 @@ fn an_exempt_receiver_gets_a_link_exit_through_a_heap_fragment() -> Result<()> {
     let (from, delivered) = unsafe { (tuple_element(payload, 1), tuple_element(payload, 2)) };
     assert_eq!(from, dying.to_eterm(), "the signaller is the dying link partner");
     assert_eq!(delivered, reason, "the reason is delivered verbatim");
+    assert!(
+        compare::eq(payload, expected, &names),
+        "the delivered EXIT equals the expected three-tuple element for element"
+    );
+
+    let mailbox = table.get(receiver).expect("the receiver is live").mailbox();
+    let first = mailbox.peek().expect("the filler is still first");
+    assert_eq!(first.payload(), filler, "the filler kept its place in the queue");
+    assert!(first.fragments().is_none(), "the ordinary delivery has no fragment");
+
+    Ok(())
+}
+
+/// A **relocation-exempt**, saturated-nursery **watcher** whose monitor reason is larger than its
+/// whole nursery still receives its `{'DOWN', …}`: here it is the **enqueue-time** reason copy
+/// that is refused (a queued signal's reason must live on the receiver's own heap, so the signal
+/// cannot even be queued), and the DOWN is built and delivered as a heap fragment straight from
+/// the enqueue site. No collection, no growth, no relocation, not one word written on the
+/// receiver's heap — and a blocked watcher is woken by the delivery.
+#[test]
+fn an_exempt_receiver_gets_a_down_reason_larger_than_its_nursery_through_a_fragment() -> Result<()> {
+    let (mut table, names, atoms) = table_with_names();
+    let mut src = source();
+    let (watcher, filler) = drained_receiver(&mut table, filler_term(&mut src))?;
+    let reason = oversized_reason(&mut src);
+    // The fixture's premise: the reason cannot fit the receiver's free space, so the *enqueue-time
+    // copy* is the refused request and the apply-time build is never reached.
+    assert!(
+        size_object(reason) > FREE_WORDS,
+        "the reason is larger than the receiver's free space"
+    );
+    let target = table.spawn_default()?;
+
+    // The expected term: the same five-tuple the table must build, on the source arena.
+    let reference = table.monitor(watcher, target, MonitorKind::Process)?;
+    let reference_term = reference.to_eterm(&mut src)?;
+    let expected = src.tuple(&[
+        make_atom(atoms.down()),
+        reference_term,
+        make_atom(atoms.process()),
+        target.to_eterm(),
+        reason,
+    ])?;
+
+    assert!(!table
+        .get(watcher)
+        .expect("the watcher is live")
+        .is_relocation_exempt());
+    table.set_relocation_exempt(watcher, true)?;
+    // A **blocked** watcher: the queued path used to wake it when the signal was applied, so the
+    // enqueue-time route has to wake it itself.
+    table
+        .get_mut(watcher)
+        .expect("the watcher is live")
+        .set_state(ProcessState::Waiting);
+    let (minor_before, base_before, used_before) = nursery(&table, watcher);
+    let mature_before = mature_used(&table, watcher);
+
+    table.terminate(target, reason)?;
+    assert!(table.contains(watcher), "the watcher survived the target");
+
+    // The exempt receiver's heap is **untouched**.
+    let (minor_after, base_after, used_after) = nursery(&table, watcher);
+    assert_eq!(
+        minor_after, minor_before,
+        "a relocation-exempt receiver must not collect"
+    );
+    assert_eq!(
+        base_after, base_before,
+        "a relocation-exempt receiver's nursery must not be relocated or grown"
+    );
+    assert_eq!(
+        used_after, used_before,
+        "the fragment-built DOWN wrote nothing on the receiver's heap"
+    );
+    assert_eq!(
+        mature_used(&table, watcher),
+        mature_before,
+        "nothing was promoted off the nursery either"
+    );
+    // The signal never reached the queue: its reason could not live on the receiver's heap.
+    assert_eq!(
+        table.pending_signals(watcher)?,
+        0,
+        "the refused reason copy left no queued signal behind"
+    );
+    // ... but the blocked watcher was woken all the same.
+    assert_eq!(
+        table.drain_woken(),
+        vec![watcher],
+        "the delivery woke the blocked watcher"
+    );
+
+    // ... and the DOWN is nevertheless delivered, whole, FIFO behind the filler.
+    let down = signal_message(&table, watcher);
+    let payload =
+        assert_fragment_resident(down, make_atom(atoms.down()), Some(make_atom(atoms.process())));
+    // SAFETY: `payload` is the live five-tuple the fragment holds; elements 1, 3 and 4 are in
+    // bounds.
+    let (delivered_ref, delivered_target, delivered_reason) = unsafe {
+        (
+            tuple_element(payload, 1),
+            tuple_element(payload, 3),
+            tuple_element(payload, 4),
+        )
+    };
+    assert!(
+        compare::eq(delivered_ref, reference_term, &names),
+        "the DOWN carries the monitor's own reference"
+    );
+    assert_eq!(delivered_target, target.to_eterm(), "the DOWN names the target pid");
+    assert!(
+        compare::eq(delivered_reason, reason, &names),
+        "the oversized reason is delivered whole (the copy went into the fragment)"
+    );
+    assert!(
+        compare::eq(payload, expected, &names),
+        "the delivered DOWN equals the expected five-tuple element for element"
+    );
+
+    // FIFO: the fixture's filler is still first and still on the receiver's heap.
+    let mailbox = table.get(watcher).expect("the watcher is live").mailbox();
+    let first = mailbox.peek().expect("the filler is still first");
+    assert_eq!(first.payload(), filler, "the filler kept its place in the queue");
+    assert!(first.fragments().is_none(), "the ordinary delivery has no fragment");
+
+    Ok(())
+}
+
+/// The same **enqueue-time** route for a **link exit**: a trapping, relocation-exempt receiver
+/// whose nursery cannot take the oversized reason still traps the signal — fragment-resident,
+/// with its nursery untouched, its signal queue never used, and a blocked receiver woken.
+#[test]
+fn an_exempt_receiver_gets_an_oversized_link_exit_through_a_fragment() -> Result<()> {
+    let (mut table, names, atoms) = table_with_names();
+    let mut src = source();
+    let (receiver, filler) = drained_receiver(&mut table, filler_term(&mut src))?;
+    let reason = oversized_reason(&mut src);
+    assert!(
+        size_object(reason) > FREE_WORDS,
+        "the reason is larger than the receiver's free space"
+    );
+    let dying = table.spawn_default()?;
+
+    // A trapping receiver survives the exit and receives it as a message; the link makes the
+    // dying partner's death the signal's source.
+    table
+        .get_mut(receiver)
+        .expect("the receiver is live")
+        .set_trap_exit(true);
+    table.link(dying, receiver)?;
+    let expected = src.tuple(&[make_atom(atoms.exit()), dying.to_eterm(), reason])?;
+
+    table.set_relocation_exempt(receiver, true)?;
+    table
+        .get_mut(receiver)
+        .expect("the receiver is live")
+        .set_state(ProcessState::Waiting);
+    let (minor_before, base_before, used_before) = nursery(&table, receiver);
+    let mature_before = mature_used(&table, receiver);
+
+    table.terminate(dying, reason)?;
+    assert!(table.contains(receiver), "the trapping receiver survived");
+
+    let (minor_after, base_after, used_after) = nursery(&table, receiver);
+    assert_eq!(
+        minor_after, minor_before,
+        "a relocation-exempt receiver must not collect"
+    );
+    assert_eq!(
+        base_after, base_before,
+        "a relocation-exempt receiver's nursery must not be relocated or grown"
+    );
+    assert_eq!(
+        used_after, used_before,
+        "the fragment-built EXIT wrote nothing on the receiver's heap"
+    );
+    assert_eq!(
+        mature_used(&table, receiver),
+        mature_before,
+        "nothing was promoted off the nursery either"
+    );
+    assert_eq!(
+        table.pending_signals(receiver)?,
+        0,
+        "the refused reason copy left no queued signal behind"
+    );
+    assert_eq!(
+        table.drain_woken(),
+        vec![receiver],
+        "the delivery woke the blocked receiver"
+    );
+
+    let exit = signal_message(&table, receiver);
+    let payload = assert_fragment_resident(exit, make_atom(atoms.exit()), None);
+    // SAFETY: `payload` is the live three-tuple the fragment holds; elements 1 and 2 are in
+    // bounds.
+    let (from, delivered) = unsafe { (tuple_element(payload, 1), tuple_element(payload, 2)) };
+    assert_eq!(from, dying.to_eterm(), "the signaller is the dying link partner");
+    assert!(
+        compare::eq(delivered, reason, &names),
+        "the oversized reason is delivered whole (the copy went into the fragment)"
+    );
     assert!(
         compare::eq(payload, expected, &names),
         "the delivered EXIT equals the expected three-tuple element for element"

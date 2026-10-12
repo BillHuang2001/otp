@@ -26,19 +26,25 @@
 //! and grown **on demand** to cover the refused request and the build is retried once — a
 //! `{'EXIT', …}`/`{'DOWN', …}` reason larger than the bounded nursery is still delivered, whole
 //! and exactly once. A **relocation-exempt** receiver
-//! ([`Process::set_relocation_exempt`](beam_process::Process)) instead surfaces the **raw**
-//! `BeamError::Alloc(AllocKind::Heap | AllocKind::Message)` refusal unchanged — no collection,
-//! no growth, no retry — because the host holds live words outside the crate root set and
-//! relocating would recycle them.
+//! ([`Process::set_relocation_exempt`](beam_process::Process)) must never do that instead: no
+//! collection, no growth, no retry, because the host holds live words outside the crate root set
+//! and relocating would recycle them. Its signal is routed into a heap fragment, or — for the one
+//! signal that would *terminate* it — refused with the raw
+//! `BeamError::Alloc(AllocKind::Heap | AllocKind::Message)`.
 //!
-//! That raw refusal is the **enqueue-time** behaviour — the reason copy onto the receiver's own
-//! heap, which case 3 below exercises (`send_exit` with an oversized reason) and which must land
-//! on the receiver's heap. The **apply-time** message build is different: it can live in a heap
-//! fragment, so a small reason's `{'EXIT', …}`/`{'DOWN', …}` is delivered to a relocation-exempt
-//! receiver through the fragment fallback rather than refused (its own suite,
-//! `tests/signal_fragment_fallback.rs`).
+//! That raw refusal is what an **enqueue-time** reason copy surfaces, and it is *not* a dead end:
+//! the receiver it belongs to is **relocation-exempt**, which is exactly the case the signal
+//! builders route into a heap fragment, because a relocation-exempt receiver's heap must not move
+//! under the host's unpublished roots. A `{'DOWN', …}` or a **trapping** receiver's `{'EXIT', …}`
+//! is therefore delivered fragment-resident (its own suite,
+//! `tests/signal_fragment_fallback.rs`), no matter whether the refusal came from the apply-time
+//! message build (a small reason on a saturated nursery) or from the enqueue-time reason copy (a
+//! reason larger than the whole nursery). The one refusal that is still returned is the *exit
+//! policy* one: an exit signal to a **non-trapping** exempt receiver would have to *terminate* it,
+//! and a termination is the caller's cascade rather than a message — cases 3 and 4 below pin that
+//! refusal and the fact that it leaves no partial state.
 //!
-//! The suite pins both halves of the policy from the observable end state:
+//! The suite pins the policy from the observable end state:
 //!
 //! 1. [`an_oversized_exit_reason_grows_the_receivers_nursery_and_is_delivered`] — a link exit
 //!    whose copied reason is one word larger than the receiver's whole nursery is delivered: the
@@ -50,8 +56,9 @@
 //!    receiver surfaces the raw `Alloc` refusal and neither the minor-GC counter nor the nursery
 //!    base pointer moves.
 //! 4. [`a_refused_signal_leaves_no_partial_state_and_the_receiver_still_delivers`] — the typed
-//!    failure leaves no partial enqueue (the signal is not queued, the mailbox is empty) and the
-//!    receiver is not wedged: a fitting signal is delivered normally afterwards.
+//!    failure leaves no partial enqueue (the signal is not queued, the mailbox is empty, the
+//!    receiver is still alive) and the receiver is not wedged: a fitting signal is delivered
+//!    normally afterwards.
 //!
 //! Determinism: no sleep, no wall-clock bound and no oracle. Every size is derived from the
 //! public heap-policy arithmetic ([`next_heap_size`], the bounded nursery of a fresh `Process`),
@@ -311,6 +318,11 @@ fn an_oversized_down_reason_grows_the_watchers_nursery_and_is_delivered() -> Res
 /// A **relocation-exempt** receiver surfaces the **raw** allocation refusal unchanged and the
 /// heap is left completely untouched: no collection ran and the nursery base did not move. Both
 /// assertions fail the instant the signal path collects/grows despite the exemption.
+///
+/// The refusal is a *policy* one: the receiver is **non-trapping**, so the exit signal would have
+/// terminated it, and a termination is not a message a heap fragment could carry. (The same
+/// refusal on a **trapping** receiver — a message — is delivered fragment-resident instead;
+/// `tests/signal_fragment_fallback.rs`.)
 #[test]
 fn a_relocation_exempt_receiver_surfaces_the_raw_refusal_without_relocating() -> Result<()> {
     let (mut table, _names) = table_with_names();
@@ -386,12 +398,17 @@ fn a_relocation_exempt_receiver_surfaces_the_raw_refusal_without_relocating() ->
 /// The typed failure leaves **no partial state**: the signal was not queued at all and the
 /// mailbox is still empty, and the receiver is not wedged -- a fitting signal is trapped and
 /// delivered exactly once afterwards.
+///
+/// The receiver is deliberately **non-trapping** for the refused half: the exit signal it could
+/// not take is one that would have *terminated* it, and terminating a process is the caller's
+/// cascade rather than a message, so the raw refusal is still what comes back. A **trapping**
+/// receiver's refusal is routed into a heap fragment instead (the enqueue-time route,
+/// `tests/signal_fragment_fallback.rs`).
 #[test]
 fn a_refused_signal_leaves_no_partial_state_and_the_receiver_still_delivers() -> Result<()> {
     let (mut table, _names) = table_with_names();
     let signaller = table.spawn_default()?;
     let receiver = table.spawn_default()?;
-    table.get_mut(receiver).expect("the receiver is live").set_trap_exit(true);
     table.set_relocation_exempt(receiver, true)?;
 
     let mut src = source();
@@ -407,12 +424,13 @@ fn a_refused_signal_leaves_no_partial_state_and_the_receiver_still_delivers() ->
         .tuple(&elems)
         .expect("the oversized reason fits the source heap");
 
-    // The oversized trapped exit is refused with the raw allocation error ...
+    // The oversized exit is refused with the raw allocation error ...
     assert!(matches!(
         table.send_exit(signaller, receiver, reason),
         Err(BeamError::Alloc(_))
     ));
-    // ... leaving no partial enqueue: the signal is not queued, the mailbox is empty.
+    // ... leaving no partial enqueue: the signal is not queued, the mailbox is empty, and the
+    // receiver is still alive (an exit signal that could not be queued is not applied).
     assert_eq!(
         table.pending_signals(receiver)?,
         0,
@@ -422,8 +440,13 @@ fn a_refused_signal_leaves_no_partial_state_and_the_receiver_still_delivers() ->
         table.get(receiver).expect("the receiver is live").mailbox().len(),
         0
     );
+    assert!(table.contains(receiver), "the refused signal did not terminate");
 
     // The receiver is not wedged: a fitting signal is trapped and delivered exactly once.
+    table
+        .get_mut(receiver)
+        .expect("the receiver is live")
+        .set_trap_exit(true);
     table.send_exit(signaller, receiver, make_small(5))?;
     let payload = sole_payload(&table, receiver);
     // SAFETY: `payload` is the live `{'EXIT', Signaller, 5}` tuple the table built on the
