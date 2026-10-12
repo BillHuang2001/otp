@@ -167,19 +167,25 @@ SMP pool:
     order ahead of a following delivery (`an_oversized_exit_reason_grows_the_receivers_nursery_and_is_delivered`);
     the same for a monitor `{'DOWN', …}` carrying a large reason
     (`an_oversized_down_reason_grows_the_watchers_nursery_and_is_delivered`). A **relocation-exempt**
-    receiver cannot take that copy at all (its heap must not move, so it is never grown), so the raw
+    receiver can never take that copy (its heap must not move, so it is never collected or grown), and
+    the refusal that is *still* surfaced for one is the exit **policy**: both exemption cases here are
+    **non-trapping**, so the exit signal would have to *terminate* them — a termination is the caller's
+    cascade rather than a message a fragment could carry — and the raw
     `Err(BeamError::Alloc(AllocKind::Heap | Message))` surfaces out of the **enqueue-time**
     `copy_reason_onto`: neither `minor_gcs()` nor the nursery `base()` moves, nothing is written or
     enqueued
     (`a_relocation_exempt_receiver_surfaces_the_raw_refusal_without_relocating`); and the typed failure
-    leaves **no partial enqueue** (the signal is not queued, the mailbox is empty) with the receiver
-    still delivering a fitting signal afterwards
+    leaves **no partial enqueue** (the signal is not queued, the mailbox is empty, and the receiver is
+    still alive, i.e. the refused signal did not terminate it) with a fitting signal received normally
+    afterwards
     (`a_refused_signal_leaves_no_partial_state_and_the_receiver_still_delivers`). **Discriminating by
     construction: the two delivery tests FAIL (a typed `Alloc` out of `terminate`) the moment the
-    builders only collect without growing, and the exemption test FAILS (a `relocation_exempt` raise
-    instead of the raw `Alloc`) the moment the short-circuit is removed.** The exemption case here is
-    the **enqueue-time** refusal only; the apply-time build's own exempt fallback (which *does* deliver)
-    is entry 39. Deterministic — sizes from the public heap-policy arithmetic, no sleeps / oracle.
+    builders only collect without growing**; the exemption pair pins the no-collect / no-grow /
+    nothing-written contract (the refusal is enforced both at the reason copy, which pre-tests
+    `is_relocation_exempt`, and in the shared `grow_receiver_for_signal`, which refuses identically).
+    A **trapping** exempt receiver's refusal, by contrast, *is* a message and is delivered
+    fragment-resident — the enqueue-time route of entry 39. Deterministic — sizes from the public
+    heap-policy arithmetic, no sleeps / oracle.
 30. `gc_refc_binary_message.rs` (1 test) — the collection's **mailbox rebuild preserves a queued
     message's off-heap ownership**. A 200-byte payload (> `ERL_ONHEAP_BINARY_LIMIT` = 64, so its bytes
     live in an off-heap counted `beam_alloc::RefcBinary`) is written as the 8-word `[BinRef][ErlSubBits]`
@@ -315,26 +321,38 @@ SMP pool:
     Deterministic — a fixed position-dependent payload, an injected allocator, explicit
     `collect()`/sweep calls; no sleeps / wall-clock bounds / oracle.
 
-39. `signal_fragment_fallback.rs` (3 tests) — the **heap-fragment fallback on the signal-application
-    path** (`build_signal_message` / `enqueue_fragment_signal` / the queued `deliver_head_signal`) for a
-    **relocation-exempt** receiver: an apply-time build its heap refuses is instead built on a 64-word
-    scratch arena and copied **whole** into a fresh `beam_message::HeapFragment` the queued `Message`
-    owns (the C's model — `erl_proc_sig_queue.c` builds every signal message into the message's own
-    fragment) rather than being lost. A **controlled experiment** on a 7-word nursery drained to one
-    word short of the four-word head build, each case first asserting that refusal and that a refused
-    request writes nothing: (1) an exempt watcher still receives its
+39. `signal_fragment_fallback.rs` (5 tests) — the **heap-fragment fallback of the signal-delivery
+    path** at **both** refusal sites for a **relocation-exempt** receiver: the **apply-time** message
+    build (`build_signal_message` / the queued `deliver_head_signal`, via `enqueue_fragment_signal`) and
+    the **enqueue-time** reason copy (`copy_reason_onto`, via `enqueue_down_signal`'s
+    `deliver_down_fragment` / `enqueue_exit_signal`'s `deliver_exit_fragment`). A refused payload is
+    built on a 64-word scratch arena and copied **whole** into a fresh `beam_message::HeapFragment` the
+    queued `Message` owns (the shared `enqueue_fragment_payload`, which copies through the **source**
+    process's off-heap table) rather than being lost — the C's model (`erl_proc_sig_queue.c` builds
+    every signal message into the message's own fragment). A **controlled experiment** on a 7-word
+    nursery drained to one word short of the four-word head build, each case first asserting that
+    refusal and that a refused request writes nothing: (1) an exempt watcher still receives its
     `{'DOWN', Ref, process, Target, noproc}` — exactly once, FIFO behind the fixture's filler, the
     five-tuple structurally equal to the expected one (`compare::eq`, so the boxed reference compares by
     content), `fragments().is_some()` with `fragment.contains(payload)`, while
     `minor_gcs()`/`young().base()`/`heap_used_words()` are **unchanged**; (2) the same for a trapping
-    receiver's `{'EXIT', Dying, normal}`; (3) the **non-exempt contrast** — the identical refusal takes
-    the other arm: `minor_gcs()` up by exactly one, the nursery grown to `next_heap_size(reserve, 0)`
-    and relocated (`base()` moved), the filler promoted to mature, the EXIT built on the **new** nursery
-    (`fragments()` is `None`, `contains_term(payload)` young, not mature) — so the fallback did not
-    replace the grow-and-retry path. **Discriminating by construction: against the pre-fix commit
-    `360a4c6536`, cases 1 and 2 FAIL with the raw `Alloc(AllocFailure { requested: 32, kind: Heap })`
-    out of `terminate` (signal lost) while case 3 passes.** Deterministic — sizes from the public
-    heap-policy arithmetic, no sleeps / wall-clock bounds / oracle.
+    receiver's `{'EXIT', Dying, normal}`; (3)/(4) the same **enqueue-time** route for a reason one word
+    larger than the receiver's **whole** nursery, so the reason copy itself is the refused request and
+    the signal is never queued (`pending_signals` stays 0, the nursery/mature observables are unchanged)
+    while the DOWN / the oversized trapping `{'EXIT', …}` is still delivered whole, fragment-resident,
+    with a **blocked** receiver woken by the delivery itself (`drain_woken()` = the receiver — the
+    queued form's wake happens in `deliver_head_signal`, which this route bypasses); (5) the
+    **non-exempt contrast** — the identical refusal takes the other arm: `minor_gcs()` up by exactly
+    one, the nursery grown to `next_heap_size(reserve, 0)` and relocated (`base()` moved), the filler
+    promoted to mature, the EXIT built on the **new** nursery (`fragments()` is `None`,
+    `contains_term(payload)` young, not mature) — so the fallback did not replace the grow-and-retry
+    path. **Discriminating by construction: against the pre-fix commit `360a4c6536`, cases 1 and 2 FAIL
+    with the raw `Alloc(AllocFailure { requested: 32, kind: Heap })` out of `terminate` (signal lost)
+    while case 5 passes; before the enqueue-time route, cases 3 and 4 FAIL (the drop is logged and no
+    message arrives).** An exit signal to a **non-trapping** exempt receiver is *not* covered by the
+    fallback (it would have to terminate the receiver) and stays a surfaced refusal — entry 29.
+    Deterministic — sizes from the public heap-policy arithmetic, no sleeps / wall-clock bounds /
+    oracle.
 
 ## Constraints
 - **Anti-flakiness (BINDING).** Every assertion is forced by **synchronization**, never a bare
@@ -354,7 +372,7 @@ SMP pool:
 - Run the whole crate gate with
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_process` (never `cd`,
   sandbox `$HOME` is read-only). Cross-checks against the real system ERTS belong to the sibling
-  `../../../tools/differential/` harness, not here. Current: **463 passed, 0 failed, 1 ignored** (166 in-module unit tests + 296
+  `../../../tools/differential/` harness, not here. Current: **472 passed, 0 failed, 1 ignored** (173 in-module unit tests + 298
   across the 39 integration targets here + 1 doctest; the single ignore is the documented
   non-yielding-runner hang failure mode in `preemption.rs`).
 
@@ -367,7 +385,7 @@ SMP pool:
   the single-threaded scheduler (incl. the port-aware slice cleanup), mailbox, signals, GC roots, PCB state,
   pre-emption/fairness, the collect-grow-and-retry exhaustion path of `Process::deliver` and the
   `{'EXIT',…}`/`{'DOWN',…}` signal builders (both the enqueue-time reason copy and the
-  relocation-exempt receivers' apply-time heap-fragment fallback), the host-controllable GC relocation
+  relocation-exempt receivers' heap-fragment fallback, at either refusal site), the host-controllable GC relocation
   exemption, the
   collection's queued-message re-install (a fragment-resident/off-heap-owning message keeps its whole
   envelope across a collect), and the **process-owned off-heap refc-binary list** (registration, the
