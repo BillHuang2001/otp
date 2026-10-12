@@ -33,8 +33,9 @@
 //!
 //! # `make_ref/0`, and the runtime's reference registry
 //!
-//! `make_ref/0` mints from [`Runtime::refs_mut`] — the runtime's one reference id space, so
-//! an id is never reused — and records the term as a **bare** reference (`None`, not a
+//! `make_ref/0` mints from [`Runtime::refs_mut`] — the runtime's **own** reference id space
+//! (monitors and aliases mint from the process table's separate allocator), so an id is never
+//! reused within this space — and records the term as a **bare** reference (`None`, not a
 //! monitor) in [`Runtime::references`](crate::Runtime::references). Reading a reference
 //! thing's payload (its id word) needs `beam_term::boxed_val`, which is `unsafe`, and this
 //! crate is `#![deny(unsafe_code)]`, so that term-keyed registry is the only way a later BIF

@@ -191,9 +191,10 @@ impl RuntimeContext<'_> {
         Err(self.exit_raise(reason))
     }
 
-    /// Whether `term` is a reference this runtime minted (see the module docs).
+    /// Whether `term` is a reference this runtime minted (see the module docs). Delegates to
+    /// the ONE provenance test, [`Runtime::is_known_local_reference`].
     fn is_minted_reference(&self, term: Eterm) -> bool {
-        self.runtime.references.contains_key(&term) || self.runtime.timers.is_timer_ref(term)
+        self.runtime.is_known_local_reference(term)
     }
 
     /// The exit-class raise that terminates the calling process with `reason`.

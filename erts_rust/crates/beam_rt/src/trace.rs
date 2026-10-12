@@ -789,14 +789,18 @@ impl RuntimeContext<'_> {
                 return Err(BeamError::BadArg);
             }
         }
-        // A monotonic delivery sequence on the trace state; the reference *id* itself comes from
-        // the runtime's one ref id space (the same space `make_ref/0` and monitors draw from).
+        // The reference comes from the runtime's **own** id space (the one `make_ref/0` and the
+        // timers draw from) — not the process table's monitor/alias space. This `trace_delivered`
+        // reference is a **bare** runtime-minted reference, so record it as such in the provenance
+        // registry: that is what tells it apart from a monitor/alias reference and keeps a send to
+        // it from ever resolving as an alias (`Runtime::local_reference`).
         let _seq = self.runtime.trace_mut().next_ref_seq();
         let reference = self.runtime.refs_mut().next();
         let mut heap = self.runtime.take_bif_heap()?;
         let ref_term = reference.to_eterm(&mut heap);
         self.runtime.put_bif_heap(heap);
         let ref_term = ref_term?;
+        self.runtime.references.insert(ref_term, None);
         let tag = self.atom("trace_delivered")?;
         let message = terms::make_tuple(self, &[tag, target, ref_term])?;
         self.send_message(self.pid().to_eterm(), message)?;

@@ -910,10 +910,10 @@ fn the_send_bif_delivers_through_an_alias_reference() {
 /// consume, a live alias maps to its owner plus the reference to consume, and a reference that
 /// is not a live alias is the typed `badarg` (both as the compiled send and as the BIF).
 ///
-/// The non-alias reference is a **table-minted** one (a plain `erlang:monitor/2` reference), not
-/// an `erlang:make_ref/0` one: `make_ref/0` mints from the *runtime's* reference allocator while
-/// monitors and aliases mint from the **process table's**, so the two id spaces can hand out the
-/// same id — see the hazard note in [`super::alias`].
+/// The non-alias reference here is a **table-minted** one (a plain `erlang:monitor/2`
+/// reference). A bare `erlang:make_ref/0` reference is rejected too: the destination is
+/// classified by **provenance** (see [`super::alias`]), so a bare reference is never treated
+/// as an alias even when its id coincides with a live alias's.
 #[test]
 fn resolve_send_target_maps_pids_and_live_aliases_and_rejects_other_references() {
     let mut rt = runtime();

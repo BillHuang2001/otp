@@ -547,7 +547,7 @@ impl<'a> RuntimeContext<'a> {
     pub(crate) fn resolve_send_target(&self, to: Eterm) -> Result<(ProcessId, Option<MonitorRef>)> {
         match ProcessId::from_eterm(to) {
             Ok(pid) => Ok((pid, None)),
-            Err(not_a_pid) => match alias::alias_destination(self.process_table(), to) {
+            Err(not_a_pid) => match alias::alias_destination(&*self.runtime, self.process_table(), to) {
                 Some((owner, reference)) => Ok((owner, Some(reference))),
                 None => Err(not_a_pid),
             },
