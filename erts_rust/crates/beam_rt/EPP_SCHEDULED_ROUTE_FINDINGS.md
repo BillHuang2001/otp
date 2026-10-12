@@ -1,197 +1,106 @@
-# `epp:parse_file/3` on the scheduled (`run`) route — localization findings
+# `epp` on the scheduled (`run`) route — localization findings
 
-Status: **localized, not fixed.** The invalid-form / `error:badarg` divergence is caused by
-**the `epp` server process's own heap being clobbered**, not by the file-server seam, the ETF
-codec, or a sibling crate's protocol handling. All instrumentation used to reach this conclusion
-has been removed from the tree.
+Status: **localized to the delivery-driven major collection; NOT fixed in `beam_rt`.** The divergence is
+caused by a **scheduled process's live mature-resident term being freed by a collection that does not
+reach it**, not by the file-server seam, the ETF codec, the message copier or `beam_rt`'s published root
+set. All instrumentation used to reach this conclusion has been removed from the tree.
 
 ## 1. Reproduction (deterministic)
 
-Source `x1_in.erl` (43 bytes):
-
-```erlang
--module(x1_in).
--export([f/0]).
-f() -> 1.
-```
-
-`go/0` calls `epp:parse_file(File, [], [])`, renders every returned form with
-`io_lib:format("~w~n", [F])` into a file, with a `try … catch` so a render failure is recorded.
-
-* `beam_rt -noshell run x1.beam x1:go/0` → 6 forms, of which the **`-export` form renders as
-  `<<RENDER-FAIL error:badarg>>`** and an **extra `{error,{4,epp,cannot_parse}}`** appears.
-* `beam_rt -noshell -pa . -eval 'x1:go()'` → the 5 oracle-identical forms, no error.
-
-The bad form is not an Erlang term of any type (`is_tuple/is_list/is_atom/…` all `false`,
-`element/1` fails, `io_lib:format("~w", …)` raises `badarg`,
-`erlang:term_to_binary(F, [])` raises the codec's generic unknown-tag
-`unsupported_external_term`).
-
-Minimal sub-reproducers (same module, `run` route only):
-
-| Probe | Shape | Outcome on `run` |
-|---|---|---|
-| `epp:scan_erl_form/1` in a loop | renders each token list | tokens **correct**, but an extra device error `{error,{4,epp,cannot_parse}}` where the oracle has `{eof,4}` |
-| manual `epp:scan_erl_form/1` + `erl_parse:parse_form/1` | renders tokens **and** form | **everything correct** (allocation timing matters) |
-| `epp:parse_erl_form/1` loop | nothing rendered between steps | epp server **dies** (`beam_rt: term not found` — a later send to a dead pid) |
-| `io:scan_erl_form(F, '', N, [])` from the main process | renders results | **correct** — the native file server is fine |
-| plain cross-process send of the same tokens/forms | render | **correct** — the copier is fine for these shapes |
-
-## 2. Instrumentation that localized it
-
-An env-gated trace was installed on (a) the nested `erl_scan:tokens/4` call in
-`src/native/file_server/get_until.rs`, and (b) the delivery seam
-(`RuntimeContext::deliver_message_with_off_heap_inner`) — printing the request's `XtraArgs[1]`
-(the scan `Options`) as a raw word sketch, i.e. **on the sender's own term, before the copy**.
-
-Sender-side transcript (`epp:scan_erl_form/1` loop; identical shape for `parse_file/3`), where
-`Options` is `[{text_fun, F}, {reserved_word_fun, F}]`:
+`b13:go/0` writes `b13_in.erl` (`-module(b13_in). -export([f/0]). f() -> 1.`), reads it back and calls
+`epp:parse_file(File, [], [])`, then prints `NFORMS=length(Forms)`.
 
 ```
-TRACE send cmd=get_until xtra1=List[0x743a875d8702, 0x743a875d8719]   # request 1 — intact
-TRACE send cmd=get_until xtra1=List[0x743a875d8702, 0x743a875d8719]   # request 2 — intact
-TRACE send cmd=get_until xtra1=List[0x743a875d8702, 0x743a875d8719]   # request 3 — intact
-TRACE send cmd=get_until xtra1=List[0x2f, 0xf]                        # request 4 — CLOBBERED
-```
-
-`0x2f`/`0xf` are the small integers `2` and `0`: the cons cell that used to head the `Options`
-list now reads `[2|0]`. The service-side trace shows exactly the same `[2|0]`, i.e. **the term
-was already corrupt before it was copied**. Consequence: `erl_scan:tokens([], eof, Line, [2|0])`
-matches no clause and raises `function_clause` inside the nested (native) run, so
-`file_io_server` boxes it as `{error, tokens}`, which `epp:scan_toks/3` (`lib/stdlib/src/epp.erl`
-lines 1117-1119) turns into `{error, {4, epp, cannot_parse}}` and an extra `leave_file/2` step.
-
-The same clobbering is what corrupts the `{attribute,2,export,[…]}` form: the epp server holds
-the per-form token list in its own state/heap before shipping it as `{ok, Toks}`; when that
-region is clobbered, the caller receives a corrupted token list and `erl_parse:parse_form/1`
-then yields a non-term. Rendering the token list in the caller (probe 2) shifts the allocation
-pattern enough that the clobber lands elsewhere — which is why that probe looked healthy.
-
-## 3. Conclusion
-
-* The native `file_server` (`get_until` → `beam_io::io_device::Continuation` → `erl_scan:tokens/4`)
-  is **correct**: it returns the right tokens and the right `eof`, and the same code path from the
-  main scheduled process agrees with the oracle.
-* The message copier is **correct** for these shapes (plain cross-process control agrees).
-* The divergence is that a **scheduled process's heap stops preserving live terms in that
-  process's own state** (the epp server's `St#epp.erl_scan_opts` and the in-flight token list)
-  after a few request/reply rounds. That points at the scheduled-process heap-management path
-  (`beam_rt`'s runner/GC glue driving `Process::grow_nursery` / the nursery chain, and/or
-  `beam_process`'s nursery growth), not at `beam_rt`'s file-server, mailbox or CLI layers.
-
-Remaining work: pin the exact nursery-growth/root-publication site and fix it there; then add a
-regression test in `tests/compile_file.rs` that drives `epp:parse_file/3` (or `compile:file/2`)
-through the scheduled `run` route and asserts the observable parsed form count / produced `.beam`.
-
-## 4. Update — canary instrumentation round (mechanism narrowed, not yet closed)
-Raw instrumentation was added in-crate (env-gated `BEAM_RT_TRACE_HEAP`, since removed) that
-(a) canaried the live region of every space `Process::grow_nursery` retires and re-read it at
-each delivery/resume, and (b) printed the nursery geometry (`base`/`cap`/`used`/`nspaces`) of the
-sending and receiving process at those same sites.
-
-### 4.1 Corrections to the earlier record
-* **The `BEAM_RT_GC_OFF=1` control is void.** No such env gate exists in the tree (it was a
-  temporary gate of an earlier wave and is gone), so that run was the *default* configuration
-  and its `NFORMS=6` says nothing about whether a collection is involved. The claim
-  "NOT a collection" does not follow from it.
-* Control experiments that DO hold: `+hms 233` → `NFORMS=6`; `+hms 500` (and every larger value)
-  → `NFORMS=5`; `BEAM_RT_GC_STRATEGY=copying` → 6, `immix` → 5. A small nursery (233 words) is
-  what makes the divergence appear, and the repro is deterministic.
-
-### 4.2 Raw trace (the decisive window)
-```
-[71] RESUME-GEOM pid=3 young(base=A=0x7b54fbc9a790 cap=233 used=233 nspaces=1) mature(0x7b54fbc9aef0 used=0)
-[74] PARK       pid=3 young(base=A cap=233 used=233 nspaces=1) mature(0x7b54fbc9aef0 used=0)
-[78] RESUME-GEOM pid=3 young(base=A cap=233 used=233 nspaces=1) mature(0x7b54fbc9aef0 used=0)
-[81] GROW pid=3 need=2 old(base=A cap=233 used=233) new(base=B=0x7b54fbcc59c0 cap=233 used=0) nspaces=2
-[82] GROW pid=3 need=2 old(base=B cap=233 used=233) new(base=C=0x7b54fbcc6120 cap=233 used=0) nspaces=3
-[83] PARK       pid=3 young(base=C cap=233 used=230 nspaces=3) mature(0x7b54fbc9aef0 used=0)
-[86] DELIVER from=pid2 n=24 to=pid3           <-- Process::deliver -> copy_message refuses -> ensure_capacity
-[87] DELIVER-GEOM pid=3 young(base=C cap=233 used=230 nspaces=3) mature(0x7b54fbc9aef0 used=0)
-[89] RESUME     pid=3
-[90] RESUME-GEOM  pid=3 young(base=C cap=233 used=4 nspaces=1) mature(0x7b54fbccbee0 used=39)
-                                                  ^ nspaces 3 -> 1: the chain COLLAPSED (retired A and B freed)
-[91] DELIVER from=pid3 n=25 to=pid2 msg={... L[0x7b54fbcc6608][...6 intact elements...]}}   <-- in the CURRENT space C
-[93] MUTATED site=deliver tag=retired base=A off=0 old=0x6cf new=0x7b54fbccc640
-[94] MUTATED site=deliver tag=retired base=A off=1 old=0x3b  new=0x7b54fbcc59c0   (= B's base)
-[95] MUTATED site=deliver tag=retired base=B off=0 old=0x67f new=0x7b54fbc9a790   (= A's base)
-[96] MUTATED site=deliver tag=retired base=B off=1 old=0x3b  new=0x0
-... further MUTATED lines over both blocks, later showing atom/tuple-header-looking
-words (0x80 = arityval(2), 0x2c8b = an ATOM immediates) — i.e. the freed blocks are
-being handed out again and filled with live-looking data.
-```
-Every `alloc_words` growth-failure path writes `[small(2) | NIL]`-shaped words into blocks A and
-B through no code of its own: the writes land **after** the collapse in §4.2's window, i.e. in
-memory the runtime has already freed.
-
-### 4.3 What this establishes and what is still open
-* A **collection runs inside `Process::deliver`** (`beam_process`'s `Process::deliver` →
-  `ensure_capacity` → `run_rooted_collection`), not through `beam_rt`'s `collect_or_grow`
-  (no `COLLECT-*` log lines were emitted), and it **collapses the nursery chain**, freeing the
-  spaces a `grow_nursery` had retired.
-* `Nursery::grow` (`beam_gc`) correctly retains the retired space in `Nursery::retired`, and
-  `Nursery::spaces()`/`add_to_from_set` do cover every retired space, so the collector *does*
-  evacuate a chained nursery. The corruption therefore means a live term of the scheduled
-  process is **not reachable from the root set that delivery-driven collection gathers** — the
-  collector then does not evacuate it, `collapse` frees its block, and the writer that re-uses
-  the block produces the observed `[2|[]]`-style clobber.
-* The delivery-driven collection (`Process::deliver`) is the one collection site that does
-  **not** consult the unscanned-root valve that `beam_rt`'s `ensure_heap` / `ensure_heap_full` /
-  `alloc_words_rooted` apply (`context::gc::root_is_unscanned`) — worth checking first, together
-  with which of the parked machine's regions `run_rooted_collection` actually gathers.
-* The canary's `MUTATED` output alone cannot separate "written while still retired-and-live"
-  from "written after the block was freed"; the round that was in flight when the turn budget ran
-  out replaced it with a per-pid block registry (live vs freed) plus a scan of the published
-  roots (`x`/stack/`extra_roots`) for pointers into a **freed** block. That scan is the piece that
-  pins the exact dangling root and must be the first thing a follow-up wave re-adds.
-
-### 4.4 Repro / controls (authoritative, cheap)
-```
-# bug (scheduled route):
-erts_rust/target/debug/beam_rt -noshell run <dir>/b13.beam b13:go/0        # NFORMS=6
-# correct (single-pass route):
-erts_rust/target/debug/beam_rt -noshell -pa <dir> -eval 'b13:go()'        # NFORMS=5
-erl -noshell -pa <dir> -eval 'b13:go()' -s init stop                      # NFORMS=5 (oracle)
-# nursery-size control:
+erts_rust/target/debug/beam_rt -noshell run <dir>/b13.beam b13:go/0     # NFORMS=6  (bug)
+erts_rust/target/debug/beam_rt -noshell -pa <dir> -eval 'b13:go()'      # NFORMS=5  (correct)
+erl -noshell -pa <dir> -eval 'b13:go()' -s init stop                    # NFORMS=5  (oracle)
 erts_rust/target/debug/beam_rt -noshell +hms 500 run <dir>/b13.beam b13:go/0   # NFORMS=5 (masked)
 ```
-`b13.erl`'s `go/0` hard-codes an absolute path; a committed regression test must not.
 
-## Round-3 freed-block scan: NO dangling published root (decisive negative)
+A small nursery (`+hms 233`, the default here) is what makes the divergence appear; the repro is
+deterministic. The `-eval` route is a single non-scheduled pass and never diverges.
 
-A temporary `BEAM_RT_TRACE_ROOTS` instrument (since removed) registered every nursery block base a
-pid had ever been observed using, marked a block **voided** once `AnyCollector::young_contains(base)`
-turned false (the delivery-collapse of the nursery chain), and at every runner observation
-(`entry`, `post-resync`, `park-yield`, `park-wait`) scanned **every** holder word —
-`Process::registers()` (`regs.x` whole file, whole stack, `extra_roots`), the process dictionary,
-`saved_args`, `signals`, every mailbox `payload`/`from`/`token`, and the parked `Machine`'s
-`x`/stack/`fr`/`pending_exception` — reporting every LIST/BOXED word whose target address landed
-inside a voided block.
+## 2. The decisive measurement — address vs contents at the send seam
 
-Raw output (`b13:go/0` on the scheduled `run` route, default `+hms`):
+The probe printed, at the delivery seam (`RuntimeContext::deliver_message_with_off_heap_inner`, i.e. on
+the **sender's own term, before any copy**), the raw address `ptr_val(XtraArgs[1])` — the scan
+`Options`, which is the `epp` server's `#epp.erl_scan_opts` list
+(`lib/stdlib/src/epp.erl:1048-1050`, used at `:1324`) — alongside its contents and the region the
+address lies in for the sending process.
+
+| Probe | `opts` address | contents | region at that moment |
+|---|---|---|---|
+| `OPT[26]` | `0x…d6bf80` | `[0x…d6bf92 \| 0x…d6bfa9]` intact | `mature` (pid3 mature base `0x…d6bee0`, used 39) |
+| `OPT[30]` | same `0x…d6bf80` | intact | `OTHER` |
+| `OPT[34]` | same `0x…d6bf80` | intact | `OTHER` |
+| `OPT[38]` | same `0x…d6bf80` | `[0x2580b \| 0x2f]` **CLOBBERED** | `OTHER` |
+
+**The address is byte-stable while the contents degrade** ⇒ the term is **never relocated**; a
+collection frees the block that holds it and a later allocation overwrites it in place. The `mature`
+→ `OTHER` transition is exactly the moment the sending process's mature space was replaced.
+
+## 3. The collecting site is pinned — `Process::deliver`, not a `beam_rt` admission door
+
+Instrumenting `beam_rt`'s four admission doors (`collect_or_grow` / `ensure_heap` / `ensure_heap_full` /
+`alloc_words_rooted` / `Runtime::serve_gc_request`) produced **no** line in the divergence window. The
+one collection that matters is the delivery-driven one:
 
 ```
-ROOTS-GEOM pid=3 site=park-wait   nspaces=3 cur=0x7bbd53f66120(cap 233 used 230) freed=0
-ROOTS-GEOM pid=3 site=entry       nspaces=1 cur=0x7bbd53f66120(cap 233 used   4) freed=1
-ROOTS-GEOM pid=3 site=post-resync nspaces=1 cur=0x7bbd53f66120(cap 233 used   4) freed=1
-... (repeated across the whole run; freed stays 1)
-NFORMS=6
+DELIVER-START to=pid3 sender=pid2 (state=Waiting, exempt=false, unpub=false)
+GC before-deliver-to pid3 young(base=…6120 used=233 cap=233 nspaces=1) mature(base=…7ee0 used=39) minor=0
+     ROOT[3] = 0x…27c2 class=cur      # x[3]
+     ROOT[6] = 0x…27da class=cur      # x[6]
+     ROOT[7] = 0x…2779 class=cur      # x[7]
+     ROOTCOUNT n=2053 in-heap=3
+DELIVERED
+GC after-deliver-to  pid3 young(base=…6120 used=4   cap=233 nspaces=1) mature(base=…19c0 used=16) minor=0
 ```
 
-**Zero `ROOTS-DANGLING` lines** — the voided block received no holder word from any published root
-or machine root at any observation. Earlier (unfiltered) rounds only ever reported `m.x[i]` at the
-`entry` site, i.e. the **parked machine's own stale register file**, which the resume replaces
-wholesale: `beam_rt/src/context/gc.rs::scatter_roots_full` requires
-`regs.x().live_slice().len() == roots.x.len().min(MAX_REG)` and `publish_roots_full` sets
-`regs.x_mut().set_live(roots.x.len().min(MAX_REG))` (= the whole register file) before copying
-`roots.x[..live]`, so the post-resync scan is clean too.
+* The collection runs inside `beam_process::Process::deliver` →
+  `Process::ensure_capacity` → `run_rooted_collection` (the `minor_gcs` counter stays 0 and the mature
+  **base changes**, so this is `Collector::collect_major`, `beam_gc/src/collector.rs:195`).
+* It ran with the receiver's `relocation_exempt == false` and `has_unpublished_roots() == false`
+  (`beam_process/src/process.rs:1097` = `exempt || state == Running`), so `deliver`'s gate
+  (`:936`) let it collect. `beam_rt`'s `root_is_unscanned` valve is **not** consulted at this site.
+* **At the collecting moment the receiver's gathered root families contain NO word pointing into the
+  mature generation** — `in-heap=3` and every in-heap root is `class=cur` (young). (At a *neighbouring*
+  park — `ROOT[0]`, `stack[0]`, `stack[3]` = `class=mature` — such roots do exist, so the probe is
+  capable of seeing them.) The process nevertheless keeps using a mature-resident term (its
+  `erl_scan_opts` field) afterwards.
 
-### Current invariant conclusion
-`beam_rt`'s park/resume round-trip publishes and restores the **whole** engine root set
-(`RootSet::ALL_LIVE` x + stack + FR, plus `pending_exception` via `extra_roots`), and
-`beam_process::Process::run_rooted_collection` gathers exactly those families. No published-root
-omission is observable: the surviving term is **not** reached through a voided block at all, so the
-earlier "live term left in the retired space" reading does not survive this range-based re-scan.
-The remaining candidate is a term clobbered **in place** in the still-current block (`used` cycles
-233 -> ~4 on the *same* base `...f66120`, i.e. the nursery is reused without alternating blocks) —
-inside the collector (`beam_gc`), not in `beam_rt`'s published root set.
+⇒ The freed term is not reachable from the root families `run_rooted_collection` gathers
+(`regs.gather_roots` = x + whole stack + `extra_roots`, mailbox `payload`/`from`/`token`, `dict`,
+`saved_args`, `signals`; `beam_process/src/process.rs:1232`), so the major collection sweeps it and
+`Nursery::collapse`/`self.mature = fresh` releases its block.
+
+## 4. What this rules out
+
+* **Not the native `file_server`** (`get_until` → `beam_io::io_device::Continuation` →
+  `erl_scan:tokens/4`): it returns the right tokens and the right `eof`; the same path driven from the
+  main scheduled process agrees with the oracle.
+* **Not the message copier**: plain cross-process sends of these shapes agree.
+* **Not `beam_rt`'s park/resume publication**: `publish_parked_roots`
+  (`src/runner/run.rs:97`) publishes the whole `RootSet::ALL_LIVE` (x + stack + FR) and the pending
+  exception via `extra_roots`, and `scatter_roots_full`/`resync_parked_roots` reconcile the machine on
+  resume. A range-based scan of every published root against the *voided nursery* blocks found zero
+  dangling roots. The finding here is a **mature**-resident term, which that scan did not cover, and the
+  gathered roots at the collecting moment hold no mature pointer at all.
+
+## 5. Where the defect is (sibling crate — not this node's write scope)
+
+`beam_process::Process::deliver` collects a receiver whose live mature-resident state is reachable only
+through a chain that its gathered families do not cover, while the collection is allowed to run because
+the only gate is `has_unpublished_roots()` (`relocation_exempt || state == Running`) — a test that
+cannot see a reference the gathered root set does not contain. The collection then frees the live term
+(`beam_gc/src/collector.rs:195` `collect_major` → `self.mature = fresh`, `:226`, via
+`beam_gc/src/copy.rs::Copier::classify_boxed`/`classify_cons`'s `from.contains` test).
+
+Closing it needs a change in `beam_process` (`Process::deliver` / `run_rooted_collection`) and/or
+`beam_gc` (the major collection's from-set/descent), not in `beam_rt`.
+
+## 6. Regression test (blocked on the fix)
+
+`tests/compile_file.rs` must drive `epp:parse_file/3` (or `compile:file/2`) through the scheduled `run`
+route on a **self-contained fixture under `tests/fixtures/`** and assert the observable result (parsed
+form count 5, or a byte-identical produced `.beam`). `b13.erl` hard-codes an absolute path and is
+therefore not committable as-is.
