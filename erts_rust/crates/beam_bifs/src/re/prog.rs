@@ -42,7 +42,7 @@
 //! | `Split` | a, b | try `a` first, `b` on backtrack |
 //! | `Jmp` | target | unconditional jump |
 //! | `Save` | slot | record the current position into a capture slot |
-//! | `BackRef` | group | match the text the group captured |
+//! | `BackRef` | group, caseless | match the text the group captured |
 //! | `Mark` | — | push the current choice-point depth |
 //! | `Cut` | — | discard every choice point above the last `Mark` |
 //! | `Match` | — | accept |
@@ -146,8 +146,14 @@ pub(crate) enum Inst {
     },
     /// Record the current subject position into a capture slot.
     Save(u32),
-    /// Match the text a capture group captured.
-    BackRef(u32),
+    /// Match the text a capture group captured, with its effective `caseless`
+    /// flag baked in.
+    BackRef {
+        /// The referenced group (1-based).
+        group: u32,
+        /// Whether the reference matches case-insensitively.
+        caseless: bool,
+    },
     /// Push the current choice-point depth.
     Mark,
     /// Discard every choice point above the last `Mark`.
@@ -291,8 +297,8 @@ impl Emitter {
                 self.emit(item)?;
                 self.push(Inst::Save(2 * index + 1));
             }
-            Ast::BackRef(group) => {
-                self.push(Inst::BackRef(*group));
+            Ast::BackRef { group, caseless } => {
+                self.push(Inst::BackRef { group: *group, caseless: *caseless });
             }
             Ast::Assert(assert) => {
                 self.push(Inst::Assert(*assert));
@@ -597,9 +603,10 @@ fn encode_inst(inst: &Inst, out: &mut Vec<u8>) {
             out.push(OP_SAVE);
             out.extend_from_slice(&slot.to_le_bytes());
         }
-        Inst::BackRef(group) => {
+        Inst::BackRef { group, caseless } => {
             out.push(OP_BACKREF);
             out.extend_from_slice(&group.to_le_bytes());
+            out.extend_from_slice(&u32::from(caseless).to_le_bytes());
         }
         Inst::Mark => out.push(OP_MARK),
         Inst::Cut => out.push(OP_CUT),
@@ -630,7 +637,8 @@ fn decode_inst(r: &mut Reader<'_>, classes: &[Ranges], ncap: u32) -> Result<Inst
             if group == 0 || group > ncap {
                 return Err(badarg());
             }
-            Inst::BackRef(group)
+            let caseless = r.u32()? != 0;
+            Inst::BackRef { group, caseless }
         }
         OP_MARK => Inst::Mark,
         OP_CUT => Inst::Cut,

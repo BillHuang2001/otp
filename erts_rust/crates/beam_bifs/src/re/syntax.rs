@@ -343,8 +343,14 @@ pub(crate) enum Ast {
     },
     /// A capturing group with the given (1-based) index.
     Capture { index: u32, item: Box<Ast> },
-    /// A backreference to the given (1-based) group.
-    BackRef(u32),
+    /// A backreference to the given (1-based) group, carrying the effective
+    /// `caseless` state of the enclosing inline options.
+    BackRef {
+        /// The referenced group (1-based).
+        group: u32,
+        /// Whether the reference matches case-insensitively.
+        caseless: bool,
+    },
     /// A zero-width assertion.
     Assert(Assert),
     /// An atomic group `(?>…)`.
@@ -996,7 +1002,7 @@ impl<'a> Parser<'a> {
                 .find(|(n, _)| n == &name)
                 .map(|(_, i)| *i)
                 .ok_or_else(|| ParseError::new(E_BAD_REFERENCE, self.here()))?;
-            return Ok(Ast::BackRef(index));
+            return Ok(Ast::BackRef { group: index, caseless: self.opts.caseless });
         }
         self.pos += 1; // `>`
         let close_pos = self.here();
@@ -1374,7 +1380,7 @@ impl<'a> Parser<'a> {
             if value > self.ncap {
                 return Err(ParseError::new(E_BAD_REFERENCE, self.byte_pos(self.pos)).into());
             }
-            return Ok(Ast::BackRef(value));
+            return Ok(Ast::BackRef { group: value, caseless: self.opts.caseless });
         }
         // Reinterpret as octal.
         self.pos = save;
@@ -1427,7 +1433,7 @@ impl<'a> Parser<'a> {
             .find(|(n, _)| n == &name)
             .map(|(_, i)| *i)
             .ok_or_else(|| ParseError::new(E_BAD_REFERENCE, self.here()))?;
-        Ok(Ast::BackRef(index))
+        Ok(Ast::BackRef { group: index, caseless: self.opts.caseless })
     }
 
     /// `\g{…}` / `\g<…>` / `\g'…'` / `\g-N`.
@@ -1449,7 +1455,7 @@ impl<'a> Parser<'a> {
                     if n == 0 || n > self.ncap {
                         return Err(ParseError::new(E_BAD_REFERENCE, self.here()).into());
                     }
-                    return Ok(Ast::BackRef(n));
+                    return Ok(Ast::BackRef { group: n, caseless: self.opts.caseless });
                 }
                 let index = self
                     .names
@@ -1457,7 +1463,7 @@ impl<'a> Parser<'a> {
                     .find(|(n, _)| n == &name)
                     .map(|(_, i)| *i)
                     .ok_or_else(|| ParseError::new(E_BAD_REFERENCE, self.here()))?;
-                Ok(Ast::BackRef(index))
+                Ok(Ast::BackRef { group: index, caseless: self.opts.caseless })
             }
             _ => Err(ParseError::new(
                 "\\g is not followed by a braced, angle-bracketed, or quoted name/number or by a plain number",
@@ -1895,17 +1901,17 @@ mod tests {
     fn backreferences_parse() {
         let s = parse_ascii(r"(a)\1").expect("parses");
         match s.ast {
-            Ast::Concat(items) => assert!(matches!(items[1], Ast::BackRef(1))),
+            Ast::Concat(items) => assert!(matches!(items[1], Ast::BackRef { group: 1, caseless: false })),
             other => panic!("{other:?}"),
         }
         let s = parse_ascii(r"(?<n>a)\k<n>").expect("parses");
         match s.ast {
-            Ast::Concat(items) => assert!(matches!(items[1], Ast::BackRef(1))),
+            Ast::Concat(items) => assert!(matches!(items[1], Ast::BackRef { group: 1, caseless: false })),
             other => panic!("{other:?}"),
         }
         let s = parse_ascii(r"(?<n>a)\g{n}").expect("parses");
         match s.ast {
-            Ast::Concat(items) => assert!(matches!(items[1], Ast::BackRef(1))),
+            Ast::Concat(items) => assert!(matches!(items[1], Ast::BackRef { group: 1, caseless: false })),
             other => panic!("{other:?}"),
         }
         // A reference to a group that does not exist is an error.
