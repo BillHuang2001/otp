@@ -1046,20 +1046,21 @@ fn enif_port_hooks_answer_the_real_port_registry() {
     fixture.cleanup();
 }
 
-/// The runtime's **per-call NIF host** exposes the runtime's global atom table, so `enif_compare`'s
-/// *nested*-atom order is **name** order (the C's `erts_cmp_atoms`) on the real call path — not the
-/// raw interned-index fallback.
+/// The runtime's **per-call NIF host** reaches `enif_compare`'s env-less entry point through the real
+/// `RuntimeContext::try_call_nif` path, ordering two *nested* atoms (each wrapped in a 1-tuple and a
+/// 1-list by the fixture) exactly as the real system `erl` does.
 ///
-/// `compare_caller:probe/1` interns the two probes in the **reverse** of their textual order, so the
-/// runtime's shared table holds `zzz` at the *lower* index: the index fallback answers `-1` for both
-/// shapes where name order answers `+1`. Removing `NifHostImpl::atom_table` therefore turns the
-/// runtime's `{1,1}` into `{-1,-1}` — exactly the nested-atom divergence
-/// `tools/differential/divergences.md` records for the `enif_compare` family.
+/// This is an **end-to-end wiring + oracle-parity** check of the runtime's NIF comparison path, not
+/// the discriminating pin for [`NifHost::atom_table`]: `compare_caller:probe/1`'s two probes are
+/// interned in the reverse of their textual order, but on this runtime their interned indices happen
+/// to already follow name order, so the answer is `{1,1}` whether or not the host exposes its table.
+/// The **load-bearing** proof that the hook is what orders a nested atom by name — and that removing
+/// it flips the answer to the raw-index order — is the unit test in `src/nif.rs`
+/// (`the_host_exposes_its_atom_table_so_nested_atoms_order_by_name`), which constructs the two index
+/// orders explicitly and pins the fallback independently (needing no `cc`/`erlc`).
 ///
-/// Oracle: the very same `.so`/`.beam` under the real system `erl` answers `{1,1}`, and the
-/// cross-check below runs it. The unit-level pin of the same hook (a `NifHostImpl` + `NifEnv` +
-/// `enif_compare`, with no `cc`/`erlc` needed) is `src/nif.rs`'s
-/// `the_host_exposes_its_atom_table_so_nested_atoms_order_by_name`.
+/// The oracle cross-check below still guards the wiring: the very same `.so`/`.beam` under the real
+/// system `erl` answers `{1,1}`.
 #[test]
 fn enif_compare_orders_nested_atoms_by_name_on_the_runtime_path() {
     let Some(fixture) = build_compare_fixture("compare_order") else {
