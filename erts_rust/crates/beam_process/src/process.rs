@@ -1066,13 +1066,16 @@ impl Process {
 
     /// Runs a safepoint collection over the whole process root set.
     ///
-    /// The root set is the registers/stack ([`Registers::gather_roots`]) **plus** the
+    /// The root set is the registers/stack **plus** the host-published extra roots
+    /// ([`Registers::gather_roots`], which appends `x[0..live)`, then the stack, then
+    /// [`Registers::extra_roots`] — the terms a host holds outside `x`/`stack`, e.g. a parked
+    /// engine machine's live pending-exception reason term) **plus** the
     /// mailbox message-envelope words, the process dictionary ([`Dict::gather_roots`]), the
     /// saved BIF/NIF arguments ([`SavedArgs::gather_roots`]) and the pending-signal queue
     /// ([`SignalQueue::gather_roots`]) — all in-heap sub-rootsets: the queue is drained, each
     /// message's `payload`/`from`/`token` and the dict/saved-arg/signal words are appended to
-    /// the root buffer, the collector runs, and each region is written back (registers via
-    /// [`Registers::scatter_roots`], each message re-installed through [`Message::with_payload`]
+    /// the root buffer, the collector runs, and each region is written back (the registers slice
+    /// via [`Registers::scatter_roots`], each message re-installed through [`Message::with_payload`]
     /// with its relocated `from`/`token` written back through
     /// [`Message::set_from`]/[`Message::set_token`] — its off-heap handles/refc binaries/node
     /// entries/fragment chain travel with the [`Message::with_payload`] rebuild — then the dict,
@@ -1197,9 +1200,11 @@ impl Process {
     where
         F: FnOnce(&mut AnyCollector, &mut [Eterm]) -> Result<Collection>,
     {
-        // 1. The flat root slice: `x[0..live)`, then the whole stack, then three words per
-        //    queued message — `[payload, from, token]`, in that fixed order. `reg_words` is where
-        //    the mailbox roots start.
+        // 1. The flat register slice: `x[0..live)`, then the whole stack, then the
+        //    host-published extra roots (`regs.extra_roots()` — a parked engine machine's live
+        //    terms, e.g. its pending-exception reason), in that fixed order. `reg_words` is both
+        //    where the mailbox roots start and the length of the register slice `scatter_roots`
+        //    is handed back below.
         let mut roots: Vec<Eterm> = Vec::new();
         let x_live = self.regs.gather_roots(&mut roots);
         let reg_words = roots.len();
@@ -1231,8 +1236,11 @@ impl Process {
         //    because the roots may already have been relocated in place even when it is `Err`.
         let action = collect(&mut self.collector, &mut roots);
 
-        // 5. Write the (relocated) registers and stack words back.
-        self.regs.scatter_roots(&roots, x_live);
+        // 5. Write the (relocated) register, stack and extra-root words back. The slice handed
+        //    in is exactly the register region `gather_roots` appended (`x` + stack + extra
+        //    roots) — the mailbox/dict/saved-arg/signal regions that follow are written back by
+        //    their own scatter steps, so the extra-root tail must not be confused with them.
+        self.regs.scatter_roots(&roots[..reg_words], x_live);
 
         // 6. Re-install every message around its relocated envelope words, preserving FIFO order.
         //    A message's three roots are `[payload, from, token]` at `index * MESSAGE_ROOT_WORDS`,
@@ -1335,7 +1343,7 @@ mod tests {
     //! the link/monitor accessors and the collect policy. Message delivery and the full
     //! safepoint collection are exercised by the `tests/` integration suite.
 
-    use beam_term::prelude::{make_small, ptr_val, AtomTable, NIL};
+    use beam_term::prelude::{make_small, ptr_val, tuple_element, tuple_size, AtomTable, NIL};
 
     use super::*;
     use crate::monitor::{Monitor, MonitorKind, RefAllocator};
@@ -1770,6 +1778,69 @@ mod tests {
                 (second_payload, second_from, second_token),
             ]
         );
+    }
+
+    /// Pins the host-published extra-root half of the root walk: a term a host holds **outside**
+    /// `x`/`stack` ([`Registers::extra_roots`] — a parked engine machine's live pending-exception
+    /// reason, say) is gathered **after** the register and stack words and written back relocated,
+    /// so a delivery-driven collection cannot leave the host holding a recycled word.
+    #[test]
+    fn run_rooted_collection_gathers_and_scatters_the_extra_roots() {
+        let mut process = Process::new(pid(51)).expect("the default heap allocates");
+        process
+            .registers_mut()
+            .x_mut()
+            .set_live(1)
+            .expect("1 <= MAX_REG");
+        process
+            .registers_mut()
+            .x_mut()
+            .set(0, make_small(1))
+            .expect("0 < live");
+        let stack_term = process
+            .heap_mut()
+            .cons(make_small(2), NIL)
+            .expect("the stack cons fits");
+        process.registers_mut().stack_mut().push(stack_term);
+        let extra = process
+            .heap_mut()
+            .tuple(&[make_small(3), make_small(4)])
+            .expect("the extra-root tuple fits");
+        process.registers_mut().extra_roots_mut().push(extra);
+
+        // Capture the pre-collection slice, then run a real collection so the write-back runs.
+        let mut captured: Vec<Eterm> = Vec::new();
+        process
+            .run_rooted_collection(|collector, roots| {
+                captured = roots.to_vec();
+                collector.collect(roots)
+            })
+            .expect("the collection succeeds");
+
+        // Order: the live x-register, then the stack word, then the host-published extra root.
+        assert_eq!(captured[0], make_small(1));
+        assert_eq!(captured[1], stack_term);
+        assert_eq!(captured[2], extra);
+        assert_eq!(captured.len(), 3);
+
+        // The host's word was written back relocated into a live space and is intact.
+        let extra_after = *process
+            .registers()
+            .extra_roots()
+            .first()
+            .expect("the extra root survived the collection");
+        let ptr = ptr_val(extra_after);
+        assert!(
+            process.collector().young_contains(ptr) || process.collector().mature_contains(ptr),
+            "the extra root was relocated into the surviving young/mature space"
+        );
+        // SAFETY: the assertion above proved `extra_after` points into a live space and it is the
+        // 2-tuple allocated above, so slots 0..2 are in bounds.
+        unsafe {
+            assert_eq!(tuple_size(extra_after), 2);
+            assert_eq!(tuple_element(extra_after, 0), make_small(3));
+            assert_eq!(tuple_element(extra_after, 1), make_small(4));
+        }
     }
 
     #[test]

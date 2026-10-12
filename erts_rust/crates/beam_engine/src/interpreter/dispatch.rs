@@ -28,7 +28,9 @@
 
 use beam_common::{BeamError, ExceptionClass, Result};
 use beam_loader::{ImportRef, Instr, Module, NO_FAIL};
-use beam_term::{cmp, is_atom, is_list, is_nil, make_atom, atom_val, Eterm, NIL};
+use beam_term::{
+    atom_val, cmp, is_atom, is_internal_pid, is_list, is_nil, make_atom, Eterm, NIL,
+};
 
 use crate::context::ExecutionContext;
 use crate::error;
@@ -36,6 +38,7 @@ use crate::families;
 use crate::families::funs::{apply_target, raise_badarg, ApplyTarget};
 use crate::machine::{Continuation, Machine, RunOutcome};
 use crate::operand::{read_operand, write_operand};
+use crate::predicates;
 use crate::Step;
 
 use super::{resolve, LabelMap};
@@ -386,6 +389,16 @@ impl Machine {
                 {
                     return self.apply_import_target(target, ImportFrame::Call, func, pc);
                 }
+                // `erlang:send/2` / `erlang:'!'/2` deliver through the host's
+                // off-heap-aware send seam (so an engine-built refc binary in the
+                // message is *shared*, not flattened), while every other import —
+                // and every destination the two routes do not resolve identically —
+                // keeps the route below.
+                if let Some(target) =
+                    self.resolve_call_ext_send(module, labels, *target, ctx)?
+                {
+                    return self.apply_import_target(target, ImportFrame::Call, func, pc);
+                }
                 if let Some((context, callee, callee_pc)) =
                     self.resolve_external_entry(module, labels, *target, ctx)?
                 {
@@ -417,6 +430,12 @@ impl Machine {
                 // (exactly like the local `Instr::CallOnly`).
                 if let Some(target) =
                     self.resolve_call_ext_apply(module, labels, *target, ctx)?
+                {
+                    return self.apply_import_target(target, ImportFrame::Only, func, pc);
+                }
+                // `erlang:send/2` / `erlang:'!'/2` — see the `CallExt` arm.
+                if let Some(target) =
+                    self.resolve_call_ext_send(module, labels, *target, ctx)?
                 {
                     return self.apply_import_target(target, ImportFrame::Only, func, pc);
                 }
@@ -472,6 +491,15 @@ impl Machine {
                 // popped frame and nothing may fail after it.
                 if let Some(target) =
                     self.resolve_call_ext_apply(module, labels, *target, ctx)?
+                {
+                    return self.apply_import_target(target, ImportFrame::Last(*deallocate), func, pc);
+                }
+                // `erlang:send/2` / `erlang:'!'/2` — see the `CallExt` arm. The
+                // delivery runs before the `deallocate` pop (the same order the
+                // synchronous BIF success path below applies), so a raise leaves the
+                // live frame untouched and a success pops it exactly once.
+                if let Some(target) =
+                    self.resolve_call_ext_send(module, labels, *target, ctx)?
                 {
                     return self.apply_import_target(target, ImportFrame::Last(*deallocate), func, pc);
                 }
@@ -788,6 +816,96 @@ impl Machine {
         Ok(Some(apply_target(self, module, count, ctx)?))
     }
 
+    /// The `call_ext*`-encoded `erlang:send/2` / `erlang:'!'/2` seam.
+    ///
+    /// `erlang:send/2` (registered also as `erlang:'!'/2`) is a **floor** BIF, so a
+    /// `call_ext*` to it normally folds into the host's synchronous
+    /// [`ExecutionContext::call_bif`] — and that route carries **no off-heap payload
+    /// handles**, because a BIF receives only its argument terms. A message the
+    /// *running* machine built with an off-heap (refc) binary — any
+    /// `bs_init_writable`/`bs_create_bin` result above
+    /// [`beam_term::refc::ERL_ONHEAP_BINARY_LIMIT`] — is therefore **flattened**
+    /// onto the receiver's heap instead of **shared**.
+    ///
+    /// The compiled `send` opcode has no such limitation: its arm
+    /// ([`families::receive`](crate::families::receive)) hands the in-flight
+    /// [`Machine::refc_binaries`] to
+    /// [`ExecutionContext::send_message_with_off_heap`], which is what lets the
+    /// receiver-side copy resolve a refc binary by its data pointer through the
+    /// copy's **source** off-heap table. This method reproduces exactly that for the
+    /// `call_ext*` form, so `erlang:send(Pid, Msg)` and `Pid ! Msg` run the same
+    /// delivery path.
+    ///
+    /// # The destination gate (why it is narrow)
+    ///
+    /// The seam and the BIF route are two implementations, and they agree only for
+    /// the destinations both resolve the **same** way:
+    ///
+    /// * an **internal pid** — both pass the pid term through as-is (the host's
+    ///   `SendBridge::resolve` and `RuntimeContext::resolve_send_target` both take
+    ///   it), including their identical handling of a pid no process exists for
+    ///   (below);
+    /// * a **reference** — both resolve it through the shared alias lookup
+    ///   (delivering to the alias owner and consuming the reference) and both
+    ///   report `badarg` for a reference that is not a live alias.
+    ///
+    /// They **differ** for an atom (the BIF route does a registered-name lookup and
+    /// can deliver where the seam is `badarg`), a port (the BIF route reports its
+    /// typed `unsupported(...)`, the seam `badarg`) and a `{Name,Node}` pair (the
+    /// BIF route reports its typed `unsupported(...)`, the seam `badarg`). Every one
+    /// of those returns `Ok(None)` here and keeps its existing `call_bif` route
+    /// unchanged, so no observable moves: the only difference the seam can make is
+    /// that an engine-built off-heap binary in the message is **shared** rather than
+    /// flattened — and only for the destinations whose delivery semantics are
+    /// provably identical.
+    ///
+    /// # Return value
+    ///
+    /// On success the send BIF's value — **the message itself**, exactly what C's
+    /// `BIF_SEND` returns and what makes `Pid ! Msg` evaluate to `Msg` — is reported
+    /// as [`ApplyTarget::Called`], which the caller's arm stores in `x(0)` and then
+    /// follows with its own [`ImportFrame`] discipline. A raise is reported as
+    /// [`ApplyTarget::Raised`], exactly as the synchronous `call_bif` failure is.
+    fn resolve_call_ext_send(
+        &mut self,
+        module: &Module,
+        labels: &LabelMap,
+        target: ImportRef,
+        ctx: &mut dyn ExecutionContext,
+    ) -> Result<Option<ApplyTarget>> {
+        let (module_name, function_name, arity) = labels.import_target(module, target)?;
+        // Only `erlang:send/2` and its `'!'/2` alias. `erlang:send/3` (which takes an
+        // option list) and every other import keep their existing route unchanged.
+        if module_name != "erlang" || arity != 2 {
+            return Ok(None);
+        }
+        if function_name != "send" && function_name != "!" {
+            return Ok(None);
+        }
+        // C's `BIF_SEND` argument shape: `x(0)` is the destination, `x(1)` the
+        // message (`emu/bif_instrs.tab`), which is also how the compiler emits an
+        // explicit `erlang:send/2` (`call_ext_only 2 {extfunc,erlang,send,2}`).
+        let to = self.x(0).ok_or_else(|| error::bad_register(0))?;
+        let message = self.x(1).ok_or_else(|| error::bad_register(1))?;
+        // The destination gate (see the method docs): only an internal pid and a
+        // reference are served identically by the seam and by the BIF route.
+        let internal_pid = is_internal_pid(to);
+        let reference = predicates::is_internal_ref(to) || predicates::is_external_ref(to);
+        if !(internal_pid || reference) {
+            return Ok(None);
+        }
+        match ctx.send_message_with_off_heap(to, message, self.refc_binaries()) {
+            Ok(()) => Ok(Some(ApplyTarget::Called(message))),
+            // A destination pid with no live process: C's `erl_send` drops the
+            // message and reports **success** (`bif.c:2478-2480`), which is exactly
+            // what the `erlang:send/2` BIF route maps the process table's typed
+            // `TermNotFound` to. Reproducing that mapping keeps this route
+            // byte-identical to the one it replaces — without it, a send to a dead
+            // pid would turn from a silent drop into a raise.
+            Err(BeamError::TermNotFound) => Ok(Some(ApplyTarget::Called(message))),
+            Err(e) => Ok(Some(ApplyTarget::Raised(self.raise_bif_error(module, e)?))),
+        }
+    }
     /// Apply an arm's own frame discipline to an [`ApplyTarget`] produced by
     /// [`Machine::resolve_call_ext_apply`].
     ///
