@@ -117,6 +117,7 @@ if [ ${#SUITES[@]} -eq 0 ]; then
             beam_ssa_fus_SUITE
             beam_ssa_fbip_SUITE
             ssa_opt_budget_SUITE
+            beam_ssa_opt_diff_SUITE
             beam_ssa_opt_equiv_SUITE)
 fi
 
