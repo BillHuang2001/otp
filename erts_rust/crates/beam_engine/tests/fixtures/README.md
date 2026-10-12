@@ -414,3 +414,13 @@ fun-taking export whose `fun` only the caller can build).
 | `ordsets_filtermap_double/1` | `ordsets:filtermap(fun(E) -> {true, E * 2} end, S).` | same, with the `{true, Value}` result shape |
 
 Rebuild it with the neutral-directory `erlc +deterministic` recipe above.
+## `catchtrace.beam` (`catchtrace.erl`) — `tests/exceptions.rs`
+A real `try … catch C:R:S -> S` whose `S` is the derived stacktrace (the raise snapshot cooked by `build_stacktrace`).
+| export | Erlang | what it pins |
+|---|---|---|
+| `run/0` | `try erlang:error(badarg) catch C:R:S -> S end.` (inline raise) | the raising frame is the catching frame |
+| `run2/0` | a non-tail call into `raise_badarg/0` under the same `try` | the raising frame first, then the live caller |
+## `raise_frames.beam` (`raise_frames.erl`) — `tests/raise_stacktrace.rs`
+The uncaught-raise frames: `outer/1` makes a **non-tail** `call` into `boom/1` (which raises `error:badarg`), so the uncaught `Raise.stacktrace` names `boom/1` then `outer/1`.
+## `xmod_caller.beam` (`xmod_caller.erl`) / `xmod_callee.beam` (`xmod_callee.erl`) — `tests/raise_stacktrace.rs`
+An in-machine cross-module raise: `xmod_caller:run/1` makes a non-tail `call_ext` into `xmod_callee:boom/1`, which raises — the frames name the callee first, then the caller, each resolved in its own module context. Both built with the neutral-directory recipe above.
