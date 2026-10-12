@@ -72,7 +72,8 @@ Per-key rationale lives in `info/unsupported.rs`; the oracle answer (OTP 29.1.1 
 - `info` / `procs` / `loaded` → **binaries** (547918 / 69206 / 1906 bytes on this host): ERTS-internal text dumps (`info()` = memory+hash-table+`allocated_areas`+allocator dump; `process_info()` = per-process dump; `loaded()` = the `Current code: N\nOld code: N\n<module> <bytes>` code-ix dump — `erl_bif_info.c:2951-2980`). The memory/table *figures* are reachable (`erlang:memory/0`, `erlang:processes/0`, the code server's loaded set), but the byte-level dump format is a different emulator's. **KEEP.**
 
 ### `badarg` — keys the oracle **rejects** (pinned in tests)
-`allocator_sizes`, `beam_jit_available`, `busy_limits`, `c_library_version`, `catchlevel`, `export_count`, `export_limit`, `memory`, `module_count`, `module_limit`, `net_ticktime`, `node`, `pure`, `run_queue`, `safe_string_hash`, `total_run_queue_lengths`, `wall_clock` — plus any unknown name (`nonsense`, `Version`).
+`allocator_sizes`, `beam_jit_available`, `busy_limits`, `c_library_version`, `catchlevel`, `export_count`, `export_limit`, `instruction_counts`, `memory`, `module_count`, `module_limit`, `net_ticktime`, `node`, `pure`, `run_queue`, `safe_string_hash`, `total_run_queue_lengths`, `wall_clock` — plus any unknown name (`nonsense`, `Version`).
+(`instruction_counts` is pinned only in the integration suite's `ORACLE_REJECTED_KEYS`; the `src/info.rs` unit list is the same set minus it.)
 
 ### Per-key decisions (A.8 `system_info`)
 Explicit close/keep decisions, so the next pass does not re-litigate them; each is a key where "answer = the oracle's figure" was considered and rejected:
