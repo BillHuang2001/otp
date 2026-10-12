@@ -336,6 +336,13 @@ fn iodata_bytes(term: Eterm) -> Option<Vec<u8>> {
             walk(access::car(term), out)?;
             return walk(access::cdr(term), out);
         }
+        // A list *element* is a byte (`iolist() = binary() | [byte() | binary() |
+        // iolist()]`), so a name written as a string — `["foo"]`, which Erlang
+        // spells as a list of small integers — is valid iodata.
+        if let Some(byte) = byte_value(term) {
+            out.push(byte);
+            return Some(());
+        }
         if access::is_binary(term) {
             out.extend_from_slice(&crate::bits::bytes(term).ok()?);
             return Some(());
@@ -344,6 +351,11 @@ fn iodata_bytes(term: Eterm) -> Option<Vec<u8>> {
     }
     walk(term, &mut out)?;
     Some(out)
+}
+
+/// A small integer in `0..=255` as a byte (the `erts_iolist_to_buf` element rule).
+fn byte_value(term: Eterm) -> Option<u8> {
+    u8::try_from(small_int(term)?).ok()
 }
 
 /// One option list element.

@@ -74,6 +74,10 @@ mod render;
 
 // The run-side BIF bodies (`re:run/2,3`, `re:internal_run/4`).
 mod run;
+
+#[cfg(test)]
+mod oracle;
+
 /// The compiled-pattern tag of the plain `{re_pattern, …}` form.
 const RE_PATTERN: &str = "re_pattern";
 
