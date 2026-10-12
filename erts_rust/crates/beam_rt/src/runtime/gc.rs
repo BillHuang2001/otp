@@ -382,10 +382,13 @@ impl Runtime {
     ///   source/destination off-heap tables (`copy.rs:502-507`), and the copy engine can only
     ///   copy what it covers. A term carrying an **off-heap payload** — the 8-word
     ///   `[BinRef][ErlSubBits]` refc-binary pair, or an MSO container — is resolved through the
-    ///   *source* off-heap table at `copy.rs:348-351` and `copy.rs:410-415`; the lookup misses
-    ///   on an empty table and the copy is refused with
+    ///   *source* off-heap table at `copy.rs:348-351` and `copy.rs:410-415`. A **refc binary**
+    ///   whose lookup misses on an empty table is not refused: the copier **flattens** its window
+    ///   into a fresh on-heap bitstring (`copy_match_context`), a byte-faithful self-contained
+    ///   copy ([`Runtime::stabilize_term`]). What remains refused with
     ///   [`BeamError::BadArg`] (`crate::error::bad_term`,
-    ///   `beam_message/src/error.rs:100-102`) — as is the cycle guard's refusal of a forged
+    ///   `beam_message/src/error.rs:100-102`) is a term carrying an unresolvable **MSO
+    ///   container** — as is the cycle guard's refusal of a forged
     ///   cyclic graph (`copy.rs:318-328`). So the split is exactly: **`Err(BeamError::SystemLimit)`
     ///   propagates, every other error is the capability gap** (that error is the *only* genuine
     ///   one `enforce_term_heap_limit` produces; `src/error.rs:89-97`). For it the original term
@@ -410,10 +413,10 @@ impl Runtime {
     /// trip); only the copy's **source** off-heap table differs — it is built from `src` instead
     /// of being empty
     /// ([`Runtime::stabilize_term_with`](crate::runtime::Runtime::stabilize_term_with), the
-    /// documented empty-source degradation unchanged). A caller that holds the handles behind
-    /// `term` (the runner's exit-reason arm) therefore stabilizes a term carrying an engine-built
-    /// off-heap binary — or a received off-heap payload — **correctly**, instead of tripping the
-    /// valve over a payload the empty table simply could not resolve.
+    /// documented empty-source form unchanged). A caller that holds the handles behind
+    /// `term` (the runner's exit-reason arm) therefore **shares** a term carrying an engine-built
+    /// off-heap binary — or a received off-heap payload — instead of materializing it on-heap the
+    /// way the empty-source form must, and neither form trips the valve over such a payload.
     ///
     /// # Errors
     ///

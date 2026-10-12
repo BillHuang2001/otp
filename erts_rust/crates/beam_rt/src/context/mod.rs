@@ -552,7 +552,9 @@ impl<'a> RuntimeContext<'a> {
     /// that one admission point (see the [`gc_armed`](Self::gc_armed) field docs).
     pub(crate) fn arm_gc(&mut self) {
         self.gc_armed = true;
-    }    /// The process table a receive/send resolves against: the caller-supplied one when
+    }
+
+    /// The process table a receive/send resolves against: the caller-supplied one when
     /// there is one, else the runtime's own.
     pub(crate) fn process_table_mut(&mut self) -> &mut ProcessTable {
         match self.mailbox_table {
@@ -679,15 +681,102 @@ impl<'a> RuntimeContext<'a> {
         }
     }
 
+    /// The **source** off-heap table a delivery resolves `message`'s refc binaries against.
+    ///
+    /// A refc binary is resolved **by its payload data pointer** (`OffHeapTable::binary_by_data_ptr`)
+    /// through this table, so a payload whose handle is missing makes the copy **flatten** the
+    /// window onto the destination heap (`beam_message`'s `copy_refc_binary` last resort) instead
+    /// of **sharing** it. The handles one delivery may be asked to resolve come from **three**
+    /// families, and only a union of all of them is correct:
+    ///
+    /// * `extra` — the sending **machine's** own handles
+    ///   ([`Machine::refc_binaries`](beam_engine::Machine::refc_binaries)), handed over by the
+    ///   engine's `send` seam;
+    /// * the runtime's **escaped-payload** store (`Runtime::eval_off_heap`), where a payload built
+    ///   by a nested run whose machine has since been dropped was adopted
+    ///   (`Runtime::adopt_escaped_binaries`);
+    /// * when `sender` is named, the off-heap families that process's **mailbox scan retained**
+    ///   from the messages it received and removed ([`MailboxState`]) — so a term a process
+    ///   **received** and then **forwards** (`erlang:send/2`) still resolves its payload, which no
+    ///   machine of the forwarding process owns.
+    ///
+    /// `Runtime::source_payloads` already unions all three families; `sender = None` is the
+    /// pass-boundary form (see below). The **node** family is carried by `SourcePayloads` but
+    /// deliberately **not** pushed: the copier registers a fresh `NodeEntry` for every external
+    /// thing it copies and never reads a source node list, while `OffHeapTable`'s `Drop` releases
+    /// every entry it holds — pushing the retained handles would zero the objects' own counts (the
+    /// same rule `Runtime::stabilize_term_with` documents).
+    ///
+    /// `None` — no handle in any family (a plain on-heap message) — is the documented empty-source
+    /// fast path, so the overwhelmingly common delivery builds no table at all.
+    ///
+    /// # Why `sender` is an `Option`
+    ///
+    /// [`Self::deliver_message`] is the **no-off-heap** delivery every runtime-internal delivery
+    /// uses (`trace.rs`, `native/process/exit.rs`) *and* the one [`Self::deliver_in_table`] drives
+    /// at a scheduler-pass boundary — where the throwaway context is built `for_process` the
+    /// **receiver**, so `self.mailbox_pid` names the receiver, never a sender. A delivery with no
+    /// sending process (`None`) must therefore resolve against the runtime's escaped store and
+    /// `extra` alone (`Runtime::off_heap_source`), never against the *receiver's* retained
+    /// families. The union only applies where a genuine sender is named
+    /// ([`Self::send_message_with_off_heap`]).
+    ///
+    /// # The sending machine's in-flight handles are **not** reachable from this node
+    ///
+    /// The engine's `send` seam passes its machine's handles as `extra`
+    /// (`ExecutionContext::send_message_with_off_heap`), but the **`erlang:send/2`/`'!'/2` BIF**
+    /// route (`SendBridge`) reaches this method through `ExecutionContext::send_message`, whose
+    /// signature carries **no** handle parameter — and it cannot carry one: the in-flight
+    /// `Machine` is removed from `RunnerState.engines` for the whole slice
+    /// (`runner/run.rs:169`), `BudgetContext` forwards only `&mut RuntimeContext`
+    /// (`runner/budget.rs:169-174`), and `Machine::refc_binaries` is a plain `Vec` field
+    /// (`beam_engine/src/machine/mod.rs:241`) no context can observe mid-run. A compiled `A ! B`
+    /// therefore carries its machine's handles, while the BIF route can only resolve what
+    /// `source_payloads` holds: a term the *running* machine just built with an off-heap payload
+    /// and forwards from a BIF callee still **flattens**. Closing that needs a sibling change (a
+    /// thread of the sender's handles into `ExecutionContext::call_bif`/`SendHook::send`), not a
+    /// beam_rt-only one — see the node `CONTEXT.md`.
+    ///
+    /// The returned table is **owned** by the caller and must outlive the copy the delivery runs
+    /// (the [`CopyContext`] borrows it as its source; the **destination** side is always the
+    /// receiver's own table, never this one).
+    fn send_source(
+        &self,
+        sender: Option<ProcessId>,
+        extra: &[beam_alloc::RefcBinary],
+    ) -> Option<OffHeapTable> {
+        // No sending process: the pass-boundary/runtime-internal form resolves against the
+        // runtime's escaped store and `extra` alone — exactly the table this path always built.
+        let Some(pid) = sender else {
+            return self.runtime.off_heap_source(extra);
+        };
+        let payloads = self.runtime.source_payloads(pid, extra);
+        if payloads.is_empty() {
+            return None;
+        }
+        // One clone (refcount++) per handle into the copy's source table; the table drops at the
+        // end of the delivery, giving every reference back. The MSO handles are pushed **in
+        // order**, so each lands on the slot its container term names.
+        let mut source = OffHeapTable::new();
+        for handle in &payloads.binaries {
+            source.push_binary(handle.clone());
+        }
+        for handle in &payloads.off_heap {
+            source.push(handle.clone());
+        }
+        Some(source)
+    }
+
     /// Delivers `message` from `from` into the mailbox of the internal pid `to`, with **no**
     /// trace event emitted — the delivery half of [`ExecutionContext::send_message`], and the
     /// delivery a trace event itself uses (so emitting an event never emits an event).
     ///
-    /// This is the **no-off-heap** form: it hands [`Self::deliver_message_with_off_heap`] an
-    /// empty source table, so every runtime-internal delivery (`trace.rs`,
-    /// `native/process/exit.rs`, [`Self::deliver_in_table`]) is byte-identical to before. The
-    /// engine's `send` seam carries the sender machine's refc-binary handles and goes through
-    /// the `_with_off_heap` form instead.
+    /// This is the **no-off-heap** form: it hands [`Self::deliver_message_with_off_heap`] the
+    /// runtime-escaped-store source table ([`Self::send_source`] with **no** sending process), so
+    /// every runtime-internal delivery (`trace.rs`, `native/process/exit.rs`,
+    /// [`Self::deliver_in_table`]) keeps its documented semantics. The engine's `send` seam carries
+    /// the sender machine's refc-binary handles and goes through the `_with_off_heap` form
+    /// instead.
     ///
     /// A delivery pushes a woken recipient onto the table's wake list, so the wake survives for
     /// the scheduler pass; the outcome itself needs no action here.
@@ -700,10 +789,11 @@ impl<'a> RuntimeContext<'a> {
         // The sender passed no handles of its own, but `message` may still carry an off-heap
         // payload that **escaped** the nested run which built it: that payload's handle lives
         // in the runtime's escaped-payload store, and the receiver-side copy resolves a refc
-        // binary by its data pointer through the source table it is handed
-        // ([`Runtime::off_heap_source`]). `None` (no handle anywhere) is the documented empty
-        // -source form — the fast path, byte-identical to before.
-        let source = self.runtime.off_heap_source(&[]);
+        // binary by its data pointer through the source table it is handed. The context's own pid
+        // is the **receiver** on the pass-boundary path ([`Self::deliver_in_table`]), so the
+        // receiver's retained families are deliberately left out (`None`); `None` (no handle in
+        // any family) is the documented empty-source fast path.
+        let source = self.send_source(None, &[]);
         match &source {
             Some(source) => self.deliver_message_with_off_heap(to, from, message, source),
             None => {
@@ -2667,9 +2757,10 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// `bs_create_bin` result over `beam_term::refc::ERL_ONHEAP_BINARY_LIMIT` bytes is stored
     /// **off** the process heap, so the copy into the recipient
     /// ([`ProcessTable::deliver`]) resolves a refc binary by its data pointer through this
-    /// table; without it the copy would refuse the whole message with
-    /// [`BeamError::BadArg`]. An empty slice (every runtime-internal send, and any message
-    /// with no off-heap payload) is byte-identical to the no-off-heap path.
+    /// table; without the handle the copy **flattens** the payload onto the recipient's heap
+    /// (a correct but unshared copy) instead of **sharing** it. An empty slice (every
+    /// runtime-internal send, and any message with no off-heap payload) is byte-identical to the
+    /// no-off-heap path.
     ///
     /// The source table is a **local that outlives the whole delivery call** — the copy
     /// borrows it for the copy's duration — and `deliver_message_with_off_heap` reads it. The
@@ -2696,16 +2787,18 @@ impl ExecutionContext for RuntimeContext<'_> {
     ) -> Result<()> {
         let (target, reference) = self.resolve_send_target(to)?;
         let from = self.mailbox_pid.to_eterm();
-        // The copy's source off-heap table: the sender machine's own handles (`src_binaries`)
-        // **unioned** with the runtime's escaped-payload store
-        // ([`Runtime::off_heap_source`]). The union matters because a term this sender holds
-        // may reference a payload built by a nested run whose machine has already been dropped
-        // — `result ! B` after `B = compile:forms(...)` — and the receiver-side copy resolves
-        // every refc binary by its data pointer through the source table, so a handle missing
-        // from it refuses the whole message with `BeamError::BadArg`. `None` (no handle in
-        // either family, i.e. a plain on-heap message) keeps the documented empty-source fast
-        // path.
-        let source = self.runtime.off_heap_source(src_binaries);
+        // The copy's source off-heap table: the sender's three handle families — its machine's own
+        // handles (`src_binaries`) **unioned** with the runtime's escaped-payload store and with
+        // the off-heap families its own **mailbox scan retained** from the messages it received
+        // ([`Self::send_source`], over `Runtime::source_payloads`). The union matters because a
+        // term this sender holds may reference a payload built by a nested run whose machine has
+        // already been dropped — `result ! B` after `B = compile:forms(...)` — or one it
+        // **received** from another process and is now forwarding (`erlang:send/2`); the
+        // receiver-side copy resolves every refc binary by its data pointer through the source
+        // table, so a handle missing from it would only **flatten** the payload (losing the share).
+        // `None` (no handle in any family, i.e. a plain on-heap message) keeps the documented
+        // empty-source fast path.
+        let source = self.send_source(Some(self.mailbox_pid), src_binaries);
         match &source {
             Some(source) => self.deliver_message_with_off_heap(target, from, message, source)?,
             None => self.deliver_message(target, from, message)?,

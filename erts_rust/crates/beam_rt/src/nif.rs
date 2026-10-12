@@ -487,6 +487,24 @@ impl NifHost for NifHostImpl<'_> {
         self.atoms.name(atom_val(atom)).map(str::to_string)
     }
 
+    /// The runtime's **global atom table** — the name source `beam_term`'s structural comparison and
+    /// hashing order two atoms by (the C's `erts_cmp_atoms`).
+    ///
+    /// `beam_abi`'s env-less `enif_compare`/`enif_is_identical`/`enif_hash` reach it through the host
+    /// of the NIF call the calling thread is inside, so an atom *nested* inside a compound (a tuple
+    /// or list element, a map value, …) orders and hashes by its **name** instead of by its raw
+    /// interned index — `beam_term`'s flatmap *key* order stays the index order it defines, as the C
+    /// does (see [`NifHost::atom_table`]).
+    ///
+    /// The host already owns the runtime's one shared table — the very table
+    /// [`NifHost::atom_name`] reads — so this is a borrow of it: no new state, no clone, and nothing
+    /// is published that could outlive the call (`beam_abi` reborrows it only for the duration of the
+    /// `enif_*` entry point). A name interned moments earlier *in this same call* is still visible to
+    /// those entry points through `beam_abi`'s per-call atom record, which is consulted first.
+    fn atom_table(&self) -> Option<&AtomTable> {
+        Some(&*self.atoms)
+    }
+
     /// `erlang:self()` inside the NIF — the pid the calling process runs as.
     fn self_pid(&mut self) -> Option<Eterm> {
         Some(self.self_pid)
@@ -937,6 +955,86 @@ mod tests {
 
         // A second call to intern the same name deduplicates within the call.
         assert_eq!(host.intern_atom("fresh"), Some(fresh));
+    }
+
+    /// **The host exposes the runtime's global atom table to the env-less `enif_*` entry points**, so
+    /// an atom *nested* inside a compound is ordered and hashed by its **name** (the C's
+    /// `erts_cmp_atoms`) rather than by its raw interned index.
+    ///
+    /// The two probe atoms are interned in the **reverse** of their textual order, so index order and
+    /// name order *disagree* on the pair: by index `{zzz} < {aaa}`, by name `{aaa} < {zzz}`. Removing
+    /// [`NifHost::atom_table`] from this host therefore flips every assertion below — which is what
+    /// makes the hook load-bearing rather than decorative. (`enif_is_identical` shares the same table
+    /// but has no *observable* nested-atom case: equality is order-independent, so a pair of nested
+    /// atoms answers the same either way; `enif_compare`/`enif_hash` are the discriminating pair.)
+    #[test]
+    // The crate is `#![deny(unsafe_code)]`; `enif_compare`/`enif_hash` are `unsafe extern "C"` (that
+    // *is* the C ABI they implement), so driving them takes the documented test-only exception
+    // `src/context/gc.rs` also takes.
+    #[allow(unsafe_code)]
+    fn the_host_exposes_its_atom_table_so_nested_atoms_order_by_name() {
+        use beam_abi::nif::types::ErlNifHash;
+        use beam_abi::nif_from_eterm;
+        use beam_term::prelude::{cmp, term_hash};
+
+        // `zzz` is interned first, so it holds the *lower* index although `aaa` is textually first:
+        // for this pair the live table's order and the raw index order are opposites.
+        let (mut host, atoms, _interner) = host_with(&["zzz", "aaa"]);
+        let zzz = make_atom(atoms.lookup("zzz").expect("seeded"));
+        let aaa = make_atom(atoms.lookup("aaa").expect("seeded"));
+        assert!(
+            atom_val(zzz).raw() < atom_val(aaa).raw(),
+            "the probe interned `zzz` first, so its index lies below `aaa`'s"
+        );
+
+        // A live env is exactly what publishes this host as "the NIF call this thread is inside" —
+        // the only route by which an env-less entry point can reach it.
+        let mut env = NifEnv::new(&mut host);
+        let t_zzz = env.heap().tuple(&[zzz]).expect("a 1-tuple on the host heap");
+        let t_aaa = env.heap().tuple(&[aaa]).expect("a 1-tuple on the host heap");
+
+        // SAFETY: both terms are live 1-tuples on this host's bump heap (which never moves) and the
+        // `enif_*` entry points only read them; `env` keeps the host published for both calls.
+        let (ord, mirrored) = unsafe {
+            (
+                beam_abi::nif::enif::enif_compare(nif_from_eterm(t_zzz), nif_from_eterm(t_aaa)),
+                beam_abi::nif::enif::enif_compare(nif_from_eterm(t_aaa), nif_from_eterm(t_zzz)),
+            )
+        };
+        assert_eq!(ord, 1, "`{{aaa}} < {{zzz}}` by name, so `{{zzz}}` vs `{{aaa}}` is +1");
+        assert_eq!(mirrored, -1, "and the mirrored comparison is -1");
+
+        // The very same pair re-compared against an *empty* table — the fallback `with_host_atoms`
+        // takes when a host exposes no table — orders the nested atoms by index, i.e. the other way
+        // round. That is the answer the assertions above would see without this hook.
+        assert_eq!(
+            cmp(t_zzz, t_aaa, &AtomTable::new()),
+            core::cmp::Ordering::Less,
+            "the raw-index fallback orders the pair the other way"
+        );
+        assert_eq!(
+            cmp(t_zzz, t_aaa, &atoms),
+            core::cmp::Ordering::Greater,
+            "the host's own table is where the name order comes from"
+        );
+
+        // The same table reaches `enif_hash`: it hashes with the *current host's* table, so the value
+        // is the name-based one — never the index-based fallback value.
+        let masked = |hash: u64| hash & ((1 << 27) - 1);
+        // SAFETY: as above — `t_zzz` is a live term and `enif_hash` only reads it.
+        let phash2 = unsafe {
+            beam_abi::nif::enif::enif_hash(ErlNifHash::Phash2, nif_from_eterm(t_zzz), 7)
+        };
+        assert_eq!(
+            phash2,
+            masked(term_hash(t_zzz, &atoms)),
+            "`enif_hash/3` hashed the nested atom by its name"
+        );
+        assert_ne!(
+            masked(term_hash(t_zzz, &atoms)),
+            masked(term_hash(t_zzz, &AtomTable::new())),
+            "the index fallback hashes the pair differently, so the pin above is real"
+        );
     }
 
     #[test]

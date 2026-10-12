@@ -23,35 +23,23 @@
 //!
 //! Whether it does depends on the binary's **representation**, not on its value:
 //!
-//! * An empty binary built **on-heap** works. A `<<>>` literal (`lit/0`),
-//!   `binary:copy(<<7>>, 0)` (`copied/0`) and `binary:part(<<1,2,3>>, 0, 0)` (`part/0`) are
-//!   all plain on-heap binaries, and `beam_rt run … emptybinres:<f>/0` prints `<<>>\n`
-//!   with exit `0` — exactly the oracle. **Test A** below pins this (it passes today).
-//! * An empty binary produced by a **`bs_init_writable` accumulator** is an **off-heap
-//!   refc binary** (`[BinRef][ErlSubBits]`), which is what `base64:encode/1` returns even
-//!   for its zero-length input. `beam_rt run … emptybinres:b64reported/1 7` prints
-//!   `beam_rt: badarg` with exit `1`, where the oracle prints `<<>>\n` with exit `0`.
-//!   **Test B** is that defect, and it is `#[ignore]`d — see the note on it.
-//!
-//! # Why Test B is ignored (root cause — it is in READ-ONLY sibling crates)
-//!
-//! The CLI renders a `run` result through `beam_rt/src/runtime.rs::stabilize_term`, which
-//! copies the returned term onto the pointer-stable arena with
-//! `beam_message::copy_struct_simple`. That shared entry copies against **empty** off-heap
-//! tables, so `beam_message/src/copy.rs::copy_refc_binary` cannot resolve the refc
-//! payload's backing store (`binary_by_data_ptr` misses) and returns `bad_term()`
-//! (`BeamError::BadArg`) — the `badarg` the CLI prints.
-//!
-//! The fix is a self-contained ("flatten") copy mode in `beam_message` plus a one-line
-//! adoption in `beam_rt/src/runtime.rs::stabilize_term`. The `beam_message` half is read-only
-//! to this node, and the adopting call cannot compile until that entry point exists, so the
-//! test is marked `#[ignore]` with that reason and must be un-ignored when the fix lands
-//! (the `beam_rt` half is the single `copy_struct_simple` call in `stabilize_term`).
+//! * An empty binary built **on-heap** — a `<<>>` literal (`lit/0`), `binary:copy(<<7>>, 0)`
+//!   (`copied/0`) or `binary:part(<<1,2,3>>, 0, 0)` (`part/0`) — is a plain on-heap binary, and
+//!   `beam_rt run … emptybinres:<f>/0` prints `<<>>\n` with exit `0`, exactly the oracle.
+//!   **Test A** below pins this.
+//! * An empty binary produced by a **`bs_init_writable` accumulator** is an **off-heap refc
+//!   binary** (`[BinRef][ErlSubBits]`), which is what `base64:encode/1` returns even for its
+//!   zero-length input. The CLI renders a `run` result through
+//!   `beam_rt/src/runtime.rs::stabilize_term`, whose copy **flattens** a refc payload that no
+//!   source off-heap table owns into a fresh on-heap bitstring
+//!   (`beam_message/src/copy.rs::copy_refc_binary` falls back to the `copy_match_context` window
+//!   copy — sound because the pair's own `base_flags` word carries its data pointer, so the bytes
+//!   copy verbatim), so `beam_rt run … emptybinres:b64reported/1 7` prints `<<>>\n` with exit `0`,
+//!   exactly the oracle. **Test B** below pins this.
 //!
 //! The fixture is compiled **at test time** with the system `erlc` into a scratch directory
 //! under the system temp dir (never committed), and every test **skips loudly** — never
 //! silently passes — when the compiler or the oracle is unavailable.
-
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -228,7 +216,7 @@ fn assert_prints_empty_binary(output: &Output, what: &str) {
 }
 
 // ---------------------------------------------------------------------------------------
-// Test A — the on-heap empty binary (passes today)
+// Test A — the on-heap empty binary
 // ---------------------------------------------------------------------------------------
 
 /// A `<<>>` literal, `binary:copy(<<7>>, 0)` and `binary:part(<<1,2,3>>, 0, 0)` all print
@@ -262,22 +250,19 @@ fn an_on_heap_empty_binary_prints_as_a_binary() {
 }
 
 // ---------------------------------------------------------------------------------------
-// Test B — the off-heap refc empty binary (the reported defect, ignored)
+// Test B — the off-heap refc empty binary
 // ---------------------------------------------------------------------------------------
 
-/// An empty binary that is an **off-heap refc binary** — `base64:encode/1`'s result — is
-/// rejected by the CLI (`beam_rt: badarg`, exit 1) instead of printing `<<>>`.
+/// An empty binary that is an **off-heap refc binary** — `base64:encode/1`'s result — prints
+/// `<<>>` through this runtime's CLI **and** the system oracle.
 ///
-/// The oracle prints `<<>>` for it. `beam_rt` cannot, because
-/// `beam_rt/src/runtime.rs::stabilize_term` copies the result with
-/// `beam_message::copy_struct_simple`, whose empty off-heap tables make
-/// `beam_message/src/copy.rs::copy_refc_binary` return `bad_term()`. The fix (a
-/// self-contained flatten copy in `beam_message` + a one-line adoption in `runtime.rs`) is
-/// outside this crate's scope, so this test is ignored until it lands.
+/// The result is the frozen 8-word `[BinRef][ErlSubBits]` pair whose payload lives off the
+/// process heap, and `beam_rt/src/runtime.rs::stabilize_term` copies it onto the pointer-stable
+/// arena with `beam_message::copy_struct_simple`, whose **empty** off-heap tables cannot resolve
+/// that payload (`binary_by_data_ptr` misses) — so the copy flattens the window into a fresh
+/// on-heap bitstring, which is exactly the byte-faithful, self-contained value the CLI prints.
 #[test]
-#[ignore = "beam_message::copy_struct_simple cannot copy an off-heap refc binary (beam_message/src/copy.rs:487) — a self-contained flatten copy + the one-line adoption in beam_rt/src/runtime.rs::stabilize_term are needed; un-ignore when they land"]
-fn an_off_heap_refc_empty_binary_prints_as_a_binary() {
-    let Some(erlc) = resolve_erlc() else {
+fn an_off_heap_refc_empty_binary_prints_as_a_binary() {    let Some(erlc) = resolve_erlc() else {
         support::skip_loudly("empty binary result", "no `erlc` on $PATH");
         return;
     };

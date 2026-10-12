@@ -443,6 +443,13 @@ fn decode_tuple(
     atoms: &AtomTable,
     vars: &BTreeSet<u32>,
 ) -> Result<Expr> {
+    // A bare `{}` (0-arity tuple) is neither a call nor the construct form, so
+    // it is `badarg` — the oracle rejects it ("{} is neither a function call,
+    // nor a tuple"). Reject it before any `elements[0]` read: an empty tuple
+    // must never index the empty slice.
+    if elements.is_empty() {
+        return Err(badarg());
+    }
     // `{{ … }}` — a one-element tuple whose element is a tuple constructs that
     // tuple.
     if elements.len() == 1 {
