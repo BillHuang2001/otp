@@ -218,7 +218,7 @@ Non-corpus modules:
 - `src/test_support.rs` -> `#[cfg(test)]`-only shared helpers (`Scratch` dir, compiler stubs) for the `module_build`/`nif_build` tests
 
 Corpus groups (`src/corpus/*`; each file's own module doc is the per-case reference — ids, prefixes, counts):
-- `src/corpus/mod.rs` -> `Case`/`CaseKind` (`Eval`/`EvalEnv`/`Module`/`ModuleEnv`)/`ModuleRun`/`EmbeddedModule`/`Contract`/`Probe`/`Golden` (plus `DIR_PLACEHOLDER`/`expand_env`) + the registry (`cases`, `find_case`, `probe_expr`) and the group wiring/well-formedness tests
+- `src/corpus/mod.rs` -> `Case`/`CaseKind` (`Eval`/`EvalEnv`/`Module`/`ModuleEnv`/`Command`)/`ModuleRun`/`CommandRun`/`CommandSpec`/`CommandProgram`/`EmbeddedModule`/`Contract`/`Probe`/`Golden` (plus `DIR_PLACEHOLDER`/`expand_env`) + the registry (`cases`, `find_case`, `probe_expr`) and the group wiring/well-formedness tests
 - `src/corpus/terms.rs` -> A.1: term ordering/equality, arithmetic
 - `src/corpus/semantics.rs` -> A.1: arithmetic/precedence, bignum, `==`/`=:=`/`=/=`, ordering, `case`/`if`/`try`, funs (incl. the `semantics/closure_*` calling-convention cases), comprehensions, maps/tuples/binaries
 - `src/corpus/errors.rs` -> A.1: the `throw`/`exit`/`error` classes and reasons, the common `badarg`/`badarith` failures, the structured `try … catch` reasons, `function_clause`/`undef`
