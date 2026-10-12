@@ -20,6 +20,7 @@
 
 use beam_bifs::{AtomInterner, BifFn, BifRegistry, BytesSink, LocalFunIdentity, LocalNode};
 use beam_engine::RunOutcome;
+use beam_loader::Operand;
 use beam_term::{atom_val, is_small, make_atom, make_small, signed_value, Atom, AtomTable, NIL};
 
 use super::*;
@@ -2270,13 +2271,13 @@ fn the_served_statistics_counters_read_the_runtimes_own_state() {
     );
 }
 
-/// A module that imports `erlang:load_nif/2` is recognised as one whose own code **reads its
-/// call site** (see [`module_observes_its_call_site`]), so the cross-module call seam never
-/// enters it in-machine under the *caller's* identity. Every other import is ignored, except
-/// the fun-image BIFs: `erlang:term_to_binary/1,2` and `erlang:external_size/1,2` no longer need
-/// the call site (their local-fun `NEW_FUN_EXT` identity is derived by searching every loaded
-/// module, [`FunIdentityBridge`]) but are kept on the synchronous route as the conservative
-/// guard against the park-window relocation hazard the predicate documents.
+/// The guarded call-site imports, and the **scope** of the refusal each one forces
+/// ([`callee_observes_its_call_site`]): a module importing `erlang:load_nif/2` keeps **every**
+/// function off the in-machine route (a local call inside the module reaches the loader and a
+/// local `call` never re-consults the seam), while the fun-image BIFs
+/// (`erlang:term_to_binary/1,2`, `erlang:external_size/1,2`) refuse only the callee **function**
+/// whose own lowered body issues the call — everything else about that module is entered
+/// in-machine. Every other import is ignored.
 #[test]
 fn the_call_site_and_guarded_imports_keep_a_callee_off_the_in_machine_route() {
     /// A synthetic module importing exactly `imports` (as `{module, function, arity}`).
@@ -2294,20 +2295,41 @@ fn the_call_site_and_guarded_imports_keep_a_callee_off_the_in_machine_route() {
         module
     }
 
-    for observant in [
-        ("erlang", "load_nif", 2),
-        ("erlang", "term_to_binary", 1),
-        ("erlang", "term_to_binary", 2),
-        ("erlang", "external_size", 1),
-        ("erlang", "external_size", 2),
-    ] {
+    /// The seam's verdict for `module`'s `function`/`arity`, interning the name on demand.
+    fn refused(module: &mut Module, function: &str, arity: u32) -> bool {
+        let function_atom = module.atom_table.intern(function);
+        callee_observes_its_call_site(module, function_atom, arity)
+    }
+
+    /// A `name`/`arity` function over exactly `code` (the guard reads neither label, so both are
+    /// `0`).
+    fn function_over(module: &mut Module, name: &str, arity: u32, code: Vec<Instr>) -> Function {
+        let name = module.atom_table.intern(name);
+        Function {
+            func_label: Label(0),
+            entry_label: Label(0),
+            module: module.name,
+            name,
+            arity,
+            code,
+            blocks: Vec::new(),
+            labels: std::collections::BTreeMap::new(),
+        }
+    }
+
+    // ---- the MODULE-wide scope: `erlang:load_nif/2` ---------------------------------------
+    // Refused for every function of the module, whether or not the callee's own body issues the
+    // call: a local `call` inside the module reaches the loader without re-consulting the seam,
+    // so nothing narrower is sound.
+    let mut load_nif = module_importing(&[("erlang", "load_nif", 2)]);
+    for (function, arity) in [("load", 1), ("init", 0), ("other", 3)] {
         assert!(
-            module_observes_its_call_site(&module_importing(&[observant])),
-            "{observant:?} keeps its module off the in-machine route"
+            refused(&mut load_nif, function, arity),
+            "load_nif/2 keeps the whole module off the in-machine route ({function}/{arity})"
         );
     }
     // The same *names* in a foreign module, a different arity of the same name, and every
-    // unrelated import are all not the runtime's guarded BIFs.
+    // unrelated import are all not the runtime's guarded BIFs — for **any** callee function.
     for ordinary in [
         ("erlang", "load_nif", 1),
         ("erlang", "load_nif", 3),
@@ -2321,23 +2343,238 @@ fn the_call_site_and_guarded_imports_keep_a_callee_off_the_in_machine_route() {
         ("erlang", "send", 2),
     ] {
         assert!(
-            !module_observes_its_call_site(&module_importing(&[ordinary])),
+            !refused(&mut module_importing(&[ordinary]), "any", 0),
             "{ordinary:?} must not keep a module off the in-machine route"
         );
     }
-    // The predicate is "any import matches", not "the first does".
-    assert!(module_observes_its_call_site(&module_importing(&[
+
+    // ---- the PER-FUNCTION scope: the fun-image BIFs ---------------------------------------
+    // A module importing one but defining no function of the callee's name/arity keeps the
+    // module-wide verdict — the conservative fallback that never admits what the guard refused
+    // before.
+    for fun_image in [
+        ("erlang", "term_to_binary", 1),
+        ("erlang", "term_to_binary", 2),
+        ("erlang", "external_size", 1),
+        ("erlang", "external_size", 2),
+    ] {
+        let mut module = module_importing(&[fun_image]);
+        assert!(
+            refused(&mut module, "encode", 1),
+            "{fun_image:?}: an unlocatable callee function keeps the module-wide verdict"
+        );
+    }
+
+    // One import, two functions: only the function whose **own** body issues the call is
+    // refused, and every instruction form carrying the import counts.
+    for observing in [
+        Instr::CallExt {
+            arity: 1,
+            target: ImportRef(0),
+        },
+        Instr::CallExtOnly {
+            arity: 1,
+            target: ImportRef(0),
+        },
+        Instr::CallExtLast {
+            arity: 1,
+            target: ImportRef(0),
+            deallocate: 0,
+        },
+        Instr::Bif0 {
+            bif: ImportRef(0),
+            dst: Operand::X(0),
+        },
+        Instr::Bif {
+            arity: 1,
+            bif: ImportRef(0),
+            fail: Label(0),
+            args: vec![Operand::X(0)],
+            dst: Operand::X(0),
+        },
+        Instr::GcBif {
+            arity: 1,
+            bif: ImportRef(0),
+            fail: Label(0),
+            live: 1,
+            args: vec![Operand::X(0)],
+            dst: Operand::X(0),
+        },
+    ] {
+        let mut module = module_importing(&[("erlang", "term_to_binary", 1)]);
+        let enc = function_over(&mut module, "enc", 1, vec![observing.clone()]);
+        let plain = function_over(&mut module, "plain", 0, Vec::new());
+        module.functions.push(enc);
+        module.functions.push(plain);
+        assert!(
+            refused(&mut module, "enc", 1),
+            "{observing:?} in the callee's own body refuses the callee"
+        );
+        assert!(
+            !refused(&mut module, "plain", 0),
+            "a non-observing function of the same module is entered in-machine"
+        );
+    }
+
+    // An import-carrying instruction whose `ImportRef` is out of range names no import at all,
+    // so it must not panic and must not refuse (a malformed image never fabricates a refusal).
+    let mut malformed = module_importing(&[("erlang", "term_to_binary", 1)]);
+    let bad = function_over(
+        &mut malformed,
+        "enc",
+        1,
+        vec![Instr::CallExt {
+            arity: 1,
+            target: ImportRef(7),
+        }],
+    );
+    malformed.functions.push(bad);
+    assert!(
+        !refused(&mut malformed, "enc", 1),
+        "an out-of-range ImportRef observes nothing"
+    );
+
+    // `load_nif` dominates a module importing both, in **either** order: the whole module is
+    // refused even for a function whose own body issues nothing.
+    for imports in [
+        [("erlang", "load_nif", 2), ("erlang", "term_to_binary", 1)],
+        [("erlang", "term_to_binary", 1), ("erlang", "load_nif", 2)],
+    ] {
+        let mut module = module_importing(&imports);
+        let plain = function_over(&mut module, "plain", 0, Vec::new());
+        module.functions.push(plain);
+        assert!(
+            refused(&mut module, "plain", 0),
+            "{imports:?}: load_nif/2 dominates the fun-image scope"
+        );
+    }
+
+    // The scan is "any import matches", not "the first does", and an empty import list observes
+    // nothing.
+    let mut mixed = module_importing(&[
         ("erlang", "+", 2),
         ("lists", "map", 2),
         ("erlang", "load_nif", 2),
-    ])));
-    assert!(!module_observes_its_call_site(&module_importing(&[])));
+    ]);
+    assert!(refused(&mut mixed, "load", 1));
+    let mut unrelated = module_importing(&[
+        ("erlang", "+", 2),
+        ("lists", "map", 2),
+        ("erlang", "term_to_binary", 1),
+    ]);
+    let enc = function_over(
+        &mut unrelated,
+        "enc",
+        1,
+        vec![Instr::CallExt {
+            arity: 1,
+            target: ImportRef(2),
+        }],
+    );
+    unrelated.functions.push(enc);
+    assert!(
+        refused(&mut unrelated, "enc", 1),
+        "the guarded import is found after unrelated ones"
+    );
+    assert!(!refused(&mut module_importing(&[]), "any", 0));
+}
+
+/// The `obs_split` fixture: one module, two functions — `enc/1` issues
+/// `erlang:term_to_binary/1` in its **own** body, `plain/0` does not.
+const SEAM_OBS_SPLIT_SRC: &str = "-module(obs_split).
+-export([plain/0, enc/1]).
+plain() -> ok.
+enc(Term) -> term_to_binary(Term).
+";
+
+/// **The guard's scope on a real `.beam`: per-function for the fun-image BIFs.** The cross-module
+/// seam admits the non-observing function of a module that imports `erlang:term_to_binary/1`
+/// while still refusing the function whose own body issues the call. That narrowing is what lets
+/// `compile:forms/2`/`compile:file/2` be entered in-machine (the A.9 self-hosted-build blocker)
+/// instead of folding a parked `receive` into the typed `blocked()` gap on the nested,
+/// non-pumping `call_bif` route.
+///
+/// The fixture is compiled for real, so the case also pins the two halves the per-function guard
+/// scans: the compiler really records the call as an `ImpT` import **and** as an import-carrying
+/// instruction in that one function's lowered body.
+#[test]
+fn the_call_seam_admits_a_non_observing_function_of_a_fun_image_module() {
+    let Some(erlc) = resolve_erlc() else {
+        skip_loudly(
+            "per-function call-site scope",
+            "no `erlc` (and none beside $ERTS_ORACLE either)",
+        );
+        return;
+    };
+    let dir = compile_fixtures(
+        &erlc,
+        "call_site_scope",
+        &[("obs_split", SEAM_OBS_SPLIT_SRC)],
+    );
+
+    let mut rt = runtime();
+    rt.add_code_path(dir.path());
+    let mut ctx = RuntimeContext::new(&mut rt);
+
+    // `plain/0` first: it is uncached here, so the seam loads the module on demand — which also
+    // caches it for the `enc/1` consultations below (the arm the JIT's second consultation
+    // takes). Both functions answer the same on both consultations (the seam is idempotent).
+    for consultation in 1..=2 {
+        assert!(
+            ctx.resolve_external_call("obs_split", "plain", 0)
+                .expect("the seam reports a routing, never an error")
+                .is_some(),
+            "consultation {consultation}: a non-observing function is entered in-machine"
+        );
+        assert!(
+            ctx.resolve_external_call("obs_split", "enc", 1)
+                .expect("the seam reports a routing, never an error")
+                .is_none(),
+            "consultation {consultation}: the function whose own body issues \
+             `erlang:term_to_binary/1` keeps the synchronous route"
+        );
+    }
+
+    // The structural half, read straight off the loaded IR: the module really imports the BIF
+    // (which is what arms the per-function check at all), and the import-carrying instruction
+    // really sits in `enc/1`'s own lowered body and nowhere else.
+    let module = ctx
+        .runtime
+        .code_server()
+        .module_handle("obs_split")
+        .expect("the seam's on-demand load cached the fixture");
+    assert_eq!(
+        call_site_reading_imports(&module),
+        CallSiteReadingImports::FunImage,
+        "the fixture imports a guarded fun-image BIF (and not `load_nif/2`)"
+    );
+    for (function, arity) in [("enc", 1)] {
+        let atom = module
+            .atom_table
+            .lookup(function)
+            .expect("the fixture's function is interned");
+        let body = module
+            .function(atom, arity)
+            .expect("the function is defined");
+        assert!(
+            function_calls_a_fun_image_bif(&module, body),
+            "`{function}/{arity}`'s own lowered body carries the `term_to_binary/1` import"
+        );
+    }
+    let plain = module
+        .atom_table
+        .lookup("plain")
+        .expect("`plain` is interned");
+    let plain_body = module.function(plain, 0).expect("`plain/0` is defined");
+    assert!(
+        !function_calls_a_fun_image_bif(&module, plain_body),
+        "`plain/0`'s body issues no guarded fun-image call"
+    );
 }
 
 // ---------------------------------------------------------------------------------------
 // The cross-module call seam vs the GC float guard (contract A.9's E0 route)
 // ---------------------------------------------------------------------------------------
-
 /// The float-using fixture (`tests/fixtures/gc_floats.beam`) — its code really lowers a
 /// float-family instruction, which is the property this case needs.
 const GC_FLOATS_BEAM: &str = concat!(
@@ -2418,8 +2655,9 @@ const SEAM_IDLE_SRC: &str = "-module(idle).
 go() -> ok.
 ";
 
-/// The `obs` fixture module: a callee whose **own** code imports `erlang:load_nif/2`, which is
-/// exactly what [`module_observes_its_call_site`] keys on.
+/// The `obs` fixture module: a callee whose **own** code imports `erlang:load_nif/2`, whose
+/// refusal is **module-wide** ([`callee_observes_its_call_site`]) — every function of the module
+/// keys on it, which is exactly what makes it an observer of its call site.
 const SEAM_OBS_SRC: &str = "-module(obs).
 -export([load/1]).
 load(Path) -> erlang:load_nif(Path, 0).
@@ -2430,7 +2668,7 @@ load(Path) -> erlang:load_nif(Path, 0).
 /// The native baseline tier resolves one `call_ext*` **twice** — its `jit_ext_call` arm asks
 /// [`RuntimeContext::resolve_external_call`] and, when it declines, the whole instruction is
 /// re-run by `Machine::step_instruction`, which asks the same seam again (see
-/// [`crate::runner::tier`]). The module-observer guard ([`module_observes_its_call_site`]) must
+/// [`crate::runner::tier`]). The call-site guard ([`callee_observes_its_call_site`]) must
 /// therefore hold on the **already-cached** arm too: a callee that the *first* consultation
 /// loaded (and thereby cached) must still be refused the second time.
 ///
