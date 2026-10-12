@@ -398,7 +398,8 @@ impl Machine {
                     self.resolve_call_ext_send(module, labels, *target, ctx)?
                 {
                     return self.apply_import_target(target, ImportFrame::Call, func, pc);
-                }                if let Some((context, callee, callee_pc)) =
+                }
+                if let Some((context, callee, callee_pc)) =
                     self.resolve_external_entry(module, labels, *target, ctx)?
                 {
                     self.set_continuation(Continuation::Address {
@@ -437,7 +438,8 @@ impl Machine {
                     self.resolve_call_ext_send(module, labels, *target, ctx)?
                 {
                     return self.apply_import_target(target, ImportFrame::Only, func, pc);
-                }                if let Some((context, callee, callee_pc)) =
+                }
+                if let Some((context, callee, callee_pc)) =
                     self.resolve_external_entry(module, labels, *target, ctx)?
                 {
                     return Ok(Step::Enter {
@@ -500,7 +502,8 @@ impl Machine {
                     self.resolve_call_ext_send(module, labels, *target, ctx)?
                 {
                     return self.apply_import_target(target, ImportFrame::Last(*deallocate), func, pc);
-                }                if let Some((context, callee, callee_pc)) =
+                }
+                if let Some((context, callee, callee_pc)) =
                     self.resolve_external_entry(module, labels, *target, ctx)?
                 {
                     self.pop_frame_checked(*deallocate)?;
