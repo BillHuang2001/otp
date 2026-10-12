@@ -2336,21 +2336,6 @@ ERL_NIF_TERM encode_adapter_flags(ErlNifEnv*            env,
     ERL_NIF_TERM ipv4Enabled, ipv6Enabled, ipv6ManagedAddrCfgSup;
     ERL_NIF_TERM eflags;
 
-#if defined(ESOCK_WIN_XP)
-    /* This is just a dummy-ifdef ... there is no such flag (ESOCK_WIN_XP).
-     * But this is a way to keep the code...
-     */
-    ddnsEnabled             = BOOL2ATOM(ipAdAddrsP->DdnsEnabled);
-    regAdSuffix             = BOOL2ATOM(ipAdAddrsP->RegisterAdapterSuffix);
-    dhcpv4Enabled           = BOOL2ATOM(ipAdAddrsP->Dhcpv4Enabled);
-    recvOnly                = BOOL2ATOM(ipAdAddrsP->ReceiveOnly);
-    noMulticast             = BOOL2ATOM(ipAdAddrsP->NoMulticast);
-    ipv6OtherStatefulCfg    = BOOL2ATOM(ipAdAddrsP->Ipv6OtherStatefulConfig);
-    netbiosOverTcpipEnabled = BOOL2ATOM(ipAdAddrsP->NetbiosOverTcpipEnabled);
-    ipv4Enabled             = BOOL2ATOM(ipAdAddrsP->Ipv4Enabled);
-    ipv6Enabled             = BOOL2ATOM(ipAdAddrsP->Ipv6Enabled);
-    ipv6ManagedAddrCfgSup   = BOOL2ATOM(ipAdAddrsP->Ipv6ManagedAddressConfigurationSupported);
-#else
     ddnsEnabled             = BOOL2ATOM(ipAdAddrsP->Flags & IP_ADAPTER_DDNS_ENABLED);
     regAdSuffix             = BOOL2ATOM(ipAdAddrsP->Flags & IP_ADAPTER_REGISTER_ADAPTER_SUFFIX);
     dhcpv4Enabled           = BOOL2ATOM(ipAdAddrsP->Flags & IP_ADAPTER_DHCP_ENABLED);
@@ -2361,7 +2346,6 @@ ERL_NIF_TERM encode_adapter_flags(ErlNifEnv*            env,
     ipv4Enabled             = BOOL2ATOM(ipAdAddrsP->Flags & IP_ADAPTER_IPV4_ENABLED);
     ipv6Enabled             = BOOL2ATOM(ipAdAddrsP->Flags & IP_ADAPTER_IPV6_ENABLED);
     ipv6ManagedAddrCfgSup   = BOOL2ATOM(ipAdAddrsP->Flags & IP_ADAPTER_IPV6_MANAGE_ADDRESS_CONFIG);
-#endif    
 
     {
         ERL_NIF_TERM keys[] = {atom_ddns_enabled,
