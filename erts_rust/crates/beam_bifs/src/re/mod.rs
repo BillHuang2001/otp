@@ -31,12 +31,15 @@
 //! lowered to the self-contained payload image and the oracle's
 //! `{ok, {re_pattern, NCap, UnicodeFlag, CrlfFlag, Payload}}` (or, with the
 //! `export` option, the `{re_exported_pattern, HeaderBin, Pattern, Options,
-//! Payload}` form) is returned. The remaining six keys still answer the typed
-//! `unsupported_bif` capability gap; the engine implementation fills those bodies
-//! in (and adds the sibling `exec`/`render` submodules) in a later stage.
+//! Payload}` form) is returned. `re:version/0`, `re:import/1` (the `export` form
+//! back into the `{re_pattern, …}` one, without recompiling) and `re:inspect/2`
+//! (`namelist` only) are implemented too. The remaining three keys (`run/2,3`,
+//! `internal_run/4`) still answer the typed `unsupported_bif` capability gap; the
+//! engine implementation fills those bodies in (and adds the sibling
+//! `exec`/`render` submodules) in a later stage.
 
 use beam_common::{BeamError, Result};
-use beam_term::{make_small, signed_value, Eterm, NIL};
+use beam_term::{atom_val, make_small, signed_value, Eterm, NIL};
 
 use crate::access;
 use crate::bits;
@@ -54,8 +57,9 @@ mod options;
 // are match-side and only exercised by the unit tests today.
 #[allow(dead_code)]
 mod syntax;
-// Temporary: see `options` above — `Payload::decode` and the image reader are
-// only reached from `re:import/1`, which is still a placeholder.
+// Temporary: see `options` above — `ProgFlags`/`Program`'s match-side fields and
+// the image reader's decode half are only reached from `re:inspect/2`/`re:import/1`
+// and the unit tests; the matcher still lands with `re:run/2,3` (next pass).
 #[allow(dead_code)]
 mod prog;
 
@@ -64,6 +68,17 @@ const RE_PATTERN: &str = "re_pattern";
 
 /// The compiled-pattern tag of the `export` form.
 const RE_EXPORTED_PATTERN: &str = "re_exported_pattern";
+
+/// The `namelist` item of `re:inspect/2` — the only item the oracle's `re.erl`
+/// implements.
+const NAMELIST: &str = "namelist";
+
+/// The arity of both compiled-pattern tuple forms (`{re_pattern, …}` and
+/// `{re_exported_pattern, …}`).
+const PATTERN_ARITY: usize = 5;
+
+/// The index of the payload image in both compiled-pattern tuple forms.
+const PATTERN_IMAGE: usize = 4;
 
 /// The 8 `(module, function, arity)` keys this node implements **for real** (not
 /// through the `RuntimeHooks` seam).
@@ -263,14 +278,122 @@ fn push_element(
     Ok(())
 }
 
-/// `re:import/1` — the placeholder the engine implementation replaces.
-fn import_1(_ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
-    Err(crate::error::unsupported_bif())
+/// Whether `term` is the atom `name` in this call's atom table.
+fn is_atom_named(ctx: &BifContext<'_>, term: Eterm, name: &str) -> bool {
+    access::is_atom(term) && ctx.atoms().name(atom_val(term)) == Some(name)
 }
 
-/// `re:inspect/2` — the placeholder the engine implementation replaces.
-fn inspect_2(_ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
-    Err(crate::error::unsupported_bif())
+/// The payload image of one of our compiled-pattern tuples.
+///
+/// `None` when `term` is not a 5-tuple, when its tag is neither `re_pattern` nor
+/// `re_exported_pattern`, or when its element 5 (the payload) is not a byte-aligned
+/// binary — the "this is not one of our patterns" test `re:inspect/2` and
+/// `re:import/1` both need. The image's *contents* are the caller's to validate
+/// ([`prog::Payload::decode`] answers a typed `badarg` for a foreign image and
+/// never panics).
+fn pattern_image(ctx: &BifContext<'_>, term: Eterm) -> Option<Vec<u8>> {
+    if !access::is_tuple(term) || access::tuple_size(term) != PATTERN_ARITY {
+        return None;
+    }
+    let tag = access::tuple_element(term, 0);
+    if !is_atom_named(ctx, tag, RE_PATTERN) && !is_atom_named(ctx, tag, RE_EXPORTED_PATTERN) {
+        return None;
+    }
+    bits::bytes(access::tuple_element(term, PATTERN_IMAGE)).ok()
+}
+
+/// The unique subpattern names in alphabetical order — the `namelist` item's value.
+///
+/// `Program::names` is sorted by `(name, group)` and a name may repeat (the
+/// `dupnames` option allows two groups to share one), so the list is sorted then
+/// deduplicated: `re:inspect(MP, namelist)` reports each name once.
+fn unique_names(payload: &prog::Payload) -> Vec<&str> {
+    let mut names: Vec<&str> =
+        payload.program.names.iter().map(|(name, _)| name.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+/// `re:import/1` — rebuild a usable `{re_pattern, …}` from the `export` form.
+///
+/// The `export` option returns `{re_exported_pattern, Header, Pattern, Options,
+/// Payload}` so the pattern survives a trip outside this runtime. Importing it back
+/// is cheap (the documented purpose of the form): the payload image already holds
+/// the compiled program, so `{re_pattern, NCap, UnicodeFlag, CrlfFlag, Payload}` is
+/// rebuilt **around the same image** — no recompilation, and the returned payload
+/// decodes to the identical program as the plain `compile/1,2` image.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] for anything that is not one of our exported patterns: a
+/// non-5-tuple, another tag (the oracle raises `badarg` for a plain `{re_pattern,…}`
+/// too), a header that is not our image magic, or a payload that is not a
+/// byte-aligned binary carrying one of our images.
+fn import_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let exported = args[0];
+    if !access::is_tuple(exported) || access::tuple_size(exported) != PATTERN_ARITY {
+        return Err(badarg());
+    }
+    if !is_atom_named(ctx, access::tuple_element(exported, 0), RE_EXPORTED_PATTERN) {
+        return Err(badarg());
+    }
+    // The header binary is our image magic (`compile` writes it), so a hand-built
+    // tuple that merely carries the tag is refused.
+    let header = bits::bytes(access::tuple_element(exported, 1)).map_err(|_| badarg())?;
+    if header != prog::MAGIC {
+        return Err(badarg());
+    }
+    let image = pattern_image(ctx, exported).ok_or_else(badarg)?;
+    let payload = prog::Payload::decode(&image).map_err(|_| badarg())?;
+    // The flags live in the image, so they are read back rather than trusted from
+    // the tuple (`import/1` has no separate flag elements).
+    let tag = ctx.intern_atom(RE_PATTERN)?;
+    let ncap = ctx.int(i64::from(payload.program.ncap))?;
+    let unicode = ctx.int(i64::from(payload.program.flags.unicode))?;
+    let crlf = ctx.int(i64::from(payload.program.flags.newline.is_crlf_like()))?;
+    let image_term = access::tuple_element(exported, PATTERN_IMAGE);
+    ctx.tuple(&[tag, ncap, unicode, crlf, image_term])
+}
+
+/// `re:inspect/2` — the `namelist` item, and the typed gap for every other item.
+///
+/// `namelist` is `{namelist, Names}`: the unique subpattern names as binaries in
+/// alphabetical order (group 0 excluded). The oracle's `re.erl` implements **only**
+/// this item and raises `badarg` for the others; every other item here (`size`,
+/// `options`, `capturecount`, `newline`, …) is the typed `unsupported_bif` rather
+/// than a fabricated value, because those describe PCRE2's own compiled blob, which
+/// this crate does not have (the payload image is ours — see this node's
+/// `CONTEXT.md`).
+///
+/// The item is examined before the pattern: a non-atom item is `badarg`, and a
+/// genuine capability gap is reported even when the pattern is unusable (the
+/// oracle's ordering is not observable for a case that is a gap either way).
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] for a non-atom item, and for a first argument that is not
+/// one of our pattern tuples (or whose payload image does not decode) — as the
+/// oracle does (`re:inspect(zzz, namelist)`); the typed `unsupported_bif` for any
+/// other item.
+fn inspect_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let item = args[1];
+    if !access::is_atom(item) {
+        return Err(badarg());
+    }
+    if !is_atom_named(ctx, item, NAMELIST) {
+        return Err(crate::error::unsupported_bif());
+    }
+    let image = pattern_image(ctx, args[0]).ok_or_else(badarg)?;
+    let payload = prog::Payload::decode(&image).map_err(|_| badarg())?;
+    let mut names: Vec<Eterm> = Vec::new();
+    for name in unique_names(&payload) {
+        names.push(bits::make_binary(ctx.heap(), name.as_bytes())?);
+    }
+    let list = ctx.list(&names)?;
+    // The `namelist` atom the caller passed is the output tag, so no lookup or
+    // interning of the item atom is needed.
+    ctx.tuple(&[item, list])
 }
 
 /// `re:internal_run/4` — the placeholder the engine implementation replaces.
@@ -320,7 +443,7 @@ pub(crate) fn register(reg: &mut BifRegistry) {
 mod tests {
     use super::*;
     use beam_alloc::Heap;
-    use beam_common::BeamError;
+    use beam_common::{BeamError, ExitReason};
     use beam_process::ProcessId;
     use beam_term::{compare, make_atom, AtomTable};
 
@@ -353,6 +476,9 @@ mod tests {
                 "all",
                 "index",
                 "nope",
+                "namelist",
+                "size",
+                "dupnames",
             ]);
             Fixture {
                 registry: crate::registry::default_registry(),
@@ -389,8 +515,13 @@ mod tests {
         }
 
         fn call(&mut self, arity: u32, args: &[Eterm]) -> Result<Eterm> {
+            self.call_fn("compile", arity, args)
+        }
+
+        /// Any `re:<func>` BIF over the fixture's heap and atom table.
+        fn call_fn(&mut self, func: &str, arity: u32, args: &[Eterm]) -> Result<Eterm> {
             let mut ctx = BifContext::new(&mut self.heap, &self.atoms, ProcessId::new(1, 0));
-            self.registry.call("re", "compile", arity, &mut ctx, args)
+            self.registry.call("re", func, arity, &mut ctx, args)
         }
 
         /// `re:compile/2` on a binary pattern and a slice of option terms.
@@ -655,5 +786,167 @@ mod tests {
         assert_eq!(decoded.program, expected);
         assert_eq!(decoded.program.ncap, 2);
         assert!(!decoded.program.insts.is_empty());
+    }
+
+    #[test]
+    fn inspect_namelist_lists_the_unique_names_alphabetically() {
+        let mut f = Fixture::new();
+        // Declaration order is not the reported order: `A` sorts before `B`.
+        let out = f.compile_bin(b"(?<B>b)|(?<A>a)", &[]).expect("compiles");
+        let mp = f.elem(out, 1);
+        let item = f.atom("namelist");
+        let got = f.call_fn("inspect", 2, &[mp, item]).expect("inspect");
+        assert_eq!(f.arity(got), 2);
+        assert!(f.eq(f.elem(got, 0), item), "the item atom tags the result");
+        let a = f.binary(b"A");
+        let b = f.binary(b"B");
+        let expected = f.list(&[a, b]);
+        assert!(f.eq(f.elem(got, 1), expected), "alphabetical, as binaries");
+
+        // Two groups may share a name (the `dupnames` option); it is reported once.
+        let dupnames = f.atom("dupnames");
+        let opts = f.list(&[dupnames]);
+        let out = f.compile_with(b"(?<n>a)(?<n>b)", opts).expect("compiles");
+        let mp = f.elem(out, 1);
+        let item = f.atom("namelist");
+        let got = f.call_fn("inspect", 2, &[mp, item]).expect("inspect");
+        let n = f.binary(b"n");
+        let expected = f.list(&[n]);
+        assert!(f.eq(f.elem(got, 1), expected), "a duplicate name collapses");
+
+        // No named group => the empty list.
+        let out = f.compile_bin(b"(a)(?:b)", &[]).expect("compiles");
+        let mp = f.elem(out, 1);
+        let item = f.atom("namelist");
+        let got = f.call_fn("inspect", 2, &[mp, item]).expect("inspect");
+        assert!(f.eq(f.elem(got, 1), NIL));
+
+        // The `export` form carries the same payload, so inspecting it agrees.
+        let export = f.atom("export");
+        let opts = f.list(&[export]);
+        let out = f.compile_with(b"(?<B>b)|(?<A>a)", opts).expect("compiles");
+        let exported = f.elem(out, 1);
+        let item = f.atom("namelist");
+        let from_export = f.call_fn("inspect", 2, &[exported, item]).expect("inspect");
+        let expected = expected_with_names(&mut f);
+        assert!(f.eq(f.elem(from_export, 1), expected));
+    }
+
+    /// `[<<"A">>, <<"B">>]` — the namelist of `(?<B>b)|(?<A>a)`.
+    fn expected_with_names(f: &mut Fixture) -> Eterm {
+        let a = f.binary(b"A");
+        let b = f.binary(b"B");
+        f.list(&[a, b])
+    }
+
+    #[test]
+    fn inspect_reports_a_gap_for_every_other_item_and_raises_badarg_for_a_bad_input() {
+        let mut f = Fixture::new();
+        let out = f.compile_bin(b"(?<A>A)", &[]).expect("compiles");
+        let mp = f.elem(out, 1);
+
+        // The oracle implements only `namelist`; any other item is our typed gap
+        // (never a fabricated PCRE2-internals value).
+        let size = f.atom("size");
+        match f.call_fn("inspect", 2, &[mp, size]) {
+            Err(BeamError::Raise(raise)) => {
+                assert_eq!(raise.reason, ExitReason::atom("unsupported_bif"));
+            }
+            other => panic!("expected the typed unsupported_bif gap, got {other:?}"),
+        }
+
+        // A non-atom item, and a first argument that is not one of our patterns.
+        let namelist = f.atom("namelist");
+        let one = make_small(1);
+        assert!(matches!(f.call_fn("inspect", 2, &[mp, one]), Err(BeamError::BadArg)));
+        assert!(matches!(
+            f.call_fn("inspect", 2, &[one, namelist]),
+            Err(BeamError::BadArg)
+        ));
+        let nope = f.atom("nope");
+        assert!(matches!(
+            f.call_fn("inspect", 2, &[nope, namelist]),
+            Err(BeamError::BadArg)
+        ));
+
+        // A `{re_pattern, …}` tuple whose element 5 is not one of our images.
+        let tag = f.atom("re_pattern");
+        let junk = f.binary(b"not an image");
+        let zero = make_small(0);
+        let fake = f.tuple(&[tag, zero, zero, zero, junk]);
+        assert!(matches!(
+            f.call_fn("inspect", 2, &[fake, namelist]),
+            Err(BeamError::BadArg)
+        ));
+        // ... and a 5-tuple tagged with our export tag but carrying a foreign image.
+        let exported_tag = f.atom("re_exported_pattern");
+        let wrong_image = f.tuple(&[exported_tag, zero, zero, zero, junk]);
+        assert!(matches!(
+            f.call_fn("inspect", 2, &[wrong_image, namelist]),
+            Err(BeamError::BadArg)
+        ));
+    }
+
+    #[test]
+    fn import_rebuilds_the_pattern_around_the_exported_payload() {
+        let mut f = Fixture::new();
+        let export = f.atom("export");
+        let opts = f.list(&[export]);
+        let out = f.compile_with(b"(?<n>a)(b)", opts).expect("compiles");
+        let exported = f.elem(out, 1);
+
+        let imported = f.call_fn("import", 1, &[exported]).expect("imports");
+        assert_eq!(f.arity(imported), 5);
+        assert!(f.eq(f.elem(imported, 0), f.atom("re_pattern")));
+        assert_eq!(f.small(f.elem(imported, 1)), 2, "NCap");
+        assert_eq!(f.small(f.elem(imported, 2)), 0, "no unicode");
+        assert_eq!(f.small(f.elem(imported, 3)), 0, "newline lf");
+        // The image is the exported one, unchanged (importing does not recompile),
+        // and it decodes to the program a plain `compile/1` of the same pattern
+        // produces.
+        let exported_image = f.elem(exported, 4);
+        assert!(f.eq(f.elem(imported, 4), exported_image));
+        let plain = f.compile_bin(b"(?<n>a)(b)", &[]).expect("compiles");
+        let plain_mp = f.elem(plain, 1);
+        let decoded = prog::Payload::decode(&f.image(imported)).expect("decodes");
+        let expected = prog::Payload::decode(&f.image(plain_mp)).expect("decodes");
+        assert_eq!(decoded.program, expected.program);
+        assert_eq!(decoded.source.as_slice(), b"(?<n>a)(b)");
+        assert!(f.eq(imported, plain_mp), "the rebuilt tuple is the compile/1 one");
+
+        // A unicode + `{newline, crlf}` pattern carries both flags through the image.
+        let unicode = f.atom("unicode");
+        let newline = f.atom("newline");
+        let crlf = f.atom("crlf");
+        let newline_opt = f.tuple(&[newline, crlf]);
+        let opts = f.list(&[export, unicode, newline_opt]);
+        let out = f.compile_with(b"(a)", opts).expect("compiles");
+        let exported = f.elem(out, 1);
+        let imported = f.call_fn("import", 1, &[exported]).expect("imports");
+        assert_eq!(f.small(f.elem(imported, 2)), 1, "the unicode flag");
+        assert_eq!(f.small(f.elem(imported, 3)), 1, "the crlf flag");
+
+        // `import/1` of anything that is not one of our exported patterns is badarg:
+        // a plain `{re_pattern, …}`, a bare integer, and a tuple that carries the
+        // tag but not our header/header image.
+        let plain = f.compile_bin(b"a", &[]).expect("compiles");
+        let plain_mp = f.elem(plain, 1);
+        assert!(matches!(f.call_fn("import", 1, &[plain_mp]), Err(BeamError::BadArg)));
+        let seven = make_small(7);
+        assert!(matches!(f.call_fn("import", 1, &[seven]), Err(BeamError::BadArg)));
+        let image = f.elem(exported, 4);
+        let junk = f.binary(b"not an image");
+        let tag = f.atom("re_exported_pattern");
+        let fake = f.tuple(&[tag, junk, image, image, image]);
+        assert!(
+            matches!(f.call_fn("import", 1, &[fake]), Err(BeamError::BadArg)),
+            "the header must be our image magic"
+        );
+        let header = f.binary(prog::MAGIC);
+        let fake = f.tuple(&[tag, header, junk, junk, junk]);
+        assert!(
+            matches!(f.call_fn("import", 1, &[fake]), Err(BeamError::BadArg)),
+            "the payload must be one of our images"
+        );
     }
 }
