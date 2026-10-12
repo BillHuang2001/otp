@@ -429,13 +429,11 @@ write-mode `{open,…}` that delegates to `prim_file:open/2` and really creates 
 - **`code:*` is the native floor, not a live `code_server`** — `code.rs`'s behaviour must not
   change (see `../CONTEXT.md`; OTP's real `code_server.beam` needs facilities outside this crate).
 - **Files ~1000 lines of production code.** Pre-existing oversize (single-responsibility, kept
-  whole because the routing table names them): `application.rs` (~953 production / 1661 total),
-  `process.rs` (~934 production / 1417 total); `prim.rs` (~1088 production / 3942 total) is mostly
-  its comprehensive colocated test module, and `prim_file.rs` (1601 lines, **no colocated tests** —
-  its fd-half bodies are exercised by `prim.rs`'s test module through the `prim_file_call`
-  dispatch). `erts_internal.rs`'s tracing half is split out into `erts_internal/trace.rs` (~309
-  lines), leaving `erts_internal.rs` at ~1114 production / 2483 total. Split by responsibility;
-  every public item documented.
+  whole because the routing table names them): `application.rs`, `process.rs`; `prim.rs` (~3237
+  total / ~805 production) and `prim_file.rs` (~1536 total) are mostly comprehensive test modules.
+  `erts_internal.rs`'s tracing half is split out into `erts_internal/trace.rs` (~310 production),
+  leaving `erts_internal.rs` at ~968 production / 2265 total. Split by responsibility; every public
+  item documented.
 
 ## Test Strategy
 - **Unit tests** colocated per module (`#[cfg(test)] mod tests`), driving the floor through the
@@ -453,14 +451,6 @@ write-mode `{open,…}` that delegates to `prim_file:open/2` and really creates 
   `file_server/`'s suites are described in [`file_server/CONTEXT.md`](file_server/CONTEXT.md).
 - Test fixtures that need a real `.beam` or the system Erlang skip **loudly**
   (`system_runtime()` / the file-local `lists_beam()`); the arithmetic/`term_type` suites need none.
-- **Suites that spawn the live `erl` oracle in-process** (bounded poll/kill; skip **loudly** when
-  absent): `code.rs` (`code_priv_dir_agrees_with_the_oracle`), `memory/tests.rs`,
-  `prim.rs` (`the_unserved_prim_file_entries_are_typed_capability_gaps`,
-  `the_closed_prim_file_families_agree_with_the_erl_oracle`,
-  `the_file_info_family_agrees_with_the_oracle`), `file_server/tests.rs`
-  (`the_getopts_answers_match_the_live_oracle`) and `file_server/get_line/tests.rs`. Every other
-  in-node test quotes its oracle value in the doc comment (verified out of band) rather than
-  re-running `erl`.
 - Cross-crate integration (CLI/exit codes, the preloaded `boot/*` corpus, `-eval`) is pinned by the
   `../tests/` suites, not here. This node's A.9 native-floor surface — `application:get_all_key/1`,
   `get_key/1,2`, `get_application/0,1`; `init:get_argument/1`'s automatic flags; `init:script_id/0`;
@@ -647,12 +637,6 @@ closable the same way and the floor already serves both, so only `/2` stays list
 `every_floor_module_is_a_real_try_native_arm`.
 
 ### Recorded gaps and fabricated values
-- **`read_file_info/1,2`, `read_link_info/1,2` and `read_handle_info/1,2` ARE served** (a real
-  14-tuple `#file_info{}`, `access` from two real `access(2)` probes via `beam_io::path_access` for
-  the path forms and `beam_io::process_credentials` + the mode bits for the handle form) — despite
-  `prim.rs`'s module-doc "Not served" list still naming them as typed gaps. Trust the dispatch
-  (`prim.rs`'s `prim_file_call` arms) and the live-oracle cross-check
-  `tests/a9_native_floor.rs::filelib_existence_probes_on_an_existing_path_agree_with_the_oracle`.
 - **`last_calls` ⇒ `false` is a real divergence** — `Process::save_calls()` holds a real flag
   (`memory/mod.rs:803`).
 - `application.rs`'s `app_env_props` reads the `.app` resource's `env` list verbatim, so kernel's

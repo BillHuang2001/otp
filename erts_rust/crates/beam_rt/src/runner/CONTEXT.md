@@ -147,7 +147,6 @@ the park/resume and the admission point can never drift:
   reason out and writes it into `Machine::pending_exception_mut()`, **clears** the process's extra
   roots (the machine owns the relocated term now), and, if the slices no longer match, **halts the
   process's collection** (`Runtime::halt_process_gc`) rather than run against inconsistent roots.
-* The **`Wait` park arm** additionally marks the process **relocation-exempt** for the whole parked window (`ProcessTable::set_relocation_exempt(pid, true)`), and the resume clears it, so a delivery- or signal-driven collection of a waiting (or just-woken, not-yet-resumed) process is declined and the delivery takes the ordinary heap-fragment fallback; the **`Yield`** (pre-emption) arm is *not* exempt. Both park arms call `Runtime::serve_gc_request` (the `erlang:garbage_collect/0,1` request, see the crate node): the `Yield` arm serves it (its roots are just published and its FR file is provably dead), the `Wait` arm's request is declined by the exemption.
 The runner's raise arm likewise copies the recorded exit reason through
 `Runtime::try_stabilize_escaped_with` — with the copy's `SourcePayloads` built by
 `Runtime::source_payloads` (the **same machine's** `refc_binaries()` unioned with the whole off-heap
