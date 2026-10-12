@@ -596,7 +596,9 @@ fn is_engine_diagnostic(reason: &ExitReason) -> bool {
     reason
         .as_atom()
         .is_some_and(|name| name.starts_with(ENGINE_DIAGNOSTIC_PREFIX))
-}/// The "no class atom resolved yet" marker (`THE_NON_VALUE` is not a term any
+}
+
+/// The "no class atom resolved yet" marker (`THE_NON_VALUE` is not a term any
 /// atom could be).
 ///
 /// It is the machine's initial `class_atoms` value (set by
