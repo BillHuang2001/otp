@@ -131,7 +131,7 @@ The binary's own `run`/`suite` exit codes are unchanged (`0` agree / `1` mismatc
 
 ## Known Issues / Notes for Agents
 - **The Rust side is a partial runtime; today's gate is 0 mismatches** (1871-case corpus). The **module-run** cases (embedded sources, the native-record group, the NIF `.so` groups, the C-driver groups, the real-system-module `mexec`/`mexec_extra` groups) `agree`, and the **eval** cases `agree` where the `-eval` evaluator supports them — `beam_rt` has a real Erlang-expression evaluator and does **not** auto-print the result. A capability gap is `unsupported`, never a mismatch: either the raise escapes and the CLI exits `3` (`beam_rt: unsupported: …`), or (for a probe-wrapped case) the probe *catches* it and prints one `exception <class> <reason>` line whose reason follows the `unsupported` convention.
-  - Current rollup (**stable across repeated runs**): **1868 total · 1864 agree · 0 mismatch · 4 unsupported · 0 skipped**; all four gaps are recorded in `known-gaps.txt` (`allowed=4 unauthorized=0 stale=0`), so `gate.sh` → exit `0`.
+  - Current rollup: **1871 total · 1864 agree · 0 mismatch · 4 unsupported · 3 skipped** when the `beam_dist` helper is not built (the three `dist/*` command cases `skip` honestly and are deliberately **not** in `known-gaps.txt`, so `gate.sh` exits `3` until the helper is built); with the helper built (`gate.sh` builds `-p beam_dist`) those three flip to `agree`, giving **1871 total · 1867 agree · 0 mismatch · 4 unsupported · 0 skipped** and `allowed=4 unauthorized=0 stale=0` → `gate.sh` exit `0`.
   - Per-contract rollup (A.1–A.9; a case may declare several contracts, so the column totals exceed `summary.total`):
 
 | Contract | total | agree | mismatch | unsupported | skipped |
