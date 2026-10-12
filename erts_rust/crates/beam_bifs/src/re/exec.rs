@@ -918,6 +918,15 @@ mod tests {
         assert_eq!(span("a{2,3}", "aaaa", &one), (0, 3), "a bounded quantifier");
         assert_eq!(span("a+?", "aaa", &one), (0, 1));
         assert_eq!(span("a?", "aaa", &one), (0, 1));
+        // A possessive quantifier's `Cut` really discards the choice points: it
+        // cannot give back what it consumed (oracle: `re:run("aaa","a++a")` and
+        // `re:run("aaa","a*+a")` are `nomatch`, while the greedy `re:run("aaa",
+        // "a*a")` matches `{0,3}`), but a following literal may still match
+        // after the consumed run (`re:run("aaab","a*+b")` = `{0,4}`).
+        assert_eq!(mismatch("a*+a", "aaa", &one), None);
+        assert_eq!(mismatch("a++a", "aaa", &one), None);
+        assert_eq!(span("a*a", "aaa", &one), (0, 3), "the greedy form backtracks");
+        assert_eq!(span("a*+b", "aaab", &one), (0, 4));
     }
 
     #[test]
@@ -1114,6 +1123,11 @@ mod tests {
         // A limit that is never reached does not interfere.
         let generous = Parsed { match_limit: Some(1_000), ..Parsed::default() };
         assert_eq!(span("a", "abc", &generous), (0, 1));
+        // A budget of one is also oracle-exact for a literal pattern:
+        // `re:run("abc","a",[{match_limit,1},report_errors])` = `{error,match_limit}`.
+        let one = Parsed { match_limit: Some(1), ..Parsed::default() };
+        let program = compile_flags("a", &CompileFlags::default());
+        assert_eq!(run(&program, &subject("abc"), &one, &[0]), Outcome::MatchLimit);
     }
 
     #[test]
