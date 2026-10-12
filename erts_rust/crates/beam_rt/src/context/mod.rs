@@ -103,7 +103,7 @@ use beam_common::{AllocKind, BeamError, Result};
 use beam_engine::context::RootSet;
 use beam_engine::machine::WaitDeadline;
 use beam_engine::{terms, ExecutionContext, Machine, RunOutcome};
-use beam_loader::{Atom, Label, Module};
+use beam_loader::{Atom, Function, ImportRef, Instr, Label, Module};
 use beam_message::{CopyContext, Message, OffHeapTable, Queue};
 use beam_process::{MonitorRef, ProcessId, ProcessTable};
 use beam_term::Eterm;
@@ -2718,8 +2718,9 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// * a module that is **not already loaded** is loaded on demand exactly as
     ///   [`Self::call_bif`] does (so the callee's `receive` suspends *this* process in the
     ///   first call too, not only the second); a load failure → `Ok(None)`, leaving
-    ///   [`Self::call_bif`] to reproduce the identical `undef` diagnostic. A callee whose own
-    ///   code reads the call site it runs at ([`module_observes_its_call_site`]) → `Ok(None)`,
+    ///   [`Self::call_bif`] to reproduce the identical `undef` diagnostic. A callee whose
+    ///   **own code for the resolved function** reads the call site it runs at
+    ///   ([`callee_observes_its_call_site`]) → `Ok(None)`,
     ///   whether it was already cached or loaded on demand by this very call — the guard is
     ///   applied to both paths, so the answer never depends on *when* the module was cached
     ///   (the seam is idempotent, see the note at the guard);
@@ -2830,9 +2831,19 @@ impl ExecutionContext for RuntimeContext<'_> {
             }
         };
         // An in-machine callee runs under the **caller's** recorded `current_module` (see the
-        // NIF exclusion above), so a module whose own code *reads* that call site
-        // ([`module_observes_its_call_site`]) keeps the synchronous [`Self::call_bif`] path,
-        // which enters it through `run_export` and sets the identity correctly.
+        // NIF exclusion above), so a callee whose own code *reads* that call site
+        // ([`callee_observes_its_call_site`]) keeps the synchronous [`Self::call_bif`] path,
+        // which enters it through `run_export` and sets the identity correctly. The guard is
+        // **module-wide** for `erlang:load_nif/2` (a local call inside the module can reach it,
+        // and a local `call` never re-consults this seam) and **per-function** for the two
+        // fun-image BIFs — see the predicate for both rationales.
+        //
+        // The callee's function atom is resolved **first** because the per-function half of the
+        // guard needs it: it is the atom `callee.export(..)` below will be asked for, and the
+        // function whose own lowered body decides the fun-image verdict. Resolving it through the
+        // **callee's own** atom table (`Module` code's atoms are that table's, never the
+        // runtime's shared one) keeps the `Ok(None)` for an unknown atom — the synchronous
+        // path's `undef` — exactly where it was.
         //
         // This check runs **after** the module is resolved, so it covers a module that was
         // already cached and one this very call just loaded alike — the answer no longer
@@ -2843,17 +2854,16 @@ impl ExecutionContext for RuntimeContext<'_> {
         // — and therefore through this seam again). Answering `Ok(None)` on the first
         // consultation and `Ok(Some(..))` on the second because the on-demand load had cached
         // the module in between would enter the callee in-machine under the caller's identity
-        // — the observed wrong `bad_lib` on a module's own `erlang:load_nif/2`.
-        if module_observes_its_call_site(&callee) {
-            return Ok(None);
-        }
-        // Resolve the export in the **callee's own** atom table (`Module` code's atoms are
-        // that table's, never the runtime's shared one) and hand back the export entry label
-        // the synchronous `run_export` would enter. An unknown atom or export is the
-        // synchronous path's `undef`.
+        // — the observed wrong `bad_lib` on a module's own `erlang:load_nif/2`. The guard is a
+        // pure function of the (immutable) loaded IR, so it answers the same both times.
         let Some(function_atom) = callee.atom_table.lookup(function) else {
             return Ok(None);
         };
+        if callee_observes_its_call_site(&callee, function_atom, arity) {
+            return Ok(None);
+        }
+        // Hand back the export entry label the synchronous `run_export` would enter. An export
+        // the callee does not have is the synchronous path's `undef`.
         match callee.export(function_atom, arity) {
             Some(label) => Ok(Some((callee, label))),
             None => Ok(None),
@@ -3181,65 +3191,167 @@ impl ExecutionContext for RuntimeContext<'_> {
     }
 }
 
-/// Whether `module`'s **own code** can read the call site it runs at, i.e. whether it imports a
-/// BIF whose answer depends on [`RuntimeContext::current_module`] — or, for the second group
-/// below, whether entering it in-machine would expose a known relocation hazard of another
-/// subsystem. Either way the answer means "keep this module on the synchronous `call_bif`
-/// route".
+/// The call-site-reading imports a module's `ImpT` declares, classified by the **scope** of
+/// the refusal each one forces — computed in **one** pass over [`Module::imports`].
 ///
-/// The engine's cross-module call seam ([`ExecutionContext::resolve_external_call`]) runs a
-/// callee inside the **caller's** machine, and the engine's module-context switch never re-enters
-/// this context, so a callee keeps the caller's `current_module`. The one imported BIF that
-/// *reads* that identity is:
+/// A callee entered in-machine through [`ExecutionContext::resolve_external_call`] runs under
+/// the **caller's** [`RuntimeContext::current_module`] (the engine's module-context switch never
+/// re-enters this context), so a callee whose own code *reads* that call site keeps the
+/// synchronous `call_bif` route, which sets the identity correctly. The two guarded groups
+/// differ in how far that refusal must reach:
 ///
-/// * `erlang:load_nif/2` — the module a NIF library is registered under, which the library's own
-///   `ErlNifEntry.name` is validated against: a stale identity is the oracle's `bad_lib` (and it
-///   is why a module carrying a *loaded* NIF is excluded from the seam altogether).
+/// * **`erlang:load_nif/2`** — the module a NIF library is registered under, which the loader
+///   validates the library's own `ErlNifEntry.name` against: a stale identity is the oracle's
+///   `bad_lib`. The refusal must be **module-wide**, because the BIF is reachable by a *local*
+///   call inside the module too and a local `call` never re-consults this seam — only refusing
+///   every function of the module is sound.
+/// * **the fun-image BIFs** `erlang:term_to_binary/1,2` / `erlang:external_size/1,2` — their
+///   local-fun `NEW_FUN_EXT` identity no longer reads the call site ([`FunIdentityBridge`]
+///   resolves the defining module by searching every loaded module for the fun's own
+///   `(uniq, index)`, caller first), so they are kept on the synchronous route only as a
+///   conservative guard against a hazard owned elsewhere, described on
+///   [`callee_observes_its_call_site`]. That hazard belongs to the **function that issues the
+///   call**, so the refusal is per-function.
 ///
-/// The `NEW_FUN_EXT` identity of a **local** fun no longer reads the call site:
-/// `erlang:term_to_binary/1,2` and `erlang:external_size/1,2` resolve the defining module by
-/// searching every loaded module for the fun's own `(uniq, index)` ([`FunIdentityBridge`], which
-/// prefers the caller but is not confined to it), so a callee entering in-machine under a stale
-/// `current_module` still derives the right image. Those three names are nevertheless kept on the
-/// synchronous route as a **conservative routing guard**: `erlang:load_nif/2` genuinely reads the
-/// call-site identity above, and the two fun-image names are routed alongside it while the A.9
-/// in-process `compile:file/2` route is settled.
+/// The scan is over the module's `ImpT` table, which is where a compiled `M:F/A` call is
+/// recorded. A call reached only through `apply/3` (`apply(erlang, load_nif, …)`) leaves no
+/// import entry to scan and is therefore not covered — the documented residual.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CallSiteReadingImports {
+    /// The module imports `erlang:load_nif/2`: refuse **every** function of the module.
+    LoadNif,
+    /// The module imports a fun-image BIF (and not `load_nif`): refuse only a function whose
+    /// **own** lowered body carries the call.
+    FunImage,
+    /// The module imports neither: it may be entered in-machine like any other `.beam` body.
+    None,
+}
+
+/// The **scope** of the call-site guard `module`'s `ImpT` forces
+/// ([`CallSiteReadingImports`]), in one pass over its imports.
 ///
-/// The parked machine's live pending-exception reason — the one term a parked machine holds that
-/// the closed [`RootSet`] shape cannot carry — **is** published as a
-/// [`Registers::extra_roots`](beam_process::Registers::extra_roots) word across the park window
-/// (`runner::run::publish_parked_roots`, read back into `Machine::pending_exception_mut` on resume
-/// by [`RuntimeContext::resync_parked_roots`]), so the park-window relocation hazard that once
-/// motivated (part of) this clause is closed. The clause itself is a separate **routing** decision
-/// — how much of the A.9 scheduled route to re-enable in-machine — and it is why the E0 route
-/// reports the honest typed [`beam_engine::blocked`] gap rather than a compile that silently fails.
+/// `load_nif` dominates: it is a whole-module refusal, so a module importing both it and a
+/// fun-image BIF answers [`CallSiteReadingImports::LoadNif`] whichever import comes first.
+fn call_site_reading_imports(module: &Module) -> CallSiteReadingImports {
+    let mut fun_image = false;
+    for import in &module.imports {
+        if module.atom_name(import.module) != Some("erlang") {
+            continue;
+        }
+        match module.atom_name(import.function) {
+            Some("load_nif") if import.arity == 2 => return CallSiteReadingImports::LoadNif,
+            Some("term_to_binary") | Some("external_size")
+                if import.arity == 1 || import.arity == 2 =>
+            {
+                fun_image = true;
+            }
+            _ => {}
+        }
+    }
+    if fun_image {
+        CallSiteReadingImports::FunImage
+    } else {
+        CallSiteReadingImports::None
+    }
+}
+
+/// Whether `module`'s **code for `function`/`arity`** can read the call site it runs at, i.e.
+/// whether entering that callee in-machine would run it under the caller's identity. The
+/// engine's cross-module call seam ([`ExecutionContext::resolve_external_call`]) refuses such a
+/// callee (`Ok(None)`), leaving it on the synchronous `call_bif` → `run_export` route, which
+/// sets the identity correctly.
 ///
-/// The other `current_module` readers cannot be made wrong by a callee's stale identity:
-/// `records:get_definition/2` resolves its module from its **argument** ([`RecordBridge`] holds no
-/// call-site state at all), and the GC float guard ([`crate::context::gc`]) / the trace
+/// # The two scopes ([`CallSiteReadingImports`])
+///
+/// * **`erlang:load_nif/2` ⇒ module-wide.** Its answer depends on
+///   [`RuntimeContext::current_module`] (the module the NIF library is registered under), and a
+///   *local* call inside the module reaches it without ever re-consulting the seam — so
+///   refusing one function would not be sound. Every function of an importing module is refused.
+/// * **`erlang:term_to_binary/1,2` / `erlang:external_size/1,2` ⇒ per-function.** The verdict is
+///   the callee **function's own** lowered body: it is refused only when one of its instructions
+///   carries an `ImportRef` resolving to one of those imports ([`function_calls_a_fun_image_bif`]).
+///   Every other function of the same module — `compile:forms/2`, `compile:file/2`, and every
+///   other `compile:*` entry — is entered in-machine, so a `receive` inside it **suspends** the
+///   process instead of folding into the typed [`beam_engine::blocked`] gap the nested
+///   non-pumping `call_bif` route reports (the A.9 self-hosted-build blocker).
+///
+///   The refusal is a **conservative routing guard against a hazard owned elsewhere**: a callee
+///   entered in-machine can park with a live
+///   [`Machine::pending_exception`](beam_engine::Machine) — a term the engine holds and which
+///   `beam_process::Registers::gather_roots` does **not** publish — and a delivery-driven
+///   collection in the park window (`beam_process`'s signal-build heap growth) then relocates
+///   the process heap against that incomplete root set, freeing words the parked machine still
+///   points at. The hazard belongs to the function that issues the fun-image call, which is why
+///   the guard is scoped to it and removed together with the root-set fix.
+///
+/// # The residual (documented, not a wrong result)
+///
+/// A fun-image call reached from an admitted function through a **local** call chain (or
+/// `apply/3`) is not seen here: a local `call` never re-consults the seam, so the park-window
+/// hazard it could reach stays uncovered by this guard. Only a `beam_engine` change that
+/// publishes the callee's own identity could remove the hazard rather than route around it.
+///
+/// The fun-image **image derivation** itself cannot be made wrong by an in-machine callee's
+/// stale identity ([`FunIdentityBridge`] searches every loaded module), so admission never
+/// fabricates an image. The other `current_module` readers are equally safe:
+/// `records:get_definition/2` resolves its module from its **argument** ([`RecordBridge`] holds
+/// no call-site state at all), and the GC float guard ([`crate::context::gc`]) / the trace
 /// global-pattern approximation only use it conservatively.
 ///
-/// The scan is over the module's `ImpT` table ([`Module::imports`]), which is where a compiled
-/// `M:F/A` call is recorded. A call reached only through `apply/3` (`apply(erlang, load_nif, …)`)
-/// leaves no import entry to scan and is therefore not covered — the documented residual.
-///
-/// The verdict is a property of the module's own code, so the seam can apply it to an
-/// already-cached callee and to one it just loaded alike; refusing a module never depends on
+/// The verdict is a property of the module's immutable loaded IR, so the seam can apply it to an
+/// already-cached callee and to one it just loaded alike; refusing a callee never depends on
 /// *when* it was cached.
 ///
 /// [`ExecutionContext::resolve_external_call`]: beam_engine::ExecutionContext::resolve_external_call
 /// [`Module::imports`]: beam_loader::Module::imports
-pub(crate) fn module_observes_its_call_site(module: &Module) -> bool {
-    module.imports.iter().any(|import| {
-        module.atom_name(import.module) == Some("erlang")
-            && match module.atom_name(import.function) {
-                Some("load_nif") => import.arity == 2,
-                Some("term_to_binary") | Some("external_size") => {
-                    import.arity == 1 || import.arity == 2
-                }
-                _ => false,
-            }
+pub(crate) fn callee_observes_its_call_site(module: &Module, function: Atom, arity: u32) -> bool {
+    match call_site_reading_imports(module) {
+        CallSiteReadingImports::LoadNif => true,
+        CallSiteReadingImports::None => false,
+        CallSiteReadingImports::FunImage => match module.function(function, arity) {
+            Some(function) => function_calls_a_fun_image_bif(module, function),
+            // Conservative: the function body is not there to prove the call absent, so the
+            // module-wide verdict stands. Never admit what the guard refused before.
+            None => true,
+        },
+    }
+}
+
+/// Whether `function`'s **own** lowered body issues a guarded fun-image BIF
+/// ([`RuntimeContext::current_module`]-free, but park-hazard-bearing) — the per-function half of
+/// [`callee_observes_its_call_site`].
+///
+/// The scan covers every `beam_loader::Instr` variant that carries an [`ImportRef`]
+/// ([`Instr::CallExt`], [`Instr::CallExtOnly`], [`Instr::CallExtLast`], [`Instr::Bif0`],
+/// [`Instr::Bif`], [`Instr::GcBif`]): the compiler lowers one `erlang:term_to_binary` call to
+/// any of them depending on the call's shape (a garbage-collecting BIF, a plain one, or a real
+/// call), so all six must be inspected.
+fn function_calls_a_fun_image_bif(module: &Module, function: &Function) -> bool {
+    function.code.iter().any(|instr| {
+        let target = match instr {
+            Instr::CallExt { target, .. }
+            | Instr::CallExtOnly { target, .. }
+            | Instr::CallExtLast { target, .. } => *target,
+            Instr::Bif0 { bif, .. } | Instr::Bif { bif, .. } | Instr::GcBif { bif, .. } => *bif,
+            _ => return false,
+        };
+        import_is_a_fun_image_bif(module, target)
     })
+}
+
+/// Whether `module.imports[index]` names a guarded fun-image BIF (`erlang:term_to_binary/1,2`
+/// or `erlang:external_size/1,2`). An index outside the `ImpT` table names no import at all, so
+/// a malformed one observes nothing rather than panicking.
+fn import_is_a_fun_image_bif(module: &Module, index: ImportRef) -> bool {
+    let Some(import) = module.imports.get(index.0 as usize) else {
+        return false;
+    };
+    module.atom_name(import.module) == Some("erlang")
+        && matches!(
+            module.atom_name(import.function),
+            Some("term_to_binary") | Some("external_size")
+        )
+        && (import.arity == 1 || import.arity == 2)
 }
 
 /// The **discriminator** for [`RuntimeContext::run_label_blocking`]: applying a local
