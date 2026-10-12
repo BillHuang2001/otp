@@ -46,7 +46,8 @@
 %%
 %%   `-run' passes every command-line argument as a flat string list, so
 %%   `main/1' receives `[Report, Suite | _]'.  Without arguments it runs the
-%%   five suites listed in ?DEFAULT_SUITES and writes the default report.
+%%   six suites listed in ?DEFAULT_SUITES (which includes
+%%   `beam_ssa_opt_diff_SUITE') and writes the default report.
 %%
 %% WHAT IT DOES
 %%   * `init_per_suite([{priv_dir,Dir}])' -- Dir is created if needed and is
@@ -111,6 +112,7 @@
          beam_ssa_fus_SUITE,
          beam_ssa_fbip_SUITE,
          ssa_opt_budget_SUITE,
+         beam_ssa_opt_diff_SUITE,
          beam_ssa_opt_equiv_SUITE]).
 
 %% Longest failure reason (and stack) rendered per line, in characters.
