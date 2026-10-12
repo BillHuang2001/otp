@@ -82,3 +82,77 @@ pattern enough that the clobber lands elsewhere — which is why that probe look
 Remaining work: pin the exact nursery-growth/root-publication site and fix it there; then add a
 regression test in `tests/compile_file.rs` that drives `epp:parse_file/3` (or `compile:file/2`)
 through the scheduled `run` route and asserts the observable parsed form count / produced `.beam`.
+
+## 4. Update — canary instrumentation round (mechanism narrowed, not yet closed)
+Raw instrumentation was added in-crate (env-gated `BEAM_RT_TRACE_HEAP`, since removed) that
+(a) canaried the live region of every space `Process::grow_nursery` retires and re-read it at
+each delivery/resume, and (b) printed the nursery geometry (`base`/`cap`/`used`/`nspaces`) of the
+sending and receiving process at those same sites.
+
+### 4.1 Corrections to the earlier record
+* **The `BEAM_RT_GC_OFF=1` control is void.** No such env gate exists in the tree (it was a
+  temporary gate of an earlier wave and is gone), so that run was the *default* configuration
+  and its `NFORMS=6` says nothing about whether a collection is involved. The claim
+  "NOT a collection" does not follow from it.
+* Control experiments that DO hold: `+hms 233` → `NFORMS=6`; `+hms 500` (and every larger value)
+  → `NFORMS=5`; `BEAM_RT_GC_STRATEGY=copying` → 6, `immix` → 5. A small nursery (233 words) is
+  what makes the divergence appear, and the repro is deterministic.
+
+### 4.2 Raw trace (the decisive window)
+```
+[71] RESUME-GEOM pid=3 young(base=A=0x7b54fbc9a790 cap=233 used=233 nspaces=1) mature(0x7b54fbc9aef0 used=0)
+[74] PARK       pid=3 young(base=A cap=233 used=233 nspaces=1) mature(0x7b54fbc9aef0 used=0)
+[78] RESUME-GEOM pid=3 young(base=A cap=233 used=233 nspaces=1) mature(0x7b54fbc9aef0 used=0)
+[81] GROW pid=3 need=2 old(base=A cap=233 used=233) new(base=B=0x7b54fbcc59c0 cap=233 used=0) nspaces=2
+[82] GROW pid=3 need=2 old(base=B cap=233 used=233) new(base=C=0x7b54fbcc6120 cap=233 used=0) nspaces=3
+[83] PARK       pid=3 young(base=C cap=233 used=230 nspaces=3) mature(0x7b54fbc9aef0 used=0)
+[86] DELIVER from=pid2 n=24 to=pid3           <-- Process::deliver -> copy_message refuses -> ensure_capacity
+[87] DELIVER-GEOM pid=3 young(base=C cap=233 used=230 nspaces=3) mature(0x7b54fbc9aef0 used=0)
+[89] RESUME     pid=3
+[90] RESUME-GEOM  pid=3 young(base=C cap=233 used=4 nspaces=1) mature(0x7b54fbccbee0 used=39)
+                                                  ^ nspaces 3 -> 1: the chain COLLAPSED (retired A and B freed)
+[91] DELIVER from=pid3 n=25 to=pid2 msg={... L[0x7b54fbcc6608][...6 intact elements...]}}   <-- in the CURRENT space C
+[93] MUTATED site=deliver tag=retired base=A off=0 old=0x6cf new=0x7b54fbccc640
+[94] MUTATED site=deliver tag=retired base=A off=1 old=0x3b  new=0x7b54fbcc59c0   (= B's base)
+[95] MUTATED site=deliver tag=retired base=B off=0 old=0x67f new=0x7b54fbc9a790   (= A's base)
+[96] MUTATED site=deliver tag=retired base=B off=1 old=0x3b  new=0x0
+... further MUTATED lines over both blocks, later showing atom/tuple-header-looking
+words (0x80 = arityval(2), 0x2c8b = an ATOM immediates) — i.e. the freed blocks are
+being handed out again and filled with live-looking data.
+```
+Every `alloc_words` growth-failure path writes `[small(2) | NIL]`-shaped words into blocks A and
+B through no code of its own: the writes land **after** the collapse in §4.2's window, i.e. in
+memory the runtime has already freed.
+
+### 4.3 What this establishes and what is still open
+* A **collection runs inside `Process::deliver`** (`beam_process`'s `Process::deliver` →
+  `ensure_capacity` → `run_rooted_collection`), not through `beam_rt`'s `collect_or_grow`
+  (no `COLLECT-*` log lines were emitted), and it **collapses the nursery chain**, freeing the
+  spaces a `grow_nursery` had retired.
+* `Nursery::grow` (`beam_gc`) correctly retains the retired space in `Nursery::retired`, and
+  `Nursery::spaces()`/`add_to_from_set` do cover every retired space, so the collector *does*
+  evacuate a chained nursery. The corruption therefore means a live term of the scheduled
+  process is **not reachable from the root set that delivery-driven collection gathers** — the
+  collector then does not evacuate it, `collapse` frees its block, and the writer that re-uses
+  the block produces the observed `[2|[]]`-style clobber.
+* The delivery-driven collection (`Process::deliver`) is the one collection site that does
+  **not** consult the unscanned-root valve that `beam_rt`'s `ensure_heap` / `ensure_heap_full` /
+  `alloc_words_rooted` apply (`context::gc::root_is_unscanned`) — worth checking first, together
+  with which of the parked machine's regions `run_rooted_collection` actually gathers.
+* The canary's `MUTATED` output alone cannot separate "written while still retired-and-live"
+  from "written after the block was freed"; the round that was in flight when the turn budget ran
+  out replaced it with a per-pid block registry (live vs freed) plus a scan of the published
+  roots (`x`/stack/`extra_roots`) for pointers into a **freed** block. That scan is the piece that
+  pins the exact dangling root and must be the first thing a follow-up wave re-adds.
+
+### 4.4 Repro / controls (authoritative, cheap)
+```
+# bug (scheduled route):
+erts_rust/target/debug/beam_rt -noshell run <dir>/b13.beam b13:go/0        # NFORMS=6
+# correct (single-pass route):
+erts_rust/target/debug/beam_rt -noshell -pa <dir> -eval 'b13:go()'        # NFORMS=5
+erl -noshell -pa <dir> -eval 'b13:go()' -s init stop                      # NFORMS=5 (oracle)
+# nursery-size control:
+erts_rust/target/debug/beam_rt -noshell +hms 500 run <dir>/b13.beam b13:go/0   # NFORMS=5 (masked)
+```
+`b13.erl`'s `go/0` hard-codes an absolute path; a committed regression test must not.
