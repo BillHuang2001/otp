@@ -905,7 +905,7 @@ impl RuntimeContext<'_> {
 
     // -- helpers --------------------------------------------------------------
 
-    /// A fresh reference from the runtime's one reference id space: its id and its term.
+    /// A fresh reference from the runtime's own reference id space: its id and its term.
     ///
     /// The term is built on a pooled BIF heap (see [`Runtime::take_bif_heap`]); that heap
     /// never moves or resets its terms, so the returned term stays valid for the runtime's

@@ -576,7 +576,7 @@ impl NifHost for NifHostImpl<'_> {
         self.atoms.lookup(name).map(make_atom)
     }
 
-    /// `enif_make_ref()` — a fresh reference, drawn from the runtime's one reference id space.
+    /// `enif_make_ref()` — a fresh reference, drawn from the runtime's own reference id space.
     ///
     /// Delegates to the borrowed [`NifHostServices`]: the provider allocates the next id, builds
     /// the reference thing on **this host's** heap and registers it as a plain reference (so
