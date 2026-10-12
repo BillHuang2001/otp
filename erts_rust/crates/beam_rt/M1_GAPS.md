@@ -344,20 +344,23 @@ re-fetch.
   half (`erlang:term_to_binary/1,2`/`external_size/1,2`, alongside the necessarily module-wide
   `erlang:load_nif/2`) stays **module-wide** because narrowing it is unsound. `compile.beam` imports
   `term_to_binary/1,2`, so a narrowed guard admits `compile:*` in-machine on the **scheduled,
-  non-relocation-exempt** route, where a collection at the running machine's **own** heap-admission
-  point (`ensure_heap`/`ensure_heap_full` → `collect_or_grow`) relocates the process heap against an
-  **incomplete** root set: the running machine's `x`/stack/FR are published into `Process::regs` only
-  at those same admission points (`context/gc.rs::ensure_heap_full` → `publish_roots_full` ~:663,
-  `alloc_words_rooted` ~:862) and at a park (`publish_parked_roots`), **never** around
-  `ExecutionContext::call_bif` (`beam_engine/src/interpreter/bif.rs:188-193`). A term the in-flight
-  call chain holds outside `x`/stack/FR (`Machine::args_scratch`) is not in the root set at all; the
-  running-window stale holder — a container on the pooled `Runtime::bif_heaps` — is the shape the
-  two-phase unscanned-root valve now declines over (see *GC-relocation hazards* above). The
-  corrupting collection is **not** a delivery: `Process::has_unpublished_roots()` (=
-  `relocation_exempt || state == ProcessState::Running`, `beam_process/src/process.rs:1097`) refuses
-  every delivery-driven collect/grow against a `Running` receiver, so the delivery paths
-  (`Process::collect`/`ensure_capacity`/`grow_receiver_for_signal`, `beam_process/src/ptab.rs`) are no
-  longer the exposure. Narrowing the guard therefore makes **both** cases a hard `mismatch`, and it is a
+  non-relocation-exempt** route, where the corrupting
+  move is a **delivery-driven** collection of the nested run's own pid. Measured on the traced
+  `no_spawn` shape (`BEAM_RT_TRACE_GC`, interpreter tier): the run executes exactly **one**
+  runtime-door collection — `site=admit_full pid=2 module=selfhost need=2 kind=Minor`, on an
+  **empty** nursery beside `2056` published root words — and **3951 declines** (`1619`
+  `site=admit_full` + `2332` `site=rooted`); `Runtime::serve_gc_request` is never reached (no park
+  collection), and `BEAM_RT_FORCE_DESCEND=1` changes nothing, so the descent gate is already open.
+  The panic's immediate predecessor is `DELIVER to=pid2 unsound=true`, so the move is **not** at any
+  of the three `beam_rt` admission doors nor at the park arm; it is a delivery-driven collection
+  inside `beam_process::Process::deliver` (`crates/beam_process/src/process.rs:1171`)
+  → `ensure_capacity` (`:1171`) → `run_rooted_collection` (`:1232`), invisible to the runtime's own
+  trace. Its gathered root set (`process.regs` via `publish_roots_full`, mailbox, dict, `saved_args`,
+  signals — the families `context/gc_walk.rs::seed_process_roots` enumerates) does **not** reach the
+  value the **nested** `beam_engine::Machine` built at `RuntimeContext::run_label_blocking`
+  (`src/context/mod.rs:1418`) holds in its own `x`/stack: that machine is not a `Process`, so nothing
+  publishes it, and `root_is_unscanned` finds no unscanned *container* in the pid's own root words —
+  the value is absent from the root set, not behind a foreign parent. Narrowing the guard therefore makes **both** cases a hard `mismatch`, and it is a
   relocating-collection race rather than a difference in compile behaviour: a nursery large enough that
   no collection occurs (`+hms 4194304`, `+hms 16777216`) makes both shapes pass (stdout `1`, exit 0) on
   both tiers, and so does the `-eval` route, whose whole driver is wrapped in `with_relocation_exempt`
@@ -367,9 +370,8 @@ re-fetch.
   `Machine::eval_test` ← `run_label_outcome` ← `run_label_blocking` (inside `with_relocation_exempt`) ←
   `apply_fun` ← `FunBridge::call_fun` ← `beam_bifs::lists::foldl3` (`beam_bifs/src/lists.rs:1356`); the
   race can also surface as a wrong `3`/exit 0 instead of the abort. The scheduled shape folds into
-  `*** Internal compiler error ***`/`exception exit: badarg` (exit 1). The parked-`pending_exception`
-  rooting is not the missing piece either: the hazard lives in the **running** (mid-slice) window, not
-  the park window.
+  `*** Internal compiler error ***`/`exception exit: badarg` (exit 1). The parked-`pending_exception` rooting is not the missing piece either: the hazard lives in the
+  **nested-run** window (the nested machine's own registers), not the park window.
 * **The native `file_server_2` service** (`src/native/file_server.rs`) answers the
   `{'$gen_call',{Pid,Tag},Request}` / `{file_request|io_request,From,ReplyAs,Request}` wire and the
   server/io-device request surface `lib/kernel/src/file.erl` issues (`{open,…}`, `read_file`, `list_dir`,
@@ -537,7 +539,7 @@ The running-window stale holder is `Runtime::bif_heaps`: a registered BIF builds
 ## Cross-node handoffs (crate index)
 * **Differential gate** — **no case disagrees**; all four `unsupported` cases are allowlisted capability gaps (`wire/new_fun_ext_encode`, `boot_extra/init_script_id_names_the_running_otp_release`, and the two `selfhost/*` cases). The rollup/allowlist state belongs to [`../tools/differential/CONTEXT.md`](../tools/differential/CONTEXT.md); re-run `gate.sh` for the figure.
 * **A.7/A.9 boot** — completes (the real `start.boot` to `{progress,started}`, leaving a live `logger_server` registered as `logger`); the residual is whatever the started applications still need from `beam_bifs`. Detail: [`src/boot/CONTEXT.md`](src/boot/CONTEXT.md) + [`src/native/CONTEXT.md`](src/native/CONTEXT.md).
-* **A.9 E0 — in-process compilation works and is byte-identical; the *scheduled* route stays gated.** `compile:file(File, [no_spawn_compiler_process, deterministic, {outdir, Dir}])` runs **in-process** and writes a `.beam` **byte-identical** to the oracle's identical-option run (`cmp` clean; the `Code` chunk also matches `erlc +deterministic`) — `tests/compile_file.rs`. Both `selfhost/*` corpus cases report `unsupported: opcode: run: process blocked (no message available)`, so their `tools/differential/known-gaps.txt` entries stay (**repo-root owned, not editable from here**; the cause named there — an unpublished live `Machine::pending_exception` — is inaccurate, the parked reason **is** rooted). What gates the route is the nested-non-pumping parked callee **plus** the module-wide fun-image half of `module_observes_its_call_site` — narrowing it admits `compile:*` in-machine on the scheduled, non-exempt route, where a collection at the running machine's **own** heap-admission point relocates the heap against a root set that does not reach a term the in-flight call chain holds (a *delivery*-driven collect of a `Running` receiver is already refused by `Process::has_unpublished_roots`, and the delivery seam additionally consults the unscanned-root valve), making both cases a hard `mismatch`. The running-window stale holder and the two-phase unscanned-root valve that declines over it: *GC-relocation hazards* above.
+* **A.9 E0 — in-process compilation works and is byte-identical; the *scheduled* route stays gated.** `compile:file(File, [no_spawn_compiler_process, deterministic, {outdir, Dir}])` runs **in-process** and writes a `.beam` **byte-identical** to the oracle's identical-option run (`cmp` clean; the `Code` chunk also matches `erlc +deterministic`) — `tests/compile_file.rs`. Both `selfhost/*` corpus cases report `unsupported: opcode: run: process blocked (no message available)`, so their `tools/differential/known-gaps.txt` entries stay (**repo-root owned, not editable from here**; the cause named there — an unpublished live `Machine::pending_exception` — is inaccurate, the parked reason **is** rooted). What gates the route is the nested-non-pumping parked callee **plus** the module-wide fun-image half of `module_observes_its_call_site` — narrowing it admits `compile:*` in-machine on the scheduled, non-exempt route, where the corrupting move is a **delivery-driven** collection of the nested run's own pid against a root set that does not reach a term the in-flight call chain holds: the **nested** `beam_engine::Machine` built by `RuntimeContext::run_label_blocking` (`src/context/mod.rs:1418`, entered from `FunBridge::call_fun` ← `lists:foldl3`) is not a `Process`, so nothing publishes its `x`/stack, and a collection driven from `beam_process::Process::deliver` → `ensure_capacity` → `run_rooted_collection` (`crates/beam_process/src/process.rs:1171`/`:1232`) moves that pid's heap under it — a **sibling-owned** collection site with no *is this move sound?* predicate, making both cases a hard `mismatch`. The running-window stale holder and the two-phase unscanned-root valve that declines over it: *GC-relocation hazards* above.
 * **`beam_process` / `beam_gc` — the delivery-driven collection site has no *is this move sound?* predicate (the residual root fix behind the A.9 E0 bullet).** `Process::deliver`'s rooted collection gathers the receiver's `regs`; `beam_gc`'s Cheney scan does not descend through a container outside the from-set (`beam_gc/src/copy.rs::EvacDest for Copier` → `Target::Foreign`), so a mature cell that IS inside the from-set and IS reachable from a gathered root *through* such a container (the runtime's arena, a pooled BIF heap, a message heap fragment) is never forwarded, and `collect_major`'s `self.mature = fresh` then recycles the block in place with the live cell still in it. The refusal belongs at the collection site: `ensure_capacity`/`run_rooted_collection` should decline when the gathered roots reach a container outside the from-set, or the copier should evacuate a from-set word through a declared-safe foreign parent. `beam_rt`'s mitigation is the delivery seam's valve consultation above — conservative, it only ever *declines* a collection, so an affected receiver's heap grows on that path (every engine admission for it already declines). Geometry, mechanism and the sibling patch sketch: [`EPP_SCHEDULED_ROUTE_FINDINGS.md`](EPP_SCHEDULED_ROUTE_FINDINGS.md).* **The native `file_server_2` service** — its served request surface and every typed per-request gap are tabled in [`src/native/CONTEXT.md`](src/native/CONTEXT.md); a process-**alias** reply tag is the typed `unsupported`.
 * **`beam_process` / `beam_message`** — an owning drain for the wake list and a `!Send`-friendly `SchedulerPool` for SMP adoption; the split heap+mailbox borrow exists.
 * **`beam_engine`** — a `MinimalContext` arena word/byte accessor (so `erlang:memory/0,1`'s process figures are real on the single-pass path).

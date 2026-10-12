@@ -81,7 +81,6 @@ mod alias;
 mod bridges;
 mod fun_identity;
 pub(crate) mod gc;
-pub(crate) mod gc_trace;
 pub(crate) mod gc_walk;
 mod memory_hook;
 mod module_info;
@@ -104,7 +103,7 @@ use beam_common::{AllocKind, BeamError, Result};
 use beam_engine::context::RootSet;
 use beam_engine::machine::WaitDeadline;
 use beam_engine::{terms, ExecutionContext, Machine, RunOutcome};
-use beam_loader::{Atom, Function, ImportRef, Instr, Label, Module};
+use beam_loader::{Atom, Label, Module};
 use beam_message::{CopyContext, Message, OffHeapTable, Queue};
 use beam_process::{MonitorRef, ProcessId, ProcessTable};
 use beam_term::Eterm;
@@ -2844,18 +2843,17 @@ impl ExecutionContext for RuntimeContext<'_> {
         // — and therefore through this seam again). Answering `Ok(None)` on the first
         // consultation and `Ok(Some(..))` on the second because the on-demand load had cached
         // the module in between would enter the callee in-machine under the caller's identity
-        // — the observed wrong `bad_lib` on a module's own `erlang:load_nif/2`. The guard is a
-        // pure function of the (immutable) loaded IR, so it answers the same both times.
-        //
-        // [LOCAL NARROWING — diagnostic reproducer]
+        // — the observed wrong `bad_lib` on a module's own `erlang:load_nif/2`.
+        if module_observes_its_call_site(&callee) {
+            return Ok(None);
+        }
+        // Resolve the export in the **callee's own** atom table (`Module` code's atoms are
+        // that table's, never the runtime's shared one) and hand back the export entry label
+        // the synchronous `run_export` would enter. An unknown atom or export is the
+        // synchronous path's `undef`.
         let Some(function_atom) = callee.atom_table.lookup(function) else {
             return Ok(None);
         };
-        if callee_observes_its_call_site(&callee, function_atom, arity) {
-            return Ok(None);
-        }
-        // Hand back the export entry label the synchronous `run_export` would enter. An export
-        // the callee does not have is the synchronous path's `undef`.
         match callee.export(function_atom, arity) {
             Some(label) => Ok(Some((callee, label))),
             None => Ok(None),
@@ -3231,7 +3229,6 @@ impl ExecutionContext for RuntimeContext<'_> {
 ///
 /// [`ExecutionContext::resolve_external_call`]: beam_engine::ExecutionContext::resolve_external_call
 /// [`Module::imports`]: beam_loader::Module::imports
-#[allow(dead_code)] // [LOCAL NARROWING] retained for the unit suite; the seam now uses the per-function guard.
 pub(crate) fn module_observes_its_call_site(module: &Module) -> bool {
     module.imports.iter().any(|import| {
         module.atom_name(import.module) == Some("erlang")
@@ -3243,76 +3240,6 @@ pub(crate) fn module_observes_its_call_site(module: &Module) -> bool {
                 _ => false,
             }
     })
-}
-
-/// [LOCAL NARROWING — diagnostic reproducer] The call-site-reading imports a module's `ImpT`
-/// declares, classified by the scope of the refusal each one forces.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum CallSiteReadingImports {
-    LoadNif,
-    FunImage,
-    None,
-}
-
-fn call_site_reading_imports(module: &Module) -> CallSiteReadingImports {
-    let mut fun_image = false;
-    for import in &module.imports {
-        if module.atom_name(import.module) != Some("erlang") {
-            continue;
-        }
-        match module.atom_name(import.function) {
-            Some("load_nif") if import.arity == 2 => return CallSiteReadingImports::LoadNif,
-            Some("term_to_binary") | Some("external_size")
-                if import.arity == 1 || import.arity == 2 =>
-            {
-                fun_image = true;
-            }
-            _ => {}
-        }
-    }
-    if fun_image {
-        CallSiteReadingImports::FunImage
-    } else {
-        CallSiteReadingImports::None
-    }
-}
-
-/// [LOCAL NARROWING — diagnostic reproducer] Whether `module`'s code for `function`/`arity` can
-/// read the call site it runs at.
-pub(crate) fn callee_observes_its_call_site(module: &Module, function: Atom, arity: u32) -> bool {
-    match call_site_reading_imports(module) {
-        CallSiteReadingImports::LoadNif => true,
-        CallSiteReadingImports::None => false,
-        CallSiteReadingImports::FunImage => match module.function(function, arity) {
-            Some(function) => function_calls_a_fun_image_bif(module, function),
-            None => true,
-        },
-    }
-}
-
-fn function_calls_a_fun_image_bif(module: &Module, function: &Function) -> bool {
-    function.code.iter().any(|instr| {
-        let target = match instr {
-            Instr::CallExt { target, .. }
-            | Instr::CallExtOnly { target, .. }
-            | Instr::CallExtLast { target, .. } => *target,
-            Instr::Bif0 { bif, .. } | Instr::Bif { bif, .. } | Instr::GcBif { bif, .. } => *bif,
-            _ => return false,
-        };
-        import_is_a_fun_image_bif(module, target)
-    })
-}
-
-fn import_is_a_fun_image_bif(module: &Module, index: ImportRef) -> bool {
-    let Some(import) = module.imports.get(index.0 as usize) else {
-        return false;
-    };
-    module.atom_name(import.module) == Some("erlang")
-        && matches!(
-            module.atom_name(import.function),
-            Some("term_to_binary") | Some("external_size")
-        )
-        && (import.arity == 1 || import.arity == 2)
 }
 
 /// The **discriminator** for [`RuntimeContext::run_label_blocking`]: applying a local
