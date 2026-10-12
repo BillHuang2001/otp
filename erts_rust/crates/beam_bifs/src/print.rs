@@ -469,6 +469,12 @@ fn render_list_chunk(
 
 /// Appends a list tail (`""`, `,e…` or `|tail`, `io_lib:write_tail/4`); the
 /// closing `]` is the caller's.
+///
+/// The tail is walked with a **loop**, never by self-recursion: `write_tail/4`
+/// consumes one depth level per element, so a self-recursive walk grew the native
+/// stack once per list element and a long flat list (tens of thousands of elements)
+/// overflowed it. The pushed chunks — the `,` before each element, the terminating
+/// `|`+tail, or the depth-limited `|...` — are exactly the recursive walk's.
 fn render_tail_chunk(
     atoms: &AtomTable,
     term: Eterm,
@@ -476,25 +482,34 @@ fn render_tail_chunk(
     depth: i64,
     out: &mut Vec<Chunk>,
 ) -> Result<()> {
-    if is_nil(term) {
-        return Ok(());
-    }
-    if depth == 1 {
-        // `[$| | "..."]` — the four characters are spliced individually.
-        out.extend(['|', '.', '.', '.'].map(Chunk::Char));
-        return Ok(());
-    }
-    if is_list(term) {
+    let mut term = term;
+    let mut depth = depth;
+    loop {
+        if is_nil(term) {
+            return Ok(());
+        }
+        if depth == 1 {
+            // `[$| | "..."]` — the four characters are spliced individually.
+            out.extend(['|', '.', '.', '.'].map(Chunk::Char));
+            return Ok(());
+        }
+        if !is_list(term) {
+            out.push(Chunk::Char('|'));
+            out.push(render_chunk(atoms, term, printable, depth - 1)?);
+            return Ok(());
+        }
         out.push(Chunk::Char(','));
         out.push(render_chunk(atoms, car(term), printable, depth - 1)?);
-        return render_tail_chunk(atoms, cdr(term), printable, depth - 1, out);
+        term = cdr(term);
+        depth -= 1;
     }
-    out.push(Chunk::Char('|'));
-    out.push(render_chunk(atoms, term, printable, depth - 1)?);
-    Ok(())
 }
 
 /// Appends the remaining tuple elements (`,e…` / `,...`), `io_lib:write_tuple/6`.
+///
+/// Iterative for the same reason as [`render_tail_chunk`]: one depth level is
+/// consumed per element, so a per-element recursion overflowed the native stack on a
+/// long tuple.
 fn render_tuple_rest_chunk(
     atoms: &AtomTable,
     term: Eterm,
@@ -503,16 +518,20 @@ fn render_tuple_rest_chunk(
     printable: bool,
     out: &mut Vec<Chunk>,
 ) -> Result<()> {
-    if index >= tuple_size(term) {
-        return Ok(());
+    let len = tuple_size(term);
+    let mut index = index;
+    let mut depth = depth;
+    while index < len {
+        if depth == 1 {
+            out.extend([',', '.', '.', '.'].map(Chunk::Char));
+            return Ok(());
+        }
+        out.push(Chunk::Char(','));
+        out.push(render_chunk(atoms, tuple_element(term, index), printable, depth - 1)?);
+        index += 1;
+        depth -= 1;
     }
-    if depth == 1 {
-        out.extend([',', '.', '.', '.'].map(Chunk::Char));
-        return Ok(());
-    }
-    out.push(Chunk::Char(','));
-    out.push(render_chunk(atoms, tuple_element(term, index), printable, depth - 1)?);
-    render_tuple_rest_chunk(atoms, term, index + 1, depth - 1, printable, out)
+    Ok(())
 }
 /// Renders a map (`#{k => v,…}`), `io_lib:write_map/4` /
 /// `io_lib_pretty:write/1` (both build `[#, {, [pair, …, pair], }]`).
@@ -550,6 +569,12 @@ fn render_map_chunk(
 ///
 /// `depth` starts at the first pair's inner depth and decreases per pair; `inner`
 /// is the (fixed) depth every key and value is rendered at.
+///
+/// Iterative for the same reason as [`render_tail_chunk`]: the walk consumes one
+/// depth level per pair, so a per-pair recursion would grow the native stack once per
+/// pair. Note the `depth == 1` check comes **before** the index bound, exactly as in
+/// the recursive form (the depth-limited run emits its `,...` even when the pairs are
+/// exhausted).
 fn render_map_body_chunk(
     atoms: &AtomTable,
     pairs: &[(Eterm, Eterm)],
@@ -559,16 +584,21 @@ fn render_map_body_chunk(
     printable: bool,
     out: &mut Vec<Chunk>,
 ) -> Result<()> {
-    if depth == 1 {
-        out.extend([',', '.', '.', '.'].map(Chunk::Char));
-        return Ok(());
+    let mut index = index;
+    let mut depth = depth;
+    loop {
+        if depth == 1 {
+            out.extend([',', '.', '.', '.'].map(Chunk::Char));
+            return Ok(());
+        }
+        if index >= pairs.len() {
+            return Ok(());
+        }
+        out.push(Chunk::Char(','));
+        out.push(map_pair_chunk(atoms, pairs[index], printable, inner)?);
+        index += 1;
+        depth -= 1;
     }
-    if index >= pairs.len() {
-        return Ok(());
-    }
-    out.push(Chunk::Char(','));
-    out.push(map_pair_chunk(atoms, pairs[index], printable, inner)?);
-    render_map_body_chunk(atoms, pairs, index + 1, depth - 1, inner, printable, out)
 }
 
 /// Renders one map pair (`io_lib:write_map_assoc/4`): `[Key, " => ", Value]` —
@@ -1133,12 +1163,47 @@ mod tests {
     /// Runs `f` over a fresh context whose atom table is seeded with the names the
     /// tests build terms from.
     fn with_ctx<R>(f: impl FnOnce(&mut BifContext<'_>) -> R) -> R {
-        let mut heap = Heap::new(1024).expect("test heap");
+        with_ctx_capacity(1024, f)
+    }
+
+    /// [`with_ctx`] over a heap of `capacity_words` term words.
+    ///
+    /// The long-container regression tests below build a flat container with tens of
+    /// thousands of elements, which does not fit the 1024-word default heap (a
+    /// [`Heap`] never reallocates; exhaustion is a typed `Alloc` error).
+    fn with_ctx_capacity<R>(capacity_words: usize, f: impl FnOnce(&mut BifContext<'_>) -> R) -> R {
+        let mut heap = Heap::new(capacity_words).expect("test heap");
         let mut atoms = AtomTable::new();
         atoms.seed(["true", "false", "ok", "hello", "Hello", "a", "b", "c", "abc", "hi"]);
         let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
         f(&mut ctx)
     }
+
+    /// Runs `f` on a thread with a deliberately small (256 KiB) stack.
+    ///
+    /// The three long-container tests below render a flat list/tuple/map with tens of
+    /// thousands of elements. The render helpers used to recurse **once per element**
+    /// (`render_tail_chunk`/`render_tuple_rest_chunk`/`render_map_body_chunk`), so on
+    /// this small stack the walk overflowed the native stack and Rust aborted the
+    /// whole test process (`fatal runtime error: stack overflow`). Running the render
+    /// here pins that per-element stack-overflow regression: the walk must be total.
+    fn on_small_stack<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(f)
+            .expect("the regression thread spawns")
+            .join()
+            .expect("the render must not overflow the native stack")
+    }
+
+    /// Elements per long list/tuple and pairs per large map in the regression tests.
+    ///
+    /// 20_000 elements overflowed a 256 KiB stack through the *old* per-element
+    /// recursion (measured: the render thread aborts with
+    /// `fatal runtime error: stack overflow`), and leaves ~2× headroom over the
+    /// ~8_000-element breaking point at this stack size.
+    const LONG_CONTAINER_LEN: i64 = 20_000;
+    const LARGE_MAP_PAIRS: i64 = 20_000;
 
     /// Renders `term` with `printable`, asserting success.
     fn show(ctx: &mut BifContext<'_>, term: Eterm, printable: bool) -> String {
@@ -1828,5 +1893,123 @@ mod tests {
             // Sanity: the atom itself still renders.
             assert_eq!(show(ctx, node, false), "hi");
         });
+    }
+
+    /// `~w` of a 20_000-element flat list renders **byte-identically** on a 256 KiB
+    /// stack.
+    ///
+    /// The list tail is walked once per element (`io_lib:write_tail/4`), which used to
+    /// recurse once per element and overflow the native stack well below this length;
+    /// `on_small_stack` pins that (see its docs). The oracle prints such a list, so the
+    /// abort was a bug and the walk must be total.
+    #[test]
+    fn a_long_list_renders_without_per_element_stack_recursion() {
+        let (rendered, limited) = on_small_stack(|| {
+            with_ctx_capacity(1 << 20, |ctx| {
+                let elems: Vec<Eterm> = (1..=LONG_CONTAINER_LEN).map(make_small).collect();
+                let list = ctx.list(&elems).expect("the long list fits");
+                (
+                    format_term(ctx, list, false).expect("the long list renders"),
+                    // A small depth stops the walk after two elements — the loop must
+                    // still consume exactly one depth level per element.
+                    format_term_depth(ctx, list, false, 3)
+                        .expect("the depth-limited list renders"),
+                )
+            })
+        });
+
+        let mut expected = String::from("[");
+        for i in 1..=LONG_CONTAINER_LEN {
+            if i > 1 {
+                expected.push(',');
+            }
+            expected.push_str(&i.to_string());
+        }
+        expected.push(']');
+        assert_eq!(rendered, expected);
+        assert_eq!(limited, "[1,2|...]");
+    }
+
+    /// `~w` of a 20_000-element tuple renders **byte-identically** on a 256 KiB stack
+    /// (same per-element-walk regression as the list above, `io_lib:write_tuple/6`).
+    #[test]
+    fn a_long_tuple_renders_without_per_element_stack_recursion() {
+        let (rendered, limited) = on_small_stack(|| {
+            with_ctx_capacity(1 << 20, |ctx| {
+                let elems: Vec<Eterm> = (1..=LONG_CONTAINER_LEN).map(make_small).collect();
+                let tuple = ctx.tuple(&elems).expect("the long tuple fits");
+                (
+                    format_term(ctx, tuple, false).expect("the long tuple renders"),
+                    format_term_depth(ctx, tuple, false, 3)
+                        .expect("the depth-limited tuple renders"),
+                )
+            })
+        });
+
+        let mut expected = String::from("{");
+        for i in 1..=LONG_CONTAINER_LEN {
+            if i > 1 {
+                expected.push(',');
+            }
+            expected.push_str(&i.to_string());
+        }
+        expected.push('}');
+        assert_eq!(rendered, expected);
+        assert_eq!(limited, "{1,2,...}");
+    }
+
+    /// `~w` of a 20_000-pair map renders on a 256 KiB stack (same per-pair-walk
+    /// totality requirement as above, `io_lib:write_map_body/5`).
+    ///
+    /// Unlike the list/tuple walk, the old per-pair recursion happened to be compiled
+    /// into a loop at `opt-level = 1` (no self-`call` in
+    /// `render_map_body_chunk`'s disassembly), so this case did *not* abort before the
+    /// rewrite; it pins the walk's totality — and would catch a re-introduced
+    /// per-pair recursion the moment the compiler stops loop-ifying it.
+    ///
+    /// The pairs come out in the map's HAMT slot order, so the assertion is on the
+    /// *structure* (the `,` separators, the ` => ` within each pair, and the exact key
+    /// set) rather than on one expected string.
+    #[test]
+    fn a_large_map_renders_without_per_pair_stack_recursion() {
+        // `beam_term::map::map_words_capacity` reserves `21 * pairs + 18` words for a
+        // hash map; give the heap that plus slack.
+        let capacity = 21 * LARGE_MAP_PAIRS as usize + 4096;
+        let (rendered, limited) = on_small_stack(move || {
+            with_ctx_capacity(capacity, |ctx| {
+                let entries: Vec<(Eterm, Eterm)> = (1..=LARGE_MAP_PAIRS)
+                    .map(|k| (make_small(k), make_small(k)))
+                    .collect();
+                let map = crate::access::make_map(ctx.heap(), &entries).expect("the map fits");
+                (
+                    format_term(ctx, map, false).expect("the large map renders"),
+                    // The map's `depth == 1` arm must precede the pair bound, exactly as
+                    // in the recursive form: one pair, then `,...`.
+                    format_term_depth(ctx, map, false, 2).expect("the depth-limited map"),
+                )
+            })
+        });
+
+        assert!(
+            rendered.starts_with("#{") && rendered.ends_with('}'),
+            "a map renders `#{{…}}`: {rendered:.40}…"
+        );
+        let body = &rendered[2..rendered.len() - 1];
+        // One pair per `,`-separated entry, and each entry is `Key => Value`.
+        assert_eq!(body.matches(" => ").count(), LARGE_MAP_PAIRS as usize);
+        assert_eq!(body.split(',').count(), LARGE_MAP_PAIRS as usize);
+        let mut keys: Vec<i64> = body
+            .split(',')
+            .map(|entry| {
+                let (key, value) = entry.split_once(" => ").expect("a `Key => Value` pair");
+                assert_eq!(key, value, "`~w` of the map `K => K`");
+                key.parse().expect("a small integer key")
+            })
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, (1..=LARGE_MAP_PAIRS).collect::<Vec<_>>());
+
+        assert_eq!(limited.matches(" => ").count(), 1, "{limited:.40}…");
+        assert!(limited.starts_with("#{") && limited.ends_with(",...}"));
     }
 }
