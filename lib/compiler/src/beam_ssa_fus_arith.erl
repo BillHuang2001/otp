@@ -39,9 +39,18 @@
 %%% vocabulary, and keeping a single copy keeps the two halves of the pass from
 %%% disagreeing about what "used nowhere else" means.
 %%%
-%%% THE SHAPE
+%%% THE SHAPES
 %%%
-%%% Every fold matches the same two-block shape. The first block LA ends with
+%%% The two operations of a chain are matched in one of two block shapes: the
+%%% two-block shape - in three tail variants, depending on what the type
+%%% analysis has already proven about the two operations - and the same-block
+%%% shape. All of them are folded by exactly the same table (`fold/5'), the same
+%%% construction (`fused_op/5') and the same rewrite rule: the fused instruction
+%%% takes the position (and the source location) of the first operation and the
+%%% NAME of the second one, so every use of `D2' stays valid and the
+%%% intermediate `D1' disappears.
+%%%
+%%% (1) The two-block shape. The first block LA ends with
 %%%
 %%%     ...                                          (Prefix)
 %%%     D1 = bif:Op1(V, K1)                          (K1 an integer literal)
@@ -59,11 +68,12 @@
 %%% location. `D2' keeps its name, so every use of `D2' - including uses beyond
 %%% LSucc - stays valid, and the intermediate `D1' disappears. In every
 %%% implemented fold the first operation is the one that survives, so the fused
-%%% BIF is always the BIF of the first operation; this is what lets the rewrite
-%%% reuse the first operation's `{succeeded,_}' guard unchanged.
+%%% BIF is always the BIF of the first operation; in the two-block shape this is
+%%% what lets the rewrite reuse the first operation's `{succeeded,_}' guard
+%%% unchanged.
 %%%
-%%% The two supported tail shapes differ in what the type analysis has already
-%%% done to the *second* operation:
+%%% The three supported tail shapes differ in what the type analysis has already
+%%% done to the two operations.
 %%%
 %%% Guarded (the shape of Fusion 4; `Guard' is reused for the fused
 %%% instruction, and the guard's destination is LA's branch variable):
@@ -97,8 +107,70 @@
 %%%     pass (`ssa_opt_merge_blocks' in the late epilogue) folds the emptied
 %%%     block away, so nothing is left behind in the generated code.
 %%%
-%%% Both shapes are recognized by `match/2'; which one applies is decided by
-%%% `fuse/3'.
+%%% Guard-free (the type analysis has proven that the FIRST operation cannot
+%%% fail either, so its `{succeeded,_}' marker and the branch on it are gone as
+%%% well; both edges of LA's branch now lead to LSucc):
+%%%
+%%%     LA:    ... D1 = bif:Op1(V, K1)
+%%%            br LSucc, LSucc                      (unconditional)
+%%%
+%%%     LA:    ... D2 = bif:FusedOp(V, FusedK)
+%%%            br LSucc, LSucc                      (unchanged)
+%%%     LSucc: <the rest of its instructions>        (Op2 removed)
+%%%            <the same terminator>
+%%%
+%%%     Again the block structure is kept - and this shape is not the same-block
+%%%     one below: the guard of the removed operation
+%%%     (`ssa_opt_live'/the type analysis) is not the same thing as the *merge*
+%%%     of its blocks, which only `ssa_opt_merge_blocks' performs in the late
+%%%     epilogue, i.e. after this pass has run. A chain whose first operation
+%%%     has been proven non-raising therefore sits in two blocks joined by an
+%%%     unconditional branch while this pass sees it, and it is this shape -
+%%%     not the same-block one - that Fusion 6 (c) and the bounded `div'/`rem'
+%%%     chains are matched in (their non-raising proof is exactly the bound
+%%%     `fold/5' requires, see `bounded_operand/1'): without it, the only shape
+%%%     left in the compiler for them would be one that does not exist yet.
+%%%
+%%% The three tail shapes are recognized by `match/2' (through
+%%% `match_two_block/2' and `match_no_guard/2'), and `fuse/3' decides which one
+%%% applies.
+%%%
+%%% (2) The same-block shape. If the two blocks of a chain have already been
+%%% merged - or were never split, e.g. inside code built by a different route -
+%%% the two operations are adjacent instructions of one block:
+%%%
+%%%     ...                                          (Prefix)
+%%%     D1 = bif:Op1(V, K1)                          (K1 an integer literal)
+%%%     D2 = bif:Op2(D1, K2)                         (K2 an integer literal)
+%%%     ...                                          (Rest)
+%%%
+%%% The pair is folded in place when the two instructions are *adjacent* - so
+%%% putting the fused instruction where the first operation was cannot reorder
+%%% anything - and when `D1' is used exactly once in the whole function
+%%% (`use_count/2'), that single use being the second operation. Any other use,
+%%% in this block's own tail, in another block or in a phi node, would observe
+%%% the eliminated value. The pair is then replaced inside the same block by the
+%%% single instruction
+%%%
+%%%     D2 = bif:FusedOp(V, FusedK)
+%%%
+%%% which leaves the block's terminator, the CFG (predecessors, successors and
+%%% their phi nodes) and every other instruction exactly as they were: nothing
+%%% is moved across a block boundary, so no dominance or phi question can arise.
+%%%
+%%% This shape is the one to fall back on when a chain has been merged into one
+%%% block before this pass runs. It is deliberately the LAST one `match/2' looks
+%%% for: a chain that is still split into two blocks is described by one of the
+%%% two-block shapes above, and those are the shapes the compiler actually
+%%% produces for a chain that straddles a guard (the guard, and with it the
+%%% block split, is created by `beam_core_to_ssa' for every operation that may
+%%% fail, and only the *guard* - not the split - is undone by the type analysis).
+%%%
+%%% The operand types are read from the first operation's `arg_types'
+%%% annotation in every shape (`anno_arg_type/1'). `match/2' tries the two
+%%% two-block shapes first and falls back to the same-block one, and `fuse/3'
+%%% folds them through `fuse_guarded/5', `fuse_unguarded/5', `fuse_no_guard/5'
+%%% and `fuse_same_block/5' respectively.
 %%%
 %%% WHAT IS FOLDED
 %%%
@@ -169,13 +241,19 @@
 %%%     `{succeeded,_}' guard the rewrite reuses, which is why rewriting the
 %%%     guard to test the fused instruction is sound (it amounts to what the
 %%%     type analysis does when it proves a guard cannot fail).
-%%%   * `D1' must not be used anywhere else (`use_count/2'): it is the
-%%%     intermediate the rewrite eliminates, and every other use would observe
-%%%     the eliminated value. Its uses are exactly the first operation's own
-%%%     guard and the second operation.
-%%%   * LSucc must have exactly one predecessor (LA), so the definition of `D2'
-%%%     that moves into LA still dominates every one of its former uses (LA
-%%%     dominates everything LSucc dominated).
+%%%   * The intermediate `D1' must not be used anywhere else (`use_count/2'):
+%%%     it is the value the rewrite eliminates, and every other use would
+%%%     observe it. Its uses are exactly the second operation - plus, in the
+%%%     two-block shape, the first operation's own guard, which the rewrite
+%%%     re-points at the fused instruction.
+%%%   * Two-block shape only: LSucc must have exactly one predecessor (LA), so
+%%%     the definition of `D2' that moves into LA still dominates every one of
+%%%     its former uses (LA dominates everything LSucc dominated).
+%%%   * Same-block shape only: the two operations must be adjacent instructions
+%%%     of one block, so that placing the fused one where the first one was
+%%%     cannot reorder anything. Nothing but that block's own instruction list
+%%%     changes: no block is added or removed, no branch is rewired, and every
+%%%     phi node stays valid, so no dominance question arises there.
 %%%   * The source location of the first operation (and of the guard) is kept,
 %%%     so error positions and stack traces are unchanged, and the type
 %%%     annotations of the rewritten instruction are dropped, since the value
@@ -244,7 +322,8 @@ fuse_blk(LA, Blk, Blocks) ->
 %% `beam_ssa_fus:has_candidate/1', which is the eligibility gate the opt-in
 %% per-pass budget/watchdog driver (`beam_ssa_opt_budget', wired in
 %% `beam_ssa_opt:gate/1') consults. True when the block is the head of a chain
-%% of a supported shape whose fold preconditions already hold.
+%% of a supported shape whose fold preconditions already hold - either the
+%% two-block shape or the same-block one (see the moduledoc).
 %%
 %% This is a NECESSARY condition, and exactly as strong as it needs to be: the
 %% rewrite is only ever attempted for a chain `match/2' recognizes and `fold/5'
@@ -262,11 +341,29 @@ candidate(Blk, Blocks) ->
             fold(Op1, Op2, K1, K2, anno_arg_type(Op1Set)) =/= false
     end.
 
-%% Match the two-block chain starting at `Blk'. Returns a map describing the
-%% pieces of the shape (see the moduledoc), or `false' when `Blk' is not the
-%% head of a chain of a supported shape.
+%% Match the chain head at `Blk'. Returns a map describing the pieces of the
+%% shape it matched (see the moduledoc), or `false' when `Blk' is not the head
+%% of a chain of a supported shape. The two-block shapes are tried first, then
+%% the same-block one.
+%%
+%% A chain of a given pair of instructions is described by exactly one shape
+%% here, so the order only decides which *pair* is folded first when a block is
+%% the head of more than one chain.
 -spec match(beam_ssa:b_blk(), beam_ssa:block_map()) -> false | map().
-match(#b_blk{is=Is,last=#b_br{bool=Bool,succ=LSucc,fail=LFail}=BrA}, Blocks) ->
+match(Blk, Blocks) ->
+    case match_two_block(Blk, Blocks) of
+        false ->
+            case match_no_guard(Blk, Blocks) of
+                false -> match_same_block(Blk);
+                Chain -> Chain
+            end;
+        Chain -> Chain
+    end.
+
+%% The two-block shape of the moduledoc.
+-spec match_two_block(beam_ssa:b_blk(), beam_ssa:block_map()) -> false | map().
+match_two_block(#b_blk{is=Is,last=#b_br{bool=Bool,succ=LSucc,fail=LFail}=BrA},
+                Blocks) ->
     case lists:reverse(Is) of
         [#b_set{op={succeeded,_},dst=Bool,args=[#b_var{}=D1]}=Guard,
          #b_set{op={bif,Op1},dst=D1,
@@ -308,15 +405,130 @@ match(#b_blk{is=Is,last=#b_br{bool=Bool,succ=LSucc,fail=LFail}=BrA}, Blocks) ->
         _ ->
             false
     end;
-match(_Blk, _Blocks) ->
+match_two_block(_Blk, _Blocks) ->
     false.
 
-%% The tail shapes of the moduledoc, decided by looking at the instructions
-%% behind the second operation and at its block's terminator. A single
-%% instruction behind it is its guard, which must then also be the block's
-%% branch (the shape of Fusion 4); with nothing behind it, the second operation
-%% is alone and the block is kept as an (emptied) jump block. Any other tail is
-%% rejected here, so that the rewrites can rely on the pieces they match.
+%% The guard-free two-block shape of the moduledoc: block LA ends with the first
+%% operation alone and branches to LSucc *unconditionally*, and LSucc starts
+%% with the second operation. This is the shape left behind when the type
+%% analysis has proven the FIRST operation non-raising: it folds the
+%% `{succeeded,_}' marker to the literal `true' (so the block no longer has the
+%% guard `match_two_block/2' looks for) and makes both edges of the branch point
+%% at LSucc, while the two blocks themselves are only merged much later, by
+%% `ssa_opt_merge_blocks' in the late epilogue - i.e. after this pass has run.
+%%
+%% This shape is what makes Fusion 6 (c) fire. Its non-raising precondition is
+%% the very bound `fold/5' requires of (c) (see `bounded_operand/1' and
+%% `beam_call_types:succeeds_if_smallish/1'), so whenever (c) is applicable the
+%% guard of the first operation is already gone by the time this pass runs -
+%% neither the guarded form of the two-block shape nor the same-block shape
+%% (which needs the merge that has not happened yet) can describe it.
+%%
+%% Only the branch is required to be unconditional (both edges to LSucc): the
+%% rewrite moves the definition of the second operation into LA, and an
+%% unconditional edge is what makes that unconditionally safe. The rest of the
+%% conditions are checked by `fuse_no_guard/5'.
+-spec match_no_guard(beam_ssa:b_blk(), beam_ssa:block_map()) -> false | map().
+match_no_guard(#b_blk{is=Is,last=#b_br{succ=LSucc,fail=LSucc}=BrA}=Blk, Blocks) ->
+    case lists:reverse(Is) of
+        [#b_set{op={bif,Op1},dst=D1,
+                args=[#b_var{}=V,#b_literal{val=K1}]}=Op1Set | RevPrefix]
+            when is_integer(K1) ->
+            case Blocks of
+                #{LSucc := #b_blk{is=[#b_set{op={bif,Op2},
+                                             args=[D1,#b_literal{val=K2}]}=Op2Set
+                                         | Rest],
+                                  last=Term}}
+                    when is_integer(K2) ->
+                    case fold_pair(Op1, Op2) of
+                        true ->
+                            D2 = Op2Set#b_set.dst,
+                            #{blk => Blk,
+                              prefix => lists:reverse(RevPrefix),
+                              op1 => Op1Set,
+                              op1name => Op1,
+                              op2 => Op2Set,
+                              op2name => Op2,
+                              dst1 => D1,
+                              dst2 => D2,
+                              var => V,
+                              k1 => K1,
+                              k2 => K2,
+                              lsucc => LSucc,
+                              lfail => LSucc,
+                              rest => Rest,
+                              term => Term,
+                              br => BrA,
+                              tail => no_guard};
+                        false ->
+                            false
+                    end;
+                #{} ->
+                    false
+            end;
+        _ ->
+            false
+    end;
+match_no_guard(_Blk, _Blocks) ->
+    false.
+
+%% The same-block shape of the moduledoc: two adjacent instructions of one
+%% block, `D1 = bif:Op1(V, K1)' immediately followed by `D2 = bif:Op2(D1, K2)'.
+%% The pair is looked for anywhere in the block, since nothing about it depends
+%% on the block's terminator, its successors or its position in the function.
+%%
+%% This is what lets the folds fire on a chain the type analysis has already
+%% proven non-raising throughout: for those, both operations live in one block
+%% and the guard that used to make the two-block shape recognizable has been
+%% folded to `true' and dropped (see the moduledoc).
+-spec match_same_block(beam_ssa:b_blk()) -> false | map().
+match_same_block(#b_blk{is=Is}=Blk) ->
+    match_same_block_is(Is, [], Blk).
+
+%% Scan the block for an adjacent foldable pair. Only the *shape* is decided
+%% here (`fold_pair/2'); whether the fold itself is provable is left to
+%% `fold/5', exactly as in the two-block path, and both the first and the second
+%% constant must be integer literals with the variable first, the same operand
+%% order requirement the two-block matcher has always imposed.
+-spec match_same_block_is([beam_ssa:b_set()], [beam_ssa:b_set()],
+                          beam_ssa:b_blk()) -> false | map().
+match_same_block_is([#b_set{op={bif,Op1},dst=D1,
+                            args=[#b_var{}=V,#b_literal{val=K1}]}=Op1Set,
+                     #b_set{op={bif,Op2},dst=D2,
+                            args=[D1,#b_literal{val=K2}]}=Op2Set | Rest],
+                    RevPrefix, Blk)
+  when is_integer(K1), is_integer(K2), D1 =/= D2 ->
+    case fold_pair(Op1, Op2) of
+        true ->
+            #{blk => Blk,
+              prefix => lists:reverse(RevPrefix),
+              op1 => Op1Set,
+              op1name => Op1,
+              op2 => Op2Set,
+              op2name => Op2,
+              dst1 => D1,
+              dst2 => D2,
+              var => V,
+              k1 => K1,
+              k2 => K2,
+              rest => Rest,
+              tail => same_block};
+        false ->
+            %% Not a foldable pair; the second operation may still start one.
+            match_same_block_is([Op2Set | Rest], [Op1Set | RevPrefix], Blk)
+    end;
+match_same_block_is([Set | Is], RevPrefix, Blk) ->
+    match_same_block_is(Is, [Set | RevPrefix], Blk);
+match_same_block_is([], _RevPrefix, _Blk) ->
+    false.
+
+%% The tail shapes of the two-block shape, decided by looking at the
+%% instructions behind the second operation and at its block's terminator. A
+%% single instruction behind it is its guard, which must then also be the
+%% block's branch (the shape of Fusion 4); with nothing behind it, the second
+%% operation is alone and the block is kept as an (emptied) jump block. Any
+%% other tail is rejected here, so that the rewrites can rely on the pieces
+%% they match.
 -spec classify([beam_ssa:b_set()], beam_ssa:terminator(), beam_ssa:b_var(),
                map()) -> false | map().
 classify([#b_set{op={succeeded,_},dst=B2,args=[D2]}],
@@ -340,7 +552,9 @@ fuse(#{op1 := Op1Set, op1name := Op1, op2name := Op2, k1 := K1, k2 := K2}=Chain,
         {FusedOp,FusedK} ->
             case maps:get(tail, Chain) of
                 guarded -> fuse_guarded(Chain, FusedOp, FusedK, LA, Blocks);
-                unguarded -> fuse_unguarded(Chain, FusedOp, FusedK, LA, Blocks)
+                unguarded -> fuse_unguarded(Chain, FusedOp, FusedK, LA, Blocks);
+                no_guard -> fuse_no_guard(Chain, FusedOp, FusedK, LA, Blocks);
+                same_block -> fuse_same_block(Chain, FusedOp, FusedK, LA, Blocks)
             end
     end.
 
@@ -457,6 +671,112 @@ unguarded_ok(LA, LSucc, D1, Type, Blocks) ->
     %% then observe the eliminated value.
     andalso use_count(D1, Blocks) =:= 2.
 
+%%============================================================================
+%% Guard-free two-block tail: LA ends with the first operation alone and
+%% branches to LSucc unconditionally (its `{succeeded,_}' guard has been folded
+%% away by the type analysis), and LSucc starts with the second operation. As in
+%% the unguarded tail, the block structure is kept; unlike it, there is no guard
+%% left in LA to re-point at the fused instruction.
+%%============================================================================
+
+fuse_no_guard(#{blk := Blk, prefix := Prefix, op1 := Op1Set, dst1 := D1,
+                dst2 := D2, var := V, lsucc := LSucc, rest := Rest},
+              FusedOp, FusedK, LA, Blocks) ->
+    case no_guard_ok(LA, LSucc, D1, Blocks) of
+        true ->
+            Fused = fused_op(Op1Set, FusedOp, FusedK, D2, V),
+            %% The fused instruction takes the place (and the name, position and
+            %% source location) of the first operation. LA's terminator already
+            %% leads to LSucc on both edges, so it is left exactly as it is; only
+            %% the second operation leaves LSucc, whose own terminator and whose
+            %% instructions behind the removed one stay untouched (the definition
+            %% of D2 keeps its name, so its former uses are not affected).
+            A1 = Blk#b_blk{is=Prefix ++ [Fused]},
+            #b_blk{}=Blk2 = maps:get(LSucc, Blocks),
+            Succ = Blk2#b_blk{is=Rest},
+            {yes, Blocks#{LA => A1, LSucc => Succ}};
+        false ->
+            no
+    end;
+%% As in the other rewrites: decline rather than rewrite something unproven.
+fuse_no_guard(_Chain, _FusedOp, _FusedK, _LA, _Blocks) ->
+    no.
+
+%% The conditions that must hold for the guard-free rewrite to be provably
+%% valid. Beyond what `fold/5' has already established (the integrality of `V'
+%% and the properties of the two constants, read from the first operation) there
+%% are three:
+%%
+%%   * LSucc is exclusively reached from LA (`preds/2'), so the definition of
+%%     `D2' that moves into LA still dominates every one of its former uses -
+%%     both in the instructions of LSucc that stay behind and in everything
+%%     LSucc dominates.
+%%   * LSucc is not LA itself, which would make the two block updates below
+%%     refer to the same block and lose one of them.
+%%   * `D1' is used exactly once in the whole function (`use_count/2'): its only
+%%     use is the second operation, which the rewrite removes. Any other use -
+%%     in another instruction of LA (in particular its terminator, which would
+%%     be a branch on the intermediate), in LSucc or in a phi node - would
+%%     observe the eliminated value.
+%%
+%% The branch that carries the chain is already known to be unconditional, and
+%% neither LA nor LSucc may be the exception pseudo block: taking a definition
+%% into or out of it is not an ordinary block rewrite.
+-spec no_guard_ok(beam_ssa:label(), beam_ssa:label(), beam_ssa:b_var(),
+                  beam_ssa:block_map()) -> boolean().
+no_guard_ok(LA, LSucc, D1, Blocks) ->
+    Special = ?EXCEPTION_BLOCK,
+    LSucc =/= LA
+    andalso LSucc =/= Special
+    andalso LA =/= Special
+    andalso preds(LSucc, Blocks) =:= [LA]
+    andalso use_count(D1, Blocks) =:= 1.
+
+%%============================================================================
+%% Same-block tail: the two operations are adjacent instructions of the matched
+%% block, because the type analysis has already folded away the guard of the
+%% first one (and merged the two blocks). The rewrite touches that block's
+%% instruction list and nothing else.
+%%============================================================================
+
+fuse_same_block(#{blk := Blk, prefix := Prefix, op1 := Op1Set, dst1 := D1,
+                  dst2 := D2, var := V, rest := Rest},
+                FusedOp, FusedK, LA, Blocks) ->
+    case use_count(D1, Blocks) =:= 1 of
+        true ->
+            Fused = fused_op(Op1Set, FusedOp, FusedK, D2, V),
+            %% The pair `[Op1Set, Op2Set]' is replaced by the single fused
+            %% instruction, in the position of the first operation and under
+            %% the name of the second one; the terminator and the block's other
+            %% instructions (including anything between the pair and the
+            %% terminator) are untouched. `D1' - used nowhere else - becomes
+            %% dead and its definition is gone, so no dead instruction is left
+            %% behind.
+            A1 = Blk#b_blk{is=Prefix ++ [Fused | Rest]},
+            {yes, Blocks#{LA => A1}};
+        false ->
+            no
+    end;
+%% As in fuse_guarded/5 and fuse_unguarded/5: only reachable if match/2 ever
+%% hands over a shape this function does not describe (a same-block chain whose
+%% intermediate has more than one use is simply declined).
+fuse_same_block(_Chain, _FusedOp, _FusedK, _LA, _Blocks) ->
+    no.
+
+%% There is exactly one condition to check for the same-block rewrite, and it is
+%% the reason `D1' may be eliminated: the intermediate is used exactly once in
+%% the whole function, that use being the second operation. Nothing else can
+%% observe it - no other instruction of this block (before the pair, between it
+%% and the terminator, or in the terminator itself), no instruction of another
+%% block and no phi node, which `use_count/2' counts as a use like any other.
+%%
+%% Everything else the fold needs was already checked by `fold/5' (the
+%% integrality of `V', the nonzero divisors, the divisibility and - for Fusion
+%% 6 (c) - the finiteness of `V' and the smallness of the constant), on the
+%% very same `arg_types' annotation the two-block path reads. No CFG condition
+%% is needed here: the rewrite does not move a definition across a block
+%% boundary, does not remove or add a block, and does not rewire a branch, so
+%% the dominance of `D2' and every phi node keep holding as they did.
 %%============================================================================
 %% The folds
 %%============================================================================
