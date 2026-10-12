@@ -26,6 +26,12 @@
 //! root and is scanned. [`Registers::gather_roots`] produces exactly that flat slice and
 //! [`Registers::scatter_roots`] writes the reloaded words back after a collection.
 //!
+//! [`Registers::extra_roots`] is the one escape hatch from that closed shape: a host-published
+//! root set for terms it holds **outside** `x`/stack (the motivating case is a parked engine
+//! `Machine`'s live `pending_exception` reason term, which `beam_rt` owns while the process
+//! waits). It is gathered **after** the stack words and scattered back the same way, so those
+//! terms are relocated with the rest of the heap and cannot dangle into the evacuated from-space.
+//!
 //! Legacy C ground truth (read-only): `erts/emulator/beam/erl_vm.h` (`MAX_REG`, `MAX_ARG`)
 //! and the `registers`/`E`/`HTOP` accessors of `erl_process.h`.
 
@@ -180,18 +186,24 @@ impl Stack {
     }
 }
 
-/// The complete root-set container: the x-register file plus the Erlang stack.
+/// The complete root-set container: the x-register file, the Erlang stack, and the
+/// host-published extra roots.
 pub struct Registers {
     x: XRegs,
     stack: Stack,
+    /// Terms a host holds **outside** `x`/`stack` but that must survive a relocation (e.g. a
+    /// parked engine machine's live pending-exception reason term). Gathered after the stack
+    /// words; see [`Registers::gather_roots`]/[`Registers::scatter_roots`].
+    extra_roots: Vec<Eterm>,
 }
 
 impl Registers {
-    /// Empty registers: all-`NIL` x-registers, nothing live, an empty stack.
+    /// Empty registers: all-`NIL` x-registers, nothing live, an empty stack, no extra roots.
     pub fn new() -> Registers {
         Registers {
             x: XRegs::new(),
             stack: Stack::new(),
+            extra_roots: Vec::new(),
         }
     }
 
@@ -215,17 +227,37 @@ impl Registers {
         &mut self.stack
     }
 
-    /// Appends the root words to `out` — `x[0..live)` first, then every stack word — and
-    /// returns the split point (`x_live`), the number of leading x-register words written.
+    /// The host-published extra roots — terms held outside `x`/`stack` that a collection must
+    /// relocate with the rest of the heap.
+    pub fn extra_roots(&self) -> &[Eterm] {
+        &self.extra_roots
+    }
+
+    /// The host-published extra roots, mutably.
+    ///
+    /// A `&mut Vec` (rather than a by-value setter) is the right shape because the host edits
+    /// this set **incrementally around the yield/resume pair**: it `push`es the parked machine's
+    /// live terms when the process suspends and `clear`s them once the machine has consumed the
+    /// relocated values — keeping terms resident across an arbitrary number of collections in
+    /// between, with no ownership hand-off and no copy.
+    pub fn extra_roots_mut(&mut self) -> &mut Vec<Eterm> {
+        &mut self.extra_roots
+    }
+
+    /// Appends the root words to `out` — `x[0..live)` first, then every stack word, then every
+    /// extra root — and returns the split point (`x_live`), the number of leading x-register
+    /// words written.
     pub fn gather_roots(&self, out: &mut Vec<Eterm>) -> usize {
         let x_live = self.x.live();
         out.extend_from_slice(self.x.live_slice());
         out.extend_from_slice(self.stack.as_slice());
+        out.extend_from_slice(&self.extra_roots);
         x_live
     }
 
-    /// Writes the (relocated) root words back: the first `x_live` into `x[0..live)` and the
-    /// remainder into the stack, exactly reversing [`Registers::gather_roots`].
+    /// Writes the (relocated) root words back: the first `x_live` into `x[0..live)`, the next
+    /// `stack.len()` into the stack, and the remainder into [`Registers::extra_roots`] — exactly
+    /// reversing [`Registers::gather_roots`] for the slice length it produced.
     pub fn scatter_roots(&mut self, roots: &[Eterm], x_live: usize) {
         // Defensive clamping: `gather_roots` always reports a split consistent with
         // `roots` and the collector preserves the slice length, so these `min`s are
@@ -240,6 +272,16 @@ impl Registers {
             self.stack.as_mut_slice()[..stack_count]
                 .copy_from_slice(&rest[..stack_count]);
         }
+
+        // Whatever trails the stack is the extra-root set, in gather order. Like the x-prefix and
+        // the stack, the container **keeps its length**: the covered words are overwritten and an
+        // uncovered tail (a caller-mismatched short slice) is left as it was, so a host-published
+        // root is never silently dropped mid-relocation.
+        let extra = &rest[stack_count..];
+        let extra_count = extra.len().min(self.extra_roots.len());
+        if extra_count > 0 {
+            self.extra_roots[..extra_count].copy_from_slice(&extra[..extra_count]);
+        }
     }
 }
 
@@ -247,7 +289,7 @@ impl Registers {
 mod tests {
     //! Unit tests for the root-set containers: live bounds and the `get`/`set` range
     //! errors, stack push/pop, and the `gather_roots`/`scatter_roots` round-trip
-    //! (including the split point).
+    //! (including the split point and the extra-root tail).
 
     use beam_common::BeamError;
     use beam_term::prelude::{make_small, NIL};
@@ -361,6 +403,123 @@ mod tests {
         );
         // Registers beyond the live prefix are untouched.
         assert!(regs.x().get(2).is_err());
+    }
+
+    #[test]
+    fn gather_appends_extra_roots_after_the_stack_words() {
+        let mut regs = Registers::new();
+        regs.x_mut().set_live(1).expect("1 <= MAX_REG");
+        regs.x_mut().set(0, make_small(10)).expect("live");
+        regs.stack_mut().push(make_small(30));
+        regs.extra_roots_mut().push(make_small(50));
+        regs.extra_roots_mut().push(make_small(60));
+
+        let mut roots = Vec::new();
+        let x_live = regs.gather_roots(&mut roots);
+        assert_eq!(x_live, 1);
+        // x prefix, then stack, then the extra-root tail — in that fixed order.
+        assert_eq!(
+            roots,
+            vec![
+                make_small(10),
+                make_small(30),
+                make_small(50),
+                make_small(60)
+            ]
+        );
+        assert_eq!(regs.extra_roots(), &[make_small(50), make_small(60)]);
+    }
+
+    #[test]
+    fn scatter_restores_x_stack_and_extra_roots() {
+        let mut regs = Registers::new();
+        regs.x_mut().set_live(2).expect("2 <= MAX_REG");
+        regs.x_mut().set(0, make_small(10)).expect("live");
+        regs.x_mut().set(1, make_small(20)).expect("live");
+        regs.stack_mut().push(make_small(30));
+        regs.stack_mut().push(make_small(40));
+        regs.stack_mut().push(make_small(50));
+        regs.extra_roots_mut().push(make_small(60));
+
+        let mut roots = Vec::new();
+        let x_live = regs.gather_roots(&mut roots);
+        assert_eq!(x_live, 2);
+        assert_eq!(roots.len(), 6);
+
+        // The collector relocated them all; scatter must write each region back exactly.
+        let relocated = [
+            make_small(110),
+            make_small(120),
+            make_small(130),
+            make_small(140),
+            make_small(150),
+            make_small(160),
+        ];
+        regs.scatter_roots(&relocated, x_live);
+
+        assert_eq!(regs.x().get(0).expect("live"), make_small(110));
+        assert_eq!(regs.x().get(1).expect("live"), make_small(120));
+        assert_eq!(
+            regs.stack().as_slice(),
+            &[make_small(130), make_small(140), make_small(150)]
+        );
+        assert_eq!(regs.extra_roots(), &[make_small(160)]);
+
+        // A second round-trip is stable: gather sees exactly what scatter wrote.
+        let mut again = Vec::new();
+        assert_eq!(regs.gather_roots(&mut again), 2);
+        assert_eq!(again, relocated);
+    }
+
+    #[test]
+    fn gather_and_scatter_without_extra_roots_is_the_closed_root_set() {
+        // The degenerate case: no extra roots ⇒ the slice is exactly x + stack, and the empty
+        // extra-root container stays empty.
+        let mut regs = Registers::new();
+        assert!(regs.extra_roots().is_empty());
+        regs.x_mut().set_live(1).expect("1 <= MAX_REG");
+        regs.stack_mut().push(make_small(7));
+
+        let mut roots = Vec::new();
+        let x_live = regs.gather_roots(&mut roots);
+        assert_eq!(x_live, 1);
+        assert_eq!(roots, vec![NIL, make_small(7)]);
+
+        regs.scatter_roots(&roots, x_live);
+        assert!(regs.extra_roots().is_empty());
+        assert_eq!(regs.stack().as_slice(), &[make_small(7)]);
+        assert_eq!(regs.x().get(0).expect("live"), NIL);
+    }
+
+    #[test]
+    fn scatter_shorter_than_the_root_set_is_clamped_and_total() {
+        // Defensive: a slice shorter than the gather produced leaves the uncovered tail
+        // untouched — including a published extra root — and never panics.
+        let mut regs = Registers::new();
+        regs.x_mut().set_live(2).expect("2 <= MAX_REG");
+        regs.x_mut().set(0, make_small(10)).expect("live");
+        regs.x_mut().set(1, make_small(20)).expect("live");
+        regs.stack_mut().push(make_small(30));
+        regs.extra_roots_mut().push(make_small(40));
+
+        // Only the x prefix: stack and extra roots are left as they were.
+        regs.scatter_roots(&[make_small(110), make_small(120)], 2);
+        assert_eq!(regs.x().get(0).expect("live"), make_small(110));
+        assert_eq!(regs.x().get(1).expect("live"), make_small(120));
+        assert_eq!(regs.stack().as_slice(), &[make_small(30)]);
+        assert_eq!(regs.extra_roots(), &[make_small(40)]);
+
+        // A split past the end (and past `live`) writes nothing at all.
+        regs.scatter_roots(&[], 99);
+        assert_eq!(regs.x().get(0).expect("live"), make_small(110));
+        assert_eq!(regs.stack().as_slice(), &[make_small(30)]);
+        assert_eq!(regs.extra_roots(), &[make_small(40)]);
+
+        // A slice long enough for x + stack but short of the extra-root tail leaves the
+        // uncovered extra root untouched rather than clearing it.
+        regs.scatter_roots(&[make_small(210), make_small(220), make_small(230)], 2);
+        assert_eq!(regs.stack().as_slice(), &[make_small(230)]);
+        assert_eq!(regs.extra_roots(), &[make_small(40)]);
     }
 
     #[test]
