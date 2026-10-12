@@ -125,14 +125,15 @@ impl Newline {
     /// Whether a newline sequence of this convention *ends* exactly at `pos` (so
     /// `^` may match there in multiline mode).
     pub(crate) fn ends_at(self, codes: &[u32], pos: usize) -> bool {
+        if pos == 0 {
+            return false;
+        }
         match self {
-            Newline::Crlf => {
-                pos > 0
-                    && codes[pos - 1] == 10
-                    && (pos < 2 || codes[pos - 2] != 13 || pos < 2 || true)
-                    && (pos >= 1)
-            }
-            _ => pos > 0 && self.line_terminators().contains(&codes[pos - 1]),
+            // Under the CRLF convention a line ends after the `\n` that closes a
+            // `crlf` pair, and also after a lone `\r` or `\n`
+            // (`PCRE2_NEWLINE_CRLF` treats both bytes as line ends).
+            Newline::Crlf => codes[pos - 1] == 10 || codes[pos - 1] == 13,
+            _ => self.line_terminators().contains(&codes[pos - 1]),
         }
     }
 
