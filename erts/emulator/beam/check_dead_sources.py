@@ -9,21 +9,26 @@
 #   differential oracle for the erts_rust/ rewrite, so it must only ever shrink
 #   by files that are PROVABLY unreferenced.  A full ERTS compile is far too
 #   expensive to use as the bar, so this script produces the mechanical
-#   reference proof instead.
+#   reference proof instead.  A false "dead" verdict is the one failure mode
+#   that matters, so every reference class below errs towards KEEPING a file.
 #
 # WHAT IT PROVES (decisive reference classes)
-#   A  BUILD REFERENCE  - the file's stem appears as a whole word (or the full
-#                         basename appears verbatim) in a build/config source:
-#                         Makefile*, *.mk, *.in, *.m4, *.ac, *.am, *.tab, *.src,
-#                         *.spec, *.sh, *.bat, *.def, *.nix, *.toml, *.exs,
-#                         *.escript, *.erl, *.hrl, configure*, otp_build, CI
-#                         yaml.  A $(wildcard ...) pattern that matches the path
-#                         also counts.
+#   A  BUILD/SCRIPT REFERENCE - a real build or script source names the file:
+#      - the candidate's basename appears VERBATIM (e.g. "foo_drv.c") in any
+#        build/script source (.sh, .erl/.hrl, .escript, .nix, .toml, .yml/.yaml,
+#        Makefile*, *.mk/*.in/*.src/*.spec/*.rel/*.def/*.cmake/*.cfg/*.pro,
+#        *.ac/*.m4/.configure, otp_build, CI yaml, xcomp/*.conf, the
+#        extension-less codegen tools in erts/emulator/utils/, *.S, ...), or
+#      - the candidate's stem appears as a whole word in a makefile-role source
+#        (Makefile*, *.mk, *.in, *.m4, *.ac, *.am, *.tab, *.src, *.spec, *.rel,
+#        *.def, *.cmake, *.cfg, *.pro, *.bat, configure*, otp_build, the codegen
+#        tools, xcomp/*.conf), or
+#      - a $(wildcard ...) pattern matches the path.
 #   B  INCLUDE REFERENCE - an #include of the basename (or a path ending in it)
-#                         in any other C-family source.
+#                        in any other C-family source.
 #   C  SYMBOL REFERENCE - an identifier the file defines (function definition,
-#                         #define, typedef name) appears as a whole word in any
-#                         other C-family or build/config source.
+#                        #define, typedef name) appears as a whole word in any
+#                        other C-family or build/config source.
 #
 #   Only whole-word matches count, so the stem "bin_drv" is NOT considered
 #   referenced by the unrelated identifier "erts_bin_drv_alloc".  Files whose
@@ -40,22 +45,49 @@
 #   STRICT (decisive)   A fixpoint / transitive-closure liveness analysis over
 #                       the build wiring.  A file is LIVE if it is
 #                         (a) a compilation unit named by a real object-list
-#                             entry (both the "$(VAR:%=prefix/%.o)" and the
-#                             "$(VAR:.c=.o)" substitution forms - zlib's
-#                             ZLIB_FILES, ryu's RYU_FILES, lib_src's
-#                             ETHREAD_LIB_SRC - are resolved back to the
-#                             sources they name), or covered by a
-#                             $(wildcard ...) pattern, or
-#                         (b) reached from a live file through an #include of its
+#                             entry - every make synthesis form is resolved back
+#                             to the sources it names:
+#                               $(VAR:%=$(OBJDIR)/%.o)      ($(VAR:.c=.o))
+#                               $(patsubst %.c,$(OBJDIR)/%.o,$(VAR))
+#                               $(VAR:%=prefix/%.c)         (source-naming)
+#                               $(addprefix D,$(notdir $(VAR:.c=.o)))
+#                             - or covered by a $(wildcard ...) pattern, or
+#                         (b) named by a build/script/codegen source (class A
+#                             above: verbatim basename, or makefile-role stem), or
+#                         (c) a driver/NIF test fixture owned by its CT suite
+#                             (*_SUITE_data/ fixture named by the fixture's own
+#                             Makefile or by the owning *_SUITE.erl), or
+#                         (d) reached from a live file through an #include of its
 #                             basename or through a symbol it defines.
 #                       Everything else is STRICT DEAD.  Only candidate files
 #                       (C-family sources) propagate liveness, so a reference
-#                       that comes solely from a CT *.erl suite, a CI yaml, a
-#                       doc or an already-dead file does NOT make a file live.
+#                       that comes solely from a DOC still does NOT make a file
+#                       live.  Text inside a never-compiled #if region (see the
+#                       advisory section) does not count as a reference either.
 #                       The deletion gate is "STRICT DEAD and not exempt" = 0.
 #   LOOSE (advisory)    The original single-pass A/B/C reference classes plus the
 #                       per-file exemptions.  Reported for context only; it is
-#                       NOT the deletion gate.
+#                       NOT the deletion gate.  "documentation-only" mentions
+#                       remain non-decisive in both tiers.
+#
+# NEVER-COMPILED #if REGIONS (advisory report section, never decisive)
+#   `#ifdef M` / `#if defined(M)` regions whose controlling macro M is never
+#   definable in this tree are reported as `file:line` + macro.  "Never
+#   definable" means, conservatively, ALL of:
+#     - M is not #define'd in any tracked source,
+#     - M is not a -D flag anywhere (Makefile/*.in, scripts, CI, ...),
+#     - M is not AC_DEFINE'd (configure.ac/xcomp) and not a config.h.in template
+#       (#undef) entry,
+#     - M is not a compiler/toolchain builtin or platform name (names starting
+#       with "_" or containing "__", HAVE_*, ERLANG_OSTYPE, DEBUG*, ETHR_*,
+#       AO_*, ZLIB*, PCRE*, ASMJIT*, ...),
+#     - M occurs in the WHOLE tree only on preprocessor condition lines (so it is
+#       not defined by a generator nor used by any code either).
+#   Anything not decidable that way is left SILENT (no false positives), and a
+#   condition that is not a single macro (arithmetic, &&/||, function-like) is
+#   never reported.  `#ifndef M` with such an M is ALWAYS compiled, so its body
+#   is not a dead region and is not reported.  These findings NEVER change the
+#   strict/actionable verdict or the exit status.
 #
 # USAGE
 #   python3 check_dead_sources.py                       # default --root erts
@@ -72,9 +104,11 @@
 
 import argparse
 import fnmatch
+import os
 import re
 import subprocess
 import sys
+import tempfile
 from collections import Counter, deque
 from pathlib import Path
 
@@ -89,12 +123,21 @@ BUILD_NAMES = {"makefile", "otp_build", "configure", "configure.ac", "configure.
 BUILD_EXTS = {".mk", ".in", ".m4", ".ac", ".am", ".tab", ".src", ".rel", ".spec",
               ".sh", ".bat", ".def", ".nix", ".toml", ".exs", ".escript", ".erl",
               ".hrl", ".yml", ".yaml", ".cmake", ".mk.in", ".cfg", ".pro"}
+# Assembly inputs are build sources too (they are compiled, not merely data).
+ASM_EXTS = {".s"}
 
 # Never a reference source: markdown/doc files and this tool's own output (which
 # lists the very names we are testing for).
 DOC_EXTS = {".md", ".markdown", ".rst", ".txt"}
 SELF_EXCLUDE = {"erts/emulator/beam/check_dead_sources.py",
                 "erts/emulator/beam/dead_source_report.txt"}
+
+# Directories whose files are build/codegen inputs even without a recognised
+# suffix: the codegen tools (beam_makeops, make_tables, make_preload, ...) are
+# EXTENSION-LESS, erts/preloaded/src/ holds add_abstract_code + the preloaded
+# *.erl, and xcomp/ holds the cross-compilation descriptions (*.conf/.template).
+CODEGEN_DIRS = ("erts/emulator/utils/", "erts/preloaded/src/")
+XCOMP_PREFIX = "xcomp/"
 
 # Unreferenced but intentionally retained, with the reason (checked before a file
 # is ever reported as deletable, by BOTH the loose and the strict tier).
@@ -143,16 +186,51 @@ FUNC_LINE_RE = re.compile(r"^([A-Za-z_][\w \t\*]*?)\b([A-Za-z_]\w*)\s*\(", re.M)
 GVAR_LINE_RE = re.compile(r"^([A-Za-z_][\w \t\*]*?)\b([A-Za-z_]\w*)\s*(\[[^\]]*\])?\s*=", re.M)
 HEADER_EXTS = {".h", ".hpp", ".inc"}
 
-# "$(VAR:%=$(OBJDIR)/%.o)" / "$(VAR:.c=.o)" - the object list is synthesized
-# from VAR's contents, so VAR's assignment must be resolved to recover the
-# sources it names (zlib's ZLIB_FILES, ryu's RYU_FILES, lib_src's
-# ETHREAD_LIB_SRC / ERTS_INTERNAL_LIB_SRCS, ...).
+# Object lists synthesised from a source registry - the object list names no
+# object token at all, so the registry variable must be resolved back to the
+# sources it names.
+#   $(VAR:%=$(OBJDIR)/%.o) / $(VAR:.c=.o)        - zlib's ZLIB_FILES, lib_src's
+#                                                  ETHREAD_LIB_SRC, ...
 SUBST_O_RE = re.compile(r"\$\(([A-Za-z_]\w*)\s*:((?:[^()\n]|\$\([^)\n]*\))*?\.o)\)")
+#   $(patsubst %.c,$(OBJDIR)/%.o,$(VAR))         - ASMJIT_OBJS over ASMJIT_CPP
+PATSUBST_O_RE = re.compile(r"\$\(\s*patsubst\s+%\.(?:c|cpp|cc)\s*,\s*"
+                           r"(?:[^,()\n]|\$\([^)\n]*\))*?%\.o\s*,\s*\$\(([A-Za-z_]\w*)\)\s*\)")
+#   $(VAR:%=prefix/%.c)                          - ryu's RYU_SRC, zlib's ZLIB_SRC
+REGISTRY_SRC_RE = re.compile(r"\$\(\s*([A-Za-z_]\w*)\s*:\s*%=\s*([^)\n]*?%\.(?:c|cpp|cc))\s*\)")
+#   $(addprefix $(OBJDIR)/,$(notdir $(VAR:.c=.o))) - ERTS_INTERNAL_LIB_OBJS
+ADDPREFIX_NOTDIR_RE = re.compile(r"\$\(\s*addprefix\s+[^,()\n]*,\s*\$\(\s*notdir\s+"
+                                 r"\$\(\s*([A-Za-z_]\w*)\s*:\s*\.c\s*=\s*\.o\s*\)\s*\)\s*\)")
 MAKE_ASSIGN_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*[:+]?=\s*(.*)$")
 # One item of a make variable that names sources: a bare object stem ("adler32")
 # or a source file, possibly reached through a make variable
 # ("$(ETHR_THR_LIB_BASE_DIR)/ethr_event.c").
 SRC_TOKEN_RE = re.compile(r"^(?:[A-Za-z_][\w.\-]*|[^\s\\]*\.(?:c|cpp|cc))$")
+
+# Macro definitions that mark a name as "definable" anywhere in the tree.
+DFLAG_RE = re.compile(r"(?<![\w-])-D\s*([A-Za-z_]\w*)")
+AC_DEFINE_RE = re.compile(r"AC_DEFINE(?:_UNQUOTED)?\(\s*([A-Za-z_]\w*)")
+UNDEF_RE = re.compile(r"^\s*#\s*undef\s+([A-Za-z_]\w*)", re.M)
+# A preprocessor condition/undef line (used to prove that a macro name occurs
+# ONLY as a condition, i.e. is neither defined nor used by any code).
+COND_LINE_RE = re.compile(r"^[ \t]*#[ \t]*(?:if|ifdef|ifndef|elif|undef)[^\n]*$", re.M)
+PP_LINE_RE = re.compile(r"^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b[ \t]*(.*?)[ \t]*$")
+IDENT_RE = re.compile(r"^[A-Za-z_]\w*$")
+# Same idea as COND_LINE_RE, but applied to a single grep'd line.
+COND_PREFIX_RE = re.compile(r"[ \t]*#[ \t]*(?:if|ifdef|ifndef|elif|undef)\b")
+# Every spelling that defines/undeclares a macro anywhere in the tree.
+DEF_NAME_RES = (re.compile(r"^[ \t]*#[ \t]*(?:define|undef)[ \t]+([A-Za-z_]\w*)", re.M),
+                re.compile(r"(?<![\w-])-D[ \t]*([A-Za-z_]\w*)"),
+                re.compile(r"AC_DEFINE(?:_UNQUOTED)?\([ \t]*([A-Za-z_]\w*)"))
+
+# Conservative allow-list for the never-compiled-block detector: names in the
+# compiler/platform/toolchain namespaces can always be defined outside the
+# tracked sources (command line, compiler builtin, system/3PP headers), so a
+# region guarded by them is never reported.
+KNOWN_MACROS = {
+    "unix", "linux", "WIN32", "APPLE", "DARWIN", "POSIX", "VXWORKS", "SOLARIS",
+    "FREEBSD", "OPENBSD", "NETBSD", "_REENTRANT", "NDEBUG", "DEBUG", "ERLANG_OSTYPE",
+}
+MACRO_BUILTIN_PREFIXES = ("DEBUG", "NDEBUG", "ETHR_", "AO_", "EI_", "ZLIB", "PCRE", "ASMJIT", "Z_")
 
 C_KEYWORDS = {
     "if", "else", "for", "while", "do", "switch", "case", "default", "return",
@@ -203,6 +281,47 @@ def tracked_files():
     return [Path(p) for p in out.decode("utf-8", "replace").split("\0") if p]
 
 
+def guard_evidence(names):
+    """Where the never-compiled-block guard names occur, in ONE git grep pass.
+
+    Returns (guard_ok, defined) where
+      guard_ok[name]  is True iff EVERY occurrence of `name` in the tree is on a
+                      preprocessor condition line (i.e. no code and no generator
+                      ever uses or defines it), and
+      defined         is the set of names some source defines (-D / #define /
+                      #undef / AC_DEFINE).
+    Returns None when git grep is unavailable; the caller then scans every file.
+    """
+    if not names:
+        return {}, set()
+    fd, pat_file = tempfile.mkstemp(prefix="cds_patterns_")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write("\n".join(sorted(names)) + "\n")
+        res = subprocess.run(["git", "-C", str(ROOT), "grep", "-I", "-n", "-F",
+                              "-f", pat_file, "--", ":/"], capture_output=True)
+        if res.returncode not in (0, 1):        # 1 = no match
+            return None
+        guard_ok, defined = {}, set()
+        for line in res.stdout.decode("utf-8", "replace").splitlines():
+            _rel, sep, rest = line.partition(":")
+            lineno, sep2, content = rest.partition(":")
+            if not sep or not sep2:
+                continue
+            if not lineno.isdigit():
+                continue                        # unexpected format: stay silent
+            if not COND_PREFIX_RE.match(content):
+                for n in names.intersection(TOKEN_RE.findall(content)):
+                    guard_ok[n] = False
+            for rx in DEF_NAME_RES:
+                defined.update(n for n in rx.findall(content) if n in names)
+        for n in names:
+            guard_ok.setdefault(n, True)
+        return guard_ok, defined
+    finally:
+        os.unlink(pat_file)
+
+
 def read_text(path):
     try:
         data = (ROOT / path).read_bytes()
@@ -216,15 +335,29 @@ def read_text(path):
         return None
 
 
+def is_codegen_source(path):
+    """Extension-less codegen tools and other build inputs that a plain suffix
+    test misses (erts/emulator/utils/beam_makeops, .../make_tables,
+    erts/preloaded/src/add_abstract_code)."""
+    s = str(path)
+    if s.startswith(CODEGEN_DIRS):
+        return True
+    return s.startswith(XCOMP_PREFIX)
+
+
 def is_makefile_source(path):
     """Sources that wire files into a build (object lists, wildcards, CI)."""
     name = path.name
     if name.startswith("Makefile") or name in (
             "otp_build", "otp_patch_apply", "erl-build-tool-vars.sh", "configure"):
         return True
+    if is_codegen_source(path):
+        return True
+    if path.suffix.lower() in ASM_EXTS:
+        return True
     return path.suffix.lower() in {".mk", ".in", ".m4", ".ac", ".am", ".tab",
                                   ".src", ".spec", ".rel", ".def", ".cmake",
-                                  ".cfg", ".pro", ".bat"}
+                                  ".cfg", ".pro", ".bat", ".conf", ".template"}
 
 
 def is_build_source(path):
@@ -272,9 +405,10 @@ def glob_to_regex(pattern):
     Make variable prefixes are stripped first ($(ASMJIT_DIR)/core/*.cpp becomes
     /core/*.cpp) and the pattern is allowed to match at any directory depth, so
     `beam/*.c` covers erts/emulator/beam/x.c without needing to know which
-    Makefile directory the pattern was written in.
+    Makefile directory the pattern was written in.  A make `%` is treated as a
+    wildcard too (source-naming registries like $(RYU_FILES:%=ryu/%.c)).
     """
-    pat = re.sub(r"\$\([^)]*\)|\$\{[^}]*\}", "", pattern).strip()
+    pat = re.sub(r"\$\([^)]*\)|\$\{[^}]*\}", "", pattern).strip().replace("%", "*")
     if not pat or not GLOB_CHARS.search(pat):
         return None
     out, i = [], 0
@@ -293,6 +427,85 @@ def glob_to_regex(pattern):
             out.append(re.escape(c))
             i += 1
     return re.compile("^(?:.*/)?" + "".join(out).lstrip("/") + "$")
+
+
+def cond_text(txt):
+    """Only the preprocessor condition/undef lines of `txt`."""
+    return "".join(m.group(0) for m in COND_LINE_RE.finditer(txt))
+
+
+def cheap_undefinable(name):
+    """Name-only filter of the never-compiled-block detector (no tree data).
+
+    Names in the compiler/platform/toolchain namespaces can always be defined
+    outside the tracked sources (command line, compiler builtin, system or 3PP
+    headers), so a region guarded by them is never reported - and this filter
+    also keeps the whole-tree work limited to the names that can matter.
+    """
+    if name in KNOWN_MACROS or name in C_KEYWORDS:
+        return False
+    if name.startswith("_") or "__" in name or "HAVE" in name.split("_"):
+        return False
+    return not name.startswith(MACRO_BUILTIN_PREFIXES)
+
+
+def single_macro_condition(kind, rest):
+    """(macro, negated) for a simple single-macro condition, else (None, False).
+
+    Anything else (arithmetic, &&/||, function-like, several identifiers) is
+    undecidable and must stay SILENT.
+    """
+    rest = rest.strip()
+    if kind in ("ifdef", "ifndef"):
+        if IDENT_RE.match(rest):
+            return rest, kind == "ifndef"
+        return None, False
+    m = re.match(r"^(!?)\s*defined\s*(?:\(\s*([A-Za-z_]\w*)\s*\)|([A-Za-z_]\w*))$", rest)
+    if m:
+        return (m.group(2) or m.group(3)), bool(m.group(1))
+    if IDENT_RE.match(rest):
+        return rest, False
+    return None, False
+
+
+def find_never_compiled_blocks(txt, undefinable):
+    """Never-compiled `#if` regions of `txt`.
+
+    Returns [{"macro", "start", "end"}] where start/end are 1-based line numbers
+    of the `#if` directive and of the last line of its BODY (the directive line
+    and the #endif/#else line are not part of the body).  Only a positive
+    single-macro condition counts; `#ifndef M`/`#if !defined(M)` with such an M
+    is always compiled and is therefore not reported, and an undecidable
+    condition is skipped.  Nested regions inside an already-reported region are
+    not reported again.
+    """
+    lines = txt.splitlines()
+    frames = []                 # [[region or None, region_closed]]
+    out = []
+    for idx, line in enumerate(lines, 1):
+        m = PP_LINE_RE.match(line)
+        if not m:
+            continue
+        kind, rest = m.group(1), m.group(2)
+        if kind in ("if", "ifdef", "ifndef"):
+            macro, negated = single_macro_condition(kind, rest)
+            region = None
+            if (macro and not negated and not any(f[0] is not None for f in frames)
+                    and undefinable(macro)):
+                region = {"macro": macro, "start": idx, "end": idx}
+                out.append(region)
+            frames.append([region, False])
+        elif kind in ("else", "elif"):
+            if frames and frames[-1][0] is not None and not frames[-1][1]:
+                frames[-1][0]["end"] = idx - 1      # alternative branch is compiled
+                frames[-1][1] = True
+        elif kind == "endif":
+            if not frames:
+                continue
+            region, closed = frames.pop()
+            if region is not None and not closed:
+                region["end"] = idx - 1
+    return [r for r in out if r["end"] >= r["start"] + 1]
 
 
 def main():
@@ -327,7 +540,11 @@ def main():
     # the candidate files.  Without this the check is quadratic over the tree
     # (13k sources x ~900 candidates) and takes minutes.
     candidate_stems = {p.name.rsplit(".", 1)[0] for p in candidates}
-    src_text = {}          # path -> text (kept for candidate files only)
+    cand_set = {str(c) for c in candidates}
+    src_text = {}          # candidate rel -> text (the ACTIVE text, see below)
+    cand_text = {}         # candidate rel -> verbatim text
+    own_tokens = {}        # candidate rel -> Counter of its own tokens
+    live_tokens = {}       # own tokens minus never-compiled-block tokens
     globs = []             # (pattern_source_path, pattern, regex)
     tokens_all = Counter()
     tokens_cfamily = Counter()
@@ -335,46 +552,112 @@ def main():
     stem_refs_all = {}     # stem -> list of sources mentioning it
     stem_refs_build = {}   # stem -> list of *build* sources mentioning it
     stem_refs_make = {}    # stem -> list of *makefile* sources mentioning it
-    basename_refs = {}     # "x.c" -> list of makefile sources mentioning it verbatim
+    basename_refs = {}     # "x.c" -> list of build sources mentioning it verbatim
     includes = {}          # basename -> list of "path" that #include it
-    own_tokens = {}        # candidate rel -> Counter
+    suite_tokens = {}      # "<x>_SUITE.erl" -> Counter (CT fixture ownership)
     object_res = []        # regex matching object basenames listed in a Makefile
-    subst_decls = []       # (makefile rel, set(source items)) for $(VAR:...%.o)
+    subst_decls = []       # (makefile rel, set(source items)) for synthesised lists
+    guard_names = set()    # macro names used on #if conditions of candidates
+    defined_macros = set() # every macro name defined anywhere in the tree
+    guard_ok = {}          # guard name -> True iff used only on condition lines
+
+    # Pass A - the candidate files: their text is needed by both tiers and to
+    # decide which of their preprocessor regions can never be compiled.
+    # guard_names only needs the macros that could be *reported*, i.e. the
+    # controlling macro of a simple POSITIVE `#if`/`#ifdef`.
+    cand_cnt = {}
+    cand_by_base = {}
+    for c in candidates:
+        rel = str(c)
+        txt = read_text(c) or ""
+        cand_text[rel] = txt
+        cand_cnt[rel] = Counter(TOKEN_RE.findall(txt))
+        cand_by_base.setdefault(c.name, []).append(rel)
+        for m in PP_LINE_RE.finditer(txt):
+            if m.group(1) in ("if", "ifdef", "ifndef"):
+                name, negated = single_macro_condition(m.group(1), m.group(2))
+                if name and not negated:
+                    guard_names.add(name)
 
     basename_re = re.compile(r"([A-Za-z_][\w.\-]*\.(?:c|h|cpp|hpp|cc|tab|inc|def))\b")
     obj_token_re = re.compile(r"([A-Za-z_][\w.\-]*\.(?:o|obj))\b")
+    # Everything below is restricted to the names that could ever be reported,
+    # so the whole-tree work stays a single pass: erts/*_HAVE_* / __*/_* / 3PP
+    # namespaces are pruned by name alone, and only the files that mention one
+    # of the surviving names are inspected in detail.
+    interesting_guards = {n for n in guard_names if cheap_undefinable(n)}
+    # Two questions decide every never-compiled block - "is this guard name ever
+    # used outside a `#if` line?" and "is it ever defined?" - both answered for
+    # all names by ONE inverted git-grep pass over the tree.  `mentions()`-style
+    # per-file tests would re-tokenize ~13k files; grep only visits matches.
+    ev = guard_evidence(interesting_guards)
+    use_grep = ev is not None
+    if use_grep:
+        guard_ok.update(ev[0])
+        defined_macros.update(ev[1])
+
+    def maybe_scan_basenames(txt):
+        # Exact prefilter for basename_re (which needs one of these suffixes).
+        return (".c" in txt or ".h" in txt or ".tab" in txt or ".inc" in txt
+                or ".def" in txt)
+
+    # Pass B - every tracked file.
     for p in files:
         rel = str(p)
         if rel in SELF_EXCLUDE or p.suffix.lower() in DOC_EXTS:
             continue
-        try:
-            if (ROOT / p).stat().st_size > 4_000_000:
-                continue
-        except OSError:
-            continue
-        txt = read_text(p)
+        txt = cand_text.get(rel)
         if txt is None:
-            continue
+            try:
+                if (ROOT / p).stat().st_size > 4_000_000:
+                    continue
+            except OSError:
+                continue
+            txt = read_text(p)
+            if txt is None:
+                continue
+        cnt = cand_cnt.get(rel)
+        if cnt is None:
+            cnt = Counter(TOKEN_RE.findall(txt))
         is_c = p.suffix.lower() in CFAMILY_EXTS
         is_b = is_build_source(p)
         is_m = is_makefile_source(p)
-        cnt = Counter(TOKEN_RE.findall(txt))
         tokens_all.update(cnt)
         if is_c:
             tokens_cfamily.update(cnt)
-            for m in INCLUDE_RE.finditer(txt):
-                includes.setdefault(m.group(1).rsplit("/", 1)[-1], []).append(rel)
+            if rel not in cand_set:
+                # Candidate #includes are read from their ACTIVE text below.
+                for m in INCLUDE_RE.finditer(txt):
+                    includes.setdefault(m.group(1).rsplit("/", 1)[-1], []).append(rel)
+        # Fallback when git grep is unavailable: a file that mentions a guard
+        # name either defines it or uses it.  "Used" means it occurs somewhere
+        # other than a `#if`/`#undef` line, compared by token count.
+        if not use_grep and interesting_guards:
+            g_hits = interesting_guards.intersection(cnt)
+            if g_hits:
+                gcnt = Counter(TOKEN_RE.findall(cond_text(txt)))
+                for name in g_hits:
+                    if cnt[name] != gcnt.get(name, 0):
+                        guard_ok[name] = False    # also used by real code
+                    else:
+                        guard_ok.setdefault(name, True)
+                defined_macros.update(n for n in MACRO_RE.findall(txt) if n in g_hits)
+                defined_macros.update(n for n in DFLAG_RE.findall(txt) if n in g_hits)
+                defined_macros.update(n for n in AC_DEFINE_RE.findall(txt) if n in g_hits)
+                defined_macros.update(n for n in UNDEF_RE.findall(txt) if n in g_hits)
         if is_b:
             tokens_build.update(cnt)
-            for stem in candidate_stems.intersection(cnt):
+            stems = candidate_stems.intersection(cnt)
+            for stem in stems:
                 stem_refs_build.setdefault(stem, []).append(rel)
                 if is_m:
                     stem_refs_make.setdefault(stem, []).append(rel)
-            if is_m:
+            if stems or maybe_scan_basenames(txt):
                 for m in basename_re.finditer(txt):
                     base = m.group(1)
-                    if base.rsplit(".", 1)[0] in candidate_stems:
+                    if base in cand_by_base:
                         basename_refs.setdefault(base, []).append(rel)
+            if is_m:
                 for m in WILDCARD_RE.finditer(txt):
                     for tok in m.group(1).split():
                         rx = glob_to_regex(tok)
@@ -389,22 +672,74 @@ def main():
                                   for ch in body)
                     object_res.append(re.compile(pat + "$"))
                 # Object lists synthesised from a source registry
-                # ($(ZLIB_FILES:%=$(ZLIB_OBJDIR)/%.o), $(ETHREAD_LIB_SRC:.c=.o))
+                #   $(VAR:%=$(OBJDIR)/%.o) | $(VAR:.c=.o)
+                #   $(patsubst %.c,$(OBJDIR)/%.o,$(VAR))
+                #   $(addprefix D,$(notdir $(VAR:.c=.o)))
                 # name no object token at all, so resolve the registry back to
                 # the sources it names here.
                 assigns = list_assignments(txt)
-                for m in SUBST_O_RE.finditer(txt):
-                    var = m.group(1)
-                    if var in assigns:
-                        subst_decls.append((rel, set(assigns[var])))
+                for rx in (SUBST_O_RE, PATSUBST_O_RE, ADDPREFIX_NOTDIR_RE):
+                    for m in rx.finditer(txt):
+                        var = m.group(1)
+                        if var in assigns:
+                            subst_decls.append((rel, set(assigns[var])))
+                #   $(VAR:%=prefix/%.c) - the reverse, source-naming form.
+                for m in REGISTRY_SRC_RE.finditer(txt):
+                    var, pat = m.group(1), m.group(2)
+                    if var not in assigns:
+                        continue
+                    rx = glob_to_regex(pat)
+                    if rx:
+                        globs.append((rel, pat, rx))
+        if rel.endswith("_SUITE.erl"):
+            suite_tokens[rel] = cnt
         for stem in candidate_stems.intersection(cnt):
             stem_refs_all.setdefault(stem, []).append(rel)
 
-    # Tokens of the candidate files themselves must be subtractable.
+    # ---- never-compiled #if regions (advisory findings) -------------------
+    def macro_undefinable(name):
+        """Conservatively "can never be defined here" (see the header comment)."""
+        if not cheap_undefinable(name) or name in defined_macros:
+            return False
+        # Provable only if no source defines *or uses* the name outside #if lines.
+        return guard_ok.get(name) is True
+
+    blocks = {}            # candidate rel -> [(line, macro)]
+    dead_lines = {}        # candidate rel -> set(1-based dead body line numbers)
     for c in candidates:
-        txt = read_text(c)
-        own_tokens[str(c)] = Counter(TOKEN_RE.findall(txt)) if txt else Counter()
-        src_text[str(c)] = txt or ""
+        rel = str(c)
+        txt = cand_text[rel]
+        if "#if" not in txt:
+            continue
+        found = find_never_compiled_blocks(txt, macro_undefinable)
+        if not found:
+            continue
+        blocks[rel] = [(b["start"], b["macro"]) for b in found]
+        dead = set()
+        for b in found:
+            dead.update(range(b["start"] + 1, b["end"] + 1))
+        dead_lines[rel] = dead
+
+    # ---- the active text ---------------------------------------------------
+    # A reference that lives only inside a never-compiled block must not make a
+    # file live, so candidate liveness evidence is taken from the text with
+    # those bodies removed.
+    for c in candidates:
+        rel = str(c)
+        own_tokens[rel] = cand_cnt[rel]
+        dead = dead_lines.get(rel)
+        if dead:
+            parts, dead_parts = [], []
+            for i, line in enumerate(cand_text[rel].splitlines(keepends=True), 1):
+                (dead_parts if i in dead else parts).append(line)
+            src_text[rel] = "".join(parts)
+            live_tokens[rel] = own_tokens[rel] - Counter(TOKEN_RE.findall("".join(dead_parts)))
+        else:
+            src_text[rel] = cand_text[rel]
+            live_tokens[rel] = own_tokens[rel]
+        if c.suffix.lower() in CFAMILY_EXTS:
+            for m in INCLUDE_RE.finditer(src_text[rel]):
+                includes.setdefault(m.group(1).rsplit("/", 1)[-1], []).append(rel)
 
     def match_scan_rel(rx, c):
         """Glob-match a candidate's path relative to the scan scope."""
@@ -428,6 +763,30 @@ def main():
                 return True
         return False
 
+    def build_ref_seed(c):
+        """Decisive class-A reference from a build/script/codegen source."""
+        base, stem = c.name, c.name.rsplit(".", 1)[0]
+        if basename_refs.get(base):
+            return f"'{base}' named verbatim in {basename_refs[base][0]}"
+        if stem_refs_make.get(stem):
+            return f"stem '{stem}' named in {stem_refs_make[stem][0]}"
+        return None
+
+    def fixture_seed(c):
+        """Driver/NIF CT fixture: built by its own Makefile and/or loaded by
+        string name from the owning *_SUITE.erl - neither is an object list."""
+        rel = str(c)
+        i = rel.rfind("_SUITE_data/")
+        if i < 0:
+            return None
+        cnt = suite_tokens.get(rel[:i] + "_SUITE.erl")
+        if cnt is None:
+            return None
+        stem, base = c.name.rsplit(".", 1)[0], c.name
+        if stem in cnt or base in cnt:
+            return f"CT fixture named by {rel[:i]}_SUITE.erl"
+        return None
+
     # ---- decide ----------------------------------------------------------
     def defined_symbols(c):
         """Externally visible symbols only.
@@ -437,7 +796,8 @@ def main():
         symbol elsewhere is NOT evidence that this file is reachable (that is
         exactly the "bin_drv.c defines static read_fill()" false positive).
         Headers, in contrast, are included wholesale, so everything they define
-        counts.
+        counts.  Symbols that exist only inside a never-compiled #if region are
+        not defined either - they cannot make their users live.
         """
         txt = src_text.get(str(c)) or ""
         syms = set()
@@ -461,10 +821,11 @@ def main():
         """Return (evidence dict, strong flag).
 
         `strong` is False when the only references found are *non-makefile*
-        build-source mentions (an .erl suite, a CI script, a .def list).
+        build-source mentions (an .erl suite, a CI script, a .def list) that are
+        not a verbatim basename / whole-word stem reference.
         """
         rel, base, stem = str(c), c.name, c.name.rsplit(".", 1)[0]
-        own_all = own_tokens[rel]
+        own_all = own_tokens.get(rel, Counter())
         own_build = own_all if is_build_source(c) else Counter()
         ev = {}
         strong = False
@@ -524,8 +885,10 @@ def main():
             return True
         return False
 
-    # A synthesised object list ("$(VAR:%=$(OBJDIR)/%.o)", "$(VAR:.c=.o)") is
-    # built from VAR's items; resolve each to the candidate source(s) it names.
+    # A synthesised object list ("$(VAR:%=$(OBJDIR)/%.o)", "$(VAR:.c=.o)",
+    # "$(patsubst %.c,$(OBJDIR)/%.o,$(VAR))", "$(addprefix ... $(VAR:.c=.o))")
+    # is built from VAR's items; resolve each to the candidate source(s) it
+    # names, preferring a source in the directory of the consuming Makefile.
     stem_to_cand = {}
     for c in candidates:
         stem_to_cand.setdefault(c.name.rsplit(".", 1)[0], []).append(c)
@@ -539,11 +902,19 @@ def main():
             local = [x for x in named if x.startswith(mkdir + "/")]
             subst_seeded.update(local or named)
 
-    # Reverse index: implies[G] = candidates that become live once G is live.
-    cand_set = {str(c) for c in candidates}
-    cand_by_base = {}
+    seed_why = {}
     for c in candidates:
-        cand_by_base.setdefault(c.name, []).append(str(c))
+        rel = str(c)
+        if strict_seed(c):
+            seed_why[rel] = "object list / $(wildcard)"
+        elif rel in subst_seeded:
+            seed_why[rel] = "synthesised object list (registry resolved)"
+        else:
+            why = build_ref_seed(c) or fixture_seed(c)
+            if why:
+                seed_why[rel] = why
+
+    # Reverse index: implies[G] = candidates that become live once G is live.
     sym_owners = {}
     for c in candidates:
         for s in defined_symbols(c):
@@ -557,18 +928,20 @@ def main():
                     if owner != g:
                         implies.setdefault(g, set()).add(owner)
     for g in cand_set:
-        for s in set(own_tokens[g]) & all_syms:
+        for s in set(live_tokens.get(g, ())) & all_syms:
             for f in sym_owners[s]:
                 if f != g:
                     implies.setdefault(g, set()).add(f)
 
-    live = {str(c) for c in candidates if strict_seed(c)} | subst_seeded
+    live = set(seed_why)
     worklist = deque(sorted(live))
+    why_live = dict(seed_why)
     while worklist:
         g = worklist.popleft()
         for f in implies.get(g, ()):
             if f not in live:
                 live.add(f)
+                why_live[f] = f"reachable from {g}"
                 worklist.append(f)
 
     strict_dead = sorted(rel for rel in (str(c) for c in candidates)
@@ -594,10 +967,14 @@ def main():
                 continue
             ev, _reason = details[rel]
             print(f"== {rel}  [{loose_verdict(rel)}] [{strict_verdict(rel)}]")
+            if rel in live:
+                print(f"   strict seed/reachability: {why_live.get(rel, '?')}")
             for cls, hits in ev.items():
                 print(f"   {cls}:")
                 for h in hits[:8]:
                     print(f"     - {h}")
+            for line, macro in blocks.get(rel, ()):
+                print(f"   never-compiled block: {rel}:{line}  #ifdef {macro}")
             adv = [s for s in stem_refs_all.get(Path(rel).name.rsplit('.', 1)[0], ())
                    if s != rel]
             if adv and not ev:
@@ -646,6 +1023,26 @@ def main():
             else:
                 lines.append("      (none)")
     lines.append("")
+    lines.append("=== ADVISORY: never-compiled #if regions (NOT part of the deletion gate) ===")
+    lines.append("A region `#ifdef M` / `#if defined(M)` is listed when M can never be defined in")
+    lines.append("this tree: M is not #define'd in any tracked source, is not any -D flag, is not")
+    lines.append("AC_DEFINE'd and not a config.h.in template entry, is not a compiler/toolchain")
+    lines.append("builtin or platform name (\"_\"/\"__\" names, HAVE_*, ERLANG_OSTYPE, DEBUG*,")
+    lines.append("ETHR_*, AO_*, ZLIB*, PCRE*, ASMJIT*, ...), and M occurs in the whole tree ONLY on")
+    lines.append("preprocessor condition lines (so no code and no generator ever defines or uses it).")
+    lines.append("Consequently the region can never be compiled here.  Undecidable conditions and")
+    lines.append("`#ifndef M` (whose body with such an M is ALWAYS compiled) are not reported.  These")
+    lines.append("findings never affect the STRICT/ACTIONABLE verdict or the exit status; a removal")
+    lines.append("pass must still verify each block against the toolchain and the configure options.")
+    if not blocks:
+        lines.append("  (none)")
+    else:
+        n_blocks = sum(len(v) for v in blocks.values())
+        lines.append(f"  regions: {n_blocks} in {len(blocks)} files")
+        for rel in sorted(blocks):
+            for line, macro in blocks[rel]:
+                lines.append(f"    {rel}:{line}  guard macro '{macro}' is never definable here")
+    lines.append("")
     lines.append("=== ADVISORY: loose single-pass tier (NOT the deletion gate) ===")
     lines.append("DELETABLE (no build ref, no #include, no symbol use):")
     if deletable:
@@ -658,14 +1055,15 @@ def main():
     for rel, why in exempt:
         lines.append(f"  {rel}  <- {why}")
     lines.append("")
-    lines.append("WEAK (retained, but the only reference is a non-makefile mention -")
-    lines.append("      a CT suite, an escript or a CI list; audit before deleting):")
+    lines.append("WEAK (retained, but the only loose reference is a non-makefile mention -")
+    lines.append("      neither a verbatim basename nor a makefile-role stem; audit before deleting):")
     for rel, ev in weak:
         hits = ev.get("A build ref", [])
         lines.append(f"  {rel}  <- {hits[0] if hits else '?'}")
     lines.append("")
-    lines.append("REFERENCED BUT NOT IN AN OBJECT LIST (compilation units reachable only by")
-    lines.append("#include / symbol use - i.e. dead-but-referenced; audit before deleting):")
+    lines.append("NOT IN AN OBJECT LIST (compilation units no object-list entry or $(wildcard)")
+    lines.append("covers; they may still be STRICT LIVE via a script/codegen/fixture reference -")
+    lines.append("check the STRICT verdict before deleting):")
     unbuilt = [rel for rel in referenced
                if Path(rel).suffix.lower() in COMPILE_EXTS
                and not is_built(Path(rel))
