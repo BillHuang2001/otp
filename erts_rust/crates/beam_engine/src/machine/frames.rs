@@ -137,6 +137,7 @@ impl Machine {
         match self.stack.get_mut(y_base + k as usize) {
             Some(slot) => {
                 *slot = v;
+                crate::poison::check("write", "Machine::set_y", v);
                 Ok(())
             }
             None => Err(error::bad_register(k)),
