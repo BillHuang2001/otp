@@ -53,9 +53,6 @@ static void bin_check(void);
 #endif
 
 static void print_garb_info(fmtfn_t to, void *to_arg, Process* p);
-#ifdef OPPROF
-static void dump_frequencies(void);
-#endif
 
 static void dump_attributes(fmtfn_t to, void *to_arg, const byte* ptr, int size);
 
@@ -644,28 +641,6 @@ do_break(void)
 	case 'k':
 	    process_killer();
 	    return;
-#ifdef OPPROF
-	case 'X':
-	    dump_frequencies();
-	    return;
-	case 'x':
-	    {
-		int i;
-		for (i = 0; i <= HIGHEST_OP; i++) {
-		    if (opc[i].name != NULL) {
-			erts_printf("%-16s %8d\n", opc[i].name, opc[i].count);
-		    }
-		}
-	    }
-	    return;
-	case 'z':
-	    {
-		int i;
-		for (i = 0; i <= HIGHEST_OP; i++)
-		    opc[i].count = 0;
-	    }
-	    return;
-#endif
 #ifdef DEBUG
 	case 't':
 	    /* erts_p_slpq(); */
@@ -685,35 +660,6 @@ do_break(void)
     }
 
 }
-
-
-#ifdef OPPROF
-static void
-dump_frequencies(void)
-{
-    int i;
-    FILE* fp;
-    time_t now;
-    static char name[] = "op_freq.dump";
-
-    fp = fopen(name, "w");
-    if (fp == NULL) {
-	fprintf(stderr, "Failed to open %s for writing\n", name);
-	return;
-    }
-
-    time(&now);
-    fprintf(fp, "# Generated %s\n", ctime(&now));
-
-    for (i = 0; i <= HIGHEST_OP; i++) {
-	if (opc[i].name != NULL) {
-	    fprintf(fp, "%s %d\n", opc[i].name, opc[i].count);
-	}
-    }
-    fclose(fp);
-    erts_printf("Frequencies dumped to %s\n", name);
-}
-#endif
 
 
 #ifdef DEBUG
