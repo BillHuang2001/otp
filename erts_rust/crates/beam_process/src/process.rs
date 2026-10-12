@@ -935,7 +935,8 @@ impl Process {
                 // the unpublished handles.
                 if self.has_unpublished_roots() {
                     return Err(BeamError::Alloc(failure));
-                }                // The copier reports the whole graph's flat word count in the failure (as
+                }
+                // The copier reports the whole graph's flat word count in the failure (as
                 // bytes) — for the preflight `AllocKind::Message` refusal and the mid-copy
                 // `AllocKind::Heap` one alike — so the words the growth must cover are
                 // recoverable from it.
@@ -1058,7 +1059,8 @@ impl Process {
     /// This flag is **one of the two** cases of the gate every delivery-driven path tests —
     /// [`Process::has_unpublished_roots`], whose other case is a [`ProcessState::Running`] process
     /// (whose own machine's live terms are unpublished mid-run).
-    pub fn set_relocation_exempt(&mut self, exempt: bool) {        self.relocation_exempt = exempt;
+    pub fn set_relocation_exempt(&mut self, exempt: bool) {
+        self.relocation_exempt = exempt;
     }
 
     /// Whether this process is **relocation-exempt** (default `false`).
@@ -1686,7 +1688,11 @@ mod tests {
     #[test]
     fn has_unpublished_roots_covers_the_exemption_and_a_running_process() {
         let mut process = Process::new(pid(41)).expect("the default heap allocates");
-        assert_eq!(process.state(), ProcessState::Runnable, "a fresh process is runnable");
+        assert_eq!(
+            process.state(),
+            ProcessState::Runnable,
+            "a fresh process is runnable"
+        );
         assert!(!process.is_relocation_exempt());
         assert!(
             !process.has_unpublished_roots(),

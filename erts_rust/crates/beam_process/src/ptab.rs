@@ -172,7 +172,8 @@ fn grow_receiver_for_signal(process: &mut Process, failure: AllocFailure) -> Res
         // The heap cannot be moved under the unpublished live terms: hand the refusal back
         // verbatim (`kind` still Heap/Message) — no collection, no growth, no retry.
         return Err(BeamError::Alloc(failure));
-    }    // The copier reports the whole graph's flat word count in the failure (as bytes), so the
+    }
+    // The copier reports the whole graph's flat word count in the failure (as bytes), so the
     // words the growth must cover are recoverable from it.
     let need_words = failure.requested / core::mem::size_of::<Eterm>();
     // The growth's own error is deliberately ignored, exactly as `Process::deliver` documents:
@@ -213,7 +214,8 @@ where
         {
             if recipient.has_unpublished_roots() {
                 return enqueue_fragment_signal(recipient, from, reason, &mut build);
-            }            grow_receiver_for_signal(recipient, failure)?;
+            }
+            grow_receiver_for_signal(recipient, failure)?;
             let term = build(recipient.heap_mut(), reason)?;
             recipient.mailbox_mut().enqueue(Message::new(term, from));
             Ok(())
@@ -316,7 +318,8 @@ fn copy_reason_onto(
             // the enqueue-time copy is performed.
             if process.has_unpublished_roots() {
                 return Err(BeamError::Alloc(failure));
-            }            grow_receiver_for_signal(process, failure)?;
+            }
+            grow_receiver_for_signal(process, failure)?;
             process.copy_into_heap(reason, src)
         }
         Err(error) => Err(error),
@@ -2378,7 +2381,8 @@ impl ProcessTable {
             Err(BeamError::Alloc(failure))
                 if refuses_collect
                     && matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
-            {                if trapping {
+            {
+                if trapping {
                     self.deliver_exit_fragment(to, from, reason, src)
                 } else {
                     Err(BeamError::Alloc(failure))
@@ -2425,7 +2429,8 @@ impl ProcessTable {
             Err(BeamError::Alloc(failure))
                 if refuses_collect
                     && matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
-            {                self.deliver_down_fragment(to, reference, target, kind, tag, reason, src)
+            {
+                self.deliver_down_fragment(to, reference, target, kind, tag, reason, src)
             }
             Err(error) => Err(error),
         }
