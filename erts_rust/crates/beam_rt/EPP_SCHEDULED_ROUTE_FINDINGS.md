@@ -51,9 +51,11 @@ collection of that process is therefore declined by `Process::has_unpublished_ro
 takes the ordinary heap-fragment fallback, and the process's own admission point — after the resume,
 where the exemption is cleared — collects as usual. The mitigation is **decline-only and bounded**: it
 never *allows* a collection, so an affected process's heap grows on that path only until it resumes.
-The regression test is `tests/compile_file.rs::a_scheduled_process_parses_a_source_file_like_the_oracle`
-(`epp:parse_file/3` driven through the scheduled `run` route over the committed `epp_forms.erl` /
-`epp_input.erl` fixtures).
+The regression is `tests/compile_file.rs::a_scheduled_process_compiles_a_source_file_in_process_like_the_oracle`
+— the E0 in-process `compile:file/2` driven through the scheduled `run` route over the committed
+`tests/fixtures/sched_compile_{driver,input}.erl` — which fails without the exemption
+(`invalid boxed header subtag`; `jit_step_one` ← `jit_ext_call`) and passes with it on both tiers;
+`a_scheduled_process_parses_a_source_file_like_the_oracle` covers the same class via `epp:parse_file/3`.
 
 ## 4. The patch owed to the sibling owner (root fix)
 `crates/beam_process/src/ptab.rs` — give the signal sites (`grow_receiver_for_signal`,
