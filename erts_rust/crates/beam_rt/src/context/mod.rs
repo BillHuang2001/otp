@@ -17,6 +17,7 @@
 // limitations under the License.
 //
 // %CopyrightEnd%
+
 //! The concrete [`ExecutionContext`] glue: the engine's seam over the runtime core.
 //!
 //! The Stage-1 engine knows nothing about BIFs, heaps, processes or ETS — it calls
