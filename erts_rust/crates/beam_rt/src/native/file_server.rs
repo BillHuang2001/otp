@@ -121,15 +121,21 @@
 //!   well-formed `{'$gen_call', …}` must never leave its caller parked with no reply (see
 //!   [`Runtime::serve_file_message`]).
 //!
-//! # Retirement: a queued request is never lost
+//! # Retirement: a request to a retired device is never lost
 //!
 //! A device that retires (`close`, or a device-killing request) stops being a device, so a
-//! request already queued in **its** mailbox is answered — rather than parked forever —
-//! with the oracle's `{error, terminated}`. The pid therefore stays in the drain coverage of
-//! [`Runtime::service_file_requests`] ([`FileServices::retired`]) until its mailbox is
-//! empty, and only then is it dropped (so the retire set stays bounded). A `{file_reply,…}`
-//! is **counted** in that step's delivery total, so a pass that only answers a retired
-//! device can never look quiescent.
+//! request that reaches it — already queued in **its** mailbox, or arriving in a **later**
+//! pass — is answered, rather than parked forever, with the oracle's `{error, terminated}`.
+//! The pid therefore stays in the drain coverage of [`Runtime::service_file_requests`]
+//! ([`FileServices::retired`]) for the **runtime's lifetime**: nothing can know that no
+//! further request will ever arrive, so any rule that dropped the pid once its mailbox looked
+//! empty would silently lose a request sent afterwards (its sender would park in
+//! `file_request/2`'s untimed `receive`, so the run would quiesce to a typed `blocked()` gap
+//! instead of surfacing the orphaned request). The cost is bounded by the number of retired
+//! devices — the same order as the io-device `Process` records the process table already
+//! retains forever (they are never removed from it either). A `{file_reply,…}` is **counted**
+//! in that step's delivery total, so a pass that only answers a retired device can never look
+//! quiescent.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -168,10 +174,12 @@ pub(crate) struct FileServices {
     /// The live io-devices, keyed by their own pid.
     devices: HashMap<ProcessId, Device>,
     /// The **retired** io-device pids: their `Device` is gone (the oracle's device process
-    /// has died), but a request may still be queued in the pid's mailbox. They stay in the
-    /// drain coverage of [`Runtime::service_file_requests`] — and are answered with the
-    /// oracle's `{error, terminated}` — until that mailbox is empty, at which point the
-    /// entry is dropped here so the set can never grow without bound.
+    /// has died), but a request may still be queued in the pid's mailbox — or arrive in a
+    /// **later** scheduler pass. They stay in the drain coverage of
+    /// [`Runtime::service_file_requests`] for the runtime's lifetime and are answered with
+    /// the oracle's `{error, terminated}`; the set is bounded by the number of retired
+    /// devices, the same order as the io-device `Process` records the process table already
+    /// retains forever.
     retired: HashSet<ProcessId>,
 }
 
@@ -241,29 +249,12 @@ impl FileServices {
     }
 
     /// Retires the io-device `service`: its open file is dropped exactly as the oracle's
-    /// device process dying closes the descriptor, and the pid is kept in drain coverage
-    /// until its mailbox is empty (see [`FileServices::retired`]).
+    /// device process dying closes the descriptor, and the pid is kept in drain coverage for
+    /// the runtime's lifetime (see [`FileServices::retired`]). A request that lands in its
+    /// mailbox at any later moment is answered `{error, terminated}`, never parked.
     fn retire(&mut self, service: ProcessId) {
         self.devices.remove(&service);
         self.retired.insert(service);
-    }
-
-    /// Drops the retired pids whose mailbox is now empty — nothing is left to answer, so
-    /// nothing is left to scan.
-    fn prune_retired(&mut self, table: &mut ProcessTable) {
-        let done: Vec<ProcessId> = self
-            .retired
-            .iter()
-            .copied()
-            .filter(|service| {
-                table
-                    .get(*service)
-                    .is_none_or(|process| process.mailbox().is_empty())
-            })
-            .collect();
-        for service in done {
-            self.retired.remove(&service);
-        }
     }
 }
 
@@ -291,7 +282,9 @@ impl Runtime {
     pub(crate) fn service_file_requests(&mut self, table: &mut ProcessTable) -> Result<usize> {
         // The servers are collected first so `self` is free while `table` is borrowed. A
         // **retired** device is still scanned: a request queued in its mailbox at the moment
-        // it retired must be answered (`{error, terminated}`), never parked forever.
+        // it retired — or arriving in **any later** pass — must be answered
+        // (`{error, terminated}`), never parked forever. The coverage is permanent (see the
+        // module docs): a retired pid is never dropped from it.
         let mut servers = Vec::with_capacity(
             1 + self.file_services.devices.len() + self.file_services.retired.len(),
         );
@@ -338,10 +331,6 @@ impl Runtime {
                 }
             }
         }
-        // A retired device whose mailbox is now empty has nothing left to answer, so it is
-        // dropped from coverage here (bounded state); one that still holds a request stays
-        // and is drained on the next pass.
-        self.file_services.prune_retired(table);
         Ok(delivered)
     }
 

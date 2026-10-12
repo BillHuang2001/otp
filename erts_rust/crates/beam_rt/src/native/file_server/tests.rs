@@ -442,7 +442,9 @@ fn a_write_open_creates_and_a_read_open_reports_enoent() {
 
 /// (a)+(b)+(c) A request queued on a **retired** io-device is drained and answered
 /// `{io_reply, _, {error, terminated}}`, is counted in the pass's `delivered`, and the retired
-/// pid is then **pruned** once its mailbox is empty.
+/// pid is then **retained** in drain coverage — for the runtime's lifetime, because nothing can
+/// know that no further request will ever arrive (see the sibling
+/// `a_request_to_a_retired_device_in_a_later_pass_is_answered`, which pins exactly that).
 ///
 /// The oracle's io-device is a real process: once it dies, the caller's monitor fires `'DOWN'
 /// noproc` and `io:request/3` answers `{error, terminated}` — the request never reaches a live
@@ -452,7 +454,7 @@ fn a_write_open_creates_and_a_read_open_reports_enoent() {
 /// and the drain are all driven through the **real** seams; the request is queued the way a
 /// scheduler pass would find it (`deliver_simple`, the same copy path the replies use).
 #[test]
-fn a_request_to_a_retired_device_is_drained_answered_and_pruned() {
+fn a_request_to_a_retired_device_is_drained_answered_and_the_pid_is_retained() {
     let mut runtime = runtime();
     let mut table = take_table(&mut runtime);
     let caller = table.spawn_default().expect("a caller");
@@ -515,10 +517,105 @@ fn a_request_to_a_retired_device_is_drained_answered_and_pruned() {
         "{io_reply,11,{error,terminated}}"
     );
 
-    // (b) a drained retired pid (its mailbox now empty) is pruned.
+    // (b) the retired pid — its mailbox now empty — stays in drain coverage: nothing can know
+    // that no further request will arrive, so it must not be dropped.
     assert!(
-        runtime.file_services.retired.is_empty(),
-        "a drained retired pid is pruned"
+        runtime.file_services.retired.contains(&device),
+        "a drained retired pid stays in the drain coverage"
+    );
+    // and a pass over that empty mailbox answers nothing else.
+    assert_eq!(
+        runtime
+            .service_file_requests(&mut table)
+            .expect("a second service pass"),
+        0,
+        "the retired device has nothing left to answer"
+    );
+
+    runtime.processes = table;
+}
+
+/// **The decisive case.** A request that reaches a retired io-device in a **later** pass —
+/// after the pass that retired it has already drained that device's mailbox to empty — is
+/// still answered `{error, terminated}` and counted.
+///
+/// This is the case a "prune the tombstone once the mailbox is empty" rule misses: the pid is
+/// gone from the scan set, so the later request sits in its mailbox with no drain step and its
+/// sender waits in `file_request/2`'s untimed `receive`
+/// (`lib/kernel/src/file.erl:3068-3077`), so the run quiesces to the typed `blocked()` gap.
+/// The observable symptom on the CLI is a `run` process that prints nothing and exits 3 with
+/// `unsupported: opcode: run: process blocked (no message available)`, where the oracle prints
+/// `close=ok after={error,terminated}`. Retaining the retired pid for the runtime's lifetime
+/// answers it instead.
+#[test]
+fn a_request_to_a_retired_device_in_a_later_pass_is_answered() {
+    let mut runtime = runtime();
+    let mut table = take_table(&mut runtime);
+    let caller = table.spawn_default().expect("a caller");
+
+    // A real `[read]` device over a real file, retired through the real io-request `close`.
+    let file = TempPath::new("retired_later_pass");
+    std::fs::write(file.path(), b"x").expect("a fixture file");
+    let modes = mode_list(&mut runtime, &["read"]);
+    let device = open_device(&mut runtime, &mut table, file.path(), modes);
+
+    let close_request = build(&mut runtime, |ctx| {
+        let tag = ctx.atom("io_request").expect("an atom");
+        let close = ctx.atom("close").expect("an atom");
+        terms::make_tuple(ctx, &[tag, caller.to_eterm(), make_small(7), close])
+            .expect("the close request")
+    });
+    let (target, envelope) = runtime
+        .serve_file_message(&mut table, device, close_request)
+        .expect("a served close")
+        .expect("an io_request is always answered");
+    assert_eq!(target, caller);
+    assert_eq!(render(&mut runtime, envelope), "{io_reply,7,ok}");
+
+    // The pass that retired the device finds nothing else in `device`'s mailbox (the close was
+    // served directly, not queued), so it answers **no** request for it.
+    assert_eq!(
+        runtime
+            .service_file_requests(&mut table)
+            .expect("the retiring pass"),
+        0,
+        "the retiring pass has nothing left to answer for the device"
+    );
+    assert!(
+        runtime.file_services.retired.contains(&device),
+        "the retired pid is still in the drain coverage after that pass"
+    );
+
+    // The later request: delivered into the retired pid's mailbox only now, i.e. after the
+    // retiring pass already saw an empty mailbox (the point a `prune` rule would have dropped
+    // the pid from coverage).
+    let later = build(&mut runtime, |ctx| {
+        let tag = ctx.atom("io_request").expect("an atom");
+        let close = ctx.atom("close").expect("an atom");
+        terms::make_tuple(ctx, &[tag, caller.to_eterm(), make_small(13), close])
+            .expect("the later request")
+    });
+    table
+        .deliver_simple(device, caller.to_eterm(), later)
+        .expect("the retired device's mailbox accepts the message");
+
+    assert_eq!(
+        runtime
+            .service_file_requests(&mut table)
+            .expect("a second service pass"),
+        1,
+        "the later request is answered and counted"
+    );
+
+    let reply = table
+        .get_mut(caller)
+        .expect("the caller is live")
+        .receive(|_| true)
+        .expect("the later request's reply")
+        .payload();
+    assert_eq!(
+        render(&mut runtime, reply),
+        "{io_reply,13,{error,terminated}}"
     );
 
     runtime.processes = table;
