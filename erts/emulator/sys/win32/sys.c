@@ -555,16 +555,6 @@ struct erl_drv_entry spawn_driver_entry = {
     stop_select
 };
 
-#ifdef HARD_POLL_DEBUG
-extern void poll_debug_set_active_fd(ErtsSysFdType fd);
-extern void poll_debug_read_begin(ErtsSysFdType fd);
-extern void poll_debug_read_done(ErtsSysFdType fd, int bytes);
-extern void poll_debug_async_initialized(ErtsSysFdType fd);
-extern void poll_debug_async_immediate(ErtsSysFdType fd, int bytes);
-extern void poll_debug_write_begin(ErtsSysFdType fd);
-extern void poll_debug_write_done(ErtsSysFdType fd, int bytes);
-#endif
-
 extern int null_func(void);
 
 struct erl_drv_entry fd_driver_entry = {
@@ -991,9 +981,6 @@ static void
 async_read_file(AsyncIo* aio, LPVOID buf, DWORD numToRead)
 {
     aio->pendingError = NO_ERROR;
-#ifdef HARD_POLL_DEBUG
-    poll_debug_async_initialized(aio->ov.hEvent);
-#endif
     if (aio->thread != (HANDLE) -1) {
 	DEBUGF(("async_read_file: signaling thread 0x%x, event 0x%x\n",
 		aio->thread, aio->ioAllowed));
@@ -1007,17 +994,11 @@ async_read_file(AsyncIo* aio, LPVOID buf, DWORD numToRead)
 		     &aio->bytesTransferred, &aio->ov)) {
 	    DEBUGF(("async_read_file: ReadFile() succeeded: %d bytes\n",
 		    aio->bytesTransferred));
-#ifdef HARD_POLL_DEBUG
-	    poll_debug_async_immediate(aio->ov.hEvent, aio->bytesTransferred);
-#endif
 	    aio->flags |= DF_OVR_READY;
 	    SetEvent(aio->ov.hEvent);
 	} else {
 	    DWORD error = GetLastError();
 	    if (error != ERROR_IO_PENDING) {
-#ifdef HARD_POLL_DEBUG
-		poll_debug_async_immediate(aio->ov.hEvent, 0);
-#endif
 		aio->pendingError = error;
 		SetEvent(aio->ov.hEvent);
 	    }
@@ -1304,12 +1285,6 @@ spawn_start(ErlDrvPort port_num, char* utf8_name, SysDriverOpts* opts)
 		goto error;
 	    }
 	}
-#ifdef HARD_POLL_DEBUG
-	if (strncmp(name,"inet_gethost",12) == 0) {
-	    erts_printf("Debugging \"%s\"\n", name);
-	    poll_debug_set_active_fd(dp->in.ov.hEvent);
-	}
-#endif
 	retval = set_driver_data(dp, hFromChild, hToChild, opts->read_write,
 				 opts->exit_status, opts);
 	if (retval != ERL_DRV_ERROR_GENERAL && retval != ERL_DRV_ERROR_ERRNO) {
@@ -2551,15 +2526,7 @@ ready_input(ErlDrvData drv_data, ErlDrvEvent ready_event)
      * Evaluate the result of the overlapped read.
      */
 
-#ifdef HARD_POLL_DEBUG
-     poll_debug_read_begin(dp->in.ov.hEvent);
-#endif
-
     error = get_overlapped_result(&dp->in, &bytesRead, TRUE);
-
-#ifdef HARD_POLL_DEBUG
-    poll_debug_read_done(dp->in.ov.hEvent,bytesRead);
-#endif
 
     if (error == NO_ERROR) {
 	if (pb == 0) { /* Continuous stream. */
@@ -2717,13 +2684,7 @@ ready_output(ErlDrvData drv_data, ErlDrvEvent ready_event)
     qsz = driver_deq(dp->port_num, dp->outBufSize);
     dp->outBufSize = 0;
     dp->outbuf = NULL;
-#ifdef HARD_POLL_DEBUG
-    poll_debug_write_begin(dp->out.ov.hEvent);
-#endif
     error = get_overlapped_result(&dp->out, &bytesWritten, TRUE);
-#ifdef HARD_POLL_DEBUG
-    poll_debug_write_done(dp->out.ov.hEvent,bytesWritten);
-#endif
 
     if (error != NO_ERROR) {
         (void) driver_select(dp->port_num, ready_event, ERL_DRV_WRITE, 0);
@@ -3305,11 +3266,7 @@ void erl_sys_init(void)
 	break;
     case VER_PLATFORM_WIN32_NT:
 	DEBUGF(("Running on Windows NT"));
-#ifdef DISABLE_NAMED_PIPES
-	use_named_pipes = FALSE;
-#else
 	use_named_pipes = TRUE;
-#endif
 	break;
     default:			/* Unsupported platform. */
 	exit(1);

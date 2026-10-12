@@ -417,11 +417,7 @@ void
 erl_sys_init(void)
 {
 
-#ifdef USE_SETLINEBUF
-    setlinebuf(stdout);
-#else
     setvbuf(stdout, (char *)NULL, _IOLBF, BUFSIZ);
-#endif
 
     erts_sys_init_float();
 
