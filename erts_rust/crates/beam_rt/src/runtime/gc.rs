@@ -389,6 +389,26 @@ impl Runtime {
         &mut self.gc.walk
     }
 
+    /// Moves the valve's **reused** walk scratch *out* of the runtime — the delivery seam's
+    /// disjoint-borrow door.
+    ///
+    /// The unscanned-root valve classifies a word against the *receiver's* own collector, so the
+    /// delivery seam ([`crate::context`]) must hold a `&Process` and the walk's scratch at the
+    /// same time. The receiver is reached through a process table that may be the runtime's own
+    /// (`runtime.processes`), and Rust cannot see that `ProcessTable` and `GcState` are disjoint
+    /// through a `&mut Runtime`. Moving the scratch out for the duration sidesteps that: the
+    /// swap is `O(1)` ([`std::mem::take`] leaves the empty default behind), the caller owns the
+    /// scratch while it walks, and [`Runtime::put_walk_scratch`] hands it back unchanged — so the
+    /// reuse (and the "a walk allocates nothing after warm-up" property) is preserved.
+    pub(crate) fn take_walk_scratch(&mut self) -> WalkScratch {
+        std::mem::take(&mut self.gc.walk)
+    }
+
+    /// Puts back the scratch [`Runtime::take_walk_scratch`] moved out.
+    pub(crate) fn put_walk_scratch(&mut self, scratch: WalkScratch) {
+        self.gc.walk = scratch;
+    }
+
     /// Records that `pid`'s collection failed, and stops collecting for it.
     ///
     /// The pre-GC runtime was an unbounded arena that could not fail at the heap-admission

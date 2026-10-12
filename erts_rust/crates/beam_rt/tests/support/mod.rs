@@ -167,8 +167,34 @@ enum Probe {
 /// binary, and the ones that never run a bounded child of their own would otherwise warn.
 #[allow(dead_code)]
 pub fn run_bounded(program: &Path, args: &[&str]) -> Option<Output> {
+    run_bounded_with_env(program, args, &[])
+}
+
+/// As [`run_bounded`], but with `env` applied to the child's environment: a `Some` value
+/// **sets** the variable and a `None` value **removes** it.
+///
+/// The child is the only process whose environment changes — the test process's own
+/// environment is never mutated (the crate is `#![deny(unsafe_code)]`, and `set_var` is
+/// `unsafe` in edition 2024), so a run can pin (or explicitly clear) an inherited setting
+/// such as `BEAM_RT_TIER` without affecting any other test in the binary.
+///
+/// `#[allow(dead_code)]`: this shared module is compiled into **every** integration-test
+/// binary, and the ones that never pin an environment variable would otherwise warn.
+#[allow(dead_code)]
+pub fn run_bounded_with_env(
+    program: &Path,
+    args: &[&str],
+    env: &[(&str, Option<&str>)],
+) -> Option<Output> {
     let mut command = Command::new(program);
     command.args(args);
+    for (key, value) in env {
+        if let Some(value) = value {
+            command.env(key, value);
+        } else {
+            command.env_remove(key);
+        }
+    }
     match run_probe(command) {
         Probe::Exited(output) => Some(output),
         Probe::TimedOut | Probe::Failed => None,

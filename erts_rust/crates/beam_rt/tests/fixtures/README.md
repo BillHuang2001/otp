@@ -33,6 +33,31 @@ also the differential oracle.
   `timeout`, the compiler-folded `after 0`, a matched queued message, a message that **cancels**
   an armed deadline, and a bare `wait`).
 
+## The scheduled-route `epp` pair (`epp_forms.erl` / `epp_input.erl`, compiled at test time)
+
+`tests/compile_file.rs::a_scheduled_process_parses_a_source_file_like_the_oracle` drives the
+`epp:parse_file/3` read path from a **scheduled `run`** process, which is the route on which a
+delivery-driven collection of the parked receiver used to corrupt its live scan options:
+
+* `epp_forms.erl` is the **driver**: `go/1` takes the input source file as a char list, runs
+  `epp:parse_file(File, [], [])` and answers `{length(Forms), [element(1, F) || F <- Forms]}` — a
+  pure `~w`-printing value, so `beam_rt run …` stdout and the oracle's
+  `io:format("~w~n", [epp_forms:go(File)])` are directly comparable.
+* `epp_input.erl` is the **input**: `-module(epp_input). -export([f/0]). f() -> 1.` — legacy
+  syntax only (no maps, no binaries), so the scan options stay on the plain cons cell.
+* The driver is compiled with the system `erlc` into a scratch directory (both files'
+  **contents** are `include_str!`-embedded by the suite, so nothing is read relative to the
+  test's CWD; the scratch dir is the only `-pa` given to either runtime).
+
+Oracle (the same artifacts under the real system `erl`): `epp` prepends its own
+`{attribute, _, file, _}` form, so the answer is the three source forms plus that attribute and
+the trailing `eof`:
+
+```sh
+erl -noshell -pa "$DIR" -eval 'io:format("~w~n",[epp_forms:go("'$DIR'/epp_input.erl")]), halt(0).'
+# {5,[attribute,attribute,attribute,function,eof]}
+```
+
 ## Driver fixtures (never committed — compiled at test time)
 
 `event_driver.c` and `event_driver.erl` are the **driver event/timer** pair for
