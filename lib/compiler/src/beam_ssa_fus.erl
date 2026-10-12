@@ -22,7 +22,7 @@
 
 %%%
 %%% This pass performs "operation fusion": it replaces a pair of operations by
-%%% a single, exactly equivalent, cheaper one. Four transformations are
+%%% a single, exactly equivalent, cheaper one. Five transformations are
 %%% implemented; all are opt-in (compile option `fusion_opt') and share the
 %%% rule that nothing is rewritten unless every condition checked by the pass
 %%% holds, so every uncertain case is left untouched.
@@ -32,10 +32,14 @@
 %%% that the map is probed once instead of twice. Fusion 5 is the same
 %%% redundancy for the `maps:get/2' spelling of an extraction.
 %%%
-%%% Fusion 4 is "arithmetic constant-chain fusion": it folds a multiplication
-%%% by an integer constant whose result is immediately multiplied by a second
-%%% integer constant into a single multiplication by the product of the two
-%%% constants.
+%%% Fusion 4 and Fusion 6 are "arithmetic constant-chain fusion": they fold a
+%%% chain of two operations by an integer constant into a single operation by a
+%%% constant folded at compile time - a multiplication chain (Fusion 4) and the
+%%% division/remainder chains (Fusion 6). Those two, together with the small SSA
+%%% vocabulary the whole pass is written in (predecessors, phi detection, use
+%%% counting, argument types) and the reasoning that makes a fold exact and
+%%% exception preserving, live in the sibling module `beam_ssa_fus_arith'; this
+%%% module delegates to it exactly as it does to its own map fusions.
 %%%
 %%% Fusion 1 (implemented): when the last instruction of a block is
 %%%
@@ -141,66 +145,20 @@
 %%% `66: get_tuple_element/3`), so there is no instruction for the pass to
 %%% emit. Out of scope.
 %%%
-%%% Fusion 4 (implemented): multiplication by a constant chain. When the last
-%%% two instructions of a block are
+%%% Fusion 4 (implemented) and Fusion 6 (implemented) are the arithmetic
+%%% constant chains, in the sibling module `beam_ssa_fus_arith`, whose
+%%% moduledoc describes the shape they match, the folds, the safety argument of
+%%% each of them and the arithmetic chains that are deliberately not folded:
 %%%
-%%%     D1 = bif:'*'(V, K1)                      (K1 an integer literal)
-%%%     Bool = succeeded:body(D1)
-%%%     br Bool, LSucc, LFail
+%%%   * Fusion 4: `(V * K1) * K2' -> `V * (K1 * K2)'.
+%%%   * Fusion 6 (a): `(V div K1) div K2' -> `V div (K1 * K2)'.
+%%%   * Fusion 6 (b): `(V rem K1) rem K2' -> `V rem K2' (K1 a multiple of K2).
+%%%   * Fusion 6 (c): `(V * K1) div K2' -> `V * (K1 div K2)' (K2 divides K1,
+%%%     and the intermediate `V * K1' is provably bounded).
 %%%
-%%% and LSucc consists of nothing but
-%%%
-%%%     D2 = bif:'*'(D1, K2)                     (K2 an integer literal)
-%%%     B2 = succeeded:body(D2)
-%%%     br B2, LFinal, LFail2
-%%%
-%%% and LSucc is reachable only from the multiplication block, then the two
-%%% multiplications are replaced by a single one in the *first* block:
-%%%
-%%%     D2 = bif:'*'(V, K1 * K2)
-%%%     Bool = succeeded:body(D2)
-%%%     br Bool, LFinal, LFail
-%%%
-%%% LSucc is then unreachable and is dropped, and its definitions are gone:
-%%% `D1' must not be used anywhere else, and the `D2' definition (which keeps
-%%% its name and therefore all of its uses, including any beyond LSucc) moves
-%%% to the first block, which dominates everything LSucc dominated because
-%%% LSucc's only predecessor is the first block.
-%%%
-%%% Semantics preserved:
-%%%
-%%%   * `K1 * K2' is evaluated at compile time by the compiler itself; integer
-%%%     arithmetic in Erlang is exact and unbounded (bignums), so it cannot
-%%%     overflow and is associative. For any integer V,
-%%%     `(V * K1) * K2 = V * (K1 * K2)' exactly.
-%%%   * The rewrite is only applied when the type analysis has proven the
-%%%     *first operand* (V) to be an integer (`#t_integer{}'), which makes
-%%%     both constants integers too. This is essential: `*' is NOT associative
-%%%     for floats (`(X * 0.1) * 0.1 =/= X * 0.01'), and an untyped operand
-%%%     could be a float at run time.
-%%%   * The failure set is unchanged. `V * K1' raises `badarith' exactly when V
-%%%     is not a number, which is impossible for a proven integer, so neither
-%%%     multiplication can raise and the fused one cannot either. The first
-%%%     multiplication keeps its failure edge (LFail) untouched; the failure
-%%%     edge LFail2 of the removed multiplication (which could only be taken if
-%%%     `D1', a number, were not a number) simply becomes unreachable, exactly
-%%%     as when the type analysis proves a guard cannot fail.
-%%%   * Instruction order and the error position are unchanged: the fused
-%%%     multiplication takes the position of the first one (keeping its source
-%%%     location annotation), and no instruction is added to any block.
-%%%   * The type annotations of the rewritten instruction are dropped, since
-%%%     the value it now defines is different; they are recomputed by the type
-%%%     passes on the next iteration.
-%%%
-%%% The gain is one multiplication and one guard test less per fused link; a
-%%% chain of n constant multiplications collapses into a single one through
-%%% repeated applications (each application drops one block).
-%%%
-%%% Nothing is rewritten unless all of the conditions checked by
-%%% `maybe_fuse_4/8' hold; every uncertain case is left untouched. In
-%%% particular, an earlier multiplication whose intermediate result is used
-%%% anywhere else, or a chain link whose block is not exclusively reached from
-%%% the multiplication, is left alone.
+%%% All of them require the operand to be type-proven to be an integer, and
+%%% nothing is rewritten unless all of the conditions checked by
+%%% `beam_ssa_fus_arith' hold; every uncertain case is left untouched.
 %%%
 %%% Fusion 5 (implemented) is Fusion 1's redundancy for the `maps:get/2'
 %%% spelling of a map extraction. `maps:get/2' is a guard BIF and is therefore
@@ -244,26 +202,19 @@
 %%%     instruction (literal lists are built through the literal pool by the
 %%%     loader), and the elements of the list are not known to be constants.
 %%%     Out of scope.
-%%%   * `X * C1 div C2' -> `X * (C1 div C2)': NOT exact. Integer division
-%%%     truncates, so the rewrite only preserves the value when C2 divides C1
-%%%     exactly (`C1 rem C2 =:= 0', with C2 > 0); `5 * 3 div 2' is 7 while
-%%%     `5 * (3 div 2)' is 5. The narrowing rewrite `(X * C1) div C2' ->
-%%%     `X * (C1 div C2)' would therefore need a divisibility proof for both
-%%%     constants on top of the integrality proof for X, and it would have to
-%%%     keep the `div' when C2 does not divide C1. The precondition is
-%%%     provable (both constants are literals) but the pattern is rare enough
-%%%     that it has not been implemented; the safe special case `C1 div C2' is
-%%%     already folded by the compiler when both operands are literals.
-%%%   * Nested `bsl'/`bsr' shifts, e.g. `(X bsl A) bsr B' -> `X bsl (A - B)':
-%%%     the fused BEAM form *does* exist (`{bif,bsl,..}'/`{bif,bsr,..}' are
-%%%     single BIFs) and the fold is exact for a proven integer X and literal
-%%%     shifts, because `bsl' is "multiply by 2^Shift" and shifts compose
-%%%     additively for both signs of the shift. It is not implemented because
-%%%     the compiler already strength-reduces multiplication chains
-%%%     (`beam_ssa_loop_opt' under its own flag, `beam_ssa_type:reassociate/3'
-%%%     for literals) and a *shift* chain of two literal shifts is folded by
-%%%     the constant folding in `sys_core_fold' before this pass ever sees it;
-%%%     there is no measured case left for it in the tree.
+%%%   * Arithmetic chains whose constants do not divide (`X * C1 div C2' with
+%%%     C2 not dividing C1 is NOT exact, since integer division truncates:
+%%%     `5 * 3 div 2' is 7 while `5 * (3 div 2)' is 5), a chain through a zero
+%%%     divisor (`X div 0'/`X rem 0' raise `badarith'), an operand that is not
+%%%     type-proven to be an integer (a float or untyped operand may be a
+%%%     float at run time, and `*' is not associative for floats), an operand
+%%%     whose magnitude cannot be proven bounded where the fold removes a
+%%%     growing intermediate product, and a chain whose first operand is the
+%%%     constant rather than the variable: all declined, with the full
+%%%     reasoning, in `beam_ssa_fus_arith'. `(X * C1) rem C2' is expressible but
+%%%     saves no instruction, and nested `bsl'/`bsr' chains are folded by
+%%%     `sys_core_fold' (or, for unbounded shift counts, must not be rewritten
+%%%     at all, since `erts_bsl' raises `system_limit').
 %%%   * `get_map_element' chains: `D1 = map_get(K1, M), D2 = map_get(K2, D1)'
 %%%     and friends. There is no fused BEAM instruction for a map lookup whose
 %%%     operand is the result of another map lookup, and `map_get/2' on a value
@@ -280,6 +231,11 @@
 
 -include("beam_ssa.hrl").
 -include("beam_types.hrl").
+
+%% The SSA vocabulary and the arithmetic constant-chain fusions (Fusion 4 and
+%% Fusion 6) live in the sibling module `beam_ssa_fus_arith'.
+-import(beam_ssa_fus_arith,
+        [preds/2, has_phi/2, use_count/2, anno_arg_type/1, is_map_type/1]).
 
 -import_record(beam_ssa_opt, [opt_st, func_info]).
 
@@ -301,16 +257,16 @@ ssa_opt_fus({#opt_st{ssa=Blocks0}=St, FuncDb}) ->
 %% and whose success edge either starts with a `get_map_element' of the same
 %% map and key (Fusion 1) or with the `map_get/2' lookup of the same map and
 %% key (Fusion 5), or is again a `has_map_field' test of the same map
-%% with the same failure label (a possible Fusion 2 test chain), or a block
-%% whose branch is on the success guard of a multiplication by an integer
-%% constant and whose successor starts with a multiplication of its result by
-%% another integer constant (Fusion 4).
+%% with the same failure label (a possible Fusion 2 test chain), or the head of
+%% an arithmetic constant chain (Fusion 4/6, whose own precondition is
+%% `beam_ssa_fus_arith:candidate/2').
 %%
 %% This is only a NECESSARY condition - a cheap filter that lets the driver
 %% skip the pass for functions that cannot fuse anything. Whether the fusion
 %% is actually legal (the map operand must be type-proven to be a map, the
 %% extraction must be the only thing on the success edge, the two chains must
-%% cover the same keys, ...) is decided by the pass itself.
+%% cover the same keys, the operand of an arithmetic chain must be type-proven
+%% to be an integer, ...) is decided by the pass itself.
 -spec eligible({#opt_st{}, term()}) -> boolean().
 eligible({#opt_st{ssa=SSA}, _FuncDb}) ->
     has_candidate(maps:from_list(normalize(SSA))).
@@ -318,9 +274,8 @@ eligible({#opt_st{ssa=SSA}, _FuncDb}) ->
 has_candidate(Blocks) ->
     lists:any(fun({_L,Blk}) ->
                       candidate_block(Blk, Blocks)
-                          orelse mul_candidate(Blk, Blocks)
+                          orelse beam_ssa_fus_arith:candidate(Blk, Blocks)
               end, maps:to_list(Blocks)).
-
 candidate_block(#b_blk{is=Is,last=#b_br{bool=Bool,succ=LSucc,fail=LFail}}, Blocks) ->
     case lists:reverse(Is) of
         [#b_set{op=has_map_field,dst=Bool,args=[Map,Key]}|_] ->
@@ -352,24 +307,7 @@ candidate_succ(Blocks, LSucc, Map, Key, LFail) ->
             false
     end.
 
-%% Fusion 4 candidate: the block ends with a multiplication by an integer
-%% constant (guarded by its `succeeded' test), and the successor starts with a
-%% multiplication of that result by another integer constant.
--spec mul_candidate(beam_ssa:b_blk(), beam_ssa:block_map()) -> boolean().
-mul_candidate(Blk, Blocks) ->
-    case mul_head(Blk) of
-        {_Prefix,_Guard,_Mul,D,_V,_K1,LSucc} ->
-            case Blocks of
-                #{LSucc := #b_blk{is=[#b_set{op={bif,'*'},
-                                             args=[D,#b_literal{val=K2}]}|_]}}
-                when is_integer(K2) -> true;
-                _ -> false
-            end;
-        false ->
-            false
-    end.
-%% The pass runs inside the repeated (fixpoint) phase, where the SSA is kept as
-%% a linearized list. Be defensive in case the representation has been changed
+%% The pass runs inside the repeated (fixpoint) phase, where the SSA is kept as%% a linearized list. Be defensive in case the representation has been changed
 %% by some other pass: always return a list.
 -spec normalize(beam_ssa:block_map() | [{beam_ssa:label(),beam_ssa:b_blk()}]) ->
           [{beam_ssa:label(),beam_ssa:b_blk()}].
@@ -403,7 +341,8 @@ scan([], _Blocks) ->
     false.
 
 %%============================================================================
-%% Fusion driver: Fusion 1, then Fusion 2, then Fusion 4, then Fusion 5.
+%% Fusion driver: Fusion 1, then Fusion 2, then the arithmetic constant chains
+%% (Fusion 4 and Fusion 6, implemented in `beam_ssa_fus_arith'), then Fusion 5.
 %%============================================================================
 
 -spec fuse_blk(beam_ssa:label(), beam_ssa:b_blk(), beam_ssa:block_map()) ->
@@ -413,7 +352,7 @@ fuse_blk(LA, Blk, Blocks) ->
         no ->
             case fuse_2_blk(LA, Blk, Blocks) of
                 no ->
-                    case fuse_4_blk(LA, Blk, Blocks) of
+                    case beam_ssa_fus_arith:fuse_blk(LA, Blk, Blocks) of
                         no -> fuse_5_blk(LA, Blk, Blocks);
                         {yes,_}=Yes -> Yes
                     end;
@@ -722,117 +661,13 @@ rewrite_2(Tests, Extracts, LFinal, LFail, Blocks) ->
 extract_labels(Extracts) -> [L || {L,_,_,_,_,_} <- Extracts].
 
 %%============================================================================
-%% Fusion 4: (V * K1) * K2 -> V * (K1 * K2), K1 and K2 integers
+%% The arithmetic constant chains (Fusion 4 and Fusion 6) and the SSA
+%% vocabulary this pass is written in live in `beam_ssa_fus_arith'.
 %%============================================================================
-
-%% The multiplication chain shape at the end of a block:
-%%
-%%     ...                                              (Prefix)
-%%     D = bif:'*'(V, K)                                (Mul)
-%%     B = succeeded:D                                  (Guard)
-%%     br B, LSucc, LFail
-%%
-%% where `K' is an integer literal and `V' is a variable. Returns the pieces of
-%% that shape, or `false' for any other block. Shared by the eligibility
-%% precondition (`mul_candidate/2') and by the Fusion 4 rewrite
-%% (`fuse_4/10'), so that both look for exactly the same shape.
--spec mul_head(beam_ssa:b_blk()) ->
-          false | {[beam_ssa:b_set()], beam_ssa:b_set(), beam_ssa:b_set(),
-                   beam_ssa:b_var(), beam_ssa:b_var(), integer(),
-                   beam_ssa:label()}.
-mul_head(#b_blk{is=Is,last=#b_br{bool=Bool,succ=LSucc}}) ->
-    case lists:reverse(Is) of
-        [#b_set{op={succeeded,_},dst=Bool,args=[#b_var{}=D]}=Guard,
-         #b_set{op={bif,'*'},dst=D,
-                args=[#b_var{}=V,#b_literal{val=K}]}=Mul | RevPrefix]
-        when is_integer(K) ->
-            {lists:reverse(RevPrefix), Guard, Mul, D, V, K, LSucc};
-        _ ->
-            false
-    end;
-mul_head(_Blk) ->
-    false.
-
-%% Entry point for Fusion 4 at a block whose branch is on the success guard of
-%% a multiplication by an integer constant.
--spec fuse_4_blk(beam_ssa:label(), beam_ssa:b_blk(), beam_ssa:block_map()) ->
-          no | {yes, beam_ssa:block_map()}.
-fuse_4_blk(LA, #b_blk{last=#b_br{}=Br}=Blk, Blocks) ->
-    case mul_head(Blk) of
-        {Prefix, Guard, Mul, D1, V, K1, LSucc} ->
-            fuse_4(LA, Prefix, Guard, Mul, D1, V, K1, Br, LSucc, Blocks);
-        false ->
-            no
-    end;
-fuse_4_blk(_LA, _Blk, _Blocks) ->
-    no.
-
-fuse_4(LA, Prefix, Guard, Mul, D1, V, K1, Br, LSucc, Blocks) ->
-    case Blocks of
-        #{LSucc := #b_blk{is=[#b_set{op={bif,'*'},dst=D2,
-                                     args=[D1,#b_literal{val=K2}]},
-                                #b_set{op={succeeded,_},dst=B2,args=[D2]}],
-                          last=#b_br{bool=B2,succ=LFinal,fail=LFail2}}}
-        when is_integer(K2) ->
-            Type = anno_arg_type(Mul),
-            case maybe_fuse_4(LA, LSucc, LFinal, LFail2, D1, B2, Type, Blocks) of
-                true ->
-                    %% The type annotations of the rewritten instruction are
-                    %% dropped: the value it now defines is a different one.
-                    Anno = maps:without([arg_types,result_type], Mul#b_set.anno),
-                    Mul1 = Mul#b_set{anno=Anno, dst=D2,
-                                     args=[V,#b_literal{val=K1 * K2}]},
-                    Is = Prefix ++ [Mul1, Guard#b_set{args=[D2]}],
-                    A1 = #b_blk{is=Is, last=Br#b_br{succ=LFinal}},
-                    {yes,maps:remove(LSucc, Blocks#{LA => A1})};
-                false ->
-                    no
-            end;
-        #{} ->
-            no
-    end.
-
-%% All the conditions that must hold for the Fusion 4 rewrite to be provably
-%% valid.
--spec maybe_fuse_4(beam_ssa:label(), beam_ssa:label(), beam_ssa:label(),
-                   beam_ssa:label(), beam_ssa:b_var(), beam_ssa:b_var(),
-                   false | term(), beam_ssa:block_map()) -> boolean().
-maybe_fuse_4(LA, LSucc, LFinal, LFail2, D1, B2, Type, Blocks) ->
-    Special = ?EXCEPTION_BLOCK,
-    %% `*' is exact for integers but not associative for floats, so the operand
-    %% must be proven to be an integer. This is what makes the two constants
-    %% integers and `K1 * K2' a valid compile-time fold.
-    is_integer_type(Type)
-    %% LSucc is removed and the definition of D2 moves to LA. LA must therefore
-    %% be LSucc's only predecessor, so that it dominates everything LSucc
-    %% dominated; D2 (with an unchanged value) can then keep all of its uses.
-    andalso preds(LSucc, Blocks) =:= [LA]
-    %% The new branch of LA must not reference the removed block or itself.
-    andalso LSucc =/= LFinal
-    andalso LFinal =/= LA
-    %% LSucc is replaced and LFinal is branched to; the exception pseudo block
-    %% is not an ordinary block and must not be part of the rewrite. LFail is
-    %% not checked: it is kept unchanged as the failure edge of the first
-    %% multiplication, and is the exception block for a guard failure.
-    andalso lists:all(fun(L) -> L =/= Special end, [LA,LSucc,LFinal])
-    %% D1 is the intermediate result, which the rewrite eliminates. It may only
-    %% be used by the multiplication that consumes it and by the guard of that
-    %% multiplication; any other use would observe the eliminated value.
-    andalso use_count(D1, Blocks) =:= 2
-    %% The guard of the removed multiplication is used only by its branch.
-    andalso use_count(B2, Blocks) =:= 1
-    %% Phi nodes would have to be rewritten when the predecessor changes; in
-    %% particular LFail2 becomes unreachable, so its phi would keep an entry for
-    %% a block that no longer exists. It is cheaper (and safer) to simply not
-    %% fuse in that case.
-    andalso not has_phi(LSucc, Blocks)
-    andalso not has_phi(LFinal, Blocks)
-    andalso not has_phi(LFail2, Blocks).
 
 %%============================================================================
 %% Fusion 5: has_map_field + map_get -> get_map_element
 %%============================================================================
-
 %% The same redundancy as Fusion 1, but for the other spelling of a map
 %% extraction. `maps:get/2' is compiled to the `map_get/2' BIF (it is a guard
 %% BIF, so it may not expand to a test instruction), which the front end pairs
@@ -983,82 +818,3 @@ maybe_fuse_5(LA, LSucc, LSS, LFail, LFail2, Bool, SBool, HmfType, Blocks) ->
     %% non-map to "false" (and `map_get' would raise `{badmap,Term}' instead).
     %% Only fuse when Map is provably a map here.
     andalso is_map_type(HmfType).
-
-%% The type of the first argument of the instruction, as recorded by
-%% beam_ssa_type. `false` when unknown.
--spec anno_arg_type(beam_ssa:b_set()) -> false | term().
-anno_arg_type(#b_set{anno=Anno}) ->
-    case Anno of
-        #{arg_types := #{0 := Type}} -> Type;
-        #{} -> false
-    end.
-
--spec is_map_type(false | term()) -> boolean().
-is_map_type(#t_map{}) -> true;
-is_map_type(_) -> false.
-
-%% True when the type analysis has proven the value to be an integer. Only
-%% integers may be folded: `*' is exact and associative for them, while it is
-%% neither for floats.
--spec is_integer_type(false | term()) -> boolean().
-is_integer_type(#t_integer{}) -> true;
-is_integer_type(_) -> false.
--spec preds(beam_ssa:label(), beam_ssa:block_map()) -> [beam_ssa:label()].
-preds(L, Blocks) ->
-    [From || {From, #b_blk{last=Last}} <- maps:to_list(Blocks),
-             lists:member(L, successors(Last))].
-
--spec successors(beam_ssa:terminator()) -> [beam_ssa:label()].
-successors(#b_br{succ=S,fail=F}) ->
-    [S,F];
-successors(#b_switch{fail=F,list=Ls}) ->
-    [F | [T || {_,T} <- Ls]];
-successors(#b_ret{}) ->
-    [].
-
--spec has_phi(beam_ssa:label(), beam_ssa:block_map()) -> boolean().
-has_phi(L, Blocks) ->
-    case Blocks of
-        #{L := #b_blk{is=Is}} -> lists:any(fun is_phi/1, Is);
-        #{} -> false
-    end.
-
--spec is_phi(beam_ssa:b_set()) -> boolean().
-is_phi(#b_set{op=phi}) -> true;
-is_phi(_) -> false.
-
--spec use_count(beam_ssa:b_var(), beam_ssa:block_map()) -> non_neg_integer().
-use_count(Var, Blocks) ->
-    maps:fold(fun(_L, #b_blk{is=Is,last=Last}, Acc) ->
-                      Acc + count_is(Var, Is) + count_last(Var, Last)
-              end, 0, Blocks).
-
--spec count_is(beam_ssa:b_var(), [beam_ssa:b_set()]) -> non_neg_integer().
-count_is(V, [#b_set{op=phi,args=Args}|Is]) ->
-    phi_count(V, Args) + count_is(V, Is);
-count_is(V, [#b_set{args=Args}|Is]) ->
-    arg_count(V, Args) + count_is(V, Is);
-count_is(_V, []) ->
-    0.
-
--spec phi_count(beam_ssa:b_var(), [beam_ssa:argument()]) ->
-          non_neg_integer().
-phi_count(V, [{V0,_}|T]) when V0 =:= V -> 1 + phi_count(V, T);
-phi_count(V, [_|T]) -> phi_count(V, T);
-phi_count(_V, []) -> 0.
-
--spec arg_count(beam_ssa:b_var(), [beam_ssa:argument()]) ->
-          non_neg_integer().
-arg_count(V, [A|T]) when A =:= V -> 1 + arg_count(V, T);
-arg_count(V, [_|T]) -> arg_count(V, T);
-arg_count(_V, []) -> 0.
-
--spec count_last(beam_ssa:b_var(), beam_ssa:terminator()) ->
-          non_neg_integer().
-count_last(V, #b_br{bool=B}) -> eq(V, B);
-count_last(V, #b_switch{arg=A}) -> eq(V, A);
-count_last(V, #b_ret{arg=A}) -> eq(V, A);
-count_last(_V, _Last) -> 0.
-
--spec eq(term(), term()) -> 0 | 1.
-eq(A, B) -> case A =:= B of true -> 1; false -> 0 end.

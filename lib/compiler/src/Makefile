@@ -73,6 +73,7 @@ MODULES =  \
 	beam_ssa_destructive_update \
 	beam_ssa_fbip \
 	beam_ssa_fus \
+	beam_ssa_fus_arith \
 	beam_ssa_lint \
 	beam_ssa_loop_arith \
 	beam_ssa_loop_cfg \
