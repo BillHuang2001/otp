@@ -257,6 +257,14 @@ because it cannot be duplicated.
   `concat!(env!("CARGO_MANIFEST_DIR"), "/../../../bootstrap/bin/start.boot")`; system-install tests
   **skip loudly** when `erl`/`erlc` or the file are absent. The in-crate tests hand that path to `read`,
   never as a `-boot` CLI value, so its shape is not a factor here.
+- `boot/drive.rs`: **no in-file `#[cfg(test)]` module** (0 `#[test]`s) — the bounded burst/`drive_scheduler`
+  logic is pinned indirectly by `bootscript.rs`'s synthetic-script tests
+  (`a_boot_spawned_process_answers_a_blocked_apply`, `a_kernel_process_registers_its_own_directive_name`,
+  `a_kernel_process_burst_waits_for_the_directive_to_return`, `registering_a_live_boot_name_is_badarg`)
+  and by `../tests/boot.rs` (`the_boot_chains_kernel_processes_survive_their_directive_processes`).
+- In-file `#[test]` counts: `bootscript.rs` **12** (lines 725–1855), `preloaded.rs` **3** (lines 75–143),
+  `drive.rs` **0** — directory total **15**; the module root `../boot.rs` adds **9** (its own
+  `#[cfg(test)] mod tests`).
 - `../runtime.rs`: `boot_is_idempotent_and_reports_itself` pins `preloaded_loaded()` = the whole registry;
   `boot_from_script_reporting` is the boot-stop-position entry point, and the in-crate boot-script suite
   exercises the `execute_reporting`/`BootStop` report API a genuine future stop would use.
