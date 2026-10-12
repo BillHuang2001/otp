@@ -196,6 +196,7 @@ Each entry here is the module's one-line purpose; the per-child API detail lives
 * `M1_GAPS.md` → the companion holding the per-item detail of the `Known Issues / Intentional M1 gaps` section above, of the longest cross-node handoffs, and of the GC-relocation hazards.
 * `DESIGN_DECISIONS.md` → the companion holding the design rationale and the binding invariants of the runtime glue.
 * `TEST_STRATEGY.md` → the companion holding the crate's test strategy (unit, code-path, seam, floor, contract, GC and performance suites).
+* `EPP_SCHEDULED_ROUTE_FINDINGS.md` → the A.9 scheduled-(`run`)-route dossier: the live mature cell a delivery-driven collection loses when it is reachable only through a container outside the from-set, the runtime's valve consultation at the delivery seam that declines it, and the patch owed to `beam_process`/`beam_gc`.
 * Read-only cross-repo: `../beam_engine/src/context.rs` (the seam implemented here), `../beam_bifs/`, `../beam_abi/{nif,driver}` (the anchored codegen units), `../beam_loader/tests/fixtures/slice.beam`; the legacy C ground truth for A.3/A.4/A.6/A.7/A.8 under `../../erts/` (per-file map in `../../erts/emulator/beam/CONTEXT.md`), `../bootstrap/bin/*.boot`.
 
 ## Handoffs (owned by OTHER nodes)
