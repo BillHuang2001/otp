@@ -49,8 +49,9 @@ framing, handshake message codecs + MD5 authentication, the byte-exact distribut
 fragmentation/reassembly, the **outbound and inbound distribution atom cache**, the control-message
 codec (all 30 `Dop` variants), inbound `DOP_*` delivery classification, the `epmd` client (real TCP
 lookup + the full request set), a blocking `Connection` API, and a **non-blocking `ConnectionDriver`**
-(the poll/step state machine). `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p
-beam_dist` is green (**337 tests + 1 doc-test**) and the workspace builds warning-free; the crate is
+(the poll/step state machine), plus a `src/bin/dist_probe.rs` CLI that exposes the hermetic two-node
+loopback to the differential harness. `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p
+beam_dist` is green (**353 tests + 1 doc-test**) and the workspace builds warning-free; the crate is
 safe Rust (`#![deny(unsafe_code)]`).
 
 **All 30 `Dop` opcodes round-trip exhaustively.** `tests/dop_roundtrip.rs` drives every variant through
@@ -340,6 +341,24 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
 - Runtime drive loop: `read → feed → loop{step until WouldBlock} → take_output → write → while
   next_message{ handle }`; `Closed`/`Failed` mean drop the link.
 
+### `src/bin/dist_probe.rs` — the hermetic-loopback CLI (bin target, not part of the library API)
+`dist_probe loopback <report>`, `<report>` ∈ `ping` | `nodes` | `term`. Cargo auto-discovers
+`src/bin/`, so no `Cargo.toml` change. The bin is **self-contained** (it re-uses only the crate's
+public API — `Connection`/`TcpListener`/`TcpTransport`/`Delivery`/`send_reg_send`/`send_message`/
+`recv_delivery` — plus `beam_codec::{VERSION_MAGIC, encode_term_body}`): it stands up two in-process
+endpoints over a real loopback socket, completes the `'N'` handshake both ways, sends a `{1,2,3}`
+tuple A→B as a `DOP_REG_SEND`, has B echo it to A's pid as a `DOP_SEND(_SENDER)`, receives it on A,
+and derives the report from that observed state.
+- Success prints **exactly one** stdout line and exits `0`: `ping` → `pong` (iff both handshakes
+  completed, else `pang`); `nodes` → `1` (peers node A handshook with); `term` → the uppercase hex of
+  the **received** term's ETF image, `hex(VERSION_MAGIC ++ encode_term_body(received))` =
+  `836803610161026103` for `{1,2,3}`.
+- An unknown/missing subcommand → a usage line on **stderr**, exit `2`. A loopback that cannot be set
+  up → `dist_probe: unsupported: <reason>` on **stderr**, exit `3` (the harness's capability-gap
+  convention) — never a fabricated `pong`/`1`/hex.
+- Bin target: its own `#![deny(unsafe_code)]` + `//!` doc (crate lints are not inherited by a bin);
+  safe Rust only.
+
 ## Constraints
 - **Safe Rust only** — `#![deny(unsafe_code)]`. `TcpTransport` uses only `std::net`.
 - **Errors**: only `beam_common::{Result, BeamError}`. Malformed/short/unknown wire data ⇒ `BadArg`;
@@ -427,6 +446,10 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
     cross-check** that spawns a real node with `erl -epmd_port <stub>` and asserts the stub parsed the
     node's `ALIVE2_REQ` and the crate's client resolved its port. Needs no host `epmd`; skips loudly
     only when `erl` is absent.
+  - `tests/dist_probe_cli.rs` — drives the built `dist_probe` bin via `env!("CARGO_BIN_EXE_dist_probe")`:
+    for each of `ping`/`nodes`/`term` the **exact** stdout line and exit `0` (and empty stderr), plus
+    exit `2` for a missing/unknown/over-long subcommand. The bin also carries a `#[cfg(test)]` unit test
+    for the `term` hex encoding.
 
 ## Design Decisions
 - **MD5 is implemented in-tree, not via a dependency.** The digest is one 16-byte hash; `md-5` would
@@ -616,6 +639,8 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
 - `src/epmd.rs` → `epmd` request/response codecs (incl. the `DUMP`/`KILL`/`STOP` admin set +
   `MAX_DUMP_RESP_BODY`), `EpmdClient` over `Transport` (`publish`/`port_please`/`names`/`dump`/`kill`/
   `stop`), and the real TCP client (`connect`/`lookup`/`lookup_port`, `EPMD_DEFAULT_ADDR`)
+- `src/bin/dist_probe.rs` → the hermetic two-node loopback CLI (`dist_probe loopback <ping|nodes|term>`)
+  the differential harness drives as an external command; not part of the library API
 - `tests/{constants,auth,handshake,framing,control,delivery,dop_roundtrip,epmd,fragment,atom_cache,connection,driver}.rs`
   → seams
 - `tests/common/mod.rs` → the shared real-`erl` spawn/harness (`ErlangNode`, `erl_hostname`, `free_port`,
@@ -631,6 +656,8 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
   non-blocking-socket `ConnectionDriver` pair, clean-close vs abrupt-drop peer death) — no `erl`/`epmd`
 - `tests/hermetic_epmd.rs` → test-local `epmd` registry stub (ALIVE2/PORT2/NAMES/STOP) + the crate
   client hermetically + an `erl -epmd_port <stub>` oracle cross-check — no host `epmd`
+- `tests/dist_probe_cli.rs` → the `dist_probe` bin's CLI contract (exact stdout + exit 0 for the three
+  reports; exit 2 on a usage error), run via `env!("CARGO_BIN_EXE_dist_probe")`
 - `../../../erts/emulator/beam/dist.h` · `dist.c` · `external.c` · `external.h` · `packet_parser.c` →
   authoritative flags/opcodes/header/framing/fragmentation (read-only)
 - `../../../erts/doc/guides/erl_dist_protocol.md` + `erl_ext_dist.md` → the wire guides (read-only)
