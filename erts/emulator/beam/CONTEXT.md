@@ -1,3 +1,7 @@
+---
+skill:
+  - beam-subsystems-reference
+---
 # erts/emulator/beam/ — BEAM emulator core (VM implementation)
 
 ## Intent
