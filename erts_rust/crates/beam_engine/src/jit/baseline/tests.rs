@@ -1410,6 +1410,169 @@ fn the_block_spills_its_cached_registers_before_a_helper_call() {
 }
 
 // ---------------------------------------------------------------------------
+// a collecting helper must not leave a cached heap term stale
+// ---------------------------------------------------------------------------
+
+/// The sentinel a [`MovingCtx`] writes into the **from-space** element word of the
+/// tuple it relocates. A compiled block that re-uses its pre-relocation cached word
+/// (instead of reloading from `machine.x` after the collecting helper) observes this.
+const POISONED_ELEMENT: i64 = 777;
+
+/// A context that genuinely **moves a heap term** at the heap-admission point.
+///
+/// A Stage-4 per-process copying collector relocates the live young heap and rewrites
+/// every root **in place**: the heap tuple in `x_regs[0]` is moved into a fresh block
+/// and the moved word is written back into the root set. The from-space copy is then
+/// poisoned — its element word set to [`POISONED_ELEMENT`], its header left a valid
+/// `arityval(1)` so an inlined tuple read on the stale pointer still succeeds — and the
+/// context's arena never frees, so a stale read is a deterministic wrong answer
+/// (`777`) rather than a wild pointer: exactly the observable this experiment needs.
+struct MovingCtx {
+    inner: MinimalContext,
+    relocations: u32,
+}
+
+impl MovingCtx {
+    fn new() -> MovingCtx {
+        MovingCtx {
+            inner: MinimalContext::new(),
+            relocations: 0,
+        }
+    }
+}
+
+impl ExecutionContext for MovingCtx {
+    fn call_bif(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<Eterm> {
+        self.inner.call_bif(module, function, arity, args)
+    }
+
+    fn ensure_heap(
+        &mut self,
+        heap_need: u32,
+        live: u32,
+        x_regs: &mut [Eterm],
+        stack: &mut [Eterm],
+    ) -> Result<()> {
+        // Reachable through the defaulted `ensure_heap_full`, which forwards the whole
+        // x-register file here — so `x_regs[0]` is a live, published root.
+        let old = x_regs[0];
+        if unsafe { beam_term::is_tuple(old) } {
+            let old_hdr = beam_term::tuple_val(old);
+            // SAFETY: `old` is a live boxed tuple on the context heap (its arena is not
+            // freed before the context drops) and `old_hdr` addresses its `arityval(1)`
+            // header, so `[0]` is that header word and `[1]` its sole element.
+            let (header, element) = unsafe { (*old_hdr, *old_hdr.add(1)) };
+            let fresh = self.inner.alloc_words(2)?;
+            // SAFETY: `fresh` is a non-null 2-word block owned by the context heap and
+            // not aliased elsewhere; the two stores initialize both its words.
+            unsafe {
+                *fresh = header;
+                *fresh.add(1) = element;
+                // The stale-word trap: a block that reads its pre-relocation cached
+                // word sees this instead of the moved term's real element.
+                *old_hdr.add(1) = make_small(POISONED_ELEMENT);
+            }
+            let moved = beam_term::make_tuple(fresh);
+            // Preserve the boxed word's literal-area bit, as a real relocation must.
+            let word = moved.raw() | (old.raw() & beam_term::TAG_LITERAL_PTR);
+            x_regs[0] = Eterm::from_raw(word);
+            self.relocations += 1;
+        }
+        self.inner.ensure_heap(heap_need, live, x_regs, stack)
+    }
+
+    fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm> {
+        self.inner.alloc_words(n)
+    }
+}
+
+/// A compiled block's cached x-registers **must be reloaded** after a helper that can
+/// collect: a collecting host relocates the young heap and rewrites `machine.x` in
+/// place, so a callee-saved cache register is stale the moment the helper returns. The
+/// invariant this guards is the `fill` in `emit_continue_check` (see `super::emit`): a
+/// block that continued at `pc + 1` on the stale cache would read a from-space term —
+/// here the poisoned element of the pre-relocation tuple — and produce a wrong result.
+///
+/// The design **isolates the collection boundary**: the tuple is the run's argument, so
+/// the block's prologue loads it into a cache register and the *only* helper between
+/// that load and the native read is the collecting `test_heap`. `get_tuple_element
+/// X(0) 0 X(0)` is then an inlined read of the cached register
+/// (`try_inline_get_tuple_element`, see `super::emit`); a missing post-helper reload
+/// returns the poisoned from-space element ([`POISONED_ELEMENT`]) instead of the real
+/// element (`5`).
+#[test]
+fn a_collecting_helper_does_not_leave_a_cached_heap_term_stale() {
+    let module = build_module(
+        "moving_collect",
+        &[],
+        vec![(
+            "f",
+            1,
+            vec![
+                Instr::Label(Label(1)),
+                Instr::Label(Label(2)),
+                Instr::TestHeap {
+                    heap_need: beam_loader::HeapNeed::Words(2),
+                    live: 1,
+                },
+                Instr::GetTupleElement {
+                    source: Operand::X(0),
+                    element: 0,
+                    dst: Operand::X(0),
+                },
+                Instr::Return,
+            ],
+        )],
+        &[("f", 1, Label(2))],
+    );
+    let name = export_atom(&module, "f");
+
+    // The read must come from a **cached** register, or the experiment proves nothing:
+    // a register addressed directly in `machine.x` is always up to date after a move.
+    let compiled = compile_module(&module).expect("compile the module");
+    assert!(
+        compiled.cached_registers().contains(&0),
+        "x0 must be held in a machine register by the body block, got {:?}",
+        compiled.cached_registers()
+    );
+
+    let mut ctx = MovingCtx::new();
+    // Seed the run's argument with a heap tuple `{5}` the context owns. Its arena is
+    // pointer-stable and never freed, so the term stays valid (and readable) for the
+    // whole run — which is what makes a stale read a wrong answer rather than UB.
+    let arg = {
+        let block = ctx.inner.alloc_words(2).expect("reserve the tuple block");
+        // SAFETY: `block` is a non-null 2-word block owned by the context heap and not
+        // aliased elsewhere; the two stores initialize both of its words.
+        unsafe {
+            *block = beam_term::make_arityval(1);
+            *block.add(1) = make_small(5);
+        }
+        beam_term::make_tuple(block)
+    };
+
+    let mut machine = Machine::new();
+    let outcome = run_compiled_outcome(&compiled, &mut machine, &module, name, 1, &[arg], &mut ctx)
+        .expect("the run deopts and returns");
+    assert_eq!(
+        ctx.relocations, 1,
+        "the `test_heap` must reach the collecting admission point exactly once"
+    );
+    assert_eq!(
+        outcome,
+        RunOutcome::Returned(make_small(5)),
+        "the inlined tuple read must reload x0 after the collecting helper — a stale \
+         cached word returns the poisoned from-space element"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // the block-entry position store
 // ---------------------------------------------------------------------------
 
