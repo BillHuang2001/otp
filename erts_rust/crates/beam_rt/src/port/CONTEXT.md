@@ -66,7 +66,7 @@ The message itself is `RuntimeContext::signal_notify_message(name)` → `(from, 
 
 ## Constraints
 - Crate is `#![deny(unsafe_code)]`: the registry slots operate over a **thread-local** entry list
-  `DRIVER_ENTRIES` (`642`), not a process-global `DriverTable`. The runtime drives every port on one thread.
+  `DRIVER_ENTRIES` (`805`), not a process-global `DriverTable`. The runtime drives every port on one thread.
 - Every driver callback runs under `publishing` → `beam_abi::with_current_host` (`715`), used at
   `start` (`1485`), `ready_*` (`1337`), `output` (`1554`), `timeout` (`1696`) and `stop` (`1737`) — this is
   what lets the two port-less registry slots reach a host during a callback.
