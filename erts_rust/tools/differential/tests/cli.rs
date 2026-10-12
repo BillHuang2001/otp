@@ -402,11 +402,18 @@ fn the_suite_reports_module_agreement_and_expression_capability_gaps() {
     let mut mismatched: Vec<String> = Vec::new();
     for case in json["cases"].as_array().expect("cases") {
         let id = case["case_id"].as_str().expect("a case id");
-        assert_eq!(
-            case["oracle"]["matched_golden"], true,
-            "the oracle drifted from a golden: {case}"
-        );
-        match case["verdict"].as_str().expect("verdict string") {
+        let verdict = case["verdict"].as_str().expect("verdict string");
+        // A `skipped` case never ran (a host tool the case needs is absent — e.g. the
+        // `dist/*` command cases without a built `dist_probe` helper), so its oracle golden was
+        // not checked: that is honest, not drift. Every case that *did* run must have
+        // reproduced its golden.
+        if verdict != "skipped" {
+            assert_eq!(
+                case["oracle"]["matched_golden"], true,
+                "the oracle drifted from a golden: {case}"
+            );
+        }
+        match verdict {
             "agree" => {
                 agree += 1;
                 // No fabricated agreement: an `agree` case reproduced the oracle exactly.
