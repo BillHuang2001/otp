@@ -390,12 +390,6 @@ re-fetch.
   `src/native/prim_file.rs`), so the `#file_info{}` **`access`** slot is served and
   `file:read_file_info/1`/`file:read_link_info/1` on an existing path answer `read_write`, matching the
   oracle.
-* **`beam_message` — an off-heap refc-binary copy mode.** `copy_struct_simple` builds **empty** source and
-  destination off-heap tables, so `copy_refc_binary` cannot resolve a `RefcBinary` payload's backing store
-  (`binary_by_data_ptr` misses) and returns `bad_term` (`BeamError::BadArg`). A self-contained "flatten"
-  copy mode would let `src/runtime.rs::stabilize_term` carry an off-heap result across; the `beam_rt` half
-  is that single `copy_struct_simple` call, pinned red by `tests/empty_binary_result.rs`'s `#[ignore]`d
-  Test B.
 * **`beam_bifs` — the `ets:setopts/2` heir gift copy and the tid-ref mint.** The owner→handle roster
   exists, so a dead owner's *unnamed* table is reclaimed (see the ETS section). Remaining gaps:
   `ets:setopts/2` installs `{heir,…}` through the non-copying `beam_ets::Table::setopts` where
@@ -510,7 +504,6 @@ The residual exposure is a live term held **outside** `process.regs` — a Rust 
 * **`beam_bifs` / `src/context` — the node identity** — the live node atom is fed from `Runtime::local_node()` on every `call_registered` arm; the residual is the **creation**, still the fixed `0` (`bridges.rs` supplies no creation where a live `crate::dist::DistNode::creation()` exists).
 * **Distribution, phase 2** — the inbound link/exit/monitor/alias `DOP_*` families need a `beam_process` remote-peer seam (plus an alias table); `DOP_SEND`/`DOP_REG_SEND` already reach local mailboxes, and a live-peer loop past the handshake needs the `FragmentAssembler` receive-buffer coupling.
 * **`beam_io` / `beam_abi`** — the driver-port lifecycle's remaining asks: `driver_async` needs a **safe** runner for the async `invoke`/`free` pair on `beam_abi`'s `DriverLibrary` (`ready_async` is safely callable and `beam_io`'s `Driver::drive_async` exists, but `beam_rt` never schedules the job, so `DriverHost::r#async` keeps the frozen `-1`); a safe reply-copy helper for a `control` reply the driver answered from its own memory; and a per-registration `ErlDrvEvent` identity. `erl_drv_monotonic_time`'s phase differs because `beam_abi` reads `CLOCK_MONOTONIC` from the system epoch (`erl_drv_time_offset` returns `0`).
-* **`beam_message` — an off-heap refc-binary copy mode** — `copy_struct_simple` builds **empty** off-heap tables, so `src/runtime.rs::stabilize_term` raises `badarg` for a `RefcBinary` payload; a self-contained "flatten" copy mode would let an off-heap result carry across.
 * **`beam_bifs` — the `ets:setopts/2` heir gift copy and the tid-ref mint** — `setopts_2` stores the gift term verbatim where `Table::install_heir` is meant, and an unnamed table's tid ref is minted locally (`runtime::ets_owner::tid_ref_thing`).
 * **`beam_io` — the port table sits behind one `RefCell`** — the `ids` port-number table shares the live ports' single `RefCell`, so the runtime cannot hand the process and port tables out as disjoint borrows and does not route its slices through `Scheduler::run_ready_with_ports`; a split accessor would unblock it.
 * **`beam_bifs` — the registry dispatch cost and the hook-set drift risk** — the per-lookup owned-`String` key tuples (`contains` + `lookup` on the dispatch path) are the largest attributable residual; a borrowed-key `lookup(&str, &str, u32)` would remove them. This crate's `uses_*` gates delegate to `beam_bifs::hook_sets`' exported `needs_*`/`*_BIFS` tables, so a new consumer is picked up automatically.
