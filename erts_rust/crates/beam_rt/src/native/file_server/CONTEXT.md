@@ -122,7 +122,9 @@ headed `binary`/`encoding`; otherwise the reply is the **value** `{error,enotsup
   Typed gaps: a leftover that is a deep iolist /
   non-charlist / negative code point / non-byte-aligned bitstring; an encoding other than
   `latin1`/`unicode`; a pid with no registered device ("closed io device").
-  (A continuation that suspends is **not** a typed gap — see Known Issues.) The `{get_chars,…}`
+  A continuation that suspends in a `receive` **is** this layer's typed capability gap: the
+  device process cannot suspend mid-request, so the request answers `Err(unsupported: …)`,
+  which neither retires the device nor reports `{error, Func}`. The `{get_chars,…}`
   arm serves the stashed buffer **before** any fresh read and `{position,At}` compensates for
   it (see *The shared read buffer* above), and a
   `{utf16,_}`/`{utf32,_}` **stream** is read as `latin1` (a divergence).
@@ -181,7 +183,6 @@ headed `binary`/`encoding`; otherwise the reply is the **value** `{error,enotsup
 - **One owner for the open path.** `{open,…}` routes through the `prim_file:open/2` floor; the
   `setopts` pipeline is a faithful reproduction of `file_io_server`'s, never a simplification.
 ## Known Issues / Test Strategy
-- **A `{get_until,…}` continuation that suspends is answered as a *raise*, not the intended typed gap.** `EngineContinuation::apply` (`get_until.rs:339-345`) sets `raised = true` on **any** `call` failure — including the `RunOutcome::Wait` → `error::unsupported("file_server: the `{get_until,…}` continuation suspended in a receive")` conversion (`get_until.rs:310-318`) — so `serve` (`get_until.rs:183-188`) takes its `Err(_) if raised` arm and replies `{error, <Func>}` while **retiring** the device (`raise_reply`, `:209-219`). The device thus claims the user function raised where the oracle would keep it blocked until a message arrives, and the documented typed gap is unreachable. A reply (never a park), but a fabricated one.
 - **A request sent to a retired device is never drained, so its sender parks forever.** `service_file_requests` scans only `self.file_services.server()` + `self.file_services.devices` keys (`file_server.rs:241-243`); `close` — and any raising `{get_until,…}` (above) — removes the pid via `devices.remove(&service)` (`:321-323`). A later `{file_request,…}`/`{io_request,…}` to that pid then sits in its mailbox with **no** drain step, and its sender waits in `file_request/2`'s untimed `receive` (`lib/kernel/src/file.erl:3068-3077`), so the run quiesces to the typed `blocked()` gap instead of surfacing the orphaned request.
 - **`serve_file_message`/`serve_server_request` silently consume an unrecognised envelope** (`Ok(None)`: `file_server.rs:300-302`/`:314`/`:316-318`/`:328-356`/`:367-372`) — the oracle's `{noreply,State}`. A well-formed `{file_request,…}`/`{io_request,…}`/`{'$gen_call',…}` never takes it (the `file.erl`/`io.erl` wire uses a plain monitor reference as `ReplyAs`, never the `[alias|Ref]` form, which is instead a typed error at `:341-347`), but a malformed envelope would park its sender with no reply and no `DOWN`.
 - [`tests.rs`](tests.rs) pins the wire decoders (`improper_list_head`'s `[alias|Ref]` detection,
@@ -199,7 +200,11 @@ headed `binary`/`encoding`; otherwise the reply is the **value** `{error,enotsup
 - `get_until/tests.rs` pins the `{get_until, …}` request: the protocol decoders (`interpret`,
   `leftover_from`), `Runtime::open_encoding`, the rejections, and the request end to end through
   `Runtime::serve_device_request` over a real temporary file with the real `erl_scan:tokens/4` on
-  the engine (the stashed leftover is fed to the second request). `get_line/tests.rs` pins the
+  the engine (the stashed leftover is fed to the second request), and the failure
+  classification: a typed capability gap (`lists:flatten/2`'s non-protocol return value)
+  leaves the device registered and is never reported as `{error, Func}`, a genuine `Mod:Func`
+  raise (`lists:nth/2` on `[]`) still replies `{error, Func}` **and** retires the device, and
+  `EngineContinuation::classify/1` itself separates the two. `get_line/tests.rs` pins the
   `LineContinuation` side.
 - `file_info.rs`'s units pin both reply paths and the `badarg` path contract.
 - Oracle values are quoted in each test's doc comment and were re-verified against the system `erl`
