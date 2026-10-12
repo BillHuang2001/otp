@@ -1394,3 +1394,294 @@ fn the_stderr_stream_option_matches_the_oracle() {
         registry.close(&mut poller, id).expect("the port closes");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Oracle cross-check: `{line, N}` line framing (`open_port(…, [line])`)
+// ---------------------------------------------------------------------------
+//
+// The C splits lines in the **port**, not in the driver: `open_port`'s bare `line` option
+// sets `ERTS_PORT_SFLG_LINEBUF_IO` with a 512-byte line buffer (`erl_bif_port.c:986`) and
+// `{line, N}` sets it to `N` (`:862-869`), after which the port wraps every frame it splits
+// out of a read as `{eol | noeol, Data}` inside `{Port, {data, …}}`
+// (`deliver_linebuf_message`, `io.c:3454`). The expectations below are the oracle's own
+// answers, taken live from the system `erl` and skipped loudly when it is absent.
+
+/// One `{Port, {data, …}}` message, normalized: `None` is a plain chunk (`[binary]`), and
+/// `Some(eol)` a `{eol | noeol, Data}` line frame.
+type DataMessage = (Option<bool>, Vec<u8>);
+
+/// Renders messages in the canonical textual form both sides of the oracle comparison agree
+/// on: one `eol:<hex>` / `noeol:<hex>` / `raw:<hex>` token per message, in arrival order.
+fn render_messages(messages: &[DataMessage]) -> String {
+    let mut out = String::new();
+    for (marker, bytes) in messages {
+        out.push_str(match marker {
+            Some(true) => "eol:",
+            Some(false) => "noeol:",
+            None => "raw:",
+        });
+        out.push_str(&hex(bytes));
+        out.push(' ');
+    }
+    out.trim_end().to_string()
+}
+
+/// Runs one port-task round and returns the `{data, …}` messages it reported for `id`.
+fn message_round(
+    poller: &mut Poller,
+    registry: &mut PortRegistry,
+    id: PortId,
+) -> Vec<DataMessage> {
+    registry
+        .execute_port_tasks(poller, DEFAULT_READINESS_RED_BUDGET)
+        .expect("port tasks run")
+        .notifications
+        .into_iter()
+        .filter_map(|notification| match notification {
+            PortNotification::DataLine { port, bytes, eol } if port == id => {
+                Some((Some(eol), bytes))
+            }
+            PortNotification::Data { port, bytes } if port == id => Some((None, bytes)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The `{data, …}` messages a real `/bin/sh -c <command>` port delivers, driven through the
+/// reactor exactly as the runtime will.
+///
+/// `line_mode` selects the framing the runtime applies through
+/// [`PortRegistry::set_line_mode`]: `None` leaves it off (the `[binary]` case), `Some(0)` turns
+/// it on with no length limit (bare `[line]`) and `Some(n)` with an `n`-byte limit
+/// (`[binary, {line, n}]`).
+///
+/// The port is opened with the `eof` stream option so the child's end of file is observable
+/// through [`PortRegistry::take_eof`] — this crate's `driver_eof` point, and therefore where
+/// the partial-line flush runs (`io.c:7211`). No oracle case needs the `eof` *message*, so the
+/// reported flag itself is not part of the comparison.
+fn port_messages(command: &str, line_mode: Option<usize>) -> Vec<DataMessage> {
+    let mut poller = poller();
+    let mut registry = PortRegistry::new();
+    let spec = SpawnSpec::SpawnExecutable {
+        path: "/bin/sh".to_string(),
+    };
+    let options = SpawnOptions {
+        args: vec!["-c".to_string(), command.to_string()],
+        ..SpawnOptions::default()
+    };
+    let driver = SpawnDriver::with_stream_options(
+        &spec,
+        &options,
+        StreamOptions {
+            stderr_to_stdout: false,
+            eof: true,
+        },
+    )
+    .expect("the shell starts");
+    let id = registry
+        .open(&mut poller, Box::new(driver))
+        .expect("the port opens");
+    if let Some(max_len) = line_mode {
+        registry
+            .set_line_mode(id, Some(max_len))
+            .expect("the port is live");
+    }
+    let mut messages = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !poller.is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the child's stdout was never exhausted"
+        );
+        let events = poll_events(&mut poller, Duration::from_millis(100));
+        registry.schedule_events(&events);
+        messages.extend(message_round(&mut poller, &mut registry, id));
+    }
+    // The child's stdout is at end of file: the `driver_eof` flush releases any pending
+    // partial line here — and only here, never on `close`.
+    assert!(
+        registry.take_eof(id).expect("the check succeeds"),
+        "an `eof` port reports the end of the stream"
+    );
+    messages.extend(message_round(&mut poller, &mut registry, id));
+    registry.close(&mut poller, id).expect("the port closes");
+    messages
+}
+
+/// The messages the *oracle* delivers for `command` opened with the literal option list
+/// `options` (`"[line]"`, `"[binary,{line,4}]"`, …), in the canonical [`render_messages`]
+/// form, or `None` when `erl` is unavailable.
+///
+/// The port is opened **without** the `eof` option — the oracle flushes a partial line at
+/// end-of-file whatever the option says — so only `{Port, {data, …}}` messages are collected.
+fn oracle_messages(command: &str, options: &str) -> Option<String> {
+    let expr = format!(
+        r#"try erlang:open_port({{spawn_executable, "/bin/sh"}},
+                              {options} ++ [{{args, ["-c", "{command}"]}}]) of
+             P -> F = fun Loop(Acc) ->
+                         receive
+                             {{P, {{data, {{Tag, B}}}}}} ->
+                                 Loop([Acc, atom_to_list(Tag), ":",
+                                       binary:encode_hex(iolist_to_binary(B), lowercase), " "]);
+                             {{P, {{data, B}}}} ->
+                                 Loop([Acc, "raw:",
+                                       binary:encode_hex(iolist_to_binary(B), lowercase), " "])
+                         after 300 -> iolist_to_binary(Acc) end end,
+                  io:format("~s~n", [F(<<>>)])
+           catch error:R -> io:format("error:~p~n", [R]) end"#
+    );
+    let out = erl_stdout_plain(&expr)?;
+    Some(out.trim().to_string())
+}
+
+/// Writes `payload` to a fresh scratch file and returns a `cat` command over it.
+///
+/// Driving the child with `cat <file>` keeps the exact bytes out of both the shell quoting
+/// and the oracle's `-eval` source string (a `printf '\n'` would have to survive a round of
+/// Rust, Erlang and shell escaping).
+fn cat_payload(dir: &Path, name: &str, payload: &[u8]) -> String {
+    let path = dir.join(name);
+    std::fs::write(&path, payload).expect("the payload file");
+    let path = path.to_string_lossy().into_owned();
+    assert!(
+        !path.contains(['"', '\\']),
+        "the scratch path is free of quoting: {path}"
+    );
+    format!("cat {path}")
+}
+
+/// The scratch directory a line-framing case writes its payload into.
+fn line_scratch(label: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("beam_io_line_{label}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("the scratch directory is writable");
+    dir
+}
+
+#[test]
+fn line_framing_matches_the_oracle() {
+    // The pinned oracle table: three newline-terminated lines, a partial line flushed at end
+    // of file, an over-long line split at the `{line, N}` limit, a blank line, CRLF
+    // terminators and a lone carriage return. Every row is a real child behind a real
+    // `{line, N}` port, compared byte-for-byte against the system `erl`.
+    let dir = line_scratch("frames");
+    let cases: &[(&str, &[u8], usize, &str)] = &[
+        ("three lines", b"a\nb\nc\n", 0, "[line]"),
+        ("partial at eof", b"a\nb", 0, "[line]"),
+        ("limit split", b"abcdefgh\n", 4, "[binary,{line,4}]"),
+        ("blank line", b"\n", 0, "[line]"),
+        ("crlf", b"a\r\nb\r\n", 0, "[line]"),
+        ("lone cr", b"a\rb\n", 0, "[line]"),
+    ];
+    for (index, (label, payload, max_len, options)) in cases.iter().enumerate() {
+        let command = cat_payload(&dir, &format!("case-{index}"), payload);
+        let oracle = match oracle_messages(&command, options) {
+            Some(messages) => messages,
+            None => {
+                eprintln!("skipping line-framing oracle check: the system `erl` is unavailable");
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+        };
+        assert!(
+            !oracle.starts_with("error:"),
+            "{label}: the oracle opened the port: {oracle}"
+        );
+        assert_eq!(
+            render_messages(&port_messages(&command, Some(*max_len))),
+            oracle,
+            "{label}: the port's line frames match the oracle"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn line_mode_off_delivers_the_plain_bytes() {
+    // The mirror row: with line mode off (the runtime never calls `set_line_mode`) the bytes
+    // cross as plain `{Port, {data, Bin}}` with no `{eol | noeol, _}` wrapper.
+    let dir = line_scratch("plain");
+    let payload: &[u8] = b"a\nb\n";
+    let command = cat_payload(&dir, "plain", payload);
+    let messages = port_messages(&command, None);
+    assert_eq!(
+        messages.iter().map(|(marker, _)| *marker).collect::<Vec<_>>(),
+        vec![None],
+        "no line wrapper is applied: {messages:?}"
+    );
+    let bytes: Vec<u8> = messages.iter().flat_map(|(_, bytes)| bytes.clone()).collect();
+    assert_eq!(bytes, payload, "every byte crosses, unframed");
+    match oracle_port_data_hex(&command, false) {
+        Some(oracle) => assert_eq!(
+            hex(&bytes),
+            oracle,
+            "the plain bytes match the oracle's `[binary]` stream"
+        ),
+        None => eprintln!("skipping line-mode-off oracle check: the system `erl` is unavailable"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn closing_a_line_port_does_not_flush_its_partial_line() {
+    // A child that writes `a\nb` and then **stays alive** keeps its stdout open, so the port
+    // never sees end of file. The oracle flushes a partial line only at `driver_eof`
+    // (`io.c:7211`), never on `port_close/1`: closing must therefore deliver the `{eol,"a"}`
+    // frame and no `{noeol,"b"}`.
+    let dir = line_scratch("close");
+    let command = format!("{}; sleep 30", cat_payload(&dir, "partial", b"a\nb"));
+    let mut poller = poller();
+    let mut registry = PortRegistry::new();
+    let spec = SpawnSpec::SpawnExecutable {
+        path: "/bin/sh".to_string(),
+    };
+    let options = SpawnOptions {
+        args: vec!["-c".to_string(), command],
+        ..SpawnOptions::default()
+    };
+    let driver = SpawnDriver::with_stream_options(
+        &spec,
+        &options,
+        StreamOptions {
+            stderr_to_stdout: false,
+            eof: true,
+        },
+    )
+    .expect("the shell starts");
+    let id = registry
+        .open(&mut poller, Box::new(driver))
+        .expect("the port opens");
+    registry
+        .set_line_mode(id, Some(0))
+        .expect("the port is live");
+    // Drive until the complete line has been framed.
+    let mut messages = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while messages.is_empty() {
+        assert!(Instant::now() < deadline, "the complete line never arrived");
+        let events = poll_events(&mut poller, Duration::from_millis(100));
+        registry.schedule_events(&events);
+        messages.extend(message_round(&mut poller, &mut registry, id));
+    }
+    assert_eq!(
+        messages,
+        vec![(Some(true), b"a".to_vec())],
+        "the partial line is held back"
+    );
+    // The child still holds its stdout open, so there is no end of file to flush from.
+    assert!(
+        !registry.take_eof(id).expect("the check succeeds"),
+        "the child still holds its stdout open"
+    );
+    assert!(
+        message_round(&mut poller, &mut registry, id).is_empty(),
+        "nothing else is due while the stream stays open"
+    );
+    // Closing reports the close and **never** a flushed `{noeol,"b"}`.
+    registry.close(&mut poller, id).expect("the port closes");
+    assert!(
+        message_round(&mut poller, &mut registry, id).is_empty(),
+        "a close flushes nothing"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -396,8 +396,9 @@ impl From<Ready> for Readiness {
 /// Something a port produced during an execution round, for its owner.
 ///
 /// This is the crate's notification seam: the runtime turns [`PortNotification::Data`] into
-/// the `{Port, {data, Data}}` message Erlang sees, and [`PortNotification::Closed`] into a
-/// `ERL_PORT_EXIT`-style port exit.
+/// the `{Port, {data, Data}}` message Erlang sees, [`PortNotification::DataLine`] into the
+/// `{Port, {data, {eol|noeol, Data}}}` message a `{line, N}` port delivers, and
+/// [`PortNotification::Closed`] into a `ERL_PORT_EXIT`-style port exit.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum PortNotification {
     /// The port's driver read `bytes`, which belong to the port's owner.
@@ -407,6 +408,24 @@ pub enum PortNotification {
         /// The bytes. A port-task round reports a payload only when it is non-empty, so a
         /// consumer may rely on this never being empty.
         bytes: Vec<u8>,
+    },
+    /// The port read one **line-framed** chunk and the bytes belong to the port's owner.
+    ///
+    /// This is the `{line, N}` mode (`ERTS_PORT_SFLG_LINEBUF_IO`): the port splits the bytes
+    /// its driver handed up into lines and wraps each one as `{eol, Data}` / `{noeol, Data}`
+    /// — the C's `deliver_linebuf_message` (`erts/emulator/beam/io.c:3454`). Unlike
+    /// [`PortNotification::Data`], an empty payload is a **real** frame here: a blank line is
+    /// the oracle's `{Port, {data, {eol, []}}}`.
+    DataLine {
+        /// The port that produced the frame.
+        port: PortId,
+        /// The frame's content bytes (the line's terminator is not included); empty for a
+        /// blank line.
+        bytes: Vec<u8>,
+        /// Whether the frame was terminated by a newline: `true` is the Erlang `eol` wrapper,
+        /// `false` the `noeol` one (a length-limited chunk, or the partial line flushed at
+        /// end-of-file).
+        eol: bool,
     },
     /// The port was closed since the previous execution round.
     Closed {

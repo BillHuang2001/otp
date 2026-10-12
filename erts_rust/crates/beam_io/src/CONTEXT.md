@@ -16,6 +16,28 @@ denies `unsafe_code`, cannot issue itself) rather than parts of the I/O pipeline
 `fs_access.rs` (`access(2)` / `geteuid(2)` / `getegid(2)`, for the `file`/`filelib` floor). Their
 frozen APIs are documented in the parent `../CONTEXT.md` and in each module's own rustdoc.
 
+### `{line, N}` line framing (`open_port(…, [line])` / `[binary, {line, N}]`)
+The C splits lines **in the port**, not in the driver: `open_port`'s bare `line` option sets
+`ERTS_PORT_SFLG_LINEBUF_IO` with a 512-byte line buffer and `{line, N}` sets it to `N`
+(`../../../erts/emulator/beam/erl_bif_port.c:862-869,986`), and the port wraps every frame it splits
+out of a read as `{eol | noeol, Data}` inside `{Port, {data, …}}` (`deliver_linebuf_message`,
+`io.c:3454`). The Rust side reproduces that placement — the driver still banks raw bytes; the
+**port** frames them — across four modules:
+- `drivers/line_buffer.rs` → `LineFrame { bytes, eol }` (the C `LINEBUF_EOL`/`LINEBUF_NOEOL` result)
+  plus the frame-level API `take_frames`/`drain_frames`/`flush_frames`/`flush_into_ready`. The
+  byte-only views (`take_lines`/`drain`/`flush_all`) are the same frames with the marker dropped and
+  are what the out-of-scope `drivers/binary_io.rs` still uses. The byte stream itself is unchanged
+  from before the marker was added.
+- `port_task.rs` → `PortNotification::DataLine { port, bytes, eol }` (additive; `Data` untouched).
+  Unlike `Data`, an **empty payload is a real frame** here — a blank line is `{data, {eol, []}}`.
+- `port.rs` → `Port::set_line_mode(Option<usize>)` / `line_mode()` (the `SFLG` bit + `linebuf->max_len`;
+  `Some(0)` = no length limit), `Port::flush_linebuf()` (the C `flush_linebuf_messages`), and
+  `take_input_notifications()` (the widened harvest: 0/1 `Data` raw, many `DataLine` framed).
+  `Port::take_eof()` is the crate's **`driver_eof` observation point** and runs the flush.
+- `registry.rs` → `PortRegistry::set_line_mode(id, Option<usize>)` / `flush_linebuf(id)` (the runtime's
+  adoption seams), and `execute_port_tasks`'s harvest **extends** instead of pushing one notification,
+  so a single read can yield many messages (601 bytes at `{line,4}` ⇒ 150).
+
 ## Known Issues (durable gotchas — not fixed by changing this file)
 - **A `PortNotification::Closed` names a number that is retired *with the report*.** `PortRegistry::close`
   queues the id in `self.closed` and keeps it **allocated** in `ids`; the reporting round
@@ -28,6 +50,17 @@ frozen APIs are documented in the parent `../CONTEXT.md` and in each module's ow
   calls `flush` before `terminate_port` and parks a port with a non-empty `ioq` in
   `ERTS_PORT_SFLG_CLOSING` (`../../../erts/emulator/beam/io.c:3659-3700,3946-3956`). Mitigated at the
   call site only (`beam_rt` sends `notify_port_exit` before `registry.close`).
+- **The partial-line flush rides `take_eof`, so it needs the `eof` *stream option* in this crate.** The
+  port's flush is triggered when `Driver::take_eof` reports `true`, but `drivers/spawn.rs`
+  (`SpawnDriver::take_eof`) reports only when `StreamOptions.eof` was set — the driver latches the end of
+  file either way. The oracle flushes at `driver_eof` regardless of the option, so a `[line]` port opened
+  without `eof` would hold its final partial line here. Closing that needs a driver-side input-EOF
+  accessor independent of the notification option (an additive `Driver` seam), and the runtime's
+  adoption of `set_line_mode`/`flush_linebuf` on the `open_port` path.
+- **A close never flushes the line buffer** (`io.c:7211` runs the flush from `driver_eof` only), and the
+  partial line is neither reported nor discarded by it — it is still held afterwards, so an explicit
+  `flush_linebuf` still releases it. Pinned by
+  `port::tests::closing_a_line_port_never_flushes_the_pending_partial_line`.
 
 ## Test Strategy
 In-module `#[cfg(test)]` unit tests only — the sibling `tests/` directory belongs to the
@@ -44,23 +77,36 @@ integration-test node, and the crate-level policy (real fds, loud skips, oracle 
   container. The missing-path refusal (`ENOENT`) and the no-execute-bit case are asserted
   unconditionally (POSIX fixes the latter for every uid, root included). The oracle test needs no
   guard at all: it compares two implementations of the *same* syscall, so they must agree for any uid.
+- **Line framing** is pinned at three levels. `drivers/line_buffer.rs` unit-tests the marker per frame
+  (`eol` only for a newline terminator; the limit split and the CR_AFTER split are `noeol`), the
+  `{eol, []}` blank line, that every flushed frame is `noeol`, and `flush_into_ready`'s arrival order.
+  `port.rs` unit-tests the port-level rule that a **close never flushes** (the held partial survives the
+  close and an explicit flush still releases it — impossible had the close reported it). `registry.rs`
+  unit-tests the round-level shapes over a real pipe port (three `eol` lines, the blank line, the
+  `{line,4}` split, raw mode off by default, `BadArg` for an unknown id, and the `take_eof`-driven
+  flush). `tests/spawn.rs` (the integration node) cross-checks the whole pinned oracle table
+  byte-for-byte against the system `erl` through a real `cat` child behind a real `[line]` /
+  `[binary, {line, N}]` port, plus the `[binary]` no-wrapper row and the close-does-not-flush rule,
+  skipping **loudly** when `erl` is absent.
 
 ## Routing Table
 - `lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `poller.rs` → `Poller` (`EINTR`-tolerant `poll`, `libc::poll(2)` regular-file fallback), `Token`, `Interest`, `Ready`, `Event`, `Waker`
-- `port.rs` → `Port`, `PortState`, `PortControl`, `PortCommandOptions`, `DEFAULT_READINESS_RED_BUDGET`, `refresh_timeout`
-- `registry.rs` → `PortRegistry` (id allocation over `beam_process::PortTable`, reactor glue, `port_command`/`port_control`, the exit/eof/async seams, `port_table`/`port_table_mut`)
-- `port_task.rs` → `PortTaskKind`/`PortTask`/`PortTaskQueue`, reduction constants, `Readiness`, `PortNotification`, `PortTaskOutcome`
+- `port.rs` → `Port`, `PortState`, `PortControl`, `PortCommandOptions`, `DEFAULT_READINESS_RED_BUDGET`, `refresh_timeout`; the line-framing state + `set_line_mode`/`line_mode`/`flush_linebuf`/`take_input_notifications`
+- `registry.rs` → `PortRegistry` (id allocation over `beam_process::PortTable`, reactor glue, `port_command`/`port_control`, the exit/eof/async seams, `port_table`/`port_table_mut`, `set_line_mode`/`flush_linebuf`)
+- `port_task.rs` → `PortTaskKind`/`PortTask`/`PortTaskQueue`, reduction constants, `Readiness`, `PortNotification` (`Data` + the additive `DataLine`), `PortTaskOutcome`
 - `queue.rs` → `ByteQueue`; `timer.rs` → `Timeout`, `Timer`
 - `driver.rs` → `Driver`, `DriverContext`, `DriverFlags`, `DriverRegistry`, `PortExitReason`, `PortArms`
 - `error.rs` → `pub(crate)` typed error constructors
 - `signal.rs` → `Signal`/`Disposition`/`SignalFacility`; `cpu_time.rs` → `CpuTimes`/`RuntimeClock`; `ddll.rs` → `DynLib`/`DllError`
 - `fs_access.rs` → the safe `access(2)`/`geteuid(2)`/`getegid(2)` floor: `AccessMode` (`Exists`/`Read`/`Write`/`Execute`, `ALL`, `libc_mode()`), `try_access` (errno-preserving `Result<()>`, the one `unsafe` `access(2)` call site), `access` (`Result<bool>`, refusal ⇒ `false`), `path_access` (`Result<(read, write)>` — the `#file_info{}` `access` slot, two independent probes) and `process_credentials` (`Result<(euid, egid)>`)
-- `drivers/` → the built-in drivers (`fd`, `efile`, `spawn`, `inet`) + framing — child node `drivers/CONTEXT.md`
+- `drivers/` → the built-in drivers (`fd`, `efile`, `spawn`, `inet`) + framing, incl. `line_buffer.rs`'s `LineFrame`/`LineBuffer` (the port-level `{eol | noeol, Data}` splitter) — child node `drivers/CONTEXT.md`
 - `abi/` → the driver C-ABI host layer — child node `abi/CONTEXT.md`
 - `io_device/` → the `{get_until,…}` io-device request layer — child node `io_device/` (files listed in `../CONTEXT.md`)
 
 ## See Also
 - `../CONTEXT.md` → the authoritative crate doc (frozen API surface, constraints, test strategy, handoffs).
-- `../../../erts/emulator/beam/{io.c,erl_port_task.c,erl_port_task.h}` and
-  `../../../erts/emulator/sys/common/{erl_poll.c,erl_check_io.c}` → the legacy C ground truth.
+- `../../../erts/emulator/beam/{io.c,erl_port_task.c,erl_port_task.h,erl_bif_port.c}` and
+  `../../../erts/emulator/sys/common/{erl_poll.c,erl_check_io.c}` → the legacy C ground truth
+  (`io.c:3140-3307` the `LineBuf` state machine, `:3454` `deliver_linebuf_message`, `:7211` the
+  `driver_eof` flush; `erl_bif_port.c:862-869,986` the `line`/`{line,N}` option decoding).

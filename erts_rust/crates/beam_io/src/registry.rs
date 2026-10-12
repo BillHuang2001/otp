@@ -278,7 +278,9 @@ impl PortRegistry {
     /// `TIMEOUT`), stopping as soon as `reds_budget` is exhausted and leaving the rest
     /// queued; a [`PortTaskKind::Timeout`] task whose deadline has not passed is not run.
     /// Afterwards every port holding buffered input has it drained into a
-    /// [`PortNotification::Data`], and every port closed since the previous round is
+    /// [`PortNotification::Data`] — or, for a port in `{line, N}` mode
+    /// ([`PortRegistry::set_line_mode`]), into one [`PortNotification::DataLine`] per line
+    /// frame the read produced — and every port closed since the previous round is
     /// reported as a [`PortNotification::Closed`].
     ///
     /// # Errors
@@ -323,13 +325,14 @@ impl PortRegistry {
         let mut notifications = self.take_closed_notifications();
 
         // Harvest the data the INPUT tasks read: a port task never hands bytes up itself,
-        // so the round reports them for the runtime to turn into `{Port, {data, Data}}`.
+        // so the round reports them for the runtime to turn into `{Port, {data, Data}}`. A
+        // port in line mode (`PortRegistry::set_line_mode`) reports **every** frame the read
+        // produced — one read can yield many `{data, {eol|noeol, Data}}` messages — so the
+        // notifications are extended, never replaced.
         let keys = self.sorted_keys();
         for key in keys {
             if let Some(port) = self.ports.get_mut(&key) {
-                if let Some(notification) = port.take_input_notification() {
-                    notifications.push(notification);
-                }
+                notifications.extend(port.take_input_notifications());
             }
         }
 
@@ -443,12 +446,18 @@ impl PortRegistry {
         }
     }
 
-    /// Takes port `id`'s end-of-file notification, once.
+    /// Takes port `id`'s end-of-file notification, once, and flushes its line buffer.
     ///
     /// This is the seam a runtime uses to synthesize the bare `eof` message of a port opened
     /// with the `eof` option: `Ok(true)` is reported exactly once, when the port's input stream
     /// reached end of file; `Ok(false)` means "not asked for", "not reached yet" or "already
     /// reported" (see [`crate::drivers::SpawnDriver`]).
+    ///
+    /// It is also the crate's **driver-end-of-file observation point** (the C's `driver_eof`),
+    /// so a reported end-of-file releases a `{line, N}` port's pending partial line as a
+    /// `noeol` frame for the next round's harvest (see [`PortRegistry::set_line_mode`] and
+    /// [`Port::flush_linebuf`]). A caller that knows the stream has ended but has no `eof`
+    /// option to report may call [`PortRegistry::flush_linebuf`] directly.
     ///
     /// # Errors
     ///
@@ -457,6 +466,49 @@ impl PortRegistry {
     pub fn take_eof(&mut self, id: PortId) -> Result<bool> {
         match self.ports.get_mut(&id.number()) {
             Some(port) => port.take_eof(),
+            None => Err(error::badarg()),
+        }
+    }
+
+    /// Enables or disables **line framing** (`{line, N}`) on port `id`'s input.
+    ///
+    /// `Some(max_len)` splits the bytes the port's driver hands up into
+    /// [`PortNotification::DataLine`] frames of at most `max_len` bytes (`0` = no length
+    /// limit); `None` (the default) delivers them raw as [`PortNotification::Data`]. This is
+    /// the runtime's adoption point for `open_port(..., [line])` / `[binary, {line, N}]`
+    /// (`ERTS_PORT_SFLG_LINEBUF_IO`, `erl_bif_port.c:862-869,986`) — see
+    /// [`Port::set_line_mode`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::BadArg` when `id` is not a live port.
+    pub fn set_line_mode(&mut self, id: PortId, max_len: Option<usize>) -> Result<()> {
+        match self.ports.get_mut(&id.number()) {
+            Some(port) => {
+                port.set_line_mode(max_len);
+                Ok(())
+            }
+            None => Err(error::badarg()),
+        }
+    }
+
+    /// Releases port `id`'s pending partial line as `noeol` frame(s) for the next harvest.
+    ///
+    /// This is the C's `flush_linebuf_messages`: it is what [`PortRegistry::take_eof`] runs when
+    /// the driver reports the end of the stream, exposed separately for a caller that knows the
+    /// stream has ended without an `eof` option to report. A port in raw mode is untouched, and
+    /// a repeat call stages nothing (see [`Port::flush_linebuf`]). Closing a port
+    /// ([`PortRegistry::close`]) never flushes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::BadArg` when `id` is not a live port.
+    pub fn flush_linebuf(&mut self, id: PortId) -> Result<()> {
+        match self.ports.get_mut(&id.number()) {
+            Some(port) => {
+                port.flush_linebuf();
+                Ok(())
+            }
             None => Err(error::badarg()),
         }
     }
@@ -1013,6 +1065,317 @@ mod tests {
             0,
             "the report drained the input queue"
         );
+    }
+
+    // --- `{line, N}` line framing --------------------------------------------
+
+    /// A `{data, {eol|noeol, Bytes}}` notification for `port`.
+    fn line(port: PortId, bytes: &[u8], eol: bool) -> PortNotification {
+        PortNotification::DataLine {
+            port,
+            bytes: bytes.to_vec(),
+            eol,
+        }
+    }
+
+    /// A driver that banks a fixed payload on its first `ready_input` and reports the end of
+    /// its input stream through the once-only `take_eof` seam.
+    ///
+    /// It arms no descriptor, so the line-framing tests drive its task queue directly
+    /// ([`Port::schedule_task`]) instead of through `schedule_readiness` — the line framing
+    /// itself never looks at the poller.
+    struct LineEofDriver {
+        payload: Vec<u8>,
+        fed: bool,
+        eof_reported: bool,
+    }
+
+    impl LineEofDriver {
+        fn new(payload: &[u8]) -> LineEofDriver {
+            LineEofDriver {
+                payload: payload.to_vec(),
+                fed: false,
+                eof_reported: false,
+            }
+        }
+    }
+
+    impl Driver for LineEofDriver {
+        fn name(&self) -> &str {
+            "line-eof-test"
+        }
+
+        fn start(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
+            Ok(())
+        }
+
+        fn output(&mut self, _ctx: &mut DriverContext<'_>) -> Result<usize> {
+            Ok(0)
+        }
+
+        fn ready_input(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
+            if !self.fed {
+                self.fed = true;
+                let payload = self.payload.clone();
+                ctx.input().push(&payload);
+            }
+            Ok(())
+        }
+
+        fn stop(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
+            Ok(())
+        }
+
+        fn take_eof(&mut self) -> Result<bool> {
+            if self.eof_reported {
+                Ok(false)
+            } else {
+                self.eof_reported = true;
+                Ok(true)
+            }
+        }
+    }
+
+    /// Opens a port around `driver` in a fresh registry.
+    fn open_with(poller: &mut Poller, driver: Box<dyn Driver>) -> (PortRegistry, PortId) {
+        let mut registry = PortRegistry::new();
+        let id = registry.open(poller, driver).expect("the port starts");
+        (registry, id)
+    }
+
+    /// Runs one port-task round and returns the notifications it produced.
+    fn round(poller: &mut Poller, registry: &mut PortRegistry) -> Vec<PortNotification> {
+        registry
+            .execute_port_tasks(poller, DEFAULT_READINESS_RED_BUDGET)
+            .expect("the round runs")
+            .notifications
+    }
+
+    /// A pipe port in `{line, N}` mode with `bytes` written to its read end.
+    fn line_pipe(poller: &mut Poller, bytes: &[u8], max_len: usize) -> (PortRegistry, PortId) {
+        let (mut registry, id) = registry_with_pipe(poller);
+        registry
+            .set_line_mode(id, Some(max_len))
+            .expect("the port is live");
+        assert_eq!(registry.output(poller, id, bytes).expect("the write"), bytes.len());
+        (registry, id)
+    }
+
+    #[test]
+    fn line_mode_reports_one_notification_per_line() {
+        let mut poller = poller();
+        let (mut registry, id) = line_pipe(&mut poller, b"a\nb\nc\n", 1024);
+
+        // One read, three lines: the round reports **three** notifications, not one blob.
+        assert!(registry.schedule_readiness(
+            id.number(),
+            Readiness {
+                readable: true,
+                ..Readiness::default()
+            }
+        ));
+        assert_eq!(
+            round(&mut poller, &mut registry),
+            vec![
+                line(id, b"a", true),
+                line(id, b"b", true),
+                line(id, b"c", true),
+            ]
+        );
+        // A second round has nothing left to report (the frames were drained).
+        assert!(round(&mut poller, &mut registry).is_empty());
+    }
+
+    #[test]
+    fn line_mode_reports_a_blank_line_as_an_empty_eol_frame() {
+        // The oracle delivers `{Port, {data, {eol, []}}}` for a lone newline: the empty frame
+        // must not be dropped (the raw path drops an empty payload).
+        let mut poller = poller();
+        let (mut registry, id) = line_pipe(&mut poller, b"\n", 1024);
+        assert!(registry.schedule_readiness(
+            id.number(),
+            Readiness {
+                readable: true,
+                ..Readiness::default()
+            }
+        ));
+        assert_eq!(round(&mut poller, &mut registry), vec![line(id, b"", true)]);
+    }
+
+    #[test]
+    fn line_mode_splits_an_over_long_line_at_the_limit() {
+        let mut poller = poller();
+        let (mut registry, id) = line_pipe(&mut poller, b"abcdefgh\n", 4);
+        assert!(registry.schedule_readiness(
+            id.number(),
+            Readiness {
+                readable: true,
+                ..Readiness::default()
+            }
+        ));
+        assert_eq!(
+            round(&mut poller, &mut registry),
+            vec![
+                line(id, b"abcd", false),
+                line(id, b"efgh", true),
+            ],
+            "the length-split chunk is noeol, the newline-terminated one eol"
+        );
+    }
+
+    #[test]
+    fn one_read_yields_every_line_frame_it_contains() {
+        // A single read can carry many messages: 597 `a`s and a newline at a `{line,4}` limit is
+        // 149 `noeol` chunks plus one newline-terminated `eol` — **150** notifications from one
+        // round, which is why the round harvests a `Vec` per port rather than a single one.
+        let mut payload = vec![b'a'; 597];
+        payload.push(b'\n');
+        let mut poller = poller();
+        let (mut registry, id) = line_pipe(&mut poller, &payload, 4);
+        assert!(registry.schedule_readiness(
+            id.number(),
+            Readiness {
+                readable: true,
+                ..Readiness::default()
+            }
+        ));
+        let frames = round(&mut poller, &mut registry);
+        assert_eq!(frames.len(), 150, "one read, 150 frames");
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|notification| matches!(
+                    notification,
+                    PortNotification::DataLine { eol: true, .. }
+                ))
+                .count(),
+            1,
+            "exactly the newline-terminated frame is `eol` ({frames:?})"
+        );
+        assert_eq!(frames[0], line(id, &[b'a'; 4], false), "every chunk is `noeol`");
+        assert_eq!(
+            frames.last(),
+            Some(&line(id, b"a", true)),
+            "the tail before the newline is the one `eol` frame"
+        );
+    }
+
+    #[test]
+    fn line_mode_is_off_by_default_and_delivers_raw_bytes() {
+        let mut poller = poller();
+        let (mut registry, id) = registry_with_pipe(&mut poller);
+        assert_eq!(registry.get(id).expect("live").line_mode(), None);
+        assert_eq!(
+            registry.output(&mut poller, id, b"a\nb\n").expect("writes"),
+            4
+        );
+        assert!(registry.schedule_readiness(
+            id.number(),
+            Readiness {
+                readable: true,
+                ..Readiness::default()
+            }
+        ));
+        assert_eq!(
+            round(&mut poller, &mut registry),
+            vec![PortNotification::Data {
+                port: id,
+                bytes: b"a\nb\n".to_vec()
+            }],
+            "with line mode off the whole read crosses as one Data notification"
+        );
+    }
+
+    #[test]
+    fn set_line_mode_and_flush_linebuf_reject_an_unknown_port() {
+        let mut registry = PortRegistry::new();
+        let missing = PortId::new(77);
+        assert!(matches!(
+            registry.set_line_mode(missing, Some(4)),
+            Err(BeamError::BadArg)
+        ));
+        assert!(matches!(
+            registry.flush_linebuf(missing),
+            Err(BeamError::BadArg)
+        ));
+    }
+
+    /// The partial-line flush is driven by **end of file**, and only by it: a `{line, N}` port
+    /// holds a line with no terminator, and `flush_linebuf`/`take_eof` release it as `noeol`
+    /// (the C's `flush_linebuf_messages`, run from `driver_eof`). A plain `close` does not.
+    #[test]
+    fn a_partial_line_is_held_until_either_the_flush_or_the_close() {
+        let mut poller = poller();
+        let (mut registry, id) = line_pipe(&mut poller, b"a\nb", 1024);
+        assert!(registry.schedule_readiness(
+            id.number(),
+            Readiness {
+                readable: true,
+                ..Readiness::default()
+            }
+        ));
+        assert_eq!(
+            round(&mut poller, &mut registry),
+            vec![line(id, b"a", true)],
+            "the partial line is held back"
+        );
+
+        // The explicit flush (what `take_eof` runs) releases it, once, as `noeol`.
+        registry.flush_linebuf(id).expect("the port is live");
+        assert_eq!(round(&mut poller, &mut registry), vec![line(id, b"b", false)]);
+        assert!(
+            round(&mut poller, &mut registry).is_empty(),
+            "the flush is not repeated"
+        );
+
+        // A second partial line, released by `close` this time: closing flushes nothing.
+        assert_eq!(registry.output(&mut poller, id, b"c\nd").expect("writes"), 3);
+        assert!(registry.schedule_readiness(
+            id.number(),
+            Readiness {
+                readable: true,
+                ..Readiness::default()
+            }
+        ));
+        assert_eq!(round(&mut poller, &mut registry), vec![line(id, b"c", true)]);
+        registry.close(&mut poller, id).expect("closes");
+        assert_eq!(
+            round(&mut poller, &mut registry),
+            vec![PortNotification::Closed { port: id }],
+            "a close reports the close and never a flushed frame"
+        );
+    }
+
+    /// `take_eof` is the crate's driver-end-of-file observation point, so a reported
+    /// end-of-file releases the pending partial line for the next round's harvest — the C's
+    /// `driver_eof` → `flush_linebuf_messages` (`io.c:7211`).
+    #[test]
+    fn take_eof_flushes_the_pending_partial_line() {
+        let mut poller = poller();
+        let (mut registry, id) = open_with(&mut poller, Box::new(LineEofDriver::new(b"a\nb")));
+        registry
+            .set_line_mode(id, Some(1024))
+            .expect("the port is live");
+
+        // Feed the payload: the complete line is reported, the terminator-less tail is held.
+        assert!(registry
+            .get_mut(id)
+            .expect("live")
+            .schedule_task(PortTaskKind::Input));
+        assert_eq!(
+            round(&mut poller, &mut registry),
+            vec![line(id, b"a", true)]
+        );
+
+        // Observing the end of the stream stages the flush…
+        assert!(
+            registry.take_eof(id).expect("the check succeeds"),
+            "the driver reports the end of the stream"
+        );
+        // …which the next round reports as a `noeol` frame; the `eof` report is once-only.
+        assert_eq!(round(&mut poller, &mut registry), vec![line(id, b"b", false)]);
+        assert!(!registry.take_eof(id).expect("the check succeeds"));
+        assert!(round(&mut poller, &mut registry).is_empty());
     }
 
     #[test]
