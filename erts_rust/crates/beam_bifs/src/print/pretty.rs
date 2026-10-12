@@ -31,6 +31,20 @@
 //!
 //! See the parent module docs (`crate::print`) for the precise rule, the term
 //! classes and the narrowest repro.
+//!
+//! **Totality.** The oracle recurses once per *element* of a list/tuple/map
+//! (`print_length_list1/7`, `print_length_tuple1/7`, `print_length_map_pairs/8`)
+//! and once per element again in the `pp` walk (`pp_tail/10`,
+//! `pp_pairs_tail/9`). Rust does **not** flatten those: each recursive call is
+//! followed by a `prepend`/`cons` that splices the step's own items in front of the
+//! result, so the walk is not a tail call and a long-but-valid container used to
+//! abort the process with a native stack overflow (`fatal runtime error: stack
+//! overflow`, SIGABRT). Those five helpers are therefore written **iteratively** —
+//! one stack frame per *container* — while producing the very same [`Seq`]/[`Chunk`]
+//! (element order, tail, `Len`/`Dots` and chunk nesting are unchanged).
+//! `cind_tail/7`/`cind_pairs_tail/7` (the [`cind`] submodule) recurse in *tail*
+//! position and are left as they are. Deep **nesting** still recurses through
+//! [`build`]/[`pp`]; that is a separate (unbounded-depth) concern.
 
 use beam_common::Result;
 use beam_term::{signed_value, Eterm};
@@ -105,19 +119,24 @@ pub(crate) fn pretty_chunk(
     line_length: usize,
     column: usize,
 ) -> Result<Chunk> {
-    let flat = term_chunk(ctx, term, printable, depth)?;
     let ll = line_length as i64;
     let col = column.max(1) as i64;
     if ll == 0 || depth == 0 {
         // `print/10`'s `Ll =:= 0` and `D =:= 0` clauses.
-        return Ok(flat);
+        return term_chunk(ctx, term, printable, depth);
     }
     if depth < 0 && !is_reflowable(term) {
         // A printable string/binary leaf has no line break of its own — but only
         // while the depth is unlimited: a depth-limited `~P` truncates the leaf
         // (`~P <<"abcdef">> 2` is `<<"abcd"...>>`), which only [`build`] knows.
-        return Ok(flat);
+        return term_chunk(ctx, term, printable, depth);
     }
+    // The single-line rendering is produced **only** by the two clauses above, so it
+    // is rendered there rather than eagerly for every call: the flat writer walks a
+    // list/tuple once per element (`crate::print`'s `render_tail_chunk`), which is
+    // pure waste for a term this printer is about to re-flow — and it used to be the
+    // first thing to exhaust the stack on a long container, before this port's own
+    // walk even started.
     let node = build(ctx, term, printable, depth, -1)?;
     // `M = max_cs(-1, Len) = Len`, so the oracle's `Len =< M` always holds.
     if node.len < ll - col {
@@ -190,13 +209,6 @@ enum SeqTail {
     Improper(Box<Node>),
 }
 impl Seq {
-    /// The `[]` sequence.
-    fn empty() -> Seq {
-        Seq {
-            elems: Vec::new(),
-            tail: SeqTail::None,
-        }
-    }
     /// The `{dots,3,3}` sequence (an elided container's contents).
     fn dots() -> Seq {
         Seq {
@@ -371,32 +383,47 @@ fn build_list(
 }
 /// `io_lib_pretty:print_length_list1/7` — the elements of a list, ending in `[]`,
 /// `{dots,3,3}` or the non-list tail term's own template.
+///
+/// **Iterative** (the recursion is per *element*, so a long list is walked on one
+/// stack frame; see the module docs on totality). The oracle's `[Elem | Rest]` is
+/// reproduced by pushing each element's template and carrying the last step's tail —
+/// exactly what `prepend(elem, inner)` did, since every recursive step prepends one
+/// element and only the final base case supplies the tail.
 fn list1(
     ctx: &mut BifContext<'_>,
-    term: Eterm,
+    mut term: Eterm,
     printable: bool,
-    d: i64,
-    t: i64,
+    mut d: i64,
+    mut t: i64,
 ) -> Result<Seq> {
-    if is_nil(term) {
-        return Ok(Seq::empty());
+    let mut elems: Vec<Node> = Vec::new();
+    while !is_nil(term) {
+        if d == 1 || t == 0 {
+            return Ok(Seq {
+                elems,
+                tail: SeqTail::Dots,
+            });
+        }
+        if !is_list(term) {
+            // The oracle's last clause: the recursion's value *is* the tail's
+            // template.
+            return Ok(Seq {
+                elems,
+                tail: SeqTail::Improper(Box::new(build(ctx, term, printable, d - 1, t)?)),
+            });
+        }
+        let rest = cdr(term);
+        let t1 = if is_nil(rest) { t } else { tsub(t, 1) };
+        let elem = build(ctx, car(term), printable, d - 1, t1)?;
+        t = tsub(t1, elem.len);
+        d -= 1;
+        elems.push(elem);
+        term = rest;
     }
-    if d == 1 || t == 0 {
-        return Ok(Seq::dots());
-    }
-    if !is_list(term) {
-        // The oracle's last clause: the recursion's value *is* the tail's
-        // template.
-        return Ok(Seq {
-            elems: Vec::new(),
-            tail: SeqTail::Improper(Box::new(build(ctx, term, printable, d - 1, t)?)),
-        });
-    }
-    let rest = cdr(term);
-    let t1 = if is_nil(rest) { t } else { tsub(t, 1) };
-    let elem = build(ctx, car(term), printable, d - 1, t1)?;
-    let inner = list1(ctx, rest, printable, d - 1, tsub(t1, elem.len))?;
-    Ok(prepend(elem, inner))
+    Ok(Seq {
+        elems,
+        tail: SeqTail::None,
+    })
 }
 /// `io_lib_pretty:print_length_tuple/7` (the `D =:= 1` elision is [`build`]'s).
 fn build_tuple(
@@ -416,25 +443,35 @@ fn build_tuple(
     })
 }
 /// `io_lib_pretty:print_length_tuple1/7` — the tuple's elements from index `i`
-/// (1-based, like `element/2`).
+/// (1-based, like `element/2`). **Iterative**, like [`list1`].
 fn tuple1(
     ctx: &mut BifContext<'_>,
     term: Eterm,
     printable: bool,
-    i: usize,
-    d: i64,
-    t: i64,
+    mut i: usize,
+    mut d: i64,
+    mut t: i64,
 ) -> Result<Seq> {
-    if i > tuple_size(term) {
-        return Ok(Seq::empty());
+    let size = tuple_size(term);
+    let mut elems: Vec<Node> = Vec::new();
+    while i <= size {
+        if d == 1 || t == 0 {
+            return Ok(Seq {
+                elems,
+                tail: SeqTail::Dots,
+            });
+        }
+        let t1 = if i == size { t } else { tsub(t, 1) };
+        let elem = build(ctx, tuple_element(term, i - 1), printable, d - 1, t1)?;
+        t = tsub(t1, elem.len);
+        d -= 1;
+        elems.push(elem);
+        i += 1;
     }
-    if d == 1 || t == 0 {
-        return Ok(Seq::dots());
-    }
-    let t1 = if i == tuple_size(term) { t } else { tsub(t, 1) };
-    let elem = build(ctx, tuple_element(term, i - 1), printable, d - 1, t1)?;
-    let inner = tuple1(ctx, term, printable, i + 1, d - 1, tsub(t1, elem.len))?;
-    Ok(prepend(elem, inner))
+    Ok(Seq {
+        elems,
+        tail: SeqTail::None,
+    })
 }
 /// `io_lib_pretty:print_length_map/7` (the `D =:= 1` elision is [`build`]'s):
 /// the pairs in the map's storage order (see the module docs).
@@ -456,27 +493,37 @@ fn build_map(
 }
 /// `io_lib_pretty:print_length_map_pairs/8` — the pairs from index `i`. The
 /// oracle threads two depths: `d` (the remaining pair budget, one pair per level)
-/// and `d0` (the depth the keys/values themselves are rendered at).
+/// and `d0` (the depth the keys/values themselves are rendered at). **Iterative**,
+/// like [`list1`]; `d0` is carried unchanged.
 fn map1(
     ctx: &mut BifContext<'_>,
     pairs: &[(Eterm, Eterm)],
     printable: bool,
-    i: usize,
-    d: i64,
+    mut i: usize,
+    mut d: i64,
     d0: i64,
-    t: i64,
+    mut t: i64,
 ) -> Result<Seq> {
-    if i >= pairs.len() {
-        return Ok(Seq::empty());
+    let mut elems: Vec<Node> = Vec::new();
+    while i < pairs.len() {
+        if d == 1 || t == 0 {
+            return Ok(Seq {
+                elems,
+                tail: SeqTail::Dots,
+            });
+        }
+        let t1 = if i + 1 == pairs.len() { t } else { tsub(t, 1) };
+        let (key, value) = pairs[i];
+        let pair = map_pair(ctx, key, value, printable, d0, t1)?;
+        t = tsub(t1, pair.len);
+        d -= 1;
+        elems.push(pair);
+        i += 1;
     }
-    if d == 1 || t == 0 {
-        return Ok(Seq::dots());
-    }
-    let t1 = if i + 1 == pairs.len() { t } else { tsub(t, 1) };
-    let (key, value) = pairs[i];
-    let pair = map_pair(ctx, key, value, printable, d0, t1)?;
-    let inner = map1(ctx, pairs, printable, i + 1, d - 1, d0, tsub(t1, pair.len))?;
-    Ok(prepend(pair, inner))
+    Ok(Seq {
+        elems,
+        tail: SeqTail::None,
+    })
 }
 /// `io_lib_pretty:print_length_map_pair/8` — `K => V` (four characters of
 /// separator between the halves).
@@ -585,16 +632,6 @@ fn write_binary_body(bytes: &[u8], d: i64) -> (Vec<Chunk>, bool) {
         return (body, true);
     }
     (body, false)
-}
-/// `prepend` an element to a sequence (the oracle's `[Elem | Rest]`).
-fn prepend(elem: Node, rest: Seq) -> Seq {
-    let mut elems = Vec::with_capacity(rest.elems.len() + 1);
-    elems.push(elem);
-    elems.extend(rest.elems);
-    Seq {
-        elems,
-        tail: rest.tail,
-    }
 }
 /// `io_lib_pretty:write/1` — the single-line (flat) rendering of a template.
 fn write(node: &Node) -> Chunk {
@@ -781,66 +818,64 @@ fn pp_elems(
 }
 /// `io_lib_pretty:pp_tail/10` — everything after a list's (or tuple's) first
 /// element, up to and including a terminating `...` or an improper tail.
+///
+/// **Iterative** (the recursion is per *element*, so a long container is rendered on
+/// one stack frame; see the module docs on totality). The oracle conses each step's
+/// own items onto the recursive result (`[$\,, write(E) | pp_tail(…)]`), i.e. it
+/// splices them in front of it, so appending them in walk order to one item vector
+/// is the very same chunk sequence.
 #[allow(clippy::too_many_arguments)]
 fn pp_tail(
     elems: &[Node],
     tail: &SeqTail,
     col0: i64,
-    col: i64,
+    mut col: i64,
     ll: i64,
     m: i64,
     t_ind: i64,
     ind: &Chunk,
     ld: i64,
     sep: char,
-    w: i64,
+    mut w: i64,
 ) -> Chunk {
-    match elems.split_first() {
-        None => match tail {
-            SeqTail::None => Chunk::List(Vec::new()),
-            // `pp_tail({dots,…}, …, S, _W) -> [S | "..."]` — a splice.
-            SeqTail::Dots => Chunk::List([sep, '.', '.', '.'].map(Chunk::Char).into()),
-            SeqTail::Improper(t) => pp_improper(t, col0, col, ll, m, t_ind, ind, ld, sep, w),
-        },
-        Some((e, rest)) => {
-            let ld1 = last_depth(!rest.is_empty(), ld);
-            let e_len = 1 + e.len;
-            let flat = if ld1 == 0 {
-                e_len + 1 < ll - col && w + e_len + 1 <= m && atomic(e)
-            } else {
-                e_len < ll - col - ld1 && w + e_len + ld1 <= m && atomic(e)
-            };
-            if flat {
-                let rest_chunk = pp_tail(
-                    rest,
-                    tail,
-                    col0,
-                    col + e_len,
-                    ll,
-                    m,
-                    t_ind,
-                    ind,
-                    ld,
-                    sep,
-                    w + e_len,
-                );
-                cons(vec![Chunk::Char(','), write(e)], rest_chunk)
-            } else {
-                let (es, we) = pp_element(e, col0, ll, m, t_ind, ind, ld1, 0);
-                let rest_chunk = pp_tail(
-                    rest,
-                    tail,
-                    col0,
-                    col0 + we,
-                    ll,
-                    m,
-                    t_ind,
-                    ind,
-                    ld,
-                    sep,
-                    we,
-                );
-                cons(vec![Chunk::Char(','), Chunk::Char('\n'), ind.clone(), es], rest_chunk)
+    let mut out: Vec<Chunk> = Vec::new();
+    let mut rest = elems;
+    loop {
+        match rest.split_first() {
+            None => {
+                match tail {
+                    SeqTail::None => {}
+                    // `pp_tail({dots,…}, …, S, _W) -> [S | "..."]` — a splice.
+                    SeqTail::Dots => out.extend([sep, '.', '.', '.'].map(Chunk::Char)),
+                    SeqTail::Improper(t) => out.extend(
+                        pp_improper(t, col0, col, ll, m, t_ind, ind, ld, sep, w).into_items(),
+                    ),
+                }
+                return Chunk::List(out);
+            }
+            Some((e, more)) => {
+                let ld1 = last_depth(!more.is_empty(), ld);
+                let e_len = 1 + e.len;
+                let flat = if ld1 == 0 {
+                    e_len + 1 < ll - col && w + e_len + 1 <= m && atomic(e)
+                } else {
+                    e_len < ll - col - ld1 && w + e_len + ld1 <= m && atomic(e)
+                };
+                if flat {
+                    out.push(Chunk::Char(','));
+                    out.push(write(e));
+                    col += e_len;
+                    w += e_len;
+                } else {
+                    let (es, we) = pp_element(e, col0, ll, m, t_ind, ind, ld1, 0);
+                    out.push(Chunk::Char(','));
+                    out.push(Chunk::Char('\n'));
+                    out.push(ind.clone());
+                    out.push(es);
+                    col = col0 + we;
+                    w = we;
+                }
+                rest = more;
             }
         }
     }
@@ -965,62 +1000,53 @@ fn pp_map(seq: &Seq, col: i64, ll: i64, m: i64, t_ind: i64, ind: &Chunk, ld: i64
         }
     }
 }
-/// `io_lib_pretty:pp_pairs_tail/9`.
+/// `io_lib_pretty:pp_pairs_tail/9`. **Iterative**, like [`pp_tail`].
 #[allow(clippy::too_many_arguments)]
 fn pp_pairs_tail(
     ps: &[Node],
     tail: &SeqTail,
     col0: i64,
-    col: i64,
+    mut col: i64,
     ll: i64,
     m: i64,
     t_ind: i64,
     ind: &Chunk,
     ld: i64,
-    w: i64,
+    mut w: i64,
 ) -> Chunk {
-    match ps.split_first() {
-        None => match tail {
-            SeqTail::Dots => Chunk::text(",..."),
-            _ => Chunk::List(Vec::new()),
-        },
-        Some((p, rest)) => {
-            let ld1 = last_depth(!rest.is_empty(), ld);
-            let e_len = 1 + p.len;
-            let flat = if ld1 == 0 {
-                e_len + 1 < ll - col && w + e_len + 1 <= m && atomic_pair(p)
-            } else {
-                e_len < ll - col - ld1 && w + e_len + ld1 <= m && atomic_pair(p)
-            };
-            if flat {
-                let rest_chunk = pp_pairs_tail(
-                    rest,
-                    tail,
-                    col0,
-                    col + e_len,
-                    ll,
-                    m,
-                    t_ind,
-                    ind,
-                    ld,
-                    w + e_len,
-                );
-                cons(vec![Chunk::Char(','), write_pair(p)], rest_chunk)
-            } else {
-                let (ps_chunk, pw) = pp_pair(p, col0, col0, ll, m, t_ind, ind, ld1, 0);
-                let rest_chunk = pp_pairs_tail(
-                    rest,
-                    tail,
-                    col0,
-                    col0 + pw,
-                    ll,
-                    m,
-                    t_ind,
-                    ind,
-                    ld,
-                    pw,
-                );
-                cons(vec![Chunk::Char(','), Chunk::Char('\n'), ind.clone(), ps_chunk], rest_chunk)
+    let mut out: Vec<Chunk> = Vec::new();
+    let mut rest = ps;
+    loop {
+        match rest.split_first() {
+            None => {
+                if matches!(tail, SeqTail::Dots) {
+                    out.push(Chunk::text(",..."));
+                }
+                return Chunk::List(out);
+            }
+            Some((p, more)) => {
+                let ld1 = last_depth(!more.is_empty(), ld);
+                let e_len = 1 + p.len;
+                let flat = if ld1 == 0 {
+                    e_len + 1 < ll - col && w + e_len + 1 <= m && atomic_pair(p)
+                } else {
+                    e_len < ll - col - ld1 && w + e_len + ld1 <= m && atomic_pair(p)
+                };
+                if flat {
+                    out.push(Chunk::Char(','));
+                    out.push(write_pair(p));
+                    col += e_len;
+                    w += e_len;
+                } else {
+                    let (ps_chunk, pw) = pp_pair(p, col0, col0, ll, m, t_ind, ind, ld1, 0);
+                    out.push(Chunk::Char(','));
+                    out.push(Chunk::Char('\n'));
+                    out.push(ind.clone());
+                    out.push(ps_chunk);
+                    col = col0 + pw;
+                    w = pw;
+                }
+                rest = more;
             }
         }
     }
@@ -1095,4 +1121,193 @@ fn pp_binary_body(body: &[Chunk], n: i64, n0: i64, ind: &Chunk) -> Chunk {
         i += 2;
     }
     Chunk::List(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::BytesSink;
+    use beam_alloc::Heap;
+    use beam_process::ProcessId;
+    use beam_term::AtomTable;
+
+    /// The `~p` line length `io:format/2` defaults to (column 1, `Ld = 0`).
+    const LL: i64 = 80;
+    /// How many elements the long-container tests render. The pre-fix per-element
+    /// recursion needs **megabytes** of stack at this count (measured: the built
+    /// runtime aborts `io:format("~p", [lists:seq(1,25_000)])` on the default 8 MiB
+    /// main stack at `opt-level=1`), so it overflows the 256 KiB thread below many
+    /// times over.
+    const LONG: i64 = 20_000;
+
+    fn seeded_atoms() -> AtomTable {
+        let mut atoms = AtomTable::new();
+        atoms.seed(["true", "false", "ok"]);
+        atoms
+    }
+
+    /// The oracle's `~p` line-fill of a container whose elements are all atomic,
+    /// written out **independently** of the printer (so a long container's exact
+    /// bytes can be expected without a ~100 KB golden literal).
+    ///
+    /// This is `io_lib_pretty:pp_tail/10`/`pp_pairs_tail/9`'s greedy rule: the first
+    /// element starts at `col0 = len(open) + 1`; every later one is appended after a
+    /// `,` while it still fits (`Off + 1 < LL - Col` for a non-final element and
+    /// `Off < LL - Col - 1` for the final one, `Ld = 0`/`1`), else after `,\n` plus
+    /// the container's continuation indent, which resets the column to
+    /// `col0 + len(elem)`. The `W + Off + Ld =< M` half of the oracle's condition is
+    /// dropped: `M` is the whole template's flat length and `W` a position inside it,
+    /// and `pp` is only reached when `Len >= LL - Col`.
+    ///
+    /// Anchored to the OTP oracle by `the_fill_generator_matches_the_pinned_goldens`.
+    fn expected_fill(open: &str, close: &str, indent: &str, elems: &[String]) -> String {
+        let col0 = open.chars().count() as i64 + 1;
+        let mut col = col0;
+        let mut out = String::from(open);
+        for (i, e) in elems.iter().enumerate() {
+            let elen = e.chars().count() as i64;
+            if i > 0 {
+                let off = 1 + elen;
+                let flat = if i + 1 == elems.len() {
+                    off < LL - col - 1
+                } else {
+                    off + 1 < LL - col
+                };
+                out.push(',');
+                if flat {
+                    col += off;
+                } else {
+                    out.push('\n');
+                    out.push_str(indent);
+                    col = col0 + elen;
+                }
+            } else {
+                col += elen;
+            }
+            out.push_str(e);
+        }
+        out.push_str(close);
+        out
+    }
+
+    /// The integer texts `1..=n`.
+    fn int_texts(n: i64) -> Vec<String> {
+        (1..=n).map(|i| i.to_string()).collect()
+    }
+
+    /// Renders the term `build` produces under `~p` and returns the captured bytes.
+    ///
+    /// The render runs on a **deliberately tiny 256 KiB stack** (the ambient 8 MiB
+    /// one hides a per-element recursion), so a passing call pins the iterative walk:
+    /// before the fix this aborts the whole test process with
+    /// `fatal runtime error: stack overflow` (SIGABRT).
+    fn render_p_on_a_tiny_stack(
+        build: impl FnOnce(&mut BifContext<'_>, &crate::BifRegistry) -> Result<Eterm> + Send + 'static,
+    ) -> String {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let reg = crate::default_registry();
+                let mut heap = Heap::new(1 << 22).expect("test heap");
+                let atoms = seeded_atoms();
+                let mut sink = BytesSink::new();
+                {
+                    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+                        .with_output(&mut sink);
+                    let format = ctx.list(&[ctx.int(126).unwrap(), ctx.int(112).unwrap()]).unwrap();
+                    let term = build(&mut ctx, &reg).expect("the term builds");
+                    let args = ctx.list(&[term]).expect("one argument fits");
+                    let rendered = reg.call("io", "format", 2, &mut ctx, &[format, args]);
+                    assert!(rendered.is_ok(), "~p renders: {rendered:?}");
+                }
+                String::from_utf8(sink.contents().to_vec()).expect("ASCII")
+            })
+            .expect("spawn")
+            .join()
+            .expect("the render must not overflow the 256 KiB stack")
+    }
+
+    #[test]
+    fn the_fill_generator_matches_the_pinned_goldens() {
+        // The generator is checked against two goldens `tests/pretty_print.rs` pins
+        // from the OTP oracle, so the long renders below are expected against the
+        // oracle's own line-fill rule rather than against this printer.
+        assert_eq!(
+            expected_fill("[", "]", " ", &int_texts(29)),
+            "[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,\n 29]"
+        );
+        let pairs: Vec<String> = (1..=20).map(|i| format!("{i} => {i}")).collect();
+        assert_eq!(
+            expected_fill("#{", "}", "  ", &pairs),
+            "#{1 => 1,2 => 2,3 => 3,4 => 4,5 => 5,6 => 6,7 => 7,8 => 8,9 => 9,10 => 10,\n  \
+             11 => 11,12 => 12,13 => 13,14 => 14,15 => 15,16 => 16,17 => 17,18 => 18,\n  \
+             19 => 19,20 => 20}"
+        );
+    }
+
+    #[test]
+    fn a_long_list_is_walked_iteratively() {
+        let out = render_p_on_a_tiny_stack(|ctx, _| {
+            let elems: Vec<Eterm> = (1..=LONG).map(|i| ctx.int(i)).collect::<Result<Vec<_>>>()?;
+            ctx.list(&elems)
+        });
+        assert_eq!(out, expected_fill("[", "]", " ", &int_texts(LONG)));
+    }
+
+    #[test]
+    fn a_long_tuple_is_walked_iteratively() {
+        let out = render_p_on_a_tiny_stack(|ctx, _| {
+            let elems: Vec<Eterm> = (1..=LONG).map(|i| ctx.int(i)).collect::<Result<Vec<_>>>()?;
+            ctx.tuple(&elems)
+        });
+        assert_eq!(out, expected_fill("{", "}", " ", &int_texts(LONG)));
+    }
+
+    #[test]
+    fn a_long_map_is_walked_iteratively() {
+        let (out, elems) = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let reg = crate::default_registry();
+                let mut heap = Heap::new(1 << 23).expect("test heap");
+                let atoms = seeded_atoms();
+                let mut sink = BytesSink::new();
+                let elems: Vec<String>;
+                {
+                    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+                        .with_output(&mut sink);
+                    let pairs: Vec<Eterm> = (1..=LONG)
+                        .map(|i| {
+                            let k = ctx.int(i)?;
+                            let v = ctx.int(i)?;
+                            ctx.tuple(&[k, v])
+                        })
+                        .collect::<Result<Vec<_>>>()
+                        .expect("the pairs build");
+                    let list = ctx.list(&pairs).expect("the pair list builds");
+                    let map = reg
+                        .call("maps", "from_list", 1, &mut ctx, &[list])
+                        .expect("the map builds");
+                    // The element texts in the map's **storage** order — the order
+                    // `build_map`/`pp_map` walk and `io_lib_pretty` renders.
+                    elems = beam_term::map::map_pairs_storage_order(map)
+                        .expect("a HAMT's storage order")
+                        .iter()
+                        .map(|(k, v)| format!("{} => {}", signed_value(*k), signed_value(*v)))
+                        .collect();
+                    let format = ctx
+                        .list(&[ctx.int(126).unwrap(), ctx.int(112).unwrap()])
+                        .unwrap();
+                    let args = ctx.list(&[map]).expect("one argument fits");
+                    let rendered = reg.call("io", "format", 2, &mut ctx, &[format, args]);
+                    assert!(rendered.is_ok(), "~p renders: {rendered:?}");
+                }
+                (String::from_utf8(sink.contents().to_vec()).expect("ASCII"), elems)
+            })
+            .expect("spawn")
+            .join()
+            .expect("the render must not overflow the 256 KiB stack");
+        assert_eq!(elems.len(), LONG as usize);
+        assert_eq!(out, expected_fill("#{", "}", "  ", &elems));
+    }
 }
