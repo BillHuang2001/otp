@@ -111,7 +111,7 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   own `CONTEXT.md`; all implemented and tested. Verify the node tree via the routing table below.
 - **Build/test:** build with `scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace
   --all-targets` (warning-free); test with `scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml
-  --workspace --no-fail-fast`. The suite is green (8200 passed / 0 failed; ~45 min wall on a loaded
+  --workspace --no-fail-fast`. The suite is green (8756+ passed / 0 failed; ~45 min wall on a loaded
   host, so run it in crate chunks when iterating).
 - **CI runs the workspace and the gate:** `.github/workflows/erts_rust.yml` (path-triggered on
   `erts_rust/**` and on the workflow file itself, plus `workflow_dispatch`) installs the pinned
@@ -131,12 +131,14 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   `ordsets`/`proplists`/`maps`/`queue`/`gb_trees`/`calendar`/`filename`/`base64`/`unicode` functions run
   with byte-identical oracle results. Anything outside the supported surface returns a typed `BeamError`
   (never a wrong result).
-- **Compatibility gate (`tools/differential`):** `summary: total=1848 agree=1845 mismatch=0 unsupported=3
-  skipped=0 allowed=3` → `gate.sh --strict` exits 0. `gate.sh` is authoritative — re-run it for the live
-  per-contract split. **No case disagrees**; the recorded capability gaps (the `known-gaps.txt` ratchet
-  allowlist) are `wire/new_fun_ext_encode` (unclosable — an `erl_eval` lambda's closure identity needs
-  `erl_eval`/`erl_scan`/`erl_parse`) and `boot_extra/init_script_id_names_the_running_otp_release` (A.9 —
-  `init:script_id/0` on a `-eval`/`run` path that loads no boot script).
+- **Compatibility gate (`tools/differential`):** `summary: total=1868 agree=1864 mismatch=0 unsupported=4
+  skipped=0 allowed=4` → `gate.sh --strict` exits 0. `gate.sh` is authoritative — re-run it for the live
+  per-contract split. **No case disagrees**; the four recorded capability gaps (the `known-gaps.txt`
+  ratchet allowlist) are `wire/new_fun_ext_encode` (unclosable — an `erl_eval` lambda's closure identity
+  needs `erl_eval`/`erl_scan`/`erl_parse`), `boot_extra/init_script_id_names_the_running_otp_release`
+  (A.9 — `init:script_id/0` on a `-eval`/`run` path that loads no boot script), and the two A.9
+  `selfhost/*` in-process-compile cases (`selfhost/in_process_compile_file_no_spawn_deterministic`,
+  `selfhost/scheduled_process_compile_file_deterministic`).
 - **BIF surface complete:** `beam_bifs` registers **556/556 declared `bif.tab` BIFs** (registry 640
   keys = 556 declared + 84 non-table keys: 79 stdlib fast paths + `erlang:memory/0,1` + the OTP-30
   `pid_to_binary`/`ref_to_binary`/`port_to_binary`) through defaulted
@@ -145,7 +147,8 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
 - **Benchmarks:** every measured figure and its caveats lives in `tools/bench/RESULTS.md` (raw artifacts
   in `tools/bench/results/`) — read it there rather than duplicating numbers. Headlines since M1: the
   registered-BIF dispatch hot path fell from ~10.6 µs to ~116 ns/call and the registry lookup is now
-  allocation-free; the `foreign` per-call gap vs the system runtime is ~54×–72× (was 703×–9891× at M1).
+  allocation-free; the baseline-JIT default took the `foreign` hot loop to **0.71×–0.84×** of the system
+  ERTS (now faster) and `gc_bound/churn` to **0.49×**.
 - **Contract A.9 (build/bootstrapping) — boot-to-completion achieved; no self-hosted build.** `beam_rt`
   loads the 22 preloaded modules on startup, and its boot-script executor drives the real
   `bootstrap/bin/start.boot` (OTP 30 / erts-17.1, 22 instructions) **to completion** — all 22 directives
@@ -157,37 +160,40 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   blocking-aware, so a cross-module `receive` suspends the caller
   (`crates/beam_engine/src/families/funs/mod.rs`, pinned by `crates/beam_rt/tests/proc_lib_start.rs`).
   A.9's remaining gaps are fidelity ones: **no self-hosted build** (the Rust runtime does not compile/run
-  itself), and a plain runtime runs **no live** `code_server`/`logger`/`erl_prim_loader` process or, off
-  the `-boot` path, `application_controller` — `code:*`/`init:*`/`application:*` queries are served by a
-  native floor (`crates/beam_rt/src/native/{code,init,application}.rs`). Per-crate detail:
+  itself), and a plain runtime runs **no live** `code_server`/`erl_prim_loader` process, nor — off the
+  `-boot` path — `application_controller` or `logger` (the real `start.boot` leaves `logger_server`
+  registered as `logger`; see `crates/CONTEXT.md`). `code:*`/`init:*`/`application:*` queries are served
+  by a native floor (`crates/beam_rt/src/native/{code,init,application}.rs`). Per-crate detail:
   `crates/CONTEXT.md` (A.9 status) and `crates/beam_rt/src/boot/CONTEXT.md`.
-- **A.9 — what an in-process compile actually needs (verified against the code; not yet implemented).**
-  OTP's default `compile:file/2` path (`../lib/compiler`) reaches only `kernel` + `stdlib`: `epp` (an
-  **io-device-only** client — `io:scan_erl_form/4` plus `io:getopts`/`io:setopts` with `binary` and
-  `{encoding,latin1|utf8}`), `erl_features`, `erl_scan`/`erl_parse`/`erl_lint`/`erl_expand_records`, the
-  `v3_core` → `beam_*` passes, and `save_binary`'s `file:delete`/`file:write_file/3`/`file:rename/2`. It
-  does **not** reach `logger`/`error_logger` (diagnostics go to the group leader via
-  `io:put_chars`/`io:fwrite`), a live `code_server` (no `code:*` on the default path), `open_port`,
-  `crypto`/`zlib`/`beam_lib`/`ets`/`persistent_term`/`re`, or `syntax_tools`. The blockers are therefore
-  narrow: the native `file_server_2` lacks the `{write_file,…}` / write-mode `{open,…}` / device
-  `getopts`/`{setopts,…}` requests, and the `compiler` ebin is not on the default code path.
-  `compile:file/2`'s one default spawn (`spawn_monitor` + an untimed `'DOWN'` receive) is avoidable with
-  the documented `no_spawn_compiler_process` option, which keeps the whole compile in the **calling**
-  (pumping) process — the route on which the `file` read path already agrees with the oracle. Two
-  compilations of one source are byte-identical under `+deterministic` (`{deterministic,true}` strips
-  the path-bearing `CInf`/`Line` fields; the `Code` chunk matches either way), so a byte comparison or a
-  `beam_lib:chunks` comparison is a valid acceptance criterion. The two engine call seams this needed
-  (`call_ext`-encoded `erlang:apply/3`, and `call_fun`/`call_fun2` for a scheduled process) are both
-  **closed**; `beam_engine`'s `resolve_local_fun` is implemented by `beam_rt`. The remaining E0 blocker
-  is a single `beam_engine` bitstring-matching operand-order bug (`bs_get_binary2`/`bs_get_integer2`/
-  `bs_get_float2` write the destination register before `reread_ctx`/`set_ctx_start` when
-  `dst == ctx`), and a **scheduled-process** invoke (the `erl -noshell -s compile` / `erlc` shape)
-  additionally needs a nested-run `receive … after T` timeout that can fire.
+- **A.9 — in-process compilation WORKS on the no-spawn route; a scheduled-process compile does not
+  yet, and there is still no self-hosted build.**
+  The native `file_server_2` (`crates/beam_rt/src/native/file_server.rs`) now serves the
+  `{write_file,…}` / write-mode `{open,…}` / device `getopts`/`{setopts,…}` requests, and the `compiler`
+  ebin is on the default code path (`crates/beam_rt/src/codeserver.rs` `EXTRA_CODE_PATH_APPS`). The A.9
+  E0 route — `compile:file(F,[no_spawn_compiler_process,deterministic,{outdir,Dir}])` — therefore runs
+  **in-process** in the calling (pumping) process and produces a `.beam` byte-identical to the oracle's
+  identical-option run (two `+deterministic` compilations of one source are byte-identical: the
+  path-bearing `CInf`/`Line` fields are stripped and the `Code` chunk matches). OTP's default
+  `compile:file/2` path reaches only `kernel` + `stdlib` (`epp` as an io-device-only client,
+  `erl_features`, `erl_scan`/`erl_parse`/`erl_lint`/`erl_expand_records`, the `v3_core` → `beam_*`
+  passes, and `save_binary`'s file writes) — not `logger`/`error_logger`, a live `code_server`,
+  `open_port`, `crypto`/`zlib`/`beam_lib`/`ets`/`persistent_term`/`re`, or `syntax_tools`. What remains is
+  fidelity: (a) the `selfhost/in_process_compile_file_no_spawn_deterministic` corpus case drives the
+  compile as a **scheduled `run` process**, whose parked receive-window collection relocates the receiver
+  heap against an incomplete root set (a live `Machine::pending_exception` is unpublished) and so reports
+  the typed `unsupported: opcode: run: process blocked (no message available)`; and (b) that
+  scheduled-process shape has no nested-run `receive … after T` timeout that can fire. Both `selfhost/*`
+  cases flip to `agree` once in-process compilation lands as a scheduled process. The engine call seams
+  this needed (`call_ext`-encoded `erlang:apply/3`, `call_fun`/`call_fun2` for a scheduled process,
+  `resolve_local_fun`) are all closed, and the bitstring-match operand-order bug (`bs_get_binary2`/
+  `bs_get_integer2`/`bs_get_float2` writing `Dst` before committing the match context when `dst == ctx`)
+  is fixed. **No self-hosted build** yet (the runtime does not compile/run itself).
 - **Honest coverage gaps** (per-crate `Known Issues`): the Cranelift hot tier (`jit-cranelift`,
-  default-OFF, not on `beam_rt`'s path — the baseline JIT tier is wired for the first module entry);
-  full match-spec compiler; ETS concurrency; `put_record/6`'s create form; several
-  structured-raise-reason degradations; depth of live distribution interop. All return typed errors,
-  never wrong results.
+  default-OFF and not on `beam_rt`'s path — the native baseline tier is the default for every process
+  entry, compiled lazily per function, with `BEAM_RT_TIER=interpreter` the only kill switch); full
+  match-spec compiler; ETS concurrency; `put_record/6`'s create form for a **foreign** module's record
+  id (the running module's own records are supported); several structured-raise-reason degradations;
+  depth of live distribution interop. All return typed errors, never wrong results.
 
 ## Future workstreams
 - **Stage 2 (compiler):** loop opts → operation fusion → FBIP on the existing BEAM-SSA IR
@@ -197,12 +203,11 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
 - **Stage 4 adoption:** the copying collector IS driven by `beam_rt` at the engine heap-admission
   point (`beam_rt/src/context/gc.rs`), conservatively gated (a process is pinned once a live float
   register is seen, halted on a collection error, and a global valve disables collection once an escaped
-  runtime store holds an off-heap term). The GenImmix mature generation (`beam_gc`; `AnyCollector` is now
-  a complete strategy-agnostic drop-in for the concrete `Collector`, with the `IMMIX_BREAK_EVEN_WORDS`
-  auto-selection rule) is measured (`beam_gc/MEASURED.md`) and the **host-side switch is the remaining
-  step** — `beam_process::Process` still holds the concrete `Collector` (see the Handoffs section of
-  `crates/beam_gc/CONTEXT.md` for the exact call sites). The production fragment model is
-  `beam_message`'s; `beam_gc::OffHeap` is the MSO slot store and its `sweep` is now slot-stable.
+  runtime store holds an off-heap term). `beam_process::Process` holds the strategy-agnostic
+  `AnyCollector` (not a concrete `Collector`), so the mature generation is whichever strategy the policy's
+  configuration resolved to — the copying default, or GenImmix above the `IMMIX_BREAK_EVEN_WORDS`
+  auto-selection rule (`beam_gc/MEASURED.md`). The production fragment model is `beam_message`'s;
+  `beam_gc::OffHeap` is the MSO slot store and its `sweep` is slot-stable.
 - **Stage 6 (Level-2 clean-room VM):** new ISA + full toolchain — research track with an explicit exit
   criterion (Part II §H).
 - **Legacy-C removal:** delete the corresponding C under `../erts/` module-by-module as each Rust crate
