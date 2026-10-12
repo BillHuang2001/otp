@@ -79,9 +79,9 @@
 ## USAGE
 ##     lib/compiler/test/run_stage2_suites.sh [SUITE ...]
 ##
-## With no arguments the five Stage-2 suites are run:
+## With no arguments the six Stage-2 suites are run:
 ##     beam_ssa_loop_opt_SUITE beam_ssa_fus_SUITE beam_ssa_fbip_SUITE
-##     ssa_opt_budget_SUITE beam_ssa_opt_equiv_SUITE
+##     ssa_opt_budget_SUITE beam_ssa_opt_diff_SUITE beam_ssa_opt_equiv_SUITE
 ##
 ## Output: one `PASS'/`FAIL'/`SKIP'/`WARN' line per test case plus per-suite and
 ## total summaries, on stdout and in `$SCRATCH/report.txt'.  The exit
@@ -117,6 +117,7 @@ if [ ${#SUITES[@]} -eq 0 ]; then
             beam_ssa_fus_SUITE
             beam_ssa_fbip_SUITE
             ssa_opt_budget_SUITE
+            beam_ssa_opt_diff_SUITE
             beam_ssa_opt_equiv_SUITE)
 fi
 
