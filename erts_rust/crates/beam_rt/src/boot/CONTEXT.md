@@ -179,9 +179,10 @@ The boot is **not** sensitive to the byte length or the canonical form of the `-
 stdout/stderr — 40/40 runs across the four forms).
 **What guarantees it is the runner's parked-root publication.** A suspended process's machine lives
 in `RunnerState.engines`, and a machine's registers are only a *copy* of the process's root set; the
-runner therefore publishes the parked machine's whole live root set into `Process::regs` at **both**
-park arms and re-syncs the machine from the process's authoritative root set on resume
-(`../runner/run.rs::publish_parked_roots` / `resume_from_process_roots`). Without that pair a
+runner therefore publishes the parked machine's whole live root set into `Process::regs` — and its
+live pending-exception reason as an extra root — at **both** park arms and re-syncs the machine from
+the process's authoritative root set on resume (`../runner/run.rs::publish_parked_roots` /
+`resume_from_process_roots`). Without that pair a
 collection driven while the process was parked — `Process::deliver`'s exit cascade is **not** gated
 by `Runtime::gc_process_enabled` — would relocate the heap against a partial root set and leave a
 stale word in `x`, which is what argv length used to perturb.
@@ -193,7 +194,7 @@ because it cannot be duplicated.
 
 ### Remaining gaps (owner per link)
 1. **`beam_engine`/`beam_process` — a scheduled `compile:file/2` is the one remaining blocked report.** The incremental io-device read (`file:read/2`, `file:read_line/1`, `io:scan_erl_exprs/4`, `io:parse_erl_exprs/4`) completes from a **scheduled** process and agrees with the oracle (`../tests/scheduled_io_device.rs`, `../tests/io_scan.rs`), as does a `receive … after T` timeout reached through a nested run.
-   The single remaining `unsupported: opcode: run: process blocked (no message available)` is a scheduled `compile:file/2`, a **root-publication gap in a delivery-driven collection** (a live `Machine::pending_exception` term outside `Registers::gather_roots`) that is **not** a read-path issue; [`../M1_GAPS.md`](../M1_GAPS.md)'s OTP-lifecycle survey carries the detail.
+   The single remaining `unsupported: opcode: run: process blocked (no message available)` is a scheduled `compile:file/2`, blocked by the **nested-non-pumping parked callee** (a scheduled slice's out-of-line nested run cannot pump the scheduler), not by a read path and not by the root set: the parked machine's live `Machine::pending_exception` reason **is** published as a `Registers::extra_roots` word across the park window (`../runner/run.rs::publish_parked_roots`, read back on resume by `RuntimeContext::resync_parked_roots`), so it relocates with the heap. [`../M1_GAPS.md`](../M1_GAPS.md)'s OTP-lifecycle survey carries the detail.
 2. **`beam_rt` `../native/` — the io-device read path completes from library code on both routes.**
    `{get_until,Enc,_Prompt,Mod,Func,XtraArgs}` and `{get_line,Enc,_Prompt}` are both real request arms (`../native/file_server.rs` dispatches each to `get_until::serve`/`get_line::serve`), and the service answers with the tag paired to the request, so `file:read/2`, `io:scan_erl_exprs/4`, `io:parse_erl_exprs/4` and `file:read_line/1` complete and agree with the oracle from the pumped `-eval` route (`../tests/io_scan.rs`) and from a **scheduled** `run` process (`../tests/scheduled_io_device.rs`), and `io:get_line/2` runs through the same `{get_line,…}` arm (the colocated `file_server/get_line/tests.rs`).
    The residual io-device divergence is a `{get_chars,…}` on a `{encoding,unicode}` **stream** counting BYTES where the oracle counts CHARACTERS, documented in `../native/file_server/CONTEXT.md`.

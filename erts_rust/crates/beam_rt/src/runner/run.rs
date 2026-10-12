@@ -79,15 +79,42 @@ impl<'a> RuntimeRunner<'a> {
 /// [`RootSet::ALL_LIVE`] is the conservative choice for the x file: the parked machine's live
 /// count is not exposed, over-approximating a copying collector's root set is always *safe* (it
 /// can only keep a term alive, never free a live one), and the FR file holds `Eterm` term slots
-/// at Milestone 1 so it is a root like any other. A `pid` with no process in `table` has nothing
-/// to publish into; the machine is left as it is.
-fn publish_parked_roots(table: &mut ProcessTable, pid: ProcessId, machine: &mut Machine) {
+/// at Milestone 1 so it is a root like any other.
+///
+/// # The pending-exception reason is an extra root
+///
+/// The machine's live **pending-exception reason** ([`Machine::pending_exception`]) is the one
+/// term a parked machine holds that the closed [`RootSet`] shape cannot carry: it is a machine
+/// *field*, not an `x`/stack/FR slot. It is therefore read out before the root-set borrow and
+/// published as the process's [`Registers::extra_roots`](beam_process::Registers::extra_roots)
+/// word — the host escape hatch `beam_process`'s `gather_roots`/`scatter_roots` relocate in
+/// place — so a collection in the park window moves it with the heap instead of leaving the
+/// machine's slot on a dead word. With **no** live pending exception the extra-root set is left
+/// **empty** (cleared, never a placeholder), so a stale root can never keep an otherwise-dead
+/// term alive.
+///
+/// A `pid` with no process in `table` has nothing to publish into; the machine is left as it is.
+pub(super) fn publish_parked_roots(
+    table: &mut ProcessTable,
+    pid: ProcessId,
+    machine: &mut Machine,
+) {
+    // Read the reason **before** the root-set borrow: `with_roots` takes `machine` mutably for
+    // the duration of the closure, so `pending_exception()` cannot be reached inside it.
+    let reason = machine.pending_exception().map(|(_, reason)| reason);
     let Some(process) = table.get_mut(pid) else {
         return;
     };
     machine.with_roots(RootSet::ALL_LIVE, |roots| {
         gc::publish_roots_full(process, &roots)
     });
+    // The extra-root set is exactly the live pending-exception reason: cleared first so a machine
+    // with none (or one whose exception was handled) never leaves a stale root behind.
+    let extra = process.registers_mut().extra_roots_mut();
+    extra.clear();
+    if let Some(reason) = reason {
+        extra.push(reason);
+    }
 }
 
 /// Re-syncs a machine about to **resume** from the process's authoritative root set.
@@ -96,9 +123,14 @@ fn publish_parked_roots(table: &mut ProcessTable, pid: ProcessId, machine: &mut 
 /// collection may have relocated its heap and rewritten the process's `regs` in place, leaving
 /// the parked machine's own `x`/`stack` pointing into the abandoned space. The process's root
 /// set — not the machine's stale copy — is therefore the truth a resume must run from; the
-/// context method reconciles them and halts the process's collection if their slices no longer
-/// match (see [`RuntimeContext::resync_parked_roots`]).
-fn resume_from_process_roots(ctx: &mut RuntimeContext<'_>, pid: ProcessId, machine: &mut Machine) {
+/// context method reconciles them (including reading the relocated pending-exception reason
+/// back into the machine and consuming the process's extra roots) and halts the process's
+/// collection if their slices no longer match (see [`RuntimeContext::resync_parked_roots`]).
+pub(super) fn resume_from_process_roots(
+    ctx: &mut RuntimeContext<'_>,
+    pid: ProcessId,
+    machine: &mut Machine,
+) {
     ctx.resync_parked_roots(pid, machine);
 }
 
