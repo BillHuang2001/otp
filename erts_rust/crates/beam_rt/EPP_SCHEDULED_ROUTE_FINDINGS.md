@@ -114,3 +114,27 @@ collection site.
 dir from `std::env::temp_dir()`) and asserts the observable parsed form list
 (`{5,[attribute,attribute,attribute,function,eof]}`). It failed before the §4 mitigation (`exit 1 —
 beam_rt: badarg`) and passes after.
+
+## 7. Refutation of the sweep-driven hypothesis (raw experiment, this node)
+The §2/§5 claim that a **delivery-driven** `Process::deliver` → `ensure_capacity` collection is the
+mover is **refuted** by a decisive experiment: forcing `RuntimeContext::delivery_collection_is_unsound`
+(`src/context/mod.rs:1020`) to answer `true` for **every** receiver — so every delivery runs with the
+receiver marked relocation-exempt and `Process::deliver` returns its raw refusal to the heap-fragment
+fallback, moving **no** word — did **not** stop the corruption. The reproducer still died:
+`beam_term::ops: invalid boxed header subtag 0x12` (interpreter tier; `run_label_blocking` ←
+`FunBridge::call_fun` ← `beam_bifs::lists::foldl3`; baseline tier inside
+`beam_engine::jit::baseline::runtime::jit_step_one` ← `jit_ext_call`).
+A heap-move tracer over this crate's own seams (`call_bif` / `run_export_blocking` /
+`run_label_blocking` / `deliver_into_mailbox`, plus a `DOOR` line at `context/gc.rs::collect_or_grow`)
+then showed that **no `beam_rt` admission-point collection runs at all** during the corrupting run
+(`collect_or_grow` never fired) and the corrupting process's (pid 4) nursery **base never changes**
+across the deliveries that fill its mailbox. So the loss is **not** a `beam_process::Process::deliver`
+relocation and **not** an `ensure_heap`/`ensure_heap_full` relocation: the failing read is a **stale
+word read from a heap position re-used/recycled** by a collection elsewhere (a live holder — Rust-local
+term handles in a `beam_bifs`/`beam_engine` frame, or an unpublished `Machine`/engine-observable field
+— reaching a from-set word), not a base-move of the reader's own heap.
+Suppressing collection entirely (`+hms 4194304`) still makes both shapes print `1` / exit 0 on both
+tiers, so a collection IS the loss; it is simply not one of the sites §2/§5 named.
+Consequence: §5's patch to `beam_process` (the `has_unpublished_roots` decline predicate) addresses a
+real but **different** hazard; it is not the fix for the A.9 selfhost mismatch. The mover is still
+unpinned; the next pass must locate the collection that actually recycles the word the reader holds.
