@@ -67,6 +67,10 @@ mod prog;
 // no non-test caller yet.
 #[allow(dead_code)]
 mod exec;
+// Temporary: `re:run/2,3` / `re:internal_run/4` are still placeholders, so the
+// renderer has no non-test caller yet.
+#[allow(dead_code)]
+mod render;
 
 /// The compiled-pattern tag of the plain `{re_pattern, …}` form.
 const RE_PATTERN: &str = "re_pattern";
