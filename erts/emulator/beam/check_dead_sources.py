@@ -18,10 +18,11 @@
 #      .erl/.hrl, .escript, .nix, .toml, .yml/.yaml, Makefile*, *.mk/*.in/*.src/
 #      *.spec/*.rel/*.def/*.cmake/*.cfg/*.pro, *.ac/*.m4, configure, otp_build,
 #      CI yaml, xcomp/*.conf, the extension-less codegen tools in
-#      erts/emulator/utils/, *.S, ...), or its stem appears as a whole word in a
-#      makefile-role source, or a $(wildcard ...) pattern matches the path.
+#      erts/emulator/utils/, *.S, *.rc/*.rc.in, ...), or its stem appears as a
+#      whole word in a makefile-role source, or a $(wildcard ...) pattern matches
+#      the path.
 #   B  INCLUDE REFERENCE - an #include of the basename (or a path ending in it) in
-#      any other C-family source.
+#      any other C-family source or Windows resource script (*.rc/*.rc.in).
 #   C  SYMBOL REFERENCE - an identifier the file defines (function definition,
 #      #define, typedef name) appears as a whole word in any other C-family or
 #      build/config source.
@@ -92,6 +93,12 @@ DEFAULT_SCAN = "erts"                               # default --root scope
 CANDIDATE_EXTS = {".c", ".h", ".cpp", ".hpp", ".cc"}
 CFAMILY_EXTS = {".c", ".h", ".cpp", ".hpp", ".cc", ".tab", ".def", ".inc"}
 COMPILE_EXTS = (".c", ".cpp", ".cc")                # units that get an object
+
+# Windows resource scripts carry `#include` directives (beam.rc: `#include
+# "resource.h"`) and are consumed by the resource compiler.  They are reference
+# sources only - never candidates - but they are include-bearing, so a header
+# included only by a `.rc` file still gets a real liveness edge.
+INCLUDE_EXTS = CFAMILY_EXTS | {".rc"}
 
 # Sources that can carry a *build* reference (class A).
 BUILD_NAMES = {"makefile", "otp_build", "configure", "configure.ac", "configure.src"}
@@ -304,10 +311,20 @@ def is_makefile_source(path):
                                   ".cfg", ".pro", ".bat", ".conf", ".template"}
 
 
+def is_include_source(path):
+    """A source whose `#include` basename is liveness evidence: C-family
+    sources and Windows resource scripts (*.rc / *.rc.in)."""
+    name = path.name.lower()
+    return name.endswith(".rc.in") or path.suffix.lower() in INCLUDE_EXTS
+
+
 def is_build_source(path):
     """Superset of is_makefile_source: also scripts/suites that name a source
     file directly (a CT suite opening "dead_port.c", a CI script, ...)."""
     if is_makefile_source(path):
+        return True
+    name = path.name.lower()
+    if name.endswith(".rc") or name.endswith(".rc.in"):
         return True
     if path.name.lower() in ("configure.ac", "configure.src"):
         return True
@@ -627,10 +644,11 @@ def main():
         is_m = is_b and is_makefile_source(p)
         if is_c:
             tokens_cfamily.update(cnt)
-            if rel not in cand_set:
-                # Candidate #includes are read from their ACTIVE text below.
-                for m in INCLUDE_RE.finditer(txt):
-                    includes.setdefault(m.group(1).rsplit("/", 1)[-1], []).append(rel)
+        if is_include_source(p) and rel not in cand_set:
+            # Non-candidate #includes (C-family sources plus resource scripts).
+            # Candidate #includes are read from their ACTIVE text below.
+            for m in INCLUDE_RE.finditer(txt):
+                includes.setdefault(m.group(1).rsplit("/", 1)[-1], []).append(rel)
         # "Used" means a guard name occurs in a C-family/build source somewhere
         # other than a `#if`/`#else`/`#endif`/`#undef` line (compared by token
         # count); a mention in a doc or in a Rust comment is not a use.
@@ -737,7 +755,7 @@ def main():
         else:
             src_text[rel] = cand_text[rel]
             live_tokens[rel] = own_tokens[rel]
-        if c.suffix.lower() in CFAMILY_EXTS:
+        if is_include_source(c):
             for m in INCLUDE_RE.finditer(src_text[rel]):
                 includes.setdefault(m.group(1).rsplit("/", 1)[-1], []).append(rel)
 
