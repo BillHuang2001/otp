@@ -81,6 +81,7 @@ mod alias;
 mod bridges;
 mod fun_identity;
 pub(crate) mod gc;
+pub(crate) mod gc_trace;
 pub(crate) mod gc_walk;
 mod memory_hook;
 mod module_info;

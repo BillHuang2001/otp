@@ -528,7 +528,7 @@ pub(crate) fn ensure_heap(
     // and the descent — the `O(live objects)` half — is only paid for a process that has ever
     // held one (see the valve's module docs). A **hit** opens the gate permanently: a foreign
     // container really did reach a live root, which is the event the gate records.
-    let descend = runtime.foreign_reachable(pid);
+    let descend = runtime.foreign_reachable(pid) || super::gc_trace::force_descend();
     if any_root_is_unscanned(
         runtime.walk_scratch(),
         process,
@@ -536,6 +536,9 @@ pub(crate) fn ensure_heap(
         descend,
     ) {
         runtime.note_foreign_reachable(pid);
+        super::gc_trace::log(format_args!(
+            "DECLINE site=admit pid={pid} module={name} need={heap_need} descend={descend}"
+        ));
         return Ok(());
     }
     // Committed: the request is answered exactly once, by this collection.
@@ -668,7 +671,7 @@ pub(crate) fn ensure_heap_full(
     // short-circuit and before the request is consumed, so a refused forced collection stays
     // armed for the runner's park arm. The descent is gated on `pid`'s foreign-reachability bit
     // and a hit opens it permanently, exactly as in [`ensure_heap`].
-    let descend = runtime.foreign_reachable(pid);
+    let descend = runtime.foreign_reachable(pid) || super::gc_trace::force_descend();
     if any_root_is_unscanned(
         runtime.walk_scratch(),
         process,
@@ -680,6 +683,9 @@ pub(crate) fn ensure_heap_full(
         descend,
     ) {
         runtime.note_foreign_reachable(pid);
+        super::gc_trace::log(format_args!(
+            "DECLINE site=admit_full pid={pid} module={name} need={heap_need} descend={descend}"
+        ));
         return Ok(());
     }
     if forced {
@@ -697,6 +703,16 @@ pub(crate) fn ensure_heap_full(
     match action {
         Ok(collection) => {
             runtime.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
+            super::gc_trace::log(format_args!(
+                "COLLECT site=admit_full pid={pid} module={name} need={heap_need} kind={:?} roots({}) {} geom=[{}]",
+                collection.kind,
+                roots.x.len() + roots.stack.len() + roots.fr.len(),
+                super::gc_trace::roots_dump(
+                    process,
+                    roots.x.iter().chain(roots.stack.iter()).chain(roots.fr.iter())
+                ),
+                super::gc_trace::geom(process),
+            ));
         }
         Err(_) => {
             runtime.halt_process_gc(pid);
@@ -876,7 +892,7 @@ pub(crate) fn alloc_words_rooted(
     // from the pointer-stable arena — the same honest fallback every other refusal path takes.
     // The descent is gated on `pid`'s foreign-reachability bit and a hit opens it permanently,
     // exactly as in [`ensure_heap`].
-    let descend = runtime.foreign_reachable(pid);
+    let descend = runtime.foreign_reachable(pid) || super::gc_trace::force_descend();
     if any_root_is_unscanned(
         runtime.walk_scratch(),
         process,
@@ -889,6 +905,9 @@ pub(crate) fn alloc_words_rooted(
     ) {
         runtime.note_foreign_reachable(pid);
         runtime.note_gc_fallback(pid);
+        super::gc_trace::log(format_args!(
+            "DECLINE site=rooted pid={pid} module={name} n={n} descend={descend}"
+        ));
         return runtime.alloc_words(n);
     }
     if !publish_roots_full(process, &roots) {
@@ -899,6 +918,10 @@ pub(crate) fn alloc_words_rooted(
     match process.collect() {
         Ok(collection) => {
             runtime.note_gc_collection(matches!(collection.kind, CollectionKind::Major));
+            super::gc_trace::log(format_args!(
+                "COLLECT site=rooted pid={pid} module={name} n={n} geom=[{}]",
+                super::gc_trace::geom(process)
+            ));
         }
         Err(_) => {
             runtime.halt_process_gc(pid);
