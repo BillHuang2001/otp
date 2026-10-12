@@ -530,6 +530,45 @@ The residual exposure is a live term held **outside** `process.regs` — a Rust 
 * **Envelope/retained payloads:** `Process::run_rooted_collection` (`../../beam_process/src/process.rs:1166-1240`) roots each queued message's `payload`, `from` and `token` and re-installs all three (`set_from`/`set_token`/`with_payload`), so a heap `from`/`token` relocates too; the envelope's `off_heap`/`binaries`/`nodes` families and the `MailboxState::remove_at` retained copies are **refcounted Rust handles** (not young-heap `Eterm` words), so a moving heap can neither move them nor dangle them, and `with_payload` carries the `Fragments` chain across. `beam_process`'s `deliver_down_message` (`ptab.rs:2265-2299`) sets `Message.from` to the target pid's `to_eterm()` (an immediate) and carries a named monitor's `{Name,Node}` in the body, so `run_rooted_collection` relocates it with the payload.
 * **The one allocation source here:** `Runtime::alloc_words` (`runtime.rs` → `self.arena`), also reached by `RuntimeContext::alloc_words`, `runner/budget.rs`, `Runtime::materialize`/`charlist`; mailbox `Queue` payloads are copied in by `copy_struct`.
 
+### Pinning the exposure: the running-window collections are measured, the stale holder is not
+With the fun-image guard's per-function narrowing applied, the A.9 E0 self-host shape
+(`selfhost:compile_self/0` → `compile:file/2` with `no_spawn_compiler_process`) runs **exactly two**
+collections. Both are at the **running** machine's own `ensure_heap_full` admission point and both at
+nested-run depth 0 — the temporary counter incremented in `run_export_blocking`/`run_label_blocking`/
+`apply_fun` never reported a nested run in flight at a collection:
+
+| # | pid | `current_module` | heap need | door | depth |
+|---|---|---|---|---|---|
+| 1 | `ProcessId{number:2,serial:0}` | `selfhost` | 2 | `ensure_heap_full` | 0 |
+| 2 | `ProcessId{number:3,serial:0}` | `epp` | 2 | `ensure_heap_full` | 0 |
+
+No `alloc_words_rooted` collection and no narrow `ensure_heap` collection ever runs, and no
+`halt_process_gc` refusal ever fires (every collection **succeeded** — instrumenting every
+`halt_process_gc` site and `collect_or_grow`'s `Err` arm produced zero markers). Skipping collection 1
+(`BEAM_GC_SKIP=selfhost`) still aborts; skipping collection 2 (`BEAM_GC_SKIP=epp`) still aborts;
+skipping **both** (`BEAM_GC_SKIP=*`) replaces the SIGABRT with the default scheduled shape's
+`*** Internal compiler error ***` / `exception exit: badarg` (prints `3`, exit 0) — so the corruption is
+collection-driven in either door and the detector (a `beam_term::class()` on a stale word, raising
+`invalid boxed header subtag`, `0x2` in some runs and `0x12` — the `ErlHeapBits` header a later
+allocation reused that from-space block — in others) fires only once the from-space memory is recycled.
+`Machine::pending_exception` is **not** the holder: across the whole run (2000+ `with_roots` windows) it
+held one constant small immediate, so the park-window root publication
+(`runner/run.rs::publish_parked_roots` + `RuntimeContext::resync_parked_roots`) is not the missing link
+and `Machine::args_scratch` is documented as left empty by the dispatcher
+(`../beam_engine/src/machine/mod.rs`). The surviving holder is a Rust local the in-flight call chain
+keeps outside the published `{x, stack, fr}` set, and the concrete candidate is `beam_bifs`' fast-path
+loop BIF accumulator — `../beam_bifs/src/lists.rs::foldl3`'s `acc`/`cur`/`elem` (whose `cur = cdr(cur)`
+re-reads the cons tail *after* `ctx.call_fun`), with the same shape in `filter2`/`foldr3`/`all2`/`any2`.
+Two seams would close it and **both are outside this node's write scope**: thread the machine's root set
+(or a root-refresh seam) into `ExecutionContext::call_bif`
+(`../beam_engine/src/interpreter/bif.rs:188-193`, which today publishes nothing), so a `beam_bifs` loop
+BIF can keep its accumulators reachable across the nested call; or make those loop BIFs allocate their
+accumulators through a rooted seam instead of Rust locals. Until then the fun-image half of
+`module_observes_its_call_site` stays **module-wide**, both `selfhost/*` cases stay the recorded
+`unsupported: opcode: run: process blocked (no message available)` gap, and the recorded cause in
+`tools/differential/known-gaps.txt` (an unpublished live `Machine::pending_exception`) is inaccurate —
+the parked reason **is** rooted (see the running-window bullet in [`src/context/CONTEXT.md`](src/context/CONTEXT.md)).
+
 ## Cross-node handoffs (crate index)
 * **Differential gate** — **no case disagrees**; all four `unsupported` cases are allowlisted capability gaps (`wire/new_fun_ext_encode`, `boot_extra/init_script_id_names_the_running_otp_release`, and the two `selfhost/*` cases). The rollup/allowlist state belongs to [`../tools/differential/CONTEXT.md`](../tools/differential/CONTEXT.md); re-run `gate.sh` for the figure.
 * **A.7/A.9 boot** — completes (the real `start.boot` to `{progress,started}`, leaving a live `logger_server` registered as `logger`); the residual is whatever the started applications still need from `beam_bifs`. Detail: [`src/boot/CONTEXT.md`](src/boot/CONTEXT.md) + [`src/native/CONTEXT.md`](src/native/CONTEXT.md).
