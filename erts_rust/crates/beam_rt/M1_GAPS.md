@@ -310,9 +310,12 @@ re-fetch.
 `+hmax*` the `max_heap_size` map; a malformed value is exit 2 where the oracle exits 1.
 
 ## Cross-node handoff detail
-* **The differential gate.** **No case disagrees**, and the sole `unsupported` is an honest capability
-  gap, never a `mismatch`: `wire/new_fun_ext_encode` (an `erl_eval` lambda's `NEW_FUN_EXT` identity —
-  `erl_eval` internals, structurally unclosable; recorded in `tools/differential/known-gaps.txt`).
+* **The differential gate.** **No case disagrees** (`mismatch=0`), and every `unsupported` is an honest
+  capability gap recorded in `tools/differential/known-gaps.txt`, never a `mismatch`:
+  `wire/new_fun_ext_encode` (an `erl_eval` lambda's `NEW_FUN_EXT` identity — `erl_eval` internals,
+  structurally unclosable), `boot_extra/init_script_id_names_the_running_otp_release` (the `-eval`/`run`
+  path loads no boot script), and the two `selfhost/*` cases (the module-wide call-site guard keeps
+  `compile:*` off the in-machine route — the A.9 bullets above).
   `erlang:statistics(runtime)` is served, so its case agrees. The live rollup, the allowlist state and
   the `gate.sh` exit code belong to [`../tools/differential/CONTEXT.md`](../tools/differential/CONTEXT.md).
 * **A.7/A.9 boot — COMPLETES.** `Runtime::boot_from_script` runs the real `bootstrap/bin/start.boot`
@@ -528,7 +531,7 @@ The residual exposure is a live term held **outside** `process.regs` — a Rust 
 * **The one allocation source here:** `Runtime::alloc_words` (`runtime.rs` → `self.arena`), also reached by `RuntimeContext::alloc_words`, `runner/budget.rs`, `Runtime::materialize`/`charlist`; mailbox `Queue` payloads are copied in by `copy_struct`.
 
 ## Cross-node handoffs (crate index)
-* **Differential gate** — **no case disagrees**; the sole `unsupported` is `wire/new_fun_ext_encode` (an `erl_eval` lambda's `NEW_FUN_EXT` identity — structurally unclosable). The rollup/allowlist state belongs to [`../tools/differential/CONTEXT.md`](../tools/differential/CONTEXT.md); re-run `gate.sh` for the figure.
+* **Differential gate** — **no case disagrees**; all four `unsupported` cases are allowlisted capability gaps (`wire/new_fun_ext_encode`, `boot_extra/init_script_id_names_the_running_otp_release`, and the two `selfhost/*` cases). The rollup/allowlist state belongs to [`../tools/differential/CONTEXT.md`](../tools/differential/CONTEXT.md); re-run `gate.sh` for the figure.
 * **A.7/A.9 boot** — completes (the real `start.boot` to `{progress,started}`, leaving a live `logger_server` registered as `logger`); the residual is whatever the started applications still need from `beam_bifs`. Detail: [`src/boot/CONTEXT.md`](src/boot/CONTEXT.md) + [`src/native/CONTEXT.md`](src/native/CONTEXT.md).
 * **A.9 E0 — in-process compilation works and is byte-identical; the *scheduled* route stays gated.** `compile:file(File, [no_spawn_compiler_process, deterministic, {outdir, Dir}])` runs **in-process** and writes a `.beam` **byte-identical** to the oracle's identical-option run (`cmp` clean; the `Code` chunk also matches `erlc +deterministic`) — `tests/compile_file.rs`. Both `selfhost/*` corpus cases report `unsupported: opcode: run: process blocked (no message available)`, so their `tools/differential/known-gaps.txt` entries stay (**repo-root owned, not editable from here**; the cause named there — an unpublished live `Machine::pending_exception` — is inaccurate, the parked reason **is** rooted). What gates the route is the nested-non-pumping parked callee **plus** the module-wide fun-image half of `module_observes_its_call_site` — narrowing it admits `compile:*` in-machine on the scheduled, non-exempt route, where a collection at the running machine's **own** heap-admission point relocates the heap against a root set that does not reach a term the in-flight call chain holds (a *delivery*-driven collect of a `Running` receiver is already refused, `Process::has_unpublished_roots`), making both cases a hard `mismatch`. Publish points, line cites and the fast-path BIF accumulator: *Cross-node handoff detail* above.
 * **The native `file_server_2` service** — its served request surface and every typed per-request gap are tabled in [`src/native/CONTEXT.md`](src/native/CONTEXT.md); a process-**alias** reply tag is the typed `unsupported`.
