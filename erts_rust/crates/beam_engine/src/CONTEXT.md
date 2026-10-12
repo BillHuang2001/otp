@@ -67,6 +67,47 @@ execution semantics are documented one level up in `../CONTEXT.md` (read it firs
 - Other top-level files: `step.rs` (`Step`), `operand.rs`, `predicates.rs`, `error.rs`
   (`unsupported`/`blocked`/…), `generic.rs` (the `Instr::Generic` sentinel)
 
+## GC publication: which `src/**` engine→host calls can be intervened on
+The engine hands a host its root set through **exactly three** doors: `Machine::with_roots`
+(`machine/mod.rs:434`), `Machine::alloc_rooted` (`:464`, → `ExecutionContext::alloc_words_rooted`) and
+`Machine::ensure_heap`/`allocate_heap` → `ExecutionContext::ensure_heap_full`
+(`machine/frames.rs:289`). Every other engine→host call carries **no** root set, so a host that
+*allocated* inside it would relocate the young heap against unpublished roots. Those calls, with the
+state each holds in a Rust local across the call:
+- `ExecutionContext::resolve_local_fun` (`families/funs/mod.rs:323`) — the `fun` Eterm (from `x(arity)`
+  or the `call_fun2` operand, `:171-189`) and the `args` copy (`register_args`, `:275-280`).
+  `terms::fun_free(fun)` (`terms/fun.rs:247`) then re-reads the term's **raw heap storage** *after* the
+  call, so a move in the seam would dangle both.
+- `ExecutionContext::apply_fun` (`:355`, the `Ok(None)` fallback) — the same `fun`/`args`; protection
+  here is the host's `with_relocation_exempt`, not publication.
+- `ExecutionContext::call_bif` — the marshalled arguments live in the `EMPTY_ARGS` stack array
+  (`interpreter/bif.rs:50-53`, `:88-93`) or `Machine.args_scratch` (`machine/mod.rs:254`); **neither is
+  in any `RootSet`**.
+
+**Verified: no admission point can intervene on the `call_fun`/`call_fun2` path with the shipped host.**
+`BudgetContext::resolve_local_fun` (`beam_rt/src/runner/budget.rs:220`) forwards **without** arming, and
+`BudgetContext` arms only at `budget.rs:244/259/315` — each immediately followed by the delegate whose
+first statement `mem::take`s the latch (`beam_rt/src/context/mod.rs:2655/2669/2693`) — so the latch can
+never be armed-and-unconsumed across that seam call. `RuntimeContext::resolve_local_fun` → `local_fun_target`
+(`:2630`/`:2232`) is `&self` and does no BEAM-heap allocation (only Rust-heap `Vec`s). The same holds for
+the BIF-in-flight window: the `gc_bif` admission point runs *before* marshalling and
+`BudgetContext::call_bif` (`budget.rs:177`) does not arm.
+
+Consequences for a `src/**` change: the `Ok(Some)` copy loop needs **no** rooted builder — there is no
+allocation to reserve, so `with_roots`/`alloc_rooted` do not apply (and cannot: the seam takes no
+`RootSet`). If a host ever made the seam allocating, the sound fix is to **re-read** `fun` from
+`x(arity)`/the operand and re-collect `args` after the seam call and before `fun_free`, never to
+"publish" (there is no door to publish through).
+
+**The real relocation hazard on this call stack is not at the copy site** — it is engine-held live terms
+absent from the host's *published* root set, on a collection that fires outside the admission hand-off.
+The one named instance is `Machine::pending_exception` (`machine/catch.rs:119`), a live reason `Eterm`
+that `beam_process::Registers::gather_roots` does not carry; the write accessor a collecting host needs
+(`Machine::pending_exception_mut`, `machine/catch.rs:135`) already exists, so the **engine-side half is
+done**. The remaining fix is host-side (`beam_process` extra-root slot + `beam_rt`'s
+`publish_parked_roots`, or `gc::halt_process_gc` on the park/yield arm); it and the other Rust-local
+vectors are recorded in `../../beam_rt/M1_GAPS.md` and `../../beam_rt/src/context/CONTEXT.md`.
+
 ## See Also
 - `../CONTEXT.md` → the crate-level FROZEN API surface, execution model, constraints and handoffs.
 - `../INSTRUCTION_SURFACE.md` → per-opcode/per-family semantics and the full known-gaps list.
