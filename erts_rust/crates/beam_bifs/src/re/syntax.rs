@@ -411,16 +411,16 @@ fn esc_class(c: u32) -> Option<(Ranges, bool)> {
     let hspace = ranges_of(&[(0x09, 0x09), (0x20, 0x20), (0xA0, 0xA0)]);
     let vspace = ranges_of(&[(0x0A, 0x0D), (0x85, 0x85)]);
     Some(match c {
-        b'd' as u32 => (digit, false),
-        b'D' as u32 => (digit, true),
-        b's' as u32 => (space, false),
-        b'S' as u32 => (space, true),
-        b'w' as u32 => (word, false),
-        b'W' as u32 => (word, true),
-        b'h' as u32 => (hspace, false),
-        b'H' as u32 => (hspace, true),
-        b'v' as u32 => (vspace, false),
-        b'V' as u32 => (vspace, true),
+        x if x == b'd' as u32 => (digit, false),
+        x if x == b'D' as u32 => (digit, true),
+        x if x == b's' as u32 => (space, false),
+        x if x == b'S' as u32 => (space, true),
+        x if x == b'w' as u32 => (word, false),
+        x if x == b'W' as u32 => (word, true),
+        x if x == b'h' as u32 => (hspace, false),
+        x if x == b'H' as u32 => (hspace, true),
+        x if x == b'v' as u32 => (vspace, false),
+        x if x == b'V' as u32 => (vspace, true),
         _ => return None,
     })
 }
@@ -505,7 +505,6 @@ pub(crate) fn parse(
         p.bump();
         return Err(ParseError::new(E_UNMATCHED_PAREN, p.byte_pos(p.pos)).into());
     }
-    ranges_unused();
     Ok(Syntax {
         ast,
         ncap: p.ncap,
@@ -514,33 +513,31 @@ pub(crate) fn parse(
     })
 }
 
-/// Keeps `ranges_add` reachable when the parser happens to fold nothing (the
-/// helper set is shared with the class parser and the fold pass).
-fn ranges_unused() {}
-
 impl From<ParseError> for beam_common::BeamError {
+    /// Wraps a compile error as a raise whose **opaque live-reason slot** carries
+    /// the [`ParseError`] value.
+    ///
+    /// A compile failure is a *value* in `re:compile/1,2` (the `{error, {Msg,
+    /// Pos}}` tuple the BIF returns), never an observable raise; the BIF layer
+    /// recovers it from [`Raise::live_reason`](beam_common::Raise::live_reason)
+    /// and renders the tuple. Carrying it in the existing slot keeps the channel
+    /// typed without inventing an error variant or a placeholder atom.
     fn from(e: ParseError) -> beam_common::BeamError {
-        // A compile error is a *value* in `re:compile/1,2`, never a raise; the
-        // BIF layer interprets this variant before returning.
-        beam_common::BeamError::Raise(beam_common::Raise::error(beam_common::ExitReason::atom(
-            "re_compile_error",
-        )))
-        .with_compile_error(e)
-    }
-}
-
-/// A `BeamError` extension carrying the parsed compile error.
-trait WithCompileError {
-    fn with_compile_error(self, e: ParseError) -> beam_common::BeamError;
-}
-
-impl WithCompileError for beam_common::BeamError {
-    fn with_compile_error(self, _e: ParseError) -> beam_common::BeamError {
-        self
+        beam_common::BeamError::Raise(
+            beam_common::Raise::error(beam_common::ExitReason::Structured)
+                .with_live_reason(beam_common::LiveReason::new(e)),
+        )
     }
 }
 
 const MAX_DEPTH: u32 = 200;
+
+/// The largest bound a `{n,m}` quantifier may carry.
+///
+/// PCRE2's `REPETITION_MAX` is `65535`; a larger bound is the oracle's
+/// `{"number too big in {} quantifier", Pos}` (verified live: `a{65535}` compiles
+/// and `a{65536}` does not).
+const QUANT_MAX: u32 = 65535;
 
 struct Parser<'a> {
     codes: &'a [u32],
@@ -668,12 +665,22 @@ impl<'a> Parser<'a> {
             }
             _ => (greedy, possessive),
         };
-        // A second quantifier is an error at the position just past it.
-        if let Some(c) = self.peek() {
-            if c == b'*' as u32 || c == b'+' as u32 || c == b'?' as u32 || c == b'{' as u32 {
+        // A second quantifier is an error at the position just past it. The
+        // oracle parses the offending quantifier in full first, so a bad bound in
+        // the *second* brace group (`a{2}{65536}`, `a{2}{2,1}`) reports its own
+        // `{}` error at the closing brace, not "nothing to repeat".
+        match self.peek() {
+            Some(c) if c == b'*' as u32 || c == b'+' as u32 || c == b'?' as u32 => {
                 self.pos += 1;
                 return Err(ParseError::new(E_NOTHING_TO_REPEAT, self.here()).into());
             }
+            Some(c) if c == b'{' as u32 => {
+                if self.brace_quantifier()?.is_some() {
+                    return Err(ParseError::new(E_NOTHING_TO_REPEAT, self.here()).into());
+                }
+                // Not a quantifier (`{}`, `{,}`, `{x}`): a literal brace, no error.
+            }
+            _ => {}
         }
         Ok(Ast::Repeat {
             item: Box::new(atom),
@@ -702,39 +709,61 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 Ok(Some((0, Some(1), false)))
             }
-            Some(c) if c == b'{' as u32 => {
-                let save = self.pos;
-                match self.brace_quantifier() {
-                    Some(spec) => Ok(Some(spec)),
-                    None => {
-                        // Not a quantifier: `{` is a literal (PCRE2 10.43+).
-                        self.pos = save;
-                        Ok(None)
-                    }
-                }
-            }
+            Some(c) if c == b'{' as u32 => self.brace_quantifier(),
             _ => Ok(None),
         }
     }
 
-    /// Parses `{n}`, `{n,}` or `{n,m}`; `None` when the braces do not form one.
-    fn brace_quantifier(&mut self) -> Option<(u32, Option<u32>, bool)> {
+    /// Parses `{n}`, `{n,}`, `{,m}` or `{n,m}`.
+    ///
+    /// Returns `Ok(None)` — with the cursor restored to the `{` — when the braces
+    /// do **not** form a quantifier (`{}`, `{,}`, `{x}`, an unterminated `{…`), so
+    /// the caller keeps `{` as a literal (PCRE2 10.43+).
+    ///
+    /// # Errors
+    ///
+    /// The oracle's own `{}` errors, reported at the closing `}`'s byte offset:
+    /// [`E_NUMBER_TOO_BIG`] for a bound above [`QUANT_MAX`] (checked first) and
+    /// [`E_NUMBERS_OUT_OF_ORDER`] when the maximum is below the minimum.
+    fn brace_quantifier(&mut self) -> beam_common::Result<Option<(u32, Option<u32>, bool)>> {
         let start = self.pos;
         self.pos += 1; // `{`
-        let min = self.read_decimal()?;
+        let first = self.read_decimal();
         let (min, max) = if self.eat(b',' as u32) {
-            match self.read_decimal() {
-                Some(max) => (min, Some(max)),
-                None => (min, None),
+            match (first, self.read_decimal()) {
+                // `{,}` — neither bound given: not a quantifier.
+                (None, None) => {
+                    self.pos = start;
+                    return Ok(None);
+                }
+                (min, max) => (min.unwrap_or(0), max),
             }
         } else {
-            (min, Some(min))
+            match first {
+                // `{}` — no bound at all: not a quantifier.
+                None => {
+                    self.pos = start;
+                    return Ok(None);
+                }
+                Some(n) => (n, Some(n)),
+            }
         };
-        if !self.eat(b'}' as u32) {
+        if self.peek() != Some(b'}' as u32) {
+            // `{1,2,}`, `{65536x}`, an unterminated `{…`: not a quantifier.
             self.pos = start;
-            return None;
+            return Ok(None);
         }
-        Some((min, max, false))
+        // The braces close here; `here()` is the `}` the oracle points at.
+        if min > QUANT_MAX || max.is_some_and(|m| m > QUANT_MAX) {
+            return Err(ParseError::new(E_NUMBER_TOO_BIG, self.here()).into());
+        }
+        if let Some(m) = max {
+            if m < min {
+                return Err(ParseError::new(E_NUMBERS_OUT_OF_ORDER, self.here()).into());
+            }
+        }
+        self.pos += 1; // `}`
+        Ok(Some((min, max, false)))
     }
 
     fn read_decimal(&mut self) -> Option<u32> {
@@ -784,6 +813,17 @@ impl<'a> Parser<'a> {
                 }))
             }
             x if x == b'\\' as u32 => self.parse_escape(false),
+            x if x == b'{' as u32 => {
+                // A `{…}` that forms a quantifier has nothing before it to
+                // repeat; the oracle reports that at the end of the quantifier.
+                if self.brace_quantifier()?.is_some() {
+                    return Err(ParseError::new(E_NOTHING_TO_REPEAT, self.here()).into());
+                }
+                // `{}`, `{,}`, `{x}`: a literal `{`.
+                self.pos += 1;
+                self.note_cr_or_lf(c);
+                Ok(Ast::Char(c, self.opts.caseless))
+            }
             x if x == b'*' as u32 || x == b'+' as u32 || x == b'?' as u32 => {
                 self.pos += 1;
                 Err(ParseError::new(E_NOTHING_TO_REPEAT, self.here()).into())
@@ -964,6 +1004,10 @@ impl<'a> Parser<'a> {
     }
 
     /// `(?i)`, `(?im-sx)`, `(?i:…)`.
+    ///
+    /// The flag run ends at a `:` (a scoped group: the flags apply only inside it)
+    /// or a `)` (an unscoped group: the flags stay in effect for the remainder of
+    /// the enclosing group). Anything else is an unknown option letter.
     fn parse_inline_options(&mut self) -> beam_common::Result<Ast> {
         let mut new = self.opts;
         let mut negate = false;
@@ -972,6 +1016,23 @@ impl<'a> Parser<'a> {
                 Some(c) if c == b'-' as u32 => {
                     self.pos += 1;
                     negate = true;
+                }
+                Some(c) if c == b')' as u32 => {
+                    self.pos += 1;
+                    // An unscoped `(?i)` leaves the flags on for what follows.
+                    self.opts = new;
+                    return Ok(Ast::Empty);
+                }
+                Some(c) if c == b':' as u32 => {
+                    self.pos += 1;
+                    // A scoped `(?i:…)` restores the outer flags after the group.
+                    let saved = self.opts;
+                    self.opts = new;
+                    let inner = self.parse_alternation();
+                    self.opts = saved;
+                    let inner = inner?;
+                    self.expect_close_paren()?;
+                    return Ok(inner);
                 }
                 Some(c) => {
                     let on = !negate;
@@ -987,27 +1048,6 @@ impl<'a> Parser<'a> {
                     self.pos += 1;
                 }
                 None => return Err(ParseError::new(E_MISSING_PAREN, self.here()).into()),
-            }
-        }
-        // Unreachable: the loop above only exits via `return`. Kept explicit so
-        // the shape of `(?i:…)` is obvious: a `:` or `)` is consumed below.
-#[allow(unreachable_code)]
-        {
-            if self.eat(b')' as u32) {
-                let saved = self.opts;
-                self.opts = new;
-                let _ = saved;
-                Ok(Ast::Empty)
-            } else if self.eat(b':' as u32) {
-                let saved = self.opts;
-                self.opts = new;
-                let inner = self.parse_alternation();
-                self.opts = saved;
-                let inner = inner?;
-                self.expect_close_paren()?;
-                Ok(inner)
-            } else {
-                Err(ParseError::new(E_BAD_GROUP_OPTION, self.here()).into())
             }
         }
     }
@@ -1580,14 +1620,15 @@ mod tests {
         parse(&codes, &offs, total, flags)
     }
 
-    fn err_pos(pattern: &str) -> Option<(String, usize)> {
+    /// The compile error a pattern raises, recovered from the raise's
+    /// **live-reason slot** (the channel `impl From<ParseError> for BeamError`
+    /// installs).
+    fn parse_error(pattern: &str) -> Option<ParseError> {
         match parse_ascii(pattern) {
-            Err(beam_common::BeamError::Raise(raise)) => {
-                let _ = raise;
-                // The compile error is carried out of band; the tests below work
-                // on the internal parser instead.
-                None
-            }
+            Err(beam_common::BeamError::Raise(raise)) => raise
+                .live_reason()
+                .and_then(|live| live.downcast_ref::<ParseError>())
+                .copied(),
             _ => None,
         }
     }
@@ -1867,23 +1908,9 @@ mod tests {
             ("[a", E_MISSING_BRACKET, 2),
             ("a{2,1}", E_NUMBERS_OUT_OF_ORDER, 5),
         ] {
-            let err = match parse_ascii(pattern) {
-                Err(e) => e,
-                Ok(s) => panic!("{pattern} unexpectedly parsed: {s:?}"),
-            };
-            let (_msg, got) = crate::re::prog::take_compile_error(err);
+            let got = parse_error(pattern).unwrap_or_else(|| panic!("{pattern} unexpectedly parsed"));
             assert_eq!(got.msg, msg, "{pattern}");
             assert_eq!(got.pos, pos, "{pattern}");
-        }
-    }
-
-    #[test]
-    fn unsupported_constructs_are_typed_gaps() {
-        for p in [r"(?=a)", r"(?!a)", r"(?<=a)", r"(?<!a)", r"\p{L}", r"\R", r"\X", r"\K", r"(?|a)"] {
-            match parse_ascii(p) {
-                Err(beam_common::BeamError::Raise(_)) => {}
-                other => panic!("{p} must be a typed gap, got {other:?}"),
-            }
         }
     }
 
@@ -1908,7 +1935,163 @@ mod tests {
     }
 
     #[test]
-    fn dummy_error_helper_is_not_needed() {
-        let _ = err_pos("a");
+    fn a_parse_error_round_trips_through_the_live_reason_slot() {
+        // 3a: the compile-error channel is the `Raise` opaque live-reason slot,
+        // not a fabricated `re_compile_error` atom.
+        let want = ParseError::new(E_MISSING_PAREN, 3);
+        match parse_ascii("a(b") {
+            Err(beam_common::BeamError::Raise(raise)) => {
+                let got = raise
+                    .live_reason()
+                    .and_then(|live| live.downcast_ref::<ParseError>())
+                    .copied()
+                    .expect("the live reason carries the ParseError");
+                assert_eq!(got, want);
+            }
+            other => panic!("expected a Raise, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_ucp_pattern_is_a_distinguishable_typed_gap() {
+        // 3a: a construct outside the subset stays the typed `unsupported_bif`
+        // (reason atom `unsupported_bif`) and is distinguishable from a compile
+        // error carried in the live-reason slot.
+        let flags = CompileFlags {
+            ucp: true,
+            ..CompileFlags::default()
+        };
+        match parse_with(r"\d", &flags) {
+            Err(beam_common::BeamError::Raise(raise)) => {
+                assert!(raise.live_reason().is_none());
+                assert_eq!(raise.reason.as_atom(), Some("unsupported_bif"));
+            }
+            other => panic!("expected a typed gap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unsupported_constructs_stay_typed_gaps_and_carry_no_parse_error() {
+        for p in [r"(?=a)", r"(?!a)", r"(?<=a)", r"(?<!a)", r"\p{L}", r"\R", r"\X", r"\K", r"(?|a)"] {
+            match parse_ascii(p) {
+                Err(beam_common::BeamError::Raise(raise)) => {
+                    assert!(
+                        raise.live_reason().is_none(),
+                        "{p} must be a typed gap, not a compile error"
+                    );
+                }
+                other => panic!("{p} must be a typed gap, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn inline_options_apply_the_flags_they_name() {
+        // 3b: `(?i)abc` marks every following char caseless.
+        let s = parse_ascii("(?i)abc").expect("parses");
+        match s.ast {
+            Ast::Concat(items) => {
+                assert_eq!(items.len(), 3);
+                assert!(items.iter().all(|i| matches!(i, Ast::Char(_, true))), "{items:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // 3b: `a(?i:BC)` applies caseless only inside the group.
+        let s = parse_ascii("a(?i:BC)d").expect("parses");
+        match s.ast {
+            Ast::Concat(items) => {
+                assert_eq!(items.len(), 3);
+                assert!(
+                    matches!(items[0], Ast::Char(c, false) if c == 0x61),
+                    "{:?}",
+                    items[0]
+                );
+                match &items[1] {
+                    Ast::Concat(inner) => {
+                        assert!(inner.iter().all(|i| matches!(i, Ast::Char(_, true))), "{inner:?}");
+                    }
+                    other => panic!("expected the group body, got {other:?}"),
+                }
+                assert!(
+                    matches!(items[2], Ast::Char(c, false) if c == 0x64),
+                    "{:?}",
+                    items[2]
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // A mixed flag run applies each flag it names.
+        let s = parse_ascii("(?im-sx)a").expect("parses");
+        match s.ast {
+            Ast::Concat(items) => {
+                assert!(matches!(items[0], Ast::Char(_, true)));
+            }
+            other => panic!("{other:?}"),
+        }
+        let s = parse_ascii("(?s)a.b").expect("parses");
+        match s.ast {
+            Ast::Concat(items) => assert!(matches!(items[1], Ast::AnyChar(true)), "{items:?}"),
+            other => panic!("{other:?}"),
+        }
+
+        // An unknown option letter is the oracle's error.
+        let got = parse_error("(?q)a").expect("error");
+        assert_eq!(got.msg, E_BAD_GROUP_OPTION);
+    }
+
+    #[test]
+    fn quantifier_errors_match_the_oracle_goldens() {
+        // 3d: quantifier errors point at the closing `}` (0-based byte offset).
+        for (pattern, msg, pos) in [
+            ("{,2}", E_NOTHING_TO_REPEAT, 4usize),
+            ("{2}", E_NOTHING_TO_REPEAT, 3),
+            ("a{2}{3}", E_NOTHING_TO_REPEAT, 7),
+            ("a{1,2}{3}", E_NOTHING_TO_REPEAT, 9),
+            ("a*{2}", E_NOTHING_TO_REPEAT, 5),
+            ("a?{2}", E_NOTHING_TO_REPEAT, 5),
+            ("a{,2}{3}", E_NOTHING_TO_REPEAT, 8),
+            ("a*?*", E_NOTHING_TO_REPEAT, 4),
+            ("a**", E_NOTHING_TO_REPEAT, 3),
+            ("a?*", E_NOTHING_TO_REPEAT, 3),
+            ("a{2}*", E_NOTHING_TO_REPEAT, 5),
+            ("a{2}??", E_NOTHING_TO_REPEAT, 6),
+            ("a{2}+?", E_NOTHING_TO_REPEAT, 6),
+            ("a{65536}", E_NUMBER_TOO_BIG, 7),
+            ("a{1000000}", E_NUMBER_TOO_BIG, 9),
+            ("a{,65536}", E_NUMBER_TOO_BIG, 8),
+            ("a{2,65536}", E_NUMBER_TOO_BIG, 9),
+            ("a{65535,65536}", E_NUMBER_TOO_BIG, 13),
+            // The too-big check precedes the order check.
+            ("a{65536,65535}", E_NUMBER_TOO_BIG, 7),
+            ("a{2}{65536}", E_NUMBER_TOO_BIG, 10),
+            // The second quantifier's own `{}` error wins.
+            ("a{2,1}{3}", E_NUMBERS_OUT_OF_ORDER, 5),
+        ] {
+            let got = parse_error(pattern)
+                .unwrap_or_else(|| panic!("{pattern} unexpectedly parsed"));
+            assert_eq!(got.msg, msg, "{pattern}");
+            assert_eq!(got.pos, pos, "{pattern}");
+        }
+    }
+
+    #[test]
+    fn benign_brace_forms_are_literals_not_quantifiers() {
+        // 3d: `{}`/`{,}`, an unterminated `{…` and a non-numeric brace are
+        // literal `{` + text, never a quantifier and never an error.
+        for pattern in [
+            "a{}", "a{,}", "a{,2}", "a{2,}", "a{}{2}", "a{,}{2}", "a{2}{}", "a{2}{,}",
+            "a{65536", "a{2,3}x", "a{65536x}", "a{2,1,}", "a{,2,3}", "{}",
+        ] {
+            assert!(parse_ascii(pattern).is_ok(), "{pattern} must be a literal brace");
+        }
+        // The boundary itself is accepted: `a{65535}` compiles, `a{65536}` does not.
+        assert!(parse_ascii("a{65535}").is_ok());
+        assert!(parse_ascii("a{65535,65535}").is_ok());
+        assert!(parse_ascii("a{0}").is_ok());
+        assert!(parse_ascii("a{0,0}").is_ok());
+        // A lone `{` that closes nothing is a literal as well.
+        assert!(parse_ascii("a{").is_ok());
     }
 }

@@ -39,6 +39,15 @@ use beam_term::Eterm;
 use crate::context::BifContext;
 use crate::registry::BifRegistry;
 
+// temporary: adopted by the re:compile/* BIF bodies in the next pass; the allow goes with it.
+#[allow(dead_code)]
+mod options;
+// temporary: adopted by the re:compile/* BIF bodies in the next pass; the allow goes with it.
+#[allow(dead_code)]
+mod syntax;
+// temporary: adopted by the re:compile/* BIF bodies in the next pass; the allow goes with it.
+#[allow(dead_code)]
+mod prog;
 /// The 8 `(module, function, arity)` keys this node implements **for real** (not
 /// through the `RuntimeHooks` seam).
 ///

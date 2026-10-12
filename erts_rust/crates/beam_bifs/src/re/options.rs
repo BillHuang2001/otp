@@ -561,7 +561,7 @@ fn capture_type(atoms: &AtomTable, value: Eterm) -> Result<CapType> {
 mod tests {
     use super::*;
     use beam_alloc::Heap;
-    use beam_term::make_atom;
+    use beam_term::{make_atom, make_small, NIL};
 
     /// Builds small terms by hand on a throw-away heap.
     struct Fixture {
@@ -590,11 +590,25 @@ mod tests {
             self.heap.tuple(elems).expect("the tuple fits")
         }
 
+        /// Builds a proper list of `elems` (right to left, on the fixture heap).
         fn list(&mut self, elems: &[Eterm]) -> Eterm {
-            self.heap.list(elems).expect("the list fits")
+            let mut tail = NIL;
+            for &elem in elems.iter().rev() {
+                tail = self.heap.cons(elem, tail).expect("the list fits");
+            }
+            tail
+        }
+
+        /// Builds the option list from its elements and parses it.
+        ///
+        /// The single entry point the tests use: it resolves the `&self.atoms`
+        /// / `&mut self.heap` borrows inside one call, which the borrow checker
+        /// rejects when a test spells them out in the same expression.
+        fn parse_opts(&mut self, elems: &[Eterm]) -> beam_common::Result<Parsed> {
+            let list = self.list(elems);
+            parse(&self.atoms, list)
         }
     }
-
     #[test]
     fn bare_flags_are_classified() {
         let mut f = Fixture::new();
@@ -613,7 +627,8 @@ mod tests {
         let opts = f.list(&[f.atom("bogus")]);
         assert!(matches!(parse(&f.atoms, opts), Err(beam_common::BeamError::BadArg)));
         // An improper list is rejected too.
-        let improper = f.heap.cons(f.atom("global"), make_atom(0)).expect("fits");
+        let global = f.atom("global");
+        let improper = f.heap.cons(global, make_small(0)).expect("fits");
         assert!(matches!(parse(&f.atoms, improper), Err(beam_common::BeamError::BadArg)));
         // ... and a non-list.
         assert!(matches!(parse(&f.atoms, f.atom("global")), Err(beam_common::BeamError::BadArg)));
@@ -629,46 +644,44 @@ mod tests {
         let none = f.atom("none");
 
         let two = f.tup(&[cap, all]);
-        let p = parse(&f.atoms, f.list(&[two])).expect("capture/all");
+        let p = f.parse_opts(&[two]).expect("capture/all");
         assert_eq!(p.capture, Some((CapValue::All, CapType::Index)));
 
         let three = f.tup(&[cap, all, list]);
-        let p = parse(&f.atoms, f.list(&[three])).expect("capture/all/list");
+        let p = f.parse_opts(&[three]).expect("capture/all/list");
         assert_eq!(p.capture, Some((CapValue::All, CapType::List)));
 
         let none_spec = f.tup(&[cap, none]);
-        let p = parse(&f.atoms, f.list(&[none_spec])).expect("capture/none");
+        let p = f.parse_opts(&[none_spec]).expect("capture/none");
         assert_eq!(p.capture, Some((CapValue::None, CapType::Index)));
 
         // The empty list is `none`.
         let empty = f.tup(&[cap, NIL]);
         assert_eq!(NIL, f.list(&[]));
-        let p = parse(&f.atoms, f.list(&empty)).expect("capture/[]");
+        let p = f.parse_opts(&[empty]).expect("capture/[]");
         assert_eq!(p.capture, Some((CapValue::None, CapType::Index)));
 
         // An explicit id list keeps its order, and a negative id is badarg.
-        let ids = f.list(&[f.heap.int(2).expect("int"), f.heap.int(1).expect("int")]);
+        let ids = f.list(&[make_small(2), make_small(1)]);
         let listed = f.tup(&[cap, ids, index]);
-        let p = parse(&f.atoms, f.list(&[listed])).expect("capture/[2,1]");
+        let p = f.parse_opts(&[listed]).expect("capture/[2,1]");
         assert_eq!(p.capture, Some((CapValue::Names(vec![CapId::Index(2), CapId::Index(1)]), CapType::Index)));
 
-        let neg = f.heap.int(-1).expect("int");
-        let bad = f.tup(&[cap, f.list(&[neg]), index]);
-        assert!(matches!(parse(&f.atoms, f.list(&bad)), Err(beam_common::BeamError::BadArg)));
+        let neg_list = f.list(&[make_small(-1)]);
+        let bad = f.tup(&[cap, neg_list, index]);
+        assert!(matches!(f.parse_opts(&[bad]), Err(beam_common::BeamError::BadArg)));
     }
 
     #[test]
     fn offsets_and_limits_reject_negative_values() {
         let mut f = Fixture::new();
         let offset = f.atom("offset");
-        let five = f.heap.int(5).expect("int");
-        let spec = f.tup(&[offset, five]);
-        let p = parse(&f.atoms, f.list(&[spec])).expect("{offset,5}");
+        let spec = f.tup(&[offset, make_small(5)]);
+        let p = f.parse_opts(&[spec]).expect("{offset,5}");
         assert_eq!(p.start_offset, 5);
 
-        let neg = f.heap.int(-1).expect("int");
-        let bad = f.tup(&[offset, neg]);
-        assert!(matches!(parse(&f.atoms, f.list(&bad)), Err(beam_common::BeamError::BadArg)));
+        let bad = f.tup(&[offset, make_small(-1)]);
+        assert!(matches!(f.parse_opts(&[bad]), Err(beam_common::BeamError::BadArg)));
     }
 
     #[test]
@@ -685,7 +698,7 @@ mod tests {
             let nl = f.atom("newline");
             let value = f.atom(name);
             let spec = f.tup(&[nl, value]);
-            let p = parse(&f.atoms, f.list(&[spec])).expect("a valid newline spec");
+            let p = f.parse_opts(&[spec]).expect("a valid newline spec");
             assert_eq!(p.newline_opt, Some(want));
             assert_eq!(p.compile.newline, want);
         }
@@ -698,7 +711,7 @@ mod tests {
         let nl = f.atom("newline");
         let value = f.atom("bogus");
         let spec = f.tup(&[nl, value]);
-        assert!(matches!(parse(&f.atoms, f.list(&[spec])), Err(beam_common::BeamError::BadArg)));
+        assert!(matches!(f.parse_opts(&[spec]), Err(beam_common::BeamError::BadArg)));
     }
 
     #[test]
