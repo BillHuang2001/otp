@@ -114,6 +114,102 @@ the differential gate **`total=1839 agree=1837 mismatch=0 unsupported=2 skipped=
   implemented, wired with derived kill switches, and proved sound by an equivalence harness
   (996 probe modules / ~156k compared calls, 0 mismatches). Two soundness holes were found and closed
   (`bsl`/`bsr` are not LICM-safe; a fresh *binary* is not a valid in-place `update_record` source).
+## 2026-10-12 — Milestone 7: default baseline JIT + per-function lazy compilation, execution-engine call/send seams + reference aliases, strategy-agnostic GC dispatch + no-relocation growth, module MD5, ETS/message/ABI fixes, `ModuleEnv`
+Scope: a compatibility-and-performance milestone. The headline structural changes are the
+**baseline native JIT becoming the default tier for every process entry** (deleting the switch-safety
+predicate that had denied it to any module containing a cross-module call) together with
+**per-function lazy compilation**, the **completion of the execution-engine call seams**
+(`erlang:apply/3`'s `fixed_apply` shape, the closure-apply `resolve_local_fun` seam, and the
+compiled-`send` seam), **reference aliases** delivered end-to-end, the process collector becoming the
+strategy-agnostic `AnyCollector`, and the `.beam` module MD5. The differential harness also gained the
+`ModuleEnv` case kind. Verified: `cargo build --workspace --all-targets` warning-free, the workspace
+test suite green (0 failed), the real `start.boot` still runs to `{progress,started}`, and the
+differential gate **`total=1868 agree=1864 mismatch=0 unsupported=4 skipped=0 allowed=4`** → exit 0
+(identical with `BEAM_RT_TIER=interpreter`).
+- **Area:** `erts_rust/crates/beam_engine` (`src/interpreter/dispatch.rs`), `erts_rust/crates/beam_rt`
+- **Change:** the `call_ext*` → `erlang:apply/3` seam (`resolve_call_ext_apply`) now reproduces the C's
+  `fixed_apply` register shape **in-machine**, and the new defaulted `ExecutionContext::resolve_local_fun`
+  enters a closure's body in the **calling machine**, so a `receive` inside the closure suspends the
+  process and a raise lands in the caller's live `try`/`catch`. A third seam — `Instr::Send` and the
+  `erlang:send/2` / `erlang:'!'/2` imports — routes through
+  `ExecutionContext::send_message_with_off_heap` (the seam `gen_server:reply`'s `Alias ! {Tag,Reply}`
+  compiles to), carrying the calling machine's refc-binary handles so a machine-built off-heap payload
+  is **shared** across the delivery instead of flattened. Consequence: `proc_lib`/`gen_server` startup,
+  `apply`-mediated entry and the boot path run through the ordinary in-machine call/send seams instead
+  of folding into a `blocked` error.
+- **Area:** `erts_rust/crates/beam_process` (`src/ptab.rs`, `src/registers.rs`), `erts_rust/crates/beam_rt`
+- **Change:** **reference aliases** are delivered end-to-end — `erlang:alias/0,1`, `erlang:unalias/1`
+  and `monitor/3`'s `{alias,Mode}` resolve on both the BIF send path (`SendHook::send`) and the
+  compiled `Dest ! Msg` path. A relocation-**exempt** receiver now receives an oversized **control
+  signal** through a **heap-fragment fallback** (`enqueue_fragment_signal`) — no collection, no growth,
+  no heap relocation — instead of the grow-the-receiver-heap route that could not relocate it. The
+  process **`Registers`** gained an **`extra_roots`** slot (gathered after the stack, scattered back),
+  the host escape hatch for a live term the closed `RootSet` shape cannot carry; the runner publishes a
+  parked machine's `Machine::pending_exception` reason through it.
+- **Area:** `erts_rust/crates/beam_engine` (`src/families/bitstrings`, `src/machine/catch.rs`)
+- **Change (bug):** the bitstring-match family committed the match context *after* binding the
+  destination register, so `bs_get_integer2`/`bs_get_binary2`/`bs_get_float2` with `dst == ctx`
+  clobbered the context. The context position is now committed **before** `Dst` is written, so the
+  `dst == ctx` shape works (this is what unblocked `compile:forms/2`). `Machine::pending_exception_mut()`
+  was added beside the reader so the reason can be published as a root.
+- **Area:** `erts_rust/crates/beam_gc`, `erts_rust/crates/beam_process`, `erts_rust/crates/beam_rt`
+- **Change:** `beam_process::Process` now holds the **strategy-agnostic `AnyCollector`** (the concrete
+  `Collector` no longer appears on the production path), so the mature generation is whichever strategy
+  the heap policy resolved to (copying by default; Immix only past the measured break-even). A
+  **no-relocation heap-growth seam** (`Process::grow_nursery`, over `beam_gc`'s growth-only nursery
+  chain) lets the **unrooted `alloc_words`** seam grow and retry the bump before the pointer-stable
+  arena, and `root_is_unscanned` now accepts a pointer into **any** nursery space (current or
+  growth-retired). Previously an `alloc_words`-only workload never collected and never grew.
+- **Area:** `erts_rust/crates/beam_loader`, `erts_rust/crates/beam_bifs`
+- **Change:** the **`.beam` module MD5** (RFC 1321) is computed and exposed through the `module_md5`
+  host bridge, and a **pad underflow** in the MD5 block finaliser at the 57..=63-byte remainder
+  boundary is fixed (`(56 + 64 - filled) & 63`; the C `(64 - 8 - filled) & 63` is only valid under
+  wrapping arithmetic).
+- **Area:** `erts_rust/crates/beam_engine` (`src/machine`), `erts_rust/crates/beam_rt` (runner + context)
+- **Change (performance / scheduling):** the **native baseline JIT is the default tier for every
+  process entry** — the whole-module `jit_is_switch_safe`/`call_ext_is_synchronous`/`module_is_switch_safe`
+  predicate that denied it to any module containing a cross-module `call_ext*`/`apply` is deleted (the
+  engine's in-machine module-context switch is implemented and driver-mediated), and compilation is
+  **lazy per function** rather than compile-at-first-entry (which had cost a 12.3× cold start). The
+  `resolve_external_call` cross-module seam is made **idempotent** (a host decline no longer double-
+  consults and corrupts `erlang:load_nif/2`'s call-site identity). The slice budget is now charged
+  **before** the instruction body (charge-before-effect reduction order), so a **non-allocating**
+  interpreted loop is pre-emptible; supporting this, `beam_rt` gained a **dispatch memo** for hot
+  `(module,function,arity)` call sites (~3.5× on that path), a lazily-allocated `PendingInterner`, an
+  interpreter register-file **written high-water mark** (bounding the per-run refill), a by-value small
+  `Step` result, and a latched `wants_reduce` gate. The only kill switch is `BEAM_RT_TIER=interpreter`.
+  Measured effect: the `foreign` per-call hot loop went from ~54×–72× **dearer** than the system ERTS to
+  **0.71×–0.84×** (now faster), and `gc_bound/churn` to **0.49×**.
+- **Area:** `erts_rust/crates/beam_ets`
+- **Change:** the match-spec guard arithmetic now materialises **bignum** results faithfully
+  (`trunc`/`round`/`ceil`/`floor`/`bnot`/`abs` over `beam_term`'s number layer, oracle-cross-checked
+  live), and a bare 0-arity-tuple match-spec expression `{}` — which previously **panicked** — now
+  returns the oracle's `badarg`.
+- **Area:** `erts_rust/crates/beam_message`, `erts_rust/crates/beam_rt`
+- **Change:** an off-heap refc-binary transport copy that cannot be shared is now **flattened** into
+  the destination heap instead of being refused with `BadArg` (plus context-aware copy sizing, so the
+  preflight can no longer pass and then fail mid-copy). The send path's source table became a
+  **superset** (`Runtime::source_payloads`: machine handles + runtime escaped store + the sender's
+  mailbox-retained families), so a forwarded mailbox payload is shared rather than flattened.
+- **Area:** `erts_rust/crates/beam_abi`, `erts_rust/crates/beam_rt`
+- **Change:** `enif_compare`/`enif_is_identical`/`enif_hash` now order nested atoms by **text** through
+  the new defaulted `NifHost::atom_table` hook (the runtime exposes its atom table) instead of by
+  interned index; the driver-port host wires the three-way `MonitorResult` hook (`Ok` / `NotAlive` /
+  `Error`) for `driver_monitor_process`.
+- **Area:** `erts_rust/tools/differential`
+- **Change:** a new **`ModuleEnv`** case kind — a module-run case that additionally carries an explicit
+  spawn environment (so a compiled dir reaches the code path only through `-pa` in that environment,
+  not through argv) — pins the `ERL_*FLAGS` merge (contract A.6) end to end. The corpus grew to 1868
+  cases, with value invariants added for A.8 (`process_count =:= length(processes())`).
+- **Area:** `erts/` (legacy C)
+- **Change:** the in-tree dead-source checker was extended to cover make-variable object lists,
+  CT fixtures, codegen inputs, `xcomp` configs, test corpora and never-compiled `#if` regions (a
+  previous blind spot that had *overstated* deadness: 102 → 5 strict-dead). It now reports
+  whole-`erts` STRICT 921 candidates / 916 live / 5 strict-dead / **0 actionable**; 512 lines of
+  provably never-compiled `#if` code were removed across 12 files (`0` whole files). Removal remains
+  parity-gated per module (the 5-point per-file gate in `erts/emulator/beam/CONTEXT.md`), never
+  build-reference-gated; a full `erts` configure/compile is still environment-blocked in the sandbox
+  and is documented as such.
 
 ## 2026-10-09 — Milestone 5: in-machine cross-module calls, ETS lifetime/concurrency fixes, per-object reclamation, slim IR + superinstruction, NIF/driver ABI completion, signal/ddll facilities, Stage-2 compiler passes
 Scope: a broad correctness + performance milestone across the runtime. The headline structural
