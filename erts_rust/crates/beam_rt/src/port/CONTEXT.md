@@ -33,22 +33,22 @@ The `DriverHost` registry hooks carry the C's exact codes: `add_driver_entry`/`r
 `beam_abi` decodes the driver's term-data stack machine into a real term on the host's arena and calls `DriverHost::send_term(port, to: Option<Eterm>, term)`. The C *delivers* there and then (`driver_deliver_term`, `io.c:5664`: the decoded term itself, `from = prt->common.id`); the frozen seam gives the host no route to a receiver's mailbox, so the term is **queued**: `TermQueue` (`pub struct`, `Rc<RefCell<Vec<(Option<Eterm>, Eterm)>>>`) is per port and shared by handle — `DriverPort::term_queue()` returns the handle, `send_term` pushes onto it (while still recording the accumulate-only `DriverPort::sent` view the A.4 test reads), `take()` drains, `is_empty()` reports. `None` = the port's connected process (`erl_drv_output_term`, `io.c:6254`), `Some(pid)` = an explicit destination (`erl_drv_send_term`, `io.c:6289`). **Lifetime invariant:** a queued term's words live on the host arena, so `DriverPortAdapter` **empties** the queue both in `beam_io::Driver::stop` (the C refuses a delivery while `ERTS_PORT_SFLG_CLOSING`, `deliver_term_check_port`, `io.c:6213`) and in its `Drop`; a late drain observes an empty queue, never a freed arena.
 **The drain is wired end to end**: `PortRegistry` seizes the handle as `meta.driver_terms` at `open_port/2`, `take_driver_terms` surfaces each queued term as `PortEvent::Term{port, to, term, owner}`, and the pump copies it onto the pointer-stable arena (`RuntimeContext::stabilize_driver_term`) and delivers it to the destination — the connected process for `None`, the explicit pid for `Some`. `tests/driver.rs` pins both paths against the oracle with `EVENT_DRIVER_MODE` 2/3 (`erl_drv_output_term` / `erl_drv_send_term`).
 
-The precise symbols of `driver.rs`:
-- `DriverPort` (`driver.rs:481`) — `impl beam_abi::DriverHost` (`driver.rs:720`); the concrete host behind
+The precise symbols of `driver.rs` (line numbers drift — anchor by symbol when they look off):
+- `DriverPort` (`driver.rs:526`) — `impl beam_abi::DriverHost` (`driver.rs:883`); the concrete host behind
   the opaque `*mut ErlDrvPort_` a driver callback receives. The port handle **is** the per-port
-  `DriverEnv`'s address. Its `binary_to_term` (`driver.rs:760`) is the `beam_codec`-backed decode above. It also keeps the per-port monitor tree (`monitors()` → `driver::DriverMonitors`), the `has_process_exit` flag its `monitor_process` hook answers from, and the shared `Rc<ProcessLiveness>` its `monitor_process_result` hook consults (`with_liveness`, installed by `RuntimePorts::open_port`).
-- `Driver { library, host: Box<DriverPort> }` (`364`) — field order is load-bearing (`library` drops first).
-- `DriverPortAdapter` (`999`) — `impl beam_io::Driver` over a loaded C driver: `load`/`name`/`state`/`selected`,
+  `DriverEnv`'s address. Its `binary_to_term` (`driver.rs:923`) is the `beam_codec`-backed decode above. It also keeps the per-port monitor tree (`monitors()` → `driver::DriverMonitors`), the `has_process_exit` flag its `monitor_process` hook answers from, and the shared `Rc<ProcessLiveness>` its `monitor_process_result` hook consults (`with_liveness`, installed by `RuntimePorts::open_port`).
+- `Driver { library, host: Box<DriverPort> }` (`409`) — field order is load-bearing (`library` drops first).
+- `DriverPortAdapter` (`1347`) — `impl beam_io::Driver` over a loaded C driver: `load`/`name`/`state`/`selected`,
   plus the callback mapping `start`/`output`/`ready_input`/`ready_output`/`control`/`timeout`/`stop`.
-  `control(command: &str, arg: &[u8])` (`1633`) parses the verb as a `c_uint` and runs the entry's `control`,
+  `control(command: &str, arg: &[u8])` (`2057`) parses the verb as a `c_uint` and runs the entry's `control`,
   with the C's codes (see Known Issues); its reply source is resolved by the associated
-  `control_reply(reply, request, rbuf, len)` (`1420`).
-- `notify_ready(&mut self, ctx, fd: c_int, read: bool)` (`1326`) — runs the entry's `ready_input`/`ready_output`
+  `control_reply(reply, request, rbuf, len)` (`1787`).
+- `notify_ready(&mut self, ctx, fd: c_int, read: bool)` (`1693`) — runs the entry's `ready_input`/`ready_output`
   for one **already-resolved** descriptor (the C's `(ErlDrvEvent) state->fd`); `dispatch_ready(ctx, read)`
-  (`1297`) keeps the resolution half, and an entry with no callback for the direction gets the C's
+  (`1664`) keeps the resolution half, and an entry with no callback for the direction gets the C's
   `no_ready_*_callback` (log *and* deselect, `io.c:7523-7538`) before `settle`. `ready_output` resolves the
   fd itself so it can capture it before the write.
-- `load_driver(candidates, name)` (`949`) — `beam_abi::driver::loader::load` per candidate, reporting the last typed error.
+- `load_driver(candidates, name)` (`1297`) — `beam_abi::driver::loader::load` per candidate, reporting the last typed error.
 - The timer family matches the C for **every** live port: the C substitutes a silent `no_timeout_callback`
 when the entry declares no `timeout` slot (`io.c:7601`), so `io.c:6918`'s `-1` stands only for an invalid
 port (`DriverControl::attached == false`); `driver_set_timer` arms the deadline and answers `0`, and a
