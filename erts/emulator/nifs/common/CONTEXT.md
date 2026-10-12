@@ -6,13 +6,13 @@ Everything here must compile on all targets (use `ESOCK_ENABLE`/`__WIN32__` guar
 Registration, `STATIC_ERLANG_NIF` semantics, preloaded membership and the `NIF_OBJS` list are documented in `../CONTEXT.md`.
 
 ## API Surface — file map (line anchors verified against source)
-- `prim_socket_nif.c` (19214 lines) — NIF module **`prim_socket`** (`ERL_NIF_INIT` at 19212; empty stub under `#ifndef ESOCK_ENABLE` at 50-66).
-  - NIF function table `esock_funcs[]` = **lines 18696-18748, 40 entries** (28 distinct `nif_*` names declared by the `ESOCK_NIF_FUNCS` macro at 1127-1155). Dirty-annotated: `nif_sendfile` (18720-18722), `nif_ioctl` (18736-18738), `nif_finalize_close` (18747).
-  - `on_load` declared 2170, defined **18785**; selects the backend and opens the resource.
+- `prim_socket_nif.c` (19143 lines) — NIF module **`prim_socket`** (`ERL_NIF_INIT` at 19141; empty stub under `#ifndef ESOCK_ENABLE` at 50-66).
+  - NIF function table `esock_funcs[]` = **lines 18625-18677, 40 entries** (28 distinct `nif_*` names declared by the `ESOCK_NIF_FUNCS` macro at 1127-1155). Dirty-annotated: `nif_sendfile` (18649-18651), `nif_ioctl` (18665-18667), `nif_finalize_close` (18676).
+  - `on_load` declared 2170, defined **18714**; selects the backend and opens the resource.
   - Backend vtable type `ESockIoBackend` is **defined here at lines 1177-1245** (NOT in `socket_io.h`); the single instance is `static ESockIoBackend io_backend = {0}` at **2972**, driven by the `ESOCK_IO_*` macros at 2976-3100+.
-  - Backend selection in `on_load`: `__WIN32__` → `esaio_*` (lines 19020-19076), else unix `essio_*` (19078-19156); `ESOCK_IO_INIT(ioNumThreads)` at 19161.
-  - Resource: `ErlNifResourceType* esocks` + `ErlNifResourceTypeInit esockInit` (dtor/stop/down) at **2961-2966**; opened via `enif_open_resource_type_x(env, "sockets", &esockInit, ERL_NIF_RT_CREATE, NULL)` at **19169**; descriptors allocated by `esock_alloc_descriptor()` with `enif_alloc_resource(esocks, sizeof(ESockDescriptor))` at **16982**.
-- `prim_net_nif.c` (5149 lines) — NIF module **`prim_net`** (`ERL_NIF_INIT` 5148; stub 42-55). Table `net_funcs[]` 4997-5022 (**15 entries**). Resource `net` opened at 5135. Does **not** use the socket `io_backend` (fully independent of prim_socket).
+  - Backend selection in `on_load`: `__WIN32__` → `esaio_*` (lines 18949-19005), else unix `essio_*` (19007-19085); `ESOCK_IO_INIT(ioNumThreads)` at 19090.
+  - Resource: `ErlNifResourceType* esocks` + `ErlNifResourceTypeInit esockInit` (dtor/stop/down) at **2961-2966**; opened via `enif_open_resource_type_x(env, "sockets", &esockInit, ERL_NIF_RT_CREATE, NULL)` at **19098**; descriptors allocated by `esock_alloc_descriptor()` with `enif_alloc_resource(esocks, sizeof(ESockDescriptor))` at **16911**.
+- `prim_net_nif.c` (5133 lines) — NIF module **`prim_net`** (`ERL_NIF_INIT` 5132; stub 42-55). Table `net_funcs[]` 4981-5006 (**15 entries**). Resource `net` opened at 5119. Does **not** use the socket `io_backend` (fully independent of prim_socket).
 - `prim_file_nif.c` (1404 lines) — NIF module **`prim_file`** (`ERL_NIF_INIT` 221). Defines the `dyncall` resource callback (see dyncall note below).
 - `prim_buffer_nif.c` (515 lines) — NIF module **`prim_buffer`** (`ERL_NIF_INIT` 98). Table `nif_funcs[]` 86-96 (**9 entries**). Resource `rtype_buffer` = `"gc_buffer"`, dtor `gc_buffer` (146), opened at 116. Payload `buffer_data_t` 58-70.
 - `prim_tty_nif.c` (1340), `zlib_nif.c` (996), `zstd_nif.c` (1118), `erl_tracer_nif.c` (260) — one NIF module each, no per-module tables documented here.
