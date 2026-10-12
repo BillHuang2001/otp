@@ -3173,6 +3173,353 @@ fn an_ordinary_young_only_root_set_is_never_declined() {
     assert_relocated_tuple(fr[0], fr_only, [9, 10], "fr[0] (reachable only through the FR file)");
 }
 
+// ---------------------------------------------------------------------------------------
+// The GC root-set hand-off, hole 3: a foreign container NESTED below a scanned one
+// ---------------------------------------------------------------------------------------
+//
+// The per-word phase classifies a **root word**; it cannot see a foreign container that a
+// *scanned* container reaches. `super::gc_walk`'s two-phase check closes that hole with a
+// gated descent, and the gate is `Runtime::foreign_reachable(pid)` — the sticky bit every
+// event that can put a foreign container into the process's graph opens (a BIF/floor/NIF
+// result, an arena fallback, a spawn argument, a delivered fragment, the escape store). A
+// test of the NESTED shape must therefore **open the gate first**, exactly as a real BIF
+// result would; with the gate closed the descent is skipped by design and the test would be
+// vacuous.
+
+/// Builds the depth-≥2 shape the **gated descent** exists to find: `layers` container levels on
+/// `pid`'s **scanned** young heap over a container built on the runtime's pooled BIF heap,
+/// whose own child aliases a term on `pid`'s young heap.
+///
+/// Returns `(root, leaf)`:
+///
+/// * `leaf` — a two-element tuple `{7,8}` on the process's own young heap; and
+/// * `root` — `layers` young-heap container levels over a `rt.bif_heaps[0]` one-element tuple
+///   holding `leaf`, wrapped in a cons cell (so the shape is a list `[ … ]`).
+///
+/// The root's own top-level address is a young-heap pointer, so the valve's per-word phase
+/// calls it safe; only the descent reaches the BIF-heap container below.
+fn nested_foreign_root(
+    rt: &mut Runtime,
+    table: &mut ProcessTable,
+    pid: ProcessId,
+    layers: usize,
+) -> (Eterm, Eterm) {
+    let leaf = table
+        .get_mut(pid)
+        .expect("the spawned process")
+        .heap_mut()
+        .tuple(&[make_small(7), make_small(8)])
+        .expect("the young heap builds {7,8}");
+    let mut node = rt
+        .bif_heaps
+        .first_mut()
+        .expect("the runtime always owns its pooled BIF heap")
+        .tuple(&[leaf])
+        .expect("the pooled BIF heap builds the foreign container");
+    for _ in 0..layers {
+        node = table
+            .get_mut(pid)
+            .expect("the spawned process")
+            .heap_mut()
+            .tuple(&[node])
+            .expect("the young heap builds a scanned layer");
+    }
+    let root = table
+        .get_mut(pid)
+        .expect("the spawned process")
+        .heap_mut()
+        .cons(node, NIL)
+        .expect("the young heap builds the root cons cell");
+    (root, leaf)
+}
+
+/// The **clean** twin of [`nested_foreign_root`]: the same `layers`-deep nesting, but every
+/// child is a container on the process's **own young heap** — the fully-scanned graph a
+/// collection must still be allowed to move.
+fn nested_scanned_root(table: &mut ProcessTable, pid: ProcessId, layers: usize) -> (Eterm, Eterm) {
+    let leaf = table
+        .get_mut(pid)
+        .expect("the spawned process")
+        .heap_mut()
+        .tuple(&[make_small(7), make_small(8)])
+        .expect("the young heap builds {7,8}");
+    let mut node = leaf;
+    for _ in 0..layers {
+        node = table
+            .get_mut(pid)
+            .expect("the spawned process")
+            .heap_mut()
+            .tuple(&[node])
+            .expect("the young heap builds a scanned layer");
+    }
+    let root = table
+        .get_mut(pid)
+        .expect("the spawned process")
+        .heap_mut()
+        .cons(node, NIL)
+        .expect("the young heap builds the root cons cell");
+    (root, leaf)
+}
+
+/// Walks `root` down through `steps` one-element container levels — starting at the cons
+/// head, asserting each layer's shape — and returns the word the last level's element 0 names.
+///
+/// A [`nested_foreign_root`] of `n` scanned levels needs `n + 1` steps (the `n` young layers
+/// plus the pooled-BIF-heap one); a [`nested_scanned_root`] of `n` levels needs `n`.
+fn nested_leaf(root: Eterm, steps: usize, what: &str) -> Eterm {
+    let mut node = terms::cons_head(root).unwrap_or_else(|e| panic!("{what}: {e}"));
+    for step in 0..steps {
+        assert_eq!(
+            terms::tuple_arity(node).unwrap_or_else(|e| panic!("{what}: {e}")),
+            1,
+            "{what}: layer {step} is a one-element tuple"
+        );
+        node = terms::tuple_element(node, 0).expect("in range");
+    }
+    node
+}
+
+/// Asserts `leaf` is the intact `{7,8}` every fixture here nests at the bottom of the graph.
+fn assert_leaf(leaf: Eterm, what: &str) {
+    assert_eq!(
+        terms::tuple_arity(leaf).unwrap_or_else(|e| panic!("{what}: {e}")),
+        2,
+        "{what}: the leaf is a two-element tuple"
+    );
+    assert_eq!(
+        terms::tuple_element(leaf, 0).expect("in range"),
+        make_small(7),
+        "{what}: leaf element 0"
+    );
+    assert_eq!(
+        terms::tuple_element(leaf, 1).expect("in range"),
+        make_small(8),
+        "{what}: leaf element 1"
+    );
+}
+
+/// **The hole-3 regression guard (one scanned level): a foreign container NESTED inside a
+/// scanned container must decline the collection too.**
+///
+/// The root is a **young-heap** cons cell — a word the collector scans and relocates — and its
+/// element is a one-element tuple built on the runtime's pooled BIF heap, whose element is a
+/// tuple on the process's own young heap. The root's own address is scanned, so the valve's
+/// cheap per-word phase calls the root set clean; only a descent through the scanned cons
+/// reaches the BIF-heap container. Before the gated descent existed the collection ran and
+/// moved the nursery out from under the BIF-heap container's child, which then read the dead
+/// from-space word.
+///
+/// The gate is opened first (`Runtime::note_foreign_reachable`), exactly as
+/// `RuntimeContext::open_gate_for_foreign_result` opens it for a real BIF result. The assert
+/// is on real observable state: `gc_stats().collections` must not advance, the forced request
+/// must stay armed for the runner's park arm, and the root — nothing moved — must still read
+/// back the intact nested `{7,8}`.
+#[test]
+fn the_valve_declines_a_foreign_container_nested_in_a_scanned_container() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    let (root, leaf) = nested_foreign_root(&mut rt, &mut table, pid, 1);
+
+    // The cheap phase alone cannot see the hole: the root word is a young-heap pointer.
+    {
+        let process = table.get(pid).expect("the spawned process");
+        let mut scratch = super::gc_walk::WalkScratch::default();
+        assert!(
+            !super::gc::any_root_is_unscanned(&mut scratch, process, [root].iter(), false),
+            "the per-word phase classifies the root's own (scanned) address, so it alone \
+             reports the graph clean — which is exactly why the descent is needed"
+        );
+    }
+
+    // The event that opens the gate in production: a foreign container entered the graph.
+    rt.note_foreign_reachable(pid);
+    assert!(rt.foreign_reachable(pid), "the descent gate is open");
+
+    let mut x = [root, NIL, NIL, NIL];
+    let mut stack = [NIL];
+    let mut fr = [NIL];
+
+    let before = rt.gc_stats();
+    rt.request_gc(pid);
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.current_module = Some(GC_CALL_SITE.to_string());
+        ctx.arm_gc();
+        ctx.ensure_heap_full(0, RootSet::new(&mut x, &mut stack, &mut fr, 1))
+            .expect("the heap-admission point never fails the program");
+    }
+    let after = rt.gc_stats();
+
+    assert_eq!(
+        after.collections, before.collections,
+        "the gated descent must decline the collection: a container on the pooled BIF heap is \
+         reachable below the scanned root, and moving this heap would leave its young child \
+         pointing into the evacuated from-space; {after:?}"
+    );
+    assert_eq!(after.halted, before.halted, "nothing failed; {after:?}");
+    assert!(
+        rt.gc_request_pending(pid),
+        "a declined collection must leave the forced request armed for the runner's park arm"
+    );
+
+    // Nothing moved, so the root (and everything below it) is still readable, and the word
+    // the BIF-heap container aliases is still the intact young `{7,8}`.
+    assert_eq!(
+        x[0], root,
+        "the declined collection moved nothing, so the root word is unchanged"
+    );
+    let leaf_read_back = nested_leaf(x[0], 2, "x[0] after the decline");
+    assert_eq!(leaf_read_back, leaf, "the aliased young leaf keeps its address");
+    assert_leaf(leaf_read_back, "the aliased young leaf after the decline");
+}
+
+/// **The hole-3 regression guard (two scanned levels): the descent is transitive.**
+///
+/// The same shape as [`the_valve_declines_a_foreign_container_nested_in_a_scanned_container`],
+/// with **two** scanned container levels above the pooled-BIF-heap one — the root cons, a
+/// young tuple, a second young tuple, then the foreign container. A walk that only classified
+/// the root's *direct* children would miss it, so this pins the descent as a genuine graph
+/// traversal rather than a one-level expansion.
+#[test]
+fn the_valve_declines_a_deeply_nested_foreign_container() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    let (root, _leaf) = nested_foreign_root(&mut rt, &mut table, pid, 2);
+
+    // Still clean to the cheap phase — both intermediate layers are young-heap pointers.
+    {
+        let process = table.get(pid).expect("the spawned process");
+        let mut scratch = super::gc_walk::WalkScratch::default();
+        assert!(
+            !super::gc::any_root_is_unscanned(&mut scratch, process, [root].iter(), false),
+            "the per-word phase sees only the scanned root address"
+        );
+    }
+
+    rt.note_foreign_reachable(pid);
+
+    let mut x = [root, NIL, NIL, NIL];
+    let mut stack = [NIL];
+    let mut fr = [NIL];
+
+    let before = rt.gc_stats();
+    rt.request_gc(pid);
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.current_module = Some(GC_CALL_SITE.to_string());
+        ctx.arm_gc();
+        ctx.ensure_heap_full(0, RootSet::new(&mut x, &mut stack, &mut fr, 1))
+            .expect("the heap-admission point never fails the program");
+    }
+    let after = rt.gc_stats();
+
+    assert_eq!(
+        after.collections, before.collections,
+        "the descent must reach a foreign container two scanned levels down; {after:?}"
+    );
+    assert_eq!(after.halted, before.halted, "nothing failed; {after:?}");
+    assert!(
+        rt.gc_request_pending(pid),
+        "a declined collection must leave the forced request armed"
+    );
+    assert_eq!(x[0], root, "the declined collection moved nothing");
+    assert_leaf(
+        nested_leaf(x[0], 3, "x[0] after the decline"),
+        "the deeply nested leaf after the decline",
+    );
+}
+
+/// **The non-firing guard for the descent: a fully-scanned nested graph must STILL collect —
+/// with the gate open, and with it closed.**
+///
+/// The valve must not become an unconditional decline. Two halves:
+///
+/// * **gate OPEN** — the `O(live objects)` descent really runs over the nested graph and finds
+///   nothing foreign, because every layer is on the process's own young heap. The forced
+///   collection must run and relocate the whole chain.
+/// * **gate CLOSED** — a fresh pid whose gate nothing has opened skips the descent (that is the
+///   gate's contract) and decides on the cheap per-word phase alone, which is clean here; the
+///   collection must run just the same. This is the guard against a "fix" that made the door
+///   decline whenever the gate is closed.
+#[test]
+fn the_valve_collects_when_the_nested_graph_is_fully_scanned() {
+    // --- gate OPEN: the descent runs and must not fire on a fully-scanned graph. ---
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    let (root, _leaf) = nested_scanned_root(&mut table, pid, 2);
+    rt.note_foreign_reachable(pid);
+    assert!(
+        rt.foreign_reachable(pid),
+        "the descent really is enabled for this pid"
+    );
+
+    let mut x = [root, NIL, NIL, NIL];
+    let mut stack = [NIL];
+    let mut fr = [NIL];
+
+    let before = rt.gc_stats();
+    rt.request_gc(pid);
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.current_module = Some(GC_CALL_SITE.to_string());
+        ctx.arm_gc();
+        ctx.ensure_heap_full(0, RootSet::new(&mut x, &mut stack, &mut fr, 1))
+            .expect("the heap-admission point never fails the program");
+    }
+    let after = rt.gc_stats();
+    assert_eq!(
+        after.collections,
+        before.collections + 1,
+        "an all-scanned nested graph must still be collected over even with the descent \
+         enabled; {after:?}"
+    );
+    assert_eq!(after.halted, before.halted, "{after:?}");
+    assert!(
+        !rt.gc_request_pending(pid),
+        "the committed collection consumed the forced request"
+    );
+    assert_ne!(
+        x[0], root,
+        "the collection really moved the nested graph (the root was relocated)"
+    );
+    assert_leaf(
+        nested_leaf(x[0], 2, "x[0] after the collection"),
+        "the fully-scanned nested leaf after the collection",
+    );
+
+    // --- gate CLOSED: the descent is skipped and the cheap phase alone decides. ---
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    let (root, _leaf) = nested_scanned_root(&mut table, pid, 2);
+    assert!(
+        !rt.foreign_reachable(pid),
+        "a fresh pid's descent gate is closed until an event opens it"
+    );
+
+    let mut x = [root, NIL, NIL, NIL];
+    let mut stack = [NIL];
+    let mut fr = [NIL];
+
+    let before = rt.gc_stats();
+    rt.request_gc(pid);
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.current_module = Some(GC_CALL_SITE.to_string());
+        ctx.arm_gc();
+        ctx.ensure_heap_full(0, RootSet::new(&mut x, &mut stack, &mut fr, 1))
+            .expect("the heap-admission point never fails the program");
+    }
+    let after = rt.gc_stats();
+    assert_eq!(
+        after.collections,
+        before.collections + 1,
+        "with the gate closed the descent is skipped and the cheap phase — clean here — lets \
+         the collection run; {after:?}"
+    );
+    assert_eq!(after.halted, before.halted, "{after:?}");
+    assert_ne!(x[0], root, "the collection really moved the nested graph");
+    assert_leaf(
+        nested_leaf(x[0], 2, "x[0] after the closed-gate collection"),
+        "the fully-scanned nested leaf after the closed-gate collection",
+    );
+}
+
 /// **The same guard on the collecting allocation seam.**
 ///
 /// [`ExecutionContext::alloc_words_rooted`] is the second site the fix reconciles: when the
