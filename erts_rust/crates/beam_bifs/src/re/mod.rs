@@ -62,6 +62,11 @@ mod syntax;
 // and the unit tests; the matcher still lands with `re:run/2,3` (next pass).
 #[allow(dead_code)]
 mod prog;
+// Temporary: see `options` above — the run-side consumers of the matcher
+// (`re:run/2,3` and `re:internal_run/4`) are still placeholders, so `exec` has
+// no non-test caller yet.
+#[allow(dead_code)]
+mod exec;
 
 /// The compiled-pattern tag of the plain `{re_pattern, …}` form.
 const RE_PATTERN: &str = "re_pattern";
