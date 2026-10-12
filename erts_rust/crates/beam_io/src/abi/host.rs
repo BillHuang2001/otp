@@ -271,6 +271,13 @@ pub struct DriverState {
     /// re-deliver a driver's own queued bytes to its `outputv` as if they were new Erlang commands;
     /// [`AbiHost::enq`] records the concrete consequence.
     pub(crate) ioq: ByteQueue,
+    /// The port's **busy** state, as last set by the driver's `set_busy_port`.
+    ///
+    /// The C keeps this on the port's own state (the `ERTS_PORT_SFLG_*` the driver flips through
+    /// `set_busy_port`, `io.c:5208-5264`); here it is the per-port flag [`AbiHost::is_busy`] reports
+    /// so the port layer *can* consult it. The caller-blocking half (a `port_command/2,3` that
+    /// suspends rather than queues) is deliberately **not** modelled here — that is the runtime's.
+    pub(crate) busy: bool,
 }
 
 impl DriverState {
@@ -282,9 +289,14 @@ impl DriverState {
             jobs: AsyncJobs::new(),
             queued_stop_select: Vec::new(),
             ioq: ByteQueue::new(),
+            busy: false,
         }
     }
 
+    /// Whether the driver last marked the port busy (`set_busy_port`), `false` until it does.
+    pub fn is_busy(&self) -> bool {
+        self.busy
+    }
     /// The port timer deadline, or `None` when none is armed.
     pub fn deadline(&self) -> Option<Instant> {
         self.deadline
@@ -462,6 +474,17 @@ impl AbiHost {
         self.state.jobs.in_flight() > 0
     }
 
+    /// Whether the driver last marked this port **busy** through `set_busy_port` (the C's per-port
+    /// busy state).
+    ///
+    /// The safe companion of [`DriverHost::set_busy_port`], exactly as [`DriverState::queue_len`] is
+    /// the safe companion of [`DriverHost::sizeq`]: the raw hook is a `void`-returning C function
+    /// whose effect (the C's `ERTS_PORT_SFLG_*`) had no reader here, so a caller that needs to know
+    /// the busy state — the port layer behind [`DriverPort::is_busy`](super::port::DriverPort::is_busy)
+    /// — reads it through this accessor. `false` until the driver marks the port busy.
+    pub fn is_busy(&self) -> bool {
+        self.state.is_busy()
+    }
     /// The head of the port's **driver queue** as a safe byte slice — the safe companion of
     /// [`DriverHost::peekq`], exactly as [`DriverState::queue_len`] is the safe companion of
     /// [`DriverHost::sizeq`].
@@ -667,6 +690,22 @@ impl DriverHost for AbiHost {
         }])
     }
 
+    // -------------------------------------------------------------------------------------------
+    // Port attributes — `set_busy_port`
+    // -------------------------------------------------------------------------------------------
+
+    /// `set_busy_port`: mark the port busy (`busy`) or idle.
+    ///
+    /// The C moves the port's scheduler flags and always answers `0` for a live port
+    /// (`io.c:5208-5264`); the busy flag is recorded on the port's [`DriverState`] and read back
+    /// through [`AbiHost::is_busy`]. What the C *additionally* does with the flag — a
+    /// `port_command/2,3` that suspends the caller or answers `false`/`notsup` — is the runtime's
+    /// side of the split and is **not** modelled here (no port-layer reader exists yet), so this
+    /// hook's only observable effect is the flag the C also keeps per port.
+    fn set_busy_port(&mut self, busy: bool) -> c_int {
+        self.state.busy = busy;
+        0
+    }
     /// `driver_select`: register, re-register or de-register interest in an OS handle.
     ///
     /// The handle is the C convention of a **fd cast to a pointer**

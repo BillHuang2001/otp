@@ -116,13 +116,20 @@
  *  24  `driver_select(port, (ErlDrvEvent) fd, ERL_DRV_WRITE, 1)` — arm the **write** direction on
  *      the configured fd, so a write-readiness event schedules an `OUTPUT` task; return the host's
  *      code (or -1 when no fd was configured).
+ *  25  `set_busy_port(port, 1)` — mark the port **busy** (the C's per-port busy state); the C
+ *      returns `void`, so answer the `cres == 0` reply (the empty list).
+ *  26  `set_busy_port(port, 0)` — clear the port's busy state; the same empty reply.
+ *  27  set `*rbuf = NULL` and return `5` — the C's documented `cres > 0`-with-a-`NULL`-reply case,
+ *      which `port_control/3` reports as the **empty list** (`ertdoc › driver_entry.md › control`:
+ *      "If `*rbuf` is set to `NULL`, an empty list is returned"), never `badarg`.
  *
- * Verbs 19–24 answer their observation as `key=value` text; the `bytes=` field is the trailing raw
+ * Verbs 19–23 answer their observation as `key=value` text; the `bytes=` field is the trailing raw
  * payload and every other field is a decimal number. Verbs 19–23 are the driver-queue family
  * (`driver_enq`/`driver_sizeq`/`driver_peekq[v]`/`driver_deq`, `io.c:6790-6919`): the queue is the
  * host's driver-private byte queue (the C's `prt->ioq`, **not** the port's Erlang→driver output
  * queue), so it persists across these `control` calls for the port's whole life and a host can
- * drive the four steps in order.
+ * drive the four steps in order. Verbs 25/26 flip the port's busy state (`set_busy_port`) and 27
+ * exercises the `NULL`-`*rbuf` reply arm; none of them carries a `key=value` payload.
  *
  * Any other command returns `-1`, the C's negative `cres` (`port_control/3` answers `badarg`,
  * `io.c:4074`).
@@ -402,11 +409,15 @@ static ErlDrvData host_start(ErlDrvPort port, char *command) {
     parse_command(st, command);
     /* Publish this port's log path for `stop_select`, which receives no `ErlDrvData`. */
     copy_token(g_stop_select_log, sizeof(g_stop_select_log), st->log, strlen(st->log));
+    /* The `busy` mode token: mark the port busy **at start time** through the C `set_busy_port`, so
+     * a host can observe a driver that reports itself busy before it is handed any command (the
+     * state a `port_command/2,3` on it must consult). `set_busy_port` returns `void`. */
+    if (strcmp(st->mode, "busy") == 0)
+        set_busy_port(port, 1);
     log_event(st, "start");
     log_handle(st);
     return (ErlDrvData) st;
 }
-
 static void host_stop(ErlDrvData drv_data) {
     host_state *st = (host_state *) drv_data;
     if (st == NULL)
@@ -472,6 +483,12 @@ static void host_output(ErlDrvData drv_data, char *buf, ErlDrvSizeT len) {
         return;
     log_event(st, "output");
     log_handle(st);
+    /* `silent`: consume the command and emit nothing (no `driver_output`). This is the driver shape
+     * the C's `void` output callback allows — the command is counted as written and the port owner
+     * gets no `{Port,{data,_}}` (`io.c:1405-1408` counts the whole command as out and frees it). It
+     * pins that a driver which produces no bytes must not be reported as having produced any. */
+    if (strcmp(st->mode, "silent") == 0)
+        return;
     if (strcmp(st->mode, "upper") == 0 && buf != NULL) {
         ErlDrvSizeT i;
         for (i = 0; i < len; i++)
@@ -480,7 +497,6 @@ static void host_output(ErlDrvData drv_data, char *buf, ErlDrvSizeT len) {
     }
     (void) driver_output(st->port, buf, len);
 }
-
 #ifdef HOST_DRIVER_HAS_OUTPUTV
 /* The C's **vector** port-command callback (`io.c:1842-1864`): `iov[0]` is the empty header block a
  * driver may fill in, `iov[1]` the data. An entry that declares it is preferred over `output`
@@ -757,12 +773,26 @@ static ErlDrvSSizeT host_control(ErlDrvData drv_data, unsigned int command,
             return (ErlDrvSSizeT) -1;
         return (ErlDrvSSizeT) driver_select(st->port, (ErlDrvEvent) (intptr_t) st->fd,
                                             ERL_DRV_WRITE, 1);
+    case 25:
+        /* `set_busy_port(port, 1)`: mark the port busy. The C returns `void`, so answer the
+         * `cres == 0` reply (the empty list). */
+        set_busy_port(st->port, 1);
+        return (ErlDrvSSizeT) 0;
+    case 26:
+        /* `set_busy_port(port, 0)`: clear the port's busy state (the same empty reply). */
+        set_busy_port(st->port, 0);
+        return (ErlDrvSSizeT) 0;
+    case 27:
+        /* The `cres > 0` reply with `*rbuf` set to `NULL`: the C reports the **empty list** for it
+         * (`erts/doc/references/driver_entry.md` › *control*), never `badarg`. */
+        if (rbuf != NULL)
+            *rbuf = NULL;
+        return (ErlDrvSSizeT) 5;
     default:
         /* An unrecognised request: a negative `cres`, which `port_control/3` reports as `badarg`. */
         return (ErlDrvSSizeT) -1;
     }
 }
-
 static ErlDrvEntry host_driver_entry = {
     .init = NULL,
     .start = host_start,

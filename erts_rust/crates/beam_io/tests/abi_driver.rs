@@ -826,6 +826,72 @@ fn port_control_returns_the_drivers_reply_bytes() {
     registry.close(&mut poller, id).expect("the port closes");
 }
 
+/// A driver that returns `cres > 0` while pointing `*rbuf` at `NULL` answers the **empty reply**,
+/// never `badarg` — the C's documented `*rbuf == NULL` case (`erts/doc/references/driver_entry.md` ›
+/// *control*: "If `*rbuf` is set to `NULL`, an empty list is returned").
+///
+/// The fixture's control verb `27` sets `*rbuf = NULL` and returns `5`. Together with the `cres == 0`
+/// arm (verb `5`, which also answers `[]`) and the negative-`cres` arm (verb `9999` ⇒ `badarg`), all
+/// three reply shapes of the C's `call_driver_control` (`io.c:4023-4083`) are pinned — so only a
+/// **negative** `cres` can ever be an error.
+#[test]
+fn port_control_with_a_null_rbuf_reply_is_the_empty_list() {
+    let Some(so) = fixture_so() else {
+        return;
+    };
+    let (host, _state) = TestPortHost::new();
+    let (mut poller, mut registry, id) = open_port(&so, "", host);
+
+    assert_eq!(
+        registry
+            .port_control(&mut poller, id, "27", &[])
+            .expect("control verb 27 answers the C's empty reply"),
+        Vec::<u8>::new(),
+        "a `cres > 0` reply with a NULL `*rbuf` is the empty list, never badarg"
+    );
+
+    registry.close(&mut poller, id).expect("the port closes");
+}
+
+/// A driver whose `output` callback consumes the command and emits nothing must **not** be reported
+/// as having produced data. The C's `output`/`outputv` callbacks are `void` and it counts the whole
+/// command as written (`prt->bytes_out += size`, `io.c:1405`+`1408`), freeing the command buffer and
+/// never re-queuing, and the port owner simply gets no `{Port,{data,_}}`.
+///
+/// The fixture's `silent` start token runs exactly that driver shape: its `output` logs the callback
+/// and returns without calling `driver_output`. `PortRegistry::output` therefore answers the whole
+/// drained buffer (the C's accounting) and the port-task round reports **no**
+/// `PortNotification::Data` for the port — so a later "fix" that re-queues unconsumed bytes or
+/// fabricates a data message fails here.
+#[test]
+fn a_silent_driver_consumes_the_command_and_emits_no_data() {
+    let Some(so) = fixture_so() else {
+        return;
+    };
+    let (host, _state) = TestPortHost::new();
+    let (mut poller, mut registry, id) = open_port(&so, "silent", host);
+
+    let written = registry
+        .output(&mut poller, id, b"hello")
+        .expect("the driver's output callback runs");
+    assert_eq!(
+        written,
+        b"hello".len(),
+        "the C's void `output` callback counts the whole command as written"
+    );
+
+    // The port-task round finds an empty input queue: the silent driver called no `driver_output`.
+    let outcome = registry
+        .execute_port_tasks(&mut poller, DEFAULT_READINESS_RED_BUDGET)
+        .expect("the port-task round runs");
+    assert!(
+        data_of(&outcome, id).is_empty(),
+        "a driver that emits nothing must not be reported as having produced data"
+    );
+
+    registry.close(&mut poller, id).expect("the port closes");
+}
+
 // ---------------------------------------------------------------------------------------------
 // The driver queue: `driver_enq`/`driver_sizeq`/`driver_peekq[v]`/`driver_deq`
 // ---------------------------------------------------------------------------------------------
