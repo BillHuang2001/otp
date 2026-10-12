@@ -5,102 +5,82 @@
 # Mechanical dead-source checker for the legacy ERTS C/C++ tree.
 #
 # WHY THIS EXISTS
-#   The legacy C/C++ ERTS tree is still the OTP build's default runtime and the
-#   differential oracle for the erts_rust/ rewrite, so it must only ever shrink
-#   by files that are PROVABLY unreferenced.  A full ERTS compile is far too
-#   expensive to use as the bar, so this script produces the mechanical
-#   reference proof instead.  A false "dead" verdict is the one failure mode
-#   that matters, so every reference class below errs towards KEEPING a file.
+#   The legacy C/C++ ERTS tree is the OTP build's default runtime and the
+#   differential oracle for the erts_rust/ rewrite, so it may only shrink by files
+#   that are PROVABLY unreferenced.  A full ERTS compile is far too expensive to
+#   use as the bar, so this script produces the mechanical reference proof.  A
+#   false "dead" verdict is the one failure mode that matters, so every reference
+#   class errs towards KEEPING a file.
 #
 # WHAT IT PROVES (decisive reference classes)
 #   A  BUILD/SCRIPT REFERENCE - a real build or script source names the file:
-#      - the candidate's basename appears VERBATIM (e.g. "foo_drv.c") in any
-#        build/script source (.sh, .erl/.hrl, .escript, .nix, .toml, .yml/.yaml,
-#        Makefile*, *.mk/*.in/*.src/*.spec/*.rel/*.def/*.cmake/*.cfg/*.pro,
-#        *.ac/*.m4/.configure, otp_build, CI yaml, xcomp/*.conf, the
-#        extension-less codegen tools in erts/emulator/utils/, *.S, ...), or
-#      - the candidate's stem appears as a whole word in a makefile-role source
-#        (Makefile*, *.mk, *.in, *.m4, *.ac, *.am, *.tab, *.src, *.spec, *.rel,
-#        *.def, *.cmake, *.cfg, *.pro, *.bat, configure*, otp_build, the codegen
-#        tools, xcomp/*.conf), or
-#      - a $(wildcard ...) pattern matches the path.
+#      the basename appears VERBATIM ("foo_drv.c") in any build/script source
+#      (.sh, .erl/.hrl, .escript, .nix, .toml, .yml/.yaml, Makefile*, *.mk/*.in/
+#      *.src/*.spec/*.rel/*.def/*.cmake/*.cfg/*.pro, *.ac/*.m4, configure,
+#      otp_build, CI yaml, xcomp/*.conf, the extension-less codegen tools in
+#      erts/emulator/utils/, *.S, ...), or its stem appears as a whole word in a
+#      makefile-role source, or a $(wildcard ...) pattern matches the path.
 #   B  INCLUDE REFERENCE - an #include of the basename (or a path ending in it)
-#                        in any other C-family source.
+#      in any other C-family source.
 #   C  SYMBOL REFERENCE - an identifier the file defines (function definition,
-#                        #define, typedef name) appears as a whole word in any
-#                        other C-family or build/config source.
-#
-#   Only whole-word matches count, so the stem "bin_drv" is NOT considered
-#   referenced by the unrelated identifier "erts_bin_drv_alloc".  Files whose
-#   own stem is generic (e.g. hash.c / time.c) are kept merely because the word
-#   occurs somewhere - the check errs towards keeping files.
+#      #define, typedef name) appears as a whole word in any other C-family or
+#      build/config source.
+#   Only whole-word matches count, so the stem "bin_drv" is NOT "referenced" by
+#   the unrelated identifier "erts_bin_drv_alloc".  Files whose own stem is
+#   generic (hash.c/time.c) are kept merely because the word occurs somewhere.
 #
 # ADVISORY (printed, never decisive)
 #   A mention in any other tracked text file (docs, CONTEXT.md, erts_rust
-#   sources, ...).  A doc mention is not a build/include/symbol reference, so it
-#   does not make a file live - but it is reported so a human can see why a
-#   grep "found" the name.
+#   sources, ...).  That is not a build/include/symbol reference, so it does not
+#   make a file live - it is reported only so a human can see why a grep "found"
+#   the name.
 #
 # TWO TIERS
-#   STRICT (decisive)   A fixpoint / transitive-closure liveness analysis over
-#                       the build wiring.  A file is LIVE if it is
-#                         (a) a compilation unit named by a real object-list
-#                             entry - every make synthesis form is resolved back
-#                             to the sources it names:
-#                               $(VAR:%=$(OBJDIR)/%.o)      ($(VAR:.c=.o))
+#   STRICT (decisive)   A fixpoint / transitive-closure liveness analysis over the
+#                       build wiring.  A file is LIVE if it is
+#                         (a) a compilation unit named by a real object-list entry
+#                             - every make synthesis form is resolved back to the
+#                             sources it names:
+#                               $(VAR:%=$(OBJDIR)/%.o) / $(VAR:.c=.o)
 #                               $(patsubst %.c,$(OBJDIR)/%.o,$(VAR))
-#                               $(VAR:%=prefix/%.c)         (source-naming)
-#                               $(addprefix D,$(notdir $(VAR:.c=.o)))
+#                               $(VAR:%=prefix/%.c) / $(addprefix D,$(notdir ...
 #                             - or covered by a $(wildcard ...) pattern, or
-#                         (b) named by a build/script/codegen source (class A
-#                             above: verbatim basename, or makefile-role stem), or
-#                         (c) a driver/NIF test fixture owned by its CT suite
-#                             (*_SUITE_data/ fixture named by the fixture's own
-#                             Makefile or by the owning *_SUITE.erl), or
+#                         (b) named by a build/script/codegen source (class A), or
+#                         (c) a driver/NIF CT fixture owned by its *_SUITE.erl, or
 #                         (d) reached from a live file through an #include of its
 #                             basename or through a symbol it defines.
 #                       Everything else is STRICT DEAD.  Only candidate files
-#                       (C-family sources) propagate liveness, so a reference
-#                       that comes solely from a DOC still does NOT make a file
-#                       live.  Text inside a never-compiled #if region (see the
-#                       advisory section) does not count as a reference either.
+#                       propagate liveness, so a reference that comes solely from
+#                       a DOC does NOT make a file live, and neither does text
+#                       inside a never-compiled #if region (advisory section).
 #                       The deletion gate is "STRICT DEAD and not exempt" = 0.
 #   LOOSE (advisory)    The original single-pass A/B/C reference classes plus the
-#                       per-file exemptions.  Reported for context only; it is
-#                       NOT the deletion gate.  "documentation-only" mentions
-#                       remain non-decisive in both tiers.
+#                       per-file exemptions; NOT the deletion gate.
 #
 # NEVER-COMPILED #if REGIONS (advisory report section, never decisive)
 #   `#ifdef M` / `#if defined(M)` regions whose controlling macro M is never
 #   definable in this tree are reported as `file:line` + macro.  "Never
 #   definable" means, conservatively, ALL of:
-#     - M is not #define'd in any tracked source,
-#     - M is not a -D flag anywhere (Makefile/*.in, scripts, CI, ...),
-#     - M is not AC_DEFINE'd (configure.ac/xcomp) and not a config.h.in template
-#       (#undef) entry,
-#     - M is not a compiler/toolchain builtin or platform name (names starting
-#       with "_" or containing "__", HAVE_*, ERLANG_OSTYPE, DEBUG*, ETHR_*,
-#       AO_*, ZLIB*, PCRE*, ASMJIT*, ...),
-#     - M occurs in the WHOLE tree only on preprocessor condition lines (so it is
-#       not defined by a generator nor used by any code either).
-#   Anything not decidable that way is left SILENT (no false positives), and a
+#     - M is not #define'd (or #undef'd) anywhere, even mid-line by a generator or
+#       in a commented-out `/* #define M */` enable path, and not a -D flag or an
+#       AC_DEFINE (configure.ac/xcomp) or a config.h.in template entry,
+#     - M is not a compiler/toolchain builtin or platform name ("_" / "__" names,
+#       HAVE_*, ERLANG_OSTYPE, DEBUG*, ETHR_*, AO_*, ZLIB*, PCRE*, ASMJIT*, ...),
+#     - M occurs in the tree only on preprocessor condition lines - a *use* in a
+#       C-family or build/config source would rule it out, but a mention in a doc
+#       or in a Rust comment is not a use and is ignored.
+#   Anything not decidable that way stays SILENT (no false positives), and a
 #   condition that is not a single macro (arithmetic, &&/||, function-like) is
-#   never reported.  `#ifndef M` with such an M is ALWAYS compiled, so its body
-#   is not a dead region and is not reported.  These findings NEVER change the
-#   strict/actionable verdict or the exit status.
+#   never reported.  `#ifndef M` with such an M is ALWAYS compiled, so its body is
+#   not a dead region.  These findings NEVER change the strict/actionable verdict
+#   or the exit status; a removal pass must still verify each block against the
+#   toolchain and the configure options.
 #
 # USAGE
-#   python3 check_dead_sources.py                       # default --root erts
-#   python3 check_dead_sources.py --root erts/emulator  # narrow the scope
-#   python3 check_dead_sources.py --root erts/lib_src
-#   python3 check_dead_sources.py --root .              # whole repository
-#   python3 check_dead_sources.py --write-report        # also write dead_source_report.txt
-#   python3 check_dead_sources.py --explain GLOB        # show evidence lines per file
-#
-#   Exit status is 1 when the ACTIONABLE STRICT-dead set (STRICT dead and not
-#   retained by an exemption rule) is non-empty, else 0.
-#
-# Scope: every tracked <root>/**/*.{c,h,cpp,hpp,cc}; the default root is `erts`.
+#   python3 check_dead_sources.py [--root DIR] [--write-report] [--explain GLOB]
+#   --root defaults to `erts`; "." means the whole repository.  Exit status is 1
+#   when the ACTIONABLE STRICT-dead set is non-empty, else 0.
+#   Scope: every tracked <root>/**/*.{c,h,cpp,hpp,cc}; the default root is `erts`.
 
 import argparse
 import fnmatch
@@ -108,7 +88,6 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 from collections import Counter, deque
 from pathlib import Path
 
@@ -206,20 +185,22 @@ MAKE_ASSIGN_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*[:+]?=\s*(.*)$")
 # ("$(ETHR_THR_LIB_BASE_DIR)/ethr_event.c").
 SRC_TOKEN_RE = re.compile(r"^(?:[A-Za-z_][\w.\-]*|[^\s\\]*\.(?:c|cpp|cc))$")
 
-# Macro definitions that mark a name as "definable" anywhere in the tree.
-DFLAG_RE = re.compile(r"(?<![\w-])-D\s*([A-Za-z_]\w*)")
-AC_DEFINE_RE = re.compile(r"AC_DEFINE(?:_UNQUOTED)?\(\s*([A-Za-z_]\w*)")
-UNDEF_RE = re.compile(r"^\s*#\s*undef\s+([A-Za-z_]\w*)", re.M)
-# A preprocessor condition/undef line (used to prove that a macro name occurs
-# ONLY as a condition, i.e. is neither defined nor used by any code).
-COND_LINE_RE = re.compile(r"^[ \t]*#[ \t]*(?:if|ifdef|ifndef|elif|undef)[^\n]*$", re.M)
-PP_LINE_RE = re.compile(r"^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b[ \t]*(.*?)[ \t]*$")
+# A preprocessor condition/undef line.  `#else`/`#endif` are included: a name on
+# such a line can only be a comment (`#endif /* NAME */`), never a use.  Used to
+# prove that a macro name occurs ONLY as a condition (i.e. is neither defined nor
+# used by any code).
+COND_LINE_RE = re.compile(
+    r"^[ \t]*#[ \t]*(?:if|ifdef|ifndef|elif|else|endif|undef)[^\n]*$", re.M)
+# re.M is REQUIRED: this regex is used both per-line (find_never_compiled_blocks)
+# and over a whole file text (Pass A's `finditer`, which must see every line).
+PP_LINE_RE = re.compile(r"^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b[ \t]*(.*?)[ \t]*$", re.M)
 IDENT_RE = re.compile(r"^[A-Za-z_]\w*$")
-# Same idea as COND_LINE_RE, but applied to a single grep'd line.
-COND_PREFIX_RE = re.compile(r"[ \t]*#[ \t]*(?:if|ifdef|ifndef|elif|undef)\b")
-# Every spelling that defines/undeclares a macro anywhere in the tree.
-DEF_NAME_RES = (re.compile(r"^[ \t]*#[ \t]*(?:define|undef)[ \t]+([A-Za-z_]\w*)", re.M),
-                re.compile(r"(?<![\w-])-D[ \t]*([A-Za-z_]\w*)"),
+# Every spelling that defines/undeclares a macro anywhere in the tree.  The
+# `#define`/`#undef` one is deliberately UNANCHORED: generators print their
+# `#define NAME` (and commented-out/disabled toggles spell it) mid-line, and a
+# macro emitted by a code generator IS definable here.
+DEF_NAME_RES = (re.compile(r"#[ \t]*(?:define|undef)[ \t]+([A-Za-z_]\w*)"),
+                re.compile(r"(?<![\w-])-D\s*([A-Za-z_]\w*)"),
                 re.compile(r"AC_DEFINE(?:_UNQUOTED)?\([ \t]*([A-Za-z_]\w*)"))
 
 # Conservative allow-list for the never-compiled-block detector: names in the
@@ -281,47 +262,6 @@ def tracked_files():
     return [Path(p) for p in out.decode("utf-8", "replace").split("\0") if p]
 
 
-def guard_evidence(names):
-    """Where the never-compiled-block guard names occur, in ONE git grep pass.
-
-    Returns (guard_ok, defined) where
-      guard_ok[name]  is True iff EVERY occurrence of `name` in the tree is on a
-                      preprocessor condition line (i.e. no code and no generator
-                      ever uses or defines it), and
-      defined         is the set of names some source defines (-D / #define /
-                      #undef / AC_DEFINE).
-    Returns None when git grep is unavailable; the caller then scans every file.
-    """
-    if not names:
-        return {}, set()
-    fd, pat_file = tempfile.mkstemp(prefix="cds_patterns_")
-    try:
-        with os.fdopen(fd, "w") as fh:
-            fh.write("\n".join(sorted(names)) + "\n")
-        res = subprocess.run(["git", "-C", str(ROOT), "grep", "-I", "-n", "-F",
-                              "-f", pat_file, "--", ":/"], capture_output=True)
-        if res.returncode not in (0, 1):        # 1 = no match
-            return None
-        guard_ok, defined = {}, set()
-        for line in res.stdout.decode("utf-8", "replace").splitlines():
-            _rel, sep, rest = line.partition(":")
-            lineno, sep2, content = rest.partition(":")
-            if not sep or not sep2:
-                continue
-            if not lineno.isdigit():
-                continue                        # unexpected format: stay silent
-            if not COND_PREFIX_RE.match(content):
-                for n in names.intersection(TOKEN_RE.findall(content)):
-                    guard_ok[n] = False
-            for rx in DEF_NAME_RES:
-                defined.update(n for n in rx.findall(content) if n in names)
-        for n in names:
-            guard_ok.setdefault(n, True)
-        return guard_ok, defined
-    finally:
-        os.unlink(pat_file)
-
-
 def read_text(path):
     try:
         data = (ROOT / path).read_bytes()
@@ -370,6 +310,17 @@ def is_build_source(path):
     return path.suffix.lower() in {".sh", ".nix", ".toml", ".exs", ".escript",
                                   ".erl", ".hrl", ".yml", ".yaml"}
 
+
+def guard_relevant(rel):
+    """Is a *use* of a guard name in `rel` real preprocessor evidence?
+
+    A preprocessor use can only live in a C-family source or in a build/config
+    source (where -D/AC_DEFINE spell it).  A mention in a doc (CONTEXT.md, ...)
+    or in a comment of the Rust rewrite is not a use, so it must NOT defeat the
+    never-compiled-block detector.
+    """
+    p = Path(rel)
+    return p.suffix.lower() in CFAMILY_EXTS or is_build_source(p)
 
 def list_assignments(txt):
     """Map VAR -> set(items) for plain "VAR = a b \\\n c" assignments whose
@@ -432,6 +383,16 @@ def glob_to_regex(pattern):
 def cond_text(txt):
     """Only the preprocessor condition/undef lines of `txt`."""
     return "".join(m.group(0) for m in COND_LINE_RE.finditer(txt))
+
+
+def defined_names(txt):
+    """Every macro name `txt` defines/undeclares (#define / #undef / -D / AC_DEFINE).
+
+    Unanchored, so a generator-emitted or commented-out `#define NAME`, and a
+    `-DNAME` (which the tokenizer would otherwise see as the word "DNAME"), all
+    count as definable.
+    """
+    return {n for rx in DEF_NAME_RES for n in rx.findall(txt)}
 
 
 def cheap_undefinable(name):
@@ -584,17 +545,12 @@ def main():
     # Everything below is restricted to the names that could ever be reported,
     # so the whole-tree work stays a single pass: erts/*_HAVE_* / __*/_* / 3PP
     # namespaces are pruned by name alone, and only the files that mention one
-    # of the surviving names are inspected in detail.
+    # of the surviving names are inspected in detail.  Pass B answers, for every
+    # such name, "is it ever used outside a `#if` line?" and "is it ever
+    # defined?" from the token counts it already computes - one pass over the
+    # tracked files, no per-pattern tree grep (git grep -f over ~1000 patterns
+    # degenerates to minutes).
     interesting_guards = {n for n in guard_names if cheap_undefinable(n)}
-    # Two questions decide every never-compiled block - "is this guard name ever
-    # used outside a `#if` line?" and "is it ever defined?" - both answered for
-    # all names by ONE inverted git-grep pass over the tree.  `mentions()`-style
-    # per-file tests would re-tokenize ~13k files; grep only visits matches.
-    ev = guard_evidence(interesting_guards)
-    use_grep = ev is not None
-    if use_grep:
-        guard_ok.update(ev[0])
-        defined_macros.update(ev[1])
 
     def maybe_scan_basenames(txt):
         # Exact prefilter for basename_re (which needs one of these suffixes).
@@ -604,8 +560,9 @@ def main():
     # Pass B - every tracked file.
     for p in files:
         rel = str(p)
-        if rel in SELF_EXCLUDE or p.suffix.lower() in DOC_EXTS:
+        if rel in SELF_EXCLUDE:
             continue
+        is_doc = p.suffix.lower() in DOC_EXTS
         txt = cand_text.get(rel)
         if txt is None:
             try:
@@ -616,6 +573,19 @@ def main():
             txt = read_text(p)
             if txt is None:
                 continue
+        # A macro name is "defined" if ANY tracked text file spells
+        # `#define`/`#undef`/`-D`/`AC_DEFINE` for it - scanned with the raw text
+        # because `-DNAME` tokenizes as "DNAME", searched ANYWHERE in the line so
+        # a generator-emitted or commented-out(disabled) `#define NAME` counts,
+        # and covering docs too (this check errs towards "definable").
+        if interesting_guards and ("#define" in txt or "#undef" in txt
+                                   or "-D" in txt or "AC_DEFINE" in txt):
+            for name in interesting_guards.intersection(defined_names(txt)):
+                defined_macros.add(name)
+                if guard_relevant(rel):
+                    guard_ok[name] = False    # a definition is not a condition
+        if is_doc:
+            continue
         cnt = cand_cnt.get(rel)
         if cnt is None:
             cnt = Counter(TOKEN_RE.findall(txt))
@@ -629,10 +599,10 @@ def main():
                 # Candidate #includes are read from their ACTIVE text below.
                 for m in INCLUDE_RE.finditer(txt):
                     includes.setdefault(m.group(1).rsplit("/", 1)[-1], []).append(rel)
-        # Fallback when git grep is unavailable: a file that mentions a guard
-        # name either defines it or uses it.  "Used" means it occurs somewhere
-        # other than a `#if`/`#undef` line, compared by token count.
-        if not use_grep and interesting_guards:
+        # "Used" means a guard name occurs in a C-family/build source somewhere
+        # other than a `#if`/`#else`/`#endif`/`#undef` line (compared by token
+        # count); a mention in a doc or in a Rust comment is not a use.
+        if interesting_guards and guard_relevant(rel):
             g_hits = interesting_guards.intersection(cnt)
             if g_hits:
                 gcnt = Counter(TOKEN_RE.findall(cond_text(txt)))
@@ -641,10 +611,6 @@ def main():
                         guard_ok[name] = False    # also used by real code
                     else:
                         guard_ok.setdefault(name, True)
-                defined_macros.update(n for n in MACRO_RE.findall(txt) if n in g_hits)
-                defined_macros.update(n for n in DFLAG_RE.findall(txt) if n in g_hits)
-                defined_macros.update(n for n in AC_DEFINE_RE.findall(txt) if n in g_hits)
-                defined_macros.update(n for n in UNDEF_RE.findall(txt) if n in g_hits)
         if is_b:
             tokens_build.update(cnt)
             stems = candidate_stems.intersection(cnt)
@@ -1024,16 +990,13 @@ def main():
                 lines.append("      (none)")
     lines.append("")
     lines.append("=== ADVISORY: never-compiled #if regions (NOT part of the deletion gate) ===")
-    lines.append("A region `#ifdef M` / `#if defined(M)` is listed when M can never be defined in")
-    lines.append("this tree: M is not #define'd in any tracked source, is not any -D flag, is not")
-    lines.append("AC_DEFINE'd and not a config.h.in template entry, is not a compiler/toolchain")
-    lines.append("builtin or platform name (\"_\"/\"__\" names, HAVE_*, ERLANG_OSTYPE, DEBUG*,")
-    lines.append("ETHR_*, AO_*, ZLIB*, PCRE*, ASMJIT*, ...), and M occurs in the whole tree ONLY on")
-    lines.append("preprocessor condition lines (so no code and no generator ever defines or uses it).")
-    lines.append("Consequently the region can never be compiled here.  Undecidable conditions and")
-    lines.append("`#ifndef M` (whose body with such an M is ALWAYS compiled) are not reported.  These")
-    lines.append("findings never affect the STRICT/ACTIONABLE verdict or the exit status; a removal")
-    lines.append("pass must still verify each block against the toolchain and the configure options.")
+    lines.append("A region `#ifdef M` / `#if defined(M)` is listed when M can never be defined here:")
+    lines.append("no #define/#undef (even mid-line, generator-emitted or commented-out), no -D, no")
+    lines.append("AC_DEFINE / config.h.in entry, not a compiler/platform builtin name, and every")
+    lines.append("other occurrence of M is a preprocessor condition line (a doc or Rust-comment")
+    lines.append("mention is not a use).  Undecidable conditions and `#ifndef M` (always compiled)")
+    lines.append("are not reported.  These findings never affect the STRICT/ACTIONABLE verdict or")
+    lines.append("the exit status; a removal pass must still verify each block against the toolchain.")
     if not blocks:
         lines.append("  (none)")
     else:
