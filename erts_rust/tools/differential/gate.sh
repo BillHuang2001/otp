@@ -3,9 +3,11 @@
 # gate.sh — the differential-test GATE for the Rust ERTS rewrite.
 #
 # Runs the built-in differential conformance corpus under BOTH runtimes (the system-ERTS
-# oracle and the Rust `beam_rt`) via `differential suite --strict --allowlist known-gaps.txt`,
-# then turns the run's machine-readable report into a CI-friendly exit code. It is a pure
-# driver: it never modifies the runtime, the corpus or the report schema.
+# oracle and the Rust `beam_rt`) via `differential suite --strict --allowlist <file>`, then
+# turns the run's machine-readable report into a CI-friendly exit code. The allowlist defaults
+# to the committed `known-gaps.txt` next to this script and is overridable with
+# `--allowlist <file>`. It is a pure driver: it never modifies the runtime, the corpus or the
+# report schema.
 #
 # ---------------------------------------------------------------------------
 # EXIT-CODE CONTRACT (this script; the binaries' own codes are 0/1/2)
@@ -40,7 +42,8 @@
 # ---------------------------------------------------------------------------
 #   1. `scripts/cargo.sh build --manifest-path <erts_rust>/Cargo.toml -p beam_rt -p beam_dist -p differential`
 #   2. `scripts/cargo.sh run   --manifest-path <erts_rust>/Cargo.toml -q -p differential -- \
-#          suite --strict --allowlist <script_dir>/known-gaps.txt --json --out <tmpdir>`
+#          suite --strict --allowlist <allowlist> --json --out <tmpdir>`
+#      (<allowlist> is `--allowlist <file>` when given, else `<script_dir>/known-gaps.txt`.)
 # The corpus JSON report is written to `<tmpdir>/report.json`; the same JSON that the
 # binary prints on stdout is captured to `<tmpdir>/stdout.json` (not echoed) so the gate's
 # own output stays a concise human summary.
@@ -53,12 +56,44 @@
 #
 set -eu
 
-# --- locate the erts_rust workspace + the allowlist relative to this script ------------
+# --- locate the erts_rust workspace + the script itself relative to this script --------
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 erts_rust=$(CDPATH= cd -- "$script_dir/../.." && pwd)
 manifest="$erts_rust/Cargo.toml"
 cargo_sh="$erts_rust/scripts/cargo.sh"
-allowlist="$script_dir/known-gaps.txt"
+# --- arguments --------------------------------------------------------------------------
+# `--allowlist <file>` overrides the committed `known-gaps.txt` next to this script (the
+# default). `--help`/`-h` prints the usage and succeeds; any other argument is a usage error.
+# These are handled before anything is built, so an explicit-but-missing allowlist fails fast.
+allowlist=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --allowlist)
+      if [ $# -lt 2 ]; then
+        echo "gate: '--allowlist' requires a file argument" >&2
+        exit 2
+      fi
+      allowlist=$2
+      shift 2
+      ;;
+    --allowlist=*)
+      allowlist=${1#--allowlist=}
+      shift
+      ;;
+    -h | --help)
+      echo "usage: gate.sh [--allowlist <file>]"
+      echo "  --allowlist <file>   known-gaps allowlist (default: <script_dir>/known-gaps.txt)"
+      exit 0
+      ;;
+    *)
+      echo "gate: unknown argument '$1' (try --help)" >&2
+      exit 2
+      ;;
+  esac
+done
+if [ -z "$allowlist" ]; then
+  allowlist="$script_dir/known-gaps.txt"
+fi
 
 if [ ! -f "$manifest" ]; then
   echo "gate: cannot find the workspace manifest at '$manifest'" >&2
