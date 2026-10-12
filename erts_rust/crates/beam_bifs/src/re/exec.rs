@@ -218,9 +218,23 @@ impl Captures {
 
 /// The span of group `g` in a slot vector — the shared accessor of
 /// [`Captures::group`] and the VM.
+///
+/// The **end** slot (`2 * g + 1`) is the one carrying the completed span: the
+/// even slot only holds the group's start position, written as the degenerate
+/// `(pos, pos)` marker when the group opens (`Save(2 * g)`), while the odd one
+/// is written as `(start, pos)` when it closes (`Save(2 * g + 1)`). Group 0 is
+/// the exception only in that `Match` writes the whole-match span into *both* of
+/// its slots, so reading the odd slot is right for every group.
 fn group_span(slots: &[Option<(usize, usize)>], g: u32) -> Option<(usize, usize)> {
-    let idx = (g as usize).checked_mul(2)?;
+    let idx = (g as usize).checked_mul(2)?.checked_add(1)?;
     slots.get(idx).copied().flatten()
+}
+
+/// The position at which group `g` opened — the even slot's value, or `None`
+/// when the group has not been entered (or does not exist).
+fn group_start(slots: &[Option<(usize, usize)>], g: u32) -> Option<usize> {
+    let idx = (g as usize).checked_mul(2)?;
+    slots.get(idx).copied().flatten().map(|(start, _)| start)
 }
 
 /// What [`run`] found: the matches (one element per reported match; a
@@ -577,8 +591,9 @@ impl<'a> Machine<'a> {
         if slot % 2 == 0 {
             self.set_slot(slot, Some((self.pos, self.pos)));
         } else {
-            let start = group_span(&self.slots, ((slot - 1) / 2) as u32)
-                .map_or(self.pos, |(start, _)| start);
+            // The group's start marker; a missing one (an odd slot with no even
+            // predecessor in the program) falls back to the current position.
+            let start = group_start(&self.slots, ((slot - 1) / 2) as u32).unwrap_or(self.pos);
             self.set_slot(slot, Some((start, self.pos)));
         }
     }
@@ -661,8 +676,14 @@ impl<'a> Machine<'a> {
         match assert {
             Assert::StartLine { multiline } => {
                 if multiline {
+                    // PCRE2's `OP_CIRC` requires `ptr < end_subject` for the
+                    // after-a-newline arm, so a trailing newline does *not* open
+                    // a line at the end of the subject (oracle-verified:
+                    // `re:run("a\nb\n","^",[global,multiline,…])` reports only
+                    // offsets 0 and 2, and `re:run("\n","^",[{offset,1},multiline,…])`
+                    // is `nomatch`).
                     (pos == 0 && !self.parsed.notbol)
-                        || (pos != 0 && self.nl.ends_at(self.codes, pos))
+                        || (pos < len && pos != 0 && self.nl.ends_at(self.codes, pos))
                 } else {
                     pos == 0 && !self.parsed.notbol
                 }
@@ -880,8 +901,8 @@ mod tests {
         assert_eq!(caps.slots.len(), 6, "2 * (ncap + 1)");
         // A non-capturing group shifts nothing.
         let caps = matched("(?:b)(c)", "xabcy", &parsed());
-        assert_eq!(caps.group(0), Some((1, 3)));
-        assert_eq!(caps.group(1), Some((2, 3)));
+        assert_eq!(caps.group(0), Some((2, 4)));
+        assert_eq!(caps.group(1), Some((3, 4)));
         assert_eq!(caps.group(2), None);
     }
 
@@ -889,13 +910,14 @@ mod tests {
     fn greedy_lazy_and_possessive_quantifiers() {
         let one = parsed();
         assert_eq!(span("a*", "aaa", &one), (0, 3), "greedy takes everything");
-        assert_eq!(span("a*?", "aaa", &one), (0, 1), "lazy takes one");
+        assert_eq!(span("a*?", "aaa", &one), (0, 0), "lazy prefers the empty match");
         assert_eq!(span("a*+", "aaa", &one), (0, 3), "possessive takes everything");
         // ... and a possessive star with nothing to consume still accepts the
         // empty match (the `Cut` discards the choice points, not the match).
         assert_eq!(span("a*+", "b", &one), (0, 0));
         assert_eq!(span("a{2,3}", "aaaa", &one), (0, 3), "a bounded quantifier");
         assert_eq!(span("a+?", "aaa", &one), (0, 1));
+        assert_eq!(span("a?", "aaa", &one), (0, 1));
     }
 
     #[test]
@@ -939,6 +961,18 @@ mod tests {
         assert_eq!(mismatch("c$", "abc\n", &noteol), None);
         // `^`/`$` at the very start/end of the subject.
         assert_eq!(span("^abc$", "abc", &one), (0, 3));
+        // A trailing newline does not open a line at the end of the subject:
+        // PCRE2's `OP_CIRC` needs `ptr < end_subject` for the after-a-newline
+        // arm (oracle: `re:run("a\nb\n","^",[global,multiline,…])` = the two
+        // matches at 0 and 2 only; `re:run("\n","^",[{offset,1},multiline,…])`
+        // = `nomatch`).
+        let global_multiline =
+            Parsed { global: true, compile: multiline.compile.clone(), ..Parsed::default() };
+        assert_eq!(spans("^", "a\nb\n", &global_multiline), vec![(0, 0), (2, 2)]);
+        assert_eq!(spans("^", "\n\n", &global_multiline), vec![(0, 0), (1, 1)]);
+        assert_eq!(spans("^", "a\n\nb", &global_multiline), vec![(0, 0), (2, 2), (3, 3)]);
+        let at_end = Parsed { start_offset: 1, ..multiline.clone() };
+        assert_eq!(mismatch("^", "\n", &at_end), None, "offset 1 == len is not a line start");
     }
 
     #[test]
@@ -957,8 +991,9 @@ mod tests {
         assert_eq!(span("\\babc\\b", "abc", &one), (0, 3));
         assert_eq!(mismatch("\\Babc", "abc", &one), None);
         assert_eq!(span("\\Bb", "abc", &one), (1, 2));
-        assert_eq!(span("b\\b", "abc", &one), (1, 2));
-        assert_eq!(mismatch("b\\b", "abcd", &one), None, "c is a word character");
+        assert_eq!(span("\\bab", "abc", &one), (0, 2));
+        assert_eq!(mismatch("\\Bab", "abc", &one), None);
+        assert_eq!(mismatch("b\\b", "abc", &one), None, "c is a word character");
     }
 
     #[test]
@@ -979,7 +1014,7 @@ mod tests {
             compile: CompileFlags { dotall: true, ..CompileFlags::default() },
             ..Parsed::default()
         };
-        assert_eq!(span("a.b", "a\nb", &one), (0, 3), "the search skips the first line");
+        assert_eq!(mismatch("a.b", "a\nb", &one), None, "`.` refuses a newline");
         assert_eq!(span("a.c", "a\nc", &dotall), (0, 3));
         assert_eq!(span("(?s)a.c", "a\nc", &one), (0, 3), "an inline `(?s)`");
         assert_eq!(span(".", "a\nb", &one), (0, 1));
