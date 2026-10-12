@@ -25,10 +25,16 @@ keys it in `FileServices::devices` as a `Device`: the open `std::fs::File` plus 
 (`file_io_server`'s `State#state.read_mode`/`unic`). The mutability is the point of
 [`setopts.rs`](setopts.rs): a `{setopts,…}` rewrites them and the next read honours the new value.
 ### The scheduler-pass step
-`Runtime::service_file_requests(&mut ProcessTable) -> Result<usize>` drains every service/io-device
-mailbox (`Process::receive`) and delivers each reply through `ProcessTable::deliver_simple`,
-returning the delivery count; a reply to a since-dead caller is dropped
-(`BeamError::TermNotFound`), exactly as `gen:reply/2` swallows its own send failure.
+`Runtime::service_file_requests(&mut ProcessTable) -> Result<usize>` drains the `file_server_2`
+service + every live io-device + every **retired** io-device pid (`Process::receive`) — a request
+that reaches a retired device, whether already queued or arriving in a **later** pass, is answered
+`{error, terminated}` rather than parked — and delivers
+each reply through `ProcessTable::deliver_simple`, returning the delivery count; a reply to a
+since-dead caller is dropped (`BeamError::TermNotFound`), exactly as `gen:reply/2` swallows its own
+send failure. A retired pid is **never** dropped from that coverage (`FileServices::retired` is
+permanent for the runtime's lifetime), because nothing here can know that no further request will
+arrive; the retained set is bounded by the number of retired devices, the same order as the
+io-device `Process` records the process table already retains forever.
 `scheduler_pass` calls it as an **additive step right after the run queue drains** (the same place
 the port half runs); a non-zero count is added to the pass's `delivered` total and followed by
 `scheduler.resume_woken`, so a serviced-only pass never looks like "nothing happened" and a caller
@@ -36,14 +42,30 @@ blocked in `gen_server:call`'s `receive` makes progress. The requesting process 
 runtime's own `Runnable` `self_pid`, which the delivery therefore does **not** enqueue; it resumes
 through the engine's blocking-aware entry (`RunOutcome::Wait` → `Machine::resume_outcome`), not a
 scheduler slice.
+`{get_until,…}` is the one request that runs **engine code** from this step: its
+`EngineContinuation::call` (`get_until.rs`) builds args and runs `Machine::run_export_outcome` under
+a fresh `RuntimeContext::new` — the **pumping** root context (`may_pump_scheduler == true`,
+`context/mod.rs`), *not* the pass's own non-pumping `for_process` context — even though
+`service_file_requests` runs inside a `scheduler_pass` that has already moved the process table out.
+A continuation that suspends is reported as this service's **own** typed gap ("the `{get_until,…}`
+continuation suspended in a `receive`"), never `beam_engine::blocked()`, so a suspending
+`{get_until,…}` is **not** the source of a corpus `opcode: run: process blocked …` failure.
+(`{get_line,…}` runs no engine code — its `LineContinuation` is a Rust-native
+`io_lib:collect_line/4`.) Hazard: because that context may pump, a blocking
+`call_bif`/`run_export_blocking` reached from inside a continuation would re-enter `pump_scheduler`
+while the pass holds the table/scheduler out; the step does not guard against it today.
 ### The wire protocols (verbatim from `lib/`)
 | Request | Reply |
 |---|---|
 | `{'$gen_call', {Pid, Tag}, Request}` (the local `infinity` form, `gen.erl:231-250`) | `{Tag, Reply}` to `Pid`; a `[alias\|Ref]` tag is the typed `unsupported` gap (the alias delivery this runtime cannot perform), never a fabricated delivery |
 | `{file_request\|io_request, From, ReplyAs, Request}` (`file_io_server.erl:199-233`) | `{file_reply\|io_reply, ReplyAs, Reply}` to `From` |
-An unknown `file_server` request is the oracle's `{noreply, State}`: nothing is delivered. A
-`FileServices` process never runs and never collects, so a mailbox payload (already copied onto the
-service's own heap by `deliver_simple`) is stable for as long as it is read.
+An unserved `file_server` request (a tuple with an atom command head) and a well-formed
+`{'$gen_call',…}` the service does not serve are answered the typed `{error, unsupported}` — a
+**directed** divergence from the oracle's silent `{noreply, State}` catch-all
+(`file_server.erl:197-201`), which would park a `gen:call/4` caller forever; only an envelope that
+names no reachable sender is consumed with no reply. A `FileServices` process never runs and never
+collects, so a mailbox payload (already copied onto the service's own heap by `deliver_simple`) is
+stable for as long as it is read.
 ### The served request surface (`file_server:handle_call/3`, `file_server.erl:101-201`)
 | Request | Behaviour |
 |---|---|
@@ -107,9 +129,12 @@ headed `binary`/`encoding`; otherwise the reply is the **value** `{error,enotsup
 * **`{get_until,Enc,_Prompt,Mod,Func,XtraArgs}` is served** by [`get_until.rs`](get_until.rs): the
   read loop drives an engine-backed `Continuation` running `Mod:Func(Cont, Data, XtraArgs…)`,
   decodes `{more,Cont}`/`{done,Reply,Buf}` and stashes `Buf` as the device's `State#state.buf`.
-  Typed gaps: a continuation suspending in a `receive`; a leftover that is a deep iolist /
+  Typed gaps: a leftover that is a deep iolist /
   non-charlist / negative code point / non-byte-aligned bitstring; an encoding other than
-  `latin1`/`unicode`; a pid with no registered device ("closed io device"). The `{get_chars,…}`
+  `latin1`/`unicode`; a pid with no registered device ("closed io device").
+  A continuation that suspends in a `receive` **is** this layer's typed capability gap: the
+  device process cannot suspend mid-request, so the request answers `Err(unsupported: …)`,
+  which neither retires the device nor reports `{error, Func}`. The `{get_chars,…}`
   arm serves the stashed buffer **before** any fresh read and `{position,At}` compensates for
   it (see *The shared read buffer* above), and a
   `{utf16,_}`/`{utf32,_}` **stream** is read as `latin1` (a divergence).
@@ -168,6 +193,21 @@ headed `binary`/`encoding`; otherwise the reply is the **value** `{error,enotsup
 - **One owner for the open path.** `{open,…}` routes through the `prim_file:open/2` floor; the
   `setopts` pipeline is a faithful reproduction of `file_io_server`'s, never a simplification.
 ## Known Issues / Test Strategy
+- **The `Mod:Func` argument vector is exactly `[Cont, Chars | XtraArgs]`; a reported `erl_scan:options/1` `function_clause` is not reachable here.** The args are built in `get_until.rs`'s `EngineContinuation::call` as `[cont, data_term] ++ xtra_args`, and `io:scan_erl_form/4`/`io:scan_erl_exprs/4` send `XtraArgs = [Pos0, Options]` — witnessed renderings on real requests: `[[], "1+2.\nrest", {1,1}, []]` (list device) and `[[], "1+2.\nrest", 1, [{text_fun,<fun>},{reserved_word_fun,<fun>}]]` (`epp:parse_file/2`, both proper lists). `Options` is therefore always a list, and `erl_scan:options/1` — reached only from `erl_scan:tokens/4` clauses 1–2 (`lib/stdlib/src/erl_scan.erl:347-351`), whose single clause requires `is_list(Opts0)` — cannot `function_clause` on this route. A future raise there would require the *request itself* to carry a non-list `Options`.
+- **A request sent to a retired device is always answered, and the retired pid stays in drain
+  coverage for the runtime's lifetime.** `service_file_requests` scans the service + every live
+  io-device + every retired io-device pid, answering `{error, terminated}` — so a request queued at
+  retire time **and** one delivered in any later pass both get the oracle's `file:read/2` answer
+  instead of parking the sender in `file_request/2`'s untimed `receive`
+  (`lib/kernel/src/file.erl:3068-3077`). A prune-on-empty-mailbox rule cannot be sound here (the
+  later request would arrive at an unscanned pid and the run would quiesce to the typed `blocked()`
+  gap), so the tombstone is never dropped; the cost is bounded by the number of retired devices, the
+  same order as the io-device `Process` records the process table already retains forever (they are
+  never removed from it either). *Optional future refinement, not implemented:* removing the device
+  pid from the `ProcessTable` on retire (`ProcessTable::take`/`remove`) would let the caller's own
+  monitor answer `'DOWN' … noproc` (→ `{error,terminated}`) with no drain at all — cross-crate, and
+  strictly an alternative to the retention design above.
+- **An unrecognised envelope is consumed with no reply (`Ok(None)`), and a well-formed `{'$gen_call',…}` the service does not serve is answered the typed `{error, unsupported}`.** `serve_server_request` returns `Ok(None)` for a request that is neither a `get_cwd` atom nor a tuple with an atom command head — its served-command arms all `.map(Some)` and its catch-all returns the typed `Err(unsupported)` — and `serve_file_message` turns a `{'$gen_call',…}`'s `Ok(None)` into `{error, unsupported}`, a **directed** divergence from the oracle's `handle_call(Request, From, State) -> {noreply, State}` catch-all (`file_server.erl:197-201`), which replies nothing and leaves the caller of a well-formed `gen:call/4` parked forever. `serve_file_message` returns `Ok(None)` itself only for envelopes that name no reachable sender: a shape that is neither a 3-tuple headed `$gen_call` nor a 4-tuple headed `{file_request|io_request,_}`, or a `{'$gen_call',…}` whose `From`/`Pid` is not an internal pid. A `[alias|Ref]` reply tag stays the typed error (`file_server.rs:341-347`).
 - [`tests.rs`](tests.rs) pins the wire decoders (`improper_list_head`'s `[alias|Ref]` detection,
   `seek_from`'s `bof`/`cur`/`eof`/bare-integer forms, `iodata_bytes`, `tuple_fields`), the errno→atom
   table, the `binary`/`list` open-mode parse, the write path (`{write_file,…}`, a write-mode
@@ -175,6 +215,16 @@ headed `binary`/`encoding`; otherwise the reply is the **value** `{error,enotsup
   read-mode surface; the service is proven end to end over real temporary files/directories by
   `../../tests/file_server.rs` (every rendering cross-checked against the live `erl`).
   `tests.rs` also holds the `runtime()`/`build()` fixtures the sibling test modules import.
+  Its `take_table` helper moves the runtime's **own** process table out (exactly as
+  `Runtime::take_processes` does) so a test can drive `Runtime::service_file_requests` over the
+  real `file_server_2` service and its io-devices, and it pins the retirement path:
+  `a_request_to_a_retired_device_is_drained_answered_and_the_pid_is_retained` (a request queued on
+  a retired device is answered `{io_reply,_,{error,terminated}}` and counted, and the now-empty
+  retired pid stays in the drain coverage),
+  `a_request_to_a_retired_device_in_a_later_pass_is_answered` (the decisive later-pass case: a
+  request delivered only *after* a pass has already drained that device to empty is still answered
+  `{error,terminated}` and counted) and `a_gen_call_the_service_does_not_serve_is_answered_unsupported`
+  (an unserved `{'$gen_call',…}` is answered the typed `{error, unsupported}`).
 - `setopts.rs`'s own docs carry the oracle probe results; its coverage is exercised through
   [`tests.rs`](tests.rs) (`getopts_reports_the_open_modes`, `setopts_updates_the_mode_and_encoding`,
   `setopts_reports_enotsup_and_badarg`, `setopts_on_a_utf16_encoding_is_the_typed_gap`,
@@ -183,7 +233,11 @@ headed `binary`/`encoding`; otherwise the reply is the **value** `{error,enotsup
 - `get_until/tests.rs` pins the `{get_until, …}` request: the protocol decoders (`interpret`,
   `leftover_from`), `Runtime::open_encoding`, the rejections, and the request end to end through
   `Runtime::serve_device_request` over a real temporary file with the real `erl_scan:tokens/4` on
-  the engine (the stashed leftover is fed to the second request). `get_line/tests.rs` pins the
+  the engine (the stashed leftover is fed to the second request), and the failure
+  classification: a typed capability gap (`lists:flatten/2`'s non-protocol return value)
+  leaves the device registered and is never reported as `{error, Func}`, a genuine `Mod:Func`
+  raise (`lists:nth/2` on `[]`) still replies `{error, Func}` **and** retires the device, and
+  `EngineContinuation::classify/1` itself separates the two. `get_line/tests.rs` pins the
   `LineContinuation` side.
 - `file_info.rs`'s units pin both reply paths and the `badarg` path contract.
 - Oracle values are quoted in each test's doc comment and were re-verified against the system `erl`

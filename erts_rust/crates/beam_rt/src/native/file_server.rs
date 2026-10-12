@@ -116,10 +116,28 @@
 //!   [`crate::error::unsupported`] gap rather than a plausible-looking wrong answer
 //!   (`pread`/`pwrite`, `advise`, `allocate`, `read_handle_info`, the legacy `put_chars`
 //!   arities, a tuple encoding).
-//! * An unknown `file_server` `handle_call` request is the oracle's `{noreply, State}`:
-//!   the service replies **nothing** and carries on.
+//! * An unknown `file_server` `handle_call` request is **answered** here with the typed
+//!   `{error, unsupported}` rather than the oracle's silent `{noreply, State}`: a
+//!   well-formed `{'$gen_call', …}` must never leave its caller parked with no reply (see
+//!   [`Runtime::serve_file_message`]).
+//!
+//! # Retirement: a request to a retired device is never lost
+//!
+//! A device that retires (`close`, or a device-killing request) stops being a device, so a
+//! request that reaches it — already queued in **its** mailbox, or arriving in a **later**
+//! pass — is answered, rather than parked forever, with the oracle's `{error, terminated}`.
+//! The pid therefore stays in the drain coverage of [`Runtime::service_file_requests`]
+//! ([`FileServices::retired`]) for the **runtime's lifetime**: nothing can know that no
+//! further request will ever arrive, so any rule that dropped the pid once its mailbox looked
+//! empty would silently lose a request sent afterwards (its sender would park in
+//! `file_request/2`'s untimed `receive`, so the run would quiesce to a typed `blocked()` gap
+//! instead of surfacing the orphaned request). The cost is bounded by the number of retired
+//! devices — the same order as the io-device `Process` records the process table already
+//! retains forever (they are never removed from it either). A `{file_reply,…}` is **counted**
+//! in that step's delivery total, so a pass that only answers a retired device can never look
+//! quiescent.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -155,6 +173,14 @@ pub(crate) struct FileServices {
     policy: HeapPolicy,
     /// The live io-devices, keyed by their own pid.
     devices: HashMap<ProcessId, Device>,
+    /// The **retired** io-device pids: their `Device` is gone (the oracle's device process
+    /// has died), but a request may still be queued in the pid's mailbox — or arrive in a
+    /// **later** scheduler pass. They stay in the drain coverage of
+    /// [`Runtime::service_file_requests`] for the runtime's lifetime and are answered with
+    /// the oracle's `{error, terminated}`; the set is bounded by the number of retired
+    /// devices, the same order as the io-device `Process` records the process table already
+    /// retains forever.
+    retired: HashSet<ProcessId>,
 }
 
 /// One open file, owned by its io-device process.
@@ -206,12 +232,29 @@ impl FileServices {
             server,
             policy,
             devices: HashMap::new(),
+            retired: HashSet::new(),
         })
     }
 
     /// The registered `file_server_2` pid.
     pub(crate) const fn server(&self) -> ProcessId {
         self.server
+    }
+
+    /// Whether `service` is an io-device that has **retired** (`close`, or a device-killing
+    /// request): its `Device` is gone, so every further request is the oracle's
+    /// `{error, terminated}`.
+    fn is_retired(&self, service: ProcessId) -> bool {
+        self.retired.contains(&service)
+    }
+
+    /// Retires the io-device `service`: its open file is dropped exactly as the oracle's
+    /// device process dying closes the descriptor, and the pid is kept in drain coverage for
+    /// the runtime's lifetime (see [`FileServices::retired`]). A request that lands in its
+    /// mailbox at any later moment is answered `{error, terminated}`, never parked.
+    fn retire(&mut self, service: ProcessId) {
+        self.devices.remove(&service);
+        self.retired.insert(service);
     }
 }
 
@@ -237,10 +280,17 @@ impl Runtime {
     /// module docs), never a fabricated reply; the process table's delivery diagnostics,
     /// and its allocation failures while spawning an io-device.
     pub(crate) fn service_file_requests(&mut self, table: &mut ProcessTable) -> Result<usize> {
-        // The servers are collected first so `self` is free while `table` is borrowed.
-        let mut servers = Vec::with_capacity(1 + self.file_services.devices.len());
+        // The servers are collected first so `self` is free while `table` is borrowed. A
+        // **retired** device is still scanned: a request queued in its mailbox at the moment
+        // it retired — or arriving in **any later** pass — must be answered
+        // (`{error, terminated}`), never parked forever. The coverage is permanent (see the
+        // module docs): a retired pid is never dropped from it.
+        let mut servers = Vec::with_capacity(
+            1 + self.file_services.devices.len() + self.file_services.retired.len(),
+        );
         servers.push(self.file_services.server());
         servers.extend(self.file_services.devices.keys().copied());
+        servers.extend(self.file_services.retired.iter().copied());
         let mut delivered = 0;
         for service in servers {
             loop {
@@ -317,9 +367,22 @@ impl Runtime {
                 return Ok(None);
             };
             let reply_as = fields[2];
+            // A device that has retired answers every further request the way the oracle's
+            // dead io-device process does: its caller monitors it, so `file_request/2`
+            // (`lib/kernel/src/file.erl:3068-3077`) and `io:request/3` take their `'DOWN'`
+            // arm and answer `{error, terminated}`. This native device outlives its retire,
+            // so that reply is delivered directly instead of synthesising a `'DOWN'`. This
+            // is the reply of `device_mut`'s "closed io device" condition.
+            if self.file_services.is_retired(service) {
+                let terminated = self.atom("terminated")?;
+                let reply = self.error_of(terminated)?;
+                let tag_atom = self.atom(reply_tag)?;
+                let envelope = self.tuple(&[tag_atom, reply_as, reply])?;
+                return Ok(Some((from, envelope)));
+            }
             let (reply, retire) = self.serve_device_request(service, fields[3])?;
             if retire {
-                self.file_services.devices.remove(&service);
+                self.file_services.retire(service);
             }
             let tag_atom = self.atom(reply_tag)?;
             let envelope = self.tuple(&[tag_atom, reply_as, reply])?;
@@ -347,8 +410,15 @@ impl Runtime {
             }
             let reply = match self.serve_server_request(table, fields[2])? {
                 Some(reply) => reply,
-                // The oracle's `handle_call(Request, From, State) -> {noreply, State}`.
-                None => return Ok(None),
+                // The oracle's `handle_call(Request, From, State) -> {noreply, State}`
+                // catch-all (`file_server.erl:197-201`) replies nothing, leaving the caller
+                // of a well-formed `{'$gen_call', …}` parked forever in `gen:call/4`'s
+                // untimed `receive`. This runtime never parks a caller silently: such a
+                // request is answered with the typed `{error, unsupported}` instead.
+                None => {
+                    let unsupported = self.atom("unsupported")?;
+                    self.error_of(unsupported)?
+                }
             };
             let envelope = self.tuple(&[tag, reply])?;
             return Ok(Some((caller, envelope)));

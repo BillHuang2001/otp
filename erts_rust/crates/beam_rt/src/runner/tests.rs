@@ -25,23 +25,24 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use beam_common::{BeamError, ExitReason};
+use beam_common::{BeamError, ExceptionClass, ExitReason};
 use beam_engine::jit::cache::{baseline_cache_len, clear_baseline_cache};
 use beam_engine::machine::WaitDeadline;
-use beam_engine::{Machine, Mailbox, MinimalContext, RunOutcome as EngineOutcome, Tier};
+use beam_engine::{terms, Machine, Mailbox, MinimalContext, RunOutcome as EngineOutcome, Tier};
 use beam_loader::{Export, Function, HeapNeed, Import, ImportRef, Instr, Label, Module, Operand};
 use beam_process::{
     ProcessId, ProcessRunner, ProcessTable, RunOutcome as ProcOutcome, SignalAtoms,
     DEFAULT_REDUCTIONS_PER_SLICE,
 };
-use beam_term::{make_atom, make_small, signed_value, Atom, AtomTable, Eterm};
+use beam_term::{make_atom, make_small, signed_value, Atom, AtomTable, Eterm, NIL};
 
 use super::budget::BudgetProbe;
 use super::entry::{ProcessEntry, RunnerState};
 use super::perf::record_baseline_code;
 use super::reason::{exit_reason, normal};
-use super::run::RuntimeRunner;
+use super::run::{publish_parked_roots, RuntimeRunner};
 use super::tier::{mode_from_value, select_entry_tier, JitMode};
+use crate::context::RuntimeContext;
 use crate::runtime::Runtime;
 
 fn runtime() -> Runtime {
@@ -1604,5 +1605,253 @@ fn a_non_allocating_loop_on_the_native_tier_completes_within_one_slice() {
         signed_value(state.result(pid).expect("the loop returns its iteration count")),
         NON_ALLOCATING_N,
         "the native tier computes the same result as the interpreter"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// The parked machine's pending-exception reason is a GC root across the park window
+// ---------------------------------------------------------------------------------------
+
+/// `boom/0` raises `{badmatch,7}` **uncaught**: `Machine::throw` records the `(class, reason)`
+/// pair in the machine's pending-exception slot even though the raise then propagates as `Err`.
+/// That recorded slot is exactly the state `publish_parked_roots` must publish as a root.
+fn raising_module() -> (Module, Atom) {
+    let mut module = Module::default();
+    module.name = module.atom_table.intern("boom");
+    // The raise tag must be interned in the module's own atom table.
+    module.atom_table.intern("badmatch");
+    let name = module.atom_table.intern("boom");
+    let module_atom = module.name;
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Badmatch {
+            value: Operand::Integer(7),
+        },
+        Instr::Return,
+    ];
+    let labels = labels_of(&code);
+    module.functions.push(Function {
+        func_label: Label(1),
+        entry_label: Label(1),
+        module: module_atom,
+        name,
+        arity: 0,
+        code,
+        blocks: Vec::new(),
+        labels,
+    });
+    module.exports.push(Export {
+        function: name,
+        arity: 0,
+        label: Label(1),
+    });
+    (module, name)
+}
+
+/// A **parked-shape** machine whose live pending-exception reason is `reason`.
+///
+/// It really raises (through the synthetic [`raising_module`]) so the slot exists, then the reason
+/// is replaced through the public `Machine::pending_exception_mut()` write half. The raise's own
+/// `{badmatch,7}` would live on the throwaway `MinimalContext` heap; overwriting the slot is what
+/// puts a term on the *process's* young heap in it — exactly the shape a real parked machine's
+/// reason has (a term the process's own heap owns) and therefore exactly what a collection in the
+/// park window must relocate. The register/stack/FR root files are left empty, so the reason is
+/// the only live word this machine holds.
+fn machine_with_pending_reason(reason: Eterm) -> Machine {
+    let (module, name) = raising_module();
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::new();
+    let outcome = machine.run_export_outcome(&module, name, 0, &[], &mut ctx);
+    assert!(
+        outcome.is_err(),
+        "boom/0 raises uncaught, got {outcome:?}"
+    );
+    assert_eq!(
+        machine.pending_class(),
+        Some(ExceptionClass::Error),
+        "the raise recorded an error-class pending exception"
+    );
+    for slot in machine.x_mut() {
+        *slot = NIL;
+    }
+    for slot in machine.stack_mut() {
+        *slot = NIL;
+    }
+    for slot in machine.fr_mut() {
+        *slot = NIL;
+    }
+    machine
+        .pending_exception_mut()
+        .expect("the recorded raise")
+        .1 = reason;
+    machine
+}
+
+/// Assert `relocated` is the two-element small-integer tuple `expected` **at a new address**: the
+/// term really moved (a copied term never keeps its from-space address) and the copy is intact.
+fn assert_tuple_relocated(relocated: Eterm, stale: Eterm, expected: [i64; 2], what: &str) {
+    assert_ne!(
+        relocated, stale,
+        "{what}: the word was left pointing into the from-space — a collection moved the heap \
+         without relocating it"
+    );
+    assert_eq!(
+        terms::tuple_arity(relocated).unwrap_or_else(|e| panic!("{what}: {e}")),
+        2,
+        "{what}: the relocated word is not the two-element tuple it was"
+    );
+    for (index, value) in expected.iter().enumerate() {
+        assert_eq!(
+            terms::tuple_element(relocated, index).expect("in range"),
+            make_small(*value),
+            "{what}: element {index} of the relocated tuple"
+        );
+    }
+}
+
+/// **The parked machine's live pending-exception reason survives a moving collection.**
+///
+/// A suspended process's machine lives in `RunnerState::engines`; while it is parked, a
+/// delivery-driven collection (`Process::deliver`'s exit cascade, ungated by
+/// `gc_process_enabled`) relocates the process's heap against its own root set. The reason term is
+/// a machine *field*, not an `x`/stack/FR slot, so `publish_parked_roots` publishes it as the
+/// process's one extra root; the collection then moves it with the heap, and
+/// `resync_parked_roots` reads the **relocated** word back into the machine.
+///
+/// The proof is by address: the reason is a `{7,8}` tuple built on the process's own young heap,
+/// so a collection that did not publish/relocate it would leave the machine's slot on the dead
+/// from-space word (a **wrong** term, not merely a stale one).
+#[test]
+fn a_parked_machines_pending_exception_reason_survives_a_moving_collection() {
+    let mut rt = runtime();
+    let mut table = table();
+    let pid = table.spawn_default().expect("a fresh process");
+
+    // The reason: a two-element tuple of small ints on the PROCESS's own young heap.
+    let reason = {
+        let process = table.get_mut(pid).expect("the spawned process");
+        process
+            .heap_mut()
+            .tuple(&[make_small(7), make_small(8)])
+            .expect("the young heap builds {7,8}")
+    };
+
+    let mut machine = machine_with_pending_reason(reason);
+
+    // Publish the parked machine's roots: the reason rides the process's extra roots.
+    publish_parked_roots(&mut table, pid, &mut machine);
+    let extra = table.get(pid).expect("the process").registers().extra_roots();
+    assert_eq!(
+        extra.len(),
+        1,
+        "the parked pending-exception reason is the one published extra root, got {extra:?}"
+    );
+    assert_eq!(extra[0], reason, "the published extra root is the reason itself");
+
+    // Fill the nursery with unreachable tuples, so the collection is a genuine evacuation of a
+    // full young heap — the shape a delivery-driven collection really has.
+    {
+        let process = table.get_mut(pid).expect("the process is in the table");
+        let filler = [make_small(1)];
+        while process.heap().available() >= 16 {
+            process
+                .heap_mut()
+                .tuple(&filler)
+                .expect("the nursery has room for a two-word tuple");
+        }
+    }
+
+    // A genuine MOVING collection: `Process::collect()` is the same `run_rooted_collection` path a
+    // delivery's `ensure_capacity` drives — it gathers x + stack + extra roots and scatters the
+    // relocated words back into exactly those slots.
+    table
+        .get_mut(pid)
+        .expect("the process is in the table")
+        .collect()
+        .expect("the collection runs");
+
+    // The reason MOVED with the heap: its address changed, its value did not.
+    let relocated = table
+        .get(pid)
+        .expect("the process")
+        .registers()
+        .extra_roots()
+        .first()
+        .copied()
+        .expect("the extra root survived the collection");
+    assert_tuple_relocated(
+        relocated,
+        reason,
+        [7, 8],
+        "the parked pending-exception reason",
+    );
+
+    // Resume: the machine reads the relocated reason back, and the extra roots are consumed.
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.resync_parked_roots(pid, &mut machine);
+    }
+    assert_eq!(
+        machine.pending_exception(),
+        Some((ExceptionClass::Error, relocated)),
+        "the resumed machine points at the RELOCATED reason, not the abandoned from-space word"
+    );
+    assert!(
+        table.get(pid).expect("the process").registers().extra_roots().is_empty(),
+        "the extra root is consumed on resume, so no stale root outlives the park window"
+    );
+}
+
+/// **No live pending exception ⇒ no extra root.**
+///
+/// A parked machine with nothing to root must leave the process's extra roots **empty** — never a
+/// NIL/placeholder — so the set is only ever the reason that is genuinely live.
+#[test]
+fn publishing_a_machine_without_a_pending_exception_leaves_no_extra_root() {
+    let mut table = table();
+    let pid = table.spawn_default().expect("a fresh process");
+    let mut machine = Machine::new();
+    assert_eq!(machine.pending_exception(), None, "a fresh machine has no raise");
+
+    publish_parked_roots(&mut table, pid, &mut machine);
+    assert!(
+        table.get(pid).expect("the process").registers().extra_roots().is_empty(),
+        "a machine with no pending exception publishes no extra root"
+    );
+}
+
+/// **A stale extra root is cleared, never left behind.**
+///
+/// Publishing once with a live pending exception sets the extra root; once the machine's raise is
+/// handled (here modelled by `Machine::reset`, which is what every `run_*` entry does) the very
+/// same publish must leave the set empty rather than keeping the now-dead term alive forever.
+#[test]
+fn publishing_again_after_the_pending_exception_is_consumed_drops_the_stale_extra_root() {
+    let mut table = table();
+    let pid = table.spawn_default().expect("a fresh process");
+    let reason = {
+        let process = table.get_mut(pid).expect("the spawned process");
+        process
+            .heap_mut()
+            .tuple(&[make_small(7), make_small(8)])
+            .expect("the young heap builds {7,8}")
+    };
+    let mut machine = machine_with_pending_reason(reason);
+
+    publish_parked_roots(&mut table, pid, &mut machine);
+    assert_eq!(
+        table.get(pid).expect("the process").registers().extra_roots(),
+        &[reason][..],
+        "the first publish roots the live reason"
+    );
+
+    // The raise is handled: the machine has no pending exception any more.
+    machine.reset();
+    assert_eq!(machine.pending_exception(), None, "the raise is gone after a reset");
+
+    publish_parked_roots(&mut table, pid, &mut machine);
+    assert!(
+        table.get(pid).expect("the process").registers().extra_roots().is_empty(),
+        "the stale extra root is cleared, never left as a leftover/NIL placeholder"
     );
 }

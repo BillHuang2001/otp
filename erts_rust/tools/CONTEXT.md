@@ -28,7 +28,7 @@ Both crates ship a **library + a binary**: the library exists so `cargo test` ca
 - **Runtime resolution — documented, overridable, no baked absolute paths:**
   - **Oracle** = `$ERTS_ORACLE` if set, else `erl` resolved on `PATH`. Missing ⇒ loud env error (exit 2).
   - **Rust runtime** = `$BEAM_RT` if set, else the workspace-relative `target/{release,debug}/beam_rt` (relative to `../..`). If neither exists ⇒ cases report `unsupported`.
-  - **Case kind drives the argv.** *Eval* cases give both runtimes the **same argv** (`["-noshell", <extra…>, "-eval", <probe>]`); *Module* cases give them **per-side argv** — the Rust side runs `beam_rt run <file.beam> <mod>:<fun>/<arity> <ints…>` (`run` action), the oracle runs `erl -noshell -pa <dir> -eval …`. Either way `beam_rt` is a drop-in `erl` (contract A.6); only the *program path* is set, internals are never assumed.
+  - **Case kind drives the argv.** *Eval* cases give both runtimes the **same argv** (`["-noshell", <extra…>, "-eval", <probe>]`); *Module* cases give them **per-side argv** — the Rust side runs `beam_rt run <file.beam> <mod>:<fun>/<arity> <ints…>` (`run` action), the oracle runs `erl -noshell -pa <dir> -eval …`. The environment-carrying variants *EvalEnv* and *ModuleEnv* additionally spawn **both** runtimes with an explicit environment, so the `ERL_*FLAGS` merge (contract A.6) is pinned end to end (a *ModuleEnv* oracle argv carries no `-pa <dir>` — the compiled dir reaches the code path only through the environment). Either way `beam_rt` is a drop-in `erl` (contract A.6); only the *program path* is set, internals are never assumed.
 - **Honest reporting:** a case/workload that cannot run is `unsupported` / `skipped(<reason>)` — **never** `pass`, and oracle output/metrics are never fabricated.
 - **Machine-readable results:** JSON with a stable schema, written under the crate's gitignored `out/` dir (`differential/out/`, `bench/out/`) unless `--out` overrides.
 - **No heavy new deps:** `serde`/`serde_json` (already workspace deps) for JSON; **hand-rolled `std`-only arg parsing** (no `clap`) to stay offline-safe. Failures are loud (nonzero exit / explicit status), never silently swallowed.
@@ -45,12 +45,14 @@ Both crates ship a **library + a binary**: the library exists so `cargo test` ca
 - `unsafe` is forbidden in both crates.
 
 ## Status
-- **Compatibility gate:** the corpus covers all nine contracts A.1–A.9 — `summary: total=1848 agree=1845
-  mismatch=0 unsupported=3 skipped=0 allowed=3` (`gate.sh` is authoritative and always runs
+- **Compatibility gate:** the corpus covers all nine contracts A.1–A.9 — `summary: total=1868 agree=1864
+  mismatch=0 unsupported=4 skipped=0 allowed=4` (`gate.sh` is authoritative and always runs
   `--strict --allowlist known-gaps.txt`; re-run it for the live per-contract split). Keep per-contract
   counts in `differential/` (its own CONTEXT.md) rather than copied here, so they cannot drift.
-  `wire/new_fun_ext_encode` is unclosable by design; the other is the A.9
-  `boot_extra/init_script_id_names_the_running_otp_release`.
+  The four recorded capability gaps (`known-gaps.txt`) are `wire/new_fun_ext_encode` (A.5, unclosable by
+  design) and three A.9 cases: `boot_extra/init_script_id_names_the_running_otp_release`, plus the two
+  in-process-compile cases `selfhost/in_process_compile_file_no_spawn_deterministic` and
+  `selfhost/scheduled_process_compile_file_deterministic`.
 - **`beam_rt` gap signalling is honoured:** cases the runtime cannot run classify as `unsupported`,
   never `mismatch`.
 - **CI:** `.github/workflows/erts_rust.yml` builds/tests the workspace and runs `differential/gate.sh`
@@ -62,15 +64,15 @@ Both crates ship a **library + a binary**: the library exists so `cargo test` ca
   measured via `beam_rt`'s `examples/perf_bif.rs`.
 
 ## Routing Table
-- `differential/` → differential-test compatibility gate: `Eval`/`EvalEnv` cases (shared argv) + `Module` cases (per-side argv, `erlc`-compiled, optional `cc`-built NIF/driver `.so`), oracle runner, Rust-runtime runner (`run` action), observable-result comparison (**stdout bytes + exit status always; stderr classified for `Eval` cases only** — the `term_to_binary` / exception-class+reason / `system_info` observables are encoded into stdout by the probe wrapper, not separate diff fields), the two-signal ⇒ `unsupported` classification (escaped exit-`3` **and** probe-caught `exception` reason), built-in conformance corpus (embedded Rust registry, 1848 cases), JSON reports
+- `differential/` → differential-test compatibility gate: `Eval`/`EvalEnv` cases (shared argv) + `Module`/`ModuleEnv` cases (per-side argv, `erlc`-compiled, optional `cc`-built NIF/driver `.so`; `ModuleEnv` additionally carries an explicit spawn environment, through which the compiled dir reaches the code path), oracle runner, Rust-runtime runner (`run` action), observable-result comparison (**stdout bytes + exit status always; stderr classified for `Eval` cases only** — the `term_to_binary` / exception-class+reason / `system_info` observables are encoded into stdout by the probe wrapper, not separate diff fields), the two-signal ⇒ `unsupported` classification (escaped exit-`3` **and** probe-caught `exception` reason), built-in conformance corpus (embedded Rust registry, 1868 cases), JSON reports
 - `bench/` → benchmark driver: pluggable workload plugins (`baseline`, `slice`, `foreign`, `list_walk`, `copy_bound`, `gc_bound`, Elixir compiler, PLB kernels, Cowboy, Khepri, EMQX, `erlc` compiler), system-ERTS baseline, cross-runtime (`--runtime all`) comparison, result store + `compare`
 
 ## Notes for Agents
 - Build/test via the committed wrapper (read-only `$HOME`): from this dir `../scripts/cargo.sh test -p differential` / `../scripts/cargo.sh test -p bench`; from the repo root add `--manifest-path erts_rust/Cargo.toml`. The cache is shared across worktrees; known deps (`serde`, `serde_json`, `libc`) resolve offline — avoid adding new crates.
 - Oracle is the system Erlang on `PATH` (OTP 29.1.1 / erts-17.1). Verified: `erl -noshell -eval 'io:format("~w~n",[term_to_binary({ok,42})]), halt().'` → `<<131,104,2,119,2,111,107,97,42>>`.
 - **Oracle = the system `erl`, never the in-tree `erts/` C build** (`differential/src/runtime.rs::resolve_oracle`: `$ERTS_ORACLE` else `erl` scanned on `$PATH`).
-- **Gate coverage (verified against code):** `differential suite` reports `summary: total=1848 agree=1845
-  mismatch=0 unsupported=3 skipped=0` (a case may declare several contracts, so the per-contract totals
+- **Gate coverage (verified against code):** `differential suite` reports `summary: total=1868 agree=1864
+  mismatch=0 unsupported=4 skipped=0 allowed=4` (a case may declare several contracts, so the per-contract totals
   exceed `summary.total`). All nine contracts A.1–A.9 have corpus cases; the live per-contract split is in
   `differential/CONTEXT.md` — do not copy it here (it drifts). A.4 (driver C ABI) is covered end to end by the `driver_c` group
   (a real C driver `.so` driven through the port lifecycle and the `port_command` echo round trip),
@@ -79,12 +81,16 @@ Both crates ship a **library + a binary**: the library exists so `cargo test` ca
   Two contracts stay shallow through the CLI alone: A.5 (the `wire` group covers the *ETF wire codec*; a live
   two-node handshake / `DOP_*` loopback is not expressible through a single CLI process — it is proven instead
   by `../crates/beam_dist/tests/two_node_loopback.rs` + `hermetic_epmd.rs`, which a gate stage would have to drive
-  as a non-CLI command) and A.9 (build), which now has a `selfhost/` case for the in-process-compile route and is
-  otherwise *boot/version observability* only (no self-hosted build yet). The 3 `unsupported` are
+  as a non-CLI command) and A.9 (build), which has `selfhost/` cases for the in-process-compile route and is
+  otherwise *boot/version observability* only (no self-hosted build yet). The 4 `unsupported` are
   `wire/new_fun_ext_encode` (an `erl_eval` lambda's closure identity, unclosable without porting
   `erl_eval`/`erl_scan`/`erl_parse`), `boot_extra/init_script_id_names_the_running_otp_release`
-  (`init:script_id/0` on a path that loads no boot script) and
-  `selfhost/in_process_compile_file_no_spawn_deterministic` (the E0 route; flips to `agree` when it lands).
+  (`init:script_id/0` on a path that loads no boot script),
+  `selfhost/in_process_compile_file_no_spawn_deterministic` (the E0 route; flips to `agree` when it lands)
+  and `selfhost/scheduled_process_compile_file_deterministic` (the default `compile:file/2` shape — its own
+  compiler process — run as a scheduled process, whose parked receive-window collection relocates the receiver
+  heap against an incomplete root set, so the run reports `opcode: run: process blocked (no message available)`;
+  it flips to `agree` once in-process compilation lands).
 - **CI wiring:** `.github/workflows/erts_rust.yml` (path-triggered on `erts_rust/**`) builds and tests the
   workspace and runs `differential/gate.sh`, honouring its exit-code policy (`1` mismatch / `2` env error
   fail the job; `3` unsupported-only is non-blocking). `bench` remains a manual/opt-in command.

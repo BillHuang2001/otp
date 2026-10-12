@@ -666,9 +666,23 @@ impl<'a> RuntimeContext<'a> {
     /// rather than run against inconsistent roots ([`crate::context::gc`] documents the
     /// hand-off).
     ///
+    /// The machine's live **pending-exception reason** rides the process's
+    /// [`extra_roots`](beam_process::Registers::extra_roots) (published by
+    /// `runner::run::publish_parked_roots`), which the collector has already relocated in
+    /// place; this reads that relocated word back into
+    /// [`Machine::pending_exception_mut`](beam_engine::Machine::pending_exception_mut) so the
+    /// resumed machine points at the moved term, then **clears** the process's extra roots so
+    /// no stale root outlives the resume. The reason is read out **before** the machine is
+    /// borrowed by `with_roots` (the mutable accessor cannot be reached inside the closure).
+    ///
     /// A `pid` with no process reconciles nothing: the runner only calls this for a parked pid
     /// whose process it owns.
     pub(crate) fn resync_parked_roots(&mut self, pid: ProcessId, machine: &mut Machine) {
+        // The relocated reason, read out before `machine` is borrowed by `with_roots`.
+        let relocated_reason = self
+            .process_table()
+            .get(pid)
+            .and_then(|process| process.registers().extra_roots().first().copied());
         let reconciled = match self.process_table().get(pid) {
             Some(process) => machine.with_roots(RootSet::ALL_LIVE, |roots| {
                 let mut roots = roots;
@@ -676,8 +690,20 @@ impl<'a> RuntimeContext<'a> {
             }),
             None => true,
         };
+        // Re-seat the relocated reason into the machine's own slot, so the resumed machine points
+        // at the moved term rather than into the abandoned from-space.
+        if let Some(reason) = relocated_reason {
+            if let Some(slot) = machine.pending_exception_mut() {
+                slot.1 = reason;
+            }
+        }
         if !reconciled {
             self.runtime.halt_process_gc(pid);
+        }
+        // Consume the published extra roots: the machine owns the relocated reason now, so a root
+        // left behind would only keep an otherwise-dead term alive across the next collection.
+        if let Some(process) = self.process_table_mut().get_mut(pid) {
+            process.registers_mut().extra_roots_mut().clear();
         }
     }
 
@@ -2940,17 +2966,18 @@ impl ExecutionContext for RuntimeContext<'_> {
 /// searching every loaded module for the fun's own `(uniq, index)` ([`FunIdentityBridge`], which
 /// prefers the caller but is not confined to it), so a callee entering in-machine under a stale
 /// `current_module` still derives the right image. Those three names are nevertheless kept on the
-/// synchronous route as a **conservative routing guard against a hazard owned elsewhere**: a
-/// callee entered in-machine can park with a live
-/// [`Machine::pending_exception`](beam_engine::Machine) — a term the engine holds and which
-/// `beam_process::Registers::gather_roots` does **not** publish — and a delivery-driven
-/// collection in the park window (`beam_process`'s signal-build heap growth) then relocates the
-/// process heap against that incomplete root set, freeing words the parked machine still points
-/// at. Until `pending_exception` is rooted across `beam_engine`/`beam_process`, entering the
-/// modules that reach that shape in-machine turns the honest typed
-/// [`beam_engine::blocked`] gap of the A.9 `compile:file/2` route into a **wrong result**, so this
-/// clause stays and is removed together with that fix (the clause is why the E0 route reports the
-/// typed gap rather than a compile that silently fails).
+/// synchronous route as a **conservative routing guard**: `erlang:load_nif/2` genuinely reads the
+/// call-site identity above, and the two fun-image names are routed alongside it while the A.9
+/// in-process `compile:file/2` route is settled.
+///
+/// The parked machine's live pending-exception reason — the one term a parked machine holds that
+/// the closed [`RootSet`] shape cannot carry — **is** published as a
+/// [`Registers::extra_roots`](beam_process::Registers::extra_roots) word across the park window
+/// (`runner::run::publish_parked_roots`, read back into `Machine::pending_exception_mut` on resume
+/// by [`RuntimeContext::resync_parked_roots`]), so the park-window relocation hazard that once
+/// motivated (part of) this clause is closed. The clause itself is a separate **routing** decision
+/// — how much of the A.9 scheduled route to re-enable in-machine — and it is why the E0 route
+/// reports the honest typed [`beam_engine::blocked`] gap rather than a compile that silently fails.
 ///
 /// The other `current_module` readers cannot be made wrong by a callee's stale identity:
 /// `records:get_definition/2` resolves its module from its **argument** ([`RecordBridge`] holds no

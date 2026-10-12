@@ -135,8 +135,17 @@ the park/resume and the admission point can never drift:
 * `publish_parked_roots` hands the machine's roots over with `RootSet::ALL_LIVE` — the conservative
   (always-safe) choice, since a parked machine's live count is not exposed and over-approximating a
   copying collector's root set can only keep a term alive, never free a live one.
+* `publish_parked_roots` **also** publishes the parked machine's live pending-exception reason
+  (`Machine::pending_exception`) — the one term a parked machine holds that the closed `RootSet`
+  shape cannot carry, because it is a machine *field*, not an `x`/stack/FR slot — as the process's
+  `Registers::extra_roots` word (the host escape hatch
+  `beam_process`'s `gather_roots`/`scatter_roots` relocate in place). With **no** live pending
+  exception the extra-root set is left **empty** (cleared, never a NIL/placeholder), so a stale root
+  can never keep an otherwise-dead term alive.
 * `resume_from_process_roots` is the context's `RuntimeContext::resync_parked_roots`: it copies the
-  process's authoritative root set back into the machine and, if the slices no longer match, **halts the
+  process's authoritative root set back into the machine, reads the (already-relocated) extra-root
+  reason out and writes it into `Machine::pending_exception_mut()`, **clears** the process's extra
+  roots (the machine owns the relocated term now), and, if the slices no longer match, **halts the
   process's collection** (`Runtime::halt_process_gc`) rather than run against inconsistent roots.
 The runner's raise arm likewise copies the recorded exit reason through
 `Runtime::try_stabilize_escaped_with` — with the copy's `SourcePayloads` built by

@@ -158,18 +158,18 @@ fn lookup_mut(slots: &mut [Slot], pid: ProcessId) -> Option<&mut Process> {
 /// ([`Process::ensure_capacity`](crate::process::Process::ensure_capacity), seeded with the word
 /// count the copier reported) and the caller retries once; `Ok(())` means "retry now".
 ///
-/// A **relocation-exempt** receiver
-/// ([`Process::is_relocation_exempt`](crate::process::Process::is_relocation_exempt)) must not
-/// collect or grow (the host holds live words outside the crate root set, so relocating would
-/// recycle them), so the raw [`BeamError::Alloc`] refusal is returned **unchanged**. This is now
-/// the **defensive** path: the live signal builders test `is_relocation_exempt` *first* and route
-/// an exempt receiver to the heap-fragment model ([`enqueue_fragment_signal`]) without ever
-/// reaching here, so only a builder that cannot use a fragment — the **enqueue-time** reason copy
-/// of [`copy_reason_onto`], which must land on the receiver's own heap — still surfaces the raw
-/// refusal.
+/// A receiver whose live terms may be **outside** the crate root set — relocation-exempt, or
+/// [`ProcessState::Running`] (its own machine is executing, so the `regs` snapshot is stale) —
+/// must not collect or grow, so the raw [`BeamError::Alloc`] refusal is returned **unchanged**
+/// (see [`Process::has_unpublished_roots`](crate::process::Process::has_unpublished_roots)). This
+/// is a purely **defensive** path: every live caller tests `has_unpublished_roots` *first* and
+/// routes such a receiver to the heap-fragment model ([`enqueue_fragment_payload`] — the
+/// apply-time builders [`build_signal_message`]/[`deliver_head_signal`], and the enqueue-time
+/// reason copy [`copy_reason_onto`]) without ever reaching here, so this branch is only reached if
+/// a new caller forgets the pre-test.
 fn grow_receiver_for_signal(process: &mut Process, failure: AllocFailure) -> Result<()> {
-    if process.is_relocation_exempt() {
-        // The heap cannot be moved under the host's unpublished roots: hand the refusal back
+    if process.has_unpublished_roots() {
+        // The heap cannot be moved under the unpublished live terms: hand the refusal back
         // verbatim (`kind` still Heap/Message) — no collection, no growth, no retry.
         return Err(BeamError::Alloc(failure));
     }
@@ -191,8 +191,10 @@ const SIGNAL_SCRATCH_WORDS: usize = 64;
 ///
 /// Exhaustion is the shared policy: a `Heap`/`Message` refusal is a normal condition —
 /// an ordinary receiver collects and grows its nursery on demand and the build is retried
-/// once ([`grow_receiver_for_signal`]), while a **relocation-exempt** receiver (whose heap must
-/// not move under the host's unpublished roots) gets the heap-fragment model instead.
+/// once ([`grow_receiver_for_signal`]), while a receiver whose live terms are **not** all in the
+/// crate root set ([`Process::has_unpublished_roots`](crate::process::Process::has_unpublished_roots)
+/// — relocation-exempt, or `Running` with a stale `regs` snapshot) gets the heap-fragment model
+/// instead.
 fn build_signal_message<F>(
     recipient: &mut Process,
     from: Eterm,
@@ -210,7 +212,7 @@ where
         Err(BeamError::Alloc(failure))
             if matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
         {
-            if recipient.is_relocation_exempt() {
+            if recipient.has_unpublished_roots() {
                 return enqueue_fragment_signal(recipient, from, reason, &mut build);
             }
             grow_receiver_for_signal(recipient, failure)?;
@@ -229,6 +231,43 @@ where
 ///
 /// This is the exhaustion fallback for a **relocation-exempt** receiver: no collection, no
 /// growth, no heap relocation — the message simply does not live on the receiver's heap.
+///
+/// `src_off_heap` describes the heap `reason` lives in — the table whose refc binaries/MSO the
+/// copy must resolve, i.e. the C's *source* process. `None` means the **recipient's own** table,
+/// which is the apply-time case (the queued signal's reason was already copied onto the
+/// receiver's heap at enqueue time) and the self-signal case; `Some` is a *signaller's* table,
+/// which the enqueue-time route passes because there the reason still lives in the signalling
+/// process's heap.
+fn enqueue_fragment_payload<F>(
+    recipient: &mut Process,
+    from: Eterm,
+    reason: Eterm,
+    src_off_heap: Option<&OffHeapTable>,
+    build: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Heap, Eterm) -> Result<Eterm>,
+{
+    // `reason` may still point into a young heap (the receiver's, or the signaller's): build the
+    // payload around it on a scratch arena, then copy the whole graph in one go.
+    let mut scratch = Heap::new(SIGNAL_SCRATCH_WORDS)?;
+    let payload = build(&mut scratch, reason)?;
+    let mut fragment = HeapFragment::new(size_object(payload) + 8)?;
+    // `copy_struct` walks the graph by pointer, so the heap-resident `reason` subtree is copied
+    // in too; the source process's persistent off-heap table resolves its refc binaries/MSO.
+    let src = src_off_heap.unwrap_or_else(|| recipient.off_heap());
+    let root = fragment.copy_root(payload, src)?;
+    let mut fragments = Fragments::new();
+    fragments.push(fragment);
+    recipient
+        .mailbox_mut()
+        .enqueue(Message::new(root, from).with_fragments(fragments));
+    Ok(())
+}
+
+/// [`enqueue_fragment_payload`] for a payload whose `reason` already lives on the **receiver's**
+/// own heap — the apply-time case, where the queued signal's reason was copied onto that heap
+/// when the signal was enqueued.
 fn enqueue_fragment_signal<F>(
     recipient: &mut Process,
     from: Eterm,
@@ -238,27 +277,24 @@ fn enqueue_fragment_signal<F>(
 where
     F: FnMut(&mut Heap, Eterm) -> Result<Eterm>,
 {
-    // `reason` may still point into the receiver's young heap: build the payload around it on a
-    // scratch arena, then copy the whole graph in one go.
-    let mut scratch = Heap::new(SIGNAL_SCRATCH_WORDS)?;
-    let payload = build(&mut scratch, reason)?;
-    let mut fragment = HeapFragment::new(size_object(payload) + 8)?;
-    // `copy_struct` walks the graph by pointer, so the receiver-heap-resident `reason` subtree is
-    // copied in too; the receiver's persistent off-heap table resolves its refc binaries/MSO.
-    let root = fragment.copy_root(payload, recipient.off_heap())?;
-    let mut fragments = Fragments::new();
-    fragments.push(fragment);
-    recipient
-        .mailbox_mut()
-        .enqueue(Message::new(root, from).with_fragments(fragments));
-    Ok(())
+    enqueue_fragment_payload(recipient, from, reason, None, build)
 }
 
 /// Copies `reason` — whose heap is described by `src_off_heap` — into `process`'s own heap,
 /// registering every referenced off-heap object in the process's own off-heap table, and
 /// returns the copied term. Retries once after a collect-and-grow on heap exhaustion
-/// ([`grow_receiver_for_signal`]): a **relocation-exempt** `process` surfaces the raw
-/// [`BeamError::Alloc`] refusal unchanged rather than collecting or growing.
+/// ([`grow_receiver_for_signal`]).
+///
+/// A `process` whose live terms are **not** all in the crate root set
+/// ([`Process::has_unpublished_roots`](crate::process::Process::has_unpublished_roots) — the
+/// exception is the same as in [`Process::deliver`](crate::process::Process::deliver)) is refused:
+/// the heap must not move under live terms the root set does not carry (a host's Rust locals, or
+/// the running machine's own x/stack/float registers), so the raw [`BeamError::Alloc`] refusal is
+/// returned unchanged — no collection, no growth, no retry. That refusal is the **signal the caller
+/// keys its heap-fragment route on**: [`ProcessTable::enqueue_down_signal`] and
+/// [`ProcessTable::enqueue_exit_signal`] then build the control message into a [`HeapFragment`]
+/// ([`enqueue_fragment_payload`]) instead of queueing a [`PendingSignal`] whose reason cannot
+/// live anywhere but the receiver's heap.
 ///
 /// `None` means the reason is already owned by `process` (a process signalling itself) and is
 /// returned unchanged.
@@ -275,6 +311,14 @@ fn copy_reason_onto(
         Err(BeamError::Alloc(failure))
             if matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
         {
+            // The pre-test: hand the refusal back *verbatim* (`kind` is still Heap/Message)
+            // without touching the collector, so the caller can route the signal into a heap
+            // fragment. The defensive branch of `grow_receiver_for_signal` would refuse
+            // identically; testing here keeps the "no collect, no grow" guarantee at the one place
+            // the enqueue-time copy is performed.
+            if process.has_unpublished_roots() {
+                return Err(BeamError::Alloc(failure));
+            }
             grow_receiver_for_signal(process, failure)?;
             process.copy_into_heap(reason, src)
         }
@@ -2189,11 +2233,12 @@ impl ProcessTable {
     /// The queued signal is an in-heap sub-rootset, so a heap-exhaustion collection relocates
     /// its `reason` in place: `build` is handed a **freshly read** reason each attempt. Exhaustion
     /// follows the shared policy: an ordinary `pid` collects and grows its nursery on demand and
-    /// the build is retried once ([`grow_receiver_for_signal`]); a **relocation-exempt** `pid`
-    /// must not have its heap move under the host's unpublished roots, so its message is built
-    /// into a heap fragment instead ([`enqueue_fragment_signal`]) — no collection, no growth, no
-    /// retry. On success the head signal is removed and a blocked `pid` is woken (and recorded on
-    /// the wake list).
+    /// the build is retried once ([`grow_receiver_for_signal`]); a `pid` whose live terms are not
+    /// all in the crate root set
+    /// ([`Process::has_unpublished_roots`](crate::process::Process::has_unpublished_roots)) must
+    /// not have its heap move under them, so its message is built into a heap fragment instead
+    /// ([`enqueue_fragment_signal`]) — no collection, no growth, no retry. On success the head
+    /// signal is removed and a blocked `pid` is woken (and recorded on the wake list).
     fn deliver_head_signal<F>(&mut self, pid: ProcessId, from: Eterm, mut build: F) -> Result<()>
     where
         F: FnMut(&mut Heap, Eterm) -> Result<Eterm>,
@@ -2216,12 +2261,11 @@ impl ProcessTable {
                     if attempt == 0 && matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
                 {
                     attempt += 1;
-                    if recipient.is_relocation_exempt() {
-                        // The heap must not move under the host's unpublished roots.
+                    if recipient.has_unpublished_roots() {
+                        // The heap must not move under the live terms the root set does not carry.
                         enqueue_fragment_signal(recipient, from, reason, &mut build)?;
                         break;
-                    }
-                    // A collection relocates the queued reason word: re-read it next iteration.
+                    }                    // A collection relocates the queued reason word: re-read it next iteration.
                     grow_receiver_for_signal(recipient, failure)?;
                 }
                 Err(error) => return Err(error),
@@ -2301,6 +2345,16 @@ impl ProcessTable {
     /// described by `src` (the signaller's off-heap table, or `None` for a self-signal whose
     /// reason already lives in `to`'s heap) so the queued reason always outlives the signaller.
     ///
+    /// A `to` whose live terms are not all in the crate root set
+    /// ([`Process::has_unpublished_roots`](crate::process::Process::has_unpublished_roots)) whose
+    /// full nursery refuses that copy is the one case the queue cannot serve — the queued reason
+    /// must live on the receiver's own heap (the queue is an in-heap sub-rootset) and that heap
+    /// must not be collected or grown — so a **trapping** receiver gets the
+    /// `{'EXIT', From, Reason}` the queue would have delivered built into a heap fragment instead
+    /// ([`ProcessTable::deliver_exit_fragment`]). A **non-trapping** one would receive no message
+    /// at all (the signal carries the exit *policy*, and terminating the receiver is the caller's
+    /// cascade), so its raw refusal is surfaced unchanged.
+    ///
     /// An unknown `to` is skipped: the caller is propagating a signal through the table and
     /// the target may have died earlier in the same propagation.
     fn enqueue_exit_signal(
@@ -2313,17 +2367,42 @@ impl ProcessTable {
         let Some(recipient) = lookup_mut(&mut self.slots, to) else {
             return Ok(());
         };
-        let reason = copy_reason_onto(recipient, reason, src)?;
-        recipient
-            .signals_mut()
-            .push(PendingSignal::exit(from, reason));
-        Ok(())
+        // Both are read before the copy: the fragment route below needs `self` again, and
+        // `recipient`'s borrow must be over by then.
+        let refuses_collect = recipient.has_unpublished_roots();
+        let trapping = recipient.is_trapping_exit();
+        match copy_reason_onto(recipient, reason, src) {
+            Ok(reason) => {
+                recipient
+                    .signals_mut()
+                    .push(PendingSignal::exit(from, reason));
+                Ok(())
+            }
+            Err(BeamError::Alloc(failure))
+                if refuses_collect
+                    && matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
+            {
+                if trapping {
+                    self.deliver_exit_fragment(to, from, reason, src)
+                } else {
+                    Err(BeamError::Alloc(failure))
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Enqueues a monitor-DOWN signal on `to`'s signal queue, copying `reason` out of the heap
     /// described by `src` (see [`ProcessTable::enqueue_exit_signal`]). `tag` is the monitor's
     /// `erlang:monitor/3` user tag — read from the side table by the caller, since the records
     /// carry none — and is a heap-independent immediate, carried verbatim.
+    ///
+    /// A `to` whose live terms are not all in the crate root set
+    /// ([`Process::has_unpublished_roots`](crate::process::Process::has_unpublished_roots)) whose
+    /// full nursery refuses that copy cannot hold the queued signal at all (see
+    /// [`ProcessTable::enqueue_exit_signal`]), so the DOWN is built into a heap fragment instead
+    /// ([`ProcessTable::deliver_down_fragment`]) — a DOWN carries no exit policy, so it is the whole
+    /// signal.
     fn enqueue_down_signal(
         &mut self,
         to: ProcessId,
@@ -2337,10 +2416,113 @@ impl ProcessTable {
         let Some(recipient) = lookup_mut(&mut self.slots, to) else {
             return Ok(());
         };
-        let reason = copy_reason_onto(recipient, reason, src)?;
-        recipient
-            .signals_mut()
-            .push(PendingSignal::down(reference, target, kind, tag, reason));
+        // Read before the copy: the fragment route below needs `self` again, and `recipient`'s
+        // borrow must be over by then.
+        let refuses_collect = recipient.has_unpublished_roots();
+        match copy_reason_onto(recipient, reason, src) {
+            Ok(reason) => {
+                recipient
+                    .signals_mut()
+                    .push(PendingSignal::down(reference, target, kind, tag, reason));
+                Ok(())
+            }
+            Err(BeamError::Alloc(failure))
+                if refuses_collect
+                    && matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
+            {
+                self.deliver_down_fragment(to, reference, target, kind, tag, reason, src)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Builds the `{'EXIT', From, Reason}` a **trapping** receiver's queued exit signal would have
+    /// been materialised into and enqueues it as a **heap fragment** — the enqueue-time route of
+    /// [`enqueue_fragment_payload`], taken when `to` is **relocation-exempt** and its full nursery
+    /// refused the reason copy ([`ProcessTable::enqueue_exit_signal`]).
+    ///
+    /// The signal never reaches the queue (its reason cannot live there), so this wakes a blocked
+    /// `to` itself, exactly as [`ProcessTable::deliver_head_signal`] does for the queued form.
+    ///
+    /// An unknown `to` is skipped (it died earlier in the same propagation).
+    fn deliver_exit_fragment(
+        &mut self,
+        to: ProcessId,
+        from: ProcessId,
+        reason: Eterm,
+        src: Option<&OffHeapTable>,
+    ) -> Result<()> {
+        let atoms = self.atoms; // Copy: the build closure captures it by value.
+        let from_term = from.to_eterm();
+        let Some(recipient) = lookup_mut(&mut self.slots, to) else {
+            return Ok(());
+        };
+        enqueue_fragment_payload(recipient, from_term, reason, src, &mut |heap, reason| {
+            build_exit_message(heap, &atoms, from, reason)
+        })?;
+        let woke = recipient.wake();
+        if woke {
+            self.ready.push(to);
+        }
+        Ok(())
+    }
+
+    /// Builds the `{'DOWN', Ref, Kind, Target, Reason}` message the queue's materialiser
+    /// ([`ProcessTable::deliver_down_message`]) would have built and enqueues it as a **heap
+    /// fragment** — the enqueue-time route of [`enqueue_fragment_payload`], taken when `to` is
+    /// **relocation-exempt** and its full nursery refused the reason copy
+    /// ([`ProcessTable::enqueue_down_signal`]).
+    ///
+    /// The DOWN never reaches the queue (its reason cannot live there), so this wakes a blocked
+    /// `to` itself, exactly as [`ProcessTable::deliver_head_signal`] does for the queued form. The
+    /// named monitor's `{Name, node}` descriptor (if any) is consumed here, exactly as the
+    /// materialiser consumes it: the DOWN is its last use.
+    ///
+    /// An unknown `to` is skipped (it died earlier in the same propagation).
+    fn deliver_down_fragment(
+        &mut self,
+        to: ProcessId,
+        reference: MonitorRef,
+        target: ProcessId,
+        kind: MonitorKind,
+        tag: Option<Eterm>,
+        reason: Eterm,
+        src: Option<&OffHeapTable>,
+    ) -> Result<()> {
+        let atoms = self.atoms; // Copy: the build closure captures it by value.
+        // Read before the recipient lookup borrows the table, exactly as `deliver_down_message`
+        // does: a named monitor's DOWN carries the `{Name, node}` pair rather than the pid.
+        let named = self.named_monitors.get(&reference).copied();
+        let kind_atom = match kind {
+            MonitorKind::Process => atoms.process(),
+            MonitorKind::Port => atoms.port(),
+        };
+        let from_term = target.to_eterm();
+        let Some(recipient) = lookup_mut(&mut self.slots, to) else {
+            return Ok(());
+        };
+        enqueue_fragment_payload(recipient, from_term, reason, src, &mut |heap, reason| {
+            let reference_term = reference.to_eterm(heap)?;
+            let target_term = match named {
+                Some(nt) => heap.tuple(&[make_atom(nt.name), make_atom(nt.node)])?,
+                None => target.to_eterm(),
+            };
+            build_down_message_term(
+                heap,
+                &atoms,
+                tag,
+                reference_term,
+                kind_atom,
+                target_term,
+                reason,
+            )
+        })?;
+        let woke = recipient.wake();
+        if woke {
+            self.ready.push(to);
+        }
+        // The named descriptor is consumed by the delivered DOWN (its last use).
+        self.named_monitors.remove(&reference);
         Ok(())
     }
 

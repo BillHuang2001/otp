@@ -74,6 +74,30 @@ fn tokens_request(runtime: &mut Runtime, enc: &str, line: i64) -> Eterm {
     })
 }
 
+/// A `{get_until, Enc, Prompt, Mod, Func, XtraArgs}` request for any user function — the
+/// general form of [`tokens_request`], so a test can drive a continuation that is neither
+/// the scanner nor protocol-conforming.
+fn request(
+    runtime: &mut Runtime,
+    enc: &str,
+    module: &str,
+    function: &str,
+    xtra_args: &[Eterm],
+) -> Eterm {
+    build(runtime, |ctx| {
+        let get_until = ctx.atom("get_until").unwrap();
+        let encoding = ctx.atom(enc).unwrap();
+        let module = ctx.atom(module).unwrap();
+        let function = ctx.atom(function).unwrap();
+        let xtra_args = terms::make_list(ctx, xtra_args).unwrap();
+        terms::make_tuple(
+            ctx,
+            &[get_until, encoding, NIL, module, function, xtra_args],
+        )
+        .unwrap()
+    })
+}
+
 /// Registers `file` as a fresh io-device — the shape [`super::super::Runtime::reply_open`]
 /// builds — and returns the pid it is keyed by.
 ///
@@ -185,9 +209,8 @@ fn interpret_decodes_more_and_done() {
     );
 }
 
-/// Anything that is not `{more, Cont}` / `{done, Result, Buf}` is `io_lib:get_until/4`'s
-/// `case_clause` — `Ok(None)` here, which [`serve`] turns into the `{error, Func}` raise
-/// (see [`EngineContinuation::apply`]).
+/// Anything that is not `{more, Cont}` / `{done, Result, Buf}` is the `case_clause` shape —
+/// `Ok(None)` here, which [`EngineContinuation::apply`] turns into the typed capability gap.
 #[test]
 fn interpret_answers_none_for_a_non_protocol_value() {
     let mut runtime = runtime();
@@ -447,6 +470,139 @@ fn serve_boxes_a_continuation_raise_as_error_func_and_retires_the_device() {
         "{error,tokens}",
         "the reply is the value `{{error, Func}}`"
     );
+}
+
+// -- the raise/gap classification ------------------------------------------------------
+
+/// A **typed capability gap** of this layer is not a raise of the user function: it travels
+/// out as [`Err`] and the device stays registered, still answering requests.
+///
+/// The continuation here is `lists:flatten/2` applied as
+/// `lists:flatten(Cont, Chars)`: it is real Erlang code (`lists.erl:1320`, unlike the
+/// `erlang:nif_error(undef)` stub `lists:reverse/2` is) whose value is the charlist itself —
+/// i.e. neither `{more, Cont}` nor `{done, Result, Buf}`, which is the gap [`interpret`]
+/// reports (`Ok(None)`).
+///
+/// The oracle, for comparison, reaches `io_lib:get_until/4`'s own `case_clause`, which
+/// `file_io_server`'s `catch` boxes as `{error, Func}` and then dies
+/// (`file_io_server.erl:681-682`; probed on OTP 29.1.1 / erts-17.1 with
+/// `1+2.\nrest` as `gap_probe.erl`):
+///
+/// ```text
+/// 1> {ok,D} = file:open("gap_probe.erl",[read]),
+///    io:request(D, {get_until,latin1,"",lists,flatten,[]}).
+/// {error,flatten}
+/// 2> io:request(D, {get_until,latin1,"",lists,flatten,[]}).
+/// {error,terminated}
+/// ```
+///
+/// This runtime reports the honest typed gap instead of fabricating a user-function raise
+/// (a capability gap is uncatchable and must never be dressed up as `{error, Func}`), and
+/// the device is **not** retired.
+#[test]
+fn a_typed_capability_gap_neither_retires_the_device_nor_reports_error_func() {
+    let Some(mut runtime) = system_runtime() else {
+        return;
+    };
+    with_scratch("gap", "1+2.\nrest", |path| {
+        let pid = open_device(
+            &mut runtime,
+            File::open(path).expect("the scratch file opens"),
+            Encoding::Latin1,
+            false,
+        );
+        let request = request(&mut runtime, "latin1", "lists", "flatten", &[]);
+        let failure = runtime
+            .serve_device_request(pid, request)
+            .expect_err("a non-protocol return value is the typed gap");
+        let reason = crate::error::unsupported_reason(&failure)
+            .expect("the gap convention is the single interpreter of `unsupported:`");
+        assert!(
+            reason.contains("neither `{more, Cont}` nor `{done, Result, Buf}`"),
+            "{reason}"
+        );
+        assert!(
+            runtime.file_services.devices.contains_key(&pid),
+            "a typed gap must not retire the device"
+        );
+
+        // ... and the device really is still serving: the same request family answers, and
+        // the scanner sees the already-consumed file as end of file.
+        let second = tokens_request(&mut runtime, "latin1", 1);
+        let (reply, retire) = runtime
+            .serve_device_request(pid, second)
+            .expect("the device survived the gap");
+        assert!(!retire);
+        assert_eq!(render(&mut runtime, reply), "{eof,{1,1}}");
+    });
+}
+
+/// A **genuine raise of the user function** keeps the oracle's behaviour: the reply is the
+/// value `{error, Func}` and the device is retired — `file_io_server`'s `{'EXIT', Reason}`
+/// arm through `get_chars_apply/7` (`file_io_server.erl:681-682`) plus `server_loop/1`'s
+/// `exit(Reason)`.
+///
+/// The continuation is `lists:nth/2` applied as `lists:nth(Cont, Chars)`: with the empty
+/// list as `Cont` no clause matches, so the callee raises `function_clause` — exactly the
+/// kind of raise the classification must not mistake for a capability gap. The oracle, probed
+/// the same way as above:
+///
+/// ```text
+/// 1> {ok,E} = file:open("gap_probe.erl",[read]),
+///    io:request(E, {get_until,latin1,"",lists,nth,[]}).
+/// {error,nth}
+/// 2> io:request(E, {get_until,latin1,"",erl_scan,tokens,[{1,1},[]]}).
+/// {error,terminated}
+/// ```
+#[test]
+fn a_genuine_continuation_raise_retires_and_reports_error_func() {
+    let Some(mut runtime) = system_runtime() else {
+        return;
+    };
+    with_scratch("raise", "1+2.\nrest", |path| {
+        let pid = open_device(
+            &mut runtime,
+            File::open(path).expect("the scratch file opens"),
+            Encoding::Latin1,
+            false,
+        );
+        let request = request(&mut runtime, "latin1", "lists", "nth", &[]);
+        let (reply, retire) = runtime
+            .serve_device_request(pid, request)
+            .expect("the oracle replies `{error, Func}` rather than propagating the reason");
+        assert!(retire, "a raising user function kills the device");
+        assert_eq!(render(&mut runtime, reply), "{error,nth}");
+    });
+}
+
+/// [`EngineContinuation::classify`] is the single decision point: the workspace
+/// `unsupported:` convention (via [`crate::error::unsupported_reason`]) separates a typed
+/// capability gap from a genuine raise of the user function.
+#[test]
+fn classify_marks_only_a_genuine_raise() {
+    let mut runtime = runtime();
+    let mut continuation = EngineContinuation {
+        runtime: &mut runtime,
+        module: None,
+        module_name: "lists".to_string(),
+        function: "reverse".to_string(),
+        arity: 2,
+        xtra_args: Vec::new(),
+        raised: false,
+    };
+
+    let gap = error::unsupported("file_server: a typed gap");
+    let gap = continuation.classify(gap);
+    assert!(
+        crate::error::unsupported_reason(&gap).is_some(),
+        "a gap stays a gap"
+    );
+    assert!(!continuation.raised, "a gap is not a raise of the user function");
+
+    // `BeamError::BadArg` is what a BIF the user function called reports; nothing about it
+    // is an `unsupported:` reason, so it is a genuine raise.
+    continuation.classify(BeamError::BadArg);
+    assert!(continuation.raised, "a user function's badarg is a raise");
 }
 
 // -- the request, end to end (the device loop + the real `erl_scan:tokens/4`) -----------

@@ -67,7 +67,22 @@
 //! native `file_server_2` also serves `save_binary`'s write, so `compile:file/2`'s artifact lands
 //! on disk), and it needs no compiled fixture. A compile driven from a **scheduled** process
 //! instead stops with the typed `unsupported: opcode: run: process blocked (no message available)`
-//! — a cross-crate root-publication gap owned by `beam_engine`/`beam_process`, not by this node.
+//! — a scheduled slice's out-of-line nested run cannot pump the scheduler, so a callee that parks
+//! in a `receive` folds into the engine's `blocked` gap, and `module_observes_its_call_site` routes
+//! the whole `compile` module onto that path. That module-wide routing is what keeps the scheduled
+//! route **sound**, not merely conservative: the parked machine's live `pending_exception` reason
+//! *is* published as a `Registers::extra_roots` word across the park window
+//! (`runner/run.rs::publish_parked_roots`), but a scheduled process is not relocation-exempt and the
+//! **running** machine's `x`/stack/FR are published into `Process::regs` only at the engine's own
+//! heap-admission points (`src/context/gc.rs::ensure_heap_full`/`alloc_words_rooted`) and at a park —
+//! never around `ExecutionContext::call_bif` — so a collection at that admission point
+//! (`ensure_heap`/`ensure_heap_full` → `collect_or_grow`) would move the heap under a live mid-slice
+//! root set that does not reach a term the in-flight call chain holds outside `x`/stack/FR
+//! (`Machine::args_scratch`; a `beam_bifs` fast-path BIF's accumulator across a `ctx.call_fun`
+//! boundary). A *delivery*-driven collect of a `Running` receiver is already refused
+//! (`Process::has_unpublished_roots`). Narrowing the guard's fun-image half is therefore unsound: it
+//! turns both self-host corpus cases into a hard mismatch (`beam_term::ops: invalid boxed header
+//! subtag 0x2`, `*** Internal compiler error ***`) rather than the typed `blocked` gap.
 
 // The shared harness is compiled in whole, but this suite uses only its bounded runner and its
 // toolchain discovery; the unused remainder is expected here — the same shape `tests/io_scan.rs`

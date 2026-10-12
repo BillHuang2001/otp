@@ -109,7 +109,8 @@ use super::{tuple_fields, Device};
 /// Reply}` envelope is [`super`]'s). `retire` is `true` when the user function **raised**:
 /// the oracle replies with `{error, Func}` and then kills the device
 /// (`file_io_server.erl:681-682` + `server_loop/1`'s `exit(Reason)`), which is what retiring
-/// the device here mirrors.
+/// the device here mirrors. A typed capability gap of this layer, by contrast, is returned
+/// as `Err` and leaves the device registered — it is not a raise of the user function.
 ///
 /// # Errors
 ///
@@ -240,9 +241,14 @@ struct EngineContinuation<'r> {
     arity: u32,
     /// The request's `XtraArgs` (for `io`'s calls, `[Pos0, Options]`).
     xtra_args: Vec<Eterm>,
-    /// Whether an application **raised** — the oracle's `{'EXIT', Reason}`, which
+    /// Whether the user function **itself raised** — the oracle's `{'EXIT', Reason}`, which
     /// `file_io_server` boxes as `{stop, Reason, {error, Func}, State}` rather than
     /// propagating the reason to the caller (see [`raise_reply`]).
+    ///
+    /// Only a genuine `Mod:Func` raise sets this; a typed capability gap of this layer (a
+    /// suspending continuation, a non-protocol return value) does **not**, so it propagates
+    /// as [`Err`] instead of being misreported as a user-function raise — see
+    /// [`classify`](EngineContinuation::classify).
     raised: bool,
 }
 
@@ -317,6 +323,22 @@ impl EngineContinuation<'_> {
             )),
         }
     }
+
+    /// Marks `failure` as a genuine raise of the user function unless it is a typed
+    /// capability gap, and hands it back.
+    ///
+    /// [`error::unsupported_reason`] is the single interpreter of the workspace
+    /// `unsupported:` convention, so a gap this layer reports (a suspending continuation)
+    /// leaves [`raised`](EngineContinuation::raised) untouched and propagates as [`Err`] —
+    /// the honest `unsupported: …` gap — while anything the user function raised (an
+    /// `undef`, an arithmetic error, an explicit `exit/1`) sets it, so [`serve`] boxes it
+    /// as `{error, Func}` and retires the device.
+    fn classify(&mut self, failure: BeamError) -> BeamError {
+        if error::unsupported_reason(&failure).is_none() {
+            self.raised = true;
+        }
+        failure
+    }
 }
 
 impl Continuation for EngineContinuation<'_> {
@@ -326,10 +348,11 @@ impl Continuation for EngineContinuation<'_> {
     /// One application of the user function, decoding `io_lib:get_until/4`'s protocol:
     /// `{more, Cont}` → [`Applied::More`], `{done, Reply, Buf}` → [`Applied::Done`].
     ///
-    /// Anything else is what `io_lib:get_until/4` itself turns into a `case_clause` — and
-    /// `file_io_server`'s `catch` turns *that* into `{error, Func}` again, so it is reported
-    /// as a raise (the [`raised`](EngineContinuation::raised) flag) rather than as a device
-    /// failure.
+    /// What the user function itself raised is classified through
+    /// [`classify`](EngineContinuation::classify), so `file_io_server`'s `catch` can box it
+    /// as `{error, Func}`. Anything else is what `io_lib:get_until/4` itself turns into a
+    /// `case_clause`; a native service process answers it as the typed capability gap rather
+    /// than as a raise of the user function.
     fn apply(
         &mut self,
         cont: Eterm,
@@ -338,19 +361,13 @@ impl Continuation for EngineContinuation<'_> {
     ) -> Result<Applied<Eterm, Eterm>> {
         let value = match self.call(cont, data) {
             Ok(value) => value,
-            Err(failure) => {
-                self.raised = true;
-                return Err(failure);
-            }
+            Err(failure) => return Err(self.classify(failure)),
         };
         match interpret(self.runtime, value)? {
             Some(applied) => Ok(applied),
-            None => {
-                self.raised = true;
-                Err(error::unsupported(
-                    "file_server: a `{get_until,…}` continuation that returned neither `{more, Cont}` nor `{done, Result, Buf}`",
-                ))
-            }
+            None => Err(error::unsupported(
+                "file_server: a `{get_until,…}` continuation that returned neither `{more, Cont}` nor `{done, Result, Buf}`",
+            )),
         }
     }
 }
