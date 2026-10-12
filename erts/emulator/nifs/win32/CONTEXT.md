@@ -6,7 +6,7 @@ Windows-only C implementations behind the cross-platform NIFs in `../common/`:
 
 ## API Surface
 ### `win_socket_asyncio.c` (12312 lines) — `esaio_*` IOCP backend
-Implements `socket_asyncio.h` (`../common/socket_asyncio.h`), wired into `ESockIoBackend io_backend` under `#ifdef __WIN32__` in `../common/prim_socket_nif.c` (~line 19022).
+Implements `socket_asyncio.h` (`../common/socket_asyncio.h`), wired into `ESockIoBackend io_backend` under `#ifdef __WIN32__` in `../common/prim_socket_nif.c` (~line 18951).
 - Backend entries: `esaio_init` (1186), `esaio_finish` (1503), `esaio_info` (1624), `esaio_command` (1694), `esaio_open_plain` (1739), `esaio_bind` (1856), `esaio_connect` (1909), `esaio_accept` (2279), `esaio_send` (2657), `esaio_sendto` (2772), `esaio_sendmsg` (2898), `esaio_sendv` (3358), `esaio_recv` (4212), `esaio_recvfrom` (4695), `esaio_recvmsg` (5045), `esaio_close` (5441), `esaio_fin_close` (5607), `esaio_cancel_connect` (5694), `esaio_cancel_accept` (5777), `esaio_cancel_send` (5872), `esaio_cancel_recv` (5956), `esaio_ioctl3` (6037), `esaio_ioctl2` (6616), `esaio_dtor` (11463), `esaio_stop` (11541), `esaio_down` (11623), `esaio_down_ctrl` (11805).
 - Internal: `esaio_completion_main` (6746, the worker loop), `esaio_add_socket` (12242), `esaio_send_completion_msg` (12259), `mk_completion_msg` (12303), `do_stop` (5503).
 
@@ -23,14 +23,14 @@ Implements the `efile_*` contract in `../common/prim_file_nif.h`; `prim_file_nif
 - Async ops are issued with the `OVERLAPPED` as the first member of `ESAIOOperation` (struct 423, field `ol` 425). Wrappers: `sock_recv_O`=WSARecv (151/4279), `sock_send_O`=WSASend (157/2731), `sock_recvfrom_O`=WSARecvFrom (4766), `sock_sendto_O`=WSASendTo (2846), `sock_sendv_O`=WSASend vector (3551), `sock_accept_O`=AcceptEx via `ctrl.accept` (134/2399), `sock_connect_O`=ConnectEx via `ctrl.connect` (139/2076), sendmsg/recvmsg via `ctrl.sendmsg`/`ctrl.recvmsg` (3144/5138).
 
 ### Completion thread pool
-- Thread count: `ioNumThreads = 2*scheduler_threads` (min 2) default, overridable by the `io_num_threads` load-info option (`../common/prim_socket_nif.c` 19009-19015); passed to `esaio_init(numThreads)` (1186). `ctrl.numThreads` set at 1220.
+- Thread count: `ioNumThreads = 2*scheduler_threads` (min 2) default, overridable by the `io_num_threads` load-info option (`../common/prim_socket_nif.c` 18938-18944); passed to `esaio_init(numThreads)` (1186). `ctrl.numThreads` set at 1220.
 - Threads created in `esaio_init` loop 1393-1448 via `TCREATE` = `enif_thread_create` (macro in `../common/socket_int.h` 910), running `esaio_completion_main` (6746). Threads are ERTS NIF threads (`enif_thread_opts_create`/`TCREATE`), each with its own `ErlNifEnv` (`esock_alloc_env`, 6763).
 - Worker loop: `GetQueuedCompletionStatus(ctrl.cport, &numBytes, &descP, &olP, INFINITE)` (6796), `CONTAINING_RECORD(olP, ESAIOOperation, ol)` (6835/6840), then `switch (opP->tag)` (6849) dispatching to `esaio_completion_{terminate,connect,accept,send,sendv,sendto,sendmsg,recv,recvfrom,recvmsg,unknown}` (6977-11392). `FREE(opP)` (6952); loop ends via `TEXIT` (6959).
 - Teardown `esaio_finish` (1503): posts `ESAIO_OP_TERMINATE` per thread with `PostQueuedCompletionStatus` (1558), `TJOIN`s each (1588 = `enif_thread_join`), `FREE(ctrl.threads)` (1603). Note the `for (t=0, lastThread=-1, lastThread; ...)` at 1518 uses `lastThread` as the condition (always -1 → truthy).
 
 ### Notification back to the Erlang process
 - No `enif_select` and no direct `enif_send` in this file. On a pending overlapped op the NIF entry returns `esock_atom_completion` (2500, 4625, 12130) after `esock_reader_push`/`esock_acceptor_push`/`esock_writer_push` records the `ErlNifPid`+`Ref`+env in `readersQ`/`acceptorsQ`/`writersQ` (e.g. 4621-4623).
-- When the op completes the worker calls `esaio_send_completion_msg` (12259) → `esock_send_msg` (`../common/prim_socket_nif.c` 17499, wraps `enif_send`) sending `{'$socket', Socket, completion, {Ref, Status}}` (`mk_completion_msg` 12303, form documented at 62-67 and 12296-12299) to `opP->caller`/`opP->data.*.sockRef`. The Erlang side waits for that message.
+- When the op completes the worker calls `esaio_send_completion_msg` (12259) → `esock_send_msg` (`../common/prim_socket_nif.c` 17428, wraps `enif_send`) sending `{'$socket', Socket, completion, {Ref, Status}}` (`mk_completion_msg` 12303, form documented at 62-67 and 12296-12299) to `opP->caller`/`opP->data.*.sockRef`. The Erlang side waits for that message.
 - Synchronous "can complete immediately" path: e.g. `recv_check_ok` (4380) returns `{ok, Bin}`/`{more, Bin}`/`{error,closed}` directly without a message; a pending/incomplete result goes through `recv_check_pending` (4604).
 
 ### Concurrency / race handling
@@ -45,7 +45,7 @@ Implements the `efile_*` contract in `../common/prim_file_nif.h`; `prim_file_nif
 
 ## Constraints
 - Must compile only on win32; the `esaio_*`/`efile_*` symbols are referenced solely from `../common/` (Unix backends live in `../unix/`).
-- Changing an `esaio_*`/`efile_*` signature requires updating `../common/socket_asyncio.h` / `../common/prim_file_nif.h` and the `io_backend` table in `../common/prim_socket_nif.c` (~19022).
+- Changing an `esaio_*`/`efile_*` signature requires updating `../common/socket_asyncio.h` / `../common/prim_file_nif.h` and the `io_backend` table in `../common/prim_socket_nif.c` (~18951).
 - `win_prim_file.c` functions may only run on dirty I/O schedulers (asserted); do not assume a normal scheduler.
 
 ## Known Issues / Gotchas

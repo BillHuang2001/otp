@@ -116,121 +116,6 @@ realloc_wrap(ErtsAlcType_t t, void *p, Uint ps, Uint s)
 #endif
 
 
-#ifdef HARD_POLL_DEBUG
-#define OP_SELECT 1
-#define OP_DESELECT 2
-#define OP_FIRED 3
-#define OP_READ_BEGIN 4
-#define OP_READ_DONE 5
-#define OP_WRITE_BEGIN 6
-#define OP_WRITE_DONE 7
-#define OP_REPORTED 8
-#define OP_DIED 9
-#define OP_ASYNC_INIT 10
-#define OP_ASYNC_IMMED 11
-#define OP_FD_MOVED 12
-
-static struct {
-    int op;
-    ErtsSysFdType active;
-    int xdata;
-} debug_save_ops[1024];
-
-static int num_debug_save_ops = 0;
-
-static ErtsSysFdType active_debug_fd;
-static int active_debug_fd_set = 0;
-
-static erts_mtx_t save_ops_mtx;
-
-static void poll_debug_init(void)
-{
-    erts_mtx_init(&save_ops_mtx, "save_ops_lock", NIL,
-        ERTS_LOCK_FLAGS_PROPERTY_STATIC | ERTS_LOCK_FLAGS_CATEGORY_DEBUG);
-}
-
-void poll_debug_set_active_fd(ErtsSysFdType fd)
-{
-    erts_mtx_lock(&save_ops_mtx);
-    active_debug_fd_set = 1;
-    active_debug_fd = fd;
-    erts_mtx_unlock(&save_ops_mtx);
-}
-
-static void do_save_op(ErtsSysFdType fd, int op, int xdata)
-{
-    erts_mtx_lock(&save_ops_mtx);
-    if (fd == active_debug_fd && num_debug_save_ops < 1024) {
-	int x = num_debug_save_ops++;
-	debug_save_ops[x].op = op;
-	debug_save_ops[x].active = fd;
-	debug_save_ops[x].xdata = xdata;
-    }
-    erts_mtx_unlock(&save_ops_mtx);
-}
-
-void poll_debug_moved(ErtsSysFdType fd, int s1, int s2)
-{
-    do_save_op(fd,OP_FD_MOVED,s1 | (s2 << 16));
-}
-
-void poll_debug_select(ErtsSysFdType fd, int mode)
-{
-    do_save_op(fd,OP_SELECT,mode);
-}
-
-void poll_debug_deselect(ErtsSysFdType fd)
-{
-    do_save_op(fd,OP_DESELECT,0);
-}
-
-void poll_debug_fired(ErtsSysFdType fd)
-{
-    do_save_op(fd,OP_FIRED,0);
-}
-
-void poll_debug_read_begin(ErtsSysFdType fd)
-{
-    do_save_op(fd,OP_READ_BEGIN,0);
-}
-
-void poll_debug_read_done(ErtsSysFdType fd, int bytes)
-{
-    do_save_op(fd,OP_READ_DONE,bytes);
-}
-
-void poll_debug_async_initialized(ErtsSysFdType fd)
-{
-    do_save_op(fd,OP_ASYNC_INIT,0);
-}
-
-void poll_debug_async_immediate(ErtsSysFdType fd, int bytes)
-{
-    do_save_op(fd,OP_ASYNC_IMMED,bytes);
-}
-
-void poll_debug_write_begin(ErtsSysFdType fd)
-{
-    do_save_op(fd,OP_WRITE_BEGIN,0);
-}
-
-void poll_debug_write_done(ErtsSysFdType fd, int bytes)
-{
-    do_save_op(fd,OP_WRITE_DONE,bytes);
-}
-
-void poll_debug_reported(ErtsSysFdType fd, int mode)
-{
-    do_save_op(fd,OP_REPORTED,mode);
-}
-
-void poll_debug_died(ErtsSysFdType fd)
-{
-    do_save_op(fd,OP_DIED,0);
-}
-
-#endif /* DEBUG */
-
 /*
  * End of debug macros
  */
@@ -675,20 +560,6 @@ static void *threaded_waiter(void *param)
 {
     register Waiter* w = (Waiter *) param;
     ErtsPollSet *ps = (ErtsPollSet*) w->xdata;
-#ifdef HARD_POLL_DEBUG2
-    HANDLE oold_fired[64];
-    int num_oold_fired;
-    HANDLE old_fired[64];
-    int num_old_fired = 0;
-    HANDLE fired[64];
-    int num_fired = 0;
-    HANDLE errors[1024];
-    int num_errors = 0;
-    HANDLE save_events[64];
-    int save_active_events;
-    int save_total_events;
-    int save_highwater;
-#endif
 
  again:
     WaitForSingleObject(w->go_ahead, INFINITE);
@@ -700,24 +571,9 @@ static void *threaded_waiter(void *param)
 	goto again;
     }
     ASSERT(w->evdata[0] == NULL);
-#ifdef HARD_POLL_DEBUG2
-    num_oold_fired = num_old_fired;
-    memcpy(oold_fired,old_fired,num_old_fired*sizeof(HANDLE));
-    num_old_fired = num_fired;
-    memcpy(old_fired,fired,num_fired*sizeof(HANDLE));
-    num_fired = 0;
-#endif
     for (;;) {
 	int i;
 	int j;
-#ifdef HARD_POLL_DEBUG2
-	erts_mtx_lock(&w->mtx);
-	memcpy(save_events,w->events,w->active_events*sizeof(HANDLE));
-	save_active_events = w->active_events;
-	save_total_events = w->total_events;
-	save_highwater = w->highwater;
-	erts_mtx_unlock(&w->mtx);	
-#endif
 	i = WaitForMultipleObjects(w->active_events, w->events, FALSE, INFINITE);
 	switch (i) {
 	case WAIT_FAILED:
@@ -730,13 +586,6 @@ static void *threaded_waiter(void *param)
 		    == WAIT_FAILED) {
 		    DEBUGF(("Invalid handle: i = %d, handle = 0x%0x\n",
 			    j, w->events[j]));
-#ifdef HARD_POLL_DEBUG2
-		    if (num_errors < 1024)
-			errors[num_errors++] = w->events[j];
-#endif
-#ifdef HARD_POLL_DEBUG
-		    poll_debug_died(w->events[j]);
-#endif
 		    remove_event_from_set(w,j);
 #ifdef DEBUG
 		    consistency_check(w);
@@ -757,12 +606,6 @@ static void *threaded_waiter(void *param)
 #endif
 	default:
 	    erts_mtx_lock(&w->mtx);
-#ifdef HARD_POLL_DEBUG2
-	    {
-		int x = memcmp(save_events,w->events,w->active_events*sizeof(HANDLE));
-		ASSERT(x == 0 && save_active_events == w->active_events);
-	    }
-#endif
 event_happened:
 #ifdef DEBUG
 	    consistency_check(w);
@@ -780,12 +623,6 @@ event_happened:
 	    HARDDEBUGF(("i = %d, a,h,t = %d,%d,%d",i,
 			w->active_events, w->highwater, w->total_events));
 	    w->active_events--;
-#ifdef HARD_POLL_DEBUG2
-	    fired[num_fired++] = w->events[i];
-#endif
-#ifdef HARD_POLL_DEBUG
-	    poll_debug_fired(w->events[i]);
-#endif
 	    if (i < w->active_events) {
 		HANDLE te = w->events[i];
 		EventData* tp = w->evdata[i];
@@ -823,9 +660,6 @@ static int set_driver_select(ErtsPollSet *ps, HANDLE event, ErtsPollEvents mode)
      * Find the waiter which is least busy.
      */
 
-#ifdef HARD_POLL_DEBUG
-    poll_debug_select(event, mode);
-#endif
 
     /* total_events can no longer be read without the lock, it's changed in the waiter */
     for (i = 0; i < ps->num_waiters; i++) {
@@ -876,14 +710,8 @@ static int set_driver_select(ErtsPollSet *ps, HANDLE event, ErtsPollEvents mode)
 	 * the very end to make place for the new event.
 	 */
 
-#ifdef HARD_POLL_DEBUG
-	poll_debug_moved(w->events[w->highwater],w->highwater,w->total_events);
-#endif
 	w->events[w->total_events] = w->events[w->highwater];
 	w->evdata[w->total_events] = w->evdata[w->highwater];
-#ifdef HARD_POLL_DEBUG
-	poll_debug_moved(w->events[w->active_events],w->active_events,w->highwater);
-#endif
 	w->events[w->highwater] = w->events[w->active_events];
 	w->evdata[w->highwater] = w->evdata[w->active_events];
 
@@ -939,9 +767,6 @@ static int cancel_driver_select(ErtsPollSet *ps, HANDLE event)
 			goto restart;
 		    }
 		}
-#ifdef HARD_POLL_DEBUG
-		poll_debug_deselect(w->events[j]);
-#endif
 		remove_event_from_set(w, j);
 		if (stopped) {
 		    START_WAITER(ps,w);
@@ -1140,10 +965,6 @@ int erts_poll_wait(ErtsPollSet *ps,
 	    ERTS_POLL_RES_SET_FD(&pr[num], w->events[j]);
 	    ERTS_POLL_RES_SET_EVTS(&pr[num], w->evdata[j]->mode);
             remove_event_from_set(w, j);
-#ifdef HARD_POLL_DEBUG
-	    poll_debug_reported(w->events[j],w->highwater | (j << 16));
-	    poll_debug_reported(w->events[j],first | (last << 16));
-#endif
 	    ++num;
 	}
 
@@ -1271,10 +1092,6 @@ void erts_poll_destroy_pollset(ErtsPollSet *ps)
  */
 void  erts_poll_init(int *concurrent_updates)
 {
-
-#ifdef HARD_POLL_DEBUG
-    poll_debug_init();
-#endif
 
     if (concurrent_updates)
         *concurrent_updates = 0;
