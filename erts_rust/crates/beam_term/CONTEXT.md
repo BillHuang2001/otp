@@ -74,6 +74,16 @@ assume a different layout.**
   falls back to `a.raw()` (documented, panic-free).
 - Note: generating the standard `am_*`-equivalent `Atom` constants from the full `atom.names` is a
   codegen/boot step (routed to `beam_rt`); this crate owns only the mechanism + parser.
+- **Backing store & cost profile** (`src/atom.rs:69-73`). `AtomTable` is the plain struct
+  `{ names: Vec<String>, index: HashMap<String, Atom> }`, `#[derive(Clone)]`. `name(Atom)` is
+  `O(1)` (`names.get(idx)`, `atom.rs:106`); `intern` is one `HashMap` lookup that allocates
+  **nothing** for an already-interned name and **two** `String`s (one appended to `names`, one as
+  the `index` key) only for a new one (`atom.rs:85-98`). `clone()` is a **deep copy of every
+  entry** — one `String` heap allocation for each `names` element *and* each `index` key, plus
+  rehashing the whole map — i.e. `O(N)` allocations; callers must never clone a populated table on
+  a hot path (`binary_to_term/1` clones the whole runtime table per call at
+  `../../beam_bifs/src/binconv.rs:1099`; every module load clones it at
+  `../../beam_rt/src/codeserver.rs:428`), so an `N`-atom runtime pays `O(N)` per decode.
 
 ### `list.rs` — cons cells (`[CAR,CDR]`, header-less, `TAG_PRIMARY_LIST`)
 - `make_list(*const Eterm) -> Eterm`; `list_val(Eterm) -> *mut Eterm`; `ptr_val(Eterm) -> *mut Eterm`
