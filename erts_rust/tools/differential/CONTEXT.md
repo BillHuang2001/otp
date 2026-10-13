@@ -140,7 +140,6 @@ Harness / data:
 - `out/` → gitignored JSON report output (default `--out`).
 
 ## See Also
-- `../../crates/beam_rt/src/port/CONTEXT.md` + `../../crates/beam_rt/M1_GAPS.md` — the **authoritative live A.4 driver-host status** (which `DriverHost` hooks `DriverPort` implements vs the typed gaps). The module docs of the A.4 corpus groups (`corpus/driver_c.rs`, `corpus/driver_abi.rs`, `corpus/driver_abi_extra.rs`) describe *pre-fix* runtime behaviour in places and must be checked against this before being trusted; the port-dir CONTEXT flags the sibling `divergences.md` A.4 entries as stale for the same reason.
 - `../CONTEXT.md` — the shared conventions this crate must follow (runtime resolution, JSON, exit codes).
 - `../../CONTEXT.md` §6 / §7 — the differential gate is the compatibility gate (Stage 0).
 - `../../../ERTS_RUST_REWRITE_DEEPDIVE.md` §H — Stage 0 mandates this harness.

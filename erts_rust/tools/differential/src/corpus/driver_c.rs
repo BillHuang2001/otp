@@ -35,8 +35,12 @@
 //! * the **oracle** never treats a `{spawn_driver, Name}` name as a path — a slashed name is
 //!   `error:badarg` — so the object must first be loaded with `erl_ddll:load_driver/2` and
 //!   then opened by its **bare driver name**;
-//! * the **Rust** runtime has no `erl_ddll` BIF yet and instead accepts the object **path**
-//!   as the name (a documented Milestone-1 extension of `beam_rt::port::driver_lookup`).
+//! * the **Rust** runtime instead accepts the object **path** as the name (a documented
+//!   Milestone-1 extension of `beam_rt::port::driver_lookup`). Its `erl_ddll` BIFs
+//!   (`try_load/3`/`try_unload/2`/`loaded_drivers/0`/`info/2`, the `ddll` corpus group) landed, but
+//!   the Erlang-level `erl_ddll:load_driver/2` it would need is still unusable: the wrapper calls
+//!   `try_load/3` with a `{driver_options, …}` option the runtime's option parser rejects with
+//!   `badarg` (measured), so the path form stays the Rust side's route.
 //!
 //! `open/2` below therefore tries the path form first and falls back to the
 //! `erl_ddll` form, so the case reads identically on both sides. (Verified: the oracle
@@ -48,10 +52,10 @@
 //! Every library is `dlopen(RTLD_NOW)`ed by both runtimes, so it may reference only `driver_*`
 //! slots the Rust runtime really exports. The original fixture uses `driver_alloc`/`driver_free`
 //! and `driver_output` (all exported by the `beam_rt` binary — see its
-//! `-Wl,--export-dynamic` link options) and never the typed gaps documented in
-//! `crates/beam_rt/src/port/driver.rs` (`driver_async` has no pool, and the entry's
-//! `control` callback behind `port_control/3` is not routed yet). The observable surface is
-//! consequently the **port lifecycle**: load → `start` → `output` → `stop`.
+//! `-Wl,--export-dynamic` link options) and never a typed gap documented in
+//! `crates/beam_rt/src/port/driver.rs` (the remaining one is `driver_async` — there is no async
+//! pool; the entry's `control` callback behind `port_control/3` **is** routed). The observable
+//! surface is consequently the **port lifecycle**: load → `start` → `output` → `stop`.
 //!
 //! # The four driver-registry slots (their own fixtures)
 //!
@@ -165,7 +169,8 @@ yn(_) -> 0.
 %% Reach the driver the way each runtime can, without changing the argv:
 %%   * the oracle refuses a path in `{spawn_driver, _}` (`badarg`) and needs the object
 %%     pre-loaded by `erl_ddll:load_driver/2`, then opened by the bare driver name;
-%%   * the Rust runtime has no `erl_ddll` BIF and takes the object path as the name.
+%%   * the Rust runtime takes the object path as the name (`erl_ddll:load_driver/2` is not
+%%     yet usable there).
 open(Dir, Suffix) ->
     case catch open_port({spawn_driver, Dir ++ "/host_driver" ++ Suffix}, [binary]) of
         P when is_port(P) -> P;
