@@ -576,3 +576,236 @@ fn a_recorded_spawn_is_enqueued_at_its_own_priority() {
         fib(5)
     );
 }
+
+// -- the connecting (client) half of distribution (contract A.5, phase 2) -------------
+
+/// One bounded, non-blocking read of `stream`: the bytes that had arrived, or an empty
+/// vector when the read would block (the link's read timeout).
+fn read_once(stream: &mut std::net::TcpStream) -> Vec<u8> {
+    use std::io::{ErrorKind, Read};
+
+    let mut buf = [0u8; 8192];
+    match stream.read(&mut buf) {
+        Ok(n) => buf[..n].to_vec(),
+        Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => Vec::new(),
+        Err(err) => panic!("peer read: {err}"),
+    }
+}
+
+/// Feeds `bytes` to `driver`, advances it until it can make no more progress, and writes
+/// back whatever it produced — one peer step of the `beam_dist` side of a loopback link.
+fn step_peer(
+    driver: &mut beam_dist::driver::ConnectionDriver,
+    stream: &mut std::net::TcpStream,
+    bytes: &[u8],
+) {
+    use std::io::Write;
+
+    if !bytes.is_empty() {
+        driver.feed(bytes);
+    }
+    loop {
+        match driver.step() {
+            Ok(beam_dist::StepOutcome::WouldBlock) => break,
+            Ok(_) => {}
+            Err(err) => panic!("peer step: {err}"),
+        }
+    }
+    if driver.has_output() {
+        let out = driver.take_output();
+        stream.write_all(&out).expect("peer write");
+        stream.flush().expect("peer flush");
+    }
+}
+
+/// The **connecting (client) half** of distribution (contract A.5, phase 2), driven end to
+/// end through the runtime's own plumbing against a `beam_dist` **server** driver over a
+/// loopback socket — no `erl` and no `epmd`.
+///
+/// It pins the four things this node's wiring is responsible for:
+///
+/// * [`Runtime::new`] builds a client for a node and installs its
+///   [`DistSignalRouter`](beam_process::DistSignalRouter) on the **process table** (the
+///   deliberate placement: the table is moved out of the runtime for a pass, and the router
+///   shares the client's `Rc`, so both survive the move);
+/// * [`Runtime::pump_dist_client`] carries the `'N'` handshake to `Established` and writes
+///   the queue;
+/// * a signal routed through the client's router is **queued**, not sent, and reaches the
+///   wire only on the next pump — the synchronous-materialisation contract of
+///   [`crate::dist_client`];
+/// * [`Runtime::dispatch_dist_client_inbound`] is gated by `allow_inbound_delivery` and
+///   routes a decoded `DOP_SEND` addressed to a local pid into that process's mailbox.
+#[test]
+fn the_outbound_distribution_client_is_wired_and_driven_by_the_runtime() {
+    use std::io::Write;
+
+    use beam_codec::term::make_external_pid;
+    use beam_dist::driver::{ConnectionDriver, DriverState};
+    use beam_dist::{Delivery, UnsupportedSink};
+    use beam_process::{DistSignal, RemotePid};
+
+    // A node runtime. Construction binds the listener and nothing else: `epmd` is touched by
+    // the *listening* half's first pump, which this test never needs.
+    let mut config = crate::config::RuntimeConfig::default();
+    config.emulator.node_name = Some("unitcli".to_string());
+    config
+        .init_args
+        .record("setcookie", vec!["cook".to_string()]);
+    let mut rt = Runtime::new(config).expect("a node runtime");
+    let creation = rt.dist_node().expect("a configured node").creation();
+    assert!(
+        rt.processes().has_dist_router(),
+        "a node installs the client's DistSignalRouter on the process table"
+    );
+
+    // The peer: a `beam_dist` **server** driver behind a loopback listener.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
+    let addr = listener.local_addr().expect("the loopback port");
+    rt.dist_client
+        .as_ref()
+        .expect("a node has a client")
+        .connect_addr("peer@localhost", addr, rt.code_server.atoms_mut())
+        .expect("dial the loopback peer");
+    let (mut stream, _) = listener.accept().expect("the client connected");
+    stream
+        .set_read_timeout(Some(crate::dist::DIST_READ_SLICE))
+        .expect("a bounded read");
+    let mut driver = ConnectionDriver::server(b"peer@localhost", b"cook", creation);
+
+    // Drive the handshake through the runtime's own pump.
+    for _ in 0..500 {
+        rt.pump_dist_client()
+            .expect("the client pump never fails a pass");
+        let bytes = read_once(&mut stream);
+        step_peer(&mut driver, &mut stream, &bytes);
+        if matches!(driver.state(), DriverState::Established)
+            && rt.dist_is_connected("peer@localhost")
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        rt.dist_is_connected("peer@localhost"),
+        "the runtime's pump carries the 'N' handshake to Established"
+    );
+    assert_eq!(
+        rt.dist_connected_nodes(),
+        vec!["peer@localhost".to_string()],
+        "the established link is reported by its full node@host name"
+    );
+
+    // A routed signal is materialised into the client's queue and is **not** on the wire
+    // until the next pump.
+    let mut heap = Heap::new(64).expect("a small heap");
+    let peer_node = make_atom(rt.code_server.atoms_mut().intern("peer@localhost"));
+    let remote = RemotePid::from_eterm(
+        make_external_pid(&mut heap, peer_node, 7, 0, creation).expect("an external pid"),
+    )
+    .expect("a remote pid");
+    let self_pid = rt.self_pid();
+    {
+        let mut router = rt.dist_client.as_ref().expect("the client").router();
+        router
+            .route(DistSignal::Link {
+                from: self_pid,
+                to: remote,
+            })
+            .expect("queue the link");
+    }
+    let nothing = read_once(&mut stream);
+    assert!(
+        nothing.is_empty(),
+        "a routed signal must not reach the wire before a pump (read {} byte(s))",
+        nothing.len()
+    );
+    rt.pump_dist_client()
+        .expect("the pump flushes the queued control");
+    let bytes = read_once(&mut stream);
+    assert!(!bytes.is_empty(), "the pump wrote the queued DOP_LINK");
+    step_peer(&mut driver, &mut stream, &bytes);
+
+    let mut inbound = Heap::new(1 << 12).expect("a decode heap");
+    let mut sink = UnsupportedSink;
+    let dispatched = driver
+        .dispatch_inbound(&mut inbound, rt.code_server.atoms_mut(), &mut sink)
+        .expect("classify the routed link");
+    match dispatched.first().map(|record| record.delivery.clone()) {
+        Some(Delivery::Link { from, to }) => {
+            let expected = make_external_pid(
+                &mut heap,
+                rt.local_node_term(),
+                self_pid.number() as u32,
+                self_pid.serial() as u32,
+                creation,
+            )
+            .expect("the expected external pid");
+            assert!(
+                beam_term::compare::eq(from, expected, rt.code_server.atoms()),
+                "the routed DOP_LINK carries this runtime's pid as an external pid"
+            );
+            assert_eq!(
+                RemotePid::from_eterm(to)
+                    .expect("the local element is an external pid")
+                    .number(),
+                7,
+                "the routed DOP_LINK addresses the remote pid it was given"
+            );
+        }
+        other => panic!("expected a DOP_LINK, got {other:?}"),
+    }
+
+    // The client's inbound half is gated: off by default, a decoded control is not routed.
+    let mut table = rt.take_processes();
+    let gated = rt
+        .dispatch_dist_client_inbound(&mut table)
+        .expect("the gated dispatch");
+    rt.put_processes(table);
+    assert_eq!(
+        gated, 0,
+        "inbound delivery is off by default, so nothing is routed into a mailbox"
+    );
+
+    // The peer now sends a `DOP_SEND` addressed to this runtime's own root process. The
+    // `From` element is the **empty atom** — the wire form `dist.c` documents for the plain
+    // `DOP_SEND` ("otherwise, the atom '' (empty cookie)", `dist.c:2536`) and, unlike the
+    // `DOP_SEND_SENDER` form (which carries the peer's *boxed* pid), an **immediate**: a
+    // boxed `from` is what `beam_message::Message::from` refuses, since this runtime never
+    // gathers a mailbox `from` as a GC root (the documented M1 gap for inbound
+    // `DOP_SEND_SENDER*`). The client's own outbound `send_message_pid` picks the sender form
+    // from the negotiated flags; inbound, `DOP_SEND` is the shape this runtime really serves.
+    let from_remote = make_atom(rt.code_server.atoms_mut().intern(""));
+    let to_local = make_external_pid(
+        &mut heap,
+        rt.local_node_term(),
+        self_pid.number() as u32,
+        self_pid.serial() as u32,
+        creation,
+    )
+    .expect("local pid");
+    let hi = make_atom(rt.code_server.atoms_mut().intern("hi"));
+    let message = heap.tuple(&[hi, make_small(9)]).expect("the message");
+    driver
+        .send_control(
+            beam_dist::Dop::Send,
+            &[from_remote, to_local, message],
+            rt.code_server.atoms(),
+        )
+        .expect("the peer sends a DOP_SEND");
+    let out = driver.take_output();
+    stream.write_all(&out).expect("peer write");
+    stream.flush().expect("peer flush");
+
+    rt.pump_dist_client()
+        .expect("the client reads the peer's send");
+    rt.allow_inbound_delivery(true);
+    let mut table = rt.take_processes();
+    let delivered = rt
+        .dispatch_dist_client_inbound(&mut table)
+        .expect("the dispatch");
+    rt.put_processes(table);
+    assert_eq!(
+        delivered, 1,
+        "the decoded DOP_SEND reached the addressed local process's mailbox"
+    );
+}

@@ -71,6 +71,7 @@ use crate::config::{strategy_env_default, ArgTerm, InitArgs, RuntimeConfig};
 use crate::context::gc_walk::RuntimeCollectionGate;
 use crate::context::{PersistentTermStore, RuntimeContext};
 use crate::dist::{resolve_cookie, DistNode, NONODE_NAME};
+use crate::dist_client::{DistClient, DIST_CONNECT_TIMEOUT};
 use crate::error;
 use crate::eval::FunBody;
 use crate::format;
@@ -422,6 +423,16 @@ pub struct Runtime {
     /// [`Runtime::pump_dist`] from the scheduler pass, next to the port half. See
     /// [`crate::dist`] for exactly how little of distribution this implements.
     dist: Option<DistNode>,
+    /// The **connecting (client) half** of distribution (contract A.5, Phase 2), when
+    /// `-name`/`-sname` was given.
+    ///
+    /// [`crate::dist`]'s `dist` field above is this runtime's *listening* half; this is its
+    /// mirror — the registry of *outbound* links the runtime dials through `epmd`
+    /// ([`crate::dist_client`]). `None` for a runtime with no node name, which has no
+    /// identity to put on the wire (and installs no [`DistSignalRouter`](beam_process::DistSignalRouter)
+    /// either). When present, the link is built and pumped by the scheduler pass, next to
+    /// [`Runtime::pump_dist`], and the client's router is installed on the process table.
+    dist_client: Option<DistClient>,
     /// The distribution **cookie** the handshake digests use, resolved once at construction
     /// from `-setcookie`, else `$HOME/.erlang.cookie`, else the documented default (see
     /// [`crate::dist::resolve_cookie`]).
@@ -635,6 +646,38 @@ impl Runtime {
         };
         let local_node = code_server.atoms_mut().intern(local_node_name);
         processes.set_local_node(local_node);
+        // The **connecting (client) half** of distribution (contract A.5, Phase 2,
+        // `crate::dist_client`): the mirror of the listening node above, which dials a peer
+        // it resolves through `epmd` and carries a two-way `DOP_*` session on the link. It
+        // exists only when this runtime **is** a node — a runtime with no node name has no
+        // identity to put on the wire, so it keeps `None` and installs no router.
+        //
+        // The router is installed on the **process table**, not kept on the runtime: the
+        // table is *moved out* of the runtime for the duration of a scheduler pass
+        // ([`Runtime::take_processes`]/[`Runtime::put_processes`]), so a router that lives
+        // inside it cannot borrow the runtime — and it does not need to, because it shares
+        // the client's own `Rc<RefCell<…>>` cell. Both the runtime-owned [`DistClient`] and
+        // the table-installed router therefore see the *same* links and outbound queue, and
+        // the table move carries the router along unharmed.
+        let dist_client = match dist.as_ref() {
+            Some(node) => {
+                let client = DistClient::new(cookie.clone())?;
+                // The advertised name is the full `node@host` form (a `-sname` node is not
+                // advertised bare), which `node_name()` already returns; the creation is the
+                // value known so far (the `epmd`-assigned one is only final after the node's
+                // first pump, which is why [`Runtime::dist_connect`] re-installs the identity
+                // immediately before it dials).
+                client.set_identity(
+                    node.node_name(),
+                    make_atom(local_node),
+                    node.creation(),
+                    &cookie,
+                );
+                processes.set_dist_router(client.router());
+                Some(client)
+            }
+            None => None,
+        };
         // The perf files are created up front, like the C's `beamasm_metadata_early_init`:
         // the map is then appended to as ranges become known. Nothing is created when the
         // flag selected no file, and a failure to create one is recorded on the `PerfMap`
@@ -687,6 +730,7 @@ impl Runtime {
             timer_wakes: Vec::new(),
             pending_spawns: Vec::new(),
             dist,
+            dist_client,
             cookie,
             local_node,
             inbound_delivery: false,
@@ -2045,6 +2089,141 @@ impl Runtime {
     /// The node's full name (`node@host`), when this runtime is a distributed node.
     pub fn node_name(&self) -> Option<&str> {
         self.dist.as_ref().map(|node| node.node_name())
+    }
+
+    /// The runtime's **client-side** distribution registry (contract A.5, Phase 2), when
+    /// `-name`/`-sname` configured a node.
+    ///
+    /// [`Runtime::dist_node`] is the *listening* half; this is its mirror — the outbound links
+    /// the runtime dialled through `epmd` ([`crate::dist_client`]). `None` means this runtime
+    /// is not a node, and therefore has no client (and no
+    /// [`DistSignalRouter`](beam_process::DistSignalRouter) installed either).
+    pub fn dist_client(&self) -> Option<&DistClient> {
+        self.dist_client.as_ref()
+    }
+
+    /// The full `node@host` names of every peer this runtime has **established** an outbound
+    /// link to. Empty for a runtime that is not a node.
+    pub fn dist_connected_nodes(&self) -> Vec<String> {
+        self.dist_client
+            .as_ref()
+            .map(DistClient::connected_nodes)
+            .unwrap_or_default()
+    }
+
+    /// Whether this runtime's outbound link to `peer` completed its `'N'` handshake.
+    /// `false` for a runtime that is not a node.
+    pub fn dist_is_connected(&self, peer: &str) -> bool {
+        self.dist_client
+            .as_ref()
+            .is_some_and(|client| client.is_connected(peer))
+    }
+
+    /// Dials `peer` and drives the connector handshake to completion (contract A.5, Phase 2).
+    ///
+    /// `peer` is a `-name`/`-sname` value (the short name of a short node, the full
+    /// `node@host` of a long one); its listen port is resolved through `epmd`
+    /// ([`crate::dist_client`]). The node identity is (re-)installed first, because the
+    /// creation is only final after `epmd` answered this node's own `ALIVE2` registration —
+    /// which the first scheduler pass performs — and an outbound handshake must carry it.
+    ///
+    /// The handshake is a handful of round trips on an already-open socket, driven here in a
+    /// bounded loop (polling with a short sleep, up to
+    /// [`DIST_CONNECT_TIMEOUT`](crate::dist_client::DIST_CONNECT_TIMEOUT)) so the caller gets
+    /// a connected link or a typed error instead of having to pump scheduler passes itself. The
+    /// scheduler pass keeps the link alive afterwards ([`Runtime::pump_dist_client`]).
+    ///
+    /// # Errors
+    ///
+    /// A typed error when this runtime is not a distributed node (no `-name`/`-sname`), the
+    /// `epmd` lookup's/socket's own failures, and a timeout or a retired link (whose recorded
+    /// reason, [`DistClient::last_error`], is included) — never a fabricated success.
+    pub fn dist_connect(&mut self, peer: &str) -> Result<()> {
+        let cookie = self.cookie.clone();
+        let (name, creation) = match self.dist.as_ref() {
+            Some(node) => (node.node_name().to_string(), node.creation()),
+            None => {
+                return Err(error::message(
+                    "distribution: this runtime is not a distributed node (no -name/-sname)",
+                ))
+            }
+        };
+        let local_node = self.local_node;
+        let Some(client) = self.dist_client.as_ref() else {
+            return Err(error::message(
+                "distribution: this runtime has no distribution client",
+            ));
+        };
+        client.set_identity(&name, make_atom(local_node), creation, &cookie);
+        client.connect(peer, self.code_server.atoms_mut())?;
+        let deadline = std::time::Instant::now() + DIST_CONNECT_TIMEOUT;
+        while !client.is_connected(peer) {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            client.pump(self.code_server.atoms_mut())?;
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        if client.is_connected(peer) {
+            return Ok(());
+        }
+        Err(match client.last_error() {
+            Some(reason) => {
+                error::message(format!("distribution: could not connect to {peer}: {reason}"))
+            }
+            None => error::message(format!(
+                "distribution: connecting to {peer} timed out after {} ms",
+                DIST_CONNECT_TIMEOUT.as_millis()
+            )),
+        })
+    }
+
+    /// Sends `msg` from `from` to the process **registered as** `name` on `peer`
+    /// (`{DOP_REG_SEND, From, Cookie, ToName} -- Msg`).
+    ///
+    /// The link must already be established ([`Runtime::dist_connect`]); an unconnected peer is
+    /// a typed error, never a silent drop and never a fabricated success.
+    ///
+    /// # Errors
+    ///
+    /// As above (not a node, no established link, the encoding/socket failures).
+    pub fn dist_send_reg_send(
+        &mut self,
+        peer: &str,
+        name: &str,
+        from: ProcessId,
+        msg: Eterm,
+    ) -> Result<()> {
+        let Some(client) = self.dist_client.as_ref() else {
+            return Err(error::message(
+                "distribution: this runtime is not a distributed node (no -name/-sname)",
+            ));
+        };
+        client.send_reg_send(peer, name, from, msg, self.code_server.atoms_mut())
+    }
+
+    /// Sends `msg` from `from` to the **external pid** `to`
+    /// (`{DOP_SEND_SENDER|DOP_SEND, From, To} -- Msg`).
+    ///
+    /// The send opcode is the driver's choice from the negotiated flags
+    /// (`DOP_SEND_SENDER` when the peer negotiated it), so it cannot be made here. As
+    /// [`Runtime::dist_send_reg_send`], the link must be established first.
+    ///
+    /// # Errors
+    ///
+    /// As above, plus a typed error when `to` is not an external pid.
+    pub fn dist_send_message_pid(
+        &mut self,
+        to: Eterm,
+        from: ProcessId,
+        msg: Eterm,
+    ) -> Result<()> {
+        let Some(client) = self.dist_client.as_ref() else {
+            return Err(error::message(
+                "distribution: this runtime is not a distributed node (no -name/-sname)",
+            ));
+        };
+        client.send_message_pid(to, from, msg, self.code_server.atoms_mut())
     }
 
     /// The distribution **cookie** this runtime's handshake digests use.
