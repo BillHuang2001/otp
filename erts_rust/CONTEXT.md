@@ -111,14 +111,15 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   own `CONTEXT.md`; all implemented and tested. Verify the node tree via the routing table below.
 - **Build/test:** build with `scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace
   --all-targets` (warning-free); test with `scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml
-  --workspace --no-fail-fast`. The suite is green (8756+ passed / 0 failed; ~45 min wall on a loaded
+  --workspace --no-fail-fast`. The suite is green (~10,800 passed / 0 failed; ~45 min wall on a loaded
   host, so run it in crate chunks when iterating).
 - **CI runs the workspace and the gate:** `.github/workflows/erts_rust.yml` (path-triggered on
   `erts_rust/**` and on the workflow file itself, plus `workflow_dispatch`) installs the pinned
   toolchain (`rust-toolchain.toml`), then runs `cargo build --workspace --all-targets`,
   `cargo test --workspace --no-fail-fast`, a **non-blocking** `cargo clippy`, and the differential gate
   `tools/differential/gate.sh` against an OTP oracle (`erlef/setup-beam`); with no `erl`/`erlc` on
-  `PATH` the gate step warns and skips. `gate.sh` always runs `--strict --allowlist known-gaps.txt`.
+  `PATH` the gate step warns and skips. `gate.sh` always passes `--strict` to the `differential`
+  binary and defaults its allowlist to `tools/differential/known-gaps.txt`.
   Its exit-code policy: `0` every executed case agreed, or every gap is recorded + the allowlist is fresh
   → pass; `1` a real `mismatch` → fails the job; `2` env/usage error or an unparsable report → fails the
   job; `3` no mismatch but the **ratchet** must be updated (an unrecorded capability gap appeared, or a
@@ -131,8 +132,8 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   `ordsets`/`proplists`/`maps`/`queue`/`gb_trees`/`calendar`/`filename`/`base64`/`unicode` functions run
   with byte-identical oracle results. Anything outside the supported surface returns a typed `BeamError`
   (never a wrong result).
-- **Compatibility gate (`tools/differential`):** `summary: total=2161 agree=2159 mismatch=0 unsupported=2
-  skipped=0 allowed=2` → `gate.sh --strict` exits 0. `gate.sh` is authoritative — re-run it for the live
+- **Compatibility gate (`tools/differential`):** `summary: total=2163 agree=2161 mismatch=0 unsupported=2
+  skipped=0 allowed=2` → `gate.sh` exits 0 (verified in both the default and the `BEAM_RT_TIER=interpreter` tier). `gate.sh` is authoritative — re-run it for the live
   per-contract split. **No case disagrees**; the two recorded capability gaps (the `known-gaps.txt`
   ratchet allowlist) are `wire/new_fun_ext_encode` (A.5, unclosable — an `erl_eval` lambda's
   closure identity needs `erl_eval`/`erl_scan`/`erl_parse`) and
@@ -146,8 +147,11 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
 - **Benchmarks:** every measured figure and its caveats lives in `tools/bench/RESULTS.md` (raw artifacts
   in `tools/bench/results/`) — read it there rather than duplicating numbers. Headlines since M1: the
   registered-BIF dispatch hot path fell from ~10.6 µs to ~116 ns/call and the registry lookup is now
-  allocation-free; the baseline-JIT default took the `foreign` hot loop to **0.71×–0.84×** of the system
-  ERTS (now faster) and `gc_bound/churn` to **0.49×**.
+  allocation-free; the baseline-JIT default took the
+  `foreign` hot loop to **0.71×–0.84×** *of the Rust interpreter tier* and `gc_bound/churn` to
+  **0.49×** — those are Rust-vs-Rust *tier-effect* ratios, NOT a system-ERTS comparison: against the
+  system ERTS the same loops remained **46.2×–74.2×** and **42.2×** dearer at M9. The registered-BIF
+  hot path is now ~79–96 ns/call. M10 then cut the ETF round trip **22.7×** (see `CHANGE.md`).
 - **Contract A.9 (build/bootstrapping) — boot-to-completion achieved; no self-hosted build.** `beam_rt`
   loads the 22 preloaded modules on startup, and its boot-script executor drives the real
   `bootstrap/bin/start.boot` (OTP 30 / erts-17.1, 22 instructions) **to completion** — all 22 directives

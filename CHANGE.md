@@ -8,6 +8,73 @@ Format: one entry per major change — date, area, what changed and why. Newest 
 
 ---
 
+## 2026-10-14 — Milestone 10: the ETF atom-table clone removed, BIF-result copy-out + bounded churn RSS, Y-slot JIT arithmetic + continuation sub-blocks, a family-aware exit policy, and the M9 ratio correction
+Scope: a performance-and-correctness milestone driven by the M9 benchmark bottleneck list. The headline
+**algorithmic/data-structure** changes are (a) the ETF decode **scratch image** that removes the
+per-call whole-`AtomTable` deep clone, (b) the BIF-result **copy-out + pooled-heap rewind** that makes a
+BIF-churn loop's RSS flat in N, (c) the baseline JIT's **continuation sub-blocks** (a change to how a
+function is cut into compiled blocks) plus Y-slot arithmetic, and (d) the **family-aware** exit policy
+(`ExitFamily::Explicit | Linked`). Verified: `cargo build --workspace --all-targets` warning-free, the
+workspace suite green (**10,828 passed / 0 failed** in chunked runs), and the differential gate
+**`total=2163 agree=2161 mismatch=0 unsupported=2 skipped=0 allowed=2`** → exit 0 in **both** the default
+and the `BEAM_RT_TIER=interpreter` tier.
+- **Ratios corrected (M9 headline):** the previously recorded `foreign` **0.71×–0.84×** and
+  `gc_bound/churn` **0.49×** were **Rust-vs-Rust tier effect** ratios, not a system-ERTS comparison;
+  against the system ERTS the same loops were **46.2×–74.2×** and **42.2×** dearer. Corrected in
+  `erts_rust/CONTEXT.md` and in the M7 entry above. The registered-BIF hot path is ~79–96 ns/call.
+- **Area:** `erts_rust/crates/beam_bifs` (`src/binconv.rs`, `src/context.rs`, the ETS/match-spec surface)
+- **Change:** `binary_to_term/1,2` no longer deep-clones the shared `AtomTable`. `beam_codec`'s decoders
+  take `&mut AtomTable` only because they *intern*, so a per-thread **memoized scratch image** of the
+  live table (`DECODE_SCRATCH` + `prefix_matches` + `with_decode_scratch`) is now reused whenever every
+  index still names the same atom, and extended in place otherwise; a stale/shorter/moved-name image
+  falls back to a rebuild, so the prediction of a novel atom's index stays exact and correctness is by
+  construction. New `BifContext::atom_and_heap` splits the borrow. The same borrow-conflict workaround
+  (`ctx.atoms().clone()`) was removed at **24 further sites** in the ETS/match-spec/records surface, and
+  `ets/adopt.rs::collect_objects` now takes `&mut Heap` directly. Measured: ETF round trip
+  **121.3 → 5.69 µs/op (21.3×)**, `ets:select/2` **129.1 → 5.80 µs (22.3×)**, `match_spec_test/3`
+  **92.7 → 0.206 µs**; a new `examples/etf_bench.rs` + `src/bin/ets_bench.rs` reproduce it in-run.
+- **Area:** `erts_rust/crates/beam_rt` (`src/context/calls.rs`, `src/runtime/gc.rs`, `src/runner/`)
+- **Change (memory model):** a registered BIF's **foreign container result is now copied into the
+  running process's own scanned heap**, after which the **pooled BIF heap is rewound** (`Heap::reset`) —
+  collection-free, inside the BIF, with the refc-owner invariant held because an empty source table
+  forces the byte-faithful flatten. A naive reset is unsound and was rejected: rewinding happens only
+  when provably safe (six escaping host seams excluded, `!reentrant`, `Ok` result, `used() == 0`); error
+  paths never rewind. Effect: the churn loop's peak RSS went from **694 MiB at N=100 000 (which used to
+  die with `error:system_limit`)** to a **flat ~19.5 MiB across a 50× N range**, and the loop now really
+  collects (10 002 GCs where it previously recorded **0** — the unscanned-root valve declined forever).
+  Also: `erlang:garbage_collect/2`'s **async completion** (`{garbage_collect, ReqId, true}`) is now
+  emitted in request order, and the per-slice/per-park **FR (float-register) publication** publishes only
+  a float-touched file instead of all 1024 slots on every slice/resume/park.
+- **Area:** `erts_rust/crates/beam_engine` (`src/jit/baseline/emit/`, `src/jit/cache.rs`,
+  `src/interpreter/dispatch.rs`)
+- **Change (code layout + dispatch):** the baseline tier now lowers a **continuation sub-block**
+  `[pc+1, block.end)` for every frame-preserving call, so the code *after* a non-tail `Call` (e.g.
+  `sum([H|T]) -> H + sum(T)`'s accumulator add) is natively reachable instead of deopting out of the
+  compiled region; `gc_bif` arithmetic and `Move` gained **Y-slot (stack) operands and destinations**
+  behind a per-block Y window, plus the `Deallocate`/`Return` frame-discipline trio. A `call_ext` BIF now
+  resolves its target **once** (the declined-seam answer is carried into the interpreter step instead of
+  being recomputed), and the module **fingerprint is computed once per compiled artifact** with an
+  address-keyed resolution memo, so a cache HIT no longer re-hashes the IR (~141 µs saved per slice
+  entry). Measured: `sum/1` **0.80–0.88× → 1.65–1.67×**, `call_ext/0` **1.68×**, `cross/2`
+  **0.73× → 1.03×**, `walk/2` **5.09×**, `kernel/2` **5.93×**.
+- **Area:** `erts_rust/crates/beam_process` (`src/signal.rs`, `src/signal_queue.rs`, `src/ptab.rs`)
+- **Change (algorithmic):** the exit policy is now **signal-family-aware**. The C rule
+  (`erts/emulator/beam/erl_proc_sig_queue.c:4740-4770`) is `untrappable = family == Explicit &&
+  reason == kill`; a `kill` **link** exit is trappable (a trapping peer gets `{'EXIT',Peer,kill}` and
+  lives) and terminates a non-trapping peer with the reason **unchanged**, while an explicit
+  `erlang:exit/2` with `kill` is untrappable and rewritten to `killed`. The family is carried on the
+  queued signal so the deferred link cascade keeps it. Also: the off-heap sweep now uses `beam_gc`'s
+  safe read-only `ReachableObject` view, dropping this crate's last production `unsafe` in `process.rs`.
+- **Area:** `erts_rust/crates/beam_gc`, `erts_rust/tools/{differential,bench}`
+- **Change:** `beam_gc` gained a safe `ReachableObject`/`for_each_reachable_object_view` enumeration (so
+  callers need no `unsafe`). The gate corpus became **load-state-explicit** — `boot/code_is_loaded_shape`
+  now `code:ensure_loaded/1`s the module it asserts on, because `code:is_loaded/1` is load-state-based
+  while `code:which/1`/`code:get_object_code/1` are path-based; every other corpus case was audited for
+  the same implicit-boot-state dependence. The bench driver's tool resolution became **version-ranked**
+  (greatest satisfying candidate across `PATH`/`$BENCH_TOOL_PATH`/the Nix store, with every rejection
+  reason recorded), which enabled the `plb` target (`dotnet` 9.0.318); `emqx` stays an honest mechanical
+  skip (its checkout pins OTP 28.5.0.7-2 while the host has 29.1.1).
+
 ## 2026-10-14 — Milestone 9: inbound distribution + the connector, off-heap reachability reclamation, the mature-generation room policy, a `gc` corpus group, the distribution probe helper
 Scope: a capability-and-evidence milestone. The headline changes are **two-way live distribution**
 (inbound delivery routing plus a real connector), **reachability-based off-heap reclamation**, and a
@@ -241,7 +308,9 @@ differential gate **`total=2161 agree=2159 mismatch=0 unsupported=2 skipped=0 al
   interpreter register-file **written high-water mark** (bounding the per-run refill), a by-value small
   `Step` result, and a latched `wants_reduce` gate. The only kill switch is `BEAM_RT_TIER=interpreter`.
   Measured effect: the `foreign` per-call hot loop went from ~54×–72× **dearer** than the system ERTS to
-  **0.71×–0.84×** (now faster), and `gc_bound/churn` to **0.49×**.
+  **0.71×–0.84×** *relative to the Rust interpreter tier* (a Rust-vs-Rust **tier effect**, corrected at
+  M10: the same loop was still **46.2×–74.2×** dearer than the system ERTS at M9), and `gc_bound/churn`
+  to **0.49×** (a tier ratio; 42.2× dearer than the system ERTS).
 - **Area:** `erts_rust/crates/beam_ets`
 - **Change:** the match-spec guard arithmetic now materialises **bignum** results faithfully
   (`trunc`/`round`/`ceil`/`floor`/`bnot`/`abs` over `beam_term`'s number layer, oracle-cross-checked

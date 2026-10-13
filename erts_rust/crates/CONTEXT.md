@@ -247,7 +247,7 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   messages **delivered to the owning process**, so a receiver blocked on port data is woken through
   `beam_process`'s resume-on-send rather than only by an explicit `send` (`beam_rt/tests/port_wake.rs`);
   `erlang:port_close/1` returns the oracle's `true`. The **differential gate reports 0 mismatches**:
-  `summary: total=2161 agree=2159 mismatch=0 unsupported=2 skipped=0 allowed=2` (`../tools/differential/gate.sh`
+  `summary: total=2163 agree=2161 mismatch=0 unsupported=2 skipped=0 allowed=2` (`../tools/differential/gate.sh`
   → exit 0); re-run `gate.sh` for the live per-contract split. The two recorded capability gaps (the
   `known-gaps.txt` ratchet allowlist) are A.9 `wire/new_fun_ext_encode` and
   `boot_extra/init_script_id_names_the_running_otp_release` (the `-eval`/`run` path loads no boot script).
