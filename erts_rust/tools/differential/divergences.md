@@ -120,7 +120,8 @@ not here.)
 - `application:get_key(erts, vsn)` differs: the oracle answers `undefined` (the emulator is not a
   *loaded* application — the same conclusion as the pinned `loaded_applications_excludes_erts` and
   `application:get_application(erts)` cases), the rust runtime answers `{ok,"17.1"}`. The
-  `kernel`/`stdlib` forms agree and are pinned. Owner: `beam_rt`.- `application:get_application/1` on a **pid** differs: the oracle answers `{ok,App}` for a
+  `kernel`/`stdlib` forms agree and are pinned. Owner: `beam_rt`.
+- `application:get_application/1` on a **pid** differs: the oracle answers `{ok,App}` for a
   process an application owns and `undefined` for every other process (`application:get_application(self())`
   and `application:get_application(spawn(fun() -> ok end))` are both `undefined` under `-noshell`),
   while the rust runtime raises `error:function_clause` (it runs no application-owned process).
@@ -142,7 +143,8 @@ not here.)
   `debug`), and `erlang:system_info(debug_compiled)` follows from it (oracle `false`, rust
   `true`); only the type/shape (`is_atom`/`is_boolean`) is pinnable. `erlang:system_info(compat_rel)`
   is release-dependent like `otp_release` (oracle `29`, rust `30`) — only `is_integer` is pinned.
-  Owner: `beam_rt`.- `erlang:system_info(loaded)` and `erlang:system_info(check_io)`
+  Owner: `beam_rt`.
+- `erlang:system_info(loaded)` and `erlang:system_info(check_io)`
   are honest capability gaps (rust exit 3 / `beam_rt: unsupported: …`) — neither cases nor
   mismatches; safe to pin as allowlisted cases once wanted.
 - `erlang:function_exported/3` is `false` in the rust runtime for `kernel` and `code` (the
