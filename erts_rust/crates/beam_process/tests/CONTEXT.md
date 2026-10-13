@@ -447,6 +447,32 @@ SMP pool:
     Deterministic — a fixed 200-byte position-dependent payload (> `ERL_ONHEAP_BINARY_LIMIT`), an
     **injected** `AllocRef` so a payload block's alloc/free is observable in isolation, and explicit
     `sweep`/`collect` calls; no sleeps / wall-clock bounds / oracle.
+43. `decline_gate_builders.rs` (13 tests) — the **collection-decline path of the six
+    `build_signal_message`-only signal builders**, the gap the crate `CONTEXT.md`'s Known Issues
+    recorded. Each builder is exercised through its public trigger with a saturated nursery (three
+    free words — one short of the four-word first allocation every one of the six builds makes) under
+    **both** valves, then asserted to deliver the notification **fragment-resident** with the
+    receiver's nursery untouched (`minor_gcs`, the young space's `base`/`used_words` and the mature
+    used words all unchanged): (1) `deliver_noproc_down` — a born-down `monitor(process, P)` on a
+    dead/never-existing pid, `{'DOWN', Ref, process, P, noproc}` (`envelope from` = the dead pid);
+    (2) `deliver_named_noproc_down` — `monitor_named(process, Name, Node)` on an unregistered name,
+    `{'DOWN', Ref, process, {Name, Node}, noproc}` (`from` = the `system` atom, the `{Name,Node}`
+    target materialised inside the fragment's build); (3) `enqueue_remote_down_message` —
+    `node_down` for a recorded remote monitor, `{'DOWN', Ref, process, RemotePid, Reason}` (`from` =
+    the node atom); (4) `enqueue_remote_exit_message` — `node_down` for a **trapping** remote link,
+    `{'EXIT', RemotePid, Reason}`; (5) `enqueue_port_down_message` — `port_closed` for a port
+    monitor, `{'DOWN', Ref, port, Port, Reason}` (`from` = the port); (6)
+    `enqueue_port_exit_message` — `port_closed` for a **trapping** port link, `{'EXIT', Port,
+    Reason}`. Each of the six gets one case for the **crate-owned** valve (a **relocation-exempt**
+    receiver) and one for the **host** `CollectionGate` (with the crate-owned predicate asserted
+    false, so only the host could have declined), every case also asserting the delivered term's
+    whole shape against the expected tuple (`compare::eq`) and FIFO behind the fixture's filler. The
+    thirteenth test `without_a_decline_each_builder_collects_and_grows` is the **shared control**:
+    the identical trigger with no gate and no exemption takes the ordinary arm for all six builders
+    (one collection, an on-heap message, no fragment), so the fragment route is an *additional*
+    decline, never a replacement. Deterministic — no sleeps / wall-clock bounds / oracle; each test
+    was verified sensitive to the guard (dropping a builder's `decline` argument flips its gate case
+    to "a declined relocation must not collect").
 
 ## Constraints
 - **Anti-flakiness (BINDING).** Every assertion is forced by **synchronization**, never a bare
@@ -466,14 +492,14 @@ SMP pool:
 - Run the whole crate gate with
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_process` (never `cd`,
   sandbox `$HOME` is read-only). Cross-checks against the real system ERTS belong to the sibling
-  `../../../tools/differential/` harness, not here. Current: **494 passed, 0 failed, 1 ignored** (179 in-module unit tests + 314
-  across the 41 integration targets here + 1 doctest; the single ignore is the documented
+  `../../../tools/differential/` harness, not here. Current: **511 passed, 0 failed, 1 ignored** (179 in-module unit tests + 331
+  across the 43 integration targets here + 1 doctest; the single ignore is the documented
   non-yielding-runner hang failure mode in `preemption.rs`).
 
 ## Routing Table
 - `scheduler.rs`, `messaging.rs`, `signals.rs`, `gc.rs`, `priority.rs`, `pending_signals.rs`,
   `preemption.rs`, `dict.rs`, `fragments.rs`, `scheduler_ports.rs`, `exhaustion.rs`,
-  `signal_exhaustion.rs`, `signal_fragment_fallback.rs`, `decline_gate.rs`, `gc_exemption.rs`, `message_relocation.rs`,
+  `signal_exhaustion.rs`, `signal_fragment_fallback.rs`, `decline_gate.rs`, `decline_gate_builders.rs`, `gc_exemption.rs`, `message_relocation.rs`,
   `gc_refc_binary_message.rs`,
   `off_heap_send_isolation.rs`, `message_from_is_immediate.rs`, `off_heap_binaries.rs`,
   `off_heap_reachability.rs` →
