@@ -196,3 +196,25 @@ out-of-bound register is never counted. Every non-selected register is read/writ
   result; (c) any value left in a cache register is covered by `spill` at the next helper call / block exit.
 - `baseline/tests.rs` glob-imports `emit`; `mod.rs` re-exports some items under `#[cfg(test)]` so splitting
   the emitter into files did not change item paths. Keep that in mind when renaming items used by tests.
+
+## Continuation sub-blocks (the lazy lowering)
+
+`compile_function` lowers the function's **IR blocks** with `emit_function` and then its
+**continuation sub-blocks** with `emit_sub_blocks`:
+
+- `stores_continuation` names the frame-preserving calls whose `pc + 1` the driver can be
+  re-entered at once the callee returns: `Instr::Call`, `Instr::CallExt`, `Instr::CallFun`,
+  `Instr::CallFun2` and `Instr::Apply`. The tail forms (`call_last`/`call_only`/
+  `call_ext_only`/`call_ext_last`/`apply_last`) store no new continuation.
+- For each such address `p` that lies strictly inside an IR block
+  (`b.start < p < b.end`, `p < code.len()`) and is not already a compiled block start,
+  `emit_sub_blocks` lowers `[p, b.end)` with the same `emit_block` an IR block uses and
+  records the resulting native entry in `CompiledFunction::sub_entries[p]`.
+- Sub-blocks are emitted **after** all IR blocks, so the per-function buffer layout, the
+  block-entry table and the `code_map` regions are unchanged; they reserve no entry label
+  (nothing branches to a continuation address) and they are not counted as blocks.
+- `sub_blocks_capacity_estimate` adds `BLOCK_BYTES + INSTRUCTION_BYTES` per instruction of
+  each sub-block range to `function_capacity_estimate`, so the extra code cannot
+  under-allocate the `CodeBuffer`.
+
+The eager lowering (`compile_module`) emits **no** sub-blocks.

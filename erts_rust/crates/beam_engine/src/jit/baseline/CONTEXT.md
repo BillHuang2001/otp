@@ -27,7 +27,8 @@ The artifact (`CompiledModule`) comes in **two layouts**:
   `highest_native_register`, `code_len`, `code_address_range`, `code_map`, plus the two per-artifact
   derived values computed **once at creation**: `fingerprint` [the module's content hash, so a
   `CodeCache` hit never re-hashes the IR] and `labels` [the module-wide label map a run reuses
-  instead of rebuilding]), plus the lazy layout's unit `CompiledFunction` and the `Summary`
+  instead of rebuilding]), plus the lazy layout's unit `CompiledFunction` (`buffer`, `entries` [IR-block
+  starts], `sub_entries` [continuation sub-blocks], `summary`) and the `Summary`
   register/block aggregate.
 - `mod.rs` — `BaselineJit` (zero-sized `JitBackend`); the driver
   `run_compiled`/`run_compiled_outcome`/`run_compiled_label_outcome`, the no-reset
@@ -48,6 +49,7 @@ The artifact (`CompiledModule`) comes in **two layouts**:
 - **Block prologue position store**: `emit_block` calls `jit_set_position(rt, func, block_start_pc)` after the six saved-register pushes and the `rt`-slot setup and before loading the cached x-registers, so a linked chain (which never returns to the driver) still advances `Machine::current_code` at block granularity.
 - **Root-set contract**: block exits spill the 5 cached x-registers to `machine.x` (`spill`); the only two `call_r` sites (`emit/mod.rs` and `emit/link.rs`) spill first. Non-cached x-registers are addressed directly in `machine.x`.
 - `FuncInfo` is NOT a metadata no-op: it must deopt so a failed head clause raises `function_clause`.
+- **Continuation sub-blocks** (`emit::compile_function` → `emit::stores_continuation`/`emit::sub_blocks_capacity_estimate`/`emit::emit_sub_blocks`, `code::CompiledFunction::sub_entries`): after the IR blocks, the lazy lowering scans the function's code for every `pc + 1` a frame-preserving call stores, and lowers `[pc + 1, containing_block.end)` through the very same `emit_block` — identical shape rules, guards and deopts, so a sub-block is interpreter-identical by construction. An address that is already a block start, or at/past the end of the function, needs no sub-block; a second call nested inside an earlier sub-block's range gets its own (the code is duplicated, correctness first). A sub-block reserves **no** entry label in `block_labels` (nothing branches to a continuation address — the driver re-enters there after a deopt or a `Wait`), so `Summary::block_count`, `code_map` and `code_address_range` keep describing IR blocks only; its register touches are folded into the function `Summary` as a **superset**. `emit_sub_blocks` runs after `emit_function`, so sub-block code sits at the **end** of the per-function buffer and the `code_map` regions stay contiguous. `function_capacity_estimate` is extended by `sub_blocks_capacity_estimate`, so the extra code can never under-allocate the `CodeBuffer` (an under-estimate would be a `SystemLimit` compile error). The eager layout emits no sub-block.
 
 ## Constraints
 - `#![allow(unsafe_code)]` on `mod.rs`/`runtime.rs` and `emit/*` (JIT zone); every `unsafe` block carries a `// SAFETY:` rationale.
@@ -57,6 +59,6 @@ The artifact (`CompiledModule`) comes in **two layouts**:
 `tests.rs` unit-tests the ABI encoding, the `#[repr(C)]` runtime layout, regalloc, the fast-path constants/arithmetic, the deopt/yield folding (a deopted `wait` folds to `RunOutcome::Wait`), and that a deopted collecting `test_heap` reaches the host's admission door exactly once and reloads the cached registers afterwards. Tier equivalence on real modules is in the crate's `tests/jit*.rs` (see `../CONTEXT.md`), which drive the **lazy** path through `Machine::run_with_tier`.
 
 ## Routing Table
-- `code.rs` → the artifact in its two layouts (`CompiledModule`/`CompiledFunction`/`Summary`) + the compile-on-entry point.
+- `code.rs` → the artifact in its two layouts (`CompiledModule`/`CompiledFunction` [`entries` + `sub_entries`]/`Summary`) + the compile-on-entry point.
 - `emit/` → the per-instruction emitters (`mod.rs` dispatch + helpers, `move/test/select/aggregate/arith/compare/link/operands/regalloc.rs`); see its `CONTEXT.md`.
 - `runtime.rs` → block ABI + `jit_step_one`/`jit_ext_call`/`jit_tail_call`; `tests.rs` → unit tests.
