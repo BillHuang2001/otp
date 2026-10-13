@@ -547,6 +547,23 @@ impl Runtime {
             // the request set is pruned to the pass's live processes here, where the table
             // holds exactly them.
             self.prune_gc_requests(&table);
+            // The **async-completion half** of `erlang:garbage_collect/2`: an
+            // `{async, ReqId}` request (`Runtime::request_gc_async`) owes its requester
+            // `{garbage_collect, ReqId, Result}`, and this pass boundary is where the runtime
+            // emits it — a delivery may collect the *receiver's* heap, which a BIF (inside the
+            // executing machine, whose root set is in the engine's Rust locals) must not drive
+            // (see `Runtime::deliver_gc_completions`). A message delivered here wakes its
+            // receiver through the table's own wake list, so the pass goes round again to run
+            // it — the same resume-on-send path a port or timer message takes.
+            match self.deliver_gc_completions(&mut table) {
+                Err(err) => break Err(err),
+                Ok(0) => {}
+                Ok(count) => {
+                    delivered += count;
+                    scheduler.resume_woken(&mut table);
+                    continue;
+                }
+            }
             // The **native-service half**: drain the `file_server_2` service's and its
             // io-devices' mailboxes and deliver each reply into the requesting process's
             // mailbox (contract A.9, `src/native/file_server.rs`). A reply is what lets a
