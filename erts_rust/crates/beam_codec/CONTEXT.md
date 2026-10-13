@@ -175,8 +175,6 @@ The `LOCAL_EXT` (`121`) 4-byte field is an opaque node hash: the encoder takes i
 - Gate (must stay GREEN): `../../scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_codec` and `../../scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`; always go through `../../scripts/cargo.sh` (`$HOME` is read-only), never `cd`, never touch `../tools/`.
 
 ## Known Issues / Remaining gaps
-- **A version-less `COMPRESSED` body has no decode entry point.** `encode_term_body_compressed` emits `[COMPRESSED_EXT][size][zlib]`, but `is_compressed_image` requires the `VERSION_MAGIC` prefix, so decoding that form needs a manual `[131]` prepend (`tests/roundtrip.rs:1190`). This matches the C (`binary2term_prepare` also requires `VERSION_MAGIC`, `external.c:1754`) and no production code calls the body-form producer, so it is an API asymmetry, not a live defect.
-
 Remaining decode divergences:
 - **`NEW_FUN_EXT` `old_index`/`old_uniq` are kept verbatim from the wire** while the C re-emits them from the runtime's fun-entry stub: C keys `erts_fun_entry_get_or_make_stub` by `(module, MD5, index, arity)` and re-emits the *stub's* fields (`external.c:3987-3988`, `:5162`/`:5164`), so a wire value differing from an already-loaded module's entry is discarded there but preserved through this crate's inlined descriptor (`src/decode/fun.rs::decode_new_fun`); observable only via `term_to_binary/1` of such a fun (rewriting the wire `old_uniq` of an `erl_eval` `NEW_FUN_EXT` changes our re-encode, while the oracle re-emits its stub's real value). **OWNER: the runtime fun-entry table** (`beam_term`/the compiling runtime).
 
