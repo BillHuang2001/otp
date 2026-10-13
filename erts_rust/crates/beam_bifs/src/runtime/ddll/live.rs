@@ -56,8 +56,8 @@
 //! * **The option set is scoped.** Only the `kill_ports` flag and the `{monitor, _}` tuple are
 //!   recognised (the latter's payload is not validated); the C additionally handles `{reload, …}` /
 //!   `{driver_options, …}` and the whole pending-reload state machine. Any other element is `badarg`.
-//! * **Unload is immediate** (not the C's pending state machine), and `monitor`/`demonitor`/`info`
-//!   remain typed `unsupported_bif` seam keys in [`crate::runtime::other`].
+//! * **Unload is immediate** (not the C's pending state machine). The sibling
+//!   `info/2`/`monitor/2`/`demonitor/1` are real too ([`super::info`], [`super::monitor`]).
 //! * **No statically linked built-ins**: the oracle lists `tcp_inet`/`udp_inet`/`ram_file_drv`;
 //!   this runtime links none, so a fresh registry is empty.
 
@@ -76,8 +76,11 @@ use super::registry::{self, Loaded};
 
 /// The `(module, function, arity)` keys this module registers **for real**.
 ///
-/// Sorted by `(module, function, arity)`. The three remaining `erl_ddll` keys
-/// (`demonitor/1`, `info/2`, `monitor/2`) stay seam-backed in [`crate::runtime::other`].
+/// Sorted by `(module, function, arity)`. The `erl_ddll` surface's other three real keys
+/// (`info/2` in [`super::info`], `monitor/2` and `demonitor/1` in [`super::monitor`]) are
+/// registered by their own submodules; together with this module's three loading keys and
+/// `format_error_int/1` (`super::REAL_BIFS`) they are the whole `erl_ddll` surface — the
+/// family has **zero** `RuntimeHooks` seam keys.
 pub(crate) const REAL_BIFS: &[(&str, &str, u32)] = &[
     ("erl_ddll", "loaded_drivers", 0),
     ("erl_ddll", "try_load", 3),
@@ -152,12 +155,14 @@ fn loaded_drivers_0(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> 
 
 /// The C `pick_list_or_atom`: a charlist of bytes, or an atom name.
 ///
+/// Shared with the sibling [`super::info`]/[`super::monitor`] modules.
+///
 /// # Errors
 ///
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for any other term, a non-byte element, or a
 /// charlist whose bytes are not valid UTF-8 (this runtime's loader takes a `&str`, so a raw
 /// non-UTF-8 path cannot be conveyed — the C passes bytes straight to `dlopen`).
-fn pick_list_or_atom(ctx: &BifContext<'_>, term: Eterm) -> Result<String> {
+pub(super) fn pick_list_or_atom(ctx: &BifContext<'_>, term: Eterm) -> Result<String> {
     if access::is_atom(term) {
         return ctx
             .atoms()
@@ -203,8 +208,20 @@ fn parse_options(ctx: &BifContext<'_>, term: Eterm) -> Result<(Vec<String>, bool
 }
 
 /// Whether `term` is the atom `name`.
-fn named_atom(ctx: &BifContext<'_>, term: Eterm, name: &str) -> bool {
+pub(super) fn named_atom(ctx: &BifContext<'_>, term: Eterm, name: &str) -> bool {
     access::is_atom(term) && ctx.atoms().name(atom_val(term)) == Some(name)
+}
+
+/// The name of a term that is an atom, or `None` for any other term.
+///
+/// Shared with the sibling [`super::info`]/[`super::monitor`] modules, which validate
+/// their item arguments by atom name.
+pub(super) fn atom_name<'a>(ctx: &'a BifContext<'_>, term: Eterm) -> Option<&'a str> {
+    if access::is_atom(term) {
+        ctx.atoms().name(atom_val(term))
+    } else {
+        None
+    }
 }
 
 /// Whether `term` is the 2-tuple `{monitor, _}`.
@@ -264,97 +281,9 @@ pub(crate) fn register(reg: &mut BifRegistry) {
 mod tests {
     use super::*;
 
-    use std::path::PathBuf;
-
-    use beam_alloc::Heap;
+    use crate::runtime::ddll::test_support::{clear_registry, compile_driver_fixture, Fixture};
     use beam_common::BeamError;
-    use beam_process::ProcessId;
-    use beam_term::{make_atom, make_small, NIL};
-
-    /// The atoms the tests build or route by name.
-    const SEEDED: [&str; 14] = [
-        "ok",
-        "error",
-        "loaded",
-        "already_loaded",
-        "open_error",
-        "not_loaded",
-        "kill_ports",
-        "monitor",
-        "no_driver_init",
-        "driver_init_failed",
-        "bad_driver_name",
-        "driver_incorrect_version",
-        "symbol_not_found",
-        "unspecified_error",
-    ];
-
-    /// The three `erl_ddll` loading BIFs over their own heap + seeded atom table.
-    struct Fixture {
-        registry: BifRegistry,
-        heap: Heap,
-        atoms: beam_term::AtomTable,
-    }
-
-    impl Fixture {
-        fn new() -> Fixture {
-            let mut atoms = beam_term::AtomTable::new();
-            atoms.seed(SEEDED);
-            let mut registry = BifRegistry::new();
-            super::register(&mut registry);
-            Fixture {
-                registry,
-                heap: Heap::new(1 << 16).expect("test heap"),
-                atoms,
-            }
-        }
-
-        /// A seeded atom term.
-        fn atom(&self, name: &str) -> Eterm {
-            make_atom(self.atoms.lookup(name).expect("a seeded atom"))
-        }
-
-        /// A charlist of `text`'s bytes.
-        fn charlist(&mut self, text: &str) -> Eterm {
-            let mut tail = NIL;
-            for byte in text.bytes().rev() {
-                tail = self
-                    .heap
-                    .cons(make_small(i64::from(byte)), tail)
-                    .expect("the charlist fits");
-            }
-            tail
-        }
-
-        /// `[term]` — a cons cell over a fresh tail.
-        fn cons(&mut self, term: Eterm) -> Eterm {
-            self.heap.cons(term, NIL).expect("a cons fits")
-        }
-
-        /// `[term | tail]`.
-        fn cons_tail(&mut self, term: Eterm, tail: Eterm) -> Eterm {
-            self.heap.cons(term, tail).expect("a cons fits")
-        }        /// Calls one of the module's BIFs.
-        fn call(&mut self, function: &str, arity: u32, args: &[Eterm]) -> Result<Eterm> {
-            let mut ctx = BifContext::new(&mut self.heap, &self.atoms, ProcessId::new(1, 0));
-            self.registry
-                .call("erl_ddll", function, arity, &mut ctx, args)
-        }
-
-        /// Renders `term` as `io_lib:write/1` (non-printable, so a charlist is its byte list).
-        fn render(&mut self, term: Eterm) -> String {
-            let mut ctx = BifContext::new(&mut self.heap, &self.atoms, ProcessId::new(1, 0));
-            crate::print::format_term(&mut ctx, term, false).expect("a printable term")
-        }
-    }
-
-    /// The registry is a `thread_local`, so a test that runs after another on the same thread would
-    /// otherwise inherit its drivers. Each test starts from an empty registry.
-    fn clear_registry() {
-        for name in crate::runtime::ddll::registry::names() {
-            crate::runtime::ddll::registry::remove(&name);
-        }
-    }
+    use beam_term::{make_small, NIL};
 
     #[test]
     fn loaded_drivers_is_empty_on_a_fresh_registry() {
@@ -446,7 +375,7 @@ mod tests {
         let monitor = {
             let tag = fx.atom("monitor");
             let payload = make_small(1);
-            fx.heap.tuple(&[tag, payload]).expect("a tuple fits")
+            fx.tuple(&[tag, payload])
         };
         let kill_ports = fx.atom("kill_ports");
         let mut options = NIL;
@@ -458,155 +387,6 @@ mod tests {
             .call("try_load", 3, &[path, name, options])
             .expect("a load failure is a result");
         assert_eq!(fx.render(out), "{error,{open_error,-10}}");
-    }
-
-    // -----------------------------------------------------------------------------------------
-    // The real shared-object fixture (compiled with the system `cc`)
-    // -----------------------------------------------------------------------------------------
-
-    /// A minimal driver: `driver_init` returns an `ErlDrvEntry` named `test_drv` with the three
-    /// callbacks the objective requires and no `driver_*` import (so `dlopen(RTLD_NOW)` resolves).
-    const DRIVER_FIXTURE_C: &str = r#"
-#include <erl_driver.h>
-
-static ErlDrvData test_start(ErlDrvPort port, char *command) {
-    (void) port;
-    (void) command;
-    return (ErlDrvData) 0;
-}
-
-static void test_stop(ErlDrvData data) { (void) data; }
-
-static void test_output(ErlDrvData data, char *buf, ErlDrvSizeT len) {
-    (void) data;
-    (void) buf;
-    (void) len;
-}
-
-static ErlDrvEntry test_drv_entry = {
-    .driver_name = "test_drv",
-    .start = test_start,
-    .stop = test_stop,
-    .output = test_output,
-    .extended_marker = ERL_DRV_EXTENDED_MARKER,
-    .major_version = ERL_DRV_EXTENDED_MAJOR_VERSION,
-    .minor_version = ERL_DRV_EXTENDED_MINOR_VERSION,
-};
-
-DRIVER_INIT(test_drv) { return &test_drv_entry; }
-"#;
-
-    /// Print a loud skip banner (never a silent pass).
-    fn skip(reason: &str) {
-        println!("================================================================");
-        println!("SKIP: {reason}");
-        println!("================================================================");
-    }
-
-    /// The installed OTP include directory holding `erl_driver.h`, if any.
-    ///
-    /// Resolution order (the first directory that really holds `erl_driver.h` wins): the answer of
-    /// `code:lib_dir(erts, include)` — accepted only when the header is actually there, since some
-    /// packaged runtimes (notably the Nix build) answer with a non-existent path — then the sibling
-    /// `include` of the `erts-*` directory of the `erl` on `PATH`.
-    fn erl_include_dir() -> Option<PathBuf> {
-        fn has_header(dir: &std::path::Path) -> bool {
-            dir.join("erl_driver.h").is_file()
-        }
-
-        if let Ok(output) = std::process::Command::new("erl")
-            .args([
-                "-noshell",
-                "-eval",
-                "io:format(\"~s\",[code:lib_dir(erts,include)])",
-                "-s",
-                "init",
-                "stop",
-            ])
-            .output()
-        {
-            if output.status.success() {
-                if let Ok(text) = String::from_utf8(output.stdout) {
-                    let dir = PathBuf::from(text.trim());
-                    if has_header(&dir) {
-                        return Some(dir);
-                    }
-                }
-            }
-        }
-
-        let erl = which_erl()?;
-        // `.../erts-<vsn>/bin/erl` -> `.../erts-<vsn>/include`
-        let erts = erl.canonicalize().ok()?.parent()?.parent().map(PathBuf::from)?;
-        let include = erts.join("include");
-        has_header(&include).then_some(include)
-    }
-
-    /// The first `erl` executable on `PATH`.
-    fn which_erl() -> Option<PathBuf> {
-        let path = std::env::var_os("PATH")?;
-        std::env::split_paths(&path)
-            .map(|dir| dir.join("erl"))
-            .find(|candidate| candidate.is_file())
-    }
-
-    /// Compile [`DRIVER_FIXTURE_C`] into `<scratch>/test_drv.so` and return `<scratch>`.
-    ///
-    /// Returns `None` (after a loud [`skip`]) when the toolchain is absent; [`try_load`] appends the
-    /// `.so`, so the caller passes the directory alone.
-    fn compile_driver_fixture() -> Option<String> {
-        let Some(include) = erl_include_dir() else {
-            skip("ddll driver fixture: no OTP include directory (erl_driver.h) found");
-            return None;
-        };
-        let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
-        if !std::process::Command::new(&cc)
-            .arg("--version")
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false)
-        {
-            skip(&format!("ddll driver fixture: no C compiler ({cc} / $CC) available"));
-            return None;
-        }
-
-        let dir = std::env::temp_dir().join(format!(
-            "beam_bifs-ddll-driver-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        let src = dir.join("test_drv.c");
-        let so = dir.join("test_drv.so");
-        let write = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&src, DRIVER_FIXTURE_C));
-        if let Err(err) = write {
-            skip(&format!("ddll driver fixture: cannot prepare {dir:?}: {err}"));
-            return None;
-        }
-
-        let output = std::process::Command::new(&cc)
-            .arg("-shared")
-            .arg("-fPIC")
-            .arg(format!("-I{}", include.display()))
-            .arg("-o")
-            .arg(&so)
-            .arg(&src)
-            .output();
-        let Ok(output) = output else {
-            skip("ddll driver fixture: could not run the C compiler");
-            return None;
-        };
-        if !output.status.success() {
-            skip(&format!(
-                "ddll driver fixture: cc failed (exit {:?}):\n{}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr)
-            ));
-            return None;
-        }
-        Some(dir.to_string_lossy().into_owned())
     }
 
     #[test]
