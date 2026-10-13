@@ -427,11 +427,16 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `ERTS_ALC_T_DB_HEIR_DATA`/`free_heir_data` pair. Storing the caller's term verbatim (the old
   behaviour) would have dangled once the installing process's heap died.
 - **`ordered_set` defaults to a K-ary B+-tree** (`ORDER = 32`, `MIN_OCCUPANCY = 16`) with an
-  arena-backed, non-relocating `NodeStore` (`NodeId` + free list), O(log n) insert/lookup/delete and a
-  leaf chain; keys compare by `cmp_arith`. The sorted-`Vec` interior is retained as a selectable
-  comparison index (`OrderedInterior::Sorted`) — measured: at n = 1e5 the sorted `Vec` is 3.9–6.3×
-  slower inserting and 3.1–34.6× slower deleting (O(n) tail shift) against parity on lookup, ~0.1–0.45×
-  on ordered iteration and 0.73× on memory, so it can never be the default for a table whose defining
+  arena-backed, non-relocating `NodeStore` (`NodeId` + free list), a leaf chain and `O(log n)` point
+  lookup (`find`/`first`/`last`/`next`/`prev`); keys compare by `cmp_arith`. Insert is `O(log n)` node
+  visits amortized (a split costs one `subtree_max_key` descent, and splits are amortized `O(1)` per
+  insert — worst case `O(log² n)` on a cascading root split); delete is `O(log² n)` node visits (each
+  unwind level re-derives the settled child's maximum) but only `O(log n)` term comparisons — see
+  `src/ordered_interior/CONTEXT.md`. The sorted-`Vec` interior is retained as a selectable comparison
+  index (`OrderedInterior::Sorted`) — measured (5-pass minima): at n = 1e5 the sorted `Vec` is 9.6–36.0×
+  slower inserting and 10.3–29.8× slower deleting (its `O(n)` tail shift), 0.27–0.33× on ordered
+  iteration (a pure memmove walk) and 0.55–0.73× the B+-tree's index bytes/entry (the sorted `Vec` packs
+  tighter), at parity-ish on lookup — so it can never be the default for a table whose defining
   operations are insert/lookup/delete. `src/interior_bench.rs` reproduces the numbers; the interior
   shape is unpinned. (Structural change → `../../CHANGE.md`.)
 - **`set` defaults to CHAMP; `bag`/`duplicate_bag` stay chained.** Measurement-driven:
