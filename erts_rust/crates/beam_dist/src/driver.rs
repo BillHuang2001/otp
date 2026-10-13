@@ -130,8 +130,8 @@ use crate::framing::{
     is_tick, read_length, read_packet, write_packet, write_tick, PacketHeaderSize,
 };
 use crate::handshake::{
-    check_mandatory, preferred_flags, publish_type, status_error, Challenge, ChallengeAck,
-    ChallengeReply, Name, PeerVisibility, Status,
+    check_mandatory, preferred_flags, publish_type, status_error, AcceptDecision, Challenge,
+    ChallengeAck, ChallengeReply, Name, PeerVisibility, Status,
 };
 use crate::transport::{MemoryTransport, Read, Write};
 
@@ -272,6 +272,11 @@ pub struct ConnectionDriver {
     /// Scratch: the peer's node name.
     hs_peer_name: Vec<u8>,
 
+    /// The accepting side's accept policy (server role only), consulted after the
+    /// peer's `Name` passes the mandatory check. `None` for a client driver and for
+    /// a server constructed without a policy — the default, which always answers
+    /// the `"ok"` status.
+    decide: Option<Box<dyn Fn(&Name) -> AcceptDecision + Send + Sync>>,
     /// Raw socket bytes fed by the runtime, not yet consumed.
     input: Vec<u8>,
     /// Bytes the runtime must write to its socket (handshake frames, tick replies,
@@ -322,6 +327,7 @@ impl ConnectionDriver {
             creation,
             our_challenge,
             preferred_flags(),
+            None,
         )
     }
 
@@ -345,6 +351,7 @@ impl ConnectionDriver {
             creation,
             gen_challenge(),
             flags,
+            None,
         )
     }
 
@@ -382,6 +389,7 @@ impl ConnectionDriver {
             creation,
             our_challenge,
             preferred_flags(),
+            None,
         )
     }
 
@@ -403,12 +411,55 @@ impl ConnectionDriver {
             creation,
             gen_challenge(),
             flags,
+            None,
+        )
+    }
+
+    /// [`ConnectionDriver::server`] consulting a caller-supplied **accept decision**.
+    ///
+    /// The non-blocking counterpart of
+    /// [`crate::connection::accept_server_with_decision`]: `decide` is consulted
+    /// once, with the peer's decoded [`Name`], after the mandatory flag check has
+    /// passed (the order a real node uses — `dist_util.erl:286` runs `check_dflags`
+    /// before `mark_pending/1`).
+    ///
+    /// * [`AcceptDecision::Ok`] behaves **exactly** as
+    ///   [`server`](Self::server)/[`server_with_flags`](Self::server_with_flags) —
+    ///   the peer receives the byte-identical `"ok"` status frame.
+    /// * [`AcceptDecision::Refuse`]`(status)` buffers that status 2-byte-framed into
+    ///   the driver's output (drained by [`take_output`](Self::take_output) — the
+    ///   bytes survive even though [`step`](Self::step) then returns `Err`), moves the
+    ///   link to [`DriverState::Failed`] and returns [`status_error`]`(&status)`.
+    ///   The statuses a real accepting node sends here are [`Status::nok`]
+    ///   (`dist_util.erl:343`), [`Status::alive`] (`dist_util.erl:386`) and
+    ///   [`Status::not_allowed`] (`dist_util.erl:286`).
+    ///
+    /// The closure is shared (`Fn`, not `FnOnce`) because the driver is a reusable
+    /// state machine; it is boxed so a driver with a policy and one without have the
+    /// same type.
+    pub fn server_with_decision(
+        our_name: &[u8],
+        cookie: &[u8],
+        creation: u32,
+        flags: DistFlags,
+        decide: Box<dyn Fn(&Name) -> AcceptDecision + Send + Sync>,
+    ) -> ConnectionDriver {
+        ConnectionDriver::new(
+            Role::Server,
+            HandshakePhase::ServerAwaitName,
+            our_name,
+            cookie,
+            creation,
+            gen_challenge(),
+            flags,
+            Some(decide),
         )
     }
 
     /// The shared constructor (`our_flags` is the capability set this node
     /// advertises — [`preferred_flags`] unless a `*_with_flags` constructor
-    /// overrides it).
+    /// overrides it; `decide` is the server-role accept policy, `None` for the
+    /// always-`"ok"` default).
     fn new(
         role: Role,
         phase: HandshakePhase,
@@ -417,6 +468,7 @@ impl ConnectionDriver {
         creation: u32,
         our_challenge: u32,
         our_flags: DistFlags,
+        decide: Option<Box<dyn Fn(&Name) -> AcceptDecision + Send + Sync>>,
     ) -> ConnectionDriver {
         ConnectionDriver {
             role,
@@ -433,6 +485,7 @@ impl ConnectionDriver {
             hs_negotiated: DistFlags::EMPTY,
             hs_peer_creation: 0,
             hs_peer_name: Vec::new(),
+            decide,
             input: Vec::new(),
             output: Vec::new(),
             eof: false,
@@ -816,6 +869,20 @@ impl ConnectionDriver {
                         return Err(refusal);
                     }
                 };
+                // The local accept policy, consulted only after the mandatory check
+                // (a real node runs `check_dflags` first, `dist_util.erl:286`). A
+                // refusal is buffered into `output` *before* this returns `Err`, so
+                // the framed status still reaches the peer through `take_output` —
+                // exactly the `not_allowed` branch above.
+                let decision = match &self.decide {
+                    Some(decide) => decide(&name),
+                    None => AcceptDecision::Ok,
+                };
+                if let AcceptDecision::Refuse(status) = decision {
+                    let body = encode_handshake_body(|w| status.encode(w))?;
+                    self.frame(HANDSHAKE_FRAMING, &body)?;
+                    return Err(status_error(&status));
+                }
                 self.hs_negotiated = negotiated;
                 self.hs_client_flags = name.flags;
                 self.hs_server_flags = self.our_flags;

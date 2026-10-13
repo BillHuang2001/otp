@@ -41,13 +41,15 @@ use beam_alloc::Heap;
 use beam_codec::{AtomEncoding, ATOM_CACHE_REF_EXT, SMALL_INTEGER_EXT, SMALL_TUPLE_EXT};
 use beam_common::BeamError;
 use beam_dist::connection::{
-    accept_server, connect_client, connect_to_node, Connection, TcpListener as DistListener,
-    TcpTransport, CLIENT_CREATION,
+    accept_server, accept_server_with_decision, connect_client, connect_to_node, Connection,
+    TcpListener as DistListener, TcpTransport, CLIENT_CREATION,
 };
 use beam_dist::dist_header::{DistHeader, DIST_FRAG_HEADER, DIST_HEADER};
 use beam_dist::flags::{DistFlags, Dop, DFLAG_PUBLISHED};
 use beam_dist::fragment::DIST_FRAGMENT_SIZE;
-use beam_dist::handshake::{publish_flag, Name, PeerVisibility, Status, StatusKind};
+use beam_dist::handshake::{
+    publish_flag, AcceptDecision, Name, PeerVisibility, Status, StatusKind,
+};
 use beam_dist::transport::{MemoryTransport, Read, Write};
 use beam_dist::{
     check_mandatory, preferred_flags, read_packet, write_packet, EpmdClient, PacketHeaderSize,
@@ -173,6 +175,15 @@ impl WireLog {
         self.0.lock().expect("wire log").push(bytes.to_vec());
     }
 
+    /// Whether the *exact* byte block `wanted` was recorded, i.e. one
+    /// `write_all`/`read_exact` carried exactly those bytes.
+    ///
+    /// [`beam_dist::framing::read_packet`]/`write_packet` transfer the length
+    /// prefix and the whole body as two separate calls, so a frame body is one
+    /// recorded block — which makes this an exact frame-body pin.
+    fn contains(&self, wanted: &[u8]) -> bool {
+        self.0.lock().expect("wire log").iter().any(|b| b.as_slice() == wanted)
+    }
     /// Whether any recorded block is a `'E'` fragment-header frame body
     /// (`VERSION_MAGIC + DIST_FRAG_HEADER`), i.e. an actual fragment was exchanged.
     fn saw_fragment_header(&self) -> bool {
@@ -1003,4 +1014,195 @@ fn an_epmd_error_reply_decodes_to_the_not_registered_path() {
     Port2Resp::Error.encode(&mut sink).expect("encode the failure reply");
     let mut client = EpmdClient::new(MemoryTransport::with_input(sink.into_written()));
     assert_eq!(client.port_please(b"nobody").expect("decode the reply"), Port2Resp::Error);
+}
+
+// ---------------------------------------------------------------------------
+// (k) The acceptor's accept policy (`accept_server_with_decision` /
+//     `Connection::server_with_decision`).
+//
+// The default acceptors proceed on every peer that passes the mandatory check —
+// `dist_util.erl:326`'s `send_status(HSData, ok)` — and a caller that owns a
+// net-kernel-style pending-connection registry can refuse one. A refusal is
+// notified to the peer *before* the error is returned (`dist_util.erl:286`,`:343`,
+// `:386`), so the peer reads a status frame instead of blocking for one that
+// never comes. Every test below is hermetic: a loopback socket, no `erl`.
+// ---------------------------------------------------------------------------
+
+/// Spawns an **acceptor that applies `decide`** over one accepted connection.
+fn spawn_deciding_server(
+    listener: TcpListener,
+    decide: impl FnOnce(&Name) -> AcceptDecision + Send + 'static,
+) -> ServerHandle {
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().map_err(BeamError::Io)?;
+        let mut transport = TcpTransport::from_stream(stream);
+        transport.set_read_timeout(Some(TEST_TIMEOUT))?;
+        Connection::server_with_decision(
+            transport,
+            SERVER_NAME,
+            COOKIE,
+            SERVER_CREATION,
+            preferred_flags(),
+            decide,
+        )
+    })
+}
+
+/// Connects to `addr`, runs the **client** handshake through a [`SpyTransport`]
+/// and returns the recorded read blocks alongside the outcome — so a test can pin
+/// the acceptor's status frame *and* observe the connection (or typed error) the
+/// client ended up with.
+fn spy_client_handshake(
+    addr: &SocketAddr,
+) -> (WireLog, beam_common::Result<Connection<SpyTransport>>) {
+    let reads = WireLog::new();
+    let mut transport = TcpTransport::connect(&addr.to_string()).expect("connect to server");
+    transport.set_read_timeout(Some(TEST_TIMEOUT)).expect("read timeout");
+    let spy = SpyTransport { inner: transport, reads: reads.clone(), writes: WireLog::new() };
+    let outcome = Connection::client(spy, CLIENT_NAME, COOKIE);
+    (reads, outcome)
+}
+
+#[test]
+fn the_default_acceptor_answers_exactly_ok_and_completes() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr = listener.local_addr().expect("local_addr");
+    let server = spawn_server(listener);
+
+    let (reads, outcome) = spy_client_handshake(&addr);
+    let client = outcome.expect("client handshake");
+    let server = joined(server);
+
+    // A spied client lets the test pin the acceptor's status frame, which is the
+    // only frame whose body is exactly `sok`.
+    assert!(reads.contains(b"sok"), "the default acceptor's status frame is exactly `sok`");
+    assert!(
+        !reads.contains(b"sok_simultaneous"),
+        "the default acceptor must not claim a simultaneous connect"
+    );
+    assert_eq!(client.peer_name(), SERVER_NAME);
+    assert_eq!(server.peer_name(), CLIENT_NAME);
+    assert_eq!(client.negotiated(), server.negotiated());
+}
+
+#[test]
+fn an_ok_accept_decision_is_byte_identical_to_the_default() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr = listener.local_addr().expect("local_addr");
+    let server = spawn_deciding_server(listener, |name| {
+        // The decision sees the peer's decoded `Name`, after the mandatory check.
+        assert_eq!(name.name, CLIENT_NAME, "the policy is consulted with the peer's Name");
+        assert_eq!(name.creation, CLIENT_CREATION);
+        AcceptDecision::Ok
+    });
+
+    let (reads, outcome) = spy_client_handshake(&addr);
+    let client = outcome.expect("client handshake");
+    let server = joined(server);
+
+    // `AcceptDecision::Ok` proceeds with the byte-identical `"ok"` status frame.
+    assert!(reads.contains(b"sok"), "an Ok decision answers exactly `sok`");
+    assert_eq!(server.peer_name(), CLIENT_NAME);
+    assert_eq!(client.peer_name(), SERVER_NAME);
+}
+
+#[test]
+fn a_refusing_accept_decision_notifies_the_peer_and_aborts_the_client() {
+    use std::io::ErrorKind;
+
+    // The statuses a real accepting node sends before dropping a peer it will not
+    // accept, and the `io::ErrorKind` the shared mapping gives the connecting side
+    // (`beam_dist::handshake::status_error`).
+    let cases = [
+        (Status::alive(), &b"salive"[..], ErrorKind::ConnectionAborted),
+        (Status::nok(), &b"snok"[..], ErrorKind::ConnectionRefused),
+    ];
+
+    for (status, wire, expected) in cases {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local_addr");
+
+        let refused = status.clone();
+        let server = spawn_deciding_server(listener, move |name| {
+            assert_eq!(name.name, CLIENT_NAME, "the policy sees the peer's Name");
+            AcceptDecision::Refuse(refused.clone())
+        });
+
+        let (reads, outcome) = spy_client_handshake(&addr);
+
+        // The connecting client surfaces the shared mapping's typed error...
+        match outcome {
+            Err(BeamError::Io(io)) => assert_eq!(io.kind(), expected, "refusal {status:?}"),
+            Err(other) => panic!("expected an Io error for {status:?}, got {other:?}"),
+            Ok(_) => panic!("a refused handshake must not produce a connection ({status:?})"),
+        }
+        // ...and the refusal really reached it — 2-byte-framed and flushed *before*
+        // the acceptor returned its error, so the peer never blocks.
+        assert!(reads.contains(wire), "the refusal body {wire:?} must reach the peer");
+        assert!(reads.contains(&[0, wire.len() as u8]), "the refusal is 2-byte length framed");
+        assert_eq!(
+            Status::decode(wire).expect("decode the refusal").kind(),
+            status.kind(),
+            "the wire text must classify as the refused status"
+        );
+
+        let outcome = server.join().expect("server thread");
+        match outcome {
+            Err(BeamError::Io(io)) => {
+                assert_eq!(io.kind(), expected, "the acceptor's own error for {status:?}")
+            }
+            Err(other) => panic!(
+                "the acceptor must refuse {status:?} with the shared Io mapping: {other:?}"
+            ),
+            Ok(_) => panic!("the acceptor must refuse {status:?}, not accept"),
+        }
+    }
+}
+
+#[test]
+fn a_peer_failing_the_mandatory_check_never_reaches_the_decision() {
+    // The mandatory check still runs first (`dist_util.erl:286`), so a `Name` whose
+    // flag word is empty is refused as `not_allowed` and the accept policy is *not*
+    // consulted — the ordering the seam promises.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let consulted = Arc::new(Mutex::new(false));
+    let consulted_in_server = consulted.clone();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().map_err(BeamError::Io)?;
+        let mut transport = TcpTransport::from_stream(stream);
+        transport.set_read_timeout(Some(TEST_TIMEOUT))?;
+        accept_server_with_decision(
+            &mut transport,
+            SERVER_NAME,
+            COOKIE,
+            SERVER_CREATION,
+            preferred_flags(),
+            move |_name| {
+                *consulted_in_server.lock().expect("consulted flag") = true;
+                AcceptDecision::Ok
+            },
+        )
+    });
+
+    let mut client = TcpTransport::connect(&addr.to_string()).expect("connect to server");
+    client.set_read_timeout(Some(TEST_TIMEOUT)).expect("read timeout");
+    send_handshake_body(
+        &mut client,
+        &encode_body(|w| {
+            Name { flags: DistFlags::EMPTY, creation: 0, name: CLIENT_NAME.to_vec() }.encode(w)
+        }),
+    );
+
+    let frame = read_packet(&mut client, PacketHeaderSize::Two)
+        .expect("the refused peer must receive a status frame, not block");
+    assert_eq!(frame, b"snot_allowed", "the mandatory check runs before the decision");
+
+    let outcome = server.join().expect("server thread");
+    assert!(matches!(outcome, Err(BeamError::BadArg)), "got {outcome:?}");
+    assert!(
+        !*consulted.lock().expect("consulted flag"),
+        "a peer that fails the mandatory check must never reach the accept policy"
+    );
 }

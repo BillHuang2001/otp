@@ -337,6 +337,19 @@ impl Status {
     pub fn nok() -> Status {
         Status::Error(STATUS_NOK.to_vec())
     }
+
+    /// The `"alive"` refusal: a real accepting node replies with it when it
+    /// believes a connection to the connecting node is already active
+    /// (`dist_util.erl:386`, `do_alive/1`); the connecting side then answers a
+    /// `"true"`/`"false"` liveness probe.
+    ///
+    /// `"alive"` has no dedicated variant — it is carried verbatim in
+    /// [`Status::Error`] (see [`Status::kind`], which classifies it
+    /// [`StatusKind::Alive`]) — so this constructor mirrors [`Status::not_allowed`]
+    /// and [`Status::nok`].
+    pub fn alive() -> Status {
+        Status::Error(STATUS_ALIVE.to_vec())
+    }
 }
 
 /// Maps a peer's non-`Ok` [`Status`] onto a typed [`BeamError`].
@@ -386,6 +399,42 @@ pub fn status_error(status: &Status) -> BeamError {
         io_kind,
         format!("distribution handshake ({kind:?}): {detail}"),
     ))
+}
+
+/// The accepting side's verdict on a peer's [`Name`].
+///
+/// This is the local accept policy seam: the default acceptors (the blocking
+/// [`crate::connection::accept_server`] and the non-blocking
+/// [`crate::driver::ConnectionDriver::server`]) proceed on every peer that passes
+/// the mandatory check — [`AcceptDecision::Ok`] — and a caller that owns a
+/// net-kernel-style pending-connection registry can refuse one.
+///
+/// Ground truth: `mark_pending/1` (`dist_util.erl:318-368`) selects between
+/// `ok`, `named`, `ok_simultaneous`, `nok` and `alive` from the `net_kernel`
+/// pending-connection registry. This crate has no such registry, so the seam
+/// covers the two outcomes a single handshake can act on: proceed (`ok`) or
+/// refuse with a status.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum AcceptDecision {
+    /// Proceed: answer `"ok"` and continue the handshake (`dist_util.erl:326`).
+    Ok,
+    /// Refuse: write `status` to the peer — 2-byte-framed and flushed, exactly
+    /// like the existing `"not_allowed"` refusal path — and then abort the
+    /// handshake by returning [`status_error`]`(&status)`.
+    ///
+    /// The statuses a real accepting node sends on this branch are
+    /// [`Status::nok`] (`"nok"`, `dist_util.erl:343`), [`Status::alive`]
+    /// (`"alive"`, `dist_util.erl:386`) and [`Status::not_allowed`]
+    /// (`"not_allowed"`, `dist_util.erl:286`); any other status is written
+    /// verbatim and mapped by [`status_error`].
+    Refuse(Status),
+}
+
+impl AcceptDecision {
+    /// Whether this decision proceeds with the handshake.
+    pub fn is_ok(&self) -> bool {
+        matches!(self, AcceptDecision::Ok)
+    }
 }
 
 /// The `'N'` challenge message.

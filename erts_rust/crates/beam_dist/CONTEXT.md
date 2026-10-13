@@ -138,6 +138,14 @@ frame+flush `Status::not_allowed()` (the exact 14 bytes `snot_allowed`) before r
 (`dist_util.erl:286`) — and driver handshake errors are terminal. `epmd` `not_registered` ->
 `BeamError::Io(NotFound)`, never a silent port `0`.
 
+**The acceptor can refuse** through the additive `AcceptDecision` seam (see Design Decisions and Known
+Issues): `accept_server_with_decision`, `Connection::server_with_decision` and
+`ConnectionDriver::server_with_decision` consult a caller-supplied policy with the peer's decoded `Name`
+after the mandatory check. `Ok` is the default and byte-unchanged; `Refuse(status)` writes that status
+(`nok`/`alive`/`not_allowed`) framed+flushed to the peer *before* returning `status_error(&status)`, on
+both the blocking and the non-blocking path. What is not modelled is the registry that *decides* — see
+the Known Issues entry.
+
 ## API Surface (FROZEN — dependents route here)
 Re-exported at the crate root and via `beam_dist::prelude::*` (see `src/lib.rs`/`src/prelude.rs`).
 
@@ -196,9 +204,14 @@ Crate constants: `DIST_VERSION: u16 = 6`, `DIST_VERSION_5: u16 = 5`, `EPMD_PORT:
   cookie, d)`. The concrete MD5 provider is [`crate::auth::Md5Digest`].
 - Status classification (a *value* type, not a new error enum): `enum StatusKind { Ok, Simultaneous,
   Named, Nok, NotAllowed, Alive, Other }`, `Status::kind()`,
-  `Status::error_kind() -> Option<StatusKind>` (the error kinds only), `Status::not_allowed()`/
-  `Status::nok()`, and the single shared `status_error(&Status) -> BeamError` mapping (used by both
-  `connection.rs` and `driver.rs`).
+  `Status::error_kind() -> Option<StatusKind>` (the error kinds only), the refusal constructors
+  `Status::not_allowed()`/`Status::nok()`/`Status::alive()` (`"not_allowed"`/`"nok"`/`"alive"`;
+  `"alive"` has no dedicated variant, so it is carried verbatim in `Status::Error`), and the single
+  shared `status_error(&Status) -> BeamError` mapping (used by both `connection.rs` and `driver.rs`).
+- The accept-policy seam type: `enum AcceptDecision { Ok, Refuse(Status) }` (+ `is_ok()`) — the
+  accepting side's verdict on a peer's `Name`. `Ok` proceeds with `"ok"`; `Refuse(status)` writes that
+  status to the peer and aborts with `status_error(&status)`. Ground truth `dist_util.erl:318-368`
+  (`mark_pending/1`).
 - Node visibility: `enum PeerVisibility { Normal, Hidden }`, `publish_type(flags: DistFlags) ->
   PeerVisibility` (reads `DFLAG_PUBLISHED`), `publish_flag(hidden: bool, published: bool) -> DistFlags`,
   `enum PublishKind { Normal, Hidden }` + `PublishKind::publish_flag(published) -> DistFlags`.
@@ -302,6 +315,13 @@ Decisions).
   `-> Result<Handshake>`, where `struct Handshake { client_flags, server_flags, negotiated,
   peer_creation, peer_name, peer_visibility, buffered }`. `pub const CLIENT_CREATION: u32 = 0` is the
   default client creation. `Connection::peer_visibility()` reads the negotiated peer visibility.
+- The accept-policy seam:
+  `accept_server_with_decision(t, our_name, cookie, creation, flags, decide: impl FnOnce(&Name) ->
+  AcceptDecision) -> Result<Handshake>` — the same accept sequence, consulting `decide(&name)` after
+  the mandatory check; `Refuse(status)` sends the status frame (via `send_refusal`) *before* returning
+  `status_error(&status)`. `accept_server`/`accept_server_with_flags` delegate with the private
+  `continue_handshake` (always `Ok`) — byte-identical to before. `Connection::server_with_decision(...)`
+  is the `Connection` constructor counterpart.
 - `connect_to_node(host, node_name, our_name, cookie) -> Result<Connection<TcpTransport>>` (+
   `connect_to_node_with_creation`) — `epmd::lookup_port` → `TcpTransport::connect` → `Connection::client`.
 - Established link (4-byte framing): `struct Connection<T: Transport>` —
@@ -346,6 +366,9 @@ Turns a decoded [`ControlMessage`] into its **semantic** delivery and routes it 
 runtime owns the socket and does the syscalls; the driver only parses/serializes.
 - `client(our_name, cookie, creation)` / `server(our_name, cookie, creation)` (+ `*_with_challenge` and
   the `*_with_flags(…, flags)` flag overrides), `is_client`.
+- `server_with_decision(our_name, cookie, creation, flags, decide: Box<dyn Fn(&Name) -> AcceptDecision
+  + Send + Sync>)` — the accept-policy seam; `server`/`server_with_flags` are the same constructor with
+  no policy (always `Ok`).
 - `feed(&[u8])` / `feed_eof()` — appends socket bytes / signals a clean EOF.
 - `step() -> Result<StepOutcome>` — makes all possible progress (incremental 2-byte handshake, then
   4-byte-framed established frames, tick replies, `'E'`/`'F'` reassembly); returns `WouldBlock` when
@@ -405,7 +428,8 @@ and derives the report from that observed state.
   - `tests/handshake.rs`/`framing.rs`/`control.rs`/`epmd.rs` — round-trips + byte-exact vectors +
     negatives; `control.rs` pins the wire tuple bytes (`DOP_SEND` args `[1,2]` ⇒ `[104,3,97,2,97,1,97,2]`)
     and proves `encode_control_cached` is byte-identical to `encode_control` with no cache and writes
-    `[82, index]` with one; `handshake.rs` covers `Status::kind`/`error_kind`/`status_error` and the
+    `[82, index]` with one; `handshake.rs` covers `Status::kind`/`error_kind`/`status_error`, the three
+    refusal constructors' exact wire texts (`snok`/`snot_allowed`/`salive`), `AcceptDecision`, and the
     `not_allowed` wire bytes; `epmd.rs` covers the admin (`DUMP`/`KILL`/`STOP`) codecs + the typed
     conflict accessors.
   - `tests/dop_roundtrip.rs` — the **exhaustive 30/30 opcode round-trip** (encode → decode →
@@ -425,7 +449,12 @@ and derives the report from that observed state.
     `New` ref per atom, `82 + index` payload, the peer resolves the names). A spy transport asserts
     `'E'` frames really crossed; the new `TcpListener` path is exercised (`accept` on a thread, plus a
     non-blocking `accept` → `WouldBlock`), and the typed `send_reg_send`/`send_link`/`send_exit`/
-    `send_monitor_p` helpers round-trip.
+    `send_monitor_p` helpers round-trip. The **accept policy** is pinned here too: the default acceptor's
+    status frame is byte-exactly `sok` (spied, and never `sok_simultaneous`); an `Ok` decision is
+    byte-identical and completes; a `Refuse` decision flushes its status frame (asserted as the exact
+    `salive`/`snok` body inside a 2-byte frame) before the client surfaces the shared
+    `Io(ConnectionAborted)`/`Io(ConnectionRefused)` mapping, and a `Name` failing the mandatory check
+    never reaches the decision.
   - `src/connection_tests.rs` — the same frame-read seam hermetically over `MemoryTransport`: a clean
     peer EOF at a frame boundary ⇒ `Io(UnexpectedEof)`, while a **truncated length prefix** and a
     **truncated body** both stay `BadArg` (boundary vs mid-frame, no real socket needed).
@@ -438,7 +467,11 @@ and derives the report from that observed state.
   - `tests/driver.rs` — the `ConnectionDriver`, hermetic: two drivers shuttling `take_output()` bytes
     (whole-buffer **and** byte-at-a-time), negotiated flags/peer names, an atom-cache round trip
     (`New` then `Cached`), the exact empty header `131,68,0`, a >`DIST_FRAGMENT_SIZE` message both ways
-    (`'E'` verified), a tick answered, and malformed/truncated/EOF/send-before-established errors.
+    (`'E'` verified), a tick answered, and malformed/truncated/EOF/send-before-established errors. The
+    **accept policy** is pinned too: the default server driver's first frame is the byte-exact `sok`;
+    an `Ok` decision is byte-identical to the default and drives a full handshake to completion; a
+    `Refuse` decision buffers exactly the 2-byte-framed `salive`/`snok` frame (no `Challenge` follows),
+    returns the shared `Io` kind and goes to `DriverState::Failed`.
   - `tests/live_interop.rs` (blocking) + `tests/live_driver.rs` (non-blocking) + `tests/live_accept.rs`
     (server side) — **live interop with a real `erl` node.** Each starts `erl -sname <uniq> -setcookie
     <c> -kernel inet_dist_listen_min P inet_dist_listen_max P` (P a free loopback port), resolves P
@@ -520,6 +553,18 @@ and derives the report from that observed state.
   (`epmd_port.c`), but `epmd` writes every *reply* body straight to the socket with no length prefix
   (`epmd_srv.c` `reply()`); the client reads it unframed/self-delimiting — by tag for `'y'`/`'v'`/`'w'`,
   and "read until the transport goes quiet" for the open-ended `NAMES_RESP` line list.
+- **The accept policy was added as an additive, defaulted seam — never a signature change.**
+  `AcceptDecision` (`Ok` | `Refuse(Status)`) plus three new entry points
+  (`accept_server_with_decision`, `Connection::server_with_decision`,
+  `ConnectionDriver::server_with_decision`) leave every existing function's type and behaviour intact:
+  `accept_server`/`accept_server_with_flags`/`Connection::server*` pass the private always-`Ok`
+  `continue_handshake`, and `ConnectionDriver::server*` store `None`, so the default status frame stays
+  the byte-identical `131`-free 2-byte-framed `sok`. The consultation happens **after**
+  `check_mandatory` (a real node runs `check_dflags` first, `dist_util.erl:286`) and a refusal reuses the
+  existing `send_refusal`/`frame` notification path, so it cannot leave the peer hanging. The blocking
+  seam takes `impl FnOnce(&Name)` and the driver a `Box<dyn Fn(&Name) … + Send + Sync>`: the driver is a
+  reusable state machine consulted once per connection, so it needs a shared (`Fn`) policy, which must be
+  boxed to keep `ConnectionDriver` a single concrete type.
 - **There is ONE status→error mapping, shared.** `handshake::status_error(&Status)` is the single
   source; `connection.rs` and `driver.rs` both delegate to it (their private duplicates were deleted).
   It returns `BeamError` values backed by `std::io::ErrorKind` — no new `BeamError` variant and no
@@ -598,13 +643,18 @@ and derives the report from that observed state.
   also carries no peer/connection identity, so an `InboundSink` cannot enforce the `dep` check without
   out-of-band context — a peer may name a `from`/`watcher` pid belonging to a *different* node and it is
   classified without complaint.
-- **The server always replies `Status::Ok`; there is no `alive`/`ok_simultaneous`/`named:` path.**
-  `connection::accept_server_core` (`connection.rs:577`) and `driver::ConnectionDriver`'s `ServerAwaitName`
-  (`driver.rs:825`) unconditionally send `ok`. The oracle's `mark_pending` instead selects
-  `ok`/`named`/`ok_simultaneous`/`nok`/`alive` from a net_kernel-level pending-connection registry
-  (`dist_util.erl:318-368`), which this crate has no equivalent of; `Status` also exposes no
-  `alive()`/`simultaneous()`/`named()` constructors (only `not_allowed()`/`nok()`, `handshake.rs:331-339`).
-  A simultaneous-connect race or a reconnect-alive probe is therefore not answered as a real node would.
+- **The accept policy can refuse, but there is no net-kernel pending-connection registry.** Both
+  acceptors now consult an **opt-in, defaulted** `AcceptDecision` seam
+  (`accept_server_with_decision` / `Connection::server_with_decision` /
+  `ConnectionDriver::server_with_decision`): `AcceptDecision::Ok` — the default, byte-identical to the
+  previous behaviour — proceeds, and `AcceptDecision::Refuse(status)` writes that status
+  (`nok`/`alive`/`not_allowed`) to the peer, flushed, before aborting with `status_error(&status)`.
+  What is still missing is the *decision source*: the oracle's `mark_pending` (`dist_util.erl:318-368`)
+  selects `ok`/`named`/`ok_simultaneous`/`nok`/`alive` from a `net_kernel`-level pending-connection
+  registry, so a simultaneous-connect race or a reconnect-alive probe is only answered as a real node
+  would once a caller supplies such a policy. The seam also cannot *continue* on a non-`ok` status:
+  `named` (dynamic node names) and `ok_simultaneous` are continuations with no `AcceptDecision`
+  representation (and this crate has no dynamic-name support).
 - **Two independent server handshake implementations; only one is live-tested.** The blocking
   `connection::accept_server_core` and the non-blocking `driver::ConnectionDriver` server states each
   implement the accept handshake separately; `tests/live_accept.rs` drives only the driver against a real
@@ -654,7 +704,8 @@ and derives the report from that observed state.
   `epmd`; reach for the same trick whenever epmd behaviour must be tested in isolation.
 
 ## Routing Table
-- `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`, `DIST_VERSION`/`EPMD_PORT`
+- `src/lib.rs` → crate docs, module wiring, root re-exports (incl. `AcceptDecision` and
+  `accept_server_with_decision`), `prelude`, `DIST_VERSION`/`EPMD_PORT`
 - `src/flags.rs` → `DFLAG_*` + `DistFlags`, the `DOP_*` opcodes + `Dop`, flag sets, the in-term
   `DIST_SPAWN_FLAG_*`/`DOP_ALTACT_SIG_FLG_*` vocabularies + `DistSpawnFlags`/`AltactSigFlags`,
   handshake/epmd tags
@@ -664,8 +715,9 @@ and derives the report from that observed state.
   `read_length_or_eof`/`read_packet_or_eof`
 - `src/handshake.rs` → `Name`/`Status`/`Challenge`/`ChallengeReply`/`ChallengeAck`/`Complement`
   codecs, `preferred_flags`/`check_mandatory`, the `ChallengeDigest`/`ChallengeSource` seams,
-  `StatusKind`/`Status::kind`/`error_kind`/`status_error`, and `publish_flag`/`publish_type`/
-  `PublishKind`/`PeerVisibility`
+  `StatusKind`/`Status::kind`/`error_kind`/`status_error`, the refusal constructors
+  `Status::not_allowed()`/`nok()`/`alive()`, the `AcceptDecision` accept-policy type, and
+  `publish_flag`/`publish_type`/`PublishKind`/`PeerVisibility`
 - `src/auth.rs` → in-tree MD5, `gen_digest`/`verify`/`gen_challenge`, `Md5Digest`/`SystemChallengeSource`
 - `src/dist_header.rs` → the `'D'` header (`N`/`Flags`/`LongAtoms`/`AtomCacheRef`) + the `'E'`
   fragmented-header decode (`FragmentedHeader`)
@@ -678,7 +730,8 @@ and derives the report from that observed state.
   opcodes, incl. `SpawnRequest`/`SpawnReply`/`AltactSigSend`/`PayloadExit*`), `DeliveryOutcome`/
   `Dispatched`, the defaulted `InboundSink` seam + `UnsupportedSink` (routing lives in `beam_rt`)
 - `src/connection.rs` → `TcpTransport`/`TcpListener`, the handshake driver (client/server + creation,
-  plus the `connect_client_with_flags`/`accept_server_with_flags` overrides),
+  plus the `connect_client_with_flags`/`accept_server_with_flags` overrides and the
+  `accept_server_with_decision` accept-policy seam + `Connection::server_with_decision`),
   `connect_to_node` (epmd→TCP→handshake), `Connection` (owning the outbound atom cache) with
   `send_control`/`send_message`/`send_tick`/`recv`/`recv_delivery`/`dispatch_inbound` + the typed
   `send_reg_send`/`send_link`/`send_exit`/`send_monitor_p`/`send_demonitor_p` helpers, and the
@@ -688,7 +741,7 @@ and derives the report from that observed state.
   `#[cfg(test)] #[path] mod tests;` so `connection.rs` stays ~1000 lines)
 - `src/driver.rs` → the non-blocking `ConnectionDriver` poll/step state machine (`feed`/`step`/
   `take_output`/`next_message`/`next_delivery`/`dispatch_inbound`/`send_control`/`peer_visibility`) +
-  `DriverState`/`StepOutcome`
+  `DriverState`/`StepOutcome` + the `server_with_decision` accept-policy constructor
 - `src/epmd.rs` → `epmd` request/response codecs (incl. the `DUMP`/`KILL`/`STOP` admin set +
   `MAX_DUMP_RESP_BODY`), `EpmdClient` over `Transport` (`publish`/`port_please`/`names`/`dump`/`kill`/
   `stop`), and the real TCP client (`connect`, the address-taking `lookup_at`/`lookup_port_at`, and the

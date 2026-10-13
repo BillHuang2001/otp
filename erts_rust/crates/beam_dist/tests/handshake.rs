@@ -34,9 +34,9 @@ use beam_dist::flags::{
 };
 use beam_dist::handshake::{
     check_mandatory, preferred_flags, publish_flag, publish_type, status_error, verify_digest,
-    Challenge, ChallengeAck, ChallengeDigest, ChallengeReply, Complement, Name, PeerVisibility,
-    PublishKind, Status, StatusKind, CHALLENGE_ACK_TAG, CHALLENGE_REPLY_TAG, CHALLENGE_TAG,
-    COMPLEMENT_TAG, NAME_TAG, STATUS_TAG,
+    AcceptDecision, Challenge, ChallengeAck, ChallengeDigest, ChallengeReply, Complement, Name,
+    PeerVisibility, PublishKind, Status, StatusKind, CHALLENGE_ACK_TAG, CHALLENGE_REPLY_TAG,
+    CHALLENGE_TAG, COMPLEMENT_TAG, NAME_TAG, STATUS_TAG,
 };
 use beam_dist::transport::Write;
 
@@ -348,13 +348,42 @@ fn error_kind_is_none_only_for_the_continuing_statuses() {
 
 #[test]
 fn refusal_constructors_match_the_reference_texts() -> Result<()> {
-    // The two refusal texts a real accepting node sends (`dist_util.erl:286`/`:343`).
+    // The refusal texts a real accepting node sends (`dist_util.erl:286`/`:343`/`:386`).
     assert_eq!(body(|w| Status::nok().encode(w)), b"snok");
     assert_eq!(body(|w| Status::not_allowed().encode(w)), b"snot_allowed");
+    assert_eq!(body(|w| Status::alive().encode(w)), b"salive");
     assert_eq!(Status::nok().kind(), StatusKind::Nok);
     assert_eq!(Status::not_allowed().kind(), StatusKind::NotAllowed);
+    assert_eq!(Status::alive().kind(), StatusKind::Alive);
+    assert_eq!(Status::alive().error_kind(), Some(StatusKind::Alive));
     assert_eq!(Status::decode(b"snot_allowed")?, Status::not_allowed());
+    assert_eq!(Status::decode(b"salive")?, Status::alive());
+    // `"alive"` has no dedicated variant: it is carried verbatim in `Error`.
+    assert_eq!(Status::alive(), Status::Error(b"alive".to_vec()));
     Ok(())
+}
+
+#[test]
+fn accept_decision_distinguishes_proceeding_from_a_refusal() {
+    assert!(AcceptDecision::Ok.is_ok());
+    // `Ok` is the only decision that proceeds.
+    assert_eq!(AcceptDecision::Ok, AcceptDecision::Ok);
+
+    let refusal = AcceptDecision::Refuse(Status::alive());
+    assert!(!refusal.is_ok());
+    assert_eq!(refusal, AcceptDecision::Refuse(Status::Error(b"alive".to_vec())));
+    // The refusal's status maps through the shared status -> error mapping, so the
+    // peer observes exactly one `io::ErrorKind` whichever accept seam refused it.
+    if let AcceptDecision::Refuse(status) = &refusal {
+        match status_error(status) {
+            beam_common::BeamError::Io(io) => {
+                assert_eq!(io.kind(), std::io::ErrorKind::ConnectionAborted)
+            }
+            other => panic!("expected an Io error, got {other:?}"),
+        }
+    } else {
+        panic!("a `Refuse` decision must carry its status");
+    }
 }
 // ---------------------------------------------------------------------------
 // Negatives: wrong tag, truncation, empty body.

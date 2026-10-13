@@ -49,7 +49,7 @@ use beam_dist::dist_header::{AtomCacheRef, DistHeader, DIST_FRAG_HEADER, DIST_HE
 use beam_dist::driver::{ConnectionDriver, DriverState, StepOutcome};
 use beam_dist::flags::{DistFlags, Dop, DFLAG_FRAGMENTS, DFLAG_PUBLISHED};
 use beam_dist::fragment::DIST_FRAGMENT_SIZE;
-use beam_dist::handshake::{publish_flag, status_error, PeerVisibility};
+use beam_dist::handshake::{publish_flag, status_error, AcceptDecision, PeerVisibility};
 use beam_dist::{
     check_mandatory, preferred_flags, write_packet, MemoryTransport, Name, PacketHeaderSize, Status,
     StatusKind,
@@ -90,11 +90,24 @@ fn establish_with(
     client_flags: DistFlags,
     server_flags: DistFlags,
 ) -> (ConnectionDriver, ConnectionDriver) {
-    let mut client =
+    let client =
         ConnectionDriver::client_with_flags(CLIENT_NAME, COOKIE, CLIENT_CREATION, client_flags);
-    let mut server =
+    let server =
         ConnectionDriver::server_with_flags(SERVER_NAME, COOKIE, SERVER_CREATION, server_flags);
+    drive_to_established(client, server, mode)
+}
 
+/// Shuttles a client and a server driver against each other until both are
+/// established, feeding each side's `take_output` bytes by hand.
+///
+/// This is the shared driver against which a *pre-built* server driver (e.g. one
+/// constructed with an accept policy) can be exercised without duplicating the
+/// loop.
+fn drive_to_established(
+    mut client: ConnectionDriver,
+    mut server: ConnectionDriver,
+    mode: Mode,
+) -> (ConnectionDriver, ConnectionDriver) {
     for _ in 0..100_000 {
         let client_out = client.take_output();
         let server_out = server.take_output();
@@ -620,4 +633,161 @@ fn a_driver_client_truncated_status_frame_ends_failed_at_eof_not_wouldblock() {
     assert!(matches!(err, BeamError::BadArg), "got {err:?}");
     assert_eq!(client.state(), DriverState::Failed);
     assert_eq!(client.step().expect("step after failure"), StepOutcome::Failed);
+}
+
+// ---------------------------------------------------------------------------
+// (g) The acceptor's accept policy (`ConnectionDriver::server_with_decision`).
+//
+// The default server driver proceeds on every peer that passes the mandatory
+// check — `dist_util.erl:326`'s `send_status(HSData, ok)` — and a caller that owns
+// a net-kernel-style pending-connection registry can refuse one. A refusal is
+// buffered into `take_output` *before* `step` returns the error, so the peer reads
+// a status frame instead of blocking for one that never comes.
+// ---------------------------------------------------------------------------
+
+/// The exact 2-byte-framed `"ok"` status frame (`dist_util.erl:326`).
+const OK_FRAME: &[u8] = &[0, 3, b's', b'o', b'k'];
+
+#[test]
+fn a_default_server_driver_answers_exactly_ok() {
+    let mut server = ConnectionDriver::server(SERVER_NAME, COOKIE, SERVER_CREATION);
+    server.feed(&frame_handshake(&name_body(preferred_flags())));
+    assert_eq!(server.step().expect("the acceptor proceeds"), StepOutcome::Handshaking);
+
+    // The acceptor's *first* framed message is the status frame; the `Challenge`
+    // follows it in the same output buffer.
+    let out = server.take_output();
+    assert!(out.len() > OK_FRAME.len(), "the status frame is followed by the challenge");
+    assert_eq!(&out[..OK_FRAME.len()], OK_FRAME, "the default acceptor answers exactly `sok`");
+    // The status body's length prefix is `3` — `sok`, never `sok_simultaneous`
+    // (whose body would be 16 bytes) and never a refusal.
+    assert_eq!(&out[..2], &[0, 3]);
+    assert_eq!(server.state(), DriverState::Handshaking);
+}
+
+#[test]
+fn an_ok_accept_decision_is_byte_identical_to_the_default() {
+    let name_frame = frame_handshake(&name_body(preferred_flags()));
+
+    let mut default_server = ConnectionDriver::server(SERVER_NAME, COOKIE, SERVER_CREATION);
+    default_server.feed(&name_frame);
+    default_server.step().expect("the default acceptor proceeds");
+    let default_out = default_server.take_output();
+
+    let mut decided_server = ConnectionDriver::server_with_decision(
+        SERVER_NAME,
+        COOKIE,
+        SERVER_CREATION,
+        preferred_flags(),
+        Box::new(|name| {
+            // The policy is consulted with the peer's decoded `Name`.
+            assert_eq!(name.name, CLIENT_NAME, "the decision sees the peer's Name");
+            assert_eq!(name.creation, 0, "the creation `name_body` puts on the wire");
+            AcceptDecision::Ok
+        }),
+    );
+    decided_server.feed(&name_frame);
+    decided_server.step().expect("the deciding acceptor proceeds");
+    let decided_out = decided_server.take_output();
+
+    // `Ok` proceeds with the identical status frame. (The `Challenge` that follows
+    // it carries a fresh random nonce, so only the status frame can be compared.)
+    assert_eq!(&default_out[..OK_FRAME.len()], OK_FRAME);
+    assert_eq!(
+        &decided_out[..OK_FRAME.len()],
+        &default_out[..OK_FRAME.len()],
+        "an Ok decision must answer the byte-identical status frame"
+    );
+
+    // The same decision drives a full handshake to completion.
+    let (client, server) = drive_to_established(
+        ConnectionDriver::client(CLIENT_NAME, COOKIE, CLIENT_CREATION),
+        ConnectionDriver::server_with_decision(
+            SERVER_NAME,
+            COOKIE,
+            SERVER_CREATION,
+            preferred_flags(),
+            Box::new(|_name| AcceptDecision::Ok),
+        ),
+        Mode::Whole,
+    );
+    assert_eq!(client.state(), DriverState::Established);
+    assert_eq!(server.state(), DriverState::Established);
+    assert_eq!(server.peer_name(), Some(CLIENT_NAME));
+    assert_eq!(client.peer_name(), Some(SERVER_NAME));
+}
+
+#[test]
+fn a_refusing_server_driver_buffers_the_status_before_failing() {
+    use std::io::ErrorKind;
+
+    let cases: [(Status, &[u8], ErrorKind, StatusKind); 2] = [
+        (Status::alive(), b"salive", ErrorKind::ConnectionAborted, StatusKind::Alive),
+        (Status::nok(), b"snok", ErrorKind::ConnectionRefused, StatusKind::Nok),
+    ];
+
+    for (status, wire, expected, kind) in cases {
+        let refused = status.clone();
+        let mut server = ConnectionDriver::server_with_decision(
+            SERVER_NAME,
+            COOKIE,
+            SERVER_CREATION,
+            preferred_flags(),
+            Box::new(move |name| {
+                assert_eq!(name.name, CLIENT_NAME, "the policy sees the peer's Name");
+                AcceptDecision::Refuse(refused.clone())
+            }),
+        );
+
+        server.feed(&frame_handshake(&name_body(preferred_flags())));
+        let err = server.step().expect_err("a refusal must fail the acceptor");
+
+        // The typed error is exactly the shared mapping's.
+        match status_error(&status) {
+            BeamError::Io(io) => assert_eq!(io.kind(), expected, "shared mapping for {status:?}"),
+            other => panic!("the shared mapping must be an Io error, got {other:?}"),
+        }
+        match err {
+            BeamError::Io(io) => assert_eq!(io.kind(), expected, "driver refusal {status:?}"),
+            other => panic!("the driver must return an Io error for {status:?}, got {other:?}"),
+        }
+        assert_eq!(server.state(), DriverState::Failed, "a refusal is terminal ({status:?})");
+
+        // The refusal was buffered *before* `step` returned the error, so it
+        // survives into `take_output`: a 2-byte-framed status, nothing else.
+        let out = server.take_output();
+        assert_eq!(out.len(), 2 + wire.len(), "only the refusal frame is emitted");
+        assert_eq!(&out[..2], &[0, wire.len() as u8], "the status body is {}", wire.len());
+        assert_eq!(&out[2..], wire, "the wire text of the refusal");
+        let decoded = Status::decode(&out[2..]).expect("decode the buffered refusal");
+        assert_eq!(decoded.kind(), kind, "the refusal wire text classifies as {kind:?}");
+        assert_eq!(decoded.error_kind(), Some(kind));
+
+        // A refused link is terminal: it stays failed and never resumes.
+        assert_eq!(server.step().expect("step after failure"), StepOutcome::Failed);
+        assert_eq!(server.state(), DriverState::Failed);
+    }
+}
+
+#[test]
+fn a_refusing_server_driver_never_emits_a_challenge() {
+    // A `Refuse` decision must short-circuit the accept sequence *before* the
+    // status/challenge pair a proceeding acceptor sends — the peer gets the refusal
+    // frame and nothing else.
+    let mut server = ConnectionDriver::server_with_decision(
+        SERVER_NAME,
+        COOKIE,
+        SERVER_CREATION,
+        preferred_flags(),
+        Box::new(|_name| AcceptDecision::Refuse(Status::alive())),
+    );
+    server.feed(&frame_handshake(&name_body(preferred_flags())));
+    server.step().expect_err("the acceptor refuses");
+
+    let out = server.take_output();
+    assert_eq!(out, [0, 6, b's', b'a', b'l', b'i', b'v', b'e']);
+    // The `Challenge` frame is `'N'`-tagged (78); a refusal must not contain it.
+    assert!(!out.contains(&b'N'), "a refused peer receives no challenge");
+    assert_eq!(server.state(), DriverState::Failed);
+    assert_eq!(server.step().expect("step after failure"), StepOutcome::Failed);
 }
