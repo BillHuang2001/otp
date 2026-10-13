@@ -419,19 +419,25 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
 `'N'` handshake both ways. Every report prints **exactly one** deterministic, host-independent stdout
 line (no timestamps/addresses/ports) and exits `0`:
 
-| `<report>` | stdout (one line) |
+| `<report>` | exact stdout (one line; exit 0) |
 |---|---|
 | `ping` | `pong` iff both handshakes completed (else `pang`) |
-| `nodes` | the number of peers node A handshook with (`1`) |
-| `term` | `hex(VERSION_MAGIC ++ encode_term_body(received))` of the delivered `{1,2,3}` (`836803610161026103`) |
-| `nodeid` | the negotiated `DFLAG_*` word (`u64` hex) + A's peer name/creation/visibility |
-| `handshake` | a **pinned**, byte-exact transcript of the `'N'` handshake (both directions) |
-| `badcookie` | the refusal shape when the connector presents a wrong cookie (`server=`/`client=` error class + the tags that crossed) |
-| `frag` | a >[`DIST_FRAGMENT_SIZE`] payload round trip: received length + checksum + the count of `'E'`/`'F'` frames A really wrote |
-| `alias` | the decoded `DOP_ALIAS_SEND` fields |
-| `monitor` | the decoded `DOP_MONITOR_P` / `DOP_LINK` / `DOP_EXIT` fields |
-| `regsend_missing` | the local outcome of a `DOP_REG_SEND` to an unregistered name |
-| `utf8` | the uppercase hex ETF image of a non-Latin-1 atom that crossed the wire |
+| `nodes` | `1` (the number of peers node A handshook with) |
+| `term` | `836803610161026103` = `hex(VERSION_MAGIC ++ encode_term_body(received))` of the delivered `{1,2,3}` |
+| `nodeid` | `nodeid flags=6D07DF7FBC peer=beta@localhost creation=2 visibility=hidden` (negotiated `DFLAG_*` word hex + A's peer) |
+| `handshake` | `handshake flags=6D07DF7FBC client=001D4E0000006D07DF7FBC00000002000E62657461406C6F63616C686F7374001572600DF00D4EA14A42245C55671C6C25D9BC6C77F9 server=0003736F6B00224E0000006D07DF7FBC0BADC0DE00000001000F616C706861406C6F63616C686F7374001161725ACE098AC503DC07BEB5941CD244DE` |
+| `badcookie` | `badcookie server=badarg client=badarg sent=Nr received=sN` (the refusal shape on a wrong cookie) |
+| `frag` | `frag bytes=200000 sum=DC029F2D frames=4` (>[`DIST_FRAGMENT_SIZE`] round trip: length + FNV-1a checksum + real `'E'`/`'F'` frame count) |
+| `alias` | `alias from=1001 to=3003 msg=42` |
+| `monitor` | `monitor watcher=1001 watched=5005 ref=9001 link from=1001 to=5006 exit from=1001 to=5007 reason=3003` |
+| `regsend_missing` | `regsend target=missing outcome=nosuchprocess` |
+| `utf8` | `837702CEA9` (uppercase hex ETF image of the non-Latin-1 atom that crossed the wire) |
+
+The literal bytes of every mode are pinned by `tests/dist_probe_cli.rs` (exact stdout + exit `0` +
+empty stderr) and asserted byte-identical across repeated runs. The `handshake` hex is the raw
+2-byte-framed wire bytes of both directions with **pinned** challenge nonces; `frag`'s
+`frames=4` is one `'E'` + three `'F'` frames really written (the `Spy` transport fails loudly on fewer
+than two).
 
 - `ping`/`nodes`/`term` drive the mutual `{1,2,3}` round trip (A → B name-addressed as a `DOP_REG_SEND`,
   B echoes it to A's pid as a `DOP_SEND(_SENDER)`, A receives it) and derive their observable from it.
