@@ -33,7 +33,7 @@
 //! bare local call would keep running the `erlang:nif_error/1` stub):
 //!
 //! * `probe/1(Selector)` — the original entry: the C builds every term it needs with the public
-//!   `enif_*` constructors (selectors `1`..`83` — see the second widening below);
+//!   `enif_*` constructors (selectors `1`..`95` — see the second widening below);
 //! * `probe_term/2(Selector, Term)` — the term-driven entry: the C observes a term the module
 //!   built in Erlang (selectors `>= 100`), which the NIF C API cannot build itself — there is no
 //!   bitstring constructor, so a **non-byte-aligned bitstring** (and a window of one) can only be
@@ -139,6 +139,36 @@
 //! is identical either way, so the cases pin the byte size and the shifted bytes through
 //! `enif_inspect_binary` / `enif_make_sub_binary` rather than the internal offset.
 //!
+//! # The widened accessor / env / update block, pinned
+//!
+//! A third selector block (added after `83`) widens the *non-variadic* constructor and accessor
+//! surface the two entries already reach:
+//!
+//! * the **length-taking constructors** — `enif_make_atom_len` interns the same atom as the
+//!   NUL-terminated `enif_make_atom` (`84`), `enif_make_existing_atom_len` **refuses** a name the
+//!   atom table does not hold (`85`, a pure lookup on both sides) and `enif_make_string_len` builds
+//!   the list from exactly its length argument, so `"hello"` with length `3` reads back as `"hel"`
+//!   (`86`);
+//! * **`enif_make_copy` across environments** — a 2-tuple built in the call env and copied into a
+//!   fresh `enif_alloc_env` environment keeps its arity and both elements (`87`);
+//! * the **local identity accessors** — `enif_get_local_pid` round trips the pid `enif_make_pid`
+//!   writes for `enif_self` (`88`) and refuses a non-pid (`89`), `enif_get_local_port` refuses a
+//!   non-port (`90`);
+//! * the **negative predicate lattice** — `enif_is_ref`, `enif_is_fun` and `enif_is_port` all
+//!   refuse a 2-tuple (`91`), and `enif_is_exception` is `0` for an ordinary term with no raise
+//!   pending (`92`);
+//! * **`enif_make_map_update`** — an update-only sibling of `enif_make_map_put`: it refuses a key
+//!   the map does not hold (`93`) and replaces an existing value while keeping the size at `1`
+//!   (`94`);
+//! * the **thread handle** — `enif_equal_tids` holds for the tid `enif_thread_self` reports
+//!   (`95`).
+//!
+//! The term-driven block is widened in step (selectors `133`..`143`): the byte-shape rules the
+//! `101`..`132` block pins are extended to the empty binary, to binary **ordering** and
+//! self-identity, and to the remaining accepted iolist elements (`[0]`, `[255]`, `[<<>>]`,
+//! `[[],[]]`, nested numeric lists, a binary element followed by a byte) plus one
+//! `enif_make_sub_binary` window.
+//!
 //! # Skip policy (inherited from [`super::nif_so`])
 //!
 //! A C-compiled fixture needs a C compiler *and* the host `erl_nif.h`; when either is missing the
@@ -195,7 +225,18 @@ built_term(122) -> <<"abcdef">>;                  %% a zero-size sub-binary requ
 built_term(123) -> <<"abcdef">>;                  %% a zero-size request one past the last byte
 built_term(130) -> [16#61, 16#20AC];              %% the UTF-8 truncation boundary (fits)
 built_term(131) -> [16#61, 16#20AC];              %% the UTF-8 truncation boundary (one byte short)
-built_term(132) -> [16#20AC].                     %% a lone multibyte char
+built_term(132) -> [16#20AC];                     %% a lone multibyte char
+built_term(133) -> <<1:7>>;                       %% a non-byte-aligned bitstring
+built_term(134) -> <<>>;                          %% the empty bitstring
+built_term(135) -> <<1,2,3>>;                     %% an ordered-binary compare
+built_term(136) -> <<1,2,3>>;                     %% a self-compare
+built_term(137) -> [[1,2],[3,4]];                 %% nested numeric lists
+built_term(138) -> [<<"ab">>,99];                 %% a binary element then a byte
+built_term(139) -> [0];                           %% the zero byte
+built_term(140) -> [255];                         %% the highest byte
+built_term(141) -> [<<>>];                        %% a byte-less binary element
+built_term(142) -> [[],[]];                       %% two byte-less nested lists
+built_term(143) -> <<"abcd">>.                    %% a sub-binary window source
 
 %% A 40-byte window that starts five bits into `<<0,1,…,45>>` — a byte-sized bitstring with a
 %% non-zero bit offset, exactly the shape enif_inspect_binary used to refuse.
@@ -952,6 +993,115 @@ static ERL_NIF_TERM probe(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
         return enif_make_int(env, us == 1000000 ? 1 : 0);
     }
 
+    /* ------------------------------------------- atom / string constructors with a length (84..86) */
+    case 84: {                                 /* make_atom_len interns the same atom as make_atom */
+        return enif_make_int(env,
+            enif_is_identical(enif_make_atom_len(env, "hello", 5),
+                              enif_make_atom(env, "hello")) ? 1 : 0);
+    }
+    case 85: {                                 /* make_existing_atom_len refuses an absent name */
+        const char absent[] = "nif_extra_absent_atom_zz";
+        ERL_NIF_TERM atom = 0;
+        return enif_make_int(env,
+            enif_make_existing_atom_len(env, absent, sizeof(absent) - 1, &atom, ERL_NIF_LATIN1)
+                ? 0 : 1);
+    }
+    case 86: {                                 /* make_string_len writes only the first 3 bytes */
+        char buf[8];
+        int r;
+        memset(buf, 0x7F, sizeof(buf));
+        r = enif_get_string(env, enif_make_string_len(env, "hello", 3, ERL_NIF_LATIN1),
+                            buf, sizeof(buf), ERL_NIF_LATIN1);
+        return enif_make_int(env, (r == 4 && memcmp(buf, "hel", 4) == 0) ? 1 : 0);
+    }
+
+    /* -------------------------------------------------------- env copy across environments (87) */
+    case 87: {                                 /* make_copy into a fresh env keeps the shape */
+        ERL_NIF_TERM arr[2];
+        ERL_NIF_TERM copied;
+        ErlNifEnv* dst = enif_alloc_env();
+        int arity = -1, a0 = 0, a1 = 0, ok;
+        const ERL_NIF_TERM* got = NULL;
+        if (dst == NULL)
+            return enif_make_int(env, 0);
+        arr[0] = enif_make_int(env, 7);
+        arr[1] = enif_make_int(env, 8);
+        copied = enif_make_copy(dst, enif_make_tuple_from_array(env, arr, 2));
+        ok = enif_get_tuple(dst, copied, &arity, &got);
+        if (ok)
+            ok = enif_get_int(dst, got[0], &a0) && enif_get_int(dst, got[1], &a1);
+        enif_free_env(dst);
+        return enif_make_int(env, (ok && arity == 2 && a0 == 7 && a1 == 8) ? 1 : 0);
+    }
+
+    /* ---------------------------------------------------- local pid / port accessors (88..90) */
+    case 88: {                                 /* get_local_pid accepts the calling pid */
+        ErlNifPid pid, back;
+        ERL_NIF_TERM self;
+        if (enif_self(env, &pid) == NULL)
+            return enif_make_int(env, 0);
+        self = enif_make_pid(env, &pid);
+        if (!enif_get_local_pid(env, self, &back))
+            return enif_make_int(env, 0);
+        return enif_make_int(env, enif_is_identical(self, enif_make_pid(env, &back)) ? 1 : 0);
+    }
+    case 89: {                                 /* get_local_pid refuses a non-pid */
+        ErlNifPid pid;
+        return enif_make_int(env,
+            enif_get_local_pid(env, enif_make_atom(env, "not_a_pid"), &pid) ? 0 : 1);
+    }
+    case 90: {                                 /* get_local_port refuses a non-port */
+        ErlNifPort port;
+        return enif_make_int(env,
+            enif_get_local_port(env, enif_make_int(env, 1), &port) ? 0 : 1);
+    }
+
+    /* ------------------------------------------------------- negative predicate lattice (91..92) */
+    case 91: {                                 /* is_ref/is_fun/is_port all refuse a 2-tuple */
+        ERL_NIF_TERM arr[2];
+        ERL_NIF_TERM t;
+        arr[0] = enif_make_int(env, 1);
+        arr[1] = enif_make_int(env, 2);
+        t = enif_make_tuple_from_array(env, arr, 2);
+        return enif_make_int(env,
+            (!enif_is_ref(env, t) && !enif_is_fun(env, t) && !enif_is_port(env, t)) ? 1 : 0);
+    }
+    case 92: {                                 /* is_exception is false for an ordinary term */
+        return enif_make_int(env,
+            enif_is_exception(env, enif_make_int(env, 1)) ? 0 : 1);
+    }
+
+    /* --------------------------------------------------------------- map update, not put (93..94) */
+    case 93: {                                 /* make_map_update refuses an absent key */
+        ERL_NIF_TERM out;
+        return enif_make_int(env,
+            enif_make_map_update(env, enif_make_new_map(env), enif_make_atom(env, "k"),
+                                 enif_make_int(env, 1), &out) ? 0 : 1);
+    }
+    case 94: {                                 /* make_map_update replaces an existing value */
+        ERL_NIF_TERM m1, m2, v = 0;
+        size_t sz = 0;
+        int iv = 0;
+        if (!enif_make_map_put(env, enif_make_new_map(env), enif_make_atom(env, "k"),
+                               enif_make_int(env, 1), &m1))
+            return enif_make_int(env, 0);
+        if (!enif_make_map_update(env, m1, enif_make_atom(env, "k"), enif_make_int(env, 2), &m2))
+            return enif_make_int(env, 0);
+        if (!enif_get_map_size(env, m2, &sz) || sz != 1)
+            return enif_make_int(env, 0);
+        if (!enif_get_map_value(env, m2, enif_make_atom(env, "k"), &v))
+            return enif_make_int(env, 0);
+        if (!enif_get_int(env, v, &iv) || iv != 2)
+            return enif_make_int(env, 0);
+        return enif_make_int(env, 1);
+    }
+
+    /* ------------------------------------------------------------------------ tid equality (95) */
+    case 95: {                                 /* the calling thread's tid equals itself */
+        ErlNifTid tid = enif_thread_self();
+        return enif_make_int(env, enif_equal_tids(tid, tid) ? 1 : 0);
+    }
+
     default:
         break;
     }
@@ -1049,6 +1199,54 @@ static ERL_NIF_TERM probe_term(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
         if (r != -1 || buf[0] != '\0')
             return enif_make_int(env, -100);
         return enif_make_int(env, r);
+    }
+
+    /* ------------------------------------- the widened binary / iolist shape block (133..143) */
+    case 133:                                  /* a non-byte-aligned bitstring stays refused */
+        return enif_make_int(env, binary_view(env, term) == -1 ? 1 : 0);
+    case 134: {                                /* the empty binary is accepted with size 0 */
+        ErlNifBinary v;
+        if (!enif_inspect_binary(env, term, &v))
+            return enif_make_int(env, 0);
+        return enif_make_int(env, (v.size == 0 && enif_is_binary(env, term)) ? 1 : 0);
+    }
+    case 135: {                                /* a binary orders by byte value */
+        char higher[3] = {1, 2, 4};
+        return enif_make_int(env,
+            enif_compare(term, make_bytes(env, higher, 3)) == -1 ? 1 : 0);
+    }
+    case 136:                                  /* a binary is identical to, and weighs equal to, itself */
+        return enif_make_int(env,
+            (enif_is_identical(term, term) && enif_compare(term, term) == 0) ? 1 : 0);
+    case 137: {                                /* [[1,2],[3,4]] flattens to <<1,2,3,4>> */
+        unsigned long long sum = 0;
+        int n = iolist_shape(env, term, &sum);
+        /* 1*1 + 2*2 + 3*3 + 4*4 = 30 */
+        return enif_make_int(env, (n == 4 && sum == 30) ? 1 : 0);
+    }
+    case 138: {                                /* [<<"ab">>,99] flattens to <<97,98,99>> */
+        unsigned long long sum = 0;
+        int n = iolist_shape(env, term, &sum);
+        /* 1*97 + 2*98 + 3*99 = 590 */
+        return enif_make_int(env, (n == 3 && sum == 590) ? 1 : 0);
+    }
+    case 139: {                                /* the zero byte is an accepted iolist element */
+        unsigned long long sum = 0;
+        int n = iolist_shape(env, term, &sum);
+        return enif_make_int(env, (n == 1 && sum == 0) ? 1 : 0);
+    }
+    case 140: {                                /* 255 is the highest accepted byte */
+        unsigned long long sum = 0;
+        int n = iolist_shape(env, term, &sum);
+        return enif_make_int(env, (n == 1 && sum == 255) ? 1 : 0);
+    }
+    case 141:                                  /* [<<>>] is the accepted empty iolist */
+        return enif_make_int(env, iolist_is_empty(env, term));
+    case 142:                                  /* [[],[]] is the accepted empty iolist */
+        return enif_make_int(env, iolist_is_empty(env, term));
+    case 143: {                                /* enif_make_sub_binary windows <<"abcd">> */
+        size_t pos = 1, size = 2;
+        return enif_make_int64(env, (ErlNifSInt64) sub_binary_view(env, term, pos, size));
     }
 
     default:
@@ -1474,7 +1672,84 @@ pub(crate) fn group() -> Vec<Case> {
             &[83],
             "1",
         ),
-        // --- enif_inspect_iolist_as_binary: the C's positional shape rules ------------------
+        // --- atom / string constructors that take an explicit length -------------------------
+        case(
+            "nif_extra/atom_make_atom_len_matches_make_atom",
+            "enif_make_atom_len interns the same atom as the NUL-terminated enif_make_atom",
+            &[84],
+            "1",
+        ),
+        case(
+            "nif_extra/atom_make_existing_atom_len_refuses_absent_name",
+            "enif_make_existing_atom_len refuses a name the atom table does not hold",
+            &[85],
+            "1",
+        ),
+        case(
+            "nif_extra/string_make_string_len_writes_prefix_only",
+            "enif_make_string_len builds a list from exactly its length argument (\"hello\" len 3)",
+            &[86],
+            "1",
+        ),
+        // --- enif_make_copy across environments ----------------------------------------------
+        case(
+            "nif_extra/make_copy_tuple_into_fresh_env",
+            "enif_make_copy moves a 2-tuple into a fresh enif_alloc_env environment",
+            &[87],
+            "1",
+        ),
+        // --- local pid / port accessors -------------------------------------------------------
+        case(
+            "nif_extra/process_get_local_pid_of_self",
+            "enif_get_local_pid round trips the pid written by enif_make_pid(enif_self)",
+            &[88],
+            "1",
+        ),
+        case(
+            "nif_extra/process_get_local_pid_rejects_non_pid",
+            "enif_get_local_pid refuses a non-pid term",
+            &[89],
+            "1",
+        ),
+        case(
+            "nif_extra/process_get_local_port_rejects_non_port",
+            "enif_get_local_port refuses a non-port term",
+            &[90],
+            "1",
+        ),
+        // --- the negative predicate lattice ---------------------------------------------------
+        case(
+            "nif_extra/pred_is_ref_fun_port_false_for_tuple",
+            "enif_is_ref, enif_is_fun and enif_is_port all refuse a 2-tuple",
+            &[91],
+            "1",
+        ),
+        case(
+            "nif_extra/pred_is_exception_false_for_integer",
+            "enif_is_exception is 0 for an ordinary term with no raise pending",
+            &[92],
+            "1",
+        ),
+        // --- enif_make_map_update (update-only, never insert) ---------------------------------
+        case(
+            "nif_extra/map_make_map_update_refuses_absent_key",
+            "enif_make_map_update refuses a key the map does not hold",
+            &[93],
+            "1",
+        ),
+        case(
+            "nif_extra/map_make_map_update_replaces_existing_value",
+            "enif_make_map_update replaces an existing value and keeps the size at 1",
+            &[94],
+            "1",
+        ),
+        // --- the thread handle ----------------------------------------------------------------
+        case(
+            "nif_extra/thread_self_tid_equals_itself",
+            "enif_equal_tids holds for the tid enif_thread_self reports twice",
+            &[95],
+            "1",
+        ),        // --- enif_inspect_iolist_as_binary: the C's positional shape rules ------------------
         case(
             "nif_extra/iolist_refuses_bare_byte_integer",
             "enif_inspect_iolist_as_binary refuses a bare byte integer (a byte is only ever a cons head)",
@@ -1584,6 +1859,73 @@ pub(crate) fn group() -> Vec<Case> {
             "enif_get_string UTF-8 answers -1 when only the multibyte char is present and cannot fit",
             &[132],
             "-1",
+        ),
+        // --- the widened binary / iolist shape block -----------------------------------------
+        case(
+            "nif_extra/binary_inspect_refuses_non_byte_sized_bitstring_again",
+            "enif_inspect_binary still refuses a non-byte-aligned bitstring (<<1:7>>)",
+            &[133],
+            "1",
+        ),
+        case(
+            "nif_extra/binary_inspect_accepts_the_empty_binary",
+            "enif_inspect_binary accepts <<>> with size 0 and enif_is_binary true",
+            &[134],
+            "1",
+        ),
+        case(
+            "nif_extra/compare_three_byte_binaries_by_byte_value",
+            "enif_compare orders <<1,2,3>> before <<1,2,4>>",
+            &[135],
+            "1",
+        ),
+        case(
+            "nif_extra/identity_and_compare_of_a_binary_with_itself",
+            "a binary is enif_is_identical to itself and enif_compare ranks it equal",
+            &[136],
+            "1",
+        ),
+        case(
+            "nif_extra/iolist_nested_numeric_lists",
+            "enif_inspect_iolist_as_binary flattens [[1,2],[3,4]] to four bytes",
+            &[137],
+            "1",
+        ),
+        case(
+            "nif_extra/iolist_binary_element_then_byte",
+            "enif_inspect_iolist_as_binary flattens [<<\"ab\">>,99] to three bytes",
+            &[138],
+            "1",
+        ),
+        case(
+            "nif_extra/iolist_zero_byte_element",
+            "enif_inspect_iolist_as_binary accepts the [0] element",
+            &[139],
+            "1",
+        ),
+        case(
+            "nif_extra/iolist_highest_byte_element",
+            "enif_inspect_iolist_as_binary accepts [255] as a byte element",
+            &[140],
+            "1",
+        ),
+        case(
+            "nif_extra/iolist_element_is_an_empty_binary",
+            "enif_inspect_iolist_as_binary accepts [<<>>] as the empty byte string",
+            &[141],
+            "1",
+        ),
+        case(
+            "nif_extra/iolist_two_empty_nested_lists",
+            "enif_inspect_iolist_as_binary accepts [[],[]] as the empty byte string",
+            &[142],
+            "1",
+        ),
+        case(
+            "nif_extra/binary_sub_binary_window_of_four",
+            "enif_make_sub_binary windows <<\"abcd\">> at byte 1 for two bytes",
+            &[143],
+            "2000296",
         ),
     ]
 }
@@ -1719,6 +2061,22 @@ mod tests {
             "enif_is_map",
             "enif_make_pid",
             "enif_self",
+            "enif_make_atom_len",
+            "enif_make_existing_atom_len",
+            "enif_make_string_len",
+            "enif_make_copy",
+            "enif_alloc_env",
+            "enif_free_env",
+            "enif_get_local_pid",
+            "enif_get_local_port",
+            "enif_is_ref",
+            "enif_is_fun",
+            "enif_is_port",
+            "enif_is_exception",
+            "enif_is_binary",
+            "enif_make_map_update",
+            "enif_thread_self",
+            "enif_equal_tids",
         ] {
             assert!(
                 super::NIF_EXTRA_C.contains(symbol),
