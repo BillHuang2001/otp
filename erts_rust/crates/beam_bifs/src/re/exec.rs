@@ -107,6 +107,16 @@
 //!   `re:run(" ab", "\\b", [global])` would report `{1,0}` twice. The flattened
 //!   loop models that with a one-element lookahead ("suppress the next reported
 //!   match if it equals this one").
+//!
+//! # Why this file is long
+//!
+//! The matcher is one engine: the dispatch loop, the choice-point stack, the
+//! undo log and the capture slots share invariants (every opcode that writes a
+//! capture must log its undo, every backtrack must replay the log down to the
+//! choice point's recorded length), so the pieces cannot be read apart, and it
+//! is split into sub-concerns only where the seams are clean (the subject, the
+//! single-shot search, the `global` loop). The remainder of the file is its unit
+//! test suite, not further special cases.
 
 use std::collections::HashMap;
 

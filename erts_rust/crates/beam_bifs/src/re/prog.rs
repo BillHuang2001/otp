@@ -171,13 +171,10 @@ pub(crate) struct ProgFlags {
     /// The `unicode` option (the compiled pattern's element 3).
     pub unicode: bool,
     /// Whether the match must start at the subject start.
-    #[allow(dead_code)] // temporary: adopted by exec.rs when re:run/2,3 lands (next pass)
     pub anchored: bool,
     /// `firstline` — the match must start on the first line.
-    #[allow(dead_code)] // temporary: adopted by exec.rs when re:run/2,3 lands (next pass)
     pub firstline: bool,
     /// PCRE2's `PCRE2_HASCRORLF` — the pattern can explicitly match CR/LF.
-    #[allow(dead_code)] // temporary: adopted by exec.rs when re:run/2,3 lands (next pass)
     pub has_cr_or_lf: bool,
     /// The newline convention (`is_crlf_like` drives the compiled pattern's
     /// element 4).
@@ -188,10 +185,8 @@ pub(crate) struct ProgFlags {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Program {
     /// The instruction stream.
-    #[allow(dead_code)] // temporary: adopted by exec.rs when re:run/2,3 lands (next pass)
     pub insts: Vec<Inst>,
     /// The character-class table (`Class(id)` indexes into this).
-    #[allow(dead_code)] // temporary: adopted by exec.rs when re:run/2,3 lands (next pass)
     pub classes: Vec<Ranges>,
     /// The number of capturing groups (excluding the whole match).
     pub ncap: u32,
@@ -687,9 +682,13 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// The typed-gap constructor, re-exported so `mod.rs` need not depend on the
-/// concrete [`BeamError`] shape of a never-matching construct.
-#[allow(dead_code)] // temporary: adopted by exec.rs when re:run/2,3 lands (next pass)
+/// The typed-gap constructor for a never-matching construct.
+///
+/// Unused today: the only construct that could ask for it — an out-of-order
+/// repeat bound like `a{2,1}` — is already rejected by `syntax.rs`, so
+/// `emit_repeat` emits [`Inst::Fail`] directly. Kept as the single typed-gap
+/// constructor the code generator would use rather than deleted.
+#[allow(dead_code)] // kept: the never-matching code path it names is currently unreachable
 pub(crate) fn never_matches() -> BeamError {
     unsupported_bif()
 }

@@ -51,6 +51,15 @@
 //! executable and none on `$PATH`), or if the oracle cannot answer a case, the
 //! test prints a `SKIP:` line and returns **without failing** — the in-suite
 //! golden assertions remain the no-oracle evidence.
+//!
+//! # Why this file is long
+//!
+//! This is a **test data file**, not logic: each corpus is a flat table of case
+//! literals grown one area at a time (literals, classes, anchors, quantifiers,
+//! captures, options, Unicode, error inputs), each row a pattern plus its subject
+//! and options, all running through the one shared sweep driver. Splitting the
+//! corpus across files would scatter one table and make a duplicate or missing
+//! case harder to see, so it stays in one place.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};

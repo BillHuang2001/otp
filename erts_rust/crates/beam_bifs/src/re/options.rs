@@ -138,6 +138,12 @@ impl Newline {
     }
 
     /// The length of the newline sequence ending exactly at `pos`, if any.
+    ///
+    /// The look-behind counterpart of [`Newline::newline_len_at`]. Nothing calls
+    /// it today — every line-end assertion in `exec.rs` looks *forward* at the
+    /// newline that starts at the position — so it is kept as the pair of
+    /// [`Newline::ends_at`] rather than deleted.
+    #[allow(dead_code)] // no caller: the line-end assertions all look forward (`newline_len_at`)
     pub(crate) fn ends_at_len(self, codes: &[u32], pos: usize) -> Option<usize> {
         if pos == 0 {
             return None;

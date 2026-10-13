@@ -54,6 +54,14 @@
 //! `caseless` behaviour is exercised over here. A codepoint outside them folds
 //! to itself, so `caseless` over an exotic script compares exactly; that is a
 //! documented coverage limit, not a silently wrong match for the covered set.
+//!
+//! # Why this file is long
+//!
+//! The parser is one coherent state machine over the pattern's codepoints, and
+//! the `E_*` table above it is one list of PCRE2 diagnostics whose messages and
+//! byte positions are pinned exactly; splitting either would spread a single
+//! diagnostic table and a single cursor discipline across files. The length is
+//! that parser plus its `#[cfg(test)]` suite, not accumulated special cases.
 
 use crate::error::unsupported_bif;
 use crate::re::options::CompileFlags;
@@ -88,6 +96,10 @@ pub(crate) const E_DIGITS_MISSING: &str = "digits missing after \\x or in \\x{} 
 pub(crate) const E_HEX_NON_HEX: &str = "non-hex character in \\x{} (closing brace missing?)";
 pub(crate) const E_OCTAL_TOO_BIG: &str = "octal value is greater than \\377 in 8-bit non-UTF-8 mode";
 pub(crate) const E_UTF_DISABLED: &str = "using UTF is disabled by the application";
+/// The PCRE2 diagnostic for a POSIX class used outside `[...]`. Kept with the
+/// other `E_*` message strings: this parser recognises `[[:name:]]` only inside
+/// a class, so nothing raises this one today.
+#[allow(dead_code)] // no caller: `[[:name:]]` is only parsed inside a class
 pub(crate) const E_POSIX_OUTSIDE: &str = "POSIX named classes are supported only within a class";
 
 /// A compile failure: the PCRE2 message text plus the byte offset into the

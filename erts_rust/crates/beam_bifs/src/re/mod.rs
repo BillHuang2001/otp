@@ -33,10 +33,13 @@
 //! `export` option, the `{re_exported_pattern, HeaderBin, Pattern, Options,
 //! Payload}` form) is returned. `re:version/0`, `re:import/1` (the `export` form
 //! back into the `{re_pattern, …}` one, without recompiling) and `re:inspect/2`
-//! (`namelist` only) are implemented too. The remaining three keys (`run/2,3`,
-//! `internal_run/4`) still answer the typed `unsupported_bif` capability gap; the
-//! engine implementation fills those bodies in (and adds the sibling
-//! `exec`/`render` submodules) in a later stage.
+//! (`namelist` only) are implemented too, and so are the run-side keys
+//! (`run/2,3`, `internal_run/4`), whose bodies live in the [`run`] submodule and
+//! drive the [`exec`] matcher and the [`render`] capture renderer.
+//!
+//! Roughly half of this file is its in-module `#[cfg(test)]` suite, which pins
+//! the `compile`/`import`/`inspect` goldens; the implementation above it is a few
+//! hundred lines of option/pattern plumbing.
 
 use beam_common::{BeamError, Result};
 use beam_term::{atom_val, make_small, signed_value, Eterm, NIL};
@@ -47,29 +50,13 @@ use crate::context::BifContext;
 use crate::error::badarg;
 use crate::registry::BifRegistry;
 
-// Temporary: the run-side consumers of these modules (the `exec`/`render`
-// siblings adopted by `re:run/2,3`, `re:internal_run/4` and `re:inspect/2`) are
-// still placeholders, so the match-side half of each module is unreachable from
-// non-test code. The allow goes when those bodies land.
-#[allow(dead_code)]
+// The compile-side submodules, all live through `compile`/`import`/`inspect`
+// and (through `exec`/`render`, below) the run-side keys.
 mod options;
-// Temporary: see `options` above — `chars_equal`/`fold_key`/`E_POSIX_OUTSIDE`
-// are match-side and only exercised by the unit tests today.
-#[allow(dead_code)]
 mod syntax;
-// Temporary: see `options` above — `ProgFlags`/`Program`'s match-side fields and
-// the image reader's decode half are only reached from `re:inspect/2`/`re:import/1`
-// and the unit tests; the matcher still lands with `re:run/2,3` (next pass).
-#[allow(dead_code)]
 mod prog;
-// Temporary: see `options` above — the run-side consumers of the matcher
-// (`re:run/2,3` and `re:internal_run/4`) are still placeholders, so `exec` has
-// no non-test caller yet.
-#[allow(dead_code)]
+// The match-side submodules, live through the run-side BIF bodies in `run`.
 mod exec;
-// Temporary: `re:run/2,3` / `re:internal_run/4` are still placeholders, so the
-// renderer has no non-test caller yet.
-#[allow(dead_code)]
 mod render;
 
 // The run-side BIF bodies (`re:run/2,3`, `re:internal_run/4`).
