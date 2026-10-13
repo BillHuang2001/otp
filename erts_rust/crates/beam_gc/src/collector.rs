@@ -128,6 +128,12 @@ impl Collector {
     }
 
     /// Whether the nursery can no longer satisfy `need_words` more words.
+    ///
+    /// This reads the **current** (allocatable) space only — a [growth](Self::grow_nursery)
+    /// retires the space it replaced and nothing is ever allocated in a retired one, so the
+    /// current space is the correct one for an allocation-admission signal. A *collection*
+    /// must instead cover the whole chain, which is why [`collect`](Self::collect) compares
+    /// the mature's room against the chain-wide [`Nursery::used_words`].
     pub fn should_collect(&self, need_words: usize) -> bool {
         self.nursery.current().available_words() < need_words
     }
@@ -184,8 +190,11 @@ impl Collector {
 
     /// Runs a major (fullsweep) collection: evacuate young and mature into a fresh space.
     ///
-    /// The fresh space is sized up front from the heap policy, so the copy always fits and
-    /// the two from-spaces are never left half-forwarded. Should
+    /// The fresh space is sized up front so the copy always fits and the two from-spaces are
+    /// never left half-forwarded: the policy is asked for room for the **exact live set** the
+    /// fullsweep evacuates plus the **young heap's occupancy** (a whole nursery's worth of
+    /// promotion, the C `need_after`, `erl_gc.c:2072`) plus its reserve, so the next
+    /// collections can be minors again. Should
     /// [`max_heap_words`](HeapPolicy::max_heap_words) clamp that size below the live set,
     /// the typed heap exhaustion is returned *before* a single word is copied rather than
     /// mid-copy.
@@ -197,20 +206,33 @@ impl Collector {
         self.nursery.add_to_from_set(&mut from);
         from.add(&self.mature);
         // Size the fresh space from the **exact live word count** of the graph this
-        // fullsweep evacuates — the C `adjust_after_fullsweep`'s
-        // `need_after = (HEAP_TOP(p) - HEAP_START(p)) + need + …` (`erl_gc.c:2072`), never
-        // the pre-collection occupancy. A fullsweep-sized generational heap is *full* when
-        // the cadence fires (live data plus every promotion the minors since the last
-        // fullsweep made, all of it garbage by now), so feeding the policy the occupancy
-        // makes its `should_grow` fire on every fullsweep and the mature capacity creeps up
-        // one growth-table step per fullsweep, without bound, for a live set that never
-        // changes (see [`crate::live`]).
+        // fullsweep evacuates, plus the **young heap's occupancy** the C folds into the same
+        // `need_after` — the C `adjust_after_fullsweep`'s
+        // `need_after = (HEAP_TOP(p) - HEAP_START(p)) + need + …` (`erl_gc.c:2072`).
+        //
+        // The live term is deliberately *not* the pre-collection occupancy: a
+        // fullsweep-sized generational heap is *full* when the cadence fires (the live set
+        // plus every promotion the minors since the last fullsweep made, all of it garbage
+        // by now), so feeding the policy the **mature** occupancy makes its `should_grow`
+        // fire on every fullsweep and the mature capacity creeps up one growth-table step
+        // per fullsweep, without bound, for a live set that never changes (see
+        // [`crate::live`]).
+        //
+        // The young occupancy is a different quantity and *is* included: the fresh mature
+        // space has to be able to receive a whole nursery's worth of promotion after the
+        // fullsweep, otherwise the very next collection cannot be a minor and every
+        // collection escalates to a fullsweep — the generational cadence never runs. It is
+        // bounded by the nursery capacity, which [`HeapPolicy::young_after_collection`]
+        // keeps bounded, so including it still converges.
         let live = crate::live::live(&from, roots).words;
+        let young_occupancy = self.nursery.used_words();
         // Grow, shrink or keep the current mature capacity
         // (`HeapPolicy::mature_after_fullsweep`, the C `adjust_after_fullsweep`).
-        let size = self
-            .policy
-            .mature_after_fullsweep(self.mature.capacity_words(), live, 0);
+        let size = self.policy.mature_after_fullsweep(
+            self.mature.capacity_words(),
+            live,
+            young_occupancy,
+        );
         let alloc = self.nursery().current().allocator().clone();
         // Sized up front so the copy always fits — a collection never leaves the
         // from-space half-forwarded. With `live` exact, this is an exact fit test rather
