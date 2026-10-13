@@ -35,7 +35,7 @@
 //! | `erlang:start_timer/3,4` | [`crate::timers`] — deliver `{timeout, TRef, Msg}` |
 //! | `erlang:send_after/4` | [`crate::timers`] — deliver `Msg` |
 //! | `erlang:cancel_timer/2` | [`crate::timers`] — the `/1` answers under the option list |
-//! | `erlang:function_exported/3` | the [`CodeServer`](crate::CodeServer) + the BIF registry |
+//! | `erlang:function_exported/3` | the [`CodeServer`](crate::CodeServer)'s loaded exports + the **emulator builtins** (the declared `bif.tab` surface plus the `erlang`-namespace registry extras) |
 //! | `erlang:link/1`, `erlang:unlink/1` | [`beam_process::ProcessTable`]'s link set |
 //! | `erlang:dt_spread_tag/1`, `erlang:dt_restore_tag/1` | the oracle's boolean check (dynamic tracing is compiled out) |
 //! | `erlang:statistics/1` | `run_queue`; `run_queues`/`run_queue_lengths`/`run_queue_lengths_all`/`total_run_queue_lengths`/`total_run_queue_lengths_all` (the runtime's **one** real run queue, `beam_process`'s `Scheduler`); `wall_clock` (the process clock); `reductions`/`exact_reductions`/`context_switches` (the runtime's own cumulative counters); `runtime` (the long-lived `beam_io::cpu_time::RuntimeClock`); `io` (the port subsystem's byte counters); `garbage_collection` (the live processes' own `beam_gc` collector counters); `scheduler_wall_time`/`scheduler_wall_time_all` (`undefined`, never enabled) |
@@ -79,7 +79,8 @@
 //! runtime-native `erlang:send_after/3`.
 
 use beam_alloc::Heap;
-use beam_bifs::RuntimeHooks;
+use beam_bifs::bif_tab::BifTab;
+use beam_bifs::{BifRegistry, RuntimeHooks};
 use beam_common::{BeamError, ExitReason, Raise, Result};
 use beam_engine::terms;
 use beam_io::signal::{Disposition, Signal};
@@ -89,6 +90,7 @@ use beam_term::{AtomTable, Eterm};
 
 use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crate::error;
@@ -229,7 +231,8 @@ impl<'a> RuntimeHooksBridge<'a> {
         })
     }
 
-    /// `erlang:function_exported/3` — whether a **loaded** module exports `Function/Arity`.
+    /// `erlang:function_exported/3` — whether a **loaded** module exports `Function/Arity`
+    /// or `M:F/A` is an **emulator builtin**.
     ///
     /// Oracle-verified (OTP 29/`erts-17.1`): the module and the function must both be atoms
     /// and the arity a small integer (anything else is `badarg` — a negative arity is *not*
@@ -239,12 +242,16 @@ impl<'a> RuntimeHooksBridge<'a> {
     /// `erts_is_builtin`). It never **autoloads**: an unloaded module answers `false`.
     ///
     /// The loaded-module half is the [`CodeServer`](crate::CodeServer)'s real module set —
-    /// the 22 preloaded `.beam`s plus everything resolved on demand — and the built-in half
-    /// is the live `beam_bifs` [`registry`](crate::Runtime::registry), so the answer is
-    /// always about *this* runtime's real state (never a fabricated export). Like
-    /// `erlang:module_loaded/1`, a module this runtime has not loaded answers `false` where
-    /// the oracle — which boots a much larger module set — may answer `true`; that is a
-    /// module-load-state difference, not a wrong answer about a loaded module.
+    /// the 22 preloaded `.beam`s plus everything resolved on demand. The built-in half is
+    /// [`is_builtin`] — the emulator's own BIF table, **never** the whole
+    /// [`registry`](crate::Runtime::registry): that registry also carries the stdlib *fast
+    /// paths* (this runtime's implementations of real *Erlang* functions such as
+    /// `lists:map/2`), which are not builtins and must not be reported as exported by an
+    /// unloaded module. The answer is therefore always about *this* runtime's real state
+    /// (never a fabricated export). Like `erlang:module_loaded/1`, a module this runtime has
+    /// not loaded answers `false` where the oracle — which boots a much larger module set —
+    /// may answer `true`; that is a module-load-state difference, not a wrong answer about a
+    /// loaded module.
     ///
     /// # Errors
     ///
@@ -265,15 +272,17 @@ impl<'a> RuntimeHooksBridge<'a> {
         // A negative arity can never match an export or a built-in, so it answers `false`
         // (the oracle does the same — it is a valid small integer, not an error).
         let arity = u32::try_from(signed_value(arity_term)).unwrap_or(u32::MAX);
-        let exported = self
+        let exported = is_builtin(
+            declared_bif_tab(),
+            &self.runtime.registry,
+            module,
+            function,
+            arity,
+        ) || self
             .runtime
-            .registry
-            .contains(module, function, arity)
-            || self
-                .runtime
-                .code_server
-                .module(module)
-                .is_some_and(|loaded| module_exports(loaded, function, arity));
+            .code_server
+            .module(module)
+            .is_some_and(|loaded| module_exports(loaded, function, arity));
         let _ = heap;
         atom_term(atoms, if exported { "true" } else { "false" })
     }
@@ -1178,6 +1187,65 @@ fn local_pid(term: Eterm, what: &str) -> Result<Eterm> {
         ))),
         Err(_) => Err(BeamError::BadArg),
     }
+}
+
+/// The emulator's **declared** builtin roster (`erts/emulator/beam/bif.tab`), parsed once.
+///
+/// `bif.tab` is the source of truth for which `M:F/A` the emulator itself implements — the
+/// table `erts_is_builtin` consults (`erts/emulator/beam/bif.c:4409-4424`). It is read
+/// **once per OS process** (the file cannot change under a running runtime) and memoized in
+/// a [`OnceLock`], so a call never touches the filesystem.
+///
+/// `None` covers both the file being absent (a bare container with no OTP source tree
+/// above the crate — [`read_real_bif_tab`](beam_bifs::bif_tab::read_real_bif_tab) answers
+/// `None`) and the file being unparsable (corrupted source data, reported once on stderr).
+/// Either way [`is_builtin`] falls back to the `erlang`-namespace extras alone, so the
+/// predicate can only ever *under*-report builtin-ness — never claim it without evidence.
+pub(super) fn declared_bif_tab() -> Option<&'static BifTab> {
+    static CACHE: OnceLock<Option<BifTab>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let text = beam_bifs::bif_tab::read_real_bif_tab()?;
+            match BifTab::parse(&text) {
+                Ok(tab) => Some(tab),
+                Err(err) => {
+                    // A malformed `bif.tab` is a bug in the source data, not a runtime
+                    // failure, so it is reported rather than swallowed silently.
+                    eprintln!("beam_rt: cannot parse bif.tab: {err}");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// Whether `M:F/A` is an **emulator builtin** — the `erts_is_builtin` half of
+/// `erlang:function_exported/3` (`erts/emulator/beam/bif.c:4424`).
+///
+/// The emulator's builtin table is `bif.tab` **plus** the extra builtins it registers
+/// itself, which all live in the `erlang` module (`erlang:memory/0,1` here; this tree's
+/// `bif.tab` declares `pid_to_binary`/`ref_to_binary`/`port_to_binary` itself). Hence:
+///
+/// ```text
+/// declared(module, name, arity) || (module == "erlang" && registry contains it)
+/// ```
+///
+/// The `beam_bifs` registry is deliberately **not** the source of truth for any other
+/// module: it also carries the stdlib *fast paths* — this runtime's implementations of real
+/// *Erlang* functions such as `lists:map/2` — which `erts_is_builtin` does not know and
+/// which must not make an unloaded module look exported.
+///
+/// When `tab` is `None` (no readable `bif.tab`) the declared half is unavailable and only
+/// the `erlang`-namespace extras are honoured; see [`declared_bif_tab`].
+pub(super) fn is_builtin(
+    tab: Option<&BifTab>,
+    registry: &BifRegistry,
+    module: &str,
+    function: &str,
+    arity: u32,
+) -> bool {
+    let declared = tab.is_some_and(|tab| tab.contains(module, function, arity));
+    declared || (module == "erlang" && registry.contains(module, function, arity))
 }
 
 /// Whether the loaded `module` exports `function/arity`.

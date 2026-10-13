@@ -18,6 +18,7 @@
 //
 // %CopyrightEnd%
 
+use beam_bifs::bif_tab::BifTab;
 use beam_bifs::{AtomInterner, BifFn, BifRegistry, BytesSink, LocalFunIdentity, LocalNode};
 use beam_engine::RunOutcome;
 use beam_loader::Operand;
@@ -2323,6 +2324,262 @@ fn the_runtime_hooks_bridge_serves_the_timer_and_export_families() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// `erlang:function_exported/3`'s membership source.
+//
+// The C answer is `true` iff the module is **loaded and exports** `F/A` **or** `M:F/A` is
+// an **emulator builtin** (`erts/emulator/beam/bif.c:4409-4424`: `erts_find_function` then
+// `erts_is_builtin`). The builtin half is the *declared* `bif.tab` surface plus the extras
+// the emulator registers in the `erlang` module — **never** the whole `beam_bifs` registry,
+// which also carries this runtime's stdlib *fast paths* (implementations of real *Erlang*
+// functions). Oracle answers (system `erl`, OTP 29/`erts-17.1`):
+// `function_exported(erlang,memory,1)` `true`, `(erlang,system_info,1)` `true`,
+// `(erlang,nonexistent,1)` `false`, `(lists,member,2)` `true`,
+// `(mnesia,start,0)` `false` and `(string,chars,1)` `false`.
+// ---------------------------------------------------------------------------
+
+/// Prints a loud skip banner — a missing prerequisite is never a silent pass.
+fn skip_builtin_case(banner: &str, why: &str) {
+    eprintln!();
+    eprintln!("=============== beam_rt {banner} SKIPPED ===============");
+    eprintln!("{why}. NOT a pass.");
+    eprintln!("=========================================================");
+    eprintln!();
+}
+
+/// The parsed real `bif.tab`, or `None` after a **loud skip** line.
+///
+/// A bare container without an OTP source tree cannot answer the declared-builtin cases,
+/// so those tests skip visibly rather than passing.
+fn bif_tab_or_skip(banner: &str) -> Option<&'static BifTab> {
+    let tab = declared_bif_tab();
+    if tab.is_none() {
+        skip_builtin_case(
+            banner,
+            "erts/emulator/beam/bif.tab is not present in this checkout",
+        );
+    }
+    tab
+}
+
+/// A stdlib **fast path** (`lists:map/2`) is NOT a builtin: with `lists` unloaded the answer
+/// must be `false`. This is the regression test for the wrong-value bug (the registry holds
+/// 640 keys, 79 of them stdlib fast paths, so `BifRegistry::contains` alone answered `true`).
+#[test]
+fn function_exported_does_not_report_a_stdlib_fast_path_as_exported() {
+    let mut rt = runtime();
+    // The premise, pinned: `lists:map/2` really is a registered key of this runtime and
+    // `lists` really is not loaded, so the answer can only come from the builtin half.
+    assert!(
+        rt.registry.contains("lists", "map", 2),
+        "lists:map/2 is a registry fast path"
+    );
+    assert!(
+        rt.module("lists").is_none(),
+        "lists must not be loaded in an un-booted runtime"
+    );
+    let lists = rt.intern("lists");
+    let map = rt.intern("map");
+    let member = rt.intern("member");
+    let true_atom = rt.intern("true");
+    let false_atom = rt.intern("false");
+    // A declared `bif.tab` BIF of the same unloaded module still answers `true`; without a
+    // readable table that half of the case cannot be asserted (the skip line is already out).
+    let has_tab = bif_tab_or_skip("function_exported_does_not_report_a_stdlib_fast_path").is_some();
+    let mut ctx = RuntimeContext::new(&mut rt);
+
+    assert_eq!(
+        ctx.call_bif(
+            "erlang",
+            "function_exported",
+            3,
+            &[lists, map, make_small(2)]
+        )
+        .expect("function_exported(lists, map, 2)"),
+        false_atom,
+        "a stdlib fast path is not an emulator builtin"
+    );
+
+    if has_tab {
+        assert_eq!(
+            ctx.call_bif(
+                "erlang",
+                "function_exported",
+                3,
+                &[lists, member, make_small(2)]
+            )
+            .expect("function_exported(lists, member, 2)"),
+            true_atom,
+            "lists:member/2 is declared as a bif.tab BIF"
+        );
+    }
+}
+
+/// A **declared** `bif.tab` builtin answers `true` with the module unloaded; a name the
+/// table does not declare (and no loaded module exports) answers `false`.
+#[test]
+fn function_exported_reports_a_declared_bif_tab_builtin() {
+    let Some(_) = bif_tab_or_skip("function_exported_reports_a_declared_bif_tab_builtin") else {
+        return;
+    };
+    let mut rt = runtime();
+    assert!(
+        rt.module("erlang").is_none(),
+        "the un-booted runtime has no loaded `erlang` module, so the declared half decides"
+    );
+    let erlang = rt.intern("erlang");
+    let system_info = rt.intern("system_info");
+    let nonexistent = rt.intern("nonexistent");
+    let true_atom = rt.intern("true");
+    let false_atom = rt.intern("false");
+    let mut ctx = RuntimeContext::new(&mut rt);
+
+    assert_eq!(
+        ctx.call_bif(
+            "erlang",
+            "function_exported",
+            3,
+            &[erlang, system_info, make_small(1)]
+        )
+        .expect("function_exported(erlang, system_info, 1)"),
+        true_atom,
+        "erlang:system_info/1 is declared in bif.tab"
+    );
+    assert_eq!(
+        ctx.call_bif(
+            "erlang",
+            "function_exported",
+            3,
+            &[erlang, nonexistent, make_small(1)]
+        )
+        .expect("function_exported(erlang, nonexistent, 1)"),
+        false_atom,
+        "erlang:nonexistent/1 is neither declared nor registered"
+    );
+}
+
+/// The **undeclared** `erlang`-namespace extras are builtins too: `erlang:memory/1` is not
+/// in `bif.tab`, yet the emulator serves it and the oracle answers `true`.
+#[test]
+fn function_exported_reports_an_undeclared_erlang_builtin() {
+    let mut rt = runtime();
+    assert!(
+        rt.registry.contains("erlang", "memory", 1),
+        "erlang:memory/1 is registered in the `erlang` namespace"
+    );
+    assert!(
+        rt.module("erlang").is_none(),
+        "the un-booted runtime has no loaded `erlang` module"
+    );
+    // The premise, pinned against the real table when it is readable.
+    if let Some(tab) = bif_tab_or_skip("function_exported_reports_an_undeclared_erlang_builtin") {
+        assert!(
+            !tab.contains("erlang", "memory", 1),
+            "erlang:memory/1 must stay undeclared, or this test stops exercising the extras"
+        );
+    }
+    let erlang = rt.intern("erlang");
+    let memory = rt.intern("memory");
+    let true_atom = rt.intern("true");
+    let mut ctx = RuntimeContext::new(&mut rt);
+
+    assert_eq!(
+        ctx.call_bif(
+            "erlang",
+            "function_exported",
+            3,
+            &[erlang, memory, make_small(1)]
+        )
+        .expect("function_exported(erlang, memory, 1)"),
+        true_atom,
+        "the `erlang`-namespace extras are emulator builtins"
+    );
+}
+
+/// The predicate itself, exercised with an **absent** `bif.tab`: the declared half is
+/// unavailable, so a non-`erlang` registry key is never claimed as a builtin, while the
+/// `erlang`-namespace extras and the real table's declarations keep working.
+#[test]
+fn a_builtin_predicate_without_bif_tab_never_claims_a_foreign_builtin() {
+    let rt = runtime();
+    assert!(
+        rt.registry.contains("lists", "map", 2),
+        "lists:map/2 is a registry fast path"
+    );
+    // The absent-table fallback: no declared half, so a stdlib fast path is not a builtin…
+    assert!(
+        !is_builtin(None, &rt.registry, "lists", "map", 2),
+        "without bif.tab a non-`erlang` fast path must never be reported as a builtin"
+    );
+    // …the `erlang`-namespace extras are still honoured…
+    assert!(is_builtin(None, &rt.registry, "erlang", "memory", 1));
+    // …and an `erlang` key the registry does not hold is still `false`.
+    assert!(!is_builtin(None, &rt.registry, "erlang", "nonexistent", 1));
+    // The readable-table path honours both halves.
+    if let Some(tab) = declared_bif_tab() {
+        assert!(is_builtin(Some(tab), &rt.registry, "lists", "member", 2));
+        assert!(!is_builtin(Some(tab), &rt.registry, "lists", "map", 2));
+        assert!(is_builtin(Some(tab), &rt.registry, "erlang", "system_info", 1));
+    }
+}
+
+/// The loaded-export half still works: a module that really is loaded and exports `F/A`
+/// answers `true`, while an unloaded module (and an unknown function of a loaded one)
+/// answers `false`.
+#[test]
+fn function_exported_sees_a_loaded_modules_real_exports() {
+    let mut rt = runtime();
+    if let Err(error) = rt.code_server.add_system_paths() {
+        skip_builtin_case(
+            "function_exported_sees_a_loaded_modules_real_exports",
+            &format!("no system code path ({error})"),
+        );
+        return;
+    }
+    rt.load_code_module("lists").expect("stdlib lists loads");
+    let lists = rt.intern("lists");
+    let map = rt.intern("map");
+    let no_such = rt.intern("no_such_fun_xyz");
+    let mnesia = rt.intern("mnesia");
+    let start = rt.intern("start");
+    let true_atom = rt.intern("true");
+    let false_atom = rt.intern("false");
+    let mut ctx = RuntimeContext::new(&mut rt);
+
+    assert_eq!(
+        ctx.call_bif(
+            "erlang",
+            "function_exported",
+            3,
+            &[lists, map, make_small(2)]
+        )
+        .expect("function_exported(lists, map, 2)"),
+        true_atom,
+        "the loaded `lists` module really exports map/2"
+    );
+    assert_eq!(
+        ctx.call_bif(
+            "erlang",
+            "function_exported",
+            3,
+            &[lists, no_such, make_small(1)]
+        )
+        .expect("function_exported(lists, no_such_fun_xyz, 1)"),
+        false_atom,
+        "a function the loaded module does not export answers false"
+    );
+    assert_eq!(
+        ctx.call_bif(
+            "erlang",
+            "function_exported",
+            3,
+            &[mnesia, start, make_small(0)]
+        )
+        .expect("function_exported(mnesia, start, 0)"),
+        false_atom,
+        "an unloaded module answers false"
+    );
+}
 #[test]
 fn the_runtime_hooks_bridge_serves_the_dynamic_tag_and_statistics_arms() {
     // The dynamic-tracing tag pair `file:call/2` brackets every file-server round trip with
