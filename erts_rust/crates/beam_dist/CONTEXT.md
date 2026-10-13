@@ -820,8 +820,8 @@ line (no timestamps/addresses/ports) and exits `0`:
 - `tests/hermetic_epmd.rs` → test-local `epmd` registry stub (ALIVE2/PORT2/NAMES/STOP) + the crate
   client and the address-taking `lookup_at`/`lookup_port_at` hermetically + an `erl -epmd_port <stub>`
   oracle cross-check — no host `epmd`
-- `tests/dist_probe_cli.rs` → the `dist_probe` bin's CLI contract (exact stdout + exit 0 for the three
-  reports; exit 2 on a usage error), run via `env!("CARGO_BIN_EXE_dist_probe")`
+- `tests/dist_probe_cli.rs` → the `dist_probe` bin's CLI contract (exact stdout + exit 0 for every
+  report; byte-identity across runs; exit 2 on a usage error), run via `env!("CARGO_BIN_EXE_dist_probe")`
 - `../../../erts/emulator/beam/dist.h` · `dist.c` · `external.c` · `external.h` · `packet_parser.c` →
   authoritative flags/opcodes/header/framing/fragmentation (read-only)
 - `../../../erts/doc/guides/erl_dist_protocol.md` + `erl_ext_dist.md` → the wire guides (read-only)
