@@ -246,6 +246,14 @@ pub(crate) type StepHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, u32, u32
 /// successor word and the frame size a local `call_last` pops).
 pub(crate) type TailHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, i64, u32) -> i64;
 
+/// The `jit_deallocate`/`jit_deallocate_return` helpers' native signature (the block ABI
+/// plus the instruction's own `(func, pc)` and the frame size the checked pop must match).
+pub(crate) type FrameExitHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, u32, u32, u32) -> i64;
+
+/// The `jit_return` helper's native signature (the block ABI plus the instruction's own
+/// `(func, pc)`); a bare `return` pops nothing, so it carries no frame size.
+pub(crate) type ReturnHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, u32, u32) -> i64;
+
 /// The `jit_ext_call` helper's native signature (the block ABI plus the
 /// instruction's own `(func, pc)`, the `ImportRef` index, the [`EXT_CALL`]-family
 /// kind and — for `call_ext_last` — the frame size to pop).
@@ -797,5 +805,217 @@ pub(crate) extern "C" fn jit_tail_call(rt: *mut JitRuntime<'_>, target: i64, dea
             runtime.error = Some(err);
             ERROR
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The frame-discipline helpers: `deallocate` / `return` / `deallocate_return`
+// ---------------------------------------------------------------------------
+//
+// The three instructions that end a function body are the last per-level control
+// flow a `sum`-shaped non-tail recursion still pays a full `jit_step_one`
+// interpreter step for. None of them needs the interpreter: what a block cannot do
+// itself is address the call-frame stack and the Erlang stack (Rust-side `Machine`
+// state with no layout a block can compute), and that is exactly what these helpers
+// do — the interpreter's own calls, in the interpreter's own order, with the
+// interpreter's own frame-discipline primitive ([`Machine::pop_frame_checked`]).
+//
+// They are byte-for-byte the interpreter's arms:
+//
+// * `Instr::Deallocate(n)` — [`Machine::pop_frame_checked`], then `Step::Next`;
+// * `Instr::Return` — the *current* frame's continuation, i.e. the
+//   `deallocate`-less half of `Instr::DeallocateReturn`'s arm;
+// * `Instr::DeallocateReturn(n)` — the two in order.
+//
+// The continuation read is `Machine::continuation()`
+// (`src/machine/frames.rs`), mapped onto the block ABI exactly as the interpreter's
+// `return_step` maps it onto a [`Step`]: `Continuation::Halt` → [`HALT`] (the driver
+// yields `x(0)`, C's `$RETURN` on the bottom frame), an
+// `Continuation::Address { func, pc, context }` in the **current** module context →
+// that `(func, pc)` as the next block target, and one in another context → the
+// [`ENTER`] word plus the `(context, func, pc)` triple in [`JitRuntime::enter`] (a
+// cross-module `return`, which only the driver can perform). The A.8 trace event
+// `return_step` emits is deliberately not reproduced: a traced run refuses native
+// entry entirely ([`super::drive`]), so `Machine::trace_on` is `false` in every
+// block and the event could never be observed as missing.
+//
+// Every failure these helpers can produce is an `error::unsupported` **engine
+// diagnostic** (a `deallocate` operand that does not match the live frame, a
+// `return` with no live frame) — and the interpreter reaches those through
+// `Machine::step_instruction`, whose uncaught-raise funnel
+// ([`Machine::with_uncaught_frames`]) deliberately leaves a diagnostic frame-less. So
+// the helpers apply the same funnel for the run's **entry** context (`0`, where the
+// active module *is* the entry module) and leave a callee context for the driver,
+// exactly as `step_instruction` does; for today's diagnostics that is a no-op, and it
+// keeps the two paths identical if an error class ever widens.
+
+/// Record `err` in the runtime's error slot and answer [`ERROR`] — the one failure
+/// path of the three frame-discipline helpers.
+///
+/// The uncaught-raise funnel is applied for the run's **entry** context only, exactly
+/// as [`Machine::step_instruction`] applies it: in context `0` the active module *is*
+/// the run's entry module, so `func`/`pc` and that module name every live frame, while
+/// a raise inside a cross-module callee is left bare for the driver, which knows the
+/// true entry module.
+fn report_frame_error(
+    runtime: &mut JitRuntime<'_>,
+    func: u32,
+    pc: u32,
+    err: BeamError,
+) -> i64 {
+    // SAFETY: the caller passes the driver's live, exclusively borrowed `JitRuntime`
+    // reborrowed; `runtime.machine` is a non-null pointer to the driver's live
+    // `Machine`, and no other `&mut Machine` exists while the helper runs (the driver
+    // is blocked in the block call that reached us).
+    let machine = unsafe { &mut *runtime.machine };
+    let err = if machine.current_context() == 0 {
+        // SAFETY: `runtime.module` points at the `&Module` the driver is running,
+        // which outlives the loop; in context `0` that module is the run's entry
+        // module (see `step_instruction`).
+        let module = unsafe { &*runtime.module };
+        machine.with_uncaught_frames(err, Some(module), func, pc)
+    } else {
+        err
+    };
+    runtime.error = Some(err);
+    ERROR
+}
+
+/// Map a frame's continuation onto the block-return word, exactly as the
+/// interpreter's `return_step` maps it onto a [`Step`] (see the section docs).
+///
+/// An `Address` in the **current** module context is the successor's `(func, pc)`
+/// word — the driver looks it up in the active artifact's block table and enters it
+/// (including a **continuation sub-block** entry). An `Address` in **another**
+/// context is the [`ENTER`] word with the triple in [`JitRuntime::enter`]: the
+/// returning function's callers may live in another module (a cross-module
+/// `call_ext`), and only the driver owns the module-context registry.
+fn return_word(runtime: &mut JitRuntime<'_>, continuation: Continuation) -> i64 {
+    match continuation {
+        Continuation::Halt => HALT,
+        Continuation::Address {
+            func,
+            pc,
+            context,
+        } => {
+            // SAFETY: `runtime.machine` is a non-null pointer to the driver's live
+            // `Machine`; no other `&mut Machine` exists while the helper runs.
+            let machine = unsafe { &mut *runtime.machine };
+            if context == machine.current_context() {
+                encode_target(func, pc)
+            } else {
+                runtime.enter = Some((context, func, pc));
+                ENTER
+            }
+        }
+    }
+}
+
+/// The **`deallocate`** helper: pop the current frame with the interpreter's exact
+/// `Instr::Deallocate` semantics and hand the block the address to continue at.
+///
+/// `pop N` is [`Machine::pop_frame_checked`] — literally the call the interpreter's
+/// `Instr::Deallocate` arm makes — so a `Deallocate` operand that no longer matches
+/// the live frame reports the same typed error it produces. The whole instruction is
+/// one helper round-trip instead of a `jit_step_one` interpreter step.
+///
+/// This is the *non-terminating* member of the family: the interpreter's arm returns
+/// `Step::Next`, so the block continues in-block at `pc + 1` on success and leaves
+/// with [`ERROR`] otherwise. `pop_frame_checked` touches no x-register (it truncates
+/// `machine.stack` and drops a frame), so the block does **not** refill its cached
+/// registers after the call; it does re-publish the Y window on the continue arm when
+/// a later instruction of the block still accesses one — the pop *is* a frame change.
+pub(crate) extern "C" fn jit_deallocate(
+    rt: *mut JitRuntime<'_>,
+    func: u32,
+    pc: u32,
+    deallocate: u32,
+) -> i64 {
+    // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
+    // `JitRuntime` and never aliases it for the duration of the call; every pointer it
+    // holds points at an object the driver owns and keeps alive for the whole loop.
+    let runtime = unsafe { &mut *rt };
+    let popped = {
+        // SAFETY: `runtime.machine` is a non-null pointer to the driver's live
+        // `Machine`; no other `&mut Machine` exists while the helper runs.
+        let machine = unsafe { &mut *runtime.machine };
+        // The same position store `Machine::step_instruction` makes at entry.
+        machine.set_current_code(func, pc);
+        machine.pop_frame_checked(deallocate)
+    };
+    match popped {
+        Ok(()) => encode_target(func, pc + 1),
+        Err(err) => report_frame_error(runtime, func, pc, err),
+    }
+}
+
+/// The **`return`** helper: follow the current frame's continuation — the bare
+/// `Instr::Return`.
+///
+/// `Instr::Return` pops nothing (`Machine::return_step` only reads the frame's
+/// continuation), which is what distinguishes it from [`jit_deallocate_return`]; the
+/// two share [`return_word`], so the mapping onto the block ABI is the one definition.
+///
+/// `return` **always** transfers control (the interpreter's `return_step` returns
+/// `Done`/`Goto`/`Enter`, never `Next`), so the caller leaves the block with the
+/// helper's word in `rax` instead of continuing at `pc + 1`.
+pub(crate) extern "C" fn jit_return(rt: *mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
+    // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
+    // `JitRuntime` and never aliases it for the duration of the call; every pointer it
+    // holds points at an object the driver owns and keeps alive for the whole loop.
+    let runtime = unsafe { &mut *rt };
+    let continuation = {
+        // SAFETY: `runtime.machine` is a non-null pointer to the driver's live
+        // `Machine`; no other `&mut Machine` exists while the helper runs.
+        let machine = unsafe { &mut *runtime.machine };
+        // The same position store `Machine::step_instruction` makes at entry.
+        machine.set_current_code(func, pc);
+        machine.continuation()
+    };
+    match continuation {
+        Ok(continuation) => return_word(runtime, continuation),
+        Err(err) => report_frame_error(runtime, func, pc, err),
+    }
+}
+
+/// The **`deallocate_return`** helper: pop the current frame with the interpreter's
+/// exact `Instr::DeallocateReturn` semantics, then follow the (now current) caller
+/// frame's continuation — C's `deallocate_return`, one instruction in the loader's
+/// IR and one helper round-trip here.
+///
+/// This is the shape **every** real compiler-produced function body ends with (the
+/// loader fuses the adjacent `deallocate N; return` pair into
+/// `Instr::DeallocateReturn(N)`), so a `call`-heavy module pays it once per function
+/// exit on each tier. The two halves are the interpreter's, in the interpreter's
+/// order — [`Machine::pop_frame_checked`] first, so a mismatched operand raises from
+/// the live frame exactly as `Instr::Deallocate` does, then [`return_word`] — and the
+/// position the helper records is the fused instruction's own `(func, pc)`, which is
+/// what `step_instruction` records for `Instr::DeallocateReturn` (the emitter passes
+/// the `return`'s `pc` when it fuses a separate pair, which is the last instruction
+/// the interpreter would have recorded in that case).
+///
+/// Like [`jit_return`] it always transfers control, so the caller leaves the block
+/// with the helper's word in `rax`.
+pub(crate) extern "C" fn jit_deallocate_return(
+    rt: *mut JitRuntime<'_>,
+    func: u32,
+    pc: u32,
+    deallocate: u32,
+) -> i64 {
+    // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
+    // `JitRuntime` and never aliases it for the duration of the call; every pointer it
+    // holds points at an object the driver owns and keeps alive for the whole loop.
+    let runtime = unsafe { &mut *rt };
+    let outcome = {
+        // SAFETY: `runtime.machine` is a non-null pointer to the driver's live
+        // `Machine`; no other `&mut Machine` exists while the helper runs.
+        let machine = unsafe { &mut *runtime.machine };
+        // The same position store `Machine::step_instruction` makes at entry.
+        machine.set_current_code(func, pc);
+        machine.pop_frame_checked(deallocate).and_then(|()| machine.continuation())
+    };
+    match outcome {
+        Ok(continuation) => return_word(runtime, continuation),
+        Err(err) => report_frame_error(runtime, func, pc, err),
     }
 }

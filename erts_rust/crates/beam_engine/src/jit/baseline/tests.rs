@@ -30,8 +30,9 @@
 //! compiled real `.beam` live in the crate's `tests/` (`jit_real_module`, `jit_bench`).
 use super::emit::*;
 use super::runtime::{
-    jit_publish_y, jit_refresh_y, EXT_CALL, EXT_CALL_LAST, EXT_CALL_ONLY, RUNTIME_MACHINE_DISP,
-    RUNTIME_XREGS_DISP, RUNTIME_YBASE_DISP, RUNTIME_YEND_DISP,
+    jit_deallocate, jit_deallocate_return, jit_publish_y, jit_refresh_y, jit_return, EXT_CALL,
+    EXT_CALL_LAST, EXT_CALL_ONLY, RUNTIME_MACHINE_DISP, RUNTIME_XREGS_DISP, RUNTIME_YBASE_DISP,
+    RUNTIME_YEND_DISP,
 };
 use super::*;
 use crate::jit::emitter::Reg;
@@ -3750,6 +3751,186 @@ fn a_continuation_sub_block_executes_and_agrees_across_tiers() {
             }
             other => panic!("the continuation sub-block run did not return: {other:?}"),
         }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// the frame-discipline inliners: `deallocate` / `return` / `deallocate_return`
+//
+// The three instructions that end a function body are lowered natively instead of
+// paying a full `jit_step_one` interpreter step. Each makes one dedicated helper
+// round-trip (`jit_deallocate`/`jit_return`/`jit_deallocate_return`) that performs
+// only *this* instruction's `Machine` work — the interpreter's own
+// `Machine::pop_frame_checked` and `Machine::continuation()` calls — and hands the
+// outcome back as the block-ABI word the driver already decodes. The agreement
+// tests below pin the interpreter-identical outcome; the code probes pin that the
+// lowering is the dedicated helper (a deopt would carry `jit_step_one` instead).
+// ---------------------------------------------------------------------------
+
+/// A **separate** `deallocate N; return` pair (the hand-built shape — the loader
+/// fuses it into `Instr::DeallocateReturn`, but a synthetic module keeps both
+/// instructions) is lowered as **one** fused helper round-trip and returns the
+/// interpreter's value.
+#[test]
+fn a_separate_deallocate_return_pair_is_fused_and_agrees_across_tiers() {
+    let (module, name) = body_module(vec![
+        Instr::Label(Label(1)),
+        Instr::Label(Label(2)),
+        Instr::Allocate {
+            stack_need: beam_loader::HeapNeed::Words(0),
+            live: 0,
+        },
+        Instr::Move {
+            src: Operand::Integer(7),
+            dst: Operand::X(0),
+        },
+        Instr::Deallocate(0),
+        Instr::Return,
+    ]);
+
+    let labels = crate::interpreter::build_label_map(&module);
+    let function = compile_function(&module, &labels, 0).expect("f/0 compiles");
+    assert!(
+        code_contains_helper(&function, jit_deallocate_return as *const ()),
+        "the adjacent `deallocate 0; return` pair lowers as one fused helper round-trip"
+    );
+    assert!(
+        !code_contains_helper(&function, jit_deallocate as *const ()),
+        "the pair is fused, so no lone `deallocate` helper is emitted"
+    );
+
+    with_both_tiers(&module, name, |interpreter, baseline| {
+        assert_same_outcome(
+            "separate deallocate/return",
+            interpreter,
+            baseline,
+            &module.atom_table,
+        );
+        match interpreter {
+            Ok(RunOutcome::Returned(value)) => {
+                assert_eq!(*value, make_small(7), "the constant reached x(0)")
+            }
+            other => panic!("the frame-exit body did not return: {other:?}"),
+        }
+    });
+}
+
+/// The loader's fused superinstruction `Instr::DeallocateReturn(N)` — the shape every
+/// compiler-produced function body ends with — is lowered through the dedicated
+/// helper and returns the interpreter's value.
+#[test]
+fn the_fused_deallocate_return_lowers_and_agrees_across_tiers() {
+    let (module, name) = body_module(vec![
+        Instr::Label(Label(1)),
+        Instr::Label(Label(2)),
+        Instr::Allocate {
+            stack_need: beam_loader::HeapNeed::Words(0),
+            live: 0,
+        },
+        Instr::Move {
+            src: Operand::Integer(9),
+            dst: Operand::X(0),
+        },
+        Instr::DeallocateReturn(0),
+    ]);
+
+    let labels = crate::interpreter::build_label_map(&module);
+    let function = compile_function(&module, &labels, 0).expect("f/0 compiles");
+    assert!(
+        code_contains_helper(&function, jit_deallocate_return as *const ()),
+        "the fused superinstruction lowers through `jit_deallocate_return`"
+    );
+
+    with_both_tiers(&module, name, |interpreter, baseline| {
+        assert_same_outcome(
+            "fused deallocate_return",
+            interpreter,
+            baseline,
+            &module.atom_table,
+        );
+        match interpreter {
+            Ok(RunOutcome::Returned(value)) => {
+                assert_eq!(*value, make_small(9), "the constant reached x(0)")
+            }
+            other => panic!("the fused exit did not return: {other:?}"),
+        }
+    });
+}
+
+/// A `deallocate` operand that no longer matches the live frame is rejected by the
+/// tier's checked pop with the interpreter's **exact** typed error, and nothing is
+/// fabricated — the `jit_step_one` fallback the interpreter would take is gone, so
+/// the helper's own error is the only path.
+#[test]
+fn a_checked_pop_mismatch_is_rejected_identically_on_both_tiers() {
+    // A frame of exactly one Y slot; the `deallocate` operand claims two.
+    let (module, name) = body_module(vec![
+        Instr::Label(Label(1)),
+        Instr::Label(Label(2)),
+        Instr::Allocate {
+            stack_need: beam_loader::HeapNeed::Words(1),
+            live: 0,
+        },
+        Instr::Deallocate(2),
+        Instr::Return,
+    ]);
+
+    with_both_tiers(&module, name, |interpreter, baseline| {
+        assert!(
+            interpreter.is_err(),
+            "the interpreter's checked pop rejects the mismatch: {interpreter:?}"
+        );
+        assert!(
+            baseline.is_err(),
+            "the baseline tier's checked pop rejects the mismatch too: {baseline:?}"
+        );
+        assert_same_outcome(
+            "stale deallocate operand",
+            interpreter,
+            baseline,
+            &module.atom_table,
+        );
+        assert_eq!(
+            error_reason(interpreter.as_ref().expect_err("the pop raised")),
+            "unsupported_opcode: deallocate: frame size mismatch",
+            "the tier must report the interpreter's own checked-pop error"
+        );
+    });
+}
+
+/// A bare `return` with **no** `deallocate` (a frame-less function's exit) is lowered
+/// through `jit_return` and follows the bottom frame's `Continuation::Halt`, yielding
+/// `x(0)` on both tiers.
+#[test]
+fn a_return_on_the_bottom_frame_halts_identically_on_both_tiers() {
+    let (module, name) = body_module(vec![
+        Instr::Label(Label(1)),
+        Instr::Label(Label(2)),
+        Instr::Move {
+            src: Operand::Integer(5),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ]);
+
+    let labels = crate::interpreter::build_label_map(&module);
+    let function = compile_function(&module, &labels, 0).expect("f/0 compiles");
+    assert!(
+        code_contains_helper(&function, jit_return as *const ()),
+        "a bare `return` lowers through the dedicated `jit_return` helper"
+    );
+
+    with_both_tiers(&module, name, |interpreter, baseline| {
+        assert_same_outcome(
+            "bottom-frame return",
+            interpreter,
+            baseline,
+            &module.atom_table,
+        );
+        assert!(
+            matches!(interpreter, Ok(RunOutcome::Returned(value)) if *value == make_small(5)),
+            "the bottom `Halt` must yield x(0): {interpreter:?}"
+        );
     });
 }
 

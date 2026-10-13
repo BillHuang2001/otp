@@ -114,6 +114,7 @@ use super::runtime::{jit_publish_y, jit_refresh_y};
 mod aggregate;
 mod arith;
 mod compare;
+mod frame;
 mod link;
 mod r#move;
 mod operands;
@@ -127,6 +128,7 @@ use aggregate::{
 };
 use arith::try_inline_gc_bif;
 use compare::try_inline_comparison;
+use frame::{emit_deallocate, emit_deallocate_return, emit_return};
 use link::{emit_frame_teardown, Linker};
 use operands::x_offset;
 use r#move::{try_inline_move, try_inline_swap};
@@ -1095,6 +1097,55 @@ fn emit_block(
                 )? {
                     emit_step_and_continue(buffer, done, allocation, func, pc)?;
                 }
+            }
+            // `deallocate N` — the **checked frame pop**. What a compiled block cannot
+            // do itself is address the call-frame stack: `Machine::frames`/`stack` are
+            // Rust-side `Vec`s with no layout a block could compute an offset into, and
+            // the pop is *checked* (a `Deallocate` operand that no longer matches the
+            // live frame must raise the interpreter's own error). So the pop goes
+            // through the dedicated `jit_deallocate` helper (the [`frame`] submodule), which
+            // makes the interpreter's own `Machine::pop_frame_checked` call and answers
+            // "the next instruction" on success or `ERROR` (the pop's typed diagnostic)
+            // otherwise — the interpreter's arm is `pop_frame_checked` then `Step::Next`.
+            // Unlike a `jit_step_one` deopt this pays no interpreter dispatch, no `Step`
+            // decode and **no register refill** (the pop touches no x-register), so the
+            // block continues in-block on success.
+            //
+            // The adjacent `deallocate N; return` pair — the loader fuses it into
+            // `Instr::DeallocateReturn` (`beam_loader::lower::fuse`), but a hand-built
+            // module (the crate's own test modules, the bench fixtures) still holds the
+            // separate pair — is lowered as **one** helper round-trip, the same shape the
+            // loaded IR pays, with the `return`'s own `pc` recorded (the position the
+            // interpreter would have recorded last in that code shape).
+            Instr::Deallocate(n) => {
+                if matches!(code.get(start + i + 1), Some(Instr::Return)) {
+                    emit_deallocate_return(buffer, allocation, done, func, pc + 1, *n)?;
+                    terminated = true;
+                    break;
+                }
+                emit_deallocate(buffer, allocation, done, func, pc, *n)?;
+            }
+            // `return` — follow the current frame's continuation (the frame is **not**
+            // popped; that is `deallocate`'s job). The dedicated `jit_return` helper makes
+            // the interpreter's own `Machine::continuation()` read and encodes it as a
+            // block-ABI word, so the block leaves with it in `rax`: a `(func, pc)` target
+            // the driver enters (including a continuation **sub-block**), `HALT` on the
+            // bottom frame, or `ENTER` for a caller in another module context. A `return`
+            // always transfers control (the interpreter's `return_step` never yields
+            // `Step::Next`), so the block ends here.
+            Instr::Return => {
+                emit_return(buffer, allocation, done, func, pc)?;
+                terminated = true;
+                break;
+            }
+            // The loader's fused superinstruction — the shape **every** compiler-produced
+            // function body ends with. One `jit_deallocate_return` helper round-trip: the
+            // interpreter's checked pop, then the continuation read, in the interpreter's
+            // own order.
+            Instr::DeallocateReturn(n) => {
+                emit_deallocate_return(buffer, allocation, done, func, pc, *n)?;
+                terminated = true;
+                break;
             }
             Instr::Jump { target } => match labels.resolve(*target) {
                 Ok((target_func, target_pc)) => {
