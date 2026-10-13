@@ -37,6 +37,7 @@ use crate::error::heap_exhausted;
 use crate::heap_info::HeapObservable;
 use crate::nursery::Nursery;
 use crate::policy::HeapPolicy;
+use crate::reachable::ReachableObject;
 use crate::space::{FromSet, HeapSpace};
 use crate::stats::GcStats;
 /// Which collection a [`Collector`] ran.
@@ -358,6 +359,30 @@ impl Collector {
         self.nursery.add_to_from_set(&mut from); // every space of the chain
         from.add(&self.mature); // the live region of the copying mature space
         crate::reachable::for_each_reachable(&from, roots, visit)
+    }
+
+    /// The **safe** form of [`for_each_reachable_object`](Self::for_each_reachable_object):
+    /// visits every **boxed object** reachable from `roots` across the **whole heap** (every
+    /// space of the nursery chain plus the mature generation), each object **exactly once**,
+    /// passing a read-only [`ReachableObject`] view of it.
+    ///
+    /// It builds the **same from-set** as the raw sibling and drives the same walk, so the two
+    /// report the same objects in the same order; the only difference is that the visitor reads
+    /// the object's words through [`ReachableObject::word`] / [`ReachableObject::words`] instead
+    /// of a raw pointer, so an inspection-only caller needs **no `unsafe`** — e.g. the off-heap
+    /// `BinRef` probe reads the payload pointer word with `obj.word(1)`. See
+    /// [`for_each_reachable_object`](Self::for_each_reachable_object) for the full contract
+    /// (read-only, whole-heap, layout-agnostic, iterative and cycle-safe, each object once, cons
+    /// cells traversed but not reported).
+    pub fn for_each_reachable_object_view(
+        &self,
+        roots: &[Eterm],
+        visit: impl FnMut(ReachableObject<'_>),
+    ) -> Result<()> {
+        let mut from = FromSet::new();
+        self.nursery.add_to_from_set(&mut from); // every space of the chain
+        from.add(&self.mature); // the live region of the copying mature space
+        crate::reachable::for_each_reachable_view(&from, roots, visit)
     }
 }
 

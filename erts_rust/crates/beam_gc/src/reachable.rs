@@ -20,8 +20,8 @@
 
 //! The read-only **reachability walk** a whole-heap scan is built on: the shared iterative
 //! worklist with its one-bit-per-word visited set, and the enumeration
-//! ([`for_each_reachable`]) that reports every reachable **boxed object** across the whole
-//! per-process heap.
+//! ([`for_each_reachable`] / [`for_each_reachable_view`]) that reports every reachable
+//! **boxed object** across the whole per-process heap.
 //!
 //! Two callers share this walk, so their per-object sizing and child enumeration can never
 //! drift apart: the exact-live counter a fullsweep sizes itself from ([`crate::live::live`])
@@ -32,6 +32,12 @@
 //! [`move_size`](crate::copy::move_size), reference enumeration is
 //! [`for_each_ref`](crate::copy::for_each_ref) — over the canonical per-object layout of
 //! [`beam_term::layout`], so no shape's size or child slots are re-derived here.
+//!
+//! [`for_each_reachable`] hands its visitor a `(header, ptr)` **raw-pointer** pair; the
+//! [`for_each_reachable_view`] sibling hands it a safe, read-only [`ReachableObject`] view of
+//! the very same object instead, so a host that only wants to *read* an object's words needs
+//! no `unsafe` of its own. The two are one walk: the raw form is expressed in terms of the view
+//! form, so they can never disagree about which objects are reachable.
 //!
 //! Properties the walk has (the contract both callers rely on):
 //!
@@ -125,6 +131,94 @@ where
     Ok(())
 }
 
+/// A **read-only view of one reachable boxed object** — the safe form of the `(header, ptr)`
+/// pair the raw reachability walk reports.
+///
+/// [`words`](Self::words)`()[0]` is the object's header word and the payload words follow it;
+/// [`word`](Self::word) reads payload word `index` with **no `unsafe` at the call site**, so a
+/// host that inspects a reported object (e.g. a subtag test that reads an off-heap handle's
+/// payload pointer word) needs no raw-pointer arithmetic of its own.
+///
+/// The view borrows the underlying heap for the duration of the visit only: a visitor is
+/// `FnMut(ReachableObject<'_>)` (higher-ranked over the borrow), so it **cannot retain** the
+/// slice past the callback — the heap may be collected as soon as the walk returns.
+///
+/// The view is equally **layout-agnostic**: it reports the object's words, never their
+/// meaning, so this crate assumes no interior layout beyond the canonical shape walk of
+/// [`beam_term::layout`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReachableObject<'a> {
+    /// The object's whole word run: `[header, w1, w2, …]`.
+    words: &'a [Eterm],
+}
+
+impl<'a> ReachableObject<'a> {
+    /// The view of an object whose whole word run is `words` (`words[0]` is the header).
+    ///
+    /// Private: the only producer is [`for_each_reachable_view`], which knows the run heads a
+    /// live boxed object of exactly that length.
+    fn new(words: &'a [Eterm]) -> Self {
+        ReachableObject { words }
+    }
+
+    /// The object's **header word** — `words()[0]`.
+    pub fn header(&self) -> Eterm {
+        self.words[0]
+    }
+
+    /// The object's **whole word run**: `[header, w1, w2, …]`.
+    pub fn words(&self) -> &'a [Eterm] {
+        self.words
+    }
+
+    /// Payload word `index` (`0` is the header), or `None` when `index` is out of range.
+    pub fn word(&self, index: usize) -> Option<Eterm> {
+        self.words.get(index).copied()
+    }
+
+    /// The object's size in words, header included.
+    pub fn len(&self) -> usize {
+        self.words.len()
+    }
+
+    /// Whether the object has no words — never true for a reported object, which always
+    /// carries at least a header word; present because [`len`](Self::len) exists.
+    pub fn is_empty(&self) -> bool {
+        self.words.is_empty()
+    }
+
+    /// The **address of the header word** — the object's identity, the same value the raw
+    /// form reports as its `ptr`.
+    pub fn address(&self) -> usize {
+        self.words.as_ptr() as usize
+    }
+}
+
+/// Visits every **boxed object** reachable from `roots` out of the ranges of `from`, each
+/// exactly once, passing a safe read-only [`ReachableObject`] view of it.
+///
+/// This is [`for_each_reachable`]'s safe sibling: the same walk, the same dedup, the same
+/// objects in the same order, but the visitor reads the object's words through
+/// [`ReachableObject`] instead of a raw pointer, so an inspection-only caller needs no
+/// `unsafe`. A cons cell is *traversed* (so the boxed objects behind it are reached) but is
+/// **not** reported — it carries no header word.
+pub(crate) fn for_each_reachable_view<F>(from: &FromSet, roots: &[Eterm], mut visit: F) -> Result<()>
+where
+    F: FnMut(ReachableObject<'_>),
+{
+    walk_reachable(from, roots, |first, ptr, total| {
+        if is_header(first) {
+            // SAFETY: `ptr` heads a live boxed object of exactly `total` words — the walk
+            // admitted it only through `Visited::index`, i.e. only when it addresses a word of
+            // one of the caller's from-space ranges, and `total` is that object's
+            // `move_size`. Those `total` words are all readable and none is written (the walk
+            // is read-only), so they form a valid `&[Eterm]` for the duration of the visit.
+            let slice = unsafe { core::slice::from_raw_parts(ptr, total) };
+            visit(ReachableObject::new(slice));
+        }
+    })
+}
+
 /// Visits every **boxed object** reachable from `roots` out of the ranges of `from`, each
 /// exactly once, passing the object's header word and a pointer to that header.
 ///
@@ -138,15 +232,14 @@ where
 /// off-heap payload — and reads whatever payload words its shape defines. This crate assumes
 /// no interior layout of its own beyond the canonical shape walk of [`beam_term::layout`], so
 /// it needs no knowledge of, and no dependency on, another crate's container interior.
+///
+/// For a visitor that need not touch raw pointers, prefer [`for_each_reachable_view`], which
+/// reports the same objects as a safe [`ReachableObject`].
 pub(crate) fn for_each_reachable<F>(from: &FromSet, roots: &[Eterm], mut visit: F) -> Result<()>
 where
     F: FnMut(Eterm, *const Eterm),
 {
-    walk_reachable(from, roots, |first, ptr, _total| {
-        if is_header(first) {
-            visit(first, ptr);
-        }
-    })
+    for_each_reachable_view(from, roots, |obj| visit(obj.header(), obj.words().as_ptr()))
 }
 
 /// Admits `ptr` into the worklist when it names a from-space object that has not been
