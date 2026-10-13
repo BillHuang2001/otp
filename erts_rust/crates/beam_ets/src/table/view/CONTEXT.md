@@ -60,7 +60,9 @@ later same-size insert silently reuses (a wrong, well-formed result).
   compile-time contract is pinned by 4 `compile_fail` doctests in-node (term.rs ×1, iter.rs ×3)
   plus 1 on `SharedTable`. All are bare `compile_fail` (no `E0xxx` code) — they pass on *any*
   compile error; the imports resolve, so the only failure is the intended escape.
-- Coverage gaps: `TableRead::member` and `TableTerm::is_bitstring` have no test.
+- Coverage gaps: none recorded — `TableRead::member` and `TableTerm::is_bitstring` are pinned by
+  `member_reports_key_presence_across_kinds` / `bitstring_reads_distinguish_aligned_binaries_from_unaligned_bits`,
+  and the `as_requester` residual hazard by `as_requester_reads_are_a_documented_residual_hazard`.
 
 ## Routing Table
 - `src/table/view/mod.rs` → module docs, scratch-heap sizing, the retry predicate
