@@ -247,7 +247,112 @@ battery() ->
 
     emit("set_large", set_large()),
     emit("ordered_large", ordered_large()),
+
+    %% The `ets:slot/2` group (`battery/slot.rs`).
+    emit("slot_ordered_ascending", slot_ordered_ascending()),
+    emit("slot_ordered_descending", slot_ordered_descending()),
+    emit("slot_ordered_bounds", slot_ordered_bounds()),
+    emit("slot_ordered_noninteger", slot_ordered_noninteger()),
+    emit("slot_ordered_empty", slot_ordered_empty()),
+    emit("slot_ordered_keypos2", slot_ordered_keypos2()),
+    emit("slot_ordered_after_delete", slot_ordered_after_delete()),
+    emit("slot_ordered_slot_order_is_next_order", slot_ordered_slot_order_is_next_order()),
+    emit("slot_ordered_big_slot", slot_ordered_big_slot()),
+    emit("slot_set_partition", slot_hash_partition(set)),
+    emit("slot_set_empty", slot_hash_empty(set)),
+    emit("slot_bag_partition", slot_hash_partition(bag)),
+    emit("slot_bag_empty", slot_hash_empty(bag)),
+    emit("slot_duplicate_bag_partition", slot_hash_partition(duplicate_bag)),
+    emit("slot_duplicate_bag_empty", slot_hash_empty(duplicate_bag)),
+    emit("slot_duplicate_bag_duplicate_union", slot_hash_duplicate_union()),
     ok.
+
+%% ------------------------------- ets:slot/2 -------------------------------
+
+slot_object(K) -> {K, K * 10}.
+
+%% Every slot a `cap/1` read: a success is `ok:<objects>` (or `ok:$end_of_table`),
+%% a failure the error class.
+slot_read(T, S) -> cap(fun() -> ets:slot(T, S) end).
+
+%% Walk slots from 0 to the end-of-table slot: the accumulated objects and the
+%% end-of-table index.
+slot_hash_walk(T, N, Acc) ->
+    case ets:slot(T, N) of
+        '$end_of_table' -> {Acc, N};
+        Objs -> slot_hash_walk(T, N + 1, lists:reverse(Objs, Acc))
+    end.
+
+slot_ordered_ascending() ->
+    T = new(ordered_set),
+    [ets:insert(T, slot_object(K)) || K <- [10, 20, 30]],
+    t([slot_read(T, S) || S <- [0, 1, 2, 3]]).
+
+slot_ordered_descending() ->
+    T = new(ordered_set),
+    [ets:insert(T, slot_object(K)) || K <- [50, 40, 30, 20, 10]],
+    t([slot_read(T, S) || S <- [0, 1, 2, 3, 4, 5]]).
+
+slot_ordered_bounds() ->
+    T = new(ordered_set),
+    [ets:insert(T, slot_object(K)) || K <- [10, 20, 30]],
+    t([slot_read(T, 2), slot_read(T, 3), slot_read(T, 4), slot_read(T, -1)]).
+
+slot_ordered_noninteger() ->
+    T = new(ordered_set),
+    ets:insert(T, slot_object(1)),
+    t([slot_read(T, 0),
+       cap(fun() -> ets:slot(T, an_atom) end),
+       cap(fun() -> ets:slot(T, 1.0) end),
+       cap(fun() -> ets:slot(T, []) end),
+       cap(fun() -> ets:slot(T, '$end_of_table') end)]).
+
+slot_ordered_empty() ->
+    T = new(ordered_set),
+    t([slot_read(T, 0), slot_read(T, 1)]).
+
+slot_ordered_keypos2() ->
+    T = new(ordered_set, 2),
+    ets:insert(T, {9, 30}), ets:insert(T, {7, 10}), ets:insert(T, {8, 20}),
+    t([slot_read(T, S) || S <- [0, 1, 2, 3]]).
+
+slot_ordered_after_delete() ->
+    T = new(ordered_set),
+    [ets:insert(T, slot_object(K)) || K <- [1, 2, 3, 4, 5]],
+    ets:delete(T, 3),
+    t([slot_read(T, S) || S <- [0, 1, 2, 3, 4]]).
+
+slot_ordered_slot_order_is_next_order() ->
+    T = new(ordered_set),
+    [ets:insert(T, slot_object(K)) || K <- [30, 10, 20]],
+    t([slot_read(T, 0), slot_read(T, 1), slot_read(T, 2),
+       cap(fun() -> ets:next(T, 10) end)]).
+
+slot_ordered_big_slot() ->
+    T = new(ordered_set),
+    ets:insert(T, slot_object(1)),
+    t([slot_read(T, 1 bsl 40), slot_read(T, 1 bsl 70)]).
+
+%% The hash kinds: the slots PARTITION every object, so only the sorted union is
+%% compared (the bucket count and the per-object index are interior freedoms).
+slot_hash_partition(Kind) ->
+    T = new(Kind),
+    [ets:insert(T, slot_object(K)) || K <- [1, 2, 3]],
+    {Objs, EOT} = slot_hash_walk(T, 0, []),
+    t([srt(Objs), slot_read(T, EOT), slot_read(T, EOT + 1), slot_read(T, -1)]).
+
+slot_hash_empty(Kind) ->
+    T = new(Kind),
+    {Objs, EOT} = slot_hash_walk(T, 0, []),
+    t([srt(Objs), slot_read(T, EOT), slot_read(T, EOT + 1)]).
+
+slot_hash_duplicate_union() ->
+    T = new(duplicate_bag),
+    ets:insert(T, slot_object(1)),
+    ets:insert(T, slot_object(2)),
+    ets:insert(T, slot_object(1)),
+    {Objs, EOT} = slot_hash_walk(T, 0, []),
+    t([srt(Objs), slot_read(T, EOT + 1)]).
 
 %% ------------------------------ per-kind cases ------------------------------
 
