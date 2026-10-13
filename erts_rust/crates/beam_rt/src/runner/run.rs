@@ -496,6 +496,55 @@ impl ProcessRunner for RuntimeRunner<'_> {
             record_baseline_code(self.runtime, module);
         }
 
+        // Register the off-heap refc binaries this machine built onto the **running process's**
+        // own off-heap table, so `erlang:process_info(Pid, binary)` has a roster to report.
+        //
+        // The real *holders* of those payloads are this machine's never-cleared reservoir
+        // (`Machine::refc_binaries`, appended by `Machine::alloc_refc_binary` whenever compiled
+        // bitstring code materializes a result above the on-heap limit and never emptied by
+        // `Machine::reset`), while the roster `process_info` reads back is
+        // `beam_process::Process`'s own table — the thing
+        // `Process::off_heap_binaries`/`off_heap_binary_count` enumerate — which is empty until
+        // something **registers** them, and nothing else in production does. This seam is what
+        // makes a running process come to *own* what its engine built.
+        //
+        // # Why this can never under-report
+        //
+        // The seam sits on the common path below the slice and above the outcome dispatch, so
+        // it runs on **every** slice outcome — a pre-emption (`Yield`), a `receive` park
+        // (`Wait`), a `Returned` and an `Err` alike (the last two belong to a process that is
+        // about to terminate, so their registration is merely harmless). A process's roster is
+        // therefore a superset of every payload its machine had built when any of its slices
+        // ended. The one window it does not cover is a `process_info(self(), binary)` issued
+        // from **inside** the running slice itself, before that slice reaches this point: the
+        // roster such a process reads back about itself can omit a binary the same slice has
+        // just built. That is safe rather than a lost term — the `Machine::refc_binaries`
+        // reservoir (of which this registration is only a mirror) is what keeps the payload
+        // alive, so a registration that has not happened yet can never *dangle* a payload; the
+        // worst it can do is omit an entry from a roster the process reads back about itself.
+        //
+        // # Why over-reporting is the safe and faithful direction
+        //
+        // Because the reservoir is never cleared, re-registering the whole of it on every slice
+        // re-lists a payload that `Process::sweep_off_heap_binaries_reachable` pruned at an
+        // earlier rooted collection. That costs nothing: `register_off_heap_binary` is
+        // dedup-by-`data_ptr` and idempotent (re-registering an existing slot drops the surplus
+        // handle), so repeats are cheap and slot-stable. And the over-report itself **mirrors
+        // the oracle**, which likewise lists a dropped binary until a GC collects it — so
+        // listing a payload the never-cleared reservoir still owns is both the safe and the
+        // faithful direction, never a fabricated entry.
+        //
+        // # Why `Runtime::eval_off_heap` is deliberately NOT registered here
+        //
+        // That store is the **pid-less** home of the `-eval` root process's escaping payloads,
+        // not this machine's work. Attributing it to this process would fabricate a roster entry
+        // for a payload the process never built, so it stays out of this seam entirely.
+        if let Some(process) = table.get_mut(pid) {
+            for payload in engine.machine.refc_binaries() {
+                process.register_off_heap_binary(payload.clone());
+            }
+        }
+
         // Pre-emption: the budget ran out at a charging point of this slicing machine
         // (an interpreted instruction's per-instruction charge, or a heap-admission
         // point). Park it at that very instruction and hand the process back to the

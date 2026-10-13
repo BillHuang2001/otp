@@ -873,6 +873,89 @@ run() ->
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// **A running process comes to OWN the off-heap refc binaries its engine built.**
+///
+/// `erlang:process_info(Pid, binary)` reads its roster from `beam_process::Process`'s off-heap
+/// table, whose only in-production producer is [`RuntimeRunner`]'s per-slice registration seam:
+/// a payload built by compiled bitstring code is held by the machine's `Machine::refc_binaries`
+/// reservoir, and the runner copies the whole reservoir onto the process's table at the end of
+/// every slice. This pins **both** halves for a process parked at a `receive` **after** building
+/// a runtime-sized (off-heap, above the 64-byte on-heap limit) binary: the machine's reservoir is
+/// non-empty *and* the process's own roster is non-empty.
+///
+/// The fixture is deliberately a real compile of `<<0:N/unit:8>>` with a **variable** size, so
+/// the compiler lowers it to `bs_create_bin` (unit 8 → `N` **bytes**, not `N` bits) →
+/// [`make_binary`](beam_engine) → `alloc_refc_binary`, which is exactly the production route. The
+/// reservoir assertion above the roster assertion is load-bearing: it fails loudly if the fixture
+/// ever stops building off-heap, so the roster assertion can never be satisfied vacuously.
+#[test]
+fn a_process_building_an_off_heap_binary_comes_to_own_it() {
+    let source = "\
+-module(ohb).
+-export([build_and_park/1]).
+build_and_park(N) ->
+    Bin = <<0:N/unit:8>>,
+    receive X -> {Bin, X} end.
+";
+    let Some(dir) = compile_modules("offheap_bin", &[("ohb", source)]) else {
+        eprintln!("SKIP: no system `erlc` on PATH -- the off-heap binary ownership test is skipped");
+        return;
+    };
+
+    let mut rt = runtime();
+    rt.add_code_path(&dir);
+    let mut state = RunnerState::default();
+    let mut table = table();
+    let pid = table.spawn_default().expect("a fresh process");
+    let module =
+        Arc::new(beam_loader::load_file(dir.join("ohb.beam")).expect("load the compiled module"));
+    let build = module
+        .atom_table
+        .lookup("build_and_park")
+        .expect("build_and_park/1 is interned");
+    state.spawn(
+        pid,
+        ProcessEntry::Export {
+            module,
+            function: build,
+            arity: 1,
+        },
+        // 256 bytes > `ERL_ONHEAP_BINARY_LIMIT` (64), so the result is an off-heap refc binary.
+        vec![make_small(256)],
+    );
+
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 1_000)
+            .expect("the slice runs")
+    };
+    assert_eq!(
+        outcome,
+        ProcOutcome::Wait,
+        "the bare `receive` parks the process after it builds the binary"
+    );
+
+    // The fixture really builds off-heap: the machine's never-cleared reservoir holds the payload.
+    let engine = state.engines.get(&pid).expect("the parked engine");
+    assert!(
+        !engine.machine.refc_binaries().is_empty(),
+        "the fixture must build its binary off-heap (a runtime-sized `<<0:N/unit:8>>`, N = 256)"
+    );
+
+    // ...and the per-slice registration seam made the *process* come to own it.
+    assert!(
+        table
+            .get(pid)
+            .expect("the parked process")
+            .off_heap_binary_count()
+            >= 1,
+        "the runner registers the machine's reservoir onto the process's own off-heap table"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// **The A.9 E0 shape, end to end.** A **scheduled** process calls a **float-using** module
 /// across a module boundary; that callee blocks in a `receive`, so the process must suspend and
 /// be resumed by the message — and its return value is the float the callee computed.

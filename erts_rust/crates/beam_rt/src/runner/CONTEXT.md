@@ -50,6 +50,13 @@ figures are in `PERF.md`).
   off-heap binary (`bs_init_writable`/`bs_create_bin` above the on-heap limit) is therefore copied
   rather than refused with `badarg` (the return path) or kept un-copied against a dangling payload
   (the exit path) — whether the process **built** it or **received** it.
+  The same `engine.machine.refc_binaries()` reservoir is also copied onto the **running process's**
+  own off-heap table once per slice, on every slice outcome (`Process::register_off_heap_binary`, no
+  matter whether the slice pre-empted, parked, returned or raised), so a process that has built a
+  payload above the on-heap limit comes to *own* it for `erlang:process_info(Pid, binary)`; the
+  registration is dedup-by-`data_ptr`/idempotent, so re-listing the never-cleared reservoir each slice
+  is cheap and its over-report (a payload an earlier reachability sweep pruned) mirrors the oracle,
+  while `Runtime::eval_off_heap` is deliberately left out as the pid-less `-eval` store.
 * [`budget`] — the slice's reduction budget and the wrapper context that charges it: `BudgetContext`
   declares its own `wants_reduce() == true` (the engine lets a host answer `false` only when its
   `reduce` is provably the no-op default) and implements `reduce` to charge the probe once per
