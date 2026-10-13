@@ -72,17 +72,18 @@
 //!   `node@host` (see [`NodeName`]) — a bare advertised name is refused by a real
 //!   peer. (`inet:gethostname/0`'s host is read from
 //!   `/proc/sys/kernel/hostname`, falling back to `$HOSTNAME`.)
-//! * **Inbound control messages are delivered for the `send` family.** An
-//!   **established** link's decoded `DOP_SEND*`/`DOP_REG_SEND*` control messages
-//!   are routed to the addressed **local** process's mailbox by
+//! * **Inbound control messages are delivered for the ordinary message family.** An
+//!   **established** link's decoded `DOP_SEND*`/`DOP_REG_SEND*`/`DOP_ALIAS_SEND*`
+//!   control messages — and the plain **message** form of `DOP_ALTACT_SIG_SEND` — are
+//!   routed to the addressed **local** process's mailbox by
 //!   [`DistNode::dispatch_inbound`] through the [`LocalDeliverySink`] (the runtime
 //!   side of `beam_dist`'s [`InboundSink`] seam). Every other classified delivery
-//!   (aliases, links, exit and monitor signals, the distributed-spawn family) has
-//!   no correct local seam in this runtime and is reported as the honest
-//!   [`DeliveryOutcome::Unsupported`] — never a fabricated or mis-addressed
-//!   delivery. A message the runtime cannot decode or classify **retires that one
-//!   link** (recorded in [`DistNode::last_link_error`]); it never fails a scheduler
-//!   pass.
+//!   (links, exit and monitor signals, the unlink-id handshake, the distributed-spawn
+//!   family) has no correct local seam in this runtime and is reported as the honest
+//!   [`DeliveryOutcome::Unsupported`], with the missing `beam_process` API named at its
+//!   match arm — never a fabricated or mis-addressed delivery. A message the runtime
+//!   cannot decode or classify **retires that one link** (recorded in
+//!   [`DistNode::last_link_error`]); it never fails a scheduler pass.
 //! * **A broken link is dropped, not raised.** A protocol error or a write
 //!   failure retires that one link and is recorded in
 //!   [`DistNode::last_link_error`]; it never aborts the runtime.
@@ -96,10 +97,10 @@ use beam_common::{BeamError, Result};
 use beam_dist::connection::TcpTransport;
 use beam_dist::driver::{ConnectionDriver, DriverState};
 use beam_dist::epmd::{Alive2Req, Alive2Resp, EpmdClient, EPMD_DEFAULT_ADDR};
-use beam_dist::{Delivery, DeliveryOutcome, Dispatched, InboundSink};
+use beam_dist::{AltactSigFlags, Delivery, DeliveryOutcome, Dispatched, InboundSink};
 use beam_dist::TcpListener;
-use beam_process::{PidTarget, ProcessId, ProcessTable};
-use beam_term::prelude::{atom_val, is_atom, make_atom, Atom, Eterm};
+use beam_process::{MonitorRef, PidTarget, ProcessId, ProcessTable};
+use beam_term::prelude::{atom_val, is_atom, is_immediate, make_atom, Atom, Eterm};
 use beam_term::AtomTable;
 
 /// The address the distribution listener binds: the wildcard on an OS-chosen
@@ -747,22 +748,42 @@ pub const NONODE_NAME: &str = "nonode@nohost";
 ///
 /// # Scope (honest)
 ///
-/// Only the **`send` family** is routed: a `DOP_SEND*` to a local pid and a
-/// `DOP_REG_SEND*` to a registered local name
-/// ([`Delivery::Send`]/[`Delivery::RegSend`]). Every other classified delivery —
-/// process aliases ([`Delivery::AliasSend`]), the link/exit family
-/// ([`Delivery::Link`]/[`Delivery::Exit`]/[`Delivery::Exit2`]), the monitor family
-/// ([`Delivery::Monitor`]/[`Delivery::Demonitor`]/[`Delivery::MonitorExit`]), the
-/// unlink-id handshake ([`Delivery::UnlinkId`]/[`Delivery::UnlinkIdAck`]), the
-/// group-leader change ([`Delivery::GroupLeader`]) and the recognised-but-
-/// unclassified opcodes ([`Delivery::Other`]) — is reported as
-/// [`DeliveryOutcome::Unsupported`]: `beam_process`'s link/monitor/party
-/// structures only accept *local* peers, so there is no correct seam to install a
-/// remote counterpart and a fabricated one would be far worse than an honest gap.
+/// **Routed** — the ordinary message family, which is what a peer's `!`/`erlang:send`
+/// produces:
+///
+/// * [`Delivery::Send`] (`DOP_SEND*`) to a local pid — an internal pid immediate, or
+///   the **external** pid shape the distribution decoder materialises for a pid on this
+///   node (`dist.c:2512-2561`);
+/// * [`Delivery::RegSend`] (`DOP_REG_SEND*`) to a registered local name
+///   (`dist.c:2463-2510`);
+/// * [`Delivery::AliasSend`] (`DOP_ALIAS_SEND*`) to a live local alias — a process
+///   reference alias (`dist.c:2563-2588`; `erl_proc_sig_queue.c:2318-2326`,
+///   `:6036-6049`), with the C's `reply_demonitor` alias consumed when the message is
+///   really delivered;
+/// * the same three targets when they arrive as the **message** form of
+///   [`Delivery::AltactSigSend`] (`DOP_ALTACT_SIG_SEND` with neither
+///   `ERTS_DOP_ALTACT_SIG_FLG_PRIO` nor `..._EXIT`, `dist.c:2590-2697`).
+///
+/// **Not routed** — every other family is reported as [`DeliveryOutcome::Unsupported`],
+/// with the missing sibling API named at its match arm. The reason is structural, not
+/// incidental: `beam_process`'s link/monitor/exit/party structures identify their
+/// *other* side by a local `ProcessId`, and every public entry point that records a
+/// remote relationship (`link_term`, `monitor_term`, `…`) is a **local-initiated**
+/// operation on its way *out* — it routes an outbound `DOP_*` control signal through the
+/// table's `DistSignalRouter`. Applying an inbound relationship needs the counterpart
+/// that installs it locally and echoes nothing (the C's receipt arms never send the
+/// mirrored opcode back: `dist.c:2258` `break; /* Done */`), and no such API exists
+/// today. Guessing at the semantics — or echoing the mirrored opcode — is far worse than
+/// an honest gap.
 ///
 /// Nothing is ever delivered to the *wrong* process: an addressed pid that is not
 /// a process of this node (another node, or a stale incarnation of this one) is
-/// [`DeliveryOutcome::NoSuchProcess`], never a lookup by number alone.
+/// [`DeliveryOutcome::NoSuchProcess`], never a lookup by number alone; a delivery
+/// outside its opcode's wire contract (a non-pid `DOP_SEND` target, a non-atom
+/// `DOP_REG_SEND` name, a non-reference `DOP_ALIAS_SEND` target) is
+/// [`DeliveryOutcome::Unsupported`]; and a well-formed delivery whose recipient does
+/// not exist is dropped ([`DeliveryOutcome::NoSuchProcess`] /
+/// [`DeliveryOutcome::Dropped`]) exactly as the C's silent-drop arms do.
 pub struct LocalDeliverySink<'a> {
     /// The runtime's process table the delivery is enqueued into.
     table: &'a mut ProcessTable,
@@ -788,6 +809,7 @@ impl<'a> LocalDeliverySink<'a> {
 impl InboundSink for LocalDeliverySink<'_> {
     fn deliver(&mut self, delivery: &Delivery) -> Result<DeliveryOutcome> {
         match delivery {
+            // --- routed: the ordinary message family (see the type docs) -----
             Delivery::Send {
                 from,
                 to,
@@ -800,11 +822,150 @@ impl InboundSink for LocalDeliverySink<'_> {
                 message,
                 ..
             } => self.deliver_to_name(*from, *name, *message),
-            // Every other delivery has no correct local seam here (see the type
-            // docs): the honest `Unsupported`, never a fabricated/mis-addressed
-            // delivery.
-            _ => Ok(DeliveryOutcome::Unsupported),
+            Delivery::AliasSend {
+                from,
+                to,
+                message,
+                ..
+            } => self.deliver_to_alias(*from, *to, *message),
+            Delivery::AltactSigSend {
+                flags,
+                from,
+                to,
+                message,
+                ..
+            } => self.deliver_altact(*flags, *from, *to, *message),
+
+            // --- typed gaps: each names the missing `beam_process` API -------
+            //
+            // `DOP_LINK` (`dist.c:2224-2275`: install the link locally, send the LINK
+            // signal, **no ack** — `break; /* Done */` at `:2258`). The only public
+            // recording entry point is `ProcessTable::link_term(to, remote_from)`,
+            // which records the remote link *and* routes an outbound
+            // `DistSignal::Link` (a `DOP_LINK` back to the peer) through the table's
+            // `DistSignalRouter` — which the C never does on an inbound link. The echo
+            // is not provably a no-op on the peer: it arrives as a *fresh* inbound
+            // `DOP_LINK`, whose arm re-creates the dist link
+            // (`erts_link_external_create` + `erts_link_dist_insert`) and sends a LINK
+            // signal that only the target's own link-tree dedup
+            // (`erts_link_tree_lookup_insert`, `erl_proc_sig_queue.c:6632-6643`)
+            // collapses. It looks harmless *today* only because this runtime installs no
+            // router at all (the connector half is unwired) — i.e. routing Link now
+            // would silently start emitting a wire message the moment one lands. Needs
+            // `record_remote_link(to: ProcessId, remote: RemotePid)`: record-only, no
+            // outbound signal.
+            Delivery::Link { .. } => Ok(DeliveryOutcome::Unsupported),
+
+            // Exit signals from a remote sender (`DOP_EXIT`/`DOP_EXIT2`, `dist.c:2760`
+            // /`:2824`): `ExitSignal`/`PendingSignal::Exit` carry a **local**
+            // `ProcessId` sender (`beam_process::signal::ExitSignal { from: ProcessId,
+            // .. }`), so a remote `from` cannot be spelled — and attributing it to a
+            // local pid would mis-address every `{'EXIT', From, Reason}` a trapping
+            // target sees. Needs `apply_remote_exit_signal(to: ProcessId, from:
+            // RemotePid, reason: Eterm, untrappable: bool)`.
+            Delivery::Exit { .. }
+            | Delivery::Exit2 { .. }
+            | Delivery::PayloadExit { .. }
+            | Delivery::PayloadExit2 { .. } => Ok(DeliveryOutcome::Unsupported),
+
+            // The OTP-26+ unlink-id handshake (`DOP_UNLINK_ID`/`DOP_UNLINK_ID_ACK`,
+            // `dist.c:2284`/`:2315`): `ProcessTable::unlink_term` is the nearest entry
+            // point but it *routes* a plain `DOP_UNLINK_ID` (the local-initiated half
+            // of the handshake), whereas an inbound `DOP_UNLINK_ID` must be answered
+            // with `DOP_UNLINK_ID_ACK` and an inbound `_ACK` must answer nothing.
+            // Needs `unlink_from_remote(...)`/`unlink_ack_from_remote(...)` — neither
+            // may echo a plain `DOP_UNLINK_ID`.
+            Delivery::UnlinkId { .. } | Delivery::UnlinkIdAck { .. } => {
+                Ok(DeliveryOutcome::Unsupported)
+            }
+
+            // A **remote watcher** monitoring a local process/name
+            // (`DOP_MONITOR_P`/`DOP_DEMONITOR_P`, `dist.c:2341`/`:2415`): the monitor
+            // record's origin side is a local `ProcessId` here, so an incoming
+            // monitor's watcher (a remote pid) has nowhere to live. Needs
+            // `monitor_from_remote(...)`/`demonitor_from_remote(...)` plus a
+            // `RemoteWatcher` record.
+            Delivery::Monitor { .. } | Delivery::Demonitor { .. } => {
+                Ok(DeliveryOutcome::Unsupported)
+            }
+
+            // A monitor **DOWN** from a remote target (`DOP_MONITOR_P_EXIT` /
+            // `DOP_PAYLOAD_MONITOR_P_EXIT`, `dist.c:2700-2714`): the local watcher's
+            // outgoing record exists (`ProcessTable::monitor_term` on a remote pid
+            // records it), but firing it is a local-death path here. Needs
+            // `remote_monitor_down(watcher: ProcessId, watched: RemotePid, reference,
+            // reason)`; the message builder it would use is already public
+            // (`beam_process::signal::build_down_message_remote`).
+            Delivery::MonitorExit { .. } | Delivery::PayloadMonitorExit { .. } => {
+                Ok(DeliveryOutcome::Unsupported)
+            }
+
+            // `DOP_GROUP_LEADER` (`dist.c:2889`): needs
+            // `set_group_leader(to: ProcessId, from: RemotePid)` — the table exposes
+            // the group leader only locally today.
+            Delivery::GroupLeader { .. } => Ok(DeliveryOutcome::Unsupported),
+
+            // The distributed-spawn family (`DOP_SPAWN_REQUEST`/`DOP_SPAWN_REPLY`,
+            // `dist.c:2902-3093`): a `beam_rt` CLI process neither serves spawn
+            // requests nor holds spawn reservations, so there is no responder — and no
+            // `beam_process` API to answer with.
+            Delivery::SpawnRequest { .. } | Delivery::SpawnReply { .. } => {
+                Ok(DeliveryOutcome::Unsupported)
+            }
+
+            // `DOP_UNLINK` is not a v6 opcode the C accepts at all: it falls into the
+            // `invalid_message` arm and **kills the connection** (`dist.c:2277-2282`).
+            // A `DOP_UNLINK` reaching this sink is therefore a protocol violation; the
+            // caller (the link driver) owns the connection-level answer, so the sink
+            // reports the honest "recognised, not routed" and never a fabricated one.
+            Delivery::Other(_) => Ok(DeliveryOutcome::Unsupported),
         }
+    }
+}
+
+/// The mailbox **envelope**'s sender word for a message classified off the wire.
+///
+/// [`ProcessTable::deliver_simple`] stores `from` in the queue entry's envelope, and
+/// that slot must be an **immediate**: `beam_message` gathers only each queued
+/// message's *payload* as a GC root, so a non-immediate word left there is not
+/// relocated and dangles into the evacuated from-space the moment the owning process
+/// collects (`beam_message/src/message.rs`'s `debug_assert_enqueue_terms`). An
+/// external pid classified off the wire is exactly such a word: the distribution
+/// decoder materialises it in the dispatch arena, which [`DistNode::dispatch_inbound`]
+/// **resets on every drain** — and `Runtime::dispatch_inbound`'s caller-supplied arena
+/// is reset by its caller. Passing the classified `from` straight through therefore
+/// stored a dangling envelope.
+///
+/// The C's own rule is exact (`erl_message.c:307`): `ERL_MESSAGE_FROM(mp) =
+/// dist_ext->dep->sysname` — the **peer node atom**, never the sender pid (the pid is
+/// used only for per-sender signal ordering, `erl_message.c:324-329`). This derives
+/// exactly that from an external-pid sender's node slot: an atom term, i.e. an
+/// immediate, safe to hold for the message's whole queued life. The plain `DOP_SEND*`
+/// forms need no derivation — the peer puts the empty atom `''` there
+/// (`dist.c:2535-2542`) — and an internal pid is already an immediate.
+///
+/// `None` means no faithful immediate word exists: a boxed sender that is neither an
+/// internal nor an external pid (outside both opcodes' wire contract) or a
+/// pathological external pid whose node slot is not an atom immediate. The delivery is
+/// then refused rather than enqueued with a term that would dangle.
+///
+/// **Typed divergence from the C:** for a plain `DOP_SEND*` the C still stores the peer's
+/// *sysname*, while this keeps the wire's `''`. Both are immediates and neither is ever
+/// read as a process identity by this runtime (nothing here resolves a mailbox
+/// envelope), so the divergence is inert — and deriving the sysname would need the
+/// peer's node name plumbed down to the sink, which this seam does not carry.
+fn envelope_from(from: Eterm) -> Option<Eterm> {
+    if is_immediate(from) {
+        return Some(from);
+    }
+    match PidTarget::from_eterm(from) {
+        Ok(PidTarget::Remote(remote)) => {
+            let node = remote.node();
+            // The pid block's node slot is an atom term (an immediate); refuse anything
+            // else rather than store a word the GC walk cannot keep alive.
+            (is_immediate(node) && is_atom(node)).then_some(node)
+        }
+        _ => None,
     }
 }
 
@@ -820,6 +981,11 @@ enum Target {
 
 impl LocalDeliverySink<'_> {
     /// Routes a `DOP_SEND*` to the addressed local pid.
+    ///
+    /// The C's receipt (`dist.c:2512-2561`) rejects a non-pid `to` as an
+    /// `invalid_message` and **silently drops** a message whose `to` is not a live local
+    /// process (a dead pid, or a stale incarnation of this node) — it answers the peer
+    /// with nothing at all.
     fn deliver_to_pid(
         &mut self,
         from: Eterm,
@@ -848,9 +1014,105 @@ impl LocalDeliverySink<'_> {
         match self.table.whereis(atom_val(name)) {
             Some(pid) => self.enqueue(pid, from, message),
             // A name nobody holds drops the message (the oracle drops it too — it
-            // answers the peer with nothing, `dist.c:2506-2509`).
+            // answers the peer with nothing, `dist.c:2506-2509`). A name registered to
+            // a *port* is the same silent drop in the C, and `ProcessTable::whereis`
+            // resolves process names only, so it lands here too.
             None => Ok(DeliveryOutcome::NoSuchProcess),
         }
+    }
+
+    /// Routes a `DOP_ALIAS_SEND*` through this node's **reference alias** table.
+    ///
+    /// The C's receipt is `erts_proc_sig_send_dist_altact_msg` (`dist.c:2563-2588`
+    /// → `erl_proc_sig_queue.c:2293-2412`): `To` must be a reference (`is_not_ref(to)`
+    /// ⇒ `invalid_message`), the reference's own embedded owner pid must be an
+    /// **internal** pid — a reference whose owner is not local is dropped outright
+    /// (`:2318-2326`) — and the alias is then resolved inside the owner's monitor tree,
+    /// where a reference that is not a live alias is **silently dropped**
+    /// (`:6036-6046`: *"Not an alias (never has been, not anymore, or not yet); drop
+    /// message…"*). The peer is answered with nothing in every one of those cases.
+    ///
+    /// A message really delivered through an `ALIAS_ONCE` (`reply_demonitor`) alias
+    /// **consumes** it (`erl_proc_sig_queue.c:6047-6064`), so that is what happens here —
+    /// after, and only after, a successful enqueue.
+    fn deliver_to_alias(
+        &mut self,
+        from: Eterm,
+        to: Eterm,
+        message: Eterm,
+    ) -> Result<DeliveryOutcome> {
+        let Ok(reference) = MonitorRef::from_eterm(to) else {
+            // Not an internal reference thing: outside the opcode's contract
+            // (`dist.c:2577`), so neither a delivery nor a drop is claimed for it.
+            //
+            // A wire-borne reference currently arrives in the **external** form — the
+            // control-message decoder installs no local-node identity
+            // (`beam_dist::control::decode_control`), so the codec's local-node
+            // demotion never runs — and an external reference is not a readable alias
+            // key here. That is a `beam_dist` handoff, recorded rather than worked
+            // around: see the module's escalation notes.
+            return Ok(DeliveryOutcome::Unsupported);
+        };
+        let Some(owner) = self.table.resolve_alias(reference) else {
+            // Never an alias, its rule already fired, or its owner has died: the C
+            // drops the message and tells the peer nothing.
+            return Ok(DeliveryOutcome::Dropped);
+        };
+        let outcome = self.enqueue(owner, from, message)?;
+        if outcome == DeliveryOutcome::Delivered {
+            // The reply-alias consumption (`erl_proc_sig_queue.c:6047-6049`); a
+            // `demonitor`/`explicit_unalias` alias survives the delivery, which the
+            // table's own mode check enforces.
+            self.table.alias_reply_delivered(reference)?;
+        }
+        Ok(outcome)
+    }
+
+    /// Routes the sub-cases of `DOP_ALTACT_SIG_SEND` that land in the ordinary
+    /// message paths above.
+    ///
+    /// The C reads the flag word and dispatches accordingly
+    /// (`dist.c:2662-2696`): `..._EXIT` is an **exit signal** (the trailing term is
+    /// the reason), otherwise a **message**; `..._ALIAS` says `To` is a reference,
+    /// `..._NAME` that it is a registered name, and neither that it is a pid.
+    /// `..._PRIO` makes the signal jump the mailbox queue.
+    ///
+    /// Only the plain **message** forms are routed ([`Self::deliver_to_pid`] /
+    /// [`Self::deliver_to_name`] / [`Self::deliver_to_alias`]) — a priority signal
+    /// needs a priority queue this mailbox has no seam for, and an exit signal needs the
+    /// `apply_remote_exit_signal` named on [`Delivery::Exit`]'s arm. Both stay typed
+    /// gaps rather than being delivered as ordinary messages (which would silently
+    /// reorder a priority signal and turn an untrappable exit into a message).
+    fn deliver_altact(
+        &mut self,
+        flags: AltactSigFlags,
+        from: Eterm,
+        to: Eterm,
+        message: Eterm,
+    ) -> Result<DeliveryOutcome> {
+        if flags.contains(AltactSigFlags::EXIT) {
+            // `ERTS_DOP_ALTACT_SIG_FLG_EXIT`: the trailing term is an exit *reason*
+            // (`dist.c:2687-2692`), with the `DOP_EXIT2` semantics — untrappable, so it
+            // must not be enqueued as a message.
+            return Ok(DeliveryOutcome::Unsupported);
+        }
+        if flags.contains(AltactSigFlags::PRIO) {
+            // `ERTS_DOP_ALTACT_SIG_FLG_PRIO`: the signal must jump the mailbox queue
+            // (`dist.c:2684`/`:2693-2696`), which the ordinary enqueue here cannot do.
+            return Ok(DeliveryOutcome::Unsupported);
+        }
+        if flags.contains(AltactSigFlags::ALIAS) {
+            // `To` is a reference (the C rejects `ALIAS` together with `NAME`,
+            // `dist.c:2666-2669`; the classifier has already applied that rule).
+            return self.deliver_to_alias(from, to, message);
+        }
+        if flags.contains(AltactSigFlags::NAME) {
+            // `To` is a registered name; an unregistered one is a silent drop
+            // (`dist.c:2670-2680`).
+            return self.deliver_to_name(from, to, message);
+        }
+        // Otherwise `To` is a pid (`dist.c:2682-2685`).
+        self.deliver_to_pid(from, to, message)
     }
 
     /// Classifies an addressed pid term as a process of this node.
@@ -879,18 +1141,27 @@ impl LocalDeliverySink<'_> {
 
     /// Enqueues `message` (from `from`) into `pid`'s mailbox, waking a blocked
     /// receiver through the process table's own wake list.
+    ///
+    /// The envelope's sender word is derived by [`envelope_from`] — shared by every
+    /// routed family, because the rule is the message envelope's, not the opcode's.
     fn enqueue(
         &mut self,
         pid: ProcessId,
         from: Eterm,
         message: Eterm,
     ) -> Result<DeliveryOutcome> {
+        let Some(envelope) = envelope_from(from) else {
+            // No immediate sender word exists for this delivery, and storing the
+            // classified word would leave a dangling envelope (see [`envelope_from`]).
+            // Refuse it: nothing is delivered, nothing is mis-delivered.
+            return Ok(DeliveryOutcome::Unsupported);
+        };
         if !self.table.contains(pid) {
             // The pid decoded to a slot this table does not hold (a dead process, or
             // a number that was never ours).
             return Ok(DeliveryOutcome::NoSuchProcess);
         }
-        match self.table.deliver_simple(pid, from, message) {
+        match self.table.deliver_simple(pid, envelope, message) {
             Ok(_) => Ok(DeliveryOutcome::Delivered),
             // The receiver's heap could not hold the message even after a
             // collection (this runtime has no inbound heap-fragment delivery). Drop
