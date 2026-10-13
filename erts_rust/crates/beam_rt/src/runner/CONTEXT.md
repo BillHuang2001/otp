@@ -227,25 +227,6 @@ default (`Auto`, and its `baseline` alias) puts every process on the native tier
   neither allocates nor leaves the block still runs to its next `return`/`wait` inside the one slice that
   entered it — and therefore never leaves its tier either. The interpreter tier carries no such limit:
   `BudgetContext::reduce` charges every instruction there.
-* **Each slice pays an O(module) recomputation inside `beam_engine`'s baseline tier — the runner's own
-  per-slice work is cheap by comparison.** The per-slice entry (`engine.machine.resume_outcome_with_tier`
-  at `run.rs:335`/`run_label_outcome_with_tier` at `run.rs:372`) dispatches into the cached-baseline
-  entries, and each of those (a) calls `CodeCache::compiled_handle`, which computes `ModuleKey::of`
-  **before** the HashMap probe — a `to_owned()` module-name `String` plus `module_fingerprint(module)`
-  (a whole-module content hash that `Debug`-formats the entire instruction stream), `jit/cache.rs:198-199`
-  / `cache.rs:306` / `cache.rs:135-178`, recomputed on cache **hits** — and (b) builds the module-wide
-  label map (`interpreter::build_label_map`) on **every** run/resume (`jit/baseline/mod.rs:431` resume,
-  `:531` first entry). Measured at ~141 µs for a 2048-instruction module and 6.0–6.5 µs for `lists`/
-  `string` (`beam_engine/MEASURED.md:100-101`); the cost is O(module) **per slice**, not per module —
-  the fix (keying the cache without the fingerprint) belongs to `beam_engine`.
-* **The runner's own per-slice allocations/operations are all small:** the one heap allocation is the
-  `current_module` `String` in `ctx.enter_module` (`run.rs:298-300` → `context/runtime_context.rs:466-473`);
-  `publish_parked_roots` (`run.rs:102-123`) is O(x-registers + whole stack + FR file) and allocates
-  nothing (it reuses the process's register containers), running once per slice *end* on the `Wait`/`Yield`
-  arms (`run.rs:575`/`run.rs:477`); the float-register safety scan (`run.rs:434-438`) walks all 1024
-  `MAX_FLOAT_REGISTER` slots after every slice; `take_timer_resume`/`note_reductions`/
-  `serve_gc_request`/`source_payloads` are allocation-free. No per-slice module re-lower, `Machine`
-  construction, heap walk, or O(processes) scan.
 
 ## Routing Table
 * `mod.rs` → module docs, sub-module wiring, root re-exports (`ProcessEntry`, `RunnerState`,
