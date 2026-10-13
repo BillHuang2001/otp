@@ -57,13 +57,12 @@ being a map are.
 The `max_heap_size` option **map image** is not pinned either, and this one is a **divergence, not a
 volatility**: `term_to_binary/1` of that map orders its atom keys differently in the two runtimes
 (the oracle emits `error_logger, include_shared_binaries, kill, size`; the Rust runtime emits
-`kill, error_logger, include_shared_binaries, size`), so pinning the image would be a `mismatch` —
-this is for the group owner to record in `divergences.md`, it is a plain differing result with no
-runtime gap signal.
-The same atom-keyed-map key-order divergence is reproduced by the smallest possible term
+`kill, error_logger, include_shared_binaries, size`), so pinning the image would be a `mismatch`.
+It is the multi-key atom-keyed map divergence recorded in `divergences.md` (A.5).
+The same divergence reproduces on the smallest possible term
 (`term_to_binary(#{b => 2, a => 1})`), so it is a property of the runtime's ETF encoder, not of the
-collector; it is left out of this group for that reason (the `wire` group's canonical-flatmap cases
-cover float/list/binary keys, not atom keys).
+collector; it is left out of this group for that reason (the `wire` group pins no multi-key
+atom-keyed image — only single-key ones and float/list/binary-keyed images).
 `erlang:garbage_collect/2` (e.g. `erlang:garbage_collect(self(), [{type, minor}])`) is an **honest
 Rust capability gap** — the CLI exits `3` with
 `beam_rt: unsupported: erlang:garbage_collect/2 is a known BIF that is not implemented` — so it must
