@@ -53,6 +53,9 @@ use beam_rt::{Runtime, RuntimeConfig};
 use beam_term::heap::Heap;
 use beam_term::prelude::*;
 
+// The shared harness is compiled into every test target; this target only uses a
+// subset of it, so the unused helpers would otherwise warn here.
+#[allow(dead_code)]
 mod support;
 
 /// How long the peer is given to print its readiness line.
