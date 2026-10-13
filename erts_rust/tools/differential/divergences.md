@@ -100,9 +100,7 @@ not here.)
 - `filelib:is_dir/1` / `is_file/1` / `is_regular/1` (and a literal-path `filelib:wildcard/1`)
   still hit the typed `#file_info{}` `access(2)` gap on an **existing** path
   (`beam_rt: unsupported: file_server: …`, exit 3); their absent-path answers and the glob
-  `filelib:wildcard/1` path agree and are pinned. `re:version/0` and `re:split/2` remain rust
-  capability gaps (`beam_rt: unsupported: re:version/0` / `re:compile/2`, exit 3) — neither
-  cases nor mismatches.
+  `filelib:wildcard/1` path agree and are pinned.
 - A bare (unqualified) name in the `-eval` path resolves differently: `phash2(T)` is `error:undef`
   under the oracle's `-eval` (a local call) but `ok …` under the rust runtime (it resolves the
   `erlang:phash2/1` BIF). The `erlang:phash2/1`-qualified shapes agree and are pinned in
@@ -219,3 +217,39 @@ not here.)
   totals are never asserted.
 - `+Q N` / `ERL_MAX_PORTS` -> `system_info(port_limit)` **is** pinned (the `next_power_of_two` sizing
   matrix); `+Q legacy` / no `+Q` -> 65536.
+
+## A.7 — erl_ddll / decode_packet (owner: `beam_bifs` / `beam_io`)
+- `erl_ddll:loaded_drivers/0`'s **list contents** differ: the oracle lists its statically linked
+  `["tcp_inet","udp_inet","ram_file_drv"]` (the entries are *strings*, not atoms), the Rust runtime
+  answers `[]`. The members are therefore unpinnable; `ddll.rs` pins only order-stable shapes of
+  the result (`{ok, List}`, the 2-tuple, `is_list/1`, an all-strings fold and a filtered
+  projection that is empty on both).
+- `erl_ddll:try_load(".", "tcp_inet", [])` answers `{error,linked_in_driver}` in the oracle but the
+  generic `{error,{open_error,-10}}` in the Rust runtime.
+- `erl_ddll:try_unload("tcp_inet", [])` answers `{error,linked_in_driver}` in the oracle but
+  `{error,not_loaded}` in the Rust runtime.
+  (The missing-object / missing-directory / non-string-name `{error,{open_error,-10}}` and the
+  not-loaded `{error,not_loaded}` shapes, plus every `info/2` `error:badarg` refusal, DO agree and
+  are pinned in `ddll.rs`.)
+- `erlang:decode_packet/3` shows **no observed divergence**: the four integer forms (`0`/`raw`,
+  `1`, `2`, `4`) and all twelve named types (`raw`, `asn1`, `sunrm`, `cdr`, `fcgi`, `line`, `tpkt`,
+  `ssl_tls`, `http`, `httph`, `http_bin`, `httph_bin`), together with their `{more,N}` /
+  `{more,undefined}` / `{error,invalid}` / `error:badarg` shapes, agree and are pinned in
+  `decode_packet.rs` (`ftp` is not a packet type — `error:badarg` on both).
+## A.7 — re (owner: `beam_bifs`; the underlying literal parser is `beam_rt`)
+- The `<<"…"/utf8>>` **binary literal** (a string segment carrying the `utf8` type) cannot be
+  constructed by the runtime's `-eval` path: `<<"åäö"/utf8>>` — and any use of it, e.g.
+  `byte_size(<<"åäö"/utf8>>)` — raises a plain `error:badarg` where the oracle yields the UTF-8
+  binary. Two `re` cases promoted from `crates/beam_bifs/src/re/oracle.rs` use that literal as a
+  *subject*, so they are **not** pinned (a plain-value `mismatch`, not an honest gap) and are
+  deliberately absent from `src/corpus/re.rs`:
+  - `unicode/utf8-binary-subject` — `re:run(<<"åäö"/utf8>>,<<"ä"/utf8>>,[unicode])`
+    (oracle `{match,[{2,2}]}`, rust `error:badarg`);
+  - `non-unicode/dot-is-a-byte` — `re:run(<<"åäö"/utf8>>,".")`
+    (oracle `{match,[{0,1}]}`, rust `error:badarg`).
+  The gap is in literal **construction**, not in the `re` engine: both cases agree once the
+  literal exists, and the byte-identical integer-segment subject (`<<195,165,195,164,195,182>>`)
+  *is* evaluable and agrees (so the equivalent of each can be pinned today, and the two source
+  expressions verbatim once the literal builds). The source's own crate-level sweep for both
+  (`crates/beam_bifs/src/re/oracle.rs`) still passes because it builds the subject as raw bytes
+  rather than through the `-eval` literal parser.
