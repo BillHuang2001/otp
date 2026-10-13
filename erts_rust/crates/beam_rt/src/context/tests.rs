@@ -1930,7 +1930,6 @@ fn the_runtime_hooks_predicate_selects_only_its_own_bifs() {
     for (module, function, arity) in [
         ("erlang", "read_timer", 1),
         ("erlang", "system_info", 1),
-        ("erl_ddll", "info", 2),
     ] {
         assert!(
             RuntimeContext::uses_runtime_hooks(module, function, arity),

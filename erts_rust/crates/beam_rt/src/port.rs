@@ -1979,6 +1979,19 @@ impl PortHook for RuntimePorts {
                 };
                 return registry.register(driver, meta);
             }
+            // A driver the runtime already **has loaded by name** is resolved against the
+            // loaded-driver list first, exactly as the C matches the name against each loaded
+            // entry's `driver_name` (`io.c:599-628`). The list records the object path the driver
+            // really came from (`erl_ddll:try_load/3`, or the path form of an earlier
+            // `open_port({spawn_driver, …})`), so the port re-uses **that** object instead of
+            // searching the name afresh — which is what lets a driver loaded with
+            // `erl_ddll:try_load(Dir, Name, [])` be opened as `{spawn_driver, Name}`. When the
+            // name is not loaded the name doubles as the search ([`driver_lookup`], the documented
+            // Milestone-1 extension).
+            let (candidates, driver_name) = match driver::loaded_driver_path(&driver_name) {
+                Some(path) => (vec![path], driver_name),
+                None => (candidates, driver_name),
+            };
             // A **C driver** (contract A.4) port: the driver is `dlopen`ed and registered as the
             // port's driver, so `port_command` reaches its `output` callback and its
             // `driver_output` bytes reach the owner. An unknown driver name is the oracle's own
