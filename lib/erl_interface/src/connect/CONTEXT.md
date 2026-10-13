@@ -72,6 +72,7 @@ None of these are installed; the installed public header set is only `../include
 - `ei_do_receive_msg`'s `staticbuffer_p && msglen > x->buffsz` check is unreachable: `ei_recv_internal` already returns `ERL_ERROR` with `EMSGSIZE` in that case.
 - `ei_thiscookie` is declared internal but looks like public API (marked `FIXME` in the source).
 - `ei_fd_to_cnode` returns a pointer into the fd table; it is invalidated by `ei_close_connection`.
+- `recv_complement` (`ei_connect.c:2535`) rejects the message unless `read_hs_package` returns exactly `21`, but the complement message is 9 bytes (`'c'` + 4-byte FlagsHigh + 4-byte Creation) per `erts/doc/guides/erl_dist_protocol.md` and the ERTS handshake in `lib/kernel/src/dist_util.erl` (`[$c, F7,F6,F5,F4, Cr3,Cr2,Cr1,Cr0]`); the function then consumes only those first 9 bytes. This path is only reached when an acceptor meets a peer that sent an old-style `'n'` name (OTP 23/24 nodes not using epmd); `ei`'s own connector always sends `'N'`.
 
 ## Build
 - Sources are listed as `CONNECTSRC` (`connect/ei_connect.c`, `ei_resolve.c`, `eirecv.c`, `send.c`, `send_exit.c`, `send_reg.c`) in `../Makefile.in`; `vpath %.c connect:encode:decode:misc:epmd:global:erts` plus `-Iconnect` in `INCFLAGS` allow plain `#include "ei_connect_int.h"`.
