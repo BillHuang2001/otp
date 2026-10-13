@@ -233,6 +233,7 @@ fn pump_events_until_exit(
             // event that says nothing about which port a round drained.
             let source = match &event {
                 PortEvent::Data { port, .. }
+                | PortEvent::Line { port, .. }
                 | PortEvent::Exited { port, .. }
                 | PortEvent::Term { port, .. } => Some(*port),
                 PortEvent::Signal { .. } => None,
