@@ -232,7 +232,7 @@ This crate's link in the A.9 boot-blocker chain (the runtime's boot stop point a
 - `src/checksum.rs` / `src/calendar.rs` (+ `localtime.rs`) / `src/os_bif.rs` -> CRC/Adler/MD5; the 9 calendar/clock BIFs; the 13 `os`/`file`/`prim_file` BIFs
 - `src/fun_info.rs` / `src/term_conv.rs` / `src/erts_internal.rs` -> fun introspection; the term-conversion/textual-id BIFs; the `erts_debug`/`erts_internal` helpers (incl. the real `map_hashmap_children/1`)
 - `src/modinfo.rs` / `src/match_spec.rs` / `src/packet/` (**`./src/packet/CONTEXT.md`**) / `src/proc_reg.rs` / `src/persistent_term.rs` -> `get_module_info`; `match_spec_test`; `decode_packet` (the dispatch + validation in `mod.rs`, the packet families in `framing`/`tls`/`http`); the 11 `ProcessHook` BIFs; the 7 `persistent_term` BIFs
-- `src/string.rs` / `src/unicode.rs` / `src/unicode/` (**`./src/unicode/CONTEXT.md`**) / `src/time.rs` -> `string:list_to_float/1`; the `unicode` conversions (incl. `wide.rs`'s UTF-16/UTF-32 codecs); the `time` BIFs
+- `src/string.rs` / `src/unicode.rs` / `src/unicode/` (**`./src/unicode/CONTEXT.md`**; sub-node `grapheme/`, **`./src/unicode/grapheme/CONTEXT.md`**) / `src/time.rs` -> `string:list_to_float/1`; the `unicode` conversions (incl. `wide.rs`'s UTF-16/UTF-32 codecs and the grapheme-cluster port); the `time` BIFs
 - `src/proc.rs` / `src/dict.rs` / `src/reason.rs` / `src/port.rs` -> `self`/`send`/`!`/`send/3` (the 3-key `SendHook` family); the `DictHook` BIFs; `error`/`exit`/`throw`/`nif_error` + the reason mapping; the `PortHook` BIFs
 - `src/ets.rs` / `src/ets/` (**`./src/ets/CONTEXT.md`**) -> the `ets:*` bridge (57 keys) + `src/ets/arith_hook.rs` (`PrecisionArith`, the scoped match-spec `ArithHook` install)
 - `src/nif.rs` -> `erlang:load_nif/2`
