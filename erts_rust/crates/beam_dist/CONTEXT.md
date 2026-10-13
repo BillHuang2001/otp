@@ -113,7 +113,15 @@ real loopback TCP socket and exchange a name-addressed `DOP_REG_SEND` and a `DOP
 (`DeliveryOutcome::Delivered`), a `ConnectionDriver` pair over two real **non-blocking `TcpStream`s**,
 and peer-death evidence (a clean socket close → `StepOutcome::Closed`; an abrupt mid-frame drop → a
 typed error). This is the crate's A.5 "two connected nodes" proof and runs in CI with no external
-process. `tests/hermetic_epmd.rs` adds an in-process `epmd` **registry stub** (independent
+process.
+`tests/two_node_session.rs` extends the hermetic loopback to the **whole inbound signal-family
+surface** of a two-node session: `DOP_LINK`, `DOP_UNLINK_ID`/`_ACK`, `DOP_DEMONITOR_P`,
+`DOP_EXIT`/`DOP_EXIT2`, `DOP_PAYLOAD_EXIT`/`_EXIT2`, `DOP_GROUP_LEADER`, `DOP_ALIAS_SEND`,
+`DOP_SPAWN_REQUEST`/`_REPLY` and `DOP_ALTACT_SIG_SEND` (token and non-token forms) each cross the
+loopback **in both directions** and are asserted on their classified `Delivery` fields, plus the `_TT`
+token field and a byte-level `'D'` distribution-header pin — so every inbound family a two-node session
+uses is proven end-to-end, not classification-only.
+`tests/hermetic_epmd.rs` adds an in-process `epmd` **registry stub** (independent
 hand-written codecs for `ALIVE2_REQ`/`PORT2_RESP`/`NAMES`/`STOP`, deregistering on connection close)
 so the `EpmdClient` is exercised without a host `epmd`, and cross-checks the stub against a real node
 spawned with `erl -epmd_port <stub>` (the node's `ALIVE2_REQ` is parsed by the stub and its port
