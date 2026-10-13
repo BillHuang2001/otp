@@ -1132,9 +1132,9 @@ static ERL_NIF_TERM probe(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
        surface. Only the shapes both runtimes answer alike are probed: a name no port is
        registered under (and a non-atom name), a port id that is not a port, a monitor payload the
        byte compare orders equal, a loader/thread/liveness answer that carries no per-VM-start
-       value. The exact `enif_thread_type()` value and `enif_demonitor_process(env, NULL, …)` are
-       deliberately absent — the first differs between the runtimes, the second crashes the oracle
-       (see `divergences.md` §A.3). */
+       value. The exact `enif_thread_type()` value and a zeroed-monitor `enif_demonitor_process`
+       probe are deliberately absent — the first differs between the runtimes, the second crashes
+       the oracle VM (see `divergences.md` §A.3). */
     case 113: {                                /* whereis_port: an unregistered name */
         ErlNifPort p;
         memset(&p, 0, sizeof(p));

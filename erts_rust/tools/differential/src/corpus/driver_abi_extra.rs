@@ -1203,25 +1203,25 @@ pub(crate) fn group() -> Vec<Case> {
             "driver_extra/erl_drv_thread_exit_response_reaches_the_joiner",
             "a thread that leaves through erl_drv_thread_exit/1 is joinable and delivers its argument",
             &[41],
-            "1",
+            "49",
         ),
         case(
             "driver_extra/erl_drv_rwlock_tryrwlock_refused_under_a_read_lock",
             "erl_drv_rwlock_tryrwlock/1 is refused while a shared read lock is held",
             &[42],
-            "1",
+            "49",
         ),
         case(
             "driver_extra/erl_drv_rwlock_tryrlock_refused_under_a_write_lock",
             "erl_drv_rwlock_tryrlock/1 is refused while the exclusive write lock is held",
             &[43],
-            "1",
+            "49",
         ),
         case(
             "driver_extra/erl_drv_cond_wait_wakes_on_signal",
             "erl_drv_cond_wait/2 blocks a worker thread until erl_drv_cond_signal/1 wakes it",
             &[44],
-            "1",
+            "49",
         ),
         case(
             "driver_extra/driver_get_now_refuses_a_null_out_parameter",
@@ -1756,7 +1756,7 @@ mod tests {
                 assert_eq!(golden, "49", "case {}: a status selector is the '1' byte", case.id);
             }
         }
-        assert_eq!(status, 40, "the forty status selectors");
+        assert_eq!(status, 44, "the forty-four status selectors");
         assert_eq!(deliveries, DELIVERY_SELECTORS.count(), "one delivery case per selector");
         assert_eq!(builtin, 2, "the two built-in-driver cases");
     }
