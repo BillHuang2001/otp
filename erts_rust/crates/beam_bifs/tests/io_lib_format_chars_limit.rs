@@ -898,34 +898,50 @@ fn run_erl(oracle: &Path, eval: &str) -> String {
 }
 
 /// Re-derives the whole corpus against the **live** oracle and requires the
-/// `erlang:term_to_binary/1` image of every result to agree byte-for-byte. Skips
-/// loudly when no oracle is available.
+/// `erlang:term_to_binary/1` image of every result to agree byte-for-byte.
+///
+/// A missing or failing oracle is a **failure**, never a silent pass: this test
+/// exists to catch the class of defect a broken generated `-eval` would hide, so
+/// skipping it when no oracle is installed — or letting it pass with zero parsed
+/// lines — would re-create that blindness.
 #[test]
 fn string_control_chars_limit_cross_checks_the_live_oracle() {
-    let Some(oracle) = resolve_oracle() else {
-        eprintln!();
-        eprintln!("===== beam_bifs io_lib chars_limit: live oracle SKIPPED =====");
-        eprintln!("No usable system `erl` oracle found ($ERTS_ORACLE unset or not");
-        eprintln!("executable, and no `erl` on $PATH).");
-        eprintln!("This test is NOT a pass — set $ERTS_ORACLE (or install Erlang/OTP).");
-        eprintln!("=============================================================");
-        eprintln!();
-        return;
-    };
+    let oracle = resolve_oracle().unwrap_or_else(|| {
+        panic!(
+            "the live-oracle cross-check for the `~s` `{{chars_limit, N}}` corpus \
+             requires a system `erl` ($ERTS_ORACLE naming an executable, or one on \
+             $PATH). Refusing to pass silently: install Erlang/OTP or set $ERTS_ORACLE."
+        )
+    });
 
     let cases = oracle_corpus();
+    assert!(
+        !cases.is_empty(),
+        "the live-oracle io_lib chars_limit corpus must not be empty"
+    );
+
     let eval = oracle_eval(&cases);
     let stdout = run_erl(&oracle, &eval);
-    let mut lines = stdout.lines().filter(|line| !line.trim().is_empty());
+    let lines: Vec<&str> = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert_eq!(
+        lines.len(),
+        cases.len(),
+        "the oracle printed {} non-empty lines for {} cases — the generated \
+         `-eval` did not run every case:\n{stdout}",
+        lines.len(),
+        cases.len(),
+    );
     let reg = default_registry();
 
-    for case in &cases {
-        let line = lines.next().unwrap_or_else(|| {
-            panic!(
-                "the oracle printed fewer lines than the corpus at case `{}`:\n{stdout}",
-                case.name
-            )
-        });
+    for (case, line) in cases.iter().zip(lines.iter()) {
+        assert!(
+            !line.trim().is_empty(),
+            "case `{}`: the oracle line is empty",
+            case.name
+        );
         // A fresh heap + atom table per case keeps the term images independent.
         let mut heap = Heap::new(1 << 20).expect("test heap");
         let atoms = seeded_atoms();
@@ -945,9 +961,4 @@ fn string_control_chars_limit_cross_checks_the_live_oracle() {
             case.name
         );
     }
-
-    assert!(
-        lines.next().is_none(),
-        "the oracle printed more lines than the corpus:\n{stdout}"
-    );
 }
