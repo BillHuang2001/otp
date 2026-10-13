@@ -117,7 +117,10 @@ not here.)
   oracle injects its runtime-added entries (`logger`, `connect_all`, …) with a per-VM-start
   order, the rust runtime returns the raw, shorter `.app` env. The `{ok,…}` shape and the other
   keys agree and are pinned. Owner: `beam_rt`.
-- `application:get_application/1` on a **pid** differs: the oracle answers `{ok,App}` for a
+- `application:get_key(erts, vsn)` differs: the oracle answers `undefined` (the emulator is not a
+  *loaded* application — the same conclusion as the pinned `loaded_applications_excludes_erts` and
+  `application:get_application(erts)` cases), the rust runtime answers `{ok,"17.1"}`. The
+  `kernel`/`stdlib` forms agree and are pinned. Owner: `beam_rt`.- `application:get_application/1` on a **pid** differs: the oracle answers `{ok,App}` for a
   process an application owns and `undefined` for every other process (`application:get_application(self())`
   and `application:get_application(spawn(fun() -> ok end))` are both `undefined` under `-noshell`),
   while the rust runtime raises `error:function_clause` (it runs no application-owned process).
@@ -126,14 +129,20 @@ not here.)
 - `erlang:module_info(exports)` → oracle the export table, rust `undef`
   (`lists:module_info(exports)` works but with a different entry order).
 - `whereis(code_server|erl_prim_loader|kernel_sup)` → oracle a pid, rust `undefined`.
-- Further surfaces found while probing: `code:get_path/0` (differing path lists),
+- Further surfaces found while probing: `code:get_path/0` (differing path lists — and every entry
+  is absolute in the rust path list (`filename:absname(S) =:= S` holds for all of them) but not in
+  the oracle's),
   `init:script_id/0` (rust `beam_rt: unsupported: init:script_id/0 (no boot script has been
   loaded)`, exit 3; the oracle `{"Erlang/OTP","29"}`),
   `erl_prim_loader:get_path/0` (`{ok,Paths}` vs `badarg`),
   `erlang:system_info(logical_processors)` (16 vs 14),
   `erlang:system_info(heap_sizes)` (the rust list has an extra entry),
   `erlang:module_loaded(lists|kernel)` (`true` vs `false`).
-- `erlang:system_info(loaded)` and `erlang:system_info(check_io)`
+- `erlang:system_info(emu_type)` is the runtime's **own build flavour** (oracle `opt`, rust
+  `debug`), and `erlang:system_info(debug_compiled)` follows from it (oracle `false`, rust
+  `true`); only the type/shape (`is_atom`/`is_boolean`) is pinnable. `erlang:system_info(compat_rel)`
+  is release-dependent like `otp_release` (oracle `29`, rust `30`) — only `is_integer` is pinned.
+  Owner: `beam_rt`.- `erlang:system_info(loaded)` and `erlang:system_info(check_io)`
   are honest capability gaps (rust exit 3 / `beam_rt: unsupported: …`) — neither cases nor
   mismatches; safe to pin as allowlisted cases once wanted.
 - `erlang:function_exported/3` is `false` in the rust runtime for `kernel` and `code` (the

@@ -64,6 +64,16 @@
 //! string, an invocation name) and by value only where the answer is a frozen constant, a boolean
 //! or a documented `undefined`.
 //!
+//! A final widened block completes that installation view and the preloaded runtime floor: the
+//! **installation hierarchy** relations (`code:root_dir/0` is absolute and prefixes the library
+//! root, `code:lib_dir/0` prefixes — and differs from — the `erts` application directory), the
+//! boot banner's frozen `"Erlang/OTP"` product-name prefix, the `.app` resources' non-empty
+//! `description`/`vsn`/manifest members, the code server's frozen `{error,nofile}` load refusal,
+//! the whole put/get floor of the preloaded `atomics`/`counters`/`persistent_term` modules, and
+//! the emulator's release/limit constants (`compat_rel`, `ets_limit`, `scheduler_id`,
+//! `min_bin_vheap_size`, `os_type`, `endian`). Every path is pinned only by a *relation* or a
+//! *shape*; no host path, release string or live counter is ever asserted by value.
+//!
 //! The surfaces deliberately **not** pinned here are plain differing observables — genuine
 //! divergences that would be a `mismatch`, not a capability gap — and are handoffs to `beam_rt`
 //! (the oracle value state, verified against the live system ERTS, is what the runtime should
@@ -75,6 +85,8 @@
 //! | `init:get_arguments/0` | every flag **plus** the emulator's `root`/`bindir`/`progname`/`home` | the runtime's own modelled flags only |
 //! | `application:get_application/1` on a **pid** | `{ok,App}`, or `undefined` for a process outside any application | raises `function_clause` (the runtime runs no application-owned process; the *module* form **does** agree and is pinned below) |
 //! | `application:get_all_key/1`'s / `get_key(App, env)`'s `env` member | the application's environment | a differing (shorter, per-VM-start-ordered) list — the *key names* are pinned, the member is not |
+//! | `application:get_key(erts, vsn)` | `undefined` (erts is not a *loaded* application) | `{ok,"17.1"}` — the `kernel`/`stdlib` forms agree and are pinned |
+//! | `erlang:system_info(emu_type)` / `(debug_compiled)` | the `opt` build flavour / `false` | the runtime's own `debug` flavour / `true` (only the type is pinned) |
 //! | `erlang:module_info/1`, `erlang:get_module_info/2` | the export table (from `erlang`) | `undef` / `badarg` |
 //! | `lists:module_info(exports)` | the export set | the same set in a differing order |
 //! | `erlang:module_loaded(kernel)` | `true` | `false` |
@@ -1458,6 +1470,218 @@ pub(crate) fn group() -> Vec<Case> {
             "begin F = erlang:system_info(fullsweep_after), is_tuple(F) andalso element(1, F) =:= fullsweep_after andalso is_integer(element(2, F)) end",
             "ok true",
         ),
+        // --- The installation hierarchy the boot chain resolves ----------------------------
+        // A booted system must resolve the *installation* it started from, not just its own
+        // preloaded modules: the root directory, the library root, an application's directory
+        // and the emulator's release constants. Only **relations** and **shapes** are pinned —
+        // every path component is host-specific, so no path is ever asserted by value.
+        eval(
+            "boot_extra/system_info_system_version_is_non_empty",
+            "erlang:system_info(system_version) is a non-empty string (the boot banner)",
+            "length(erlang:system_info(system_version)) > 0",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/system_info_system_version_names_erlang_otp",
+            "erlang:system_info(system_version) begins with the frozen product name \"Erlang/OTP\"",
+            "lists:prefix(\"Erlang/OTP\", erlang:system_info(system_version))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/code_root_dir_is_absolute",
+            "code:root_dir/0 is an absolute path (filename:absname/1 is a fixed point on it)",
+            "filename:absname(code:root_dir()) =:= code:root_dir()",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/code_lib_dir_0_is_non_empty_string",
+            "code:lib_dir/0 is a non-empty string (the installation's library root)",
+            "begin D = code:lib_dir(), is_list(D) andalso length(D) > 0 end",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/code_lib_dir_0_prefixes_the_erts_application_dir",
+            "the library root (code:lib_dir/0) is a path prefix of the erts application directory",
+            "lists:prefix(code:lib_dir(), code:lib_dir(erts))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/code_lib_dir_0_differs_from_the_erts_application_dir",
+            "the library root (code:lib_dir/0) is not the erts application directory itself",
+            "code:lib_dir() =/= code:lib_dir(erts)",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/code_root_dir_prefixes_the_library_root",
+            "the installation root (code:root_dir/0) is a path prefix of the library root",
+            "lists:prefix(code:root_dir(), code:lib_dir())",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/code_root_dir_and_lib_dir_are_distinct",
+            "the installation root and the library root are two different directories",
+            "code:root_dir() =/= code:lib_dir()",
+            "ok true",
+        ),
+        // --- The application resources the boot chain reads, by value shape ----------------
+        // `application:get_key/2` reads the parsed `.app` resource of a started application;
+        // its string-valued members are release-varying, so only their *non-emptiness* is
+        // pinned. The collection- and manifest-valued keys are pinned by a positive length.
+        eval(
+            "boot_extra/application_get_key_kernel_description_is_non_empty_string",
+            "the kernel application resource carries a non-empty `description` string",
+            "begin {ok,D} = application:get_key(kernel, description), is_list(D) andalso length(D) > 0 end",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/application_get_key_stdlib_description_is_non_empty_string",
+            "the stdlib application resource carries a non-empty `description` string",
+            "begin {ok,D} = application:get_key(stdlib, description), is_list(D) andalso length(D) > 0 end",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/application_get_key_stdlib_vsn_is_non_empty_string",
+            "the stdlib application resource carries a non-empty `vsn` string",
+            "begin {ok,Vs} = application:get_key(stdlib, vsn), is_list(Vs) andalso length(Vs) > 0 end",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/application_get_key_kernel_modules_is_non_empty",
+            "application:get_key(kernel, modules) is a non-empty module manifest",
+            "length(element(2, application:get_key(kernel, modules))) > 0",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/application_get_key_kernel_registered_is_non_empty",
+            "application:get_key(kernel, registered) is a non-empty registered-name manifest",
+            "length(element(2, application:get_key(kernel, registered))) > 0",
+            "ok true",
+        ),
+        // --- The code server's load refusal ------------------------------------------------
+        // `code:ensure_loaded/1` is how the boot chain pulls in a module that is not preloaded.
+        // Its refusal reason for a module that exists nowhere is the frozen `nofile` atom.
+        eval(
+            "boot_extra/code_ensure_loaded_unknown_module_is_nofile",
+            "code:ensure_loaded/1 reports the frozen {error,nofile} for a module that exists nowhere",
+            "code:ensure_loaded(no_such_module_xyz)",
+            "ok {error,nofile}",
+        ),
+        // --- The preloaded `atomics` runtime floor -----------------------------------------
+        // `atomics` is preloaded (see the membership cases above); its observable floor is live
+        // with no application started. The whole put/get family is pinned by value: the
+        // operations are deterministic in a single process.
+        eval(
+            "boot_extra/atomics_put_get_round_trip",
+            "the preloaded `atomics` module round-trips put/3 then get/2 on one slot",
+            "begin A = atomics:new(1, []), atomics:put(A, 1, 5), atomics:get(A, 1) =:= 5 end",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/atomics_add_get_returns_the_sum",
+            "atomics:add_get/3 returns the sum it just stored",
+            "begin A = atomics:new(1, []), atomics:add_get(A, 1, 3) =:= 3 end",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/atomics_exchange_returns_the_previous_value",
+            "atomics:exchange/3 returns the slot's previous value (0 for a fresh array)",
+            "begin A = atomics:new(1, []), atomics:exchange(A, 1, 9) =:= 0 end",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/atomics_unsigned_round_trip",
+            "an unsigned ({signed,false}) `atomics` array round-trips put/3 then get/2",
+            "begin A = atomics:new(1, [{signed,false}]), atomics:put(A, 1, 5), atomics:get(A, 1) =:= 5 end",
+            "ok true",
+        ),
+        // --- The preloaded `counters` runtime floor ----------------------------------------
+        // `counters` is preloaded (see the membership cases above); its arithmetic floor is the
+        // per-scheduler-free counter API the boot chain and `rpc`/`os_mon` rely on.
+        eval(
+            "boot_extra/counters_get_initial_is_zero",
+            "a fresh `counters` array's first slot reads 0",
+            "begin Cnt = counters:new(1, []), counters:get(Cnt, 1) =:= 0 end",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/counters_add_round_trip",
+            "counters:add/3 then get/2 returns the accumulated value",
+            "begin Cnt = counters:new(1, []), counters:add(Cnt, 1, 7), counters:get(Cnt, 1) =:= 7 end",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/counters_sub_returns_the_difference",
+            "counters:sub/3 subtracts from the accumulated value",
+            "begin Cnt = counters:new(1, []), counters:add(Cnt, 1, 7), counters:sub(Cnt, 1, 2), counters:get(Cnt, 1) =:= 5 end",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/counters_put_sets_the_slot",
+            "counters:put/3 overwrites the accumulated value",
+            "begin Cnt = counters:new(1, []), counters:add(Cnt, 1, 7), counters:put(Cnt, 1, 3), counters:get(Cnt, 1) =:= 3 end",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/counters_new_with_write_concurrency_round_trip",
+            "a `counters` array created with the write_concurrency option still round-trips add/get",
+            "begin Cnt = counters:new(1, [write_concurrency]), counters:add(Cnt, 1, 4), counters:get(Cnt, 1) =:= 4 end",
+            "ok true",
+        ),
+        // --- The preloaded `persistent_term` runtime floor ---------------------------------
+        // `persistent_term` is preloaded (see the membership cases above); erase/1 completes the
+        // get/put/erase floor the boot chain's configuration handoff uses.
+        eval(
+            "boot_extra/persistent_term_erase_removes_the_key",
+            "persistent_term:erase/1 removes a key so get/2 serves the default again",
+            "begin persistent_term:put(boot_extra_pt_key, 1), persistent_term:erase(boot_extra_pt_key), persistent_term:get(boot_extra_pt_key, default) end",
+            "ok default",
+        ),
+        eval(
+            "boot_extra/persistent_term_round_trips_a_compound_term",
+            "the preloaded `persistent_term` round-trips a compound (tuple) term unchanged",
+            "begin persistent_term:put(boot_extra_pt_term, {a,b}), persistent_term:get(boot_extra_pt_term) end",
+            "ok {a,b}",
+        ),
+        // --- Release constants a booted system must answer ---------------------------------
+        // The emulator's release/limit constants the boot chain and `init` read at startup. The
+        // release-dependent `compat_rel` number is pinned by **type** only (oracle OTP 29 vs the
+        // rewrite's OTP 30), exactly like `otp_release`.
+        eval(
+            "boot_extra/system_info_compat_rel_is_an_integer",
+            "erlang:system_info(compat_rel) is an integer (value is release-dependent)",
+            "is_integer(erlang:system_info(compat_rel))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/system_info_ets_limit_is_positive",
+            "erlang:system_info(ets_limit) is a positive integer limit",
+            "erlang:system_info(ets_limit) > 0",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/system_info_scheduler_id_is_positive",
+            "erlang:system_info(scheduler_id) is a positive scheduler index",
+            "erlang:system_info(scheduler_id) > 0",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/system_info_min_bin_vheap_size_pair_shape",
+            "erlang:system_info(min_bin_vheap_size) is the {min_bin_vheap_size,Words} pair",
+            "begin M = erlang:system_info(min_bin_vheap_size), is_tuple(M) andalso element(1, M) =:= min_bin_vheap_size andalso is_integer(element(2, M)) end",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/system_info_os_type_shape",
+            "erlang:system_info(os_type) is the {Family,Name} pair of atoms",
+            "begin O = erlang:system_info(os_type), is_tuple(O) andalso is_atom(element(1, O)) andalso is_atom(element(2, O)) end",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/system_info_endian_is_an_atom",
+            "erlang:system_info(endian) is an atom (little/big — the host's byte order)",
+            "is_atom(erlang:system_info(endian))",
+            "ok true",
+        ),
     ]
 }
 
@@ -1600,7 +1824,9 @@ mod tests {
         "ok {file,preloaded}",
         "ok {module,lists}",
         "ok {error,bad_name}",
+        "ok {error,nofile}",
         "ok {starting,started}",
+        "ok {a,b}",
     ];
 
     /// The keys whose *value* varies per VM start, per host or per OTP release. A case may observe
