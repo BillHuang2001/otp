@@ -829,6 +829,7 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 - **`beam_bifs/src/match_spec.rs` keeps the `trace` dialect typed `unsupported`** until the trace runner
   subsystem exists (the Known Issues entry above); the exact `{ok,…}`/`{error,…}` shapes and lint strings
   are recorded in `src/select/CONTEXT.md`.
+
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/kind.rs` → `TableKind`, `SetInterior`/`OrderedInterior`, `Access`, `Concurrency`, `WriteConcurrency`, `TableOptions` (incl. heir + `decentralized_counters`), `can_read`/`can_write`; unit tests in `src/kind/tests.rs`
