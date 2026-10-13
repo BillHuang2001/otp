@@ -912,7 +912,7 @@ fn un_lowered_instructions_deopt_to_the_interpreter_with_identical_outcomes() {
 
 /// A frame-preserving `call` whose continuation address falls **inside** an IR block
 /// (the loader cuts a function into blocks only at labels) gets its own native
-/// **sub-block** in the lazy layout, so the driver has a native entry at the address
+/// **sub-block** in each layout, so the driver has a native entry at the address
 /// the callee returns to rather than one interpreter round-trip per remaining
 /// instruction of the block. The sub-block is *not* a block: the driver's block table,
 /// `block_count` and the code map still describe IR blocks only.
@@ -945,11 +945,50 @@ fn a_call_continuation_inside_a_block_gets_its_own_native_sub_block() {
     );
     assert_eq!(compiled.block_count(), 2, "sub-blocks add no block");
 
-    // The eager layout lowers no sub-block, so the continuation address has no entry.
+    // The eager layout lowers the same continuation sub-blocks, so the continuation
+    // address is natively enterable there too; a block start still wins and the
+    // sub-block is still not counted as a block.
     let eager = compile_module(&module).expect("the module compiles eagerly");
+    let (eager_block, _) = eager.native_entry(&module, 0, 1).expect("pc 1 is a block");
+    assert_eq!(eager.entry(0, 1), Some(eager_block), "the block entry wins");
     assert!(
-        eager.entry(0, 4).is_none(),
-        "the eager layout is unchanged: no sub-block"
+        eager.entry(0, 4).is_some(),
+        "the eager layout has a sub-block at the continuation address"
+    );
+    assert_eq!(eager.block_count(), 3, "sub-blocks add no block");
+}
+
+/// The **eager** layout — the one the mandated `jit_bench` harness compiles — lowers the
+/// same continuation sub-blocks as the lazy layout, so its driver has a native entry at the
+/// `pc + 1` a frame-preserving call returns to even though that address is not an IR block
+/// start. An address with no code at all still answers `None`, and `block_count` still
+/// counts the non-empty IR blocks only (sub-blocks are not blocks).
+#[test]
+fn the_eager_layout_lowers_continuation_sub_blocks() {
+    let (module, _) = local_call_case();
+    let compiled = compile_module(&module).expect("the module compiles eagerly");
+
+    // `f/0`'s `call` sits at pc 3 inside the `Label(2)` block `[1, 5)`, so the
+    // continuation pc 4 is strictly inside that block: the eager artifact now has a
+    // native entry there, in addition to the IR block start at pc 1.
+    let (block, _) = compiled.native_entry(&module, 0, 1).expect("pc 1 is a block");
+    assert_eq!(compiled.entry(0, 1), Some(block), "pc 1 is the block start");
+    assert!(
+        compiled.entry(0, 4).is_some(),
+        "the eager continuation pc 4 has a native sub-block entry"
+    );
+    // An address with no code at all (past the end of the function) still has no entry.
+    assert!(
+        compiled.entry(0, module.functions[0].code.len() as u32).is_none(),
+        "an address past the end of the function has no entry"
+    );
+
+    // A sub-block is not a block: `block_count` equals the number of non-empty IR blocks.
+    let ir_blocks: usize = module.functions.iter().map(|f| f.blocks.len()).sum();
+    assert_eq!(
+        compiled.block_count(),
+        ir_blocks,
+        "sub-blocks add no compiled block"
     );
 }
 

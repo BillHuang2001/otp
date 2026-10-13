@@ -111,6 +111,18 @@ struct EagerLayout {
     /// that address compiled no block. A flat index (not a `HashMap`) because the
     /// driver probes it on every cross-block jump.
     entries: Vec<Vec<Option<*const u8>>>,
+    /// The native entry point of the **continuation sub-block** starting at `[func][pc]`,
+    /// or `None` (indexed `[func][pc]`).
+    ///
+    /// The eager twin of [`CompiledFunction::sub_entries`]: the `pc + 1` a
+    /// frame-preserving call stores in the live frame is generally *not* a block start
+    /// (only an [`Instr::Label`] is), so [`compile_module`](super::emit::compile_module)
+    /// lowers each such address as its own sub-block and records its native entry here.
+    /// Consulted by [`eager_entry`] **only after** `entries` came up empty, so a compiled
+    /// IR-block start always wins.
+    ///
+    /// [`Instr::Label`]: beam_loader::Instr::Label
+    sub_entries: Vec<Vec<Option<*const u8>>>,
     /// The whole-module register/block summary.
     summary: Summary,
 }
@@ -191,7 +203,8 @@ fn max_option(a: Option<u32>, b: Option<u32>) -> Option<u32> {
 
 impl CompiledModule {
     /// The **eager** artifact: the sealed buffer `buffer` holds every function's
-    /// blocks and `entries[func][pc]` is the block table.
+    /// blocks, `entries[func][pc]` is the block table and `sub_entries[func][pc]` the
+    /// continuation-sub-block table (see [`EagerLayout::sub_entries`]).
     ///
     /// The register-file guard for the eager layout is the **whole-module**
     /// [`Summary::highest_native_register`] (carried in `summary`), never a per-function
@@ -202,6 +215,7 @@ impl CompiledModule {
     pub(crate) fn eager(
         buffer: CodeBuffer,
         entries: Vec<Vec<Option<*const u8>>>,
+        sub_entries: Vec<Vec<Option<*const u8>>>,
         summary: Summary,
         labels: crate::interpreter::LabelMap,
         fingerprint: u64,
@@ -212,6 +226,7 @@ impl CompiledModule {
             layout: Layout::Eager(EagerLayout {
                 buffer,
                 entries,
+                sub_entries,
                 summary,
             }),
         }
@@ -519,10 +534,20 @@ impl EagerLayout {
     }
 }
 
-/// The eager block-table probe: `entries[func][pc]`.
+/// The eager block-table probe: `entries[func][pc]` first (so a real IR-block start
+/// always wins), then the continuation-sub-block table `sub_entries[func][pc]`.
 fn eager_entry(eager: &EagerLayout, func: u32, pc: u32) -> Option<*const u8> {
-    eager
+    if let Some(entry) = eager
         .entries
+        .get(func as usize)?
+        .get(pc as usize)
+        .copied()
+        .flatten()
+    {
+        return Some(entry);
+    }
+    eager
+        .sub_entries
         .get(func as usize)?
         .get(pc as usize)
         .copied()

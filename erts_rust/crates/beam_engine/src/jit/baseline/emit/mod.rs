@@ -239,6 +239,14 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
         .iter()
         .map(|function| vec![None; function.code.len()])
         .collect();
+    // The eager twin of the lazy layout's `CompiledFunction::sub_entries`: the native
+    // entry of the continuation sub-block starting at `[func][pc]`, filled by
+    // [`emit_shared_sub_blocks`] after every IR block (see that function).
+    let mut sub_entries: Vec<Vec<Option<*const u8>>> = module
+        .functions
+        .iter()
+        .map(|function| vec![None; function.code.len()])
+        .collect();
 
     // Reserve one entry label per non-empty compiled block **before** emitting any
     // code, so a branch to a successor block — usually a forward reference, e.g. a
@@ -273,12 +281,32 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
         summary.merge(&func_summary);
     }
 
+    // The eager layout's continuation sub-blocks: emitted **after every** IR block (so
+    // the block regions `entries`/`code_map` describe stay contiguous at the front of
+    // the shared mapping) and **before** `seal`, so the driver has a native entry at the
+    // `pc + 1` a frame-preserving call returns to instead of one interpreter step per
+    // remaining instruction of the block. See [`emit_shared_sub_blocks`].
+    for func_index in 0..module.functions.len() {
+        let function = &module.functions[func_index];
+        emit_shared_sub_blocks(
+            &mut buffer,
+            module,
+            &labels,
+            &block_labels,
+            func_index as u32,
+            &function.code,
+            &function.blocks,
+            &mut sub_entries[func_index],
+        )?;
+    }
+
     buffer.seal()?;
     // The artifact records the module's content fingerprint (computed here once, at
     // creation) so the cross-run cache can identify it without re-hashing the IR.
     Ok(CompiledModule::eager(
         buffer,
         entries,
+        sub_entries,
         summary,
         labels,
         crate::jit::cache::module_fingerprint(module),
@@ -484,6 +512,102 @@ fn emit_sub_blocks(
     Ok(())
 }
 
+/// Lower the eager layout's **continuation sub-blocks** into `buffer`, filling
+/// `sub_entries` — the eager twin of [`emit_sub_blocks`].
+///
+/// The eager layout lowers every function into one shared mapping up front and its driver
+/// entry probes the block table only through `entries` (see
+/// [`eager_entry`](super::code::eager_entry)); without this pass a continuation address —
+/// the `pc + 1` a frame-preserving call stores, usually strictly inside an IR block — would
+/// be executed one interpreter-step-per-instruction by the driver. The mandated
+/// `jit_bench` harness compiles the eager layout, so this pass gives the eager artifact the
+/// same non-block-start native entries the lazy layout already exposes through
+/// [`CompiledFunction::sub_entries`](super::code::CompiledFunction).
+///
+/// It mirrors the lazy [`emit_sub_blocks`] loop *exactly* except for two deliberate
+/// differences, both of which keep the eager **whole-module** introspection surface (a
+/// frozen contract asserted byte-exactly by the read-only tests — e.g.
+/// `block_count`/`cached_registers`/`highest_*`) untouched:
+///
+/// * **Allocation source** — the **containing IR block's** allocation
+///   ([`allocate_registers`] over `[block.start, block.end)`), not the sub-range's own. The
+///   sub-block's instructions are a subset of that block's, so the block's cache set is
+///   sound for it (every register the sub-block touches natively is already accounted for:
+///   either held resident, or read/written directly in `machine.x`), and — because the
+///   whole-module [`Summary`] was built from exactly this allocation when the IR block was
+///   emitted — reusing it leaves `cached_registers`/`highest_*` unchanged. A sub-range's own
+///   usage-weighted allocation is *not* necessarily a subset of the block's, so calling
+///   [`allocate_registers`] on `[start, end)` could widen the summary.
+/// * **No summary fold** — [`emit_block`]'s register touches during this pass go to a
+///   throwaway sink, so the eager whole-module [`Summary`] is provably untouched (it is
+///   idempotent anyway: the containing block already touched the same registers).
+///
+/// Everything else matches the lazy pass: a `start` at or past the end of the function, one
+/// that is already a compiled block start (`block_labels`), or one no IR block strictly
+/// contains, is skipped; a second call nested inside an earlier sub-block's range gets its
+/// own sub-block. Like the lazy version a sub-block reserves no entry label and adds no
+/// `entries` slot, so `block_count`/`code_map`/`code_address_range` keep describing IR
+/// blocks only.
+#[allow(clippy::too_many_arguments)]
+fn emit_shared_sub_blocks(
+    buffer: &mut CodeBuffer,
+    module: &Module,
+    labels: &LabelMap,
+    block_labels: &BTreeMap<(u32, u32), CodeLabel>,
+    func: u32,
+    code: &[Instr],
+    blocks: &[Block],
+    sub_entries: &mut [Option<*const u8>],
+) -> Result<()> {
+    for (pc, instr) in code.iter().enumerate() {
+        if !stores_continuation(instr) {
+            continue;
+        }
+        let start = pc + 1;
+        if start >= code.len() {
+            continue;
+        }
+        // An address that is already a compiled block start is served by the IR block's
+        // own entry; only a continuation strictly *inside* an IR block needs a sub-block.
+        if block_labels.contains_key(&(func, start as u32)) {
+            continue;
+        }
+        let Some(block) = blocks.iter().find(|b| b.start < start && start < b.end) else {
+            continue;
+        };
+        let end = block.end.min(code.len());
+        if start >= end {
+            continue;
+        }
+        // The containing IR block's allocation (see the doc comment): sound for the
+        // sub-range and identical to what the batch IR-block pass merged into the
+        // whole-module summary, so that summary is unchanged. `allocate_registers`
+        // clamps `end` to `code.len()` itself, so `block.end` needs no pre-clamp here.
+        let allocation = allocate_registers(module, code, block.start, block.end);
+        let mut discard: Option<u32> = None;
+        let offset = buffer.len();
+        emit_block(
+            buffer,
+            module,
+            labels,
+            block_labels,
+            func,
+            code,
+            start,
+            end,
+            &allocation,
+            &mut discard,
+        )?;
+        // SAFETY: the sub-block was fully emitted (no error), so `offset` is the start of
+        // a complete native function inside the buffer; `offset + emitted < capacity` was
+        // enforced by every emission call.
+        let entry = unsafe { buffer.code_ptr().add(offset) };
+        // `start < end <= code.len()`, so the slot always exists.
+        sub_entries[start] = Some(entry);
+    }
+    Ok(())
+}
+
 /// Lower every non-empty block of function `func` into `buffer`, binding the
 /// pre-reserved entry label of each and filling `entries[start]` with its native
 /// entry point.
@@ -575,7 +699,10 @@ fn code_capacity_estimate(module: &Module) -> usize {
     module
         .functions
         .iter()
-        .map(|function| function_capacity_estimate(&function.code, function.blocks.len()))
+        .map(|function| {
+            function_capacity_estimate(&function.code, function.blocks.len())
+                + sub_blocks_capacity_estimate(&function.code, &function.blocks)
+        })
         .sum::<usize>()
         + DEFAULT_CAPACITY
 }
