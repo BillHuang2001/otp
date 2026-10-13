@@ -172,16 +172,25 @@
 //!   middle, while `{chars_limit,100}`/`{chars_limit,-1}` are the normal deep
 //!   list. Every *small* control (`~s` of an atom, `~e`/`~f`/`~g`, `~b`/`~B`,
 //!   `~x`/`~X`, `~c`, `~~`, `~n`, `~i`) is covered — its characters count toward
-//!   `Other` and the running column. **`~s` of a list or binary under an active
-//!   limit is not ported** and stays a typed, catchable `unsupported_bif` (see
-//!   [`check_options`]), never a wrong rendering.
+//!   `Other` and the running column.
+//! * **`~s` of a *list* or *binary* under an active limit is covered too**
+//!   ([`render_limited_s`], the oracle's `control_limited($s, …)`): the iolist is
+//!   limited to the per-directive budget by `iolist_to_chars/3` (eliding with
+//!   `"..."`) and `string/6` then applies the directive's field width / precision
+//!   to the *limited* text, so
+//!   `io_lib:format("~s", ["hello world!!"], [{chars_limit,10}])` is
+//!   `[[104,101,108,108,111,32,119,46,46,46]]` ("hello w..."). The `unicode`
+//!   (`~ts`) arm — `cdata_to_chars/3` + `uniconv/1`, which is grapheme-based and
+//!   flattens the iolist differently — **stays a typed, catchable
+//!   `unsupported_bif`** (see [`render_limited_s`]), never a wrong rendering.
 
 use beam_codec::term::big_parts;
 use beam_common::Result;
 use beam_term::{atom_val, signed_value, Eterm};
 
 use crate::access::{
-    float_value, is_atom, is_big, is_float, is_list, is_small, is_tuple, tuple_element, tuple_size,
+    car, cdr, float_value, is_atom, is_big, is_float, is_list, is_nil, is_small, is_tuple,
+    tuple_element, tuple_size,
 };
 use crate::arith::int_from_mag;
 use crate::bits;
@@ -282,13 +291,14 @@ fn format_lib_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// The `{chars_limit, N}` option is honoured (see [`check_options`]): a
 /// non-negative `N` returns the oracle's *limited* deep list, a negative one the
-/// normal unlimited rendering. A *limiting* `chars_limit` combined with `~s` of a
-/// list/binary is the typed, catchable `unsupported_bif` gap. The gap is a plain
-/// `BeamError::Raise` (reason atom `unsupported_bif`), so interpreted/compiled
-/// Erlang code can `try … catch error:unsupported_bif -> …` it; it never aborts
-/// the runtime. (The CLI's `-eval` entry point reports every capability gap as an
-/// unrecoverable `Flow::Fatal` by design — a `beam_rt` policy, not a property of
-/// this BIF.)
+/// normal unlimited rendering. The only control still not covered under a
+/// limiting `chars_limit` is `~s` of a list/binary in the **unicode** (`~ts`)
+/// encoding — the typed, catchable `unsupported_bif` gap (see
+/// [`render_limited_s`]). The gap is a plain `BeamError::Raise` (reason atom
+/// `unsupported_bif`), so interpreted/compiled Erlang code can
+/// `try … catch error:unsupported_bif -> …` it; it never aborts the runtime. (The
+/// CLI's `-eval` entry point reports every capability gap as an unrecoverable
+/// `Flow::Fatal` by design — a `beam_rt` policy, not a property of this BIF.)
 fn format_lib_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let chars_limit = check_options(ctx, args[2])?;
     io_lib_format(ctx, args[0], Some(args[1]), chars_limit)
@@ -503,9 +513,8 @@ enum BuildItem {
     Big(BigControl),
 }
 
-/// A "big" control as pass 1 captured it (`~w`/`~W`/`~p`/`~P`, and `~s` of a
-/// list/binary — the last of which pass 2 refuses, see
-/// [`render_limited_control`]).
+/// A "big" control as pass 1 captured it (`~w`/`~W`/`~p`/`~P` and `~s` of a
+/// list/binary — the `not_small` arms of the oracle's `control_small/7`).
 struct BigControl {
     /// The control character.
     ctrl: u8,
@@ -513,7 +522,7 @@ struct BigControl {
     spec: Spec,
     /// The term argument.
     term: Eterm,
-    /// The `~W`/`~P` depth argument (`UNLIMITED_DEPTH` for `~w`/`~p`).
+    /// The `~W`/`~P` depth argument (`UNLIMITED_DEPTH` for `~w`/`~p`/`~s`).
     depth: i64,
 }
 
@@ -522,7 +531,8 @@ struct BigControl {
 ///
 /// Pass 1 is [`render_format_unlimited`]'s walk with the big controls *captured*
 /// instead of rendered (`build_small/2`: a literal and every *small* control
-/// become flat characters, `~w`/`~W`/`~p`/`~P` stay a control). `count_small/1`
+/// become flat characters, `~w`/`~W`/`~p`/`~P`/`~s`-of-a-list-or-binary stay a
+/// control). `count_small/1`
 /// then sums the flat characters into `Other` and counts the big controls into
 /// `P` (`~p`/`~P`) and `W` (`~w`/`~W`/`~s` — the oracle's own quirk keeps its `S`
 /// counter at `0`). Pass 2 walks the captured items again with the per-directive
@@ -571,12 +581,32 @@ fn render_format_limited(
                     depth,
                 }));
             }
+            b's' => {
+                // `build_small/2` splices a **small** control's characters flat and
+                // keeps everything else as a control for pass 2. `~s` is small only
+                // for an **atom** (`control_small($s, [A], …) when is_atom(A)`); a
+                // list, a binary or anything else stays a `not_small` control.
+                let term = take(args, &mut next_arg)?;
+                if is_atom(term) {
+                    let piece = string_piece(ctx, term, &spec)?;
+                    column = indentation_of(&piece.chunk, column);
+                    items.push(BuildItem::Flat(piece.chunk));
+                } else {
+                    items.push(BuildItem::Big(BigControl {
+                        ctrl,
+                        spec,
+                        term,
+                        depth: UNLIMITED_DEPTH,
+                    }));
+                }
+            }
             _ => {
+                // Every remaining control is one `control_small/7` renders, so its
+                // characters are spliced flat; a `not_small` piece here would be a
+                // bug (only `~s` of a non-atom is `not_small`), so it stays the
+                // typed gap rather than a wrong rendering.
                 let piece = dispatch(ctx, ctrl, &spec, args, &mut next_arg, column)?;
                 if !piece.small {
-                    // `~s` of a list/binary under an active limit is not ported:
-                    // the typed gap, never a wrong (unlimited or wrongly elided)
-                    // string.
                     return Err(unsupported_bif());
                 }
                 column = indentation_of(&piece.chunk, column);
@@ -653,12 +683,13 @@ fn render_format_limited(
 ///   [`pretty_write_limited`] entry point) followed by the directive's field
 ///   (`term/6`, [`term_field`]);
 /// * `~p`/`~P` — `io_lib_format:print/…` under the limit ([`render_p`] with a
-///   non-negative `chars_limit`).
+///   non-negative `chars_limit`);
+/// * `~s` — [`render_limited_s`] (`iolist_to_chars/3` then `string/6`).
 ///
 /// # Errors
 ///
-/// The typed [`unsupported_bif`] for a big control with no limited clause here
-/// (`~s` of a list/binary), plus whatever the renderer itself reports.
+/// The typed [`unsupported_bif`] for the `~s` **unicode** arm, plus whatever the
+/// renderer itself reports.
 fn render_limited_control(
     ctx: &mut BifContext<'_>,
     big: &BigControl,
@@ -686,7 +717,278 @@ fn render_limited_control(
             at,
             max_chars,
         ),
+        b's' => render_limited_s(big, max_chars),
         _ => Err(unsupported_bif()),
+    }
+}
+
+/// `io_lib_format:control_limited($s, …)` — `~s` of a **list or binary** under
+/// the per-directive budget `chars_limit` (`io_lib_format.erl`):
+///
+/// ```text
+/// control_limited($s, [L0], F, Adj, P, Pad, latin1, _Str, _Ord, CL, _I) ->
+///     L = iolist_to_chars(L0, F, CL),
+///     string(L, limit_field(F, CL), Adj, P, Pad, latin1);
+/// ```
+///
+/// [`iolist_to_chars_limited`] limits the iolist to
+/// `limit_field`'s field rule and the per-directive budget (eliding with `"..."`),
+/// and [`string_field_chunk`] then applies the directive's field width / precision
+/// to the *limited* text — `io_lib_format:string/6`. The result is a single
+/// sub-list element of the output, exactly like the un-limited `~s`
+/// ([`render_format_limited`] pushes it as one item).
+///
+/// The `unicode` (`~ts`) arm — `cdata_to_chars(L0, F, CL)` then
+/// `uniconv(string(L, …))` — is **not** this algorithm: `limit_cdata_to_chars/3`
+/// advances by `string:next_grapheme/1` (so it flattens the iolist *and* counts
+/// grapheme clusters), and the oracle's `uniconv/1` may re-encode to a binary.
+/// It stays the typed, catchable [`unsupported_bif`], never a wrong rendering.
+fn render_limited_s(big: &BigControl, chars_limit: i64) -> Result<Chunk> {
+    if big.spec.unicode {
+        return Err(unsupported_bif());
+    }
+    let limited = iolist_to_chars_limited(big.term, big.spec.width, chars_limit)?;
+    string_field_chunk(
+        Chunk::List(limited),
+        limit_field(big.spec.width, chars_limit),
+        big.spec.left,
+        big.spec.precision,
+        big.spec.pad,
+    )
+}
+
+/// `io_lib_format:limit_field/2` — the field width a control's rendering uses
+/// under the per-directive budget `chars_limit`.
+///
+/// A negative budget (the unlimited path) or no width at all leaves the width
+/// unchanged; otherwise the width is clamped to at least 3 characters and to the
+/// budget: `max(3, min(F, CharsLimit))`. The `min(3, …)` floor is what lets the
+/// elision marker `"..."` still fit.
+fn limit_field(field: Option<usize>, chars_limit: i64) -> Option<usize> {
+    if chars_limit < 0 {
+        return field;
+    }
+    field.map(|f| f.min(chars_limit.max(0) as usize).max(3))
+}
+
+/// `io_lib_format:iolist_to_chars/3` — the iolist rendering of `L0` under the
+/// char limit `chars_limit`, with the directive's field width `field`.
+///
+/// The oracle returns the *plain* [`iolist_to_chars/1`] nesting when the limit is
+/// negative or at least the field width — note that a **missing** width (`none`,
+/// i.e. `None` here) is an atom in Erlang, and an integer is always ordered
+/// *before* an atom, so `CharsLimit >= none` is false and the limited walk runs —
+/// else it runs [`limit_iolist_to_chars`] with `CharsLimit - 3` characters and the
+/// `"..."` elision (the `sub/2` clamp keeps that budget non-negative).
+///
+/// The result is the **element list** of the produced list: each element is a
+/// [`Chunk::Char`] or a nested [`Chunk::List`], so the caller can materialize the
+/// oracle's exact nesting (`io_lib:format("~s", [[<<"ab">>,[$c,$d]]],
+/// [{chars_limit,100}])` is `[[[97,98],99,100]]`, not a flat `[97,98,99,100]`).
+fn iolist_to_chars_limited(
+    term: Eterm,
+    field: Option<usize>,
+    chars_limit: i64,
+) -> Result<Vec<Chunk>> {
+    let plain = chars_limit < 0 || field.is_some_and(|f| chars_limit >= f as i64);
+    if plain {
+        return iolist_to_chars(term);
+    }
+    limit_iolist_to_chars(
+        LimitSource::Term(term),
+        tsub(chars_limit, 3),
+        &mut Vec::new(),
+        LimitMode::Normal,
+    )
+}
+
+/// `io_lib_format:iolist_to_chars/1` — the **unlimited** iolist rendering.
+///
+/// A byte-sized small integer is one element, a nested list keeps its nesting and a
+/// byte-aligned binary becomes one flat sub-list; anything else (a float, a
+/// bignum, a non-byte-aligned bitstring) is the oracle's `function_clause`, i.e.
+/// the observable `badarg`.
+fn iolist_to_chars(term: Eterm) -> Result<Vec<Chunk>> {
+    if bits::is_bitstring(term) {
+        return Ok(vec![Chunk::List(binary_chars(term)?)]);
+    }
+    if is_list(term) {
+        let head = car(term);
+        let mut out = match byte_char(head) {
+            Some(byte) => vec![Chunk::Char(byte)],
+            None => vec![Chunk::List(iolist_to_chars(head)?)],
+        };
+        out.extend(iolist_to_chars(cdr(term))?);
+        return Ok(out);
+    }
+    if is_nil(term) {
+        return Ok(Vec::new());
+    }
+    Err(badarg())
+}
+
+/// The `Cs` of `io_lib_format:limit_iolist_to_chars/4` — the source term, or the
+/// byte slice a `split_binary/2` in the recursion continues with (the split tail
+/// is a raw binary the caller never materialized as a term).
+enum LimitSource<'a> {
+    /// A term of the source iolist: a cons, `[]` or a byte-aligned binary.
+    Term(Eterm),
+    /// The tail of a binary `split_binary(B, Limit)` cut off.
+    Bytes(&'a [u8]),
+}
+
+/// `io_lib_format:limit_iolist_to_chars/4`'s `Mode`: `normal` still has budget to
+/// spend, `final` is the 4-character `"..."` probe the `0` budget triggers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LimitMode {
+    Normal,
+    Final,
+}
+
+/// `io_lib_format:limit_iolist_to_chars/4` — the limited iolist walk.
+///
+/// * a byte-sized small integer is one element and spends one character;
+/// * a nested list is walked with its tail pushed on `stack` (the oracle's `S`),
+///   so an inner list's characters splice into the **outer** element list while
+///   keeping their own nesting;
+/// * a byte-aligned binary becomes one flat sub-list, cut at the remaining budget;
+/// * a non-byte-aligned bitstring, a float, a bignum, an improper tail and any
+///   other term are the oracle's `function_clause`, i.e. the observable `badarg`.
+///
+/// The `Normal`/`Final` mode and the `stack` reproduce the oracle's mutually
+/// recursive clauses: budget `0` in `Normal` mode probes 4 more characters in
+/// `Final` mode and yields `"..."` when all 4 were spent; budget `0` in `Final`
+/// mode ends the probe.
+fn limit_iolist_to_chars(
+    source: LimitSource<'_>,
+    limit: i64,
+    stack: &mut Vec<Eterm>,
+    mode: LimitMode,
+) -> Result<Vec<Chunk>> {
+    let mut source = source;
+    let limit = limit;
+    loop {
+        if limit == 0 {
+            if mode == LimitMode::Final {
+                return Ok(Vec::new());
+            }
+            let probed = limit_iolist_to_chars(source, 4, stack, LimitMode::Final)?;
+            // `case iolist_size(L) of N when N < 4 -> L; 4 -> "..." end`.
+            return Ok(if chunk_list_len(&probed) < 4 {
+                probed
+            } else {
+                vec![Chunk::Char('.'), Chunk::Char('.'), Chunk::Char('.')]
+            });
+        }
+        match source {
+            LimitSource::Bytes(bytes) => return limit_iolist_to_binary(bytes, limit, stack, mode),
+            LimitSource::Term(term) => {
+                if bits::is_bitstring(term) {
+                    if !bits::is_binary(term) {
+                        return Err(badarg());
+                    }
+                    let bytes = bits::bytes(term)?;
+                    return limit_iolist_to_binary(&bytes, limit, stack, mode);
+                }
+                if is_list(term) {
+                    let head = car(term);
+                    if let Some(byte) = byte_char(head) {
+                        let mut out = vec![Chunk::Char(byte)];
+                        out.extend(limit_iolist_to_chars(
+                            LimitSource::Term(cdr(term)),
+                            limit - 1,
+                            stack,
+                            mode,
+                        )?);
+                        return Ok(out);
+                    }
+                    // `[I|Cs] -> limit(I, Limit, [Cs|S], Mode)`.
+                    stack.push(cdr(term));
+                    source = LimitSource::Term(head);
+                    continue;
+                }
+                if is_nil(term) {
+                    // `[]` with `S == []` ends; otherwise the stack pops.
+                    return limit_iolist_to_empty(limit, stack, mode);
+                }
+                return Err(badarg());
+            }
+        }
+    }
+}
+
+/// The oracle's binary clause of `limit_iolist_to_chars/4`: a binary that fits
+/// the budget is one flat sub-list and spends its bytes; a longer one is cut, its
+/// prefix becoming a sub-list and its tail re-walked with a `0` budget.
+fn limit_iolist_to_binary(
+    bytes: &[u8],
+    limit: i64,
+    stack: &mut Vec<Eterm>,
+    mode: LimitMode,
+) -> Result<Vec<Chunk>> {
+    let size = bytes.len() as i64;
+    let mut out = Vec::new();
+    if size > limit {
+        // `limit >= 0` always (the `0` probe and the `- 1` steps never go below it).
+        let cut = limit.max(0) as usize;
+        out.push(Chunk::List(bytes_chars(&bytes[..cut])));
+        out.extend(limit_iolist_to_chars(
+            LimitSource::Bytes(&bytes[cut..]),
+            0,
+            stack,
+            mode,
+        )?);
+    } else {
+        out.push(Chunk::List(bytes_chars(bytes)));
+        out.extend(limit_iolist_to_empty(limit - size, stack, mode)?);
+    }
+    Ok(out)
+}
+
+/// The oracle's `[]` clauses of `limit_iolist_to_chars/4`: an empty `S` ends the
+/// walk, otherwise the top continuation is popped and resumed.
+fn limit_iolist_to_empty(
+    limit: i64,
+    stack: &mut Vec<Eterm>,
+    mode: LimitMode,
+) -> Result<Vec<Chunk>> {
+    match stack.pop() {
+        Some(tail) => limit_iolist_to_chars(LimitSource::Term(tail), limit, stack, mode),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// The `binary_to_list/1` of a byte-aligned binary **term** — a non-byte-aligned
+/// bitstring is the oracle's `function_clause`, i.e. `badarg`.
+fn binary_chars(term: Eterm) -> Result<Vec<Chunk>> {
+    if !bits::is_binary(term) {
+        return Err(badarg());
+    }
+    Ok(bytes_chars(&bits::bytes(term)?))
+}
+
+/// `binary_to_list/1` of a byte slice: one [`Chunk::Char`] per byte.
+fn bytes_chars(bytes: &[u8]) -> Vec<Chunk> {
+    bytes.iter().map(|&b| Chunk::Char(b as char)).collect()
+}
+
+/// `iolist_size/1` of an element list — the elements are only [`Chunk::Char`]s and
+/// nested lists of them, so the flat character count *is* the byte count.
+fn chunk_list_len(items: &[Chunk]) -> usize {
+    items.iter().map(Chunk::flat_len).sum()
+}
+
+/// The `char` a byte-sized small integer denotes, `None` for anything else (a
+/// bignum, a float, a list, a binary, …) — the oracle's `0 =< C =< 255` guard.
+fn byte_char(term: Eterm) -> Option<char> {
+    if !is_small(term) {
+        return None;
+    }
+    let value = signed_value(term);
+    if (0..=255).contains(&value) {
+        Some(value as u8 as char)
+    } else {
+        None
     }
 }
 
@@ -984,9 +1286,7 @@ fn dispatch(
         }
         b's' => {
             let arg = take(args, next_arg)?;
-            let (text, small) = string_arg(ctx, arg)?;
-            let chunk = string_field_chunk(text, spec.width, spec.left, spec.precision, spec.pad)?;
-            Ok(Piece { chunk, small })
+            string_piece(ctx, arg, spec)
         }
         b'c' => {
             let arg = take(args, next_arg)?;
@@ -1130,6 +1430,19 @@ fn is_deep_char(term: Eterm) -> bool {
     (0..0xD800).contains(&value)
         || (0xE000..0xFFFE).contains(&value)
         || (0x10000..=0x10FFFF).contains(&value)
+}
+
+/// Renders the `~s` argument (`io_lib_format:control_small($s,…)` /
+/// `control_limited($s,…)`): the [`string_arg`] text wrapped in the directive's
+/// field rule ([`string_field_chunk`] — `io_lib_format:string/6`).
+///
+/// Also reports whether the control is "small" ([`string_arg`]): only `~s` of an
+/// **atom** is, so pass 1 of the limited path splices it flat while a list or a
+/// binary is captured for [`render_limited_s`].
+fn string_piece(ctx: &BifContext<'_>, arg: Eterm, spec: &Spec) -> Result<Piece> {
+    let (text, small) = string_arg(ctx, arg)?;
+    let chunk = string_field_chunk(text, spec.width, spec.left, spec.precision, spec.pad)?;
+    Ok(Piece { chunk, small })
 }
 
 /// Renders the `~s` argument: an atom's name, a proper list of byte-sized small
