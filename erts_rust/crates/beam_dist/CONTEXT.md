@@ -729,7 +729,12 @@ line (no timestamps/addresses/ports) and exits `0`:
   the **connector half** and the `net_kernel` `{setup,…}`/`{nodeup,…}` protocol; every non-send delivery
   is `DeliveryOutcome::Unsupported`; and the node does **not** advertise `DFLAG_PUBLISHED`/visibility at
   startup (no `publish_flag` caller). The value/connection layer plus this accept-only wiring is the
-  whole of the current distribution support.
+  whole of the current distribution support. The per-link **checked** path this crate now exposes
+  (`Connection::recv_delivery_checked`/`dispatch_inbound_checked`, `ConnectionDriver::next_delivery_checked`/
+  `dispatch_inbound_checked`, over `LinkIdentity` + `Delivery::classify_validated`) is **not yet adopted
+  there**: `LocalDeliverySink` is a single sink built once per scheduler pass and shared across every
+  established link, so it cannot supply the per-link peer identity the C's `dep` check needs — adoption
+  requires a per-link sink (or threading the link's peer into `InboundSink::deliver`).
 - **Tick *scheduling* is `net_kernel`'s job.** The `net_ticktime` timeout and the resulting
   `{nodedown,Node}` decision belong to `net_kernel` (Erlang, `lib/kernel/src/net_kernel.erl`), not
   this crate's; this crate only answers an inbound tick.
