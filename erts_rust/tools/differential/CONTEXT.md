@@ -133,6 +133,7 @@ Harness / data:
 - `tests/cli.rs` → end-to-end binary tests (above); holds `corpus_run_lock()` for full-corpus bodies.
 - `tests/abi.rs` → A.3/A.4 structural C-ABI check (above).
 - `tests/module_sweep.rs` → the broad real-module execute sweep (above), kept out of the default `suite`.
+- `tests/dist_probe_contract.rs` → the `dist_probe` helper's **CLI contract** driven directly (all eleven `loopback <report>` lines byte-exact + exit `0`, and the exit-`2` usage contract for a missing/unknown/over-long argv); resolves the helper via `$BEAM_DIST_PROBE` else a built `dist_probe`, skips loudly when absent. The failure half cannot be a corpus case (a `Command` case needs a non-empty golden stdout and a zero golden exit code).
 - `gate.sh` → the CI gate wrapper (arg handling + the `0/1/2/3` ratchet contract).
 - `known-gaps.txt` → the committed ratchet allowlist (source of truth; `<case-id> <owning-crate> <reason…>` per line, `#` comments ignored).
 - `GAPS.md` → the generated gaps document (`--gaps`), never hand-edited; appends `divergences.md`.
