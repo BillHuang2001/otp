@@ -294,49 +294,21 @@ fn item_of_term(term: Eterm) -> Result<Chunk> {
     Err(badarg())
 }
 
-/// `io_lib:chars_length(S)` — `try iolist_size(S) catch _:_ -> string:length(S) end`.
+/// `io_lib:chars_length(S)` — `try iolist_size(S) catch _:_ -> string:length(S) end`
+/// — over the element list, through the shared
+/// [`crate::io::chars_length_chunk`] (the same rule `io_lib_format:string/6` uses
+/// on the unlimited path).
 ///
 /// The **first** branch wins whenever the element list measures as an iolist (every
 /// element a byte-sized integer or a binary, recursively), so a cluster list of
 /// code points above 255 (`[97,769]`) falls through to the grapheme count — the
 /// distinction that decides how far `string/6` pads.
 fn chars_length(ctx: &mut BifContext<'_>, items: &[Chunk]) -> Result<i64> {
-    match iolist_size(items) {
-        Some(size) => Ok(size as i64),
-        None => items_string_length(ctx, items),
-    }
+    let n = crate::io::chars_length_chunk(ctx, &Chunk::List(items.to_vec()))?;
+    i64::try_from(n).map_err(|_| badarg())
 }
 
-/// The `iolist_size/1` branch: `None` when some element is not a valid iolist leaf
-/// (an integer outside `0..=255`), which is exactly the oracle's raise.
-fn iolist_size(items: &[Chunk]) -> Option<usize> {
-    let mut total = 0usize;
-    for item in items {
-        total += iolist_size_item(item)?;
-    }
-    Some(total)
-}
-
-fn iolist_size_item(item: &Chunk) -> Option<usize> {
-    match item {
-        Chunk::Char(c) => {
-            let value = *c as u32;
-            (value <= 0xFF).then_some(1)
-        }
-        Chunk::Int(term) => {
-            if is_small(*term) && (0..=255).contains(&signed_value(*term)) {
-                Some(1)
-            } else {
-                None
-            }
-        }
-        Chunk::Bin(bytes) => Some(bytes.len()),
-        Chunk::List(inner) => iolist_size(inner),
-    }
-}
-
-/// `string:length(List)` of an element list — the fallback of
-/// [`chars_length`] and the elision probe's counter.
+/// `string:length(List)` of an element list — the elision probe's counter.
 ///
 /// A binary element makes the oracle's `string:length/1` raise (`{badarg, …}`),
 /// which [`crate::unicode::grapheme::grapheme_count`] reproduces; the raise surfaces
@@ -450,7 +422,7 @@ fn flat_trunc(ctx: &mut BifContext<'_>, items: &[Chunk], n: usize) -> Result<Vec
 /// `append(GC, Str)` **splices** a cluster list (`GC ++ Str`) and conses a bare
 /// integer — so a multi-code-point cluster is flattened into the truncated result
 /// (`string:slice([[97,769],[98]], 0, 2)` = `[97,769,98]`).
-fn slice_list(ctx: &mut BifContext<'_>, cd: Eterm, n: usize) -> Result<Vec<Chunk>> {
+pub(crate) fn slice_list(ctx: &mut BifContext<'_>, cd: Eterm, n: usize) -> Result<Vec<Chunk>> {
     if n == 0 {
         return Ok(Vec::new());
     }

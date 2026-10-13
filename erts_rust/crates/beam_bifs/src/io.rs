@@ -229,8 +229,8 @@ use crate::error::{badarg, unsupported_bif};
 use crate::numeric::integer_digits;
 use crate::print::{
     adjust_chunk, dup_chars, dup_element, field_chunk, flatten_output, pretty_chunk,
-    pretty_chunk_limited, pretty_chunk_order, pretty_write_limited, proper_list,
-    string_field_chunk, term_chunk_order, tsub, Chunk, MapOrder, UNLIMITED_DEPTH,
+    pretty_chunk_limited, pretty_chunk_order, pretty_write_limited, proper_list, term_chunk_order,
+    tsub, Chunk, MapOrder, UNLIMITED_DEPTH,
 };
 use crate::registry::BifRegistry;
 
@@ -787,6 +787,7 @@ fn render_limited_s(ctx: &mut BifContext<'_>, big: &BigControl, chars_limit: i64
     }
     let limited = iolist_to_chars_limited(big.term, big.spec.width, chars_limit)?;
     string_field_chunk(
+        ctx,
         Chunk::List(limited),
         limit_field(big.spec.width, chars_limit),
         big.spec.left,
@@ -1117,6 +1118,56 @@ pub(crate) fn chunk_to_term(ctx: &mut BifContext<'_>, chunk: &Chunk) -> Result<E
             ctx.list(&elems)
         }
         Chunk::Bin(bytes) => bits::make_binary(ctx.heap(), bytes),
+    }
+}
+
+/// `io_lib:chars_length/1` — `try iolist_size(S) catch _:_ -> string:length(S) end`
+/// — over a chunk's term image.
+///
+/// The `iolist_size/1` branch wins whenever **every** leaf is a byte-sized integer
+/// (a [`Chunk::Char`] in `0..=255`, a [`Chunk::Int`] likewise, or a
+/// [`Chunk::Bin`]); otherwise the oracle falls back to `string:length/1`, which
+/// counts **grapheme clusters** over the whole flattened term. The two disagree for
+/// a code point above 255: `chars_length([97,769,98,99])` is `3` (the combining
+/// acute accent merges with the `a`), not the `4` element count — which is why
+/// `io_lib:format("~10ts", [[97,769,98,99]], [{chars_limit,-1}])` pads 7, not 6.
+///
+/// # Errors
+///
+/// `badarg` when the fallback's `string:length/1` raises (a binary element, an
+/// unwalkable term), exactly as the oracle's `chars_length/1` propagates it.
+pub(crate) fn chars_length_chunk(ctx: &mut BifContext<'_>, chunk: &Chunk) -> Result<usize> {
+    match iolist_size_chunk(chunk) {
+        Some(size) => Ok(size),
+        None => {
+            let term = chunk_to_term(ctx, chunk)?;
+            let count =
+                crate::unicode::grapheme::grapheme_count(ctx, term).map_err(|_| badarg())?;
+            if !is_small(count) {
+                return Err(badarg());
+            }
+            usize::try_from(signed_value(count)).map_err(|_| badarg())
+        }
+    }
+}
+
+/// The `iolist_size/1` branch of [`chars_length_chunk`]: the summed byte size,
+/// `None` when some element is not an iolist leaf (an integer outside `0..=255`),
+/// which is exactly the oracle's raise.
+pub(crate) fn iolist_size_chunk(chunk: &Chunk) -> Option<usize> {
+    match chunk {
+        Chunk::Char(c) => ((*c as u32) <= 0xFF).then_some(1),
+        Chunk::Int(term) => {
+            (is_small(*term) && (0..=255).contains(&signed_value(*term))).then_some(1)
+        }
+        Chunk::Bin(bytes) => Some(bytes.len()),
+        Chunk::List(items) => {
+            let mut total = 0usize;
+            for item in items {
+                total += iolist_size_chunk(item)?;
+            }
+            Some(total)
+        }
     }
 }
 
@@ -1488,10 +1539,86 @@ fn is_deep_char(term: Eterm) -> bool {
 /// Also reports whether the control is "small" ([`string_arg`]): only `~s` of an
 /// **atom** is, so pass 1 of the limited path splices it flat while a list or a
 /// binary is captured for [`render_limited_s`].
-fn string_piece(ctx: &BifContext<'_>, arg: Eterm, spec: &Spec) -> Result<Piece> {
+fn string_piece(ctx: &mut BifContext<'_>, arg: Eterm, spec: &Spec) -> Result<Piece> {
     let (chunk, small) = string_arg(ctx, arg, spec.unicode)?;
-    let chunk = string_field_chunk(chunk, spec.width, spec.left, spec.precision, spec.pad)?;
+    let chunk = string_field_chunk(ctx, chunk, spec.width, spec.left, spec.precision, spec.pad)?;
     Ok(Piece { chunk, small })
+}
+
+/// `io_lib_format:string/6` — the `~s` field rule.
+///
+/// `io_lib:chars_length(S)` is measured **lazily**: the oracle's `S, none, _, none`
+/// clause returns `S` untouched, so an argument whose `string:length/1` would raise
+/// (an out-of-range code point) is only an error once a width or a precision is
+/// present. The truncation is the oracle's `flat_trunc/3` — a grapheme-cluster
+/// `string:slice/3`, so a cluster is kept whole (`~1ts` of `[97,769,98,99]` is
+/// `[[97,769]]`, not `[[97]]`).
+fn string_field_chunk(
+    ctx: &mut BifContext<'_>,
+    s: Chunk,
+    width: Option<usize>,
+    left: bool,
+    precision: Option<usize>,
+    pad: u8,
+) -> Result<Chunk> {
+    match (width, precision) {
+        (None, None) => Ok(s),
+        (Some(f), None) => string_field(ctx, s, f, left, pad),
+        (None, Some(p)) => string_field(ctx, s, p, true, pad),
+        (Some(f), Some(p)) if f >= p => {
+            let n = chars_length_chunk(ctx, &s)?;
+            if f > p {
+                if n > p {
+                    Ok(adjust_chunk(
+                        flat_trunc_chunk(ctx, &s, p)?,
+                        dup_chars(pad as char, f - p),
+                        left,
+                    ))
+                } else if n < p {
+                    // `[S | chars(Pad, P-N)]`.
+                    let mut items = vec![s];
+                    items.extend(dup_chars(pad as char, p - n).into_items());
+                    Ok(adjust_chunk(
+                        Chunk::List(items),
+                        dup_chars(pad as char, f - p),
+                        left,
+                    ))
+                } else {
+                    Ok(adjust_chunk(s, dup_chars(pad as char, f - p), left))
+                }
+            } else {
+                string_field(ctx, s, f, left, pad)
+            }
+        }
+        _ => Err(badarg()),
+    }
+}
+
+/// `io_lib_format:string_field/6` with `N = io_lib:chars_length(S)`.
+fn string_field(
+    ctx: &mut BifContext<'_>,
+    s: Chunk,
+    f: usize,
+    left: bool,
+    pad: u8,
+) -> Result<Chunk> {
+    let n = chars_length_chunk(ctx, &s)?;
+    if n > f {
+        flat_trunc_chunk(ctx, &s, f)
+    } else if n < f {
+        Ok(adjust_chunk(s, dup_chars(pad as char, f - n), left))
+    } else {
+        Ok(s)
+    }
+}
+
+/// `io_lib_format:flat_trunc/3` — `string:slice(S, 0, N)` over the chunk's term
+/// image (the list clause; the `~s`/`~ts` argument is always an element list here),
+/// so the slice advances by **grapheme clusters** and splices a multi-code-point
+/// cluster flat (`string:slice([97,769,98,99], 0, 1)` = `[97,769]`).
+fn flat_trunc_chunk(ctx: &mut BifContext<'_>, s: &Chunk, n: usize) -> Result<Chunk> {
+    let term = chunk_to_term(ctx, s)?;
+    Ok(Chunk::List(crate::io_ts::slice_list(ctx, term, n)?))
 }
 
 /// Renders the `~s` argument: an atom's name, or — under the `latin1` encoding —
@@ -3702,6 +3829,10 @@ mod tests {
         // `print.rs`'s `dup_chars` (the oracle's `chars/2`), `adjust_chunk`
         // (`adjust/3`) and `string_field_chunk` (`string/6`, `flat_trunc/3`),
         // asserted through their flattened text.
+        let mut heap = Heap::new(1 << 16).expect("test heap");
+        let mut atoms = AtomTable::new();
+        atoms.seed(SEED);
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
         let pad = || dup_chars('*', 3);
         assert_eq!(flatten(&[adjust_chunk(Chunk::text("x"), pad(), false)]), "***x");
         assert_eq!(flatten(&[adjust_chunk(Chunk::text("x"), pad(), true)]), "x***");
@@ -3715,9 +3846,27 @@ mod tests {
         );
         assert_eq!(flatten(&[dup_chars('0', 3)]), "000");
         assert_eq!(
-            flatten(&[string_field_chunk(Chunk::text("hello"), Some(3), false, None, b' ')
-                .expect("fits")]),
+            flatten(&[string_field_chunk(
+                &mut ctx,
+                Chunk::text("hello"),
+                Some(3),
+                false,
+                None,
+                b' '
+            )
+            .expect("fits")]),
             "hel"
         );
+        // `~1ts` of `[97,769,98,99]`: the truncation keeps the first **grapheme
+        // cluster** (`[97,769]`) whole (`flat_trunc/3` = `string:slice/3`), not the
+        // first code point.
+        let a = [97, 769, 98, 99]
+            .iter()
+            .map(|v| ctx.int(*v).expect("fits"))
+            .collect::<Vec<_>>();
+        let s = ctx.list(&a).expect("fits");
+        let items = cdata_chunk(s).expect("an element list");
+        let got = string_field_chunk(&mut ctx, items, Some(1), false, None, b' ').expect("fits");
+        assert_eq!(flatten(&[got]), "a\u{301}");
     }
 }

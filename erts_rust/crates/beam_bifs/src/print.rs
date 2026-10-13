@@ -306,18 +306,11 @@ impl Chunk {
     }
 
     /// The element list of a `Chunk::List`.
-    fn into_items(self) -> Vec<Chunk> {
+    pub(crate) fn into_items(self) -> Vec<Chunk> {
         match self {
             Chunk::List(items) => items,
             char => vec![char],
         }
-    }
-
-    /// The first `n` characters as one flat sub-list (`flat_trunc/3`).
-    fn flat_trunc(&self, n: usize) -> Chunk {
-        let mut text = String::new();
-        self.flatten_into(&mut text);
-        Chunk::List(text.chars().take(n).map(Chunk::Char).collect())
     }
 }
 
@@ -847,58 +840,10 @@ pub(crate) fn field_chunk(
     }
 }
 
-/// `io_lib_format:string/6` — the `~s` field rule as a chunk.
-pub(crate) fn string_field_chunk(
-    s: Chunk,
-    width: Option<usize>,
-    left: bool,
-    precision: Option<usize>,
-    pad: u8,
-) -> Result<Chunk> {
-    match (width, precision) {
-        (None, None) => Ok(s),
-        (Some(f), None) => Ok(string_field(s, f, left, pad)),
-        (None, Some(p)) => Ok(string_field(s, p, true, pad)),
-        (Some(f), Some(p)) if f >= p => {
-            let n = s.flat_len();
-            if f > p {
-                if n > p {
-                    Ok(adjust_chunk(
-                        s.flat_trunc(p),
-                        dup_chars(pad as char, f - p),
-                        left,
-                    ))
-                } else if n < p {
-                    // `[S | chars(Pad, P-N)]`.
-                    let mut items = vec![s];
-                    items.extend(dup_chars(pad as char, p - n).into_items());
-                    Ok(adjust_chunk(
-                        Chunk::List(items),
-                        dup_chars(pad as char, f - p),
-                        left,
-                    ))
-                } else {
-                    Ok(adjust_chunk(s, dup_chars(pad as char, f - p), left))
-                }
-            } else {
-                Ok(string_field(s, f, left, pad))
-            }
-        }
-        _ => Err(badarg()),
-    }
-}
-
-/// `io_lib_format:string_field/6`.
-fn string_field(s: Chunk, f: usize, left: bool, pad: u8) -> Chunk {
-    let n = s.flat_len();
-    if n > f {
-        s.flat_trunc(f)
-    } else if n < f {
-        adjust_chunk(s, dup_chars(pad as char, f - n), left)
-    } else {
-        s
-    }
-}
+/// `io_lib_format`'s `~s` field rule (`string/6`, `string_field/6`, `flat_trunc/3`)
+/// lives in [`crate::io`] as [`crate::io::string_field_chunk`], because the
+/// `io_lib:chars_length/1` measurement and the `string:slice/3` truncation both
+/// need the `BifContext` (a grapheme count / a grapheme slice).
 /// Renders a binary (`io_lib:write_binary/2` for `~w`,
 /// `io_lib_pretty:write/1` for `~p`).
 ///
