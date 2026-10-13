@@ -550,7 +550,13 @@ constructors only (no new error enum).
   policy)` build the copying `Collector` and the default path keeps its Copying behaviour (the corpus gate
   reports 0 mismatches). Immix is reached by a policy that configures a large mature generation (the
   automatic rule — `beam_rt`'s default-OFF `BEAM_RT_GC_STRATEGY=immix` opt-in does exactly that) or by an
-  explicit `GcConfig::immix` / `MatureSelection::Explicit` pin.
+  explicit `GcConfig::immix` / `MatureSelection::Explicit` pin. Either way the **mature generation is
+  genuinely exercised**: the fullsweep room policy sizes the fresh mature for a nursery's worth of
+  promotion, so the copying default really runs minors (a churn gate measures **147 minors : 73
+  fullsweeps**), and Immix runs the same cadence once its region leaves promotion room — at its default
+  512-word / 32-line region it holds the 20-line live set with only 12 free lines, fewer than a round
+  promotes, so it still escalates every round (a region-granularity consequence, not a sizing gap;
+  `MEASURED.md`).
 - **The Immix region never reallocates in place; the collector grows it by relocation.** `ImmixSpace` wraps
   a `beam_alloc::Heap` and is never resized in place. Instead a major replaces the whole region: the live set
   is relocated into a fresh `ImmixSpace` sized by the policy — the `mature_after_fullsweep` target
