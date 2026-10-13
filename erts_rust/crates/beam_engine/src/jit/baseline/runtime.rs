@@ -145,7 +145,8 @@ pub const fn decode_wait(word: i64) -> Option<(u32, u32)> {
 /// frame's first Y slot (`machine.stack[y_base]`) and the one-past-the-last address of
 /// its `y_count` slots. A block reads a Y operand and writes a Y destination through
 /// them; the pair is refreshed by [`JitRuntime::refresh_y_base`], which the driver runs
-/// before every native entry and every frame-changing helper runs at its end — the
+/// **once before its loop** and after each interpreter step of its own, and which every
+/// frame-changing helper runs at its end — the
 /// Erlang stack is a Rust `Vec` that `push_frame` may reallocate, so the window must
 /// never outlive the frame it names. When no frame is live both are null, which makes
 /// every emitted Y access reject (see the Y-window guard in the arithmetic fast path).
@@ -190,16 +191,23 @@ pub(crate) struct JitRuntime<'a> {
 impl JitRuntime<'_> {
     /// Re-publish the current top frame's Y window into [`Self::y_base`]/[`Self::y_end`].
     ///
-    /// Called by the driver before every native entry and by every helper that can
-    /// change the frame stack or **reallocate** `machine.stack` ([`jit_step_one`],
-    /// [`jit_tail_call`]) at the end of its own work. `Machine::push_frame` grows the
+    /// Called by the driver **once before its loop** and at the end of its own
+    /// per-instruction interpreter step, and by every helper that can change the frame
+    /// stack or **reallocate** `machine.stack` ([`jit_step_one`], [`jit_tail_call`],
+    /// [`jit_ext_call`]) at the end of its own work. `Machine::push_frame` grows the
     /// Erlang stack with `Vec::resize`, so a window taken before a frame push can name
     /// freed memory; refreshing here is what keeps the published window always current.
-    /// No inlined shape pushes a frame or grows the stack (only a helper does), so
-    /// refreshing at those two helpers covers every in-block continue as well.
+    /// No inlined shape pushes a frame or grows the stack (only a helper does), so the
+    /// helpers cover every in-block continue and the driver's own step covers the
+    /// out-of-block one -- there is nothing left for a per-iteration refresh to catch.
     ///
     /// With no live frame both fields are null: `lea k*8; cmp; jae` then rejects every
     /// Y access (the emitted guard), so a frame-less block can never dereference one.
+    ///
+    /// `#[inline]`: the body is a handful of instructions and it sits on the
+    /// per-round-trip path (`jit_step_one` runs it for every deopt that moved the
+    /// window), so the call overhead is a measurable share of a cheap round-trip.
+    #[inline]
     pub(crate) fn refresh_y_base(&mut self) {
         // SAFETY: `rt.machine` is a non-null pointer to the driver's live `Machine`;
         // no other `&mut Machine` exists while a helper/driver frame runs (the driver
@@ -378,6 +386,11 @@ pub(crate) const EXT_CALL_LAST: u32 = 2;
 ///   interpreter's own checked pop — **after** the target resolved, so a bad label
 ///   can never leave a popped frame behind (an `Instr::CallLast`).
 ///
+/// Because `CallExtLast` changes which frame is on top, a successful `CallExtLast`
+/// resolution ends by re-publishing the current frame's Y window
+/// ([`JitRuntime::refresh_y_base`]) before it hands the [`ENTER`] word back — the
+/// callee's blocks read that window, and the pop moved it.
+///
 /// Anything the host cannot run in this machine — the seam's `Ok(None)` (the
 /// synchronous `call_bif` path, NIFs, the runtime's native floor), an import whose
 /// atoms the module's table lacks, a target label the callee does not define, a
@@ -430,6 +443,18 @@ pub(crate) extern "C" fn jit_ext_call(
     };
     match resolved {
         Some((context, callee, callee_pc)) => {
+            // A `call_ext_last` popped the caller's frame (the only variant whose
+            // discipline touches the frame stack), so the Y window the callee's blocks
+            // will read must be re-published before they run. The other two variants
+            // leave the frame -- and therefore the window -- exactly as the last
+            // refresh published it, so they pay nothing; the callee's own `allocate`
+            // refreshes when it pushes its frame.
+            if kind == EXT_CALL_LAST {
+                // SAFETY: `rt` is the same live, exclusively borrowed `JitRuntime` the
+                // driver owns; the `&mut` derived from it above is dead by now, so this
+                // does not alias it.
+                unsafe { (*rt).refresh_y_base() };
+            }
             // SAFETY: `rt` is the same live, exclusively borrowed `JitRuntime` the
             // driver owns; the `&mut` derived from it above is dead by now, so this
             // store does not alias it. The driver takes the slot when it decodes the
