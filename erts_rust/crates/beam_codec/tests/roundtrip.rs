@@ -74,12 +74,12 @@ use beam_codec::term::{
     make_float, make_fun_external, make_fun_imported, tuple_arity, tuple_element,
 };
 use beam_codec::{
-    decode_term, encode_term, encode_term_body, encode_term_body_compressed, encode_term_compressed,
-    AtomEncoding, Decoder, Encoder, ATOM_EXT, ATOM_UTF8_EXT, BINARY_EXT, COMPRESSED_EXT, EXPORT_EXT,
-    FLOAT_EXT, FunKind, FunPid, INTEGER_EXT, LARGE_BIG_EXT, LARGE_TUPLE_EXT, LIST_EXT, MAP_EXT,
-    NEWER_REFERENCE_EXT, NEW_FLOAT_EXT, NEW_FUN_EXT, NEW_PID_EXT, NEW_PORT_EXT, NEW_REFERENCE_EXT,
-    NIL_EXT, SMALL_ATOM_UTF8_EXT, SMALL_BIG_EXT, SMALL_INTEGER_EXT, SMALL_TUPLE_EXT, STRING_EXT,
-    V4_PORT_EXT, VERSION_MAGIC,
+    decode_term, decode_term_body, encode_term, encode_term_body, encode_term_body_compressed,
+    encode_term_compressed, AtomEncoding, Decoder, Encoder, ATOM_EXT, ATOM_UTF8_EXT, BINARY_EXT,
+    COMPRESSED_EXT, EXPORT_EXT, FLOAT_EXT, FunKind, FunPid, INTEGER_EXT, LARGE_BIG_EXT,
+    LARGE_TUPLE_EXT, LIST_EXT, MAP_EXT, NEWER_REFERENCE_EXT, NEW_FLOAT_EXT, NEW_FUN_EXT,
+    NEW_PID_EXT, NEW_PORT_EXT, NEW_REFERENCE_EXT, NIL_EXT, SMALL_ATOM_UTF8_EXT, SMALL_BIG_EXT,
+    SMALL_INTEGER_EXT, SMALL_TUPLE_EXT, STRING_EXT, V4_PORT_EXT, VERSION_MAGIC,
 };
 
 // ---------------------------------------------------------------------------
@@ -1187,13 +1187,28 @@ fn compressed_body_form_omits_the_version_byte() {
     );
     assert_eq!(decompress(&image[5..]).unwrap(), body);
 
-    // Prepending the version byte yields a valid versioned image for the same term.
-    let mut versioned = vec![VERSION_MAGIC];
-    versioned.extend_from_slice(&image);
+    // The body-form entries consume what the body-form producers emit: no manual
+    // `VERSION_MAGIC` prepend is needed any more.
     let mut h2 = heap(4096);
     let mut a2 = AtomTable::new();
-    let term2 = decode_term(&versioned, &mut h2, &mut a2).unwrap();
+    let term2 = decode_term_body(&image, &mut h2, &mut a2).unwrap();
     assert_term_eq(term, &atoms, term2, &a2);
+
+    // The plain body form (`encode_term_body`, no wrapper) decodes through the same
+    // entry point.
+    let mut h3 = heap(4096);
+    let mut a3 = AtomTable::new();
+    let term3 = decode_term_body(&body, &mut h3, &mut a3).unwrap();
+    assert_term_eq(term, &atoms, term3, &a3);
+
+    // Prepending the version byte still yields a valid *versioned* image for the same
+    // term — the two forms stay interchangeable at the wrapper level.
+    let mut versioned = vec![VERSION_MAGIC];
+    versioned.extend_from_slice(&image);
+    let mut h4 = heap(4096);
+    let mut a4 = AtomTable::new();
+    let term4 = decode_term(&versioned, &mut h4, &mut a4).unwrap();
+    assert_term_eq(term, &atoms, term4, &a4);
 }
 
 #[test]

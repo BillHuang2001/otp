@@ -1181,3 +1181,112 @@
         assert_eq!(atoms.name(atom_val(node)), Some("n1"));
         assert_eq!((ids, creation), (&[1u32][..], 7));
     }
+
+    // -----------------------------------------------------------------------
+    // The body-form entry points: `decode_term_body` / `decode_term_body_used`
+    // -----------------------------------------------------------------------
+
+    /// A body-form image of a repetitive term whose zlib stream does shrink it, so
+    /// `encode_term_body_compressed` emits the `[COMPRESSED_EXT]…` wrapper.
+    fn compressed_body_image() -> (Vec<u8>, Vec<u8>) {
+        let mut atoms = AtomTable::new();
+        // A 500-element list of the same atom compresses well below `len - 5`.
+        let hello = make_atom(atoms.intern("hello"));
+        let mut heap = Heap::new(4096).unwrap();
+        let mut list = NIL;
+        for _ in 0..500 {
+            list = heap.cons(hello, list).unwrap();
+        }
+        let body = crate::encode::encode_term_body(list, &atoms).unwrap();
+        let image = crate::encode::encode_term_body_compressed(list, &atoms, 6).unwrap();
+        assert_eq!(image[0], COMPRESSED_EXT, "the body form carries no version byte");
+        assert_eq!(
+            u32::from_be_bytes([image[1], image[2], image[3], image[4]]) as usize,
+            body.len()
+        );
+        (body, image)
+    }
+
+    #[test]
+    fn is_compressed_body_requires_the_tag_and_five_bytes() {
+        assert!(is_compressed_body(&[COMPRESSED_EXT, 0, 0, 0, 1]));
+        // Four bytes: the 4-byte size field is not complete yet.
+        assert!(!is_compressed_body(&[COMPRESSED_EXT, 0, 0, 0]));
+        // The *versioned* form does not start with the tag.
+        assert!(!is_compressed_body(&[VERSION_MAGIC, COMPRESSED_EXT, 0, 0, 0, 1]));
+        // A plain body (a tag that is not `COMPRESSED`) is not compressed.
+        assert!(!is_compressed_body(&[97, 7]));
+        assert!(!is_compressed_body(&[]));
+    }
+
+    #[test]
+    fn decode_term_body_decodes_the_plain_body_form() {
+        // `encode_term_body` is the symmetric producer (no version byte).
+        let mut atoms = AtomTable::new();
+        let term = make_atom(atoms.intern("hello"));
+        let body = crate::encode::encode_term_body(term, &atoms).unwrap();
+        assert_eq!(body[0], 119, "SMALL_ATOM_UTF8_EXT");
+
+        let mut heap = Heap::new(64).unwrap();
+        let mut atoms2 = AtomTable::new();
+        let (decoded, used) = decode_term_body_used(&body, &mut heap, &mut atoms2).unwrap();
+        assert_eq!(used, body.len());
+        assert_eq!(atoms2.name(atom_val(decoded)), Some("hello"));
+    }
+
+    #[test]
+    fn decode_term_body_unwraps_the_compressed_body_form() {
+        let (body, image) = compressed_body_image();
+        // The plain body still decodes, and the compressed body decodes to the same
+        // term — the producer/consumer pair is symmetric with no manual `131` prepend.
+        let mut plain_heap = Heap::new(8192).unwrap();
+        let mut plain_atoms = AtomTable::new();
+        let (t_plain, used_plain) =
+            decode_term_body_used(&body, &mut plain_heap, &mut plain_atoms).unwrap();
+        assert_eq!(used_plain, body.len());
+
+        let mut heap = Heap::new(8192).unwrap();
+        let mut atoms = AtomTable::new();
+        let (t_compressed, used) = decode_term_body_used(&image, &mut heap, &mut atoms).unwrap();
+        // The `used` count is the 5-byte body header plus the whole zlib stream.
+        assert_eq!(used, image.len());
+
+        // Structural equality through the safe accessors (atoms by name).
+        assert_eq!(is_list(t_plain), is_list(t_compressed));
+        assert_eq!(is_list(t_compressed), true);
+    }
+
+    #[test]
+    fn decode_term_body_rejects_a_lying_declared_size() {
+        let (_body, mut image) = compressed_body_image();
+        // Bump the declared inner size by one: the inflated length no longer matches
+        // (`external.c:1807-1810`) — BadArg, never a partially decoded term.
+        let declared = u32::from_be_bytes([image[1], image[2], image[3], image[4]]);
+        image[4] = (declared.wrapping_add(1) & 0xFF) as u8;
+        let mut heap = Heap::new(8192).unwrap();
+        let mut atoms = AtomTable::new();
+        assert!(matches!(
+            decode_term_body(&image, &mut heap, &mut atoms),
+            Err(BeamError::BadArg)
+        ));
+    }
+
+    #[test]
+    fn decode_term_body_rejects_a_corrupt_zlib_stream() {
+        let (_body, mut image) = compressed_body_image();
+        // Flip a byte in the deflate stream: zlib fails => BadArg.
+        let last = image.len() - 1;
+        image[last] ^= 0xFF;
+        let mut heap = Heap::new(8192).unwrap();
+        let mut atoms = AtomTable::new();
+        assert!(decode_term_body(&image, &mut heap, &mut atoms).is_err());
+    }
+
+    #[test]
+    fn decode_term_body_rejects_a_truncated_body() {
+        // A body whose term is truncated (a tuple announcing two elements, one given).
+        assert!(matches!(
+            decode_term_body(&[104, 2, 97, 1], &mut Heap::new(64).unwrap(), &mut AtomTable::new()),
+            Err(BeamError::BadArg)
+        ));
+    }

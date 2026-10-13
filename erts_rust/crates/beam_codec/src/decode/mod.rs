@@ -1008,6 +1008,71 @@ pub fn decode_term_used(
     Ok((term, decoder.position()))
 }
 
+/// Decodes a term **body** — no leading `VERSION_MAGIC` — into `heap`, interning atoms
+/// into `atoms`. The body-form twin of [`decode_term`], and the symmetric consumer of
+/// [`crate::encode_term_body`] / [`crate::encode_term_body_compressed`].
+///
+/// A body is the bytes that follow a distribution header (or an ETS term blob) and
+/// differs from a `term_to_binary` image only in that the version byte is not part of
+/// it. Two body forms are accepted, exactly the two the matching encoders produce:
+///
+/// * an ordinary **plain** body (`[<term>]`), [`Decoder::new_body`] + `finish`; and
+/// * a **`COMPRESSED` body** (`[COMPRESSED_EXT][size:4 BE][zlib stream]`, the form
+///   [`crate::encode_term_body_compressed`] writes), unwrapped here by
+///   [`decompress_body_wrapper`] exactly as [`decode_term`] unwraps the versioned
+///   wrapper.
+///
+/// The two forms are unambiguous: `80` (`'P'`, the `COMPRESSED` tag) is not a term tag,
+/// so no plain body begins with it.
+///
+/// **Bytes after a compressed body's inner term are ignored** (mirroring
+/// [`decode_term`]'s compressed path); the plain path calls [`Decoder::finish`], so it
+/// is strict about trailing bytes. Before this entry point the body-form producer had
+/// no matching consumer — a caller had to prepend `VERSION_MAGIC` by hand — so the
+/// helper is **additive**: no existing entry point changes.
+///
+/// # Errors
+///
+/// Every error [`decode_term`] reports — a body whose declared `COMPRESSED` size
+/// disagrees with its inflated length, or a corrupt zlib stream, is `BeamError::BadArg`.
+pub fn decode_term_body(bytes: &[u8], heap: &mut Heap, atoms: &mut AtomTable) -> Result<Eterm> {
+    if let Some((body, _consumed)) = decompress_body_wrapper(bytes)? {
+        let mut decoder = Decoder::new_body(&body);
+        return decoder.decode(heap, atoms);
+    }
+    let mut decoder = Decoder::new_body(bytes);
+    let term = decoder.decode(heap, atoms)?;
+    decoder.finish()?;
+    Ok(term)
+}
+
+/// Like [`decode_term_body`], but also reports how many **source** bytes the body
+/// occupied — the body-form twin of [`decode_term_used`].
+///
+/// For a plain body the count is [`Decoder::position`] after the term; for a
+/// `COMPRESSED` body it is the 5-byte `[COMPRESSED_EXT][size:4 BE]` header plus the zlib
+/// stream (see [`crate::compress::decompress_bounded_used`]). Like [`decode_term_used`]
+/// this entry point does **not** call [`Decoder::finish`] on either branch, so trailing
+/// bytes are tolerated.
+///
+/// # Errors
+///
+/// Every error [`decode_term_body`] reports.
+pub fn decode_term_body_used(
+    bytes: &[u8],
+    heap: &mut Heap,
+    atoms: &mut AtomTable,
+) -> Result<(Eterm, usize)> {
+    if let Some((body, consumed)) = decompress_body_wrapper(bytes)? {
+        let mut decoder = Decoder::new_body(&body);
+        let term = decoder.decode(heap, atoms)?;
+        return Ok((term, consumed));
+    }
+    let mut decoder = Decoder::new_body(bytes);
+    let term = decoder.decode(heap, atoms)?;
+    Ok((term, decoder.position()))
+}
+
 /// Like [`decode_term`], but installs the local node identity so an incoming
 /// identifier whose node/creation name the running node is materialized as this
 /// runtime's **internal** form (internal pid/port immediate, M1 internal
@@ -1107,8 +1172,32 @@ pub fn decode_term_with_local_node_used(
 /// rather than a term decoder's cursor; it is public so a caller can make the same
 /// distinction without re-deriving it.
 pub fn is_compressed_image(bytes: &[u8]) -> bool {
-    bytes.len() >= 6 && bytes[0] == VERSION_MAGIC && bytes[1] == COMPRESSED_EXT
+    bytes.len() >= COMPRESSED_IMAGE_HEADER
+        && bytes[0] == VERSION_MAGIC
+        && bytes[1] == COMPRESSED_EXT
 }
+
+/// Whether `bytes` is a top-level **`COMPRESSED` body**:
+/// `[COMPRESSED_EXT][size:4 BE][zlib stream]` — the version-less twin of
+/// [`is_compressed_image`], the form [`crate::encode_term_body_compressed`] produces.
+///
+/// A body never carries the version byte (it follows a distribution header, or is an
+/// ETS term blob), so the wrapper starts at the `80` byte and is 5 bytes: the tag plus
+/// the 4-byte size. This mirrors the C's own split — `binary2term_prepare` checks the
+/// tag **after** the version byte (`external.c:1759`), so the byte-pair it looks at is
+/// exactly `[COMPRESSED_EXT][size byte 0]`, while a body-form helper (the ETS
+/// `erts_decode_ext_ets` route) sees the tag first.
+///
+/// The preimage is unambiguous: `80` (`'P'`) is not a term tag, so a plain body can
+/// never begin with it (see [`Tag::Compressed`](crate::Tag::Compressed)).
+pub fn is_compressed_body(bytes: &[u8]) -> bool {
+    bytes.len() >= COMPRESSED_BODY_HEADER && bytes[0] == COMPRESSED_EXT
+}
+
+/// The `COMPRESSED` image header: `[VERSION_MAGIC][COMPRESSED_EXT][size:4 BE]`.
+const COMPRESSED_IMAGE_HEADER: usize = 6;
+/// The `COMPRESSED` **body** header: `[COMPRESSED_EXT][size:4 BE]`.
+const COMPRESSED_BODY_HEADER: usize = 5;
 
 /// Unwraps a top-level `COMPRESSED` image, returning the inner term body and the total
 /// consumed source bytes.
@@ -1133,6 +1222,37 @@ fn decompress_wrapper(bytes: &[u8]) -> Result<Option<(Vec<u8>, usize)>> {
     }
     // `is_compressed_image` guarantees `bytes[..6]` is present.
     let size = u32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]) as usize;
+    inflate_compressed(&bytes[COMPRESSED_IMAGE_HEADER..], size, COMPRESSED_IMAGE_HEADER)
+}
+
+/// Unwraps a top-level **`COMPRESSED` body** — the version-less twin of
+/// [`decompress_wrapper`], for the `[COMPRESSED_EXT][size:4 BE][zlib stream]` form
+/// [`crate::encode_term_body_compressed`] produces (and [`decode_term_body`] consumes).
+///
+/// `Ok(None)` means the body is not compressed; otherwise the returned body is the
+/// inner term **body** (no version byte) and `consumed` is the 5-byte body header plus
+/// the zlib stream the input occupied.
+fn decompress_body_wrapper(bytes: &[u8]) -> Result<Option<(Vec<u8>, usize)>> {
+    if !is_compressed_body(bytes) {
+        return Ok(None);
+    }
+    // `is_compressed_body` guarantees `bytes[..5]` is present.
+    let size = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as usize;
+    inflate_compressed(&bytes[COMPRESSED_BODY_HEADER..], size, COMPRESSED_BODY_HEADER)
+}
+
+/// Inflates the zlib stream of a `COMPRESSED` wrapper whose `header_len`-byte header
+/// has already been consumed, returning the inner term body and the **total** source
+/// bytes the wrapper occupied (`header_len` + the zlib stream it wraps).
+///
+/// Shared by the versioned ([`decompress_wrapper`]) and body ([`decompress_body_wrapper`])
+/// forms: only the header length differs, so the inflate rule — and its bound — live
+/// here once.
+fn inflate_compressed(
+    stream: &[u8],
+    size: usize,
+    header_len: usize,
+) -> Result<Option<(Vec<u8>, usize)>> {
     // Inflate bounded by the declared size: the C allocates exactly `size` bytes and
     // requires zlib to fill it (`dlen != dest_len` is an error, `external.c:1805-1810`),
     // so a payload that inflates to more than the declaration is `badarg` too. Using the
@@ -1140,12 +1260,12 @@ fn decompress_wrapper(bytes: &[u8]) -> Result<Option<(Vec<u8>, usize)>> {
     // large payload — e.g. the 33 MiB binary `tests/compressed_oracle.rs` compresses —
     // decodable, exactly as the oracle does (`external.c:1768-1781` measures the real
     // uncompressed size instead of failing).
-    let (body, stream_consumed) = crate::compress::decompress_bounded_used(&bytes[6..], size)?;
+    let (body, stream_consumed) = crate::compress::decompress_bounded_used(stream, size)?;
     if body.len() != size {
         return Err(bad_arg());
     }
-    // The image is the 6-byte wrapper header plus the zlib stream it wraps.
-    Ok(Some((body, 6 + stream_consumed)))
+    // The wrapper is its header plus the zlib stream it wraps.
+    Ok(Some((body, header_len + stream_consumed)))
 }
 
 /// Groups base-256 magnitude bytes (least significant first) into `ErtsDigit`s —
