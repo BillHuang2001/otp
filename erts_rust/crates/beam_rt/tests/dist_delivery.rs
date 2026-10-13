@@ -62,7 +62,7 @@ use beam_dist::{
 use beam_process::{ProcessId, ProcessTable, SignalAtoms, UnaliasMode};
 use beam_rt::dist::LocalDeliverySink;
 use beam_rt::{Runtime, RuntimeConfig};
-use beam_term::prelude::{is_immediate, make_atom, make_small, Atom, Eterm};
+use beam_term::prelude::{eq, is_immediate, make_atom, make_small, size_object, Atom, Eterm};
 use beam_term::AtomTable;
 
 /// The shared cookie both ends authenticate with.
@@ -798,13 +798,17 @@ fn a_send_sender_envelope_is_an_immediate_that_survives_the_arena_reset() {
     let pid = fixture.pid;
     let mut heap = Heap::new(HEAP_WORDS).expect("scratch heap");
 
-    // The `From` of a `DOP_SEND_SENDER`: a boxed external pid on *this* node.
+    // The `From` of a `DOP_SEND_SENDER`: a boxed external pid on *this* node. The
+    // payload is a **compound** term, so "still readable afterwards" is a real
+    // structural check rather than a trivially-immediate one.
     let from = external_pid_term(&mut heap, make_atom(node), 9, 3, NODE_CREATION);
-    let message = make_small(4242);
+    let payload = heap
+        .tuple(&[make_small(11), make_small(22)])
+        .expect("build the payload tuple");
     let delivery = Delivery::Send {
         from,
         to: pid.to_eterm(),
-        message,
+        message: payload,
         token: None,
     };
     assert_eq!(
@@ -815,8 +819,9 @@ fn a_send_sender_envelope_is_an_immediate_that_survives_the_arena_reset() {
     let delivered = mailbox(&fixture.table, pid);
     assert_eq!(delivered.len(), 1, "exactly one message was delivered");
     assert_eq!(
-        delivered[0].0, message,
-        "the payload must sit in the addressed process's mailbox"
+        size_object(delivered[0].0),
+        3,
+        "the mailbox must hold the whole `{{11,22}}` payload tuple, not a bare pointer"
     );
     assert!(
         is_immediate(delivered[0].1),
@@ -834,11 +839,16 @@ fn a_send_sender_envelope_is_an_immediate_that_survives_the_arena_reset() {
     // mailbox back: what the sink stored must not point into the arena at all.
     heap.reset();
     let after = mailbox(&fixture.table, pid);
-    assert_eq!(
-        after, delivered,
-        "the mailbox must be unaffected by the decode arena's reset"
+    let rebuilt = heap
+        .tuple(&[make_small(11), make_small(22)])
+        .expect("rebuild the payload tuple");
+    assert_eq!(size_object(after[0].0), 3, "the payload must still be walkable");
+    assert!(
+        eq(after[0].0, rebuilt, &fixture.atoms),
+        "the delivered payload must still compare `=:=` to the tuple that was sent"
     );
     assert!(is_immediate(after[0].1));
+    assert_eq!(after[0].1, make_atom(node));
 }
 
 // --- `DOP_REG_SEND*` --------------------------------------------------------
