@@ -397,6 +397,14 @@ constructors only (no new error enum).
   `val` word a collection wrote stays resolvable across any number of sweeps (`mso.rs`, API Surface).
 
 ### Measured (summary — every figure, table and caveat is in `MEASURED.md`)
+- **The mature-generation room policy (`tests/generational_cadence.rs`, `tests/steady_state.rs`).** Folding
+  the **young heap's occupancy** into the fullsweep's size request (the C `adjust_after_fullsweep`
+  `need_after`, `erl_gc.c:2072`) is what makes the mature generation reachable at the default policy: on a
+  churn loop the copying default goes from **1 minor : 219 fullsweeps** (every collection after the first
+  escalates) to **147 minors : 73 fullsweeps**, converging to young 233 / mature **376** (total 609) with
+  both capacities constant across 200 rounds. Using the **mature** occupancy instead would creep without
+  bound, which is why only the young occupancy is folded in. Immix runs the same 147/73 cadence given
+  promotion room (`initial_mature_words` 1024 → mature 1024).
 - **The multi-workload gate (`tests/immix_measure.rs`, `tests/immix_workloads.rs`, `tests/immix_selection_curve.rs`).**
   GenImmix wins **copy work on long-lived data**, but every win is paired with a loss: **footprint** 3.6×–8×
   (line-granular internal fragmentation), a longer reclaim **pause**, and an outright loss on the common
