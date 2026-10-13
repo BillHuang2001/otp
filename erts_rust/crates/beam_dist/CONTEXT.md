@@ -787,7 +787,9 @@ line (no timestamps/addresses/ports) and exits `0`:
   + `carries_message` (the 16 message-carrying opcodes)
 - `src/delivery.rs` → inbound `DOP_*` delivery: `Delivery` (classify a `ControlMessage` — all 30
   opcodes, incl. `SpawnRequest`/`SpawnReply`/`AltactSigSend`/`PayloadExit*`), `DeliveryOutcome`/
-  `Dispatched`, the defaulted `InboundSink` seam + `UnsupportedSink` (routing lives in `beam_rt`)
+  `Dispatched`, the defaulted `InboundSink` seam + `UnsupportedSink` (routing lives in `beam_rt`),
+  plus the **checked** `LinkIdentity` + `Delivery::classify_validated` (the C's per-opcode
+  `invalid_message` shape/`dep` checks)
 - `src/connection.rs` → `TcpTransport`/`TcpListener`, the handshake driver (client/server + creation,
   plus the `connect_client_with_flags`/`accept_server_with_flags` overrides and the
   `accept_server_with_decision` accept-policy seam + `Connection::server_with_decision`),
