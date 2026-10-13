@@ -100,9 +100,7 @@ not here.)
 - `filelib:is_dir/1` / `is_file/1` / `is_regular/1` (and a literal-path `filelib:wildcard/1`)
   still hit the typed `#file_info{}` `access(2)` gap on an **existing** path
   (`beam_rt: unsupported: file_server: …`, exit 3); their absent-path answers and the glob
-  `filelib:wildcard/1` path agree and are pinned. `re:version/0` and `re:split/2` remain rust
-  capability gaps (`beam_rt: unsupported: re:version/0` / `re:compile/2`, exit 3) — neither
-  cases nor mismatches.
+  `filelib:wildcard/1` path agree and are pinned.
 - A bare (unqualified) name in the `-eval` path resolves differently: `phash2(T)` is `error:undef`
   under the oracle's `-eval` (a local call) but `ok …` under the rust runtime (it resolves the
   `erlang:phash2/1` BIF). The `erlang:phash2/1`-qualified shapes agree and are pinned in
@@ -208,3 +206,20 @@ not here.)
   totals are never asserted.
 - `+Q N` / `ERL_MAX_PORTS` -> `system_info(port_limit)` **is** pinned (the `next_power_of_two` sizing
   matrix); `+Q legacy` / no `+Q` -> 65536.
+## A.7 — re (owner: `beam_bifs`; the underlying literal parser is `beam_rt`)
+- The `<<"…"/utf8>>` **binary literal** (a string segment carrying the `utf8` type) cannot be
+  constructed by the runtime's `-eval` path: `<<"åäö"/utf8>>` — and any use of it, e.g.
+  `byte_size(<<"åäö"/utf8>>)` — raises a plain `error:badarg` where the oracle yields the UTF-8
+  binary. Two `re` cases promoted from `crates/beam_bifs/src/re/oracle.rs` use that literal as a
+  *subject*, so they are **not** pinned (a plain-value `mismatch`, not an honest gap) and are
+  deliberately absent from `src/corpus/re.rs`:
+  - `unicode/utf8-binary-subject` — `re:run(<<"åäö"/utf8>>,<<"ä"/utf8>>,[unicode])`
+    (oracle `{match,[{2,2}]}`, rust `error:badarg`);
+  - `non-unicode/dot-is-a-byte` — `re:run(<<"åäö"/utf8>>,".")`
+    (oracle `{match,[{0,1}]}`, rust `error:badarg`).
+  The gap is in literal **construction**, not in the `re` engine: both cases agree once the
+  literal exists, and the byte-identical integer-segment subject (`<<195,165,195,164,195,182>>`)
+  *is* evaluable and agrees (so the equivalent of each can be pinned today, and the two source
+  expressions verbatim once the literal builds). The source's own crate-level sweep for both
+  (`crates/beam_bifs/src/re/oracle.rs`) still passes because it builds the subject as raw bytes
+  rather than through the `-eval` literal parser.

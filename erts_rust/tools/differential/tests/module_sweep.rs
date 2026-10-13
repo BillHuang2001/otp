@@ -83,10 +83,12 @@ const CONTRACTS: &[Contract] = &[Contract::BeamAsm, Contract::OtpApps];
 /// `proplists`, `queue`, `rand`, `re`, `sets`, `sofs`, `string`, `unicode` and
 /// `uri_string`.
 ///
-/// Every entry is verified against the current `beam_rt`: all but four `Agree`, and the four
+/// Every entry is verified against the current `beam_rt`: all but two `Agree`, and the two
 /// that do not are honest, counted `Unsupported` capability gaps (`filelib:is_dir/1` /
-/// `filelib:is_file/1`, whose `read_file_info/1` seam the runtime does not serve; and
-/// `re:version/0` / `re:split/2`, which need `re:compile/2`).
+/// `filelib:is_file/1`, whose `read_file_info/1` seam the runtime does not serve). The two
+/// `re:*` entries (`re:version/0`, `re:split/2`) now `Agree` — the `re` family is fully
+/// implemented — and are additionally gate-checked by the A.7 `re` corpus group
+/// (`src/corpus/re.rs`).
 ///
 /// A candidate whose observable would be volatile (a `~w` of a multi-key map, a pid/ref/port,
 /// or an unseeded clock/`rand` value) is deliberately absent. Two shapes that *used* to produce
