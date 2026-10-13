@@ -57,7 +57,7 @@ use crate::context::BifContext;
 
 use super::{
     char_printable, dup_chars, latin1_printable_char, printable_string, proper_list, quoted_string,
-    term_chunk, Chunk, UNLIMITED_DEPTH,
+    resolve_map_pairs, term_chunk_order, Chunk, MapOrder, UNLIMITED_DEPTH,
 };
 
 mod cind;
@@ -110,7 +110,7 @@ fn binary_printable(term: Eterm) -> bool {
 ///
 /// # Errors
 ///
-/// As [`term_chunk`].
+/// As [`crate::print::term_chunk`].
 pub(crate) fn pretty_chunk(
     ctx: &mut BifContext<'_>,
     term: Eterm,
@@ -119,17 +119,44 @@ pub(crate) fn pretty_chunk(
     line_length: usize,
     column: usize,
 ) -> Result<Chunk> {
+    pretty_chunk_order(
+        ctx,
+        term,
+        printable,
+        depth,
+        line_length,
+        column,
+        MapOrder::Storage,
+    )
+}
+
+/// As [`pretty_chunk`], but with the map order a `~k`/`~K` modifier selected
+/// ([`MapOrder`]) applied to every map at any depth.
+///
+/// # Errors
+///
+/// As [`pretty_chunk`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn pretty_chunk_order(
+    ctx: &mut BifContext<'_>,
+    term: Eterm,
+    printable: bool,
+    depth: i64,
+    line_length: usize,
+    column: usize,
+    order: MapOrder,
+) -> Result<Chunk> {
     let ll = line_length as i64;
     let col = column.max(1) as i64;
     if ll == 0 || depth == 0 {
         // `print/10`'s `Ll =:= 0` and `D =:= 0` clauses.
-        return term_chunk(ctx, term, printable, depth);
+        return term_chunk_order(ctx, term, printable, depth, order);
     }
     if depth < 0 && !is_reflowable(term) {
         // A printable string/binary leaf has no line break of its own — but only
         // while the depth is unlimited: a depth-limited `~P` truncates the leaf
         // (`~P <<"abcdef">> 2` is `<<"abcd"...>>`), which only [`build`] knows.
-        return term_chunk(ctx, term, printable, depth);
+        return term_chunk_order(ctx, term, printable, depth, order);
     }
     // The single-line rendering is produced **only** by the two clauses above, so it
     // is rendered there rather than eagerly for every call: the flat writer walks a
@@ -137,7 +164,7 @@ pub(crate) fn pretty_chunk(
     // pure waste for a term this printer is about to re-flow — and it used to be the
     // first thing to exhaust the stack on a long container, before this port's own
     // walk even started.
-    let node = build(ctx, term, printable, depth, -1)?;
+    let node = build(ctx, term, printable, depth, -1, order)?;
     // `M = max_cs(-1, Len) = Len`, so the oracle's `Len =< M` always holds.
     if node.len < ll - col {
         return Ok(write(&node));
@@ -313,8 +340,15 @@ fn list_length(seq: &Seq, acc: i64, dots: i64) -> (i64, i64) {
 ///
 /// # Errors
 ///
-/// As [`term_chunk`]: a term outside the Milestone-1 printable set.
-fn build(ctx: &mut BifContext<'_>, term: Eterm, printable: bool, d: i64, t: i64) -> Result<Node> {
+/// As [`crate::print::term_chunk`]: a term outside the Milestone-1 printable set.
+fn build(
+    ctx: &mut BifContext<'_>,
+    term: Eterm,
+    printable: bool,
+    d: i64,
+    t: i64,
+    order: MapOrder,
+) -> Result<Node> {
     if is_nil(term) {
         return Ok(Node::leaf("[]"));
     }
@@ -325,7 +359,7 @@ fn build(ctx: &mut BifContext<'_>, term: Eterm, printable: bool, d: i64, t: i64)
         if d == 1 {
             return Ok(Node::elided("{...}"));
         }
-        return build_tuple(ctx, term, printable, d, t);
+        return build_tuple(ctx, term, printable, d, t, order);
     }
     if is_map(term) {
         if beam_term::map::map_size(term, ctx.atoms())? == 0 {
@@ -334,7 +368,7 @@ fn build(ctx: &mut BifContext<'_>, term: Eterm, printable: bool, d: i64, t: i64)
         if d == 1 {
             return Ok(Node::elided("#{...}"));
         }
-        return build_map(ctx, term, printable, d, t);
+        return build_map(ctx, term, printable, d, t, order);
     }
     if is_list(term) {
         // `printable_list/4` is `false` at `D =:= 1`, so only a deeper printable
@@ -351,7 +385,7 @@ fn build(ctx: &mut BifContext<'_>, term: Eterm, printable: bool, d: i64, t: i64)
                 dots: 3,
             });
         }
-        return build_list(ctx, term, printable, d, t);
+        return build_list(ctx, term, printable, d, t, order);
     }
     if bits::is_bitstring(term) {
         if bits::bit_size(term)? == 0 {
@@ -360,10 +394,16 @@ fn build(ctx: &mut BifContext<'_>, term: Eterm, printable: bool, d: i64, t: i64)
         if d == 1 {
             return Ok(Node::elided("<<...>>"));
         }
-        return build_binary(ctx, term, printable, d, t);
+        return build_binary(ctx, term, printable, d, t, order);
     }
     // `print_length/7`'s catch-all: `io_lib:write/1`, never truncated.
-    Ok(Node::text(term_chunk(ctx, term, false, UNLIMITED_DEPTH)?))
+    Ok(Node::text(term_chunk_order(
+        ctx,
+        term,
+        false,
+        UNLIMITED_DEPTH,
+        order,
+    )?))
 }
 /// `io_lib_pretty:print_length_list/7`.
 fn build_list(
@@ -372,8 +412,9 @@ fn build_list(
     printable: bool,
     d: i64,
     t: i64,
+    order: MapOrder,
 ) -> Result<Node> {
-    let seq = list1(ctx, term, printable, d, tsub(t, 2))?;
+    let seq = list1(ctx, term, printable, d, tsub(t, 2), order)?;
     let (len, dots) = list_length(&seq, 2, 0);
     Ok(Node {
         tpl: Tpl::Container(Kind::List, seq),
@@ -395,6 +436,7 @@ fn list1(
     printable: bool,
     mut d: i64,
     mut t: i64,
+    order: MapOrder,
 ) -> Result<Seq> {
     let mut elems: Vec<Node> = Vec::new();
     while !is_nil(term) {
@@ -409,12 +451,12 @@ fn list1(
             // template.
             return Ok(Seq {
                 elems,
-                tail: SeqTail::Improper(Box::new(build(ctx, term, printable, d - 1, t)?)),
+                tail: SeqTail::Improper(Box::new(build(ctx, term, printable, d - 1, t, order)?)),
             });
         }
         let rest = cdr(term);
         let t1 = if is_nil(rest) { t } else { tsub(t, 1) };
-        let elem = build(ctx, car(term), printable, d - 1, t1)?;
+        let elem = build(ctx, car(term), printable, d - 1, t1, order)?;
         t = tsub(t1, elem.len);
         d -= 1;
         elems.push(elem);
@@ -432,8 +474,9 @@ fn build_tuple(
     printable: bool,
     d: i64,
     t: i64,
+    order: MapOrder,
 ) -> Result<Node> {
-    let seq = tuple1(ctx, term, printable, 1, d, tsub(t, 2))?;
+    let seq = tuple1(ctx, term, printable, 1, d, tsub(t, 2), order)?;
     let (len, dots) = list_length(&seq, 2, 0);
     let tagged = tuple_size(term) > 1 && is_atom(tuple_element(term, 0));
     Ok(Node {
@@ -451,6 +494,7 @@ fn tuple1(
     mut i: usize,
     mut d: i64,
     mut t: i64,
+    order: MapOrder,
 ) -> Result<Seq> {
     let size = tuple_size(term);
     let mut elems: Vec<Node> = Vec::new();
@@ -462,7 +506,7 @@ fn tuple1(
             });
         }
         let t1 = if i == size { t } else { tsub(t, 1) };
-        let elem = build(ctx, tuple_element(term, i - 1), printable, d - 1, t1)?;
+        let elem = build(ctx, tuple_element(term, i - 1), printable, d - 1, t1, order)?;
         t = tsub(t1, elem.len);
         d -= 1;
         elems.push(elem);
@@ -481,9 +525,10 @@ fn build_map(
     printable: bool,
     d: i64,
     t: i64,
+    order: MapOrder,
 ) -> Result<Node> {
-    let pairs: Vec<(Eterm, Eterm)> = beam_term::map::map_pairs_storage_order(term)?;
-    let seq = map1(ctx, &pairs, printable, 0, d, d - 1, tsub(t, 3))?;
+    let pairs: Vec<(Eterm, Eterm)> = resolve_map_pairs(term, order, ctx.atoms())?;
+    let seq = map1(ctx, &pairs, printable, 0, d, d - 1, tsub(t, 3), order)?;
     let (len, dots) = list_length(&seq, 3, 0);
     Ok(Node {
         tpl: Tpl::Container(Kind::Map, seq),
@@ -503,6 +548,7 @@ fn map1(
     mut d: i64,
     d0: i64,
     mut t: i64,
+    order: MapOrder,
 ) -> Result<Seq> {
     let mut elems: Vec<Node> = Vec::new();
     while i < pairs.len() {
@@ -514,7 +560,7 @@ fn map1(
         }
         let t1 = if i + 1 == pairs.len() { t } else { tsub(t, 1) };
         let (key, value) = pairs[i];
-        let pair = map_pair(ctx, key, value, printable, d0, t1)?;
+        let pair = map_pair(ctx, key, value, printable, d0, t1, order)?;
         t = tsub(t1, pair.len);
         d -= 1;
         elems.push(pair);
@@ -534,10 +580,11 @@ fn map_pair(
     printable: bool,
     d0: i64,
     t: i64,
+    order: MapOrder,
 ) -> Result<Node> {
-    let k = build(ctx, key, printable, d0, t)?;
+    let k = build(ctx, key, printable, d0, t, order)?;
     let sep_len = k.len + 4;
-    let v = build(ctx, value, printable, d0, tsub(t, sep_len))?;
+    let v = build(ctx, value, printable, d0, tsub(t, sep_len), order)?;
     Ok(Node {
         len: sep_len + v.len,
         dots: k.dots + v.dots,
@@ -554,11 +601,12 @@ fn build_binary(
     printable: bool,
     d: i64,
     t: i64,
+    order: MapOrder,
 ) -> Result<Node> {
     if bits::bit_size(term)? % 8 != 0 {
         // A non-byte-aligned bitstring is never printable, so the oracle goes
         // straight to `io_lib:write_binary/3`.
-        return Ok(Node::text(term_chunk(ctx, term, false, d)?));
+        return Ok(Node::text(term_chunk_order(ctx, term, false, d, order)?));
     }
     let bytes = bits::bytes(term)?;
     let n = bytes.len() as i64;

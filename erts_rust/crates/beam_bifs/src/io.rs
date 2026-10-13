@@ -141,9 +141,16 @@
 //! * **Output is a Rust `String` (UTF-8).** Raw format bytes `>= 128` and
 //!   `~s`/`~c` values `>= 128` are emitted as their UTF-8 encoding, not raw latin1
 //!   bytes. The ASCII subset is byte-exact.
-//! * **`~k`/`~K` are rejected.** They select a *map printing order*; this engine's
-//!   printer always uses the flatmap internal order, so honouring them is not
-//!   possible and a silent wrong order is worse than `badarg`.
+//! * **`~k`/`~K` select the map printing order** for the directive that follows
+//!   (`io_lib_format:modifiers/3`): `~k` sets `ordered` (ascending term order)
+//!   without consuming an argument, and `~K` takes the order from the next
+//!   argument. The order is not validated while parsing — it is interpreted only
+//!   when a map is actually rendered (`maps:iterator(Map, Order)`): the atoms
+//!   `ordered`/`reversed`/`undefined` select a built-in order, and a 2-arity fun
+//!   is the order *comparator* the oracle would call — an honest, typed
+//!   [`unsupported_bif`] here, since the printer has no `FunCaller` seam to invoke
+//!   it. Any other order term is `error:badarg`, raised only when a map is
+//!   reached (so `~Kp [M, ordered]` — no map — prints `ordered` with no error).
 //! * **`~t` is the unicode modifier.** (The objective's wording calls `~t` a
 //!   column/table directive; in erts-17.1 `~t` sets the encoding and `~tc`/`~ts`
 //!   are the unicode forms — reproduced here. There is no column directive.)
@@ -186,8 +193,9 @@ use crate::context::BifContext;
 use crate::error::{badarg, unsupported_bif};
 use crate::numeric::integer_digits;
 use crate::print::{
-    adjust_chunk, dup_chars, dup_element, field_chunk, flatten_output, pretty_chunk, proper_list,
-    string_field_chunk, term_chunk, Chunk, UNLIMITED_DEPTH,
+    adjust_chunk, dup_chars, dup_element, field_chunk, flatten_output, pretty_chunk,
+    pretty_chunk_order, proper_list, string_field_chunk, term_chunk_order, Chunk, MapOrder,
+    UNLIMITED_DEPTH,
 };
 use crate::registry::BifRegistry;
 
@@ -425,6 +433,9 @@ struct Spec {
     unicode: bool,
     /// `~l` — disable the `~p` string rule.
     strings: bool,
+    /// `~k`/`~K` — the map printing order for this directive (`ordered` for `~k`,
+    /// the next argument for `~K`); the default storage order otherwise.
+    maps_order: MapOrder,
 }
 
 impl Spec {
@@ -436,6 +447,7 @@ impl Spec {
             pad: b' ',
             unicode: false,
             strings: true,
+            maps_order: MapOrder::Storage,
         }
     }
 }
@@ -664,8 +676,20 @@ fn parse_cseq(
                 spec.strings = false;
                 *i += 1;
             }
-            // `~k`/`~K` choose a map printing order we cannot honour — reject.
-            Some(b'k') | Some(b'K') => return Err(badarg()),
+            // `~k` selects the ascending (`ordered`) map printing order without
+            // consuming an argument; `~K` takes the order from the next argument
+            // (`io_lib_format:modifiers/3`). Neither is validated here — the order
+            // is interpreted only when a map is rendered (see
+            // [`crate::print::resolve_map_pairs`]).
+            Some(b'k') => {
+                spec.maps_order = MapOrder::Ordered;
+                *i += 1;
+            }
+            Some(b'K') => {
+                let order = take(args, next_arg)?;
+                spec.maps_order = MapOrder::Explicit(order);
+                *i += 1;
+            }
             _ => break,
         }
     }
@@ -737,7 +761,7 @@ fn dispatch(
         }
         b'w' => {
             let arg = take(args, next_arg)?;
-            let chunk = term_chunk(ctx, arg, false, UNLIMITED_DEPTH)?;
+            let chunk = term_chunk_order(ctx, arg, false, UNLIMITED_DEPTH, spec.maps_order)?;
             Ok(Piece::element(term_field(chunk, spec)))
         }
         b'p' => {
@@ -754,7 +778,7 @@ fn dispatch(
         b'W' => {
             let arg = take(args, next_arg)?;
             let depth = take_depth(args, next_arg)?;
-            let chunk = term_chunk(ctx, arg, false, depth)?;
+            let chunk = term_chunk_order(ctx, arg, false, depth, spec.maps_order)?;
             Ok(Piece::element(term_field(chunk, spec)))
         }
         b'P' => {
@@ -979,7 +1003,10 @@ fn render_p(
     // `io_lib_format:print/12` defaults the column to `I + 1` — the running
     // indentation at the directive — not to 1 (`io_lib_pretty:print/10`'s `Column`).
     let column = spec.precision.unwrap_or((at + 1).max(1) as usize);
-    pretty_chunk(ctx, term, printable, depth, line_length, column)
+    match spec.maps_order {
+        MapOrder::Storage => pretty_chunk(ctx, term, printable, depth, line_length, column),
+        order => pretty_chunk_order(ctx, term, printable, depth, line_length, column, order),
+    }
 }
 /// `io_lib_format:term/6` — the field-width / truncation rule for a term
 /// rendering (`~w`/`~W` and the integer directives).
@@ -1295,7 +1322,7 @@ mod tests {
     use beam_alloc::Heap;
     use beam_common::{BeamError, ExceptionClass, ExitReason};
     use beam_process::ProcessId;
-    use beam_term::{make_small, AtomTable, NIL};
+    use beam_term::{atom_val, make_small, AtomTable, NIL};
 
     use crate::context::BytesSink;
 
@@ -1310,9 +1337,22 @@ mod tests {
         format: &str,
         build_args: impl FnOnce(&mut BifContext<'_>) -> Option<Eterm>,
     ) -> (String, Result<Eterm>) {
+        run_io_seeded(SEED, format, build_args)
+    }
+
+    /// [`run_io`] over a caller-chosen seeded atom table (the `~K` map orders, a
+    /// nested-map key and a bogus atom are not in [`SEED`]).
+    fn run_io_seeded<'a, I>(
+        seed: I,
+        format: &str,
+        build_args: impl FnOnce(&mut BifContext<'_>) -> Option<Eterm>,
+    ) -> (String, Result<Eterm>)
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
         let mut heap = Heap::new(4096).expect("test heap");
         let mut atoms = AtomTable::new();
-        atoms.seed(SEED);
+        atoms.seed(seed);
         let mut sink = BytesSink::new();
         let result = {
             let mut ctx =
@@ -2408,6 +2448,9 @@ mod tests {
         for (format, arg) in [(0u8, 255i64), (1, 255), (2, 255)] {
             let _ = (format, arg);
         }
+        // `~k w`/`~K w` stay badarg: the `k`/`K` modifier is accepted (K consuming
+        // `255` as its order term), but the space that follows is an invalid control
+        // character — the order is never interpreted, so the oracle agrees.
         for format in ["~5~~", "~-p", "~k w", "~K w", "~z"] {
             let (_, result) = run_io(format, |ctx| ints(ctx, &[255]));
             assert!(
@@ -2424,7 +2467,229 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(output, "10#255w");
     }
+
+    // ---- the `~k`/`~K` map-order modifiers -------------------------------------
+
+    /// The seeded atoms the map-order tests need beyond [`SEED`]: the three built-in
+    /// order atoms, a nested-map key and a bogus atom.
+    const ORDER_SEED: [&str; 19] = [
+        "true", "false", "ok", "hello", "a", "b", "c", "abc", "hi", "foo", "abcdefgh", "", "e",
+        "chars_limit", "ordered", "reversed", "undefined", "x", "bogus",
+    ];
+
+    /// `#{hello=>1,a=>2,b=>3,c=>4}` with the **storage** order the writers produce —
+    /// `cmp_flatmap_keys` (atom-index) order `hello, a, b, c`, which differs from the
+    /// ascending **name** order `a, b, c, hello` an `ordered` render yields, so the
+    /// two orders are distinguishable.
+    fn order_map(ctx: &mut BifContext<'_>) -> Eterm {
+        let hello = ctx.atom("hello").expect("seeded");
+        let a = ctx.atom("a").expect("seeded");
+        let b = ctx.atom("b").expect("seeded");
+        let c = ctx.atom("c").expect("seeded");
+        let one = ctx.int(1).expect("fits");
+        let two = ctx.int(2).expect("fits");
+        let three = ctx.int(3).expect("fits");
+        let four = ctx.int(4).expect("fits");
+        let mut pairs = [(hello, one), (a, two), (b, three), (c, four)];
+        pairs.sort_by(|k, l| beam_term::compare::cmp_flatmap_keys(k.0, l.0, ctx.atoms()));
+        crate::access::make_flatmap(ctx.heap(), &pairs).expect("fits")
+    }
+
+    /// A `~K`/`~k` order is applied only when a map is rendered; `~k` takes the
+    /// ascending `ordered` order, `~K` the built-in order named by its argument.
     #[test]
+    fn map_order_modifiers_select_the_map_rendering_order() {
+        // The default (no modifier): the map's stored order.
+        let (output, result) = run_io_seeded(ORDER_SEED, "~p", |ctx| {
+            let map = order_map(ctx);
+            one(ctx, map)
+        });
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(output, "#{hello => 1,a => 2,b => 3,c => 4}");
+
+        // `~k` — ascending name order, on both the `~p` and the `~w` path.
+        let (output, result) = run_io_seeded(ORDER_SEED, "~kp", |ctx| {
+            let map = order_map(ctx);
+            one(ctx, map)
+        });
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(output, "#{a => 2,b => 3,c => 4,hello => 1}");
+        let (output, result) = run_io_seeded(ORDER_SEED, "~kw", |ctx| {
+            let map = order_map(ctx);
+            one(ctx, map)
+        });
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(output, "#{a => 2,b => 3,c => 4,hello => 1}");
+
+        // `~K` with each built-in order atom, on the flat `~w` path.
+        for (order, expected) in [
+            ("ordered", "#{a => 2,b => 3,c => 4,hello => 1}"),
+            ("reversed", "#{hello => 1,c => 4,b => 3,a => 2}"),
+            ("undefined", "#{hello => 1,a => 2,b => 3,c => 4}"),
+        ] {
+            let (output, result) = run_io_seeded(ORDER_SEED, "~Kw", move |ctx| {
+                let map = order_map(ctx);
+                let atom = ctx.atom(order).expect("seeded");
+                Some(ctx.list(&[atom, map]).expect("fits"))
+            });
+            assert!(result.is_ok(), "{order}: {result:?}");
+            assert_eq!(output, expected, "{order}");
+        }
+
+        // The order follows `~W`'s depth form and a `~P` with an explicit depth.
+        let (output, result) = run_io_seeded(ORDER_SEED, "~kW", |ctx| {
+            let map = order_map(ctx);
+            let depth = ctx.int(5).expect("fits");
+            Some(ctx.list(&[map, depth]).expect("fits"))
+        });
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(output, "#{a => 2,b => 3,c => 4,hello => 1,...}");
+        let (output, result) = run_io_seeded(ORDER_SEED, "~kP", |ctx| {
+            let map = order_map(ctx);
+            let depth = ctx.int(5).expect("fits");
+            Some(ctx.list(&[map, depth]).expect("fits"))
+        });
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(output, "#{a => 2,b => 3,c => 4,hello => 1}");
+
+        // The order applies to every map at any depth: the nested map is ordered too.
+        let (output, result) = run_io_seeded(ORDER_SEED, "~kp", |ctx| {
+            let inner = order_map(ctx);
+            let x = ctx.atom("x").expect("seeded");
+            let outer = crate::access::make_flatmap(ctx.heap(), &[(x, inner)]).expect("fits");
+            one(ctx, outer)
+        });
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            output,
+            "#{x => #{a => 2,b => 3,c => 4,hello => 1}}"
+        );
+
+        // An order with no map in the directive is simply unused.
+        let (output, result) = run_io_seeded(ORDER_SEED, "~kb", |ctx| ints(ctx, &[255]));
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(output, "255");
+        let (output, result) = run_io_seeded(ORDER_SEED, "~Kp", |ctx| {
+            let atom = ctx.atom("ordered").expect("seeded");
+            let elems = [ctx.int(1).expect("fits"), ctx.int(2).expect("fits")];
+            let list = ctx.list(&elems).expect("fits");
+            Some(ctx.list(&[atom, list]).expect("fits"))
+        });
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(output, "[1,2]");
+    }
+
+    /// The `~k`/`~K` modifier needs a following control character; the order term is
+    /// validated only when a map is actually rendered.
+    #[test]
+    fn map_order_modifier_errors_match_the_oracle() {
+        // No control character follows the modifier.
+        let (_, result) = run_io_seeded(ORDER_SEED, "~k", |ctx| {
+            let map = order_map(ctx);
+            one(ctx, map)
+        });
+        assert!(matches!(result, Err(BeamError::BadArg)), "{result:?}");
+        let (_, result) = run_io_seeded(ORDER_SEED, "~K", |ctx| {
+            let map = order_map(ctx);
+            one(ctx, map)
+        });
+        assert!(matches!(result, Err(BeamError::BadArg)), "{result:?}");
+
+        // An invalid order term is `badarg` — but only once a map is reached.
+        for order in OrderArg::rejected() {
+            let (_, result) = run_io_seeded(ORDER_SEED, "~Kw", move |ctx| {
+                let map = order_map(ctx);
+                let term = order.build(ctx);
+                Some(ctx.list(&[term, map]).expect("fits"))
+            });
+            assert!(matches!(result, Err(BeamError::BadArg)), "{order:?}: {result:?}");
+        }
+
+        // A **2-arity fun** is the oracle's order *comparator*; with no `FunCaller`
+        // seam the printer answers the typed `unsupported_bif`, never a wrong order.
+        let (_, result) = run_io_seeded(ORDER_SEED, "~Kw", |ctx| {
+            let map = order_map(ctx);
+            let fun = OrderArg::fun(ctx, 2);
+            Some(ctx.list(&[fun, map]).expect("fits"))
+        });
+        assert!(
+            matches!(&result, Err(BeamError::Raise(r)) if r.reason.as_atom() == Some("unsupported_bif")),
+            "{result:?}"
+        );
+
+        // A **bogus order is never interpreted when no map is rendered**, so a
+        // `~Kp` of a non-map prints it with no error (the oracle's own behaviour).
+        let (output, result) = run_io_seeded(ORDER_SEED, "~Kp", |ctx| {
+            let atom = ctx.atom("bogus").expect("seeded");
+            let elems = [ctx.int(1).expect("fits"), ctx.int(2).expect("fits")];
+            let list = ctx.list(&elems).expect("fits");
+            Some(ctx.list(&[atom, list]).expect("fits"))
+        });
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(output, "[1,2]");
+    }
+
+    /// An empty map is special on the two paths: `~p` never reaches the pair
+    /// iterator (`print_length/7` answers `#{}` first), while `~w` calls
+    /// `maps:iterator/2` eagerly — so a bogus order is `badarg` there and not under
+    /// `~p`. Verified against the oracle.
+    #[test]
+    fn map_order_modifier_on_an_empty_map_follows_the_oracle() {
+        let empty = |ctx: &mut BifContext<'_>| crate::access::make_flatmap(ctx.heap(), &[]).expect("fits");
+
+        let (output, result) = run_io_seeded(ORDER_SEED, "~Kp", |ctx| {
+            let map = empty(ctx);
+            let atom = ctx.atom("bogus").expect("seeded");
+            Some(ctx.list(&[atom, map]).expect("fits"))
+        });
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(output, "#{}");
+
+        let (_, result) = run_io_seeded(ORDER_SEED, "~Kw", |ctx| {
+            let map = empty(ctx);
+            let atom = ctx.atom("bogus").expect("seeded");
+            Some(ctx.list(&[atom, map]).expect("fits"))
+        });
+        assert!(matches!(result, Err(BeamError::BadArg)), "{result:?}");
+    }
+
+    /// The `~K` order arguments a test needs — an integer, an empty list, a bogus
+    /// atom and a fun of a given arity.
+    #[derive(Clone, Copy, Debug)]
+    enum OrderArg {
+        Int(i64),
+        EmptyList,
+        Bogus,
+        Fun(usize),
+    }
+
+    impl OrderArg {
+        /// The order terms the oracle rejects with `badarg` (`maps:iterator/2`).
+        fn rejected() -> [OrderArg; 4] {
+            [
+                OrderArg::Int(255),
+                OrderArg::EmptyList,
+                OrderArg::Bogus,
+                OrderArg::Fun(1),
+            ]
+        }
+
+        fn build(self, ctx: &mut BifContext<'_>) -> Eterm {
+            match self {
+                OrderArg::Int(v) => ctx.int(v).expect("fits"),
+                OrderArg::EmptyList => NIL,
+                OrderArg::Bogus => ctx.atom("bogus").expect("seeded"),
+                OrderArg::Fun(arity) => Self::fun(ctx, arity),
+            }
+        }
+
+        /// An `External` (`fun M:F/A`) fun of `arity` — the header carries the arity
+        /// [`crate::access::fun_arity`] reads.
+        fn fun(ctx: &mut BifContext<'_>, arity: usize) -> Eterm {
+            let foo = atom_val(ctx.atom("foo").expect("seeded"));
+            beam_codec::term::make_fun_external(ctx.heap(), arity, foo, foo).expect("fits")
+        }
+    }    #[test]
     fn printable_range_is_latin1_by_default() {
         // `io:printable_range/0` ⇒ `latin1`: the `ERL_PRINTABLE_CHARACTERS_LATIN1`
         // default (`erl_init.c:1379-1382`), which only `+pc unicode` upgrades, and

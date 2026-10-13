@@ -67,13 +67,24 @@
 //! # Maps
 //!
 //! A map renders `#{k => v,…}` (note ` => ` between a key and its value and a
-//! bare `,` between pairs — the oracle's rendering). Pairs are printed in the
-//! map's **storage order** ([`beam_term::map::map_pairs_storage_order`]) — the
-//! order `maps:keys/1` yields: a flat map (≤32 pairs) stores its keys in the
-//! oracle's *flatmap key order* (`erts_cmp_flatmap_keys`, `erl_utils.h:267`: two
-//! atom keys by their raw term word, i.e. atom index / intern order; anything else
-//! by the exact term order), and a hash map (>32 pairs) stores them in its HAMT slot
-//! traversal order. Both match the oracle's `~w`/`~p` byte for byte.
+//! bare `,` between pairs — the oracle's rendering). By default the pairs are
+//! printed in the map's **storage order**
+//! ([`beam_term::map::map_pairs_storage_order`]) — the order `maps:keys/1`
+//! yields: a flat map (≤32 pairs) stores its keys in the oracle's *flatmap key
+//! order* (`erts_cmp_flatmap_keys`, `erl_utils.h:267`: two atom keys by their raw
+//! term word, i.e. atom index / intern order; anything else by the exact term
+//! order), and a hash map (>32 pairs) stores them in its HAMT slot traversal
+//! order. Both match the oracle's `~w`/`~p` byte for byte.
+//!
+//! The `~k`/`~K` **map-order modifiers** select a different order for the
+//! directive that follows them (`io_lib_format:modifiers/3`): `~k` sets the
+//! order to `ordered` (ascending term order), and `~K` takes the order from the
+//! next argument — the atoms `ordered`/`reversed`/`undefined` (the default
+//! storage order) select a built-in order, and a 2-arity fun is the order
+//! *comparator* the oracle would call (a typed [`unsupported_bif`] here, as no
+//! `FunCaller` seam is available). The order applies to **every** map at any
+//! depth of the directive's term; [`MapOrder`] carries it and
+//! [`resolve_map_pairs`] interprets it exactly when a map is rendered.
 //!
 //! # `~p`/`~P` re-flow (`io_lib_pretty`)
 //!
@@ -133,20 +144,93 @@ use beam_common::Result;
 use beam_term::{atom_val, pid_number, pid_serial, signed_value, AtomTable, Eterm};
 
 use crate::access::{
-    bitstring_bit_size, bitstring_bits, car, cdr, float_value, is_atom, is_big, is_float,
-    is_internal_pid, is_internal_ref, is_list, is_map, is_nil, is_small, is_tuple, ref_thing_id,
-    tuple_element, tuple_size,
+    bitstring_bit_size, bitstring_bits, car, cdr, float_value, fun_arity, is_atom, is_big,
+    is_float, is_function, is_internal_pid, is_internal_ref, is_list, is_map, is_nil, is_small,
+    is_tuple, ref_thing_id, tuple_element, tuple_size,
 };
 use crate::bits;
 use crate::context::BifContext;
-use crate::error::badarg;
+use crate::error::{badarg, unsupported_bif};
 
 mod pretty;
-pub(crate) use pretty::pretty_chunk;
+pub(crate) use pretty::{pretty_chunk, pretty_chunk_order};
 
 /// The depth value that disables depth limiting — `io_lib` passes `-1` for `~w`.
 pub(crate) const UNLIMITED_DEPTH: i64 = -1;
 
+/// The map printing order a `~k`/`~K` modifier selected
+/// (`io_lib_format:modifiers/3` → `Spec#{maps_order => …}`).
+///
+/// Threaded through the whole rendering of one directive's term, so it applies to
+/// every map at any depth. The order is interpreted **only when a map is
+/// rendered** ([`resolve_map_pairs`]), exactly as the oracle's `maps:iterator/2`
+/// is only reached by `write_map`/`print_length_map`.
+#[derive(Clone, Copy)]
+pub(crate) enum MapOrder {
+    /// The default: the map's stored pair order (the `undefined` order).
+    Storage,
+    /// `ordered` (the `~k` modifier): ascending term order.
+    Ordered,
+    /// `reversed`: descending term order.
+    Reversed,
+    /// A raw `~K` order term, interpreted at map-render time.
+    Explicit(Eterm),
+}
+
+/// Resolves the pairs of a map `term` in the order a `~k`/`~K` modifier selected
+/// — the oracle's `maps:iterator(Map, MapsOrder)` + `maps:next/1` walk.
+///
+/// * [`MapOrder::Storage`] — the map's stored pair order (`maps:to_list/1`'s
+///   order, the `undefined` order);
+/// * [`MapOrder::Ordered`] — ascending **term** order (`map_pairs`);
+/// * [`MapOrder::Reversed`] — descending term order (`map_pairs` reversed);
+/// * [`MapOrder::Explicit`] — a `~K` order term: the atoms `ordered`/`reversed`/
+///   `undefined` select as above, a **2-arity fun** is the typed
+///   [`unsupported_bif`] (the printer has no `FunCaller` seam to invoke it, and a
+///   fabricated order would be a wrong result), and anything else (any other
+///   atom, a non-atom, or a fun of another arity) is `badarg`, as the oracle's
+///   `maps:iterator/2` argument check.
+///
+/// # Errors
+///
+/// As [`beam_term::map`] (`badarg` for a non-map), plus the `badarg`/
+/// `unsupported_bif` cases above.
+pub(crate) fn resolve_map_pairs(
+    term: Eterm,
+    order: MapOrder,
+    atoms: &AtomTable,
+) -> Result<Vec<(Eterm, Eterm)>> {
+    match order {
+        MapOrder::Storage => Ok(beam_term::map::map_pairs_storage_order(term)?),
+        MapOrder::Ordered => Ok(beam_term::map::map_pairs(term, atoms)?),
+        MapOrder::Reversed => {
+            let mut pairs = beam_term::map::map_pairs(term, atoms)?;
+            pairs.reverse();
+            Ok(pairs)
+        }
+        MapOrder::Explicit(order_term) => {
+            // A 2-arity fun is the order *comparator* the oracle would call
+            // (`maps:iterator(Map, CmpFun)`) — the printer has no `FunCaller` seam,
+            // so it is an honest typed gap rather than a fabricated order.
+            if is_function(order_term) {
+                return match fun_arity(order_term) {
+                    Some(2) => Err(unsupported_bif()),
+                    _ => Err(badarg()),
+                };
+            }
+            if !is_atom(order_term) {
+                return Err(badarg());
+            }
+            let resolved = match atoms.name(atom_val(order_term)).ok_or_else(badarg)? {
+                "ordered" => MapOrder::Ordered,
+                "reversed" => MapOrder::Reversed,
+                "undefined" => MapOrder::Storage,
+                _ => return Err(badarg()),
+            };
+            resolve_map_pairs(term, resolved, atoms)
+        }
+    }
+}
 /// A fragment of a rendering: the exact nested character-list structure the
 /// oracle's `io_lib`/`io_lib_pretty` build.
 ///
@@ -338,9 +422,24 @@ pub(crate) fn term_chunk(
     printable: bool,
     depth: i64,
 ) -> Result<Chunk> {
-    render_chunk(ctx.atoms(), term, printable, depth)
+    render_chunk(ctx.atoms(), term, printable, depth, MapOrder::Storage)
 }
-/// Collects `term` into its element vector iff it is a proper list.
+
+/// As [`term_chunk`], but with the map order a `~k`/`~K` modifier selected
+/// ([`MapOrder`]) applied to every map at any depth.
+///
+/// # Errors
+///
+/// As [`term_chunk`].
+pub(crate) fn term_chunk_order(
+    ctx: &mut BifContext<'_>,
+    term: Eterm,
+    printable: bool,
+    depth: i64,
+    order: MapOrder,
+) -> Result<Chunk> {
+    render_chunk(ctx.atoms(), term, printable, depth, order)
+}/// Collects `term` into its element vector iff it is a proper list.
 ///
 /// `NIL` yields `Some(vec![])`; a cons chain ending in anything but `NIL`, or a
 /// non-list term, yields `None`. Shared with [`crate::io`] and [`crate::ets`] so
@@ -380,7 +479,13 @@ fn char_printable(value: i64) -> bool {
 
 /// Renders `term` as one element chunk (`io_lib:write1/4` for `~w`, or
 /// `io_lib_pretty:write/1` for `~p`).
-fn render_chunk(atoms: &AtomTable, term: Eterm, printable: bool, depth: i64) -> Result<Chunk> {
+fn render_chunk(
+    atoms: &AtomTable,
+    term: Eterm,
+    printable: bool,
+    depth: i64,
+    order: MapOrder,
+) -> Result<Chunk> {
     if depth == 0 {
         return Ok(Chunk::text("..."));
     }
@@ -402,7 +507,7 @@ fn render_chunk(atoms: &AtomTable, term: Eterm, printable: bool, depth: i64) -> 
                 return Ok(Chunk::text(&quoted_string(&bytes)));
             }
         }
-        return render_list_chunk(atoms, term, printable, depth);
+        return render_list_chunk(atoms, term, printable, depth, order);
     }
     if is_tuple(term) {
         let arity = tuple_size(term);
@@ -413,8 +518,14 @@ fn render_chunk(atoms: &AtomTable, term: Eterm, printable: bool, depth: i64) -> 
             return Ok(Chunk::text("{...}"));
         }
         let mut body: Vec<Chunk> = Vec::with_capacity(arity);
-        body.push(render_chunk(atoms, tuple_element(term, 0), printable, depth - 1)?);
-        render_tuple_rest_chunk(atoms, term, 1, depth - 1, printable, &mut body)?;
+        body.push(render_chunk(
+            atoms,
+            tuple_element(term, 0),
+            printable,
+            depth - 1,
+            order,
+        )?);
+        render_tuple_rest_chunk(atoms, term, 1, depth - 1, printable, order, &mut body)?;
         return Ok(Chunk::List(vec![
             Chunk::Char('{'),
             Chunk::List(body),
@@ -435,7 +546,7 @@ fn render_chunk(atoms: &AtomTable, term: Eterm, printable: bool, depth: i64) -> 
         return render_bitstring_chunk(term, printable, depth);
     }
     if is_map(term) {
-        return render_map_chunk(atoms, term, printable, depth);
+        return render_map_chunk(atoms, term, printable, depth, order);
     }
     if is_internal_pid(term) {
         return Ok(Chunk::text(&format!(
@@ -456,10 +567,11 @@ fn render_list_chunk(
     term: Eterm,
     printable: bool,
     depth: i64,
+    order: MapOrder,
 ) -> Result<Chunk> {
     let mut body: Vec<Chunk> = Vec::new();
-    body.push(render_chunk(atoms, car(term), printable, depth - 1)?);
-    render_tail_chunk(atoms, cdr(term), printable, depth - 1, &mut body)?;
+    body.push(render_chunk(atoms, car(term), printable, depth - 1, order)?);
+    render_tail_chunk(atoms, cdr(term), printable, depth - 1, order, &mut body)?;
     Ok(Chunk::List(vec![
         Chunk::Char('['),
         Chunk::List(body),
@@ -480,6 +592,7 @@ fn render_tail_chunk(
     term: Eterm,
     printable: bool,
     depth: i64,
+    order: MapOrder,
     out: &mut Vec<Chunk>,
 ) -> Result<()> {
     let mut term = term;
@@ -495,11 +608,11 @@ fn render_tail_chunk(
         }
         if !is_list(term) {
             out.push(Chunk::Char('|'));
-            out.push(render_chunk(atoms, term, printable, depth - 1)?);
+            out.push(render_chunk(atoms, term, printable, depth - 1, order)?);
             return Ok(());
         }
         out.push(Chunk::Char(','));
-        out.push(render_chunk(atoms, car(term), printable, depth - 1)?);
+        out.push(render_chunk(atoms, car(term), printable, depth - 1, order)?);
         term = cdr(term);
         depth -= 1;
     }
@@ -516,6 +629,7 @@ fn render_tuple_rest_chunk(
     index: usize,
     depth: i64,
     printable: bool,
+    order: MapOrder,
     out: &mut Vec<Chunk>,
 ) -> Result<()> {
     let len = tuple_size(term);
@@ -527,7 +641,13 @@ fn render_tuple_rest_chunk(
             return Ok(());
         }
         out.push(Chunk::Char(','));
-        out.push(render_chunk(atoms, tuple_element(term, index), printable, depth - 1)?);
+        out.push(render_chunk(
+            atoms,
+            tuple_element(term, index),
+            printable,
+            depth - 1,
+            order,
+        )?);
         index += 1;
         depth -= 1;
     }
@@ -536,26 +656,29 @@ fn render_tuple_rest_chunk(
 /// Renders a map (`#{k => v,…}`), `io_lib:write_map/4` /
 /// `io_lib_pretty:write/1` (both build `[#, {, [pair, …, pair], }]`).
 ///
-/// The pairs come from the map's storage order (flat-map key order for a flat map,
-/// HAMT slot order for a hash map) — the order `maps:keys/1` yields and the oracle
-/// prints — so no re-sort is needed and a >32-pair hash map renders like the oracle.
+/// The pairs come from [`resolve_map_pairs`]: the map's storage order by default
+/// (flat-map key order for a flat map, HAMT slot order for a hash map) — the order
+/// `maps:keys/1` yields and the oracle prints — or the `ordered`/`reversed`/`~K`
+/// order `order` selected. So no re-sort is needed and a >32-pair hash map renders
+/// like the oracle.
 fn render_map_chunk(
     atoms: &AtomTable,
     term: Eterm,
     printable: bool,
     depth: i64,
+    order: MapOrder,
 ) -> Result<Chunk> {
     if depth == 1 {
         return Ok(Chunk::text("#{}"));
     }
-    let pairs: Vec<(Eterm, Eterm)> = beam_term::map::map_pairs_storage_order(term)?;
+    let pairs: Vec<(Eterm, Eterm)> = resolve_map_pairs(term, order, atoms)?;
     if pairs.is_empty() {
         return Ok(Chunk::text("#{}"));
     }
     let inner = depth - 1;
     let mut body: Vec<Chunk> = Vec::new();
-    body.push(map_pair_chunk(atoms, pairs[0], printable, inner)?);
-    render_map_body_chunk(atoms, &pairs, 1, inner, inner, printable, &mut body)?;
+    body.push(map_pair_chunk(atoms, pairs[0], printable, inner, order)?);
+    render_map_body_chunk(atoms, &pairs, 1, inner, inner, printable, order, &mut body)?;
     Ok(Chunk::List(vec![
         Chunk::Char('#'),
         Chunk::Char('{'),
@@ -582,6 +705,7 @@ fn render_map_body_chunk(
     depth: i64,
     inner: i64,
     printable: bool,
+    order: MapOrder,
     out: &mut Vec<Chunk>,
 ) -> Result<()> {
     let mut index = index;
@@ -595,7 +719,7 @@ fn render_map_body_chunk(
             return Ok(());
         }
         out.push(Chunk::Char(','));
-        out.push(map_pair_chunk(atoms, pairs[index], printable, inner)?);
+        out.push(map_pair_chunk(atoms, pairs[index], printable, inner, order)?);
         index += 1;
         depth -= 1;
     }
@@ -608,11 +732,12 @@ fn map_pair_chunk(
     pair: (Eterm, Eterm),
     printable: bool,
     depth: i64,
+    order: MapOrder,
 ) -> Result<Chunk> {
     Ok(Chunk::List(vec![
-        render_chunk(atoms, pair.0, printable, depth)?,
+        render_chunk(atoms, pair.0, printable, depth, order)?,
         Chunk::text(" => "),
-        render_chunk(atoms, pair.1, printable, depth)?,
+        render_chunk(atoms, pair.1, printable, depth, order)?,
     ]))
 }
 /// `io_lib_format:chars/2` — a deeply nested `lists:duplicate/2`.
