@@ -647,6 +647,14 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   **required by default** — a genuinely absent
   `erl` FAILS the cross-check rather than skipping it (`BEAM_ETS_ALLOW_NO_ORACLE=1` opts out with a loud
   skip; `BEAM_ETS_REQUIRE_ORACLE=1` forces the requirement).
+- **Randomised `ordered_set` differential** (`tests/ets_ordered_oracle.rs`, `#[ignore]`d by default):
+  a 73-term mixed-type key pool (ints incl. `0`/negatives, the collapsing pairs `1`/`1.0` and `2`/`2.0`,
+  distinct floats, atoms, binaries, tuples, lists) driven by a SplitMix64-finalised LCG through 40 op
+  slots (insert/insert_new/lookup/member/delete/delete_object/delete_all_objects/take + `first`/`last`/
+  `next`/`prev`/`select`/`select_count`/`match_object`/`select_reverse`/`foldl`), rendering every observed
+  key as its pool index and comparing `{size, in-order tab2list, op result}` after every step against the
+  live oracle — **1800 steps / 3 seeds agree, no divergence**. Run it with `--ignored`; it exercises the
+  split/merge churn (max ~48–54 live keys, past `ORDER = 32`) the fixed battery cannot.
 - **`tests/ets_continuation.rs` / `tests/ets_continuation_direction.rs` cross-check the continuation
   cursor against the live oracle, including a mutation between chunks**: an `ordered_set` resume
   survives a delete of the last-yielded (anchor) key, and a delete/insert behind the cursor does not
