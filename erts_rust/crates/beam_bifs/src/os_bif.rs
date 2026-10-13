@@ -54,6 +54,21 @@
 //! present in the tree), so no faithful transcription is possible — an
 //! approximation would risk *wrong* results.
 //!
+//! # `os:system_time/1`'s unit
+//!
+//! `os:system_time/1` runs the same `time_unit_conversion` as
+//! `erlang:system_time/1` (`erl_time_sup.c:2268-2356`): the atoms
+//! `native`/`perf_counter` (both 1e9/s on this host), `second|seconds`,
+//! `millisecond|milli_seconds`, `microsecond|micro_seconds` and
+//! `nanosecond|nano_seconds`, or any **positive integer** naming that many units
+//! per second — so the value is `native * per_second div 1_000_000_000` with
+//! `native` in nanoseconds. A ratio that fits a small integer converts in `i128`;
+//! a **positive bignum** is the C's `default` arm, handed to
+//! `erlang:convert_time_unit/3` and converted in arbitrary precision
+//! ([`convert_big_unit`]) — `os:system_time(1 bsl 200)` is the oracle's bignum,
+//! never a capability gap. A zero or negative small integer, a **negative**
+//! bignum (the C's `big_sign`), a float or any other term is `badarg`.
+//!
 //! # Environment model
 //!
 //! Real ERTS keeps its **own** copy of the environment (`sysenv_global_env`,
@@ -362,17 +377,27 @@ fn perf_counter_native() -> i64 {
 /// A target time unit of `os:system_time/1`: `tu` units per second, so the value
 /// is `native * tu div 1_000_000_000` (`time_unit_conversion` /
 /// `erlang:convert_time_unit/3`; `native` is nanoseconds).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct OsUnit {
-    /// Target units per second.
-    per_second: i128,
+///
+/// The C converts every unit that fits a machine word inline and hands the rest
+/// to `erlang:convert_time_unit/3` (`erl_time_sup.c:2277-2352`); the two variants
+/// below are that split.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OsUnit {
+    /// Target units per second, for a unit that fits a small integer — every
+    /// accepted atom, and a positive integer inside the 60-bit range.
+    PerSecond(i128),
+    /// A caller-supplied **positive bignum**: that many target units per second,
+    /// held as a little-endian `u64` magnitude — the C's `default` arm, which
+    /// `trap_to_erlang_code` converts in arbitrary precision
+    /// (`erl_time_sup.c:2333-2352`, [`convert_big_unit`]).
+    PerSecondBig(Vec<u64>),
 }
 
-impl OsUnit {
-    /// The native→`self` conversion of a non-negative native (nanosecond) value.
-    fn convert(self, native: i64) -> i128 {
-        (i128::from(native) * self.per_second) / 1_000_000_000
-    }
+/// `native * per_second div 1_000_000_000` for a unit that fits `i128`: the
+/// widest ratio is the largest small integer (`2^59 - 1` units/s), so the product
+/// of an `i64` nanosecond count and `per_second` stays far inside `i128`.
+fn convert_per_second(native: i64, per_second: i128) -> i128 {
+    (i128::from(native) * per_second) / 1_000_000_000
 }
 
 /// The unit named by `term`, or `badarg` (`time_unit_conversion`'s accepted
@@ -380,23 +405,32 @@ impl OsUnit {
 /// this host), `second|seconds`, `millisecond|milli_seconds`,
 /// `microsecond|micro_seconds`, `nanosecond|nano_seconds`, and any **positive**
 /// integer expressed as units per second (`os:system_time(1000)` ⇒
-/// milliseconds).
+/// milliseconds) — a small integer or a bignum.
 ///
-/// A zero, a negative or a non-integer unit is `badarg`. A **bignum** unit is a
-/// typed [`BeamError::Raise`] (`unsupported`) rather than a wrong value: the C
-/// computes `TU * Time` in arbitrary precision, which M1's `i128`-bounded
-/// arithmetic here does not reproduce. `os:system_time(1 bsl 70)` is the only
-/// such form.
+/// # Errors
+///
+/// [`BeamError::BadArg`] for anything else: a zero or negative small integer, a
+/// float, a list, an unrecognized atom, and a **negative** bignum (the C's
+/// `big_sign`). A *positive* bignum is a legal unit ([`OsUnit::PerSecondBig`]);
+/// only a product past the bignum cap is `badarg` ([`convert_big_unit`]).
 fn os_unit(ctx: &mut BifContext<'_>, term: Eterm) -> Result<OsUnit> {
     if is_small(term) {
         let value = signed_value(term);
+        // `time_unit_conversion`'s `signed_val(term) <= 0` arm.
         if value <= 0 {
             return Err(badarg());
         }
-        return Ok(OsUnit { per_second: i128::from(value) });
+        return Ok(OsUnit::PerSecond(i128::from(value)));
     }
     if is_big(term) {
-        return Err(crate::error::unsupported_bif());
+        // A bignum term is never zero, so a non-negative one is positive; a
+        // negative one is the C's `big_sign` arm.
+        let (negative, magnitude) = beam_codec::term::big_parts(term).map_err(|_| badarg())?;
+        return if negative {
+            Err(badarg())
+        } else {
+            Ok(OsUnit::PerSecondBig(magnitude.to_vec()))
+        };
     }
     if is_atom(term) {
         let name = ctx.atoms().name(atom_val(term));
@@ -408,9 +442,81 @@ fn os_unit(ctx: &mut BifContext<'_>, term: Eterm) -> Result<OsUnit> {
             Some("nanosecond" | "nano_seconds") => 1_000_000_000,
             _ => return Err(badarg()),
         };
-        return Ok(OsUnit { per_second });
+        return Ok(OsUnit::PerSecond(per_second));
     }
     Err(badarg())
+}
+
+/// The **bignum** unit conversion: `native * per_second div 1_000_000_000`,
+/// exact and floor-rounded in arbitrary precision.
+///
+/// This is the C's `trap_to_erlang_code` arm (`erl_time_sup.c:2343-2352`), which
+/// hands the conversion to `erlang:convert_time_unit/3` — `TU * Time div FU` with
+/// `FU = 1_000_000_000` and `TU` the unit, plus the `TU*Time - (FU - 1)`
+/// adjustment that turns the truncating `div` into a floor for a negative `Time`
+/// (`erlang.erl:5368-5377`). The arithmetic is the crate's registered
+/// `erlang:'*'/2`, `erlang:'-'/2` and `erlang:'div'/2` implementations
+/// ([`arithmetic_operators`]): one exact bignum multiply and one exact divide, so
+/// no bignum math is written a second time. [`crate::time`]'s `convert_unit_big`
+/// is the same chain for the `erlang` clocks; that helper is private and this
+/// module may not edit it, so the two stand side by side.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] for a product past the `BIG_ARITY_MAX` limb cap — the one
+/// arithmetic failure left here (both operands are integers, the divisor is
+/// `1_000_000_000`) and the class the oracle reports too: its
+/// `convert_time_unit/3` body runs inside `try ... catch _:_ -> badarg`, so the
+/// `system_limit` of an oversized product surfaces as `badarg`
+/// (`os:system_time(1 bsl 4194239)` ⇒ `badarg` in the oracle and here).
+fn convert_big_unit(ctx: &mut BifContext<'_>, native: i64, per_second: &[u64]) -> Result<Eterm> {
+    let operators = arithmetic_operators();
+    let native_term = arith::int_from_i64(ctx, native)?;
+    let per_second_term = arith::int_from_mag(ctx, false, per_second)?;
+    let product = operators
+        .call("erlang", "*", 2, ctx, &[native_term, per_second_term])
+        .map_err(trap_arith_class)?;
+    let numerator = if native < 0 {
+        let adjust = arith::int_from_i64(ctx, 1_000_000_000 - 1)?;
+        operators
+            .call("erlang", "-", 2, ctx, &[product, adjust])
+            .map_err(trap_arith_class)?
+    } else {
+        product
+    };
+    let divisor = arith::int_from_i64(ctx, 1_000_000_000)?;
+    operators
+        .call("erlang", "div", 2, ctx, &[numerator, divisor])
+        .map_err(trap_arith_class)
+}
+
+/// The crate's registered `erlang` arithmetic operators, for the
+/// arbitrary-precision conversion a bignum unit needs ([`convert_big_unit`]).
+///
+/// Built once from [`crate::arith::register`] — the same `fn`s
+/// [`BifRegistry::with_core_bifs`] installs — so the multi-limb multiply and the
+/// Knuth-D divide stay the crate's single implementation; the registry (rather
+/// than `crate::arith`'s private helpers) is the arithmetic entry point a
+/// [`BifContext`] can be handed to, exactly as the runtime dispatches them.
+fn arithmetic_operators() -> &'static BifRegistry {
+    static OPERATORS: OnceLock<BifRegistry> = OnceLock::new();
+    OPERATORS.get_or_init(|| {
+        let mut operators = BifRegistry::new();
+        arith::register(&mut operators);
+        operators
+    })
+}
+
+/// The error class `erlang:convert_time_unit/3` reports: its whole body runs
+/// inside `try ... catch _:_ -> error_with_info(badarg, ...)`
+/// (`erlang.erl:5378-5380`), so the `system_limit` an oversized product raises
+/// surfaces as `badarg`. Any other error is a genuine capability gap and is
+/// passed through untouched.
+fn trap_arith_class(error: BeamError) -> BeamError {
+    match error {
+        BeamError::BadArith | BeamError::SystemLimit => badarg(),
+        other => other,
+    }
 }
 
 /// An arbitrarily large non-negative result: a small int when it fits, else a
@@ -486,10 +592,16 @@ fn os_system_time_0(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> 
 }
 
 /// `os:system_time/1` — `os:system_time/0` expressed in the given unit.
+///
+/// The unit's ratio is a machine integer for every atom and for a small positive
+/// integer ([`convert_per_second`]), and arbitrary precision for a **positive
+/// bignum** ([`convert_big_unit`]).
 fn os_system_time_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let native = system_native()?;
-    let unit = os_unit(ctx, args[0])?;
-    int_from_i128(ctx, unit.convert(native))
+    match os_unit(ctx, args[0])? {
+        OsUnit::PerSecond(per_second) => int_from_i128(ctx, convert_per_second(native, per_second)),
+        OsUnit::PerSecondBig(per_second) => convert_big_unit(ctx, native, &per_second),
+    }
 }
 
 /// `os:timestamp/0` — the deprecated `{MegaSecs, Secs, MicroSecs}`
@@ -702,39 +814,127 @@ mod tests {
         let native = os_unit(&mut ctx, native_unit).expect("native");
         let perf_unit = ctx.atom("perf_counter").unwrap();
         let perf = os_unit(&mut ctx, perf_unit).expect("perf");
-        assert_eq!(seconds.per_second, 1);
-        assert_eq!(milli.per_second, 1_000);
-        assert_eq!(native.per_second, 1_000_000_000);
-        assert_eq!(perf.per_second, 1_000_000_000);
-        assert_eq!(native.convert(1_500_000_000), 1_500_000_000);
-        assert_eq!(milli.convert(1_500_000_000), 1_500);
-        assert_eq!(seconds.convert(1_500_000_000), 1);
+        assert_eq!(seconds, OsUnit::PerSecond(1));
+        assert_eq!(milli, OsUnit::PerSecond(1_000));
+        assert_eq!(native, OsUnit::PerSecond(1_000_000_000));
+        assert_eq!(perf, OsUnit::PerSecond(1_000_000_000));
+        assert_eq!(convert_per_second(1_500_000_000, 1_000_000_000), 1_500_000_000);
+        assert_eq!(convert_per_second(1_500_000_000, 1_000), 1_500);
+        assert_eq!(convert_per_second(1_500_000_000, 1), 1);
 
         // A positive integer is a unit; zero/negative/non-integer are `badarg`.
         let thousand = ctx.int(1000).unwrap();
-        assert_eq!(os_unit(&mut ctx, thousand).expect("1000").per_second, 1_000);
+        assert_eq!(os_unit(&mut ctx, thousand).expect("1000"), OsUnit::PerSecond(1_000));
         for bad in [ctx.int(0).unwrap(), ctx.int(-1).unwrap(), ctx.atom("fortnight").unwrap()] {
             assert!(matches!(os_unit(&mut ctx, bad), Err(BeamError::BadArg)));
         }
-        // A float is `badarg`; a bignum is a typed unsupported.
+        // A float is `badarg`; a **negative** bignum is `badarg` (the C's
+        // `big_sign`), while a **positive** bignum is a legal unit held as its
+        // magnitude — never the typed capability gap it used to be.
         let one_float = ctx.make_float(1.0).unwrap();
         assert!(matches!(os_unit(&mut ctx, one_float), Err(BeamError::BadArg)));
-        let big = {
-            let limbs = [0u64, 1u64]; // 2^64, far past the 60-bit small range
-            arith::int_from_mag(&mut ctx, false, &limbs).expect("a bignum")
-        };
-        assert!(matches!(os_unit(&mut ctx, big), Err(BeamError::Raise(_))));
+        let limbs = [0u64, 0, 0, 1u64 << 8]; // 2^200, far past the 60-bit range
+        let negative_big = arith::int_from_mag(&mut ctx, true, &limbs).expect("a bignum");
+        assert!(matches!(os_unit(&mut ctx, negative_big), Err(BeamError::BadArg)));
+        let positive_big = arith::int_from_mag(&mut ctx, false, &limbs).expect("a bignum");
+        assert_eq!(
+            os_unit(&mut ctx, positive_big).expect("2^200"),
+            OsUnit::PerSecondBig(limbs.to_vec())
+        );
 
         // The huge-unit result promotes to a bignum.
         let twelve = ctx.int(1_000_000_000_000).unwrap();
-        let huge = os_unit(&mut ctx, twelve).expect("1e12");
-        let value = huge.convert(1_700_000_000_000_000_000);
+        let OsUnit::PerSecond(per_second) = os_unit(&mut ctx, twelve).expect("1e12") else {
+            panic!("1e12 fits `i128`");
+        };
+        let value = convert_per_second(1_700_000_000_000_000_000, per_second);
         assert!(value > i64::MAX as i128);
         let promoted = int_from_i128(&mut ctx, value).expect("promotes");
         assert!(
             beam_codec::term::big_parts(promoted).is_ok(),
             "a value past 2^63 must be a heap bignum"
         );
+    }
+
+    /// The exact decimal rendering of an integer result (the crate's own
+    /// `integer_digits` — the renderer `integer_to_list/1` uses). The goldens
+    /// below are written in this shape.
+    fn decimal(term: Eterm) -> String {
+        crate::numeric::integer_digits(term, 10).expect("an integer result")
+    }
+
+    /// A **positive bignum** unit converts in arbitrary precision, exactly as
+    /// `erlang:convert_time_unit(Time, nanosecond, Unit)` does — every golden
+    /// below is the oracle's own output (probe: system OTP 29.1.1 / erts-17.1),
+    /// which `os:system_time/1` reproduces on its own clock reading.
+    #[test]
+    fn bignum_units_convert_exactly_like_convert_time_unit() {
+        let mut heap = heap();
+        let atoms = seeded_atoms();
+        let mut ctx = context(&mut heap, &atoms);
+        let unit_200 = arith::int_from_mag(&mut ctx, false, &[0, 0, 0, 1u64 << 8]).expect("2^200");
+        let OsUnit::PerSecondBig(per_second_200) =
+            os_unit(&mut ctx, unit_200).expect("2^200 is a legal unit")
+        else {
+            panic!("2^200 must take the bignum arm");
+        };
+        assert_eq!(per_second_200, vec![0, 0, 0, 1u64 << 8]);
+        let unit_61 = arith::int_from_mag(&mut ctx, false, &[1u64 << 61]).expect("2^61");
+        let OsUnit::PerSecondBig(per_second_61) =
+            os_unit(&mut ctx, unit_61).expect("2^61 is a legal unit")
+        else {
+            panic!("2^61 must take the bignum arm");
+        };
+        for (native, per_second, expected) in [
+            (
+                1_500_000_000_000_000_000i64,
+                &per_second_200,
+                "2410407066388485413312943138511743903783304490674189252952064000000000",
+            ),
+            (
+                1_700_000_000_000_000_000,
+                &per_second_200,
+                "2731794675240283468421335556979976424287745089430747820012339200000000",
+            ),
+            (
+                1,
+                &per_second_200,
+                "1606938044258990275541962092341162602522202993782792",
+            ),
+            (0, &per_second_200, "0"),
+            (1_500_000_000_000_000_000, &per_second_61, "3458764513820540928000000000"),
+        ] {
+            let term = convert_big_unit(&mut ctx, native, per_second).expect("a legal unit");
+            assert_eq!(decimal(term), expected, "{native} ns with the unit {per_second:?}");
+        }
+    }
+
+    /// The `BIG_ARITY_MAX` boundary: a unit of the largest legal bignum size (65535
+    /// limbs) converts a small reading, while a product that needs one limb more is
+    /// `badarg` — the oracle's own behaviour, its `erlang:convert_time_unit/3`
+    /// folding the `system_limit` into `badarg`
+    /// (`erlang:convert_time_unit(1500000000000000000, nanosecond, 1 bsl 4194239)`).
+    #[test]
+    fn an_oversized_bignum_unit_product_is_badarg() {
+        // A `BIG_ARITY_MAX`-sized bignum is 65536 words, and the unit, the product
+        // and the quotient are on this heap at once.
+        let mut heap = Heap::new(1 << 19).expect("the boundary heap");
+        let atoms = seeded_atoms();
+        let mut ctx = context(&mut heap, &atoms);
+        let mut limbs = vec![0u64; 65_535];
+        limbs[65_534] = 1u64 << 63; // `1 bsl 4194239`: 4194240 bits, the cap
+        let unit = arith::int_from_mag(&mut ctx, false, &limbs).expect("the largest legal bignum");
+        let OsUnit::PerSecondBig(per_second) = os_unit(&mut ctx, unit).expect("a legal unit") else {
+            panic!("a 4194239-bit unit must take the bignum arm");
+        };
+        let term = convert_big_unit(&mut ctx, 1, &per_second).expect("the largest legal unit");
+        let (negative, digits) = beam_codec::term::big_parts(term).expect("a bignum");
+        assert!(!negative, "a positive reading converts to a positive value");
+        assert_eq!(digits.len(), 65_535, "`1 bsl 4194239 div 1e9` still fills the cap");
+        assert!(matches!(
+            convert_big_unit(&mut ctx, 1_500_000_000_000_000_000, &per_second),
+            Err(BeamError::BadArg)
+        ));
     }
 
     #[test]
