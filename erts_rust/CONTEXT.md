@@ -134,10 +134,10 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
 - **Compatibility gate (`tools/differential`):** `summary: total=1871 agree=1869 mismatch=0 unsupported=2
   skipped=0 allowed=2` → `gate.sh --strict` exits 0. `gate.sh` is authoritative — re-run it for the live
   per-contract split. **No case disagrees**; the two recorded capability gaps (the `known-gaps.txt`
-  ratchet allowlist) both belong to A.9 — `wire/new_fun_ext_encode` (unclosable — an `erl_eval` lambda's
+  ratchet allowlist) are `wire/new_fun_ext_encode` (A.5, unclosable — an `erl_eval` lambda's
   closure identity needs `erl_eval`/`erl_scan`/`erl_parse`) and
-  `boot_extra/init_script_id_names_the_running_otp_release` (`init:script_id/0` on a `-eval`/`run` path
-  that loads no boot script). The two A.9 `selfhost/*` in-process-compile cases now **agree**.
+  `boot_extra/init_script_id_names_the_running_otp_release` (A.9 — `init:script_id/0` on a `-eval`/`run`
+  path that loads no boot script). The two A.9 `selfhost/*` in-process-compile cases now **agree**.
 - **BIF surface complete:** `beam_bifs` registers **556/556 declared `bif.tab` BIFs** (registry 640
   keys = 556 declared + 84 non-table keys: 79 stdlib fast paths + `erlang:memory/0,1` + the OTP-30
   `pid_to_binary`/`ref_to_binary`/`port_to_binary`) through defaulted
@@ -177,12 +177,9 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   `erl_features`, `erl_scan`/`erl_parse`/`erl_lint`/`erl_expand_records`, the `v3_core` → `beam_*`
   passes, and `save_binary`'s file writes) — not `logger`/`error_logger`, a live `code_server`,
   `open_port`, `crypto`/`zlib`/`beam_lib`/`ets`/`persistent_term`/`re`, or `syntax_tools`. What remains is
-  fidelity: (a) the `selfhost/in_process_compile_file_no_spawn_deterministic` corpus case drives the
-  compile as a **scheduled `run` process**, whose parked receive-window collection relocates the receiver
-  heap against an incomplete root set (a live `Machine::pending_exception` is unpublished) and so reports
-  the typed `unsupported: opcode: run: process blocked (no message available)`; and (b) that
-  scheduled-process shape has no nested-run `receive … after T` timeout that can fire. Both `selfhost/*`
-  cases flip to `agree` once in-process compilation lands as a scheduled process. The engine call seams
+  fidelity: both `selfhost/*` corpus cases (`selfhost/in_process_compile_file_no_spawn_deterministic`,
+  which drives the compile as a scheduled `run` process, and `selfhost/scheduled_process_compile_file_deterministic`,
+  the default `compile:file/2` shape) now **agree** with the oracle. The engine call seams
   this needed (`call_ext`-encoded `erlang:apply/3`, `call_fun`/`call_fun2` for a scheduled process,
   `resolve_local_fun`) are all closed, and the bitstring-match operand-order bug (`bs_get_binary2`/
   `bs_get_integer2`/`bs_get_float2` writing `Dst` before committing the match context when `dst == ctx`)

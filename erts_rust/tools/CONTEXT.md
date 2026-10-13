@@ -46,11 +46,11 @@ Both crates ship a **library + a binary**: the library exists so `cargo test` ca
 
 ## Status
 - **Compatibility gate:** the corpus covers all nine contracts A.1–A.9 — `summary: total=1871 agree=1869
-  mismatch=0 unsupported=2 skipped=0 allowed=2` (`gate.sh` is authoritative and always runs
-  `--strict --allowlist known-gaps.txt`; re-run it for the live per-contract split). Keep per-contract
-  counts in `differential/` (its own CONTEXT.md) rather than copied here, so they cannot drift.
-  The two recorded capability gaps (`known-gaps.txt`) are both A.9: `wire/new_fun_ext_encode` (unclosable
-  by design) and `boot_extra/init_script_id_names_the_running_otp_release`.
+  mismatch=0 unsupported=2 skipped=0 allowed=2` (`gate.sh` is authoritative and always runs a strict,
+  allowlisted `differential suite`; re-run it for the live per-contract split, or `differential list
+  --by-contract` for the static one — do not copy a per-contract table into any CONTEXT.md, it drifts).
+  The two recorded capability gaps (`known-gaps.txt`) are `wire/new_fun_ext_encode` (A.5, unclosable
+  by design) and `boot_extra/init_script_id_names_the_running_otp_release` (A.9).
 - **`beam_rt` gap signalling is honoured:** cases the runtime cannot run classify as `unsupported`,
   never `mismatch`.
 - **CI:** `.github/workflows/erts_rust.yml` builds/tests the workspace and runs `differential/gate.sh`
@@ -71,8 +71,9 @@ Both crates ship a **library + a binary**: the library exists so `cargo test` ca
 - **Oracle = the system `erl`, never the in-tree `erts/` C build** (`differential/src/runtime.rs::resolve_oracle`: `$ERTS_ORACLE` else `erl` scanned on `$PATH`).
 - **Gate coverage (verified against code):** `differential suite` reports `summary: total=1871 agree=1869
   mismatch=0 unsupported=2 skipped=0 allowed=2` (a case may declare several contracts, so the per-contract totals
-  exceed `summary.total`). All nine contracts A.1–A.9 have corpus cases; the live per-contract split is in
-  `differential/CONTEXT.md` — do not copy it here (it drifts). A.4 (driver C ABI) is covered end to end by the `driver_c` group
+  exceed `summary.total`). All nine contracts A.1–A.9 have corpus cases; use `differential list
+  --by-contract` (or the run report) for the live per-contract split — never copy it into a CONTEXT.md
+  (it drifts). A.4 (driver C ABI) is covered end to end by the `driver_c` group
   (a real C driver `.so` driven through the port lifecycle and the `port_command` echo round trip),
   alongside the built-in spawn-driver `driver/` cases and the structural C-ABI check (`tests/abi.rs`). The
   genuine end-to-end agreement core is the module-run groups (`modules`/`mexec`/`nif_so`/`nif_res`/`driver_c`/`records`).

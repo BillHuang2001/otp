@@ -8,6 +8,106 @@ Format: one entry per major change — date, area, what changed and why. Newest 
 
 ---
 
+## 2026-10-13 — Milestone 8: host decline-gate seam for signal delivery, the `beam_rt::context` module split, the reference-id provenance bridge, a self-contained `re` engine, port-level line framing, the legacy-C removal plan
+Scope: a breadth-and-structure milestone. The headline structural changes are the **host
+decline-gate seam** that closes the last known GC-relocation-against-an-incomplete-root-set hole
+on the signal-delivery path, the **decomposition of `beam_rt`'s 3502-line `context/mod.rs`** into
+concern-scoped submodules, the **reference-id provenance bridge** that removes a mis-delivery
+hazard, and a **self-contained regex engine** replacing the last large BIF hole. Verified:
+`cargo build --workspace --all-targets` warning-free, the workspace test suite green
+(≈8600 passed / 0 failed; the `differential` live-oracle binary suite passes in 1791 s), and the
+differential gate **`total=1871 agree=1869 mismatch=0 unsupported=2 skipped=0 allowed=2`** → exit 0
+in BOTH the default (baseline-JIT) and `BEAM_RT_TIER=interpreter` tiers.
+- **Area:** `erts_rust/crates/beam_process` (`src/process.rs`, `src/ptab.rs`)
+- **Change (correctness):** a new host seam, `trait CollectionGate { fn declines_relocation(&mut
+  self, receiver: &Process) -> bool }`, plus a `ProcessTable::collection_gate` slot
+  (`set_collection_gate`/`take_collection_gate`). **Every** signal site that can admit heap words on
+  a receiver (`deliver_head_signal`, `enqueue_exit_signal`, `enqueue_down_signal`,
+  `deliver_noproc_down`, `deliver_named_noproc_down`, `enqueue_remote_*`, `enqueue_port_*`) now tests
+  `has_unpublished_roots() || decline` before a collecting `ensure_capacity`; declining refuses
+  **only the relocation** (a no-relocation `grow_nursery` or the fragment-resident delivery still
+  proceeds, so a notification is never lost). Before this, the only gate was
+  `relocation_exempt || state == Running`, so a signal-driven collection could relocate a heap
+  belonging to a process that was neither — the exact hazard behind the A.9 `selfhost/*` mover (a
+  monitor watcher freshly woken `Waiting → Runnable`, whose `regs` snapshot is not its whole live
+  root set). Additive/defaulted: no sibling crate had to change to keep compiling.
+- **Area:** `erts_rust/crates/beam_rt` (`src/context/`)
+- **Change (structure):** `src/context/mod.rs` went **3502 → 128 lines**, split along its real seams
+  into `runtime_context.rs` (the type + relocation-exemption windows), `dispatch.rs` (the dispatch
+  memo + the twelve `uses_*` predicates), `calls.rs` (the registered-BIF/NIF call path),
+  `send.rs` (the send/deliver family), `apply.rs` (fun application + callee admission), `pump.rs`
+  (the nested-run pump, incl. the moved inline `mod blocking_fun_apply`) and `execution.rs` (the
+  **single** `impl ExecutionContext`, which Rust forbids distributing, so it delegates to inherent
+  helpers in the owning sibling). `mod.rs` is now root-only plumbing (docs, `mod` decls, re-exports,
+  `#[cfg(test)]` name plumbing). Public surface and every `crate::context::…` path unchanged;
+  `tests.rs`/`test_support.rs` stayed byte-identical, so the crate's test count was unchanged by the
+  split (1447 → 1447).
+- **Area:** `erts_rust/crates/beam_rt` (`src/context/alias.rs`, `src/runtime.rs`, `src/nif.rs`, …)
+- **Change (correctness):** the runtime carried **two independent reference-id spaces** — a
+  `Runtime::refs` allocator (`make_ref/0`, NIF `make_ref`, timers, `seq_trace`) and the
+  `ProcessTable`'s own private allocator (every `monitor/2,3` and `alias/0,1`), both monotone from 0
+  and both encoding the same `[hdr,0,0,id]` term — so a *bare* reference whose id collided with a live
+  alias was **mis-delivered to the alias owner**. A single space is not reachable from `beam_rt`
+  (`MonitorRef::id` is private, `RefAllocator` exposes no seed, `ProcessTable::refs` is private), so
+  the fix is a **provenance bridge**: `Runtime::local_reference(term) -> Option<Option<MonitorRef>>`
+  classifies a send destination by provenance (`Some(Some(_))` = a reference this runtime minted →
+  the only shape routed to `resolve_alias`; `Some(None)` = a bare/timer ref, never an alias; `None` =
+  unknown provenance → the old id-parse fallback, so no working case regressed). HAZARD 2 — a bare and
+  a monitor reference with equal ids comparing `=:=` — is **not closable from this crate** and is
+  pinned as an explicit divergence owned by `beam_process`.
+- **Area:** `erts_rust/crates/beam_bifs` (`src/re/`, `src/runtime/ddll/`, `src/unicode/grapheme/`,
+  `src/io_ts.rs`)
+- **Change:** the **`re` module is now a real, self-contained regex engine** — all 8 declared `bif.tab`
+  keys (`version/0`, `compile/1,2`, `run/2,3`, `internal_run/4`, `inspect/2`, `import/1`) are backed by
+  a safe-Rust backtracking matcher (no third-party regex dependency). The compiled term is
+  `{re_pattern, NCap, UnicodeFlag, CrlfFlag, Payload}` whose `Payload` is **our own** versioned image
+  (`MAGIC = b"rustre2\0"`), never PCRE2's `#Ref<…>`, and there is no process-global pattern registry.
+  Verified against a 136-case live-oracle corpus, ETF-byte-identical, 0 disagreements. `erl_ddll`
+  gained a real name-keyed driver registry over `beam_abi`'s safe `load(path,name)` (`try_load/3`,
+  `try_unload/2`, `monitor/2`, `demonitor/1`, `info/2`, `loaded_drivers/0`, `format_error_int/1`) —
+  a new `beam_bifs → beam_abi` dependency edge. `io_lib:format/3`'s `~ts` (both unlimited — where a
+  UTF-8 binary's raw bytes had been emitted as codepoints, a silent **wrong result** — and the
+  `{chars_limit,N}` grapheme-cluster-eliding arm) plus `~k`/`~K` map ordering and all 15
+  `erlang:decode_packet/3` types are now oracle-exact, backed by generated Unicode 17.0 tables in
+  `src/unicode/grapheme/`.
+- **Area:** `erts_rust/crates/beam_io` (`src/port.rs`, `src/port_task.rs`, `src/registry.rs`,
+  `src/drivers/line_buffer.rs`)
+- **Change:** **`PORT_FLAG_LINE` framing implemented at the C's own placement** — line buffering is a
+  *port* state machine (`ERL_PORT_SFLG_LINEBUF_IO`), not a driver option: `LineFrame`/`take_frames`/
+  `flush_frames`, a port-level `line_mode`, and a `LineNotification` channel kept **separate** from
+  `PortNotification` (so `beam_rt`'s exhaustive two-arm match kept compiling untouched). Empty `eol`
+  frames are preserved (`{data,{eol,[]}}` for a blank line), `close()` never flushes, and the trailing
+  partial line flushes at input EOF. Also: `control`'s `NULL`-reply now returns the oracle's `[]`
+  instead of `badarg`, and the driver `set_busy_port` state half is implemented
+  (`DriverPort::is_busy`). Pinned against an oracle framing table over a real `cat` child behind a
+  real port; the assumption that a driver `output` callback returns a byte count was **refuted** from
+  the C (`void (*output)(…)`, the whole command always counted) and that fact is now pinned by a test.
+- **Area:** `erts/` (legacy C/C++)
+- **Change:** the dead-source checker was re-run and the tree re-verified: whole-`erts` STRICT
+  **921 candidates / 916 live / 5 strict-dead / 0 ACTIONABLE** (the 5 are the exempt vendored asmjit
+  `.cpp`), so **this pass removed no code — there is nothing provably dead left**. The committed
+  `dead_source_report.txt` was regenerated (it had drifted: 126 never-compiled-`#if` regions in 44
+  files → 99 in 41, because those guards were deleted after the report was generated). A
+  **parity-gated removal plan** (a 10-group parity matrix with per-group Rust owner + differential
+  evidence + verdict, a first→last **removal order** for the four PARTIAL groups, and the per-group
+  blockers — no GC value-oracle, no scheduler pre-emption under real concurrency, inbound
+  distribution default-OFF, no CA-tree for `ordered_set`, JIT off the Rust path) is now written into
+  `erts/emulator/beam/CONTEXT.md`. The **in-sandbox full emulator build now works** and is documented:
+  `env -u CONFIG_SHELL ./configure --without-termcap` in `erts/`, then top-level `make/configure` (to
+  generate `make/output.mk`), then `make -C erts` builds `beam.jit`/`beam.smp`/`libbeam.a` plus
+  `erlexec`/`dialyzer`/`typer`/`heart`/`inet_gethost`/`erl_child_setup`, and the built VM **boots and
+  evaluates Erlang** (only `erlc` fails, at link, on `-lei` from the unbuilt cross-node
+  `lib/erl_interface`). The legacy tree remains the OTP build's DEFAULT `FLAVOR=jit` runtime and the
+  differential fallback.
+- **Area:** `erts_rust/tools/differential` (`gate.sh`, `CONTEXT.md`, `divergences.md`)
+- **Change:** `gate.sh` no longer hardcodes its allowlist — it parses `--allowlist <file>` /
+  `--allowlist=<file>` and handles `--help`/unknown args before building (pinned by
+  `tests/cli.rs::gate_sh_resolves_the_allowlist_from_its_arguments`). The node's `CONTEXT.md` was
+  pruned from **73 KB to 29.7 KB** (over the ~64 KB per-file read budget, so its readers had been
+  getting truncated context) by moving the "how to add a corpus case" procedure into a new
+  `differential-add-corpus-case` skill and the divergent behaviours into the canonical owner-annotated
+  `divergences.md` ledger.
+
 ## 2026-10-10 — Milestone 6: GC root-set completion (the P0 fix), mailbox use-after-free, heap-sizing defect, bounded ETF decode, 3-word External fun descriptor, ETS navigation, IO framing + ABI fixes, boot-to-completion
 Scope: a correctness-and-robustness milestone. The headline structural change is the **completion of
 the frozen root-set contract** — the class of defect that produced an intermittent `SIGSEGV` — plus
