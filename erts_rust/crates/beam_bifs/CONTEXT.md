@@ -236,7 +236,7 @@ This crate's link in the A.9 boot-blocker chain (the runtime's boot stop point a
 - `src/proc.rs` / `src/dict.rs` / `src/reason.rs` / `src/port.rs` -> `self`/`send`/`!`/`send/3` (the 3-key `SendHook` family); the `DictHook` BIFs; `error`/`exit`/`throw`/`nif_error` + the reason mapping; the `PortHook` BIFs
 - `src/ets.rs` / `src/ets/` (**`./src/ets/CONTEXT.md`**) -> the `ets:*` bridge (57 keys) + `src/ets/arith_hook.rs` (`PrecisionArith`, the scoped match-spec `ArithHook` install)
 - `src/nif.rs` -> `erlang:load_nif/2`
-- `src/io.rs` / `src/print.rs` -> the `io`/`io_lib` format engine; the `~w`/`~p`/`~W`/`~P` leaf renderer
+- `src/io.rs` / `src/io_ts.rs` / `src/print.rs` -> the `io`/`io_lib` format engine (incl. the `{chars_limit,N}` limited paths and the unicode `~ts` arm in `io_ts.rs`); the `~w`/`~p`/`~W`/`~P` leaf renderer with the `~k`/`~K` map-order handling
 - `src/print/pretty.rs` / `src/print/pretty/cind.rs` -> the `io_lib_pretty` port; the `cind/7` family
 - `tests/` -> 72 integration files / 737 tests (lib suite 769)
 - siblings `../beam_engine`/`../beam_process`/`../beam_ets`/`../beam_codec`/`../beam_term`/`../beam_loader`/`../beam_io` -> the `call_bif` seam, `ProcessId`/`PortId`/`PortTable`, the `Table`/match-spec engine, the ETF codec, the frozen term API, the `Recs` chunk, the poller (read-only)
