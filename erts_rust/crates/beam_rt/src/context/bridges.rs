@@ -40,7 +40,7 @@ use beam_bifs::{
 use beam_common::{BeamError, Result};
 use beam_engine::ExecutionContext;
 use beam_loader::Module;
-use beam_process::{MonitorRef, PortId, ProcessId, ProcessTable, RemotePid};
+use beam_process::{ProcessId, ProcessTable};
 use beam_term::{atom_val, is_atom, Atom, AtomTable, Eterm};
 
 use crate::codeserver::CodeServer;
@@ -48,7 +48,6 @@ use crate::error;
 use crate::nif::{NifEntry, NifHostImpl};
 use crate::runtime::Runtime;
 
-use super::alias::alias_destination;
 use super::RuntimeContext;
 
 /// A cloneable, shared `io:format` destination.
@@ -264,11 +263,16 @@ impl DictHook for DictBridge<'_> {
 ///   that pid's node ([`SendBridge::resolve`]'s `RemotePid` arm), which needs the link to be
 ///   **established** already. An unconnected node (or a pid on another node's creation) is a
 ///   typed error, never a silent drop and never a fabricated success.
-/// * A **`{Name, Node}`** tuple of atoms (`bif.c:2614-2667`) — a `DOP_REG_SEND` to the process
-///   registered as `Name` on the node `Node`. On a runtime that is **not** a distributed node
-///   (`-name`/`-sname` unset, so there is no link table at all) this stays the oracle-independent
-///   typed capability gap it has always been, so a non-node VM's observable behaviour is
-///   unchanged byte for byte. ([`SendBridge::resolve`]'s `RemoteName` arm.)
+/// * A **`{Name, Node}`** tuple of atoms (`bif.c:2614-2667`). When `Node` names **this** node
+///   (`node()`, whatever the spelling — `nonode@nohost` on a runtime with no `-name`/`-sname`
+///   included) the pair is a **local** named send: the C resolves it with the very same
+///   `erts_whereis_name_to_id` (`bif.c:2628-2654`, the `dep == erts_this_dist_entry` arm) and
+///   reports success without delivering when nothing is registered under `Name` — it does *not*
+///   fall back to `SEND_BADARG`. Any other node is a `DOP_REG_SEND` to the process registered as
+///   `Name` on it; on a runtime that is **not** a distributed node (`-name`/`-sname` unset, so
+///   there is no link table at all) *that* stays the oracle-independent typed capability gap it
+///   has always been, so a non-node VM never silently drops a remote message.
+///   ([`SendBridge::resolve`]'s `RemoteName`/`Local` arms.)
 /// * A **port** (`erlang:send(Port, Data)`, `bif.c:2551-2613`) needs the port subsystem's write
 ///   path, so it is the honest typed **capability gap** rather than a fabricated value.
 /// * Anything else (`42`, a list, a 3-element tuple, …) is the oracle's `error:badarg` (the
@@ -291,36 +295,6 @@ pub(super) struct SendBridge<'a> {
     pub(super) current_module: Option<String>,
     /// The outer call's [`RuntimeContext::engines`] view (see [`FunBridge::engines`]).
     pub(super) engines: Option<&'a crate::runner::RunnerState>,
-}
-
-/// A `send` destination, classified by [`SendBridge::resolve`].
-///
-/// The distinction exists because the two *remote* arms must be transmitted through
-/// [`Runtime::dist_send_message_pid`]/[`Runtime::dist_send_reg_send`], which take `&mut Runtime`
-/// — so the classification (`&self`) and the transmission (`&mut self`) are separate steps.
-enum SendTarget {
-    /// A destination on **this** node: an internal pid term to deliver to, plus the alias
-    /// reference to consume once the message has been delivered (`None` for every other
-    /// destination).
-    Local {
-        /// The internal pid term the delivery addresses.
-        target: Eterm,
-        /// The `erlang:alias/1`/`monitor/3` reference to consume after a successful delivery.
-        reference: Option<MonitorRef>,
-    },
-    /// An external (remote-node) pid: `{DOP_SEND_SENDER|DOP_SEND, From, To} -- Msg`.
-    RemotePid {
-        /// The external pid term as it was passed to `send` (it decodes with
-        /// [`RemotePid::from_eterm`], which is how this arm was selected).
-        to: Eterm,
-    },
-    /// A `{Name, Node}` atom pair: `{DOP_REG_SEND, From, Cookie, ToName} -- Msg`.
-    RemoteName {
-        /// The registered name on the peer.
-        name: String,
-        /// The peer's node name, as the caller spelled it (short or full).
-        node: String,
-    },
 }
 
 /// A `send` destination, classified by [`SendBridge::resolve`] — the one shared
@@ -422,13 +396,21 @@ impl SendHook for SendBridge<'_> {
 ///
 /// The C only treats a 2-tuple of **atoms** as a remote send (`bif.c:2614-2621`); every other
 /// tuple shape is `SEND_BADARG`. A non-2-tuple, a non-tuple, or a tuple with a non-atom element
-/// yields `None` (which the caller turns into `badarg`, the oracle's reason). The two atoms are
-/// resolved to their names through the shared table, so the diagnostic names the destination.
+/// yields `None` (which the caller turns into `badarg`, the oracle's reason).
+///
+/// The two **interned atoms** are handed back alongside their **names**: the atoms are what the
+/// classifier compares against this runtime's own node identity and resolves a local `whereis`
+/// with, the names what the wire transmission and the diagnostic spell. Both names are resolved
+/// here through the shared table, so a pair the table cannot spell (it cannot arise for an
+/// interned atom) is the same `None` as a shape the C rejects.
 ///
 /// Shared with the destination classifier
 /// ([`classify_send_destination`](super::send::classify_send_destination)), which is why it is
 /// `pub(super)`.
-pub(super) fn two_atom_tuple(atoms: &AtomTable, to: Eterm) -> Option<(String, String)> {
+pub(super) fn two_atom_tuple(
+    atoms: &AtomTable,
+    to: Eterm,
+) -> Option<(Atom, Atom, String, String)> {
     if beam_engine::terms::tuple_arity(to).ok()? != 2 {
         return None;
     }
@@ -437,9 +419,11 @@ pub(super) fn two_atom_tuple(atoms: &AtomTable, to: Eterm) -> Option<(String, St
     if !is_atom(name) || !is_atom(node) {
         return None;
     }
-    let name = atoms.name(atom_val(name))?.to_string();
-    let node = atoms.name(atom_val(node))?.to_string();
-    Some((name, node))
+    let name_atom = atom_val(name);
+    let node_atom = atom_val(node);
+    let name = atoms.name(name_atom)?.to_string();
+    let node = atoms.name(node_atom)?.to_string();
+    Some((name_atom, node_atom, name, node))
 }
 
 /// The `beam_bifs` NIF-loading seam: `dlopen`s a NIF library and registers it with the runtime.
