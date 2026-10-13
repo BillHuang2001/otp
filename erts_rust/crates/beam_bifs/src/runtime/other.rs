@@ -122,12 +122,13 @@ mod tests {
     use crate::registry::BifRegistry;
     use beam_alloc::Heap;
     use beam_process::ProcessId;
-    use beam_term::{AtomTable, Eterm};
+    use beam_term::{make_small, AtomTable, Eterm, NIL};
 
     /// Every `RuntimeHooks`-seam key registered here is reachable and, with no
     /// [`RuntimeHooks`] hook installed, answers the typed capability gap rather than a
-    /// fabricated value. (The `re` keys are real implementations — `crate::re` — and are
-    /// asserted reachable only.)
+    /// fabricated value. The `re` keys are **not** seam keys, though: they are real
+    /// implementations (`crate::re`) and are asserted to *run* (`re:run/3` returns the
+    /// engine's `{match,[{2,1}]}`), not merely to be reachable.
     ///
     /// [`RuntimeHooks`]: crate::context::RuntimeHooks
     #[test]
@@ -141,9 +142,34 @@ mod tests {
         // (see the module `CONTEXT.md`).
         assert!(reg.contains("os", "set_signal", 2));
 
-        let mut heap = Heap::new(8).expect("test heap");
-        let atoms = AtomTable::new();
+        // `re` is the real in-crate engine: `re:run/3` is a working BIF, so its
+        // result — never a typed gap — is asserted. The atoms the engine mints
+        // (`match` here) must be seeded, since no `AtomInterner` is installed. The
+        // subject/pattern are built with the frozen writers before the context
+        // borrows the heap (`list_to_binary/1` is not registered by `super::register`
+        // — it lives in `binconv.rs`).
+        let mut heap = Heap::new(1024).expect("test heap");
+        let subject = {
+            let mut tail = NIL;
+            for &b in b"xabcy".iter().rev() {
+                tail = heap
+                    .cons(make_small(i64::from(b)), tail)
+                    .expect("the subject fits");
+            }
+            tail
+        };
+        let pattern = crate::bits::make_binary(&mut heap, b"b").expect("the pattern fits");
+        let mut atoms = AtomTable::new();
+        atoms.seed(["match", "nomatch", "ok", "true", "false"]);
         let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let out = reg
+            .call("re", "run", 3, &mut ctx, &[subject, pattern, NIL])
+            .expect("re:run matches");
+        assert_eq!(
+            crate::print::format_term(&mut ctx, out, true).expect("the result is printable"),
+            "{match,[{2,1}]}",
+            "re:run/3 of \"xabcy\" / \"b\" must return the oracle's match result"
+        );
 
         let args = vec![ctx.int(0).expect("small int"); 2];
         match reg.call("os", "set_signal", 2, &mut ctx, &args) {
