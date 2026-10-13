@@ -186,8 +186,12 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   - `TableWrite<'g>` — metadata, mutations over caller-owned inputs (`insert`, `insert_new`,
     `insert_list`, `delete`, `delete_object`, `delete_all_objects`, `update_counter`,
     `update_counter_with`, `update_element`, `select_delete`, `match_delete`, `select_replace`,
-    `set_fixation`, `set_owner`, `set_heir`, `set_access`, `setopts`, `give_away`), `heir()`, `take ->
-    Vec<TableTerm<'_>>`, and `as_requester`.
+    `set_fixation`, `set_owner`, `set_heir`, `set_access`, `setopts`, `give_away`),
+    `heir() -> Option<HeirView<'_>>`, `take -> Vec<TableTerm<'_>>`, and `as_requester` (the re-scoped
+    raw access-enforcement seam — its reads are bare aliasing `Eterm`s by design, see `view/CONTEXT.md`).
+  - `pub struct HeirView<'g>` (`view/term.rs`, re-exported at the crate root) — the guard-scoped heir:
+    `owner() -> OwnerId` (owned) and `data() -> Option<TableTerm<'g>>` (the table-owned gift term tagged
+    to the view's borrow), so a caller cannot read the heir's gift data past the guard.
   - **View-borrowed traversal** (`view/iter.rs`) — `TableRead::{iter_keys, iter_keys_rev, iter_objects,
     iter_objects_rev}` (each yields `TableTerm<'a>` bound to the view borrow via `ets:first|next` /
     `last|prev`; the `*_objects` forms expand the multi kinds per object), `TableRead::{foldl, foldr}`
