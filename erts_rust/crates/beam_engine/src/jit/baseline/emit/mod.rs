@@ -98,7 +98,7 @@
 use std::collections::BTreeMap;
 
 use beam_common::Result;
-use beam_loader::{ImportRef, Instr, Module};
+use beam_loader::{Block, ImportRef, Instr, Module};
 
 use crate::interpreter::{self, LabelMap};
 use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg, DEFAULT_CAPACITY};
@@ -296,6 +296,13 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
 /// the driver, which compiles that function on entry (see
 /// [`CompiledModule::native_entry`](super::code::CompiledModule::native_entry)).
 ///
+/// A **continuation address** — the `pc + 1` a frame-preserving call stores in the live
+/// frame — is an address the driver can be re-entered at when the callee returns, and it
+/// is generally **not** a block start (only an [`Instr::Label`] is). So after the IR
+/// blocks are lowered, [`emit_sub_blocks`] lowers one **sub-block** per continuation
+/// address that lies strictly inside a block, giving the driver a native entry there
+/// instead of a per-instruction interpreter step for the whole block tail.
+///
 /// Each function gets its **own** mapping ([`CodeBuffer`]), so a lazy artifact never
 /// holds code for a function the run has not entered.
 pub(crate) fn compile_function(
@@ -307,8 +314,11 @@ pub(crate) fn compile_function(
         .functions
         .get(func as usize)
         .ok_or_else(|| crate::error::unsupported("jit: no such function"))?;
-    let mut buffer =
-        CodeBuffer::with_capacity(function_capacity_estimate(&function.code, function.blocks.len()) + DEFAULT_CAPACITY)?;
+    let mut buffer = CodeBuffer::with_capacity(
+        function_capacity_estimate(&function.code, function.blocks.len())
+            + sub_blocks_capacity_estimate(&function.code, &function.blocks)
+            + DEFAULT_CAPACITY,
+    )?;
     let mut entries: Vec<Option<*const u8>> = vec![None; function.code.len()];
     let mut block_labels: BTreeMap<(u32, u32), CodeLabel> = BTreeMap::new();
     for block in &function.blocks {
@@ -319,13 +329,159 @@ pub(crate) fn compile_function(
         }
         block_labels.insert((func, start as u32), buffer.label());
     }
-    let summary = emit_function(&mut buffer, module, labels, &block_labels, func, &mut entries)?;
+    let mut summary = emit_function(&mut buffer, module, labels, &block_labels, func, &mut entries)?;
+    let mut sub_entries: Vec<Option<*const u8>> = vec![None; function.code.len()];
+    emit_sub_blocks(
+        &mut buffer,
+        module,
+        labels,
+        &block_labels,
+        func,
+        &function.code,
+        &function.blocks,
+        &mut summary,
+        &mut sub_entries,
+    )?;
     buffer.seal()?;
     Ok(CompiledFunction {
         buffer,
         entries,
+        sub_entries,
         summary,
     })
+}
+
+/// Whether `instr` is a **frame-preserving call** — one that stores its return address
+/// (`Continuation::Address { func, pc: pc + 1, context: current }`) in the live frame.
+///
+/// These are exactly the calls whose `pc + 1` the driver can be re-entered at once the
+/// callee returns: a non-tail local `call`, a non-tail `call_ext`, `call_fun`/`call_fun2`
+/// and `apply`. The tail forms (`call_last`, `call_only`, `call_ext_only`,
+/// `call_ext_last`, `apply_last`) reuse the caller's *existing* continuation — they store
+/// nothing — so they create no new continuation address.
+fn stores_continuation(instr: &Instr) -> bool {
+    matches!(
+        instr,
+        Instr::Call { .. }
+            | Instr::CallExt { .. }
+            | Instr::CallFun { .. }
+            | Instr::CallFun2 { .. }
+            | Instr::Apply { .. }
+    )
+}
+
+/// The extra byte budget the continuation **sub-blocks** of `code` need (see
+/// [`emit_sub_blocks`]); the [`function_capacity_estimate`] of the IR blocks does not
+/// cover them.
+///
+/// For every continuation address that gets a sub-block covering `[p, b.end)` this
+/// budgets a full block ([`BLOCK_BYTES`]) plus one [`INSTRUCTION_BYTES`] per instruction
+/// of that range — the same per-instruction bound [`function_capacity_estimate`] uses.
+/// Two calls sharing a sub-block range are budgeted twice (a harmless over-estimate):
+/// under-estimating would turn a large function into a `SystemLimit` compile error.
+fn sub_blocks_capacity_estimate(code: &[Instr], blocks: &[Block]) -> usize {
+    let mut total = 0usize;
+    for (pc, instr) in code.iter().enumerate() {
+        if !stores_continuation(instr) {
+            continue;
+        }
+        let start = pc + 1;
+        if start >= code.len() {
+            continue;
+        }
+        if let Some(block) = blocks.iter().find(|b| b.start < start && start < b.end) {
+            let end = block.end.min(code.len());
+            if start < end {
+                total += BLOCK_BYTES + INSTRUCTION_BYTES * (end - start);
+            }
+        }
+    }
+    total
+}
+
+/// Lower a native **sub-block** for every continuation address a frame-preserving call
+/// in `code` stores, filling `sub_entries`.
+///
+/// A continuation address `p = pc + 1` of a [`stores_continuation`] call is where the
+/// driver resumes once the callee returns. The loader cuts a function into blocks only at
+/// [`Instr::Label`]s, so `p` usually lies **inside** a block and the driver would
+/// otherwise run the whole block tail `[p, b.end)` through one round-trip-plus-interpreter
+/// -step per instruction. Emitting `[p, b.end)` as its own standalone block (through the
+/// same [`emit_block`] an IR block uses, so every shape rule, guard and deopt is
+/// identical) gives the driver a native entry there instead.
+///
+/// Each such `p` is lowered independently, against the **IR block** that strictly
+/// contains it: a second call nested inside an earlier sub-block's range therefore gets
+/// its own sub-block too (the code is duplicated — acceptable, and correctness first).
+/// An address that is already a compiled block start (the call is the last instruction of
+/// its block), and one at or past the end of the function, need no sub-block and are
+/// skipped.
+///
+/// A sub-block is reached only from the driver (nothing jumps to a continuation address),
+/// so it reserves no entry label in `block_labels` and adds no entry to the driver's block
+/// table: `Summary::block_count` stays the number of IR blocks, and the artifact's
+/// `code_map`/`code_address_range` describe IR blocks only. Its register touches are
+/// folded into `summary` as a **superset** (a defensive widening is always safe).
+#[allow(clippy::too_many_arguments)]
+fn emit_sub_blocks(
+    buffer: &mut CodeBuffer,
+    module: &Module,
+    labels: &LabelMap,
+    block_labels: &BTreeMap<(u32, u32), CodeLabel>,
+    func: u32,
+    code: &[Instr],
+    blocks: &[Block],
+    summary: &mut Summary,
+    sub_entries: &mut [Option<*const u8>],
+) -> Result<()> {
+    for (pc, instr) in code.iter().enumerate() {
+        if !stores_continuation(instr) {
+            continue;
+        }
+        let start = pc + 1;
+        if start >= code.len() {
+            continue;
+        }
+        // An address that is already a compiled block start is served by the IR block's
+        // own entry; only a continuation strictly *inside* an IR block needs a sub-block.
+        if block_labels.contains_key(&(func, start as u32)) {
+            continue;
+        }
+        let Some(block) = blocks.iter().find(|b| b.start < start && start < b.end) else {
+            continue;
+        };
+        let end = block.end.min(code.len());
+        if start >= end {
+            continue;
+        }
+        let allocation = allocate_registers(module, code, start, end);
+        for (x, _) in &allocation.slots {
+            touch(&mut summary.highest_cached_register, *x);
+            if !summary.cached_registers.contains(x) {
+                summary.cached_registers.push(*x);
+            }
+        }
+        let offset = buffer.len();
+        emit_block(
+            buffer,
+            module,
+            labels,
+            block_labels,
+            func,
+            code,
+            start,
+            end,
+            &allocation,
+            &mut summary.highest_native_register,
+        )?;
+        // SAFETY: the sub-block was fully emitted (no error), so `offset` is the start of
+        // a complete native function inside the buffer; `offset + emitted < capacity` was
+        // enforced by every emission call.
+        let entry = unsafe { buffer.code_ptr().add(offset) };
+        // `start < end <= code.len()`, so the slot always exists.
+        sub_entries[start] = Some(entry);
+    }
+    Ok(())
 }
 
 /// Lower every non-empty block of function `func` into `buffer`, binding the

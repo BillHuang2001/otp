@@ -910,6 +910,49 @@ fn un_lowered_instructions_deopt_to_the_interpreter_with_identical_outcomes() {
     });
 }
 
+/// A frame-preserving `call` whose continuation address falls **inside** an IR block
+/// (the loader cuts a function into blocks only at labels) gets its own native
+/// **sub-block** in the lazy layout, so the driver has a native entry at the address
+/// the callee returns to rather than one interpreter round-trip per remaining
+/// instruction of the block. The sub-block is *not* a block: the driver's block table,
+/// `block_count` and the code map still describe IR blocks only.
+#[test]
+fn a_call_continuation_inside_a_block_gets_its_own_native_sub_block() {
+    let (module, _) = local_call_case();
+    let labels = crate::interpreter::build_label_map(&module);
+    let function = compile_function(&module, &labels, 0).expect("f/0 compiles");
+
+    // `f/0`'s `call` sits at pc 3 inside the `Label(2)` block `[1, 5)`, so the
+    // continuation pc 4 is strictly inside that block.
+    assert!(function.entries[4].is_none(), "pc 4 is not an IR block start");
+    assert!(function.sub_entries[4].is_some(), "pc 4 has a sub-block entry");
+    // An IR block start is still served by the block table, and gains no sub-block.
+    assert!(function.entries[1].is_some(), "pc 1 is the `Label(2)` block start");
+    assert!(function.sub_entries[1].is_none(), "a block start needs no sub-block");
+    // A sub-block is not a block: the summary counts the two IR blocks only.
+    assert_eq!(function.summary.block_count, 2, "only the IR blocks are counted");
+
+    // The artifact consults the sub-block table only after the block table, so a block
+    // start still wins and the continuation address is natively enterable.
+    let compiled = CompiledModule::lazy(&module);
+    let (block, _) = compiled.native_entry(&module, 0, 1).expect("pc 1 is a block");
+    assert_eq!(compiled.entry(0, 1), Some(block), "the block entry wins");
+    let (sub, _) = compiled.native_entry(&module, 0, 4).expect("pc 4 is a sub-block");
+    assert_eq!(
+        compiled.entry(0, 4),
+        Some(sub),
+        "the continuation address is natively enterable"
+    );
+    assert_eq!(compiled.block_count(), 2, "sub-blocks add no block");
+
+    // The eager layout lowers no sub-block, so the continuation address has no entry.
+    let eager = compile_module(&module).expect("the module compiles eagerly");
+    assert!(
+        eager.entry(0, 4).is_none(),
+        "the eager layout is unchanged: no sub-block"
+    );
+}
+
 /// A context that answers `erlang:'+'/2` with a fixed small-int result (recording
 /// the raw argument words it was handed) and delegates the heap and every other
 /// BIF to a [`MinimalContext`].
@@ -2740,3 +2783,4 @@ fn measure_declined_call_ext() {
         );
     }
 }
+

@@ -45,7 +45,10 @@
 //!   on its own first entry and keeps its native loop. Each function links only its own
 //!   blocks, so this layout's register-file guard is the **entered function's** own
 //!   bound; a cross-function transfer returns the `(func, pc)` word to the driver, which
-//!   re-checks the target function's bound on its own entry.
+//!   re-checks the target function's bound on its own entry. On top of its IR blocks a
+//!   function also carries **continuation sub-blocks** — one per `pc + 1` a
+//!   frame-preserving call stores — so the driver has a native entry at the address a
+//!   callee returns to, not only at IR block starts (see [`CompiledFunction`]).
 //!
 //! The two layouts answer the same queries, and every multi-mapping (lazy) answer is
 //! the aggregate over the functions **currently** compiled: introspection that must
@@ -128,6 +131,19 @@ pub(crate) struct CompiledFunction {
     /// The native entry point of the block starting at `pc`, or `None` (indexed by
     /// `pc`, so the driver's block probe stays two `Vec` loads).
     pub(crate) entries: Vec<Option<*const u8>>,
+    /// The native entry point of the **continuation sub-block** starting at `pc`, or
+    /// `None` (indexed by `pc`).
+    ///
+    /// The loader cuts a function into blocks only at [`Instr::Label`]s, so the `pc + 1`
+    /// a frame-preserving call stores in the live frame — where the driver resumes once
+    /// the callee returns — usually lies *inside* a block. The lazy layout lowers each
+    /// such address as its own sub-block (see
+    /// [`compile_function`](super::emit::compile_function)), and this table is where its
+    /// native entry lives. Probed by [`CompiledModule::entry`]/[`CompiledModule::native_entry`]
+    /// only after `entries` came up empty, so a compiled IR-block start always wins.
+    ///
+    /// [`Instr::Label`]: beam_loader::Instr::Label
+    pub(crate) sub_entries: Vec<Option<*const u8>>,
     /// This function's own register/block summary.
     pub(crate) summary: Summary,
 }
@@ -237,16 +253,24 @@ impl CompiledModule {
     /// The native entry point of the block starting at `(func, pc)`, if it is already
     /// compiled.
     ///
-    /// A **pure lookup** — it never compiles. For the lazy layout an uncompiled
-    /// function simply has no entry here; the driver's compile-on-entry runs through
-    /// [`CompiledModule::native_entry`].
+    /// A **pure lookup** — it never compiles. An address that names a compiled IR block
+    /// start answers from the block table; otherwise, for the lazy layout, it may still
+    /// be the start of a **continuation sub-block** ([`CompiledFunction::sub_entries`]),
+    /// which is consulted second so a real block start always wins. For the lazy layout an
+    /// uncompiled function simply has no entry here; the driver's compile-on-entry runs
+    /// through [`CompiledModule::native_entry`].
     pub fn entry(&self, func: u32, pc: u32) -> Option<*const u8> {
         match &self.layout {
             Layout::Eager(eager) => eager_entry(eager, func, pc),
             Layout::Lazy(lazy) => {
                 let functions = lazy.functions.borrow();
                 let function = functions.get(func as usize)?.as_ref()?;
-                function.entries.get(pc as usize).copied().flatten()
+                function
+                    .entries
+                    .get(pc as usize)
+                    .copied()
+                    .flatten()
+                    .or_else(|| function.sub_entries.get(pc as usize).copied().flatten())
             }
         }
     }
@@ -286,7 +310,12 @@ impl CompiledModule {
             }
             Layout::Lazy(_) => {
                 let function = self.function(module, func)?;
-                let entry = function.entries.get(pc as usize).copied().flatten()?;
+                let entry = function
+                    .entries
+                    .get(pc as usize)
+                    .copied()
+                    .flatten()
+                    .or_else(|| function.sub_entries.get(pc as usize).copied().flatten())?;
                 Some((entry, function.summary.highest_native_register))
             }
         }
