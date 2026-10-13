@@ -110,7 +110,7 @@
 //!
 //! # The A.3 binary/string shape fixes, pinned
 //!
-//! A later selector block (the term-driven `probe_term/2` entry, selectors `101`..`132`) pins the
+//! A later selector block (the term-driven `probe_term/2` entry, selectors `101`..`143`) pins the
 //! binary/string shape rules the runtime got wrong before, so they can never regress:
 //!
 //! * **`enif_inspect_iolist_as_binary`** follows the C's positional rules
@@ -2160,6 +2160,19 @@ mod tests {
             assert!(
                 super::NIF_EXTRA_MODULE_SOURCE.contains(needle),
                 "the module must stub every ErlNifFunc entry: {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_widened_selector_blocks_have_a_c_arm_each() {
+        // Every selector a case claims must have a real `case <sel>:` label in the shared library:
+        // a missing arm would fall through to the `-1` "unknown selector" tail and the case would
+        // pin that sentinel instead of the behaviour it names.
+        for sel in (84..=95).chain(133..=143) {
+            assert!(
+                super::NIF_EXTRA_C.contains(&format!("case {sel}:")),
+                "the library must carry a case arm for the widened selector {sel}"
             );
         }
     }
