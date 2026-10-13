@@ -50,8 +50,10 @@ fragmentation/reassembly, the **outbound and inbound distribution atom cache**, 
 codec (all 30 `Dop` variants), inbound `DOP_*` delivery classification, the `epmd` client (real TCP
 lookup + the full request set), a blocking `Connection` API, and a **non-blocking `ConnectionDriver`**
 (the poll/step state machine), plus a `src/bin/dist_probe.rs` CLI that exposes the hermetic two-node
-loopback to the differential harness. `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p
-beam_dist` is green (**382 tests, 0 failed**) and the workspace builds warning-free; the crate is
+loopback to the differential harness as eleven byte-comparable report kinds (`ping`/`nodes`/`term` plus
+`nodeid`/`handshake`/`badcookie`/`frag`/`alias`/`monitor`/`regsend_missing`/`utf8`).
+`erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p
+beam_dist` is green (**412 tests, 0 failed**) and the workspace builds warning-free; the crate is
 safe Rust (`#![deny(unsafe_code)]`).
 
 **All 30 `Dop` opcodes round-trip exhaustively.** `tests/dop_roundtrip.rs` drives every variant through
