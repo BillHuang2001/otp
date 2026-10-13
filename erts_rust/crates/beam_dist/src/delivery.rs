@@ -53,6 +53,18 @@
 //! `DOP_UNLINK`, which the C never sends and rejects outright and which is
 //! therefore reported as [`Delivery::Other`] rather than guessed at.
 //!
+//! # Validated classification (opt-in)
+//!
+//! [`Delivery::classify`] is deliberately *shape-only*: it answers **what a message
+//! means**, never whether that message is well-formed *for a given link*.
+//! [`Delivery::classify_validated`] adds the C's per-opcode `invalid_message`
+//! checks (`erts_dist_command`) on top of it — the term-shape checks plus the
+//! per-link node-identity (`dep`) anti-spoof checks — driven by a [`LinkIdentity`]
+//! (the peer node's name and this node's own name, interned in the same
+//! [`AtomTable`] the message was decoded against). A violation is
+//! [`BeamError::BadArg`]. The validator is **opt-in**; `classify` stays exactly as
+//! it was.
+//!
 //! Ground truth (read-only, never modified): `erts/emulator/beam/dist.c` —
 //! `erts_dist_command` and the per-opcode arity/argument checks cited below.
 //!
@@ -85,9 +97,10 @@
 //! a `dist.c`-level same-node delivery short-circuit wrapper around an ETF body,
 //! not a `DOP_*` opcode.
 
+use beam_codec::term::{external_pid_parts, external_ref_parts, tuple_arity, tuple_element};
 use beam_common::{BeamError, Result};
-use beam_term::prelude::{is_small, signed_value};
-use beam_term::Eterm;
+use beam_term::prelude::{is_atom, is_internal_pid, is_small, make_atom, signed_value};
+use beam_term::{AtomTable, Eterm};
 
 use crate::control::ControlMessage;
 use crate::flags::{AltactSigFlags, DistSpawnFlags, Dop};
@@ -631,6 +644,378 @@ impl Delivery {
         };
         Ok(delivery)
     }
+
+    /// [`Delivery::classify`] **plus** the C's per-opcode `invalid_message`
+    /// validation: the term-shape checks and the per-link node-identity (`dep`)
+    /// anti-spoof checks of `erts_dist_command`.
+    ///
+    /// `classify` answers *"what does this control message mean?"* — the
+    /// shape/arity/keying view that the wire tests and the hermetic loopback use,
+    /// and which is **unchanged**. This validator answers the C's second question:
+    /// *"is this message well-formed for **this** link?"* — the checks that turn a
+    /// forged or malformed control message into a dropped connection instead of a
+    /// mis-delivered signal. It is opt-in: a caller that only needs the semantic
+    /// view keeps calling [`Delivery::classify`].
+    ///
+    /// The node-identity checks compare the node named by a foreign pid/ref against
+    /// [`LinkIdentity::peer_node`] (the C's `dep`) and, for the *local* endpoints,
+    /// against [`LinkIdentity::local_node`] (the C's `erts_this_dist_entry`). Both
+    /// are atom terms of the **same** [`AtomTable`] the message was decoded
+    /// against, so the comparison is a raw term `==` — never a string compare.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] for any violation — the C's single
+    /// `goto invalid_message` arm. A malformed or spoofed message is never
+    /// silently accepted and never turned into a substituted term.
+    ///
+    /// # What is deliberately *not* checked here
+    ///
+    /// * The C's `SEQ_TRACE_T_VALID(token)` checks on the `_TT` forms (the
+    ///   internal shape of a trace token) are not modelled — no token shape is
+    ///   exposed at this layer, so no check could be faithful.
+    /// * The C's per-opcode *liveness* lookups (`erts_proc_lookup`,
+    ///   `erts_whereis_process`, `erts_whereis_name_to_id`) are not validation: a
+    ///   missing local process makes the C **drop** the message, not reject it.
+    ///   That decision belongs to the [`InboundSink`]
+    ///   ([`DeliveryOutcome::NoSuchProcess`]).
+    /// * [`Delivery::Other`] (today only `DOP_UNLINK`) keeps exactly what `classify`
+    ///   gives it: the C rejects that opcode outright (`dist.c:2277-2282`), so
+    ///   there is nothing left to validate.
+    /// * The C's *additional* `to` rule for `DOP_LINK` — an external `to` belonging
+    ///   to some other node is also `invalid_message` (`dist.c:2240-2242`) — is not
+    ///   reproduced: the task keeps `to` out of the link check (the C's own
+    ///   old-incarnation case is handled gracefully there, `dist.c:2241-2244`).
+    pub fn classify_validated(message: &ControlMessage, link: &LinkIdentity) -> Result<Delivery> {
+        // The shape/arity/keying view first: `classify` has already resolved every
+        // argument (and reported a control-only `send` form), so the checks below
+        // read *named* fields instead of re-deriving byte offsets.
+        let delivery = Delivery::classify(message)?;
+
+        match &delivery {
+            // `{DOP_SEND*, From, To[, Token]} -- Message`: the destination must be
+            // a pid (`is_not_pid(to)`, `dist.c:2549`).
+            Delivery::Send { to, .. } => {
+                if !is_pid(*to) {
+                    return Err(BeamError::BadArg);
+                }
+            }
+            // `{DOP_REG_SEND*, From, Cookie, ToName[, Token]} -- Message`: the
+            // sender must be a pid and the target a registered name
+            // (`is_not_pid(from) || is_not_atom(to)`, `dist.c:2486`).
+            Delivery::RegSend { from, name, .. } => {
+                if !is_pid(*from) || !is_atom(*name) {
+                    return Err(BeamError::BadArg);
+                }
+            }
+            // `{DOP_ALIAS_SEND*, From, To[, Token]} -- Message`: an alias send is
+            // addressed to a reference (`is_not_ref(to)`, `dist.c:2584`).
+            Delivery::AliasSend { to, .. } => {
+                if !is_ref(*to) {
+                    return Err(BeamError::BadArg);
+                }
+            }
+            // `{DOP_LINK, From, To}`: the remote endpoint must be an external pid
+            // **of this link's peer** (`is_not_external_pid(from)`,
+            // `dist.c:2234`; `dep != external_pid_dist_entry(from)`,
+            // `dist.c:2237`). `to` is not validated here (see the doc above).
+            Delivery::Link { from, .. } => {
+                if external_pid_node(*from) != Some(link.peer_node) {
+                    return Err(BeamError::BadArg);
+                }
+            }
+            // `{DOP_UNLINK_ID[_ACK], Id, From, To}` (the OTP-26 link protocol):
+            // `Id` is a non-zero unsigned integer — the C checks `term_to_Uint64`
+            // and then `id == 0` for `DOP_UNLINK_ID` (`dist.c:2291-2295`); the ACK
+            // form checks `term_to_Uint64` alone (`dist.c:2320`), and this validator
+            // applies the same non-zero rule to both forms. `From` is an external
+            // pid of this link's peer (`dist.c:2299-2302` / `2325-2328`) and `To` a
+            // local pid (`dist.c:2304-2309` / `2330-2335`).
+            Delivery::UnlinkId { id, from, to } | Delivery::UnlinkIdAck { id, from, to } => {
+                if !is_nonzero_uint(*id) {
+                    return Err(BeamError::BadArg);
+                }
+                if external_pid_node(*from) != Some(link.peer_node) {
+                    return Err(BeamError::BadArg);
+                }
+                // LITERAL C QUIRK, mirrored on purpose: the C's old-incarnation
+                // escape hatch compares **`from`'s** distribution entry against this
+                // node — not `to`'s — (`erts_this_dist_entry ==
+                // external_pid_dist_entry(from)`, `dist.c:2304-2306` and
+                // `dist.c:2330-2332`), so the term compared against `local_node`
+                // here is `from`'s node, exactly as the C does it.
+                let from_node = external_pid_node(*from).ok_or(BeamError::BadArg)?;
+                let to_ok = is_internal_pid(*to)
+                    || (is_external_pid(*to) && from_node == link.local_node);
+                if !to_ok {
+                    return Err(BeamError::BadArg);
+                }
+            }
+            // `{DOP_MONITOR_P, Remote, Local, Ref}`: the watcher must be an external
+            // pid of this link's peer, the reference a ref, and the watched process a
+            // local pid, a registered name, or an external pid of *this* node (an old
+            // incarnation) — `dist.c:2356-2379`.
+            Delivery::Monitor { watcher, watched, reference } => {
+                if external_pid_node(*watcher) != Some(link.peer_node) {
+                    return Err(BeamError::BadArg);
+                }
+                if !is_ref(*reference) {
+                    return Err(BeamError::BadArg);
+                }
+                let watched_ok = is_internal_pid(*watched)
+                    || is_atom(*watched)
+                    || external_pid_node(*watched) == Some(link.local_node);
+                if !watched_ok {
+                    return Err(BeamError::BadArg);
+                }
+            }
+            // `{DOP_DEMONITOR_P, Remote, Local, Ref}`: `dist.c:2427-2459`.
+            Delivery::Demonitor { watcher, watched, reference } => {
+                if !is_ref(*reference) {
+                    return Err(BeamError::BadArg);
+                }
+                if external_pid_node(*watcher) != Some(link.peer_node) {
+                    return Err(BeamError::BadArg);
+                }
+                let watched_ok = is_internal_pid(*watched)
+                    || external_pid_node(*watched) == Some(link.local_node)
+                    || is_atom(*watched);
+                if !watched_ok {
+                    return Err(BeamError::BadArg);
+                }
+            }
+            // `{DOP_EXIT[_TT], From, To, …}` / `{DOP_PAYLOAD_EXIT[_TT], From, To, …}
+            // -- Reason`: the signal source must be an external pid of this link's
+            // peer and the target a **local** pid (`is_not_external_pid(from) ||
+            // dep != external_pid_dist_entry(from) || is_not_internal_pid(to)`,
+            // `dist.c:2793-2797`).
+            Delivery::Exit { from, to, .. } | Delivery::PayloadExit { from, to, .. } => {
+                if external_pid_node(*from) != Some(link.peer_node) {
+                    return Err(BeamError::BadArg);
+                }
+                if !is_internal_pid(*to) {
+                    return Err(BeamError::BadArg);
+                }
+            }
+            // `{DOP_EXIT2[_TT], From, To, …}` / `{DOP_PAYLOAD_EXIT2[_TT], From, To,
+            // …} -- Reason`: `is_not_pid(from) || dep != external_pid_dist_entry(from)`
+            // (`dist.c:2857-2860`) and `to` a local pid or an external pid of *this*
+            // node (`dist.c:2863-2870`). The C's `is_pid(from)` also admits an
+            // internal pid, but a wire `from` is always external and only an external
+            // pid has a node to compare — so this requires an external pid whose node
+            // is the peer's, which is the same verdict for every real message.
+            Delivery::Exit2 { from, to, .. } | Delivery::PayloadExit2 { from, to, .. } => {
+                if external_pid_node(*from) != Some(link.peer_node) {
+                    return Err(BeamError::BadArg);
+                }
+                let to_ok = is_internal_pid(*to)
+                    || external_pid_node(*to) == Some(link.local_node);
+                if !to_ok {
+                    return Err(BeamError::BadArg);
+                }
+            }
+            // `{DOP_GROUP_LEADER, From, To}`: both must be pids
+            // (`is_not_pid(from) || is_not_pid(to)`, `dist.c:2895`).
+            Delivery::GroupLeader { from, to } => {
+                if !is_pid(*from) || !is_pid(*to) {
+                    return Err(BeamError::BadArg);
+                }
+            }
+            // `{DOP_MONITOR_P_EXIT, Remote, Local, Ref, Reason}` /
+            // `{DOP_PAYLOAD_MONITOR_P_EXIT, Remote, Local, Ref} -- Reason`:
+            // `dist.c:2723-2735`. The C's `monitored_process_not_alive` arm
+            // (`dist.c:2729-2733`, an external watcher of *this* node) is a drop,
+            // not an `invalid_message`, so it is accepted here.
+            Delivery::MonitorExit { watched, watcher, reference, .. }
+            | Delivery::PayloadMonitorExit { watched, watcher, reference, .. } => {
+                if !is_ref(*reference) {
+                    return Err(BeamError::BadArg);
+                }
+                if !(is_external_pid(*watched) || is_atom(*watched)) {
+                    return Err(BeamError::BadArg);
+                }
+                let watcher_ok = is_internal_pid(*watcher)
+                    || external_pid_node(*watcher) == Some(link.local_node);
+                if !watcher_ok {
+                    return Err(BeamError::BadArg);
+                }
+            }
+            // `{DOP_SPAWN_REQUEST[_TT], Ref, From, GL, MFA, Opts[, Token]} -- Args`:
+            // `dist.c:2933-2949` — an external reference, an external pid, a pid
+            // group leader and an `{Module, Function, Arity}` tuple whose elements
+            // are atom/atom/small. The spawn *options* (`opts`) are parsed by the C's
+            // `erts_parse_spawn_opts` and are not validated here.
+            Delivery::SpawnRequest { reference, from, group_leader, mfa, .. } => {
+                if !is_external_pid(*from) || !is_pid(*group_leader) {
+                    return Err(BeamError::BadArg);
+                }
+                if external_ref_parts(*reference).is_err() {
+                    return Err(BeamError::BadArg);
+                }
+                if !matches!(tuple_arity(*mfa), Ok(3)) {
+                    return Err(BeamError::BadArg);
+                }
+                let module = tuple_element(*mfa, 0)?;
+                let function = tuple_element(*mfa, 1)?;
+                let arity = tuple_element(*mfa, 2)?;
+                if !is_atom(module) || !is_atom(function) || !is_small(arity) {
+                    return Err(BeamError::BadArg);
+                }
+            }
+            // `{DOP_SPAWN_REPLY[_TT], Ref, To, Flags, From[, Token]}`:
+            // `dist.c:3070-3095`. The parent (`to`) is a local pid or an external pid
+            // of *this* node, the reference is this node's own reference re-arriving
+            // as an external ref (the C accepts an internal ref too, `dist.c:3079`,
+            // which a decoded wire message cannot carry), and the result is the new
+            // remote pid or an error atom. The `Flags` word is already validated by
+            // `classify` (`spawn_flags`, `dist.c:3088-3093`).
+            Delivery::SpawnReply { reference, to, result, .. } => {
+                let to_ok = is_internal_pid(*to)
+                    || external_pid_node(*to) == Some(link.local_node);
+                if !to_ok {
+                    return Err(BeamError::BadArg);
+                }
+                if external_ref_node(*reference) != Some(link.local_node) {
+                    return Err(BeamError::BadArg);
+                }
+                if !(is_external_pid(*result) || is_atom(*result)) {
+                    return Err(BeamError::BadArg);
+                }
+            }
+            // `{DOP_ALTACT_SIG_SEND, Flags, SenderPid, To[, Token]} -- Signal`:
+            // `is_not_pid(from)` (`dist.c:2647`) and then the `To` shape selected by
+            // the flags — `ALIAS` ⇒ a ref and **not** `NAME` (`dist.c:2662-2666`),
+            // else `NAME` ⇒ an atom (`dist.c:2667-2670`), else a pid
+            // (`dist.c:2681-2685`). The flags themselves are already parsed by
+            // `classify` (`altact_flags`).
+            Delivery::AltactSigSend { flags, from, to, .. } => {
+                if !is_pid(*from) {
+                    return Err(BeamError::BadArg);
+                }
+                if flags.contains(AltactSigFlags::ALIAS) {
+                    if !is_ref(*to) || flags.contains(AltactSigFlags::NAME) {
+                        return Err(BeamError::BadArg);
+                    }
+                } else if flags.contains(AltactSigFlags::NAME) {
+                    if !is_atom(*to) {
+                        return Err(BeamError::BadArg);
+                    }
+                } else if !is_pid(*to) {
+                    return Err(BeamError::BadArg);
+                }
+            }
+            // `DOP_UNLINK` — the C rejects the opcode itself (`dist.c:2277-2282`),
+            // so `classify` already reports it as [`Delivery::Other`] and there is
+            // nothing further to validate. Left exactly as `classify` produces it.
+            Delivery::Other(_) => {}
+        }
+
+        Ok(delivery)
+    }
+}
+
+/// The **per-link node identity** [`Delivery::classify_validated`] compares node
+/// names against: the peer node's name — the C's `dep` — and this node's own name
+/// (`erts_this_dist_entry`).
+///
+/// Both are **atom terms**, interned in the same [`AtomTable`] the control message
+/// was decoded against. An atom term is its table-local index, so comparing a
+/// decoded pid/ref's node against these is a raw term `==`: no string comparison
+/// and no chance of matching an atom that was never interned here.
+///
+/// Ground truth: `dep != external_pid_dist_entry(from)` (`dist.c:2237`),
+/// `external_pid_dist_entry(watcher) != dep` (`dist.c:2358`) and the
+/// `erts_this_dist_entry` comparisons (`dist.c:2241`, `dist.c:2305`, `dist.c:2374`,
+/// `dist.c:2866`, `dist.c:3073`, `dist.c:3082`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LinkIdentity {
+    /// This link's peer node name — the C's `dep`.
+    pub peer_node: Eterm,
+    /// This node's own node name — the C's `erts_this_dist_entry`.
+    pub local_node: Eterm,
+}
+
+impl LinkIdentity {
+    /// Interns `peer_name`/`local_name` into `atoms` and builds the identity.
+    ///
+    /// `atoms` **must** be the table the control message was decoded against —
+    /// atom terms compare by their table-local value, so an identity built against
+    /// a different table could never match a decoded node.
+    ///
+    /// The names are the wire node names (`node@host`), which the distribution
+    /// protocol carries as UTF-8: a name that is not valid UTF-8 is
+    /// [`BeamError::BadArg`], never a lossy substitution.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] if either name is not valid UTF-8.
+    pub fn intern(
+        atoms: &mut AtomTable,
+        peer_name: &[u8],
+        local_name: &[u8],
+    ) -> Result<LinkIdentity> {
+        let peer = core::str::from_utf8(peer_name).map_err(|_| BeamError::BadArg)?;
+        let local = core::str::from_utf8(local_name).map_err(|_| BeamError::BadArg)?;
+        Ok(LinkIdentity {
+            peer_node: make_atom(atoms.intern(peer)),
+            local_node: make_atom(atoms.intern(local)),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The safe term predicates `classify_validated` is built from.
+//
+// Every one of them is a pure read of the term's tag/header — no heap write, so
+// the crate's `#![deny(unsafe_code)]` holds; the raw heap reads live inside
+// `beam_term`/`beam_codec`, which own the frozen layout (workspace `CONTEXT.md`
+// §2).
+// ---------------------------------------------------------------------------
+
+/// `is_pid(x)`: an internal (local) pid, or an external pid (`dist.c`'s `is_pid`
+/// spans both — an external pid is a pid).
+fn is_pid(x: Eterm) -> bool {
+    is_internal_pid(x) || is_external_pid(x)
+}
+
+/// `is_external_pid(x)`.
+fn is_external_pid(x: Eterm) -> bool {
+    external_pid_parts(x).is_ok()
+}
+
+/// The node-name term of an external pid, or `None` for anything else.
+///
+/// The `node` slot holds the sysname atom term (see
+/// [`beam_codec::term::make_external_pid`]), i.e. exactly what
+/// [`LinkIdentity`]'s node names are.
+fn external_pid_node(x: Eterm) -> Option<Eterm> {
+    external_pid_parts(x).ok().map(|(node, _, _, _)| node)
+}
+
+/// `is_ref(x)`: an external reference.
+///
+/// A **decoded wire** reference is always external (an internal reference is a
+/// same-node term the decoder only produces for a local-node demotion, and the C's
+/// `is_ref` — which spans internal and external refs — has no safe equivalent
+/// here: `is_internal_ref` is not exposed as a safe predicate). This predicate
+/// therefore reports exactly the references a remote control message can carry.
+fn is_ref(x: Eterm) -> bool {
+    external_ref_parts(x).is_ok()
+}
+
+/// The node-name term of an external reference, or `None` for anything else.
+fn external_ref_node(x: Eterm) -> Option<Eterm> {
+    external_ref_parts(x).ok().map(|(node, _, _)| node)
+}
+
+/// A non-zero, non-negative **small** integer — the C's `term_to_Uint64(…) &&
+/// id != 0` (`dist.c:2291-2295`).
+///
+/// A bignum id, which the C's `term_to_Uint64` also accepts, is **out of scope for
+/// this safe path** (there is no safe bignum accessor at this layer) and is
+/// reported as a violation rather than guessed at.
+fn is_nonzero_uint(x: Eterm) -> bool {
+    is_small(x) && signed_value(x) > 0
 }
 
 /// Reads the `Flags` field of `DOP_SPAWN_REPLY` as an [`DistSpawnFlags`] word.
@@ -733,3 +1118,256 @@ pub trait InboundSink {
 pub struct UnsupportedSink;
 
 impl InboundSink for UnsupportedSink {}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the opt-in [`Delivery::classify_validated`] validator — the
+    //! C's per-opcode `invalid_message` checks (`erts_dist_command`).
+    //!
+    //! These build **real** terms (external pids/refs on an arena, real tuples),
+    //! not small-int stand-ins: the whole point of the validator is the term
+    //! *shape* and the per-link node identity, so a stand-in would prove nothing.
+    //! Every test that expects a rejection also asserts that the **unchanged**
+    //! [`Delivery::classify`] still accepts the same message, so the two can never
+    //! be conflated.
+
+    use super::*;
+    use beam_alloc::Heap;
+    use beam_codec::term::{make_external_pid, make_external_ref};
+    use beam_term::prelude::{make_atom, make_internal_pid, make_pid_data, make_small, NIL};
+
+    /// The peer node name of the link under test (the C's `dep`).
+    const PEER: &str = "peer@host";
+    /// This node's own name (the link's `local_node`).
+    const LOCAL: &str = "local@host";
+    /// A third node that is *not* part of the link.
+    const OTHER: &str = "other@host";
+
+    /// An arena, an atom table, and the link identity over `PEER`/`LOCAL`.
+    fn setup() -> (Heap, AtomTable, LinkIdentity) {
+        let heap = Heap::new(1 << 16).expect("arena");
+        let mut atoms = AtomTable::new();
+        let link = LinkIdentity::intern(&mut atoms, PEER.as_bytes(), LOCAL.as_bytes())
+            .expect("intern the link identity");
+        (heap, atoms, link)
+    }
+
+    /// A local (internal) pid.
+    fn local_pid() -> Eterm {
+        // `make_pid_data(ser, num)` — the pid's serial and process-table number.
+        make_internal_pid(make_pid_data(0, 1))
+    }
+
+    /// An external pid whose `node` slot is the atom named `node`.
+    fn pid_on(heap: &mut Heap, atoms: &mut AtomTable, node: &str) -> Eterm {
+        let node = make_atom(atoms.intern(node));
+        make_external_pid(heap, node, 1, 0, 0).expect("materialize an external pid")
+    }
+
+    /// An external reference whose `node` slot is the atom named `node`.
+    fn ref_on(heap: &mut Heap, atoms: &mut AtomTable, node: &str) -> Eterm {
+        let node = make_atom(atoms.intern(node));
+        make_external_ref(heap, node, &[1, 2, 3], 0).expect("materialize an external ref")
+    }
+
+    /// A control message with the given opcode and flattened terms.
+    fn msg(dop: Dop, terms: Vec<Eterm>) -> ControlMessage {
+        ControlMessage { dop, terms }
+    }
+
+    #[test]
+    fn link_identity_interns_both_node_names() {
+        let (_, mut atoms, link) = setup();
+        assert_eq!(link.peer_node, make_atom(atoms.intern(PEER)));
+        assert_eq!(link.local_node, make_atom(atoms.intern(LOCAL)));
+        assert_ne!(link.peer_node, link.local_node, "distinct names, distinct atoms");
+
+        // A name that is not valid UTF-8 is a typed error, never a lossy
+        // substitution (the wire carries the node name as UTF-8).
+        let bad = LinkIdentity::intern(&mut atoms, &[0xff, 0xfe], LOCAL.as_bytes());
+        assert!(matches!(bad, Err(BeamError::BadArg)));
+        let bad = LinkIdentity::intern(&mut atoms, PEER.as_bytes(), &[0xff]);
+        assert!(matches!(bad, Err(BeamError::BadArg)));
+    }
+
+    #[test]
+    fn a_link_from_the_peer_node_is_accepted() {
+        let (mut heap, mut atoms, link) = setup();
+        let from = pid_on(&mut heap, &mut atoms, PEER);
+        let to = local_pid();
+        let message = msg(Dop::Link, vec![from, to]);
+
+        assert_eq!(
+            Delivery::classify_validated(&message, &link).expect("a peer link validates"),
+            Delivery::Link { from, to },
+        );
+    }
+
+    #[test]
+    fn a_link_from_another_node_is_rejected() {
+        let (mut heap, mut atoms, link) = setup();
+        let from = pid_on(&mut heap, &mut atoms, OTHER);
+        let to = local_pid();
+        let message = msg(Dop::Link, vec![from, to]);
+
+        // `classify` is shape-only and unchanged: it accepts the spoofed link.
+        assert!(Delivery::classify(&message).is_ok());
+        // The C's `dep != external_pid_dist_entry(from)` (`dist.c:2237`) rejects it.
+        assert!(matches!(
+            Delivery::classify_validated(&message, &link),
+            Err(BeamError::BadArg)
+        ));
+    }
+
+    #[test]
+    fn a_monitor_with_a_non_pid_watcher_is_rejected() {
+        let (mut heap, mut atoms, link) = setup();
+        let watched = local_pid();
+        let reference = ref_on(&mut heap, &mut atoms, PEER);
+
+        // A valid `{DOP_MONITOR_P, Remote, Local, Ref}`: the watcher is an external
+        // pid of the peer.
+        let good = msg(
+            Dop::MonitorP,
+            vec![pid_on(&mut heap, &mut atoms, PEER), watched, reference],
+        );
+        assert!(Delivery::classify_validated(&good, &link).is_ok());
+
+        // A small integer in the watcher slot is `is_not_external_pid(watcher)`
+        // (`dist.c:2356`): rejected by the validator, still classified by
+        // `classify`.
+        let bad = msg(Dop::MonitorP, vec![make_small(7), watched, reference]);
+        assert!(Delivery::classify(&bad).is_ok());
+        assert!(matches!(
+            Delivery::classify_validated(&bad, &link),
+            Err(BeamError::BadArg)
+        ));
+    }
+
+    #[test]
+    fn a_reg_send_to_a_non_atom_name_is_rejected() {
+        let (_, mut atoms, link) = setup();
+        let from = local_pid(); // a pid, so only the name check can fail
+        let cookie = make_atom(atoms.intern(""));
+        let registered = make_atom(atoms.intern("genesis_recv"));
+        let body = make_small(42);
+
+        let good = msg(Dop::RegSend, vec![from, cookie, registered, body]);
+        assert!(Delivery::classify_validated(&good, &link).is_ok());
+
+        let bad = msg(Dop::RegSend, vec![from, cookie, make_small(1), body]);
+        assert!(Delivery::classify(&bad).is_ok());
+        assert!(matches!(
+            Delivery::classify_validated(&bad, &link),
+            Err(BeamError::BadArg)
+        ));
+    }
+
+    #[test]
+    fn a_spawn_request_with_a_well_formed_mfa_is_accepted() {
+        let (mut heap, mut atoms, link) = setup();
+        let reference = ref_on(&mut heap, &mut atoms, PEER);
+        let from = pid_on(&mut heap, &mut atoms, PEER);
+        let group_leader = local_pid();
+        let module = make_atom(atoms.intern("example"));
+        let function = make_atom(atoms.intern("run"));
+        let mfa = heap
+            .tuple(&[module, function, make_small(0)])
+            .expect("build the {M,F,A} tuple");
+        let message = msg(Dop::SpawnRequest, vec![reference, from, group_leader, mfa, NIL, NIL]);
+
+        assert!(Delivery::classify_validated(&message, &link).is_ok());
+    }
+
+    #[test]
+    fn a_spawn_request_with_a_malformed_mfa_is_rejected() {
+        let (mut heap, mut atoms, link) = setup();
+        let reference = ref_on(&mut heap, &mut atoms, PEER);
+        let from = pid_on(&mut heap, &mut atoms, PEER);
+        let group_leader = local_pid();
+        let module = make_atom(atoms.intern("example"));
+        let function = make_atom(atoms.intern("run"));
+
+        // A 2-tuple is `is_not_tuple_arity(mfa, 3)` (`dist.c:2939`).
+        let short = heap.tuple(&[module, function]).expect("build a 2-tuple");
+        let bad = msg(Dop::SpawnRequest, vec![reference, from, group_leader, short, NIL, NIL]);
+        assert!(Delivery::classify(&bad).is_ok());
+        assert!(matches!(
+            Delivery::classify_validated(&bad, &link),
+            Err(BeamError::BadArg)
+        ));
+
+        // A non-tuple is rejected by the same check.
+        let not_tuple = msg(
+            Dop::SpawnRequest,
+            vec![reference, from, group_leader, make_small(1), NIL, NIL],
+        );
+        assert!(matches!(
+            Delivery::classify_validated(&not_tuple, &link),
+            Err(BeamError::BadArg)
+        ));
+    }
+
+    #[test]
+    fn the_exit_family_requires_a_peer_sender_and_a_local_target() {
+        let (mut heap, mut atoms, link) = setup();
+        let to = local_pid();
+        let reason = make_small(1);
+
+        let good = msg(Dop::Exit, vec![pid_on(&mut heap, &mut atoms, PEER), to, reason]);
+        assert!(matches!(
+            Delivery::classify_validated(&good, &link),
+            Ok(Delivery::Exit { .. })
+        ));
+
+        // A sender from a third node is a spoof (`dist.c:2793-2797`).
+        let spoofed = msg(Dop::Exit, vec![pid_on(&mut heap, &mut atoms, OTHER), to, reason]);
+        assert!(Delivery::classify(&spoofed).is_ok());
+        assert!(matches!(
+            Delivery::classify_validated(&spoofed, &link),
+            Err(BeamError::BadArg)
+        ));
+
+        // A non-local target is `is_not_internal_pid(to)` (`dist.c:2796`).
+        let remote_target = msg(
+            Dop::Exit,
+            vec![pid_on(&mut heap, &mut atoms, PEER), make_small(1), reason],
+        );
+        assert!(matches!(
+            Delivery::classify_validated(&remote_target, &link),
+            Err(BeamError::BadArg)
+        ));
+    }
+
+    #[test]
+    fn an_altact_send_requires_the_to_shape_its_flags_name() {
+        let (mut heap, mut atoms, link) = setup();
+        let from = pid_on(&mut heap, &mut atoms, PEER);
+        let alias = ref_on(&mut heap, &mut atoms, LOCAL);
+        let name = make_atom(atoms.intern("genesis_recv"));
+
+        // `ALIAS` without `NAME` ⇒ `to` is a reference (`dist.c:2662-2666`).
+        let alias_msg = msg(
+            Dop::AltactSigSend,
+            vec![make_small(i64::from(AltactSigFlags::ALIAS.bits())), from, alias, NIL],
+        );
+        assert!(Delivery::classify_validated(&alias_msg, &link).is_ok());
+        // …and a pid in that slot is `is_not_ref(to)`.
+        let bad_alias = msg(
+            Dop::AltactSigSend,
+            vec![make_small(i64::from(AltactSigFlags::ALIAS.bits())), from, local_pid(), NIL],
+        );
+        assert!(Delivery::classify(&bad_alias).is_ok());
+        assert!(matches!(
+            Delivery::classify_validated(&bad_alias, &link),
+            Err(BeamError::BadArg)
+        ));
+
+        // `NAME` ⇒ `to` is an atom (`dist.c:2667-2670`).
+        let name_msg = msg(
+            Dop::AltactSigSend,
+            vec![make_small(i64::from(AltactSigFlags::NAME.bits())), from, name, NIL],
+        );
+        assert!(Delivery::classify_validated(&name_msg, &link).is_ok());
+    }
+}
