@@ -16,7 +16,13 @@ later same-size insert silently reuses (a wrong, well-formed result).
   `as_float`/`tuple_arity`/`tuple_element`/`tuple_elements`/`list_to_terms`/`size`), comparisons
   (`eq_term`/`cmp_term`, which **delegate** to `beam_term::compare::{eq,cmp}`), and the copy-out
   `copy_into` (delegates to `TermStore::copy`). Constructor `new` is `pub(super)`; the raw
-  `term: Eterm` field is private; no method returns a bare aliasing `Eterm`.
+  `term: Eterm` field is private; no method returns a bare aliasing `Eterm`. It is `Clone + Copy`
+  (one word + a ZST marker) so a tagged term can be handed back by value — both copies stay bounded
+  by `'g`, so this does not widen the lifetime discipline.
+- `term.rs` — `HeirView<'g>`: the installed heir read under a live write guard — owned
+  `owner() -> OwnerId` plus `data() -> Option<TableTerm<'g>>`, the gift term tagged to the view's
+  borrow so the table-owned copy cannot escape. `new(owner, Option<Eterm>)` is `pub(super)`; the
+  only producer is `TableWrite::heir`.
 - `read.rs` — `TableRead<'g>`: owned metadata; tagged term reads (`lookup`/`member`/
   `lookup_element`/`lookup_element_or`/`lookup_element_all`/`lookup_element_all_or`/`first`/
   `last`/`next`/`prev`/`slot`/`tab2list`); the **copy-out** select family (`select`/`select_count`/
