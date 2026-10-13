@@ -57,9 +57,10 @@ later same-size insert silently reuses (a wrong, well-formed result).
 ## Test Strategy
 - Inline `#[cfg(test)]`: `tests.rs` (the hazard + fix, view reads/writes, exact shapes) and
   `iter.rs`'s own module (traversal orders, folds, `tab2list_into` churn survival). The
-  compile-time contract is pinned by 4 `compile_fail` doctests in-node (term.rs ×1, iter.rs ×3)
-  plus 1 on `SharedTable`. All are bare `compile_fail` (no `E0xxx` code) — they pass on *any*
-  compile error; the imports resolve, so the only failure is the intended escape.
+  compile-time contract is pinned by 6 `compile_fail` doctests in-node (term.rs ×2 — `TableTerm`,
+  `HeirView`; iter.rs ×3; shared.rs ×1), all bare `compile_fail` with no `E0xxx` code — the imports
+  resolve, so the only failure is the intended escape. `HeirView`'s `compile_fail` is paired with a
+  *passing* doctest of the same call shape (owned metadata extraction), so it is non-vacuous.
 - Coverage gaps: none recorded — `TableRead::member` and `TableTerm::is_bitstring` are pinned by
   `member_reports_key_presence_across_kinds` / `bitstring_reads_distinguish_aligned_binaries_from_unaligned_bits`,
   and the `as_requester` residual hazard by `as_requester_reads_are_a_documented_residual_hazard`.
