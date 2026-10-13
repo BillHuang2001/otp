@@ -551,6 +551,25 @@ and derives the report from that observed state.
 - **`DOP_UNLINK` never routes to a side effect.** The C *rejects* the bare `DOP_UNLINK` opcode
   (`dist.c:2277-2282`), so `classify` leaves it `Other(DOP_UNLINK)` — encodable/decodable, but carrying
   no semantic `Delivery`.
+- **`Delivery::classify` performs no per-opcode type or node-identity validation.** It checks term
+  presence + arity (via `decode_control`) and the spawn/altact flag-word constraints, but not the C's
+  per-opcode checks: `is_external_pid(from)` + `external_pid_dist_entry(from) == dep` (the peer's dist
+  entry), `is_ref(ref)`, `is_atom`/`is_internal_pid` on `watched`/`to` (`dist.c:2224-2441`). `Delivery`
+  also carries no peer/connection identity, so an `InboundSink` cannot enforce the `dep` check without
+  out-of-band context — a peer may name a `from`/`watcher` pid belonging to a *different* node and it is
+  classified without complaint.
+- **The server always replies `Status::Ok`; there is no `alive`/`ok_simultaneous`/`named:` path.**
+  `connection::accept_server_core` (`connection.rs:577`) and `driver::ConnectionDriver`'s `ServerAwaitName`
+  (`driver.rs:825`) unconditionally send `ok`. The oracle's `mark_pending` instead selects
+  `ok`/`named`/`ok_simultaneous`/`nok`/`alive` from a net_kernel-level pending-connection registry
+  (`dist_util.erl:318-368`), which this crate has no equivalent of; `Status` also exposes no
+  `alive()`/`simultaneous()`/`named()` constructors (only `not_allowed()`/`nok()`, `handshake.rs:331-339`).
+  A simultaneous-connect race or a reconnect-alive probe is therefore not answered as a real node would.
+- **Two independent server handshake implementations; only one is live-tested.** The blocking
+  `connection::accept_server_core` and the non-blocking `driver::ConnectionDriver` server states each
+  implement the accept handshake separately; `tests/live_accept.rs` drives only the driver against a real
+  `erl` peer, so the blocking path's parity with real OTP is pinned only hermetically
+  (`tests/connection.rs`).
 - **Consumed by `beam_rt` for the ACCEPTING half only.** `beam_rt/src/dist.rs` (`DistNode`, driven from
   `runtime/scheduler.rs::pump_dist`) derives the node name from `-name`/`-sname` (`NodeName`), registers
   with `epmd` (`ALIVE2_REQ`), binds a listener and completes the `'N'` handshake as **server** via this
