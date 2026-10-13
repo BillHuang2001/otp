@@ -73,6 +73,7 @@ pub mod config;
 pub mod context;
 pub mod crash_dump;
 pub mod dist;
+pub mod dist_client;
 pub mod error;
 pub mod eval;
 pub mod format;
@@ -99,6 +100,7 @@ pub use crate::format::{term_to_string, term_to_string_w};
 pub use crate::info::{system_info_value, InfoValue, SUPPORTED_KEYS};
 pub use crate::port::{PortName, PortRegistry, RuntimePorts, StreamType, PORT_INFO_ATOMS};
 pub use crate::dist::{DistConnection, DistNode, NodeName};
+pub use crate::dist_client::DistClient;
 pub use crate::runtime::Runtime;
 /// The conventional glob-import surface for downstream crates.
 ///
