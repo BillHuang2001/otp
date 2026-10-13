@@ -34,7 +34,10 @@
 //! [`ProcessTable::monitor_term`] emits before the inbound DOWN is applied).
 //!
 //! Semantics are the C's: `dist.c`'s receipt switch (link/unlink/monitor/exit/group-leader arms)
-//! and `erl_proc_sig_queue.c`'s `handle_exit_signal` (the link-exit vs `exit/2` trap rules).
+//! and `erl_proc_sig_queue.c`'s `handle_exit_signal` (the link-exit vs `exit/2` trap rules). The
+//! [`RemoteWatcher`] incoming-record table is pinned here directly too: a record is resolved by
+//! the watched process's death or by a `DOP_DEMONITOR_P` receipt
+//! ([`ProcessTable::demonitor_from_remote`]), and a later receipt never resurrects it.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -245,6 +248,49 @@ fn a_link_exit_removes_the_link_and_traps_for_a_trapping_receiver() {
         log.borrow().is_empty(),
         "an inbound DOP_EXIT is never re-routed"
     );
+}
+
+#[test]
+fn a_link_exit_traps_for_every_reason_including_normal_and_kill() {
+    // A link exit is trappable for *every* reason: the C guards its `killed` rewrite — and every
+    // other special case — behind `op == ERTS_SIG_Q_OP_EXIT` (`erl_proc_sig_queue.c:4740`), which
+    // the link-exit family never is, so a trapping receiver takes the `{'EXIT', RemotePid, Reason}`
+    // message verbatim — `normal` and `kill` included.
+    let (mut table, names, node, log) = fixture();
+    let mut heap = Heap::new(64).expect("test heap");
+    let rpid = RemotePid::from_eterm(remote_pid(&mut heap, node, 71, 72, 73)).expect("ext");
+
+    for reason in [named(&names, "normal"), named(&names, "kill"), make_small(7)] {
+        // A fresh receiver per reason, so `sole_payload` sees exactly one message.
+        let to = table.spawn_default().expect("to");
+        table.get_mut(to).expect("to").set_trap_exit(true);
+        table.record_remote_link(to, rpid).expect("to is live");
+        table
+            .apply_remote_exit_signal(to, rpid, reason, false)
+            .expect("to is live");
+
+        assert!(table.contains(to), "a trapping receiver survives");
+        assert!(
+            table.remote_links(to).is_empty(),
+            "the link record is removed first"
+        );
+        let payload = sole_payload(&table, to);
+        // SAFETY: `payload` is the live `{'EXIT', RemotePid, Reason}` tuple on `to`'s heap.
+        unsafe {
+            assert_eq!(tuple_size(payload), 3);
+            assert_eq!(tuple_element(payload, 0), named(&names, "EXIT"));
+            assert_eq!(
+                RemotePid::from_eterm(tuple_element(payload, 1)).expect("an external pid"),
+                rpid
+            );
+            assert_eq!(
+                tuple_element(payload, 2),
+                reason,
+                "the link-exit reason is handed over unchanged (never `killed`)"
+            );
+        }
+    }
+    assert!(log.borrow().is_empty());
 }
 
 #[test]
@@ -595,6 +641,133 @@ fn an_incoming_watcher_record_dies_with_the_watched_process() {
     table.terminate(watched, make_small(0)).expect("watched is live");
     assert!(!table.contains(watched));
     assert!(table.remote_watchers(watched).is_empty());
+    assert!(log.borrow().is_empty());
+}
+
+#[test]
+fn demonitor_from_remote_removes_only_its_reference_on_that_process() {
+    // `demonitor_from_remote` is the `DOP_DEMONITOR_P` receipt on its own (not merely a step of
+    // the monitor round-trip above): it drops exactly the matching reference of the named local
+    // process, is an `Ok` no-op for one that is already gone (no "resurrection"), and never
+    // touches another local process holding the very same reference.
+    let (mut table, _names, node, log) = fixture();
+    let mut heap = Heap::new(64).expect("test heap");
+    let watched = table.spawn_default().expect("watched");
+    let other = table.spawn_default().expect("other");
+    let first = RemotePid::from_eterm(remote_pid(&mut heap, node, 151, 152, 153)).expect("ext");
+    let second = RemotePid::from_eterm(remote_pid(&mut heap, node, 161, 162, 163)).expect("ext");
+
+    let r1 = table.next_reference();
+    let r2 = table.next_reference();
+    table
+        .monitor_from_remote(watched, first, r1, MonitorKind::Process)
+        .expect("watched is live");
+    table
+        .monitor_from_remote(watched, second, r2, MonitorKind::Process)
+        .expect("watched is live");
+    // The same reference recorded for a **different** local process is an independent record.
+    table
+        .monitor_from_remote(other, first, r1, MonitorKind::Process)
+        .expect("other is live");
+
+    table
+        .demonitor_from_remote(watched, r1)
+        .expect("watched is live");
+    assert_eq!(
+        table.remote_watchers(watched),
+        &[RemoteWatcher {
+            reference: r2,
+            watcher: second,
+            kind: MonitorKind::Process,
+        }],
+        "only the matching reference on the named process goes"
+    );
+    assert_eq!(
+        table.remote_watchers(other).len(),
+        1,
+        "another local process's identical reference is untouched"
+    );
+    assert_eq!(table.remote_watchers(other)[0].watcher, first);
+
+    // Removing a reference that is already gone is an `Ok` no-op, not an error, and does not
+    // resurrect the record.
+    table
+        .demonitor_from_remote(watched, r1)
+        .expect("watched is live");
+    assert_eq!(
+        table.remote_watchers(watched),
+        &[RemoteWatcher {
+            reference: r2,
+            watcher: second,
+            kind: MonitorKind::Process,
+        }],
+        "a re-sent DOP_DEMONITOR_P resurrects nothing"
+    );
+
+    assert!(matches!(
+        table.demonitor_from_remote(ProcessId::new(202, 0), r2),
+        Err(BeamError::TermNotFound)
+    ));
+    assert!(log.borrow().is_empty(), "an inbound DOP_DEMONITOR_P never routes");
+}
+
+#[test]
+fn an_incoming_watcher_record_is_dropped_by_death_and_by_demonitor() {
+    // The `RemoteWatcher` incoming-record table resolves by the two paths the C has: the watched
+    // process's death drops its whole entry (the monitor teardown in `erl_proc_sig_queue.c`), and
+    // a `DOP_DEMONITOR_P` receipt drops the one reference it names. Neither ever resurfaces.
+    let (mut table, _names, node, log) = fixture();
+    let mut heap = Heap::new(64).expect("test heap");
+    let demonitored = table.spawn_default().expect("demonitored");
+    let dying = table.spawn_default().expect("dying");
+    let watcher = RemotePid::from_eterm(remote_pid(&mut heap, node, 171, 172, 173)).expect("ext");
+
+    // The very same reference names an incoming watcher of each of the two processes.
+    let reference = table.next_reference();
+    table
+        .monitor_from_remote(demonitored, watcher, reference, MonitorKind::Process)
+        .expect("demonitored is live");
+    table
+        .monitor_from_remote(dying, watcher, reference, MonitorKind::Port)
+        .expect("dying is live");
+
+    // 1. a DOP_DEMONITOR_P receipt drops the record of `demonitored` only.
+    table
+        .demonitor_from_remote(demonitored, reference)
+        .expect("demonitored is live");
+    assert!(
+        table.remote_watchers(demonitored).is_empty(),
+        "the demonitored record is gone"
+    );
+    assert_eq!(
+        table.remote_watchers(dying),
+        &[RemoteWatcher {
+            reference,
+            watcher,
+            kind: MonitorKind::Port,
+        }],
+        "the sibling process's record under the same reference survives"
+    );
+    // ... and it is not resurrected by a re-sent DOP_DEMONITOR_P.
+    table
+        .demonitor_from_remote(demonitored, reference)
+        .expect("demonitored is live");
+    assert!(table.remote_watchers(demonitored).is_empty());
+
+    // 2. the watched process's death drops its record wholesale.
+    table.terminate(dying, make_small(0)).expect("dying is live");
+    assert!(!table.contains(dying));
+    assert!(
+        table.remote_watchers(dying).is_empty(),
+        "a dead process keeps no incoming-watcher record"
+    );
+    // ... nor can a later receipt resurrect one for the dead pid.
+    assert!(matches!(
+        table.monitor_from_remote(dying, watcher, reference, MonitorKind::Process),
+        Err(BeamError::TermNotFound)
+    ));
+    assert!(table.remote_watchers(dying).is_empty());
+
     assert!(log.borrow().is_empty());
 }
 
