@@ -803,7 +803,8 @@ line (no timestamps/addresses/ports) and exits `0`:
 - `src/connection_tests.rs` → the `connection` module's in-module unit tests (path-included via
   `#[cfg(test)] #[path] mod tests;` so `connection.rs` stays ~1000 lines)
 - `src/driver.rs` → the non-blocking `ConnectionDriver` poll/step state machine (`feed`/`step`/
-  `take_output`/`next_message`/`next_delivery`/`dispatch_inbound`/`send_control`/`peer_visibility`) +
+  `take_output`/`next_message`/`next_delivery`/`next_delivery_checked`/`dispatch_inbound`/
+  `dispatch_inbound_checked`/`send_control`/`peer_visibility`) +
   `DriverState`/`StepOutcome` + the `server_with_decision` accept-policy constructor
 - `src/epmd.rs` → `epmd` request/response codecs (incl. the `DUMP`/`KILL`/`STOP` admin set +
   `MAX_DUMP_RESP_BODY`), `EpmdClient` over `Transport` (`publish`/`port_please`/`names`/`dump`/`kill`/
