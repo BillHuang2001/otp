@@ -18,47 +18,40 @@
 //
 // %CopyrightEnd%
 
-//! `erlang:decode_packet/3` — the packet length decoder and the `raw` family.
+//! `erlang:decode_packet/3` — the argument validation, the per-type dispatch and
+//! the result rendering.
 //!
 //! Ground truth (read-only):
 //! `../../erts/emulator/beam/erl_bif_port.c:1476-1617` (`decode_packet_3`: the
-//! type switch, the option loop, the `{ok,…}`/`{more,…}`/`{error,invalid}`
-//! dispatch), `../../erts/emulator/beam/packet_parser.c:248-501`
-//! (`packet_get_length`, incl. the `more:`/`remain:`/`error:` labels at
-//! 483-500), `../../erts/emulator/beam/packet_parser.h:34-50` (`enum
-//! PacketParseType`) and `:152-164` (`packet_get_body`).
+//! type switch at 1492-1511, the option loop at 1518-1548, the
+//! `{ok,…}`/`{more,…}`/`{error,invalid}` dispatch at 1558-1607) and
+//! `../../erts/emulator/beam/packet_parser.h:34-50` (`enum PacketParseType`).
 //!
-//! # Implemented types (six)
+//! # Dispatch
 //!
-//! `raw`/`0` (`TCP_PB_RAW`), `1` (`TCP_PB_1`), `2` (`TCP_PB_2`), `4`
-//! (`TCP_PB_4`) and `line` (`TCP_PB_LINE_LF`). Each reproduces the C's
-//! length-extraction verbatim:
+//! `Type` resolves to a [`PacketType`] ([`resolve_type`], the C's type switch).
+//! After the argument validation below, the byte view of `Bin` reaches exactly
+//! **one** family parser — [`tls`] for `ssl_tls`, [`http`] for the four http
+//! types, [`framing`] for every other valid type — and each returns an
+//! [`Outcome`], which this module renders:
 //!
-//! * `raw`/`0` — the whole binary is one packet; an empty binary is
-//!   `{more, undefined}` (`packet_parser.c:258-263`). `packet_size`/`line_length`
-//!   are parsed but never applied (the C returns `n` before the `remain:` label).
-//! * `1`/`2`/`4` — a 1/2/4-byte big-endian length prefix
-//!   (`packet_parser.c:265-284`), then the shared `remain:` label
-//!   (`:486-494`): an effective `max_plen` of `packet_size` when given, else
-//!   `INT_MAX - hlen`; `plen > max_plen` is `{error, invalid}`, otherwise the
-//!   packet is `hlen + plen` bytes long and the body starts at `hlen`
-//!   (`packet_get_body`).
-//! * `line` — a delimiter-terminated line (`packet_parser.c:295-322`), the
-//!   delimiter being `\n` unless `{line_delimiter, C}` (only valid for `line`,
-//!   `C <= 255`). A not-yet-terminated line is `{more, undefined}` unless it
-//!   has already reached `line_length` (then the first `line_length` bytes are
-//!   the packet), and a terminated line longer than `line_length` is truncated
-//!   to it; `packet_size` bounds the line in both cases (`{error, invalid}`).
+//! * [`Outcome::Invalid`] => `{error, invalid}`;
+//! * [`Outcome::More`] => `{more, undefined}` (`None`) or `{more, N}`
+//!   (`Some(N)`, the total size required);
+//! * [`Outcome::Ok`] => `{ok, Packet, Rest}`, but only when the packet really is
+//!   in `Bin`: a `packet_sz` of `0` or one beyond `Bin`'s length is the *same*
+//!   `{more, …}` rule (`0` => `undefined`, else `{more, packet_sz}`), never a
+//!   partial packet (`erl_bif_port.c:1564-1569`). Otherwise `Rest` is
+//!   `bytes[packet_sz..]` and `Packet` is either the body slice
+//!   `bytes[start..end]` ([`Body::Binary`], the length-prefixed families) or a
+//!   term the family parser already built ([`Body::Term`], the http family and
+//!   `ssl_tls`).
 //!
-//! # The result shape
-//!
-//! `{ok, Packet, Rest}` for a complete packet (the body excludes the length
-//! prefix; `Rest` is the remainder of `Bin`), `{more, Length}` when more bytes
-//! are needed (`undefined` when the required length is not yet known) and
-//! `{error, invalid}` for a malformed/oversized declared length
-//! (`erl_bif_port.c:1561-1607`). A declared length that exceeds `Bin` is
-//! reported as `{more, Length}` **without allocating** the packet
-//! (`erl_bif_port.c:1564-1569`), and every loop here is bounded by the input.
+//! **The per-type implemented subset is documented in each submodule.** A valid
+//! packet type whose rules are not implemented yet returns the typed
+//! `unsupported_bif` capability gap — never a fabricated packet — and its
+//! arguments are still validated first, so `decode_packet(asn1, 42, [])` stays
+//! `badarg` exactly as the oracle answers it.
 //!
 //! # Argument validation (oracle-faithful)
 //!
@@ -71,16 +64,10 @@
 //! (e.g. `bogus`, `3`, `cd`, `ssl`) is likewise `badarg` — pinned by probing the
 //! oracle, which reports `badarg` with `cause => badopt` rather than a
 //! `{error, {unknown_packet_type, _}}` tuple.
-//!
-//! # Honest capability gaps
-//!
-//! The other valid packet types — `asn1`, `sunrm`, `cdr`, `fcgi`, `tpkt`,
-//! `http`, `httph`, `http_bin`, `httph_bin` and `ssl_tls`
-//! (`packet_parser.h:34-50`) — are recognised (so their `Type` is not `badarg`)
-//! but return the typed [`unsupported_bif`] capability gap. Their arguments are
-//! still validated first, so `decode_packet(asn1, 42, [])` stays `badarg`
-//! exactly as the oracle answers it. No packet type ever yields a fabricated
-//! result.
+
+mod framing;
+mod http;
+mod tls;
 
 use beam_common::Result;
 use beam_term::{atom_val, signed_value, Eterm};
@@ -88,21 +75,21 @@ use beam_term::{atom_val, signed_value, Eterm};
 use crate::access;
 use crate::bits;
 use crate::context::BifContext;
-use crate::error::{badarg, unsupported_bif};
+use crate::error::badarg;
 use crate::registry::BifRegistry;
 
 /// The default line delimiter — `decode_packet_3`'s `char delimiter = '\n'`
 /// (`erl_bif_port.c:1490`).
 const DEFAULT_DELIMITER: u8 = b'\n';
 
-/// The C `INT_MAX` (`limits.h`): the fallback packet-length ceiling of the
-/// `remain:` label (`packet_parser.c:488-490`).
-const INT_MAX: u64 = i32::MAX as u64;
-
 /// The packet type selected by `Type` (`enum PacketParseType`,
 /// `packet_parser.h:34-50`).
+///
+/// Every valid type has its own variant so that an unimplemented one is the
+/// typed capability gap rather than a `badarg`; only a term that names no packet
+/// type at all is `badarg` (see [`resolve_type`]).
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum PacketType {
+pub(super) enum PacketType {
     /// `raw` | `0` (`TCP_PB_RAW`).
     Raw,
     /// `1` (`TCP_PB_1`).
@@ -113,33 +100,62 @@ enum PacketType {
     Len4,
     /// `line` (`TCP_PB_LINE_LF`).
     Line,
-    /// A valid packet type this Milestone does not implement — the typed
-    /// [`unsupported_bif`] capability gap (see the module docs).
-    Unimplemented,
-}
-
-/// The outcome of the length extraction — the C `packet_get_length` plus the
-/// `{ok,…}` / `{more,…}` / `{error,invalid}` decision in `decode_packet_3`
-/// (`erl_bif_port.c:1558-1570`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum PacketLength {
-    /// A whole packet of `packet_sz` bytes, whose body begins at `header_len`
-    /// (`packet_get_body`, `packet_parser.h:152-164`).
-    Packet { packet_sz: usize, header_len: usize },
-    /// More bytes are needed: `Some(n)` is the total size required (`{more, n}`),
-    /// `None` the C's `0` length (`{more, undefined}`).
-    More(Option<usize>),
-    /// A malformed/oversized declared length (`packet_get_length` returning `< 0`).
-    Invalid,
+    /// `asn1` (`TCP_PB_ASN1`).
+    Asn1,
+    /// `sunrm` (`TCP_PB_RM`).
+    Sunrm,
+    /// `cdr` (`TCP_PB_CDR`).
+    Cdr,
+    /// `fcgi` (`TCP_PB_FCGI`).
+    Fcgi,
+    /// `tpkt` (`TCP_PB_TPKT`).
+    Tpkt,
+    /// `ssl_tls` (`TCP_PB_SSL_TLS`).
+    SslTls,
+    /// `http` (`TCP_PB_HTTP`).
+    Http,
+    /// `httph` (`TCP_PB_HTTPH`).
+    HttpH,
+    /// `http_bin` (`TCP_PB_HTTP_BIN`).
+    HttpBin,
+    /// `httph_bin` (`TCP_PB_HTTPH_BIN`).
+    HttpHBin,
 }
 
 /// The `packet_size`/`line_length`/`line_delimiter` options
 /// (`erl_bif_port.c:1479-1548`); `0` means "no limit" in the C.
 #[derive(Clone, Copy, Debug)]
-struct Options {
-    max_plen: u64,
-    trunc_len: u64,
-    delimiter: u8,
+pub(super) struct Options {
+    /// `packet_size` — the C's `max_plen`.
+    pub max_plen: u64,
+    /// `line_length` — the C's `trunc_len`.
+    pub trunc_len: u64,
+    /// `line_delimiter` — the C's `delimiter` (only the `line` type; `\n` by
+    /// default).
+    pub delimiter: u8,
+}
+
+/// The body of a complete packet, as reported by a family parser.
+pub(super) enum Body {
+    /// A plain binary body: `bytes[start..end]`. The producing parser guarantees
+    /// `start <= end <= packet_sz <= bytes.len()`.
+    Binary { start: usize, end: usize },
+    /// A term already built by the family parser — the http family and
+    /// `ssl_tls`, whose packet is a term rather than a slice of the input.
+    Term(Eterm),
+}
+
+/// The outcome of a family parser ([`framing::parse`], [`tls::parse`],
+/// [`http::parse`]).
+pub(super) enum Outcome {
+    /// The packet is malformed — the C's negative `packet_get_length` =>
+    /// `{error, invalid}`.
+    Invalid,
+    /// More bytes are needed: `Some(n)` is the total size required (`{more, n}`),
+    /// `None` the C's `0` length (`{more, undefined}`).
+    More(Option<usize>),
+    /// A whole packet of `packet_sz` bytes plus its [`Body`].
+    Ok { packet_sz: usize, body: Body },
 }
 
 /// `erlang:decode_packet/3`.
@@ -147,7 +163,7 @@ struct Options {
 /// # Errors
 ///
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for any argument the
-/// oracle rejects, the typed [`unsupported_bif`] raise for a valid packet type
+/// oracle rejects, the typed `unsupported_bif` raise for a valid packet type
 /// that is not implemented, and [`BeamError::Alloc`](beam_common::BeamError::Alloc)
 /// / [`BeamError::TermNotFound`](beam_common::BeamError::TermNotFound) when the
 /// result term cannot be built.
@@ -165,26 +181,36 @@ fn decode_packet_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let bytes = bits::bytes(bin)?;
     let opts = parse_options(ctx, opts_term, packet_type)?;
 
-    // A valid-but-unimplemented type is an honest typed gap, reported only after
-    // the argument validation above (so a bad `Bin`/`Opts` still answers `badarg`).
-    if packet_type == PacketType::Unimplemented {
-        return Err(unsupported_bif());
-    }
+    // The one dispatch: the two term-building families, then the length-prefixed
+    // ones. An unimplemented type is an honest typed gap raised *inside* its own
+    // family module — never a fabricated result.
+    let outcome = match packet_type {
+        PacketType::SslTls => tls::parse(ctx, packet_type, &bytes, &opts)?,
+        PacketType::Http | PacketType::HttpH | PacketType::HttpBin | PacketType::HttpHBin => {
+            http::parse(ctx, packet_type, &bytes, &opts)?
+        }
+        _ => framing::parse(ctx, packet_type, &bytes, &opts)?,
+    };
 
-    match packet_length(packet_type, &bytes, &opts) {
-        PacketLength::Invalid => {
+    render(ctx, &bytes, outcome)
+}
+
+/// Renders a family parser's [`Outcome`] as the result term.
+fn render(ctx: &mut BifContext<'_>, bytes: &[u8], outcome: Outcome) -> Result<Eterm> {
+    match outcome {
+        Outcome::Invalid => {
             let reason = ctx.intern_atom("invalid")?;
             error_tuple(ctx, reason)
         }
-        PacketLength::More(None) => {
+        Outcome::More(None) => {
             let reason = ctx.intern_atom("undefined")?;
             more_tuple(ctx, reason)
         }
-        PacketLength::More(Some(len)) => {
+        Outcome::More(Some(len)) => {
             let len = ctx.int(len as i64)?;
             more_tuple(ctx, len)
         }
-        PacketLength::Packet { packet_sz, header_len } => {
+        Outcome::Ok { packet_sz, body } => {
             if packet_sz == 0 || packet_sz > bytes.len() {
                 // `erl_bif_port.c:1564-1569`: `{more, PacketSz}` (or `undefined`
                 // for the degenerate zero length) — never a partial packet.
@@ -198,9 +224,13 @@ fn decode_packet_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
             } else {
                 // A whole packet: the body (`packet_get_body`) and the remainder.
                 let ok = ctx.intern_atom("ok")?;
-                let body = bits::make_binary(ctx.heap(), &bytes[header_len..packet_sz])?;
+                let packet = match body {
+                    // `start <= end <= packet_sz` is the `Body::Binary` contract.
+                    Body::Binary { start, end } => bits::make_binary(ctx.heap(), &bytes[start..end])?,
+                    Body::Term(term) => term,
+                };
                 let rest = bits::make_binary(ctx.heap(), &bytes[packet_sz..])?;
-                let elems = [ok, body, rest];
+                let elems = [ok, packet, rest];
                 ctx.tuple(&elems)
             }
         }
@@ -223,9 +253,10 @@ fn more_tuple(ctx: &mut BifContext<'_>, required: Eterm) -> Result<Eterm> {
 
 /// The `Type` switch (`erl_bif_port.c:1492-1511`).
 ///
-/// The four integer types and the packet-type atoms are accepted; the valid but
-/// unimplemented atoms are [`PacketType::Unimplemented`]; everything else is the
-/// oracle's `badarg`.
+/// The four integer types and all eleven packet-type atoms are accepted — each
+/// valid type maps to its own [`PacketType`], so that the unimplemented ones are
+/// recognised (not a `badarg`) and reported as the typed capability gap by their
+/// family parser. Everything else is the oracle's `badarg`.
 fn resolve_type(ctx: &BifContext<'_>, term: Eterm) -> Result<PacketType> {
     if access::is_small(term) {
         return match signed_value(term) {
@@ -241,13 +272,16 @@ fn resolve_type(ctx: &BifContext<'_>, term: Eterm) -> Result<PacketType> {
     match atom_name(ctx, term) {
         Some("raw") => Ok(PacketType::Raw),
         Some("line") => Ok(PacketType::Line),
-        // Valid packet types (`packet_parser.h:34-50`) this Milestone does not
-        // implement: recognised so they are not a `badarg`, then reported as the
-        // typed capability gap.
-        Some(
-            "asn1" | "sunrm" | "cdr" | "fcgi" | "tpkt" | "http" | "httph" | "http_bin"
-            | "httph_bin" | "ssl_tls",
-        ) => Ok(PacketType::Unimplemented),
+        Some("asn1") => Ok(PacketType::Asn1),
+        Some("sunrm") => Ok(PacketType::Sunrm),
+        Some("cdr") => Ok(PacketType::Cdr),
+        Some("fcgi") => Ok(PacketType::Fcgi),
+        Some("tpkt") => Ok(PacketType::Tpkt),
+        Some("ssl_tls") => Ok(PacketType::SslTls),
+        Some("http") => Ok(PacketType::Http),
+        Some("httph") => Ok(PacketType::HttpH),
+        Some("http_bin") => Ok(PacketType::HttpBin),
+        Some("httph_bin") => Ok(PacketType::HttpHBin),
         _ => Err(badarg()),
     }
 }
@@ -322,78 +356,6 @@ fn atom_name<'a>(ctx: &'a BifContext<'_>, term: Eterm) -> Option<&'a str> {
         return None;
     }
     ctx.atoms().name(atom_val(term))
-}
-
-// ---------------------------------------------------------------------------
-// Length extraction (`packet_get_length`, packet_parser.c:248-501)
-// ---------------------------------------------------------------------------
-
-/// `packet_get_length` for the six implemented types.
-fn packet_length(packet_type: PacketType, bytes: &[u8], opts: &Options) -> PacketLength {
-    match packet_type {
-        PacketType::Raw => {
-            // `packet_parser.c:258-263`: the whole buffer is one packet (so
-            // `packet_size`/`line_length` never apply), an empty buffer is `more`.
-            if bytes.is_empty() {
-                PacketLength::More(None)
-            } else {
-                PacketLength::Packet { packet_sz: bytes.len(), header_len: 0 }
-            }
-        }
-        PacketType::Len1 => length_prefix(1, bytes, opts),
-        PacketType::Len2 => length_prefix(2, bytes, opts),
-        PacketType::Len4 => length_prefix(4, bytes, opts),
-        PacketType::Line => line_length(bytes, opts),
-        // Handled by `decode_packet_3` before this point.
-        PacketType::Unimplemented => PacketLength::Invalid,
-    }
-}
-
-/// `TCP_PB_1`/`TCP_PB_2`/`TCP_PB_4`: a big-endian length prefix of `hlen` bytes,
-/// then the `remain:` label (`packet_parser.c:265-284, 486-494`).
-fn length_prefix(hlen: usize, bytes: &[u8], opts: &Options) -> PacketLength {
-    if bytes.len() < hlen {
-        return PacketLength::More(None);
-    }
-    let plen = match hlen {
-        1 => u64::from(bytes[0]),
-        2 => u64::from(u16::from_be_bytes([bytes[0], bytes[1]])),
-        _ => u64::from(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
-    };
-    // The default ceiling is `INT_MAX - hlen`, so `hlen + plen` never overflows.
-    let max_plen = if opts.max_plen == 0 { INT_MAX - hlen as u64 } else { opts.max_plen };
-    if plen > max_plen {
-        return PacketLength::Invalid;
-    }
-    PacketLength::Packet { packet_sz: hlen + plen as usize, header_len: hlen }
-}
-
-/// `TCP_PB_LINE_LF` (`packet_parser.c:295-322`).
-fn line_length(bytes: &[u8], opts: &Options) -> PacketLength {
-    let n = bytes.len() as u64;
-    match bytes.iter().position(|&b| b == opts.delimiter) {
-        None => {
-            if opts.max_plen != 0 && n > opts.max_plen {
-                PacketLength::Invalid
-            } else if opts.trunc_len != 0 && n >= opts.trunc_len {
-                // The buffer is full: the first `trunc_len` bytes are the packet.
-                PacketLength::Packet { packet_sz: opts.trunc_len as usize, header_len: 0 }
-            } else {
-                PacketLength::More(None)
-            }
-        }
-        Some(pos) => {
-            let len = pos as u64 + 1; // including the delimiter
-            if opts.max_plen != 0 && len > opts.max_plen {
-                PacketLength::Invalid
-            } else if opts.trunc_len != 0 && len > opts.trunc_len {
-                // A too-long terminated line is truncated to `trunc_len`.
-                PacketLength::Packet { packet_sz: opts.trunc_len as usize, header_len: 0 }
-            } else {
-                PacketLength::Packet { packet_sz: len as usize, header_len: 0 }
-            }
-        }
-    }
 }
 
 /// Registers `erlang:decode_packet/3` (`bif.tab:503`).
