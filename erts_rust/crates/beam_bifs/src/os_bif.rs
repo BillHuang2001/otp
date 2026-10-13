@@ -65,8 +65,8 @@
 //! `native` in nanoseconds. A ratio that fits a small integer converts in `i128`;
 //! a **positive bignum** is the C's `default` arm, handed to
 //! `erlang:convert_time_unit/3` and converted in arbitrary precision
-//! ([`convert_big_unit`]) — `os:system_time(1 bsl 200)` is the oracle's bignum,
-//! never a capability gap. A zero or negative small integer, a **negative**
+//! ([`crate::time::convert_unit_big`]) — `os:system_time(1 bsl 200)` is the oracle's
+//! bignum, never a capability gap. A zero or negative small integer, a **negative**
 //! bignum (the C's `big_sign`), a float or any other term is `badarg`.
 //!
 //! # Environment model
@@ -389,7 +389,7 @@ enum OsUnit {
     /// A caller-supplied **positive bignum**: that many target units per second,
     /// held as a little-endian `u64` magnitude — the C's `default` arm, which
     /// `trap_to_erlang_code` converts in arbitrary precision
-    /// (`erl_time_sup.c:2333-2352`, [`convert_big_unit`]).
+    /// (`erl_time_sup.c:2333-2352`, [`crate::time::convert_unit_big`]).
     PerSecondBig(Vec<u64>),
 }
 
@@ -412,7 +412,7 @@ fn convert_per_second(native: i64, per_second: i128) -> i128 {
 /// [`BeamError::BadArg`] for anything else: a zero or negative small integer, a
 /// float, a list, an unrecognized atom, and a **negative** bignum (the C's
 /// `big_sign`). A *positive* bignum is a legal unit ([`OsUnit::PerSecondBig`]);
-/// only a product past the bignum cap is `badarg` ([`convert_big_unit`]).
+/// only a product past the bignum cap is `badarg` ([`crate::time::convert_unit_big`]).
 fn os_unit(ctx: &mut BifContext<'_>, term: Eterm) -> Result<OsUnit> {
     if is_small(term) {
         let value = signed_value(term);
@@ -447,77 +447,12 @@ fn os_unit(ctx: &mut BifContext<'_>, term: Eterm) -> Result<OsUnit> {
     Err(badarg())
 }
 
-/// The **bignum** unit conversion: `native * per_second div 1_000_000_000`,
-/// exact and floor-rounded in arbitrary precision.
-///
-/// This is the C's `trap_to_erlang_code` arm (`erl_time_sup.c:2343-2352`), which
-/// hands the conversion to `erlang:convert_time_unit/3` — `TU * Time div FU` with
-/// `FU = 1_000_000_000` and `TU` the unit, plus the `TU*Time - (FU - 1)`
-/// adjustment that turns the truncating `div` into a floor for a negative `Time`
-/// (`erlang.erl:5368-5377`). The arithmetic is the crate's registered
-/// `erlang:'*'/2`, `erlang:'-'/2` and `erlang:'div'/2` implementations
-/// ([`arithmetic_operators`]): one exact bignum multiply and one exact divide, so
-/// no bignum math is written a second time. [`crate::time`]'s `convert_unit_big`
-/// is the same chain for the `erlang` clocks; that helper is private and this
-/// module may not edit it, so the two stand side by side.
-///
-/// # Errors
-///
-/// [`BeamError::BadArg`] for a product past the `BIG_ARITY_MAX` limb cap — the one
-/// arithmetic failure left here (both operands are integers, the divisor is
-/// `1_000_000_000`) and the class the oracle reports too: its
-/// `convert_time_unit/3` body runs inside `try ... catch _:_ -> badarg`, so the
-/// `system_limit` of an oversized product surfaces as `badarg`
-/// (`os:system_time(1 bsl 4194239)` ⇒ `badarg` in the oracle and here).
-fn convert_big_unit(ctx: &mut BifContext<'_>, native: i64, per_second: &[u64]) -> Result<Eterm> {
-    let operators = arithmetic_operators();
-    let native_term = arith::int_from_i64(ctx, native)?;
-    let per_second_term = arith::int_from_mag(ctx, false, per_second)?;
-    let product = operators
-        .call("erlang", "*", 2, ctx, &[native_term, per_second_term])
-        .map_err(trap_arith_class)?;
-    let numerator = if native < 0 {
-        let adjust = arith::int_from_i64(ctx, 1_000_000_000 - 1)?;
-        operators
-            .call("erlang", "-", 2, ctx, &[product, adjust])
-            .map_err(trap_arith_class)?
-    } else {
-        product
-    };
-    let divisor = arith::int_from_i64(ctx, 1_000_000_000)?;
-    operators
-        .call("erlang", "div", 2, ctx, &[numerator, divisor])
-        .map_err(trap_arith_class)
-}
-
-/// The crate's registered `erlang` arithmetic operators, for the
-/// arbitrary-precision conversion a bignum unit needs ([`convert_big_unit`]).
-///
-/// Built once from [`crate::arith::register`] — the same `fn`s
-/// [`BifRegistry::with_core_bifs`] installs — so the multi-limb multiply and the
-/// Knuth-D divide stay the crate's single implementation; the registry (rather
-/// than `crate::arith`'s private helpers) is the arithmetic entry point a
-/// [`BifContext`] can be handed to, exactly as the runtime dispatches them.
-fn arithmetic_operators() -> &'static BifRegistry {
-    static OPERATORS: OnceLock<BifRegistry> = OnceLock::new();
-    OPERATORS.get_or_init(|| {
-        let mut operators = BifRegistry::new();
-        arith::register(&mut operators);
-        operators
-    })
-}
-
-/// The error class `erlang:convert_time_unit/3` reports: its whole body runs
-/// inside `try ... catch _:_ -> error_with_info(badarg, ...)`
-/// (`erlang.erl:5378-5380`), so the `system_limit` an oversized product raises
-/// surfaces as `badarg`. Any other error is a genuine capability gap and is
-/// passed through untouched.
-fn trap_arith_class(error: BeamError) -> BeamError {
-    match error {
-        BeamError::BadArith | BeamError::SystemLimit => badarg(),
-        other => other,
-    }
-}
+// The bignum-unit conversion is shared with the `erlang` clocks:
+// `crate::time::convert_unit_big` owns the single `TU * Time div FU`
+// arbitrary-precision chain (`crate::arith`'s registered operators) that both
+// `os:system_time/1` and `erlang:monotonic_time/1`/`system_time/1`/
+// `time_offset/1` run — see its docs for the floor adjustment and the
+// `BIG_ARITY_MAX` `badarg`.
 
 /// An arbitrarily large non-negative result: a small int when it fits, else a
 /// heap bignum (the promotion convention of [`crate::arith`]).
@@ -595,12 +530,12 @@ fn os_system_time_0(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> 
 ///
 /// The unit's ratio is a machine integer for every atom and for a small positive
 /// integer ([`convert_per_second`]), and arbitrary precision for a **positive
-/// bignum** ([`convert_big_unit`]).
+/// bignum** ([`crate::time::convert_unit_big`]).
 fn os_system_time_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let native = system_native()?;
     match os_unit(ctx, args[0])? {
         OsUnit::PerSecond(per_second) => int_from_i128(ctx, convert_per_second(native, per_second)),
-        OsUnit::PerSecondBig(per_second) => convert_big_unit(ctx, native, &per_second),
+        OsUnit::PerSecondBig(per_second) => crate::time::convert_unit_big(ctx, native, &per_second),
     }
 }
 
@@ -904,7 +839,8 @@ mod tests {
             (0, &per_second_200, "0"),
             (1_500_000_000_000_000_000, &per_second_61, "3458764513820540928000000000"),
         ] {
-            let term = convert_big_unit(&mut ctx, native, per_second).expect("a legal unit");
+            let term =
+                crate::time::convert_unit_big(&mut ctx, native, per_second).expect("a legal unit");
             assert_eq!(decimal(term), expected, "{native} ns with the unit {per_second:?}");
         }
     }
@@ -927,12 +863,13 @@ mod tests {
         let OsUnit::PerSecondBig(per_second) = os_unit(&mut ctx, unit).expect("a legal unit") else {
             panic!("a 4194239-bit unit must take the bignum arm");
         };
-        let term = convert_big_unit(&mut ctx, 1, &per_second).expect("the largest legal unit");
+        let term =
+            crate::time::convert_unit_big(&mut ctx, 1, &per_second).expect("the largest legal unit");
         let (negative, digits) = beam_codec::term::big_parts(term).expect("a bignum");
         assert!(!negative, "a positive reading converts to a positive value");
         assert_eq!(digits.len(), 65_535, "`1 bsl 4194239 div 1e9` still fills the cap");
         assert!(matches!(
-            convert_big_unit(&mut ctx, 1_500_000_000_000_000_000, &per_second),
+            crate::time::convert_unit_big(&mut ctx, 1_500_000_000_000_000_000, &per_second),
             Err(BeamError::BadArg)
         ));
     }
