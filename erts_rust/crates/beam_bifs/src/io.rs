@@ -1840,7 +1840,7 @@ mod tests {
     use super::*;
     use crate::print::flatten;
     use beam_alloc::Heap;
-    use beam_common::{BeamError, ExceptionClass, ExitReason};
+    use beam_common::BeamError;
     use beam_process::ProcessId;
     use beam_term::{atom_val, make_small, AtomTable, NIL};
 
@@ -3022,25 +3022,122 @@ mod tests {
     }
 
     #[test]
-    fn io_lib_format_3_chars_limit_refuses_a_string_control() {
-        // `~s` of a list/binary under an *active* limit is not ported: it stays the
-        // typed, *catchable* `unsupported_bif`, never a wrong (unlimited or
-        // wrongly elided) rendering. `unsupported_bif` is a plain
-        // `BeamError::Raise`, i.e. what a BEAM `catch` sees as
-        // `error:unsupported_bif`.
-        for limit in [0, 5, 100] {
-            let result = run_limited("~s", limit, |ctx| {
-                let bytes = byte_list(ctx, b"abc");
-                ctx.list(&[bytes]).expect("fits")
-            });
-            match result {
-                Err(BeamError::Raise(raise)) => {
-                    assert_eq!(raise.reason, ExitReason::atom("unsupported_bif"));
-                    assert_eq!(raise.class, ExceptionClass::Error);
-                }
-                other => panic!("limit {limit}: expected the typed ~s gap, got {other:?}"),
-            }
+    fn io_lib_format_3_chars_limit_limits_a_string_control() {
+        // `~s` of a **list** under an active limit is a "big" control: its text is
+        // limited to the per-directive budget and elided with `"..."`.
+        // `io_lib:format("~s", ["hello world!!"], [{chars_limit,10}])` on the oracle
+        // is `["hello w..."]`, i.e. the deep list
+        // `[[104,101,108,108,111,32,119,46,46,46]]`.
+        let (text, shape) = run_limited("~s", 10, |ctx| {
+            let s = byte_list(ctx, b"hello world!!");
+            ctx.list(&[s]).expect("fits")
+        })
+        .expect("renders");
+        assert_eq!(text, "hello w...");
+        assert_eq!(shape, "[[104,101,108,108,111,32,119,46,46,46]]");
+
+        // A budget the text fits into keeps it whole; a `0` budget still probes a
+        // further four characters (the oracle's `final` mode), so a 3-character
+        // string survives every budget. `~s` of "abc" is `[[97,98,99]]` throughout.
+        for limit in [0, 3, 100] {
+            let (text, shape) = run_limited("~s", limit, |ctx| {
+                let s = byte_list(ctx, b"abc");
+                ctx.list(&[s]).expect("fits")
+            })
+            .unwrap_or_else(|err| panic!("limit {limit}: {err:?}"));
+            assert_eq!(text, "abc", "limit {limit}");
+            assert_eq!(shape, "[[97,98,99]]", "limit {limit}");
         }
+
+        // A negative budget is the unlimited path (byte-identical to `format/2`).
+        let (text, shape) = run_limited("~s", -1, |ctx| {
+            let s = byte_list(ctx, b"hello world!!");
+            ctx.list(&[s]).expect("fits")
+        })
+        .expect("renders");
+        assert_eq!(text, "hello world!!");
+        assert_eq!(shape, "[[104,101,108,108,111,32,119,111,114,108,100,33,33]]");
+
+        // The directive's field width is clamped to the budget (`limit_field/2`):
+        // `io_lib:format("~8s", ["abc"], [{chars_limit,6}])` is `[["   ",97,98,99]]`.
+        let (text, shape) = run_limited("~8s", 6, |ctx| {
+            let s = byte_list(ctx, b"abc");
+            ctx.list(&[s]).expect("fits")
+        })
+        .expect("renders");
+        assert_eq!(text, "   abc");
+        assert_eq!(shape, "[[[32,32,32],97,98,99]]");
+
+        // A field width below 3 is raised to 3 (`limit_field`'s floor) and the text
+        // is truncated to it: `~2s` of "hello" with limit 10 is `["hel"]`.
+        let (text, shape) = run_limited("~2s", 10, |ctx| {
+            let s = byte_list(ctx, b"hello");
+            ctx.list(&[s]).expect("fits")
+        })
+        .expect("renders");
+        assert_eq!(text, "hel");
+        assert_eq!(shape, "[[104,101,108]]");
+
+        // A precision truncates the limited text without a field: `~.2s` of "hello"
+        // with limit 10 is `["he"]`.
+        let (text, shape) = run_limited("~.2s", 10, |ctx| {
+            let s = byte_list(ctx, b"hello");
+            ctx.list(&[s]).expect("fits")
+        })
+        .expect("renders");
+        assert_eq!(text, "he");
+        assert_eq!(shape, "[[104,101]]");
+
+        // The literal text is charged against the budget first and is never elided:
+        // `io_lib:format("hello ~s world", ["abcdefghij"], [{chars_limit,10}])`
+        // elides only the `~s` (`[104,…,32,[46,46,46],32,…]`, "hello ... world").
+        let (text, shape) = run_limited("hello ~s world", 10, |ctx| {
+            let s = byte_list(ctx, b"abcdefghij");
+            ctx.list(&[s]).expect("fits")
+        })
+        .expect("renders");
+        assert_eq!(text, "hello ... world");
+        assert_eq!(
+            shape,
+            "[104,101,108,108,111,32,[46,46,46],32,119,111,114,108,100]"
+        );
+
+        // `~s` and `~w` share the `w` bucket, so `~s ~w` with `{chars_limit,6}`
+        // splits the budget: the `~s` gets 3, the `~w` the rest, and each elides its
+        // own overflow (`[[97,98,99],32,[91,[46,46,46],93]]`, "abc [...]").
+        let (text, shape) = run_limited("~s ~w", 6, |ctx| {
+            let s = byte_list(ctx, b"abc");
+            let l = int_list(ctx, &[1, 2, 3]);
+            ctx.list(&[s, l]).expect("fits")
+        })
+        .expect("renders");
+        assert_eq!(text, "abc [...]");
+        assert_eq!(shape, "[[97,98,99],32,[91,[46,46,46],93]]");
+
+        // An invalid `~s` iolist is `badarg` (the oracle's `function_clause`), never
+        // a wrong rendering: an improper tail, a float element and an out-of-range
+        // integer element.
+        let improper = run_limited("~s", 5, |ctx| {
+            // `[97,98|99]`.
+            let tail = ctx.cons(ctx.int(98).expect("fits"), ctx.int(99).expect("fits"))
+                .expect("fits");
+            let list = ctx.cons(ctx.int(97).expect("fits"), tail).expect("fits");
+            ctx.list(&[list]).expect("fits")
+        });
+        assert!(matches!(improper, Err(BeamError::BadArg)));
+        let float = run_limited("~s", 5, |ctx| {
+            // `[1.5]` — a float element.
+            let f = ctx.make_float(1.5).expect("fits");
+            let inner = ctx.cons(f, NIL).expect("fits");
+            ctx.list(&[inner]).expect("fits")
+        });
+        assert!(matches!(float, Err(BeamError::BadArg)));
+        let big = run_limited("~s", 5, |ctx| {
+            // `[400]` — an integer outside the byte range.
+            let inner = ctx.cons(ctx.int(400).expect("fits"), NIL).expect("fits");
+            ctx.list(&[inner]).expect("fits")
+        });
+        assert!(matches!(big, Err(BeamError::BadArg)));
 
         // `~s` of an **atom** is a *small* control, so it stays supported: its
         // characters are spliced flat and no control is budgeted.
