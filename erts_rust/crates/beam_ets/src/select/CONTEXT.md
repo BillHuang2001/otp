@@ -179,6 +179,79 @@ its compiled-opcode program. The interior is a Rust AST, not a term program.
   output compared against the crate's own evaluation (oracle required by default; loud
   skip when `erl`/`erlc` is absent).
 
+## Map pattern / guard / body — oracle parity (probed)
+Systematically probed against the live system `erl` (OTP 29.1.1 / erts-17.1) with
+`ets:select/2`, `ets:select_replace/2` and `erlang:match_spec_test/3`; **every case
+agrees** with this crate — no behaviour change was needed. The rules the probes pinned
+(the C `db_match_compile` head-map path at `erl_db_util.c:1783-1859`, the `dmc_map`
+constructor, the `db_match_keeps_key` static check):
+- a head map's **keys stay literal** and are checked **only at the top level** of each
+  key: a key term that *is directly* a `'$N'` atom or `'_'` is `badarg` (at every
+  nesting depth reached by the structural walk), while a `'$N'`/`'_'` **nested inside a
+  compound key** (a tuple/list/map key) is an **ordinary literal** (`#{{'$2',b} => '_'}`
+  is a literal-key head, not an error);
+- a head map's **values** match **structurally** (wildcard/variable/literal/tuple/list/
+  nested-map), and an object with **extra keys** still matches; `#{}` matches any map;
+  non-atom keys (integer, float, tuple, bignum, binary, empty-map, list) are legal and
+  compared exactly (`1` and `1.0` are distinct map keys);
+- a map **expression** in a guard/body is **constructed** (`dmc_map`): keys/values may be
+  variables; a **tuple key** needs the `{{ … }}` double-tuple form (`#{ {'$1','$2'} => 1 }`
+  is `badarg`, `#{ {{'$1','$2'}} => 1 }` builds `#{{1,2} => 1}`), while a **list key** is
+  built by the ordinary list-construction form;
+- `map_get/2` with an absent key is `badarg`; `map_get/3` is `badarg`; `map_size/1`/
+  `is_map_key/2` on a non-map is `badarg` (so the guard clause is skipped, per the
+  guard-error classification);
+- `select_replace/2` accepts a map in a `{{ … }}` body **only** when the body's key is
+  provably the head's key; a bare map body is `badarg`.
+Evidence: the probe program `$TMPDIR/ets_probe/pmap.erl` (21 cases, `cap/1` wrapper);
+the reference rendering is recorded in the handoff below.
+
+## Trace dialect (`erlang:match_spec_test/3`, `Type = trace`) — LEFT-OPEN
+The trace dialect is **not implemented** here and is left open with proof, per the
+"do not fake it" rule; a typed `unsupported` is the honest answer.
+- **Why it is large.** `match_spec_test(...trace...)` needs (a) the trace dialect's
+  `db_match_set_lint`/`db_match_set_compile` (`erl_db_util.c:1568-1605`: a **list** head
+  is rewritten to a **tuple** of its elements, with a trailing `'_'` becoming a
+  *prefix* flag — `matchArrayPrefix`, `erl_db_util.c:2293`), (b) the trace **runner**
+  `erts_match_set_run_trace` → `db_prog_match` over an **args array** (`erl_db_util.c:1631`),
+  and (c) the trace-only special forms `message`, `return_trace`, `exception_trace`,
+  `display`, `process_dump`, `enable_trace`/`disable_trace`/`trace`, `caller`/`caller_line`/
+  `current_stacktrace`, `silent`, `is_seq_trace`/`set_seq_token`/`get_seq_token` and the
+  `tcw` ops `get_tcw` (arity 0) / `set_tcw` (arity 1) / `set_tcw_fake` (arity 1)
+  (`erl_db_util.c:4855-5555`; the `guard_tab` entries at `:958-975` carry
+  `DBIF_TRACE_GUARD`/`DBIF_TRACE_BODY`, so the **table** dialect rejects them). The
+  return shape `{ok, Return, Flags, Errors}` folds the run in (`Return` is the match
+  result / `{message,_}` value, `Flags` the accumulated `MATCH_SET_{RETURN,EXCEPTION}_TRACE`
+  bits, `erl_db_util.c:6125-6155`), so a *lint-only* subset cannot answer it.
+- **Evidence (live `erl`).** With the correct 3-tuple clause shape `{Head,Guards,Body}`:
+  `match_spec_test([1,2],[{{'$1','$2'},[],[ok]}],trace)` ⇒ `{ok,true,[],[]}`;
+  `…[{'_',[],[ok]}]…` ⇒ `{ok,true,[],[]}`; `…[{{'$1','$2'},[],[{return_trace}]}]…` ⇒
+  `{ok,true,[return_trace],[]}`; `…[{message,hello}]…` ⇒ `{ok,hello,[],[]}`;
+  `…[{{'$1','$2'},[{'=:=','$1',9}],[matched]}]…` ⇒ `{ok,false,[],[]}`; and the same specs
+  with `Type = table` reject a **list** `Against` (`badarg`), as do all non-list `Against`
+  values for `trace`. Malformed shapes give the lint errors
+  `{error,[{error,"Match programs are not in a list."}]}`,
+  `{error,[{error,"Match program part is not a tuple of arity 3."}]}` (a 2-tuple clause, an
+  `is_list` head such as `([a|'_'])`, …), and an unknown/ill-arity guard op gives
+  `{error,[{error,"Function <name>/<arity> does_not_exist."}]}`. Probe programs:
+  `$TMPDIR/ets_probe/probe6.erl`, `$TMPDIR/ets_probe/probe3.erl`.
+- **Not shipped as dead code.** A partial trace lint implemented here would have **no
+  caller**: the `erlang:match_spec_test/3` BIF lives in the **sibling** `beam_bifs`
+  (`crates/beam_bifs/src/match_spec.rs`), where `Some("trace")` returns the typed
+  `unsupported_bif()`. Wiring it needs a sibling edit (out of this node's scope), so the
+  dialect stays open with the evidence above rather than an unreachable stub.
+
+## Handoff — `beam_bifs` sibling wiring (NOT done here)
+`crates/beam_bifs/src/match_spec.rs` is a **read-only sibling** for this node; two
+changes are owed there (report, do not apply):
+1. **Stale head-map refusal.** `test_table` → `head_mentions_a_map`/`term_mentions_a_map`
+   refuses **any** head map with `unsupported_bif()`. That is now stale/over-conservative:
+   `beam_ets` fully implements head maps (this section), so the table dialect should stop
+   refusing them and delegate to `beam_ets::select::compile`.
+2. **Trace dialect.** `Some("trace")` should remain `unsupported_bif()` until the trace
+   sub-system above is implemented; the exact `{ok,…}`/`{error,…}` shape and the lint
+   strings are recorded above for whoever picks it up.
+
 ## Routing Table
 - `mod.rs` → `MatchSpec`/`MatchClause`/`compile`/`SelectPredicate` + term-decode helpers (`atom_name`, `var_index`, `tuple_elements`, `list_elements`)
 - `pattern.rs` → `Pattern` + head decode/match
