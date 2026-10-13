@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "tool": "bench",
+  "tool_version": "0.1.0",
+  "generated_at_unix_ms": 1791903180236,
+  "profile": "quick",
+  "runtimes": [
+    {
+      "kind": "sys",
+      "program": "/nix/store/khp1dd3fk8476mwg62cinwvk5a17r53s-erlang-29.1.1/lib/erlang/erts-17.1/bin/erl",
+      "version": "29",
+      "supported": true,
+      "notes": []
+    }
+  ],
+  "results": [
+    {
+      "workload": "plb",
+      "runtime": "sys",
+      "category": "compute",
+      "description": "Programming-Language-Benchmarks kernels via the dotnet tool",
+      "status": "ok",
+      "reason": null,
+      "metrics": [
+        {
+          "name": "wall_ms",
+          "unit": "ms",
+          "value": 72613.24235799999
+        },
+        {
+          "name": "test_time_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 10,
+            "min": 0.0,
+            "max": 3978.3289,
+            "mean": 1309.5019,
+            "p50": 601.66275,
+            "p90": 3227.2164399999997,
+            "p99": 3903.217654
+          }
+        },
+        {
+          "name": "test_mem_bytes",
+          "unit": "bytes",
+          "value": 92782592.0
+        }
+      ],
+      "peak_memory_bytes": 170004480,
+      "notes": [
+        "build stage ok (dotnet --task build took 19112 ms)",
+        "rejected dotnet 8.0.425 at /nix/store/9ql2v7xa762qgibgrq84prdz4sl212c7-dotnet-sdk-8.0.425/bin/dotnet (PATH): requires >= 9",
+        "rejected dotnet 8.0.425 at /nix/store/9ql2v7xa762qgibgrq84prdz4sl212c7-dotnet-sdk-8.0.425/bin/dotnet (nix-store): requires >= 9",
+        "rejected dotnet 8.0.425 at /nix/store/qybc3wpz3hz5daipbmnj7rgc73hn35j2-dotnet-sdk-wrapped-8.0.425/bin/dotnet (nix-store): requires >= 9",
+        "resolved dotnet 9.0.318 at /nix/store/abbkzygy9aix7b6m9vqlm1xw766mlrf1-dotnet-sdk-9.0.318/bin/dotnet (nix-store)"
+      ]
+    }
+  ]
+}

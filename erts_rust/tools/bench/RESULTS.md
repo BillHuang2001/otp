@@ -6,10 +6,13 @@ A workload that could not run is reported with a *verified* reason and **no numb
 
 Measured on the host in §1 on **2026-10-13, 13:25–14:10 UTC** (the span of the artifacts' own `generated_at_unix_ms`: `m9-bench-plb.json` 13:25:38 → `m9-bench-emqx.json` 14:09:45).
 Raw harness JSON is committed under `results/` as `m9-*`; the previous runs are kept as `m6-*` (2026-10-11), `m5-*` (2026-10-09) and `m4-*` (2026-10-08) and are the regression baselines for the delta section (§7).
+A **later same-session smoke sub-run (2026-10-13, 14:49–14:53 UTC)** re-checked the two tool-driven targets after the tool-resolution fix (§4.1–§4.3): `plb` now **runs** and `emqx` keeps its skip. Those are smoke runs (one workload each, `--quick`), archived as `m9-bench-plb-smoke*.json` / `m9-bench-emqx-smoke.json`; they are **not** a re-measurement of the m9 figures above.
+
+> **This is a shared, usually-loaded host** (§1, §6.1): absolute latencies/throughputs move several-fold with load, so **ratios are the signal** and a single contended sample is never a constant. §4.1's two smoke rows illustrate it directly — the same code, run 2 minutes apart at 1-min loads 6.2/12.5 and 10.6/34.7, gave 73.6 s vs 72.6 s wall. Do **not** re-measure the m9 headline figures to "refresh" them; a full re-measure is a later, deliberate milestone (the engine/BIF/allocator work has not landed yet).
 
 ## Verdict
 
-**(a) / (b) Which targets run, which skip.** Four of the six external target projects run; one (`plb`) is `failed` for a verified environment reason and one (`emqx`) skips with a verified toolchain reason (neither is ever a fabricated number).
+**(a) / (b) Which targets run, which skip.** Five of the six external target projects run; one (`emqx`) skips with a verified toolchain reason (never a fabricated number). `plb`, which the m9 measurement run recorded as `failed`, now **runs** after the tool-resolution fix (§4.1) — each outcome below carries its own date, because the target-resolvability is tool/environment state, not repository state.
 
 | target project | runs? | result / verified reason |
 |---|---|---|
@@ -17,8 +20,8 @@ Raw harness JSON is committed under `results/` as `m9-*`; the previous runs are 
 | `cowboy` (HTTP server) | **runs** | `ok` — 220 143.53 req/s, p50 0.0639 ms / p99 0.2764 ms (§4.4) |
 | `erlc_compiler` (Erlang compiler) | **runs** | `ok` — 9.844 files/s over the stdlib+Elixir corpus (§4.5) |
 | `elixir_compiler` (Elixir compiler) | **runs** | `ok` — 4.579 files/s over 105 sources / 223 `.beam` (§4.6) |
-| `plb` (Benchmarks Game kernels, .NET) | **fails** | `failed(plb-build-failed)` — the `dotnet` on `PATH` is SDK **8.0.425** while the PLB elixir env targets `net9.0` ⇒ instant `NETSDK1045` (§4.1, §5) |
-| `emqx` (MQTT broker) | **skips** | `skipped(emqx-requires-otp-28)` — EMQX pins OTP 28, the host `erl` is OTP 29 (§4.3, §5) |
+| `plb` (Benchmarks Game kernels, .NET) | **runs** | `ok` (2026-10-13 14:49–14:53 UTC smoke) — version-aware tool resolution picks the store's `dotnet` 9.0.318 and builds the `net9` env (§4.1). *The m9 measurement run itself recorded `failed(plb-build-failed)`: the `dotnet` on `PATH` then was 8.0.425* |
+| `emqx` (MQTT broker) | **skips** | `skipped(emqx-requires-otp-28)` — EMQX pins OTP **28.5.0.7-2** (`env.sh:3`/`.tool-versions:1`), the host `erl` is OTP 29.1.1 / erts-17.1; not satisfiable without a full OTP-28 toolchain swap (§4.3, §5) |
 
 The six workloads the Rust runtime itself can host (`Runtimes::Both`) — `baseline`, `slice`, `foreign`, `list_walk`, `copy_bound`, `gc_bound` — all ran: **12/12 rows `ok`** (0 skipped, 0 unsupported, 0 failed). Every other workload is `SysOnly` and would report `skipped(runtime-unsupported)` under `rust` (§5).
 
@@ -83,7 +86,7 @@ The driver exercises the messaging/copy, ETF, ETS and GC surfaces named in the t
 | `erlc` | OTP 29.1.1 (on `PATH`) |
 | `elixirc` | **Elixir 1.20.4** (compiled with Erlang/OTP 29) |
 | `rebar3` | **3.27.1**, resolved from the Nix store by the driver's **store scan** (**not** on `PATH`); its shebang runs it under **Erlang/OTP 28** — see the honesty note on `runtimes[]` version reporting |
-| `dotnet` | **8.0.425, on `PATH`** (`/run/current-system/sw/bin/dotnet`) — the store also holds a 9.0.318 SDK, but **step 1 (`PATH`) wins before the version-ranked store scan**, so `plb`'s `net9.0` build aborts with `NETSDK1045` (§4.1, §5) |
+| `dotnet` | **9.0.318, on `PATH`** (`/run/current-system/sw/bin/dotnet` → store `dotnet-sdk-wrapped-9.0.318`), **as of the 14:49–14:53 UTC smoke sub-run**. During the m9 measurement run (13:25–14:10) the `PATH` `dotnet` was **8.0.425**, which shadowed the store's 9.0.318 SDK (the old policy consulted `PATH` before the store scan) and made `plb`'s `net9.0` build abort with `NETSDK1045` (§4.1). The store holds both an 8.0.425 and a 9.0.318 SDK; the driver now resolves the version-constrained tool by **version**, not source order (§4.1, §5) |
 | `clang` | **21.1.8**, on `PATH` |
 | `$BENCH_TRY_NIX` | not needed and not set for the m9 runs — the store scan resolves `rebar3` locally (§4.2) |
 | `$HOME` | read-only (`touch` fails with `Read-only file system`) — relevant to `plb` |
@@ -283,15 +286,54 @@ All absolute values in this section are inflated by the varied host load (§1) a
 
 ### 4.1 `plb` — Programming-Language-Benchmarks (dotnet)
 
-`plb` **does not run** in this environment: `failed(plb-build-failed)`, with no number fabricated (the ~1.3 s attempt produced only a build error). The `--quick` attempt resolved the **`dotnet` on `PATH`, SDK 8.0.425**, and the PLB elixir environment targets **`net9.0`**, so `dotnet --task build` died instantly with `NETSDK1045`:
+**Current state: `plb` runs.** The m9 measurement run recorded `failed(plb-build-failed)` (§7.1) — a **tool-resolution** defect, not a PLB bug, and it is now fixed.
+
+**The defect (m9).** The shared tool policy (`src/workloads/tool.rs`) consulted **`PATH` first** and only then the version-ranked Nix-store scan, so a too-old `dotnet` on `PATH` **shadowed** the store's 9.0.318 SDK — the store scan was never consulted — and the `net9.0` build died instantly with `NETSDK1045`:
 
 ```
 error NETSDK1045: The current .NET SDK does not support targeting .NET 9.0.
 Either target .NET 8.0 or lower, or use a version of the .NET SDK that supports .NET 9.0.
-[/nix/store/9ql2v7xa762qgibgrq84prdz4sl212c7-dotnet-sdk-8.0.425/...]
 ```
 
-This is the honest, un-fabricated outcome for this host, and it is a **tool-resolution** fact, not a PLB bug: the shared tool policy (`src/workloads/tool.rs`) consults **`PATH` first** (step 1), and only then the version-ranked Nix-store scan (step 3). A too-old `dotnet` on `PATH` therefore **shadows** the store's 9.0.318 SDK — the store scan is never consulted — so **realizing `nixpkgs#dotnet-sdk_9` in the store is not by itself sufficient on this host** (§5). This is recorded as a Known Issue in `CONTEXT.md`, and reported as the mechanism to fix.
+**The fix (`src/workloads/tool.rs`).** A version-aware path, `tool::command_for_min(tool, nix_attr, min_version)`, resolves the tool by **version, not source order**: it enumerates **every** candidate (`PATH` → `$BENCH_TOOL_PATH` → the store scan), probes each one's `--version`, and selects the **greatest version that satisfies the caller's declared minimum** — with `PATH`/source order only as the tie-break. The requirement is caller-declared (`src/workloads/plb.rs`: `const MIN_DOTNET_SDK: &[u64] = &[9]`, because PLB's envs target `net9`); a candidate whose version cannot be probed never satisfies. When nothing satisfies, the resolver still returns the best available candidate and records an explicit `no <tool> >= X available; using the best available …` note — never a silent wrong pick. The chosen binary **and every rejection reason** are written into the result `notes`: `resolved dotnet 9.0.318 at <path> (<source>)` plus one `rejected dotnet 8.0.425 at <path> (<source>): requires >= 9` per failing candidate, so a failure names exactly what was tried and why it was rejected. (The `rebar3` store resolution and all other tools are unchanged; `command_for_min` is additive.)
+
+**Smoke evidence — two runs, 2026-10-13 14:49–14:53 UTC, `--quick`, one workload at a time.**
+
+| # | invocation | loadavg before → after | status | `wall_ms` | `test_time_ms` (n=10) | `peak_memory_bytes` |
+|---|---|---|---|---|---|---|
+| 1 | `bench run --quick --runtime sys --workloads plb` (default `PATH`) | `6.24 6.08 5.61` → `12.51 8.67 6.61` | `ok` | 73 591.25 | min 0 / mean 1 344.51 / p50 692.47 / p99 3 751.48 | 170 196 992 |
+| 2 | same, with a real 8.0.425 store SDK forced to the **front of `PATH`** | `10.60 8.49 6.59` → `34.67 14.33 8.70` | `ok` | 72 613.24 | min 0 / mean 1 309.50 / p50 601.66 / p99 3 903.22 | 170 004 480 |
+
+Exact command (run from the repo root; `--out-file` repointed at the tracked `results/` copy between runs):
+
+```sh
+erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- \
+    run --quick --runtime sys --workloads plb \
+    --out-file erts_rust/tools/bench/out/plb-smoke.json --verbose
+```
+
+Provenance notes as recorded — run 1 (default `PATH`):
+
+```
+build stage ok (dotnet --task build took 25416 ms)
+rejected dotnet 8.0.425 at /nix/store/9ql2v7xa762qgibgrq84prdz4sl212c7-dotnet-sdk-8.0.425/bin/dotnet (nix-store): requires >= 9
+rejected dotnet 8.0.425 at /nix/store/qybc3wpz3hz5daipbmnj7rgc73hn35j2-dotnet-sdk-wrapped-8.0.425/bin/dotnet (nix-store): requires >= 9
+resolved dotnet 9.0.318 at /run/current-system/sw/bin/dotnet (PATH)
+```
+
+run 2 (real 8.0.425 store SDK forced to the front of `PATH`):
+
+```
+build stage ok (dotnet --task build took 19112 ms)
+rejected dotnet 8.0.425 at /nix/store/9ql2v7xa762qgibgrq84prdz4sl212c7-dotnet-sdk-8.0.425/bin/dotnet (PATH): requires >= 9
+rejected dotnet 8.0.425 at /nix/store/9ql2v7xa762qgibgrq84prdz4sl212c7-dotnet-sdk-8.0.425/bin/dotnet (nix-store): requires >= 9
+rejected dotnet 8.0.425 at /nix/store/qybc3wpz3hz5daipbmnj7rgc73hn35j2-dotnet-sdk-wrapped-8.0.425/bin/dotnet (nix-store): requires >= 9
+resolved dotnet 9.0.318 at /nix/store/abbkzygy9aix7b6m9vqlm1xw766mlrf1-dotnet-sdk-9.0.318/bin/dotnet (nix-store)
+```
+
+**Run 2 is the decisive proof.** It reproduces the original defect condition exactly — a `real` 8.0.425 `dotnet` first on `PATH` (`which dotnet` → the 8.0.425 store bin) — and the resolver *rejects it* and falls through to the store's 9.0.318, so the build still succeeds. The two runs' `wall_ms` differ by ~1% for identical work, i.e. the figure is stable despite the loadavgs differing by ~3× (§ header caveat).
+
+The smoke numbers are **`--quick` observations on a shared host**, not milestone figures: `test_time_ms` here is PLB's own per-test time across its 10 elixir kernels (n = 10, `min` 0 = a sub-millisecond kernel), `wall_ms` is the whole two-stage `--task build` + `--task bench` run (building the kernels' escripts dominates), and `peak_memory_bytes` is the driver's external `VmHWM` of the `.NET` tool. Read them as "PLB builds and runs on this host"; they do not belong in a cross-run comparison.
 
 ### 4.2 `khepri` — Khepri `rebar3 eunit` (GC / data-structure bound)
 
@@ -304,11 +346,14 @@ This is the honest, un-fabricated outcome for this host, and it is a **tool-reso
 
 ### 4.3 `emqx` — EMQX umbrella build (`make emqx-enterprise-compile`)
 
-`emqx` **does not run**: `skipped(emqx-requires-otp-28)`, with no number fabricated. The blocker is a genuine toolchain constraint, verified first-hand:
+`emqx` **does not run**: `skipped(emqx-requires-otp-28)`, with no number fabricated. The blocker is a genuine, mechanical toolchain constraint — **the checkout's exactly-declared pin vs the host's actual runtime**, verified first-hand:
 
-* The checkout pins OTP 28 (`.tool-versions` → `erlang 28.5.0.7-2`; `env.sh` → `OTP_VSN=28.5.0.7-2`), but the host `erl` is `otp_release=29` / `symbolic version=17.1`.
-* The mechanism, demonstrated directly on this host (exit `0`, **no output at all**): `erl -noshell -s init stop -eval 'io:format("ENV_MK_WOULD_BE_WRITTEN~n"), halt().'` — `init stop` halts before `-eval` is evaluated, so EMQX's dependency `:ezstd`'s makefile (which generates its `env.mk` with exactly this idiom) writes nothing, and EMQX's `mix compile` then aborts with `No rule to make target '…/env.mk'`.
-* Swapping in a whole OTP-28 toolchain (the store `erl-28.5.0.7` cannot be paired with the OTP-29-built Elixir 1.20.4 / `mix` on `PATH`) is out of this crate's scope, as the workload's own module docs state. Nothing was changed to paper over it.
+* **The exact pin (required).** `28.5.0.7-2` — `/home/bill/Source/emqx/.tool-versions:1` → `erlang 28.5.0.7-2`, and `/home/bill/Source/emqx/env.sh:3` → `export OTP_VSN=28.5.0.7-2`. The gate reads only these declared pins (via `required_otp`/`OtpPin` in `src/workloads/emqx.rs`); it never assumes checkout layout.
+* **The exact available runtime.** `erl -noshell -eval 'io:format("~s ~s~n",[erlang:system_info(otp_release), erlang:system_info(version)]), halt().'` → `29 17.1`, resolved at `/nix/store/khp1dd3fk8476mwg62cinwvk5a17r53s-erlang-29.1.1/lib/erlang/erts-17.1/bin/erl` (the driver reports both the major and the erts version in the note).
+* **The mechanism (why a major-version mismatch is fatal here).** The umbrella build aborts in the `:ezstd` dependency's NIF makefile, which regenerates its `env.mk` with the idiom `erl -noshell -s init stop -eval '…'`. On OTP 29 `init stop` halts **before** the `-eval` runs, so the idiom writes nothing — demonstrated directly on this host: `erl -noshell -s init stop -eval 'io:format("ENV_MK_WOULD_BE_WRITTEN~n"), halt().'` exits `0` with **no output at all** (on OTP 28 it prints the line). `mix compile` then fails with `No rule to make target '…/env.mk'`. EMQX documents the same constraint in its own `scripts/ensure-rebar3.sh`, whose `case ${OTP_VSN}` accepts only `25*`/`26*`/`27*`/`28*` and prints `Unsupported Erlang/OTP version $OTP_VSN` otherwise.
+* **Why not "just override the pin".** There is no supported-version override that works: the only OTP-28 binding in the store (`erlang-28.5.0.7`) cannot be paired with the OTP-29-built **Elixir 1.20.4** / `mix` that the umbrella build's `mix` stage needs, and the pin lives in the **read-only** target checkout (the driver stages a copy, but editing the pinned version would be changing the project under test — not an honest measurement). Swapping the whole toolchain is out of this crate's scope. Nothing was changed to paper over it; the workload's own module docs say the same.
+
+Recorded in `results/m9-bench-emqx.json` (m9) and re-confirmed by the 2026-10-13 14:51 UTC smoke run (`results/m9-bench-emqx-smoke.json`, loadavg `10.91 8.52 6.59` unchanged — the target skips immediately, before any build work).
 
 ### 4.4 `cowboy` — hello_world HTTP (in-process HTTP/1.1 load generator, 16 connections × 5 s — `--full`)
 
@@ -354,12 +399,12 @@ Measures the **installed** `elixirc` (the in-repo checkout is unbuilt and read-o
 
 **`files_attempted` (105) < `files_compiled` (223) is expected, not a bug:** the workload's own note explains that one Elixir source may define several modules, so the produced `.beam` count can exceed the source count. The throughput rate uses the produced count (223).
 
-## 5. Workloads that did **not** run — verified reasons
+## 5. Workloads that did **not** run in the m9 measurement run — verified reasons
 
 | workload | status | verified reason |
 |---|---|---|
-| `plb` | `failed(plb-build-failed)` | The tool policy resolves **`PATH` first**, and the `PATH` `dotnet` is SDK **8.0.425** while the PLB elixir env targets `net9.0`, so `dotnet --task build` dies with `NETSDK1045`. The store's 9.0.318 SDK is never reached (the version-ranked store scan is step 3, after `PATH`). No number is fabricated. (§4.1) |
-| `emqx` | `skipped(emqx-requires-otp-28)` | EMQX pins OTP 28 while the host `erl` is OTP 29; the `:ezstd` `env.mk` make-target's `erl -noshell -s init stop -eval …` idiom produces nothing under OTP 29, so `mix compile` aborts (§4.3). No number is fabricated. |
+| `plb` | `failed(plb-build-failed)` **(m9 run; since fixed — see §4.1)** | The old tool policy resolved **`PATH` first**, and the `PATH` `dotnet` then was SDK **8.0.425** while the PLB elixir env targets `net9.0`, so `dotnet --task build` died with `NETSDK1045`. The store's 9.0.318 SDK was never reached (the version-ranked store scan was step 3, after `PATH`). No number was fabricated. The resolver now selects by version (`tool::command_for_min`), so `plb` runs (§4.1). |
+| `emqx` | `skipped(emqx-requires-otp-28)` | EMQX pins OTP **28.5.0.7-2** (`env.sh:3`/`.tool-versions:1`) while the host `erl` is OTP 29.1.1 / erts-17.1; the `:ezstd` `env.mk` make-target's `erl -noshell -s init stop -eval …` idiom produces nothing under OTP 29, so `mix compile` aborts. Not satisfiable without a full OTP-28 toolchain swap (§4.3). No number is fabricated. |
 | every `SysOnly` workload scheduled under `rust` | `skipped(runtime-unsupported)` | The Rust runtime is not an OTP release host: it cannot run `rebar3`/bootstrap an OTP release, act as `erlc`/`elixirc`, or boot the Cowboy release. `Runtimes::SysOnly` in the harness gates this before any probe. (Not exercised as a row in m9 — the m9 sys-only runs used `--runtime sys` — but it is the harness behaviour.) |
 
 ## 6. Reproducibility, stability and known measurement caveats
@@ -431,12 +476,12 @@ Sys-only external targets (`m9-bench-external.json`, `--full`) vs the m6 quick a
 | `cowboy` | `requests_per_sec` | 40 684.14 (8 conns × 2 s) | 220 143.53 (16 conns × 5 s) |
 | `erlc_compiler` | `files_per_sec` | 6.236 (60 files) | 9.844 (60 files) |
 | `elixir_compiler` | `files_per_sec` | 1.796 (25 attempted / 39 produced) | 4.579 (105 attempted / 223 produced) |
-| `plb` | status | `ok` (.NET 9 store SDK present) | `failed(plb-build-failed)` (.NET 8.0.425 on `PATH` shadows it) |
+| `plb` | status | `ok` (.NET 9 store SDK present) | `failed(plb-build-failed)` (.NET 8.0.425 on `PATH` shadowed it) — **now fixed; `plb` runs** (§4.1) |
 
 ### 7.2 Real, code- and environment-attributable changes since m6
 
 * **The rust per-unit marginals improved across the board** (the table in §7.1): `foreign` per-call, `list_walk` per-element, `copy_bound` per-op and `gc_bound` per-op are all lower than m6 on the rust side, while the oracle side is unchanged. This is the current-state execution-throughput story; the direction and the `~14×–119×` band are the same.
-* **`plb` flipped from `ok` to `failed`** — and it is a **tool-resolution** change, not a PLB regression. m6 realized `nixpkgs#dotnet-sdk_9` in the store and the store scan resolved 9.0.318; in the m9 environment a `dotnet` **on `PATH`** (`8.0.425`) wins step 1 of the shared policy, so the store's 9.x SDK is never reached and the `net9.0` build aborts with `NETSDK1045`. Recorded honestly as `failed(plb-build-failed)` (§4.1, §5).
+* **`plb` flipped from `ok` to `failed`** — and it was a **tool-resolution** change, not a PLB regression. m6 realized `nixpkgs#dotnet-sdk_9` in the store and the store scan resolved 9.0.318; in the m9 environment a `dotnet` **on `PATH`** (`8.0.425`) won step 1 of the shared policy, so the store's 9.x SDK was never reached and the `net9.0` build aborted with `NETSDK1045` — recorded honestly as `failed(plb-build-failed)` (§4.1, §5). **Since fixed:** the resolver now selects by version (`tool::command_for_min`), so `plb` runs even with an 8.0.425 `PATH` `dotnet` present (2026-10-13 smoke, §4.1).
 * **`erlc_compiler`'s throughput rates now divide the *produced* `.beam`/LOC counts** (a just-landed honesty fix), not the attempted counts. With 60/60 produced in both runs the m9 numbers are produced-based by construction; a partial run can no longer overstate throughput next to `files_compiled`.
 
 ### 7.3 Load-attributable / not comparable
@@ -457,14 +502,14 @@ No workload returns a hard-coded or estimated metric; a workload that fails to b
 
 - **`foreign` classifies a staging failure honestly** (`src/workloads/foreign.rs`: `StageError` + `stage_outcome`): a checkout whose foreign `.erl` sources are genuinely absent ⇒ `skipped(sources-missing)`, while a failure to compile the sources we *did* stage (the embedded driver or a present foreign source) ⇒ `failed(module-compile-failed)` — matching the workloads whose sources are ours (`list_walk`/`copy_bound`/`gc_bound`). `slice` treats a failed fixture rebuild as `skipped(fixture-missing)`.
 - **`erlc_compiler`'s `files_per_sec`/`loc_per_sec` are computed from the *produced* counts** (`rates_per_second` over `CorpusRun::produced` / `produced_loc`, the latter from `compiled_sources`, which matches each newly written `.beam` back to its source by file stem), so a partial `erlc` run cannot overstate throughput next to `files_compiled`. The attempted file/LOC totals are still reported, but only in a note. `elixir_compiler` likewise uses the produced count.
-- **`plb` reports a failed build as `failed(plb-build-failed)` with the captured `NETSDK1045` stderr**, never a placeholder number (§4.1); `khepri`'s `runtimes[]` version describes the driver's oracle, not necessarily the Erlang the store `rebar3` escript chose (§4.2).
+- **A version-constrained tool is resolved by version, and the choice is auditable.** `plb` calls `tool::command_for_min(TOOL, TOOL_NIX_ATTR, MIN_DOTNET_SDK)` (min `9`), which probes every candidate's `--version` and selects the greatest satisfying one (§4.1). The resolved binary + version + source and every rejected candidate's reason are recorded in the row's `notes` — in **both** the success and the build-failure branch, so a `failed` row names the exact SDK it used. If no candidate satisfies, the resolver still returns the best available one and records a `no <tool> >= X …` note — it never silently picks a too-old tool, and it never fabricates a number. `khepri`'s `runtimes[]` version describes the driver's oracle, not necessarily the Erlang the store `rebar3` escript chose (§4.2).
 - `proc.rs`'s drain-thread join (`h.join().unwrap_or_default()`) is infallible **by construction** — the drain threads run only `read_to_end` + a lossy UTF-8 conversion, neither of which can panic — so the `unwrap_or_default` masks nothing real; the invariant is documented at the call site.
 
 `baseline.rs`'s docs correctly state that both runtimes serve `erlang:memory/0,1` (`beam_rt` via its `MemoryHook` seam), recording a real `vm_memory_total_bytes` for `rust`; `is_capability_gap` survives only as a fallback classifier.
 
 The `foreign`/`list_walk`/`copy_bound`/`gc_bound` startup-cancelled methodology is implemented exactly as this document states (startup-cancelled `(mean wall@N − mean wall@0) / N`), and the registered-BIF dispatch cost — **≈ 79–96 ns/call** for the non-inlinable `call_ext` round trip (`../../crates/beam_rt/PERF.md`, *Registered-BIF (non-inlinable) per-call*) and **≈ 76 ns/iter** for `pb:tr/2`'s `trunc/1` (`../../crates/beam_rt/TRACE_AND_PERF.md`, *Dispatch cost (registered-BIF path)*) — is **not** produced here; it is a `beam_rt` measurement.
 
-**Reproducibility note (PLB / tool resolution).** `plb`'s outcome is *tool- and environment* state, not repository state: on a host where a sufficiently new `dotnet` (≥ 9.0) is first on `PATH`, or where no `dotnet` is on `PATH` at all (so step 3's version-ranked store scan picks the store's 9.x SDK), `plb` builds and runs; on this host a `dotnet` **8.0.425** is on `PATH` and shadows the store, so the row is honest `failed(plb-build-failed)`. `khepri` needs only the `rebar3` store entry and runs as-is.
+**Reproducibility note (PLB / tool resolution).** `plb`'s outcome is *tool- and environment* state, not repository state. The resolver now picks the **greatest `dotnet` ≥ 9.0** across `PATH` + `$BENCH_TOOL_PATH` + the Nix store, so `plb` runs wherever any 9.x+ SDK is reachable — even with an older `dotnet` first on `PATH` (the run-2 smoke of §4.1 proves exactly that). It is `skipped(dotnet-absent)` only if no `dotnet` resolves at all, and if a `dotnet` resolves but none is ≥ 9 it still returns the best available one with an explicit `requires >= 9` note, so the resulting `NETSDK1045` failure names the SDK. `khepri` needs only the `rebar3` store entry and runs as-is.
 
 ## Archived artifacts
 
@@ -473,8 +518,11 @@ The `foreign`/`list_walk`/`copy_bound`/`gc_bound` startup-cancelled methodology 
 | `results/m9-bench-xrun.json` | **current cross-runtime run**: `--full --runtime all`, the six `Runtimes::Both` workloads × both runtimes, 12/12 rows `ok` (full pass, 1-min load 11.01 → 6.02, wall 2m44s) — the source of §3 |
 | `results/m9-compare-cross-runtime.txt` | `bench compare` — sys vs rust inside `m9-bench-xrun.json` (69 numeric rows; the tool diffs the **mean**) |
 | `results/m9-bench-external.json` | the external sys-only targets in one `--full` report: `erlc_compiler`, `elixir_compiler`, `cowboy`, `khepri` (§4.2, §4.4–§4.6; load 4.68 → 4.43, wall 3m00s) |
-| `results/m9-bench-plb.json` | `plb` → `failed(plb-build-failed)` (`NETSDK1045`, `PATH` `dotnet` 8.0.425; §4.1) |
+| `results/m9-bench-plb.json` | `plb` during the m9 measurement run → `failed(plb-build-failed)` (`NETSDK1045`, `PATH` `dotnet` 8.0.425; §4.1) — the pre-fix observation |
 | `results/m9-bench-emqx.json` | EMQX → `skipped(emqx-requires-otp-28)` (§4.3) |
+| `results/m9-bench-plb-smoke.json` | **post-fix smoke (2026-10-13 14:49 UTC)**: `plb` → `ok`, `wall_ms` 73 591.25, store 9.0.318 resolved from `PATH` (§4.1) |
+| `results/m9-bench-plb-smoke-path8.json` | **post-fix smoke, defect condition reproduced (14:51 UTC)**: a real 8.0.425 `dotnet` forced first on `PATH` → still `ok`, store 9.0.318 resolved (§4.1) — the decisive proof |
+| `results/m9-bench-emqx-smoke.json` | **post-fix smoke (14:51 UTC)**: EMQX re-confirmed → `skipped(emqx-requires-otp-28)` with the exact pin/mechanism note (§4.3) |
 | `results/m9-load-record.md` | the m9 pass: exact commands, the `/proc/loadavg` before/after each run, and the note on which passes were quick vs full |
 | `results/m9-tool-targets-notes.md` | the factual per-target status/blocker notes and the environment findings (`dotnet` on `PATH`, `clang` present, `rebar3` store-resolved) |
 | `results/m6-*` | the **previous** run (2026-10-11, cross-runtime load ≈414–440): the focused cross-runtime report, the per-target runs, the cross-runtime diff, and the `m6-load-record.md`/`m6-tool-targets-notes.md` records — **regression baseline for §7** |

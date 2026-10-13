@@ -8,8 +8,11 @@ The `m<session>-` prefix names the measurement session the files belong to; the 
 ### `m9-` — the current session (2026-10-13)
 - `m9-bench-xrun.json` — **the full cross-runtime report**: `run --full --runtime all`, the six `Runtimes::Both` workloads × both runtimes (12/12 rows `ok`). The source of every headline number in `../RESULTS.md` §3.
 - `m9-bench-external.json` — the full sys-only external targets in one report: `erlc_compiler`, `elixir_compiler`, `cowboy`, `khepri` (4/4 `ok`). The source of `../RESULTS.md` §4.
-- `m9-bench-plb.json` — the PLB observation: `failed(plb-build-failed)` (`NETSDK1045`; `PATH` `dotnet` 8.0.425 vs the `net9.0` target).
+- `m9-bench-plb.json` — the PLB observation from the measurement run: `failed(plb-build-failed)` (`NETSDK1045`; the `PATH` `dotnet` was 8.0.425 vs the `net9.0` target).
 - `m9-bench-emqx.json` — the EMQX skip observation: `skipped(emqx-requires-otp-28)`.
+- `m9-bench-plb-smoke.json` — the post-fix PLB smoke (14:49 UTC): `ok`, store 9.0.318 resolved from `PATH`; carries the resolved-and-rejected provenance notes.
+- `m9-bench-plb-smoke-path8.json` — the post-fix PLB smoke with the defect condition reproduced (14:51 UTC): a real 8.0.425 `dotnet` forced first on `PATH` → still `ok`, store 9.0.318 resolved (the decisive proof).
+- `m9-bench-emqx-smoke.json` — the post-fix EMQX smoke (14:51 UTC): re-confirmed `skipped(emqx-requires-otp-28)` with the exact pin (`28.5.0.7-2`) and mechanism note.
 - `m9-compare-cross-runtime.txt` — `bench compare` of `m9-bench-xrun.json` (sys vs rust inside one report, 69 numeric rows).
 - `m9-load-record.md` — the session's exact commands and the per-run `/proc/loadavg` before/after record.
 - `m9-tool-targets-notes.md` — the per-target status/blocker notes and the environment findings.
