@@ -123,6 +123,10 @@ pub fn run(cmd: &mut Command) -> std::io::Result<Completed> {
     stop.store(true, Ordering::Relaxed);
     let _ = poller.join();
 
+    // The drain threads run only `read_to_end` + a lossy UTF-8 conversion — neither can
+    // panic — so a join failure is impossible by construction and `unwrap_or_default` cannot
+    // mask any real failure. (A panic would have to come from the capture thread's own body
+    // unwinding, which would already have printed to the driver's stderr.)
     let stdout = out_handle.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
     let stderr = err_handle.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
 
