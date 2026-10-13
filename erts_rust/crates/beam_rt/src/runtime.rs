@@ -68,6 +68,7 @@ use crate::boot::bootscript::{self, BootScript, BootStop};
 use crate::boot::{self, PreloadedModules};
 use crate::codeserver::CodeServer;
 use crate::config::{strategy_env_default, ArgTerm, InitArgs, RuntimeConfig};
+use crate::context::gc_walk::RuntimeCollectionGate;
 use crate::context::{PersistentTermStore, RuntimeContext};
 use crate::dist::{resolve_cookie, DistNode, NONODE_NAME};
 use crate::error;
@@ -566,6 +567,15 @@ impl Runtime {
         }
         let signals = SignalAtoms::from_table(code_server.atoms_mut());
         let mut processes = ProcessTable::new(signals);
+        // The host **collection gate** (`context/gc_walk.rs::RuntimeCollectionGate`): the
+        // signal sites the table drives — a monitor `'DOWN'`, an exit propagation, an applied
+        // trap reason — run with only `&mut ProcessTable` in hand, so they cannot consult the
+        // runtime's unscanned-root valve directly. Without this gate a relocating
+        // `ensure_capacity` on a **waiting** receiver (neither relocation-exempt nor `Running`)
+        // would move a heap the valve must refuse — the hole the A.9 `selfhost/*` corruption
+        // went through. The gate is a *table* field, so it travels with the table into every
+        // scheduler pass and covers every process the table holds.
+        processes.set_collection_gate(Box::new(RuntimeCollectionGate::new()));
         // The ETS owner-death index and the observer that fills it: a process death records the
         // pid here and nothing else, and the runtime drains the obligations at a scheduler
         // boundary where the ETS registry is free (see [`crate::runtime::ets_owner`]). The

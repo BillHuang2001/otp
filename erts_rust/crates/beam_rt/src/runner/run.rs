@@ -546,14 +546,26 @@ impl ProcessRunner for RuntimeRunner<'_> {
                     // Keep the parked process **relocation-exempt** for the whole parked
                     // window. While it waits, a delivery or signal can drive a collection of
                     // its heap (`Process::deliver`'s exit cascade is not gated by
-                    // `gc_process_enabled`) against the *published* root snapshot — which is
-                    // not the whole truth: a live `Machine::pending_exception` or a Rust-local
-                    // term in an in-flight `beam_bifs`/`beam_engine` frame is not in it, so a
-                    // move can recycle a word a live holder still points at. Exempting is
-                    // **decline-only**: such a delivery takes the ordinary heap-fragment
-                    // fallback (`Process::deliver`'s raw refusal), and the process's own next
-                    // admission point — after it is resumed, where the exemption is cleared
-                    // above — collects as usual, so nothing grows unboundedly.
+                    // `gc_process_enabled`) against the *published* root snapshot.
+                    //
+                    // That snapshot is not the whole truth, and the two protections are **not**
+                    // equivalent. The installed host collection gate
+                    // (`crate::context::gc_walk::RuntimeCollectionGate`) declines only when an
+                    // **unscanned container is reachable from the receiver's GATHERED roots**
+                    // (`seed_process_roots`); this exemption refuses *any* relocation for the
+                    // parked window. The gap it covers is a live term the host holds **outside**
+                    // that gathered set — the runner's own entry terms (`ProcessEngine::args`,
+                    // `ProcessEntry::Fun::fun`, `LocalFunTarget::args`) and any live `Eterm` in
+                    // the host's Rust state — which the walk cannot see, plus
+                    // `Runtime::serve_gc_request`, which gates its descent on the per-pid latch
+                    // (`foreign_reachable`) rather than always descending, so it can miss a
+                    // depth-≥2 foreign container the gate's unconditional descent would catch.
+                    // Exempting is **decline-only**: such a delivery takes the ordinary
+                    // heap-fragment fallback (`Process::deliver`'s raw refusal), and the
+                    // process's own next admission point — after it is resumed, where the
+                    // exemption is cleared above — collects as usual, so nothing grows
+                    // unboundedly. Pinned by
+                    // `super::tests::a_parked_process_stays_relocation_exempt_for_its_parked_window`.
                     process.set_relocation_exempt(true);
                 }
                 // Publish the machine's roots before the engine is parked. The parked process
