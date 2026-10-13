@@ -29,8 +29,8 @@ later same-size insert silently reuses (a wrong, well-formed result).
   `match_object`/`match_`) over a lazily-allocated scratch `Heap`; `table()` is `pub(in view)`.
 - `write.rs` — `TableWrite<'g>`: metadata; mutations (`insert`/`insert_new`/`insert_list`/
   `delete`/`delete_object`/`delete_all_objects`/`update_counter*`/`update_element`/`select_delete`/
-  `match_delete`/`select_replace`); tagged `take`; fixation; ownership (`heir`/`set_heir`/`set_owner`/
-  `give_away`/`setopts`); and `as_requester` (the access-enforcing view).
+  `match_delete`/`select_replace`); tagged `take`; fixation; ownership (`heir -> Option<HeirView>`,
+  `set_heir`/`set_owner`/`give_away`/`setopts`); and `as_requester` (the raw access-enforcing view).
 - `iter.rs` — view-borrowed traversal returning `TableTerm<'a>` bound to the borrow
   (`iter_keys`/`iter_keys_rev`/`iter_objects`/`iter_objects_rev`), `foldl`/`foldr` (accumulator
   escapes, the object term does not), and the bulk copy-out `tab2list_into`; plus its unit tests.
