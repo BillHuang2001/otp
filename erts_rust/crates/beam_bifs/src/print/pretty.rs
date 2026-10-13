@@ -504,7 +504,12 @@ fn printable_latin1_list(term: Eterm, n: i64) -> PrintablePrefix {
 /// The byte values of the first `limit` elements of the list `term` (all of which
 /// the caller has already established are printable).
 fn list_prefix_bytes(term: Eterm, limit: usize) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(limit);
+    // `limit` is `usize::MAX` on the `PrintablePrefix::All` arm, where the caller
+    // wants *every* element: reserving `limit` words up front would ask the allocator
+    // for an impossible block and abort the whole process (`capacity overflow`), so
+    // only a small bounded amount is reserved and the `Vec` grows to the list's real
+    // length. The result is identical for every `limit` (the loop is the same).
+    let mut bytes = Vec::with_capacity(limit.min(PREFIX_RESERVE));
     let mut cur = term;
     while bytes.len() < limit && is_list(cur) {
         bytes.push(signed_value(car(cur)) as u8);
@@ -512,6 +517,10 @@ fn list_prefix_bytes(term: Eterm, limit: usize) -> Vec<u8> {
     }
     bytes
 }
+/// How much [`list_prefix_bytes`] reserves up front, whatever the (possibly
+/// unbounded) `limit` — enough to avoid a reallocation for a typical short prefix,
+/// small enough to be allocated unconditionally.
+const PREFIX_RESERVE: usize = 32;
 /// `io_lib_pretty:print_length/7` (`RecDefFun = no_fun`, `Str = true`): the
 /// template of `term` at depth `d` and chars budget `t` (`-1` = unlimited) — the
 /// *shape* of the render, with its flat length and dots count, and no rendering at
@@ -1015,7 +1024,11 @@ fn write_seq(seq: &Seq, sep: char) -> Chunk {
         // value is the nested `[46,46,46]` leaf itself (not a list wrapping it).
         return Chunk::text("...");
     }
-    let mut items: Vec<Chunk> = Vec::with_capacity(2 * seq.elems.len() + 2);
+    // `2 * n + 2` is the exact item count, but computed saturating: a `Vec` that
+    // large cannot exist, so the arithmetic must never be allowed to wrap into a
+    // bogus (and unreachable) reservation.
+    let mut items: Vec<Chunk> =
+        Vec::with_capacity(seq.elems.len().saturating_mul(2).saturating_add(2));
     for (i, e) in seq.elems.iter().enumerate() {
         if i > 0 {
             items.push(Chunk::Char(','));
@@ -1711,9 +1724,33 @@ mod tests {
     /// times over.
     const LONG: i64 = 20_000;
 
+    /// The atom table every test's [`BifContext`] borrows.
+    ///
+    /// `BifContext::atom/1` is a **pure lookup** (`TermNotFound` for an unseeded
+    /// name) — nothing here interns on demand — so every name the tests render must
+    /// be seeded up front: the three booleans/`ok` the other suites use, plus the
+    /// single-letter names the `[a,b,…]` / `{a,1,…}` limited goldens render and
+    /// `abcdefghij` (the `never truncated` atom).
     fn seeded_atoms() -> AtomTable {
         let mut atoms = AtomTable::new();
-        atoms.seed(["true", "false", "ok"]);
+        atoms.seed([
+            "true",
+            "false",
+            "ok",
+            "a",
+            "b",
+            "c",
+            "d",
+            "e",
+            "f",
+            "g",
+            "h",
+            "i",
+            "j",
+            "k",
+            "l",
+            "abcdefghij",
+        ]);
         atoms
     }
 
@@ -2003,28 +2040,36 @@ mod tests {
 
     #[test]
     fn write_limited_map_matches_the_pinned_goldens() {
+        // Integer keys **on purpose.** A flat map stores its keys in
+        // `erts_cmp_flatmap_keys` order, which compares two atoms by their immediate
+        // value — i.e. by atom *index* — and the oracle's atom indices are seeded per
+        // VM start: the same `erl -eval` renders `#{c => 3,a => 1,…}` and
+        // `#{c => 3,b => 2,…}` on different runs (`maps:to_list/1` returns
+        // `[{c,3},{a,1},{b,2},{d,4}]` or `[{c,3},{b,2},{a,1},{d,4}]`). An atom-keyed
+        // map therefore has **no** single oracle rendering to pin. Integers order by
+        // term order, which both sides agree on.
         with_ctx(|ctx, reg| {
-            let pairs: Vec<Eterm> = [("a", 1i64), ("b", 2), ("c", 3), ("d", 4)]
-                .into_iter()
-                .map(|(k, v)| {
-                    let k = ctx.atom(k)?;
-                    let v = ctx.int(v)?;
+            let pairs: Vec<Eterm> = (1i64..=4)
+                .map(|i| {
+                    let k = ctx.int(i)?;
+                    let v = ctx.int(i)?;
                     ctx.tuple(&[k, v])
                 })
                 .collect::<Result<Vec<_>>>()
                 .unwrap();
             let list = ctx.list(&pairs).unwrap();
             let map = reg.call("maps", "from_list", 1, ctx, &[list]).unwrap();
-            // The oracle's storage order for this map is `c, a, b, d` (its own
-            // `maps:iterator/1` order), so the goldens below are only meaningful if
-            // the first storage pair is `c`.
+            // The oracle's `maps:to_list/1` for this map is `[{1,1},{2,2},{3,3},{4,4}]`,
+            // and that storage order is the one `~w`/`~p` walk.
             let storage = beam_term::map::map_pairs_storage_order(map).unwrap();
-            assert_eq!(signed_value(storage[0].0), -1, "atom keys sort last");
+            let keys: Vec<i64> = storage.iter().map(|(k, _)| signed_value(*k)).collect();
+            assert_eq!(keys, [1, 2, 3, 4], "integers order by term order");
             for (cl, want) in [
                 (1, "#{...}"),
                 (6, "#{...}"),
-                (7, "#{c => 3,...}"),
-                (13, "#{c => 3,...}"),
+                (7, "#{1 => 1,...}"),
+                (13, "#{1 => 1,...}"),
+                (14, "#{1 => 1,2 => 2,...}"),
             ] {
                 assert_eq!(write_limited(ctx, map, -1, cl).unwrap(), want, "CL={cl}");
             }
@@ -2177,69 +2222,153 @@ mod tests {
         });
     }
 
-    /// The oracle terms the live cross-check sweeps, as Erlang source text (the
-    /// evaluator used below accepts any expression).
-    const ORACLE_TERMS: [&str; 7] = [
-        "[1,2,3]",
-        "lists:seq(1,12)",
-        "{a,1,2,3,4,5,6}",
-        "#{a=>1,b=>2,c=>3,d=>4}",
-        "12345",
-        "[a,b,c,d,e,f,g,h,i,j,k,l]",
-        "\"hello world\"",
+    /// The oracle terms the live cross-checks sweep, as `(label, Erlang source)`.
+    ///
+    /// The label is what the `Term|CL|Rendering` lines carry and what
+    /// [`build_oracle_term`] rebuilds; the source is the expression the oracle
+    /// **evaluates literally**. It must be a rendering both sides agree on
+    /// *deterministically* — hence the integer-keyed map (an atom-keyed one orders by
+    /// the oracle's per-VM-start atom indices; see
+    /// [`write_limited_map_matches_the_pinned_goldens`]).
+    ///
+    /// `lists:seq(1,60)` is the **re-flow** term: its flat render is 172 characters,
+    /// so once `CL` passes the 80-character line length `~p` breaks it across lines
+    /// and the limited `pp/8` walk runs with a limit in force. Every other term is
+    /// short enough to stay on one line at any limit.
+    const ORACLE_TERMS: [(&str, &str); 9] = [
+        ("[1,2,3]", "[1,2,3]"),
+        ("lists:seq(1,12)", "lists:seq(1,12)"),
+        ("{a,1,2,3,4,5,6}", "{a,1,2,3,4,5,6}"),
+        ("#{1=>1,2=>2,3=>3,4=>4}", "#{1=>1,2=>2,3=>3,4=>4}"),
+        ("12345", "12345"),
+        ("[a,b,c,d,e,f,g,h,i,j,k,l]", "[a,b,c,d,e,f,g,h,i,j,k,l]"),
+        ("\"hello world\"", "\"hello world\""),
+        ("<<a..j>>", "list_to_binary(lists:seq($a,$j))"),
+        ("lists:seq(1,60)", "lists:seq(1,60)"),
     ];
-    /// The chars limits every sweep uses.
-    const ORACLE_LIMITS: i64 = 20;
+    /// The chars limits every sweep uses — far past the 80-character line length, so
+    /// the sweeps cross from "truncate on one line" into "re-flow with a limit".
+    const ORACLE_LIMITS: i64 = 200;
+    /// How many cases one sweep compares (`ORACLE_TERMS` × `ORACLE_LIMITS + 1`), the
+    /// floor both live cross-checks assert — so a sweep that quietly stops comparing
+    /// anything cannot pass.
+    const ORACLE_CASES: usize = ORACLE_TERMS.len() * (ORACLE_LIMITS as usize + 1);
 
-    /// Runs `erl -noshell -eval <expr>` and returns stdout, or `None` when no
-    /// oracle is available (the test then skips **loudly**).
+    /// Runs `erl -noshell -eval <expr>` and returns stdout.
+    ///
+    /// `None` means **no oracle exists at all** — `erl` could not be spawned — in
+    /// which case the caller skips loudly. An oracle that *ran and failed* is a hard
+    /// panic instead: the first cut of these sweeps shipped an expression
+    /// (`{ok,Tk,_}=erl_scan:string(Str++"."), {value,Term,_}=erl_eval:exprs(Tk,[])`)
+    /// that made `erl -eval` exit **1 with no output for every input** — `-eval`
+    /// lints its argument as a *shell command* (`erl_lint:exprs/3` →
+    /// `check_command/2`), which a list literal is not — and mapping that to "no
+    /// oracle" silently skipped the comparison. The terms are therefore embedded
+    /// literally in the expression instead of being re-scanned.
     fn run_oracle(expr: &str) -> Option<String> {
         let erl = std::env::var("ERTS_ORACLE").unwrap_or_else(|_| "erl".to_string());
-        let out = Command::new(erl)
+        let out = match Command::new(&erl)
             .args(["-noshell", "-eval", expr])
             .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
+        {
+            Ok(out) => out,
+            Err(e) => {
+                eprintln!("[beam_bifs print] cannot run `{erl}`: {e}");
+                eprintln!(
+                    "($ERTS_ORACLE unset or not executable, and no `erl` on $PATH).\n\
+                     This test is NOT a pass — set $ERTS_ORACLE (or install Erlang/OTP)."
+                );
+                return None;
+            }
+        };
+        assert!(
+            out.status.success(),
+            "`{erl} -noshell -eval` failed with {}: stderr {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
         Some(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
-    /// `Term|CL|Rendering` lines for every term and limit above.
-    fn oracle_sweep(call: &str) -> String {
+    /// The `Term|CL|Rendering` lines the oracle prints for every term and limit.
+    ///
+    /// `render` is the Erlang expression rendering the bound `Tm` at the bound `CL`.
+    /// A re-flowed rendering spans several lines, so every newline in it is escaped to
+    /// the two characters `\n` before it is printed (and escaped the same way on this
+    /// side) to keep one case on one line. Any other byte — including a rendering's own
+    /// backslashes — passes through untouched on both sides.
+    fn oracle_sweep(render: &str) -> String {
         let terms = ORACLE_TERMS
             .iter()
-            .map(|t| format!("\"{}\"", t.replace('\\', "\\\\").replace('"', "\\\"")))
+            .map(|(label, source)| {
+                let label = label.replace('\\', "\\\\").replace('"', "\\\"");
+                format!("{{\"{label}\",{source}}}")
+            })
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "S=[{terms}],\
-             lists:foreach(fun(Str)->\
-               {{ok,Tk,_}}=erl_scan:string(Str++\".\"),\
-               {{value,Term,_}}=erl_eval:exprs(Tk,[]),\
+            "T=[{terms}],\
+             lists:foreach(fun({{S,Tm}})->\
                lists:foreach(fun(CL)->\
-                 io:format(\"~s|~p|~s~n\",[Str,CL,{call}])\
+                 R={render},\
+                 io:format(\"~s|~p|~s~n\",[S,CL,\
+                   lists:flatten(string:replace(R,\"\\n\",\"\\\\n\",all))])\
                end,lists:seq(0,{ORACLE_LIMITS}))\
-             end,S),\
+             end,T),\
              halt(0)."
         )
     }
 
-    /// The `Term|CL|Rendering` lines the printer produces for the same sweep.
+    /// Parses `Term|CL|Rendering` lines into a `Term|CL` → rendering map.
+    ///
+    /// The rendering itself may contain `|` (`[1|...]`), so only the first two
+    /// separators are separators — `splitn(3, '|')`, not `split_once`.
+    fn parse_sweep(golden: &str) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        for line in golden.lines().filter(|l| !l.is_empty()) {
+            let mut parts = line.splitn(3, '|');
+            let label = parts.next().expect("a `Term` field");
+            let cl = parts.next().expect("a `CL` field");
+            let text = parts
+                .next()
+                .unwrap_or_else(|| panic!("not Term|CL|Text: {line}"));
+            out.insert(format!("{label}|{cl}"), text.to_string());
+        }
+        out
+    }
+
+    /// The same `Term|CL` → rendering map from this crate's printer, with the same
+    /// newline escaping the oracle sweep uses.
     fn ours_sweep(
         ctx: &mut BifContext<'_>,
         reg: &crate::BifRegistry,
         render: impl Fn(&mut BifContext<'_>, Eterm, i64) -> Result<String>,
-    ) -> Vec<String> {
-        let mut out = Vec::new();
-        for src in ORACLE_TERMS {
-            let term = build_oracle_term(ctx, reg, src);
+    ) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        for (label, _) in ORACLE_TERMS {
+            let term = build_oracle_term(ctx, reg, label);
             for cl in 0..=ORACLE_LIMITS {
-                let text = render(ctx, term, cl).unwrap();
-                out.push(format!("{src}|{cl}|{text}"));
+                let text = render(ctx, term, cl).unwrap().replace('\n', "\\n");
+                out.insert(format!("{label}|{cl}"), text);
             }
         }
         out
+    }
+
+    /// Compares a whole sweep case by case and returns how many matched.
+    fn compare_sweeps(golden: &str, ours: &BTreeMap<String, String>) -> usize {
+        let expected = parse_sweep(golden);
+        assert_eq!(
+            expected.len(),
+            ORACLE_CASES,
+            "the oracle printed every term and limit"
+        );
+        assert_eq!(ours.len(), ORACLE_CASES, "the printer rendered every case");
+        for (key, want) in &expected {
+            let got = ours.get(key).unwrap_or_else(|| panic!("no case {key}"));
+            assert_eq!(got, want, "{key}");
+        }
+        expected.len()
     }
 
     /// Builds one of [`ORACLE_TERMS`] in the crate's own terms.
@@ -2253,12 +2382,11 @@ mod tests {
                 elems.extend((1..=6).map(|i| ctx.int(i).unwrap()));
                 ctx.tuple(&elems).unwrap()
             }
-            "#{a=>1,b=>2,c=>3,d=>4}" => {
-                let pairs: Vec<Eterm> = [("a", 1i64), ("b", 2), ("c", 3), ("d", 4)]
-                    .into_iter()
-                    .map(|(k, v)| {
-                        let k = ctx.atom(k)?;
-                        let v = ctx.int(v)?;
+            "#{1=>1,2=>2,3=>3,4=>4}" => {
+                let pairs: Vec<Eterm> = (1i64..=4)
+                    .map(|i| {
+                        let k = ctx.int(i)?;
+                        let v = ctx.int(i)?;
                         ctx.tuple(&[k, v])
                     })
                     .collect::<Result<Vec<_>>>()
@@ -2281,50 +2409,48 @@ mod tests {
                     .collect();
                 ctx.list(&elems).unwrap()
             }
+            "<<a..j>>" => {
+                let bytes = ctx
+                    .list(
+                        &(b'a'..=b'j')
+                            .map(|b| ctx.int(b as i64).unwrap())
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap();
+                reg.call("erlang", "list_to_binary", 1, ctx, &[bytes])
+                    .unwrap()
+            }
+            "lists:seq(1,60)" => int_list(ctx, 60).unwrap(),
             other => panic!("unknown oracle term {other}"),
         }
     }
 
     #[test]
     fn write_limited_agrees_with_the_live_oracle() {
-        let expr = oracle_sweep("io_lib:write(Term,-1,latin1,undefined,CL)");
+        let expr = oracle_sweep("io_lib:write(Tm,-1,latin1,undefined,CL)");
         let Some(golden) = run_oracle(&expr) else {
-            eprintln!("skipping write_limited live oracle check: no `erl` on PATH");
-            return;
+            return; // No `erl` at all — `run_oracle` has said so loudly.
         };
         let ours = with_ctx(|ctx, reg| {
             ours_sweep(ctx, reg, |ctx, term, cl| write_limited(ctx, term, -1, cl))
         });
-        let mut expected: BTreeMap<String, String> = BTreeMap::new();
-        for line in golden.lines().filter(|l| !l.is_empty()) {
-            let (key, value) = line.split_once('|').expect("Term|CL|Text");
-            let (key, _) = key.rsplit_once('|').map_or((key, ""), |(k, c)| (k, c));
-            expected.insert(format!("{key}|{}", key.rsplit_once('|').map_or("", |(_, c)| c)), value.to_string());
-        }
-        let mut checked = 0usize;
-        for line in ours {
-            let (key, value) = line.split_once('|').expect("Term|CL|Text");
-            let (key, _) = key.rsplit_once('|').map_or((key, ""), |(k, c)| (k, c));
-            if let Some(want) = expected.get(&format!("{key}|{}", key.rsplit_once('|').map_or("", |(_, c)| c)))
-            {
-                assert_eq!(value, want, "{key}");
-                checked += 1;
-            }
-        }
+        let checked = compare_sweeps(&golden, &ours);
         assert!(checked >= 100, "the sweep compared {checked} cases");
     }
 
     #[test]
     fn print_limited_agrees_with_the_live_oracle() {
-        let expr = oracle_sweep("io_lib:write(Term,-1,latin1,undefined,CL)");
+        // The **`~p`** sweep this time: `io_lib:format/3` with `{chars_limit, CL}`,
+        // which is the oracle's `io_lib_pretty:print/10` pipeline that
+        // [`print_limited`] ports (a single directive, so the per-directive budget is
+        // `CL` itself and the term starts at column 1, `MaxChars = CL`, indentation 0).
+        let expr = oracle_sweep("lists:flatten(io_lib:format(\"~p\",[Tm],[{chars_limit,CL}]))");
         let Some(golden) = run_oracle(&expr) else {
-            eprintln!("skipping print_limited live oracle check: no `erl` on PATH");
-            return;
+            return; // No `erl` at all — `run_oracle` has said so loudly.
         };
-        assert!(!golden.is_empty());
-        let ours = with_ctx(|ctx, reg| {
-            ours_sweep(ctx, reg, |ctx, term, cl| print_limited(ctx, term, cl))
-        });
-        assert!(!ours.is_empty());
+        let ours =
+            with_ctx(|ctx, reg| ours_sweep(ctx, reg, |ctx, term, cl| print_limited(ctx, term, cl)));
+        let checked = compare_sweeps(&golden, &ours);
+        assert!(checked >= 100, "the sweep compared {checked} cases");
     }
 }
