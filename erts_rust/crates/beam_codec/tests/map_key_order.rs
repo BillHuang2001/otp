@@ -74,6 +74,32 @@
 //! [`decoded_flatmap_canonicalises_into_atom_index_order`] shows the decoder
 //! canonicalising a wire image whose atom order is *not* the receiving VM's index order
 //! (the atom-order seed there is derived from the oracle, never hard-coded).
+//! [`atom_key_order_is_interning_order_not_name_order_against_the_oracle`] makes the
+//! controlled case explicit on **both** sides: `zzzq` is interned before `aaaq` (created
+//! fresh, via `list_to_atom/1` and `AtomTable::intern`, so no boot-time table can pre-empt
+//! them), the pair order is the *opposite* of name order, and our image is byte-identical to
+//! the oracle's — a seeding-independent differential pin of the rule. The encoder's half of
+//! the contract is pinned independently by
+//! [`encoder_preserves_a_stored_order_that_is_not_atom_index_order`].
+//!
+//! ## The recorded `-eval` divergence is atom-table *seeding*, not encoding
+//!
+//! `tools/differential/divergences.md` records a multi-key atom-keyed map as "not
+//! byte-identical", attributing it to the rust runtime "keeping the source order" while
+//! "the oracle's encoder emits atom keys sorted". That is a **misdiagnosis**. Neither
+//! implementation sorts on the wire: *both* order atom keys by **atom-table index**
+//! (`erts_cmp_flatmap_keys`, `erl_utils.h:267-272`; the encoder emits the stored order
+//! verbatim, `external.c:3746-3769`). The two sides disagree only about **which index each
+//! name has**, because a fresh `erl` and a fresh `beam_rt` intern atoms in different orders —
+//! the oracle's `-eval` path scans the expression text and interns the source atoms first,
+//! while the rust runtime's table is seeded from its boot atom list. Bypass the eager scan
+//! with `list_to_atom/1` (this file's tests) or fix the table by compiling, and the two agree
+//! exactly: compiling `-module(mtest). -export([lit/0]). lit() -> #{b => 2, a => 1}.` with the
+//! system `erlc` and asking `maps:to_list(mtest:lit())` / `binary_to_list(term_to_binary(mtest:lit()))`
+//! yields `[{a,1},{b,2}]` and `[131,116,0,0,0,2,119,1,97,97,1,119,1,98,97,2]` — the same bytes
+//! this crate's encoder emits. The fix for the recorded divergence therefore belongs to the
+//! **runtime's atom seeding** (owner `beam_rt`), never to `beam_codec`'s encoder, whose only
+//! job is to preserve the stored order.
 //!
 //! ## Hash maps (> 32 pairs) are encoded too, byte-identically to ERTS
 //!
@@ -252,6 +278,31 @@ fn parse_key_name_list(out: &str) -> Vec<String> {
     inner.split(',').map(|t| t.trim().to_string()).collect()
 }
 
+/// Reads the key order out of a flat `MAP_EXT` (`116`) whose keys are all
+/// `SMALL_ATOM_UTF8_EXT` (`119`) atoms and whose values are small integers — the exact shape
+/// this file's two-atom tests produce. Returns the key names in **wire (== emitted) order**,
+/// so a caller can assert the emitted order directly off the bytes without going through this
+/// crate's decoder (which canonicalises).
+fn flatmap_atom_key_names(image: &[u8]) -> Vec<String> {
+    assert_eq!(image[0], VERSION_MAGIC, "version byte");
+    assert_eq!(image[1], MAP_EXT, "MAP_EXT tag");
+    let count = u32::from_be_bytes([image[2], image[3], image[4], image[5]]) as usize;
+    let mut names = Vec::with_capacity(count);
+    let mut i = 6;
+    for _ in 0..count {
+        assert_eq!(image[i], 119, "the key must be SMALL_ATOM_UTF8_EXT");
+        let len = image[i + 1] as usize;
+        let name = std::str::from_utf8(&image[i + 2..i + 2 + len])
+            .unwrap_or_else(|e| panic!("a UTF-8 atom name: {e}"))
+            .to_string();
+        names.push(name);
+        i += 2 + len;
+        assert_eq!(image[i], 97, "the value must be SMALL_INTEGER_EXT");
+        i += 2;
+    }
+    names
+}
+
 /// A fresh heap for building/decoding a term.
 fn heap(words: usize) -> Heap {
     Heap::new(words).expect("the carrier allocator never fails for this size")
@@ -309,6 +360,79 @@ fn flatmap_pairs_encode_in_stored_order() {
     assert_ne!(
         &bytes[6..],
         &[97, 2, 97, 2, 97, 3, 97, 4, 97, 7, 97, 3, 97, 10, 97, 1][..]
+    );
+}
+
+/// `MAP_EXT` must reproduce a flat map's **stored** pair order even when that order is
+/// deliberately **not** the atom-index order the canonical constructor produces — proof that
+/// sorting atom keys is the *constructor's* job ([`beam_term::map::write_map`], reached
+/// through [`beam_codec::term::make_map`]) and never the encoder's.
+///
+/// The two atoms are interned in the order `aaaq` then `zzzq`, so the atom-index order is
+/// `[aaaq, zzzq]` — the opposite of the pair order `[zzzq, aaaq]` handed to both builders.
+/// [`beam_codec::term::make_flatmap`] keeps the handed order and the encoder emits it
+/// verbatim, while the canonical `make_map` re-sorts it to `[aaaq, zzzq]`; the two images
+/// differ purely by stored order.
+#[test]
+fn encoder_preserves_a_stored_order_that_is_not_atom_index_order() {
+    use beam_codec::term::make_map;
+
+    // Intern `aaaq` FIRST, so index(aaaq) < index(zzzq): the canonical (index) order is
+    // `[aaaq, zzzq]`, the OPPOSITE of the pair order given below (`[zzzq, aaaq]`).
+    let mut atoms = AtomTable::new();
+    let aaaq = atoms.intern("aaaq");
+    let zzzq = atoms.intern("zzzq");
+    assert!(
+        aaaq.raw() < zzzq.raw(),
+        "aaaq must hold the lower atom index in this deliberate interning order"
+    );
+
+    // The same pairs in the caller's non-index order: zzzq first.
+    let caller_order = [
+        (make_atom(zzzq), make_small(1)),
+        (make_atom(aaaq), make_small(2)),
+    ];
+
+    // (a) `make_flatmap` keeps the caller's order verbatim, and the encoder preserves it:
+    //     it must NOT sort the stored pair order into atom-index order.
+    let mut h = heap(64);
+    let flat = make_flatmap(&mut h, &caller_order).expect("a 2-pair flat map is buildable");
+    let (flat_keys, flat_values) = flatmap_parts(flat).expect("a flat map");
+    assert_eq!(
+        flat_keys,
+        &[make_atom(zzzq), make_atom(aaaq)],
+        "make_flatmap must store the caller's pair order as-is"
+    );
+    assert_eq!(flat_values, &[make_small(1), make_small(2)]);
+    let flat_bytes = encode_term(flat, &atoms).expect("a flat map is encodable");
+    assert_eq!(
+        flatmap_atom_key_names(&flat_bytes),
+        vec!["zzzq", "aaaq"],
+        "the encoder must emit the STORED order, not the atom-index order"
+    );
+
+    // (b) The canonical constructor applies `erts_cmp_flatmap_keys`: atom-index order.
+    let mut h2 = heap(64);
+    let canonical =
+        make_map(&mut h2, &caller_order, &atoms).expect("a 2-pair map is buildable");
+    let (canon_keys, canon_values) = flatmap_parts(canonical).expect("a flat map");
+    assert_eq!(
+        canon_keys,
+        &[make_atom(aaaq), make_atom(zzzq)],
+        "make_map must sort atom keys into atom-index order"
+    );
+    assert_eq!(canon_values, &[make_small(2), make_small(1)]);
+    let canon_bytes = encode_term(canonical, &atoms).expect("a flat map is encodable");
+    assert_eq!(
+        flatmap_atom_key_names(&canon_bytes),
+        vec!["aaaq", "zzzq"],
+        "the canonical map emits atom-index order"
+    );
+
+    // The two images differ purely by stored pair order — the encoder re-ordered nothing.
+    assert_ne!(
+        flat_bytes, canon_bytes,
+        "the encoder must not have sorted the stored (non-index) order into index order"
     );
 }
 
@@ -587,6 +711,119 @@ fn atom_keyed_map_matches_the_oracle_in_index_order_not_name_order() {
     );
 
     let ours = encode_term(map, &atoms).expect("an atom-keyed flat map is encodable");
+    assert_eq!(
+        ours, *oracle_image,
+        "our index-ordered flat-map image must be byte-identical to the oracle's"
+    );
+}
+
+/// Pins the flat-map **atom-key order rule** as *atom-table index* on **both** sides, in a
+/// way that is **independent of any atom-table seeding**: the two atoms are created fresh
+/// (`list_to_atom/1` in the oracle, `AtomTable::intern` here) in a deliberately
+/// **non-lexicographic** order (`zzzq` before `aaaq`), so index order is the exact opposite
+/// of name order and both implementations must then agree byte-for-byte.
+///
+/// Because the names are fresh, no boot-time atom table can pre-empt them; the relative
+/// interning order is the only thing that decides the key order on either side, which is the
+/// whole rule under test.
+///
+/// Oracle: `erl -noshell -eval 'A = list_to_atom("zzzq"), B = list_to_atom("aaaq"),
+/// M = #{A => 1, B => 2}, io:format("~w~n",[maps:keys(M)]),
+/// io:format("~w~n",[term_to_binary(M)])' -s init stop`
+/// → `[zzzq,aaaq]` then `<<131,116,0,0,0,2,119,4,"zzzq",97,1,119,4,"aaaq",97,2>>` — `zzzq`
+/// first, the opposite of the name order `[aaaq, zzzq]`.
+#[test]
+fn atom_key_order_is_interning_order_not_name_order_against_the_oracle() {
+    use beam_codec::term::make_map;
+
+    let Some(oracle) =
+        oracle_or_skip("atom_key_order_is_interning_order_not_name_order_against_the_oracle")
+    else {
+        return;
+    };
+
+    // One oracle spawn yields both the key order (`maps:keys/1`) and the wire image.
+    let out = run_erl(
+        &oracle,
+        r#"A = list_to_atom("zzzq"), B = list_to_atom("aaaq"), M = #{A => 1, B => 2}, io:format("~w~n", [maps:keys(M)]), io:format("~w~n", [term_to_binary(M)])"#,
+    );
+    let oracle_keys = parse_key_name_list(&out);
+    let oracle_images = parse_binary_list(&out);
+    assert_eq!(oracle_images.len(), 1, "one oracle image");
+    let oracle_image = &oracle_images[0];
+    assert_eq!(oracle_image[0], VERSION_MAGIC, "version byte");
+    assert_eq!(oracle_image[1], MAP_EXT, "MAP_EXT tag");
+    assert_eq!(
+        u32::from_be_bytes([
+            oracle_image[2],
+            oracle_image[3],
+            oracle_image[4],
+            oracle_image[5]
+        ]),
+        2,
+        "pair count"
+    );
+
+    // The oracle interning `zzzq` first makes its index order `[zzzq, aaaq]` — NOT the name
+    // order `[aaaq, zzzq]`.
+    assert_eq!(
+        oracle_keys,
+        vec!["zzzq", "aaaq"],
+        "the oracle must order atom keys by index (zzzq interned first), not by name"
+    );
+    assert_ne!(
+        oracle_keys,
+        vec!["aaaq", "zzzq"],
+        "the oracle's order must not be lexicographic name order"
+    );
+    // ... and its `term_to_binary/1` carries that same interning order.
+    assert_eq!(
+        flatmap_atom_key_names(oracle_image),
+        vec!["zzzq", "aaaq"],
+        "the oracle's MAP_EXT must emit atom keys in index order"
+    );
+
+    // The SAME relative interning order in a fresh table: zzzq first, then aaaq.
+    let mut atoms = AtomTable::new();
+    let zzzq = atoms.intern("zzzq");
+    let aaaq = atoms.intern("aaaq");
+    assert!(
+        zzzq.raw() < aaaq.raw(),
+        "zzzq must hold the lower atom index in this deliberate interning order"
+    );
+
+    // `make_map` applies the canonical `erts_cmp_flatmap_keys` order (atom index), so the
+    // stored order is the interning order — the opposite of name order.
+    let mut h = heap(64);
+    let pairs = [
+        (make_atom(zzzq), make_small(1)),
+        (make_atom(aaaq), make_small(2)),
+    ];
+    let map = make_map(&mut h, &pairs, &atoms).expect("a 2-pair map is buildable");
+    let (keys, values) = flatmap_parts(map).expect("a flat map");
+    let names: Vec<&str> = keys
+        .iter()
+        .map(|k| atoms.name(atom_val(*k)).unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["zzzq", "aaaq"],
+        "atom keys must order by atom-table INDEX, not by name"
+    );
+    assert_ne!(
+        names,
+        vec!["aaaq", "zzzq"],
+        "the stored order must not be lexicographic name order"
+    );
+    assert_eq!(values, &[make_small(1), make_small(2)]);
+
+    // ... and our encoder emits exactly that order, byte-identical to the oracle's.
+    let ours = encode_term(map, &atoms).expect("an atom-keyed flat map is encodable");
+    assert_eq!(
+        flatmap_atom_key_names(&ours),
+        vec!["zzzq", "aaaq"],
+        "our MAP_EXT must emit atom keys in interning (index) order"
+    );
     assert_eq!(
         ours, *oracle_image,
         "our index-ordered flat-map image must be byte-identical to the oracle's"
