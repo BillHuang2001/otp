@@ -603,6 +603,115 @@ fn a_large_or_negative_limit_does_not_elide() {
     );
 }
 
+/// The **left-adjust** (`~-Ns`) field shape cuts and pads the limited text from the
+/// right (`io_lib_format:adjust/3`'s `[Data|Pad]`), and a bare width / a precision
+/// under the budget behave exactly as on the right-adjust side. This is the clause
+/// `string/6` owns; `tests/io_lib_format_ts_limited.rs` pins the unicode `~ts` twin.
+///
+/// `A = "abcdefghij"` (10 characters) is the one long list used throughout.
+#[test]
+fn left_adjusted_field_width_cuts_the_limited_text() {
+    let reg = default_registry();
+    let mut heap = Heap::new(1 << 20).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    // `io_lib:format("~-10s", ["ab"], [{chars_limit,4}])` => `[[[97,98],32,32]]`:
+    // the two characters fit the budget whole and (left-adjusted) the padding
+    // splices *after* them as the same run; the width is clamped to the budget by
+    // `limit_field/2`, so the field is only 4 wide.
+    check_limited(
+        &mut ctx,
+        &reg,
+        "~-10s",
+        4,
+        |c| vec![char_list(c, "ab")],
+        &E::L(vec![E::L(vec![E::S("ab"), E::I(32), E::I(32)])]),
+    );
+
+    // `io_lib:format("~-10s", [A], [{chars_limit,6}])` => `["abc..."]`: the budget
+    // cuts `A` to `abc` + the elision marker, which is exactly the 6-wide field, so
+    // no padding is added.
+    check_limited(
+        &mut ctx,
+        &reg,
+        "~-10s",
+        6,
+        |c| vec![char_list(c, "abcdefghij")],
+        &E::L(vec![E::S("abc...")]),
+    );
+
+    // `io_lib:format("~-3s", [A], [{chars_limit,3}])` => `["abc"]`: the field 3
+    // equals the budget, so the plain iolist is truncated to the field.
+    check_limited(
+        &mut ctx,
+        &reg,
+        "~-3s",
+        3,
+        |c| vec![char_list(c, "abcdefghij")],
+        &E::L(vec![E::S("abc")]),
+    );
+
+    // A **negative** limit selects the unlimited path, so the left-adjust field just
+    // pads or truncates: `~-10s` keeps all ten characters, `~-3s` cuts to three.
+    check_limited(
+        &mut ctx,
+        &reg,
+        "~-10s",
+        -1,
+        |c| vec![char_list(c, "abcdefghij")],
+        &E::L(vec![E::S("abcdefghij")]),
+    );
+    check_limited(
+        &mut ctx,
+        &reg,
+        "~-3s",
+        -1,
+        |c| vec![char_list(c, "abcdefghij")],
+        &E::L(vec![E::S("abc")]),
+    );
+
+    // `io_lib:format("~10.4s", [A], [{chars_limit,6}])` => `[[[32,32],97,98,99,46]]`:
+    // width 10 + precision 4 (right-adjusted) truncates to 4 and pads to 6, the pad
+    // splicing *before* the data as its own sub-list.
+    check_limited(
+        &mut ctx,
+        &reg,
+        "~10.4s",
+        6,
+        |c| vec![char_list(c, "abcdefghij")],
+        &E::L(vec![E::L(vec![
+            E::S("  "),
+            E::I(97),
+            E::I(98),
+            E::I(99),
+            E::I(46),
+        ])]),
+    );
+
+    // `io_lib:format("~.4s", [A], [{chars_limit,6}])` => `["abc."]`: the precision
+    // alone truncates the limited text (no field, no padding).
+    check_limited(
+        &mut ctx,
+        &reg,
+        "~.4s",
+        6,
+        |c| vec![char_list(c, "abcdefghij")],
+        &E::L(vec![E::S("abc.")]),
+    );
+
+    // `io_lib:format("~0s", [A], [{chars_limit,4}])` => `["abc"]`: a field width of 0
+    // is raised to `limit_field/2`'s floor of 3 and truncates.
+    check_limited(
+        &mut ctx,
+        &reg,
+        "~0s",
+        4,
+        |c| vec![char_list(c, "abcdefghij")],
+        &E::L(vec![E::S("abc")]),
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The live-oracle cross-check (byte-exact, printer-free; skips loudly)
 // ---------------------------------------------------------------------------
@@ -767,6 +876,62 @@ fn oracle_corpus() -> Vec<OracleCase> {
             erl_args: "[\"hello world!!\"]",
             limit: 1_000_000,
             build: Box::new(|c, _r| vec![char_list(c, "hello world!!")]),
+        },
+        OracleCase {
+            name: "left-adjust/limit-4",
+            format: "~-10s",
+            erl_args: "[\"ab\"]",
+            limit: 4,
+            build: Box::new(|c, _r| vec![char_list(c, "ab")]),
+        },
+        OracleCase {
+            name: "left-adjust/limit-6",
+            format: "~-10s",
+            erl_args: "[\"abcdefghij\"]",
+            limit: 6,
+            build: Box::new(|c, _r| vec![char_list(c, "abcdefghij")]),
+        },
+        OracleCase {
+            name: "left-adjust/limit-3",
+            format: "~-3s",
+            erl_args: "[\"abcdefghij\"]",
+            limit: 3,
+            build: Box::new(|c, _r| vec![char_list(c, "abcdefghij")]),
+        },
+        OracleCase {
+            name: "left-adjust/negative-limit",
+            format: "~-10s",
+            erl_args: "[\"abcdefghij\"]",
+            limit: -1,
+            build: Box::new(|c, _r| vec![char_list(c, "abcdefghij")]),
+        },
+        OracleCase {
+            name: "left-adjust/negative-limit-cut",
+            format: "~-3s",
+            erl_args: "[\"abcdefghij\"]",
+            limit: -1,
+            build: Box::new(|c, _r| vec![char_list(c, "abcdefghij")]),
+        },
+        OracleCase {
+            name: "width-and-precision/limit-6",
+            format: "~10.4s",
+            erl_args: "[\"abcdefghij\"]",
+            limit: 6,
+            build: Box::new(|c, _r| vec![char_list(c, "abcdefghij")]),
+        },
+        OracleCase {
+            name: "precision-alone/limit-6",
+            format: "~.4s",
+            erl_args: "[\"abcdefghij\"]",
+            limit: 6,
+            build: Box::new(|c, _r| vec![char_list(c, "abcdefghij")]),
+        },
+        OracleCase {
+            name: "zero-width/limit-4",
+            format: "~0s",
+            erl_args: "[\"abcdefghij\"]",
+            limit: 4,
+            build: Box::new(|c, _r| vec![char_list(c, "abcdefghij")]),
         },
         OracleCase {
             name: "error/improper-list",
