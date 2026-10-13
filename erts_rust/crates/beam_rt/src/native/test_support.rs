@@ -41,6 +41,23 @@ pub(crate) fn runtime() -> Runtime {
     Runtime::with_defaults().expect("the default runtime")
 }
 
+/// An **external** (remote) pid term naming a process on `node`, plus the heap it lives on.
+///
+/// The term is the boxed 4-word thing `beam_codec`'s external-pid encoder builds (the same
+/// encoder the compiled-module suites use — never a second one), so `PidTarget::from_eterm`
+/// classifies it as [`beam_process::PidTarget::Remote`]. `node` is interned in the runtime's
+/// **shared** atom table, so the term's node slot is the very `Eterm` a router keys an
+/// established link by.
+///
+/// The returned [`beam_alloc::Heap`] **owns** the term's words: keep it alive (bind it to a
+/// local, however unused) for as long as the term is passed around.
+pub(crate) fn remote_pid(runtime: &mut Runtime, node: &str) -> (beam_alloc::Heap, Eterm) {
+    let node = make_atom(runtime.code_server_atoms_mut().intern(node));
+    let mut heap = beam_alloc::Heap::new(64).expect("a scratch heap");
+    let term = beam_codec::term::make_external_pid(&mut heap, node, 1, 0, 0x1234_5678)
+        .expect("an external pid");
+    (heap, term)
+}
 /// A runtime whose system code path resolved, or `None` (the caller then skips
 /// **loudly**) when no system Erlang is available.
 pub(crate) fn system_runtime() -> Option<Runtime> {

@@ -849,9 +849,14 @@ impl InboundSink for LocalDeliverySink<'_> {
             // (`erts_link_external_create` + `erts_link_dist_insert`) and sends a LINK
             // signal that only the target's own link-tree dedup
             // (`erts_link_tree_lookup_insert`, `erl_proc_sig_queue.c:6632-6643`)
-            // collapses. It looks harmless *today* only because this runtime installs no
-            // router at all (the connector half is unwired) — i.e. routing Link now
-            // would silently start emitting a wire message the moment one lands. Needs
+            // collapses. Nor is the echo hypothetical: the router **is** installed
+            // whenever `-name`/`-sname` made this runtime a node
+            // (`src/runtime.rs`'s `processes.set_dist_router(client.router())`, the
+            // connector half being [`crate::dist_client`]), so routing an inbound Link
+            // through `link_term` today would really put that echo on the wire — or,
+            // with no established link to the peer's node, surface the router's own
+            // `distribution: no established connection to node …` error for an
+            // *inbound* signal the C serves unconditionally. Needs
             // `record_remote_link(to: ProcessId, remote: RemotePid)`: record-only, no
             // outbound signal.
             Delivery::Link { .. } => Ok(DeliveryOutcome::Unsupported),

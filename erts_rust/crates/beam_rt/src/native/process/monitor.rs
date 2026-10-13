@@ -520,7 +520,7 @@ mod tests {
     use beam_bifs::NullSink;
     use beam_term::{make_small, signed_value, NIL};
 
-    use crate::native::test_support::{atom, call, runtime};
+    use crate::native::test_support::{atom, call, remote_pid, runtime};
 
     /// Whether `term` is a reference, asked through the registry's own `is_reference/1`.
     fn is_reference(runtime: &mut crate::Runtime, term: Eterm) -> bool {
@@ -820,6 +820,69 @@ mod tests {
                 "monitor(process, {target:?}) is badarg"
             );
         }
+    }
+
+    /// **A remote pid is a remote monitor, not a capability gap.**
+    ///
+    /// Oracle-verified against a real `erl -sname` peer:
+    /// `erlang:monitor(process, RemotePid)` ⇒ `#Ref<>` and `demonitor(Ref, [info])` ⇒ `true`.
+    /// The target is classified once through `PidTarget::from_eterm`; a remote pid reaches
+    /// `ProcessTable::monitor_term_with_options`, which records the outgoing remote monitor
+    /// (and, on a node runtime, routes `DOP_MONITOR_P`). This runtime is **not** a
+    /// distributed node, so no router is installed — `ProcessTable::route` is a no-op and
+    /// the local record is all that happens — and the answer is a fresh reference, where the
+    /// front door used to answer `badarg`.
+    ///
+    /// The remote **`{Name, Node}`** shape is untouched: it is not a pid, so it still
+    /// classifies into the tuple arm and stays the typed capability gap.
+    #[test]
+    fn monitor_of_a_remote_pid_is_a_reference_and_a_remote_name_stays_a_gap() {
+        let mut runtime = runtime();
+        let process = atom(&mut runtime, "process");
+        let watcher = runtime.self_pid();
+        // The term's words live on `_remote_heap`, so the heap must outlive every use below.
+        let (_remote_heap, remote) = remote_pid(&mut runtime, "elsewhere@host");
+
+        let reference = monitor_target(&mut runtime, remote);
+        assert!(
+            is_reference(&mut runtime, reference),
+            "erlang:monitor/2 on a remote pid answers a reference"
+        );
+        let recorded = runtime.processes().remote_monitors(watcher);
+        assert_eq!(recorded.len(), 1, "the outgoing remote monitor is recorded");
+        assert_eq!(
+            recorded[0].remote,
+            beam_process::RemotePid::from_eterm(remote).expect("an external pid"),
+            "the record names the watched remote pid"
+        );
+        assert_eq!(recorded[0].kind, MonitorKind::Process, "a `process` kind");
+        assert_eq!(
+            monitor_count(&runtime, watcher),
+            0,
+            "a remote monitor installs no *local* monitor"
+        );
+
+        // The answered reference is the very one `demonitor/1` recognises.
+        let answer = call(&mut runtime, "erlang", "demonitor", &[reference]).expect("demonitor/1");
+        assert_eq!(atom_name(&runtime, answer), Some("true"));
+        assert!(
+            runtime.processes().remote_monitors(watcher).is_empty(),
+            "demonitor/1 removes the recorded remote monitor"
+        );
+
+        // A `{Name, OtherNode}` target is still the typed capability gap: `Name` would be
+        // resolved against **this** node's registration table, so a foreign node would watch
+        // a local process the caller never asked about.
+        let name = atom(&mut runtime, "myreg");
+        let other = atom(&mut runtime, "elsewhere@host");
+        let remote_name = make_tuple(&mut runtime, &[name, other]);
+        let error = call(&mut runtime, "erlang", "monitor", &[process, remote_name])
+            .expect_err("a remote {Name, Node} monitor is the typed gap");
+        assert_eq!(
+            crate::error::unsupported_reason(&error).as_deref(),
+            Some("erlang:monitor/2 on a {Name, Node} of another node"),
+            "{error}"
+        );
     }
 
     #[test]

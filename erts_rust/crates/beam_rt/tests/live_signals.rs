@@ -18,31 +18,35 @@
 //
 // %CopyrightEnd%
 
-//! The **outbound distribution *signal* router** (contract A.5, phase 2) against a
-//! **real system `erl` peer**.
+//! The **outbound distribution *signal* path** (contract A.5, phase 2) against a
+//! **real system `erl` peer**: the `erlang:link/1` front door on a remote pid, and the
+//! `beam_process::DistSignalRouter` seam a [`Runtime`](beam_rt::Runtime) installs on its
+//! process table (`Runtime::new` → `ProcessTable::set_dist_router`).
 //!
 //! [`tests/dist_client.rs`](../dist_client.rs) pins the outbound *message* path (this
 //! runtime dials a real peer and `DOP_REG_SEND`s it a payload). This suite pins the
-//! outbound *signal* path — the `beam_process::DistSignalRouter` seam a
-//! [`Runtime`](beam_rt::Runtime) installs on its process table
-//! (`Runtime::new` → `ProcessTable::set_dist_router`), whose live end was previously
-//! unproven: the only wiring test
+//! outbound *signal* path, whose live end was previously unproven: the only wiring test
 //! (`runtime/scheduler/tests.rs::the_outbound_distribution_client_is_wired_and_driven_by_the_runtime`)
 //! is a loopback that has `beam_dist`'s own server driver decode the queued control
 //! message — no real `erl` ever acted on one.
 //!
 //! # The proof
 //!
-//! One peer session routes **two** control messages through the *runtime-installed*
-//! router ([`DistClient::router`](beam_rt::DistClient::router), the same `Rc` the process
-//! table holds):
+//! One peer session establishes the link and then routes the exit for that same pair. The
+//! three sessions differ **only** in how the link is established:
 //!
 //! 1. [`DistSignal::Link`] from this runtime's own pid to the peer's pid → `DOP_LINK`
 //!    (`dist.c:2224` `{DOP_LINK, From, To}` with `From` first — the order
 //!    [`beam_process::remote`](../src/../beam_process/src/remote.rs) documents and
-//!    `beam_dist`'s own live interop exercises);
+//!    `beam_dist`'s own live interop exercises). The **subject** case establishes it by
+//!    calling the real `erlang:link/1` BIF
+//!    ([`RuntimeContext::call_bif`](beam_rt::RuntimeContext), the front door a program
+//!    actually calls); the sibling case routes the same signal through the
+//!    runtime-installed router
+//!    ([`DistClient::router`](beam_rt::DistClient::router), the same `Rc` the process table
+//!    holds) directly, so the seam itself keeps its own live proof;
 //! 2. [`DistSignal::Exit`] for that same pair → `DOP_EXIT` (`dist.c:2760`,
-//!    "`from`, which `to` is linked to, died").
+//!    "`from`, which `to` is linked to, died"), routed through the router in both cases.
 //!
 //! The peer runs `process_flag(trap_exit, true)` and then blocks on
 //! `receive {'EXIT', From, Reason} → io:format("LINKEXIT ~p ~p ~p~n", [From, node(From), Reason])`.
@@ -53,7 +57,7 @@
 //! in the target's link tree and sets `ignore = destroy = !0` when it is absent
 //! (`erl_proc_sig_queue.c:4674-4679`), so the exit is silently dropped. That same
 //! mechanism is the **negative control** (`without_the_link_the_exit_is_not_delivered`):
-//! the byte-identical peer session with the `DistSignal::Link` step skipped reports
+//! the byte-identical peer session with the link step skipped reports
 //! `NOLINKEXIT`, which is what makes the `LINKEXIT` observation non-vacuous.
 //!
 //! # The peer's real pid
@@ -68,20 +72,18 @@
 //! [`DistClient::is_connected_to_node`](beam_rt::DistClient::is_connected_to_node)
 //! asserts before anything is routed.
 //!
-//! # Why the peer is driven through [`DistClient`] and not `erlang:link/1`
+//! # The `erlang:link/1` front door, and why the router case stays
 //!
-//! The objective this suite was written for names `erlang:link/1` on a remote pid as the
-//! trigger. That BIF route is **blocked by a source-level capability gap today**:
-//! `RuntimeHooksBridge::link` (`beam_rt/src/context/runtime_hooks.rs`) classifies its
-//! argument with `local_pid`, which rejects `PidTarget::Remote` with the typed
-//! `unsupported: erlang:link/1 on a remote pid: distribution is not implemented`
-//! (exit 3) — *even though* the process table's own `link_term`/`unlink_term` already
-//! route `DistSignal::Link`/`Unlink` for a `PidTarget::Remote`
-//! (`beam_process/src/ptab.rs:2781`) and a dying process's `terminate_into` drains its
-//! `remote_links` into `DistSignal::Exit`. So the router's **live** end is reachable
-//! today only through the seam itself, which is exactly what this suite drives; the BIF
-//! guard is a `beam_rt` source gap that belongs to the agent that owns
-//! `src/context/runtime_hooks.rs` and is reported up rather than papered over here.
+//! `erlang:link/1` on a remote pid used to be a source-level capability gap here
+//! (`unsupported: erlang:link/1 on a remote pid: distribution is not implemented`, exit 3).
+//! `RuntimeHooksBridge::link` (`beam_rt/src/context/runtime_hooks.rs`) now classifies its
+//! argument with `link_target`, so a `PidTarget::Remote` reaches
+//! `ProcessTable::link_term` (`beam_process/src/ptab.rs:2781`) — which records the remote
+//! link **and** routes `DistSignal::Link` through the router the runtime installed. The
+//! subject case therefore drives the peer through the BIF itself, which is the route a
+//! program actually takes; the router case stays beside it, because it pins the seam
+//! (and its wire encoding) independently of the BIF's classification, so a regression is
+//! attributed to one half or the other.
 //!
 //! Every test is a **loud skip** (`SKIP: …` + early `return`, never a panic and never a
 //! silent pass) when no usable `erl`/`epmd` is available, the peers are killed and reaped
@@ -95,11 +97,14 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use beam_alloc::Heap;
+use beam_bifs::NullSink;
+use beam_engine::ExecutionContext;
 use beam_process::{DistSignal, RemotePid};
-use beam_rt::{Runtime, RuntimeConfig};
+use beam_rt::{Runtime, RuntimeConfig, RuntimeContext};
 
 // The shared harness is compiled into every test target; this target only uses a
 // subset of it, so the unused helpers would otherwise warn here.
@@ -127,6 +132,13 @@ const CONTROL_WAIT: Duration = Duration::from_secs(12);
 fn unique(tag: &str) -> String {
     format!("beamrtls{}{}", tag, std::process::id())
 }
+
+/// A session counter, because libtest runs this target's tests **in parallel threads of one
+/// OS process**: a tag keyed on the process id alone would hand two concurrent sessions the
+/// same `-sname`, and `erl` refuses to start ("the name … seems to be in use by another
+/// Erlang node") — as does this runtime's own listener. Every session therefore appends its
+/// own ordinal.
+static SESSION: AtomicUsize = AtomicUsize::new(0);
 
 /// The **oracle** `erl` to spawn as the peer, resolved without running it; a missing
 /// toolchain is the shared loud skip ([`support::require_oracle`]).
@@ -344,16 +356,37 @@ fn decode_remote_pid(rt: &mut Runtime, hex: &str) -> RemotePid {
         .unwrap_or_else(|err| panic!("the decoded peer pid is not an external pid: {err:?}"))
 }
 
+/// How a session establishes the link between this runtime's own pid and the peer's.
+///
+/// The exit half is routed through the runtime-installed
+/// [`DistSignalRouter`](beam_process::DistSignalRouter) in every non-`None` case: this
+/// suite proves the **link** front door, not an `exit/2` one (and a dying process's own
+/// termination drains its `remote_links` into `DistSignal::Exit` anyway).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LinkRoute {
+    /// The **real front door**: `erlang:link/1` on the peer's external pid term through the
+    /// ordinary BIF dispatch a running program's `link(Pid)` reaches.
+    Bif,
+    /// The [`DistClient`](beam_rt::DistClient)-installed
+    /// [`DistSignalRouter`](beam_process::DistSignalRouter) directly — the seam the BIF route
+    /// delegates to, pinned independently of the BIF's own classification.
+    Router,
+    /// No link at all: the **negative control**.
+    None,
+}
+
 /// Runs one live session and returns the peer's own final line.
 ///
-/// `link` selects the **subject** (route `DOP_LINK`, then `DOP_EXIT`) or the **negative
-/// control** (route only the `DOP_EXIT`). Everything else — the peer, this runtime's
-/// node identity, the connector handshake and the pid decoding — is identical, so the
-/// only difference between a `LINKEXIT` and a `NOLINKEXIT` is whether the `DOP_LINK` was
-/// routed.
-fn run_session(oracle: &Path, link: bool) -> String {
-    let peer_node = unique("p");
-    let our_node = unique("c");
+/// `route` selects the **subject** shape (establish the link — through `erlang:link/1` or
+/// through the router seam — then route `DOP_EXIT`) or the **negative control** (route only
+/// the `DOP_EXIT`). Everything else — the peer, this runtime's node identity, the connector
+/// handshake and the pid decoding — is identical, so the only difference between a
+/// `LINKEXIT` and a `NOLINKEXIT` is whether the `DOP_LINK` was routed.
+fn run_session(oracle: &Path, route: LinkRoute) -> String {
+    let link = route != LinkRoute::None;
+    let session = SESSION.fetch_add(1, Ordering::Relaxed);
+    let peer_node = format!("{}{}", unique("p"), session);
+    let our_node = format!("{}{}", unique("c"), session);
     let cookie = unique("k");
     let port = free_port();
     let peer_timeout_ms = if link {
@@ -431,12 +464,44 @@ fn run_session(oracle: &Path, link: bool) -> String {
     };
 
     if link {
-        router
-            .route(DistSignal::Link {
-                from,
-                to: remote,
-            })
-            .expect("queue the outbound DOP_LINK");
+        match route {
+            LinkRoute::Bif => {
+                // **The real Erlang front door.** `erlang:link/1` reaches
+                // `RuntimeHooksBridge::link`, which classifies the argument as a remote pid and
+                // hands it to `ProcessTable::link_term` (record the remote link, then route
+                // `DistSignal::Link` through the installed router). The external pid term must
+                // live on a heap that outlives the call, so it is materialised here.
+                let mut pid_heap = Heap::new(256).expect("a remote-pid heap");
+                let remote_term = remote
+                    .to_eterm(&mut pid_heap)
+                    .expect("the peer's pid as an external pid term");
+                let answer = {
+                    let mut sink = NullSink;
+                    let mut ctx = RuntimeContext::with_output(&mut rt, &mut sink);
+                    ctx.call_bif("erlang", "link", 1, &[remote_term])
+                        .expect("erlang:link/1 on a remote pid")
+                };
+                assert_eq!(
+                    rt.atom_name_of(answer),
+                    Some("true"),
+                    "the erlang:link/1 front door answers the atom `true`"
+                );
+                assert_eq!(
+                    rt.processes().remote_links(from).len(),
+                    1,
+                    "the front door recorded exactly one remote link"
+                );
+            }
+            LinkRoute::Router => {
+                router
+                    .route(DistSignal::Link {
+                        from,
+                        to: remote,
+                    })
+                    .expect("queue the outbound DOP_LINK");
+            }
+            LinkRoute::None => {}
+        }
         // The scheduler pass is what writes the queued control to the socket
         // (`pump_dist_client` → `DistClient::pump`).
         rt.run_one_slice().expect("a scheduler pass");
@@ -510,12 +575,13 @@ fn run_session(oracle: &Path, link: bool) -> String {
     line
 }
 
-/// **The outbound signal router, end to end.** A `DOP_LINK` and a `DOP_EXIT` routed
-/// through the runtime-installed [`beam_process::DistSignalRouter`] are acted on by a
-/// real `erl` node: the linked, exit-trapping peer process receives
+/// **The `erlang:link/1` front door, end to end.** A real program's `link(Pid)` on the
+/// peer's remote pid establishes a `DOP_LINK` through the production BIF dispatch (not
+/// through the router seam directly), and a `DOP_EXIT` for that same pair is then acted on
+/// by a real `erl` node: the linked, exit-trapping peer process receives
 /// `{'EXIT', OurPid, router_boom}` and prints it.
 #[test]
-fn a_routed_link_and_exit_reach_a_real_erl_peer() {
+fn a_bif_link_and_exit_reach_a_real_erl_peer() {
     let Some(oracle) = oracle() else {
         return; // `require_oracle` already reported the loud skip
     };
@@ -528,15 +594,41 @@ fn a_routed_link_and_exit_reach_a_real_erl_peer() {
         return;
     }
 
-    let line = run_session(&oracle, true);
+    let line = run_session(&oracle, LinkRoute::Bif);
     assert!(
         line.starts_with("LINKEXIT "),
-        "the real peer reported the link exit it could only see with the DOP_LINK installed \
-         (got {line:?})"
+        "the real peer reported the link exit it could only see with the DOP_LINK the \
+         `erlang:link/1` front door queued (got {line:?})"
     );
 }
 
-/// **The negative control** — the same session with the `DistSignal::Link` step skipped.
+/// **The router seam, end to end.** The same proof with the `DistSignal::Link` routed
+/// through the runtime-installed [`beam_process::DistSignalRouter`] directly, so a
+/// regression is attributable to the seam itself rather than to the BIF's own remote-pid
+/// classification.
+#[test]
+fn a_router_routed_link_and_exit_reach_a_real_erl_peer() {
+    let Some(oracle) = oracle() else {
+        return; // `require_oracle` already reported the loud skip
+    };
+    if epmd_unreachable() {
+        eprintln!(
+            "SKIP: the peer must register with `epmd` (and this runtime resolves it there), \
+             and no daemon answers on {}",
+            beam_dist::EPMD_DEFAULT_ADDR
+        );
+        return;
+    }
+
+    let line = run_session(&oracle, LinkRoute::Router);
+    assert!(
+        line.starts_with("LINKEXIT "),
+        "the real peer reported the link exit it could only see with the DOP_LINK routed \
+         through the runtime's own `DistSignalRouter` (got {line:?})"
+    );
+}
+
+/// **The negative control** — the same session with the link step skipped.
 ///
 /// ERTS drops a `DOP_EXIT` whose `from` is not in the target's link tree
 /// (`erl_proc_sig_queue.c:4674-4679`), so a byte-identical, exit-trapping peer that was
@@ -556,7 +648,7 @@ fn without_the_link_the_exit_is_not_delivered() {
         return;
     }
 
-    let line = run_session(&oracle, false);
+    let line = run_session(&oracle, LinkRoute::None);
     assert!(
         line.starts_with("NOLINKEXIT"),
         "with no DOP_LINK routed, the peer's exit-trapping process must not receive an exit \

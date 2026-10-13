@@ -104,7 +104,7 @@ mod prim;
 mod prim_file;
 mod process;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 
 use std::process::Command;
 

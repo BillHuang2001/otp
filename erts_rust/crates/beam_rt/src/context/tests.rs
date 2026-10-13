@@ -27,6 +27,7 @@ use beam_term::{atom_val, is_small, make_atom, make_small, signed_value, Atom, A
 use super::*;
 use crate::config::RuntimeConfig;
 use crate::context::test_support::{compile_fixtures, resolve_erlc, skip_loudly};
+use crate::native::test_support::remote_pid;
 fn runtime() -> Runtime {
     Runtime::new(RuntimeConfig::default()).expect("the default runtime")
 }
@@ -2325,6 +2326,117 @@ fn the_runtime_hooks_bridge_serves_the_timer_and_export_families() {
 }
 
 // ---------------------------------------------------------------------------
+// `erlang:link/1` / `erlang:unlink/1`: the pid-taking front door on a **remote** pid.
+// ---------------------------------------------------------------------------
+
+/// `erlang:link/1` and `erlang:unlink/1` with a **remote** pid: both answer the atom
+/// `true`, and the relationship is recorded where the rest of the runtime reads it.
+///
+/// Oracle (OTP 29/`erts-17.1`, measured against a real `erl -sname` peer):
+/// `erlang:link(RemotePid)` ⇒ `true` and `erlang:unlink(RemotePid)` ⇒ `true`. Before the
+/// front-door change both answered the blanket capability gap
+/// `unsupported: erlang:link/1 on a remote pid: distribution is not implemented`.
+///
+/// A runtime with no `-name`/`-sname` installs **no** `DistSignalRouter` on its process
+/// table (`Runtime::new`), so `ProcessTable::route` is a no-op and the local record is the
+/// whole observable effect — which is exactly the oracle's answer for this BIF, never a
+/// fabricated success on top of a silently dropped signal. A non-pid stays `badarg`.
+#[test]
+fn the_link_and_unlink_front_doors_serve_a_remote_pid() {
+    let mut rt = runtime();
+    let me = rt.self_pid();
+    let true_atom = rt.intern("true");
+    // The term's words live on `_remote_heap`, so the heap must outlive every use below.
+    let (_remote_heap, remote) = remote_pid(&mut rt, "peer@localhost");
+    assert!(
+        !rt.processes().has_dist_router(),
+        "a runtime with no -name/-sname installs no router"
+    );
+
+    {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        assert_eq!(
+            ctx.call_bif("erlang", "link", 1, &[remote])
+                .expect("erlang:link(RemotePid)"),
+            true_atom,
+            "link/1 on a remote pid answers `true`"
+        );
+    }
+    assert_eq!(
+        rt.processes().remote_links(me).len(),
+        1,
+        "the remote link is recorded on the caller"
+    );
+    {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        assert_eq!(
+            ctx.call_bif("erlang", "unlink", 1, &[remote])
+                .expect("erlang:unlink(RemotePid)"),
+            true_atom,
+            "unlink/1 on a remote pid answers `true`"
+        );
+    }
+    assert!(
+        rt.processes().remote_links(me).is_empty(),
+        "the remote link is dropped again"
+    );
+
+    // The `badarg` rule for a non-pid is unchanged by the remote arm.
+    let mut ctx = RuntimeContext::new(&mut rt);
+    for function in ["link", "unlink"] {
+        let error = ctx
+            .call_bif("erlang", function, 1, &[make_small(1)])
+            .expect_err("a non-pid is badarg");
+        assert_eq!(error.as_atom(), Some("badarg"), "{function}(1): {error}");
+    }
+}
+
+/// The same two BIFs on a runtime that **is** a node but holds no established link to the
+/// peer's node: the router's own typed transport error surfaces — never the stale blanket
+/// `distribution is not implemented` gap, and never a fabricated `true`.
+///
+/// Construction only binds the listener; `epmd` is touched by the *listening* half's first
+/// pump, which this case never runs. A sandbox that cannot bind a listener skips loudly
+/// (the same rule `src/info/dist.rs`'s node case applies).
+#[test]
+fn the_link_and_unlink_front_doors_report_the_routers_own_error_with_no_link() {
+    let config = RuntimeConfig::default().with_node_name("unitlink@localhost");
+    let Ok(mut rt) = Runtime::new(config) else {
+        eprintln!(
+            "SKIP the_link_and_unlink_front_doors_report_the_routers_own_error_with_no_link: \
+             could not bind a distribution listener"
+        );
+        return;
+    };
+    assert!(
+        rt.processes().has_dist_router(),
+        "a node installs the client's DistSignalRouter on the process table"
+    );
+    let (_remote_heap, remote) = remote_pid(&mut rt, "peer@localhost");
+    let mut ctx = RuntimeContext::new(&mut rt);
+
+    for function in ["link", "unlink"] {
+        let error = ctx
+            .call_bif("erlang", function, 1, &[remote])
+            .expect_err("a remote pid with no link is an error, never a fabricated `true`");
+        let reason = error.to_string();
+        assert!(
+            reason.contains("no established connection to node"),
+            "{function}/1 must surface the router's own transport error, got {reason:?}"
+        );
+        assert!(
+            !reason.contains("distribution is not implemented"),
+            "{function}/1 must not fall back to the stale blanket gap, got {reason:?}"
+        );
+        assert!(
+            crate::error::unsupported_reason(&error).is_none(),
+            "{function}/1 on a connectable remote pid is an ordinary error, not a capability \
+             gap: {reason:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // `erlang:function_exported/3`'s membership source.
 //
 // The C answer is `true` iff the module is **loaded and exports** `F/A` **or** `M:F/A` is
@@ -3548,11 +3660,8 @@ fn the_runtime_hooks_bridge_serves_the_internal_notsup_and_constants() {
     let call = rt.intern("call");
     let warning = rt.intern("warning");
     let me = rt.self_pid().to_eterm();
-    let remote_node = rt.intern("elsewhere@host");
-    let mut remote_heap = beam_alloc::Heap::new(64).expect("a scratch heap");
-    let remote_pid =
-        beam_codec::term::make_external_pid(&mut remote_heap, remote_node, 1, 0, 0x1234_5678)
-            .expect("an external pid");
+    // The term's words live on `_remote_heap`, so the heap must outlive every use below.
+    let (_remote_heap, remote) = remote_pid(&mut rt, "elsewhere@host");
     let mut ctx = RuntimeContext::new(&mut rt);
 
     for function in ["is_system_process", "is_process_executing_dirty"] {
@@ -3565,7 +3674,7 @@ fn the_runtime_hooks_bridge_serves_the_internal_notsup_and_constants() {
         // A remote pid needs the peer's process record (distribution, contract A.5), so it
         // is the typed gap rather than a fabricated `false`.
         let error = ctx
-            .call_bif("erts_internal", function, 1, &[remote_pid])
+            .call_bif("erts_internal", function, 1, &[remote])
             .expect_err("a remote pid is a typed gap");
         shared_gap(
             &error,
