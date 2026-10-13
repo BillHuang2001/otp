@@ -261,12 +261,12 @@ fn create(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     // `make_hash2({module, name, is_exported, keys})`: a record's `erlang:phash2/1`
     // mixes it, so the `0` placeholder `access::native_record_write` leaves is a
     // fabricated value. `beam_codec::term::make_record` writes the real one (it
-    // needs the atom table to name the module/name/keys, so the caller's table is
-    // cloned first — `ctx.heap()` and `ctx.atoms()` cannot be borrowed at once).
-    let atoms = ctx.atoms().clone();
+    // needs the atom table to name the module/name/keys, so the caller's table and
+    // heap are split in one borrow — `ctx.atom_and_heap()` — rather than cloned).
+    let (atoms, heap) = ctx.atom_and_heap();
     beam_codec::term::make_record(
-        ctx.heap(),
-        &atoms,
+        heap,
+        atoms,
         atom_val(module),
         atom_val(name),
         is_exported,
@@ -372,12 +372,14 @@ fn update(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     // Preserve the record's own definition (module/name/is_exported), and carry its
     // real cached definition hash: `beam_codec::term::make_record` recomputes it
     // from those same four inputs (see the `create` call site), whereas
-    // `access::native_record_write` would write back the fabricated `0`.
+    // `access::native_record_write` would write back the fabricated `0`. The atom
+    // table and the caller heap are split in one borrow (`ctx.atom_and_heap()`)
+    // rather than cloned.
     let is_exported = atom_val(rec_exported) == beam_term::AM_TRUE;
-    let atoms = ctx.atoms().clone();
+    let (atoms, heap) = ctx.atom_and_heap();
     beam_codec::term::make_record(
-        ctx.heap(),
-        &atoms,
+        heap,
+        atoms,
         atom_val(rec_module),
         atom_val(rec_name),
         is_exported,

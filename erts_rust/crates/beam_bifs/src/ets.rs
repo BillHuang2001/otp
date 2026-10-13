@@ -1235,11 +1235,13 @@ fn update_counter_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let update_op = args[2];
     let mut table = take_table_gated(ctx, handle, resolve::Gate::Write)?;
     // `Table::update_counter` needs the atom table *and* the caller heap at once;
-    // the context lends them through two conflicting borrows, so it is given a
-    // clone of the atom table (identical indices, and the call only reads it —
-    // see `binconv::decode_term_bif` for the same pattern).
-    let atoms = ctx.atoms().clone();
-    let outcome = table.update_counter(key, update_op, &atoms, ctx.heap());
+    // the context lends them through two conflicting borrows, so it splits the two
+    // disjoint fields in a single borrow (`ctx.atom_and_heap()`) rather than cloning
+    // the table — see `binconv::decode_term_bif` for the same pattern.
+    let outcome = {
+        let (atoms, heap) = ctx.atom_and_heap();
+        table.update_counter(key, update_op, atoms, heap)
+    };
     restore_table(ctx, handle, table)?;
     outcome
 }
@@ -1253,8 +1255,11 @@ fn update_counter_4(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let update_op = args[2];
     let default = args[3];
     let mut table = take_table_gated(ctx, handle, resolve::Gate::Write)?;
-    let atoms = ctx.atoms().clone();
-    let outcome = table.update_counter_with(key, update_op, default, &atoms, ctx.heap());
+    // As [`update_counter_3`]: split the table/heap borrow instead of cloning.
+    let outcome = {
+        let (atoms, heap) = ctx.atom_and_heap();
+        table.update_counter_with(key, update_op, default, atoms, heap)
+    };
     restore_table(ctx, handle, table)?;
     outcome
 }
@@ -1289,8 +1294,8 @@ fn update_element_of(
     ctx: &mut BifContext<'_>,
 ) -> Result<bool> {
     let updates = parse_updates(spec)?;
-    let atoms = ctx.atoms().clone();
-    table.update_element(key, &updates, &atoms, ctx.heap())
+    let (atoms, heap) = ctx.atom_and_heap();
+    table.update_element(key, &updates, atoms, heap)
 }
 
 /// The `{Pos, Value}` / `[{Pos, Value}, …]` element updates of
@@ -1332,11 +1337,13 @@ fn select_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
     let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
     // `Table::select` needs the atom table *and* the caller heap at once; the
-    // context lends them through two conflicting borrows, so it is given a clone
-    // of the atom table (identical indices, and the call only reads it — the same
-    // pattern `update_counter` uses).
-    let atoms = ctx.atoms().clone();
-    let outcome = table.select(&spec, &atoms, ctx.heap());
+    // context splits the two disjoint fields in a single borrow
+    // (`ctx.atom_and_heap()`) rather than cloning the table — the same pattern
+    // `update_counter` and `binconv::decode_term_bif` use.
+    let outcome = {
+        let (atoms, heap) = ctx.atom_and_heap();
+        table.select(&spec, atoms, heap)
+    };
     restore_table(ctx, handle, table)?;
     copy_out_list(outcome?, ctx)
 }
@@ -1356,8 +1363,10 @@ fn select_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let limit = element_pos(args[2])?;
 
     let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
-    let atoms = ctx.atoms().clone();
-    let outcome = table.select_limit(&spec, limit, &atoms, ctx.heap());
+    let outcome = {
+        let (atoms, heap) = ctx.atom_and_heap();
+        table.select_limit(&spec, limit, atoms, heap)
+    };
     restore_table(ctx, handle, table)?;
     let (results, cont) = outcome?;
     finish_chunk(ctx, handle, results, cont, false)
@@ -1443,8 +1452,10 @@ pub(super) fn resume_continuation(
     };
 
     let table = take_table(ctx, table_handle)?;
-    let atoms = ctx.atoms().clone();
-    let outcome = resume(&table, &cont, reverse, &atoms, ctx.heap());
+    let outcome = {
+        let (atoms, heap) = ctx.atom_and_heap();
+        resume(&table, &cont, reverse, atoms, heap)
+    };
     restore_table(ctx, table_handle, table)?;
     let (results, next) = outcome?;
     finish_chunk(ctx, table_handle, results, next, reverse)

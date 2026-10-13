@@ -322,13 +322,13 @@ fn update_element_with_default(
         TableKind::Bag | TableKind::DuplicateBag => return Err(badarg()),
     }
     let updates = parse_updates(spec)?;
-    // `Table::update_element` needs the atom table *and* the caller heap at once;
-    // the context lends them through two conflicting borrows, so it is given a
-    // clone of the atom table (identical indices, and the call only reads it — the
-    // same pattern the sibling `update_element/3` uses).
-    let atoms = ctx.atoms().clone();
-    if table.member(key, &atoms) {
-        return table.update_element(key, &updates, &atoms, ctx.heap());
+    // `Table::member`/`update_element` need the atom table *and* the caller heap at
+    // once; the context splits the two disjoint fields in a single borrow
+    // (`ctx.atom_and_heap()`) rather than cloning the table — the same pattern the
+    // sibling `update_element/3` uses.
+    let (atoms, heap) = ctx.atom_and_heap();
+    if table.member(key, atoms) {
+        return table.update_element(key, &updates, atoms, heap);
     }
     // Absent key: the default object (with its key slot replaced by `key`) is what
     // gets updated and deposited. Positions are checked against *its* arity, and
@@ -426,11 +426,13 @@ fn internal_select_delete_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<
     let spec = compile(args[1], ctx.atoms())?;
     let mut table = take_table_gated(ctx, handle, Gate::Write)?;
     // `Table::select_delete` needs the atom table *and* the caller heap at once; the
-    // context lends them through two conflicting borrows, so it is given a clone of
-    // the atom table (identical indices, and the call only reads it — the same
-    // pattern `ets:select_delete/2` in the `matches` sibling uses).
-    let atoms = ctx.atoms().clone();
-    let outcome = table.select_delete(&spec, &atoms, ctx.heap());
+    // context splits the two disjoint fields in a single borrow
+    // (`ctx.atom_and_heap()`) rather than cloning the table — the same pattern
+    // `ets:select_delete/2` in the `matches` sibling uses.
+    let outcome = {
+        let (atoms, heap) = ctx.atom_and_heap();
+        table.select_delete(&spec, atoms, heap)
+    };
     restore_table(ctx, handle, table)?;
     count_term(ctx, outcome?)
 }

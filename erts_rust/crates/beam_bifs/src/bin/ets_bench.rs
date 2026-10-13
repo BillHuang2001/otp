@@ -48,6 +48,8 @@
 //! * `info`         — `ets:info(T, size)`: a **control** with no atom-table clone
 //!   anywhere (it took the non-cloning path before *and* after), the floor the other
 //!   phases are read against;
+//! * `clone`        — one `AtomTable::clone()` of the shared table in isolation, the
+//!   exact work the `ets` sites used to do on every call;
 //! * `select`       — `ets:select/2` (whole-object projection match spec);
 //! * `match`        — `ets:match/2` (`{'$1','$2'}` pattern);
 //! * `select_rev`   — `ets:select_reverse/2`;
@@ -249,6 +251,12 @@ fn main() {
         black_box(out);
     });
 
+    // --- clone: the whole-table rebuild in isolation --------------------------------
+    // (the exact work the `ets` sites above used to do on every call; measured alone
+    // so the removed cost is visible independently of the traversal work)
+    let clone_ns = bench(iters, || {
+        black_box(atoms.clone());
+    });
     // --- select/2 ------------------------------------------------------------------
     let select_ns = bench(iters, || {
         dst_heap.reset();
@@ -362,6 +370,7 @@ fn main() {
 
     println!("atoms={seeded} objects={objects} iters={iters} loadavg={loadavg}");
     println!("info         {info_ns:>10.1} ns/op  = {:>8.3} us/op  (control: no clone, before or after)", info_ns / 1000.0);
+    println!("clone        {clone_ns:>10.1} ns/op  = {:>8.3} us/op  (isolated AtomTable::clone)", clone_ns / 1000.0);
     println!("select       {select_ns:>10.1} ns/op  = {:>8.3} us/op", select_ns / 1000.0);
     println!("match        {match_ns:>10.1} ns/op  = {:>8.3} us/op", match_ns / 1000.0);
     println!("select_rev   {reverse_ns:>10.1} ns/op  = {:>8.3} us/op", reverse_ns / 1000.0);

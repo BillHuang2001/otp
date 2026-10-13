@@ -222,17 +222,22 @@ fn test_table(ctx: &mut BifContext<'_>, against: Eterm, spec: Eterm) -> Result<E
     // run.rs`), which is exactly the C's `erts_match_set_run_ets(p, mps, against,
     // 0, &ret_flags)` (`erl_db_util.c:6133`), so the single term is run as a
     // one-element list.
-    let atoms = ctx.atoms().clone();
     let singleton = ctx.list(&[against])?;
-    let mut results = match beam_ets::match_spec_run(singleton, spec, &atoms, ctx.heap()) {
-        Ok(results) => results,
-        // `beam_ets::compile` rejected the spec. That is either a construct
-        // outside its subset that the oracle accepts, or one of the C's semantic
-        // lint diagnostics this module does not reproduce — a typed capability
-        // gap either way, never a guessed `{error, …}` or a fabricated `{ok, …}`
-        // (module docs).
-        Err(BeamError::BadArg) => return Err(unsupported_bif()),
-        Err(other) => return Err(other),
+    let mut results = {
+        // `beam_ets::match_spec_run` needs the atom table and the caller heap at
+        // once; the two disjoint fields are split in a single borrow
+        // (`ctx.atom_and_heap()`) rather than cloned (the `select_2` pattern).
+        let (atoms, heap) = ctx.atom_and_heap();
+        match beam_ets::match_spec_run(singleton, spec, atoms, heap) {
+            Ok(results) => results,
+            // `beam_ets::compile` rejected the spec. That is either a construct
+            // outside its subset that the oracle accepts, or one of the C's semantic
+            // lint diagnostics this module does not reproduce — a typed capability
+            // gap either way, never a guessed `{error, …}` or a fabricated `{ok, …}`
+            // (module docs).
+            Err(BeamError::BadArg) => return Err(unsupported_bif()),
+            Err(other) => return Err(other),
+        }
     };
     let value = match results.pop() {
         Some(value) => value,
