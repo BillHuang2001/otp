@@ -44,7 +44,7 @@
 //! | [`RecordSource`] | [`RECORD_SOURCE_BIFS`] | 1 |
 //! | [`ModuleInfo`] | [`MODULE_INFO_BIFS`] | 2 |
 //! | [`PersistentTerm`] | [`PERSISTENT_TERM_BIFS`] | 7 |
-//! | [`FunCaller`] | [`FUN_CALLER_BIFS`] | 22 |
+//! | [`FunCaller`] | [`FUN_CALLER_BIFS`] | 24 |
 //! | [`LocalNode`] | [`LOCAL_NODE_BIFS`] | 6 |
 //! | [`RuntimeHooks`] | [`RUNTIME_HOOKS_BIFS`] | 172 |
 //!
@@ -260,22 +260,27 @@ pub const PERSISTENT_TERM_BIFS: &[(&str, &str, u32)] = &[
     ("persistent_term", "put_new", 2),
 ];
 
-/// The registered BIFs that read the [`FunCaller`] seam — every `lists`/`maps`
+/// The registered BIFs that read the [`FunCaller`] seam — every `lists`/`maps`/`ets`
 /// function that **applies a fun argument** back into the runtime.
 ///
 /// The `lists` 18: `map/2`, `filter/2`, `foldl/3`, `foldr/3`, `foreach/2`, `sort/2`,
 /// `usort/2`, `flatmap/2`, `zipwith/3`, `mapfoldl/3`, `mapfoldr/3`, `all/2`, `any/2`,
 /// `takewhile/2`, `dropwhile/2`, `splitwith/2`, `partition/2`, `keymap/3`. The `maps` 4:
-/// `map/2`, `fold/3`, `filter/2`, `foreach/2`. Every one of them registers a `BifFn`
-/// whose body reaches [`BifContext::call_fun`](crate::context::BifContext::call_fun)
+/// `map/2`, `fold/3`, `filter/2`, `foreach/2`. The `ets` 2: `foldl/3`, `foldr/3` — the
+/// two table folds in `src/ets/adopt.rs`, which apply their fun to each object. Every
+/// one of them registers a `BifFn` whose body reaches
+/// [`BifContext::call_fun`](crate::context::BifContext::call_fun)
 /// directly or through the shared `call_predicate`/`fun_order` helpers. The
-/// non-fun-taking `lists`/`maps` fast paths in the same modules do not read the seam.
+/// non-fun-taking `lists`/`maps`/`ets` fast paths in the same modules do not read the
+/// seam.
 ///
 /// Note: a host that gates the fun caller cannot use this table alone — it must also
 /// keep any *argument*-based guard it has (a `fun` argument is what makes a call
 /// re-entrant for ETS-cell purposes). This table answers only "does this key read the
 /// seam". Sorted by `(module, function, arity)`; see [`needs_fun_caller`].
 pub const FUN_CALLER_BIFS: &[(&str, &str, u32)] = &[
+    ("ets", "foldl", 3),
+    ("ets", "foldr", 3),
     ("lists", "all", 2),
     ("lists", "any", 2),
     ("lists", "dropwhile", 2),
@@ -894,10 +899,13 @@ mod tests {
 
     #[test]
     fn fun_caller_bifs_are_the_fun_taking_surface() {
-        // The 18 `lists` + 4 `maps` functions that apply a fun argument.
+        // The 18 `lists` + 4 `maps` + 2 `ets` (the table folds) functions that apply a
+        // fun argument.
         assert_eq!(
             FUN_CALLER_BIFS,
             &[
+                ("ets", "foldl", 3),
+                ("ets", "foldr", 3),
                 ("lists", "all", 2),
                 ("lists", "any", 2),
                 ("lists", "dropwhile", 2),
@@ -1023,8 +1031,8 @@ mod tests {
     /// "`erlang:send/2` and its quoted alias … the same `src/proc.rs`
     /// implementation", `node/0,1` in `src/convert.rs`, the encoders split across
     /// `src/binconv.rs`/`src/term_conv.rs`, the fun-taking surface across
-    /// `src/lists.rs`/`src/maps.rs` — and catches a key listed under the wrong module
-    /// (a typo, or a BIF that moved).
+    /// `src/lists.rs`/`src/maps.rs`/`src/ets/adopt.rs` — and catches a key listed
+    /// under the wrong module (a typo, or a BIF that moved).
     #[test]
     fn subset_tables_are_contained_in_their_defining_modules() {
         let cases: &[(&str, &[(&str, &str, u32)], &[fn(&mut BifRegistry)])] = &[
@@ -1048,7 +1056,11 @@ mod tests {
             (
                 "FUN_CALLER_BIFS",
                 FUN_CALLER_BIFS,
-                &[crate::lists::register, crate::maps::register],
+                &[
+                    crate::lists::register,
+                    crate::maps::register,
+                    crate::ets::register,
+                ],
             ),
             (
                 "LOCAL_NODE_BIFS",
@@ -1200,8 +1212,8 @@ mod tests {
             "the doc's documented-key total must equal the sum over every exported table"
         );
         assert_eq!(
-            aggregate, 242,
-            "the documented seam surface is 242 keys across the 13 tables; a table \
+            aggregate, 244,
+            "the documented seam surface is 244 keys across the 13 tables; a table \
              added/removed (or resized) without refreshing the module-doc table changes this"
         );
     }
@@ -1361,6 +1373,8 @@ mod tests {
                 needs_fun_caller,
                 "needs_fun_caller",
                 &[
+                    ("ets", "foldl", 2),     // wrong arity
+                    ("ets", "foldr", 2),     // wrong arity
                     ("lists", "map", 3),     // wrong arity
                     ("lists", "foldl", 2),   // wrong arity
                     ("lists", "usort", 1),   // the non-fun arity
