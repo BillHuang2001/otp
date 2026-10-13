@@ -894,6 +894,138 @@ thread_local! {
     static DRIVER_ENTRIES: RefCell<Vec<DriverEntryRecord>> = const { RefCell::new(Vec::new()) };
 }
 
+/// One `dlopen`ed C driver this runtime knows about, keyed by its driver **name** — the runtime's
+/// loaded-driver list.
+///
+/// Unlike [`DRIVER_ENTRIES`] (keyed by the `ErlDrvEntry` **address**, modelling only the two
+/// port-less `driver_*` slots), this list is keyed by the driver *name*, because that is how the C
+/// resolves an `open_port({spawn_driver, Name}, _)` request against its process-global driver list
+/// (`io.c:599-628`) and how `erl_ddll:loaded_drivers/0` reports it. Recording every `dlopen` here
+/// is what makes those two views **one** view: a driver is listed however it was opened.
+#[derive(Debug)]
+pub(crate) struct LoadedDriver {
+    /// The driver's registered name (the entry's validated `driver_name`).
+    pub(crate) name: String,
+    /// The object path the driver was loaded from — the candidate a later `open_port` re-uses.
+    pub(crate) path: String,
+    /// Whether the `kill_ports` load option was given (`erl_ddll:try_load/3`); `false` for a
+    /// driver reached through `open_port({spawn_driver, …})`, which has no such option.
+    pub(crate) kill_ports: bool,
+    /// The `dlopen` handle when **`erl_ddll:try_load/3`** performed the load — the record owns
+    /// that handle (so dropping the record runs the driver's `finish` and `dlclose`s it, exactly
+    /// like `beam_bifs`'s registry).
+    ///
+    /// `None` for a driver opened by `open_port({spawn_driver, …})`: its handle lives in the
+    /// **port's** adapter, so forgetting the record must never unload it.
+    pub(crate) library: Option<DriverLibrary>,
+}
+
+thread_local! {
+    /// The runtime's loaded-driver list, keyed by driver name, in load order (a `Vec`, so the
+    /// names report load order like the C's list walk). Thread-local for the same reason as
+    /// [`DRIVER_ENTRIES`]: the records hold the `!Send` `dlopen` handle and this crate is
+    /// `#![deny(unsafe_code)]`, and the runtime drives every driver on one thread.
+    static LOADED_DRIVERS: RefCell<Vec<LoadedDriver>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Records `name` as loaded by **`erl_ddll:try_load/3`**, owning `library` (the load's `dlopen`
+/// handle) unless an entry of the same name is already present.
+///
+/// Replacing an existing entry only happens when a caller deliberately re-registers; the loading
+/// BIF checks [`driver_is_loaded`] first and answers `already_loaded`.
+pub(crate) fn record_driver_loaded(name: &str, path: &str, kill_ports: bool, library: DriverLibrary) {
+    LOADED_DRIVERS.with(|drivers| {
+        let mut drivers = drivers.borrow_mut();
+        let record = LoadedDriver {
+            name: name.to_string(),
+            path: path.to_string(),
+            kill_ports,
+            library: Some(library),
+        };
+        match drivers.iter_mut().find(|entry| entry.name == name) {
+            Some(slot) => *slot = record,
+            None => drivers.push(record),
+        }
+    });
+}
+
+/// Notes that `name` is open through **`open_port({spawn_driver, …})`** at `path`.
+///
+/// The handle belongs to the port, so the record stores no library; a `kill_ports` flag already
+/// recorded by an earlier `try_load` is preserved.
+pub(crate) fn note_driver_opened(name: &str, path: &str) {
+    let kill_ports = loaded_driver_kill_ports(name).unwrap_or(false);
+    LOADED_DRIVERS.with(|drivers| {
+        let mut drivers = drivers.borrow_mut();
+        let record = LoadedDriver {
+            name: name.to_string(),
+            path: path.to_string(),
+            kill_ports,
+            library: None,
+        };
+        match drivers.iter_mut().find(|entry| entry.name == name) {
+            Some(slot) => *slot = record,
+            None => drivers.push(record),
+        }
+    });
+}
+
+/// Whether `name` is currently loaded (whatever loaded it).
+pub(crate) fn driver_is_loaded(name: &str) -> bool {
+    LOADED_DRIVERS.with(|drivers| drivers.borrow().iter().any(|entry| entry.name == name))
+}
+
+/// The object path `name` was loaded from, or `None` when it is not loaded.
+pub(crate) fn loaded_driver_path(name: &str) -> Option<String> {
+    LOADED_DRIVERS.with(|drivers| {
+        drivers
+            .borrow()
+            .iter()
+            .find(|entry| entry.name == name)
+            .map(|entry| entry.path.clone())
+    })
+}
+
+/// Whether `name` was loaded with the `kill_ports` option, or `None` when it is not loaded.
+pub(crate) fn loaded_driver_kill_ports(name: &str) -> Option<bool> {
+    LOADED_DRIVERS.with(|drivers| {
+        drivers
+            .borrow()
+            .iter()
+            .find(|entry| entry.name == name)
+            .map(|entry| entry.kill_ports)
+    })
+}
+
+/// Every loaded driver's name, in load order.
+pub(crate) fn loaded_driver_names() -> Vec<String> {
+    LOADED_DRIVERS.with(|drivers| {
+        drivers
+            .borrow()
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect()
+    })
+}
+
+/// Forgets `name`, answering whether it was loaded (`false` ⇒ the caller reports `not_loaded`).
+///
+/// A record that owns a `dlopen` handle drops it here (running the driver's `finish` and
+/// `dlclose`ing the object); a record for an `open_port`-opened driver owns no handle, so its port
+/// keeps working — "unload" means "no longer listed", matching the C's list removal.
+pub(crate) fn forget_driver(name: &str) -> bool {
+    LOADED_DRIVERS.with(|drivers| {
+        let mut drivers = drivers.borrow_mut();
+        match drivers.iter().position(|entry| entry.name == name) {
+            Some(index) => {
+                drivers.remove(index);
+                true
+            }
+            None => false,
+        }
+    })
+}
+
 /// Records `entry` as a **statically linked** driver entry, the C's `add_driver_entry` →
 /// `erts_add_driver_entry(de, NULL, …)` (`io.c:7640-7695`).
 ///
@@ -1399,10 +1531,23 @@ pub fn load_driver(
     candidates: &[String],
     name: &str,
 ) -> std::result::Result<DriverLibrary, DriverLoadError> {
+    load_driver_at(candidates, name).map(|(library, _path)| library)
+}
+
+/// [`load_driver`], also reporting **which** candidate resolved — the object path the loader was
+/// handed, recorded in the runtime's loaded-driver list so the same object is re-used later.
+///
+/// # Errors
+///
+/// The last candidate's typed [`DriverLoadError`] (see [`load_driver`]).
+pub(crate) fn load_driver_at(
+    candidates: &[String],
+    name: &str,
+) -> std::result::Result<(DriverLibrary, String), DriverLoadError> {
     let mut last: Option<DriverLoadError> = None;
     for candidate in candidates {
         match loader::load(candidate, name) {
-            Ok(library) => return Ok(library),
+            Ok(library) => return Ok((library, candidate.clone())),
             Err(error) => last = Some(error),
         }
     }
