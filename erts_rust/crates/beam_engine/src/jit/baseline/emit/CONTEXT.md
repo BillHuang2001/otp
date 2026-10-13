@@ -3,10 +3,11 @@
 ## Intent
 Lower the typed IR basic blocks of a `beam_loader::Module` into native x86-64 functions for the
 **baseline** execution tier. One file per responsibility: `mod.rs` owns the compiled-block shape
-(prologue/epilogue, `emit_block`'s lowering dispatch, the deopt sequence, `spill`/`fill`) and the two
-compilation entry points — `compile_module` (the **eager** whole-module layout: one shared
+(prologue/epilogue, `emit_block`'s lowering dispatch, the deopt sequence, `spill`/`fill`); `compile.rs`
+owns the compilation entry points — `compile_module` (the **eager** whole-module layout: one shared
 `CodeBuffer`, a whole-module block map) and `compile_function`/`emit_function` (the **lazy** layout's
-per-function unit: its own `CodeBuffer`, a map covering only that function); `regalloc.rs` picks the
+per-function unit: its own `CodeBuffer`, a map covering only that function) — plus the continuation
+sub-blocks and the code-size estimates; `regalloc.rs` picks the
 cached x-registers; `operands.rs` reads operand shapes;
 `r#move.rs`/`test.rs`/`select.rs`/`arith.rs`/`compare.rs`/`aggregate.rs` each lower one instruction
 group; `frame.rs` lowers the frame-discipline trio that ends a function body
@@ -205,14 +206,18 @@ entry (the driver's bound is `machine.x.len() > bound`).
 
 ## Routing Table
 - `mod.rs` -> compiled-block shape: `SAVED_REGISTERS`/`CACHE_REGISTERS`/scratch constants, `touch`/`Allocation`
-  (incl. `y_last`/`refresh_y_after`), the two compilation entry points `compile_module` (**eager**:
+  (incl. `y_last`/`refresh_y_after`), `emit_block` (the dispatch), `emit_publish_y`/`emit_refresh_y` (the
+  Y-window prologue publish / gated post-helper refresh), `emit_helper_call`, `emit_step_and_continue`,
+  `emit_ext_call`, `emit_continue_check`, `spill`/`fill`; also re-exports `compile_module`/`compile_function`
+  (keeping those item paths stable for `baseline/mod.rs` and `baseline/code.rs`) plus the `#[cfg(test)]`
+  names `baseline/tests.rs` reaches through `emit::*`.
+- `compile.rs` -> the compilation entry points and what they share: `compile_module` (**eager**:
   whole-module block map + the merged whole-module summary that guards entry, plus `emit_shared_sub_blocks`)
   and `compile_function` (**lazy**: one function's own buffer/entries/sub_entries/summary, sharing
-  `emit_function` and running `emit_sub_blocks`), `stores_continuation`,
-  `code_capacity_estimate`/`function_capacity_estimate`/`sub_blocks_capacity_estimate` + size budgets,
-  `emit_block` (the dispatch), `emit_publish_y`/`emit_refresh_y` (the Y-window prologue publish / gated
-  post-helper refresh), `emit_helper_call`, `emit_step_and_continue`, `emit_ext_call`, `emit_continue_check`,
-  `spill`/`fill`.
+  `emit_function` and running `emit_sub_blocks`), `stores_continuation`, `emit_sub_blocks`/
+  `emit_shared_sub_blocks`, `emit_function`, and the code-size budgets (`BLOCK_BYTES`/`INSTRUCTION_BYTES`/
+  `FAST_PATH_BYTES`/`COMPARE_PATH_BYTES`/`LIST_PATH_BYTES`/`TUPLE_PATH_BYTES`) with their estimates
+  `code_capacity_estimate`/`function_capacity_estimate`/`sub_blocks_capacity_estimate`.
 - `regalloc.rs` -> `allocate_registers` (incl. the `y_last` derivation) + `cacheable_touches`.
 - `operands.rs` -> `x_offset`, `x_register`, `y_offset`, `y_register`, `y_addressable`, `constant_word`, `small_word`.
 - `r#move.rs` -> `try_inline_move`, `try_inline_swap` (`Move` over in-bound x-registers or an addressable `Y` slot on either side, behind the frame-window guard; `Swap` needs two in-bound x-registers).
