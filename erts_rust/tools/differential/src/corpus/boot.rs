@@ -313,7 +313,13 @@ pub(crate) fn group() -> Vec<Case> {
             description: "code:is_loaded/1 reports {file,Path} for a loaded module (shape, not the path)",
             contracts: &[Contract::Build],
             kind: CaseKind::Eval {
-                expr: "begin L = code:is_loaded(lists), is_tuple(L) andalso element(1, L) =:= file andalso is_list(element(2, L)) end",
+                // `code:is_loaded/1` answers from the code server's *load state*, not from
+                // code-path resolvability, so the case must make that state explicit rather
+                // than inherit the oracle's boot set: the Rust runtime boots a smaller module
+                // set than the oracle and `lists` is not preloaded (it is, however, on the
+                // code path, so `code:ensure_loaded/1` succeeds on both sides). Same fix as
+                // the sibling `boot_extra/code_is_loaded_lists_is_a_file_pair`.
+                expr: "begin code:ensure_loaded(lists), L = code:is_loaded(lists), is_tuple(L) andalso element(1, L) =:= file andalso is_list(element(2, L)) end",
                 extra_argv: &[],
                 probe: Probe::Value,
             },
