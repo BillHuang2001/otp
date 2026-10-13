@@ -486,6 +486,32 @@ enum PortEvent {
         /// The process the message belongs to.
         owner: ProcessId,
     },
+    /// A **line-framed** read: one `{Port, {data, {eol|noeol, Data}}}` message.
+    ///
+    /// This is the `line`/`{line, N}` option's message shape — the C's
+    /// `deliver_linebuf_message` (`erts/emulator/beam/io.c:3454`), whose wrapper
+    /// `{Port, {data, {eol|noeol, Data}}}` is built at `io.c:3430-3435`. `eol` means the frame
+    /// was terminated by a newline; `noeol` means it was a length-limited `{line, N}` chunk or
+    /// the trailing partial line released at end-of-file. `Data` is shaped by `stream`
+    /// exactly as the raw [`PortEvent::Data`] arm shapes its payload.
+    ///
+    /// Unlike [`PortEvent::Data`] — whose empty payload is dropped, because a driver read of
+    /// nothing is no message at all — an **empty `bytes` here is a real frame**: a blank line
+    /// is the oracle's `{Port, {data, {eol, []}}}`. The line channel
+    /// ([`beam_io::PortRegistry::take_line_notifications`]) is what feeds this variant; a
+    /// line-mode port never reports the raw [`PortNotification::Data`] channel.
+    Line {
+        /// The port the frame came from.
+        port: PortId,
+        /// The frame's content bytes (its terminator is not included; empty for a blank line).
+        bytes: Vec<u8>,
+        /// Whether the frame was newline-terminated (`eol`) or not (`noeol`).
+        eol: bool,
+        /// The port's `binary`/`list` option.
+        stream: StreamType,
+        /// The process the message belongs to.
+        owner: ProcessId,
+    },
     /// The child was reaped and its `exit_status` option asked for the status.
     Exited {
         /// The port whose child went away.
@@ -1209,6 +1235,34 @@ impl PortRegistry {
             let outcome = self
                 .registry
                 .execute_port_tasks(&mut self.poller, PORT_REDS_EXECUTE)?;
+            // The **line channel** is drained on *every* round, immediately after the tasks:
+            // `take_line_notifications` empties every line-mode port's staged frames, so
+            // deferring it until something else looked non-empty would lose them (see
+            // [`PortEvent::Line`]). The end-of-stream flush runs first: it is what releases a
+            // trailing partial line as a `noeol` frame (the C's `driver_eof` →
+            // `flush_linebuf_messages`).
+            self.flush_line_stream_ends()?;
+            for frame in self.registry.take_line_notifications() {
+                // A frame for a port whose metadata is gone (closed while the task was
+                // queued) has no recipient and is dropped — the rule the raw `Data` arm
+                // below follows too.
+                if let Some(meta) = self.meta.get(&frame.port.number()) {
+                    // Framed bytes are **input** for `erlang:statistics(io)`, counted where
+                    // they really arrive; a blank line contributes zero bytes, exactly as
+                    // the C's per-read accounting does.
+                    self.io_counters.note_input(frame.bytes.len());
+                    // ...and for this port's own `port_info(Port, input)`.
+                    meta.input
+                        .set(meta.input.get().saturating_add(frame.bytes.len() as u64));
+                    events.push(PortEvent::Line {
+                        port: frame.port,
+                        bytes: frame.bytes,
+                        eol: frame.eol,
+                        stream: meta.stream,
+                        owner: meta.owner,
+                    });
+                }
+            }
             for notification in outcome.notifications {
                 match notification {
                     PortNotification::Data { port, bytes } => {
@@ -1292,6 +1346,47 @@ impl PortRegistry {
             }
         }
         events
+    }
+
+    /// Runs the **end-of-stream line flush** for every `line`/`{line, N}` port.
+    ///
+    /// A `{line, N}` port holds back the bytes since the last `\n`, so a trailing partial line
+    /// is never a complete frame on its own. The C releases it from `driver_eof` —
+    /// `driver_failure_eof` → `flush_linebuf_messages` (`erts/emulator/beam/io.c:7210-7211`),
+    /// the same observation point that also runs the derived `flush_linebuf` (`io.c:7221`) —
+    /// which delivers the held bytes **once** as a `noeol` frame (the oracle's
+    /// `printf 'a\nb' ⇒ {eol,"a"} {noeol,"b"}`).
+    ///
+    /// [`beam_io::PortRegistry::take_eof`] *is* that observation point: it forwards to the
+    /// driver's `Driver::take_eof` and, when the stream really has ended, runs
+    /// [`beam_io::Port::flush_linebuf`] as its side effect. The `bool` it answers is the `eof`
+    /// **option**'s `{Port, eof}` message, which this runtime does not synthesize (the module
+    /// documents the option as accepted but inert), so the value is deliberately discarded —
+    /// it is the flush that is wanted here. A port whose stream has not ended answers `false`
+    /// and stages nothing, and a repeat observation stages nothing either (the flush is
+    /// idempotent), so calling this every round is safe.
+    ///
+    /// Only line-mode ports are visited: a raw port has no line buffer to release.
+    /// [`PortOptions::stream_options`] asks the child port's driver to report end-of-stream for
+    /// exactly those ports, so the observation is available where it is needed.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver's `take_eof` returns. The port numbers are snapshotted first, and
+    /// nothing between the snapshot and the call can close a port, so a live entry always
+    /// resolves.
+    fn flush_line_stream_ends(&mut self) -> Result<()> {
+        let numbers: Vec<u64> = self
+            .meta
+            .iter()
+            .filter(|(_, meta)| meta.line.is_some())
+            .map(|(number, _)| *number)
+            .collect();
+        for number in numbers {
+            // The boolean is the (inert) `eof` option's report; the flush it runs is the point.
+            let _eof_option_report = self.registry.take_eof(PortId::new(number))?;
+        }
+        Ok(())
     }
 
     /// Commits every live driver port's pending interned names into `atoms` — the runtime's
@@ -1616,12 +1711,15 @@ impl PortOptions {
     /// The child-stream options the `spawn` driver applies at `fork`/`exec` time
     /// ([`beam_io::StreamOptions`]).
     ///
-    /// `eof` is left off: the `eof` option is accepted by the whitelist but inert here (its
-    /// `{Port, eof}` message is not synthesized — see the module docs).
+    /// `eof` is asked for on exactly the ports that need the driver's **end-of-stream
+    /// observation**: a `line`/`{line, N}` port, whose trailing partial line is released by
+    /// the flush `take_eof` runs (see [`PortRegistry::flush_line_stream_ends`]). The option's
+    /// own `{Port, eof}` message stays unsynthesized — the report is discarded — so asking the
+    /// driver for it changes nothing an Erlang program can observe beyond the flush it enables.
     fn stream_options(&self) -> StreamOptions {
         StreamOptions {
             stderr_to_stdout: self.stderr_to_stdout,
-            eof: false,
+            eof: self.line.is_some(),
         }
     }
 
@@ -2396,6 +2494,19 @@ impl Runtime {
                         port.to_eterm(),
                         ctx.port_data_message(*port, bytes, *stream)?,
                     ),
+                    // A line-framed read is the same `{Port, {data, …}}` delivery with the
+                    // `{eol|noeol, Data}` body the `line` option selects.
+                    PortEvent::Line {
+                        port,
+                        bytes,
+                        eol,
+                        stream,
+                        owner,
+                    } => (
+                        *owner,
+                        port.to_eterm(),
+                        ctx.port_line_message(*port, bytes, *eol, *stream)?,
+                    ),
                     PortEvent::Exited { port, status, owner } => (
                         *owner,
                         port.to_eterm(),
@@ -2485,6 +2596,15 @@ impl RuntimeContext<'_> {
                 PortEvent::Data {
                     port, bytes, stream, ..
                 } => messages.push(self.port_data_message(port, &bytes, stream)?),
+                // The `line` option's framed shape (see [`PortEvent::Line`]); the evaluator is
+                // the port's owner on this path, so the message is its own.
+                PortEvent::Line {
+                    port,
+                    bytes,
+                    eol,
+                    stream,
+                    ..
+                } => messages.push(self.port_line_message(port, &bytes, eol, stream)?),
                 PortEvent::Exited { port, status, .. } => {
                     messages.push(self.port_exit_message(port, status)?)
                 }
@@ -2561,18 +2681,67 @@ impl RuntimeContext<'_> {
         stream: StreamType,
     ) -> Result<Eterm> {
         let data = make_atom(self.runtime.code_server.atoms_mut().intern("data"));
-        let payload = match stream {
-            StreamType::Binary => beam_codec::term::make_binary(self.eval_heap(), bytes)?,
+        let payload = self.port_data_payload(bytes, stream)?;
+        let inner = terms::make_tuple(self, &[data, payload])?;
+        terms::make_tuple(self, &[port.to_eterm(), inner])
+    }
+
+    /// The `{Port, {data, {eol|noeol, Data}}}` message of one **line-framed** port read.
+    ///
+    /// This is the `line`/`{line, N}` option's shape, the [`PortEvent::Line`] variant's
+    /// rendering: the C's `deliver_linebuf_message` (`erts/emulator/beam/io.c:3454`) builds the
+    /// `{eol|noeol, Data}` wrapper (`io.c:3430-3435`) and hands it to the port's connected
+    /// process as the `{Port, {data, …}}` body. `eol` (the atom `eol`) means the frame was
+    /// newline-terminated; `noeol` means a length-limited `{line, N}` chunk or the trailing
+    /// partial line released at end-of-stream. `Data` is shaped by `stream` exactly as
+    /// [`Self::port_data_message`] shapes an unframed read.
+    ///
+    /// Unlike the unframed builder this one is reachable with an **empty** `bytes`: a blank
+    /// line is the oracle's `{Port, {data, {eol, []}}}` (and an empty `noeol` frame is
+    /// possible when a flush releases nothing), so the payload is built even for zero bytes.
+    /// The `data`/`eol`/`noeol` atoms are interned into the runtime's **one shared** table, so
+    /// the message is nameable by the printer and matchable by a `receive` clause, and it is
+    /// built on the same pointer-stable `-eval` arena as the unframed builder.
+    pub(crate) fn port_line_message(
+        &mut self,
+        port: PortId,
+        bytes: &[u8],
+        eol: bool,
+        stream: StreamType,
+    ) -> Result<Eterm> {
+        let tag = if eol { "eol" } else { "noeol" };
+        let (data, tag) = {
+            let atoms = self.runtime.code_server.atoms_mut();
+            (make_atom(atoms.intern("data")), make_atom(atoms.intern(tag)))
+        };
+        let payload = self.port_data_payload(bytes, stream)?;
+        let framed = terms::make_tuple(self, &[tag, payload])?;
+        let inner = terms::make_tuple(self, &[data, framed])?;
+        terms::make_tuple(self, &[port.to_eterm(), inner])
+    }
+
+    /// The `Data` **payload** of a port-stream message, shaped by the port's stream option.
+    ///
+    /// Shared by [`Self::port_data_message`] and [`Self::port_line_message`] so the two
+    /// message shapes can never drift: a `binary` stream yields an Erlang binary (built by
+    /// [`beam_codec::term::make_binary`], see [`Self::port_data_message`] on the width), a
+    /// `list` stream a char list. The block is allocated on the runtime's pointer-stable
+    /// `-eval` arena.
+    ///
+    /// # Errors
+    ///
+    /// The arena's allocation failure when the term does not fit.
+    fn port_data_payload(&mut self, bytes: &[u8], stream: StreamType) -> Result<Eterm> {
+        match stream {
+            StreamType::Binary => beam_codec::term::make_binary(self.eval_heap(), bytes),
             StreamType::List => {
                 let mut list = NIL;
                 for byte in bytes.iter().rev() {
                     list = terms::make_cons(self, make_small(i64::from(*byte)), list)?;
                 }
-                list
+                Ok(list)
             }
-        };
-        let inner = terms::make_tuple(self, &[data, payload])?;
-        terms::make_tuple(self, &[port.to_eterm(), inner])
+        }
     }
 
     /// The `{Port, {exit_status, Status}}` message of a port whose child has been reaped,
