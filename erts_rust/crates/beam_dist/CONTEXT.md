@@ -573,6 +573,12 @@ and derives the report from that observed state.
 - **Handshake framing is 2-byte; established framing is 4-byte.** The frame read after `ChallengeAck`
   is treated as the OTP-23 `Complement` only when its tag is `'c'`; otherwise it is buffered and
   delivered by the next `recv`.
+- **The accept handshake exists twice (by design) and both halves are live-tested.** The blocking
+  `connection::accept_server_core` and the non-blocking `driver::ConnectionDriver` server states each
+  implement the accept sequence (they share the message codecs, `check_mandatory`, `auth` and
+  `status_error`, but not the state machine). `tests/live_accept.rs` pins the driver path against a real
+  `erl` peer and `tests/live_accept_blocking.rs` pins the blocking path, so the two cannot drift
+  silently.
 - **epmd frames its requests but not its replies.** A client *request* is 2-byte length-framed
   (`epmd_port.c`), but `epmd` writes every *reply* body straight to the socket with no length prefix
   (`epmd_srv.c` `reply()`); the client reads it unframed/self-delimiting — by tag for `'y'`/`'v'`/`'w'`,
