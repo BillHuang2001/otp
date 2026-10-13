@@ -288,6 +288,7 @@ fn test_meta(command: &str) -> PortMeta {
         kind: PortName::Spawn,
         os_pid: None,
         stream: StreamType::List,
+        line: None,
         notify_exit: false,
         monitors: Vec::new(),
         owner: OWNER,
@@ -631,27 +632,27 @@ fn an_unknown_spawn_driver_name_is_still_badarg() {
 #[test]
 fn whitelisted_option_atoms_and_tuples_are_accepted() {
     let mut fx = fixture();
-    // The whole accepted option-atom whitelist, every no-op here except `binary`.
-    let atoms = [
-        "stream",
-        "use_stdio",
-        "stderr_to_stdout",
-        "line",
-        "nouse_stdio",
-        "binary",
-        "in",
-        "out",
-        "eof",
-        "hide",
-        "exit_status",
-        "overlapped_io",
-    ];
-    let mut elements: Vec<Eterm> = Vec::new();
-    for name in atoms {
-        let atom = fx.atom(name);
-        elements.push(atom);
-    }
-    // A whitelisted tuple option is accepted too.
+    // The whole accepted option-atom whitelist, split into the two **mutually compatible**
+    // halves the oracle's own exclusion rules force (`erl_bif_port.c:1019-1022`): a list
+    // carrying both `line` and `{packet, N}`, or both `stderr_to_stdout` and `nouse_stdio`, is
+    // `badarg` — which `the_option_matrix_matches_the_oracle` pins. Everything else combines.
+    let err_side = ["stream", "use_stdio", "stderr_to_stdout", "line", "binary", "in", "out",
+                    "eof", "hide", "exit_status", "overlapped_io"];
+    let atoms: Vec<Eterm> = err_side.iter().map(|name| fx.atom(name)).collect();
+    let options = fx.list(&atoms);
+    let name = fx.spawn("true");
+    let port = fx
+        .hook
+        .open_port(name, options)
+        .expect("the stderr/line half of the whitelist is accepted");
+    // Accepting an option never changes what the port is (the `binary` atom is the one
+    // that *does* change the stream, exercised in the name-forms test).
+    assert_eq!(text_of(fx.item(port, "name")), "true");
+
+    // The other half: `nouse_stdio` (no `stderr_to_stdout`) with a `{packet, 4}` (no `line`).
+    let stdio_side = ["stream", "use_stdio", "nouse_stdio", "binary", "in", "out", "eof", "hide",
+                      "exit_status", "overlapped_io"];
+    let mut elements: Vec<Eterm> = stdio_side.iter().map(|name| fx.atom(name)).collect();
     let packet = {
         let tag = fx.atom("packet");
         fx.heap.tuple(&[tag, make_small(4)]).expect("a packet option")
@@ -662,9 +663,7 @@ fn whitelisted_option_atoms_and_tuples_are_accepted() {
     let port = fx
         .hook
         .open_port(name, options)
-        .expect("whitelisted options are accepted");
-    // Accepting an option never changes what the port is (the `binary` atom is the one
-    // that *does* change the stream, exercised in the name-forms test).
+        .expect("the stdio/packet half of the whitelist is accepted");
     assert_eq!(text_of(fx.item(port, "name")), "true");
 }
 

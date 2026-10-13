@@ -355,6 +355,15 @@ struct PortMeta {
     /// The `binary`/`list` option (shapes the `{Port, {data, …}}` messages; no longer a
     /// `port_info` item).
     stream: StreamType,
+    /// The resolved line-framing option — the C's `linebuf` ([`PortOptions::line`]):
+    /// `Some(max_len)` puts the port in line mode (`beam_io`'s
+    /// [`PortRegistry::set_line_mode`](beam_io::PortRegistry::set_line_mode)), `None` (the
+    /// default) leaves it in raw mode.
+    ///
+    /// It is carried on the metadata (rather than merged into [`PortMeta::stream`]) because the
+    /// two are **independent** port state bits (`[binary, line]` sets both; see
+    /// [`StreamType::port_flags`]), and [`PortRegistry::register`] arms the framing from it.
+    line: Option<usize>,
     /// Whether the `exit_status` option was asked for.
     ///
     /// `beam_io`'s driver already hands the status out exactly once
@@ -768,6 +777,14 @@ impl PortRegistry {
     /// `start` returns (the driver having been torn down).
     fn register(&mut self, driver: Box<dyn Driver>, meta: PortMeta) -> Result<PortId> {
         let id = self.registry.open(&mut self.poller, driver)?;
+        // Arm line framing on the freshly-registered port when `open_port/2` resolved a
+        // `line`/`{line, N}` option (`Some`), so `beam_io`'s line machinery — which is off
+        // otherwise — becomes reachable. This is the single funnel every `open_port/2` Name
+        // form registers through, so it covers all of them. `set_line_mode` only refuses an
+        // unknown port, which `open` has just made live.
+        if let Some(max_len) = meta.line {
+            self.registry.set_line_mode(id, Some(max_len))?;
+        }
         self.meta.insert(id.number(), meta);
         Ok(id)
     }
@@ -1533,13 +1550,32 @@ impl NameSpec {
 
 /// The validated option list of an `open_port/2` call.
 ///
-/// `stream` is an `Option` so that overlaying the inline options of a
-/// `{spawn_executable, Path, Opts}` name with the call's own `Options` can tell "no stream
-/// asked for" from "`list` asked for".
+/// `stream` and `use_stdio` are `Option`s so that overlaying the inline options of a
+/// `{spawn_executable, Path, Opts}` name with the call's own `Options` can tell "not asked
+/// for" from an explicit choice.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct PortOptions {
     /// The `binary`/`list` stream choice.
     stream: Option<StreamType>,
+    /// The resolved **line framing** option — the C's `linebuf` (`erl_bif_port.c:806,862-869,
+    /// 985-986`): `Some(max_len)` is line mode on (`line` ⇒ [`LINE_DEFAULT_MAX_LEN`],
+    /// `{line, N}` with `N > 0` ⇒ `N`), `None` (the default) is off.
+    ///
+    /// This is deliberately a **separate field** rather than a [`StreamType`] variant: it is
+    /// an *independent* port state bit (`ERTS_PORT_SFLG_LINEBUF_IO`) from the
+    /// `binary`/`list` one, both may be set at once (`[binary, line]`), and keeping it out of
+    /// [`StreamType`] leaves the read path's message shape ([`RuntimeContext::port_data_message`])
+    /// untouched.
+    line: Option<usize>,
+    /// Whether a `{packet, N}` option is in effect — the C's `opts.packet_bytes != 0`
+    /// (`erl_bif_port.c:813,849-861`). The `stream` atom resets it to `false` (the C clears
+    /// `packet_bytes`), and only the **mutual-exclusion** check reads it
+    /// (`line` + packet ⇒ `badarg`); this runtime does not frame packets.
+    packet: bool,
+    /// The `use_stdio`/`nouse_stdio` choice — `None` is the oracle's default (`true`;
+    /// `erl_bif_port.c:814`). Only the mutual-exclusion check reads it
+    /// (`stderr_to_stdout` without `use_stdio` ⇒ `badarg`).
+    use_stdio: Option<bool>,
     /// The `{cd, Dir}` working directory.
     cd: Option<String>,
     /// The `{env, [{Name, Value}]}` environment additions.
@@ -1555,11 +1591,26 @@ struct PortOptions {
     stderr_to_stdout: bool,
 }
 
+/// The line-length limit a bare `line` option selects, in bytes — the oracle's default
+/// (`linebuf = 512`, `erl_bif_port.c:986`), cross-checked live against erts-17.1.
+const LINE_DEFAULT_MAX_LEN: usize = 512;
+
 impl PortOptions {
     /// The effective stream type (`list` unless `binary` was asked for — the oracle's
     /// default).
     fn stream(&self) -> StreamType {
         self.stream.unwrap_or(StreamType::List)
+    }
+
+    /// The effective `use_stdio` choice (the oracle's default is `true`).
+    fn use_stdio(&self) -> bool {
+        self.use_stdio.unwrap_or(true)
+    }
+
+    /// The port's **state** stream flags, as `driver_get_port_flags` reports them from the
+    /// resolved `binary`/`line` options (see [`StreamType::port_flags`]).
+    fn port_flags(&self) -> i32 {
+        self.stream().port_flags(self.line)
     }
 
     /// The child-stream options the `spawn` driver applies at `fork`/`exec` time
@@ -1581,6 +1632,17 @@ impl PortOptions {
         if other.stream.is_some() {
             self.stream = other.stream;
         }
+        // The line option is a switch: asking for it in either list turns it on, and the
+        // later (call) list's explicit length wins.
+        if other.line.is_some() {
+            self.line = other.line;
+        }
+        if other.use_stdio.is_some() {
+            self.use_stdio = other.use_stdio;
+        }
+        // `{packet, N}` from either list is in effect unless the same list cancelled it with
+        // `stream` — which `port_options` has already folded into `other.packet`.
+        self.packet |= other.packet;
         if other.cd.is_some() {
             self.cd = other.cd;
         }
@@ -1815,12 +1877,21 @@ impl RuntimePorts {
     /// **tuple tags** are [`PORT_OPTION_TUPLES`]; anything outside them — including the
     /// `list` atom (a list stream is already the default) — is `badarg`.
     ///
-    /// `binary` (the stream shape), `exit_status`, `{cd, Dir}`, `{env, [{Name, Value}]}` and
-    /// `{args, [String]}` are honored; every other whitelisted option is recognized and
-    /// accepted **without effect** here (`eof`, `stream`, `use_stdio`, `in`, `out`, `hide`,
-    /// `line`, `{packet, N}`, `{parallelism, Bool}`, …). A whitelisted tuple with the wrong
-    /// arity, or a recognized option with a malformed value (`{cd, 5}`, `{args, foo}`), is
-    /// [`BeamError::BadArg`] — the drivers cannot accept those.
+    /// `binary` (the stream shape), `line`/`{line, N}` (line framing), `use_stdio`/
+    /// `nouse_stdio`, `stream` (packet cancellation), `exit_status`, `{cd, Dir}`,
+    /// `{env, [{Name, Value}]}` and `{args, [String]}` are honored; every other whitelisted
+    /// option is recognized and accepted **without effect** here (`eof`, `in`, `out`, `hide`,
+    /// `{parallelism, Bool}`, …).
+    ///
+    /// The oracle's two **mutual-exclusion** rules are enforced after the whole list is
+    /// parsed, so they are order-independent (`erl_bif_port.c:1019-1022`): a line-buffered
+    /// port cannot also be packet-framed (`line` + `{packet, N}` ⇒ `badarg`, unless a later
+    /// `stream` cancelled the packet), and a redirected stderr requires `use_stdio`
+    /// (`stderr_to_stdout` without `use_stdio` ⇒ `badarg`).
+    ///
+    /// A whitelisted tuple with the wrong arity, or a recognized option with a malformed
+    /// value (`{cd, 5}`, `{args, foo}`, `{line, 0}`), is [`BeamError::BadArg`] — the drivers
+    /// cannot accept those.
     fn port_options(&self, options: Eterm) -> Result<PortOptions> {
         let mut parsed = PortOptions::default();
         for element in terms::list_elements(options)? {
@@ -1839,6 +1910,15 @@ impl RuntimePorts {
                     // The child's stderr is merged into its stdout, so its bytes arrive as
                     // port data (the `spawn` driver's `dup2(1, 2)`).
                     "stderr_to_stdout" => parsed.stderr_to_stdout = true,
+                    // `line` is line framing at the oracle's default length (`linebuf = 512`).
+                    "line" => parsed.line = Some(LINE_DEFAULT_MAX_LEN),
+                    // The two stdio switches; the oracle's default is `use_stdio` (`true`).
+                    "use_stdio" => parsed.use_stdio = Some(true),
+                    "nouse_stdio" => parsed.use_stdio = Some(false),
+                    // `stream` cancels any packet framing (`opts.packet_bytes = 0`,
+                    // `erl_bif_port.c:979-980`), which is what makes `[line, {packet,2},
+                    // stream]` legal where `[line, {packet,2}]` is not.
+                    "stream" => parsed.packet = false,
                     // Whitelisted, accepted, without effect here (see the module docs).
                     _ => {}
                 }
@@ -1865,9 +1945,35 @@ impl RuntimePorts {
                 "args" => {
                     parsed.args = self.arg_list(terms::tuple_element(element, 1)?)?;
                 }
+                // `{line, N}` is line framing at `N` bytes; the oracle requires a **positive**
+                // integer (`if (linebuf <= 0) goto bad_settings`, `erl_bif_port.c:866-869`),
+                // so `{line,0}`/`{line,-1}`/`{line,foo}` are `badarg`.
+                "line" => {
+                    let value = terms::tuple_element(element, 1)?;
+                    if !is_small(value) {
+                        return Err(BeamError::BadArg);
+                    }
+                    let length = signed_value(value);
+                    if length <= 0 {
+                        return Err(BeamError::BadArg);
+                    }
+                    parsed.line =
+                        Some(usize::try_from(length).map_err(|_| BeamError::BadArg)?);
+                }
+                // A `{packet, N}` puts packet framing in effect (only the mutual-exclusion
+                // check below reads that; this runtime does not frame packets).
+                "packet" => parsed.packet = true,
                 // Whitelisted, accepted, without effect here.
                 _ => {}
             }
+        }
+        // The oracle's **mutual-exclusion** rules, checked **after** the whole list is parsed
+        // (so they are order-independent): a line-buffered port cannot also be packet-framed,
+        // and a redirected stderr requires `use_stdio` (`erl_bif_port.c:1019-1022`).
+        if (parsed.line.is_some() && parsed.packet)
+            || (parsed.stderr_to_stdout && !parsed.use_stdio())
+        {
+            return Err(BeamError::BadArg);
         }
         Ok(parsed)
     }
@@ -1897,26 +2003,35 @@ impl RuntimePorts {
 
 impl StreamType {
     /// The C's **port state** stream flags, as `driver_get_port_flags` reports them
-    /// (`io.c:5325-5344`): `ERTS_PORT_SFLG_BINARY_IO` ⇒ `PORT_FLAG_BINARY` (1), else
-    /// `ERTS_PORT_SFLG_LINEBUF_IO` ⇒ `PORT_FLAG_LINE` (2), else `0`.
+    /// (`io.c:5325-5344`): the two state bits are **OR-ed** independently —
+    /// `ERTS_PORT_SFLG_BINARY_IO` ⇒ `PORT_FLAG_BINARY` (1) and `ERTS_PORT_SFLG_LINEBUF_IO` ⇒
+    /// `PORT_FLAG_LINE` (2), either, both or neither.
     ///
-    /// Those state bits are set by the `open_port/2` stream option alone (`binary` ⇒ binary I/O,
-    /// `line`/`{line,N}` ⇒ line-buffered, otherwise neither — `erl_bif_port.c:985-990`,
-    /// `1139-1141`), so they are derived here from the same resolved stream that decides the read
-    /// path's message shape. This runtime's `open_port/2` accepts `line` as a whitelisted-but-inert
-    /// option, so the `PORT_FLAG_LINE` case is **not reachable** here: a driver port opened `[line]`
-    /// answers `0` where the oracle answers `2` (documented residual, never guessed).
-    pub(crate) fn port_flags(self) -> i32 {
-        match self {
+    /// Those state bits are set by the `open_port/2` stream options alone (`binary` ⇒ binary I/O
+    /// at `erl_bif_port.c:989-990`, `line`/`{line,N}` ⇒ line-buffered at `:1139-1141`), so they
+    /// are derived here from the resolved `binary`/`list` stream **and** the resolved line option.
+    /// `[line]` is therefore `2`, `[binary]` is `1`, `[binary, line]` is `3` and no stream option
+    /// is `0` — every one cross-checked live against erts-17.1 through a C driver's
+    /// `get_port_flags`.
+    pub(crate) fn port_flags(self, line: Option<usize>) -> i32 {
+        let mut flags = match self {
             StreamType::Binary => PORT_FLAG_BINARY,
             StreamType::List => 0,
+        };
+        if line.is_some() {
+            flags |= PORT_FLAG_LINE;
         }
+        flags
     }
 }
 
 /// The C's `PORT_FLAG_BINARY`: the port state bit `driver_get_port_flags` maps
 /// `ERTS_PORT_SFLG_BINARY_IO` onto (`erl_driver.h`'s `PORT_FLAG_BINARY`, `1 << 0`).
 const PORT_FLAG_BINARY: i32 = 1;
+
+/// The C's `PORT_FLAG_LINE`: the port state bit `driver_get_port_flags` maps
+/// `ERTS_PORT_SFLG_LINEBUF_IO` onto (`erl_driver.h`'s `PORT_FLAG_LINE`, `1 << 1`).
+const PORT_FLAG_LINE: i32 = 1 << 1;
 
 impl PortHook for RuntimePorts {
     fn open_port(&mut self, name: Eterm, options: Eterm) -> Result<PortId> {
@@ -1935,6 +2050,9 @@ impl PortHook for RuntimePorts {
         // before anything is registered anywhere, so a failure here cannot leak an id; the
         // OS pid the driver reports is what `port_info(Port, os_pid)` answers.
         let stream = resolved.stream();
+        // The resolved line framing, read before the honored fields below are moved out of
+        // `resolved`; it is carried into every `PortMeta` so `PortRegistry::register` arms it.
+        let line = resolved.line;
         if spec.kind == PortName::SpawnDriver {
             // The driver name is the prefix up to the first blank — the C's own rule (`io.c` walks
             // the name to the first blank before matching `driver_name`), the same rule
@@ -1962,6 +2080,7 @@ impl PortHook for RuntimePorts {
                     // `undefined`.
                     os_pid: None,
                     stream,
+                    line,
                     // Nothing to reap, so no `{Port, {exit_status, …}}` is ever synthesized.
                     notify_exit: false,
                     monitors: Vec::new(),
@@ -1979,6 +2098,19 @@ impl PortHook for RuntimePorts {
                 };
                 return registry.register(driver, meta);
             }
+            // A driver the runtime already **has loaded by name** is resolved against the
+            // loaded-driver list first, exactly as the C matches the name against each loaded
+            // entry's `driver_name` (`io.c:599-628`). The list records the object path the driver
+            // really came from (`erl_ddll:try_load/3`, or the path form of an earlier
+            // `open_port({spawn_driver, …})`), so the port re-uses **that** object instead of
+            // searching the name afresh — which is what lets a driver loaded with
+            // `erl_ddll:try_load(Dir, Name, [])` be opened as `{spawn_driver, Name}`. When the
+            // name is not loaded the name doubles as the search ([`driver_lookup`], the documented
+            // Milestone-1 extension).
+            let (candidates, driver_name) = match driver::loaded_driver_path(&driver_name) {
+                Some(path) => (vec![path], driver_name),
+                None => (candidates, driver_name),
+            };
             // A **C driver** (contract A.4) port: the driver is `dlopen`ed and registered as the
             // port's driver, so `port_command` reaches its `output` callback and its
             // `driver_output` bytes reach the owner. An unknown driver name is the oracle's own
@@ -1992,7 +2124,7 @@ impl PortHook for RuntimePorts {
             // The port's **state** stream flags, which `driver_get_port_flags` reports: the C reads
             // `ERTS_PORT_SFLG_BINARY_IO`/`ERTS_PORT_SFLG_LINEBUF_IO` (`io.c:5338-5341`) set by the
             // very stream option the port was opened with (`erl_bif_port.c:985-990`).
-            .with_port_flags(stream.port_flags())
+            .with_port_flags(resolved.port_flags())
             // The liveness view this host answers `driver_monitor_process`'s positive
             // `ERL_DRV_MONITOR_NOT_ALIVE` from: the runtime's most recent observation, published
             // by [`PortRegistry::refresh_liveness`] at the start of each port round (see
@@ -2028,6 +2160,7 @@ impl PortHook for RuntimePorts {
                 // A driver port owns no OS child; `port_info(Port, os_pid)` is `undefined`.
                 os_pid: None,
                 stream,
+                line,
                 // Nothing to reap, so no `{Port, {exit_status, …}}` is ever synthesized.
                 notify_exit: false,
                 monitors: Vec::new(),
@@ -2061,6 +2194,7 @@ impl PortHook for RuntimePorts {
             command: spec.command,
             os_pid,
             stream,
+            line,
             notify_exit: spawn_options.exit_status,
             monitors: Vec::new(),
             owner: self.owner,

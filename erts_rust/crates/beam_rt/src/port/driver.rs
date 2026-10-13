@@ -917,6 +917,10 @@ pub(crate) struct LoadedDriver {
     ///
     /// `None` for a driver opened by `open_port({spawn_driver, …})`: its handle lives in the
     /// **port's** adapter, so forgetting the record must never unload it.
+    // Held for its `Drop`: dropping the record runs the driver's `finish` and `dlclose`s the
+    // object. The field is deliberately never *read* (the C's handle is opaque to the
+    // runtime), which is exactly why the dead-code lint must not fire on it.
+    #[allow(dead_code)]
     pub(crate) library: Option<DriverLibrary>,
 }
 
@@ -1663,7 +1667,7 @@ impl DriverPortAdapter {
         host: DriverPort,
         command: String,
     ) -> std::result::Result<DriverPortAdapter, DriverLoadError> {
-        let library = load_driver(candidates, name)?;
+        let (library, path) = load_driver_at(candidates, name)?;
         // The host and the loaded entry first coexist here, so this is where the one fact the host
         // cannot observe for itself is stamped: whether the entry declares a `process_exit` slot,
         // which gates `driver_monitor_process` (`io.c:6998`). `beam_io`'s own host reads the very
@@ -1679,6 +1683,12 @@ impl DriverPortAdapter {
         // `remove_driver_entry` refuses it. Recording the same entry here lets the frozen
         // `remove_driver_entry` slot answer the C's `-1` for a port's own driver.
         registry_note_loaded_entry(library.entry() as *const ErlDrvEntry as *mut ErlDrvEntry);
+        // The runtime's **loaded-driver list** ([`LOADED_DRIVERS`]), keyed by driver name: the
+        // same view `erl_ddll:loaded_drivers/0` reports and the one a later
+        // `open_port({spawn_driver, Name}, …)` matches the name against (`io.c:599-628`). The
+        // `dlopen` handle stays with this port — the record stores none, so forgetting the entry
+        // never unloads a live port (see [`note_driver_opened`]).
+        note_driver_opened(name, &path);
         let control = host.control();
         let terms = host.term_queue();
         // The driver-monitor tree the host's monitor hooks install into. Seizing it here is what
