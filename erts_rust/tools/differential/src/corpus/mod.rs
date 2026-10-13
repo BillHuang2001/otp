@@ -73,6 +73,7 @@
 //! | [`ets_spec`] | A.7 — the `ets` match-spec / `select` family + the `info/1,2` fields + the `ordered_set` arithmetic-key rule |
 //! | [`proc_signals`] | A.7 — the group leader, the `dt_*` switches, `erlang:statistics/1`, `spawn_monitor`/`monitor` |
 //! | [`proc_control`] | A.7 — `monitor`/`demonitor`, the `exit/1,2` taxonomy, `register`/`unregister`/`whereis`, the run-queue priorities |
+//! | [`gc`] | A.1/A.7 — the per-process collector observed through the values it must preserve (forced collections, collector-stressing programs, the `garbage_collect`/`process_info` BIF surface) |
 //! | [`system_info`] | A.8 — introspection (incl. `erlang:memory/0,1` — a Rust capability gap — and the trace / `seq_trace` / `halt` surface) |
 //! | [`boot`] | A.9 — boot/version observability (asserted by shape) |
 //! | [`boot_prereq`] | A.9 — the boot-path prerequisite primitives (preloaded set, boot-script applications, `register`/`whereis`, group-leader inheritance, the `-boot` flag, the `proc_lib` start wait) |
@@ -111,6 +112,7 @@ mod ets_spec;
 mod flags;
 mod flags_apply;
 mod format_limit;
+mod gc;
 mod math_bifs;
 mod mexec;
 mod mexec_extra;
@@ -601,6 +603,7 @@ fn build_corpus() -> Vec<Case> {
     cases.extend(flags::group());
     cases.extend(flags_apply::group());
     cases.extend(format_limit::group());
+    cases.extend(gc::group());
     cases.extend(mexec::group());
     cases.extend(mexec_extra::group());
     cases.extend(modules::group());
