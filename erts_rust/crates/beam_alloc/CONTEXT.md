@@ -114,8 +114,18 @@ exercisable there).
 Fixed-capacity bump arena over a carrier-provided block; **never reallocates** (handed-out pointers
 stay valid; growth is a new heap + copy by `beam_gc`). `new(capacity_words)`,
 `with_allocator(alloc, capacity_words)`, `capacity`, `used`, `available`, `peak_used`, `reset`,
-`hp`, `hend`, `allocator`, `unsafe alloc_words`, `unsafe alloc_tuple`, `cons`, `tuple`, `Drop`
+`reset_to(used) -> Result<()>`, `hp`, `hend`, `allocator`, `unsafe alloc_words`,
+`unsafe alloc_tuple`, `cons`, `tuple`, `Drop`
 returns the block. Exhaustion ⇒ `BeamError::Alloc(AllocKind::Heap)` (= "collect", not fatal OOM).
+`reset()` rewinds to empty and `reset_to(used)` to a **mark** (the exact inverse of allocating `used`
+words, `used` in *term words*): the first `used` words stay owned and their contents are not touched,
+everything after them is only freed-and-reused (never wiped), and `peak_used` is preserved by both
+(the high-water mark is live-word history, not the offset) — `reset_to(0)` is therefore exactly
+`reset()`. A `used` **above** the current `used()` is the typed `BeamError::BadArg` with the heap left
+completely unchanged (never a silent clamp, never a panic): rewinding *forward* would claim words the
+heap never handed out — the same refusal rule [`ReservedHeap::relocate`] applies to an
+undersized reservation. This is what lets a *pooled* heap that reaches a caller already owning words
+handed over to another caller be rewound precisely instead of only when it is empty.
 
 ### `reserved_heap` — the reservation-capable per-process term heap (`ReservedHeap`)
 The **frozen seam** for hosts that must grow a live process heap. One backing block of
