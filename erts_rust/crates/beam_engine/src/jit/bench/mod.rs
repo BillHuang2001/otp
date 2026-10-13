@@ -30,7 +30,7 @@
 //! [`run_measurement_table`] (the `#[ignore]`d table). Keeping the harness here is what
 //! stops the unit-test and integration-test halves from growing a copy each.
 //!
-//! Eleven workloads, split by lowering story:
+//! Twelve workloads, split by lowering story:
 //!
 //! * The shapes the baseline tier **deopts** (every instruction is a `jit_step_one`
 //!   helper round-trip on a native tier) — **`build/0`** (`put_tuple2`/`put_list`),
@@ -50,6 +50,13 @@
 //!   workload that measures a cross-module *transfer*: on the baseline tier the callee
 //!   is compiled into the per-thread code cache on first sight, so it runs natively
 //!   too and the figure isolates the switch.
+//! * **`call_ext/0`** ([`workloads::workloads`]) — the `call_ext*` **decline** path: a
+//!   counted loop of `call_ext 2 erlang:'+'/2` calls the host answers "run it
+//!   synchronously" (`Ok(None)`). On the baseline tier the native `jit_ext_call` helper
+//!   consults the host's cross-module seam **once** and hands the instruction to
+//!   `jit_step_ext` with that already-computed answer, so `call_ext_dispatch` never
+//!   re-asks the seam (it did, before that helper existed). Its per-instruction pin is
+//!   `src/jit/baseline/tests.rs::the_baseline_tier_agrees_with_the_interpreter_on_the_declined_call_ext_seam_count`.
 //!
 //! # Method
 //!

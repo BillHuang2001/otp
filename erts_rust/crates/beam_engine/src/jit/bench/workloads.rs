@@ -51,7 +51,9 @@ use beam_term::{make_atom, make_small, Atom, Eterm, NIL};
 use crate::context::{BifHook, MinimalContext};
 use crate::terms;
 
-use super::checks::{verify_build, verify_cross, verify_map, verify_select, verify_sum, verify_walk};
+use super::checks::{
+    verify_build, verify_call_ext, verify_cross, verify_map, verify_select, verify_sum, verify_walk,
+};
 use super::support::{arith_hook, Fixture};
 
 // ---------------------------------------------------------------------------
@@ -85,6 +87,25 @@ pub(super) const SUM_LENGTH: usize = 64;
 /// Every transfer increments the accumulator exactly once, so the exported result is
 /// this count — a loop that ran a different number of transfers cannot produce it.
 pub(super) const CROSS_STEPS: usize = 64;
+
+/// The number of **declined** `erlang:'+'/2` `call_ext` calls one `call_ext/0` run makes.
+///
+/// Every call adds [`CALL_EXT_INCREMENT`] to the accumulator, and the loop trips when
+/// the accumulator reaches `CALL_EXT_ROUNDS * CALL_EXT_INCREMENT`, so the exported
+/// result is that product — a run that skipped, repeated or reordered a call cannot
+/// produce it.
+pub(super) const CALL_EXT_ROUNDS: i64 = 256;
+
+/// The small integer the declined `erlang:'+'/2` `call_ext` adds on every call.
+///
+/// A value `> 1` (rather than a unit increment) means the accumulator only reaches the
+/// loop limit — itself `CALL_EXT_ROUNDS * CALL_EXT_INCREMENT` — after exactly
+/// [`CALL_EXT_ROUNDS`] calls, so the pinned result is only reproduced if the loop trips
+/// at the right iteration.
+pub(super) const CALL_EXT_INCREMENT: i64 = 3;
+
+/// The module the declined-`call_ext` workload is entered through.
+const CALL_EXT_MODULE: &str = "jit_bench_call_ext";
 
 /// The module the cross-module workload is **entered** through (the caller side).
 const PING_MODULE: &str = "jit_bench_cross_a";
@@ -288,8 +309,8 @@ impl Workload {
 }
 /// Every workload the tier table measures: the shapes the baseline tier **deopts**
 /// ([`build_workload`]/[`map_workload`]/[`select_workload`]/[`walk_workload`]/[`sum_workload`])
-/// followed by the shapes it **inlines** (`super::inlined`) and the cross-module transfer
-/// ([`cross_workload`]).
+/// followed by the shapes it **inlines** (`super::inlined`), the cross-module transfer
+/// ([`cross_workload`]) and the declined `call_ext` seam ([`call_ext_workload`]).
 pub(super) fn workloads() -> Vec<Workload> {
     let mut all = vec![
         build_workload(),
@@ -300,6 +321,7 @@ pub(super) fn workloads() -> Vec<Workload> {
     ];
     all.extend(super::inlined::inlined_workloads());
     all.push(cross_workload());
+    all.push(call_ext_workload());
     all
 }
 /// `build/0` — [`BUILD_ROUNDS`] `put_tuple2` + `put_list` pairs, then `return`.
@@ -816,6 +838,102 @@ fn cross_body(fixture: &Fixture, cross: ImportRef) -> Vec<Instr> {
     ]
 }
 
+/// `call_ext/0` — [`CALL_EXT_ROUNDS`] **declined** `erlang:'+'/2` `call_ext` calls in a
+/// counted loop.
+///
+/// ```text
+/// entry:
+///   x0 = 0                                 ; move (the accumulator)
+///   x1 = CALL_EXT_INCREMENT                ; move (the addend)
+///   allocate 0 2                           ; the frame the non-tail call_ext needs
+/// loop:
+///   call_ext 2 erlang:'+'/2                ; resolved through the host seam, DECLINED
+///   test is_ge Fail=loop x0 limit          ; loop while x0 < limit
+///   deallocate 0
+///   return
+/// ```
+///
+/// This is the workload for the **declined** `call_ext*` path — a `call_ext` whose host
+/// answer is "run it synchronously in this process" (`Ok(None)`, the common BIF shape
+/// and the `MinimalContext` default) rather than a module this machine can enter. On the
+/// baseline tier the `call_ext` is not a plain deopt: it is lowered through the native
+/// `jit_ext_call` helper, which consults the host's cross-module seam **once**; on the
+/// decline the same instruction is then handed to `jit_step_ext` with that already-computed
+/// answer, so `Machine::call_ext_dispatch` never re-asks the seam. Before that helper
+/// existed the tier resolved the same import **twice** (once in `jit_ext_call`, once
+/// inside the `jit_step_one` fallback), so measuring the decline from now on is exactly
+/// what keeps the one-consultation property honest at the benchmark level. The
+/// deterministic per-instruction pin lives in
+/// `src/jit/baseline/tests.rs::the_baseline_tier_agrees_with_the_interpreter_on_the_declined_call_ext_seam_count`;
+/// this workload is its end-to-end, hot-loop counterpart.
+///
+/// The import is `erlang:'+'/2` (`Fixture::with_plus`'s index-0 import), the same shape
+/// the per-instruction pin uses: it is answered by the harness's [`arith_hook`] on the
+/// synchronous `call_bif` route, so every call is a **declined** `call_ext` that lands on
+/// the BIF. It is deliberately *synthetic* — `erlc` emits `+`/2 as a `gc_bif`, not a
+/// `call_ext` — because the instruction under measurement is the `call_ext` **seam**, not
+/// the arithmetic: the seam is identical for any declined import, and `'+'/2` is the one
+/// the harness's `Fixture` interns and its hook answers.
+///
+/// The frame discipline is load-bearing. A `run_export` body pushes a bottom `Halt`
+/// frame; a non-tail `call_ext` would overwrite *that* frame's continuation, so the loop
+/// `allocate`s its own frame first and `deallocate`s it before its final `return`. Each
+/// call adds [`CALL_EXT_INCREMENT`] to the accumulator, the `test is_ge` trips once it
+/// reaches `CALL_EXT_ROUNDS * CALL_EXT_INCREMENT`, so the exported result is that product
+/// and the loop made exactly [`CALL_EXT_ROUNDS`] calls (a `test` branches on the
+/// *negation* of its predicate, so `is_ge` loops while `x0 <` the limit).
+fn call_ext_workload() -> Workload {
+    let fixture = Fixture::with_plus(CALL_EXT_MODULE);
+    let entry = Label(1);
+    let loop_label = Label(2);
+    let limit = CALL_EXT_ROUNDS * CALL_EXT_INCREMENT;
+    let code = vec![
+        Instr::Label(entry),
+        Instr::Move {
+            src: Operand::Integer(0),
+            dst: Operand::X(0),
+        },
+        Instr::Move {
+            src: Operand::Integer(CALL_EXT_INCREMENT),
+            dst: Operand::X(1),
+        },
+        // The frame the non-tail `call_ext` needs (see the doc above): allocated once,
+        // outside the loop, and popped before the final `return`.
+        Instr::Allocate {
+            stack_need: HeapNeed::Words(0),
+            live: 2,
+        },
+        Instr::Label(loop_label),
+        // `x0 = x0 + x1` — a `call_ext` the host's seam declines (`Ok(None)`), i.e. the
+        // duplicate-resolution shape `jit_step_ext` removes.
+        Instr::CallExt {
+            arity: 2,
+            target: ImportRef(0),
+        },
+        // A `test` jumps on FAILURE, so `is_ge` loops while `x0 < limit` and falls
+        // through once the accumulator reaches it.
+        Instr::Test {
+            kind: TestKind::IsGe,
+            fail: loop_label,
+            args: vec![Operand::X(0), Operand::Integer(limit)],
+        },
+        Instr::Deallocate(0),
+        Instr::Return,
+    ];
+
+    let (module, function) = fixture.finish("call_ext", 0, code);
+    Workload::new(
+        format!(
+            "call_ext/0 ({CALL_EXT_ROUNDS} declined erlang:'+'/2 call_ext calls in a loop)"
+        ),
+        module,
+        function,
+        0,
+        Args::Fixed(Vec::new()),
+        verify_call_ext,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Argument preparation (heap terms must live in the run's own context)
 // ---------------------------------------------------------------------------
@@ -891,5 +1009,48 @@ mod tests {
             y_destinations, 1,
             "sum/1 must keep exactly one `gc_bif` writing to a Y slot"
         );
+    }
+
+    /// The `call_ext/0` workload exists to measure exactly one path: a `call_ext` the
+    /// host **declines** (the synchronous BIF route through `jit_step_ext`). Swap it for
+    /// a `gc_bif` — or drop the import — and the workload would keep passing the
+    /// tier-agreement check while silently measuring nothing, so the shape is pinned
+    /// here: exactly one `call_ext 2 erlang:'+'/2`, no `gc_bif` anywhere, and the one
+    /// import is the `erlang:'+'/2` [`Fixture::with_plus`] installs.
+    #[test]
+    fn the_call_ext_workload_keeps_a_declined_call_ext_in_its_loop() {
+        let workload = call_ext_workload();
+        let mut call_exts = 0;
+        let mut gc_bifs = 0;
+        for function in &workload.module.functions {
+            for instr in &function.code {
+                match instr {
+                    Instr::CallExt { arity, target }
+                        if *arity == 2 && matches!(target, ImportRef(0)) =>
+                    {
+                        call_exts += 1;
+                    }
+                    Instr::GcBif { .. } => gc_bifs += 1,
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(
+            call_exts, 1,
+            "call_ext/0 must keep exactly one `call_ext 2` in its loop"
+        );
+        assert_eq!(
+            gc_bifs, 0,
+            "the declined path must stay a `call_ext`, never a `gc_bif`"
+        );
+
+        let import = workload
+            .module
+            .imports
+            .first()
+            .expect("the module imports the one BIF its `call_ext` names");
+        assert_eq!(workload.module.atom_name(import.module), Some("erlang"));
+        assert_eq!(workload.module.atom_name(import.function), Some("+"));
+        assert_eq!(import.arity, 2);
     }
 }

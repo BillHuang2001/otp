@@ -1,12 +1,12 @@
 # `beam_engine` JIT measurement harnesses (`src/jit/bench/`)
 
 ## Intent
-The in-crate measurement harness for the execution tiers, over **eleven** workloads split by lowering
+The in-crate measurement harness for the execution tiers, over **twelve** workloads split by lowering
 story. It is a `pub mod` (not `#[cfg(test)]`) because the `#[test]` entry points live in the
 integration test `tests/jit_bench.rs`, which cannot see a `#[cfg(test)]` lib module; the library only
 exposes two plain functions and the harness itself is never on the engine's execution path.
 
-Eleven workloads, split by how the baseline tier lowers them:
+Twelve workloads, split by how the baseline tier lowers them:
 
 * **Deopted** (every instruction is a `jit_step_one` helper round-trip on a native tier) — in
   `workloads.rs`: **`build/0`** (`put_tuple2`/`put_list` term building), **`map/2`**
@@ -29,6 +29,23 @@ Eleven workloads, split by how the baseline tier lowers them:
   `crate::jit::cache::cached_module_blocks`, which compiles the callee into the per-thread `CodeCache`
   on first sight — so the callee runs **natively** too, and the workload's figure isolates the
   *transfer* itself.
+* **Declined `call_ext`** — in `workloads.rs`: **`call_ext/0`**, a counted loop of
+  `call_ext 2 erlang:'+'/2` calls the host answers "run it synchronously in this process"
+  (`Ok(None)` — the common BIF shape and the `MinimalContext` default). This is the workload for the
+  `call_ext*` **decline** path: on the baseline tier the call is *not* a plain deopt, it is lowered
+  through the native `jit_ext_call` helper, which consults the host's seam **once** and (on the
+  decline) hands the instruction to `jit_step_ext` with that already-computed answer, so
+  `Machine::call_ext_dispatch` never re-asks the seam — before that helper existed the tier resolved
+  the same import **twice** (once in `jit_ext_call`, once inside the `jit_step_one` fallback). The
+  deterministic per-instruction pin is
+  `src/jit/baseline/tests.rs::the_baseline_tier_agrees_with_the_interpreter_on_the_declined_call_ext_seam_count`;
+  `call_ext/0` is its end-to-end hot-loop counterpart, so the harness measures the decline from now
+  on. The import is `erlang:'+'/2` (`Fixture::with_plus`'s index-0 import — answered by the harness's
+  `arith_hook` on the synchronous `call_bif` route), the same shape the per-instruction pin uses; it is
+  deliberately *synthetic* (`erlc` emits `+`/2 as a `gc_bif`), because the instruction under
+  measurement is the `call_ext` **seam**, not the arithmetic. The loop `allocate`s its own frame first
+  and `deallocate`s it before the final `return` — a `run_export` body's bottom frame is the `Halt`
+  frame, so the frame discipline is load-bearing.
 
 ## API Surface (crate-visible; `crate::jit::bench::…`)
 - `support` (`pub(crate) mod`) — the scaffolding shared with the sibling Cranelift harness
@@ -39,13 +56,16 @@ Eleven workloads, split by how the baseline tier lowers them:
 - `workloads` — the `Workload` type (module + exported `function/arity` + argument source + a value
   check pinning the intended result + an optional `CrossCall`), the five deopted workload builders,
   the cross-module pair, their round constants
-  (`BUILD_ROUNDS`/`MAP_ROUNDS`/`SELECT_ROUNDS`/`WALK_LENGTH`/`SUM_LENGTH`/`CROSS_STEPS`, `TIMED_RUNS`/
-  `AGREEMENT_RUNS`) and the in-context argument builders (`map_args`/`walk_args`/`sum_args`);
-  `workloads()` returns all eleven (the six here plus `inlined::inlined_workloads()`), and
-  `sum_workload()`'s Y-operand `gc_bif` is pinned by a `#[cfg(test)]` shape guard
+  (`BUILD_ROUNDS`/`MAP_ROUNDS`/`SELECT_ROUNDS`/`WALK_LENGTH`/`SUM_LENGTH`/`CROSS_STEPS`,
+  `CALL_EXT_ROUNDS`/`CALL_EXT_INCREMENT`, `TIMED_RUNS`/`AGREEMENT_RUNS`) and the in-context argument
+  builders (`map_args`/`walk_args`/`sum_args`); `workloads()` returns all twelve (the seven here plus
+  `inlined::inlined_workloads()`), and `sum_workload()`'s Y-operand `gc_bif` is pinned by a
+  `#[cfg(test)]` shape guard
   (`tests::the_sum_workload_keeps_its_y_slot_operand_and_destination`), so the workload cannot quietly
-  stop measuring its gap. `Workload::bif_hook()` installs
-  the arithmetic hook (with working booleans only when the module interns both `true` and `false`).
+  stop measuring its gap — as is `call_ext_workload()`'s declined `call_ext`
+  (`tests::the_call_ext_workload_keeps_a_declined_call_ext_in_its_loop`). `Workload::bif_hook()`
+  installs the arithmetic hook (with working booleans only when the module interns both `true` and
+  `false`).
   `CrossCall` carries the callee's shared `Arc<Module>`, the import `(module, function, arity)` the
   caller resolves and the callee's export **entry** label; `Workload::with_cross` attaches it and
   `Workload::install_cross(ctx)` installs the `ExternalResolver` answering **both** ping-pong
@@ -53,11 +73,14 @@ Eleven workloads, split by how the baseline tier lowers them:
   leaving every other import on the synchronous `call_bif` path.
 - `inlined` — the five tier-inlined workload builders and their pinned result constants
   (`FIB_RESULT`/`KERNEL_RESULT`/`WIDE_RESULT`/`AGGR_RESULT`, `pub(super)` for `checks`).
-- `checks` — the eleven per-workload result checks (`verify_build`/`verify_map`/`verify_select`/
+- `checks` — the twelve per-workload result checks (`verify_build`/`verify_map`/`verify_select`/
   `verify_walk`/`verify_sum`/`verify_fib`/`verify_kernel`/`verify_wide`/`verify_aggr`/`verify_cmp`/
-  `verify_cross`), each `fn(&Workload, Eterm) -> Result<(), String>`. `verify_cross` pins the
-  exported result to `CROSS_STEPS`, which a loop that ran a different number of transfers cannot
-  produce; `verify_sum` pins the triangular sum `SUM_LENGTH * (SUM_LENGTH + 1) / 2`.
+  `verify_cross`/`verify_call_ext`), each `fn(&Workload, Eterm) -> Result<(), String>`.
+  `verify_cross` pins the exported result to `CROSS_STEPS`, which a loop that ran a different number
+  of transfers cannot produce; `verify_sum` pins the triangular sum
+  `SUM_LENGTH * (SUM_LENGTH + 1) / 2`; `verify_call_ext` pins
+  `CALL_EXT_ROUNDS * CALL_EXT_INCREMENT`, which a loop that skipped, repeated or reordered a declined
+  `call_ext` cannot produce.
 - `mod.rs` — the tier seam (`Runner`), the timing loop (`Measurement`) and the reporting
   (`report`/`bench_workload`), plus the two public entry points `assert_tier_agreement()` (fast, the
   agreement half) and `run_measurement_table()` (the `#[ignore]`d timing table). `Measurement::run`
@@ -124,11 +147,24 @@ compiled block, bypassing the block linker entirely; on the interpreter a `Step:
 a ping-pong, the tier's pre-compiled caller artifact is used for the very first hop only, so this
 workload measures the **un-amortised** cross-module transfer by construction.
 
+## Measured: `call_ext/0` (min of 3 timed runs, shared sandbox)
+`call_ext/0`'s baseline figure is **above** the interpreter's: min-of-3 over three runs of the timing
+table (`/proc/loadavg` `21.98`–`22.51` before each) is interpreter **8360.1 ns/op** vs baseline-jit
+**6855.8 ns/op**, i.e. baseline ≈ **1.22×** the interpreter (a 1.22× speed-up, range 1.21×–1.30× across
+the three runs). That is the expected shape for the decline path: the `call_ext` instruction itself is
+lowered **natively** through `jit_ext_call` (so the tier pays one helper call, not a full
+decode + dispatch interpreter step) and the rest of the loop — the two `move`s and the `test is_ge` —
+is inlined, so the interpreter is the slower tier. The figure still isolates the decline cost the
+helper exposes: 256 declined calls per run at ≈ **26.8 ns/call** on the baseline (≈ **32.7 ns/call** on
+the interpreter), against a loop whose non-call work is two register moves and one compare per
+iteration. Quote it as the **ratio within one run set**, never as a bare absolute — the sandbox is
+shared and heavily loaded.
+
 ## Routing Table
 - `support.rs` → the shared scaffolding (see API Surface); `workloads.rs` → the five deopted
-  workloads (`build/0`, `map/2`, `select/1`, `walk/2`, `sum/1`) **and** the cross-module `cross/2`
-  pair; `inlined.rs` → the five tier-inlined workloads; `checks.rs` → the result checks; `mod.rs` →
-  the tier-table harness.
+  workloads (`build/0`, `map/2`, `select/1`, `walk/2`, `sum/1`), the cross-module `cross/2` pair
+  **and** the declined-`call_ext` `call_ext/0`; `inlined.rs` → the five tier-inlined workloads;
+  `checks.rs` → the result checks; `mod.rs` → the tier-table harness.
 - `../../cranelift/bench.rs` → the sibling order-balanced baseline-vs-Cranelift harness, which
   consumes `support` through `crate::jit::bench::support`.
 
