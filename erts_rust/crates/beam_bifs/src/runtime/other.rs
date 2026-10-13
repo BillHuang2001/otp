@@ -23,7 +23,7 @@
 //! Every key here is a declared `bif.tab` entry whose implementation needs host
 //! machinery this crate does not own: the interpreter-level debugger tools
 //! (`erl_debugger`), the code-coverage bookkeeping (`code`), the `ets` scheduler fan-in
-//! (`internal_request_all/0`) and C-interior slot walk (`slot/2`), the
+//! (`internal_request_all/0`), the
 //! tracing-state cleanup and literal-area copy protocols, and the `prim_file` NFC
 //! normalizer, `os` signal handling, `net_kernel` distribution flag and
 //! `error_logger` category map. Each is registered through the single
@@ -63,11 +63,10 @@ pub(crate) const REAL_BIFS: &[(&str, &str, u32)] = &[
 
 /// Registers this family's BIFs.
 pub(crate) fn register(reg: &mut BifRegistry) {
-    // `ets` -- the C-only `slot/2` interior walk and the scheduler fan-in
-    // `internal_request_all/0`; every other `ets:*` key the C interior used to
-    // stand in for now has a real implementation in `src/ets/`.
+    // `ets` -- the scheduler fan-in `internal_request_all/0`; every other `ets:*`
+    // key the C interior used to stand in for now has a real implementation in
+    // `src/ets/` (`ets:slot/2` included).
     crate::runtime::runtime_bif!(reg, "ets", internal_request_all, 0);
-    crate::runtime::runtime_bif!(reg, "ets", slot, 2);
 
     // `erl_debugger` -- the interpreter-level debugger tools.
     crate::runtime::runtime_bif!(reg, "erl_debugger", breakpoints, 1);
@@ -169,7 +168,9 @@ mod tests {
         let mut reg = BifRegistry::new();
         super::register(&mut reg);
         assert!(reg.contains("re", "run", 3));
-        assert!(reg.contains("ets", "slot", 2));
+        // `ets:internal_request_all/0` is this file's only remaining `ets` seam key
+        // (`ets:slot/2` now has a real implementation in `src/ets/`).
+        assert!(reg.contains("ets", "internal_request_all", 0));
         // `os:set_signal/2`'s home is *this* file (`src/runtime/other.rs`), not
         // `src/os_bif.rs`; it is a seam key answering the typed gap with no provider
         // (see the module `CONTEXT.md`).
@@ -231,7 +232,7 @@ mod tests {
     fn os_set_signal_is_a_roster_seam_key_forwarder() {
         assert!(
             crate::hook_sets::needs_runtime_hooks("os", "set_signal", 2),
-            "os:set_signal/2 must be in the 173-key RuntimeHooks roster"
+            "os:set_signal/2 must be in the 172-key RuntimeHooks roster"
         );
 
         let mut reg = BifRegistry::new();

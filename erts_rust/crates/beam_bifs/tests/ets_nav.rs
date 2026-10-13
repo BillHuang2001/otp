@@ -18,12 +18,13 @@
 //
 // %CopyrightEnd%
 
-//! End-to-end **reachability** tests for the eleven `ets:*` keys that used to be
-//! registered twice: `src/ets/{nav,reverse,extra,specs}.rs` gave them a real
-//! implementation, while `src/runtime/other.rs` registered a `RuntimeHooks` seam
-//! stub that — because `crate::runtime::register` runs **last** in `with_core_bifs`
+//! End-to-end **reachability** tests for the `ets:*` keys that used to be reachable
+//! only through a `RuntimeHooks` seam stub: `src/ets/{nav,reverse,extra,specs}.rs`
+//! gave eleven of them a real implementation while `src/runtime/other.rs` registered
+//! a stub that — because `crate::runtime::register` runs **last** in `with_core_bifs`
 //! and `BifRegistry::register` overwrites — shadowed the real one in
-//! `default_registry()`.
+//! `default_registry()`. `ets:slot/2` was a stub-only key until it, too, got a real
+//! implementation in `src/ets.rs`.
 //!
 //! Now that the stubs are gone, each of these keys must dispatch **through the
 //! public registry** (`beam_bifs::default_registry()` + `BifRegistry::call`) to its
@@ -35,11 +36,13 @@
 //! * `ets:rename/2`, `ets:internal_delete_all/2`, `ets:internal_select_delete/2`
 //!   (`src/ets/extra.rs`);
 //! * `ets:match_spec_run_r/3` (`src/ets/specs.rs`);
-//! * `ets:select_reverse/1,2,3` (`src/ets/reverse.rs`).
+//! * `ets:select_reverse/1,2,3` (`src/ets/reverse.rs`);
+//! * `ets:slot/2` (`src/ets.rs`), whose `RuntimeHooks` stub was removed when it got
+//!   a real implementation over `beam_ets::Table::slot`.
 //!
-//! The two keys that **stay** `RuntimeHooks` gaps — the C-only `ets:slot/2` and the
-//! scheduler fan-in `ets:internal_request_all/0` — are still asserted to answer the
-//! typed gap, so the split is pinned as well.
+//! The one key that **stays** a `RuntimeHooks` gap — the scheduler fan-in
+//! `ets:internal_request_all/0` — is still asserted to answer the typed gap, so the
+//! split is pinned as well.
 //!
 //! Every golden here was probed against the system `erl` (OTP 29.1.1 / erts-17.1);
 //! the probes are quoted beside the assertions. Terms are compared
@@ -72,6 +75,7 @@ fn seeded_atoms() -> AtomTable {
         "set",
         "ordered_set",
         "public",
+        "private",
         "named_table",
         "$end_of_table",
         // Table names.
@@ -232,8 +236,8 @@ fn delete_key1_spec(ctx: &mut BifContext<'_>) -> Eterm {
 
 // -------------------------------------------------------------- the hook gate
 
-/// The eleven unshadowed keys left `RUNTIME_HOOKS_BIFS` (they are no longer
-/// `RuntimeHooks` seam keys); the two kept keys are still there.
+/// The twelve unshadowed keys left `RUNTIME_HOOKS_BIFS` (they are no longer
+/// `RuntimeHooks` seam keys); the one kept key is still there.
 #[test]
 fn the_unshadowed_keys_are_no_longer_runtime_hook_keys() {
     for (function, arity) in [
@@ -248,6 +252,7 @@ fn the_unshadowed_keys_are_no_longer_runtime_hook_keys() {
         ("select_reverse", 1),
         ("select_reverse", 2),
         ("select_reverse", 3),
+        ("slot", 2),
     ] {
         assert!(
             !needs_runtime_hooks("ets", function, arity),
@@ -255,29 +260,20 @@ fn the_unshadowed_keys_are_no_longer_runtime_hook_keys() {
         );
     }
     assert!(
-        needs_runtime_hooks("ets", "slot", 2),
-        "ets:slot/2 stays a RuntimeHooks key"
-    );
-    assert!(
         needs_runtime_hooks("ets", "internal_request_all", 0),
         "ets:internal_request_all/0 stays a RuntimeHooks key"
     );
 }
 
-/// The two keys that stay seam-backed still answer the typed capability gap
+/// The one key that stays seam-backed still answers the typed capability gap
 /// through the registry (with no `RuntimeHooks` installed).
 #[test]
-fn the_kept_ets_keys_still_answer_the_typed_gap() {
+fn the_kept_ets_key_still_answers_the_typed_gap() {
     let bifs = default_registry();
     let mut heap = Heap::new(1 << 14).expect("test heap");
     let atoms = seeded_atoms();
     let mut tables = TableRegistry::new();
     let mut ctx = BifContext::new(&mut heap, &atoms, self_pid()).with_tables(&mut tables);
-
-    let handle = new_table(&bifs, &mut ctx, "nav_t", &["set"]);
-    let one = int(&mut ctx, 1);
-    let err = call(&bifs, &mut ctx, "ets", "slot", 2, &[handle, one]).expect_err("slot/2");
-    assert!(is_unsupported(&err), "ets:slot/2 must be the typed gap: {err:?}");
 
     let err = call(&bifs, &mut ctx, "ets", "internal_request_all", 0, &[])
         .expect_err("internal_request_all/0");
@@ -287,6 +283,155 @@ fn the_kept_ets_keys_still_answer_the_typed_gap() {
     );
 }
 
+// ----------------------------------------------------------------- nav: slot
+
+/// `ets:slot/2` reaches its real implementation and walks an `ordered_set`'s exact
+/// slots.
+///
+/// Oracle probe (`erl -noshell`, OTP 29.1.1 / erts-17.1), an `ordered_set` holding
+/// `{6,60},{3,30},{4,40},{8,80},{1,10}` (insertion order), read as
+/// `[ets:slot(T, N) || N <- lists:seq(0, 5)]`:
+/// `[[{1,10}],[{3,30}],[{4,40}],[{6,60}],[{8,80}],'$end_of_table']` — slot `n` is the
+/// object of the `(n+1)`-th smallest key, and the first slot past the end is the
+/// `'$end_of_table'` atom (never a `badarg`). The live oracle is re-queried at the
+/// end of the test; it **skips loudly** (never passes vacuously — the pinned
+/// assertions above always run) when `erl` is absent.
+#[test]
+fn slot_walks_the_ordered_set_exactly() {
+    let bifs = default_registry();
+    let mut heap = Heap::new(1 << 16).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut tables = TableRegistry::new();
+    let mut ctx = BifContext::new(&mut heap, &atoms, self_pid()).with_tables(&mut tables);
+
+    let handle = new_table(&bifs, &mut ctx, "nav_t", &["ordered_set"]);
+    let rows = [(6, 60), (3, 30), (4, 40), (8, 80), (1, 10)];
+    insert_pairs(&bifs, &mut ctx, handle, &rows);
+
+    for (slot, row) in [
+        (0i64, (1, 10)),
+        (1, (3, 30)),
+        (2, (4, 40)),
+        (3, (6, 60)),
+        (4, (8, 80)),
+    ] {
+        let s = int(&mut ctx, slot);
+        let chunk = call(&bifs, &mut ctx, "ets", "slot", 2, &[handle, s]).expect("ets:slot");
+        let expected = obj_list(&mut ctx, &[row]);
+        assert_same(&atoms, chunk, expected);
+    }
+
+    // The first slot past the end is `'$end_of_table'`, not a `badarg`.
+    let five = int(&mut ctx, 5);
+    let end = call(&bifs, &mut ctx, "ets", "slot", 2, &[handle, five]).expect("ets:slot");
+    assert!(
+        atom_is(&atoms, end, "$end_of_table"),
+        "slot 5 past the end is the end-of-table atom"
+    );
+
+    // Live oracle cross-check (skips loudly when `erl` is absent).
+    let statement = concat!(
+        "T = ets:new(nav_t, [ordered_set]), ",
+        "[ets:insert(T, O) || O <- [{6,60},{3,30},{4,40},{8,80},{1,10}]], ",
+        "io:format(\"~w~n\", [[ets:slot(T, N) || N <- lists:seq(0, 5)]])"
+    );
+    let Some(actual) = oracle_eval(statement) else {
+        return;
+    };
+    assert_eq!(
+        actual,
+        "[[{1,10}],[{3,30}],[{4,40}],[{6,60}],[{8,80}],'$end_of_table']",
+        "the live oracle disagrees with the pinned `ets:slot/2` goldens"
+    );
+}
+
+/// An **empty** `ordered_set`'s slot 0 is `'$end_of_table'` (oracle-verified):
+/// there is no object to return, but the slot is still in range.
+#[test]
+fn slot_of_an_empty_ordered_set_is_the_end() {
+    let bifs = default_registry();
+    let mut heap = Heap::new(1 << 14).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut tables = TableRegistry::new();
+    let mut ctx = BifContext::new(&mut heap, &atoms, self_pid()).with_tables(&mut tables);
+
+    let handle = new_table(&bifs, &mut ctx, "nav_t", &["ordered_set"]);
+    let zero = int(&mut ctx, 0);
+    let out = call(&bifs, &mut ctx, "ets", "slot", 2, &[handle, zero]).expect("ets:slot");
+    assert!(
+        atom_is(&atoms, out, "$end_of_table"),
+        "an empty ordered_set has no slot 0 object"
+    );
+}
+
+/// Every ill-typed or out-of-range slot is the oracle's `badarg`: a **negative**
+/// slot, a slot past the end, a **float**, a **bignum** and a non-integer
+/// (oracle-verified: a bignum and a float are `badarg` because the C reads only a
+/// small integer, and a negative slot is rejected before the interior).
+#[test]
+fn slot_argument_errors_are_badarg() {
+    let bifs = default_registry();
+    let mut heap = Heap::new(1 << 16).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut tables = TableRegistry::new();
+    let mut ctx = BifContext::new(&mut heap, &atoms, self_pid()).with_tables(&mut tables);
+
+    let handle = new_table(&bifs, &mut ctx, "nav_t", &["ordered_set"]);
+    insert_pairs(&bifs, &mut ctx, handle, &[(1, 10), (2, 20), (3, 30)]);
+
+    let negative = int(&mut ctx, -1);
+    let past_end = int(&mut ctx, 99);
+    let float = ctx.make_float(1.0).expect("the float fits");
+    let non_integer = ctx.atom("undefined").expect("seeded");
+    let bignum = beam_codec::term::make_big(ctx.heap(), false, &[0, 1]).expect("2^64 fits");
+
+    for (name, slot) in [
+        ("negative", negative),
+        ("past_end", past_end),
+        ("float", float),
+        ("non_integer", non_integer),
+        ("bignum", bignum),
+    ] {
+        let err = call(&bifs, &mut ctx, "ets", "slot", 2, &[handle, slot])
+            .expect_err("a bad slot is badarg");
+        assert!(
+            matches!(err, BeamError::BadArg),
+            "a {name} slot must be badarg, got {err:?}"
+        );
+    }
+}
+
+/// `ets:slot/2` is read-gated: a **non-owner** of a `private` table is `badarg`,
+/// while the owner reads it (the oracle's `DB_READ` status mask).
+#[test]
+fn slot_is_read_gated_for_a_non_owner_of_a_private_table() {
+    let bifs = default_registry();
+    let mut heap = Heap::new(1 << 16).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut tables = TableRegistry::new();
+
+    // The owner creates the private table and inserts two objects.
+    let handle = {
+        let mut ctx = BifContext::new(&mut heap, &atoms, self_pid()).with_tables(&mut tables);
+        let handle = new_table(&bifs, &mut ctx, "nav_t", &["ordered_set", "private"]);
+        insert_pairs(&bifs, &mut ctx, handle, &[(1, 10), (2, 20)]);
+        let zero = int(&mut ctx, 0);
+        let out = call(&bifs, &mut ctx, "ets", "slot", 2, &[handle, zero]).expect("owner slot");
+        assert_same(&atoms, out, obj_list(&mut ctx, &[(1, 10)]));
+        handle
+    };
+
+    // A different process is refused.
+    let other = ProcessId::new(2, 0);
+    let mut ctx = BifContext::new(&mut heap, &atoms, other).with_tables(&mut tables);
+    let zero = int(&mut ctx, 0);
+    let err = call(&bifs, &mut ctx, "ets", "slot", 2, &[handle, zero])
+        .expect_err("a non-owner read of a private table is badarg");
+    assert!(
+        matches!(err, BeamError::BadArg),
+        "a non-owner `ets:slot/2` on a private table must be badarg, got {err:?}"
+    );
+}
 // ------------------------------------------------------------- nav: lookups
 
 /// `ets:first_lookup/1` and `ets:last_lookup/1` reach their real implementations.

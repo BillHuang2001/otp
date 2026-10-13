@@ -108,10 +108,10 @@ mod tests {
     }
 
     /// The per-family key counts this module's `CONTEXT.md` states, pinned against the
-    /// actual registrations: `76 + 56 + 18 + 44 = 194` keys registered across the four
-    /// `runtime_bif!` families, of which **173** forward to the `RuntimeHooks` seam (the
+    /// actual registrations: `76 + 56 + 18 + 43 = 193` keys registered across the four
+    /// `runtime_bif!` families, of which **172** forward to the `RuntimeHooks` seam (the
     /// other twenty-one are the families' real `REAL_BIFS`), plus the 2 `MemoryHook`
-    /// (`erlang:memory/0,1`), 13 `atomics`/`counters` and 1 `ddll` real keys — **210**
+    /// (`erlang:memory/0,1`), 13 `atomics`/`counters` and 1 `ddll` real keys — **209**
     /// registered under `runtime/`. A family that drifts must update the doc.
     #[test]
     fn the_family_key_counts_are_pinned() {
@@ -127,13 +127,13 @@ mod tests {
             "runtime/erts_internal.rs"
         );
         assert_eq!(count(super::erts_debug::register), 18, "runtime/erts_debug.rs");
-        assert_eq!(count(super::other::register), 44, "runtime/other.rs");
+        assert_eq!(count(super::other::register), 43, "runtime/other.rs");
         assert_eq!(count(super::memory::register), 2, "runtime/memory.rs");
         assert_eq!(count(super::atomics::register), 13, "runtime/atomics.rs");
         assert_eq!(count(super::ddll::register), 1, "runtime/ddll.rs");
 
-        let family = 76 + 56 + 18 + 44;
-        assert_eq!(family, 194, "the four runtime_bif! families' registered keys");
+        let family = 76 + 56 + 18 + 43;
+        assert_eq!(family, 193, "the four runtime_bif! families' registered keys");
         // The subset of those keys that really forwards to the `RuntimeHooks` seam is
         // `family` minus every family's real `REAL_BIFS`; it must equal the authoritative
         // `crate::hook_sets::RUNTIME_HOOKS_BIFS` roster.
@@ -149,6 +149,6 @@ mod tests {
         );
         let mut all = BifRegistry::new();
         super::register(&mut all);
-        assert_eq!(all.len(), family + 2 + 13 + 1, "210 runtime-coupled keys");
+        assert_eq!(all.len(), family + 2 + 13 + 1, "209 runtime-coupled keys");
     }
 }

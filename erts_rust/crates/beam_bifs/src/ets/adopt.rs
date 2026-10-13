@@ -109,9 +109,6 @@
 //!   oracle rewrites has no counterpart here (`ets:is_compiled_ms/1` is the
 //!   registered predicate). Closing it needs a continuation representation with a
 //!   raw-spec slot plus a `function_clause` raise.
-//! * **`ets:slot/2`** — the objects of an internal B-tree node / hash bucket. The
-//!   workspace contract (§2) explicitly leaves the interior layout open, so the
-//!   value is interior-specific and cannot be reproduced faithfully.
 //! * **`ets:internal_request_all/0`** — an underscore-internal C helper: it answers
 //!   this scheduler's *fan-in reference* (`#Ref<…>`), an implementation-specific
 //!   value, not part of the documented API. (`internal_delete_all/2` and

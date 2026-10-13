@@ -152,15 +152,15 @@
 //! fun through the `FunCaller` seam, so a non-empty fold is the typed
 //! `unsupported_bif` gap until a host installs it.)
 //!
-//! Four `ets` keys stay honest typed gaps, each for a reason no `BifFn` can
-//! satisfy (see [`adopt`] and [`extra`]): `ets:slot/2` (C-interior `db_slot`) and
-//! `ets:internal_request_all/0` (a ref + one reply message per scheduler, which
-//! needs process messaging), both seam-backed through the `RuntimeHooks` stub in
-//! `src/runtime/other.rs`, plus `ets:fun2ms/1` and `ets:repair_continuation/2` —
-//! pure `stdlib/src/ets.erl` functions, **not** `bif.tab` entries — so the registry
-//! can never dispatch them and they stay unregistered. `ets:setopts/2`'s
-//! `{protection, P}` sub-option is **not** a gap: [`adopt`] applies it through the
-//! owner-gated `Table::setopts(Some(owner), SetOpt::Access(P))`.
+//! Three `ets` keys stay honest typed gaps, each for a reason no `BifFn` can
+//! satisfy (see [`adopt`] and [`extra`]): `ets:internal_request_all/0` (a ref +
+//! one reply message per scheduler, which needs process messaging), seam-backed
+//! through the `RuntimeHooks` stub in `src/runtime/other.rs`, plus
+//! `ets:fun2ms/1` and `ets:repair_continuation/2` — pure `stdlib/src/ets.erl`
+//! functions, **not** `bif.tab` entries — so the registry can never dispatch them
+//! and they stay unregistered. `ets:setopts/2`'s `{protection, P}` sub-option is
+//! **not** a gap: [`adopt`] applies it through the owner-gated
+//! `Table::setopts(Some(owner), SetOpt::Access(P))`.
 //!
 //! # The `*_lookup` family (see [`nav`] for the BIFs)
 //!
@@ -709,6 +709,7 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("ets", "last", 1, last_1);
     reg.register("ets", "next", 2, next_2);
     reg.register("ets", "prev", 2, prev_2);
+    reg.register("ets", "slot", 2, slot_2);
     // Element updates.
     reg.register("ets", "update_counter", 3, update_counter_3);
     reg.register("ets", "update_counter", 4, update_counter_4);
@@ -1193,6 +1194,35 @@ fn prev_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let outcome = table.prev(key, ctx.atoms());
     restore_table(ctx, handle, table)?;
     key_or_end(ctx, outcome?)
+}
+
+/// `ets:slot(Tab, Slot)` — the objects of a table slot (a hash kind answers its
+/// own bucket decomposition; an `ordered_set` one object per key).
+///
+/// The `Slot` argument must be a **small** integer: a non-integer and a bignum
+/// are both `badarg` (the C `signed_val(slot_term)` reads only a small int, and a
+/// bignum is far beyond any slot count). The read gate mirrors every other read
+/// verb ([`resolve::Gate::Read`], the oracle's `DB_READ` mask); a negative or
+/// out-of-range slot propagates [`Table::slot`]'s `badarg`, while the first slot
+/// past the end is the `'$end_of_table'` atom. Verified against the system `erl`
+/// (OTP 29.1.1 / erts-17.1): an `ordered_set` holding `{6,a},{3,b},{4,c},{8,d},{1,e}`
+/// yields slots `0..4` = `[{1,e}]`,`[{3,b}]`,`[{4,c}]`,`[{6,a}]`,`[{8,d}]` and slot
+/// `5` = `'$end_of_table'`, an empty `ordered_set`'s slot `0` is
+/// `'$end_of_table'`, and a negative/`99`/`1.0`/`1 bsl 100` slot is `badarg`.
+fn slot_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let handle = resolve::resolve_handle(ctx, args[0])?;
+    let slot_term = args[1];
+    if !is_small(slot_term) {
+        return Err(badarg());
+    }
+    let slot = signed_value(slot_term);
+    let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
+    let outcome = table.slot(slot, ctx.atoms());
+    restore_table(ctx, handle, table)?;
+    match outcome? {
+        Some(objects) => copy_out_list(objects, ctx),
+        None => ctx.intern_atom(END_OF_TABLE),
+    }
 }
 
 // -------------------------------------------------------- element updates
