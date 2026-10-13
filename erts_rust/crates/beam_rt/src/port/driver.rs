@@ -2524,6 +2524,16 @@ mod fire_tests;
 /// separate file so the C fixture it compiles does not grow this one.
 #[cfg(test)]
 mod liveness_tests;
+
+/// The A.4 **driver-registry-unification regression suite**: the runtime's one name-keyed
+/// loaded-driver list ([`LOADED_DRIVERS`]) is the list `erl_ddll:*` reports **and** the one
+/// `open_port({spawn_driver, Name}, …)` resolves a name against — a driver `erl_ddll:try_load/3`
+/// loaded is openable by **name**, and a driver a port opened appears in
+/// `erl_ddll:loaded_drivers/0`. A separate file so the C driver fixture it compiles does not grow
+/// this one.
+#[cfg(test)]
+mod ddll_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
