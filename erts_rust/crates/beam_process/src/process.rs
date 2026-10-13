@@ -36,7 +36,8 @@ use beam_alloc::{Heap, RefcBinary};
 use beam_common::{AllocKind, BeamError, Result};
 use beam_gc::{AnyCollector, Collection, HeapPolicy, OffHeap, OffHeapEntry};
 use beam_message::{copy_struct, CopyContext, Message, OffHeapTable, Queue};
-use beam_term::prelude::Eterm;
+use beam_term::prelude::{Eterm, HEADER_BIN_REF};
+use std::collections::HashSet;
 
 use crate::dict::Dict;
 use crate::error;
@@ -141,6 +142,33 @@ const MESSAGE_ROOT_PAYLOAD: usize = 0;
 const MESSAGE_ROOT_FROM: usize = 1;
 /// The offset of a message's `token` word within its [`MESSAGE_ROOT_WORDS`] slice.
 const MESSAGE_ROOT_TOKEN: usize = 2;
+
+/// The off-heap payload pointer a **reachable** object names, or `None` when the object is not an
+/// off-heap binary handle.
+///
+/// This is the per-object test [`Process::sweep_off_heap_binaries_reachable`] applies to the
+/// `(header, ptr)` pairs [`beam_gc::AnyCollector::for_each_reachable_object`] reports. An off-heap
+/// refc binary's on-heap handle is the frozen `[BinRef(3 words)][ErlSubBits(5 words)]` pair
+/// (`beam_term::refc`), and the payload pointer — the frozen `BinRef.val` contract, identical to
+/// [`RefcBinary::data_ptr`] — is exactly `BinRef`'s word 1.
+///
+/// The collector's walk descends an `ErlSubBits`'s `orig` slot unconditionally (the canonical copy
+/// child walk of `beam_term::layout::for_each_child_slot`), so the `BinRef` behind **every**
+/// reachable `ErlSubBits` is reported to the walk as an object of its own; testing the header word
+/// alone therefore covers the whole refc pair, whichever of the two objects is reached first (and a
+/// match-context `ErlSubBits`, whose `orig` is an on-heap bitstring, is correctly ignored).
+fn reachable_bin_ref_payload(header: Eterm, ptr: *const Eterm) -> Option<usize> {
+    if header != HEADER_BIN_REF {
+        return None;
+    }
+    // SAFETY: the walk guarantees `ptr` addresses the live header word `header` of a reachable
+    // object, and `header == HEADER_BIN_REF` fixes that object's shape at the frozen 3-word
+    // `[HEADER_BIN_REF, val, next]` `BinRef` (`beam_term::refc`), so word 1 is its initialized
+    // `val` slot and is readable. This is a plain **read** of one `Eterm` word: it writes nothing,
+    // follows no pointer and moves no term, so it can neither invalidate the walk nor disturb the
+    // heap.
+    Some(unsafe { *ptr.add(1) }.raw())
+}
 
 impl ProcessFlags {
     /// No flags set.
@@ -775,6 +803,95 @@ impl Process {
         })
     }
 
+    /// Reclaims every owned off-heap binary that **no reachable on-heap handle names** any more,
+    /// and returns how many entries were released.
+    ///
+    /// This is the **reachability-driven** half of the off-heap reclamation seam. Instead of the
+    /// conservative "release only what the caller declared dead"
+    /// ([`Process::sweep_off_heap_binaries`]), it enumerates the process heap with
+    /// [`beam_gc::AnyCollector::for_each_reachable_object`] and releases exactly the owned payloads
+    /// whose [`RefcBinary::data_ptr`] — the frozen `BinRef.val` contract — is not named by any
+    /// reachable `BinRef`. The release goes through the existing
+    /// [`Process::retain_off_heap_binaries`] seam, so slot stability holds: a survivor keeps its
+    /// original slot and a released slot is never reused.
+    ///
+    /// # The root set, and why nothing moves
+    ///
+    /// The walk runs over the **same** root set [`Process::collect`] gathers, because a handle the
+    /// root set fails to publish would look unreachable: the registers/stack/extra roots
+    /// ([`Registers::gather_roots`]), each queued message's `payload`/`from`/`token`, the process
+    /// dictionary, the saved BIF/NIF arguments and the pending-signal queue. The mailbox is read
+    /// **in place** ([`Queue::iter`]) rather than drained, so no message can be lost or reordered;
+    /// the call is read-only and never collects, so it moves no term and needs no safepoint.
+    ///
+    /// # Why this REFUSES for a process with unpublished roots
+    ///
+    /// The verdict is only sound when the root set is **complete**. A **relocation-exempt**
+    /// process ([`Process::set_relocation_exempt`]) or a currently **`Running`** one has live terms
+    /// outside the crate root set (see [`Process::has_unpublished_roots`]), so the walk could miss
+    /// a live `BinRef` and release a payload a real handle still names — a **dangle**. This method
+    /// therefore retains everything and returns `0` for such a process; the conservative
+    /// declared-dead path ([`Process::sweep_off_heap_binaries`]) stays available and is the
+    /// fallback [`Process::run_rooted_collection`] uses for it.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the walk's `BeamError` — it can only come from the shared reference-enumeration
+    /// primitive, whose signature is fallible for its copier callers. Nothing is released when it
+    /// errors, so the residual is a **leak, never a dangle**.
+    pub fn sweep_off_heap_binaries_reachable(&mut self) -> Result<usize> {
+        let mut roots: Vec<Eterm> = Vec::new();
+        self.gather_scan_roots(&mut roots);
+        self.sweep_off_heap_binaries_reachable_from(&roots)
+    }
+
+    /// The reachability-driven sweep over an **already gathered** root set — the shared body of
+    /// [`Process::sweep_off_heap_binaries_reachable`] and the off-heap step of
+    /// [`Process::run_rooted_collection`] (which reuses the roots its collection just gathered, so
+    /// the walk can never disagree with the collection about what is reachable).
+    ///
+    /// Refuses (releasing nothing, `Ok(0)`) for a process whose root set is incomplete — see
+    /// [`Process::sweep_off_heap_binaries_reachable`] for why.
+    fn sweep_off_heap_binaries_reachable_from(&mut self, roots: &[Eterm]) -> Result<usize> {
+        // Nothing owned: skip the walk entirely. The enumeration is O(heap), and a process that owns
+        // no off-heap binary — the common case — must not pay for it on every collection.
+        if self.owned_binaries.is_empty() {
+            return Ok(0);
+        }
+        if self.has_unpublished_roots() {
+            return Ok(0);
+        }
+        let mut reachable: HashSet<usize> = HashSet::new();
+        self.collector
+            .for_each_reachable_object(roots, |header, ptr| {
+                if let Some(payload) = reachable_bin_ref_payload(header, ptr) {
+                    reachable.insert(payload);
+                }
+            })?;
+        Ok(self.retain_off_heap_binaries(|binary| {
+            reachable.contains(&(binary.data_ptr() as usize))
+        }))
+    }
+
+    /// Gathers the process root set **read-only** — the scan-side gather for
+    /// [`Process::sweep_off_heap_binaries_reachable`].
+    ///
+    /// The region list must stay in sync with the one [`Process::run_rooted_collection`] gathers
+    /// (registers/stack/extra roots, then each message's `payload`/`from`/`token`, then the
+    /// dictionary, the saved args and the pending signals); the two differ only in *how* they read
+    /// the mailbox — this one peeks each message in place, the collection one drains it because it
+    /// must write the relocated envelope words back.
+    fn gather_scan_roots(&self, roots: &mut Vec<Eterm>) {
+        self.regs.gather_roots(roots);
+        for message in self.mailbox.iter() {
+            roots.push(message.payload());
+            roots.push(message.from());
+            roots.push(message.token());
+        }
+        self.dict.gather_roots(roots);
+        self.saved_args.gather_roots(roots);
+        self.signals.gather_roots(roots);
+    }
     /// Reclaims every **live** owned off-heap binary `is_live` reports dead, and returns how many
     /// entries were released.
     ///
@@ -1153,11 +1270,13 @@ impl Process {
     /// collector classifies it as foreign to every evacuated range and leaves it exactly where
     /// it is; the message keeps owning the fragment chain that holds it.
     ///
-    /// The last step is [`Process::sweep_off_heap_binaries`] — the process's off-heap
-    /// refc-binary reclamation, run after every root region is back in place. It releases only the
-    /// binaries the caller has declared dead and retains everything else (the conservative
-    /// predicate — liveness of an off-heap payload cannot be decided without a heap traversal).
-    ///
+    /// The last step is the process's off-heap refc-binary reclamation, run after every root region
+    /// is back in place. It has two halves: the **reachability** sweep
+    /// ([`Process::sweep_off_heap_binaries_reachable_from`]) releases every owned payload no
+    /// reachable on-heap `BinRef` names any more when the root set is complete, and the
+    /// **conservative** declared-dead sweep ([`Process::sweep_off_heap_binaries`]) always runs — so
+    /// a payload the caller has declared dead is released, and one the walk could not soundly judge
+    /// (a process with unpublished roots) is retained.    ///
     /// The outgoing port-monitor set ([`Process::port_monitors`]) is deliberately **not**
     /// gathered: a [`PortWatch`] holds a reference and a port number, both plain values
     /// rather than heap terms, so it cannot be relocated and needs no root.
@@ -1332,18 +1451,35 @@ impl Process {
         self.saved_args.scatter_roots(&roots, saved_start);
         self.signals.scatter_roots(&roots, signals_start);
 
-        // 8. Reclaim the off-heap binaries the caller declared dead. The roots are all back in
-        //    place, so the heap is consistent; the sweep releases only declared-dead entries (the
-        //    conservative predicate — see `sweep_off_heap_binaries`), and because liveness cannot
-        //    be decided here (an on-heap `BinRef` is nested inside boxed terms) everything else is
-        //    retained. A no-op for a process that owns no off-heap binaries. This is deliberately
-        //    *after* the write-back: releasing a payload never moves a heap word, and doing it last
-        //    keeps it off the relocation path.
+        // 8. Reclaim the off-heap binaries, over the roots gathered above. Two halves:
+        //
+        //    * the **reachability** sweep (`sweep_off_heap_binaries_reachable_from`) releases every
+        //      owned payload no reachable on-heap `BinRef` names any more — sound only when the
+        //      root set is complete, so it refuses (signalling `Ok(0)` and releasing nothing) for a
+        //      process with unpublished roots (`has_unpublished_roots`), where the walk could miss
+        //      a live handle and release its payload — a dangle;
+        //    * the **conservative declared-dead** sweep (`sweep_off_heap_binaries`) always runs, so
+        //      a caller's asserted death is honoured whether or not the reachability half was sound
+        //      (its declarations are unreachable by definition, and an entry the reachability half
+        //      released is simply skipped as an already-released slot).
+        //
+        //    Both are deliberately *after* the write-back: the roots are consistent again, and
+        //    releasing a payload never moves a heap word. A no-op for a process that owns no
+        //    off-heap binaries.
+        let reclamation = self.sweep_off_heap_binaries_reachable_from(&roots);
         self.sweep_off_heap_binaries();
 
-        action
+        // The collection's own result is what the caller asked for, and it is reported even when
+        // it is `Err`; a reclamation failure only surfaces when the collection itself succeeded
+        // (the roots are already back in place either way, so the heap stays consistent).
+        match action {
+            Ok(collection) => {
+                reclamation?;
+                Ok(collection)
+            }
+            Err(err) => Err(err),
+        }
     }
-
     /// Collects first when `need` more words do not fit, then reports whether a collection
     /// ran.
     ///
@@ -1981,5 +2117,62 @@ mod tests {
         let atoms = SignalAtoms::from_table(&mut table);
         assert_eq!(table.name(atoms.exit()), Some("EXIT"));
         assert_eq!(table.name(atoms.kill()), Some("kill"));
+    }
+
+    /// The per-object reachability test keys on the object's **header word** alone: the `BinRef` of
+    /// the frozen refc pair is identified (and its `val` word read), while the pair's `ErlSubBits`
+    /// root and an unrelated boxed shape are rejected.
+    #[test]
+    fn the_reachability_test_identifies_a_bin_ref_by_its_header() {
+        use beam_term::prelude::{
+            boxed_val, write_refc_binary, ERL_BIN_REF_SIZE, ERL_REFC_BITS_SIZE, HEADER_FLONUM,
+            HEADER_SUB_BITS,
+        };
+
+        // A scratch `[BinRef][ErlSubBits]` pair; `write_refc_binary` returns the `ErlSubBits` root.
+        let mut words = vec![Eterm::default(); ERL_REFC_BITS_SIZE];
+        let payload = words.as_mut_ptr() as *mut u8;
+        // SAFETY: `words` owns `ERL_REFC_BITS_SIZE` writable words, `payload` points at the start of
+        // that storage (word-aligned, and covering the zero-bit window requested), and both outlive
+        // the returned term.
+        let root = unsafe {
+            write_refc_binary(
+                words.as_mut_ptr(),
+                payload as *mut Eterm,
+                core::ptr::null_mut(),
+                payload,
+                0,
+                0,
+            )
+        };
+
+        let sub_bits = boxed_val(root) as *const Eterm;
+        // SAFETY: `sub_bits` addresses word `ERL_BIN_REF_SIZE` of the pair `write_refc_binary` just
+        // wrote, so its header word is live and readable.
+        let sub_bits_header = unsafe { *sub_bits };
+        assert_eq!(sub_bits_header, HEADER_SUB_BITS, "the root is the `ErlSubBits`");
+        assert_eq!(
+            reachable_bin_ref_payload(sub_bits_header, sub_bits),
+            None,
+            "an `ErlSubBits` root carries no payload pointer in its header word"
+        );
+
+        // The `BinRef` sits `ERL_BIN_REF_SIZE` words before the root; word 1 is its `val` slot.
+        let bin_ref = sub_bits.wrapping_sub(ERL_BIN_REF_SIZE);
+        // SAFETY: `bin_ref` addresses word 0 of the pair `write_refc_binary` just wrote.
+        let header = unsafe { *bin_ref };
+        assert_eq!(header, HEADER_BIN_REF);
+        assert_eq!(
+            reachable_bin_ref_payload(header, bin_ref),
+            Some(payload as usize),
+            "the `BinRef` header yields its `val` word (the payload's first data byte)"
+        );
+
+        // Any other boxed shape is rejected — its header alone never names an off-heap payload.
+        assert_eq!(
+            reachable_bin_ref_payload(HEADER_FLONUM, sub_bits),
+            None,
+            "a float header is not an off-heap binary handle"
+        );
     }
 }
