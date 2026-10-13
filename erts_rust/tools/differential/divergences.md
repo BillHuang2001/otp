@@ -151,3 +151,60 @@ not here.)
 - The preloaded ∩ registered intersection
   (`[M || M <- erlang:pre_loaded(), lists:member(M, registered())]`) differs — the rust runtime
   registers far fewer names.
+
+## A.1 — terms, records, exceptions (owner: `beam_engine`, `beam_bifs` / `beam_rt`)
+- Calling a non-fun (`5(1)`) raises `{badfun,5}` in the oracle vs `badarg` in the rust runtime.
+- `records:update/4`'s unknown-field reason is nested in the oracle vs flat in the rust runtime.
+- `put_record`'s create form for a **foreign** module's record id is a typed `unsupported` in the
+  rust runtime (the running module's own records are supported and pinned).
+- Generic opcodes **192/193** cannot be emitted by the installed OTP-29 `erlc`, so no case can pin them.
+
+## A.3 — NIF load/call shapes (owner: `beam_abi` / `beam_rt`)
+- A **`.so`-suffixed** `load_nif/2` path loads in the oracle vs `…load_failed` in the rust runtime.
+- A **local** NIF call runs the NIF in the oracle vs the `erlang:nif_error` stub in the rust runtime
+  (the rust runtime intercepts only **external** dispatch).
+- A module that does **not** stub every entry in the library's `ErlNifFunc` loads in the rust runtime
+  where the oracle refuses it.
+
+## A.4 — port/driver observable grammar (owner: `beam_rt` / `beam_io`)
+- The `{fd,…}` port grammar is disjoint; `{line,N}` returns raw bytes; `eof` is never delivered;
+  a non-iodata `port_command/2` is accepted; `port_info(P,registered_name)` is `badarg`; only the
+  oracle writes a missing-`{spawn,Cmd}` shell stderr line.
+
+## A.6 — CLI flags & environment (owner: `beam_rt` / the `-eval` evaluator)
+- Plain `-extra`/`--` arguments are unusable through the harness; a repeated `-eval` is recorded
+  verbatim where `init:get_argument(eval)` -> `error`; an unbound `-eval` variable is a loud error
+  vs silent.
+- `erlang:halt/1`: `halt([1,2])` prints nothing (exit 1) vs exiting with a `beam_rt_dump:` message;
+  only `halt({bad})` -> `badarg` is pinned.
+- `+hmax` overflow: the oracle **kills the process** where the rust evaluator raises
+  `error:system_limit`; only the tiny bounded-allocation case is pinned.
+- A large `-eval` iolist raises `error:out_of_memory` in the rust evaluator, so `iolist_size/1`'s
+  bignum promotion is not observable and has no case.
+- The `ERL_*FLAGS` merge **order** IS pinned (`flags/env_*`); `ERL_OTP<sysver>_FLAGS` (29 vs 30) and
+  an `-eval` carried by `ERL_FLAGS`/`ERL_AFLAGS` are deliberately not.
+
+## A.7 — BIFs, ETS, printing, math (owner: `beam_bifs`, `beam_ets`)
+- `binary:match/2,3` with no match: `nomatch` vs `beam_rt: term not found` (exit 1); the agreeing
+  no-match shapes are pinned in `binmatch.rs`.
+- `lists:usort/2` with an **ascending** comparator returns a wrong result: `[1,2,3]` vs `[1,1,3]`;
+  the other comparator shapes agree.
+- Plain `~w` float notation uses exponent notation below ~`1.0e-4` / at-or-above `1.0e5` vs plain
+  decimal (`short` formatting agrees, pinned in `printing.rs`); `~W` of a binary depth-elides only at
+  depth 1 (`~P` and `~W` at depths 0/1/4 agree and are pinned).
+- `math:erf/1`/`erfc/1` are not bit-exact (1–5 ULP); every other `math` BIF is pinned bit-exactly.
+- ETS query surface: `ets:select/1` rejects the `'$end_of_table'` sentinel; the continuation is a
+  bare single-use ref; a `named_table` lookup by name and `ets:info/1,2` on a deleted table are
+  `badarg`; `ets:info(T, owner)` is `undefined`.
+- ETS access control: the mode is recorded at `ets:new/2` but **not enforced** for a non-owner
+  (a private read returns `[]`, a protected/private write returns `true`); `ets:info(T, owner)` is
+  `undefined`.
+- `erlang:module_loaded/1`: `module_loaded(lists)` is `true` vs `false`.
+- `erlang:trace_info/2`: the `all`/`traced` selectors differ (`badarg` vs a value list); only
+  `flags`/`tracer` agree.
+- `erlang:exit(self(), normal)`: the oracle ignores it (`true`), the rust runtime raises `exit:normal`.
+- `erlang:memory/0,1` is pinned **structurally** (A.8): the 9-key order/count,
+  `is_integer(memory(total))`, the selection shape and the unknown-key `badarg`; the volatile byte
+  totals are never asserted.
+- `+Q N` / `ERL_MAX_PORTS` -> `system_info(port_limit)` **is** pinned (the `next_power_of_two` sizing
+  matrix); `+Q legacy` / no `+Q` -> 65536.

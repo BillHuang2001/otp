@@ -1005,3 +1005,45 @@ fn an_allowlist_without_strict_is_a_usage_error() {
         invocation.describe()
     );
 }
+
+/// `gate.sh` resolves its allowlist from its arguments: an explicit `--allowlist <file>` is
+/// honoured (a missing one is a loud env error, exit `2`, naming the path), `--help` prints the
+/// usage and succeeds, and any other argument is a usage error. All of these are handled before
+/// anything is built, so this pins the gate's argument handling without running the corpus.
+#[cfg(unix)]
+#[test]
+fn gate_sh_resolves_the_allowlist_from_its_arguments() {
+    let gate = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("gate.sh");
+    assert!(gate.is_file(), "the gate script is present: {}", gate.display());
+    let run = |args: &[&str]| {
+        let output = Command::new("sh")
+            .arg(&gate)
+            .args(args)
+            .output()
+            .expect("spawn gate.sh");
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+
+    // An explicit, non-existent allowlist is a loud env error naming the path, and it fails
+    // before the (slow) build/corpus run.
+    let scratch = Scratch::new("gate-allowlist");
+    let missing = scratch.0.join("no-such-allowlist.txt");
+    let (code, _stdout, stderr) = run(&["--allowlist", &missing.display().to_string()]);
+    assert_eq!(code, Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("allowlist"), "stderr: {stderr}");
+    assert!(stderr.contains("no-such-allowlist.txt"), "stderr: {stderr}");
+
+    // `--help` prints the usage (which names `--allowlist`) and succeeds without building.
+    let (code, stdout, _stderr) = run(&["--help"]);
+    assert_eq!(code, Some(0), "stdout: {stdout}");
+    assert!(stdout.contains("--allowlist"), "stdout: {stdout}");
+
+    // An unknown argument is a usage error.
+    let (code, _stdout, stderr) = run(&["--bogus"]);
+    assert_eq!(code, Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("unknown argument"), "stderr: {stderr}");
+}
