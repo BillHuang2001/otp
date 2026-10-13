@@ -231,8 +231,9 @@ SMP pool:
     is checked before the payload is read, so a pre-fix run never dereferences the freed bytes;
     deterministic — a fixed payload pattern and an explicit `collect`, no sleeps / wall-clock bounds /
     oracle.
-31. `common/mod.rs` — the **shared oracle driver** used by `registry_monitors.rs`, `dict_oracle.rs`,
-    `monitor_tag.rs`, `lifecycle_oracle.rs`, `capability_inventory.rs` and `port_monitor_cleanup.rs`:
+31. `common/mod.rs` — the **shared oracle driver** used by `alias.rs`, `registry_monitors.rs`,
+    `dict_oracle.rs`, `monitor_tag.rs`, `lifecycle_oracle.rs`, `capability_inventory.rs` and
+    `port_monitor_cleanup.rs`:
     `ERL_TIMEOUT`, `erl_stdout`, `expect_oracle` and `strip_logger_reports` (+ 4 unit tests for the
     normalizer). It runs
     `erl -noshell -kernel logger_level none -eval …` (the `none` level deterministically suppresses the
@@ -510,6 +511,25 @@ SMP pool:
     decline, never a replacement. Deterministic — no sleeps / wall-clock bounds / oracle; each test
     was verified sensitive to the guard (dropping a builder's `decline` argument flips its gate case
     to "a declined relocation must not collect").
+44. `alias.rs` (12 tests, 9 `oracle_*`) — **reference aliases**: `erlang:alias/1`/`erlang:unalias/1` and
+    the `erlang:monitor/3` `{alias, Mode}` option, cross-checked against the real `erl` (skips loudly
+    when it is absent; `mod common;`). A standalone alias (`ProcessTable::create_alias`, with no
+    monitor behind it) resolves to its owner for a send and reports `true`/`false` out of `unalias`;
+    `unalias` clears the alias and keeps the monitor. The **three expiry sites** — the target's DOWN,
+    `demonitor/1`, and the reply site (`alias_reply_delivered`) — are pinned one mode at a time
+    against the oracle: `explicit_unalias` survives both the DOWN and `demonitor/1`, `demonitor`
+    expires at the DOWN, and `reply_demonitor` expires at the DOWN **and** at the reply (the reply
+    consuming the alias and its monitor). Also: a dying owner takes every alias with it; a standalone
+    alias is not a monitor (the discriminating probe is `demonitor(Ref, [info])`'s internal verdict,
+    since `demonitor/1` renders the C's `am_false` as `true`); a monitor reference round-trips through
+    its term and rejects every non-reference (integer/atom/pid/header word) with `BadArg`; a plain
+    monitor reference is not an alias (the alias API is a no-op on it and its DOWN is unaffected);
+    `monitor_term_with_options` routes every local dispatch through the alias path (a local pid term →
+    `monitor_with_options`, a name atom → `monitor_named_with_options` carrying the `{Name, Node}` DOWN
+    target); a monitor-with-alias on an already-dead target registers the alias **before** the
+    immediate `noproc` DOWN; and a port monitor and a remote (external-pid) target each refuse the
+    option with their own typed `unsupported`, leaking no relationship or message. Deterministic —
+    the mode rules against fixed oracle expressions, no sleeps / wall-clock bounds.
 
 ## Constraints
 - **Anti-flakiness (BINDING).** Every assertion is forced by **synchronization**, never a bare
@@ -520,7 +540,7 @@ SMP pool:
 - `lock_scope.rs` is the **only** file with wall-clock bounds; they are deliberately loose and
   two-sided (a cross-thread send must be serviced far below the slice's duration, and the slice must
   last far above that bound — the anti-vacuity guard).
-- The `oracle_*` suites (`dict_oracle.rs`, `registry_monitors.rs`, `monitor_tag.rs`,
+- The `oracle_*` suites (`alias.rs`, `dict_oracle.rs`, `registry_monitors.rs`, `monitor_tag.rs`,
   `lifecycle_oracle.rs`, and the `erl`
   cross-checks in `capability_inventory.rs`/`port_monitor_cleanup.rs`) go through the **shared driver**
   `common/mod.rs`, **skip loudly** when `erl` is absent, and must never spawn a child process that
@@ -555,9 +575,12 @@ SMP pool:
   stability, the conservative declared-dead sweep on the collection path, and the
   **reachability-driven** sweep — its root set, its `HEADER_BIN_REF` payload-pointer test, the
   nested-container descent, and its unpublished-roots decline valve)
-- `registry_monitors.rs`, `monitor_tag.rs`, `capability_inventory.rs`, `process_info_source.rs`,
+- `registry_monitors.rs`, `monitor_tag.rs`, `alias.rs`, `capability_inventory.rs`,
+  `process_info_source.rs`,
   `spawn_options.rs`, `collector_dispatch.rs`, `lifecycle_oracle.rs` → the process-control surface: name registry + monitors (incl.
-  the `monitor/3` user tag), the typed-error/capability inventory, the `process_info` item→accessor
+  the `monitor/3` user tag), the reference-alias semantics (`erlang:alias/1`/`unalias/1` and the
+  `monitor/3` `{alias, Mode}` expiry rules), the typed-error/capability inventory, the
+  `process_info` item→accessor
   mapping, the spawn-option composition and the GC **strategy dispatch** (the strategy a process's
   policy resolves to, the unchanged default cadence, and collection through the process root set), and
   the lifecycle semantics (link exit propagation, the **exit-family split** for a `kill` — trappable
@@ -575,9 +598,9 @@ SMP pool:
   (`ProcessTable`'s `RefAllocator` vs `beam_rt::Runtime::refs`) collide on `=:=` — a documented
   divergence, not closable from this crate (the owner and the blocked avenues are named in the
   file's module docs)
-- `dict_oracle.rs`, `registry_monitors.rs`, `monitor_tag.rs`, `lifecycle_oracle.rs`,
+- `alias.rs`, `dict_oracle.rs`, `registry_monitors.rs`, `monitor_tag.rs`, `lifecycle_oracle.rs`,
   `port_monitor_cleanup.rs` (oracle tests) →
-  `erl`-cross-checked process-dictionary, process-control, lifecycle and port-monitor evidence (loud skip
+  `erl`-cross-checked process-dictionary, reference-alias, process-control, lifecycle and port-monitor evidence (loud skip
   when `erl` is absent); their driver is the shared `common/mod.rs`
 - `ports.rs`, `remote.rs` → the port table and distributed links/monitors
 - `remote_inbound.rs` → the inbound (receipt) half of the same families: the route-free `ProcessTable`
