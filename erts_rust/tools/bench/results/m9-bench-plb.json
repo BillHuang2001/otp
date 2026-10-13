@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "tool": "bench",
+  "tool_version": "0.1.0",
+  "generated_at_unix_ms": 1791897938165,
+  "profile": "quick",
+  "runtimes": [
+    {
+      "kind": "sys",
+      "program": "/nix/store/khp1dd3fk8476mwg62cinwvk5a17r53s-erlang-29.1.1/lib/erlang/erts-17.1/bin/erl",
+      "version": "29",
+      "supported": true,
+      "notes": []
+    }
+  ],
+  "results": [
+    {
+      "workload": "plb",
+      "runtime": "sys",
+      "category": "compute",
+      "description": "Programming-Language-Benchmarks kernels via the dotnet tool",
+      "status": "failed",
+      "reason": "plb-build-failed",
+      "metrics": [],
+      "peak_memory_bytes": null,
+      "notes": [
+        "build stage (dotnet --task build) exit Some(1)",
+        "stderr: The build failed. Fix the build errors and run again.",
+        "stdout: /nix/store/9ql2v7xa762qgibgrq84prdz4sl212c7-dotnet-sdk-8.0.425/share/dotnet/sdk/8.0.425/Sdks/Microsoft.NET.Sdk/targets/Microsoft.NET.TargetFrameworkInference.targets(166,5): error NETSDK1045: The current .NET SDK does not support targeting .NET 9.0. Either target .NET 8.0 or lower, or use a version of the .NET SDK that supports .NET 9.0. Download the .NET SDK from https://aka.ms/dotnet/download [/…"
+      ]
+    }
+  ]
+}
