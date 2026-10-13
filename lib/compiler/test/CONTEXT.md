@@ -94,7 +94,7 @@ This recipe drives the pass suites (`ssa_opt_budget_SUITE`, `beam_ssa_loop_opt_S
 - It builds the rig via `../scripts/host_env.sh build` unless `RIG_EBIN` is preset.
 - The report carries a `host adaptation:` header line and a per-suite `NOTE` wherever the flattening applied, so a host result is never mistaken for a real OTP-30 run (it exercises the pass *logic*, not native records).
 - The transform is strict and only the compiled files are handed to it: requesting `compile_SUITE` (arity-1 `is_record/1`) or `native_record_SUITE` (`#_{...}`, arity-1 `is_record/1`) aborts with the offending construct named — those constructs cannot exist on a host without native records.
-- Last full run (host OTP 29.1.1, rig compiler 10.0.6): **86 pass, 0 fail** (`loop_opt` 22, `fus` 20, `fbip` 12, `budget` 20, `diff` 3, `equiv` 9).
+- Last full run (host OTP 29.1.1, rig compiler 10.0.6): **87 pass, 0 fail** (`loop_opt` 22, `fus` 20, `fbip` 12, `budget` 20, `diff` 4, `equiv` 9).
 
 ## Known Issues
 - **The host runner compiles the suites with an older OTP**, so nothing it runs can validate OTP-30-only language/term features (native records in particular), and `beam_lib:chunks/2` cannot read the `code` chunk on this host — `beam_ssa_opt_equiv_SUITE` therefore extracts the `Code` chunk by hand from the FOR1 container.
