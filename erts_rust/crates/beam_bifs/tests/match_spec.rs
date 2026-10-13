@@ -680,7 +680,7 @@ fn the_live_oracle_agrees_on_the_whole_corpus() {
         let other = ctx.atom("other").expect("seeded");
         let whole = ctx.atom("$_").expect("seeded");
         let all = ctx.atom("$$").expect("seeded");
-
+        let underscore = ctx.atom("_").expect("seeded");
         // 1. `[{'$1',[],['$1']}]` — a match.
         let c = clause(&mut ctx, v1, &[], &[v1]).expect("fits");
         corpus.push(("match", seven, ctx.list(&[c]).expect("fits")));
@@ -696,6 +696,36 @@ fn the_live_oracle_agrees_on_the_whole_corpus() {
         // 4. A multi-expression body returns the last value.
         let c = clause(&mut ctx, v1, &[], &[a, b]).expect("fits");
         corpus.push(("body_sequence", seven, ctx.list(&[c]).expect("fits")));
+
+        // 4a-4d. Head maps (delegated to `beam_ets`: literal keys, recursive
+        // values) — the oracle-agreeing map corpus.
+        let ok_atom = ctx.atom("ok").expect("seeded");
+        let two = ctx.int(2).expect("fits");
+        let map_ab =
+            beam_codec::term::make_flatmap(ctx.heap(), &[(a, one), (b, two)]).expect("fits");
+        let map_a = beam_codec::term::make_flatmap(ctx.heap(), &[(a, one)]).expect("fits");
+        // `#{a => 1}` against the superset object `#{a => 1, b => 2}`.
+        let head = beam_codec::term::make_flatmap(ctx.heap(), &[(a, one)]).expect("fits");
+        let c = clause(&mut ctx, head, &[], &[ok_atom]).expect("fits");
+        corpus.push(("map_head_superset", map_ab, ctx.list(&[c]).expect("fits")));
+        // `#{a => '$2'}` binds the value.
+        let head = beam_codec::term::make_flatmap(ctx.heap(), &[(a, v2)]).expect("fits");
+        let c = clause(&mut ctx, head, &[], &[v2]).expect("fits");
+        corpus.push(("map_head_value_binds", map_a, ctx.list(&[c]).expect("fits")));
+        // A map nested inside a tuple head recurses.
+        let nested_obj = ctx.tuple(&[x, map_ab]).expect("fits");
+        let inner = beam_codec::term::make_flatmap(ctx.heap(), &[(a, one)]).expect("fits");
+        let head = ctx.tuple(&[x, inner]).expect("fits");
+        let c = clause(&mut ctx, head, &[], &[ok_atom]).expect("fits");
+        corpus.push((
+            "map_head_nested_in_tuple",
+            nested_obj,
+            ctx.list(&[c]).expect("fits"),
+        ));
+        // A wildcard value matches any value for the key.
+        let head = beam_codec::term::make_flatmap(ctx.heap(), &[(a, underscore)]).expect("fits");
+        let c = clause(&mut ctx, head, &[], &[ok_atom]).expect("fits");
+        corpus.push(("map_head_wildcard_value", map_a, ctx.list(&[c]).expect("fits")));
 
         // 5. A non-matching head.
         let c = clause(&mut ctx, seven, &[], &[a]).expect("fits");
