@@ -138,6 +138,7 @@ Harness / data:
 - `known-gaps.txt` → the committed ratchet allowlist (source of truth; `<case-id> <owning-crate> <reason…>` per line, `#` comments ignored).
 - `GAPS.md` → the generated gaps document (`--gaps`), never hand-edited; appends `divergences.md`.
 - `divergences.md` → the hand-maintained ledger of observed-but-unpinned divergences (surfaced through the generated `GAPS.md`).
+- `GC_COMPARABILITY.md` → the `gc` group's oracle-comparability limits: what is pinned vs what is an internal counter / capability gap.
 - `out/` → gitignored JSON report output (default `--out`).
 
 ## See Also
