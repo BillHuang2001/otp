@@ -51,8 +51,8 @@ shared catch-aware `raise_bif_error`.
 - `seam` is how a caller that has **already** consulted the host's cross-module seam for this import reports its
   answer: `None` = "resolve it here" (through `resolve_external_entry`), `Some(None)` = "the host declined" (skip
   straight to the BIF route, never re-asking), `Some(Some((context, func, pc)))` = the host's callee, entered
-  verbatim. The three `step_instruction` arms always pass `None`, so an interpreted `call_ext*` is byte-identical to
-  the pre-hoist arm bodies.
+  verbatim. The three `step_instruction` arms pass `None`, so an interpreted `call_ext*` resolves through
+  `resolve_external_entry` and is otherwise unchanged.
 - Each arm keeps its own tracing (`trace_call_import`) **before** delegating, so contract A.8 emission order is
   unchanged.
 
