@@ -208,7 +208,8 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
     `erl_gc.c:1493`); `should_grow(...)`, `should_shrink(...)`.
 - `pub const DEFAULT_MIN_HEAP_WORDS: usize = 233` — the C `H_DEFAULT_SIZE`.
 - `pub fn heap_sizes() -> &'static [usize]` — the curated growth table (Fibonacci+1 to index 23, then
-  +20%, capped at `2^53 / word`), `LazyLock`-built from `erts_init_gc` (`erl_gc.c:240-303`).
+  +20%, stopping before the first entry that would exceed the 64-bit cap `cap = (1u64 << 53) / 8`
+  = `2^50` words ≈ 8 PB), `LazyLock`-built from `erts_init_gc` (`erl_gc.c:240-303`).
 - `pub fn next_heap_size(size, offset) -> usize` — `erts_next_heap_size` over that table.
 
 ### `heap_info.rs` — the `garbage_collection` observables
