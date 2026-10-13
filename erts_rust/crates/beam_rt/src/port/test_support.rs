@@ -230,6 +230,7 @@ fn register_driver_port(
         kind: PortName::SpawnDriver,
         os_pid: None,
         stream: StreamType::List,
+        line: None,
         notify_exit: false,
         monitors: Vec::new(),
         owner: OWNER,
