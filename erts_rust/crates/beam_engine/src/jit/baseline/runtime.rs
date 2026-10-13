@@ -482,6 +482,9 @@ pub(crate) extern "C" fn jit_ext_call(
         // SAFETY: `runtime.module` points at the module the driver is running, which
         // outlives the loop.
         let module = unsafe { &*runtime.module };
+        // SAFETY: `runtime.labels` points at the driver's `labels` local, which
+        // outlives the loop.
+        let labels = unsafe { &*runtime.labels };
         // SAFETY: `runtime.ctx` is the driver's `&mut dyn ExecutionContext` reborrowed
         // as a raw pointer; the driver holds no `&mut` to it while the helper runs.
         let ctx = unsafe { &mut *runtime.ctx };
@@ -489,6 +492,7 @@ pub(crate) extern "C" fn jit_ext_call(
         resolve_ext_entry(
             machine,
             module,
+            labels,
             ImportRef(target),
             kind,
             func,
@@ -534,6 +538,7 @@ pub(crate) extern "C" fn jit_ext_call(
 fn resolve_ext_entry(
     machine: &mut Machine,
     module: &Module,
+    labels: &LabelMap,
     target: ImportRef,
     kind: u32,
     func: u32,
@@ -541,14 +546,17 @@ fn resolve_ext_entry(
     deallocate: u32,
     ctx: &mut dyn ExecutionContext,
 ) -> Option<Option<(u32, u32, u32)>> {
-    // The import's `(module, function, arity)`. This is the per-call resolution
-    // (`LabelMap::import_target`'s uncached fallback), which is the definition of the
-    // import semantics: an index past the end of `ImpT` and an atom the module's table
-    // does not hold are not resolvable, so the interpreter must report them.
-    let import = module.imports.get(target.0 as usize)?;
-    let module_name = module.atom_name(import.module)?;
-    let function_name = module.atom_name(import.function)?;
-    let (callee, label) = match ctx.resolve_external_call(module_name, function_name, import.arity) {
+    // The import's `(module, function, arity)`, through the same per-run import cache
+    // the interpreter's own `call_ext*` arm uses (`LabelMap::import_target`, which falls
+    // back to the uncached resolution when the map was not built from this module, so
+    // the two can never disagree). An index past the end of `ImpT` and an atom the
+    // module's table does not hold are not resolvable, so the interpreter must report
+    // them — the fallback re-runs the instruction and produces its exact diagnostic.
+    let (module_name, function_name, arity) = match labels.import_target(module, target) {
+        Ok(triple) => triple,
+        Err(_) => return None,
+    };
+    let (callee, label) = match ctx.resolve_external_call(module_name, function_name, arity) {
         // The host's **decline**: report the seam's own answer so the caller can skip
         // the duplicate resolution (see `jit_step_ext`).
         Ok(None) => return Some(None),
