@@ -25,7 +25,7 @@ other occurrence of M is a preprocessor condition line (a doc or Rust-comment
 mention is not a use).  Undecidable conditions and `#ifndef M` (always compiled)
 are not reported.  These findings never affect the STRICT/ACTIONABLE verdict or
 the exit status; a removal pass must still verify each block against the toolchain.
-  regions: 126 in 44 files
+  regions: 99 in 41 files
     erts/emulator/asmjit/core/virtmem.cpp:64  guard macro 'TARGET_OS_OSX' is never definable here
     erts/emulator/beam/dtrace-wrapper.h:99  guard macro 'STAP_PROBE_ADDR' is never definable here
     erts/emulator/beam/erl_map.c:278  guard macro 'INCLUDE_YCF_TRANSFORMED_ONLY_FUNCTIONS' is never definable here
@@ -44,7 +44,7 @@ the exit status; a removal pass must still verify each block against the toolcha
     erts/emulator/beam/jit/x86/beam_asm_module.cpp:435  guard macro 'BEAMASM_DUMP_SIZES' is never definable here
     erts/emulator/beam/sys.h:597  guard macro 'USE_BCOPY' is never definable here
     erts/emulator/nifs/common/prim_socket_int.h:547  guard macro 'ESOCK_DESCRIPTOR_FILLER' is never definable here
-    erts/emulator/nifs/common/prim_socket_nif.c:17083  guard macro 'ESOCK_DESCRIPTOR_FILLER' is never definable here
+    erts/emulator/nifs/common/prim_socket_nif.c:17012  guard macro 'ESOCK_DESCRIPTOR_FILLER' is never definable here
     erts/emulator/nifs/common/socket_util.c:2737  guard macro 'ESOCK_PACKET_ADDRESS_AS_TUPLE' is never definable here
     erts/emulator/nifs/unix/unix_prim_file.c:51  guard macro 'NO_UMASK' is never definable here
     erts/emulator/nifs/unix/unix_prim_file.c:980  guard macro 'NO_MKDIR_MODE' is never definable here
@@ -75,37 +75,10 @@ the exit status; a removal pass must still verify each block against the toolcha
     erts/emulator/pcre/pcre2_tables.c:260  guard macro 'EBCDIC_NL25' is never definable here
     erts/emulator/pcre/pcre2_tables.c:283  guard macro 'EBCDIC_NL25' is never definable here
     erts/emulator/pcre/pcre2_tables.c:295  guard macro 'EBCDIC_NL25' is never definable here
-    erts/emulator/sys/common/erl_mmap.c:2790  guard macro 'FREE_SEG_API_SMOKE_TEST' is never definable here
     erts/emulator/sys/unix/sys.c:27  guard macro 'ISC32' is never definable here
     erts/emulator/sys/unix/sys.c:42  guard macro 'ISC32' is never definable here
-    erts/emulator/sys/unix/sys.c:420  guard macro 'USE_SETLINEBUF' is never definable here
     erts/emulator/sys/unix/sys_drivers.c:27  guard macro 'ISC32' is never definable here
     erts/emulator/sys/unix/sys_drivers.c:43  guard macro 'ISC32' is never definable here
-    erts/emulator/sys/win32/erl_poll.c:119  guard macro 'HARD_POLL_DEBUG' is never definable here
-    erts/emulator/sys/win32/erl_poll.c:678  guard macro 'HARD_POLL_DEBUG2' is never definable here
-    erts/emulator/sys/win32/erl_poll.c:703  guard macro 'HARD_POLL_DEBUG2' is never definable here
-    erts/emulator/sys/win32/erl_poll.c:713  guard macro 'HARD_POLL_DEBUG2' is never definable here
-    erts/emulator/sys/win32/erl_poll.c:733  guard macro 'HARD_POLL_DEBUG2' is never definable here
-    erts/emulator/sys/win32/erl_poll.c:737  guard macro 'HARD_POLL_DEBUG' is never definable here
-    erts/emulator/sys/win32/erl_poll.c:760  guard macro 'HARD_POLL_DEBUG2' is never definable here
-    erts/emulator/sys/win32/erl_poll.c:783  guard macro 'HARD_POLL_DEBUG2' is never definable here
-    erts/emulator/sys/win32/erl_poll.c:786  guard macro 'HARD_POLL_DEBUG' is never definable here
-    erts/emulator/sys/win32/erl_poll.c:826  guard macro 'HARD_POLL_DEBUG' is never definable here
-    erts/emulator/sys/win32/erl_poll.c:879  guard macro 'HARD_POLL_DEBUG' is never definable here
-    erts/emulator/sys/win32/erl_poll.c:884  guard macro 'HARD_POLL_DEBUG' is never definable here
-    erts/emulator/sys/win32/erl_poll.c:942  guard macro 'HARD_POLL_DEBUG' is never definable here
-    erts/emulator/sys/win32/erl_poll.c:1143  guard macro 'HARD_POLL_DEBUG' is never definable here
-    erts/emulator/sys/win32/erl_poll.c:1275  guard macro 'HARD_POLL_DEBUG' is never definable here
-    erts/emulator/sys/win32/sys.c:558  guard macro 'HARD_POLL_DEBUG' is never definable here
-    erts/emulator/sys/win32/sys.c:994  guard macro 'HARD_POLL_DEBUG' is never definable here
-    erts/emulator/sys/win32/sys.c:1010  guard macro 'HARD_POLL_DEBUG' is never definable here
-    erts/emulator/sys/win32/sys.c:1018  guard macro 'HARD_POLL_DEBUG' is never definable here
-    erts/emulator/sys/win32/sys.c:1307  guard macro 'HARD_POLL_DEBUG' is never definable here
-    erts/emulator/sys/win32/sys.c:2554  guard macro 'HARD_POLL_DEBUG' is never definable here
-    erts/emulator/sys/win32/sys.c:2560  guard macro 'HARD_POLL_DEBUG' is never definable here
-    erts/emulator/sys/win32/sys.c:2720  guard macro 'HARD_POLL_DEBUG' is never definable here
-    erts/emulator/sys/win32/sys.c:2724  guard macro 'HARD_POLL_DEBUG' is never definable here
-    erts/emulator/sys/win32/sys.c:3308  guard macro 'DISABLE_NAMED_PIPES' is never definable here
     erts/emulator/zlib/gzguts.h:127  guard macro 'UNDER_CE' is never definable here
     erts/emulator/zlib/gzguts.h:208  guard macro 'UNDER_CE' is never definable here
     erts/emulator/zlib/inffast.c:177  guard macro 'INFLATE_ALLOW_INVALID_DISTANCE_TOOFAR_ARRR' is never definable here
