@@ -291,15 +291,22 @@ fn the_key_is_registered_and_not_seam_backed() {
         !needs_runtime_hooks("erl_ddll", "format_error_int", 1),
         "the real implementation must not be gated behind the RuntimeHooks seam"
     );
-    // The six keys that DO need the live driver registry stay seam-backed.
-    for (function, arity) in [
-        ("demonitor", 1),
-        ("info", 2),
-        ("loaded_drivers", 0),
-        ("monitor", 2),
-        ("try_load", 3),
-        ("try_unload", 2),
-    ] {
+    // `loaded_drivers/0`, `try_load/3` and `try_unload/2` are now real
+    // implementations over the thread-local loaded-driver registry, so they are
+    // NOT gated behind the `RuntimeHooks` seam either.
+    for (function, arity) in [("loaded_drivers", 0), ("try_load", 3), ("try_unload", 2)] {
+        assert!(
+            reg.lookup("erl_ddll", function, arity).is_some(),
+            "erl_ddll:{function}/{arity} must have an implementation"
+        );
+        assert!(
+            !needs_runtime_hooks("erl_ddll", function, arity),
+            "erl_ddll:{function}/{arity} is served by the real registry, not the seam"
+        );
+    }
+    // The three keys that DO need the live driver monitor machinery stay
+    // seam-backed.
+    for (function, arity) in [("demonitor", 1), ("info", 2), ("monitor", 2)] {
         assert!(
             needs_runtime_hooks("erl_ddll", function, arity),
             "erl_ddll:{function}/{arity} still needs the live driver registry"

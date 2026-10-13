@@ -59,6 +59,7 @@ dependencies = [
 name = "beam_bifs"
 version = "0.1.0"
 dependencies = [
+ "beam_abi",
  "beam_alloc",
  "beam_codec",
  "beam_common",

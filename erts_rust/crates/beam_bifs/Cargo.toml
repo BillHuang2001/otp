@@ -9,6 +9,7 @@ description = "BIF registry (bif.tab surface) and the built-in function implemen
 beam_common = { path = "../beam_common" }
 beam_term = { path = "../beam_term" }
 beam_alloc = { path = "../beam_alloc" }
+beam_abi = { path = "../beam_abi" }
 beam_process = { path = "../beam_process" }
 beam_message = { path = "../beam_message" }
 beam_codec = { path = "../beam_codec" }
