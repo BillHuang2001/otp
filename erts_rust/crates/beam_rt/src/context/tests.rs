@@ -4392,3 +4392,139 @@ fn a_message_beats_a_nested_finite_receive_deadline() {
         .mailbox();
     assert!(mailbox.is_empty(), "the receive removed the message");
 }
+
+// ---------------------------------------------------------------------------------------
+// The installed `CollectionGate` host seam: the SAME valve, at the `beam_process` signal sites
+// ---------------------------------------------------------------------------------------
+//
+// The signal sites (a monitor `'DOWN'`, an exit propagation, an applied trap reason) run inside
+// `beam_process::ProcessTable` with only `&mut ProcessTable` in hand, so they cannot consult the
+// runtime's unscanned-root valve; `Runtime::new` installs `RuntimeCollectionGate` on the
+// runtime's table as their half of exactly that decision. The case below pins the seam end to
+// end, through a real signal site, for both its firing and non-firing behaviour.
+
+/// **The installed gate declines a signal-driven relocation of a foreign-reachable receiver.**
+///
+/// The receiver's **gathered** roots reach a container at depth ≥ 2 on the pooled BIF heap (a
+/// foreign container below the process's own scanned young layers) — the shape only the
+/// *descent* can see. An exit signal whose reason is larger than the receiver's whole nursery
+/// must then be delivered **without** collecting or moving that heap: the enqueue-time copy is
+/// refused and the message is built into a heap fragment instead, so the notification is never
+/// lost.
+#[test]
+fn the_installed_gate_declines_a_signal_driven_relocation_of_a_foreign_reachable_receiver() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    // A foreign container at depth >= 2 below a SCANNED root: the pooled-BIF-heap tuple is
+    // reachable only through the process's own young layers, so the cheap per-word phase cannot
+    // see it and the descent is what flags the receiver.
+    let (root, _leaf) = nested_foreign_root(&mut rt, &mut table, pid, 2);
+    table
+        .get_mut(pid)
+        .expect("the receiver is live")
+        .registers_mut()
+        .extra_roots_mut()
+        .push(root);
+    // The production gate, exactly as `Runtime::new` installs it on the runtime's own table.
+    table.set_collection_gate(Box::new(super::gc_walk::RuntimeCollectionGate::new()));
+    assert!(table.has_collection_gate(), "the host gate is installed");
+
+    // The seam itself, called directly: the answer for this receiver is `true`.
+    {
+        let process = table.get(pid).expect("the receiver is live");
+        let mut gate = super::gc_walk::RuntimeCollectionGate::new();
+        assert!(
+            <super::gc_walk::RuntimeCollectionGate as beam_process::CollectionGate>::declines_relocation(
+                &mut gate,
+                process
+            ),
+            "a container at depth >= 2 on the pooled BIF heap is reachable from the receiver's \
+             gathered roots (its extra roots), so the gate must decline"
+        );
+    }
+
+    // A reason LARGER than the receiver's whole nursery: without a decline the enqueue-time copy
+    // would collect and grow the receiver's heap.
+    let signaller = table.spawn_default().expect("a signaller");
+    table.get_mut(pid).expect("live").set_trap_exit(true);
+    let capacity = table
+        .get(pid)
+        .expect("live")
+        .collector()
+        .young()
+        .capacity_words();
+    let mut src = beam_alloc::Heap::new(capacity + 8).expect("the source arena allocates");
+    let elems: Vec<Eterm> = (0..capacity).map(|i| make_small(i as i64)).collect();
+    let reason = src.tuple(&elems).expect("the oversized reason fits the arena");
+
+    let minor_before = table.get(pid).expect("live").collector().minor_gcs();
+    let base_before = table.get(pid).expect("live").collector().young().base();
+    let mailbox_before = table.get(pid).expect("live").mailbox().len();
+
+    table
+        .send_exit(signaller, pid, reason)
+        .expect("the trapping receiver takes the signal");
+
+    let r = table.get(pid).expect("the receiver survived");
+    assert_eq!(
+        r.collector().minor_gcs(),
+        minor_before,
+        "the installed gate declined the signal-driven relocation"
+    );
+    assert_eq!(
+        r.collector().young().base(),
+        base_before,
+        "a declined signal must not move or grow the nursery"
+    );
+    assert_eq!(
+        r.mailbox().len(),
+        mailbox_before + 1,
+        "the notification is NOT lost: it is enqueued fragment-resident"
+    );
+    assert!(
+        !r.is_relocation_exempt(),
+        "the signal route leaves the receiver's own exemption flag alone"
+    );
+    // The new message is fragment-resident and carries the exit tuple whole.
+    let exit_msg = {
+        let process = table.get_mut(pid).expect("live");
+        let mut last = None;
+        while let Some(message) = process.receive(|_| true) {
+            last = Some(message);
+        }
+        last.expect("the exit message is in the mailbox")
+    };
+    assert!(
+        exit_msg.fragments().is_some(),
+        "the declining gate's fallback enqueued a fragment-resident message"
+    );
+    let payload = exit_msg.payload();
+    assert_eq!(
+        terms::tuple_arity(payload).expect("the exit message is a tuple"),
+        3,
+        "the exit message is the three-tuple EXIT/From/Reason"
+    );
+    assert_eq!(
+        terms::tuple_element(payload, 1).expect("in range"),
+        signaller.to_eterm(),
+        "the signaller is the exit sender"
+    );
+
+    // --- the non-firing guard: an identical receiver with NOTHING foreign reachable takes the
+    // ordinary collect-and-grow arm, so the gate is not an unconditional decline. ---
+    let clean = table.spawn_default().expect("a clean receiver");
+    table.get_mut(clean).expect("live").set_trap_exit(true);
+    let minor_before = table.get(clean).expect("live").collector().minor_gcs();
+    table
+        .send_exit(signaller, clean, reason)
+        .expect("the clean receiver takes the signal");
+    let r = table.get(clean).expect("the clean receiver survived");
+    assert!(
+        r.collector().minor_gcs() > minor_before,
+        "with nothing foreign reachable the gate must NOT fire: the ordinary arm collects"
+    );
+    assert_eq!(
+        r.mailbox().len(),
+        1,
+        "the signal is delivered onto the receiver's own (grown) heap"
+    );
+}
