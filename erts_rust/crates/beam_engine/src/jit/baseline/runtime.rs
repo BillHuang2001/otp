@@ -33,11 +33,11 @@
 //! these items produce.
 #![allow(unsafe_code)]
 
-use crate::interpreter::LabelMap;
+use crate::interpreter::{ImportFrame, LabelMap};
 use std::mem;
 
 use beam_common::BeamError;
-use beam_loader::{ImportRef, Module};
+use beam_loader::{ImportRef, Instr, Module};
 use beam_term::Eterm;
 
 use crate::context::ExecutionContext;
@@ -202,13 +202,57 @@ pub(crate) const RUNTIME_XREGS_DISP: i32 =
 // The helper
 // ---------------------------------------------------------------------------
 
+/// Fold a [`Step`] (or a propagating raise) into the block-return word — the **one**
+/// definition of the block-ABI encoding, shared by every helper that runs
+/// interpreter semantics ([`jit_step_one`], [`jit_step_ext`]).
+///
+/// `func`/`pc` are the address of the instruction the helper ran; they are used only
+/// for [`Step::Next`], which advances to `pc + 1`.
+fn fold_step(
+    runtime: &mut JitRuntime<'_>,
+    step: std::result::Result<Step, Box<BeamError>>,
+    func: u32,
+    pc: u32,
+) -> i64 {
+    match step {
+        Ok(Step::Next) => encode_target(func, pc + 1),
+        Ok(Step::Goto { func, pc }) => encode_target(func, pc),
+        // Hand the resume address to the driver (see `WAIT_BIT`): a blocking-aware
+        // driver reports it as `RunOutcome::Wait`, a non-blocking one folds it into
+        // the typed `blocked` error (never a wrong result and never a silent
+        // continue at the `wait`'s own re-examination label).
+        Ok(Step::Wait { func, pc }) => encode_wait(func, pc),
+        // A module-context transfer (a `call_ext*` the host resolved through
+        // `ExecutionContext::resolve_external_call`, a `return` onto a
+        // caller-context continuation, or a raise landing in another context's catch
+        // frame). A compiled block's code, label map and literal area are all bound
+        // for one module, so the block cannot make the switch itself: it hands the
+        // resolved target to the driver, which owns the module-context registry
+        // (`Machine::switch_context`) exactly as the interpreter's driver does.
+        Ok(Step::Enter {
+            context,
+            func,
+            pc,
+        }) => {
+            runtime.enter = Some((context, func, pc));
+            ENTER
+        }
+        Ok(Step::Done) => HALT,
+        Err(err) => {
+            runtime.error = Some(*err);
+            ERROR
+        }
+    }
+}
+
 /// The per-instruction deopt: execute exactly one instruction with the
 /// interpreter's own semantics.
 ///
 /// This is the block ABI's helper. A block calls it (with `rt`, the instruction's
 /// `func` and `pc`) for the first instruction it could not lower natively; the
 /// helper runs [`Machine::step_instruction`](crate::Machine) — *the* interpreter
-/// step — and maps its result onto the same return word the block ABI uses:
+/// step — and maps its result onto the same return word the block ABI uses
+/// ([`fold_step`], the one definition of that encoding):
 ///
 /// * [`Step::Next`] → `encode_target(func, pc + 1)`,
 /// * [`Step::Goto { func, pc }`] → `encode_target(func, pc)`,
@@ -239,35 +283,134 @@ pub(crate) extern "C" fn jit_step_one(rt: *mut JitRuntime<'_>, func: u32, pc: u3
     // a raw pointer; the driver holds no `&mut` to it while the helper runs.
     let ctx = unsafe { &mut *runtime.ctx };
 
-    match machine.step_instruction(module, labels, func, pc, ctx) {
-        Ok(Step::Next) => encode_target(func, pc + 1),
-        Ok(Step::Goto { func, pc }) => encode_target(func, pc),
-        // Hand the resume address to the driver (see `WAIT_BIT`): a blocking-aware
-        // driver reports it as `RunOutcome::Wait`, a non-blocking one folds it into
-        // the typed `blocked` error (never a wrong result and never a silent
-        // continue at the `wait`'s own re-examination label).
-        Ok(Step::Wait { func, pc }) => encode_wait(func, pc),
-        // A module-context transfer (a `call_ext*` the host resolved through
-        // `ExecutionContext::resolve_external_call`, a `return` onto a
-        // caller-context continuation, or a raise landing in another context's catch
-        // frame). A compiled block's code, label map and literal area are all bound
-        // for one module, so the block cannot make the switch itself: it hands the
-        // resolved target to the driver, which owns the module-context registry
-        // (`Machine::switch_context`) exactly as the interpreter's driver does.
-        Ok(Step::Enter {
-            context,
-            func,
-            pc,
-        }) => {
-            runtime.enter = Some((context, func, pc));
-            ENTER
+    let step = machine.step_instruction(module, labels, func, pc, ctx);
+    fold_step(runtime, step, func, pc)
+}
+
+/// The `call_ext*` **decline** step: run the `call_ext*` instruction at `(func, pc)`
+/// through [`Machine::call_ext_dispatch`] with the host's **already-computed** seam
+/// answer, so the host's cross-module seam is consulted **once** per declined call
+/// instead of twice.
+///
+/// A native tier lowers a `call_ext*` through the [`jit_ext_call`] helper, which
+/// consults the host seam itself ([`ExecutionContext::resolve_external_call`]). When
+/// the host answers "run it synchronously in this process" (`Ok(None)` — the common
+/// BIF case) the helper used to hand the *whole* instruction back to
+/// [`jit_step_one`], and the interpreter's `call_ext*` arm then resolved the **same**
+/// import through the **same** seam a second time ([`Machine::resolve_external_entry`]
+/// inside [`Machine::call_ext_dispatch`]) before falling through to the synchronous
+/// `call_bif` route. `seam` carries the host's answer verbatim (`Some(None)` = "the
+/// host declined"), which [`Machine::call_ext_dispatch`] consumes **without** asking
+/// the seam again, while still running the interpreter's own `erlang:apply/3` /
+/// `erlang:send/2` special cases and the variant's frame discipline — so this is the
+/// interpreter's `call_ext*` semantics with the duplicate resolution removed.
+///
+/// The instruction's own operand shape (`arity`, and the variant's `deallocate`) is
+/// read straight out of the active module's code, so the helper reproduces the exact
+/// [`ImportFrame`] the interpreter's `call_ext*` arm builds. Everything else — the
+/// `Step` → block-ABI folding, the position store, the context-`0` half of the raise
+/// funnel — is [`jit_step_one`]'s, so the two paths are interpreter-identical by
+/// construction.
+///
+/// Deliberately **not** `extern "C"`/in the helper fn-pointer table: it is reachable
+/// only from [`jit_ext_call`] (Rust), never directly from generated code, so its
+/// `seam` argument may be an ordinary Rust `Option`.
+fn jit_step_ext(
+    rt: *mut JitRuntime<'_>,
+    func: u32,
+    pc: u32,
+    seam: Option<Option<(u32, u32, u32)>>,
+) -> i64 {
+    let step = {
+        // SAFETY: the driver passes `rt` as the address of a live, exclusively
+        // borrowed `JitRuntime` and never aliases it for the duration of the call;
+        // every pointer it holds points at an object the driver owns and keeps alive
+        // for the whole loop (`machine`, `module`), or at a local (`labels`) that
+        // outlives the loop.
+        let runtime = unsafe { &mut *rt };
+        // SAFETY: `runtime.machine` is a non-null pointer to the driver's live
+        // `Machine`; no other `&mut Machine` exists while the helper runs.
+        let machine = unsafe { &mut *runtime.machine };
+        // SAFETY: `runtime.module` points at the module the driver is running, which
+        // outlives the loop.
+        let module = unsafe { &*runtime.module };
+        // SAFETY: `runtime.labels` points at the driver's `labels` local, which
+        // outlives the loop.
+        let labels = unsafe { &*runtime.labels };
+        // SAFETY: `runtime.ctx` is the driver's `&mut dyn ExecutionContext` reborrowed
+        // as a raw pointer; the driver holds no `&mut` to it while the helper runs.
+        let ctx = unsafe { &mut *runtime.ctx };
+
+        // The same position store `Machine::step_instruction` makes at entry, so
+        // `Machine::current_code` keeps the granularity this instruction had before the
+        // duplicate resolution was removed.
+        machine.set_current_code(func, pc);
+
+        // The instruction's own operand shape selects the frame discipline, exactly as
+        // the interpreter's three `call_ext*` arms do (`ImportFrame::Call`/`Only`/
+        // `Last(deallocate)`).
+        let step = match module
+            .functions
+            .get(func as usize)
+            .and_then(|function| function.code.get(pc as usize))
+        {
+            Some(Instr::CallExt { arity, target }) => machine.call_ext_dispatch(
+                module,
+                labels,
+                *target,
+                *arity,
+                func,
+                pc,
+                ImportFrame::Call,
+                ctx,
+                seam,
+            ),
+            Some(Instr::CallExtOnly { arity, target }) => machine.call_ext_dispatch(
+                module,
+                labels,
+                *target,
+                *arity,
+                func,
+                pc,
+                ImportFrame::Only,
+                ctx,
+                seam,
+            ),
+            Some(Instr::CallExtLast {
+                arity,
+                target,
+                deallocate,
+            }) => machine.call_ext_dispatch(
+                module,
+                labels,
+                *target,
+                *arity,
+                func,
+                pc,
+                ImportFrame::Last(*deallocate),
+                ctx,
+                seam,
+            ),
+            // Not a `call_ext*`: `jit_ext_call` only reaches this helper for one, so
+            // this defensive arm takes the interpreter's full step (exactly what the
+            // helper's old fallback did) rather than inventing a result.
+            _ => machine.step_instruction(module, labels, func, pc, ctx),
+        };
+        // The uniform raise funnel's context-`0` half, exactly as
+        // `Machine::step_instruction` runs it: in context `0` the active module IS the
+        // entry module, so a propagating raise is decorated here; a non-zero context is
+        // left to the driver, which knows the true entry module.
+        if machine.current_context() == 0 {
+            step.map_err(|err| Box::new(machine.with_uncaught_frames(*err, Some(module), func, pc)))
+        } else {
+            step
         }
-        Ok(Step::Done) => HALT,
-        Err(err) => {
-            runtime.error = Some(*err);
-            ERROR
-        }
-    }
+    };
+    // SAFETY: `rt` is the same live, exclusively borrowed `JitRuntime` the driver
+    // owns; the `&mut` derived from it above is dead by now, so this borrow does not
+    // alias it.
+    let runtime = unsafe { &mut *rt };
+    fold_step(runtime, step, func, pc)
 }
 
 /// The kind of `call_ext*` a [`jit_ext_call`] call describes: `call_ext Arity Bif` —
@@ -302,11 +445,16 @@ pub(crate) const EXT_CALL_LAST: u32 = 2;
 /// Anything the host cannot run in this machine — the seam's `Ok(None)` (the
 /// synchronous `call_bif` path, NIFs, the runtime's native floor), an import whose
 /// atoms the module's table lacks, a target label the callee does not define, a
-/// frame discipline that failed — falls back to [`jit_step_one`], which runs the
-/// *entire* instruction through the interpreter. That fallback is what keeps the
-/// synchronous path and every one of its errors byte-identical to the tier before
-/// this arm existed: nothing is mutated before the fallback, so the interpreter sees
-/// exactly the state it would have seen and reports exactly its own error.
+/// frame discipline that failed — keeps the synchronous path byte-identical to the
+/// tier before this arm existed. Two routes get there:
+///
+/// * the host's **decline** (`Ok(None)`) goes through [`jit_step_ext`]'s
+///   `Some(None)` seam answer, which drives the instruction through
+///   [`Machine::call_ext_dispatch`] **without** re-asking the host's seam;
+/// * every *other* unresolved shape re-runs the whole instruction through
+///   [`jit_step_one`], the interpreter step that re-resolves and reports its own
+///   exact diagnostic. Nothing is mutated before that fallback, so the interpreter
+///   sees exactly the state it would have seen.
 ///
 /// The import's `(module name, function name, arity)` is read straight out of the
 /// active module's `ImpT` table and atom table — the same triple the per-run import
@@ -350,7 +498,7 @@ pub(crate) extern "C" fn jit_ext_call(
         )
     };
     match resolved {
-        Some((context, callee, callee_pc)) => {
+        Some(Some((context, callee, callee_pc))) => {
             // SAFETY: `rt` is the same live, exclusively borrowed `JitRuntime` the
             // driver owns; the `&mut` derived from it above is dead by now, so this
             // store does not alias it. The driver takes the slot when it decodes the
@@ -358,20 +506,31 @@ pub(crate) extern "C" fn jit_ext_call(
             unsafe { (*rt).enter = Some((context, callee, callee_pc)) };
             ENTER
         }
-        // The instruction is the interpreter's to execute (all of it, exactly once).
+        // The host declined **this** import (`Ok(None)`): hand that answer to the
+        // dispatching seam so the instruction runs with the interpreter's own
+        // `call_ext*` semantics — special cases and frame discipline included — while
+        // the host's seam is consulted only once.
+        Some(None) => jit_step_ext(rt, func, pc, Some(None)),
+        // Resolution never reached the host's decline, so the instruction is the
+        // interpreter's to execute (all of it, exactly once).
         None => jit_step_one(rt, func, pc),
     }
 }
 
 /// Resolve a `call_ext*` through the host's seam and apply its frame discipline.
 ///
-/// `None` means "the interpreter step must run this instruction": the host cannot run
-/// the callee in this machine, the import does not resolve, the callee's entry label
+/// `None` means "the interpreter step must re-run this instruction": the import does
+/// not resolve, the host's seam **errored** (not a decline), the callee's entry label
 /// is not in its own label index, or the frame discipline failed. **Nothing has been
 /// mutated** on any of those paths (registering a module context is idempotent, the
 /// continuation store and the frame pop both validate before writing), so the caller's
 /// [`jit_step_one`] fallback re-runs the instruction and produces exactly what the
 /// interpreter would have produced.
+///
+/// `Some(None)` means the host **declined** the import (`Ok(None)`): the caller can
+/// answer the seam's own question verbatim ([`jit_step_ext`] with `Some(None)`), so
+/// [`Machine::call_ext_dispatch`] never re-asks it. `Some(Some(target))` is a resolved
+/// callee this machine can enter.
 fn resolve_ext_entry(
     machine: &mut Machine,
     module: &Module,
@@ -381,7 +540,7 @@ fn resolve_ext_entry(
     pc: u32,
     deallocate: u32,
     ctx: &mut dyn ExecutionContext,
-) -> Option<(u32, u32, u32)> {
+) -> Option<Option<(u32, u32, u32)>> {
     // The import's `(module, function, arity)`. This is the per-call resolution
     // (`LabelMap::import_target`'s uncached fallback), which is the definition of the
     // import semantics: an index past the end of `ImpT` and an atom the module's table
@@ -389,9 +548,15 @@ fn resolve_ext_entry(
     let import = module.imports.get(target.0 as usize)?;
     let module_name = module.atom_name(import.module)?;
     let function_name = module.atom_name(import.function)?;
-    let (callee, label) = ctx
-        .resolve_external_call(module_name, function_name, import.arity)
-        .ok()??;
+    let (callee, label) = match ctx.resolve_external_call(module_name, function_name, import.arity) {
+        // The host's **decline**: report the seam's own answer so the caller can skip
+        // the duplicate resolution (see `jit_step_ext`).
+        Ok(None) => return Some(None),
+        Ok(Some(resolved)) => resolved,
+        // A host *error* is not a decline: leave the instruction to the interpreter,
+        // which re-asks the seam and reports that error exactly as it always has.
+        Err(_) => return None,
+    };
     // Registering is idempotent by the handle's allocation identity, so a recursive or
     // repeated cross-module call reuses one context (and its already-built label index).
     let context = machine.register_context(&callee);
@@ -415,7 +580,7 @@ fn resolve_ext_entry(
         _ => Err(error::unsupported("jit: unknown call_ext kind")),
     };
     discipline.ok()?;
-    Some((context, callee_func, callee_pc))
+    Some(Some((context, callee_func, callee_pc)))
 }
 
 /// The **position store** helper: record a compiled block's own `(func, pc)` as the

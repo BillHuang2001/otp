@@ -2322,6 +2322,150 @@ fn jit_ext_call_falls_back_to_the_synchronous_path_when_no_callee_resolves() {
     );
 }
 
+/// The host's **decline** (`Ok(None)`) is answered through the dispatching seam
+/// ([`jit_step_ext`] with `Some(None)`), so the host's `resolve_external_call` is
+/// consulted **exactly once** per declined `call_ext*` — not once by
+/// [`jit_ext_call`]'s own resolution and again by the interpreter step it used to
+/// fall back to. The result is unchanged: the synchronous `call_bif` route still
+/// runs the BIF and advances by one.
+#[test]
+fn jit_ext_call_consults_the_host_seam_once_per_declined_call() {
+    let (caller, (func, pc)) = ext_call_caller(Instr::CallExt {
+        arity: 0,
+        target: ImportRef(0),
+    });
+    // A counting resolver that declines *every* import: the host's seam answer is
+    // `Ok(None)`, so the call must reach `call_bif` — but be asked only once.
+    let asks = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let counter = std::rc::Rc::clone(&asks);
+    let mut ctx = MinimalContext::new();
+    ctx.set_external_resolver(Box::new(move |_module, _function, _arity| {
+        counter.set(counter.get() + 1);
+        Ok(None)
+    }));
+    ctx.set_bif_hook(Box::new(|module, function, arity, _args| {
+        assert_eq!(
+            (module, function, arity),
+            ("callee_x", "g", 0),
+            "the declined import still reaches the synchronous BIF route"
+        );
+        Ok(make_small(7))
+    }));
+
+    let probe = run_ext_call(&caller, (func, pc), ctx, EXT_CALL, 0);
+
+    assert_eq!(
+        asks.get(),
+        1,
+        "the host's cross-module seam must be consulted exactly once per declined \
+         `call_ext` (the duplicate `resolve_external_entry` pass is gone)"
+    );
+    assert_eq!(
+        probe.word,
+        encode_target(func, pc + 1),
+        "a declined call_ext still runs the interpreter's CallExt and advances by one"
+    );
+    assert_eq!(
+        probe.enter, None,
+        "no cross-module transfer is reported on the synchronous path"
+    );
+    assert_eq!(
+        probe.x0,
+        Some(make_small(7)),
+        "the synchronous call_bif wrote its result to x(0)"
+    );
+    assert_eq!(
+        probe.frame_depth, 1,
+        "the synchronous path keeps the caller's frame"
+    );
+}
+
+/// A module whose whole body is `rounds` `call_ext` calls to an import the host
+/// declines: `erlang:'+'/2` on two small integers. Every call is therefore the
+/// exact shape the duplicate-resolution bug covered.
+///
+/// `x(0)` is the accumulator (starting at `0`), `x(1)` is the constant `1`, so the
+/// returned value is `rounds` — a figure a run that skipped, repeated or reordered
+/// a call cannot produce.
+fn declined_call_ext_module(rounds: usize) -> (Module, Atom) {
+    let mut code = vec![
+        Instr::Label(Label(1)),
+        Instr::Label(Label(2)),
+        Instr::Move {
+            src: Operand::Integer(0),
+            dst: Operand::X(0),
+        },
+        Instr::Move {
+            src: Operand::Integer(1),
+            dst: Operand::X(1),
+        },
+    ];
+    for _ in 0..rounds {
+        code.push(Instr::CallExt {
+            arity: 2,
+            target: ImportRef(0),
+        });
+    }
+    code.push(Instr::Return);
+    let module = build_module(
+        "declined_ext",
+        &[("erlang", "+", 2)],
+        vec![("f", 0, code)],
+        &[("f", 0, Label(2))],
+    );
+    let name = export_atom(&module, "f");
+    (module, name)
+}
+
+/// End-to-end tier agreement over the duplicate-resolution path: a body of
+/// `call_ext` instructions the host declines runs on the interpreter and on the
+/// baseline tier, producing the same value **and** consulting the host's
+/// cross-module seam the same number of times (once per call) on both.
+///
+/// This is the regression pin for the decline path: before `jit_step_ext`, the
+/// baseline tier asked the host's seam twice per declined `call_ext` (once in
+/// `jit_ext_call`'s own resolution, once inside the `jit_step_one` fallback's
+/// `resolve_external_entry`) while the interpreter asked once, so any counting
+/// host saw a tier-dependent seam-call count.
+#[test]
+fn the_baseline_tier_agrees_with_the_interpreter_on_the_declined_call_ext_seam_count() {
+    const ROUNDS: usize = 5;
+    let (module, name) = declined_call_ext_module(ROUNDS);
+
+    let mut counts = Vec::new();
+    for tier in [Tier::Interpreter, Tier::BaselineJit] {
+        let asks = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let counter = std::rc::Rc::clone(&asks);
+        let mut ctx = MinimalContext::new();
+        ctx.set_bif_hook(crate::jit::bench::support::arith_hook(None, None));
+        ctx.set_external_resolver(Box::new(move |_module, _function, _arity| {
+            counter.set(counter.get() + 1);
+            Ok(None)
+        }));
+
+        let mut machine = Machine::new();
+        let outcome = machine
+            .run_export_outcome_with_tier(&module, name, 0, &[], &mut ctx, tier)
+            .unwrap_or_else(|err| panic!("{tier:?}: the declined call_ext run returns: {err:?}"));
+        assert_eq!(
+            outcome,
+            RunOutcome::Returned(make_small(ROUNDS as i64)),
+            "{tier:?}: {ROUNDS} declined `erlang:'+'/2` calls accumulate to {ROUNDS}"
+        );
+        counts.push(asks.get());
+    }
+
+    assert_eq!(
+        counts[0], ROUNDS,
+        "the interpreter consults the host's cross-module seam once per call_ext"
+    );
+    assert_eq!(
+        counts[1], counts[0],
+        "the baseline tier must consult the host's cross-module seam the SAME number \
+         of times as the interpreter ({ROUNDS} calls, no duplicate resolution)"
+    );
+}
+
 /// A `call_ext_last` whose `Deallocate` operand is **stale** (its frame size no
 /// longer matches the live frame — the shape `trim` produces) must not fabricate
 /// a wrong `ENTER`: the frame discipline's checked pop rejects the mismatch, the
