@@ -671,7 +671,8 @@ constructors only (no new error enum).
 - `tests/immix_invariants.rs` → the mark-region invariant probes (mutation-verified)
 - `tests/immix_stress.rs` → the mark-region stress set (multi-block promotion, fragmentation/reuse, asserted bounded accounting)
 - `tests/subtag_copy.rs` → per-subtag copy correctness with exact footprint accounting (bignum, record instance, `ErlSubBits` match context, external port/ref, HAMT head node)
-- `tests/steady_state.rs` → the default-cadence steady-state gate (`MEASURED.md`; capacities converge to 233 Copying / 512 Immix)
+- `tests/steady_state.rs` → the default-cadence steady-state gate (`MEASURED.md`; capacities converge to 233/376 Copying, 233/512 Immix)
+- `tests/generational_cadence.rs` → the mature-generation room-policy regression gate (minors actually run at the default policy; `minor_gcs` advances/resets; converged constants)
 - `tests/offheap_liveness.rs` → an off-heap handle held INSIDE a moved container: refcount stable, payload verbatim, freed exactly once
 - `tests/offheap_slot_stability.rs` → slot stability across a releasing sweep (a `val`-slot container still resolves after a **middle** sweep; released slots answer `None`)
 - `tests/offheap_steady_state.rs` → the `live`/`live_full` verification from outside the crate + 240-round bounded steady state (`MEASURED.md`)
