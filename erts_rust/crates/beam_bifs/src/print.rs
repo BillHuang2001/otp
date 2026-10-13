@@ -840,10 +840,6 @@ pub(crate) fn field_chunk(
     }
 }
 
-/// `io_lib_format`'s `~s` field rule (`string/6`, `string_field/6`, `flat_trunc/3`)
-/// lives in [`crate::io`] as [`crate::io::string_field_chunk`], because the
-/// `io_lib:chars_length/1` measurement and the `string:slice/3` truncation both
-/// need the `BifContext` (a grapheme count / a grapheme slice).
 /// Renders a binary (`io_lib:write_binary/2` for `~w`,
 /// `io_lib_pretty:write/1` for `~p`).
 ///
