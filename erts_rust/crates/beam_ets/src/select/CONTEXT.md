@@ -114,8 +114,7 @@ its compiled-opcode program. The interior is a Rust AST, not a term program.
   (`Cursor::Position`; bounds-checked, never OOB, because ERTS's cursor there is a bucket/index). Hash-kind
   order is unspecified, so a mutation between `/3` and `/1` may shift the hash-kind resume — never a
   typed error and never a wrong mutation-free result.
-- **Dead code:** `pattern::bound_vars` is `#[allow(dead_code)]` and has no caller
-  (only self-recursion; no test). Its doc "handy for tests" is aspirational.
+- **Removed:** `pattern::bound_vars` (dead code, no caller) was deleted.
 
 ## Design Decisions
 - **The guard-error classification (`exec.rs::guards_hold` returns `Result<bool>`).** A
