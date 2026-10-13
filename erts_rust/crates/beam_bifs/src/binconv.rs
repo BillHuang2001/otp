@@ -207,6 +207,8 @@
 //! extend the very table `ctx.atoms()` borrows) is the one
 //! [`crate::context`] documents for the hook.
 
+use std::cell::RefCell;
+
 use beam_codec::compress::compress as zlib_compress;
 use beam_codec::{
     decode_term_used, decode_term_with_local_node_used, Encoder, MinorVersion, COMPRESSED_EXT,
@@ -1055,6 +1057,69 @@ fn binary_to_term_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     decode_term_bif(ctx, args[0], safe, used)
 }
 
+// A memoized, per-thread **image** of the caller's shared atom table, used as the
+// decoder's mutable scratch (maintained by `with_decode_scratch` below, which also
+// carries the correctness argument).
+//
+// `beam_codec`'s decode entry points take `&mut AtomTable` because they intern every
+// atom an image carries. The decode path only ever *interns* — no arm of the decoder
+// reads a name back — so a copy of the caller's table is exactly the interface
+// required: a name already present in the caller's table is returned at the caller's
+// own index, and a genuinely new one at `shared.len() + k`, which is precisely the
+// index the `AtomInterner` seam predicts (its `base` is the table's length when the
+// call started) and therefore the index it assigns when the novel names are committed
+// after the decode (see `decode_term_bif`).
+//
+// Building that copy per call is `O(table)` **allocations** — ~127 us for the
+// ~3000-atom table of a booted runtime, which is the whole cost of
+// `binary_to_term/1,2` (the term itself decodes in ~1 us). The copy is therefore
+// memoized per thread and **verified** against the live table index by index before it
+// is reused: comparing is allocation-free and ~25x cheaper than rebuilding.
+//
+// This is a *cache of the caller's own immutable input*, carrying no cross-call
+// semantics; it retains one table image per thread while the process lives.
+thread_local! {
+    static DECODE_SCRATCH: RefCell<Option<AtomTable>> = const { RefCell::new(None) };
+}
+
+/// Whether `memo` names the same atom as `shared` at every index `memo` holds.
+///
+/// `memo.len() > shared.len()` is `false` by definition: such a memo cannot stand in
+/// for `shared` (its novel-atom prediction would be off by the difference).
+fn prefix_matches(memo: &AtomTable, shared: &AtomTable) -> bool {
+    memo.len() <= shared.len()
+        && (0..memo.len()).all(|index| {
+            let atom = Atom::from_raw(index as u32);
+            memo.name(atom) == shared.name(atom)
+        })
+}
+
+/// Runs `f` on an exact image of `shared`, rebuilding or extending the per-thread memo
+/// as needed (see [`DECODE_SCRATCH`]).
+///
+/// `f` receives a table that is index-identical to `shared`, and may extend it (that is
+/// what the decoder does with a novel atom); the memo is *not* required to stay an
+/// image of `shared` afterwards, so the next call revalidates. A re-entrant call (which
+/// the decode path cannot produce — decoding never dispatches a BIF) falls back to a
+/// private copy rather than panicking.
+fn with_decode_scratch<R>(shared: &AtomTable, f: impl FnOnce(&mut AtomTable) -> R) -> R {
+    DECODE_SCRATCH.with(|cell| {
+        let Ok(mut slot) = cell.try_borrow_mut() else {
+            return f(&mut shared.clone());
+        };
+        if slot.as_ref().is_none_or(|memo| !prefix_matches(memo, shared)) {
+            *slot = Some(shared.clone());
+        }
+        let scratch = slot.as_mut().expect("installed above");
+        for index in scratch.len()..shared.len() {
+            if let Some(name) = shared.name(Atom::from_raw(index as u32)) {
+                scratch.intern(name);
+            }
+        }
+        f(scratch)
+    })
+}
+
 /// Decodes an external term image (see the module docs for the atom-index
 /// coupling this relies on).
 ///
@@ -1073,6 +1138,9 @@ fn binary_to_term_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// identity the decode is byte-for-byte the previous behaviour (the wire form, an
 /// external id). The 4-byte `LOCAL_EXT` node hash is runtime state with no seam here,
 /// so it is not installed (`None` consumes it unchecked).
+///
+/// The body is decoded into [`DECODE_SCRATCH`], an exact, memoized image of the
+/// context's table — never a fresh `O(table)` clone per call.
 ///
 /// # Errors
 ///
@@ -1094,35 +1162,47 @@ fn decode_term_bif(
     // on the decoder below so an incoming identifier that names this node demotes to
     // the internal form (see the docs above); `None` leaves the decode unchanged.
     let identity = ctx.local_node();
-    // Decode into a *clone* of the context's table: the decoder needs `&mut`, and
-    // the clone has the context's indices (the names are interned in order).
-    let mut local = ctx.atoms().clone();
-    let known = local.len();
-    let heap = ctx.heap();
-    // The codec's `[used]` entry points own the `COMPRESSED` wrapper handling and the
-    // consumed-source-byte count (the zlib stream end for a compressed image,
-    // `Decoder::position` otherwise) — and, unlike the `finish()`-ing `decode_term`
-    // pair, they tolerate trailing bytes, matching the oracle's `binary_to_term/2`.
-    // The identity-aware twin installs the identity on both paths.
-    let (term, position) = match identity {
-        Some((node, creation)) => {
-            decode_term_with_local_node_used(&data, heap, &mut local, node, creation, None)?
-        }
-        None => decode_term_used(&data, heap, &mut local)?,
+    // Decode into the scratch image and collect the names it appended, before the
+    // scratch is released — they are exactly the names that must reach the shared
+    // table, at exactly the indices the decoder wrote into the term.
+    let (decoded, fresh) = {
+        let (shared, heap) = ctx.atom_and_heap();
+        with_decode_scratch(shared, |scratch| {
+            let known = scratch.len();
+            // The codec's `[used]` entry points own the `COMPRESSED` wrapper handling and
+            // the consumed-source-byte count (the zlib stream end for a compressed image,
+            // `Decoder::position` otherwise) — and, unlike the `finish()`-ing
+            // `decode_term` pair, they tolerate trailing bytes, matching the oracle's
+            // `binary_to_term/2`. The identity-aware twin installs the identity on both
+            // paths.
+            let decoded = match identity {
+                Some((node, creation)) => {
+                    decode_term_with_local_node_used(&data, heap, scratch, node, creation, None)
+                }
+                None => decode_term_used(&data, heap, scratch),
+            };
+            // A failed decode leaves the scratch possibly ahead of the shared table (the
+            // next call's `prefix_matches` rebuilds it); nothing is committed.
+            let fresh: Vec<String> = if decoded.is_ok() {
+                (known..scratch.len())
+                    .filter_map(|index| {
+                        scratch
+                            .name(Atom::from_raw(index as u32))
+                            .map(str::to_string)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (decoded, fresh)
+        })
     };
-    if local.len() > known {
+    let (term, position) = decoded?;
+    if !fresh.is_empty() {
         if safe {
             // `safe` forbids creating atoms; nothing has been created yet.
             return Err(badarg());
         }
-        let fresh: Vec<String> = (known..local.len())
-            .map(|index| {
-                local
-                    .name(Atom::from_raw(index as u32))
-                    .unwrap_or_default()
-                    .to_string()
-            })
-            .collect();
         for name in &fresh {
             ctx.intern_atom(name)?;
         }
@@ -1134,7 +1214,6 @@ fn decode_term_bif(
         Ok(term)
     }
 }
-
 /// Registers the `erlang` binary/atom conversion and term (de)serialization BIFs.
 pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("erlang", "list_to_binary", 1, list_to_binary_1);

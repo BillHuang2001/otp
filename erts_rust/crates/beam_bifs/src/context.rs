@@ -1028,6 +1028,18 @@ impl<'a> BifContext<'a> {
         self.atoms
     }
 
+    /// The atom table and the destination heap together.
+    ///
+    /// Both accessors above borrow the whole context, so a caller that needs the
+    /// (immutable) table and the (mutable) heap at the same time cannot obtain them
+    /// one after the other. This splits the two disjoint fields in a single borrow —
+    /// `binary_to_term` needs exactly that, because it decodes into a copy of the
+    /// table while writing the decoded term onto the heap (see
+    /// [`crate::binconv`]'s decode scratch).
+    pub(crate) fn atom_and_heap(&mut self) -> (&AtomTable, &mut Heap) {
+        let atoms: &AtomTable = self.atoms;
+        (atoms, self.heap)
+    }
     /// The calling process's pid.
     pub fn self_pid(&self) -> ProcessId {
         self.self_pid
