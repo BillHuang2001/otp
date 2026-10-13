@@ -3253,9 +3253,329 @@ fn an_out_of_frame_y_slot_is_rejected_identically_on_both_tiers() {
 }
 
 // ---------------------------------------------------------------------------
-// the Y-window publication is gated at compile time
+// Y-slot `move`: the source and/or the destination may be an in-frame Y slot
+// ---------------------------------------------------------------------------
+//
+// A `move` whose source and/or destination is a `Y` slot is lowered natively behind
+// the **same shared frame-window guard** the arithmetic fast path uses
+// (`operands.rs::emit_guarded_y_load`/`emit_guarded_y_store` § the guarded Y-window
+// access), so the shape is purely syntactic [`move_shape`] and the run-time guard can
+// only ever *reject*. The compile-time Y gate ([`uses_y`]) must claim **exactly** those
+// moves — otherwise a later in-block Y access after a helper call would read a window
+// published before a `machine.stack` reallocation.
 // ---------------------------------------------------------------------------
 
+/// `f/0`'s body as a chain of Y-slot moves — `Allocate{2}` · `Move 7 -> Y(0)` (a **Y
+/// destination**) · `Move Y(0) -> Y(1)` (**Y source and destination**) ·
+/// `Move Y(1) -> X(0)` (a **Y source**) · `Deallocate 2` · `Return`.
+fn y_slot_move_code() -> Vec<Instr> {
+    vec![
+        Instr::Label(Label(1)),
+        Instr::Label(Label(2)),
+        Instr::Allocate {
+            stack_need: beam_loader::HeapNeed::Words(2),
+            live: 0,
+        },
+        Instr::Move {
+            src: Operand::Integer(7),
+            dst: Operand::Y(0),
+        },
+        Instr::Move {
+            src: Operand::Y(0),
+            dst: Operand::Y(1),
+        },
+        Instr::Move {
+            src: Operand::Y(1),
+            dst: Operand::X(0),
+        },
+        Instr::Deallocate(2),
+        Instr::Return,
+    ]
+}
+
+/// Every Y-slot `move` shape (a `Y` source, a `Y` destination, or both) **lowers** at
+/// compile time and **executes identically** on the baseline tier and the interpreter.
+#[test]
+fn a_y_source_and_a_y_destination_move_lower_and_agree_across_tiers() {
+    let code = y_slot_move_code();
+    for instr in &code {
+        if let Instr::Move { src, dst } = instr {
+            assert!(
+                move_shape(src, dst).is_some(),
+                "a Y-slot move must lower at compile time: {src:?} -> {dst:?}"
+            );
+        }
+    }
+    let module = build_module("yslot_move", &[], vec![("f", 0, code)], &[("f", 0, Label(2))]);
+    let name = export_atom(&module, "f");
+    with_both_tiers(&module, name, |interpreter, baseline| {
+        assert_same_outcome("y-slot move", interpreter, baseline, &module.atom_table);
+        match (interpreter, baseline) {
+            (Ok(RunOutcome::Returned(value)), _) => {
+                assert_eq!(*value, make_small(7), "the constant travelled through Y(0)/Y(1)");
+            }
+            other => panic!("the Y-slot moves did not return: {other:?}"),
+        }
+    });
+}
+
+/// A `move` naming a Y slot **outside** the current frame is rejected identically by
+/// both tiers — as a destination and as a source.
+///
+/// The emitted guard only ever *rejects* (branching to `jit_step_one`), so the
+/// interpreter's own `y(k)` judgement — a typed error, never a wrong value and never a
+/// panic — surfaces on the baseline tier unchanged. This is exactly the case a
+/// fabricated value would show up in: `Move 7 -> Y(1)` must not silently succeed.
+#[test]
+fn an_out_of_frame_y_move_is_rejected_identically_on_both_tiers() {
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Label(Label(2)),
+        Instr::Allocate {
+            stack_need: beam_loader::HeapNeed::Words(1),
+            live: 0,
+        },
+        // A frame of exactly one Y slot: `Y(1)` is outside it, both as a store …
+        Instr::Move {
+            src: Operand::Integer(7),
+            dst: Operand::Y(1),
+        },
+        // … and as a load.
+        Instr::Move {
+            src: Operand::Y(1),
+            dst: Operand::X(0),
+        },
+        Instr::Deallocate(1),
+        Instr::Return,
+    ];
+    for instr in &code {
+        if let Instr::Move { src, dst } = instr {
+            assert!(
+                move_shape(src, dst).is_some(),
+                "the shape still lowers; the frame window is a run-time guard: {src:?} -> {dst:?}"
+            );
+        }
+    }
+    let module = build_module("yslot_move_bad", &[], vec![("f", 0, code)], &[("f", 0, Label(2))]);
+    let name = export_atom(&module, "f");
+    with_both_tiers(&module, name, |interpreter, baseline| {
+        assert!(
+            interpreter.is_err(),
+            "the interpreter must reject an out-of-frame Y move: {interpreter:?}"
+        );
+        assert!(
+            baseline.is_err(),
+            "the baseline tier must reject an out-of-frame Y move: {baseline:?}"
+        );
+        assert_same_outcome(
+            "out-of-frame Y move",
+            interpreter,
+            baseline,
+            &module.atom_table,
+        );
+    });
+}
+
+/// A `move` naming a Y index the emitted `disp32` cannot address is refused at
+/// **compile** time (a deopt — the interpreter reports the faithful error), and the
+/// compile-time Y gate agrees: a refused move accesses no window, so it must not make
+/// the block publish one.
+#[test]
+fn an_unaddressable_y_move_index_is_refused_at_compile_time() {
+    let module = Module::default();
+    assert!(!y_addressable(u32::MAX));
+    for (src, dst) in [
+        (Operand::X(0), Operand::Y(u32::MAX)),
+        (Operand::Y(u32::MAX), Operand::X(0)),
+        (Operand::Y(u32::MAX), Operand::Y(0)),
+        (Operand::Integer(1), Operand::Y(u32::MAX)),
+    ] {
+        assert!(
+            move_shape(&src, &dst).is_none(),
+            "an un-addressable Y index must be refused at compile time: {src:?} -> {dst:?}"
+        );
+        assert!(
+            !uses_y(&module, &Instr::Move { src, dst }),
+            "a refused Y move accesses no window"
+        );
+    }
+
+    // The largest index the `lea ... disp32` still addresses IS claimed, so the refusal
+    // is the displacement bound and nothing else.
+    let biggest = (i32::MAX / std::mem::size_of::<Eterm>() as i32) as u32;
+    assert!(y_addressable(biggest));
+    assert!(move_shape(&Operand::X(0), &Operand::Y(biggest)).is_some());
+}
+
+/// The compile-time Y gate ([`uses_y`]) is true **exactly** for the `move` shapes the
+/// inliner claims *and* that read the frame window — the invariant `Allocation::y_last`
+/// / `refresh_y_after` rest on. A move the inliner refuses deopts and reads nothing, so
+/// the gate must be false for it too.
+#[test]
+fn the_move_y_gate_matches_the_move_inliner_exactly() {
+    let module = Module::default();
+    let typed_y = Operand::Typed {
+        reg: RegRef::Y(1),
+        ty: beam_loader::TypeIndex(0),
+    };
+    let typed_x = Operand::Typed {
+        reg: RegRef::X(2),
+        ty: beam_loader::TypeIndex(0),
+    };
+    let moves = vec![
+        // x-only: lowered, but no window read.
+        Instr::Move {
+            src: Operand::X(0),
+            dst: Operand::X(1),
+        },
+        Instr::Move {
+            src: Operand::Integer(1),
+            dst: Operand::X(1),
+        },
+        Instr::Move {
+            src: Operand::Nil,
+            dst: Operand::X(1),
+        },
+        Instr::Move {
+            src: typed_x,
+            dst: Operand::X(1),
+        },
+        // Y source and/or destination, plain and `Typed`: lowered AND a window read.
+        Instr::Move {
+            src: Operand::X(0),
+            dst: Operand::Y(0),
+        },
+        Instr::Move {
+            src: Operand::Integer(1),
+            dst: Operand::Y(0),
+        },
+        Instr::Move {
+            src: Operand::Y(0),
+            dst: Operand::X(0),
+        },
+        Instr::Move {
+            src: Operand::Y(0),
+            dst: Operand::Y(1),
+        },
+        Instr::Move {
+            src: typed_y.clone(),
+            dst: Operand::X(0),
+        },
+        Instr::Move {
+            src: Operand::X(0),
+            dst: typed_y.clone(),
+        },
+        // refused shapes: an out-of-bound register or Y index (`fr`/literal operands
+        // cannot even be spelled), so the whole instruction deopts.
+        Instr::Move {
+            src: Operand::X(MAX_REGISTER),
+            dst: Operand::X(0),
+        },
+        Instr::Move {
+            src: Operand::X(0),
+            dst: Operand::X(MAX_REGISTER),
+        },
+        Instr::Move {
+            src: Operand::Y(u32::MAX),
+            dst: Operand::X(0),
+        },
+        Instr::Move {
+            src: Operand::X(0),
+            dst: Operand::Y(u32::MAX),
+        },
+    ];
+
+    for instr in &moves {
+        let Instr::Move { src, dst } = instr else {
+            unreachable!("the table holds only moves")
+        };
+        let shape = move_shape(src, dst);
+        let claimed_reads_y = shape.as_ref().map_or(false, MoveShape::uses_y);
+        // The operand-level restatement of the same predicate: the shape is claimed and
+        // one of its two sides is an addressable Y slot. The inliner claims exactly the
+        // shapes `move_shape` accepts (it refuses nothing else), so the three must agree.
+        let in_bound_y =
+            |operand: &Operand| matches!(y_register(operand), Some(k) if y_addressable(k));
+        let expected = shape.is_some() && (in_bound_y(src) || in_bound_y(dst));
+        assert_eq!(claimed_reads_y, expected, "{src:?} -> {dst:?}");
+        assert_eq!(
+            uses_y(&module, instr),
+            expected,
+            "the Y gate must match the inliner for {src:?} -> {dst:?}"
+        );
+    }
+
+    // An x-only move is still charged its x-registers, and a Y slot never is.
+    let y_only = Instr::Move {
+        src: Operand::Y(0),
+        dst: Operand::Y(1),
+    };
+    let Instr::Move { src, dst } = &y_only else {
+        unreachable!()
+    };
+    assert!(move_shape(src, dst).expect("Y->Y lowers").registers().is_empty());
+}
+
+/// A block whose inlined Y moves follow an in-block helper call is covered by the
+/// compile-time gate: `y_last` names the last Y access, so the helper's deopt arm
+/// (`Allocate`, which may reallocate `machine.stack`) re-publishes the window
+/// (`refresh_y_after`) before the move reads it.
+#[test]
+fn the_y_window_gate_covers_the_inlined_y_moves() {
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Label(Label(2)),
+        Instr::Allocate {
+            stack_need: beam_loader::HeapNeed::Words(2),
+            live: 0,
+        },
+        Instr::Move {
+            src: Operand::Integer(7),
+            dst: Operand::Y(0),
+        },
+        Instr::Move {
+            src: Operand::Y(0),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let module = build_module(
+        "yslot_move_gate",
+        &[],
+        vec![("f", 0, code)],
+        &[("f", 0, Label(2))],
+    );
+    let code = &module.functions[0].code;
+    let allocation = allocate_registers(&module, code, 1, code.len());
+    assert_eq!(
+        allocation.y_last,
+        Some(4),
+        "the block's last Y access is the Y-source move at pc 4"
+    );
+    assert!(
+        allocation.refresh_y_after(3),
+        "the Y-destination move's own fallback is followed by the Y-source move"
+    );
+    assert!(
+        !allocation.refresh_y_after(4),
+        "nothing follows the last Y access, so its own fallback refreshes nothing"
+    );
+
+    let labels = crate::interpreter::build_label_map(&module);
+    let function = compile_function(&module, &labels, 0).expect("f/0 compiles");
+    assert!(
+        code_contains_helper(&function, jit_publish_y as *const ()),
+        "a block with an inlined Y move publishes the window from its prologue"
+    );
+    assert!(
+        code_contains_helper(&function, jit_refresh_y as *const ()),
+        "the `allocate` deopt re-publishes the window before the Y move reads it"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// the Y-window publication is gated at compile time
+// ---------------------------------------------------------------------------
 /// Whether the function's sealed machine code contains a `movabs r11, <helper>`
 /// immediate — the `49 BB <imm64>` shape every helper call emits (the same probe
 /// `the_compiled_block_wires_the_ext_call_helper_into_native_code` uses).

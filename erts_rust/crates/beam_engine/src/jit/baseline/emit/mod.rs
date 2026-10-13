@@ -138,11 +138,13 @@ use test::try_inline_test;
 // submodules changed no item path. Only the tests use them, hence `cfg(test)`.
 #[cfg(test)]
 pub(crate) use arith::{
-    fast_arith, FastDest, SmallArith, FAST_A, FAST_B, FAST_C, FAST_R, FAST_T, MAX_SMALL_WORD,
-    MIN_SMALL_WORD, SMALL_MASK, SMALL_SHIFT, SMALL_TAG,
+    fast_arith, uses_y, FastDest, SmallArith, FAST_A, FAST_B, FAST_C, FAST_R, FAST_T,
+    MAX_SMALL_WORD, MIN_SMALL_WORD, SMALL_MASK, SMALL_SHIFT, SMALL_TAG,
 };
 #[cfg(test)]
-pub(crate) use operands::{constant_word, x_register};
+pub(crate) use operands::{constant_word, x_register, y_addressable, y_register};
+#[cfg(test)]
+pub(crate) use r#move::{move_shape, MoveShape};
 pub(crate) use regalloc::allocate_registers;
 
 // ---------------------------------------------------------------------------
@@ -901,7 +903,16 @@ fn emit_block(
             | Instr::ExecutableLine { .. }
             | Instr::DebugLine { .. } => {}
             Instr::Move { src, dst } => {
-                if !try_inline_move(buffer, src, dst, allocation, highest_touched)? {
+                if !try_inline_move(
+                    buffer,
+                    src,
+                    dst,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? {
                     emit_step_and_continue(buffer, done, allocation, func, pc)?;
                 }
             }

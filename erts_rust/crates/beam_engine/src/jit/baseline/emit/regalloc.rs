@@ -39,7 +39,8 @@ use super::aggregate::{
 };
 use super::arith::{fast_arith, uses_y};
 use super::compare::comparison_shape;
-use super::operands::{constant_word, x_register};
+use super::r#move::move_shape;
+use super::operands::x_register;
 use super::select::select_val_plan;
 use super::test::{test_plan, TestSrc};
 use super::{Allocation, CACHE_REGISTERS};
@@ -167,27 +168,14 @@ fn cacheable_touches(
     let mut touches = Vec::new();
     match instr {
         Instr::Move { src, dst } => {
-            let Some(dst_x) = x_register(dst) else {
-                return touches;
-            };
-            if dst_x >= MAX_REGISTER {
-                return touches;
+            // Charged exactly the x-register operands of the shape
+            // [`super::r#move::try_inline_move`] lowers. A `Y` source or `Y` destination is
+            // a stack slot, **not** an x-register, so it is never charged: a spurious
+            // entry would both evict a real x-register from the cache and raise the
+            // x-register bound the driver's native-entry guard reads.
+            if let Some(shape) = move_shape(src, dst) {
+                touches.extend(shape.registers());
             }
-            match x_register(src) {
-                Some(src_x) => {
-                    if src_x >= MAX_REGISTER {
-                        return touches;
-                    }
-                    touches.push(src_x);
-                }
-                // A non-register source must be a constant word, else the move deopts.
-                None => {
-                    if constant_word(src).is_none() {
-                        return touches;
-                    }
-                }
-            }
-            touches.push(dst_x);
         }
         Instr::Swap { a, b } => {
             let (Some(a_x), Some(b_x)) = (x_register(a), x_register(b)) else {

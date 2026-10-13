@@ -28,9 +28,12 @@ use beam_term::{MAX_SMALL, MIN_SMALL, TAG_IMMED1_MASK, TAG_IMMED1_SIZE, TAG_IMME
 use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg};
 use crate::machine::MAX_REGISTER;
 
-use super::operands::{constant_word, x_offset, x_register, y_addressable, y_offset, y_register};
-use super::{emit_step_and_continue, touch, Allocation, RUNTIME_SLOT_DISP};
-use super::super::runtime::{RUNTIME_YBASE_DISP, RUNTIME_YEND_DISP};
+use super::operands::{
+    constant_word, emit_guarded_y_load, emit_guarded_y_store, x_offset, x_register, y_addressable,
+    y_register,
+};
+use super::r#move::move_shape;
+use super::{emit_step_and_continue, touch, Allocation};
 // ---------------------------------------------------------------------------
 // The small-int arithmetic fast path
 // ---------------------------------------------------------------------------
@@ -215,12 +218,19 @@ impl FastArith<'_> {
 /// Whether lowering `instr` would read the current frame's Y window — the emitter's
 /// per-instruction Y gate ([`super::Allocation::y_last`]).
 ///
-/// Exact for the current emitter: it is [`fast_arith`]'s companion, and the arith fast
-/// path is the only lowering that reads the window (see [`FastArith::uses_y`]). Gate
-/// conservatively at the call site — a block whose code contains any such instruction
-/// publishes the window in its prologue, and refreshes it after an in-block helper call
-/// when one still follows.
-pub(super) fn uses_y(module: &Module, instr: &Instr) -> bool {
+/// True exactly for the two lowerings that read the window: the arithmetic fast path
+/// ([`FastArith::uses_y`], for a `Y` operand or `Y` destination `gc_bif`) and a `move`
+/// whose inlined shape has a `Y` source or `Y` destination ([`move_shape`] +
+/// [`super::r#move::MoveShape::uses_y`]). MUST stay in exact agreement with the inliners: a `move`
+/// shape the move inliner **refuses** deopts and reads nothing, so it must be false
+/// here too, or a later in-block Y access would use a window published before a
+/// `machine.stack` reallocation. Gate conservatively at the call site — a block whose
+/// code contains any such instruction publishes the window in its prologue, and
+/// refreshes it after an in-block helper call when one still follows.
+pub(crate) fn uses_y(module: &Module, instr: &Instr) -> bool {
+    if let Instr::Move { src, dst } = instr {
+        return move_shape(src, dst).map_or(false, |shape| shape.uses_y());
+    }
     fast_arith(module, instr).map_or(false, |fast| fast.uses_y())
 }
 
@@ -347,6 +357,12 @@ fn fast_source(operand: &Operand, allocation: &Allocation) -> Option<FastSource>
 ///
 /// The Y branch is the only one that can transfer control at run time: every other
 /// source is a compile-time-addressable x-register slot or an immediate.
+///
+/// The Y-slot guard itself is the shared [`emit_guarded_y_load`]: `reg` receives the
+/// slot's word and [`FAST_C`] is its window-bound scratch (caller-saved and dead at
+/// operand-load time — the mask constant is loaded into it only **after** both operands
+/// are loaded). See that helper for the exact emitted sequence and why the guard can
+/// only ever reject.
 fn load_into(
     buffer: &mut CodeBuffer,
     source: FastSource,
@@ -360,77 +376,22 @@ fn load_into(
             touch(highest_touched, x);
             buffer.mov_rm(reg, Reg::Rbx, x_offset(x))
         }
-        FastSource::YSlot(k) => emit_y_load(buffer, reg, k, fallback),
+        FastSource::YSlot(k) => emit_guarded_y_load(buffer, reg, FAST_C, k, fallback),
         FastSource::Constant(word) => buffer.mov_ri(reg, word),
     }
-}
-
-/// Emit a **guarded** read of Y slot `k` into `reg`, jumping to `fallback` when the
-/// slot lies outside the current frame's Y window.
-///
-/// ```text
-///   mov  reg,      [rsp + RUNTIME_SLOT_DISP]   ; rt (the block's own stack slot)
-///   mov  FAST_C,   [reg + RUNTIME_YEND_DISP]   ; y_end
-///   mov  reg,      [reg + RUNTIME_YBASE_DISP]  ; y_base
-///   lea  FAST_R,   [reg + k*8]                 ; the slot address
-///   cmp  FAST_R,   FAST_C
-///   jae  fallback                              ; slot >= y_end -> outside the frame
-///   mov  reg,      [FAST_R]
-/// ```
-///
-/// Registers are safe: `reg` is [`FAST_A`] or [`FAST_B`] (the operand scratch the
-/// caller is filling), and the two temporaries [`FAST_C`]/[`FAST_R`] are
-/// caller-saved and dead at operand-load time — the mask constant is loaded into
-/// [`FAST_C`] only **after** both operands are loaded, and the result register
-/// [`FAST_R`] is written only much later. Reloading `rt` out of the block's own stack
-/// slot (`[rsp + RUNTIME_SLOT_DISP]`) is the established idiom
-/// ([`super::emit_helper_call`] does the same for every helper call).
-///
-/// The guard is a pure rejection: the fallback is the caller's `jit_step_one` path,
-/// which runs the instruction in the interpreter and reports exactly its own
-/// value/error. `y_base == y_end == null` (no live frame) rejects every slot, so the
-/// emitted `lea` result is never dereferenced out of frame.
-fn emit_y_load(
-    buffer: &mut CodeBuffer,
-    reg: Reg,
-    k: u32,
-    fallback: CodeLabel,
-) -> Result<()> {
-    buffer.mov_rm(reg, Reg::Rsp, RUNTIME_SLOT_DISP)?;
-    buffer.mov_rm(FAST_C, reg, RUNTIME_YEND_DISP)?;
-    buffer.mov_rm(reg, reg, RUNTIME_YBASE_DISP)?;
-    buffer.lea(FAST_R, reg, y_offset(k))?;
-    buffer.cmp_rr(FAST_R, FAST_C)?;
-    buffer.jcc(Cond::Ae, fallback)?;
-    buffer.mov_rm(reg, FAST_R, 0)
 }
 
 /// Emit the **guarded** store of the fast path's result (`FAST_R`) into Y slot `k`,
 /// jumping to `fallback` when the slot lies outside the current frame's Y window.
 ///
-/// ```text
-///   mov  FAST_C, [rsp + RUNTIME_SLOT_DISP]   ; rt
-///   mov  FAST_A, [FAST_C + RUNTIME_YBASE_DISP] ; y_base
-///   mov  FAST_C, [FAST_C + RUNTIME_YEND_DISP]  ; y_end
-///   lea  FAST_A, [FAST_A + k*8]              ; the slot address
-///   cmp  FAST_A, FAST_C
-///   jae  fallback                            ; outside the frame
-///   mov  [FAST_A], FAST_R
-/// ```
-///
-/// Emitted only after the arithmetic is complete, so [`FAST_A`] (an operand scratch)
-/// and [`FAST_C`] are dead; the value being stored lives in [`FAST_R`]. A rejection
-/// falls back to `jit_step_one`, which re-runs the **whole** instruction in the
-/// interpreter — nothing has been committed to the machine before this store, so the
+/// The store is the shared [`emit_guarded_y_store`]: [`FAST_A`] holds the slot address
+/// and [`FAST_C`] the window bound. Both are dead when this runs (the arithmetic is
+/// complete), and the value being stored lives in [`FAST_R`] — so the three are distinct.
+/// A rejection falls back to `jit_step_one`, which re-runs the **whole** instruction in
+/// the interpreter — nothing has been committed to the machine before this store, so the
 /// interpreter sees exactly the state it would have seen.
 fn emit_y_store(buffer: &mut CodeBuffer, k: u32, fallback: CodeLabel) -> Result<()> {
-    buffer.mov_rm(FAST_C, Reg::Rsp, RUNTIME_SLOT_DISP)?;
-    buffer.mov_rm(FAST_A, FAST_C, RUNTIME_YBASE_DISP)?;
-    buffer.mov_rm(FAST_C, FAST_C, RUNTIME_YEND_DISP)?;
-    buffer.lea(FAST_A, FAST_A, y_offset(k))?;
-    buffer.cmp_rr(FAST_A, FAST_C)?;
-    buffer.jcc(Cond::Ae, fallback)?;
-    buffer.mov_mr(FAST_A, 0, FAST_R)
+    emit_guarded_y_store(buffer, FAST_R, FAST_A, FAST_C, k, fallback)
 }
 
 /// Lower a fast-path-eligible `gc_bif` natively, or report that the block must

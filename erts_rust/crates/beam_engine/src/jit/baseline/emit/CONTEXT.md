@@ -38,7 +38,7 @@ group's `try_inline_*`; **`Ok(false)` means "lowered nothing"** and the arm then
 | Group | Instr(s) | Lowering entry | Shape/guard predicate |
 |---|---|---|---|
 | Metadata no-ops | `Label`,`Line`,`IntCodeEnd`,`ExecutableLine`,`DebugLine` | `mod.rs` empty arm (no bytes) | n/a |
-| Move / swap | `Move`, `Swap` | `r#move.rs::try_inline_move`, `::try_inline_swap` | dst must be in-bound `X(n)` (a `Y` destination is **not** a lowered shape — the move deopts) |
+| Move / swap | `Move`, `Swap` | `r#move.rs::try_inline_move`, `::try_inline_swap` | `r#move.rs::move_shape`: source = in-bound `X(n)`, in-bound **`Y` slot**, or a constant word; destination = in-bound `X(n)` or an in-bound **`Y` slot** (a `Y` side carries a run-time frame-window guard). `Swap` needs two in-bound `X(n)` operands |
 | Test (word + boxed header) | `Test` | `test.rs::try_inline_test` | `test.rs::test_plan` |
 | Switch | `SelectVal` | `select.rs::try_inline_select_val` | `select.rs::select_val_plan` |
 | Arity switch | `SelectTupleArity` | `aggregate.rs::try_inline_select_tuple_arity` | `aggregate.rs::select_tuple_arity_plan` |
