@@ -469,6 +469,7 @@ fn iolist_bytes(term: Eterm, out: &mut Vec<u8>, top_level: bool) -> Result<()> {
 mod tests {
     use super::*;
     use crate::native::test_support::{atom, call, chars, runtime};
+    use crate::port::driver::BusyFlag;
     use crate::runtime::Runtime;
     use beam_bifs::NullSink;
     use beam_term::{make_small, NIL};
@@ -763,15 +764,16 @@ mod tests {
             &mut runtime,
             "erlang",
             "port_command",
-            &[port.to_eterm(), data, list_of(&mut runtime, &[nosuspend])],
+            &[port.to_eterm(), data, nosuspend_only],
         )
         .expect("`nosuspend` on an idle port is a no-op");
         assert_eq!(runtime.atom_name_of(answer), Some("true"));
+        let force_only = list_of(&mut runtime, &[force]);
         let error = call(
             &mut runtime,
             "erlang",
             "port_command",
-            &[port.to_eterm(), data, list_of(&mut runtime, &[force])],
+            &[port.to_eterm(), data, force_only],
         )
         .expect_err("`force` still needs SOFT_BUSY on an idle port");
         assert_eq!(raise_atom(&error), "notsup", "{error}");
@@ -802,21 +804,23 @@ mod tests {
         }
         // Busy + `[nosuspend]` (no `force`) is still the atom `false` — `SOFT_BUSY` only widens the
         // `force` arm.
+        let nosuspend_only = list_of(&mut runtime, &[nosuspend]);
         let answer = call(
             &mut runtime,
             "erlang",
             "port_command",
-            &[port.to_eterm(), data, list_of(&mut runtime, &[nosuspend])],
+            &[port.to_eterm(), data, nosuspend_only],
         )
         .expect("nosuspend answers false");
         assert_eq!(runtime.atom_name_of(answer), Some("false"));
         // Idle + `[force]` ⇒ `true`.
         flag.set_busy(false);
+        let force_only = list_of(&mut runtime, &[force]);
         let answer = call(
             &mut runtime,
             "erlang",
             "port_command",
-            &[port.to_eterm(), data, list_of(&mut runtime, &[force])],
+            &[port.to_eterm(), data, force_only],
         )
         .expect("`force` on an idle SOFT_BUSY port is the plain write");
         assert_eq!(runtime.atom_name_of(answer), Some("true"));
@@ -832,30 +836,26 @@ mod tests {
         let not_iodata = make_small(42);
         // Busy, no `SOFT_BUSY`: `[nosuspend]` ⇒ `false`, not `badarg`.
         let (port, _flag) = busy_port(&mut runtime, true, false);
+        let nosuspend = atom(&mut runtime, "nosuspend");
+        let nosuspend_only = list_of(&mut runtime, &[nosuspend]);
         let answer = call(
             &mut runtime,
             "erlang",
             "port_command",
-            &[
-                port.to_eterm(),
-                not_iodata,
-                list_of(&mut runtime, &[atom(&mut runtime, "nosuspend")]),
-            ],
+            &[port.to_eterm(), not_iodata, nosuspend_only],
         )
         .expect("the busy arm precedes the iodata conversion");
         assert_eq!(runtime.atom_name_of(answer), Some("false"));
         // Busy, `SOFT_BUSY`: `[force]` bypasses the busy arm, so the bad iodata really is `badarg`.
         let (port, _flag) = busy_port(&mut runtime, true, true);
+        let force = atom(&mut runtime, "force");
+        let force_only = list_of(&mut runtime, &[force]);
         assert!(matches!(
             call(
                 &mut runtime,
                 "erlang",
                 "port_command",
-                &[
-                    port.to_eterm(),
-                    not_iodata,
-                    list_of(&mut runtime, &[atom(&mut runtime, "force")])
-                ]
+                &[port.to_eterm(), not_iodata, force_only]
             ),
             Err(BeamError::BadArg)
         ));
@@ -872,14 +872,16 @@ mod tests {
         let nosuspend = context.atom("nosuspend").expect("an atom");
         let bogus = context.atom("bogus").expect("an atom");
         let list = |context: &mut RuntimeContext<'_>, elements: &[Eterm]| {
-            terms::make_list(&mut **context, elements).expect("a list")
+            terms::make_list(&mut *context, elements).expect("a list")
         };
+        let options = list(&mut context, &[force, nosuspend]);
         let parsed = context
-            .port_command_options(list(&mut context, &[force, nosuspend]))
+            .port_command_options(options)
             .expect("both atoms are recognized");
         assert!(parsed.force && parsed.nosuspend);
+        let options = list(&mut context, &[nosuspend]);
         let parsed = context
-            .port_command_options(list(&mut context, &[nosuspend]))
+            .port_command_options(options)
             .expect("`nosuspend` alone is recognized");
         assert!(!parsed.force && parsed.nosuspend);
         // An empty list leaves both unset (the `/2` shape).
@@ -888,8 +890,9 @@ mod tests {
             .expect("[] is a valid option container");
         assert!(!parsed.force && !parsed.nosuspend);
         // An unknown atom is still `badarg`.
+        let options = list(&mut context, &[bogus]);
         assert!(matches!(
-            context.port_command_options(list(&mut context, &[bogus])),
+            context.port_command_options(options),
             Err(BeamError::BadArg)
         ));
     }
