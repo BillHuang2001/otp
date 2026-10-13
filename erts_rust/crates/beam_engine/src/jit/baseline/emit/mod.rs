@@ -274,7 +274,15 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
     }
 
     buffer.seal()?;
-    Ok(CompiledModule::eager(buffer, entries, summary, labels))
+    // The artifact records the module's content fingerprint (computed here once, at
+    // creation) so the cross-run cache can identify it without re-hashing the IR.
+    Ok(CompiledModule::eager(
+        buffer,
+        entries,
+        summary,
+        labels,
+        crate::jit::cache::module_fingerprint(module),
+    ))
 }
 
 /// Lower **one** function of `module` into its own native artifact.
