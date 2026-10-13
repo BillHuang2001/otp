@@ -679,11 +679,6 @@ and derives the report from that observed state.
   would once a caller supplies such a policy. The seam also cannot *continue* on a non-`ok` status:
   `named` (dynamic node names) and `ok_simultaneous` are continuations with no `AcceptDecision`
   representation (and this crate has no dynamic-name support).
-- **Two independent server handshake implementations; only one is live-tested.** The blocking
-  `connection::accept_server_core` and the non-blocking `driver::ConnectionDriver` server states each
-  implement the accept handshake separately; `tests/live_accept.rs` drives only the driver against a real
-  `erl` peer, so the blocking path's parity with real OTP is pinned only hermetically
-  (`tests/connection.rs`).
 - **Consumed by `beam_rt` for the ACCEPTING half only.** `beam_rt/src/dist.rs` (`DistNode`, driven from
   `runtime/scheduler.rs::pump_dist`) derives the node name from `-name`/`-sname` (`NodeName`), registers
   with `epmd` (`ALIVE2_REQ`), binds a listener and completes the `'N'` handshake as **server** via this
