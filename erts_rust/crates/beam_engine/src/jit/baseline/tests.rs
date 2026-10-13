@@ -2392,3 +2392,132 @@ fn the_compiled_block_wires_the_ext_call_helper_into_native_code() {
          emit arm did not wire the native `call_ext*` helper"
     );
 }
+
+// ---------------------------------------------------------------------------
+// the artifact owns the module-wide label map
+// ---------------------------------------------------------------------------
+
+/// The compiled artifact **owns** the module-wide label map, so a run of it resolves
+/// its entry label and imports against that one map instead of rebuilding a per-module
+/// value on every run.
+///
+/// Before this, the native driver called [`interpreter::build_label_map`] again on
+/// every `run_compiled`/`run_compiled_outcome` (in `enter_machine`) **and** on every
+/// resume (in `run_compiled_resume_outcome`) — a whole traversal of the module's
+/// per-function `BTreeMap` label tables — even though the map is a property of the
+/// (immutable) module the artifact was compiled from. It is now built once, when the
+/// artifact is created: at `compile_module` for the eager layout,
+/// [`CompiledModule::lazy`] for the lazy one, and the driver reuses it through
+/// [`NativeCode::labels`].
+///
+/// The counter is thread-local, so it sees only this test's own builds. The one build
+/// still attributable to a run is the export-entry resolution
+/// (`interpreter::resolve_label`, out of this crate-node's scope) — the assertion is
+/// therefore "at most one per run, never two", which is exactly what distinguishes the
+/// driver's map reuse from the old double build.
+#[test]
+fn runs_reuse_the_artifacts_label_map_instead_of_rebuilding_it() {
+    // `label; label; move 7 -> x0; return`, exported as `f/0`: every run returns 7.
+    let (module, name) = exported_module(
+        "f",
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Label(Label(2)),
+            Instr::Move {
+                src: Operand::Integer(7),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ],
+    );
+
+    crate::interpreter::reset_label_map_builds();
+    // The eager artifact stores the module-wide map it built at compile time.
+    let compiled = compile_module(&module).expect("the module compiles");
+    let built_at_compilation = crate::interpreter::label_map_builds();
+    assert!(
+        built_at_compilation >= 1,
+        "the eager artifact holds a module-wide label map built at compile time, got \
+         {built_at_compilation}"
+    );
+
+    // One exported run.
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::new();
+    let value = run_compiled(&compiled, &mut machine, &module, name, 0, &[], &mut ctx)
+        .expect("the exported run returns");
+    assert_eq!(value, make_small(7), "the exported run returns the moved x(0)");
+    let built_by_one_run = crate::interpreter::label_map_builds() - built_at_compilation;
+    assert!(
+        built_by_one_run <= 1,
+        "a run of an artifact that holds its own label map must NOT rebuild it in the \
+         driver: this run built {built_by_one_run} maps, and two would mean the \
+         driver's per-run build is back"
+    );
+
+    // Two more runs: the per-run cost is a constant, so nothing accumulates.
+    for run in 1..3 {
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        let value = run_compiled(&compiled, &mut machine, &module, name, 0, &[], &mut ctx)
+            .expect("the exported run returns");
+        assert_eq!(value, make_small(7), "run {run} returns the moved x(0)");
+    }
+    assert_eq!(
+        crate::interpreter::label_map_builds() - built_at_compilation,
+        3 * built_by_one_run,
+        "every run of one eager artifact builds the same number of maps: the driver \
+         adds none of its own"
+    );
+
+    // The label-addressed entry resolves against the run's map, so on top of the
+    // export-path constant it adds nothing at all.
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::new();
+    let outcome = run_compiled_label_outcome(
+        &compiled,
+        &mut machine,
+        &module,
+        Label(2),
+        0,
+        &[],
+        &mut ctx,
+    )
+    .expect("the label run returns");
+    assert_eq!(outcome, RunOutcome::Returned(make_small(7)));
+    assert_eq!(
+        crate::interpreter::label_map_builds() - built_at_compilation,
+        3 * built_by_one_run,
+        "the label-addressed entry builds no map: it resolves against the artifact's"
+    );
+
+    // The lazy artifact builds exactly one map, at creation.
+    let lazy = CompiledModule::lazy(&module);
+    assert_eq!(
+        crate::interpreter::label_map_builds() - built_at_compilation,
+        3 * built_by_one_run + 1,
+        "CompiledModule::lazy builds exactly one map, at creation"
+    );
+
+    // Its first entry compiles the function (a one-time cost); every run after that
+    // still pays only the export-path constant, never a second map.
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::new();
+    let value = run_compiled(&lazy, &mut machine, &module, name, 0, &[], &mut ctx)
+        .expect("the lazy artifact's first entry compiles the function and returns");
+    assert_eq!(value, make_small(7));
+    let after_first_entry = crate::interpreter::label_map_builds();
+
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::new();
+    let value = run_compiled(&lazy, &mut machine, &module, name, 0, &[], &mut ctx)
+        .expect("the second lazy run returns");
+    assert_eq!(value, make_small(7));
+    assert_eq!(
+        crate::interpreter::label_map_builds() - after_first_entry,
+        built_by_one_run,
+        "a lazy run whose function is already compiled costs the same per-run constant \
+         as an eager one (the driver rebuilds nothing, and the lazy artifact's map is \
+         the one built at creation)"
+    );
+}

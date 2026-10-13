@@ -69,6 +69,15 @@ use super::emit::compile_function;
 /// An entry is a raw pointer into a sealed executable mapping, so a `CompiledModule`
 /// must outlive every call into it and is neither `Send` nor `Sync`.
 pub struct CompiledModule {
+    /// The module-wide label map, built **once** at artifact creation.
+    ///
+    /// Every driver run resolves its labels/imports against it, so storing it here
+    /// removes a per-run [`build_label_map`](crate::interpreter::build_label_map) — a
+    /// per-module value does not need rebuilding for each run of the same artifact (the
+    /// lazy layout already built one per compile, and the eager layout one per
+    /// `compile_module`). `Module` is immutable once loaded, so the map is valid for
+    /// the artifact's whole life.
+    labels: crate::interpreter::LabelMap,
     /// Which compilation layout this artifact has (see the module docs).
     layout: Layout,
 }
@@ -95,11 +104,6 @@ struct EagerLayout {
 
 /// The lazy layout: one sealed mapping per compiled function, filled on first entry.
 struct LazyLayout {
-    /// The module-wide label map, built once: every on-demand function compilation
-    /// resolves its `jump`/`call_last`/`call_only` targets against it. It is a
-    /// per-module value, not per function, so it is built once here rather than per
-    /// compile.
-    labels: crate::interpreter::LabelMap,
     /// One slot per module function, filled by the first entry into that function.
     ///
     /// `RefCell` because compile-on-entry happens through [`CompiledModule::native_entry`],
@@ -173,8 +177,10 @@ impl CompiledModule {
         buffer: CodeBuffer,
         entries: Vec<Vec<Option<*const u8>>>,
         summary: Summary,
+        labels: crate::interpreter::LabelMap,
     ) -> CompiledModule {
         CompiledModule {
+            labels,
             layout: Layout::Eager(EagerLayout {
                 buffer,
                 entries,
@@ -186,14 +192,23 @@ impl CompiledModule {
     /// The **lazy** artifact for `module`: nothing compiled yet, one slot per function.
     ///
     /// The module-wide label map is built here (once) so each on-demand function
-    /// compilation can resolve its targets without re-scanning the module.
+    /// compilation can resolve its targets — and so every driver run of the artifact
+    /// can reuse it — without re-scanning the module.
     pub(crate) fn lazy(module: &Module) -> CompiledModule {
         CompiledModule {
+            labels: crate::interpreter::build_label_map(module),
             layout: Layout::Lazy(LazyLayout {
-                labels: crate::interpreter::build_label_map(module),
                 functions: RefCell::new(vec![None; module.functions.len()]),
             }),
         }
+    }
+
+    /// The module-wide label map this artifact holds, built once at creation.
+    ///
+    /// The native driver resolves a run's entry label and every import through it
+    /// instead of rebuilding one per run (see [`super::NativeCode::labels`]).
+    pub(crate) fn labels(&self) -> &crate::interpreter::LabelMap {
+        &self.labels
     }
 
     /// The native entry point of the block starting at `(func, pc)`, if it is already
@@ -276,7 +291,7 @@ impl CompiledModule {
         // First entry into this function: lower it once and keep the artifact. Codegen
         // never calls back into the host, so the compile cannot re-enter this store;
         // the `is_none` re-check below only guards against a future change that would.
-        let compiled = Rc::new(compile_function(module, &lazy.labels, func).ok()?);
+        let compiled = Rc::new(compile_function(module, &self.labels, func).ok()?);
         let mut functions = lazy.functions.borrow_mut();
         let slot = functions.get_mut(func as usize)?;
         if slot.is_none() {

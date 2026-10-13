@@ -274,7 +274,7 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
     }
 
     buffer.seal()?;
-    Ok(CompiledModule::eager(buffer, entries, summary))
+    Ok(CompiledModule::eager(buffer, entries, summary, labels))
 }
 
 /// Lower **one** function of `module` into its own native artifact.

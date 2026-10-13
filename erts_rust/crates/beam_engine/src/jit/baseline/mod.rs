@@ -250,6 +250,18 @@ pub(crate) trait NativeCode {
         let _ = module;
         None
     }
+
+    /// The module-wide label map this tier already holds for `module`, if any.
+    ///
+    /// A compiled artifact owns the label map it was built with
+    /// ([`CompiledModule::labels`]), so a driver run of it resolves its entry label and
+    /// every import against that one instead of rebuilding a per-module value on every
+    /// run. The **default is `None`** ("I hold none"), so an implementor that predates
+    /// this method keeps the documented per-run build and stays byte-identical.
+    fn labels(&self, module: &Module) -> Option<&interpreter::LabelMap> {
+        let _ = module;
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -428,7 +440,9 @@ pub(crate) fn run_compiled_resume_outcome(
     // as `Machine::drive` does for the interpreter's resume (`run_loop` -> `drive`).
     machine.reset_reductions();
     machine.enter_run(module, func);
-    let labels = interpreter::build_label_map(module);
+    // The artifact already holds the module-wide label map (built once at creation),
+    // so a resume reuses it instead of rebuilding it per resume.
+    let labels = compiled.labels();
     let code = block_entries(compiled);
     drive(machine, module, labels, func, pc, ctx, &code)
 }
@@ -466,6 +480,12 @@ impl NativeCode for BlockEntries<'_> {
     /// than aborting the run.
     fn module_blocks(&self, module: &Arc<Module>) -> Option<Rc<CompiledModule>> {
         crate::jit::cache::cached_module_blocks(module)
+    }
+
+    /// The artifact's own label map, built once at compilation: a run of `compiled`
+    /// resolves its labels/imports through it instead of rebuilding one per run.
+    fn labels(&self, _module: &Module) -> Option<&interpreter::LabelMap> {
+        Some(self.compiled.labels())
     }
 }
 
@@ -512,15 +532,44 @@ fn enter_compiled(
     Some(block(rt))
 }
 
+/// The module-wide label map a driver run resolves labels/imports through: the tier's
+/// own (built once with the artifact) when it holds one, else a fresh build.
+///
+/// `Deref`s to [`LabelMap`], so a driver call site passes it exactly as it passed the
+/// by-value map before ([`drive`] takes `&LabelMap`, [`interpreter::resolve`] too).
+pub(crate) enum RunLabels<'a> {
+    /// The map the tier's artifact already holds ([`NativeCode::labels`]): reused, so
+    /// the run pays no per-run build.
+    Stored(&'a interpreter::LabelMap),
+    /// The per-run map the driver built because the tier holds none.
+    Built(interpreter::LabelMap),
+}
+
+impl std::ops::Deref for RunLabels<'_> {
+    type Target = interpreter::LabelMap;
+    fn deref(&self) -> &interpreter::LabelMap {
+        match self {
+            RunLabels::Stored(map) => map,
+            RunLabels::Built(map) => map,
+        }
+    }
+}
+
 /// Reset `machine`, seed `x[0..arity)` from `args`, push the bottom frame, bind the
-/// module's literal area and build the module-wide label map — the setup both driver
+/// module's literal area and bind the module-wide label map — the setup both driver
 /// entry points share (it mirrors [`Machine::run_label`](crate::Machine)).
-fn enter_machine(
+///
+/// The label map is **reused** from the tier's artifact when it holds one
+/// ([`NativeCode::labels`], i.e. the compiled map) and built here only otherwise: it is
+/// a per-module value, so rebuilding it on every run of the same artifact is pure
+/// per-run overhead.
+fn enter_machine<'a>(
     machine: &mut Machine,
     module: &Module,
     arity: u32,
     args: &[Eterm],
-) -> Result<interpreter::LabelMap> {
+    code: &'a dyn NativeCode,
+) -> Result<RunLabels<'a>> {
     machine.reset();
     let n = arity.min(args.len() as u32);
     for (i, arg) in args.iter().take(n as usize).enumerate() {
@@ -528,7 +577,10 @@ fn enter_machine(
     }
     machine.push_frame(0)?;
     machine.set_literals(module.literals.clone());
-    Ok(interpreter::build_label_map(module))
+    Ok(match code.labels(module) {
+        Some(labels) => RunLabels::Stored(labels),
+        None => RunLabels::Built(interpreter::build_label_map(module)),
+    })
 }
 
 /// The driver loop both native tiers run on.
@@ -604,7 +656,7 @@ pub(crate) fn run_native_outcome(
         .export(function, arity)
         .ok_or_else(|| error::unsupported("jit: export not found"))?;
 
-    let labels = enter_machine(machine, module, arity, args)?;
+    let labels = enter_machine(machine, module, arity, args, code)?;
     let (func, pc) = interpreter::resolve_label(module, entry)?;
     // Record the run's entry call, exactly as every other run entry does
     // (`Machine::run_label_outcome`, `run_native_label_outcome`): without it the
@@ -612,7 +664,7 @@ pub(crate) fn run_native_outcome(
     // backing `process_info/2`'s `initial_call`/`current_function` — and report a
     // different run-entry position than the interpreter for the same module/export.
     machine.enter_run(module, func);
-    drive(machine, module, labels, func, pc, ctx, code)
+    drive(machine, module, &labels, func, pc, ctx, code)
 }
 
 /// The label-addressed outcome-aware driver loop.
@@ -631,10 +683,10 @@ pub(crate) fn run_native_label_outcome(
     ctx: &mut dyn ExecutionContext,
     code: &dyn NativeCode,
 ) -> Result<RunOutcome> {
-    let labels = enter_machine(machine, module, arity, args)?;
+    let labels = enter_machine(machine, module, arity, args, code)?;
     let (func, pc) = interpreter::resolve(&labels, label)?;
     machine.enter_run(module, func);
-    drive(machine, module, labels, func, pc, ctx, code)
+    drive(machine, module, &labels, func, pc, ctx, code)
 }
 
 /// One non-entry module context the native driver has entered, with its compiled
@@ -775,7 +827,7 @@ fn switch_into(
 fn drive(
     machine: &mut Machine,
     module: &Module,
-    labels: interpreter::LabelMap,
+    labels: &interpreter::LabelMap,
     mut func: u32,
     mut pc: u32,
     ctx: &mut dyn ExecutionContext,
@@ -783,7 +835,7 @@ fn drive(
 ) -> Result<RunOutcome> {
     if ctx.trace_enabled() {
         machine.trace_on = true;
-        return machine.drive(module, Some(&labels), func, pc, ctx);
+        return machine.drive(module, Some(labels), func, pc, ctx);
     }
     // Latch the per-run tracing gate (see the `Machine::trace_on` field docs): the
     // deopt path's `step_instruction` reads the plain `bool`, so this single call
@@ -801,7 +853,7 @@ fn drive(
     let mut state = DriverContext {
         context: 0,
         module: module as *const Module,
-        labels: &labels as *const LabelMap,
+        labels: labels as *const LabelMap,
         callee_module: None,
         callees: Vec::new(),
         active: None,
@@ -814,7 +866,7 @@ fn drive(
             unsafe { &mut *machine_ptr },
             code,
             module,
-            &labels,
+            labels,
             &mut state,
             start_context,
         )?;
@@ -885,7 +937,7 @@ fn drive(
                     unsafe { &mut *machine_ptr },
                     code,
                     module,
-                    &labels,
+                    labels,
                     &mut state,
                     context,
                 )?;
@@ -961,7 +1013,7 @@ fn drive(
                     unsafe { &mut *machine_ptr },
                     code,
                     module,
-                    &labels,
+                    labels,
                     &mut state,
                     context,
                 )?;
