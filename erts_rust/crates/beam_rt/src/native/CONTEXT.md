@@ -45,7 +45,7 @@ Drift-guarded by `native.rs::tests::every_floor_module_is_a_real_try_native_arm`
 |---|---|
 | `../native.rs` (parent) | module docs, `try_native`, the shared helpers (`atom`/`atom_name`/`charlist`/`render`/`string_list`/`write_output`/`chars_to_string`), and the arms whose bodies live here: the `erlang` core (`halt/0,1,2`, `display/1`, `apply/2,3`, `system_info/1`, `send_after/3`, `cancel_timer/1`, `make_ref/0`, `pre_loaded/0`, `module_loaded/1`), `io:put_chars/1,2`, `os:cmd/1`, the `seq_trace`/`seq_trace_info`/`seq_trace_print`/`system_flag(reset_seq_trace)` family over `crate::seq_trace`, and the `trace`/`trace_info`/`trace_delivered`/`trace_pattern` family over `crate::trace` |
 | `init.rs` | `init:get_argument/1` (a command-line flag from `RuntimeConfig::init_args`, plus the four **automatic** flags `root`/`home`/`progname`/`bindir`), `get_arguments/0`, `get_plain_arguments/0`, `get_status/0`, `script_id/0`, `stop/0,1`, `restart/0`, `boot/1` |
-| `code.rs` | `code:get_path/0`, `all_loaded/0`, `which/1`, `is_loaded/1`, `is_sticky/1,2`, `ensure_loaded/1`, `load_file/1`, `lib_dir/0,1,2`, `priv_dir/1`, `root_dir/0`, `get_mode/0` |
+| `code.rs` | `code:get_path/0`, `all_loaded/0`, `which/1`, `get_object_code/1`, `is_loaded/1`, `is_sticky/1,2`, `ensure_loaded/1`, `load_file/1`, `lib_dir/0,1,2`, `priv_dir/1`, `root_dir/0`, `get_mode/0` |
 | `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) | `erlang:make_ref/0`, `spawn/1,2,3`, `spawn_link/1,2,3`, `spawn_opt/2,3,4`, `spawn_monitor/1,2,3,4`, `ports/0`, `processes/0`, `pre_loaded/0`, `group_leader/0`, `whereis/1`, `register/2`, `unregister/1`, `module_loaded/1`; the reference-alias family (`alias/0,1`, `unalias/1`); the monitor family (`monitor/2,3`, `demonitor/1,2`) in `process/monitor.rs`; `exit/2,3` in `process/exit.rs` |
 | `node.rs` | `erlang:is_alive/0`, `get_cookie/0`, `set_cookie/2` |
 | `net.rs` | `erlang:nodes/0,1`, `net_adm:ping/1`, `net_kernel:connect_node/1` |
@@ -94,10 +94,18 @@ init's receive loop) whereas this one returns after booting.
 for a name the code server does not know (`code.erl:978-980`).
 **`code:*` is the native floor, not a live `code_server`** — OTP's real `code_server.beam` needs
 facilities outside this crate, so `code.rs`'s behaviour must not change (see `../CONTEXT.md`).
-`code:is_loaded/1` and `code:which/1` report **path resolvability**, not the code server's load
-state — the deliberate divergence that keeps the `boot/code_is_loaded_*` corpus cases agreeing;
-never "fix" it.
-
+`code:which/1` is **path**-based, exactly as the oracle's `code.erl:1782-1789` is: it answers the
+**load state** first (the recorded file, or the atom `preloaded` from the registry) and then falls
+back to a code-path search, so an unloaded-but-findable module (`dets`) still has a path.
+`code:is_loaded/1` is **load-state**-based, exactly as the oracle's `code.erl:755` is: `false`
+unless the module is preloaded or really loaded here, and `{file, Beam}` (the `beam_location` shape)
+otherwise. The two therefore differ on an unloaded-but-findable module (`which(dets)` ⇒ a path,
+`is_loaded(dets)` ⇒ `false`), which is a real divergence from the oracle only for a module the
+oracle's *boot* loaded and this runtime has not — `code:ensure_loaded/1` closes it.
+`code:get_object_code/1` is served and **path**-based like the oracle's (it never consults the load
+state, so `get_object_code(dets)` works while `dets` is unloaded), answering
+`{Module, Binary, Filename}` with `Filename` a char list made absolute when the code path entry is
+relative, and the atom `error` for a module (or a non-basename name) no code-path directory holds.
 **`application`** (`application.rs`). A minimal native `.app` view: `get_env/1,2,3`,
 `get_all_env/1`, `get_all_key/1`, `get_key/1,2`, `get_application/0,1`, `loaded_applications/0`,
 `which_applications/0`. `get_application/0` is always `undefined`; `/1` maps a module to its
@@ -721,7 +729,8 @@ closable the same way and the floor already serves all three, so none of them st
 **Needs a new facility (shape-closable only):** `port_connect/2`/`port_call/3`,
 `spawn_request/1..5`, `suspend_process/1,2`, `system_monitor/0,1,2` (`/0` ⇒ `undefined`;
 `erts_internal:system_monitor/1,3` exported but unserved), `process_display/2`, `load_module/2`,
-`disconnect_node/1` (the `"net_kernel"` namespace is now in `FLOOR_MODULES`, but the arm itself is unimplemented). Edit gates: `../error.rs`'s
+`disconnect_node/1` (the `"net_kernel"` namespace **is** in `FLOOR_MODULES` and serves
+`connect_node/1` — `net.rs` — but this BIF has no arm). Edit gates: `../error.rs`'s
 `known_unimplemented_bifs_are_capability_gaps_and_never_shadow_the_registry` +
 `the_effective_gap_set_never_shadows_the_registry`, and `native.rs`'s
 `every_floor_module_is_a_real_try_native_arm`.
@@ -750,10 +759,18 @@ closable the same way and the floor already serves all three, so none of them st
 - `erlang:module_loaded/1` answers this runtime's **own** loaded set: the boot set is smaller than
   the oracle's (an app outside the preloaded `primLoad` batches is not yet loaded here), a
   documented divergence pinned by `../tests/module_loaded.rs`.
-- `code:is_loaded/1`/`code:which/1` report **path resolvability**, not the code server's load state
-  — the deliberate divergence that keeps the `boot/code_is_loaded_*` corpus cases agreeing; never
-  "fix" it.
-- `code:load_file/1` really loads with the oracle's `{error,sticky_directory|nofile|badfile}`
+- `code:is_loaded/1` is **load-state**-based (the oracle's `code.erl:755`) and `code:which/1`
+  **path**-based (the oracle's `code.erl:1782-1789`), so on an unloaded-but-findable module
+  `is_loaded` is `false` and `which` is a path — the oracle's own asymmetry. The remaining
+  divergence is the *boot set*: a module the oracle's boot loaded (`lists`) is not loaded here, so
+  `code:is_loaded(lists)` is `false` and `code:which(lists)` still a path until
+  `code:ensure_loaded/1` (or any use) loads it. The differential corpus' `is_loaded(lists)` cases
+  therefore call `ensure_loaded` first.
+- `code:get_object_code/1` is **path**-based like the oracle's, so a module loaded from **off** the
+  code path (`code:load_abs/1`) answers the atom `error` where `code:which/1` reports its load path
+  — the oracle's own behaviour, measured. A non-atom argument is `badarg` here (the oracle raises
+  `function_clause`), and an unreadable-but-found candidate is a diagnostic rather than the atom
+  `error` (the oracle's `mod_to_bin/3` would skip the entry).- `code:load_file/1` really loads with the oracle's `{error,sticky_directory|nofile|badfile}`
   vocabulary. Divergences: a **non-atom** argument is `badarg` where the oracle raises
   `function_clause`; a non-sticky module of an application outside `stdlib`/`kernel`/`erts` is
   `{error,nofile}` unless a `-pa` directory supplies it (this runtime's code path holds only the

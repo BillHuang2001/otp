@@ -79,7 +79,7 @@ impl RuntimeContext<'_> {
     /// string) for a loaded one, and the **empty string** for one loaded from memory (no
     /// source file: [`CodeServer::load_bytes`]) — see [`Self::beam_location`], which is the
     /// single source of truth for the shape (so `all_loaded/0`, `which/1` and `is_loaded/1`
-    /// can never disagree). The preloaded names come first — in
+    /// agree on a module they all report). The preloaded names come first — in
     /// [`erlang:pre_loaded/0`](crate::PreloadedModules::names)'s order — so the list is
     /// never empty, as the oracle's always is. The oracle orders the list by load time;
     /// here the loaded modules that are not preloaded are sorted by name. Neither order is
@@ -117,6 +117,11 @@ impl RuntimeContext<'_> {
     /// `code:which(Module)`: the atom `preloaded` for a preloaded module, the module's
     /// `.beam` path (a string) for one that is loaded or on the code path, and the atom
     /// `non_existing` otherwise.
+    ///
+    /// Like the oracle's `code.erl:1782-1789` this consults the **load state first** (the
+    /// loaded file, or the `preloaded` registry) and then falls back to a code-path search —
+    /// which is exactly why it stays **path-based** where [`Self::code_is_loaded`] is not:
+    /// `code:which(dets)` is `dets`'s path although `dets` has never been loaded.
     pub(super) fn code_which(&mut self, args: &[Eterm]) -> Result<Eterm> {
         let name = self
             .atom_name(*args.first().ok_or(BeamError::BadArg)?)
@@ -127,14 +132,24 @@ impl RuntimeContext<'_> {
         }
     }
 
-    /// `code:is_loaded(Module)`: `{file, Beam}` for a module that has a `.beam` file (or
-    /// is preloaded), and the atom `false` for one that is nowhere to be found.
+    /// `code:is_loaded(Module)`: `{file, Beam}` for a module that is **loaded** (or
+    /// preloaded), and the atom `false` for one that is not — however findable on the code
+    /// path it may be.
     ///
-    /// Oracle-verified (OTP 29/erts-17.1): `code:is_loaded(lists)` ⇒
-    /// `{file,"…/stdlib-8.1/ebin/lists.beam"}`, `code:is_loaded(erlang)` ⇒
-    /// `{file,preloaded}` (the *atom*, from the preloaded registry) and
-    /// `code:is_loaded(no_such_mod_xyz)` ⇒ `false`. The location is exactly
-    /// [`Self::code_which`]'s minus its `non_existing`, so the two can never disagree.
+    /// The oracle's rule (`code.erl:755`) is the code server's **load state**, not path
+    /// resolvability: `code:is_loaded/1` answers from the loaded-module table while
+    /// [`Self::code_which`] falls back to a code-path search. Oracle-verified
+    /// (OTP 29.1.1 / erts-17.1): `code:is_loaded(dets)` ⇒ `false` (`dets` is on the code path
+    /// but not loaded), `code:is_loaded(lists)` ⇒ `{file,"…/stdlib-8.1/ebin/lists.beam"}`
+    /// (stdlib's `lists` *is* loaded by boot), `code:is_loaded(erlang)` ⇒ `{file,preloaded}`
+    /// (the *atom*, from the preloaded registry) and `code:is_loaded(no_such_mod_xyz)` ⇒
+    /// `false`. An unloaded-but-findable module is therefore `false` here too — a module this
+    /// runtime has not loaded (its boot set is smaller than the oracle's) reports the honest
+    /// `false` rather than the path a load *would* use.
+    ///
+    /// When the module is loaded, `Beam` is exactly [`Self::beam_location`]'s value: the atom
+    /// `preloaded`, the recorded load path, or the empty string for a module loaded from
+    /// memory.
     ///
     /// A non-atom argument cannot name a module and is `badarg` — the local convention
     /// every `code:*` entry already follows (the oracle's own reason is
@@ -143,13 +158,79 @@ impl RuntimeContext<'_> {
         let name = self
             .atom_name(*args.first().ok_or(BeamError::BadArg)?)
             .ok_or(BeamError::BadArg)?;
-        match self.beam_location(&name)? {
-            Some(beam) => {
-                let file = self.atom("file")?;
-                terms::make_tuple(self, &[file, beam])
-            }
-            None => self.atom("false"),
+        // The load-state gate: a module on the code path but not loaded is `false`, exactly
+        // as the oracle's `code_server` answers before it has an entry for the name.
+        if !self.runtime.preloaded().is_preloaded(&name)
+            && !self.runtime.code_server.is_loaded(&name)
+        {
+            return self.atom("false");
         }
+        // Loaded or preloaded, so `beam_location` always has an answer (the `None` arm is
+        // unreachable from here and only mirrors `code_all_loaded/0`'s shape).
+        let beam = match self.beam_location(&name)? {
+            Some(beam) => beam,
+            None => self.charlist("")?,
+        };
+        let file = self.atom("file")?;
+        terms::make_tuple(self, &[file, beam])
+    }
+
+    /// `code:get_object_code(Module)`: the module's object code, as
+    /// `{Module, Binary, Filename}`, or the atom `error` when no `<Module>.beam` is on the
+    /// code path.
+    ///
+    /// The oracle's rule is the code server's `get_object_code` (`code_server.erl:1112-1126`)
+    /// plus `code.erl:778-787`: it is **path**-based, *not* load-state-based — `mod_to_bin/3`
+    /// walks the code path reading `<Dir>/<Module>.beam` and a module that is simply findable
+    /// (never loaded) still has object code. Oracle-verified (OTP 29.1.1 / erts-17.1):
+    /// `code:get_object_code(lists)` ⇒ `{lists, <<557 KB>>, "…/stdlib-8.1/ebin/lists.beam"}`,
+    /// `code:get_object_code(dets)` ⇒ `{dets, <<…>>, "<the same stdlib ebin>"}` (dets is *not*
+    /// loaded), `code:get_object_code(no_such_mod_xyz)` ⇒ the atom `error`, and a module
+    /// loaded from **off** the code path (`code:load_abs/1`) ⇒ `error` as well (measured
+    /// against the live oracle).
+    ///
+    /// Two consequences of the oracle's own code are reproduced:
+    ///
+    /// * `Filename` is the code-path entry as found, made **absolute** when it is relative
+    ///   (`absname_when_relative/1`, `code_server.erl:1133`) — so `-pa .` answers
+    ///   `<cwd>/m.beam` here, while `code:which/1` (which does *not* make it absolute) answers
+    ///   `./m.beam`; and
+    /// * a name that is not a **basename** is `error` without any search
+    ///   (`erl_prim_loader:is_basename/1`, `code_server.erl:1114`), so `code:get_object_code('a/b')`
+    ///   is `error` even if `<dir>/a/b.beam` exists.
+    ///
+    /// The bytes are materialized on the runtime's long-lived `-eval` heap by the same
+    /// [`beam_codec::term::make_binary`] the `prim_file:read_file/1` floor uses (an on-heap
+    /// `ErlHeapBits` block whatever the size), so the returned term stays valid for the
+    /// runtime's lifetime.
+    ///
+    /// A non-atom argument is `badarg` — the same local convention as the other `code:*`
+    /// entries (the oracle raises `function_clause`).
+    pub(super) fn code_get_object_code(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let name = self
+            .atom_name(*args.first().ok_or(BeamError::BadArg)?)
+            .ok_or(BeamError::BadArg)?;
+        // `erl_prim_loader:is_basename/1`: a name with a directory separator is not a module
+        // file name at all, so no path entry is ever searched for it.
+        if name.contains(std::path::is_separator) {
+            return self.atom("error");
+        }
+        let Some(file) = self.path_file(&name) else {
+            return self.atom("error");
+        };
+        // A path entry that is not readable is skipped by `mod_to_bin/3`; here `find_file`
+        // has already required the candidate to be a readable-through `is_file`, so a read
+        // that still fails has no oracle answer to mirror — report it rather than
+        // fabricating an `error` value.
+        let bytes = std::fs::read(&file).map_err(|error| {
+            error::message(format!(
+                "code:get_object_code/1: cannot read the object code at {file}: {error}"
+            ))
+        })?;
+        let contents = beam_codec::term::make_binary(self.eval_heap(), &bytes)?;
+        let module = self.atom(&name)?;
+        let filename = self.charlist(&absolute_path(&file))?;
+        terms::make_tuple(self, &[module, contents, filename])
     }
 
     /// `code:is_sticky(Module)`: whether `Module` is a **sticky** module.
@@ -569,6 +650,16 @@ impl RuntimeContext<'_> {
         if let Some(path) = self.runtime.code_server.loaded_path(name) {
             return Some(path.display().to_string());
         }
+        self.path_file(name)
+    }
+
+    /// The `.beam` file of `name` on the **code path alone** — no recorded load path, so
+    /// [`Self::code_get_object_code`] sees exactly what the oracle's `mod_to_bin/3`
+    /// (`code_server.erl:1128-1140`) sees.
+    ///
+    /// `None` when no code-path directory holds `<name>.beam`; a failure to resolve the
+    /// system directories is not an error here (see [`Self::code_get_path`]).
+    fn path_file(&mut self, name: &str) -> Option<String> {
         if let Some(path) = self.runtime.code_server.find_file(name) {
             return Some(path.display().to_string());
         }
@@ -579,6 +670,35 @@ impl RuntimeContext<'_> {
         }
         None
     }
+}
+
+/// `file` as an absolute path when it is relative, and unchanged when it already is.
+///
+/// The oracle's `absname_when_relative/1` (`code_server.erl:1133`) applied to the file
+/// `mod_to_bin/3` found on the code path — the only `code:*` answer the oracle makes
+/// absolute (`code:which/1` reports the entry as it stands). Erlang's `filename:absname/1`
+/// prepends the cwd and drops `.` components but keeps `..` ones; `Component::CurDir`-skipping
+/// reproduces that, so `-pa .` + `m.beam` answers `<cwd>/m.beam` exactly as the oracle does.
+///
+/// A cwd that cannot be read leaves the path as it stands (there is nothing to prepend, and
+/// the oracle's own `absname/1` fails the same way).
+fn absolute_path(file: &str) -> String {
+    use std::path::Component;
+    let path = Path::new(file);
+    if path.is_absolute() {
+        return file.to_string();
+    }
+    let Ok(cwd) = std::env::current_dir() else {
+        return file.to_string();
+    };
+    let mut absolute = cwd;
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            other => absolute.push(other),
+        }
+    }
+    absolute.display().to_string()
 }
 
 #[cfg(test)]
@@ -982,7 +1102,7 @@ mod tests {
     }
 
     #[test]
-    fn code_is_loaded_reports_file_preloaded_and_false() {
+    fn code_is_loaded_is_load_state_based() {
         let mut runtime = runtime();
         // A module nowhere to be found is the atom `false`.
         let missing = module_atom(&mut runtime, "definitely_not_a_module");
@@ -1002,7 +1122,7 @@ mod tests {
             Some("preloaded")
         );
 
-        // A loaded module reports the file it was loaded from.
+        // A module **loaded from a file** reports the file it was loaded from.
         let slice = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../beam_loader/tests/fixtures/slice.beam"
@@ -1012,22 +1132,249 @@ mod tests {
         let answer = call(&mut runtime, "code", "is_loaded", &[slice_atom]).expect("is_loaded/1");
         assert_eq!(string_of(terms::tuple_element(answer, 1).unwrap()), slice);
 
-        // A system module is found through the resolved code path and agrees with
-        // `code:which/1` (the two share the location helper).
         let Some(mut runtime) = system_runtime() else {
             return;
         };
+        // `dets` is on the code path but has **never been loaded**, so `is_loaded/1` is the
+        // atom `false` where `which/1` — which stays path-based — answers its `.beam` path.
+        // (Oracle, OTP 29.1.1 / erts-17.1: `code:is_loaded(dets)` ⇒ `false`,
+        // `code:which(dets)` ⇒ `"…/stdlib-8.1/ebin/dets.beam"`.)
+        let dets = module_atom(&mut runtime, "dets");
+        let loaded = call(&mut runtime, "code", "is_loaded", &[dets]).expect("is_loaded/1");
+        assert_eq!(
+            runtime.atom_name_of(loaded),
+            Some("false"),
+            "an unloaded module is `false` however findable it is"
+        );
+        let which = call(&mut runtime, "code", "which", &[dets]).expect("which/1");
+        let which = string_of(which);
+        assert!(which.ends_with("dets.beam"), "which/1 stays path-based: {which}");
+
+        // The very same module is `{file, Path}` once it really is loaded, and the path is
+        // exactly `which/1`'s (`dets` shares `lists`'s directory, so the two agree byte for
+        // byte once both are loaded).
+        runtime.code_server.load("lists").expect("stdlib lists loads");
         let lists = module_atom(&mut runtime, "lists");
         let loaded = call(&mut runtime, "code", "is_loaded", &[lists]).expect("is_loaded/1");
+        let path = string_of(terms::tuple_element(loaded, 1).unwrap());
         let which = call(&mut runtime, "code", "which", &[lists]).expect("which/1");
-        assert_eq!(
-            string_of(terms::tuple_element(loaded, 1).unwrap()),
-            string_of(which),
-            "is_loaded/1 and which/1 must agree on the location"
-        );
-        assert!(string_of(which).ends_with("lists.beam"));
+        assert_eq!(path, string_of(which), "a loaded module's file is which/1's");
+        assert!(path.ends_with("lists.beam"), "{path}");
     }
 
+    #[test]
+    fn code_is_loaded_agrees_with_the_oracle() {
+        // The live-oracle cross-check of the load-state rule: the same four shapes the
+        // rustdoc quotes, and the `dets`/`lists` asymmetry that separates `is_loaded/1`
+        // (load state) from `which/1` (path).
+        let Some(mut runtime) = system_runtime() else {
+            return;
+        };
+        let Some(oracle) = oracle_probe(
+            "io:format(\"~p|~p|~p|~p\",[code:is_loaded(dets),code:is_loaded(erlang),\
+             code:is_loaded(no_such_mod_xyz),is_list(code:which(dets))])",
+        ) else {
+            skip_oracle_loudly();
+            return;
+        };
+        // The oracle answers `dets` ⇒ `false` (on the path, not loaded), `erlang` ⇒
+        // `{file,preloaded}`, an unknown module ⇒ `false`, and `which(dets)` ⇒ a string.
+        assert_eq!(
+            oracle, "false|{file,preloaded}|false|true",
+            "the oracle's own load-state answers"
+        );
+
+        let dets = module_atom(&mut runtime, "dets");
+        let answer = call(&mut runtime, "code", "is_loaded", &[dets]).expect("is_loaded/1");
+        assert_eq!(runtime.atom_name_of(answer), Some("false"), "dets");
+        let erlang = module_atom(&mut runtime, "erlang");
+        let answer = call(&mut runtime, "code", "is_loaded", &[erlang]).expect("is_loaded/1");
+        assert_eq!(terms::tuple_arity(answer).expect("a pair"), 2);
+        assert_eq!(
+            runtime.atom_name_of(terms::tuple_element(answer, 1).unwrap()),
+            Some("preloaded"),
+            "erlang"
+        );
+        let missing = module_atom(&mut runtime, "no_such_mod_xyz");
+        let answer = call(&mut runtime, "code", "is_loaded", &[missing]).expect("is_loaded/1");
+        assert_eq!(runtime.atom_name_of(answer), Some("false"), "an unknown module");
+        let which = call(&mut runtime, "code", "which", &[dets]).expect("which/1");
+        assert!(string_of(which).ends_with("dets.beam"), "which(dets) is a path");
+
+        // A module the oracle has loaded by boot (`lists`) is `{file, Path}` **only once it
+        // has really been loaded here** — `code:ensure_loaded/1` is what makes the two runtimes
+        // agree, which is why the differential corpus' `is_loaded(lists)` cases call it first.
+        let lists = module_atom(&mut runtime, "lists");
+        let before = call(&mut runtime, "code", "is_loaded", &[lists]).expect("is_loaded/1");
+        assert_eq!(
+            runtime.atom_name_of(before),
+            Some("false"),
+            "this runtime's boot set does not include stdlib's `lists`"
+        );
+        call(&mut runtime, "code", "ensure_loaded", &[lists]).expect("ensure_loaded/1");
+        let after = call(&mut runtime, "code", "is_loaded", &[lists]).expect("is_loaded/1");
+        let path = string_of(terms::tuple_element(after, 1).unwrap());
+        assert!(path.ends_with("lists.beam"), "{path}");
+        let Some(oracle_path) = oracle_probe(
+            "code:ensure_loaded(lists),io:format(\"~s\",[element(2,code:is_loaded(lists))])",
+        ) else {
+            skip_oracle_loudly();
+            return;
+        };
+        assert_eq!(path, oracle_path, "the loaded path is the oracle's own");
+    }
+
+    #[test]
+    fn code_get_object_code_reports_the_beam_bytes_or_error() {
+        let Some(mut runtime) = system_runtime() else {
+            return;
+        };
+        // `dets` is **not** loaded here (and the oracle does not load it either) yet its
+        // object code is on the code path: the answer is the `{Module, Binary, Filename}`
+        // triple, `Filename` a char list and `Binary` the file's real bytes.
+        let dets = module_atom(&mut runtime, "dets");
+        let answer = call(&mut runtime, "code", "get_object_code", &[dets]).expect("goc/1");
+        assert_eq!(terms::tuple_arity(answer).expect("a triple"), 3);
+        let module = terms::tuple_element(answer, 0).unwrap();
+        assert_eq!(runtime.atom_name_of(module), Some("dets"));
+        let file = string_of(terms::tuple_element(answer, 2).unwrap());
+        assert!(file.ends_with("dets.beam"), "{file}");
+        assert!(
+            std::path::Path::new(&file).is_absolute(),
+            "the oracle makes the found path absolute: {file}"
+        );
+        let binary = terms::tuple_element(answer, 1).unwrap();
+        let bytes = object_code_bytes(binary);
+        assert!(
+            !bytes.is_empty(),
+            "the object code is a binary, not a list"
+        );
+        assert!(
+            std::fs::read(&file).expect("the file is readable") == bytes,
+            "the binary is the file's own bytes"
+        );
+        assert_eq!(
+            oracle_size_of_object_code("dets"),
+            Some(bytes.len()),
+            "the object code is the same byte count as the oracle's"
+        );
+        // A module nowhere on the code path is the atom `error`.
+        let missing = module_atom(&mut runtime, "no_such_mod_xyz");
+        let answer = call(&mut runtime, "code", "get_object_code", &[missing]).expect("goc/1");
+        assert_eq!(runtime.atom_name_of(answer), Some("error"));
+
+        // A name that is not a basename is `error` without any search
+        // (`erl_prim_loader:is_basename/1`), and a non-atom argument is this floor's `badarg`.
+        let slashed = module_atom(&mut runtime, "a/b");
+        let answer = call(&mut runtime, "code", "get_object_code", &[slashed]).expect("goc/1");
+        assert_eq!(runtime.atom_name_of(answer), Some("error"));
+        let error = call(&mut runtime, "code", "get_object_code", &[make_small(42)])
+            .expect_err("a non-atom module");
+        assert_eq!(error.as_atom(), Some("badarg"), "{error}");
+    }
+
+    #[test]
+    fn code_get_object_code_of_an_off_path_module_is_error() {
+        // The oracle's `get_object_code/1` is **path**-based: a module loaded from a file
+        // outside the code path still answers `error` (`mod_to_bin/3` never consults the
+        // load state), even though `code:which/1` reports the load path.
+        let Some(mut runtime) = system_runtime() else {
+            return;
+        };
+        let dir = temp_dir("code_goc_off_path");
+        let module = dir.join("off_path_probe.beam");
+        std::fs::copy(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../beam_loader/tests/fixtures/slice.beam"
+            ),
+            &module,
+        )
+        .expect("the fixture is copyable");
+        runtime.load_module(&module).expect("the fixture loads");
+        let name = module_atom(&mut runtime, "slice");
+        // `which/1` reports the load path …
+        let which = call(&mut runtime, "code", "which", &[name]).expect("which/1");
+        assert_eq!(string_of(which), module.display().to_string());
+        // … but the code-path search does not see it.
+        let answer = call(&mut runtime, "code", "get_object_code", &[name]).expect("goc/1");
+        assert_eq!(
+            runtime.atom_name_of(answer),
+            Some("error"),
+            "an off-path module has no object code"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn code_get_object_code_agrees_with_the_oracle() {
+        // The live-oracle cross-check of the PATH rule, on the three shapes the rustdoc
+        // quotes (`lists` loaded, `dets` not loaded, an unknown module).
+        let Some(mut runtime) = system_runtime() else {
+            return;
+        };
+        let Some(oracle) = oracle_probe(
+            "F = fun(M) -> case code:get_object_code(M) of {M2,B,F2} -> \
+             {M2,erlang:byte_size(B),is_list(F2)}; other -> other end end,\
+             io:format(\"~p|~p|~p\",[F(lists),F(dets),F(no_such_mod_xyz)])",
+        ) else {
+            skip_oracle_loudly();
+            return;
+        };
+        // The oracle's own answers: three fields, a real byte count and a char-list filename
+        // for both findable modules, and the atom `error` for the unknown one.
+        assert!(oracle.starts_with("{lists,"), "{oracle}");
+        assert!(oracle.contains("|{dets,"), "{oracle}");
+        assert!(oracle.ends_with("|error"), "{oracle}");
+
+        for name in ["lists", "dets"] {
+            let module = module_atom(&mut runtime, name);
+            let answer =
+                call(&mut runtime, "code", "get_object_code", &[module]).expect("goc/1");
+            assert_eq!(terms::tuple_arity(answer).expect("a triple"), 3, "{name}");
+            let file = string_of(terms::tuple_element(answer, 2).unwrap());
+            assert!(beam_term::is_list(terms::tuple_element(answer, 2).unwrap()));
+            assert!(file.ends_with(&format!("{name}.beam")), "{file}");
+            let binary = terms::tuple_element(answer, 1).unwrap();
+            assert_eq!(
+                oracle_size_of_object_code(name),
+                Some(object_code_size(binary)),
+                "{name}: the object code's byte count is the oracle's"
+            );        }
+        let missing = module_atom(&mut runtime, "no_such_mod_xyz");
+        let answer = call(&mut runtime, "code", "get_object_code", &[missing]).expect("goc/1");
+        assert_eq!(runtime.atom_name_of(answer), Some("error"));
+    }
+
+    /// The byte count of the `Binary` an `{M, Binary, Filename}` object-code triple carries.
+    fn object_code_size(binary: Eterm) -> usize {
+        object_code_bytes(binary).len()
+    }
+
+    /// The bytes of the `Binary` an `{M, Binary, Filename}` object-code triple carries, read
+    /// through the engine's own byte view ([`beam_engine::terms::binary_bytes`], which covers
+    /// both the on-heap and the off-heap representation).
+    fn object_code_bytes(binary: Eterm) -> Vec<u8> {
+        terms::binary_bytes(binary)
+            .expect("the object code is a byte-aligned binary")
+            .to_vec()
+    }
+    /// The oracle's `byte_size/1` of `code:get_object_code(Mod)`'s binary, or `None` when the
+    /// oracle is unavailable or answers `error`.
+    fn oracle_size_of_object_code(module: &str) -> Option<usize> {
+        let answer = oracle_probe(&format!(
+            "case code:get_object_code({module}) of {{_,B,_}} -> io:format(\"~p\",[byte_size(B)]); other -> io:format(\"~p\",[other]) end"
+        ))?;
+        answer.parse().ok()
+    }
+
+    /// A fresh scratch directory for the off-path fixture.
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the scratch directory is creatable");
+        dir
+    }
     #[test]
     fn code_is_sticky_matches_the_oracle() {
         let Some(mut runtime) = system_runtime() else {
