@@ -117,7 +117,7 @@ use beam_term::{AtomTable, Eterm};
 use crate::atom_cache::{OutboundAtomCache, ReceiveAtomCache};
 use crate::auth::{gen_challenge, gen_digest, verify};
 use crate::control::{decode_control, encode_control_cached, ControlMessage};
-use crate::delivery::{Delivery, Dispatched, InboundSink};
+use crate::delivery::{Delivery, Dispatched, InboundSink, LinkIdentity};
 use crate::dist_header::{DistHeader, DIST_HEADER};
 use crate::flags::{DistFlags, Dop, DFLAG_FRAGMENTS, DFLAG_SEND_SENDER};
 use crate::fragment::{split, Assembly, FragmentAssembler, DIST_FRAGMENT_SIZE};
@@ -773,6 +773,9 @@ pub struct Connection<T: Transport> {
     transport: T,
     /// The negotiated capabilities and peer identity.
     handshake: Handshake,
+    /// This node's own name, as advertised in the handshake (the
+    /// [`LinkIdentity::local_node`] of a checked delivery).
+    our_name: Vec<u8>,
     /// Reassembles `'E'`/`'F'` fragment sequences.
     fragments: FragmentAssembler,
     /// Applies inbound distribution headers so payload atom-cache refs resolve.
@@ -810,7 +813,7 @@ impl<T: Transport> Connection<T> {
     ) -> Result<Connection<T>> {
         let mut transport = transport;
         let handshake = connect_client_with_creation(&mut transport, name, cookie, creation)?;
-        Ok(Connection::from_handshake(transport, handshake))
+        Ok(Connection::from_handshake(transport, handshake, name))
     }
 
     /// Accepts a peer and completes the handshake (server role).
@@ -822,7 +825,7 @@ impl<T: Transport> Connection<T> {
     ) -> Result<Connection<T>> {
         let mut transport = transport;
         let handshake = accept_server(&mut transport, name, cookie, creation)?;
-        Ok(Connection::from_handshake(transport, handshake))
+        Ok(Connection::from_handshake(transport, handshake, name))
     }
 
     /// [`Connection::client`] advertising an explicit **capability flag set**.
@@ -838,7 +841,7 @@ impl<T: Transport> Connection<T> {
     ) -> Result<Connection<T>> {
         let mut transport = transport;
         let handshake = connect_client_with_flags(&mut transport, name, cookie, creation, flags)?;
-        Ok(Connection::from_handshake(transport, handshake))
+        Ok(Connection::from_handshake(transport, handshake, name))
     }
 
     /// [`Connection::server`] advertising an explicit **capability flag set**.
@@ -855,7 +858,7 @@ impl<T: Transport> Connection<T> {
     ) -> Result<Connection<T>> {
         let mut transport = transport;
         let handshake = accept_server_with_flags(&mut transport, name, cookie, creation, flags)?;
-        Ok(Connection::from_handshake(transport, handshake))
+        Ok(Connection::from_handshake(transport, handshake, name))
     }
 
     /// [`Connection::server`] consulting a caller-supplied **accept decision**.
@@ -878,14 +881,15 @@ impl<T: Transport> Connection<T> {
         let mut transport = transport;
         let handshake =
             accept_server_with_decision(&mut transport, name, cookie, creation, flags, decide)?;
-        Ok(Connection::from_handshake(transport, handshake))
+        Ok(Connection::from_handshake(transport, handshake, name))
     }
     /// Builds a connection over a finished handshake.
-    fn from_handshake(transport: T, mut handshake: Handshake) -> Connection<T> {
+    fn from_handshake(transport: T, mut handshake: Handshake, our_name: &[u8]) -> Connection<T> {
         let pending = handshake.buffered.take();
         Connection {
             transport,
             handshake,
+            our_name: our_name.to_vec(),
             fragments: FragmentAssembler::new(),
             recv_cache: ReceiveAtomCache::new(),
             outbound: OutboundAtomCache::new(),
@@ -914,6 +918,15 @@ impl<T: Transport> Connection<T> {
     /// The peer's node name.
     pub fn peer_name(&self) -> &[u8] {
         &self.handshake.peer_name
+    }
+
+    /// This node's own name, as advertised in the handshake.
+    ///
+    /// It is the local endpoint the checked receive path
+    /// ([`recv_delivery_checked`](Self::recv_delivery_checked)) compares a
+    /// message's local/`this-node` fields against.
+    fn our_name(&self) -> &[u8] {
+        &self.our_name
     }
 
     /// The peer's node creation.
@@ -1066,6 +1079,30 @@ impl<T: Transport> Connection<T> {
         Delivery::classify(&message)
     }
 
+    /// Receives one control message and **validates + classifies** it for local
+    /// delivery.
+    ///
+    /// This is [`recv`](Self::recv) followed by
+    /// [`Delivery::classify_validated`] against a [`LinkIdentity`] built from this
+    /// link's peer and own names — the C's per-opcode `invalid_message` shape and
+    /// per-link `dep` anti-spoof checks (`dist.c`), which a forged or malformed
+    /// control message fails instead of being mis-delivered.
+    ///
+    /// The [`LinkIdentity`] is interned into `atoms` — the **same** table the
+    /// message was decoded against, so the node comparison is a raw term `==`.
+    ///
+    /// [`recv_delivery`](Self::recv_delivery) is the unchanged, unchecked
+    /// counterpart (the semantic view with no validation).
+    pub fn recv_delivery_checked(
+        &mut self,
+        heap: &mut Heap,
+        atoms: &mut AtomTable,
+    ) -> Result<Delivery> {
+        let message = self.recv(heap, atoms)?;
+        let link = LinkIdentity::intern(atoms, self.peer_name(), self.our_name())?;
+        Delivery::classify_validated(&message, &link)
+    }
+
     /// Receives one control message, classifies it and **routes** it through
     /// `sink`, returning the classified [`Delivery`] and the [`DeliveryOutcome`]
     /// the sink reported (the blocking counterpart of
@@ -1080,6 +1117,25 @@ impl<T: Transport> Connection<T> {
         sink: &mut dyn InboundSink,
     ) -> Result<Dispatched> {
         let delivery = self.recv_delivery(heap, atoms)?;
+        let outcome = sink.deliver(&delivery)?;
+        Ok(Dispatched { delivery, outcome })
+    }
+
+    /// Receives one control message, **validates + classifies** it and routes it
+    /// through `sink`, returning the classified [`Delivery`] and the
+    /// [`DeliveryOutcome`] the sink reported.
+    ///
+    /// The checked counterpart of [`dispatch_inbound`](Self::dispatch_inbound): it
+    /// goes through [`recv_delivery_checked`](Self::recv_delivery_checked), so a
+    /// message that fails the C's `invalid_message` validation is returned as
+    /// `Err` and never reaches `sink`.
+    pub fn dispatch_inbound_checked(
+        &mut self,
+        heap: &mut Heap,
+        atoms: &mut AtomTable,
+        sink: &mut dyn InboundSink,
+    ) -> Result<Dispatched> {
+        let delivery = self.recv_delivery_checked(heap, atoms)?;
         let outcome = sink.deliver(&delivery)?;
         Ok(Dispatched { delivery, outcome })
     }

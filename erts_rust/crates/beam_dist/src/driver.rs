@@ -122,7 +122,7 @@ use crate::atom_cache::{OutboundAtomCache, ReceiveAtomCache};
 use crate::auth::{gen_challenge, gen_digest, verify};
 use crate::connection::Handshake;
 use crate::control::{decode_control, encode_control_cached, ControlMessage};
-use crate::delivery::{Delivery, Dispatched, InboundSink};
+use crate::delivery::{Delivery, Dispatched, InboundSink, LinkIdentity};
 use crate::dist_header::{DistHeader, DIST_HEADER};
 use crate::flags::{DistFlags, Dop, DFLAG_FRAGMENTS, DFLAG_SEND_SENDER};
 use crate::fragment::{split, Assembly, FragmentAssembler, DIST_FRAGMENT_SIZE};
@@ -633,6 +633,34 @@ impl ConnectionDriver {
         }
     }
 
+    /// Decodes, **validates + classifies** the next queued inbound control
+    /// message, or returns `None` when none is pending.
+    ///
+    /// This is [`next_message`](Self::next_message) followed by
+    /// [`Delivery::classify_validated`] against a [`LinkIdentity`] built from this
+    /// driver's peer and own names — the C's per-opcode `invalid_message` shape and
+    /// per-link `dep` anti-spoof checks (`dist.c`), which a forged or malformed
+    /// control message fails instead of being mis-delivered.
+    ///
+    /// The [`LinkIdentity`] is interned into `atoms` — the **same** table the
+    /// message was decoded against, so the node comparison is a raw term `==`.
+    /// [`next_delivery`](Self::next_delivery) is the unchanged, unchecked
+    /// counterpart.
+    pub fn next_delivery_checked(
+        &mut self,
+        heap: &mut Heap,
+        atoms: &mut AtomTable,
+    ) -> Result<Option<Delivery>> {
+        match self.next_message(heap, atoms)? {
+            Some(message) => {
+                let peer = self.peer_name().unwrap_or_default();
+                let link = LinkIdentity::intern(atoms, peer, &self.our_name)?;
+                Ok(Some(Delivery::classify_validated(&message, &link)?))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Decodes, classifies and **routes** every queued inbound control message
     /// through `sink`, returning a [`Dispatched`] record per message in arrival
     /// order.
@@ -651,6 +679,28 @@ impl ConnectionDriver {
     ) -> Result<Vec<Dispatched>> {
         let mut dispatched = Vec::new();
         while let Some(delivery) = self.next_delivery(heap, atoms)? {
+            let outcome = sink.deliver(&delivery)?;
+            dispatched.push(Dispatched { delivery, outcome });
+        }
+        Ok(dispatched)
+    }
+
+    /// Decodes, **validates + classifies** and routes every queued inbound control
+    /// message through `sink`, returning a [`Dispatched`] record per message in
+    /// arrival order.
+    ///
+    /// The checked counterpart of [`dispatch_inbound`](Self::dispatch_inbound): it
+    /// drains through [`next_delivery_checked`](Self::next_delivery_checked), so a
+    /// message that fails the C's `invalid_message` validation is returned as `Err`
+    /// and never reaches `sink`; messages already dispatched stay dispatched.
+    pub fn dispatch_inbound_checked(
+        &mut self,
+        heap: &mut Heap,
+        atoms: &mut AtomTable,
+        sink: &mut dyn InboundSink,
+    ) -> Result<Vec<Dispatched>> {
+        let mut dispatched = Vec::new();
+        while let Some(delivery) = self.next_delivery_checked(heap, atoms)? {
             let outcome = sink.deliver(&delivery)?;
             dispatched.push(Dispatched { delivery, outcome });
         }

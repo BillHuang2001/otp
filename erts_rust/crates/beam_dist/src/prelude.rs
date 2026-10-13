@@ -28,7 +28,9 @@
 //! **not** glob-exported — they would shadow `std::io::{Read, Write}`.
 
 pub use crate::control::{decode_control, encode_control, encode_control_cached, ControlMessage};
-pub use crate::delivery::{Delivery, DeliveryOutcome, Dispatched, InboundSink, UnsupportedSink};
+pub use crate::delivery::{
+    Delivery, DeliveryOutcome, Dispatched, InboundSink, LinkIdentity, UnsupportedSink,
+};
 pub use crate::dist_header::*;
 pub use crate::driver::{ConnectionDriver, DriverState, StepOutcome};
 pub use crate::epmd::*;

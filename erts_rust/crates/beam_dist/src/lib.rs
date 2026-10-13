@@ -66,7 +66,9 @@ pub mod transport;
 pub use crate::control::{
     carries_message, decode_control, encode_control, encode_control_cached, ControlMessage,
 };
-pub use crate::delivery::{Delivery, DeliveryOutcome, Dispatched, InboundSink, UnsupportedSink};
+pub use crate::delivery::{
+    Delivery, DeliveryOutcome, Dispatched, InboundSink, LinkIdentity, UnsupportedSink,
+};
 pub use crate::dist_header::{AtomCacheRef, DistFragment, DistHeader};
 pub use crate::driver::{ConnectionDriver, DriverState, StepOutcome};
 pub use crate::epmd::{

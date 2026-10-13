@@ -427,6 +427,7 @@ fn connection(input: Vec<u8>) -> Connection<MemoryTransport> {
             peer_visibility: PeerVisibility::Hidden,
             buffered: None,
         },
+        b"local@host",
     )
 }
 
