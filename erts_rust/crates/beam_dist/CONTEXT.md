@@ -780,11 +780,16 @@ and derives the report from that observed state.
   `DOP_EXIT2`, `DOP_UNLINK_ID`, client-originated `DOP_MONITOR_P`, fragmented >`DIST_FRAGMENT_SIZE` both ways
 - `tests/live_accept.rs` → real-`erl` server-side `'N'` handshake + Rust→node→Rust `DOP_REG_SEND` round
   trip (full `node@host` + epmd creation) + published-vs-hidden peer visibility
+- `tests/live_accept_blocking.rs` → real-`erl` peer vs the **blocking** `accept_server`/`Connection::server`
+  (blocking server handshake + the inbound `Send`/`Link`/`Monitor` signals the peer initiates against our pid)
 - `tests/live_driver.rs` → real-`erl` non-blocking `ConnectionDriver` handshake + send
 - `tests/two_node_loopback.rs` → hermetic in-process two-node loopback (two named `beam_dist`
   endpoints over a real loopback socket: bidirectional `DOP_REG_SEND`/`DOP_SEND_SENDER`, monitor
   round-trip, ticks, >`DIST_FRAGMENT_SIZE` both ways, an `InboundSink` routing a delivery, a real
   non-blocking-socket `ConnectionDriver` pair, clean-close vs abrupt-drop peer death) — no `erl`/`epmd`
+- `tests/two_node_session.rs` → hermetic full inbound signal-family loopback (every two-node-session
+  family — `Link`/`UnlinkId`/`DemonitorP`/`Exit(2)`/`PayloadExit(2)`/`GroupLeader`/`AliasSend`/
+  `SpawnRequest`/`SpawnReply`/`AltactSigSend` + `_TT` — both directions, with a spy `'D'` header pin)
 - `tests/hermetic_epmd.rs` → test-local `epmd` registry stub (ALIVE2/PORT2/NAMES/STOP) + the crate
   client and the address-taking `lookup_at`/`lookup_port_at` hermetically + an `erl -epmd_port <stub>`
   oracle cross-check — no host `epmd`
