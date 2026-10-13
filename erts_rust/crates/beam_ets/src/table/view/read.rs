@@ -249,6 +249,21 @@ impl<'g> TableRead<'g> {
             .map(|term| TableTerm::new(term)))
     }
 
+    /// `ets:slot/2`: the objects in slot `slot`, tagged to this view's lifetime
+    /// like every other term read here.
+    ///
+    /// `Ok(Some(objects))` is the slot's object list, `Ok(None)` the
+    /// `'$end_of_table'` slot and `Err` every out-of-range slot (a negative one
+    /// included). See [`Table::slot`] for the exact semantics.
+    pub fn slot(&self, slot: i64, atoms: &AtomTable) -> Result<Option<Vec<TableTerm<'_>>>> {
+        Ok(self.guard.slot(slot, atoms)?.map(|objects| {
+            objects
+                .into_iter()
+                .map(|term| TableTerm::new(term))
+                .collect()
+        }))
+    }
+
     /// Every object in the table (ordered for `ordered_set`).
     pub fn tab2list(&self) -> Vec<TableTerm<'_>> {
         self.guard

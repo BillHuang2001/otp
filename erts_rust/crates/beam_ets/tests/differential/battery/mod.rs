@@ -70,6 +70,7 @@ mod navigation;
 mod reclamation;
 mod replace;
 mod access;
+mod slot;
 
 // ---------------------------------------------------------------------------
 // Canonical rendering (the port of the oracle's `r/1`, `t/1`, `l/1`, `srt/1`)

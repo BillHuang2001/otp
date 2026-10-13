@@ -344,6 +344,19 @@ impl TableAccess<'_> {
         self.table.prev(key, atoms)
     }
 
+    /// `ets:slot/2`, requiring read access (the oracle's `ets_slot_2` takes the
+    /// `DB_READ` status mask, `erl_db.c:3752`).
+    ///
+    /// `Ok(Some(objects))` is the slot's object list, `Ok(None)` the
+    /// `'$end_of_table'` slot and `Err(BeamError::BadArg)` every out-of-range slot
+    /// (a negative slot included). See [`Table::slot`] for the exact semantics —
+    /// an `ordered_set` slot is exact, a hash-kind slot is the interior's own
+    /// (unpinned) bucket decomposition.
+    pub fn slot(&self, slot: i64, atoms: &AtomTable) -> Result<Option<Vec<Eterm>>> {
+        self.table.check_read(self.requester)?;
+        self.table.slot(slot, atoms)
+    }
+
     /// `ets:tab2list/1`, requiring read access.
     pub fn tab2list(&self) -> Result<Vec<Eterm>> {
         self.table.check_read(self.requester)?;
