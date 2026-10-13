@@ -796,7 +796,8 @@ line (no timestamps/addresses/ports) and exits `0`:
   `MAX_DUMP_RESP_BODY`), `EpmdClient` over `Transport` (`publish`/`port_please`/`names`/`dump`/`kill`/
   `stop`), and the real TCP client (`connect`, the address-taking `lookup_at`/`lookup_port_at`, and the
   `EPMD_DEFAULT_ADDR`-pinned `lookup`/`lookup_port` wrappers)
-- `src/bin/dist_probe.rs` → the hermetic two-node loopback CLI (`dist_probe loopback <ping|nodes|term>`)
+- `src/bin/dist_probe.rs` → the hermetic two-node loopback CLI (`dist_probe loopback <report>`; 11
+  report kinds — ping/nodes/term + badcookie/nodeid/frag/alias/monitor/regsend_missing/handshake/utf8)
   the differential harness drives as an external command; not part of the library API
 - `tests/{constants,auth,handshake,framing,control,delivery,dop_roundtrip,epmd,fragment,atom_cache,connection,driver}.rs`
   → seams
