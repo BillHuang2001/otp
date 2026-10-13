@@ -35,7 +35,7 @@
 //! connector handshake (`beam_dist::driver::ConnectionDriver::client`), the
 //! control-message codec (`send_control`), the `epmd` `PORT2_REQ` lookup
 //! (`beam_dist::epmd::lookup_port`) and the inbound classifier
-//! (`ConnectionDriver::dispatch_inbound`). What this module adds is the *driving
+//! (`ConnectionDriver::dispatch_inbound_checked`). What this module adds is the *driving
 //! state* the runtime owns: a socket per peer, a bounded non-blocking pump, a
 //! failure-recorded retirement policy and the [`DistSignalRouter`] implementation
 //! the process table's outbound signals are routed through.
@@ -453,8 +453,14 @@ impl DistClient {
     /// returning how many reached a local mailbox.
     ///
     /// The mirror of [`crate::dist::DistNode::dispatch_inbound`]: the driver owns the
-    /// queue and the receive atom cache, the sink owns the routing. A link-level
-    /// decode failure retires that one link and records why — it is never raised.
+    /// queue, the receive atom cache and **the link's own identity**, the sink owns the
+    /// routing. Every queued control message is therefore validated against **that**
+    /// link's peer/own names (the C's per-opcode `invalid_message` shape checks and the
+    /// `dep != external_pid_dist_entry(from)` anti-spoof check, `dist.c`) before it can
+    /// reach a mailbox — an inbound `DOP_*` from a peer this runtime dialled out to is
+    /// checked with the identity of *that* connection, never a pass-wide one. A
+    /// link-level failure (a decode/classification failure **or** a validation failure)
+    /// retires that one link and records why — it is never raised.
     pub fn dispatch_inbound(
         &self,
         atoms: &mut AtomTable,
@@ -714,8 +720,15 @@ impl DistClientInner {
         Ok(sent)
     }
 
-    /// Decodes, classifies and routes every control message the established links
-    /// queued, using one scratch arena reset per drain.
+    /// Decodes, **validates + classifies** and routes every control message the
+    /// established links queued, using one scratch arena reset per drain.
+    ///
+    /// The checked drain ([`ConnectionDriver::dispatch_inbound_checked`]) is what makes
+    /// each link validate against its **own** peer/own identity: the driver builds the
+    /// [`beam_dist::LinkIdentity`] from its own handshake names, interned into the same
+    /// table the message was decoded against, so a forged or malformed control message
+    /// is an `Err` — which retires that one link (recorded in
+    /// [`DistClientInner::last_error`]) instead of being mis-routed.
     fn dispatch(&mut self, atoms: &mut AtomTable, sink: &mut dyn InboundSink) -> Result<usize> {
         self.dispatch_heap.reset();
         let mut delivered = 0;
@@ -731,7 +744,7 @@ impl DistClientInner {
                 let heap = &mut self.dispatch_heap;
                 self.links[index]
                     .driver
-                    .dispatch_inbound(heap, atoms, sink)
+                    .dispatch_inbound_checked(heap, atoms, sink)
             };
             match outcome {
                 Ok(dispatched) => {

@@ -18,7 +18,7 @@
 //
 // %CopyrightEnd%
 
-//! `erlang:garbage_collect/0,1` (contract A.7) — the observable contract.
+//! `erlang:garbage_collect/0,1,2` (contract A.7) — the observable contract.
 //!
 //! `src/native/erts_internal.rs` owns the BIF layer and its colocated unit tests pin the
 //! argument/return shapes against this runtime's own process table. This suite pins what a
@@ -29,7 +29,9 @@
 //!    (same `-eval`, terminated with `-s init stop`), and the two printed results must be
 //!    identical: `/0` and `/1` on the calling process are `true`, `/1` on another **live**
 //!    pid is `true`, `/1` on a pid that has terminated is `false`, and `/1` on a non-pid is
-//!    `badarg`.
+//!    `badarg`. `/2`'s options form is classified the same way — the `{async, _}` form is a
+//!    served call (exit `0`) and a bad option is the ordinary `badarg` (exit `1`) — never a
+//!    capability gap (exit `3`).
 //! 2. **The collection really happens.** A **scheduled** process whose code calls
 //!    `erlang:garbage_collect()` and then allocates really moves
 //!    [`Runtime::gc_stats`]'s `collections` counter, while the *same* workload without the
@@ -419,22 +421,61 @@ fn an_uncaught_badarg_is_a_runtime_error_in_both() {
     );
 }
 
-/// **`/2` stays a typed capability gap.** The asynchronous system-task protocol
-/// (`erlang:garbage_collect/2` with `{async, ReqId}`) is not implemented, so the call must
-/// report the honest `unsupported` capability gap (exit `3`) — never a fabricated result.
+/// **Half 1c — the `/2` options form is served, and a bad option is a runtime error.**
+///
+/// `erlang:garbage_collect/2` is served from the native floor, so the classification the
+/// differential harness keys off must be the oracle's: the `{async, _}` option is a genuinely
+/// **served** call — exit `0`, the atom `async` — where a capability gap would exit `3`; and an
+/// option outside the wrapper's two 2-tuple forms (`{async, _}`/`{type, _}`) is what
+/// `get_gc_opts/2` raises its `throw(bad_option)` for, i.e. the ordinary `error:badarg` (exit
+/// `1`), never a capability gap either. Both runtimes are probed and both the exit code and the
+/// printed value must agree, with the oracle's own expectations re-probed rather than assumed.
 #[test]
-fn the_async_form_stays_a_typed_capability_gap() {
-    let ours = beam_rt_eval("erlang:garbage_collect(self(), []).");
+fn the_async_options_form_is_served_and_a_bad_option_is_a_runtime_error() {
+    let Some(oracle) = support::require_oracle("garbage_collect") else {
+        return;
+    };
+
+    // The `{async, _}` form is a served call: exit 0 and the atom `async` on both runtimes.
+    let async_expr = "io:format(\"~p~n\", [erlang:garbage_collect(self(), [{async, false}])]), \
+                      halt(0).";
+    let ours = beam_rt_eval(async_expr);
     assert_eq!(
-        ours.code, 3,
-        "garbage_collect/2 must be a capability gap: {} / {}",
-        ours.out,
-        ours.err
+        ours.code, 0,
+        "the async form is a served call, not a capability gap: {} / {}",
+        ours.out, ours.err
+    );
+    assert_eq!(ours.out, "async", "our runtime's answer to the async form");
+    let theirs = oracle_eval(&oracle, async_expr);
+    assert_eq!(
+        theirs.code, 0,
+        "the oracle serves the async form too: {} / {}",
+        theirs.out, theirs.err
+    );
+    assert_eq!(
+        theirs.out, "async",
+        "the live oracle's answer to the async form"
+    );
+
+    // An option outside the wrapper's two 2-tuple forms is the oracle's own `badarg`: exit 1 on
+    // both runtimes, never the exit-3 capability gap.
+    let bad_expr = "erlang:garbage_collect(self(), [{type, foo}]).";
+    let ours = beam_rt_eval(bad_expr);
+    assert_eq!(
+        ours.code, 1,
+        "a bad option is an ordinary runtime error, not a capability gap: {} / {}",
+        ours.out, ours.err
     );
     assert!(
-        ours.err.contains("unsupported") && ours.err.contains("garbage_collect/2"),
-        "the gap must name the BIF: {}",
+        ours.err.contains("badarg"),
+        "our runtime must report the reason: {}",
         ours.err
+    );
+    let theirs = oracle_eval(&oracle, bad_expr);
+    assert_eq!(
+        theirs.code, 1,
+        "the oracle classifies a bad option as a runtime error too: {} / {}",
+        theirs.out, theirs.err
     );
 }
 

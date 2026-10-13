@@ -34,16 +34,15 @@
 //! the access mode — a non-owner may inspect a `private` table's metadata. That is pinned
 //! here (as a shape: the size is an integer, the `info/1` result is a proplist).
 //!
-//! # The *denied* cells are deliberately NOT in the corpus
+//! # The *denied* cells pin only the refusal, never the reason's shape
 //!
-//! The Rust runtime sets the access mode at `ets:new/2` (so `ets:info(T, protection)`
-//! agrees) but does **not** enforce it on a later access by a non-owner: a non-owner
-//! `ets:lookup/2` of a `private` table returns `[]` instead of raising `error:badarg`,
-//! and a non-owner `ets:insert/2` of a `protected`/`private` table returns `true` instead
-//! of raising. Those are genuine *observable* divergences (a plain value/reason, so the
-//! harness would report a `mismatch`), so the denial half of the matrix is a handoff to
-//! `beam_ets`/`beam_bifs` rather than a case. Only the cells both runtimes agree on are
-//! pinned, and the allowed half is still covered end to end (owner + non-owner reads and
+//! The Rust runtime enforces the access mode both at `ets:new/2` (so `ets:info(T, protection)`
+//! agrees) and on a later access by a non-owner: a non-owner `ets:lookup/2` of a `private`
+//! table and a non-owner `ets:insert/2` of a `protected`/`private` table both raise. The
+//! **reason** differs though — the oracle raises a stacktrace-carrying `error:{badarg,
+//! Stacktrace}`, the Rust runtime a bare `error:badarg` — and the stacktrace frames are
+//! volatile, so the denial half of the matrix is a handoff to `beam_ets`/`beam_bifs` rather
+//! than a pinned case. The allowed half is covered end to end (owner + non-owner reads and
 //! non-owner writes) so a regression in the enforcing path shows up as a failure.
 use super::{Case, CaseKind, Contract, Golden, Probe};
 

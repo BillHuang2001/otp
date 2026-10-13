@@ -76,6 +76,13 @@ Single-threaded scheduler, mailbox, signals, GC roots, PCB state:
 16. `remote.rs` — an external pid links/monitors via the same table entry points, is recorded
     separately, and every change is handed to a recording `DistSignalRouter`; `node_down` resolves then
     purges.
+16b. `remote_inbound.rs` (22 tests) — the **inbound (receipt)** half of the distribution
+    link/monitor/exit/unlink/group-leader families: every new `ProcessTable` primitive
+    (`record_remote_link`, `apply_remote_exit_signal` for both the link-exit and the `exit/2`
+    families, `unlink_from_remote`/`unlink_ack_from_remote`, `monitor_from_remote`/
+    `demonitor_from_remote`/`remote_watchers`, `remote_monitor_down`, `set_group_leader_from_remote`/
+    `group_leader`, `next_reference`) applies its local effect and routes **nothing** — the recording
+    router staying empty is the proof of the C's non-echoing receipt arms (`dist.c:2258`).
 SMP pool:
 17. `smp.rs` (11 tests) — the SMP pool: N-on-M-scheduler progress (M ∈ {1,4}, 200 pids each, each
     process running `YIELDS + 1` runner invocations and **one** recorded slice); work stealing (a
@@ -538,5 +545,7 @@ SMP pool:
   `erl`-cross-checked process-dictionary, process-control, lifecycle and port-monitor evidence (loud skip
   when `erl` is absent); their driver is the shared `common/mod.rs`
 - `ports.rs`, `remote.rs` → the port table and distributed links/monitors
+- `remote_inbound.rs` → the inbound (receipt) half of the same families: the route-free `ProcessTable`
+  entry points (non-echoing by construction), pinned with a recording `DistSignalRouter`
 - `smp.rs`, `lock_scope.rs`, `timers.rs`, `dirty.rs`, `progress.rs` → the SMP pool (see
   `../src/smp/CONTEXT.md`)

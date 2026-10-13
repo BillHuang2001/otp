@@ -285,6 +285,55 @@ fn valid_corpus() -> Vec<Valid> {
         &atoms,
         false,
     ));
+    // Legacy identifier wire forms — decode-only (the encoder always emits the modern
+    // `NEW_PID_EXT`/`V4_PORT_EXT`/`NEWER_REFERENCE_EXT` tags). Hand-built so the
+    // truncation and byte-flip sweeps exercise `PID_EXT` (103), `PORT_EXT` (102),
+    // `REFERENCE_EXT` (101) and `NEW_REFERENCE_EXT` (114), whose interior layouts differ
+    // from the modern forms; a remote node (no local-node identity) keeps them external
+    // and the oracle's own `binary_to_term` may demote/reject them, so they are
+    // `oracle: false` (their *malformed* variants are oracle-compared in
+    // `targeted_corpus`).
+    v.push(Valid {
+        label: "legacy_pid_ext",
+        image: wi(&[PID_EXT, 119, 2, b'n', b'1', 0, 0, 0, 3, 0, 0, 0, 0, 0]),
+        oracle: false,
+    });
+    v.push(Valid {
+        label: "legacy_port_ext",
+        image: wi(&[PORT_EXT, 119, 2, b'n', b'1', 0, 0, 0, 5, 0]),
+        oracle: false,
+    });
+    v.push(Valid {
+        label: "legacy_reference_ext",
+        image: wi(&[REFERENCE_EXT, 119, 2, b'n', b'1', 0, 0, 0, 1, 0]),
+        oracle: false,
+    });
+    v.push(Valid {
+        label: "legacy_new_reference_ext",
+        image: wi(&[
+            NEW_REFERENCE_EXT,
+            0,
+            3,
+            119,
+            2,
+            b'n',
+            b'1',
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            2,
+            0,
+            0,
+            0,
+            3,
+        ]),
+        oracle: false,
+    });
     let enc_node = |t: Eterm| {
         let mut e = Encoder::new(&atoms).with_local_node(node, 0);
         e.encode(t)

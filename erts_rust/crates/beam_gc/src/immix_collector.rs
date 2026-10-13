@@ -103,6 +103,7 @@ use crate::heap_info::HeapObservable;
 use crate::immix::{lines_for, ImmixSpace, ImmixStats, LINE_WORDS};
 use crate::nursery::Nursery;
 use crate::policy::HeapPolicy;
+use crate::reachable::ReachableObject;
 use crate::space::{FromSet, HeapSpace};
 use crate::stats::GcStats;
 
@@ -534,6 +535,30 @@ impl GenImmixCollector {
         let base = self.mature.base() as usize;
         from.add_range(base, base + self.mature.capacity_words() * core::mem::size_of::<Eterm>());
         crate::reachable::for_each_reachable(&from, roots, visit)
+    }
+
+    /// The **safe** form of [`for_each_reachable_object`](Self::for_each_reachable_object):
+    /// visits every **boxed object** reachable from `roots` across the **whole heap** (every
+    /// space of the nursery chain plus the mark-region mature generation), each object
+    /// **exactly once**, passing a read-only [`ReachableObject`] view of it.
+    ///
+    /// It builds the **same from-set** as the raw sibling and drives the same walk, so the two
+    /// report the same objects in the same order; the only difference is that the visitor reads
+    /// the object's words through [`ReachableObject::word`] / [`ReachableObject::words`] instead
+    /// of a raw pointer, so an inspection-only caller needs **no `unsafe`**. See
+    /// [`Collector::for_each_reachable_object`](crate::Collector::for_each_reachable_object) for
+    /// the full contract; the mature range is the mark-region space's deliberately
+    /// over-inclusive `base .. base + capacity`.
+    pub fn for_each_reachable_object_view(
+        &self,
+        roots: &[Eterm],
+        visit: impl FnMut(ReachableObject<'_>),
+    ) -> Result<()> {
+        let mut from = FromSet::new();
+        self.nursery.add_to_from_set(&mut from); // every space of the chain
+        let base = self.mature.base() as usize;
+        from.add_range(base, base + self.mature.capacity_words() * core::mem::size_of::<Eterm>());
+        crate::reachable::for_each_reachable_view(&from, roots, visit)
     }
 
     /// Folds one collection's [`GcStats`] into the collector's accumulated counters.

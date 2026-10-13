@@ -34,13 +34,14 @@
 //!
 //! # Capability gaps degrade, they never abort
 //!
-//! The Rust runtime does not implement the `erlang:memory/0,1` BIF yet, so the memory
-//! probe fails there. That failure is recorded as the explicit note
-//! `vm_memory_total_bytes: not-run (unsupported: erlang:memory/1)` and **no** metric —
-//! the startup summary, the compute loop and every other metric are still produced, so
-//! a run always yields numbers or an explicit reason. A runtime that answers the probe
-//! records the bytes; any *other* probe failure is surfaced verbatim as `failed: …`.
-//! Nothing is ever fabricated, and a probe failure never aborts the workload.
+//! Both runtimes answer the memory probe: `beam_rt` serves `erlang:memory/0,1` through its
+//! `MemoryHook` seam, so the `rust` row records a real `vm_memory_total_bytes` alongside the
+//! oracle's. Should a runtime ever *not* answer it, that gap is not an abort: the failure is
+//! recorded as the explicit note `vm_memory_total_bytes: not-run (unsupported:
+//! erlang:memory/1)` and **no** metric, while the startup summary, the compute loop and every
+//! other metric are still produced, so a run always yields numbers or an explicit reason. Any
+//! *other* probe failure is surfaced verbatim as `failed: …`. Nothing is ever fabricated, and
+//! a probe failure never aborts the workload.
 
 use std::process::Command;
 
@@ -58,8 +59,9 @@ const COMPUTE_EVAL: &str =
     r#"S = lists:sum(lists:seq(1,1000000)), io:format("~p~n",[S]), halt()."#;
 
 /// The VM-memory probe: prints the single integer `erlang:memory(total)` in bytes.
-/// `erlang:memory/0,1` is not implemented by the Rust runtime yet, so this is the probe
-/// that reports a capability gap rather than a number there.
+/// Both runtimes serve `erlang:memory/0,1` today (`beam_rt` via its `MemoryHook` seam), so
+/// both report a real byte count; if a runtime ever does not, the probe records a capability
+/// gap rather than a number.
 const MEMORY_EVAL: &str = r#"M = erlang:memory(total), io:format("~p~n",[M]), halt()."#;
 
 /// The BIF the memory probe depends on, named in the capability-gap note.
@@ -217,9 +219,11 @@ fn parse_leading_u64(stdout: &str) -> Option<u64> {
 /// Whether a failed memory probe is a documented **capability gap** rather than a genuine
 /// runtime error.
 ///
-/// The Rust runtime reports the missing `erlang:memory/0,1` BIF as a bare `beam_rt: error
-/// undef` (exit `1`) today, so the gap is recognised from the runtime's own `undef` /
-/// `unsupported` diagnostic as well as from the exit-`3` `unsupported` signal.
+/// Both runtimes answer the probe today, so this survives only as a **fallback** classifier
+/// for a runtime that stops doing so: such a runtime reports the missing `erlang:memory/0,1`
+/// BIF as a bare `beam_rt: error undef` (exit `1`), so the gap is recognised from the
+/// runtime's own `undef` / `unsupported` diagnostic as well as from the exit-`3`
+/// `unsupported` signal.
 fn is_capability_gap(out: &Completed) -> bool {
     if out.exit_code == Some(3) {
         return true;

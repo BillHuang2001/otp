@@ -65,6 +65,8 @@
 //!   **no** timing for that case — never a fabricated number.
 //! * `erlc` unavailable, or every case's sources missing from the (read-only) checkout
 //!   ⇒ an honest `skipped(erlc-absent)` / `skipped(sources-missing)`.
+//! * `erlc` *failing* on the sources we did stage (the embedded driver, or a present
+//!   foreign source) ⇒ a real `failed(module-compile-failed)`, never a benign skip.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -259,14 +261,44 @@ fn argv_for(kind: RuntimeKind, dir: &Path, case: &Case, n: i64) -> Vec<String> {
     }
 }
 
+/// Why [`stage`] could not produce a single runnable case.
+///
+/// The two arms are reported differently on purpose: a checkout that does not contain the
+/// foreign `.erl` sources is a **missing prerequisite** (`skipped(sources-missing)`), while a
+/// failure to compile sources we *did* stage — our own embedded driver, or a present foreign
+/// source — is a **real failure** (`failed(module-compile-failed)`) that must never be
+/// disguised as a benign skip.
+#[derive(Debug, PartialEq, Eq)]
+enum StageError {
+    /// No case's `.erl` sources are present in the (read-only) checkout.
+    NoSources,
+    /// The driver plus the staged foreign sources could not be compiled by `erlc`.
+    CompileFailed,
+}
+
+/// Maps a [`StageError`] to the honest `(status, reason)` for the `foreign` report row:
+/// sources genuinely absent ⇒ `skipped(sources-missing)`; any compile failure of code we
+/// staged ⇒ `failed(module-compile-failed)` — never a benign skip.
+fn stage_outcome(err: StageError) -> (Status, &'static str) {
+    match err {
+        StageError::NoSources => (Status::Skipped, "sources-missing"),
+        StageError::CompileFailed => (Status::Failed, "module-compile-failed"),
+    }
+}
+
 /// Stages the driver plus every case's foreign sources into `dir` and compiles them with
-/// `erlc`, returning the cases that are ready to run. Anything that cannot be staged is
-/// recorded in `notes` — never silently dropped.
-fn stage(dir: &Path, erlc: &Path, notes: &mut Vec<String>) -> Vec<&'static Case> {
+/// `erlc`, returning the cases that are ready to run. A compile failure of anything we
+/// staged is surfaced as [`StageError::CompileFailed`] (never a missing prerequisite), and
+/// every reason is recorded in `notes` — never silently dropped.
+fn stage(
+    dir: &Path,
+    erlc: &Path,
+    notes: &mut Vec<String>,
+) -> std::result::Result<Vec<&'static Case>, StageError> {
     let driver = dir.join(format!("{DRIVER_MODULE}.erl"));
     if let Err(e) = std::fs::write(&driver, DRIVER_SOURCE) {
         notes.push(format!("driver-write-failed: {e}"));
-        return Vec::new();
+        return Err(StageError::CompileFailed);
     }
 
     let mut wanted: Vec<&'static Case> = Vec::new();
@@ -307,7 +339,7 @@ fn stage(dir: &Path, erlc: &Path, notes: &mut Vec<String>) -> Vec<&'static Case>
         wanted.push(case);
     }
     if wanted.is_empty() {
-        return Vec::new();
+        return Err(StageError::NoSources);
     }
 
     // Compile the driver together with every staged foreign source in one `erlc` call.
@@ -327,24 +359,24 @@ fn stage(dir: &Path, erlc: &Path, notes: &mut Vec<String>) -> Vec<&'static Case>
                 out.exit_code,
                 out.stderr.trim()
             ));
-            return Vec::new();
+            return Err(StageError::CompileFailed);
         }
         Err(e) => {
             notes.push(format!("erlc spawn failed: {e}"));
-            return Vec::new();
+            return Err(StageError::CompileFailed);
         }
     }
 
     if !dir.join(format!("{DRIVER_MODULE}.beam")).is_file() {
         notes.push("driver .beam missing after erlc".to_string());
-        return Vec::new();
+        return Err(StageError::CompileFailed);
     }
     notes.push(format!(
         "staged {} foreign case(s) from {} distinct source file(s)",
         wanted.len(),
         copied.len()
     ));
-    wanted
+    Ok(wanted)
 }
 
 /// The samples collected for one case under one runtime.
@@ -556,18 +588,21 @@ impl Workload for Foreign {
         let dir = scratch.path();
 
         let mut staging_notes: Vec<String> = Vec::new();
-        let ready = stage(dir, &erlc, &mut staging_notes);
-        if ready.is_empty() {
-            let mut result = WorkloadResult::skipped(
-                self.id(),
-                kind,
-                self.category(),
-                self.description(),
-                "sources-missing",
-            );
-            result.notes = staging_notes;
-            return result;
-        }
+        let ready = match stage(dir, &erlc, &mut staging_notes) {
+            Ok(ready) => ready,
+            Err(err) => {
+                // A checkout that simply lacks the foreign sources is a *missing
+                // prerequisite* (skip); a failure to compile the sources we did stage is a
+                // real failure, never a benign skip.
+                let (status, reason) = stage_outcome(err);
+                let mut result =
+                    WorkloadResult::new(self.id(), kind, self.category(), self.description());
+                result.status = status;
+                result.reason = Some(reason.to_string());
+                result.notes = staging_notes;
+                return result;
+            }
+        };
 
         let runs = runs_for(ctx.profile);
         let mut result = WorkloadResult::new(self.id(), kind, self.category(), self.description());
@@ -716,13 +751,33 @@ mod tests {
     }
 
     #[test]
-    fn stage_without_a_driver_dir_reports_and_yields_nothing() {
-        let missing = std::env::temp_dir().join(format!("bench-foreign-absent-{}", std::process::id()));
+    fn stage_in_a_missing_dir_is_a_compile_failure_flag_not_a_skip() {
+        // A non-existent scratch dir makes the driver write fail — a real failure of code
+        // we staged, which must classify as `CompileFailed`, never as `NoSources`.
+        let missing =
+            std::env::temp_dir().join(format!("bench-foreign-absent-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&missing);
         let mut notes = Vec::new();
-        let ready = stage(&missing, Path::new("/nonexistent/erlc"), &mut notes);
-        assert!(ready.is_empty());
+        let err = match stage(&missing, Path::new("/nonexistent/erlc"), &mut notes) {
+            Ok(_) => panic!("a missing driver dir must not report success"),
+            Err(e) => e,
+        };
+        assert_eq!(err, StageError::CompileFailed);
         assert!(!notes.is_empty(), "the failure must be recorded, not swallowed");
+    }
+
+    #[test]
+    fn stage_failure_maps_sources_absent_to_skip_and_compile_failure_to_failed() {
+        // Genuinely-absent sources are a missing prerequisite…
+        assert_eq!(
+            stage_outcome(StageError::NoSources),
+            (Status::Skipped, "sources-missing")
+        );
+        // …whereas a compile failure of staged code is a real failure, never a benign skip.
+        assert_eq!(
+            stage_outcome(StageError::CompileFailed),
+            (Status::Failed, "module-compile-failed")
+        );
     }
 
     /// Oracle-gated smoke test: with the real checkouts + `erlc` present, one case must
@@ -740,7 +795,9 @@ mod tests {
             }
             let scratch = ScratchDir::new("bench-foreign-smoke").expect("scratch");
             let mut notes = Vec::new();
-            let ready = stage(scratch.path(), &erlc, &mut notes);
+            let Ok(ready) = stage(scratch.path(), &erlc, &mut notes) else {
+                continue;
+            };
             let Some(case) = ready.first() else { continue };
             let program = runtime.program().expect("a self-checking runtime resolves");
             let outcome = execute_case(program, runtime.kind, scratch.path(), case, 1);

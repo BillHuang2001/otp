@@ -440,7 +440,9 @@ and `… beam_rt -noshell -pa <fix> -eval '…'` (runtime root process, which **
 Exit 0 = success, 1 = runtime error, 3 = capability gap.
 
 ### Works today (oracle-identical)
-`code:which/1`, `code:load_file/1` (then `module_loaded/1` true), `application:get_key/1,2`,
+`code:which/1`, `code:get_object_code/1` (the oracle's path-based `{Module,Binary,Filename}`, its
+bytes and byte count cross-checked against `erl`'s own `mod_to_bin/3` read), `code:load_file/1` (then `module_loaded/1` true),
+`application:get_key/1,2`,
 `application:loaded_applications/0`, `application:which_applications/0`, `error_logger:warning_map/0`
 (a `RuntimeHooks` bridge). **An OTP-behaviour child comes up and survives**: `proc_lib:start_link/3`,
 `gen_server:start_link/2,3` (unnamed and `{local,Name}`), `gen_server:start/2,3` and
@@ -490,9 +492,6 @@ where the oracle counts **characters**
    `{error,{not_started,sasl}}`. The native floor answers only the read-only queries (items in "Works
    today"); no application's `start/2` runs and no supervision tree becomes live. Repro:
    `ap:start_sasl/0`, `ap:start_syntax/0`, `ap:ensure_syntax/0`.
-3. **`code:get_object_code/1` raises `badarg`** (oracle: `{Module,Binary,Filename}`); `code:which/1` and
-   `code:load_file/1` are fine. `erlang:module_loaded/1` is truthful to this runtime's own loaded set, so
-   `module_loaded(lists)` is `false` until `lists` is demanded (oracle: `true`).
 
 ### The `-eval` vs scheduled asymmetry
 The `-eval` root process **pumps** the scheduler and can suspend a blocking call; a **scheduled**

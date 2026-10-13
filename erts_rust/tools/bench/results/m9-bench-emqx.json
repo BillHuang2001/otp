@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "tool": "bench",
+  "tool_version": "0.1.0",
+  "generated_at_unix_ms": 1791900585050,
+  "profile": "quick",
+  "runtimes": [
+    {
+      "kind": "sys",
+      "program": "/nix/store/khp1dd3fk8476mwg62cinwvk5a17r53s-erlang-29.1.1/lib/erlang/erts-17.1/bin/erl",
+      "version": "29",
+      "supported": true,
+      "notes": []
+    }
+  ],
+  "results": [
+    {
+      "workload": "emqx",
+      "runtime": "sys",
+      "category": "messaging",
+      "description": "EMQX broker build (make emqx-enterprise-compile: mix deps.get + mix compile) — messaging/copy bound",
+      "status": "skipped",
+      "reason": "emqx-requires-otp-28",
+      "metrics": [],
+      "peak_memory_bytes": null,
+      "notes": [
+        "EMQX builds with Erlang/OTP 28 (env.sh OTP_VSN / .tool-versions), but `erl` on PATH is OTP 29: the umbrella build aborts in a dependency NIF (:ezstd) whose makefile generates env.mk via `erl -noshell -s init stop -eval …`, an idiom OTP 29 no longer evaluates, so `mix compile` fails with \"No rule to make target '…/env.mk'\"; no number is fabricated"
+      ]
+    }
+  ]
+}

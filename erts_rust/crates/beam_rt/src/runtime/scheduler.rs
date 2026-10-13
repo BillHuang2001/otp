@@ -753,6 +753,24 @@ impl Runtime {
     /// identity, exactly the one [`crate::context`]'s node identity hands
     /// `beam_codec`: an addressed pid on any other node is then a foreign process.
     ///
+    /// # Why this entry stays on the *classify-only* path
+    ///
+    /// The two **production** inbound drives — the listening node
+    /// ([`crate::dist::DistNode::dispatch_inbound`]) and the connecting half
+    /// ([`DistClient::dispatch_inbound`](crate::dist_client::DistClient::dispatch_inbound))
+    /// — both drain through a driver's `dispatch_inbound_checked`, so every delivery a
+    /// real peer sends is validated against **its own** link identity. This entry is
+    /// the *explicit, single-driver* seam (`runtime.rs`: "an explicit caller has
+    /// already asked"), and it cannot perform that per-link check soundly: the caller
+    /// supplies an arbitrary hand-built [`ConnectionDriver`] whose own
+    /// handshake names need not be this runtime's node identity, so validating against
+    /// them would judge a message against a *foreign* identity — the identity check is
+    /// only meaningful where the driver and the node were built from the same name,
+    /// which is exactly what the two production drives guarantee and this seam cannot.
+    /// It therefore stays on [`ConnectionDriver::dispatch_inbound`] (the semantic
+    /// classification view); a caller that drives real wire bytes should use the
+    /// production drives.
+    ///
     /// # Errors
     ///
     /// A link-level decode/classification failure (a truncated or malformed control

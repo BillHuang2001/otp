@@ -61,7 +61,7 @@
 //! | [`driver_ports`] | A.4 — the `open_port/2` port-open error shapes + the missing-`spawn_executable` `enoent` shape |
 //! | [`wire`] | A.5 — the distribution wire codec (ETF cross-encoding) |
 //! | [`wire_ids`] | A.2/A.5 — `term_to_binary` of a local pid / port id, plus the A.5 node-identity surface (`node/0,1`, `nodes/0,1`, the `set_cookie/2` family) |
-//! | [`dist`] | A.5 — the live two-node distribution loopback (handshake / node visibility / term delivery) via the external `dist_probe` helper (`CaseKind::Command`) |
+//! | [`dist`] | A.5 — the live two-node distribution loopback (handshake / node visibility / term delivery / non-Latin-1 atom round trip) via the external `dist_probe` helper (`CaseKind::Command`) |
 //! | [`flags`] | A.6 — CLI / configuration (incl. the `+hmax`/`+hmaxk`/`+hmaxel`/`+hmaxib`/`+hms`/`+hmbs` max-heap family) |
 //! | [`bifs`] | A.7 — BIF / OTP app surface (incl. the timer, process-control and code-loading families, `erts_debug:size/1`, `erts_internal:cmp_term/2`) |
 //! | [`phash`] | A.7 — `phash/2` and `phash2/1,2` (the externally-observable legacy hashes) |

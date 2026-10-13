@@ -82,11 +82,22 @@
 //!   family) has no correct local seam in this runtime and is reported as the honest
 //!   [`DeliveryOutcome::Unsupported`], with the missing `beam_process` API named at its
 //!   match arm — never a fabricated or mis-addressed delivery. A message the runtime
-//!   cannot decode or classify **retires that one link** (recorded in
+//!   cannot decode, validate or classify **retires that one link** (recorded in
 //!   [`DistNode::last_link_error`]); it never fails a scheduler pass.
-//! * **A broken link is dropped, not raised.** A protocol error or a write
-//!   failure retires that one link and is recorded in
-//!   [`DistNode::last_link_error`]; it never aborts the runtime.
+//! * **Every inbound delivery is validated against its own link.** Each link drains
+//!   through [`ConnectionDriver::dispatch_inbound_checked`], so a delivery is checked
+//!   against **that** link's peer/own identity (the C's per-opcode `invalid_message`
+//!   shape checks plus the `dep != external_pid_dist_entry(from)` anti-spoof check,
+//!   `dist.c`) before it can reach a mailbox. The check cannot live in the sink — one
+//!   [`LocalDeliverySink`] is built per pass and shared by every link — so it is the
+//!   per-link driver that performs it; a **validation failure is a link-level `Err`**,
+//!   i.e. it retires (kills) that one link and is recorded in
+//!   [`DistNode::last_link_error`], exactly as the C's `invalid_message` arm does. A
+//!   forged `From` naming another node, or a malformed party term, is therefore never
+//!   delivered and never merely ignored.
+//! * **A broken link is dropped, not raised.** A protocol error, a write
+//!   failure or a failed per-link inbound validation retires that one link and is
+//!   recorded in [`DistNode::last_link_error`]; it never aborts the runtime.
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -337,20 +348,34 @@ impl DistConnection {
         Ok(events)
     }
 
-    /// Decodes, classifies and routes every control message this link has queued,
-    /// returning one [`Dispatched`] record per message in arrival order.
+    /// Decodes, **validates + classifies** and routes every control message this
+    /// link has queued, returning one [`Dispatched`] record per message in arrival
+    /// order.
     ///
-    /// A thin forwarder to [`ConnectionDriver::dispatch_inbound`]: the driver owns
-    /// the queue and the receive atom cache, the sink owns the routing (see
-    /// [`LocalDeliverySink`]). An `Err` is a link-level decode/classification
-    /// failure — the caller retires the link and records the reason.
+    /// A thin forwarder to [`ConnectionDriver::dispatch_inbound_checked`]: the driver
+    /// owns the queue, the receive atom cache **and the link's own identity** (its
+    /// `peer_name()`/`our_name()`), so every delivery is validated against *this*
+    /// link — the C's per-opcode `invalid_message` shape checks and the per-link
+    /// `dep != external_pid_dist_entry(from)` anti-spoof check (`dist.c`) — while the
+    /// sink owns the routing (see [`LocalDeliverySink`]). The link identity is
+    /// interned into the **same** atom table the message was decoded against, so the
+    /// node comparison is a raw term `==`.
+    ///
+    /// The identity check deliberately lives here rather than in the sink: one
+    /// [`LocalDeliverySink`] is built per scheduler pass and shared by **every** link,
+    /// so it has no peer to compare a `From` against; only the per-link driver does.
+    ///
+    /// An `Err` is a **link-level** failure — a decode/classification failure *or* a
+    /// validation failure (a malformed message, or a forged one whose named node is
+    /// not this link's peer) — and the caller retires the link and records the reason,
+    /// exactly as the C kills the connection on `invalid_message`.
     fn dispatch_inbound(
         &mut self,
         heap: &mut Heap,
         atoms: &mut AtomTable,
         sink: &mut dyn InboundSink,
     ) -> Result<Vec<Dispatched>> {
-        self.driver.dispatch_inbound(heap, atoms, sink)
+        self.driver.dispatch_inbound_checked(heap, atoms, sink)
     }
 }
 
@@ -558,11 +583,14 @@ impl DistNode {
     /// immediately.
     ///
     /// A **link-level** failure — a message this runtime cannot decode or classify
-    /// (`beam_dist`'s `BadArg` from a truncated/malformed control message) — retires
-    /// **that one link** and records the reason in [`DistNode::last_link_error`],
-    /// exactly as [`DistNode::pump`] does; it is never propagated, so a hostile or
-    /// broken peer can neither fail nor stall a scheduler pass. The existing links
-    /// (and their already-dispatched messages) are untouched.
+    /// (`beam_dist`'s `BadArg` from a truncated/malformed control message), **or** one
+    /// that fails the per-link [`Delivery::classify_validated`] checks (a forged
+    /// control message whose named node/party identity is not this link's own) —
+    /// retires **that one link** and records the reason in
+    /// [`DistNode::last_link_error`], exactly as [`DistNode::pump`] does and exactly
+    /// as the C's `invalid_message` arm kills the connection (`dist.c`); it is never
+    /// propagated, so a hostile or broken peer can neither fail nor stall a scheduler
+    /// pass. The existing links (and their already-dispatched messages) are untouched.
     ///
     /// # Errors
     ///

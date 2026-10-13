@@ -96,11 +96,14 @@ use crate::monitor::{
 use crate::pid::{PortId, ProcessId, MAX_PROCESS_NUMBER};
 use crate::port::PortTable;
 use crate::process::{CollectionGate, DeliverOutcome, Process, ProcessState};
-use crate::remote::{DistSignal, DistSignalRouter, PidTarget, RemoteMonitor, RemotePid};
+use crate::remote::{
+    DistSignal, DistSignalRouter, PidTarget, RemoteMonitor, RemotePid, RemoteWatcher,
+};
 use crate::run_queue::Priority;
 use crate::signal::{
     build_down_message_port, build_down_message_remote, build_down_message_term,
-    build_exit_message, build_exit_message_term, exit_policy, ExitPolicy, ExitSignal, SignalAtoms,
+    build_exit_message, build_exit_message_term, exit_policy, ExitPolicy, ExitSignal, ReasonClass,
+    SignalAtoms,
 };
 use crate::signal_queue::PendingSignal;
 
@@ -474,6 +477,17 @@ pub struct ProcessTable {
     remote_links: HashMap<ProcessId, Vec<RemotePid>>,
     /// Per local process: its outgoing monitors on remote processes/ports.
     remote_monitors: HashMap<ProcessId, Vec<RemoteMonitor>>,
+    /// Per local process: the **incoming** remote monitors — remote processes watching it
+    /// (`DOP_MONITOR_P`). The mirror of [`ProcessTable::remote_monitors`], kept in a side table
+    /// rather than in the frozen [`MonitoredBy`](crate::monitor::MonitoredBy) record set (see
+    /// [`RemoteWatcher`]). An entry dies with the watched process
+    /// ([`ProcessTable::terminate_into`]).
+    remote_watchers: HashMap<ProcessId, Vec<RemoteWatcher>>,
+    /// Per local process: its **group leader**, as a [`PidTarget`] so a leader on another node
+    /// (`DOP_GROUP_LEADER`) is representable. Side table for the same reason as
+    /// [`ProcessTable::remote_watchers`]: `Process`'s field set is frozen. An entry dies with
+    /// the member process ([`ProcessTable::terminate_into`]).
+    group_leaders: HashMap<ProcessId, PidTarget>,
     /// The target descriptor of every **named** monitor (`erlang:monitor(process, Name)`), keyed
     /// by its reference (see [`NamedTarget`]). An entry dies with its monitor: `demonitor`, the
     /// dying holder's outgoing-monitor sweep and a delivered DOWN all remove it.
@@ -533,6 +547,8 @@ impl ProcessTable {
             ready: Vec::new(),
             remote_links: HashMap::new(),
             remote_monitors: HashMap::new(),
+            remote_watchers: HashMap::new(),
+            group_leaders: HashMap::new(),
             named_monitors: HashMap::new(),
             tags: HashMap::new(),
             aliases: HashMap::new(),
@@ -1664,28 +1680,73 @@ impl ProcessTable {
     ///
     /// Propagates the router's transport errors.
     fn demonitor_remote(&mut self, watcher: ProcessId, reference: MonitorRef) -> Result<bool> {
-        let (monitor, emptied) = {
-            let Some(monitors) = self.remote_monitors.get_mut(&watcher) else {
-                return Ok(false);
-            };
-            let Some(index) = monitors
-                .iter()
-                .position(|monitor| monitor.reference == reference)
-            else {
-                return Ok(false);
-            };
-            let monitor = monitors.remove(index);
-            (monitor, monitors.is_empty())
+        let Some(monitor) = self.remove_remote_monitor(watcher, reference) else {
+            return Ok(false);
         };
-        if emptied {
-            self.remote_monitors.remove(&watcher);
-        }
         self.route(DistSignal::Demonitor {
             watcher,
             target: monitor.remote,
             reference,
         })?;
         Ok(true)
+    }
+
+    /// Removes the outgoing **remote** monitor `watcher` holds under `reference`, returning it.
+    ///
+    /// The **route-free** half of [`ProcessTable::demonitor_remote`]: the inbound
+    /// `DOP_MONITOR_P_EXIT` route ([`ProcessTable::remote_monitor_down`]) must resolve the local
+    /// record without putting a `DOP_DEMONITOR_P` back on the wire, so both share this one
+    /// removal (an emptied monitor set carries no information, so its map entry is dropped).
+    fn remove_remote_monitor(
+        &mut self,
+        watcher: ProcessId,
+        reference: MonitorRef,
+    ) -> Option<RemoteMonitor> {
+        let (monitor, emptied) = match self.remote_monitors.get_mut(&watcher) {
+            Some(monitors) => {
+                let monitor = match monitors
+                    .iter()
+                    .position(|monitor| monitor.reference == reference)
+                {
+                    Some(index) => Some(monitors.remove(index)),
+                    None => None,
+                };
+                (monitor, monitors.is_empty())
+            }
+            None => (None, false),
+        };
+        if emptied {
+            self.remote_monitors.remove(&watcher);
+        }
+        monitor
+    }
+
+    /// Removes the recorded remote link `from` from `to`'s `remote_links`, answering whether one
+    /// was recorded.
+    ///
+    /// The route-free half [`ProcessTable::link_term`]'s remote branch and
+    /// [`ProcessTable::unlink_term`] share, now also used by the inbound receipt arms
+    /// ([`ProcessTable::apply_remote_exit_signal`]'s link-exit family and
+    /// [`ProcessTable::unlink_from_remote`]). An emptied link set carries no information, so its
+    /// map entry is dropped (exactly as `unlink_term` does).
+    fn remove_remote_link(&mut self, to: ProcessId, from: RemotePid) -> bool {
+        let (removed, emptied) = match self.remote_links.get_mut(&to) {
+            Some(links) => {
+                let removed = match links.iter().position(|entry| *entry == from) {
+                    Some(index) => {
+                        links.remove(index);
+                        true
+                    }
+                    None => false,
+                };
+                (removed, links.is_empty())
+            }
+            None => (false, false),
+        };
+        if emptied {
+            self.remote_links.remove(&to);
+        }
+        removed
     }
 
     // --- reference aliases (`erlang:alias/1`, `erlang:unalias/1`) ------------
@@ -2133,6 +2194,16 @@ impl ProcessTable {
         // Outgoing *remote* monitors die with the watcher: the remote node will simply
         // never see a `DOP_DEMONITOR_P`, which mirrors the local case above.
         self.remote_monitors.remove(&pid);
+        // The dying process's **incoming** remote watchers and its group-leader entry go with
+        // it: neither can outlive its subject, and both are keyed by the local pid (whose slot
+        // serial `take` has already bumped, so a stale entry could never be observed again).
+        //
+        // A **gap**, recorded in `../CONTEXT.md` Known Issues: a local process with remote
+        // watchers should tell each of them it is gone (`DOP_MONITOR_P_EXIT`), and the outgoing
+        // `DistSignal` enum has no variant for it — so the records are dropped without
+        // notifying them here.
+        self.remote_watchers.remove(&pid);
+        self.group_leaders.remove(&pid);
         // 5. Notify the process-death observer exactly once, now that the death has been
         //    propagated and *before* `drop(process)`: `reason` may live in the dying heap, so the
         //    payload is only valid up to the drop below. The observer is isolated (a panic is
@@ -2808,19 +2879,7 @@ impl ProcessTable {
         match PidTarget::from_eterm(b)? {
             PidTarget::Local(pid) => self.unlink(a, pid),
             PidTarget::Remote(remote) => {
-                let emptied = match self.remote_links.get_mut(&a) {
-                    Some(links) => {
-                        if let Some(index) = links.iter().position(|entry| *entry == remote) {
-                            links.remove(index);
-                        }
-                        links.is_empty()
-                    }
-                    None => false,
-                };
-                if emptied {
-                    // An emptied link set carries no information.
-                    self.remote_links.remove(&a);
-                }
+                self.remove_remote_link(a, remote);
                 self.route(DistSignal::Unlink { from: a, to: remote })
             }
         }
@@ -3015,6 +3074,379 @@ impl ProcessTable {
             .get(&pid)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    // --- inbound (receipt) distribution primitives ---------------------------
+    //
+    // The other half of the distribution seam: a `DOP_*` a peer sent us, decoded by `beam_rt`
+    // (which owns the wire) and handed here as its already-parsed pieces. Every entry point below
+    // is deliberately **route-free** — the C's inbound receipt arms never echo the opcode they
+    // received (`dist.c:2258` `break; /* Done */` after `DOP_LINK`), so none may go through the
+    // locally-initiated entry points (`link_term`/`unlink_term`/`monitor_term`/`demonitor`/
+    // `send_exit_term`), which all route a `DOP_*` through the installed `DistSignalRouter`.
+    // Legacy C ground truth (read-only): `dist.c`'s receipt switch (`case DOP_LINK` …) plus
+    // `erl_proc_sig_queue.c`'s signal handlers.
+
+    /// Records an incoming `DOP_LINK` — `{DOP_LINK, From(remote), To(local)}` (`dist.c:2224`):
+    /// the remote `from` is now linked to the local `to`.
+    ///
+    /// **Record-only.** The C's arm installs the link and then ends `break; /* Done */`
+    /// (`dist.c:2258`) — it sends **no** `DOP_LINK` back. This writes the same `remote_links`
+    /// half [`ProcessTable::link_term`] writes for a *locally initiated* link (deduplicated the
+    /// same way), so a later [`ProcessTable::apply_remote_exit_signal`] link-exit finds the link
+    /// and removes it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::TermNotFound` when `to` is not a live local process, recording
+    /// nothing. The C replies `DOP_EXIT` with `noproc` on that failure/race path
+    /// (`dist.c:2269-2275`); that reply is a wire artifact `beam_rt`/`beam_dist` own, so this
+    /// reports the same condition as a typed error and lets the caller decide.
+    pub fn record_remote_link(&mut self, to: ProcessId, from: RemotePid) -> Result<()> {
+        if !self.contains(to) {
+            return Err(error::unknown_process());
+        }
+        let links = self.remote_links.entry(to).or_default();
+        // Like `Links::add`: a re-link of an already-linked pair changes nothing.
+        if !links.contains(&from) {
+            links.push(from);
+        }
+        Ok(())
+    }
+
+    /// Applies an incoming exit signal from a remote process —
+    /// `DOP_EXIT`/`DOP_PAYLOAD_EXIT` or `DOP_EXIT2`/`DOP_PAYLOAD_EXIT2` (`dist.c:2760`/`:2824`),
+    /// which the C funnels into `handle_exit_signal` (`erl_proc_sig_queue.c:4633`).
+    ///
+    /// `untrappable` selects the C **operation family**, which is what decides the trap rule:
+    ///
+    /// * `untrappable == false` — the **link-exit** family (`ERTS_SIG_Q_OP_EXIT_LINKED`, what
+    ///   `DOP_EXIT`/`DOP_PAYLOAD_EXIT` become). The recorded incoming remote link `from` is
+    ///   removed from `to`'s `remote_links` **first**, and **if no such link is recorded the
+    ///   signal is ignored entirely** (`ignore = destroy = !0`,
+    ///   `erl_proc_sig_queue.c:4674-4680`). The trap rule is then: a **trapping** `to` receives
+    ///   `{'EXIT', RemotePid, Reason}` for *every* reason, while a non-trapping one **ignores**
+    ///   `normal` and is otherwise terminated with the reason **unchanged** — a link exit of
+    ///   reason `kill` to a non-trapping process terminates it with `kill`, *not* `killed`,
+    ///   because the `reason = am_killed` rewrite is guarded by `op == ERTS_SIG_Q_OP_EXIT`
+    ///   (`erl_proc_sig_queue.c:4740`/`:4768`).
+    /// * `untrappable == true` — the **`erlang:exit/2`** family (`ERTS_SIG_Q_OP_EXIT`, what
+    ///   `DOP_EXIT2`/`DOP_PAYLOAD_EXIT2` become, `dist.c:2863`): **no link is consulted or
+    ///   removed**, and the trap rule is the crate's [`exit_policy`] — trapping traps everything
+    ///   **except** `kill`, which terminates even a trapping receiver, with reason `killed`.
+    ///
+    /// The `to`'s recorded remote link is removed *before* the policy runs, exactly as the C
+    /// deletes the link in `handle_exit_signal` regardless of what it then decides.
+    ///
+    /// The trapped `{'EXIT', RemotePid, Reason}` is materialised straight into `to`'s mailbox
+    /// ([`ProcessTable::enqueue_remote_exit_message`]): an external-pid signal bypasses the
+    /// signal queue, exactly as [`ProcessTable::node_down`] does (it carries no `trap_exit`
+    /// decision to defer). The message's **`from`** is the remote **node atom** (an immediate,
+    /// as the C stores it) while the external pid stays in the message *body*.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::TermNotFound` when `to` is not a live local process; propagates the
+    /// message builder's `BeamError::Alloc` and the cascading termination's errors.
+    pub fn apply_remote_exit_signal(
+        &mut self,
+        to: ProcessId,
+        from: RemotePid,
+        reason: Eterm,
+        untrappable: bool,
+    ) -> Result<()> {
+        let trapping = match self.get(to) {
+            Some(process) => process.is_trapping_exit(),
+            None => return Err(error::unknown_process()),
+        };
+        if untrappable {
+            // The `erlang:exit/2` family: no link is consulted, and `exit_policy` already spells
+            // this family's rule (trapping traps everything but `kill`; `kill` ⇒ `killed`).
+            match exit_policy(reason, trapping, &self.atoms) {
+                ExitPolicy::Ignore => Ok(()),
+                ExitPolicy::Trap => self.enqueue_remote_exit_message(to, from, reason),
+                ExitPolicy::Terminate(peer_reason) => self.terminate(to, peer_reason),
+            }
+        } else {
+            // The link-exit family: the link record goes first, and an exit with no matching link
+            // is ignored outright (`erl_proc_sig_queue.c:4674-4680`).
+            if !self.remove_remote_link(to, from) {
+                return Ok(());
+            }
+            if trapping {
+                // A link exit is trappable for *every* reason, `kill` included.
+                return self.enqueue_remote_exit_message(to, from, reason);
+            }
+            match self.atoms.classify(reason) {
+                // A `normal` link exit is ignored by a non-trapping process.
+                ReasonClass::Normal => Ok(()),
+                // ... any other reason terminates it with the reason UNCHANGED (`kill` is not
+                // rewritten to `killed` in the link-exit family — see the method docs).
+                ReasonClass::Kill | ReasonClass::Other => self.terminate(to, reason),
+            }
+        }
+    }
+
+    /// Applies an incoming `DOP_UNLINK_ID` — `{DOP_UNLINK_ID, Id, From(remote), To(local)}`
+    /// (`dist.c:2284`) — and answers the id the caller must acknowledge with.
+    ///
+    /// Removes the recorded remote link `from` from `to`'s `remote_links`, and returns `Some(id)`
+    /// when an `{DOP_UNLINK_ID_ACK, Id, To(local), From(remote)}` reply is required (`id != 0`),
+    /// `None` otherwise. The C's handler (`ERTS_SIG_Q_OP_UNLINK`,
+    /// `erl_proc_sig_queue.c:6665-6700`) calls `reply_dist_unlink_ack` **unconditionally** — the
+    /// link-tree lookup above it only decides whether a link is dropped — and
+    /// `reply_dist_unlink_ack` sends nothing when `id == 0` (`erl_proc_sig_queue.c:2753-2760`:
+    /// *"'id' is zero if the other side not understand unlink-ack signals"*). An `id == 0` on the
+    /// wire is in fact rejected before it ever gets here (`dist.c:2292-2293`
+    /// `if (id == 0) goto invalid_message;`), so `None` is the answer for a case `beam_rt` would
+    /// have dropped.
+    ///
+    /// **Route-free.** The ACK is a **different opcode** and the wire is `beam_rt`'s, so this
+    /// never routes — in particular it must not route a plain `DOP_UNLINK_ID` (which is what the
+    /// locally-initiated [`ProcessTable::unlink_term`] does). The public [`DistSignal`] enum
+    /// gained **no** `UnlinkAck` variant for it: a required variant would break the sibling
+    /// `beam_rt`'s exhaustive match, and the id of a locally-initiated unlink is minted by the
+    /// router (`remote.rs`'s mapping).
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::TermNotFound` when `to` is not a live local process. An unlink of a
+    /// link that is not recorded is **not** an error — the link set simply does not change (the
+    /// C's `if (llnk)` guard).
+    pub fn unlink_from_remote(
+        &mut self,
+        to: ProcessId,
+        from: RemotePid,
+        id: u64,
+    ) -> Result<Option<u64>> {
+        if !self.contains(to) {
+            return Err(error::unknown_process());
+        }
+        self.remove_remote_link(to, from);
+        Ok(if id != 0 { Some(id) } else { None })
+    }
+
+    /// Applies an incoming `DOP_UNLINK_ID_ACK` — `{DOP_UNLINK_ID_ACK, Id, From(remote),
+    /// To(local)}` (`dist.c:2315`): the remote side acknowledged a `DOP_UNLINK_ID` this node
+    /// sent.
+    ///
+    /// The C resolves its own pending unlink operation here (`ERTS_SIG_Q_OP_UNLINK_ACK`,
+    /// `erl_proc_sig_queue.c:6733-6760`: it deletes the link whose `unlinking` id equals the ack
+    /// id). **This crate models no pending unlink-id operations** — [`DistSignal::Unlink`]
+    /// carries no id (the router mints one on the fly and keeps no record of it), so there is
+    /// nothing for this side to resolve. The call therefore only validates that `to` is live and
+    /// is otherwise a no-op, so a caller can never mistake "nothing to do here" for
+    /// "unsupported". Closing the gap needs pending-op bookkeeping where the id is minted — the
+    /// router (`beam_rt`'s `dist_client`) — which is recorded in `../CONTEXT.md` Known Issues.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::TermNotFound` when `to` is not a live local process.
+    pub fn unlink_ack_from_remote(
+        &mut self,
+        to: ProcessId,
+        _from: RemotePid,
+        _id: u64,
+    ) -> Result<()> {
+        if !self.contains(to) {
+            return Err(error::unknown_process());
+        }
+        Ok(())
+    }
+
+    /// Records an incoming `DOP_MONITOR_P` — `{DOP_MONITOR_P, Remote(watcher), Local
+    /// pid-or-name(watched), Ref}` (`dist.c:2341`): a process on another node monitors the local
+    /// `watched`.
+    ///
+    /// The record is a [`RemoteWatcher`] in the `remote_watchers` side table — the mirror of the
+    /// outgoing [`RemoteMonitor`] [`ProcessTable::monitor_term`] records. A record is keyed by its
+    /// reference, as the C keys its origin tree: a re-sent `DOP_MONITOR_P` for an already-recorded
+    /// reference changes no observable state (the C's `erts_monitor_dist_insert` fails on the
+    /// duplicate and the new monitor is released, `dist.c:2374-2378`; replacing in place is the
+    /// same from the outside). **Nothing is routed**: the C's arm ends `break; /* done */` once
+    /// the local monitor signal has been queued (`dist.c:2378-2381`), so no `DOP_MONITOR_P` goes
+    /// back.
+    ///
+    /// The wire target may be a registered **name**; resolving the name and passing the resulting
+    /// `ProcessId` here is `beam_rt`'s job (this crate decodes no wire term), so this takes the
+    /// resolved local pid.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::TermNotFound` when `watched` is not a live local process, recording
+    /// nothing. The C replies `DOP_MONITOR_P_EXIT` with `noproc` on that path
+    /// (`dist.c:2404-2409`); that reply is a wire artifact `beam_rt`/`beam_dist` own.
+    pub fn monitor_from_remote(
+        &mut self,
+        watched: ProcessId,
+        watcher: RemotePid,
+        reference: MonitorRef,
+        kind: MonitorKind,
+    ) -> Result<()> {
+        if !self.contains(watched) {
+            return Err(error::unknown_process());
+        }
+        let record = RemoteWatcher {
+            reference,
+            watcher,
+            kind,
+        };
+        let watchers = self.remote_watchers.entry(watched).or_default();
+        match watchers.iter().position(|entry| entry.reference == reference) {
+            Some(index) => watchers[index] = record,
+            None => watchers.push(record),
+        }
+        Ok(())
+    }
+
+    /// Applies an incoming `DOP_DEMONITOR_P` — `{DOP_DEMONITOR_P, Remote(watcher), Local
+    /// pid-or-name(watched), Ref}` (`dist.c:2415`): the remote watcher cancels its monitor of
+    /// the local `watched`.
+    ///
+    /// Removes the matching [`RemoteWatcher`]. Removing a reference that is not recorded is an
+    /// `Ok(())` no-op (the record could already be gone). **Nothing is routed** — the C's arm
+    /// only cancels the local record and answers nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::TermNotFound` when `watched` is not a live local process.
+    pub fn demonitor_from_remote(
+        &mut self,
+        watched: ProcessId,
+        reference: MonitorRef,
+    ) -> Result<()> {
+        if !self.contains(watched) {
+            return Err(error::unknown_process());
+        }
+        let emptied = match self.remote_watchers.get_mut(&watched) {
+            Some(watchers) => {
+                watchers.retain(|entry| entry.reference != reference);
+                watchers.is_empty()
+            }
+            None => false,
+        };
+        if emptied {
+            self.remote_watchers.remove(&watched);
+        }
+        Ok(())
+    }
+
+    /// The **incoming** remote monitors recorded for `watched` — the remote processes that
+    /// monitor it (an inbound `DOP_MONITOR_P` per entry).
+    ///
+    /// A pid that is no longer live resolves to nothing, the same rule
+    /// [`ProcessTable::remote_links`] applies.
+    pub fn remote_watchers(&self, watched: ProcessId) -> &[RemoteWatcher] {
+        if !self.contains(watched) {
+            return &[];
+        }
+        self.remote_watchers
+            .get(&watched)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Applies an incoming `DOP_MONITOR_P_EXIT` / `DOP_PAYLOAD_MONITOR_P_EXIT` — `{…,
+    /// Remote-or-name(watched), Local(watcher), Ref, Reason}` (`dist.c:2700-2714`): a process the
+    /// **local** `watcher` monitors on the remote node has died.
+    ///
+    /// Two things happen, and both matter:
+    ///
+    /// 1. the `watcher`'s outgoing [`RemoteMonitor`] under `reference` is **removed without
+    ///    routing** — no `DOP_DEMONITOR_P` may go back on the wire (the C's arm only queues the
+    ///    local DOWN signal, `erts_proc_sig_send_dist_monitor_down`). This is why
+    ///    [`ProcessTable::demonitor_remote`] (which routes) is *not* used, and why the removal is
+    ///    the point rather than an optimisation: a stale record would make a later
+    ///    [`ProcessTable::node_down`] sweep fire a **second** `{'DOWN', …}` for the same
+    ///    reference.
+    /// 2. `{'DOWN', Ref, process, RemotePid, Reason}` is delivered into `watcher`'s mailbox
+    ///    (through [`ProcessTable::enqueue_remote_down_message`], the builder `node_down` also
+    ///    uses), waking a blocked watcher. `DOP_MONITOR_P_EXIT` is a **process** monitor on the
+    ///    wire, so the DOWN's kind slot is `process` — matching `node_down`, which likewise
+    ///    ignores a record's `kind` for a remote monitor.
+    ///
+    /// **If no matching record exists, nothing is delivered**: the C resolves the DOWN through
+    /// the watcher's monitor tree by reference and drops the signal when the lookup misses
+    /// (`erl_proc_sig_queue.c:6355-6396`).
+    ///
+    /// The wire's `watched` may be a registered **name** (`dist.c:2722` accepts an external pid
+    /// *or* an atom); resolving it is `beam_rt`'s job and the outgoing record it must match holds
+    /// a [`RemotePid`], so this takes the resolved `RemotePid`. A name-targeted DOWN (the C's
+    /// `watched = am_...` form) is therefore **not** representable through this API — recorded as
+    /// a Known Issue with its owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::TermNotFound` when `watcher` is not a live local process; propagates
+    /// the message builder's `BeamError::Alloc`.
+    pub fn remote_monitor_down(
+        &mut self,
+        watcher: ProcessId,
+        watched: RemotePid,
+        reference: MonitorRef,
+        reason: Eterm,
+    ) -> Result<()> {
+        if !self.contains(watcher) {
+            return Err(error::unknown_process());
+        }
+        if self.remove_remote_monitor(watcher, reference).is_none() {
+            // No outgoing record for that reference: the C drops the DOWN (see the method docs).
+            return Ok(());
+        }
+        self.enqueue_remote_down_message(watcher, reference, watched, reason)
+    }
+
+    /// Applies an incoming `DOP_GROUP_LEADER` — `{DOP_GROUP_LEADER, From(leader),
+    /// To(member)}` (`dist.c:2889-2900`): the remote `from` becomes the group leader of the
+    /// local `to`.
+    ///
+    /// The leader is recorded as a [`PidTarget::Remote`] in the table's `group_leaders` store — a
+    /// side table, not a `Process` field (whose shape is frozen) — through which
+    /// [`ProcessTable::group_leader`] reads it back. **Nothing is routed**: the C's arm only
+    /// installs the leader (`erts_proc_sig_send_group_leader`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::TermNotFound` when `to` is not a live local process.
+    pub fn set_group_leader_from_remote(&mut self, to: ProcessId, from: RemotePid) -> Result<()> {
+        if !self.contains(to) {
+            return Err(error::unknown_process());
+        }
+        self.group_leaders.insert(to, PidTarget::Remote(from));
+        Ok(())
+    }
+
+    /// The group leader recorded for the local process `to` — a [`PidTarget`], so a leader on
+    /// **another node** (an inbound `DOP_GROUP_LEADER`) is representable.
+    ///
+    /// `None` for a process with no recorded leader, and for one that is not live (the same rule
+    /// [`ProcessTable::remote_links`] applies). An entry is dropped when its member process dies
+    /// ([`ProcessTable::terminate_into`]).
+    pub fn group_leader(&self, to: ProcessId) -> Option<PidTarget> {
+        if !self.contains(to) {
+            return None;
+        }
+        self.group_leaders.get(&to).copied()
+    }
+
+    /// Mints a fresh reference from the table's own [`RefAllocator`] — the allocator every
+    /// monitor, alias and outgoing remote monitor reference in this crate is drawn from.
+    ///
+    /// This is an **additive** seam for HAZARD 2, the collision of the two independent
+    /// reference-id spaces (this table's [`RefAllocator`] and `beam_rt::Runtime::refs`, which
+    /// feeds `make_ref/0`, the NIF `make_ref`, the timers and `seq_trace`). `next_reference`
+    /// lets the host draw *those* references from the **same** id space, which makes an id
+    /// collision between a monitor/alias reference and a bare `make_ref/0` reference
+    /// impossible — the one closure avenue available from this crate. **Nothing in this crate
+    /// calls it**: it closes HAZARD 2 only once the host adopts it (draw `make_ref/0` and its
+    /// timer/`seq_trace` references from here instead of from its own allocator). The
+    /// alternative — a distinguishing `node`/`serial` word in
+    /// [`MonitorRef::to_eterm`](crate::monitor::MonitorRef::to_eterm)'s payload — is *not*
+    /// closable from `beam_process`: `beam_codec`'s internal-reference codec rebuilds through
+    /// `beam_term`'s `write_internal_ref` with both words zeroed, and
+    /// `beam_term::compare::cmp_refs` compares payload words only.
+    pub fn next_reference(&mut self) -> MonitorRef {
+        self.refs.next()
     }
 
     /// A whole remote **node** went away (its distribution connection dropped): every local

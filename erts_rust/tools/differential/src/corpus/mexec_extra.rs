@@ -36,9 +36,9 @@
 //! [`Contract::BeamAsm`] (a compiled `.beam` executes) and [`Contract::OtpApps`] (a real
 //! OTP application module is loaded and run).
 //!
-//! Deliberately avoided (documented divergences, not agreement): `lists:usort/2` with an
-//! ascending comparator (the Rust runtime produces a wrong *result*) and the `math:erf/1`/
-//! `erfc/1` pair (1–5 ULP). `filelib` is only partly avoided: its **absent-path**
+//! Deliberately avoided (documented divergences, not agreement): the `math:erf/1`/`erfc/1`
+//! pair (a last-ULP difference — `erf(1.0)` is `0.8427007929497150` in the Rust runtime but
+//! `0.8427007929497149` in the oracle). `filelib` is only partly avoided: its **absent-path**
 //! `is_dir/1`/`is_file/1`/`is_regular/1` answers and the literal `wildcard/1` glob now AGREE
 //! (pinned by `boot_extra/filelib_*`), while its **existing-path** probes still hit the typed
 //! `#file_info{}` `access(2)` capability gap (a gap, not a differing value). Any golden that

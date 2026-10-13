@@ -43,31 +43,56 @@
 //! # The handoff: signal → distribution control message
 //!
 //! A downstream implementor of [`DistSignalRouter`] maps each signal onto one distributed
-//! control message, exactly as follows (so the wire format stays owned by `beam_dist`):
+//! control message, exactly as follows (so the wire format stays owned by `beam_dist`). The
+//! argument orders are the C's, read off the `erts_dsig_send_*` builders in the send half of
+//! `dist.c`:
 //!
 //! ```text
-//! DistSignal::Link      -> {DOP_LINK, From, To}                 -> Dop::Link,       &[from.to_eterm(), to_term]
-//! DistSignal::Unlink    -> {DOP_UNLINK_ID, From, To}            -> Dop::UnlinkId,   &[from.to_eterm(), to_term]
-//! DistSignal::Monitor   -> {DOP_MONITOR_P, Remote, Local, Ref}  -> Dop::MonitorP,   &[to_term, watcher.to_eterm(), ref_term]
-//! DistSignal::Demonitor -> {DOP_DEMONITOR_P, Remote, Local, Ref}-> Dop::DemonitorP, &[to_term, watcher.to_eterm(), ref_term]
-//! DistSignal::Exit      -> {DOP_EXIT, From, To, Reason}         -> Dop::Exit,       &[from.to_eterm(), to_term, reason]
-//! DistSignal::Exit2     -> {DOP_EXIT2, From, To, Reason}        -> Dop::Exit2,      &[from.to_eterm(), to_term, reason]
+//! DistSignal::Link      -> {DOP_LINK,        From(local), To(remote)}                 -> Dop::Link,       &[from.to_eterm(),  target_term]          dist.c:1456
+//! DistSignal::Unlink    -> {DOP_UNLINK_ID,   Id, From(local), To(remote)}             -> Dop::UnlinkId,   &[id_term, from.to_eterm(), target_term]  dist.c:1472
+//! DistSignal::Monitor   -> {DOP_MONITOR_P,   Watcher(local), Watched(remote), Ref}    -> Dop::MonitorP,   &[watcher.to_eterm(), target_term, ref_term]  dist.c:1543
+//! DistSignal::Demonitor -> {DOP_DEMONITOR_P, Watcher(local), Watched(remote), Ref}    -> Dop::DemonitorP, &[watcher.to_eterm(), target_term, ref_term]  dist.c:1566
+//! DistSignal::Exit      -> {DOP_EXIT,        From(local), To(remote), Reason}        -> Dop::Exit,       &[from.to_eterm(),  target_term, reason]  dist.c:1747
+//! DistSignal::Exit2     -> {DOP_EXIT2,       From(local), To(remote), Reason}        -> Dop::Exit2,      &[from.to_eterm(),  target_term, reason]  dist.c:1800
 //! ```
 //!
-//! where `to_term` is the [`RemotePid`] materialised on the router's own scratch heap with
-//! [`RemotePid::to_eterm`] and `ref_term` is the [`MonitorRef`] materialised with
-//! [`MonitorRef::to_eterm`]. (`DOP_UNLINK` = 4 is documented as *never sent*; modern ERTS
-//! unlinks by id, hence `Dop::UnlinkId`.) `DOP_EXIT` and `DOP_EXIT2` are distinct opcodes with
-//! distinct receipt semantics (read-only `dist.c:2760` vs `dist.c:2824`): `DOP_EXIT` is a
-//! **link** exit ("`from`, which `to` is linked to, died" → `erts_dsig_send_exit`,
-//! `dist.c:1747`) and `DOP_EXIT2` is a plain exit signal from `erlang:exit/2` ("`from` sent an
-//! exit signal to `to`" → `erts_dsig_send_exit2`, `dist.c:1800`), so the seam keeps them
-//! separate.
+//! where `target_term` is the **target** [`RemotePid`] (the `To` of the link/unlink/exit
+//! family, the *watched* remote process/port of the monitor family) and `from`/`watcher` is
+//! the local sender, each materialised on the router's own scratch heap with
+//! [`RemotePid::to_eterm`]; `ref_term` is the [`MonitorRef`] materialised with
+//! [`MonitorRef::to_eterm`]. Two details a router must not get wrong: **the watcher comes
+//! first** in the monitor family (`TUPLE4(DOP_MONITOR_P, watcher, watched, ref)`,
+//! `dist.c:1543-1545`), and **`DOP_UNLINK_ID` carries a leading `Id`**
+//! (`TUPLE4(DOP_UNLINK_ID, id, from, to)`, `dist.c:1472`) which [`DistSignal::Unlink`] does
+//! **not** carry — the router supplies it. (`DOP_UNLINK` = 4 is documented as *never sent*;
+//! modern ERTS unlinks by id, hence `Dop::UnlinkId`.) `DOP_EXIT` and `DOP_EXIT2` are distinct
+//! opcodes with distinct receipt semantics (read-only `dist.c:2760` vs `dist.c:2824`):
+//! `DOP_EXIT` is a **link** exit ("`from`, which `to` is linked to, died" →
+//! `erts_dsig_send_exit`, `dist.c:1747`) and `DOP_EXIT2` is a plain exit signal from
+//! `erlang:exit/2` ("`from` sent an exit signal to `to`" → `erts_dsig_send_exit2`,
+//! `dist.c:1800`), so the seam keeps them separate.
 //!
 //! [`DistSignalRouter::route`] must serialise the signal **synchronously**: `reason` may live
 //! in the signaller's heap, which the caller is free to drop or recycle as soon as `route`
 //! returns. Legacy C ground truth (read-only): `erts/emulator/beam/erl_monitor_link.c` and
 //! `dist.c`.
+//!
+//! # Inbound (receipt) primitives — the other half of the seam
+//!
+//! The [`DistSignalRouter`] seam itself is **outbound only** (local → remote). The *inbound*
+//! half — a `DOP_*` a peer sent us — is decoded by `beam_rt` (which owns the wire) and handed
+//! to [`ProcessTable`](crate::ptab::ProcessTable) as the *already-parsed* pieces
+//! (`ProcessTable::record_remote_link`, `apply_remote_exit_signal`,
+//! `unlink_from_remote`/`unlink_ack_from_remote`, `monitor_from_remote`/`demonitor_from_remote`,
+//! `remote_monitor_down`, `set_group_leader_from_remote`).
+//!
+//! Those entry points are deliberately **separate** from the locally-initiated ones
+//! (`link_term`, `unlink_term`, `monitor_term`, `demonitor`, `send_exit_term`): the C's inbound
+//! receipt arms never echo the opcode they received (`dist.c:2258` `break; /* Done */` after a
+//! successful `DOP_LINK`), whereas every locally-initiated entry point routes a `DOP_*` through
+//! [`DistSignalRouter`]. Reusing them for an inbound signal would put that echo on the wire.
+//! [`RemoteWatcher`] is the record of an **incoming** monitor (a remote process watching a
+//! local one), the mirror of [`RemoteMonitor`].
 
 use beam_alloc::Heap;
 use beam_common::Result;
@@ -193,6 +218,30 @@ pub struct RemoteMonitor {
     pub reference: MonitorRef,
     /// The watched remote process.
     pub remote: RemotePid,
+    /// Whether a process or a port is watched.
+    pub kind: MonitorKind,
+}
+
+/// An **incoming** remote monitor: a process on another node watching a **local** process or
+/// port — the mirror of [`RemoteMonitor`].
+///
+/// It is the record an inbound `DOP_MONITOR_P` ({`DOP_MONITOR_P`, `Remote(watcher)`,
+/// `Local pid-or-name(watched)`, `Ref`}, `dist.c:2341`) installs, and an inbound
+/// `DOP_DEMONITOR_P` (`dist.c:2415`) removes. The record holds no term that can be relocated:
+/// [`RemotePid`] is a decomposed external pid (its `node` is an immediate) and the reference is
+/// a plain value, so it is not a GC root.
+///
+/// It lives in a side table on
+/// [`ProcessTable`](crate::ptab::ProcessTable) rather than in
+/// [`MonitoredBy`](crate::monitor::MonitoredBy) because `MonitoredBy`'s
+/// `watcher` field is a local `ProcessId` and its shape is frozen (built by struct literal from
+/// other crates).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteWatcher {
+    /// The reference the watcher's `{'DOWN', …}` will carry.
+    pub reference: MonitorRef,
+    /// The watching remote process.
+    pub watcher: RemotePid,
     /// Whether a process or a port is watched.
     pub kind: MonitorKind,
 }

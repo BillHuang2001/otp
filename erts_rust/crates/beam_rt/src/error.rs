@@ -428,8 +428,8 @@ pub(crate) fn no_mailbox(pid: beam_process::ProcessId) -> BeamError {
 /// this fallback and must never be listed here; what remains is the residue of
 /// `erlang`-namespace calls that carry **no** declared `bif.tab` entry under the `erlang`
 /// module — the OTP `erlang` functions whose implementation is an `erts_internal:*` BIF
-/// (`port_control/3`, `process_flag/3`, `suspend_process/1,2`, `system_monitor/1`,
-/// `garbage_collect/2`, ...) or an `erlang.erl` wrapper, which the registry cannot own.
+/// (`port_control/3`, `process_flag/3`, `suspend_process/1,2`, `system_monitor/1`, ...) or an
+/// `erlang.erl` wrapper, which the registry cannot own.
 /// The list is curated rather than generated: a name is added once the oracle is confirmed
 /// to export it *and* it is noticed reaching the fallback with the plain `not a BIF`
 /// diagnostic.
@@ -459,9 +459,8 @@ pub(crate) const KNOWN_UNIMPLEMENTED_ERLANG_BIFS: &[(&str, u32)] = &[
     ("system_monitor", 1),
     ("system_monitor", 2),
     // Garbage collection: `erts_internal:garbage_collect/1` hosts the collector entry, and
-    // `/0`+`/1` are served by the runtime-native floor (`src/native/erts_internal.rs`); `/2`
-    // is the asynchronous system-task form, which this runtime has no protocol for.
-    ("garbage_collect", 2),
+    // `/0`+`/1`+`/2` are all served by the runtime-native floor
+    // (`src/native/erts_internal.rs`), so no arity of it is a gap.
     // Code loading.
     ("load_module", 2),
     // The system/time surface.

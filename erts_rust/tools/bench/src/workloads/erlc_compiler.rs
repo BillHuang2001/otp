@@ -33,10 +33,14 @@
 //! LOC/sec and wall time for both runtimes (oracle and `beam_rt`).
 //!
 //! Honest reporting: if `erlc` produces **zero** `.beam` files the result is `failed`
-//! (never a fabricated throughput); a *partial* success is recorded `ok` with a note.
-//! When the Elixir corpus is absent or fails to compile, the workload falls back to the
-//! OTP-only corpus and records *why* in its notes — it never fabricates a result.
+//! (never a fabricated throughput); a *partial* success is recorded `ok` with a note. The
+//! `files_per_sec` / `loc_per_sec` rates are computed from the files/LOC `erlc` actually
+//! **produced**, not from what was attempted, so a partial run cannot overstate them next
+//! to the `files_compiled` metric. When the Elixir corpus is absent or fails to compile, the
+//! workload falls back to the OTP-only corpus and records *why* in its notes — it never
+//! fabricates a result.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -119,25 +123,47 @@ struct CorpusRun {
     label: &'static str,
     /// How many source files were handed to `erlc`.
     files: usize,
-    /// The total source lines across those files (a LOC proxy).
+    /// The total source lines across those files (a LOC proxy for what was attempted).
     loc: usize,
     /// How many `.beam` files this slice actually produced.
     produced: usize,
+    /// The source lines of the files that actually produced a `.beam` (the *produced* LOC,
+    /// as opposed to [`CorpusRun::loc`]'s attempted LOC) — the honest base for the rate.
+    produced_loc: usize,
     /// The raw subprocess outcome (exit code, stderr, wall time, peak RSS).
     completed: Completed,
+}
+
+/// The subset of `files` that produced a `.beam` in `build`, matched by file stem.
+///
+/// `erlc` emits `<stem>.beam` for each source that compiled, so matching the newly written
+/// `.beam` files back to their sources identifies exactly which sources the run compiled —
+/// without trusting the exit code or assuming every attempted file succeeded.
+fn compiled_sources(files: &[PathBuf], build: &Path, new_beams: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
+    files
+        .iter()
+        .filter(|src| {
+            src.file_stem().is_some_and(|stem| {
+                new_beams.contains(&build.join(format!("{}.beam", stem.to_string_lossy())))
+            })
+        })
+        .cloned()
+        .collect()
 }
 
 /// Compiles `files` from `corpus` into `build`, returning the run summary.
 ///
 /// `.beam` files are counted as the **delta** in `build` around the run, so a shared
-/// output directory still attributes the produced modules to the right corpus.
+/// output directory still attributes the produced modules to the right corpus. The produced
+/// count (and the produced LOC) therefore drive the throughput rates — never the attempted
+/// counts.
 fn compile_corpus(
     erlc: &Path,
     corpus: &Corpus,
     files: &[PathBuf],
     build: &Path,
 ) -> std::io::Result<CorpusRun> {
-    let before = collect_files(build, "beam").len();
+    let before: BTreeSet<PathBuf> = collect_files(build, "beam").into_iter().collect();
 
     let mut cmd = Command::new(erlc);
     cmd.arg("-o").arg(build);
@@ -148,14 +174,28 @@ fn compile_corpus(
 
     let completed = proc::run(&mut cmd)?;
 
-    let after = collect_files(build, "beam").len();
+    let after: BTreeSet<PathBuf> = collect_files(build, "beam").into_iter().collect();
+    let new_beams: BTreeSet<PathBuf> = after.difference(&before).cloned().collect();
+    let compiled = compiled_sources(files, build, &new_beams);
     Ok(CorpusRun {
         label: corpus.label,
         files: files.len(),
         loc: count_source_lines(files),
-        produced: after.saturating_sub(before),
+        produced: new_beams.len(),
+        produced_loc: count_source_lines(&compiled),
         completed,
     })
+}
+
+/// The throughput rates, computed from the **produced** file/LOC counts — so a partial
+/// `erlc` run cannot overstate throughput next to the `files_compiled` metric. The wall time
+/// is floored at a positive epsilon so a zero/negative duration yields a large finite rate,
+/// never an infinity.
+fn rates_per_second(produced: usize, produced_loc: usize, wall_ms: f64) -> (f64, f64) {
+    // A real `erlc` run always takes milliseconds, so this floor only guards the degenerate
+    // zero/negative duration: it keeps the rate finite instead of overflowing to infinity.
+    let seconds = if wall_ms > 0.0 { wall_ms / 1000.0 } else { 1e-9 };
+    (produced as f64 / seconds, produced_loc as f64 / seconds)
 }
 
 /// The first non-empty line of `text`, trimmed; the empty string when there is none.
@@ -272,6 +312,7 @@ impl Workload for ErlcCompiler {
         // Aggregate every successfully compiled slice.
         let total_files: usize = runs.iter().map(|r| r.files).sum();
         let total_produced: usize = runs.iter().map(|r| r.produced).sum();
+        let total_produced_loc: usize = runs.iter().map(|r| r.produced_loc).sum();
         let total_loc: usize = runs.iter().map(|r| r.loc).sum();
         let wall_ms: f64 = runs.iter().map(|r| r.completed.wall_ms).sum();
         let peak = runs
@@ -283,26 +324,29 @@ impl Workload for ErlcCompiler {
             .map(|r| r.label)
             .collect::<Vec<_>>()
             .join("+");
-        let seconds = (wall_ms / 1000.0).max(f64::MIN_POSITIVE);
+
+        // The rates are computed from what `erlc` actually **produced**, so a partial run
+        // cannot overstate throughput next to the `files_compiled` metric.
+        let (files_per_sec, loc_per_sec) =
+            rates_per_second(total_produced, total_produced_loc, wall_ms);
 
         let mut result = WorkloadResult::new(self.id(), kind, self.category(), self.description());
         result.metrics.push(Metric::scalar("wall_ms", "ms", wall_ms));
         result
             .metrics
             .push(Metric::scalar("files_compiled", "files", total_produced as f64));
-        result.metrics.push(Metric::scalar(
-            "files_per_sec",
-            "files/s",
-            total_files as f64 / seconds,
-        ));
         result
             .metrics
-            .push(Metric::scalar("loc_per_sec", "loc/s", total_loc as f64 / seconds));
+            .push(Metric::scalar("files_per_sec", "files/s", files_per_sec));
+        result
+            .metrics
+            .push(Metric::scalar("loc_per_sec", "loc/s", loc_per_sec));
         result.peak_memory_bytes = peak;
         result.notes.extend(notes);
-        result
-            .notes
-            .push(format!("corpus: {total_files} files from {sources}"));
+        result.notes.push(format!(
+            "corpus: {total_files} files ({total_loc} LOC) attempted from {sources}; \
+             {total_produced} produced .beam ({total_produced_loc} LOC)"
+        ));
 
         if total_produced == 0 {
             let exit = runs.last().and_then(|r| r.completed.exit_code);
@@ -440,5 +484,49 @@ mod tests {
         );
         assert_eq!(failed.status, Status::Failed);
         assert_eq!(failed.reason.as_deref(), Some("erlc-produced-no-output"));
+    }
+
+    #[test]
+    fn rates_are_computed_from_the_produced_counts_not_the_attempted_ones() {
+        // 3 produced files and 120 produced LOC over exactly one second.
+        let (files_per_sec, loc_per_sec) = rates_per_second(3, 120, 1000.0);
+        assert!((files_per_sec - 3.0).abs() < 1e-9, "{files_per_sec}");
+        assert!((loc_per_sec - 120.0).abs() < 1e-9, "{loc_per_sec}");
+        // The attempted-count rate (30 files / 1 s) must be strictly larger, i.e. the
+        // produced-based rate can never overstate a partial run.
+        assert!(files_per_sec < 30.0);
+    }
+
+    #[test]
+    fn rates_stay_finite_for_a_zero_or_negative_wall_time() {
+        for wall_ms in [0.0, -5.0] {
+            let (files_per_sec, loc_per_sec) = rates_per_second(5, 50, wall_ms);
+            assert!(files_per_sec.is_finite() && files_per_sec > 0.0, "{files_per_sec}");
+            assert!(loc_per_sec.is_finite() && loc_per_sec > 0.0, "{loc_per_sec}");
+        }
+        // Zero produced ⇒ zero rate (no divide-by-zero, no invented number).
+        assert_eq!(rates_per_second(0, 0, 1000.0), (0.0, 0.0));
+    }
+
+    #[test]
+    fn compiled_sources_matches_produced_beams_by_file_stem() {
+        let base = std::env::temp_dir().join(format!("bench-erlc-produced-{}", std::process::id()));
+        let build = base.join("build");
+        std::fs::create_dir_all(&build).unwrap();
+        let a = base.join("a.erl");
+        let b = base.join("b.erl");
+        let c = base.join("c.erl");
+        for f in [&a, &b, &c] {
+            std::fs::write(f, "line1\nline2\n").unwrap();
+        }
+        // Only `a` and `b` compiled (produced a `.beam`); `c` did not.
+        let new_beams: BTreeSet<PathBuf> = [build.join("a.beam"), build.join("b.beam")]
+            .into_iter()
+            .collect();
+        let compiled = compiled_sources(&[a.clone(), b.clone(), c.clone()], &build, &new_beams);
+        assert_eq!(compiled, vec![a, b]);
+        // Its produced LOC is the two compiled files' lines, not all three.
+        assert_eq!(count_source_lines(&compiled), 4);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

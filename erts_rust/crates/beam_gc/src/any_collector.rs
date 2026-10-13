@@ -39,6 +39,7 @@ use crate::config::{GcConfig, MatureKind};
 use crate::heap_info::HeapObservable;
 use crate::immix_collector::GenImmixCollector;
 use crate::policy::HeapPolicy;
+use crate::reachable::ReachableObject;
 use crate::selection::MatureChoice;
 use crate::space::HeapSpace;
 use crate::stats::GcStats;
@@ -340,6 +341,29 @@ impl AnyCollector {
         match self {
             AnyCollector::Copying(c) => c.for_each_reachable_object(roots, visit),
             AnyCollector::Immix(c) => c.for_each_reachable_object(roots, visit),
+        }
+    }
+
+    /// The **safe** form of [`for_each_reachable_object`](Self::for_each_reachable_object):
+    /// visits every **boxed object** reachable from `roots` across the **whole heap**, each
+    /// object **exactly once**, passing a read-only [`ReachableObject`] view of it — forwarded
+    /// to whichever strategy is selected, so the view enumeration is strategy-agnostic:
+    /// [`Collector::for_each_reachable_object_view`] /
+    /// [`GenImmixCollector::for_each_reachable_object_view`].
+    ///
+    /// Both strategies answer over the same nursery chain and their own mature region, so the
+    /// reachable-object set is identical, and the caller needs **no `unsafe`**. See
+    /// [`Collector::for_each_reachable_object`] for the full contract (read-only, whole-heap,
+    /// layout-agnostic, iterative and cycle-safe, each object once, cons cells traversed but not
+    /// reported).
+    pub fn for_each_reachable_object_view(
+        &self,
+        roots: &[Eterm],
+        visit: impl FnMut(ReachableObject<'_>),
+    ) -> Result<()> {
+        match self {
+            AnyCollector::Copying(c) => c.for_each_reachable_object_view(roots, visit),
+            AnyCollector::Immix(c) => c.for_each_reachable_object_view(roots, visit),
         }
     }
 }
