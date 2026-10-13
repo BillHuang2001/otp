@@ -42,7 +42,7 @@ pub(crate) fn call_ext_dispatch(
     seam: Option<Option<(u32, u32, u32)>>,
 ) -> StepResult;   // `StepResult` = `Result<Step, Box<BeamError>>` (the crate-internal hot step result)
 ```
-Its resolution order is the arms' historical order: `resolve_call_ext_apply` (the `erlang:apply/3` special case and
+Its resolution order is: `resolve_call_ext_apply` (the `erlang:apply/3` special case and
 the cross-module call seam), then `resolve_call_ext_send`, then the host's cross-module seam, then the synchronous
 `call_import` BIF route — the last one marshalled with the **instruction's own `arity` operand**, never the import
 table's arity (the seam's own resolution uses the table's). The resolved `ApplyTarget` is then handed to
