@@ -37,15 +37,19 @@
 //! `HOME`/`MIX_HOME`/`HEX_HOME` under the scratch dir: the read-only checkout and the
 //! developer's real home are never touched.
 //!
-//! **Toolchain gate.** EMQX pins the Erlang/OTP release it builds with (`env.sh`'s `OTP_VSN`,
-//! `.tool-versions`) and does not build on a newer toolchain. This checkout pins OTP 28;
-//! under the OTP 29 `erl` on `PATH` the `:ezstd` dependency's NIF makefile writes its
-//! `env.mk` with `erl -noshell -s init stop -eval …`, an idiom OTP 29 no longer evaluates (it
-//! halts first), so `mix compile` aborts with *No rule to make target '…/env.mk'*. Rather
-//! than spend minutes discovering that, the mismatch is detected cheaply up front and recorded
-//! as an honest `skipped(emqx-requires-otp-<n>)` (with the mechanism in the notes); when the
-//! toolchain *does* match the checkout's pin, the real build runs and the row carries a real
-//! wall time — or `failed(emqx-build-failed)` with the captured error. No number is ever
+//! **Toolchain gate.** EMQX pins the Erlang/OTP release it builds with — `env.sh`'s
+//! `export OTP_VSN=…` (which the root `Makefile` `include`s, so it also feeds the
+//! `scripts/ensure-rebar3.sh` bootstrap, whose `case ${OTP_VSN}` accepts only `25*`–`28*`)
+//! and `.tool-versions`' `erlang …` line — and does not build on a newer one. This checkout
+//! pins **28.5.0.7-2**; the `erl` on `PATH` here is OTP **29.1.1** (erts 17.1). Under OTP 29
+//! the `:ezstd` dependency's NIF makefile generates its `env.mk` with
+//! `erl -noshell -s init stop -eval …`, an idiom OTP 29 halts before evaluating (verified on
+//! this host: exit 0, no output at all), so `mix compile` aborts with *No rule to make target
+//! '…/env.mk'*. Rather than spend minutes discovering that, the mismatch is detected cheaply
+//! up front and recorded as an honest `skipped(emqx-requires-otp-<major>)` whose note names
+//! the exact pin (version + `file:line`) and the host's exact toolchain. When the toolchain
+//! *does* match the checkout's pin, the real build runs and the row carries a real wall
+//! time — or `failed(emqx-build-failed)` with the captured error. No number is ever
 //! fabricated.
 
 use std::path::{Path, PathBuf};
@@ -140,47 +144,98 @@ fn leading_major(version: &str) -> Option<u32> {
 
 /// The OTP major release this EMQX checkout builds with, taken from its own declaration:
 /// `env.sh`'s `OTP_VSN` (`export OTP_VSN=28.5.0.7-2`), else `.tool-versions`' `erlang` line.
-/// `None` when neither is present/parseable, in which case no toolchain gate is applied.
-fn required_otp_major(repo: &Path) -> Option<u32> {
+/// Each carries the exact version and the `file:line` it came from, so a skip note can name
+/// the pin mechanically rather than by hand-waving.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OtpPin {
+    /// The exact pinned version, e.g. `28.5.0.7-2`.
+    version: String,
+    /// The declaring file and line, e.g. `env.sh:3 (export OTP_VSN=28.5.0.7-2)`.
+    source: String,
+}
+
+impl OtpPin {
+    /// The major release of the pin (`28.5.0.7-2` → `28`), driving the toolchain gate.
+    fn major(&self) -> Option<u32> {
+        leading_major(&self.version)
+    }
+}
+
+/// The Erlang/OTP the host's `erl` runs, and which `erl` that is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostOtp {
+    /// The major release, from `erlang:system_info(otp_release)`.
+    major: u32,
+    /// The ERTS version, from `erlang:system_info(version)` (e.g. `17.1`).
+    erts: String,
+    /// The resolved `erl` program.
+    program: PathBuf,
+}
+
+/// The toolchain this EMQX checkout builds with, from its own declaration: `env.sh`'s
+/// `OTP_VSN`, else `.tool-versions`' `erlang` line. `None` when neither is present/parseable,
+/// in which case no toolchain gate is applied.
+fn required_otp(repo: &Path) -> Option<OtpPin> {
     if let Ok(text) = std::fs::read_to_string(repo.join("env.sh")) {
-        for line in text.lines() {
-            if let Some((_, value)) = line.split_once("OTP_VSN=") {
-                if let Some(major) = leading_major(value) {
-                    return Some(major);
-                }
+        for (index, line) in text.lines().enumerate() {
+            let Some((_, value)) = line.split_once("OTP_VSN=") else {
+                continue;
+            };
+            let version = value.trim().to_string();
+            if !version.is_empty() {
+                return Some(OtpPin {
+                    version,
+                    source: format!("env.sh:{} ({})", index + 1, line.trim()),
+                });
             }
         }
     }
     if let Ok(text) = std::fs::read_to_string(repo.join(".tool-versions")) {
-        for line in text.lines() {
-            if let Some(rest) = line.trim().strip_prefix("erlang ") {
-                if let Some(major) = leading_major(rest) {
-                    return Some(major);
-                }
+        for (index, line) in text.lines().enumerate() {
+            let Some(rest) = line.trim().strip_prefix("erlang ") else {
+                continue;
+            };
+            let version = rest.trim().to_string();
+            if !version.is_empty() {
+                return Some(OtpPin {
+                    version,
+                    source: format!(".tool-versions:{} ({})", index + 1, line.trim()),
+                });
             }
         }
     }
     None
 }
 
-/// The OTP major release of the `erl` on `PATH`, cached for the process. `None` when `erl`
-/// cannot be resolved or queried — the gate is then skipped and the real build is attempted.
-fn host_otp_major() -> Option<u32> {
-    static CACHE: OnceLock<Option<u32>> = OnceLock::new();
-    *CACHE.get_or_init(|| {
-        let erl = proc::which("erl")?;
-        let mut cmd = Command::new(erl);
-        cmd.args([
-            "-noshell",
-            "-eval",
-            "io:format(\"~s\", [erlang:system_info(otp_release)]), halt().",
-        ]);
-        let out = proc::run(&mut cmd).ok()?;
-        if !out.success {
-            return None;
-        }
-        out.stdout.trim().parse().ok()
-    })
+/// The Erlang/OTP the `erl` on `PATH` runs (major release, ERTS version and program), cached
+/// for the process. `None` when `erl` cannot be resolved or queried — the gate is then
+/// skipped and the real build is attempted.
+fn host_otp() -> Option<HostOtp> {
+    static CACHE: OnceLock<Option<HostOtp>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let erl = proc::which("erl")?;
+            let mut cmd = Command::new(&erl);
+            cmd.args([
+                "-noshell",
+                "-eval",
+                "io:format(\"~s ~s\", [erlang:system_info(otp_release), \
+                 erlang:system_info(version)]), halt().",
+            ]);
+            let out = proc::run(&mut cmd).ok()?;
+            if !out.success {
+                return None;
+            }
+            let mut parts = out.stdout.split_whitespace();
+            let major = parts.next()?.parse().ok()?;
+            let erts = parts.next().unwrap_or("unknown").to_string();
+            Some(HostOtp {
+                major,
+                erts,
+                program: erl,
+            })
+        })
+        .clone()
 }
 
 /// The honest skip reason when the host OTP (`host`) is newer than the release the checkout
@@ -189,23 +244,32 @@ fn otp_gate_reason(required: u32, host: u32) -> Option<String> {
     (host > required).then(|| format!("emqx-requires-otp-{required}"))
 }
 
-/// The note explaining an [`otp_gate_reason`] skip, naming the observed build breakage.
-fn otp_gate_note(required: u32, host: u32) -> String {
+/// The note explaining an [`otp_gate_reason`] skip: the exact pin (version + `file:line`), the
+/// host toolchain it conflicts with, and the observed build breakage.
+fn otp_gate_note(pin: &OtpPin, host: &HostOtp) -> String {
     format!(
-        "EMQX builds with Erlang/OTP {required} (env.sh OTP_VSN / .tool-versions), but `erl` on PATH \
-         is OTP {host}: the umbrella build aborts in a dependency NIF (:ezstd) whose makefile generates \
-         env.mk via `erl -noshell -s init stop -eval …`, an idiom OTP {host} no longer evaluates, so \
-         `mix compile` fails with \"No rule to make target '…/env.mk'\"; no number is fabricated"
+        "EMQX pins Erlang/OTP {} ({}), but the `erl` on PATH ({}) is OTP {} (erts-{}): the \
+         umbrella build aborts in the :ezstd dependency's NIF makefile, which generates its \
+         env.mk via `erl -noshell -s init stop -eval …` — an idiom OTP {} halts before \
+         evaluating (verified on this host: exit 0, no output at all), so `mix compile` fails \
+         with \"No rule to make target '…/env.mk'\"; no number is fabricated",
+        pin.version,
+        pin.source,
+        host.program.display(),
+        host.major,
+        host.erts,
+        host.major
     )
 }
 
 /// The `(reason, note)` of the toolchain gate, or `None` when the host can build this
 /// checkout (or the gate cannot be evaluated).
 fn toolchain_gate(repo: &Path) -> Option<(String, String)> {
-    let required = required_otp_major(repo)?;
-    let host = host_otp_major()?;
-    let reason = otp_gate_reason(required, host)?;
-    Some((reason, otp_gate_note(required, host)))
+    let pin = required_otp(repo)?;
+    let required = pin.major()?;
+    let host = host_otp()?;
+    let reason = otp_gate_reason(required, host.major)?;
+    Some((reason, otp_gate_note(&pin, &host)))
 }
 
 impl Workload for Emqx {
@@ -442,10 +506,10 @@ mod tests {
     }
 
     #[test]
-    fn required_otp_major_prefers_env_sh_then_tool_versions() {
+    fn required_otp_records_the_exact_pin_and_its_file_line() {
         let s = Scratch::new("otp");
         // Neither file: nothing declared.
-        assert_eq!(required_otp_major(&s.dir), None);
+        assert_eq!(required_otp(&s.dir), None);
 
         // `.tool-versions` alone.
         std::fs::write(
@@ -453,15 +517,21 @@ mod tests {
             "erlang 27.3.1-1\nelixir 1.18\n",
         )
         .expect("write .tool-versions");
-        assert_eq!(required_otp_major(&s.dir), Some(27));
+        let pin = required_otp(&s.dir).expect("pinned");
+        assert_eq!(pin.version, "27.3.1-1");
+        assert_eq!(pin.source, ".tool-versions:1 (erlang 27.3.1-1)");
+        assert_eq!(pin.major(), Some(27));
 
-        // `env.sh` wins over `.tool-versions`.
+        // `env.sh` wins over `.tool-versions`, and the line number is exact.
         std::fs::write(
             s.dir.join("env.sh"),
             "# c\nset -eu\nexport OTP_VSN=28.5.0.7-2\nexport ELIXIR_VSN=1.19.1\n",
         )
         .expect("write env.sh");
-        assert_eq!(required_otp_major(&s.dir), Some(28));
+        let pin = required_otp(&s.dir).expect("pinned");
+        assert_eq!(pin.version, "28.5.0.7-2");
+        assert_eq!(pin.source, "env.sh:3 (export OTP_VSN=28.5.0.7-2)");
+        assert_eq!(pin.major(), Some(28));
     }
 
     #[test]
@@ -476,10 +546,29 @@ mod tests {
         );
         assert_eq!(otp_gate_reason(28, 28), None, "a matching host builds");
         assert_eq!(otp_gate_reason(28, 27), None, "an older host is attempted");
-        // The note names both sides of the mismatch and the observed mechanism.
-        let note = otp_gate_note(28, 29);
-        assert!(note.contains("OTP 28") && note.contains("OTP 29"), "{note}");
-        assert!(note.contains("env.mk"), "{note}");
+
+        // The note names both sides of the mismatch — the exact pin *with its file:line* and
+        // the host's exact toolchain — plus the observed mechanism.
+        let pin = OtpPin {
+            version: "28.5.0.7-2".to_string(),
+            source: "env.sh:3 (export OTP_VSN=28.5.0.7-2)".to_string(),
+        };
+        let host = HostOtp {
+            major: 29,
+            erts: "17.1".to_string(),
+            program: PathBuf::from("/usr/bin/erl"),
+        };
+        let note = otp_gate_note(&pin, &host);
+        for needle in [
+            "OTP 28.5.0.7-2",
+            "env.sh:3",
+            "OTP 29",
+            "erts-17.1",
+            "/usr/bin/erl",
+            "env.mk",
+        ] {
+            assert!(note.contains(needle), "{needle} missing from: {note}");
+        }
     }
 
     #[test]

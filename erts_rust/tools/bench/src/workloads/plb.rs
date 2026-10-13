@@ -49,6 +49,13 @@
 //! [`crate::workloads::tool`]. It too is validated with a bounded `--version` probe and,
 //! if it fails, the honest `dotnet-absent` skip is kept.
 //!
+//! **The SDK is resolved by version, not by source order** ([`tool::command_for_min`]): the
+//! project targets `net9` (see [`MIN_DOTNET_SDK`]), so an 8.x `dotnet` on `PATH` must not
+//! shadow a newer SDK the Nix store holds — that shadowing is exactly what made the build
+//! fail with `NETSDK1045` while a satisfying SDK was installed. The resolution's provenance
+//! (which binary, which version, which source, and every rejected candidate) is recorded in
+//! the row's `notes`, so a `failed` row names the SDK it actually used.
+//!
 //! A run that yields **no** result JSON is recorded `failed` (`plb-tool-failed` when the
 //! tool exited non-zero, `plb-no-results` when it exited `0` while benching nothing) —
 //! never `ok`, because the only other number on such a row is the tool's own wall time,
@@ -78,6 +85,12 @@ const TOOL: &str = "dotnet";
 
 /// The `nixpkgs` attribute that supplies [`TOOL`] for the opt-in `nix` fallback.
 const TOOL_NIX_ATTR: &str = "dotnet-sdk";
+
+/// The .NET SDK the checkout requires: `bench/tool/BenchTool.csproj` and the elixir
+/// environment's `bench/include/dotnet/app.csproj` both target `net9`, so an SDK of major 9
+/// or newer is needed. An 8.x SDK refuses with `NETSDK1045`, which is why the tool is
+/// resolved by version (`tool::command_for_min`) rather than by the first source that has it.
+const MIN_DOTNET_SDK: &[u64] = &[9];
 
 /// The honest skip reason reported when [`TOOL`] cannot be resolved.
 const TOOL_ABSENT: &str = "dotnet-absent";
@@ -155,7 +168,7 @@ impl Workload for Plb {
                 "repo-missing",
             );
         }
-        let Some(base) = tool::command_for(TOOL, TOOL_NIX_ATTR) else {
+        let Some(resolved) = tool::command_for_min(TOOL, TOOL_NIX_ATTR, MIN_DOTNET_SDK) else {
             return WorkloadResult::skipped(
                 self.id(),
                 kind,
@@ -164,6 +177,10 @@ impl Workload for Plb {
                 TOOL_ABSENT,
             );
         };
+        // The SDK provenance (binary, version, source, rejections) belongs in the row, so a
+        // failure names the SDK that was actually used instead of only the reason code.
+        let sdk_notes = resolved.notes;
+        let base = resolved.command;
 
         // Stage the read-only checkout into a private scratch copy and run there, so the
         // `dotnet` build never writes build artifacts (or `_results`) into the source repo.
@@ -242,6 +259,7 @@ impl Workload for Plb {
                 self.description(),
                 BUILD_FAILED,
             );
+            result.notes.extend(sdk_notes.iter().cloned());
             result.notes.push(format!(
                 "build stage (dotnet --task build) exit {:?}",
                 build.exit_code
@@ -273,6 +291,7 @@ impl Workload for Plb {
             "build stage ok (dotnet --task build took {:.0} ms)",
             build.wall_ms
         ));
+        result.notes.extend(sdk_notes.iter().cloned());
 
         // Read the result JSON from the *scratch* copy, never the (read-only) source repo.
         let (times, mems) = read_results(&bench_dir.join("build/_results"));

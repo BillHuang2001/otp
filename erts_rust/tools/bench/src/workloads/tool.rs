@@ -49,6 +49,14 @@
 //! workload that uses this module. It is off by default and is the only place this
 //! variable is read.
 //!
+//! A workload whose tool must meet a **minimum version** uses [`command_for_min`] instead of
+//! [`command_for`]. That path does not simply take the first candidate found: it evaluates
+//! *every* candidate, prefers the **greatest version that satisfies the requirement**, and
+//! returns the provenance — which binary, which version, which source, and why each
+//! alternative was rejected. It is what stops a too-old `dotnet` on `PATH` (8.0.425) from
+//! shadowing the newer SDK the Nix store holds (9.0.318), the defect that made the `plb`
+//! build fail with `NETSDK1045` even though a satisfying SDK was installed.
+//!
 //! Whatever resolves, when *nothing* does the caller keeps its own honest
 //! `skipped(<tool>-absent)` reason — never a fabricated number.
 
@@ -119,6 +127,16 @@ pub fn command_for(tool: &str, nix_attr: &str) -> Option<Command> {
     if let Some(program) = resolve_tool_path(tool) {
         return Some(Command::new(program));
     }
+    validated_nix_shim(tool, nix_attr).map(|(_, command)| command)
+}
+
+/// The opt-in `nix shell nixpkgs#<nix_attr> --command <tool>` shim together with the `nix`
+/// program that runs it, validated with a bounded `--version` probe.
+///
+/// `None` unless `$BENCH_TRY_NIX` is enabled, `nix` resolves, **and** the shim actually
+/// runs — a shim that cannot start must stay an honest `skipped(<tool>-absent)`, never a
+/// silent no-op. Both [`command_for`] and [`command_for_min`] fall back to this.
+fn validated_nix_shim(tool: &str, nix_attr: &str) -> Option<(PathBuf, Command)> {
     if !nix_opt_in() {
         return None;
     }
@@ -126,7 +144,7 @@ pub fn command_for(tool: &str, nix_attr: &str) -> Option<Command> {
     let mut probe = nix_shell(&nix, tool, nix_attr);
     probe.arg("--version");
     match proc::run(&mut probe) {
-        Ok(out) if out.success => Some(nix_shell(&nix, tool, nix_attr)),
+        Ok(out) if out.success => Some((nix.clone(), nix_shell(&nix, tool, nix_attr))),
         _ => None,
     }
 }
@@ -272,6 +290,211 @@ fn discover_tool(tool: &str) -> Option<PathBuf> {
     discover_in(&extra_tool_dirs(), tool).or_else(|| discover_in(&nix_store_bin_dirs(tool), tool))
 }
 
+/// A candidate executable discovered for a tool: where it is, which source it came from (for
+/// the provenance notes) and the version it reports.
+#[derive(Debug, Clone)]
+struct Candidate {
+    path: PathBuf,
+    /// `"PATH"`, `"$BENCH_TOOL_PATH"` or `"nix-store"`.
+    source: &'static str,
+    /// The version the executable itself reports, when [`probe_tool_version`] could read it.
+    version: Option<Vec<u64>>,
+}
+
+/// The outcome of a version-constrained resolution (see [`command_for_min`]): the
+/// ready-to-run command plus the provenance notes the caller records — which binary resolved,
+/// and why every alternative was rejected.
+#[derive(Debug)]
+pub struct ToolCommand {
+    /// The command to run: a bare binary, or (only under `$BENCH_TRY_NIX`, and only when
+    /// nothing local resolves) a `nix shell nixpkgs#<nix_attr> --command <tool>` shim.
+    pub command: Command,
+    /// One note per rejected candidate, then the note naming the resolved binary.
+    pub notes: Vec<String>,
+}
+
+/// Resolves `tool` **requiring at least `min_version`** (a dotted-numeric version such as
+/// `[9]`), preferring the *newest* satisfying build over merely the *first* one found.
+///
+/// Unlike [`command_for`], the resolution compares versions instead of trusting the source
+/// order: a too-old `dotnet` on `PATH` must not shadow the newer SDK the Nix store holds.
+/// Every candidate is version-probed ([`probe_tool_version`] — the version the binary
+/// reports, not the store entry name); the greatest version that satisfies `min_version`
+/// wins, ties keeping the documented source order (`PATH`, then `$BENCH_TOOL_PATH`, then the
+/// Nix store).
+///
+/// Returns `None` only when *nothing* resolves at all, so the caller keeps its honest
+/// `skipped(<tool>-absent)`. When nothing meets `min_version`, the greatest-version candidate
+/// is still returned — **with** a note naming it and the unmet requirement — so the caller's
+/// failure message is exact rather than hand-waving.
+pub fn command_for_min(tool: &str, nix_attr: &str, min_version: &[u64]) -> Option<ToolCommand> {
+    let candidates = versioned_candidates(tool);
+    let Some(chosen) = select_candidate(&candidates, min_version) else {
+        // Nothing local at all: the opt-in `nix shell` shim is the only remaining source.
+        let (nix, command) = validated_nix_shim(tool, nix_attr)?;
+        return Some(ToolCommand {
+            command,
+            notes: vec![format!(
+                "resolved {tool} via `{}` (no local candidate); version not probed",
+                nix.display()
+            )],
+        });
+    };
+    let mut notes: Vec<String> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != chosen)
+        .filter_map(|(_, candidate)| rejection_note(tool, candidate, min_version))
+        .collect();
+    notes.push(resolution_note(tool, &candidates[chosen], min_version));
+    Some(ToolCommand {
+        command: Command::new(&candidates[chosen].path),
+        notes,
+    })
+}
+
+/// Whether `candidate`'s reported version satisfies `min_version`. A candidate whose version
+/// could not be probed never *satisfies* a requirement — it is not assumed to be new enough.
+fn satisfies(candidate: &Candidate, min_version: &[u64]) -> bool {
+    candidate
+        .version
+        .as_deref()
+        .is_some_and(|version| version >= min_version)
+}
+
+/// The index of the best candidate for a `min_version` requirement: the **greatest** version
+/// that satisfies it, else — when nothing does — the greatest version overall (a best-effort
+/// fallback whose shortfall [`resolution_note`] records). Ties keep the candidates' order,
+/// i.e. the documented source order (`PATH` first).
+///
+/// This is what stops an 8.0.425 `dotnet` on `PATH` from shadowing the store's 9.0.318 SDK:
+/// the *versions* decide, not the order the sources are consulted in. Pure, so the policy is
+/// unit-testable without a store or a subprocess.
+fn select_candidate(candidates: &[Candidate], min_version: &[u64]) -> Option<usize> {
+    let mut best_satisfying: Option<usize> = None;
+    let mut best_any: Option<usize> = None;
+    for (index, candidate) in candidates.iter().enumerate() {
+        let outranks =
+            |best: Option<usize>| best.is_none_or(|b| candidate.version > candidates[b].version);
+        if satisfies(candidate, min_version) && outranks(best_satisfying) {
+            best_satisfying = Some(index);
+        }
+        if outranks(best_any) {
+            best_any = Some(index);
+        }
+    }
+    best_satisfying.or(best_any)
+}
+
+/// Every candidate executable for `tool` in the module's documented source order (`PATH`,
+/// then `$BENCH_TOOL_PATH`, then the Nix store), each carrying the version it reports.
+///
+/// The store candidates are the store entries' `<entry>/bin/<tool>` (greatest entry-name
+/// version first, per [`nix_store_bin_dirs`]); *every* candidate is version-probed, so the
+/// version a note reports is the version the binary itself reports.
+fn versioned_candidates(tool: &str) -> Vec<Candidate> {
+    let mut found: Vec<(PathBuf, &'static str)> = Vec::new();
+    if let Some(path) = proc::which(tool) {
+        found.push((path, "PATH"));
+    }
+    if let Some(path) = discover_in(&extra_tool_dirs(), tool) {
+        found.push((path, "$BENCH_TOOL_PATH"));
+    }
+    for dir in nix_store_bin_dirs(tool) {
+        let path = dir.join(tool);
+        if path.is_file() {
+            found.push((path, "nix-store"));
+        }
+    }
+    found
+        .into_iter()
+        .map(|(path, source)| Candidate {
+            version: probe_tool_version(&path),
+            path,
+            source,
+        })
+        .collect()
+}
+
+/// Runs `<path> --version` and parses the version it reports. `None` when the probe cannot
+/// run, exits non-zero, or prints no dotted-numeric version — so an unusable executable is
+/// never *assumed* to satisfy a requirement.
+fn probe_tool_version(path: &Path) -> Option<Vec<u64>> {
+    let mut cmd = Command::new(path);
+    cmd.arg("--version");
+    let out = proc::run(&mut cmd).ok()?;
+    if !out.success {
+        return None;
+    }
+    parse_version_output(&out.stdout)
+}
+
+/// The version named by a tool's own `--version` output: the first whitespace-separated token
+/// that is a dotted-numeric version (`"9.0.318\n"` → `[9, 0, 318]`).
+fn parse_version_output(stdout: &str) -> Option<Vec<u64>> {
+    stdout.split_whitespace().find_map(entry_version)
+}
+
+/// Renders a parsed version the way a note reads it (`[9, 0, 318]` → `"9.0.318"`).
+fn fmt_version(version: &[u64]) -> String {
+    version
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// `version` as a note reads it, or a marker when it could not be probed.
+fn describe_version(version: &Option<Vec<u64>>) -> String {
+    version
+        .as_deref()
+        .map(fmt_version)
+        .unwrap_or_else(|| "version-unknown".to_string())
+}
+
+/// The provenance note for the chosen candidate: which binary resolved, at what version and
+/// from which source — or, when nothing satisfied `min_version`, that this is the best
+/// available fallback.
+fn resolution_note(tool: &str, candidate: &Candidate, min_version: &[u64]) -> String {
+    let version = describe_version(&candidate.version);
+    if satisfies(candidate, min_version) {
+        format!(
+            "resolved {tool} {version} at {} ({})",
+            candidate.path.display(),
+            candidate.source
+        )
+    } else {
+        format!(
+            "no {tool} >= {} available; using the best available {version} at {} ({})",
+            fmt_version(min_version),
+            candidate.path.display(),
+            candidate.source
+        )
+    }
+}
+
+/// The provenance note for a candidate that did **not** meet `min_version`; `None` for a
+/// satisfying candidate that merely lost the version comparison (unremarkable).
+fn rejection_note(tool: &str, candidate: &Candidate, min_version: &[u64]) -> Option<String> {
+    if satisfies(candidate, min_version) {
+        return None;
+    }
+    Some(match &candidate.version {
+        Some(version) => format!(
+            "rejected {tool} {} at {} ({}): requires >= {}",
+            fmt_version(version),
+            candidate.path.display(),
+            candidate.source,
+            fmt_version(min_version)
+        ),
+        None => format!(
+            "rejected {tool} at {} ({}): `--version` reported no usable version",
+            candidate.path.display(),
+            candidate.source
+        ),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,6 +530,18 @@ mod tests {
             std::fs::create_dir_all(&d).expect("create sub dir");
             std::fs::write(d.join(name), b"").expect("write tool file");
             d
+        }
+
+        /// Writes an executable `#!/bin/sh` script `body` directly under this scratch dir.
+        #[cfg(unix)]
+        fn script(&self, name: &str, body: &str) -> PathBuf {
+            let path = self.dir.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write script");
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path).expect("stat").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).expect("chmod");
+            path
         }
     }
 
@@ -590,5 +825,150 @@ mod tests {
                 "{name} must be skipped when staging"
             );
         }
+    }
+
+    /// A synthetic candidate for the pure selection tests.
+    fn cand(source: &'static str, path: &str, version: Option<Vec<u64>>) -> Candidate {
+        Candidate {
+            path: PathBuf::from(path),
+            source,
+            version,
+        }
+    }
+
+    /// The `plb` defect in miniature: an 8.0.425 `dotnet` on `PATH` must not shadow the
+    /// store's 9.0.318 SDK when the project requires >= 9.
+    #[test]
+    fn select_candidate_prefers_the_greatest_version_that_satisfies_the_minimum() {
+        let candidates = vec![
+            cand("PATH", "/usr/bin/dotnet", Some(vec![8, 0, 425])),
+            cand(
+                "nix-store",
+                "/nix/store/x-dotnet-sdk-9.0.318/bin/dotnet",
+                Some(vec![9, 0, 318]),
+            ),
+        ];
+        assert_eq!(select_candidate(&candidates, &[9]), Some(1));
+
+        // A *newer* `PATH` build still wins over an older store one: the version decides,
+        // and the source order is only the tie-break.
+        let candidates = vec![
+            cand("PATH", "/usr/bin/dotnet", Some(vec![10, 0, 1])),
+            cand(
+                "nix-store",
+                "/nix/store/x-dotnet-sdk-9.0.318/bin/dotnet",
+                Some(vec![9, 0, 318]),
+            ),
+        ];
+        assert_eq!(select_candidate(&candidates, &[9]), Some(0));
+    }
+
+    #[test]
+    fn select_candidate_tie_breaks_by_source_order_and_falls_back_when_nothing_satisfies() {
+        // Equal versions keep the documented source order: `PATH` first.
+        let tie = vec![
+            cand("PATH", "/usr/bin/dotnet", Some(vec![9, 0, 318])),
+            cand("nix-store", "/nix/store/x/bin/dotnet", Some(vec![9, 0, 318])),
+        ];
+        assert_eq!(select_candidate(&tie, &[9]), Some(0));
+
+        // Nothing satisfies: the greatest of the too-old candidates is still returned (a
+        // best effort the caller records), never `None`.
+        let too_old = vec![
+            cand("PATH", "/usr/bin/dotnet", Some(vec![8, 0, 425])),
+            cand("nix-store", "/nix/store/x/bin/dotnet", Some(vec![7])),
+        ];
+        assert_eq!(select_candidate(&too_old, &[9]), Some(0));
+
+        // An unprobeable version never satisfies a requirement …
+        let unknown = vec![
+            cand("PATH", "/usr/bin/dotnet", None),
+            cand("nix-store", "/nix/store/x/bin/dotnet", Some(vec![9])),
+        ];
+        assert_eq!(select_candidate(&unknown, &[9]), Some(1));
+        // … but with only unprobeable candidates the first is still a best effort.
+        assert_eq!(
+            select_candidate(&[cand("PATH", "/usr/bin/dotnet", None)], &[9]),
+            Some(0)
+        );
+        assert_eq!(select_candidate(&[], &[9]), None);
+    }
+
+    #[test]
+    fn parse_version_output_reads_the_first_dotted_numeric_token() {
+        assert_eq!(parse_version_output("9.0.318\n"), Some(vec![9, 0, 318]));
+        assert_eq!(parse_version_output("  9.0.318 extra\n"), Some(vec![9, 0, 318]));
+        assert_eq!(parse_version_output("dotnet 8.0.425"), Some(vec![8, 0, 425]));
+        assert_eq!(parse_version_output("no version here"), None);
+        assert_eq!(parse_version_output(""), None);
+    }
+
+    /// The provenance notes name the chosen binary and every rejected candidate — the
+    /// evidence a `failed`/`skipped` row carries instead of a bare reason code.
+    #[test]
+    fn provenance_notes_name_the_resolved_binary_and_the_rejections() {
+        let candidate = cand("PATH", "/usr/bin/dotnet", Some(vec![9, 0, 318]));
+        assert_eq!(
+            resolution_note("dotnet", &candidate, &[9]),
+            "resolved dotnet 9.0.318 at /usr/bin/dotnet (PATH)"
+        );
+        assert_eq!(rejection_note("dotnet", &candidate, &[9]), None);
+
+        let old = cand(
+            "nix-store",
+            "/nix/store/x-8.0.425/bin/dotnet",
+            Some(vec![8, 0, 425]),
+        );
+        let note = rejection_note("dotnet", &old, &[9]).expect("rejected");
+        assert!(note.starts_with("rejected dotnet 8.0.425"), "{note}");
+        assert!(note.ends_with("requires >= 9"), "{note}");
+
+        // A fallback below the requirement says so instead of pretending it satisfied it.
+        let note = resolution_note("dotnet", &old, &[9]);
+        assert!(note.starts_with("no dotnet >= 9 available;"), "{note}");
+        assert!(note.contains("8.0.425"), "{note}");
+
+        // An unprobeable candidate is rejected for a different, exact reason.
+        let unknown = cand("PATH", "/usr/bin/dotnet", None);
+        let note = rejection_note("dotnet", &unknown, &[9]).expect("rejected");
+        assert!(
+            note.contains("`--version` reported no usable version"),
+            "{note}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_tool_version_reads_a_script_and_rejects_a_failing_one() {
+        let s = Scratch::new("probe");
+        let good = s.script("good-tool", "echo 9.0.318");
+        assert_eq!(probe_tool_version(&good), Some(vec![9, 0, 318]));
+
+        // A tool that exits non-zero is *unprobeable*, not mis-parsed.
+        let bad = s.script("bad-tool", "exit 1");
+        assert_eq!(probe_tool_version(&bad), None);
+        // Neither is a program that prints no version.
+        let wordy = s.script("wordy-tool", "echo no-version-here");
+        assert_eq!(probe_tool_version(&wordy), None);
+        assert_eq!(probe_tool_version(Path::new("/nonexistent/xyzzy")), None);
+    }
+
+    /// End to end on the real host: the version-aware resolution names a binary that exists
+    /// and reports provenance. (Skipped where `dotnet` is absent, like the other real-tool
+    /// tests here.)
+    #[test]
+    fn the_real_versioned_resolution_reports_provenance() {
+        if proc::which("dotnet").is_none() {
+            return;
+        }
+        let Some(resolved) = command_for_min("dotnet", "dotnet-sdk", &[9]) else {
+            return;
+        };
+        let notes = resolved.notes.join("\n");
+        assert!(notes.contains("resolved dotnet"), "{notes}");
+        assert!(
+            Path::new(resolved.command.get_program()).is_file(),
+            "the resolved program must exist: {notes}"
+        );
     }
 }
