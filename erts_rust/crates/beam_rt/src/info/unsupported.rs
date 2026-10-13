@@ -37,7 +37,6 @@
 //! | `check_io` | no poll-set introspection |
 //! | `c_compiler_used` | not built by a C compiler |
 //! | `embedded_3pps` | embeds none of ERTS's third-party C libraries |
-//! | `system_logger` | no logger process to name |
 //! | `info` / `procs` / `loaded` | no memory/process/loaded-code self-description dumps |
 //! | `compile_info` | not built by a C toolchain, so it has no `ldflags`/`cflags`/`config.h` triple |
 //! | `ethread_info` / `ethread_used_tse` | no C ethread library (and no thread-specific-data slots) |
@@ -92,9 +91,6 @@ pub(crate) fn try_value(key: &str, _rt: &Runtime) -> Option<Result<InfoValue>> {
         "embedded_3pps" => {
             "this runtime embeds none of ERTS's third-party C libraries; \
              its dependencies are Rust crates, a different set this key does not describe"
-        }
-        "system_logger" => {
-            "this runtime runs no logger process, so it has no logger pid to report"
         }
         "info" | "procs" | "loaded" => "this runtime has no self-description dump",
         "compile_info" => {

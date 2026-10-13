@@ -58,7 +58,8 @@
 //!   are therefore correct-but-smaller than the oracle's run-time figure.
 //! * [`UNSUPPORTED_KEYS`] — the oracle accepts the key but it describes a facility this
 //!   runtime genuinely does not have (the time-correction service, CPU-topology detection,
-//!   the C-compiler/3PP identification, the code-loading dumps, the logger pid, …). Each
+//!   the C-compiler/3PP identification, the code-loading dumps, the poll-set
+//!   introspection, …). Each
 //!   returns a raise whose reason atom starts with `unsupported`
 //!   ([`crate::error::unsupported`]) so a `-eval` caller sees the exit-3 capability gap —
 //!   **never** a fabricated value or a hardcoded oracle number.
@@ -76,6 +77,7 @@
 
 use beam_alloc::Heap;
 use beam_common::{BeamError, Result};
+use beam_process::ProcessId;
 use beam_term::{make_atom, try_make_small, AtomTable, Eterm, NIL};
 
 use crate::error;
@@ -131,6 +133,9 @@ pub const SUPPORTED_KEYS: &[&str] = &[
     "kernel_poll",
     "halt_flush_timeout",
     "creation",
+    // The system logger's process — **this runtime's own registration** (the pid the real
+    // `start.boot` leaves behind), never a copied oracle pid (see [`system`]).
+    "system_logger",
     // The emulator's own build/implementation flags (see [`system`]).
     "compat_rel",
     "endian",
@@ -229,8 +234,7 @@ pub const UNSUPPORTED_KEYS: &[&str] = &[
     "check_io",
     "c_compiler_used",
     "embedded_3pps",
-    // The logger process, and the code-loading self-description dumps.
-    "system_logger",
+    // The code-loading self-description dumps.
     "info",
     "procs",
     "loaded",
@@ -384,7 +388,8 @@ pub const INFO_ATOMS: &[&str] = &[
 
 /// A `system_info/1` value, independent of any heap.
 ///
-/// The first six variants are the scalar shapes; [`InfoValue::List`],
+/// The scalar variants (`Int`, `Str`, `Atom`, `Bool`, `Tuple`, `Binary` and the pid-valued
+/// `Pid`); [`InfoValue::List`],
 /// [`InfoValue::Tupled`] and [`InfoValue::Map`] are the generic containers the richer
 /// keys (`alloc_util_allocators`, `allocated_areas`, `{allocator, A}`,
 /// `garbage_collection`, `max_heap_size`) are built from — a `{Key, Value}` row is
@@ -416,6 +421,13 @@ pub enum InfoValue {
     /// oracle's `=node:…`/`=no_distribution` dump), built through the safe heap writer
     /// [`beam_codec::term::make_binary`] so this crate stays `unsafe`-free.
     Binary(Vec<u8>),
+    /// A **pid**, materialized as the internal-pid immediate the process table holds.
+    ///
+    /// The only pid-valued key is `system_logger` (see [`system`]). A [`ProcessId`] encodes
+    /// to its term with no heap at all ([`ProcessId::to_eterm`]), so the value is
+    /// byte-identical to what `erlang:whereis/1` answers for the same process — the
+    /// oracle's own route to `system_logger`'s pid.
+    Pid(ProcessId),
     /// A proper list, in order (materialized element by element, head first).
     List(Vec<InfoValue>),
     /// A tuple of arbitrary arity, in order.
@@ -456,6 +468,7 @@ impl InfoValue {
                 heap.tuple(&[first, second])
             }
             InfoValue::Binary(bytes) => beam_codec::term::make_binary(heap, bytes),
+            InfoValue::Pid(pid) => Ok(pid.to_eterm()),
             InfoValue::List(elements) => {
                 // Materialize the elements first (they may need heap space of their own),
                 // then build the spine, so a nested container cannot be half-written.
@@ -780,7 +793,7 @@ mod tests {
         }
         // The surface is the union of the family modules; keep the count pinned so a key
         // dropped from a family is caught.
-        assert_eq!(SUPPORTED_KEYS.len(), 87);
+        assert_eq!(SUPPORTED_KEYS.len(), 88);
         let mut sorted: Vec<&str> = SUPPORTED_KEYS.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
@@ -805,7 +818,7 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), UNSUPPORTED_KEYS.len(), "no duplicate keys");
-        assert_eq!(sorted.len(), 28);
+        assert_eq!(sorted.len(), 27);
     }
 
     #[test]
@@ -937,6 +950,52 @@ mod tests {
         assert!(InfoValue::Binary(payload.to_vec())
             .to_eterm(&mut heap, &AtomTable::new())
             .is_ok());
+    }
+
+    #[test]
+    fn the_pid_variant_materializes_to_a_real_pid_without_a_heap_or_atom_table() {
+        // `system_logger` is the one pid-valued key; its term must be exactly what
+        // `erlang:whereis/1` answers for that process, i.e. the internal-pid immediate.
+        let mut heap = Heap::new(64).expect("test heap");
+        let pid = ProcessId::new(7, 1);
+        let term = InfoValue::Pid(pid)
+            .to_eterm(&mut heap, &seeded_atoms())
+            .expect("pid");
+        assert_eq!(term, pid.to_eterm());
+        assert!(ProcessId::is_process(term));
+        // A pid is an immediate: it needs no heap space and resolves no atom.
+        assert!(InfoValue::Pid(pid)
+            .to_eterm(&mut heap, &AtomTable::new())
+            .is_ok());
+    }
+
+    #[test]
+    fn system_logger_reports_the_registered_logger_process_or_undefined() {
+        let mut rt = runtime();
+        // A runtime that never ran a boot script has no process registered as `logger`, so
+        // the honest answer is the atom `undefined` — one of the two non-pid shapes the
+        // oracle itself produces for this key
+        // (`erlang:system_flag(system_logger, undefined)`, `logger_proxy.erl:147`).
+        assert_eq!(
+            system_info_value("system_logger", &rt).expect("system_logger"),
+            InfoValue::Atom("undefined")
+        );
+        // A process registered as `logger` — what the real `start.boot` leaves behind
+        // (instruction 13's `{kernelProcess,logger,{logger_server,start_link,[]}}`) — is
+        // reported as its pid, never a fabricated one.
+        let pid = rt.self_pid();
+        rt.register_boot_process("logger", pid)
+            .expect("`logger` is not yet registered");
+        let value = system_info_value("system_logger", &rt).expect("system_logger");
+        assert_eq!(value, InfoValue::Pid(pid));
+        let mut heap = Heap::new(64).expect("test heap");
+        assert_eq!(
+            value
+                .to_eterm(&mut heap, &seeded_atoms())
+                .expect("a pid needs no heap or atom"),
+            pid.to_eterm(),
+            "the value is byte-identical to `erlang:whereis(logger)`"
+        );
     }
 
     #[test]
