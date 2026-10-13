@@ -475,13 +475,12 @@ regardless of `PATH` order); the rest probe ready, and `khepri` runs once the `r
 ## Measured — where the numbers live
 
 **`RESULTS.md` is the authoritative source for every measured number** (one table per workload category,
-the environment record, the exact reproduction commands, the `/proc/loadavg` record, the stability bounds
-and a "what these numbers do and do not mean" section). The raw harness JSON behind it is committed under
-`results/`: `m9-*` = the **current** run (the full cross-runtime report, the full external-target report, the
-PLB/EMQX observations, the post-fix tool-resolution smokes `m9-bench-plb-smoke.json` /
-`m9-bench-plb-smoke-path8.json` / `m9-bench-emqx-smoke.json`, the cross-runtime diff, and the
-`m9-load-record.md`/`m9-tool-targets-notes.md` records);
-`m6-*`/`m5-*`/`m4-*` = the previous runs, kept as the regression baseline.
+the environment record, the exact reproduction commands, the `/proc/loadavg` record, the stability bounds,
+the m10-vs-m9 delta section and the ranked bottleneck list). The raw harness JSON behind it is committed
+under `results/`: `m10-*` = the **current** run (the full cross-runtime report, the Rust-only interpreter-tier
+control, the full external-target report, the PLB/EMQX observations, the cross-runtime/tier/vs-m9 diffs, and
+the `m10-load-record.md`/`m10-tool-targets-notes.md` records);
+`m9-*`/`m6-*`/`m5-*`/`m4-*` = the previous runs, kept as the regression baseline.
 This file deliberately restates none of those numbers — read them there, and regenerate with the Runbook
 above rather than quoting a stale copy.
 
