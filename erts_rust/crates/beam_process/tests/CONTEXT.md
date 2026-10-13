@@ -12,14 +12,23 @@ Single-threaded scheduler, mailbox, signals, GC roots, PCB state:
    resume-on-send (blocked receiver re-enqueued in the same slice) + a two-process counter ping-pong.
 2. `messaging.rs` — send into a receiver's mailbox, selective `receive` (FIFO, non-matches stay
    queued), `DeliverOutcome::Woke` vs `Enqueued`.
-3. `signals.rs` — link exit propagation (non-trapping dies, trapping survives with
+3. `signals.rs` (17 tests) — link exit propagation (non-trapping dies, trapping survives with
    `{'EXIT', A, Reason}`), monitor down-message, reason ownership (a structured reason survives the
    recipient's `Process::collect`); trapping-peer, cascaded A→B→C link, `{'DOWN'}`, self-signal. Also
    `a_targets_death_resolves_the_watchers_outgoing_monitor` (a target's death drops the watcher's
    outgoing `Monitor`, so a later `demonitor` reports it gone) and
    `link_to_a_non_live_pid_signals_noproc_from_it` (a non-live `link` target signals `noproc` from it:
    a trapping caller is handed `{'EXIT', Target, noproc}`, a non-trapping one is terminated with
-   `noproc`).
+   `noproc`). The **exit-family split** is pinned by three tests (the C's
+   `ERTS_SIG_Q_OP_EXIT`/`ERTS_SIG_Q_OP_EXIT_LINKED`, `erl_proc_sig_queue.c:4740-4770`):
+   `a_trapping_link_peer_traps_a_kill_link_exit_and_survives` — a link exit of reason `kill` **is**
+   trappable, so the trapping peer survives with `{'EXIT', Peer, kill}` delivered **unchanged** (never
+   `killed`); `a_non_trapping_link_peer_follows_a_kill_link_exit_with_kill_not_killed` — its
+   non-trapping peer is terminated with reason `kill`, observed through a watcher's `{'DOWN', …}`
+   reason, asserted both `== kill` and `!= killed`; and
+   `an_explicit_exit_2_kill_still_terminates_a_trapping_receiver` — the contrast over the explicit
+   `erlang:exit/2` family, where the `kill` sentinel stays untrappable and a trapping receiver dies
+   with the rewritten `killed`.
 4. `gc.rs` — safepoint GC over the process root set (x-register + stack + mailbox payload relocate
    while garbage is reclaimed).
 5. `priority.rs` — four-level order (MAX → NORMAL → LOW, FIFO within a level), requeue at **own**
@@ -76,13 +85,25 @@ Single-threaded scheduler, mailbox, signals, GC roots, PCB state:
 16. `remote.rs` — an external pid links/monitors via the same table entry points, is recorded
     separately, and every change is handed to a recording `DistSignalRouter`; `node_down` resolves then
     purges.
-16b. `remote_inbound.rs` (22 tests) — the **inbound (receipt)** half of the distribution
+16b. `remote_inbound.rs` (25 tests) — the **inbound (receipt)** half of the distribution
     link/monitor/exit/unlink/group-leader families: every new `ProcessTable` primitive
     (`record_remote_link`, `apply_remote_exit_signal` for both the link-exit and the `exit/2`
     families, `unlink_from_remote`/`unlink_ack_from_remote`, `monitor_from_remote`/
     `demonitor_from_remote`/`remote_watchers`, `remote_monitor_down`, `set_group_leader_from_remote`/
     `group_leader`, `next_reference`) applies its local effect and routes **nothing** — the recording
     router staying empty is the proof of the C's non-echoing receipt arms (`dist.c:2258`).
+    `a_link_exit_traps_for_every_reason_including_normal_and_kill` pins that the link-exit family
+    traps **every** reason (the `killed` rewrite is confined to `op == ERTS_SIG_Q_OP_EXIT`), so a
+    trapping receiver takes `{'EXIT', RemotePid, normal|kill|Other}` verbatim with the recorded link
+    removed **first**; `demonitor_from_remote_removes_only_its_reference_on_that_process` pins the
+    `DOP_DEMONITOR_P` receipt as dropping **exactly** the matching reference of the named local
+    process (another local process's identical reference untouched, a re-sent reference an `Ok`
+    no-op that resurrects nothing, a dead pid `TermNotFound`); and
+    `an_incoming_watcher_record_is_dropped_by_death_and_by_demonitor` pins the `RemoteWatcher`
+    incoming-record table resolving through **both** the watched process's death and a
+    `DOP_DEMONITOR_P` receipt, each destroying nothing that is not its own record (a sibling's
+    identical reference surviving) and never resurrecting one. Every case asserts the recording
+    router's log stays empty.
 SMP pool:
 17. `smp.rs` (11 tests) — the SMP pool: N-on-M-scheduler progress (M ∈ {1,4}, 200 pids each, each
     process running `YIELDS + 1` runner invocations and **one** recorded slice); work stealing (a
@@ -220,12 +241,17 @@ SMP pool:
     removed), so a comparison is exact and never flaky. A support module (subdirectory files are not
     compiled as test targets); it carries `#![allow(dead_code)]` because not every including binary uses
     every helper.
-32. `lifecycle_oracle.rs` (7 tests) — the **lifecycle / process-control semantics** cross-checked against
+32. `lifecycle_oracle.rs` (8 tests) — the **lifecycle / process-control semantics** cross-checked against
     the real `erl` (skips loudly when absent), filling the cases the other `oracle_*` suites leave
     unpinned: link exit propagation from a **live** linked origin (a non-trapping peer dies, a trapping
     peer survives with `{'EXIT', A, {bad,1}}`, and the watcher's DOWN carries the same structured
     reason); **`kill` under `trap_exit`** (an untrappable `killed` death of a trapping process, with a
-    trapping link peer receiving `{'EXIT', P, killed}` and a `killed` DOWN); the `noproc`/`normal`/
+    trapping link peer receiving `{'EXIT', P, killed}` and a `killed` DOWN); the **exit-family split
+    for a `kill` link exit** — `oracle_kill_link_exit_is_trappable_and_not_rewritten_to_killed`, whose
+    probe 1 has a `trap_exit` receiver linked to a peer that terminates with `kill` receive
+    `{'EXIT', Peer, kill}` unchanged and stay alive (`is_process_alive(P)` false, itself true) while
+    probe 2 has a non-trapping linked peer die with reason `kill` (**never** `killed`) observed through
+    a monitor's DOWN reason, with the same two probes re-run against the Rust table; the `noproc`/`normal`/
     `killed` exit-reason **shapes** at a trapping peer (incl. an explicit `killed` being *trappable*,
     unlike the `kill` sentinel); `erlang:exit/2` propagating a structured reason verbatim with `From` the
     signaller; the registry's `register`/`whereis`/`registered`/`unregister` round trip; `demonitor`
@@ -425,7 +451,9 @@ SMP pool:
     Deterministic — no sleeps / wall-clock bounds / oracle.
 42. `off_heap_reachability.rs` (9 tests) — the **reachability-driven** liveness decision for the
     **process-owned** off-heap refc binaries (`Process::sweep_off_heap_binaries_reachable`, over
-    `beam_gc::AnyCollector::for_each_reachable_object` + the read-only `gather_scan_roots` root set;
+    `beam_gc::AnyCollector::for_each_reachable_object_view` + the read-only `gather_scan_roots` root
+    set — every reported object is read through the **safe** `beam_gc::ReachableObject` view
+    (`header()` / `word(1)`), so the sweep adds no `unsafe` of its own;
     `Process::run_rooted_collection` runs it automatically over the roots the collection just
     gathered). `a_payload_reachable_through_an_on_heap_handle_is_retained`: a 200-byte payload named
     by a real on-heap `[BinRef][ErlSubBits]` pair rooted in `x(0)` is kept — the sweep returns 0, the
@@ -439,7 +467,9 @@ SMP pool:
     (`write_map`) survives, while a fourth payload registered but rooted nowhere is reclaimed in the
     same sweep. `a_payload_reached_through_any_root_region_is_retained`: a payload reached only through
     one of the process's **in-heap sub-rootsets** — a queued `Message` payload, a dict value, a saved
-    BIF/NIF arg, or a `PendingSignal` reason — is kept (so the scan-side `gather_scan_roots` cannot lag
+    BIF/NIF arg, or a `PendingSignal` reason (queued through
+    `PendingSignal::exit(from, reason, ExitFamily::Explicit)`) — is kept (so the scan-side
+    `gather_scan_roots` cannot lag
     the collection's own gather), and only the unrooted one is released.
     `a_process_with_unpublished_roots_is_not_reachability_swept`: a **relocation-exempt** process and a
     `Running` one each return `Ok(0)` and retain every owned payload (the **decline valve** — an
@@ -499,9 +529,11 @@ SMP pool:
 - Run the whole crate gate with
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_process` (never `cd`,
   sandbox `$HOME` is read-only). Cross-checks against the real system ERTS belong to the sibling
-  `../../../tools/differential/` harness, not here. Current: **511 passed, 0 failed, 1 ignored** (179 in-module unit tests + 331
-  across the 43 integration targets here + 1 doctest; the single ignore is the documented
-  non-yielding-runner hang failure mode in `preemption.rs`).
+  `../../../tools/differential/` harness, not here. Current: **541 passed, 0 failed, 1 ignored** (180
+  in-module unit tests + 360 across the 44 integration test targets under `tests/` — one per top-level
+  `tests/*.rs` file; the `common/mod.rs` support module contributes its 4 normalizer unit tests to each
+  of its 7 includers — plus 1 doctest; the single ignore is the documented non-yielding-runner hang
+  failure mode in `preemption.rs`).
 
 ## Routing Table
 - `scheduler.rs`, `messaging.rs`, `signals.rs`, `gc.rs`, `priority.rs`, `pending_signals.rs`,
@@ -510,7 +542,9 @@ SMP pool:
   `gc_refc_binary_message.rs`,
   `off_heap_send_isolation.rs`, `message_from_is_immediate.rs`, `off_heap_binaries.rs`,
   `off_heap_reachability.rs` →
-  the single-threaded scheduler (incl. the port-aware slice cleanup), mailbox, signals, GC roots, PCB state,
+  the single-threaded scheduler (incl. the port-aware slice cleanup), mailbox, signals (incl. the
+  **family-aware** exit policy — a link-exit `kill` traps, an explicit `erlang:exit/2` `kill` does
+  not), GC roots, PCB state,
   pre-emption/fairness, the collect-grow-and-retry exhaustion path of `Process::deliver` and the
   `{'EXIT',…}`/`{'DOWN',…}` signal builders (both the enqueue-time reason copy and the
   heap-fragment fallback for a receiver whose relocation is declined — the crate-owned unpublished
@@ -526,8 +560,9 @@ SMP pool:
   the `monitor/3` user tag), the typed-error/capability inventory, the `process_info` item→accessor
   mapping, the spawn-option composition and the GC **strategy dispatch** (the strategy a process's
   policy resolves to, the unchanged default cadence, and collection through the process root set), and
-  the lifecycle semantics (link exit propagation, `kill` under
-  `trap_exit`, exit-reason shapes, `erlang:exit/2` propagation, the registry round trip, `demonitor`
+  the lifecycle semantics (link exit propagation, the **exit-family split** for a `kill` — trappable
+  as a link exit, untrappable and `killed`-rewritten as an explicit `erlang:exit/2` — exit-reason
+  shapes, `erlang:exit/2` propagation, the registry round trip, `demonitor`
   `[info]`/`[flush]`)
 - `split_borrow.rs` → the two `Process` split borrows (`heap_and_off_heap_mut` + `Fragments::move_into`;
   `heap_and_mailbox_mut` + `send_fragmented`)
