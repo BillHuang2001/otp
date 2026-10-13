@@ -265,6 +265,24 @@ battery() ->
     emit("slot_duplicate_bag_partition", slot_hash_partition(duplicate_bag)),
     emit("slot_duplicate_bag_empty", slot_hash_empty(duplicate_bag)),
     emit("slot_duplicate_bag_duplicate_union", slot_hash_duplicate_union()),
+
+    %% The match-spec `map` group (`battery/maps.rs`).
+    emit("map_literal_atom_key", map_literal_atom_key()),
+    emit("map_wildcard_value", map_wildcard_value()),
+    emit("map_extra_keys_match", map_extra_keys_match()),
+    emit("map_empty_pattern", map_empty_pattern()),
+    emit("map_nonatom_keys", map_nonatom_keys()),
+    emit("map_int_vs_float_keys_distinct", map_int_vs_float_keys_distinct()),
+    emit("map_nonliteral_key_badarg", map_nonliteral_key_badarg()),
+    emit("map_nested_in_containers", map_nested_in_containers()),
+    emit("map_value_matched_structurally", map_value_matched_structurally()),
+    emit("map_absent_key_empty", map_absent_key_empty()),
+    emit("map_large_head_map", map_large_head_map()),
+    emit("map_construct_guard", map_construct_guard()),
+    emit("map_construct_body_nested", map_construct_body_nested()),
+    emit("map_get_absent_badarg", map_get_absent_badarg()),
+    emit("map_size_is_map_key_on_nonmap", map_size_is_map_key_on_nonmap()),
+    emit("select_replace_bare_map_body", select_replace_bare_map_body()),
     ok.
 
 %% ------------------------------- ets:slot/2 -------------------------------
@@ -353,6 +371,154 @@ slot_hash_duplicate_union() ->
     ets:insert(T, slot_object(1)),
     {Objs, EOT} = slot_hash_walk(T, 0, []),
     t([srt(Objs), slot_read(T, EOT + 1)]).
+
+%% ----------------------------- match-spec maps -----------------------------
+%% The head-map rule (literal keys, structural values, extra keys allowed), the
+%% map guards/bodies, and the bare-map `select_replace` refusal. Every case is
+%% read through `cap_str/1`/`cap/1` so a raising call is compared as a value.
+
+map_literal_atom_key() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, #{ a => 10 }}),
+    ets:insert(T, {2, #{ b => 20 }}),
+    S = [{{'$1', #{ a => '$2' }}, [], ['$1']}],
+    cap_str(fun() -> inorder(ets:select(T, S)) end).
+
+map_wildcard_value() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, #{ a => 10 }}),
+    ets:insert(T, {2, #{ b => 20 }}),
+    ets:insert(T, {3, #{ a => 30, b => 40 }}),
+    S = [{{'$1', #{ a => '_' }}, [], ['$1']}],
+    cap_str(fun() -> inorder(ets:select(T, S)) end).
+
+map_extra_keys_match() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, #{ a => 1, b => 2, c => 3 }}),
+    ets:insert(T, {2, #{ b => 2 }}),
+    S = [{{'$1', #{ a => '$2' }}, [], ['$2']}],
+    cap_str(fun() -> inorder(ets:select(T, S)) end).
+
+map_empty_pattern() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, #{}}),
+    ets:insert(T, {2, #{ a => 1 }}),
+    ets:insert(T, {3, 5}),
+    S = [{{'$1', #{}}, [], ['$1']}],
+    cap_str(fun() -> inorder(ets:select(T, S)) end).
+
+map_nonatom_keys() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, #{ 1 => 10 }}),
+    ets:insert(T, {2, #{ 1.0 => 20 }}),
+    ets:insert(T, {3, #{ {1,2} => 30 }}),
+    ets:insert(T, {4, #{ <<"ab">> => 40 }}),
+    ets:insert(T, {5, #{ #{ x => 1 } => 50 }}),
+    SI = [{{'$1', #{ 1 => '$2' }}, [], ['$2']}],
+    SF = [{{'$1', #{ 1.0 => '$2' }}, [], ['$2']}],
+    ST = [{{'$1', #{ {1,2} => '$2' }}, [], ['$2']}],
+    SB = [{{'$1', #{ <<"ab">> => '$2' }}, [], ['$2']}],
+    SO = [{{'$1', #{ #{ x => 1 } => '$2' }}, [], ['$2']}],
+    t([cap_str(fun() -> inorder(ets:select(T, SI)) end),
+       cap_str(fun() -> inorder(ets:select(T, SF)) end),
+       cap_str(fun() -> inorder(ets:select(T, ST)) end),
+       cap_str(fun() -> inorder(ets:select(T, SB)) end),
+       cap_str(fun() -> inorder(ets:select(T, SO)) end)]).
+
+map_int_vs_float_keys_distinct() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, #{ 1 => int }}),
+    ets:insert(T, {2, #{ 1.0 => afloat }}),
+    SI = [{{'$1', #{ 1 => '$2' }}, [], ['$2']}],
+    SF = [{{'$1', #{ 1.0 => '$2' }}, [], ['$2']}],
+    t([cap_str(fun() -> inorder(ets:select(T, SI)) end),
+       cap_str(fun() -> inorder(ets:select(T, SF)) end)]).
+
+map_nonliteral_key_badarg() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, #{ a => 1 }}),
+    ets:insert(T, {2, #{ {1,2} => 20 }}),
+    S1 = [{{'$1', #{ '$2' => '$3' }}, [], ['$1']}],
+    S2 = [{{'$1', #{ '_' => '$3' }}, [], ['$1']}],
+    S3 = [{{'$1', #{ {1, '$2'} => '$3' }}, [], ['$1']}],
+    t([cap_str(fun() -> inorder(ets:select(T, S1)) end),
+       cap_str(fun() -> inorder(ets:select(T, S2)) end),
+       cap_str(fun() -> inorder(ets:select(T, S3)) end)]).
+
+map_nested_in_containers() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, {a, #{ k => 10 }}}),
+    ets:insert(T, {2, [b, #{ k => 20 }]}),
+    ST = [{{'$1', {'$2', #{ k => '$3' }}}, [], ['$3']}],
+    SL = [{{'$1', ['$2', #{ k => '$3' }]}, [], ['$3']}],
+    t([cap_str(fun() -> inorder(ets:select(T, ST)) end),
+       cap_str(fun() -> inorder(ets:select(T, SL)) end)]).
+
+map_value_matched_structurally() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, #{ a => {x, 1} }}),
+    ets:insert(T, {2, #{ a => {y, 2} }}),
+    S = [{{'$1', #{ a => {'$2', '$3'} }}, [], [{{'$2', '$3'}}]}],
+    cap_str(fun() -> inorder(ets:select(T, S)) end).
+
+map_absent_key_empty() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, #{ b => 1 }}),
+    ets:insert(T, {2, #{ c => 2 }}),
+    S = [{{'$1', #{ a => '$2' }}, [], ['$1']}],
+    cap_str(fun() -> inorder(ets:select(T, S)) end).
+
+map_large_head_map() ->
+    T = new(ordered_set),
+    Obj1 = maps:from_list([{K, K * 10} || K <- lists:seq(1, 40)]),
+    Obj2 = maps:from_list([{K, K * 10} || K <- lists:seq(2, 41)]),
+    ets:insert(T, {1, Obj1}),
+    ets:insert(T, {2, Obj2}),
+    KeyList = [{K, '_'} || K <- lists:seq(1, 35)],
+    S = [{{'$1', maps:from_list(KeyList)}, [], ['$1']}],
+    cap_str(fun() -> inorder(ets:select(T, S)) end).
+
+map_construct_guard() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, 10}),
+    ets:insert(T, {2, 20}),
+    S = [{{'$1', '$2'}, [{'andalso', {'==', {map_size, #{ '$1' => '$2' }}, 1},
+                                   {'==', {map_get, '$1', #{ '$1' => '$2' }}, '$2'}}], ['$1']}],
+    cap_str(fun() -> inorder(ets:select(T, S)) end).
+
+map_construct_body_nested() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, 10}),
+    ets:insert(T, {2, 20}),
+    Outer = #{ k => #{ k => '$2' }},
+    S = [{{'$1', '$2'}, [], [{map_get, k, {map_get, k, Outer}}]}],
+    cap_str(fun() -> inorder(ets:select(T, S)) end).
+
+map_get_absent_badarg() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, #{ b => 1 }}),
+    SG = [{{'$1', '$2'}, [{'==', {map_get, a, '$2'}, 0}], ['$1']}],
+    SB = [{{'$1', '$2'}, [], [{map_get, a, '$2'}]}],
+    t([cap_str(fun() -> inorder(ets:select(T, SG)) end),
+       cap_str(fun() -> inorder(ets:select(T, SB)) end)]).
+
+map_size_is_map_key_on_nonmap() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, 10}),
+    ets:insert(T, {2, #{ a => 1 }}),
+    S1 = [{{'$1', '$2'}, [{'==', {map_size, '$2'}, 1}], ['$1']}],
+    S2 = [{{'$1', '$2'}, [{is_map_key, a, '$2'}], ['$1']}],
+    t([cap_str(fun() -> inorder(ets:select(T, S1)) end),
+       cap_str(fun() -> inorder(ets:select(T, S2)) end)]).
+
+select_replace_bare_map_body() ->
+    T = new(set),
+    ets:insert(T, {1, 10}),
+    ets:insert(T, {2, 20}),
+    S = [{{'$1', '$2'}, [], [#{ '$1' => '$2' }]}],
+    C = cap(fun() -> ets:select_replace(T, S) end),
+    L = srt(ets:tab2list(T)),
+    t([C, L]).
 
 %% ------------------------------ per-kind cases ------------------------------
 

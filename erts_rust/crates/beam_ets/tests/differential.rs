@@ -628,6 +628,22 @@ const EXPECTED: &[(&str, &str)] = &[
         "slot_duplicate_bag_duplicate_union",
         "{[{1,10},{1,10},{2,20}],badarg}",
     ),
+    ("map_literal_atom_key", "ok:[1]"),
+    ("map_wildcard_value", "ok:[1,3]"),
+    ("map_extra_keys_match", "ok:[1]"),
+    ("map_empty_pattern", "ok:[1,2]"),
+    ("map_nonatom_keys", "{ok:[10],ok:[20],ok:[30],ok:[40],ok:[50]}"),
+    ("map_int_vs_float_keys_distinct", "{ok:[int],ok:[afloat]}"),
+    ("map_nonliteral_key_badarg", "{badarg,badarg,ok:[]}"),
+    ("map_nested_in_containers", "{ok:[10],ok:[20]}"),
+    ("map_value_matched_structurally", "ok:[{x,1},{y,2}]"),
+    ("map_absent_key_empty", "ok:[]"),
+    ("map_large_head_map", "ok:[1]"),
+    ("map_construct_guard", "ok:[1,2]"),
+    ("map_construct_body_nested", "ok:[10,20]"),
+    ("map_get_absent_badarg", "{ok:[],ok:[EXIT]}"),
+    ("map_size_is_map_key_on_nonmap", "{ok:[2],ok:[2]}"),
+    ("select_replace_bare_map_body", "{badarg,[{1,10},{2,20}]}"),
 ];
 
 // ---------------------------------------------------------------------------
