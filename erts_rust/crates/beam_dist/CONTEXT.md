@@ -552,9 +552,11 @@ line (no timestamps/addresses/ports) and exits `0`:
     node's `ALIVE2_REQ` and the crate's client resolved its port. Needs no host `epmd`; skips loudly
     only when `erl` is absent.
   - `tests/dist_probe_cli.rs` — drives the built `dist_probe` bin via `env!("CARGO_BIN_EXE_dist_probe")`:
-    for each of `ping`/`nodes`/`term` the **exact** stdout line and exit `0` (and empty stderr), plus
-    exit `2` for a missing/unknown/over-long subcommand. The bin also carries a `#[cfg(test)]` unit test
-    for the `term` hex encoding.
+    for **every** report (`ping`/`nodes`/`term` + the eight `badcookie`/`nodeid`/`frag`/`alias`/
+    `monitor`/`regsend_missing`/`handshake`/`utf8`) the **exact** stdout line and exit `0` (and empty
+    stderr), a repeated-run byte-identity check, plus exit `2` for a missing/unknown/over-long
+    subcommand. The bin also carries `#[cfg(test)]` unit tests for the `term` hex encoding, the
+    `frame_tags` handshake-tag walker, the FNV-1a checksum, and the `Spy`'s fragment-frame counting.
 
 ## Design Decisions
 - **MD5 is implemented in-tree, not via a dependency.** The digest is one 16-byte hash; `md-5` would
