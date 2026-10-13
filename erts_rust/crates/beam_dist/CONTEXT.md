@@ -707,13 +707,6 @@ line (no timestamps/addresses/ports) and exits `0`:
 - **`DOP_UNLINK` never routes to a side effect.** The C *rejects* the bare `DOP_UNLINK` opcode
   (`dist.c:2277-2282`), so `classify` leaves it `Other(DOP_UNLINK)` — encodable/decodable, but carrying
   no semantic `Delivery`.
-- **`Delivery::classify` performs no per-opcode type or node-identity validation.** It checks term
-  presence + arity (via `decode_control`) and the spawn/altact flag-word constraints, but not the C's
-  per-opcode checks: `is_external_pid(from)` + `external_pid_dist_entry(from) == dep` (the peer's dist
-  entry), `is_ref(ref)`, `is_atom`/`is_internal_pid` on `watched`/`to` (`dist.c:2224-2441`). `Delivery`
-  also carries no peer/connection identity, so an `InboundSink` cannot enforce the `dep` check without
-  out-of-band context — a peer may name a `from`/`watcher` pid belonging to a *different* node and it is
-  classified without complaint.
 - **The accept policy can refuse, but there is no net-kernel pending-connection registry.** Both
   acceptors now consult an **opt-in, defaulted** `AcceptDecision` seam
   (`accept_server_with_decision` / `Connection::server_with_decision` /
