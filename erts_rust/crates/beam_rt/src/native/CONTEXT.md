@@ -453,14 +453,41 @@ write-mode `{open,…}` that delegates to `prim_file:open/2` and really creates 
   `file_server/`'s suites are described in [`file_server/CONTEXT.md`](file_server/CONTEXT.md).
 - Test fixtures that need a real `.beam` or the system Erlang skip **loudly**
   (`system_runtime()` / the file-local `lists_beam()`); the arithmetic/`term_type` suites need none.
-- **Suites that spawn the live `erl` oracle in-process** (bounded poll/kill; skip **loudly** when
-  absent): `code.rs` (`code_priv_dir_agrees_with_the_oracle`), `memory/tests.rs`,
-  `prim.rs` (`the_unserved_prim_file_entries_are_typed_capability_gaps`,
-  `the_closed_prim_file_families_agree_with_the_erl_oracle`,
-  `the_file_info_family_agrees_with_the_oracle`), `file_server/tests.rs`
-  (`the_getopts_answers_match_the_live_oracle`) and `file_server/get_line/tests.rs`. Every other
-  in-node test quotes its oracle value in the doc comment (verified out of band) rather than
-  re-running `erl`.
+- **The ONLY external toolchain ever spawned in this node is `erl`** — no `erlc`/`escript`/`cc`/
+  `gcc`/`clang` invocation exists anywhere under `src/native/`. Every live-oracle comparison compares
+  the oracle's **stdout** (`~p`/`~w`/`~s` rendering) or its exit status; none compares `term_to_binary`
+  bytes.
+- **Suites that spawn the live `erl` oracle in-process** (skip **loudly** when absent). Each spawn
+  site, its resolution and its bound:
+  * `memory/tests.rs:677` (`oracle_pi_1_keys`, used by `the_implemented_item_order_is_a_subsequence_of_the_oracles`)
+    and `:923` (`oracle_eval`, used by `the_oracle_reports_zero_catchlevel_outside_a_try_and_a_depth_inside_one`,
+    `the_oracle_backs_the_remaining_gaps_values`, `the_oracle_lists_a_processes_off_heap_binaries`)
+    — resolve via a **bare `$PATH` lookup only** (they do NOT honor `$ERTS_ORACLE`); `oracle_pi_1_keys`
+    is **unbounded**, `oracle_eval` is bounded by `ORACLE_TIMEOUT = 30s`; the probes print inline
+    `eprintln!("SKIPPING …")` (no banner).
+  * `code.rs:931` (`oracle_probe` over `oracle_erl()`, used by `code_priv_dir_agrees_with_the_oracle`)
+    — `$ERTS_ORACLE` else `$PATH`, `.output()`, **unbounded**, argv `-noshell -eval … -s init stop`;
+    loud skip via `skip_oracle_loudly()` (`code.rs:943`, no arg); gated first by `system_runtime()`.
+  * `prim.rs:3203` (`run_oracle` over `resolve_oracle()`, used by `the_closed_prim_file_families_agree_with_the_erl_oracle`
+    and `the_file_info_family_agrees_with_the_oracle`) — `$ERTS_ORACLE` else `$PATH`, bounded 30 s /
+    10 ms poll; loud skip via `skip_oracle_loudly(why)` (`prim.rs:3163`, takes a reason string).
+    `the_unserved_prim_file_entries_are_typed_capability_gaps` does NOT spawn the oracle.
+  * `file_server/tests.rs:1319` (`oracle_render`/`compare_with_oracle`, used by
+    `the_write_answers_match_the_live_oracle`, `the_getopts_answers_match_the_live_oracle`,
+    `the_buffered_read_answers_match_the_live_oracle`) — `$ERTS_ORACLE` else `$PATH`, bounded 30 s /
+    20 ms poll; multi-line SKIPPED banner.
+  * `file_server/get_line/tests.rs:926` (`run_oracle` over `resolve_oracle()`, used by
+    `the_replies_match_the_live_oracle`) — same convention and bound; multi-line SKIPPED banner.
+  * `file_server/get_until/tests.rs` spawns **nothing** — every oracle value there is quoted in a
+    doc comment (verified out of band).
+- **`process_info(Pid, garbage_collection)` is NEVER compared against a live oracle.**
+  `garbage_collection_matches_the_oracle_for_a_live_process` (`memory/tests.rs:586`) asserts the
+  runtime's own root-process value against a **hard-coded** `expected` array (233 / 46422 / 65535 / 0,
+  `:593-599`) — the name's "oracle" is the constants' documented provenance, not a live run.
+  `erlang:memory/0,1` and `erlang:statistics(garbage_collection)` do not appear in this node at all.
+  The only live-oracle GC-family probe is `the_oracle_backs_the_remaining_gaps_values`
+  (`memory/tests.rs:1003-1026`), which compares `garbage_collection_info`'s **item KEY NAMES** only
+  (via `element(1,…)`, `:1011`), never values.
 - Cross-crate integration (CLI/exit codes, the preloaded `boot/*` corpus, `-eval`) is pinned by the
   `../tests/` suites, not here. This node's A.9 native-floor surface — `application:get_all_key/1`,
   `get_key/1,2`, `get_application/0,1`; `init:get_argument/1`'s automatic flags; `init:script_id/0`;
