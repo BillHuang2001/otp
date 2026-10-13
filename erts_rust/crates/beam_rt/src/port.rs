@@ -411,6 +411,22 @@ struct PortMeta {
     /// `None` for every port without a C driver (a `spawn`/`fd` port) — one whose `control` reply
     /// is the oracle's own `badarg`.
     driver_control_flags: Option<Rc<Cell<c_int>>>,
+    /// The **busy state** of a `{spawn_driver, Name}` port's C driver — the C's
+    /// `prt->sched.flags & ERTS_PTS_FLG_BUSY_PORT`, as the driver's own `set_busy_port` sets it.
+    ///
+    /// `erlang:port_command/2,3` consults it exactly as `erts_port_output` does (`io.c:1749-1764` and
+    /// `erl_bif_port.c:192-220`): `nosuspend` on a busy port answers `false`, `force` bypasses the
+    /// busy check, and a plain command on a busy port suspends the caller. The handle also carries
+    /// whether the loaded entry advertises `ERL_DRV_FLAG_SOFT_BUSY`, which decides the `force` arm.
+    /// Seized from the host with [`driver::DriverPort::busy_flag`] before the host is moved into the
+    /// port lifecycle (the boxed driver exposes no host), the same way [`PortMeta::driver_terms`],
+    /// [`PortMeta::driver_atoms`] and [`PortMeta::driver_control_flags`] are.
+    ///
+    /// `None` for every port without a C driver (a `spawn`/`fd` port) — and for a **built-in**
+    /// driver port, whose entry flags are not exposed by the built-in registry. Both are the C's
+    /// "never busy, no `SOFT_BUSY`" case, i.e. `force` ⇒ `notsup`, matching the oracle's own answers
+    /// for `{spawn, Cmd}` and `{fd, N}` ports.
+    driver_busy: Option<driver::BusyFlag>,
     /// The monitor tree a `{spawn_driver, Name}` port's C driver holds on Erlang processes
     /// (`driver_monitor_process`) — the C's per-port monitor list.
     ///
@@ -904,6 +920,38 @@ impl PortRegistry {
             .get(&id.number())
             .and_then(|meta| meta.driver_control_flags.as_ref())
             .is_some_and(|flags| flags.get() & PORT_CONTROL_FLAG_BINARY != 0)
+    }
+
+    /// Whether `id`'s port is currently **busy** — the state the driver last reported through
+    /// `set_busy_port` (the C's `prt->sched.flags & ERTS_PTS_FLG_BUSY_PORT`, `io.c:5208-5264`).
+    ///
+    /// `erlang:port_command/2,3` consults it exactly as `erts_port_output` does: a busy port answers
+    /// `false` for `nosuspend`, suspends the caller for a plain command, and lets `force` through —
+    /// when the driver entry advertises `ERL_DRV_FLAG_SOFT_BUSY`
+    /// ([`PortRegistry::soft_busy`]).
+    ///
+    /// `false` for an unknown port and for every port without a C driver (a `spawn`/`fd` port and a
+    /// built-in driver port), none of which can ever report busy — the oracle's own answer for a
+    /// `{spawn, Cmd}`/`{fd, N}` port.
+    pub fn is_busy(&self, id: PortId) -> bool {
+        self.meta
+            .get(&id.number())
+            .and_then(|meta| meta.driver_busy.as_ref())
+            .is_some_and(driver::BusyFlag::is_busy)
+    }
+
+    /// Whether `id`'s C driver **entry** advertises `ERL_DRV_FLAG_SOFT_BUSY` — the bit
+    /// `erlang:port_command/2,3`'s `force` arm tests (`erl_bif_port.c:195-198`).
+    ///
+    /// `true` only for a `{spawn_driver, Name}` port whose loaded `ErlDrvEntry::driver_flags`
+    /// carries the bit; `false` for an unknown port, for every `spawn`/`fd` port, for a built-in
+    /// driver port and for a `{spawn_driver, Name}` port whose entry does not advertise it — in
+    /// every one of which `[force]` is the oracle's `error:notsup`.
+    pub fn soft_busy(&self, id: PortId) -> bool {
+        self.meta
+            .get(&id.number())
+            .and_then(|meta| meta.driver_busy.as_ref())
+            .is_some_and(driver::BusyFlag::soft_busy)
     }
 
     /// The process-monitor tree a `{spawn_driver, Name}` port's C driver holds — the handle the
@@ -1924,6 +1972,7 @@ impl PortHook for RuntimePorts {
                     driver_terms: None,
                     driver_atoms: None,
                     driver_control_flags: None,
+                    driver_busy: None,
                     driver_monitors: None,
                     input: Cell::new(0),
                     output: Cell::new(0),
@@ -1961,6 +2010,12 @@ impl PortHook for RuntimePorts {
             // callback through `set_port_control_flags`, and the runtime reads them back to pick
             // the reply's Erlang form (a list, or a binary in `PORT_CONTROL_FLAG_BINARY` mode).
             let driver_control_flags = host.control_flags();
+            // And for the port's **busy state**: the driver marks it from inside a callback through
+            // `set_busy_port`, and `erlang:port_command/2,3` reads it back to answer the way the C
+            // does (`io.c:1749-1764`). The handle also carries the entry's `ERL_DRV_FLAG_SOFT_BUSY`
+            // bit, which `DriverPortAdapter::load` stamps onto this same handle once the library is
+            // open — so the value is visible here without re-reading the entry.
+            let driver_busy = host.busy_flag();
             // And for the monitors the driver may install through `driver_monitor_process`: the
             // runtime sweeps this handle at the scheduler-pass boundary to mark a monitored process
             // that has died, and the port's own drive point fires the driver's `process_exit`.
@@ -1981,6 +2036,7 @@ impl PortHook for RuntimePorts {
                 driver_terms: Some(driver_terms),
                 driver_atoms: Some(driver_atoms),
                 driver_control_flags: Some(driver_control_flags),
+                driver_busy: Some(driver_busy),
                 driver_monitors: Some(driver_monitors),
                 input: Cell::new(0),
                 output: Cell::new(0),
@@ -2010,10 +2066,11 @@ impl PortHook for RuntimePorts {
             owner: self.owner,
             kind: spec.kind,
             // A `spawn`/`fd` port has no C driver, so it has neither driver term queue nor names
-            // a driver interned, nor control flags, nor process monitors.
+            // a driver interned, nor control flags, nor a busy state, nor process monitors.
             driver_terms: None,
             driver_atoms: None,
             driver_control_flags: None,
+            driver_busy: None,
             driver_monitors: None,
             input: Cell::new(0),
             output: Cell::new(0),

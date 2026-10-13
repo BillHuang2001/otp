@@ -172,6 +172,7 @@ use beam_abi::driver::types::{
     ErlDrvBinary, ErlDrvEntry, ErlDrvEvent, ErlDrvPort, ErlDrvSizeT, ErlIOVec,
     ERTS_INVALID_ERL_DRV_PORT, ERL_DRV_READ, ERL_DRV_USE, ERL_DRV_USE_NO_CALLBACK, ERL_DRV_WRITE,
 };
+use beam_abi::driver::types::ERL_DRV_FLAG_SOFT_BUSY;
 use beam_abi::driver::types::ErlDrvPDL;
 use beam_abi::{
     monitor_from_identity, monitor_identity, DriverEnv, DriverHost, ErlDrvMonitor, MonitorResult,
@@ -514,6 +515,60 @@ impl TermQueue {
     }
 }
 
+/// The **busy state** of one driver port — the C's `prt->sched.flags & ERTS_PTS_FLG_BUSY_PORT`,
+/// as the driver's own `set_busy_port` sets it (`io.c:5208-5264`).
+///
+/// Shared by [`Rc`] between the [`DriverPort`] host (which [`DriverHost::set_busy_port`] writes,
+/// from inside a driver callback) and the runtime's port metadata, which
+/// [`crate::port::PortRegistry::write_command`] and `erlang:port_command/2,3` read back. Seized
+/// with [`DriverPort::busy_flag`] **before** the host is boxed into the port lifecycle (the boxed
+/// driver exposes no host), exactly like [`DriverPort::control_flags`].
+///
+/// The handle also carries the *other* half of the C's `port_command` decision: whether the driver
+/// **entry** advertises `ERL_DRV_FLAG_SOFT_BUSY`. The C tests `prt->drv_ptr->flags` for it, which
+/// is a property of the loaded `ErlDrvEntry`, not of the per-port state — but the entry is only
+/// known *after* the `dlopen` that happens inside [`DriverPortAdapter::load`], and the host is
+/// consumed by that same call. Recording it here (a [`Cell`] written by `load` through the very
+/// handle the runtime already holds) is what lets the runtime consult it later without re-reading
+/// the library.
+#[derive(Clone, Debug)]
+pub struct BusyFlag {
+    /// Whether the port is currently busy — what `set_busy_port` toggles.
+    busy: Rc<Cell<bool>>,
+    /// Whether the loaded driver entry advertises `ERL_DRV_FLAG_SOFT_BUSY`.
+    soft_busy: Rc<Cell<bool>>,
+}
+
+impl BusyFlag {
+    /// A fresh, **idle**, non-`soft_busy` flag — the state of a port no driver has reported on.
+    pub fn new() -> BusyFlag {
+        BusyFlag {
+            busy: Rc::new(Cell::new(false)),
+            soft_busy: Rc::new(Cell::new(false)),
+        }
+    }
+
+    /// Whether the port is busy (`set_busy_port(port, 1)` was the last request).
+    pub fn is_busy(&self) -> bool {
+        self.busy.get()
+    }
+
+    /// Marks the port busy or idle — the write half of `set_busy_port`.
+    pub fn set_busy(&self, busy: bool) {
+        self.busy.set(busy);
+    }
+
+    /// Whether the loaded driver entry advertises `ERL_DRV_FLAG_SOFT_BUSY`.
+    pub fn soft_busy(&self) -> bool {
+        self.soft_busy.get()
+    }
+
+    /// Records whether the loaded entry advertises `ERL_DRV_FLAG_SOFT_BUSY`.
+    pub fn set_soft_busy(&self, soft_busy: bool) {
+        self.soft_busy.set(soft_busy);
+    }
+}
+
 /// A driver host for one port: the runtime services the `driver_*` / `erl_drv_*` functions need.
 ///
 /// It owns a private term arena (the heap the term-data decoder builds its terms on), holds a
@@ -561,6 +616,16 @@ pub struct DriverPort {
     /// integers normally, a **binary** when `PORT_CONTROL_FLAG_BINARY` is set. Seized with
     /// [`DriverPort::control_flags`] before the host is boxed into the port lifecycle.
     control_flags: Rc<Cell<c_int>>,
+    /// The port's **busy state** — the C's `prt->sched.flags & ERTS_PTS_FLG_BUSY_PORT`, as the
+    /// driver's own `set_busy_port` sets it (`io.c:5208-5264`).
+    ///
+    /// Shared with the runtime's `PortMeta`, which reads it (and the driver entry's
+    /// `ERL_DRV_FLAG_SOFT_BUSY` bit, recorded on the very same handle) to answer
+    /// `erlang:port_command/2,3` the way the C does: `nosuspend` on a busy port ⇒ `false`, `force`
+    /// ⇒ `notsup` unless the entry advertises `SOFT_BUSY`, and a plain command on a busy port
+    /// suspends the caller. Seized with [`DriverPort::busy_flag`] before the host is boxed into
+    /// the port lifecycle, exactly like [`DriverPort::control_flags`].
+    busy: BusyFlag,
     /// The driver's **private** byte queue — the C's `prt->ioq` (`io.c:6790-6919`), which
     /// `driver_enq`/`driver_pushq`/`driver_deq`/… reach and nothing else does. Distinct from the
     /// port's *input* queue (the bytes `driver_output` answers with) and from the Erlang→driver
@@ -621,6 +686,9 @@ impl DriverPort {
             terms: TermQueue::new(),
             control: Rc::new(RefCell::new(DriverControl::default())),
             control_flags: Rc::new(Cell::new(0)),
+            // A port opened without a driver request is idle and its entry's `SOFT_BUSY` is
+            // unknown until the library is loaded (`with_soft_busy`, from `DriverPortAdapter::load`).
+            busy: BusyFlag::new(),
             queue: DriverQueue::new(),
             // A port opened without a stream option is the C's default `list` stream (`io.c:5338`).
             port_flags: 0,
@@ -716,6 +784,27 @@ impl DriverPort {
     /// like [`DriverPort::term_queue`].
     pub fn control_flags(&self) -> Rc<Cell<c_int>> {
         Rc::clone(&self.control_flags)
+    }
+    /// The port's **busy state** handle, shared with the runtime — the C's
+    /// `prt->sched.flags & ERTS_PTS_FLG_BUSY_PORT` (see [`BusyFlag`]).
+    ///
+    /// Taken **before** the host is boxed into a port (the boxed driver exposes no host), exactly
+    /// like [`DriverPort::control_flags`]. The driver's `set_busy_port` writes it from inside a
+    /// callback; the runtime reads it back to answer `erlang:port_command/2,3`.
+    pub fn busy_flag(&self) -> BusyFlag {
+        self.busy.clone()
+    }
+    /// Records whether the loaded driver entry advertises `ERL_DRV_FLAG_SOFT_BUSY` (see
+    /// [`BusyFlag`]).
+    ///
+    /// A builder step like [`DriverPort::with_has_process_exit`]: [`DriverPortAdapter::load`] is the
+    /// one place the host and the loaded `ErlDrvEntry` first coexist, so it is the only caller. The
+    /// write lands on the handle the runtime already seized with [`DriverPort::busy_flag`] (shared
+    /// by `Rc`), so the caller observes it without re-reading the library. A host nobody claims
+    /// keeps the default (`false`): a driver that advertises nothing is not `SOFT_BUSY`.
+    pub fn with_soft_busy(self, soft_busy: bool) -> DriverPort {
+        self.busy.set_soft_busy(soft_busy);
+        self
     }
     /// The process the port belongs to.
     pub fn owner(&self) -> ProcessId {
@@ -994,6 +1083,18 @@ impl DriverHost for DriverPort {
     /// the C's own rule (`write_port_control_result`, `io.c:4133-4175`).
     fn set_control_flags(&mut self, _mode: c_int, flags: c_int) -> c_int {
         self.control_flags.set(flags);
+        0
+    }
+
+    /// Records the port's **busy state** (`set_busy_port` — the C's
+    /// `prt->sched.flags & ERTS_PTS_FLG_BUSY_PORT`, `io.c:5208-5264`).
+    ///
+    /// Marking a port busy is a request to the *emulator*, not to the driver: the C stores the bit
+    /// on the port and `erlang:port_command/2,3` consults it (`erts_port_output`, `io.c:1749-1764`).
+    /// `0` is the C's answer (the `void set_busy_port(ErlDrvPort, int)` wrapper discards it) and the
+    /// flag reads back through the shared [`BusyFlag`] handle the runtime seized at `open_port`.
+    fn set_busy_port(&mut self, busy: bool) -> c_int {
+        self.busy.set_busy(busy);
         0
     }
 
@@ -1423,6 +1524,11 @@ impl DriverPortAdapter {
         // which gates `driver_monitor_process` (`io.c:6998`). `beam_io`'s own host reads the very
         // same field at its own load site.
         let host = host.with_has_process_exit(library.entry().process_exit.is_some());
+        // The same load site stamps the entry's `ERL_DRV_FLAG_SOFT_BUSY` bit onto the host's
+        // shared busy handle: `erlang:port_command/2,3`'s `force` arm consults it
+        // (`erl_bif_port.c:195-198`), and the runtime already holds the handle (it seized it with
+        // `DriverPort::busy_flag` before this call, and the write lands on the same `Rc`).
+        let host = host.with_soft_busy(library.entry().driver_flags & ERL_DRV_FLAG_SOFT_BUSY != 0);
         // The C's load path records the entry as a **dynamically loaded** driver
         // (`erts_add_driver_entry(dp, dh, …)`, `io.c:7650`, `dp->handle != NULL`), which is why
         // `remove_driver_entry` refuses it. Recording the same entry here lets the frozen
