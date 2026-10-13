@@ -62,6 +62,7 @@ pub mod mso;
 mod nursery; // the young nursery chain (the no-relocation growth seam) — NOT public
 pub mod policy;
 pub(crate) mod reachable; // the read-only whole-heap reachability walk — NOT public
+pub use crate::reachable::ReachableObject; // the safe view a visitor reads — the walk stays crate-internal
 pub mod selection;
 pub mod space;
 pub mod stats;
@@ -90,6 +91,7 @@ pub mod prelude {
     pub use crate::immix_collector::*;
     pub use crate::mso::*;
     pub use crate::policy::*;
+    pub use crate::reachable::ReachableObject;
     pub use crate::selection::*;
     pub use crate::space::*;
     pub use crate::stats::*;
