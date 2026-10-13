@@ -401,20 +401,43 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
   next_message{ handle }`; `Closed`/`Failed` mean drop the link.
 
 ### `src/bin/dist_probe.rs` — the hermetic-loopback CLI (bin target, not part of the library API)
-`dist_probe loopback <report>`, `<report>` ∈ `ping` | `nodes` | `term`. Cargo auto-discovers
-`src/bin/`, so no `Cargo.toml` change. The bin is **self-contained** (it re-uses only the crate's
-public API — `Connection`/`TcpListener`/`TcpTransport`/`Delivery`/`send_reg_send`/`send_message`/
-`recv_delivery` — plus `beam_codec::{VERSION_MAGIC, encode_term_body}`): it stands up two in-process
-endpoints over a real loopback socket, completes the `'N'` handshake both ways, sends a `{1,2,3}`
-tuple A→B as a `DOP_REG_SEND`, has B echo it to A's pid as a `DOP_SEND(_SENDER)`, receives it on A,
-and derives the report from that observed state.
-- Success prints **exactly one** stdout line and exits `0`: `ping` → `pong` (iff both handshakes
-  completed, else `pang`); `nodes` → `1` (peers node A handshook with); `term` → the uppercase hex of
-  the **received** term's ETF image, `hex(VERSION_MAGIC ++ encode_term_body(received))` =
-  `836803610161026103` for `{1,2,3}`.
+`dist_probe loopback <report>`. Cargo auto-discovers `src/bin/`, so no `Cargo.toml` change. The bin is
+**self-contained** (it re-uses only the crate's public API — `Connection`/`ConnectionDriver`/
+`TcpListener`/`TcpTransport`/`Delivery`/`InboundSink`/`connect_client_with_creation`/`send_control`/
+`send_reg_send`/`send_message`/`send_link`/`send_exit`/`send_monitor_p`/`recv_delivery`/
+`dispatch_inbound` — plus `beam_codec`/`beam_term`/`beam_alloc`): it stands up two in-process endpoints
+(`alpha@localhost` acceptor / `beta@localhost` connector) over a real loopback socket and completes the
+`'N'` handshake both ways. Every report prints **exactly one** deterministic, host-independent stdout
+line (no timestamps/addresses/ports) and exits `0`:
+
+| `<report>` | stdout (one line) |
+|---|---|
+| `ping` | `pong` iff both handshakes completed (else `pang`) |
+| `nodes` | the number of peers node A handshook with (`1`) |
+| `term` | `hex(VERSION_MAGIC ++ encode_term_body(received))` of the delivered `{1,2,3}` (`836803610161026103`) |
+| `nodeid` | the negotiated `DFLAG_*` word (`u64` hex) + A's peer name/creation/visibility |
+| `handshake` | a **pinned**, byte-exact transcript of the `'N'` handshake (both directions) |
+| `badcookie` | the refusal shape when the connector presents a wrong cookie (`server=`/`client=` error class + the tags that crossed) |
+| `frag` | a >[`DIST_FRAGMENT_SIZE`] payload round trip: received length + checksum + the count of `'E'`/`'F'` frames A really wrote |
+| `alias` | the decoded `DOP_ALIAS_SEND` fields |
+| `monitor` | the decoded `DOP_MONITOR_P` / `DOP_LINK` / `DOP_EXIT` fields |
+| `regsend_missing` | the local outcome of a `DOP_REG_SEND` to an unregistered name |
+| `utf8` | the uppercase hex ETF image of a non-Latin-1 atom that crossed the wire |
+
+- `ping`/`nodes`/`term` drive the mutual `{1,2,3}` round trip (A → B name-addressed as a `DOP_REG_SEND`,
+  B echoes it to A's pid as a `DOP_SEND(_SENDER)`, A receives it) and derive their observable from it.
+  Their stdout is **frozen** — the harness's existing `dist/*` cases depend on those exact bytes.
+- `handshake` drives two `ConnectionDriver`s with **pinned** challenge nonces (the `*_with_challenge`
+  seams), so the digests are constant across runs; the emitted fields are the raw 2-byte-framed wire
+  bytes of each direction. `frag` wraps each endpoint's transport in a `Spy` (a `Transport` that counts
+  `VERSION_MAGIC`+`'E'`/`'F'` writes) and fails loudly if fewer than two frames were written.
+- `regsend_missing` models the **receiver's** half with an `InboundSink`: ground truth
+  (`dist.c:2484-2509`) is that a `DOP_REG_SEND` to an unregistered name is *silently dropped* — the C
+  looks the name up and, on a miss, returns with no error and nothing sent back (so there is no
+  public-API path that yields a `badarg` here).
 - An unknown/missing subcommand → a usage line on **stderr**, exit `2`. A loopback that cannot be set
-  up → `dist_probe: unsupported: <reason>` on **stderr**, exit `3` (the harness's capability-gap
-  convention) — never a fabricated `pong`/`1`/hex.
+  up, or a report that cannot be produced → `dist_probe: unsupported: <reason>` on **stderr**, exit `3`
+  (the harness's capability-gap convention) — never a fabricated line.
 - Bin target: its own `#![deny(unsafe_code)]` + `//!` doc (crate lints are not inherited by a bin);
   safe Rust only.
 
