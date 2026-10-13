@@ -394,6 +394,27 @@ SMP pool:
     checked against the receiver's own nursery observables (`minor_gcs`, the young space's
     base/used words, the mature generation's used words); no sleeps / wall-clock bounds / oracle.
 
+41. `reference_ids.rs` (4 tests) — **PIN — HAZARD 2, the two reference-id spaces colliding on `=:=`**
+    (a documented divergence, **not closable from this crate**): the crate's [`RefAllocator`] is
+    monotone from `0`, so two independent instances hand out the same ids
+    (`two_independent_reference_allocators_start_at_the_same_zero`); a `ProcessTable`-minted
+    `erlang:alias/1` reference and an **independent** allocator's (`beam_rt::Runtime::refs`'s shape)
+    `make_ref/0` reference carry the same id and are the **byte-identical** four-word block
+    (`the_process_table_and_an_independent_allocator_mint_the_same_reference_for_the_same_id`); the
+    runtime's `beam_term::boxed::write_internal_ref` block (`beam_bifs`'s `make_ref_thing` shape) is
+    the same term as a `MonitorRef::to_eterm` block with the same id
+    (`a_runtime_minted_bare_reference_and_a_monitor_reference_with_equal_ids_are_exactly_equal`);
+    and the comparison mechanism — `beam_term::compare::cmp_refs` keys on the payload words
+    (`[arity, node, serial, id]`), and both producers pin `node`/`serial` to `0`, so the shared id is
+    the only distinguishing word
+    (`the_reference_payload_is_compared_word_for_word_leaving_only_the_id`, which also shows a block
+    differing only in `node` **would** be distinguished). The module docs state the exact reason it
+    cannot be closed here (the id-only `beam_codec` internal-reference codec; the two independent
+    allocators; `beam_rt`'s monotone-from-0 dependency) and name the owner (a cross-crate change:
+    extend the ref codec to preserve the whole payload, or unify the allocators via `beam_rt`). No
+    oracle cross-check — the oracle has **one** id space, so it cannot produce the colliding pair.
+    Deterministic — no sleeps / wall-clock bounds / oracle.
+
 ## Constraints
 - **Anti-flakiness (BINDING).** Every assertion is forced by **synchronization**, never a bare
   `std::thread::sleep`: `mpsc` channels + `recv_timeout` carry the completion signals,
@@ -412,9 +433,9 @@ SMP pool:
 - Run the whole crate gate with
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_process` (never `cd`,
   sandbox `$HOME` is read-only). Cross-checks against the real system ERTS belong to the sibling
-  `../../../tools/differential/` harness, not here. Current: **484 passed, 0 failed, 1 ignored** (178 in-module unit tests + 305
-  across the 40 integration targets here + 1 doctest; the single ignore is the documented
-  non-yielding-runner hang failure mode in `preemption.rs`).
+  `../../../tools/differential/` harness, not here. Current: **488 passed, 0 failed, 1 ignored** (178
+  in-module unit tests + 309 across the 41 integration targets here + 1 doctest; the single ignore is
+  the documented non-yielding-runner hang failure mode in `preemption.rs`).
 
 ## Routing Table
 - `scheduler.rs`, `messaging.rs`, `signals.rs`, `gc.rs`, `priority.rs`, `pending_signals.rs`,
@@ -446,6 +467,10 @@ SMP pool:
 - `terminate_best_effort.rs` → the best-effort termination cascade (a failing `DistSignalRouter` /
   an unreachable peer heap must not abort the death; the observer and the port-monitor cleanup still
   run)
+- `reference_ids.rs` → the **HAZARD-2 pin**: the two independent reference-id spaces
+  (`ProcessTable`'s `RefAllocator` vs `beam_rt::Runtime::refs`) collide on `=:=` — a documented
+  divergence, not closable from this crate (the owner and the blocked avenues are named in the
+  file's module docs)
 - `dict_oracle.rs`, `registry_monitors.rs`, `monitor_tag.rs`, `lifecycle_oracle.rs`,
   `port_monitor_cleanup.rs` (oracle tests) →
   `erl`-cross-checked process-dictionary, process-control, lifecycle and port-monitor evidence (loud skip
