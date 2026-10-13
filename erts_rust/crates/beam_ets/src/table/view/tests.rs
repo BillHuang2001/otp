@@ -550,6 +550,105 @@ fn tagged_element_reads_cover_the_lookup_element_family() {
     assert!(values.iter().all(|value| eq(*value, make_small(10), &atoms) || eq(*value, make_small(20), &atoms)));
 }
 
+/// `TableRead::member` reports key presence — a plain `bool`, so nothing tagged
+/// escapes — for both an ordered and a hash kind.
+#[test]
+fn member_reports_key_presence_across_kinds() {
+    let atoms = AtomTable::new();
+    let mut source = Heap::new(64);
+
+    for kind in [TableKind::Set, TableKind::OrderedSet] {
+        let shared = shared_table(kind);
+        put(&shared, pair(&mut source, 1, 10), &atoms);
+        put(&shared, pair(&mut source, 2, 20), &atoms);
+
+        let (first, second, absent) = shared
+            .with_read(|read| {
+                (
+                    read.member(make_small(1), &atoms),
+                    read.member(make_small(2), &atoms),
+                    read.member(make_small(9), &atoms),
+                )
+            })
+            .expect("no poisoned lock");
+
+        assert!(first, "{kind:?}: a stored key is a member");
+        assert!(second, "{kind:?}: every stored key is a member");
+        assert!(!absent, "{kind:?}: an absent key is not a member");
+    }
+}
+
+/// `TableTerm::is_bitstring` distinguishes a **byte-aligned** binary from a
+/// **non-byte-aligned** bitstring. Both are read back through the table, which
+/// deep-copies them into table storage (the A.1 copy boundary).
+#[test]
+fn bitstring_reads_distinguish_aligned_binaries_from_unaligned_bits() {
+    use beam_term::bitstring::{heap_bits_size_words, write_binary, write_heap_bits};
+
+    let atoms = AtomTable::new();
+    let shared = shared_table(TableKind::Set);
+
+    // The bitstring writers need `Eterm`-aligned words and hand back a term that
+    // points into them, so the arena must outlive the insert (which deep-copies).
+    let binary_words = heap_bits_size_words(24);
+    let bits_words = heap_bits_size_words(13);
+    let mut source = Heap::new(binary_words + bits_words + 32);
+
+    // A byte-aligned binary `<<0,1,2>>` (24 bits).
+    // SAFETY: `binary_words == heap_bits_size_words(24)` words are reserved, which
+    // is exactly what `write_binary` fills for a 3-byte binary.
+    let binary = unsafe {
+        let hp = source.alloc_words(binary_words).expect("arena room");
+        write_binary(hp, &[0u8, 1, 2]).expect("3 bytes is a 24-bit binary")
+    };
+    // A 13-bit string `<<16#146B:13>>` (not a whole number of bytes).
+    // SAFETY: `bits_words == heap_bits_size_words(13)` words are reserved, which is
+    // exactly what `write_heap_bits` fills for a 13-bit string.
+    let bits = unsafe {
+        let hp = source.alloc_words(bits_words).expect("arena room");
+        write_heap_bits(hp, &[0xA3, 0x5C], 13).expect("a bitstring is writable")
+    };
+
+    // Wrap each in a tuple: an inserted object must be a tuple (its key element is
+    // what the table indexes on), and the store deep-copies it in.
+    put(
+        &shared,
+        source.tuple(&[make_small(1), binary]).expect("arena room"),
+        &atoms,
+    );
+    put(
+        &shared,
+        source.tuple(&[make_small(2), bits]).expect("arena room"),
+        &atoms,
+    );
+
+    let (aligned, unaligned) = shared
+        .with_read(|read| {
+            let aligned = read.lookup(make_small(1), &atoms)[0]
+                .tuple_element(1)
+                .expect("the binary element");
+            let unaligned = read.lookup(make_small(2), &atoms)[0]
+                .tuple_element(1)
+                .expect("the bitstring element");
+            (
+                (aligned.is_bitstring(), aligned.is_binary()),
+                (unaligned.is_bitstring(), unaligned.is_binary()),
+            )
+        })
+        .expect("no poisoned lock");
+
+    assert_eq!(
+        aligned,
+        (true, true),
+        "a 24-bit binary is both a bitstring and a binary"
+    );
+    assert_eq!(
+        unaligned,
+        (true, false),
+        "a 13-bit string is a bitstring but not a binary"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 4. The write view
 // ---------------------------------------------------------------------------
@@ -674,10 +773,18 @@ fn write_view_exposes_the_ownership_operations() {
     );
     let heir_owner = shared
         .with_write(|write| {
-            let heir = write.heir().expect("the heir is installed");
-            assert_eq!(heir.data, Some(make_small(7)));
+            // The gift data is a *tagged* term read under the guard, so the heir view
+            // is confined to this block: only its owned fields leave it.
+            let (data, owner) = {
+                let heir = write.heir().expect("the heir is installed");
+                (
+                    heir.data().and_then(|data| data.as_small_int()),
+                    heir.owner(),
+                )
+            };
+            assert_eq!(data, Some(7));
             assert!(write.give_away(Some(first), Some(second)).is_ok());
-            heir.owner
+            owner
         })
         .expect("no poisoned lock");
     assert_eq!(heir_owner, second);
@@ -690,9 +797,72 @@ fn write_view_exposes_the_ownership_operations() {
         .expect("no poisoned lock")
         .expect("the owner may clear the heir");
     assert!(shared
-        .with_write(|write| write.heir())
+        .with_write(|write| write.heir().is_none())
+        .expect("no poisoned lock"));
+}
+
+/// **The residual hazard of `as_requester`, pinned.** Its reads are bare `Eterm`s
+/// that alias table storage (by design — it is the raw access-enforcement seam),
+/// so a term read there escapes the guard and silently re-reads as a *different,
+/// well-formed object* once the store recycles its words. The recycling assertion
+/// makes this fail loudly if the allocator ever stops reusing free runs.
+#[test]
+fn as_requester_reads_are_a_documented_residual_hazard() {
+    use crate::table::OwnerId;
+
+    let atoms = AtomTable::new();
+    let mut source = Heap::new(64);
+    let shared = shared_table(TableKind::Set);
+    let owner = OwnerId::new(7);
+    shared
+        .with_write(|write| write.set_owner(Some(owner)))
+        .expect("no poisoned lock");
+
+    let original = pair(&mut source, 1, 10);
+    put(&shared, original, &atoms);
+
+    // A bare term read through the access-checked raw view, taken *out* of the
+    // closure — nothing tags it to the guard.
+    let escaped = shared
+        .with_write(|write| {
+            let hits = write
+                .as_requester(Some(owner))
+                .lookup(make_small(1), &atoms)
+                .expect("the owner may read");
+            hits[0]
+        })
+        .expect("no poisoned lock");
+    assert!(eq(escaped, original, &atoms), "the read backs the inserted object");
+
+    // Churn: delete the entry and insert a *same-word-size* object; the store frees
+    // the deleted object's runs and hands them straight back to the replacement.
+    shared
+        .with_write(|write| write.delete(make_small(1), &atoms))
         .expect("no poisoned lock")
-        .is_none());
+        .expect("the key is present");
+    let replacement = pair(&mut source, 1, 999);
+    put(&shared, replacement, &atoms);
+
+    let reread = shared
+        .with_write(|write| {
+            write
+                .as_requester(Some(owner))
+                .lookup(make_small(1), &atoms)
+                .expect("the owner may read")[0]
+        })
+        .expect("no poisoned lock");
+    assert_eq!(
+        escaped, reread,
+        "the store must have recycled the freed words — without recycling this hazard test is vacuous"
+    );
+    assert!(
+        eq(escaped, replacement, &atoms),
+        "the escaped term now reads as the replacement object"
+    );
+    assert!(
+        !eq(escaped, original, &atoms),
+        "the escaped term no longer reads as the object it was read from"
+    );
 }
 
 // ---------------------------------------------------------------------------
