@@ -374,8 +374,17 @@ Turns a decoded [`ControlMessage`] into its **semantic** delivery and routes it 
   to `Unsupported` (a runtime with no process registry never mis-delivers); `struct UnsupportedSink`
   is the do-nothing impl. The production impl belongs to `beam_rt` (over `beam_process`/`Mailbox`) —
   keeping the value layer free of the message/process crates (dependency DAG).
-- `ConnectionDriver::next_delivery`/`dispatch_inbound` (non-blocking) and
-  `Connection::recv_delivery`/`dispatch_inbound` (blocking) are the two entry points.
+- The **checked** (validated) view: `struct LinkIdentity { peer_node, local_node }` +
+  `LinkIdentity::intern(&mut AtomTable, peer_name, local_name)` (interns the two node names into the
+  table the message was decoded against) and `Delivery::classify_validated(&ControlMessage,
+  &LinkIdentity) -> Result<Delivery>` — `classify` **plus** the C's per-opcode `invalid_message`
+  shape/`dep` anti-spoof checks (`dist.c`), so a forged or malformed message is `Err(BeamError::BadArg)`
+  instead of mis-delivered. Opt-in: `classify` is unchanged.
+- The two entry points each have an unchecked and a checked form:
+  `ConnectionDriver::next_delivery`/`dispatch_inbound` and `Connection::recv_delivery`/
+  `dispatch_inbound` (the semantic view) vs `ConnectionDriver::next_delivery_checked`/
+  `dispatch_inbound_checked` and `Connection::recv_delivery_checked`/`dispatch_inbound_checked` (the
+  per-link validated view).
 
 ### `src/driver.rs` — the non-blocking poll/step state machine (safe)
 `struct ConnectionDriver` + `enum DriverState { Handshaking, Established, Closed, Failed }` +
