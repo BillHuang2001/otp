@@ -228,7 +228,7 @@ impl LabelMap {
     /// cover (not built from this module: [`LabelMap::new`], `From`, ...) falls
     /// straight through to [`import_target`], so the two can never disagree.
     #[inline]
-    fn import_target<'a>(
+    pub(crate) fn import_target<'a>(
         &'a self,
         module: &'a Module,
         target: ImportRef,
