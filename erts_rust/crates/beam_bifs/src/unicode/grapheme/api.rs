@@ -208,9 +208,14 @@ fn run(ctx: &mut BifContext<'_>, mut state: State) -> Result<Eterm> {
                 // length_b(Bin0, CP1, Cont, N) ->
                 //     [_|Cont1] = unicode_util:gc([CP1,Bin0|Cont]),
                 //     case unicode_util:cp(Cont1) of ...
+                //
+                // The list is `[CP1,Bin0|Cont]` — a **flat** two-element prefix in
+                // front of `Cont`, not `[[CP1,Bin0]|Cont]`: `gc/1`'s "losing work
+                // done on T" roll-backs hand `T0` (this very term) to `gc_ext_pict`'s
+                // `++`, and an improper prefix would make that `++` raise.
                 let bin0 = bits::make_binary(ctx.heap(), bin0)?;
-                let inner = ctx.cons(cp1, bin0)?;
-                let combined = ctx.cons(inner, cont)?;
+                let inner = ctx.cons(bin0, cont)?;
+                let combined = ctx.cons(cp1, inner)?;
                 let cluster = gc(ctx, combined)?;
                 let Some((_head, cont1)) = head_tail(cluster) else {
                     // `[_|Cont1]` always matches for a `gc/1` result headed by an
@@ -310,9 +315,11 @@ mod tests {
         let improper = ctx.cons(head, tail).unwrap();
         let error = grapheme_count(&mut ctx, improper).expect_err("must raise");
         assert_eq!(error.as_atom(), Some("function_clause"));
-        // `next_grapheme/1` walks the same input happily.
-        let ok = next_grapheme(&mut ctx, improper).expect("gc accepts it");
-        assert!(beam_term::compare::eq(ok, improper, &atoms));
+        // `next_grapheme/1` raises it too: `gc/1`'s list clauses all fall through to
+        // `cp/1`, which has no clause for the integer tail `98`
+        // (`unicode_util:cp/1` line 417 via `gc_1/2` line 601; live-oracle confirmed).
+        let error = next_grapheme(&mut ctx, improper).expect_err("must raise");
+        assert_eq!(error.as_atom(), Some("function_clause"));
     }
 
     #[test]
@@ -326,12 +333,25 @@ mod tests {
         let Some((cluster, rest)) = head_tail(got) else {
             panic!("next_grapheme must return a cons");
         };
-        assert_eq!(beam_term::signed_value(rest), 98);
-        let Some((first, second)) = head_tail(cluster) else {
+        // The remainder keeps the input's own tail **as a list**: the answer is
+        // `[[97,769],98]`, i.e. `[[97,769] | [98]]`, so the cdr is the one-element
+        // list `[98]` rather than the bare integer `98`
+        // (`string:next_grapheme([97,769,98])`, live-oracle confirmed).
+        let Some((tail_head, tail_tail)) = head_tail(rest) else {
+            panic!("the remainder is a list, not the bare integer tail");
+        };
+        assert_eq!(beam_term::signed_value(tail_head), 98);
+        assert!(access::is_nil(tail_tail));
+        // The cluster is the list `[97, 769]` — walk it element by element.
+        let Some((first, cluster_rest)) = head_tail(cluster) else {
             panic!("the cluster must be a list");
         };
         assert_eq!(beam_term::signed_value(first), 97);
+        let Some((second, cluster_tail)) = head_tail(cluster_rest) else {
+            panic!("the cluster holds both code points");
+        };
         assert_eq!(beam_term::signed_value(second), 769);
+        assert!(access::is_nil(cluster_tail));
         let empty = next_grapheme(&mut ctx, NIL).unwrap();
         assert!(access::is_nil(empty));
     }
