@@ -559,6 +559,15 @@ receiver, and by the park arm's relocation exemption for the parked (plus woken-
 *GC-relocation hazards* below). The incremental `file` read path agrees with the oracle on both routes — pure read, pure line
 and mixed order alike (the device is buffer-first).
 
+**A `spawn`ed `-eval` closure is run synchronously to completion**, so it is not a nested run that
+suspends: the evaluator (`src/eval/mod.rs`, `apply_eval_closure`) drives the closure to its end before
+the spawning expression continues, and the evaluator's `receive … after T` arm polls the port poller
+once and then falls straight through to the `after` body (M1 has no host timer to block on). A `-eval`
+child that "parks" therefore returns and terminates before the parent's next statement — which is why
+the async-completion shape for a **live, blocked** target is pinned only on the scheduled route
+(`tests/garbage_collect.rs`). Owner: `src/eval/mod.rs`'s `receive` — the `after T` deadline must
+actually be waited out (or a spawned `-eval` child otherwise kept alive).
+
 ## GC-relocation hazards (what a MOVING engine heap would invalidate)
 The engine's `alloc_words` seam prefers the running scheduled process's own **young heap** (a capacity refusal is met by a no-relocation `Process::grow_nursery` and one retry) and falls back to the pointer-stable `Runtime::arena` (`MinimalContext`, chunked but never moved); the stores below are exposed according to the roster's *at risk*/*safe* split — a raw `Eterm` pinned **outside** the GC root set is what a future **moving** heap would dangle.
 **`Process::regs` is a snapshot, not a live mirror of the running machine.** `publish_roots_full`/`scatter_roots_full` (`context/gc.rs`) copy every x register, the whole stack **and** the FR file into `process.regs` (the FR words appended after the stack words — `beam_process::Registers` has no FR container) **only** at a heap-admission point (`gc::ensure_heap_full`, which always publishes the FR) or a park (`publish_parked_roots`, which publishes the FR **only when the post-slice scan found it live** — an all-`NIL` FR roots nothing, so a float-free park skips the 1024 words and records the choice on `ProcessEngine::fr_published` for the resume to replay — and additionally publishes the parked machine's live `pending_exception` reason as a `Registers::extra_roots` word); between those points `process.regs` is stale by up to one slice, so a collection rooted in that snapshot reaches the machine's x/stack/FR and nothing else — a term the in-flight call chain holds outside them (a Rust local, or a `Machine` field with no extra-root publication) is not in the root set at all. The engine's `live` count is ignored (over-approximating a copying collector's root set is always safe).

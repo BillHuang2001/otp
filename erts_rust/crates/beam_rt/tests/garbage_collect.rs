@@ -192,56 +192,23 @@ const PROGRAMS: [(&str, &str, &str); 4] = [
 // The `/2` async completion message (the follow-up `{garbage_collect, ReqId, Result}`)
 // ---------------------------------------------------------------------------------------
 
-/// `/2`'s `{async, ReqId}` form on a **blocked** child: the wrapper answers `async` and the
-/// child's collection owes the **caller** `{garbage_collect, ReqId, true}`.
-///
-/// The child parks in a `receive … after 60000` (rather than a bare `receive`) so it stays a
-/// **live** blocked process: a bare `receive` inside a spawned process is a documented
-/// capability gap of this runtime's `-eval` evaluator (there is no host timer to block on), and
-/// the child would terminate — which is a *different* case, pinned by
-/// [`EXPR_ASYNC_DEAD`]. The scheduled-process fixture covers the bare-receive shape.
-///
-/// The probe prints a **normalized** shape — the reference is compared with `=:=` rather than
-/// printed, because a `#Ref<…>`'s textual form names the node's own reference allocator and
-/// could never be compared across runtimes. A missing message prints the atom `timeout`, so a
-/// regression is a clean mismatch rather than a hang.
-///
-/// Oracle (the same expression, terminated with `-s init stop`): `{true,true}`.
-///
-/// **KNOWN GAP — this case disagrees with the oracle (measured, not assumed).** This runtime
-/// prints `{true,false}` where the oracle prints `{true,true}`. The divergence is the **liveness
-/// `Result`** (the `{garbage_collect, ReqId, Result}` *shape* and the `ReqId` match are both
-/// right; only the `true`/`false` differs), and the `false` is honest: the **target is already
-/// gone** by the pass boundary that emits the completion, not a wrong answer from the completion
-/// logic.
-///
-/// The premise in the paragraph above does **not** hold here: a spawned `-eval` child's
-/// `receive … after 60000` does **not** park it for 60000 ms. The evaluator's `after` arm
-/// (`src/eval/mod.rs`, `Evaluator::receive`) polls the port poller once for the remaining time
-/// and then falls through to the `after` body — the `break` after that single round is
-/// unconditional, and with no live port `poll_port_messages` (`src/port.rs`) returns at once
-/// (there is no host timer to block on in M1). So the child runs `ok`, returns and terminates on
-/// its **first** slice; `is_process_alive(P)` is already `false` at the `erlang:garbage_collect(P,
-/// …)` call, where `erl` says `true` (verified directly). The completion then reports that dead
-/// target's `false` — exactly what the C's `liveness_notify_sys_task_executed`
-/// (`erts/emulator/beam/erl_process.c:11488-11490`) does for a dead target.
-///
-/// **Owner:** `src/eval/mod.rs`'s `receive` — the `after T` deadline must actually be waited out
-/// (or a spawned `-eval` child otherwise kept alive) before this case can match the oracle. The
-/// two modules the harness-level diagnosis points at are **downstream and correct**:
-/// `src/runtime/gc.rs::deliver_gc_completions` and the native floor `src/native/erts_internal.rs`
-/// (which passes `live` from the request instant and reports the target's real liveness) both
-/// answer `false` here because the target really is dead, and both would answer the oracle's
-/// `true` unchanged once the child survives the call. The assertion is deliberately **kept, not
-/// weakened**, so the gap stays visible.
-const EXPR_ASYNC_BLOCKED: &str = "\
-Self = self(), \
-P = spawn(fun() -> Self ! {ready, self()}, receive _ -> ok after 60000 -> ok end end), \
-receive {ready, P} -> ok end, \
-Ref = make_ref(), \
-async = erlang:garbage_collect(P, [{async, Ref}]), \
-R = receive {garbage_collect, Got, Result} -> {Got =:= Ref, Result} after 2000 -> timeout end, \
-io:format(\"~p~n\", [R]), halt(0).";
+// The `{async, ReqId}` completion for a **live, blocked** target is pinned on the
+// **scheduled-process** route (the `..._on_the_scheduled_route` test below), because the
+// `-eval` route cannot express its premise. A `spawn`ed `-eval` closure is run
+// **synchronously to completion** by the evaluator (`src/eval/mod.rs`, `apply_eval_closure`),
+// and its `receive … after T` arms poll the port poller once and then fall straight through to
+// the `after` body — there is no host timer to block on in M1 — so a "parked" `-eval` child
+// runs `ok`, returns and terminates before the parent's next statement. The target is then
+// genuinely dead at the `erlang:garbage_collect(P, …)` call, and this runtime answers the
+// oracle's own dead-target `false` — the C's `liveness_notify_sys_task_executed`
+// (`erts/emulator/beam/erl_process.c:11488-11490`), the same `false` as `EXPR_ASYNC_DEAD`. The
+// live-target (`true`) and dead-target (`false`) halves of the completion are therefore pinned
+// here by `EXPR_ASYNC_SELF` / `EXPR_ASYNC_DEAD`, and the live-**blocked**-target half by the
+// scheduled fixture entry `gc_req:ask_async/0`.
+//
+// Owner of the `-eval` capability gap: `src/eval/mod.rs`'s `receive` — the `after T` deadline
+// must actually be waited out (or a spawned `-eval` child otherwise kept alive) before the
+// `-eval` route could carry this case.
 
 /// The requester is the **target** (`self()`): the completion is delivered into the requesting
 /// process's own mailbox, so it can receive it after the call returns.
@@ -268,14 +235,11 @@ async = erlang:garbage_collect(P, [{async, Ref}]), \
 R = receive {garbage_collect, Got, Result} -> {Got =:= Ref, Result} after 2000 -> timeout end, \
 io:format(\"~p~n\", [R]), halt(0).";
 
-/// The three async-completion programs and the value both runtimes must print — the pinned
-/// shape of the follow-up message `{garbage_collect, ReqId, Result}`.
-const ASYNC_PROGRAMS: [(&str, &str, &str); 3] = [
-    (
-        "the async completion of a blocked target",
-        EXPR_ASYNC_BLOCKED,
-        "{true,true}",
-    ),
+/// The two async-completion programs the `-eval` route can express, and the value both runtimes
+/// must print — the pinned shape of the follow-up message `{garbage_collect, ReqId, Result}`.
+/// The live-**blocked**-target half is pinned on the scheduled route (see the section comment
+/// above [`EXPR_ASYNC_SELF`]).
+const ASYNC_PROGRAMS: [(&str, &str, &str); 2] = [
     (
         "the async completion of the requesting process itself",
         EXPR_ASYNC_SELF,
@@ -304,7 +268,7 @@ const ASYNC_PROGRAMS: [(&str, &str, &str); 3] = [
 /// float-register file).
 const FIXTURE_ERL: &str = r#"%% Generated by `beam_rt/tests/garbage_collect.rs` (never committed).
 -module(gc_req).
--export([ask/1, plain/1, ask_other/0, plain_other/0, child/1]).
+-export([ask/1, plain/1, ask_other/0, plain_other/0, child/1, ask_async/0, parked/1]).
 
 ask(N) ->
     true = erlang:garbage_collect(),
@@ -336,6 +300,23 @@ child(Parent) ->
     receive go -> ok end,
     V = cons(8, []),
     Parent ! {done, self(), V}.
+
+%% The async-completion shape for a **live, blocked** target — the half the `-eval` route
+%% cannot express (see `tests/garbage_collect.rs`). The child is a **scheduled** process that
+%% parks in a bare `receive` and so stays live for the whole run; the caller receives the
+%% follow-up `{garbage_collect, ReqId, Result}` with the oracle's live-target `true`.
+ask_async() ->
+    Self = self(),
+    Child = spawn(gc_req, parked, [Self]),
+    receive {ready, Child} -> ok end,
+    Ref = make_ref(),
+    async = erlang:garbage_collect(Child, [{async, Ref}]),
+    receive {garbage_collect, Got, Result} -> {Got =:= Ref, Result} after 2000 -> timeout end.
+
+%% Parks for ever: it must never receive anything, so it stays **live** for the whole run.
+parked(Parent) ->
+    Parent ! {ready, self()},
+    receive _ -> ok end.
 
 cons(0, Acc) ->
     length(Acc);
@@ -494,14 +475,18 @@ fn the_return_values_match_the_live_oracle() {
     }
 }
 
-/// **Half 1d — `/2`'s async completion message matches the live oracle.**
+/// **Half 1d — `/2`'s async completion message matches the live oracle (the `-eval`-expressible
+/// halves).**
 ///
 /// The `{async, ReqId}` form does not merely answer `async`: the target's collection owes the
-/// **requester** `{garbage_collect, ReqId, Result}`, and the three probes below pin the whole
-/// shape — a **blocked** target (`true`), the requesting process itself (`true`) and an
-/// already-**terminated** target (`false`, the C's `noproc_res`). Both runtimes are given the
-/// same expression and must print the same normalized `{Ref-equality, Result}` pair, so the
-/// pinned message shapes are re-probed against the oracle rather than assumed.
+/// **requester** `{garbage_collect, ReqId, Result}`, and the two probes below pin the halves the
+/// `-eval` route can express — the requesting process itself (`true`) and an already-
+/// **terminated** target (`false`, the C's `noproc_res`); the live-**blocked**-target half is
+/// pinned on the scheduled route by
+/// [`the_async_completion_of_a_live_blocked_target_is_pinned_on_the_scheduled_route`]. Both
+/// runtimes are given the same expression and must print the same normalized
+/// `{Ref-equality, Result}` pair, so the pinned message shapes are re-probed against the oracle
+/// rather than assumed.
 #[test]
 fn the_async_completion_message_matches_the_live_oracle() {
     let Some(oracle) = support::require_oracle("garbage_collect") else {
@@ -514,11 +499,6 @@ fn the_async_completion_message_matches_the_live_oracle() {
             "{case}: `beam_rt -eval` must exit 0; stderr: {}",
             ours.err
         );
-        // KNOWN GAP: for the "blocked target" case (`EXPR_ASYNC_BLOCKED`) `ours.out` is
-        // `{true,false}` against the oracle's `{true,true}` — the sole divergence is the
-        // completion message's **liveness `Result`**, because this runtime's `-eval` evaluator
-        // lets the spawned child terminate immediately (its `receive … after 60000` does not
-        // wait). Kept, not weakened; the cause and owner are on `EXPR_ASYNC_BLOCKED`'s doc.
         assert_eq!(ours.out, expected, "{case}: our runtime's answer (stderr: {})", ours.err);
         let theirs = oracle_eval(&oracle, expr);
         assert_eq!(
@@ -698,6 +678,68 @@ fn a_request_for_another_live_process_is_served_when_it_runs() {
         asked.collections >= 1,
         "the request recorded for another live process must be served when it next runs; \
          {asked:?}"
+    );
+
+    fixture.cleanup();
+}
+
+/// **Half 1e — `/2`'s async completion for a live, blocked target, on the scheduled route.**
+///
+/// This is the half the `-eval` route cannot express (see the section comment above
+/// [`EXPR_ASYNC_SELF`]): the fixture's `ask_async/0` runs as a **scheduled** process, spawns a
+/// **scheduled** `parked/1` child that parks in a bare `receive` and so stays **live** for the
+/// whole run, waits for the child's `{ready, _}` rendezvous, asks for `[{async, Ref}]`, and then
+/// receives the follow-up. The result must be `{true, true}`: the completion message's `ReqId`
+/// matches and its `Result` is the oracle's live-target `true`. The **same** compiled module is
+/// run under the system `erl` and must print the same term, so the golden is confirmed live
+/// rather than recorded.
+#[test]
+fn the_async_completion_of_a_live_blocked_target_is_pinned_on_the_scheduled_route() {
+    let Some(fixture) = build_fixture("async") else {
+        return;
+    };
+    let Some(mut rt) = runtime_with(&fixture.beam) else {
+        return;
+    };
+
+    let scheduled = run_entry(&mut rt, "gc_req", "ask_async", &[]);
+    let printed = rt
+        .format_term(scheduled.value, None)
+        .expect("the fixture's result formats");
+    assert_eq!(
+        printed.trim(),
+        "{true,true}",
+        "a live blocked target's async completion is `{{garbage_collect, ReqId, true}}`; \
+         {scheduled:?}"
+    );
+
+    // Confirm the golden against the live oracle: the same module, run under the system `erl`,
+    // prints the same term for `ask_async/0`.
+    let oracle =
+        support::require_oracle("garbage_collect").expect("runtime_with already required it");
+    let program = oracle.to_str().expect("the oracle path is UTF-8");
+    let dir = fixture.dir.to_str().expect("the scratch directory is UTF-8");
+    let theirs = run(
+        program,
+        &[
+            "-noshell",
+            "-pa",
+            dir,
+            "-eval",
+            "io:format(\"~p~n\", [gc_req:ask_async()]).",
+            "-s",
+            "init",
+            "stop",
+        ],
+    );
+    assert_eq!(
+        theirs.code, 0,
+        "the oracle exited {} running the same program; stderr: {}",
+        theirs.code, theirs.err
+    );
+    assert_eq!(
+        theirs.out, "{true,true}",
+        "the live oracle's answer for the same program"
     );
 
     fixture.cleanup();
