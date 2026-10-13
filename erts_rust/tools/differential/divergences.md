@@ -25,7 +25,14 @@ not here.)
 - `enif_getenv`'s "too small" path leaves `*value_size` at `capacity-1` in the oracle vs the
   needed capacity in the rust runtime (the success path and the missing-key refusal DO agree
   and are pinned).
-
+- `enif_thread_type()`'s **exact value** differs (oracle `1`, rust `0`) — only the documented-set
+  *membership* shape (one of the four thread kinds) is pinned, never the value itself.
+- An `ErlNifMonitor`-based probe that hands the runtime a **zeroed** monitor is a **probe hazard**:
+  `enif_demonitor_process(env, NULL, &mon)` over one crashes the oracle VM (an exit signal with
+  empty stdout), so it is deliberately not pinned — such a case would be a harness artifact, never
+  a runtime difference. The zeroed-monitor reads that *do* survive the oracle are pinned instead
+  (`enif_compare_monitors` ordering two equal payloads, `enif_make_monitor_term`'s not-a-ref
+  answer).
 ## A.4 — driver C ABI (owner: `beam_rt` / `beam_io`; `beam_abi` for the timer units)
 - **Landed:** `erl_drv_output_term` / `erl_drv_send_term` / `driver_output_term` /
   `driver_send_term` now *deliver* the decoded `ErlDrvTerm` spec to the receiving process
