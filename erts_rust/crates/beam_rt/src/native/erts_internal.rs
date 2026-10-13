@@ -55,7 +55,8 @@
 //! | `erts_internal:processes_next/1` | `bif.c:4111-4120` | `processes_next(1000000000000)`→`badarg`; `foo`→`badarg` |
 //! | `erts_internal:term_to_string/1,2` | `bif.c:4160-4189` | `{a,1}`→`"{a,1}"` (one line, `~w`); a limit `1`→`error:badarg` |
 //! | `erts_internal:garbage_collect/1` | `bif.c:4081-4094` | `minor`/`major`→`true` (a request is recorded); `foo`/`1`→`error:badarg` |
-//! | `erlang:garbage_collect/0,1` | `erlang.erl:3051-3066` (both reduce to that `erts_internal` BIF) | `()`→`true`; `(self())`→`true`; `(LivePid)`→`true`; `(DeadPid)`→`false`; `(foo\|123\|[Pid])`→`error:badarg`; `/2` is a typed gap |
+//! | `erlang:garbage_collect/0,1` | `erlang.erl:3051-3066` (both reduce to that `erts_internal` BIF) | `()`→`true`; `(self())`→`true`; `(LivePid)`→`true`; `(DeadPid)`→`false`; `(foo\|123\|[Pid])`→`error:badarg` |
+//! | `erlang:garbage_collect/2` | `erlang.erl:3073-3157` (`get_gc_opts/2`) + `erl_process.c:11309-11461` (`request_system_task`) | `(P,[])`→`true`; `(P,[{type,major\|minor}])`→`true`; `(DeadPid,[])`→`false`; `(P,[{async,ReqId}])`→`async`; `(P,[major\|foo\|42])`/`(P,42)`/`(P,[{type,foo}])`/`(P,[{type}])`/`(foo,[])`→`error:badarg` |
 //!
 //! # Deliberate Milestone-1 divergences (documented, deterministic)
 //!
@@ -349,6 +350,125 @@ impl RuntimeContext<'_> {
         // does for the calling process (the same latch, no second mechanism).
         self.runtime.request_gc(pid);
         self.atom("true")
+    }
+
+    /// `erlang:garbage_collect/2` — collect `Pid`, synchronously or asynchronously
+    /// (`erts/preloaded/src/erlang.erl:3073-3157`).
+    ///
+    /// # Ground truth (oracle probes, OTP 29.1.1 / erts-17.1)
+    ///
+    /// The wrapper is `erlang.erl` code, so its option grammar is *Erlang*, not C:
+    /// `get_gc_opts/2` (`erlang.erl:3150-3157`) walks the list and accepts exactly a 2-tuple
+    /// `{async, ReqId}` (recording it) or a 2-tuple `{type, T}` (recording it); every other
+    /// element — a bare atom, an integer, a 1- or 3-tuple, an improper tail, a non-list — is
+    /// `erlang:throw(bad_option)`, which the wrapper's `throw:bad_option` clause turns into
+    /// `badarg`. A **later** option wins (`get_gc_opts/2` rebuilds `#gcopt{}` on each step),
+    /// and the default type is `major` (`#gcopt.type`).
+    ///
+    /// The `async` half then calls `erts_internal:request_system_task(Pid, inherit,
+    /// {garbage_collect, ReqId, Type})` and returns the atom `async` — without waiting, for a
+    /// live *and* a dead local pid alike. The `sync` half, for `Pid == self()`, calls
+    /// `erts_internal:garbage_collect(Type)` and returns its `true`; for any other pid it
+    /// sends that same system task and blocks on `{garbage_collect, ReqId, GCResult}` — the
+    /// target's `true`, or the C's `false` when the target terminated first
+    /// (`erts/emulator/beam/erl_process.c:11420-11461`, `noproc_res = am_false`).
+    ///
+    /// Both halves meet the **eager** validation in `request_system_task`
+    /// (`erl_process.c:11309-11461`), the single source of every `badarg` here: the target
+    /// must be an internal (node-local) pid — or an external pid naming *this* node — and the
+    /// request's first argument must be the atom `minor` or `major`
+    /// (`switch (st->arg[0]) { case am_minor: … default: goto badarg; }`). That the type check
+    /// precedes every liveness decision is observable: `garbage_collect(DeadPid,
+    /// [{type,foo}])` is `badarg`, **not** `false`.
+    ///
+    /// | call (`P` live, `DeadPid` terminated) | oracle |
+    /// |---|---|
+    /// | `garbage_collect(P, [])` | `true` |
+    /// | `garbage_collect(P, [{type, major\|minor}])` | `true` |
+    /// | `garbage_collect(DeadPid, [])` | `false` |
+    /// | `garbage_collect(P, [{async, ReqId}])` | `async` (any `ReqId`, `false` included) |
+    /// | `garbage_collect(DeadPid, [{async, ReqId}])` | `async` |
+    /// | `garbage_collect(P, [{type, foo}])` | `error:badarg` |
+    /// | `garbage_collect(DeadPid, [{type, foo}])` | `error:badarg` |
+    /// | `garbage_collect(P, [{async, R}, {type, foo}])` | `error:badarg` |
+    /// | `garbage_collect(P, [major\|foo\|42])` / `(P, 42)` / `(P, {type,major})` / `(P, [{type}])` / `(P, [{nope,major}])` / `(P, [{type,major,extra}])` | `error:badarg` |
+    /// | `garbage_collect(foo, [])` / `(foo, [{async, R}])` | `error:badarg` |
+    ///
+    /// # This runtime
+    ///
+    /// The option grammar is parsed here by exactly that rule ([`Self::gc_options`]), so every
+    /// `badarg` above comes from the same place, and the target is then resolved as `/1`
+    /// resolves it: a pid the process table holds is the accepted request (the oracle's
+    /// `true`) through the one GC latch, a well-formed local pid the table does not hold is
+    /// the oracle's `false` with nothing recorded, and anything else — including an external
+    /// (wire) pid, which this runtime cannot send a request to — is the C's `badarg`. The
+    /// `async` form answers the oracle's `async` and records the same request, so the target's
+    /// collection happens at its next serving point.
+    ///
+    /// The one thing this runtime does **not** reproduce is the async form's **follow-up
+    /// message**: the oracle's request is a cross-process system task the target eventually
+    /// answers with `{garbage_collect, ReqId, GCResult}` to the requester, and this runtime
+    /// has no system-task protocol (the same limitation `/1`'s blocking form documents). The
+    /// **return value** is the oracle's exactly; only that notification never arrives — it is
+    /// not faked with a fabricated reply.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] for an option list outside the two 2-tuple forms, a target that
+    /// is not a node-local pid, or a `{type, _}` value that is not `major`/`minor`; the BIF
+    /// heap's own exhaustion otherwise.
+    pub(super) fn garbage_collect_2(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let target = *args.first().ok_or(BeamError::BadArg)?;
+        let options = *args.get(1).ok_or(BeamError::BadArg)?;
+        let (is_async, mode) = self.gc_options(options)?;
+        // The eager validation `request_system_task` performs, ahead of any liveness check.
+        let pid = ProcessId::from_eterm(target).map_err(|_| BeamError::BadArg)?;
+        if !matches!(mode.as_deref(), Some("major") | Some("minor")) {
+            return Err(BeamError::BadArg);
+        }
+        // A live local process accepts the request through the one latch (never a fabricated
+        // collection); a pid the table does not hold cannot be honoured, so nothing is
+        // recorded and the synchronous form is the oracle's `false`.
+        let live = self.process_table_mut().contains(pid);
+        if live {
+            self.runtime.request_gc(pid);
+        }
+        if is_async {
+            // The wrapper returns `async` without waiting, whether or not the target is still
+            // alive (a dead target's request is simply dropped).
+            return self.atom("async");
+        }
+        self.atom(if live { "true" } else { "false" })
+    }
+
+    /// Parses `erlang:garbage_collect/2`'s option list — the Erlang grammar of the wrapper's
+    /// `get_gc_opts/2` (`erts/preloaded/src/erlang.erl:3150-3157`).
+    ///
+    /// Every element must be a 2-tuple tagged `async` (`{async, ReqId}`, any `ReqId`) or
+    /// `type` (`{type, T}`); a later option overrides an earlier one. Anything else — a bare
+    /// atom, a 1- or 3-tuple, a non-atom tag, an improper tail, a non-list — is the wrapper's
+    /// `throw(bad_option)`, i.e. the caller's `badarg`.
+    ///
+    /// Returns `(is_async, type)` where `type` is the **atom name** of the last `{type, _}`
+    /// value (`None` when it is not an atom). The default is `major` — `#gcopt{}`'s own
+    /// default — and the type is *not* validated here: `request_system_task` validates it,
+    /// after this parse, so the caller does both in that order.
+    fn gc_options(&self, options: Eterm) -> Result<(bool, Option<String>)> {
+        let mut is_async = false;
+        let mut mode = Some("major".to_string());
+        for option in terms::list_elements(options)? {
+            if terms::tuple_arity(option)? != 2 {
+                return Err(BeamError::BadArg);
+            }
+            let tag = self.atom_name(terms::tuple_element(option, 0)?);
+            let value = terms::tuple_element(option, 1)?;
+            match tag.as_deref() {
+                Some("async") => is_async = true,
+                Some("type") => mode = self.atom_name(value),
+                _ => return Err(BeamError::BadArg),
+            }
+        }
+        Ok((is_async, mode))
     }
 
     /// Records a GC request for the **calling** process — the body `erlang:garbage_collect/0`
@@ -2466,6 +2586,203 @@ mod tests {
                 .expect_err("only an internal pid is accepted");
             assert!(matches!(error, BeamError::BadArg), "got {error:?}");
         }
+    }
+
+    /// `erlang:garbage_collect/2` mirrors the oracle: the synchronous forms are `true` for a
+    /// live local pid and `false` for one the process table does not hold; the `{async, _}`
+    /// form is the atom `async` for a live **and** a dead pid alike; and every option list
+    /// outside the wrapper's two 2-tuple forms — and every target that is not a node-local
+    /// pid — is the C's `badarg`. The `{type, _}` value is validated **before** liveness is
+    /// consulted, so a dead target with `{type, foo}` is `badarg` rather than `false`.
+    ///
+    /// Oracle (`erl -noshell -eval '…'`, OTP 29.1.1 / erts-17.1; `P` live, `D` terminated):
+    /// `(P,[])` ⇒ `true`, `(P,[{type,major}])` ⇒ `true`, `(P,[{type,minor}])` ⇒ `true`,
+    /// `(D,[])` ⇒ `false`, `(P,[{async,false}])` ⇒ `async`, `(D,[{async,r}])` ⇒ `async`,
+    /// `(P,[{type,major},{type,minor}])` ⇒ `true`, `(D,[{type,foo}])` ⇒ `error:badarg`,
+    /// `(P,[{async,r},{type,foo}])` ⇒ `error:badarg`, `(P,[major])` ⇒ `error:badarg`,
+    /// `(P,[foo])` ⇒ `error:badarg`, `(P,[42])` ⇒ `error:badarg`, `(P,42)` ⇒ `error:badarg`,
+    /// `(P,{type,major})` ⇒ `error:badarg`, `(P,[{type}])` ⇒ `error:badarg`,
+    /// `(P,[{type,major,extra}])` ⇒ `error:badarg`, `(P,[{nope,major}])` ⇒ `error:badarg`,
+    /// `(foo,[])` ⇒ `error:badarg`, `(foo,[{async,r}])` ⇒ `error:badarg`.
+    #[test]
+    fn erlang_garbage_collect_2_matches_the_oracle() {
+        let mut runtime = runtime();
+        let me = runtime.self_pid();
+        let dead = ProcessId::from_eterm(make_internal_pid(make_pid_data(1, 0x0FFF_FFFF)))
+            .expect("a well-formed internal pid the table does not hold");
+
+        let major = atom(&mut runtime, "major");
+        let minor = atom(&mut runtime, "minor");
+        let foo = atom(&mut runtime, "foo");
+        let req_id = atom(&mut runtime, "r");
+        let bad_options = {
+            let untyped = list_of(&mut runtime, &[major]);
+            let unknown = list_of(&mut runtime, &[foo]);
+            let integer = list_of(&mut runtime, &[make_small(42)]);
+            let one_element = one_tuple(&mut runtime, major);
+            let one_tuple = list_of(&mut runtime, &[one_element]);
+            let three_element = three_tuple(&mut runtime, major);
+            let three_tuple = list_of(&mut runtime, &[three_element]);
+            let unknown_element = pair(&mut runtime, "nope", major);
+            let wrong_tag = list_of(&mut runtime, &[unknown_element]);
+            let improper = improper(&mut runtime, req_id);
+            let not_a_list = make_small(42);
+            let not_a_tuple_list = type_tuple(&mut runtime, major);
+            vec![
+                untyped,
+                unknown,
+                integer,
+                one_tuple,
+                three_tuple,
+                wrong_tag,
+                improper,
+                not_a_list,
+                not_a_tuple_list,
+            ]
+        };
+
+        // The synchronous forms: `true` for a live local pid (and the request lands on it),
+        // `false` for one the table does not hold (with nothing recorded).
+        for options in [NIL, type_option(&mut runtime, major), type_option(&mut runtime, minor)]
+        {
+            let answer = call(&mut runtime, "erlang", "garbage_collect", &[me.to_eterm(), options])
+                .expect("a live local pid is served");
+            assert_eq!(runtime.atom_name_of(answer), Some("true"), "the oracle's `true`");
+        }
+        assert!(
+            runtime.gc_request_pending(me),
+            "the request is recorded for the target pid"
+        );
+        let answer = call(&mut runtime, "erlang", "garbage_collect", &[dead.to_eterm(), NIL])
+            .expect("a pid the table does not hold is served");
+        assert_eq!(runtime.atom_name_of(answer), Some("false"));
+        assert!(
+            !runtime.gc_request_pending(dead),
+            "a request that cannot be honoured is never recorded"
+        );
+
+        // A later `{type, _}` wins, as `get_gc_opts/2`'s `#gcopt{}` rebuild does — including
+        // when an earlier value was invalid.
+        for options in [
+            two_options(&mut runtime, major, minor),
+            two_options(&mut runtime, foo, major),
+        ] {
+            let answer = call(&mut runtime, "erlang", "garbage_collect", &[me.to_eterm(), options])
+                .expect("a live local pid is served");
+            assert_eq!(runtime.atom_name_of(answer), Some("true"));
+        }
+
+        // The `async` form: the atom `async`, live or dead, and never a fabricated reply.
+        for target in [me, dead] {
+            let options = async_option(&mut runtime, make_small(0));
+            let answer =
+                call(&mut runtime, "erlang", "garbage_collect", &[target.to_eterm(), options])
+                    .expect("the async form is served");
+            assert_eq!(runtime.atom_name_of(answer), Some("async"), "the oracle's `async`");
+        }
+
+        // Every `badarg` the oracle raises, in the same order the wrapper reaches it: the
+        // option parse first, the target's locality second.
+        for options in bad_options {
+            let error = call(&mut runtime, "erlang", "garbage_collect", &[me.to_eterm(), options])
+                .expect_err("a malformed option list is the C's `badarg`");
+            assert!(matches!(error, BeamError::BadArg), "got {error:?}");
+        }
+        for options in [
+            type_option(&mut runtime, foo),
+            two_options(&mut runtime, major, foo),
+            async_then_type(&mut runtime, "r", foo),
+        ] {
+            let error = call(&mut runtime, "erlang", "garbage_collect", &[me.to_eterm(), options])
+                .expect_err("only `major`/`minor` are accepted types");
+            assert!(matches!(error, BeamError::BadArg), "got {error:?}");
+        }
+        // The type check precedes the liveness check: a **dead** target with a bad type is
+        // `badarg`, never the `false` a valid type would give.
+        let dead_bad_type = type_option(&mut runtime, foo);
+        let error = call(
+            &mut runtime,
+            "erlang",
+            "garbage_collect",
+            &[dead.to_eterm(), dead_bad_type],
+        )
+        .expect_err("the type is validated before liveness");
+        assert!(matches!(error, BeamError::BadArg), "got {error:?}");
+        // A target that is not a node-local pid is the C's `badarg` in both forms.
+        for target in [foo, make_small(123)] {
+            for options in [NIL, async_option(&mut runtime, req_id)] {
+                let error =
+                    call(&mut runtime, "erlang", "garbage_collect", &[target, options])
+                        .expect_err("only a node-local pid is accepted");
+                assert!(matches!(error, BeamError::BadArg), "got {error:?}");
+            }
+        }
+    }
+
+    /// `[{type, Value}]` on the runtime's arena.
+    fn type_option(runtime: &mut Runtime, value: Eterm) -> Eterm {
+        let tuple = type_tuple(runtime, value);
+        list_of(runtime, &[tuple])
+    }
+
+    /// `[{async, ReqId}]` on the runtime's arena.
+    fn async_option(runtime: &mut Runtime, req_id: Eterm) -> Eterm {
+        let tag = atom(runtime, "async");
+        heap_term(runtime, |ctx| {
+            let tuple = terms::make_tuple(ctx, &[tag, req_id])?;
+            terms::make_list(ctx, &[tuple])
+        })
+    }
+
+    /// `[{type, First}, {type, Second}]` on the runtime's arena.
+    fn two_options(runtime: &mut Runtime, first: Eterm, second: Eterm) -> Eterm {
+        let one = type_tuple(runtime, first);
+        let two = type_tuple(runtime, second);
+        list_of(runtime, &[one, two])
+    }
+
+    /// `[{async, ReqId}, {type, Value}]` on the runtime's arena.
+    fn async_then_type(runtime: &mut Runtime, req_id: &str, value: Eterm) -> Eterm {
+        let req_id = atom(runtime, req_id);
+        let first = pair(runtime, "async", req_id);
+        let second = type_tuple(runtime, value);
+        list_of(runtime, &[first, second])
+    }
+
+    /// The `{type, Value}` 2-tuple on the runtime's arena.
+    fn type_tuple(runtime: &mut Runtime, value: Eterm) -> Eterm {
+        pair(runtime, "type", value)
+    }
+
+    /// The `{Tag, Value}` 2-tuple on the runtime's arena.
+    fn pair(runtime: &mut Runtime, tag: &str, value: Eterm) -> Eterm {
+        let tag = atom(runtime, tag);
+        heap_term(runtime, |ctx| terms::make_tuple(ctx, &[tag, value]))
+    }
+
+    /// A 1-tuple holding `value` (an invalid option *element*).
+    fn one_tuple(runtime: &mut Runtime, value: Eterm) -> Eterm {
+        heap_term(runtime, |ctx| terms::make_tuple(ctx, &[value]))
+    }
+
+    /// A 3-tuple (an invalid option *element*).
+    fn three_tuple(runtime: &mut Runtime, value: Eterm) -> Eterm {
+        let tag = atom(runtime, "type");
+        heap_term(runtime, |ctx| terms::make_tuple(ctx, &[tag, value, value]))
+    }
+
+    /// `[{async, ReqId} | tail]` — a valid option **element** behind an **improper** tail,
+    /// which `get_gc_opts/2`'s catch-all clause rejects (`throw(bad_option)`).
+    fn improper(runtime: &mut Runtime, req_id: Eterm) -> Eterm {
+        let head = pair(runtime, "async", req_id);
+        let tail = atom(runtime, "x");
+        heap_term(runtime, |ctx| terms::make_cons(ctx, head, tail))
+    }
+
+    /// A list of ready-made elements on the runtime's arena.
+    fn list_of(runtime: &mut Runtime, elements: &[Eterm]) -> Eterm {
+        let elements = elements.to_vec();
+        heap_term(runtime, |ctx| terms::make_list(ctx, &elements))
     }
 
     /// A BIF this module does not serve is `None` from `erts_internal_call`, so the call

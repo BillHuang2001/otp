@@ -298,15 +298,16 @@ impl RuntimeContext<'_> {
             ("erlang", "module_loaded", 1) => Some(self.module_loaded_1(args)),
             // The on-demand collection (contract A.7). `erlang:garbage_collect/0` is the
             // `erlang.erl` wrapper over `erts_internal:garbage_collect(major)`
-            // (`erlang.erl:3051-3053`) and `/1` is the wrapper over
+            // (`erlang.erl:3051-3053`), `/1` is the wrapper over
             // `erlang:garbage_collect(Pid, [])` (`erlang.erl:3055-3066`), whose `self()` clause
-            // reaches that same `erts_internal` BIF — and `erlang` is a floor namespace
+            // reaches that same `erts_internal` BIF, and `/2` is the option-taking wrapper
+            // (`erlang.erl:3073-3157`) — and `erlang` is a floor namespace
             // ([`FLOOR_MODULES`]), so its `.beam` wrapper is un-enterable and the floor owns
-            // both names. The latch, its two serving points and the honest refusals live in
-            // [`erts_internal`]. `/2` remains a typed capability gap (the asynchronous
-            // system-task protocol).
+            // all three names. The latch, its two serving points and the honest refusals live
+            // in [`erts_internal`].
             ("erlang", "garbage_collect", 0) => Some(self.garbage_collect_0()),
             ("erlang", "garbage_collect", 1) => Some(self.garbage_collect_1(args)),
+            ("erlang", "garbage_collect", 2) => Some(self.garbage_collect_2(args)),
             // The per-process **group leader** (contract A.9): `erlang:group_leader/2` is the
             // `erlang.erl` wrapper over `erts_internal:group_leader/2,3`, and the leader is
             // runtime state `beam_process` does not model — the store lives on

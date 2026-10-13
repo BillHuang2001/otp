@@ -53,7 +53,7 @@ Drift-guarded by `native.rs::tests::every_floor_module_is_a_real_try_native_arm`
 | `group_leader.rs` | `erlang:group_leader/2` + `erts_internal:group_leader/2,3` over `Runtime::group_leaders` |
 | `port.rs` | `erlang:port_command/2,3`, `erlang:port_control/3` (the driver's `control` callback, with the oracle's list-vs-binary reply rule) and the closed-port half of `erlang:port_info/1,2` (the `PortHook` seam cannot express those) |
 | `application.rs` | `application:get_env/1,2,3`, `get_all_env/1`, `get_all_key/1`, `get_key/1,2`, `get_application/0,1`, `loaded_applications/0`, `which_applications/0` over a minimal native `.app` view |
-| `erts_internal.rs` | the `erts_internal` floor (`erts_internal_call`) **plus the `erlang:garbage_collect/0,1` bodies** it hosts |
+| `erts_internal.rs` | the `erts_internal` floor (`erts_internal_call`) **plus the `erlang:garbage_collect/0,1,2` bodies** it hosts |
 | `erts_internal/trace.rs` | the `erts_internal:trace/3` + `:trace_pattern/3` handler bodies (`erlang:trace/2,3`/`trace_pattern/2,3` call them) + their pattern/target helpers, over `crate::trace` (no colocated tests — `../tests/trace*.rs`) |
 | `prim.rs` | the **path** half of the `prim_file` floor (`prim_file_call`) + the path contract, the `errno`→atom table and their unit tests |
 | `prim_file.rs` | the **whole-file-descriptor** half of the `prim_file` floor + its unit tests |
@@ -154,7 +154,7 @@ the pass's runner state and enqueues the pid **at its own priority**, so the chi
 a nested spawn, oracle-cross-checked) and by the two `runtime::scheduler::tests` cases over
 `absorb_pending_spawns`.
 
-### `erlang:garbage_collect/0,1` (contract A.7) — the on-demand collection
+### `erlang:garbage_collect/0,1,2` (contract A.7) — the on-demand collection
 Bodies in `erts_internal.rs`, arms in `../native.rs::try_native`. `erlang` is a floor namespace, so
 its `.beam` wrappers are un-enterable and the floor owns both names: `/0` (`erlang.erl:3051-3053`,
 whose body is `erts_internal:garbage_collect(major)`) and `/1` (`erlang.erl:3055-3066`, the wrapper
@@ -181,9 +181,20 @@ re-armed.
 `erl_process.c:11309-11324`): a **live local pid** ⇒ `true` and a request recorded for *that* pid; a
 well-formed internal pid the process table does not hold ⇒ `false`, with nothing recorded; anything
 that is not an internal pid — including an **external**/wire pid, which this runtime has no
-distribution link to and so can never honour ⇒ `badarg`. `/2` (`{async, ReqId}` system tasks)
-remains a **typed capability gap** and stays in
-[`../../src/error.rs::KNOWN_UNIMPLEMENTED_ERLANG_BIFS`](../../src/error.rs). Observable evidence:
+distribution link to and so can never honour ⇒ `badarg`. `/2` (`erlang.erl:3073-3157`) is the same
+contract extended by the wrapper's own option grammar (`get_gc_opts/2`, `erlang.erl:3150-3157`):
+every list element must be a 2-tuple `{async, _}` or `{type, _}` (a later option overrides an
+earlier; default `major`), anything else is the wrapper's `throw(bad_option)` ⇒ `badarg`, and the
+`{type, _}` value is validated by the C's `switch` **before** any liveness decision, so
+`garbage_collect(DeadPid, [{type, foo}])` is `badarg` and never `false`. The synchronous form is the
+oracle's `true` for a live local pid and `false` for one the table does not hold; the `{async,
+ReqId}` form is the atom `async` for a live **and** a dead target alike, and records the same request
+for a live one. **The async form's follow-up `{garbage_collect, ReqId, GCResult}` message is the one
+part this runtime cannot reproduce** — the oracle's request is a cross-process system task
+(`erts_internal:request_system_task/3`, `erl_process.c:11309-11461`) whose reply arrives when the
+target reaches its *next* serving point, and this runtime has no system-task protocol; the return
+value is the oracle's exactly and the notification is simply never sent, never faked. Observable
+evidence:
 [`../../tests/garbage_collect.rs`](../../tests/garbage_collect.rs) — the return values are
 oracle-cross-checked, and a scheduled `ask/1` really moves the `collections` counter where the
 identical `plain/1` workload moves it by zero.
@@ -635,9 +646,9 @@ needs:
   does not expose. `ets_super_user/1` needs an ETS-protection-bypass bit on
   `beam_process::ProcessFlags` (answering `ok` without it would fabricate a grant).
   `ets_info_binary/1` is **not a BIF** (absent from `erts/emulator/beam/bif.tab`).
-- **Process & scheduler control/introspection:** `erlang:garbage_collect/2` stays a typed
-  capability gap. `process_display/2` needs a process **stack dump**, which the engine exposes no
-  accessor for. `suspend_process/2` needs suspend/resume signalling; `await_result/1`,
+- **Process & scheduler control/introspection:** `process_display/2` needs a process **stack dump**,
+  which the engine exposes no accessor for. `suspend_process/2` needs suspend/resume signalling;
+  `await_result/1`,
   `flush_monitor_messages/3` and `'@flush_monitor_messages_refopt'/0` are **pure Erlang** receive
   loops, not BIFs at all.
 - **Map internals:** `map_hashmap_children/1` and `map_next/3` are **already served** by the
@@ -696,17 +707,17 @@ release does not export (`apply/1`, `function_exported/2`, `load_module/3`, `sys
 `statistics/0`, `map_get/3`, `concatenate/2`, `register/3`, `system_profile/1`) are **not** listed
 and classify as the bare `undef`.
 
-The listed set is 19 `(function, arity)` pairs over 12 names: `set_cookie/2` (already served by the
+The listed set is 18 `(function, arity)` pairs over 11 names: `set_cookie/2` (already served by the
 floor, so an inert entry), `disconnect_node/1`, `port_connect/2`, `port_call/3`,
 `spawn_request/1,2,3,4,5`, `process_flag/3`, `process_display/2`, `suspend_process/1,2`,
-`system_monitor/0,1,2`, `garbage_collect/2`, `load_module/2`, `localtime_to_universaltime/1`.
+`system_monitor/0,1,2`, `load_module/2`, `localtime_to_universaltime/1`.
 **Closable via an `erlang.erl` wrapper arm** — the public `erlang:` name wraps an `erts_internal:*`
 primitive this floor already serves: `erlang:process_flag/3` (`erlang.erl:5522-5531`) → the
 **served** `erts_internal:process_flag/3`; `erlang:localtime_to_universaltime/1`
 (`erlang.erl:11875-11881`) → the **registered** `/2` (`beam_bifs/src/calendar.rs`). A non-self
 target lowers to `erlang:F(Node,...)`, whose `erlang.erl` clause calls `erts_internal:F(...)`
-(`call_bif`'s `module == "erlang"` fallback, `context/mod.rs`). `erlang:garbage_collect/0,1` are
-closable the same way and the floor already serves both, so only `/2` stays listed.
+(`call_bif`'s `module == "erlang"` fallback, `context/mod.rs`). `erlang:garbage_collect/0,1,2` are
+closable the same way and the floor already serves all three, so none of them stays listed.
 **Needs a new facility (shape-closable only):** `port_connect/2`/`port_call/3`,
 `spawn_request/1..5`, `suspend_process/1,2`, `system_monitor/0,1,2` (`/0` ⇒ `undefined`;
 `erts_internal:system_monitor/1,3` exported but unserved), `process_display/2`, `load_module/2`,
