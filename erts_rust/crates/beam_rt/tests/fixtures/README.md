@@ -1,9 +1,9 @@
 # `beam_rt` test fixtures
 
 `mailbox.beam`, `sched.beam`, `port_recv.beam`, `raise_structured.beam`,
-`function_clause_fixture.beam` and `recv_after.beam` are committed oracle fixtures: real
-`.beam` images produced by the **system Erlang** toolchain (OTP 29 / `erts-17.1`), which is
-also the differential oracle.
+`function_clause_fixture.beam`, `recv_after.beam` and `dist_echo.beam` are committed oracle
+fixtures: real `.beam` images produced by the **system Erlang** toolchain (OTP 29 /
+`erts-17.1`), which is also the differential oracle.
 * `mailbox.beam` is the receive/message end-to-end image — `tests/mailbox.rs` (the
   runtime slice) and the receive-seam unit tests in `src/context.rs` run it through the
   real `RuntimeContext`.
@@ -32,6 +32,11 @@ also the differential oracle.
   pins the five opcode shapes the runtime deadline path is read from (`wait_timeout` +
   `timeout`, the compiler-folded `after 0`, a matched queued message, a message that **cancels**
   an armed deadline, and a bare `wait`).
+* `dist_echo.beam` is the **inbound-distribution** image (`tests/live_inbound.rs`): `wait/0`
+  registers the name `echo` and blocks in a compiled `receive`, so a real system `erl` peer
+  that resolves this runtime's `-sname` listener through `epmd` and sends
+  `{echo, Node} ! {hello, node()}` makes the message arrive as a `DOP_REG_SEND` in the
+  running process's mailbox — the value `wait/0` returns *is* the delivered payload.
 
 ## The scheduled-route `epp` pair (`epp_forms.erl` / `epp_input.erl`, compiled at test time)
 
@@ -171,6 +176,13 @@ rm -rf "$SCRATCH"; mkdir -p "$SCRATCH/gen"
 cp recv_after.erl "$SCRATCH/gen/"
 ( cd "$SCRATCH/gen" && erlc +deterministic recv_after.erl )
 cp "$SCRATCH/gen/recv_after.beam" recv_after.beam
+
+# dist_echo.beam (632 bytes) — same deterministic scratch-dir recipe
+SCRATCH="$TMPDIR/beam_rt_dist_echo_fix"
+rm -rf "$SCRATCH"; mkdir -p "$SCRATCH/gen"
+cp dist_echo.erl "$SCRATCH/gen/"
+( cd "$SCRATCH/gen" && erlc +deterministic dist_echo.erl )
+cp "$SCRATCH/gen/dist_echo.beam" dist_echo.beam
 ```
 Every fixture is built with `+deterministic` in a `$TMPDIR` scratch dir, so no
 absolute checkout path is embedded in any committed `.beam`.
@@ -226,6 +238,23 @@ self_send()   -> self() ! hello,
                  receive X -> X after 2000   -> timeout end.
 wait_forever()-> receive X -> X after infinity -> timeout end.
 ```
+
+`dist_echo.erl` (the input, also committed):
+
+```erlang
+-module(dist_echo).
+-export([wait/0]).
+wait() -> register(echo, self()), loop().
+loop() -> receive M -> M after 20 -> loop() end.
+```
+
+The `after 20` is **load-bearing** (the same rule `recv_after.beam` pins and
+`tests/dist.rs`'s keep-alive fixture relies on): a bare `receive` with no deadline leaves the
+scheduler quiescent (an empty run queue, nothing to poll, no pending timer), so
+`Runtime::run_scheduled` would stop with its honest `blocked` diagnostic *before* the peer's
+message can arrive. The per-iteration deadline keeps a pass stepping, so the distribution half
+(`pump_dist`) keeps draining the accepted link until the delivery arrives.
+
 Any byte change in a fixture invalidates the expected values in the tests that load it;
 re-derive them from the system `erl`, do **not** guess.
 
