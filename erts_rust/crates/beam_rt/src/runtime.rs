@@ -452,11 +452,14 @@ pub struct Runtime {
     /// Whether a scheduler pass **routes** inbound distribution control messages into
     /// local mailboxes ([`Runtime::dispatch_dist_inbound`]).
     ///
-    /// Default **`false`**: a node still accepts a peer, completes the `'N'`
-    /// handshake and pumps its links, but nothing a peer sends is enqueued — so the
-    /// differential corpus, whose `-eval` probes must stay byte-identical to the
-    /// oracle, never observes a delivery it did not ask for.
-    /// [`Runtime::allow_inbound_delivery`] turns it on; the explicit
+    /// Default **`true`**: a live distributed node delivers what a peer sends, which is
+    /// the whole point of accepting the peer. The switch cannot regress a run without
+    /// distribution traffic — [`Runtime::dispatch_dist_inbound`] early-returns unless
+    /// this runtime *has* a node (`-name`/`-sname`) **and** that node has an established
+    /// link, so a hermetic `nonode@nohost` run (and the differential corpus, whose
+    /// `-eval` probes must stay byte-identical to the oracle) pays one boolean test per
+    /// pass and allocates nothing.
+    /// [`Runtime::allow_inbound_delivery`] turns it off; the explicit
     /// [`Runtime::dispatch_inbound`] entry never consults it (an explicit caller has
     /// already asked).
     inbound_delivery: bool,
@@ -733,7 +736,7 @@ impl Runtime {
             dist_client,
             cookie,
             local_node,
-            inbound_delivery: false,
+            inbound_delivery: true,
             perf_map,
             open_files: HashMap::new(),
             file_services,
@@ -2264,12 +2267,13 @@ impl Runtime {
     /// Turns routing of **inbound** distribution control messages into local mailboxes
     /// on or off for the scheduler pass ([`Runtime::dispatch_dist_inbound`]).
     ///
-    /// Off by default (see the `inbound_delivery` field): a node handshakes and pumps
-    /// its links either way, but only with this enabled does the pass route what a
-    /// peer decoded — a `DOP_SEND*`/`DOP_REG_SEND*` — into the addressed local
-    /// process's mailbox. Enabling it is what makes a peer's message observable to the
-    /// running code; leaving it off keeps a runtime's behaviour byte-identical to one
-    /// with no inbound traffic.
+    /// On by default (see the `inbound_delivery` field): a node handshakes and pumps
+    /// its links either way, and with delivery on the pass routes what a peer decoded —
+    /// a `DOP_SEND*`/`DOP_REG_SEND*`/`DOP_ALIAS_SEND*`, or the message form of a
+    /// `DOP_ALTACT_SIG_SEND` — into the addressed local process's mailbox. That is what
+    /// makes a peer's message observable to the running code. Turning it off keeps the
+    /// links alive while a runtime's behaviour stays byte-identical to one with no
+    /// inbound traffic.
     ///
     /// This is a runtime capability, not an emulator switch: no `-name`/`-sname` →
     /// no node → nothing to route.

@@ -49,9 +49,14 @@ use std::time::{Duration, Instant};
 use beam_alloc::Heap;
 use beam_codec::term::make_external_pid;
 use beam_dist::flags::Dop;
-use beam_dist::{ConnectionDriver, DeliveryOutcome, DriverState, StepOutcome};
+use beam_dist::{
+    AltactSigFlags, ConnectionDriver, Delivery, DeliveryOutcome, DistSpawnFlags, DriverState,
+    InboundSink, StepOutcome,
+};
+use beam_process::{MonitorRef, ProcessId, ProcessTable, SignalAtoms, UnaliasMode};
+use beam_rt::dist::LocalDeliverySink;
 use beam_rt::{Runtime, RuntimeConfig};
-use beam_term::prelude::{make_atom, make_small, Eterm};
+use beam_term::prelude::{is_immediate, make_atom, make_small, Atom, Eterm};
 use beam_term::AtomTable;
 
 /// The shared cookie both ends authenticate with.
@@ -150,7 +155,7 @@ fn foreign_pid_term(rt: &mut Runtime, heap: &mut Heap) -> Eterm {
 }
 
 /// The single message in `pid`'s mailbox, or `None` when it is empty.
-fn only_message(rt: &Runtime, pid: beam_process::ProcessId) -> Option<Eterm> {
+fn only_message(rt: &Runtime, pid: ProcessId) -> Option<Eterm> {
     let process = rt.processes().get(pid)?;
     let mut messages = process.mailbox().iter();
     let first = messages.next()?.payload();
@@ -321,9 +326,11 @@ fn an_alias_send_is_unsupported_not_a_wrong_delivery() {
     let (mut client, mut server) = establish();
     let mut heap = Heap::new(HEAP_WORDS).expect("heap");
 
-    // An alias cannot be resolved here (this runtime has no alias table), so the
-    // delivery must be refused rather than delivered to whichever pid the *number*
-    // happens to name.
+    // `DOP_ALIAS_SEND`'s `To` must be a **reference** (`dist.c:2577`
+    // `is_not_ref(to)` ⇒ `invalid_message`); a small integer is outside the
+    // opcode's wire contract, so the sink must refuse it rather than deliver to
+    // whichever pid the *number* happens to name. (A genuinely unowned reference is
+    // `Dropped` — see the routing-logic cases below.)
     let to = make_small(7);
     let from = make_small(1);
     let message = make_small(2);
@@ -387,20 +394,35 @@ fn the_signal_families_are_unsupported_without_a_correct_local_seam() {
 }
 
 // ---------------------------------------------------------------------------
-// (5) The scheduler-pass gate: routing is off unless it is asked for
+// (5) The scheduler-pass gate: routing is ON by default and can be switched off
 // ---------------------------------------------------------------------------
 
 #[test]
-fn inbound_routing_is_off_by_default_and_toggleable() {
+fn inbound_routing_is_on_by_default_and_toggleable() {
     let mut rt = node_runtime("gate");
     assert!(
+        rt.inbound_delivery_enabled(),
+        "a live node must deliver what a peer sends it by default — that is what accepting the peer meant"
+    );
+    rt.allow_inbound_delivery(false);
+    assert!(
         !rt.inbound_delivery_enabled(),
-        "an inbound delivery must never be routed into a runtime that did not ask for it"
+        "the explicit off switch must still keep a node's links alive while routing nothing"
     );
     rt.allow_inbound_delivery(true);
     assert!(rt.inbound_delivery_enabled());
-    rt.allow_inbound_delivery(false);
-    assert!(!rt.inbound_delivery_enabled());
+}
+
+/// Flipping the default cannot regress a run without distribution traffic: a
+/// hermetic `nonode@nohost` runtime has no node to dispatch for, so the pass's
+/// inbound half stays a no-op.
+#[test]
+fn a_nodeless_runtime_still_reports_no_inbound_traffic() {
+    let config = beam_rt::parse(&["-noshell".to_string(), "-eval".to_string(), "ok.".to_string()])
+        .expect("the default switches parse");
+    let mut rt = Runtime::new(config).expect("a hermetic runtime starts");
+    assert!(rt.dist_node().is_none(), "no `-name`/`-sname` ⇒ no node");
+    rt.run_one_slice().expect("a scheduler pass");
 }
 
 // ---------------------------------------------------------------------------
