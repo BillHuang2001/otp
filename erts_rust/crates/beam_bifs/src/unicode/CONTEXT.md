@@ -35,4 +35,5 @@ An encoding atom naming anything else is `badarg` (the oracle's class), never a 
 ## Routing Table
 - `./` (`src/unicode.rs`) -> the six `unicode` BIFs, the `Encoding` selection and the two engines
 - `./wide.rs` -> the UTF-16/UTF-32 step decoder, the `cbv/2` prefix probe and the `<<One/utf16>>`/`<<One/utf32>>` builders
+- `./grapheme/` (**`./grapheme/CONTEXT.md`**) -> the grapheme-cluster port (`api.rs`/`mod.rs`), the chardata walk (`chardata.rs`), the GENERATED property tables (`props.rs`), the golden + live-oracle tests (`tests.rs`) and the generator (`gen_props.escript`)
 - `../CONTEXT.md` -> the crate root (Intent/API Surface/census/Constraints/Test Strategy/Routing Table)
