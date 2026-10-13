@@ -167,9 +167,14 @@ fn check(
                 case.name
             );
         }
-        (Err(error), Outcome::BadArgRaise(reason)) => {
-            let want = build(ctx, reason);
+        (Err(error), Outcome::BadArgRaise(payload)) => {
             assert_eq!(error.as_atom(), None, "case `{}` {what}", case.name);
+            // The raise's live reason is the oracle's **whole** `{badarg, Payload}`
+            // tuple (`length_gc/2` / `length_b/4` raise `error({badarg, Err})`), so
+            // the row's payload is re-tagged here before the comparison.
+            let payload = build(ctx, payload);
+            let tag = ctx.atom("badarg").expect("`badarg` is seeded");
+            let want = ctx.tuple(&[tag, payload]).expect("a tuple fits");
             let got = live_reason(&error);
             assert!(
                 eq(got, want, atoms),
@@ -476,7 +481,15 @@ fn cases() -> Vec<Case> {
         case(
             "improper tail inside a list",
             Expr::List(vec![Expr::Int(97), Expr::Cons(Box::new(Expr::Int(98)), Box::new(Expr::Int(99)))]),
-            value(Expr::Cons(Box::new(Expr::Int(97)), Box::new(Expr::Int(98)))),
+            // `gc/1`'s Latin-1 fast path does not fire (`[98|99]` is not a Latin-1
+            // integer head), so `cp/1` flattens the nested tail: the oracle answers
+            // the whole input as the **flat** improper chain `[97,98|99]`
+            // (`string:next_grapheme([97,[98|99]])`, live-oracle cross-checked by
+            // `the_live_oracle_agrees_on_the_whole_corpus`).
+            value(Expr::Cons(
+                Box::new(Expr::Int(97)),
+                Box::new(Expr::Cons(Box::new(Expr::Int(98)), Box::new(Expr::Int(99)))),
+            )),
             fc.clone(),
         ),
         case(

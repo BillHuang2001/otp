@@ -83,6 +83,7 @@ mod ets;
 mod fun_info;
 pub mod hook_sets;
 mod io;
+mod io_ts;
 mod lists;
 mod maps;
 mod match_spec;

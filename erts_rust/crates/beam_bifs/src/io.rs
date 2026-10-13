@@ -105,8 +105,8 @@
 //! `string(atom_to_list(A), …)` — `io_lib:format("~ts",[abc])` ⇒ `[97,98,99]`.
 //!
 //! `~ts` under an active `{chars_limit, N}` (the grapheme-cluster-limited
-//! `cdata_to_chars/3` walk) is **not** this algorithm and stays the typed,
-//! catchable [`unsupported_bif`] — see [`render_limited_s`].
+//! `cdata_to_chars/3` walk) is **not** this algorithm and lives in
+//! [`crate::io_ts`] — see [`render_limited_s`].
 //!
 //! Every integer directive — `~b`/`~B`, `~x`/`~X`, `~+`/`~#` — renders an
 //! **arbitrary-precision** integer: the digits come from the shared
@@ -210,9 +210,9 @@
 //!   to the *limited* text, so
 //!   `io_lib:format("~s", ["hello world!!"], [{chars_limit,10}])` is
 //!   `[[104,101,108,108,111,32,119,46,46,46]]` ("hello w..."). The `unicode`
-//!   (`~ts`) arm — `cdata_to_chars/3` + `uniconv/1`, which is grapheme-based and
-//!   flattens the iolist differently — **stays a typed, catchable
-//!   `unsupported_bif`** (see [`render_limited_s`]), never a wrong rendering.
+//!   (`~ts`) arm — `cdata_to_chars/3` + `uniconv/1`, which limits by grapheme
+//!   cluster instead of by iolist leaf and can carry a real **binary** element —
+//!   is a separate walk with its own module ([`crate::io_ts`]).
 
 use beam_codec::term::big_parts;
 use beam_common::Result;
@@ -321,14 +321,9 @@ fn format_lib_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// The `{chars_limit, N}` option is honoured (see [`check_options`]): a
 /// non-negative `N` returns the oracle's *limited* deep list, a negative one the
-/// normal unlimited rendering. The only control still not covered under a
-/// limiting `chars_limit` is `~s` of a list/binary in the **unicode** (`~ts`)
-/// encoding — the typed, catchable `unsupported_bif` gap (see
-/// [`render_limited_s`]). The gap is a plain `BeamError::Raise` (reason atom
-/// `unsupported_bif`), so interpreted/compiled Erlang code can
-/// `try … catch error:unsupported_bif -> …` it; it never aborts the runtime. (The
-/// CLI's `-eval` entry point reports every capability gap as an unrecoverable
-/// `Flow::Fatal` by design — a `beam_rt` policy, not a property of this BIF.)
+/// normal unlimited rendering. Both the latin1 and the **unicode** (`~ts`) forms
+/// of `~s` of a list/binary are covered under a limiting `chars_limit` (see
+/// [`render_limited_s`] and [`crate::io_ts`]).
 fn format_lib_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let chars_limit = check_options(ctx, args[2])?;
     io_lib_format(ctx, args[0], Some(args[1]), chars_limit)
@@ -429,18 +424,22 @@ fn format_bytes(format: Eterm) -> Result<Vec<u8>> {
 
 /// The control-sequence prefix shared by every directive
 /// (`io_lib_format:collect_cseq/2`).
+///
+/// `pub(crate)` because the `~ts`-under-`{chars_limit, N}` arm
+/// ([`crate::io_ts`]) is the one renderer that needs the directive's width,
+/// justification, precision and pad character.
 #[derive(Clone, Copy)]
-struct Spec {
+pub(crate) struct Spec {
     /// Field width; `None` when the format gave none.
-    width: Option<usize>,
+    pub(crate) width: Option<usize>,
     /// `~-…` left justify.
-    left: bool,
+    pub(crate) left: bool,
     /// `.` precision (never negative).
-    precision: Option<usize>,
+    pub(crate) precision: Option<usize>,
     /// Pad character (`.`-form), default space.
-    pad: u8,
+    pub(crate) pad: u8,
     /// `~t` — unicode encoding.
-    unicode: bool,
+    pub(crate) unicode: bool,
     /// `~l` — disable the `~p` string rule.
     strings: bool,
     /// `~k`/`~K` — the map printing order for this directive (`ordered` for `~k`,
@@ -714,12 +713,13 @@ fn render_format_limited(
 ///   (`term/6`, [`term_field`]);
 /// * `~p`/`~P` — `io_lib_format:print/…` under the limit ([`render_p`] with a
 ///   non-negative `chars_limit`);
-/// * `~s` — [`render_limited_s`] (`iolist_to_chars/3` then `string/6`).
+/// * `~s` — [`render_limited_s`] (the latin1 arm: `iolist_to_chars/3` then
+///   `string/6`; the unicode arm: [`crate::io_ts::render_limited_ts`]).
 ///
 /// # Errors
 ///
-/// The typed [`unsupported_bif`] for the `~s` **unicode** arm, plus whatever the
-/// renderer itself reports.
+/// Whatever the renderer itself reports — for `~s` of a list/binary that is
+/// `badarg` (the oracle's `function_clause`).
 fn render_limited_control(
     ctx: &mut BifContext<'_>,
     big: &BigControl,
@@ -747,7 +747,7 @@ fn render_limited_control(
             at,
             max_chars,
         ),
-        b's' => render_limited_s(big, max_chars),
+        b's' => render_limited_s(ctx, big, max_chars),
         _ => Err(unsupported_bif()),
     }
 }
@@ -759,23 +759,31 @@ fn render_limited_control(
 /// control_limited($s, [L0], F, Adj, P, Pad, latin1, _Str, _Ord, CL, _I) ->
 ///     L = iolist_to_chars(L0, F, CL),
 ///     string(L, limit_field(F, CL), Adj, P, Pad, latin1);
+/// control_limited($s, [L0], F, Adj, P, Pad, unicode, _Str, _Ord, CL, _I) ->
+///     L = cdata_to_chars(L0, F, CL),
+///     uniconv(string(L, limit_field(F, CL), Adj, P, Pad, unicode)).
 /// ```
 ///
-/// [`iolist_to_chars_limited`] limits the iolist to
+/// The **latin1** arm runs [`iolist_to_chars_limited`] to limit the iolist to
 /// `limit_field`'s field rule and the per-directive budget (eliding with `"..."`),
-/// and [`string_field_chunk`] then applies the directive's field width / precision
-/// to the *limited* text — `io_lib_format:string/6`. The result is a single
-/// sub-list element of the output, exactly like the un-limited `~s`
-/// ([`render_format_limited`] pushes it as one item).
+/// then [`string_field_chunk`] applies the directive's field width / precision to
+/// the *limited* text — `io_lib_format:string/6`.
 ///
-/// The `unicode` (`~ts`) arm — `cdata_to_chars(L0, F, CL)` then
-/// `uniconv(string(L, …))` — is **not** this algorithm: `limit_cdata_to_chars/3`
-/// advances by `string:next_grapheme/1` (so it flattens the iolist *and* counts
-/// grapheme clusters), and the oracle's `uniconv/1` may re-encode to a binary.
-/// It stays the typed, catchable [`unsupported_bif`], never a wrong rendering.
-fn render_limited_s(big: &BigControl, chars_limit: i64) -> Result<Chunk> {
+/// The **unicode** (`~ts`) arm is a *different* walk — grapheme clusters instead of
+/// iolist leaves, a limit probe counted by `string:length/1`, a
+/// `string:slice/3`-based truncation, and a possible **binary** element — and lives
+/// in [`crate::io_ts::render_limited_ts`].
+///
+/// Either way the result is a single sub-list element of the output, exactly like
+/// the un-limited `~s` ([`render_format_limited`] pushes it as one item).
+fn render_limited_s(ctx: &mut BifContext<'_>, big: &BigControl, chars_limit: i64) -> Result<Chunk> {
     if big.spec.unicode {
-        return Err(unsupported_bif());
+        // The `unicode` (`~ts`) arm is a **different** algorithm:
+        // `cdata_to_chars(L0, F, CL)` then `string(L, …)`, where
+        // `limit_cdata_to_chars/3` advances by `string:next_grapheme/1` (so it
+        // flattens the iolist *and* counts grapheme clusters) and the element list
+        // may carry a real **binary** element. See [`crate::io_ts`].
+        return crate::io_ts::render_limited_ts(ctx, &big.spec, big.term, chars_limit);
     }
     let limited = iolist_to_chars_limited(big.term, big.spec.width, chars_limit)?;
     string_field_chunk(
@@ -794,7 +802,7 @@ fn render_limited_s(big: &BigControl, chars_limit: i64) -> Result<Chunk> {
 /// unchanged; otherwise the width is clamped to at least 3 characters and to the
 /// budget: `max(3, min(F, CharsLimit))`. The `min(3, …)` floor is what lets the
 /// elision marker `"..."` still fit.
-fn limit_field(field: Option<usize>, chars_limit: i64) -> Option<usize> {
+pub(crate) fn limit_field(field: Option<usize>, chars_limit: i64) -> Option<usize> {
     if chars_limit < 0 {
         return field;
     }
@@ -1060,6 +1068,11 @@ fn indentation_of(chunk: &Chunk, column: i64) -> i64 {
         // `indentation([C|Cs], I) when is_integer(C) -> indentation(Cs, I+1)`.
         Chunk::Int(_) => column + 1,
         Chunk::List(items) => items.iter().fold(column, |col, item| indentation_of(item, col)),
+        // `indentation(Bin, I) when is_binary(Bin) -> indentation(binary_to_list(Bin), I)`
+        // — the `~ts`-limited arm's binary element (see [`crate::print::Chunk::Bin`]).
+        Chunk::Bin(bytes) => bytes
+            .iter()
+            .fold(column, |col, &byte| indent_char(byte as char, col)),
     }
 }
 
@@ -1073,6 +1086,10 @@ fn splice_flat(out: &mut Vec<Chunk>, chunk: Chunk) {
                 splice_flat(out, item);
             }
         }
+        // A binary element never flows through a *small* control (only the
+        // `~ts`-limited element list builds one), but the walk stays total by
+        // splicing its bytes as individual characters, as `lists:flatten/1` does.
+        Chunk::Bin(bytes) => out.extend(bytes.iter().map(|&byte| Chunk::Char(byte as char))),
     }
 }
 
@@ -1086,8 +1103,9 @@ fn chunks_to_term(ctx: &mut BifContext<'_>, chunks: &[Chunk]) -> Result<Eterm> {
 }
 
 /// Materializes one chunk: a character is a small integer, a raw integer is that
-/// integer itself, a list a sub-list.
-fn chunk_to_term(ctx: &mut BifContext<'_>, chunk: &Chunk) -> Result<Eterm> {
+/// integer itself, a list a sub-list and a binary a **binary** term (the
+/// `~ts`-limited arm's binary element — `io_lib:format` keeps it verbatim).
+pub(crate) fn chunk_to_term(ctx: &mut BifContext<'_>, chunk: &Chunk) -> Result<Eterm> {
     match chunk {
         Chunk::Char(c) => ctx.int(i64::from(*c as u32)),
         Chunk::Int(term) => int_element_term(ctx, *term),
@@ -1098,6 +1116,7 @@ fn chunk_to_term(ctx: &mut BifContext<'_>, chunk: &Chunk) -> Result<Eterm> {
             }
             ctx.list(&elems)
         }
+        Chunk::Bin(bytes) => bits::make_binary(ctx.heap(), bytes),
     }
 }
 
@@ -1526,7 +1545,7 @@ fn string_arg(ctx: &BifContext<'_>, arg: Eterm, unicode: bool) -> Result<(Chunk,
 /// `badarg` (the oracle's `function_clause`) for a negative integer, a float, an
 /// atom, a tuple, an improper tail, a byte-aligned-ness failure, and for the bare
 /// non-list/non-binary argument itself (`~ts` of an integer or a tuple).
-fn cdata_chunk(term: Eterm) -> Result<Chunk> {
+pub(crate) fn cdata_chunk(term: Eterm) -> Result<Chunk> {
     if bits::is_bitstring(term) {
         // The only binary clause is guarded by `is_binary/1`; a non-byte-aligned
         // bitstring matches no clause at all.
@@ -1573,7 +1592,7 @@ fn cdata_element(head: Eterm) -> Result<Chunk> {
 /// feeding the running indentation the way `io_lib_format:indentation/2` reads it);
 /// every other non-negative integer — the surrogate `55296`, `1114112`, and any
 /// bignum — is carried verbatim as a [`Chunk::Int`], with no upper bound.
-fn cdata_integer_chunk(term: Eterm) -> Option<Chunk> {
+pub(crate) fn cdata_integer_chunk(term: Eterm) -> Option<Chunk> {
     if !is_nonneg_integer(term) {
         return None;
     }

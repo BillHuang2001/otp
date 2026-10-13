@@ -252,6 +252,17 @@ pub(crate) enum Chunk {
     Int(Eterm),
     /// A sub-list element.
     List(Vec<Chunk>),
+    /// A **binary** element: the one element kind a deep `io_lib:format` result can
+    /// carry that is not a character list. Only the `~ts`-under-`{chars_limit, N}`
+    /// arm builds one (`io_lib_format:cdata_to_chars/3` hands a
+    /// `string:next_grapheme/1` error payload's binary through verbatim), so
+    /// `io_lib:format("~10.4ts", [[[<<200,201>>],97]], [{chars_limit,4}])` is
+    /// `[[[32],<<200,201>>,97]]` — a real binary term inside the list.
+    ///
+    /// Its [`Chunk::flat_len`] is `io_lib:chars_length(Bin)` = `byte_size(Bin)`,
+    /// and it is the only variant that materializes as a **binary** rather than as
+    /// a list of small integers (see `crate::io::chunk_to_term`).
+    Bin(Vec<u8>),
 }
 
 impl Chunk {
@@ -275,6 +286,11 @@ impl Chunk {
                     item.flatten_into(out);
                 }
             }
+            // A binary element of a deep list: `io_lib` splices its bytes into the
+            // surrounding character list (`iolist_to_binary/1` leaves them as they
+            // are), so they are appended one latin1 character each — the same
+            // mapping the latin1 `~s` arm uses for a binary's bytes.
+            Chunk::Bin(bytes) => out.extend(bytes.iter().map(|&b| b as char)),
         }
     }
 
@@ -284,6 +300,8 @@ impl Chunk {
             // `io_lib:chars_length/1` counts a raw integer element as one character.
             Chunk::Char(_) | Chunk::Int(_) => 1,
             Chunk::List(items) => items.iter().map(Chunk::flat_len).sum(),
+            // `io_lib:chars_length(Bin)` is `iolist_size(Bin)` = `byte_size(Bin)`.
+            Chunk::Bin(bytes) => bytes.len(),
         }
     }
 
@@ -367,6 +385,14 @@ fn flatten_output_into(chunk: &Chunk, out: &mut String) -> Result<()> {
             for item in items {
                 flatten_output_into(item, out)?;
             }
+            Ok(())
+        }
+        // Unreachable from `io:format` (the `~ts`-under-`{chars_limit, N}` arm is
+        // only reachable through `io_lib:format/3`, whose result is materialized as
+        // a term, not flattened to text). Handled as [`Chunk::flatten_into`] does,
+        // byte by byte, so the walk stays total without inventing a raise.
+        Chunk::Bin(bytes) => {
+            out.extend(bytes.iter().map(|&b| b as char));
             Ok(())
         }
     }
