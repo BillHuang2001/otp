@@ -9,10 +9,12 @@ compilation entry points — `compile_module` (the **eager** whole-module layout
 per-function unit: its own `CodeBuffer`, a map covering only that function); `regalloc.rs` picks the
 cached x-registers; `operands.rs` reads operand shapes;
 `r#move.rs`/`test.rs`/`select.rs`/`arith.rs`/`compare.rs`/`aggregate.rs` each lower one instruction
-group; `link.rs` owns the direct block-to-block jump and the linked local tail call.
+group; `frame.rs` lowers the frame-discipline trio that ends a function body
+(`deallocate`/`return`/`deallocate_return`); `link.rs` owns the direct block-to-block jump and the
+linked local tail call.
 The driver, block ABI and the helpers (`jit_step_one`, `jit_ext_call`, `jit_tail_call`,
-`jit_publish_y`, `jit_refresh_y`) live one level up in `../mod.rs` / `../runtime.rs`; this node only
-*emits calls* to them.
+`jit_deallocate`, `jit_return`, `jit_deallocate_return`, `jit_publish_y`, `jit_refresh_y`) live one
+level up in `../mod.rs` / `../runtime.rs`; this node only *emits calls* to them.
 
 ## Core model (do not break)
 - **Only `CACHE_REGISTERS.len()` = 5 x-registers are held in machine registers** (`r12`-`r15` + `rbp`,
@@ -47,6 +49,9 @@ group's `try_inline_*`; **`Ok(false)` means "lowered nothing"** and the arm then
 | Tuple write | `SetTupleElement` | `aggregate.rs::try_inline_set_tuple_element` via `emit_tuple_write` | `set_tuple_element_shape` |
 | Arithmetic gc_bif | `GcBif` (`+`/`-`/`*`) | `arith.rs::try_inline_gc_bif` | `arith.rs::fast_arith` (x-register **or Y-slot** operand/destination; a Y access carries a run-time frame-window guard) |
 | Comparisons | `Bif` (and `GcBif` fallback) | `compare.rs::try_inline_comparison` | `compare.rs::comparison_shape` |
+| Frame pop | `Deallocate` | `frame.rs::emit_deallocate` (an `emit_helper_call` to `jit_deallocate`) | always lowered (the instruction's own outcome is the helper's block-ABI word): continues in-block on `encode_target(func, pc+1)`, else leaves via `done` |
+| Return | `Return` | `frame.rs::emit_return` (an `emit_helper_call` to `jit_return`) | always lowered — a `return` always transfers control, so the block leaves via `emit_word_exit` |
+| Fused frame pop + return | `DeallocateReturn` | `frame.rs::emit_deallocate_return` (an `emit_helper_call` to `jit_deallocate_return`); `emit_block` also fuses a separate adjacent `Deallocate`+`Return` pair into one such call | always lowered — always transfers control, leaves via `emit_word_exit` |
 | Jump | `Jump` | `link.rs::Linker::emit_exit` | resolved label **in the block map** -> linked; otherwise return-to-driver (the target's function is compiled on entry) |
 | Local tail call | `CallLast` | `link.rs::Linker::emit_tail_exit` | `Linker::is_compiled` |
 | Local tail call (no pop) | `CallOnly` | `link.rs::Linker::emit_exit` (lowers like `Jump`) | resolved label |
@@ -104,7 +109,7 @@ Note `GcBif` tries arith **then** comparison; `Bif` tries only comparison
   interned (else the whole instruction deopts — a wrong atom is never fabricated). `Fail` is
   deliberately not inspected (the fast path never errors; a guard rejection deopts to the full step).
 
-## Deopt mechanism (two levels)
+## Deopt mechanism (two levels, plus a direct-helper exit)
 1. **Compile-time shape refusal**: a `try_inline_*` returns `Ok(false)` **without emitting a byte**, and
    the dispatch arm emits `mod.rs::emit_step_and_continue` in its place; the `_` arm does the same for
    any unclaimed `Instr`.
@@ -114,6 +119,15 @@ Note `GcBif` tries arith **then** comparison; `Bif` tries only comparison
    `aggregate.rs` (`emit_list_read`/`emit_tuple_read`/`try_inline_select_tuple_arity`), and the arith fast
    path's Y access (`arith.rs::emit_y_load`/`emit_y_store`, whose frame-window guard is the same pure
    rejection). `select_val` has no fallback (all-immediate alternatives are total).
+3. **Direct-helper exit (not a deopt at all)**: the frame-discipline arms (`frame.rs` —
+   `Deallocate`/`Return`/`DeallocateReturn`) are lowered as a plain `emit_helper_call` to a dedicated
+   helper that performs exactly this instruction's `Machine` work and hands the driver a block-ABI word,
+   so **no interpreter step runs**: `emit_deallocate` continues in-block on the
+   `encode_target(func, pc+1)` word (branching to `done` otherwise), while `emit_return`/
+   `emit_deallocate_return` always transfer control and leave via `emit_word_exit`. There are no guards
+   to emit: every operand shape is lowered (a `Deallocate` frame size is a `u32`, a `return` has no
+   operand), and the only failure is a `CodeBuffer` that cannot hold the bytes — the shared typed
+   `SystemLimit`.
 `emit_step_and_continue` (`mod.rs`) = one `jit_step_one` call + `emit_continue_check`: `rax` is compared
 against `encode_target(func, pc+1)`; equal -> `fill` and fall through natively at `pc+1`; any other word
 (`Goto`/`HALT`/`ERROR`/`ENTER`/`Wait`) -> `jmp done`, the shared epilogue, which `ret`s to the driver with
@@ -171,7 +185,8 @@ entry (the driver's bound is `machine.x.len() > bound`).
 
 ## Constraints
 - `#![allow(unsafe_code)]` at the emitter entry (`mod.rs`) because it drives the encoder; nothing here
-  dereferences a raw pointer itself.
+  dereferences a raw pointer itself. `frame.rs` is in that same JIT zone: it emits bytes and forms
+  helper function pointers, never dereferencing a raw pointer itself.
 - `emit_block` accumulates `highest_native_register` (direct `machine.x` accesses) via `touch`; the driver
   refuses native entry to a machine whose register file does not cover the bound the artifact's layout
   requires. `emit_function` records `highest_cached_register` / `cached_registers` and
@@ -213,8 +228,12 @@ entry (the driver's bound is `machine.x.len() > bound`).
   `emit_tuple_header_guard`.
 - `link.rs` -> `Linker` (`is_compiled`, `emit_exit`, `emit_tail_exit`), `emit_frame_teardown`, and the
   byte-level linker unit tests (alongside `test.rs`'s own unit tests).
-- `../runtime.rs` -> `jit_step_one` / `jit_tail_call` / `jit_publish_y` / `jit_refresh_y` / `JitRuntime`
-  (`y_base`/`y_end`) / the `encode_target`/`encode_wait` codec (the helpers these emitters call).
+- `frame.rs` -> `emit_deallocate`, `emit_return`, `emit_deallocate_return`, `emit_word_exit` (the three
+  end-of-body lowerings + the shared `jmp done` exit), plus its unit tests (the frame-discipline bytes
+  and the emitter-side `Deallocate`+`Return` fusion).
+- `../runtime.rs` -> `jit_step_one` / `jit_tail_call` / `jit_deallocate` / `jit_return` /
+  `jit_deallocate_return` / `jit_publish_y` / `jit_refresh_y` / `JitRuntime` (`y_base`/`y_end`) / the
+  `encode_target`/`encode_wait` codec (the helpers these emitters call).
 
 ## Notes for Agents
 - Read `super::CONTEXT.md` (`../`) and the crate `CONTEXT.md` (`../../`) for the block ABI, the driver, the
