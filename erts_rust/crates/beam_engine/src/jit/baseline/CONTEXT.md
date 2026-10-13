@@ -38,9 +38,11 @@ The artifact (`CompiledModule`) comes in **two layouts**:
   the per-run fallback); the `NativeCode` trait (`enter(rt, module, func, pc)` + `module_blocks` +
   `labels`) and its `BlockEntries` impl; `enter_compiled`/`block_entries`.
 - `runtime.rs` — the block ABI (`HALT`/`ERROR`/`WAIT_BIT`/`ENTER`, `encode_target`/`decode_target`/`encode_wait`/`decode_wait`, `JitRuntime`, `RUNTIME_{MACHINE,XREGS,YBASE,YEND}_DISP`) and the helpers: `jit_step_one` (per-instruction deopt → `Machine::step_instruction`; a `Step::Enter` returns the `ENTER` word with the target in `JitRuntime::enter`), `jit_ext_call` (the native `call_ext`/`call_ext_only`/`call_ext_last` arm: import resolution through the host seam plus the variant's frame discipline — the `Continuation::Address{func, pc+1, context}` store, nothing, or `pop_frame_checked` — handed to the driver as `ENTER`), `jit_step_ext` (the `call_ext*` deopt carrying the host's **already-computed** seam answer into `Machine::call_ext_dispatch`, so a declined import is resolved **once**, not twice), `fold_step` (the single `Step`→block-ABI encoder both `jit_step_one` and `jit_step_ext` end in), `jit_tail_call` (`Machine::pop_frame_checked` for a linked local `call_last`), `jit_deallocate`/`jit_return`/`jit_deallocate_return` (the frame-discipline helpers: the checked pop and/or the continuation read, encoding the instruction's own outcome as the block-ABI word — sharing `return_word` for the continuation→word mapping and `report_frame_error` for the typed diagnostic, with the `FrameExitHelper`/`ReturnHelper` fn-pointer types), `jit_set_position` (`Machine::set_current_code`, the block prologue's position store), `jit_publish_y` (`jit_set_position` + `JitRuntime::refresh_y_base` in one call — a Y-accessing block's prologue publish) and `jit_refresh_y` (the gated post-helper window refresh).
-- `emit/` — the per-instruction emitters + usage-weighted regalloc; `Allocation::y_last`/`refresh_y_after`
-  and the Y-window publish/refresh emission, the sub-block emitters (`stores_continuation`/
-  `sub_blocks_capacity_estimate`/`emit_sub_blocks`/`emit_shared_sub_blocks`); per file — `operands.rs`
+- `emit/` — `compile.rs` (the compilation entry points `compile_module`/`compile_function`, `emit_function`,
+  the continuation sub-block emitters `stores_continuation`/`sub_blocks_capacity_estimate`/`emit_sub_blocks`/
+  `emit_shared_sub_blocks`, and the code-size estimates) and `mod.rs` (the per-instruction dispatch, the
+  compiled-block shape and the helpers) + usage-weighted regalloc; `Allocation::y_last`/`refresh_y_after`
+  and the Y-window publish/refresh emission; per file — `operands.rs`
   (`y_offset`/`y_addressable`/`y_register`), `arith.rs` (the Y operand/destination support + `uses_y`) and
   `regalloc.rs` (the `y_last` derivation, and the "a Y slot is not an x-register" rule). See `emit/CONTEXT.md`.
 
