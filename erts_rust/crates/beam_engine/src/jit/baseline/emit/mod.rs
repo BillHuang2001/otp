@@ -105,10 +105,11 @@ use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg, DEFAULT_CAP
 
 use super::code::{CompiledFunction, CompiledModule, Summary};
 use super::runtime::{
-    encode_target, ExtCallHelper, PositionHelper, StepHelper, EXT_CALL, EXT_CALL_LAST,
-    EXT_CALL_ONLY, RUNTIME_XREGS_DISP,
+    encode_target, ExtCallHelper, PositionHelper, RefreshHelper, StepHelper, EXT_CALL,
+    EXT_CALL_LAST, EXT_CALL_ONLY, RUNTIME_XREGS_DISP,
 };
 use super::{jit_ext_call, jit_set_position, jit_step_one};
+use super::runtime::{jit_publish_y, jit_refresh_y};
 
 mod aggregate;
 mod arith;
@@ -137,8 +138,8 @@ use test::try_inline_test;
 // submodules changed no item path. Only the tests use them, hence `cfg(test)`.
 #[cfg(test)]
 pub(crate) use arith::{
-    fast_arith, SmallArith, FAST_A, FAST_B, FAST_C, FAST_R, FAST_T, MAX_SMALL_WORD, MIN_SMALL_WORD,
-    SMALL_MASK, SMALL_SHIFT, SMALL_TAG,
+    fast_arith, SmallArith, FAST_A, FAST_B, FAST_C, FAST_R, FAST_T, MAX_SMALL_WORD,
+    MIN_SMALL_WORD, SMALL_MASK, SMALL_SHIFT, SMALL_TAG,
 };
 #[cfg(test)]
 pub(crate) use operands::{constant_word, x_register};
@@ -205,6 +206,22 @@ pub(super) fn touch(highest: &mut Option<u32>, x: u32) {
 pub(crate) struct Allocation {
     /// The slots, in assignment order (`src` before `dst` within a `move`).
     pub(crate) slots: Vec<(u32, Reg)>,
+    /// The **highest pc of the block whose instruction accesses a Y slot**, or `None`
+    /// when no instruction of the block does.
+    ///
+    /// The emitter's two Y-window decisions both read it, and both are compile-time
+    /// (so a Y-free block pays nothing at run time):
+    ///
+    /// * the **prologue** publishes the current frame's Y window iff `y_last.is_some()`
+    ///   (a block that may read `JitRuntime::y_base`/`y_end`);
+    /// * the **post-deopt refresh** ([`Allocation::refresh_y_after`]) is emitted only
+    ///   when a still-later instruction accesses a Y slot.
+    ///
+    /// Only the arithmetic fast path reads the window (see the Y-operand contract in
+    /// [`arith`]): an instruction "accesses a Y slot" exactly when [`arith::uses_y`]
+    /// says so. A `move`/`get_list`/… with a Y operand is *not* a window access — it
+    /// deopts to the interpreter, which reads `machine.stack` itself.
+    pub(crate) y_last: Option<u32>,
 }
 
 impl Allocation {
@@ -214,6 +231,20 @@ impl Allocation {
             .iter()
             .find(|(n, _)| *n == x)
             .map(|(_, reg)| *reg)
+    }
+
+    /// Whether a helper call made at `pc` — whose `Step::Next` continues the block
+    /// in-block at `pc + 1` — must be followed by a Y-window refresh.
+    ///
+    /// True only when a later instruction of the block still accesses a Y slot: the
+    /// helper ran one instruction in the interpreter, which may have pushed a frame,
+    /// `trim`med one, or **reallocated** `machine.stack`, so the window the block
+    /// published in its prologue may be stale. When no later instruction accesses a Y
+    /// slot the refresh is not emitted at all — and when the helper leaves the block to
+    /// the driver, the next block's prologue publishes instead, so no driver
+    /// round-trip ever refreshes.
+    pub(crate) fn refresh_y_after(&self, pc: u32) -> bool {
+        matches!(self.y_last, Some(last) if last > pc)
     }
 }
 
@@ -825,7 +856,18 @@ fn emit_block(
     // returns to the driver. A parked `receive` and a raise stay exact because both go
     // through the interpreted deopt (`jit_step_one`), which records the *instruction*
     // address itself. See `jit_set_position`.
-    emit_position_store(buffer, func, start as u32)?;
+    //
+    // A block that accesses a Y slot ([`Allocation::y_last`]) publishes the current
+    // frame's Y window through `jit_publish_y` **instead**, which does the position
+    // store *and* refreshes the window in the one call — so publishing costs such a
+    // block nothing extra, and a Y-free block keeps emitting the plain position store
+    // (it pays literally nothing). See `jit_publish_y` for why the prologue is the
+    // sound, cheapest publish point.
+    if allocation.y_last.is_some() {
+        emit_publish_y(buffer, func, start as u32)?;
+    } else {
+        emit_position_store(buffer, func, start as u32)?;
+    }
     for (x, reg) in &allocation.slots {
         touch(highest_touched, *x);
         buffer.mov_rm(*reg, Reg::Rbx, x_offset(*x))?;
@@ -1215,10 +1257,54 @@ fn emit_block(
 /// (see [`SAVED_REGISTERS`]). The helper returns nothing — a position store cannot
 /// fail — so `rax` is not consulted.
 fn emit_position_store(buffer: &mut CodeBuffer, func: u32, pc: u32) -> Result<()> {
+    let helper: PositionHelper = jit_set_position;
+    emit_prologue_helper(buffer, func, pc, helper as *const ())
+}
+
+/// Emit the prologue's **Y-window publish**: call `jit_publish_y(rt, func, pc)`, which
+/// records this block's entry `(func, pc)` as the machine's position *and* re-publishes
+/// the current frame's Y window.
+///
+/// A block whose body accesses a Y slot ([`Allocation::y_last`]) emits this in place of
+/// [`emit_position_store`] — same three-argument call shape, so the block pays no extra
+/// call for publishing. The window must be live before the block's first Y access
+/// because the Erlang stack is a `Vec` a frame push may reallocate; see `jit_publish_y`.
+fn emit_publish_y(buffer: &mut CodeBuffer, func: u32, pc: u32) -> Result<()> {
+    let helper: PositionHelper = jit_publish_y;
+    emit_prologue_helper(buffer, func, pc, helper as *const ())
+}
+
+/// Emit the prologue's three-argument helper call — `helper(rt, func, pc)` — shared by
+/// [`emit_position_store`] and [`emit_publish_y`] (the two differ only in the helper's
+/// body).
+///
+/// `rt` is read out of the prologue-reserved stack slot ([`RUNTIME_SLOT_DISP`]), so this
+/// may be emitted anywhere after that slot is written. The helper clobbers only
+/// caller-saved registers, so a block must have loaded nothing it needs into them at
+/// the call; every cached x-register and `rbx` live in callee-saved registers, which
+/// the helper preserves ([`emit_block`] emits this before loading the cached
+/// x-registers for exactly that reason). `rsp` is already 16-byte aligned at the call
+/// (see [`SAVED_REGISTERS`]). Neither helper returns a value, so `rax` is not consulted.
+fn emit_prologue_helper(buffer: &mut CodeBuffer, func: u32, pc: u32, helper: *const ()) -> Result<()> {
     buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)?;
     buffer.mov_ri(Reg::Rsi, i64::from(func))?;
     buffer.mov_ri(Reg::Rdx, i64::from(pc))?;
-    let helper: PositionHelper = jit_set_position;
+    buffer.mov_ri(Reg::R11, helper as i64)?;
+    buffer.call_r(Reg::R11)
+}
+
+/// Emit the **gated Y-window refresh**: call `jit_refresh_y(rt)` so the block's next Y
+/// access compares against the live frame.
+///
+/// Emitted on the *continue* arm of an in-block helper call ([`emit_continue_check`])
+/// only when a later instruction of the block still accesses a Y slot
+/// ([`Allocation::refresh_y_after`]): the helper ran one instruction in the interpreter,
+/// which may have pushed a frame, `trim`med one, or reallocated `machine.stack`. The
+/// register arguments are the same as a deopt's (`rt` from the block's own stack slot);
+/// the helper clobbers only caller-saved registers and returns nothing.
+fn emit_refresh_y(buffer: &mut CodeBuffer) -> Result<()> {
+    buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)?;
+    let helper: RefreshHelper = jit_refresh_y;
     buffer.mov_ri(Reg::R11, helper as *const () as i64)?;
     buffer.call_r(Reg::R11)
 }
@@ -1350,7 +1436,18 @@ fn emit_continue_check(
     buffer.mov_ri(Reg::R11, encode_target(func, pc + 1))?;
     buffer.cmp_rr(Reg::Rax, Reg::R11)?;
     buffer.jcc(Cond::Ne, done)?;
-    fill(buffer, allocation)
+    fill(buffer, allocation)?;
+    // Continuing in-block past the helper: the instruction it ran may have pushed or
+    // popped a frame (moving the Y window) or reallocated `machine.stack` (freeing the
+    // published one), so re-publish the window before the next instruction when a later
+    // instruction of this block still accesses a Y slot. The gate is compile-time, so a
+    // block that never touches Y emits nothing here, and the refresh sits on the
+    // *continue* arm only — a helper that leaves the block to the driver pays nothing
+    // (the next block's prologue publishes).
+    if allocation.refresh_y_after(pc) {
+        emit_refresh_y(buffer)?;
+    }
+    Ok(())
 }
 
 /// Write every cached x-register back into `machine.x` (`rbx` holds the base).

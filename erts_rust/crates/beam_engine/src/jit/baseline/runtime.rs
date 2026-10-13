@@ -129,9 +129,9 @@ pub const fn decode_wait(word: i64) -> Option<(u32, u32)> {
 /// A `#[repr(C)]` bag of raw pointers at the live driver-owned objects (valid for
 /// the whole driver call, never aliased while a `&mut` derived from a field is
 /// alive) plus the slot a helper stores a propagating [`BeamError`] in. Generated
-/// code touches **only offset 0 and 8** ([`RUNTIME_MACHINE_DISP`],
-/// [`RUNTIME_XREGS_DISP`]); the remaining fields are read by the Rust-side
-/// [`jit_step_one`] helper.
+/// code touches **only offsets 0, 8, 16 and 24** ([`RUNTIME_MACHINE_DISP`],
+/// [`RUNTIME_XREGS_DISP`], [`RUNTIME_YBASE_DISP`], [`RUNTIME_YEND_DISP`]); the
+/// remaining fields are read by the Rust-side [`jit_step_one`] helper.
 ///
 /// `machine` is the [`Machine`] itself (what the helper needs); `x_regs` is the base
 /// of its **x-register array** (`machine.x.as_ptr()`), which is what a block indexes.
@@ -140,6 +140,16 @@ pub const fn decode_wait(word: i64) -> Option<(u32, u32)> {
 /// Rust struct. `machine.x` is only resized by [`Machine::reset`] (which runs before
 /// this pointer is taken) — `ensure_heap` hands the context a slice, so it cannot
 /// reallocate the array mid-run.
+///
+/// `y_base`/`y_end` are the **current frame's Y window**: the base of the top call
+/// frame's first Y slot (`machine.stack[y_base]`) and the one-past-the-last address of
+/// its `y_count` slots. A block reads a Y operand and writes a Y destination through
+/// them; a block that accesses a Y slot publishes the pair in its **prologue**
+/// ([`jit_publish_y`]), and re-publishes it after an in-block helper call when a later
+/// instruction of the block accesses a Y slot ([`jit_refresh_y`]) — the Erlang stack is
+/// a Rust `Vec` that `push_frame` may reallocate, so the window must never outlive the
+/// frame it names. When no frame is live both are null, which makes every emitted Y
+/// access reject (see the Y-window guard in the arithmetic fast path).
 ///
 /// The lifetime parameter bounds only the [`ExecutionContext`] trait object (it is
 /// invariant, so the object's own lifetime must be named); it does not affect the
@@ -150,6 +160,16 @@ pub(crate) struct JitRuntime<'a> {
     pub(crate) machine: *mut Machine,
     /// The base of the x-register array (`machine.x`) a block loads from / spills to.
     pub(crate) x_regs: *mut Eterm,
+    /// The base of the current frame's first Y slot (`machine.stack[y_base]`).
+    ///
+    /// Null when no frame is live. Read by generated code at
+    /// [`RUNTIME_YBASE_DISP`].
+    pub(crate) y_base: *mut Eterm,
+    /// One past the current frame's last Y slot (`y_base + y_count`).
+    ///
+    /// Null when no frame is live. Read by generated code at
+    /// [`RUNTIME_YEND_DISP`].
+    pub(crate) y_end: *mut Eterm,
     /// The module being executed (its `code`, labels, imports, literals).
     pub(crate) module: *const Module,
     /// The module-wide `Label -> (func, pc)` map the helper resolves fail/target
@@ -165,10 +185,56 @@ pub(crate) struct JitRuntime<'a> {
     /// the [`ENTER`] word; the driver takes it, switches context and re-enters there.
     ///
     /// Read and written **only by Rust** (the driver and [`jit_step_one`]); the
-    /// generated code loads no field past [`RUNTIME_XREGS_DISP`].
+    /// generated code loads no field past [`RUNTIME_YEND_DISP`].
     pub(crate) enter: Option<(u32, u32, u32)>,
 }
-
+impl JitRuntime<'_> {
+    /// Re-publish the current top frame's Y window into [`Self::y_base`]/[`Self::y_end`].
+    ///
+    /// Called from generated code — through [`jit_publish_y`] in a block's prologue and
+    /// [`jit_refresh_y`] after an in-block helper call — so the emitted Y-window guard
+    /// always compares against the live frame. `Machine::push_frame` grows the Erlang
+    /// stack with `Vec::resize`, so a window taken before a frame push can name freed
+    /// memory; re-publishing here is what keeps it current. The **driver does not call
+    /// it**: every native entry point is a block prologue (a linked tail-call target is
+    /// a block entry too), and the only in-block state change that can move the window
+    /// is a helper call, which the emitter covers with a gated refresh — so a driver
+    /// round-trip pays nothing.
+    ///
+    /// With no live frame both fields are null: `lea k*8; cmp; jae` then rejects every
+    /// Y access (the emitted guard), so a frame-less block can never dereference one.
+    ///
+    /// `#[inline]`: the body is a handful of instructions and it sits on the per-block
+    /// entry path, so the call overhead would otherwise be a measurable share of a cheap
+    /// entry.
+    #[inline]
+    pub(crate) fn refresh_y_base(&mut self) {
+        // SAFETY: `rt.machine` is a non-null pointer to the driver's live `Machine`;
+        // no other `&mut Machine` exists while a helper/driver frame runs (the driver
+        // is blocked in the block call that reached us).
+        let machine = unsafe { &mut *self.machine };
+        // Copy the top frame's window out *before* taking the stack pointer: the
+        // `frames` borrow must end for the `stack.as_mut_ptr()` borrow to start.
+        let window = machine.frames.last().map(|frame| (frame.y_base, frame.y_count));
+        match window {
+            Some((y_base, y_count)) => {
+                // SAFETY: `push_frame` sized the stack to `y_base + y_count` and the
+                // frame is still live (`deallocate`/`pop_frame` truncate the stack and
+                // drop the frame together), so `[y_base, y_base + y_count]` is in
+                // bounds of the current allocation. `as_mut_ptr` is freshly taken, so
+                // the pointers follow any earlier reallocation.
+                let base = machine.stack.as_mut_ptr();
+                let start = unsafe { base.add(y_base) };
+                self.y_base = start;
+                self.y_end = unsafe { start.add(y_count as usize) };
+            }
+            None => {
+                self.y_base = std::ptr::null_mut();
+                self.y_end = std::ptr::null_mut();
+            }
+        }
+    }
+}
 /// A compiled block's native signature.
 pub(crate) type NativeBlock = for<'a> extern "C" fn(*mut JitRuntime<'a>) -> i64;
 
@@ -186,17 +252,33 @@ pub(crate) type TailHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, i64, u32
 pub(crate) type ExtCallHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, u32, u32, u32, u32, u32) -> i64;
 /// The `jit_set_position` helper's native signature (the block ABI plus the block's
 /// own `(func, pc)`); it returns nothing — a position store cannot fail.
+///
+/// [`jit_publish_y`] shares it: the Y-window publish is the position store plus the
+/// window refresh, and is emitted through the same three-argument call sequence.
 pub(crate) type PositionHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, u32, u32);
+
+/// The `jit_refresh_y` helper's native signature (the block ABI only); it returns
+/// nothing — re-publishing the frame's Y window cannot fail.
+pub(crate) type RefreshHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>);
 
 /// The byte offset of [`JitRuntime::machine`] — the field the helper scaffolding is
 /// handed; generated code reads [`JitRuntime::x_regs`] instead.
 pub(crate) const RUNTIME_MACHINE_DISP: i32 = 0;
 
-/// The byte offset of [`JitRuntime::x_regs`] (the base of `machine.x`) — the **only**
+/// The byte offset of [`JitRuntime::x_regs`] (the base of `machine.x`) — the first
 /// field generated code loads indirectly. It is the second `#[repr(C)]` pointer
 /// field, hence one pointer width past `machine`.
 pub(crate) const RUNTIME_XREGS_DISP: i32 =
     RUNTIME_MACHINE_DISP + mem::size_of::<*const u8>() as i32;
+
+/// The byte offset of [`JitRuntime::y_base`] (the base of the current frame's first Y
+/// slot) — a field generated code loads indirectly for a Y-operand or Y-destination
+/// arithmetic fast path.
+pub(crate) const RUNTIME_YBASE_DISP: i32 = RUNTIME_XREGS_DISP + mem::size_of::<*const u8>() as i32;
+
+/// The byte offset of [`JitRuntime::y_end`] (one past the current frame's last Y slot)
+/// — the bound the emitted Y-window guard compares a Y slot's address against.
+pub(crate) const RUNTIME_YEND_DISP: i32 = RUNTIME_YBASE_DISP + mem::size_of::<*const u8>() as i32;
 
 // ---------------------------------------------------------------------------
 // The helper
@@ -617,6 +699,58 @@ pub(crate) extern "C" fn jit_set_position(rt: *mut JitRuntime<'_>, func: u32, pc
     // `Machine`.
     let machine = unsafe { &mut *runtime.machine };
     machine.set_current_code(func, pc);
+}
+
+/// The **Y-window publish** helper: re-publish the current frame's Y window *and*
+/// record the block's entry position, in one call.
+///
+/// It is [`jit_set_position`] plus [`JitRuntime::refresh_y_base`], and a block **whose
+/// body accesses a Y slot** calls it from its prologue *in place of* the position store
+/// — so such a block pays no extra call for publishing its window, and a block that
+/// never touches a Y slot keeps emitting the plain position store (it pays nothing).
+///
+/// The prologue is the cheapest sound publish point: **every** native entry runs one —
+/// a fresh driver entry, a linked branch, a linked tail call and a continuation
+/// sub-block all start at a block prologue — so publishing here covers a frame a helper
+/// moved before the block was entered (an `allocate`'s `push_frame`, a `deallocate`'s
+/// pop, or the `Vec` reallocation a push may cause), without a per-round-trip refresh in
+/// the driver. The one in-block state change the prologue does not cover is a helper
+/// call the block then continues past; the emitter covers it with a refresh
+/// ([`jit_refresh_y`]) gated to a block that still accesses a Y slot after that point.
+///
+/// Infallible, and it clobbers only caller-saved registers, so it is emitted before the
+/// prologue loads the cached x-registers (exactly like [`jit_set_position`]).
+pub(crate) extern "C" fn jit_publish_y(rt: *mut JitRuntime<'_>, func: u32, pc: u32) {
+    // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
+    // `JitRuntime` and never aliases it for the duration of the call; `runtime.machine`
+    // points at the driver's live `Machine`, and no other `&mut Machine` exists while
+    // the helper runs (the driver is blocked in the block call that reached us).
+    let runtime = unsafe { &mut *rt };
+    runtime.refresh_y_base();
+    // SAFETY: see above — `runtime.machine` is a non-null pointer to the driver's live
+    // `Machine`; the `&mut JitRuntime` above is dead by now, so borrowing through the
+    // field does not alias it.
+    let machine = unsafe { &mut *runtime.machine };
+    machine.set_current_code(func, pc);
+}
+
+/// The **Y-window refresh** helper: re-publish the current frame's Y window after an
+/// in-block helper call, so the next Y access in the block compares against the live
+/// frame.
+///
+/// A block emits this on the *continue* arm of an in-block helper call only when a later
+/// instruction of the block still accesses a Y slot (the emitter's gated refresh): the
+/// helper ran one instruction in the interpreter, which may have pushed a frame,
+/// `trim`med one, or **reallocated** `machine.stack` — any of which moves or frees the
+/// window the block published in its prologue. When no later instruction accesses a Y
+/// slot the call is not emitted at all, and when the block leaves to the driver the
+/// next block's prologue publishes instead (so a driver round-trip never refreshes).
+pub(crate) extern "C" fn jit_refresh_y(rt: *mut JitRuntime<'_>) {
+    // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
+    // `JitRuntime` and never aliases it for the duration of the call (the driver is
+    // blocked in the block call that reached us).
+    let runtime = unsafe { &mut *rt };
+    runtime.refresh_y_base();
 }
 
 /// The **local tail-call** helper: pop the current frame with the interpreter's

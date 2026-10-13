@@ -879,6 +879,8 @@ fn drive(
         ctx: ctx_ptr,
         error: None,
         enter: None,
+        y_base: std::ptr::null_mut(),
+        y_end: std::ptr::null_mut(),
     };
 
     loop {
