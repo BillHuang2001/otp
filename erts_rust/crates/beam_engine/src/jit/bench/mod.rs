@@ -30,14 +30,18 @@
 //! [`run_measurement_table`] (the `#[ignore]`d table). Keeping the harness here is what
 //! stops the unit-test and integration-test halves from growing a copy each.
 //!
-//! Ten workloads, split by lowering story:
+//! Eleven workloads, split by lowering story:
 //!
 //! * The shapes the baseline tier **deopts** (every instruction is a `jit_step_one`
 //!   helper round-trip on a native tier) — **`build/0`** (`put_tuple2`/`put_list`),
 //!   **`map/2`** (`has_map_fields`/`get_map_elements`/`put_map_assoc`), **`select/1`**
 //!   (a body dominated by `select_val`, deliberately mixing the inlined immediate shape
-//!   with the deopted register shape) and **`walk/2`** (a hot tail-recursive cons-list
-//!   walk: an `is_nonempty_list` guard + `get_list` + a small-int `'+'/2` + `call_only`).
+//!   with the deopted register shape), **`walk/2`** (a hot tail-recursive cons-list
+//!   walk: an `is_nonempty_list` guard + `get_list` + a small-int `'+'/2` + `call_only`)
+//!   and **`sum/1`** (the **non**-tail-recursive cons-list sum: the caller's frame — and
+//!   therefore a Y slot holding the head — stays live across the recursive call, so the
+//!   `gc_bif '+'/2` reads a Y operand and the tier's inlined small-int fast path refuses
+//!   it and deopts).
 //! * The shapes the tier **inlines** ([`inlined`]) — **`slice:fib/1`** (a real `.beam`
 //!   fixture), **`kernel/2`**, **`wide/2`**, **`aggr/2`** and **`cmp/2`**.
 //! * **`cross/2`** ([`workloads::workloads`]) — a two-module `ping/2` ⇄ `pong/2`

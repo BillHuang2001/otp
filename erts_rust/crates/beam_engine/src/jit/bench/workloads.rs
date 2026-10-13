@@ -18,17 +18,19 @@
 //
 // %CopyrightEnd%
 
-//! The workload **type** and the four shapes the baseline tier does **not** inline.
+//! The workload **type** and the five shapes the baseline tier does **not** inline.
 //!
 //! Each workload is a [`Workload`] — a [`Module`] assembled with the loader's own block
 //! decomposition ([`beam_loader::lower::build_blocks`]), an exported `function/arity`,
 //! how to obtain the call arguments, and a value check that pins the result the body is
 //! *supposed* to compute (so a tier that "agrees" on a wrong answer still fails).
 //!
-//! This file owns the four shapes whose lowering story is "every instruction is a
+//! This file owns the five shapes whose lowering story is "every instruction is a
 //! `jit_step_one` helper round-trip on a native tier": `build/0`
-//! (`put_tuple2`/`put_list`), `map/2` (the map family), `select/1` (`select_val`) and
-//! `walk/2` (a tail-recursive cons-list walk), plus the two-module `cross/2` shape,
+//! (`put_tuple2`/`put_list`), `map/2` (the map family), `select/1` (`select_val`),
+//! `walk/2` (a tail-recursive cons-list walk) and `sum/1` (the **non**-tail-recursive
+//! list sum, whose live Y slot forces its `gc_bif '+'/2` off the tier's inlined
+//! small-int fast path), plus the two-module `cross/2` shape,
 //! whose transfer is neither: its `call_ext_last` deopts, but the *driver* then lands
 //! the call cross-module. The shapes the tier *inlines* are in [`super::inlined`],
 //! and [`workloads`] is the concatenation of all three.
@@ -49,7 +51,7 @@ use beam_term::{make_atom, make_small, Atom, Eterm, NIL};
 use crate::context::{BifHook, MinimalContext};
 use crate::terms;
 
-use super::checks::{verify_build, verify_cross, verify_map, verify_select, verify_walk};
+use super::checks::{verify_build, verify_cross, verify_map, verify_select, verify_sum, verify_walk};
 use super::support::{arith_hook, Fixture};
 
 // ---------------------------------------------------------------------------
@@ -68,6 +70,15 @@ pub(super) const SELECT_ROUNDS: usize = 32;
 
 /// The number of cons cells in the list the walk workload traverses.
 pub(super) const WALK_LENGTH: usize = 64;
+
+/// The number of cons cells in the list a `sum/1` run consumes.
+///
+/// Cell `i` (1-based) holds the small integer `i`, so the sum is the triangular number
+/// `SUM_LENGTH * (SUM_LENGTH + 1) / 2` — a figure a wrong length, a wrong cell value,
+/// or a head the recursion failed to keep alive in its Y slot cannot produce. It is
+/// deliberately the same magnitude as [`WALK_LENGTH`], so the two list walks are
+/// comparable.
+pub(super) const SUM_LENGTH: usize = 64;
 
 /// The number of cross-module `call_ext_last` transfers one `cross/2` run performs.
 ///
@@ -276,8 +287,8 @@ impl Workload {
     }
 }
 /// Every workload the tier table measures: the shapes the baseline tier **deopts**
-/// ([`build_workload`]/[`map_workload`]/[`select_workload`]/[`walk_workload`]) followed
-/// by the shapes it **inlines** (`super::inlined`) and the cross-module transfer
+/// ([`build_workload`]/[`map_workload`]/[`select_workload`]/[`walk_workload`]/[`sum_workload`])
+/// followed by the shapes it **inlines** (`super::inlined`) and the cross-module transfer
 /// ([`cross_workload`]).
 pub(super) fn workloads() -> Vec<Workload> {
     let mut all = vec![
@@ -285,6 +296,7 @@ pub(super) fn workloads() -> Vec<Workload> {
         map_workload(),
         select_workload(),
         walk_workload(),
+        sum_workload(),
     ];
     all.extend(super::inlined::inlined_workloads());
     all.push(cross_workload());
@@ -573,6 +585,108 @@ fn walk_workload() -> Workload {
     }
 }
 
+/// `sum/1` — the **non-tail-recursive** cons-list sum, i.e. the compiled lowering of
+///
+/// ```text
+///   sum([])     -> 0;
+///   sum([H|T])  -> H + sum(T).
+/// ```
+///
+/// ```text
+///   test is_nonempty_list Fail base [x0]   ; a `test` jumps on FAILURE, so this
+///                                          ; branches to `base` exactly when x0 is []
+///   get_list x0 x1 x0                      ; x1 = head, x0 = tail
+///   allocate 2 2                           ; the frame this call needs (2 Y slots)
+///   move x1 y0                             ; the head survives the recursion in Y(0)
+///   call 1 entry                           ; NON-tail: the continuation is saved in the frame
+///   y1 = y0 + x0                           ; gc_bif '+'/2 — DEOPTED (a Y operand)
+///   move y1 x0
+///   deallocate 2
+///   return
+/// base:
+///   x0 = 0
+///   return
+/// ```
+///
+/// Where `walk/2` recurses **tail** (so its `'+'` is over two cached x-registers and the
+/// tier inlines it natively), this one genuinely needs the caller's frame across the
+/// recursive call — which is exactly the shape `src/jit/baseline/emit/arith.rs`'s
+/// `loadable()` refuses: a `gc_bif '+'/2` whose operand is an `Operand::Y(k)` is not a
+/// small-int fast-path candidate, so the **whole instruction** deopts to one
+/// `jit_step_one` interpreter step. That is the gap this workload exists to measure (the
+/// `sum/1` figure is the BEFORE baseline for closing it). The list
+/// `[1, 2, …, SUM_LENGTH]` is built once per measurement in the run's own context by
+/// [`sum_args`].
+///
+/// The `gc_bif` writes its result to a Y slot as well (`{y,1}`), a second reason the
+/// fast path refuses the instruction; the interpreter accepts both the Y operand and the
+/// Y destination, so the tier agreement check pins the exact triangular sum.
+fn sum_workload() -> Workload {
+    let fixture = Fixture::with_plus("jit_bench_sum");
+    let entry = Label(1);
+    let base = Label(3);
+    let code = vec![
+        Instr::Label(entry),
+        Instr::Test {
+            kind: TestKind::IsNonemptyList,
+            fail: base,
+            args: vec![Operand::X(0)],
+        },
+        Instr::GetList {
+            source: Operand::X(0),
+            head: Operand::X(1),
+            tail: Operand::X(0),
+        },
+        Instr::Allocate {
+            stack_need: HeapNeed::Words(2),
+            live: 2,
+        },
+        Instr::Move {
+            src: Operand::X(1),
+            dst: Operand::Y(0),
+        },
+        Instr::Call {
+            arity: 1,
+            target: entry,
+        },
+        // `y1 = y0 + x0` — the Y operand (and the Y destination) put this `gc_bif`
+        // outside the tier's inlined small-int fast path.
+        Instr::GcBif {
+            arity: 2,
+            bif: ImportRef(0),
+            fail: NO_FAIL,
+            live: 1,
+            args: vec![Operand::Y(0), Operand::X(0)],
+            dst: Operand::Y(1),
+        },
+        Instr::Move {
+            src: Operand::Y(1),
+            dst: Operand::X(0),
+        },
+        Instr::Deallocate(2),
+        Instr::Return,
+        Instr::Label(base),
+        Instr::Move {
+            src: Operand::Integer(0),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+
+    let (module, function) = fixture.finish("sum", 1, code);
+    Workload {
+        label: format!(
+            "sum/1 (non-tail-recursive list sum + a Y-operand '+'/2 over {SUM_LENGTH} cells)"
+        ),
+        module,
+        function,
+        arity: 1,
+        args: Args::InContext(sum_args),
+        verify: verify_sum,
+        cross: None,
+    }
+}
+
 /// `cross/2` — [`CROSS_STEPS`] cross-module `call_ext_last` transfers between **two**
 /// modules, a `ping/2` ⇄ `pong/2` ping-pong.
 ///
@@ -726,4 +840,56 @@ fn walk_args(ctx: &mut MinimalContext) -> Result<Vec<Eterm>> {
         list = terms::make_cons(ctx, make_small(1), list)?;
     }
     Ok(vec![list, make_small(0)])
+}
+
+/// The `sum/1` argument: the `[1, 2, …, SUM_LENGTH]` list, built in `ctx`.
+///
+/// The cells are prepended from the tail, so cell `i` holds `i` (1-based); distinct cell
+/// values mean the pinned triangular sum is only reproduced if every head is carried
+/// across the recursive call correctly.
+fn sum_args(ctx: &mut MinimalContext) -> Result<Vec<Eterm>> {
+    let mut list = NIL;
+    for value in (1..=SUM_LENGTH as i64).rev() {
+        list = terms::make_cons(ctx, make_small(value), list)?;
+    }
+    Ok(vec![list])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `sum/1` workload exists to measure exactly one gap: a `gc_bif '+'/2` whose
+    /// operand is an `Operand::Y(k)`, which the baseline tier's small-int fast path
+    /// refuses (`src/jit/baseline/emit/arith.rs::loadable`), so the whole instruction
+    /// deopts to one interpreter step. Drop that Y operand and the workload would keep
+    /// passing the tier-agreement check while silently measuring nothing, so the shape is
+    /// pinned here. The Y **destination** is the second half of the same refusal.
+    #[test]
+    fn the_sum_workload_keeps_its_y_slot_operand_and_destination() {
+        let workload = sum_workload();
+        let mut y_operands = 0;
+        let mut y_destinations = 0;
+        for function in &workload.module.functions {
+            for instr in &function.code {
+                let Instr::GcBif { args, dst, .. } = instr else {
+                    continue;
+                };
+                if args.iter().any(|operand| matches!(operand, Operand::Y(_))) {
+                    y_operands += 1;
+                }
+                if matches!(dst, Operand::Y(_)) {
+                    y_destinations += 1;
+                }
+            }
+        }
+        assert_eq!(
+            y_operands, 1,
+            "sum/1 must keep exactly one `gc_bif` with a Y-slot operand"
+        );
+        assert_eq!(
+            y_destinations, 1,
+            "sum/1 must keep exactly one `gc_bif` writing to a Y slot"
+        );
+    }
 }
