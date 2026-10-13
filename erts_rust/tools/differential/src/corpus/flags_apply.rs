@@ -205,6 +205,75 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // --- the same *application* rule for the other merge sources and emulator flags -------
+        // These widen the family above: `ERL_ZFLAGS` is the **last** merge source, so a switch
+        // it carries must still be applied (`+S` → `schedulers`, `+A` → `thread_pool_size`);
+        // `ERL_AFLAGS`'s `+Q` goes through the same round-up-to-a-power-of-two sizing as the
+        // command-line flag; and `+hmax` -- which has no `system_info/1` observable at all --
+        // is pinned by acceptance exactly as its command-line form is in `super::flags`.
+        Case {
+            id: "flags_apply/erl_zflags_plus_s_sets_schedulers",
+            description: "an ERL_ZFLAGS-carried +S N is applied to the scheduler count",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::EvalEnv {
+                expr: "erlang:system_info(schedulers)",
+                extra_argv: &[],
+                env: &[("ERL_ZFLAGS", "+S 3")],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 3"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags_apply/erl_zflags_plus_a_sets_thread_pool_size",
+            description: "an ERL_ZFLAGS-carried +A N is applied to the async thread pool size",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::EvalEnv {
+                expr: "erlang:system_info(thread_pool_size)",
+                extra_argv: &[],
+                env: &[("ERL_ZFLAGS", "+A 3")],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 3"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags_apply/erl_aflags_plus_q_rounds_a_request_up",
+            description: "an ERL_AFLAGS-carried +Q 2000 is rounded up to the 2048-port table",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::EvalEnv {
+                expr: "erlang:system_info(port_limit)",
+                extra_argv: &[],
+                env: &[("ERL_AFLAGS", "+Q 2000")],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 2048"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags_apply/erl_flags_plus_hmax_bounded_allocation",
+            description: "an ERL_FLAGS-carried +hmax cap is applied and a bounded allocation still succeeds",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::EvalEnv {
+                // The `+hmax` family has no `init`/`system_info` observable, so -- exactly as
+                // for its command-line form -- the pinned observable is that a tiny, strictly
+                // bounded allocation still returns the same value.
+                expr: "length(lists:seq(1,1000))",
+                extra_argv: &[],
+                env: &[("ERL_FLAGS", "+hmax 1048576")],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 1000"),
+                exit_code: 0,
+            },
+        },
     ]
 }
 
@@ -276,5 +345,53 @@ mod tests {
                 case.id
             );
         }
+    }
+
+    /// The widened application family: `ERL_ZFLAGS` is applied like every other merge source,
+    /// `ERL_AFLAGS`'s `+Q` is sized through the same port-table rule, and an `ERL_FLAGS`-carried
+    /// `+hmax` cap is pinned by acceptance. Every golden is the oracle's own output.
+    #[test]
+    fn the_widened_family_pins_each_merge_source_and_emulator_flag() {
+        let find = |id: &str| group().into_iter().find(|c| c.id == id).expect("case");
+        for (id, expr, env, golden) in [
+            (
+                "flags_apply/erl_zflags_plus_s_sets_schedulers",
+                "erlang:system_info(schedulers)",
+                &[("ERL_ZFLAGS", "+S 3")][..],
+                "ok 3",
+            ),
+            (
+                "flags_apply/erl_zflags_plus_a_sets_thread_pool_size",
+                "erlang:system_info(thread_pool_size)",
+                &[("ERL_ZFLAGS", "+A 3")][..],
+                "ok 3",
+            ),
+            (
+                "flags_apply/erl_aflags_plus_q_rounds_a_request_up",
+                "erlang:system_info(port_limit)",
+                &[("ERL_AFLAGS", "+Q 2000")][..],
+                "ok 2048",
+            ),
+            (
+                "flags_apply/erl_flags_plus_hmax_bounded_allocation",
+                "length(lists:seq(1,1000))",
+                &[("ERL_FLAGS", "+hmax 1048576")][..],
+                "ok 1000",
+            ),
+        ] {
+            let case = find(id);
+            assert_eq!(case.env(), env, "case {id}: the environment is the only source");
+            assert_eq!(case.expr(), Some(expr), "case {id}");
+            assert_eq!(case.golden.stdout, Some(golden), "case {id}");
+            assert!(
+                case.extra_argv().is_empty(),
+                "case {id}: the switch must reach the argv through the environment only"
+            );
+        }
+        // The `+hmax` acceptance case is the one non-`system_info` observable of the family.
+        assert_eq!(
+            find("flags_apply/erl_flags_plus_hmax_bounded_allocation").expr(),
+            Some("length(lists:seq(1,1000))")
+        );
     }
 }

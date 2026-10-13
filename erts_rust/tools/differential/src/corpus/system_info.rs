@@ -572,5 +572,199 @@ pub(crate) fn group() -> Vec<Case> {
             "element(1, erlang:process_info(self(), status))",
             "ok status",
         ),
+        // --- the scheduler / thread introspection keys ($+S / +A observables) ---------------
+        // `scheduler_id/0` (the calling scheduler), the dirty-scheduler counts and the
+        // async-thread pool size are all per-VM figures, so only their *type* (or a
+        // documented relation) is pinned; `schedulers_online =< schedulers` is the canonical
+        // value-invariant relation for the pair. Every golden is the oracle's own output.
+        case(
+            "system_info/scheduler_id_is_integer",
+            "system_info(scheduler_id) is an integer (the calling scheduler is per-VM)",
+            "is_integer(erlang:system_info(scheduler_id))",
+            "ok true",
+        ),
+        case(
+            "system_info/dirty_cpu_schedulers_is_integer",
+            "system_info(dirty_cpu_schedulers) is an integer count",
+            "is_integer(erlang:system_info(dirty_cpu_schedulers))",
+            "ok true",
+        ),
+        case(
+            "system_info/dirty_io_schedulers_is_integer",
+            "system_info(dirty_io_schedulers) is an integer count",
+            "is_integer(erlang:system_info(dirty_io_schedulers))",
+            "ok true",
+        ),
+        case(
+            "system_info/schedulers_online_at_most_schedulers",
+            "system_info(schedulers_online) never exceeds system_info(schedulers)",
+            "erlang:system_info(schedulers_online) =< erlang:system_info(schedulers)",
+            "ok true",
+        ),
+        case(
+            "system_info/thread_pool_size_is_integer",
+            "system_info(thread_pool_size) is an integer count",
+            "is_integer(erlang:system_info(thread_pool_size))",
+            "ok true",
+        ),
+        case(
+            "system_info/garbage_collection_is_a_proplist",
+            "system_info(garbage_collection) is the documented per-level proplist",
+            "is_list(erlang:system_info(garbage_collection))",
+            "ok true",
+        ),
+        Case {
+            id: "system_info/unknown_nonatom_key_is_badarg",
+            description: "erlang:system_info/1 with a non-atom key (not just an unknown atom) is error:badarg",
+            contracts: &[Contract::Introspection],
+            kind: CaseKind::Eval {
+                expr: "erlang:system_info(42)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("exception error badarg"),
+                exit_code: 1,
+            },
+        },
+        case(
+            "system_info/memory_selected_keys_keep_the_requested_order",
+            "erlang:memory/1 with a three-key request keeps that order (values are volatile)",
+            "[K || {K,_} <- erlang:memory([total,processes,atom])]",
+            "ok [total,processes,atom]",
+        ),
+        case(
+            "system_info/process_info_min_heap_size_is_tagged",
+            "process_info(self(), min_heap_size) is tagged by its own key",
+            "element(1, erlang:process_info(self(), min_heap_size))",
+            "ok min_heap_size",
+        ),
+        Case {
+            id: "system_info/process_info_unknown_item_is_badarg",
+            description: "erlang:process_info/2 with an unknown item raises error:badarg",
+            contracts: &[Contract::Introspection],
+            kind: CaseKind::Eval {
+                expr: "erlang:process_info(self(), no_such_item)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("exception error badarg"),
+                exit_code: 1,
+            },
+        },
+        // --- the `seq_trace` token surface: the setter's *return* value is the observable ---
+        case(
+            "system_info/seq_trace_set_token_serial_returns_previous",
+            "seq_trace:set_token(serial, _) returns the previous serial token",
+            "seq_trace:set_token(serial, {0,1})",
+            "ok {0,0}",
+        ),
+        case(
+            "system_info/seq_trace_set_token_print_flag_returns_previous",
+            "seq_trace:set_token(print, true) returns the previous print flag",
+            "seq_trace:set_token(print, true)",
+            "ok false",
+        ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    //! Invariants of the A.8 introspection group: every case is a `value` eval case claiming
+    //! the introspection contract, and no case ever pins a per-VM figure exactly — each
+    //! volatile value is either a *type* assertion, a documented relation, or a build
+    //! constant of the frozen target.
+    use super::group;
+    use crate::corpus::{CaseKind, Contract, Probe};
+
+    #[test]
+    fn every_case_is_an_introspection_value_probe() {
+        for case in group() {
+            assert_eq!(case.contracts, &[Contract::Introspection], "case {}", case.id);
+            assert!(
+                case.id.starts_with("system_info/"),
+                "case {} is outside the system_info group",
+                case.id
+            );
+            assert!(!case.description.is_empty(), "case {}", case.id);
+            let CaseKind::Eval {
+                expr,
+                extra_argv,
+                probe,
+            } = case.kind
+            else {
+                panic!("case {}: an A.8 case must be an eval case", case.id);
+            };
+            assert_eq!(probe, Probe::Value, "case {}", case.id);
+            assert!(extra_argv.is_empty(), "case {}", case.id);
+            assert!(
+                !expr.is_empty() && !expr.contains('\n'),
+                "case {}: a one-line expression",
+                case.id
+            );
+            assert!(
+                case.golden.stdout.is_some_and(|s| !s.is_empty()),
+                "case {}: empty golden",
+                case.id
+            );
+        }
+    }
+
+    /// The widened scheduler / memory / `process_info` / `seq_trace` block: each case pins
+    /// either a type, a documented relation, or a tagged key — never a volatile figure.
+    #[test]
+    fn the_widened_block_pins_types_relations_and_tags() {
+        let golden = |id: &str| {
+            group()
+                .into_iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("no case {id}"))
+                .golden
+                .stdout
+                .expect("a golden")
+        };
+        for id in [
+            "system_info/scheduler_id_is_integer",
+            "system_info/dirty_cpu_schedulers_is_integer",
+            "system_info/dirty_io_schedulers_is_integer",
+            "system_info/schedulers_online_at_most_schedulers",
+            "system_info/thread_pool_size_is_integer",
+            "system_info/garbage_collection_is_a_proplist",
+        ] {
+            assert_eq!(golden(id), "ok true", "case {id}");
+        }
+        assert_eq!(
+            golden("system_info/memory_selected_keys_keep_the_requested_order"),
+            "ok [total,processes,atom]"
+        );
+        assert_eq!(
+            golden("system_info/process_info_min_heap_size_is_tagged"),
+            "ok min_heap_size"
+        );
+        // The `seq_trace` setters answer the *previous* token, so the goldens are the
+        // documented defaults (`{0,0}` / `false`).
+        assert_eq!(
+            golden("system_info/seq_trace_set_token_serial_returns_previous"),
+            "ok {0,0}"
+        );
+        assert_eq!(
+            golden("system_info/seq_trace_set_token_print_flag_returns_previous"),
+            "ok false"
+        );
+        // Both `badarg` cases observe the reason through the probe wrapper (exit 1), never a
+        // stack trace: a non-atom `system_info` key and an unknown `process_info` item.
+        for (id, expr) in [
+            ("system_info/unknown_nonatom_key_is_badarg", "erlang:system_info(42)"),
+            (
+                "system_info/process_info_unknown_item_is_badarg",
+                "erlang:process_info(self(), no_such_item)",
+            ),
+        ] {
+            let case = group().into_iter().find(|c| c.id == id).expect("registered");
+            assert_eq!(case.golden.stdout, Some("exception error badarg"), "case {id}");
+            assert_eq!(case.golden.exit_code, 1, "case {id}");
+            assert_eq!(case.expr(), Some(expr), "case {id}");
+        }
+    }
 }
