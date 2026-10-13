@@ -10,8 +10,9 @@ per-function unit: its own `CodeBuffer`, a map covering only that function); `re
 cached x-registers; `operands.rs` reads operand shapes;
 `r#move.rs`/`test.rs`/`select.rs`/`arith.rs`/`compare.rs`/`aggregate.rs` each lower one instruction
 group; `link.rs` owns the direct block-to-block jump and the linked local tail call.
-The driver, block ABI and the three helpers (`jit_step_one`, `jit_ext_call`, `jit_tail_call`) live one
-level up in `../mod.rs` / `../runtime.rs`; this node only *emits calls* to them.
+The driver, block ABI and the helpers (`jit_step_one`, `jit_ext_call`, `jit_tail_call`,
+`jit_publish_y`, `jit_refresh_y`) live one level up in `../mod.rs` / `../runtime.rs`; this node only
+*emits calls* to them.
 
 ## Core model (do not break)
 - **Only `CACHE_REGISTERS.len()` = 5 x-registers are held in machine registers** (`r12`-`r15` + `rbp`,
@@ -37,14 +38,14 @@ group's `try_inline_*`; **`Ok(false)` means "lowered nothing"** and the arm then
 | Group | Instr(s) | Lowering entry | Shape/guard predicate |
 |---|---|---|---|
 | Metadata no-ops | `Label`,`Line`,`IntCodeEnd`,`ExecutableLine`,`DebugLine` | `mod.rs` empty arm (no bytes) | n/a |
-| Move / swap | `Move`, `Swap` | `r#move.rs::try_inline_move`, `::try_inline_swap` | dst must be in-bound `X(n)` |
+| Move / swap | `Move`, `Swap` | `r#move.rs::try_inline_move`, `::try_inline_swap` | dst must be in-bound `X(n)` (a `Y` destination is **not** a lowered shape — the move deopts) |
 | Test (word + boxed header) | `Test` | `test.rs::try_inline_test` | `test.rs::test_plan` |
 | Switch | `SelectVal` | `select.rs::try_inline_select_val` | `select.rs::select_val_plan` |
 | Arity switch | `SelectTupleArity` | `aggregate.rs::try_inline_select_tuple_arity` | `aggregate.rs::select_tuple_arity_plan` |
 | Cons readers | `GetList`,`GetHd`,`GetTl` | `aggregate.rs::try_inline_get_{list,hd,tl}` via `emit_list_read` | `get_{list,hd,tl}_shape` -> `shape` |
 | Tuple read | `GetTupleElement` | `aggregate.rs::try_inline_get_tuple_element` via `emit_tuple_read` | `get_tuple_element_shape` |
 | Tuple write | `SetTupleElement` | `aggregate.rs::try_inline_set_tuple_element` via `emit_tuple_write` | `set_tuple_element_shape` |
-| Arithmetic gc_bif | `GcBif` (`+`/`-`/`*`) | `arith.rs::try_inline_gc_bif` | `arith.rs::fast_arith` |
+| Arithmetic gc_bif | `GcBif` (`+`/`-`/`*`) | `arith.rs::try_inline_gc_bif` | `arith.rs::fast_arith` (x-register **or Y-slot** operand/destination; a Y access carries a run-time frame-window guard) |
 | Comparisons | `Bif` (and `GcBif` fallback) | `compare.rs::try_inline_comparison` | `compare.rs::comparison_shape` |
 | Jump | `Jump` | `link.rs::Linker::emit_exit` | resolved label **in the block map** -> linked; otherwise return-to-driver (the target's function is compiled on entry) |
 | Local tail call | `CallLast` | `link.rs::Linker::emit_tail_exit` | `Linker::is_compiled` |
@@ -57,10 +58,13 @@ Note `GcBif` tries arith **then** comparison; `Bif` tries only comparison
 
 ## Restricted shapes (where each is enforced)
 - **Operand readers** (`operands.rs`): `x_register` accepts only `X(n)` / `Typed{reg:X(n)}` (a `Y`
-  reg, float reg or literal -> `None`); `constant_word` accepts only `Integer`/`Character`
+  reg, float reg or literal -> `None`); `y_register` is its Y twin (a purely syntactic `Y(n)` /
+  `Typed{reg:Y(n)}` read — the caller decides addressability via `y_addressable`); `y_offset` is the
+  `lea [y_base + k*8]` displacement. `constant_word` accepts only `Integer`/`Character`
   (small, via `small_word`) and `Atom`/`Nil` — a bignum constant, a float or a literal -> `None`.
   `MAX_REGISTER` is enforced per lowering (a register past it must deopt so the interpreter reports
-  the faithful `bad_register`).
+  the faithful `bad_register`); `y_addressable` refuses a Y index whose `disp32` would overflow
+  (`k <= i32::MAX / size_of::<Eterm>()`), so the arith fast path deopts at **compile** time.
 - **`test`** (`test.rs` section comment): word tests `is_nil`/`is_atom`/`is_list`/`is_nonempty_list`
   and `is_boolean` (only when the module interned `true`/`false`); the **boxed-term header tests**
   `is_integer`/`is_number`/`is_float`/`is_tuple`/`is_map`/`is_bitstring`/`is_binary`/`is_function`/
@@ -88,8 +92,13 @@ Note `GcBif` tries arith **then** comparison; `Bif` tries only comparison
   module constants would corrupt them), so the emitted guard rejects that bit too, branching to the
   helper. The store writes the word `8*(1+offset)` past the header — the exact word
   `get_tuple_element` reads — straight through scratch (no write barrier, no cached-register clobber).
-- **arith** (`arith.rs::fast_arith`): only `erlang` `+`/`-`/`*` at arity 2, `args.len() == 2`, in-bound
-  x destination, every operand loadable (in-bound x or small-int constant).
+- **arith** (`arith.rs::fast_arith`): only `erlang` `+`/`-`/`*` at arity 2, `args.len() == 2`; the
+  destination is an in-bound x-register (`FastDest::X`) **or an addressable Y slot** (`FastDest::Y`),
+  and every operand is loadable — an in-bound x-register, an **addressable Y slot** (`FastSource::YSlot`)
+  or a small-int constant. Every Y access emits a **run-time** frame-window guard (a pure rejection to
+  `jit_step_one`); an un-addressable Y index (`operands.rs::y_addressable`) is refused at compile time.
+  `FastArith::uses_y` is the emitter's Y-window gate and `FastArith::registers` pushes only x-register
+  operands plus an x-register destination, so a Y slot never enters the usage counts.
 - **compare** (`compare.rs::comparison_shape`): only the eight `erlang` comparison ops at arity 2; both
   operands must be `cmp_operand`; a derivable guard; and the module must have both `true` and `false`
   interned (else the whole instruction deopts — a wrong atom is never fabricated). `Fail` is
@@ -102,8 +111,9 @@ Note `GcBif` tries arith **then** comparison; `Bif` tries only comparison
 2. **Run-time guard rejection**: an inlined sequence that passed the shape test but whose *runtime* guard
    fails branches to a local `fallback` label that runs `emit_step_and_continue` and then falls through
    to the rest of the block (`fast_done`). Present in `arith.rs`, `compare.rs`, `test.rs`,
-   `aggregate.rs` (`emit_list_read`/`emit_tuple_read`/`try_inline_select_tuple_arity`). `select_val` has
-   no fallback (all-immediate alternatives are total).
+   `aggregate.rs` (`emit_list_read`/`emit_tuple_read`/`try_inline_select_tuple_arity`), and the arith fast
+   path's Y access (`arith.rs::emit_y_load`/`emit_y_store`, whose frame-window guard is the same pure
+   rejection). `select_val` has no fallback (all-immediate alternatives are total).
 `emit_step_and_continue` (`mod.rs`) = one `jit_step_one` call + `emit_continue_check`: `rax` is compared
 against `encode_target(func, pc+1)`; equal -> `fill` and fall through natively at `pc+1`; any other word
 (`Goto`/`HALT`/`ERROR`/`ENTER`/`Wait`) -> `jmp done`, the shared epilogue, which `ret`s to the driver with
@@ -120,9 +130,11 @@ block map, so the driver compiles the target's function on entry — or takes on
 
 ## Spill/fill discipline
 - Prologue (`mod.rs::emit_block`): push `SAVED_REGISTERS` (6 callee-saved regs), reserve the 24-byte `rt`
-  slot, `rbx = rt->x_regs`, call `jit_set_position(rt, func, block_start_pc)` (the block-entry position
-  store — emitted before the cached loads, because `rbx` is callee-saved and no cached register may sit in
-  caller-saved scratch across the call), then load each cached register from `machine.x`.
+  slot, `rbx = rt->x_regs`, then call `jit_set_position(rt, func, block_start_pc)` (the block-entry
+  position store — emitted before the cached loads, because `rbx` is callee-saved and no cached register
+  may sit in caller-saved scratch across the call) — or, when the block accesses a Y slot
+  (`Allocation::y_last`), `jit_publish_y(rt, func, pc)`, which does that same position store **and**
+  re-publishes the current frame's Y window in one call — then load each cached register from `machine.x`.
 - `mod.rs::spill` / `mod.rs::fill`: store/load every `(x, reg)` in `Allocation::slots`.
 - **Every helper call spills first.** `mod.rs::emit_helper_call` (used by `emit_step_and_continue` and
   `emit_ext_call`) calls `spill` before loading `rdi` from the `rt` slot, filling the ABI argument
@@ -130,6 +142,13 @@ block map, so the driver compiles the target's function on entry — or takes on
   spill after the call (the helper legitimately wrote `machine.x`) — `fill` reloads instead.
   `link.rs::emit_tail_exit` spills before `call jit_tail_call`. No emitted path in this node calls a helper
   without spilling first.
+- **Gated Y-window refresh after an in-block helper.** `emit_continue_check` (the shared continue arm of
+  `emit_step_and_continue` and `emit_ext_call`) emits `jit_refresh_y(rt)` — after `fill`, on the
+  continue-in-block path only — exactly when a later instruction of the block still accesses a Y slot
+  (`Allocation::refresh_y_after(pc)`), because the helper ran one instruction in the interpreter, which may
+  have pushed/`trim`med a frame or **reallocated** `machine.stack` and so staled the prologue's window. When
+  no later instruction accesses Y the call is not emitted at all, and a helper that leaves the block to the
+  driver pays nothing (the next block's prologue publishes).
 - `link.rs::emit_exit` and `link.rs::emit_tail_exit` spill on **both** the linked and the deopt paths.
 - The epilogue (`mod.rs`: `done` -> `emit_frame_teardown` -> `ret`) does **not** spill: every path reaching
   it has already spilled. The inline fast paths (`move`/`arith`/`compare`/`test`/`select`/`aggregate`) do
@@ -143,6 +162,12 @@ regalloc and `emit_block` agree). Counts are ranked by descending touch count, t
 index, and the top `CACHE_REGISTERS.len()` = 5 are kept (`r12`,`r13`,`r14`,`r15`,`rbp`). Physical
 assignment is by **first-appearance order** of the selected registers (deterministic), not by rank. An
 out-of-bound register is never counted. Every non-selected register is read/written directly in `machine.x`.
+
+`allocate_registers` also derives `Allocation::y_last` — the highest pc of the block whose instruction
+accesses a Y slot (`arith::uses_y`), or `None` — which is the compile-time gate for the emitter's
+prologue publish and its post-helper refresh. A `Y` slot is **not** an x-register, so it is never charged
+to the touch counts above and never raises `highest_native_register`: a stack slot must not refuse native
+entry (the driver's bound is `machine.x.len() > bound`).
 
 ## Constraints
 - `#![allow(unsafe_code)]` at the emitter entry (`mod.rs`) because it drives the encoder; nothing here
@@ -164,28 +189,32 @@ out-of-bound register is never counted. Every non-selected register is read/writ
   `.rs` (byte-exact, license scanner enforced).
 
 ## Routing Table
-- `mod.rs` -> compiled-block shape: `SAVED_REGISTERS`/`CACHE_REGISTERS`/scratch constants, `touch`/`Allocation`,
-  the two compilation entry points `compile_module` (**eager**: whole-module block map + the merged
-  whole-module summary that guards entry) and
-  `compile_function` (**lazy**: one function's own buffer/entries/summary, sharing `emit_function`),
-  `code_capacity_estimate`/`function_capacity_estimate` + size budgets, `emit_block` (the dispatch),
-  `emit_helper_call`, `emit_step_and_continue`, `emit_ext_call`, `emit_continue_check`, `spill`/`fill`.
-- `regalloc.rs` -> `allocate_registers` + `cacheable_touches`.
-- `operands.rs` -> `x_offset`, `x_register`, `constant_word`, `small_word`.
-- `r#move.rs` -> `try_inline_move`, `try_inline_swap`.
+- `mod.rs` -> compiled-block shape: `SAVED_REGISTERS`/`CACHE_REGISTERS`/scratch constants, `touch`/`Allocation`
+  (incl. `y_last`/`refresh_y_after`), the two compilation entry points `compile_module` (**eager**:
+  whole-module block map + the merged whole-module summary that guards entry, plus `emit_shared_sub_blocks`)
+  and `compile_function` (**lazy**: one function's own buffer/entries/sub_entries/summary, sharing
+  `emit_function` and running `emit_sub_blocks`), `stores_continuation`,
+  `code_capacity_estimate`/`function_capacity_estimate`/`sub_blocks_capacity_estimate` + size budgets,
+  `emit_block` (the dispatch), `emit_publish_y`/`emit_refresh_y` (the Y-window prologue publish / gated
+  post-helper refresh), `emit_helper_call`, `emit_step_and_continue`, `emit_ext_call`, `emit_continue_check`,
+  `spill`/`fill`.
+- `regalloc.rs` -> `allocate_registers` (incl. the `y_last` derivation) + `cacheable_touches`.
+- `operands.rs` -> `x_offset`, `x_register`, `y_offset`, `y_register`, `y_addressable`, `constant_word`, `small_word`.
+- `r#move.rs` -> `try_inline_move`, `try_inline_swap` (x-register destination only — a `Y` destination deopts).
 - `test.rs` -> `TestSrc`/`TestPred`/`Guard`/`TestPlan`, `test_plan`, `test_src`, `compare_shape`,
   `arith_guard`, `order_guard`, `load_test_src`, `try_inline_test` (also `TEST_A`/`TEST_T` reused by `select.rs`).
 - `select.rs` -> `SelectPlan`, `select_val_plan`, `try_inline_select_val`.
-- `arith.rs` -> `SmallArith`, `fast_arith`, `import_names`, `try_inline_gc_bif` (+ the small-int constants).
+- `arith.rs` -> `SmallArith`, `fast_arith`, `FastArith`/`FastDest`/`FastSource`, `uses_y`, `import_names`,
+  `try_inline_gc_bif`, `emit_y_load`/`emit_y_store` (+ the small-int constants).
 - `compare.rs` -> `ComparisonOp`, `comparison_shape`, `cmp_operand`, `comparison_guard`, `try_inline_comparison`.
 - `aggregate.rs` -> `ListShape`/`get_*_shape`/`emit_list_read`, `TupleReadShape`/`get_tuple_element_shape`/
   `emit_tuple_read`, `TupleWriteShape`/`TupleWriteValue`/`set_tuple_element_shape`/`emit_tuple_write`/
   `try_inline_set_tuple_element`, `AritySwitchPlan`/`select_tuple_arity_plan`/`try_inline_select_tuple_arity`,
   `emit_tuple_header_guard`.
 - `link.rs` -> `Linker` (`is_compiled`, `emit_exit`, `emit_tail_exit`), `emit_frame_teardown`, and the
-  byte-level linker unit tests (the only tests in this node).
-- `../runtime.rs` -> `jit_step_one` / `jit_tail_call` / `JitRuntime` / the `encode_target`/`encode_wait` codec
-  (the helpers these emitters call).
+  byte-level linker unit tests (alongside `test.rs`'s own unit tests).
+- `../runtime.rs` -> `jit_step_one` / `jit_tail_call` / `jit_publish_y` / `jit_refresh_y` / `JitRuntime`
+  (`y_base`/`y_end`) / the `encode_target`/`encode_wait` codec (the helpers these emitters call).
 
 ## Notes for Agents
 - Read `super::CONTEXT.md` (`../`) and the crate `CONTEXT.md` (`../../`) for the block ABI, the driver, the
@@ -197,24 +226,32 @@ out-of-bound register is never counted. Every non-selected register is read/writ
 - `baseline/tests.rs` glob-imports `emit`; `mod.rs` re-exports some items under `#[cfg(test)]` so splitting
   the emitter into files did not change item paths. Keep that in mind when renaming items used by tests.
 
-## Continuation sub-blocks (the lazy lowering)
+## Continuation sub-blocks (both layouts)
 
-`compile_function` lowers the function's **IR blocks** with `emit_function` and then its
-**continuation sub-blocks** with `emit_sub_blocks`:
+A **continuation address** is the `pc + 1` a **frame-preserving call** stores in the live frame — one of
+`Instr::Call`, a non-tail `Instr::CallExt`, `Instr::CallFun`, `Instr::CallFun2` and `Instr::Apply`
+(`stores_continuation`). The tail forms (`call_last`/`call_only`/`call_ext_only`/`call_ext_last`/
+`apply_last`) store no new continuation. The loader cuts a function into blocks only at `Instr::Label`s,
+so a continuation address usually lies **inside** an IR block, where the driver would otherwise run the
+rest of the block one interpreter-step-per-instruction. **Both** layouts lower one sub-block per such
+address, through the same `emit_block` an IR block uses (identical shape rules, guards and deopts):
 
-- `stores_continuation` names the frame-preserving calls whose `pc + 1` the driver can be
-  re-entered at once the callee returns: `Instr::Call`, `Instr::CallExt`, `Instr::CallFun`,
-  `Instr::CallFun2` and `Instr::Apply`. The tail forms (`call_last`/`call_only`/
-  `call_ext_only`/`call_ext_last`/`apply_last`) store no new continuation.
-- For each such address `p` that lies strictly inside an IR block
-  (`b.start < p < b.end`, `p < code.len()`) and is not already a compiled block start,
-  `emit_sub_blocks` lowers `[p, b.end)` with the same `emit_block` an IR block uses and
-  records the resulting native entry in `CompiledFunction::sub_entries[p]`.
-- Sub-blocks are emitted **after** all IR blocks, so the per-function buffer layout, the
-  block-entry table and the `code_map` regions are unchanged; they reserve no entry label
-  (nothing branches to a continuation address) and they are not counted as blocks.
-- `sub_blocks_capacity_estimate` adds `BLOCK_BYTES + INSTRUCTION_BYTES` per instruction of
-  each sub-block range to `function_capacity_estimate`, so the extra code cannot
-  under-allocate the `CodeBuffer`.
+- **Lazy** — `compile_function` lowers the IR blocks with `emit_function`, then the sub-blocks with
+  `emit_sub_blocks`, recording each native entry in `CompiledFunction::sub_entries[p]`.
+- **Eager** — `compile_module` lowers every IR block, then calls `emit_shared_sub_blocks` **after every**
+  IR block (so the block regions stay contiguous at the front of the shared mapping) and **before**
+  `seal`, recording each entry in `EagerLayout::sub_entries`.
 
-The eager lowering (`compile_module`) emits **no** sub-blocks.
+For each `p` that lies strictly inside an IR block (`b.start < p < b.end`, `p < code.len()`) and is not
+already a compiled block start, the pass lowers `[p, b.end)`. An address already at a block start, or at/
+past the end of the function, needs no sub-block; a second call nested inside an earlier sub-block's range
+gets its own (the code is duplicated, correctness first).
+
+Sub-blocks are emitted after all IR blocks, so the block-entry table and the `code_map` regions keep
+describing IR blocks only; they reserve no entry label (nothing branches to a continuation address), they
+start with a full block prologue, and they are not counted as blocks. `entries` is probed **first** and
+`sub_entries` second, so a real block start always wins. The lazy pass folds its register touches into the
+per-function `Summary` as a superset; the eager pass reuses the **containing IR block's** allocation and
+discards its touches, so the whole-module `Summary` is provably untouched. Both add
+`sub_blocks_capacity_estimate` (`BLOCK_BYTES + INSTRUCTION_BYTES` per instruction of each sub-block range)
+to the buffer size, so the extra code cannot under-allocate the `CodeBuffer`.
