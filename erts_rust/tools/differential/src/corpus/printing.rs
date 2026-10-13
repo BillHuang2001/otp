@@ -33,16 +33,11 @@
 //! The probes print a **flattened** rendering (`lists:flatten/1` of `io_lib:format/2`), so
 //! the compared stdout line is the exact character sequence a program would see.
 //!
-//! # `~W` of a binary is only depth-elided at depth 1
+//! # `~W` and `~P` agree at every depth
 //! `~W` is a *flat* depth renderer (`io_lib_format:control_limited/6`), not the
-//! `io_lib_pretty` one `~P` goes through — and [`crate`]'s sibling runtime
-//! (`crates/beam_bifs` `src/print.rs`) documents that its `~W` of a binary is *not*
-//! depth-elided past depth 1 (`render_binary_chunk` only handles `depth == 1`). That is a
-//! **real divergence** (the oracle prints `<<1,...>>` at depth 2, the Rust runtime
-//! `<<1,2,3>>`), so the `print/w_binary_depth_elision` case pins only the depths that
-//! agree: `~W` at depths `0`/`1` (plus a depth past the element count, which renders in
-//! full) and `~P` at every depth (its `io_lib_pretty` re-flow *does* elide). The depths
-//! `2`/`3` under `~W` are deliberately **not** pinned — see the group's tests.
+//! `io_lib_pretty` one `~P` goes through, but their **binary depth-elision agrees with the
+//! oracle at every depth** (both print `<<1,...>>` for `<<1,2,3>>` at depth 2), so no
+//! `~W`/`~P` depth divergence remains.
 
 use super::{Case, CaseKind, Contract, Golden, Probe};
 

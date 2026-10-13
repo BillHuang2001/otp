@@ -43,13 +43,6 @@
 //! Each of these produces a *plain value/reason* (not a capability-gap signal), so a case
 //! would be a `mismatch`; they are recorded here instead.
 //!
-//! * **The `nomatch` result of `binary:match/2,3`** — the oracle prints `nomatch` while the
-//!   Rust runtime fails the whole evaluation with `beam_rt: term not found` (empty stdout,
-//!   exit `1`): the `nomatch` atom is not interned on the `binary:match` bridge. It is not
-//!   specific to the compiled path — the raw-subject form fails identically — and the bare
-//!   atom `nomatch` evaluates fine, so the gap is in the BIF's result construction.
-//!   `binary:matches/2` (empty list) and `binary:split/2,3` (subject unchanged) *do* agree on
-//!   their no-match paths and are pinned below.
 //! * **`iolist_size/1` beyond the 60-bit small range** — unreachable: an iolist's size is the
 //!   sum of the *actual* byte lengths of the terms it references, so any size ≥ 2^59 needs at
 //!   least 2^59 byte-references (≥ 2^63 bytes of cons cells). The C source says the same
@@ -119,6 +112,20 @@ pub(crate) fn group() -> Vec<Case> {
             },
             golden: Golden {
                 stdout: Some("ok {{1,2},{1,2},{4,2}}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "binary/match_nomatch",
+            description: "the no-match path of match/2 and matches/2 returns nomatch / the empty list, for a raw, a compiled and a pattern-list subject",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{binary:match(<<\"abc\">>, <<\"z\">>), binary:match(<<\"abc\">>, binary:compile_pattern(<<\"z\">>)), binary:match(<<\"abc\">>, [<<\"z\">>]), binary:matches(<<\"abc\">>, <<\"z\">>)}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {nomatch,nomatch,nomatch,[]}"),
                 exit_code: 0,
             },
         },
@@ -295,10 +302,22 @@ mod tests {
     }
 
     #[test]
-    fn the_no_match_paths_are_pinned_where_they_are_expressible() {
-        // `binary:match/2`'s `nomatch` result diverges today (see the module docs) and is
-        // therefore absent; the two agreeing no-match shapes must stay pinned.
+    fn the_no_match_paths_are_pinned() {
+        // Every no-match shape agrees with the oracle, so each is pinned directly: `nomatch`
+        // for `match/2` (raw, compiled and pattern-list subjects) and the empty list for
+        // `matches/2` on a compiled pattern and for `split/2` (subject unchanged).
         let cases = group();
+        let nomatch = cases
+            .iter()
+            .find(|c| c.id == "binary/match_nomatch")
+            .expect("registered");
+        assert_eq!(
+            nomatch.golden,
+            Golden {
+                stdout: Some("ok {nomatch,nomatch,nomatch,[]}"),
+                exit_code: 0
+            }
+        );
         let matches = cases
             .iter()
             .find(|c| c.id == "binary/matches_compiled")
@@ -312,13 +331,5 @@ mod tests {
             .golden
             .stdout
             .is_some_and(|g| g.ends_with("[<<97,98,99>>]}")));
-        for case in &cases {
-            let expr = case.expr().expect("eval case");
-            assert!(
-                !expr.contains("<<\"zz\">>") && !expr.contains("nomatch"),
-                "case {}: the diverging nomatch path must not be pinned",
-                case.id
-            );
-        }
     }
 }
