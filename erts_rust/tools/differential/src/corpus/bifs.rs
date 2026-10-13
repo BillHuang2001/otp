@@ -449,18 +449,18 @@ pub(crate) fn group() -> Vec<Case> {
         // below was probed under BOTH runtimes before pinning, and every golden is the
         // oracle's exact (single-line) answer.
         //
-        // A Rust side that exits `3` with `beam_rt: unsupported: ...` is an honest
-        // capability gap (`unsupported`), never a mismatch: `bifs/start_timer_returns_ref`
-        // and `bifs/function_exported_lists_member` are pinned that way (the timer family
-        // and `function_exported/3` are not registered in `beam_rt` yet). They flip to
-        // `agree` automatically once the BIFs land, because the golden is the oracle's.
+        // The whole block now **agrees**: the timer family and `function_exported/3` are
+        // registered in `beam_rt`, so `bifs/start_timer_returns_ref` and
+        // `bifs/function_exported_lists_member` are ordinary agreeing cases (a Rust side
+        // that exits `3` with `beam_rt: unsupported: ...` would instead be an honest
+        // capability gap, never a mismatch).
         //
         // Deliberately NOT pinned: `erlang:module_loaded(lists)` -- the oracle answers
         // `true` while `beam_rt` answers `false` (a plain differing value, i.e. a genuine
-        // mismatch), and `code:module_loaded/1` does not exist in the oracle at all
-        // (`error:undef`). And no volatile rendering is asserted: the timer `Ref`s are
-        // observed only through `is_reference/1`, and `registered()`/`processes()` only
-        // through their shape (`is_list/1`, `lists:member/2`), never the per-VM atom/pid
+        // mismatch, recorded in `divergences.md`), and `code:module_loaded/1` does not exist
+        // in either runtime (`error:undef`). And no volatile rendering is asserted: the timer
+        // `Ref`s are observed only through `is_reference/1`, and `registered()`/`processes()`
+        // only through their shape (`is_list/1`, `lists:member/2`), never the per-VM atom/pid
         // list (`boot/processes_is_list` / `boot/processes_contains_self` already cover
         // the process-list shape).
         // ---------------------------------------------------------------------------------
@@ -584,9 +584,13 @@ pub(crate) fn group() -> Vec<Case> {
         },
         Case {
             id: "bifs/function_exported_lists_member",
-            description: "erlang:function_exported/3 sees the loaded lists:member/2",
+            description: "erlang:function_exported/3 reports the declared `bif.tab` builtin lists:member/2",
             contracts: &[Contract::OtpApps],
             kind: CaseKind::Eval {
+                // `lists:member/2` IS declared in `erts/emulator/beam/bif.tab`, so the builtin
+                // membership rule answers `true` regardless of whether the module is loaded —
+                // this case is load-state independent (unlike `lists:sort/1`, which is only
+                // exported once the module is loaded).
                 expr: "erlang:function_exported(lists,member,2)",
                 extra_argv: &[],
                 probe: Probe::Value,
@@ -598,12 +602,15 @@ pub(crate) fn group() -> Vec<Case> {
         },
         Case {
             id: "bifs/module_loaded_lists_shape",
-            description: "code:is_loaded/1 answers the `{file, Path}` shape for lists",
+            description: "code:is_loaded/1 answers the `{file, Path}` shape for lists once it is loaded",
             contracts: &[Contract::OtpApps],
             kind: CaseKind::Eval {
                 // The path is machine-specific, so only the `file` tag is asserted (the
                 // `flatten`/`preloaded`/`false` shapes are the other possibilities).
-                expr: "element(1, code:is_loaded(lists))",
+                // `code:ensure_loaded/1` makes the load state explicit: the Rust runtime's
+                // `code:is_loaded/1` is path-based, so without it the case would agree only
+                // because the oracle happens to have `lists` loaded.
+                expr: "begin code:ensure_loaded(lists), element(1, code:is_loaded(lists)) end",
                 extra_argv: &[],
                 probe: Probe::Value,
             },
