@@ -64,12 +64,14 @@ mod kind;
 mod keypos;
 mod large;
 mod lookup;
+mod maps;
 mod matchspec;
 mod multikind;
 mod navigation;
 mod reclamation;
 mod replace;
 mod access;
+mod slot;
 
 // ---------------------------------------------------------------------------
 // Canonical rendering (the port of the oracle's `r/1`, `t/1`, `l/1`, `srt/1`)
@@ -571,6 +573,8 @@ pub fn rust_battery() -> Vec<(String, String)> {
     cases.extend(continuation::continuation_cases(&mut battery));
     cases.extend(info::info_cases(&mut battery));
     cases.extend(large::large_cases(&mut battery));
+    cases.extend(slot::slot_cases(&mut battery));
+    cases.extend(maps::maps_cases(&mut battery));
     cases.extend(reclamation::reclamation_cases(&mut battery));
     cases.extend(access::access_cases(&mut battery));
     cases.extend(multikind::multikind_cases(&mut battery));

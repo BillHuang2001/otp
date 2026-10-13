@@ -172,6 +172,7 @@ use beam_abi::driver::types::{
     ErlDrvBinary, ErlDrvEntry, ErlDrvEvent, ErlDrvPort, ErlDrvSizeT, ErlIOVec,
     ERTS_INVALID_ERL_DRV_PORT, ERL_DRV_READ, ERL_DRV_USE, ERL_DRV_USE_NO_CALLBACK, ERL_DRV_WRITE,
 };
+use beam_abi::driver::types::ERL_DRV_FLAG_SOFT_BUSY;
 use beam_abi::driver::types::ErlDrvPDL;
 use beam_abi::{
     monitor_from_identity, monitor_identity, DriverEnv, DriverHost, ErlDrvMonitor, MonitorResult,
@@ -514,6 +515,60 @@ impl TermQueue {
     }
 }
 
+/// The **busy state** of one driver port — the C's `prt->sched.flags & ERTS_PTS_FLG_BUSY_PORT`,
+/// as the driver's own `set_busy_port` sets it (`io.c:5208-5264`).
+///
+/// Shared by [`Rc`] between the [`DriverPort`] host (which [`DriverHost::set_busy_port`] writes,
+/// from inside a driver callback) and the runtime's port metadata, which
+/// [`crate::port::PortRegistry::write_command`] and `erlang:port_command/2,3` read back. Seized
+/// with [`DriverPort::busy_flag`] **before** the host is boxed into the port lifecycle (the boxed
+/// driver exposes no host), exactly like [`DriverPort::control_flags`].
+///
+/// The handle also carries the *other* half of the C's `port_command` decision: whether the driver
+/// **entry** advertises `ERL_DRV_FLAG_SOFT_BUSY`. The C tests `prt->drv_ptr->flags` for it, which
+/// is a property of the loaded `ErlDrvEntry`, not of the per-port state — but the entry is only
+/// known *after* the `dlopen` that happens inside [`DriverPortAdapter::load`], and the host is
+/// consumed by that same call. Recording it here (a [`Cell`] written by `load` through the very
+/// handle the runtime already holds) is what lets the runtime consult it later without re-reading
+/// the library.
+#[derive(Clone, Debug)]
+pub struct BusyFlag {
+    /// Whether the port is currently busy — what `set_busy_port` toggles.
+    busy: Rc<Cell<bool>>,
+    /// Whether the loaded driver entry advertises `ERL_DRV_FLAG_SOFT_BUSY`.
+    soft_busy: Rc<Cell<bool>>,
+}
+
+impl BusyFlag {
+    /// A fresh, **idle**, non-`soft_busy` flag — the state of a port no driver has reported on.
+    pub fn new() -> BusyFlag {
+        BusyFlag {
+            busy: Rc::new(Cell::new(false)),
+            soft_busy: Rc::new(Cell::new(false)),
+        }
+    }
+
+    /// Whether the port is busy (`set_busy_port(port, 1)` was the last request).
+    pub fn is_busy(&self) -> bool {
+        self.busy.get()
+    }
+
+    /// Marks the port busy or idle — the write half of `set_busy_port`.
+    pub fn set_busy(&self, busy: bool) {
+        self.busy.set(busy);
+    }
+
+    /// Whether the loaded driver entry advertises `ERL_DRV_FLAG_SOFT_BUSY`.
+    pub fn soft_busy(&self) -> bool {
+        self.soft_busy.get()
+    }
+
+    /// Records whether the loaded entry advertises `ERL_DRV_FLAG_SOFT_BUSY`.
+    pub fn set_soft_busy(&self, soft_busy: bool) {
+        self.soft_busy.set(soft_busy);
+    }
+}
+
 /// A driver host for one port: the runtime services the `driver_*` / `erl_drv_*` functions need.
 ///
 /// It owns a private term arena (the heap the term-data decoder builds its terms on), holds a
@@ -561,6 +616,16 @@ pub struct DriverPort {
     /// integers normally, a **binary** when `PORT_CONTROL_FLAG_BINARY` is set. Seized with
     /// [`DriverPort::control_flags`] before the host is boxed into the port lifecycle.
     control_flags: Rc<Cell<c_int>>,
+    /// The port's **busy state** — the C's `prt->sched.flags & ERTS_PTS_FLG_BUSY_PORT`, as the
+    /// driver's own `set_busy_port` sets it (`io.c:5208-5264`).
+    ///
+    /// Shared with the runtime's `PortMeta`, which reads it (and the driver entry's
+    /// `ERL_DRV_FLAG_SOFT_BUSY` bit, recorded on the very same handle) to answer
+    /// `erlang:port_command/2,3` the way the C does: `nosuspend` on a busy port ⇒ `false`, `force`
+    /// ⇒ `notsup` unless the entry advertises `SOFT_BUSY`, and a plain command on a busy port
+    /// suspends the caller. Seized with [`DriverPort::busy_flag`] before the host is boxed into
+    /// the port lifecycle, exactly like [`DriverPort::control_flags`].
+    busy: BusyFlag,
     /// The driver's **private** byte queue — the C's `prt->ioq` (`io.c:6790-6919`), which
     /// `driver_enq`/`driver_pushq`/`driver_deq`/… reach and nothing else does. Distinct from the
     /// port's *input* queue (the bytes `driver_output` answers with) and from the Erlang→driver
@@ -621,6 +686,9 @@ impl DriverPort {
             terms: TermQueue::new(),
             control: Rc::new(RefCell::new(DriverControl::default())),
             control_flags: Rc::new(Cell::new(0)),
+            // A port opened without a driver request is idle and its entry's `SOFT_BUSY` is
+            // unknown until the library is loaded (`with_soft_busy`, from `DriverPortAdapter::load`).
+            busy: BusyFlag::new(),
             queue: DriverQueue::new(),
             // A port opened without a stream option is the C's default `list` stream (`io.c:5338`).
             port_flags: 0,
@@ -717,6 +785,27 @@ impl DriverPort {
     pub fn control_flags(&self) -> Rc<Cell<c_int>> {
         Rc::clone(&self.control_flags)
     }
+    /// The port's **busy state** handle, shared with the runtime — the C's
+    /// `prt->sched.flags & ERTS_PTS_FLG_BUSY_PORT` (see [`BusyFlag`]).
+    ///
+    /// Taken **before** the host is boxed into a port (the boxed driver exposes no host), exactly
+    /// like [`DriverPort::control_flags`]. The driver's `set_busy_port` writes it from inside a
+    /// callback; the runtime reads it back to answer `erlang:port_command/2,3`.
+    pub fn busy_flag(&self) -> BusyFlag {
+        self.busy.clone()
+    }
+    /// Records whether the loaded driver entry advertises `ERL_DRV_FLAG_SOFT_BUSY` (see
+    /// [`BusyFlag`]).
+    ///
+    /// A builder step like [`DriverPort::with_has_process_exit`]: [`DriverPortAdapter::load`] is the
+    /// one place the host and the loaded `ErlDrvEntry` first coexist, so it is the only caller. The
+    /// write lands on the handle the runtime already seized with [`DriverPort::busy_flag`] (shared
+    /// by `Rc`), so the caller observes it without re-reading the library. A host nobody claims
+    /// keeps the default (`false`): a driver that advertises nothing is not `SOFT_BUSY`.
+    pub fn with_soft_busy(self, soft_busy: bool) -> DriverPort {
+        self.busy.set_soft_busy(soft_busy);
+        self
+    }
     /// The process the port belongs to.
     pub fn owner(&self) -> ProcessId {
         self.owner
@@ -803,6 +892,142 @@ thread_local! {
     /// correct scope — and it needs no `unsafe impl Send` (the crate is `#![deny(unsafe_code)]`),
     /// matching the thread-local publication `beam_abi` already uses for the current driver host.
     static DRIVER_ENTRIES: RefCell<Vec<DriverEntryRecord>> = const { RefCell::new(Vec::new()) };
+}
+
+/// One `dlopen`ed C driver this runtime knows about, keyed by its driver **name** — the runtime's
+/// loaded-driver list.
+///
+/// Unlike [`DRIVER_ENTRIES`] (keyed by the `ErlDrvEntry` **address**, modelling only the two
+/// port-less `driver_*` slots), this list is keyed by the driver *name*, because that is how the C
+/// resolves an `open_port({spawn_driver, Name}, _)` request against its process-global driver list
+/// (`io.c:599-628`) and how `erl_ddll:loaded_drivers/0` reports it. Recording every `dlopen` here
+/// is what makes those two views **one** view: a driver is listed however it was opened.
+#[derive(Debug)]
+pub(crate) struct LoadedDriver {
+    /// The driver's registered name (the entry's validated `driver_name`).
+    pub(crate) name: String,
+    /// The object path the driver was loaded from — the candidate a later `open_port` re-uses.
+    pub(crate) path: String,
+    /// Whether the `kill_ports` load option was given (`erl_ddll:try_load/3`); `false` for a
+    /// driver reached through `open_port({spawn_driver, …})`, which has no such option.
+    pub(crate) kill_ports: bool,
+    /// The `dlopen` handle when **`erl_ddll:try_load/3`** performed the load — the record owns
+    /// that handle (so dropping the record runs the driver's `finish` and `dlclose`s it, exactly
+    /// like `beam_bifs`'s registry).
+    ///
+    /// `None` for a driver opened by `open_port({spawn_driver, …})`: its handle lives in the
+    /// **port's** adapter, so forgetting the record must never unload it.
+    // Held for its `Drop`: dropping the record runs the driver's `finish` and `dlclose`s the
+    // object. The field is deliberately never *read* (the C's handle is opaque to the
+    // runtime), which is exactly why the dead-code lint must not fire on it.
+    #[allow(dead_code)]
+    pub(crate) library: Option<DriverLibrary>,
+}
+
+thread_local! {
+    /// The runtime's loaded-driver list, keyed by driver name, in load order (a `Vec`, so the
+    /// names report load order like the C's list walk). Thread-local for the same reason as
+    /// [`DRIVER_ENTRIES`]: the records hold the `!Send` `dlopen` handle and this crate is
+    /// `#![deny(unsafe_code)]`, and the runtime drives every driver on one thread.
+    static LOADED_DRIVERS: RefCell<Vec<LoadedDriver>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Records `name` as loaded by **`erl_ddll:try_load/3`**, owning `library` (the load's `dlopen`
+/// handle) unless an entry of the same name is already present.
+///
+/// Replacing an existing entry only happens when a caller deliberately re-registers; the loading
+/// BIF checks [`driver_is_loaded`] first and answers `already_loaded`.
+pub(crate) fn record_driver_loaded(name: &str, path: &str, kill_ports: bool, library: DriverLibrary) {
+    LOADED_DRIVERS.with(|drivers| {
+        let mut drivers = drivers.borrow_mut();
+        let record = LoadedDriver {
+            name: name.to_string(),
+            path: path.to_string(),
+            kill_ports,
+            library: Some(library),
+        };
+        match drivers.iter_mut().find(|entry| entry.name == name) {
+            Some(slot) => *slot = record,
+            None => drivers.push(record),
+        }
+    });
+}
+
+/// Notes that `name` is open through **`open_port({spawn_driver, …})`** at `path`.
+///
+/// The handle belongs to the port, so the record stores no library; a `kill_ports` flag already
+/// recorded by an earlier `try_load` is preserved.
+pub(crate) fn note_driver_opened(name: &str, path: &str) {
+    let kill_ports = loaded_driver_kill_ports(name).unwrap_or(false);
+    LOADED_DRIVERS.with(|drivers| {
+        let mut drivers = drivers.borrow_mut();
+        let record = LoadedDriver {
+            name: name.to_string(),
+            path: path.to_string(),
+            kill_ports,
+            library: None,
+        };
+        match drivers.iter_mut().find(|entry| entry.name == name) {
+            Some(slot) => *slot = record,
+            None => drivers.push(record),
+        }
+    });
+}
+
+/// Whether `name` is currently loaded (whatever loaded it).
+pub(crate) fn driver_is_loaded(name: &str) -> bool {
+    LOADED_DRIVERS.with(|drivers| drivers.borrow().iter().any(|entry| entry.name == name))
+}
+
+/// The object path `name` was loaded from, or `None` when it is not loaded.
+pub(crate) fn loaded_driver_path(name: &str) -> Option<String> {
+    LOADED_DRIVERS.with(|drivers| {
+        drivers
+            .borrow()
+            .iter()
+            .find(|entry| entry.name == name)
+            .map(|entry| entry.path.clone())
+    })
+}
+
+/// Whether `name` was loaded with the `kill_ports` option, or `None` when it is not loaded.
+pub(crate) fn loaded_driver_kill_ports(name: &str) -> Option<bool> {
+    LOADED_DRIVERS.with(|drivers| {
+        drivers
+            .borrow()
+            .iter()
+            .find(|entry| entry.name == name)
+            .map(|entry| entry.kill_ports)
+    })
+}
+
+/// Every loaded driver's name, in load order.
+pub(crate) fn loaded_driver_names() -> Vec<String> {
+    LOADED_DRIVERS.with(|drivers| {
+        drivers
+            .borrow()
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect()
+    })
+}
+
+/// Forgets `name`, answering whether it was loaded (`false` ⇒ the caller reports `not_loaded`).
+///
+/// A record that owns a `dlopen` handle drops it here (running the driver's `finish` and
+/// `dlclose`ing the object); a record for an `open_port`-opened driver owns no handle, so its port
+/// keeps working — "unload" means "no longer listed", matching the C's list removal.
+pub(crate) fn forget_driver(name: &str) -> bool {
+    LOADED_DRIVERS.with(|drivers| {
+        let mut drivers = drivers.borrow_mut();
+        match drivers.iter().position(|entry| entry.name == name) {
+            Some(index) => {
+                drivers.remove(index);
+                true
+            }
+            None => false,
+        }
+    })
 }
 
 /// Records `entry` as a **statically linked** driver entry, the C's `add_driver_entry` →
@@ -994,6 +1219,18 @@ impl DriverHost for DriverPort {
     /// the C's own rule (`write_port_control_result`, `io.c:4133-4175`).
     fn set_control_flags(&mut self, _mode: c_int, flags: c_int) -> c_int {
         self.control_flags.set(flags);
+        0
+    }
+
+    /// Records the port's **busy state** (`set_busy_port` — the C's
+    /// `prt->sched.flags & ERTS_PTS_FLG_BUSY_PORT`, `io.c:5208-5264`).
+    ///
+    /// Marking a port busy is a request to the *emulator*, not to the driver: the C stores the bit
+    /// on the port and `erlang:port_command/2,3` consults it (`erts_port_output`, `io.c:1749-1764`).
+    /// `0` is the C's answer (the `void set_busy_port(ErlDrvPort, int)` wrapper discards it) and the
+    /// flag reads back through the shared [`BusyFlag`] handle the runtime seized at `open_port`.
+    fn set_busy_port(&mut self, busy: bool) -> c_int {
+        self.busy.set_busy(busy);
         0
     }
 
@@ -1298,10 +1535,23 @@ pub fn load_driver(
     candidates: &[String],
     name: &str,
 ) -> std::result::Result<DriverLibrary, DriverLoadError> {
+    load_driver_at(candidates, name).map(|(library, _path)| library)
+}
+
+/// [`load_driver`], also reporting **which** candidate resolved — the object path the loader was
+/// handed, recorded in the runtime's loaded-driver list so the same object is re-used later.
+///
+/// # Errors
+///
+/// The last candidate's typed [`DriverLoadError`] (see [`load_driver`]).
+pub(crate) fn load_driver_at(
+    candidates: &[String],
+    name: &str,
+) -> std::result::Result<(DriverLibrary, String), DriverLoadError> {
     let mut last: Option<DriverLoadError> = None;
     for candidate in candidates {
         match loader::load(candidate, name) {
-            Ok(library) => return Ok(library),
+            Ok(library) => return Ok((library, candidate.clone())),
             Err(error) => last = Some(error),
         }
     }
@@ -1417,17 +1667,28 @@ impl DriverPortAdapter {
         host: DriverPort,
         command: String,
     ) -> std::result::Result<DriverPortAdapter, DriverLoadError> {
-        let library = load_driver(candidates, name)?;
+        let (library, path) = load_driver_at(candidates, name)?;
         // The host and the loaded entry first coexist here, so this is where the one fact the host
         // cannot observe for itself is stamped: whether the entry declares a `process_exit` slot,
         // which gates `driver_monitor_process` (`io.c:6998`). `beam_io`'s own host reads the very
         // same field at its own load site.
         let host = host.with_has_process_exit(library.entry().process_exit.is_some());
+        // The same load site stamps the entry's `ERL_DRV_FLAG_SOFT_BUSY` bit onto the host's
+        // shared busy handle: `erlang:port_command/2,3`'s `force` arm consults it
+        // (`erl_bif_port.c:195-198`), and the runtime already holds the handle (it seized it with
+        // `DriverPort::busy_flag` before this call, and the write lands on the same `Rc`).
+        let host = host.with_soft_busy(library.entry().driver_flags & ERL_DRV_FLAG_SOFT_BUSY != 0);
         // The C's load path records the entry as a **dynamically loaded** driver
         // (`erts_add_driver_entry(dp, dh, …)`, `io.c:7650`, `dp->handle != NULL`), which is why
         // `remove_driver_entry` refuses it. Recording the same entry here lets the frozen
         // `remove_driver_entry` slot answer the C's `-1` for a port's own driver.
         registry_note_loaded_entry(library.entry() as *const ErlDrvEntry as *mut ErlDrvEntry);
+        // The runtime's **loaded-driver list** ([`LOADED_DRIVERS`]), keyed by driver name: the
+        // same view `erl_ddll:loaded_drivers/0` reports and the one a later
+        // `open_port({spawn_driver, Name}, …)` matches the name against (`io.c:599-628`). The
+        // `dlopen` handle stays with this port — the record stores none, so forgetting the entry
+        // never unloads a live port (see [`note_driver_opened`]).
+        note_driver_opened(name, &path);
         let control = host.control();
         let terms = host.term_queue();
         // The driver-monitor tree the host's monitor hooks install into. Seizing it here is what
@@ -2263,6 +2524,16 @@ mod fire_tests;
 /// separate file so the C fixture it compiles does not grow this one.
 #[cfg(test)]
 mod liveness_tests;
+
+/// The A.4 **driver-registry-unification regression suite**: the runtime's one name-keyed
+/// loaded-driver list ([`LOADED_DRIVERS`]) is the list `erl_ddll:*` reports **and** the one
+/// `open_port({spawn_driver, Name}, …)` resolves a name against — a driver `erl_ddll:try_load/3`
+/// loaded is openable by **name**, and a driver a port opened appears in
+/// `erl_ddll:loaded_drivers/0`. A separate file so the C driver fixture it compiles does not grow
+/// this one.
+#[cfg(test)]
+mod ddll_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

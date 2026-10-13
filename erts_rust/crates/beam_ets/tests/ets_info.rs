@@ -431,3 +431,77 @@ fn info_reports_memory_and_named_table() {
         Some(make_atom(atoms.lookup("false").unwrap()))
     );
 }
+
+/// While a table is fixed (`ets:safe_fixtable/2`), a deletion still empties it —
+/// `ets:info(T, size)` is `0` — but the deleted objects' storage is held, so
+/// `ets:info(T, memory)` stays above the unfixed twin and only falls at unfix.
+///
+/// The oracle shape (system `erl`, OTP 29 / erts-17.1): `ets:info(Tab, memory)`
+/// does not drop until `ets:safe_fixtable(Tab, false)`; `ets:info(Tab, size)`
+/// drops immediately. The comparison is against an *identical* table that deleted
+/// the same objects unfixed, so the two differ only in the fix flag.
+#[test]
+fn fixed_tables_report_size_zero_while_info_memory_is_held() {
+    for kind in [
+        TableKind::Set,
+        TableKind::OrderedSet,
+        TableKind::Bag,
+        TableKind::DuplicateBag,
+    ] {
+        let atoms = AtomTable::new();
+        let mut heap = Heap::new(1 << 16);
+        let mut fixed = new_table(kind);
+        let mut released = new_table(kind);
+
+        let objects: Vec<Eterm> = (0..64).map(|i| int_tuple(&mut heap, &[i, i])).collect();
+        for &object in &objects {
+            fixed.insert(object, &atoms).unwrap();
+            released.insert(object, &atoms).unwrap();
+        }
+        let loaded = fixed.memory();
+        assert_eq!(fixed.info().memory, loaded, "{kind:?}: info agrees while loaded");
+        assert_eq!(fixed.info().size, 64, "{kind:?}: the loaded object count");
+
+        fixed.set_fixation(true);
+        fixed.delete_all_objects();
+        released.delete_all_objects();
+
+        assert_eq!(fixed.info().size, 0, "{kind:?}: a fixed table still empties");
+        assert!(fixed.is_empty(), "{kind:?}: a fixed table reports empty");
+        assert_eq!(
+            fixed.deferred_objects(),
+            64,
+            "{kind:?}: every removed object's storage is held"
+        );
+        assert_eq!(released.deferred_objects(), 0, "{kind:?}");
+        assert_eq!(
+            fixed.info().memory,
+            fixed.memory(),
+            "{kind:?}: `TableInfo::memory` agrees with `Table::memory` while fixed"
+        );
+        assert!(
+            fixed.info().memory > released.info().memory,
+            "{kind:?}: a fixed table holds the deleted storage ({} !> {})",
+            fixed.info().memory,
+            released.info().memory
+        );
+
+        fixed.set_fixation(false);
+        assert_eq!(
+            fixed.deferred_objects(),
+            0,
+            "{kind:?}: unfixing releases everything held"
+        );
+        assert_eq!(
+            fixed.info().memory,
+            fixed.memory(),
+            "{kind:?}: `TableInfo::memory` agrees after unfix"
+        );
+        assert_eq!(
+            fixed.info().memory,
+            released.info().memory,
+            "{kind:?}: after unfixing, both tables account for the same storage"
+        );
+        assert_eq!(fixed.info().size, 0, "{kind:?}: still empty after unfix");
+    }
+}

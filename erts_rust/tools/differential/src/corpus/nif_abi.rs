@@ -213,6 +213,16 @@ static ERL_NIF_TERM make_bytes(ErlNifEnv* env, const char* s, size_t n) {
     return term;
 }
 
+/* The error handler `enif_dlopen`/`enif_dlsym` invoke; it only counts the calls, so the probe can
+   assert "the handler ran exactly once" without depending on the message text (which embeds the
+   path). */
+static int err_calls = 0;
+static void on_err(void* arg, const char* msg) {
+    (void) arg;
+    (void) msg;
+    err_calls++;
+}
+
 static ERL_NIF_TERM probe(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
     int sel = 0;
     if (argc != 1 || !enif_get_int(env, argv[0], &sel))
@@ -1118,6 +1128,85 @@ static ERL_NIF_TERM probe(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
         return enif_make_int(env, r == 1 ? 1 : 0);
     }
 
+    /* ------------------------------------------- the port / monitor / dynamic-loader / scheduler
+       surface. Only the shapes both runtimes answer alike are probed: a name no port is
+       registered under (and a non-atom name), a port id that is not a port, a monitor payload the
+       byte compare orders equal, a loader/thread/liveness answer that carries no per-VM-start
+       value. The exact `enif_thread_type()` value and a zeroed-monitor `enif_demonitor_process`
+       probe are deliberately absent — the first differs between the runtimes, the second crashes
+       the oracle VM (see `divergences.md` §A.3). */
+    case 113: {                                /* whereis_port: an unregistered name */
+        ErlNifPort p;
+        memset(&p, 0, sizeof(p));
+        return enif_make_int(env, enif_whereis_port(env, enif_make_atom(env, "no_such_reg_port_zzz"), &p) == 0 ? 1 : 0);
+    }
+    case 114: {                                /* whereis_port: a non-atom name */
+        ErlNifPort p;
+        memset(&p, 0, sizeof(p));
+        return enif_make_int(env, enif_whereis_port(env, enif_make_int(env, 1), &p) == 0 ? 1 : 0);
+    }
+    case 115: {                                /* is_port_alive: an id that is not a port */
+        ErlNifPort p;
+        memset(&p, 0, sizeof(p));
+        p.port_id = enif_make_int(env, 7);
+        return enif_make_int(env, enif_is_port_alive(env, &p) == 0 ? 1 : 0);
+    }
+    case 116: {                                /* port_command: a non-port destination */
+        ErlNifPort p;
+        memset(&p, 0, sizeof(p));
+        p.port_id = enif_make_atom(env, "not_a_port");
+        return enif_make_int(env, enif_port_command(env, &p, NULL, enif_make_int(env, 1)) == 0 ? 1 : 0);
+    }
+    case 117: {                                /* schedule_nif: an argc above MAX_ARG (255) */
+        /* The C refuses before reading `argv` (`erl_nif.c:3569`); the refused term is the raise
+           the NIF returns, so the module observes `error:badarg`. */
+        return enif_schedule_nif(env, "probe", 0, probe, 256, NULL);
+    }
+    case 118: {                                /* schedule_nif: a flag outside the dirty-job pair */
+        return enif_schedule_nif(env, "probe", 1 << 10, probe, 1, NULL);
+    }
+    case 119: {                                /* compare_monitors: two equal payloads */
+        ErlNifMonitor a, b;
+        memset(&a, 0, sizeof(a));
+        memset(&b, 0, sizeof(b));
+        return enif_make_int(env, enif_compare_monitors(&a, &b));
+    }
+    case 120: {                                /* make_monitor_term of a zeroed payload */
+        /* Its *ref-ness* is the pinnable shape: the value itself is per-monitor state. */
+        ErlNifMonitor m;
+        memset(&m, 0, sizeof(m));
+        return enif_make_int(env, enif_is_ref(env, enif_make_monitor_term(env, &m)) ? 1 : 0);
+    }
+    case 122: {                                /* dlopen of a path that does not exist */
+        void* h;
+        err_calls = 0;
+        h = enif_dlopen("/no/such/dir/no_such_nif_lib_zzz", on_err, NULL);
+        return enif_make_int(env, (h == NULL && err_calls == 1) ? 1 : 0);
+    }
+    case 123: {                                /* dlsym with no handle */
+        void* s;
+        err_calls = 0;
+        s = enif_dlsym(NULL, "no_such_symbol_zzz", on_err, NULL);
+        return enif_make_int(env, s == NULL ? 1 : 0);
+    }
+    case 124: {                                /* thread_type: one of the documented kinds */
+        int ty = enif_thread_type();
+        return enif_make_int(env, (ty == ERL_NIF_THR_UNDEFINED || ty == ERL_NIF_THR_NORMAL_SCHEDULER
+            || ty == ERL_NIF_THR_DIRTY_CPU_SCHEDULER || ty == ERL_NIF_THR_DIRTY_IO_SCHEDULER) ? 1 : 0);
+    }
+    case 126: {                                /* send: a receiver that is not a pid */
+        ErlNifPid to;
+        memset(&to, 0, sizeof(to));
+        to.pid = enif_make_int(env, 3);
+        return enif_make_int(env, enif_send(env, &to, NULL, enif_make_int(env, 1)));
+    }
+    case 127: {                                /* whereis_port on a name registered to a process */
+        ErlNifPort p;
+        memset(&p, 0, sizeof(p));
+        /* `init` names a *process*, so no port is resolved. */
+        return enif_make_int(env, enif_whereis_port(env, enif_make_atom(env, "init"), &p));
+    }
+
     default:
         break;
     }
@@ -1591,6 +1680,85 @@ pub(crate) fn group() -> Vec<Case> {
             &[112],
             "1",
         ),
+        // --- the port / monitor / dynamic-loader / scheduler family ------------------------
+        case(
+            "nif_abi/port_whereis_port_unregistered",
+            "enif_whereis_port answers 0 for a name no port is registered under",
+            &[113],
+            "1",
+        ),
+        case(
+            "nif_abi/port_whereis_port_rejects_non_atom",
+            "enif_whereis_port answers 0 for a non-atom name",
+            &[114],
+            "1",
+        ),
+        case(
+            "nif_abi/port_is_port_alive_rejects_non_port",
+            "enif_is_port_alive answers 0 for an id that is not a port",
+            &[115],
+            "1",
+        ),
+        case(
+            "nif_abi/port_command_rejects_non_port",
+            "enif_port_command answers 0 for a non-port destination",
+            &[116],
+            "1",
+        ),
+        case(
+            "nif_abi/schedule_nif_rejects_argc_above_max",
+            "enif_schedule_nif raises badarg for an argc above MAX_ARG (255)",
+            &[117],
+            "81",
+        ),
+        case(
+            "nif_abi/schedule_nif_rejects_unknown_flag",
+            "enif_schedule_nif raises badarg for a flag bit outside the dirty-job pair",
+            &[118],
+            "81",
+        ),
+        case(
+            "nif_abi/monitor_compare_equal_payloads",
+            "enif_compare_monitors orders two equal monitor payloads as 0",
+            &[119],
+            "0",
+        ),
+        case(
+            "nif_abi/monitor_make_monitor_term_zeroed_not_ref",
+            "enif_make_monitor_term over a zeroed payload yields a non-reference",
+            &[120],
+            "0",
+        ),
+        case(
+            "nif_abi/dlopen_missing_library_reports_error",
+            "enif_dlopen of a missing path yields no handle and calls the error handler once",
+            &[122],
+            "1",
+        ),
+        case(
+            "nif_abi/dlsym_without_handle_is_null",
+            "enif_dlsym with no handle yields no symbol",
+            &[123],
+            "1",
+        ),
+        case(
+            "nif_abi/thread_type_in_documented_set",
+            "enif_thread_type reports one of the four documented thread kinds",
+            &[124],
+            "1",
+        ),
+        case(
+            "nif_abi/send_rejects_non_pid_receiver",
+            "enif_send answers 0 for a receiver that is not a pid",
+            &[126],
+            "0",
+        ),
+        case(
+            "nif_abi/port_whereis_port_on_process_name",
+            "enif_whereis_port answers 0 for a name registered to a process, not a port",
+            &[127],
+            "0",
+        ),
     ]
 }
 #[cfg(test)]
@@ -1824,6 +1992,36 @@ mod tests {
                 "the library must not reference the variadic {banned}"
             );
         }
+    }
+
+    #[test]
+    fn the_c_library_covers_the_port_monitor_loader_and_scheduler_families() {
+        // The families the third block adds (each symbol must really be referenced).
+        for symbol in [
+            "enif_whereis_port(",
+            "enif_is_port_alive(",
+            "enif_port_command(",
+            "enif_schedule_nif(",
+            "enif_compare_monitors(",
+            "enif_make_monitor_term(",
+            "enif_dlopen(",
+            "enif_dlsym(",
+            "enif_thread_type(",
+            "enif_send(",
+        ] {
+            assert!(
+                super::NIF_ABI_C.contains(symbol),
+                "the library must reference {symbol}"
+            );
+        }
+        // Two probes are deliberately absent: the *exact* `enif_thread_type()` value and
+        // `enif_demonitor_process(env, NULL, …)` both differ from the oracle — the first returns a
+        // different kind, the second crashes the oracle VM (see `divergences.md` §A.3). Pinning
+        // either would be a mismatch, so no call site may exist.
+        assert!(
+            !super::NIF_ABI_C.contains("enif_demonitor_process("),
+            "the library must not call enif_demonitor_process (a probe hazard)"
+        );
     }
 
     #[test]

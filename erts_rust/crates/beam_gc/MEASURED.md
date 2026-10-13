@@ -265,6 +265,53 @@ what fixes the *destination sizing* in Design Decisions.
   its **233**-word default while the total heap plateaus at **609** (Copying) / **1257** (Immix)
   words. Evidence: `tests/nursery_bounded.rs`.
 
+## The mature-generation room policy (generational cadence)
+
+The fullsweep sizes the fresh mature space from `live.rs`'s **exact reachable live word count** *plus*
+the **young heap's occupancy** (`nursery.used_words()`) — the C `adjust_after_fullsweep`
+`need_after = (HEAP_TOP(p) - HEAP_START(p)) + need + …` (`erl_gc.c:2072`). This is the measurement that
+gates that policy; the alternative (passing `0` for the young occupancy) is **dominated** and is why the
+policy is what it is.
+
+**Workload.** A churn loop: each round allocates a fresh bounded live graph of 20 `{a, 2a}` tuples
+(60 words) plus 50 garbage tuples (150 words) and then collects — 20 warm-up + 200 measured rounds,
+at the crate-default `HeapPolicy` (`fullsweep_after` 65535, 233-word young / 233-word mature,
+`need_reserve_words` 64). Deterministic counts only.
+
+| | Copying, before (`need = 0`) | Copying, after (`need = young`) | Immix @default | Immix @`initial_mature_words` 1024 |
+|---|---|---|---|---|
+| minors / fullsweeps | 1 / 219 | **147 / 73** | 0 / 220 | **147 / 73** |
+| collection-kind cycle | every collection a Major | `Minor, Minor, Major` | every collection a Major | `Minor, Minor, Major` |
+| longest minor run | 0 | 2 | 0 | 3 |
+| young capacity (constant) | 233 | 233 | 233 | 233 |
+| mature capacity (constant) | 233 | **376** | 512 | 1024 |
+| total heap (`heap_info`) | 466 | **609** | 745 | 1257 |
+
+With `need = 0` the fresh mature is never large enough to receive a nursery's worth of promotion, so
+**every collection after the first escalates to a fullsweep** and `minor_gcs` stays 0 — the generational
+payoff (promote survivors into a mature generation, fullsweep it only on the `fullsweep_after` cadence)
+is never realized. Folding the young occupancy in makes the mature region able to hold the next round's
+promotion, so minors actually run and dominate the cadence (**147 vs 73**).
+
+**Bounded, not creeping.** Both capacities are a single constant across the 200 measured rounds. The
+young occupancy is capped by the nursery capacity, which `young_after_collection` itself keeps bounded,
+so the grow branch's target `next_words(need_after, 0)` is a fixed point (376 for the Copying default,
+1024 for the Immix policy above) — memory does **not** grow per collection. Using the **mature**
+occupancy instead would be garbage-inflated and creep without bound; that is why only the young
+occupancy is folded in.
+
+**Immix at the crate default.** The default mature region converges to 512 words = 32 lines, which holds
+the 20-line live set and leaves only 12 free lines — fewer than the ~20 a round promotes — so at the
+*default* policy Immix still escalates every round (a region-granularity consequence, not a sizing
+regression). Given room for the promotion (`initial_mature_words` 1024 = 64 lines) Immix runs the same
+147/73 cadence as Copying and its region stays a bounded 1024 words.
+
+**Evidence:** `tests/generational_cadence.rs` (asserts the cadence, the `minor_gcs` advance/reset, live
+term survival, reclamation and the converged constants for both strategies), `tests/steady_state.rs`
+(pins young 233 / mature 376, total 609, Copying; 233 / 512, total 745, Immix),
+`tests/mature_capacity_convergence.rs`, `tests/nursery_chain.rs`. A large off-heap loop at a 4096-word
+young policy converges to Copying 4096 / **4185** (9 fullsweeps / 231 minors) and Immix 4096 / 4352.
+
 ## Caveats
 
 * **The pause column is a signal, not a benchmark.** It is a single-threaded, in-process

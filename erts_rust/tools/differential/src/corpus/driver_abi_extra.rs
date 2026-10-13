@@ -842,6 +842,97 @@ static void ex_deliver(extra_state *st, int shape) {
     }
 }
 
+/* -- thread lifecycle, lock refusals and condition waiting ---------------------------------- */
+
+/* `erl_drv_thread_exit/1` terminates the calling thread and hands its argument to the joiner
+ * (`erl_drv_thread.c:705-730`): `erl_drv_thread_join/2` answers `0` and writes that very pointer
+ * through `respp`. Only pointer identity is compared — the value never leaves C. */
+static void *ex_exiting_worker(void *arg) {
+    erl_drv_thread_exit(arg);
+    return NULL; /* unreachable: `erl_drv_thread_exit` never returns */
+}
+
+static int chk_thread_exit_reaches_joiner(void) {
+    ErlDrvTid tid;
+    void *resp = NULL;
+    void *magic = (void *) (intptr_t) 0x1234abcd;
+    if (erl_drv_thread_create("driver_extra_exit", &tid, ex_exiting_worker, magic, NULL) != 0)
+        return 0;
+    if (erl_drv_thread_join(tid, &resp) != 0)
+        return 0;
+    return resp == magic;
+}
+
+/* A read/write lock refuses the *opposite* acquisition mode: a writer trylock under a held read
+ * lock, and a reader trylock under a held write lock, both answer the non-zero `EBUSY`
+ * (`erl_drv_thread.c:371-435`). The two success directions are pinned in `driver_abi`. */
+static int chk_tryrwlock_refused_while_reader(void) {
+    ErlDrvRWLock *l = erl_drv_rwlock_create("driver_extra_rw1");
+    int ok = 0;
+    if (l != NULL) {
+        if (erl_drv_rwlock_tryrlock(l) == 0) {
+            ok = (erl_drv_rwlock_tryrwlock(l) != 0);
+            erl_drv_rwlock_runlock(l);
+        }
+        erl_drv_rwlock_destroy(l);
+    }
+    return ok;
+}
+
+static int chk_tryrlock_refused_while_writer(void) {
+    ErlDrvRWLock *l = erl_drv_rwlock_create("driver_extra_rw2");
+    int ok = 0;
+    if (l != NULL) {
+        if (erl_drv_rwlock_tryrwlock(l) == 0) {
+            ok = (erl_drv_rwlock_tryrlock(l) != 0);
+            erl_drv_rwlock_rwunlock(l);
+        }
+        erl_drv_rwlock_destroy(l);
+    }
+    return ok;
+}
+
+/* `erl_drv_cond_wait/2` releases the mutex and returns once the condition has been signalled
+ * (`erl_drv_thread.c:306`). A worker thread locks the mutex and waits; this thread signals in a
+ * bounded loop (a signal that arrives before the worker waits would be lost, so it repeats) and
+ * then joins, so the case can never hang: the worker wakes on the first signal that lands after it
+ * entered the wait, and the loop's final signal covers the rest. The worker's `woke` flag and the
+ * `0` join answer are the whole observable. */
+static ErlDrvMutex *ex_cw_mutex = NULL;
+static ErlDrvCond *ex_cw_cond = NULL;
+static volatile int ex_cw_woke = 0;
+
+static void *ex_cw_worker(void *arg) {
+    (void) arg;
+    erl_drv_mutex_lock(ex_cw_mutex);
+    erl_drv_cond_wait(ex_cw_cond, ex_cw_mutex);
+    ex_cw_woke = 1;
+    erl_drv_mutex_unlock(ex_cw_mutex);
+    return NULL;
+}
+
+static int chk_cond_wait_wakes(void) {
+    ErlDrvTid tid;
+    int i;
+    if (ex_cw_mutex == NULL)
+        ex_cw_mutex = erl_drv_mutex_create("driver_extra_cw_mutex");
+    if (ex_cw_cond == NULL)
+        ex_cw_cond = erl_drv_cond_create("driver_extra_cw_cond");
+    if (ex_cw_mutex == NULL || ex_cw_cond == NULL)
+        return 0;
+    ex_cw_woke = 0;
+    if (erl_drv_thread_create("driver_extra_cw", &tid, ex_cw_worker, NULL, NULL) != 0)
+        return 0;
+    for (i = 0; i < 300 && !ex_cw_woke; i++) {
+        usleep(2000);
+        erl_drv_cond_signal(ex_cw_cond);
+    }
+    erl_drv_cond_signal(ex_cw_cond);
+    if (erl_drv_thread_join(tid, NULL) != 0)
+        return 0;
+    return ex_cw_woke;
+}
+
 /* -- the selectors ------------------------------------------------------------------------- */
 
 static void ex_dispatch(extra_state *st, unsigned char sel) {
@@ -890,6 +981,11 @@ static void ex_dispatch(extra_state *st, unsigned char sel) {
     case 38: ex_answer(st, chk_rwlock_name()); break;
     case 39: ex_answer(st, chk_cond_name_null()); break;
     case 40: ex_answer(st, chk_rwlock_name_null()); break;
+    /* The thread-lifecycle, lock-refusal and condition-wait family. */
+    case 41: ex_answer(st, chk_thread_exit_reaches_joiner()); break;
+    case 42: ex_answer(st, chk_tryrwlock_refused_while_reader()); break;
+    case 43: ex_answer(st, chk_tryrlock_refused_while_writer()); break;
+    case 44: ex_answer(st, chk_cond_wait_wakes()); break;
     /* The delivery family: nothing is answered through the byte channel — the delivered term is
      * the observable. */
     case 100: ex_deliver(st, 0); break;
@@ -1102,6 +1198,31 @@ fn builtin_case(
 /// the agreeing surfaces appear here (see the module docs' *Known gaps*).
 pub(crate) fn group() -> Vec<Case> {
     vec![
+        // --- thread lifecycle, lock refusal and condition waiting --------------------------
+        case(
+            "driver_extra/erl_drv_thread_exit_response_reaches_the_joiner",
+            "a thread that leaves through erl_drv_thread_exit/1 is joinable and delivers its argument",
+            &[41],
+            "49",
+        ),
+        case(
+            "driver_extra/erl_drv_rwlock_tryrwlock_refused_under_a_read_lock",
+            "erl_drv_rwlock_tryrwlock/1 is refused while a shared read lock is held",
+            &[42],
+            "49",
+        ),
+        case(
+            "driver_extra/erl_drv_rwlock_tryrlock_refused_under_a_write_lock",
+            "erl_drv_rwlock_tryrlock/1 is refused while the exclusive write lock is held",
+            &[43],
+            "49",
+        ),
+        case(
+            "driver_extra/erl_drv_cond_wait_wakes_on_signal",
+            "erl_drv_cond_wait/2 blocks a worker thread until erl_drv_cond_signal/1 wakes it",
+            &[44],
+            "49",
+        ),
         case(
             "driver_extra/driver_get_now_refuses_a_null_out_parameter",
             "driver_get_now/1 answers its -1 refusal for a NULL out-parameter",
@@ -1635,7 +1756,7 @@ mod tests {
                 assert_eq!(golden, "49", "case {}: a status selector is the '1' byte", case.id);
             }
         }
-        assert_eq!(status, 40, "the forty status selectors");
+        assert_eq!(status, 44, "the forty-four status selectors");
         assert_eq!(deliveries, DELIVERY_SELECTORS.count(), "one delivery case per selector");
         assert_eq!(builtin, 2, "the two built-in-driver cases");
     }

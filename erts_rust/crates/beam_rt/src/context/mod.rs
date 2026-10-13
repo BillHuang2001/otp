@@ -126,3 +126,5 @@ use self::dispatch::{dispatch_slot, DispatchHooks, DISPATCH_MEMO_SLOTS};
 use self::fun_identity::FunIdentityBridge;
 #[cfg(test)]
 use self::pump::{pump_until_returned, BLOCKING_PUMP_DEADLINE};
+#[cfg(test)]
+use self::runtime_hooks::{declared_bif_tab, is_builtin};

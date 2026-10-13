@@ -27,7 +27,9 @@
 //! exercised hermetically against [`MemoryTransport`].
 //!
 //! Errors: a transport failure maps to `BeamError::Io`; a short read / end of the
-//! input buffer maps to `BeamError::BadArg` (never a panic).
+//! input buffer maps to `BeamError::BadArg` (never a panic). [`Read::read_exact_or_eof`]
+//! additionally lets a reader tell a clean end of stream *at a frame boundary*
+//! (`Ok(false)`) from a truncated read (`BadArg`).
 
 use beam_common::{BeamError, Result};
 
@@ -39,6 +41,28 @@ pub trait Read {
     /// A short read (end of stream before `buf` is full) yields
     /// `BeamError::BadArg`; an underlying I/O failure yields `BeamError::Io`.
     fn read_exact(&mut self, buf: &mut [u8]) -> Result<()>;
+
+    /// Reads exactly `buf.len()` bytes, distinguishing a **clean end of stream at
+    /// the start of the read** from a truncated read.
+    ///
+    /// * `Ok(true)` — `buf` was filled.
+    /// * `Ok(false)` — the stream ended cleanly *before any byte was read*, i.e.
+    ///   the peer closed the connection at this frame boundary. A caller reading
+    ///   the leading bytes of a frame can treat this as a normal end of link
+    ///   rather than malformed data.
+    /// * `Err(BeamError::BadArg)` — a partial read (some bytes, then end of
+    ///   stream): the frame was truncated.
+    /// * `Err(BeamError::Io)` — an underlying I/O failure.
+    ///
+    /// The default implementation simply delegates to
+    /// [`read_exact`](Read::read_exact), so it can only ever report `Ok(true)` or
+    /// an error: no existing transport is forced to change. A transport that can
+    /// observe a peer's end of stream ([`TcpTransport`](crate::connection::TcpTransport),
+    /// [`MemoryTransport`]) overrides it.
+    fn read_exact_or_eof(&mut self, buf: &mut [u8]) -> Result<bool> {
+        self.read_exact(buf)?;
+        Ok(true)
+    }
 
     /// Reads a single byte.
     fn read_u8(&mut self) -> Result<u8> {
@@ -157,6 +181,18 @@ impl Read for MemoryTransport {
         buf.copy_from_slice(&self.input[self.pos..end]);
         self.pos = end;
         Ok(())
+    }
+
+    fn read_exact_or_eof(&mut self, buf: &mut [u8]) -> Result<bool> {
+        // Running out of input *before the read begins* is the in-memory
+        // equivalent of a peer closing at a frame boundary; a read that starts
+        // but cannot be satisfied from what is left is a truncated frame and
+        // still fails with `BadArg` (via `read_exact`).
+        if !buf.is_empty() && self.input_remaining() == 0 {
+            return Ok(false);
+        }
+        self.read_exact(buf)?;
+        Ok(true)
     }
 }
 

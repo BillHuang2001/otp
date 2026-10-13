@@ -18,6 +18,7 @@
 //
 // %CopyrightEnd%
 
+use beam_bifs::bif_tab::BifTab;
 use beam_bifs::{AtomInterner, BifFn, BifRegistry, BytesSink, LocalFunIdentity, LocalNode};
 use beam_engine::RunOutcome;
 use beam_loader::Operand;
@@ -1930,7 +1931,6 @@ fn the_runtime_hooks_predicate_selects_only_its_own_bifs() {
     for (module, function, arity) in [
         ("erlang", "read_timer", 1),
         ("erlang", "system_info", 1),
-        ("erl_ddll", "info", 2),
     ] {
         assert!(
             RuntimeContext::uses_runtime_hooks(module, function, arity),
@@ -2324,6 +2324,262 @@ fn the_runtime_hooks_bridge_serves_the_timer_and_export_families() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// `erlang:function_exported/3`'s membership source.
+//
+// The C answer is `true` iff the module is **loaded and exports** `F/A` **or** `M:F/A` is
+// an **emulator builtin** (`erts/emulator/beam/bif.c:4409-4424`: `erts_find_function` then
+// `erts_is_builtin`). The builtin half is the *declared* `bif.tab` surface plus the extras
+// the emulator registers in the `erlang` module — **never** the whole `beam_bifs` registry,
+// which also carries this runtime's stdlib *fast paths* (implementations of real *Erlang*
+// functions). Oracle answers (system `erl`, OTP 29/`erts-17.1`):
+// `function_exported(erlang,memory,1)` `true`, `(erlang,system_info,1)` `true`,
+// `(erlang,nonexistent,1)` `false`, `(lists,member,2)` `true`,
+// `(mnesia,start,0)` `false` and `(string,chars,1)` `false`.
+// ---------------------------------------------------------------------------
+
+/// Prints a loud skip banner — a missing prerequisite is never a silent pass.
+fn skip_builtin_case(banner: &str, why: &str) {
+    eprintln!();
+    eprintln!("=============== beam_rt {banner} SKIPPED ===============");
+    eprintln!("{why}. NOT a pass.");
+    eprintln!("=========================================================");
+    eprintln!();
+}
+
+/// The parsed real `bif.tab`, or `None` after a **loud skip** line.
+///
+/// A bare container without an OTP source tree cannot answer the declared-builtin cases,
+/// so those tests skip visibly rather than passing.
+fn bif_tab_or_skip(banner: &str) -> Option<&'static BifTab> {
+    let tab = declared_bif_tab();
+    if tab.is_none() {
+        skip_builtin_case(
+            banner,
+            "erts/emulator/beam/bif.tab is not present in this checkout",
+        );
+    }
+    tab
+}
+
+/// A stdlib **fast path** (`lists:map/2`) is NOT a builtin: with `lists` unloaded the answer
+/// must be `false`. This is the regression test for the wrong-value bug (the registry holds
+/// 640 keys, 79 of them stdlib fast paths, so `BifRegistry::contains` alone answered `true`).
+#[test]
+fn function_exported_does_not_report_a_stdlib_fast_path_as_exported() {
+    let mut rt = runtime();
+    // The premise, pinned: `lists:map/2` really is a registered key of this runtime and
+    // `lists` really is not loaded, so the answer can only come from the builtin half.
+    assert!(
+        rt.registry.contains("lists", "map", 2),
+        "lists:map/2 is a registry fast path"
+    );
+    assert!(
+        rt.module("lists").is_none(),
+        "lists must not be loaded in an un-booted runtime"
+    );
+    let lists = rt.intern("lists");
+    let map = rt.intern("map");
+    let member = rt.intern("member");
+    let true_atom = rt.intern("true");
+    let false_atom = rt.intern("false");
+    // A declared `bif.tab` BIF of the same unloaded module still answers `true`; without a
+    // readable table that half of the case cannot be asserted (the skip line is already out).
+    let has_tab = bif_tab_or_skip("function_exported_does_not_report_a_stdlib_fast_path").is_some();
+    let mut ctx = RuntimeContext::new(&mut rt);
+
+    assert_eq!(
+        ctx.call_bif(
+            "erlang",
+            "function_exported",
+            3,
+            &[lists, map, make_small(2)]
+        )
+        .expect("function_exported(lists, map, 2)"),
+        false_atom,
+        "a stdlib fast path is not an emulator builtin"
+    );
+
+    if has_tab {
+        assert_eq!(
+            ctx.call_bif(
+                "erlang",
+                "function_exported",
+                3,
+                &[lists, member, make_small(2)]
+            )
+            .expect("function_exported(lists, member, 2)"),
+            true_atom,
+            "lists:member/2 is declared as a bif.tab BIF"
+        );
+    }
+}
+
+/// A **declared** `bif.tab` builtin answers `true` with the module unloaded; a name the
+/// table does not declare (and no loaded module exports) answers `false`.
+#[test]
+fn function_exported_reports_a_declared_bif_tab_builtin() {
+    let Some(_) = bif_tab_or_skip("function_exported_reports_a_declared_bif_tab_builtin") else {
+        return;
+    };
+    let mut rt = runtime();
+    assert!(
+        rt.module("erlang").is_none(),
+        "the un-booted runtime has no loaded `erlang` module, so the declared half decides"
+    );
+    let erlang = rt.intern("erlang");
+    let system_info = rt.intern("system_info");
+    let nonexistent = rt.intern("nonexistent");
+    let true_atom = rt.intern("true");
+    let false_atom = rt.intern("false");
+    let mut ctx = RuntimeContext::new(&mut rt);
+
+    assert_eq!(
+        ctx.call_bif(
+            "erlang",
+            "function_exported",
+            3,
+            &[erlang, system_info, make_small(1)]
+        )
+        .expect("function_exported(erlang, system_info, 1)"),
+        true_atom,
+        "erlang:system_info/1 is declared in bif.tab"
+    );
+    assert_eq!(
+        ctx.call_bif(
+            "erlang",
+            "function_exported",
+            3,
+            &[erlang, nonexistent, make_small(1)]
+        )
+        .expect("function_exported(erlang, nonexistent, 1)"),
+        false_atom,
+        "erlang:nonexistent/1 is neither declared nor registered"
+    );
+}
+
+/// The **undeclared** `erlang`-namespace extras are builtins too: `erlang:memory/1` is not
+/// in `bif.tab`, yet the emulator serves it and the oracle answers `true`.
+#[test]
+fn function_exported_reports_an_undeclared_erlang_builtin() {
+    let mut rt = runtime();
+    assert!(
+        rt.registry.contains("erlang", "memory", 1),
+        "erlang:memory/1 is registered in the `erlang` namespace"
+    );
+    assert!(
+        rt.module("erlang").is_none(),
+        "the un-booted runtime has no loaded `erlang` module"
+    );
+    // The premise, pinned against the real table when it is readable.
+    if let Some(tab) = bif_tab_or_skip("function_exported_reports_an_undeclared_erlang_builtin") {
+        assert!(
+            !tab.contains("erlang", "memory", 1),
+            "erlang:memory/1 must stay undeclared, or this test stops exercising the extras"
+        );
+    }
+    let erlang = rt.intern("erlang");
+    let memory = rt.intern("memory");
+    let true_atom = rt.intern("true");
+    let mut ctx = RuntimeContext::new(&mut rt);
+
+    assert_eq!(
+        ctx.call_bif(
+            "erlang",
+            "function_exported",
+            3,
+            &[erlang, memory, make_small(1)]
+        )
+        .expect("function_exported(erlang, memory, 1)"),
+        true_atom,
+        "the `erlang`-namespace extras are emulator builtins"
+    );
+}
+
+/// The predicate itself, exercised with an **absent** `bif.tab`: the declared half is
+/// unavailable, so a non-`erlang` registry key is never claimed as a builtin, while the
+/// `erlang`-namespace extras and the real table's declarations keep working.
+#[test]
+fn a_builtin_predicate_without_bif_tab_never_claims_a_foreign_builtin() {
+    let rt = runtime();
+    assert!(
+        rt.registry.contains("lists", "map", 2),
+        "lists:map/2 is a registry fast path"
+    );
+    // The absent-table fallback: no declared half, so a stdlib fast path is not a builtin…
+    assert!(
+        !is_builtin(None, &rt.registry, "lists", "map", 2),
+        "without bif.tab a non-`erlang` fast path must never be reported as a builtin"
+    );
+    // …the `erlang`-namespace extras are still honoured…
+    assert!(is_builtin(None, &rt.registry, "erlang", "memory", 1));
+    // …and an `erlang` key the registry does not hold is still `false`.
+    assert!(!is_builtin(None, &rt.registry, "erlang", "nonexistent", 1));
+    // The readable-table path honours both halves.
+    if let Some(tab) = declared_bif_tab() {
+        assert!(is_builtin(Some(tab), &rt.registry, "lists", "member", 2));
+        assert!(!is_builtin(Some(tab), &rt.registry, "lists", "map", 2));
+        assert!(is_builtin(Some(tab), &rt.registry, "erlang", "system_info", 1));
+    }
+}
+
+/// The loaded-export half still works: a module that really is loaded and exports `F/A`
+/// answers `true`, while an unloaded module (and an unknown function of a loaded one)
+/// answers `false`.
+#[test]
+fn function_exported_sees_a_loaded_modules_real_exports() {
+    let mut rt = runtime();
+    if let Err(error) = rt.code_server.add_system_paths() {
+        skip_builtin_case(
+            "function_exported_sees_a_loaded_modules_real_exports",
+            &format!("no system code path ({error})"),
+        );
+        return;
+    }
+    rt.load_code_module("lists").expect("stdlib lists loads");
+    let lists = rt.intern("lists");
+    let map = rt.intern("map");
+    let no_such = rt.intern("no_such_fun_xyz");
+    let mnesia = rt.intern("mnesia");
+    let start = rt.intern("start");
+    let true_atom = rt.intern("true");
+    let false_atom = rt.intern("false");
+    let mut ctx = RuntimeContext::new(&mut rt);
+
+    assert_eq!(
+        ctx.call_bif(
+            "erlang",
+            "function_exported",
+            3,
+            &[lists, map, make_small(2)]
+        )
+        .expect("function_exported(lists, map, 2)"),
+        true_atom,
+        "the loaded `lists` module really exports map/2"
+    );
+    assert_eq!(
+        ctx.call_bif(
+            "erlang",
+            "function_exported",
+            3,
+            &[lists, no_such, make_small(1)]
+        )
+        .expect("function_exported(lists, no_such_fun_xyz, 1)"),
+        false_atom,
+        "a function the loaded module does not export answers false"
+    );
+    assert_eq!(
+        ctx.call_bif(
+            "erlang",
+            "function_exported",
+            3,
+            &[mnesia, start, make_small(0)]
+        )
+        .expect("function_exported(mnesia, start, 0)"),
+        false_atom,
+        "an unloaded module answers false"
+    );
+}
 #[test]
 fn the_runtime_hooks_bridge_serves_the_dynamic_tag_and_statistics_arms() {
     // The dynamic-tracing tag pair `file:call/2` brackets every file-server round trip with
@@ -4391,4 +4647,140 @@ fn a_message_beats_a_nested_finite_receive_deadline() {
         .expect("the runtime process")
         .mailbox();
     assert!(mailbox.is_empty(), "the receive removed the message");
+}
+
+// ---------------------------------------------------------------------------------------
+// The installed `CollectionGate` host seam: the SAME valve, at the `beam_process` signal sites
+// ---------------------------------------------------------------------------------------
+//
+// The signal sites (a monitor `'DOWN'`, an exit propagation, an applied trap reason) run inside
+// `beam_process::ProcessTable` with only `&mut ProcessTable` in hand, so they cannot consult the
+// runtime's unscanned-root valve; `Runtime::new` installs `RuntimeCollectionGate` on the
+// runtime's table as their half of exactly that decision. The case below pins the seam end to
+// end, through a real signal site, for both its firing and non-firing behaviour.
+
+/// **The installed gate declines a signal-driven relocation of a foreign-reachable receiver.**
+///
+/// The receiver's **gathered** roots reach a container at depth ≥ 2 on the pooled BIF heap (a
+/// foreign container below the process's own scanned young layers) — the shape only the
+/// *descent* can see. An exit signal whose reason is larger than the receiver's whole nursery
+/// must then be delivered **without** collecting or moving that heap: the enqueue-time copy is
+/// refused and the message is built into a heap fragment instead, so the notification is never
+/// lost.
+#[test]
+fn the_installed_gate_declines_a_signal_driven_relocation_of_a_foreign_reachable_receiver() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    // A foreign container at depth >= 2 below a SCANNED root: the pooled-BIF-heap tuple is
+    // reachable only through the process's own young layers, so the cheap per-word phase cannot
+    // see it and the descent is what flags the receiver.
+    let (root, _leaf) = nested_foreign_root(&mut rt, &mut table, pid, 2);
+    table
+        .get_mut(pid)
+        .expect("the receiver is live")
+        .registers_mut()
+        .extra_roots_mut()
+        .push(root);
+    // The production gate, exactly as `Runtime::new` installs it on the runtime's own table.
+    table.set_collection_gate(Box::new(super::gc_walk::RuntimeCollectionGate::new()));
+    assert!(table.has_collection_gate(), "the host gate is installed");
+
+    // The seam itself, called directly: the answer for this receiver is `true`.
+    {
+        let process = table.get(pid).expect("the receiver is live");
+        let mut gate = super::gc_walk::RuntimeCollectionGate::new();
+        assert!(
+            <super::gc_walk::RuntimeCollectionGate as beam_process::CollectionGate>::declines_relocation(
+                &mut gate,
+                process
+            ),
+            "a container at depth >= 2 on the pooled BIF heap is reachable from the receiver's \
+             gathered roots (its extra roots), so the gate must decline"
+        );
+    }
+
+    // A reason LARGER than the receiver's whole nursery: without a decline the enqueue-time copy
+    // would collect and grow the receiver's heap.
+    let signaller = table.spawn_default().expect("a signaller");
+    table.get_mut(pid).expect("live").set_trap_exit(true);
+    let capacity = table
+        .get(pid)
+        .expect("live")
+        .collector()
+        .young()
+        .capacity_words();
+    let mut src = beam_alloc::Heap::new(capacity + 8).expect("the source arena allocates");
+    let elems: Vec<Eterm> = (0..capacity).map(|i| make_small(i as i64)).collect();
+    let reason = src.tuple(&elems).expect("the oversized reason fits the arena");
+
+    let minor_before = table.get(pid).expect("live").collector().minor_gcs();
+    let base_before = table.get(pid).expect("live").collector().young().base();
+    let mailbox_before = table.get(pid).expect("live").mailbox().len();
+
+    table
+        .send_exit(signaller, pid, reason)
+        .expect("the trapping receiver takes the signal");
+
+    let r = table.get(pid).expect("the receiver survived");
+    assert_eq!(
+        r.collector().minor_gcs(),
+        minor_before,
+        "the installed gate declined the signal-driven relocation"
+    );
+    assert_eq!(
+        r.collector().young().base(),
+        base_before,
+        "a declined signal must not move or grow the nursery"
+    );
+    assert_eq!(
+        r.mailbox().len(),
+        mailbox_before + 1,
+        "the notification is NOT lost: it is enqueued fragment-resident"
+    );
+    assert!(
+        !r.is_relocation_exempt(),
+        "the signal route leaves the receiver's own exemption flag alone"
+    );
+    // The new message is fragment-resident and carries the exit tuple whole.
+    let exit_msg = {
+        let process = table.get_mut(pid).expect("live");
+        let mut last = None;
+        while let Some(message) = process.receive(|_| true) {
+            last = Some(message);
+        }
+        last.expect("the exit message is in the mailbox")
+    };
+    assert!(
+        exit_msg.fragments().is_some(),
+        "the declining gate's fallback enqueued a fragment-resident message"
+    );
+    let payload = exit_msg.payload();
+    assert_eq!(
+        terms::tuple_arity(payload).expect("the exit message is a tuple"),
+        3,
+        "the exit message is the three-tuple EXIT/From/Reason"
+    );
+    assert_eq!(
+        terms::tuple_element(payload, 1).expect("in range"),
+        signaller.to_eterm(),
+        "the signaller is the exit sender"
+    );
+
+    // --- the non-firing guard: an identical receiver with NOTHING foreign reachable takes the
+    // ordinary collect-and-grow arm, so the gate is not an unconditional decline. ---
+    let clean = table.spawn_default().expect("a clean receiver");
+    table.get_mut(clean).expect("live").set_trap_exit(true);
+    let minor_before = table.get(clean).expect("live").collector().minor_gcs();
+    table
+        .send_exit(signaller, clean, reason)
+        .expect("the clean receiver takes the signal");
+    let r = table.get(clean).expect("the clean receiver survived");
+    assert!(
+        r.collector().minor_gcs() > minor_before,
+        "with nothing foreign reachable the gate must NOT fire: the ordinary arm collects"
+    );
+    assert_eq!(
+        r.mailbox().len(),
+        1,
+        "the signal is delivered onto the receiver's own (grown) heap"
+    );
 }

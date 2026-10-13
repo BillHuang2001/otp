@@ -247,25 +247,43 @@ impl Law {
 
 /// The heap policy both strategies share at `objects` long-lived objects of `shape`: the
 /// fullsweep cadence disabled (every collection measured is one this file explicitly asked
-/// for), a nursery that holds the whole corpus, and a mature capacity `2 × (live lines +
-/// reserve)` — the fixed point of [`HeapPolicy::mature_after_fullsweep`] that keeps the
-/// mark-region fullsweep **in place** (neither `should_grow` nor `should_shrink` fires), so
-/// the pinning (or partial-block evacuation) regime is what is measured, never a relocating
-/// fullsweep.
+/// for), a nursery that holds the whole corpus, and a mature capacity that is the **in-place
+/// fixed point** of [`HeapPolicy::mature_after_fullsweep`], so both fullsweeps this file runs
+/// (the promotion and the measured one) reclaim in place rather than relocating.
 ///
-/// The fullsweep is now sized from the **exact live word count**, which for a small-object
-/// live set is far below the line-rounded region size, so `should_shrink` would otherwise fire
-/// and relocate the region. `min_heap_words` is therefore pinned to the (whole-block-aligned)
-/// intended region: with `capacity == min_heap_words`, `should_shrink` can never fire, and
-/// `should_grow` does not either (the region already covers `live.words + reserve` with room to
-/// spare), so the region stays the in-place fixed point the measurement needs.
+/// A fullsweep now sizes its fresh mature space from the **exact live word count** *plus the
+/// nursery's occupancy* (the C `erl_gc.c:2072` `need_after = (HEAP_TOP(p) - HEAP_START(p)) +
+/// need + …`; see [`crate::Collector::collect_major`](beam_gc::Collector::collect_major)). The
+/// promotion fullsweep (phase 2) therefore sees the corpus **twice** — once as the live set and
+/// once as the nursery's fill — i.e. `need_after = 2 × live words + reserve`, and the measured
+/// fullsweep (phase 4, over a nursery of garbage) a little more than the live set.
+///
+/// The fixed point the region must sit at is one where neither [`HeapPolicy::should_grow`]
+/// (`3 × capacity < 4 × need_after`) nor [`HeapPolicy::should_shrink`] fires. Sizing it to
+/// `4/3 × need_after` (whole Immix blocks) and pinning `min_heap_words` to that same value does
+/// exactly that — the second half of `should_shrink` can never hold — so the region is *kept*,
+/// the promotion (or partial-block evacuation) regime is what is measured, and no fullsweep
+/// relocates the region merely to make room for the next promotion.
+///
+/// The `4/3 × need_after` headroom alone is not enough for a small-object shape, though: a
+/// mark-region space charges a whole **line** per object, so the region must also cover the
+/// copy's real line need (`live lines`, one per object) — the `2 × (live lines + reserve)`
+/// floor the sweep's original sizing used. The capacity is the larger of the two, so the
+/// promotion fits the region *and* the policy keeps it.
 fn policy(shape: Shape, objects: usize) -> HeapPolicy {
     let need_reserve_words = 64;
+    let live_words = objects * shape.words();
     let live_line_words = objects * shape.lines() * LINE_WORDS;
-    // Round the intended region up to a whole number of Immix blocks, so the region the
-    // collector builds and its `min_heap_words` floor agree exactly.
-    let mature_words =
-        (2 * (live_line_words + need_reserve_words)).div_ceil(BLOCK_WORDS) * BLOCK_WORDS;
+    // The promotion fullsweep's request: the live set twice (live + a whole nursery's worth of
+    // promotion) plus the reserve.
+    let need_after = 2 * live_words + need_reserve_words;
+    // The line-granular floor: one line per object needs `live_line_words` words, plus the
+    // reserve, doubled (the sweep's original over-provisioning for the line need).
+    let line_floor = 2 * (live_line_words + need_reserve_words);
+    // `4/3 × need_after`, so `3 × capacity >= 4 × need_after` (no grow).
+    let grow_floor = (4 * need_after).div_ceil(3);
+    // Whole Immix blocks, so the region capacity agrees exactly with its `min_heap_words` floor.
+    let mature_words = line_floor.max(grow_floor).div_ceil(BLOCK_WORDS) * BLOCK_WORDS;
     HeapPolicy {
         fullsweep_after: 65535,
         initial_young_words: live_line_words + 4096,

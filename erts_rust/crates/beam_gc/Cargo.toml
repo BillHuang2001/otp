@@ -11,5 +11,14 @@ beam_term = { path = "../beam_term" }
 beam_alloc = { path = "../beam_alloc" }
 libc.workspace = true
 
+[dev-dependencies]
+# `tests/gc_value_oracle.rs` re-encodes a post-collection term with the External Term
+# Format codec and compares it byte-for-byte with the system Erlang oracle's
+# `term_to_binary/1`. This is a **dev-only** edge (never a real dependency, so the
+# release DAG is unchanged): `beam_codec` depends only on `beam_common`/`beam_term`/
+# `beam_alloc`/`flate2`/`libc` and does **not** depend on `beam_gc` (directly or
+# transitively), so it adds no cycle — neither a dev-only cycle nor a backward wave edge.
+beam_codec = { path = "../beam_codec" }
+
 [lints]
 workspace = true

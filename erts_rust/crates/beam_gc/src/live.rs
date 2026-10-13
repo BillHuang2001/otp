@@ -33,40 +33,34 @@
 //! (`need_after = (HEAP_TOP(p) - HEAP_START(p)) + need + stack_size + S_RESERVED`,
 //! `erts/emulator/beam/erl_gc.c:2072`).
 //!
-//! This module provides that count, and it is deliberately the *same* walk a collection
-//! performs: object sizing is [`move_size`](crate::copy::move_size), reference enumeration is
-//! [`for_each_ref`](crate::copy::for_each_ref) — the two `pub(crate)` primitives the copier
-//! and the mark-region space share — so the counter's per-object sizing and child
-//! enumeration cannot drift from the copy it is sizing for. The `#[cfg(test)]` module at the
-//! bottom of this file pins the two to each other.
+//! This module provides that count. The traversal itself — the iterative worklist, its
+//! one-bit-per-word visited set and the per-object sizing/child enumeration driven by the
+//! shared [`move_size`](crate::copy::move_size) / [`for_each_ref`](crate::copy::for_each_ref)
+//! primitives — is [`crate::reachable::walk_reachable`], the *same* read-only walk the public
+//! reachability enumeration ([`crate::Collector::for_each_reachable_object`]) is built on, so
+//! the counter's per-object sizing and child enumeration cannot drift from either the copy it
+//! is sizing for or the enumeration. This module only accumulates the sizes the walk reports.
+//! The `#[cfg(test)]` module at the bottom of this file pins the count to a real collection.
 //!
-//! Properties the counter must have (the objective it exists for):
+//! [`live`]'s contract inherits the walk's: it is **read-only** (it writes no forwarding
+//! marker, so it can run immediately before a collection over the very same from-spaces —
+//! `Copier` relies on the headers still being headers), **iterative** (a 50 000-deep list
+//! cannot overflow the real stack), counts each object **once** however many references reach
+//! it (a shared subterm, a cycle), and skips every reference that falls outside the from-set
+//! (an immediate, a literal, a foreign space, an off-heap pointer) exactly as the copier
+//! classifies [`Target::Foreign`](crate::copy::Target::Foreign).
 //!
-//! * **Read-only.** It writes no forwarding marker, so it can run immediately before a
-//!   collection over the very same from-spaces (`Copier` relies on the headers still being
-//!   headers).
-//! * **Iterative.** The traversal is a worklist over reference words, never the real stack,
-//!   so a 50 000-deep list cannot overflow it.
-//! * **Each object counted once.** A bitset over the from-space ranges (one bit per word)
-//!   records the objects already admitted, so a shared subterm — or a cycle — contributes
-//!   its words exactly once, exactly as the copier's in-place forwarding markers make it.
-//! * **Out-of-from-set references skipped.** An immediate, a literal, a foreign space and an
-//!   off-heap pointer are all left out, precisely as
-//!   [`forward_slot`](crate::copy::forward_slot) classifies
-//!   [`Target::Foreign`](crate::copy::Target::Foreign).
-//!
-//! `unsafe` here is confined to reading the words the walk visits — the same guarantee the
-//! copier relies on ([`Target::Live`](crate::copy::Target::Live) dereferences them too) — and
-//! each block carries a `// SAFETY:` rationale.
+//! This module is safe Rust: the word-level `unsafe` lives in
+//! [`crate::reachable`](crate::reachable) (the walk) and [`crate::copy`](crate::copy) (the
+//! sizing/reference primitives), each with a `// SAFETY:` rationale.
 
 use core::mem::size_of;
 
-use beam_common::Result;
-use beam_term::prelude::{is_header, primary_tag, ptr_val, Eterm, PrimaryTag};
+use beam_term::prelude::Eterm;
 
-use crate::copy::{for_each_ref, move_size};
 use crate::immix::{lines_for, ImmixSpace};
 use crate::nursery::Nursery;
+use crate::reachable::walk_reachable;
 use crate::space::FromSet;
 
 /// The exact size of the live graph a fullsweep has to evacuate.
@@ -86,53 +80,16 @@ pub(crate) struct Live {
 /// Counts the live graph reachable from `roots` out of the evacuated ranges of `from` — see
 /// the module docs. `roots` is borrowed immutably: the count never rewrites a term.
 pub(crate) fn live(from: &FromSet, roots: &[Eterm]) -> Live {
-    let mut visited = Visited::new(from);
-    let mut work: Vec<*mut Eterm> = Vec::new();
     let mut words = 0usize;
     let mut lines = 0usize;
 
-    for &root in roots {
-        seed(root, &mut visited, &mut work);
-    }
-
-    // A worklist, so the traversal depth is bounded by the heap and not by the real stack:
-    // a 50 000-cell list is counted without recursing once.
-    while let Some(obj) = work.pop() {
-        // SAFETY: `obj` was admitted only through `Visited::index`, i.e. only when it
-        // addresses a word of one of the caller's from-space ranges — the same guarantee
-        // `Copier` relies on before it dereferences a reference word
-        // (`Target::Live`/`Target::Forwarded` both read `*ptr`). Its first word is
-        // therefore readable.
-        let first = unsafe { *obj };
-        // A cons cell carries no header word: its first word is the car, a term that never
-        // has the `Header` primary tag (`beam_term::tag::is_header`). That frozen shape test
-        // is the one `Copier::complete` and the mark-region `scan_young` use.
-        let total = if is_header(first) {
-            move_size(first, obj)
-        } else {
-            2
-        };
+    let walk = walk_reachable(from, roots, |_first, _ptr, total| {
         words += total;
         lines += lines_for(total);
-
-        // SAFETY: `obj` addresses a live object of exactly `total` words, all readable and
-        // none of them written (this walk is read-only), so the canonical child-slot
-        // enumeration is covered by this block. `for_each_ref` yields the address of a live
-        // reference word inside the object `obj`, so reading it through `*slot` is covered
-        // too.
-        let walk: Result<()> = unsafe {
-            for_each_ref(obj, total, &mut |slot| {
-                let term = *slot;
-                if matches!(primary_tag(term), PrimaryTag::Boxed | PrimaryTag::List) {
-                    admit(ptr_val(term) as *const Eterm, &mut visited, &mut work);
-                }
-                Ok(())
-            })
-        };
-        // The visit closure above is infallible, so the enumeration cannot fail; the
-        // accumulator exists only because the shared primitive's signature is fallible.
-        debug_assert!(walk.is_ok(), "the live counter's visit closure never fails");
-    }
+    });
+    // The counting closure above is infallible, so the walk cannot fail; the accumulator
+    // exists only because the shared reference enumeration's signature is fallible.
+    debug_assert!(walk.is_ok(), "the live counter's visit closure never fails");
 
     Live { words, lines }
 }
@@ -147,71 +104,6 @@ pub(crate) fn live_full(nursery: &Nursery, mature: &ImmixSpace, roots: &[Eterm])
     let base = mature.base() as usize;
     from.add_range(base, base + mature.capacity_words() * size_of::<Eterm>());
     live(&from, roots)
-}
-
-/// Admits `ptr` into the worklist when it names a from-space object that has not been counted
-/// yet — a reference outside every range (a literal, a foreign space, an off-heap pointer) is
-/// skipped, exactly as the copier's forwarding switch leaves its `Target::Foreign` alone.
-fn admit(ptr: *const Eterm, visited: &mut Visited, work: &mut Vec<*mut Eterm>) {
-    if let Some(index) = visited.index(ptr) {
-        if visited.test_and_set(index) {
-            work.push(ptr as *mut Eterm);
-        }
-    }
-}
-
-/// Seeds the worklist with `term` when it is a reference into a from-space range.
-fn seed(term: Eterm, visited: &mut Visited, work: &mut Vec<*mut Eterm>) {
-    if matches!(primary_tag(term), PrimaryTag::Boxed | PrimaryTag::List) {
-        admit(ptr_val(term) as *const Eterm, visited, work);
-    }
-}
-
-/// The visited set: **one bit per word** of every from-space range, so an object is counted
-/// exactly once however many references reach it (a shared subterm, a cycle). Keying on the
-/// object's first word is the same identity the copier's in-place forwarding marker uses, so
-/// the two dedup in lockstep.
-struct Visited {
-    /// `(lo, hi, first_bit)` per range, `lo`/`hi` in byte addresses and `first_bit` the bit
-    /// index the range starts at — the ranges are packed into one bit vector.
-    ranges: Vec<(usize, usize, usize)>,
-    bits: Vec<u64>,
-}
-
-impl Visited {
-    /// Indexes the ranges of `from` (`from.ranges()` is byte-addressed; a range added from a
-    /// space's live region spans a whole number of term words).
-    fn new(from: &FromSet) -> Visited {
-        let word = size_of::<Eterm>();
-        let mut ranges = Vec::with_capacity(from.ranges().len());
-        let mut total = 0usize;
-        for &(lo, hi) in from.ranges() {
-            ranges.push((lo, hi, total));
-            total += (hi - lo) / word;
-        }
-        Visited {
-            ranges,
-            bits: vec![0; total.div_ceil(64)],
-        }
-    }
-
-    /// The bit index of the word `ptr` addresses, or `None` when it lies outside every range.
-    fn index(&self, ptr: *const Eterm) -> Option<usize> {
-        let addr = ptr as usize;
-        self.ranges.iter().find_map(|&(lo, hi, first)| {
-            (lo <= addr && addr < hi).then(|| first + (addr - lo) / size_of::<Eterm>())
-        })
-    }
-
-    /// Sets the bit at `index`, reporting whether it was previously clear (a newly seen
-    /// object).
-    fn test_and_set(&mut self, index: usize) -> bool {
-        let word = index / 64;
-        let mask = 1u64 << (index % 64);
-        let newly_seen = self.bits[word] & mask == 0;
-        self.bits[word] |= mask;
-        newly_seen
-    }
 }
 
 #[cfg(test)]

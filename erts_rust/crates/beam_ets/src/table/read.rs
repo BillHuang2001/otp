@@ -234,6 +234,44 @@ impl Table {
         Ok(self.interior.prev_key(key, atoms))
     }
 
+    /// `ets:slot/2`: the objects in slot `slot` — the positional read the oracle
+    /// pairs with [`next`](Table::next)/[`prev`](Table::prev) for a table whose
+    /// iteration order is not contract.
+    ///
+    /// Mirrors the system `erl` (OTP 29.1.1 / erts-17.1) exactly:
+    ///
+    /// * slot numbers are **0-based** (the oracle's `db_slot` counts "from 1 and
+    ///   up" only inside its own 1-based tree search — `erl_db_tree.c:1171`);
+    /// * `Ok(Some(objects))` is the slot's object list — a **one-element** list
+    ///   for an `ordered_set` (one object per key), possibly empty or several
+    ///   objects for the hash kinds (`set`/`bag`/`duplicate_bag`), where a slot is
+    ///   a hash bucket;
+    /// * `Ok(None)` is the `'$end_of_table'` slot — the first slot past the end;
+    /// * `Err(BeamError::BadArg)` is **every** out-of-range or ill-typed slot: a
+    ///   negative or `'$end_of_table'`-beyond slot, and a non-integer never
+    ///   reaches this method (the caller cannot turn an atom/float/list into an
+    ///   `i64`, so it raises `badarg` itself, exactly like the oracle).
+    ///
+    /// The slot argument is a **signed** integer so that the oracle's
+    /// `signed_val(slot_term) < 0` rejection (`erl_db_hash.c:1741`,
+    /// `erl_db_tree.c:1157`) is answered here: a negative slot is `badarg`. A
+    /// bignum slot is the caller's `badarg` (an `i64` cannot carry one); every
+    /// bignum is far beyond any slot count, so it is `badarg` either way.
+    ///
+    /// The **slot layout is not part of the contract** for the hash kinds
+    /// (`../CONTEXT.md` §2): the interior decides its own partition of the stored
+    /// objects (see `Interior::slot`), so which objects a hash slot holds, and how
+    /// many slots there are, differ from ERTS's — only the partition, the single
+    /// end-of-table slot and the badarg boundary are reproduced. An `ordered_set`
+    /// is exact: slot `n` is the object with the (n+1)-th smallest key, and the
+    /// end-of-table slot is `size`.
+    pub fn slot(&self, slot: i64, atoms: &AtomTable) -> Result<Option<Vec<Eterm>>> {
+        // A negative slot is `badarg` before the interior is consulted, mirroring
+        // the C `signed_val(slot_term) < 0`.
+        let slot = usize::try_from(slot).map_err(|_| badarg())?;
+        self.interior.slot(slot, atoms)
+    }
+
     /// The guard shared by [`next`](Table::next)/[`prev`](Table::prev): only the
     /// hash kinds need the anchor key to be present.
     fn check_navigable(&self, key: Eterm, atoms: &AtomTable) -> Result<()> {

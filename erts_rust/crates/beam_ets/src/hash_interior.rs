@@ -112,6 +112,16 @@ impl HashInterior {
         (term_hash(key, atoms) as usize) % self.buckets.len()
     }
 
+    /// The number of hash slots this index exposes (`ets:slot/2`'s
+    /// `'$end_of_table'` boundary): the bucket-array length.
+    ///
+    /// The C's `nactive` (`NACTIVE(tb)`, the count of active buckets); it is this
+    /// interior's own, unpinned bucket *count* — only the resulting
+    /// partition/end-of-table/badarg contract is.
+    fn bucket_count(&self) -> usize {
+        self.buckets.len()
+    }
+
     /// The position of `key`'s entry in `bucket`, if any. Term equality is
     /// delegated to `beam_term::compare::eq`.
     fn entry_pos(bucket: &[Entry], key: Eterm, atoms: &AtomTable) -> Option<usize> {
@@ -510,6 +520,37 @@ impl Interior for HashInterior {
     /// `first`/`next`), so this is [`iter_objects`](Interior::iter_objects) as-is.
     fn iter_objects_rev(&self) -> Box<dyn Iterator<Item = Eterm> + '_> {
         self.iter_objects()
+    }
+
+    /// `ets:slot/2` for a hash kind: the objects of hash **bucket** `slot` — the
+    /// list `erl_db_hash.c:1733` `db_slot_hash` builds from `BUCKET(tb, slot)`.
+    ///
+    /// The bucket-array length ([`Self::bucket_count`], the C `nactive`) is this
+    /// interior's own: slots `0..len` **partition every** stored object (each
+    /// object belongs to the one bucket its key hashes to, and a bucket holds all
+    /// objects of every key that hashes to it), slot `len` is `'$end_of_table'`,
+    /// and `slot > len` is `badarg` — the C's `slot < nactive` /
+    /// `slot == nactive` / `slot > nactive` cases exactly.
+    ///
+    /// The bucket *count* is an interior freedom (`../CONTEXT.md` §2): ERTS
+    /// derives its `nactive` from its own bucket allocation, so which slot a given
+    /// object lands in is not reproducible — but the partition, the single
+    /// end-of-table slot and the out-of-range failure are.
+    fn slot(&self, slot: usize, _atoms: &AtomTable) -> Result<Option<Vec<Eterm>>> {
+        let nactive = self.bucket_count();
+        if slot > nactive {
+            return Err(badarg());
+        }
+        if slot == nactive {
+            return Ok(None);
+        }
+        // `slot < nactive` because of the two guards above.
+        Ok(Some(
+            self.buckets[slot]
+                .iter()
+                .flat_map(|entry| entry.objs.iter().copied())
+                .collect(),
+        ))
     }
 
     fn memory(&self) -> usize {

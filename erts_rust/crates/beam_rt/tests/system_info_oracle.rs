@@ -201,7 +201,6 @@ const ORACLE_ACCEPTED_UNSUPPORTED_KEYS: &[&str] = &[
     "check_io",
     "c_compiler_used",
     "embedded_3pps",
-    "system_logger",
     "info",
     "procs",
     "loaded",
@@ -222,6 +221,16 @@ const ORACLE_ACCEPTED_UNSUPPORTED_KEYS: &[&str] = &[
     "max_integer",
     "thread_progress",
 ];
+
+/// Keys whose value is **this runtime's own process**, so neither value nor kind is
+/// comparable: the oracle answers the pid of the process *it* has registered (a different
+/// process of a different emulator), while this runtime answers the pid of the process it
+/// has registered — or the atom `undefined` when it has none (the preloaded-only
+/// `-eval`/`run` path; the oracle produces the same alternative shape after
+/// `erlang:system_flag(system_logger, undefined)`). The test therefore only pins that the
+/// oracle accepts the key and that our answer is a pid or the honest `undefined` — never a
+/// fabricated pid and never a wrong shape.
+const ORACLE_OWN_PID_KEYS: &[&str] = &["system_logger"];
 
 /// Keys the oracle raises `error:badarg` for — this runtime must not invent an answer.
 const ORACLE_REJECTED_KEYS: &[&str] = &[
@@ -257,6 +266,7 @@ enum Kind {
     List,
     Map,
     Binary,
+    Pid,
 }
 
 /// A value's observable shape: its kind plus (for containers) its top-level arity.
@@ -303,6 +313,11 @@ fn rust_shape(value: &InfoValue) -> Shape {
         InfoValue::Map(pairs) => Shape {
             kind: Kind::Map,
             arity: pairs.len(),
+        },
+        // A pid is a scalar: `~p` renders it as `<N.M.K>` with no comparable element count.
+        InfoValue::Pid(_) => Shape {
+            kind: Kind::Pid,
+            arity: 0,
         },
     }
 }
@@ -374,6 +389,11 @@ fn oracle_shape(text: &str) -> Shape {
     if text.parse::<i64>().is_ok() {
         return scalar(Kind::Int);
     }
+    // A pid renders as `<N.M.K>`. Checked after the binary/tuple/list forms (a bit string
+    // also opens with `<`, but `<<"…">>` / `<<1,2>>` already returned above).
+    if text.starts_with('<') && text.ends_with('>') {
+        return scalar(Kind::Pid);
+    }
     scalar(Kind::Atom)
 }
 
@@ -434,6 +454,10 @@ fn render(value: &InfoValue) -> String {
                 .collect();
             format!("#{{{}}}", parts.join(","))
         }
+        // A pid renders as `<Number.Serial.0>` (the creation is this runtime's node-local
+        // one). No key carrying this variant is text-compared against the oracle — the
+        // oracle's pid names a different process of a different emulator.
+        InfoValue::Pid(pid) => format!("<0.{}.{}>", pid.number(), pid.serial()),
     }
 }
 
@@ -729,6 +753,7 @@ fn the_key_sets_partition_the_supported_surface() {
     let mut classified: Vec<&str> = ORACLE_EQUAL_KEYS
         .iter()
         .chain(SHAPE_ONLY_KEYS)
+        .chain(ORACLE_OWN_PID_KEYS)
         .copied()
         .collect();
     classified.sort_unstable();
@@ -748,6 +773,7 @@ fn the_oracle_shapes_and_values_match() {
     let keys: Vec<&str> = ORACLE_EQUAL_KEYS
         .iter()
         .chain(SHAPE_ONLY_KEYS)
+        .chain(ORACLE_OWN_PID_KEYS)
         .chain(ORACLE_ACCEPTED_UNSUPPORTED_KEYS.iter())
         .chain(ORACLE_REJECTED_KEYS.iter())
         .copied()
@@ -780,6 +806,26 @@ fn the_oracle_shapes_and_values_match() {
         );
     }
 
+    // -- keys whose value is this runtime's own process ----------------------------
+    // The oracle answers *its* process; we answer ours (a pid) or the honest `undefined`
+    // when no boot script has registered one. Never a fabricated pid.
+    for key in ORACLE_OWN_PID_KEYS {
+        let oracle = answers
+            .get(*key)
+            .unwrap_or_else(|| panic!("the oracle did not answer {key}"));
+        assert!(
+            !oracle_rejected(oracle),
+            "the oracle must accept {key}: {oracle}"
+        );
+        let value =
+            system_info_value(key, &rt).unwrap_or_else(|error| panic!("system_info({key}): {error}"));
+        match &value {
+            InfoValue::Pid(_) | InfoValue::Atom("undefined") => {}
+            other => panic!(
+                "system_info({key}) must be a pid or the honest `undefined`, got {other:?}"
+            ),
+        }
+    }
     // -- keys whose value must match exactly ---------------------------------------
     for key in ORACLE_EQUAL_KEYS {
         let oracle = answers

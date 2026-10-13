@@ -198,29 +198,3 @@ pub(super) fn matches(
         }
     }
 }
-
-/// The `'$N'` variables a pattern binds. Unused by the executor (the set is
-/// collected during decoding) but handy for tests.
-#[allow(dead_code)]
-pub(super) fn bound_vars(pattern: &Pattern, out: &mut BTreeSet<u32>) {
-    match pattern {
-        Pattern::Bind(index) => {
-            out.insert(*index);
-        }
-        Pattern::Tuple(patterns) => {
-            for pattern in patterns {
-                bound_vars(pattern, out);
-            }
-        }
-        Pattern::Cons(head, tail) => {
-            bound_vars(head, out);
-            bound_vars(tail, out);
-        }
-        Pattern::Map(entries) => {
-            for (_, value) in entries {
-                bound_vars(value, out);
-            }
-        }
-        Pattern::Wildcard | Pattern::Literal(_) => {}
-    }
-}

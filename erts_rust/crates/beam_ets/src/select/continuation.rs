@@ -160,8 +160,8 @@
 //!   mutation landing at or behind that ordinal shifts the resume, where the oracle's
 //!   bucket cursor would not: that divergence is the *only* one, it is **never a typed
 //!   error and never a wrong result** for a walk with no mutation between chunks (the
-//!   159-case differential battery and the whole continuation suite hold the table
-//!   fixed between chunks and agree everywhere).
+//!   differential battery and the whole continuation suite hold the table fixed
+//!   between chunks and agree everywhere).
 //!
 //! Both cursor shapes are bounds-checked, so a stale ordinal never reads out of
 //! bounds — it just resumes at a possibly different object.

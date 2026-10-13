@@ -36,10 +36,10 @@ use std::time::{Duration, Instant};
 use beam_alloc::Heap;
 use beam_common::BeamError;
 use beam_dist::connection::{connect_to_node, Connection, TcpListener as DistListener, TcpTransport};use beam_dist::epmd::{
-    lookup, lookup_port, Alive2Req, Alive2Resp, DumpLine, DumpNodeKind, DumpReq, DumpResp,
-    EpmdClient, KillReq, KillResp, NamesResp, Port2Req, Port2Resp, StopReq, StopResp,
-    EPMD_ALIVE2_REQ, EPMD_ALIVE2_RESP, EPMD_ALIVE2_X_RESP, EPMD_DEFAULT_ADDR, EPMD_DIST_HIGH,
-    EPMD_DIST_LOW, EPMD_DUMP_REQ, EPMD_KILL_REQ, EPMD_NAMES_REQ, EPMD_NODE_HIDDEN,
+    lookup, lookup_at, lookup_port, lookup_port_at, Alive2Req, Alive2Resp, DumpLine, DumpNodeKind,
+    DumpReq, DumpResp, EpmdClient, KillReq, KillResp, NamesResp, Port2Req, Port2Resp, StopReq,
+    StopResp, EPMD_ALIVE2_REQ, EPMD_ALIVE2_RESP, EPMD_ALIVE2_X_RESP, EPMD_DEFAULT_ADDR,
+    EPMD_DIST_HIGH, EPMD_DIST_LOW, EPMD_DUMP_REQ, EPMD_KILL_REQ, EPMD_NAMES_REQ, EPMD_NODE_HIDDEN,
     EPMD_NODE_NORMAL, EPMD_PORT2_REQ, EPMD_PORT2_RESP, EPMD_PORT_PLEASE2_REQ, EPMD_PROTO_TCP,
     EPMD_STOP_REQ, MAX_DUMP_RESP_BODY,
 };use beam_dist::flags::Dop;
@@ -721,6 +721,75 @@ fn live_epmd_publish_then_a_second_connection_looks_the_port_up() {
         "epmd still knows {name} after its ALIVE2 socket closed"
     );
     eprintln!("live_epmd: {name} de-registered once its ALIVE2 socket closed");
+}
+
+/// The address-taking lookups reach a **real** `epmd`: `lookup_at`/
+/// `lookup_port_at` (aimed here at [`EPMD_DEFAULT_ADDR`], where they coincide
+/// with the pinned `lookup`/`lookup_port` wrappers) resolve a freshly registered
+/// node and report an unknown name as the same typed `NotFound`.
+#[test]
+fn live_epmd_address_taking_lookups_resolve_a_node() {
+    let Some(mut publisher) = live_epmd_client() else {
+        return;
+    };
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a free port");
+    let port = listener.local_addr().expect("local_addr").port();
+    let name = live_node_name();
+
+    let req = Alive2Req {
+        port,
+        node_type: EPMD_NODE_NORMAL,
+        protocol: EPMD_PROTO_TCP,
+        high_vsn: EPMD_DIST_HIGH,
+        low_vsn: EPMD_DIST_LOW,
+        name: name.clone().into_bytes(),
+        extra: Vec::new(),
+    };
+    let resp = match publisher.publish(&req) {
+        Ok(resp) => resp,
+        Err(err) => {
+            eprintln!(
+                "live_epmd: SKIP — {EPMD_DEFAULT_ADDR} accepted the connection but not an \
+                 ALIVE2_REQ ({err:?}); `lookup_at` is still exercised hermetically by \
+                 tests/hermetic_epmd.rs"
+            );
+            return;
+        }
+    };
+    match &resp {
+        Alive2Resp::Legacy { ok, .. } | Alive2Resp::Extended { ok, .. } => {
+            assert!(*ok, "epmd refused to register {name} on port {port}: {resp:?}")
+        }
+    }
+
+    // `lookup_port_at` resolves the node through the real daemon.
+    assert_eq!(
+        lookup_port_at(EPMD_DEFAULT_ADDR, name.as_bytes()).expect("lookup_port_at"),
+        port,
+        "lookup_port_at must resolve the registered port"
+    );
+    // `lookup_at` returns the same registration as a raw `Port2Resp`.
+    match lookup_at(EPMD_DEFAULT_ADDR, name.as_bytes()).expect("lookup_at") {
+        Port2Resp::Ok { port: found, .. } => assert_eq!(found, port),
+        Port2Resp::Error => panic!("epmd did not know {name} right after registering it"),
+    }
+
+    // An unregistered name is the same typed `NotFound` as the pinned form.
+    let absent = format!("{name}absent");
+    match lookup_port_at(EPMD_DEFAULT_ADDR, absent.as_bytes()) {
+        Err(BeamError::Io(err)) => {
+            assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "unregistered name: {err:?}");
+        }
+        other => panic!("an unregistered name must be NotFound, got {other:?}"),
+    }
+
+    // Closing the ALIVE2 socket de-registers the node.
+    drop(publisher);
+    assert!(
+        wait_until_unregistered(name.as_bytes(), Duration::from_secs(5)),
+        "epmd still knows {name} after its ALIVE2 socket closed"
+    );
 }
 
 /// The cookie and node identity the `connect_to_node` live test authenticates with.

@@ -48,13 +48,24 @@
 //! fullsweep cadence (`fullsweep_after = 65535`). Neither test overrides a sizing knob.
 //!
 //! Test 1 deliberately runs that **default cadence** rather than forcing a fullsweep per round:
-//! the fullsweep now sizes its fresh mature space from the **exact reachable live word count**
-//! (`collect_major` → `crate::live`), not from the (garbage-inflated) pre-collection occupancy,
-//! so the mature capacity converges under the very cadence a plain process runs — the strongest
-//! form of the regression assertion. Sizing it from the occupancy instead makes
-//! [`HeapPolicy::should_grow`] fire on every fullsweep and creeps the capacity up one
-//! growth-table step per fullsweep, without bound, for a live set that never changes. The same
+//! the fullsweep sizes its fresh mature space from the **exact reachable live word count**
+//! (`collect_major` → `crate::live`) **plus the young heap's occupancy** — a whole nursery's
+//! worth of promotion, so the next collections can be minors (the C `adjust_after_fullsweep`'s
+//! `need_after = (HEAP_TOP(p) - HEAP_START(p)) + need + …`, `erl_gc.c:2072`) — and **never** from
+//! the *mature* generation's (garbage-inflated) pre-collection occupancy. Sizing from the mature
+//! occupancy makes [`HeapPolicy::should_grow`] fire on every fullsweep and creeps the capacity up
+//! one growth-table step per fullsweep, without bound, for a live set that never changes. The
+//! young occupancy is a different quantity: it is bounded by the nursery capacity, which
+//! [`HeapPolicy::young_after_collection`] keeps bounded, so the capacity converges under the very
+//! cadence a plain process runs — the strongest form of the regression assertion. The same
 //! property, isolated from the nursery, is pinned by `tests/mature_capacity_convergence.rs`.
+//!
+//! Under that rule the **copying** strategy's mature occupancy is *not* constant: a copying minor
+//! promotes the nursery's live words *onto the top of* the mature space without reclaiming it
+//! (that is the point of a generational collector — the mature generation is reclaimed only by a
+//! fullsweep), so the occupancy steps up one live set per minor until the escalation test fires a
+//! fullsweep. Its deterministic **cycle** is pinned instead of a constant, and every *capacity*
+//! is a constant.
 //!
 //! ## Determinism
 //!
@@ -140,46 +151,69 @@ const MEASURED: usize = 200;
 /// The stable live set in words (the graph with which the converged heap must cope).
 const LIVE_WORDS: usize = LIVE_TUPLES as usize * TUPLE_WORDS;
 
-/// One round's quiescent-heap observables.
+/// One round's quiescent-heap observables that must be **constant** under the default cadence.
+///
+/// `mature().used_words()` is deliberately not a field: for the copying strategy it cycles (see
+/// the module header) and for the mark-region strategy it is constant, so the per-strategy
+/// [`occupancy_cycle`] pins either shape exactly instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Steady {
     /// `young().capacity_words()` — the nursery capacity (the C `HEAP_SIZE`).
     young_capacity: usize,
     /// `mature().capacity_words()` — the mature generation's capacity.
     mature_capacity: usize,
-    /// `mature().used_words()` — the words the mature generation holds.
-    mature_occupancy: usize,
     /// `heap_info().total_heap_size` = nursery + mature capacity (the C `heap_sz + old heap`).
     total_heap_size: usize,
 }
 
-/// The converged steady state for the **copying** strategy. The fullsweep now sizes the fresh
-/// mature space from the **exact** reachable live word count (60 words) plus the reserve — not
-/// from the round's occupancy — so `mature_after_fullsweep(233, 60, 0)` neither grows nor
-/// shrinks the default 233-word mature capacity; the nursery stays at the default 233.
+/// The converged **constant** steady state for the **copying** strategy. The fullsweep sizes the
+/// fresh mature space from the exact reachable live word count (60 words) **plus the young heap's
+/// occupancy** (210 words) plus the reserve: `mature_after_fullsweep(233, 60, 210)` requests
+/// `next_words(334) = 376` words, so the default 233-word mature capacity moves one growth-table
+/// step to 376 (`376 >= 334` and `3 * 376 >= 4 * 334`, so it is then a fixed point). The nursery
+/// stays at the default 233 and the total heap is `233 + 376 = 609`. The mature *occupancy* is
+/// not constant — see [`COPYING_OCCUPANCY_CYCLE`].
 const COPYING_STEADY: Steady = Steady {
     young_capacity: DEFAULT_NURSERY,
-    mature_capacity: 233,
-    mature_occupancy: LIVE_WORDS,
-    total_heap_size: 233 + 233,
+    mature_capacity: 376,
+    total_heap_size: 233 + 376,
 };
 
-/// The converged steady state for the **mark-region** strategy. The exact-live sizing asks the
-/// policy for `next_words(2 * (60 + need_reserve(64))) = 376` words; the line-granular region
-/// rounds that request up to two whole 256-word blocks (512), and the 20 live tuples occupy 20
-/// lines = 320 resident words. The nursery stays at the default 233.
+/// The **copying** mature occupancy's converged cycle: one live set per minor since the last
+/// fullsweep (`60 -> 120 -> 180 -> 60`). A minor promotes the nursery's live words onto the top
+/// of the mature space without reclaiming it; once the mature space can no longer receive the
+/// nursery's occupancy the escalation test fires a fullsweep, which evacuates young *and* mature
+/// into a fresh space holding exactly the 60-word live set — so the occupancy starts over at 60
+/// rather than growing without bound.
+const COPYING_OCCUPANCY_CYCLE: [usize; 3] = [LIVE_WORDS, 2 * LIVE_WORDS, 3 * LIVE_WORDS];
+
+/// The converged **constant** steady state for the **mark-region** strategy. The exact-live
+/// sizing asks the policy for `next_words(60 + 210 + need_reserve(64)) = next_words(334) = 376`
+/// words; the line-granular region rounds that request up to two whole 256-word blocks (512), and
+/// the 20 live tuples occupy 20 lines = 320 resident words. The nursery stays at the default 233.
 const IMMIX_STEADY: Steady = Steady {
     young_capacity: DEFAULT_NURSERY,
     mature_capacity: 512,
-    mature_occupancy: LIVE_TUPLES as usize * 16,
     total_heap_size: 233 + 512,
 };
 
-/// The pinned expectation for a strategy.
+/// The **mark-region** occupancy is constant: the region is reclaimed **in place** at every
+/// fullsweep and then holds exactly the live set — 20 one-line tuples = 20 lines = 320 words.
+const IMMIX_OCCUPANCY_CYCLE: [usize; 1] = [LIVE_TUPLES as usize * 16];
+
+/// The pinned constant expectation for a strategy.
 fn expected(kind: MatureKind) -> Steady {
     match kind {
         MatureKind::Copying => COPYING_STEADY,
         MatureKind::Immix => IMMIX_STEADY,
+    }
+}
+
+/// The pinned mature-occupancy cycle for a strategy (a single value for the mark-region space).
+fn occupancy_cycle(kind: MatureKind) -> &'static [usize] {
+    match kind {
+        MatureKind::Copying => &COPYING_OCCUPANCY_CYCLE,
+        MatureKind::Immix => &IMMIX_OCCUPANCY_CYCLE,
     }
 }
 
@@ -215,6 +249,7 @@ fn the_quiescent_heap_converges_to_a_constant() {
 
         let mut roots: Vec<Eterm> = Vec::new();
         let mut samples: Vec<Steady> = Vec::with_capacity(MEASURED);
+        let mut occupancies: Vec<usize> = Vec::with_capacity(MEASURED);
         let mut kinds: Vec<CollectionKind> = Vec::with_capacity(WARMUP + MEASURED);
 
         for round in 0..(WARMUP + MEASURED) {
@@ -252,10 +287,10 @@ fn the_quiescent_heap_converges_to_a_constant() {
 
             if round >= WARMUP {
                 let (mature_occupancy, mature_capacity) = mature_words(&c);
+                occupancies.push(mature_occupancy);
                 samples.push(Steady {
                     young_capacity: c.young().capacity_words(),
                     mature_capacity,
-                    mature_occupancy,
                     total_heap_size: c.heap_info().total_heap_size,
                 });
             }
@@ -269,25 +304,34 @@ fn the_quiescent_heap_converges_to_a_constant() {
         // round fills it), and the rounds in between run minors. Asserting both happened keeps
         // the convergence honest: it is the sizing of the real fullsweep, not a run that never
         // reached one.
-        assert!(
-            kinds.contains(&CollectionKind::Minor),
-            "{kind:?}: the default cadence must run minors"
-        );
+        //
+        // For the **copying** strategy that is exactly the 60 -> 120 -> 180 occupancy cycle: two
+        // minors per fullsweep. The **mark-region** region is line-granular and its `collect`
+        // escalates to a fullsweep unless the region's *free lines* cover the promotion's line
+        // need: 20 one-line tuples need 20 lines, while the 512-word (32-line) region holds the
+        // 20-line live set and leaves only 12 free lines — so at the default policy every
+        // collection is a fullsweep (reclaimed in place, which is why its occupancy is constant).
+        // The mark-region *minor* cadence is pinned by `tests/generational_cadence.rs`, whose
+        // bounded live set does leave the region room to promote.
         assert!(
             kinds.contains(&CollectionKind::Major),
             "{kind:?}: the default cadence must escalate to a fullsweep"
+        );
+        assert_eq!(
+            kinds.contains(&CollectionKind::Minor),
+            kind == MatureKind::Copying,
+            "{kind:?}: the default cadence must run minors (copying only: this live set leaves \
+             the mark-region region too few free lines to admit a promotion)"
         );
 
         // ---- the converged constant: min == max for all four observables ----
         let young: Vec<usize> = samples.iter().map(|s| s.young_capacity).collect();
         let mature_cap: Vec<usize> = samples.iter().map(|s| s.mature_capacity).collect();
-        let mature_occ: Vec<usize> = samples.iter().map(|s| s.mature_occupancy).collect();
         let totals: Vec<usize> = samples.iter().map(|s| s.total_heap_size).collect();
 
         for (label, series) in [
             ("young capacity", &young),
             ("mature capacity", &mature_cap),
-            ("mature occupancy", &mature_occ),
             ("total_heap_size", &totals),
         ] {
             let (min, max) = min_max(series);
@@ -298,7 +342,7 @@ fn the_quiescent_heap_converges_to_a_constant() {
             );
         }
 
-        // ---- and the constant is exactly the pinned expectation ----
+        // ---- and the capacities are exactly the pinned expectation ----
         let want = expected(kind);
         assert_eq!(
             samples[MEASURED - 1],
@@ -306,12 +350,23 @@ fn the_quiescent_heap_converges_to_a_constant() {
             "{kind:?}: the converged quiescent heap must equal the pinned expectation"
         );
 
+        // ---- the mature occupancy follows the pinned cycle, exactly ----
+        let cycle = occupancy_cycle(kind);
+        let mut observed = occupancies.clone();
+        observed.sort_unstable();
+        observed.dedup();
+        let mut pinned = cycle.to_vec();
+        pinned.sort_unstable();
+        assert_eq!(
+            observed, pinned,
+            "{kind:?}: the mature occupancy must follow the pinned cycle {cycle:?}"
+        );
+
         // ---- non-trivial: it covers the stable live set and is not a degenerate minimum ----
         assert!(
-            want.mature_occupancy >= LIVE_WORDS,
-            "{kind:?}: the converged mature occupancy ({} words) must cover the stable live set \
-             ({LIVE_WORDS} words)",
-            want.mature_occupancy
+            *cycle.iter().min().expect("a pinned cycle") >= LIVE_WORDS,
+            "{kind:?}: the mature occupancy cycle {cycle:?} must cover the stable live set \
+             ({LIVE_WORDS} words)"
         );
         assert!(
             want.total_heap_size >= LIVE_WORDS + DEFAULT_NURSERY,
@@ -333,9 +388,9 @@ fn the_quiescent_heap_converges_to_a_constant() {
              warm-up), stable live set = {LIVE_WORDS} words:"
         );
         eprintln!(
-            "  young capacity = {}, mature capacity = {}, mature occupancy = {}, \
-             total_heap_size = {}",
-            want.young_capacity, want.mature_capacity, want.mature_occupancy, want.total_heap_size
+            "  young capacity = {}, mature capacity = {}, total_heap_size = {}, mature occupancy \
+             cycles over {cycle:?}",
+            want.young_capacity, want.mature_capacity, want.total_heap_size
         );
     }
 }

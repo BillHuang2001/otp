@@ -108,8 +108,9 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 - **Reads:** `lookup(key) -> Vec<Eterm>` (0/1 for set/ordered_set), `member`, `lookup_element(key, pos)`
   / `lookup_element_or(key, pos, default)` (scalar; `unsupported` raise for the multi kinds),
   `lookup_element_all(key, pos) -> Vec<Eterm>` / `lookup_element_all_or(..) -> Option<Vec<Eterm>>` (the
-  multi kinds' list result), `memory()`, `size()` (objects, not keys, for bag/dup_bag), `is_empty()`,
-  `tab2list()` (ordered for ordered_set).
+  multi kinds' list result), `slot(slot, atoms) -> Result<Option<Vec<Eterm>>>` (`ets:slot/2`: 0-based;
+  `None` ⇒ `'$end_of_table'`; a negative or out-of-range slot ⇒ `badarg`), `memory()`, `size()` (objects,
+  not keys, for bag/dup_bag), `is_empty()`, `tab2list()` (ordered for ordered_set).
 - **Element updates:** `update_counter(key, op)`, `update_counter_with(key, op, default)`,
   `update_element(key, &[(pos, term)]) -> bool`.
 - **Navigation:** `first()`, `last()`, `next(key)`, `prev(key)`, `take(key) -> Vec<Eterm>` (copies out +
@@ -136,7 +137,7 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   table-independent `ets:match_spec_run/2` runner.
 - `pub(crate) trait Interior` — the internal dispatch seam (`insert`/`insert_new`/`delete`/
   `delete_object`/`lookup`/`member`/`lookup_element`/`lookup_elements`/`size`/`iter_objects`/
-  `iter_objects_rev`/`keys`/`take`/`first_key`/`last_key`/`next_key`/`prev_key`/`memory`/
+  `iter_objects_rev`/`keys`/`take`/`slot`/`first_key`/`last_key`/`next_key`/`prev_key`/`memory`/
   `update_counter`/`update_element`). `insert` returns `Result<bool>` — **whether the object was
   retained** — so `Table::insert` reclaims the deep copy it made when the interior rejects it (`bag`'s
   duplicate is the only `false`). Generic defaults rebuild the object on the caller's heap; the hash
@@ -145,7 +146,10 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   objects): the default is the exact reverse of `iter_objects()` (the `ordered_set` semantics), and
   both hash interiors (`ChampInterior`/`HashInterior`) override it to return `iter_objects()`
   **unchanged**, because their `last`/`prev` **are** `first`/`next`. It is the single source of truth
-  behind `Table::tab2list_rev` (and so `select_reverse`). Private — not part of the cross-crate API.
+  behind `Table::tab2list_rev` (and so `select_reverse`). `slot()` is likewise **defaulted** (a
+  one-object-per-slot partition, exact for both `ordered_set` interiors and sufficient for the CHAMP
+  `set`); the chained `HashInterior` overrides it with its bucket array. Private — not part of the
+  cross-crate API.
 
 ### `table/rename.rs` — `ets:rename/2` (oracle-pinned)
 - `pub fn Table::rename(&mut self, name: Atom, is_taken: impl FnOnce(Atom) -> bool) ->
@@ -175,7 +179,7 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   - `TableRead<'g>` — owned metadata (`id/size/is_empty/memory/info/kind/keypos/access/owner/name/
     named_table/is_fixed`) plus term reads returning `TableTerm<'g>` (`member`, `lookup`,
     `lookup_element`, `lookup_element_or`, `lookup_element_all`, `lookup_element_all_or`, `first`,
-    `last`, `next`, `prev`, `tab2list`), and the **copy-out** select family (`select`, `select_count`,
+    `last`, `next`, `prev`, `tab2list`, `slot`), and the **copy-out** select family (`select`, `select_count`,
     `match_object`, `match_` take a `&mut TermStore` destination and return owned terms, because a
     `'$_'`/variable body returns the stored object itself; internal scratch `Heap` is grown and retried
     on heap exhaustion).
@@ -246,7 +250,7 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `update_counter`/`update_counter_with`/`update_element`/`select_delete`/`match_delete`/
   `select_replace`/`rename`; read-checked `lookup`/`member`/`lookup_element(+_or/_all/_all_or)`/`select`/
   `select_reverse`(+_limit/_continue)/`select_count`/`match_object`/`match_`/`first`/`last`/`next`/`prev`/
-  `tab2list`/`set_fixation` (the oracle gates `safe_fixtable/2` as a READ) and the `/3`+`/1` limited
+  `tab2list`/`slot`/`set_fixation` (the oracle gates `safe_fixtable/2` as a READ) and the `/3`+`/1` limited
   forms. `ets:match_spec_run/2` is a free function over a list with no table/requester, so it has no
   access concept. `ets:info/1,2` is deliberately **not** gated — `size`/`is_empty` are its ungated
   projection (the oracle resolves `ets:info(T, size)` with no read-status mask, so a non-owner of a
@@ -283,7 +287,10 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `update_counter(key, pos, incr, atoms)`, `update_element(key, updates, atoms)`, `memory(atoms)`. It
   implements `keys()` (with `first_key`/`next_key` from the trait defaults) and overrides the hash-kind
   navigation aliasing: `last_key(atoms) = first_key(atoms)`, `prev_key(k, atoms) = next_key(k, atoms)`
-  and `iter_objects_rev() = iter_objects()` (`erl_db_hash.c:853-856`).
+  and `iter_objects_rev() = iter_objects()` (`erl_db_hash.c:853-856`). It overrides `Interior::slot`
+  with its bucket array and exposes the inherent `bucket_count()` (the `nactive` boundary): slot `i` is
+  bucket `i`'s objects, slots `0..nactive` partition every stored object, `nactive` is
+  `'$end_of_table'` and `> nactive` is `badarg` (`erl_db_hash.c:1733` `db_slot_hash`).
 
 ### `ordered_interior/` — the ordered `ordered_set` interiors (B+-tree + sorted `Vec`)
 - **A same-arith-key replace replaces the stored KEY term too** (the key follows the object): an insert
@@ -474,6 +481,14 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `beam_ets` free of a `beam_bifs` dependency; candidate to lift into `beam_term` later.
 - **Continuations are opaque owned values, not terms** (table id + compiled spec + limit + position),
   so `select_continue` resumes without re-compiling; `Option::None` is the crate's `'$end_of_table'`.
+- **`ets:slot/2` is one contract over two decompositions.** The defaulted `Interior::slot` is a
+  **one-object-per-slot** partition (slot `n` is the n'th object of `iter_objects`, `size` is the
+  end-of-table slot), which is exactly right for the two `ordered_set` interiors **and** the CHAMP
+  `set`; the chained `HashInterior` overrides it with its bucket array (`nactive` = the bucket count).
+  An `ordered_set` slot is **exact** — the object with the (n+1)-th smallest key
+  (`erl_db_tree.c:1139` `db_slot_tree_common`); a hash slot is a hash *bucket* whose count and contents
+  are the interior's own (`../CONTEXT.md` §2), so only the partition / single end-of-table slot /
+  `badarg` boundary is contract (`erl_db_hash.c:1733` `db_slot_hash`).
 - **A BODY runtime failure yields the atom `EXIT`; a GUARD failure skips the clause** (verified against
   `erl`: `[{{'_','_'},[],[{hd,5}]}]` ⇒ `['EXIT','EXIT']`).
 - **Guard truth is an internal boolean** (`Expr::Bool`), so it never depends on the atom table;
@@ -597,18 +612,29 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `BEAM_ETS_BENCH_SIZES`/`BEAM_ETS_BENCH_SHAPES`.
 - Crate-level integration over the **public API**: `tests/ets_{basic,order,select,bag,info,nav,access,
   update,replace,continuation,continuation_direction,set_access,ownership,fixtable,shared,options,rename,
-  reclamation,concurrency,store_terms}.rs`, `tests/select.rs`, `tests/match_spec_run.rs`, sharing helpers
+  reclamation,concurrency,slot,store_terms}.rs`, `tests/select.rs`, `tests/match_spec_run.rs`, sharing helpers
   from `tests/common/`, and the live-`erl` plumbing in `tests/common/oracle.rs`. `ets_store_terms.rs`
   cross-checks every newly-copyable boxed kind (hash map, each fun kind, external pid/port/ref, bitstring,
   refc binary) through `Table::insert`/`lookup` against the oracle's `phash2`. `ets_replace.rs` also
   pins that 100 repeats of the identical `duplicate_bag` replacement stay oracle-identical (`{ok:3,…}`
-  and the same `tab2list`) with a flat `Table::memory`.
-- **Differential evidence suite** (the compatibility gate): `tests/differential.rs` runs **159 cases**
-  (13 case-group files under `tests/differential/battery/` plus the shared harness `battery/mod.rs`, the
+  and the same `tab2list`) with a flat `Table::memory`. `ets_slot.rs` pins `Table::slot`'s
+  ordered-exact / hash-contract split, its read gate and the guard-scoped `TableRead::slot`.
+  `ets_reclamation.rs` pins per-object reclamation across every kind and interior shape (the store's
+  `words`/`blocks` floors across churn) and `ets_info.rs` the `size`/`memory` counters (incl. the
+  `ordered_set` node-arena share and `safe_fixtable`'s held memory).
+- **Per-operation access matrix against the live oracle**:
+  `tests/ets_access.rs::every_read_and_write_op_of_the_access_matrix_matches_the_live_oracle` drives
+  **every** read, every write, every `ets:info` field, every ownership op and the four continuation
+  resumes, under owner + non-owner × `public`/`protected`/`private`, asserting each cell's crate
+  outcome equals the live oracle's **and** the oracle's `{SizeBefore,SizeAfter,is_list(ets:info(T))}`
+  intact triple (so a denial is `badarg` *and* left the table untouched).
+- **Differential evidence suite** (the compatibility gate): `tests/differential.rs` runs **191 cases**
+  (15 case-group files under `tests/differential/battery/` plus the shared harness `battery/mod.rs`, the
   embedded oracle program in `erl_program.rs`) identically under the system `erl` (OTP 29.1.1 / erts-17.1)
   and under `beam_ets`, comparing canonical renderings line-by-line — **every case agrees**;
   `KNOWN_DIVERGENCES` is empty. The hash-kind navigation/reverse aliasing is pinned by the `multikind`
-  group's `hash_last_prev_alias_first_next` and `hash_select_reverse_aliases_select`. The oracle is
+  group's `hash_last_prev_alias_first_next` and `hash_select_reverse_aliases_select`; the `slot` group
+  pins `ets:slot/2` and the `maps` group the head-map/map-guard/map-body subset. The oracle is
   **required by default** — a genuinely absent
   `erl` FAILS the cross-check rather than skipping it (`BEAM_ETS_ALLOW_NO_ORACLE=1` opts out with a loud
   skip; `BEAM_ETS_REQUIRE_ORACLE=1` forces the requirement).
@@ -617,9 +643,9 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   survives a delete of the last-yielded (anchor) key, and a delete/insert behind the cursor does not
   shift the next chunk.
 - **Gate (this crate):** `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_ets`
-  is green — **25 test binaries, 559 passed / 0 failed** (including the 8 doctests — 5 of them
-  `compile_fail`); with the oracle required, the battery emits and compares all **159** cases
-  (`[differential] oracle: … — 159 cases emitted` / `— comparing 159 cases against beam_ets`).
+  is green — **28 test binaries, 595 passed / 0 failed** (including the 8 doctests — 5 of them
+  `compile_fail`); with the oracle required, the battery emits and compares all **191** cases
+  (`[differential] oracle: … — 191 cases emitted` / `— comparing 191 cases against beam_ets`).
   Forced-oracle: `BEAM_ETS_REQUIRE_ORACLE=1 erts_rust/scripts/cargo.sh test
   --manifest-path erts_rust/Cargo.toml -p beam_ets --test differential`.
 
@@ -673,7 +699,7 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   remain the enumeration path. Full reasoning in `ETS_SURFACE.md` §5.
 - **Operations outside this crate's scope** (all present in OTP 29): `update_element/4`, the
   `foldl`/`foldr` **BIFs** (the view layer has `TableRead::{foldl,foldr}` traversal, but the BIFs need a
-  `FunCaller`), `whereis/1`, `table/1,2`, `slot/2`, `tab2file*`/`file2tab*` —
+  `FunCaller`), `whereis/1`, `table/1,2`, `tab2file*`/`file2tab*` —
   `ETS_SURFACE.md` §1–§5 names the owner and the blocker for every one. (`ets:clear/1` and `ets:size/1`
   do not exist in OTP 29, so their absence is correct.) The `/3` limited forms are implemented; their
   opaque continuation terms and the bare-vs-`{Results,'$end_of_table'}` shaping are `beam_bifs`'s.
@@ -696,7 +722,7 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   crate's hash iteration order is an interior freedom; a mutation landing at or behind the ordinal can
   therefore skip or repeat an object relative to the oracle. That divergence only appears across a
   resume straddling a mutation — never a typed error and never a wrong result for a mutation-free walk
-  (every single-chunk and no-mutation-between-chunks case agrees; the 159-case battery covers the
+  (every single-chunk and no-mutation-between-chunks case agrees; the 191-case battery covers the
   latter).
 - **Deep-copy covers every kind the oracle accepts in `ets:insert/2`.** Immediates, cons cells, tuples,
   flat **and hash** maps (HAMT/collision nodes copied node-by-node, no `AtomTable` needed), funs (all
@@ -708,6 +734,16 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   (`RECORD_SUBTAG`), the reserved boxed subtags, a bare header word, and a malformed `ErlSubBits` (null
   base or `end < start`). Evidence: `src/store/tests.rs` (per-kind units + the accounting invariant) and
   `tests/ets_store_terms.rs` (live-oracle cross-check).
+- **`ets:take/2` retains the checked-out object's arena until the table is dropped.** `Table::take`
+  deep-copies the removed object out of table storage and `relinquish`es the copy: `store.words()` drops
+  by exactly the object's word count (so `Table::memory`/`ets:info(T,memory)` and `size` are correct and
+  flat across a take + re-insert churn), but the words stay **valid** and are never returned to the free
+  lists, so a repeated take churn grows the store's `blocks` without bound (bounded only by the total
+  taken volume) until `store.reset()` (`ets:delete_all_objects/1`) or the table is dropped. This is
+  inherent to the current API — a checked-out term must stay valid, and `take` hands back table-owned
+  `Eterm`s. Reproduced by
+  `tests/ets_reclamation.rs::take_style_relinquish_churn_retains_its_arena_until_the_store_is_reset`
+  (and pinned as bounded in reverse by `take_churn_reclaims_the_table_originals_and_keeps_the_counters_flat`).
 - **The match-spec compiler covers essentially the whole `guard_tab[]`.** The decoder
   (`src/select/expr/{mod,guard}.rs`) accepts the connectives, the comparisons, the type tests, the
   guard BIFs (`element/2`, `size/1`, `hd/1`, `tl/1`, `length/1`, `map_get/2`, `is_map_key/2`,
@@ -721,12 +757,14 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   only (checked `i64` plus faithful float `+ - * /`), while `beam_bifs` installs an arbitrary-precision
   hook (`beam_bifs/src/ets/arith_hook.rs`) around every match-spec-evaluating BIF — so a bignum operand
   or an out-of-range integer result yields the oracle's value in the runtime, the `unsupported_ets` being
-  reachable only from the un-hooked default. Typed divergences (always a typed error,
-  never a wrong result): a **head** map's **keys** are literal — a variable/underscore key is `badarg`
-  at every nesting depth — while its **values** are matched structurally like tuple elements, so
-  `#{a => '_'}` matches `#{a => 1}` and an object carrying extra keys still matches (a wildcard/variable
-  inside a *nested head tuple used as a map value* is likewise matched structurally, not
-  under-matched); `self/0` resolves through the thread-local `SelfHook` seam (`set_self_hook`) and its
+  reachable only from the un-hooked default. The head-**map** pattern, map **guard** and map **body**
+  subset is **oracle parity** (probed against the system `erl`; pinned by the `maps` battery group): a
+  head map's keys stay literal at the **top level of each key** — a bare `'$N'`/`'_'` key is `badarg` at
+  every depth the structural walk reaches — but an ordinary literal when nested inside a compound key
+  (`#{{'$2',b} => '_'}` is a literal-key head), while its **values** match structurally like tuple
+  elements, an object carrying extra keys still matches, `#{}` matches any map, and a non-atom key
+  compares exactly (`1` ≠ `1.0`). Typed divergences (always a typed error, never a wrong result):
+  `self/0` resolves through the thread-local `SelfHook` seam (`set_self_hook`) and its
   default is the typed `badarg` — the ETS layer has no process identity, so without an installed hook a
   `self/0` guard clause is skipped and a `self/0` body is `badarg` (the oracle evaluates it against the
   calling process: a semantic under-match); integer arithmetic whose result leaves the 60-bit small range
@@ -738,6 +776,14 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   bitstring). A match-spec **body** runtime failure yields the atom `EXIT` resolved from the caller's
   `AtomTable` (`select::exec::exit_term`), so a host running a raising body must pre-intern `EXIT`
   (real runtimes do); an uninterned `EXIT` ⇒ typed `badarg`.
+- **`erlang:match_spec_test/3`'s `trace` dialect is left-open (typed `unsupported`).** The oracle folds
+  the trace **run** into the `{ok,Return,Flags,Errors}` shape and needs the trace-only special forms
+  (`get_tcw`/`set_tcw`/`message`/`return_trace`/`exception_trace`/`display`/`set_seq_token`/…), i.e. a
+  runner subsystem — not a lint-only subset. The **`table`** dialect *is* implemented (native structural
+  lint + `beam_ets`'s compiler). `beam_bifs::match_spec` returns the typed `unsupported_bif` for `trace`.
+  C refs: `erl_db_util.c:6042` `match_spec_test_3`, `:1509` `db_match_set_lint` (prefix-flag logic),
+  `:6125` `erts_match_set_run_trace`. Detail and the probed `{ok,…}`/`{error,…}` shapes live in
+  `src/select/CONTEXT.md`.
 - **`select_replace/2`'s key check is the C's static syntactic check** (`db_match_keeps_key`). A
   replacement clause whose body is not syntactically `'$_'`/`{{…}}`/`{const,{…}}`/`{element,KeyPos,'$_'}`
   is `badarg` for the whole call, even when nothing matches, exactly like the oracle (pinned by the
@@ -769,6 +815,21 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   span. `Table::last`/`Table::prev` are C-faithful now (the interior aliases them to `first`/`next` for
   the hash kinds, `erl_db_hash.c:853-856`), so both BIFs could call `table.last(..)`/`table.prev(..)`
   unconditionally and drop the branch (the ordered-kind `'$end_of_table'` anchor rejection stays).
+- **`beam_bifs` — adopt `ets:slot/2`.** Call the **read**-gated `TableAccess::slot` (the oracle's
+  `erl_db.c:3744` `ets_slot_2` takes a `DB_READ` gate); a non-integer or bignum slot is the BIF layer's
+  `badarg` (an `i64` cannot carry it), an out-of-range/negative slot is the crate's `Err(BeamError::BadArg)`
+  and `Ok(None)` is `'$end_of_table'`. `beam_bifs::runtime::other` still answers the typed `unsupported_bif`.
+- **`beam_bifs/src/match_spec.rs` still refuses ANY head pattern mentioning a map.** `test_table`'s
+  `head_mentions_a_map`/`term_mentions_a_map` (~:218-220 / :278-312), the stale doc block (~:127-159) and
+  the test `beam_bifs/tests/match_spec.rs::a_head_pattern_with_a_map_is_a_typed_gap` are now **stale**:
+  `beam_ets` implements head maps (see Known Issues) and the oracle's **`table`** dialect accepts them
+  (verified: `erlang:match_spec_test(#{a=>1,b=>2}, [{#{a=>1},[],[ok]}], table)` ⇒ `{ok,ok,[],[]}`;
+  `erlang:match_spec_test(#{a=>1}, [{#{a=>'$2'},[],['$2']}], table)` ⇒ `{ok,1,[],[]}`). Delegate to
+  `beam_ets::select::compile` instead of refusing a map head.
+- **`beam_bifs/src/match_spec.rs` keeps the `trace` dialect typed `unsupported`** until the trace runner
+  subsystem exists (the Known Issues entry above); the exact `{ok,…}`/`{error,…}` shapes and lint strings
+  are recorded in `src/select/CONTEXT.md`.
+
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/kind.rs` → `TableKind`, `SetInterior`/`OrderedInterior`, `Access`, `Concurrency`, `WriteConcurrency`, `TableOptions` (incl. heir + `decentralized_counters`), `can_read`/`can_write`; unit tests in `src/kind/tests.rs`
@@ -777,19 +838,19 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 - `src/store/tests.rs` → the `TermStore` unit-test module
 - `src/table/mod.rs` → `Table`/`TableId`/`OwnerId`, constructors, metadata/ownership accessors (incl. the live `access` field + `set_access`), write ops, access checks, `select_all`, module wiring
 - `src/table/tests.rs` → the table-level unit tests (write ops, metadata, access/protection, ownership/heir, counters, the store-accounting cases)
-- `src/table/read.rs` → the read/navigation `impl Table` (incl. `is_named_table`, `tab2list_rev`, and the hash-kind `last`/`prev` aliasing)
+- `src/table/read.rs` → the read/navigation `impl Table` (incl. `is_named_table`, `slot`, `tab2list_rev`, and the hash-kind `last`/`prev` aliasing)
 - `src/table/rename.rs` → `Table::rename` + `RenameOutcome` (`ets:rename/2` semantics)
 - `src/table/shared.rs` → `SharedTable` (the locked handle) + its unit tests
 - `src/table/view/mod.rs`, `view/read.rs`, `view/write.rs`, `view/term.rs`, `view/iter.rs` → the guard-scoped `TableRead`/`TableWrite`/`TableTerm` views (the aliasing defence, incl. `TableWrite::set_access`) + the view-borrowed traversal API (iterators / `foldl` / `foldr` / `tab2list_into`)
 - `src/table/view/tests.rs` → the view-layer unit tests (incl. the aliasing evidence)
-- `src/table/interior.rs` → the private `pub(crate) trait Interior` (incl. the defaulted `iter_objects_rev`) + `build_interior`
+- `src/table/interior.rs` → the private `pub(crate) trait Interior` (incl. the defaulted `iter_objects_rev` and `slot`) + `build_interior`
 - `src/table/access.rs` → `TableAccess` (access-enforcing view, incl. `set_access`)
 - `src/table/ownership.rs` → `Heir`/`SetOpt` (incl. `Access(Access)`), the owner-gated `Table::setopts`, `install_heir`/`heir_data`/`copy_heir`/`replace_heir`, the `give_away` semantics + the pid-gap docs
 - `src/table/lifecycle.rs` → `OwnerDeath` + `Table::owner_died`
 - `src/table/element.rs` → the table-level `update_counter`/`update_element` operations
 - `src/table/update.rs` → the counter/element operand machinery (shared with the interiors)
 - `src/champ_interior.rs` → `ChampInterior` (CHAMP index) — the **default `set`** interior
-- `src/hash_interior.rs` → `HashInterior` (chained index) for `bag`/`duplicate_bag` (and opt-in `set`), `with_keypos` key re-anchoring
+- `src/hash_interior.rs` → `HashInterior` (chained index) for `bag`/`duplicate_bag` (and opt-in `set`), `with_keypos` key re-anchoring, the `Interior::slot` bucket override + `bucket_count()`
 - `src/interior_parity.rs` → cross-interior equivalence + default-selection tests (`#[cfg(test)]`)
 - `src/interior_bench.rs` → the interior microbenchmarks (`#[cfg(test)]`)
 - `src/ordered_interior/{mod,sorted,node,tree,iter}.rs` → the B+-tree `ordered_set` interior (conditional separator refresh via `InsertStep`, single-descent `insert_new`), the sorted-`Vec` alternative, the node arena, the tree ops, the iterator
@@ -798,8 +859,8 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 - `src/info.rs` → `TableInfo` + `entries` (the 15-field `ets:info` pairs)
 - `src/error.rs` → `badarg`/`unsupported` failure constructors
 - `tests/common/mod.rs` → shared integration-test helpers; `tests/common/oracle.rs` → the live-`erl` plumbing
-- `tests/ets_*.rs` → public-API integration tests by concern (basic/order/select/bag/info/nav/access/set_access/update/replace/continuation/continuation_direction/ownership/fixtable/shared/options/rename/reclamation/concurrency/store_terms), plus `tests/select.rs` and `tests/match_spec_run.rs`
-- `tests/differential.rs` + `tests/differential/{battery/*,erl_program.rs}` → the differential evidence suite vs the system `erl` (159 cases, 13 battery groups)
+- `tests/ets_*.rs` → public-API integration tests by concern (basic/order/select/bag/info/nav/access/set_access/update/replace/continuation/continuation_direction/ownership/fixtable/shared/options/rename/reclamation/concurrency/slot/store_terms), plus `tests/select.rs` and `tests/match_spec_run.rs`
+- `tests/differential.rs` + `tests/differential/{battery/*,erl_program.rs}` → the differential evidence suite vs the system `erl` (191 cases, 15 battery groups)
 - `ETS_SURFACE.md` → the `ets:*` coverage census + the oracle-probed semantic facts + the runtime-level gaps and the exact API each needs
 - `../../erts/emulator/beam/erl_db.c` / `erl_db_hash.c` / `erl_db_tree.c` / `erl_db_util.c` / `erl_db*.h` → the API, interiors, key/match handling and flags being mirrored (read-only)
 

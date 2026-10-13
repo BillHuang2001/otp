@@ -394,8 +394,17 @@ impl GenImmixCollector {
     /// the value the `garbage_collection` item reports as `minor_gcs`.
     pub fn minor_gcs(&self) -> u32 {
         self.minor_since_major
-    }    /// Whether the nursery can no longer satisfy `need_words` more words — the same signal
+    }
+
+    /// Whether the nursery can no longer satisfy `need_words` more words — the same signal
     /// [`crate::Collector`] uses (an exact-fit allocation still fits).
+    ///
+    /// This reads the **current** (allocatable) space only — a [growth](Self::grow_nursery)
+    /// retires the space it replaced and nothing is ever allocated in a retired one, so the
+    /// current space is the correct one for an allocation-admission signal. A *collection*
+    /// must instead cover the whole chain, which is why [`collect`](Self::collect) sizes the
+    /// promotion (and the region the fullsweep leaves behind) from the chain-wide
+    /// [`Nursery::used_words`].
     pub fn should_collect(&self, need_words: usize) -> bool {
         self.nursery.current().available_words() < need_words
     }
@@ -499,6 +508,34 @@ impl GenImmixCollector {
         self.nursery.space_count()
     }
 
+    /// Visits every **boxed object** reachable from `roots` across the **whole heap** — every
+    /// space of the nursery chain (the current one and any a
+    /// [`grow_nursery`](Self::grow_nursery) retired) plus the mark-region mature generation —
+    /// passing the object's header word and a pointer to that header, each object **exactly
+    /// once**.
+    ///
+    /// The mark-region sibling of
+    /// [`Collector::for_each_reachable_object`](crate::Collector::for_each_reachable_object);
+    /// see it for the full contract. The only difference is the mature range: a
+    /// [`ImmixSpace`] is one contiguous block-aligned region whose free lines are still inside
+    /// it, so (as in [`crate::live::live_full`]) the from-set covers `base .. base + capacity`
+    /// — a **deliberately over-inclusive** range, harmless here because a walk only ever visits
+    /// objects a live reference reaches, and a free line is never a live reference's target.
+    ///
+    /// **Layout-agnostic**, **read-only**, **iterative and cycle-safe**; a cons cell is
+    /// traversed but not reported (it carries no header word).
+    pub fn for_each_reachable_object(
+        &self,
+        roots: &[Eterm],
+        visit: impl FnMut(Eterm, *const Eterm),
+    ) -> Result<()> {
+        let mut from = FromSet::new();
+        self.nursery.add_to_from_set(&mut from); // every space of the chain
+        let base = self.mature.base() as usize;
+        from.add_range(base, base + self.mature.capacity_words() * core::mem::size_of::<Eterm>());
+        crate::reachable::for_each_reachable(&from, roots, visit)
+    }
+
     /// Folds one collection's [`GcStats`] into the collector's accumulated counters.
     fn accumulate(&mut self, stats: &GcStats, kind: CollectionKind) {
         self.stats.words_copied += stats.words_copied;
@@ -554,13 +591,22 @@ impl GenImmixCollector {
         refs: Vec<(*mut Eterm, Eterm)>,
     ) -> Result<GcStats> {
         // The size this fullsweep should leave behind, from the **exact live graph** it
-        // evacuates (nursery *and* mature, reachable-from-roots only) — never the
-        // pre-collection occupancy, whose garbage would make the policy's `should_grow`
-        // fire on every fullsweep and creep the region up without bound (see
-        // [`crate::live`]).
+        // evacuates (nursery *and* mature, reachable-from-roots only) plus the **young heap's
+        // occupancy** — the C `adjust_after_fullsweep`'s
+        // `need_after = (HEAP_TOP(p) - HEAP_START(p)) + need + …` (`erl_gc.c:2072`). The
+        // region must be able to receive a whole nursery's worth of promotion, or the very
+        // next collection cannot be a minor and the cadence degenerates into a fullsweep
+        // every time. It is still **never** the *mature* occupancy: that is garbage-inflated
+        // (the graphs the minors promoted and the next round's roots replaced), so using it
+        // would make the policy's `should_grow` fire on every fullsweep and creep the region
+        // up without bound (see [`crate::live`]). The young occupancy is bounded by the
+        // nursery capacity, which `young_after_collection` keeps bounded.
         let live = crate::live::live_full(self.nursery(), &self.mature, roots);
         let capacity = self.mature.capacity_words();
-        let target = self.policy.mature_after_fullsweep(capacity, live.words, 0);
+        let young_occupancy = self.nursery.used_words();
+        let target = self
+            .policy
+            .mature_after_fullsweep(capacity, live.words, young_occupancy);
         if target != capacity {
             return self.relocate_major(roots, target, live.lines);
         }

@@ -1855,3 +1855,121 @@ fn publishing_again_after_the_pending_exception_is_consumed_drops_the_stale_extr
         "the stale extra root is cleared, never left as a leftover/NIL placeholder"
     );
 }
+
+/// **The park arm keeps a waiting process relocation-exempt for its whole parked window.**
+///
+/// A signal to a *waiting* receiver whose heap cannot hold the payload must not relocate it: the
+/// runner marks the pid relocation-exempt at the park arm (`set_state(Waiting)` +
+/// `set_relocation_exempt(true)`) and clears the mark when the process is resumed. This is
+/// **additional** to the installed host collection gate
+/// ([`crate::context::gc_walk::RuntimeCollectionGate`]), which declines only when an unscanned
+/// container is reachable from the receiver's GATHERED roots — here nothing foreign is reachable,
+/// so the gate answers `false` and the park window's exemption is the sole decider. Removing the
+/// park arm's `set_relocation_exempt(true)` lets the signal collect and grow the parked heap, and
+/// this case then fails on its first assertion.
+#[test]
+fn a_parked_process_stays_relocation_exempt_for_its_parked_window() {
+    let mut rt = runtime();
+    let mut state = RunnerState::default();
+    let mut table = table();
+    // Mirror production exactly: the runtime's own table carries the installed gate
+    // (`Runtime::new`), and `take_processes` carries it into the scheduler pass.
+    table.set_collection_gate(Box::new(crate::context::gc_walk::RuntimeCollectionGate::new()));
+    let pid = table.spawn_default().expect("a fresh process");
+    let module = Arc::new(beam_loader::load_file(recv_after_fixture()).expect("recv_after.beam"));
+    let function = module
+        .atom_table
+        .lookup("wait_forever")
+        .expect("wait_forever is interned");
+    state.spawn(
+        pid,
+        ProcessEntry::Export {
+            module,
+            function,
+            arity: 0,
+        },
+        Vec::new(),
+    );
+
+    // The first slice: `receive X -> X after infinity` parks on the empty mailbox.
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 1_000)
+            .expect("the first slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Wait, "the empty mailbox parks the receive");
+    assert!(
+        table.is_relocation_exempt(pid).expect("the pid is live"),
+        "the park arm marks the parked process relocation-exempt"
+    );
+
+    // The gate does NOT decline for this receiver: nothing foreign is reachable from its
+    // gathered roots, so the park window's exemption — not the gate — is the deciding mechanism.
+    {
+        let process = table.get(pid).expect("the process is live");
+        let mut gate = crate::context::gc_walk::RuntimeCollectionGate::new();
+        assert!(
+            !<crate::context::gc_walk::RuntimeCollectionGate as beam_process::CollectionGate>::declines_relocation(
+                &mut gate,
+                process
+            ),
+            "no foreign container is reachable from the parked process's gathered roots, so the \
+             gate answers `false` — the exemption is what refuses the move"
+        );
+    }
+
+    // A reason LARGER than the receiver's WHOLE nursery: only a decline keeps the on-enqueue copy
+    // from collecting and growing the parked heap.
+    let capacity = table
+        .get(pid)
+        .expect("live")
+        .collector()
+        .young()
+        .capacity_words();
+    let mut src = beam_alloc::Heap::new(capacity + 8).expect("the source arena allocates");
+    let elems: Vec<Eterm> = (0..capacity).map(|i| make_small(i as i64)).collect();
+    let reason = src.tuple(&elems).expect("the oversized reason fits the arena");
+    let signaller = table.spawn_default().expect("a signaller");
+    table.get_mut(pid).expect("live").set_trap_exit(true);
+
+    let minor_before = table.get(pid).expect("live").collector().minor_gcs();
+    let base_before = table.get(pid).expect("live").collector().young().base();
+    table
+        .send_exit(signaller, pid, reason)
+        .expect("the trapping receiver takes the signal");
+
+    let r = table.get(pid).expect("the receiver survived");
+    assert_eq!(
+        r.collector().minor_gcs(),
+        minor_before,
+        "the park window's exemption declined the signal-driven relocation"
+    );
+    assert_eq!(
+        r.collector().young().base(),
+        base_before,
+        "a declined signal must not move or grow the parked process's nursery"
+    );
+    assert_eq!(r.mailbox().len(), 1, "the notification is NOT lost");
+    assert!(
+        r.is_relocation_exempt(),
+        "the process stays relocation-exempt for the whole parked window"
+    );
+
+    // The resume clears the exemption, so the process's own admission point collects again.
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 1_000)
+            .expect("the resume slice runs")
+    };
+    assert_eq!(
+        outcome,
+        ProcOutcome::Exit(normal(&mut rt)),
+        "the resumed receive takes the delivered exit message"
+    );
+    assert!(
+        !table.is_relocation_exempt(pid).expect("the pid is live"),
+        "the resume cleared the park window's exemption, so the process collects normally again"
+    );
+}

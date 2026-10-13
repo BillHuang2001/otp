@@ -377,3 +377,101 @@ erl -noshell -pa "$TMPDIR" -eval 'io:format("~w~n",[env_caller:go(os:getenv("TMP
 
 the C's `enif_alloc_env` never returns `NULL` (an allocation failure aborts the emulator), so `live`
 is the reference answer.
+
+## Busy-port driver (`busy_driver.c` — never committed, compiled at test time)
+
+The fixture behind `tests/port_busy.rs` (contract A.4): the `erlang:port_command/2,3` behaviour
+table against a **real, busy C driver**. It is a plain `driver_*`-only driver (like
+`beam_io/tests/fixtures/host_driver.c`), so `dlopen(RTLD_NOW)` resolves every symbol from the
+loading process's dynamic symbol table — no driver may reference an unimplemented `driver_*` slot.
+
+### What the callbacks do
+
+* `start` allocates the private state, emits the **start-up data message** with `driver_output`
+  (the C `command` tail when the port was opened with one, else the literal `"started"` — so a port
+  *always* reports one, and a test can prove `start` ran before it sends anything), and then calls
+  `set_busy_port(port, 1)`. **A port therefore starts busy**: every `port_command` is issued against
+  a busy port unless the test clears it first.
+* `control` serves two verbs, both through `set_busy_port`, and answers the C's `0`:
+  * `$B` (`'B'`, 66) sets the busy bit;
+  * `$N` (`'N'`, 78) clears it — which on the oracle also **resumes** any caller the C had suspended
+    on the busy port (`erts_port_resume_procs`, `io.c:5261-5262`).
+
+  Because it answers `0`, `port_control/3` yields the **empty list** `[]` (never `ok`).
+* `output` **echoes** the bytes it is handed back through `driver_output`, so the command really
+  reaching the driver (rather than being dropped by a busy/no-`force` arm) is observable at the
+  port's owner.
+* `stop` frees the private state.
+
+### The compile-time variant (`-D`, one source → two objects)
+
+A driver may only be opened under the `driver_name` its entry declares — and the entry's
+`driver_flags` decides whether `[force]` is accepted at all — so the fixture is compiled **twice**
+from one source into one scratch directory:
+
+```sh
+ERL=$(readlink -f "$(command -v erl)"); INC="$(dirname "$(dirname "$ERL")")/include"
+cc -shared -fPIC -I"$INC"                                    -o "$DIR/busy.so"     "$DIR/busy_driver.c"
+cc -shared -fPIC -I"$INC" -DBUSY_DRIVER_SOFT=1               -o "$DIR/busysoft.so" "$DIR/busy_driver.c"
+```
+
+| macro | `driver_name` | `driver_flags` |
+|---|---|---|
+| `BUSY_DRIVER_SOFT=0` (the committed default, no `-D` needed) | `"busy"` | `0` |
+| `BUSY_DRIVER_SOFT=1` | `"busysoft"` | `ERL_DRV_FLAG_SOFT_BUSY` |
+
+The Erlang half (`busy_probe.erl`) is generated and compiled at test time too (`erlc -o "$DIR"`),
+because it interpolates the object's path — which only exists then. It opens the port the way **each
+runtime** requires: the oracle first loads the object (`erl_ddll:load_driver/2`, which returns `ok`)
+and opens `{spawn_driver, Name}`; this runtime has no such BIF and opens `{spawn_driver, Path}`
+(`beam_rt::port::driver_lookup`). A `try`/`catch` around the load doubles as the selector.
+
+> `code:lib_dir(erts,include)` names a path that does **not** exist in the Nix store layout, so the
+> include directory is resolved from the **canonicalized `erl` sibling**
+> (`…/erts-<vsn>/include`), with a `code:root_dir()` probe and the standard install roots as
+> fallbacks. Every `erl` probe is **bounded** (`tests/support/mod.rs`) and carries `-s init stop`.
+
+### Oracle values (`erl -noshell`, erts-17.1 / OTP 29.1.1)
+
+Six cases per variant, each a fresh port (start-up message drained, then the state set with
+`port_control`) — `{Tag, {CommandResult, Echo}}`:
+
+```none
+%% driver_flags = 0 ("busy")
+[{idle_none,{ok,echoed}},{idle_empty,{ok,echoed}},{idle_nosuspend,{ok,echoed}},
+ {idle_force,{{other,{error,notsup}},no_data}},{busy_nosuspend,{dropped,no_data}},
+ {busy_force,{{other,{error,notsup}},no_data}}]
+
+%% driver_flags = ERL_DRV_FLAG_SOFT_BUSY ("busysoft")
+[{idle_none,{ok,echoed}},{idle_empty,{ok,echoed}},{idle_nosuspend,{ok,echoed}},
+ {idle_force,{ok,echoed}},{busy_nosuspend,{dropped,no_data}},{busy_force,{ok,echoed}}]
+```
+
+(The probe's `try … catch` renders a raise as `{Class, Reason}`, so the printed
+`{{other,{error,notsup}},no_data}}` is the echoed `error:notsup`; `true` → `ok`, `false` →
+`dropped`, and a missing echo → `no_data`.)
+
+| port state | options | entry | result |
+|---|---|---|---|
+| idle | none / `[]` / `[nosuspend]` | either | `true`, command delivered (`echoed`) |
+| idle | `[force]` | without `ERL_DRV_FLAG_SOFT_BUSY` | `error:notsup`, nothing written |
+| idle | `[force]` | with `ERL_DRV_FLAG_SOFT_BUSY` | `true`, command delivered |
+| busy | `[nosuspend]` | either | `false` (`dropped`), nothing written |
+| busy | `[force]` | without `ERL_DRV_FLAG_SOFT_BUSY` | `error:notsup`, nothing written |
+| busy | `[force]` | with `ERL_DRV_FLAG_SOFT_BUSY` | `true`, command delivered |
+| busy | none | either | caller **suspends** until the port is idle, then `true`, command delivered |
+
+The last row is the one **documented divergence**: this runtime's BIF seam has no
+"suspend the caller and re-run me" shape (`src/native/port.rs`), so a bare `port_command` on a busy
+port raises the typed capability gap (exit 3) rather than fabricating a `true`.
+
+> **Never run the busy + no-options case on the oracle without something to clear the busy bit.** It
+> blocks for ever (the C's `erts_suspend` + `ERTS_BIF_YIELD3`). `tests/port_busy.rs` asserts the
+> runtime's typed gap on that call, and evidences the oracle's suspend **only** through
+> `busy_plain_resumed/1`, whose helper clears the bit 200 ms in and yields the oracle's
+> `{ok,cleared,echoed}`.
+
+### Skip-loudly rule
+
+The suite needs the C compiler, the host `erl_driver.h`, `erlc` and the oracle `erl`. A missing one
+prints a loud `SKIP` banner and returns — it is never a silent pass.

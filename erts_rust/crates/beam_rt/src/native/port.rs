@@ -46,15 +46,32 @@
 //! input back. The read side is
 //! [`RuntimeContext::poll_port_messages`](crate::context::RuntimeContext).
 //!
-//! `/3` `Options` are validated **and honored**: `nosuspend` changes nothing here (the write
-//! is always asynchronous and buffered), while `force` is rejected with the oracle's
-//! `error:notsup` because the spawn driver does not carry `ERL_DRV_FLAG_SOFT_BUSY`. Every
-//! other option — an unknown atom, a non-atom element, an improper tail or a non-list
-//! container — is `error:badarg`, and the port liveness check precedes the `force` check, so
-//! a dead port with `[force]` is `badarg` rather than `notsup`. The result is the atom
-//! `true` (the oracle's own value). A non-port argument, a port the runtime does not hold
-//! (closed, or never opened), and non-iodata are [`BeamError::BadArg`] — the oracle's own
-//! reason.
+//! `/3` `Options` are validated **and honored**, and the port's **busy state** decides the answer
+//! exactly as it does in the C (`erts_port_output`, `io.c:1749-1764`; `erl_bif_port.c:192-220`).
+//! A driver marks its port busy with `set_busy_port`; this runtime records that bit on the
+//! `{spawn_driver, Name}` port's metadata and reads it back here:
+//!
+//! | Port state | Options | Answer |
+//! |---|---|---|
+//! | busy | `[nosuspend]` (no `force`) | the atom `false` — the command is dropped, nothing written |
+//! | busy | `[force]` | `true` if the driver entry advertises `ERL_DRV_FLAG_SOFT_BUSY`, else `error:notsup` |
+//! | busy | neither | the C **suspends** the caller until the port is idle, then `true` — a typed capability gap here (no BIF-suspend channel; see [`RuntimeContext::port_command`]) |
+//! | idle | any | `true` — except `[force]` on a driver **without** `ERL_DRV_FLAG_SOFT_BUSY`, which is `error:notsup` |
+//!
+//! The `force` rule is a property of the driver **entry**, not of the current busy state: the C
+//! rejects `[force]` with `notsup` whenever the driver does not advertise `ERL_DRV_FLAG_SOFT_BUSY`
+//! (`erl_bif_port.c:195-198`), idle or busy alike. A `spawn`/`fd` port — and a built-in driver
+//! port, whose entry flags the built-in registry does not expose — therefore always answers
+//! `notsup` for `[force]`, which is the oracle's own answer for `{spawn, Cmd}` and `{fd, N}`.
+//! `nosuspend` on an idle port, like an empty option list, changes nothing.
+//!
+//! Every other option — an unknown atom, a non-atom element, an improper tail or a non-list
+//! container — is `error:badarg`, and the option list is validated **before** the port is even
+//! looked up, exactly as the C loops the options first. The port liveness check then precedes the
+//! busy/`force` decision, so a dead port with `[force]` is `badarg` rather than `notsup`. The
+//! result on the ordinary path is the atom `true` (the oracle's own value). A non-port argument, a
+//! port the runtime does not hold (closed, or never opened), and non-iodata are
+//! [`BeamError::BadArg`] — the oracle's own reason.
 //!
 //! # `port_info/1,2`
 //!
@@ -82,6 +99,21 @@ use beam_term::{is_small, make_small, signed_value, Eterm, NIL};
 use crate::context::RuntimeContext;
 use crate::error;
 
+/// The two recognized `erlang:port_command/3` options, as
+/// [`RuntimeContext::port_command_options`] parsed them.
+///
+/// Both are meaningful: `force` bypasses a busy port (and is the oracle's `error:notsup` unless the
+/// driver entry advertises `ERL_DRV_FLAG_SOFT_BUSY`), while `nosuspend` turns a busy port's suspend
+/// into the atom `false`. `/2` — and a `/3` with `[]` — is [`CommandOptions::default`], i.e. both
+/// unset.
+#[derive(Clone, Copy, Default)]
+struct CommandOptions {
+    /// The atom `force` was named — the C's `ERTS_PORT_SIG_FLG_FORCE`.
+    force: bool,
+    /// The atom `nosuspend` was named — the C's `ERTS_PORT_SIG_FLG_NOSUSPEND`.
+    nosuspend: bool,
+}
+
 impl RuntimeContext<'_> {
     /// The single entry the [`try_native`](RuntimeContext::try_native) dispatch arm added
     /// for the port surface calls: `erlang:port_command/2,3` and the native half of
@@ -106,52 +138,94 @@ impl RuntimeContext<'_> {
     }
 
     /// `erlang:port_command(Port, Data[, Options])`: write `Data`'s bytes to the port's write
-    /// stream and answer the atom `true`.
+    /// stream and answer the atom `true` — or the atom `false`, or a raise, when the port's
+    /// **busy state** intervenes.
     ///
-    /// The steps follow the oracle's own order (`erts_internal_port_command_3`, with the
-    /// `badopt` → `badarg` mapping `erlang.erl`'s `port_command/3` wrapper applies):
+    /// The steps follow the oracle's own order (`erts_internal_port_command_3`,
+    /// `../../erts/emulator/beam/erl_bif_port.c:168-236`, with the `badopt` → `badarg` mapping
+    /// `erlang.erl`'s `port_command/3` wrapper applies):
     ///
     /// 1. decode the port (a non-port is [`BeamError::BadArg`]);
-    /// 2. validate **every** `/3` option ([`RuntimeContext::port_command_options`]);
+    /// 2. validate **every** `/3` option ([`RuntimeContext::port_command_options`]) — before the
+    ///    port is even looked up, exactly as the C loops the option list first;
     /// 3. the port must still be live — the same check the `/2` path makes, and it
-    ///    deliberately precedes the `force` check, so a dead port with `[force]` is `badarg`
-    ///    rather than `notsup`;
-    /// 4. `force` — a request to bypass the driver's busy state — is `error:notsup`, because
-    ///    the spawn driver does not carry `ERL_DRV_FLAG_SOFT_BUSY`;
-    /// 5. otherwise collect `Data` as iodata and write it — to the child's stdin, or to the
+    ///    deliberately precedes the `force`/busy decisions, so a dead port with `[force]` is
+    ///    `badarg` rather than `notsup`;
+    /// 4. `force` asks to bypass the busy state. The C rejects it with `error:notsup` unless the
+    ///    driver **entry** advertises `ERL_DRV_FLAG_SOFT_BUSY` (`erl_bif_port.c:195-198`) — and
+    ///    that test is **independent of the port's current busy state**: `[force]` on an *idle*
+    ///    port whose driver lacks the flag is `notsup` too (measured against erts-17.1);
+    /// 5. otherwise, a **busy** port follows the C's busy arms (`erl_bif_port.c:211-220`):
+    ///    `nosuspend` answers the atom `false` (nothing is written, and — matching the C, which
+    ///    checks the busy state *before* it converts the iolist, `io.c:1760-1764` — even
+    ///    non-iodata is not rejected), while a plain command makes the C **suspend** the caller
+    ///    until the port goes idle and then answer `true`;
+    /// 6. otherwise collect `Data` as iodata and write it — to the child's stdin, or to the
     ///    adopted duplex descriptor of a `{fd, N}` port.
+    ///
+    /// # The one remaining divergence
+    ///
+    /// Step 5's plain-command-on-a-busy-port arm is the C's `erts_suspend` + `ERTS_BIF_YIELD3`: the
+    /// caller blocks until the port is idle and the BIF is then **re-run**. This runtime's BIF seam
+    /// (`ExecutionContext::call_bif`) has no way to express "block the caller and re-run me" — its
+    /// only shapes are a value and an error, and the engine's sole suspend is the `receive` family's
+    /// `Step::Wait` — so fabricating the C's eventual `true` would be a **wrong result**, and there
+    /// is no truthful suspend to take. That case therefore raises the runtime's typed capability gap
+    /// ([`crate::error::unsupported`], exit 3) rather than answering at all. Every other arm —
+    /// including both busy arms that *do* have an answer (`false`, `notsup`) — matches the oracle.
     ///
     /// # Errors
     ///
     /// [`BeamError::BadArg`] for a non-port, a port the runtime does not hold, a malformed
-    /// or unrecognized option list, or non-iodata `Data`; the `notsup` raise for `force`;
-    /// [`BeamError::Io`] when the write fails.
+    /// or unrecognized option list, or non-iodata `Data`; the `notsup` raise for `force` on a port
+    /// whose driver does not advertise `ERL_DRV_FLAG_SOFT_BUSY`; the typed capability gap for a
+    /// plain command on a busy port (above); [`BeamError::Io`] when the write fails.
     fn port_command(&mut self, args: &[Eterm], with_options: bool) -> Result<Eterm> {
         let port = PortId::from_eterm(*args.first().ok_or(BeamError::BadArg)?)?;
         let data = *args.get(1).ok_or(BeamError::BadArg)?;
-        let force = if with_options {
+        let options = if with_options {
             self.port_command_options(*args.get(2).ok_or(BeamError::BadArg)?)?
         } else {
-            false
+            CommandOptions::default()
         };
         // The registry is reached through a cheap clone of its `Rc` handle so writing to the
         // child never holds a borrow of the runtime while a term (the atom `true`) is built —
-        // the same snapshot rule the port poller follows (`crate::port`).
+        // the same snapshot rule the port poller follows (`crate::port`). The liveness check and
+        // the two busy facts are read under **one** borrow: they are the C's `sig_lookup_port`
+        // followed by its `prt->drv_ptr->flags`/`ERTS_PTS_FLG_BUSY_PORT` reads (`erl_bif_port.c:192-198`,
+        // `io.c:1749-1764`), taken before any decision.
         let ports = std::rc::Rc::clone(&self.runtime.ports);
-        {
+        let (busy, soft_busy) = {
             let registry = ports
                 .try_borrow()
                 .map_err(|_| error::unsupported("the port table is already in use"))?;
             if !registry.is_live(port) {
                 return Err(BeamError::BadArg);
             }
-        }
-        if force {
-            // `force` asks the driver to push the command through a busy port regardless.
-            // The spawn driver does not advertise `ERL_DRV_FLAG_SOFT_BUSY`, so the oracle
-            // answers the atom `notsup` — an **error**-class raise, deliberately not a
-            // capability gap (see `crate::error`'s `unsupported` convention).
-            return Err(error::message("notsup"));
+            (registry.is_busy(port), registry.soft_busy(port))
+        };
+        if options.force {
+            // `force` pushes the command through a busy port. Only a driver that advertises
+            // `ERL_DRV_FLAG_SOFT_BUSY` can accept it; every other driver — the spawn/`fd` drivers
+            // included — is the oracle's `error:notsup`, whether or not the port is busy.
+            // Deliberately **not** a capability gap (see `crate::error`'s `unsupported` convention):
+            // the oracle raises the same `notsup`.
+            if !soft_busy {
+                return Err(error::message("notsup"));
+            }
+        } else if busy {
+            if options.nosuspend {
+                // The C answers the atom `false` and drops the command (nothing is written).
+                return self.atom("false");
+            }
+            // The C suspends the caller (`erts_suspend` + `ERTS_BIF_YIELD3`) and re-runs the BIF
+            // once the port is idle, then answers `true`. This runtime has no BIF-suspend channel,
+            // so there is no truthful answer to give — a typed capability gap, never a fabricated
+            // `true`.
+            return Err(error::unsupported(
+                "port_command on a busy port: suspending the caller until the port is idle is not \
+                 implemented",
+            ));
         }
         let mut bytes = Vec::new();
         self.iodata_bytes(data, &mut bytes)?;
@@ -164,30 +238,31 @@ impl RuntimeContext<'_> {
         self.atom("true")
     }
 
-    /// Validates `erlang:port_command/3`'s `Options` and reports whether `force` was
-    /// requested.
+    /// Validates `erlang:port_command/3`'s `Options` and reports which of the two recognized
+    /// option atoms were named.
     ///
     /// The oracle accepts exactly the atoms `force` and `nosuspend` as elements
-    /// (`erts_internal_port_command_3`'s `is_not_nil`/`is_list` loop) and maps everything
-    /// else to `badarg`: an unknown atom, a non-atom element, an **improper** tail
-    /// (`[force|bogus]`) and a non-list container all fail. `[]` and `nosuspend` change
-    /// nothing about the write here (it is always asynchronous and buffered), so only
-    /// `force` is reported back — the caller rejects it as `notsup`.
+    /// (`erts_internal_port_command_3`'s `is_not_nil`/`is_list` loop, `erl_bif_port.c:175-190`)
+    /// and maps everything else to `badarg`: an unknown atom, a non-atom element, an **improper**
+    /// tail (`[force|bogus]`) and a non-list container all fail. Both accepted options are reported
+    /// back because both change the answer: `force` bypasses a busy port (and is rejected `notsup`
+    /// unless the driver advertises `ERL_DRV_FLAG_SOFT_BUSY`), and `nosuspend` turns a busy port's
+    /// suspend into the atom `false`.
     ///
     /// # Errors
     ///
     /// [`BeamError::BadArg`] for a malformed option container/tail or an unrecognized
     /// option element.
-    fn port_command_options(&self, options: Eterm) -> Result<bool> {
-        let mut force = false;
+    fn port_command_options(&self, options: Eterm) -> Result<CommandOptions> {
+        let mut parsed = CommandOptions::default();
         for element in terms::list_elements(options).map_err(|_| BeamError::BadArg)? {
             match self.atom_name(element).as_deref() {
-                Some("force") => force = true,
-                Some("nosuspend") => {}
+                Some("force") => parsed.force = true,
+                Some("nosuspend") => parsed.nosuspend = true,
                 _ => return Err(BeamError::BadArg),
             }
         }
-        Ok(force)
+        Ok(parsed)
     }
 
     /// `erlang:port_control(Port, Operation, Data)`: hand the drive's own `control` callback an
@@ -394,6 +469,7 @@ fn iolist_bytes(term: Eterm, out: &mut Vec<u8>, top_level: bool) -> Result<()> {
 mod tests {
     use super::*;
     use crate::native::test_support::{atom, call, chars, runtime};
+    use crate::port::driver::BusyFlag;
     use crate::runtime::Runtime;
     use beam_bifs::NullSink;
     use beam_term::{make_small, NIL};
@@ -582,6 +658,243 @@ mod tests {
         )
         .expect("port_command/2 after the notsup");
         assert_eq!(runtime.atom_name_of(answer), Some("true"));
+    }
+
+    /// Registers a live `{spawn_driver, _}`-kind port whose **busy state** the test controls,
+    /// returning its id together with the shared handle a driver would write through
+    /// `set_busy_port` (bypasses `open_port/2` so no C compiler is needed).
+    fn busy_port(runtime: &mut Runtime, busy: bool, soft_busy: bool) -> (PortId, BusyFlag) {
+        crate::port::test_support::register_busy_port(runtime, "native_port_busy", busy, soft_busy)
+    }
+
+    /// The busy-port arms of `erlang:port_command/2,3`, pinned against the oracle
+    /// (erts-17.1, `erts_port_output`/`erl_bif_port.c:192-220`).
+    ///
+    /// The table this test locks down, for a driver that does **not** advertise
+    /// `ERL_DRV_FLAG_SOFT_BUSY`:
+    ///
+    /// | port | options | oracle |
+    /// |---|---|---|
+    /// | busy | `[nosuspend]` | the atom `false` (nothing written) |
+    /// | busy | `[force]` | `error:notsup` |
+    /// | busy | `[]` / none | the caller is **suspended**, then `true` — a capability gap here |
+    /// | idle | `[]` / none / `[nosuspend]` / **`[force]`** | `true` **except** `[force]` ⇒ `notsup` |
+    ///
+    /// The last row's `[force]` cell is the subtle one: the C's `notsup` test is on the driver
+    /// **entry** (`prt->drv_ptr->flags & ERL_DRV_FLAG_SOFT_BUSY`), so it fires on an *idle* port
+    /// too. That is measured, and it is why `{spawn, Cmd}`/`{fd, N}` ports answer `notsup` for
+    /// `[force]` here exactly as the oracle does.
+    #[test]
+    fn port_command_consults_the_ports_busy_state_like_the_oracle() {
+        let mut runtime = runtime();
+        let data = chars(&mut runtime, "x");
+        let nosuspend = atom(&mut runtime, "nosuspend");
+        let force = atom(&mut runtime, "force");
+
+        // A busy port whose driver does not advertise `SOFT_BUSY`.
+        let (port, flag) = busy_port(&mut runtime, true, false);
+        // `[nosuspend]` ⇒ the atom `false`, nothing written.
+        let nosuspend_only = list_of(&mut runtime, &[nosuspend]);
+        let answer = call(
+            &mut runtime,
+            "erlang",
+            "port_command",
+            &[port.to_eterm(), data, nosuspend_only],
+        )
+        .expect("nosuspend on a busy port is not an error");
+        assert_eq!(runtime.atom_name_of(answer), Some("false"));
+        // `[force]` ⇒ `notsup` (the entry lacks `SOFT_BUSY`), whatever `nosuspend` adds.
+        for options in [
+            list_of(&mut runtime, &[force]),
+            list_of(&mut runtime, &[force, nosuspend]),
+            list_of(&mut runtime, &[nosuspend, force]),
+        ] {
+            let error = call(
+                &mut runtime,
+                "erlang",
+                "port_command",
+                &[port.to_eterm(), data, options],
+            )
+            .expect_err("a driver without SOFT_BUSY rejects `force`");
+            assert_eq!(raise_atom(&error), "notsup", "{error}");
+            assert_eq!(
+                error::unsupported_reason(&error),
+                None,
+                "`notsup` is a genuine error, not a capability gap: {error}"
+            );
+        }
+        // A plain command on the busy port is the C's `erts_suspend`: a typed capability gap here
+        // (the runtime has no BIF-suspend channel), and deliberately **not** a fabricated `true`.
+        for options in [data, list_of(&mut runtime, &[])] {
+            let args: Vec<Eterm> = if options == data {
+                vec![port.to_eterm(), data]
+            } else {
+                vec![port.to_eterm(), data, options]
+            };
+            let error = call(&mut runtime, "erlang", "port_command", &args)
+                .expect_err("a plain command on a busy port cannot answer");
+            let reason = error::unsupported_reason(&error)
+                .unwrap_or_else(|| panic!("a capability gap, not {error}"));
+            assert!(
+                reason.contains("busy port"),
+                "the reason names the busy state: {reason}"
+            );
+        }
+        // A command the port accepts must not have been written by the refused arms: the port is
+        // still busy (the driver never cleared it).
+        {
+            let ports = std::rc::Rc::clone(&runtime.ports);
+            let registry = ports.try_borrow().expect("the port table");
+            assert!(registry.is_busy(port), "nothing cleared the busy state");
+            assert!(!registry.soft_busy(port), "the fixture driver is not SOFT_BUSY");
+        }
+
+        // Now clear it: the same three shapes all answer `true` **except** `[force]`, which is
+        // still `notsup` because the *driver* lacks `SOFT_BUSY` (the entry test, not a state test).
+        flag.set_busy(false);
+        let answer = call(
+            &mut runtime,
+            "erlang",
+            "port_command",
+            &[port.to_eterm(), data],
+        )
+        .expect("an idle port accepts the write");
+        assert_eq!(runtime.atom_name_of(answer), Some("true"));
+        let answer = call(
+            &mut runtime,
+            "erlang",
+            "port_command",
+            &[port.to_eterm(), data, nosuspend_only],
+        )
+        .expect("`nosuspend` on an idle port is a no-op");
+        assert_eq!(runtime.atom_name_of(answer), Some("true"));
+        let force_only = list_of(&mut runtime, &[force]);
+        let error = call(
+            &mut runtime,
+            "erlang",
+            "port_command",
+            &[port.to_eterm(), data, force_only],
+        )
+        .expect_err("`force` still needs SOFT_BUSY on an idle port");
+        assert_eq!(raise_atom(&error), "notsup", "{error}");
+    }
+
+    /// A driver that **does** advertise `ERL_DRV_FLAG_SOFT_BUSY` lets `[force]` through — busy or
+    /// idle — and the busy state then no longer gates a plain command either.
+    #[test]
+    fn port_command_force_goes_through_for_a_soft_busy_driver() {
+        let mut runtime = runtime();
+        let data = chars(&mut runtime, "x");
+        let force = atom(&mut runtime, "force");
+        let nosuspend = atom(&mut runtime, "nosuspend");
+        let (port, flag) = busy_port(&mut runtime, true, true);
+        // Busy + `[force]` (with or without `nosuspend`) ⇒ `true`: `force` bypasses the busy arm.
+        for options in [
+            list_of(&mut runtime, &[force]),
+            list_of(&mut runtime, &[force, nosuspend]),
+        ] {
+            let answer = call(
+                &mut runtime,
+                "erlang",
+                "port_command",
+                &[port.to_eterm(), data, options],
+            )
+            .expect("a SOFT_BUSY driver accepts `force`");
+            assert_eq!(runtime.atom_name_of(answer), Some("true"));
+        }
+        // Busy + `[nosuspend]` (no `force`) is still the atom `false` — `SOFT_BUSY` only widens the
+        // `force` arm.
+        let nosuspend_only = list_of(&mut runtime, &[nosuspend]);
+        let answer = call(
+            &mut runtime,
+            "erlang",
+            "port_command",
+            &[port.to_eterm(), data, nosuspend_only],
+        )
+        .expect("nosuspend answers false");
+        assert_eq!(runtime.atom_name_of(answer), Some("false"));
+        // Idle + `[force]` ⇒ `true`.
+        flag.set_busy(false);
+        let force_only = list_of(&mut runtime, &[force]);
+        let answer = call(
+            &mut runtime,
+            "erlang",
+            "port_command",
+            &[port.to_eterm(), data, force_only],
+        )
+        .expect("`force` on an idle SOFT_BUSY port is the plain write");
+        assert_eq!(runtime.atom_name_of(answer), Some("true"));
+    }
+
+    /// The C checks the busy state **before** it converts the iolist (`io.c:1760-1764`), so a busy
+    /// port's `[nosuspend]` answers `false` even for `Data` that is **not** iodata — the command is
+    /// dropped, never `badarg`. A `[force]` on a `SOFT_BUSY` driver bypasses the busy arm and *does*
+    /// reach the conversion, so the same bad `Data` is `badarg` there.
+    #[test]
+    fn port_command_busy_short_circuits_before_iodata_conversion() {
+        let mut runtime = runtime();
+        let not_iodata = make_small(42);
+        // Busy, no `SOFT_BUSY`: `[nosuspend]` ⇒ `false`, not `badarg`.
+        let (port, _flag) = busy_port(&mut runtime, true, false);
+        let nosuspend = atom(&mut runtime, "nosuspend");
+        let nosuspend_only = list_of(&mut runtime, &[nosuspend]);
+        let answer = call(
+            &mut runtime,
+            "erlang",
+            "port_command",
+            &[port.to_eterm(), not_iodata, nosuspend_only],
+        )
+        .expect("the busy arm precedes the iodata conversion");
+        assert_eq!(runtime.atom_name_of(answer), Some("false"));
+        // Busy, `SOFT_BUSY`: `[force]` bypasses the busy arm, so the bad iodata really is `badarg`.
+        let (port, _flag) = busy_port(&mut runtime, true, true);
+        let force = atom(&mut runtime, "force");
+        let force_only = list_of(&mut runtime, &[force]);
+        assert!(matches!(
+            call(
+                &mut runtime,
+                "erlang",
+                "port_command",
+                &[port.to_eterm(), not_iodata, force_only]
+            ),
+            Err(BeamError::BadArg)
+        ));
+    }
+
+    /// `port_command_options` reports **both** recognized atoms (the caller needs both to pick the
+    /// busy arm), and still rejects everything else with `badarg`.
+    #[test]
+    fn port_command_options_reports_force_and_nosuspend() {
+        let mut runtime = runtime();
+        let mut sink = NullSink;
+        let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
+        let force = context.atom("force").expect("an atom");
+        let nosuspend = context.atom("nosuspend").expect("an atom");
+        let bogus = context.atom("bogus").expect("an atom");
+        let list = |context: &mut RuntimeContext<'_>, elements: &[Eterm]| {
+            terms::make_list(&mut *context, elements).expect("a list")
+        };
+        let options = list(&mut context, &[force, nosuspend]);
+        let parsed = context
+            .port_command_options(options)
+            .expect("both atoms are recognized");
+        assert!(parsed.force && parsed.nosuspend);
+        let options = list(&mut context, &[nosuspend]);
+        let parsed = context
+            .port_command_options(options)
+            .expect("`nosuspend` alone is recognized");
+        assert!(!parsed.force && parsed.nosuspend);
+        // An empty list leaves both unset (the `/2` shape).
+        let parsed = context
+            .port_command_options(NIL)
+            .expect("[] is a valid option container");
+        assert!(!parsed.force && !parsed.nosuspend);
+        // An unknown atom is still `badarg`.
+        let options = list(&mut context, &[bogus]);
+        assert!(matches!(
+            context.port_command_options(options),
+            Err(BeamError::BadArg)
+        ));
     }
 
     /// A live port with a malformed/unrecognized option list is `badarg` — the oracle's

@@ -45,6 +45,7 @@ use beam_common::{BeamError, Result};
 use beam_io::{Driver, DriverContext};
 use beam_process::{PortId, ProcessId};
 
+use super::driver::BusyFlag;
 use super::{PortMeta, PortName, StreamType};
 use crate::Runtime;
 
@@ -164,7 +165,28 @@ pub(crate) fn register_control_port(
     name: &'static str,
     verbs: Vec<ControlVerb>,
 ) -> (PortId, Rc<Cell<libc::c_int>>) {
-    register_driver_port(runtime, name, verbs, None)
+    register_driver_port(runtime, name, verbs, None, None)
+}
+
+/// Registers a [`ControlDriver`] as a live `{spawn_driver, _}`-kind port that reports the **busy**
+/// state `busy`, and returns its id together with the shared [`BusyFlag`] handle so a test can
+/// toggle the state (`set_busy_port`) the way a C driver does from inside a callback.
+///
+/// The handle is shared by `Rc` with the registered port's metadata — exactly as
+/// [`super::driver::DriverPort::busy_flag`] is with a real C host — so
+/// [`PortRegistry::is_busy`](super::PortRegistry::is_busy) sees every change, and a test can drive
+/// the `erlang:port_command/2,3` busy arms without a C compiler.
+pub(crate) fn register_busy_port(
+    runtime: &mut Runtime,
+    name: &'static str,
+    busy: bool,
+    soft_busy: bool,
+) -> (PortId, BusyFlag) {
+    let flag = BusyFlag::new();
+    flag.set_busy(busy);
+    flag.set_soft_busy(soft_busy);
+    let (id, _flags) = register_driver_port(runtime, name, Vec::new(), None, Some(flag.clone()));
+    (id, flag)
 }
 
 /// Registers a [`ControlDriver`] as a live `{spawn_driver, _}`-kind port that **holds the
@@ -184,7 +206,7 @@ pub(crate) fn register_monitored_port(
     name: &'static str,
     monitors: Rc<super::driver::DriverMonitors>,
 ) -> PortId {
-    let (id, _flags) = register_driver_port(runtime, name, Vec::new(), Some(monitors));
+    let (id, _flags) = register_driver_port(runtime, name, Vec::new(), Some(monitors), None);
     id
 }
 
@@ -195,6 +217,7 @@ fn register_driver_port(
     name: &'static str,
     verbs: Vec<ControlVerb>,
     driver_monitors: Option<Rc<super::driver::DriverMonitors>>,
+    driver_busy: Option<BusyFlag>,
 ) -> (PortId, Rc<Cell<libc::c_int>>) {
     let flags = Rc::new(Cell::new(0));
     let driver = ControlDriver {
@@ -207,6 +230,7 @@ fn register_driver_port(
         kind: PortName::SpawnDriver,
         os_pid: None,
         stream: StreamType::List,
+        line: None,
         notify_exit: false,
         monitors: Vec::new(),
         owner: OWNER,
@@ -216,6 +240,7 @@ fn register_driver_port(
         driver_terms: None,
         driver_atoms: None,
         driver_control_flags: Some(Rc::clone(&flags)),
+        driver_busy,
         driver_monitors,
         input: Cell::new(0),
         output: Cell::new(0),

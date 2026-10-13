@@ -883,8 +883,10 @@ fn dropping_one_endpoint_is_observed_as_a_closed_link_by_the_peer() {
     // Close α's socket by dropping its connection.
     drop(alpha);
 
-    // β's next read sees end-of-stream: a typed `BadArg` (a short read), never a
-    // hang and never a panic. The finite read timeout bounds a regression.
+    // β's next read sees end-of-stream: a typed `UnexpectedEof` — the *clean*
+    // peer close at a frame boundary — never a hang and never a panic, and
+    // deliberately distinct from the `BadArg` malformed wire data yields. The
+    // finite read timeout bounds a regression.
     //
     // Honest finding: at THIS layer peer death is transport EOF. The
     // `net_ticktime` timeout and the resulting `{nodedown, Node}` decision belong
@@ -893,10 +895,14 @@ fn dropping_one_endpoint_is_observed_as_a_closed_link_by_the_peer() {
     let err = beta
         .recv(&mut beta_heap, &mut beta_atoms)
         .expect_err("a closed peer must not yield a message");
-    assert!(
-        matches!(err, BeamError::BadArg),
-        "expected an EOF short read, got {err:?}"
-    );
+    match err {
+        BeamError::Io(io) => assert_eq!(
+            io.kind(),
+            std::io::ErrorKind::UnexpectedEof,
+            "a clean peer close must be UnexpectedEof, got {io:?}"
+        ),
+        other => panic!("expected a clean-EOF UnexpectedEof, got {other:?}"),
+    }
 
     // The non-blocking driver reports the same event as a terminal `Closed` state.
     let (mut client, _server) = establish_drivers();

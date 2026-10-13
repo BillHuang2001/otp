@@ -31,11 +31,11 @@
 //! crate's live coverage (`tests/epmd.rs`) needs a real `epmd` on the host and
 //! skips when there is none. [`EpmdStub`] closes that gap: it binds an ephemeral
 //! loopback port, speaks the daemon's wire protocol, and is queried through
-//! [`EpmdClient::connect`], the address-taking entry point.
-//! ([`beam_dist::epmd::lookup`]/[`lookup_port`] are pinned to
-//! [`EPMD_DEFAULT_ADDR`](beam_dist::epmd::EPMD_DEFAULT_ADDR), so they cannot be
-//! aimed at an ephemeral port — a genuine client-side gap, reported rather than
-//! papered over here.)
+//! [`EpmdClient::connect`] and the address-taking
+//! [`lookup_at`](beam_dist::epmd::lookup_at) /
+//! [`lookup_port_at`](beam_dist::epmd::lookup_port_at), which reach any `epmd`
+//! address ([`beam_dist::epmd::lookup`]/[`lookup_port`] are the
+//! [`EPMD_DEFAULT_ADDR`](beam_dist::epmd::EPMD_DEFAULT_ADDR)-pinned wrappers).
 //!
 //! The stub is an **independent** implementation of the wire, not a second call
 //! into the crate under test: requests are hand-decoded and replies hand-encoded
@@ -86,9 +86,10 @@ use std::time::{Duration, Instant};
 
 use beam_common::BeamError;
 use beam_dist::epmd::{
-    Alive2Req, Alive2Resp, EpmdClient, Port2Resp, StopResp, EPMD_ALIVE2_REQ, EPMD_ALIVE2_RESP,
-    EPMD_ALIVE2_X_RESP, EPMD_DIST_HIGH, EPMD_DIST_LOW, EPMD_NAMES_REQ, EPMD_NODE_NORMAL,
-    EPMD_PORT2_REQ, EPMD_PORT2_RESP, EPMD_PROTO_TCP, EPMD_STOP_REQ,
+    lookup_at, lookup_port_at, Alive2Req, Alive2Resp, EpmdClient, Port2Resp, StopResp,
+    EPMD_ALIVE2_REQ, EPMD_ALIVE2_RESP, EPMD_ALIVE2_X_RESP, EPMD_DIST_HIGH, EPMD_DIST_LOW,
+    EPMD_NAMES_REQ, EPMD_NODE_NORMAL, EPMD_PORT2_REQ, EPMD_PORT2_RESP, EPMD_PROTO_TCP,
+    EPMD_STOP_REQ,
 };
 use beam_dist::TcpTransport;
 
@@ -180,9 +181,9 @@ fn the_crate_client_publishes_and_looks_up_a_node_against_a_hermetic_stub() {
     let missing = unknown.port_please(b"no_such_hermetic_node").expect("the stub answers PORT2_REQ");
     assert!(missing.is_not_registered(), "an unknown name must not resolve: {missing:?}");
     assert!(matches!(missing, Port2Resp::Error), "the 'w'+1 reply is the Error variant");
-    // `port_please` surfaces that reply as a *value*; the `Io(NotFound)`
-    // translation lives in `lookup_port`, which is pinned to `127.0.0.1:4369` and
-    // so cannot be aimed at this stub (see the module docs).
+    // `port_please` surfaces that reply as a *value*; the `Io(NotFound)` translation
+    // lives in `lookup_port_at` (the address-taking form of `lookup_port`), which
+    // this test drives below.
     drop(unknown);
 
     // Closing the ALIVE socket de-registers the node.
@@ -196,6 +197,53 @@ fn the_crate_client_publishes_and_looks_up_a_node_against_a_hermetic_stub() {
     assert!(gone.is_not_registered(), "a de-registered node must not resolve: {gone:?}");
 }
 
+/// `lookup_at`/`lookup_port_at` aim the one-shot `PORT2_REQ` lookup at an
+/// **arbitrary** `epmd`, so the `Io(NotFound)` translation is reachable against a
+/// daemon that is not on [`EPMD_DEFAULT_ADDR`] — here the hermetic stub.
+#[test]
+fn address_taking_lookups_resolve_a_node_on_a_non_default_epmd() {
+    let stub = EpmdStub::start().expect("bind a hermetic epmd stub");
+    let addr = stub.addr_string();
+    let name = b"at_node".to_vec();
+    const NODE_PORT: u16 = 47_120;
+
+    // Publish the node, keeping the ALIVE socket alive for the lookups below
+    // (`epmd` de-registers a node when its ALIVE socket closes).
+    let (_publisher, resp) =
+        publish(&addr, &alive2_req(&name, NODE_PORT)).expect("the stub answers ALIVE2_REQ");
+    assert!(resp.is_accepted(), "the stub refused the registration: {resp:?}");
+
+    // `lookup_at` resolves the name against the stub's own (non-default) address,
+    // and the stub is an independent decoder of the bytes the client wrote.
+    let resolved = lookup_at(&addr, &name).expect("the stub answers PORT2_REQ");
+    assert!(resolved.is_registered(), "the node must resolve: {resolved:?}");
+    match &resolved {
+        Port2Resp::Ok { port, name: reported, .. } => {
+            assert_eq!(*port, NODE_PORT, "the resolved port");
+            assert_eq!(reported, &name, "the resolved name");
+        }
+        Port2Resp::Error => panic!("the node must resolve: {resolved:?}"),
+    }
+
+    // `lookup_port_at` reduces that very reply to its port on a fresh connection.
+    assert_eq!(
+        lookup_port_at(&addr, &name).expect("the stub answers PORT2_REQ"),
+        NODE_PORT,
+        "lookup_port_at must return the registered port"
+    );
+
+    // The `Io(NotFound)` translation (never a silent port `0`) is now reachable
+    // against a non-default `epmd`: an unknown name is a typed error.
+    match lookup_port_at(&addr, b"no_such_node_at") {
+        Err(BeamError::Io(err)) => assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "an unknown name must be Io(NotFound): {err}"
+        ),
+        other => panic!("an unknown name must be Io(NotFound), not {other:?}"),
+    }
+    assert!(lookup_at(&addr, b"no_such_node_at").expect("the stub answers PORT2_REQ").is_not_registered());
+}
 /// `NAMES_REQ`/`STOP_REQ` against the stub, hermetically.
 #[test]
 fn the_stub_lists_and_unregisters_nodes_hermetically() {

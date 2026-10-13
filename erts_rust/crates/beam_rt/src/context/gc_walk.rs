@@ -82,6 +82,31 @@
 //!   entry is pruned only when the process itself is gone), so a flag observed `true` at one
 //!   collection stays `true` at every later one.
 //!
+//! # The same valve installed as the `beam_process` collection gate
+//!
+//! The valve's host call sites — the three heap-admission points in [`super::gc`] and the
+//! runner's park arm — all hold a [`Runtime`](crate::runtime::Runtime), so they can consult
+//! [`any_root_is_unscanned`] directly and gate the descent on the per-pid latch. The
+//! `beam_process` **signal** sites cannot: a monitor `'DOWN'`, an exit propagation and an
+//! applied trap reason all run inside [`ProcessTable`](beam_process::ProcessTable) with only
+//! `&mut ProcessTable` available, so they can reach neither the runtime's scratch nor its
+//! per-pid latch, and the rust-level `Process` they *can* reach exposes only the crate's own
+//! [`Process::has_unpublished_roots`] test (relocation-exempt, or
+//! [`Running`](beam_process::ProcessState::Running)). A relocating `ensure_capacity` on a
+//! **waiting** receiver — the woken-but-not-yet-resumed shape the A.9 `selfhost/*` corruption
+//! went through — is therefore neither exempt nor `Running`, and moved a heap this valve would
+//! have refused.
+//!
+//! The crate's [`beam_process::CollectionGate`] seam is the host's half of that decision:
+//! [`RuntimeCollectionGate`] implements it by running **this very walk** over the receiver's
+//! gathered roots, and [`Runtime::new`](crate::runtime::Runtime::new) installs one on the
+//! runtime's process table. Because the gate is a *table* field, it travels with the table into
+//! every scheduler pass ([`Runtime::take_processes`](crate::runtime::Runtime)) and covers every
+//! process the table holds — including one spawned from inside a pass — so all signal sites
+//! (`ptab.rs`'s `declines_signal_collection`) and
+//! [`ProcessTable::deliver`](beam_process::ProcessTable) decide with the *same* predicate the
+//! admission points use. One valve, never two that could drift.
+//!
 //! # Why no boxed kind can be missed
 //!
 //! The per-object child enumeration is the canonical
@@ -183,6 +208,75 @@ pub(crate) fn process_roots_are_unscanned(
     descend: bool,
 ) -> bool {
     any_root_is_unscanned(scratch, process, std::iter::empty::<&Eterm>(), descend)
+}
+
+/// The host side of the [`beam_process::CollectionGate`] seam: it answers a signal site's
+/// "may this receiver's heap be relocated?" question with **this module's** reachability walk,
+/// so a signal-driven relocation and an admission-point one decide identically.
+///
+/// [`Runtime::new`](crate::runtime::Runtime::new) installs one on the runtime's process table;
+/// see the module docs' *the same valve installed as the `beam_process` collection gate* for
+/// why the signal sites need it at all.
+///
+/// # Borrowing
+///
+/// The gate is owned by the [`ProcessTable`](beam_process::ProcessTable), and a signal site
+/// holds nothing but `&mut ProcessTable`, so the gate must be self-sufficient: it **owns its own
+/// [`WalkScratch`]** and drives it through `&mut self` in
+/// [`declines_relocation`](beam_process::CollectionGate::declines_relocation). No shared handle
+/// (`Rc<RefCell<…>>`, `thread_local!`) and no `unsafe` is needed or used; the crate stays
+/// `#![deny(unsafe_code)]` (this module's narrow, documented `#![allow(unsafe_code)]` covers
+/// only the raw object read in [`Walk::expand`]). The scratch is a plain struct of two `Vec`s
+/// that only ever grow, so after warm-up a decision allocates nothing.
+///
+/// This is a **second, independent** scratch instance — never the runtime's admission-point one
+/// ([`GcState::walk`](crate::runtime::gc::GcState)): a signal site runs from a different borrow
+/// than an admission point and may even run while a machine is mid-collection, so aliasing the
+/// two would be a borrow violation. Two instances cost one extra `Vec` pair and no correctness.
+///
+/// # Why the descent always runs (`descend = true`)
+///
+/// A signal site has **no in-flight machine**: the receiver is not the running process, so there
+/// is no machine root set to publish and the rule that lets an admission point skip the descent
+/// while the per-pid latch is closed cannot be evaluated here (the latch lives on the runtime,
+/// which the table cannot reach). Passing `true` is both **correct** and **conservative**:
+///
+/// * *correct* — the shape the descent exists to catch is a foreign container at depth ≥ 2 (a
+///   scanned mailbox/dict container holding a pooled-BIF-heap container holding a nursery word),
+///   which the cheap per-word phase alone cannot see; skipping the descent would let a signal
+///   site move a heap this valve must refuse.
+/// * *conservative* — declining a relocation is never wrong: the notification is still delivered,
+///   through the heap-fragment route the `Running`/relocation-exempt receiver already takes (a
+///   byte-faithful copy), so over-declining can only route a delivery to a fragment, never lose
+///   it or fabricate a value.
+pub(crate) struct RuntimeCollectionGate {
+    /// The descent scratch this gate owns; never shared with the runtime's admission-point
+    /// scratch (see the type docs).
+    scratch: WalkScratch,
+}
+
+impl RuntimeCollectionGate {
+    /// A gate with an empty (allocated lazily, on the first decision) descent scratch.
+    pub(crate) fn new() -> RuntimeCollectionGate {
+        RuntimeCollectionGate {
+            scratch: WalkScratch::default(),
+        }
+    }
+}
+
+impl Default for RuntimeCollectionGate {
+    fn default() -> RuntimeCollectionGate {
+        RuntimeCollectionGate::new()
+    }
+}
+
+impl beam_process::CollectionGate for RuntimeCollectionGate {
+    /// `true` when the receiver's gathered roots reach a container in a region its collector
+    /// does not scan — exactly [`process_roots_are_unscanned`] with the unconditional descent
+    /// the type docs justify.
+    fn declines_relocation(&mut self, receiver: &Process) -> bool {
+        process_roots_are_unscanned(&mut self.scratch, receiver, true)
+    }
 }
 
 /// The walk's mutable state: the reused scratch plus whether an unscanned container has been

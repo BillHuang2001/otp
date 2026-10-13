@@ -578,6 +578,72 @@ const EXPECTED: &[(&str, &str)] = &[
         "ordered_large",
         "{10001,0,10000,10001,5001,$end_of_table,[{0,0},{10000,20000},{5000,10000}],5000}",
     ),
+    // The `ets:slot/2` group. An `ordered_set` slot is exact (compared per slot);
+    // a hash-kind case renders only the contract (the sorted union of the slots,
+    // then the end-of-table / badarg boundary), because the bucket count and the
+    // per-object index are an interior freedom.
+    (
+        "slot_ordered_ascending",
+        "{ok:[{10,100}],ok:[{20,200}],ok:[{30,300}],ok:$end_of_table}",
+    ),
+    (
+        "slot_ordered_descending",
+        "{ok:[{10,100}],ok:[{20,200}],ok:[{30,300}],ok:[{40,400}],ok:[{50,500}],ok:$end_of_table}",
+    ),
+    ("slot_ordered_bounds", "{ok:[{30,300}],ok:$end_of_table,badarg,badarg}"),
+    (
+        "slot_ordered_noninteger",
+        "{ok:[{1,10}],badarg,badarg,badarg,badarg}",
+    ),
+    ("slot_ordered_empty", "{ok:$end_of_table,badarg}"),
+    (
+        "slot_ordered_keypos2",
+        "{ok:[{7,10}],ok:[{8,20}],ok:[{9,30}],ok:$end_of_table}",
+    ),
+    (
+        "slot_ordered_after_delete",
+        "{ok:[{1,10}],ok:[{2,20}],ok:[{4,40}],ok:[{5,50}],ok:$end_of_table}",
+    ),
+    (
+        "slot_ordered_slot_order_is_next_order",
+        "{ok:[{10,100}],ok:[{20,200}],ok:[{30,300}],ok:20}",
+    ),
+    ("slot_ordered_big_slot", "{badarg,badarg}"),
+    (
+        "slot_set_partition",
+        "{[{1,10},{2,20},{3,30}],ok:$end_of_table,badarg,badarg}",
+    ),
+    ("slot_set_empty", "{[],ok:$end_of_table,badarg}"),
+    (
+        "slot_bag_partition",
+        "{[{1,10},{2,20},{3,30}],ok:$end_of_table,badarg,badarg}",
+    ),
+    ("slot_bag_empty", "{[],ok:$end_of_table,badarg}"),
+    (
+        "slot_duplicate_bag_partition",
+        "{[{1,10},{2,20},{3,30}],ok:$end_of_table,badarg,badarg}",
+    ),
+    ("slot_duplicate_bag_empty", "{[],ok:$end_of_table,badarg}"),
+    (
+        "slot_duplicate_bag_duplicate_union",
+        "{[{1,10},{1,10},{2,20}],badarg}",
+    ),
+    ("map_literal_atom_key", "ok:[1]"),
+    ("map_wildcard_value", "ok:[1,3]"),
+    ("map_extra_keys_match", "ok:[1]"),
+    ("map_empty_pattern", "ok:[1,2]"),
+    ("map_nonatom_keys", "{ok:[10],ok:[20],ok:[30],ok:[40],ok:[50]}"),
+    ("map_int_vs_float_keys_distinct", "{ok:[int],ok:[afloat]}"),
+    ("map_nonliteral_key_badarg", "{badarg,badarg,ok:[]}"),
+    ("map_nested_in_containers", "{ok:[10],ok:[20]}"),
+    ("map_value_matched_structurally", "ok:[{x,1},{y,2}]"),
+    ("map_absent_key_empty", "ok:[]"),
+    ("map_large_head_map", "ok:[1]"),
+    ("map_construct_guard", "ok:[1,2]"),
+    ("map_construct_body_nested", "ok:[10,20]"),
+    ("map_get_absent_badarg", "{ok:[],ok:[EXIT]}"),
+    ("map_size_is_map_key_on_nonmap", "{ok:[2],ok:[2]}"),
+    ("select_replace_bare_map_body", "{badarg,[{1,10},{2,20}]}"),
 ];
 
 // ---------------------------------------------------------------------------

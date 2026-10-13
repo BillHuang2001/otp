@@ -122,11 +122,12 @@ use crate::dist_header::{DistHeader, DIST_HEADER};
 use crate::flags::{DistFlags, Dop, DFLAG_FRAGMENTS, DFLAG_SEND_SENDER};
 use crate::fragment::{split, Assembly, FragmentAssembler, DIST_FRAGMENT_SIZE};
 use crate::framing::{
-    is_tick, read_packet, write_packet, write_tick, PacketHeaderSize, MAX_PACKET_BODY,
+    is_tick, read_packet, read_packet_or_eof, write_packet, write_tick, PacketHeaderSize,
+    MAX_PACKET_BODY,
 };
 use crate::handshake::{
-    check_mandatory, preferred_flags, publish_type, status_error, Challenge, ChallengeAck,
-    ChallengeReply, Name, PeerVisibility, Status, StatusKind,
+    check_mandatory, preferred_flags, publish_type, status_error, AcceptDecision, Challenge,
+    ChallengeAck, ChallengeReply, Name, PeerVisibility, Status, StatusKind,
 };
 use crate::transport::{Read, Transport, Write};
 
@@ -221,6 +222,29 @@ impl Read for TcpTransport {
             Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => Err(BeamError::BadArg),
             Err(err) => Err(BeamError::Io(err)),
         }
+    }
+
+    fn read_exact_or_eof(&mut self, buf: &mut [u8]) -> Result<bool> {
+        // Read until `buf` is full. A `0`-byte read means the peer closed the
+        // socket: at the *start* of the read (no byte filled yet) that is a clean
+        // EOF at a frame boundary (`Ok(false)`); after some bytes it is a
+        // truncated frame (`BadArg`). `Interrupted` is retried, as `read_exact`
+        // would; any other I/O failure (including a read timeout) is `Io`.
+        let mut filled = 0;
+        while filled < buf.len() {
+            match std::io::Read::read(&mut self.stream, &mut buf[filled..]) {
+                Ok(0) => {
+                    if filled == 0 {
+                        return Ok(false);
+                    }
+                    return Err(BeamError::BadArg);
+                }
+                Ok(n) => filled += n,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(BeamError::Io(err)),
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -532,7 +556,55 @@ pub fn accept_server_with_flags<T: Transport>(
     creation: u32,
     flags: DistFlags,
 ) -> Result<Handshake> {
-    accept_server_core(t, our_name, cookie, creation, gen_challenge(), flags)
+    accept_server_core(
+        t,
+        our_name,
+        cookie,
+        creation,
+        gen_challenge(),
+        flags,
+        continue_handshake,
+    )
+}
+
+/// [`accept_server`] consulting a caller-supplied **accept decision**.
+///
+/// The seam for an acceptor that owns a net-kernel-style pending-connection
+/// registry: `decide` is consulted once, with the peer's decoded [`Name`], after
+/// the mandatory flag check has passed (the order a real node uses —
+/// `dist_util.erl:286` runs `check_dflags` before `mark_pending/1`).
+///
+/// * [`AcceptDecision::Ok`] behaves **exactly** as [`accept_server`] — the peer
+///   receives the byte-identical `"ok"` status frame.
+/// * [`AcceptDecision::Refuse`]`(status)` writes that status 2-byte-framed and
+///   flushed to the peer *before* returning [`status_error`]`(&status)`, so the
+///   refused peer reads a status frame instead of blocking on one that never
+///   arrives (the same notification rule the mandatory-check refusal uses,
+///   `dist_util.erl:286`). The statuses a real accepting node sends here are
+///   [`Status::nok`] (`dist_util.erl:343`), [`Status::alive`]
+///   (`dist_util.erl:386`) and [`Status::not_allowed`] (`dist_util.erl:286`).
+///
+/// `our_name`, `cookie` and `creation` have the same meaning as in
+/// [`accept_server`]; `flags` is the advertised capability set (see
+/// [`accept_server_with_flags`]).
+pub fn accept_server_with_decision<T: Transport, D>(
+    t: &mut T,
+    our_name: &[u8],
+    cookie: &[u8],
+    creation: u32,
+    flags: DistFlags,
+    decide: D,
+) -> Result<Handshake>
+where
+    D: FnOnce(&Name) -> AcceptDecision,
+{
+    accept_server_core(t, our_name, cookie, creation, gen_challenge(), flags, decide)
+}
+
+/// The default accept policy: proceed with every peer that passes the mandatory
+/// check (the behavior of [`accept_server`]/[`accept_server_with_flags`]).
+fn continue_handshake(_name: &Name) -> AcceptDecision {
+    AcceptDecision::Ok
 }
 
 /// [`accept_server`] with an explicit challenge nonce (the testable core).
@@ -543,19 +615,32 @@ fn accept_server_with<T: Transport>(
     creation: u32,
     our_challenge: u32,
 ) -> Result<Handshake> {
-    accept_server_core(t, our_name, cookie, creation, our_challenge, preferred_flags())
+    accept_server_core(
+        t,
+        our_name,
+        cookie,
+        creation,
+        our_challenge,
+        preferred_flags(),
+        continue_handshake,
+    )
 }
 
 /// The accept handshake with every knob explicit: the challenge nonce
-/// (`our_challenge`) and the advertised capability flag set (`our_flags`).
-fn accept_server_core<T: Transport>(
+/// (`our_challenge`), the advertised capability flag set (`our_flags`) and the
+/// local accept policy (`decide`).
+fn accept_server_core<T: Transport, D>(
     t: &mut T,
     our_name: &[u8],
     cookie: &[u8],
     creation: u32,
     our_challenge: u32,
     our_flags: DistFlags,
-) -> Result<Handshake> {
+    decide: D,
+) -> Result<Handshake>
+where
+    D: FnOnce(&Name) -> AcceptDecision,
+{
     // 1. Name: the client's flags, creation and name.
     let name = Name::decode(&read_packet(t, HANDSHAKE_FRAMING)?)?;
     // A peer whose flags fail the mandatory check (the v6 version gate) is
@@ -573,6 +658,14 @@ fn accept_server_core<T: Transport>(
         }
     };
 
+    // 1b. The local accept policy, consulted only after the mandatory check (a real
+    //     node runs `check_dflags` first, `dist_util.erl:286`). A refusal is written
+    //     to the peer *before* the error is returned — the notification rule the
+    //     mandatory-check branch above uses — so the peer never blocks.
+    if let AcceptDecision::Refuse(status) = decide(&name) {
+        send_refusal(t, status.clone())?;
+        return Err(status_error(&status));
+    }
     // 2. Status::Ok.
     let body = encode_handshake(|w| Status::Ok.encode(w))?;
     send_handshake(t, &body)?;
@@ -765,6 +858,28 @@ impl<T: Transport> Connection<T> {
         Ok(Connection::from_handshake(transport, handshake))
     }
 
+    /// [`Connection::server`] consulting a caller-supplied **accept decision**.
+    ///
+    /// The blocking counterpart of
+    /// [`ConnectionDriver::server_with_decision`](crate::driver::ConnectionDriver::server_with_decision):
+    /// `decide` runs once with the peer's [`Name`] and a
+    /// [`AcceptDecision::Refuse`]`(status)` is written to the peer before the
+    /// handshake aborts with [`status_error`]`(&status)`. An
+    /// [`AcceptDecision::Ok`] is byte-identical to [`Connection::server`]'s `"ok"`.
+    /// `flags` is the advertised capability set (see [`Connection::server_with_flags`]).
+    pub fn server_with_decision(
+        transport: T,
+        name: &[u8],
+        cookie: &[u8],
+        creation: u32,
+        flags: DistFlags,
+        decide: impl FnOnce(&Name) -> AcceptDecision,
+    ) -> Result<Connection<T>> {
+        let mut transport = transport;
+        let handshake =
+            accept_server_with_decision(&mut transport, name, cookie, creation, flags, decide)?;
+        Ok(Connection::from_handshake(transport, handshake))
+    }
     /// Builds a connection over a finished handshake.
     fn from_handshake(transport: T, mut handshake: Handshake) -> Connection<T> {
         let pending = handshake.buffered.take();
@@ -1005,12 +1120,19 @@ impl<T: Transport> Connection<T> {
     /// Reads the next complete (defragmented) message body.
     ///
     /// Ticks are answered transparently; a fragment sequence is buffered until its
-    /// last frame arrives.
+    /// last frame arrives. A peer that closed the connection cleanly at a frame
+    /// boundary is reported as [`BeamError::Io`] with
+    /// [`std::io::ErrorKind::UnexpectedEof`] — distinct from the
+    /// [`BeamError::BadArg`] a malformed or truncated frame yields, so a caller
+    /// can tell "the peer went away" from "the wire is corrupt".
     fn read_message_body(&mut self) -> Result<Vec<u8>> {
         loop {
             let packet = match self.pending.take() {
                 Some(packet) => packet,
-                None => read_packet(&mut self.transport, ESTABLISHED_FRAMING)?,
+                None => match read_packet_or_eof(&mut self.transport, ESTABLISHED_FRAMING)? {
+                    Some(packet) => packet,
+                    None => return Err(peer_closed()),
+                },
             };
             if is_tick(&packet) {
                 self.send_tick()?;
@@ -1031,6 +1153,20 @@ impl<T: Transport> Connection<T> {
             }
         }
     }
+}
+
+/// The typed error a **clean peer EOF at a frame boundary** produces on the
+/// blocking [`Connection`] path.
+///
+/// It is deliberately distinct from [`BeamError::BadArg`] (malformed/truncated
+/// wire data), so a caller can tell `Ok(0)`-at-frame-boundary from garbage. The
+/// non-blocking [`ConnectionDriver`](crate::driver::ConnectionDriver) reports the
+/// same condition as [`StepOutcome::Closed`](crate::driver::StepOutcome::Closed).
+fn peer_closed() -> BeamError {
+    BeamError::Io(std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        "beam_dist: peer closed the connection at a frame boundary",
+    ))
 }
 
 /// Splits a received message body into its distribution header and the offset at
