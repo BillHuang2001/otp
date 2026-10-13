@@ -815,6 +815,11 @@ line (no timestamps/addresses/ports) and exits `0`:
   the differential harness drives as an external command; not part of the library API
 - `tests/{constants,auth,handshake,framing,control,delivery,dop_roundtrip,epmd,fragment,atom_cache,connection,driver}.rs`
   → seams
+- `tests/validated_delivery.rs` → the **checked** per-link receive/dispatch layer over a real wire
+  (blocking `Connection` loopback + a `ConnectionDriver` byte shuttle): a peer `DOP_LINK` validates, a
+  third-node `from` is `Err(BadArg)`, a `DOP_MONITOR_P` with a small-int watcher is `Err`, and the
+  **unchanged** unchecked `recv_delivery`/`next_delivery` still accepts the same bytes (fed twice
+  byte-identically to the driver) — no `erl`/`epmd`
 - `tests/common/mod.rs` → the shared real-`erl` spawn/harness (`ErlangNode`, `erl_hostname`, `free_port`,
   `resolve_listen_port`) used by the live tests
 - `tests/live_interop.rs` → real-`erl` blocking handshake + `DOP_REG_SEND`/`DOP_SEND`/monitor exchange,
