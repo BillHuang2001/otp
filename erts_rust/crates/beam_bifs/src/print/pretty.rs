@@ -401,7 +401,7 @@ impl Node {
 }
 /// `io_lib_pretty:tsub/2` — `t` minus `e`, never crossing zero; a negative `t`
 /// (the unlimited chars limit) is preserved.
-fn tsub(t: i64, e: i64) -> i64 {
+pub(crate) fn tsub(t: i64, e: i64) -> i64 {
     if t < 0 {
         t
     } else if t >= e {

@@ -162,23 +162,19 @@
 //!   (verified against the oracle). A non-integer `N` is `badarg`, and a non-list
 //!   `Options` is `badarg`, exactly as in the oracle; a negative `chars_limit`
 //!   (the oracle's default, i.e. no limit) behaves like `format/2`.
-//! * **A *limiting* `chars_limit` (`N >= 0`) is an honest, typed, catchable gap.**
-//!   The oracle then returns a *limited* deep list — literal format text is never
-//!   limited, but each "big" control (`~w`/`~W`/`~p`/`~P`, and `~s` of a list or
-//!   binary) is rendered at a per-directive budget and elided with `"..."`, so
-//!   `io_lib:format("~w", [[1,2,3]], [{chars_limit,3}])` is `["[","...","]"]`
-//!   while `{chars_limit,100}`/`{chars_limit,-1}` are the normal deep list.
-//!   Reproducing that needs `io_lib_format`'s [`check_options`]/`build_limited`
-//!   two-pass **plus** `io_lib_pretty:intermediate/7` + `find_upper/11` +
-//!   `search_depth/9` + `expand/3` (a binary search over the depth/limit space
-//!   that grows a template until it just fits the budget). [`crate::print::pretty`]
-//!   already threads the template's `T`/`Dots` through `print_length/7` and owns
-//!   `tsub`/the `T =:= 0` elision, but it has **no `More` closure** on its `Node`
-//!   and none of the four `intermediate`-side functions, and `render_format`
-//!   performs no `count_small`/`build_limited` pass — see [`check_options`] for
-//!   the exact boundary. Until that is ported this is refused with the typed,
-//!   **catchable** `error:unsupported_bif` raise rather than emitting a wrong
-//!   (unlimited) line.
+//! * **A *limiting* `chars_limit` (`N >= 0`) is reproduced** (`io_lib_format`'s
+//!   two-pass `build/2`: `build_small/2` then `count_small/1` then
+//!   `build_limited/5`). Literal format text is never limited, but each "big"
+//!   control (`~w`/`~W`/`~p`/`~P`) is rendered at a per-directive budget and
+//!   elided with `"..."`, so `io_lib:format("~w", [[1,2,3]], [{chars_limit,3}])`
+//!   is `[[91,"...",93]]` and
+//!   `io_lib:format("hello ~w world", [[1..10]], [{chars_limit,10}])` elides the
+//!   middle, while `{chars_limit,100}`/`{chars_limit,-1}` are the normal deep
+//!   list. Every *small* control (`~s` of an atom, `~e`/`~f`/`~g`, `~b`/`~B`,
+//!   `~x`/`~X`, `~c`, `~~`, `~n`, `~i`) is covered — its characters count toward
+//!   `Other` and the running column. **`~s` of a list or binary under an active
+//!   limit is not ported** and stays a typed, catchable `unsupported_bif` (see
+//!   [`check_options`]), never a wrong rendering.
 
 use beam_codec::term::big_parts;
 use beam_common::Result;
@@ -194,8 +190,8 @@ use crate::error::{badarg, unsupported_bif};
 use crate::numeric::integer_digits;
 use crate::print::{
     adjust_chunk, dup_chars, dup_element, field_chunk, flatten_output, pretty_chunk,
-    pretty_chunk_order, proper_list, string_field_chunk, term_chunk_order, Chunk, MapOrder,
-    UNLIMITED_DEPTH,
+    pretty_chunk_limited, pretty_chunk_order, pretty_write_limited, proper_list,
+    string_field_chunk, term_chunk_order, tsub, Chunk, MapOrder, UNLIMITED_DEPTH,
 };
 use crate::registry::BifRegistry;
 
@@ -278,75 +274,42 @@ fn format_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `io_lib:format(Format, Args)` — returns the rendering as an iolist.
 fn format_lib_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    io_lib_format(ctx, args[0], Some(args[1]))
+    io_lib_format(ctx, args[0], Some(args[1]), -1)
 }
 
 /// `io_lib:format(Format, Args, Options)` — the rendering as an iolist, with the
 /// oracle's `format_options()` (`[{chars_limit, N}]`).
 ///
-/// Only the default/unlimited options are reproduced (see [`check_options`]): a
-/// *limiting* `chars_limit` (`N >= 0`) is the typed, catchable `unsupported_bif`
-/// gap. The gap is a plain `BeamError::Raise` (reason atom `unsupported_bif`), so
-/// interpreted/compiled Erlang code can `try … catch error:unsupported_bif -> …`
-/// it; it never aborts the runtime. (The CLI's `-eval` entry point reports every
-/// capability gap as an unrecoverable `Flow::Fatal` by design — a `beam_rt`
-/// policy, not a property of this BIF.)
+/// The `{chars_limit, N}` option is honoured (see [`check_options`]): a
+/// non-negative `N` returns the oracle's *limited* deep list, a negative one the
+/// normal unlimited rendering. A *limiting* `chars_limit` combined with `~s` of a
+/// list/binary is the typed, catchable `unsupported_bif` gap. The gap is a plain
+/// `BeamError::Raise` (reason atom `unsupported_bif`), so interpreted/compiled
+/// Erlang code can `try … catch error:unsupported_bif -> …` it; it never aborts
+/// the runtime. (The CLI's `-eval` entry point reports every capability gap as an
+/// unrecoverable `Flow::Fatal` by design — a `beam_rt` policy, not a property of
+/// this BIF.)
 fn format_lib_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    check_options(ctx, args[2])?;
-    io_lib_format(ctx, args[0], Some(args[1]))
+    let chars_limit = check_options(ctx, args[2])?;
+    io_lib_format(ctx, args[0], Some(args[1]), chars_limit)
 }
 
-/// Validates `io_lib:format/3`'s `Options` list
-/// (`io_lib_format:get_option/3` over `lists:keyfind/3`) and rejects the
-/// not-yet-ported *limiting* `chars_limit`.
+/// `io_lib:format/3`'s `Options` list (`io_lib_format:get_option/3` over
+/// `lists:keyfind/3`): the effective `chars_limit`, `-1` (the oracle's default,
+/// i.e. no limit) when absent.
 ///
 /// `Options` must be a proper list (`badarg` otherwise, as in the oracle).
 /// Elements other than `{chars_limit, N}` are ignored — the oracle only reads that
-/// one key — and a negative `N` is the oracle's default (no limit). A limiting
-/// `chars_limit` (`N >= 0`) is a typed [`unsupported_bif`] gap.
-///
-/// **What is missing** (precisely bounded — the oracle's own algorithm):
-///
-/// * `io_lib_format:build/2`'s two passes: `build_small(FormatList, CharsLimit)`
-///   (a `lists:flatten` of every *small* control's rendering, with
-///   `limit_field(F, CL) = max(3, min(F, CL))` applied when `CL >= 0`), then
-///   `count_small/1` partitioning the result into the big-control counts
-///   `P`/`S`/`W` (`~p`/`~P`, `~s`-of-list/binary, `~w`/`~W`) and `Other` (the
-///   `io_lib:chars_length` of every literal/`small`-spliced character), and only
-///   then `build_limited/5`.
-/// * `build_limited(Res1, NumOfPs, Count0, RemainingChars, I)` with
-///   `RemainingChars = CharsLimit - Other`, the per-directive budget
-///   `MaxChars = if MaxLen0 < 0 -> MaxLen0; true -> MaxLen0 div Count0 end`,
-///   `MaxLen = MaxLen0 - chars_length(S)` after each big control, `decr_pc/2` (only
-///   `~p`/`~P` decrement the `P` budget) and the `indentation/2`-threaded column
-///   `I` (`I + 1` is a `~p`/`~P`'s default initial column).
-/// * That per-directive budget for `~w`/`~W` is
-///   `io_lib_pretty:intermediate(Term, Depth, T, Enc, RFun, StrFun, Ord)`: build the
-///   template at depth `D0 = 1` with `print_length(Term, 1, T, …)` and, when
-///   `Dots =/= 0 orelse Len > T orelse D0 =:= 1` is *not* decisive, binary-search
-///   the depth via `find_upper(…, Lower = 1, Upper = 2, …)` + `search_depth/9`
-///   (with its `Du - Dl =:= 1 ⇒ Lower iff its Len =:= T` tie rule) and `expand/3`
-///   (which re-derives *more* of the term at the winning depth by re-running the
-///   `More` closure each non-dots node carries). `~p`/`~P` under a limit take the
-///   same `intermediate` + the **flat** `write/1` (the `pp/8` re-flow is unreached,
-///   so a limited `~p` never breaks lines).
-///
-/// [`crate::print::pretty`] already models the `print_length/7` side of that
-/// (`build` + `tsub` + the `T =:= 0` elision + `Tpl::Container`/`SeqTail::Dots`)
-/// and `write/1` — but its `Node` carries **no `More` closure**, and
-/// `intermediate`/`find_upper`/`search_depth`/`expand`, `count_small`,
-/// `build_limited` and `limit_field` are all absent. So the port is a real
-/// algorithm addition, not a flag flip; half-implementing it would produce a
-/// *wrong* limited rendering, which this crate must never do.
-fn check_options(ctx: &BifContext<'_>, options: Eterm) -> Result<()> {
+/// one key — and a negative `N` is the oracle's default (no limit). A
+/// `chars_limit` whose value is not a small integer is `badarg`.
+fn check_options(ctx: &BifContext<'_>, options: Eterm) -> Result<i64> {
+    let mut chars_limit = -1i64;
     for option in proper_list(options).ok_or_else(badarg)? {
         if let Some(limit) = chars_limit_option(ctx, option)? {
-            if limit >= 0 {
-                return Err(unsupported_bif());
-            }
+            chars_limit = limit;
         }
     }
-    Ok(())
+    Ok(chars_limit)
 }
 
 /// The `N` of a `{chars_limit, N}` element, `None` for any other element (which
@@ -369,7 +332,7 @@ fn chars_limit_option(ctx: &BifContext<'_>, option: Eterm) -> Result<Option<i64>
 
 /// `io:format`: render, write the result, return `ok`.
 fn io_format(ctx: &mut BifContext<'_>, format: Eterm, args: Option<Eterm>) -> Result<Eterm> {
-    let chunks = render_format_of(ctx, format, args)?;
+    let chunks = render_format_of(ctx, format, args, -1)?;
     ctx.write_output(&flatten_output(&chunks)?)?;
     ctx.ok()
 }
@@ -378,9 +341,15 @@ fn io_format(ctx: &mut BifContext<'_>, format: Eterm, args: Option<Eterm>) -> Re
 ///
 /// The list is *not* flat: each literal format character and each "small" control
 /// contributes its own element, while every other control contributes a single
-/// sub-list element (see [`render_format`]).
-fn io_lib_format(ctx: &mut BifContext<'_>, format: Eterm, args: Option<Eterm>) -> Result<Eterm> {
-    let chunks = render_format_of(ctx, format, args)?;
+/// sub-list element (see [`render_format`]). `chars_limit` is
+/// `io_lib:format/3`'s `{chars_limit, N}` (`-1` for `/2`, i.e. unlimited).
+fn io_lib_format(
+    ctx: &mut BifContext<'_>,
+    format: Eterm,
+    args: Option<Eterm>,
+    chars_limit: i64,
+) -> Result<Eterm> {
+    let chunks = render_format_of(ctx, format, args, chars_limit)?;
     chunks_to_term(ctx, &chunks)
 }
 
@@ -389,6 +358,7 @@ fn render_format_of(
     ctx: &mut BifContext<'_>,
     format: Eterm,
     args: Option<Eterm>,
+    chars_limit: i64,
 ) -> Result<Vec<Chunk>> {
     let bytes = format_bytes(format)?;
     let arg_terms = match args {
@@ -396,7 +366,7 @@ fn render_format_of(
         None => Vec::new(),
     };
     let mut chunks = Vec::new();
-    render_format(ctx, &bytes, &arg_terms, &mut chunks)?;
+    render_format(ctx, &bytes, &arg_terms, &mut chunks, chars_limit)?;
     Ok(chunks)
 }
 
@@ -464,7 +434,27 @@ impl Spec {
 ///
 /// `io:format` flattens `out` to text; `io_lib:format` materializes it as the deep
 /// list the oracle returns.
+///
+/// `chars_limit` is `io_lib:format/3`'s `{chars_limit, N}`: a **negative** value
+/// (the oracle's default) is the plain unlimited rendering
+/// ([`render_format_unlimited`]); a non-negative one runs the oracle's two-pass
+/// limited build ([`render_format_limited`]).
 fn render_format(
+    ctx: &mut BifContext<'_>,
+    bytes: &[u8],
+    args: &[Eterm],
+    out: &mut Vec<Chunk>,
+    chars_limit: i64,
+) -> Result<()> {
+    if chars_limit < 0 {
+        return render_format_unlimited(ctx, bytes, args, out);
+    }
+    render_format_limited(ctx, bytes, args, out, chars_limit)
+}
+
+/// The unlimited rendering — the single pass
+/// `io_lib_format:build_small/2` runs when `CharsLimit < 0`.
+fn render_format_unlimited(
     ctx: &mut BifContext<'_>,
     bytes: &[u8],
     args: &[Eterm],
@@ -501,6 +491,203 @@ fn render_format(
         return Err(badarg());
     }
     Ok(())
+}
+
+/// One element of `io_lib_format:build_small/2`'s result `Res1`.
+enum BuildItem {
+    /// A literal format character, or a *small* control's characters
+    /// (`lists:flatten/1`-ed, so they count one character each toward `Other`).
+    Flat(Chunk),
+    /// A "big" control, kept as its captured directive state for pass 2
+    /// (`io_lib_format:build_limited/5`).
+    Big(BigControl),
+}
+
+/// A "big" control as pass 1 captured it (`~w`/`~W`/`~p`/`~P`, and `~s` of a
+/// list/binary — the last of which pass 2 refuses, see
+/// [`render_limited_control`]).
+struct BigControl {
+    /// The control character.
+    ctrl: u8,
+    /// The parsed control-sequence prefix (width/precision/order…).
+    spec: Spec,
+    /// The term argument.
+    term: Eterm,
+    /// The `~W`/`~P` depth argument (`UNLIMITED_DEPTH` for `~w`/`~p`).
+    depth: i64,
+}
+
+/// `io_lib_format:build_limited/5` — the oracle's limited rendering
+/// (`CharsLimit >= 0`).
+///
+/// Pass 1 is [`render_format_unlimited`]'s walk with the big controls *captured*
+/// instead of rendered (`build_small/2`: a literal and every *small* control
+/// become flat characters, `~w`/`~W`/`~p`/`~P` stay a control). `count_small/1`
+/// then sums the flat characters into `Other` and counts the big controls into
+/// `P` (`~p`/`~P`) and `W` (`~w`/`~W`/`~s` — the oracle's own quirk keeps its `S`
+/// counter at `0`). Pass 2 walks the captured items again with the per-directive
+/// budget `MaxLen div Count` and charges each rendering's
+/// [`Chunk::flat_len`] (`io_lib:chars_length/1`) back against the budget.
+fn render_format_limited(
+    ctx: &mut BifContext<'_>,
+    bytes: &[u8],
+    args: &[Eterm],
+    out: &mut Vec<Chunk>,
+    chars_limit: i64,
+) -> Result<()> {
+    // ---- pass 1: build_small/2 (with the big controls captured) --------------
+    let mut items: Vec<BuildItem> = Vec::new();
+    let mut i = 0usize;
+    let mut next_arg = 0usize;
+    let mut column = 0i64;
+
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if byte != b'~' {
+            items.push(BuildItem::Flat(Chunk::Char(byte as char)));
+            column = indent_char(byte as char, column);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let (spec, ctrl) = parse_cseq(bytes, &mut i, args, &mut next_arg)?;
+        match ctrl {
+            b'w' | b'p' => {
+                let term = take(args, &mut next_arg)?;
+                items.push(BuildItem::Big(BigControl {
+                    ctrl,
+                    spec,
+                    term,
+                    depth: UNLIMITED_DEPTH,
+                }));
+            }
+            b'W' | b'P' => {
+                let term = take(args, &mut next_arg)?;
+                let depth = take_depth(args, &mut next_arg)?;
+                items.push(BuildItem::Big(BigControl {
+                    ctrl,
+                    spec,
+                    term,
+                    depth,
+                }));
+            }
+            _ => {
+                let piece = dispatch(ctx, ctrl, &spec, args, &mut next_arg, column)?;
+                if !piece.small {
+                    // `~s` of a list/binary under an active limit is not ported:
+                    // the typed gap, never a wrong (unlimited or wrongly elided)
+                    // string.
+                    return Err(unsupported_bif());
+                }
+                column = indentation_of(&piece.chunk, column);
+                items.push(BuildItem::Flat(piece.chunk));
+            }
+        }
+    }
+    if next_arg != args.len() {
+        return Err(badarg());
+    }
+
+    // ---- count_small/1 --------------------------------------------------------
+    let mut num_of_ps = 0i64;
+    let mut num_of_ws = 0i64;
+    let mut other = 0i64;
+    for item in &items {
+        match item {
+            BuildItem::Flat(chunk) => other += chunk.flat_len() as i64,
+            BuildItem::Big(big) => match big.ctrl {
+                b'p' | b'P' => num_of_ps += 1,
+                b'w' | b'W' | b's' => num_of_ws += 1,
+                _ => {}
+            },
+        }
+    }
+    let count0 = num_of_ps + num_of_ws;
+    if count0 == 0 {
+        // `build/2` returns `Res1` unchanged when `P + S + W =:= 0`.
+        for item in items {
+            if let BuildItem::Flat(chunk) = item {
+                splice_flat(out, chunk);
+            }
+        }
+        return Ok(());
+    }
+
+    // ---- pass 2: build_limited/5 ---------------------------------------------
+    let mut count = count0;
+    let mut max_len = tsub(chars_limit, other);
+    let mut column = 0i64;
+    for item in items {
+        match item {
+            BuildItem::Flat(chunk) => {
+                column = indentation_of(&chunk, column);
+                splice_flat(out, chunk);
+            }
+            BuildItem::Big(big) => {
+                let budget = if max_len < 0 { -1 } else { max_len / count };
+                let chunk = render_limited_control(ctx, &big, budget, column)?;
+                // `indentation/2` runs before `NumOfPs` is decremented, but the
+                // column only advances while `~p`/`~P` remain.
+                let next_column = indentation_of(&chunk, column);
+                if matches!(big.ctrl, b'p' | b'P') {
+                    num_of_ps -= 1;
+                }
+                count -= 1;
+                max_len = if max_len < 0 {
+                    -1
+                } else {
+                    tsub(max_len, chunk.flat_len() as i64)
+                };
+                column = if num_of_ps > 0 { next_column } else { column };
+                out.push(chunk);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `io_lib_format:control_limited/3` — one big control rendered under the
+/// per-directive budget `max_chars` (`< 0` = unlimited) at running column `at`.
+///
+/// * `~w`/`~W` — `io_lib:write(Term, Depth, Enc, Ord, MaxChars)` (the
+///   [`pretty_write_limited`] entry point) followed by the directive's field
+///   (`term/6`, [`term_field`]);
+/// * `~p`/`~P` — `io_lib_format:print/…` under the limit ([`render_p`] with a
+///   non-negative `chars_limit`).
+///
+/// # Errors
+///
+/// The typed [`unsupported_bif`] for a big control with no limited clause here
+/// (`~s` of a list/binary), plus whatever the renderer itself reports.
+fn render_limited_control(
+    ctx: &mut BifContext<'_>,
+    big: &BigControl,
+    max_chars: i64,
+    at: i64,
+) -> Result<Chunk> {
+    match big.ctrl {
+        b'w' | b'W' => {
+            let chunk = pretty_write_limited(
+                ctx,
+                big.term,
+                false,
+                big.depth,
+                max_chars,
+                big.spec.maps_order,
+            )?;
+            Ok(term_field(chunk, &big.spec))
+        }
+        b'p' | b'P' => render_p(
+            ctx,
+            big.term,
+            big.spec.strings,
+            big.depth,
+            &big.spec,
+            at,
+            max_chars,
+        ),
+        _ => Err(unsupported_bif()),
+    }
 }
 
 /// One directive's result: the chunk tree plus whether it is a *small* control.
@@ -773,6 +960,7 @@ fn dispatch(
                 UNLIMITED_DEPTH,
                 spec,
                 column,
+                -1,
             )?))
         }
         b'W' => {
@@ -791,6 +979,7 @@ fn dispatch(
                 depth,
                 spec,
                 column,
+                -1,
             )?))
         }
         b's' => {
@@ -987,6 +1176,11 @@ fn byte_string(elems: &[Eterm]) -> Result<String> {
 /// way `io_lib_pretty` breaks a container across lines when it does not fit
 /// `line_length - column` (see [`crate::print::pretty_chunk`] and the module docs
 /// for the supported forms and the remaining gap).
+///
+/// A **non-negative** `chars_limit` selects the limited path
+/// ([`pretty_chunk_limited`], `io_lib_pretty:print/10` with `T = chars_limit`),
+/// which elides with `"..."` instead of re-flowing.
+#[allow(clippy::too_many_arguments)]
 fn render_p(
     ctx: &mut BifContext<'_>,
     term: Eterm,
@@ -994,6 +1188,7 @@ fn render_p(
     depth: i64,
     spec: &Spec,
     at: i64,
+    chars_limit: i64,
 ) -> Result<Chunk> {
     if spec.left {
         // A left-adjusted `~p`/`~P` has no clause in `io_lib_format`.
@@ -1003,6 +1198,18 @@ fn render_p(
     // `io_lib_format:print/12` defaults the column to `I + 1` — the running
     // indentation at the directive — not to 1 (`io_lib_pretty:print/10`'s `Column`).
     let column = spec.precision.unwrap_or((at + 1).max(1) as usize);
+    if chars_limit >= 0 {
+        return pretty_chunk_limited(
+            ctx,
+            term,
+            printable,
+            depth,
+            line_length,
+            column,
+            chars_limit,
+            spec.maps_order,
+        );
+    }
     match spec.maps_order {
         MapOrder::Storage => pretty_chunk(ctx, term, printable, depth, line_length, column),
         order => pretty_chunk_order(ctx, term, printable, depth, line_length, column, order),
@@ -2279,6 +2486,49 @@ mod tests {
         }
     }
 
+    /// The nested-list **shape** of an `io_lib:format` result — the oracle's
+    /// structure, which a flattened-text comparison cannot distinguish
+    /// (`[[91,[46,46,46],93]]` vs `[[91,46,46,46,93]]`).
+    fn deep_shape(term: Eterm) -> String {
+        if is_small(term) {
+            return signed_value(term).to_string();
+        }
+        let elems = proper_list(term).expect("io_lib:format returns a proper list");
+        let parts: Vec<String> = elems.iter().map(|&e| deep_shape(e)).collect();
+        format!("[{}]", parts.join(","))
+    }
+
+    /// Renders `format` with the argument list `build_args` builds under
+    /// `[{chars_limit, Limit}]` through `io_lib:format/3`, materializing both the
+    /// flattened text and the result's [`deep_shape`] before the heap is dropped.
+    fn run_limited(
+        format: &str,
+        limit: i64,
+        build_args: impl FnOnce(&mut BifContext<'_>) -> Eterm,
+    ) -> Result<(String, String)> {
+        let mut heap = Heap::new(4096).expect("test heap");
+        let mut atoms = AtomTable::new();
+        atoms.seed(SEED);
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let format_term = list_from_bytes(&mut ctx, format.as_bytes());
+        let args = build_args(&mut ctx);
+        let limit_term = ctx.int(limit).expect("fits");
+        let options = chars_limit(&mut ctx, limit_term);
+        format_lib_3(&mut ctx, &[format_term, args, options])
+            .map(|term| (deep_text(term), deep_shape(term)))
+    }
+
+    /// A proper list of small-int elements on `ctx`'s heap.
+    fn int_list(ctx: &mut BifContext<'_>, values: &[i64]) -> Eterm {
+        let elems: Vec<Eterm> = values.iter().map(|&v| ctx.int(v).expect("fits")).collect();
+        ctx.list(&elems).expect("fits")
+    }
+
+    /// The argument list `[List]` for a one-argument `~w`/`~p` directive.
+    fn list_arg(ctx: &mut BifContext<'_>, values: &[i64]) -> Eterm {
+        let list = int_list(ctx, values);
+        ctx.list(&[list]).expect("fits")
+    }
     /// Renders `format` with the small-int `args` under `build_options`, both
     /// through `io_lib:format/3` and (as the reference) `io_lib:format/2`.
     fn run_lib3(
@@ -2353,17 +2603,10 @@ mod tests {
         let (three, two) = run_lib3("~w", &[42], option_chars_limit_neg);
         assert_eq!(text(three), text(two));
 
-        // A limiting `chars_limit` is a typed, *catchable* error, never a wrong
-        // (unlimited) line and never a runtime abort: `unsupported_bif` is a plain
-        // `BeamError::Raise`, i.e. the `error:unsupported_bif` a BEAM `catch` sees.
+        // A limiting `chars_limit` is honoured: `~w` of `42` has room to spare in
+        // a 3-character budget, so the oracle renders it unchanged (`[[52,50]]`).
         let (three, _) = run_lib3("~w", &[42], option_chars_limit_three);
-        match three {
-            Outcome::Err(BeamError::Raise(raise)) => {
-                assert_eq!(raise.reason, ExitReason::atom("unsupported_bif"));
-                assert_eq!(raise.class, ExceptionClass::Error);
-            }
-            other => panic!("expected a typed unsupported-option error, got {other:?}"),
-        }
+        assert_eq!(text(three), "42");
 
         // A non-integer `chars_limit` value and a non-list `Options` are `badarg`.
         let (three, _) = run_lib3("~w", &[42], option_chars_limit_atom);
@@ -2374,6 +2617,127 @@ mod tests {
         // `format/3` still renders directives normally.
         let (three, _) = run_lib3("~b~n", &[255], |ctx| ctx.list(&[]).expect("fits"));
         assert_eq!(text(three), "255\n");
+    }
+
+    #[test]
+    fn io_lib_format_3_chars_limit_elides_a_term_control() {
+        // A zero budget elides the whole control — the oracle's `["..."]`.
+        let (text, shape) =
+            run_limited("~w", 0, |ctx| list_arg(ctx, &[1, 2, 3])).expect("renders");
+        assert_eq!(text, "...");
+        assert_eq!(shape, "[[46,46,46]]");
+
+        // The `[1,2,3]` rendering is 7 characters, so any budget below that elides
+        // the container's contents to `"..."`: the oracle's `[[91,"...",93]]`.
+        for limit in [1, 2, 3, 5] {
+            let (text, shape) = run_limited("~w", limit, |ctx| list_arg(ctx, &[1, 2, 3]))
+                .unwrap_or_else(|err| panic!("limit {limit}: {err:?}"));
+            assert_eq!(text, "[...]", "limit {limit}");
+            assert_eq!(shape, "[[91,[46,46,46],93]]", "limit {limit}");
+        }
+
+        // A budget the rendering fits into is the plain unlimited deep list
+        // (`[[91,["1",44,"2",44,"3"],93]]`), i.e. the elements stay sub-lists.
+        for limit in [7, 100] {
+            let (text, shape) = run_limited("~w", limit, |ctx| list_arg(ctx, &[1, 2, 3]))
+                .unwrap_or_else(|err| panic!("limit {limit}: {err:?}"));
+            assert_eq!(text, "[1,2,3]", "limit {limit}");
+            assert_eq!(
+                shape, "[[91,[[49],44,[50],44,[51]],93]]",
+                "limit {limit}"
+            );
+        }
+
+        // `~p` takes the same limited path (the flat `write/1` arm).
+        let (text, shape) =
+            run_limited("~p", 3, |ctx| list_arg(ctx, &[1, 2, 3])).expect("renders");
+        assert_eq!(text, "[...]");
+        assert_eq!(shape, "[[91,[46,46,46],93]]");
+
+        // `~W`/`~P` too (the depth argument is consumed before the budget).
+        let (text, _) = run_limited("~W", 4, |ctx| {
+            let list = int_list(ctx, &[1, 2, 3]);
+            let depth = ctx.int(2).expect("fits");
+            ctx.list(&[list, depth]).expect("fits")
+        })
+        .expect("renders");
+        assert_eq!(text, "[...]");
+    }
+
+    #[test]
+    fn io_lib_format_3_chars_limit_accounts_for_literal_text() {
+        // The literal `hello ` / ` world` is never limited but is charged against
+        // the budget first (`Other`): a 10-character limit leaves nothing, so the
+        // `[1..10]` control elides to `"..."` (the oracle's
+        // `[104,101,108,108,111,32,"...",32,…]`).
+        let (text, shape) = run_limited("hello ~w world", 10, |ctx| {
+            list_arg(ctx, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+        })
+        .expect("renders");
+        assert_eq!(text, "hello ... world");
+        assert_eq!(
+            shape,
+            "[104,101,108,108,111,32,[46,46,46],32,119,111,114,108,100]"
+        );
+
+        // A small control's characters count toward `Other` the same way.
+        let (text, shape) = run_limited("~c~w", 6, |ctx| {
+            let ch = ctx.int(i64::from(b'x')).expect("fits");
+            let list = int_list(ctx, &[1, 2, 3]);
+            ctx.list(&[ch, list]).expect("fits")
+        })
+        .expect("renders");
+        assert_eq!(text, "x[...]");
+        assert_eq!(shape, "[120,[91,[46,46,46],93]]");
+    }
+
+    #[test]
+    fn io_lib_format_3_chars_limit_splits_the_budget_between_controls() {
+        // `~w ~w` with `{chars_limit,8}`: the literal space is `Other = 1`, so the
+        // remaining 7 is split `7 div 2 = 3` for the first control, then
+        // `7 - 3 = 4` for the second — both elide (the oracle's
+        // `[[91,"...",93],32,[91,"...",93]]`). Giving each control the whole 7
+        // would render `[1,2,3]` twice, so this pins the per-directive budget.
+        let (text, shape) = run_limited("~w ~w", 8, |ctx| {
+            let first = int_list(ctx, &[1, 2, 3]);
+            let second = int_list(ctx, &[4, 5, 6]);
+            ctx.list(&[first, second]).expect("fits")
+        })
+        .expect("renders");
+        assert_eq!(text, "[...] [...]");
+        assert_eq!(shape, "[[91,[46,46,46],93],32,[91,[46,46,46],93]]");
+    }
+
+    #[test]
+    fn io_lib_format_3_chars_limit_refuses_a_string_control() {
+        // `~s` of a list/binary under an *active* limit is not ported: it stays the
+        // typed, *catchable* `unsupported_bif`, never a wrong (unlimited or
+        // wrongly elided) rendering. `unsupported_bif` is a plain
+        // `BeamError::Raise`, i.e. what a BEAM `catch` sees as
+        // `error:unsupported_bif`.
+        for limit in [0, 5, 100] {
+            let result = run_limited("~s", limit, |ctx| {
+                let bytes = byte_list(ctx, b"abc");
+                ctx.list(&[bytes]).expect("fits")
+            });
+            match result {
+                Err(BeamError::Raise(raise)) => {
+                    assert_eq!(raise.reason, ExitReason::atom("unsupported_bif"));
+                    assert_eq!(raise.class, ExceptionClass::Error);
+                }
+                other => panic!("limit {limit}: expected the typed ~s gap, got {other:?}"),
+            }
+        }
+
+        // `~s` of an **atom** is a *small* control, so it stays supported: its
+        // characters are spliced flat and no control is budgeted.
+        let (text, shape) = run_limited("~s", 100, |ctx| {
+            let atom = ctx.atom("abc").expect("seeded");
+            ctx.list(&[atom]).expect("fits")
+        })
+        .expect("renders");
+        assert_eq!(text, "abc");
+        assert_eq!(shape, "[97,98,99]");
     }
 
     #[test]
