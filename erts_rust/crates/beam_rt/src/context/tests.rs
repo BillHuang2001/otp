@@ -4893,3 +4893,215 @@ fn the_installed_gate_declines_a_signal_driven_relocation_of_a_foreign_reachable
         "the signal is delivered onto the receiver's own (grown) heap"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// A registered BIF's container result is MOVED onto the running process's own (SCANNED) young
+// heap and the pooled BIF heap is then REWOUND.
+// ---------------------------------------------------------------------------------------------
+
+/// Builds the list `[a, b, c]` on `pid`'s **own young heap**.
+///
+/// A BIF's *arguments* come from the caller's heap, so a case exercising the result move must not
+/// hand the BIF a list built on the pooled BIF heap (that would test the wrong region).
+fn young_int_list(table: &mut ProcessTable, pid: ProcessId, values: &[i64]) -> Eterm {
+    let heap = table.get_mut(pid).expect("the process").heap_mut();
+    let mut list = NIL;
+    for value in values.iter().rev() {
+        list = heap
+            .cons(make_small(*value), list)
+            .expect("the young heap builds the list");
+    }
+    list
+}
+
+/// **A registered BIF's container result is re-homed onto the process's own young heap, and the
+/// pooled BIF heap is rewound.**
+///
+/// Two halves of the same decision, asserted together because either alone would be a weaker
+/// claim:
+///
+/// * the result's address lies in the process's **young space** — the region the copying
+///   collector scans — so [`super::gc::root_is_unscanned`] no longer classifies it as a foreign
+///   container; and
+/// * the pooled heap's `used()` is back at its pre-call mark (0 for a fresh pool), so the pool
+///   serves the next call from word 0 instead of marching toward its capacity.
+///
+/// Before the copy-out the result stayed on the pool: it was foreign, so the unscanned-root valve
+/// declined every collection while it was live in an x register, and the pool's bump pointer only
+/// ever advanced.
+#[test]
+fn a_bif_container_result_is_moved_onto_the_process_heap_and_the_pool_is_rewound() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    let pool_before = rt.bif_heaps.first().expect("the pool owns a heap").used();
+    assert_eq!(pool_before, 0, "the pooled heap starts untouched");
+
+    let list = young_int_list(&mut table, pid, &[1, 2, 3]);
+    let tuple = {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.call_bif("erlang", "list_to_tuple", 1, &[list])
+            .expect("list_to_tuple([1,2,3])")
+    };
+
+    assert_eq!(
+        terms::tuple_arity(tuple).expect("the result is a tuple"),
+        3,
+        "the BIF really built a container"
+    );
+    let process = table.get(pid).expect("the process");
+    assert!(
+        !super::gc::root_is_unscanned(process, tuple),
+        "the BIF result must live in a region the collector scans"
+    );
+    assert!(
+        process
+            .collector()
+            .young_contains(beam_term::list::ptr_val(tuple) as *const Eterm),
+        "the result's pointer is inside the process's young nursery"
+    );
+
+    assert_eq!(rt.bif_heaps.len(), 1, "the one pooled heap came back");
+    assert_eq!(
+        rt.bif_heaps[0].used(),
+        pool_before,
+        "the pooled BIF heap must be rewound once the result has been copied out"
+    );
+}
+
+/// **An immediate result rewinds the pool without paying a copy.**
+///
+/// The arithmetic/immediate hot path must not become a copier: an immediate is neither boxed nor
+/// a cons, so nothing reachable can live on the pooled heap and the call is free to rewind it
+/// outright. The case pins both halves — a plain small integer comes back unchanged, and the pool
+/// is at its base afterwards.
+#[test]
+fn an_immediate_result_rewinds_the_pool_without_a_copy() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    let sum = {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.call_bif("erlang", "+", 2, &[make_small(2), make_small(3)])
+            .expect("2 + 3")
+    };
+    assert!(is_small(sum), "the result is an immediate");
+    assert_eq!(signed_value(sum), 5);
+    assert_eq!(
+        rt.bif_heaps.first().expect("the pool owns a heap").used(),
+        0,
+        "an immediate result allocates nothing on the pool, so the pool is rewound"
+    );
+}
+
+/// **An ESCAPING arm neither moves the result nor rewinds the pool.**
+///
+/// The seven-arm `safe_to_rewind` gate exists because six of the `DispatchHooks` arms let a term
+/// the BIF built on `ctx.heap()` escape into state that outlives the call. The case drives one of
+/// them — the process-dictionary arm — with a BIF that **does** allocate on the BIF heap:
+/// `erlang:get_keys/1` builds its key list there. The stored term (`7`) is a small integer, so
+/// the observable proof is the *result*: it stays on the pooled heap (still classified foreign)
+/// and the pool's `used()` is **not** reset.
+#[test]
+fn an_escaping_arm_neither_moves_the_result_nor_rewinds_the_pool() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    // The process dictionary holds one pair, so `get_keys/1` really builds a one-element list.
+    table
+        .get_mut(pid)
+        .expect("the process")
+        .dict_mut()
+        .put(make_small(7), make_small(11));
+
+    let keys = {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.call_bif("erlang", "get_keys", 1, &[make_small(11)])
+            .expect("get_keys(11)")
+    };
+
+    // The result is the key list `[7]` — a cons cell built on the pooled BIF heap.
+    assert!(
+        beam_term::list::is_list(keys),
+        "get_keys/1 builds a list on `ctx.heap()`"
+    );
+    assert_eq!(terms::cons_head(keys).expect("a cons cell"), make_small(7));
+    assert_eq!(
+        terms::cons_tail(keys).expect("a cons cell"),
+        NIL,
+        "the key list is exactly `[7]`"
+    );
+
+    let process = table.get(pid).expect("the process");
+    assert!(
+        super::gc::root_is_unscanned(process, keys),
+        "the `dict` arm is an escaping seam, so the result must NOT have been moved"
+    );
+    assert!(
+        rt.bif_heaps.first().expect("the pool owns a heap").used() > 0,
+        "the pooled heap must NOT be rewound: the escaping arm forbids it"
+    );
+    // The term the arm let escape is still valid (nothing was rewound).
+    assert_eq!(
+        terms::cons_head(keys).expect("the cons cell is still readable"),
+        make_small(7)
+    );
+}
+
+/// **Item #10b — the collection the valve used to decline now RUNS.**
+///
+/// The same rig as the hole-2 guard
+/// ([`a_collection_is_declined_when_a_live_root_lives_in_an_unscanned_region`]), with the
+/// hand-built pooled-heap root replaced by a **real registered-BIF result**: `list_to_tuple/1`'s
+/// tuple now lands on the process's own young heap, so a forced admission-point collection over
+/// it must run (`gc_stats().collections` advances) and relocate it. With the result left on the
+/// pool the valve would have declined and the counter would not move.
+///
+/// Repeated over several rounds on purpose: that is the shape the peak-RSS problem had, a churn
+/// loop whose every result used to be an immutable foreign root and so disabled collection for
+/// the rest of the process's life. Every round must collect, and every round must relocate the
+/// result intact.
+#[test]
+fn a_bif_result_on_the_process_heap_lets_the_churn_loop_be_collected() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    const ROUNDS: usize = 8;
+    for round in 0..ROUNDS {
+        let list = young_int_list(&mut table, pid, &[1, 2, 3]);
+        let tuple = {
+            let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+            ctx.call_bif("erlang", "list_to_tuple", 1, &[list])
+                .expect("list_to_tuple/1")
+        };
+
+        let mut x = [tuple, NIL, NIL, NIL];
+        let mut stack = [NIL];
+        let mut fr = [NIL];
+        let before = rt.gc_stats();
+        rt.request_gc(pid);
+        {
+            let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+            ctx.current_module = Some(GC_CALL_SITE.to_string());
+            ctx.arm_gc();
+            ctx.ensure_heap_full(0, RootSet::new(&mut x, &mut stack, &mut fr, 1))
+                .expect("the heap-admission point never fails the program");
+        }
+        let after = rt.gc_stats();
+        assert!(
+            after.collections > before.collections,
+            "round {round}: the forced collection must RUN — the BIF result is on the scanned \
+             heap, so the unscanned-root valve has nothing to decline; {after:?}"
+        );
+        assert_eq!(
+            after.halted, before.halted,
+            "round {round}: nothing failed; {after:?}"
+        );
+
+        // The relocated result is still the tuple, at its (new) address.
+        assert_eq!(
+            terms::tuple_arity(x[0]).expect("the relocated word is a tuple"),
+            3,
+            "round {round}: the relocated result"
+        );
+        for (index, value) in [1i64, 2, 3].iter().enumerate() {
+            assert_eq!(
+                terms::tuple_element(x[0], index).expect("in range"),
+                make_small(*value),
+                "round {round}: element {index} of the relocated result"
+            );
+        }
+    }
+}
