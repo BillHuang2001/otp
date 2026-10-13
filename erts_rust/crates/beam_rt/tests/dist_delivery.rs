@@ -552,6 +552,286 @@ fn a_real_loopback_link_delivers_through_the_scheduler_pass() {
 }
 
 // ---------------------------------------------------------------------------
+// (6b) Every inbound delivery is validated against **its own link**
+// ---------------------------------------------------------------------------
+//
+// Both halves of the runtime's inbound drive — the listening node
+// ([`crate::dist::DistNode::dispatch_inbound`]) and the connector
+// ([`crate::dist_client::DistClient::dispatch_inbound`]) — drain through a driver's
+// `dispatch_inbound_checked`, so a delivery is checked against **that** link's
+// peer/own identity (the C's per-opcode `invalid_message` shape checks plus
+// `dep != external_pid_dist_entry(from)`, `dist.c`) before it can reach a mailbox. A
+// validation failure is a link-level `Err`: the link is **retired** and the reason
+// recorded (`DistNode::last_link_error`) — the C's connection kill.
+//
+// The tests below prove the validated path is live on the runtime's *own* drive (a real
+// loopback link driven by `Runtime::run_one_slice`): a malformed or forged control
+// message is never delivered and retires the link, while a well-formed one on the same
+// link is delivered normally.
+
+/// The node name the tests' `ConnectionDriver::client` advertises, so it is the
+/// **peer** name the runtime's server-side driver learns from the `'N'` handshake —
+/// and therefore the node a well-formed inbound `From` must name. Must stay in step
+/// with [`CLIENT_NAME`].
+const PEER_NODE_NAME: &str = "client@host";
+
+/// The cookie [`node_runtime`] starts the runtime with.
+const LIVE_COOKIE: &[u8] = b"delivery-cookie";
+
+/// Opens a **real loopback link** to `rt`'s own listener and drives it to
+/// `Established`, returning the client side (socket, driver, scratch heap, atom table)
+/// for the test to write inbound control messages on.
+fn live_link(rt: &mut Runtime) -> (TcpStream, ConnectionDriver, Heap, AtomTable) {
+    // One pass publishes the node and opens the listener for accepting.
+    rt.run_one_slice().expect("a scheduler pass");
+    let port = rt.dist_node().expect("a configured node").port();
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the listener");
+    stream.set_nonblocking(true).expect("non-blocking socket");
+    let mut client = ConnectionDriver::client(CLIENT_NAME, LIVE_COOKIE, CLIENT_CREATION);
+
+    let deadline = Instant::now() + LIVE_TIMEOUT;
+    loop {
+        round(&mut stream, &mut client);
+        rt.run_one_slice().expect("a scheduler pass");
+        if client.state() == DriverState::Established {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the loopback link never reached Established within {LIVE_TIMEOUT:?}"
+        );
+        std::thread::sleep(POLL_SLEEP);
+    }
+    (
+        stream,
+        client,
+        Heap::new(HEAP_WORDS).expect("client heap"),
+        AtomTable::new(),
+    )
+}
+
+/// Drives loopback rounds and runtime passes until `condition` holds, failing with
+/// `what` after [`LIVE_TIMEOUT`].
+fn drive_until<F: Fn(&Runtime) -> bool>(
+    rt: &mut Runtime,
+    stream: &mut TcpStream,
+    client: &mut ConnectionDriver,
+    what: &str,
+    condition: F,
+) {
+    let deadline = Instant::now() + LIVE_TIMEOUT;
+    loop {
+        round(stream, client);
+        rt.run_one_slice().expect("a scheduler pass");
+        if condition(rt) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the runtime never {what} within {LIVE_TIMEOUT:?}"
+        );
+        std::thread::sleep(POLL_SLEEP);
+    }
+}
+
+/// How many messages `pid`'s mailbox holds.
+fn mailbox_len(rt: &Runtime, pid: ProcessId) -> usize {
+    match rt.processes().get(pid) {
+        Some(process) => process.mailbox().iter().count(),
+        None => 0,
+    }
+}
+
+/// A **malformed** inbound `DOP_REG_SEND` reaches no mailbox and **retires its link**,
+/// while a well-formed one on the *same* link is delivered first.
+///
+/// The forged shape is `dist.c:2486`'s `is_not_pid(from)`: a sender that is not a pid
+/// is an `invalid_message` — a connection kill, not a delivery. The **unchecked**
+/// classifier would have delivered it (the sink resolves the *recipient*, which here is
+/// a genuinely registered local name), so the mailbox count is exactly what proves the
+/// validator ran.
+#[test]
+fn a_malformed_inbound_reg_send_is_refused_and_retires_its_link() {
+    let mut rt = node_runtime("forged");
+    rt.allow_inbound_delivery(true);
+    let (mut stream, mut client, mut heap, mut atoms) = live_link(&mut rt);
+
+    let peer_node = make_atom(atoms.intern(PEER_NODE_NAME));
+    let pid = rt.self_pid();
+    // The recipient is the runtime's own root process, which `Runtime::new` registers as
+    // `init` — a real local name, so the recipient alone would never stop a delivery.
+    let name = make_atom(atoms.intern("init"));
+    let empty = make_small(0);
+    // A well-formed sender: an external pid of **this link's peer**.
+    let peer_pid =
+        make_external_pid(&mut heap, peer_node, 3, 0, CLIENT_CREATION).expect("the peer's pid");
+    let well_formed = make_small(4242);
+    let forged = make_small(6666);
+
+    // 1. Well-formed: `From` is a pid and the name is registered ⇒ delivered.
+    client
+        .send_control(Dop::RegSend, &[peer_pid, empty, name, well_formed], &atoms)
+        .expect("queue the well-formed reg_send");
+    drive_until(
+        &mut rt,
+        &mut stream,
+        &mut client,
+        "deliver the well-formed reg_send",
+        |rt| only_message(rt, pid) == Some(well_formed),
+    );
+    assert_eq!(
+        mailbox_len(&rt, pid),
+        1,
+        "exactly the well-formed message reached the mailbox"
+    );
+    {
+        let node = rt.dist_node().expect("a configured node");
+        assert!(
+            !node.is_idle(),
+            "the link that carried a valid message is still live"
+        );
+        assert!(
+            node.last_link_error().is_none(),
+            "a well-formed message retires nothing: {:?}",
+            node.last_link_error()
+        );
+    }
+
+    // 2. Forged: a sender that is not a pid (`is_not_pid(from)`, `dist.c:2486`) is an
+    // `invalid_message`. It must not be delivered, and it must retire the link.
+    client
+        .send_control(Dop::RegSend, &[make_small(1), empty, name, forged], &atoms)
+        .expect("queue the forged reg_send");
+    drive_until(
+        &mut rt,
+        &mut stream,
+        &mut client,
+        "retire the link that carried a forged control message",
+        |rt| rt.dist_node().expect("a configured node").is_idle(),
+    );
+    assert_eq!(
+        mailbox_len(&rt, pid),
+        1,
+        "a malformed control message must never reach a mailbox"
+    );
+    assert_eq!(
+        only_message(&rt, pid),
+        Some(well_formed),
+        "the mailbox still holds only the well-formed message"
+    );
+    let error = rt
+        .dist_node()
+        .expect("a configured node")
+        .last_link_error()
+        .expect("the reason the forged link was retired is recorded")
+        .to_string();
+    assert!(
+        error.contains(PEER_NODE_NAME),
+        "the retirement names the peer it retired: {error}"
+    );
+}
+
+/// The **per-link identity** check (`dep != external_pid_dist_entry(from)`,
+/// `dist.c:2237`) is live: the very same `DOP_LINK` opcode is accepted from the peer's
+/// own node — the link keeps working afterwards — and refused from a **third** node's,
+/// which retires that link.
+#[test]
+fn a_forged_inbound_link_from_a_third_node_retires_its_link() {
+    let mut rt = node_runtime("spoofed");
+    rt.allow_inbound_delivery(true);
+    let (mut stream, mut client, mut heap, mut atoms) = live_link(&mut rt);
+
+    let node_name = rt
+        .dist_node()
+        .expect("a configured node")
+        .node_name()
+        .to_string();
+    let creation = rt.dist_node().expect("a configured node").creation();
+    let our_node = make_atom(atoms.intern(&node_name));
+    let peer_node = make_atom(atoms.intern(PEER_NODE_NAME));
+    let other_node = make_atom(atoms.intern("somewhere-else@host"));
+    let pid = rt.self_pid();
+    let to = make_external_pid(
+        &mut heap,
+        our_node,
+        pid.number() as u32,
+        pid.serial() as u32,
+        creation,
+    )
+    .expect("the addressed pid");
+    let name = make_atom(atoms.intern("init"));
+    let empty = make_small(0);
+    let peer_pid =
+        make_external_pid(&mut heap, peer_node, 3, 0, CLIENT_CREATION).expect("the peer's pid");
+    let third_pid = make_external_pid(&mut heap, other_node, 3, 0, CLIENT_CREATION)
+        .expect("a third node's pid");
+
+    // 1. `From` names this link's **peer** ⇒ well-formed. The link family itself has no
+    // local seam (the sink answers `Unsupported`), so the observable is that the link
+    // survives: the message queued *behind* the `DOP_LINK` is delivered, and the driver
+    // drains in arrival order, so the link was accepted before that delivery happened.
+    let accepted = make_small(1010);
+    client
+        .send_control(Dop::Link, &[peer_pid, to], &atoms)
+        .expect("queue the peer's own link");
+    client
+        .send_control(Dop::RegSend, &[peer_pid, empty, name, accepted], &atoms)
+        .expect("queue the message behind the link");
+    drive_until(
+        &mut rt,
+        &mut stream,
+        &mut client,
+        "accept a DOP_LINK authored by the peer and keep the link",
+        |rt| only_message(rt, pid) == Some(accepted),
+    );
+    {
+        let node = rt.dist_node().expect("a configured node");
+        assert!(
+            !node.is_idle(),
+            "a DOP_LINK from the link's own peer must not retire it"
+        );
+        assert!(node.last_link_error().is_none());
+    }
+
+    // 2. The same opcode with a `From` on a **third** node is the spoof `dist.c:2237`
+    // rejects. Nothing it was queued with may be delivered, and the link is retired.
+    let lost = make_small(2020);
+    client
+        .send_control(Dop::Link, &[third_pid, to], &atoms)
+        .expect("queue the third node's link");
+    client
+        .send_control(Dop::RegSend, &[peer_pid, empty, name, lost], &atoms)
+        .expect("queue the message behind the spoofed link");
+    drive_until(
+        &mut rt,
+        &mut stream,
+        &mut client,
+        "retire the link that carried a DOP_LINK from a third node",
+        |rt| rt.dist_node().expect("a configured node").is_idle(),
+    );
+    assert_eq!(
+        mailbox_len(&rt, pid),
+        1,
+        "nothing queued behind the spoofed control message may be delivered"
+    );
+    assert_eq!(
+        only_message(&rt, pid),
+        Some(accepted),
+        "the mailbox still holds only the message the accepted link delivered"
+    );
+    let error = rt
+        .dist_node()
+        .expect("a configured node")
+        .last_link_error()
+        .expect("the reason the spoofed link was retired is recorded")
+        .to_string();
+    assert!(
+        error.contains(PEER_NODE_NAME),
+        "the retirement names the link's peer, not the spoofed node: {error}"
+    );
+}
+// ---------------------------------------------------------------------------
 // (7) The routing table, driven **per family** through the public sink
 // ---------------------------------------------------------------------------
 //
