@@ -286,22 +286,30 @@ fn two_ports_get_distinct_pdl_handles() {
 }
 
 /// `driver_get_port_flags` (`get_port_flags`, `erl_driver.h:401`) reports the port's **state** stream
-/// flags, derived from the `open_port/2` stream option — `PORT_FLAG_BINARY` (1) for a `binary` port,
-/// `0` for a `list` one (`io.c:5325-5339`) — and **not** the `port_control` reply flags
+/// flags, derived from the `open_port/2` `binary`/`line` options — `PORT_FLAG_BINARY` (1) for a
+/// `binary` port, `PORT_FLAG_LINE` (2) for a line-buffered one (the two bits OR-ed independently),
+/// `0` for neither (`io.c:5325-5341`) — and **not** the `port_control` reply flags
 /// `set_port_control_flags` records into `prt->control_flags` (`io.c:5318`). The two cells are driven
 /// in **opposite** directions so a host that conflated them fails whichever way it collapsed.
 ///
 /// Oracle ground truth (OTP 29 / erts-17.1), observed through `port_control/3` **after** the port is
-/// open: `open_port({spawn_driver, Name}, [binary])` → `"1"`, `[line]` → `"2"`, no option → `"0"`.
+/// open: `open_port({spawn_driver, Name}, [binary])` → `"1"`, `[line]` → `"2"`, `[binary,line]` →
+/// `"3"`, no option → `"0"`.
 /// (A C driver that calls `get_port_flags` from **inside its own `start`** gets `0` in every case:
 /// the C ORs the bits into `port->state` only *after* `open_driver` returns,
 /// `erl_bif_port.c:1139-1143`. Visible through a later callback only — see `Known Issues`.)
 #[test]
 fn get_port_flags_reports_the_stream_not_the_control_flags() {
-    // The provider computes the flags from the resolved stream option; the same bits the oracle
-    // reports (`erl_driver.h`'s `PORT_FLAG_BINARY`/`PORT_FLAG_LINE`).
-    assert_eq!(StreamType::Binary.port_flags(), PORT_FLAG_BINARY);
-    assert_eq!(StreamType::List.port_flags(), 0);
+    // The provider computes the flags from the resolved `binary` and `line` options; the same bits
+    // the oracle reports (`erl_driver.h`'s `PORT_FLAG_BINARY`/`PORT_FLAG_LINE`), OR-ed independently.
+    assert_eq!(StreamType::Binary.port_flags(None), PORT_FLAG_BINARY);
+    assert_eq!(StreamType::List.port_flags(None), 0);
+    assert_eq!(StreamType::List.port_flags(Some(512)), PORT_FLAG_LINE);
+    assert_eq!(
+        StreamType::Binary.port_flags(Some(4)),
+        PORT_FLAG_BINARY | PORT_FLAG_LINE,
+        "`[binary, line]` sets **both** state bits (the oracle answers 3)"
+    );
 
     // A host nobody wired keeps the C's default `list` stream (`io.c:5338`).
     let mut bare = host();
@@ -309,8 +317,13 @@ fn get_port_flags_reports_the_stream_not_the_control_flags() {
 
     // A `[binary]` port answers the oracle-observed `1` (every A.4 corpus fixture opens
     // `open_port({spawn_driver, …}, [binary])`).
-    let mut binary = host().with_port_flags(StreamType::Binary.port_flags());
+    let mut binary = host().with_port_flags(StreamType::Binary.port_flags(None));
     assert_eq!(binary.get_port_flags(), Some(PORT_FLAG_BINARY));
+
+    // A `[line]` port answers the oracle-observed `2`: `PORT_FLAG_LINE` is reachable now that
+    // `open_port/2` decodes the line option into the port's state.
+    let mut line = host().with_port_flags(StreamType::List.port_flags(Some(512)));
+    assert_eq!(line.get_port_flags(), Some(PORT_FLAG_LINE));
 
     // ...and the port state bits are independent of the control flags: clearing the control flags
     // (what a `control` callback may do) must not clear the binary state bit.
@@ -324,7 +337,7 @@ fn get_port_flags_reports_the_stream_not_the_control_flags() {
 
     // The other direction: a `list` port whose driver asked for a binary `port_control` reply is
     // still `0` from `driver_get_port_flags`, and its control cell really holds the request.
-    let mut list = host().with_port_flags(StreamType::List.port_flags());
+    let mut list = host().with_port_flags(StreamType::List.port_flags(None));
     assert_eq!(list.set_control_flags(0, PORT_CONTROL_FLAG_BINARY), 0);
     assert_eq!(list.control_flags().get(), PORT_CONTROL_FLAG_BINARY);
     assert_eq!(
@@ -332,20 +345,24 @@ fn get_port_flags_reports_the_stream_not_the_control_flags() {
         Some(0),
         "a binary control reply does not make the port a binary port"
     );
-
-    // `PORT_FLAG_LINE` is unreachable here — `[line]`/`{line,N}` is whitelisted-but-inert in
-    // `open_port/2`, so no stream resolves to it, while the oracle answers `2` for a `[line]` port —
-    // pinned so a future `[line]` wiring changes this deliberately rather than by accident.
-    assert_ne!(list.get_port_flags(), Some(PORT_FLAG_LINE));
-    assert_ne!(binary.get_port_flags(), Some(PORT_FLAG_LINE));
+    assert_eq!(
+        line.set_control_flags(0, PORT_CONTROL_FLAG_BINARY),
+        0,
+        "the line port's control cell is independent of its state bits"
+    );
+    assert_eq!(
+        line.get_port_flags(),
+        Some(PORT_FLAG_LINE),
+        "a binary control reply does not clear the line state bit either"
+    );
 }
 
 /// Two hosts are two ports, so the flags, the queue and the PDL of one never leak into the other —
 /// the private state this module exists for is genuinely per port.
 #[test]
 fn the_private_state_is_per_port() {
-    let mut binary = host().with_port_flags(StreamType::Binary.port_flags());
-    let mut list = host().with_port_flags(StreamType::List.port_flags());
+    let mut binary = host().with_port_flags(StreamType::Binary.port_flags(None));
+    let mut list = host().with_port_flags(StreamType::List.port_flags(None));
 
     binary.enq(b"only-binary", false);
     let _ = binary.pdl_create().expect("the binary port's PDL");

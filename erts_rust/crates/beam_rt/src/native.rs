@@ -28,6 +28,7 @@
 //! | Call | Why it is runtime-native |
 //! |---|---|
 //! | `erlang:halt/0,1,2` | terminates the runtime: it must travel out of the running code as a raise and become the process exit status |
+//! | `erl_ddll:loaded_drivers/0`, `erl_ddll:try_load/3`, `erl_ddll:try_unload/2`, `erl_ddll:info/2` | the loaded-driver **list** an `open_port({spawn_driver, Name}, …)` resolves the name against: it is the runtime's own `dlopen`/port registry (`crate::port::driver`), not `beam_bifs`'s separate one |
 //! | `erlang:display/1` | writes to the *process's* output sink |
 //! | `io:put_chars/1,2` | writes to the process's output sink (the device argument is accepted and ignored) |
 //! | `erlang:apply/2,3` | re-enters the host's own dispatch (BIF **or** load-on-demand module call) |
@@ -79,11 +80,13 @@
 //! The floor is split by responsibility: the `erlang`-core items and the shared helpers live
 //! in this module; the `init:*` entries in [`init`], the `code:*` entries in [`code`], the
 //! `erlang:*` process/registry/reference entries in [`process`], the `application:*`
-//! entries in [`application`] and the `prim_file:*` primitives in [`prim`]. The submodules
+//! entries in [`application`], the `prim_file:*` primitives in [`prim`] and the `erl_ddll:*`
+//! loaded-driver-list entries in [`ddll`]. The submodules
 //! reach the shared helpers through `super` (they are `pub(super)`).
 
 mod application;
 mod code;
+mod ddll;
 mod erts_internal;
 pub(crate) mod file_server;
 mod group_leader;
@@ -110,15 +113,16 @@ use crate::format;
 /// The module namespaces [`RuntimeContext::try_native`] serves — the floor's own dispatch.
 ///
 /// Every one of them is a module the code server can *also* load as a `.beam` (`erlang`,
-/// `io`, `init`, `os`, `code`, `application`, `erts_internal`, `prim_file`), so the
+/// `io`, `init`, `os`, `code`, `application`, `erts_internal`, `prim_file`, `erl_ddll`), so the
 /// cross-module-call seam ([`RuntimeContext::resolve_external_call`]) must answer
 /// `Ok(None)` for all of them: entering the module body would run it *instead of* the host
 /// implementation. The list is written next to the `try_native` match arms it mirrors, and
 /// [`tests::every_floor_module_is_a_real_try_native_arm`] pins it against that source so it
 /// cannot silently drift out of the host's dispatch.
-pub(crate) const FLOOR_MODULES: [&str; 8] = [
+pub(crate) const FLOOR_MODULES: [&str; 9] = [
     "application",
     "code",
+    "erl_ddll",
     "erlang",
     "erts_internal",
     "init",
@@ -131,7 +135,7 @@ pub(crate) const FLOOR_MODULES: [&str; 8] = [
 /// `(module, function, arity)` **in-machine** because the runtime-native floor owns that
 /// EXACT key.
 ///
-/// The module-level rule ([`FLOOR_MODULES`]) is right for seven of the eight namespaces:
+/// The module-level rule ([`FLOOR_MODULES`]) is right for eight of the nine namespaces:
 /// practically every name in them is either a floor arm or a `beam_bifs` registry BIF, so
 /// entering the module body would run it *instead of* the host implementation — a wrong
 /// result. `io` is the exception. The floor serves only `io:put_chars/1,2` for that
@@ -346,6 +350,14 @@ impl RuntimeContext<'_> {
             // unclaimed entry still falls through to the preloaded `.beam` (an honest
             // `erlang:nif_error(undef)`).
             ("prim_file", _, _) => self.prim_file_call(function, arity, args),
+            // The `erl_ddll` loaded-driver-list floor: `loaded_drivers/0`, `try_load/3`,
+            // `try_unload/2` and `info/2` served from **this** runtime's loaded-driver
+            // registry ([`crate::port::driver`]) — the same one an
+            // `open_port({spawn_driver, Name}, …)` resolves the name against, so the driver
+            // list and the port machinery are one view. One arm; the per-function dispatch
+            // lives in [`ddll`], which answers `None` for `monitor/2`/`demonitor/1`/
+            // `format_error/1` so `beam_bifs`'s real implementations stay reachable.
+            ("erl_ddll", _, _) => self.ddll_call(function, arity, args),
             _ => None,
         }
     }
@@ -1015,7 +1027,7 @@ mod tests {
                  `floor_shadows` must let it be entered in-machine"
             );
         }
-        // The other seven namespaces stay refused wholesale.
+        // The other eight namespaces stay refused wholesale.
         for module in FLOOR_MODULES {
             if module != "io" {
                 assert!(

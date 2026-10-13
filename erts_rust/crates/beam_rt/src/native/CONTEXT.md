@@ -29,10 +29,10 @@ on-demand external-module load**. A key in the `erlang` namespace that none of t
 classified as the capability gap (`unsupported: …`, CLI exit 3) or the bare `error:undef`
 (`../error.rs`).
 
-`FLOOR_MODULES: [&str; 8]` (`native.rs:119`) = `application`, `code`, `erlang`, `erts_internal`,
-`init`, `io`, `os`, `prim_file`. Every one is a module the code server can **also** load as a
-`.beam`, so it gates `RuntimeContext::resolve_external_call`, which must answer `Ok(None)` for all
-of them — entering the body would run it *instead of* the host implementation. It does **not**
+`FLOOR_MODULES: [&str; 9]` (`native.rs:122`) = `application`, `code`, `erl_ddll`, `erlang`,
+`erts_internal`, `init`, `io`, `os`, `prim_file`. Every one is a module the code server can **also**
+load as a `.beam`, so it gates `RuntimeContext::resolve_external_call`, which must answer `Ok(None)`
+for all of them — entering the body would run it *instead of* the host implementation. It does **not**
 gate `call_bif`'s dispatch: a `beam_bifs` registry key in a floor namespace the floor has no arm
 for still reaches the registry (`os:env/0` is `beam_bifs`'s; the floor owns only `os:cmd/1`).
 Drift-guarded by `native.rs::tests::every_floor_module_is_a_real_try_native_arm` (⇔ the
@@ -56,6 +56,7 @@ Drift-guarded by `native.rs::tests::every_floor_module_is_a_real_try_native_arm`
 | `erts_internal/trace.rs` | the `erts_internal:trace/3` + `:trace_pattern/3` handler bodies (`erlang:trace/2,3`/`trace_pattern/2,3` call them) + their pattern/target helpers, over `crate::trace` (no colocated tests — `../tests/trace*.rs`) |
 | `prim.rs` | the **path** half of the `prim_file` floor (`prim_file_call`) + the path contract, the `errno`→atom table and their unit tests |
 | `prim_file.rs` | the **whole-file-descriptor** half of the `prim_file` floor + its unit tests |
+| `ddll.rs` | the `erl_ddll:*` loaded-driver list (`loaded_drivers/0`, `try_load/3`, `try_unload/2`, `info/2`) over `crate::port::driver`'s **one** name-keyed registry — the list `open_port({spawn_driver, Name})` resolves against; `monitor/2`/`demonitor/1`/`format_error/1` deliberately fall through to `beam_bifs` |
 | `file_server.rs` (+ `file_server/`) | the native **`file_server_2` service** (contract A.9) — see [`file_server/CONTEXT.md`](file_server/CONTEXT.md) |
 | `test_support.rs` | the shared test fixtures (`runtime`/`system_runtime`/`call`/`atom`/`chars`/`string_of`) |
 
@@ -399,6 +400,41 @@ unclaimed** because the oracle answers the same: `copy/2`, `write_file/3`, `dela
 (unexported ⇒ `error:undef`), `sendfile/8` (`{error,enotsup}`/`badarg`), and
 `internal_get_nif_resource/1` (no NIF-resource model). `copy/3` works (pure Erlang).
 
+### `erl_ddll:*` — one loaded-driver list (contract A.4) — `ddll.rs`
+`RuntimeContext::ddll_call(function, arity, args) -> Option<Result<Eterm>>`. `beam_bifs` registers six
+`erl_ddll` keys over its **own** loaded-driver registry, which this crate's port machinery never reads;
+the floor therefore serves the four list/load/unload/report keys from the **one** name-keyed registry
+the ports really use ([`crate::port::driver`](port/driver.rs)'s `LOADED_DRIVERS`, filled by
+`record_driver_loaded` from an `erl_ddll:try_load/3` and by `note_driver_opened` from an
+`open_port({spawn_driver, …})`), so `erl_ddll:loaded_drivers/0` **is** the list
+`open_port({spawn_driver, Name})` resolves a name against. Being dispatched before `call_registered`,
+these four keys **shadow** `beam_bifs`'s registry keys of the same name; `monitor/2`, `demonitor/1`
+and `format_error/1` deliberately return `None` and stay with `beam_bifs` — claiming them would
+duplicate its `errint`→text table and mint monitor references against a driver list the monitor
+machinery does not read.
+
+| BIF | Oracle answer |
+|---|---|
+| `erl_ddll:loaded_drivers/0` | `{ok, [Name, …]}` — each name a charlist, in load order |
+| `erl_ddll:try_load/3` | `{ok,loaded}` / `{ok,already_loaded}` / `{error,{open_error,-10}}` / `{error,Reason}` |
+| `erl_ddll:try_unload/2` | `ok` / `{error,not_loaded}` |
+| `erl_ddll:info/2` | the item value of a **loaded** name; `badarg` for an unknown name or item |
+
+**Error mapping** (the mirror of `beam_bifs`'s `load_error_tuple`): a `DriverLoadError` whose reason is
+a fixed `errcode_tab` code becomes the **bare reason atom**; a failed `dlopen` becomes the 2-tuple
+`{open_error, -10}` (`ERL_DE_DYNAMIC_ERROR_OFFSET`); a malformed argument or option is `badarg`, never
+a fabricated result.
+
+**Divergences** (own-state, never a fabricated value): a fresh `loaded_drivers/0` is `{ok,[]}` here
+where the oracle reports its statically linked `tcp_inet`/`udp_inet`/`ram_file_drv`;
+`open_port({spawn_driver, Name})` auto-`dlopen`s an unloaded name (a `/`-containing name is the object
+path, driver name = its file stem) where the oracle answers `badarg`; `try_unload/2` is an immediate
+`ok`, not the C's `{ok,pending_process}`/`{ok,pending_driver}` state machine (forgetting an entry only
+drops it from the list — a live port keeps its driver working); opening a `try_load`ed driver
+re-`dlopen`s the object (the port owns its own handle), so the entry's `init` runs once per open rather
+than once per load; and a loaded driver's monitor subscription is not delivered (`monitor/2` stays with
+`beam_bifs`).
+
 ### `file_server_2` — the native file service (contract A.9)
 `file_server.rs` + `file_server/` own the runtime-native **file service**: the registered
 `file_server_2` process (never enqueued, drained by the scheduler-pass step), its per-`open` native
@@ -424,8 +460,12 @@ write-mode `{open,…}` that delegates to `prim_file:open/2` and really creates 
   crate-local error enum, never `panic!`/`unwrap()` on runtime data, never a silent swallow. A
   "value atom" answer the C *returns* (`badarg`, `big`, `no_integer`, `not_a_list`) is `Ok(atom)`.
 - **Consulted before the registry.** A native entry must never shadow or duplicate a `beam_bifs`
-  BIF; the `erlang`-namespace fallback classifies a known-unimplemented name as the capability gap
-  (`unsupported: …`, CLI exit 3) and anything else as the bare `error:undef`.
+  BIF, with one deliberate exception: the four `erl_ddll` list/load/unload/report keys
+  (`loaded_drivers/0`, `try_load/3`, `try_unload/2`, `info/2`) shadow `beam_bifs`'s registry keys of
+  the same name so that the driver list `open_port({spawn_driver, Name})` reads and the one
+  `erl_ddll` reports stay a single view (see the `erl_ddll:*` section). The `erlang`-namespace
+  fallback classifies a known-unimplemented name as the capability gap (`unsupported: …`, CLI exit 3)
+  and anything else as the bare `error:undef`.
 - **`code:*` is the native floor, not a live `code_server`** — `code.rs`'s behaviour must not
   change (see `../CONTEXT.md`; OTP's real `code_server.beam` needs facilities outside this crate).
 - **Files ~1000 lines of production code.** Pre-existing oversize (single-responsibility, kept
@@ -492,6 +532,8 @@ write-mode `{open,…}` that delegates to `prim_file:open/2` and really creates 
   (incl. a `directory`-mode `O_DIRECTORY` open), `read/2`, `write/2`, `close/1`, `position/2`,
   `pread/2,3`, `pwrite/2,3`, `truncate/1`, `sync/1`, `datasync/1`, `write_file/2`, `set_cwd/1`,
   `ipread_s32bu_p32bu/3`, `get_handle/1`, `read_handle_info/1,2`
+- `ddll.rs` → the `erl_ddll:*` loaded-driver list (`loaded_drivers/0`, `try_load/3`, `try_unload/2`,
+  `info/2`) over `../port/driver.rs`'s one name-keyed registry + its unit tests
 - `file_server.rs` (+ `file_server/`) → the native `file_server_2` service, its io-devices, the
   request/reply wire, the write path (`{write_file,…}` + the delegating write-mode `{open,…}`), the
   `{get_until,…}`/`{get_line,…}` readers and the `getopts`/`setopts` read-mode surface
