@@ -189,6 +189,79 @@ const PROGRAMS: [(&str, &str, &str); 4] = [
 ];
 
 // ---------------------------------------------------------------------------------------
+// The `/2` async completion message (the follow-up `{garbage_collect, ReqId, Result}`)
+// ---------------------------------------------------------------------------------------
+
+/// `/2`'s `{async, ReqId}` form on a **blocked** child: the wrapper answers `async` and the
+/// child's collection owes the **caller** `{garbage_collect, ReqId, true}`.
+///
+/// The child parks in a `receive … after 60000` (rather than a bare `receive`) so it stays a
+/// **live** blocked process: a bare `receive` inside a spawned process is a documented
+/// capability gap of this runtime's `-eval` evaluator (there is no host timer to block on), and
+/// the child would terminate — which is a *different* case, pinned by
+/// [`EXPR_ASYNC_DEAD`]. The scheduled-process fixture covers the bare-receive shape.
+///
+/// The probe prints a **normalized** shape — the reference is compared with `=:=` rather than
+/// printed, because a `#Ref<…>`'s textual form names the node's own reference allocator and
+/// could never be compared across runtimes. A missing message prints the atom `timeout`, so a
+/// regression is a clean mismatch rather than a hang.
+///
+/// Oracle (the same expression, terminated with `-s init stop`): `{true,true}`.
+const EXPR_ASYNC_BLOCKED: &str = "\
+Self = self(), \
+P = spawn(fun() -> Self ! {ready, self()}, receive _ -> ok end after 60000 -> ok end end), \
+receive {ready, P} -> ok end, \
+Ref = make_ref(), \
+async = erlang:garbage_collect(P, [{async, Ref}]), \
+R = receive {garbage_collect, Got, Result} -> {Got =:= Ref, Result} after 2000 -> timeout end, \
+io:format(\"~p~n\", [R]), halt(0).";
+
+/// The requester is the **target** (`self()`): the completion is delivered into the requesting
+/// process's own mailbox, so it can receive it after the call returns.
+///
+/// Oracle: `{true,true}`.
+const EXPR_ASYNC_SELF: &str = "\
+Ref = make_ref(), \
+async = erlang:garbage_collect(self(), [{async, Ref}]), \
+R = receive {garbage_collect, Got, Result} -> {Got =:= Ref, Result} after 2000 -> timeout end, \
+io:format(\"~p~n\", [R]), halt(0).";
+
+/// A target that has **terminated** before the call: the oracle's result is `false` (the C's
+/// `noproc_res`, `erl_process.c:11420-11461`) — the same `{garbage_collect, ReqId, …}` shape,
+/// with the honest liveness answer. The `'DOWN'` rendezvous makes "it really is gone"
+/// deterministic in both runtimes.
+///
+/// Oracle: `{true,false}`.
+const EXPR_ASYNC_DEAD: &str = "\
+P = spawn(fun() -> ok end), \
+M = erlang:monitor(process, P), \
+receive {'DOWN', M, _, _, _} -> ok after 2000 -> ok end, \
+Ref = make_ref(), \
+async = erlang:garbage_collect(P, [{async, Ref}]), \
+R = receive {garbage_collect, Got, Result} -> {Got =:= Ref, Result} after 2000 -> timeout end, \
+io:format(\"~p~n\", [R]), halt(0).";
+
+/// The three async-completion programs and the value both runtimes must print — the pinned
+/// shape of the follow-up message `{garbage_collect, ReqId, Result}`.
+const ASYNC_PROGRAMS: [(&str, &str, &str); 3] = [
+    (
+        "the async completion of a blocked target",
+        EXPR_ASYNC_BLOCKED,
+        "{true,true}",
+    ),
+    (
+        "the async completion of the requesting process itself",
+        EXPR_ASYNC_SELF,
+        "{true,true}",
+    ),
+    (
+        "the async completion of a terminated target",
+        EXPR_ASYNC_DEAD,
+        "{true,false}",
+    ),
+];
+
+// ---------------------------------------------------------------------------------------
 // The scheduled-process fixture (half 2)
 // ---------------------------------------------------------------------------------------
 
@@ -381,6 +454,40 @@ fn the_return_values_match_the_live_oracle() {
             ours.err
         );
         assert_eq!(ours.out, expected, "{case}: our runtime's answer");
+        let theirs = oracle_eval(&oracle, expr);
+        assert_eq!(
+            theirs.code, 0,
+            "{case}: the oracle exited {}; stderr: {}",
+            theirs.code, theirs.err
+        );
+        assert_eq!(
+            theirs.out, expected,
+            "{case}: the live oracle's answer (the recorded ground truth must be re-probed)"
+        );
+    }
+}
+
+/// **Half 1d — `/2`'s async completion message matches the live oracle.**
+///
+/// The `{async, ReqId}` form does not merely answer `async`: the target's collection owes the
+/// **requester** `{garbage_collect, ReqId, Result}`, and the three probes below pin the whole
+/// shape — a **blocked** target (`true`), the requesting process itself (`true`) and an
+/// already-**terminated** target (`false`, the C's `noproc_res`). Both runtimes are given the
+/// same expression and must print the same normalized `{Ref-equality, Result}` pair, so the
+/// pinned message shapes are re-probed against the oracle rather than assumed.
+#[test]
+fn the_async_completion_message_matches_the_live_oracle() {
+    let Some(oracle) = support::require_oracle("garbage_collect") else {
+        return;
+    };
+    for (case, expr, expected) in ASYNC_PROGRAMS {
+        let ours = beam_rt_eval(expr);
+        assert_eq!(
+            ours.code, 0,
+            "{case}: `beam_rt -eval` must exit 0; stderr: {}",
+            ours.err
+        );
+        assert_eq!(ours.out, expected, "{case}: our runtime's answer (stderr: {})", ours.err);
         let theirs = oracle_eval(&oracle, expr);
         assert_eq!(
             theirs.code, 0,
