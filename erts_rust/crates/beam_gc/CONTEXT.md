@@ -246,12 +246,18 @@ constructors only (no new error enum).
   to a major, which sizes a fresh space up front (`mature_after_fullsweep(capacity, live, 0)` over the
   **exact reachable live count**) *before* copying — the C's `heap_sizes`/`adjust_after_fullsweep`
   estimate. A collection therefore never leaves the from-space half-forwarded.
-- **The fresh mature space is sized from the EXACT reachable live set, never the pre-collection
-  occupancy.** Occupancy is **garbage-inflated** (it includes everything the sweep is about to reclaim), so
-  sizing from `young.used_words() + mature.used_words()` fires the policy's grow test (`should_grow`,
-  `3*capacity < 4*need`) on *every* fullsweep and the mature capacity climbs without bound; sizing from
-  `live.rs`'s exact reachable count converges the same loop to a constant, matching the C reference
-  (`erl_gc.c:2072`). Measured sequences: `MEASURED.md`. Evidence: `tests/steady_state.rs`,
+- **The fresh mature space is sized from the EXACT reachable live set plus the young heap's occupancy —
+  never the mature occupancy.** `mature_after_fullsweep(capacity, live, need)` is called with `live` =
+  `live.rs`'s exact reachable word count and `need` = the **young heap's occupancy**
+  (`nursery.used_words()`), the C `adjust_after_fullsweep`
+  `need_after = (HEAP_TOP(p) - HEAP_START(p)) + need + …` (`erl_gc.c:2072`). The young occupancy is what
+  lets the mature region receive the **next** nursery's promotion, so minors actually run instead of every
+  collection escalating to a fullsweep (the generational payoff). It stays bounded: the young occupancy is
+  capped by the nursery capacity, which `young_after_collection` itself keeps bounded, so the grow branch's
+  target `next_words(need_after, 0)` is a fixed point. The **mature** occupancy must never be used — it is
+  garbage-inflated (everything the sweep is about to reclaim), so it would make `should_grow` fire on every
+  fullsweep and creep the capacity up without bound. Measured: `MEASURED.md` ("The mature-generation room
+  policy"). Evidence: `tests/generational_cadence.rs`, `tests/steady_state.rs`,
   `tests/mature_capacity_convergence.rs`.
 - **`GenImmixCollector` = the same copying nursery + a mark-region mature space; its major reclaims the
   mature generation *first*.** A **minor** promotes the nursery's live terms into the `ImmixSpace` through
