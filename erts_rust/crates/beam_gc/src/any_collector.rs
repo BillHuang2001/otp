@@ -319,6 +319,29 @@ impl AnyCollector {
             AnyCollector::Immix(c) => c.young_space_count(),
         }
     }
+
+    /// Visits every **boxed object** reachable from `roots` across the **whole heap** — every
+    /// space of the nursery chain plus the mature generation — forwarded to whichever strategy
+    /// is selected, so the enumeration is strategy-agnostic:
+    /// [`Collector::for_each_reachable_object`] /
+    /// [`GenImmixCollector::for_each_reachable_object`].
+    ///
+    /// Both strategies answer over the same nursery chain and their own mature region, so the
+    /// reachable-object set is identical — the enumeration reports *which* objects are
+    /// reachable, never where in the mature generation they live. See
+    /// [`Collector::for_each_reachable_object`] for the full contract (read-only, whole-heap,
+    /// layout-agnostic, iterative and cycle-safe, each object once, cons cells traversed but not
+    /// reported).
+    pub fn for_each_reachable_object(
+        &self,
+        roots: &[Eterm],
+        visit: impl FnMut(Eterm, *const Eterm),
+    ) -> Result<()> {
+        match self {
+            AnyCollector::Copying(c) => c.for_each_reachable_object(roots, visit),
+            AnyCollector::Immix(c) => c.for_each_reachable_object(roots, visit),
+        }
+    }
 }
 
 impl HeapObservable for AnyCollector {

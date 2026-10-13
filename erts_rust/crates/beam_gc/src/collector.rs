@@ -318,6 +318,47 @@ impl Collector {
     pub fn young_space_count(&self) -> usize {
         self.nursery.space_count()
     }
+
+    /// Visits every **boxed object** reachable from `roots` across the **whole heap** — every
+    /// space of the nursery chain (the current one and any a
+    /// [`grow_nursery`](Self::grow_nursery) retired) plus the mature generation — passing the
+    /// object's header word and a pointer to that header, each object **exactly once**.
+    ///
+    /// This is the **reachability half** of an off-heap liveness scan: a caller that owns an
+    /// off-heap object list (e.g. `beam_process`'s owned refc binaries) can enumerate the heap
+    /// to find which on-heap handles still name a payload, instead of retaining every entry it
+    /// cannot decide. The walk itself is **layout-agnostic**: it reports *which* objects are
+    /// reachable, never what they contain, so the caller applies **its own** predicate to the
+    /// reported `(header, ptr)` pairs — e.g. a subtag test that picks out the
+    /// `ErlSubBits`/`BinRef` handles and reads their off-heap payload pointer word. No
+    /// container interior is assumed here.
+    ///
+    /// # Contract
+    ///
+    /// * **Read-only.** No term is written and no forwarding marker is laid down, so it may run
+    ///   at any safepoint, immediately before a collection.
+    /// * **Whole-heap.** A growth-retained nursery space and the mature generation are both
+    ///   covered ([`young_contains`](Self::young_contains)'s rule); a reference into the
+    ///   literal area, another heap or off-heap memory is *not* visited and not descended into
+    ///   (the copier's [`Target::Foreign`](crate::copy::Target::Foreign) rule).
+    /// * **Iterative and cycle-safe.** A 50 000-object chain or a cycle neither recurses nor
+    ///   hangs, and a shared object is reported once.
+    /// * A **cons cell** is traversed (so the boxed objects behind it are reached) but not
+    ///   reported: it carries no header word.
+    ///
+    /// Returns the crate's typed [`Result`]; the walk can only fail through the shared
+    /// reference-enumeration primitive, whose signature is fallible for its copier callers —
+    /// this method's own callback is infallible.
+    pub fn for_each_reachable_object(
+        &self,
+        roots: &[Eterm],
+        visit: impl FnMut(Eterm, *const Eterm),
+    ) -> Result<()> {
+        let mut from = FromSet::new();
+        self.nursery.add_to_from_set(&mut from); // every space of the chain
+        from.add(&self.mature); // the live region of the copying mature space
+        crate::reachable::for_each_reachable(&from, roots, visit)
+    }
 }
 
 impl HeapObservable for Collector {

@@ -42,7 +42,8 @@
 //! legacy `erts/emulator/beam/erl_gc.c` + `copy.c` are the ground-truth behaviour.
 //!
 //! `unsafe` is confined to `copy.rs` and `immix_collector.rs` (the word-level copier and
-//! the promotion driver), `live.rs` (the read-only live-graph counter a fullsweep sizes
+//! the promotion driver), `reachable.rs` (the read-only, whole-heap reachability walk and its
+//! one-bit-per-word visited set), `live.rs` (the exact-live counter a fullsweep sizes
 //! itself from), `immix/` (the mark-region space's word-level mark/evacuation
 //! walks), the raw-pointer range tests in `space.rs` and the two narrow `NonNull`-deref /
 //! `Box::from_raw` blocks in `mso.rs`; `policy.rs`, `stats.rs` and the collector driving
@@ -60,6 +61,7 @@ pub(crate) mod live; // the read-only live-graph counter — NOT public
 pub mod mso;
 mod nursery; // the young nursery chain (the no-relocation growth seam) — NOT public
 pub mod policy;
+pub(crate) mod reachable; // the read-only whole-heap reachability walk — NOT public
 pub mod selection;
 pub mod space;
 pub mod stats;

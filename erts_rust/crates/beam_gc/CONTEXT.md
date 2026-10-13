@@ -55,9 +55,24 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
 - Counts the **exactly reachable** from-set graph **without mutating it**: read-only, iterative (a worklist
   — 50 000 cons cells without recursing), with a visited set keyed by the pointer word address. Built on the
   copier's own `move_size`/`for_each_ref`, so it provably equals the `GcStats::words_copied` of a real
-  collection on the same from-set and roots.
+  collection on the same from-set and roots. The traversal itself — the worklist and its visited set — is
+  `reachable.rs`'s `walk_reachable`; this module only accumulates the sizes it reports.
 - Consumers: `Collector::collect_major` and `GenImmixCollector`'s `run_major`/`grow_major`/`relocate_major`,
   to size a **fresh** mature space from the true live set (the C `adjust_after_fullsweep` `need_after`).
+
+### `reachable.rs` — the read-only whole-heap reachability walk
+- `pub(crate) fn walk_reachable<F: FnMut(Eterm, *const Eterm, usize)>(from: &FromSet, roots: &[Eterm], on_object: F) -> Result<()>`
+  — the shared iterative worklist with its one-bit-per-word visited set: calls `on_object(first_word, ptr,
+  total_words)` once per reachable object out of `from`'s ranges. The **single** walk both `live.rs` and the
+  public enumeration are built on, so their per-object sizing and child enumeration cannot drift.
+- `pub(crate) fn for_each_reachable<F: FnMut(Eterm, *const Eterm)>(from: &FromSet, roots: &[Eterm], visit: F) -> Result<()>`
+  — reports every reachable **boxed object** (one carrying a header word) exactly once; a cons cell is
+  traversed (so the objects behind it are reached) but not reported. **Layout-agnostic**: it reports *which*
+  objects are reachable, never what they contain.
+- Both drive `copy.rs`'s `move_size`/`for_each_ref` (hence `beam_term::layout`), are read-only (no
+  forwarding marker), iterative (a 50 000-chain does not recurse), dedup by the object's first-word address,
+  and skip every reference outside `from` (a literal, a foreign space, an off-heap pointer —
+  `Target::Foreign`). The word-level `unsafe` (reading the visited words) lives here, not in the callers.
 
 ### `collector.rs` — the two-generation collector
 - `pub enum CollectionKind { Minor, Major }`; `pub struct Collection { pub kind, pub stats: GcStats }`
@@ -83,6 +98,13 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
     retained): the nursery-range test the host's unscanned-root valve uses; `young_space_count() -> usize` —
     how many spaces the chain holds (`1`, or more after a growth retained one, back to `1` once a collection
     collapses it), a chain observable read only from tests
+  - `for_each_reachable_object(&self, roots: &[Eterm], visit: impl FnMut(Eterm, *const Eterm)) -> Result<()>`
+    — the **public, safe, read-only reachability enumeration** (the off-heap liveness scan's marking half):
+    visits every **boxed object** reachable from `roots` across the **whole heap** (every nursery space +
+    the mature generation's live region `[base, top)`), each once, passing `(header_word, *const Eterm)`.
+    Iterative/cycle-safe, skips out-of-heap references (`Target::Foreign`), reports a cons cell's boxed
+    children but not the cell itself, and is **layout-agnostic** — the caller applies its own predicate;
+    mirrored on `GenImmixCollector`/`AnyCollector`
   - After **every** collection the chain is collapsed back to one space via `Nursery::collapse`, which re-sizes
     that space via `young_after_collection` from the round's
     **surviving** words, and a fullsweep sizes the fresh mature space via `mature_after_fullsweep` from
@@ -114,6 +136,10 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
     force a specific collection; `ensure_capacity(need_words, roots)` (same semantics as `Collector`);
     `grow_nursery(need_words)`/`young_contains(ptr)`/`young_space_count()` (the chain seam + observables,
     same semantics as `Collector`); `minor_gcs()`; `impl HeapObservable`
+  - `for_each_reachable_object(roots, visit) -> Result<()>` — the mark-region sibling of
+    `Collector::for_each_reachable_object` (same whole-heap walk, read-only/iterative/layout-agnostic); its
+    only difference is the mature range, which is the whole `base .. base + capacity` region (with its free
+    lines — over-inclusive yet harmless, as in `live_full`)
   - A fullsweep that cannot fit its promotion grows the region (`grow_major`); a `max_heap_words` cap the
     promotion cannot fit returns the typed `heap_exhausted` **before any copy**. Coverage:
     `src/immix_collector/grow_tests.rs`.
@@ -137,6 +163,9 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   - `collect(&mut self, roots) -> Result<Collection>`; `collect_minor`/`collect_major` (`-> Result<GcStats>`);
     `ensure_capacity(need_words, roots) -> Result<Collection>`; `grow_nursery(need_words) -> Result<()>` (the
     chain's no-relocation growth seam); `young_contains(ptr) -> bool`; `young_space_count() -> usize`.
+  - `for_each_reachable_object(roots, visit) -> Result<()>` — forwarded to whichever strategy was selected,
+    so the reachability enumeration is **strategy-agnostic** (both strategies enumerate the same nursery chain
+    plus their own mature region, so the reachable-object set is identical)
   - The **mature generation** accessors: `mature_capacity_words()`, `mature_used_words()`,
     `mature_available_words()` (mark-region figures are line-rounded — `used_lines * LINE_WORDS`, i.e. "at
     least this many words"), `mature_base() -> *mut Eterm`, `mature_contains(ptr: *const Eterm) -> bool`.
@@ -503,6 +532,13 @@ constructors only (no new error enum).
   untouched; a grow-then-collect loop plateaus (nursery + chain + mature).
 - `tests/memory_overhead.rs` → per-object overhead `< 1` word (measured 0) + an RSS/word-count plateau
   (skipped loudly off-Linux).
+- `tests/reachable_objects.rs` → the public reachability enumeration: a live graph spanning young + mature
+  (after a fullsweep) and a **chained** nursery yields exactly the reachable boxed objects, once each, and no
+  garbage (and the walk is read-only — no root rewritten, nothing allocated); a live refc binary's
+  `ErlSubBits`/`BinRef` handle is reported (its `BinRef.val` names the payload) while an unreachable one is
+  not; a 50 000-object chain neither recurses nor hangs and a three-tuple ring visits each object once
+  (a cons ring is traversed, its boxed leaf reached, the cells not reported); `AnyCollector` forwards the
+  enumeration to both strategies.
 - `tests/stress_cross_generation.rs` → one mixed graph through 6 minors + 2 majors under both strategies:
   structural equality after *each* collection, sharing, cycle closure, dropped garbage.
 - `tests/collector_adversarial.rs` → break-attempts through both strategies + the primitive path (deep
@@ -586,18 +622,24 @@ constructors only (no new error enum).
 - **A.6 runtime heap options** (`+hms`, `+hmbs`, …) — this crate exposes `HeapPolicy`, not the CLI
   surface (owned by `beam_rt`).
 - **`OffHeap` is on the production path as both the MSO slot store and the process's binary store; its
-  liveness predicate is caller-driven and deliberately conservative.** `OffHeap` holds both MSO and
-  refc-binary entries and IS the production MSO slot store inside `beam_message::OffHeapTable` (which stores
-  the slot index an on-heap container names). `beam_process::Process` additionally owns a dedicated `OffHeap`
-  (`owned_binaries`) for the `RefcBinary` payloads it takes ownership of (`Process::register_off_heap_binary`)
-  and drives `OffHeap::sweep` as the last step of every rooted collection
-  (`Process::sweep_off_heap_binaries`), with a predicate that releases only entries the caller declared dead
-  and retains anything undecided (leak-not-dangle).
-  **The remaining gap is the marking half, and it is this crate's:** the walk deciding whether an on-heap
-  `BinRef`/`ErlSubBits` (possibly inside another off-heap payload) still names a payload lives in
-  `live.rs`/`copy.rs` and is `pub(crate)`, so a public, scan-driven liveness enumeration over a heap would
-  let a caller release undecided entries instead of retaining them;
-  `Process::retain_off_heap_binaries(is_live)` is the seam such a host drives.
+  liveness predicate is caller-driven.** `OffHeap` holds both MSO and refc-binary entries and IS the
+  production MSO slot store inside `beam_message::OffHeapTable` (which stores the slot index an on-heap
+  container names). `beam_process::Process` additionally owns a dedicated `OffHeap` (`owned_binaries`) for the
+  `RefcBinary` payloads it takes ownership of (`Process::register_off_heap_binary`) and drives
+  `OffHeap::sweep` as the last step of every rooted collection (`Process::sweep_off_heap_binaries`), with a
+  predicate that releases only entries the caller declared dead and retains anything undecided
+  (leak-not-dangle).
+  **This crate's half — the marking walk — is now public.** `Collector::for_each_reachable_object` (plus its
+  `GenImmixCollector`/`AnyCollector` siblings) enumerates every reachable **boxed object** across the whole
+  heap — the nursery chain and the mature generation — each once, so a host can discover which on-heap
+  `BinRef`/`ErlSubBits` handles (possibly nested inside another off-heap payload) still name a payload and
+  drive `Process::retain_off_heap_binaries(is_live)` from that, instead of retaining every undecided entry.
+  The walk is **layout-agnostic**: it reports the reachable `(header, ptr)` pairs and the caller applies its
+  own `ErlSubBits`/`BinRef` subtag test and reads the payload pointer word, so this crate takes no dependency
+  on `beam_message`'s container interior. **The remaining work is the host's, in `beam_process`:** wire
+  `for_each_reachable_object` into its own heap scan and derive the off-heap liveness predicate from it,
+  replacing the conservative retain-everything-undecided path (`declare_off_heap_binary_dead` plus
+  `retain_off_heap_binaries(|_| true)`).
 
 ## Handoffs (owned by other nodes)
 - **The strategy switch is adopted; the residual is an explicit pin on the process-construction path.**
@@ -643,8 +685,9 @@ constructors only (no new error enum).
 - `src/space.rs` → `HeapSpace` (copying semi-space over `beam_alloc::Heap`) + `FromSet`
 - `src/nursery.rs` → `Nursery`: the young nursery as a **chain of spaces** — the **no-relocation** growth seam (`grow`), the collapse to one space after a collection (`collapse`), and the every-space range test / from-set (`spaces`/`contains`/`add_to_from_set`/`used_words`/`capacity_words`)
 - `src/copy.rs` → the Cheney copy engine: `Copier`, `forward_roots`/`complete`, `collect`, and the copy-specific `pub(crate)` primitives; all per-object sizing/walking is delegated to `beam_term::layout`
-- `src/collector.rs` → the two-generation `Collector`: minor/major driver over the nursery chain, bounded nursery collapse, mature sizing from the `live.rs` exact count, capacity pre-check, `ensure_capacity`/`grow_nursery`, `young_contains`/`young_space_count`
-- `src/live.rs` → the **exact-live counter** (`live`/`live_full` + `Live { words, lines }`); its `#[cfg(test)]` module pins it against a real collection, incl. the mature generation, a relocating major and a **chained nursery**
+- `src/collector.rs` → the two-generation `Collector`: minor/major driver over the nursery chain, bounded nursery collapse, mature sizing from the `live.rs` exact count, capacity pre-check, `ensure_capacity`/`grow_nursery`, `young_contains`/`young_space_count`, `for_each_reachable_object`
+- `src/live.rs` → the **exact-live counter** (`live`/`live_full` + `Live { words, lines }`); it accumulates the sizes `reachable.rs`'s walk reports, and its `#[cfg(test)]` module pins it against a real collection, incl. the mature generation, a relocating major and a **chained nursery**
+- `src/reachable.rs` → the **read-only whole-heap reachability walk**: `walk_reachable` (the shared iterative worklist + one-bit-per-word visited set) and `for_each_reachable` (reports every reachable boxed object once, layout-agnostic); the marking half behind `for_each_reachable_object`
 - `src/config.rs` → GC-strategy seam: `GcConfig`, `MatureKind`, `MatureSelection`, `mature()`/`mature_choice()`, `growable`
 - `src/selection.rs` → the **automatic rule**: `IMMIX_BREAK_EVEN_WORDS`/`IMMIX_BREAK_EVEN_BLOCKS`, `select_mature`, `mature_words_of`, `resolve_mature`/`choice_for`, `MatureSource`, `MatureChoice`
 - `src/immix/mod.rs` → `ImmixSpace` geometry, block metadata, line-granular allocation, accounting views (`ImmixStats`/`ImmixCounters`)
@@ -676,6 +719,7 @@ constructors only (no new error enum).
 - `tests/nursery_bounded.rs` → the bounded-nursery evidence (nursery + total heap plateau; shrink on a garbage-heavy round)
 - `tests/nursery_chain.rs` → the `Nursery` chain: address-preserving `grow_nursery` (no collection), the growth-boundary-spanning graph, `young_contains`/`young_space_count` + the summed `heap_size_words`, the typed capped-growth error, and the collapse to one space
 - `tests/memory_overhead.rs` → per-object overhead vs the frozen layout + the RSS/word-accounting no-leak plateau
+- `tests/reachable_objects.rs` → the public reachability enumeration across young + mature + a **chained** nursery (exact, once each, no garbage, read-only); a live off-heap refc-binary handle found and an unreachable one not; a 50 000-object chain and a cycle (boxed-only, cons cells traversed but not reported); `AnyCollector` forwarding on both strategies
 - `tests/stress_cross_generation.rs` → the mixed-term cross-generation gate (both strategies)
 - `tests/collector_adversarial.rs` → the adversarial copy-correctness / no-leak set (both strategies)
 - `tests/cyclic_safety.rs` → `size_object_bounded`'s typed cyclic verdict + the collector's forwarding-pointer cycle safety

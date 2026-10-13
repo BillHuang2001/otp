@@ -508,6 +508,34 @@ impl GenImmixCollector {
         self.nursery.space_count()
     }
 
+    /// Visits every **boxed object** reachable from `roots` across the **whole heap** — every
+    /// space of the nursery chain (the current one and any a
+    /// [`grow_nursery`](Self::grow_nursery) retired) plus the mark-region mature generation —
+    /// passing the object's header word and a pointer to that header, each object **exactly
+    /// once**.
+    ///
+    /// The mark-region sibling of
+    /// [`Collector::for_each_reachable_object`](crate::Collector::for_each_reachable_object);
+    /// see it for the full contract. The only difference is the mature range: a
+    /// [`ImmixSpace`] is one contiguous block-aligned region whose free lines are still inside
+    /// it, so (as in [`crate::live::live_full`]) the from-set covers `base .. base + capacity`
+    /// — a **deliberately over-inclusive** range, harmless here because a walk only ever visits
+    /// objects a live reference reaches, and a free line is never a live reference's target.
+    ///
+    /// **Layout-agnostic**, **read-only**, **iterative and cycle-safe**; a cons cell is
+    /// traversed but not reported (it carries no header word).
+    pub fn for_each_reachable_object(
+        &self,
+        roots: &[Eterm],
+        visit: impl FnMut(Eterm, *const Eterm),
+    ) -> Result<()> {
+        let mut from = FromSet::new();
+        self.nursery.add_to_from_set(&mut from); // every space of the chain
+        let base = self.mature.base() as usize;
+        from.add_range(base, base + self.mature.capacity_words() * core::mem::size_of::<Eterm>());
+        crate::reachable::for_each_reachable(&from, roots, visit)
+    }
+
     /// Folds one collection's [`GcStats`] into the collector's accumulated counters.
     fn accumulate(&mut self, stats: &GcStats, kind: CollectionKind) {
         self.stats.words_copied += stats.words_copied;
