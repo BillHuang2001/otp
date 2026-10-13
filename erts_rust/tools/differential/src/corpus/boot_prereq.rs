@@ -31,12 +31,13 @@
 //!
 //! The group also pins the **booted system's own self-description** — the state a drop-in
 //! runtime must reproduce to be a plausible boot target: `init`'s recorded arguments
-//! (`root`/`home`/`noshell`/`-pa`, and the absence of any ungiven flag) and boot status, the
-//! code server's resolution of every OTP application's library directory and of the *preloaded*
-//! module set (`code:which/1` ⇒ `preloaded`, `code:is_loaded/1` ⇒ `{file,preloaded}`,
+//! (`root`/`home`/`bindir`/`progname`/`noshell`/`-pa`, and the absence of any ungiven flag) and boot
+//! status, the code server's resolution of every OTP application's library directory and of the
+//! *preloaded* module set (`code:which/1` ⇒ `preloaded`, `code:is_loaded/1` ⇒ `{file,preloaded}`,
 //! `erlang:module_loaded/1` ⇒ `true`), the OTP application metadata the boot script leaves
-//! behind (`application:get_key/2`, `application:get_env/1,2`, `application:get_application/0`),
-//! and the emulator's version/flavour constants. Wherever a value is machine- or
+//! behind (`application:get_key/1,2`, `application:get_env/1,2`, `application:get_application/0,1`,
+//! the `{App,Description,Vsn}` triples of `loaded_applications/0`), and the emulator's
+//! version/flavour constants. Wherever a value is machine- or
 //! release-dependent (a filesystem path, the `otp_release` string, a scheduler count) the case
 //! asserts the **shape**; only release-stable constants are pinned by value. No case pins a
 //! pid/ref/creation or a multi-key-map `~w` rendering.
@@ -590,6 +591,110 @@ pub(crate) fn group() -> Vec<Case> {
             "is_list(erlang:system_info(otp_release)) andalso is_list(erlang:system_info(version))",
             "ok true",
         ),
+        // --- `init`'s recorded arguments: the emulator's own automatic flags --------------
+        //
+        // Beyond the command line it was given, the emulator records its own `root`/`bindir`/
+        // `progname`/`home` flags, so a booted system's `init:get_arguments/0` always carries
+        // them whatever the argv. The **presence** of each flag is pinned (never its value: the
+        // installation root and the invocation name are host-specific). This is the boot
+        // chain's own self-description — the very flags the real boot script reads back.
+        eval(
+            "boot/init_get_arguments_records_root",
+            "init:get_arguments/0 records the emulator's automatic `root` flag",
+            "lists:keymember(root, 1, init:get_arguments())",
+            "ok true",
+        ),
+        eval(
+            "boot/init_get_arguments_records_bindir",
+            "init:get_arguments/0 records the emulator's automatic `bindir` flag",
+            "lists:keymember(bindir, 1, init:get_arguments())",
+            "ok true",
+        ),
+        eval(
+            "boot/init_get_arguments_records_progname",
+            "init:get_arguments/0 records the emulator's automatic `progname` flag",
+            "lists:keymember(progname, 1, init:get_arguments())",
+            "ok true",
+        ),
+        eval(
+            "boot/init_get_arguments_records_home",
+            "init:get_arguments/0 records the emulator's automatic `home` flag",
+            "lists:keymember(home, 1, init:get_arguments())",
+            "ok true",
+        ),
+        eval(
+            "boot/init_get_arguments_is_non_empty",
+            "a booted system's init:get_arguments/0 is non-empty (the automatic flags are always recorded)",
+            "init:get_arguments() =/= []",
+            "ok true",
+        ),
+        eval(
+            "boot/init_get_arguments_entries_are_flag_value_pairs",
+            "every init:get_arguments/0 entry is a {Flag,Values} pair tagged by an atom",
+            "lists:all(fun(T) -> tuple_size(T) =:= 2 andalso is_atom(element(1,T)) end, init:get_arguments())",
+            "ok true",
+        ),
+        eval(
+            "boot/init_get_argument_root_is_ok",
+            "init:get_argument/1 answers {ok,_} (never `error`) for the automatic `root` flag",
+            "init:get_argument(root) =/= error",
+            "ok true",
+        ),
+        eval(
+            "boot/init_get_argument_progname_is_ok",
+            "init:get_argument/1 answers {ok,_} (never `error`) for the automatic `progname` flag",
+            "init:get_argument(progname) =/= error",
+            "ok true",
+        ),
+        eval(
+            "boot/init_get_argument_bindir_is_ok",
+            "init:get_argument/1 answers {ok,_} (never `error`) for the automatic `bindir` flag",
+            "init:get_argument(bindir) =/= error",
+            "ok true",
+        ),
+        // --- The OTP application metadata and the installation hierarchy -------------------
+        eval(
+            "boot/application_get_key_kernel_maxt_is_infinity",
+            "application:get_key(kernel, maxT) is the frozen {ok,infinity} termination timeout",
+            "application:get_key(kernel, maxT)",
+            "ok {ok,infinity}",
+        ),
+        eval(
+            "boot/application_get_key_stdlib_maxt_is_infinity",
+            "application:get_key(stdlib, maxT) is the frozen {ok,infinity} termination timeout",
+            "application:get_key(stdlib, maxT) =:= {ok,infinity}",
+            "ok true",
+        ),
+        eval(
+            "boot/application_get_key_kernel_runtime_dependencies_is_undefined",
+            "kernel's application resource carries no `runtime_dependencies` key",
+            "application:get_key(kernel, runtime_dependencies)",
+            "ok undefined",
+        ),
+        eval(
+            "boot/application_get_application_of_a_kernel_module_is_kernel",
+            "application:get_application/1 resolves a kernel module (`code`) to kernel",
+            "application:get_application(code)",
+            "ok {ok,kernel}",
+        ),
+        eval(
+            "boot/application_get_application_of_a_preloaded_module_is_undefined",
+            "application:get_application/1 is `undefined` for a preloaded module outside any application (prim_file)",
+            "application:get_application(prim_file)",
+            "ok undefined",
+        ),
+        eval(
+            "boot/loaded_applications_entries_are_tagged_triples",
+            "every application:loaded_applications/0 entry is an {App,Description,Vsn} triple of an atom and two strings",
+            "lists:all(fun({A,D,Vs}) -> is_atom(A) andalso is_list(D) andalso is_list(Vs) end, application:loaded_applications())",
+            "ok true",
+        ),
+        eval(
+            "boot/application_lib_dirs_are_under_the_library_root",
+            "code:lib_dir/1 places every installed application under the library root (code:lib_dir/0)",
+            "lists:all(fun(A) -> lists:prefix(code:lib_dir(), code:lib_dir(A)) end, [kernel,stdlib,erts,compiler])",
+            "ok true",
+        ),
     ]
 }
 
@@ -663,6 +768,22 @@ mod tests {
         "boot/system_info_nif_and_driver_version_are_strings",
         "boot/system_info_emu_flavor_and_machine_shape",
         "boot/system_info_otp_release_and_version_shape",
+        "boot/init_get_arguments_records_root",
+        "boot/init_get_arguments_records_bindir",
+        "boot/init_get_arguments_records_progname",
+        "boot/init_get_arguments_records_home",
+        "boot/init_get_arguments_is_non_empty",
+        "boot/init_get_arguments_entries_are_flag_value_pairs",
+        "boot/init_get_argument_root_is_ok",
+        "boot/init_get_argument_progname_is_ok",
+        "boot/init_get_argument_bindir_is_ok",
+        "boot/application_get_key_kernel_maxt_is_infinity",
+        "boot/application_get_key_stdlib_maxt_is_infinity",
+        "boot/application_get_key_kernel_runtime_dependencies_is_undefined",
+        "boot/application_get_application_of_a_kernel_module_is_kernel",
+        "boot/application_get_application_of_a_preloaded_module_is_undefined",
+        "boot/loaded_applications_entries_are_tagged_triples",
+        "boot/application_lib_dirs_are_under_the_library_root",
     ];
 
     /// The one **new** case that takes extra argv: the `-pa` code-path switch (contract A.6).
@@ -767,6 +888,8 @@ mod tests {
         "ok preloaded",
         "ok {file,preloaded}",
         "ok undefined",
+        "ok {ok,infinity}",
+        "ok {ok,kernel}",
     ];
 
     #[test]

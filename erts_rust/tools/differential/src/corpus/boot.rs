@@ -32,17 +32,22 @@
 //! asserted exactly.
 //!
 //! Beyond the code path and loaded-module registry, the group also pins the **code
-//! server's query surface** (`code:is_loaded/1`, `code:ensure_loaded/1`, `code:is_sticky/1`)
-//! and the **OTP application surface** the booted system exposes (`application:get_env/1,2,3`,
-//! `get_all_env/1`, `loaded_applications/0`, `which_applications/0`, `get_key/2`) — again by
-//! shape wherever the value is release/installation-specific.
+//! server's query surface** (`code:is_loaded/1`, `code:ensure_loaded/1`, `code:is_sticky/1`,
+//! `code:get_object_code/1`, `code:lib_dir/2`) and the **OTP application surface** the booted
+//! system exposes (`application:get_env/1,2,3`, `get_all_env/1`, `loaded_applications/0`,
+//! `which_applications/0`, `get_key/2`) — again by shape wherever the value is
+//! release/installation-specific. `code:get_object_code/1` is pinned as a *relation* to
+//! `code:which/1` and `code:objfile_extension/0` (a path is never asserted by value), and the
+//! code path is pinned by resolving the whole booted stdlib floor through `code:ensure_loaded/1`.
 //!
 //! The **process** surface is driven through `-eval` and asserted **by shape**, never by an
 //! exact pid (pids vary per VM start): `spawn/1`, `spawn_link/1` and `spawn_opt/2` must return
 //! a pid, the mailbox carries a real `spawn` + `!` + `receive` round trip (including a
-//! non-zero `after` timeout), and `erlang:processes/0` is a list. The **process dictionary**
-//! (`put/2`, `get/1`, `erase/1`) and `init:get_status/0` are part of the booted system's
-//! observable surface.
+//! non-zero `after` timeout), `erlang:processes/0` is a list of pids whose length is the
+//! bootstrap's own `system_info(process_count)`, and `erlang:registered/0` is the booted
+//! system's name table (a name the boot chain owns — `init` — cannot be re-registered). The
+//! **process dictionary** (`put/2`, `get/1`, `erase/1`) and `init:get_status/0` are part of the
+//! booted system's observable surface.
 //!
 //! The boot-path **prerequisite primitives** (the `erlang:pre_loaded/0` set, the boot script's
 //! `which_applications/0`/`loaded_applications/0`, the preloaded `init`, kernel's
@@ -51,6 +56,30 @@
 //! `proc_lib:start_link/4` start wait) live in the sibling `boot_prereq`
 //! group; this group keeps the boot/version observability surface.
 use super::{Case, CaseKind, Contract, Golden, Probe};
+
+/// One A.9 boot-observability case: evaluate `expr` under both runtimes with the same
+/// `-eval` argv and pin the oracle's `~w` rendering.
+fn eval(
+    id: &'static str,
+    description: &'static str,
+    expr: &'static str,
+    golden: &'static str,
+) -> Case {
+    Case {
+        id,
+        description,
+        contracts: &[Contract::Build],
+        kind: CaseKind::Eval {
+            expr,
+            extra_argv: &[],
+            probe: Probe::Value,
+        },
+        golden: Golden {
+            stdout: Some(golden),
+            exit_code: 0,
+        },
+    }
+}
 
 /// The A.9 cases: boot/version observability, asserted by shape.
 pub(crate) fn group() -> Vec<Case> {
@@ -793,6 +822,181 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // --- The code server's object-file resolution (the boot chain's own read path) ---
+        //
+        // `code:get_object_code/1` is how the boot chain reads a module off the code path: the
+        // module tag, the binary image and the *file name* it was read from. That file name must
+        // be the one `code:which/1` resolves, and it must carry the frozen compiled-artifact
+        // extension (`code:objfile_extension/0`). Only the tag, the `error` refusal and those
+        // *relations* are pinned — never a path value.
+        eval(
+            "boot/get_object_code_module_is_tagged_by_the_module",
+            "code:get_object_code/1 tags its result with the module it read (lists)",
+            "element(1, code:get_object_code(lists)) =:= lists",
+            "ok true",
+        ),
+        eval(
+            "boot/get_object_code_filename_is_the_code_which_path",
+            "the object-file name code:get_object_code/1 reports is the path code:which/1 resolves",
+            "element(3, code:get_object_code(lists)) =:= code:which(lists)",
+            "ok true",
+        ),
+        eval(
+            "boot/get_object_code_filename_suffix_is_the_objfile_extension",
+            "the object-file name ends in the frozen compiled-artifact extension (code:objfile_extension/0)",
+            "lists:suffix(code:objfile_extension(), element(3, code:get_object_code(lists)))",
+            "ok true",
+        ),
+        eval(
+            "boot/get_object_code_unknown_module_is_error",
+            "code:get_object_code/1 reports the atom `error` for a module that exists nowhere",
+            "code:get_object_code(no_such_module_xyz)",
+            "ok error",
+        ),
+        eval(
+            "boot/get_object_code_preloaded_module_is_tagged",
+            "code:get_object_code/1 tags the preloaded `init` module with that module",
+            "element(1, code:get_object_code(init)) =:= init",
+            "ok true",
+        ),
+        eval(
+            "boot/get_object_code_kernel_module_is_tagged",
+            "code:get_object_code/1 tags the code server's own module (`code`) with that module",
+            "element(1, code:get_object_code(code)) =:= code",
+            "ok true",
+        ),
+        // --- The code server's lib_dir/2 resolution and code-path resolution floor --------
+        //
+        // `code:lib_dir/2` resolves an application's subdirectory (the `ebin` the boot chain
+        // loads from); the code path must resolve the whole booted stdlib floor. Sub-paths are
+        // pinned by their *relation* to `code:lib_dir/1`, never by value.
+        eval(
+            "boot/code_lib_dir_2_ebin_is_a_string",
+            "code:lib_dir/2 resolves an application's subdirectory (stdlib/ebin) to a string",
+            "is_list(code:lib_dir(stdlib, ebin))",
+            "ok true",
+        ),
+        eval(
+            "boot/code_lib_dir_2_is_under_the_application_dir",
+            "an application's subdirectory (stdlib/ebin) extends its application directory",
+            "lists:prefix(code:lib_dir(stdlib), code:lib_dir(stdlib, ebin))",
+            "ok true",
+        ),
+        eval(
+            "boot/code_lib_dir_2_differs_from_the_application_dir",
+            "code:lib_dir/2's subdirectory is not the application directory itself",
+            "code:lib_dir(stdlib, ebin) =/= code:lib_dir(stdlib)",
+            "ok true",
+        ),
+        eval(
+            "boot/code_ensure_loaded_stdlib_floor",
+            "the code path resolves every module of the booted stdlib floor to {module,Module}",
+            "lists:all(fun(M) -> code:ensure_loaded(M) =:= {module,M} end, [lists,string,ordsets,proplists,maps,queue,gb_trees,calendar,filename,base64,unicode])",
+            "ok true",
+        ),
+        eval(
+            "boot/ensure_loaded_preloaded_module_is_module",
+            "code:ensure_loaded/1 answers {module,Module} for a preloaded module (erlang)",
+            "code:ensure_loaded(erlang)",
+            "ok {module,erlang}",
+        ),
+        eval(
+            "boot/ensure_loaded_preloaded_zlib_is_module",
+            "code:ensure_loaded/1 answers {module,Module} for a preloaded module (zlib)",
+            "code:ensure_loaded(zlib)",
+            "ok {module,zlib}",
+        ),
+        eval(
+            "boot/ensure_loaded_makes_module_visible_in_all_loaded",
+            "after code:ensure_loaded/1 the module is a member of code:all_loaded/0",
+            "begin code:ensure_loaded(lists), lists:keymember(lists, 1, code:all_loaded()) end",
+            "ok true",
+        ),
+        eval(
+            "boot/code_is_loaded_matches_which_after_ensure_loaded",
+            "after code:ensure_loaded/1, code:is_loaded/1 is the {file,Path} pair of code:which/1",
+            "begin code:ensure_loaded(lists), code:is_loaded(lists) =:= {file, code:which(lists)} end",
+            "ok true",
+        ),
+        // --- code:all_loaded/0 invariants the boot chain maintains ------------------------
+        eval(
+            "boot/all_loaded_entries_are_pairs",
+            "every code:all_loaded/0 entry is a two-element {Module,Beam} pair",
+            "lists:all(fun(T) -> tuple_size(T) =:= 2 end, code:all_loaded())",
+            "ok true",
+        ),
+        eval(
+            "boot/all_loaded_module_names_are_atoms",
+            "every module name projected out of code:all_loaded/0 is an atom",
+            "lists:all(fun(M) -> is_atom(M) end, [M || {M,_} <- code:all_loaded()])",
+            "ok true",
+        ),
+        eval(
+            "boot/all_loaded_covers_the_preloaded_floor",
+            "the loaded-module registry is at least as large as the preloaded set",
+            "length([M || {M,_} <- code:all_loaded()]) >= length(erlang:pre_loaded())",
+            "ok true",
+        ),
+        // --- The booted system's own process and named-process surface --------------------
+        //
+        // The kernel processes the boot chain starts, asserted **by shape** (a pid, a list, an
+        // integer count) — never by an exact pid, and never by which processes exist.
+        eval(
+            "boot/group_leader_is_pid",
+            "erlang:group_leader/0 is the pid of the boot chain's I/O group leader",
+            "is_pid(group_leader())",
+            "ok true",
+        ),
+        eval(
+            "boot/self_is_alive",
+            "the running process is alive according to erlang:is_process_alive/1",
+            "erlang:is_process_alive(self())",
+            "ok true",
+        ),
+        eval(
+            "boot/processes_members_are_pids",
+            "every member of erlang:processes/0 is a pid",
+            "lists:all(fun erlang:is_pid/1, erlang:processes())",
+            "ok true",
+        ),
+        eval(
+            "boot/process_count_matches_the_process_list",
+            "erlang:system_info(process_count) equals the length of erlang:processes/0",
+            "erlang:system_info(process_count) =:= length(erlang:processes())",
+            "ok true",
+        ),
+        eval(
+            "boot/registered_is_a_list",
+            "erlang:registered/0 is the booted system's registered-name table (a list)",
+            "is_list(erlang:registered())",
+            "ok true",
+        ),
+        Case {
+            id: "boot/register_of_a_boot_name_is_badarg",
+            description: "the boot chain's own `init` name cannot be re-registered (register/2 raises badarg)",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "begin P = spawn(fun() -> receive _ -> ok end end), register(init, P) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("exception error badarg"),
+                exit_code: 1,
+            },
+        },
+        eval(
+            "boot/init_get_status_size_is_two",
+            "init:get_status/0 is the two-element {State,Phase} boot-status tuple",
+            "tuple_size(init:get_status()) =:= 2",
+            "ok true",
+        ),
+        eval(
+            "boot/process_info_memory_shape",
+            "erlang:process_info/2 reports the process's memory as the {memory,Words} pair",
+            "begin M = process_info(self(), memory), is_tuple(M) andalso element(1, M) =:= memory andalso is_integer(element(2, M)) end",
+            "ok true",
+        ),
     ]
 }
 
@@ -909,5 +1113,112 @@ mod tests {
         assert!(exprs.iter().any(|e| e.contains("put(")), "no put/2 case");
         assert!(exprs.iter().any(|e| e.contains("get(")), "no get case");
         assert!(exprs.iter().any(|e| e.contains("erase(")), "no erase/1 case");
+    }
+
+    /// The **load-surface** cases this group adds on top of the code-server/path cases: the
+    /// object-file read path (`code:get_object_code/1`), `code:lib_dir/2`, the code path's
+    /// resolution of the booted stdlib floor, the `code:all_loaded/0` invariants, and the
+    /// booted system's own process/named-process surface. Every assertion is a **relation**, a
+    /// **shape**, or a frozen value; a path, a pid and a count are never pinned by value.
+    const LOAD_SURFACE_CASES: &[&str] = &[
+        "boot/get_object_code_module_is_tagged_by_the_module",
+        "boot/get_object_code_filename_is_the_code_which_path",
+        "boot/get_object_code_filename_suffix_is_the_objfile_extension",
+        "boot/get_object_code_unknown_module_is_error",
+        "boot/get_object_code_preloaded_module_is_tagged",
+        "boot/get_object_code_kernel_module_is_tagged",
+        "boot/code_lib_dir_2_ebin_is_a_string",
+        "boot/code_lib_dir_2_is_under_the_application_dir",
+        "boot/code_lib_dir_2_differs_from_the_application_dir",
+        "boot/code_ensure_loaded_stdlib_floor",
+        "boot/ensure_loaded_preloaded_module_is_module",
+        "boot/ensure_loaded_preloaded_zlib_is_module",
+        "boot/ensure_loaded_makes_module_visible_in_all_loaded",
+        "boot/code_is_loaded_matches_which_after_ensure_loaded",
+        "boot/all_loaded_entries_are_pairs",
+        "boot/all_loaded_module_names_are_atoms",
+        "boot/all_loaded_covers_the_preloaded_floor",
+        "boot/group_leader_is_pid",
+        "boot/self_is_alive",
+        "boot/processes_members_are_pids",
+        "boot/process_count_matches_the_process_list",
+        "boot/registered_is_a_list",
+        "boot/init_get_status_size_is_two",
+        "boot/process_info_memory_shape",
+    ];
+
+    /// The one negative load-surface case: a name the boot chain owns cannot be re-registered.
+    const LOAD_SURFACE_NEGATIVE_CASES: &[&str] = &["boot/register_of_a_boot_name_is_badarg"];
+
+    #[test]
+    fn load_surface_cases_are_build_eval_cases_with_reviewed_goldens() {
+        let cases = group();
+        let cases = cases.as_slice();
+        for id in LOAD_SURFACE_CASES.iter().chain(LOAD_SURFACE_NEGATIVE_CASES) {
+            let case = case(cases, id);
+            assert_eq!(case.contracts, &[Contract::Build], "case {id}");
+            assert_eq!(case.kind_label(), "value", "case {id}");
+            assert!(
+                matches!(case.kind, CaseKind::Eval { .. }),
+                "case {id} must be an Eval case"
+            );
+            assert!(
+                case.extra_argv().is_empty(),
+                "case {id} takes no extra argv"
+            );
+            assert!(case.env().is_empty(), "case {id} pins no environment");
+            assert!(
+                !case.description.is_empty(),
+                "case {id} has no description"
+            );
+            let golden = case
+                .golden
+                .stdout
+                .unwrap_or_else(|| panic!("case {id} asserts stdout"));
+            assert!(
+                LOAD_SURFACE_GOLDENS.contains(&golden),
+                "case {id}: golden {golden:?} is outside the reviewed set"
+            );
+            // No volatile rendering may be baked into a golden: no pid/ref/port (`<`), no
+            // filesystem path (`/`), no map (`#{`).
+            for unstable in ["<", "/", "#{"] {
+                assert!(
+                    !golden.contains(unstable),
+                    "case {id}: the golden pins an unstable rendering: {golden:?}"
+                );
+            }
+        }
+        assert_eq!(
+            case(cases, LOAD_SURFACE_NEGATIVE_CASES[0]).golden.exit_code,
+            1,
+            "the negative case exits non-zero"
+        );
+    }
+
+    /// Every golden the load-surface cases may assert. Explicit (rather than a loose shape rule)
+    /// so a new case cannot slip a volatile rendering past review.
+    const LOAD_SURFACE_GOLDENS: &[&str] = &[
+        "ok true",
+        "ok error",
+        "ok {module,erlang}",
+        "ok {module,zlib}",
+        "exception error badarg",
+    ];
+
+    /// No load-surface expression may bind the probe wrapper's own names (`V`, `C`, `R`): the
+    /// *oracle* would reject the wrapped probe (`unsafe_var`), a guaranteed false mismatch.
+    #[test]
+    fn load_surface_expressions_do_not_shadow_the_probe_variables() {
+        let cases = group();
+        let cases = cases.as_slice();
+        for id in LOAD_SURFACE_CASES.iter().chain(LOAD_SURFACE_NEGATIVE_CASES) {
+            let expr = case(cases, id).expr().expect("an Eval case has an expr");
+            for reserved in [" V ", " C ", " R ", "V =", "C =", "R ="] {
+                assert!(
+                    !expr.contains(reserved),
+                    "case {id}: the expression binds the probe variable {reserved:?}: {expr:?}"
+                );
+            }
+        }
     }
 }

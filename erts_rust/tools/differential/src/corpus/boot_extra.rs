@@ -59,10 +59,16 @@
 //! boot chain reads out of the running installation rather than out of the emulator: the
 //! `application` resource of a started application (`get_all_key/1`, `get_key/1,2`,
 //! `get_application/0,1`), `init`'s automatic `progname`/`bindir` arguments, `init:script_id/0`,
-//! `code:lib_dir/2`, and `filelib`'s existence probes on a guaranteed-absent path. Every one of
+//! `code:lib_dir/2`, and `filelib`'s existence probes on a guaranteed-absent path *and on the
+//! installation's own directories* (`code:root_dir/0`, `code:lib_dir/0,2`, a resolved object file).
+//! Every one of
 //! them is pinned **structurally** where the value is host- or release-dependent (a path, a version
 //! string, an invocation name) and by value only where the answer is a frozen constant, a boolean
 //! or a documented `undefined`.
+//!
+//! The same block completes the booted system's **builtin/export floor**: `erlang:is_builtin/3`
+//! (the loader's own BIF table — never a module export) and `erlang:function_exported/3` for the
+//! remaining preloaded modules (`persistent_term`/`atomics`/`erts_code_purger`).
 //!
 //! A final widened block completes that installation view and the preloaded runtime floor: the
 //! **installation hierarchy** relations (`code:root_dir/0` is absolute and prefixes the library
@@ -1687,6 +1693,179 @@ pub(crate) fn group() -> Vec<Case> {
             "is_atom(erlang:system_info(endian))",
             "ok true",
         ),
+        // --- The installation view, probed through the file system -------------------------
+        // The boot chain reads the running installation out of the file system. These cases pin
+        // the **relations** — `code:root_dir/0`, `code:lib_dir/0,2` and a resolved object file
+        // name real directories/files — and never a path value.
+        eval(
+            "boot_extra/filelib_is_dir_of_the_installation_root",
+            "the installation root code:root_dir/0 names an existing directory",
+            "filelib:is_dir(code:root_dir())",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/filelib_is_dir_of_the_library_root",
+            "the library root code:lib_dir/0 names an existing directory",
+            "filelib:is_dir(code:lib_dir())",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/filelib_is_dir_of_the_erts_application_dir",
+            "the erts application directory code:lib_dir(erts) names an existing directory",
+            "filelib:is_dir(code:lib_dir(erts))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/filelib_is_dir_of_an_ebin_directory",
+            "the code-path subdirectory code:lib_dir(kernel, ebin) names an existing directory",
+            "filelib:is_dir(code:lib_dir(kernel, ebin))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/filelib_is_regular_of_the_library_root_is_false",
+            "the library root code:lib_dir/0 is a directory, not a regular file",
+            "not filelib:is_regular(code:lib_dir())",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/filelib_is_regular_of_a_resolved_object_file",
+            "the object-file path code:which/1 resolves names an existing regular file",
+            "begin code:ensure_loaded(lists), filelib:is_regular(code:which(lists)) end",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/code_object_path_suffix_is_the_objfile_extension",
+            "a resolved object-file path ends in the frozen compiled-artifact extension",
+            "begin code:ensure_loaded(lists), lists:suffix(code:objfile_extension(), code:which(lists)) end",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/code_which_agrees_with_get_object_code_filename",
+            "code:which/1 resolves the same file name code:get_object_code/1 read the module from",
+            "begin code:ensure_loaded(lists), code:which(lists) =:= element(3, code:get_object_code(lists)) end",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/code_is_sticky_erlang_is_true",
+            "the preloaded `erlang` module is sticky (code:is_sticky/1 -> true)",
+            "code:is_sticky(erlang)",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/pre_loaded_every_module_can_be_ensure_loaded",
+            "code:ensure_loaded/1 answers {module,Module} for every member of erlang:pre_loaded/0",
+            "lists:all(fun(M) -> code:ensure_loaded(M) =:= {module,M} end, erlang:pre_loaded())",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/pre_loaded_every_module_has_a_preloaded_object_path",
+            "code:which/1 reports the atom `preloaded` for exactly the members of erlang:pre_loaded/0",
+            "length([M || M <- erlang:pre_loaded(), code:which(M) =:= preloaded]) =:= 22",
+            "ok true",
+        ),
+        // --- The kernel processes the boot chain registered --------------------------------
+        eval(
+            "boot_extra/whereis_file_server_2_is_registered",
+            "the boot chain's file server is a live registered process (whereis(file_server_2) is a pid)",
+            "is_pid(whereis(file_server_2))",
+            "ok true",
+        ),
+        // --- The booted system's builtin/export floor --------------------------------------
+        // `erlang:is_builtin/3` answers from the loader's own table (a BIF is not a module
+        // export); `erlang:function_exported/3` answers from the loaded preloaded module.
+        eval(
+            "boot_extra/is_builtin_erlang_self_0",
+            "erlang:is_builtin/3 reports erlang:self/0 as a BIF",
+            "erlang:is_builtin(erlang, self, 0)",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/is_builtin_erlang_is_builtin_3",
+            "erlang:is_builtin/3 reports itself as a BIF",
+            "erlang:is_builtin(erlang, is_builtin, 3)",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/is_builtin_lists_sort_1_is_false",
+            "erlang:is_builtin/3 is false for a real module export (lists:sort/1)",
+            "erlang:is_builtin(lists, sort, 1) =:= false",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/function_exported_persistent_term_get_1",
+            "the preloaded `persistent_term` module exports get/1",
+            "erlang:function_exported(persistent_term, get, 1)",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/function_exported_atomics_new_2",
+            "the preloaded `atomics` module exports new/2",
+            "erlang:function_exported(atomics, new, 2)",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/function_exported_erts_code_purger_purge_1",
+            "the preloaded `erts_code_purger` module exports purge/1",
+            "erlang:function_exported(erts_code_purger, purge, 1)",
+            "ok true",
+        ),
+        // --- The preloaded `atomics`/`counters`/`persistent_term` runtime floor ------------
+        eval(
+            "boot_extra/atomics_sub_get_returns_the_difference",
+            "atomics:sub_get/3 returns the difference it just stored (the signed floor)",
+            "begin A = atomics:new(1, []), atomics:sub_get(A, 1, 2) =:= -2 end",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/counters_atomics_backend_round_trip",
+            "a `counters` array built on the `atomics` backend still round-trips add/get",
+            "begin Cnt = counters:new(1, [atomics]), counters:add(Cnt, 1, 3), counters:get(Cnt, 1) =:= 3 end",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/persistent_term_get_with_default_when_set",
+            "persistent_term:get/2 serves the stored value (not the default) for a set key",
+            "begin persistent_term:put(boot_extra_pt_set, 17), persistent_term:get(boot_extra_pt_set, default) end",
+            "ok 17",
+        ),
+        eval(
+            "boot_extra/persistent_term_erase_of_an_unset_key_is_false",
+            "persistent_term:erase/1 reports `false` for a key that was never set",
+            "persistent_term:erase(boot_extra_pt_never_set)",
+            "ok false",
+        ),
+        // --- The kernel application's registered-name manifest -----------------------------
+        eval(
+            "boot_extra/application_get_key_kernel_registered_names_inet_db",
+            "kernel's registered-name manifest names the boot chain's inet_db",
+            "lists:member(inet_db, element(2, application:get_key(kernel, registered)))",
+            "ok true",
+        ),
+        // --- Release-stable emulator observability -----------------------------------------
+        eval(
+            "boot_extra/system_info_garbage_collection_is_a_list",
+            "erlang:system_info(garbage_collection) is the emulator's GC-parameter list",
+            "is_list(erlang:system_info(garbage_collection))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/system_info_max_heap_size_is_a_map",
+            "erlang:system_info(max_heap_size) is the emulator's max-heap-size map",
+            "is_map(erlang:system_info(max_heap_size))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/system_info_schedulers_online_at_most_schedulers",
+            "the online scheduler count never exceeds the configured scheduler count",
+            "erlang:system_info(schedulers_online) =< erlang:system_info(schedulers)",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/system_info_endian_is_little_or_big",
+            "erlang:system_info(endian) is one of the two frozen byte orders",
+            "lists:member(erlang:system_info(endian), [little, big])",
+            "ok true",
+        ),
     ]
 }
 
@@ -1832,6 +2011,7 @@ mod tests {
         "ok {error,nofile}",
         "ok {starting,started}",
         "ok {a,b}",
+        "ok 17",
     ];
 
     /// The keys whose *value* varies per VM start, per host or per OTP release. A case may observe
