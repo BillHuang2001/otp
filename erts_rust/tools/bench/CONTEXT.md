@@ -518,9 +518,22 @@ kill switch), and its runtime path compiles **per function, lazily** on a functi
 process pays only for the functions it actually enters, and is **not** paying a whole-module compile. The
 eager whole-module artifact (`JitBackend::compile`/`CodeCache::get_or_compile`) serves the whole-module
 introspection surface and the `beam_engine` `jit_bench` harness only, so `jit_bench` pins the **hot** path and
-not the lazy runtime path's per-entry cost. The current tier and one-shot cold-start figures (a
-module-graph-heavy `slice` case at **~1.2×** the interpreter tier) live in
-`../../crates/beam_engine/MEASURED.md` and `../../crates/beam_rt/PERF.md` — they are not re-measured here.
+not the lazy runtime path's per-entry cost. The one-shot cold-start characterisation (a module-graph-heavy
+`slice` case at **~1.2–1.3×** the interpreter tier) lives in `../../crates/beam_engine/MEASURED.md` and
+`../../crates/beam_rt/PERF.md`.
+
+**The tier effect is now also measured here**, as `results/m10-bench-xrun-interp.json` (the same six workloads,
+`--runtime rust` only, with `BEAM_RT_TIER=interpreter` exported — `bench` spawns the runtime with an inherited
+environment, so the switch reaches every child). It is a **Rust-vs-Rust** control with **no `sys` rows**: never
+read it against the system-ERTS column. `RESULTS.md` §3.9 tabulates it. Two facts to carry forward:
+- The baseline JIT is a clear win for `list_walk` (default is **3.84× cheaper** than the interpreter),
+  `gc_bound churn` (**1.98×**) and the `foreign` per-call rows (1.20×–1.46×); it is neutral on
+  `startup`/`compute`/`etf`.
+- The **one inverted row** is the two-process `send_recv` loop: the default tier is **2.15× dearer** than the
+  interpreter (79 518 vs 36 969 ns/op) and a focused `--quick` re-run reproduced it at **3.31×**
+  (97 518 vs 29 493). `../../crates/beam_rt/PERF.md`'s own snapshot recorded the same direction
+  (1.456× worse), so it is a repeatable baseline-JIT message-passing cost — the first item in
+  `RESULTS.md` §8 that is a tier *regression* rather than a gap.
 
 Consequence for reading results: startup latency is the trustworthy cross-runtime comparison for
 whole-process cost (and, on `slice`, peak RSS); the `foreign`/`list_walk`/`copy_bound`/`gc_bound`
