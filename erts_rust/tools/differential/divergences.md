@@ -97,6 +97,18 @@ not here.)
   integer binary segment wider than 64 bits — are no longer divergences: `beam_rt` now evaluates
   each shape, so they are pinned as **agreeing** regression cases; see the table above, owner
   `beam_rt`.)
+- A **multi-key atom-keyed** small map is **not** byte-identical on either of two observable
+  paths, both reproducing on the minimal 2-key term and through `maps:from_list/1`:
+  `term_to_binary(#{b => 2, a => 1})` ⇒ oracle `…119,1,97,97,1,119,1,98,97,2` (keys `a` then `b`,
+  sorted) vs rust `…119,1,98,97,2,119,1,97,97,1` (construction order); and
+  `maps:to_list(#{a => 1, b => 2})` ⇒ oracle `[{b,2},{a,1}]` vs rust `[{a,1},{b,2}]` (a differing
+  interior order: the rust runtime keeps the source order, the oracle's is its own literal order
+  and its encoder emits atom keys sorted). Consequently no corpus case pins a multi-key atom-keyed
+  map: only single-key images (where the order is vacuous) and `=:=`/sorted/`maps:size` projections
+  are pinned.
+  **Integer**-, **float**-, **binary**- and **list**-keyed maps agree on both paths and are pinned
+  (`wire.rs`/`wire_extra.rs`, incl. the non-canonical-wire-order canonicalization case). Owner:
+  `beam_rt`.
 
 ## A.7 — process signals (owner: `beam_bifs` / `beam_process`)
 - A `{'DOWN', …}` for a monitored **port** is not delivered after `port_close/1`: the oracle
