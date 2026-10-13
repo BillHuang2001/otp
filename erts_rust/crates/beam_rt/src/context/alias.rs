@@ -61,29 +61,35 @@
 //! `MonitorRef::from_eterm(to).is_ok()` test) is what adopting the C's answer exactly would
 //! take; this module deliberately keeps the callers' answer unchanged instead.
 //!
-//! # Known hazard: two reference id spaces
+//! # The **provenance bridge** (how a destination is classified)
 //!
-//! `MonitorRef` is a **bare id**, and the runtime mints reference terms from **two independent**
-//! allocators: `erlang:make_ref/0` goes through
-//! [`Runtime::refs_mut`](crate::Runtime::refs_mut)
-//! (`crate::native::process::mint_reference`), while every monitor *and* every alias mints from
-//! the [`ProcessTable`]'s own `RefAllocator` (`ProcessTable::monitor_*`,
-//! `ProcessTable::create_alias`). Both allocators start at id `0`, so the same id can name a
-//! `make_ref/0` term **and** a live alias: a send to that `make_ref/0` term would then resolve
-//! as the alias and be delivered to the alias owner — a wrong delivery rather than the C's
-//! silent drop. (Measured: a `make_ref/0` term minted first and an alias minted first collide on
-//! id `0`.)
+//! A reference term carries an `id` word, but this runtime has **two independent** reference
+//! id spaces — [`Runtime::refs`](crate::Runtime) (fed by `erlang:make_ref/0`, the NIF
+//! `make_ref`, the timers and `seq_trace`) and the [`ProcessTable`]'s own allocator (fed by
+//! every `erlang:monitor/2,3` and `erlang:alias/1`). Both start at `0`, so the same id can
+//! name a bare `make_ref/0` term **and** a live alias, and resolving a destination by its
+//! parsed id alone would deliver to the wrong place.
 //!
-//! A reference the **table** minted can never collide with another table-minted reference, so
-//! only runtime-minted (`make_ref/0`, and a reference decoded out of an external term) terms are
-//! exposed. Within this node there is no sound way to prove a term's provenance (the runtime's
-//! `references` map records bare `make_ref/0` terms too), so the fix belongs to the owners of
-//! the two allocators: mint `make_ref/0` from the **table's** allocator (one id space, like the
-//! C), or key the alias lookup by the reference *term* the way
-//! [`Runtime::references`](crate::Runtime::references) keys its monitor map.
+//! So the destination is classified by **provenance first**, through the runtime's term-keyed
+//! registry ([`Runtime::local_reference`](crate::Runtime)):
+//!
+//! * `Some(Some(reference))` — the term is a monitor/alias reference this runtime minted: the
+//!   classification is authoritative, and **only** this shape may be looked up as a live
+//!   alias ([`ProcessTable::resolve_alias`]).
+//! * `Some(None)` — a bare runtime-minted reference (`make_ref/0`, a timer, a `seq_trace`
+//!   ref): never an alias, so `None`.
+//! * `None` — the term was **not** minted here (a reference decoded from an external term, or
+//!   the copy of one received in a message): its provenance is unknown, so fall back to the id
+//!   the term encodes. That keeps a send to an alias that came back through `binary_to_term/1`
+//!   or in a `{'DOWN', …}` message working.
+//!
+//! The lookup is read-only and holds no borrow: the caller resolves (immutable), delivers
+//! (mutable) and consumes (mutable) strictly in sequence, never across.
 
 use beam_process::{MonitorRef, ProcessId, ProcessTable};
 use beam_term::Eterm;
+
+use crate::runtime::Runtime;
 
 /// The **alias owner** a `send` destination names, together with the reference that named it.
 ///
@@ -93,16 +99,28 @@ use beam_term::Eterm;
 /// `reply_demonitor` alias is consumed by the reply it received (the C's alias-message site).
 ///
 /// `None` means `to` is not a reference at all, or is a reference that names no live alias —
-/// `ProcessTable::resolve_alias` already answers `None` for a plain monitor reference and for
-/// an alias whose owner has died. The callers keep their existing typed `badarg` for that case
-/// (see the module docs' divergence note).
+/// a bare `make_ref/0`/timer/`seq_trace` reference (never an alias), a plain monitor
+/// reference, or an alias whose owner has died. The callers keep their existing typed `badarg`
+/// for that case (see the module docs' divergence note).
 ///
-/// The lookup is read-only and holds no borrow: the caller resolves (immutable), delivers
-/// (mutable) and consumes (mutable) strictly in sequence, never across.
+/// `to` is classified by **provenance** (`runtime`, see the module docs): a term this runtime
+/// minted as a monitor/alias reference is resolved through [`ProcessTable::resolve_alias`],
+/// a bare runtime-minted reference is rejected outright, and a term of unknown provenance
+/// falls back to the id it encodes.
 pub(super) fn alias_destination(
+    runtime: &Runtime,
     table: &ProcessTable,
     to: Eterm,
 ) -> Option<(ProcessId, MonitorRef)> {
-    let reference = MonitorRef::from_eterm(to).ok()?;
-    table.resolve_alias(reference).map(|owner| (owner, reference))
+    match runtime.local_reference(to) {
+        // Authoritative: a reference this runtime minted as a monitor/alias.
+        Some(Some(reference)) => table.resolve_alias(reference).map(|owner| (owner, reference)),
+        // Authoritative: a bare runtime-minted reference is never an alias.
+        Some(None) => None,
+        // Unknown provenance: fall back to the id the term encodes.
+        None => {
+            let reference = MonitorRef::from_eterm(to).ok()?;
+            table.resolve_alias(reference).map(|owner| (owner, reference))
+        }
+    }
 }

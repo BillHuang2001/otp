@@ -316,7 +316,7 @@ impl SendBridge<'_> {
                 None => Err(BeamError::BadArg),
             };
         }
-        if let Some((owner, reference)) = alias_destination(table, to) {
+        if let Some((owner, reference)) = alias_destination(&*self.runtime, table, to) {
             // A live **alias**: the message goes to its owner and the reference is consumed
             // after a successful delivery (the C's `send_altact_message` arm, `bif.c:2478-2492`).
             return Ok((owner.to_eterm(), Some(reference)));

@@ -298,7 +298,10 @@ pub(crate) trait NifHostServices {
 /// uses. `processes` is the caller-supplied pass table when the call runs inside a scheduler slice,
 /// else the runtime's own — the same resolution [`RuntimeContext::process_table`] makes.
 pub(crate) struct RuntimeNifServices<'a> {
-    /// The one reference id space (`erlang:make_ref/0` and a monitor ref share it).
+    /// The runtime's **own** reference id space (`erlang:make_ref/0`, the NIF `make_ref`, the
+    /// timers and `seq_trace` draw from it). Monitor/alias references mint from the process
+    /// table's separate allocator; a minted plain reference is recorded in `references` so its
+    /// provenance stays unambiguous.
     pub(crate) refs: &'a mut RefAllocator,
     /// The runtime's reference registry; a minted plain reference is recorded here.
     pub(crate) references: &'a mut HashMap<Eterm, Option<MonitorRef>>,
@@ -573,7 +576,7 @@ impl NifHost for NifHostImpl<'_> {
         self.atoms.lookup(name).map(make_atom)
     }
 
-    /// `enif_make_ref()` — a fresh reference, drawn from the runtime's one reference id space.
+    /// `enif_make_ref()` — a fresh reference, drawn from the runtime's own reference id space.
     ///
     /// Delegates to the borrowed [`NifHostServices`]: the provider allocates the next id, builds
     /// the reference thing on **this host's** heap and registers it as a plain reference (so

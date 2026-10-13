@@ -204,10 +204,9 @@ impl<'a> RuntimeHooksBridge<'a> {
         let term = *args.first().ok_or(BeamError::BadArg)?;
         // A timer reference, or a reference this runtime minted for something else
         // (`make_ref/0`, a monitor) — anything else is not a reference and is `badarg`, the
-        // same test `erlang:cancel_timer/1` (the runtime-native floor) applies.
-        if !self.runtime.timers.is_timer_ref(term)
-            && !self.runtime.references.contains_key(&term)
-        {
+        // same test `erlang:cancel_timer/1` (the runtime-native floor) applies. The ONE
+        // provenance test decides (`Runtime::is_known_local_reference`).
+        if !self.runtime.is_known_local_reference(term) {
             return Err(BeamError::BadArg);
         }
         let options = *args.get(1).ok_or(BeamError::BadArg)?;

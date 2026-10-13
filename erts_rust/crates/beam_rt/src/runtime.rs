@@ -334,10 +334,15 @@ pub struct Runtime {
     /// to `seq_trace:get_token/0` in the next, and `reset_seq_trace` clears it for *all*
     /// processes. See [`crate::seq_trace`] for the model and exactly what is deferred.
     seq_trace: SeqTrace,
-    /// The reference id space every `erlang:make_ref/0` and `erlang:monitor/2` draws from.
+    /// The reference id space `erlang:make_ref/0`, the NIF `make_ref` and the timer /
+    /// `seq_trace` references draw from (see [`Runtime::refs_mut`]).
     ///
-    /// One space for both, so a bare reference and a monitor reference can never collide
-    /// (see `crate::native::process`).
+    /// This is **not** the process table's reference allocator: `erlang:monitor/2,3` and
+    /// `erlang:alias/1` mint from [`ProcessTable`]'s **own** [`RefAllocator`], and the two
+    /// spaces are independent (both monotone `u64` from `0`). A term→reference resolution
+    /// must therefore key on the **term** ([`Runtime::references`], via
+    /// [`Runtime::local_reference`]) rather than on a decoded id — the same id can name a
+    /// `make_ref/0` term and a live monitor/alias reference.
     pub(crate) refs: RefAllocator,
     /// Every reference term the runtime minted, keyed by the term itself.
     ///
@@ -863,10 +868,44 @@ impl Runtime {
         self.arena.heap_available()
     }
 
-    /// The runtime's one reference id space (the source of `erlang:make_ref/0` and every
-    /// `erlang:monitor/2` reference — see [`Runtime::references`]).
+    /// The runtime's own reference id space — the source of `erlang:make_ref/0`, the NIF
+    /// `make_ref` and the timer / `seq_trace` references (see [`Runtime::refs`]). Monitor
+    /// and alias references mint from the process table's allocator instead.
     pub fn refs_mut(&mut self) -> &mut RefAllocator {
         &mut self.refs
+    }
+
+    /// The **provenance** of `term` as a reference this runtime minted, or `None` when the
+    /// term was not minted here (a reference decoded from an external term, or one received
+    /// in a message as a *copy*).
+    ///
+    /// * `Some(Some(reference))` — a monitor or alias reference: [`Runtime::references`]
+    ///   records the [`MonitorRef`] the term stands for, which is the only reference shape
+    ///   that can be a live **alias** (see [`ProcessTable::resolve_alias`](beam_process::ProcessTable::resolve_alias));
+    /// * `Some(None)` — a **bare** runtime-minted reference: an `erlang:make_ref/0`, a NIF
+    ///   `make_ref`, a timer reference ([`Timers::is_timer_ref`]) or a `seq_trace`
+    ///   reference. Such a term is never an alias;
+    /// * `None` — this runtime did not mint the term, so its provenance is unknown.
+    ///
+    /// This is the ONE provenance test shared by the send path
+    /// ([`crate::context::alias`]), the runtime's reference predicates
+    /// ([`Runtime::is_known_local_reference`]) and the timer BIFs — it replaces the
+    /// hand-spelled `timers.is_timer_ref(t) || references.contains_key(&t)` copies.
+    pub(crate) fn local_reference(&self, term: Eterm) -> Option<Option<MonitorRef>> {
+        if let Some(entry) = self.references.get(&term) {
+            return Some(*entry);
+        }
+        if self.timers.is_timer_ref(term) {
+            return Some(None);
+        }
+        None
+    }
+
+    /// Whether `term` is a reference **this runtime minted** — the predicate
+    /// `erlang:cancel_timer/1,2`, `erts_internal:group_leader/3` and the send path share
+    /// (see [`Runtime::local_reference`]).
+    pub(crate) fn is_known_local_reference(&self, term: Eterm) -> bool {
+        self.local_reference(term).is_some()
     }
 
     /// The runtime's pending timer deadlines (`erlang:send_after/3`).

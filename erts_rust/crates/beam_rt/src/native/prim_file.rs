@@ -48,7 +48,7 @@
 //! *decodes* `handle` (a NIF resource reference) to find the descriptor; reading that
 //! payload here would need `beam_term::boxed_val`, which is `unsafe` and this crate is
 //! `#![deny(unsafe_code)]`, so the key is carried in the clear. The value is the reference
-//! id minted for `handle` out of the runtime's one reference id space
+//! id minted for `handle` out of the runtime's own reference id space
 //! ([`Runtime::refs_mut`](crate::Runtime::refs_mut)), so an id is never reused and a stale
 //! descriptor can never name a later descriptor's file.
 //!

@@ -33,8 +33,9 @@
 //!
 //! # `make_ref/0`, and the runtime's reference registry
 //!
-//! `make_ref/0` mints from [`Runtime::refs_mut`] — the runtime's one reference id space, so
-//! an id is never reused — and records the term as a **bare** reference (`None`, not a
+//! `make_ref/0` mints from [`Runtime::refs_mut`] — the runtime's **own** reference id space
+//! (monitors and aliases mint from the process table's separate allocator), so an id is never
+//! reused within this space — and records the term as a **bare** reference (`None`, not a
 //! monitor) in [`Runtime::references`](crate::Runtime::references). Reading a reference
 //! thing's payload (its id word) needs `beam_term::boxed_val`, which is `unsafe`, and this
 //! crate is `#![deny(unsafe_code)]`, so that term-keyed registry is the only way a later BIF
@@ -904,7 +905,7 @@ impl RuntimeContext<'_> {
 
     // -- helpers --------------------------------------------------------------
 
-    /// A fresh reference from the runtime's one reference id space: its id and its term.
+    /// A fresh reference from the runtime's own reference id space: its id and its term.
     ///
     /// The term is built on a pooled BIF heap (see [`Runtime::take_bif_heap`]); that heap
     /// never moves or resets its terms, so the returned term stays valid for the runtime's

@@ -519,8 +519,8 @@ impl RuntimeContext<'_> {
     /// `beam_process`'s ordinary deliver path, so a blocked receiver is woken exactly as a
     /// `send` wakes it) and, with nothing else to run, sleeps until the earliest one. The
     /// reference comes from [`Runtime::refs_mut`](crate::Runtime::refs_mut) — the runtime's
-    /// **one** reference id space, so it can never collide with a `make_ref/0`/monitor
-    /// reference.
+    /// own id space — and the timer heap registers it, so it is a **bare** runtime-minted
+    /// reference that can never resolve as an alias (`Runtime::local_reference`).
     ///
     /// Oracle parity (verified against `erl`, OTP 29):
     ///
@@ -580,17 +580,18 @@ impl RuntimeContext<'_> {
     }
 
     /// Whether `term` is a reference **this runtime minted**: a pending timer's reference or
-    /// one `make_ref/0`/`monitor/2` registered (`Runtime::references`).
+    /// one a `make_ref/0`/NIF `make_ref`/`monitor/2`/`alias/1`/`seq_trace` path registered.
     ///
     /// This is the argument test `erlang:cancel_timer/1` and `erts_internal:group_leader/3`
     /// share. The C only checks the *shape* (`is_not_internal_ref`), because it can read the
     /// thing's payload; reading one here would need `beam_term::boxed_val`, which is `unsafe`
-    /// (and this crate is `#![deny(unsafe_code)]`), so the term-keyed registries — the only
-    /// safe way to recognise a reference — are the test. The comparison is by raw term word,
-    /// which is exact for a reference: two distinct references are distinct terms, and an
-    /// equal term word denotes the same reference.
+    /// (and this crate is `#![deny(unsafe_code)]`), so the runtime's term-keyed registries —
+    /// the only safe way to recognise a reference — are the test. The comparison is by raw
+    /// term word, which is exact for a reference: two distinct references are distinct terms,
+    /// and an equal term word denotes the same reference. Delegates to the ONE provenance test,
+    /// [`Runtime::is_known_local_reference`].
     pub(super) fn is_runtime_reference(&self, term: Eterm) -> bool {
-        self.runtime.timers.is_timer_ref(term) || self.runtime.references.contains_key(&term)
+        self.runtime.is_known_local_reference(term)
     }
 
     // The delay/destination validation of a timer BIF lives in `crate::timers`
@@ -598,14 +599,16 @@ impl RuntimeContext<'_> {
     // (`erlang:start_timer/*`, `send_after/4`, `cancel_timer/2`) so the validation can
     // never drift between the two entry points.
 
-    /// A fresh `#Ref<>` for a timer, from the runtime's one reference id space.
+    /// A fresh `#Ref<>` for a timer, from the runtime's own reference id space.
     ///
     /// The term is built on a pooled BIF heap (see
     /// [`Runtime::take_bif_heap`](crate::Runtime::take_bif_heap)), which never moves or resets
     /// its terms, so it stays valid for the runtime's lifetime. This is the same three-line
-    /// mint the process/reference floor uses for `make_ref/0`/`monitor/2`; it cannot call that
-    /// module's private helper, but it draws from the same allocator, so the id space stays
-    /// single and an id is never reused.
+    /// mint the process/reference floor uses for `make_ref/0`; it cannot call that module's
+    /// private helper, but it draws from the same allocator, so an id is never reused. The term
+    /// is registered in the timer heap ([`Timers::schedule`](crate::timers::Timers)), which makes
+    /// it a **bare** runtime-minted reference — never a monitor/alias
+    /// (`Runtime::local_reference`).
     fn mint_timer_ref(&mut self) -> Result<Eterm> {
         let reference = self.runtime.refs_mut().next();
         let mut heap = self.runtime.take_bif_heap()?;
