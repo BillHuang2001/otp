@@ -200,7 +200,7 @@ entry (the driver's bound is `machine.x.len() > bound`).
   `spill`/`fill`.
 - `regalloc.rs` -> `allocate_registers` (incl. the `y_last` derivation) + `cacheable_touches`.
 - `operands.rs` -> `x_offset`, `x_register`, `y_offset`, `y_register`, `y_addressable`, `constant_word`, `small_word`.
-- `r#move.rs` -> `try_inline_move`, `try_inline_swap` (x-register destination only — a `Y` destination deopts).
+- `r#move.rs` -> `try_inline_move`, `try_inline_swap` (`Move` over in-bound x-registers or an addressable `Y` slot on either side, behind the frame-window guard; `Swap` needs two in-bound x-registers).
 - `test.rs` -> `TestSrc`/`TestPred`/`Guard`/`TestPlan`, `test_plan`, `test_src`, `compare_shape`,
   `arith_guard`, `order_guard`, `load_test_src`, `try_inline_test` (also `TEST_A`/`TEST_T` reused by `select.rs`).
 - `select.rs` -> `SelectPlan`, `select_val_plan`, `try_inline_select_val`.
