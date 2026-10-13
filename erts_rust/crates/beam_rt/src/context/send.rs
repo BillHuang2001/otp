@@ -71,8 +71,14 @@ pub(super) enum SendDestination {
         /// The peer's node name, as the caller spelled it (short or full).
         node: String,
     },
+    /// A `{Name, Node}` pair whose `Node` names **this** node but under which **no** process is
+    /// registered: the destination is accepted and the message is **dropped**, which is the C's
+    /// `return 0` for exactly this case (`bif.c:2654` — the `dep == erts_this_dist_entry` arm
+    /// looks `Name` up locally and reports success when the lookup finds nothing, without ever
+    /// reaching `SEND_BADARG`). The send therefore reports the message term, after the ordinary
+    /// `send` trace event.
+    Dropped,
 }
-
 /// The C's `send` destination classification (`bif.c:2469-2674`), shared by every send route.
 ///
 /// The order is the C's: an internal pid, a registered name, an alias reference, an external
@@ -85,13 +91,32 @@ pub(super) enum SendDestination {
 /// own table inside a slice, else [`Runtime`]'s own (the same choice
 /// [`RuntimeContext::process_table`] and [`SendBridge`](super::bridges::SendBridge) make).
 ///
+/// # The `{Name, Node}` pair: same node vs another node
+///
+/// A 2-tuple of atoms is the C's tuple arm (`bif.c:2614-2667`), and the C splits it by *which*
+/// node it names — `erts_find_dist_entry(tp[2]) == erts_this_dist_entry`:
+///
+/// * `Node` naming **this** node (`node()`, and on a runtime with no `-name`/`-sname` that is
+///   the fixed `nonode@nohost`, so the comparison is meaningful there too) is a **local named
+///   send**: the C runs the very same `erts_whereis_name_to_id` the atom-destination arm uses
+///   (`bif.c:2636`), delivers to the process it finds, and — when it finds none — reports
+///   success without delivering (`bif.c:2654`'s `return 0`), *not* `SEND_BADARG`. Oracle
+///   measurements on the system `erl` (OTP 29.1.1 / erts-17.1) pin both halves:
+///   `register(foo, self()), {foo, node()} ! hi` delivers `hi` on a non-distributed node (and on
+///   a `-sname` node), while `{noreg, node()} ! hi` and `erlang:send({noreg, node()}, hi)` both
+///   answer `hi` with nothing delivered.
+/// * Any other node is the remote arm: `RemoteName` when this runtime **is** a node, and
+///   otherwise the typed capability gap it has always been (never a silent drop). The oracle
+///   accepts the tuple whatever the node atom is — `{foo, 'xyz@abc'} ! hi` answers `hi`,
+///   dropping the message — so the gap is this runtime's honest signal, not the oracle's error.
+///
 /// # Errors
 ///
 /// [`BeamError::BadArg`] for the destinations the oracle rejects with `badarg`; a typed
 /// capability gap ([`crate::error::unsupported`]) for the ones it accepts but this runtime
-/// cannot serve yet — a port destination, and the `{Name, Node}` pair on a runtime that is
-/// **not** a distributed node (`dist_client()` is `None`, which is the message the
-/// non-distributed corpus has always pinned).
+/// cannot serve yet — a port destination, and a `{Name, Node}` pair naming **another** node on
+/// a runtime that is **not** a distributed node (`dist_client()` is `None`, which is the
+/// message the non-distributed corpus has always pinned).
 pub(super) fn classify_send_destination(
     runtime: &Runtime,
     table: &ProcessTable,
@@ -132,11 +157,28 @@ pub(super) fn classify_send_destination(
             "erlang:send/2 to a port: the port write path is not wired",
         ));
     }
-    if let Some((name, node)) = two_atom_tuple(runtime.code_server.atoms(), to) {
+    if let Some((name_atom, node_atom, name, node)) = two_atom_tuple(runtime.code_server.atoms(), to)
+    {
+        if node_atom == runtime.local_node() {
+            // `Node` names this runtime's own node: the C's `dep == erts_this_dist_entry` arm
+            // (`bif.c:2628-2655`) — a plain local `whereis(Name)`, no distribution involved.
+            // `node()` is this atom by construction (`erlang:node/0` is served from
+            // `Runtime::local_node_term`), and the identity is the *full* `node@host` name the
+            // node advertises, so the comparison is the C's own by-name `erts_find_dist_entry`.
+            return match table.whereis(name_atom) {
+                Some(pid) => Ok(SendDestination::Local {
+                    target: pid,
+                    reference: None,
+                }),
+                // Nothing registered under that name on this node: the C reports success and
+                // drops the message (`bif.c:2654`).
+                None => Ok(SendDestination::Dropped),
+            };
+        }
         if runtime.dist_client().is_none() {
-            // Not a distributed node: no link table exists, so this stays the exact capability
-            // gap it has always been -- which keeps a non-node VM's observable behaviour (and
-            // the differential corpus) byte-identical.
+            // Another node, and not a distributed node: no link table exists, so this stays the
+            // exact capability gap it has always been -- which keeps a non-node VM's observable
+            // behaviour (and the differential corpus) byte-identical.
             return Err(error::unsupported(&format!(
                 "erlang:send/2 to {name}@{node}: distributed send is not implemented"
             )));
@@ -652,24 +694,30 @@ impl<'a> RuntimeContext<'a> {
     /// [`BeamError::BadArg`] for everything that is neither an internal pid nor a live alias
     /// reference — the destinations the oracle rejects with `badarg` (see the [`alias`] module's
     /// divergence note for a reference that is not a live alias).
-    pub(crate) fn resolve_send_target(&self, to: Eterm) -> Result<(ProcessId, Option<MonitorRef>)> {
+    ///
+    /// `#[cfg(test)]`: the four in-module `tests.rs` cases are this form's only callers. The
+    /// three send seams all need the **remote** arms too, so they resolve through
+    /// [`RuntimeContext::resolve_send_destination`] and transmit with
+    /// [`RuntimeContext::deliver_remote`].
+    #[cfg(test)]
+    pub(super) fn resolve_send_target(&self, to: Eterm) -> Result<(ProcessId, Option<MonitorRef>)> {
         match self.resolve_send_destination(to)? {
             SendDestination::Local { target, reference } => Ok((target, reference)),
-            // A remote destination has no local `ProcessId`, which is all this form can
-            // express: the four in-module callers pin exactly the local contract. The send
-            // seams reach the remote arms through
-            // [`RuntimeContext::resolve_send_destination`] directly.
-            SendDestination::RemotePid { .. } | SendDestination::RemoteName { .. } => {
-                Err(BeamError::BadArg)
-            }
+            // A remote (or dropped) destination has no local `ProcessId`, which is all this form
+            // can express: the in-module callers pin exactly the local contract. The send seams
+            // reach the remote arms through [`RuntimeContext::resolve_send_destination`]
+            // directly.
+            SendDestination::RemotePid { .. }
+            | SendDestination::RemoteName { .. }
+            | SendDestination::Dropped => Err(BeamError::BadArg),
         }
     }
 
     /// The full [`SendDestination`] a `send` destination term names — the shared
     /// classification ([`classify_send_destination`]) every send route runs.
     ///
-    /// Unlike [`RuntimeContext::resolve_send_target`] this keeps the two **remote** arms, so the
-    /// compiled `Dest ! Msg`, the `-eval` `!` and the `erlang:send/2` BIF can all transmit a
+    /// Unlike the (test-only) `resolve_send_target` form this keeps the two **remote** arms, so
+    /// the compiled `Dest ! Msg`, the `-eval` `!` and the `erlang:send/2` BIF can all transmit a
     /// remote destination through [`RuntimeContext::deliver_remote`]. The lookup is read-only (a
     /// `&self` borrow of the table the context resolves against), so the caller can transmit with
     /// `&mut self` afterwards.
@@ -678,7 +726,7 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// As [`classify_send_destination`]: [`BeamError::BadArg`] for a destination the oracle
     /// rejects, and a typed capability gap for the accepted-but-unsupported ones.
-    pub(crate) fn resolve_send_destination(&self, to: Eterm) -> Result<SendDestination> {
+    pub(super) fn resolve_send_destination(&self, to: Eterm) -> Result<SendDestination> {
         classify_send_destination(&*self.runtime, self.process_table(), to)
     }
 
@@ -697,6 +745,12 @@ impl<'a> RuntimeContext<'a> {
     /// The link must already be established ([`Runtime::dist_connect`]); an unconnected peer is
     /// the connector's typed error, propagated rather than turned into a silent drop, so a real
     /// peer is never mis-served. `Local` is unreachable here and is rejected outright.
+    ///
+    /// This is also the seam's arm for [`SendDestination::Dropped`] — a `{Name, Node}` pair
+    /// naming this node under which nothing is registered (`bif.c:2654`'s `return 0`): there is
+    /// no local receiver to copy into and nothing to transmit, so the destination is spent
+    /// exactly like the C spends it, leaving only the `send` trace event (which the C also
+    /// emits, `bif.c:2631-2632`). The send therefore reports the message term.
     ///
     /// # Errors
     ///
@@ -717,6 +771,8 @@ impl<'a> RuntimeContext<'a> {
             SendDestination::RemoteName { name, node } => {
                 self.runtime.dist_send_reg_send(&node, &name, from, message)?;
             }
+            // Accepted and dropped: nothing to deliver and nothing to transmit.
+            SendDestination::Dropped => {}
             SendDestination::Local { .. } => return Err(BeamError::BadArg),
         }
         self.trace_send_events(to, message)

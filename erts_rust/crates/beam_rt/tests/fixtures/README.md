@@ -183,6 +183,13 @@ rm -rf "$SCRATCH"; mkdir -p "$SCRATCH/gen"
 cp dist_echo.erl "$SCRATCH/gen/"
 ( cd "$SCRATCH/gen" && erlc +deterministic dist_echo.erl )
 cp "$SCRATCH/gen/dist_echo.beam" dist_echo.beam
+
+# remote_send.beam (984 bytes) — same deterministic scratch-dir recipe
+SCRATCH="$TMPDIR/beam_rt_remote_send_fix"
+rm -rf "$SCRATCH"; mkdir -p "$SCRATCH/gen"
+cp remote_send.erl "$SCRATCH/gen/"
+( cd "$SCRATCH/gen" && erlc +deterministic remote_send.erl )
+cp "$SCRATCH/gen/remote_send.beam" remote_send.beam
 ```
 Every fixture is built with `+deterministic` in a `$TMPDIR` scratch dir, so no
 absolute checkout path is embedded in any committed `.beam`.

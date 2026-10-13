@@ -36,7 +36,7 @@
 //! | `erlang:send_after/4` | [`crate::timers`] — deliver `Msg` |
 //! | `erlang:cancel_timer/2` | [`crate::timers`] — the `/1` answers under the option list |
 //! | `erlang:function_exported/3` | the [`CodeServer`](crate::CodeServer)'s loaded exports + the **emulator builtins** (the declared `bif.tab` surface plus the `erlang`-namespace registry extras) |
-//! | `erlang:link/1`, `erlang:unlink/1` | [`beam_process::ProcessTable`]'s link set |
+//! | `erlang:link/1`, `erlang:unlink/1` | [`beam_process::ProcessTable`]'s link set — a **local** pid through [`ProcessTable::link`]/`unlink`, a **remote** pid through [`ProcessTable::link_term`]/`unlink_term` (the remote-link set + the wire `DOP_LINK`/`DOP_UNLINK_ID`) |
 //! | `erlang:dt_spread_tag/1`, `erlang:dt_restore_tag/1` | the oracle's boolean check (dynamic tracing is compiled out) |
 //! | `erlang:statistics/1` | `run_queue`; `run_queues`/`run_queue_lengths`/`run_queue_lengths_all`/`total_run_queue_lengths`/`total_run_queue_lengths_all` (the runtime's **one** real run queue, `beam_process`'s `Scheduler`); `wall_clock` (the process clock); `reductions`/`exact_reductions`/`context_switches` (the runtime's own cumulative counters); `runtime` (the long-lived `beam_io::cpu_time::RuntimeClock`); `io` (the port subsystem's byte counters); `garbage_collection` (the live processes' own `beam_gc` collector counters); `scheduler_wall_time`/`scheduler_wall_time_all` (`undefined`, never enabled) |
 //! | `os:set_signal/2` | [`signal`] — the one long-lived `beam_io::signal::SignalFacility` (the dispositions persist for the runtime's life) |
@@ -337,21 +337,39 @@ impl<'a> RuntimeHooksBridge<'a> {
         atom_term(atoms, "ok")
     }
 
-    /// `erlang:link/1`: link the calling process to `Target`, answering `true`.
+    /// `erlang:link/1` (`unlink = false`) and `erlang:unlink/1` (`unlink = true`): link or
+    /// unlink the calling process and `Target`, answering `true`.
     ///
     /// Oracle-verified (OTP 29/`erts-17.1`): `Target` must be a pid — anything else is
-    /// `badarg`; a pid answers `true`, including `self()` and a pid no process backs (the
+    /// `badarg`; a pid answers `true`, including `self()`, a pid no process backs (the
     /// oracle discards a link to a non-existent process and still reports success, exactly
-    /// as the C's `erts_proc_lookup_raw` miss does). A **remote** pid is a link to another
-    /// node, which needs distribution (contract A.5) — the typed capability gap rather than
-    /// a fabricated success.
+    /// as the C's `erts_proc_lookup_raw` miss does) **and a remote pid** (measured against a
+    /// real peer: `erl -sname Peer` + `erlang:link(rpc:call(Peer, erlang, self, []))` ⇒
+    /// `true`, and `erlang:unlink/1` on the same pid ⇒ `true`).
+    ///
+    /// # The remote pid is a **remote link**, not a capability gap
+    ///
+    /// [`ProcessTable::link_term`] / [`ProcessTable::unlink_term`] are the entry points that
+    /// implement the oracle's semantics for a `PidTarget::Remote`: the pair is recorded in
+    /// the caller's **remote-link set** *and* the wire control signal
+    /// ([`DistSignal::Link`](beam_process::DistSignal) / `Unlink` ⇒ `DOP_LINK` /
+    /// `DOP_UNLINK_ID`) is handed to the [`DistSignalRouter`](beam_process::DistSignalRouter)
+    /// installed on the process table — which this runtime supplies
+    /// ([`crate::dist_client::DistRouter`]). The signal only reaches a socket when this
+    /// runtime **is** a node *and* holds an established link to the peer's node; otherwise
+    /// the router reports its own typed `distribution: no established connection to node …`
+    /// error, which is propagated rather than swallowed. A runtime with **no** router at all
+    /// (no `-name`/`-sname`) keeps the local record and reports `true` — which is the
+    /// oracle's own observable answer for this BIF, never a fabricated success on top of a
+    /// silently dropped signal.
     ///
     /// # Errors
     ///
-    /// `badarg` for a non-pid; the typed gap for a remote pid, for a caller with no process
-    /// in the table, and for any link-set failure the table reports.
+    /// `badarg` for a non-pid; the typed gap for a caller with no process in the table; the
+    /// router's typed transport error for a remote pid it cannot deliver; and any other
+    /// link-set failure the table reports.
     fn link(&mut self, args: &[Eterm], unlink: bool) -> Result<Eterm> {
-        let target = local_pid(*args.first().ok_or(BeamError::BadArg)?, "link")?;
+        let target = link_target(*args.first().ok_or(BeamError::BadArg)?)?;
         let self_pid = self.self_pid;
         if !self.table_mut().contains(self_pid) {
             return Err(error::no_process(self_pid));
@@ -363,10 +381,11 @@ impl<'a> RuntimeHooksBridge<'a> {
         };
         match outcome {
             Ok(()) => atom_term(self.runtime.code_server.atoms(), "true"),
-            // The target pid is not in the table: the oracle treats a pid no process backs
-            // as a successful no-op link (the signal/`{'EXIT',…}` simply never arrives), so
-            // this is the oracle's semantics rather than a swallowed failure. The *caller*
-            // is known to exist (checked above), so this can only be the target.
+            // The target pid is not in the table (the `unlink` half reports an unknown pair
+            // as `TermNotFound`): the oracle treats a pid no process backs as a successful
+            // no-op — the `{'EXIT',…}` simply never arrives and `unlink/1` still answers
+            // `true` — so this is the oracle's semantics rather than a swallowed failure. The
+            // *caller* is known to exist (checked above), so this can only be the target.
             Err(BeamError::TermNotFound) => {
                 atom_term(self.runtime.code_server.atoms(), "true")
             }
@@ -1175,16 +1194,47 @@ fn boolean_value(atoms: &AtomTable, value: Eterm) -> Result<bool> {
 
 /// The local pid `term` names, or the oracle's rejection of it.
 ///
+/// The **local-only** classifier, and the one place this bridge spells the "not a pid ⇒
+/// `badarg`" rule for a pid-taking key. Its remote arm is the typed capability gap for a
+/// caller that has no peer-side answer to give (`distribution is not implemented`); a key
+/// whose oracle semantics for a remote pid *are* implementable must classify with its own
+/// entry point instead of this one — [`link_target`] is that sibling for
+/// `erlang:link/1`/`unlink/1`.
+///
 /// # Errors
 ///
-/// `badarg` for anything that is not a pid; the typed capability gap for a **remote** pid
-/// (distribution, contract A.5, is not implemented) — never a fabricated local pid.
+/// `badarg` for anything that is not a pid; the typed capability gap for a **remote** pid —
+/// never a fabricated local pid.
 fn local_pid(term: Eterm, what: &str) -> Result<Eterm> {
     match PidTarget::from_eterm(term) {
         Ok(PidTarget::Local(_)) => Ok(term),
         Ok(PidTarget::Remote(_)) => Err(error::unsupported(&format!(
             "erlang:{what}/1 on a remote pid: distribution is not implemented"
         ))),
+        Err(_) => Err(BeamError::BadArg),
+    }
+}
+
+/// The `erlang:link/1`/`unlink/1` target `term` names, or the oracle's rejection of it.
+///
+/// A **local** pid is classified by [`local_pid`] — the local-only classifier, so the
+/// "not a pid ⇒ `badarg`" rule for this arm stays spelled in exactly one place — while a
+/// **remote** (external) pid is accepted unchanged: linking a process on another node is a
+/// **remote link**, which [`ProcessTable::link_term`]/`unlink_term` record in the caller's
+/// remote-link set and route as a wire `DOP_LINK`/`DOP_UNLINK_ID` control signal
+/// ([`RuntimeHooksBridge::link`] carries the full contract). This is deliberately *not* the
+/// blanket capability gap the local-only classifier reports for a remote pid — that guard
+/// remains in force for the keys that genuinely need peer state
+/// ([`RuntimeHooksBridge::is_process_predicate`],
+/// [`RuntimeHooksBridge::dflag_unicode_io`], which do not go through here).
+///
+/// # Errors
+///
+/// `badarg` for anything that is not a pid — the same reason [`local_pid`] reports.
+fn link_target(term: Eterm) -> Result<Eterm> {
+    match PidTarget::from_eterm(term) {
+        Ok(PidTarget::Local(_)) => local_pid(term, "link"),
+        Ok(PidTarget::Remote(_)) => Ok(term),
         Err(_) => Err(BeamError::BadArg),
     }
 }
