@@ -76,11 +76,8 @@
 //! * the ownership verbs `ets:give_away/3` and `ets:setopts/2` live in
 //!   [`super::adopt`].
 //!
-//! The two remaining keys are genuine typed gaps:
+//! The remaining key is a genuine typed gap:
 //!
-//! * **`ets:slot/2`** — returns the objects of an internal tree node / hash bucket
-//!   slot; the contract pins the *interior layout*, which the crate contract
-//!   explicitly leaves open (§2), so the value cannot be reproduced faithfully.
 //! * **`ets:internal_request_all/0`** — the helper `ets.erl`'s own `ets:all/0`
 //!   drives: it mints a fresh `make_ref()` and has **each scheduler** reply
 //!   `{Ref, Tables}`, so `ets.erl`'s `receive_all/3` waits for
@@ -89,7 +86,7 @@
 //!   forever** — so it stays a typed gap. (`ets:all/0` itself is served directly in
 //!   [`super::adopt`].)
 //!
-//! Both are registered through the `RuntimeHooks` stub in `src/runtime/other.rs`.
+//! It is registered through the `RuntimeHooks` stub in `src/runtime/other.rs`.
 //! `ets:setopts/2`'s `{protection, P}` sub-option is **not** a gap: [`super::adopt`]
 //! applies it through the owner-gated `Table::setopts(Some(owner), SetOpt::Access(P))`.
 //!
@@ -120,7 +117,7 @@ use super::{parse_updates, restore_table, take_table_gated};
 ///
 /// The `rename/2`, `internal_delete_all/2` and `internal_select_delete/2`
 /// registrations here are the live ones: `src/runtime/other.rs` registers only the
-/// `ets:slot/2` and `ets:internal_request_all/0` typed gaps, so no key registered
+/// `ets:internal_request_all/0` typed gap, so no key registered
 /// here is shadowed.
 pub(super) fn register(reg: &mut BifRegistry) {
     reg.register("ets", "safe_fixtable", 2, safe_fixtable_2);

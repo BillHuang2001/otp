@@ -45,6 +45,7 @@ use beam_term::Eterm;
 use super::apply::{callee_observes_its_call_site, LocalFunTarget};
 use super::gc;
 use super::runtime_context::RuntimeContext;
+use super::send::SendDestination;
 
 impl ExecutionContext for RuntimeContext<'_> {
     /// The runtime's unified dispatch — see the module docs.
@@ -388,9 +389,11 @@ impl ExecutionContext for RuntimeContext<'_> {
     }
     /// `send`: deliver `message` to the pid term `to`.
     ///
-    /// `to` is resolved by [`RuntimeContext::resolve_send_target`]: an internal pid, or a
-    /// reference that is a live **alias** (whose message goes to the alias owner); anything
-    /// else is [`BeamError::BadArg`]. The message is copied into the recipient's heap and
+    /// `to` is resolved by [`RuntimeContext::resolve_send_destination`]: an internal pid, a
+    /// reference that is a live **alias** (whose message goes to the alias owner), a
+    /// `{Name, Node}` pair naming **this** node (the C's local `whereis` arm), or a genuinely
+    /// remote destination (transmitted by the distribution client); anything else is
+    /// [`BeamError::BadArg`]. The message is copied into the recipient's heap and
     /// enqueued by [`ProcessTable::deliver`] (an unknown pid is the table's typed
     /// `TermNotFound`). The sender is this context's pid, so `self() ! M` reaches the very
     /// mailbox the following `receive` scans.
@@ -421,9 +424,10 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// destination is the receiver's own off-heap table, so no runtime-level table is needed
     /// (see [`Self::deliver_message_with_off_heap`]).
     ///
-    /// `to` is resolved by [`Self::resolve_send_target`] — a pid, or a reference that is a
+    /// `to` is resolved by [`Self::resolve_send_destination`] — a pid, a reference that is a
     /// live **alias** (the compiled `Alias ! Msg` of `gen_server:reply/2`, delivered to the
-    /// alias owner and consuming the reference). A `reply_demonitor` alias is consumed only
+    /// alias owner and consuming the reference), or a `{Name, Node}` pair naming this node (the
+    /// C's local named-send arm). A `reply_demonitor` alias is consumed only
     /// **after** the delivery succeeded.
     ///
     /// A completed send also produces **events** (contract A.8, item 1): the ordinary
@@ -439,7 +443,14 @@ impl ExecutionContext for RuntimeContext<'_> {
         message: Eterm,
         src_binaries: &[beam_alloc::RefcBinary],
     ) -> Result<()> {
-        let (target, reference) = self.resolve_send_target(to)?;
+        let destination = self.resolve_send_destination(to)?;
+        // A **remote** destination (an external pid, or a `{Name, Node}` pair naming another
+        // node) has no local receiver to copy into: it is transmitted by the distribution client
+        // exactly as the `erlang:send/2` BIF route transmits it, and the `send` seam is done.
+        let (target, reference) = match destination {
+            SendDestination::Local { target, reference } => (target, reference),
+            remote => return self.deliver_remote(remote, to, message),
+        };
         let from = self.mailbox_pid.to_eterm();
         // The copy's source off-heap table: the sender's three handle families — its machine's own
         // handles (`src_binaries`) **unioned** with the runtime's escaped-payload store and with

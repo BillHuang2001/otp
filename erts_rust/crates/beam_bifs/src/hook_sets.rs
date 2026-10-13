@@ -46,7 +46,7 @@
 //! | [`PersistentTerm`] | [`PERSISTENT_TERM_BIFS`] | 7 |
 //! | [`FunCaller`] | [`FUN_CALLER_BIFS`] | 22 |
 //! | [`LocalNode`] | [`LOCAL_NODE_BIFS`] | 6 |
-//! | [`RuntimeHooks`] | [`RUNTIME_HOOKS_BIFS`] | 173 |
+//! | [`RuntimeHooks`] | [`RUNTIME_HOOKS_BIFS`] | 172 |
 //!
 //! # Why the sets live **here**, not in the host
 //!
@@ -100,7 +100,7 @@
 //! | `RuntimeContext::uses_send_hook` | [`needs_send_hook`] |
 //! | `RuntimeContext::uses_module_info` | [`needs_module_info`] |
 //! | `RuntimeContext::uses_persistent_term` | [`needs_persistent_term`] |
-//! | `RuntimeContext::uses_runtime_hooks` | [`needs_runtime_hooks`] (the whole 173-key seam) |
+//! | `RuntimeContext::uses_runtime_hooks` | [`needs_runtime_hooks`] (the whole 172-key seam) |
 //! | — (the port hook is installed unconditionally today) | [`needs_port_hook`] |
 //! | — (the fun caller is gated by `reentrancy_capable(args)` today) | [`needs_fun_caller`] |
 //! | — (the local node is installed unconditionally today) | [`needs_local_node`] |
@@ -324,7 +324,7 @@ pub const LOCAL_NODE_BIFS: &[(&str, &str, u32)] = &[
 ///
 /// The union of the four `runtime_bif!` family modules: `runtime/erlang.rs` (76),
 /// `runtime/erts_internal.rs` (56), `runtime/erts_debug.rs` (18) and
-/// `runtime/other.rs` (44) = **194** registered keys, of which **173** forward to the
+/// `runtime/other.rs` (43) = **193** registered keys, of which **172** forward to the
 /// seam — the twenty-one keys with real implementations (`erlang:is_builtin/3`,
 /// `erlang:term_to_iovec/1,2`, `erts_debug:map_info/1`,
 /// `erts_debug:unaligned_bitstring/2`, `erts_internal:ets_raw_first/1`,
@@ -517,7 +517,6 @@ pub const RUNTIME_HOOKS_BIFS: &[(&str, &str, u32)] = &[
     ("erts_trace_cleaner", "check", 0),
     ("erts_trace_cleaner", "send_trace_clean_signal", 1),
     ("ets", "internal_request_all", 0),
-    ("ets", "slot", 2),
     ("net_kernel", "dflag_unicode_io", 1),
     ("os", "set_signal", 2),
     ("prim_file", "internal_normalize_utf8", 1),
@@ -1130,7 +1129,7 @@ mod tests {
     /// magnitude explicit).
     #[test]
     fn runtime_hooks_bifs_has_the_expected_size() {
-        assert_eq!(RUNTIME_HOOKS_BIFS.len(), 173);
+        assert_eq!(RUNTIME_HOOKS_BIFS.len(), 172);
     }
 
     /// The module-doc table at the top of this file is the human-readable record of the
@@ -1201,8 +1200,8 @@ mod tests {
             "the doc's documented-key total must equal the sum over every exported table"
         );
         assert_eq!(
-            aggregate, 243,
-            "the documented seam surface is 243 keys across the 13 tables; a table \
+            aggregate, 242,
+            "the documented seam surface is 242 keys across the 13 tables; a table \
              added/removed (or resized) without refreshing the module-doc table changes this"
         );
     }

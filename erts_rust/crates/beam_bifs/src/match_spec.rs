@@ -124,30 +124,37 @@
 //! one message where the oracle prints another would be a fabricated result.
 //! `beam_ets::compile` rejecting the spec is therefore the honest outside.
 //!
-//! # Head patterns containing a map are refused (verified divergence)
+//! # Head patterns containing a map are delegated to `beam_ets` (verified)
 //!
-//! `beam_ets::pattern::decode` treats **every** head map as an exact
-//! (`=:=`) literal and documents that a head map "containing wildcards/variables
-//! therefore under-matches" (`../beam_ets/src/select/pattern.rs:66-69`). That is
-//! not the C's semantics, and it is wrong in **both** directions of interest:
+//! A head map is compiled by the shared `beam_ets` match-spec compiler
+//! (`beam_ets::select::pattern::decode`), which the `table` dialect already
+//! delegates to wholesale: a head map's **keys stay literal** while its
+//! **values recurse structurally**, exactly like tuple elements (at every nesting
+//! depth, through tuples and conses). That is the C's semantics, so these agree
+//! with the oracle rather than being guessed at:
 //!
 //! * a map pattern matches an object with *more* keys —
 //!   `match_spec_test(#{a => 1, b => 2}, [{#{a => 1}, [], [ok]}], table)` is
-//!   `{ok, ok, [], []}` on the oracle, while a literal `=:=` comparison of
-//!   `#{a => 1}` and `#{a => 1, b => 2}` is false;
-//! * a map **value** is itself a sub-pattern that binds —
+//!   `{ok, ok, [], []}` (verified);
+//! * a map **value** is a sub-pattern that binds —
 //!   `match_spec_test(#{a => 1}, [{#{a => '$2'}, [], ['$2']}], table)` is
-//!   `{ok, 1, [], []}`, while the literal comparison against the atom `'$2'`
-//!   fails;
-//! * a map **key** must not be a variable or `'_'` — the C reports
-//!   `Variable found in map key.` / `Underscore found in map key.`
-//!   (`erl_db_util.c:1788-1800`) where this runtime would silently compare.
+//!   `{ok, 1, [], []}` (verified);
+//! * a map nested inside a tuple head recurses —
+//!   `match_spec_test({x, #{a => 1, b => 2}}, [{{x, #{a => 1}}, [], [ok]}], table)`
+//!   is `{ok, ok, [], []}` (verified).
 //!
-//! So any head pattern that mentions a map (at any depth, through tuples and
-//! conses) is a typed [`unsupported_bif`]. A map in a **guard or body** needs no
-//! special case: `beam_ets` decodes a map expression (`#{K => V}`, the C's
-//! `dmc_map`) and **constructs** it at evaluation time — its keys/values may be
-//! variables — exactly as the C does
+//! The one remaining map-related gap is a **variable or `'_'` map key**
+//! (`#{'$1' => '$2'}`, `#{'_' => 1}`): the C's linter reports
+//! `Variable found in map key.` / `Underscore found in map key.`
+//! (`erl_db_util.c:1788-1800`) as `{error, [{error, "…"}]}`, whereas
+//! `beam_ets::select::pattern::decode` refuses the spec with a plain `badarg`.
+//! That `badarg` reaches [`test_table`], which answers the typed
+//! [`unsupported_bif`] — reproducing the C's semantic lint diagnostic is a port
+//! of its own (see the lint section above), so it is not guessed here.
+//!
+//! A map in a **guard or body** needs no special case: `beam_ets` decodes a map
+//! expression (`#{K => V}`, the C's `dmc_map`) and **constructs** it at
+//! evaluation time — its keys/values may be variables — exactly as the C does
 //! (`../beam_ets/src/select/expr.rs:358-363`), so the wholesale delegation below
 //! already answers it. Verified: `erlang:match_spec_test(7, [{'$1',[],[#{a=>'$1'}]}], table)`
 //! and the crate both yield `{ok, #{a => 7}, [], []}`, and
@@ -161,9 +168,7 @@
 use beam_common::{BeamError, Result};
 use beam_term::{AtomTable, Eterm, NIL};
 
-use crate::access::{
-    car, cdr, is_atom, is_flatmap, is_hashmap, is_list, is_nil, is_tuple, tuple_element, tuple_size,
-};
+use crate::access::{car, cdr, is_atom, is_list, is_nil, is_tuple, tuple_size};
 use crate::context::BifContext;
 use crate::error::{badarg, unsupported_bif};
 use crate::registry::BifRegistry;
@@ -203,8 +208,7 @@ fn match_spec_test_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> 
     }
 }
 
-/// The `table` dialect: lint, refuse the unsupported head shapes, then compile
-/// and run through `beam_ets`.
+/// The `table` dialect: lint, then compile and run through `beam_ets`.
 fn test_table(ctx: &mut BifContext<'_>, against: Eterm, spec: Eterm) -> Result<Eterm> {
     // The spec's guards/bodies may compute arithmetic; install this crate's
     // arbitrary-precision `ArithHook` over `beam_ets` for the run (the same scoped
@@ -212,11 +216,6 @@ fn test_table(ctx: &mut BifContext<'_>, against: Eterm, spec: Eterm) -> Result<E
     let _arith = crate::ets::arith_hook::PrecisionArith::install();
     if let Some(message) = structural_lint(spec) {
         return lint_error(ctx, message);
-    }
-    // `structural_lint` established a proper list of 3-tuples, so the head of
-    // every clause is `tuple_element(clause, 0)`.
-    if head_mentions_a_map(spec) {
-        return Err(unsupported_bif());
     }
     // `beam_ets::match_spec_run` compiles the raw spec internally and matches the
     // head against the **element itself** (any term — `../beam_ets/src/select/
@@ -271,44 +270,6 @@ fn structural_lint(spec: Eterm) -> Option<&'static str> {
         return Some(NOT_A_3_TUPLE);
     }
     None
-}
-
-/// Does any clause head mention a map (at any depth)? See the module docs: a head
-/// map is a documented `beam_ets` under-match and must not be guessed at.
-fn head_mentions_a_map(spec: Eterm) -> bool {
-    let mut cursor = spec;
-    while is_list(cursor) {
-        let clause = car(cursor);
-        // `structural_lint` ran first, so every clause here is a 3-tuple.
-        if term_mentions_a_map(tuple_element(clause, 0)) {
-            return true;
-        }
-        cursor = cdr(cursor);
-    }
-    false
-}
-
-/// A structural walk over a head pattern: `true` when a map appears anywhere
-/// (a tuple element, a cons head, or an improper cons tail).
-fn term_mentions_a_map(term: Eterm) -> bool {
-    if is_flatmap(term) || is_hashmap(term) {
-        return true;
-    }
-    if is_tuple(term) {
-        return (0..tuple_size(term)).any(|index| term_mentions_a_map(tuple_element(term, index)));
-    }
-    if is_list(term) {
-        let mut cursor = term;
-        while is_list(cursor) {
-            if term_mentions_a_map(car(cursor)) {
-                return true;
-            }
-            cursor = cdr(cursor);
-        }
-        // The tail of an improper list is itself a pattern.
-        return term_mentions_a_map(cursor);
-    }
-    false
 }
 
 /// `{error, [{error, "Message"}]}` — the C's failed-compile result

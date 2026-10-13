@@ -40,6 +40,9 @@
 //! | `init:stop/0,1` | terminates the **node**: records the exit status (or raises the crash-dump slogan / `badarg`) and answers `ok` without interrupting the caller |
 //! | `init:restart/0` | reboots the node **in place** (resets the code path to its boot default, re-runs the boot sequence and the loaded boot script) and answers `ok` (`init.erl:492-518,937-954`) |
 //! | `init:boot/1` | the boot **entry point**: parses the `-boot <Script>` flag out of the byte-list argument, resolves it exactly as the CLI's `-boot FILE` does and executes the script (`init.erl:585-597`) |
+//! | `erlang:is_alive/0`, `erlang:get_cookie/0`, `erlang:set_cookie/2` | read/replace this node's own identity (the name, the cookie) and its liveness — the distribution state no BIF module can reach (contract A.5, `src/native/node.rs`) |
+//! | `erlang:nodes/0,1` | read this runtime's own **link table** (the established outbound distribution links), not a registry value (contract A.5, `src/native/net.rs`) |
+//! | `net_adm:ping/1`, `net_kernel:connect_node/1` | **drive** that link table: the outbound `epmd` lookup + `'N'` client handshake (`Runtime::dist_connect`) is host socket work (contract A.5, `src/native/net.rs`) |
 //! | `os:cmd/1` | runs a command through `/bin/sh` and returns its stdout — the host's own process spawn |
 //! | `code:get_path/0`, `code:all_loaded/0`, `code:which/1`, `code:is_loaded/1`, `code:is_sticky/1,2`, `code:ensure_loaded/1`, `code:load_file/1`, `code:lib_dir/0,1,2`, `code:priv_dir/1`, `code:root_dir/0` | read the runtime's own [`CodeServer`](crate::CodeServer) state (the code path, the loaded/preloaded module set, the installation) |
 //! | `application:get_env/1,2,3`, `application:get_all_env/1`, `application:get_key/2`, `application:loaded_applications/0`, `application:which_applications/0` | read the runtime's own **application-config view** — the `.app` resource files of the OTP applications its code path resolves |
@@ -80,8 +83,10 @@
 //! The floor is split by responsibility: the `erlang`-core items and the shared helpers live
 //! in this module; the `init:*` entries in [`init`], the `code:*` entries in [`code`], the
 //! `erlang:*` process/registry/reference entries in [`process`], the `application:*`
-//! entries in [`application`], the `prim_file:*` primitives in [`prim`] and the `erl_ddll:*`
-//! loaded-driver-list entries in [`ddll`]. The submodules
+//! entries in [`application`], the `prim_file:*` primitives in [`prim`], the `erl_ddll:*`
+//! loaded-driver-list entries in [`ddll`], the distribution **identity** in [`node`] and the
+//! distribution **node set + connector** (`erlang:nodes/0,1`, `net_adm:ping/1`,
+//! `net_kernel:connect_node/1`) in [`net`]. The submodules
 //! reach the shared helpers through `super` (they are `pub(super)`).
 
 mod application;
@@ -92,13 +97,14 @@ pub(crate) mod file_server;
 mod group_leader;
 mod init;
 pub(crate) mod memory;
+mod net;
 mod node;
 pub(crate) mod port;
 mod prim;
 mod prim_file;
 mod process;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 
 use std::process::Command;
 
@@ -113,13 +119,14 @@ use crate::format;
 /// The module namespaces [`RuntimeContext::try_native`] serves — the floor's own dispatch.
 ///
 /// Every one of them is a module the code server can *also* load as a `.beam` (`erlang`,
-/// `io`, `init`, `os`, `code`, `application`, `erts_internal`, `prim_file`, `erl_ddll`), so the
-/// cross-module-call seam ([`RuntimeContext::resolve_external_call`]) must answer
-/// `Ok(None)` for all of them: entering the module body would run it *instead of* the host
-/// implementation. The list is written next to the `try_native` match arms it mirrors, and
+/// `io`, `init`, `os`, `code`, `application`, `erts_internal`, `prim_file`, `erl_ddll`,
+/// `net_adm`, `net_kernel`), so the cross-module-call seam
+/// ([`RuntimeContext::resolve_external_call`]) must answer `Ok(None)` for all of them:
+/// entering the module body would run it *instead of* the host implementation. The list is
+/// written next to the `try_native` match arms it mirrors, and
 /// [`tests::every_floor_module_is_a_real_try_native_arm`] pins it against that source so it
 /// cannot silently drift out of the host's dispatch.
-pub(crate) const FLOOR_MODULES: [&str; 9] = [
+pub(crate) const FLOOR_MODULES: [&str; 11] = [
     "application",
     "code",
     "erl_ddll",
@@ -127,6 +134,8 @@ pub(crate) const FLOOR_MODULES: [&str; 9] = [
     "erts_internal",
     "init",
     "io",
+    "net_adm",
+    "net_kernel",
     "os",
     "prim_file",
 ];
@@ -135,7 +144,7 @@ pub(crate) const FLOOR_MODULES: [&str; 9] = [
 /// `(module, function, arity)` **in-machine** because the runtime-native floor owns that
 /// EXACT key.
 ///
-/// The module-level rule ([`FLOOR_MODULES`]) is right for eight of the nine namespaces:
+/// The module-level rule ([`FLOOR_MODULES`]) is right for ten of the eleven namespaces:
 /// practically every name in them is either a floor arm or a `beam_bifs` registry BIF, so
 /// entering the module body would run it *instead of* the host implementation — a wrong
 /// result. `io` is the exception. The floor serves only `io:put_chars/1,2` for that
@@ -305,16 +314,19 @@ impl RuntimeContext<'_> {
             // (the boot script's `application:start_boot(kernel, permanent)`) is what needs it.
             // See [`group_leader`].
             ("erlang", "group_leader", 2) => Some(self.group_leader_2(args)),
-            // The distribution identity surface (contract A.5): this node's name, its cookie
-            // and the (always empty) set of connected nodes. One arm per name; every answer
-            // reads the runtime's own node table, so the per-function bodies -- including the
-            // `set_cookie/2` raise shapes the differential corpus pins
-            // (`wire_ids/node_identity_cases`) -- live in [`node`].
+            // The distribution identity + node-set surface (contract A.5): this node's
+            // name, its cookie, the set of connected nodes, and the connector. One arm per
+            // name; every answer reads the runtime's own node/link tables, so the
+            // per-function bodies -- including the `set_cookie/2` raise shapes the
+            // differential corpus pins (`wire_ids/node_identity_cases`) -- live in [`node`]
+            // (identity) and [`net`] (the node set + `net_adm`/`net_kernel` connector).
             ("erlang", "is_alive", 0) => Some(self.is_alive_0()),
             ("erlang", "get_cookie", 0) => Some(self.get_cookie_0()),
             ("erlang", "set_cookie", 2) => Some(self.set_cookie_2(args)),
             ("erlang", "nodes", 0) => Some(self.nodes_0()),
             ("erlang", "nodes", 1) => Some(self.nodes_1(args)),
+            ("net_adm", "ping", 1) => Some(self.net_adm_ping_1(args)),
+            ("net_kernel", "connect_node", 1) => Some(self.net_kernel_connect_node_1(args)),
             // Sequential tracing (contract A.8, item 2) — exactly the four BIFs
             // `bif.tab:220-223` declares, served by [`crate::seq_trace`], which also owns the
             // token model. `system_flag/2` is claimed **only** for the `reset_seq_trace` arm
@@ -964,7 +976,7 @@ mod tests {
 
     /// **Drift guard for the `io` exception to the floor exclusion.**
     ///
-    /// [`floor_shadows`] refuses a whole namespace for seven of the eight floor modules but
+    /// [`floor_shadows`] refuses a whole namespace for ten of the eleven floor modules but
     /// `io` only for the keys the floor really serves (`io:put_chars/1,2`); every other
     /// `io:*` must be entered in-machine, or a scheduled process's io-device `receive` folds
     /// into the typed `blocked()` capability gap. This parses the `("io", "FUNC", ARITY)`
@@ -1027,7 +1039,7 @@ mod tests {
                  `floor_shadows` must let it be entered in-machine"
             );
         }
-        // The other eight namespaces stay refused wholesale.
+        // The other ten namespaces stay refused wholesale.
         for module in FLOOR_MODULES {
             if module != "io" {
                 assert!(

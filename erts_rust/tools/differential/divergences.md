@@ -42,25 +42,25 @@ not here.)
 - The four forms' exact **success code** still differs (oracle `1` for a queued delivery, rust `0`
   — the frozen `DriverHost::send_term` "accepted" code), so the return value is not pinned; the
   accept/refuse split (selectors `30..38`) and the delivered term (the delivery family above) are.
-- **An `ErlDrvTerm` spec that interns a *new* atom is not delivered observably.** The Rust
-  runtime's driver host records the name on its `PendingInterner` and never commits it, so the
-  delivered term carries a nameless atom: an `ERL_DRV_ATOM` spec for `"driver_abi_term"` yields
-  oracle `{driver_abi_term,7}` / `term_to_binary` `<<131,104,2,119,15,"driver_abi_term",97,7>>`
-  vs rust `term_to_binary/1` → `error:badarg` (the atom has no name). A spec over an atom both
-  tables already hold (`ok`) agrees and **is** pinned. Owner: `beam_rt` / `beam_io`
-  (`crates/beam_rt/src/port/driver.rs`, `commit_atoms/1` is only reached from its unit test).
+- (An `ErlDrvTerm` spec that interns a *new* atom is **no longer a divergence**: the runtime now
+  commits the driver host's interned names (`commit_driver_atoms` runs in
+  `RuntimePorts::deliver_port_messages`), so the delivered `{driver_abi_term,7}` — and
+  `term_to_binary/1` on it — matches the oracle. The `driver_abi` delivery family still uses `ok`,
+  an atom both tables already hold, so its goldens do not depend on the commit.)
 - **`driver_async/5` schedules nothing.** Measured: the C's `driver_async(port, &key, invoke,
   data, free)` answers a positive handle (oracle `1`, the queued job's id) and later runs
   `async_invoke`; the Rust runtime keeps the [`beam_abi::DriverHost`] default and answers `-1`.
   A case observing the handle is a plain-value `mismatch` (oracle `49` vs rust `11569`), so the
   scheduler family stays unpinned. Owner: `beam_rt` / `beam_io`.
-- `driver_set_timer/2` on an entry **without** a `timeout` callback differs (oracle accepts,
-  rust `-1`); the timing shapes (0 ms, large, re-arm, pending/idle read) agree and are pinned.
+- (`driver_set_timer/2` on an entry **without** a `timeout` callback is **no longer a divergence**:
+  the runtime answers `0` for any attached live port, reproducing the C's `no_timeout_callback`
+  (`io.c:7601`), so the refusal half is unreachable and the timing shapes agree and are pinned.)
 - `erl_drv_monotonic_time/1` differs by **absolute phase** (oracle non-positive `0`, rust `1`);
   the phase-free properties (monotonicity, unit conversions) agree and are pinned.
 - `erl_drv_time_offset/1` differs (oracle a non-zero offset, rust `0`).
-- An entry whose only port-command callback is `outputv` never receives `port_command/2`
-  (oracle `49`, rust `-1`).
+- (An entry whose only port-command callback is `outputv` is **no longer a divergence**:
+  `DriverPortAdapter::output` prefers the entry's `outputv` when it declares one, mirroring
+  `io.c:1782`. No corpus fixture exercises an `outputv`-only entry, so the surface stays unpinned.)
 - An `ErlDrvTerm` `ERL_DRV_LIST N` spec differs: `INT 1, INT 2, INT 3, LIST 3` is the
   **improper** list `[1,2|3]` in the oracle (the last popped word is the tail) but the proper
   list `[1,2,3]` in the Rust runtime. No case pins it.
@@ -80,10 +80,11 @@ not here.)
   bounds; `erl_drv_getenv` sets `size` on an absent key in the rust runtime;
   `driver_dl_error()`'s message length differs (33 vs 25); `driver_dl_open(NULL)` +
   `driver_dl_sym` SIGSEGVs the oracle.
-- The monitor family `driver_monitor_process` / `driver_demonitor_process` /
-  `driver_get_monitored_process` / `driver_compare_monitors` succeeds in the oracle but is refused
-  by the rust runtime (the `DriverHost` hooks are left at `None`), so no case pins it.
-  Owner: `beam_rt` / `beam_io`.
+- (The monitor family `driver_monitor_process` / `driver_demonitor_process` /
+  `driver_get_monitored_process` / `driver_compare_monitors` is **no longer a divergence**: the
+  runtime implements the `DriverHost` monitor hooks (`DriverPort::{monitor_process,
+  monitor_process_result,demonitor_process,get_monitored_process}`) over its per-port monitor tree.
+  No corpus case pins it.) Owner: `beam_rt` / `beam_io`.
 
 ## A.5 — distribution wire / ETF (owner: `beam_codec`, `beam_rt`)
 - A `[compressed]` image is **not** byte-identical: the framing (`131,80`), the 32-bit
@@ -96,6 +97,18 @@ not here.)
   integer binary segment wider than 64 bits — are no longer divergences: `beam_rt` now evaluates
   each shape, so they are pinned as **agreeing** regression cases; see the table above, owner
   `beam_rt`.)
+- A **multi-key atom-keyed** small map is **not** byte-identical on either of two observable
+  paths, both reproducing on the minimal 2-key term and through `maps:from_list/1`:
+  `term_to_binary(#{b => 2, a => 1})` ⇒ oracle `…119,1,97,97,1,119,1,98,97,2` (keys `a` then `b`,
+  sorted) vs rust `…119,1,98,97,2,119,1,97,97,1` (construction order); and
+  `maps:to_list(#{a => 1, b => 2})` ⇒ oracle `[{b,2},{a,1}]` vs rust `[{a,1},{b,2}]` (a differing
+  interior order: the rust runtime keeps the source order, the oracle's is its own literal order
+  and its encoder emits atom keys sorted). Consequently no corpus case pins a multi-key atom-keyed
+  map: only single-key images (where the order is vacuous) and `=:=`/sorted/`maps:size` projections
+  are pinned.
+  **Integer**-, **float**-, **binary**- and **list**-keyed maps agree on both paths and are pinned
+  (`wire.rs`/`wire_extra.rs`, incl. the non-canonical-wire-order canonicalization case). Owner:
+  `beam_rt`.
 
 ## A.7 — process signals (owner: `beam_bifs` / `beam_process`)
 - A `{'DOWN', …}` for a monitored **port** is not delivered after `port_close/1`: the oracle
@@ -154,6 +167,12 @@ not here.)
   mismatches; safe to pin as allowlisted cases once wanted.
 - `erlang:function_exported/3` is `false` in the rust runtime for `kernel` and `code` (the
   oracle says `true`); it agrees for the preloaded modules and for the file-loaded `lists`.
+- `erlang:function_exported/3` (like `erlang:module_loaded/1`) answers out of **which modules the side
+  has loaded**, so an answer for a non-preloaded module is boot-state dependent — the oracle boots the
+  whole stdlib while this runtime's `-eval`/`run` path loads only the 22 preloaded modules — and the
+  module must be `code:ensure_loaded/1`ed first before its answer is asserted; the corpus case
+  `boot_extra/function_exported_lists_sort_1_is_true` is ensure-load-explicit for that reason (while
+  the `bif.tab`-declared `lists:member/2` answers `true` regardless). Owner: `beam_rt` / `beam_bifs`.
 - `erlang:system_info(schedulers|dirty_cpu_schedulers|dirty_io_schedulers)` → oracle
   `16`/`16`/`10`, rust `14`/`0`/`0`.
 - `erlang:system_info(build_type)` is an honest rust capability gap (exit 3 /
@@ -216,6 +235,12 @@ not here.)
   (a private read returns `[]`, a protected/private write returns `true`); `ets:info(T, owner)` is
   `undefined`.
 - `erlang:module_loaded/1`: `module_loaded(lists)` is `true` vs `false`.
+- `code:is_loaded/1` is **path-based** in this runtime — it answers the `{file, Beam}` pair for any
+  module findable on the code path — where the oracle answers `false` for a module that exists on the
+  code path but is **not loaded** (`code:is_loaded(dets)` → oracle `false`, rust `{file, …}`), so the
+  affected corpus cases (`bifs/module_loaded_lists_shape`,
+  `boot_extra/code_is_loaded_lists_is_a_file_pair`, `boot_extra/code_is_loaded_kernel_is_file`) are
+  now ensure-load-explicit and pin the loaded answer. Owner: `beam_rt`.
 - `erlang:trace_info/2`: the `all`/`traced` selectors differ (`badarg` vs a value list); only
   `flags`/`tracer` agree.
 - `erlang:exit(self(), normal)`: the oracle ignores it (`true`), the rust runtime raises `exit:normal`.

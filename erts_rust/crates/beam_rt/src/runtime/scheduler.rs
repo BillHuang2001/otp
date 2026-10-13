@@ -641,7 +641,31 @@ impl Runtime {
                     scheduler.resume_woken(&mut table);
                     continue;
                 }
-            }            // The timer half: deliver every `erlang:send_after/3` message whose deadline has
+            }
+            // The **connecting (client) half** of distribution (contract A.5, Phase 2): drive
+            // every outbound link one non-blocking step and flush the controls the process
+            // layer's [`DistSignalRouter`](beam_process::DistSignalRouter) queued. The same
+            // shape as `pump_dist` above — a runtime that is not a node, or a node with no
+            // outbound link, pays nothing and a pass never blocks here.
+            match self.pump_dist_client() {
+                Err(err) => break Err(err),
+                Ok(0) => {}
+                Ok(count) => delivered += count,
+            }
+            // The client's inbound half: route what the established **outbound** links decoded
+            // into the addressed local process's mailbox, gated exactly like the server half.
+            // A delivery is what wakes a receiver blocked in a compiled `receive`, so it goes
+            // round again on the same resume-on-send path a port or timer message takes.
+            match self.dispatch_dist_client_inbound(&mut table) {
+                Err(err) => break Err(err),
+                Ok(0) => {}
+                Ok(count) => {
+                    delivered += count;
+                    scheduler.resume_woken(&mut table);
+                    continue;
+                }
+            }
+            // The timer half: deliver every `erlang:send_after/3` message whose deadline has
             // passed (which may wake a blocked receiver, exactly like a port message) and
             // resume every process whose finite `receive … after T` deadline fired.
             match self.fire_due_timers(&mut table) {
@@ -794,6 +818,72 @@ impl Runtime {
         let mut sink = LocalDeliverySink::new(table, name_atom, creation);
         node.dispatch_inbound(self.code_server.atoms_mut(), &mut sink)
     }
+
+    /// The **connecting half** of a scheduler pass (contract A.5, Phase 2).
+    ///
+    /// Drives the runtime's outbound distribution client
+    /// ([`DistClient::pump`](crate::dist_client::DistClient::pump)): every link is stepped one
+    /// bounded non-blocking step (its read is clamped to [`crate::dist::DIST_READ_SLICE`]), the
+    /// driver's reply is written, and the controls the process layer's
+    /// [`DistSignalRouter`](beam_process::DistSignalRouter) queued are encoded with the live
+    /// atom table and flushed. A link that fails is **retired and recorded**
+    /// ([`DistClient::last_error`](crate::dist_client::DistClient::last_error)), never raised —
+    /// a hostile or broken peer must not be able to fail a scheduler pass.
+    ///
+    /// `Ok(0)` for a runtime that is not a node (the common case) or a node with no outbound
+    /// link, so a pass never waits here.
+    ///
+    /// # Errors
+    ///
+    /// Only the shared cell's borrow conditions and the scratch heap's own allocation
+    /// failures; a link's I/O failure is the recorded retirement described above.
+    pub(crate) fn pump_dist_client(&mut self) -> Result<usize> {
+        match self.dist_client.as_ref() {
+            Some(client) => client.pump(self.code_server.atoms_mut()),
+            None => Ok(0),
+        }
+    }
+
+    /// The **inbound-delivery half of the client** (contract A.5, Phase 2).
+    ///
+    /// Drains what every **established outbound** link decoded and routes the `send` family
+    /// into the addressed local process's mailbox, returning how many messages were really
+    /// delivered. The mirror of [`Runtime::dispatch_dist_inbound`] (the listening node's half),
+    /// with the same gates and the same sink, so both directions route through exactly one
+    /// implementation.
+    ///
+    /// A no-op unless [`Runtime::allow_inbound_delivery`] turned the capability on (off by
+    /// default, so the differential corpus stays byte-identical) **and** this runtime has a
+    /// client — so a runtime with no node, no outbound link or the capability off pays one bool
+    /// test per pass and never allocates the decode arena. Never raises in practice: a
+    /// link-level failure retires just that link and records why.
+    ///
+    /// # Errors
+    ///
+    /// Never in practice (as above); the `Result` keeps the pass's call sites uniform.
+    pub(crate) fn dispatch_dist_client_inbound(
+        &mut self,
+        table: &mut ProcessTable,
+    ) -> Result<usize> {
+        if !self.inbound_delivery {
+            return Ok(0);
+        }
+        let Some(client) = self.dist_client.as_ref() else {
+            return Ok(0);
+        };
+        // The node identity the sink resolves an addressed pid against: this runtime's own
+        // `node@host` name and creation, exactly what the listening half uses. A client exists
+        // only for a node, so the `None` arm is unreachable in practice — it keeps the fixed
+        // non-node identity as the honest fallback rather than a panic.
+        let (name, creation) = match self.dist.as_ref() {
+            Some(node) => (node.node_name().to_string(), node.creation()),
+            None => (NONODE_NAME.to_string(), 0),
+        };
+        let name_atom = self.code_server.atoms_mut().intern(&name);
+        let mut sink = LocalDeliverySink::new(table, name_atom, creation);
+        client.dispatch_inbound(self.code_server.atoms_mut(), &mut sink)
+    }
+
     /// How long this pass may sleep waiting for the next timer deadline, or `None` when it
     /// must not (or cannot) wait — see [`TimerWait`].
     ///

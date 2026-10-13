@@ -82,30 +82,34 @@
 //! "not `-1`" (the accept/refuse split, on which the two runtimes agree). Owner: `beam_rt` /
 //! `beam_io`.
 //!
-//! * An `ErlDrvTerm` spec that interns a **new** atom cannot be delivered observably: this seam's
-//!   driver host records the name on its `PendingInterner` and never commits it
-//!   ([`beam_abi::DriverHost::intern_atom`]'s doc: commit is the runtime's step), so the delivered
-//!   term carries a nameless atom and `term_to_binary/1` on it raises `badarg` where the C delivers
-//!   `{driver_abi_term,7}`. The delivery family therefore uses `ok`, an atom both tables already
-//!   hold. Owner: `beam_rt` / `beam_io` (`crates/beam_rt/src/port/driver.rs`, `commit_atoms/1`).
-//! * An entry whose only port-command callback is `outputv` never receives `port_command/2`
-//!   (the C routes through the entry's `outputv`; the Rust runtime has no `outputv` path). Owner:
-//!   `beam_rt` / `beam_io`.
+//! * An `ErlDrvTerm` spec that interns a **new** atom **is** delivered now: this seam's driver host
+//!   records the name on its `PendingInterner` and the runtime commits it (`commit_driver_atoms`
+//!   runs in `RuntimePorts::deliver_port_messages`, `crates/beam_rt/src/port.rs`), so
+//!   `term_to_binary/1` on the delivered `{driver_abi_term,7}` matches the C's image. The delivery
+//!   family nevertheless uses `ok`, an atom both tables already hold, so its goldens do not depend
+//!   on that commit. Owner: `beam_rt` / `beam_io`.
+//! * An entry whose only port-command callback is `outputv` **is** routed now:
+//!   `DriverPortAdapter::output` prefers the entry's `outputv` when it declares one
+//!   (`crates/beam_rt/src/port/driver.rs`, mirroring `io.c:1782`). The group keeps no `outputv`-only
+//!   fixture, so the surface stays unpinned. Owner: `beam_rt` / `beam_io`.
 //! * `driver_async/5` — the C schedules the job on the port's async pool and answers a positive
 //!   handle (`1`), the Rust runtime keeps the [`beam_abi::DriverHost`] default (`-1`). No live-port
 //!   shape can agree, so the scheduler family is unpinned. Owner: `beam_rt` / `beam_io`.
-//!   `broadcast`/`outputv`-only routing is unpinned for the same reason.
-//! * `driver_set_timer/2` **without** a `timeout` callback — the C *accepts* it (`0`) and this
-//!   seam answers `-1`; the group's one fixture declares a `timeout` callback (selectors `22`,
-//!   `202`, `40..44`), so the refusal half cannot be reached. Owner: `beam_rt` / `beam_io`.
+//! * `driver_set_timer/2` **without** a `timeout` callback now matches the C:
+//!   `DriverPortAdapter::set_timer` answers `0` for any attached live port (the C substitutes its own
+//!   `no_timeout_callback`, `io.c:7601`), so the refusal half is no longer reachable; the group's one
+//!   fixture declares a `timeout` callback anyway (selectors `22`, `202`, `40..44`). Owner: `beam_rt`
+//!   / `beam_io`.
 //! * `erl_drv_monotonic_time/1`'s **absolute phase** — the C answers *Erlang* monotonic time
 //!   (anchored to the time offset, so early values are non-positive), this seam answers the raw
 //!   system monotonic clock (always positive); only monotonicity and unit consistency are pinned
 //!   (`60..65`). `erl_drv_time_offset/1` likewise differs (the C's offset is non-zero, this seam's
 //!   is `0`). Owner: `beam_rt` / `beam_abi`.
 //!
-//! `driver_enq/3` + `driver_sizeq/1` (the port-queue family) **hangs the oracle** for a driver port
-//! under a single CLI process, so it is deliberately unpinned. Owner: `beam_rt` / `beam_io`.
+//! `driver_enq/3` + `driver_sizeq/1` on a driver port that leaves a **non-empty** private queue at
+//! `port_command` return **hangs the oracle** under a single CLI process, so no such shape is pinned
+//! here; the drained round trip **is** pinned, by the sibling `driver_abi_extra` group (selectors
+//! `19`/`20`). Owner: the oracle's port-close path, not a runtime gap.
 //!
 //! # Skip policy (contract A.4 needs host tools, like A.3)
 //!
@@ -177,7 +181,8 @@ bytes_code(<<B, Rest/binary>>, Acc) -> bytes_code(Rest, Acc * 256 + B).
 %% Reach the driver the way each runtime can, without changing the argv:
 %%   * the oracle refuses a path in `{spawn_driver, _}` (`badarg`) and needs the object
 %%     pre-loaded by `erl_ddll:load_driver/2`, then opened by the bare driver name;
-%%   * the Rust runtime has no `erl_ddll` BIF and takes the object path as the name.
+%%   * the Rust runtime takes the object path as the name (`erl_ddll:load_driver/2` is not
+%%     yet usable there).
 open(Dir) ->
     try open_port({spawn_driver, Dir ++ "/driver_abi"}, [binary]) of
         P when is_port(P) -> P
@@ -692,9 +697,9 @@ static int chk_read_timer_after_cancel(abi_state *st) {
  *   * `{<<1, 2, 3>>, 5}` — a byte-string operand (`ERL_DRV_BUF2BINARY`), plus an integer.
  *
  * The delivered term itself is the whole observable (the destination process sees it as its message,
- * `io.c:6162-6176`), so every operand is a value both runtimes can name: a spec that interns a *new*
- * atom is not pinnable, because the Rust runtime's driver host never commits the names it records
- * (see the module docs' *Known gaps*). */
+ * `io.c:6162-6176`), so every operand is a value both runtimes can name — `ok`, which both atom
+ * tables already hold, keeps the goldens independent of the runtime's driver-atom commit (a spec
+ * that interns a *new* atom is delivered now too; see the module docs' *Known gaps*). */
 
 static void abi_deliver_ints(ErlDrvTermData *spec) {
     spec[0] = ERL_DRV_INT;

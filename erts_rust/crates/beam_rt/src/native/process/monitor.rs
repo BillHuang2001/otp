@@ -47,13 +47,31 @@
 //!
 //! # The targets the oracle accepts
 //!
-//! `monitor(process, Pid)`, `monitor(process, Name)` and `monitor(process, {Name, Node})`
-//! are all resolved (the last only when `Node` is **this** node; a remote node needs
-//! distribution, contract A.5), and `monitor(port, Port)` is recorded on the runtime's
-//! **port table** (`beam_io`'s `PortRegistry`, reached through
+//! `monitor(process, Pid)`, `monitor(process, RemotePid)`, `monitor(process, Name)` and
+//! `monitor(process, {Name, Node})` are all resolved (the last only when `Node` is **this**
+//! node; a **remote** `{Name, Node}` is the one target that stays a typed capability gap —
+//! see below), and `monitor(port, Port)` is recorded on the runtime's **port table**
+//! (`beam_io`'s `PortRegistry`, reached through
 //! [`crate::port::PortRegistry::port_table_mut`]) — the same table `open_port/2` allocates
 //! from and `port_close/1` releases, so the monitor's `{'DOWN', Ref, port, Port, Reason}`
 //! fires when the port closes.
+//!
+//! A **remote** (external) pid is a *remote monitor*: `ProcessTable::monitor_term_with_options`
+//! records it in the watcher's outgoing remote-monitor set and routes the `DOP_MONITOR_P`
+//! control signal; `demonitor/1,2` shares that path, because `ProcessTable::demonitor`
+//! falls back to its outgoing remote monitors and routes `DOP_DEMONITOR_P`
+//! (`beam_process/src/ptab.rs:1580-1588`, `demonitor_remote`). Oracle-verified against a real
+//! `erl -sname` peer: `monitor(process, RemotePid)` ⇒ a reference and
+//! `demonitor(Ref, [info])` ⇒ `true`. The wire signal only reaches a socket when this
+//! runtime **is** a node with an established link to the peer's node; otherwise the router
+//! reports its own typed error, which is propagated (never a silently dropped monitor).
+//!
+//! The **remote `{Name, Node}`** target remains the typed gap it always was:
+//! `ProcessTable::monitor_named_with_options` resolves the name against **this** node's
+//! registration table and has no node argument that would re-address the wire signal (a
+//! named monitor's `DOP_MONITOR_P` is a *name* signal), so passing a foreign node there
+//! would install a monitor on a *local* process the caller never asked about — a wrong
+//! result. It is therefore refused precisely (`named_node_target`).
 //!
 //! # `erlang:monitor/3`'s option list
 //!
@@ -89,7 +107,8 @@ use std::rc::Rc;
 use beam_common::{BeamError, Result};
 use beam_engine::terms;
 use beam_process::{
-    MonitorKind, MonitorOptions, MonitorRef, PortTable, ProcessId, ProcessTable, UnaliasMode,
+    MonitorKind, MonitorOptions, MonitorRef, PidTarget, PortTable, ProcessId, ProcessTable,
+    UnaliasMode,
 };
 use beam_term::{atom_val, is_atom, Atom, Eterm};
 
@@ -98,8 +117,13 @@ use crate::error;
 
 /// The target `erlang:monitor(process, Target)` watches, once resolved.
 enum MonitorTarget {
-    /// A pid: `ProcessTable::monitor` resolves it itself, so an unknown pid is born down.
+    /// A local pid: `ProcessTable::monitor` resolves it itself, so an unknown pid is born down.
     Pid(ProcessId),
+    /// A **remote** (external) pid: a remote monitor, installed by
+    /// `ProcessTable::monitor_term_with_options` (it is recorded in the watcher's outgoing
+    /// remote-monitor set *and* routed as a `DOP_MONITOR_P` control signal). The term is
+    /// carried through unchanged so that entry point decomposes it into its stable parts.
+    Remote(Eterm),
     /// A registered name on `node`.
     Named {
         /// The registered name.
@@ -115,16 +139,16 @@ impl RuntimeContext<'_> {
     /// `erlang:monitor(process, Target)`: a fresh reference, with the monitor recorded on
     /// both sides (the caller's outgoing `Monitors` and the target's `monitored_by`).
     ///
-    /// `Target` may be a pid, a registered **name**, or a `{Name, Node}` pair on this node.
-    /// A pid or name the table does not hold still yields a reference, exactly as the
-    /// oracle's does: the monitor is born down and the caller is sent the matching
-    /// `{'DOWN', …}` with reason `noproc` (delivered by `beam_process`).
+    /// `Target` may be a pid, a **remote** pid, a registered **name**, or a `{Name, Node}`
+    /// pair on this node. A pid — local or remote — or a local name the table does not hold
+    /// still yields a reference, exactly as the oracle's does: the monitor is born down and
+    /// the caller is sent the matching `{'DOWN', …}` with reason `noproc` (delivered by
+    /// `beam_process`; a *remote* pid is recorded and routed instead — see the module docs).
     ///
     /// A `port` kind is served (the monitor is recorded on the runtime's **port table**, the
     /// one `open_port/2` allocates from — a non-port target is `badarg`, a registered *name*
-    /// the typed named-port-monitor gap). A remote `{Name, Node}` target and any other kind
-    /// are rejected: the former is the Milestone-1 distribution gap (the oracle answers a
-    /// reference), the latter the oracle's `badarg`.
+    /// the typed named-port-monitor gap). A remote `{Name, Node}` target is the one target
+    /// rejected as the typed capability gap, and any other kind is the oracle's `badarg`.
     pub(in crate::native) fn monitor_2(&mut self, args: &[Eterm]) -> Result<Eterm> {
         let kind = *args.first().ok_or(BeamError::BadArg)?;
         let target = *args.get(1).ok_or(BeamError::BadArg)?;
@@ -229,6 +253,19 @@ impl RuntimeContext<'_> {
                 MonitorKind::Process,
                 options,
             )?,
+            // A remote pid is a **remote monitor**: the single `beam_process` entry point for
+            // an arbitrary pid term records the outgoing monitor in the watcher's remote set
+            // and routes the `DOP_MONITOR_P` control signal (the same entry point
+            // `erlang:monitor/2` on a remote pid is *supposed* to reach — the front door used
+            // to answer `badarg` for one). A `{tag, Tag}`/`{alias, Mode}` option on a remote
+            // target is that crate's typed capability gap (the wire signal carries neither),
+            // propagated rather than silently dropped.
+            MonitorTarget::Remote(term) => self.process_table_mut().monitor_term_with_options(
+                watcher,
+                term,
+                MonitorKind::Process,
+                options,
+            )?,
             MonitorTarget::Named { name, node } => self
                 .process_table_mut()
                 .monitor_named_with_options(watcher, name, node, MonitorKind::Process, options)?,
@@ -291,13 +328,18 @@ impl RuntimeContext<'_> {
 
     /// The target `erlang:monitor(process, Target)` watches.
     ///
-    /// A pid term always resolves (the oracle returns a reference even for a pid that does
-    /// not exist, and the monitor then fires `noproc`); an atom is a name registered on
-    /// **this** node; a `{Name, Node}` pair needs `Node` to be this node (see
+    /// A **local** pid always resolves (the oracle returns a reference even for a pid that
+    /// does not exist, and the monitor then fires `noproc`); a **remote** (external) pid is a
+    /// *remote monitor* ([`MonitorTarget::Remote`]) — the oracle answers a reference there
+    /// too (measured against a real peer: `erlang:monitor(process, RemotePid)` ⇒ `#Ref<>`),
+    /// so the front door must not reject it; an atom is a name registered on **this** node; a
+    /// `{Name, Node}` pair needs `Node` to be this node (see
     /// [`Self::named_node_target`]); anything else is `badarg`, the oracle's reason.
     fn monitor_target(&self, target: Eterm) -> Result<MonitorTarget> {
-        if let Ok(pid) = ProcessId::from_eterm(target) {
-            return Ok(MonitorTarget::Pid(pid));
+        match PidTarget::from_eterm(target) {
+            Ok(PidTarget::Local(pid)) => return Ok(MonitorTarget::Pid(pid)),
+            Ok(PidTarget::Remote(_)) => return Ok(MonitorTarget::Remote(target)),
+            Err(_) => {}
         }
         if is_atom(target) {
             return Ok(MonitorTarget::Named {
@@ -316,8 +358,12 @@ impl RuntimeContext<'_> {
     /// Both elements must be atoms — anything else is the oracle's `badarg`, as is a tuple
     /// that is not a 2-tuple. A `Node` naming this runtime's own node resolves the
     /// registration locally (the `{Name, Node}` monitor the local node was seeded for at
-    /// boot); any other node needs distribution (contract A.5), which Milestone-1 does not
-    /// implement, so it is a typed capability gap rather than a fabricated local monitor.
+    /// boot); any **other** node stays the typed capability gap — it is the one remote shape
+    /// the monitor entry points cannot express: `ProcessTable::monitor_named_with_options`
+    /// resolves `Name` against **this** node's registration table (its `node` argument only
+    /// spells the `{'DOWN', …}` target), so a foreign `Node` here would watch a *local*
+    /// process the caller never asked about — a wrong result, not a gap. A remote **pid**
+    /// needs no such treatment and is served (see [`MonitorTarget::Remote`]).
     fn named_node_target(&self, target: Eterm) -> Result<MonitorTarget> {
         if !matches!(terms::tuple_arity(target), Ok(2)) {
             return Err(BeamError::BadArg);
@@ -474,7 +520,7 @@ mod tests {
     use beam_bifs::NullSink;
     use beam_term::{make_small, signed_value, NIL};
 
-    use crate::native::test_support::{atom, call, runtime};
+    use crate::native::test_support::{atom, call, remote_pid, runtime};
 
     /// Whether `term` is a reference, asked through the registry's own `is_reference/1`.
     fn is_reference(runtime: &mut crate::Runtime, term: Eterm) -> bool {
@@ -774,6 +820,69 @@ mod tests {
                 "monitor(process, {target:?}) is badarg"
             );
         }
+    }
+
+    /// **A remote pid is a remote monitor, not a capability gap.**
+    ///
+    /// Oracle-verified against a real `erl -sname` peer:
+    /// `erlang:monitor(process, RemotePid)` ⇒ `#Ref<>` and `demonitor(Ref, [info])` ⇒ `true`.
+    /// The target is classified once through `PidTarget::from_eterm`; a remote pid reaches
+    /// `ProcessTable::monitor_term_with_options`, which records the outgoing remote monitor
+    /// (and, on a node runtime, routes `DOP_MONITOR_P`). This runtime is **not** a
+    /// distributed node, so no router is installed — `ProcessTable::route` is a no-op and
+    /// the local record is all that happens — and the answer is a fresh reference, where the
+    /// front door used to answer `badarg`.
+    ///
+    /// The remote **`{Name, Node}`** shape is untouched: it is not a pid, so it still
+    /// classifies into the tuple arm and stays the typed capability gap.
+    #[test]
+    fn monitor_of_a_remote_pid_is_a_reference_and_a_remote_name_stays_a_gap() {
+        let mut runtime = runtime();
+        let process = atom(&mut runtime, "process");
+        let watcher = runtime.self_pid();
+        // The term's words live on `_remote_heap`, so the heap must outlive every use below.
+        let (_remote_heap, remote) = remote_pid(&mut runtime, "elsewhere@host");
+
+        let reference = monitor_target(&mut runtime, remote);
+        assert!(
+            is_reference(&mut runtime, reference),
+            "erlang:monitor/2 on a remote pid answers a reference"
+        );
+        let recorded = runtime.processes().remote_monitors(watcher);
+        assert_eq!(recorded.len(), 1, "the outgoing remote monitor is recorded");
+        assert_eq!(
+            recorded[0].remote,
+            beam_process::RemotePid::from_eterm(remote).expect("an external pid"),
+            "the record names the watched remote pid"
+        );
+        assert_eq!(recorded[0].kind, MonitorKind::Process, "a `process` kind");
+        assert_eq!(
+            monitor_count(&runtime, watcher),
+            0,
+            "a remote monitor installs no *local* monitor"
+        );
+
+        // The answered reference is the very one `demonitor/1` recognises.
+        let answer = call(&mut runtime, "erlang", "demonitor", &[reference]).expect("demonitor/1");
+        assert_eq!(atom_name(&runtime, answer), Some("true"));
+        assert!(
+            runtime.processes().remote_monitors(watcher).is_empty(),
+            "demonitor/1 removes the recorded remote monitor"
+        );
+
+        // A `{Name, OtherNode}` target is still the typed capability gap: `Name` would be
+        // resolved against **this** node's registration table, so a foreign node would watch
+        // a local process the caller never asked about.
+        let name = atom(&mut runtime, "myreg");
+        let other = atom(&mut runtime, "elsewhere@host");
+        let remote_name = make_tuple(&mut runtime, &[name, other]);
+        let error = call(&mut runtime, "erlang", "monitor", &[process, remote_name])
+            .expect_err("a remote {Name, Node} monitor is the typed gap");
+        assert_eq!(
+            crate::error::unsupported_reason(&error).as_deref(),
+            Some("erlang:monitor/2 on a {Name, Node} of another node"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -357,9 +357,9 @@ fn slot_indices_stay_valid_across_a_sweep() -> Result<()> {
     Ok(())
 }
 
-/// The sweep runs **on the process path**: a rooted collection reclaims a payload the caller
-/// declared dead, with no explicit `sweep_off_heap_binaries` call — and does not touch an
-/// undeclared one beside it.
+/// The reclamation runs **on the process path**: a rooted collection reclaims a payload the caller
+/// declared dead — and one no on-heap handle names — with no explicit `sweep_off_heap_binaries`
+/// call, while a still-reachable one beside them survives.
 #[test]
 fn a_collection_drives_the_off_heap_sweep() -> Result<()> {
     let alloc = test_allocator("offheap-binaries-collection");
@@ -372,18 +372,26 @@ fn a_collection_drives_the_off_heap_sweep() -> Result<()> {
     let kept_slot = process.register_off_heap_binary(kept.clone());
     assert!(process.declare_off_heap_binary_dead(doomed_slot));
 
-    // No explicit sweep: the collection's last step is the sweep.
+    // A genuine on-heap reference to `kept`, so the reachability half of the reclamation step
+    // classifies it live and retains it.
+    // SAFETY: the process's own handle plus the local `kept` keep the payload alive, and the
+    // 8-word pair fits the young heap.
+    let root = unsafe { refc_binary_term(process.heap_mut(), kept.data_ptr(), payload().len()) };
+    process.registers_mut().x_mut().set_live(1)?;
+    process.registers_mut().x_mut().set(0, root)?;
+
+    // No explicit sweep: the collection's last step is the reclamation.
     process.collect()?;
 
     assert!(
         process.off_heap_binary(doomed_slot).is_none(),
         "the collection reclaimed the declared-dead entry"
     );
-    let survivor = process.off_heap_binary(kept_slot).expect("the undeclared entry survived");
+    let survivor = process.off_heap_binary(kept_slot).expect("the reachable entry survived");
     assert_eq!(survivor.data_ptr(), kept.data_ptr());
     assert_eq!(survivor.as_bytes(), &payload()[..]);
     assert_eq!(process.off_heap_binary_count(), 1);
-    assert_eq!(alloc.stats().live_blocks, 1, "exactly the declared-dead payload was freed");
+    assert_eq!(alloc.stats().live_blocks, 1, "exactly the dead and unreachable payload was freed");
     Ok(())
 }
 
@@ -477,10 +485,12 @@ fn a_faithful_liveness_predicate_can_drive_the_sweep() -> Result<()> {
     Ok(())
 }
 
-/// A collection leaves the owned off-heap list alone when nothing is declared dead — the
-/// conservative default that makes the sweep safe to run on every collection.
+/// A collection releases nothing that is still **reachable**: with no declaration at all, a payload
+/// named by an on-heap `BinRef` survives both halves of the reclamation step (the reachability walk
+/// and the conservative declared-dead sweep), and the exact bookkeeping — bytes, count, reference
+/// count — is unchanged.
 #[test]
-fn a_collection_without_a_declaration_releases_nothing() -> Result<()> {
+fn a_collection_releases_nothing_that_is_still_reachable() -> Result<()> {
     let alloc = test_allocator("offheap-binaries-conservative");
     let binary = off_heap_payload(&alloc)?;
 
@@ -488,10 +498,17 @@ fn a_collection_without_a_declaration_releases_nothing() -> Result<()> {
     let slot = process.register_off_heap_binary(binary.clone());
     let before = process.off_heap_binary_bytes();
 
+    // A genuine on-heap reference to the payload, rooted in `x(0)`.
+    // SAFETY: the process's own handle plus the local `binary` keep the payload alive, and the
+    // 8-word pair fits the young heap.
+    let root = unsafe { refc_binary_term(process.heap_mut(), binary.data_ptr(), payload().len()) };
+    process.registers_mut().x_mut().set_live(1)?;
+    process.registers_mut().x_mut().set(0, root)?;
+
     process.collect()?;
     process.collect()?;
 
-    let held = process.off_heap_binary(slot).expect("the entry survived both collections");
+    let held = process.off_heap_binary(slot).expect("the reachable entry survived both collections");
     assert_eq!(held.as_bytes(), &payload()[..]);
     assert_eq!(held.refcount(), 2);
     assert_eq!(process.off_heap_binary_count(), 1);

@@ -40,7 +40,7 @@ use beam_bifs::{
 use beam_common::{BeamError, Result};
 use beam_engine::ExecutionContext;
 use beam_loader::Module;
-use beam_process::{MonitorRef, PortId, ProcessId, ProcessTable};
+use beam_process::{ProcessId, ProcessTable};
 use beam_term::{atom_val, is_atom, Atom, AtomTable, Eterm};
 
 use crate::codeserver::CodeServer;
@@ -48,7 +48,6 @@ use crate::error;
 use crate::nif::{NifEntry, NifHostImpl};
 use crate::runtime::Runtime;
 
-use super::alias::alias_destination;
 use super::RuntimeContext;
 
 /// A cloneable, shared `io:format` destination.
@@ -260,11 +259,22 @@ impl DictHook for DictBridge<'_> {
 /// * A **reference alias** (an `erlang:alias/1` / `erlang:monitor/3` `{alias, Mode}` reference) —
 ///   the message goes to the alias **owner**, and the reference is consumed after the successful
 ///   delivery (see [`SendBridge::resolve`] and [`super::alias`]).
-/// * A destination the oracle accepts but this runtime cannot serve yet is an honest typed
-///   **capability gap** rather than a fabricated value:
-///   * a **port** (`erlang:send(Port, Data)`, `bif.c:2551-2613`) needs the port subsystem's
-///     write path;
-///   * a **`{Name, Node}`** tuple (`bif.c:2614-2667`) is a distributed send (contract A.5).
+/// * An **external (remote-node) pid** — a `DOP_SEND[_SENDER]` control message on the link to
+///   that pid's node ([`SendBridge::resolve`]'s `RemotePid` arm), which needs the link to be
+///   **established** already. An unconnected node (or a pid on another node's creation) is a
+///   typed error, never a silent drop and never a fabricated success.
+/// * A **`{Name, Node}`** tuple of atoms (`bif.c:2614-2667`). When `Node` names **this** node
+///   (`node()`, whatever the spelling — `nonode@nohost` on a runtime with no `-name`/`-sname`
+///   included) the pair is a **local** named send: the C resolves it with the very same
+///   `erts_whereis_name_to_id` (`bif.c:2628-2654`, the `dep == erts_this_dist_entry` arm) and
+///   reports success without delivering when nothing is registered under `Name` — it does *not*
+///   fall back to `SEND_BADARG`. Any other node is a `DOP_REG_SEND` to the process registered as
+///   `Name` on it; on a runtime that is **not** a distributed node (`-name`/`-sname` unset, so
+///   there is no link table at all) *that* stays the oracle-independent typed capability gap it
+///   has always been, so a non-node VM never silently drops a remote message.
+///   ([`SendBridge::resolve`]'s `RemoteName`/`Local` arms.)
+/// * A **port** (`erlang:send(Port, Data)`, `bif.c:2551-2613`) needs the port subsystem's write
+///   path, so it is the honest typed **capability gap** rather than a fabricated value.
 /// * Anything else (`42`, a list, a 3-element tuple, …) is the oracle's `error:badarg` (the
 ///   C's final `else` arm, `bif.c:2668-2674` and the tuple shape checks at `bif.c:2617-2621`).
 pub(super) struct SendBridge<'a> {
@@ -287,103 +297,120 @@ pub(super) struct SendBridge<'a> {
     pub(super) engines: Option<&'a crate::runner::RunnerState>,
 }
 
+/// A `send` destination, classified by [`SendBridge::resolve`] — the one shared
+/// [`classify_send_destination`](super::send::classify_send_destination) the compiled `Dest !
+/// Msg`, the `-eval` `!` and this BIF route all use, re-exported here for the BIF arm's match.
+use super::send::{classify_send_destination, SendDestination};
+
 impl SendBridge<'_> {
-    /// Resolves a `send` destination term to the internal pid term to deliver to, plus the
-    /// **alias reference to consume** once the message has been delivered (`None` for every
-    /// other destination).
+    /// Resolves a `send` destination term to the [`SendDestination`] the delivery runs against.
+    ///
+    /// The classification itself lives in
+    /// [`classify_send_destination`](super::send::classify_send_destination) — the **one** copy
+    /// the compiled `!`, the `-eval` `!` and this BIF route share, so the three can never drift.
+    /// This only picks the table local destinations resolve against: the pass table in a
+    /// scheduler slice, else the runtime's own (the same choice
+    /// `RuntimeContext::process_table`/`process_table_mut` make on the outer context).
     ///
     /// # Errors
     ///
-    /// [`BeamError::BadArg`] for the destinations the oracle rejects with `badarg`; a typed
-    /// capability gap ([`crate::error::unsupported`]) for the ones it accepts but this
-    /// runtime cannot serve yet (see the struct docs).
-    fn resolve(&self, to: Eterm) -> Result<(Eterm, Option<MonitorRef>)> {
-        // The table every destination is resolved against: the pass table in a scheduler
-        // slice, else the runtime's own (the same choice `process_table`/`process_table_mut`
-        // make on the outer context).
+    /// As the shared classifier: [`BeamError::BadArg`] for the destinations the oracle rejects
+    /// with `badarg`, and a typed capability gap ([`crate::error::unsupported`]) for the ones it
+    /// accepts but this runtime cannot serve — including the `{Name, Node}` pair on a runtime
+    /// that is **not** a distributed node, which is the message the non-distributed corpus has
+    /// always pinned.
+    fn resolve(&self, to: Eterm) -> Result<SendDestination> {
         let table: &ProcessTable = match self.mailbox_table {
             Some(ref table) => table,
             None => &self.runtime.processes,
         };
-        if ProcessId::is_process(to) {
-            return Ok((to, None));
-        }
-        if is_atom(to) {
-            return match table.whereis(atom_val(to)) {
-                Some(pid) => Ok((pid.to_eterm(), None)),
-                // An atom name no process is registered under: the oracle's only failing
-                // (correctly typed) destination (`bif.c:2536`).
-                None => Err(BeamError::BadArg),
-            };
-        }
-        if let Some((owner, reference)) = alias_destination(&*self.runtime, table, to) {
-            // A live **alias**: the message goes to its owner and the reference is consumed
-            // after a successful delivery (the C's `send_altact_message` arm, `bif.c:2478-2492`).
-            return Ok((owner.to_eterm(), Some(reference)));
-        }
-        if PortId::from_eterm(to).is_ok() {
-            return Err(error::unsupported(
-                "erlang:send/2 to a port: the port write path is not wired",
-            ));
-        }
-        if let Some((name, node)) = two_atom_tuple(self.runtime.code_server.atoms(), to) {
-            return Err(error::unsupported(&format!(
-                "erlang:send/2 to {name}@{node}: distributed send is not implemented"
-            )));
-        }
-        Err(BeamError::BadArg)
+        classify_send_destination(&*self.runtime, table, to)
     }
 }
 
 impl SendHook for SendBridge<'_> {
     fn send(&mut self, to: Eterm, term: Eterm) -> Result<()> {
-        let (target, reference) = self.resolve(to)?;
-        // The nested context inherits the sender's identity (pid + table) so the delivery
-        // runs exactly as the compiled `send` instruction's does. It is scoped to the
-        // delivery: it borrows the runtime **and** the pass table, so both must be free again
-        // before the alias can be consumed through the table it was resolved against.
-        let delivered = {
-            let mut ctx = RuntimeContext {
-                runtime: self.runtime,
-                output: self.output.clone(),
-                mailbox_pid: self.mailbox_pid,
-                mailbox_table: self.mailbox_table.as_deref_mut(),
-                may_pump_scheduler: self.may_pump_scheduler,
-                current_module: self.current_module.clone(),
-                engines: self.engines,
-                // A **nested** run: the delivery itself allocates no roots to relocate, and
-                // the latch must never be inherited (see `context::gc`).
-                gc_armed: false,
-                // A nested run keeps its own (empty) memo: see `super::DispatchMemo`.
-                dispatch_memo: super::DispatchMemo::default(),
-            };
-            match ctx.send_message(target, term) {
-                // No process for the pid: the C drops the message and reports success
-                // (`bif.c:2478-2480`); the table's typed not-found is that same case.
-                Err(BeamError::TermNotFound) => Ok(()),
-                delivered => delivered,
+        match self.resolve(to)? {
+            SendDestination::Local { target, reference } => {
+                // The nested context inherits the sender's identity (pid + table) so the
+                // delivery runs exactly as the compiled `send` instruction's does. It is scoped
+                // to the delivery: it borrows the runtime **and** the pass table, so both must
+                // be free again before the alias can be consumed through the table it was
+                // resolved against.
+                let delivered = {
+                    let mut ctx = RuntimeContext {
+                        runtime: self.runtime,
+                        output: self.output.clone(),
+                        mailbox_pid: self.mailbox_pid,
+                        mailbox_table: self.mailbox_table.as_deref_mut(),
+                        may_pump_scheduler: self.may_pump_scheduler,
+                        current_module: self.current_module.clone(),
+                        engines: self.engines,
+                        // A **nested** run: the delivery itself allocates no roots to
+                        // relocate, and the latch must never be inherited (see `context::gc`).
+                        gc_armed: false,
+                        // A nested run keeps its own (empty) memo: see `super::DispatchMemo`.
+                        dispatch_memo: super::DispatchMemo::default(),
+                    };
+                    match ctx.send_message(target.to_eterm(), term) {
+                        // No process for the pid: the C drops the message and reports success
+                        // (`bif.c:2478-2480`); the table's typed not-found is that same case.
+                        Err(BeamError::TermNotFound) => Ok(()),
+                        delivered => delivered,
+                    }
+                };
+                // Only a **successful** delivery consumes the alias.
+                delivered?;
+                if let Some(reference) = reference {
+                    let table: &mut ProcessTable = match self.mailbox_table {
+                        Some(ref mut table) => table,
+                        None => &mut self.runtime.processes,
+                    };
+                    table.alias_reply_delivered(reference)?;
+                }
+                Ok(())
             }
-        };
-        // Only a **successful** delivery consumes the alias.
-        delivered?;
-        if let Some(reference) = reference {
-            let table: &mut ProcessTable = match self.mailbox_table {
-                Some(ref mut table) => table,
-                None => &mut self.runtime.processes,
-            };
-            table.alias_reply_delivered(reference)?;
+            // A remote destination is transmitted by the distribution client, which needs
+            // `&mut Runtime` — so the send happens here rather than in `resolve`. Its typed
+            // error is propagated: an unestablished link is a real failure, never a silent
+            // drop. This is the **same** transmission the compiled `!` runs
+            // (`RuntimeContext::deliver_remote`).
+            remote => {
+                let mut ctx = RuntimeContext {
+                    runtime: self.runtime,
+                    output: self.output.clone(),
+                    mailbox_pid: self.mailbox_pid,
+                    mailbox_table: self.mailbox_table.as_deref_mut(),
+                    may_pump_scheduler: self.may_pump_scheduler,
+                    current_module: self.current_module.clone(),
+                    engines: self.engines,
+                    gc_armed: false,
+                    dispatch_memo: super::DispatchMemo::default(),
+                };
+                ctx.deliver_remote(remote, to, term)
+            }
         }
-        Ok(())
     }
 }
 /// The `{Name, Node}` pair of an atom/atom 2-tuple destination, if `to` is one.
 ///
 /// The C only treats a 2-tuple of **atoms** as a remote send (`bif.c:2614-2621`); every other
-/// tuple shape is `SEND_BADARG`. Milestone-1 has no distributed send, so this only feeds the
-/// capability-gap message. A non-2-tuple, a non-tuple, or a tuple with a non-atom element
-/// yields `None` (which the caller turns into `badarg`, the oracle's reason). The two atoms are
-/// resolved to their names through the shared table, so the diagnostic names the destination.
-fn two_atom_tuple(atoms: &AtomTable, to: Eterm) -> Option<(String, String)> {
+/// tuple shape is `SEND_BADARG`. A non-2-tuple, a non-tuple, or a tuple with a non-atom element
+/// yields `None` (which the caller turns into `badarg`, the oracle's reason).
+///
+/// The two **interned atoms** are handed back alongside their **names**: the atoms are what the
+/// classifier compares against this runtime's own node identity and resolves a local `whereis`
+/// with, the names what the wire transmission and the diagnostic spell. Both names are resolved
+/// here through the shared table, so a pair the table cannot spell (it cannot arise for an
+/// interned atom) is the same `None` as a shape the C rejects.
+///
+/// Shared with the destination classifier
+/// ([`classify_send_destination`](super::send::classify_send_destination)), which is why it is
+/// `pub(super)`.
+pub(super) fn two_atom_tuple(
+    atoms: &AtomTable,
+    to: Eterm,
+) -> Option<(Atom, Atom, String, String)> {
     if beam_engine::terms::tuple_arity(to).ok()? != 2 {
         return None;
     }
@@ -392,9 +419,11 @@ fn two_atom_tuple(atoms: &AtomTable, to: Eterm) -> Option<(String, String)> {
     if !is_atom(name) || !is_atom(node) {
         return None;
     }
-    let name = atoms.name(atom_val(name))?.to_string();
-    let node = atoms.name(atom_val(node))?.to_string();
-    Some((name, node))
+    let name_atom = atom_val(name);
+    let node_atom = atom_val(node);
+    let name = atoms.name(name_atom)?.to_string();
+    let node = atoms.name(node_atom)?.to_string();
+    Some((name_atom, node_atom, name, node))
 }
 
 /// The `beam_bifs` NIF-loading seam: `dlopen`s a NIF library and registers it with the runtime.

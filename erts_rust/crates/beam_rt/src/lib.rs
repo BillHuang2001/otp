@@ -48,9 +48,13 @@
 //! * [`format`] — term printing, which drives the registered `io:format/2` `~p`/`~w` printer.
 //! * [`native`] — the runtime-native BIF floor (`halt`, `display`, `io:put_chars`,
 //!   `erlang:apply`, `erlang:system_info`, `init:get_argument`) consulted before the registry.
-//! * [`dist`] — the **distributed node** (contract A.5, Phase 1): the `epmd`
-//!   registration, the bound distribution listener and the accepting half of the
-//!   `'N'` handshake, pumped from [`Runtime`]'s scheduler pass.
+//! * [`dist`] — the **distributed node** (contract A.5): the `epmd`
+//!   registration, the bound distribution listener, the accepting half of the
+//!   `'N'` handshake and the inbound delivery sink, pumped from [`Runtime`]'s
+//!   scheduler pass.
+//! * [`dist_client`] — the **connecting** half (contract A.5): the outbound client
+//!   handshake and the `beam_process::DistSignalRouter` that turns a
+//!   locally-initiated link/monitor/exit into wire `DOP_*`.
 //!
 //! # Contracts
 //!
@@ -73,6 +77,7 @@ pub mod config;
 pub mod context;
 pub mod crash_dump;
 pub mod dist;
+pub mod dist_client;
 pub mod error;
 pub mod eval;
 pub mod format;
@@ -99,6 +104,7 @@ pub use crate::format::{term_to_string, term_to_string_w};
 pub use crate::info::{system_info_value, InfoValue, SUPPORTED_KEYS};
 pub use crate::port::{PortName, PortRegistry, RuntimePorts, StreamType, PORT_INFO_ATOMS};
 pub use crate::dist::{DistConnection, DistNode, NodeName};
+pub use crate::dist_client::DistClient;
 pub use crate::runtime::Runtime;
 /// The conventional glob-import surface for downstream crates.
 ///

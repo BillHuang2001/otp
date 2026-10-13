@@ -310,11 +310,13 @@ SMP pool:
     shifted-in entry (the list never shifts/reorders/reuses a slot) — and a fresh registration appends at
     a new index. Plus: `a_sweep_never_frees_a_payload_another_owner_still_holds` (the no-over-decrement
     half), `a_collection_drives_the_off_heap_sweep` (a rooted collection reclaims a declared death on its
-    own, leaving an undeclared sibling untouched), `registering_a_payload_twice_keeps_one_slot_and_one_reference`
+    own, leaving an undeclared sibling untouched — its kept payload is rooted via a real
+    `[BinRef][ErlSubBits]` pair in `x(0)`, so the reachability half keeps it), `registering_a_payload_twice_keeps_one_slot_and_one_reference`
     (the `MSO(p)` one-reference-per-object invariant), `a_dropped_process_releases_the_binaries_it_still_owns`
     (the process-death reclamation endpoint of the conservative fallback), `a_faithful_liveness_predicate_can_drive_the_sweep`
     (the `retain_off_heap_binaries` seam for a party that *can* walk the heap) and
-    `a_collection_without_a_declaration_releases_nothing` (the conservative default). **Every assertion
+    `a_collection_releases_nothing_that_is_still_reachable` (a collection leaves a still-rooted payload
+    alone — the payload is rooted in `x(0)`; the reachability-driven half is in entry 41). **Every assertion
     fails to compile on the pre-change code** — HEAD had no process-owned off-heap list and no sweep on
     the process path, so the registration/read/sweep API does not exist; the released-count and
     slot-resolution assertions have no old-code counterpart (there was no list to release from).
@@ -394,6 +396,84 @@ SMP pool:
     checked against the receiver's own nursery observables (`minor_gcs`, the young space's
     base/used words, the mature generation's used words); no sleeps / wall-clock bounds / oracle.
 
+41. `reference_ids.rs` (4 tests) — **PIN — HAZARD 2, the two reference-id spaces colliding on `=:=`**
+    (a documented divergence, **not closable from this crate**): the crate's [`RefAllocator`] is
+    monotone from `0`, so two independent instances hand out the same ids
+    (`two_independent_reference_allocators_start_at_the_same_zero`); a `ProcessTable`-minted
+    `erlang:alias/1` reference and an **independent** allocator's (`beam_rt::Runtime::refs`'s shape)
+    `make_ref/0` reference carry the same id and are the **byte-identical** four-word block
+    (`the_process_table_and_an_independent_allocator_mint_the_same_reference_for_the_same_id`); the
+    runtime's `beam_term::boxed::write_internal_ref` block (`beam_bifs`'s `make_ref_thing` shape) is
+    the same term as a `MonitorRef::to_eterm` block with the same id
+    (`a_runtime_minted_bare_reference_and_a_monitor_reference_with_equal_ids_are_exactly_equal`);
+    and the comparison mechanism — `beam_term::compare::cmp_refs` keys on the payload words
+    (`[arity, node, serial, id]`), and both producers pin `node`/`serial` to `0`, so the shared id is
+    the only distinguishing word
+    (`the_reference_payload_is_compared_word_for_word_leaving_only_the_id`, which also shows a block
+    differing only in `node` **would** be distinguished). The module docs state the exact reason it
+    cannot be closed here (the id-only `beam_codec` internal-reference codec; the two independent
+    allocators; `beam_rt`'s monotone-from-0 dependency) and name the owner (a cross-crate change:
+    extend the ref codec to preserve the whole payload, or unify the allocators via `beam_rt`). No
+    oracle cross-check — the oracle has **one** id space, so it cannot produce the colliding pair.
+    Deterministic — no sleeps / wall-clock bounds / oracle.
+42. `off_heap_reachability.rs` (9 tests) — the **reachability-driven** liveness decision for the
+    **process-owned** off-heap refc binaries (`Process::sweep_off_heap_binaries_reachable`, over
+    `beam_gc::AnyCollector::for_each_reachable_object` + the read-only `gather_scan_roots` root set;
+    `Process::run_rooted_collection` runs it automatically over the roots the collection just
+    gathered). `a_payload_reachable_through_an_on_heap_handle_is_retained`: a 200-byte payload named
+    by a real on-heap `[BinRef][ErlSubBits]` pair rooted in `x(0)` is kept — the sweep returns 0, the
+    slot resolves with the same `data_ptr`/bytes/refcount, and the injected `AllocRef`'s `live_blocks`
+    stays 1. `an_unreachable_payload_is_reclaimed`: a payload whose registration moved the **sole**
+    handle into the process and that no on-heap `BinRef` names is freed at reference count 0 (the
+    injected allocator's `live_blocks`/`live_bytes` drop to 0), its slot answers `None`, and a second
+    sweep releases nothing (no double free).
+    `a_payload_reached_only_through_a_nested_container_is_retained`: the walk descends the container
+    shapes — a payload reached only through a **tuple**, a **list** cell, or a **flat map** value
+    (`write_map`) survives, while a fourth payload registered but rooted nowhere is reclaimed in the
+    same sweep. `a_payload_reached_through_any_root_region_is_retained`: a payload reached only through
+    one of the process's **in-heap sub-rootsets** — a queued `Message` payload, a dict value, a saved
+    BIF/NIF arg, or a `PendingSignal` reason — is kept (so the scan-side `gather_scan_roots` cannot lag
+    the collection's own gather), and only the unrooted one is released.
+    `a_process_with_unpublished_roots_is_not_reachability_swept`: a **relocation-exempt** process and a
+    `Running` one each return `Ok(0)` and retain every owned payload (the **decline valve** — an
+    incomplete root set could miss a live `BinRef` and dangle); `a_declined_collection_still_honours_a_declared_death`:
+    the conservative declared-dead sweep still fires for such a process.
+    `the_reachability_sweep_keeps_dedup_and_slot_stability`: the `MSO(p)` one-reference-per-payload
+    dedup and slot stability hold across a reachability sweep;
+    `a_declared_death_is_honoured_over_the_reachability_verdict`: a caller's `declare_off_heap_binary_dead`
+    wins even when the handle is still on the heap (the conservative half runs after the reachability
+    half); `a_collection_that_relocates_the_handle_keeps_the_payload`: a `Process::collect` that
+    relocates the heap (`handle_before != handle_after`) keeps the payload at the same `data_ptr`.
+    Deterministic — a fixed 200-byte position-dependent payload (> `ERL_ONHEAP_BINARY_LIMIT`), an
+    **injected** `AllocRef` so a payload block's alloc/free is observable in isolation, and explicit
+    `sweep`/`collect` calls; no sleeps / wall-clock bounds / oracle.
+43. `decline_gate_builders.rs` (13 tests) — the **collection-decline path of the six
+    `build_signal_message`-only signal builders**, the gap the crate `CONTEXT.md`'s Known Issues
+    recorded. Each builder is exercised through its public trigger with a saturated nursery (three
+    free words — one short of the four-word first allocation every one of the six builds makes) under
+    **both** valves, then asserted to deliver the notification **fragment-resident** with the
+    receiver's nursery untouched (`minor_gcs`, the young space's `base`/`used_words` and the mature
+    used words all unchanged): (1) `deliver_noproc_down` — a born-down `monitor(process, P)` on a
+    dead/never-existing pid, `{'DOWN', Ref, process, P, noproc}` (`envelope from` = the dead pid);
+    (2) `deliver_named_noproc_down` — `monitor_named(process, Name, Node)` on an unregistered name,
+    `{'DOWN', Ref, process, {Name, Node}, noproc}` (`from` = the `system` atom, the `{Name,Node}`
+    target materialised inside the fragment's build); (3) `enqueue_remote_down_message` —
+    `node_down` for a recorded remote monitor, `{'DOWN', Ref, process, RemotePid, Reason}` (`from` =
+    the node atom); (4) `enqueue_remote_exit_message` — `node_down` for a **trapping** remote link,
+    `{'EXIT', RemotePid, Reason}`; (5) `enqueue_port_down_message` — `port_closed` for a port
+    monitor, `{'DOWN', Ref, port, Port, Reason}` (`from` = the port); (6)
+    `enqueue_port_exit_message` — `port_closed` for a **trapping** port link, `{'EXIT', Port,
+    Reason}`. Each of the six gets one case for the **crate-owned** valve (a **relocation-exempt**
+    receiver) and one for the **host** `CollectionGate` (with the crate-owned predicate asserted
+    false, so only the host could have declined), every case also asserting the delivered term's
+    whole shape against the expected tuple (`compare::eq`) and FIFO behind the fixture's filler. The
+    thirteenth test `without_a_decline_each_builder_collects_and_grows` is the **shared control**:
+    the identical trigger with no gate and no exemption takes the ordinary arm for all six builders
+    (one collection, an on-heap message, no fragment), so the fragment route is an *additional*
+    decline, never a replacement. Deterministic — no sleeps / wall-clock bounds / oracle; each test
+    was verified sensitive to the guard (dropping a builder's `decline` argument flips its gate case
+    to "a declined relocation must not collect").
+
 ## Constraints
 - **Anti-flakiness (BINDING).** Every assertion is forced by **synchronization**, never a bare
   `std::thread::sleep`: `mpsc` channels + `recv_timeout` carry the completion signals,
@@ -412,16 +492,17 @@ SMP pool:
 - Run the whole crate gate with
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_process` (never `cd`,
   sandbox `$HOME` is read-only). Cross-checks against the real system ERTS belong to the sibling
-  `../../../tools/differential/` harness, not here. Current: **484 passed, 0 failed, 1 ignored** (178 in-module unit tests + 305
-  across the 40 integration targets here + 1 doctest; the single ignore is the documented
+  `../../../tools/differential/` harness, not here. Current: **511 passed, 0 failed, 1 ignored** (179 in-module unit tests + 331
+  across the 43 integration targets here + 1 doctest; the single ignore is the documented
   non-yielding-runner hang failure mode in `preemption.rs`).
 
 ## Routing Table
 - `scheduler.rs`, `messaging.rs`, `signals.rs`, `gc.rs`, `priority.rs`, `pending_signals.rs`,
   `preemption.rs`, `dict.rs`, `fragments.rs`, `scheduler_ports.rs`, `exhaustion.rs`,
-  `signal_exhaustion.rs`, `signal_fragment_fallback.rs`, `decline_gate.rs`, `gc_exemption.rs`, `message_relocation.rs`,
+  `signal_exhaustion.rs`, `signal_fragment_fallback.rs`, `decline_gate.rs`, `decline_gate_builders.rs`, `gc_exemption.rs`, `message_relocation.rs`,
   `gc_refc_binary_message.rs`,
-  `off_heap_send_isolation.rs`, `message_from_is_immediate.rs`, `off_heap_binaries.rs` →
+  `off_heap_send_isolation.rs`, `message_from_is_immediate.rs`, `off_heap_binaries.rs`,
+  `off_heap_reachability.rs` →
   the single-threaded scheduler (incl. the port-aware slice cleanup), mailbox, signals, GC roots, PCB state,
   pre-emption/fairness, the collect-grow-and-retry exhaustion path of `Process::deliver` and the
   `{'EXIT',…}`/`{'DOWN',…}` signal builders (both the enqueue-time reason copy and the
@@ -429,8 +510,10 @@ SMP pool:
   roots or the host `CollectionGate` — at either refusal site), the host-controllable GC relocation
   exemption, the
   collection's queued-message re-install (a fragment-resident/off-heap-owning message keeps its whole
-  envelope across a collect), and the **process-owned off-heap refc-binary list** (registration, the
-  caller-declared sweep on the collection path, slot stability, and the conservative predicate)
+  envelope across a collect), and the **process-owned off-heap refc-binary list** (registration, slot
+  stability, the conservative declared-dead sweep on the collection path, and the
+  **reachability-driven** sweep — its root set, its `HEADER_BIN_REF` payload-pointer test, the
+  nested-container descent, and its unpublished-roots decline valve)
 - `registry_monitors.rs`, `monitor_tag.rs`, `capability_inventory.rs`, `process_info_source.rs`,
   `spawn_options.rs`, `collector_dispatch.rs`, `lifecycle_oracle.rs` → the process-control surface: name registry + monitors (incl.
   the `monitor/3` user tag), the typed-error/capability inventory, the `process_info` item→accessor
@@ -446,6 +529,10 @@ SMP pool:
 - `terminate_best_effort.rs` → the best-effort termination cascade (a failing `DistSignalRouter` /
   an unreachable peer heap must not abort the death; the observer and the port-monitor cleanup still
   run)
+- `reference_ids.rs` → the **HAZARD-2 pin**: the two independent reference-id spaces
+  (`ProcessTable`'s `RefAllocator` vs `beam_rt::Runtime::refs`) collide on `=:=` — a documented
+  divergence, not closable from this crate (the owner and the blocked avenues are named in the
+  file's module docs)
 - `dict_oracle.rs`, `registry_monitors.rs`, `monitor_tag.rs`, `lifecycle_oracle.rs`,
   `port_monitor_cleanup.rs` (oracle tests) →
   `erl`-cross-checked process-dictionary, process-control, lifecycle and port-monitor evidence (loud skip

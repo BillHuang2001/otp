@@ -29,8 +29,8 @@ on-demand external-module load**. A key in the `erlang` namespace that none of t
 classified as the capability gap (`unsupported: …`, CLI exit 3) or the bare `error:undef`
 (`../error.rs`).
 
-`FLOOR_MODULES: [&str; 9]` (`native.rs:122`) = `application`, `code`, `erl_ddll`, `erlang`,
-`erts_internal`, `init`, `io`, `os`, `prim_file`. Every one is a module the code server can **also**
+`FLOOR_MODULES: [&str; 11]` (`native.rs:129`) = `application`, `code`, `erl_ddll`, `erlang`,
+`erts_internal`, `init`, `io`, `net_adm`, `net_kernel`, `os`, `prim_file`. Every one is a module the code server can **also**
 load as a `.beam`, so it gates `RuntimeContext::resolve_external_call`, which must answer `Ok(None)`
 for all of them — entering the body would run it *instead of* the host implementation. It does **not**
 gate `call_bif`'s dispatch: a `beam_bifs` registry key in a floor namespace the floor has no arm
@@ -47,7 +47,8 @@ Drift-guarded by `native.rs::tests::every_floor_module_is_a_real_try_native_arm`
 | `init.rs` | `init:get_argument/1` (a command-line flag from `RuntimeConfig::init_args`, plus the four **automatic** flags `root`/`home`/`progname`/`bindir`), `get_arguments/0`, `get_plain_arguments/0`, `get_status/0`, `script_id/0`, `stop/0,1`, `restart/0`, `boot/1` |
 | `code.rs` | `code:get_path/0`, `all_loaded/0`, `which/1`, `is_loaded/1`, `is_sticky/1,2`, `ensure_loaded/1`, `load_file/1`, `lib_dir/0,1,2`, `priv_dir/1`, `root_dir/0`, `get_mode/0` |
 | `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) | `erlang:make_ref/0`, `spawn/1,2,3`, `spawn_link/1,2,3`, `spawn_opt/2,3,4`, `spawn_monitor/1,2,3,4`, `ports/0`, `processes/0`, `pre_loaded/0`, `group_leader/0`, `whereis/1`, `register/2`, `unregister/1`, `module_loaded/1`; the reference-alias family (`alias/0,1`, `unalias/1`); the monitor family (`monitor/2,3`, `demonitor/1,2`) in `process/monitor.rs`; `exit/2,3` in `process/exit.rs` |
-| `node.rs` | `erlang:is_alive/0`, `get_cookie/0`, `set_cookie/2`, `nodes/0,1` |
+| `node.rs` | `erlang:is_alive/0`, `get_cookie/0`, `set_cookie/2` |
+| `net.rs` | `erlang:nodes/0,1`, `net_adm:ping/1`, `net_kernel:connect_node/1` |
 | `memory/` | `erlang:process_info/1,2` — the per-process introspection surface (+ `memory/tests.rs`) |
 | `group_leader.rs` | `erlang:group_leader/2` + `erts_internal:group_leader/2,3` over `Runtime::group_leaders` |
 | `port.rs` | `erlang:port_command/2,3`, `erlang:port_control/3` (the driver's `control` callback, with the oracle's list-vs-binary reply rule) and the closed-port half of `erlang:port_info/1,2` (the `PortHook` seam cannot express those) |
@@ -130,11 +131,9 @@ is raised directly (non-trapping caller, or the untrappable `kill`) or delivered
 self(), R}` via `RuntimeContext::deliver_message` (trapping caller and `Reason != kill`) — because
 the sibling scheduler defers a self-directed signal that arrives while the pid is `Running`, which
 it is inside a slice. `exit/3` accepts ONLY the bare atom `priority` as an option (`[{priority,
-high}]` is `badarg`). The node surface (`node.rs`) reads the runtime's `DistNode`/cookie/local-node
-state: `get_cookie/0` is the atom `nocookie` while the node is not alive, `set_cookie/2` raises
+high}]` is `badarg`). The node surface is split: `node.rs` reads the runtime's `DistNode`/cookie/local-node state — `get_cookie/0` is the atom `nocookie` while the node is not alive, `set_cookie/2` raises
 `badarg` for a non-atom node/cookie (and for this runtime's own node name on a non-alive VM) and
-`distribution_not_started` for a well-typed remote pair, `nodes/0,1` answers this runtime's own
-node set.
+`distribution_not_started` for a well-typed remote pair — and `net.rs` answers the node set and the connector entry points (`nodes/0,1`, `net_adm:ping/1`, `net_kernel:connect_node/1`).
 
 `spawn_opt` parses and validates EVERY option **before** the child is allocated, then builds the
 child's `HeapPolicy` with `beam_gc::HeapPolicy::from_spawn_opts` and applies it via the
@@ -575,7 +574,8 @@ write-mode `{open,…}` that delegates to `prim_file:open/2` and really creates 
   `spawn_monitor`) and registry/reference surfaces, the monitor/demonitor and exit-signalling
   surfaces, and the port surface (`port_command/2,3`, `port_control/3` and the closed-port/
   `registered_name` halves of `port_info/1,2`) (contracts A.4/A.7/A.8/A.9)
-- `node.rs` → the node/cookie surface (`is_alive/0`, `get_cookie/0`, `set_cookie/2`, `nodes/0,1`)
+- `node.rs` → the node/cookie surface (`is_alive/0`, `get_cookie/0`, `set_cookie/2`)
+- `net.rs` → the node set + connector surface (`nodes/0,1`, `net_adm:ping/1`, `net_kernel:connect_node/1`)
 - `group_leader.rs` → `erlang:group_leader/2` + `erts_internal:group_leader/2,3` over
   `Runtime::group_leaders`
 - `test_support.rs` → the shared fixtures
@@ -710,7 +710,7 @@ closable the same way and the floor already serves both, so only `/2` stays list
 **Needs a new facility (shape-closable only):** `port_connect/2`/`port_call/3`,
 `spawn_request/1..5`, `suspend_process/1,2`, `system_monitor/0,1,2` (`/0` ⇒ `undefined`;
 `erts_internal:system_monitor/1,3` exported but unserved), `process_display/2`, `load_module/2`,
-`disconnect_node/1` (needs `"net_kernel"` in `FLOOR_MODULES`). Edit gates: `../error.rs`'s
+`disconnect_node/1` (the `"net_kernel"` namespace is now in `FLOOR_MODULES`, but the arm itself is unimplemented). Edit gates: `../error.rs`'s
 `known_unimplemented_bifs_are_capability_gaps_and_never_shadow_the_registry` +
 `the_effective_gap_set_never_shadows_the_registry`, and `native.rs`'s
 `every_floor_module_is_a_real_try_native_arm`.
