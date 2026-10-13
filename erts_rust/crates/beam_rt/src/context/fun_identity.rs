@@ -36,9 +36,17 @@
 //! The bridge is built **before** `call_registered` destructures the runtime: every arm of
 //! that method hands the [`BifContext`](beam_bifs::BifContext) a bridge that borrows the
 //! runtime (`FunBridge`/`SendBridge`/`NifBridge`/…) or a process table (`DictBridge`), so
-//! this hook must hold **no** borrow of either. It therefore snapshots what the derivation
-//! needs — every loaded module's IR plus the `.beam` file it came from (the source of its
-//! lazy checksum) and the local node atom — and reads them without touching the runtime.
+//! this hook must hold **no** borrow of either. It therefore holds the code server's own
+//! **cached** snapshot of what the derivation needs — every loaded module's IR plus the
+//! `.beam` file it came from (the source of its lazy checksum) — as a shared
+//! [`Rc`](std::rc::Rc) handle ([`CodeServer::fun_module_snapshot`]), plus the local node
+//! atom, and reads them without touching the runtime.
+//!
+//! Building that snapshot is a full walk of the module cache, and this hook runs on **every**
+//! `term_to_binary/1,2` call, so the walk is cached in the code server behind a
+//! loaded-module **generation**: an unchanged module set hands out one snapshot and each
+//! per-call bridge costs an `Rc` clone plus one name lookup. Loading (or reloading) a module
+//! bumps the generation, so a module loaded mid-run is always visible to the next call.
 //!
 //! # What it derives, and from where
 //!
@@ -53,13 +61,15 @@
 //! A `make_fun3` closure's term inlines only `[uniq: u64][index: u32]`
 //! ([`beam_term::fun`]) — it does **not** name its module — so the defining module is
 //! recovered by searching the loaded modules for a `FunT` entry with that
-//! `(uniq, index)`. The snapshot is ordered **caller-first**, then by module name, so the
-//! overwhelmingly common case — a module encoding its own fun — resolves against the caller
-//! exactly as it always has, while a fun that **escaped** its defining module still resolves
-//! against the module that really defines it (the deterministic scan finds it) instead of
-//! reporting the capability gap. A cross-module `(uniq, index)` collision is possible in
-//! principle; preferring the caller is then the same choice the former module-scoped
-//! derivation always made, and it is deterministic either way.
+//! `(uniq, index)`. The **scan** is ordered caller-first, then by module name (the order the
+//! code server's snapshot is in), so the overwhelmingly common case — a module encoding its
+//! own fun — resolves against the caller exactly as it always has, while a fun that
+//! **escaped** its defining module still resolves against the module that really defines it
+//! (the deterministic scan finds it) instead of reporting the capability gap. Preferring the
+//! caller is an index into the shared snapshot, never a reorder or a copy of it. A
+//! cross-module `(uniq, index)` collision is possible in principle; preferring the caller is
+//! then the same choice the former module-scoped derivation always made, and it is
+//! deterministic either way.
 //!
 //! # Honesty (nothing is ever fabricated)
 //!
@@ -79,6 +89,7 @@
 //! fun whose image cannot be faithfully derived is reported, never mis-encoded.
 
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use beam_bifs::LocalFunIdentity;
@@ -89,57 +100,59 @@ use beam_term::{Atom, Eterm};
 use super::bridges::{descriptor_position, local_fun_identity, module_md5};
 use crate::codeserver::CodeServer;
 
-/// The concrete [`LocalFunIdentity`]: an owned snapshot of every loaded module's fun-table
-/// identity (see the module docs).
+/// The concrete [`LocalFunIdentity`]: the code server's **cached** loaded-module snapshot
+/// (see the module docs) plus this context's own scan order over it.
 pub(super) struct FunIdentityBridge {
     /// Every loaded module that has a `.beam` path, as `(loaded IR, its `.beam` file)` — the
-    /// source of the module atom/`FunT` lookup and of the lazy checksum. Ordered **caller
-    /// module first**, then the code server's name-sorted order, so the scan is
-    /// deterministic and the common self-encoding case is reached first.
-    modules: Vec<(Arc<Module>, PathBuf)>,
+    /// source of the module atom/`FunT` lookup and of the lazy checksum.
+    ///
+    /// This is the [`Rc`] handle the [`CodeServer`] itself caches
+    /// ([`CodeServer::fun_module_snapshot`]), **not** a per-call rebuild: an unchanged
+    /// loaded-module set shares one snapshot across every `term_to_binary/1,2` call, and the
+    /// code server rebuilds it only when its loaded-module generation moves. The entries are
+    /// in the code server's own name-sorted order.
+    modules: Rc<Vec<(Arc<Module>, PathBuf)>>,
+    /// Where the **caller** module sits in [`Self::modules`], when it is loaded: the scan
+    /// visits it first (a module encoding **its own** fun is the common case), then every
+    /// other module in the snapshot's own order. It is an index, not a copy, so preferring
+    /// the caller costs nothing and leaves the shared snapshot untouched.
+    preferred: Option<usize>,
     /// The local node's name atom (the `NEW_PID_EXT` creator pid's node).
     node: Option<Atom>,
 }
 
 impl FunIdentityBridge {
     /// Snapshots the fun-table identity of **every** loaded module, plus the local node atom
-    /// `node`; `module` (a name, or `None` for a context with no calling module) is moved to
+    /// `node`; `module` (a name, or `None` for a context with no calling module) moves to
     /// the front of the resolution order.
     ///
-    /// Every piece is cloned out of `code_server`, so the returned bridge holds no borrow
-    /// and can be installed while the runtime itself is mutably borrowed (see the module
-    /// docs). `module_handle`/`loaded_path` are both lookups only — they never load a
-    /// module, so this cannot have a side effect on the code server. A module with no known
-    /// `.beam` path (one supplied in memory) is skipped: its checksum cannot be derived, so
-    /// it could never contribute a faithful identity.
+    /// The module half is the code server's **cached** snapshot
+    /// ([`CodeServer::fun_module_snapshot`]), so building a bridge is an [`Rc`] clone plus
+    /// one name lookup — no per-call `Vec`, no walk of the module cache, no `Arc`/`PathBuf`
+    /// clone per loaded module. The bridge still holds **no** borrow of the code server (it
+    /// owns the shared [`Rc`]), so it can be installed while the runtime itself is mutably
+    /// borrowed (see the module docs). `module_handle`/`loaded_path` are both lookups only —
+    /// they never load a module, so neither this nor the snapshot has a side effect on the
+    /// code server. A module with no known `.beam` path (one supplied in memory) is skipped:
+    /// its checksum cannot be derived, so it could never contribute a faithful identity.
     pub(super) fn new(
         code_server: &CodeServer,
         module: Option<&str>,
         node: Option<Atom>,
     ) -> FunIdentityBridge {
-        // `CodeServer::loaded` is name-sorted, so the snapshot order is deterministic even
-        // though the code server's own store is a `HashMap`.
-        let mut modules: Vec<(Arc<Module>, PathBuf)> = code_server
-            .loaded()
-            .into_iter()
-            .filter_map(|name| {
-                let handle = code_server.module_handle(&name)?;
-                let path = code_server.loaded_path(&name).map(PathBuf::from)?;
-                Some((handle, path))
-            })
-            .collect();
+        let modules = code_server.fun_module_snapshot();
         // Prefer the caller module: a module encoding **its own** fun is the common case, and
         // resolving it first keeps that already-oracle-verified image byte-for-byte unchanged.
-        if let Some(caller) = module {
-            if let Some(position) = modules
+        let preferred = module.and_then(|caller| {
+            modules
                 .iter()
                 .position(|(handle, _)| handle.atom_name(handle.name) == Some(caller))
-            {
-                let preferred = modules.remove(position);
-                modules.insert(0, preferred);
-            }
+        });
+        FunIdentityBridge {
+            modules,
+            preferred,
+            node,
         }
-        FunIdentityBridge { modules, node }
     }
 }
 
@@ -161,7 +174,16 @@ impl LocalFunIdentity for FunIdentityBridge {
         // is whichever loaded module's `FunT` declares this `(uniq, index)`.
         let uniq = beam_engine::terms::fun_uniq(term)?;
         let index = beam_engine::terms::fun_index(term)?;
-        for (module, path) in &self.modules {
+        // The caller module first (when it is loaded), then every other module in the
+        // snapshot's own order — the deterministic caller-first order the derivation has
+        // always used, expressed as a scan position so the **shared** snapshot is never
+        // reordered or copied.
+        let preferred = self.preferred;
+        let order = preferred
+            .into_iter()
+            .chain((0..self.modules.len()).filter(move |position| Some(*position) != preferred));
+        for position in order {
+            let (module, path) = &self.modules[position];
             if descriptor_position(module, uniq, index).is_none() {
                 continue;
             }
@@ -196,6 +218,8 @@ impl LocalFunIdentity for FunIdentityBridge {
 /// test skips **loudly** when no `erl`/`erlc` is available — never a silent pass.
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use beam_term::prelude::make_small;
     use beam_term::Eterm;
 
@@ -203,6 +227,7 @@ mod tests {
         compile_fixture, compile_fixtures, decode_hex, hex, resolve_erlc, resolve_oracle,
         run_oracle_probe, skip_loudly,
     };
+    use super::FunIdentityBridge;
     use crate::runtime::Runtime;
 
     /// The skip banner (shared with [`super::super::bridges`]'s test).
@@ -338,6 +363,102 @@ io:format(\"~s~n\", [binary:encode_hex(term_to_binary(F))])";
              ours:   {}\n  oracle: {}",
             hex(produced),
             hex(&image)
+        );
+    }
+
+    /// The **cache** contract, with no toolchain: the loaded-module snapshot the bridge reads
+    /// is the code server's cached one, so two bridges built over an unchanged module set
+    /// share a single allocation (`Rc::ptr_eq`) — and a module **load** really invalidates
+    /// it, so a mid-run load is never answered from stale state. Pointer identity and the
+    /// code server's own rebuild count are both deterministic; nothing here is timing-based.
+    #[test]
+    fn the_bridge_reuses_the_code_servers_cached_loaded_module_snapshot() {
+        let mut rt = Runtime::with_defaults().expect("the default runtime");
+        if rt.code_server.add_system_paths().is_err() {
+            skip_loudly(BANNER, "no system code path");
+            return;
+        }
+        rt.code_server.load("lists").expect("stdlib lists loads");
+        let first = FunIdentityBridge::new(rt.code_server(), None, None);
+        let second = FunIdentityBridge::new(rt.code_server(), None, None);
+        assert!(
+            Rc::ptr_eq(&first.modules, &second.modules),
+            "an unchanged loaded-module set must hand out one shared snapshot, not a per-call walk"
+        );
+        // A load changes the loaded-module set: the snapshot is rebuilt (and the new module is
+        // in it), so nothing later reads a stale module set.
+        rt.code_server
+            .load("proplists")
+            .expect("stdlib proplists loads");
+        let third = FunIdentityBridge::new(rt.code_server(), None, None);
+        assert!(
+            !Rc::ptr_eq(&first.modules, &third.modules),
+            "loading a module must invalidate the cached snapshot"
+        );
+        assert!(
+            third
+                .modules
+                .iter()
+                .any(|(handle, _)| handle.atom_name(handle.name) == Some("proplists")),
+            "the rebuilt snapshot must contain the newly loaded module"
+        );
+        // Caller preference is a scan position, not a copy: the shared snapshot is untouched.
+        let caller = FunIdentityBridge::new(rt.code_server(), Some("proplists"), None);
+        assert!(Rc::ptr_eq(&caller.modules, &third.modules));
+        assert_eq!(
+            caller.preferred,
+            third
+                .modules
+                .iter()
+                .position(|(handle, _)| handle.atom_name(handle.name) == Some("proplists")),
+            "the caller module must be visited first"
+        );
+    }
+
+    /// The fixture: **two** `term_to_binary/1` calls in one exported function, each on a fresh
+    /// local (`make_fun3`) closure — two consultations of the fun-identity seam inside one run.
+    const LFUNTWICE_SRC: &str = "\
+-module(lfuntwice).
+-export([encs/0]).
+encs() -> {term_to_binary(fun() -> ok end), term_to_binary(fun(Y) -> Y + 1 end)}.
+";
+
+    /// The **per-call** proof on the production path: a run whose module makes two
+    /// `term_to_binary/1` calls rebuilds the loaded-module snapshot **once** (the run's own
+    /// module load), not once per call. The count is the code server's own rebuild counter, so
+    /// the assertion is deterministic — no timing.
+    #[test]
+    fn two_term_to_binary_calls_in_one_run_rebuild_the_loaded_module_snapshot_once() {
+        let Some(erlc) = resolve_erlc() else {
+            skip_loudly(BANNER, "no usable `erlc`");
+            return;
+        };
+        let dir = compile_fixture(&erlc, "fun_identity_cache", "lfuntwice", LFUNTWICE_SRC);
+        let mut rt = Runtime::with_defaults().expect("the default runtime");
+        // Warm up (boot, the fixture's own load and one run) so the measurement starts from a
+        // settled runtime whose module set already holds the fixture.
+        rt.run_function(dir.join("lfuntwice.beam"), "encs", 0, &[])
+            .expect("lfuntwice:encs/0 runs");
+        let before = rt.code_server().fun_snapshot_rebuilds();
+        let result = rt
+            .run_function(dir.join("lfuntwice.beam"), "encs", 0, &[])
+            .expect("lfuntwice:encs/0 runs");
+        let after = rt.code_server().fun_snapshot_rebuilds();
+        assert_eq!(
+            after - before,
+            1,
+            "one run of two term_to_binary/1 calls must rebuild the loaded-module snapshot \
+             exactly once (the run's own module load); a per-call rebuild would be 2"
+        );
+        // …and the run really did encode two funs, so the count above cannot be satisfied by a
+        // `term_to_binary` that silently did nothing (the printer renders `{<<…>>,<<…>>}`).
+        let printed = rt
+            .format_term(result, None)
+            .expect("the two encoded funs print");
+        assert_eq!(
+            printed.matches("<<").count(),
+            2,
+            "the measured run must produce two encoded funs, got {printed}"
         );
     }
 }

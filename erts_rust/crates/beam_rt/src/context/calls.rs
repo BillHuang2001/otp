@@ -199,10 +199,12 @@ impl<'a> RuntimeContext<'a> {
         // the same image) of a compiled module's `make_fun3` closure needs the `NEW_FUN_EXT`
         // fields the term does not carry (module atom, module MD5, `old_index`/`old_uniq`,
         // creator pid), which only the *loaded module* knows. Like `local_node` this hook
-        // needs **no** runtime borrow — it snapshots every loaded module's `Arc<Module>` and
-        // `.beam` path (caller module first) plus the node atom — but building that snapshot
-        // is not free (an `Arc` clone plus a `PathBuf` per loaded module), so it is built
-        // **only** for the four BIFs that consult this seam (see [`Self::uses_fun_identity`]).
+        // needs **no** runtime borrow: it shares the code server's **cached** loaded-module
+        // snapshot (`CodeServer::fun_module_snapshot`, rebuilt only when the loaded-module
+        // set changes) and scans it caller-first, so a call costs one `Rc` clone and one name
+        // lookup rather than a walk of the module cache. It is still built **only** for the
+        // four BIFs that consult this seam (see [`Self::uses_fun_identity`]); every other
+        // registered call pays nothing at all.
         // For every other registered call it stays `None` and no hook is installed —
         // indistinguishable from the hook itself, because no other BIF ever calls
         // `local_fun_identity`. The `-eval` evaluator's own closures match no loaded module's
