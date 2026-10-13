@@ -44,7 +44,7 @@
 //! | `erlang:nodes/0,1` | read this runtime's own **link table** (the established outbound distribution links), not a registry value (contract A.5, `src/native/net.rs`) |
 //! | `net_adm:ping/1`, `net_kernel:connect_node/1` | **drive** that link table: the outbound `epmd` lookup + `'N'` client handshake (`Runtime::dist_connect`) is host socket work (contract A.5, `src/native/net.rs`) |
 //! | `os:cmd/1` | runs a command through `/bin/sh` and returns its stdout — the host's own process spawn |
-//! | `code:get_path/0`, `code:all_loaded/0`, `code:which/1`, `code:is_loaded/1`, `code:is_sticky/1,2`, `code:ensure_loaded/1`, `code:load_file/1`, `code:lib_dir/0,1,2`, `code:priv_dir/1`, `code:root_dir/0` | read the runtime's own [`CodeServer`](crate::CodeServer) state (the code path, the loaded/preloaded module set, the installation) |
+//! | `code:get_path/0`, `code:all_loaded/0`, `code:which/1`, `code:get_object_code/1`, `code:is_loaded/1`, `code:is_sticky/1,2`, `code:ensure_loaded/1`, `code:load_file/1`, `code:lib_dir/0,1,2`, `code:priv_dir/1`, `code:root_dir/0` | read the runtime's own [`CodeServer`](crate::CodeServer) state (the code path, the loaded/preloaded module set, the installation) — and, for `get_object_code/1`, its `.beam` bytes |
 //! | `application:get_env/1,2,3`, `application:get_all_env/1`, `application:get_key/2`, `application:loaded_applications/0`, `application:which_applications/0` | read the runtime's own **application-config view** — the `.app` resource files of the OTP applications its code path resolves |
 //! | `prim_file:get_cwd/0,1`, `prim_file:read_file/1`, `prim_file:open/2`, `prim_file:read/2`, `prim_file:write/2`, `prim_file:close/1`, `prim_file:position/2` | the file-system **primitives** `file.erl` delegates to: they are the host's own `getcwd`/`open`/`read`/`write`/`close`/`lseek` (`std::env`/`std::fs`), which only the host can perform |
 //!
@@ -230,6 +230,7 @@ impl RuntimeContext<'_> {
             ("code", "get_path", 0) => Some(self.code_get_path()),
             ("code", "all_loaded", 0) => Some(self.code_all_loaded()),
             ("code", "which", 1) => Some(self.code_which(args)),
+            ("code", "get_object_code", 1) => Some(self.code_get_object_code(args)),
             ("code", "is_loaded", 1) => Some(self.code_is_loaded(args)),
             ("code", "is_sticky", 1) => Some(self.code_is_sticky_1(args)),
             ("code", "is_sticky", 2) => Some(self.code_is_sticky_2()),
