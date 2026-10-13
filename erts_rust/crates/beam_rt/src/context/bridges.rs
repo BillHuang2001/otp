@@ -323,84 +323,41 @@ enum SendTarget {
     },
 }
 
+/// A `send` destination, classified by [`SendBridge::resolve`] — the one shared
+/// [`classify_send_destination`](super::send::classify_send_destination) the compiled `Dest !
+/// Msg`, the `-eval` `!` and this BIF route all use, re-exported here for the BIF arm's match.
+use super::send::{classify_send_destination, SendDestination};
+
 impl SendBridge<'_> {
-    /// Resolves a `send` destination term to the [`SendTarget`] the delivery runs against.
+    /// Resolves a `send` destination term to the [`SendDestination`] the delivery runs against.
     ///
-    /// The classification order is the C's (`bif.c:2469-2674`): an internal pid, a registered
-    /// name, an alias reference, an external pid, a port, then a `{Name, Node}` pair — and
-    /// finally `badarg`. An **external pid is boxed**, so none of the three local cases can
-    /// match it, which is why their order relative to it does not matter; what does matter is
-    /// that the port and `{Name, Node}` arms come last (their shapes are boxed too).
+    /// The classification itself lives in
+    /// [`classify_send_destination`](super::send::classify_send_destination) — the **one** copy
+    /// the compiled `!`, the `-eval` `!` and this BIF route share, so the three can never drift.
+    /// This only picks the table local destinations resolve against: the pass table in a
+    /// scheduler slice, else the runtime's own (the same choice
+    /// `RuntimeContext::process_table`/`process_table_mut` make on the outer context).
     ///
     /// # Errors
     ///
-    /// [`BeamError::BadArg`] for the destinations the oracle rejects with `badarg`; a typed
-    /// capability gap ([`crate::error::unsupported`]) for the ones it accepts but this
-    /// runtime cannot serve yet (see the struct docs) — including the `{Name, Node}` pair on a
-    /// runtime that is **not** a distributed node, which is the message the non-distributed
-    /// corpus has always pinned.
-    fn resolve(&self, to: Eterm) -> Result<SendTarget> {
-        // The table every local destination is resolved against: the pass table in a scheduler
-        // slice, else the runtime's own (the same choice `process_table`/`process_table_mut`
-        // make on the outer context).
+    /// As the shared classifier: [`BeamError::BadArg`] for the destinations the oracle rejects
+    /// with `badarg`, and a typed capability gap ([`crate::error::unsupported`]) for the ones it
+    /// accepts but this runtime cannot serve — including the `{Name, Node}` pair on a runtime
+    /// that is **not** a distributed node, which is the message the non-distributed corpus has
+    /// always pinned.
+    fn resolve(&self, to: Eterm) -> Result<SendDestination> {
         let table: &ProcessTable = match self.mailbox_table {
             Some(ref table) => table,
             None => &self.runtime.processes,
         };
-        if ProcessId::is_process(to) {
-            return Ok(SendTarget::Local {
-                target: to,
-                reference: None,
-            });
-        }
-        if is_atom(to) {
-            return match table.whereis(atom_val(to)) {
-                Some(pid) => Ok(SendTarget::Local {
-                    target: pid.to_eterm(),
-                    reference: None,
-                }),
-                // An atom name no process is registered under: the oracle's only failing
-                // (correctly typed) destination (`bif.c:2536`).
-                None => Err(BeamError::BadArg),
-            };
-        }
-        if let Some((owner, reference)) = alias_destination(&*self.runtime, table, to) {
-            // A live **alias**: the message goes to its owner and the reference is consumed
-            // after a successful delivery (the C's `send_altact_message` arm, `bif.c:2478-2492`).
-            return Ok(SendTarget::Local {
-                target: owner.to_eterm(),
-                reference: Some(reference),
-            });
-        }
-        if RemotePid::from_eterm(to).is_ok() {
-            // A pid on another node (`bif.c:2614-2667`'s sibling arm): the message travels as a
-            // `DOP_SEND[_SENDER]` control message on the link to that node.
-            return Ok(SendTarget::RemotePid { to });
-        }
-        if PortId::from_eterm(to).is_ok() {
-            return Err(error::unsupported(
-                "erlang:send/2 to a port: the port write path is not wired",
-            ));
-        }
-        if let Some((name, node)) = two_atom_tuple(self.runtime.code_server.atoms(), to) {
-            if self.runtime.dist_client().is_none() {
-                // Not a distributed node: no link table exists, so this stays the exact
-                // capability gap it was before the connector -- which keeps a non-node VM's
-                // observable behaviour (and the differential corpus) byte-identical.
-                return Err(error::unsupported(&format!(
-                    "erlang:send/2 to {name}@{node}: distributed send is not implemented"
-                )));
-            }
-            return Ok(SendTarget::RemoteName { name, node });
-        }
-        Err(BeamError::BadArg)
+        classify_send_destination(&*self.runtime, table, to)
     }
 }
 
 impl SendHook for SendBridge<'_> {
     fn send(&mut self, to: Eterm, term: Eterm) -> Result<()> {
         match self.resolve(to)? {
-            SendTarget::Local { target, reference } => {
+            SendDestination::Local { target, reference } => {
                 // The nested context inherits the sender's identity (pid + table) so the
                 // delivery runs exactly as the compiled `send` instruction's does. It is scoped
                 // to the delivery: it borrows the runtime **and** the pass table, so both must
@@ -421,7 +378,7 @@ impl SendHook for SendBridge<'_> {
                         // A nested run keeps its own (empty) memo: see `super::DispatchMemo`.
                         dispatch_memo: super::DispatchMemo::default(),
                     };
-                    match ctx.send_message(target, term) {
+                    match ctx.send_message(target.to_eterm(), term) {
                         // No process for the pid: the C drops the message and reports success
                         // (`bif.c:2478-2480`); the table's typed not-found is that same case.
                         Err(BeamError::TermNotFound) => Ok(()),
@@ -442,13 +399,21 @@ impl SendHook for SendBridge<'_> {
             // A remote destination is transmitted by the distribution client, which needs
             // `&mut Runtime` — so the send happens here rather than in `resolve`. Its typed
             // error is propagated: an unestablished link is a real failure, never a silent
-            // drop.
-            SendTarget::RemotePid { to } => {
-                self.runtime.dist_send_message_pid(to, self.mailbox_pid, term)
-            }
-            SendTarget::RemoteName { name, node } => {
-                self.runtime
-                    .dist_send_reg_send(&node, &name, self.mailbox_pid, term)
+            // drop. This is the **same** transmission the compiled `!` runs
+            // (`RuntimeContext::deliver_remote`).
+            remote => {
+                let mut ctx = RuntimeContext {
+                    runtime: self.runtime,
+                    output: self.output.clone(),
+                    mailbox_pid: self.mailbox_pid,
+                    mailbox_table: self.mailbox_table.as_deref_mut(),
+                    may_pump_scheduler: self.may_pump_scheduler,
+                    current_module: self.current_module.clone(),
+                    engines: self.engines,
+                    gc_armed: false,
+                    dispatch_memo: super::DispatchMemo::default(),
+                };
+                ctx.deliver_remote(remote, to, term)
             }
         }
     }
@@ -456,11 +421,14 @@ impl SendHook for SendBridge<'_> {
 /// The `{Name, Node}` pair of an atom/atom 2-tuple destination, if `to` is one.
 ///
 /// The C only treats a 2-tuple of **atoms** as a remote send (`bif.c:2614-2621`); every other
-/// tuple shape is `SEND_BADARG`. Milestone-1 has no distributed send, so this only feeds the
-/// capability-gap message. A non-2-tuple, a non-tuple, or a tuple with a non-atom element
+/// tuple shape is `SEND_BADARG`. A non-2-tuple, a non-tuple, or a tuple with a non-atom element
 /// yields `None` (which the caller turns into `badarg`, the oracle's reason). The two atoms are
 /// resolved to their names through the shared table, so the diagnostic names the destination.
-fn two_atom_tuple(atoms: &AtomTable, to: Eterm) -> Option<(String, String)> {
+///
+/// Shared with the destination classifier
+/// ([`classify_send_destination`](super::send::classify_send_destination)), which is why it is
+/// `pub(super)`.
+pub(super) fn two_atom_tuple(atoms: &AtomTable, to: Eterm) -> Option<(String, String)> {
     if beam_engine::terms::tuple_arity(to).ok()? != 2 {
         return None;
     }

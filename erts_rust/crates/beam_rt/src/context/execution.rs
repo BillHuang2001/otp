@@ -45,6 +45,7 @@ use beam_term::Eterm;
 use super::apply::{callee_observes_its_call_site, LocalFunTarget};
 use super::gc;
 use super::runtime_context::RuntimeContext;
+use super::send::SendDestination;
 
 impl ExecutionContext for RuntimeContext<'_> {
     /// The runtime's unified dispatch — see the module docs.
@@ -439,7 +440,14 @@ impl ExecutionContext for RuntimeContext<'_> {
         message: Eterm,
         src_binaries: &[beam_alloc::RefcBinary],
     ) -> Result<()> {
-        let (target, reference) = self.resolve_send_target(to)?;
+        let destination = self.resolve_send_destination(to)?;
+        // A **remote** destination (an external pid, or a `{Name, Node}` pair naming another
+        // node) has no local receiver to copy into: it is transmitted by the distribution client
+        // exactly as the `erlang:send/2` BIF route transmits it, and the `send` seam is done.
+        let (target, reference) = match destination {
+            SendDestination::Local { target, reference } => (target, reference),
+            remote => return self.deliver_remote(remote, to, message),
+        };
         let from = self.mailbox_pid.to_eterm();
         // The copy's source off-heap table: the sender's three handle families — its machine's own
         // handles (`src_binaries`) **unioned** with the runtime's escaped-payload store and with
