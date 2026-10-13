@@ -31,6 +31,7 @@
 use super::emit::*;
 use super::runtime::{
     EXT_CALL, EXT_CALL_LAST, EXT_CALL_ONLY, RUNTIME_MACHINE_DISP, RUNTIME_XREGS_DISP,
+    RUNTIME_YBASE_DISP, RUNTIME_YEND_DISP,
 };
 use super::*;
 use crate::jit::emitter::Reg;
@@ -80,6 +81,8 @@ fn the_runtime_layout_matches_the_offsets_generated_code_uses() {
     let rt = JitRuntime {
         machine: &mut machine,
         x_regs: machine.x.as_mut_ptr(),
+        y_base: std::ptr::null_mut(),
+        y_end: std::ptr::null_mut(),
         module: &module,
         labels: &labels,
         ctx: &mut ctx,
@@ -89,8 +92,12 @@ fn the_runtime_layout_matches_the_offsets_generated_code_uses() {
     let base = &rt as *const JitRuntime as usize;
     let machine_field = &rt.machine as *const *mut Machine as usize;
     let x_regs_field = &rt.x_regs as *const *mut Eterm as usize;
+    let y_base_field = &rt.y_base as *const *mut Eterm as usize;
+    let y_end_field = &rt.y_end as *const *mut Eterm as usize;
     assert_eq!(machine_field - base, RUNTIME_MACHINE_DISP as usize);
     assert_eq!(x_regs_field - base, RUNTIME_XREGS_DISP as usize);
+    assert_eq!(y_base_field - base, RUNTIME_YBASE_DISP as usize);
+    assert_eq!(y_end_field - base, RUNTIME_YEND_DISP as usize);
     assert_eq!(RUNTIME_SLOT_DISP, 0);
 }
 
@@ -296,13 +303,27 @@ fn fast_arith_recognizes_only_the_three_small_int_bifs() {
             "import {index}"
         );
     }
-    // Shapes the fast path refuses: a Y destination, a Y operand, a non-small
-    // constant operand, a wrong argument count, an out-of-bound register.
+    // A Y destination and a Y operand now lower too (behind the frame-window guard):
+    // the guard rejects an out-of-frame slot at run time, so the shape itself is
+    // accepted at compile time.
     let plus = refs[0];
+    let y_dst = gc_bif(plus, args.clone(), Operand::Y(0));
+    assert_eq!(
+        fast_arith(&module, &y_dst).map(|fast| fast.dst),
+        Some(FastDest::Y(0)),
+        "a Y destination lowers"
+    );
+    let y_operand = gc_bif(plus, vec![Operand::X(0), Operand::Y(1)], Operand::X(0));
+    assert!(
+        fast_arith(&module, &y_operand).is_some(),
+        "a Y operand lowers"
+    );
+
+    // Shapes the fast path still refuses: a non-small constant operand, a wrong
+    // argument count, an out-of-bound x-register, and a Y index so large its offset
+    // would overflow the emitted `disp32` (the interpreter runs those).
     let atom = module.name;
     for instr in [
-        gc_bif(plus, args.clone(), Operand::Y(0)),
-        gc_bif(plus, vec![Operand::X(0), Operand::Y(1)], Operand::X(0)),
         gc_bif(plus, vec![Operand::X(0), Operand::Atom(atom)], Operand::X(0)),
         gc_bif(plus, vec![Operand::X(0), Operand::Nil], Operand::X(0)),
         gc_bif(plus, vec![Operand::X(0)], Operand::X(0)),
@@ -312,6 +333,8 @@ fn fast_arith_recognizes_only_the_three_small_int_bifs() {
             Operand::X(0),
         ),
         gc_bif(plus, args.clone(), Operand::X(MAX_REGISTER)),
+        gc_bif(plus, args.clone(), Operand::Y(u32::MAX)),
+        gc_bif(plus, vec![Operand::Y(u32::MAX), Operand::X(0)], Operand::X(0)),
     ] {
         assert!(fast_arith(&module, &instr).is_none(), "{instr:?}");
     }
@@ -1764,6 +1787,8 @@ fn the_eager_guard_covers_the_whole_module_but_the_lazy_guard_the_entered_functi
     let mut rt = JitRuntime {
         machine: &mut machine,
         x_regs: machine.x.as_mut_ptr(),
+        y_base: std::ptr::null_mut(),
+        y_end: std::ptr::null_mut(),
         module: &module,
         labels: &labels,
         ctx: &mut ctx,
@@ -2154,6 +2179,8 @@ fn run_ext_call(
     let mut rt = JitRuntime {
         machine: &mut machine,
         x_regs,
+        y_base: std::ptr::null_mut(),
+        y_end: std::ptr::null_mut(),
         module: caller,
         labels: &labels,
         ctx: &mut ctx,

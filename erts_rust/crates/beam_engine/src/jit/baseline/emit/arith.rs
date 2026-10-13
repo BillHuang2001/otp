@@ -94,7 +94,8 @@ use super::super::runtime::{RUNTIME_YBASE_DISP, RUNTIME_YEND_DISP};
 // native entry.
 
 /// The three BIFs the fast path lowers — `erlang:'+'/2`, `erlang:'-'/2` and
-/// `erlang:'*'/2`, and nothing else.#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// `erlang:'*'/2`, and nothing else.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SmallArith {
     /// `erlang:'+'/2`.
     Add,
@@ -422,7 +423,8 @@ fn emit_y_store(buffer: &mut CodeBuffer, k: u32, fallback: CodeLabel) -> Result<
 /// lies outside the current frame, so an in-frame Y `gc_bif` runs natively and a
 /// malformed frame keeps the interpreter's exact error.
 ///
-/// The emitted shape (see the section comment above for why it is exact):///
+/// The emitted shape (see the section comment above for why it is exact):
+///
 /// ```text
 ///   mov  rax, a          ; the operand: a cached register, `[rbx + x*8]`, a
 ///                        ; movabs of a small constant, or the guarded Y read below

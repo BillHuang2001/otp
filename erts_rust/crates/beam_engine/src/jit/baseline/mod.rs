@@ -874,6 +874,11 @@ fn drive(
     let mut rt = JitRuntime {
         machine: machine_ptr,
         x_regs,
+        // Initialised to null; the loop's first `refresh_y_base` publishes the real
+        // window (which a resume may already have a live frame for) before any
+        // native entry.
+        y_base: std::ptr::null_mut(),
+        y_end: std::ptr::null_mut(),
         module: state.module,
         labels: state.labels,
         ctx: ctx_ptr,
@@ -882,6 +887,13 @@ fn drive(
     };
 
     loop {
+        // Re-publish the current top frame's Y window before every native entry: an
+        // instruction the previous iteration DEOPTED to the interpreter may have
+        // pushed/`trim`med a frame or **reallocated** `machine.stack`, and a block
+        // loaded from a stale `y_base` would read relocated memory. Only a helper
+        // changes frames (no inlined shape does), and the helpers refresh too, so this
+        // covers the in-block continue as well; it is one store pair per iteration.
+        rt.refresh_y_base();
         // Native entry for the ACTIVE module: the caller-owned artifact in context
         // `0`, the callee's blocks (if the tier has any) in a non-entry context.
         let native = match state.active {

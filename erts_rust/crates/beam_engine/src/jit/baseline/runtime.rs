@@ -169,7 +169,8 @@ pub(crate) struct JitRuntime<'a> {
     /// Null when no frame is live. Read by generated code at [`RUNTIME_YEND_DISP`].
     pub(crate) y_end: *mut Eterm,
     /// The module being executed (its `code`, labels, imports, literals).
-    pub(crate) module: *const Module,    /// The module-wide `Label -> (func, pc)` map the helper resolves fail/target
+    pub(crate) module: *const Module,
+    /// The module-wide `Label -> (func, pc)` map the helper resolves fail/target
     /// labels through (built once per driver call by
     /// [`interpreter::build_label_map`](crate::interpreter)).
     pub(crate) labels: *const LabelMap,
@@ -294,7 +295,8 @@ pub(crate) const RUNTIME_YEND_DISP: i32 = RUNTIME_YBASE_DISP + mem::size_of::<*c
 /// `Step::Next` without returning to the driver — so the window the next Y access
 /// reads must be this helper's own post-instruction state, never a stale pointer into
 /// a freed `Vec` buffer.
-pub(crate) extern "C" fn jit_step_one(rt: *mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {    // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
+pub(crate) extern "C" fn jit_step_one(rt: *mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
+    // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
     // `JitRuntime` and never aliases it for the duration of the call; every pointer
     // it holds points at an object the driver owns and keeps alive for the whole
     // loop (`machine`, `module`), or at a local (`labels`) that outlives the loop.
@@ -554,7 +556,8 @@ pub(crate) extern "C" fn jit_set_position(rt: *mut JitRuntime<'_>, func: u32, pc
 /// On success the resolved `target` word is returned so the block can compare it with
 /// the constant it compiled in and jump straight to the successor's entry; on failure
 /// the error is stored in `rt.error` and [`ERROR`] is returned, exactly as
-/// [`jit_step_one`] reports a raise.pub(crate) extern "C" fn jit_tail_call(rt: *mut JitRuntime<'_>, target: i64, deallocate: u32) -> i64 {
+/// [`jit_step_one`] reports a raise.
+pub(crate) extern "C" fn jit_tail_call(rt: *mut JitRuntime<'_>, target: i64, deallocate: u32) -> i64 {
     // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
     // `JitRuntime` and never aliases it for the duration of the call; every pointer
     // it holds points at an object the driver owns and keeps alive for the whole
