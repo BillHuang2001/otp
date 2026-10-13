@@ -33,6 +33,18 @@
 %% the ratio against `off', and how many modules produced a different `Code'
 %% chunk than the baseline -- i.e. how many modules the pass actually changed.
 %%
+%% Two corpora can be selected by the optional third positional argument (the
+%% wrapper exposes it as CORPUS):
+%%
+%%     stdlib (default)  <root>/lib/stdlib/src/*.erl   96 modules
+%%     all               <root>/lib/*/src/*.erl        ~772 modules
+%%
+%% The `all' corpus is the source of the full-lib/*/src reach numbers: it
+%% compiles every library source file and adds every lib/*/include directory to
+%% the include search path so that as many modules as possible build.  A handful
+%% of files still fail for unrelated include/host reasons; they are recorded and
+%% printed, and the measurement continues.
+%%
 %% Run it through test/measure_stage2_compile.sh; do not invoke it directly.
 %% It needs (a) the host Erlang (an older release is fine) and (b) the rig
 %% compiler as the FIRST `compile' on the code path: it hard-fails when
@@ -69,6 +81,8 @@
 -define(CODE_CHUNK, <<"Code">>).
 
 -type digest() :: binary() | failed.
+%% Which source corpus to measure.
+-type corpus_kind() :: stdlib | all.
 %% {wall-clock ms, per-module code digests, compile failures, changed count}
 -type run() :: {non_neg_integer(),
                 [{string(), digest()}],
@@ -85,11 +99,11 @@ main() ->
 
 -spec main([string()]) -> no_return().
 main(Args) ->
-    {Reps, Root} = parse_args(Args),
+    {Reps, Root, Corpus} = parse_args(Args),
     ok = check_compiler(),
-    Files = corpus(Root),
-    Base = base_opts(Root),
-    print_header(Root, Reps, Files),
+    Files = corpus(Corpus, Root),
+    Base = base_opts(Root, Corpus),
+    print_header(Root, Reps, Corpus, Files),
     Ref = warmup(Files, Base),
     Results = measure(Reps, Files, Base, Ref),
     report(Results),
@@ -102,13 +116,22 @@ main(Args) ->
 %% Argument / environment handling
 %% ===================================================================
 
--spec parse_args([string()]) -> {pos_integer(), string()}.
+-spec parse_args([string()]) -> {pos_integer(), string(), corpus_kind()}.
 parse_args([]) ->
-    {?DEFAULT_REPS, "."};
+    {?DEFAULT_REPS, ".", stdlib};
 parse_args([Reps]) ->
-    {to_reps(Reps), "."};
-parse_args([Reps, Root | _]) ->
-    {to_reps(Reps), Root}.
+    {to_reps(Reps), ".", stdlib};
+parse_args([Reps, Root | Rest]) ->
+    {to_reps(Reps), Root, to_corpus(Rest)}.
+
+%% The third positional argument names the corpus; an omitted argument selects
+%% the default `stdlib' corpus, so `-extra REPS ROOT' stays valid.
+-spec to_corpus([string()]) -> corpus_kind().
+to_corpus([]) -> stdlib;
+to_corpus(["stdlib" | _]) -> stdlib;
+to_corpus(["all" | _]) -> all;
+to_corpus([Other | _]) ->
+    die("unknown corpus " ++ Other ++ "; expected `stdlib' or `all'").
 
 -spec to_reps(string()) -> pos_integer().
 to_reps(Str) ->
@@ -141,22 +164,40 @@ check_compiler() ->
             end
     end.
 
--spec base_opts(string()) -> [compile:option()].
-base_opts(Root) ->
-    [binary,
-     return,
-     {i, filename:join([Root, "lib", "stdlib", "include"])},
-     {i, filename:join([Root, "lib", "kernel", "include"])},
-     {i, filename:join([Root, "lib", "compiler", "src"])}].
+-spec base_opts(string(), corpus_kind()) -> [compile:option()].
+base_opts(Root, Kind) ->
+    [binary, return | [{i, Dir} || Dir <- include_dirs(Root, Kind)]].
 
--spec corpus(string()) -> [string()].
-corpus(Root) ->
-    Files = lists:sort(filelib:wildcard(
-                         filename:join([Root, "lib", "stdlib", "src", "*.erl"]))),
-    case Files of
-        [] -> die("empty corpus: no lib/stdlib/src/*.erl under " ++ Root);
-        _ -> Files
+%% The three includes every corpus needs, plus (for `all') every lib/*/include
+%% directory, so that the library modules find their own application headers.
+-spec include_dirs(string(), corpus_kind()) -> [string()].
+include_dirs(Root, Kind) ->
+    Base = [filename:join([Root, "lib", "stdlib", "include"]),
+            filename:join([Root, "lib", "kernel", "include"]),
+            filename:join([Root, "lib", "compiler", "src"])],
+    case Kind of
+        stdlib ->
+            Base;
+        all ->
+            Extra = lists:sort(
+                      filelib:wildcard(
+                        filename:join([Root, "lib", "*", "include"]))),
+            Base ++ [Dir || Dir <- Extra, not lists:member(Dir, Base)]
     end.
+
+-spec corpus(corpus_kind(), string()) -> [string()].
+corpus(Kind, Root) ->
+    Pattern = corpus_pattern(Kind, Root),
+    case lists:sort(filelib:wildcard(Pattern)) of
+        [] -> die("empty corpus: no files matching " ++ Pattern);
+        Files -> Files
+    end.
+
+-spec corpus_pattern(corpus_kind(), string()) -> string().
+corpus_pattern(stdlib, Root) ->
+    filename:join([Root, "lib", "stdlib", "src", "*.erl"]);
+corpus_pattern(all, Root) ->
+    filename:join([Root, "lib", "*", "src", "*.erl"]).
 
 %% The measured option sets, in their canonical order.
 -spec sets() -> [{string(), [compile:option()]}].
@@ -180,6 +221,11 @@ warmup(Files, Base) ->
               [length(Files)]),
     {Ms, Digests, Fails} = pass(Files, Base, []),
     print_failures("warmup(off)", Fails),
+    case [File || {File, D} <- Digests, D =/= failed] of
+        [] -> die("nothing compiled: all " ++ integer_to_list(length(Files))
+                  ++ " module(s) failed");
+        _ -> ok
+    end,
     io:format("warmup: ~w ms (~.1f ms/module)~n~n",
               [Ms, Ms / length(Files)]),
     Digests.
@@ -312,8 +358,8 @@ failure_files(Fails) ->
 %% Reporting
 %% ===================================================================
 
--spec print_header(string(), pos_integer(), [string()]) -> ok.
-print_header(Root, Reps, Files) ->
+-spec print_header(string(), pos_integer(), corpus_kind(), [string()]) -> ok.
+print_header(Root, Reps, Kind, Files) ->
     io:format(
       "~n======================================================================~n"
       " Stage-2 compile-throughput harness (ratios are the only signal; this~n"
@@ -321,12 +367,12 @@ print_header(Root, Reps, Files) ->
       "======================================================================~n"
       " host OTP        : ~s (erts ~s)~n"
       " compiler module : ~s~n"
-      " corpus          : ~w modules: ~s/lib/stdlib/src/*.erl~n"
+      " corpus          : ~w modules: ~s~n"
       " repetitions     : ~w measured + 1 discarded warmup, rotated order~n"
       " option sets     : ~s~n"
       "======================================================================~n",
       [erlang:system_info(otp_release), erlang:system_info(version),
-       code:which(compile), length(Files), Root, Reps,
+       code:which(compile), length(Files), corpus_pattern(Kind, Root), Reps,
        order_str(sets())]),
     ok.
 

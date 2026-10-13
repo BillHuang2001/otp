@@ -25,15 +25,24 @@
 ## "Stage-2" compiler passes (`loop_opt`+`loop_arith_licm`, `fusion_opt`,
 ## `fbip_opt`).
 ##
-## It compiles a whole Erlang corpus (lib/stdlib/src/*.erl) in ONE Erlang
-## session, once per option set, and reports the wall-clock cost of each set
-## relative to the default (OFF) build, together with the number of modules
-## whose generated `Code' chunk actually changed -- i.e. whether the pass fired.
+## It compiles a whole Erlang corpus in ONE Erlang session, once per option set,
+## and reports the wall-clock cost of each set relative to the default (OFF)
+## build, together with the number of modules whose generated `Code' chunk
+## actually changed -- i.e. whether the pass fired.
+##
+## Two corpora are available (CORPUS):
+##     stdlib (default)  $ERL_TOP/lib/stdlib/src/*.erl   96 modules
+##     all               $ERL_TOP/lib/*/src/*.erl        ~772 modules
+## The `all' corpus is the source of the full-lib/*/src reach numbers; a handful
+## of its files fail for unrelated include/host reasons and are listed, and the
+## run continues.
 ##
 ## Usage:
 ##     lib/compiler/test/measure_stage2_compile.sh
+##     CORPUS=all REPS=1 lib/compiler/test/measure_stage2_compile.sh
 ##
 ## Environment:
+##     CORPUS=stdlib|all  corpus to measure (default stdlib)
 ##     REPS=N          measured repetitions per option set (default 5, >= 1)
 ##     RIG_EBIN=DIR    skip the rig build and use an existing rig ebin
 ##     KEEP_SCRATCH=1  keep the scratch dir holding the compiled helper module
@@ -56,8 +65,15 @@ set -u
 script_dir="$(cd "$(dirname "$0")" && pwd -P)"
 ERL_TOP="${ERL_TOP:-$(cd "$script_dir/../../.." && pwd -P)}"
 REPS="${REPS:-5}"
+CORPUS="${CORPUS:-stdlib}"
 
 die() { echo "measure_stage2_compile: $*" >&2; exit 1; }
+
+case "$CORPUS" in
+    stdlib) corpus_glob="$ERL_TOP/lib/stdlib/src/*.erl" ;;
+    all)    corpus_glob="$ERL_TOP/lib/*/src/*.erl" ;;
+    *)      die "unknown CORPUS=$CORPUS (expected stdlib or all)" ;;
+esac
 
 # ---------------------------------------------------------------- 1/3 rig ---
 # The host `erl'/`erlc' are usually an older OTP that cannot load this tree's
@@ -101,10 +117,10 @@ echo "== 2/3 compiling the helper (stage2_bench.erl) into $SCRATCH/ebin =="
 # otherwise (an escript or a forgotten -pa would silently benchmark the host
 # OTP compiler, whose default pass pipeline knows nothing about the Stage-2
 # flags).
-echo "== 3/3 measuring: REPS=$REPS, corpus=$ERL_TOP/lib/stdlib/src/*.erl =="
+echo "== 3/3 measuring: REPS=$REPS, CORPUS=$CORPUS, corpus=$corpus_glob =="
 RIG_EBIN="$RIG_EBIN" "$HOST_ERL" -noshell \
     -pa "$SCRATCH/ebin" -pa "$RIG_EBIN" \
-    -s stage2_bench main -extra "$REPS" "$ERL_TOP"
+    -s stage2_bench main -extra "$REPS" "$ERL_TOP" "$CORPUS"
 rc=$?
 
 if [ "$rc" -ne 0 ]; then
