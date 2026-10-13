@@ -630,7 +630,8 @@ impl<'a> RuntimeContext<'a> {
                 }
             }
         }
-        // The BIF (and any NIF a bridge ran) is done and every borrow released, so commit the        // names interned during the call: each lands at the index the interner predicted,
+        // The BIF (and any NIF a bridge ran) is done and every borrow released, so commit the
+        // names interned during the call: each lands at the index the interner predicted,
         // keeping the BIF's/NIF's atom terms (and every printer/comparison that resolves them)
         // consistent.
         //
@@ -738,6 +739,7 @@ impl<'a> RuntimeContext<'a> {
         let mut ctx = beam_message::CopyContext::new(&src, &mut runtime.eval_off_heap);
         beam_message::copy_struct(term, process.heap_mut(), &mut ctx).ok()
     }
+
     /// Dispatches a **NIF** call without touching the runtime's ordinary dispatch.
     ///
     /// A perfect no-op on a miss (`Ok(None)`), so it is safe to try before *every* BIF: only a
