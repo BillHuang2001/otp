@@ -1,7 +1,7 @@
 # ETS surface census — where every `ets:*` operation lives
 Static census of the **real** ETS surface OTP 29 / erts-17.1 exposes, against this workspace.
 Purpose: a future agent must not re-derive "is `ets:X` implemented, and where?".
-Gate source of truth for *behaviour* is the differential suite (`tests/differential.rs`, **159 cases**,
+Gate source of truth for *behaviour* is the differential suite (`tests/differential.rs`, **191 cases**,
 live oracle, `mismatch = 0`, `KNOWN_DIVERGENCES` **empty** — every case agrees); this file is the
 *coverage* map.
 Three owners exist:
@@ -38,7 +38,7 @@ Three owners exist:
 | `first/1`, `next/2`, `last/1`, `prev/2` | implemented | `beam_ets::Table` (`first`/`next`/`last`/`prev`, `Option::None` ⇒ `'$end_of_table'`). For the **hash kinds** (`set`/`bag`/`duplicate_bag`) `last` **is** `first` and `prev` **is** `next` (`erl_db_hash.c:853-856`) — no backward walk; only `ordered_set` has the real arithmetic order. An absent anchor is `badarg` for a hash kind (an `ordered_set` reads it as a range bound) |
 | `member/2` | implemented | `beam_ets::Table::member` |
 | `tab2list/1` | implemented | `beam_ets::Table::tab2list` |
-| `slot/2` | missing | seam-backed `unsupported_bif` (`beam_bifs::runtime::other` — a C-interior slot walk) |
+| `slot/2` | implemented here; **BIF adoption pending** | `beam_ets::Table::slot(slot: i64, atoms) -> Result<Option<Vec<Eterm>>>` (0-based; `Ok(None)` ⇒ `'$end_of_table'`; an out-of-range **or negative** slot ⇒ `badarg`) and the **read**-gated `TableAccess::slot` (the oracle's `erl_db.c:3744` `ets_slot_2` takes a `DB_READ` gate). An `ordered_set` slot is **exact** — the object with the (n+1)-th smallest key (`erl_db_tree.c:1139` `db_slot_tree_common`), `size` = EOT, `> size` = `badarg`; a hash-kind slot is a hash **bucket** (`erl_db_hash.c:1733` `db_slot_hash`), so only the contract is pinned (slots `0..nactive-1` partition every object, `nactive` = EOT, `> nactive` = `badarg`). `beam_bifs::runtime::other` still answers the typed `unsupported_bif` (§7) |
 | `first_lookup/1`, `last_lookup/1`, `next_lookup/2`, `prev_lookup/2` | implemented | `beam_bifs::ets::nav` (**read**-gated) over the table's `first`/`last`/`next`/`prev` |
 | `foldl/3`, `foldr/3` | implemented | `beam_bifs::ets::adopt::{foldl_3, foldr_3}` (**read**-gated) — the per-object fun is applied through `BifContext::call_fun` (the `FunCaller` seam), so a non-empty fold with no `FunCaller` hook is the typed `unsupported_bif`; an empty table returns `Acc0` without ever calling the fun |
 | `take/2` | implemented | `beam_ets::Table::take` (checked-out copies; the stored originals are reclaimed) |
@@ -65,7 +65,7 @@ Three owners exist:
 | `match_spec_compile/1` | implemented | `beam_bifs::ets::specs` (registry of raw specs) + `beam_ets::compile` for validation |
 | `match_spec_run/2` | implemented | `beam_ets::match_spec_run` driven by the registry (`beam_bifs::ets::specs`) |
 | `match_spec_run_r/3` | implemented | `beam_bifs::ets::specs::match_spec_run_r_3` |
-| `match_spec_test/3` (`erlang:`) | implemented | `beam_bifs::match_spec` (native structural lint + `table` dialect → `beam_ets`); the `trace` dialect is `unsupported_bif`. `match_spec_test/2` is not an OTP 29 export |
+| `match_spec_test/3` (`erlang:`) | `table` dialect implemented; `trace` dialect **left-open** | `beam_bifs::match_spec` (native structural lint + the `table` dialect → `beam_ets`, head maps included); the `trace` dialect is left-open, answered by the typed `unsupported_bif` (it folds the trace **run** into `{ok,Return,Flags,Errors}` and needs the trace-only forms — `get_tcw`/`set_tcw`/`message`/`return_trace`/… — i.e. a runner subsystem; see `CONTEXT.md` Known Issues and `src/select/CONTEXT.md`). `match_spec_test/2` is not an OTP 29 export |
 | `fun2ms/1` | missing | an `ms_transform` stdlib parse transform, not a BIF; `beam_ets` has the compiled-spec *shape* only (`select` tests are named `fun2ms_*` because they reproduce `fun2ms/1`'s output shape) |
 | `internal_select_delete/2`, `internal_delete_all/2` | implemented | `beam_bifs::ets::extra::{internal_select_delete_2, internal_delete_all_2}` (both **write**-gated) |
 | `internal_request_all/0` | missing | seam-backed `unsupported_bif` (`beam_bifs::runtime::other` — the `ets` scheduler fan-in) |
@@ -78,9 +78,15 @@ Three owners exist:
 | `from_dets/2`, `to_dets/2`, `init_table/2`, `test_ms/2`, `i/0..3` | missing | the remaining exported `ets.erl` helpers: DETS interop (`from_dets`/`to_dets`), the legacy table loader (`init_table/2`), a thin wrapper over the already-implemented `erlang:match_spec_test/3` (`test_ms/2`) and the human-readable `ets:i()` table dump. None is a `bif.tab` entry, so the BIF layer never sees them |
 | `clear/1`, `size/1` | not an OTP export | correct absence (verified against `ets:module_info(exports)` on erts-17.1; `ets:info(T, size)` is the `size` spelling) |
 ## 6. Oracle-probed semantic facts pinned by the differential suite
-These are the reference answers, each compared against the live `erl` (`tests/differential`, 159 cases).
+These are the reference answers, each compared against the live `erl` (`tests/differential`, 191 cases).
 * **Access matrix.** `requester == owner` ⇒ read + write always. Otherwise: `public` ⇒ read + write;
   `protected` ⇒ read only; `private` ⇒ neither. Every denial is `badarg`.
+  * The matrix is pinned **per operation**:
+    `tests/ets_access.rs::every_read_and_write_op_of_the_access_matrix_matches_the_live_oracle` drives
+    **every** read, every write, every `ets:info` field, every ownership op and the four continuation
+    resumes under owner + non-owner × `public`/`protected`/`private`, asserting each cell's crate
+    outcome equals the live oracle's **and** the oracle's `{SizeBefore,SizeAfter,is_list(ets:info(T))}`
+    intact triple (so a denial is `badarg` *and* left the table untouched).
   * `ets:info/1` and `ets:info/2` are **never** access-gated (a non-owner may `info` a `private` table).
   * `ets:safe_fixtable/2` and `ets:take/2` are gated as **read** / **write** (a non-owner may fix a
     `protected` table); `ets:rename/2` is **write**-gated.
@@ -243,6 +249,13 @@ These are the reference answers, each compared against the live `erl` (`tests/di
    `TableRead::{iter_keys, iter_keys_rev, iter_objects, iter_objects_rev, foldl, foldr, tab2list_into}`,
    `TableTerm::tuple_elements` and the copy-out `TableTerm::copy_into` — so `beam_bifs` can adopt the
    safe views instead of the raw read family. `Table::set_owner` **is** called (at `ets:new/2`, §7.2).
+   `take/2` carries a storage-lifetime consequence of its own: `Table::take` hands back table-owned
+   `Eterm`s and `relinquish`es each checked-out copy, so `store.words()`/`Table::memory`/`size` drop by
+   exactly the object's word count (flat across a take + re-insert churn) while the words stay valid and
+   are never returned to the free lists — a repeated take churn grows the store's block count (bounded
+   only by the total taken volume) until `delete_all_objects/1`'s `reset()` or the table drop. Inherent
+   to `take` returning a live checked-out term; reproduced by
+   `tests/ets_reclamation.rs::take_style_relinquish_churn_retains_its_arena_until_the_store_is_reset`.
 7. **Match-spec arithmetic operators default to the small-int/float subset.** `src/select/expr/arith.rs`'s
    `DefaultArithHook` computes checked `i64` arithmetic and faithful float `+ - * /`, and raises the
    typed `unsupported_ets` for a bignum operand or an integer result that leaves the 60-bit small

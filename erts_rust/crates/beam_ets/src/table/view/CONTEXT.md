@@ -19,7 +19,7 @@ later same-size insert silently reuses (a wrong, well-formed result).
   `term: Eterm` field is private; no method returns a bare aliasing `Eterm`.
 - `read.rs` — `TableRead<'g>`: owned metadata; tagged term reads (`lookup`/`member`/
   `lookup_element`/`lookup_element_or`/`lookup_element_all`/`lookup_element_all_or`/`first`/
-  `last`/`next`/`prev`/`tab2list`); the **copy-out** select family (`select`/`select_count`/
+  `last`/`next`/`prev`/`slot`/`tab2list`); the **copy-out** select family (`select`/`select_count`/
   `match_object`/`match_`) over a lazily-allocated scratch `Heap`; `table()` is `pub(in view)`.
 - `write.rs` — `TableWrite<'g>`: metadata; mutations (`insert`/`insert_new`/`insert_list`/
   `delete`/`delete_object`/`delete_all_objects`/`update_counter*`/`update_element`/`select_delete`/

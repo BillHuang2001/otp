@@ -17,7 +17,9 @@ API and its honest limits.
   removing the key's old objects, so a rebuild reclaims what it replaces instead of checking it out
   (`take`'s semantics).
 - `read.rs` — `Table` reads/navigation: `lookup`/`member`/`lookup_element(+_or/_all/_all_or)`,
-  `first`/`last`/`next`/`prev`, `take`, `size`/`is_empty`/`tab2list`/`memory`.
+  `first`/`last`/`next`/`prev`, `slot(slot: i64, atoms) -> Result<Option<Vec<Eterm>>>` (0-based;
+  `Ok(None)` ⇒ `'$end_of_table'`; an out-of-range or negative slot ⇒ `badarg`), `take`,
+  `size`/`is_empty`/`tab2list`/`memory`.
 - `rename.rs` — `Table::rename` + `RenameOutcome` (checked name write; registry rekey is the host's).
 - `shared.rs` — `SharedTable` (`Arc<RwLock<Table>>`): `read`/`write`/`with_read`/`with_write`/
   `try_into_inner`; a poisoned lock is the typed `unsupported_ets: table lock poisoned`.
@@ -86,7 +88,7 @@ advisory only (throughput, never results) — see the crate `CONTEXT.md`.
 
 ## Routing Table
 - `mod.rs` → `Table` core + write ops (`replace_key` included) + access checks + `select_all`; `TableId`/`OwnerId`
-- `read.rs` → `Table` reads, navigation, `take`
+- `read.rs` → `Table` reads, navigation, `slot`, `take`
 - `rename.rs` → `Table::rename` (`ets:rename/2`)
 - `shared.rs` → `SharedTable` (the lock handle)
 - `access.rs` → `TableAccess` (access-enforcing view)
