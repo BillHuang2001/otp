@@ -2665,3 +2665,78 @@ fn runs_reuse_the_artifacts_label_map_instead_of_rebuilding_it() {
          the one built at creation)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Measurement (not an assertion): the declined `call_ext*` seam cost
+// ---------------------------------------------------------------------------
+
+/// The `call_ext` calls one measured run makes, and the timed run count.
+///
+/// Sized like the crate's JIT workloads (`WALK_LENGTH`/`CROSS_STEPS` are 64; this is
+/// larger so the per-run setup — `Machine::reset` + the label-map build — is a small
+/// fraction of a run, which is what makes the figure track the call itself).
+const MEASURED_CALL_EXT_ROUNDS: usize = 256;
+
+/// The timed runs per tier after one warm-up run.
+const MEASURED_CALL_EXT_RUNS: u32 = 1_000;
+
+/// **A measurement, never an assertion**: the cost of a body of
+/// [`MEASURED_CALL_EXT_ROUNDS`] `call_ext` BIF calls whose host seam answers `Ok(None)`
+/// ("run it synchronously"), on both tiers.
+///
+/// This is the shape the duplicate host-seam resolution covered: a native tier lowered
+/// the `call_ext*` through [`jit_ext_call`], consulted the host's cross-module seam,
+/// and — on the host's decline — handed the whole instruction back to [`jit_step_one`],
+/// whose `call_ext*` arm consulted the **same** seam a second time. The fix routes that
+/// decline through [`jit_step_ext`]'s `Some(None)` answer, so the seam is consulted once.
+/// The seam-counter test above pins the **count**; this one reports the **cost**, so the
+/// before/after figures for one build can be compared by running the same `#[ignore]`d
+/// test against both.
+///
+/// `#[ignore]`d because it is a benchmark, not a unit test, and because it is
+/// timing-sensitive: run it alone with
+/// `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine
+/// --lib -- --ignored --nocapture measure_declined_call_ext` (one test, so no other
+/// workload's timing can contaminate it) and read the ratios across builds, never the
+/// absolute nanoseconds (this is a shared, high-load sandbox).
+#[test]
+#[ignore = "measurement: run with --ignored --nocapture"]
+fn measure_declined_call_ext() {
+    let (module, name) = declined_call_ext_module(MEASURED_CALL_EXT_ROUNDS);
+
+    for tier in [Tier::Interpreter, Tier::BaselineJit] {
+        let mut ctx = MinimalContext::new();
+        // The reference implementation of the BIF the calls reach synchronously; the
+        // host's cross-module seam keeps its default `Ok(None)` (the decline).
+        ctx.set_bif_hook(crate::jit::bench::support::arith_hook(None, None));
+        let mut machine = Machine::new();
+
+        // One warm-up run (the first execution through the artifact), not timed.
+        machine
+            .run_export_outcome_with_tier(&module, name, 0, &[], &mut ctx, tier)
+            .unwrap_or_else(|err| panic!("{tier:?}: the warm-up run returns: {err:?}"));
+
+        let start = std::time::Instant::now();
+        for _ in 0..MEASURED_CALL_EXT_RUNS {
+            let outcome = machine
+                .run_export_outcome_with_tier(&module, name, 0, &[], &mut ctx, tier)
+                .unwrap_or_else(|err| panic!("{tier:?}: a timed run returns: {err:?}"));
+            assert_eq!(
+                outcome,
+                RunOutcome::Returned(make_small(MEASURED_CALL_EXT_ROUNDS as i64)),
+                "{tier:?}: the measured body must still compute the same value"
+            );
+        }
+        let elapsed = start.elapsed();
+        let ns_per_run = elapsed.as_secs_f64() * 1e9 / f64::from(MEASURED_CALL_EXT_RUNS);
+        println!(
+            "measure_declined_call_ext | tier={:<12} runs={:<5} total={:>9.3} ms | \
+             {:>12.1} ns/run | {:>8.2} ns/call_ext",
+            tier.name(),
+            MEASURED_CALL_EXT_RUNS,
+            elapsed.as_secs_f64() * 1e3,
+            ns_per_run,
+            ns_per_run / MEASURED_CALL_EXT_ROUNDS as f64,
+        );
+    }
+}
