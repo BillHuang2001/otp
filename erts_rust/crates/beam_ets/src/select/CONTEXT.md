@@ -182,7 +182,7 @@ its compiled-opcode program. The interior is a Rust AST, not a term program.
 
 ## Routing Table
 - `mod.rs` → `MatchSpec`/`MatchClause`/`compile`/`SelectPredicate` + term-decode helpers (`atom_name`, `var_index`, `tuple_elements`, `list_elements`)
-- `pattern.rs` → `Pattern` + head decode/match (+ dead `bound_vars`)
+- `pattern.rs` → `Pattern` + head decode/match
 - `expr/mod.rs` → `Expr`/`CmpOp`/`TypeTest`/`ArithOp`/`Value` + `ArithHook` + `decode`/`decode_tuple`/`decode_call`/`eval`/`eval_term`/`value_bool`/`classify`
 - `expr/guard.rs` → the guard-BIF helpers (incl. `abs_of`/`bnot`/`integral_of`/`ceil_floor`/`float_to_integer`/`f64_magnitude_limbs`/`write_big_term`/`ceil_floor`/`max_min`/`binary_part2,3`/`is_record3`/`is_function2`/`is_integer3`/`node0,1`/`xor` + `map_get`/`map_size`/`is_map_key`/`tuple_size`/`byte_size`/`bit_size`/`float`/`trunc`/`round` + map construction) + the `SelfHook`/`set_self_hook` seam
 - `exec.rs` → `impl Table` select/match/delete/replace/count + `run_clauses`/`guards_hold`/`spec_for_pattern`/`BodyKind` + the static `select_replace` body check (`static_keeps_key`/`clause_keeps_key`, the `db_match_keeps_key` mirror)
