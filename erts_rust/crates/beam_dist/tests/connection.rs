@@ -414,6 +414,31 @@ fn a_wrong_cookie_fails_the_handshake_without_hanging() {
 }
 
 // ---------------------------------------------------------------------------
+// (d2) A clean peer close at a frame boundary is distinct from malformed data.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_clean_peer_close_at_a_frame_boundary_reports_eof_not_bad_arg() {
+    let (mut client, server) = connect_pair();
+    // Join the server and drop its connection: the underlying socket closes
+    // cleanly (a FIN), with no half-written frame in flight. The client's next
+    // frame read therefore starts at a boundary and reads no byte at all.
+    drop(joined(server));
+
+    let mut heap = Heap::new(4096).expect("heap");
+    let mut atoms = AtomTable::new();
+    match client.recv(&mut heap, &mut atoms) {
+        // "The peer went away" — reported as `UnexpectedEof`, NOT the `BadArg`
+        // that malformed/truncated wire data yields.
+        Err(BeamError::Io(err)) => assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::UnexpectedEof,
+            "a clean peer close must surface as UnexpectedEof: {err}"
+        ),
+        other => panic!("a clean peer close must be UnexpectedEof, not {other:?}"),
+    }
+}
+// ---------------------------------------------------------------------------
 // (e) A message larger than a fragment round-trips (fragmentation both ways).
 // ---------------------------------------------------------------------------
 

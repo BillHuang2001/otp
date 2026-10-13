@@ -27,8 +27,9 @@
 //! protocol over any [`Transport`], so the whole codec layer is exercised against
 //! [`MemoryTransport`](crate::transport::MemoryTransport) with no sockets;
 //! [`EpmdClient::connect`] adds the concrete `std::net::TcpStream` path (and
-//! [`lookup`]/[`lookup_port`] the one-shot `PORT2_REQ` lookup) against a real
-//! `epmd`.
+//! [`lookup_at`]/[`lookup_port_at`] — with [`lookup`]/[`lookup_port`] as the
+//! [`EPMD_DEFAULT_ADDR`]-pinned forms — the one-shot `PORT2_REQ` lookup) against
+//! a real `epmd`.
 //!
 //! # The framing is asymmetric
 //!
@@ -1210,8 +1211,12 @@ pub fn connect(addr: &str) -> Result<EpmdClient<TcpTransport>> {
 /// a name that is not registered yields [`Port2Resp::Error`] — the reply `epmd`
 /// itself sends (`epmd_srv.c:930`) — rather than a transport error. Use
 /// [`lookup_port`] when only the port is wanted.
+///
+/// This is [`lookup_at`] pinned to [`EPMD_DEFAULT_ADDR`]; use it to resolve a
+/// name against an `epmd` listening elsewhere (e.g. one an `erl` node was pointed
+/// at with `-epmd_port N`).
 pub fn lookup(name: &[u8]) -> Result<Port2Resp> {
-    EpmdClient::connect(EPMD_DEFAULT_ADDR)?.port_please(name)
+    lookup_at(EPMD_DEFAULT_ADDR, name)
 }
 
 /// The listen port of the node registered as `name` on the local `epmd`
@@ -1221,8 +1226,36 @@ pub fn lookup(name: &[u8]) -> Result<Port2Resp> {
 /// connecting to a published node ([`crate::connection::connect_to_node`]). An
 /// unregistered name is a typed [`BeamError::Io`] with
 /// [`std::io::ErrorKind::NotFound`] — never a panic and never a silent `0`.
+///
+/// This is [`lookup_port_at`] pinned to [`EPMD_DEFAULT_ADDR`].
 pub fn lookup_port(name: &[u8]) -> Result<u16> {
-    match lookup(name)? {
+    lookup_port_at(EPMD_DEFAULT_ADDR, name)
+}
+
+/// Looks a node's registration up on the `epmd` at `addr` (a `host:port` pair),
+/// returning the raw [`Port2Resp`].
+///
+/// The address-taking form of [`lookup`]: [`EpmdClient::connect`] reaches any
+/// `epmd`, so a name can be resolved against a daemon that is **not** on the
+/// well-known [`EPMD_DEFAULT_ADDR`] — for instance the private `epmd` a node was
+/// started against with `erl -epmd_port N` (`erl_epmd:get_epmd_port/0`), or the
+/// in-process stub in `tests/hermetic_epmd.rs`. A fresh connection is opened for
+/// the lookup (and closed when it is dropped); a name that is not registered
+/// yields [`Port2Resp::Error`] rather than a transport error. Use
+/// [`lookup_port_at`] when only the port is wanted.
+pub fn lookup_at(addr: &str, name: &[u8]) -> Result<Port2Resp> {
+    EpmdClient::connect(addr)?.port_please(name)
+}
+
+/// The listen port of the node registered as `name` on the `epmd` at `addr` (a
+/// `host:port` pair).
+///
+/// The address-taking form of [`lookup_port`]: [`lookup_at`] reduced to its port,
+/// so a node published on a private `epmd` (e.g. `erl -epmd_port N`) can be
+/// resolved. An unregistered name is a typed [`BeamError::Io`] with
+/// [`std::io::ErrorKind::NotFound`] — never a panic and never a silent `0`.
+pub fn lookup_port_at(addr: &str, name: &[u8]) -> Result<u16> {
+    match lookup_at(addr, name)? {
         Port2Resp::Ok { port, .. } => Ok(port),
         Port2Resp::Error => Err(BeamError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,

@@ -32,9 +32,12 @@ pub use crate::delivery::{Delivery, DeliveryOutcome, Dispatched, InboundSink, Un
 pub use crate::dist_header::*;
 pub use crate::driver::{ConnectionDriver, DriverState, StepOutcome};
 pub use crate::epmd::*;
-pub use crate::epmd::{connect, lookup, lookup_port, EPMD_DEFAULT_ADDR};
+pub use crate::epmd::{connect, lookup, lookup_at, lookup_port, lookup_port_at, EPMD_DEFAULT_ADDR};
 pub use crate::flags::*;
-pub use crate::framing::{is_tick, read_packet, write_packet, write_tick, PacketHeaderSize};
+pub use crate::framing::{
+    is_tick, read_length_or_eof, read_packet, read_packet_or_eof, write_packet, write_tick,
+    PacketHeaderSize,
+};
 pub use crate::handshake::*;
 pub use crate::transport::{MemoryTransport, Transport};
 

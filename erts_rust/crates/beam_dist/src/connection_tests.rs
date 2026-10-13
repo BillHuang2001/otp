@@ -658,6 +658,48 @@ fn recv_rejects_an_unknown_message_shape() {
 }
 
 #[test]
+fn recv_reports_a_clean_peer_eof_at_a_frame_boundary_distinctly() {
+    // A peer that closes the connection with nothing buffered has ended the link
+    // cleanly: the frame read starts at a boundary and reads no byte at all.
+    // That must be a typed `UnexpectedEof`, NOT the `BadArg` reserved for
+    // malformed/truncated wire data — so a caller can tell "the peer went away"
+    // from "the wire is corrupt".
+    let mut conn = connection(Vec::new());
+    let mut heap = Heap::new(64).unwrap();
+    let mut atoms = AtomTable::new();
+    match conn.recv(&mut heap, &mut atoms) {
+        Err(BeamError::Io(err)) => assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::UnexpectedEof,
+            "a clean peer EOF must be UnexpectedEof: {err}"
+        ),
+        other => panic!("a clean peer EOF must be UnexpectedEof, not {other:?}"),
+    }
+}
+
+#[test]
+fn recv_rejects_a_truncated_length_prefix_with_badarg() {
+    // Only two of the four length-prefix bytes arrived before the end of the
+    // input: the frame was *started*, so this is a truncated frame (BadArg), not
+    // a clean EOF.
+    let mut conn = connection(vec![0x00, 0x00]);
+    let mut heap = Heap::new(64).unwrap();
+    let mut atoms = AtomTable::new();
+    assert!(matches!(conn.recv(&mut heap, &mut atoms), Err(BeamError::BadArg)));
+}
+
+#[test]
+fn recv_rejects_a_truncated_body_with_badarg() {
+    // A well-formed length prefix advertising four body bytes, but only two are
+    // present: the frame boundary was passed, so this is still a truncated frame.
+    let mut input = framed(&[0xff, 0xff, 0xff, 0xff], ESTABLISHED_FRAMING);
+    input.truncate(input.len() - 2);
+    let mut conn = connection(input);
+    let mut heap = Heap::new(64).unwrap();
+    let mut atoms = AtomTable::new();
+    assert!(matches!(conn.recv(&mut heap, &mut atoms), Err(BeamError::BadArg)));
+}
+#[test]
 fn send_message_selects_the_negotiated_send_opcode() {
     let atoms = AtomTable::new();
     let mut conn = connection(Vec::new());

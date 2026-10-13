@@ -70,13 +70,14 @@ pub use crate::delivery::{Delivery, DeliveryOutcome, Dispatched, InboundSink, Un
 pub use crate::dist_header::{AtomCacheRef, DistFragment, DistHeader};
 pub use crate::driver::{ConnectionDriver, DriverState, StepOutcome};
 pub use crate::epmd::{
-    connect, lookup, lookup_port, Alive2Req, Alive2Resp, DumpLine, DumpNodeKind, DumpReq, DumpResp,
-    EpmdClient, KillReq, KillResp, NamesResp, Port2Req, Port2Resp, StopReq, StopResp,
-    EPMD_DEFAULT_ADDR, MAX_DUMP_RESP_BODY,
+    connect, lookup, lookup_at, lookup_port, lookup_port_at, Alive2Req, Alive2Resp, DumpLine,
+    DumpNodeKind, DumpReq, DumpResp, EpmdClient, KillReq, KillResp, NamesResp, Port2Req, Port2Resp,
+    StopReq, StopResp, EPMD_DEFAULT_ADDR, MAX_DUMP_RESP_BODY,
 };
 pub use crate::flags::{AltactSigFlags, DistFlags, DistSpawnFlags, Dop};
 pub use crate::framing::{
-    is_tick, read_length, read_packet, write_packet, write_tick, PacketHeaderSize, MAX_PACKET_BODY,
+    is_tick, read_length, read_length_or_eof, read_packet, read_packet_or_eof, write_packet,
+    write_tick, PacketHeaderSize, MAX_PACKET_BODY,
 };
 pub use crate::handshake::{
     check_mandatory, preferred_flags, publish_flag, publish_type, status_error, verify_digest,

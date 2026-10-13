@@ -107,6 +107,54 @@ pub fn read_packet<R: Read>(r: &mut R, hdr: PacketHeaderSize) -> Result<Vec<u8>>
     Ok(body)
 }
 
+/// Reads a length prefix, distinguishing a **clean end of stream at the frame
+/// boundary** (`Ok(None)`) from a truncated prefix.
+///
+/// The prefix is read with [`Read::read_exact_or_eof`], so a peer that closed the
+/// connection before sending any byte of the prefix reports `Ok(None)` — no frame
+/// was started. A peer that closed *part-way through* the prefix (some bytes, then
+/// end of stream) is a truncated frame and yields `BeamError::BadArg`, exactly as
+/// [`read_length`] would. An advertised length beyond the ceiling of `hdr` is
+/// `BeamError::SystemLimit`.
+pub fn read_length_or_eof<R: Read>(r: &mut R, hdr: PacketHeaderSize) -> Result<Option<usize>> {
+    let width = hdr.bytes();
+    let mut buf = [0u8; 4];
+    if !r.read_exact_or_eof(&mut buf[..width])? {
+        return Ok(None);
+    }
+    let len = match hdr {
+        PacketHeaderSize::Two => usize::from(u16::from_be_bytes([buf[0], buf[1]])),
+        PacketHeaderSize::Four => u32::from_be_bytes(buf) as usize,
+    };
+    if len > ceiling(hdr) {
+        return Err(BeamError::SystemLimit);
+    }
+    Ok(Some(len))
+}
+
+/// Reads a length-framed packet body, reporting a clean end of stream **at the
+/// frame boundary** as `Ok(None)`.
+///
+/// This is [`read_packet`] with the boundary made observable: an end of stream
+/// before the length prefix yields `Ok(None)` (no frame was started at all),
+/// whereas a truncated prefix or a truncated body is still an error
+/// (`BeamError::BadArg`) and a zero-length packet is still a tick
+/// (`Ok(Some(vec![]))`).
+pub fn read_packet_or_eof<R: Read>(r: &mut R, hdr: PacketHeaderSize) -> Result<Option<Vec<u8>>> {
+    let len = match read_length_or_eof(r, hdr)? {
+        Some(len) => len,
+        None => return Ok(None),
+    };
+    if len == 0 {
+        // A zero-length packet is a tick: return an empty body, never allocate.
+        return Ok(Some(Vec::new()));
+    }
+    // `len` is validated against the ceiling above, so this allocation is bounded.
+    let mut body = vec![0u8; len];
+    r.read_exact(&mut body)?;
+    Ok(Some(body))
+}
+
 /// Writes `body` with its length prefix.
 pub fn write_packet<W: Write>(w: &mut W, hdr: PacketHeaderSize, body: &[u8]) -> Result<()> {
     // Reject an oversized body rather than silently truncating the length

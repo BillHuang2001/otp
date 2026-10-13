@@ -168,14 +168,23 @@ Crate constants: `DIST_VERSION: u16 = 6`, `DIST_VERSION_5: u16 = 5`, `EPMD_PORT:
 
 ### `src/transport.rs` — the abstract transport seam (safe)
 - `trait Read` / `trait Write` (with default big-endian helpers) + blanket `trait Transport`.
-- `struct MemoryTransport` — full-duplex in-memory test double.
+- `Read::read_exact_or_eof(&mut self, buf) -> Result<bool>` — the frame-boundary seam: `Ok(true)`
+  when `buf` was filled, `Ok(false)` on a **clean end of stream before any byte was read**, a
+  truncated read (`BadArg`) when some bytes arrived but `buf` was not filled. The trait default
+  delegates to `read_exact` (so it can only return `Ok(true)`/an error, and no implementor is forced
+  to change); `TcpTransport` and `MemoryTransport` override it.
+- `struct MemoryTransport` — full-duplex in-memory test double (its exhausted input is a clean EOF
+  at a frame boundary for `read_exact_or_eof`, a `BadArg` for `read_exact`).
 - Errors: transport failure → `BeamError::Io`; a short read → `BeamError::BadArg`.
 
 ### `src/framing.rs` — packet-length framing (safe)
 - `enum PacketHeaderSize { Two, Four }`; `read_length`/`read_packet`/`write_packet`/`write_tick`/
   `is_tick`; `MAX_PACKET_BODY` (`u32::MAX`). A zero-length packet is a **tick**; over-ceiling
   advertised length ⇒ `BeamError::SystemLimit`.
-
+- `read_length_or_eof`/`read_packet_or_eof` — the EOF-aware forms: `Ok(None)` when the stream ended
+  **at the frame boundary** (no byte of the length prefix arrived), otherwise identical to
+  `read_length`/`read_packet` (a truncated prefix/body is still `BadArg`, a zero-length packet is
+  still `Ok(Some(tick))`).
 ### `src/handshake.rs` — connect/challenge handshake messages (safe)
 - Body codecs (tag + fields, no length prefix) for `Name` (`'N'`), `Status` (`'s'`), `Challenge`
   (`'N'`), `ChallengeReply` (`'r'`), `ChallengeAck` (`'a'`), `Complement` (`'c'`) — each
@@ -265,7 +274,13 @@ Decisions).
   `epmd::connect(addr)` — a real TCP client to `epmd` (sets `DEFAULT_READ_TIMEOUT` + `TCP_NODELAY`).
 - `epmd::lookup(name) -> Result<Port2Resp>` (raw) and `epmd::lookup_port(name) -> Result<u16>`
   (`Port2Resp::Error` ⇒ `BeamError::Io(NotFound)`, never a silent `0`); both connect to
-  `EPMD_DEFAULT_ADDR` (`"127.0.0.1:4369"`, pinned to `EPMD_PORT`).
+  `EPMD_DEFAULT_ADDR` (`"127.0.0.1:4369"`, pinned to `EPMD_PORT`) and delegate to the
+  address-taking forms below.
+- `epmd::lookup_at(addr: &str, name) -> Result<Port2Resp>` and
+  `epmd::lookup_port_at(addr: &str, name) -> Result<u16>` — the same lookups against an **arbitrary**
+  `epmd` address (the plumbing that lets a name be resolved against a private daemon, e.g.
+  `erl -epmd_port N`). `lookup_port_at` applies the identical `Port2Resp::Error` ⇒ `Io(NotFound)`
+  translation (never a silent `0`).
 - Typed accessors: `Alive2Resp::{is_accepted, is_rejected, is_alive_conflict, creation}`,
   `Port2Resp::{is_registered, is_not_registered}`.
 - Admin/DUMP codecs: `DumpReq`/`DumpResp`/`DumpLine`/`DumpNodeKind { Active, OldUnused }` (the
@@ -298,7 +313,11 @@ Decisions).
   `send_link(from, to, atoms)` / `send_exit(from, to, reason, atoms)` /
   `send_monitor_p(from, to, ref, atoms)` / `send_demonitor_p(from, to, ref, atoms)`.
   `MAX_ESTABLISHED_PACKET_BODY`. The connection owns an `OutboundAtomCache` that `send_payload` drains
-  via `take_header()`.
+  via `take_header()`. **The frame read (`read_message_body`) distinguishes a clean peer EOF from
+  malformed data**: a peer that closed the socket at a frame boundary surfaces as `BeamError::Io` with
+  `std::io::ErrorKind::UnexpectedEof`, while a truncated/malformed frame stays `BadArg` (the
+  handshake reads keep the plain `read_packet`/`BadArg` behaviour). The `TcpTransport` `Read` impl
+  overrides `read_exact_or_eof` to make that distinction over a real socket.
 
 ### `src/delivery.rs` — inbound `DOP_*` delivery classification + the `InboundSink` seam (safe)
 Turns a decoded [`ControlMessage`] into its **semantic** delivery and routes it to the local recipient.
@@ -401,17 +420,21 @@ and derives the report from that observed state.
     (the header it yields resolves the payload the encoder wrote).
   - `tests/connection.rs` — hermetic loopback (real `TcpListener` on `127.0.0.1:0`, server on a
     thread): both handshake roles, a `DOP_*` round-trip, a >`DIST_FRAGMENT_SIZE` message, a tick, a
-    wrong-cookie failure that is not a hang, and the **outbound atom cache over a real link** (one
+    wrong-cookie failure that is not a hang, a **clean peer close at a frame boundary** surfacing as
+    `Io(UnexpectedEof)` (never `BadArg`), and the **outbound atom cache over a real link** (one
     `New` ref per atom, `82 + index` payload, the peer resolves the names). A spy transport asserts
     `'E'` frames really crossed; the new `TcpListener` path is exercised (`accept` on a thread, plus a
     non-blocking `accept` → `WouldBlock`), and the typed `send_reg_send`/`send_link`/`send_exit`/
     `send_monitor_p` helpers round-trip.
+  - `src/connection_tests.rs` — the same frame-read seam hermetically over `MemoryTransport`: a clean
+    peer EOF at a frame boundary ⇒ `Io(UnexpectedEof)`, while a **truncated length prefix** and a
+    **truncated body** both stay `BadArg` (boundary vs mid-frame, no real socket needed).
   - `tests/epmd.rs` — the epmd codecs plus **live epmd**: `publish` an `ALIVE2_REQ` on one connection,
     `port_please`/`lookup_port` it over a second, observe de-registration on close, `connect_to_node`
-    end-to-end, and a live `DUMP_REQ` (asserting the published node's own `Active` line); the
-    `PORT2_REQ` framing pin (frame length = `1 + name.len()`, the name is the packet remainder) and the
-    `not_registered` → `Io(NotFound)` typed error. `KILL`/`STOP` are codec-only (destructive). Skips
-    loudly when epmd is unreachable.
+    end-to-end, a live `DUMP_REQ` (asserting the published node's own `Active` line), and a live
+    `lookup_at`/`lookup_port_at` resolution; the `PORT2_REQ` framing pin (frame length =
+    `1 + name.len()`, the name is the packet remainder) and the `not_registered` → `Io(NotFound)` typed
+    error. `KILL`/`STOP` are codec-only (destructive). Skips loudly when epmd is unreachable.
   - `tests/driver.rs` — the `ConnectionDriver`, hermetic: two drivers shuttling `take_output()` bytes
     (whole-buffer **and** byte-at-a-time), negotiated flags/peer names, an atom-cache round trip
     (`New` then `Cached`), the exact empty header `131,68,0`, a >`DIST_FRAGMENT_SIZE` message both ways
@@ -442,7 +465,9 @@ and derives the report from that observed state.
     and the v6 "no `DOP_NODEUP`/`DOP_NODEDOWN`" pin.
   - `tests/hermetic_epmd.rs` — a test-local `epmd` **registry stub** (an **independent** hand-written
     request decoder / reply encoder, so the round-trip is not self-consistent by construction) driving
-    the crate's `EpmdClient` (`publish`/`port_please`/`names`/`stop`) hermetically, plus an **oracle
+    the crate's `EpmdClient` (`publish`/`port_please`/`names`/`stop`) and the address-taking
+    `lookup_at`/`lookup_port_at` (the stub's ephemeral port is exactly the non-default address those
+    forms exist for — including the `Io(NotFound)` translation) hermetically, plus an **oracle
     cross-check** that spawns a real node with `erl -epmd_port <stub>` and asserts the stub parsed the
     node's `ALIVE2_REQ` and the crate's client resolved its port. Needs no host `epmd`; skips loudly
     only when `erl` is absent.
@@ -528,6 +553,21 @@ and derives the report from that observed state.
   distribution header is decoded (and applied to the receive atom cache) in `next_message`, because a
   `NewAtomCacheRef`'s interned atoms must land in the *same* `AtomTable` the payload decodes against
   (otherwise a payload `ATOM_CACHE_REF` could collide with an inline atom's index).
+- **The frame-boundary EOF seam is a *defaulted* `Read` method.** `Read::read_exact_or_eof`
+  returns `Ok(false)` only for a clean end of stream *before any byte of the buffer was read*, so it
+  can be added to the trait without touching a single implementor (the default delegates to
+  `read_exact` and can only return `Ok(true)`/an error). `TcpTransport` overrides it (a `0`-byte
+  `read` at the start of the buffer is `Ok(false)`; a partial read is `BadArg`) and `MemoryTransport`
+  maps an exhausted input to `Ok(false)`. The blocking `Connection`'s established frame read
+  (`read_message_body`, via `framing::read_packet_or_eof`) turns that into
+  `BeamError::Io(UnexpectedEof)`, distinct from the `BadArg` of a truncated/malformed frame; the
+  handshake reads deliberately keep the plain `read_packet` (`BadArg`) behaviour, and the
+  non-blocking `ConnectionDriver` path is unchanged (`feed_eof` → `StepOutcome::Closed`).
+- **The `epmd` lookups have address-taking forms.** `lookup_at`/`lookup_port_at(addr, name)` are the
+  primitives; `lookup`/`lookup_port` are thin wrappers pinned to `EPMD_DEFAULT_ADDR` (no behaviour
+  change). This is what lets a name be resolved against a private daemon (`erl -epmd_port N`) and
+  what makes the `Io(NotFound)` translation testable against the hermetic `epmd` stub, which does not
+  listen on the well-known address.
 - **`NamesResp::encode` is lossy** (per-node ports are not retained) — decoding (the client direction)
   is exact.
 
@@ -581,19 +621,9 @@ and derives the report from that observed state.
   is `DeliveryOutcome::Unsupported`; and the node does **not** advertise `DFLAG_PUBLISHED`/visibility at
   startup (no `publish_flag` caller). The value/connection layer plus this accept-only wiring is the
   whole of the current distribution support.
-- **`epmd::lookup`/`epmd::lookup_port` are pinned to `127.0.0.1:4369`.** Only the address-taking
-  `EpmdClient::connect(addr)`/`epmd::connect(addr)` can reach a non-default `epmd` (e.g. one an `erl`
-  node was pointed at with `-epmd_port N`); there is no `lookup_port_at(addr, name)` convenience and
-  the `lookup_port`-only "unknown name → `Io(NotFound)`" translation is therefore not reachable
-  against a custom epmd (use `port_please` + `Port2Resp::is_not_registered` there).
-- **The blocking `Connection` does not distinguish a clean peer EOF from malformed data.** The
-  transport seam maps a short/zero-length read to `BeamError::BadArg` (`src/transport.rs`), so a peer
-  closing the socket surfaces as `BadArg` — indistinguishable from garbage. The non-blocking
-  `ConnectionDriver` (the runtime's path) *does* distinguish it: the runtime's 0-byte read →
-  `feed_eof()` → `StepOutcome::Closed`. Tick *scheduling* and the `net_ticktime` `{nodedown,Node}`
-  decision are `net_kernel`'s (Erlang, `lib/kernel/src/net_kernel.erl`) job, not this crate's; this
-  crate only answers an inbound tick.
-
+- **Tick *scheduling* is `net_kernel`'s job.** The `net_ticktime` timeout and the resulting
+  `{nodedown,Node}` decision belong to `net_kernel` (Erlang, `lib/kernel/src/net_kernel.erl`), not
+  this crate's; this crate only answers an inbound tick.
 ## Notes for Agents
 - **A safe pid/port/ref term builder exists.** `beam_codec::term::{make_external_pid,
   make_external_port, make_external_ref}` are safe public wrappers over `beam_term::thing`'s raw
@@ -628,8 +658,10 @@ and derives the report from that observed state.
 - `src/flags.rs` → `DFLAG_*` + `DistFlags`, the `DOP_*` opcodes + `Dop`, flag sets, the in-term
   `DIST_SPAWN_FLAG_*`/`DOP_ALTACT_SIG_FLG_*` vocabularies + `DistSpawnFlags`/`AltactSigFlags`,
   handshake/epmd tags
-- `src/transport.rs` → the abstract `Read`/`Write`/`Transport` seam + `MemoryTransport` test double
-- `src/framing.rs` → 2-/4-byte packet-length framing, tick, `PacketHeaderSize`
+- `src/transport.rs` → the abstract `Read`/`Write`/`Transport` seam (incl. the defaulted
+  `read_exact_or_eof` frame-boundary method) + `MemoryTransport` test double
+- `src/framing.rs` → 2-/4-byte packet-length framing, tick, `PacketHeaderSize`, and the EOF-aware
+  `read_length_or_eof`/`read_packet_or_eof`
 - `src/handshake.rs` → `Name`/`Status`/`Challenge`/`ChallengeReply`/`ChallengeAck`/`Complement`
   codecs, `preferred_flags`/`check_mandatory`, the `ChallengeDigest`/`ChallengeSource` seams,
   `StatusKind`/`Status::kind`/`error_kind`/`status_error`, and `publish_flag`/`publish_type`/
@@ -649,7 +681,9 @@ and derives the report from that observed state.
   plus the `connect_client_with_flags`/`accept_server_with_flags` overrides),
   `connect_to_node` (epmd→TCP→handshake), `Connection` (owning the outbound atom cache) with
   `send_control`/`send_message`/`send_tick`/`recv`/`recv_delivery`/`dispatch_inbound` + the typed
-  `send_reg_send`/`send_link`/`send_exit`/`send_monitor_p`/`send_demonitor_p` helpers
+  `send_reg_send`/`send_link`/`send_exit`/`send_monitor_p`/`send_demonitor_p` helpers, and the
+  `read_message_body` frame read that reports a clean peer EOF as `Io(UnexpectedEof)` (the
+  `TcpTransport` `read_exact_or_eof` override)
 - `src/connection_tests.rs` → the `connection` module's in-module unit tests (path-included via
   `#[cfg(test)] #[path] mod tests;` so `connection.rs` stays ~1000 lines)
 - `src/driver.rs` → the non-blocking `ConnectionDriver` poll/step state machine (`feed`/`step`/
@@ -657,7 +691,8 @@ and derives the report from that observed state.
   `DriverState`/`StepOutcome`
 - `src/epmd.rs` → `epmd` request/response codecs (incl. the `DUMP`/`KILL`/`STOP` admin set +
   `MAX_DUMP_RESP_BODY`), `EpmdClient` over `Transport` (`publish`/`port_please`/`names`/`dump`/`kill`/
-  `stop`), and the real TCP client (`connect`/`lookup`/`lookup_port`, `EPMD_DEFAULT_ADDR`)
+  `stop`), and the real TCP client (`connect`, the address-taking `lookup_at`/`lookup_port_at`, and the
+  `EPMD_DEFAULT_ADDR`-pinned `lookup`/`lookup_port` wrappers)
 - `src/bin/dist_probe.rs` → the hermetic two-node loopback CLI (`dist_probe loopback <ping|nodes|term>`)
   the differential harness drives as an external command; not part of the library API
 - `tests/{constants,auth,handshake,framing,control,delivery,dop_roundtrip,epmd,fragment,atom_cache,connection,driver}.rs`
@@ -674,7 +709,8 @@ and derives the report from that observed state.
   round-trip, ticks, >`DIST_FRAGMENT_SIZE` both ways, an `InboundSink` routing a delivery, a real
   non-blocking-socket `ConnectionDriver` pair, clean-close vs abrupt-drop peer death) — no `erl`/`epmd`
 - `tests/hermetic_epmd.rs` → test-local `epmd` registry stub (ALIVE2/PORT2/NAMES/STOP) + the crate
-  client hermetically + an `erl -epmd_port <stub>` oracle cross-check — no host `epmd`
+  client and the address-taking `lookup_at`/`lookup_port_at` hermetically + an `erl -epmd_port <stub>`
+  oracle cross-check — no host `epmd`
 - `tests/dist_probe_cli.rs` → the `dist_probe` bin's CLI contract (exact stdout + exit 0 for the three
   reports; exit 2 on a usage error), run via `env!("CARGO_BIN_EXE_dist_probe")`
 - `../../../erts/emulator/beam/dist.h` · `dist.c` · `external.c` · `external.h` · `packet_parser.c` →

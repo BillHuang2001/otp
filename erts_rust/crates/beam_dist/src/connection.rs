@@ -122,7 +122,8 @@ use crate::dist_header::{DistHeader, DIST_HEADER};
 use crate::flags::{DistFlags, Dop, DFLAG_FRAGMENTS, DFLAG_SEND_SENDER};
 use crate::fragment::{split, Assembly, FragmentAssembler, DIST_FRAGMENT_SIZE};
 use crate::framing::{
-    is_tick, read_packet, write_packet, write_tick, PacketHeaderSize, MAX_PACKET_BODY,
+    is_tick, read_packet, read_packet_or_eof, write_packet, write_tick, PacketHeaderSize,
+    MAX_PACKET_BODY,
 };
 use crate::handshake::{
     check_mandatory, preferred_flags, publish_type, status_error, Challenge, ChallengeAck,
@@ -221,6 +222,29 @@ impl Read for TcpTransport {
             Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => Err(BeamError::BadArg),
             Err(err) => Err(BeamError::Io(err)),
         }
+    }
+
+    fn read_exact_or_eof(&mut self, buf: &mut [u8]) -> Result<bool> {
+        // Read until `buf` is full. A `0`-byte read means the peer closed the
+        // socket: at the *start* of the read (no byte filled yet) that is a clean
+        // EOF at a frame boundary (`Ok(false)`); after some bytes it is a
+        // truncated frame (`BadArg`). `Interrupted` is retried, as `read_exact`
+        // would; any other I/O failure (including a read timeout) is `Io`.
+        let mut filled = 0;
+        while filled < buf.len() {
+            match std::io::Read::read(&mut self.stream, &mut buf[filled..]) {
+                Ok(0) => {
+                    if filled == 0 {
+                        return Ok(false);
+                    }
+                    return Err(BeamError::BadArg);
+                }
+                Ok(n) => filled += n,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(BeamError::Io(err)),
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -1005,12 +1029,19 @@ impl<T: Transport> Connection<T> {
     /// Reads the next complete (defragmented) message body.
     ///
     /// Ticks are answered transparently; a fragment sequence is buffered until its
-    /// last frame arrives.
+    /// last frame arrives. A peer that closed the connection cleanly at a frame
+    /// boundary is reported as [`BeamError::Io`] with
+    /// [`std::io::ErrorKind::UnexpectedEof`] — distinct from the
+    /// [`BeamError::BadArg`] a malformed or truncated frame yields, so a caller
+    /// can tell "the peer went away" from "the wire is corrupt".
     fn read_message_body(&mut self) -> Result<Vec<u8>> {
         loop {
             let packet = match self.pending.take() {
                 Some(packet) => packet,
-                None => read_packet(&mut self.transport, ESTABLISHED_FRAMING)?,
+                None => match read_packet_or_eof(&mut self.transport, ESTABLISHED_FRAMING)? {
+                    Some(packet) => packet,
+                    None => return Err(peer_closed()),
+                },
             };
             if is_tick(&packet) {
                 self.send_tick()?;
@@ -1031,6 +1062,20 @@ impl<T: Transport> Connection<T> {
             }
         }
     }
+}
+
+/// The typed error a **clean peer EOF at a frame boundary** produces on the
+/// blocking [`Connection`] path.
+///
+/// It is deliberately distinct from [`BeamError::BadArg`] (malformed/truncated
+/// wire data), so a caller can tell `Ok(0)`-at-frame-boundary from garbage. The
+/// non-blocking [`ConnectionDriver`](crate::driver::ConnectionDriver) reports the
+/// same condition as [`StepOutcome::Closed`](crate::driver::StepOutcome::Closed).
+fn peer_closed() -> BeamError {
+    BeamError::Io(std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        "beam_dist: peer closed the connection at a frame boundary",
+    ))
 }
 
 /// Splits a received message body into its distribution header and the offset at
