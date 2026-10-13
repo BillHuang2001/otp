@@ -20,14 +20,34 @@
 
 //! Exit signals: the well-known atoms, the propagation rule and the signal-message builders.
 //!
-//! The exit semantics of Erlang are a pure function of the reason and the target's
-//! `trap_exit` flag, which is exactly what [`exit_policy`] computes:
+//! The exit semantics of Erlang are a pure function of the reason, the target's `trap_exit` flag
+//! **and the signal's family** — which is exactly what [`exit_policy`] computes. The family is the
+//! C's `ERTS_PROC_SIG_OP(tag)` on a `ERTS_SIG_Q_TYPE_GEN_EXIT` signal
+//! (`erts/emulator/beam/erl_proc_sig_queue.h:176-177`, `erl_proc_sig_queue.c:4740-4770`):
 //!
-//! * reason `kill` ⇒ [`ExitPolicy::Terminate`] with reason `killed` — **untrappable**;
-//! * otherwise trapping ⇒ [`ExitPolicy::Trap`] — the reason is delivered as an
-//!   `{'EXIT', From, Reason}` message;
-//! * otherwise reason `normal` ⇒ [`ExitPolicy::Ignore`];
-//! * otherwise ⇒ [`ExitPolicy::Terminate`] with the reason unchanged.
+//! * [`ExitFamily::Explicit`] — `ERTS_SIG_Q_OP_EXIT` (0), an explicit `erlang:exit/2` signal:
+//!   * reason `kill` ⇒ [`ExitPolicy::Terminate`] with reason `killed` — **untrappable**;
+//!   * otherwise trapping ⇒ [`ExitPolicy::Trap`] — the reason is delivered as an
+//!     `{'EXIT', From, Reason}` message;
+//!   * otherwise reason `normal` ⇒ [`ExitPolicy::Ignore`];
+//!   * otherwise ⇒ [`ExitPolicy::Terminate`] with the reason unchanged.
+//! * [`ExitFamily::Linked`] — `ERTS_SIG_Q_OP_EXIT_LINKED` (1), a link exit (a linked peer's
+//!   termination, a node-down or a port-close cascade). Here `kill` is **trappable**, and the
+//!   reason is never rewritten:
+//!   * trapping ⇒ [`ExitPolicy::Trap`] (the peer receives `{'EXIT', From, kill}` and survives);
+//!   * otherwise reason `normal` ⇒ [`ExitPolicy::Ignore`];
+//!   * otherwise ⇒ [`ExitPolicy::Terminate`] with the reason **unchanged** — a `kill` link exit
+//!     terminates a non-trapping process with `kill`, never `killed`.
+//!
+//! The C's `ERTS_SIG_LNK_X_FLAG_NORMAL_KILLS` escape (`erl_proc_sig_queue.c:4758-4759`,
+//! `:1809`), which makes a `normal` link exit terminate anyway, is **not modelled** (a documented
+//! gap).
+//!
+//! The **third** signal category — a monitor `{'DOWN', …}`
+//! (`ERTS_SIG_Q_OP_MONITOR_DOWN`, `erl_proc_sig_queue.h:178`) — never consults this policy at all:
+//! the C handles it in its own arm (`erl_proc_sig_queue.c:6355`) and this crate in its own
+//! ([`crate::ptab::ProcessTable`]'s `deliver_down_message`), so a DOWN is delivered
+//! **unconditionally**, whatever the receiver's `trap_exit` flag says.
 //!
 //! The message builders allocate the message terms on the *receiving* process's heap
 //! (through `beam_alloc::Heap`), so a built `{'EXIT', …}`/`{'DOWN', …}` term is already
@@ -39,8 +59,8 @@
 //! (`{Tag, Reference, Kind, Target, Reason}`), exactly as the oracle delivers it.
 //!
 //! Legacy C ground truth (read-only): `erts/emulator/beam/erl_monitor_link.c`,
-//! `erl_proc_sig_queue.c` and the `am_exit`/`am_down`/`am_kill`/`am_killed` atoms of
-//! `atom.names`.
+//! `erl_proc_sig_queue.{c,h}` (the `ERTS_SIG_Q_OP_EXIT` / `ERTS_SIG_Q_OP_EXIT_LINKED` families and
+//! `handle_exit_signal`) and the `am_exit`/`am_down`/`am_kill`/`am_killed` atoms of `atom.names`.
 
 use beam_alloc::Heap;
 use beam_common::Result;
@@ -180,12 +200,28 @@ impl SignalAtoms {
 /// The class of an exit reason, as far as propagation is concerned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReasonClass {
-    /// The `normal` reason: silently ignored by a non-trapping target.
+    /// The `normal` reason: silently ignored by a non-trapping target, in **both** families.
     Normal,
-    /// The `kill` reason: terminates any target, `trap_exit` or not.
+    /// The `kill` reason: **untrappable only in the [`ExitFamily::Explicit`] family**, where it
+    /// also terminates with the rewritten `killed`; a [`ExitFamily::Linked`] `kill` is an ordinary
+    /// trappable reason (see [`exit_policy`]).
     Kill,
     /// Every other reason.
     Other,
+}
+
+/// The **family** an exit signal belongs to — the C's `ERTS_PROC_SIG_OP(tag)` on an
+/// `ERTS_SIG_Q_TYPE_GEN_EXIT` signal (`erts/emulator/beam/erl_proc_sig_queue.h:176-177`), which is
+/// what decides whether `kill` is untrappable (`erl_proc_sig_queue.c:4740-4770`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExitFamily {
+    /// An explicit `erlang:exit/2` signal — the C's `ERTS_SIG_Q_OP_EXIT` (0). Here `kill` is
+    /// **untrappable** and terminates with the rewritten `killed`.
+    Explicit,
+    /// A link exit — the C's `ERTS_SIG_Q_OP_EXIT_LINKED` (1): a linked peer's termination, or the
+    /// node-down / port-close cascade. Here `kill` **is** trappable and the reason is never
+    /// rewritten.
+    Linked,
 }
 
 /// An exit signal from one process to another.
@@ -209,17 +245,45 @@ pub enum ExitPolicy {
 }
 
 /// Computes the propagation rule for `reason` against a target whose `trap_exit` flag is
-/// `trapping` (see the module docs for the table).
-pub fn exit_policy(reason: Eterm, trapping: bool, atoms: &SignalAtoms) -> ExitPolicy {
-    match atoms.classify(reason) {
-        // `kill` is untrappable: it terminates with `killed` whatever the flag says.
-        ReasonClass::Kill => ExitPolicy::Terminate(atoms.killed_term()),
-        // Every other reason is trapped as a message when the target traps exits ...
-        _ if trapping => ExitPolicy::Trap,
-        // ... a `normal` reason is otherwise ignored ...
-        ReasonClass::Normal => ExitPolicy::Ignore,
-        // ... and any other reason terminates the target unchanged.
-        ReasonClass::Other => ExitPolicy::Terminate(reason),
+/// `trapping`, for a signal of family `family` — the C's `handle_exit_signal`
+/// (`erts/emulator/beam/erl_proc_sig_queue.c:4740-4770`):
+///
+/// ```text
+/// untrappable = family == Explicit && classify(reason) == Kill
+/// if !untrappable && trapping                             -> Trap
+/// else if classify(reason) == Normal                      -> Ignore
+/// else if untrappable (Explicit && Kill)                  -> Terminate(killed)
+/// else                                                    -> Terminate(reason)
+/// ```
+///
+/// In particular `kill` is untrappable **only** in the [`ExitFamily::Explicit`] family; a
+/// [`ExitFamily::Linked`] `kill` is an ordinary trappable reason whose termination reason is
+/// **unchanged** (`kill`, never `killed`). A `normal` reason is ignored by a non-trapping target
+/// in **both** families. See the module docs for the full table.
+pub fn exit_policy(
+    reason: Eterm,
+    trapping: bool,
+    family: ExitFamily,
+    atoms: &SignalAtoms,
+) -> ExitPolicy {
+    let class = atoms.classify(reason);
+    // `erl_proc_sig_queue.c:4740`: `(op != ERTS_SIG_Q_OP_EXIT || reason != am_kill)` — the
+    // untrappable sentinel is confined to the explicit `erlang:exit/2` family.
+    let untrappable = family == ExitFamily::Explicit && class == ReasonClass::Kill;
+    if !untrappable && trapping {
+        // Everything but an explicit `kill` is trapped as `{'EXIT', From, Reason}`.
+        ExitPolicy::Trap
+    } else if class == ReasonClass::Normal {
+        // A `normal` exit is ignored by a non-trapping target, in both families
+        // (`erl_proc_sig_queue.c:4758`).
+        ExitPolicy::Ignore
+    } else if untrappable {
+        // The `reason = am_killed` rewrite, guarded by `op == ERTS_SIG_Q_OP_EXIT`
+        // (`erl_proc_sig_queue.c:4768`): only an explicit `kill` becomes `killed`.
+        ExitPolicy::Terminate(atoms.killed_term())
+    } else {
+        // Every other reason terminates the target unchanged — including a linked-family `kill`.
+        ExitPolicy::Terminate(reason)
     }
 }
 
@@ -426,41 +490,67 @@ mod tests {
 
     #[test]
     fn exit_policy_table() {
+        // The full C table (`erl_proc_sig_queue.c:4740-4770`): {normal, kill, other} ×
+        // {Explicit, Linked} × trapping{false, true} = 12 cases.
+        use ExitFamily::{Explicit, Linked};
+
         let mut f = fixture();
         let atoms = &f.atoms;
         let boom = make_atom(f.table.intern("boom"));
+        let normal = atoms.normal_term();
+        let kill = atoms.kill_term();
+        let killed = atoms.killed_term();
 
-        // `kill` is untrappable: `Terminate(killed)` in both trapping states.
+        // --- The untrappable sentinel: `kill` in the EXPLICIT `erlang:exit/2` family. ---
+        // It terminates with the rewritten `killed`, trapping or not.
         assert_eq!(
-            exit_policy(atoms.kill_term(), false, atoms),
-            ExitPolicy::Terminate(atoms.killed_term())
+            exit_policy(kill, false, Explicit, atoms),
+            ExitPolicy::Terminate(killed)
         );
         assert_eq!(
-            exit_policy(atoms.kill_term(), true, atoms),
-            ExitPolicy::Terminate(atoms.killed_term())
-        );
-
-        // `normal` without trapping is ignored; with trapping it is delivered.
-        assert_eq!(
-            exit_policy(atoms.normal_term(), false, atoms),
-            ExitPolicy::Ignore
-        );
-        assert_eq!(
-            exit_policy(atoms.normal_term(), true, atoms),
-            ExitPolicy::Trap
+            exit_policy(kill, true, Explicit, atoms),
+            ExitPolicy::Terminate(killed)
         );
 
-        // Any other reason terminates unchanged, or traps when trapping.
+        // --- A LINK exit of reason `kill` IS trappable and is NOT rewritten. ---
         assert_eq!(
-            exit_policy(boom, false, atoms),
+            exit_policy(kill, true, Linked, atoms),
+            ExitPolicy::Trap,
+            "a trapping receiver traps a `kill` link exit"
+        );
+        assert_eq!(
+            exit_policy(kill, false, Linked, atoms),
+            ExitPolicy::Terminate(kill),
+            "a non-trapping receiver terminates with `kill`, never `killed`"
+        );
+
+        // --- `normal` is ignored by a non-trapping target in BOTH families ... ---
+        assert_eq!(exit_policy(normal, false, Explicit, atoms), ExitPolicy::Ignore);
+        assert_eq!(exit_policy(normal, false, Linked, atoms), ExitPolicy::Ignore);
+        // ... and trapped by a trapping one in both.
+        assert_eq!(exit_policy(normal, true, Explicit, atoms), ExitPolicy::Trap);
+        assert_eq!(exit_policy(normal, true, Linked, atoms), ExitPolicy::Trap);
+
+        // --- Any other reason traps when trapping, terminates unchanged otherwise, in both. ---
+        assert_eq!(exit_policy(boom, true, Explicit, atoms), ExitPolicy::Trap);
+        assert_eq!(exit_policy(boom, true, Linked, atoms), ExitPolicy::Trap);
+        assert_eq!(
+            exit_policy(boom, false, Explicit, atoms),
             ExitPolicy::Terminate(boom)
         );
-        assert_eq!(exit_policy(boom, true, atoms), ExitPolicy::Trap);
+        assert_eq!(
+            exit_policy(boom, false, Linked, atoms),
+            ExitPolicy::Terminate(boom)
+        );
 
-        // A non-atom reason is "other" too.
+        // A non-atom reason is "other" too, in both families.
         let weird = make_small(3);
         assert_eq!(
-            exit_policy(weird, false, atoms),
+            exit_policy(weird, false, Explicit, atoms),
+            ExitPolicy::Terminate(weird)
+        );
+        assert_eq!(
+            exit_policy(weird, false, Linked, atoms),
             ExitPolicy::Terminate(weird)
         );
     }

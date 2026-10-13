@@ -31,11 +31,13 @@
 //! safepoint collection of the recipient. A raw word pointing into a dropped heap would segfault
 //! or compare unequal here.
 //!
-//! The `kill`/`normal` tests at the end pin the two reason-class special cases of
-//! [`exit_policy`]: `kill` is **untrappable** and always terminates with the rewritten `killed`,
-//! while a `normal` link exit is silently ignored by a non-trapping peer and delivered as
-//! `{'EXIT', From, normal}` only to a trapping one. Each asserts the value the system `erl`
-//! (OTP 29.1.1) was probed to produce before asserting it (the probes are cited on the tests).
+//! The `kill`/`normal` tests pin the two reason-class special cases of [`exit_policy`], which is
+//! **family aware**: `kill` is untrappable and terminates with the rewritten `killed` **only** in
+//! the explicit `erlang:exit/2` family, while in the **link-exit** family (`kill`/`normal` tests at
+//! the end) a `kill` link exit is trappable and unrewritten and a `normal` link exit is silently
+//! ignored by a non-trapping peer (delivered as `{'EXIT', From, normal}` only to a trapping one).
+//! Each asserts the value the system `erl` (OTP 29.1.1) was probed to produce before asserting it
+//! (the probes are cited on the tests).
 
 use beam_process::prelude::*;
 use beam_term::compare;
@@ -741,4 +743,164 @@ fn link_to_a_non_live_pid_signals_noproc_from_it() {
     table.link(a, a).expect("a self-link is a no-op");
     assert!(!table.get(a).expect("a").links().contains(a));
     assert_eq!(table.pending_signals(a).expect("a is live"), 0);
+}
+
+// ---------------------------------------------------------------------------
+// The exit-signal FAMILY: `kill` is untrappable only over `erlang:exit/2`
+// ---------------------------------------------------------------------------
+
+// The three tests below pin the C's family split (`erl_proc_sig_queue.c:4740-4770`,
+// `ERTS_SIG_Q_OP_EXIT`/`ERTS_SIG_Q_OP_EXIT_LINKED`): the local **link cascade** carries the
+// link-exit family, where `kill` IS trappable and the reason is never rewritten, while an explicit
+// `erlang:exit/2` (`ProcessTable::send_exit`) keeps `kill` untrappable with the `killed` rewrite.
+// Before the family was modelled, a `kill` link exit wrongly terminated a trapping peer.
+
+#[test]
+fn a_trapping_link_peer_traps_a_kill_link_exit_and_survives() {
+    // Oracle probe (OTP 29.1.1):
+    //   process_flag(trap_exit, true),
+    //   P = spawn(fun() -> receive go -> exit(kill) end end),
+    //   link(P), P ! go,
+    //   R = receive M -> M after 1000 -> timeout end
+    // => `R = {'EXIT', P, kill}` and the receiver is still alive: in the LINK-exit family `kill`
+    // is trappable and is NOT rewritten to `killed`.
+    let (mut table, mut names) = table_with_names();
+    let exit_atom = make_atom(names.intern("EXIT"));
+    let kill = make_atom(names.intern("kill"));
+
+    let peer = table.spawn_default().expect("the peer");
+    let receiver = table.spawn_default().expect("the receiver");
+    table
+        .get_mut(receiver)
+        .expect("the receiver is live")
+        .set_trap_exit(true);
+    table.link(peer, receiver).expect("both pids are live");
+
+    // Only the family differs from `an_explicit_exit_2_kill_still_terminates_a_trapping_receiver`
+    // below: this is the link cascade (`ExitFamily::Linked`).
+    table.terminate(peer, kill).expect("the peer is live");
+
+    assert!(!table.contains(peer), "the peer is gone");
+    assert!(
+        table.contains(receiver),
+        "a trapping receiver survives a `kill` LINK exit (only an explicit `kill` is untrappable)"
+    );
+
+    let payload = sole_payload(&table, receiver);
+    // SAFETY: `payload` is the live `{'EXIT', Peer, kill}` tuple the table built on the receiver's
+    // heap; the three element slots are in bounds.
+    unsafe {
+        assert_eq!(tuple_size(payload), 3);
+        assert_eq!(tuple_element(payload, 0), exit_atom);
+        assert_eq!(
+            tuple_element(payload, 1),
+            peer.to_eterm(),
+            "the message came from the dead linked peer"
+        );
+        assert_eq!(
+            tuple_element(payload, 2),
+            kill,
+            "the link-exit reason is delivered UNCHANGED — `kill`, never `killed`"
+        );
+    }
+}
+
+#[test]
+fn a_non_trapping_link_peer_follows_a_kill_link_exit_with_kill_not_killed() {
+    // Oracle probe (OTP 29.1.1):
+    //   P = spawn(fun() -> receive go -> exit(kill) end end),
+    //   N = spawn(fun() -> link(P), ..., receive never -> ok end end),   % trap_exit false
+    //   M = erlang:monitor(process, N), P ! go,
+    //   receive {'DOWN', M, process, N, Rn} -> Rn end  => `kill` (NOT `killed`)
+    let (mut table, mut names) = table_with_names();
+    let kill = make_atom(names.intern("kill"));
+    let killed = make_atom(names.intern("killed"));
+    let down = make_atom(names.intern("DOWN"));
+    let process = make_atom(names.intern("process"));
+
+    let origin = table.spawn_default().expect("the origin");
+    let victim = table.spawn_default().expect("the non-trapping peer");
+    let watcher = table.spawn_default().expect("the watcher");
+    table.link(origin, victim).expect("both pids are live");
+    // The watcher is not linked to the origin, so only the DOWN (not an EXIT) reaches it.
+    table
+        .monitor(watcher, victim, MonitorKind::Process)
+        .expect("both pids are live");
+
+    table.terminate(origin, kill).expect("the origin is live");
+
+    assert!(!table.contains(origin), "the origin is gone");
+    assert!(
+        !table.contains(victim),
+        "a non-trapping peer follows a `kill` LINK exit"
+    );
+    assert!(table.contains(watcher), "the watcher is not linked to either");
+
+    let payload = sole_payload(&table, watcher);
+    // SAFETY: the live `{'DOWN', Ref, process, Victim, kill}` tuple the table built on the
+    // watcher's heap; the five element slots are in bounds.
+    unsafe {
+        assert_eq!(tuple_size(payload), 5);
+        assert_eq!(tuple_element(payload, 0), down);
+        assert_eq!(tuple_element(payload, 2), process);
+        assert_eq!(tuple_element(payload, 3), victim.to_eterm());
+        assert_eq!(
+            tuple_element(payload, 4),
+            kill,
+            "a link exit of reason `kill` terminates with the reason UNCHANGED"
+        );
+        assert_ne!(
+            tuple_element(payload, 4),
+            killed,
+            "the `kill` -> `killed` rewrite is guarded by the explicit `erlang:exit/2` family"
+        );
+    }
+}
+
+#[test]
+fn an_explicit_exit_2_kill_still_terminates_a_trapping_receiver() {
+    // The family contrast, on the *same* trapping shape as
+    // `a_trapping_link_peer_traps_a_kill_link_exit_and_survives`: over `erlang:exit/2`
+    // (`ProcessTable::send_exit` = the explicit family) the `kill` sentinel is untrappable, so the
+    // trapping receiver dies with the rewritten `killed` instead of trapping `{'EXIT', _, kill}`.
+    let (mut table, mut names) = table_with_names();
+    let kill = make_atom(names.intern("kill"));
+    let killed = make_atom(names.intern("killed"));
+    let down = make_atom(names.intern("DOWN"));
+    let process = make_atom(names.intern("process"));
+
+    let signaller = table.spawn_default().expect("the signaller");
+    let victim = table.spawn_default().expect("the trapping victim");
+    table
+        .get_mut(victim)
+        .expect("the victim is live")
+        .set_trap_exit(true);
+    let watcher = table.spawn_default().expect("the watcher");
+    table
+        .monitor(watcher, victim, MonitorKind::Process)
+        .expect("both pids are live");
+
+    table
+        .send_exit(signaller, victim, kill)
+        .expect("the victim is live");
+
+    assert!(
+        !table.contains(victim),
+        "an explicit `kill` terminates even a trapping target"
+    );
+    let payload = sole_payload(&table, watcher);
+    // SAFETY: the live `{'DOWN', Ref, process, Victim, killed}` tuple the table built on the
+    // watcher's heap; the five element slots are in bounds.
+    unsafe {
+        assert_eq!(tuple_size(payload), 5);
+        assert_eq!(tuple_element(payload, 0), down);
+        assert_eq!(tuple_element(payload, 2), process);
+        assert_eq!(tuple_element(payload, 3), victim.to_eterm());
+        assert_eq!(
+            tuple_element(payload, 4),
+            killed,
+            "the explicit family rewrites `kill` to `killed`"
+        );
+        assert_ne!(tuple_element(payload, 4), kill);
+    }
 }

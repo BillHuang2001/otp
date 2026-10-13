@@ -307,9 +307,11 @@ fn a_payload_reached_through_any_root_region_is_retained() -> Result<()> {
     process.saved_args_mut().push(saved_arg);
 
     let signal_reason = bin_ref_pair(&mut process, &in_signal);
-    process
-        .signals_mut()
-        .push(PendingSignal::exit(ProcessId::new(99, 0), signal_reason));
+    process.signals_mut().push(PendingSignal::exit(
+        ProcessId::new(99, 0),
+        signal_reason,
+        ExitFamily::Explicit,
+    ));
 
     assert_eq!(
         process.sweep_off_heap_binaries_reachable()?,
