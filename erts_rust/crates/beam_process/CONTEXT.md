@@ -114,6 +114,15 @@ The rationale (why) behind the frozen API and constraints lives in **`DESIGN_DEC
 ## Status
 - **Architected, implemented and tested.** Gate GREEN and warning-free: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_process` → **511 passed / 0 failed / 1 ignored** (re-run for the live count; 179 in-module unit tests + 331 integration tests across the 43 files under `tests/` + 1 doctest; the ignored test is the documented non-yielding-runner hang in `preemption.rs`), and `... build --manifest-path erts_rust/Cargo.toml --workspace` clean.
 - The remaining structural debts are the ones recorded above: the `beam_rt` alias wiring (Handoffs), the SMP pool's port-less gap, and the two residual off-heap-reclamation gaps — a copy-engine binary not auto-registering, and the unpublished-roots decline valve (Known Issues).
+## Performance (per-slice / per-delivery hot path)
+Measured by reading, not by a benchmark — use it to rule this node in or out of a perf hunt.
+- **One slice** (`src/scheduler.rs:388-431` `run_slice_inner`) = `run_queue.dequeue()` + one `runner.run` (`:542-614` `run_one`) + `resume_woken_into` (`:769-773`). **No heap allocation per slice**; `service_signals`'s `VecDeque` worklist (`src/ptab.rs:2225`) is empty (no heap alloc) for a signal-free process.
+- **Every pid op is O(1)**: `ProcessTable` is a `Vec<Slot>` indexed by `pid.number()` with a serial check (`src/ptab.rs:122-160` `lookup`/`lookup_mut`) — not a hashed map. A slice performs ~4 lookups: `slice_begin` `get_mut` (`:659`), `slice_end` `get_mut` (`:739`), plus two (`get` then `get_mut`) per woken pid in `drain_woken_into` (`:786-811`).
+- **The run queue is O(1) per op**: four `VecDeque<ProcessId>` (`src/run_queue.rs:125-168`); `dequeue` scans 4 constant levels; `enqueue` is an amortized-O(1) `push_back`.
+- **A send allocates nothing in this crate**: `ProcessTable::deliver` (`src/ptab.rs:813-846`) → `Process::deliver` (`src/process.rs:1062-1120`) copies via `beam_message::send` and `wake` (`:523-531`) is O(1); the only per-send cost is mailbox `VecDeque` growth. The collect-grow-retry path runs only on nursery exhaustion, and `has_unpublished_roots` (`:1247-1249`, O(1)) short-circuits it for a parked/`Running` receiver.
+- **Root gather/scatter is O(x_live + stack + extra_roots)** (`src/registers.rs:250-285`) and runs only inside a collection, never per slice or per send.
+- **Host-published `Process::regs` is never read or written by the scheduler slice path** — the O(stack+x) `publish_roots_full` is the host's, once per park/yield. So this crate's hot path cannot explain a large per-hop slowdown; suspect the `ProcessRunner` before this node (per-slice cost profile: `../beam_rt/src/runner/CONTEXT.md`).
+
 ## Routing Table
 - `src/` → **the module layer** — the complete per-module API surface (every seam type + shape, entry point and caveat), the module-level agent notes and the per-file routing table: see `src/CONTEXT.md`.
 - `src/smp/CONTEXT.md` → the SMP pool's API, the **BINDING locking discipline** and the bounded-quantum lock rule.
