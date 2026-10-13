@@ -113,6 +113,7 @@ use crate::context::BifContext;
 use crate::error::badarg;
 use crate::registry::BifRegistry;
 
+pub(crate) mod grapheme;
 mod wide;
 
 // ---------------------------------------------------------------------------

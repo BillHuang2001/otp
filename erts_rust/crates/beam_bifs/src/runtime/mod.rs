@@ -28,7 +28,8 @@
 //! [`RuntimeHooks`](crate::context::RuntimeHooks) seam (the `erlang:memory/0,1` pair
 //! through [`MemoryHook`](crate::context::MemoryHook)); with no hook installed a call
 //! answers the typed `unsupported_bif` capability gap — never `undef`, never a
-//! fabricated value.
+//! fabricated value. The `re` group is the exception: its 8 keys are real
+//! implementations in `crate::re`, not seam-backed.
 
 use crate::registry::BifRegistry;
 
@@ -38,7 +39,7 @@ pub(crate) mod erlang;
 pub(crate) mod erts_debug;
 pub(crate) mod erts_internal;
 mod memory;
-mod other;
+pub(crate) mod other;
 
 /// Registers a runtime-coupled BIF `module:function/arity` that bridges to the
 /// [`RuntimeHooks`](crate::context::RuntimeHooks) dispatcher via
@@ -108,8 +109,8 @@ mod tests {
 
     /// The per-family key counts this module's `CONTEXT.md` states, pinned against the
     /// actual registrations: `76 + 56 + 18 + 44 = 194` keys registered across the four
-    /// `runtime_bif!` families, of which **187** forward to the `RuntimeHooks` seam (the
-    /// other seven are the families' real `REAL_BIFS`), plus the 2 `MemoryHook`
+    /// `runtime_bif!` families, of which **173** forward to the `RuntimeHooks` seam (the
+    /// other twenty-one are the families' real `REAL_BIFS`), plus the 2 `MemoryHook`
     /// (`erlang:memory/0,1`), 13 `atomics`/`counters` and 1 `ddll` real keys — **210**
     /// registered under `runtime/`. A family that drifts must update the doc.
     #[test]
@@ -139,7 +140,8 @@ mod tests {
         let seam = family
             - super::erlang::REAL_BIFS.len()
             - super::erts_debug::REAL_BIFS.len()
-            - super::erts_internal::REAL_BIFS.len();
+            - super::erts_internal::REAL_BIFS.len()
+            - super::other::REAL_BIFS.len();
         assert_eq!(
             seam,
             crate::hook_sets::RUNTIME_HOOKS_BIFS.len(),

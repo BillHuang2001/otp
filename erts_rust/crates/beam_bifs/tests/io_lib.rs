@@ -718,9 +718,11 @@ fn field_padding_is_a_linked_tree() {
 }
 
 /// `io_lib:format/3`'s `Options` list: the default/unlimited options reproduce
-/// `format/2`, an unknown option is ignored, and a *limiting* `chars_limit` is a
-/// typed error (the documented Milestone-1 gap) — never a wrong (unlimited)
-/// rendering. The list shape is the same as `format/2` (the oracle's `["42"]`).
+/// `format/2`, an unknown option is ignored, and a *limiting* `chars_limit` is
+/// honoured (`build_small`/`count_small`/`build_limited`, eliding a big control
+/// with `"..."` when it does not fit the per-directive budget) — never a wrong
+/// (always-unlimited) rendering. The list shape is the same as `format/2` (the
+/// oracle's `["42"]`).
 #[test]
 fn format_3_options_reproduce_or_reject_the_chars_limit() {
     let reg = default_registry();
@@ -754,18 +756,27 @@ fn format_3_options_reproduce_or_reject_the_chars_limit() {
         .expect("an unknown option is ignored");
     assert!(beam_term::compare::eq(got, reference, ctx.atoms()));
 
-    // A limiting `chars_limit` is a typed error, not a wrong rendering.
+    // A limiting `chars_limit` is honoured: `~w` of `42` fits a 3-character
+    // budget, so the oracle renders it unchanged (`[[52,50]]`).
     let tag = atom(&mut ctx, "chars_limit");
     let three = int(&mut ctx, 3);
     let option = tuple(&mut ctx, &[tag, three]);
     let limit = ctx.list(&[option]).expect("fits");
-    let err = reg
+    let got = reg
         .call("io_lib", "format", 3, &mut ctx, &[format_term, args, limit])
-        .expect_err("a limiting chars_limit is unsupported");
-    assert!(
-        matches!(err, BeamError::Raise(_)),
-        "the limitation must be a typed raise, got {err:?}"
-    );
+        .expect("a limiting chars_limit is honoured");
+    assert!(beam_term::compare::eq(got, reference, ctx.atoms()));
+
+    // A zero budget elides the control, as the oracle does:
+    // `io_lib:format("~w", [42], [{chars_limit,0}])` => `["..."]`.
+    let zero = int(&mut ctx, 0);
+    let option = tuple(&mut ctx, &[tag, zero]);
+    let limit = ctx.list(&[option]).expect("fits");
+    let got = reg
+        .call("io_lib", "format", 3, &mut ctx, &[format_term, args, limit])
+        .expect("a zero chars_limit is honoured");
+    let elided = build(&mut ctx, &E::L(vec![E::S("...")]));
+    assert!(beam_term::compare::eq(got, elided, ctx.atoms()));
 
     // A negative `chars_limit` is the oracle's default (no limit).
     let neg = int(&mut ctx, -1);

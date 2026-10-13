@@ -18,11 +18,17 @@
 //
 // %CopyrightEnd%
 
-//! `erl_ddll:format_error_int/1` — the driver load/format error table (contract A.7).
+//! `erl_ddll`'s error table and its driver registry.
 //!
-//! This is the **one** `erl_ddll` key that needs no live driver registry: it is a
-//! pure `error description -> message` translation, so it is registered here as a
-//! real [`BifFn`](crate::registry::BifFn) instead of a `runtime_bif!` seam gap.
+//! Two halves live here:
+//!
+//! * [`format_error_int_1`] — a pure `error description -> message` translation, registered here as a
+//!   real [`BifFn`](crate::registry::BifFn) instead of a `runtime_bif!` seam gap; and
+//! * the loaded-driver **registry** ([`registry`]) plus the six keys it backs: the three
+//!   **loading** keys ([`live`]: `try_load/3`, `try_unload/2`, `loaded_drivers/0`), the
+//!   state report `info/2` ([`info`]) and the event registrations `monitor/2`/`demonitor/1`
+//!   ([`monitor`]) — the `dlopen` face of contract A.4 driven through `beam_abi`'s safe
+//!   driver loader.
 //!
 //! Ground truth (read-only): `erts/emulator/beam/erl_bif_ddll.c`
 //! (`erl_ddll_format_error_int_1:813`, `erts_ddll_error:1201`, `errdesc_to_code:1722`,
@@ -65,12 +71,20 @@ use crate::context::BifContext;
 use crate::error::badarg;
 use crate::registry::BifRegistry;
 
+pub(crate) mod info;
+pub(crate) mod live;
+pub(crate) mod monitor;
+mod registry;
+#[cfg(test)]
+pub(crate) mod test_support;
+
 /// The `(module, function, arity)` keys this module registers **for real**.
 ///
-/// Sorted by `(module, function, arity)`. The six remaining `erl_ddll` keys
-/// (`demonitor/1`, `info/2`, `loaded_drivers/0`, `monitor/2`, `try_load/3`,
-/// `try_unload/2`) stay seam-backed in `src/runtime/other.rs`: they need the live
-/// driver registry owned by `beam_rt`.
+/// Sorted by `(module, function, arity)`. Together with the three **loading** keys
+/// (`loaded_drivers/0`, `try_load/3`, `try_unload/2` in [`live`], [`live::REAL_BIFS`]),
+/// `info/2` ([`info`], [`info::REAL_BIFS`]) and the monitor pair `monitor/2`/`demonitor/1`
+/// ([`monitor`], [`monitor::REAL_BIFS`]) this is the whole `erl_ddll` surface — the family
+/// has **zero** `RuntimeHooks` seam keys.
 pub(crate) const REAL_BIFS: &[(&str, &str, u32)] = &[("erl_ddll", "format_error_int", 1)];
 
 /// The Erlang-interface-only error atoms — the C `switch` in

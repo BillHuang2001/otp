@@ -34,7 +34,7 @@ use std::process::Command;
 
 use beam_alloc::Heap;
 use beam_bifs::prelude::*;
-use beam_common::{BeamError, ExitReason, Result};
+use beam_common::{BeamError, Result};
 use beam_process::ProcessId;
 use beam_term::{atom_val, signed_value, AtomTable, Eterm, NIL};
 
@@ -786,33 +786,16 @@ fn an_unknown_packet_type_is_badarg() {
 
 #[test]
 fn valid_unimplemented_types_are_a_typed_capability_gap() {
-    // The other valid packet types (`packet_parser.h:34-50`) are recognised — so
-    // they are not `badarg` — but this Milestone reports them as the typed
-    // `unsupported_bif` gap, never a fabricated packet.
+    // The valid packet types (`packet_parser.h:34-50`) are recognised — so they
+    // are not `badarg` — and each has its own family module. This test pins what
+    // holds for **every** one of them regardless of implementation state: the
+    // arguments are validated before the type is dispatched.
     let reg = default_registry();
     let mut heap = heap();
     let atoms = seeded_atoms();
     let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
 
-    for name in [
-        "asn1", "sunrm", "cdr", "fcgi", "tpkt", "http", "httph", "http_bin", "httph_bin",
-        "ssl_tls",
-    ] {
-        let ty = ctx.atom(name).expect("seeded");
-        let bin = binary_term(&reg, &mut ctx, &[1, 2, 3]);
-        match decode(&reg, &mut ctx, ty, bin, NIL) {
-            Err(BeamError::Raise(raise)) => {
-                assert_eq!(
-                    raise.reason,
-                    ExitReason::atom("unsupported_bif"),
-                    "{name} must be the typed capability gap"
-                );
-            }
-            other => panic!("{name}: expected unsupported_bif, got {other:?}"),
-        }
-    }
-
-    // Arguments are still validated first: a non-binary `Bin` stays `badarg`.
+    // Arguments are validated first: a non-binary `Bin` stays `badarg`.
     let ty = ctx.atom("asn1").expect("seeded");
     let bad_bin = ctx.int(42).expect("fits");
     assert!(matches!(
